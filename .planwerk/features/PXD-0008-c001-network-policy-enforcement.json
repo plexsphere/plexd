@@ -1,0 +1,24 @@
+{
+  "feature_id": "PXD-0008",
+  "title": "C001: Network Policy Enforcement",
+  "slug": "c001-network-policy-enforcement",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Receive network policies from the control plane and enforce them locally. Implement two enforcement mechanisms: peer visibility filtering (controlling which peers a node can see and connect to) and firewall rules (controlling traffic flow between peers). Policies are reconciled as part of the configuration loop.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.107158"
+    }
+  },
+  "origin": "plan"
+}

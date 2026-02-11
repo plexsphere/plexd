@@ -1,0 +1,24 @@
+{
+  "feature_id": "PXD-0006",
+  "title": "B002: NAT Traversal via STUN",
+  "slug": "b002-nat-traversal-via-stun",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Discover the node's public endpoint using STUN servers. Determine NAT type and public IP:port mapping so peers behind NAT can establish direct connections. Report discovered endpoints to the control plane for distribution to peers.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.106301"
+    }
+  },
+  "origin": "plan"
+}

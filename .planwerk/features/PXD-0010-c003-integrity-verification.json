@@ -1,0 +1,24 @@
+{
+  "feature_id": "PXD-0010",
+  "title": "C003: Integrity Verification",
+  "slug": "c003-integrity-verification",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Ensure integrity of the plexd binary itself and any custom hook scripts via SHA-256 checksum verification. Verify checksums on startup, after updates, and before executing hook scripts. Report integrity violations to the control plane.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.108139"
+    }
+  },
+  "origin": "plan"
+}

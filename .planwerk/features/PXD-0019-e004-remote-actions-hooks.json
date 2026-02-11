@@ -1,0 +1,24 @@
+{
+  "feature_id": "PXD-0019",
+  "title": "E004: Remote Actions & Hooks",
+  "slug": "e004-remote-actions-hooks",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Execute platform-triggered actions on nodes. Support built-in operations (diagnostics, service management) and custom hook scripts. Hooks are delivered from the control plane with SHA-256 checksums for integrity verification. Report action results back to the control plane.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.112214"
+    }
+  },
+  "origin": "plan"
+}

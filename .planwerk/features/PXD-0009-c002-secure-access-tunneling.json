@@ -1,0 +1,24 @@
+{
+  "feature_id": "PXD-0009",
+  "title": "C002: Secure Access Tunneling",
+  "slug": "c002-secure-access-tunneling",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Enable platform-mediated access to managed resources. Tunnel SSH sessions to servers/VMs and Kubernetes API access through the mesh without exposing services directly to the internet. The control plane orchestrates access sessions; plexd provides the local tunnel endpoints.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.107577"
+    }
+  },
+  "origin": "plan"
+}

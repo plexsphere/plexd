@@ -1,0 +1,24 @@
+{
+  "feature_id": "PXD-0001",
+  "title": "A001: Control Plane Client (HTTPS + SSE)",
+  "slug": "a001-control-plane-client-https-sse",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Implement the outbound-only communication layer to the Plexsphere control plane. Uses HTTPS for API calls (registration, key exchange, policy fetch) and Server-Sent Events (SSE) for real-time event streaming from the control plane. All connections are initiated by the node — no inbound ports required.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.103985"
+    }
+  },
+  "origin": "plan"
+}

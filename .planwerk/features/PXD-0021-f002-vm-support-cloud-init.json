@@ -1,0 +1,24 @@
+{
+  "feature_id": "PXD-0021",
+  "title": "F002: VM Support (Cloud-Init)",
+  "slug": "f002-vm-support-cloud-init",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Support automated deployment on virtual machines via Cloud-Init. Provide Cloud-Init user-data templates that install plexd and inject the bootstrap token automatically during VM provisioning. Integrate with cloud provider metadata services where applicable.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.113133"
+    }
+  },
+  "origin": "plan"
+}

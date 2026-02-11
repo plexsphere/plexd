@@ -1,0 +1,24 @@
+{
+  "feature_id": "PXD-0002",
+  "title": "A002: Self-Registration & Bootstrap Authentication",
+  "slug": "a002-self-registration-bootstrap-authentication",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Authenticate with the control plane using a one-time bootstrap token and enroll the node. Supports platform-provisioned tokens (injected via Cloud-Init or Kubernetes Secret) and manually provided tokens for user-onboarded resources. After successful registration, the node receives its identity, mesh IP, and initial configuration.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.104550"
+    }
+  },
+  "origin": "plan"
+}

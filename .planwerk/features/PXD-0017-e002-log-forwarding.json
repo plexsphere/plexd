@@ -1,0 +1,24 @@
+{
+  "feature_id": "PXD-0017",
+  "title": "E002: Log Forwarding",
+  "slug": "e002-log-forwarding",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Stream system and application logs from the node to the control plane for centralized monitoring and troubleshooting. Support structured log formats and efficient transport. Handle log buffering during connectivity interruptions.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.111312"
+    }
+  },
+  "origin": "plan"
+}
