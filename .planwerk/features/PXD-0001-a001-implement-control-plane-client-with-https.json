@@ -1,0 +1,768 @@
+{
+  "feature_id": "PXD-0001",
+  "title": "A001: Implement Control Plane client with HTTPS and SSE",
+  "slug": "a001-implement-control-plane-client-with-https",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "\n\n**Size:** 🏗️ large\n**Category:** backend\n**Priority:** critical\n\n## Summary\n\nS001 implements the foundational outbound-only communication layer between plexd and the Plexsphere control plane. It provides two transport mechanisms: an HTTPS client for request/response API calls (registration, heartbeat, state fetch, metrics delivery, etc.) and a persistent SSE client for receiving real-time events (peer changes, policy updates, action requests, key rotation). This is the lowest-level building block — every other plexd feature (S002–S022) depends on it.\n\n## Scope\n\n**Included:**\n- `ControlPlane` client struct using `net/http` stdlib — shared HTTP client, base URL, TLS config, injectable auth token (`Authorization: Bearer`), gzip, JSON ser/de\n- All 17 control plane API endpoint methods as typed Go functions (per README API reference: `POST /v1/register` through `GET /v1/artifacts/...`)\n- SSE client connecting to `GET /v1/nodes/{node_id}/events` with `text/event-stream` line-by-line parsing\n- SSE reconnection via `ReconnectEngine` — exponential backoff (1s → 60s cap) with ±25% jitter\n- `Last-Event-ID` tracking and replay header on reconnect\n- Event dispatching to registered handlers by `event_type` string (all 11 event types from README)\n- Signed event envelope parsing — JSON struct: `event_type`, `event_id`, `issued_at`, `nonce`, `payload`, `signature`\n- `EventVerifier` interface for signature + staleness + nonce checks (pluggable; concrete Ed25519 impl deferred to S010)\n- Polling fallback after 5 minutes continuous SSE failure (`GET /v1/nodes/{id}/state`)\n- Structured error types per HTTP status (`ErrUnauthorized`, `ErrConflict`, `ErrNotFound`, etc.)\n- Context-based cancellation and graceful shutdown of SSE stream\n- Configuration loading for `api` block (base URL, TLS, timeouts) from config file / env / flags\n- Unit tests with `httptest.Server` for all HTTPS endpoints and SSE stream scenarios (reconnect, backoff, dispatch, envelope parsing)\n\n**Excluded (YAGNI / belongs to other features):**\n- Bootstrap token reading from file/env/metadata — S002\n- Registration orchestration logic (retry state machine) — S002\n- Reconciliation loop scheduling and diff logic — S003\n- Ed25519 signature verification implementation — S010\n- Nonce tracking bounded set implementation — S010 (interface defined here)\n- Heartbeat scheduling — S003\n- WireGuard or mesh-layer logic — S005\n- Metrics/log/audit batch delivery scheduling — S016/S017/S018\n- Node API server — S004\n\n## Visualization\n\n```mermaid\nflowchart TD\n    subgraph plexd[\"plexd process\"]\n        CFG[\"Config Loader\"]\n        CP[\"ControlPlane Client\"]\n        HTTP[\"HTTPS Transport\"]\n        SSE[\"SSE Stream Manager\"]\n        DISP[\"Event Dispatcher\"]\n        VERIF[\"EventVerifier interface\"]\n        RECON[\"Reconnect Engine\"]\n\n        CFG -->|\"base URL, TLS\"| CP\n        CP --> HTTP\n        CP --> SSE\n        SSE --> RECON\n        SSE -->|\"raw events\"| VERIF\n        VERIF -->|\"verified events\"| DISP\n        DISP -->|\"by event_type\"| HANDLERS[\"Handler Registry\"]\n    end\n\n    subgraph controlplane[\"Plexsphere Control Plane\"]\n        REG_API[\"Registration API\"]\n        HB_API[\"Heartbeat API\"]\n        STATE_API[\"State API\"]\n        EVBUS[\"Event Bus / SSE\"]\n        OTHER[\"Other Endpoints\"]\n    end\n\n    HTTP -->|\"POST, GET, PUT\"| REG_API\n    HTTP -->|\"POST\"| HB_API\n    HTTP -->|\"GET, POST\"| STATE_API\n    HTTP -->|\"various\"| OTHER\n    EVBUS -->|\"text/event-stream\"| SSE\n```\n\n```mermaid\nsequenceDiagram\n    participant P as plexd\n    participant CP as Control Plane\n\n    P->>CP: POST /v1/register\n    CP-->>P: 201 node_id, signing_key, peers\n\n    P->>CP: GET /v1/nodes/{id}/events\n    CP-->>P: 200 text/event-stream\n\n    loop SSE Stream\n        CP--)P: event: peer_added (signed envelope)\n        P->>P: Parse envelope, verify signature\n        P->>P: Dispatch to handler\n    end\n\n    Note over P,CP: Connection drops\n    P->>P: Backoff 1s, 2s, 4s... +/- 25% jitter\n    P->>CP: GET /v1/nodes/{id}/events (Last-Event-ID: evt_xyz)\n    CP-->>P: Replay missed events + resume stream\n\n    Note over P,CP: SSE down > 5 min\n    loop Polling Fallback\n        P->>CP: GET /v1/nodes/{id}/state\n        CP-->>P: Full state snapshot\n    end\n```\n\n```mermaid\nstateDiagram-v2\n    [*] --> Disconnected\n    Disconnected --> Connecting: Start\n    Connecting --> Connected: SSE 200 OK\n    Connecting --> Backoff: Connection failed\n    Backoff --> Connecting: Timer expired\n    Connected --> Processing: Event received\n    Processing --> Connected: Event dispatched\n    Connected --> Disconnected: Connection lost\n    Backoff --> Polling: 5 min timeout\n    Polling --> Connecting: SSE retry\n    Polling --> Polling: Poll interval\n    Connected --> [*]: Shutdown\n    Polling --> [*]: Shutdown\n```\n\n## Key Components\n\n- **`internal/api/client.go`** — `ControlPlane` struct: shared `*http.Client`, base URL, TLS config, auth token. Exposes typed methods for all 17 API endpoints (`Register()`, `Heartbeat()`, `FetchState()`, `ReportMetrics()`, etc.). Handles JSON marshalling, gzip, error mapping.\n- **`internal/api/sse.go`** — `SSEStream` struct: manages persistent `GET /v1/nodes/{id}/events` connection, parses `text/event-stream` line protocol (`event:`, `data:`, `id:`, `retry:`), tracks `Last-Event-ID`.\n- **`internal/api/reconnect.go`** — `ReconnectEngine`: exponential backoff (1s–60s) with ±25% jitter, 5-minute cumulative SSE failure threshold triggering polling fallback, automatic SSE retry from polling state.\n- **`internal/api/dispatcher.go`** — `EventDispatcher`: type-safe handler registry, routes parsed events to registered `EventHandler` functions keyed by `event_type` string.\n- **`internal/api/envelope.go`** — `SignedEnvelope` struct: JSON parsing for envelope schema (`event_type`, `event_id`, `issued_at`, `nonce`, `payload`, `signature`). Defines `EventVerifier` interface with `Verify(envelope) error`.\n- **`internal/api/errors.go`** — Structured error types mapping HTTP status codes: `ErrUnauthorized` (401), `ErrForbidden` (403), `ErrNotFound` (404), `ErrConflict` (409), `ErrRateLimit` (429), `ErrServer` (5xx).\n- **`internal/api/config.go`** — Client configuration struct: base URL, TLS skip-verify flag, timeouts (connect, request, SSE idle), loaded from `/etc/plexd/config.yaml` `api` block.\n- **`internal/api/*_test.go`** — Unit tests using `httptest.Server` for all HTTPS endpoints and SSE stream simulation (reconnect, backoff, event dispatch, envelope parsing, error handling).",
+  "stories": [
+    {
+      "title": "plexd can make authenticated HTTPS API calls to the control plane",
+      "role": "plexd agent",
+      "want": "to send typed HTTPS requests (POST, GET, PUT) to all 17 control plane API endpoints with proper auth, JSON ser/de, gzip, and TLS",
+      "so_that": "all higher-level features (registration, heartbeat, reconciliation, observability) can communicate with the control plane through a single shared client",
+      "criteria": [
+        "ControlPlane client struct holds shared *http.Client, base URL, TLS config, and injectable Bearer token",
+        "All 17 API endpoint methods are implemented as typed Go functions matching the README API reference",
+        "JSON request bodies are marshalled automatically; JSON response bodies are unmarshalled into typed structs",
+        "Request bodies larger than 1 KiB are gzip-compressed with Content-Encoding: gzip header",
+        "Authorization: Bearer {token} header is injected on every request (except POST /v1/register which uses the bootstrap token)",
+        "User-Agent header is set to plexd/{version}",
+        "Context-based cancellation is supported on all requests"
+      ]
+    },
+    {
+      "title": "plexd receives real-time events from the control plane via SSE",
+      "role": "plexd agent",
+      "want": "to maintain a persistent SSE connection to GET /v1/nodes/{node_id}/events, parse the text/event-stream line protocol, and dispatch parsed events to registered handlers",
+      "so_that": "the agent reacts to peer changes, policy updates, action requests, key rotations, and state updates in real time",
+      "criteria": [
+        "SSEStream connects to GET /v1/nodes/{node_id}/events with Accept: text/event-stream",
+        "Line protocol parsing handles event:, data:, id:, retry:, and comment lines (lines starting with :) correctly",
+        "Multi-line data fields are concatenated with newline separators per SSE spec",
+        "Last-Event-ID is tracked and sent as a header on reconnection",
+        "The retry field from the server updates the base reconnection interval",
+        "SSE stream respects context cancellation for graceful shutdown"
+      ]
+    },
+    {
+      "title": "plexd reconnects to SSE with exponential backoff and falls back to polling",
+      "role": "plexd agent",
+      "want": "to automatically reconnect the SSE stream on connection failure with exponential backoff (1s-60s, ±25% jitter), and fall back to polling GET /v1/nodes/{node_id}/state after 5 minutes of continuous SSE failure",
+      "so_that": "the agent remains resilient to transient network issues and control plane restarts while avoiding thundering herd effects",
+      "criteria": [
+        "ReconnectEngine implements exponential backoff: 1s base, 2x multiplier, 60s cap",
+        "Each backoff interval has ±25% jitter applied randomly",
+        "Failure classification: transient errors (network, 5xx) use backoff; 401 triggers re-auth callback and stops retry; 429 respects Retry-After header; 403/404 stops and surfaces error",
+        "After 5 minutes cumulative SSE failure, polling fallback activates at reconcile.interval",
+        "Polling mode periodically retries SSE connection to recover real-time streaming",
+        "Successful reconnection resets backoff state and sends Last-Event-ID for replay",
+        "Context cancellation stops the reconnect engine and any pending timers"
+      ]
+    },
+    {
+      "title": "plexd parses and verifies signed event envelopes before dispatching",
+      "role": "plexd agent",
+      "want": "to parse each SSE data payload as a signed event envelope JSON and verify it through the EventVerifier interface before dispatching to handlers",
+      "so_that": "forged or replayed events are rejected even if TLS is compromised",
+      "criteria": [
+        "SignedEnvelope struct deserializes: event_type, event_id, issued_at, nonce, payload (json.RawMessage), signature",
+        "EventVerifier interface defines Verify(envelope SignedEnvelope) error",
+        "A no-op verifier is provided as default (concrete Ed25519 impl deferred to S010)",
+        "Verified events are dispatched to registered EventHandler functions keyed by event_type string",
+        "All 12 event types from the README are defined as constants: peer_added, peer_removed, peer_key_rotated, peer_endpoint_changed, policy_updated, action_request, session_revoked, ssh_session_setup, rotate_keys, signing_key_rotated, node_state_updated, node_secrets_updated",
+        "Unrecognized event_type values are logged at warn level and discarded (forward compatibility)"
+      ]
+    },
+    {
+      "title": "plexd dispatches verified events to registered handlers by event type",
+      "role": "plexd agent",
+      "want": "to register event handler functions per event_type and have the dispatcher invoke the correct handler for each verified event",
+      "so_that": "each feature (S002-S022) can register its own handler without modifying the core SSE client",
+      "criteria": [
+        "EventDispatcher supports Register(eventType string, handler EventHandler) method",
+        "EventHandler is defined as a function type: func(ctx context.Context, envelope SignedEnvelope) error",
+        "Multiple handlers can be registered for the same event_type (all are invoked sequentially)",
+        "Handler errors are logged but do not stop processing of subsequent events",
+        "Events with no registered handler are logged at debug level and discarded"
+      ]
+    },
+    {
+      "title": "plexd maps HTTP errors to structured error types",
+      "role": "developer consuming the ControlPlane client",
+      "want": "to receive structured, typed errors for each HTTP status code so that error handling logic can branch on error type",
+      "so_that": "callers can distinguish between retryable errors (5xx, 429), auth errors (401), and permanent errors (403, 404, 409) without parsing status codes",
+      "criteria": [
+        "ErrUnauthorized (401), ErrForbidden (403), ErrNotFound (404), ErrConflict (409), ErrRateLimit (429), ErrPayloadTooLarge (413), ErrBadRequest (400), ErrServer (5xx) are defined as typed error structs",
+        "Each error type includes StatusCode int, Message string, and optional RetryAfter time.Duration (for 429)",
+        "errors.Is() and errors.As() work correctly for all error types",
+        "Unknown 4xx/5xx status codes are wrapped in a generic APIError with status code and body"
+      ]
+    },
+    {
+      "title": "plexd loads API client configuration from config file, env vars, and flags",
+      "role": "platform operator",
+      "want": "to configure the control plane API URL, TLS settings, and timeouts via /etc/plexd/config.yaml, environment variables, or CLI flags with a clear precedence order",
+      "so_that": "the agent can connect to different control plane environments without code changes",
+      "criteria": [
+        "Config struct defines: BaseURL (required), TLSInsecureSkipVerify bool, ConnectTimeout, RequestTimeout, SSEIdleTimeout durations",
+        "Config is loaded from the api block of /etc/plexd/config.yaml if the file exists",
+        "PLEXD_API env var overrides BaseURL from config file",
+        "TLSInsecureSkipVerify defaults to false; when true, a warning is logged at startup",
+        "Reasonable defaults: ConnectTimeout=10s, RequestTimeout=30s, SSEIdleTimeout=90s",
+        "Config struct is passed to ControlPlane constructor (no file I/O in the api package itself)"
+      ]
+    },
+    {
+      "title": "SSE connection errors do not cause the plexd process to crash",
+      "role": "platform operator",
+      "want": "SSE failures to be handled gracefully with logging, backoff, and fallback rather than panics or unrecoverable states",
+      "so_that": "plexd remains operational even during extended control plane outages",
+      "criteria": [
+        "Network errors during SSE connection are logged at warn level and trigger reconnection",
+        "Malformed SSE data (invalid JSON, missing fields) is logged at error level and the event is skipped without disconnecting",
+        "The SSE stream goroutine recovers from panics, logs the stack trace, and triggers reconnection",
+        "Shutdown via context cancellation cleanly closes the SSE HTTP response body",
+        "All goroutines are properly tracked and drained during shutdown"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The ControlPlane client SHALL provide typed Go methods for all 17 control plane API endpoints as specified in the README API reference",
+      "priority": "SHALL",
+      "rationale": "Every plexd feature (S002-S022) depends on these methods; having them in a single client ensures consistent auth, error handling, and transport behavior",
+      "scenarios": [
+        {
+          "name": "Register endpoint sends correct payload",
+          "when": "Register() is called with a valid RegisterRequest",
+          "then": "the client sends POST /v1/register with JSON body and receives a typed RegisterResponse",
+          "and_then": [
+            "Authorization header uses the bootstrap token"
+          ]
+        },
+        {
+          "name": "Heartbeat endpoint sends and parses response",
+          "when": "Heartbeat() is called with a valid HeartbeatRequest",
+          "then": "the client sends POST /v1/nodes/{node_id}/heartbeat and returns HeartbeatResponse",
+          "and_then": [
+            "reconcile and rotate_keys boolean fields are correctly parsed"
+          ]
+        },
+        {
+          "name": "FetchState returns full desired state",
+          "when": "FetchState() is called with a node_id",
+          "then": "the client sends GET /v1/nodes/{node_id}/state and returns typed StateResponse",
+          "and_then": []
+        },
+        {
+          "name": "FetchArtifact returns binary stream",
+          "when": "FetchArtifact() is called with version, os, arch",
+          "then": "the client sends GET /v1/artifacts/plexd/{version}/{os}/{arch} and returns an io.ReadCloser",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The ControlPlane client SHALL map HTTP error status codes to structured Go error types supporting errors.Is/errors.As",
+      "priority": "SHALL",
+      "rationale": "Callers need typed errors to implement correct retry, re-auth, and error-handling logic",
+      "scenarios": [
+        {
+          "name": "401 maps to ErrUnauthorized",
+          "when": "any API call returns HTTP 401",
+          "then": "errors.Is(err, ErrUnauthorized) returns true",
+          "and_then": [
+            "error message includes response body"
+          ]
+        },
+        {
+          "name": "429 maps to ErrRateLimit with Retry-After",
+          "when": "API call returns HTTP 429 with Retry-After: 30",
+          "then": "errors.As extracts ErrRateLimit with RetryAfter=30s",
+          "and_then": []
+        },
+        {
+          "name": "5xx maps to ErrServer",
+          "when": "API call returns HTTP 500, 502, 503, or 504",
+          "then": "errors.Is(err, ErrServer) returns true with StatusCode available",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The SSE client SHALL parse text/event-stream line protocol per the W3C EventSource specification",
+      "priority": "SHALL",
+      "rationale": "Correct SSE parsing is critical for receiving real-time events; edge cases must be handled",
+      "scenarios": [
+        {
+          "name": "Single-line event parsed",
+          "when": "stream delivers event: peer_added, data: {...}, id: evt_001",
+          "then": "parser emits SSEEvent with correct Type, Data, ID",
+          "and_then": [
+            "Last-Event-ID updated to evt_001"
+          ]
+        },
+        {
+          "name": "Multi-line data concatenated",
+          "when": "stream delivers data: line1 and data: line2",
+          "then": "parser emits SSEEvent with Data=line1\\nline2",
+          "and_then": []
+        },
+        {
+          "name": "Comment lines ignored",
+          "when": "stream delivers :keepalive",
+          "then": "no event emitted, idle timer reset",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The SSE client SHALL track Last-Event-ID and send it as a header on reconnection",
+      "priority": "SHALL",
+      "rationale": "Enables replay of missed events during disconnection windows",
+      "scenarios": [
+        {
+          "name": "Last-Event-ID sent on reconnect",
+          "when": "SSE drops after receiving id: evt_042",
+          "then": "reconnection includes Last-Event-ID: evt_042 header",
+          "and_then": []
+        },
+        {
+          "name": "No header on first connection",
+          "when": "SSEStream starts with no prior IDs",
+          "then": "no Last-Event-ID header sent",
+          "and_then": []
+        },
+        {
+          "name": "ID persists across reconnections",
+          "when": "stream reconnects multiple times",
+          "then": "each reconnection uses the most recent event ID",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The ReconnectEngine SHALL implement exponential backoff (1s base, 2x multiplier, 60s cap) with ±25% jitter and failure classification",
+      "priority": "SHALL",
+      "rationale": "Prevents thundering herd; failure classification prevents useless retries on auth errors",
+      "scenarios": [
+        {
+          "name": "Exponential backoff on transient failure",
+          "when": "network error occurs 4 times consecutively",
+          "then": "delays are approximately 1s, 2s, 4s, 8s with ±25% jitter",
+          "and_then": [
+            "maximum delay never exceeds 60s"
+          ]
+        },
+        {
+          "name": "401 triggers auth failure callback",
+          "when": "SSE returns HTTP 401",
+          "then": "OnAuthFailure callback is invoked; reconnection pauses",
+          "and_then": []
+        },
+        {
+          "name": "429 respects Retry-After",
+          "when": "SSE returns HTTP 429 with Retry-After: 60",
+          "then": "engine waits at least 60s before next attempt",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The SSE client SHALL fall back to polling after 5 minutes continuous SSE failure and periodically retry SSE",
+      "priority": "SHALL",
+      "rationale": "Ensures agent stays in sync during extended SSE outages",
+      "scenarios": [
+        {
+          "name": "Polling activates after 5 min SSE failure",
+          "when": "SSE cannot connect for 5 continuous minutes",
+          "then": "client switches to polling FetchState at reconcile.interval",
+          "and_then": [
+            "warn-level log indicates fallback"
+          ]
+        },
+        {
+          "name": "SSE retried from polling",
+          "when": "in polling mode",
+          "then": "SSE reconnection attempted every 60s",
+          "and_then": [
+            "success exits polling mode"
+          ]
+        },
+        {
+          "name": "Polling handles FetchState errors",
+          "when": "FetchState fails during polling",
+          "then": "error logged, next poll scheduled normally",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The SignedEnvelope SHALL parse event envelope JSON and the EventVerifier interface SHALL define Verify(envelope) error",
+      "priority": "SHALL",
+      "rationale": "Pluggable verification enables S010 to add Ed25519 without modifying S001",
+      "scenarios": [
+        {
+          "name": "Valid envelope parsed",
+          "when": "JSON contains all envelope fields",
+          "then": "SignedEnvelope populated; payload stored as json.RawMessage",
+          "and_then": []
+        },
+        {
+          "name": "Missing required field fails",
+          "when": "JSON missing event_type",
+          "then": "parse error returned describing missing field",
+          "and_then": []
+        },
+        {
+          "name": "No-op verifier accepts all",
+          "when": "default verifier used",
+          "then": "Verify returns nil for any envelope",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The EventDispatcher SHALL route events to registered handlers by event_type, supporting multiple handlers per type",
+      "priority": "SHALL",
+      "rationale": "Handler-based dispatch allows features to register independently",
+      "scenarios": [
+        {
+          "name": "Event dispatched to handler",
+          "when": "peer_added event received with handler registered",
+          "then": "handler invoked with context and envelope",
+          "and_then": []
+        },
+        {
+          "name": "Multiple handlers invoked",
+          "when": "two handlers registered for policy_updated",
+          "then": "both invoked in registration order; first failure doesn't block second",
+          "and_then": []
+        },
+        {
+          "name": "Unhandled event discarded",
+          "when": "unknown event_type arrives",
+          "then": "logged at debug, discarded, stream continues",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The client SHALL compress request bodies over 1 KiB with gzip and accept gzip responses",
+      "priority": "SHALL",
+      "rationale": "Observability endpoints require gzip; consistent compression reduces bandwidth",
+      "scenarios": [
+        {
+          "name": "Large body compressed",
+          "when": "request body exceeds 1 KiB",
+          "then": "body gzip-compressed, Content-Encoding: gzip set",
+          "and_then": []
+        },
+        {
+          "name": "Small body not compressed",
+          "when": "request body is 500 bytes",
+          "then": "body sent uncompressed",
+          "and_then": []
+        },
+        {
+          "name": "Gzip responses decompressed",
+          "when": "response has Content-Encoding: gzip",
+          "then": "response body transparently decompressed",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The Config struct SHALL define BaseURL, TLS, and timeout settings with reasonable defaults, passed as constructor argument to ControlPlane client",
+      "priority": "SHALL",
+      "rationale": "Separating config from client keeps api package free of file I/O; config struct is the contract",
+      "scenarios": [
+        {
+          "name": "Minimal config uses defaults",
+          "when": "Config with only BaseURL passed",
+          "then": "defaults applied: ConnectTimeout=10s, RequestTimeout=30s, SSEIdleTimeout=90s, TLS verified",
+          "and_then": []
+        },
+        {
+          "name": "TLS skip-verify warns",
+          "when": "TLSInsecureSkipVerify=true",
+          "then": "client created with InsecureSkipVerify and warning logged",
+          "and_then": []
+        },
+        {
+          "name": "Auth token thread-safe",
+          "when": "SetAuthToken called concurrently with requests",
+          "then": "no data race; subsequent requests use new token",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "The SSE client and ReconnectEngine SHALL support graceful shutdown via context cancellation",
+      "priority": "SHALL",
+      "rationale": "Clean shutdown on SIGTERM prevents goroutine and connection leaks",
+      "scenarios": [
+        {
+          "name": "Context cancellation stops SSE",
+          "when": "context cancelled during active stream",
+          "then": "HTTP body closed, goroutines exit, no leak",
+          "and_then": []
+        },
+        {
+          "name": "Cancellation during backoff",
+          "when": "context cancelled during backoff timer",
+          "then": "timer stopped, engine returns immediately",
+          "and_then": []
+        },
+        {
+          "name": "Cancellation during polling",
+          "when": "context cancelled in polling mode",
+          "then": "polling exits cleanly",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-012",
+      "description": "All 12 SSE event type constants SHALL be defined matching the README specification",
+      "priority": "SHALL",
+      "rationale": "Type constants prevent typos and enable compile-time checking by consumers",
+      "scenarios": [
+        {
+          "name": "All event types defined",
+          "when": "the event type constants are inspected",
+          "then": "all 12 types exist: peer_added, peer_removed, peer_key_rotated, peer_endpoint_changed, policy_updated, action_request, session_revoked, ssh_session_setup, rotate_keys, signing_key_rotated, node_state_updated, node_secrets_updated",
+          "and_then": []
+        },
+        {
+          "name": "Constants match exact string values",
+          "when": "each constant is compared to its string value",
+          "then": "they match exactly (e.g. EventPeerAdded == \"peer_added\")",
+          "and_then": []
+        },
+        {
+          "name": "Unknown event type is handled gracefully",
+          "when": "an event with unrecognized type arrives",
+          "then": "it is logged and discarded without error",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/api/types.go — Define all request/response structs for the 17 API endpoints: RegisterRequest, RegisterResponse, HeartbeatRequest, HeartbeatResponse, StateResponse (with Peer, Policy, SigningKeys, DataEntry, SecretRef sub-types), DriftReport, SecretResponse, ReportSyncRequest, ExecutionAck, ExecutionResult, MetricBatch, LogBatch, AuditBatch, CapabilitiesPayload, EndpointReport, EndpointResponse, KeyRotateRequest, KeyRotateResponse. All types must use json struct tags matching the README API reference exactly. Include unit tests verifying JSON marshalling/unmarshalling roundtrips for each type. (REQ-001)",
+    "1.2 Create internal/api/errors.go — Define structured error types: APIError (base), ErrUnauthorized (401), ErrForbidden (403), ErrNotFound (404), ErrConflict (409), ErrRateLimit (429 with RetryAfter duration parsed from Retry-After header), ErrPayloadTooLarge (413), ErrBadRequest (400), ErrServer (5xx). Implement errors.Is/errors.As support via Is() and As() methods. Implement errorFromResponse(resp *http.Response) error factory function. Include tests for each error mapping and for errors.Is/errors.As behavior. (REQ-002)",
+    "1.3 Create internal/api/config.go — Define Config struct with fields: BaseURL string, TLSInsecureSkipVerify bool, ConnectTimeout/RequestTimeout/SSEIdleTimeout time.Duration. Implement ApplyDefaults() to set ConnectTimeout=10s, RequestTimeout=30s, SSEIdleTimeout=90s when zero. Implement Validate() returning error if BaseURL is empty. Note: no file I/O in this package — config loading is the caller's responsibility. Include tests for defaults and validation. (REQ-010)",
+    "1.4 Create internal/api/client.go — Implement ControlPlane struct with: *http.Client (configured from Config including TLS and timeouts), baseURL, authToken (sync.RWMutex-protected). Implement NewControlPlane(cfg Config, logger) constructor. Implement SetAuthToken(token string). Implement private doRequest(ctx, method, path, body, response) helper that: sets Authorization Bearer header, sets User-Agent, applies gzip compression for bodies >1KiB, sends Accept-Encoding: gzip, handles gzip response decompression, calls errorFromResponse for non-2xx. Include tests using httptest.Server for auth header injection, gzip compression/decompression, and error propagation. (REQ-001, REQ-002, REQ-009, REQ-010)",
+    "1.5 Create internal/api/endpoints.go — Implement all 17 typed endpoint methods on ControlPlane: Register(ctx, req) (RegisterResponse, error), Heartbeat(ctx, nodeID, req), FetchState(ctx, nodeID), ReportDrift(ctx, nodeID, req), FetchSecret(ctx, nodeID, key), SyncReports(ctx, nodeID, req), AckExecution(ctx, nodeID, execID, req), ReportResult(ctx, nodeID, execID, req), ReportMetrics(ctx, nodeID, batch), ReportLogs(ctx, nodeID, batch), ReportAudit(ctx, nodeID, batch), UpdateCapabilities(ctx, nodeID, caps), ReportEndpoint(ctx, nodeID, req), RotateKeys(ctx, req), Deregister(ctx, nodeID), FetchArtifact(ctx, version, os, arch) (io.ReadCloser, error), ConnectSSE(ctx, nodeID, lastEventID) (*http.Response, error). Each method delegates to doRequest. Include httptest.Server tests for all 17 endpoints covering request body, path, and response parsing. (REQ-001)",
+    "2.1 Create internal/api/envelope.go — Define SignedEnvelope struct: EventType string, EventID string, IssuedAt time.Time, Nonce string, Payload json.RawMessage, Signature string (all json-tagged). Define EventVerifier interface: Verify(ctx context.Context, envelope SignedEnvelope) error. Implement NoOpVerifier that returns nil. Define all 12 event type constants (EventPeerAdded, EventPeerRemoved, etc.). Implement ParseEnvelope(data []byte) (SignedEnvelope, error) with validation for required fields. Include tests for parsing valid/invalid envelopes, NoOpVerifier, and constant values. (REQ-007, REQ-012)",
+    "2.2 Create internal/api/dispatcher.go — Implement EventDispatcher struct with handler registry (map[string][]EventHandler protected by sync.RWMutex). Define EventHandler type: func(ctx context.Context, envelope SignedEnvelope) error. Implement Register(eventType string, handler EventHandler). Implement Dispatch(ctx context.Context, envelope SignedEnvelope) error that invokes all handlers for the event type sequentially, logging handler errors but continuing. Log unhandled event types at debug. Include tests for single handler dispatch, multiple handlers, error isolation between handlers, and unhandled events. (REQ-008)",
+    "2.3 Create internal/api/sse.go — Implement SSEParser struct that reads from a bufio.Scanner and emits SSEEvent structs (Type, Data, ID string). Parse event:, data:, id:, retry: fields per W3C spec. Handle multi-line data (concatenate with \\n). Ignore comment lines (: prefix). Track Last-Event-ID. Support retry field callback. Implement SSEStream struct wrapping the parser + ControlPlane.ConnectSSE: Start(ctx) connects, reads events, parses envelopes via ParseEnvelope, passes to EventVerifier, then dispatches via EventDispatcher. SSE idle timeout (from config) triggers reconnect. Include httptest.Server tests for single events, multi-line data, comments, retry, and context cancellation. (REQ-003, REQ-004, REQ-011)",
+    "2.4 Create internal/api/reconnect.go — Implement ReconnectEngine struct with: base interval (default 1s, overridable by SSE retry field), multiplier (2x), cap (60s), jitter (±25%), failure duration tracker, polling fallback threshold (5 min). Define FailureClassifier that categorizes errors into: RetryTransient (network, 5xx — use backoff), RetryAuth (401 — invoke OnAuthFailure callback, pause), RespectServer (429 — use Retry-After), Permanent (403, 404 — stop). Implement Run(ctx, connectFn, pollFn) that manages the state machine: Connecting → Connected | Backoff, Backoff → Connecting | Polling, Polling → Connecting, with context cancellation at all states. Include tests with fake clock for backoff sequence, jitter range, failure classification, polling fallback timing, and context cancellation. (REQ-005, REQ-006, REQ-011)",
+    "3.1 Create internal/api/manager.go — Implement SSEManager as the top-level orchestrator that wires SSEStream, ReconnectEngine, EventVerifier, and EventDispatcher together. Expose Start(ctx, nodeID) error for the main agent to call. Expose RegisterHandler(eventType, handler) for features to register handlers before Start. Expose Shutdown() for graceful cleanup. Include an integration-style test using httptest.Server that: starts SSE stream, delivers events, verifies dispatch, simulates disconnect, verifies reconnection with Last-Event-ID, simulates 5-min failure, verifies polling fallback, and verifies shutdown. (REQ-001 through REQ-012)",
+    "4.1 Create docs/reference/backend/control-plane-client.md — Reference documentation for the internal/api package: Config struct fields and defaults, ControlPlane constructor and methods, error types and usage patterns, SSEManager lifecycle, EventDispatcher handler registration, EventVerifier interface, event type constants. Include code examples for constructing the client, making API calls, and registering event handlers. (REQ-001 through REQ-012)",
+    "4.2 Create docs/reference/backend/api-types.md — Reference documentation for all request/response types: field names, types, JSON tags, validation rules. Organized by API endpoint group (Registration, Heartbeat, State, Secrets, Reports, Executions, Observability, Artifacts, SSE). Include the signed envelope schema and event type listing. (REQ-001, REQ-007, REQ-012)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/api/client_test.go",
+      "test_function": "TestRegister_Success",
+      "story": "plexd can make authenticated HTTPS API calls to the control plane",
+      "expected": "POST /v1/register with correct JSON body returns typed RegisterResponse with node_id, mesh_ip, peers",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/api/client_test.go",
+      "test_function": "TestRegister_UsesBootstrapToken",
+      "story": "plexd can make authenticated HTTPS API calls to the control plane",
+      "expected": "Register() uses the bootstrap token in Authorization header, not the node identity token",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/api/client_test.go",
+      "test_function": "TestHeartbeat_ParsesReconcileFlag",
+      "story": "plexd can make authenticated HTTPS API calls to the control plane",
+      "expected": "Heartbeat correctly parses 200 OK response with reconcile: true flag",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/api/client_test.go",
+      "test_function": "TestFetchState_ReturnsFullState",
+      "story": "plexd can make authenticated HTTPS API calls to the control plane",
+      "expected": "GET /v1/nodes/{id}/state returns StateResponse with peers, policies, signing_keys, metadata, data, secret_refs",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/api/client_test.go",
+      "test_function": "TestFetchArtifact_ReturnsBinaryStream",
+      "story": "plexd can make authenticated HTTPS API calls to the control plane",
+      "expected": "GET /v1/artifacts/plexd/{v}/{os}/{arch} returns io.ReadCloser with binary content",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/api/errors_test.go",
+      "test_function": "TestErrorMapping_401_ErrUnauthorized",
+      "story": "plexd maps HTTP errors to structured error types",
+      "expected": "HTTP 401 response maps to error satisfying errors.Is(err, ErrUnauthorized)",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/api/errors_test.go",
+      "test_function": "TestErrorMapping_429_ErrRateLimitWithRetryAfter",
+      "story": "plexd maps HTTP errors to structured error types",
+      "expected": "HTTP 429 with Retry-After header maps to ErrRateLimit with correct RetryAfter duration",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/api/errors_test.go",
+      "test_function": "TestErrorMapping_5xx_ErrServer",
+      "story": "plexd maps HTTP errors to structured error types",
+      "expected": "HTTP 500/502/503/504 map to error satisfying errors.Is(err, ErrServer)",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/api/errors_test.go",
+      "test_function": "TestErrorMapping_UnknownStatus_APIError",
+      "story": "plexd maps HTTP errors to structured error types",
+      "expected": "Unknown 4xx status returns generic APIError with StatusCode and body",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/api/sse_test.go",
+      "test_function": "TestSSEParser_SingleLineEvent",
+      "story": "plexd receives real-time events from the control plane via SSE",
+      "expected": "Parses event: type, data: payload, id: id correctly from single-line event",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/api/sse_test.go",
+      "test_function": "TestSSEParser_MultiLineData",
+      "story": "plexd receives real-time events from the control plane via SSE",
+      "expected": "Multiple data: lines are concatenated with newline separators",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/api/sse_test.go",
+      "test_function": "TestSSEParser_CommentLinesIgnored",
+      "story": "plexd receives real-time events from the control plane via SSE",
+      "expected": "Lines starting with : are treated as keepalives and produce no events",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/api/sse_test.go",
+      "test_function": "TestSSEParser_RetryFieldUpdatesInterval",
+      "story": "plexd receives real-time events from the control plane via SSE",
+      "expected": "retry: 5000 field updates the base reconnection interval to 5s",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/api/sse_test.go",
+      "test_function": "TestSSE_LastEventIDSentOnReconnect",
+      "story": "plexd receives real-time events from the control plane via SSE",
+      "expected": "Reconnection request includes Last-Event-ID header from last received event",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/api/sse_test.go",
+      "test_function": "TestSSE_NoLastEventIDOnFirstConnect",
+      "story": "plexd receives real-time events from the control plane via SSE",
+      "expected": "First connection does not include Last-Event-ID header",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/api/reconnect_test.go",
+      "test_function": "TestReconnect_ExponentialBackoff",
+      "story": "plexd reconnects to SSE with exponential backoff and falls back to polling",
+      "expected": "Consecutive failures produce delays of ~1s, ~2s, ~4s, ~8s with jitter, capped at 60s",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/api/reconnect_test.go",
+      "test_function": "TestReconnect_JitterDistribution",
+      "story": "plexd reconnects to SSE with exponential backoff and falls back to polling",
+      "expected": "Jitter produces values within ±25% of the base backoff",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/api/reconnect_test.go",
+      "test_function": "TestReconnect_401TriggersAuthCallback",
+      "story": "plexd reconnects to SSE with exponential backoff and falls back to polling",
+      "expected": "HTTP 401 from SSE endpoint invokes OnAuthFailure callback instead of backoff",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/api/reconnect_test.go",
+      "test_function": "TestReconnect_429RespectsRetryAfter",
+      "story": "plexd reconnects to SSE with exponential backoff and falls back to polling",
+      "expected": "HTTP 429 with Retry-After header overrides calculated backoff delay",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/api/reconnect_test.go",
+      "test_function": "TestReconnect_PollingFallbackAfter5Min",
+      "story": "plexd reconnects to SSE with exponential backoff and falls back to polling",
+      "expected": "After 5 minutes continuous SSE failure, switches to polling mode calling FetchState",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/api/reconnect_test.go",
+      "test_function": "TestReconnect_SSERetryFromPolling",
+      "story": "plexd reconnects to SSE with exponential backoff and falls back to polling",
+      "expected": "In polling mode, periodically retries SSE; success exits polling mode",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/api/envelope_test.go",
+      "test_function": "TestSignedEnvelope_ParseValid",
+      "story": "plexd parses and verifies signed event envelopes before dispatching",
+      "expected": "Valid JSON envelope deserializes all fields; payload stored as json.RawMessage",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/api/envelope_test.go",
+      "test_function": "TestSignedEnvelope_MissingField",
+      "story": "plexd parses and verifies signed event envelopes before dispatching",
+      "expected": "Missing event_type or event_id returns descriptive parse error",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/api/envelope_test.go",
+      "test_function": "TestNoOpVerifier_AcceptsAll",
+      "story": "plexd parses and verifies signed event envelopes before dispatching",
+      "expected": "NoOpVerifier.Verify() returns nil for any envelope",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/api/dispatcher_test.go",
+      "test_function": "TestDispatcher_RoutesToHandler",
+      "story": "plexd dispatches verified events to registered handlers by event type",
+      "expected": "Registered handler for peer_added is invoked when peer_added event dispatched",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/api/dispatcher_test.go",
+      "test_function": "TestDispatcher_MultipleHandlers",
+      "story": "plexd dispatches verified events to registered handlers by event type",
+      "expected": "Two handlers registered for same type are both invoked; first failure doesn't block second",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/api/dispatcher_test.go",
+      "test_function": "TestDispatcher_UnhandledEventLogged",
+      "story": "plexd dispatches verified events to registered handlers by event type",
+      "expected": "Event with no registered handler is logged at debug and discarded",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/api/client_test.go",
+      "test_function": "TestClient_GzipCompression",
+      "story": "plexd can make authenticated HTTPS API calls to the control plane",
+      "expected": "Request bodies over 1 KiB are gzip-compressed; small bodies are not",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/api/client_test.go",
+      "test_function": "TestClient_GzipResponseDecompression",
+      "story": "plexd can make authenticated HTTPS API calls to the control plane",
+      "expected": "Gzip-encoded responses are transparently decompressed",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/api/config_test.go",
+      "test_function": "TestConfig_Defaults",
+      "story": "plexd loads API client configuration from config file, env vars, and flags",
+      "expected": "Config with only BaseURL uses default timeouts and TLS verification",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/api/config_test.go",
+      "test_function": "TestConfig_TLSInsecureLogsWarning",
+      "story": "plexd loads API client configuration from config file, env vars, and flags",
+      "expected": "TLSInsecureSkipVerify=true results in warning log and InsecureSkipVerify on transport",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/api/sse_test.go",
+      "test_function": "TestSSE_GracefulShutdownOnContextCancel",
+      "story": "SSE connection errors do not cause the plexd process to crash",
+      "expected": "Context cancellation closes HTTP body, exits goroutines, no leaks",
+      "requirement_id": "REQ-011"
+    },
+    {
+      "test_file": "internal/api/reconnect_test.go",
+      "test_function": "TestReconnect_CancelDuringBackoff",
+      "story": "SSE connection errors do not cause the plexd process to crash",
+      "expected": "Context cancellation during backoff timer stops immediately and returns",
+      "requirement_id": "REQ-011"
+    },
+    {
+      "test_file": "internal/api/sse_test.go",
+      "test_function": "TestSSE_MalformedDataSkipped",
+      "story": "SSE connection errors do not cause the plexd process to crash",
+      "expected": "Invalid JSON in data field is logged and skipped without disconnecting the stream",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/api/envelope_test.go",
+      "test_function": "TestEventTypeConstants",
+      "story": "plexd parses and verifies signed event envelopes before dispatching",
+      "expected": "All 12 event type constants are defined and match their string values",
+      "requirement_id": "REQ-012"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-012) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "All 17 API endpoint methods match the README API reference exactly (paths, methods, request/response schemas)",
+    "All 12 SSE event type constants match the README specification",
+    "Error types support errors.Is/errors.As correctly for all defined HTTP status code mappings",
+    "SSE parser handles W3C edge cases: multi-line data, comment keepalives, retry field, empty event names",
+    "ReconnectEngine failure classification correctly differentiates transient (backoff), auth (callback), rate-limit (Retry-After), and permanent (stop) failures",
+    "Polling fallback activates after 5 minutes continuous SSE failure and periodically retries SSE",
+    "All goroutines are properly tracked and drained on context cancellation (no leaks verified via goleak or equivalent)",
+    "No file I/O in internal/api/ — Config is passed as struct, no YAML/env parsing in the package",
+    "Thread-safety: auth token changes via SetAuthToken are protected by sync.RWMutex; EventDispatcher handler registry is RWMutex-protected",
+    "gzip compression applied for request bodies >1KiB; gzip responses decompressed transparently",
+    "Reference documentation covers all public types, methods, and usage patterns (docs/reference/backend/)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All code lives in `internal/api/` per the README project structure. No sub-packages — keep it flat since all components are tightly related.\n\n2. **Config separation**: The `Config` struct is defined in `internal/api/config.go` but contains no file I/O. Config loading from YAML/env/flags will be handled by `internal/agent/` or `cmd/plexd/` when those packages are created in later features. The `ControlPlane` client accepts `Config` as a constructor argument.\n\n3. **Auth token management**: The auth token is stored behind `sync.RWMutex` because it changes after registration (bootstrap token → node identity token). `SetAuthToken()` is the only mutation point.\n\n4. **Gzip strategy**: Use `compress/gzip` from stdlib. Compress request bodies >1KiB with `Content-Encoding: gzip`. Always send `Accept-Encoding: gzip` and check `Content-Encoding` on responses. The Go http.Transport handles gzip decompression automatically when `DisableCompression` is false (default), but we set the header explicitly to be safe.\n\n5. **SSE parser**: Hand-rolled per W3C spec using `bufio.Scanner`. Rationale: avoids external dependency (the devils_advocate_report raises this but the scope description explicitly states line-by-line parsing). Handle CR, LF, and CRLF line endings. Store state between lines to accumulate multi-line data fields.\n\n6. **ReconnectEngine design**: Uses an injectable `connectFn` and `pollFn` for testability. A `FailureClassifier` function categorizes errors. A fake `clock` interface enables deterministic testing of backoff timing without real sleeps. State machine: Disconnected → Connecting → Connected | Backoff → Polling, with context cancellation checked at every transition.\n\n7. **Logging**: Accept a `*slog.Logger` in constructors. Use structured logging with consistent keys: `component`, `event_type`, `event_id`, `status_code`, `backoff_duration`, `attempt`.\n\n8. **Testing strategy**: All tests use `httptest.Server` for HTTP assertions. SSE tests use a custom `httptest.Server` handler that writes SSE-formatted responses. Reconnect tests use a fake clock to avoid real sleeps. Dispatcher tests use function closures to capture invocations.\n\n9. **Devils advocate mitigations incorporated**: (a) Failure classification in ReconnectEngine per challenge #5. (b) Config struct as constructor arg per challenge #6. (c) However, we implement all 17 endpoints as specified in scope — the elaboration explicitly includes them and they're needed for type definitions even if some callers come later. (d) EventVerifier interface is minimal (single Verify method) — if S010 needs async verification, the interface can be adapted.\n\n10. **Key files from README project structure**: `internal/api/` is the designated location. `cmd/plexd/` and `internal/agent/` will be created by later features.\n\n11. **Go module**: Will need `go mod init github.com/plexsphere/plexd` and Go 1.22+ per README prerequisites.\n\n12. **Potential pitfalls**: (a) SSE idle timeout must be longer than the server's keepalive interval — default 90s should be safe if server sends keepalives every 30-60s. (b) gzip compression for small payloads can increase size — threshold of 1KiB avoids this. (c) json.RawMessage in SignedEnvelope.Payload allows deferred parsing per event type, avoiding a generic interface{}.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.103985"
+    },
+    "elaborated": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T21:32:08.213849"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T21:38:14.524982"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T21:44:22.527755"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "b327d301-9b52-4cca-8ca1-cb6cfaef9d10",
+      "timestamp": "2026-02-11T21:44:22.527796",
+      "total_duration": 363.6922838687897,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 363.6922838687897,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
