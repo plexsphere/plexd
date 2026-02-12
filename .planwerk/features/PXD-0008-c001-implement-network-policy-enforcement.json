@@ -1,0 +1,616 @@
+{
+  "feature_id": "PXD-0008",
+  "title": "C001: Implement network policy enforcement",
+  "slug": "c001-implement-network-policy-enforcement",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Receive network policies from the control plane and enforce them locally. Implement two enforcement mechanisms: peer visibility filtering (controlling which peers a node can see and connect to) and firewall rules (controlling traffic flow between peers). Policies are reconciled as part of the configuration loop.",
+  "stories": [
+    {
+      "title": "plexd enforces peer visibility filtering from network policies",
+      "role": "plexd agent",
+      "want": "to filter the peer list during reconciliation based on network policies received from the control plane, so that only peers explicitly allowed by policy are configured in WireGuard",
+      "so_that": "nodes cannot see or connect to unauthorized peers, enforcing network segmentation as defined by the control plane",
+      "criteria": [
+        "PolicyEngine.FilterPeers(peers []api.Peer, policies []api.Policy) returns only peers whose mesh IPs are allowed by at least one policy rule with Action=allow",
+        "Peers not matched by any allow rule are excluded from the WireGuard configuration (not added or actively removed)",
+        "When policies change (detected via reconcile diff PoliciesToAdd/PoliciesToRemove), the full peer list is re-evaluated against the new policy set",
+        "An empty policy set results in no peers being visible (deny-by-default)",
+        "Peers that were previously configured in WireGuard but are no longer allowed by updated policies are removed via wireguard.Manager.RemovePeerByID"
+      ]
+    },
+    {
+      "title": "plexd applies firewall rules from network policies to control traffic between peers",
+      "role": "plexd agent",
+      "want": "to translate network policy rules into local firewall rules (nftables) controlling traffic flow between mesh peers on the WireGuard interface",
+      "so_that": "traffic between peers is restricted to only the ports and protocols explicitly allowed by policy, providing defense-in-depth beyond peer visibility",
+      "criteria": [
+        "FirewallController interface abstracts OS-level firewall operations (AddRule, RemoveRule, FlushChain, ListRules) for testability",
+        "PolicyRule fields (Src, Dst, Port, Protocol, Action) are translated to nftables-style rules applied on the WireGuard interface",
+        "Rules are scoped to the WireGuard interface (Config.InterfaceName) — no rules are applied to other interfaces",
+        "A default-deny rule drops all traffic on the WireGuard interface that is not explicitly allowed by policy",
+        "Rules for the node's own mesh IP are applied — both inbound (where this node is Dst) and outbound (where this node is Src)"
+      ]
+    },
+    {
+      "title": "plexd reconciles network policies as part of the configuration loop",
+      "role": "plexd agent",
+      "want": "to reconcile network policies from the control plane during the standard reconciliation cycle, detecting policy additions and removals and applying them to both peer visibility and firewall rules",
+      "so_that": "policy changes are enforced automatically and continuously, even after missed SSE events or agent restarts",
+      "criteria": [
+        "A reconcile.ReconcileHandler for network policy enforcement is registered with the Reconciler",
+        "The handler receives the full desired state (including policies and peers) and the StateDiff (PoliciesToAdd, PoliciesToRemove)",
+        "When policies change, both peer visibility (WireGuard peer list) and firewall rules are recomputed",
+        "The handler processes in order: update firewall rules first, then filter/update peer visibility",
+        "If the firewall rule update fails, an error is returned (preventing snapshot update) so the reconciler retries"
+      ]
+    },
+    {
+      "title": "plexd handles policy_updated SSE events for real-time policy enforcement",
+      "role": "plexd agent",
+      "want": "to receive policy_updated SSE events from the control plane and trigger immediate policy re-evaluation without waiting for the next reconciliation cycle",
+      "so_that": "policy changes take effect in sub-second time when the SSE connection is active",
+      "criteria": [
+        "An EventHandler for EventPolicyUpdated is registered with the SSEManager",
+        "The SSE handler triggers reconciler.TriggerReconcile() to force an immediate reconciliation cycle",
+        "The handler does NOT apply policies directly — it delegates to the reconcile loop for consistency",
+        "Malformed policy_updated payloads are logged at error level and do not crash the agent",
+        "Multiple rapid policy_updated events are coalesced by the reconciler's trigger mechanism"
+      ]
+    },
+    {
+      "title": "plexd handles edge cases in policy enforcement gracefully",
+      "role": "plexd agent",
+      "want": "to handle edge cases like empty policies, wildcard rules, overlapping rules, and self-referencing rules without errors",
+      "so_that": "policy enforcement is robust and predictable under all conditions",
+      "criteria": [
+        "Empty policy list (no policies) results in deny-all: no peers visible, default-deny firewall rule active",
+        "A rule with Src='*' or Dst='*' matches all mesh IPs in the respective direction",
+        "Overlapping rules (same src/dst but different ports) are all applied — most specific match is not needed since nftables evaluates all rules",
+        "Rules where Src and Dst are the same peer are applied without error (loopback policy)",
+        "Policies with no rules are treated as no-op (they don't grant any access)"
+      ]
+    },
+    {
+      "title": "Platform operator can configure network policy enforcement",
+      "role": "platform operator",
+      "want": "to configure policy enforcement parameters: enable/disable, WireGuard interface name (from wireguard.Config), and firewall chain name",
+      "so_that": "policy enforcement can be tuned for different deployment environments or disabled entirely",
+      "criteria": [
+        "Config struct has Enabled bool (default: true), ChainName string (default: 'plexd-mesh'), and references wireguard.Config.InterfaceName for interface scoping",
+        "When Enabled is false, the reconcile handler passes through all peers unfiltered and no firewall rules are applied",
+        "Config.Validate rejects empty ChainName when Enabled is true",
+        "Config.ApplyDefaults sets Enabled=true and ChainName='plexd-mesh' on zero-valued Config"
+      ]
+    },
+    {
+      "title": "Network policy enforcement errors do not crash the agent",
+      "role": "platform operator",
+      "want": "all policy enforcement errors to be handled gracefully with logging rather than panics",
+      "so_that": "plexd remains operational even when firewall operations fail or policies contain invalid data",
+      "criteria": [
+        "Firewall rule application failures are logged at error level and collected; the reconcile handler returns an aggregated error",
+        "Invalid policy rules (unknown protocol, negative port) are logged at warn level and skipped",
+        "Peer removal failures during visibility filtering are logged at error level but do not block processing of other peers",
+        "If the firewall controller is unavailable (e.g., nftables not installed), an error is returned and logged by the reconciler"
+      ]
+    },
+    {
+      "title": "Reference documentation for network policy enforcement",
+      "role": "developer",
+      "want": "comprehensive reference documentation for the internal/policy package",
+      "so_that": "future developers understand the PolicyEngine, FirewallController, reconcile handler integration, and data flow",
+      "criteria": [
+        "Documentation covers Config, PolicyEngine, FirewallController interface, and ReconcileHandler",
+        "Documentation includes data flow: control plane → policies → peer visibility filtering + firewall rules → WireGuard",
+        "Documentation references related packages: internal/wireguard, internal/reconcile, internal/api",
+        "Documentation is placed at docs/reference/backend/network-policy.md"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The policy package SHALL provide a PolicyEngine struct that evaluates network policies to determine peer visibility and firewall rules",
+      "priority": "SHALL",
+      "rationale": "A central policy evaluation engine is needed to determine which peers are visible and which traffic flows are allowed, separate from the enforcement mechanisms",
+      "scenarios": [
+        {
+          "name": "FilterPeers returns only allowed peers",
+          "when": "PolicyEngine.FilterPeers is called with a list of peers and policies containing allow rules matching some peer mesh IPs",
+          "then": "only peers whose mesh IPs match at least one allow rule are returned",
+          "and_then": [
+            "peers not matching any allow rule are excluded"
+          ]
+        },
+        {
+          "name": "Empty policy set denies all peers",
+          "when": "PolicyEngine.FilterPeers is called with an empty policy list",
+          "then": "an empty peer list is returned (deny-by-default)",
+          "and_then": []
+        },
+        {
+          "name": "Wildcard source matches all peers",
+          "when": "a policy rule has Src='*' and Action='allow'",
+          "then": "all peers are allowed as traffic sources for the specified Dst, Port, and Protocol",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The policy package SHALL compute firewall rules from network policies for traffic enforcement on the WireGuard interface",
+      "priority": "SHALL",
+      "rationale": "Peer visibility filtering alone is not sufficient — firewall rules provide defense-in-depth by controlling traffic flow at the port/protocol level",
+      "scenarios": [
+        {
+          "name": "Policy rules translated to firewall rules",
+          "when": "PolicyEngine.ComputeFirewallRules is called with policies and the node's mesh IP",
+          "then": "each matching PolicyRule is translated to a FirewallRule with interface, source IP, destination IP, port, protocol, and action",
+          "and_then": [
+            "only rules relevant to this node (Src or Dst matching node's mesh IP, or wildcard) are included"
+          ]
+        },
+        {
+          "name": "Default deny rule appended",
+          "when": "firewall rules are computed",
+          "then": "a default deny rule dropping all traffic on the WireGuard interface is appended as the last rule",
+          "and_then": []
+        },
+        {
+          "name": "Rules for unknown protocols are skipped",
+          "when": "a PolicyRule has an unrecognized Protocol value",
+          "then": "the rule is logged at warn level and skipped",
+          "and_then": [
+            "other valid rules are still processed"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The policy package SHALL provide a FirewallController interface abstracting OS-level firewall operations for testability",
+      "priority": "SHALL",
+      "rationale": "Abstracting firewall operations behind an interface enables unit testing without root privileges or nftables installed, following the same pattern as wireguard.WGController",
+      "scenarios": [
+        {
+          "name": "Apply rules via FirewallController",
+          "when": "the Enforcer calls FirewallController.ApplyRules with a set of FirewallRules",
+          "then": "the controller flushes the existing chain and applies the new rules atomically",
+          "and_then": []
+        },
+        {
+          "name": "Delete chain on teardown",
+          "when": "Enforcer.Teardown is called",
+          "then": "FirewallController.DeleteChain removes the plexd-mesh chain",
+          "and_then": [
+            "DeleteChain is idempotent — deleting a non-existent chain returns nil"
+          ]
+        },
+        {
+          "name": "FirewallController failure returns error",
+          "when": "a firewall operation fails (e.g., nftables not available)",
+          "then": "the error is returned to the caller for logging and retry",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The policy package SHALL provide a reconcile.ReconcileHandler that enforces network policies when drift is detected",
+      "priority": "SHALL",
+      "rationale": "Integration with the existing reconciliation loop ensures policies are enforced continuously and self-heal after drift",
+      "scenarios": [
+        {
+          "name": "Policy changes trigger re-evaluation",
+          "when": "the reconcile handler is invoked with a StateDiff containing PoliciesToAdd or PoliciesToRemove",
+          "then": "firewall rules are recomputed from the full desired policy set and applied via FirewallController, and the peer list is re-filtered",
+          "and_then": [
+            "peers no longer allowed are removed via wireguard.Manager.RemovePeerByID",
+            "newly allowed peers are added via wireguard.Manager.AddPeer"
+          ]
+        },
+        {
+          "name": "Peer changes with existing policies",
+          "when": "the reconcile handler is invoked with PeersToAdd but no policy changes",
+          "then": "new peers are filtered against existing policies before being added to WireGuard",
+          "and_then": [
+            "peers not allowed by policy are not added"
+          ]
+        },
+        {
+          "name": "No policy or peer drift skips enforcement",
+          "when": "the reconcile handler is invoked but the StateDiff has no policy or peer changes",
+          "then": "no firewall or peer visibility changes are made",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The policy package SHALL handle the policy_updated SSE event by triggering an immediate reconciliation cycle",
+      "priority": "SHALL",
+      "rationale": "SSE events provide real-time policy updates without waiting for the next reconciliation interval",
+      "scenarios": [
+        {
+          "name": "policy_updated triggers reconcile",
+          "when": "a policy_updated SSE event is received",
+          "then": "reconciler.TriggerReconcile() is called to force an immediate reconciliation cycle",
+          "and_then": [
+            "the reconcile cycle fetches the latest state including updated policies"
+          ]
+        },
+        {
+          "name": "Multiple rapid policy_updated events coalesced",
+          "when": "multiple policy_updated SSE events arrive in rapid succession",
+          "then": "the reconciler coalesces them into a single extra cycle",
+          "and_then": []
+        },
+        {
+          "name": "Malformed policy_updated event handled",
+          "when": "a policy_updated SSE event has invalid payload",
+          "then": "an error is logged and TriggerReconcile is still called (state is fetched from control plane, not from the event payload)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The policy package SHALL use structured logging with log/slog and component=policy",
+      "priority": "SHALL",
+      "rationale": "Operational consistency with existing internal packages (api, wireguard, nat, reconcile) logging patterns",
+      "scenarios": [
+        {
+          "name": "Policy enforcement logged",
+          "when": "firewall rules are applied during reconciliation",
+          "then": "info log with component=policy, rule_count, peer_count",
+          "and_then": []
+        },
+        {
+          "name": "Peer filtered out logged",
+          "when": "a peer is excluded by policy",
+          "then": "debug log with component=policy, peer_id, reason='denied_by_policy'",
+          "and_then": []
+        },
+        {
+          "name": "Invalid rule logged",
+          "when": "a policy rule has invalid protocol or port",
+          "then": "warn log with component=policy, policy_id, rule details, reason",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The policy Config SHALL follow the established Config pattern with ApplyDefaults and Validate methods",
+      "priority": "SHALL",
+      "rationale": "Consistency with wireguard.Config, nat.Config, reconcile.Config patterns in the codebase",
+      "scenarios": [
+        {
+          "name": "Zero-valued config gets defaults",
+          "when": "Config.ApplyDefaults is called on a zero-valued Config",
+          "then": "Enabled is set to true, ChainName is set to 'plexd-mesh'",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects empty chain name when enabled",
+          "when": "Config.Validate is called with Enabled=true and empty ChainName",
+          "then": "an error is returned: 'policy: config: ChainName must not be empty when enabled'",
+          "and_then": []
+        },
+        {
+          "name": "Disabled config passes validation",
+          "when": "Config.Validate is called with Enabled=false",
+          "then": "nil is returned regardless of other field values",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The policy package SHALL enforce deny-by-default semantics for both peer visibility and firewall rules",
+      "priority": "SHALL",
+      "rationale": "Security best practice — no access is granted unless explicitly allowed by policy",
+      "scenarios": [
+        {
+          "name": "No policies means no access",
+          "when": "the desired state contains peers but no policies",
+          "then": "no peers are visible in WireGuard and a default-deny firewall rule is active",
+          "and_then": []
+        },
+        {
+          "name": "Policy with only deny rules",
+          "when": "all policy rules have Action='deny'",
+          "then": "no peers are visible (allow rules are needed to grant visibility) and only deny firewall rules plus default-deny are active",
+          "and_then": []
+        },
+        {
+          "name": "Removed policy revokes access",
+          "when": "a policy that previously allowed peer A is removed",
+          "then": "peer A is removed from WireGuard and its firewall allow rules are deleted",
+          "and_then": [
+            "the default-deny rule remains active"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The policy Enforcer SHALL support graceful teardown, removing all firewall rules on shutdown",
+      "priority": "SHALL",
+      "rationale": "Clean shutdown prevents orphaned firewall rules that could block traffic after agent restart or removal",
+      "scenarios": [
+        {
+          "name": "Teardown removes firewall chain",
+          "when": "Enforcer.Teardown is called",
+          "then": "FirewallController.DeleteChain is called to remove the plexd-mesh chain",
+          "and_then": [
+            "all rules within the chain are removed"
+          ]
+        },
+        {
+          "name": "Teardown is idempotent",
+          "when": "Teardown is called when no chain exists",
+          "then": "no error is returned",
+          "and_then": []
+        },
+        {
+          "name": "Teardown failure is logged",
+          "when": "DeleteChain fails",
+          "then": "the error is returned for the caller to log",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The policy package SHALL correctly handle wildcard source and destination in policy rules",
+      "priority": "SHALL",
+      "rationale": "Wildcards enable broad policies like 'allow all peers to reach port 443 on this node' without listing every peer IP",
+      "scenarios": [
+        {
+          "name": "Wildcard source allows all sources",
+          "when": "a rule has Src='*', Dst=node's mesh IP, Port=443, Protocol=tcp, Action=allow",
+          "then": "all peers can reach port 443/tcp on this node; all peers are visible",
+          "and_then": []
+        },
+        {
+          "name": "Wildcard destination allows all destinations",
+          "when": "a rule has Src=node's mesh IP, Dst='*', Port=0, Protocol='*', Action=allow",
+          "then": "this node can reach all peers on all ports; all peers are visible",
+          "and_then": []
+        },
+        {
+          "name": "Port 0 means all ports",
+          "when": "a rule has Port=0",
+          "then": "the firewall rule matches all ports",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/policy/config.go — Define Config struct with Enabled bool and ChainName string. Implement ApplyDefaults() (Enabled=true, ChainName='plexd-mesh' on zero-valued Config) and Validate() (reject empty ChainName when enabled, pass when disabled). Follow the same Config pattern as internal/wireguard/config.go. Include tests in config_test.go for: defaults applied, validation errors, disabled passes, custom values respected. (REQ-007)",
+    "1.2 Create internal/policy/firewall.go — Define FirewallRule struct (Interface, SrcIP, DstIP, Port int, Protocol, Action string) and FirewallController interface (ApplyRules(chainName string, rules []FirewallRule) error, DeleteChain(chainName string) error). Include mock_firewall_test.go with mockFirewallController following the mockController pattern from internal/wireguard/mock_controller_test.go. (REQ-003)",
+    "1.3 Create internal/policy/engine.go — Define PolicyEngine struct with logger. Implement FilterPeers(nodeMeshIP string, peers []api.Peer, policies []api.Policy) []api.Peer that returns only peers allowed by at least one allow rule (deny-by-default). A peer is visible if its mesh IP appears as Src or Dst in an allow rule (considering wildcards '*'). Implement ComputeFirewallRules(nodeMeshIP string, interfaceName string, policies []api.Policy) []FirewallRule that translates policy rules relevant to this node into FirewallRules, appending a default-deny rule. Invalid protocols are logged and skipped. Port=0 matches all ports, Protocol='*' matches all protocols. Include comprehensive tests in engine_test.go. (REQ-001, REQ-002, REQ-008, REQ-010)",
+    "1.4 Create internal/policy/enforcer.go — Define Enforcer struct wrapping PolicyEngine, FirewallController, wireguard.Manager, Config, and logger. Implement ApplyPolicies(ctx context.Context, nodeMeshIP string, peers []api.Peer, policies []api.Policy) (allowedPeers []api.Peer, err error) that computes and applies firewall rules, then returns filtered peers. Implement Teardown() error that calls FirewallController.DeleteChain. When Config.Enabled=false, return all peers unfiltered. Include tests in enforcer_test.go. (REQ-003, REQ-008, REQ-009)",
+    "2.1 Create internal/policy/handler.go — Define ReconcileHandler(enforcer *Enforcer, wgMgr *wireguard.Manager, nodeMeshIP string) reconcile.ReconcileHandler. The handler: (1) checks if policy or peer changes exist in diff, (2) calls enforcer.ApplyPolicies with full desired state, (3) computes peer visibility diff (currently configured vs. newly allowed), (4) removes disallowed peers via wgMgr.RemovePeerByID, (5) adds newly allowed peers via wgMgr.AddPeer. Also define HandlePolicyUpdated(reconciler *reconcile.Reconciler) api.EventHandler that calls reconciler.TriggerReconcile() on policy_updated events. Include tests in handler_test.go. (REQ-004, REQ-005, REQ-006)",
+    "3.1 Create internal/policy/handler_integration_test.go — Integration tests wiring real PolicyEngine, mock FirewallController, mock WGController, and Reconciler. Tests: full policy enforcement flow (policies arrive → firewall rules applied → peers filtered → WireGuard updated), policy removal revokes access, SSE policy_updated triggers reconcile cycle, concurrent policy and peer changes do not race (run with -race). (REQ-004, REQ-005, REQ-008)",
+    "4.1 Create docs/reference/backend/network-policy.md — Reference documentation for internal/policy/ package: Config struct, PolicyEngine (FilterPeers, ComputeFirewallRules), FirewallController interface, Enforcer struct (ApplyPolicies, Teardown), ReconcileHandler, HandlePolicyUpdated SSE handler. Include data flow diagram: control plane → policies → PolicyEngine → peer visibility + firewall rules → WireGuard + nftables. Reference integration with internal/wireguard, internal/reconcile, internal/api. (REQ-001 through REQ-010)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/policy/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults",
+      "story": "Platform operator can configure network policy enforcement",
+      "expected": "Config.ApplyDefaults sets Enabled=true, ChainName='plexd-mesh' on zero-valued Config",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/policy/config_test.go",
+      "test_function": "TestConfig_Validate",
+      "story": "Platform operator can configure network policy enforcement",
+      "expected": "Config.Validate rejects empty ChainName when enabled, passes when disabled, passes with valid values",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/policy/engine_test.go",
+      "test_function": "TestFilterPeers_AllowedPeersOnly",
+      "story": "plexd enforces peer visibility filtering from network policies",
+      "expected": "FilterPeers returns only peers whose mesh IPs are allowed by policy rules",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/policy/engine_test.go",
+      "test_function": "TestFilterPeers_EmptyPoliciesDenyAll",
+      "story": "plexd enforces peer visibility filtering from network policies",
+      "expected": "FilterPeers with empty policy list returns empty peer list (deny-by-default)",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/policy/engine_test.go",
+      "test_function": "TestFilterPeers_WildcardSource",
+      "story": "plexd handles edge cases in policy enforcement gracefully",
+      "expected": "FilterPeers with Src='*' allows all peers as sources",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/policy/engine_test.go",
+      "test_function": "TestFilterPeers_WildcardDestination",
+      "story": "plexd handles edge cases in policy enforcement gracefully",
+      "expected": "FilterPeers with Dst='*' allows all peers as destinations",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/policy/engine_test.go",
+      "test_function": "TestFilterPeers_DenyOnlyRules",
+      "story": "plexd handles edge cases in policy enforcement gracefully",
+      "expected": "FilterPeers with only deny rules returns empty list (no allow = no visibility)",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/policy/engine_test.go",
+      "test_function": "TestComputeFirewallRules_BasicTranslation",
+      "story": "plexd applies firewall rules from network policies to control traffic between peers",
+      "expected": "PolicyRules are translated to FirewallRules with correct interface, IPs, port, protocol, action",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/policy/engine_test.go",
+      "test_function": "TestComputeFirewallRules_DefaultDenyAppended",
+      "story": "plexd applies firewall rules from network policies to control traffic between peers",
+      "expected": "A default deny rule is the last rule in the computed list",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/policy/engine_test.go",
+      "test_function": "TestComputeFirewallRules_InvalidProtocolSkipped",
+      "story": "Network policy enforcement errors do not crash the agent",
+      "expected": "Rules with unknown protocol are skipped with warning, valid rules still processed",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/policy/engine_test.go",
+      "test_function": "TestComputeFirewallRules_OnlyRelevantRules",
+      "story": "plexd applies firewall rules from network policies to control traffic between peers",
+      "expected": "Only rules where Src or Dst matches the node's mesh IP (or wildcard) are included",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/policy/engine_test.go",
+      "test_function": "TestComputeFirewallRules_PortZeroMatchesAll",
+      "story": "plexd handles edge cases in policy enforcement gracefully",
+      "expected": "Port=0 in a PolicyRule translates to a FirewallRule matching all ports",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/policy/enforcer_test.go",
+      "test_function": "TestEnforcer_ApplyPolicies",
+      "story": "plexd reconciles network policies as part of the configuration loop",
+      "expected": "Enforcer applies firewall rules via FirewallController and filters peers",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/policy/enforcer_test.go",
+      "test_function": "TestEnforcer_Teardown",
+      "story": "Network policy enforcement errors do not crash the agent",
+      "expected": "Teardown calls FirewallController.DeleteChain, idempotent on non-existent chain",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/policy/enforcer_test.go",
+      "test_function": "TestEnforcer_FirewallFailureReturnsError",
+      "story": "Network policy enforcement errors do not crash the agent",
+      "expected": "When FirewallController.ApplyRules fails, error is returned",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/policy/enforcer_test.go",
+      "test_function": "TestEnforcer_DisabledPassesThrough",
+      "story": "Platform operator can configure network policy enforcement",
+      "expected": "When Config.Enabled=false, all peers are returned unfiltered and no firewall rules applied",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/policy/handler_test.go",
+      "test_function": "TestReconcileHandler_PolicyChange",
+      "story": "plexd reconciles network policies as part of the configuration loop",
+      "expected": "When StateDiff contains policy changes, firewall rules are recomputed and peers re-filtered",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/policy/handler_test.go",
+      "test_function": "TestReconcileHandler_PeerChangeWithPolicies",
+      "story": "plexd reconciles network policies as part of the configuration loop",
+      "expected": "New peers are filtered against existing policies; disallowed peers are not added to WireGuard",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/policy/handler_test.go",
+      "test_function": "TestReconcileHandler_NoDriftSkips",
+      "story": "plexd reconciles network policies as part of the configuration loop",
+      "expected": "No policy or peer changes means no firewall or peer visibility changes",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/policy/handler_test.go",
+      "test_function": "TestReconcileHandler_RemovedPolicyRevokesPeer",
+      "story": "plexd enforces peer visibility filtering from network policies",
+      "expected": "When a policy is removed, previously allowed peers are removed from WireGuard",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/policy/handler_test.go",
+      "test_function": "TestSSEHandler_PolicyUpdated",
+      "story": "plexd handles policy_updated SSE events for real-time policy enforcement",
+      "expected": "policy_updated SSE event calls reconciler.TriggerReconcile()",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/policy/handler_test.go",
+      "test_function": "TestSSEHandler_PolicyUpdated_MalformedPayload",
+      "story": "plexd handles policy_updated SSE events for real-time policy enforcement",
+      "expected": "Malformed policy_updated event is logged, TriggerReconcile still called",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/policy/enforcer_test.go",
+      "test_function": "TestEnforcer_DenyByDefault_NoPolicies",
+      "story": "plexd handles edge cases in policy enforcement gracefully",
+      "expected": "With no policies, no peers are visible and default-deny firewall rule is active",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/policy/handler_test.go",
+      "test_function": "TestReconcileHandler_PartialFailureAggregated",
+      "story": "Network policy enforcement errors do not crash the agent",
+      "expected": "Firewall failure returns error; peer removal failure logged but other peers still processed",
+      "requirement_id": "REQ-004"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-010) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "Deny-by-default semantics enforced: empty policies = no peers visible, no traffic allowed",
+    "FirewallController interface follows the same abstraction pattern as wireguard.WGController for testability",
+    "ReconcileHandler integrates with the existing reconcile.Reconciler via RegisterHandler (same pattern as wireguard.ReconcileHandler)",
+    "HandlePolicyUpdated SSE handler delegates to reconciler.TriggerReconcile rather than applying policies directly (consistency with reconcile loop as source of truth)",
+    "All operations support context-based cancellation and error aggregation (errors.Join pattern from wireguard handler)",
+    "Code follows existing patterns: log/slog with component key, Config with ApplyDefaults/Validate, stdlib-only test dependencies",
+    "Reference documentation covers all public types, methods, data flow, and integration patterns (docs/reference/backend/network-policy.md)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All code lives in `internal/policy/`. Files: config.go, firewall.go (types + interface), engine.go (pure logic), enforcer.go (orchestration), handler.go (reconcile + SSE handlers), and corresponding _test.go files. An integration test file handler_integration_test.go wires components together.\n\n2. **Two-layer enforcement**: The design separates policy evaluation (PolicyEngine) from policy application (Enforcer). PolicyEngine is a pure function layer — FilterPeers and ComputeFirewallRules are stateless and easily testable. Enforcer orchestrates PolicyEngine + FirewallController + wireguard.Manager.\n\n3. **Peer visibility filtering**: A peer is considered 'visible' (allowed in WireGuard) if its mesh IP appears in at least one allow rule — either as Src (this peer can send to us) or as Dst (we can send to this peer), or via wildcard '*'. This is evaluated by FilterPeers against the node's own mesh IP. The node's own mesh IP is required as a parameter because rules are directional.\n\n4. **Firewall rules**: ComputeFirewallRules translates api.PolicyRule entries into FirewallRule structs. Only rules where Src or Dst matches the node's mesh IP (or '*') are included — rules between two other peers are irrelevant to this node. A default-deny rule is always appended as the last rule. The FirewallController.ApplyRules method performs an atomic replace (flush + apply) to avoid inconsistent intermediate states.\n\n5. **FirewallController interface**: Mirrors the wireguard.WGController pattern. Two methods: ApplyRules(chainName, rules) for atomic rule replacement, and DeleteChain(chainName) for teardown. The production implementation (nftables via netlink) is external to this package. Tests use a mock controller.\n\n6. **Reconcile handler integration**: The policy reconcile handler is registered alongside the existing wireguard reconcile handler. Processing order matters: the policy handler should run BEFORE the wireguard handler (registered first). The policy handler filters peers and updates firewall rules; the wireguard handler then only sees the filtered set. However, since the wireguard handler uses diff.PeersToAdd/Remove/Update directly from StateDiff (not filtered), the policy handler needs to adjust the peer list that reaches WireGuard. The cleanest approach: the policy handler modifies which peers are actually configured by managing its own peer tracking, and the wireguard handler continues to process its diff. This means the policy handler must handle peer add/remove/update for the filtered set.\n\n7. **SSE handler strategy**: The HandlePolicyUpdated SSE handler does NOT parse or apply the policy directly. It simply calls reconciler.TriggerReconcile() which causes the reconciler to fetch the latest full state from the control plane and run all handlers. This ensures consistency — policies are always applied through the reconcile loop, never through two different paths.\n\n8. **Existing API types**: api.Policy{ID, Rules []PolicyRule} and api.PolicyRule{Src, Dst, Port, Protocol, Action} are already defined in internal/api/types.go. The reconcile.StateDiff already tracks PoliciesToAdd and PoliciesToRemove. No changes to existing packages are needed.\n\n9. **Key files from existing codebase**:\n    - `internal/api/types.go:81-92` — Policy and PolicyRule structs (already defined)\n    - `internal/api/envelope.go:19` — EventPolicyUpdated constant (already defined)\n    - `internal/reconcile/diff.go:17-18` — PoliciesToAdd, PoliciesToRemove in StateDiff (already defined)\n    - `internal/reconcile/reconciler.go:21` — ReconcileHandler type and RegisterHandler method\n    - `internal/reconcile/reconciler.go:56-62` — TriggerReconcile method\n    - `internal/wireguard/handler.go:17-59` — ReconcileHandler pattern to follow\n    - `internal/wireguard/manager.go:71-144` — Manager.AddPeer, RemovePeerByID, UpdatePeer methods\n    - `internal/wireguard/controller.go:10-21` — WGController interface pattern to follow for FirewallController\n    - `internal/wireguard/mock_controller_test.go` — Mock pattern to follow\n\n10. **Potential pitfalls**:\n    - The reconcile handler receives the full desired state but needs to know the node's own mesh IP to evaluate policies. This must be passed at handler construction time (from registration identity).\n    - The policy reconcile handler and wireguard reconcile handler both affect WireGuard peers. The policy handler should be the gatekeeper — it decides which peers are visible, and only those peers should be configured. This means the policy handler effectively wraps/replaces the wireguard handler's peer management. One clean approach: register only the policy handler, which internally handles both policy enforcement AND peer configuration (delegating to wireguard.Manager). The wireguard reconcile handler would then not be registered separately when policy enforcement is enabled.\n    - Wildcard '*' matching must be handled carefully — it applies to the IP field, not as a subnet. A rule with Src='*' means 'any source IP'.\n    - Port=0 means 'all ports' in the firewall rule. Protocol='*' means 'all protocols'.\n    - The diff comparison for policies in the existing reconcile.ComputeDiff only checks presence/absence by ID, not rule content changes within a policy. If a policy's rules change but its ID stays the same, the diff won't detect it as a change. The reconcile handler should therefore always recompute when any policy change is detected (add or remove), and the engine should be idempotent.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.107158"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T13:46:25.800126"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T13:51:12.504792"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "8b40e802-ce23-4935-8145-9aff2ad3b582",
+      "timestamp": "2026-02-12T13:51:12.504817",
+      "total_duration": 282.4143753051758,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 282.4143753051758,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
