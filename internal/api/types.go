@@ -49,7 +49,8 @@ type HeartbeatRequest struct {
 	NAT            *NATInfo        `json:"nat,omitempty"`
 	Bridge         *BridgeInfo     `json:"bridge,omitempty"`
 	UserAccess     *UserAccessInfo `json:"user_access,omitempty"`
-	Ingress        *IngressInfo   `json:"ingress,omitempty"`
+	Ingress        *IngressInfo    `json:"ingress,omitempty"`
+	SiteToSite     *SiteToSiteInfo `json:"site_to_site,omitempty"`
 }
 
 type MeshInfo struct {
@@ -81,6 +82,7 @@ type StateResponse struct {
 	RelayConfig      *RelayConfig      `json:"relay_config,omitempty"`
 	UserAccessConfig *UserAccessConfig  `json:"user_access_config,omitempty"`
 	IngressConfig    *IngressConfig    `json:"ingress_config,omitempty"`
+	SiteToSiteConfig *SiteToSiteConfig `json:"site_to_site_config,omitempty"`
 	Data             []DataEntry       `json:"data"`
 	SecretRefs       []SecretRef       `json:"secret_refs"`
 }
@@ -360,8 +362,10 @@ type BridgeInfo struct {
 	ActiveRoutes        int    `json:"active_routes"`
 	RelayEnabled        bool   `json:"relay_enabled"`
 	ActiveRelaySessions int    `json:"active_relay_sessions"`
-	IngressEnabled      bool   `json:"ingress_enabled"`
-	ActiveIngressRules  int    `json:"active_ingress_rules"`
+	IngressEnabled          bool   `json:"ingress_enabled"`
+	ActiveIngressRules      int    `json:"active_ingress_rules"`
+	SiteToSiteEnabled       bool   `json:"site_to_site_enabled"`
+	ActiveSiteToSiteTunnels int    `json:"active_site_to_site_tunnels"`
 }
 
 // RelayConfig is the relay configuration pushed from the control plane.
@@ -433,4 +437,32 @@ type IngressInfo struct {
 	Enabled         bool `json:"enabled"`
 	RuleCount       int  `json:"rule_count"`
 	ConnectionCount int  `json:"connection_count"`
+}
+
+// ---------------------------------------------------------------------------
+// Site-to-Site VPN
+// ---------------------------------------------------------------------------
+
+// SiteToSiteConfig is the site-to-site VPN configuration pushed from the control plane.
+type SiteToSiteConfig struct {
+	Enabled bool               `json:"enabled"`
+	Tunnels []SiteToSiteTunnel `json:"tunnels"`
+}
+
+// SiteToSiteTunnel represents a single site-to-site VPN tunnel definition.
+type SiteToSiteTunnel struct {
+	TunnelID        string   `json:"tunnel_id"`
+	RemoteEndpoint  string   `json:"remote_endpoint"`
+	RemotePublicKey string   `json:"remote_public_key"`
+	LocalSubnets    []string `json:"local_subnets"`
+	RemoteSubnets   []string `json:"remote_subnets"`
+	PSK             string   `json:"psk,omitempty"`
+	InterfaceName   string   `json:"interface_name"`
+	ListenPort      int      `json:"listen_port"`
+}
+
+// SiteToSiteInfo is the site-to-site VPN status reported by the node in heartbeats.
+type SiteToSiteInfo struct {
+	Enabled     bool `json:"enabled"`
+	TunnelCount int  `json:"tunnel_count"`
 }

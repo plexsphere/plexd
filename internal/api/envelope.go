@@ -33,6 +33,9 @@ const (
 	EventIngressConfigUpdated      = "ingress_config_updated"
 	EventIngressRuleAssigned       = "ingress_rule_assigned"
 	EventIngressRuleRevoked        = "ingress_rule_revoked"
+	EventSiteToSiteConfigUpdated   = "site_to_site_config_updated"
+	EventSiteToSiteTunnelAssigned  = "site_to_site_tunnel_assigned"
+	EventSiteToSiteTunnelRevoked   = "site_to_site_tunnel_revoked"
 )
 
 // ---------------------------------------------------------------------------

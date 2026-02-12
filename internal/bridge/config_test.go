@@ -561,3 +561,157 @@ func TestConfig_Validate_IngressDisabled(t *testing.T) {
 		t.Errorf("Validate should return nil when ingress is disabled, got: %v", err)
 	}
 }
+
+func TestConfig_ApplyDefaults_SiteToSiteFields(t *testing.T) {
+	var cfg Config
+	cfg.ApplyDefaults()
+
+	if cfg.SiteToSiteEnabled {
+		t.Error("SiteToSiteEnabled should default to false")
+	}
+	if cfg.SiteToSiteInterfacePrefix != DefaultSiteToSiteInterfacePrefix {
+		t.Errorf("SiteToSiteInterfacePrefix = %q, want %q", cfg.SiteToSiteInterfacePrefix, DefaultSiteToSiteInterfacePrefix)
+	}
+	if cfg.SiteToSiteListenPort != DefaultSiteToSiteListenPort {
+		t.Errorf("SiteToSiteListenPort = %d, want %d", cfg.SiteToSiteListenPort, DefaultSiteToSiteListenPort)
+	}
+	if cfg.MaxSiteToSiteTunnels != DefaultMaxSiteToSiteTunnels {
+		t.Errorf("MaxSiteToSiteTunnels = %d, want %d", cfg.MaxSiteToSiteTunnels, DefaultMaxSiteToSiteTunnels)
+	}
+}
+
+func TestConfig_Validate_SiteToSiteWithoutBridge(t *testing.T) {
+	cfg := Config{
+		Enabled:           false,
+		SiteToSiteEnabled: true,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate should return error when site-to-site enabled without bridge")
+	}
+	want := "bridge: config: site-to-site requires bridge mode to be enabled"
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+func TestConfig_Validate_SiteToSiteValidConfig(t *testing.T) {
+	cfg := Config{
+		Enabled:                   true,
+		AccessInterface:           "eth1",
+		AccessSubnets:             []string{"10.0.0.0/24"},
+		SiteToSiteEnabled:         true,
+		SiteToSiteInterfacePrefix: "wg-s2s-",
+		SiteToSiteListenPort:      51823,
+		MaxSiteToSiteTunnels:      10,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate should return nil for valid site-to-site config, got: %v", err)
+	}
+}
+
+func TestConfig_Validate_SiteToSiteInvalidPort(t *testing.T) {
+	tests := []struct {
+		name string
+		port int
+	}{
+		{"port zero", 0},
+		{"port too high", 70000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:                   true,
+				AccessInterface:           "eth1",
+				AccessSubnets:             []string{"10.0.0.0/24"},
+				SiteToSiteEnabled:         true,
+				SiteToSiteInterfacePrefix: "wg-s2s-",
+				SiteToSiteListenPort:      tt.port,
+				MaxSiteToSiteTunnels:      10,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate should return error for invalid port")
+			}
+			want := "bridge: config: SiteToSiteListenPort must be between 1 and 65535"
+			if err.Error() != want {
+				t.Errorf("got %q, want %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_SiteToSiteBoundaryPorts(t *testing.T) {
+	tests := []struct {
+		name    string
+		port    int
+		wantErr bool
+	}{
+		{"port 1 (min valid)", 1, false},
+		{"port 65535 (max valid)", 65535, false},
+		{"port 65536 (just over max)", 65536, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:                   true,
+				AccessInterface:           "eth1",
+				AccessSubnets:             []string{"10.0.0.0/24"},
+				SiteToSiteEnabled:         true,
+				SiteToSiteInterfacePrefix: "wg-s2s-",
+				SiteToSiteListenPort:      tt.port,
+				MaxSiteToSiteTunnels:      10,
+			}
+			err := cfg.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatal("Validate should return error for out-of-range port")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("Validate should return nil for valid port %d, got: %v", tt.port, err)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_SiteToSiteInvalidMaxTunnels(t *testing.T) {
+	tests := []struct {
+		name       string
+		maxTunnels int
+	}{
+		{"zero tunnels", 0},
+		{"negative tunnels", -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:                   true,
+				AccessInterface:           "eth1",
+				AccessSubnets:             []string{"10.0.0.0/24"},
+				SiteToSiteEnabled:         true,
+				SiteToSiteInterfacePrefix: "wg-s2s-",
+				SiteToSiteListenPort:      51823,
+				MaxSiteToSiteTunnels:      tt.maxTunnels,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate should return error for invalid MaxSiteToSiteTunnels")
+			}
+			want := "bridge: config: MaxSiteToSiteTunnels must be positive when site-to-site is enabled"
+			if err.Error() != want {
+				t.Errorf("got %q, want %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_SiteToSiteDisabled(t *testing.T) {
+	cfg := Config{
+		Enabled:           true,
+		AccessInterface:   "eth1",
+		AccessSubnets:     []string{"10.0.0.0/24"},
+		SiteToSiteEnabled: false,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate should return nil when site-to-site is disabled, got: %v", err)
+	}
+}

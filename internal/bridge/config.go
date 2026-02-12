@@ -17,6 +17,10 @@ const (
 
 	DefaultMaxIngressRules    = 20
 	DefaultIngressDialTimeout = 10 * time.Second
+
+	DefaultSiteToSiteInterfacePrefix = "wg-s2s-"
+	DefaultSiteToSiteListenPort      = 51823
+	DefaultMaxSiteToSiteTunnels      = 10
 )
 
 // Config holds the configuration for bridge mode.
@@ -79,6 +83,24 @@ type Config struct {
 	// IngressDialTimeout is the timeout for dialing target mesh peers.
 	// Default: 10s. Minimum: 1s.
 	IngressDialTimeout time.Duration
+
+	// SiteToSiteEnabled controls whether site-to-site VPN connectivity is active.
+	// Default: false. Requires Enabled=true.
+	SiteToSiteEnabled bool
+
+	// SiteToSiteInterfacePrefix is the prefix for WireGuard interfaces used by site-to-site tunnels.
+	// Each tunnel gets an interface named {prefix}{index}.
+	// Default: "wg-s2s-"
+	SiteToSiteInterfacePrefix string
+
+	// SiteToSiteListenPort is the base UDP port for site-to-site WireGuard interfaces.
+	// Each tunnel uses this port + tunnel index offset.
+	// Default: 51823
+	SiteToSiteListenPort int
+
+	// MaxSiteToSiteTunnels is the maximum number of concurrent site-to-site tunnels.
+	// Default: 10
+	MaxSiteToSiteTunnels int
 }
 
 // BoolPtr returns a pointer to the given bool value.
@@ -119,6 +141,15 @@ func (c *Config) ApplyDefaults() {
 	if c.IngressDialTimeout == 0 {
 		c.IngressDialTimeout = DefaultIngressDialTimeout
 	}
+	if c.SiteToSiteInterfacePrefix == "" {
+		c.SiteToSiteInterfacePrefix = DefaultSiteToSiteInterfacePrefix
+	}
+	if c.SiteToSiteListenPort == 0 {
+		c.SiteToSiteListenPort = DefaultSiteToSiteListenPort
+	}
+	if c.MaxSiteToSiteTunnels == 0 {
+		c.MaxSiteToSiteTunnels = DefaultMaxSiteToSiteTunnels
+	}
 }
 
 // Validate checks that configuration values are acceptable.
@@ -132,6 +163,9 @@ func (c *Config) Validate() error {
 	}
 	if c.IngressEnabled && !c.Enabled {
 		return fmt.Errorf("bridge: config: ingress requires bridge mode to be enabled")
+	}
+	if c.SiteToSiteEnabled && !c.Enabled {
+		return fmt.Errorf("bridge: config: site-to-site requires bridge mode to be enabled")
 	}
 	if !c.Enabled {
 		return nil
@@ -175,6 +209,17 @@ func (c *Config) Validate() error {
 		}
 		if c.IngressDialTimeout < 1*time.Second {
 			return fmt.Errorf("bridge: config: IngressDialTimeout must be at least 1s")
+		}
+	}
+	if c.SiteToSiteEnabled {
+		if c.SiteToSiteListenPort < 1 || c.SiteToSiteListenPort > 65535 {
+			return fmt.Errorf("bridge: config: SiteToSiteListenPort must be between 1 and 65535")
+		}
+		if c.SiteToSiteInterfacePrefix == "" {
+			return fmt.Errorf("bridge: config: SiteToSiteInterfacePrefix is required when site-to-site is enabled")
+		}
+		if c.MaxSiteToSiteTunnels <= 0 {
+			return fmt.Errorf("bridge: config: MaxSiteToSiteTunnels must be positive when site-to-site is enabled")
 		}
 	}
 	return nil

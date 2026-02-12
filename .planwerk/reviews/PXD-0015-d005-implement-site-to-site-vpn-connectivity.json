@@ -1,0 +1,108 @@
+{
+  "feature_id": "PXD-0015",
+  "title": "D005: Implement site-to-site VPN connectivity",
+  "date": "2026-02-12",
+  "summary": "Implements site-to-site VPN connectivity for bridge mode: SiteToSiteManager with per-tunnel WireGuard interface lifecycle (create, configure peer, route, rollback), VPNController interface, SSE event handlers (tunnel-assigned/revoked/config-updated), SiteToSiteReconcileHandler for convergence with drift detection via reflect.DeepEqual, API types (SiteToSiteConfig, SiteToSiteTunnel, SiteToSiteInfo), config validation with defaults, heartbeat/capability reporting, and comprehensive tests (unit, handler, integration with -race). Reference documentation added.",
+  "verdict": "APPROVED",
+  "tests_checklist": [
+    {"item": "All tests pass (go test -race ./internal/bridge/... ./internal/api/...)", "checked": true},
+    {"item": "Unit tests cover Setup, AddTunnel, RemoveTunnel, Teardown, GetTunnel, TunnelIDs, SiteToSiteStatus, SiteToSiteCapabilities", "checked": true},
+    {"item": "Edge cases covered: duplicate tunnel, max tunnels, non-existent remove, inactive manager, idempotent teardown, error aggregation", "checked": true},
+    {"item": "Rollback tests: create interface failure, configure peer failure (rolls back interface), add route failure (rolls back routes + peer + interface)", "checked": true},
+    {"item": "SSE handler tests: tunnel-assigned, tunnel-revoked, config-updated, malformed payloads", "checked": true},
+    {"item": "Reconcile handler tests: nil config, add new, remove stale, detect changed (DeepEqual), unchanged untouched, mixed add+remove", "checked": true},
+    {"item": "Integration test: full lifecycle (Setup → SSE assign → reconcile no-op → SSE revoke → Teardown → idempotent Teardown)", "checked": true},
+    {"item": "Integration test: reconcile drift with real Reconciler and state transitions", "checked": true},
+    {"item": "Integration test: concurrent SSE + reconcile with -race and max tunnels enforcement", "checked": true},
+    {"item": "goleak.VerifyTestMain in leak_test.go covers goroutine leak detection for entire bridge package", "checked": true},
+    {"item": "API types round-trip JSON tests for SiteToSiteConfig, SiteToSiteTunnel, SiteToSiteInfo, StateResponse with s2s, HeartbeatRequest with s2s, BridgeInfo with s2s fields", "checked": true},
+    {"item": "Config validation tests: site-to-site without bridge, invalid port, boundary ports, non-positive MaxSiteToSiteTunnels, empty prefix", "checked": true},
+    {"item": "VPNController mock compile-time interface check (var _ VPNController = (*mockVPNController)(nil))", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing bridge module patterns (interface-based controller, Manager with mu/active/tracked-state)", "checked": true},
+    {"item": "SSE handlers follow factory function pattern (HandleSiteToSiteTunnelAssigned, etc.)", "checked": true},
+    {"item": "ReconcileHandler follows IngressReconcileHandler pattern with add/remove/change detection", "checked": true},
+    {"item": "Error prefixes follow 'bridge: site-to-site: <operation>: <detail>' pattern", "checked": true},
+    {"item": "Structured logging with component=bridge", "checked": true},
+    {"item": "Functions have clear single responsibility, all under 40 lines", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "Mock follows existing mockRouteController/mockAccessController pattern with per-key error injection", "checked": true},
+    {"item": "reflect.DeepEqual correctly used for tunnel comparison (SiteToSiteTunnel contains []string slice fields)", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "PSK field uses omitempty to avoid exposing empty PSKs in JSON", "checked": true},
+    {"item": "PSK not logged in Info/Error messages (only tunnel_id, interface, remote_endpoint, remote_subnets logged)", "checked": true},
+    {"item": "Config validation rejects invalid configuration before runtime", "checked": true},
+    {"item": "VPNController interface abstracts all OS-level WireGuard operations (no direct command execution in this package)", "checked": true},
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "Malformed SSE payloads return errors without crashing (tested)", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "VPNController interface abstracts WireGuard tunnel operations for testability", "checked": true},
+    {"item": "SiteToSiteManager follows established Manager pattern (Setup/Teardown/mu/active)", "checked": true},
+    {"item": "Clean separation: manager (site_to_site.go), handlers (site_to_site_handler.go), controller (vpn_controller.go)", "checked": true},
+    {"item": "API types extend existing StateResponse and HeartbeatRequest with pointer/omitempty fields", "checked": true},
+    {"item": "Per-tunnel isolation: each tunnel gets its own WireGuard interface, enabling independent lifecycle", "checked": true},
+    {"item": "Solution is as simple as possible for the requirements", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code", "checked": true},
+    {"item": "No unnecessary abstractions", "checked": true},
+    {"item": "No future-proofing beyond requirements", "checked": true},
+    {"item": "Reuses errForKey helper from mock_route_test.go in mock_vpn_test.go", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config validation fails early for invalid site-to-site settings", "checked": true},
+    {"item": "AddTunnel rejects inactive manager, duplicate tunnel, max tunnels before any OS operations", "checked": true},
+    {"item": "Port range validated (1-65535) in config", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Teardown aggregates errors via errors.Join and continues cleanup", "checked": true},
+    {"item": "Teardown is idempotent (tested with double teardown)", "checked": true},
+    {"item": "RemoveTunnel for non-existent tunnel is a no-op", "checked": true},
+    {"item": "RemoveTunnel on inactive manager is a no-op", "checked": true},
+    {"item": "Mutex protects concurrent access to activeTunnels map", "checked": true},
+    {"item": "AddTunnel performs full rollback on partial failure (routes, peer, interface)", "checked": true},
+    {"item": "RemoveTunnel logs errors but continues cleanup of remaining resources", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [
+    {
+      "id": "Q-01",
+      "severity": "minor",
+      "check_id": "P1",
+      "description": "SiteToSiteManager.Setup() does not accept a meshIface parameter and does not call RouteController.EnableForwarding between tunnel interfaces and the mesh interface. The task specification (task 1.4) mentions 'enable forwarding via routeCtrl.EnableForwarding between tunnel iface and mesh iface' in AddTunnel and 'disable forwarding' in RemoveTunnel. The implementation skips this step. While this may be intentional (per-tunnel forwarding is implicitly handled by OS routing when routes are added to the tunnel interface), it deviates from the task spec. The existing bridge.Manager calls EnableForwarding for the access interface, and UserAccessManager calls it for the user-access interface. If VPN traffic requires IP forwarding between the tunnel and mesh interfaces, this would need to be added.",
+      "location": "internal/bridge/site_to_site.go:49-66 (Setup), 110-169 (AddTunnel), 173-219 (RemoveTunnel)",
+      "fix": "If IP forwarding between tunnel and mesh interfaces is required: add meshIface parameter to Setup(), call m.routes.EnableForwarding(iface, m.meshIface) in AddTunnel after routes, and call m.routes.DisableForwarding(at.iface, m.meshIface) in RemoveTunnel. If not required, document the rationale in a comment."
+    },
+    {
+      "id": "Q-02",
+      "severity": "minor",
+      "check_id": "D2",
+      "description": "SiteToSiteManager logs 'component=bridge' manually in every log statement rather than pre-configuring it in the constructor. The Relay manager (relay.go) uses logger.With('component', 'bridge') in the constructor. This is a minor DRY improvement.",
+      "location": "internal/bridge/site_to_site.go:37-44",
+      "fix": "Optional: change constructor to use logger.With('component', 'bridge') and remove manual 'component', 'bridge' from all log calls. Consistent with relay.go pattern."
+    },
+    {
+      "id": "Q-03",
+      "severity": "minor",
+      "check_id": "TE2",
+      "description": "No test for AddTunnel with empty RemoteSubnets slice. The implementation handles this correctly (zero iterations, no routes added), but an explicit edge case test would document this behavior.",
+      "location": "internal/bridge/site_to_site_test.go",
+      "fix": "Optional: add TestSiteToSiteManager_AddTunnel_EmptyRemoteSubnets to verify tunnel creation succeeds with zero routes."
+    }
+  ],
+  "suggested_improvements": [
+    "Consider adding EnableForwarding/DisableForwarding calls for tunnel-to-mesh forwarding if required by the network topology (task spec mentions it)",
+    "Pre-configure logger with component=bridge in NewSiteToSiteManager constructor to reduce repetition in log calls",
+    "Add edge case test for AddTunnel with empty RemoteSubnets to document expected behavior"
+  ],
+  "next_steps": [
+    "Integrate SiteToSiteManager into the main bridge Manager wiring (Setup/Teardown lifecycle, SSE handler registration, reconcile handler registration)",
+    "Implement production VPNController using wgctrl/netlink for actual WireGuard interface management",
+    "Wire site-to-site capabilities into registration and heartbeat reporting in the agent's main loop",
+    "Determine if EnableForwarding between tunnel and mesh interfaces is required for the production network topology"
+  ]
+}

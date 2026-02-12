@@ -874,3 +874,176 @@ func TestBridgeInfo_IngressFields_JSONRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestSiteToSiteConfig_JSONRoundTrip(t *testing.T) {
+	orig := SiteToSiteConfig{
+		Enabled: true,
+		Tunnels: []SiteToSiteTunnel{
+			{
+				TunnelID:        "tun-001",
+				RemoteEndpoint:  "203.0.113.1:51820",
+				RemotePublicKey: "rpk-001",
+				LocalSubnets:    []string{"192.168.1.0/24"},
+				RemoteSubnets:   []string{"10.0.0.0/8"},
+				PSK:             "s2s-psk-001",
+				InterfaceName:   "wg-s2s0",
+				ListenPort:      51830,
+			},
+			{
+				TunnelID:        "tun-002",
+				RemoteEndpoint:  "203.0.113.2:51821",
+				RemotePublicKey: "rpk-002",
+				LocalSubnets:    []string{"172.16.0.0/12"},
+				RemoteSubnets:   []string{"10.10.0.0/16", "10.20.0.0/16"},
+				InterfaceName:   "wg-s2s1",
+				ListenPort:      51831,
+			},
+		},
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"enabled", "tunnels"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestSiteToSiteTunnel_JSONRoundTrip(t *testing.T) {
+	// With PSK set.
+	orig := SiteToSiteTunnel{
+		TunnelID:        "tun-001",
+		RemoteEndpoint:  "203.0.113.1:51820",
+		RemotePublicKey: "rpk-001",
+		LocalSubnets:    []string{"192.168.1.0/24"},
+		RemoteSubnets:   []string{"10.0.0.0/8"},
+		PSK:             "s2s-psk-001",
+		InterfaceName:   "wg-s2s0",
+		ListenPort:      51830,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"tunnel_id", "remote_endpoint", "remote_public_key", "local_subnets", "remote_subnets", "psk", "interface_name", "listen_port"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+
+	// PSK should be omitted when empty.
+	orig.PSK = ""
+	data2, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data2); contains(s, `"psk"`) {
+		t.Errorf("psk should be omitted when empty, got: %s", s)
+	}
+}
+
+func TestSiteToSiteInfo_JSONRoundTrip(t *testing.T) {
+	orig := SiteToSiteInfo{
+		Enabled:     true,
+		TunnelCount: 3,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"enabled", "tunnel_count"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestStateResponse_WithSiteToSiteConfig(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := StateResponse{
+		Peers:    []Peer{{ID: "n-002", PublicKey: "pk", MeshIP: "10.42.0.2", Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.42.0.2/32"}, PSK: "psk"}},
+		Policies: []Policy{},
+		SiteToSiteConfig: &SiteToSiteConfig{
+			Enabled: true,
+			Tunnels: []SiteToSiteTunnel{
+				{TunnelID: "tun-001", RemoteEndpoint: "203.0.113.1:51820", RemotePublicKey: "rpk-001", LocalSubnets: []string{"192.168.1.0/24"}, RemoteSubnets: []string{"10.0.0.0/8"}, InterfaceName: "wg-s2s0", ListenPort: 51830},
+			},
+		},
+		Data:       []DataEntry{{Key: "k", ContentType: "text/plain", Payload: json.RawMessage(`"v"`), Version: 1, UpdatedAt: now}},
+		SecretRefs: []SecretRef{},
+	}
+	_, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// SiteToSiteConfig field should be omitted when nil.
+	orig.SiteToSiteConfig = nil
+	data, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data); contains(s, `"site_to_site_config"`) {
+		t.Errorf("site_to_site_config should be omitted when nil, got: %s", s)
+	}
+}
+
+func TestHeartbeatRequest_WithSiteToSite(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := HeartbeatRequest{
+		NodeID:         "n-001",
+		Timestamp:      now,
+		Status:         "healthy",
+		Uptime:         "6h45m",
+		BinaryChecksum: "sha256:abc",
+		SiteToSite: &SiteToSiteInfo{
+			Enabled:     true,
+			TunnelCount: 2,
+		},
+	}
+	_, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// SiteToSite field should be omitted when nil.
+	orig.SiteToSite = nil
+	data, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data); contains(s, `"site_to_site"`) {
+		t.Errorf("site_to_site should be omitted when nil, got: %s", s)
+	}
+}
+
+func TestBridgeInfo_SiteToSiteFields_JSONRoundTrip(t *testing.T) {
+	orig := BridgeInfo{
+		Enabled:                 true,
+		AccessInterface:         "eth1",
+		ActiveRoutes:            5,
+		RelayEnabled:            true,
+		ActiveRelaySessions:     3,
+		IngressEnabled:          true,
+		ActiveIngressRules:      4,
+		SiteToSiteEnabled:       true,
+		ActiveSiteToSiteTunnels: 2,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify site-to-site-specific snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"site_to_site_enabled", "active_site_to_site_tunnels"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
