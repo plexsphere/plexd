@@ -73,7 +73,7 @@ enabled = true
 auto_request = true
 
 [git]
-author = "Planwerk Sandbox <planwerk@b42labs.com>"
+author = "Planwerk <planwerk@b42labs.com>"
 co_author = "Planwerk <planwerk@b42labs.com>"
 
 [[git.users]]
