@@ -1,0 +1,715 @@
+{
+  "feature_id": "PXD-0003",
+  "title": "A003: Implement configuration reconciliation loop",
+  "slug": "a003-implement-configuration-reconciliation-loop",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Periodically compare local tunnel and policy state against the control plane's source of truth. Detect configuration drift (missing tunnels, stale peers, outdated policies) and correct it automatically. This is the core convergence loop that keeps every node aligned with desired state.",
+  "stories": [
+    {
+      "title": "plexd periodically fetches desired state and detects configuration drift",
+      "role": "plexd agent",
+      "want": "to periodically call GET /v1/nodes/{node_id}/state at reconcile.interval (default 60s), compare the returned desired state (peers, policies, signing keys, metadata, data, secret refs) against a local state snapshot, and produce a structured diff describing what has drifted",
+      "so_that": "the node detects missing tunnels, stale peers, outdated policies, signing key changes, and metadata/data drift automatically without relying solely on the SSE stream",
+      "criteria": [
+        "Reconciler runs a tick loop at the configured reconcile.interval (default 60s)",
+        "Each tick calls ControlPlane.FetchState(ctx, nodeID) to get the full desired state",
+        "A StateDiff is computed comparing desired StateResponse against a local StateSnapshot",
+        "StateDiff identifies: peers to add, peers to remove, peers with changed fields (endpoint, allowed_ips, psk), policies to add, policies to remove, signing key changes, metadata changes, data entry changes, secret ref changes",
+        "Empty StateDiff (no drift) skips correction and drift reporting",
+        "FetchState errors are logged and the tick is skipped without crashing the loop"
+      ]
+    },
+    {
+      "title": "plexd applies drift corrections by invoking pluggable reconcile handlers",
+      "role": "plexd agent",
+      "want": "to apply corrections for each category of drift (peers, policies, signing keys, state) by invoking registered ReconcileHandler functions, so that higher-level features (S005 mesh, S008 policy, S010 crypto) can plug in their own correction logic",
+      "so_that": "the reconciliation loop remains decoupled from WireGuard, nftables, and other subsystem implementations while still driving convergence",
+      "criteria": [
+        "ReconcileHandler is a function type: func(ctx context.Context, desired *StateResponse, diff StateDiff) error",
+        "Handlers are registered by category (peers, policies, signing_keys, state) before the loop starts",
+        "All registered handlers are invoked for each non-empty diff, in registration order",
+        "Handler errors are logged at error level but do not stop other handlers from running",
+        "After all handlers run, the local StateSnapshot is updated to reflect the new desired state",
+        "If any handler returns an error, the snapshot update for that category is skipped so it will be retried next tick"
+      ]
+    },
+    {
+      "title": "plexd reports drift corrections to the control plane",
+      "role": "plexd agent",
+      "want": "to report detected drift to the control plane via POST /v1/nodes/{node_id}/drift after corrections are applied, including what was corrected",
+      "so_that": "operators have centralized visibility into configuration drift across all nodes",
+      "criteria": [
+        "After applying corrections, a DriftReport is constructed from the StateDiff with one DriftCorrection per corrected item",
+        "DriftReport.Timestamp is set to the current time",
+        "DriftCorrection.Type matches the drift category (peer_added, peer_removed, peer_updated, policy_added, policy_removed, signing_keys_updated, metadata_updated, data_updated, secret_refs_updated)",
+        "DriftCorrection.Detail contains a human-readable description (e.g. peer ID, policy ID)",
+        "ReportDrift is called only when corrections were applied (non-empty diff)",
+        "ReportDrift errors are logged at warn level but do not affect the reconciliation loop"
+      ]
+    },
+    {
+      "title": "plexd triggers immediate reconciliation after SSE reconnection and on heartbeat hint",
+      "role": "plexd agent",
+      "want": "to trigger an immediate reconciliation cycle (bypassing the interval timer) when the SSE stream reconnects or when a heartbeat response contains reconcile: true",
+      "so_that": "the node catches up on any missed updates during SSE disconnection windows and responds to control plane hints promptly",
+      "criteria": [
+        "Reconciler exposes a TriggerReconcile() method that wakes the loop for an immediate cycle",
+        "SSE reconnection (detected in SSEManager) calls TriggerReconcile()",
+        "Heartbeat response with reconcile: true calls TriggerReconcile()",
+        "Multiple rapid triggers are coalesced — only one reconciliation runs at a time",
+        "Triggered reconciliation uses the same FetchState + diff + apply + report flow as periodic reconciliation",
+        "The periodic timer resets after a triggered reconciliation"
+      ]
+    },
+    {
+      "title": "plexd caches desired state locally for diffing and offline resilience",
+      "role": "plexd agent",
+      "want": "to maintain an in-memory StateSnapshot of the last known desired state, initialized from the first FetchState response, and updated after each successful reconciliation",
+      "so_that": "the diff can be computed without re-fetching state and the snapshot serves as the baseline for detecting drift",
+      "criteria": [
+        "StateSnapshot holds the same structure as StateResponse (peers, policies, signing_keys, metadata, data, secret_refs)",
+        "On first reconciliation, the entire desired state is treated as 'new' (full apply)",
+        "After successful reconciliation, the snapshot is updated atomically",
+        "The snapshot is stored in memory only (disk persistence is deferred to future features)",
+        "Concurrent access to the snapshot is protected by a sync.RWMutex"
+      ]
+    },
+    {
+      "title": "plexd gracefully starts and stops the reconciliation loop",
+      "role": "platform operator",
+      "want": "the reconciliation loop to start after registration completes and stop cleanly on context cancellation or agent shutdown",
+      "so_that": "the loop integrates into the agent lifecycle without goroutine leaks or resource leaks",
+      "criteria": [
+        "Reconciler.Run(ctx, nodeID) blocks until context is cancelled",
+        "Context cancellation stops the tick timer, cancels any in-flight FetchState/ReportDrift calls, and returns ctx.Err()",
+        "All goroutines are tracked and exit cleanly on shutdown (verifiable via goleak)",
+        "The first reconciliation occurs immediately on start (no initial delay)",
+        "Run returns a descriptive error if the Reconciler is misconfigured (missing client, empty nodeID)"
+      ]
+    },
+    {
+      "title": "plexd configuration for reconciliation follows existing config patterns",
+      "role": "platform operator",
+      "want": "to configure the reconciliation interval via the reconcile block in the config, following the same Config/ApplyDefaults/Validate pattern used by internal/api/ and internal/registration/",
+      "so_that": "configuration is consistent across all plexd subsystems",
+      "criteria": [
+        "Config struct defines Interval time.Duration (default 60s)",
+        "ApplyDefaults sets Interval to 60s when zero",
+        "Validate returns error if Interval is negative or less than 1s",
+        "Config is passed to Reconciler constructor, no file I/O in the reconcile package"
+      ]
+    },
+    {
+      "title": "Reconciliation errors do not crash or block the agent",
+      "role": "platform operator",
+      "want": "the reconciliation loop to be resilient to all error conditions: FetchState failures, handler panics, ReportDrift failures, and clock issues",
+      "so_that": "plexd remains operational even when the control plane is temporarily unreachable or handler code has bugs",
+      "criteria": [
+        "FetchState errors are logged at warn level and the tick continues to the next interval",
+        "Handler panics are recovered, logged at error level with stack trace, and do not stop the loop",
+        "ReportDrift errors are logged at warn level and do not affect the loop",
+        "The loop never blocks indefinitely — all operations use the context with the tick deadline",
+        "Structured logging uses component=reconcile with consistent keys: node_id, interval, drift_count, duration"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The Reconciler SHALL periodically call GET /v1/nodes/{node_id}/state at the configured reconcile.interval (default 60s) and compute a StateDiff against the local StateSnapshot",
+      "priority": "SHALL",
+      "rationale": "Periodic state comparison is the core mechanism for detecting configuration drift that SSE events may have missed",
+      "scenarios": [
+        {
+          "name": "Periodic fetch at configured interval",
+          "when": "the Reconciler is running with interval=60s",
+          "then": "FetchState is called approximately every 60s",
+          "and_then": [
+            "the first call occurs immediately on start"
+          ]
+        },
+        {
+          "name": "Diff detects added peer",
+          "when": "FetchState returns a peer not present in the local snapshot",
+          "then": "StateDiff.PeersToAdd contains the new peer",
+          "and_then": []
+        },
+        {
+          "name": "Diff detects removed peer",
+          "when": "local snapshot has a peer not present in the FetchState response",
+          "then": "StateDiff.PeersToRemove contains the removed peer ID",
+          "and_then": []
+        },
+        {
+          "name": "FetchState error skips tick",
+          "when": "FetchState returns an error",
+          "then": "the error is logged at warn level and the loop waits for the next tick",
+          "and_then": [
+            "no correction or drift report is attempted"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The StateDiff SHALL identify changes across all state categories: peers (add/remove/update), policies (add/remove), signing keys, metadata, data entries, and secret references",
+      "priority": "SHALL",
+      "rationale": "Complete drift detection ensures no category of state can silently diverge from desired state",
+      "scenarios": [
+        {
+          "name": "Peer endpoint change detected",
+          "when": "a peer exists in both desired and local state but has a different endpoint",
+          "then": "StateDiff.PeersToUpdate contains the peer with the new endpoint",
+          "and_then": []
+        },
+        {
+          "name": "Policy added",
+          "when": "desired state contains a policy ID not in the local snapshot",
+          "then": "StateDiff.PoliciesToAdd contains the new policy",
+          "and_then": []
+        },
+        {
+          "name": "Signing keys changed",
+          "when": "desired state signing keys differ from local snapshot",
+          "then": "StateDiff.SigningKeysChanged is true and contains the new keys",
+          "and_then": []
+        },
+        {
+          "name": "No drift produces empty diff",
+          "when": "desired state matches local snapshot exactly",
+          "then": "StateDiff.IsEmpty() returns true",
+          "and_then": [
+            "no handlers are invoked",
+            "no drift report is sent"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The Reconciler SHALL invoke registered ReconcileHandler functions for each non-empty diff, passing the full desired state and the diff",
+      "priority": "SHALL",
+      "rationale": "Handler-based correction allows each subsystem (mesh, policy, crypto) to plug in its own reconciliation logic without coupling to the reconcile package",
+      "scenarios": [
+        {
+          "name": "Handler invoked on drift",
+          "when": "StateDiff is non-empty and a handler is registered",
+          "then": "the handler is called with the desired state and the diff",
+          "and_then": []
+        },
+        {
+          "name": "Multiple handlers invoked sequentially",
+          "when": "two handlers are registered",
+          "then": "both are invoked in registration order; first handler error does not block second",
+          "and_then": []
+        },
+        {
+          "name": "Handler error prevents snapshot update for that category",
+          "when": "a handler returns an error",
+          "then": "the error is logged and the snapshot is not updated for the failed category",
+          "and_then": [
+            "the same drift will be detected and retried on the next tick"
+          ]
+        },
+        {
+          "name": "Handler panic recovered",
+          "when": "a handler panics",
+          "then": "the panic is recovered and logged at error level with stack trace",
+          "and_then": [
+            "the reconciliation loop continues"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The Reconciler SHALL report drift corrections to the control plane via POST /v1/nodes/{node_id}/drift after applying corrections",
+      "priority": "SHALL",
+      "rationale": "Drift reporting enables centralized monitoring and alerting on configuration divergence across the fleet",
+      "scenarios": [
+        {
+          "name": "Drift reported after corrections",
+          "when": "corrections are applied for added/removed peers",
+          "then": "POST /v1/nodes/{node_id}/drift is called with a DriftReport containing one DriftCorrection per corrected item",
+          "and_then": [
+            "DriftCorrection.Type is peer_added or peer_removed"
+          ]
+        },
+        {
+          "name": "No drift report on empty diff",
+          "when": "no drift is detected",
+          "then": "ReportDrift is not called",
+          "and_then": []
+        },
+        {
+          "name": "Drift report failure does not affect loop",
+          "when": "ReportDrift returns an error",
+          "then": "the error is logged at warn level and the loop continues normally",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The Reconciler SHALL support immediate reconciliation triggers from SSE reconnection events and heartbeat hints",
+      "priority": "SHALL",
+      "rationale": "After SSE disconnect, missed events may have caused drift; heartbeat reconcile: true is an out-of-band hint from the control plane",
+      "scenarios": [
+        {
+          "name": "SSE reconnection triggers reconcile",
+          "when": "the SSE stream reconnects after a disconnection",
+          "then": "TriggerReconcile() is called and an immediate reconciliation cycle runs",
+          "and_then": [
+            "the periodic timer resets after the triggered cycle"
+          ]
+        },
+        {
+          "name": "Heartbeat hint triggers reconcile",
+          "when": "a heartbeat response contains reconcile: true",
+          "then": "TriggerReconcile() is called and an immediate reconciliation cycle runs",
+          "and_then": []
+        },
+        {
+          "name": "Concurrent triggers coalesced",
+          "when": "TriggerReconcile() is called multiple times before the current tick completes",
+          "then": "only one reconciliation cycle runs for the coalesced triggers",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The Reconciler SHALL maintain an in-memory StateSnapshot updated atomically after each successful reconciliation cycle",
+      "priority": "SHALL",
+      "rationale": "The snapshot provides the baseline for diff computation and ensures consistent state comparison",
+      "scenarios": [
+        {
+          "name": "First reconciliation treats everything as new",
+          "when": "the Reconciler runs its first cycle with an empty snapshot",
+          "then": "the entire desired state appears as additions in the diff",
+          "and_then": [
+            "the snapshot is populated after successful reconciliation"
+          ]
+        },
+        {
+          "name": "Snapshot updated after success",
+          "when": "all handlers complete without error",
+          "then": "the snapshot is updated to match the desired state",
+          "and_then": []
+        },
+        {
+          "name": "Snapshot not updated on handler failure",
+          "when": "a handler returns an error for the peers category",
+          "then": "the peers portion of the snapshot is not updated",
+          "and_then": [
+            "the same peer drift is detected again on the next tick"
+          ]
+        },
+        {
+          "name": "Concurrent snapshot access is safe",
+          "when": "TriggerReconcile() is called while a periodic tick is reading the snapshot",
+          "then": "no data race occurs (protected by sync.RWMutex)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The Reconciler SHALL support graceful shutdown via context cancellation, with all goroutines exiting cleanly",
+      "priority": "SHALL",
+      "rationale": "Clean shutdown on SIGTERM prevents goroutine leaks and ensures no orphaned HTTP requests",
+      "scenarios": [
+        {
+          "name": "Context cancellation stops the loop",
+          "when": "the context is cancelled during a tick interval wait",
+          "then": "the loop exits immediately with ctx.Err()",
+          "and_then": [
+            "no further FetchState or ReportDrift calls are made"
+          ]
+        },
+        {
+          "name": "Context cancellation during FetchState",
+          "when": "the context is cancelled during an in-flight FetchState call",
+          "then": "the HTTP request is cancelled and the loop exits with ctx.Err()",
+          "and_then": []
+        },
+        {
+          "name": "No goroutine leaks on shutdown",
+          "when": "Reconciler.Run returns after context cancellation",
+          "then": "all goroutines spawned by the Reconciler have exited",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The reconcile Config SHALL define Interval with a default of 60s, following the ApplyDefaults/Validate pattern from internal/api/ and internal/registration/",
+      "priority": "SHALL",
+      "rationale": "Consistent configuration patterns across packages simplifies maintenance and reduces cognitive load",
+      "scenarios": [
+        {
+          "name": "Default interval applied",
+          "when": "Config with zero Interval",
+          "then": "ApplyDefaults sets Interval to 60s",
+          "and_then": []
+        },
+        {
+          "name": "Custom interval used",
+          "when": "Config.Interval set to 30s",
+          "then": "the Reconciler uses 30s as its tick interval",
+          "and_then": []
+        },
+        {
+          "name": "Invalid interval rejected",
+          "when": "Config.Interval is negative or less than 1s",
+          "then": "Validate returns a descriptive error",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The Reconciler SHALL use structured logging (log/slog) with component=reconcile and consistent keys matching existing patterns",
+      "priority": "SHALL",
+      "rationale": "Operational consistency with internal/api/ and internal/registration/ logging approach",
+      "scenarios": [
+        {
+          "name": "Reconciliation cycle logged",
+          "when": "a reconciliation cycle completes",
+          "then": "info log with component=reconcile, node_id, drift_count, duration",
+          "and_then": []
+        },
+        {
+          "name": "FetchState error logged",
+          "when": "FetchState fails",
+          "then": "warn log with component=reconcile, node_id, error",
+          "and_then": []
+        },
+        {
+          "name": "Drift corrections logged",
+          "when": "drift is detected and corrected",
+          "then": "info log with component=reconcile, correction_type, detail for each correction",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The Reconciler SHALL recover from handler panics and continue the reconciliation loop",
+      "priority": "SHALL",
+      "rationale": "Handler code from other subsystems may have bugs; the reconciliation loop must not crash the agent",
+      "scenarios": [
+        {
+          "name": "Panic recovered and logged",
+          "when": "a handler panics during a reconciliation cycle",
+          "then": "the panic is recovered, logged at error level with the panic value",
+          "and_then": [
+            "the reconciliation loop continues with the next tick"
+          ]
+        },
+        {
+          "name": "Other handlers still run after panic",
+          "when": "handler A panics and handler B is also registered",
+          "then": "handler B is still invoked",
+          "and_then": []
+        },
+        {
+          "name": "Snapshot not updated for panicked category",
+          "when": "a handler panics",
+          "then": "the snapshot for that category retains the previous value",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/reconcile/config.go — Define Config struct: Interval time.Duration (default 60s). Implement ApplyDefaults() setting Interval=60s when zero. Implement Validate() returning error if Interval <1s. Export DefaultInterval=60s constant. Follow the same pattern as internal/api/config.go and internal/registration/config.go. Include tests in config_test.go for defaults and validation. (REQ-008)",
+    "1.2 Create internal/reconcile/snapshot.go — Define StateSnapshot struct mirroring api.StateResponse fields: Peers []api.Peer, Policies []api.Policy, SigningKeys *api.SigningKeys, Metadata map[string]string, Data []api.DataEntry, SecretRefs []api.SecretRef. Protect with sync.RWMutex. Implement Get() returning a copy, Update(desired *api.StateResponse) setting all fields, and UpdatePartial(categories ...string) for selective update. Include tests in snapshot_test.go for initial empty state, update, concurrent access (using -race). (REQ-006)",
+    "1.3 Create internal/reconcile/diff.go — Define StateDiff struct: PeersToAdd []api.Peer, PeersToRemove []string (IDs), PeersToUpdate []api.Peer, PoliciesToAdd []api.Policy, PoliciesToRemove []string (IDs), SigningKeysChanged bool, NewSigningKeys *api.SigningKeys, MetadataChanged bool, DataChanged bool, SecretRefsChanged bool. Implement IsEmpty() bool. Implement ComputeDiff(desired *api.StateResponse, snapshot StateSnapshot) StateDiff comparing: peers by ID (add/remove/update by comparing endpoint, allowed_ips, psk), policies by ID, signing keys (current/previous), metadata map equality, data entries by key+version, secret refs by key+version. Include tests in diff_test.go for all scenarios: add, remove, update, no drift, empty snapshot, all categories. (REQ-001, REQ-002)",
+    "1.4 Create internal/reconcile/drift.go — Implement BuildDriftReport(diff StateDiff) api.DriftReport. Generate one api.DriftCorrection per item: Type=peer_added/peer_removed/peer_updated/policy_added/policy_removed/signing_keys_updated/metadata_updated/data_updated/secret_refs_updated, Detail=human-readable string (peer ID, policy ID, etc.). Set Timestamp=time.Now(). Return empty corrections for empty diff. Include tests in drift_test.go for all correction types and empty diff. (REQ-004)",
+    "2.1 Create internal/reconcile/reconciler.go — Define ReconcileHandler type: func(ctx context.Context, desired *api.StateResponse, diff StateDiff) error. Define Reconciler struct: client *api.ControlPlane, cfg Config, logger *slog.Logger, snapshot *StateSnapshot, handlers []ReconcileHandler, triggerCh chan struct{}. Implement NewReconciler(client, cfg, logger) with cfg.ApplyDefaults(). Implement RegisterHandler(handler ReconcileHandler). Implement TriggerReconcile() sending on triggerCh (non-blocking, buffered channel size 1 for coalescing). Implement Run(ctx, nodeID) error: validate inputs, run first cycle immediately, then select on time.Ticker and triggerCh. Each cycle: FetchState → ComputeDiff → if non-empty: invoke handlers with panic recovery → BuildDriftReport → ReportDrift → update snapshot. Log all outcomes with structured keys. Include tests in reconciler_test.go using httptest.Server for: periodic fetch, immediate first fetch, handler invocation, multiple handlers, panic recovery, drift reporting, trigger, trigger coalescing, snapshot update, context cancellation, FetchState error, no goroutine leaks (goleak). (REQ-001, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-009, REQ-010)",
+    "3.1 Create docs/reference/backend/reconciliation.md — Reference documentation for internal/reconcile/ package: Config struct fields and defaults, Reconciler constructor and methods (RegisterHandler, TriggerReconcile, Run), ReconcileHandler type signature, StateDiff struct and ComputeDiff, StateSnapshot lifecycle, BuildDriftReport usage, integration points (SSEManager reconnection callback, heartbeat reconcile flag). Include code examples for constructing a Reconciler, registering handlers, and starting the loop. (REQ-001 through REQ-010)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/reconcile/config_test.go",
+      "test_function": "TestConfig_Defaults",
+      "story": "plexd configuration for reconciliation follows existing config patterns",
+      "expected": "Config with zero Interval uses default 60s after ApplyDefaults",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/reconcile/config_test.go",
+      "test_function": "TestConfig_ValidateRejectsInvalidInterval",
+      "story": "plexd configuration for reconciliation follows existing config patterns",
+      "expected": "Config.Validate returns error for negative or sub-second intervals",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/reconcile/snapshot_test.go",
+      "test_function": "TestStateSnapshot_InitiallyEmpty",
+      "story": "plexd caches desired state locally for diffing and offline resilience",
+      "expected": "A new StateSnapshot has empty peers, policies, signing keys, metadata, data, and secret refs",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/reconcile/snapshot_test.go",
+      "test_function": "TestStateSnapshot_UpdateAfterReconcile",
+      "story": "plexd caches desired state locally for diffing and offline resilience",
+      "expected": "After Update(), the snapshot reflects the new desired state",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/reconcile/snapshot_test.go",
+      "test_function": "TestStateSnapshot_ConcurrentAccess",
+      "story": "plexd caches desired state locally for diffing and offline resilience",
+      "expected": "Concurrent reads and writes to the snapshot produce no data races",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/reconcile/diff_test.go",
+      "test_function": "TestComputeDiff_PeersAdded",
+      "story": "plexd periodically fetches desired state and detects configuration drift",
+      "expected": "A peer in desired but not snapshot appears in PeersToAdd",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/reconcile/diff_test.go",
+      "test_function": "TestComputeDiff_PeersRemoved",
+      "story": "plexd periodically fetches desired state and detects configuration drift",
+      "expected": "A peer in snapshot but not desired appears in PeersToRemove",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/reconcile/diff_test.go",
+      "test_function": "TestComputeDiff_PeersUpdated",
+      "story": "plexd periodically fetches desired state and detects configuration drift",
+      "expected": "A peer present in both but with changed endpoint/allowed_ips/psk appears in PeersToUpdate",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/reconcile/diff_test.go",
+      "test_function": "TestComputeDiff_PoliciesAddedAndRemoved",
+      "story": "plexd periodically fetches desired state and detects configuration drift",
+      "expected": "Added and removed policies are correctly identified by policy ID",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/reconcile/diff_test.go",
+      "test_function": "TestComputeDiff_SigningKeysChanged",
+      "story": "plexd periodically fetches desired state and detects configuration drift",
+      "expected": "Changed signing keys (current or previous) set SigningKeysChanged=true",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/reconcile/diff_test.go",
+      "test_function": "TestComputeDiff_MetadataChanged",
+      "story": "plexd periodically fetches desired state and detects configuration drift",
+      "expected": "Changed, added, or removed metadata keys are detected",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/reconcile/diff_test.go",
+      "test_function": "TestComputeDiff_DataEntriesChanged",
+      "story": "plexd periodically fetches desired state and detects configuration drift",
+      "expected": "Data entries with different versions or new/removed keys are detected",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/reconcile/diff_test.go",
+      "test_function": "TestComputeDiff_SecretRefsChanged",
+      "story": "plexd periodically fetches desired state and detects configuration drift",
+      "expected": "Secret references with different versions or new/removed keys are detected",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/reconcile/diff_test.go",
+      "test_function": "TestComputeDiff_NoDrift",
+      "story": "plexd periodically fetches desired state and detects configuration drift",
+      "expected": "Identical desired and snapshot state produces IsEmpty()=true",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/reconcile/diff_test.go",
+      "test_function": "TestComputeDiff_EmptySnapshot",
+      "story": "plexd caches desired state locally for diffing and offline resilience",
+      "expected": "Empty snapshot vs full desired state treats everything as additions",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_PeriodicFetch",
+      "story": "plexd periodically fetches desired state and detects configuration drift",
+      "expected": "FetchState is called at approximately the configured interval",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_FirstReconcileImmediate",
+      "story": "plexd gracefully starts and stops the reconciliation loop",
+      "expected": "The first reconciliation occurs immediately on Run, not after waiting one interval",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_HandlerInvokedOnDrift",
+      "story": "plexd applies drift corrections by invoking pluggable reconcile handlers",
+      "expected": "Registered handler is invoked with correct desired state and diff when drift is detected",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_MultipleHandlers",
+      "story": "plexd applies drift corrections by invoking pluggable reconcile handlers",
+      "expected": "Multiple registered handlers all invoked; first handler error does not block second",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_HandlerPanicRecovered",
+      "story": "Reconciliation errors do not crash or block the agent",
+      "expected": "Handler panic is recovered, logged, and the loop continues with the next tick",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_DriftReported",
+      "story": "plexd reports drift corrections to the control plane",
+      "expected": "ReportDrift is called with correct DriftCorrection entries after corrections are applied",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_NoDriftNoReport",
+      "story": "plexd reports drift corrections to the control plane",
+      "expected": "ReportDrift is not called when no drift is detected",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_DriftReportFailureIgnored",
+      "story": "plexd reports drift corrections to the control plane",
+      "expected": "ReportDrift error is logged but the reconciliation loop continues",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_TriggerReconcile",
+      "story": "plexd triggers immediate reconciliation after SSE reconnection and on heartbeat hint",
+      "expected": "TriggerReconcile() causes an immediate reconciliation cycle before the next tick",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_TriggerCoalesced",
+      "story": "plexd triggers immediate reconciliation after SSE reconnection and on heartbeat hint",
+      "expected": "Multiple rapid TriggerReconcile() calls result in only one extra reconciliation cycle",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_SnapshotUpdatedOnSuccess",
+      "story": "plexd caches desired state locally for diffing and offline resilience",
+      "expected": "After successful reconciliation, snapshot matches the desired state; next cycle with same state produces empty diff",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_SnapshotNotUpdatedOnHandlerError",
+      "story": "plexd caches desired state locally for diffing and offline resilience",
+      "expected": "After handler error, snapshot retains old state; next cycle detects the same drift again",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_ContextCancellation",
+      "story": "plexd gracefully starts and stops the reconciliation loop",
+      "expected": "Context cancellation during interval wait exits Run immediately with ctx.Err()",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_ContextCancelDuringFetch",
+      "story": "plexd gracefully starts and stops the reconciliation loop",
+      "expected": "Context cancellation during FetchState exits Run with ctx.Err()",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_FetchStateErrorSkipsTick",
+      "story": "Reconciliation errors do not crash or block the agent",
+      "expected": "FetchState error is logged at warn; loop waits for next tick; no crash",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/reconcile/reconciler_test.go",
+      "test_function": "TestReconciler_NoGoroutineLeaks",
+      "story": "plexd gracefully starts and stops the reconciliation loop",
+      "expected": "After Run returns, goleak detects no leaked goroutines",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/reconcile/drift_test.go",
+      "test_function": "TestBuildDriftReport",
+      "story": "plexd reports drift corrections to the control plane",
+      "expected": "BuildDriftReport produces correct DriftCorrection entries from a StateDiff",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/reconcile/drift_test.go",
+      "test_function": "TestBuildDriftReport_EmptyDiff",
+      "story": "plexd reports drift corrections to the control plane",
+      "expected": "Empty StateDiff produces an empty corrections list",
+      "requirement_id": "REQ-004"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-010) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "StateDiff correctly identifies changes across all 6 state categories: peers (add/remove/update), policies (add/remove), signing keys, metadata, data entries, secret references",
+    "Reconciliation loop runs first cycle immediately on start, then at configured interval",
+    "TriggerReconcile() correctly wakes the loop for immediate reconciliation and coalesces multiple triggers",
+    "Handler errors and panics are recovered without stopping the reconciliation loop",
+    "Snapshot is updated atomically after successful reconciliation; failed categories retain old state for retry",
+    "DriftReport is constructed only for non-empty diffs and sent via ReportDrift; ReportDrift errors logged but do not affect loop",
+    "All goroutines exit cleanly on context cancellation (no leaks verified via goleak)",
+    "Code follows existing patterns: log/slog with structured keys, Config with ApplyDefaults/Validate, no file I/O in the reconcile package",
+    "No duplication of types — uses api.StateResponse, api.Peer, api.Policy, api.DriftReport, api.DriftCorrection directly",
+    "Reference documentation covers all public types, methods, and usage patterns (docs/reference/backend/reconciliation.md)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All code lives in `internal/reconcile/` per the README project structure (`internal/reconcile/`). Files: config.go, snapshot.go, diff.go, drift.go, reconciler.go, and corresponding _test.go files.\n\n2. **Dependency on internal/api/**: The Reconciler takes a `*api.ControlPlane` client and uses `FetchState()` and `ReportDrift()`. It uses `api.StateResponse`, `api.Peer`, `api.Policy`, `api.SigningKeys`, `api.DataEntry`, `api.SecretRef`, `api.DriftReport`, and `api.DriftCorrection` types directly — no type duplication.\n\n3. **Handler pattern**: `ReconcileHandler` is a simple function type, following the same pattern as `api.EventHandler`. Handlers are registered before `Run()` is called. Future features (S005 mesh, S008 policy, S010 crypto) will register their own handlers to apply corrections to WireGuard, nftables, and signing key stores respectively. This feature only defines the handler interface and invocation mechanism — no concrete handlers are implemented.\n\n4. **Trigger mechanism**: `TriggerReconcile()` writes to a buffered channel (size 1). The `Run()` loop selects on both `time.Ticker.C` and the trigger channel. Buffered channel with len=1 provides natural coalescing: if a trigger is already pending, additional triggers are dropped (non-blocking send). After a triggered cycle, the ticker is reset.\n\n5. **Snapshot design**: `StateSnapshot` is a simple struct holding copies of the desired state fields, protected by `sync.RWMutex`. It is not persisted to disk in this feature (disk persistence is a future concern for offline resilience — see README note about caching last known state). The snapshot is updated per-category: if a handler for peers fails, only the peers portion of the snapshot is left stale, while policies/signing_keys/metadata/data/secret_refs can still be updated.\n\n6. **Diff computation**: `ComputeDiff` compares desired vs. snapshot using ID-based matching for peers and policies. Peer comparison checks: ID match (add/remove), then field equality for endpoint, allowed_ips (sorted comparison), and psk (update). Policy comparison is by ID only (add/remove) — detailed rule-level diffing is deferred to S008. Signing key comparison checks Current and Previous strings. Metadata/data/secret_refs use reflect.DeepEqual or key-version comparison.\n\n7. **Panic recovery**: Each handler invocation is wrapped in a defer/recover. This matches the pattern established by `EventDispatcher.Dispatch()` in `internal/api/dispatcher.go` where handler errors don't stop processing.\n\n8. **Logging convention**: Uses `log/slog` with `component=reconcile` key. Matches the `internal/api/` and `internal/registration/` pattern of accepting `*slog.Logger` in constructors.\n\n9. **Testing strategy**: All tests use `httptest.Server` for HTTP assertions. Reconciler tests configure fast intervals (e.g., 10ms) for responsive tests. Goroutine leak detection uses `go.uber.org/goleak` (already in go.mod). Diff tests are pure unit tests with no I/O.\n\n10. **Key files from existing codebase**:\n    - `internal/api/client.go` — ControlPlane.FetchState(), ReportDrift() methods\n    - `internal/api/types.go` — StateResponse, Peer, Policy, SigningKeys, DataEntry, SecretRef, DriftReport, DriftCorrection types\n    - `internal/api/config.go` — Config pattern with ApplyDefaults/Validate\n    - `internal/api/manager.go` — SSEManager integration point for reconnection trigger\n    - `internal/registration/identity.go` — NodeIdentity.NodeID for the reconciler\n\n11. **Scope boundary — what is NOT in this feature**:\n    - Concrete reconcile handlers for WireGuard (S005), nftables (S008), or signing keys (S010)\n    - Heartbeat sending loop (will be a separate component that calls TriggerReconcile)\n    - Disk persistence of the state snapshot (future feature)\n    - SSE event-driven state updates (already handled by SSEManager + EventDispatcher)\n    - The actual agent lifecycle wiring (connecting Registrar → SSEManager → Reconciler)\n\n12. **Potential pitfalls**:\n    - `time.Ticker` must be stopped on context cancellation to avoid goroutine leaks.\n    - The trigger channel must be buffered (size 1) to prevent goroutine blocking on send.\n    - `reflect.DeepEqual` for metadata map comparison is correct since maps with same keys/values are equal.\n    - Data entries should be compared by key + version, not by payload content (payload is json.RawMessage).\n    - Secret refs should be compared by key + version only.\n    - `ComputeDiff` must handle nil SigningKeys in both desired and snapshot gracefully.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.105001"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T08:40:43.378168"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T08:45:33.760816"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "66c4e68c-343f-442d-9151-45ba51f982e8",
+      "timestamp": "2026-02-12T08:45:33.760844",
+      "total_duration": 286.9941382408142,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 286.9941382408142,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
