@@ -2,8 +2,8 @@
   "feature_id": "PXD-0005",
   "title": "B001: Implement WireGuard tunnel management",
   "slug": "b001-implement-wireguard-tunnel-management",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Create, configure, and manage WireGuard interfaces and peer entries. Establish direct encrypted tunnels to all authorized peers within the same tenant. Implement full-mesh topology where every node can communicate directly with every other node. Handle key generation, peer configuration, and tunnel lifecycle.",
   "stories": [
@@ -440,13 +440,13 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/wireguard/config.go — Define Config struct: InterfaceName string (default wg0), ListenPort int (default 51820), MTU int (default 0 = system default). Implement ApplyDefaults() and Validate() matching internal/api/config.go pattern. Include tests in config_test.go for defaults, validation of invalid port (0, >65535), negative MTU, and custom overrides. (REQ-008)",
-    "1.2 Create internal/wireguard/controller.go — Define WGController interface with methods: CreateInterface(name string, privateKey []byte, listenPort int) error, DeleteInterface(name string) error, ConfigureAddress(name string, address string) error, SetInterfaceUp(name string) error, SetMTU(name string, mtu int) error, AddPeer(iface string, cfg PeerConfig) error, RemovePeer(iface string, publicKey []byte) error. Define PeerConfig struct: PublicKey []byte, Endpoint string, AllowedIPs []string, PSK []byte, PersistentKeepalive int. Implement PeerConfigFromAPI(peer api.Peer) (PeerConfig, error) to translate api.Peer to PeerConfig with base64 decoding of PublicKey and PSK. Include tests in controller_test.go for PeerConfigFromAPI: all fields, no endpoint, no PSK, invalid public key, invalid PSK. (REQ-002, REQ-009)",
-    "1.3 Create internal/wireguard/index.go — Implement PeerIndex struct with sync.RWMutex-protected map[string]string (peerID → base64 public key). Methods: Add(peerID, publicKey string), Remove(peerID string), Lookup(peerID string) (string, bool), Update(peerID, newPublicKey string), LoadFromPeers(peers []api.Peer) to bulk-populate. Include tests in index_test.go: add/lookup, remove, update key, lookup unknown ID, concurrent access with -race. (REQ-010)",
-    "2.1 Create internal/wireguard/manager.go — Implement Manager struct: WGController, Config, *slog.Logger, PeerIndex. Constructor NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager. Implement Setup(ctx, identity *registration.NodeIdentity) error: create interface, set private key, assign mesh IP/32, set MTU if configured, bring interface up. Implement Teardown() error: delete interface (no error if not exists). Implement AddPeer(peer api.Peer) error, RemovePeer(publicKey []byte) error, RemovePeerByID(peerID string) error, UpdatePeer(peer api.Peer) error. Implement ConfigurePeers(ctx, peers []api.Peer) error: bulk add peers with context check per peer. Include tests in manager_test.go with mock WGController for: Setup, Setup with existing interface, ConfigurePeers, AddPeer, RemovePeerByID, RemovePeerByID unknown, UpdatePeer, Teardown, Teardown no interface, ConfigurePeers context cancellation. (REQ-001, REQ-002, REQ-003, REQ-004, REQ-007, REQ-011, REQ-012)",
-    "2.2 Create internal/wireguard/handler.go — Implement ReconcileHandler(mgr *Manager) reconcile.ReconcileHandler: returns a function that processes StateDiff.PeersToRemove (via RemovePeerByID), PeersToUpdate (via UpdatePeer), PeersToAdd (via AddPeer) in that order. Individual failures logged and collected; aggregated error returned. Implement SSE event handler functions: HandlePeerAdded(mgr *Manager) api.EventHandler, HandlePeerRemoved(mgr *Manager) api.EventHandler, HandlePeerKeyRotated(mgr *Manager) api.EventHandler, HandlePeerEndpointChanged(mgr *Manager) api.EventHandler. Each parses the SignedEnvelope.Payload, calls the appropriate Manager method, logs errors. Include tests in handler_test.go with mock WGController for: full diff, empty diff, partial failure, SSE peer_added, peer_removed, peer_key_rotated, peer_endpoint_changed, malformed payload. (REQ-005, REQ-006)",
-    "3.1 Create internal/wireguard/mock_controller_test.go — Implement mockController struct satisfying WGController interface for use across all test files. Records all calls with arguments for assertion. Supports configurable error returns per method. This is a test helper, not a production file. (REQ-009)",
-    "4.1 Create docs/reference/backend/wireguard.md — Reference documentation for internal/wireguard/ package: Config struct fields and defaults, WGController interface and PeerConfig struct, Manager lifecycle (NewManager → Setup → ConfigurePeers → AddPeer/RemovePeer/UpdatePeer → Teardown), PeerIndex usage, ReconcileHandler factory function, SSE event handler factory functions. Include code examples for constructing a Manager, setting up the interface, and registering handlers with Reconciler and SSEManager. (REQ-001 through REQ-012)"
+    "[done] 1.1 Create internal/wireguard/config.go — Define Config struct: InterfaceName string (default wg0), ListenPort int (default 51820), MTU int (default 0 = system default). Implement ApplyDefaults() and Validate() matching internal/api/config.go pattern. Include tests in config_test.go for defaults, validation of invalid port (0, >65535), negative MTU, and custom overrides. (REQ-008)",
+    "[done] 1.2 Create internal/wireguard/controller.go — Define WGController interface with methods: CreateInterface(name string, privateKey []byte, listenPort int) error, DeleteInterface(name string) error, ConfigureAddress(name string, address string) error, SetInterfaceUp(name string) error, SetMTU(name string, mtu int) error, AddPeer(iface string, cfg PeerConfig) error, RemovePeer(iface string, publicKey []byte) error. Define PeerConfig struct: PublicKey []byte, Endpoint string, AllowedIPs []string, PSK []byte, PersistentKeepalive int. Implement PeerConfigFromAPI(peer api.Peer) (PeerConfig, error) to translate api.Peer to PeerConfig with base64 decoding of PublicKey and PSK. Include tests in controller_test.go for PeerConfigFromAPI: all fields, no endpoint, no PSK, invalid public key, invalid PSK. (REQ-002, REQ-009)",
+    "[done] 1.3 Create internal/wireguard/index.go — Implement PeerIndex struct with sync.RWMutex-protected map[string]string (peerID → base64 public key). Methods: Add(peerID, publicKey string), Remove(peerID string), Lookup(peerID string) (string, bool), Update(peerID, newPublicKey string), LoadFromPeers(peers []api.Peer) to bulk-populate. Include tests in index_test.go: add/lookup, remove, update key, lookup unknown ID, concurrent access with -race. (REQ-010)",
+    "[done] 1.4 Create internal/wireguard/mock_controller_test.go — Implement mockController struct satisfying WGController interface for use across all test files. Records all calls with arguments for assertion. Supports configurable error returns per method. This is a test helper, not a production file. (REQ-009)",
+    "[done] 2.1 Create internal/wireguard/manager.go — Implement Manager struct: WGController, Config, *slog.Logger, PeerIndex. Constructor NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager. Implement Setup(ctx, identity *registration.NodeIdentity) error: create interface, set private key, assign mesh IP/32, set MTU if configured, bring interface up. Implement Teardown() error: delete interface (no error if not exists). Implement AddPeer(peer api.Peer) error, RemovePeer(publicKey []byte) error, RemovePeerByID(peerID string) error, UpdatePeer(peer api.Peer) error. Implement ConfigurePeers(ctx, peers []api.Peer) error: bulk add peers with context check per peer. Include tests in manager_test.go with mock WGController for: Setup, Setup with existing interface, ConfigurePeers, AddPeer, RemovePeerByID, RemovePeerByID unknown, UpdatePeer, Teardown, Teardown no interface, ConfigurePeers context cancellation. (REQ-001, REQ-002, REQ-003, REQ-004, REQ-007, REQ-011, REQ-012)",
+    "[done] 2.2 Create internal/wireguard/handler.go — Implement ReconcileHandler(mgr *Manager) reconcile.ReconcileHandler: returns a function that processes StateDiff.PeersToRemove (via RemovePeerByID), PeersToUpdate (via UpdatePeer), PeersToAdd (via AddPeer) in that order. Individual failures logged and collected; aggregated error returned. Implement SSE event handler functions: HandlePeerAdded(mgr *Manager) api.EventHandler, HandlePeerRemoved(mgr *Manager) api.EventHandler, HandlePeerKeyRotated(mgr *Manager) api.EventHandler, HandlePeerEndpointChanged(mgr *Manager) api.EventHandler. Each parses the SignedEnvelope.Payload, calls the appropriate Manager method, logs errors. Include tests in handler_test.go with mock WGController for: full diff, empty diff, partial failure, SSE peer_added, peer_removed, peer_key_rotated, peer_endpoint_changed, malformed payload. (REQ-005, REQ-006)",
+    "[done] 3.1 Create docs/reference/backend/wireguard.md — Reference documentation for internal/wireguard/ package: Config struct fields and defaults, WGController interface and PeerConfig struct, Manager lifecycle (NewManager → Setup → ConfigurePeers → AddPeer/RemovePeer/UpdatePeer → Teardown), PeerIndex usage, ReconcileHandler factory function, SSE event handler factory functions. Include code examples for constructing a Manager, setting up the interface, and registering handlers with Reconciler and SSEManager. (REQ-001 through REQ-012)"
   ],
   "test_specifications": [
     {
@@ -682,6 +682,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T10:29:44.724606"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T12:20:38.209556"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T12:45:35.311601"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T12:45:35.326239"
     }
   },
   "execution_history": [
@@ -695,6 +707,50 @@
           "name": "prepare",
           "duration": 466.24170994758606,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "6ac7d6cb-6cbd-4bb1-9c34-cb276ae7f4e5",
+      "timestamp": "2026-02-12T12:43:22.222404",
+      "total_duration": 1214.522356748581,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 370.55512619018555,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (2 tasks)",
+          "duration": 410.71413350105286,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 89.27486181259155,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0005] Code Review",
+          "duration": 165.44115281105042,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0005] Improvements",
+          "duration": 108.69072270393372,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0005] Simplify",
+          "duration": 69.84635972976685,
+          "type": "simplify",
           "status": "done"
         }
       ]

@@ -1,0 +1,189 @@
+{
+  "feature_id": "PXD-0005",
+  "title": "B001: Implement WireGuard tunnel management",
+  "date": "2026-02-12",
+  "summary": "Implements the internal/wireguard package providing WireGuard interface lifecycle management, peer configuration, reconcile handler, and SSE event handlers. 5 production files (config.go, controller.go, index.go, manager.go, handler.go), 6 test files, and reference documentation. All 37 tests pass with -race. Coverage 78.8%. go vet clean. Code follows existing patterns (Config/ApplyDefaults/Validate, slog with component key, stdlib-only tests). WGController interface provides clean testability boundary. ReconcileHandler processes removes-then-updates-then-adds. SSE handlers cover all four peer event types. PeerIndex bridges control-plane IDs to WireGuard public keys with sync.RWMutex. Private keys and PSKs are never logged.",
+  "verdict": "NEEDS_CHANGES",
+  "tests_checklist": [
+    {"item": "V1: All 37 tests pass (go test ./internal/wireguard/... -race -count=1)", "checked": true},
+    {"item": "V2: go vet passes with no errors", "checked": true},
+    {"item": "V3: golangci-lint (blocked by toolchain version mismatch go1.23 vs go1.24, not a code issue)", "checked": true},
+    {"item": "TestConfig_Defaults — REQ-008 defaults applied", "checked": true},
+    {"item": "TestConfig_DefaultsPreserveExisting — REQ-008 custom overrides preserved", "checked": true},
+    {"item": "TestConfig_ValidateRejectsInvalidPort — REQ-008 port 0 and >65535 rejected", "checked": true},
+    {"item": "TestConfig_ValidateRejectsNegativeMTU — REQ-008 negative MTU rejected", "checked": true},
+    {"item": "TestConfig_ValidateAcceptsDefaults — REQ-008 valid defaults", "checked": true},
+    {"item": "TestConfig_ValidateAcceptsCustomValues — REQ-008 custom valid values", "checked": true},
+    {"item": "TestPeerConfigFromAPI_AllFields — REQ-002 all fields decoded", "checked": true},
+    {"item": "TestPeerConfigFromAPI_NoEndpoint — REQ-002 empty endpoint", "checked": true},
+    {"item": "TestPeerConfigFromAPI_NoPSK — REQ-002 nil PSK when empty", "checked": true},
+    {"item": "TestPeerConfigFromAPI_InvalidPublicKey — REQ-002 invalid base64 rejected", "checked": true},
+    {"item": "TestPeerConfigFromAPI_InvalidPSK — REQ-002 invalid PSK rejected", "checked": true},
+    {"item": "TestPeerIndex_AddAndLookup — REQ-010 add/lookup", "checked": true},
+    {"item": "TestPeerIndex_LookupUnknown — REQ-010 unknown ID returns false", "checked": true},
+    {"item": "TestPeerIndex_Remove — REQ-010 remove and verify", "checked": true},
+    {"item": "TestPeerIndex_RemoveUnknown — REQ-010 no panic on unknown remove", "checked": true},
+    {"item": "TestPeerIndex_UpdateKey — REQ-010 update key", "checked": true},
+    {"item": "TestPeerIndex_LoadFromPeers — REQ-010 bulk populate clears old entries", "checked": true},
+    {"item": "TestPeerIndex_ConcurrentAccess — REQ-010 race-free concurrent access", "checked": true},
+    {"item": "TestManager_Setup — REQ-001 interface created with key, IP, port", "checked": true},
+    {"item": "TestManager_Setup_WithMTU — REQ-001 MTU set when > 0", "checked": true},
+    {"item": "TestManager_Setup_CreateInterfaceError — REQ-001 error propagated", "checked": true},
+    {"item": "TestManager_Teardown — REQ-007 interface deleted", "checked": true},
+    {"item": "TestManager_Teardown_NoInterface — REQ-007 idempotent teardown", "checked": false},
+    {"item": "TestManager_AddPeer — REQ-002 peer added and indexed", "checked": true},
+    {"item": "TestManager_RemovePeerByID — REQ-003 resolve ID, remove, clean index", "checked": true},
+    {"item": "TestManager_RemovePeerByID_UnknownID — REQ-003 error on unknown ID", "checked": true},
+    {"item": "TestManager_UpdatePeer — REQ-004 upsert via AddPeer", "checked": true},
+    {"item": "TestManager_ConfigurePeers — REQ-002 bulk add 3 peers", "checked": true},
+    {"item": "TestManager_ConfigurePeers_ContextCancellation — REQ-012 stops on cancelled ctx", "checked": true},
+    {"item": "TestReconcileHandler_FullDiff — REQ-005 removes, updates, adds in order", "checked": true},
+    {"item": "TestReconcileHandler_EmptyDiff — REQ-005 no-op on empty diff", "checked": true},
+    {"item": "TestReconcileHandler_PartialFailure — REQ-005 aggregated error on failure", "checked": true},
+    {"item": "TestSSEHandler_PeerAdded — REQ-006 parse and add", "checked": true},
+    {"item": "TestSSEHandler_PeerRemoved — REQ-006 parse ID and remove", "checked": true},
+    {"item": "TestSSEHandler_PeerKeyRotated — REQ-006 remove old + add new", "checked": true},
+    {"item": "TestSSEHandler_PeerEndpointChanged — REQ-006 update peer endpoint", "checked": true},
+    {"item": "TestSSEHandler_MalformedPayload — REQ-006 error on bad JSON", "checked": true},
+    {"item": "TE1: Happy paths tested with realistic data (base64 keys, IP addresses, ports)", "checked": true},
+    {"item": "TE2: Edge cases tested (empty endpoint, nil PSK, unknown peer ID, empty diff, concurrent access)", "checked": true},
+    {"item": "TE3: Error cases tested (invalid base64, controller errors, context cancellation, malformed payload)", "checked": true},
+    {"item": "TE4: Tests independent (no shared mutable state)", "checked": true},
+    {"item": "TE6: Mocking appropriate (mockController for WGController only)", "checked": true},
+    {"item": "TE7: Assertions specific (exact values, call counts, error message substrings)", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "P1: Follows Config/ApplyDefaults/Validate pattern from internal/api/config.go", "checked": true},
+    {"item": "P1: Logging uses log/slog with component=wireguard consistently", "checked": true},
+    {"item": "P1: No file I/O in constructors (NewManager, NewPeerIndex)", "checked": true},
+    {"item": "P1: Interface abstraction for OS operations (WGController)", "checked": true},
+    {"item": "P1: Factory functions for handlers (ReconcileHandler, HandlePeerAdded, etc.) matching api.EventHandler/reconcile.ReconcileHandler types", "checked": true},
+    {"item": "P5: File location matches project structure (internal/wireguard/)", "checked": true},
+    {"item": "Q1: Functions have single responsibility", "checked": true},
+    {"item": "Q2: Functions are small (largest is ConfigurePeers ~34 lines, Setup ~27 lines)", "checked": true},
+    {"item": "Q3: No significant code duplication", "checked": true},
+    {"item": "Q4: Clear naming throughout (PeerConfigFromAPI, RemovePeerByID, LoadFromPeers)", "checked": true},
+    {"item": "Q5: Max 3 nesting levels (early returns used)", "checked": true},
+    {"item": "Q6: Named constants for defaults (DefaultInterfaceName, DefaultListenPort)", "checked": true},
+    {"item": "Q7: No dead code or commented-out code", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "S1: base64 input validated at API boundary (PeerConfigFromAPI rejects invalid encoding)", "checked": true},
+    {"item": "S3: No hardcoded secrets or keys", "checked": true},
+    {"item": "S5: Private key material never logged (Setup logs mesh_ip, listen_port, interface — not private key)", "checked": true},
+    {"item": "S5: PSK never logged (AddPeer/UpdatePeer log only peer_id)", "checked": true},
+    {"item": "S5: Public keys not logged (only peer_id in debug logs)", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Solution is the simplest approach for the requirements", "checked": true},
+    {"item": "WGController interface is minimal — only 7 methods covering exact OS operations needed", "checked": true},
+    {"item": "PeerIndex is the minimum data structure needed to bridge peer IDs to public keys", "checked": true},
+    {"item": "No over-engineering: no generics, no reflection, no external dependencies", "checked": true},
+    {"item": "Manager coordinates WGController + PeerIndex cleanly without leaking abstractions", "checked": true},
+    {"item": "Handler functions are stateless factories that close over the Manager", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code across files", "checked": true},
+    {"item": "PeerIndex.Update is semantically distinct from Add (same implementation, different intent)", "checked": true},
+    {"item": "No speculative features or future-proofing", "checked": true},
+    {"item": "No unused exports", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "PeerConfigFromAPI fails fast on invalid base64 before any controller call", "checked": true},
+    {"item": "RemovePeerByID fails fast on unknown peer ID before attempting removal", "checked": true},
+    {"item": "ConfigurePeers checks ctx.Err() before each peer operation", "checked": true},
+    {"item": "Config.Validate rejects invalid port/MTU before any interface operations", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "All base64 inputs validated (PublicKey, PSK)", "checked": true},
+    {"item": "Empty PSK handled as nil (not decoded)", "checked": true},
+    {"item": "Empty endpoint allowed (NAT traversal peers)", "checked": true},
+    {"item": "Unknown peer ID in RemovePeerByID returns explicit error", "checked": true},
+    {"item": "Context cancellation checked in bulk operations", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [
+    {
+      "severity": "MAJOR",
+      "id": "C3-1",
+      "description": "Manager.Teardown is NOT idempotent: the test TestManager_Teardown_NoInterface does not actually test non-existent interface — it uses a mock that returns nil by default. The real Teardown always calls DeleteInterface and wraps any error. If the controller returns an error for non-existent interface, Teardown returns that error. The plan/REQ-007 scenario 'Missing interface is no-op' requires Teardown to not error on non-existent interface, but this idempotency is delegated entirely to the WGController implementation — the Manager itself does not catch/suppress such errors. This should be documented as a contract on WGController.DeleteInterface.",
+      "location": "internal/wireguard/manager.go:63-68",
+      "fix": "Either (a) add a comment on WGController.DeleteInterface documenting that it MUST return nil for non-existent interface, or (b) have Teardown suppress 'not found' errors. Option (a) is simplest since the interface contract should specify this. Add a TestManager_Teardown_InterfaceNotFound test with a mock returning an error to verify the current behavior and document the expectation."
+    },
+    {
+      "severity": "MAJOR",
+      "id": "TE5-1",
+      "description": "Test naming does not follow test_should_X_when_Y convention specified in review checklist. Current names use TestType_Method or TestType_Method_Variant. This is however consistent with the project-wide Go testing convention seen in internal/api/, internal/reconcile/, and internal/registration/. Project convention overrides checklist naming.",
+      "location": "internal/wireguard/*_test.go",
+      "fix": "No action needed — project convention is TestType_Method which is already followed consistently."
+    },
+    {
+      "severity": "MAJOR",
+      "id": "C3-2",
+      "description": "Manager.RemovePeer(publicKey []byte) is exported but has 0% test coverage and is not called by any code in this package. RemovePeerByID is used everywhere (reconcile handler, SSE handler). RemovePeer exists only as a thin wrapper. While the plan specifies it, it is currently dead code within the package.",
+      "location": "internal/wireguard/manager.go:92-97",
+      "fix": "Add at least one test for RemovePeer to achieve coverage, or if it's only needed by future external callers, add a brief comment explaining the intent. A simple TestManager_RemovePeer test calling RemovePeer with a valid public key would suffice."
+    },
+    {
+      "severity": "MAJOR",
+      "id": "C3-3",
+      "description": "TestManager_Setup_InterfaceAlreadyExists is listed in test_specifications (REQ-001) but there is no corresponding test in manager_test.go. The test spec says 'Setup reconfigures existing interface without error' — this scenario is not explicitly tested. The current TestManager_Setup only tests first-time creation.",
+      "location": "internal/wireguard/manager_test.go",
+      "fix": "Add TestManager_Setup_InterfaceAlreadyExists that either (a) calls Setup twice and verifies no error on second call, or (b) configures the mock to simulate an 'already exists' scenario on CreateInterface. This depends on the WGController contract — if CreateInterface is idempotent, a second call should succeed."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "MAJOR-1",
+      "severity": "major",
+      "check_id": "C3-1",
+      "description": "Teardown idempotency not verified by tests. REQ-007 scenario 'Missing interface is no-op' requires idempotent teardown, but the test TestManager_Teardown_NoInterface just calls Teardown with a default mock (which always returns nil). It doesn't test the case where DeleteInterface returns an error for a non-existent interface.",
+      "location": "internal/wireguard/manager_test.go:123-131",
+      "fix": "Add a test that configures mockController.deleteInterfaceErr to return an 'interface not found' error and verify Manager.Teardown behavior. Also add a doc comment on WGController.DeleteInterface specifying it must return nil for non-existent interfaces."
+    },
+    {
+      "id": "MAJOR-2",
+      "severity": "major",
+      "check_id": "C3-2",
+      "description": "Manager.RemovePeer has 0% test coverage. While it's a simple wrapper, it's an exported method on a core type.",
+      "location": "internal/wireguard/manager.go:92-97",
+      "fix": "Add TestManager_RemovePeer that exercises the method with a valid public key byte slice."
+    },
+    {
+      "id": "MAJOR-3",
+      "severity": "major",
+      "check_id": "C3-3",
+      "description": "Missing test TestManager_Setup_InterfaceAlreadyExists from test_specifications. This test is listed in the plan's test_specifications but was not implemented.",
+      "location": "internal/wireguard/manager_test.go",
+      "fix": "Add TestManager_Setup_InterfaceAlreadyExists that tests Setup when the interface already exists (e.g., double Setup call or mock simulating existing interface)."
+    },
+    {
+      "id": "MINOR-1",
+      "severity": "minor",
+      "check_id": "D2",
+      "description": "WGController.DeleteInterface lacks a doc comment specifying the idempotency contract (must return nil for non-existent interface).",
+      "location": "internal/wireguard/controller.go:13",
+      "fix": "Add a comment: // DeleteInterface removes the named WireGuard interface. It must return nil if the interface does not exist."
+    },
+    {
+      "id": "MINOR-2",
+      "severity": "minor",
+      "check_id": "PF4",
+      "description": "ConfigurePeers silently continues on individual peer errors (logs them but returns nil). The caller has no way to know some peers failed. This is by design per the plan, but the method's doc comment says 'Individual errors are logged but not returned' which is accurate.",
+      "location": "internal/wireguard/manager.go:146-181",
+      "fix": "No code change needed — behavior matches the documented contract. Consider returning an error count or aggregated error in a future iteration if operational visibility is needed."
+    }
+  ],
+  "suggested_improvements": [
+    "Add WGController.DeleteInterface doc comment specifying idempotency contract (must return nil for non-existent interface)",
+    "Add TestManager_RemovePeer test to achieve coverage on the exported RemovePeer method",
+    "Add TestManager_Setup_InterfaceAlreadyExists test as specified in test_specifications",
+    "Consider adding TestManager_Teardown_DeleteError to verify error wrapping when deletion fails"
+  ],
+  "next_steps": [
+    "Implement the 3 missing tests (RemovePeer, Setup_InterfaceAlreadyExists, Teardown with deleteInterfaceErr)",
+    "Add doc comment on WGController.DeleteInterface idempotency contract",
+    "Re-run tests and verify coverage improves above 80%",
+    "Request re-review after changes"
+  ]
+}
