@@ -2,8 +2,8 @@
   "feature_id": "PXD-0002",
   "title": "A002: Implement self-registration and bootstrap auth",
   "slug": "a002-implement-self-registration-and-bootstrap",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Authenticate with the control plane using a one-time bootstrap token and enroll the node. Supports platform-provisioned tokens (injected via Cloud-Init or Kubernetes Secret) and manually provided tokens for user-onboarded resources. After successful registration, the node receives its identity, mesh IP, and initial configuration.",
   "stories": [
@@ -495,13 +495,13 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/registration/config.go — Define Config struct: DataDir string, TokenFile string (default /etc/plexd/bootstrap-token), TokenEnv string (default PLEXD_BOOTSTRAP_TOKEN), TokenValue string (direct override), UseMetadata bool, Hostname string (override, default os.Hostname()), Metadata map[string]string, MaxRetryDuration time.Duration (default 5m). Implement ApplyDefaults() and Validate() matching internal/api/config.go pattern. Include tests in config_test.go for defaults and validation. (REQ-008)",
-    "1.2 Create internal/registration/keys.go — Implement GenerateKeypair() (Keypair, error) using golang.org/x/crypto/curve25519. Keypair struct: PrivateKey []byte, PublicKey []byte. Use crypto/rand for 32-byte private key, clamp per Curve25519 spec, derive public key via curve25519.X25519(privateKey, curve25519.Basepoint). Implement EncodePublicKey() string returning standard base64. Include tests in keys_test.go: valid key derivation, base64 roundtrip, uniqueness across calls. (REQ-002)",
-    "1.3 Create internal/registration/token.go — Implement TokenResolver struct with Resolve(ctx) (TokenResult, error). TokenResult: Value string, FilePath string (non-empty if from file). Check sources in order: Config.TokenValue, Config.TokenFile (os.ReadFile, trim), Config.TokenEnv (os.Getenv, trim), metadata (via MetadataProvider interface, nil = skip). Validate: non-empty, <=512 bytes, printable ASCII. Implement MetadataProvider interface: ReadToken(ctx) (string, error) for future Cloud-Init/K8s support. Include tests in token_test.go using temp files and t.Setenv for all scenarios. (REQ-001)",
-    "1.4 Create internal/registration/identity.go — Define NodeIdentity struct: NodeID string, MeshIP string, PrivateKey []byte (json:\"-\"), SigningPublicKey string, NodeSecretKey string (json:\"-\"). Define ErrNotRegistered sentinel error. Implement SaveIdentity(dataDir, identity) error: create dataDir (0700), write identity.json atomically (temp+rename, 0600), write private_key (0600), write node_secret_key (0600), write signing_public_key (0600). Implement LoadIdentity(dataDir) (*NodeIdentity, error): read all files, validate, return ErrNotRegistered if missing. Include tests in identity_test.go using t.TempDir for save/load roundtrip, missing files, corrupt JSON, permissions. (REQ-005)",
-    "2.1 Create internal/registration/registrar.go — Implement Registrar struct: ControlPlane client, Config, logger. Implement Register(ctx) (*NodeIdentity, error) orchestrating: (1) LoadIdentity → if ok, set auth token, return. (2) TokenResolver.Resolve → (3) GenerateKeypair → (4) set bootstrap token as auth → (5) call registerWithRetry → (6) build NodeIdentity from response + private key → (7) SaveIdentity → (8) delete token file if applicable → (9) set node_secret_key as auth token → return. Implement IsRegistered() bool. Include tests in registrar_test.go using httptest.Server: successful flow, skip on existing identity, 401/409 immediate failure. (REQ-003, REQ-006, REQ-007, REQ-009)",
-    "2.2 Add retry logic to registrar.go — Implement registerWithRetry(ctx, req) (*RegisterResponse, error): retry loop using the same backoff pattern as internal/api/reconnect.go (reuse ClassifyError). Exponential backoff 1s/2x/60s cap, ±25% jitter. Permanent errors (401, 403, 409, 400) fail immediately. 429 respects Retry-After. Timeout after Config.MaxRetryDuration. Context cancellation exits. Use injectable Clock interface for testable timing. Include tests in registrar_test.go: transient retry with eventual success, 429 with Retry-After, timeout after max duration, context cancellation during backoff. (REQ-004, REQ-010)",
-    "3.1 Create docs/reference/backend/registration.md — Reference documentation for internal/registration/ package: Config struct fields and defaults, TokenResolver usage and source priority, GenerateKeypair usage, NodeIdentity struct and persistence layout, Registrar lifecycle and Register() method, ErrNotRegistered error, MetadataProvider interface. Include code examples for constructing a Registrar and running registration. (REQ-001 through REQ-012)"
+    "[done] 1.1 Create internal/registration/config.go — Define Config struct: DataDir string, TokenFile string (default /etc/plexd/bootstrap-token), TokenEnv string (default PLEXD_BOOTSTRAP_TOKEN), TokenValue string (direct override), UseMetadata bool, Hostname string (override, default os.Hostname()), Metadata map[string]string, MaxRetryDuration time.Duration (default 5m). Implement ApplyDefaults() and Validate() matching internal/api/config.go pattern. Include tests in config_test.go for defaults and validation. (REQ-008)",
+    "[done] 1.2 Create internal/registration/keys.go — Implement GenerateKeypair() (Keypair, error) using golang.org/x/crypto/curve25519. Keypair struct: PrivateKey []byte, PublicKey []byte. Use crypto/rand for 32-byte private key, clamp per Curve25519 spec, derive public key via curve25519.X25519(privateKey, curve25519.Basepoint). Implement EncodePublicKey() string returning standard base64. Include tests in keys_test.go: valid key derivation, base64 roundtrip, uniqueness across calls. (REQ-002)",
+    "[done] 1.3 Create internal/registration/token.go — Implement TokenResolver struct with Resolve(ctx) (TokenResult, error). TokenResult: Value string, FilePath string (non-empty if from file). Check sources in order: Config.TokenValue, Config.TokenFile (os.ReadFile, trim), Config.TokenEnv (os.Getenv, trim), metadata (via MetadataProvider interface, nil = skip). Validate: non-empty, <=512 bytes, printable ASCII. Implement MetadataProvider interface: ReadToken(ctx) (string, error) for future Cloud-Init/K8s support. Include tests in token_test.go using temp files and t.Setenv for all scenarios. (REQ-001)",
+    "[done] 1.4 Create internal/registration/identity.go — Define NodeIdentity struct: NodeID string, MeshIP string, PrivateKey []byte (json:\"-\"), SigningPublicKey string, NodeSecretKey string (json:\"-\"). Define ErrNotRegistered sentinel error. Implement SaveIdentity(dataDir, identity) error: create dataDir (0700), write identity.json atomically (temp+rename, 0600), write private_key (0600), write node_secret_key (0600), write signing_public_key (0600). Implement LoadIdentity(dataDir) (*NodeIdentity, error): read all files, validate, return ErrNotRegistered if missing. Include tests in identity_test.go using t.TempDir for save/load roundtrip, missing files, corrupt JSON, permissions. (REQ-005)",
+    "[done] 2.1 Create internal/registration/registrar.go — Implement Registrar struct: ControlPlane client, Config, logger. Implement Register(ctx) (*NodeIdentity, error) orchestrating: (1) LoadIdentity → if ok, set auth token, return. (2) TokenResolver.Resolve → (3) GenerateKeypair → (4) set bootstrap token as auth → (5) call registerWithRetry → (6) build NodeIdentity from response + private key → (7) SaveIdentity → (8) delete token file if applicable → (9) set node_secret_key as auth token → return. Implement IsRegistered() bool. Include tests in registrar_test.go using httptest.Server: successful flow, skip on existing identity, 401/409 immediate failure. (REQ-003, REQ-006, REQ-007, REQ-009)",
+    "[done] 2.2 Add retry logic to registrar.go — Implement registerWithRetry(ctx, req) (*RegisterResponse, error): retry loop using the same backoff pattern as internal/api/reconnect.go (reuse ClassifyError). Exponential backoff 1s/2x/60s cap, ±25% jitter. Permanent errors (401, 403, 409, 400) fail immediately. 429 respects Retry-After. Timeout after Config.MaxRetryDuration. Context cancellation exits. Use injectable Clock interface for testable timing. Include tests in registrar_test.go: transient retry with eventual success, 429 with Retry-After, timeout after max duration, context cancellation during backoff. (REQ-004, REQ-010)",
+    "[done] 3.1 Create docs/reference/backend/registration.md — Reference documentation for internal/registration/ package: Config struct fields and defaults, TokenResolver usage and source priority, GenerateKeypair usage, NodeIdentity struct and persistence layout, Registrar lifecycle and Register() method, ErrNotRegistered error, MetadataProvider interface. Include code examples for constructing a Registrar and running registration. (REQ-001 through REQ-012)"
   ],
   "test_specifications": [
     {
@@ -738,6 +738,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T08:10:55.283882"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T08:13:45.286780"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T08:40:26.512563"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T08:40:26.553481"
     }
   },
   "execution_history": [
@@ -751,6 +763,50 @@
           "name": "prepare",
           "duration": 342.4106676578522,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "091f82f3-d981-46fd-8971-9aafee3dc91f",
+      "timestamp": "2026-02-12T08:36:58.868232",
+      "total_duration": 1202.9501783847809,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 308.28270983695984,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (2 tasks)",
+          "duration": 441.6743423938751,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 73.55836272239685,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0002] Code Review",
+          "duration": 213.45655059814453,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0002] Improvements",
+          "duration": 116.48853135108948,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0002] Simplify",
+          "duration": 49.48968148231506,
+          "type": "simplify",
           "status": "done"
         }
       ]

@@ -1,0 +1,102 @@
+{
+  "feature_id": "PXD-0002",
+  "title": "A002: Implement self-registration and bootstrap auth",
+  "date": "2026-02-12",
+  "verdict": "APPROVED",
+  "summary": "Clean, well-structured registration package implementing token resolution, Curve25519 keypair generation, identity persistence, and retry-aware control plane registration. All 39 tests pass, security practices are sound (json:\"-\" tags, 0600 permissions, atomic writes, no key material in logs), and the code follows established patterns from internal/api/. Minor suggestions for improved temp file permissions and an additional priority test case.",
+  "tests_checklist": [
+    {"item": "All 39 tests pass (go test ./internal/registration/...)", "checked": true},
+    {"item": "Edge cases covered: corrupt JSON, missing files, empty/whitespace tokens, non-printable chars, boundary token length (512 bytes)", "checked": true},
+    {"item": "Error cases covered: 401/409 immediate failure, 5xx transient retry, 429 Retry-After, timeout, context cancellation, permission denied", "checked": true},
+    {"item": "Test independence: t.TempDir(), httptest.Server per test, t.Setenv() for env vars, atomic counters", "checked": true},
+    {"item": "Specific assertions: exact values, exact permissions, exact field checks", "checked": true},
+    {"item": "Token priority order tested (file > env)", "checked": true},
+    {"item": "Curve25519 clamping verified at bit level", "checked": true},
+    {"item": "Save/load roundtrip tested with non-trivial key material", "checked": true},
+    {"item": "Full end-to-end flow tested (register, persist, cleanup, reload)", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing patterns (Config ApplyDefaults/Validate, slog structured logging, api.ClassifyError reuse)", "checked": true},
+    {"item": "Single responsibility per file (config, keys, token, identity, registrar)", "checked": true},
+    {"item": "Functions small and focused (Register ~40 lines as orchestrator, acceptable)", "checked": true},
+    {"item": "Named constants (DefaultTokenFile, DefaultMaxRetryDuration, maxTokenLength)", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "Clear naming conventions throughout", "checked": true},
+    {"item": "Guard clauses and early returns used properly", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "PrivateKey and NodeSecretKey use json:\"-\" tags preventing accidental serialization", "checked": true},
+    {"item": "No private key material in any log statement", "checked": true},
+    {"item": "crypto/rand used for key generation (not math/rand)", "checked": true},
+    {"item": "Curve25519 clamping correctly applied (bits 0-2 cleared, bit 255 cleared, bit 254 set)", "checked": true},
+    {"item": "Token validation: max 512 bytes, printable ASCII only", "checked": true},
+    {"item": "Sensitive files written with 0600 permissions", "checked": true},
+    {"item": "Data directory created with 0700 permissions", "checked": true},
+    {"item": "Atomic writes (temp + fsync + rename) prevent partial identity files", "checked": true},
+    {"item": "Bootstrap token file deleted after successful registration", "checked": true},
+    {"item": "No hardcoded secrets or credentials", "checked": true},
+    {"item": "No path traversal risk (filepath.Join used consistently)", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Package boundary respected: no file I/O beyond identity and token operations", "checked": true},
+    {"item": "Reuses api.ClassifyError instead of duplicating retry classification", "checked": true},
+    {"item": "Reuses api.Clock interface for testable time", "checked": true},
+    {"item": "MetadataProvider interface enables future cloud-specific token sources", "checked": true},
+    {"item": "Config loading is caller's responsibility (no file I/O in package)", "checked": true},
+    {"item": "Registration is idempotent (loads existing identity on restart)", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code across files", "checked": true},
+    {"item": "No unnecessary abstractions or interfaces", "checked": true},
+    {"item": "No unused exports or functions", "checked": true},
+    {"item": "No future-proofing beyond MetadataProvider (which is in the plan)", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config.Validate catches missing DataDir early", "checked": true},
+    {"item": "Token validation rejects invalid input before HTTP call", "checked": true},
+    {"item": "LoadIdentity validates required fields (node_id, mesh_ip) after loading", "checked": true},
+    {"item": "Permanent errors (401, 403, 409, 400) fail immediately without retry", "checked": true},
+    {"item": "Context cancellation checked before each retry iteration", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Token from file/env is trimmed of whitespace", "checked": true},
+    {"item": "File-not-found for token file falls through to next source gracefully", "checked": true},
+    {"item": "Corrupt identity files trigger re-registration with warning log", "checked": true},
+    {"item": "Token deletion failure logged but does not fail registration", "checked": true},
+    {"item": "Temp files cleaned up via deferred os.Remove on error paths", "checked": true}
+  ],
+  "security_findings": [
+    {
+      "severity": "LOW",
+      "description": "writeFileAtomic uses os.Create which creates temp file with default permissions (0666 & ~umask) before os.Chmod sets 0600. Brief window where temp file may have broader permissions than intended.",
+      "location": "internal/registration/identity.go:120",
+      "fix": "Use os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600) instead of os.Create(tmpPath). Note: parent dir is 0700 which mitigates this — risk is minimal."
+    }
+  ],
+  "architecture_findings": [],
+  "issues_found": [
+    {
+      "id": "TE2-1",
+      "severity": "minor",
+      "description": "Missing test for direct token value overriding file when both are configured. TestTokenResolver_PriorityOrder tests file > env but not direct > file.",
+      "location": "internal/registration/token_test.go",
+      "fix": "Add TestTokenResolver_DirectValueOverridesFile that sets both TokenValue and TokenFile and verifies TokenValue wins."
+    },
+    {
+      "id": "Q7-1",
+      "severity": "minor",
+      "description": "identity.go:100-102 silently overwrites JSON SigningPublicKey with file value when they differ. This is correct behavior (file is source of truth) but the discrepancy could be logged.",
+      "location": "internal/registration/identity.go:100-102",
+      "fix": "Optional: add a debug/warn log when file SPK differs from JSON SPK to aid troubleshooting."
+    }
+  ],
+  "suggested_improvements": [
+    "Use os.OpenFile with 0600 in writeFileAtomic instead of os.Create to avoid brief permission window (identity.go:120)",
+    "Add TestTokenResolver_DirectValueOverridesFile to verify full priority chain (direct > file > env > metadata)",
+    "Consider logging a warning in LoadIdentity when signing_public_key file differs from identity.json value (identity.go:100-102)"
+  ],
+  "next_steps": [
+    "Integration: Wire Registrar into agent lifecycle (main.go or agent bootstrap code)",
+    "Implement concrete MetadataProvider for Cloud-Init and Kubernetes token sources (S020/S021/S022)"
+  ]
+}
