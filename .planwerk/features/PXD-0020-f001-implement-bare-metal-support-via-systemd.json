@@ -1,0 +1,773 @@
+{
+  "feature_id": "PXD-0020",
+  "title": "F001: Implement bare-metal support via systemd",
+  "slug": "f001-implement-bare-metal-support-via-systemd",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Package plexd as a systemd service for bare-metal Linux servers. Include systemd unit files, installation scripts, and support for both manual enrollment (user provides bootstrap token) and automated enrollment. Support amd64 and arm64 architectures.",
+  "stories": [
+    {
+      "title": "Operator installs plexd as a systemd service on a bare-metal Linux server",
+      "role": "platform operator",
+      "want": "to run `plexd install` on a bare-metal Linux server and have plexd installed as a systemd service with correct unit file, default configuration, and proper directory structure",
+      "so_that": "plexd starts automatically on boot and is managed via standard systemctl commands (start, stop, restart, status, enable, disable)",
+      "criteria": [
+        "`plexd install` copies the plexd binary to /usr/local/bin/plexd (or the configured path)",
+        "`plexd install` writes the systemd unit file to /etc/systemd/system/plexd.service",
+        "`plexd install` creates /etc/plexd/ directory with 0755 permissions for configuration",
+        "`plexd install` creates /var/lib/plexd/ directory with 0700 permissions for data",
+        "`plexd install` writes a default config.yaml to /etc/plexd/config.yaml if none exists (does not overwrite existing)",
+        "`plexd install` runs `systemctl daemon-reload` after writing the unit file",
+        "The install command requires root privileges and exits with an error if not running as root",
+        "If plexd is already installed (unit file exists), the command updates the binary and unit file and reloads systemd"
+      ]
+    },
+    {
+      "title": "Operator uninstalls plexd systemd service from a bare-metal server",
+      "role": "platform operator",
+      "want": "to run `plexd uninstall` to cleanly remove the plexd systemd service, optionally purging all data",
+      "so_that": "the server is left clean without dangling services or stale state after decommissioning",
+      "criteria": [
+        "`plexd uninstall` stops the plexd service if running",
+        "`plexd uninstall` disables the plexd service (systemctl disable)",
+        "`plexd uninstall` removes the systemd unit file from /etc/systemd/system/plexd.service",
+        "`plexd uninstall` runs `systemctl daemon-reload` after removing the unit file",
+        "With `--purge` flag, `plexd uninstall` also removes /var/lib/plexd/ (data_dir) and /etc/plexd/ (config_dir)",
+        "Without `--purge`, configuration and data directories are preserved",
+        "The uninstall command requires root privileges and exits with an error if not running as root",
+        "If plexd is not installed (no unit file), the command logs a message and exits successfully"
+      ]
+    },
+    {
+      "title": "plexd systemd unit file follows Linux service best practices",
+      "role": "platform operator",
+      "want": "the systemd unit file to follow best practices for a long-running network daemon: restart on failure, proper ordering, security hardening, and correct resource management",
+      "so_that": "the service is reliable, recovers from crashes, starts after network is available, and follows the principle of least privilege",
+      "criteria": [
+        "Unit file specifies Type=notify or Type=simple with appropriate start verification",
+        "Unit file includes After=network-online.target and Wants=network-online.target for network dependency",
+        "Unit file sets Restart=on-failure with RestartSec=5s for automatic crash recovery",
+        "Unit file sets StartLimitBurst=5 and StartLimitIntervalSec=60s to prevent crash loops",
+        "Unit file sets LimitNOFILE=65536 for sufficient file descriptors for WireGuard tunnels",
+        "Unit file specifies Environment=PLEXD_CONFIG=/etc/plexd/config.yaml",
+        "Unit file includes security hardening: ProtectSystem=full, ProtectHome=true, NoNewPrivileges=false (needs NET_ADMIN), ReadWritePaths=/var/lib/plexd /var/run/plexd",
+        "Unit file grants AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW for WireGuard and ICMP"
+      ]
+    },
+    {
+      "title": "Operator enrolls a bare-metal node with a manually provided bootstrap token",
+      "role": "platform operator",
+      "want": "to provide a bootstrap token during installation or first startup so the node registers with the control plane",
+      "so_that": "I can enroll bare-metal servers that don't have automated token provisioning (no Cloud-Init or metadata service)",
+      "criteria": [
+        "`plexd install --token <value>` writes the token to /etc/plexd/bootstrap-token with 0600 permissions",
+        "`plexd install --token-file <path>` copies the specified token file to /etc/plexd/bootstrap-token",
+        "If no token is provided during install, plexd starts but waits for a token (operator can use `plexd join` later)",
+        "The bootstrap token file is deleted after successful registration (existing behavior from registration package)",
+        "Interactive `plexd join` prompts for the token without echoing it to the terminal (existing CLI behavior)"
+      ]
+    },
+    {
+      "title": "Operator enrolls a bare-metal node via automated token provisioning",
+      "role": "platform operator",
+      "want": "plexd to automatically discover the bootstrap token from the environment or a pre-provisioned file",
+      "so_that": "I can automate bare-metal provisioning via configuration management tools (Ansible, Puppet) or PXE boot without manual intervention",
+      "criteria": [
+        "When the bootstrap token file (/etc/plexd/bootstrap-token) is pre-provisioned, plexd reads it on startup and registers automatically",
+        "When PLEXD_BOOTSTRAP_TOKEN is set in the systemd environment, plexd uses it for registration",
+        "The systemd unit file supports EnvironmentFile=-/etc/plexd/environment for operator-defined environment variables",
+        "The token resolution order is preserved: direct value > file > env var > metadata (existing TokenResolver behavior)"
+      ]
+    },
+    {
+      "title": "plexd binary supports both amd64 and arm64 architectures",
+      "role": "platform operator",
+      "want": "to install plexd on both x86_64 (amd64) and ARM64 (arm64) Linux servers",
+      "so_that": "I can manage heterogeneous infrastructure including cloud instances, edge devices, and ARM-based servers",
+      "criteria": [
+        "The install script detects the CPU architecture via `uname -m` and downloads the correct binary",
+        "Supported architectures are mapped: x86_64 -> amd64, aarch64 -> arm64",
+        "Unsupported architectures cause the install script to exit with a clear error message listing supported architectures",
+        "The installer verifies the downloaded binary checksum (SHA-256) before installing",
+        "Go build targets include GOOS=linux GOARCH=amd64 and GOOS=linux GOARCH=arm64"
+      ]
+    },
+    {
+      "title": "Operator uses an install script to download and set up plexd on a fresh server",
+      "role": "platform operator",
+      "want": "to run a single curl-pipe-sh command to download, verify, and install plexd with all necessary directories and systemd configuration",
+      "so_that": "I can quickly provision new bare-metal nodes with minimal manual steps",
+      "criteria": [
+        "The install script is a self-contained POSIX-compatible shell script (no bash-specific features)",
+        "The script detects OS (must be Linux) and architecture (amd64 or arm64)",
+        "The script downloads the plexd binary from the configured artifact URL",
+        "The script verifies the binary SHA-256 checksum against a published checksum file",
+        "The script runs `plexd install` to set up the systemd service, directories, and unit file",
+        "The script accepts optional flags: --token, --api-url, --version, --no-start",
+        "The script prints a clear summary of what was installed and next steps",
+        "The script exits with non-zero on any failure and cleans up partial state"
+      ]
+    },
+    {
+      "title": "plexd service reports correct status and handles signals gracefully",
+      "role": "platform operator",
+      "want": "plexd to respond to systemd lifecycle management: SIGTERM for graceful stop, status reporting, and journal logging",
+      "so_that": "standard Linux administration tools work as expected with the plexd service",
+      "criteria": [
+        "plexd writes logs to stdout/stderr (captured by systemd journal)",
+        "SIGTERM triggers graceful shutdown: stop SSE, drain actions, deregister, tear down tunnels",
+        "systemctl status plexd shows the service as active (running) when connected",
+        "Structured log output is captured in journald and visible via `journalctl -u plexd`"
+      ]
+    },
+    {
+      "title": "Reference documentation covers systemd packaging and installation",
+      "role": "developer",
+      "want": "reference documentation for the install/uninstall commands, systemd unit file format, configuration, and the packaging module",
+      "so_that": "operators and developers can understand the systemd integration and customize it",
+      "criteria": [
+        "Documentation lists all install/uninstall command flags with descriptions",
+        "Documentation describes the systemd unit file sections and their purpose",
+        "Documentation lists all file paths created during installation with permissions",
+        "Documentation describes the install script flags and behavior"
+      ]
+    },
+    {
+      "title": "Operator follows a how-to guide to install plexd on bare-metal",
+      "role": "platform operator",
+      "want": "a step-by-step guide to install plexd on a bare-metal server with manual enrollment",
+      "so_that": "I can follow a clear procedure to get plexd running on a new server",
+      "criteria": [
+        "Guide includes prerequisites (Linux, root access, network connectivity to control plane)",
+        "Guide covers both install script method and manual installation",
+        "Guide covers providing the bootstrap token (interactive, file, env var)",
+        "Guide covers verifying the installation with systemctl status and plexd status"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The install package SHALL create a systemd unit file at /etc/systemd/system/plexd.service with correct service configuration including restart policy, network dependency, capabilities, and security hardening",
+      "priority": "SHALL",
+      "rationale": "The systemd unit file is the core artifact for bare-metal deployment; it must follow Linux best practices for a network daemon that needs NET_ADMIN capability",
+      "scenarios": [
+        {
+          "name": "Unit file created with correct sections",
+          "when": "GenerateUnitFile() is called with default InstallConfig",
+          "then": "the output contains [Unit], [Service], and [Install] sections",
+          "and_then": [
+            "Type=simple is set",
+            "After=network-online.target is set",
+            "Restart=on-failure with RestartSec=5s is set",
+            "WantedBy=multi-user.target is set in [Install]"
+          ]
+        },
+        {
+          "name": "Unit file includes security hardening",
+          "when": "GenerateUnitFile() is called",
+          "then": "security directives are present: ProtectSystem=full, ProtectHome=true, ReadWritePaths for data and run dirs",
+          "and_then": [
+            "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW is set",
+            "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW is set"
+          ]
+        },
+        {
+          "name": "Unit file includes environment file",
+          "when": "GenerateUnitFile() is called",
+          "then": "EnvironmentFile=-/etc/plexd/environment is set (dash prefix means optional)",
+          "and_then": [
+            "the file is not required to exist for the service to start"
+          ]
+        },
+        {
+          "name": "Unit file supports custom binary path",
+          "when": "GenerateUnitFile() is called with BinaryPath=/opt/plexd/bin/plexd",
+          "then": "ExecStart points to /opt/plexd/bin/plexd up --config /etc/plexd/config.yaml",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The install command SHALL create required directories (/etc/plexd/, /var/lib/plexd/, /var/run/plexd/) with correct permissions and install the binary and unit file",
+      "priority": "SHALL",
+      "rationale": "Correct directory structure with proper permissions is required for security and operation",
+      "scenarios": [
+        {
+          "name": "Directories created with correct permissions",
+          "when": "Install() is called with default config",
+          "then": "/etc/plexd/ is created with 0755, /var/lib/plexd/ with 0700, /var/run/plexd/ with 0755",
+          "and_then": []
+        },
+        {
+          "name": "Binary copied to install path",
+          "when": "Install() is called with a valid running binary path",
+          "then": "the binary is copied to the configured install path with 0755 permissions",
+          "and_then": []
+        },
+        {
+          "name": "Existing config not overwritten",
+          "when": "Install() is called and config.yaml already exists",
+          "then": "the existing config file is preserved",
+          "and_then": [
+            "a log message indicates the existing config was kept"
+          ]
+        },
+        {
+          "name": "Default config written if absent",
+          "when": "Install() is called and config.yaml does not exist",
+          "then": "a default config.yaml is written with the api URL placeholder",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The install command SHALL execute `systemctl daemon-reload` after writing or updating the unit file",
+      "priority": "SHALL",
+      "rationale": "systemd requires a daemon-reload to pick up new or changed unit files",
+      "scenarios": [
+        {
+          "name": "daemon-reload after fresh install",
+          "when": "Install() writes a new unit file",
+          "then": "`systemctl daemon-reload` is executed",
+          "and_then": [
+            "the exit code is checked and an error is returned on failure"
+          ]
+        },
+        {
+          "name": "daemon-reload after unit file update",
+          "when": "Install() updates an existing unit file",
+          "then": "`systemctl daemon-reload` is executed",
+          "and_then": []
+        },
+        {
+          "name": "Install fails if systemctl is not available",
+          "when": "systemctl binary is not found in PATH",
+          "then": "Install() returns an error indicating systemd is not available",
+          "and_then": [
+            "no files are created or modified"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The uninstall command SHALL stop, disable, and remove the systemd service, and optionally purge data and configuration directories",
+      "priority": "SHALL",
+      "rationale": "Clean uninstallation prevents dangling services and stale state",
+      "scenarios": [
+        {
+          "name": "Service stopped and disabled",
+          "when": "Uninstall() is called and the service is running",
+          "then": "`systemctl stop plexd` and `systemctl disable plexd` are executed",
+          "and_then": [
+            "the unit file is removed",
+            "`systemctl daemon-reload` is executed"
+          ]
+        },
+        {
+          "name": "Purge removes all directories",
+          "when": "Uninstall(purge=true) is called",
+          "then": "/var/lib/plexd/ and /etc/plexd/ are removed recursively",
+          "and_then": [
+            "the plexd binary is removed"
+          ]
+        },
+        {
+          "name": "Non-purge preserves directories",
+          "when": "Uninstall(purge=false) is called",
+          "then": "only the unit file and binary are removed; data and config dirs preserved",
+          "and_then": []
+        },
+        {
+          "name": "Uninstall when not installed is idempotent",
+          "when": "Uninstall() is called but no unit file exists",
+          "then": "the command logs a message and returns nil",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The install command SHALL support writing a bootstrap token to /etc/plexd/bootstrap-token with 0600 permissions when provided via --token or --token-file flags",
+      "priority": "SHALL",
+      "rationale": "Manual enrollment on bare-metal requires the token to be available at the configured path for the TokenResolver",
+      "scenarios": [
+        {
+          "name": "Token from --token flag written to file",
+          "when": "Install() is called with TokenValue='plx_enroll_abc123'",
+          "then": "the token is written to /etc/plexd/bootstrap-token with 0600 permissions",
+          "and_then": [
+            "the file contains only the token value with no trailing newline"
+          ]
+        },
+        {
+          "name": "Token from --token-file flag copied",
+          "when": "Install() is called with TokenFile='/tmp/my-token'",
+          "then": "the content is read, trimmed, validated, and written to /etc/plexd/bootstrap-token with 0600",
+          "and_then": []
+        },
+        {
+          "name": "No token is valid",
+          "when": "Install() is called without any token flags",
+          "then": "no bootstrap-token file is created",
+          "and_then": []
+        },
+        {
+          "name": "Invalid token rejected",
+          "when": "a token exceeding 512 bytes or containing non-printable characters is provided",
+          "then": "Install returns a validation error",
+          "and_then": [
+            "no files are created"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The install and uninstall commands SHALL require root privileges and verify systemd availability before making any changes",
+      "priority": "SHALL",
+      "rationale": "System-level operations require root; pre-flight checks prevent partial installations",
+      "scenarios": [
+        {
+          "name": "Non-root user rejected",
+          "when": "Install() is called by a non-root user",
+          "then": "an error is returned immediately",
+          "and_then": [
+            "no files are created or modified"
+          ]
+        },
+        {
+          "name": "systemd not available rejected",
+          "when": "Install() is called but systemctl is not in PATH",
+          "then": "an error is returned immediately",
+          "and_then": [
+            "no files are created or modified"
+          ]
+        },
+        {
+          "name": "Root with systemd proceeds",
+          "when": "Install() is called as root with systemctl available",
+          "then": "installation proceeds normally",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The install script SHALL detect the system OS and architecture, download the correct binary, verify its SHA-256 checksum, and run plexd install",
+      "priority": "SHALL",
+      "rationale": "The install script is the primary onboarding mechanism; it must be safe and cross-architecture",
+      "scenarios": [
+        {
+          "name": "Correct binary for amd64",
+          "when": "the script runs on Linux x86_64",
+          "then": "the amd64 binary is downloaded and verified",
+          "and_then": []
+        },
+        {
+          "name": "Correct binary for arm64",
+          "when": "the script runs on Linux aarch64",
+          "then": "the arm64 binary is downloaded and verified",
+          "and_then": []
+        },
+        {
+          "name": "Non-Linux rejected",
+          "when": "the script runs on a non-Linux OS",
+          "then": "the script exits with error code 1 and an error message",
+          "and_then": []
+        },
+        {
+          "name": "Checksum mismatch aborts",
+          "when": "the binary checksum does not match",
+          "then": "the downloaded file is deleted and the script exits with error",
+          "and_then": []
+        },
+        {
+          "name": "Script passes flags through",
+          "when": "the script is called with --token and --api-url flags",
+          "then": "these flags are passed to `plexd install`",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The InstallConfig SHALL define all configurable installation paths and options with sensible defaults matching the README specification",
+      "priority": "SHALL",
+      "rationale": "Configuration with defaults enables standard installs while supporting non-standard environments",
+      "scenarios": [
+        {
+          "name": "Defaults applied for zero values",
+          "when": "InstallConfig with all zero values",
+          "then": "BinaryPath=/usr/local/bin/plexd, ConfigDir=/etc/plexd, DataDir=/var/lib/plexd, RunDir=/var/run/plexd",
+          "and_then": [
+            "UnitFilePath=/etc/systemd/system/plexd.service"
+          ]
+        },
+        {
+          "name": "Validate rejects empty ServiceName",
+          "when": "InstallConfig.ServiceName is empty after ApplyDefaults",
+          "then": "this cannot happen because ApplyDefaults sets it to 'plexd'",
+          "and_then": []
+        },
+        {
+          "name": "Custom paths override defaults",
+          "when": "InstallConfig with custom BinaryPath and ConfigDir",
+          "then": "the custom values are used; the generated unit file references them",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "All install/uninstall operations SHALL use structured logging (log/slog) with component='packaging'",
+      "priority": "SHALL",
+      "rationale": "Consistent structured logging following the project convention (component field)",
+      "scenarios": [
+        {
+          "name": "Install steps logged at info level",
+          "when": "Install() runs successfully",
+          "then": "each step emits an info log with component='packaging'",
+          "and_then": []
+        },
+        {
+          "name": "Errors include context",
+          "when": "a step fails",
+          "then": "the error log includes the step name and wrapped error",
+          "and_then": []
+        },
+        {
+          "name": "Uninstall steps logged at info level",
+          "when": "Uninstall() runs",
+          "then": "each step emits an info log with component='packaging'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The packaging module SHALL use injectable interfaces (SystemdController, RootChecker) for all system-level interactions to enable testing without root or systemd",
+      "priority": "SHALL",
+      "rationale": "Unit tests must run in CI without root; dependency injection enables full coverage",
+      "scenarios": [
+        {
+          "name": "Mock SystemdController captures all calls",
+          "when": "tests use a mock",
+          "then": "all systemctl calls are recorded without execution",
+          "and_then": []
+        },
+        {
+          "name": "Mock RootChecker controls privilege check",
+          "when": "tests use a mock RootChecker",
+          "then": "tests can simulate root and non-root contexts",
+          "and_then": []
+        },
+        {
+          "name": "Real implementations call OS/systemctl",
+          "when": "production code uses real implementations",
+          "then": "actual system calls are made",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "The system SHALL provide reference documentation for the packaging module covering all flags, paths, permissions, and unit file structure",
+      "priority": "SHALL",
+      "rationale": "Operators and developers need complete reference for the systemd integration",
+      "scenarios": [
+        {
+          "name": "Reference doc is complete",
+          "when": "documentation is reviewed",
+          "then": "all InstallConfig fields, command flags, file paths, and permissions are documented",
+          "and_then": []
+        },
+        {
+          "name": "Unit file directives explained",
+          "when": "documentation is reviewed",
+          "then": "each systemd directive in the unit file template is described with its purpose",
+          "and_then": []
+        },
+        {
+          "name": "Install script flags documented",
+          "when": "documentation is reviewed",
+          "then": "all install script flags (--token, --api-url, --version, --no-start) are documented",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-012",
+      "description": "The system SHALL provide a how-to guide for bare-metal installation covering quick-start, manual, and automated enrollment paths",
+      "priority": "SHALL",
+      "rationale": "Step-by-step guidance reduces onboarding friction for operators new to plexd",
+      "scenarios": [
+        {
+          "name": "Quick install covered",
+          "when": "operator reads the how-to guide",
+          "then": "curl-pipe-sh command with common flag combinations is documented",
+          "and_then": []
+        },
+        {
+          "name": "Manual install covered",
+          "when": "operator reads the how-to guide",
+          "then": "step-by-step manual binary download, plexd install, and enrollment are documented",
+          "and_then": []
+        },
+        {
+          "name": "Verification steps covered",
+          "when": "operator reads the how-to guide",
+          "then": "systemctl status, plexd status, journalctl commands are documented with expected output",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/packaging/config.go: InstallConfig struct with BinaryPath, ConfigDir, DataDir, RunDir, UnitFilePath, ServiceName, APIBaseURL, TokenValue, TokenFile string fields. Default constants: DefaultBinaryPath=/usr/local/bin/plexd, DefaultConfigDir=/etc/plexd, DefaultDataDir=/var/lib/plexd, DefaultRunDir=/var/run/plexd, DefaultServiceName=plexd, DefaultUnitFilePath=/etc/systemd/system/plexd.service. ApplyDefaults() and Validate() following internal/registration/config.go pattern. Create internal/packaging/config_test.go with tests for ApplyDefaults zero-value, custom overrides, Validate. (REQ-008)",
+    "1.2 Create internal/packaging/unitfile.go: GenerateUnitFile(cfg InstallConfig) string function that produces a complete systemd unit file. [Unit]: Description=plexd node agent, After=network-online.target, Wants=network-online.target. [Service]: Type=simple, ExecStart={BinaryPath} up --config {ConfigDir}/config.yaml, Restart=on-failure, RestartSec=5s, StartLimitBurst=5, StartLimitIntervalSec=60, LimitNOFILE=65536, EnvironmentFile=-{ConfigDir}/environment, AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW, CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW, ProtectSystem=full, ProtectHome=true, ReadWritePaths={DataDir} {RunDir}. [Install]: WantedBy=multi-user.target. Create internal/packaging/unitfile_test.go with tests for: default config, security hardening, environment file, custom binary path, crash loop protection, file descriptor limit. (REQ-001)",
+    "1.3 Create internal/packaging/interfaces.go: Define SystemdController interface with methods: IsAvailable() bool, DaemonReload() error, Enable(service string) error, Disable(service string) error, Stop(service string) error, IsActive(service string) bool. Define RootChecker interface with IsRoot() bool. Define FileSystem interface with methods for file/dir operations used by installer (or use os functions directly with mock at higher level). (REQ-010)",
+    "2.1 Create internal/packaging/systemd.go: realSystemdController struct implementing SystemdController using os/exec to call systemctl. IsAvailable checks exec.LookPath(\"systemctl\"). DaemonReload executes `systemctl daemon-reload`. Enable/Disable/Stop execute the corresponding systemctl commands. IsActive uses `systemctl is-active`. Create realRootChecker implementing RootChecker using os.Getuid()==0. Create internal/packaging/systemd_test.go with tests that verify command construction (using a mock exec approach or build-tag-gated integration tests). (REQ-003, REQ-010)",
+    "2.2 Create internal/packaging/installer.go: Installer struct with InstallConfig, SystemdController, RootChecker, logger. NewInstaller constructor applies defaults. Install() error method: (1) check root, (2) check systemd available, (3) create directories, (4) copy binary, (5) write default config if absent, (6) write bootstrap token if provided (validate using registration.validateToken pattern), (7) write unit file, (8) daemon-reload. Uninstall(purge bool) error method: (1) check root, (2) if not installed return nil, (3) stop service, (4) disable service, (5) remove unit file, (6) daemon-reload, (7) remove binary, (8) if purge remove data/config dirs. Create internal/packaging/installer_test.go with mock SystemdController and RootChecker, using t.TempDir() for all file operations. Full test suite per test_specifications. (REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-009)",
+    "2.3 Create internal/packaging/defaultconfig.go: GenerateDefaultConfig(apiBaseURL string) string function that produces a minimal default config.yaml with api URL (or placeholder), data_dir, log_level=info, and token file path. Create internal/packaging/defaultconfig_test.go with tests for: with API URL, without API URL (placeholder), YAML validity. (REQ-002)",
+    "3.1 Create deploy/systemd/plexd.service: The reference systemd unit file template (static copy matching GenerateUnitFile output with default paths). This is the canonical unit file for documentation and manual installation. (REQ-001)",
+    "3.2 Create deploy/install.sh: POSIX-compatible install script that: detects OS (Linux required), detects arch (x86_64->amd64, aarch64->arm64), downloads binary from artifact URL, downloads checksum file, verifies SHA-256, makes binary executable, runs `plexd install` with passthrough flags (--token, --api-url, --no-start). Supports --version flag (default: latest). Cleans up on failure. Create deploy/install_test.sh: Shell-based tests using shellcheck-compatible patterns — test arch detection, test unsupported OS handling, test flag parsing. (REQ-007)",
+    "4.1 Create docs/reference/backend/bare-metal-packaging.md: Reference documentation for internal/packaging module: InstallConfig struct (all fields, types, defaults), GenerateUnitFile() output format with all directives explained, Install()/Uninstall() method behavior, SystemdController and RootChecker interfaces, file paths and permissions table, install script flags. (REQ-011)",
+    "4.2 Create docs/how-to/backend/bare-metal-installation.md: How-to guide: Prerequisites (Linux, root, network to control plane, bootstrap token), Quick Start (curl|sh one-liner with --token and --api-url), Manual Install (download binary, run plexd install --token, systemctl enable --now plexd), Automated Install (pre-provision token file, run install script without --token), Verification (systemctl status plexd, plexd status, journalctl -u plexd), Uninstall (plexd uninstall, plexd uninstall --purge). Cross-references docs/reference/backend/bare-metal-packaging.md. (REQ-012)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/packaging/config_test.go",
+      "test_function": "TestInstallConfig_ApplyDefaults",
+      "story": "Operator installs plexd as a systemd service on a bare-metal Linux server",
+      "expected": "ApplyDefaults sets BinaryPath=/usr/local/bin/plexd, ConfigDir=/etc/plexd, DataDir=/var/lib/plexd, RunDir=/var/run/plexd, UnitFilePath=/etc/systemd/system/plexd.service, ServiceName=plexd",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/packaging/config_test.go",
+      "test_function": "TestInstallConfig_CustomValues",
+      "story": "Operator installs plexd as a systemd service on a bare-metal Linux server",
+      "expected": "Custom paths override defaults and are preserved after ApplyDefaults",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/packaging/unitfile_test.go",
+      "test_function": "TestGenerateUnitFile_DefaultConfig",
+      "story": "plexd systemd unit file follows Linux service best practices",
+      "expected": "Generated unit file contains [Unit], [Service], [Install] sections with Type=simple, After=network-online.target, Restart=on-failure, RestartSec=5s, WantedBy=multi-user.target",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/packaging/unitfile_test.go",
+      "test_function": "TestGenerateUnitFile_SecurityHardening",
+      "story": "plexd systemd unit file follows Linux service best practices",
+      "expected": "Unit file includes ProtectSystem=full, ProtectHome=true, AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW, CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/packaging/unitfile_test.go",
+      "test_function": "TestGenerateUnitFile_EnvironmentFile",
+      "story": "Operator enrolls a bare-metal node via automated token provisioning",
+      "expected": "Unit file includes EnvironmentFile=-/etc/plexd/environment with the dash prefix for optional file",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/packaging/unitfile_test.go",
+      "test_function": "TestGenerateUnitFile_CustomBinaryPath",
+      "story": "plexd systemd unit file follows Linux service best practices",
+      "expected": "ExecStart references the custom binary path when InstallConfig.BinaryPath is overridden",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/packaging/unitfile_test.go",
+      "test_function": "TestGenerateUnitFile_CrashLoopProtection",
+      "story": "plexd systemd unit file follows Linux service best practices",
+      "expected": "Unit file includes StartLimitBurst=5, StartLimitIntervalSec=60",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/packaging/unitfile_test.go",
+      "test_function": "TestGenerateUnitFile_FileDescriptorLimit",
+      "story": "plexd systemd unit file follows Linux service best practices",
+      "expected": "Unit file includes LimitNOFILE=65536",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_CreatesDirectories",
+      "story": "Operator installs plexd as a systemd service on a bare-metal Linux server",
+      "expected": "Install creates ConfigDir (0755), DataDir (0700), RunDir (0755) under a temp root",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_CopiesBinary",
+      "story": "Operator installs plexd as a systemd service on a bare-metal Linux server",
+      "expected": "Install copies the binary to the configured BinaryPath with 0755 permissions",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_WritesUnitFile",
+      "story": "Operator installs plexd as a systemd service on a bare-metal Linux server",
+      "expected": "Install writes the unit file to UnitFilePath and calls DaemonReload on the SystemdController",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_PreservesExistingConfig",
+      "story": "Operator installs plexd as a systemd service on a bare-metal Linux server",
+      "expected": "When config.yaml already exists, Install does not overwrite it",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_WritesDefaultConfig",
+      "story": "Operator installs plexd as a systemd service on a bare-metal Linux server",
+      "expected": "When config.yaml does not exist, Install writes a default config with api placeholder",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_CallsDaemonReload",
+      "story": "Operator installs plexd as a systemd service on a bare-metal Linux server",
+      "expected": "After writing the unit file, Install calls SystemdController.DaemonReload()",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_RejectsNonRoot",
+      "story": "Operator installs plexd as a systemd service on a bare-metal Linux server",
+      "expected": "Install returns an error when RootChecker.IsRoot() returns false",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_RejectsNoSystemd",
+      "story": "Operator installs plexd as a systemd service on a bare-metal Linux server",
+      "expected": "Install returns an error when SystemdController.IsAvailable() returns false",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_WritesTokenFromValue",
+      "story": "Operator enrolls a bare-metal node with a manually provided bootstrap token",
+      "expected": "When TokenValue is set, the token is written to ConfigDir/bootstrap-token with 0600 permissions",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_WritesTokenFromFile",
+      "story": "Operator enrolls a bare-metal node with a manually provided bootstrap token",
+      "expected": "When TokenFile is set, its content is read, trimmed, and written to ConfigDir/bootstrap-token with 0600",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_SkipsTokenWhenNoneProvided",
+      "story": "Operator enrolls a bare-metal node with a manually provided bootstrap token",
+      "expected": "When neither TokenValue nor TokenFile is set, no bootstrap-token file is created",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_RejectsInvalidToken",
+      "story": "Operator enrolls a bare-metal node with a manually provided bootstrap token",
+      "expected": "When token exceeds 512 bytes or contains non-printable chars, Install returns a validation error",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestUninstall_StopsAndDisablesService",
+      "story": "Operator uninstalls plexd systemd service from a bare-metal server",
+      "expected": "Uninstall calls Stop(), Disable() on SystemdController, removes unit file, calls DaemonReload()",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestUninstall_PurgeRemovesAllDirs",
+      "story": "Operator uninstalls plexd systemd service from a bare-metal server",
+      "expected": "With purge=true, DataDir and ConfigDir are removed recursively",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestUninstall_NoPurgePreservesDirs",
+      "story": "Operator uninstalls plexd systemd service from a bare-metal server",
+      "expected": "With purge=false, DataDir and ConfigDir are preserved; only unit file and binary removed",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestUninstall_IdempotentWhenNotInstalled",
+      "story": "Operator uninstalls plexd systemd service from a bare-metal server",
+      "expected": "When unit file does not exist, Uninstall returns nil without error",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestUninstall_RejectsNonRoot",
+      "story": "Operator uninstalls plexd systemd service from a bare-metal server",
+      "expected": "Uninstall returns an error when RootChecker.IsRoot() returns false",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/packaging/installer_test.go",
+      "test_function": "TestInstall_WithAPIBaseURL",
+      "story": "Operator installs plexd as a systemd service on a bare-metal Linux server",
+      "expected": "When APIBaseURL is set, the generated default config.yaml includes the api URL",
+      "requirement_id": "REQ-008"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-012) have corresponding passing tests in internal/packaging/*_test.go",
+    "All WHEN/THEN scenarios from requirements are covered by at least one test case in test_specifications",
+    "Generated systemd unit file includes all security hardening directives: ProtectSystem, ProtectHome, AmbientCapabilities, CapabilityBoundingSet, ReadWritePaths",
+    "Token validation reuses the same rules as internal/registration/token.go (<=512 bytes, printable ASCII only)",
+    "Install/Uninstall use injectable interfaces (SystemdController, RootChecker) — no real systemctl calls in unit tests",
+    "All file operations in tests use t.TempDir() — no modifications to the real filesystem",
+    "Code follows existing project patterns: Config with ApplyDefaults/Validate, log/slog with component field, stdlib-only test dependencies",
+    "Install script is POSIX-compatible (tested with shellcheck), supports both amd64 and arm64, verifies checksums",
+    "Reference documentation (docs/reference/backend/bare-metal-packaging.md) covers all InstallConfig fields, unit file directives, and command flags",
+    "How-to guide (docs/how-to/backend/bare-metal-installation.md) covers quick start, manual install, automated install, verification, and uninstall with cross-references to reference docs",
+    "No sensitive data (tokens, keys) logged at any level; token values are never included in log messages or error strings",
+    "deploy/systemd/plexd.service matches the output of GenerateUnitFile with default InstallConfig"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All Go code lives in `internal/packaging/` following the project convention. Files: config.go, unitfile.go, interfaces.go, systemd.go, installer.go, defaultconfig.go, and corresponding _test.go files. The static unit file lives at deploy/systemd/plexd.service. The install script lives at deploy/install.sh.\n\n2. **No new dependencies**: The packaging module uses only stdlib packages: os, os/exec, path/filepath, fmt, strings, log/slog. No external Go dependencies are added.\n\n3. **Interface-based testing**: SystemdController and RootChecker interfaces allow full test coverage without root or systemd. Tests use mock implementations with recorded calls. This follows the project pattern from nat.STUNClient, wireguard.WGController, etc.\n\n4. **Token validation**: The installer validates tokens using the same rules as internal/registration/token.go (<=512 bytes, printable ASCII). Rather than importing the registration package (which would create a dependency cycle if packaging were used by a CLI that also uses registration), the validation logic is duplicated as a simple helper. This is acceptable given the trivial complexity of the validation.\n\n5. **Unit file generation**: GenerateUnitFile() produces the unit file as a formatted string using fmt.Sprintf or text/template. The output is deterministic and testable by string assertions. The unit file follows systemd best practices for a network daemon: network dependency ordering, crash loop protection (StartLimitBurst/IntervalSec), automatic restart, file descriptor limits for WireGuard tunnels, security hardening (ProtectSystem, ProtectHome), and Linux capabilities (NET_ADMIN, NET_RAW).\n\n6. **ProtectSystem=full (not strict)**: We use `full` rather than `strict` because plexd needs write access to multiple system paths (/etc/plexd via ReadWritePaths would work with strict, but full is simpler and sufficient since we already use ReadWritePaths for data_dir). The ProtectSystem=full makes /usr, /boot, /efi read-only, which is correct for our use case.\n\n7. **AmbientCapabilities**: plexd needs CAP_NET_ADMIN (WireGuard interface management, nftables rules) and CAP_NET_RAW (ICMP for latency probes). NoNewPrivileges is NOT set because the service needs these capabilities. CapabilityBoundingSet limits the set to exactly what's needed.\n\n8. **Install script design**: POSIX sh (not bash) for maximum portability across Linux distros. The script uses `curl` or `wget` (whichever is available) for downloads. Architecture detection via `uname -m` with mapping (x86_64->amd64, aarch64->arm64). Checksum verification using `sha256sum` or `shasum -a 256`.\n\n9. **Binary installation**: The installer copies the currently-running binary (os.Executable()) to the configured BinaryPath. This avoids downloading — the install script handles download, and `plexd install` handles system setup. This separation of concerns matches the README pattern: `curl ... | sh` downloads, `plexd install` installs.\n\n10. **Default config generation**: The generated config.yaml includes only essential fields: api URL, data_dir, log_level, and token file path. This matches the README's minimal config example. If APIBaseURL is not provided, a placeholder comment is written.\n\n11. **Potential pitfalls**:\n    - Binary copy must handle the case where source and destination are the same path (skip copy).\n    - File permissions on token files must be 0600 to prevent other users from reading bootstrap tokens.\n    - The install script must handle both GNU coreutils and BusyBox variants of sha256sum.\n    - systemctl commands may fail with non-zero exit codes for expected conditions (e.g., `stop` when service isn't running) — the uninstaller should handle these gracefully.\n    - The EnvironmentFile directive uses the `-` prefix so the service starts even if /etc/plexd/environment doesn't exist.\n\n12. **Key files from existing codebase**:\n    - `internal/registration/config.go` — Config pattern with ApplyDefaults/Validate\n    - `internal/registration/token.go` — Token validation rules (reused in installer)\n    - `internal/fsutil/atomic.go` — WriteFileAtomic for safe file writes\n    - `internal/api/config.go` — Config pattern reference\n    - `README.md:297-298` — install/uninstall CLI commands\n    - `README.md:1940` — deploy/systemd/ directory in project structure\n    - `README.md:2675` — systemd restart during upgrades\n\n13. **Relationship to S021 (VM/Cloud-Init)**: The packaging module created here provides the foundation for Cloud-Init support. S021 will add Cloud-Init user-data templates that invoke the install script with pre-provisioned tokens. The MetadataProvider interface in internal/registration/token.go is already prepared for cloud metadata integration.\n\n14. **Security design**: SECPLAN-1: No authentication needed for install/uninstall (local root operation). SECPLAN-2: Token validation at install time (same rules as registration). SECPLAN-3: Bootstrap tokens have 0600 permissions. Private keys in data_dir have 0700 directory and 0600 files (existing behavior). SECPLAN-4: Trust boundary is the local filesystem — the install script verifies binary checksum before installation.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.112680"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:28:57.102285"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:35:02.431823"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "22661a0e-e563-4465-a397-9fe0a5720119",
+      "timestamp": "2026-02-12T21:35:02.431850",
+      "total_duration": 360.6858320236206,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 360.6858320236206,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
