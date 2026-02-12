@@ -1,0 +1,779 @@
+{
+  "feature_id": "PXD-0022",
+  "title": "F003: Implement Kubernetes DaemonSet support",
+  "slug": "f003-implement-kubernetes-daemonset-support",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Deploy plexd as a DaemonSet on Kubernetes clusters. Bootstrap token is injected via Kubernetes Secret. Auto-detect Kubernetes environment and enable K8s-specific features: PlexdNodeState CRD for the local node API, Kubernetes audit log collection, and integration with the cluster's networking stack.",
+  "stories": [
+    {
+      "title": "Operator deploys plexd as a DaemonSet on a Kubernetes cluster",
+      "role": "platform operator",
+      "want": "to deploy plexd on all nodes of a Kubernetes cluster using a DaemonSet manifest, with the bootstrap token injected via a Kubernetes Secret and the API URL provided as an environment variable",
+      "so_that": "every Kubernetes node runs plexd and automatically joins the Plexsphere mesh without manual per-node intervention",
+      "criteria": [
+        "A DaemonSet manifest at deploy/kubernetes/daemonset.yaml creates a plexd pod on every node with hostNetwork: true, NET_ADMIN and NET_RAW capabilities, and a hostPath volume for /var/lib/plexd",
+        "The DaemonSet references a ServiceAccount 'plexd' with the necessary RBAC for CRD management, Secret management, and TokenReview",
+        "The bootstrap token is injected via PLEXD_BOOTSTRAP_TOKEN from a secretKeyRef to a Secret named plexd-bootstrap",
+        "plexd auto-detects the Kubernetes environment (via KUBERNETES_SERVICE_HOST env or /var/run/secrets/kubernetes.io/serviceaccount/) and enables K8s-specific features"
+      ]
+    },
+    {
+      "title": "plexd auto-detects Kubernetes environment and enables K8s-specific features",
+      "role": "system",
+      "want": "plexd to detect when it is running inside a Kubernetes pod and automatically enable K8s-specific features: PlexdNodeState CRD management, Kubernetes audit log collection, and K8s-aware token resolution",
+      "so_that": "no manual configuration is needed to switch between bare-metal/VM mode and Kubernetes mode — the agent adapts to its runtime environment",
+      "criteria": [
+        "A KubernetesDetector with method Detect() returns a KubernetesEnvironment struct with InCluster bool, Namespace, NodeName, and PodName",
+        "Detection checks for KUBERNETES_SERVICE_HOST environment variable and the service account token at /var/run/secrets/kubernetes.io/serviceaccount/token",
+        "When InCluster is true, plexd enables PlexdNodeState CRD management, Kubernetes audit log source, and K8s bearer token authentication on the node-local HTTP API",
+        "When InCluster is false, K8s features are silently skipped with a debug log message",
+        "The detector is injectable for testing (interface-based)",
+        "Namespace is read from /var/run/secrets/kubernetes.io/serviceaccount/namespace, NodeName from NODE_NAME env (set via fieldRef in the DaemonSet)"
+      ]
+    },
+    {
+      "title": "plexd manages a PlexdNodeState CRD for the local node API on Kubernetes",
+      "role": "platform operator",
+      "want": "plexd to create and maintain a PlexdNodeState custom resource representing the node's metadata, data entries, and secret references, and to watch the status subresource for workload-written report entries",
+      "so_that": "Kubernetes workloads can consume node state via the standard Kubernetes API (kubectl, client-go, watches) without needing direct socket access to plexd",
+      "criteria": [
+        "A CRD definition YAML at deploy/kubernetes/crds/plexdnodestate-crd.yaml defines the PlexdNodeState resource in the plexd.plexsphere.com API group, v1alpha1, with spec/status split and status subresource",
+        "A CRDController struct manages the lifecycle: creates the PlexdNodeState resource on startup, updates .spec when metadata/data/secretRefs change, and watches .status.report for workload-written report entries",
+        "The CRDController implements the same StateCache update interface (UpdateMetadata, UpdateData, UpdateSecretIndex) so it can be used as a secondary sync target alongside the file-based StateCache",
+        "The CRDController creates Kubernetes Secrets with ownerReferences to the PlexdNodeState resource for each secret ref, containing NSK-encrypted ciphertext",
+        "Report entries written by workloads to .status.report are detected via a watch and synced to the StateCache and control plane via the existing ReportSyncer",
+        "The PlexdNodeState resource name follows the pattern node-{node_id} in the plexd-system namespace"
+      ]
+    },
+    {
+      "title": "plexd collects Kubernetes audit log events on K8s nodes",
+      "role": "platform operator",
+      "want": "plexd to automatically detect and tail the Kubernetes audit log file when running on a K8s node, forwarding events to the control plane via the existing audit forwarding module",
+      "so_that": "Kubernetes API server activity is captured for compliance and security analysis alongside Linux auditd events",
+      "criteria": [
+        "A K8sAuditLogReader implements the K8sAuditReader interface from internal/auditfwd with a method ReadEvents(ctx) returning parsed K8s audit events",
+        "The reader auto-detects the audit log path via kubelet configuration (typical path: /var/log/kubernetes/audit/audit.log) with a configurable override",
+        "The reader tails the log file, tracking position across reads to avoid re-reading events",
+        "Each Kubernetes audit log entry is parsed from the JSON Lines format into the K8sAuditEvent struct",
+        "When the audit log file does not exist or is not readable, the reader returns an error that the Forwarder isolates per REQ-006 of the audit forwarding spec",
+        "The K8sAuditLogReader is registered as an AuditSource with the audit Forwarder when Kubernetes environment is detected"
+      ]
+    },
+    {
+      "title": "plexd authenticates node-local HTTP API callers via Kubernetes TokenReview on K8s",
+      "role": "developer",
+      "want": "plexd's node-local HTTP API to authenticate callers using Kubernetes bearer tokens verified via the TokenReview API when running on Kubernetes, replacing the static file-based token authentication",
+      "so_that": "Kubernetes workloads can access node state and secrets using their ServiceAccount tokens without needing a pre-shared static token",
+      "criteria": [
+        "A TokenReviewAuthenticator implements an Authenticator interface that validates bearer tokens via the Kubernetes TokenReview API",
+        "The authenticator extracts the ServiceAccount username, namespace, and groups from the TokenReview response",
+        "When running on Kubernetes, the HTTP listener uses the TokenReviewAuthenticator instead of the static BearerAuthMiddleware",
+        "The authenticator accepts an injectable TokenReview client interface for testing without a real Kubernetes API server",
+        "Failed token review (invalid token, API unreachable) returns 401 Unauthorized with a clear error message",
+        "The Kubernetes ServiceAccount token is read from the standard projected volume path by the calling workload"
+      ]
+    },
+    {
+      "title": "Operator configures Kubernetes-specific plexd features",
+      "role": "platform operator",
+      "want": "to configure Kubernetes-specific settings: CRD namespace, audit log path override, and K8s feature toggles via the plexd config",
+      "so_that": "I can customize Kubernetes-specific behavior for non-standard cluster configurations",
+      "criteria": [
+        "A KubernetesConfig struct has fields: Enabled (bool, auto-detected if not set), Namespace (string, auto-detected from SA), AuditLogPath (string, auto-detected), CRDEnabled (bool, default true when in K8s)",
+        "Config.ApplyDefaults() sets sensible defaults: auto-detect all values from the K8s environment",
+        "Config.Validate() verifies Namespace is non-empty when Enabled is true",
+        "When Enabled is explicitly set to false in config, all K8s features are disabled even when running in a K8s pod"
+      ]
+    },
+    {
+      "title": "Kubernetes RBAC and ServiceAccount are properly configured for plexd",
+      "role": "platform operator",
+      "want": "RBAC manifests that grant the plexd ServiceAccount exactly the permissions needed: CRD management, Secret management, TokenReview, and audit log access",
+      "so_that": "plexd follows the principle of least privilege and the deployment is ready to use without manual RBAC setup",
+      "criteria": [
+        "A ServiceAccount manifest at deploy/kubernetes/serviceaccount.yaml creates the 'plexd' ServiceAccount in plexd-system namespace",
+        "A ClusterRole at deploy/kubernetes/rbac.yaml grants: plexdnodestates (CRUD + status), secrets (create/get/update/delete for plexd-managed secrets), tokenreviews (create)",
+        "A ClusterRoleBinding binds the ClusterRole to the plexd ServiceAccount",
+        "Consumer RBAC roles (plexd-state-reader, plexd-state-reporter, plexd-secrets-reader) are provided as separate manifests for operators to assign to workloads",
+        "All RBAC manifests use specific resource names and API groups — no wildcard permissions"
+      ]
+    },
+    {
+      "title": "Operator deploys the PlexdNodeState CRD to the cluster",
+      "role": "platform operator",
+      "want": "a CRD manifest that defines the PlexdNodeState custom resource matching the README specification",
+      "so_that": "the CRD is available in the cluster before the DaemonSet starts, enabling plexd to create PlexdNodeState resources on startup",
+      "criteria": [
+        "The CRD definition at deploy/kubernetes/crds/plexdnodestate-crd.yaml matches the README specification exactly: group plexd.plexsphere.com, kind PlexdNodeState, version v1alpha1",
+        "The CRD schema includes .spec (nodeId, meshIp, metadata, data, secretRefs) and .status (report) with proper types",
+        "The CRD enables the status subresource for separate RBAC on .spec vs .status",
+        "The CRD includes additionalPrinterColumns for kubectl output: Node ID, Mesh IP, Age"
+      ]
+    },
+    {
+      "title": "Reference documentation covers Kubernetes deployment and CRD",
+      "role": "developer",
+      "want": "reference documentation for the Kubernetes deployment: DaemonSet manifest, RBAC setup, CRD schema, KubernetesDetector, CRDController, TokenReviewAuthenticator, and K8sAuditLogReader",
+      "so_that": "operators and developers can understand the Kubernetes integration and customize it",
+      "criteria": [
+        "Documentation lists all Kubernetes manifest files with their purpose and location",
+        "Documentation describes the KubernetesConfig fields with types, defaults, and auto-detection behavior",
+        "Documentation describes the PlexdNodeState CRD schema with all spec and status fields",
+        "Documentation describes the RBAC roles and their purposes (plexd SA role, consumer reader/reporter/secrets roles)",
+        "Documentation describes the authentication flow for the node-local API on Kubernetes (TokenReview)"
+      ]
+    },
+    {
+      "title": "Operator follows a how-to guide to deploy plexd on Kubernetes",
+      "role": "platform operator",
+      "want": "a step-by-step guide to deploy plexd on a Kubernetes cluster using the provided manifests",
+      "so_that": "I can follow a clear procedure to get plexd running on all cluster nodes",
+      "criteria": [
+        "Guide includes prerequisites (Kubernetes cluster, kubectl access, bootstrap token, namespace creation)",
+        "Guide covers applying CRD, RBAC, Secret, and DaemonSet manifests in the correct order",
+        "Guide covers verifying the deployment (pod status, PlexdNodeState resources, plexd status)",
+        "Guide covers configuring workload access to PlexdNodeState and secrets via RBAC"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL auto-detect the Kubernetes environment by checking for KUBERNETES_SERVICE_HOST environment variable and service account token file, returning environment metadata (namespace, node name, pod name)",
+      "priority": "SHALL",
+      "rationale": "Auto-detection eliminates manual configuration for the most common deployment scenario and enables plexd to adapt its behavior to the runtime environment without operator intervention",
+      "scenarios": [
+        {
+          "name": "Kubernetes environment detected",
+          "when": "Detect() is called inside a Kubernetes pod with KUBERNETES_SERVICE_HOST set and /var/run/secrets/kubernetes.io/serviceaccount/token exists",
+          "then": "returns KubernetesEnvironment with InCluster=true, Namespace from SA namespace file, NodeName from NODE_NAME env",
+          "and_then": [
+            "PodName is read from HOSTNAME env"
+          ]
+        },
+        {
+          "name": "Non-Kubernetes environment detected",
+          "when": "Detect() is called on a bare-metal/VM node without KUBERNETES_SERVICE_HOST",
+          "then": "returns KubernetesEnvironment with InCluster=false and all other fields empty",
+          "and_then": []
+        },
+        {
+          "name": "Partial Kubernetes environment",
+          "when": "KUBERNETES_SERVICE_HOST is set but service account token file is missing",
+          "then": "returns KubernetesEnvironment with InCluster=false",
+          "and_then": [
+            "a warning log is emitted indicating partial K8s environment"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The system SHALL provide a KubernetesConfig struct with Enabled, Namespace, AuditLogPath, and CRDEnabled fields following the project's ApplyDefaults/Validate pattern",
+      "priority": "SHALL",
+      "rationale": "Configuration consistency with the rest of the codebase and operator customization of auto-detected values",
+      "scenarios": [
+        {
+          "name": "Defaults applied when in K8s",
+          "when": "ApplyDefaults() is called with zero-valued fields and KubernetesEnvironment.InCluster=true",
+          "then": "Enabled=true, Namespace from detected SA namespace, AuditLogPath=/var/log/kubernetes/audit/audit.log, CRDEnabled=true",
+          "and_then": []
+        },
+        {
+          "name": "Defaults applied when not in K8s",
+          "when": "ApplyDefaults() is called with InCluster=false",
+          "then": "Enabled remains false, other K8s fields remain zero-valued",
+          "and_then": []
+        },
+        {
+          "name": "Explicit disable overrides auto-detection",
+          "when": "Enabled is explicitly set to false in config (not zero-value — use a *bool or explicit disable flag)",
+          "then": "Validate returns nil and all K8s features are disabled",
+          "and_then": []
+        },
+        {
+          "name": "Missing namespace when enabled rejects",
+          "when": "Validate() is called with Enabled=true and Namespace is empty",
+          "then": "returns error containing 'Namespace is required when Kubernetes is enabled'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The system SHALL provide a PlexdNodeState CRD definition at deploy/kubernetes/crds/plexdnodestate-crd.yaml matching the README specification",
+      "priority": "SHALL",
+      "rationale": "The CRD is the Kubernetes-native interface for workloads to consume node state and must match the documented contract exactly",
+      "scenarios": [
+        {
+          "name": "CRD defines correct API group",
+          "when": "the CRD YAML is inspected",
+          "then": "group is plexd.plexsphere.com, kind is PlexdNodeState, version is v1alpha1",
+          "and_then": [
+            "short name 'pns' is defined"
+          ]
+        },
+        {
+          "name": "Spec schema matches README",
+          "when": "the CRD schema is inspected",
+          "then": "spec has nodeId, meshIp, metadata, data, secretRefs with correct types",
+          "and_then": [
+            "data items have key, contentType, payload (preserve-unknown-fields), version, updatedAt",
+            "secretRefs items have key, secretName, version"
+          ]
+        },
+        {
+          "name": "Status subresource enabled",
+          "when": "the CRD is applied",
+          "then": "status subresource is enabled for separate RBAC on .spec vs .status",
+          "and_then": [
+            "status.report array has same item schema as data (key, contentType, payload, version, updatedAt)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The system SHALL implement a CRDController that manages the PlexdNodeState lifecycle: create on startup, update spec on state changes, watch status for workload reports, and manage associated Kubernetes Secrets with ownerReferences",
+      "priority": "SHALL",
+      "rationale": "The CRDController bridges plexd's internal state management with the Kubernetes API, enabling Kubernetes-native consumption of node state",
+      "scenarios": [
+        {
+          "name": "CRD resource created on startup",
+          "when": "CRDController.Start() is called with nodeID, meshIP, and namespace",
+          "then": "a PlexdNodeState named node-{node_id} is created with .spec populated from the current StateCache",
+          "and_then": [
+            "the resource has label plexd.plexsphere.com/node-id={node_id}"
+          ]
+        },
+        {
+          "name": "Existing resource updated on startup",
+          "when": "CRDController.Start() is called and a PlexdNodeState already exists",
+          "then": "the existing resource's .spec is updated to match the current StateCache",
+          "and_then": []
+        },
+        {
+          "name": "Spec updated on metadata change",
+          "when": "UpdateMetadata() is called on the CRDController",
+          "then": "the PlexdNodeState .spec.metadata is updated via a Kubernetes API patch",
+          "and_then": []
+        },
+        {
+          "name": "Secrets created for secret refs",
+          "when": "UpdateSecretIndex() is called with new secret refs",
+          "then": "Kubernetes Secrets are created for each new ref with ownerReferences to the PlexdNodeState",
+          "and_then": [
+            "the Secret name follows the pattern plexd-secret-{node_id}-{key}"
+          ]
+        },
+        {
+          "name": "Report changes detected from status watch",
+          "when": "a workload patches .status.report with a new entry",
+          "then": "the CRDController detects the change and calls ReportSyncer.NotifyChange()",
+          "and_then": []
+        },
+        {
+          "name": "Graceful shutdown",
+          "when": "CRDController.Stop() is called",
+          "then": "the status watch is stopped and Run returns without blocking",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The system SHALL implement a TokenReviewAuthenticator that validates Kubernetes bearer tokens via the TokenReview API for the node-local HTTP listener",
+      "priority": "SHALL",
+      "rationale": "Kubernetes-native authentication via TokenReview integrates with the cluster's identity model and eliminates static token management",
+      "scenarios": [
+        {
+          "name": "Valid token returns authenticated identity",
+          "when": "Authenticate(token) is called with a valid ServiceAccount token",
+          "then": "TokenReview confirms authentication and the ServiceAccount username/namespace/groups are returned",
+          "and_then": []
+        },
+        {
+          "name": "Invalid token returns error",
+          "when": "Authenticate(token) is called with an invalid token",
+          "then": "TokenReview returns authenticated=false and an error is returned",
+          "and_then": []
+        },
+        {
+          "name": "API server unreachable returns error",
+          "when": "Authenticate(token) is called but the API server is unreachable",
+          "then": "an error is returned with the underlying network error wrapped",
+          "and_then": []
+        },
+        {
+          "name": "Empty token returns error",
+          "when": "Authenticate('') is called",
+          "then": "an error is returned without making an API call",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The system SHALL implement a K8sAuditLogReader that tails the Kubernetes audit log file, tracks read position, handles log rotation, and parses JSON audit events into K8sAuditEvent structs",
+      "priority": "SHALL",
+      "rationale": "Kubernetes audit log collection is a key K8s-specific feature; the reader must integrate with the existing auditfwd module's K8sAuditReader interface",
+      "scenarios": [
+        {
+          "name": "New events read from audit log",
+          "when": "ReadEvents() is called after new lines are appended to the audit log",
+          "then": "only the new lines are parsed and returned as K8sAuditEvent structs",
+          "and_then": []
+        },
+        {
+          "name": "Read position tracked",
+          "when": "ReadEvents() is called twice",
+          "then": "the second call returns only events written after the first call",
+          "and_then": []
+        },
+        {
+          "name": "Log rotation handled",
+          "when": "the audit log file is truncated or replaced (log rotation)",
+          "then": "the reader detects the file is shorter than the previous position and resets to the beginning",
+          "and_then": []
+        },
+        {
+          "name": "Missing file returns error",
+          "when": "the audit log file does not exist",
+          "then": "an error is returned wrapped with context about the expected path",
+          "and_then": []
+        },
+        {
+          "name": "Malformed JSON lines skipped",
+          "when": "the audit log contains invalid JSON lines",
+          "then": "invalid lines are skipped with a debug log; valid lines are still returned",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The DaemonSet manifest SHALL include hostNetwork, NET_ADMIN/NET_RAW capabilities, hostPath volume for /var/lib/plexd, bootstrap token from Secret, NODE_NAME from fieldRef, and the plexd ServiceAccount",
+      "priority": "SHALL",
+      "rationale": "The DaemonSet is the primary K8s deployment mechanism and must be production-ready",
+      "scenarios": [
+        {
+          "name": "DaemonSet correctly configured",
+          "when": "the manifest is reviewed",
+          "then": "hostNetwork: true, capabilities NET_ADMIN/NET_RAW, hostPath /var/lib/plexd (DirectoryOrCreate), serviceAccountName: plexd are set",
+          "and_then": []
+        },
+        {
+          "name": "Token injected from Secret",
+          "when": "the container starts",
+          "then": "PLEXD_BOOTSTRAP_TOKEN env var is set from plexd-bootstrap Secret key 'token'",
+          "and_then": []
+        },
+        {
+          "name": "NODE_NAME set from fieldRef",
+          "when": "the container starts",
+          "then": "NODE_NAME env var is set from spec.nodeName",
+          "and_then": []
+        },
+        {
+          "name": "Audit log volume mounted",
+          "when": "K8s audit log collection is needed",
+          "then": "the DaemonSet mounts /var/log/kubernetes/audit as a hostPath volume (ReadOnly)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The RBAC manifests SHALL grant the plexd ServiceAccount exactly the permissions needed: plexdnodestates CRUD + status, secrets CRUD, tokenreviews create — with no wildcard permissions",
+      "priority": "SHALL",
+      "rationale": "Least privilege is a Kubernetes security best practice; overly permissive RBAC is a common vulnerability",
+      "scenarios": [
+        {
+          "name": "CRD permissions granted",
+          "when": "RBAC is applied",
+          "then": "plexd SA can get/list/watch/create/update/delete plexdnodestates and patch plexdnodestates/status",
+          "and_then": []
+        },
+        {
+          "name": "Secret permissions granted",
+          "when": "RBAC is applied",
+          "then": "plexd SA can create/get/update/delete secrets in the plexd-system namespace",
+          "and_then": []
+        },
+        {
+          "name": "TokenReview permissions granted",
+          "when": "RBAC is applied",
+          "then": "plexd SA can create tokenreviews in authentication.k8s.io",
+          "and_then": []
+        },
+        {
+          "name": "No wildcards used",
+          "when": "RBAC manifests are reviewed",
+          "then": "no rules use '*' for any field",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "All Kubernetes-specific components SHALL use injectable interfaces for Kubernetes API interactions to enable unit testing without a real cluster",
+      "priority": "SHALL",
+      "rationale": "Unit tests must run in CI without a Kubernetes cluster; mock-based testing ensures full coverage",
+      "scenarios": [
+        {
+          "name": "KubeClient interface covers CRD and Secret operations",
+          "when": "tests use a mock KubeClient",
+          "then": "CRDController operations are fully testable without a cluster",
+          "and_then": []
+        },
+        {
+          "name": "TokenReviewClient interface covers authentication",
+          "when": "tests use a mock TokenReviewClient",
+          "then": "valid/invalid/error scenarios are testable without a cluster",
+          "and_then": []
+        },
+        {
+          "name": "Detector interface covers environment detection",
+          "when": "tests use a mock Detector",
+          "then": "in-cluster and non-cluster scenarios are testable without env manipulation",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "All Kubernetes-related code SHALL use structured logging (log/slog) with appropriate component fields consistent with the project pattern",
+      "priority": "SHOULD",
+      "rationale": "Consistent logging enables correlation and filtering across all plexd components",
+      "scenarios": [
+        {
+          "name": "Detection logging",
+          "when": "K8s environment detection runs",
+          "then": "result is logged at debug level with component='kubernetes'",
+          "and_then": []
+        },
+        {
+          "name": "CRD controller logging",
+          "when": "CRD operations execute",
+          "then": "operations are logged at info level with component='nodeapi' and resource details",
+          "and_then": []
+        },
+        {
+          "name": "Auth logging",
+          "when": "TokenReview is performed",
+          "then": "auth results are logged at debug level with component='nodeapi' without exposing token values",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "The system SHALL provide reference documentation covering all Kubernetes manifests, config fields, CRD schema, RBAC roles, and Go interfaces",
+      "priority": "SHALL",
+      "rationale": "Complete reference documentation enables operators to deploy and developers to extend the Kubernetes integration",
+      "scenarios": [
+        {
+          "name": "Manifest reference complete",
+          "when": "documentation is reviewed",
+          "then": "all files in deploy/kubernetes/ are listed with descriptions and customization guidance",
+          "and_then": []
+        },
+        {
+          "name": "CRD schema documented",
+          "when": "documentation is reviewed",
+          "then": "all spec and status fields are documented with types, constraints, and examples",
+          "and_then": []
+        },
+        {
+          "name": "RBAC roles documented",
+          "when": "documentation is reviewed",
+          "then": "plexd SA role and consumer roles are documented with their permissions and use cases",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-012",
+      "description": "The system SHALL provide a how-to guide for deploying plexd on Kubernetes with step-by-step instructions covering CRD, RBAC, Secret, and DaemonSet application",
+      "priority": "SHALL",
+      "rationale": "Step-by-step guidance reduces onboarding friction and ensures correct deployment order",
+      "scenarios": [
+        {
+          "name": "Full deployment path documented",
+          "when": "operator reads the guide",
+          "then": "steps are: create namespace, apply CRD, apply RBAC, create Secret, apply DaemonSet",
+          "and_then": []
+        },
+        {
+          "name": "Verification steps documented",
+          "when": "operator reads the guide",
+          "then": "kubectl commands to verify pods, PlexdNodeState resources, and plexd status are provided",
+          "and_then": []
+        },
+        {
+          "name": "Workload access section included",
+          "when": "operator reads the guide",
+          "then": "instructions for granting workloads access to PlexdNodeState and secrets via consumer RBAC roles are provided",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/kubernetes/detect.go: KubernetesEnvironment struct with InCluster (bool), Namespace (string), NodeName (string), PodName (string). EnvironmentDetector interface with Detect() KubernetesEnvironment. DefaultDetector implementation: checks os.Getenv('KUBERNETES_SERVICE_HOST') non-empty AND os.Stat('/var/run/secrets/kubernetes.io/serviceaccount/token') succeeds; reads namespace from /var/run/secrets/kubernetes.io/serviceaccount/namespace; NodeName from NODE_NAME env; PodName from HOSTNAME env. Logs result at debug with component='kubernetes'. Create internal/kubernetes/detect_test.go: tests with mock filesystem/env injection for InCluster, NotInCluster, PartialEnvironment scenarios. (REQ-001)",
+    "1.2 Create internal/kubernetes/config.go: Config struct with Enabled (bool), Namespace (string), AuditLogPath (string), CRDEnabled (bool). DefaultAuditLogPath = /var/log/kubernetes/audit/audit.log. ApplyDefaults(env KubernetesEnvironment) sets Enabled=env.InCluster when not explicitly set, Namespace=env.Namespace when empty and enabled, AuditLogPath=DefaultAuditLogPath when empty, CRDEnabled=true when enabled. Validate() rejects empty Namespace when Enabled. Create internal/kubernetes/config_test.go with tests for all scenarios in REQ-002. (REQ-002)",
+    "1.3 Create internal/kubernetes/interfaces.go: Define KubeClient interface with methods for CRD CRUD: CreateNodeState(ctx, namespace string, state *PlexdNodeState) error, UpdateNodeStateSpec(ctx, namespace, name string, spec PlexdNodeStateSpec) error, GetNodeState(ctx, namespace, name string) (*PlexdNodeState, error), WatchNodeState(ctx, namespace, name string) (<-chan PlexdNodeStateEvent, error), CreateSecret(ctx, namespace string, secret *KubeSecret) error, UpdateSecret(ctx, namespace, name string, secret *KubeSecret) error, DeleteSecret(ctx, namespace, name string) error. Define TokenReviewClient interface with method: Review(ctx context.Context, token string) (*TokenReviewResult, error). Define PlexdNodeState, PlexdNodeStateSpec, PlexdNodeStateStatus, KubeSecret, TokenReviewResult types matching README schema. (REQ-009)",
+    "1.4 Create internal/kubernetes/auth.go: TokenReviewAuthenticator struct with TokenReviewClient and logger. Authenticate(ctx, token string) (*AuthIdentity, error) method: reject empty token, call Review, return AuthIdentity{Username, Namespace, Groups} on success, error on failure. TokenReviewMiddleware(auth *TokenReviewAuthenticator) func(http.Handler) http.Handler: extract Bearer token from Authorization header, call Authenticate, return 401 on failure, attach identity to context on success. Create internal/kubernetes/auth_test.go with mock TokenReviewClient: valid token, invalid token, API unavailable, empty token, middleware integration. (REQ-005)",
+    "2.1 Create internal/kubernetes/crdcontroller.go: CRDController struct with fields: kubeClient KubeClient, cache *nodeapi.StateCache, reportSyncer *nodeapi.ReportSyncer, nodeID, meshIP, namespace, resourceName string, logger. NewCRDController constructor. Start(ctx) error: get-or-create PlexdNodeState resource, populate spec from cache, start status watcher goroutine. UpdateMetadata(m), UpdateData(entries), UpdateSecretIndex(refs) methods that patch the CRD spec via kubeClient and manage Secrets with ownerReferences. handleStatusChange(event) detects new/changed report entries and syncs to cache + reportSyncer. Stop() cancels watcher. Create internal/kubernetes/crdcontroller_test.go with mock KubeClient: all scenarios from REQ-004 (create, update existing, metadata update, data update, secret creation/deletion with ownerRefs, status watch detection, graceful shutdown). (REQ-004, REQ-009, REQ-010)",
+    "2.2 Create internal/kubernetes/auditreader.go: K8sAuditLogReader struct implementing the auditfwd.K8sAuditReader interface. Fields: path string, offset int64, logger. ReadEvents(ctx) ([]auditfwd.K8sAuditEvent, error): open file, seek to offset, read new lines, parse JSON per line (skip malformed with debug log), detect truncation (file size < offset → reset), update offset. Create internal/kubernetes/auditreader_test.go using t.TempDir() for file operations: tests for all scenarios in REQ-006 (parse JSON lines, track position, handle rotation, missing file, malformed lines, empty file). (REQ-006)",
+    "3.1 Create deploy/kubernetes/namespace.yaml: Namespace manifest for plexd-system. Create deploy/kubernetes/crds/plexdnodestate-crd.yaml: CRD definition matching README exactly — group plexd.plexsphere.com, kind PlexdNodeState, version v1alpha1, spec/status schema, status subresource, printer columns, short name 'pns'. (REQ-003)",
+    "3.2 Create deploy/kubernetes/serviceaccount.yaml: ServiceAccount 'plexd' in plexd-system. Create deploy/kubernetes/rbac.yaml: ClusterRole for plexd SA with plexdnodestates CRUD+status, secrets CRUD, tokenreviews create. ClusterRoleBinding binding SA to role. Consumer roles: plexd-state-reader (get/list/watch plexdnodestates), plexd-state-reporter (get/patch plexdnodestates/status), plexd-secrets-reader (get secrets). No wildcard permissions. (REQ-008)",
+    "3.3 Create deploy/kubernetes/daemonset.yaml: DaemonSet manifest for plexd in plexd-system. hostNetwork: true, serviceAccountName: plexd, NET_ADMIN+NET_RAW capabilities, hostPath /var/lib/plexd (DirectoryOrCreate), hostPath /var/log/kubernetes/audit (ReadOnly), PLEXD_BOOTSTRAP_TOKEN from plexd-bootstrap Secret, PLEXD_API env var, NODE_NAME from fieldRef spec.nodeName. Match the README example plus additions for audit log mount and NODE_NAME. (REQ-007)",
+    "3.4 Create deploy/kubernetes/secret.yaml: Example Secret manifest template for plexd-bootstrap in plexd-system with placeholder token value and a comment about ESO for production. (REQ-007)",
+    "4.1 Create docs/reference/backend/kubernetes-deployment.md: Reference documentation covering: KubernetesConfig struct (all fields, types, defaults, auto-detection), KubernetesEnvironment detection logic, PlexdNodeState CRD schema (spec + status fields with types and constraints), CRDController lifecycle (Start, Update*, Stop), TokenReviewAuthenticator behavior, K8sAuditLogReader behavior (file tailing, position tracking, rotation handling), all manifest files in deploy/kubernetes/ with descriptions, RBAC roles (plexd SA role and consumer roles with permissions tables), KubeClient and TokenReviewClient interfaces. Cross-reference docs/reference/backend/nodeapi.md and docs/reference/backend/audit-forwarding.md. (REQ-011)",
+    "4.2 Create docs/how-to/backend/kubernetes-deployment.md: How-to guide covering: Prerequisites (Kubernetes 1.25+, kubectl, bootstrap token, cluster-admin for CRD), Deployment steps (kubectl create namespace plexd-system, kubectl apply CRD, kubectl apply RBAC, kubectl create secret, kubectl apply DaemonSet), Verification (kubectl get pods, kubectl get pns, kubectl logs), Workload access (applying consumer RBAC roles, reading PlexdNodeState, writing reports via status patch, accessing secrets via node-local API), Troubleshooting (CRD not found, pods CrashLoopBackOff, token issues). Cross-reference reference doc. (REQ-012)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/kubernetes/config_test.go",
+      "test_function": "TestKubernetesConfig_ApplyDefaults_InCluster",
+      "story": "Operator configures Kubernetes-specific plexd features",
+      "expected": "ApplyDefaults with InCluster=true sets Enabled=true, CRDEnabled=true, AuditLogPath=/var/log/kubernetes/audit/audit.log, Namespace from detected env",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/kubernetes/config_test.go",
+      "test_function": "TestKubernetesConfig_ApplyDefaults_NotInCluster",
+      "story": "Operator configures Kubernetes-specific plexd features",
+      "expected": "ApplyDefaults with InCluster=false keeps Enabled=false and all K8s fields empty",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/kubernetes/config_test.go",
+      "test_function": "TestKubernetesConfig_Validate_MissingNamespace",
+      "story": "Operator configures Kubernetes-specific plexd features",
+      "expected": "Validate returns error when Enabled=true and Namespace is empty",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/kubernetes/config_test.go",
+      "test_function": "TestKubernetesConfig_Validate_ValidConfig",
+      "story": "Operator configures Kubernetes-specific plexd features",
+      "expected": "Validate returns nil for a valid config with Enabled=true and Namespace set",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/kubernetes/config_test.go",
+      "test_function": "TestKubernetesConfig_Validate_DisabledSkipsValidation",
+      "story": "Operator configures Kubernetes-specific plexd features",
+      "expected": "Validate returns nil when Enabled=false regardless of other field values",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/kubernetes/detect_test.go",
+      "test_function": "TestDetect_InCluster",
+      "story": "plexd auto-detects Kubernetes environment and enables K8s-specific features",
+      "expected": "When KUBERNETES_SERVICE_HOST is set and SA token exists, InCluster=true, Namespace and NodeName populated",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/kubernetes/detect_test.go",
+      "test_function": "TestDetect_NotInCluster",
+      "story": "plexd auto-detects Kubernetes environment and enables K8s-specific features",
+      "expected": "When KUBERNETES_SERVICE_HOST is not set, InCluster=false with all fields empty",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/kubernetes/detect_test.go",
+      "test_function": "TestDetect_PartialEnvironment",
+      "story": "plexd auto-detects Kubernetes environment and enables K8s-specific features",
+      "expected": "When KUBERNETES_SERVICE_HOST is set but SA token missing, InCluster=false",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/kubernetes/crdcontroller_test.go",
+      "test_function": "TestCRDController_Start_CreatesResource",
+      "story": "plexd manages a PlexdNodeState CRD for the local node API on Kubernetes",
+      "expected": "Start creates a PlexdNodeState resource named node-{node_id} with correct spec populated from StateCache",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/crdcontroller_test.go",
+      "test_function": "TestCRDController_Start_UpdatesExistingResource",
+      "story": "plexd manages a PlexdNodeState CRD for the local node API on Kubernetes",
+      "expected": "When resource already exists, Start updates the spec to match current StateCache",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/crdcontroller_test.go",
+      "test_function": "TestCRDController_UpdateMetadata",
+      "story": "plexd manages a PlexdNodeState CRD for the local node API on Kubernetes",
+      "expected": "UpdateMetadata updates the PlexdNodeState .spec.metadata via KubeClient",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/crdcontroller_test.go",
+      "test_function": "TestCRDController_UpdateData",
+      "story": "plexd manages a PlexdNodeState CRD for the local node API on Kubernetes",
+      "expected": "UpdateData updates the PlexdNodeState .spec.data via KubeClient",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/crdcontroller_test.go",
+      "test_function": "TestCRDController_UpdateSecretIndex_CreatesSecrets",
+      "story": "plexd manages a PlexdNodeState CRD for the local node API on Kubernetes",
+      "expected": "UpdateSecretIndex creates Kubernetes Secrets for new refs with ownerReferences and updates .spec.secretRefs",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/crdcontroller_test.go",
+      "test_function": "TestCRDController_UpdateSecretIndex_DeletesRemovedSecrets",
+      "story": "plexd manages a PlexdNodeState CRD for the local node API on Kubernetes",
+      "expected": "When a secretRef is removed, the corresponding Kubernetes Secret is deleted",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/crdcontroller_test.go",
+      "test_function": "TestCRDController_StatusWatch_DetectsReportChange",
+      "story": "plexd manages a PlexdNodeState CRD for the local node API on Kubernetes",
+      "expected": "When status.report is patched by a workload, the controller detects the change and syncs to StateCache",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/crdcontroller_test.go",
+      "test_function": "TestCRDController_Stop_GracefulShutdown",
+      "story": "plexd manages a PlexdNodeState CRD for the local node API on Kubernetes",
+      "expected": "Stop cancels the status watch and returns without blocking",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/auth_test.go",
+      "test_function": "TestTokenReviewAuth_ValidToken",
+      "story": "plexd authenticates node-local HTTP API callers via Kubernetes TokenReview on K8s",
+      "expected": "Authenticate returns identity with username and namespace when TokenReview returns authenticated=true",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/kubernetes/auth_test.go",
+      "test_function": "TestTokenReviewAuth_InvalidToken",
+      "story": "plexd authenticates node-local HTTP API callers via Kubernetes TokenReview on K8s",
+      "expected": "Authenticate returns error when TokenReview returns authenticated=false",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/kubernetes/auth_test.go",
+      "test_function": "TestTokenReviewAuth_APIUnavailable",
+      "story": "plexd authenticates node-local HTTP API callers via Kubernetes TokenReview on K8s",
+      "expected": "Authenticate returns error wrapping the API unavailability",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/kubernetes/auth_test.go",
+      "test_function": "TestTokenReviewAuth_EmptyToken",
+      "story": "plexd authenticates node-local HTTP API callers via Kubernetes TokenReview on K8s",
+      "expected": "Authenticate returns error without making API call for empty token",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/kubernetes/auth_test.go",
+      "test_function": "TestTokenReviewMiddleware_Integration",
+      "story": "plexd authenticates node-local HTTP API callers via Kubernetes TokenReview on K8s",
+      "expected": "HTTP middleware correctly extracts bearer token, calls authenticator, and returns 401 on failure or passes through on success",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/kubernetes/auditreader_test.go",
+      "test_function": "TestK8sAuditLogReader_ReadEvents_ParsesJSONLines",
+      "story": "plexd collects Kubernetes audit log events on K8s nodes",
+      "expected": "ReadEvents parses JSON Lines audit log entries into K8sAuditEvent structs with correct field mapping",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/kubernetes/auditreader_test.go",
+      "test_function": "TestK8sAuditLogReader_ReadEvents_TracksPosition",
+      "story": "plexd collects Kubernetes audit log events on K8s nodes",
+      "expected": "Second ReadEvents call returns only events written after the first call",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/kubernetes/auditreader_test.go",
+      "test_function": "TestK8sAuditLogReader_ReadEvents_HandlesRotation",
+      "story": "plexd collects Kubernetes audit log events on K8s nodes",
+      "expected": "When file is truncated (shorter than tracked position), reader resets to beginning",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/kubernetes/auditreader_test.go",
+      "test_function": "TestK8sAuditLogReader_ReadEvents_MissingFile",
+      "story": "plexd collects Kubernetes audit log events on K8s nodes",
+      "expected": "ReadEvents returns error when audit log file does not exist",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/kubernetes/auditreader_test.go",
+      "test_function": "TestK8sAuditLogReader_ReadEvents_SkipsMalformedLines",
+      "story": "plexd collects Kubernetes audit log events on K8s nodes",
+      "expected": "Invalid JSON lines are skipped; valid lines are still returned",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/kubernetes/auditreader_test.go",
+      "test_function": "TestK8sAuditLogReader_ReadEvents_EmptyFile",
+      "story": "plexd collects Kubernetes audit log events on K8s nodes",
+      "expected": "ReadEvents returns empty slice and nil error for an empty file",
+      "requirement_id": "REQ-006"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-012) have corresponding passing tests in internal/kubernetes/*_test.go",
+    "All WHEN/THEN scenarios from requirements are covered by at least one test case in test_specifications",
+    "All test_specifications are implemented with matching function names and file paths",
+    "KubernetesDetector correctly identifies in-cluster vs bare-metal environments using KUBERNETES_SERVICE_HOST and SA token file",
+    "CRDController uses injectable KubeClient interface — no real Kubernetes API calls in unit tests",
+    "TokenReviewAuthenticator uses injectable TokenReviewClient interface — no real TokenReview calls in unit tests",
+    "K8sAuditLogReader uses t.TempDir() for file operations — no modifications to the real filesystem",
+    "PlexdNodeState CRD definition matches README specification exactly: API group, version, spec/status schema, status subresource, printer columns",
+    "RBAC manifests follow least privilege: no wildcard permissions, specific API groups and resources only",
+    "DaemonSet manifest includes: hostNetwork, NET_ADMIN/NET_RAW, hostPath volumes, token from Secret, NODE_NAME from fieldRef, ServiceAccount",
+    "Code follows existing project patterns: Config with ApplyDefaults/Validate, log/slog with component field, injectable interfaces, stdlib-only test assertions",
+    "No sensitive data (tokens, keys, NSK) logged at any level; token values are never included in log messages or error strings",
+    "Kubernetes Secrets created by CRDController have ownerReferences to PlexdNodeState for garbage collection",
+    "Reference documentation (docs/reference/backend/kubernetes-deployment.md) covers all Config fields, CRD schema, RBAC roles, interfaces, and manifests",
+    "How-to guide (docs/how-to/backend/kubernetes-deployment.md) covers full deployment procedure, verification, workload access, and troubleshooting"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All Go code lives in `internal/kubernetes/` as a new package. Files: detect.go, config.go, interfaces.go, auth.go, crdcontroller.go, auditreader.go, and corresponding _test.go files. Kubernetes manifests live under deploy/kubernetes/ (matching the README project structure).\n\n2. **No external Kubernetes dependencies**: The CRDController and TokenReviewAuthenticator use injectable interfaces (KubeClient, TokenReviewClient) that abstract all Kubernetes API interactions. The actual implementations that use client-go or REST calls will be thin wrappers. For this feature, we define the interfaces and mock-based tests. The real implementations can use net/http to call the Kubernetes API directly (the in-cluster config provides the service account token and CA cert at well-known paths) — avoiding the heavy client-go dependency. This keeps the module stdlib-only for now.\n\n3. **Kubernetes environment detection**: The DefaultDetector uses os.Getenv and os.Stat to check for the standard Kubernetes service account paths. This is the same approach used by client-go's rest.InClusterConfig() but without the dependency. The detector is injectable for testing.\n\n4. **CRD management pattern**: The CRDController acts as a secondary consumer of StateCache changes alongside the file-based persistence. When the nodeapi server updates metadata/data/secretRefs in the StateCache, the CRDController is also notified and updates the CRD. For the status watch (workload-written reports), the controller runs a watch goroutine that detects changes to .status.report and syncs them to the StateCache and ReportSyncer.\n\n5. **PlexdNodeState resource naming**: Resources are named `node-{node_id}` (e.g., `node-n-abc123`) in the `plexd-system` namespace, matching the README example. The resource has a label `plexd.plexsphere.com/node-id={node_id}` for easy lookup.\n\n6. **Secret management**: For each secretRef in the control plane state, the CRDController creates a Kubernetes Secret named `plexd-secret-{node_id}-{key}` with ownerReferences pointing to the PlexdNodeState resource. The Secret contains only NSK-encrypted ciphertext (matching README specification). When secretRefs change, Secrets for removed refs are deleted.\n\n7. **TokenReview authentication**: On Kubernetes, the HTTP listener uses TokenReviewMiddleware instead of the static BearerAuthMiddleware. The middleware extracts the bearer token, calls TokenReviewClient.Review(), and attaches the authenticated identity to the request context. The Server.Start() method selects the appropriate middleware based on whether Kubernetes is detected.\n\n8. **K8s audit log reader**: The K8sAuditLogReader implements the auditfwd.K8sAuditReader interface. It tails the Kubernetes audit log file (JSON Lines format), tracking the file offset between reads. Log rotation is detected by comparing file size to tracked offset — if the file is shorter, the offset is reset. This is a simple but reliable approach that avoids inotify complexity.\n\n9. **DaemonSet design**: The DaemonSet uses hostNetwork:true for WireGuard mesh access (same as the README example). The bootstrap token is injected via PLEXD_BOOTSTRAP_TOKEN from a Secret. NODE_NAME is set from spec.nodeName fieldRef to enable the detector to know which node this pod is on. The audit log volume (/var/log/kubernetes/audit) is mounted read-only for audit collection.\n\n10. **Deploy directory structure**: Following the README: deploy/kubernetes/namespace.yaml, deploy/kubernetes/crds/plexdnodestate-crd.yaml, deploy/kubernetes/serviceaccount.yaml, deploy/kubernetes/rbac.yaml, deploy/kubernetes/daemonset.yaml, deploy/kubernetes/secret.yaml.\n\n11. **Security design**: SECPLAN-1: Authentication via Kubernetes TokenReview for HTTP API; CRD access controlled by Kubernetes RBAC. SECPLAN-2: All inputs validated (token length, CRD resource names). SECPLAN-3: Secrets in CRD contain only NSK-encrypted ciphertext; token values never logged. SECPLAN-4: Trust boundary is the Kubernetes API server — TokenReview validates identities, RBAC controls access.\n\n12. **Potential pitfalls**:\n    - The CRDController must handle Kubernetes API conflicts (409 Conflict from concurrent updates) by retrying with the latest resourceVersion.\n    - The status watch may receive events for changes made by the CRDController itself (spec updates); the controller must filter these to only process status changes.\n    - The K8s audit log path varies by cluster configuration; auto-detection via kubelet config is best-effort, with a configurable override.\n    - OwnerReferences require the PlexdNodeState UID, which is only available after creation — Secrets must be created/updated after the CRD resource exists.\n    - When plexd restarts, it must reconcile the CRD state with the local StateCache, handling cases where the CRD has more recent data (from workload status patches during downtime).\n\n13. **Key files from existing codebase**:\n    - `internal/nodeapi/server.go` — Server.Start() pattern for selecting middleware (extend for K8s auth)\n    - `internal/nodeapi/cache.go` — StateCache (the CRDController syncs with this)\n    - `internal/nodeapi/sync.go` — ReportSyncer (CRDController notifies this for status changes)\n    - `internal/nodeapi/auth.go` — BearerAuthMiddleware (the K8s equivalent replaces this on K8s)\n    - `internal/nodeapi/events.go` — RegisterEventHandlers (CRDController registers alongside these)\n    - `internal/nodeapi/handler.go` — Handler.Mux() (the same HTTP API served on K8s with different auth)\n    - `internal/api/types.go:220-231` — AuditEntry, AuditBatch types (audit reader produces these)\n    - `internal/registration/config.go` — Config pattern with ApplyDefaults/Validate\n    - `README.md:191-250` — Kubernetes DaemonSet section\n    - `README.md:1584-1893` — PlexdNodeState CRD section\n\n14. **Relationship to dependencies**: S022 depends on S002 (registration — for bootstrap token), S004 (local node API — for CRD extension), S005 (WireGuard — for mesh tunnels), S018 (audit — for K8s audit log source). The registration package already supports PLEXD_BOOTSTRAP_TOKEN env var. The nodeapi package provides the StateCache and ReportSyncer. The auditfwd package provides the K8sAuditReader interface. All dependencies are already implemented.\n\n15. **Performance design**: PERFPLAN-1: CRD updates are debounced via the existing StateCache update pattern. PERFPLAN-2: The status watch uses server-side filtering (field selector for the specific resource). PERFPLAN-3: The audit log reader uses simple seek-based file tailing, which is efficient and low-overhead.\n\n16. **Observability**: OBSPLAN-1: All components use structured logging with appropriate component fields. OBSPLAN-2: CRD operations are logged at info level for operator visibility. OBSPLAN-3: TokenReview and audit reader operations are logged at debug level to avoid log noise.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.113586"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:41:51.112405"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:48:34.632112"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "0f4a245d-f20e-4685-ae80-4f7da91c1b1f",
+      "timestamp": "2026-02-12T21:48:34.632139",
+      "total_duration": 399.4981529712677,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 399.4981529712677,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
