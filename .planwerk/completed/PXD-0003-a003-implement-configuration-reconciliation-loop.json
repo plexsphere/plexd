@@ -2,8 +2,8 @@
   "feature_id": "PXD-0003",
   "title": "A003: Implement configuration reconciliation loop",
   "slug": "a003-implement-configuration-reconciliation-loop",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Periodically compare local tunnel and policy state against the control plane's source of truth. Detect configuration drift (missing tunnels, stale peers, outdated policies) and correct it automatically. This is the core convergence loop that keeps every node aligned with desired state.",
   "stories": [
@@ -425,12 +425,12 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/reconcile/config.go — Define Config struct: Interval time.Duration (default 60s). Implement ApplyDefaults() setting Interval=60s when zero. Implement Validate() returning error if Interval <1s. Export DefaultInterval=60s constant. Follow the same pattern as internal/api/config.go and internal/registration/config.go. Include tests in config_test.go for defaults and validation. (REQ-008)",
-    "1.2 Create internal/reconcile/snapshot.go — Define StateSnapshot struct mirroring api.StateResponse fields: Peers []api.Peer, Policies []api.Policy, SigningKeys *api.SigningKeys, Metadata map[string]string, Data []api.DataEntry, SecretRefs []api.SecretRef. Protect with sync.RWMutex. Implement Get() returning a copy, Update(desired *api.StateResponse) setting all fields, and UpdatePartial(categories ...string) for selective update. Include tests in snapshot_test.go for initial empty state, update, concurrent access (using -race). (REQ-006)",
-    "1.3 Create internal/reconcile/diff.go — Define StateDiff struct: PeersToAdd []api.Peer, PeersToRemove []string (IDs), PeersToUpdate []api.Peer, PoliciesToAdd []api.Policy, PoliciesToRemove []string (IDs), SigningKeysChanged bool, NewSigningKeys *api.SigningKeys, MetadataChanged bool, DataChanged bool, SecretRefsChanged bool. Implement IsEmpty() bool. Implement ComputeDiff(desired *api.StateResponse, snapshot StateSnapshot) StateDiff comparing: peers by ID (add/remove/update by comparing endpoint, allowed_ips, psk), policies by ID, signing keys (current/previous), metadata map equality, data entries by key+version, secret refs by key+version. Include tests in diff_test.go for all scenarios: add, remove, update, no drift, empty snapshot, all categories. (REQ-001, REQ-002)",
-    "1.4 Create internal/reconcile/drift.go — Implement BuildDriftReport(diff StateDiff) api.DriftReport. Generate one api.DriftCorrection per item: Type=peer_added/peer_removed/peer_updated/policy_added/policy_removed/signing_keys_updated/metadata_updated/data_updated/secret_refs_updated, Detail=human-readable string (peer ID, policy ID, etc.). Set Timestamp=time.Now(). Return empty corrections for empty diff. Include tests in drift_test.go for all correction types and empty diff. (REQ-004)",
-    "2.1 Create internal/reconcile/reconciler.go — Define ReconcileHandler type: func(ctx context.Context, desired *api.StateResponse, diff StateDiff) error. Define Reconciler struct: client *api.ControlPlane, cfg Config, logger *slog.Logger, snapshot *StateSnapshot, handlers []ReconcileHandler, triggerCh chan struct{}. Implement NewReconciler(client, cfg, logger) with cfg.ApplyDefaults(). Implement RegisterHandler(handler ReconcileHandler). Implement TriggerReconcile() sending on triggerCh (non-blocking, buffered channel size 1 for coalescing). Implement Run(ctx, nodeID) error: validate inputs, run first cycle immediately, then select on time.Ticker and triggerCh. Each cycle: FetchState → ComputeDiff → if non-empty: invoke handlers with panic recovery → BuildDriftReport → ReportDrift → update snapshot. Log all outcomes with structured keys. Include tests in reconciler_test.go using httptest.Server for: periodic fetch, immediate first fetch, handler invocation, multiple handlers, panic recovery, drift reporting, trigger, trigger coalescing, snapshot update, context cancellation, FetchState error, no goroutine leaks (goleak). (REQ-001, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-009, REQ-010)",
-    "3.1 Create docs/reference/backend/reconciliation.md — Reference documentation for internal/reconcile/ package: Config struct fields and defaults, Reconciler constructor and methods (RegisterHandler, TriggerReconcile, Run), ReconcileHandler type signature, StateDiff struct and ComputeDiff, StateSnapshot lifecycle, BuildDriftReport usage, integration points (SSEManager reconnection callback, heartbeat reconcile flag). Include code examples for constructing a Reconciler, registering handlers, and starting the loop. (REQ-001 through REQ-010)"
+    "[done] 1.1 Create internal/reconcile/config.go — Define Config struct: Interval time.Duration (default 60s). Implement ApplyDefaults() setting Interval=60s when zero. Implement Validate() returning error if Interval <1s. Export DefaultInterval=60s constant. Follow the same pattern as internal/api/config.go and internal/registration/config.go. Include tests in config_test.go for defaults and validation. (REQ-008)",
+    "[done] 1.2 Create internal/reconcile/snapshot.go — Define StateSnapshot struct mirroring api.StateResponse fields: Peers []api.Peer, Policies []api.Policy, SigningKeys *api.SigningKeys, Metadata map[string]string, Data []api.DataEntry, SecretRefs []api.SecretRef. Protect with sync.RWMutex. Implement Get() returning a copy, Update(desired *api.StateResponse) setting all fields, and UpdatePartial(categories ...string) for selective update. Include tests in snapshot_test.go for initial empty state, update, concurrent access (using -race). (REQ-006)",
+    "[done] 1.3 Create internal/reconcile/diff.go — Define StateDiff struct: PeersToAdd []api.Peer, PeersToRemove []string (IDs), PeersToUpdate []api.Peer, PoliciesToAdd []api.Policy, PoliciesToRemove []string (IDs), SigningKeysChanged bool, NewSigningKeys *api.SigningKeys, MetadataChanged bool, DataChanged bool, SecretRefsChanged bool. Implement IsEmpty() bool. Implement ComputeDiff(desired *api.StateResponse, snapshot StateSnapshot) StateDiff comparing: peers by ID (add/remove/update by comparing endpoint, allowed_ips, psk), policies by ID, signing keys (current/previous), metadata map equality, data entries by key+version, secret refs by key+version. Include tests in diff_test.go for all scenarios: add, remove, update, no drift, empty snapshot, all categories. (REQ-001, REQ-002)",
+    "[done] 1.4 Create internal/reconcile/drift.go — Implement BuildDriftReport(diff StateDiff) api.DriftReport. Generate one api.DriftCorrection per item: Type=peer_added/peer_removed/peer_updated/policy_added/policy_removed/signing_keys_updated/metadata_updated/data_updated/secret_refs_updated, Detail=human-readable string (peer ID, policy ID, etc.). Set Timestamp=time.Now(). Return empty corrections for empty diff. Include tests in drift_test.go for all correction types and empty diff. (REQ-004)",
+    "[done] 2.1 Create internal/reconcile/reconciler.go — Define ReconcileHandler type: func(ctx context.Context, desired *api.StateResponse, diff StateDiff) error. Define Reconciler struct: client *api.ControlPlane, cfg Config, logger *slog.Logger, snapshot *StateSnapshot, handlers []ReconcileHandler, triggerCh chan struct{}. Implement NewReconciler(client, cfg, logger) with cfg.ApplyDefaults(). Implement RegisterHandler(handler ReconcileHandler). Implement TriggerReconcile() sending on triggerCh (non-blocking, buffered channel size 1 for coalescing). Implement Run(ctx, nodeID) error: validate inputs, run first cycle immediately, then select on time.Ticker and triggerCh. Each cycle: FetchState → ComputeDiff → if non-empty: invoke handlers with panic recovery → BuildDriftReport → ReportDrift → update snapshot. Log all outcomes with structured keys. Include tests in reconciler_test.go using httptest.Server for: periodic fetch, immediate first fetch, handler invocation, multiple handlers, panic recovery, drift reporting, trigger, trigger coalescing, snapshot update, context cancellation, FetchState error, no goroutine leaks (goleak). (REQ-001, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-009, REQ-010)",
+    "[done] 3.1 Create docs/reference/backend/reconciliation.md — Reference documentation for internal/reconcile/ package: Config struct fields and defaults, Reconciler constructor and methods (RegisterHandler, TriggerReconcile, Run), ReconcileHandler type signature, StateDiff struct and ComputeDiff, StateSnapshot lifecycle, BuildDriftReport usage, integration points (SSEManager reconnection callback, heartbeat reconcile flag). Include code examples for constructing a Reconciler, registering handlers, and starting the loop. (REQ-001 through REQ-010)"
   ],
   "test_specifications": [
     {
@@ -694,6 +694,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T08:45:33.760816"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T08:52:35.854326"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T09:14:53.137624"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T09:14:53.152665"
     }
   },
   "execution_history": [
@@ -707,6 +719,50 @@
           "name": "prepare",
           "duration": 286.9941382408142,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "69ce9bee-8931-4522-97e9-0e429f7ed84c",
+      "timestamp": "2026-02-12T09:13:20.156566",
+      "total_duration": 1044.5085051059723,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 368.2773997783661,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (1 tasks)",
+          "duration": 236.41401362419128,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 75.07499527931213,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0003] Code Review",
+          "duration": 209.17247557640076,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0003] Improvements",
+          "duration": 67.93169021606445,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0003] Simplify",
+          "duration": 87.63793063163757,
+          "type": "simplify",
           "status": "done"
         }
       ]
