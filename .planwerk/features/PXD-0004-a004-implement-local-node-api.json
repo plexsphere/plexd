@@ -1,0 +1,908 @@
+{
+  "feature_id": "PXD-0004",
+  "title": "A004: Implement local node API",
+  "slug": "a004-implement-local-node-api",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Expose node state (metadata, configuration data, secrets) to local workloads and scripts. On bare-metal/VM, serve via a Unix socket API. On Kubernetes, expose state via a PlexdNodeState CRD. Supports bidirectional data exchange — downstream from the control plane and upstream reporting from the node.",
+  "stories": [
+    {
+      "title": "Local workloads read node metadata via Unix socket",
+      "role": "local workload",
+      "want": "to read node metadata (labels, tags, environment, role) assigned by the control plane via HTTP on a Unix socket at /var/run/plexd/api.sock",
+      "so_that": "scripts and services on the node can discover their identity, role, and environment without direct control plane access",
+      "criteria": [
+        "GET /v1/state/metadata returns all metadata key-value pairs as a JSON object",
+        "GET /v1/state/metadata/{key} returns a single metadata value; 404 if key does not exist",
+        "GET /v1/state returns a summary including metadata keys, data entry keys with versions, secret ref keys with versions, and report entry keys with versions",
+        "Metadata is served from the local state cache (data_dir/state/metadata.json), not fetched from the control plane per request",
+        "Responses include Content-Type: application/json",
+        "The Unix socket is created at the configured path with group plexd ownership"
+      ]
+    },
+    {
+      "title": "Local workloads read data entries via Unix socket",
+      "role": "local workload",
+      "want": "to read named data entries (arbitrary JSON payloads managed by the control plane) via the local Node API",
+      "so_that": "applications can consume configuration data pushed by the platform without polling the control plane",
+      "criteria": [
+        "GET /v1/state/data returns a JSON array listing all data entry keys with their versions and content types",
+        "GET /v1/state/data/{key} returns the full data entry envelope (key, content_type, payload, version, updated_at); 404 if key does not exist",
+        "Data entries are served from the local file cache (data_dir/state/data/{key}.json)",
+        "Response format matches the api.DataEntry struct exactly"
+      ]
+    },
+    {
+      "title": "Local workloads read secrets via real-time proxy",
+      "role": "local workload with elevated privileges",
+      "want": "to read a secret value by name via GET /v1/state/secrets/{key}, with plexd fetching the encrypted value from the control plane in real-time and decrypting it with the NSK before returning the plaintext",
+      "so_that": "secret values are never cached on disk and the control plane can enforce access policies on every request",
+      "criteria": [
+        "GET /v1/state/secrets returns a JSON array listing secret names and versions from the local index (data_dir/state/secrets.json); no secret values",
+        "GET /v1/state/secrets/{key} proxies to ControlPlane.FetchSecret(ctx, nodeID, key) and decrypts the NSK-encrypted ciphertext",
+        "Decryption uses AES-256-GCM with the node's NSK loaded from data_dir/node_secret_key",
+        "Plaintext is returned as JSON {\"key\": \"...\", \"value\": \"...\", \"version\": N}; plaintext is never written to disk or logged",
+        "Returns 503 Service Unavailable if the control plane is unreachable",
+        "Returns 404 if the secret key does not exist on the control plane",
+        "Secret endpoints require elevated access: plexd-secrets group membership (socket) or bearer token (TCP)"
+      ]
+    },
+    {
+      "title": "Local workloads write and manage report entries",
+      "role": "local workload",
+      "want": "to create, update, and delete report entries via PUT and DELETE on /v1/state/report/{key}, with data buffered locally and synced upstream to the control plane",
+      "so_that": "workloads can publish status, health, and custom data back to the platform without direct control plane connectivity",
+      "criteria": [
+        "GET /v1/state/report returns a JSON array listing report entry keys with versions",
+        "GET /v1/state/report/{key} returns the full report entry; 404 if not found",
+        "PUT /v1/state/report/{key} creates or updates a report entry; request body must include content_type and payload fields",
+        "PUT /v1/state/report/{key} with If-Match header performs optimistic concurrency check; returns 409 Conflict if version mismatch",
+        "DELETE /v1/state/report/{key} removes a report entry; 404 if not found",
+        "Successful write operations increment the local version counter",
+        "Report entries are persisted locally in data_dir/state/report/{key}.json immediately on write",
+        "Changes are synced upstream via POST /v1/nodes/{node_id}/report after debounce (default 5s)"
+      ]
+    },
+    {
+      "title": "Report entries are synced upstream with debounce and retry",
+      "role": "plexd agent",
+      "want": "to buffer local report entry changes and sync them to the control plane via POST /v1/nodes/{node_id}/report with a configurable debounce period, retrying on transient failures",
+      "so_that": "rapid local writes are batched into efficient upstream calls and no data is lost during control plane outages",
+      "criteria": [
+        "After a report write or delete, the sync is delayed by the debounce period (default 5s)",
+        "Multiple writes within the debounce window are coalesced into a single sync call",
+        "The sync payload includes all changed entries (ReportSyncRequest with Entries for creates/updates and Deleted for removals) since the last successful sync",
+        "If the control plane is unreachable, the pending changes remain buffered and are retried on the next debounce cycle",
+        "Successful sync clears the pending change buffer",
+        "Sync errors are logged at warn level but do not affect local read/write operations",
+        "Context cancellation stops the sync goroutine cleanly"
+      ]
+    },
+    {
+      "title": "plexd populates and maintains the state cache from the control plane",
+      "role": "plexd agent",
+      "want": "to populate the local state cache (metadata, data entries, secret index) from the initial FetchState response and keep it in sync via SSE events (node_state_updated, node_secrets_updated)",
+      "so_that": "local API requests are served from a warm cache and reflect the latest control plane state",
+      "criteria": [
+        "On startup (after registration and first reconciliation), the state cache is populated from the reconciliation snapshot",
+        "The state cache persists to data_dir/state/ files: metadata.json, data/{key}.json, secrets.json",
+        "SSE event node_state_updated triggers a cache update for metadata and data entries",
+        "SSE event node_secrets_updated triggers a cache update for the secret index (names + versions only, no values)",
+        "The reconciliation loop reconcile handler detects drift in metadata, data, and secret refs and updates the cache",
+        "Cache reads use in-memory state with file persistence as backup for restart resilience"
+      ]
+    },
+    {
+      "title": "plexd serves the Node API over an optional TCP listener with bearer token auth",
+      "role": "platform operator",
+      "want": "to optionally enable a TCP listener (default 127.0.0.1:9100) for the Node API with bearer token authentication",
+      "so_that": "containers and environments without Unix socket access can still consume the Node API",
+      "criteria": [
+        "When node_api.http.enabled is true, plexd listens on the configured TCP address",
+        "TCP requests must include Authorization: Bearer <token> header; requests without valid token receive 401",
+        "The token is read from node_api.http.token_file at startup",
+        "All endpoints (metadata, data, secrets, report) are available on both Unix socket and TCP",
+        "TCP listener respects the same context cancellation for graceful shutdown"
+      ]
+    },
+    {
+      "title": "plexd gracefully starts and stops the Node API server",
+      "role": "platform operator",
+      "want": "the Node API server to start after registration completes and stop cleanly on context cancellation or agent shutdown",
+      "so_that": "the server integrates into the agent lifecycle without goroutine leaks or unclosed sockets",
+      "criteria": [
+        "Server.Start(ctx) opens the Unix socket and optionally the TCP listener, then serves requests",
+        "Context cancellation triggers graceful HTTP server shutdown with a configurable timeout (default 5s)",
+        "The Unix socket file is removed on shutdown",
+        "All goroutines (server, report sync) exit cleanly on shutdown (verifiable via goleak)",
+        "Start returns a descriptive error if the config is invalid (missing socket path, invalid token file)"
+      ]
+    },
+    {
+      "title": "Node API configuration follows existing config patterns",
+      "role": "platform operator",
+      "want": "to configure the Node API via the nodeapi block in the config, following the same Config/ApplyDefaults/Validate pattern used by internal/api/ and internal/registration/",
+      "so_that": "configuration is consistent across all plexd subsystems",
+      "criteria": [
+        "Config struct defines: SocketPath (default /var/run/plexd/api.sock), HTTPEnabled (default false), HTTPListen (default 127.0.0.1:9100), HTTPTokenFile string, DebouncePeriod (default 5s), ShutdownTimeout (default 5s), DataDir string (required)",
+        "ApplyDefaults sets SocketPath, HTTPListen, DebouncePeriod, and ShutdownTimeout when zero",
+        "Validate returns error if DataDir is empty",
+        "Config is passed to Server constructor, no file I/O in the nodeapi package during construction"
+      ]
+    },
+    {
+      "title": "Node API errors are handled consistently with appropriate HTTP status codes",
+      "role": "local workload developer",
+      "want": "to receive appropriate HTTP status codes and descriptive error messages for all error conditions",
+      "so_that": "client code can handle errors programmatically without guessing",
+      "criteria": [
+        "404 Not Found for nonexistent metadata keys, data entries, secrets, and report entries",
+        "409 Conflict when If-Match version does not match current report entry version",
+        "400 Bad Request for malformed JSON, missing required fields, or invalid Content-Type",
+        "401 Unauthorized for TCP requests without valid bearer token",
+        "503 Service Unavailable when control plane is unreachable (secret fetch, report sync)",
+        "405 Method Not Allowed for unsupported HTTP methods on endpoints",
+        "All error responses are JSON: {\"error\": \"message\"}",
+        "Internal errors are logged with full details but external responses contain safe messages only"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The Node API server SHALL serve HTTP/1.1 on a Unix socket at the configured path, created with group plexd ownership",
+      "priority": "SHALL",
+      "rationale": "Unix socket provides local-only access with filesystem-based access control, matching the security model in the README",
+      "scenarios": [
+        {
+          "name": "Socket created and listening",
+          "when": "Server.Start is called with a valid config",
+          "then": "the Unix socket is created at SocketPath and accepts HTTP requests",
+          "and_then": [
+            "the socket file exists with appropriate permissions"
+          ]
+        },
+        {
+          "name": "Socket removed on shutdown",
+          "when": "the server is shut down via context cancellation",
+          "then": "the Unix socket file is removed from the filesystem",
+          "and_then": [
+            "no goroutine leaks after shutdown"
+          ]
+        },
+        {
+          "name": "Existing socket removed on startup",
+          "when": "a stale socket file exists at the configured path",
+          "then": "the existing file is removed and a new socket is created",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The Node API SHALL serve GET /v1/state returning a summary of all cached state categories",
+      "priority": "SHALL",
+      "rationale": "A single summary endpoint allows consumers to discover available state without multiple requests",
+      "scenarios": [
+        {
+          "name": "Summary includes all categories",
+          "when": "GET /v1/state is called with populated cache",
+          "then": "the response includes metadata, data_keys, secret_keys, and report_keys",
+          "and_then": []
+        },
+        {
+          "name": "Summary with empty cache",
+          "when": "GET /v1/state is called before any state is loaded",
+          "then": "the response includes empty collections for all categories",
+          "and_then": []
+        },
+        {
+          "name": "Unsupported method returns 405",
+          "when": "POST /v1/state is called",
+          "then": "the server returns 405 Method Not Allowed",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The Node API SHALL serve GET /v1/state/metadata and GET /v1/state/metadata/{key} from the local state cache",
+      "priority": "SHALL",
+      "rationale": "Metadata is the most commonly read state category; serving from cache avoids control plane latency",
+      "scenarios": [
+        {
+          "name": "All metadata returned",
+          "when": "GET /v1/state/metadata is called",
+          "then": "the response is a JSON object of all key-value pairs",
+          "and_then": []
+        },
+        {
+          "name": "Single metadata key found",
+          "when": "GET /v1/state/metadata/{key} is called and the key exists",
+          "then": "the response is a JSON object with key and value fields",
+          "and_then": []
+        },
+        {
+          "name": "Single metadata key not found",
+          "when": "GET /v1/state/metadata/{key} is called and the key does not exist",
+          "then": "the response is 404 with JSON error body",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The Node API SHALL serve GET /v1/state/data and GET /v1/state/data/{key} from the local file cache",
+      "priority": "SHALL",
+      "rationale": "Data entries may contain large JSON payloads; serving from file cache provides restart resilience",
+      "scenarios": [
+        {
+          "name": "List all data entries",
+          "when": "GET /v1/state/data is called",
+          "then": "the response lists all data entry keys with version and content_type",
+          "and_then": []
+        },
+        {
+          "name": "Single data entry found",
+          "when": "GET /v1/state/data/{key} is called and the key exists",
+          "then": "the response contains the full DataEntry envelope",
+          "and_then": []
+        },
+        {
+          "name": "Single data entry not found",
+          "when": "GET /v1/state/data/{key} is called and the key does not exist",
+          "then": "the response is 404 with JSON error body",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The Node API SHALL serve GET /v1/state/secrets (local index) and GET /v1/state/secrets/{key} (real-time proxy with NSK decryption)",
+      "priority": "SHALL",
+      "rationale": "Secrets are never cached in plaintext; individual values require live control plane access",
+      "scenarios": [
+        {
+          "name": "List secret keys and versions",
+          "when": "GET /v1/state/secrets is called",
+          "then": "the response lists secret names and versions from the local index; no values",
+          "and_then": []
+        },
+        {
+          "name": "Secret value fetched and decrypted",
+          "when": "GET /v1/state/secrets/{key} is called and control plane is reachable",
+          "then": "plexd proxies to FetchSecret, decrypts with NSK (AES-256-GCM), and returns plaintext",
+          "and_then": [
+            "plaintext is never written to disk or logged"
+          ]
+        },
+        {
+          "name": "Control plane unreachable returns 503",
+          "when": "GET /v1/state/secrets/{key} is called and control plane is unreachable",
+          "then": "the response is 503 Service Unavailable",
+          "and_then": []
+        },
+        {
+          "name": "Secret not found returns 404",
+          "when": "GET /v1/state/secrets/{key} is called and control plane returns 404",
+          "then": "the response is 404",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The Node API SHALL serve CRUD operations for report entries with local persistence and optimistic concurrency via If-Match",
+      "priority": "SHALL",
+      "rationale": "Report entries are the upstream data channel; optimistic locking prevents lost updates from concurrent writers",
+      "scenarios": [
+        {
+          "name": "Create report entry",
+          "when": "PUT /v1/state/report/{key} is called with valid JSON body",
+          "then": "the entry is created with version=1 and persisted to file",
+          "and_then": [
+            "response is 200 with the created entry"
+          ]
+        },
+        {
+          "name": "Update with matching If-Match",
+          "when": "PUT /v1/state/report/{key} with If-Match matching current version",
+          "then": "the entry is updated and version is incremented",
+          "and_then": []
+        },
+        {
+          "name": "Update with stale If-Match rejected",
+          "when": "PUT /v1/state/report/{key} with If-Match not matching current version",
+          "then": "response is 409 Conflict",
+          "and_then": []
+        },
+        {
+          "name": "Delete existing entry",
+          "when": "DELETE /v1/state/report/{key} is called for an existing entry",
+          "then": "the entry is removed and 204 No Content returned",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The Node API SHALL sync report changes to the control plane via POST /v1/nodes/{node_id}/report with configurable debounce coalescing",
+      "priority": "SHALL",
+      "rationale": "Debounced batching reduces control plane load while ensuring eventual upstream consistency",
+      "scenarios": [
+        {
+          "name": "Writes coalesced within debounce window",
+          "when": "multiple report entries are written within the debounce period",
+          "then": "a single SyncReports call includes all changed entries",
+          "and_then": []
+        },
+        {
+          "name": "Sync failure retried",
+          "when": "SyncReports returns an error",
+          "then": "changes remain buffered and are included in the next sync",
+          "and_then": [
+            "error is logged at warn level"
+          ]
+        },
+        {
+          "name": "Context cancellation stops sync",
+          "when": "the context is cancelled during debounce wait",
+          "then": "the sync goroutine exits cleanly",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The Node API SHALL maintain a file-based state cache in data_dir/state/ that survives agent restarts",
+      "priority": "SHALL",
+      "rationale": "Local cache enables offline reads and provides restart resilience",
+      "scenarios": [
+        {
+          "name": "Cache populated from reconciliation",
+          "when": "the reconciliation loop completes with new state",
+          "then": "cache files are written to data_dir/state/",
+          "and_then": []
+        },
+        {
+          "name": "Cache loaded on startup",
+          "when": "Server starts with existing cache files",
+          "then": "the in-memory cache is populated from persisted files",
+          "and_then": []
+        },
+        {
+          "name": "Cache directory created if missing",
+          "when": "data_dir/state/ does not exist",
+          "then": "the directory tree is created with 0700 permissions",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The Node API SHALL optionally serve on a TCP listener with bearer token authentication",
+      "priority": "SHALL",
+      "rationale": "TCP access is needed for containers and environments without Unix socket access",
+      "scenarios": [
+        {
+          "name": "Authenticated TCP request accepted",
+          "when": "TCP request includes valid Authorization: Bearer header",
+          "then": "the request is processed normally",
+          "and_then": []
+        },
+        {
+          "name": "Unauthenticated TCP request rejected",
+          "when": "TCP request has no or invalid Authorization header",
+          "then": "the response is 401 Unauthorized",
+          "and_then": []
+        },
+        {
+          "name": "TCP listener disabled by default",
+          "when": "HTTPEnabled is false",
+          "then": "no TCP listener is started",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The Node API SHALL decrypt secret values using AES-256-GCM with the per-node NSK and NEVER persist plaintext to disk or include it in logs",
+      "priority": "SHALL",
+      "rationale": "Envelope encryption ensures secrets are protected at rest and in transit within the node",
+      "scenarios": [
+        {
+          "name": "AES-256-GCM decryption succeeds",
+          "when": "FetchSecret returns valid ciphertext and nonce",
+          "then": "the ciphertext is decrypted and plaintext returned",
+          "and_then": []
+        },
+        {
+          "name": "Decryption failure returns generic error",
+          "when": "the ciphertext is corrupted",
+          "then": "500 error with generic message (no cryptographic details leaked)",
+          "and_then": []
+        },
+        {
+          "name": "Plaintext never logged",
+          "when": "a secret is decrypted and served",
+          "then": "no log entry contains the plaintext",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "The Node API SHALL support graceful shutdown via context cancellation with all goroutines exiting cleanly",
+      "priority": "SHALL",
+      "rationale": "Clean shutdown on SIGTERM prevents resource leaks and data loss",
+      "scenarios": [
+        {
+          "name": "Context cancellation stops server",
+          "when": "the context is cancelled",
+          "then": "HTTP servers shut down gracefully, socket file removed, sync goroutine exits",
+          "and_then": []
+        },
+        {
+          "name": "No goroutine leaks",
+          "when": "Start returns after shutdown",
+          "then": "all goroutines have exited (verifiable via goleak)",
+          "and_then": []
+        },
+        {
+          "name": "In-flight requests complete",
+          "when": "shutdown during active request",
+          "then": "the request completes before server stops (up to shutdown timeout)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-012",
+      "description": "The nodeapi Config SHALL follow the ApplyDefaults/Validate pattern with reasonable defaults",
+      "priority": "SHALL",
+      "rationale": "Consistent configuration patterns across packages",
+      "scenarios": [
+        {
+          "name": "Defaults applied",
+          "when": "Config with only DataDir set",
+          "then": "SocketPath, HTTPListen, DebouncePeriod, ShutdownTimeout use defaults",
+          "and_then": []
+        },
+        {
+          "name": "Missing DataDir rejected",
+          "when": "DataDir is empty",
+          "then": "Validate returns error",
+          "and_then": []
+        },
+        {
+          "name": "Custom values used",
+          "when": "non-zero values are configured",
+          "then": "configured values override defaults",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-013",
+      "description": "The Node API SHALL register SSE event handlers for node_state_updated and node_secrets_updated to keep the cache in sync",
+      "priority": "SHALL",
+      "rationale": "Real-time SSE updates minimize cache staleness between reconciliation cycles",
+      "scenarios": [
+        {
+          "name": "node_state_updated updates cache",
+          "when": "SSE event received with updated metadata and data",
+          "then": "in-memory and file cache updated",
+          "and_then": []
+        },
+        {
+          "name": "node_secrets_updated updates index",
+          "when": "SSE event received with updated secret refs",
+          "then": "secrets.json index updated (no values)",
+          "and_then": []
+        },
+        {
+          "name": "Malformed payload logged and skipped",
+          "when": "SSE event has invalid JSON",
+          "then": "error logged, cache not modified",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-014",
+      "description": "The Node API SHALL use structured logging with component=nodeapi and consistent keys",
+      "priority": "SHALL",
+      "rationale": "Operational consistency with existing packages",
+      "scenarios": [
+        {
+          "name": "Request logged at debug",
+          "when": "an API request is processed",
+          "then": "debug log with component=nodeapi, method, path, status, duration",
+          "and_then": []
+        },
+        {
+          "name": "Secret access logged without value",
+          "when": "a secret is fetched",
+          "then": "info log with secret_key only, no plaintext",
+          "and_then": []
+        },
+        {
+          "name": "Sync logged",
+          "when": "report sync completes",
+          "then": "info log with entries_count, deleted_count, success/failure",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/nodeapi/config.go — Define Config struct: SocketPath string (default /var/run/plexd/api.sock), HTTPEnabled bool (default false), HTTPListen string (default 127.0.0.1:9100), HTTPTokenFile string, DebouncePeriod time.Duration (default 5s), ShutdownTimeout time.Duration (default 5s), DataDir string (required). Implement ApplyDefaults() and Validate() following internal/api/config.go and internal/registration/config.go patterns. Export default constants. Include tests in config_test.go for defaults, validation, and custom overrides. (REQ-012)",
+    "1.2 Create internal/nodeapi/cache.go — Define StateCache struct with sync.RWMutex: metadata map[string]string, data map[string]api.DataEntry, secretIndex []api.SecretRef, reports map[string]api.ReportEntry (define ReportEntry: Key, ContentType, Payload json.RawMessage, Version int, UpdatedAt time.Time). Implement NewStateCache(dataDir), Load() error (read from data_dir/state/), UpdateMetadata(m), UpdateData(entries), UpdateSecretIndex(refs), GetMetadata/GetData/GetSecretIndex/GetReports, PutReport(key, contentType, payload, ifMatch *int) (ReportEntry, error) with version increment and optimistic locking (ErrVersionConflict), DeleteReport(key) error (ErrNotFound), persist methods writing to data_dir/state/ atomically. Include tests in cache_test.go for all CRUD, locking, persistence, and concurrent access. (REQ-006, REQ-008)",
+    "1.3 Create internal/nodeapi/decrypt.go — Implement DecryptSecret(nsk []byte, ciphertext string, nonce string) (string, error). Decode base64 ciphertext and nonce, decrypt using crypto/aes + crypto/cipher (AES-256-GCM). Return plaintext string. Return generic error on decryption failure (no crypto details leaked). Include tests in decrypt_test.go: successful decryption roundtrip (encrypt then decrypt), corrupted ciphertext, invalid nonce, wrong key. (REQ-010)",
+    "1.4 Create internal/nodeapi/sync.go — Implement ReportSyncer struct with: client (interface with SyncReports method), nodeID string, debouncePeriod time.Duration, logger *slog.Logger, pending changes buffer (entries []api.ReportEntry, deleted []string) protected by mutex. Implement NotifyChange(entries, deleted) to buffer changes. Implement Run(ctx) that loops: wait for debounce timer after NotifyChange, coalesce all buffered changes, call SyncReports, clear buffer on success, retain on failure. Include tests in sync_test.go: debounce timing, coalescing, retry on failure, context cancellation, no goroutine leaks. (REQ-007)",
+    "2.1 Create internal/nodeapi/handler.go — Implement HTTP handler (using net/http ServeMux or manual routing): routes for GET /v1/state, GET /v1/state/metadata, GET /v1/state/metadata/{key}, GET /v1/state/data, GET /v1/state/data/{key}, GET /v1/state/secrets, GET /v1/state/secrets/{key}, GET /v1/state/report, GET /v1/state/report/{key}, PUT /v1/state/report/{key}, DELETE /v1/state/report/{key}. Each handler reads from StateCache. Secret handler proxies to ControlPlane.FetchSecret and calls DecryptSecret. Report PUT parses If-Match header for optimistic locking. All responses JSON with proper status codes (200, 204, 400, 404, 405, 409, 500, 503). Include tests in handler_test.go using httptest.Server for all endpoints, success and error cases. (REQ-002, REQ-003, REQ-004, REQ-005, REQ-006)",
+    "2.2 Create internal/nodeapi/auth.go — Implement BearerAuthMiddleware(token string) func(http.Handler) http.Handler that checks Authorization: Bearer header on TCP requests. Returns 401 for missing or invalid token. Unix socket requests bypass auth (no middleware applied). Include tests in auth_test.go for valid token, missing token, invalid token, and bypass for socket. (REQ-009)",
+    "2.3 Create internal/nodeapi/events.go — Implement SSE event handlers for node_state_updated and node_secrets_updated. Define NodeStateUpdatePayload struct (Metadata map[string]string, Data []api.DataEntry) and NodeSecretsUpdatePayload struct (SecretRefs []api.SecretRef). Implement HandleNodeStateUpdated(ctx, envelope) error that parses payload and updates the StateCache. Implement HandleNodeSecretsUpdated(ctx, envelope) error that parses payload and updates the secret index. Implement RegisterEventHandlers(dispatcher *api.EventDispatcher, cache *StateCache, logger) that registers both handlers. Include tests in events_test.go for valid payloads, malformed payloads, and cache update verification. (REQ-013)",
+    "3.1 Create internal/nodeapi/server.go — Implement Server struct wiring all components: Config, StateCache, ReportSyncer, ControlPlane client (interface for FetchSecret, SyncReports), NSK []byte, logger. Implement NewServer(cfg, client, nsk, logger). Implement Start(ctx, nodeID) error: (1) create data_dir/state/ if needed, (2) load cache from disk, (3) start ReportSyncer goroutine, (4) set up HTTP routes with handler, (5) open Unix socket listener (remove stale socket first), (6) optionally open TCP listener with auth middleware, (7) start serving. On context cancellation: graceful HTTP shutdown with ShutdownTimeout, close listeners, remove socket file. Implement RegisterEventHandlers(dispatcher) to register SSE handlers. Implement ReconcileHandler() reconcile.ReconcileHandler that updates the cache on drift detection. Include tests in server_test.go using t.TempDir and httptest: Unix socket lifecycle, TCP with auth, graceful shutdown, no goroutine leaks (goleak). (REQ-001, REQ-009, REQ-011)",
+    "4.1 Create docs/reference/backend/nodeapi.md — Reference documentation for internal/nodeapi/ package: Config struct fields and defaults, Server constructor and lifecycle (NewServer, Start, RegisterEventHandlers, ReconcileHandler), StateCache CRUD operations and persistence layout, ReportSyncer debounce and retry behavior, DecryptSecret usage, BearerAuthMiddleware, HTTP API endpoints (paths, methods, request/response schemas, error codes), SSE event handler registration, integration points (ControlPlane client methods, reconcile.ReconcileHandler, api.EventDispatcher). Include examples for constructing a Server, configuring listeners, and making API requests. (REQ-001 through REQ-014)",
+    "4.2 Create docs/how-to/backend/local-node-api.md — How-to guide for using the Local Node API: prerequisites (plexd running, correct group membership), reading metadata and data from the Unix socket with curl examples, writing and deleting report entries with optimistic locking, reading secrets (elevated access requirements), using the optional TCP listener with bearer token, troubleshooting common errors (403, 503). Reference the reference docs. (REQ-001 through REQ-014)",
+    "5.1 Add integration test in internal/nodeapi/server_test.go — TestServer_EndToEndFlow: start server with Unix socket, populate cache with test data, verify GET /v1/state returns summary, GET /v1/state/metadata returns metadata, PUT /v1/state/report creates entry, GET /v1/state/report/{key} returns it, DELETE /v1/state/report/{key} removes it, verify report sync is triggered. (REQ-001 through REQ-008)",
+    "5.2 Add integration test in internal/nodeapi/server_test.go — TestServer_SecretProxy: start server with mock ControlPlane returning NSK-encrypted secrets, verify GET /v1/state/secrets/{key} returns decrypted value, verify 503 when mock returns error, verify 404 when mock returns ErrNotFound. (REQ-005, REQ-010)",
+    "5.3 Add integration test in internal/nodeapi/server_test.go — TestServer_CacheUpdateFromEvents: start server, simulate node_state_updated and node_secrets_updated events via the event handlers, verify cache reflects the updates and GET endpoints return new data. (REQ-008, REQ-013)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/nodeapi/config_test.go",
+      "test_function": "TestConfig_Defaults",
+      "story": "Node API configuration follows existing config patterns",
+      "expected": "Config with only DataDir set uses default SocketPath, HTTPListen, DebouncePeriod, ShutdownTimeout",
+      "requirement_id": "REQ-012"
+    },
+    {
+      "test_file": "internal/nodeapi/config_test.go",
+      "test_function": "TestConfig_ValidateRequiresDataDir",
+      "story": "Node API configuration follows existing config patterns",
+      "expected": "Config.Validate returns error when DataDir is empty",
+      "requirement_id": "REQ-012"
+    },
+    {
+      "test_file": "internal/nodeapi/config_test.go",
+      "test_function": "TestConfig_CustomValuesOverrideDefaults",
+      "story": "Node API configuration follows existing config patterns",
+      "expected": "Non-zero configured values are preserved after ApplyDefaults",
+      "requirement_id": "REQ-012"
+    },
+    {
+      "test_file": "internal/nodeapi/cache_test.go",
+      "test_function": "TestStateCache_InitiallyEmpty",
+      "story": "plexd populates and maintains the state cache from the control plane",
+      "expected": "A new StateCache has empty metadata, data, secret index, and report entries",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/nodeapi/cache_test.go",
+      "test_function": "TestStateCache_UpdateMetadata",
+      "story": "plexd populates and maintains the state cache from the control plane",
+      "expected": "UpdateMetadata replaces the full metadata map and persists to file",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/nodeapi/cache_test.go",
+      "test_function": "TestStateCache_UpdateData",
+      "story": "plexd populates and maintains the state cache from the control plane",
+      "expected": "UpdateData replaces data entries and persists each to data_dir/state/data/{key}.json",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/nodeapi/cache_test.go",
+      "test_function": "TestStateCache_UpdateSecretIndex",
+      "story": "plexd populates and maintains the state cache from the control plane",
+      "expected": "UpdateSecretIndex updates names and versions only, persists to secrets.json",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/nodeapi/cache_test.go",
+      "test_function": "TestStateCache_LoadFromDisk",
+      "story": "plexd populates and maintains the state cache from the control plane",
+      "expected": "Load() reads metadata.json, data/*.json, secrets.json, and report/*.json into memory",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/nodeapi/cache_test.go",
+      "test_function": "TestStateCache_ReportCRUD",
+      "story": "Local workloads write and manage report entries",
+      "expected": "PutReport creates/updates with version increment, GetReport returns entry, DeleteReport removes entry",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/nodeapi/cache_test.go",
+      "test_function": "TestStateCache_ReportOptimisticLocking",
+      "story": "Local workloads write and manage report entries",
+      "expected": "PutReport with stale version returns ErrVersionConflict; matching version succeeds",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/nodeapi/cache_test.go",
+      "test_function": "TestStateCache_ConcurrentAccess",
+      "story": "plexd populates and maintains the state cache from the control plane",
+      "expected": "Concurrent reads and writes produce no data races (verified with -race)",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/nodeapi/decrypt_test.go",
+      "test_function": "TestDecryptSecret_Success",
+      "story": "Local workloads read secrets via real-time proxy",
+      "expected": "Valid NSK-encrypted ciphertext is correctly decrypted with AES-256-GCM",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/nodeapi/decrypt_test.go",
+      "test_function": "TestDecryptSecret_CorruptCiphertext",
+      "story": "Local workloads read secrets via real-time proxy",
+      "expected": "Corrupted ciphertext returns a descriptive error without leaking crypto details",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/nodeapi/decrypt_test.go",
+      "test_function": "TestDecryptSecret_InvalidNonce",
+      "story": "Local workloads read secrets via real-time proxy",
+      "expected": "Invalid nonce returns a descriptive error",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/nodeapi/sync_test.go",
+      "test_function": "TestReportSync_SingleWriteSyncedAfterDebounce",
+      "story": "Report entries are synced upstream with debounce and retry",
+      "expected": "A single report write triggers SyncReports after the debounce period",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/nodeapi/sync_test.go",
+      "test_function": "TestReportSync_MultipleWritesCoalesced",
+      "story": "Report entries are synced upstream with debounce and retry",
+      "expected": "Multiple writes within debounce window produce a single SyncReports call with all entries",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/nodeapi/sync_test.go",
+      "test_function": "TestReportSync_DeleteIncluded",
+      "story": "Report entries are synced upstream with debounce and retry",
+      "expected": "Deleted report keys appear in SyncReports.Deleted",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/nodeapi/sync_test.go",
+      "test_function": "TestReportSync_RetryOnFailure",
+      "story": "Report entries are synced upstream with debounce and retry",
+      "expected": "Failed sync retains changes in buffer for next cycle",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/nodeapi/sync_test.go",
+      "test_function": "TestReportSync_ContextCancellation",
+      "story": "Report entries are synced upstream with debounce and retry",
+      "expected": "Context cancellation stops the sync goroutine cleanly",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_GetState",
+      "story": "Local workloads read node metadata via Unix socket",
+      "expected": "GET /v1/state returns summary with all state categories",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_GetMetadataAll",
+      "story": "Local workloads read node metadata via Unix socket",
+      "expected": "GET /v1/state/metadata returns all key-value pairs",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_GetMetadataKey",
+      "story": "Local workloads read node metadata via Unix socket",
+      "expected": "GET /v1/state/metadata/{key} returns single value; 404 for missing key",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_GetDataAll",
+      "story": "Local workloads read data entries via Unix socket",
+      "expected": "GET /v1/state/data returns list of data entry summaries",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_GetDataKey",
+      "story": "Local workloads read data entries via Unix socket",
+      "expected": "GET /v1/state/data/{key} returns full data entry; 404 for missing key",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_GetSecretsList",
+      "story": "Local workloads read secrets via real-time proxy",
+      "expected": "GET /v1/state/secrets returns key/version list from local index",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_GetSecretValue",
+      "story": "Local workloads read secrets via real-time proxy",
+      "expected": "GET /v1/state/secrets/{key} proxies to control plane, decrypts, returns plaintext",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_GetSecretValue_ControlPlaneDown",
+      "story": "Local workloads read secrets via real-time proxy",
+      "expected": "Returns 503 when control plane is unreachable",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_GetReportAll",
+      "story": "Local workloads write and manage report entries",
+      "expected": "GET /v1/state/report returns list of report entry summaries",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_PutReport",
+      "story": "Local workloads write and manage report entries",
+      "expected": "PUT /v1/state/report/{key} creates entry with version=1 and returns it",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_PutReport_IfMatchConflict",
+      "story": "Local workloads write and manage report entries",
+      "expected": "PUT with stale If-Match returns 409 Conflict",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_DeleteReport",
+      "story": "Local workloads write and manage report entries",
+      "expected": "DELETE /v1/state/report/{key} returns 204; 404 for missing key",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_MethodNotAllowed",
+      "story": "Node API errors are handled consistently with appropriate HTTP status codes",
+      "expected": "Unsupported HTTP methods return 405",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestHandler_PutReport_InvalidJSON",
+      "story": "Node API errors are handled consistently with appropriate HTTP status codes",
+      "expected": "PUT with malformed JSON returns 400 Bad Request",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/nodeapi/auth_test.go",
+      "test_function": "TestBearerAuth_ValidToken",
+      "story": "plexd serves the Node API over an optional TCP listener with bearer token auth",
+      "expected": "Request with correct bearer token is accepted",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/nodeapi/auth_test.go",
+      "test_function": "TestBearerAuth_MissingToken",
+      "story": "plexd serves the Node API over an optional TCP listener with bearer token auth",
+      "expected": "Request without Authorization header returns 401",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/nodeapi/auth_test.go",
+      "test_function": "TestBearerAuth_InvalidToken",
+      "story": "plexd serves the Node API over an optional TCP listener with bearer token auth",
+      "expected": "Request with incorrect token returns 401",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/nodeapi/server_test.go",
+      "test_function": "TestServer_UnixSocket",
+      "story": "plexd gracefully starts and stops the Node API server",
+      "expected": "Server creates Unix socket, accepts requests, removes socket on shutdown",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/nodeapi/server_test.go",
+      "test_function": "TestServer_TCPListener",
+      "story": "plexd serves the Node API over an optional TCP listener with bearer token auth",
+      "expected": "Server accepts authenticated TCP requests when HTTP is enabled",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/nodeapi/server_test.go",
+      "test_function": "TestServer_GracefulShutdown",
+      "story": "plexd gracefully starts and stops the Node API server",
+      "expected": "Context cancellation stops server, removes socket, no goroutine leaks",
+      "requirement_id": "REQ-011"
+    },
+    {
+      "test_file": "internal/nodeapi/server_test.go",
+      "test_function": "TestServer_NoGoroutineLeaks",
+      "story": "plexd gracefully starts and stops the Node API server",
+      "expected": "After Start returns, goleak detects no leaked goroutines",
+      "requirement_id": "REQ-011"
+    },
+    {
+      "test_file": "internal/nodeapi/events_test.go",
+      "test_function": "TestEventHandler_NodeStateUpdated",
+      "story": "plexd populates and maintains the state cache from the control plane",
+      "expected": "node_state_updated SSE event updates metadata and data in cache",
+      "requirement_id": "REQ-013"
+    },
+    {
+      "test_file": "internal/nodeapi/events_test.go",
+      "test_function": "TestEventHandler_NodeSecretsUpdated",
+      "story": "plexd populates and maintains the state cache from the control plane",
+      "expected": "node_secrets_updated SSE event updates secret index in cache",
+      "requirement_id": "REQ-013"
+    },
+    {
+      "test_file": "internal/nodeapi/events_test.go",
+      "test_function": "TestEventHandler_MalformedPayload",
+      "story": "plexd populates and maintains the state cache from the control plane",
+      "expected": "Malformed event payload is logged at error level and cache is not modified",
+      "requirement_id": "REQ-013"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-014) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "All 11 HTTP endpoints match the README Local Node API specification exactly (paths, methods, request/response schemas)",
+    "Secret plaintext is NEVER written to disk, logged, or included in error messages",
+    "AES-256-GCM decryption correctly handles base64-encoded ciphertext and nonce from SecretResponse",
+    "Report entry writes use atomic file persistence (temp + rename) following the writeFileAtomic pattern from internal/registration/identity.go",
+    "Report sync coalesces multiple writes within the debounce window into a single SyncReports call",
+    "Optimistic locking via If-Match header correctly rejects stale version updates with 409",
+    "Unix socket is created and removed correctly on server lifecycle (including stale socket cleanup on startup)",
+    "TCP listener with bearer token auth correctly rejects unauthenticated/invalid requests with 401",
+    "All goroutines exit cleanly on context cancellation (no leaks verified via goleak)",
+    "Code follows existing patterns: log/slog with component=nodeapi, Config with ApplyDefaults/Validate, no file I/O in constructors, interfaces for ControlPlane dependency",
+    "State cache correctly loads from data_dir/state/ on startup and persists updates atomically",
+    "SSE event handlers for node_state_updated and node_secrets_updated correctly update the cache",
+    "Reference documentation covers all public types, methods, API endpoints, and usage patterns (docs/reference/backend/nodeapi.md)",
+    "How-to documentation covers reading metadata/data, writing reports, reading secrets, and using the TCP listener (docs/how-to/backend/local-node-api.md)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All code lives in `internal/nodeapi/` per the README project structure. Files: config.go, cache.go, decrypt.go, sync.go, handler.go, auth.go, events.go, server.go, and corresponding _test.go files.\n\n2. **Dependency on internal/api/**: The Server uses ControlPlane.FetchSecret() for secret proxy and ControlPlane.SyncReports() for report sync. It uses api.DataEntry, api.SecretRef, api.SecretResponse, api.ReportSyncRequest, api.ReportEntry types directly. The ControlPlane dependency is abstracted via an interface (NodeAPIClient) with FetchSecret and SyncReports methods for testability.\n\n3. **Dependency on internal/reconcile/**: The Server exposes a ReconcileHandler() method that returns a reconcile.ReconcileHandler function. This handler is registered with the Reconciler and updates the StateCache when drift is detected in metadata, data, or secret refs. This bridges the reconciliation loop with the Node API cache.\n\n4. **Dependency on internal/api/ EventDispatcher**: The Server exposes RegisterEventHandlers(dispatcher) to register handlers for node_state_updated and node_secrets_updated SSE events. These handlers update the StateCache in real-time.\n\n5. **State cache design**: The StateCache combines in-memory state (sync.RWMutex-protected) with file persistence in data_dir/state/. Reads are always from memory. Writes update memory first, then persist to file atomically (writeFileAtomic pattern from internal/registration/identity.go). The cache directory structure matches the README: metadata.json, data/{key}.json, secrets.json, report/{key}.json.\n\n6. **Report entry type**: ReportEntry is a new type in the nodeapi package (not api.ReportEntry) since it needs local version tracking. On sync, it maps to api.ReportEntry for the SyncReports call. Fields: Key, ContentType, Payload (json.RawMessage), Version (int, locally incrementing), UpdatedAt (time.Time).\n\n7. **Report sync design**: ReportSyncer runs as a goroutine started by Server.Start. It uses a time.Timer for debouncing — reset on each NotifyChange. Pending changes are accumulated in a buffer (entries map + deleted set). On timer fire: build api.ReportSyncRequest from buffer, call SyncReports, clear buffer on success. On failure: log warn, keep buffer for next attempt.\n\n8. **Secret proxy flow**: GET /v1/state/secrets/{key} → handler calls ControlPlane.FetchSecret(ctx, nodeID, key) → receives SecretResponse{Ciphertext, Nonce, Version} → calls DecryptSecret(nsk, ciphertext, nonce) → returns {key, value, version} JSON. Plaintext exists only in the handler's stack frame. 503 on network error, 404 if control plane returns ErrNotFound.\n\n9. **AES-256-GCM decryption**: Uses crypto/aes and crypto/cipher stdlib packages (no new dependencies). NSK is 32 bytes loaded from data_dir/node_secret_key (already persisted by registration). Ciphertext and nonce are base64-encoded in SecretResponse.\n\n10. **HTTP routing**: Uses net/http.ServeMux with Go 1.22+ enhanced routing patterns ({key} path params). This avoids external router dependencies. Two ServeMux instances: one for the actual handlers, one wrapping with auth middleware for TCP.\n\n11. **Auth middleware**: BearerAuthMiddleware wraps the handler for TCP requests. It compares the token from data_dir/node-api-token (read at startup) against the request Authorization header. Unix socket requests skip auth (the mux is registered directly without middleware).\n\n12. **Kubernetes CRD**: NOT in scope for S004. The PlexdNodeState CRD controller is explicitly part of S022 (Kubernetes Support DaemonSet), which depends on S004. S004 provides the core Node API server, state cache, and report sync that S022 will extend with CRD management.\n\n13. **Logging**: Uses log/slog with component=nodeapi. Request logging at debug level (method, path, status, duration). Secret access at info level (key only, no value). Sync at info level (entries_count, deleted_count). Errors at warn/error level.\n\n14. **Testing strategy**: All tests use t.TempDir() for file operations. Server tests create Unix sockets in temp directories. Handler tests use httptest.NewServer for isolated endpoint testing. Sync tests use fake timers or short debounce periods. Secret tests encrypt-then-decrypt with test NSK. Integration tests in server_test.go wire all components. Goroutine leak detection via goleak (already in go.mod).\n\n15. **Key files from existing codebase**:\n    - `internal/api/client.go` — ControlPlane.FetchSecret(), SyncReports() methods\n    - `internal/api/types.go` — DataEntry, SecretRef, SecretResponse, ReportSyncRequest, ReportEntry types\n    - `internal/api/errors.go` — ErrNotFound, ErrServer for error mapping\n    - `internal/api/envelope.go` — EventNodeStateUpdated, EventNodeSecretsUpdated constants, SignedEnvelope\n    - `internal/api/dispatcher.go` — EventDispatcher.Register() for SSE handler registration\n    - `internal/api/config.go` — Config pattern with ApplyDefaults/Validate\n    - `internal/registration/identity.go` — writeFileAtomic pattern, LoadIdentity for NSK loading\n    - `internal/reconcile/reconciler.go` — ReconcileHandler type for integration\n    - `internal/reconcile/snapshot.go` — Deep copy pattern for state management\n\n16. **Potential pitfalls**:\n    - Unix socket must be removed on shutdown AND on startup (stale socket from crashed process).\n    - net.Listen(\"unix\", path) will fail if a regular file exists at the path — must os.Remove first.\n    - Report entry versions are local-only (not synchronized with control plane versions). The control plane tracks its own versioning.\n    - The If-Match header value is a string that must be parsed as an integer.\n    - json.RawMessage in report payloads must be validated as valid JSON on PUT.\n    - AES-256-GCM nonce must be exactly 12 bytes (standard GCM nonce size).\n    - The NSK from registration is base64-encoded in the file; it must be decoded to 32 raw bytes for use as the AES key.\n    - Concurrent reads and writes to the cache must be safe. Use sync.RWMutex consistently.\n    - File persistence must use the same directory for temp files as the target (atomic rename).",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.105426"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T09:23:56.015012"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T09:30:52.316392"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "879a5fd7-f017-4236-a418-2f2492127241",
+      "timestamp": "2026-02-12T09:30:52.316419",
+      "total_duration": 413.00543236732483,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 413.00543236732483,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
