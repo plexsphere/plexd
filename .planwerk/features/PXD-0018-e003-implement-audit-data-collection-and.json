@@ -1,0 +1,715 @@
+{
+  "feature_id": "PXD-0018",
+  "title": "E003: Implement audit data collection and forwarding",
+  "slug": "e003-implement-audit-data-collection-and",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Collect and forward audit data from managed resources for compliance and security analysis. On Linux, integrate with auditd. On Kubernetes, collect Kubernetes audit logs. Forward audit events to the control plane with minimal latency.",
+  "stories": [
+    {
+      "title": "Platform operator sees audit events forwarded to the control plane",
+      "role": "platform operator",
+      "want": "audit events from managed nodes forwarded to the control plane in structured format",
+      "so_that": "I can perform compliance analysis, security investigations, and detect suspicious activity from a centralized dashboard",
+      "criteria": [
+        "Forwarder reads audit entries from an injectable AuditSource interface (abstracting auditd/K8s audit log sources for testability)",
+        "Each audit entry is mapped to an api.AuditEntry with Timestamp, Source, EventType, Subject, Object, Action, Result, Hostname, and Raw fields",
+        "Audit entries are batched into api.AuditBatch and sent to the control plane via AuditReporter.ReportAudit (POST /v1/nodes/{node_id}/audit) at the configured ReportInterval",
+        "The forwarder populates Hostname from the system hostname at startup"
+      ]
+    },
+    {
+      "title": "Platform operator sees Linux auditd events forwarded from bare-metal/VM nodes",
+      "role": "platform operator",
+      "want": "auditd events parsed and forwarded with correct field mapping",
+      "so_that": "I can track security-relevant system calls, file access, and user activity on Linux nodes for compliance",
+      "criteria": [
+        "AuditdSource reads audit events from an injectable AuditdReader interface with method ReadEvents(ctx context.Context) ([]AuditdEvent, error)",
+        "Each auditd event includes Timestamp, Type (SYSCALL, PATH, USER_AUTH, etc.), Subject (uid/gid/pid), Object (file path, socket, etc.), Action (syscall name), and Result (success/fail)",
+        "Source field is set to 'auditd' for all entries from the auditd source",
+        "The raw auditd log line is preserved in the Raw field of api.AuditEntry",
+        "Subject and Object are serialized as json.RawMessage containing structured key-value data from the auditd fields"
+      ]
+    },
+    {
+      "title": "Platform operator sees Kubernetes audit log events forwarded from K8s nodes",
+      "role": "platform operator",
+      "want": "Kubernetes API server audit log events parsed and forwarded",
+      "so_that": "I can track API server activity, RBAC violations, and resource modifications in Kubernetes clusters",
+      "criteria": [
+        "K8sAuditSource reads audit events from an injectable K8sAuditReader interface with method ReadEvents(ctx context.Context) ([]K8sAuditEvent, error)",
+        "Each K8s audit event includes Timestamp, Verb (create/update/delete/get), User (subject), Resource (object), ResponseStatus (result), and RequestURI",
+        "Source field is set to 'k8s-audit' for all entries from the K8s audit source",
+        "Subject contains user info (username, groups, uid) as json.RawMessage",
+        "Object contains resource info (apiVersion, resource, namespace, name) as json.RawMessage",
+        "Action is mapped from the Kubernetes verb field",
+        "Result is mapped from the Kubernetes responseStatus code (success for 2xx, failure otherwise)"
+      ]
+    },
+    {
+      "title": "Node buffers audit events during control plane connectivity interruptions",
+      "role": "platform operator",
+      "want": "audit events to be buffered when the control plane is unreachable and forwarded when connectivity is restored",
+      "so_that": "I do not lose critical audit data during transient network issues",
+      "criteria": [
+        "When ReportAudit fails, the failed batch is retained in a ring buffer for the next report cycle",
+        "Buffer capacity is bounded at 2 * BatchSize entries to prevent unbounded memory growth",
+        "When the buffer exceeds capacity, the oldest entries are dropped first",
+        "On the next successful report, all buffered entries are sent (respecting BatchSize limits per API call)",
+        "A warning log is emitted when entries are dropped due to buffer overflow"
+      ]
+    },
+    {
+      "title": "Node continues operating normally when audit forwarding fails",
+      "role": "platform operator",
+      "want": "audit forwarding failures to not affect core mesh functionality",
+      "so_that": "transient control plane issues do not degrade the mesh network",
+      "criteria": [
+        "The forwarder logs a warning when ReportAudit fails but does not return an error to the run loop",
+        "The forwarder continues collecting on the next interval after a reporting failure",
+        "The forwarder gracefully stops when its context is cancelled without blocking",
+        "No goroutine leaks occur when the forwarder is stopped"
+      ]
+    },
+    {
+      "title": "Operator configures audit forwarding behavior",
+      "role": "operator",
+      "want": "to configure collection interval, report interval, batch size, and source selection",
+      "so_that": "I can tune audit forwarding overhead based on environment constraints and compliance needs",
+      "criteria": [
+        "Config struct has Enabled, CollectInterval, ReportInterval, and BatchSize fields with sensible defaults",
+        "Config.ApplyDefaults() sets CollectInterval=5s, ReportInterval=15s, BatchSize=500",
+        "Config.Validate() rejects CollectInterval < 1s, ReportInterval < CollectInterval, BatchSize < 1",
+        "When Enabled=false, the forwarder Run method returns immediately without error"
+      ]
+    },
+    {
+      "title": "Developer extends audit forwarding with new audit sources",
+      "role": "developer",
+      "want": "an AuditSource interface that allows adding new audit sources without modifying the core forwarding loop",
+      "so_that": "future audit sources (e.g., application-level audit logs, container runtime events) can be added cleanly",
+      "criteria": [
+        "An AuditSource interface is defined with a Collect(ctx) ([]api.AuditEntry, error) method",
+        "The Forwarder accepts multiple AuditSource implementations and invokes them all during each collection cycle",
+        "Individual source errors are logged and skipped; other sources still run",
+        "New AuditSource implementations require no changes to the Forwarder"
+      ]
+    },
+    {
+      "title": "Reference documentation covers the audit forwarding module",
+      "role": "developer",
+      "want": "complete reference documentation for the auditfwd package",
+      "so_that": "operators can configure audit forwarding and developers can extend it with new sources",
+      "criteria": [
+        "All Config fields are documented with types, defaults, and validation constraints",
+        "The AuditSource interface is described with its contract and usage pattern",
+        "The AuditReporter interface is described",
+        "The Forwarder lifecycle (NewForwarder, RegisterSource, Run) is documented",
+        "The POST /v1/nodes/{node_id}/audit API contract is referenced with the api.AuditBatch schema",
+        "The auditd field mapping (type, uid, gid, pid, syscall, path, success) is documented",
+        "The K8s audit field mapping (verb, user, resource, responseStatus) is documented"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL collect audit entries from registered AuditSource implementations at the configured CollectInterval",
+      "priority": "SHALL",
+      "rationale": "Audit collection is the primary function of the audit forwarding module and must run reliably on schedule to minimize latency for compliance-critical events",
+      "scenarios": [
+        {
+          "name": "Audit entries collected on interval",
+          "when": "the CollectInterval elapses",
+          "then": "the forwarder invokes Collect on all registered AuditSource implementations",
+          "and_then": [
+            "results are aggregated into a single buffer",
+            "each entry is a valid api.AuditEntry"
+          ]
+        },
+        {
+          "name": "Partial collection on source error",
+          "when": "one of multiple registered AuditSource implementations returns an error",
+          "then": "the forwarder logs a warning and continues with other sources",
+          "and_then": [
+            "successfully collected entries from other sources are still buffered"
+          ]
+        },
+        {
+          "name": "Collection skipped when disabled",
+          "when": "the config Enabled=false",
+          "then": "no collection occurs and Run returns nil immediately",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The system SHALL batch collected audit entries and send them to the control plane at the configured ReportInterval via POST /v1/nodes/{node_id}/audit",
+      "priority": "SHALL",
+      "rationale": "Batching reduces API call overhead while the short default ReportInterval (15s) ensures minimal latency for audit events as required by the feature description",
+      "scenarios": [
+        {
+          "name": "Batch sent at report interval",
+          "when": "the ReportInterval elapses and collected audit entries exist in the buffer",
+          "then": "the forwarder sends an api.AuditBatch via AuditReporter.ReportAudit",
+          "and_then": [
+            "the buffer is cleared after successful send",
+            "batch size does not exceed BatchSize per API call"
+          ]
+        },
+        {
+          "name": "Empty buffer not sent",
+          "when": "the ReportInterval elapses but no audit entries were collected",
+          "then": "no API call is made",
+          "and_then": []
+        },
+        {
+          "name": "Large batch split into multiple API calls",
+          "when": "the buffer contains more entries than BatchSize",
+          "then": "the forwarder sends multiple api.AuditBatch payloads, each at most BatchSize entries",
+          "and_then": [
+            "all entries are eventually sent",
+            "if a partial send fails, remaining entries are retained"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The system SHALL buffer audit entries when reporting fails and retry on the next ReportInterval",
+      "priority": "SHALL",
+      "rationale": "Audit data is compliance-critical; buffering prevents data loss during transient outages while bounding memory usage",
+      "scenarios": [
+        {
+          "name": "Report failure retains entries",
+          "when": "ReportAudit returns an error",
+          "then": "the failed batch entries are retained in the buffer for the next report cycle",
+          "and_then": [
+            "a warning is logged with the error details"
+          ]
+        },
+        {
+          "name": "Buffer overflow drops oldest",
+          "when": "retained entries exceed 2 * BatchSize",
+          "then": "the oldest entries are dropped to bring the buffer within capacity",
+          "and_then": [
+            "a warning is logged indicating entries were dropped with the count"
+          ]
+        },
+        {
+          "name": "Buffered entries sent on recovery",
+          "when": "ReportAudit succeeds after previous failures",
+          "then": "all buffered entries are included in the batch",
+          "and_then": [
+            "the buffer is cleared after successful send"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The system SHALL NOT block core mesh operations when audit forwarding fails",
+      "priority": "SHALL",
+      "rationale": "Audit forwarding is an observability layer; failures must not degrade mesh connectivity or other node functions",
+      "scenarios": [
+        {
+          "name": "Collection error isolated",
+          "when": "an AuditSource returns an error",
+          "then": "the forwarder logs the error and continues with the next collection cycle",
+          "and_then": [
+            "no panic or goroutine leak occurs"
+          ]
+        },
+        {
+          "name": "Reporting error isolated",
+          "when": "ReportAudit returns a network error",
+          "then": "the forwarder logs a warning and retries on the next report interval",
+          "and_then": [
+            "the main context is not cancelled"
+          ]
+        },
+        {
+          "name": "Graceful shutdown",
+          "when": "the forwarder's context is cancelled",
+          "then": "Run returns ctx.Err() without blocking",
+          "and_then": [
+            "any in-progress collection is abandoned",
+            "no goroutine leaks"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The system SHALL validate all audit forwarding configuration values with clear error messages",
+      "priority": "SHALL",
+      "rationale": "Invalid configuration should fail fast at startup, not silently produce bad behavior",
+      "scenarios": [
+        {
+          "name": "Valid configuration accepted",
+          "when": "all config fields are within acceptable ranges",
+          "then": "Validate returns nil",
+          "and_then": []
+        },
+        {
+          "name": "CollectInterval too low rejected",
+          "when": "CollectInterval is less than 1 second",
+          "then": "Validate returns an error containing 'CollectInterval must be at least 1s'",
+          "and_then": []
+        },
+        {
+          "name": "ReportInterval less than CollectInterval rejected",
+          "when": "ReportInterval is less than CollectInterval",
+          "then": "Validate returns an error containing 'ReportInterval must be >= CollectInterval'",
+          "and_then": []
+        },
+        {
+          "name": "BatchSize zero rejected",
+          "when": "BatchSize is 0 or negative",
+          "then": "Validate returns an error containing 'BatchSize must be at least 1'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The system SHALL support an AuditSource interface for extensible audit collection",
+      "priority": "SHALL",
+      "rationale": "A pluggable source design enables adding new audit types (e.g., container runtime events, application audit) without modifying the core forwarding loop",
+      "scenarios": [
+        {
+          "name": "Multiple sources invoked",
+          "when": "the forwarder has three registered AuditSource implementations",
+          "then": "all three are called during each collection cycle",
+          "and_then": [
+            "results are aggregated into a single buffer"
+          ]
+        },
+        {
+          "name": "Individual source failure isolated",
+          "when": "one of three sources returns an error",
+          "then": "the other two sources' results are still included in the buffer",
+          "and_then": [
+            "the error is logged at warn level"
+          ]
+        },
+        {
+          "name": "Source panics recovered",
+          "when": "an AuditSource panics during collection",
+          "then": "the panic is recovered and logged as an error",
+          "and_then": [
+            "other sources still run",
+            "the forwarder does not crash"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The AuditdSource SHALL read audit events from the Linux audit subsystem with correct field mapping",
+      "priority": "SHALL",
+      "rationale": "auditd is the standard audit framework on Linux; correct field mapping is essential for compliance analysis and security investigations",
+      "scenarios": [
+        {
+          "name": "Auditd events mapped correctly",
+          "when": "the AuditdReader returns audit events with type, timestamp, uid, gid, pid, syscall, path, and success fields",
+          "then": "each event is mapped to an api.AuditEntry with Source='auditd', EventType from audit type, Subject from uid/gid/pid, Object from path/target, Action from syscall, Result from success, and Raw from the original line",
+          "and_then": []
+        },
+        {
+          "name": "Subject serialized as JSON",
+          "when": "an auditd event has uid=1000, gid=1000, pid=5432",
+          "then": "the Subject field contains json.RawMessage with {\"uid\":\"1000\",\"gid\":\"1000\",\"pid\":\"5432\"}",
+          "and_then": []
+        },
+        {
+          "name": "Object serialized as JSON",
+          "when": "an auditd event has path=/etc/passwd",
+          "then": "the Object field contains json.RawMessage with {\"path\":\"/etc/passwd\"}",
+          "and_then": []
+        },
+        {
+          "name": "Missing optional fields handled",
+          "when": "an auditd event is missing the syscall field (e.g., USER_AUTH type)",
+          "then": "the Action field is set to the event type name and the entry is still collected",
+          "and_then": []
+        },
+        {
+          "name": "Reader error is non-fatal",
+          "when": "the AuditdReader returns an error",
+          "then": "the AuditdSource returns the error wrapped with context",
+          "and_then": [
+            "the Forwarder isolates the error per REQ-006"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The K8sAuditSource SHALL read Kubernetes audit log events with correct field mapping",
+      "priority": "SHALL",
+      "rationale": "Kubernetes audit logs are the standard mechanism for tracking API server activity; correct mapping enables RBAC analysis and compliance",
+      "scenarios": [
+        {
+          "name": "K8s audit events mapped correctly",
+          "when": "the K8sAuditReader returns audit events with verb, user, objectRef, responseStatus, and requestURI fields",
+          "then": "each event is mapped to an api.AuditEntry with Source='k8s-audit', EventType='k8s-audit', Subject from user info, Object from objectRef, Action from verb, Result mapped from responseStatus code",
+          "and_then": []
+        },
+        {
+          "name": "Subject contains user info as JSON",
+          "when": "a K8s audit event has user with username='admin', groups=['system:masters'], uid='abc-123'",
+          "then": "the Subject field contains json.RawMessage with {\"username\":\"admin\",\"groups\":[\"system:masters\"],\"uid\":\"abc-123\"}",
+          "and_then": []
+        },
+        {
+          "name": "Object contains resource info as JSON",
+          "when": "a K8s audit event references a resource with apiVersion='v1', resource='pods', namespace='default', name='my-pod'",
+          "then": "the Object field contains json.RawMessage with {\"apiVersion\":\"v1\",\"resource\":\"pods\",\"namespace\":\"default\",\"name\":\"my-pod\"}",
+          "and_then": []
+        },
+        {
+          "name": "Result mapped from HTTP status code",
+          "when": "a K8s audit event has responseStatus with code=201",
+          "then": "Result is set to 'success'",
+          "and_then": []
+        },
+        {
+          "name": "Failed request mapped as failure",
+          "when": "a K8s audit event has responseStatus with code=403",
+          "then": "Result is set to 'failure'",
+          "and_then": []
+        },
+        {
+          "name": "Reader error is non-fatal",
+          "when": "the K8sAuditReader returns an error",
+          "then": "the K8sAuditSource returns the error wrapped with context",
+          "and_then": [
+            "the Forwarder isolates the error per REQ-006"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The system SHOULD use structured logging with component='auditfwd' for all log messages",
+      "priority": "SHOULD",
+      "rationale": "Consistent structured logging enables filtering and correlation in centralized log systems",
+      "scenarios": [
+        {
+          "name": "All log messages include component field",
+          "when": "any log message is emitted by the auditfwd package",
+          "then": "the log message includes the field component='auditfwd'",
+          "and_then": []
+        },
+        {
+          "name": "Collection cycle logged at debug level",
+          "when": "a collection cycle completes successfully",
+          "then": "a debug log is emitted with entry_count and duration fields",
+          "and_then": []
+        },
+        {
+          "name": "Report cycle logged at info level",
+          "when": "a batch is successfully reported to the control plane",
+          "then": "an info log is emitted with batch_size and duration fields",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The system SHALL provide reference documentation for the audit forwarding module",
+      "priority": "SHALL",
+      "rationale": "Reference documentation enables operators and developers to understand and configure the audit forwarding subsystem",
+      "scenarios": [
+        {
+          "name": "Config reference documented",
+          "when": "an operator reads the audit forwarding reference doc",
+          "then": "all Config fields are listed with types, defaults, and validation constraints",
+          "and_then": []
+        },
+        {
+          "name": "AuditSource interface documented",
+          "when": "a developer reads the audit forwarding reference doc",
+          "then": "the AuditSource interface is described with its contract and usage pattern",
+          "and_then": []
+        },
+        {
+          "name": "AuditEntry schema documented",
+          "when": "an operator reads the audit forwarding reference doc",
+          "then": "the api.AuditEntry fields are described with their data types and source mapping from both auditd and K8s audit",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/auditfwd/config.go: Config struct with Enabled, CollectInterval, ReportInterval, BatchSize fields; DefaultCollectInterval=5s, DefaultReportInterval=15s, DefaultBatchSize=500 constants; ApplyDefaults and Validate methods following the nat/config.go pattern. Audit uses shorter defaults than metrics/logfwd because the feature description requires 'minimal latency'. Create internal/auditfwd/config_test.go with tests for ApplyDefaults (zero-valued Config), Validate happy path, Validate rejects low CollectInterval (<1s), Validate rejects ReportInterval < CollectInterval, Validate rejects BatchSize=0, Validate skips when Enabled=false (REQ-005)",
+    "1.2 Create internal/auditfwd/source.go: Define the AuditSource interface with method Collect(ctx context.Context) ([]api.AuditEntry, error). Define AuditReporter interface abstracting ControlPlane.ReportAudit: ReportAudit(ctx context.Context, nodeID string, batch api.AuditBatch) error. No tests needed for interface definitions (REQ-006)",
+    "1.3 Create internal/auditfwd/auditd.go: AuditdSource struct implementing AuditSource, using injectable AuditdReader interface with method ReadEvents(ctx context.Context) ([]AuditdEvent, error). AuditdEvent struct with Timestamp (time.Time), Type (string, e.g., SYSCALL/PATH/USER_AUTH), UID/GID/PID (string), Syscall (string), Path (string), Success (string), Raw (string) fields. Field mapping: Subject=json.RawMessage from uid/gid/pid, Object=json.RawMessage from path, Action=syscall (fallback to Type if empty), Result=success field value, EventType=Type, Source='auditd', Raw=original line. Hostname populated at construction time via injectable value. Create internal/auditfwd/auditd_test.go with mock AuditdReader; tests for correct field mapping, Subject JSON serialization, Object JSON serialization, missing syscall handled, reader error propagated, empty events returns empty slice (REQ-007)",
+    "1.4 Create internal/auditfwd/k8saudit.go: K8sAuditSource struct implementing AuditSource, using injectable K8sAuditReader interface with method ReadEvents(ctx context.Context) ([]K8sAuditEvent, error). K8sAuditEvent struct with Timestamp (time.Time), Verb (string), User (K8sUser with Username/Groups/UID), ObjectRef (K8sObjectRef with APIVersion/Resource/Namespace/Name), ResponseStatus (int), RequestURI (string), Raw (string). Field mapping: Subject=json.RawMessage from User, Object=json.RawMessage from ObjectRef, Action=Verb, Result='success' for 2xx codes / 'failure' otherwise, EventType='k8s-audit', Source='k8s-audit'. Hostname populated at construction time. Create internal/auditfwd/k8saudit_test.go with mock K8sAuditReader; tests for correct field mapping, Subject JSON serialization, Object JSON serialization, success/failure result mapping, reader error propagated, empty events returns empty slice (REQ-008)",
+    "2.1 Create internal/auditfwd/forwarder.go: Forwarder struct with fields for config, sources []AuditSource, reporter AuditReporter, nodeID, hostname, logger. NewForwarder constructor applies defaults. RegisterSource method adds to the source list. Run method implements the dual-ticker loop: collect at CollectInterval, report at ReportInterval. Run returns nil immediately when Enabled=false. Buffer management: accumulate entries in a slice, send at ReportInterval, respect BatchSize (split into multiple API calls if needed), retain on failure, drop oldest when exceeding 2*BatchSize. Panic recovery per source (matching reconciler safeInvoke pattern). (REQ-001, REQ-002, REQ-003, REQ-004, REQ-006)",
+    "2.2 Create internal/auditfwd/forwarder_test.go: Full test suite for Forwarder.Run using mock AuditSource and mock AuditReporter. Tests: collects and reports on schedule, skips empty batch, retains on report error, drops oldest when over capacity (with warning log verification), stops on context cancel, isolates source error, recovers source panic, respects BatchSize (splits into multiple calls), returns nil when disabled, multiple sources aggregated. Use discardLogger helper, short intervals for fast tests (REQ-001, REQ-002, REQ-003, REQ-004, REQ-006)",
+    "3.1 Write docs/reference/backend/audit-forwarding.md: Reference documentation covering Config struct (all fields, types, defaults, validation rules), AuditSource interface contract, AuditReporter interface, AuditdReader interface, K8sAuditReader interface, AuditdSource field mapping (auditd type/uid/gid/pid/syscall/path/success to AuditEntry), K8sAuditSource field mapping (verb/user/objectRef/responseStatus to AuditEntry), Forwarder lifecycle (NewForwarder, RegisterSource, Run), buffer behavior (capacity, overflow policy), and the POST /v1/nodes/{node_id}/audit API contract with api.AuditEntry schema (REQ-010)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/auditfwd/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults",
+      "story": "Operator configures audit forwarding behavior",
+      "expected": "ApplyDefaults sets CollectInterval=5s, ReportInterval=15s, BatchSize=500 on zero-valued Config",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/auditfwd/config_test.go",
+      "test_function": "TestConfig_Validate_AcceptsValid",
+      "story": "Operator configures audit forwarding behavior",
+      "expected": "Validate returns nil for valid config with CollectInterval=5s, ReportInterval=15s, BatchSize=500",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/auditfwd/config_test.go",
+      "test_function": "TestConfig_Validate_RejectsLowCollectInterval",
+      "story": "Operator configures audit forwarding behavior",
+      "expected": "Validate returns error when CollectInterval < 1s",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/auditfwd/config_test.go",
+      "test_function": "TestConfig_Validate_RejectsReportIntervalBelowCollect",
+      "story": "Operator configures audit forwarding behavior",
+      "expected": "Validate returns error when ReportInterval < CollectInterval",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/auditfwd/config_test.go",
+      "test_function": "TestConfig_Validate_RejectsBatchSizeZero",
+      "story": "Operator configures audit forwarding behavior",
+      "expected": "Validate returns error when BatchSize is 0",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/auditfwd/config_test.go",
+      "test_function": "TestConfig_Validate_SkipsWhenDisabled",
+      "story": "Operator configures audit forwarding behavior",
+      "expected": "Validate returns nil when Enabled=false regardless of other field values",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/auditfwd/auditd_test.go",
+      "test_function": "TestAuditdSource_Collect_MapsFieldsCorrectly",
+      "story": "Platform operator sees Linux auditd events forwarded from bare-metal/VM nodes",
+      "expected": "Collect returns api.AuditEntry with Source='auditd', EventType from audit type, Subject from uid/gid/pid as json.RawMessage, Object from path, Action from syscall, Result from success, Raw from original line",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/auditfwd/auditd_test.go",
+      "test_function": "TestAuditdSource_Collect_SerializesSubjectAsJSON",
+      "story": "Platform operator sees Linux auditd events forwarded from bare-metal/VM nodes",
+      "expected": "Subject field contains json.RawMessage with uid, gid, pid fields",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/auditfwd/auditd_test.go",
+      "test_function": "TestAuditdSource_Collect_SerializesObjectAsJSON",
+      "story": "Platform operator sees Linux auditd events forwarded from bare-metal/VM nodes",
+      "expected": "Object field contains json.RawMessage with path field",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/auditfwd/auditd_test.go",
+      "test_function": "TestAuditdSource_Collect_HandlesMissingSyscall",
+      "story": "Platform operator sees Linux auditd events forwarded from bare-metal/VM nodes",
+      "expected": "When syscall field is absent (e.g., USER_AUTH type), Action is set to event type name",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/auditfwd/auditd_test.go",
+      "test_function": "TestAuditdSource_Collect_HandlesReaderError",
+      "story": "Platform operator sees Linux auditd events forwarded from bare-metal/VM nodes",
+      "expected": "When AuditdReader returns error, Collect returns wrapped error",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/auditfwd/auditd_test.go",
+      "test_function": "TestAuditdSource_Collect_ReturnsEmptyOnNoEvents",
+      "story": "Platform operator sees Linux auditd events forwarded from bare-metal/VM nodes",
+      "expected": "When AuditdReader returns no events, Collect returns empty slice and nil error",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/auditfwd/k8saudit_test.go",
+      "test_function": "TestK8sAuditSource_Collect_MapsFieldsCorrectly",
+      "story": "Platform operator sees Kubernetes audit log events forwarded from K8s nodes",
+      "expected": "Collect returns api.AuditEntry with Source='k8s-audit', EventType='k8s-audit', Subject from user info, Object from objectRef, Action from verb, Result mapped from responseStatus code",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/auditfwd/k8saudit_test.go",
+      "test_function": "TestK8sAuditSource_Collect_SerializesSubjectAsJSON",
+      "story": "Platform operator sees Kubernetes audit log events forwarded from K8s nodes",
+      "expected": "Subject contains json.RawMessage with username, groups, uid fields",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/auditfwd/k8saudit_test.go",
+      "test_function": "TestK8sAuditSource_Collect_SerializesObjectAsJSON",
+      "story": "Platform operator sees Kubernetes audit log events forwarded from K8s nodes",
+      "expected": "Object contains json.RawMessage with apiVersion, resource, namespace, name fields",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/auditfwd/k8saudit_test.go",
+      "test_function": "TestK8sAuditSource_Collect_MapsSuccessResult",
+      "story": "Platform operator sees Kubernetes audit log events forwarded from K8s nodes",
+      "expected": "responseStatus code 201 maps to Result='success'",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/auditfwd/k8saudit_test.go",
+      "test_function": "TestK8sAuditSource_Collect_MapsFailureResult",
+      "story": "Platform operator sees Kubernetes audit log events forwarded from K8s nodes",
+      "expected": "responseStatus code 403 maps to Result='failure'",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/auditfwd/k8saudit_test.go",
+      "test_function": "TestK8sAuditSource_Collect_HandlesReaderError",
+      "story": "Platform operator sees Kubernetes audit log events forwarded from K8s nodes",
+      "expected": "When K8sAuditReader returns error, Collect returns wrapped error",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/auditfwd/k8saudit_test.go",
+      "test_function": "TestK8sAuditSource_Collect_ReturnsEmptyOnNoEvents",
+      "story": "Platform operator sees Kubernetes audit log events forwarded from K8s nodes",
+      "expected": "When K8sAuditReader returns no events, Collect returns empty slice and nil error",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/auditfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_CollectsAndReports",
+      "story": "Platform operator sees audit events forwarded to the control plane",
+      "expected": "Forwarder calls sources at CollectInterval and reports at ReportInterval via ReportAudit",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/auditfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_SkipsEmptyBatch",
+      "story": "Node continues operating normally when audit forwarding fails",
+      "expected": "No ReportAudit call when all sources return empty slices",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/auditfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_RetainsOnReportError",
+      "story": "Node buffers audit events during control plane connectivity interruptions",
+      "expected": "When ReportAudit fails, entries are retained and included in the next batch",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/auditfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_DropsOldestWhenOverCapacity",
+      "story": "Node buffers audit events during control plane connectivity interruptions",
+      "expected": "When retained entries exceed 2*BatchSize, oldest entries are dropped",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/auditfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_StopsOnContextCancel",
+      "story": "Node continues operating normally when audit forwarding fails",
+      "expected": "Run returns ctx.Err() when context is cancelled",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/auditfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_IsolatesSourceError",
+      "story": "Node continues operating normally when audit forwarding fails",
+      "expected": "When one source returns error, others still contribute to the buffer",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/auditfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_RecoversSourcePanic",
+      "story": "Developer extends audit forwarding with new audit sources",
+      "expected": "When a source panics, the panic is recovered, logged, and other sources still run",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/auditfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_DisabledReturnsNil",
+      "story": "Operator configures audit forwarding behavior",
+      "expected": "Run returns nil immediately when Enabled=false",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/auditfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_BatchSizeRespected",
+      "story": "Platform operator sees audit events forwarded to the control plane",
+      "expected": "When collected entries exceed BatchSize, they are sent in multiple batches of at most BatchSize",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/auditfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_DropsOldestLogsWarning",
+      "story": "Node buffers audit events during control plane connectivity interruptions",
+      "expected": "When entries are dropped due to buffer overflow, a warning is logged with the count of dropped entries",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/auditfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_MultipleSources",
+      "story": "Developer extends audit forwarding with new audit sources",
+      "expected": "When multiple sources are registered, all contribute entries to the buffer and entries are aggregated",
+      "requirement_id": "REQ-006"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-010) have corresponding passing tests in internal/auditfwd/*_test.go",
+    "All WHEN/THEN scenarios from requirements are covered by at least one test case",
+    "All test_specifications are implemented with matching function names and file paths",
+    "Config follows existing ApplyDefaults/Validate pattern from nat/config.go and reconcile/config.go",
+    "Forwarder follows dual-ticker Run-loop pattern from logfwd/metrics design (collect at CollectInterval, report at ReportInterval, context cancellation, panic recovery per source)",
+    "AuditSource interface uses dependency injection for all external state (no direct auditd/K8s API access in production code paths tested by unit tests)",
+    "All log messages use structured logging with component='auditfwd' field consistent with other packages (nat, reconcile)",
+    "No goroutine leaks: tests use goleak or manual verification of Run return",
+    "AuditEntry payloads match the api.AuditEntry schema from internal/api/types.go (Timestamp, Source, EventType, Subject, Object, Action, Result, Hostname, Raw)",
+    "Subject and Object fields are valid json.RawMessage containing structured data from the source-specific fields",
+    "Reference documentation (docs/reference/backend/audit-forwarding.md) covers all Config fields, interfaces, field mappings for both auditd and K8s sources, and API contract"
+  ],
+  "implementation_notes": "Architecture: New package internal/auditfwd with the standard module layout (config.go, source.go, auditd.go, k8saudit.go, forwarder.go). The Forwarder orchestrates collection and reporting using a dual-ticker pattern: collect at CollectInterval, report at ReportInterval. This decouples collection frequency from reporting frequency. Audit uses shorter default intervals (5s collect, 15s report) than logfwd (10s/30s) and metrics (30s/60s) because the feature description explicitly requires 'minimal latency' for audit events.\n\nKey patterns to follow:\n- Config with ApplyDefaults()/Validate() (see internal/nat/config.go, internal/reconcile/config.go)\n- Dual-ticker Run loop with context cancellation (see logfwd/metrics plans for the same pattern; ticker + select on ctx.Done)\n- Panic recovery per source invocation (see internal/reconcile/reconciler.go:safeInvoke)\n- Interface-based dependency injection for testability: AuditdReader abstracts Linux audit subsystem access, K8sAuditReader abstracts Kubernetes audit log access, AuditReporter abstracts ControlPlane.ReportAudit\n- Mock test doubles defined in _test.go files with sync.Mutex for concurrency safety\n- discardLogger helper for tests (see internal/nat/mock_stun_test.go pattern)\n\nData flow: AuditSource.Collect reads events from auditd/K8s audit → Forwarder accumulates into ring buffer → Forwarder sends api.AuditBatch via AuditReporter.ReportAudit at ReportInterval → ControlPlane.ReportAudit sends POST /v1/nodes/{node_id}/audit.\n\nAPI types already exist: api.AuditBatch (alias for []AuditEntry), api.AuditEntry (internal/api/types.go:220-231). API endpoint already exists: ControlPlane.ReportAudit (internal/api/endpoints.go:169-172). No changes to the api package are needed.\n\nAuditd field mapping:\n- type (SYSCALL, PATH, USER_AUTH, etc.) → AuditEntry.EventType\n- uid, gid, pid → AuditEntry.Subject (json.RawMessage: {\"uid\":\"...\",\"gid\":\"...\",\"pid\":\"...\"})\n- path (or target for USER_AUTH) → AuditEntry.Object (json.RawMessage: {\"path\":\"...\"})\n- syscall name → AuditEntry.Action (falls back to event type if no syscall)\n- success field → AuditEntry.Result\n- raw line → AuditEntry.Raw\n- Source always 'auditd' for AuditdSource\n- Hostname set at Forwarder construction (os.Hostname or injected)\n\nK8s audit field mapping:\n- verb (create/update/delete/get/list/watch/patch) → AuditEntry.Action\n- user (username, groups, uid) → AuditEntry.Subject (json.RawMessage)\n- objectRef (apiVersion, resource, namespace, name) → AuditEntry.Object (json.RawMessage)\n- responseStatus code → AuditEntry.Result ('success' for 200-299, 'failure' otherwise)\n- EventType always 'k8s-audit'\n- Source always 'k8s-audit'\n- requestURI preserved in Raw field\n\nBuffer management:\n- Ring buffer with max capacity 2 * BatchSize\n- On report failure: entries retained in buffer\n- On buffer overflow: oldest entries dropped, warning logged with count\n- On successful report: buffer cleared for sent entries\n- Large batches split into multiple API calls of BatchSize each\n\nPotential pitfalls:\n- AuditdSource must use the AuditdReader interface rather than directly reading from /var/log/audit/audit.log or netlink audit socket to enable cross-platform testing and unit test isolation.\n- K8sAuditSource must use the K8sAuditReader interface rather than directly reading from the Kubernetes API server audit webhook or log file.\n- The auditd reader abstraction handles cursor/position tracking internally to avoid re-reading events.\n- Buffer overflow: When the control plane is unreachable, entries accumulate. Cap at 2*BatchSize and drop oldest to bound memory. With BatchSize=500, this means max 1000 entries in memory.\n- Subject and Object must be valid json.RawMessage; use json.Marshal for serialization rather than string formatting to handle special characters correctly.\n- Hostname should be resolved once at startup, not per-entry, to avoid unnecessary syscalls.\n- K8s audit responseStatus may be nil for some event stages (RequestReceived); handle nil gracefully by defaulting Result to empty string.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.111771"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:17:37.262040"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:22:31.213270"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "daef53ef-a270-468f-8a9e-ab53d5d6d995",
+      "timestamp": "2026-02-12T21:22:31.213296",
+      "total_duration": 289.8717896938324,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 289.8717896938324,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
