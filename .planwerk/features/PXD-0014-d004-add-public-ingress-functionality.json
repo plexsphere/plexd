@@ -1,0 +1,699 @@
+{
+  "feature_id": "PXD-0014",
+  "title": "D004: Add public ingress functionality",
+  "slug": "d004-add-public-ingress-functionality",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Expose mesh-internal services to public internet traffic through the bridge node. Handle inbound traffic on public IPs and route it to the appropriate mesh peer. Support TLS termination or passthrough as needed.",
+  "stories": [
+    {
+      "title": "Bridge node exposes a mesh service to the public internet",
+      "role": "platform operator",
+      "want": "to configure public ingress rules on a bridge node so that inbound traffic on a public IP/port is forwarded to a specific mesh peer",
+      "so_that": "mesh-internal services (e.g. HTTP, HTTPS) are reachable from the public internet without exposing the mesh directly",
+      "criteria": [
+        "Control plane pushes IngressConfig in StateResponse containing ingress rules",
+        "IngressManager creates TCP listeners on specified public ports",
+        "Incoming TCP connections are proxied to the target mesh peer address",
+        "IngressManager tracks active listeners and connection counts",
+        "IngressStatus is reported in heartbeats when ingress is active"
+      ]
+    },
+    {
+      "title": "Bridge node supports TLS passthrough for ingress rules",
+      "role": "platform operator",
+      "want": "to route TLS traffic to mesh peers without terminating TLS at the bridge node",
+      "so_that": "end-to-end encryption is preserved and the bridge node never sees plaintext",
+      "criteria": [
+        "Ingress rules with mode=passthrough forward raw TCP bytes without decryption",
+        "The bridge node does not need TLS certificates for passthrough rules",
+        "Connection proxying uses io.Copy-based bidirectional relay",
+        "Connections are cleaned up when either side closes or the context is cancelled"
+      ]
+    },
+    {
+      "title": "Bridge node terminates TLS and forwards plaintext to mesh peers",
+      "role": "platform operator",
+      "want": "to configure TLS termination at the bridge node for services that do not handle TLS themselves",
+      "so_that": "mesh services can receive plaintext HTTP while clients connect over HTTPS",
+      "criteria": [
+        "Ingress rules with mode=terminate accept TLS connections using provided certificate and key",
+        "After TLS handshake, plaintext is forwarded to the target mesh peer",
+        "Invalid or expired certificates cause a startup error for that rule, not a runtime panic",
+        "TLS termination uses tls.Config with reasonable defaults (TLS 1.2 minimum)"
+      ]
+    },
+    {
+      "title": "Public ingress rules are reconciled from control plane state",
+      "role": "system",
+      "want": "to add, update, and remove ingress rules when the desired state changes",
+      "so_that": "the bridge node always reflects the control plane's intended configuration",
+      "criteria": [
+        "IngressReconcileHandler diffs desired vs active rules and adds/removes listeners",
+        "Rules are matched by rule ID — changed rules are stopped and re-created",
+        "Stale rules (present locally but not in desired state) are stopped and removed",
+        "New rules (present in desired state but not locally) are started",
+        "Errors for individual rules are aggregated; other rules continue operating"
+      ]
+    },
+    {
+      "title": "Public ingress reacts to real-time SSE events",
+      "role": "system",
+      "want": "to immediately reconcile ingress when the control plane pushes an ingress_config_updated event",
+      "so_that": "configuration changes take effect within seconds rather than waiting for the next reconcile interval",
+      "criteria": [
+        "HandleIngressConfigUpdated triggers an immediate reconciliation cycle",
+        "The event payload is not parsed — the reconcile cycle fetches fresh state",
+        "Multiple rapid events are coalesced by the reconciler's trigger mechanism"
+      ]
+    },
+    {
+      "title": "Public ingress supports individual rule assignment and revocation via SSE",
+      "role": "system",
+      "want": "to add or remove a single ingress rule via SSE without a full reconcile",
+      "so_that": "individual rule changes are applied immediately and efficiently",
+      "criteria": [
+        "HandleIngressRuleAssigned parses an IngressRule from the SSE payload and starts a listener",
+        "HandleIngressRuleRevoked parses a rule_id from the SSE payload and stops the listener",
+        "Duplicate rule assignment returns an error (rule already active)",
+        "Revoking a non-existent rule is a no-op"
+      ]
+    },
+    {
+      "title": "Ingress configuration is validated before activation",
+      "role": "system",
+      "want": "to reject invalid ingress configurations at validation time",
+      "so_that": "runtime failures from bad configuration are prevented",
+      "criteria": [
+        "IngressEnabled requires Enabled=true (bridge mode)",
+        "ListenPort must be 1-65535",
+        "Target must be a valid host:port",
+        "TLS mode terminate requires non-empty CertPEM and KeyPEM",
+        "MaxIngressRules must be positive when ingress is enabled"
+      ]
+    },
+    {
+      "title": "Ingress status and capabilities are reported to the control plane",
+      "role": "system",
+      "want": "to report ingress status in heartbeats and capabilities during registration",
+      "so_that": "the control plane knows which bridge nodes support ingress and their current state",
+      "criteria": [
+        "IngressStatus returns IngressInfo with enabled flag, active rule count, and total connection count",
+        "IngressCapabilities returns capability metadata for registration",
+        "Both return nil when ingress is not enabled/active"
+      ]
+    },
+    {
+      "title": "Ingress teardown cleans up all listeners and connections",
+      "role": "system",
+      "want": "to gracefully stop all ingress listeners and drain connections on shutdown",
+      "so_that": "no orphaned goroutines or leaked file descriptors remain after teardown",
+      "criteria": [
+        "Teardown closes all active TCP listeners",
+        "Active proxy connections are closed via context cancellation",
+        "Errors are aggregated — cleanup continues even on individual failure",
+        "Second teardown is a no-op",
+        "goleak verification passes (no leaked goroutines)"
+      ]
+    },
+    {
+      "title": "Reference documentation covers the public ingress API and components",
+      "role": "developer",
+      "want": "comprehensive reference documentation for all ingress types, interfaces, and handlers",
+      "so_that": "contributors can understand and extend the ingress implementation",
+      "criteria": [
+        "Documentation covers Config fields, validation rules, and defaults",
+        "Documentation covers IngressController interface and all methods",
+        "Documentation covers IngressManager lifecycle, methods, and error prefixes",
+        "Documentation covers SSE handlers, reconcile handler, and API types",
+        "Documentation includes data flow diagram and integration points"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL accept TCP connections on configured public ingress ports and proxy them to mesh peer targets",
+      "priority": "SHALL",
+      "rationale": "Core functionality: bridge node must forward public internet traffic to mesh-internal services",
+      "scenarios": [
+        {
+          "name": "TCP connection is proxied to mesh peer",
+          "when": "an external client connects to the ingress listen port",
+          "then": "a TCP connection is established to the target mesh peer address and bidirectional data relay begins",
+          "and_then": [
+            "data sent by the client is forwarded to the target",
+            "data sent by the target is forwarded to the client"
+          ]
+        },
+        {
+          "name": "Target unreachable returns connection error",
+          "when": "an external client connects but the target mesh peer is unreachable",
+          "then": "the incoming connection is closed after a dial timeout",
+          "and_then": [
+            "the error is logged with the rule ID and target address"
+          ]
+        },
+        {
+          "name": "Connection closes when either side disconnects",
+          "when": "the client or target closes the TCP connection",
+          "then": "the other side of the proxy connection is also closed",
+          "and_then": [
+            "the active connection count is decremented"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The system SHALL support TLS passthrough mode where raw TCP bytes are forwarded without decryption",
+      "priority": "SHALL",
+      "rationale": "Many services handle their own TLS — the bridge should not require certificates for these",
+      "scenarios": [
+        {
+          "name": "TLS passthrough forwards bytes unmodified",
+          "when": "an ingress rule has mode=passthrough and a TLS client connects",
+          "then": "the encrypted bytes are forwarded to the target without decryption",
+          "and_then": [
+            "the bridge node never accesses plaintext content"
+          ]
+        },
+        {
+          "name": "Passthrough mode requires no certificate configuration",
+          "when": "an ingress rule is created with mode=passthrough",
+          "then": "CertPEM and KeyPEM fields are ignored",
+          "and_then": [
+            "validation passes without certificate fields"
+          ]
+        },
+        {
+          "name": "Non-TLS traffic works in passthrough mode",
+          "when": "a plain HTTP client connects to a passthrough rule",
+          "then": "the bytes are forwarded as-is to the target",
+          "and_then": [
+            "passthrough mode is protocol-agnostic"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The system SHALL support TLS termination mode where the bridge node decrypts TLS and forwards plaintext",
+      "priority": "SHALL",
+      "rationale": "Backend services that do not handle TLS need the bridge to terminate TLS on their behalf",
+      "scenarios": [
+        {
+          "name": "TLS termination decrypts and forwards plaintext",
+          "when": "an ingress rule has mode=terminate with valid cert/key and a TLS client connects",
+          "then": "the TLS handshake completes at the bridge node and plaintext is forwarded to the target",
+          "and_then": [
+            "the target receives unencrypted data"
+          ]
+        },
+        {
+          "name": "Invalid certificate rejects rule at startup",
+          "when": "an ingress rule has mode=terminate with invalid CertPEM or KeyPEM",
+          "then": "the rule fails to start with a descriptive error",
+          "and_then": [
+            "other valid rules continue operating"
+          ]
+        },
+        {
+          "name": "TLS termination enforces minimum TLS 1.2",
+          "when": "a client attempts to connect using TLS 1.1 or below",
+          "then": "the TLS handshake fails",
+          "and_then": [
+            "the error is logged"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The system SHALL validate all ingress configuration fields before accepting them",
+      "priority": "SHALL",
+      "rationale": "Prevent runtime failures from malformed configuration",
+      "scenarios": [
+        {
+          "name": "Valid ingress config accepted",
+          "when": "ingress config has valid listen port, target, and mode",
+          "then": "validation returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Ingress without bridge mode rejected",
+          "when": "IngressEnabled is true but bridge Enabled is false",
+          "then": "validation returns error: ingress requires bridge mode to be enabled",
+          "and_then": []
+        },
+        {
+          "name": "Invalid listen port rejected",
+          "when": "a rule has listen port 0 or > 65535",
+          "then": "validation returns error with descriptive message",
+          "and_then": []
+        },
+        {
+          "name": "TLS terminate mode without certificate rejected",
+          "when": "a rule has mode=terminate but empty CertPEM",
+          "then": "validation returns error requiring certificate for terminate mode",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The system SHALL reconcile ingress rules by diffing desired state against active listeners",
+      "priority": "SHALL",
+      "rationale": "Convergence loop must keep ingress state aligned with control plane intent",
+      "scenarios": [
+        {
+          "name": "New rule starts listener",
+          "when": "desired state contains a rule not currently active",
+          "then": "a new TCP listener is started on the rule's listen port",
+          "and_then": [
+            "the rule is tracked in the active rules set"
+          ]
+        },
+        {
+          "name": "Stale rule stops listener",
+          "when": "an active rule is not present in the desired state",
+          "then": "the TCP listener for that rule is stopped",
+          "and_then": [
+            "active connections are drained via context cancellation"
+          ]
+        },
+        {
+          "name": "Unchanged rules are not touched",
+          "when": "desired and active rules match exactly",
+          "then": "no listeners are stopped or started",
+          "and_then": []
+        },
+        {
+          "name": "Changed rule is restarted",
+          "when": "a rule's target or TLS config has changed",
+          "then": "the old listener is stopped and a new one is started with the updated config",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The system SHALL handle SSE events for real-time ingress rule management",
+      "priority": "SHALL",
+      "rationale": "Immediate response to control plane changes without waiting for the reconcile interval",
+      "scenarios": [
+        {
+          "name": "ingress_config_updated triggers reconcile",
+          "when": "an ingress_config_updated SSE event is received",
+          "then": "TriggerReconcile is called on the reconciler",
+          "and_then": [
+            "the event payload is not parsed"
+          ]
+        },
+        {
+          "name": "ingress_rule_assigned adds a rule",
+          "when": "an ingress_rule_assigned SSE event is received with a valid payload",
+          "then": "the rule is added to the IngressManager and a listener is started",
+          "and_then": []
+        },
+        {
+          "name": "ingress_rule_revoked removes a rule",
+          "when": "an ingress_rule_revoked SSE event is received with a rule_id",
+          "then": "the rule is stopped and removed from the IngressManager",
+          "and_then": []
+        },
+        {
+          "name": "Malformed SSE payload returns error",
+          "when": "an ingress SSE event has invalid JSON payload",
+          "then": "an error is returned with event_id in the log",
+          "and_then": [
+            "other events continue to be processed"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The system SHALL report ingress status in heartbeats and capabilities during registration",
+      "priority": "SHALL",
+      "rationale": "The control plane needs visibility into which bridge nodes support ingress and their current load",
+      "scenarios": [
+        {
+          "name": "Active ingress reports status",
+          "when": "the IngressManager is active with rules",
+          "then": "IngressStatus returns IngressInfo with enabled=true, rule count, and connection count",
+          "and_then": []
+        },
+        {
+          "name": "Inactive ingress returns nil",
+          "when": "the IngressManager is not active",
+          "then": "IngressStatus returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Ingress capabilities reported at registration",
+          "when": "IngressEnabled is true in config",
+          "then": "IngressCapabilities returns map with ingress=true",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The system SHALL gracefully tear down all ingress resources on shutdown without leaking goroutines or file descriptors",
+      "priority": "SHALL",
+      "rationale": "Resource cleanup is critical for reliable operation and testing with goleak",
+      "scenarios": [
+        {
+          "name": "Teardown stops all listeners",
+          "when": "Teardown is called on an active IngressManager",
+          "then": "all TCP listeners are closed",
+          "and_then": [
+            "active connections are cancelled via context"
+          ]
+        },
+        {
+          "name": "Teardown aggregates errors",
+          "when": "some listener close operations fail",
+          "then": "all listeners are still attempted and errors are aggregated via errors.Join",
+          "and_then": []
+        },
+        {
+          "name": "Double teardown is no-op",
+          "when": "Teardown is called on an already-inactive IngressManager",
+          "then": "nil is returned immediately",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The system SHALL limit the maximum number of concurrent ingress rules",
+      "priority": "SHALL",
+      "rationale": "Prevent resource exhaustion from excessive rule creation",
+      "scenarios": [
+        {
+          "name": "Adding rule within limit succeeds",
+          "when": "the number of active rules is below MaxIngressRules",
+          "then": "the rule is added successfully",
+          "and_then": []
+        },
+        {
+          "name": "Adding rule at limit fails",
+          "when": "the number of active rules equals MaxIngressRules",
+          "then": "an error is returned indicating max rules reached",
+          "and_then": [
+            "the existing rules continue operating"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The system SHOULD use a configurable dial timeout for outbound connections to mesh targets",
+      "priority": "SHOULD",
+      "rationale": "Prevents hanging connections when mesh peers are unreachable",
+      "scenarios": [
+        {
+          "name": "Dial timeout applied to target connections",
+          "when": "a target mesh peer does not respond within the timeout",
+          "then": "the dial fails and the incoming connection is closed",
+          "and_then": [
+            "the timeout defaults to 10 seconds"
+          ]
+        },
+        {
+          "name": "Successful dial within timeout proceeds normally",
+          "when": "a target mesh peer responds within the timeout",
+          "then": "bidirectional proxying begins",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Add IngressConfig, IngressRule, and IngressInfo API types to internal/api/types.go. Add SSE event constants (EventIngressConfigUpdated, EventIngressRuleAssigned, EventIngressRuleRevoked) to internal/api/envelope.go. Add IngressConfig field to StateResponse and IngressInfo field to HeartbeatRequest/BridgeInfo. (REQ-004, REQ-007)",
+    "1.2 Extend bridge Config with ingress fields (IngressEnabled, MaxIngressRules, DialTimeout), add defaults in ApplyDefaults, add validation in Validate, and write tests in config_test.go. (REQ-004)",
+    "1.3 Define IngressController interface in internal/bridge/ingress_controller.go with methods: Listen(addr string, tlsCfg *tls.Config) (net.Listener, error), Close(listener net.Listener) error. Create mockIngressController in mock_ingress_test.go. (REQ-001, REQ-002, REQ-003)",
+    "2.1 Implement IngressManager in internal/bridge/ingress.go: struct with IngressController dependency, mu sync.Mutex, activeRules map, active bool. Implement NewIngressManager constructor, Setup (no-op when disabled), Teardown (close all listeners, aggregate errors), AddRule (start listener, track rule), RemoveRule (stop listener, untrack). Write unit tests in ingress_test.go. (REQ-001, REQ-008, REQ-009)",
+    "2.2 Implement TCP proxy logic in IngressManager: accept loop per rule, bidirectional io.Copy relay via goroutines, context cancellation for connection cleanup, dial timeout for target connections. Support passthrough mode (raw TCP) and terminate mode (tls.NewListener wrapper). Write proxy tests in ingress_test.go using real TCP connections on localhost. (REQ-001, REQ-002, REQ-003, REQ-010)",
+    "2.3 Implement IngressStatus and IngressCapabilities methods on IngressManager. IngressStatus returns *api.IngressInfo (nil when inactive). IngressCapabilities returns map[string]string (nil when disabled). Write tests in ingress_test.go. (REQ-007)",
+    "3.1 Implement HandleIngressConfigUpdated, HandleIngressRuleAssigned, and HandleIngressRuleRevoked SSE event handlers in internal/bridge/ingress_handler.go. Follow the HandleUserAccessPeerAssigned/Revoked pattern. Write tests in ingress_handler_test.go. (REQ-006)",
+    "3.2 Implement IngressReconcileHandler in internal/bridge/ingress_handler.go: diff desired IngressConfig.Rules against active rules, add missing, remove stale, restart changed. Follow the UserAccessReconcileHandler pattern. Write tests in ingress_handler_test.go. (REQ-005)",
+    "4.1 Write integration test TestIngressIntegration_FullLifecycle in internal/bridge/ingress_integration_test.go: wire IngressManager with real TCP listeners and connections, verify Setup -> AddRule -> proxy traffic -> RemoveRule -> Teardown lifecycle. (REQ-001, REQ-008)",
+    "4.2 Write integration test TestIngressIntegration_ReconcileDrift in internal/bridge/ingress_integration_test.go: wire IngressManager with real Reconciler, verify rules are added/removed via reconciliation cycle. Follow TestUserAccessIntegration_ReconcileDrift pattern. (REQ-005)",
+    "4.3 Write integration test TestIngressIntegration_ConcurrentAccess in internal/bridge/ingress_integration_test.go: concurrent SSE events + reconcile loop, verify no data races with -race. Follow TestUserAccessIntegration_ConcurrentAccess pattern. (REQ-006)",
+    "5.1 Write reference documentation in docs/reference/backend/public-ingress.md covering: data flow diagram, Config fields, IngressController interface, IngressManager methods/lifecycle, SSE handlers, reconcile handler, API types, error prefixes, logging, integration points. Follow the user-access-integration.md structure. (REQ-001 to REQ-010)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults_IngressFields",
+      "story": "Ingress configuration is validated before activation",
+      "expected": "Should set default values for IngressListenPort, MaxIngressRules, DialTimeout when zero",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_IngressWithoutBridge",
+      "story": "Ingress configuration is validated before activation",
+      "expected": "Should return error when IngressEnabled is true but Enabled is false",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_IngressValidConfig",
+      "story": "Ingress configuration is validated before activation",
+      "expected": "Should return nil for a valid ingress configuration",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_IngressInvalidMaxRules",
+      "story": "Ingress configuration is validated before activation",
+      "expected": "Should return error when MaxIngressRules is zero or negative",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_Setup_Disabled",
+      "story": "Bridge node exposes a mesh service to the public internet",
+      "expected": "Setup should be a no-op when IngressEnabled is false",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_AddRule_StartsListener",
+      "story": "Bridge node exposes a mesh service to the public internet",
+      "expected": "AddRule should start a TCP listener on the specified port via IngressController",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_AddRule_DuplicateRejects",
+      "story": "Public ingress supports individual rule assignment and revocation via SSE",
+      "expected": "Adding a rule with an existing ID should return an error",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_AddRule_MaxRulesReject",
+      "story": "Public ingress supports individual rule assignment and revocation via SSE",
+      "expected": "Adding a rule when MaxIngressRules is reached should return an error",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_RemoveRule_StopsListener",
+      "story": "Public ingress supports individual rule assignment and revocation via SSE",
+      "expected": "RemoveRule should stop the TCP listener and remove the rule from tracking",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_RemoveRule_NonexistentNoop",
+      "story": "Public ingress supports individual rule assignment and revocation via SSE",
+      "expected": "Removing a non-existent rule should be a no-op",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_Teardown",
+      "story": "Ingress teardown cleans up all listeners and connections",
+      "expected": "Teardown should close all listeners, cancel connections, and become inactive",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_Teardown_Idempotent",
+      "story": "Ingress teardown cleans up all listeners and connections",
+      "expected": "Second teardown should be a no-op",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_IngressStatus_Active",
+      "story": "Ingress status and capabilities are reported to the control plane",
+      "expected": "IngressStatus should return IngressInfo with active rule count when active",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_IngressStatus_Inactive",
+      "story": "Ingress status and capabilities are reported to the control plane",
+      "expected": "IngressStatus should return nil when inactive",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_IngressCapabilities",
+      "story": "Ingress status and capabilities are reported to the control plane",
+      "expected": "IngressCapabilities should return map with ingress=true when enabled",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_ProxyPassthrough",
+      "story": "Bridge node supports TLS passthrough for ingress rules",
+      "expected": "Passthrough mode should relay raw TCP bytes bidirectionally",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_ProxyTLSTerminate",
+      "story": "Bridge node terminates TLS and forwards plaintext to mesh peers",
+      "expected": "TLS terminate mode should decrypt TLS and forward plaintext to target",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_ProxyTLSTerminate_InvalidCert",
+      "story": "Bridge node terminates TLS and forwards plaintext to mesh peers",
+      "expected": "Invalid certificate should cause rule startup failure, not panic",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/ingress_test.go",
+      "test_function": "TestIngressManager_ProxyDialTimeout",
+      "story": "Bridge node exposes a mesh service to the public internet",
+      "expected": "Unreachable target should cause dial timeout and close incoming connection",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/bridge/ingress_handler_test.go",
+      "test_function": "TestHandleIngressConfigUpdated",
+      "story": "Public ingress reacts to real-time SSE events",
+      "expected": "Should call TriggerReconcile on the reconciler",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/ingress_handler_test.go",
+      "test_function": "TestHandleIngressRuleAssigned",
+      "story": "Public ingress supports individual rule assignment and revocation via SSE",
+      "expected": "Should parse IngressRule from payload and call AddRule",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/ingress_handler_test.go",
+      "test_function": "TestHandleIngressRuleAssigned_MalformedPayload",
+      "story": "Public ingress supports individual rule assignment and revocation via SSE",
+      "expected": "Should return error for invalid JSON payload",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/ingress_handler_test.go",
+      "test_function": "TestHandleIngressRuleRevoked",
+      "story": "Public ingress supports individual rule assignment and revocation via SSE",
+      "expected": "Should parse rule_id from payload and call RemoveRule",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/ingress_handler_test.go",
+      "test_function": "TestIngressReconcileHandler_AddsNewRules",
+      "story": "Public ingress rules are reconciled from control plane state",
+      "expected": "Should add rules present in desired state but not locally",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/ingress_handler_test.go",
+      "test_function": "TestIngressReconcileHandler_RemovesStaleRules",
+      "story": "Public ingress rules are reconciled from control plane state",
+      "expected": "Should remove rules present locally but not in desired state",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/ingress_handler_test.go",
+      "test_function": "TestIngressReconcileHandler_NilConfig",
+      "story": "Public ingress rules are reconciled from control plane state",
+      "expected": "Should be a no-op when IngressConfig is nil in desired state",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/ingress_integration_test.go",
+      "test_function": "TestIngressIntegration_FullLifecycle",
+      "story": "Bridge node exposes a mesh service to the public internet",
+      "expected": "Setup, AddRule, proxy traffic, RemoveRule, Teardown with real TCP connections",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/ingress_integration_test.go",
+      "test_function": "TestIngressIntegration_ReconcileDrift",
+      "story": "Public ingress rules are reconciled from control plane state",
+      "expected": "Wires IngressManager with real Reconciler and verifies rule add/remove via reconciliation",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/ingress_integration_test.go",
+      "test_function": "TestIngressIntegration_ConcurrentAccess",
+      "story": "Public ingress reacts to real-time SSE events",
+      "expected": "Concurrent SSE events + reconcile loop produces no data races (run with -race)",
+      "requirement_id": "REQ-006"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-009) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case",
+    "Implementation follows existing bridge module patterns: interface-based controllers, Manager with mu/active/tracked-state, SSE handlers as factory functions, ReconcileHandler for convergence",
+    "No goroutine leaks: goleak.VerifyTestMain in leak_test.go passes for all new tests",
+    "Concurrent safety: IngressManager uses sync.Mutex consistent with UserAccessManager; integration tests pass with -race",
+    "Error prefixes follow established pattern: 'bridge: ingress: <operation>: <detail>'",
+    "All log entries use component=bridge with structured keys",
+    "Config validation rejects invalid ingress configuration before runtime",
+    "TLS termination uses tls.Config with MinVersion=tls.VersionTLS12",
+    "Reference documentation covers all new types, interfaces, handlers, and integration points"
+  ],
+  "implementation_notes": "Architecture follows the established bridge module pattern exactly:\n\n1. **IngressController interface** (ingress_controller.go): Abstracts TCP listener operations for testability, like RouteController and AccessController. Production implementation is external.\n\n2. **IngressManager** (ingress.go): Manages ingress rule lifecycle. Concurrent-safe via sync.Mutex (same as UserAccessManager). Tracks active rules by ID. Each rule has a TCP listener and accept loop goroutine. Proxy logic uses bidirectional io.Copy in goroutines with context cancellation.\n\n3. **TCP Proxy**: Each accepted connection spawns a goroutine that dials the target (with DialTimeout), then runs two io.Copy goroutines for bidirectional relay. For TLS terminate mode, the listener is wrapped with tls.NewListener. For passthrough, raw TCP is used.\n\n4. **SSE Handlers** (ingress_handler.go): HandleIngressConfigUpdated triggers reconcile (like HandleBridgeConfigUpdated). HandleIngressRuleAssigned/Revoked parse payloads and call AddRule/RemoveRule (like HandleUserAccessPeerAssigned/Revoked).\n\n5. **ReconcileHandler** (ingress_handler.go): IngressReconcileHandler diffs desired rules against active rules by rule ID, adding missing and removing stale. Changed rules (same ID but different config) are stopped and re-created. Follows UserAccessReconcileHandler pattern.\n\n6. **API Types** (api/types.go): IngressConfig contains []IngressRule. IngressRule has RuleID, ListenPort, TargetAddr, Mode (passthrough/terminate), CertPEM, KeyPEM. IngressInfo has Enabled, RuleCount, ConnectionCount.\n\n7. **Config Fields**: IngressEnabled bool, MaxIngressRules int (default 20), DialTimeout time.Duration (default 10s). Validation follows existing relay/user-access pattern.\n\nKey patterns from existing code to replicate:\n- internal/bridge/config.go: Config struct extension, ApplyDefaults, Validate\n- internal/bridge/user_access.go: Manager with mu, active, tracked state, Setup/Teardown/Add/Remove pattern\n- internal/bridge/user_access_handler.go: SSE handler factories, ReconcileHandler factory\n- internal/bridge/mock_access_test.go: Mock controller with call recording\n- internal/bridge/user_access_integration_test.go: Integration tests with real Reconciler\n\nRisks:\n- Port conflicts: Two ingress rules on the same port should be caught by the OS (EADDRINUSE) — the error propagates up to AddRule.\n- Goroutine leaks from proxy connections: Use context cancellation to ensure both io.Copy goroutines exit when either side closes. Store cancel functions per-connection.\n- TLS certificate lifecycle: Certificates are provided per-rule in the config. Certificate rotation requires rule restart (stop + re-create), which the reconcile handler handles via the changed-rule path.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.109977"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T19:55:03.028643"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T19:59:03.520023"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "1b6b1ada-54b3-4e3f-af25-f1fb2acb69df",
+      "timestamp": "2026-02-12T19:59:03.520050",
+      "total_duration": 236.6076204776764,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 236.6076204776764,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
