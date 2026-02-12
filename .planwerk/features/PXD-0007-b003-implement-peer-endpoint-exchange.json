@@ -1,0 +1,489 @@
+{
+  "feature_id": "PXD-0007",
+  "title": "B003: Implement peer endpoint exchange",
+  "slug": "b003-implement-peer-endpoint-exchange",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Exchange discovered public endpoints with peers through the control plane. Receive peer endpoint updates via SSE events and update local WireGuard peer configurations accordingly. Handle endpoint changes due to NAT rebinding or IP changes gracefully.",
+  "stories": [
+    {
+      "title": "plexd exchanges endpoint with peers on startup",
+      "role": "plexd agent",
+      "want": "to run the peer endpoint exchange loop on startup, performing initial STUN discovery, reporting the endpoint to the control plane, receiving peer endpoints in the response, and applying them to WireGuard",
+      "so_that": "all mesh peers have up-to-date endpoint information for direct WireGuard connectivity immediately after the node joins the mesh",
+      "criteria": [
+        "Exchanger.Run performs initial NAT discovery via nat.Discoverer.Discover, reporting the result via api.ControlPlane.ReportEndpoint",
+        "Peer endpoints received in the EndpointResponse are applied to WireGuard via wireguard.Manager.UpdatePeer",
+        "Peers with empty endpoint strings in the response are skipped without error",
+        "If initial STUN discovery fails (all servers unreachable), Exchanger.Run returns an error without entering the refresh loop",
+        "If endpoint reporting fails after successful discovery, a warn log is emitted and the refresh loop still starts (non-fatal)"
+      ]
+    },
+    {
+      "title": "plexd refreshes endpoint periodically and distributes changes to peers",
+      "role": "plexd agent",
+      "want": "to re-discover the public endpoint at a configurable interval and report any changes to the control plane for distribution to peers",
+      "so_that": "NAT rebinding, IP changes, and port re-allocation are detected and all peers receive the updated endpoint promptly",
+      "criteria": [
+        "The refresh loop runs at the configured nat.Config.RefreshInterval (default 60s)",
+        "If the endpoint has not changed since the last report, the endpoint is still reported (acts as liveness signal and returns updated peer endpoints)",
+        "If the endpoint has changed since the last report, an info-level log is emitted with old and new endpoint values",
+        "If STUN discovery fails during a refresh, the previous endpoint remains in effect and a warn log is emitted",
+        "Updated peer endpoints from each refresh response are applied to WireGuard",
+        "The refresh loop stops cleanly on context cancellation"
+      ]
+    },
+    {
+      "title": "plexd receives peer endpoint updates via SSE in real-time",
+      "role": "plexd agent",
+      "want": "to receive peer_endpoint_changed SSE events from the control plane and update the corresponding WireGuard peer endpoint immediately",
+      "so_that": "when a remote peer discovers a new endpoint (e.g., NAT rebinding on the remote side), this node updates WireGuard without waiting for the next refresh cycle",
+      "criteria": [
+        "The existing wireguard.HandlePeerEndpointChanged SSE handler (from B001) is registered with the SSEManager for peer_endpoint_changed events",
+        "No new SSE handler is created — the Exchanger registers the existing B001 handler during setup",
+        "SSE endpoint updates are applied immediately (sub-second latency, limited only by SSE delivery)",
+        "Malformed peer_endpoint_changed payloads are logged at error level and skipped without crashing"
+      ]
+    },
+    {
+      "title": "plexd handles endpoint changes from NAT rebinding gracefully",
+      "role": "plexd agent",
+      "want": "to detect when the node's own public endpoint changes (NAT rebinding, IP address change) and report the new endpoint to the control plane, which distributes it to all peers",
+      "so_that": "peers update their WireGuard configuration with the new endpoint and direct connectivity is restored after a NAT rebinding event",
+      "criteria": [
+        "When a refresh cycle discovers a different endpoint than the previous cycle, the new endpoint is reported immediately",
+        "The control plane response may include updated peer endpoints (peers that also changed), which are applied to WireGuard",
+        "The endpoint change is logged at info level with component=exchange, old_endpoint, and new_endpoint",
+        "The LastResult on the Discoverer is updated atomically so heartbeat payloads reflect the latest endpoint"
+      ]
+    },
+    {
+      "title": "plexd integrates endpoint exchange with SSE manager and reconciler",
+      "role": "plexd agent",
+      "want": "to wire together the SSE event handlers, NAT discoverer, and WireGuard manager through a single Exchanger component that manages the full endpoint exchange lifecycle",
+      "so_that": "there is a single integration point for endpoint exchange that can be started and stopped as part of the agent lifecycle",
+      "criteria": [
+        "Exchanger accepts nat.Discoverer, wireguard.Manager, api.ControlPlane, and a logger",
+        "Exchanger.RegisterHandlers(sseManager) registers the peer_endpoint_changed SSE handler",
+        "Exchanger.Run(ctx, nodeID) starts the NAT discovery and reporting loop (delegates to nat.Discoverer.Run)",
+        "Exchanger.Run blocks until context cancellation and returns the context error",
+        "The Exchanger does not duplicate logic already in nat.Discoverer.Run or wireguard.HandlePeerEndpointChanged"
+      ]
+    },
+    {
+      "title": "Platform operator can configure peer endpoint exchange parameters",
+      "role": "platform operator",
+      "want": "to configure the endpoint exchange behavior through the existing nat.Config (STUN servers, refresh interval, timeout, enabled/disabled)",
+      "so_that": "endpoint exchange can be customized for different network environments or disabled for nodes with static public IPs",
+      "criteria": [
+        "Exchanger Config embeds nat.Config, reusing the existing Enabled, STUNServers, RefreshInterval, and Timeout settings",
+        "When nat.Config.Enabled is false, Exchanger.Run returns immediately without error (no STUN, no reporting)",
+        "When nat.Config.Enabled is false, SSE handlers for peer_endpoint_changed are still registered (inbound updates still processed)",
+        "Config validation delegates to nat.Config.Validate"
+      ]
+    },
+    {
+      "title": "Endpoint exchange errors do not crash the agent",
+      "role": "platform operator",
+      "want": "all endpoint exchange errors to be handled gracefully with logging and retries rather than panics",
+      "so_that": "plexd remains operational even when STUN servers are unreachable, the control plane is temporarily unavailable, or WireGuard peer updates fail",
+      "criteria": [
+        "STUN discovery failures during refresh are logged at warn level and the loop continues",
+        "Control plane endpoint report failures are logged at warn level and retried on the next cycle",
+        "Individual WireGuard peer update failures are logged at warn level but do not block other peer updates",
+        "Context cancellation during any operation cleanly aborts and returns the context error",
+        "No goroutine leaks: the refresh ticker is stopped on context cancellation"
+      ]
+    },
+    {
+      "title": "Reference documentation for peer endpoint exchange",
+      "role": "developer",
+      "want": "comprehensive reference documentation for the internal/peerexchange package",
+      "so_that": "future developers understand the Exchanger lifecycle, integration points, configuration, and how SSE events, NAT discovery, and WireGuard updates are wired together",
+      "criteria": [
+        "Documentation covers Exchanger struct, Config, and all public methods",
+        "Documentation includes a data flow diagram: STUN discovery → control plane report → peer endpoint response → WireGuard update, and SSE peer_endpoint_changed → WireGuard update",
+        "Documentation references related packages: internal/nat, internal/wireguard, internal/api",
+        "Documentation is placed at docs/reference/backend/peer-endpoint-exchange.md"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The peerexchange package SHALL provide an Exchanger struct that orchestrates STUN-based endpoint discovery, control plane reporting, and WireGuard peer endpoint updates",
+      "priority": "SHALL",
+      "rationale": "A single integration component is needed to wire together nat.Discoverer, api.ControlPlane.ReportEndpoint, and wireguard.Manager.UpdatePeer into a coherent endpoint exchange lifecycle",
+      "scenarios": [
+        {
+          "name": "Exchanger runs initial discovery and reporting",
+          "when": "Exchanger.Run(ctx, nodeID) is called",
+          "then": "initial STUN discovery is performed via nat.Discoverer.Discover, followed by endpoint reporting via ReportEndpoint, and peer endpoints from the response are applied to WireGuard",
+          "and_then": [
+            "the refresh loop is entered after successful initial exchange"
+          ]
+        },
+        {
+          "name": "Exchanger enters refresh loop",
+          "when": "initial discovery and reporting succeed",
+          "then": "a periodic refresh loop re-discovers the endpoint at nat.Config.RefreshInterval and reports it to the control plane",
+          "and_then": [
+            "peer endpoints from each response are applied to WireGuard"
+          ]
+        },
+        {
+          "name": "Exchanger stops on context cancellation",
+          "when": "context is cancelled while the refresh loop is running",
+          "then": "Exchanger.Run returns the context error",
+          "and_then": [
+            "no goroutine leaks, ticker is stopped"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The Exchanger SHALL register the existing wireguard.HandlePeerEndpointChanged SSE handler for real-time peer endpoint updates",
+      "priority": "SHALL",
+      "rationale": "SSE events provide sub-second endpoint updates without waiting for the next refresh cycle; the handler already exists in B001",
+      "scenarios": [
+        {
+          "name": "SSE handler registered",
+          "when": "Exchanger.RegisterHandlers(sseManager) is called",
+          "then": "wireguard.HandlePeerEndpointChanged is registered for EventPeerEndpointChanged on the SSEManager",
+          "and_then": []
+        },
+        {
+          "name": "SSE event updates WireGuard peer",
+          "when": "a peer_endpoint_changed SSE event is received with a valid Peer payload",
+          "then": "the WireGuard peer endpoint is updated via Manager.UpdatePeer",
+          "and_then": []
+        },
+        {
+          "name": "SSE handler registered even when NAT disabled",
+          "when": "nat.Config.Enabled is false and RegisterHandlers is called",
+          "then": "the SSE handler is still registered for inbound peer endpoint updates",
+          "and_then": [
+            "inbound endpoint updates from peers who DO use STUN are still processed"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The Exchanger SHALL delegate STUN discovery and endpoint reporting to nat.Discoverer.Run without duplicating logic",
+      "priority": "SHALL",
+      "rationale": "B002 already implements the full discovery → report → apply loop; B003 should orchestrate, not re-implement",
+      "scenarios": [
+        {
+          "name": "Run delegates to Discoverer.Run",
+          "when": "Exchanger.Run is called with NAT enabled",
+          "then": "nat.Discoverer.Run is called with the EndpointReporter and PeerUpdater interfaces satisfied by api.ControlPlane and wireguard.Manager respectively",
+          "and_then": []
+        },
+        {
+          "name": "Discoverer uses correct node ID",
+          "when": "Exchanger.Run is called with a nodeID",
+          "then": "the nodeID is passed to Discoverer.Run for use in ReportEndpoint API calls",
+          "and_then": []
+        },
+        {
+          "name": "Discoverer results accessible for heartbeat",
+          "when": "Discoverer.Run is running",
+          "then": "Exchanger.LastResult delegates to nat.Discoverer.LastResult for heartbeat integration",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The Exchanger SHALL skip STUN discovery when nat.Config.Enabled is false but still process inbound SSE peer endpoint events",
+      "priority": "SHALL",
+      "rationale": "Nodes with static public IPs don't need STUN but still need to receive endpoint updates from peers who use NAT",
+      "scenarios": [
+        {
+          "name": "NAT disabled skips discovery",
+          "when": "nat.Config.Enabled is false and Exchanger.Run is called",
+          "then": "Run returns nil immediately without performing STUN discovery or entering the refresh loop",
+          "and_then": [
+            "an info log indicates NAT traversal is disabled"
+          ]
+        },
+        {
+          "name": "NAT disabled still processes inbound SSE",
+          "when": "nat.Config.Enabled is false",
+          "then": "RegisterHandlers still registers the peer_endpoint_changed SSE handler",
+          "and_then": [
+            "inbound peer endpoint changes are applied to WireGuard"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The Exchanger SHALL use structured logging with log/slog and component=exchange",
+      "priority": "SHALL",
+      "rationale": "Operational consistency with existing internal packages (api, wireguard, nat, reconcile) logging patterns",
+      "scenarios": [
+        {
+          "name": "Start logged",
+          "when": "Exchanger.Run starts with NAT enabled",
+          "then": "info log with component=exchange, node_id",
+          "and_then": []
+        },
+        {
+          "name": "NAT disabled logged",
+          "when": "Exchanger.Run is called with NAT disabled",
+          "then": "info log with component=exchange indicating NAT traversal is disabled",
+          "and_then": []
+        },
+        {
+          "name": "SSE handler registration logged",
+          "when": "RegisterHandlers is called",
+          "then": "debug log with component=exchange indicating peer_endpoint_changed handler registered",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The peerexchange Config SHALL embed nat.Config and delegate validation",
+      "priority": "SHALL",
+      "rationale": "No new configuration fields are needed; the existing nat.Config covers all STUN and refresh settings",
+      "scenarios": [
+        {
+          "name": "Config embeds nat.Config",
+          "when": "a peerexchange.Config is created",
+          "then": "it embeds nat.Config with all fields (Enabled, STUNServers, RefreshInterval, Timeout)",
+          "and_then": []
+        },
+        {
+          "name": "Validate delegates to nat.Config.Validate",
+          "when": "Config.Validate is called",
+          "then": "nat.Config.Validate is called and its result returned",
+          "and_then": []
+        },
+        {
+          "name": "ApplyDefaults delegates to nat.Config.ApplyDefaults",
+          "when": "Config.ApplyDefaults is called",
+          "then": "nat.Config.ApplyDefaults is called to set default values",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The Exchanger SHALL adapt api.ControlPlane to the nat.EndpointReporter interface for endpoint reporting",
+      "priority": "SHALL",
+      "rationale": "nat.Discoverer.Run requires EndpointReporter and PeerUpdater interfaces; the Exchanger bridges the concrete types to these interfaces",
+      "scenarios": [
+        {
+          "name": "EndpointReporter adapter calls ControlPlane.ReportEndpoint",
+          "when": "the adapter's ReportEndpoint is called",
+          "then": "api.ControlPlane.ReportEndpoint is called with the configured nodeID",
+          "and_then": []
+        },
+        {
+          "name": "PeerUpdater satisfied by Manager",
+          "when": "Exchanger passes wireguard.Manager as PeerUpdater",
+          "then": "wireguard.Manager.UpdatePeer is called directly since it matches the interface",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The Exchanger SHALL support context-based cancellation for graceful shutdown",
+      "priority": "SHALL",
+      "rationale": "Agent lifecycle management requires clean shutdown of all components",
+      "scenarios": [
+        {
+          "name": "Context cancelled during refresh loop",
+          "when": "context is cancelled while waiting for the next refresh tick",
+          "then": "Run returns the context error within one tick interval",
+          "and_then": [
+            "no goroutine leaks"
+          ]
+        },
+        {
+          "name": "Context cancelled during STUN discovery",
+          "when": "context is cancelled while a STUN binding request is in progress",
+          "then": "the STUN request is aborted and Run returns the context error",
+          "and_then": []
+        },
+        {
+          "name": "Context cancelled during endpoint reporting",
+          "when": "context is cancelled during an HTTP call to ReportEndpoint",
+          "then": "the HTTP request is cancelled and Run returns the context error",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/peerexchange/config.go — Define Config struct that embeds nat.Config. Implement ApplyDefaults() delegating to nat.Config.ApplyDefaults() and Validate() delegating to nat.Config.Validate(). Follow the same Config pattern as internal/nat/config.go and internal/wireguard/config.go. Include tests in config_test.go for: defaults applied via delegation, validation errors propagated (empty STUN servers when enabled, low refresh interval), disabled config passes, custom values respected. (REQ-006)",
+    "1.2 Create internal/peerexchange/exchanger.go — Define Exchanger struct: nat.Discoverer, wireguard.Manager (as nat.PeerUpdater), *api.ControlPlane (for ReportEndpoint), nat.Config (embedded from Config), *slog.Logger. Constructor NewExchanger(discoverer *nat.Discoverer, wgManager *wireguard.Manager, cpClient *api.ControlPlane, cfg Config, logger *slog.Logger) *Exchanger. Define controlPlaneReporter adapter struct wrapping *api.ControlPlane to satisfy nat.EndpointReporter, binding nodeID at call time. Implement RegisterHandlers(sseManager *api.SSEManager) — registers wireguard.HandlePeerEndpointChanged(wgManager) for api.EventPeerEndpointChanged, logs at debug level. Implement Run(ctx context.Context, nodeID string) error — if !cfg.Enabled, log info and return nil; otherwise log info with node_id, create controlPlaneReporter adapter, call discoverer.Run(ctx, reporter, wgManager, nodeID) and return its result. Implement LastResult() *api.NATInfo delegating to discoverer.LastResult(). Include tests in exchanger_test.go with mock STUNClient, mock WGController, and mock HTTP server for: initial discovery + report + peer update, refresh loop, endpoint change detection, NAT disabled returns nil, context cancellation, discovery failure continues, report failure continues, empty peer endpoint skipped, peer update failure continues, RegisterHandlers registers correct handler, LastResult delegation. (REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-007, REQ-008)",
+    "2.1 Create internal/peerexchange/exchanger_integration_test.go — Integration tests that wire together real nat.Discoverer (with mock STUNClient), real wireguard.Manager (with mock WGController), and a test HTTP server simulating ControlPlane endpoints. Tests: full endpoint exchange flow (discover → report → receive peer endpoints → apply to WireGuard), SSE peer_endpoint_changed event triggers WireGuard update via registered handler, endpoint change during refresh loop updates peers correctly, concurrent SSE event and refresh cycle do not race (run with -race). (REQ-001, REQ-002, REQ-003, REQ-008)",
+    "3.1 Create docs/reference/backend/peer-endpoint-exchange.md — Reference documentation for internal/peerexchange/ package: Config struct (embeds nat.Config), Exchanger struct and lifecycle (NewExchanger → RegisterHandlers → Run → LastResult), controlPlaneReporter adapter, data flow diagram (STUN → ControlPlane → WireGuard and SSE → WireGuard), integration points with internal/nat, internal/wireguard, and internal/api. Include code examples for constructing an Exchanger and wiring it into the agent lifecycle. (REQ-001 through REQ-008)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/peerexchange/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults",
+      "story": "Platform operator can configure peer endpoint exchange parameters",
+      "expected": "Config.ApplyDefaults delegates to embedded nat.Config.ApplyDefaults, setting Enabled=true, default STUN servers, RefreshInterval=60s, Timeout=5s",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/peerexchange/config_test.go",
+      "test_function": "TestConfig_Validate",
+      "story": "Platform operator can configure peer endpoint exchange parameters",
+      "expected": "Config.Validate delegates to nat.Config.Validate: rejects empty STUN servers when enabled, rejects low refresh interval, passes when disabled",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_Run_InitialDiscoveryAndReport",
+      "story": "plexd exchanges endpoint with peers on startup",
+      "expected": "Exchanger.Run performs initial STUN discovery, reports endpoint, and applies peer endpoints from response to WireGuard",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_Run_RefreshLoop",
+      "story": "plexd refreshes endpoint periodically and distributes changes to peers",
+      "expected": "After initial exchange, refresh loop re-discovers and reports at configured interval, applying peer endpoint updates",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_Run_EndpointChange",
+      "story": "plexd handles endpoint changes from NAT rebinding gracefully",
+      "expected": "When refresh discovers a different endpoint, info log emitted with old/new values, new endpoint reported",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_Run_DiscoveryFailureContinues",
+      "story": "Endpoint exchange errors do not crash the agent",
+      "expected": "STUN discovery failure during refresh logs warn and continues to next cycle",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_Run_ReportFailureContinues",
+      "story": "Endpoint exchange errors do not crash the agent",
+      "expected": "Endpoint report failure logs warn and continues to next cycle",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_RegisterHandlers",
+      "story": "plexd receives peer endpoint updates via SSE in real-time",
+      "expected": "RegisterHandlers registers wireguard.HandlePeerEndpointChanged for EventPeerEndpointChanged on the SSEManager",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_RegisterHandlers_NATDisabled",
+      "story": "plexd receives peer endpoint updates via SSE in real-time",
+      "expected": "RegisterHandlers registers SSE handler even when nat.Config.Enabled is false",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_Run_DelegatesToDiscoverer",
+      "story": "plexd integrates endpoint exchange with SSE manager and reconciler",
+      "expected": "Run calls nat.Discoverer.Run with correct EndpointReporter and PeerUpdater",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_LastResult",
+      "story": "plexd integrates endpoint exchange with SSE manager and reconciler",
+      "expected": "LastResult delegates to nat.Discoverer.LastResult, returning nil before discovery and NATInfo after",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_Run_NATDisabled",
+      "story": "Platform operator can configure peer endpoint exchange parameters",
+      "expected": "When Enabled=false, Run returns nil immediately with info log indicating NAT disabled",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_Run_ContextCancellation",
+      "story": "Endpoint exchange errors do not crash the agent",
+      "expected": "Context cancellation stops Run cleanly, returns context error",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_EndpointReporterAdapter",
+      "story": "plexd exchanges endpoint with peers on startup",
+      "expected": "The controlPlaneReporter adapter correctly calls ControlPlane.ReportEndpoint with the configured nodeID",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_Run_PeerUpdateFailureContinues",
+      "story": "Endpoint exchange errors do not crash the agent",
+      "expected": "When a peer update fails during endpoint response processing, other peers are still updated",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/peerexchange/exchanger_test.go",
+      "test_function": "TestExchanger_Run_SkipsEmptyPeerEndpoint",
+      "story": "plexd exchanges endpoint with peers on startup",
+      "expected": "Peer endpoints with empty endpoint strings in EndpointResponse are skipped without error",
+      "requirement_id": "REQ-001"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-008) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "Exchanger delegates to nat.Discoverer.Run without duplicating discovery/report/apply logic from B002",
+    "RegisterHandlers uses existing wireguard.HandlePeerEndpointChanged from B001 — no new SSE handler created",
+    "controlPlaneReporter adapter correctly binds nodeID and delegates to api.ControlPlane.ReportEndpoint",
+    "wireguard.Manager is passed directly as nat.PeerUpdater (satisfies interface)",
+    "NAT disabled mode: Run returns nil immediately, SSE handlers still registered",
+    "All operations support context-based cancellation, no goroutine leaks (tested with go test -race and goleak)",
+    "Code follows existing patterns: log/slog with component key, Config with ApplyDefaults/Validate, stdlib-only test dependencies",
+    "Reference documentation covers all public types, methods, data flow, and integration patterns (docs/reference/backend/peer-endpoint-exchange.md)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All code lives in `internal/peerexchange/`. Files: config.go, exchanger.go, and corresponding _test.go files. An integration test file exchanger_integration_test.go wires real components with mocks.\n\n2. **Thin orchestration layer**: The Exchanger is deliberately thin. It does NOT re-implement STUN discovery, endpoint reporting, or WireGuard peer updates. It orchestrates existing components:\n   - `nat.Discoverer.Run()` handles the full discovery → report → apply → refresh loop\n   - `wireguard.HandlePeerEndpointChanged()` handles inbound SSE events\n   - The Exchanger wires these together and manages lifecycle\n\n3. **controlPlaneReporter adapter**: `nat.Discoverer.Run` requires a `nat.EndpointReporter` interface (method: `ReportEndpoint(ctx, nodeID, req) (*EndpointResponse, error)`). The `api.ControlPlane.ReportEndpoint` method signature matches. The adapter simply wraps the ControlPlane pointer. The nodeID could be captured as a closure or struct field.\n\n4. **PeerUpdater satisfied directly**: `wireguard.Manager` already has `UpdatePeer(peer api.Peer) error` which matches the `nat.PeerUpdater` interface exactly. No adapter needed — pass `wgManager` directly.\n\n5. **NAT disabled behavior**: When `Config.Enabled` is false:\n   - `Run()` logs and returns nil immediately (no STUN, no refresh loop)\n   - `RegisterHandlers()` still registers the SSE handler (inbound updates from peers who DO use STUN)\n   - This separation ensures nodes with static public IPs still receive peer endpoint updates\n\n6. **SSE handler registration**: The Exchanger's `RegisterHandlers(sseManager)` calls `sseManager.RegisterHandler(api.EventPeerEndpointChanged, wireguard.HandlePeerEndpointChanged(wgManager))`. This is the same handler B001 defines — we just register it here as part of the endpoint exchange lifecycle rather than having the agent lifecycle code register it directly.\n\n7. **LastResult for heartbeat**: The Exchanger exposes `LastResult() *api.NATInfo` by delegating to `nat.Discoverer.LastResult()`. The heartbeat module (future) calls this to populate `HeartbeatRequest.NAT`.\n\n8. **Error handling**: All errors in the refresh loop (discovery failure, report failure, peer update failure) are non-fatal and logged at warn level. This matches the resilience pattern in nat.Discoverer.Run and nat.reportAndApply.\n\n9. **Testing strategy**: Unit tests use the same mock patterns as B001 and B002:\n   - Mock STUNClient (from internal/nat/mock_stun_test.go pattern)\n   - Mock WGController (from internal/wireguard/mock_controller_test.go pattern)\n   - httptest.Server for ControlPlane API simulation\n   - Integration tests wire real components with mocks, verifying end-to-end data flow\n   - All tests use stdlib only, run with -race\n\n10. **Key files from existing codebase**:\n    - `internal/nat/discoverer.go:124` — Discoverer.Run (the core loop this package orchestrates)\n    - `internal/nat/reporter.go:12-14` — EndpointReporter interface to satisfy\n    - `internal/nat/reporter.go:17-19` — PeerUpdater interface (wireguard.Manager satisfies this)\n    - `internal/wireguard/handler.go:136-152` — HandlePeerEndpointChanged (SSE handler to register)\n    - `internal/wireguard/manager.go:126-144` — Manager.UpdatePeer (satisfies nat.PeerUpdater)\n    - `internal/api/endpoints.go:91-98` — ControlPlane.ReportEndpoint (to wrap as EndpointReporter)\n    - `internal/api/manager.go:40-42` — SSEManager.RegisterHandler (to register SSE handlers)\n    - `internal/api/envelope.go:18` — EventPeerEndpointChanged constant\n\n11. **Potential pitfalls**:\n    - The controlPlaneReporter adapter must correctly bind the nodeID — it receives nodeID in Run() and passes it through to ReportEndpoint calls\n    - wireguard.Manager must be initialized (Setup called) before Exchanger.Run is called — the agent lifecycle handles this ordering\n    - If the SSEManager is started before RegisterHandlers is called, early events may be missed — RegisterHandlers must be called before SSEManager.Start\n    - The nat.Discoverer must be created with the correct STUNClient and localPort (WireGuard listen port) — these are passed from the agent lifecycle, not created by the Exchanger",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.106727"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T13:19:28.633765"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T13:23:44.977845"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "80ef52dd-47cc-4dce-99dd-51f59ed3b5ad",
+      "timestamp": "2026-02-12T13:23:44.977871",
+      "total_duration": 252.21442818641663,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 252.21442818641663,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
