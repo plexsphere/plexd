@@ -1,0 +1,77 @@
+{
+  "feature_id": "PXD-0010",
+  "title": "C003: Implement integrity verification",
+  "date": "2026-02-12",
+  "verdict": "APPROVED",
+  "summary": "Clean, minimal implementation of SHA-256 integrity verification for plexd binaries and hook scripts. The package follows established patterns (Config with ApplyDefaults/Validate, ViolationReporter interface for testability), uses streaming io.Copy for memory-efficient hashing, atomic writes via fsutil.WriteFileAtomic for crash-safe persistence, and proper concurrency primitives (sync.RWMutex for Store, sync.Mutex for Verifier.binaryChecksum). All violations are non-fatal with graceful degradation. Tests are comprehensive with race detector coverage and goleak for goroutine leak detection. Documentation covers all public types, methods, data flow, and integration patterns.",
+  "tests_checklist": [
+    {"item": "All tests pass (go test -race ./internal/integrity/... ./internal/api/...)", "checked": true},
+    {"item": "go vet passes clean", "checked": true},
+    {"item": "Edge cases covered (empty file, not found, empty checksum, invalid JSON)", "checked": true},
+    {"item": "Error paths tested (file not found, empty expected checksum for hooks)", "checked": true},
+    {"item": "Concurrent access tested under race detector", "checked": true},
+    {"item": "Integration tests with real files and full lifecycle", "checked": true},
+    {"item": "Goroutine leak detection via goleak.VerifyTestMain", "checked": true},
+    {"item": "Context cancellation tested with clean shutdown", "checked": true},
+    {"item": "API type round-trip serialization tested", "checked": true},
+    {"item": "Endpoint test verifies POST path and request body", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing Config pattern (ApplyDefaults/Validate) matching tunnel.Config and policy.Config", "checked": true},
+    {"item": "Functions do one thing (SRP) and are small (all under 25 lines)", "checked": true},
+    {"item": "Clear, intention-revealing naming throughout", "checked": true},
+    {"item": "No code duplication requiring extraction", "checked": true},
+    {"item": "Uses slog with component=integrity key consistently", "checked": true},
+    {"item": "Named constants for defaults (DefaultVerifyInterval, checksumFileName)", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "Early returns and guard clauses keep nesting shallow", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "SHA-256 via crypto/sha256 stdlib (no external crypto libraries)", "checked": true},
+    {"item": "Streaming hash via io.Copy - no full-file memory load (REQ-010)", "checked": true},
+    {"item": "Atomic file writes via fsutil.WriteFileAtomic for crash-safe persistence", "checked": true},
+    {"item": "No hardcoded secrets or sensitive data in logs", "checked": true},
+    {"item": "URL path parameters escaped with url.PathEscape in endpoint", "checked": true},
+    {"item": "Integrity violations are non-fatal (logged + reported, agent continues)", "checked": true},
+    {"item": "Store file written with 0o600 permissions", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Two-layer design: pure computation (checker.go) separated from orchestration (verifier.go)", "checked": true},
+    {"item": "ViolationReporter interface abstracts control plane for testability", "checked": true},
+    {"item": "Store handles persistence with proper concurrency protection", "checked": true},
+    {"item": "Config follows established ApplyDefaults/Validate pattern", "checked": true},
+    {"item": "Package location (internal/integrity/) matches project structure", "checked": true},
+    {"item": "API types and endpoints follow existing codebase conventions", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code requiring extraction", "checked": true},
+    {"item": "No unnecessary abstractions or helpers", "checked": true},
+    {"item": "No future-proofing or unused features", "checked": true},
+    {"item": "Uses existing fsutil.WriteFileAtomic utility", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config.Validate rejects invalid VerifyInterval early", "checked": true},
+    {"item": "VerifyFile returns error immediately on empty expected checksum for hooks", "checked": true},
+    {"item": "HashFile returns wrapped os.ErrNotExist for missing files", "checked": true},
+    {"item": "NewStore returns error on invalid JSON", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Store.Get returns empty string for missing keys (not nil/error)", "checked": true},
+    {"item": "Run returns immediately when Config.Enabled=false", "checked": true},
+    {"item": "Violation report failures logged at warn level, not fatal", "checked": true},
+    {"item": "Config.ApplyDefaults handles zero-valued Config correctly", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [],
+  "suggested_improvements": [
+    "MINOR (D2): Consider extracting violation report construction into a helper method in verifier.go if a third violation type is added in the future (currently binary and hook share similar but not identical construction at lines 80-87 and 115-122)",
+    "MINOR (PF4): Consider adding a test with a larger file (e.g. 1MB) to checker_test.go to validate streaming behavior under more realistic conditions, though the current io.Copy implementation is correct by inspection",
+    "MINOR (Q4): The magic strings 'binary' and 'hook' used as violation types in verifier.go could be defined as package-level constants for discoverability, though they are only used once each"
+  ],
+  "next_steps": [
+    "Merge feature branch - implementation is complete and passes all review criteria",
+    "Wire Verifier into the main agent lifecycle (VerifyBinary on startup, Run in background goroutine, VerifyHook before hook execution) in a future integration task",
+    "Populate HeartbeatRequest.BinaryChecksum from Verifier.BinaryChecksum() when heartbeat sender is connected"
+  ]
+}

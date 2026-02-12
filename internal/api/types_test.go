@@ -296,6 +296,31 @@ func TestTypesTunnelClosedRequest(t *testing.T) {
 	requireEqual(t, orig, got)
 }
 
+func TestTypesIntegrityViolationReport(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := IntegrityViolationReport{
+		Type:             "binary",
+		Path:             "/usr/local/bin/plexd",
+		ExpectedChecksum: "abc123",
+		ActualChecksum:   "def456",
+		Detail:           "binary checksum mismatch on startup",
+		Timestamp:        now,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"type", "path", "expected_checksum", "actual_checksum", "detail", "timestamp"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
 // contains is a simple substring check helper.
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchSubstring(s, substr)

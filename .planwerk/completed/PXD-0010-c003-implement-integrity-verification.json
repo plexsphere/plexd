@@ -2,8 +2,8 @@
   "feature_id": "PXD-0010",
   "title": "C003: Implement integrity verification",
   "slug": "c003-implement-integrity-verification",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Ensure integrity of the plexd binary itself and any custom hook scripts via SHA-256 checksum verification. Verify checksums on startup, after updates, and before executing hook scripts. Report integrity violations to the control plane.",
   "stories": [
@@ -436,13 +436,13 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/integrity/config.go — Define Config struct with Enabled bool, BinaryPath string, HooksDir string, and VerifyInterval time.Duration. Implement ApplyDefaults() (Enabled=true, VerifyInterval=5m on zero-valued Config) and Validate() (reject VerifyInterval<30s when enabled, pass when disabled). Follow the same Config pattern as internal/tunnel/config.go and internal/policy/config.go. Include tests in config_test.go for: defaults applied, validation errors, disabled passes, custom values respected. (REQ-008)",
-    "1.2 Create internal/integrity/checker.go — Define CheckResult struct (Path, Expected, Actual string, OK bool). Implement HashFile(path string) (string, error) that opens the file, streams its content into crypto/sha256 via io.Copy, and returns the hex-encoded digest. Implement VerifyFile(path string, expectedChecksum string) (CheckResult, error) that calls HashFile and compares the result against expectedChecksum. If expectedChecksum is empty and the file is a hook (indicated by a requireChecksum bool parameter), return an error. Include comprehensive tests in checker_test.go for: correct SHA-256 computation, matching checksums, mismatched checksums, file not found, empty file, empty expected for hooks. (REQ-001, REQ-003, REQ-010)",
-    "1.3 Create internal/integrity/store.go — Define Store struct with dataDir string, checksums map[string]string protected by sync.RWMutex. Implement NewStore(dataDir string) (*Store, error) that loads existing checksums.json or creates empty map. Implement Get(path string) string, Set(path string, checksum string) error (persists via fsutil.WriteFileAtomic), and Remove(path string) error. Include tests in store_test.go for: set+get, get missing, remove, persist+reload from disk, missing file on first run, concurrent access under -race. (REQ-006)",
-    "1.4 Add API types to internal/api/types.go — Add IntegrityViolationReport struct (Type string, Path string, ExpectedChecksum string, ActualChecksum string, Detail string, Timestamp time.Time). Add ReportIntegrityViolation endpoint method to internal/api/endpoints.go (POST /v1/nodes/{node_id}/integrity/violations). Include tests for the new type in types_test.go and endpoint in endpoints_test.go. (REQ-005)",
-    "2.1 Create internal/integrity/verifier.go — Define ViolationReporter interface (ReportViolation(ctx, nodeID string, report api.IntegrityViolationReport) error). Define Verifier struct wrapping Config, Checker funcs (HashFile, VerifyFile), Store, ViolationReporter, logger, and sync.Mutex-protected binaryChecksum string. Implement VerifyBinary(ctx, nodeID string) error: compute binary hash, compare against Store baseline; on first run store baseline; on mismatch report violation. Implement VerifyHook(ctx, nodeID, hookPath, expectedChecksum string) (bool, error): verify hook and report violation on mismatch. Implement BinaryChecksum() string (thread-safe getter). Implement Run(ctx, nodeID string) error: startup binary verification then periodic loop at VerifyInterval. When disabled, Run returns immediately. Include tests in verifier_test.go. (REQ-002, REQ-003, REQ-004, REQ-007, REQ-009, REQ-011)",
-    "3.1 Create internal/integrity/verifier_integration_test.go — Integration tests with real files on disk, real Store, and mock ViolationReporter. Tests: full lifecycle (startup → periodic → tamper → violation), hook verification lifecycle, concurrent verification under -race, context cancellation with no goroutine leaks (goleak). (REQ-001 through REQ-007, REQ-010, REQ-011)",
-    "4.1 Create docs/reference/backend/integrity-verification.md — Reference documentation for internal/integrity/ package: Config struct, CheckResult struct, HashFile/VerifyFile functions, Store (Get/Set/Remove/persistence), Verifier (VerifyBinary/VerifyHook/BinaryChecksum/Run), ViolationReporter interface. Include data flow diagram: startup → HashFile(binary) → compare baseline → report violation → periodic loop → re-verify. Reference integration with internal/api (IntegrityViolationReport, HeartbeatRequest.BinaryChecksum), internal/fsutil (atomic writes), internal/registration (BinaryPath from os.Executable). (REQ-001 through REQ-011)"
+    "[done] 1.1 Create internal/integrity/config.go — Define Config struct with Enabled bool, BinaryPath string, HooksDir string, and VerifyInterval time.Duration. Implement ApplyDefaults() (Enabled=true, VerifyInterval=5m on zero-valued Config) and Validate() (reject VerifyInterval<30s when enabled, pass when disabled). Follow the same Config pattern as internal/tunnel/config.go and internal/policy/config.go. Include tests in config_test.go for: defaults applied, validation errors, disabled passes, custom values respected. (REQ-008)",
+    "[done] 1.2 Create internal/integrity/checker.go — Define CheckResult struct (Path, Expected, Actual string, OK bool). Implement HashFile(path string) (string, error) that opens the file, streams its content into crypto/sha256 via io.Copy, and returns the hex-encoded digest. Implement VerifyFile(path string, expectedChecksum string) (CheckResult, error) that calls HashFile and compares the result against expectedChecksum. If expectedChecksum is empty and the file is a hook (indicated by a requireChecksum bool parameter), return an error. Include comprehensive tests in checker_test.go for: correct SHA-256 computation, matching checksums, mismatched checksums, file not found, empty file, empty expected for hooks. (REQ-001, REQ-003, REQ-010)",
+    "[done] 1.3 Create internal/integrity/store.go — Define Store struct with dataDir string, checksums map[string]string protected by sync.RWMutex. Implement NewStore(dataDir string) (*Store, error) that loads existing checksums.json or creates empty map. Implement Get(path string) string, Set(path string, checksum string) error (persists via fsutil.WriteFileAtomic), and Remove(path string) error. Include tests in store_test.go for: set+get, get missing, remove, persist+reload from disk, missing file on first run, concurrent access under -race. (REQ-006)",
+    "[done] 1.4 Add API types to internal/api/types.go — Add IntegrityViolationReport struct (Type string, Path string, ExpectedChecksum string, ActualChecksum string, Detail string, Timestamp time.Time). Add ReportIntegrityViolation endpoint method to internal/api/endpoints.go (POST /v1/nodes/{node_id}/integrity/violations). Include tests for the new type in types_test.go and endpoint in endpoints_test.go. (REQ-005)",
+    "[done] 2.1 Create internal/integrity/verifier.go — Define ViolationReporter interface (ReportViolation(ctx, nodeID string, report api.IntegrityViolationReport) error). Define Verifier struct wrapping Config, Checker funcs (HashFile, VerifyFile), Store, ViolationReporter, logger, and sync.Mutex-protected binaryChecksum string. Implement VerifyBinary(ctx, nodeID string) error: compute binary hash, compare against Store baseline; on first run store baseline; on mismatch report violation. Implement VerifyHook(ctx, nodeID, hookPath, expectedChecksum string) (bool, error): verify hook and report violation on mismatch. Implement BinaryChecksum() string (thread-safe getter). Implement Run(ctx, nodeID string) error: startup binary verification then periodic loop at VerifyInterval. When disabled, Run returns immediately. Include tests in verifier_test.go. (REQ-002, REQ-003, REQ-004, REQ-007, REQ-009, REQ-011)",
+    "[done] 3.1 Create internal/integrity/verifier_integration_test.go — Integration tests with real files on disk, real Store, and mock ViolationReporter. Tests: full lifecycle (startup → periodic → tamper → violation), hook verification lifecycle, concurrent verification under -race, context cancellation with no goroutine leaks (goleak). (REQ-001 through REQ-007, REQ-010, REQ-011)",
+    "[done] 4.1 Create docs/reference/backend/integrity-verification.md — Reference documentation for internal/integrity/ package: Config struct, CheckResult struct, HashFile/VerifyFile functions, Store (Get/Set/Remove/persistence), Verifier (VerifyBinary/VerifyHook/BinaryChecksum/Run), ViolationReporter interface. Include data flow diagram: startup → HashFile(binary) → compare baseline → report violation → periodic loop → re-verify. Reference integration with internal/api (IntegrityViolationReport, HeartbeatRequest.BinaryChecksum), internal/fsutil (atomic writes), internal/registration (BinaryPath from os.Executable). (REQ-001 through REQ-011)"
   ],
   "test_specifications": [
     {
@@ -676,6 +676,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T16:31:06.919800"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T16:52:34.335588"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T17:18:30.343309"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T17:18:30.358675"
     }
   },
   "execution_history": [
@@ -689,6 +701,56 @@
           "name": "prepare",
           "duration": 288.9902186393738,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "5eff653c-8d0f-40d5-a579-d5f8ce4a8281",
+      "timestamp": "2026-02-12T17:13:26.556196",
+      "total_duration": 1129.5484566688538,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 268.0274074077606,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (1 tasks)",
+          "duration": 253.48167395591736,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 104.73001599311829,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (1 tasks)",
+          "duration": 89.47530245780945,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0010] Code Review",
+          "duration": 239.54377388954163,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0010] Improvements",
+          "duration": 98.69678020477295,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0010] Simplify",
+          "duration": 75.59350275993347,
+          "type": "simplify",
           "status": "done"
         }
       ]

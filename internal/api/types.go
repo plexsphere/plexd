@@ -320,3 +320,17 @@ type TunnelClosedRequest struct {
 	Duration  string    `json:"duration"`
 	Timestamp time.Time `json:"timestamp"`
 }
+
+// ---------------------------------------------------------------------------
+// Integrity  POST /v1/nodes/{node_id}/integrity/violations
+// ---------------------------------------------------------------------------
+
+// IntegrityViolationReport is sent when a file integrity check fails.
+type IntegrityViolationReport struct {
+	Type             string    `json:"type"`
+	Path             string    `json:"path"`
+	ExpectedChecksum string    `json:"expected_checksum"`
+	ActualChecksum   string    `json:"actual_checksum"`
+	Detail           string    `json:"detail"`
+	Timestamp        time.Time `json:"timestamp"`
+}

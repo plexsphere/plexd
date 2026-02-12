@@ -193,3 +193,10 @@ func (c *ControlPlane) TunnelClosed(ctx context.Context, nodeID, sessionID strin
 	path := fmt.Sprintf("/v1/nodes/%s/tunnels/%s/closed", url.PathEscape(nodeID), url.PathEscape(sessionID))
 	return c.doRequest(ctx, http.MethodPost, path, req, nil)
 }
+
+// ReportIntegrityViolation reports a file integrity violation to the control plane.
+// POST /v1/nodes/{node_id}/integrity/violations
+func (c *ControlPlane) ReportIntegrityViolation(ctx context.Context, nodeID string, req IntegrityViolationReport) error {
+	path := fmt.Sprintf("/v1/nodes/%s/integrity/violations", url.PathEscape(nodeID))
+	return c.doRequest(ctx, http.MethodPost, path, req, nil)
+}

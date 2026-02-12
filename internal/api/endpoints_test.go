@@ -702,3 +702,45 @@ func TestFetchSecret_PathParametersEscaped(t *testing.T) {
 		t.Errorf("path contains unescaped slashes in parameters: %s", gotPath)
 	}
 }
+
+func TestReportIntegrityViolation_Success(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/nodes/n1/integrity/violations" {
+			t.Errorf("path = %s, want /v1/nodes/n1/integrity/violations", r.URL.Path)
+		}
+
+		var req IntegrityViolationReport
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.Type != "binary" {
+			t.Errorf("Type = %q, want %q", req.Type, "binary")
+		}
+		if req.Path != "/usr/local/bin/plexd" {
+			t.Errorf("Path = %q, want %q", req.Path, "/usr/local/bin/plexd")
+		}
+		if req.ExpectedChecksum != "abc123" {
+			t.Errorf("ExpectedChecksum = %q, want %q", req.ExpectedChecksum, "abc123")
+		}
+		if req.ActualChecksum != "def456" {
+			t.Errorf("ActualChecksum = %q, want %q", req.ActualChecksum, "def456")
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	err := client.ReportIntegrityViolation(context.Background(), "n1", IntegrityViolationReport{
+		Type:             "binary",
+		Path:             "/usr/local/bin/plexd",
+		ExpectedChecksum: "abc123",
+		ActualChecksum:   "def456",
+		Detail:           "binary checksum mismatch",
+		Timestamp:        time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("ReportIntegrityViolation: %v", err)
+	}
+}
