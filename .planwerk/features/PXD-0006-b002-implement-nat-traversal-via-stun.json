@@ -1,0 +1,639 @@
+{
+  "feature_id": "PXD-0006",
+  "title": "B002: Implement NAT traversal via STUN",
+  "slug": "b002-implement-nat-traversal-via-stun",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Discover the node's public endpoint using STUN servers. Determine NAT type and public IP:port mapping so peers behind NAT can establish direct connections. Report discovered endpoints to the control plane for distribution to peers.",
+  "stories": [
+    {
+      "title": "plexd discovers its public endpoint via STUN",
+      "role": "plexd agent",
+      "want": "to send STUN binding requests to configured STUN servers and parse the response to determine my public IP:port mapping",
+      "so_that": "the node knows its externally reachable endpoint for direct peer-to-peer WireGuard connectivity",
+      "criteria": [
+        "A STUN binding request is sent to the first reachable STUN server from the configured list (default: stun.l.google.com:19302, stun.cloudflare.com:3478)",
+        "The XOR-MAPPED-ADDRESS attribute is parsed from the STUN binding response to extract the public IP and port",
+        "If the first STUN server is unreachable, subsequent servers in the list are tried in order",
+        "If all STUN servers fail, a descriptive error is returned without crashing the agent",
+        "The STUN transaction uses the WireGuard listen port as the local UDP source port so the NAT mapping matches WireGuard traffic",
+        "STUN requests have a configurable timeout (default 5s per server) and use the RFC 5389 transaction ID for response matching",
+        "All STUN operations go through a STUNClient interface for testability"
+      ]
+    },
+    {
+      "title": "plexd determines the NAT type",
+      "role": "plexd agent",
+      "want": "to classify the NAT behavior (full_cone, restricted_cone, port_restricted, symmetric, or none) by performing multiple STUN binding requests",
+      "so_that": "the control plane can determine whether peers can establish direct connections or need relay fallback",
+      "criteria": [
+        "NAT type classification performs binding requests to at least two different STUN server addresses to detect symmetric NAT (different mapped addresses for different destinations)",
+        "If the public endpoint matches the local address, NAT type is classified as 'none' (public/no NAT)",
+        "If the mapped address is the same across different STUN servers, NAT is classified as 'full_cone' (or 'restricted_cone' / 'port_restricted' — simplified to 'full_cone' for this feature since the distinction requires additional probes not covered in scope)",
+        "If the mapped address differs between STUN servers, NAT is classified as 'symmetric'",
+        "NAT type classification errors are logged but do not prevent endpoint reporting (endpoint is still reported with type 'unknown')"
+      ]
+    },
+    {
+      "title": "plexd reports discovered endpoint to the control plane",
+      "role": "plexd agent",
+      "want": "to call PUT /v1/nodes/{node_id}/endpoint with the discovered public endpoint and NAT type, and receive peer endpoints in response",
+      "so_that": "the control plane distributes my endpoint to peers and I receive their discovered endpoints for direct connectivity",
+      "criteria": [
+        "After STUN discovery, the endpoint is reported via api.ControlPlane.ReportEndpoint with EndpointReport{PublicEndpoint: 'ip:port', NATType: 'full_cone|symmetric|none|unknown'}",
+        "The EndpointResponse containing PeerEndpoints is processed: each peer's WireGuard endpoint is updated via wireguard.Manager.UpdatePeer",
+        "If ReportEndpoint fails with a transient error (5xx, network), the error is logged and the next refresh cycle retries",
+        "If ReportEndpoint fails with 401, endpoint reporting stops and relies on the SSE manager's re-auth handling",
+        "Peer endpoints with empty endpoint strings are skipped (peer has not yet discovered its endpoint)"
+      ]
+    },
+    {
+      "title": "plexd periodically refreshes the STUN endpoint",
+      "role": "plexd agent",
+      "want": "to re-discover the public endpoint at nat_traversal.refresh_interval (default 60s) and report changes to the control plane",
+      "so_that": "NAT rebinding, IP changes, and dynamic port allocations are detected and peers are updated promptly",
+      "criteria": [
+        "A refresh loop runs at nat_traversal.refresh_interval, re-running STUN discovery and reporting the result",
+        "If the discovered endpoint has not changed since the last report, the report is still sent (the control plane uses it as a liveness signal and may return updated peer endpoints)",
+        "The refresh loop respects context cancellation for graceful shutdown",
+        "If STUN discovery fails during a refresh, the error is logged at warn level and the previous endpoint remains in effect until the next successful discovery",
+        "The refresh loop starts only after the initial STUN discovery succeeds"
+      ]
+    },
+    {
+      "title": "plexd handles peer_endpoint_changed SSE events for real-time endpoint updates",
+      "role": "plexd agent",
+      "want": "to receive peer_endpoint_changed SSE events and update the corresponding WireGuard peer endpoint immediately",
+      "so_that": "peers behind NAT that discover or change their endpoint are reachable without waiting for the next refresh cycle",
+      "criteria": [
+        "The existing wireguard.HandlePeerEndpointChanged SSE handler (from B001) already processes peer_endpoint_changed events and updates WireGuard peers via Manager.UpdatePeer",
+        "No new SSE handler is needed — this story confirms the existing handler is sufficient for the NAT traversal flow",
+        "The NAT discovery module does NOT register its own SSE handler; it relies on the wireguard handler for inbound endpoint updates"
+      ]
+    },
+    {
+      "title": "Platform operator can configure NAT traversal parameters",
+      "role": "platform operator",
+      "want": "to configure STUN server addresses, refresh interval, and enable/disable NAT traversal via the agent configuration",
+      "so_that": "NAT traversal can be customized for different network environments or disabled for nodes with public IPs",
+      "criteria": [
+        "Config struct defines: Enabled bool (default true), STUNServers []string (default [stun.l.google.com:19302, stun.cloudflare.com:3478]), RefreshInterval time.Duration (default 60s), Timeout time.Duration (default 5s per STUN server)",
+        "Config.Validate rejects empty STUNServers when Enabled is true",
+        "Config.Validate rejects RefreshInterval < 10s (prevents excessive STUN traffic)",
+        "Config.Validate rejects Timeout <= 0",
+        "Config follows the existing pattern: ApplyDefaults() + Validate()"
+      ]
+    },
+    {
+      "title": "plexd includes NAT info in heartbeat payloads",
+      "role": "plexd agent",
+      "want": "to include the most recently discovered public endpoint and NAT type in the heartbeat payload's nat field",
+      "so_that": "the control plane has up-to-date NAT information for monitoring and peer coordination even outside the endpoint reporting cycle",
+      "criteria": [
+        "The Discoverer exposes a method to return the last discovered result (public endpoint and NAT type) as an api.NATInfo struct",
+        "The heartbeat caller (not part of this feature's code — exists in future agent lifecycle) can call this method to populate HeartbeatRequest.NAT",
+        "If no STUN discovery has succeeded yet, the method returns nil (omitting the NAT field from the heartbeat)",
+        "The result is read-protected with a sync.RWMutex for concurrent access safety"
+      ]
+    },
+    {
+      "title": "STUN discovery errors do not crash the agent",
+      "role": "platform operator",
+      "want": "STUN failures to be handled gracefully with logging and retries rather than panics or unrecoverable states",
+      "so_that": "plexd remains operational even when STUN servers are unreachable or the network blocks UDP",
+      "criteria": [
+        "Network errors during STUN binding are logged at warn level and the next STUN server is tried",
+        "If all STUN servers fail, the error is logged and the refresh loop retries on the next interval",
+        "Malformed STUN responses are logged at error level and treated as server failure (try next server)",
+        "The STUN discovery goroutine does not panic — all errors are caught and handled",
+        "Context cancellation during a STUN request cleanly aborts the request and returns"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The nat package SHALL send STUN binding requests per RFC 5389 and parse XOR-MAPPED-ADDRESS from the response to determine the public IP:port",
+      "priority": "SHALL",
+      "rationale": "STUN is the standard protocol for NAT traversal endpoint discovery; XOR-MAPPED-ADDRESS is the primary attribute for this purpose",
+      "scenarios": [
+        {
+          "name": "Public endpoint discovered from first STUN server",
+          "when": "Discover() is called and the first STUN server responds with a valid binding response",
+          "then": "the public IP:port is extracted from XOR-MAPPED-ADDRESS",
+          "and_then": [
+            "the result includes the formatted endpoint as 'ip:port'"
+          ]
+        },
+        {
+          "name": "Fallback to second STUN server",
+          "when": "the first STUN server is unreachable but the second responds",
+          "then": "the public endpoint is extracted from the second server's response",
+          "and_then": [
+            "a warn log indicates the first server failed"
+          ]
+        },
+        {
+          "name": "All STUN servers fail",
+          "when": "no STUN server responds within the timeout",
+          "then": "a descriptive error is returned listing which servers were tried",
+          "and_then": [
+            "no endpoint is reported to the control plane"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The nat package SHALL classify the NAT type as 'full_cone', 'symmetric', 'none', or 'unknown' based on comparing mapped addresses from multiple STUN servers",
+      "priority": "SHALL",
+      "rationale": "NAT type determines whether direct P2P is feasible or relay is needed; symmetric NAT cannot maintain stable port mappings",
+      "scenarios": [
+        {
+          "name": "No NAT detected",
+          "when": "the mapped address matches the local WireGuard listen address",
+          "then": "NAT type is classified as 'none'",
+          "and_then": []
+        },
+        {
+          "name": "Full cone NAT detected",
+          "when": "the mapped address is the same across two different STUN servers",
+          "then": "NAT type is classified as 'full_cone'",
+          "and_then": []
+        },
+        {
+          "name": "Symmetric NAT detected",
+          "when": "the mapped address differs between two STUN servers",
+          "then": "NAT type is classified as 'symmetric'",
+          "and_then": []
+        },
+        {
+          "name": "Classification fails gracefully",
+          "when": "only one STUN server responds (second times out)",
+          "then": "NAT type is classified as 'unknown' and the endpoint from the first server is still returned",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The nat package SHALL use the WireGuard listen port as the local UDP source port for STUN binding requests",
+      "priority": "SHALL",
+      "rationale": "The NAT mapping must match the port used for WireGuard traffic, otherwise the discovered endpoint is useless for peer connectivity",
+      "scenarios": [
+        {
+          "name": "Source port matches WireGuard listen port",
+          "when": "a STUN binding request is sent",
+          "then": "the local UDP source port is the configured WireGuard listen port",
+          "and_then": [
+            "the NAT creates a mapping for this port that WireGuard traffic can use"
+          ]
+        },
+        {
+          "name": "Port binding conflict handled",
+          "when": "the WireGuard listen port is already bound by WireGuard",
+          "then": "SO_REUSEADDR/SO_REUSEPORT is used to share the UDP port for STUN requests",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The nat package SHALL report the discovered endpoint to the control plane via PUT /v1/nodes/{node_id}/endpoint and process the peer endpoints response",
+      "priority": "SHALL",
+      "rationale": "The control plane distributes endpoints to peers; the response contains peer endpoints for WireGuard configuration",
+      "scenarios": [
+        {
+          "name": "Endpoint reported and peer endpoints received",
+          "when": "ReportEndpoint is called after successful STUN discovery",
+          "then": "the control plane returns EndpointResponse with peer endpoints",
+          "and_then": [
+            "each peer endpoint with a non-empty endpoint string is applied to WireGuard"
+          ]
+        },
+        {
+          "name": "Transient API error retried on next cycle",
+          "when": "ReportEndpoint returns a 5xx error",
+          "then": "the error is logged at warn level",
+          "and_then": [
+            "the next refresh cycle retries the report"
+          ]
+        },
+        {
+          "name": "Peer with empty endpoint skipped",
+          "when": "EndpointResponse contains a PeerEndpoint with empty endpoint string",
+          "then": "that peer is skipped without error",
+          "and_then": [
+            "other peers with valid endpoints are still updated"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The nat package SHALL periodically refresh the STUN endpoint at nat_traversal.refresh_interval (default 60s)",
+      "priority": "SHALL",
+      "rationale": "NAT mappings expire; periodic refresh detects IP changes and keeps the control plane informed",
+      "scenarios": [
+        {
+          "name": "Refresh discovers same endpoint",
+          "when": "the refresh cycle discovers the same public endpoint",
+          "then": "the endpoint is still reported to the control plane",
+          "and_then": [
+            "updated peer endpoints from the response are applied"
+          ]
+        },
+        {
+          "name": "Refresh discovers changed endpoint",
+          "when": "the NAT rebinds and the public port changes",
+          "then": "the new endpoint is reported to the control plane",
+          "and_then": [
+            "log at info level indicates endpoint change"
+          ]
+        },
+        {
+          "name": "Refresh fails gracefully",
+          "when": "STUN discovery fails during a refresh cycle",
+          "then": "the previous endpoint remains in effect",
+          "and_then": [
+            "warn log indicates refresh failure",
+            "the next interval retries"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The nat Config SHALL define Enabled, STUNServers, RefreshInterval, and Timeout with sensible defaults and validation",
+      "priority": "SHALL",
+      "rationale": "Follows established Config pattern with ApplyDefaults/Validate; operators need to customize STUN servers and intervals",
+      "scenarios": [
+        {
+          "name": "Defaults applied",
+          "when": "Config with no fields set has ApplyDefaults called",
+          "then": "Enabled=true, STUNServers=[stun.l.google.com:19302, stun.cloudflare.com:3478], RefreshInterval=60s, Timeout=5s",
+          "and_then": []
+        },
+        {
+          "name": "Empty STUN servers rejected when enabled",
+          "when": "Enabled=true and STUNServers is empty",
+          "then": "Validate returns descriptive error",
+          "and_then": []
+        },
+        {
+          "name": "Too-low refresh interval rejected",
+          "when": "RefreshInterval < 10s",
+          "then": "Validate returns error indicating minimum is 10s",
+          "and_then": []
+        },
+        {
+          "name": "Disabled config skips validation of STUN fields",
+          "when": "Enabled=false and STUNServers is empty",
+          "then": "Validate returns nil",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "All STUN network operations SHALL go through a STUNClient interface for testability",
+      "priority": "SHALL",
+      "rationale": "STUN requires UDP network access; interface enables unit testing without real STUN servers",
+      "scenarios": [
+        {
+          "name": "Mock client in tests",
+          "when": "Discoverer uses a mock STUNClient",
+          "then": "all operations are recorded on the mock, no network calls",
+          "and_then": []
+        },
+        {
+          "name": "Real client sends UDP STUN requests",
+          "when": "production STUNClient is used",
+          "then": "RFC 5389 STUN binding requests are sent via UDP",
+          "and_then": [
+            "responses are parsed per RFC 5389"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The nat package SHALL expose the last discovered result (endpoint + NAT type) for heartbeat inclusion via a thread-safe method",
+      "priority": "SHALL",
+      "rationale": "The heartbeat payload includes NAT info; concurrent access from heartbeat and refresh goroutines requires synchronization",
+      "scenarios": [
+        {
+          "name": "Result available after discovery",
+          "when": "LastResult() is called after successful STUN discovery",
+          "then": "returns *api.NATInfo with PublicEndpoint and Type fields",
+          "and_then": []
+        },
+        {
+          "name": "No result before first discovery",
+          "when": "LastResult() is called before any STUN discovery",
+          "then": "returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Concurrent access safe",
+          "when": "LastResult() is called concurrently with a refresh cycle updating the result",
+          "then": "no data race (protected by sync.RWMutex)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The nat package SHALL support context-based cancellation for all long-running operations",
+      "priority": "SHALL",
+      "rationale": "Agent may receive SIGTERM during STUN discovery or refresh; cancellation prevents resource leaks",
+      "scenarios": [
+        {
+          "name": "Context cancelled during STUN binding",
+          "when": "context is cancelled while waiting for STUN response",
+          "then": "the UDP operation is aborted and context error returned",
+          "and_then": []
+        },
+        {
+          "name": "Context cancelled during refresh loop",
+          "when": "context is cancelled between refresh cycles",
+          "then": "the loop exits cleanly returning context error",
+          "and_then": []
+        },
+        {
+          "name": "Context cancelled during endpoint reporting",
+          "when": "context is cancelled during ReportEndpoint API call",
+          "then": "the HTTP request is cancelled via context propagation",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The nat package SHALL use structured logging with log/slog and component=nat",
+      "priority": "SHALL",
+      "rationale": "Operational consistency with existing internal packages (api, wireguard, reconcile) logging patterns",
+      "scenarios": [
+        {
+          "name": "Discovery logged",
+          "when": "STUN discovery succeeds",
+          "then": "info log with component=nat, endpoint, nat_type, stun_server",
+          "and_then": []
+        },
+        {
+          "name": "Endpoint change logged",
+          "when": "refresh discovers a different endpoint than previous",
+          "then": "info log with component=nat, old_endpoint, new_endpoint",
+          "and_then": []
+        },
+        {
+          "name": "STUN failure logged",
+          "when": "a STUN server fails to respond",
+          "then": "warn log with component=nat, stun_server, error",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/nat/config.go — Define Config struct: Enabled bool (default true), STUNServers []string (default [stun.l.google.com:19302, stun.cloudflare.com:3478]), RefreshInterval time.Duration (default 60s), Timeout time.Duration (default 5s). Implement ApplyDefaults() and Validate() matching existing Config pattern (internal/wireguard/config.go, internal/api/config.go). When Enabled=false, skip validation of STUN-specific fields. Include tests in config_test.go for: defaults, reject empty STUN servers when enabled, reject low refresh interval (<10s), reject non-positive timeout, disabled config passes with empty fields, custom values override defaults. (REQ-006)",
+    "1.2 Create internal/nat/stun.go — Define STUNClient interface: Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, error). Define MappedAddress struct: IP net.IP, Port int. Implement STUN message encoding/decoding as helper functions: buildBindingRequest(transactionID [12]byte) []byte (20-byte STUN header per RFC 5389), parseBindingResponse(data []byte, transactionID [12]byte) (MappedAddress, error) (parse XOR-MAPPED-ADDRESS attribute: type 0x0020, XOR with magic cookie 0x2112A442 and transaction ID). Define NATType string constants: NATNone='none', NATFullCone='full_cone', NATSymmetric='symmetric', NATUnknown='unknown'. Include tests in stun_test.go for: buildBindingRequest produces valid 20-byte STUN header, parseBindingResponse extracts correct IP:port from XOR-MAPPED-ADDRESS for IPv4, parseBindingResponse rejects wrong transaction ID, parseBindingResponse rejects truncated response, parseBindingResponse rejects non-success response class. (REQ-001, REQ-007)",
+    "1.3 Create internal/nat/mock_stun_test.go — Implement mockSTUNClient struct satisfying STUNClient interface for use across all test files. Records all Bind calls with arguments. Supports configurable results per server address (map[string]result). Supports configurable error returns per server. This is a test helper, not a production file. (REQ-007)",
+    "2.1 Create internal/nat/discoverer.go — Implement Discoverer struct: STUNClient, Config, *slog.Logger, localPort int, sync.RWMutex-protected lastResult *api.NATInfo. Constructor NewDiscoverer(client STUNClient, cfg Config, localPort int, logger *slog.Logger) *Discoverer. Implement Discover(ctx context.Context) (*DiscoveryResult, error): try each STUN server in order using STUNClient.Bind with localPort; on first success, save endpoint; try second server for NAT type classification; compare results — same mapped addr = full_cone, different = symmetric, matches local = none, only one server responded = unknown. Implement LastResult() *api.NATInfo (read-locked). Define DiscoveryResult struct: Endpoint string (ip:port), NATType string. Include tests in discoverer_test.go with mock STUNClient for: full_cone classification, symmetric classification, none classification, unknown on partial failure, fallback to second server on first failure, all servers fail, uses configured local port, context cancellation during STUN, LastResult before/after discovery, concurrent access with -race. (REQ-001, REQ-002, REQ-003, REQ-008, REQ-009, REQ-010)",
+    "2.2 Create internal/nat/reporter.go — Define EndpointReporter interface: ReportEndpoint(ctx context.Context, nodeID string, req api.EndpointReport) (*api.EndpointResponse, error). Define PeerUpdater interface: UpdatePeer(peer api.Peer) error. Implement reportAndApply(ctx context.Context, reporter EndpointReporter, updater PeerUpdater, nodeID string, result *DiscoveryResult, logger *slog.Logger) error: call reporter.ReportEndpoint with EndpointReport{PublicEndpoint, NATType}; iterate PeerEndpoints in response; for each with non-empty endpoint, construct api.Peer{ID: pe.PeerID, Endpoint: pe.Endpoint} and call updater.UpdatePeer; skip empty endpoints; log errors at warn level but continue processing remaining peers. Include tests in reporter_test.go with mock implementations for: successful report and peer update, skip empty peer endpoint, transient API error logged, peer update error logged but others still processed. (REQ-004)",
+    "2.3 Implement Run method on Discoverer (in discoverer.go) — Run(ctx context.Context, reporter EndpointReporter, updater PeerUpdater, nodeID string) error: perform initial Discover(); if successful, call reportAndApply(); enter ticker loop at cfg.RefreshInterval; on each tick, re-discover and report; if discovery fails, log warn and keep previous result; if endpoint changed, log info with old/new; on context cancellation, return ctx.Err(). Include tests in discoverer_test.go for: Run executes initial discovery + report, Run refreshes at interval, Run logs endpoint change, Run continues on refresh failure, Run stops on context cancellation, Run skips report when Discover fails. (REQ-004, REQ-005, REQ-009, REQ-010)",
+    "3.1 Create docs/reference/backend/nat-traversal.md — Reference documentation for internal/nat/ package: Config struct fields and defaults, STUNClient interface and MappedAddress struct, NATType constants (none, full_cone, symmetric, unknown), Discoverer lifecycle (NewDiscoverer → Discover → Run → LastResult), EndpointReporter and PeerUpdater interfaces, reportAndApply flow, STUN protocol details (RFC 5389 binding, XOR-MAPPED-ADDRESS). Include code examples for constructing a Discoverer, running discovery, and integrating with wireguard.Manager and api.ControlPlane. (REQ-001 through REQ-010)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/nat/config_test.go",
+      "test_function": "TestConfig_Defaults",
+      "story": "Platform operator can configure NAT traversal parameters",
+      "expected": "Config with no fields set uses Enabled=true, default STUN servers, RefreshInterval=60s, Timeout=5s",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/nat/config_test.go",
+      "test_function": "TestConfig_ValidateRejectsEmptySTUNServers",
+      "story": "Platform operator can configure NAT traversal parameters",
+      "expected": "Validate returns error when Enabled=true and STUNServers is empty",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/nat/config_test.go",
+      "test_function": "TestConfig_ValidateRejectsLowRefreshInterval",
+      "story": "Platform operator can configure NAT traversal parameters",
+      "expected": "Validate returns error when RefreshInterval < 10s",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/nat/config_test.go",
+      "test_function": "TestConfig_ValidateDisabledSkipsSTUNValidation",
+      "story": "Platform operator can configure NAT traversal parameters",
+      "expected": "Validate returns nil when Enabled=false even if STUNServers is empty",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/nat/stun_test.go",
+      "test_function": "TestSTUNBinding_ParsesXORMappedAddress",
+      "story": "plexd discovers its public endpoint via STUN",
+      "expected": "Valid STUN binding response with XOR-MAPPED-ADDRESS is parsed to correct IP:port",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/nat/stun_test.go",
+      "test_function": "TestSTUNBinding_FallbackToSecondServer",
+      "story": "plexd discovers its public endpoint via STUN",
+      "expected": "When first STUN server fails, second server is tried and succeeds",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/nat/stun_test.go",
+      "test_function": "TestSTUNBinding_AllServersFail",
+      "story": "plexd discovers its public endpoint via STUN",
+      "expected": "When all STUN servers fail, descriptive error returned",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/nat/stun_test.go",
+      "test_function": "TestSTUNBinding_TransactionIDMatching",
+      "story": "plexd discovers its public endpoint via STUN",
+      "expected": "STUN response with non-matching transaction ID is rejected",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/nat/stun_test.go",
+      "test_function": "TestSTUNBinding_MalformedResponseRejected",
+      "story": "STUN discovery errors do not crash the agent",
+      "expected": "Malformed STUN response bytes are logged and treated as server failure",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestDiscover_ClassifiesFullCone",
+      "story": "plexd determines the NAT type",
+      "expected": "Same mapped address from two servers classifies as full_cone",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestDiscover_ClassifiesSymmetric",
+      "story": "plexd determines the NAT type",
+      "expected": "Different mapped addresses from two servers classifies as symmetric",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestDiscover_ClassifiesNone",
+      "story": "plexd determines the NAT type",
+      "expected": "Mapped address matching local address classifies as none",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestDiscover_ClassifiesUnknownOnPartialFailure",
+      "story": "plexd determines the NAT type",
+      "expected": "When only one STUN server responds, type is unknown but endpoint is returned",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestDiscover_UsesConfiguredListenPort",
+      "story": "plexd discovers its public endpoint via STUN",
+      "expected": "STUN client is called with the WireGuard listen port as the local port",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestDiscover_ReportsEndpointToControlPlane",
+      "story": "plexd reports discovered endpoint to the control plane",
+      "expected": "After discovery, ReportEndpoint is called with correct EndpointReport",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestDiscover_AppliesPeerEndpointsFromResponse",
+      "story": "plexd reports discovered endpoint to the control plane",
+      "expected": "Peer endpoints from EndpointResponse are applied to WireGuard via Manager.UpdatePeer",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestDiscover_SkipsEmptyPeerEndpoint",
+      "story": "plexd reports discovered endpoint to the control plane",
+      "expected": "Peer endpoints with empty endpoint string are skipped",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestDiscover_TransientAPIErrorLogged",
+      "story": "plexd reports discovered endpoint to the control plane",
+      "expected": "5xx error from ReportEndpoint is logged at warn, no panic",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestRun_RefreshesAtInterval",
+      "story": "plexd periodically refreshes the STUN endpoint",
+      "expected": "Refresh loop calls Discover at configured interval",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestRun_RefreshLogsEndpointChange",
+      "story": "plexd periodically refreshes the STUN endpoint",
+      "expected": "When endpoint changes between refreshes, info log emitted with old and new",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestRun_RefreshFailureKeepsPreviousEndpoint",
+      "story": "plexd periodically refreshes the STUN endpoint",
+      "expected": "STUN failure during refresh keeps previous endpoint, logs warn",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestLastResult_BeforeDiscovery",
+      "story": "plexd includes NAT info in heartbeat payloads",
+      "expected": "LastResult() returns nil before any discovery",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestLastResult_AfterDiscovery",
+      "story": "plexd includes NAT info in heartbeat payloads",
+      "expected": "LastResult() returns NATInfo with correct endpoint and type after discovery",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestLastResult_ConcurrentAccess",
+      "story": "plexd includes NAT info in heartbeat payloads",
+      "expected": "Concurrent LastResult and Discover calls do not race (run with -race)",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestRun_ContextCancellation",
+      "story": "STUN discovery errors do not crash the agent",
+      "expected": "Context cancellation stops refresh loop cleanly, returns context error",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/nat/discoverer_test.go",
+      "test_function": "TestDiscover_ContextCancelledDuringSTUN",
+      "story": "STUN discovery errors do not crash the agent",
+      "expected": "Context cancellation during STUN request returns context error",
+      "requirement_id": "REQ-009"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-010) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "STUNClient interface is minimal: single Bind method for testability; STUN protocol details are encapsulated in helper functions",
+    "STUN message encoding/decoding correctly implements RFC 5389: 20-byte header, magic cookie 0x2112A442, XOR-MAPPED-ADDRESS parsing",
+    "NAT type classification correctly distinguishes full_cone (same mapped addr), symmetric (different mapped addrs), none (matches local), and unknown (partial failure)",
+    "Discoverer uses the WireGuard listen port as local source port for STUN requests",
+    "LastResult is thread-safe (sync.RWMutex) and tests pass with go test -race",
+    "EndpointReporter and PeerUpdater are interfaces matching api.ControlPlane.ReportEndpoint and wireguard.Manager.UpdatePeer signatures for testability",
+    "Refresh loop correctly handles: endpoint change logging, failure resilience (keeps previous), context cancellation",
+    "No external STUN library dependencies — STUN binding request/response is implemented using stdlib net and encoding/binary only",
+    "Code follows existing patterns: log/slog with component key, Config with ApplyDefaults/Validate, stdlib-only test dependencies",
+    "Reference documentation covers all public types, interfaces, methods, and integration patterns (docs/reference/backend/nat-traversal.md)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All code lives in `internal/nat/` per the README project structure (`internal/nat/ — STUN-based NAT traversal and endpoint discovery`). Files: config.go, stun.go, discoverer.go, reporter.go, and corresponding _test.go files. A mock_stun_test.go provides the test mock.\n\n2. **STUNClient interface**: This is the critical abstraction. It encapsulates the UDP STUN binding request/response round trip. The production implementation will create a UDP socket bound to the WireGuard listen port (using SO_REUSEADDR/SO_REUSEPORT), send a STUN binding request, and parse the response. However, the concrete implementation that handles real UDP sockets is NOT the focus — the interface enables unit testing with a mock. A minimal real implementation is included in stun.go but integration testing against real STUN servers is out of scope.\n\n3. **No external STUN dependencies**: STUN binding requests are trivial (20-byte header with type=0x0001, length=0x0000, magic cookie=0x2112A442, and 12-byte transaction ID). Parsing XOR-MAPPED-ADDRESS requires XOR with magic cookie and transaction ID. This is implemented with stdlib encoding/binary and net packages — no need for an external STUN library.\n\n4. **NAT type classification strategy**: The simplified classification performs binding requests to two STUN servers:\n   - If mapped address matches local address → 'none' (no NAT)\n   - If both mapped addresses are identical → 'full_cone' (consistent NAT mapping)\n   - If mapped addresses differ → 'symmetric' (per-destination mapping, P2P unlikely)\n   - If only one server responded → 'unknown' (can't classify but still report endpoint)\n   This is a simplification of full RFC 3489 NAT classification (which distinguishes restricted/port-restricted cone) but is sufficient for the control plane to decide direct vs. relay.\n\n5. **Port sharing with WireGuard**: The STUN client must send from the WireGuard listen port (default 51820) so the NAT mapping applies to WireGuard traffic. Since WireGuard already binds this port, SO_REUSEADDR/SO_REUSEPORT is needed. On Linux, this works with `net.ListenConfig{Control: func(network, address string, c syscall.RawConn) error { ... }}` to set socket options. The STUNClient interface abstracts this complexity.\n\n6. **Integration with existing packages**: The Discoverer depends on:\n   - `api.ControlPlane.ReportEndpoint` — abstracted as EndpointReporter interface\n   - `wireguard.Manager.UpdatePeer` — abstracted as PeerUpdater interface\n   - `api.NATInfo` — used for heartbeat integration (already defined in api/types.go)\n   - `api.EndpointReport` / `api.EndpointResponse` / `api.PeerEndpoint` — already defined in api/types.go\n   No new API types are needed — all wire types already exist.\n\n7. **Heartbeat integration**: The Discoverer exposes LastResult() *api.NATInfo for the heartbeat caller to include in HeartbeatRequest.NAT. This is a passive read — the heartbeat goroutine (future S003+ lifecycle code) calls it on each heartbeat cycle.\n\n8. **SSE handler reuse**: The existing wireguard.HandlePeerEndpointChanged handler (from B001) already handles peer_endpoint_changed SSE events. No new SSE handlers are needed for B002 — the NAT discovery module only produces endpoint reports; inbound endpoint updates come through the existing wireguard handler.\n\n9. **Error handling strategy**: STUN failures are non-fatal. If discovery fails, the refresh loop retries on the next interval. If endpoint reporting fails, it's retried next cycle. Individual peer endpoint update failures are logged but don't block other updates. This matches the resilience patterns in the wireguard and reconcile packages.\n\n10. **Testing strategy**: All tests use a mock STUNClient (defined in mock_stun_test.go). The mock records all calls for assertion. STUN protocol encoding/decoding is tested with crafted byte sequences. The Discoverer tests verify classification logic, fallback, and error handling. Reporter tests verify endpoint reporting and peer update application. No real STUN servers or UDP sockets are used in tests. Tests use stdlib only.\n\n11. **Key files from existing codebase**:\n    - `internal/api/types.go:58-61` — NATInfo struct (PublicEndpoint, Type) already defined for heartbeat\n    - `internal/api/types.go:270-282` — EndpointReport, EndpointResponse, PeerEndpoint already defined\n    - `internal/api/endpoints.go:91-98` — ControlPlane.ReportEndpoint already implemented\n    - `internal/wireguard/manager.go:126-144` — Manager.UpdatePeer already implemented\n    - `internal/wireguard/handler.go:136-152` — HandlePeerEndpointChanged SSE handler already implemented\n    - `internal/wireguard/config.go:24` — DefaultListenPort = 51820\n\n12. **Potential pitfalls**:\n    - STUN XOR-MAPPED-ADDRESS XOR uses magic cookie (4 bytes) + transaction ID (12 bytes) for IPv6 but only magic cookie for IPv4 port — implement both correctly\n    - The local port for STUN must match the WireGuard listen port exactly; if WireGuard is not yet started when STUN runs, the port bind may work but the mapping won't apply — the agent lifecycle should ensure WireGuard is set up before NAT discovery\n    - Transaction ID must be cryptographically random (use crypto/rand) to prevent response spoofing\n    - STUN servers may return MAPPED-ADDRESS (0x0001) instead of XOR-MAPPED-ADDRESS (0x0020) — prefer XOR-MAPPED-ADDRESS but fall back to MAPPED-ADDRESS if present\n    - The refresh ticker should be stopped on context cancellation to prevent goroutine leaks",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.106301"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T12:45:48.968127"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T12:50:55.512846"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "71bf96e8-1f4d-4ea8-b8d9-0be261c841dc",
+      "timestamp": "2026-02-12T12:50:55.512879",
+      "total_duration": 301.8233549594879,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 301.8233549594879,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
