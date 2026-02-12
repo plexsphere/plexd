@@ -76,6 +76,7 @@ type StateResponse struct {
 	SigningKeys *SigningKeys       `json:"signing_keys,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty"`
 	BridgeConfig *BridgeConfig     `json:"bridge_config,omitempty"`
+	RelayConfig  *RelayConfig      `json:"relay_config,omitempty"`
 	Data         []DataEntry       `json:"data"`
 	SecretRefs   []SecretRef       `json:"secret_refs"`
 }
@@ -350,7 +351,25 @@ type BridgeConfig struct {
 
 // BridgeInfo is the bridge status reported by the node in heartbeats.
 type BridgeInfo struct {
-	Enabled         bool   `json:"enabled"`
-	AccessInterface string `json:"access_interface"`
-	ActiveRoutes    int    `json:"active_routes"`
+	Enabled             bool   `json:"enabled"`
+	AccessInterface     string `json:"access_interface"`
+	ActiveRoutes        int    `json:"active_routes"`
+	RelayEnabled        bool   `json:"relay_enabled"`
+	ActiveRelaySessions int    `json:"active_relay_sessions"`
+}
+
+// RelayConfig is the relay configuration pushed from the control plane.
+// It contains the list of relay session assignments for this bridge node.
+type RelayConfig struct {
+	Sessions []RelaySessionAssignment `json:"sessions"`
+}
+
+// RelaySessionAssignment represents a relay session assigned by the control plane.
+type RelaySessionAssignment struct {
+	SessionID     string    `json:"session_id"`
+	PeerAID       string    `json:"peer_a_id"`
+	PeerAEndpoint string    `json:"peer_a_endpoint"`
+	PeerBID       string    `json:"peer_b_id"`
+	PeerBEndpoint string    `json:"peer_b_endpoint"`
+	ExpiresAt     time.Time `json:"expires_at"`
 }

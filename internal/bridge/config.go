@@ -3,6 +3,13 @@ package bridge
 import (
 	"fmt"
 	"net"
+	"time"
+)
+
+const (
+	DefaultRelayListenPort  = 51821
+	DefaultMaxRelaySessions = 100
+	DefaultSessionTTL       = 5 * time.Minute
 )
 
 // Config holds the configuration for bridge mode.
@@ -21,6 +28,22 @@ type Config struct {
 	// EnableNAT controls whether NAT masquerading is applied on the access-side interface.
 	// nil means use default (true); explicit false disables NAT.
 	EnableNAT *bool
+
+	// RelayEnabled controls whether the bridge node serves as a relay.
+	// Default: false. Requires Enabled=true.
+	RelayEnabled bool
+
+	// RelayListenPort is the UDP port for relay traffic.
+	// Default: 51821
+	RelayListenPort int
+
+	// MaxRelaySessions is the maximum number of concurrent relay sessions.
+	// Default: 100
+	MaxRelaySessions int
+
+	// SessionTTL is the time-to-live for relay sessions.
+	// Default: 5m. Minimum: 30s.
+	SessionTTL time.Duration
 }
 
 // BoolPtr returns a pointer to the given bool value.
@@ -37,11 +60,23 @@ func (c *Config) natEnabled() bool {
 // ApplyDefaults sets default values for zero-valued fields.
 func (c *Config) ApplyDefaults() {
 	// EnableNAT is handled via natEnabled(); nil means default true.
+	if c.RelayListenPort == 0 {
+		c.RelayListenPort = DefaultRelayListenPort
+	}
+	if c.MaxRelaySessions == 0 {
+		c.MaxRelaySessions = DefaultMaxRelaySessions
+	}
+	if c.SessionTTL == 0 {
+		c.SessionTTL = DefaultSessionTTL
+	}
 }
 
 // Validate checks that configuration values are acceptable.
 // When bridge mode is disabled, validation is skipped.
 func (c *Config) Validate() error {
+	if c.RelayEnabled && !c.Enabled {
+		return fmt.Errorf("bridge: config: relay requires bridge mode to be enabled")
+	}
 	if !c.Enabled {
 		return nil
 	}
@@ -54,6 +89,17 @@ func (c *Config) Validate() error {
 	for _, subnet := range c.AccessSubnets {
 		if _, _, err := net.ParseCIDR(subnet); err != nil {
 			return fmt.Errorf("bridge: config: invalid CIDR %q: %w", subnet, err)
+		}
+	}
+	if c.RelayEnabled {
+		if c.RelayListenPort < 1 || c.RelayListenPort > 65535 {
+			return fmt.Errorf("bridge: config: RelayListenPort must be between 1 and 65535")
+		}
+		if c.MaxRelaySessions <= 0 {
+			return fmt.Errorf("bridge: config: MaxRelaySessions must be positive when relay is enabled")
+		}
+		if c.SessionTTL < 30*time.Second {
+			return fmt.Errorf("bridge: config: SessionTTL must be at least 30s")
 		}
 	}
 	return nil

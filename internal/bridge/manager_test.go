@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"context"
 	"fmt"
 	"testing"
 )
@@ -385,6 +386,162 @@ func TestManager_BridgeCapabilities(t *testing.T) {
 	mgrDisabled := NewManager(ctrl, cfgDisabled, discardLogger())
 	if caps := mgrDisabled.BridgeCapabilities(); caps != nil {
 		t.Errorf("BridgeCapabilities should be nil when disabled, got %v", caps)
+	}
+}
+
+func TestManager_NewManager_WithRelay(t *testing.T) {
+	ctrl := &mockRouteController{}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		RelayEnabled:    true,
+	}
+	mgr := NewManager(ctrl, cfg, discardLogger())
+
+	if mgr.Relay() == nil {
+		t.Fatal("Relay() should not be nil when RelayEnabled is true")
+	}
+}
+
+func TestManager_NewManager_WithoutRelay(t *testing.T) {
+	ctrl := &mockRouteController{}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		RelayEnabled:    false,
+	}
+	mgr := NewManager(ctrl, cfg, discardLogger())
+
+	if mgr.Relay() != nil {
+		t.Fatal("Relay() should be nil when RelayEnabled is false")
+	}
+}
+
+func TestManager_StartRelay_NilRelay(t *testing.T) {
+	ctrl := &mockRouteController{}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		RelayEnabled:    false,
+	}
+	mgr := NewManager(ctrl, cfg, discardLogger())
+
+	if err := mgr.StartRelay(context.Background()); err != nil {
+		t.Fatalf("StartRelay with nil relay should return nil, got %v", err)
+	}
+}
+
+func TestManager_StopRelay_NilRelay(t *testing.T) {
+	ctrl := &mockRouteController{}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		RelayEnabled:    false,
+	}
+	mgr := NewManager(ctrl, cfg, discardLogger())
+
+	if err := mgr.StopRelay(); err != nil {
+		t.Fatalf("StopRelay with nil relay should return nil, got %v", err)
+	}
+}
+
+func TestManager_Teardown_WithRelay(t *testing.T) {
+	ctrl := &mockRouteController{}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		EnableNAT:       BoolPtr(false),
+		RelayEnabled:    true,
+	}
+	mgr := NewManager(ctrl, cfg, discardLogger())
+
+	if err := mgr.Setup("wg0"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	// DO NOT call StartRelay to avoid goroutine leaks.
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+
+	if mgr.BridgeStatus() != nil {
+		t.Error("BridgeStatus should be nil after teardown")
+	}
+}
+
+func TestManager_BridgeStatus_WithRelay(t *testing.T) {
+	ctrl := &mockRouteController{}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		EnableNAT:       BoolPtr(false),
+		RelayEnabled:    true,
+	}
+	mgr := NewManager(ctrl, cfg, discardLogger())
+
+	if err := mgr.Setup("wg0"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	info := mgr.BridgeStatus()
+	if info == nil {
+		t.Fatal("BridgeStatus should not be nil when active")
+	}
+	if !info.RelayEnabled {
+		t.Error("BridgeInfo.RelayEnabled should be true")
+	}
+	if info.ActiveRelaySessions != 0 {
+		t.Errorf("BridgeInfo.ActiveRelaySessions = %d, want 0", info.ActiveRelaySessions)
+	}
+}
+
+func TestManager_BridgeCapabilities_WithRelay(t *testing.T) {
+	ctrl := &mockRouteController{}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		RelayEnabled:    true,
+	}
+	mgr := NewManager(ctrl, cfg, discardLogger())
+
+	caps := mgr.BridgeCapabilities()
+	if caps == nil {
+		t.Fatal("BridgeCapabilities should not be nil when enabled")
+	}
+	if caps["relay"] != "true" {
+		t.Errorf("caps[relay] = %q, want %q", caps["relay"], "true")
+	}
+	if caps["relay_listen_port"] != "51821" {
+		t.Errorf("caps[relay_listen_port] = %q, want %q", caps["relay_listen_port"], "51821")
+	}
+}
+
+func TestManager_BridgeCapabilities_WithoutRelay(t *testing.T) {
+	ctrl := &mockRouteController{}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		RelayEnabled:    false,
+	}
+	mgr := NewManager(ctrl, cfg, discardLogger())
+
+	caps := mgr.BridgeCapabilities()
+	if caps == nil {
+		t.Fatal("BridgeCapabilities should not be nil when enabled")
+	}
+	if caps["relay"] != "" {
+		t.Errorf("caps[relay] = %q, want empty", caps["relay"])
+	}
+	if caps["relay_listen_port"] != "" {
+		t.Errorf("caps[relay_listen_port] = %q, want empty", caps["relay_listen_port"])
 	}
 }
 

@@ -1,0 +1,116 @@
+{
+  "feature_id": "PXD-0012",
+  "title": "D002: Implement NAT relay functionality",
+  "date": "2026-02-12",
+  "verdict": "APPROVED",
+  "summary": "Implements NAT relay functionality for bridge nodes that forward encrypted UDP traffic between peers behind symmetric NAT. The implementation adds: RelayConfig/RelaySessionAssignment API types with SSE event constants, relay config fields on bridge.Config with validation, a Relay struct managing UDP listener and relay sessions with O(1) dispatch, SSE event handlers and reconcile handler following existing patterns, Manager integration with status/capabilities reporting, comprehensive tests (unit, handler, integration, race), and reference documentation. All SHALL requirements (REQ-001 through REQ-009) are met with passing tests. Code follows established bridge package patterns precisely.",
+  "tests_checklist": [
+    {"item": "All tests pass with -race flag", "checked": true},
+    {"item": "go vet passes", "checked": true},
+    {"item": "Build succeeds", "checked": true},
+    {"item": "Config validation edge cases covered (port range, max sessions, TTL minimum, relay-without-bridge)", "checked": true},
+    {"item": "Relay session lifecycle tested (add, duplicate, max reached, remove, stop)", "checked": true},
+    {"item": "UDP forwarding tested bidirectionally (A→B, B→A)", "checked": true},
+    {"item": "Unknown source packets dropped (tested)", "checked": true},
+    {"item": "Session TTL expiry tested", "checked": true},
+    {"item": "Idempotent Close/Stop tested", "checked": true},
+    {"item": "SSE handlers tested (valid, malformed, duplicate, non-existent)", "checked": true},
+    {"item": "Reconcile handler tested (nil config, add missing, remove stale, mixed)", "checked": true},
+    {"item": "Integration: full flow with real UDP sockets", "checked": true},
+    {"item": "Integration: reconciler session sync with state transitions", "checked": true},
+    {"item": "Integration: concurrent operations with -race", "checked": true},
+    {"item": "API types JSON round-trip with snake_case verification", "checked": true},
+    {"item": "Manager relay integration tested (create, start/stop nil, teardown, status, capabilities)", "checked": true},
+    {"item": "goleak.VerifyTestMain configured for goroutine leak detection", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing bridge package patterns (Config/ApplyDefaults/Validate, Manager integration)", "checked": true},
+    {"item": "SSE handlers follow tunnel.HandleSSHSessionSetup/HandleSessionRevoked pattern", "checked": true},
+    {"item": "RelayReconcileHandler follows bridge.ReconcileHandler closure pattern", "checked": true},
+    {"item": "Uses log/slog with component=bridge key consistently", "checked": true},
+    {"item": "Functions are focused and small (single responsibility)", "checked": true},
+    {"item": "Named constants used (DefaultRelayListenPort, DefaultMaxRelaySessions, DefaultSessionTTL, relayBufSize)", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "stdlib-only test dependencies (no testify)", "checked": true},
+    {"item": "Reuses existing test infrastructure (discardLogger, integrationStateFetcher, waitForCondition, mockRouteController)", "checked": true},
+    {"item": "API types use json tags with snake_case and omitempty for pointer fields", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "Max session limit enforced in AddSession", "checked": true},
+    {"item": "Duplicate session ID rejected", "checked": true},
+    {"item": "Unknown source addresses dropped", "checked": true},
+    {"item": "TTL-based session expiry prevents orphaned sessions", "checked": true},
+    {"item": "Config validation enforces valid port range and minimum TTL", "checked": true},
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "Sensitive data not exposed in logs (only session IDs and addresses)", "checked": true},
+    {"item": "Session data from control plane (signed SSE envelopes)", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Relay is an extension of bridge mode (same package, Config integration)", "checked": true},
+    {"item": "Single shared UDP socket with O(1) dispatch via addrIndex map", "checked": true},
+    {"item": "Pre-allocated 64KB read buffer (relayBufSize=65535)", "checked": true},
+    {"item": "Context-based cancellation for dispatch loop", "checked": true},
+    {"item": "Clean separation: relay.go (core), relay_handler.go (SSE/reconcile), manager.go (integration)", "checked": true},
+    {"item": "No circular dependencies (only imports api and reconcile packages)", "checked": true},
+    {"item": "Idempotent Stop/Close following established teardown patterns", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code", "checked": true},
+    {"item": "No speculative features beyond requirements", "checked": true},
+    {"item": "Minimal API surface (only required public methods)", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config.Validate catches invalid config before relay creation", "checked": true},
+    {"item": "AddSession validates endpoints via net.ResolveUDPAddr before creating session", "checked": true},
+    {"item": "Duplicate session and max session checks are early returns", "checked": true},
+    {"item": "SSE handlers return errors on parse failure", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Nil relay checks in Manager methods (StartRelay, StopRelay, Teardown, BridgeStatus)", "checked": true},
+    {"item": "Nil desired/RelayConfig checks in reconcile handler", "checked": true},
+    {"item": "Closed session check in Forward prevents writing to closed socket", "checked": true},
+    {"item": "RemoveSession is no-op for non-existent sessions", "checked": true},
+    {"item": "TTL timers stopped on session removal (prevents double-removal race)", "checked": true}
+  ],
+  "security_findings": [
+    {
+      "severity": "LOW",
+      "description": "AddSession does not validate that SessionID is non-empty or that PeerAEndpoint != PeerBEndpoint. An empty SessionID would create an entry keyed by empty string; identical endpoints would create a self-forwarding loop. In practice, these values come from the trusted control plane via signed envelopes, making exploitation unlikely.",
+      "location": "internal/bridge/relay.go:162-180",
+      "fix": "Add guard: if assignment.SessionID == \"\" return error; if peerA.String() == peerB.String() return error"
+    },
+    {
+      "severity": "LOW",
+      "description": "dispatchLoop allocates a new byte slice per packet (line 143) before checking if the source address has a registered session (line 147). Moving the session lookup before the allocation would avoid allocation for unregistered sources. This is a minor optimization, not a security risk in a trusted bridge environment.",
+      "location": "internal/bridge/relay.go:143-155",
+      "fix": "Move RLock/addrIndex lookup before make([]byte, n); only allocate if session exists"
+    }
+  ],
+  "architecture_findings": [
+    {
+      "severity": "MINOR",
+      "description": "UpdateSession method was specified in plan task 1.3 (for NAT rebinding endpoint changes) but not implemented. REQ-010 (SHOULD priority) describes this capability. The system works without it since reconciliation can remove and re-add sessions with updated endpoints. However, this is less efficient than in-place endpoint updates.",
+      "location": "internal/bridge/relay.go",
+      "recommendation": "Acceptable for initial implementation. UpdateSession can be added when REQ-010 is promoted to SHALL or when performance profiling shows remove+add churn is a bottleneck."
+    },
+    {
+      "severity": "MINOR",
+      "description": "StartRelay logs 'relay started' at manager.go:209 even though Relay.Start already logs 'relay started' at relay.go:119-121. This produces duplicate log entries for the same event.",
+      "location": "internal/bridge/manager.go:209",
+      "recommendation": "Remove the duplicate log in Manager.StartRelay since Relay.Start already handles it."
+    }
+  ],
+  "issues_found": [],
+  "suggested_improvements": [
+    "Add empty SessionID and same-endpoint validation in AddSession (defensive, LOW priority)",
+    "Move session lookup before byte slice allocation in dispatchLoop for minor GC optimization",
+    "Remove duplicate 'relay started' log in Manager.StartRelay (already logged by Relay.Start)",
+    "Consider adding invalid endpoint format tests (e.g., malformed host:port) to relay_test.go for additional edge case coverage",
+    "Add boundary port tests in config_test.go (port 1, 65535, 65536) for completeness"
+  ],
+  "next_steps": [
+    "Merge: implementation is complete and approved",
+    "Future: implement UpdateSession (REQ-010 SHOULD) when NAT rebinding is observed in production",
+    "Future: integrate relay fallback logic in mesh node endpoint exchange (client-side counterpart)"
+  ]
+}

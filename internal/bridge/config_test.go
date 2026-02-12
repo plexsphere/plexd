@@ -3,6 +3,7 @@ package bridge
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestConfig_ApplyDefaults(t *testing.T) {
@@ -107,5 +108,179 @@ func TestConfig_Validate_ValidConfig(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate should return nil for valid config, got: %v", err)
+	}
+}
+
+func TestConfig_ApplyDefaults_RelayFields(t *testing.T) {
+	var cfg Config
+	cfg.ApplyDefaults()
+
+	if cfg.RelayEnabled {
+		t.Error("RelayEnabled should default to false")
+	}
+	if cfg.RelayListenPort != DefaultRelayListenPort {
+		t.Errorf("RelayListenPort = %d, want %d", cfg.RelayListenPort, DefaultRelayListenPort)
+	}
+	if cfg.MaxRelaySessions != DefaultMaxRelaySessions {
+		t.Errorf("MaxRelaySessions = %d, want %d", cfg.MaxRelaySessions, DefaultMaxRelaySessions)
+	}
+	if cfg.SessionTTL != DefaultSessionTTL {
+		t.Errorf("SessionTTL = %v, want %v", cfg.SessionTTL, DefaultSessionTTL)
+	}
+}
+
+func TestConfig_Validate_RelayDisabled(t *testing.T) {
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		RelayEnabled:    false,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate should return nil when relay is disabled, got: %v", err)
+	}
+}
+
+func TestConfig_Validate_RelayWithoutBridge(t *testing.T) {
+	cfg := Config{
+		Enabled:      false,
+		RelayEnabled: true,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate should return error when relay enabled without bridge")
+	}
+	want := "bridge: config: relay requires bridge mode to be enabled"
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+func TestConfig_Validate_RelayBoundaryPorts(t *testing.T) {
+	tests := []struct {
+		name    string
+		port    int
+		wantErr bool
+	}{
+		{"port 1 (min valid)", 1, false},
+		{"port 65535 (max valid)", 65535, false},
+		{"port 65536 (just over max)", 65536, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:          true,
+				AccessInterface:  "eth1",
+				AccessSubnets:    []string{"10.0.0.0/24"},
+				RelayEnabled:     true,
+				RelayListenPort:  tt.port,
+				MaxRelaySessions: 100,
+				SessionTTL:       5 * time.Minute,
+			}
+			err := cfg.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatal("Validate should return error for out-of-range port")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("Validate should return nil for valid port %d, got: %v", tt.port, err)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_RelayInvalidPort(t *testing.T) {
+	tests := []struct {
+		name string
+		port int
+	}{
+		{"port zero", 0},
+		{"port too high", 70000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:          true,
+				AccessInterface:  "eth1",
+				AccessSubnets:    []string{"10.0.0.0/24"},
+				RelayEnabled:     true,
+				RelayListenPort:  tt.port,
+				MaxRelaySessions: 100,
+				SessionTTL:       5 * time.Minute,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate should return error for invalid port")
+			}
+			want := "bridge: config: RelayListenPort must be between 1 and 65535"
+			if err.Error() != want {
+				t.Errorf("got %q, want %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_RelayInvalidMaxSessions(t *testing.T) {
+	tests := []struct {
+		name        string
+		maxSessions int
+	}{
+		{"zero sessions", 0},
+		{"negative sessions", -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:          true,
+				AccessInterface:  "eth1",
+				AccessSubnets:    []string{"10.0.0.0/24"},
+				RelayEnabled:     true,
+				RelayListenPort:  51821,
+				MaxRelaySessions: tt.maxSessions,
+				SessionTTL:       5 * time.Minute,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate should return error for invalid MaxRelaySessions")
+			}
+			want := "bridge: config: MaxRelaySessions must be positive when relay is enabled"
+			if err.Error() != want {
+				t.Errorf("got %q, want %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_RelayInvalidSessionTTL(t *testing.T) {
+	cfg := Config{
+		Enabled:          true,
+		AccessInterface:  "eth1",
+		AccessSubnets:    []string{"10.0.0.0/24"},
+		RelayEnabled:     true,
+		RelayListenPort:  51821,
+		MaxRelaySessions: 100,
+		SessionTTL:       10 * time.Second,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate should return error for SessionTTL below 30s")
+	}
+	want := "bridge: config: SessionTTL must be at least 30s"
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+func TestConfig_Validate_RelayValidConfig(t *testing.T) {
+	cfg := Config{
+		Enabled:          true,
+		AccessInterface:  "eth1",
+		AccessSubnets:    []string{"10.0.0.0/24"},
+		RelayEnabled:     true,
+		RelayListenPort:  51821,
+		MaxRelaySessions: 100,
+		SessionTTL:       5 * time.Minute,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate should return nil for valid relay config, got: %v", err)
 	}
 }

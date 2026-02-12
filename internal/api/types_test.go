@@ -403,6 +403,141 @@ func TestHeartbeatRequest_WithBridge(t *testing.T) {
 	}
 }
 
+func TestRelayConfig_JSONRoundTrip(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := RelayConfig{
+		Sessions: []RelaySessionAssignment{
+			{
+				SessionID:     "relay-001",
+				PeerAID:       "n-001",
+				PeerAEndpoint: "1.2.3.4:51820",
+				PeerBID:       "n-002",
+				PeerBEndpoint: "5.6.7.8:51820",
+				ExpiresAt:     now.Add(1 * time.Hour),
+			},
+			{
+				SessionID:     "relay-002",
+				PeerAID:       "n-003",
+				PeerAEndpoint: "9.10.11.12:51820",
+				PeerBID:       "n-004",
+				PeerBEndpoint: "13.14.15.16:51820",
+				ExpiresAt:     now.Add(2 * time.Hour),
+			},
+		},
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case key.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["sessions"]; !ok {
+		t.Errorf("expected JSON key %q", "sessions")
+	}
+}
+
+func TestRelaySessionAssignment_JSONRoundTrip(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := RelaySessionAssignment{
+		SessionID:     "relay-001",
+		PeerAID:       "n-001",
+		PeerAEndpoint: "1.2.3.4:51820",
+		PeerBID:       "n-002",
+		PeerBEndpoint: "5.6.7.8:51820",
+		ExpiresAt:     now.Add(1 * time.Hour),
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"session_id", "peer_a_id", "peer_a_endpoint", "peer_b_id", "peer_b_endpoint", "expires_at"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestBridgeInfo_RelayFields_JSONRoundTrip(t *testing.T) {
+	orig := BridgeInfo{
+		Enabled:             true,
+		AccessInterface:     "eth1",
+		ActiveRoutes:        5,
+		RelayEnabled:        true,
+		ActiveRelaySessions: 3,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify relay-specific snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"relay_enabled", "active_relay_sessions"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestStateResponse_WithRelayConfig(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := StateResponse{
+		Peers:    []Peer{{ID: "n-002", PublicKey: "pk", MeshIP: "10.42.0.2", Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.42.0.2/32"}, PSK: "psk"}},
+		Policies: []Policy{},
+		RelayConfig: &RelayConfig{
+			Sessions: []RelaySessionAssignment{
+				{
+					SessionID:     "relay-001",
+					PeerAID:       "n-001",
+					PeerAEndpoint: "1.2.3.4:51820",
+					PeerBID:       "n-002",
+					PeerBEndpoint: "5.6.7.8:51820",
+					ExpiresAt:     now.Add(1 * time.Hour),
+				},
+			},
+		},
+		Data:       []DataEntry{{Key: "k", ContentType: "text/plain", Payload: json.RawMessage(`"v"`), Version: 1, UpdatedAt: now}},
+		SecretRefs: []SecretRef{},
+	}
+	_, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// RelayConfig field should be omitted when nil.
+	orig.RelayConfig = nil
+	data, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data); contains(s, `"relay_config"`) {
+		t.Errorf("relay_config should be omitted when nil, got: %s", s)
+	}
+}
+
+func TestHeartbeatRequest_WithBridgeRelay(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := HeartbeatRequest{
+		NodeID:         "n-001",
+		Timestamp:      now,
+		Status:         "healthy",
+		Uptime:         "2h30m",
+		BinaryChecksum: "sha256:abc",
+		Bridge: &BridgeInfo{
+			Enabled:             true,
+			AccessInterface:     "eth1",
+			ActiveRoutes:        3,
+			RelayEnabled:        true,
+			ActiveRelaySessions: 2,
+		},
+	}
+	_, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+}
+
 func TestStateResponse_WithBridgeConfig(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	orig := StateResponse{

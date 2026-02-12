@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,6 +15,7 @@ type Manager struct {
 	ctrl   RouteController
 	cfg    Config
 	logger *slog.Logger
+	relay  *Relay
 
 	// tracked state
 	active        bool
@@ -25,10 +27,17 @@ type Manager struct {
 // NewManager creates a new Manager. Config defaults are applied automatically.
 func NewManager(ctrl RouteController, cfg Config, logger *slog.Logger) *Manager {
 	cfg.ApplyDefaults()
+
+	var relay *Relay
+	if cfg.RelayEnabled {
+		relay = NewRelay(cfg.RelayListenPort, cfg.MaxRelaySessions, cfg.SessionTTL, logger)
+	}
+
 	return &Manager{
 		ctrl:         ctrl,
 		cfg:          cfg,
 		logger:       logger,
+		relay:        relay,
 		activeRoutes: make(map[string]struct{}),
 	}
 }
@@ -168,9 +177,41 @@ func (m *Manager) Teardown() error {
 		errs = append(errs, err)
 	}
 
+	// Stop relay if configured.
+	if m.relay != nil {
+		if err := m.relay.Stop(); err != nil {
+			m.logger.Error("bridge: teardown: stop relay failed",
+				"component", "bridge",
+				"error", err,
+			)
+			errs = append(errs, err)
+		}
+	}
+
 	m.active = false
 
 	return errors.Join(errs...)
+}
+
+// Relay returns the relay instance, or nil if relay is not configured.
+func (m *Manager) Relay() *Relay {
+	return m.relay
+}
+
+// StartRelay starts the relay UDP listener. No-op if relay is not configured.
+func (m *Manager) StartRelay(ctx context.Context) error {
+	if m.relay == nil {
+		return nil
+	}
+	return m.relay.Start(ctx)
+}
+
+// StopRelay stops the relay. No-op if relay is not configured.
+func (m *Manager) StopRelay() error {
+	if m.relay == nil {
+		return nil
+	}
+	return m.relay.Stop()
 }
 
 // UpdateRoutes computes the diff between current active routes and the desired
@@ -224,11 +265,16 @@ func (m *Manager) BridgeStatus() *api.BridgeInfo {
 	if !m.active {
 		return nil
 	}
-	return &api.BridgeInfo{
+	info := &api.BridgeInfo{
 		Enabled:         true,
 		AccessInterface: m.cfg.AccessInterface,
 		ActiveRoutes:    len(m.activeRoutes),
 	}
+	if m.relay != nil {
+		info.RelayEnabled = true
+		info.ActiveRelaySessions = m.relay.ActiveCount()
+	}
+	return info
 }
 
 // BridgeCapabilities returns bridge capability metadata for registration.
@@ -243,6 +289,10 @@ func (m *Manager) BridgeCapabilities() map[string]string {
 	}
 	for i, s := range m.cfg.AccessSubnets {
 		caps[fmt.Sprintf("access_subnet_%d", i)] = s
+	}
+	if m.cfg.RelayEnabled {
+		caps["relay"] = "true"
+		caps["relay_listen_port"] = fmt.Sprintf("%d", m.cfg.RelayListenPort)
 	}
 	return caps
 }

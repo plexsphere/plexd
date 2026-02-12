@@ -2,8 +2,8 @@
   "feature_id": "PXD-0012",
   "title": "D002: Implement NAT relay functionality",
   "slug": "d002-implement-nat-relay-functionality",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Serve as a relay for nodes that cannot establish direct P2P tunnels (e.g., both peers behind symmetric NAT). Bridge nodes forward encrypted traffic between unreachable peers. Nodes fall back to relay automatically when direct connectivity fails after STUN-based NAT traversal attempts.",
   "stories": [
@@ -427,13 +427,13 @@
     }
   ],
   "tasks": [
-    "1.1 Add RelayConfig, RelaySessionAssignment, and RelayInfo API types to internal/api/types.go — RelayConfig struct (Sessions []RelaySessionAssignment) added as *RelayConfig field on StateResponse. RelaySessionAssignment struct (SessionID string, PeerAID string, PeerAEndpoint string, PeerBID string, PeerBEndpoint string, ExpiresAt time.Time). Add RelayEnabled bool and ActiveRelaySessions int fields to BridgeInfo. Add relay_session_assigned and relay_session_revoked event constants to envelope.go. Include JSON round-trip tests in types_test.go. (REQ-004, REQ-007)",
-    "1.2 Extend internal/bridge/config.go — Add relay fields to Config: RelayEnabled bool, RelayListenPort int, MaxRelaySessions int, SessionTTL time.Duration. Add DefaultRelayListenPort=51821, DefaultMaxRelaySessions=100, DefaultSessionTTL=5m constants. Update ApplyDefaults to set relay defaults. Update Validate to check: relay requires bridge enabled, valid port 1-65535, positive MaxRelaySessions, SessionTTL >= 30s. Include tests in config_test.go. (REQ-001)",
-    "1.3 Create internal/bridge/relay.go — RelaySession struct with SessionID, PeerAAddr/PeerBAddr *net.UDPAddr, conn *net.UDPConn (shared relay socket), closed bool, mu sync.Mutex. Implement Forward(srcAddr *net.UDPAddr, data []byte) method that determines the other peer and writes to their endpoint. Implement Close() (idempotent). Relay struct with cfg Config, conn *net.UDPConn, logger *slog.Logger, sessions map[string]*RelaySession, addrIndex map[string]*RelaySession (source addr → session for O(1) lookup), active bool, mu sync.RWMutex. Implement NewRelay(cfg Config, logger *slog.Logger) *Relay. Implement Start(ctx context.Context) error (open UDP socket, start dispatchLoop goroutine). Implement dispatchLoop (read UDP, lookup session by source addr, call Forward). Implement AddSession(assignment api.RelaySessionAssignment) error (parse endpoints, create session, register in addrIndex, start TTL timer). Implement RemoveSession(sessionID string) (close session, remove from maps). Implement UpdateSession(sessionID string, peerAEndpoint, peerBEndpoint string) error. Implement Stop() error (close all sessions, close conn, idempotent). Implement ActiveCount() int. Implement SessionIDs() []string. Include tests in relay_test.go. (REQ-002, REQ-003, REQ-008, REQ-009, REQ-010)",
-    "2.1 Create internal/bridge/relay_handler.go — HandleRelaySessionAssigned(relay *Relay) api.EventHandler: parse RelaySessionAssignment from envelope payload, call relay.AddSession. HandleRelaySessionRevoked(relay *Relay) api.EventHandler: parse session_id from payload, call relay.RemoveSession, no-op if not found. RelayReconcileHandler(relay *Relay) reconcile.ReconcileHandler: compare desired RelayConfig.Sessions against relay.SessionIDs(), add missing via AddSession, remove stale via RemoveSession. Include tests in relay_handler_test.go. (REQ-005, REQ-006)",
-    "2.2 Update internal/bridge/manager.go — Add relay *Relay field to Manager. Update NewManager to create Relay if RelayEnabled. Add StartRelay(ctx context.Context) error that delegates to relay.Start. Add StopRelay() error that delegates to relay.Stop. Update BridgeStatus to include RelayEnabled and ActiveRelaySessions from relay.ActiveCount(). Update BridgeCapabilities to include relay=true and relay_listen_port when RelayEnabled. Update Teardown to call StopRelay. Include tests in manager_test.go. (REQ-007)",
-    "3.1 Create internal/bridge/relay_integration_test.go — TestRelayIntegration_FullFlow: start real UDP relay, add session with two local UDP sockets as peers, send packet from peer A, verify peer B receives it, send from B verify A receives. TestRelayIntegration_ReconcileSessionSync: wire Relay with real Reconciler, verify reconciliation adds/removes relay sessions from desired state. TestRelayIntegration_ConcurrentNoRace: concurrent AddSession/RemoveSession/packet forwarding with -race. (REQ-002, REQ-003, REQ-006)",
-    "4.1 Create docs/reference/backend/nat-relay.md — Reference documentation for relay functionality in internal/bridge: Config relay fields with defaults and validation, Relay struct lifecycle (Start, Stop, AddSession, RemoveSession), RelaySession UDP forwarding, SSE handlers (HandleRelaySessionAssigned, HandleRelaySessionRevoked), RelayReconcileHandler, API types (RelayConfig, RelaySessionAssignment, BridgeInfo relay fields), data flow diagram (Peer A → relay bridge UDP listener → Peer B), integration with reconcile, SSE, and bridge Manager. (REQ-001 through REQ-010)"
+    "[done] 1.1 Add RelayConfig, RelaySessionAssignment, and RelayInfo API types to internal/api/types.go — RelayConfig struct (Sessions []RelaySessionAssignment) added as *RelayConfig field on StateResponse. RelaySessionAssignment struct (SessionID string, PeerAID string, PeerAEndpoint string, PeerBID string, PeerBEndpoint string, ExpiresAt time.Time). Add RelayEnabled bool and ActiveRelaySessions int fields to BridgeInfo. Add relay_session_assigned and relay_session_revoked event constants to envelope.go. Include JSON round-trip tests in types_test.go. (REQ-004, REQ-007)",
+    "[done] 1.2 Extend internal/bridge/config.go — Add relay fields to Config: RelayEnabled bool, RelayListenPort int, MaxRelaySessions int, SessionTTL time.Duration. Add DefaultRelayListenPort=51821, DefaultMaxRelaySessions=100, DefaultSessionTTL=5m constants. Update ApplyDefaults to set relay defaults. Update Validate to check: relay requires bridge enabled, valid port 1-65535, positive MaxRelaySessions, SessionTTL >= 30s. Include tests in config_test.go. (REQ-001)",
+    "[done] 1.3 Create internal/bridge/relay.go — RelaySession struct with SessionID, PeerAAddr/PeerBAddr *net.UDPAddr, conn *net.UDPConn (shared relay socket), closed bool, mu sync.Mutex. Implement Forward(srcAddr *net.UDPAddr, data []byte) method that determines the other peer and writes to their endpoint. Implement Close() (idempotent). Relay struct with cfg Config, conn *net.UDPConn, logger *slog.Logger, sessions map[string]*RelaySession, addrIndex map[string]*RelaySession (source addr → session for O(1) lookup), active bool, mu sync.RWMutex. Implement NewRelay(cfg Config, logger *slog.Logger) *Relay. Implement Start(ctx context.Context) error (open UDP socket, start dispatchLoop goroutine). Implement dispatchLoop (read UDP, lookup session by source addr, call Forward). Implement AddSession(assignment api.RelaySessionAssignment) error (parse endpoints, create session, register in addrIndex, start TTL timer). Implement RemoveSession(sessionID string) (close session, remove from maps). Implement UpdateSession(sessionID string, peerAEndpoint, peerBEndpoint string) error. Implement Stop() error (close all sessions, close conn, idempotent). Implement ActiveCount() int. Implement SessionIDs() []string. Include tests in relay_test.go. (REQ-002, REQ-003, REQ-008, REQ-009, REQ-010)",
+    "[done] 2.1 Create internal/bridge/relay_handler.go — HandleRelaySessionAssigned(relay *Relay) api.EventHandler: parse RelaySessionAssignment from envelope payload, call relay.AddSession. HandleRelaySessionRevoked(relay *Relay) api.EventHandler: parse session_id from payload, call relay.RemoveSession, no-op if not found. RelayReconcileHandler(relay *Relay) reconcile.ReconcileHandler: compare desired RelayConfig.Sessions against relay.SessionIDs(), add missing via AddSession, remove stale via RemoveSession. Include tests in relay_handler_test.go. (REQ-005, REQ-006)",
+    "[done] 2.2 Update internal/bridge/manager.go — Add relay *Relay field to Manager. Update NewManager to create Relay if RelayEnabled. Add StartRelay(ctx context.Context) error that delegates to relay.Start. Add StopRelay() error that delegates to relay.Stop. Update BridgeStatus to include RelayEnabled and ActiveRelaySessions from relay.ActiveCount(). Update BridgeCapabilities to include relay=true and relay_listen_port when RelayEnabled. Update Teardown to call StopRelay. Include tests in manager_test.go. (REQ-007)",
+    "[done] 3.1 Create internal/bridge/relay_integration_test.go — TestRelayIntegration_FullFlow: start real UDP relay, add session with two local UDP sockets as peers, send packet from peer A, verify peer B receives it, send from B verify A receives. TestRelayIntegration_ReconcileSessionSync: wire Relay with real Reconciler, verify reconciliation adds/removes relay sessions from desired state. TestRelayIntegration_ConcurrentNoRace: concurrent AddSession/RemoveSession/packet forwarding with -race. (REQ-002, REQ-003, REQ-006)",
+    "[done] 4.1 Create docs/reference/backend/nat-relay.md — Reference documentation for relay functionality in internal/bridge: Config relay fields with defaults and validation, Relay struct lifecycle (Start, Stop, AddSession, RemoveSession), RelaySession UDP forwarding, SSE handlers (HandleRelaySessionAssigned, HandleRelaySessionRevoked), RelayReconcileHandler, API types (RelayConfig, RelaySessionAssignment, BridgeInfo relay fields), data flow diagram (Peer A → relay bridge UDP listener → Peer B), integration with reconcile, SSE, and bridge Manager. (REQ-001 through REQ-010)"
   ],
   "test_specifications": [
     {
@@ -696,6 +696,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T18:16:19.833024"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T18:20:56.725766"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T19:05:40.936020"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T19:05:40.950486"
     }
   },
   "execution_history": [
@@ -709,6 +721,56 @@
           "name": "prepare",
           "duration": 307.86452078819275,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "b723699d-711a-4712-9193-45c2e46819de",
+      "timestamp": "2026-02-12T18:53:44.227356",
+      "total_duration": 1831.3703010082245,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (3 tasks)",
+          "duration": 521.8942439556122,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (2 tasks)",
+          "duration": 591.2627115249634,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 87.44734907150269,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (1 tasks)",
+          "duration": 95.62575721740723,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0012] Code Review",
+          "duration": 243.38090896606445,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0012] Improvements",
+          "duration": 183.86614298820496,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0012] Simplify",
+          "duration": 107.8931872844696,
+          "type": "simplify",
           "status": "done"
         }
       ]
