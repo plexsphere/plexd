@@ -1,0 +1,703 @@
+{
+  "feature_id": "PXD-0005",
+  "title": "B001: Implement WireGuard tunnel management",
+  "slug": "b001-implement-wireguard-tunnel-management",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Create, configure, and manage WireGuard interfaces and peer entries. Establish direct encrypted tunnels to all authorized peers within the same tenant. Implement full-mesh topology where every node can communicate directly with every other node. Handle key generation, peer configuration, and tunnel lifecycle.",
+  "stories": [
+    {
+      "title": "plexd creates and configures a WireGuard interface on startup",
+      "role": "plexd agent",
+      "want": "to create a WireGuard network interface (wg0) with the node's private key, assigned mesh IP, and a configured listen port, so that peer tunnels can be established",
+      "so_that": "the node is ready to accept and initiate encrypted WireGuard tunnels with authorized mesh peers",
+      "criteria": [
+        "A WireGuard interface is created with a configurable name (default: wg0)",
+        "The node's Curve25519 private key (from registration identity) is set on the interface",
+        "The node's mesh IP (from registration identity) is assigned to the interface as an address with /32 prefix",
+        "The listen port is configurable (default: 51820)",
+        "The interface is brought up (link set up) after configuration",
+        "If the interface already exists (agent restart), it is reconfigured rather than recreated",
+        "Interface creation errors (permission denied, module not loaded) return descriptive typed errors",
+        "All WireGuard operations go through a WGController interface for testability"
+      ]
+    },
+    {
+      "title": "plexd adds peer entries for all authorized mesh peers",
+      "role": "plexd agent",
+      "want": "to configure WireGuard peer entries for each peer received from the control plane (via registration response or state fetch), including public key, allowed IPs, endpoint, and optional pre-shared key",
+      "so_that": "the node can establish direct encrypted tunnels to all authorized peers in the mesh",
+      "criteria": [
+        "Each api.Peer is translated to a WireGuard peer entry with: PublicKey (base64-decoded), AllowedIPs, Endpoint (if non-empty), PSK (if non-empty, base64-decoded)",
+        "Peers with empty endpoints are added without an endpoint (await NAT traversal from S006/S007)",
+        "PSK is decoded from base64 and set as the preshared key if non-empty",
+        "Adding a peer that already exists updates its configuration (idempotent)",
+        "Peer addition errors are logged at error level with the peer ID but do not prevent other peers from being configured",
+        "The number of configured peers is logged at info level after bulk peer configuration"
+      ]
+    },
+    {
+      "title": "plexd removes peer entries that are no longer authorized",
+      "role": "plexd agent",
+      "want": "to remove WireGuard peer entries for peers that have been removed from the control plane's desired state",
+      "so_that": "deauthorized nodes cannot communicate through the mesh, maintaining the security boundary",
+      "criteria": [
+        "Peers listed in StateDiff.PeersToRemove are removed from the WireGuard interface by public key",
+        "Removing a non-existent peer does not produce an error (idempotent)",
+        "Peer removal errors are logged at error level with the peer ID",
+        "After removal, the peer can no longer send or receive traffic through the mesh interface"
+      ]
+    },
+    {
+      "title": "plexd updates peer entries when configuration changes",
+      "role": "plexd agent",
+      "want": "to update WireGuard peer entries when their endpoint, allowed IPs, or PSK changes (as detected by StateDiff.PeersToUpdate)",
+      "so_that": "peer configuration stays in sync with the control plane's desired state, handling endpoint changes and IP reassignments",
+      "criteria": [
+        "Peers listed in StateDiff.PeersToUpdate are reconfigured with updated fields",
+        "Endpoint changes are applied to allow reconnection to peers that have moved",
+        "AllowedIPs changes are applied to handle mesh IP reassignments",
+        "PSK changes are applied for key rotation scenarios",
+        "The update is idempotent — applying the same configuration twice has no effect"
+      ]
+    },
+    {
+      "title": "plexd integrates with the reconciliation loop for continuous peer convergence",
+      "role": "plexd agent",
+      "want": "to register a ReconcileHandler with the Reconciler that applies peer add/remove/update operations from the StateDiff on each reconciliation cycle",
+      "so_that": "WireGuard peer configuration converges to the control plane's desired state even after network partitions, agent restarts, or missed SSE events",
+      "criteria": [
+        "A ReconcileHandler is registered that processes StateDiff.PeersToAdd, PeersToRemove, and PeersToUpdate",
+        "The handler applies all peer operations and returns an error only if critical operations fail",
+        "Individual peer operation failures are logged but do not prevent other operations in the same cycle",
+        "The handler is idempotent — running the same diff twice produces the same WireGuard state"
+      ]
+    },
+    {
+      "title": "plexd handles peer events from the SSE stream for real-time updates",
+      "role": "plexd agent",
+      "want": "to register SSE event handlers for peer_added, peer_removed, peer_key_rotated, and peer_endpoint_changed events, applying changes immediately without waiting for the next reconciliation cycle",
+      "so_that": "mesh topology changes propagate in real-time across the network",
+      "criteria": [
+        "EventPeerAdded handler parses the Peer from the envelope payload and adds it to WireGuard",
+        "EventPeerRemoved handler parses the peer ID from the payload and removes the peer from WireGuard",
+        "EventPeerKeyRotated handler parses the updated Peer (with new public key) and reconfigures the peer",
+        "EventPeerEndpointChanged handler parses the updated endpoint and reconfigures the peer",
+        "After handling an SSE event, TriggerReconcile is NOT called — the reconcile loop will catch any missed changes on its next cycle",
+        "Parse errors in the payload are logged at error level and the event is skipped"
+      ]
+    },
+    {
+      "title": "plexd tears down the WireGuard interface on graceful shutdown",
+      "role": "plexd agent",
+      "want": "to cleanly tear down the WireGuard interface when the agent shuts down, removing the interface and cleaning up resources",
+      "so_that": "no stale WireGuard interfaces or routes remain after the agent stops",
+      "criteria": [
+        "The WireGuard interface is removed (link delete) on shutdown",
+        "Shutdown is triggered by context cancellation",
+        "If the interface does not exist at shutdown (already removed), no error is returned",
+        "Shutdown errors are logged at warn level but do not prevent agent exit"
+      ]
+    },
+    {
+      "title": "Platform operator can configure WireGuard interface parameters",
+      "role": "platform operator",
+      "want": "to configure the WireGuard interface name, listen port, and optional MTU via the agent configuration",
+      "so_that": "WireGuard can be customized for different network environments (e.g., different MTU for cloud providers, non-default listen port to avoid conflicts)",
+      "criteria": [
+        "Config struct defines InterfaceName (default: wg0), ListenPort (default: 51820), MTU (default: 0 = system default)",
+        "Config.Validate rejects invalid port numbers (0, >65535) and negative MTU",
+        "Config follows the existing pattern: ApplyDefaults() + Validate()",
+        "Configuration changes require an agent restart (no hot-reload)"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The wireguard package SHALL create a WireGuard interface with the node's private key, mesh IP address, and configured listen port",
+      "priority": "SHALL",
+      "rationale": "Interface setup is the prerequisite for all WireGuard tunnel operations",
+      "scenarios": [
+        {
+          "name": "Interface created successfully",
+          "when": "Manager.Setup(ctx, identity) is called with valid NodeIdentity",
+          "then": "a WireGuard interface is created with the private key set, mesh IP assigned, and interface brought up",
+          "and_then": [
+            "the listen port matches the configured value"
+          ]
+        },
+        {
+          "name": "Interface reconfigured on restart",
+          "when": "Manager.Setup is called and the interface already exists",
+          "then": "the existing interface is reconfigured (not deleted and recreated)",
+          "and_then": [
+            "existing peer connections are preserved where possible"
+          ]
+        },
+        {
+          "name": "Missing WireGuard module returns typed error",
+          "when": "the WireGuard kernel module is not loaded",
+          "then": "a descriptive error is returned indicating the module is missing",
+          "and_then": [
+            "the error wraps the original OS error for debugging"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The wireguard package SHALL configure WireGuard peer entries from api.Peer data, translating public keys, endpoints, allowed IPs, and pre-shared keys",
+      "priority": "SHALL",
+      "rationale": "Correct peer configuration is essential for establishing encrypted mesh tunnels",
+      "scenarios": [
+        {
+          "name": "Peer added with all fields",
+          "when": "AddPeer is called with a Peer containing PublicKey, Endpoint, AllowedIPs, and PSK",
+          "then": "a WireGuard peer is configured with all fields decoded and set",
+          "and_then": [
+            "the PSK is decoded from base64 before being set"
+          ]
+        },
+        {
+          "name": "Peer added without endpoint",
+          "when": "AddPeer is called with a Peer with empty Endpoint",
+          "then": "the peer is added without an endpoint configured",
+          "and_then": []
+        },
+        {
+          "name": "Invalid public key rejected",
+          "when": "AddPeer is called with a Peer with invalid base64 PublicKey",
+          "then": "a descriptive error is returned",
+          "and_then": [
+            "no peer is added to the WireGuard interface"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The wireguard package SHALL remove WireGuard peer entries by public key when peers are deauthorized",
+      "priority": "SHALL",
+      "rationale": "Removing deauthorized peers prevents unauthorized mesh access",
+      "scenarios": [
+        {
+          "name": "Peer removed successfully",
+          "when": "RemovePeer is called with a valid peer public key",
+          "then": "the peer entry is removed from the WireGuard interface",
+          "and_then": []
+        },
+        {
+          "name": "Removing non-existent peer is no-op",
+          "when": "RemovePeer is called with a public key not configured on the interface",
+          "then": "no error is returned",
+          "and_then": []
+        },
+        {
+          "name": "Peer ID to public key resolution",
+          "when": "StateDiff.PeersToRemove contains peer IDs",
+          "then": "the handler resolves peer IDs to public keys via the local index",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The wireguard package SHALL update existing peer entries when endpoint, allowed IPs, or PSK changes",
+      "priority": "SHALL",
+      "rationale": "Peers may change endpoints, allowed IPs, or PSKs due to NAT rebinding or rotation",
+      "scenarios": [
+        {
+          "name": "Endpoint updated",
+          "when": "UpdatePeer is called with a new endpoint",
+          "then": "the WireGuard peer's endpoint is updated",
+          "and_then": []
+        },
+        {
+          "name": "AllowedIPs updated",
+          "when": "UpdatePeer is called with new AllowedIPs",
+          "then": "the peer's allowed IPs are replaced",
+          "and_then": []
+        },
+        {
+          "name": "PSK rotated",
+          "when": "UpdatePeer is called with a new PSK",
+          "then": "the peer's preshared key is updated",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The wireguard package SHALL provide a ReconcileHandler integrating with the reconcile package for continuous peer convergence",
+      "priority": "SHALL",
+      "rationale": "The reconcile loop is the primary convergence mechanism, ensuring WireGuard state matches control plane even after partitions",
+      "scenarios": [
+        {
+          "name": "Full diff applied",
+          "when": "the handler receives a StateDiff with adds, removes, and updates",
+          "then": "all operations applied: removes first, then updates, then adds",
+          "and_then": [
+            "nil returned on full success"
+          ]
+        },
+        {
+          "name": "Partial failure",
+          "when": "one peer add fails",
+          "then": "remaining operations still attempted",
+          "and_then": [
+            "error returned summarizing failures"
+          ]
+        },
+        {
+          "name": "Empty diff is no-op",
+          "when": "StateDiff has no peer changes",
+          "then": "handler returns nil without any WGController calls",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The wireguard package SHALL provide SSE event handlers for peer_added, peer_removed, peer_key_rotated, and peer_endpoint_changed",
+      "priority": "SHALL",
+      "rationale": "Real-time SSE events enable immediate mesh topology updates",
+      "scenarios": [
+        {
+          "name": "peer_added event handled",
+          "when": "SSE event peer_added received with valid Peer payload",
+          "then": "peer added to WireGuard interface",
+          "and_then": [
+            "peer ID added to lookup index"
+          ]
+        },
+        {
+          "name": "peer_removed event handled",
+          "when": "SSE event peer_removed received with peer ID",
+          "then": "peer removed from WireGuard interface",
+          "and_then": [
+            "peer ID removed from lookup index"
+          ]
+        },
+        {
+          "name": "Malformed payload skipped",
+          "when": "SSE event has unparseable payload",
+          "then": "error logged, event skipped",
+          "and_then": [
+            "reconcile loop will correct on next cycle"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The wireguard package SHALL tear down the WireGuard interface on graceful shutdown",
+      "priority": "SHALL",
+      "rationale": "Prevents stale interfaces and routes from accumulating",
+      "scenarios": [
+        {
+          "name": "Interface removed on shutdown",
+          "when": "Teardown() is called",
+          "then": "WireGuard interface is deleted",
+          "and_then": []
+        },
+        {
+          "name": "Missing interface is no-op",
+          "when": "Teardown() called but interface doesn't exist",
+          "then": "no error returned",
+          "and_then": []
+        },
+        {
+          "name": "Teardown error logged",
+          "when": "interface deletion fails",
+          "then": "error logged at warn, error returned",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The wireguard Config SHALL define InterfaceName, ListenPort, and MTU with sensible defaults and validation",
+      "priority": "SHALL",
+      "rationale": "Follows established Config pattern with ApplyDefaults/Validate",
+      "scenarios": [
+        {
+          "name": "Defaults applied",
+          "when": "Config with no fields set",
+          "then": "InterfaceName=wg0, ListenPort=51820",
+          "and_then": []
+        },
+        {
+          "name": "Invalid port rejected",
+          "when": "ListenPort > 65535",
+          "then": "Validate returns descriptive error",
+          "and_then": []
+        },
+        {
+          "name": "Custom values used",
+          "when": "InterfaceName=mesh0, ListenPort=51821",
+          "then": "configured values override defaults",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "All WireGuard OS operations SHALL go through a WGController interface for testability",
+      "priority": "SHALL",
+      "rationale": "WireGuard operations require root and kernel modules; interface enables unit testing",
+      "scenarios": [
+        {
+          "name": "Mock controller in tests",
+          "when": "Manager uses a mock WGController",
+          "then": "all operations recorded on mock, no OS calls",
+          "and_then": []
+        },
+        {
+          "name": "Real controller wraps OS operations",
+          "when": "production WGController used",
+          "then": "appropriate netlink/userspace operations invoked",
+          "and_then": [
+            "errors wrapped with context"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The wireguard package SHALL maintain a thread-safe peer-ID-to-public-key index for peer removal by ID",
+      "priority": "SHALL",
+      "rationale": "StateDiff.PeersToRemove uses peer IDs; WireGuard uses public keys; index bridges this gap",
+      "scenarios": [
+        {
+          "name": "Index populated on add",
+          "when": "peer added",
+          "then": "peer ID to public key mapping stored",
+          "and_then": []
+        },
+        {
+          "name": "Index used for removal",
+          "when": "RemovePeerByID called",
+          "then": "public key resolved from index, peer removed",
+          "and_then": [
+            "index entry removed"
+          ]
+        },
+        {
+          "name": "Unknown peer ID returns error",
+          "when": "RemovePeerByID called with unknown ID",
+          "then": "error returned indicating unknown peer",
+          "and_then": []
+        },
+        {
+          "name": "Index updated on key rotation",
+          "when": "peer key rotated",
+          "then": "index updated with new public key",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "The wireguard package SHALL use structured logging with log/slog and component=wireguard",
+      "priority": "SHALL",
+      "rationale": "Operational consistency with internal/api/ and internal/reconcile/ logging patterns",
+      "scenarios": [
+        {
+          "name": "Setup logged",
+          "when": "interface created",
+          "then": "info log with component=wireguard, interface, port, mesh_ip",
+          "and_then": [
+            "private key never logged"
+          ]
+        },
+        {
+          "name": "Peer operations logged",
+          "when": "peer added/removed/updated",
+          "then": "debug log with component=wireguard, peer_id, operation",
+          "and_then": [
+            "PSK never logged"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-012",
+      "description": "The wireguard package SHALL support context-based cancellation for all long-running operations",
+      "priority": "SHALL",
+      "rationale": "Agent may receive SIGTERM during peer configuration; cancellation prevents resource leaks",
+      "scenarios": [
+        {
+          "name": "Bulk peer configuration respects cancellation",
+          "when": "context cancelled during ConfigurePeers",
+          "then": "operation stops, context error returned",
+          "and_then": [
+            "already-configured peers remain"
+          ]
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/wireguard/config.go — Define Config struct: InterfaceName string (default wg0), ListenPort int (default 51820), MTU int (default 0 = system default). Implement ApplyDefaults() and Validate() matching internal/api/config.go pattern. Include tests in config_test.go for defaults, validation of invalid port (0, >65535), negative MTU, and custom overrides. (REQ-008)",
+    "1.2 Create internal/wireguard/controller.go — Define WGController interface with methods: CreateInterface(name string, privateKey []byte, listenPort int) error, DeleteInterface(name string) error, ConfigureAddress(name string, address string) error, SetInterfaceUp(name string) error, SetMTU(name string, mtu int) error, AddPeer(iface string, cfg PeerConfig) error, RemovePeer(iface string, publicKey []byte) error. Define PeerConfig struct: PublicKey []byte, Endpoint string, AllowedIPs []string, PSK []byte, PersistentKeepalive int. Implement PeerConfigFromAPI(peer api.Peer) (PeerConfig, error) to translate api.Peer to PeerConfig with base64 decoding of PublicKey and PSK. Include tests in controller_test.go for PeerConfigFromAPI: all fields, no endpoint, no PSK, invalid public key, invalid PSK. (REQ-002, REQ-009)",
+    "1.3 Create internal/wireguard/index.go — Implement PeerIndex struct with sync.RWMutex-protected map[string]string (peerID → base64 public key). Methods: Add(peerID, publicKey string), Remove(peerID string), Lookup(peerID string) (string, bool), Update(peerID, newPublicKey string), LoadFromPeers(peers []api.Peer) to bulk-populate. Include tests in index_test.go: add/lookup, remove, update key, lookup unknown ID, concurrent access with -race. (REQ-010)",
+    "2.1 Create internal/wireguard/manager.go — Implement Manager struct: WGController, Config, *slog.Logger, PeerIndex. Constructor NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager. Implement Setup(ctx, identity *registration.NodeIdentity) error: create interface, set private key, assign mesh IP/32, set MTU if configured, bring interface up. Implement Teardown() error: delete interface (no error if not exists). Implement AddPeer(peer api.Peer) error, RemovePeer(publicKey []byte) error, RemovePeerByID(peerID string) error, UpdatePeer(peer api.Peer) error. Implement ConfigurePeers(ctx, peers []api.Peer) error: bulk add peers with context check per peer. Include tests in manager_test.go with mock WGController for: Setup, Setup with existing interface, ConfigurePeers, AddPeer, RemovePeerByID, RemovePeerByID unknown, UpdatePeer, Teardown, Teardown no interface, ConfigurePeers context cancellation. (REQ-001, REQ-002, REQ-003, REQ-004, REQ-007, REQ-011, REQ-012)",
+    "2.2 Create internal/wireguard/handler.go — Implement ReconcileHandler(mgr *Manager) reconcile.ReconcileHandler: returns a function that processes StateDiff.PeersToRemove (via RemovePeerByID), PeersToUpdate (via UpdatePeer), PeersToAdd (via AddPeer) in that order. Individual failures logged and collected; aggregated error returned. Implement SSE event handler functions: HandlePeerAdded(mgr *Manager) api.EventHandler, HandlePeerRemoved(mgr *Manager) api.EventHandler, HandlePeerKeyRotated(mgr *Manager) api.EventHandler, HandlePeerEndpointChanged(mgr *Manager) api.EventHandler. Each parses the SignedEnvelope.Payload, calls the appropriate Manager method, logs errors. Include tests in handler_test.go with mock WGController for: full diff, empty diff, partial failure, SSE peer_added, peer_removed, peer_key_rotated, peer_endpoint_changed, malformed payload. (REQ-005, REQ-006)",
+    "3.1 Create internal/wireguard/mock_controller_test.go — Implement mockController struct satisfying WGController interface for use across all test files. Records all calls with arguments for assertion. Supports configurable error returns per method. This is a test helper, not a production file. (REQ-009)",
+    "4.1 Create docs/reference/backend/wireguard.md — Reference documentation for internal/wireguard/ package: Config struct fields and defaults, WGController interface and PeerConfig struct, Manager lifecycle (NewManager → Setup → ConfigurePeers → AddPeer/RemovePeer/UpdatePeer → Teardown), PeerIndex usage, ReconcileHandler factory function, SSE event handler factory functions. Include code examples for constructing a Manager, setting up the interface, and registering handlers with Reconciler and SSEManager. (REQ-001 through REQ-012)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/wireguard/config_test.go",
+      "test_function": "TestConfig_Defaults",
+      "story": "Platform operator can configure WireGuard interface parameters",
+      "expected": "Config with no fields set uses InterfaceName=wg0, ListenPort=51820",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/wireguard/config_test.go",
+      "test_function": "TestConfig_ValidateRejectsInvalidPort",
+      "story": "Platform operator can configure WireGuard interface parameters",
+      "expected": "Validate returns error for ListenPort > 65535 or ListenPort = 0",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/wireguard/config_test.go",
+      "test_function": "TestConfig_ValidateRejectsNegativeMTU",
+      "story": "Platform operator can configure WireGuard interface parameters",
+      "expected": "Validate returns error for negative MTU",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/wireguard/controller_test.go",
+      "test_function": "TestPeerConfigFromAPI_AllFields",
+      "story": "plexd adds peer entries for all authorized mesh peers",
+      "expected": "api.Peer with all fields converts to WireGuard peer config with decoded keys",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/wireguard/controller_test.go",
+      "test_function": "TestPeerConfigFromAPI_NoEndpoint",
+      "story": "plexd adds peer entries for all authorized mesh peers",
+      "expected": "api.Peer with empty endpoint produces peer config with no endpoint",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/wireguard/controller_test.go",
+      "test_function": "TestPeerConfigFromAPI_NoPSK",
+      "story": "plexd adds peer entries for all authorized mesh peers",
+      "expected": "api.Peer with empty PSK produces peer config without preshared key",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/wireguard/controller_test.go",
+      "test_function": "TestPeerConfigFromAPI_InvalidPublicKey",
+      "story": "plexd adds peer entries for all authorized mesh peers",
+      "expected": "api.Peer with invalid base64 PublicKey returns error",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/wireguard/manager_test.go",
+      "test_function": "TestManager_Setup",
+      "story": "plexd creates and configures a WireGuard interface on startup",
+      "expected": "Setup creates interface with private key, mesh IP, listen port via mock controller",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/wireguard/manager_test.go",
+      "test_function": "TestManager_Setup_InterfaceAlreadyExists",
+      "story": "plexd creates and configures a WireGuard interface on startup",
+      "expected": "Setup reconfigures existing interface without error",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/wireguard/manager_test.go",
+      "test_function": "TestManager_ConfigurePeers",
+      "story": "plexd adds peer entries for all authorized mesh peers",
+      "expected": "ConfigurePeers adds all peers from api.Peer slice to mock controller",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/wireguard/manager_test.go",
+      "test_function": "TestManager_AddPeer",
+      "story": "plexd adds peer entries for all authorized mesh peers",
+      "expected": "AddPeer translates api.Peer to WireGuard peer config and calls controller",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/wireguard/manager_test.go",
+      "test_function": "TestManager_RemovePeerByID",
+      "story": "plexd removes peer entries that are no longer authorized",
+      "expected": "RemovePeerByID resolves peer ID to public key via index and removes via controller",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/wireguard/manager_test.go",
+      "test_function": "TestManager_RemovePeerByID_UnknownID",
+      "story": "plexd removes peer entries that are no longer authorized",
+      "expected": "RemovePeerByID returns error for unknown peer ID",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/wireguard/manager_test.go",
+      "test_function": "TestManager_UpdatePeer",
+      "story": "plexd updates peer entries when configuration changes",
+      "expected": "UpdatePeer reconfigures peer with new endpoint/AllowedIPs/PSK",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/wireguard/manager_test.go",
+      "test_function": "TestManager_Teardown",
+      "story": "plexd tears down the WireGuard interface on graceful shutdown",
+      "expected": "Teardown deletes the interface via mock controller",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/wireguard/manager_test.go",
+      "test_function": "TestManager_Teardown_NoInterface",
+      "story": "plexd tears down the WireGuard interface on graceful shutdown",
+      "expected": "Teardown on non-existent interface returns nil",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/wireguard/index_test.go",
+      "test_function": "TestPeerIndex_AddAndLookup",
+      "story": "plexd adds peer entries for all authorized mesh peers",
+      "expected": "After adding a peer, Lookup returns the correct public key for the peer ID",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/wireguard/index_test.go",
+      "test_function": "TestPeerIndex_Remove",
+      "story": "plexd removes peer entries that are no longer authorized",
+      "expected": "After removing a peer, Lookup returns not-found for that peer ID",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/wireguard/index_test.go",
+      "test_function": "TestPeerIndex_UpdateKey",
+      "story": "plexd updates peer entries when configuration changes",
+      "expected": "After updating, Lookup returns the new public key for the peer ID",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/wireguard/index_test.go",
+      "test_function": "TestPeerIndex_ConcurrentAccess",
+      "story": "plexd adds peer entries for all authorized mesh peers",
+      "expected": "Concurrent Add/Remove/Lookup operations do not race (run with -race)",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/wireguard/handler_test.go",
+      "test_function": "TestReconcileHandler_FullDiff",
+      "story": "plexd integrates with the reconciliation loop for continuous peer convergence",
+      "expected": "Handler applies removes, updates, then adds from StateDiff; returns nil on success",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/wireguard/handler_test.go",
+      "test_function": "TestReconcileHandler_EmptyDiff",
+      "story": "plexd integrates with the reconciliation loop for continuous peer convergence",
+      "expected": "Handler returns nil without calling WGController when no peer changes",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/wireguard/handler_test.go",
+      "test_function": "TestReconcileHandler_PartialFailure",
+      "story": "plexd integrates with the reconciliation loop for continuous peer convergence",
+      "expected": "Handler continues processing after individual peer failure and returns aggregated error",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/wireguard/handler_test.go",
+      "test_function": "TestSSEHandler_PeerAdded",
+      "story": "plexd handles peer events from the SSE stream for real-time updates",
+      "expected": "peer_added event handler parses Peer payload and adds to WireGuard",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/wireguard/handler_test.go",
+      "test_function": "TestSSEHandler_PeerRemoved",
+      "story": "plexd handles peer events from the SSE stream for real-time updates",
+      "expected": "peer_removed event handler parses peer ID and removes from WireGuard",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/wireguard/handler_test.go",
+      "test_function": "TestSSEHandler_PeerKeyRotated",
+      "story": "plexd handles peer events from the SSE stream for real-time updates",
+      "expected": "peer_key_rotated event removes old peer and adds new with updated key",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/wireguard/handler_test.go",
+      "test_function": "TestSSEHandler_PeerEndpointChanged",
+      "story": "plexd handles peer events from the SSE stream for real-time updates",
+      "expected": "peer_endpoint_changed event updates peer endpoint",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/wireguard/handler_test.go",
+      "test_function": "TestSSEHandler_MalformedPayload",
+      "story": "plexd handles peer events from the SSE stream for real-time updates",
+      "expected": "Malformed SSE payload is logged and skipped without error",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/wireguard/manager_test.go",
+      "test_function": "TestManager_ConfigurePeers_ContextCancellation",
+      "story": "plexd adds peer entries for all authorized mesh peers",
+      "expected": "ConfigurePeers stops and returns context error when cancelled mid-loop",
+      "requirement_id": "REQ-012"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-012) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "WGController interface is minimal and covers only OS-level WireGuard operations needed by the Manager",
+    "PeerConfigFromAPI correctly decodes base64 public keys and PSKs, rejects invalid encoding",
+    "PeerIndex is thread-safe (sync.RWMutex) and tests pass with go test -race",
+    "ReconcileHandler processes peers in order: removes first (clean up stale), then updates, then adds",
+    "SSE event handlers parse SignedEnvelope.Payload correctly and handle malformed payloads gracefully",
+    "Private key material and PSKs are never logged at any level",
+    "Manager.Teardown is idempotent — no error on non-existent interface",
+    "All operations support context-based cancellation",
+    "Code follows existing patterns: log/slog with component key, Config with ApplyDefaults/Validate, stdlib-only test dependencies",
+    "Reference documentation covers all public types, interfaces, methods, and integration patterns (docs/reference/backend/wireguard.md)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All code lives in `internal/wireguard/`. Files: config.go, controller.go, index.go, manager.go, handler.go, and corresponding _test.go files. A mock_controller_test.go provides the test mock.\n\n2. **WGController interface**: This is the critical abstraction. It encapsulates all OS-level WireGuard operations (create/delete interface, add/remove peer, set address, etc.). The production implementation will use netlink or the `wg` userspace tool — but that is NOT part of this feature. This feature only defines the interface and provides the Manager that uses it. The concrete implementation will be added in S020 (bare-metal systemd) when real WireGuard integration is tested.\n\n3. **No external dependencies**: The wireguard package uses only stdlib + internal packages (api, reconcile, registration). No WireGuard Go libraries are added — the WGController interface is implemented externally.\n\n4. **PeerConfig vs api.Peer**: api.Peer uses base64-encoded strings for keys; WireGuard uses raw bytes. PeerConfigFromAPI handles this translation, validating base64 encoding. This separation keeps api types wire-format and wireguard types OS-format.\n\n5. **PeerIndex**: WireGuard identifies peers by public key, but the control plane uses peer IDs. The PeerIndex (map[string]string protected by sync.RWMutex) bridges this gap. It is populated during ConfigurePeers and maintained by AddPeer/RemovePeer/UpdatePeer operations.\n\n6. **Reconcile handler ordering**: Removes → Updates → Adds. This order prevents conflicts: removing stale peers first frees allowed IPs, then updates reconfigure existing peers, then new peers are added. This matches the field ordering in StateDiff.\n\n7. **SSE handlers vs Reconcile handler**: SSE handlers provide real-time updates; the reconcile handler provides convergence. They operate on the same Manager but through different paths. Both are idempotent — applying the same change twice has no effect because AddPeer/UpdatePeer are idempotent operations.\n\n8. **Key rotation handling**: peer_key_rotated events require removing the old peer (identified by old public key via the index) and adding a new one with the new public key. The index is updated atomically.\n\n9. **Error handling strategy**: Individual peer operation failures do not block other operations. The reconcile handler collects errors and returns an aggregated error. This matches the reconcile loop's behavior of retrying on handler failure (snapshot not updated → same diff on next cycle).\n\n10. **Registration integration**: After registration, the caller passes `RegisterResponse.Peers` to `Manager.ConfigurePeers()` to set up the initial mesh. This is orchestrated by the agent lifecycle code (not by this package).\n\n11. **Testing strategy**: All tests use a mock WGController (defined in mock_controller_test.go). The mock records all calls for assertion. No real WireGuard operations are performed in tests. Tests use stdlib only.\n\n12. **Key files from existing codebase**:\n    - `internal/api/types.go:29-36` — Peer struct (ID, PublicKey, MeshIP, Endpoint, AllowedIPs, PSK)\n    - `internal/api/types.go:288-295` — KeyRotateRequest/Response\n    - `internal/api/envelope.go:14-27` — SSE event type constants (EventPeerAdded, etc.)\n    - `internal/reconcile/diff.go:12-26` — StateDiff with PeersToAdd/Remove/Update\n    - `internal/reconcile/reconciler.go:21` — ReconcileHandler type\n    - `internal/api/dispatcher.go` — EventHandler type\n    - `internal/registration/identity.go:17-23` — NodeIdentity (MeshIP, PrivateKey)\n    - `internal/registration/keys.go` — Keypair / key encoding patterns\n\n13. **Potential pitfalls**:\n    - base64 decoding of public keys must use StdEncoding (not URLEncoding) to match registration/keys.go\n    - PeerConfig.Endpoint may be empty string (peer behind NAT, no known endpoint yet)\n    - peer_key_rotated requires removing by OLD public key and adding with NEW — the PeerIndex must be consulted for the old key before updating\n    - ConfigurePeers should check ctx.Err() between each peer to support graceful shutdown during large peer sets\n    - The mesh IP from registration.NodeIdentity should be formatted as IP/32 for the interface address",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.105868"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T10:21:54.264867"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T10:29:44.724606"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "9e5bad56-23f5-41ae-bcff-74d73deadc88",
+      "timestamp": "2026-02-12T10:29:44.724633",
+      "total_duration": 466.24170994758606,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 466.24170994758606,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
