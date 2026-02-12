@@ -1,0 +1,759 @@
+{
+  "feature_id": "PXD-0002",
+  "title": "A002: Implement self-registration and bootstrap auth",
+  "slug": "a002-implement-self-registration-and-bootstrap",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Authenticate with the control plane using a one-time bootstrap token and enroll the node. Supports platform-provisioned tokens (injected via Cloud-Init or Kubernetes Secret) and manually provided tokens for user-onboarded resources. After successful registration, the node receives its identity, mesh IP, and initial configuration.",
+  "stories": [
+    {
+      "title": "plexd resolves the bootstrap token from multiple sources",
+      "role": "plexd agent",
+      "want": "to locate the one-time bootstrap token by checking sources in priority order: CLI flag/direct value, file path, environment variable (PLEXD_BOOTSTRAP_TOKEN), and cloud metadata service",
+      "so_that": "the agent works across all deployment modes — manual enrollment (interactive/CLI), VM provisioning (Cloud-Init token file), Kubernetes (env var from Secret), and cloud-native (metadata service) — without code changes",
+      "criteria": [
+        "TokenResolver checks sources in defined priority order: direct value > file > env var > metadata, returning the first non-empty result",
+        "File-based token reading trims whitespace and newlines from the file content",
+        "File read errors (permission denied, not found) are returned as typed errors with the attempted path",
+        "Environment variable source reads PLEXD_BOOTSTRAP_TOKEN and trims whitespace",
+        "Metadata source is pluggable via an interface (concrete cloud implementations deferred to S020/S021)",
+        "If no source provides a token, a descriptive error is returned listing all attempted sources",
+        "Token format is validated: must be non-empty, max 512 bytes, printable ASCII only"
+      ]
+    },
+    {
+      "title": "plexd generates a Curve25519 keypair for mesh encryption",
+      "role": "plexd agent",
+      "want": "to generate a fresh Curve25519 keypair before registration so the public key can be sent to the control plane and the private key stored locally for WireGuard tunnel setup",
+      "so_that": "the node's private key never leaves the node and the control plane can distribute the public key to authorized peers",
+      "criteria": [
+        "Keypair generation uses crypto/rand for the private key and Curve25519 scalar base multiplication for the public key",
+        "Generated keys are 32 bytes each, base64-encoded for the registration request",
+        "Private key is returned as a byte slice, never logged or included in error messages",
+        "Key generation failures (insufficient entropy) return a descriptive error",
+        "The generation function is deterministic when given a fixed reader (for testing)"
+      ]
+    },
+    {
+      "title": "plexd registers with the control plane using the bootstrap token",
+      "role": "plexd agent",
+      "want": "to POST the bootstrap token, generated public key, hostname, metadata, and capabilities to POST /v1/register, and receive the node identity (node_id, mesh_ip, signing_public_key, node_secret_key, peers) in response",
+      "so_that": "the node is enrolled in the mesh and has all the cryptographic material needed to establish tunnels and verify SSE events",
+      "criteria": [
+        "Registration sends POST /v1/register with RegisterRequest containing token, public_key, hostname, metadata, and capabilities",
+        "The bootstrap token is sent as the Authorization: Bearer header for this request (not the node identity token)",
+        "On 201 Created, RegisterResponse is parsed with node_id, mesh_ip, signing_public_key, node_secret_key, and peers array",
+        "On 401 Unauthorized (invalid/expired/used token), ErrUnauthorized is returned and no retry is attempted",
+        "On 409 Conflict (hostname already registered), ErrConflict is returned and no retry is attempted",
+        "On 400 Bad Request (malformed payload), ErrBadRequest is returned and no retry is attempted",
+        "On 5xx or network error, transient retry logic is applied with exponential backoff",
+        "The ControlPlane.SetAuthToken is called with the bootstrap token before the Register call"
+      ]
+    },
+    {
+      "title": "plexd retries registration on transient failures with exponential backoff",
+      "role": "plexd agent",
+      "want": "to retry the registration request on transient failures (network errors, 5xx, 429) with exponential backoff and jitter, while immediately failing on permanent errors (401, 403, 409)",
+      "so_that": "the agent handles control plane outages during initial setup gracefully without overwhelming the control plane with retries",
+      "criteria": [
+        "Transient errors (network errors, 5xx) trigger exponential backoff: 1s base, 2x multiplier, 60s cap, ±25% jitter",
+        "429 errors respect the Retry-After header duration before next attempt",
+        "Permanent errors (401 Unauthorized, 403 Forbidden, 409 Conflict, 400 Bad Request) fail immediately without retry",
+        "Maximum retry duration is configurable (default: 5 minutes) after which registration fails with a timeout error",
+        "Each retry attempt is logged at warn level with attempt number, error, and backoff duration",
+        "Context cancellation stops the retry loop immediately and returns the context error",
+        "Successful registration after retries resets all backoff state"
+      ]
+    },
+    {
+      "title": "plexd persists registration identity and credentials to data_dir",
+      "role": "plexd agent",
+      "want": "to persist the node identity (node_id, mesh_ip), private key, signing public key, node secret key (NSK), and initial peer list to the data directory after successful registration",
+      "so_that": "the node can restart without re-registering and has all material needed for mesh tunnel setup and SSE event verification",
+      "criteria": [
+        "NodeIdentity struct contains: NodeID, MeshIP, PrivateKey, SigningPublicKey, NodeSecretKey",
+        "Identity file is written atomically (write to temp file, fsync, rename) to prevent corruption on crash",
+        "Private key and NSK files are written with 0600 permissions (owner read/write only)",
+        "Identity file path is {data_dir}/identity.json",
+        "Private key file path is {data_dir}/private_key",
+        "NSK file path is {data_dir}/node_secret_key",
+        "Signing public key file path is {data_dir}/signing_public_key",
+        "If data_dir does not exist, it is created with 0700 permissions",
+        "LoadIdentity function reads persisted identity from data_dir, returning ErrNotRegistered if files are missing"
+      ]
+    },
+    {
+      "title": "plexd deletes the bootstrap token after successful registration",
+      "role": "platform operator",
+      "want": "the bootstrap token to be securely deleted from disk (if file-based) immediately after successful registration",
+      "so_that": "the one-time token cannot be reused if the filesystem is compromised, reducing the attack window per the security model",
+      "criteria": [
+        "If the token was read from a file, the file is deleted after successful registration",
+        "If the token was from an environment variable or metadata service, no file cleanup is needed",
+        "Token deletion failure is logged at warn level but does not fail the registration process",
+        "The token source path is tracked by the TokenResolver so cleanup knows which file to delete",
+        "After deletion, a debug-level log confirms the token file was removed"
+      ]
+    },
+    {
+      "title": "plexd skips registration if already registered",
+      "role": "plexd agent",
+      "want": "to detect an existing valid identity in data_dir and skip re-registration, using the persisted identity to set the auth token and proceed to the connected state",
+      "so_that": "the agent can restart without consuming a new bootstrap token and without unnecessary control plane calls",
+      "criteria": [
+        "On startup, the Registrar checks for existing identity files in data_dir",
+        "If a valid identity exists, the node_id is used to set the ControlPlane auth token and registration is skipped",
+        "If identity files are corrupt or incomplete, a warning is logged and re-registration is attempted",
+        "The Registrar.Register method returns the NodeIdentity whether from persisted state or fresh registration",
+        "The IsRegistered() method returns true if valid identity files exist in data_dir"
+      ]
+    },
+    {
+      "title": "plexd orchestrates the full registration flow end-to-end",
+      "role": "plexd agent",
+      "want": "a Registrar that orchestrates the complete registration flow: check existing identity → resolve token → generate keypair → register with retries → persist identity → cleanup token → set auth token",
+      "so_that": "higher-level agent code can call a single Register() method and receive a fully initialized NodeIdentity ready for mesh setup",
+      "criteria": [
+        "Registrar struct accepts ControlPlane client, Config, logger, and data_dir path",
+        "Register(ctx) returns (*NodeIdentity, error) handling the full orchestration",
+        "The method is idempotent: calling it when already registered returns the existing identity",
+        "After successful registration, the ControlPlane auth token is set to the node_secret_key (used as bearer token for subsequent API calls)",
+        "All errors are wrapped with context describing which step failed",
+        "The Registrar does not manage SSE connection or mesh setup — those are separate concerns"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The TokenResolver SHALL locate a bootstrap token by checking sources in priority order: direct value, file, environment variable (PLEXD_BOOTSTRAP_TOKEN), and metadata service",
+      "priority": "SHALL",
+      "rationale": "Multiple token provisioning mechanisms are required to support all deployment modes (manual, Cloud-Init, K8s Secret, cloud metadata)",
+      "scenarios": [
+        {
+          "name": "Token resolved from file",
+          "when": "a token file exists at the configured path with valid content",
+          "then": "the file contents are returned as the token with whitespace trimmed",
+          "and_then": [
+            "the file path is recorded for post-registration cleanup"
+          ]
+        },
+        {
+          "name": "Token resolved from env var when file is absent",
+          "when": "no token file exists but PLEXD_BOOTSTRAP_TOKEN is set",
+          "then": "the environment variable value is returned as the token",
+          "and_then": [
+            "no file path is recorded for cleanup"
+          ]
+        },
+        {
+          "name": "No token found returns descriptive error",
+          "when": "all token sources are empty or unavailable",
+          "then": "an error is returned listing all attempted sources and how to provide a token",
+          "and_then": []
+        },
+        {
+          "name": "Token format validation rejects invalid tokens",
+          "when": "a token exceeds 512 bytes or contains non-printable characters",
+          "then": "a validation error is returned describing the constraint violated",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The registration package SHALL generate a Curve25519 keypair using crypto/rand and return the base64-encoded public key for the registration request",
+      "priority": "SHALL",
+      "rationale": "WireGuard requires Curve25519 keys; private key must never leave the node",
+      "scenarios": [
+        {
+          "name": "Keypair generated successfully",
+          "when": "GenerateKeypair() is called with a working entropy source",
+          "then": "a 32-byte private key and corresponding 32-byte public key are returned",
+          "and_then": [
+            "public key matches Curve25519(private_key)"
+          ]
+        },
+        {
+          "name": "Public key is base64-encoded for wire format",
+          "when": "the public key is encoded for the registration request",
+          "then": "standard base64 encoding produces a valid 44-character string",
+          "and_then": []
+        },
+        {
+          "name": "Private key is never logged",
+          "when": "key generation succeeds or fails",
+          "then": "no log entry contains the private key bytes or their encoding",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The Registrar SHALL send POST /v1/register with the bootstrap token as Bearer auth, public key, hostname, metadata, and capabilities, and parse the registration response",
+      "priority": "SHALL",
+      "rationale": "Registration is the foundational step that gives the node its identity and all cryptographic material for mesh participation",
+      "scenarios": [
+        {
+          "name": "Successful registration returns identity",
+          "when": "POST /v1/register returns 201 Created with valid JSON body",
+          "then": "RegisterResponse is parsed into NodeIdentity with node_id, mesh_ip, signing_public_key, node_secret_key, and peers",
+          "and_then": [
+            "the auth token on the ControlPlane client is updated to node identity token"
+          ]
+        },
+        {
+          "name": "401 fails immediately without retry",
+          "when": "POST /v1/register returns 401 Unauthorized",
+          "then": "registration fails with ErrUnauthorized",
+          "and_then": [
+            "no retry attempts are made"
+          ]
+        },
+        {
+          "name": "409 fails immediately without retry",
+          "when": "POST /v1/register returns 409 Conflict",
+          "then": "registration fails with ErrConflict",
+          "and_then": [
+            "error message indicates hostname already registered"
+          ]
+        },
+        {
+          "name": "5xx triggers retry with backoff",
+          "when": "POST /v1/register returns 500 or 503",
+          "then": "registration is retried with exponential backoff",
+          "and_then": [
+            "each retry is logged with attempt number and delay"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The Registrar SHALL retry registration on transient failures with exponential backoff (1s base, 2x multiplier, 60s cap, ±25% jitter) and a configurable maximum retry duration (default 5 minutes)",
+      "priority": "SHALL",
+      "rationale": "Network or control plane outages during initial setup should not permanently prevent enrollment",
+      "scenarios": [
+        {
+          "name": "Exponential backoff on transient failures",
+          "when": "3 consecutive 503 errors occur",
+          "then": "delays are approximately 1s, 2s, 4s with ±25% jitter applied",
+          "and_then": [
+            "maximum delay never exceeds 60s"
+          ]
+        },
+        {
+          "name": "429 respects Retry-After",
+          "when": "POST /v1/register returns 429 with Retry-After: 30",
+          "then": "the retry waits at least 30s before the next attempt",
+          "and_then": []
+        },
+        {
+          "name": "Timeout after max duration",
+          "when": "all retry attempts fail for 5 minutes",
+          "then": "registration fails with a timeout error wrapping the last encountered error",
+          "and_then": []
+        },
+        {
+          "name": "Context cancellation stops retry",
+          "when": "the context is cancelled during a backoff wait",
+          "then": "the retry loop exits immediately with the context error",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The registration package SHALL persist node identity and credentials atomically to data_dir with secure file permissions (0600 for keys, 0700 for directory)",
+      "priority": "SHALL",
+      "rationale": "Atomic writes prevent corruption on crash; secure permissions protect private key material",
+      "scenarios": [
+        {
+          "name": "Identity persisted after registration",
+          "when": "registration succeeds with valid response",
+          "then": "identity.json, private_key, node_secret_key, and signing_public_key files are written to data_dir",
+          "and_then": [
+            "private_key and node_secret_key have 0600 permissions"
+          ]
+        },
+        {
+          "name": "Atomic write prevents corruption",
+          "when": "write to temp file and rename pattern is used",
+          "then": "either the old state or the new state is present, never a partial write",
+          "and_then": []
+        },
+        {
+          "name": "data_dir created if missing",
+          "when": "data_dir does not exist",
+          "then": "the directory is created with 0700 permissions",
+          "and_then": []
+        },
+        {
+          "name": "LoadIdentity returns ErrNotRegistered for missing files",
+          "when": "identity files are absent from data_dir",
+          "then": "LoadIdentity returns ErrNotRegistered",
+          "and_then": [
+            "errors.Is(err, ErrNotRegistered) returns true"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The Registrar SHALL delete the bootstrap token file from disk immediately after successful registration",
+      "priority": "SHALL",
+      "rationale": "One-time-use tokens must be removed to prevent reuse if the filesystem is compromised",
+      "scenarios": [
+        {
+          "name": "File-based token deleted after registration",
+          "when": "registration succeeds and the token was read from a file",
+          "then": "the token file is deleted from disk",
+          "and_then": [
+            "a debug log confirms deletion"
+          ]
+        },
+        {
+          "name": "Deletion failure does not fail registration",
+          "when": "the token file cannot be deleted (permission denied)",
+          "then": "a warn-level log is emitted with the error",
+          "and_then": [
+            "the registration result is still returned successfully"
+          ]
+        },
+        {
+          "name": "Non-file tokens skip cleanup",
+          "when": "the token was read from an environment variable",
+          "then": "no file deletion is attempted",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The Registrar SHALL detect existing valid identity in data_dir and skip re-registration on agent restart",
+      "priority": "SHALL",
+      "rationale": "Avoids consuming a new bootstrap token on agent restart and reduces unnecessary control plane calls",
+      "scenarios": [
+        {
+          "name": "Existing identity used on restart",
+          "when": "Register() is called and valid identity files exist in data_dir",
+          "then": "the persisted identity is loaded and returned without calling POST /v1/register",
+          "and_then": [
+            "the ControlPlane auth token is set from the persisted identity"
+          ]
+        },
+        {
+          "name": "Corrupt identity triggers re-registration",
+          "when": "identity files exist but are corrupt or incomplete",
+          "then": "a warning is logged and fresh registration proceeds",
+          "and_then": [
+            "new identity files overwrite the corrupt ones"
+          ]
+        },
+        {
+          "name": "IsRegistered returns correct state",
+          "when": "IsRegistered() is called",
+          "then": "returns true if valid identity files exist, false otherwise",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The registration Config SHALL define data_dir, token source paths, hostname override, metadata, and retry settings with reasonable defaults",
+      "priority": "SHALL",
+      "rationale": "Separates configuration from logic; defaults match the README specification",
+      "scenarios": [
+        {
+          "name": "Defaults applied for zero values",
+          "when": "Config with only DataDir set",
+          "then": "MaxRetryDuration defaults to 5m, TokenFile defaults to /etc/plexd/bootstrap-token, TokenEnv defaults to PLEXD_BOOTSTRAP_TOKEN",
+          "and_then": []
+        },
+        {
+          "name": "Empty DataDir rejected on validation",
+          "when": "Config.DataDir is empty",
+          "then": "Validate returns a descriptive error",
+          "and_then": []
+        },
+        {
+          "name": "Custom settings override defaults",
+          "when": "MaxRetryDuration set to 10m and TokenFile set to custom path",
+          "then": "the configured values are used instead of defaults",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The Registrar SHALL set the ControlPlane client auth token to the bootstrap token before registration and update it to the node identity token after successful registration",
+      "priority": "SHALL",
+      "rationale": "POST /v1/register authenticates via bootstrap token; all subsequent API calls require the node identity token",
+      "scenarios": [
+        {
+          "name": "Bootstrap token set before register call",
+          "when": "the Registrar calls POST /v1/register",
+          "then": "the ControlPlane client Authorization header contains the bootstrap token",
+          "and_then": []
+        },
+        {
+          "name": "Identity token set after registration",
+          "when": "registration succeeds",
+          "then": "the ControlPlane client auth token is updated to node_secret_key",
+          "and_then": []
+        },
+        {
+          "name": "Persisted identity sets token on restart",
+          "when": "the agent loads an existing identity",
+          "then": "the ControlPlane client auth token is set from the persisted node_secret_key",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "All registration operations SHALL support context-based cancellation for graceful shutdown",
+      "priority": "SHALL",
+      "rationale": "The agent may receive SIGTERM during registration; clean cancellation prevents resource leaks",
+      "scenarios": [
+        {
+          "name": "Cancellation during retry backoff",
+          "when": "context is cancelled during a backoff wait",
+          "then": "the retry loop exits immediately with context error",
+          "and_then": []
+        },
+        {
+          "name": "Cancellation during HTTP request",
+          "when": "context is cancelled while POST /v1/register is in flight",
+          "then": "the HTTP request is cancelled and error propagated",
+          "and_then": []
+        },
+        {
+          "name": "Cancellation during token file read",
+          "when": "context is cancelled (though file reads are fast, the check is consistent)",
+          "then": "cancellation is checked before each operation",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "The registration package SHALL use structured logging (log/slog) with consistent keys matching internal/api/ patterns",
+      "priority": "SHALL",
+      "rationale": "Operational consistency with the existing codebase logging approach",
+      "scenarios": [
+        {
+          "name": "Registration success logged with identity",
+          "when": "registration completes successfully",
+          "then": "info log with component=registration, node_id, mesh_ip",
+          "and_then": [
+            "no private key material in any log"
+          ]
+        },
+        {
+          "name": "Retry logged with context",
+          "when": "a transient error triggers retry",
+          "then": "warn log with component=registration, attempt, error, backoff_duration",
+          "and_then": []
+        },
+        {
+          "name": "Token source logged without value",
+          "when": "token resolved",
+          "then": "debug log with component=registration, source=(file|env|metadata)",
+          "and_then": [
+            "token value is never logged"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-012",
+      "description": "The registration package SHALL collect the local hostname via os.Hostname() or an override, and pass optional metadata to the registration request",
+      "priority": "SHALL",
+      "rationale": "Hostname and metadata are required fields in RegisterRequest for node identification",
+      "scenarios": [
+        {
+          "name": "OS hostname used by default",
+          "when": "no hostname override is configured",
+          "then": "os.Hostname() provides the hostname for the registration request",
+          "and_then": []
+        },
+        {
+          "name": "Hostname override from config",
+          "when": "Config.Hostname is set",
+          "then": "the configured hostname overrides os.Hostname()",
+          "and_then": []
+        },
+        {
+          "name": "Metadata included in request",
+          "when": "Config.Metadata is non-empty",
+          "then": "all key-value pairs are included in the RegisterRequest.Metadata field",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/registration/config.go — Define Config struct: DataDir string, TokenFile string (default /etc/plexd/bootstrap-token), TokenEnv string (default PLEXD_BOOTSTRAP_TOKEN), TokenValue string (direct override), UseMetadata bool, Hostname string (override, default os.Hostname()), Metadata map[string]string, MaxRetryDuration time.Duration (default 5m). Implement ApplyDefaults() and Validate() matching internal/api/config.go pattern. Include tests in config_test.go for defaults and validation. (REQ-008)",
+    "1.2 Create internal/registration/keys.go — Implement GenerateKeypair() (Keypair, error) using golang.org/x/crypto/curve25519. Keypair struct: PrivateKey []byte, PublicKey []byte. Use crypto/rand for 32-byte private key, clamp per Curve25519 spec, derive public key via curve25519.X25519(privateKey, curve25519.Basepoint). Implement EncodePublicKey() string returning standard base64. Include tests in keys_test.go: valid key derivation, base64 roundtrip, uniqueness across calls. (REQ-002)",
+    "1.3 Create internal/registration/token.go — Implement TokenResolver struct with Resolve(ctx) (TokenResult, error). TokenResult: Value string, FilePath string (non-empty if from file). Check sources in order: Config.TokenValue, Config.TokenFile (os.ReadFile, trim), Config.TokenEnv (os.Getenv, trim), metadata (via MetadataProvider interface, nil = skip). Validate: non-empty, <=512 bytes, printable ASCII. Implement MetadataProvider interface: ReadToken(ctx) (string, error) for future Cloud-Init/K8s support. Include tests in token_test.go using temp files and t.Setenv for all scenarios. (REQ-001)",
+    "1.4 Create internal/registration/identity.go — Define NodeIdentity struct: NodeID string, MeshIP string, PrivateKey []byte (json:\"-\"), SigningPublicKey string, NodeSecretKey string (json:\"-\"). Define ErrNotRegistered sentinel error. Implement SaveIdentity(dataDir, identity) error: create dataDir (0700), write identity.json atomically (temp+rename, 0600), write private_key (0600), write node_secret_key (0600), write signing_public_key (0600). Implement LoadIdentity(dataDir) (*NodeIdentity, error): read all files, validate, return ErrNotRegistered if missing. Include tests in identity_test.go using t.TempDir for save/load roundtrip, missing files, corrupt JSON, permissions. (REQ-005)",
+    "2.1 Create internal/registration/registrar.go — Implement Registrar struct: ControlPlane client, Config, logger. Implement Register(ctx) (*NodeIdentity, error) orchestrating: (1) LoadIdentity → if ok, set auth token, return. (2) TokenResolver.Resolve → (3) GenerateKeypair → (4) set bootstrap token as auth → (5) call registerWithRetry → (6) build NodeIdentity from response + private key → (7) SaveIdentity → (8) delete token file if applicable → (9) set node_secret_key as auth token → return. Implement IsRegistered() bool. Include tests in registrar_test.go using httptest.Server: successful flow, skip on existing identity, 401/409 immediate failure. (REQ-003, REQ-006, REQ-007, REQ-009)",
+    "2.2 Add retry logic to registrar.go — Implement registerWithRetry(ctx, req) (*RegisterResponse, error): retry loop using the same backoff pattern as internal/api/reconnect.go (reuse ClassifyError). Exponential backoff 1s/2x/60s cap, ±25% jitter. Permanent errors (401, 403, 409, 400) fail immediately. 429 respects Retry-After. Timeout after Config.MaxRetryDuration. Context cancellation exits. Use injectable Clock interface for testable timing. Include tests in registrar_test.go: transient retry with eventual success, 429 with Retry-After, timeout after max duration, context cancellation during backoff. (REQ-004, REQ-010)",
+    "3.1 Create docs/reference/backend/registration.md — Reference documentation for internal/registration/ package: Config struct fields and defaults, TokenResolver usage and source priority, GenerateKeypair usage, NodeIdentity struct and persistence layout, Registrar lifecycle and Register() method, ErrNotRegistered error, MetadataProvider interface. Include code examples for constructing a Registrar and running registration. (REQ-001 through REQ-012)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/registration/token_test.go",
+      "test_function": "TestTokenResolver_FromFile",
+      "story": "plexd resolves the bootstrap token from multiple sources",
+      "expected": "Token is read from file, whitespace trimmed, and file path recorded for cleanup",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/token_test.go",
+      "test_function": "TestTokenResolver_FromEnvVar",
+      "story": "plexd resolves the bootstrap token from multiple sources",
+      "expected": "Token is read from PLEXD_BOOTSTRAP_TOKEN env var when file is not available",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/token_test.go",
+      "test_function": "TestTokenResolver_PriorityOrder",
+      "story": "plexd resolves the bootstrap token from multiple sources",
+      "expected": "File source takes priority over env var when both are available",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/token_test.go",
+      "test_function": "TestTokenResolver_NoSourceAvailable",
+      "story": "plexd resolves the bootstrap token from multiple sources",
+      "expected": "Returns descriptive error listing all attempted sources when no token is found",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/token_test.go",
+      "test_function": "TestTokenResolver_InvalidFormat",
+      "story": "plexd resolves the bootstrap token from multiple sources",
+      "expected": "Rejects tokens exceeding 512 bytes or containing non-printable characters",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/keys_test.go",
+      "test_function": "TestGenerateKeypair_ValidKeys",
+      "story": "plexd generates a Curve25519 keypair for mesh encryption",
+      "expected": "Generated public key is the Curve25519 scalar base product of the private key",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/registration/keys_test.go",
+      "test_function": "TestGenerateKeypair_Base64Encoding",
+      "story": "plexd generates a Curve25519 keypair for mesh encryption",
+      "expected": "Public key base64 encoding produces a valid 44-character string that round-trips",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/registration/keys_test.go",
+      "test_function": "TestGenerateKeypair_Uniqueness",
+      "story": "plexd generates a Curve25519 keypair for mesh encryption",
+      "expected": "Two consecutive keypair generations produce different keys",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_SuccessfulRegistration",
+      "story": "plexd registers with the control plane using the bootstrap token",
+      "expected": "POST /v1/register with correct payload returns NodeIdentity with node_id, mesh_ip, signing_public_key, node_secret_key, peers",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_401FailsImmediately",
+      "story": "plexd registers with the control plane using the bootstrap token",
+      "expected": "401 Unauthorized response causes immediate failure with ErrUnauthorized, no retries",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_409FailsImmediately",
+      "story": "plexd registers with the control plane using the bootstrap token",
+      "expected": "409 Conflict response causes immediate failure with ErrConflict, no retries",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_RetriesOnTransientError",
+      "story": "plexd retries registration on transient failures with exponential backoff",
+      "expected": "503 errors trigger retries with increasing backoff delays; eventual success returns identity",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_Retry429RespectsRetryAfter",
+      "story": "plexd retries registration on transient failures with exponential backoff",
+      "expected": "429 with Retry-After header delays next attempt by the specified duration",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_RetryTimeout",
+      "story": "plexd retries registration on transient failures with exponential backoff",
+      "expected": "After max retry duration, registration fails with timeout error wrapping last error",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_ContextCancellationStopsRetry",
+      "story": "plexd retries registration on transient failures with exponential backoff",
+      "expected": "Context cancellation during backoff exits immediately with context error",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/registration/identity_test.go",
+      "test_function": "TestSaveIdentity_AtomicWrite",
+      "story": "plexd persists registration identity and credentials to data_dir",
+      "expected": "Identity files are written atomically via temp-write-rename; permissions are 0600",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/registration/identity_test.go",
+      "test_function": "TestSaveIdentity_CreatesDataDir",
+      "story": "plexd persists registration identity and credentials to data_dir",
+      "expected": "If data_dir does not exist, it is created with 0700 permissions before writing files",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/registration/identity_test.go",
+      "test_function": "TestLoadIdentity_Success",
+      "story": "plexd persists registration identity and credentials to data_dir",
+      "expected": "LoadIdentity returns populated NodeIdentity from previously saved files",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/registration/identity_test.go",
+      "test_function": "TestLoadIdentity_MissingFiles",
+      "story": "plexd persists registration identity and credentials to data_dir",
+      "expected": "LoadIdentity returns ErrNotRegistered when identity files are absent",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/registration/identity_test.go",
+      "test_function": "TestLoadIdentity_CorruptJSON",
+      "story": "plexd persists registration identity and credentials to data_dir",
+      "expected": "LoadIdentity returns a descriptive error when identity.json contains invalid JSON",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_DeletesTokenFileAfterRegistration",
+      "story": "plexd deletes the bootstrap token after successful registration",
+      "expected": "Token file is deleted from disk after successful registration; verify file no longer exists",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_TokenDeletionFailureDoesNotFailRegistration",
+      "story": "plexd deletes the bootstrap token after successful registration",
+      "expected": "When token file deletion fails, registration still returns success",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_SkipsRegistrationIfIdentityExists",
+      "story": "plexd skips registration if already registered",
+      "expected": "When valid identity files exist, Register() returns identity without HTTP call",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_ReRegistersOnCorruptIdentity",
+      "story": "plexd skips registration if already registered",
+      "expected": "When identity files are corrupt, re-registration proceeds and overwrites them",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_IsRegistered",
+      "story": "plexd skips registration if already registered",
+      "expected": "IsRegistered() returns true with valid identity files, false without",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/registration/config_test.go",
+      "test_function": "TestConfig_Defaults",
+      "story": "plexd orchestrates the full registration flow end-to-end",
+      "expected": "Config with only DataDir set uses default MaxRetryDuration=5m and default token paths",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/registration/config_test.go",
+      "test_function": "TestConfig_ValidateRequiresDataDir",
+      "story": "plexd orchestrates the full registration flow end-to-end",
+      "expected": "Config.Validate returns error when DataDir is empty",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_SetsAuthTokenBeforeAndAfterRegistration",
+      "story": "plexd orchestrates the full registration flow end-to-end",
+      "expected": "Bootstrap token used for register call, node_secret_key set after success",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/registration/registrar_test.go",
+      "test_function": "TestRegistrar_FullFlow",
+      "story": "plexd orchestrates the full registration flow end-to-end",
+      "expected": "End-to-end: resolve token → generate keypair → register → persist → cleanup → set auth token",
+      "requirement_id": "REQ-003"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-012) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "Token resolution correctly follows priority order: direct > file > env > metadata",
+    "Curve25519 keypair generation uses crypto/rand and produces valid WireGuard-compatible keys",
+    "Registration retry logic correctly classifies errors using internal/api.ClassifyError: 401/403/409/400 fail immediately, 5xx/network retry with backoff, 429 respects Retry-After",
+    "Identity persistence uses atomic write (temp file + rename) with 0600 permissions for all sensitive files",
+    "Bootstrap token file is deleted after successful registration; deletion failure does not block registration",
+    "Private key material (PrivateKey, NodeSecretKey) is never logged at any level",
+    "Agent restart with valid identity files skips registration and loads persisted state",
+    "All operations support context-based cancellation and exit cleanly",
+    "Code follows existing patterns: log/slog with structured keys, Config with ApplyDefaults/Validate, stdlib-only test dependencies (httptest.Server)",
+    "Reference documentation covers all public types, methods, and usage patterns (docs/reference/backend/registration.md)",
+    "No file I/O in the registration package beyond the explicitly defined identity and token operations — config loading is the caller's responsibility"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All code lives in `internal/registration/` per the README project structure. Files: config.go, keys.go, token.go, identity.go, registrar.go, and corresponding _test.go files.\n\n2. **Dependency on internal/api/**: The Registrar takes a `*api.ControlPlane` client and uses its `Register()` method and `SetAuthToken()`. It reuses `api.ClassifyError()` for error classification in the retry loop. It uses `api.RegisterRequest` and `api.RegisterResponse` types.\n\n3. **No duplication of retry logic**: Rather than re-implementing exponential backoff, the registrar uses the same `ClassifyError` function from `internal/api/reconnect.go` and implements a simpler retry loop (not a full state machine like ReconnectEngine, since registration is a single-shot operation, not a persistent connection). The retry loop shares the same backoff parameters (1s base, 2x, 60s cap, ±25% jitter) for consistency.\n\n4. **Curve25519 key generation**: Uses `golang.org/x/crypto/curve25519` for WireGuard-compatible keys. This adds one external dependency. The private key is clamped per the Curve25519 spec (clear bits 0-2 and 255, set bit 254). Public key = curve25519.X25519(privateKey, Basepoint).\n\n5. **Token resolution design**: The `TokenResolver` is a pure function over config + OS state. The `MetadataProvider` interface (`ReadToken(ctx) (string, error)`) allows S020 (bare-metal) and S021 (VM/Cloud-Init) to inject cloud-specific metadata readers without modifying the registration package.\n\n6. **Identity persistence**: Uses the standard atomic write pattern (write to temp file in same directory, fsync, os.Rename). The `NodeIdentity.PrivateKey` and `NodeIdentity.NodeSecretKey` fields use `json:\"-\"` tags to prevent accidental serialization — they are stored in separate files. The identity.json file contains only NodeID, MeshIP, and SigningPublicKey.\n\n7. **Auth token lifecycle**: Before registration: `SetAuthToken(bootstrapToken)`. After registration: `SetAuthToken(response.NodeSecretKey)`. On restart: `SetAuthToken(persisted.NodeSecretKey)`. The README states the node_secret_key is used as the bearer token for all post-registration API calls.\n\n8. **Capabilities**: The `RegisterRequest.Capabilities` field is optional. S002 passes it through from the caller (the capabilities payload is assembled by the agent lifecycle code, not by the registration package). If nil, the field is omitted from the JSON payload.\n\n9. **Hostname**: Default from `os.Hostname()`, overridable via `Config.Hostname`. This avoids pulling in the full agent config — the registration Config is focused.\n\n10. **Testing strategy**: All tests use `t.TempDir()` for file operations and `httptest.Server` for HTTP assertions. Token tests use `t.Setenv()` for environment variable manipulation. Retry tests use a fake Clock interface (same pattern as `internal/api/reconnect.go`).\n\n11. **Logging convention**: Uses `log/slog` with `component=registration` key. Matches the `internal/api/` pattern of accepting `*slog.Logger` in constructors.\n\n12. **Key files from existing codebase**:\n    - `internal/api/client.go` — ControlPlane.SetAuthToken(), Register() method\n    - `internal/api/types.go` — RegisterRequest, RegisterResponse types\n    - `internal/api/errors.go` — APIError, ErrUnauthorized, ErrConflict sentinels\n    - `internal/api/reconnect.go` — ClassifyError, Clock interface, jitter pattern\n    - `internal/api/config.go` — Config pattern with ApplyDefaults/Validate\n\n13. **Potential pitfalls**:\n    - `golang.org/x/crypto/curve25519` must be added to go.mod — this is the only new dependency.\n    - Token file may not exist if Cloud-Init hasn't run yet — the resolver must handle this gracefully.\n    - Atomic rename fails across filesystem boundaries — temp file must be in the same directory as the target.\n    - The `node_secret_key` from the RegisterResponse is base64-encoded — store it as-is for use as bearer token.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.104550"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T08:05:09.839333"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T08:10:55.283882"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "067c47a7-b5c5-48d0-9f20-77f9ffca84d8",
+      "timestamp": "2026-02-12T08:10:55.283923",
+      "total_duration": 342.4106676578522,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 342.4106676578522,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
