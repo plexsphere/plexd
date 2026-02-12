@@ -1,0 +1,622 @@
+{
+  "feature_id": "PXD-0009",
+  "title": "C002: Implement secure access tunneling",
+  "slug": "c002-implement-secure-access-tunneling",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Enable platform-mediated access to managed resources. Tunnel SSH sessions to servers/VMs and Kubernetes API access through the mesh without exposing services directly to the internet. The control plane orchestrates access sessions; plexd provides the local tunnel endpoints.",
+  "stories": [
+    {
+      "title": "plexd receives ssh_session_setup SSE events and opens a local TCP listener for SSH tunneling",
+      "role": "plexd agent",
+      "want": "to receive ssh_session_setup SSE events from the control plane containing session details (session_id, target_host, target_port, authorized_public_key), open a local TCP listener, and forward connections through the WireGuard mesh to the target host",
+      "so_that": "platform users can access SSH on managed servers through the mesh without exposing SSH ports to the public internet",
+      "criteria": [
+        "An EventHandler for EventSSHSessionSetup is registered with the SSEManager",
+        "The handler parses the SSE payload into an SSHSessionSetup struct containing SessionID, TargetHost, TargetPort, AuthorizedKey, and ExpiresAt",
+        "A local TCP listener is opened on a free port bound to the WireGuard mesh IP (not 0.0.0.0)",
+        "The listener address (mesh_ip:port) is reported back to the control plane via POST /v1/nodes/{node_id}/tunnels/{session_id}/ready",
+        "Malformed ssh_session_setup payloads are logged at error level and do not crash the agent"
+      ]
+    },
+    {
+      "title": "plexd forwards TCP connections from the local tunnel listener to the target host",
+      "role": "plexd agent",
+      "want": "to accept incoming TCP connections on the tunnel listener and forward them bidirectionally to the target host:port on the managed server",
+      "so_that": "SSH traffic flows transparently through the mesh tunnel to the target service",
+      "criteria": [
+        "Each accepted TCP connection triggers a goroutine that dials target_host:target_port and performs bidirectional io.Copy",
+        "The tunnel supports exactly one concurrent connection per session (additional connections are rejected with a close)",
+        "If the dial to the target fails, the incoming connection is closed and the error is logged at error level",
+        "Data is forwarded bidirectionally: client→target and target→client, with both directions shutting down cleanly when either side closes",
+        "Context cancellation (from session expiry or session_revoked event) closes both the listener and any active connection"
+      ]
+    },
+    {
+      "title": "plexd enforces session expiry and revocation for tunnel sessions",
+      "role": "plexd agent",
+      "want": "to automatically close tunnel sessions when they expire (based on ExpiresAt) or when a session_revoked SSE event is received",
+      "so_that": "access tunnels are time-bounded and can be revoked in real-time by the platform, preventing stale or unauthorized access",
+      "criteria": [
+        "A time.AfterFunc or context.WithDeadline is used to close the listener and active connection when ExpiresAt is reached",
+        "An EventHandler for EventSessionRevoked is registered that looks up the session by ID and cancels its context",
+        "When a session is closed (expired or revoked), the tunnel listener is closed, active connections are terminated, and the session is removed from the active session map",
+        "Session closure is logged at info level with session_id, reason (expired/revoked), and duration",
+        "Revoking a non-existent session ID is a no-op (logged at debug level)"
+      ]
+    },
+    {
+      "title": "plexd tracks active tunnel sessions and enforces a maximum session limit",
+      "role": "plexd agent",
+      "want": "to track all active tunnel sessions in a concurrent-safe map and reject new sessions when the maximum session count is reached",
+      "so_that": "the node's resources are protected from being exhausted by excessive tunnel sessions",
+      "criteria": [
+        "SessionManager maintains a sync.Map or mutex-protected map of active sessions keyed by session_id",
+        "Config.MaxSessions (default: 10) limits concurrent active sessions",
+        "When MaxSessions is reached, new ssh_session_setup events are rejected with an error logged at warn level",
+        "Completed sessions are removed from the map automatically on close",
+        "SessionManager.Shutdown() closes all active sessions during graceful agent shutdown"
+      ]
+    },
+    {
+      "title": "plexd reports tunnel session status to the control plane",
+      "role": "plexd agent",
+      "want": "to report tunnel readiness when a listener is opened, and session closure when the tunnel terminates",
+      "so_that": "the control plane knows the tunnel is ready for use and can track session lifecycle for auditing",
+      "criteria": [
+        "POST /v1/nodes/{node_id}/tunnels/{session_id}/ready is sent with the listener address when the tunnel is ready",
+        "POST /v1/nodes/{node_id}/tunnels/{session_id}/closed is sent with reason (expired, revoked, error, completed) when the tunnel closes",
+        "If reporting fails, the error is logged at warn level but does not affect tunnel operation (fire-and-forget)",
+        "All status reports include session_id and timestamp"
+      ]
+    },
+    {
+      "title": "Platform operator can configure tunnel session parameters",
+      "role": "platform operator",
+      "want": "to configure tunnel parameters: enable/disable tunneling, maximum concurrent sessions, and default session timeout",
+      "so_that": "tunnel behavior can be tuned per deployment environment or disabled entirely for security",
+      "criteria": [
+        "Config struct has Enabled bool (default: true), MaxSessions int (default: 10), DefaultTimeout time.Duration (default: 30m)",
+        "When Enabled is false, ssh_session_setup events are ignored with a debug log",
+        "Config.Validate rejects MaxSessions <= 0 when enabled and DefaultTimeout < 1m when enabled",
+        "Config.ApplyDefaults sets Enabled=true, MaxSessions=10, DefaultTimeout=30m on zero-valued Config"
+      ]
+    },
+    {
+      "title": "Tunnel session errors do not crash the agent",
+      "role": "platform operator",
+      "want": "all tunnel session errors to be handled gracefully with logging rather than panics",
+      "so_that": "plexd remains operational even when individual tunnel sessions fail",
+      "criteria": [
+        "Listener bind failures are logged at error level and the session is not added to the active map",
+        "Dial failures to the target host are logged at error level per connection attempt",
+        "IO copy errors (broken pipe, connection reset) are logged at warn level and the connection is closed cleanly",
+        "Concurrent map access for session tracking is safe under all conditions (run with -race)"
+      ]
+    },
+    {
+      "title": "Reference documentation for secure access tunneling",
+      "role": "developer",
+      "want": "comprehensive reference documentation for the internal/tunnel package",
+      "so_that": "future developers understand the SessionManager, tunnel lifecycle, SSE event handling, and data flow",
+      "criteria": [
+        "Documentation covers Config, SessionManager, Session struct, SSE handlers, and API reporting",
+        "Documentation includes data flow: control plane → ssh_session_setup SSE → local listener → TCP forward → target host",
+        "Documentation references related packages: internal/wireguard, internal/api, internal/policy",
+        "Documentation is placed at docs/reference/backend/secure-access-tunneling.md"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The tunnel package SHALL parse ssh_session_setup SSE events and open a local TCP tunnel listener on the mesh IP",
+      "priority": "SHALL",
+      "rationale": "The core functionality: receiving tunnel requests from the control plane and creating the local endpoint for SSH forwarding",
+      "scenarios": [
+        {
+          "name": "Valid ssh_session_setup creates tunnel listener",
+          "when": "an ssh_session_setup SSE event is received with valid SessionID, TargetHost, TargetPort, and ExpiresAt",
+          "then": "a TCP listener is opened on the node's mesh IP on a free port",
+          "and_then": [
+            "the session is added to the active session map",
+            "the tunnel ready status is reported to the control plane"
+          ]
+        },
+        {
+          "name": "Malformed ssh_session_setup is rejected",
+          "when": "an ssh_session_setup SSE event has an invalid or missing required field (e.g., empty TargetHost, port=0)",
+          "then": "the event is logged at error level and no tunnel is created",
+          "and_then": [
+            "no session is added to the active map"
+          ]
+        },
+        {
+          "name": "Duplicate session ID is rejected",
+          "when": "an ssh_session_setup event arrives with a session_id that already has an active session",
+          "then": "the event is logged at warn level and ignored",
+          "and_then": [
+            "the existing session remains unaffected"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The tunnel package SHALL forward TCP connections bidirectionally between the listener and the target host",
+      "priority": "SHALL",
+      "rationale": "The actual data path: forwarding bytes between the SSH client (connecting via mesh) and the target SSH server",
+      "scenarios": [
+        {
+          "name": "Bidirectional forwarding works",
+          "when": "a client connects to the tunnel listener and the dial to target succeeds",
+          "then": "data flows bidirectionally: bytes written by the client are forwarded to the target and vice versa",
+          "and_then": [
+            "when either side closes the connection, both sides are cleaned up"
+          ]
+        },
+        {
+          "name": "Dial failure closes client connection",
+          "when": "a client connects to the tunnel listener but the dial to target_host:target_port fails",
+          "then": "the client connection is closed immediately",
+          "and_then": [
+            "error is logged with session_id and target address"
+          ]
+        },
+        {
+          "name": "Only one concurrent connection per session",
+          "when": "a second client connects while the first connection is still active",
+          "then": "the second connection is closed immediately",
+          "and_then": [
+            "the first connection remains unaffected"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The tunnel package SHALL enforce session expiry via the ExpiresAt timestamp from the SSE event",
+      "priority": "SHALL",
+      "rationale": "Security requirement — tunnels must not remain open indefinitely; time-bounded access prevents stale sessions",
+      "scenarios": [
+        {
+          "name": "Session expires at ExpiresAt",
+          "when": "the current time reaches or exceeds the session's ExpiresAt timestamp",
+          "then": "the tunnel listener is closed and any active connection is terminated",
+          "and_then": [
+            "the session is removed from the active map",
+            "session closed status with reason 'expired' is reported to the control plane"
+          ]
+        },
+        {
+          "name": "Session with ExpiresAt in the past is rejected",
+          "when": "an ssh_session_setup event has ExpiresAt in the past",
+          "then": "the session is rejected and logged at warn level",
+          "and_then": [
+            "no listener is opened"
+          ]
+        },
+        {
+          "name": "DefaultTimeout caps session duration",
+          "when": "the ExpiresAt is more than Config.DefaultTimeout from now",
+          "then": "the session duration is capped at DefaultTimeout",
+          "and_then": [
+            "a debug log indicates the cap was applied"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The tunnel package SHALL handle session_revoked SSE events by closing the corresponding session immediately",
+      "priority": "SHALL",
+      "rationale": "Platform administrators need the ability to immediately revoke access tunnels for security incidents",
+      "scenarios": [
+        {
+          "name": "Session revocation closes tunnel",
+          "when": "a session_revoked SSE event is received with a session_id matching an active session",
+          "then": "the session's context is cancelled, listener is closed, active connection is terminated",
+          "and_then": [
+            "session closed status with reason 'revoked' is reported to the control plane"
+          ]
+        },
+        {
+          "name": "Revocation of unknown session is no-op",
+          "when": "a session_revoked SSE event is received with a session_id not in the active map",
+          "then": "the event is logged at debug level and ignored",
+          "and_then": []
+        },
+        {
+          "name": "Malformed session_revoked event handled",
+          "when": "a session_revoked SSE event has an invalid payload",
+          "then": "an error is logged but the agent does not crash",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The tunnel package SHALL enforce a configurable maximum number of concurrent sessions",
+      "priority": "SHALL",
+      "rationale": "Resource protection — prevents a compromised or misconfigured control plane from exhausting node resources",
+      "scenarios": [
+        {
+          "name": "Sessions within limit are accepted",
+          "when": "the number of active sessions is below Config.MaxSessions",
+          "then": "the new session is created normally",
+          "and_then": []
+        },
+        {
+          "name": "Sessions exceeding limit are rejected",
+          "when": "the number of active sessions equals Config.MaxSessions and a new ssh_session_setup arrives",
+          "then": "the event is rejected with a warn log indicating max sessions reached",
+          "and_then": [
+            "no listener is opened"
+          ]
+        },
+        {
+          "name": "Closed session frees a slot",
+          "when": "an active session closes (expired/revoked/completed) and a new ssh_session_setup arrives",
+          "then": "the new session is accepted since the count is now below MaxSessions",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The tunnel package SHALL report session lifecycle events to the control plane via dedicated API endpoints",
+      "priority": "SHALL",
+      "rationale": "The control plane needs to know when tunnels are ready and when they close, for user-facing status and auditing",
+      "scenarios": [
+        {
+          "name": "Ready status reported on tunnel open",
+          "when": "a tunnel listener is successfully opened",
+          "then": "POST /v1/nodes/{node_id}/tunnels/{session_id}/ready is sent with the listener address",
+          "and_then": [
+            "if the POST fails, a warn log is emitted but the tunnel remains operational"
+          ]
+        },
+        {
+          "name": "Closed status reported on tunnel close",
+          "when": "a tunnel session closes for any reason",
+          "then": "POST /v1/nodes/{node_id}/tunnels/{session_id}/closed is sent with the close reason",
+          "and_then": [
+            "if the POST fails, a warn log is emitted"
+          ]
+        },
+        {
+          "name": "Status reporting is non-blocking",
+          "when": "the control plane is unreachable during status reporting",
+          "then": "the report times out and a warn log is emitted",
+          "and_then": [
+            "the tunnel operation is not affected"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The tunnel Config SHALL follow the established Config pattern with ApplyDefaults and Validate methods",
+      "priority": "SHALL",
+      "rationale": "Consistency with wireguard.Config, nat.Config, policy.Config patterns in the codebase",
+      "scenarios": [
+        {
+          "name": "Zero-valued config gets defaults",
+          "when": "Config.ApplyDefaults is called on a zero-valued Config",
+          "then": "Enabled is set to true, MaxSessions is set to 10, DefaultTimeout is set to 30m",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects invalid MaxSessions when enabled",
+          "when": "Config.Validate is called with Enabled=true and MaxSessions <= 0",
+          "then": "an error is returned: 'tunnel: config: MaxSessions must be positive when enabled'",
+          "and_then": []
+        },
+        {
+          "name": "Disabled config passes validation",
+          "when": "Config.Validate is called with Enabled=false",
+          "then": "nil is returned regardless of other field values",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The tunnel package SHALL use structured logging with log/slog and component=tunnel",
+      "priority": "SHALL",
+      "rationale": "Operational consistency with existing internal packages (api, wireguard, nat, policy) logging patterns",
+      "scenarios": [
+        {
+          "name": "Session created logged",
+          "when": "a new tunnel session is created",
+          "then": "info log with component=tunnel, session_id, target_host, target_port, listen_addr, expires_at",
+          "and_then": []
+        },
+        {
+          "name": "Session closed logged",
+          "when": "a tunnel session closes",
+          "then": "info log with component=tunnel, session_id, reason, duration",
+          "and_then": []
+        },
+        {
+          "name": "Connection forwarded logged",
+          "when": "a TCP connection is accepted and forwarding begins",
+          "then": "debug log with component=tunnel, session_id, remote_addr",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The SessionManager SHALL support graceful shutdown closing all active sessions",
+      "priority": "SHALL",
+      "rationale": "Clean shutdown prevents orphaned listeners and goroutine leaks when the agent stops",
+      "scenarios": [
+        {
+          "name": "Shutdown closes all sessions",
+          "when": "SessionManager.Shutdown is called",
+          "then": "all active sessions have their contexts cancelled, listeners closed, and connections terminated",
+          "and_then": [
+            "close status is reported for each session with reason 'shutdown'"
+          ]
+        },
+        {
+          "name": "Shutdown is idempotent",
+          "when": "Shutdown is called when no sessions are active",
+          "then": "no error is returned",
+          "and_then": []
+        },
+        {
+          "name": "No goroutine leaks after shutdown",
+          "when": "Shutdown completes",
+          "then": "all goroutines spawned by sessions have terminated",
+          "and_then": [
+            "verified by goleak in tests"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The tunnel package SHALL bind listeners exclusively to the mesh IP, not to 0.0.0.0",
+      "priority": "SHALL",
+      "rationale": "Security requirement — tunnel listeners must only be reachable through the WireGuard mesh, not on public interfaces",
+      "scenarios": [
+        {
+          "name": "Listener bound to mesh IP",
+          "when": "a tunnel session is created",
+          "then": "the TCP listener binds to mesh_ip:0 (random free port on mesh interface only)",
+          "and_then": [
+            "connections from outside the mesh cannot reach the listener"
+          ]
+        },
+        {
+          "name": "Listen failure on mesh IP",
+          "when": "net.Listen fails on the mesh IP (e.g., address not available)",
+          "then": "the session creation fails with an error logged",
+          "and_then": [
+            "no session is added to the active map"
+          ]
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/tunnel/config.go — Define Config struct with Enabled bool, MaxSessions int, DefaultTimeout time.Duration. Implement ApplyDefaults() (Enabled=true, MaxSessions=10, DefaultTimeout=30m on zero-valued Config) and Validate() (reject MaxSessions<=0 when enabled, reject DefaultTimeout<1m when enabled, pass when disabled). Follow the same Config pattern as internal/wireguard/config.go and internal/policy/config.go. Include tests in config_test.go. (REQ-007)",
+    "1.2 Add API types to internal/api/types.go — Add SSHSessionSetup struct (SessionID, TargetHost string, TargetPort int, AuthorizedKey string, ExpiresAt time.Time), TunnelReadyRequest struct (ListenAddr string), TunnelClosedRequest struct (Reason string, Duration string). Add TunnelReady and TunnelClosed API endpoint methods to internal/api/endpoints.go (POST /v1/nodes/{node_id}/tunnels/{session_id}/ready and /closed). Include tests for the new types in types_test.go. (REQ-001, REQ-006)",
+    "1.3 Create internal/tunnel/session.go — Define Session struct holding SessionID, TargetHost, TargetPort, listener net.Listener, cancel context.CancelFunc, startTime, expiresAt, and active connection tracking (sync.Mutex + net.Conn). Implement Session.Run(ctx) that accepts TCP connections, enforces single-connection limit, dials target, performs bidirectional io.Copy, and closes cleanly on context cancellation. Implement Session.Close(). Include tests in session_test.go covering: bidirectional forwarding, dial failure, single-connection enforcement, context cancellation, mesh IP binding. (REQ-002, REQ-003, REQ-010)",
+    "1.4 Create internal/tunnel/manager.go — Define SessionManager struct wrapping Config, logger, mesh IP, active sessions map (sync.Mutex + map[string]*Session). Implement CreateSession(ctx, setup SSHSessionSetup) (string, error) that validates fields, checks max sessions, checks ExpiresAt > now, caps at DefaultTimeout, opens listener on mesh IP, starts session goroutine. Implement CloseSession(sessionID, reason), Shutdown(), ActiveCount(). Include tests in manager_test.go covering: create session, duplicate rejected, max sessions enforced, close session, shutdown, expired rejected, disabled rejects all, timeout cap. (REQ-001, REQ-003, REQ-005, REQ-009)",
+    "2.1 Create internal/tunnel/handler.go — Define HandleSSHSessionSetup(mgr *SessionManager, reporter TunnelReporter) api.EventHandler that parses the SSE payload, calls mgr.CreateSession, and reports ready status. Define HandleSessionRevoked(mgr *SessionManager, reporter TunnelReporter) api.EventHandler that parses session_id from payload and calls mgr.CloseSession with reason 'revoked'. Define TunnelReporter interface (ReportReady, ReportClosed) matching the API client methods. Include tests in handler_test.go. (REQ-001, REQ-004, REQ-006, REQ-008)",
+    "3.1 Create internal/tunnel/handler_integration_test.go — Integration tests wiring real SessionManager with local TCP test servers. Tests: full tunnel lifecycle (SSE setup → listener → connect → data → expire → cleanup), session revocation during active connection terminates it, max sessions enforced under concurrent ssh_session_setup events with -race, no goroutine leaks via goleak. (REQ-001 through REQ-005, REQ-009)",
+    "4.1 Create docs/reference/backend/secure-access-tunneling.md — Reference documentation for internal/tunnel/ package: Config struct, SessionManager, Session struct, SSE handlers (HandleSSHSessionSetup, HandleSessionRevoked), TunnelReporter interface, API types (SSHSessionSetup, TunnelReadyRequest, TunnelClosedRequest). Include data flow diagram: control plane → ssh_session_setup SSE → SessionManager → Session (listener + forwarder) → target host. Reference integration with internal/api, internal/wireguard. (REQ-001 through REQ-010)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/tunnel/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults",
+      "story": "Platform operator can configure tunnel session parameters",
+      "expected": "Config.ApplyDefaults sets Enabled=true, MaxSessions=10, DefaultTimeout=30m on zero-valued Config",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/tunnel/config_test.go",
+      "test_function": "TestConfig_Validate",
+      "story": "Platform operator can configure tunnel session parameters",
+      "expected": "Config.Validate rejects MaxSessions<=0 when enabled, rejects DefaultTimeout<1m when enabled, passes when disabled",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/tunnel/session_test.go",
+      "test_function": "TestSession_ForwardBidirectional",
+      "story": "plexd forwards TCP connections from the local tunnel listener to the target host",
+      "expected": "Data written by the client appears at the target and vice versa",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/tunnel/session_test.go",
+      "test_function": "TestSession_DialFailureClosesClient",
+      "story": "plexd forwards TCP connections from the local tunnel listener to the target host",
+      "expected": "When the target is unreachable, the client connection is closed and an error is logged",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/tunnel/session_test.go",
+      "test_function": "TestSession_SingleConnection",
+      "story": "plexd forwards TCP connections from the local tunnel listener to the target host",
+      "expected": "A second concurrent connection to the same session listener is rejected",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/tunnel/session_test.go",
+      "test_function": "TestSession_ExpiresAtDeadline",
+      "story": "plexd enforces session expiry and revocation for tunnel sessions",
+      "expected": "Session listener closes and connection terminates when ExpiresAt is reached",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/tunnel/session_test.go",
+      "test_function": "TestSession_ContextCancellation",
+      "story": "plexd enforces session expiry and revocation for tunnel sessions",
+      "expected": "Session closes cleanly when its context is cancelled (simulating revocation)",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/tunnel/session_test.go",
+      "test_function": "TestSession_BindsToMeshIP",
+      "story": "plexd receives ssh_session_setup SSE events and opens a local TCP listener for SSH tunneling",
+      "expected": "Listener address uses the mesh IP, not 0.0.0.0 or localhost",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/tunnel/manager_test.go",
+      "test_function": "TestSessionManager_CreateSession",
+      "story": "plexd receives ssh_session_setup SSE events and opens a local TCP listener for SSH tunneling",
+      "expected": "SessionManager.CreateSession opens a listener and adds session to active map",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/tunnel/manager_test.go",
+      "test_function": "TestSessionManager_DuplicateSessionRejected",
+      "story": "plexd tracks active tunnel sessions and enforces a maximum session limit",
+      "expected": "Creating a session with an existing session_id returns an error",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/tunnel/manager_test.go",
+      "test_function": "TestSessionManager_MaxSessionsEnforced",
+      "story": "plexd tracks active tunnel sessions and enforces a maximum session limit",
+      "expected": "Creating sessions beyond MaxSessions returns an error",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/tunnel/manager_test.go",
+      "test_function": "TestSessionManager_CloseSession",
+      "story": "plexd enforces session expiry and revocation for tunnel sessions",
+      "expected": "CloseSession cancels the session context, closes listener, removes from active map",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/tunnel/manager_test.go",
+      "test_function": "TestSessionManager_Shutdown",
+      "story": "Tunnel session errors do not crash the agent",
+      "expected": "Shutdown closes all active sessions; no goroutine leaks (goleak verified)",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/tunnel/manager_test.go",
+      "test_function": "TestSessionManager_ExpiredSessionRejected",
+      "story": "plexd enforces session expiry and revocation for tunnel sessions",
+      "expected": "Creating a session with ExpiresAt in the past returns an error",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/tunnel/manager_test.go",
+      "test_function": "TestSessionManager_DefaultTimeoutCapsExpiry",
+      "story": "plexd enforces session expiry and revocation for tunnel sessions",
+      "expected": "Session expiry is capped at DefaultTimeout if ExpiresAt exceeds it",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/tunnel/manager_test.go",
+      "test_function": "TestSessionManager_DisabledRejectsAll",
+      "story": "Platform operator can configure tunnel session parameters",
+      "expected": "When Config.Enabled=false, CreateSession returns an error",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/tunnel/handler_test.go",
+      "test_function": "TestSSEHandler_SSHSessionSetup",
+      "story": "plexd receives ssh_session_setup SSE events and opens a local TCP listener for SSH tunneling",
+      "expected": "ssh_session_setup SSE event creates a tunnel session via SessionManager",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/tunnel/handler_test.go",
+      "test_function": "TestSSEHandler_SSHSessionSetup_MalformedPayload",
+      "story": "Tunnel session errors do not crash the agent",
+      "expected": "Malformed ssh_session_setup payload returns an error but does not crash",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/tunnel/handler_test.go",
+      "test_function": "TestSSEHandler_SessionRevoked",
+      "story": "plexd enforces session expiry and revocation for tunnel sessions",
+      "expected": "session_revoked SSE event closes the matching active session",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/tunnel/handler_test.go",
+      "test_function": "TestSSEHandler_SessionRevoked_UnknownSession",
+      "story": "plexd enforces session expiry and revocation for tunnel sessions",
+      "expected": "session_revoked for an unknown session_id is a no-op",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/tunnel/handler_integration_test.go",
+      "test_function": "TestIntegration_FullTunnelLifecycle",
+      "story": "plexd receives ssh_session_setup SSE events and opens a local TCP listener for SSH tunneling",
+      "expected": "Full lifecycle: SSE setup → listener opens → client connects → data flows → session expires → cleanup",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/tunnel/handler_integration_test.go",
+      "test_function": "TestIntegration_SessionRevocationDuringActiveConnection",
+      "story": "plexd enforces session expiry and revocation for tunnel sessions",
+      "expected": "Active connection is terminated when session_revoked event arrives",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/tunnel/handler_integration_test.go",
+      "test_function": "TestIntegration_MaxSessionsWithConcurrentSetups",
+      "story": "plexd tracks active tunnel sessions and enforces a maximum session limit",
+      "expected": "Concurrent ssh_session_setup events respect MaxSessions limit under race detector",
+      "requirement_id": "REQ-005"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-010) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "Tunnel listeners bind exclusively to the mesh IP — no 0.0.0.0 bindings (REQ-010 security requirement)",
+    "Session expiry enforced: ExpiresAt causes automatic session closure, DefaultTimeout caps maximum duration (REQ-003)",
+    "Session revocation closes tunnel immediately: session_revoked SSE handler cancels session context (REQ-004)",
+    "MaxSessions limit enforced: concurrent session creation respects the limit under race detector (REQ-005)",
+    "Graceful shutdown: SessionManager.Shutdown closes all sessions, no goroutine leaks verified by goleak (REQ-009)",
+    "Code follows existing patterns: log/slog with component key, Config with ApplyDefaults/Validate, stdlib-only test dependencies, EventHandler function signature matching api.EventHandler",
+    "API types and endpoint methods follow existing patterns in internal/api/types.go and internal/api/endpoints.go",
+    "Reference documentation covers all public types, methods, data flow, and integration patterns (docs/reference/backend/secure-access-tunneling.md)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All code lives in `internal/tunnel/`. Files: config.go (Config struct), session.go (single tunnel session with TCP forwarding), manager.go (session lifecycle management), handler.go (SSE event handlers + TunnelReporter interface), and corresponding _test.go files. An integration test file handler_integration_test.go wires components with real TCP connections.\n\n2. **Session model**: Each tunnel session is an independent unit with its own context, TCP listener, and connection tracking. Session.Run() is a goroutine that: (a) accepts a TCP connection, (b) dials the target, (c) performs bidirectional io.Copy using two goroutines (client→target, target→client), (d) closes everything when the context is cancelled or the connection ends. Only one concurrent connection is allowed per session (SSH is inherently single-stream per tunnel).\n\n3. **SessionManager**: Thread-safe orchestrator using sync.Mutex + map[string]*Session. CreateSession validates inputs, checks limits, creates Session, opens listener on mesh_ip:0, and starts the session goroutine. CloseSession looks up the session, cancels its context, and removes it from the map. Shutdown iterates all active sessions and calls CloseSession for each.\n\n4. **SSE event handling**: HandleSSHSessionSetup parses the payload into api.SSHSessionSetup, calls mgr.CreateSession, and calls reporter.ReportReady (fire-and-forget). HandleSessionRevoked parses the session_id from the payload and calls mgr.CloseSession. Both follow the api.EventHandler signature: func(context.Context, api.SignedEnvelope) error.\n\n5. **API integration**: New types in internal/api/types.go: SSHSessionSetup (payload of ssh_session_setup SSE), TunnelReadyRequest (body of POST .../ready), TunnelClosedRequest (body of POST .../closed). New methods in internal/api/endpoints.go: TunnelReady and TunnelClosed on ControlPlane. The TunnelReporter interface in the tunnel package abstracts these for testability.\n\n6. **Security design**:\n   - **Binding**: Listeners bind to mesh_ip:0 only — not accessible from public interfaces (SECPLAN-1)\n   - **Session limits**: MaxSessions prevents resource exhaustion (SECPLAN-2)\n   - **Time-bounded**: ExpiresAt + DefaultTimeout cap prevent indefinite access (SECPLAN-3)\n   - **Revocation**: session_revoked SSE provides immediate access termination (SECPLAN-4)\n   - **No auth passthrough**: This feature tunnels TCP, not authenticates — SSH auth is the target server's responsibility\n\n7. **Existing SSE event types**: EventSSHSessionSetup = \"ssh_session_setup\" and EventSessionRevoked = \"session_revoked\" are already defined in internal/api/envelope.go:22-23. No changes needed there.\n\n8. **TCP forwarding approach**: Use io.Copy in two goroutines with errgroup or WaitGroup. When either copy returns, close both connections. Use net.Conn.Close() to unblock the other io.Copy. sync.Once ensures cleanup runs exactly once.\n\n9. **Key files from existing codebase**:\n   - `internal/api/envelope.go:22-23` — EventSSHSessionSetup and EventSessionRevoked constants (already defined)\n   - `internal/api/types.go` — Add SSHSessionSetup, TunnelReadyRequest, TunnelClosedRequest structs\n   - `internal/api/endpoints.go` — Add TunnelReady, TunnelClosed methods\n   - `internal/api/dispatcher.go:10` — EventHandler type for SSE handler signature\n   - `internal/policy/config.go` — Config pattern to follow\n   - `internal/wireguard/handler.go` — SSE handler pattern to follow\n   - `internal/registration/identity.go:17-23` — NodeIdentity with MeshIP field\n\n10. **Potential pitfalls**:\n    - TCP forwarding goroutines must be properly cleaned up to avoid leaks — always close both connections and use WaitGroup/errgroup to wait for both io.Copy goroutines\n    - net.Listener.Accept() blocks — must check context.Done() or close the listener to unblock\n    - The mesh IP for listener binding comes from the node's registration identity (registration.NodeIdentity.MeshIP), which must be passed to SessionManager at construction time\n    - io.Copy returns nil on EOF — this is normal connection close, not an error\n    - Session cleanup must be idempotent — CloseSession may be called from expiry timer, revocation handler, and Shutdown concurrently\n\n11. **Observability** (OBSPLAN-1): All operations use log/slog with component=tunnel. Key log points: session created (info), session closed (info with reason and duration), connection accepted (debug), forwarding error (warn), setup error (error).\n\n12. **Dependencies**: This feature depends on S005 (WireGuard tunnel management for mesh IP) and S008 (network policy enforcement for controlling who can connect to tunnel listeners). The policy package already controls peer visibility — tunnel listeners are accessible only to authorized mesh peers.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.107577"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T15:43:48.457612"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T15:48:31.359785"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "97aaf4ca-0b90-4813-a698-b424c9337816",
+      "timestamp": "2026-02-12T15:48:31.359834",
+      "total_duration": 278.8735432624817,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 278.8735432624817,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
