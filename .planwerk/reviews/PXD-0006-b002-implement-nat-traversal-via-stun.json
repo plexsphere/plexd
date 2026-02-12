@@ -1,0 +1,75 @@
+{
+  "feature_id": "PXD-0006",
+  "title": "B002: Implement NAT traversal via STUN",
+  "date": "2026-02-12",
+  "verdict": "APPROVED",
+  "summary": "Clean STUN-based NAT traversal implementation with Config, STUNClient interface, STUN RFC 5389 encoding/decoding, Discoverer with NAT classification, EndpointReporter/PeerUpdater interfaces, refresh loop, and reference documentation. 39 tests pass with -race, 92.5% coverage, stdlib-only dependencies, follows existing codebase patterns.",
+  "tests_checklist": [
+    {"item": "Tests exist and pass (39 tests, go test -race)", "checked": true},
+    {"item": "Edge cases covered (truncated response, wrong txID, wrong cookie, all servers fail, context cancellation)", "checked": true},
+    {"item": "Error paths tested (reporter error, updater error continues, initial discovery failure)", "checked": true},
+    {"item": "Thread safety verified (TestLastResult_ConcurrentAccess with -race)", "checked": true},
+    {"item": "NAT classification tested (full_cone, symmetric, none, unknown)", "checked": true},
+    {"item": "Refresh loop tested (interval, endpoint change, failure resilience, context stop)", "checked": true},
+    {"item": "Mock STUNClient records calls with arguments for verification", "checked": true},
+    {"item": "Coverage >= 90% (92.5%)", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing Config pattern (ApplyDefaults/Validate matching api.Config, wireguard.Config)", "checked": true},
+    {"item": "Uses log/slog with component=nat key consistently", "checked": true},
+    {"item": "Interface-based dependencies (STUNClient, EndpointReporter, PeerUpdater) for testability", "checked": true},
+    {"item": "Functions are small and single-purpose", "checked": true},
+    {"item": "No code duplication", "checked": true},
+    {"item": "Clear naming throughout", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "STUN constants defined as named constants (no magic numbers)", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "No sensitive data in logs (endpoints are operational data, not secrets)", "checked": true},
+    {"item": "Transaction ID validation prevents response spoofing", "checked": true},
+    {"item": "Magic cookie validation per RFC 5389", "checked": true},
+    {"item": "Attribute length bounds checked before access (no buffer overread)", "checked": true},
+    {"item": "Message length validated against actual data length", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Solution is as simple as possible for requirements", "checked": true},
+    {"item": "No external STUN library — stdlib net and encoding/binary only", "checked": true},
+    {"item": "STUNClient interface is minimal (single Bind method)", "checked": true},
+    {"item": "EndpointReporter matches api.ControlPlane.ReportEndpoint signature", "checked": true},
+    {"item": "PeerUpdater matches wireguard.Manager.UpdatePeer signature", "checked": true},
+    {"item": "Package boundary clean — depends only on internal/api types", "checked": true},
+    {"item": "File structure matches project conventions (internal/nat/)", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code", "checked": true},
+    {"item": "No unused types or functions", "checked": true},
+    {"item": "No over-abstraction (reportAndApply is a plain function, not a struct)", "checked": true},
+    {"item": "NATType constants match what's needed (no unused restricted_cone/port_restricted per task spec)", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config.Validate fails on invalid fields before use", "checked": true},
+    {"item": "Run returns error immediately on initial discovery failure", "checked": true},
+    {"item": "parseBindingResponse rejects invalid data early (size, cookie, txID, msg type)", "checked": true},
+    {"item": "Discover returns error when all STUN servers fail", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "STUN response size validated (>= 20 bytes)", "checked": true},
+    {"item": "Attribute length bounds checked", "checked": true},
+    {"item": "4-byte padding handled in attribute parsing", "checked": true},
+    {"item": "nil response from reporter handled gracefully", "checked": true},
+    {"item": "Empty peer endpoints skipped", "checked": true},
+    {"item": "Peer update failures logged but don't halt processing", "checked": true},
+    {"item": "Refresh failures logged and previous endpoint retained", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [],
+  "suggested_improvements": [
+    "Minor: Config.ApplyDefaults always sets Enabled=true (config.go:43), overriding explicit Config{Enabled: false}. This is documented behavior but differs from api.Config/wireguard.Config which only set zero-value defaults. Consider only setting Enabled=true when the field hasn't been explicitly set, or document more prominently.",
+    "Minor: NATNone classification (discoverer.go:67) only checks if mapped port matches local port, not IP. A node with a public IP but port-forwarded traffic could get a matching port but different IP. Current behavior is correct for the common case and matches the task spec.",
+    "Minor: reportAndApply takes individual fields (endpoint, natType) instead of *DiscoveryResult. Passing the struct would be marginally cleaner but current approach is acceptable.",
+    "Minor: parseMappedAddress and parseXORMappedAddress only support IPv4 (stun.go:146,172). IPv6 support is not required by the task spec but could be added in the future if needed."
+  ],
+  "next_steps": []
+}

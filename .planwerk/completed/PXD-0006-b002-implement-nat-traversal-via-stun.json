@@ -2,8 +2,8 @@
   "feature_id": "PXD-0006",
   "title": "B002: Implement NAT traversal via STUN",
   "slug": "b002-implement-nat-traversal-via-stun",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Discover the node's public endpoint using STUN servers. Determine NAT type and public IP:port mapping so peers behind NAT can establish direct connections. Report discovered endpoints to the control plane for distribution to peers.",
   "stories": [
@@ -397,13 +397,13 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/nat/config.go — Define Config struct: Enabled bool (default true), STUNServers []string (default [stun.l.google.com:19302, stun.cloudflare.com:3478]), RefreshInterval time.Duration (default 60s), Timeout time.Duration (default 5s). Implement ApplyDefaults() and Validate() matching existing Config pattern (internal/wireguard/config.go, internal/api/config.go). When Enabled=false, skip validation of STUN-specific fields. Include tests in config_test.go for: defaults, reject empty STUN servers when enabled, reject low refresh interval (<10s), reject non-positive timeout, disabled config passes with empty fields, custom values override defaults. (REQ-006)",
-    "1.2 Create internal/nat/stun.go — Define STUNClient interface: Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, error). Define MappedAddress struct: IP net.IP, Port int. Implement STUN message encoding/decoding as helper functions: buildBindingRequest(transactionID [12]byte) []byte (20-byte STUN header per RFC 5389), parseBindingResponse(data []byte, transactionID [12]byte) (MappedAddress, error) (parse XOR-MAPPED-ADDRESS attribute: type 0x0020, XOR with magic cookie 0x2112A442 and transaction ID). Define NATType string constants: NATNone='none', NATFullCone='full_cone', NATSymmetric='symmetric', NATUnknown='unknown'. Include tests in stun_test.go for: buildBindingRequest produces valid 20-byte STUN header, parseBindingResponse extracts correct IP:port from XOR-MAPPED-ADDRESS for IPv4, parseBindingResponse rejects wrong transaction ID, parseBindingResponse rejects truncated response, parseBindingResponse rejects non-success response class. (REQ-001, REQ-007)",
-    "1.3 Create internal/nat/mock_stun_test.go — Implement mockSTUNClient struct satisfying STUNClient interface for use across all test files. Records all Bind calls with arguments. Supports configurable results per server address (map[string]result). Supports configurable error returns per server. This is a test helper, not a production file. (REQ-007)",
-    "2.1 Create internal/nat/discoverer.go — Implement Discoverer struct: STUNClient, Config, *slog.Logger, localPort int, sync.RWMutex-protected lastResult *api.NATInfo. Constructor NewDiscoverer(client STUNClient, cfg Config, localPort int, logger *slog.Logger) *Discoverer. Implement Discover(ctx context.Context) (*DiscoveryResult, error): try each STUN server in order using STUNClient.Bind with localPort; on first success, save endpoint; try second server for NAT type classification; compare results — same mapped addr = full_cone, different = symmetric, matches local = none, only one server responded = unknown. Implement LastResult() *api.NATInfo (read-locked). Define DiscoveryResult struct: Endpoint string (ip:port), NATType string. Include tests in discoverer_test.go with mock STUNClient for: full_cone classification, symmetric classification, none classification, unknown on partial failure, fallback to second server on first failure, all servers fail, uses configured local port, context cancellation during STUN, LastResult before/after discovery, concurrent access with -race. (REQ-001, REQ-002, REQ-003, REQ-008, REQ-009, REQ-010)",
-    "2.2 Create internal/nat/reporter.go — Define EndpointReporter interface: ReportEndpoint(ctx context.Context, nodeID string, req api.EndpointReport) (*api.EndpointResponse, error). Define PeerUpdater interface: UpdatePeer(peer api.Peer) error. Implement reportAndApply(ctx context.Context, reporter EndpointReporter, updater PeerUpdater, nodeID string, result *DiscoveryResult, logger *slog.Logger) error: call reporter.ReportEndpoint with EndpointReport{PublicEndpoint, NATType}; iterate PeerEndpoints in response; for each with non-empty endpoint, construct api.Peer{ID: pe.PeerID, Endpoint: pe.Endpoint} and call updater.UpdatePeer; skip empty endpoints; log errors at warn level but continue processing remaining peers. Include tests in reporter_test.go with mock implementations for: successful report and peer update, skip empty peer endpoint, transient API error logged, peer update error logged but others still processed. (REQ-004)",
-    "2.3 Implement Run method on Discoverer (in discoverer.go) — Run(ctx context.Context, reporter EndpointReporter, updater PeerUpdater, nodeID string) error: perform initial Discover(); if successful, call reportAndApply(); enter ticker loop at cfg.RefreshInterval; on each tick, re-discover and report; if discovery fails, log warn and keep previous result; if endpoint changed, log info with old/new; on context cancellation, return ctx.Err(). Include tests in discoverer_test.go for: Run executes initial discovery + report, Run refreshes at interval, Run logs endpoint change, Run continues on refresh failure, Run stops on context cancellation, Run skips report when Discover fails. (REQ-004, REQ-005, REQ-009, REQ-010)",
-    "3.1 Create docs/reference/backend/nat-traversal.md — Reference documentation for internal/nat/ package: Config struct fields and defaults, STUNClient interface and MappedAddress struct, NATType constants (none, full_cone, symmetric, unknown), Discoverer lifecycle (NewDiscoverer → Discover → Run → LastResult), EndpointReporter and PeerUpdater interfaces, reportAndApply flow, STUN protocol details (RFC 5389 binding, XOR-MAPPED-ADDRESS). Include code examples for constructing a Discoverer, running discovery, and integrating with wireguard.Manager and api.ControlPlane. (REQ-001 through REQ-010)"
+    "[done] 1.1 Create internal/nat/config.go — Define Config struct: Enabled bool (default true), STUNServers []string (default [stun.l.google.com:19302, stun.cloudflare.com:3478]), RefreshInterval time.Duration (default 60s), Timeout time.Duration (default 5s). Implement ApplyDefaults() and Validate() matching existing Config pattern (internal/wireguard/config.go, internal/api/config.go). When Enabled=false, skip validation of STUN-specific fields. Include tests in config_test.go for: defaults, reject empty STUN servers when enabled, reject low refresh interval (<10s), reject non-positive timeout, disabled config passes with empty fields, custom values override defaults. (REQ-006)",
+    "[done] 1.2 Create internal/nat/stun.go — Define STUNClient interface: Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, error). Define MappedAddress struct: IP net.IP, Port int. Implement STUN message encoding/decoding as helper functions: buildBindingRequest(transactionID [12]byte) []byte (20-byte STUN header per RFC 5389), parseBindingResponse(data []byte, transactionID [12]byte) (MappedAddress, error) (parse XOR-MAPPED-ADDRESS attribute: type 0x0020, XOR with magic cookie 0x2112A442 and transaction ID). Define NATType string constants: NATNone='none', NATFullCone='full_cone', NATSymmetric='symmetric', NATUnknown='unknown'. Include tests in stun_test.go for: buildBindingRequest produces valid 20-byte STUN header, parseBindingResponse extracts correct IP:port from XOR-MAPPED-ADDRESS for IPv4, parseBindingResponse rejects wrong transaction ID, parseBindingResponse rejects truncated response, parseBindingResponse rejects non-success response class. (REQ-001, REQ-007)",
+    "[done] 1.3 Create internal/nat/mock_stun_test.go — Implement mockSTUNClient struct satisfying STUNClient interface for use across all test files. Records all Bind calls with arguments. Supports configurable results per server address (map[string]result). Supports configurable error returns per server. This is a test helper, not a production file. (REQ-007)",
+    "[done] 2.1 Create internal/nat/discoverer.go — Implement Discoverer struct: STUNClient, Config, *slog.Logger, localPort int, sync.RWMutex-protected lastResult *api.NATInfo. Constructor NewDiscoverer(client STUNClient, cfg Config, localPort int, logger *slog.Logger) *Discoverer. Implement Discover(ctx context.Context) (*DiscoveryResult, error): try each STUN server in order using STUNClient.Bind with localPort; on first success, save endpoint; try second server for NAT type classification; compare results — same mapped addr = full_cone, different = symmetric, matches local = none, only one server responded = unknown. Implement LastResult() *api.NATInfo (read-locked). Define DiscoveryResult struct: Endpoint string (ip:port), NATType string. Include tests in discoverer_test.go with mock STUNClient for: full_cone classification, symmetric classification, none classification, unknown on partial failure, fallback to second server on first failure, all servers fail, uses configured local port, context cancellation during STUN, LastResult before/after discovery, concurrent access with -race. (REQ-001, REQ-002, REQ-003, REQ-008, REQ-009, REQ-010)",
+    "[done] 2.2 Create internal/nat/reporter.go — Define EndpointReporter interface: ReportEndpoint(ctx context.Context, nodeID string, req api.EndpointReport) (*api.EndpointResponse, error). Define PeerUpdater interface: UpdatePeer(peer api.Peer) error. Implement reportAndApply(ctx context.Context, reporter EndpointReporter, updater PeerUpdater, nodeID string, result *DiscoveryResult, logger *slog.Logger) error: call reporter.ReportEndpoint with EndpointReport{PublicEndpoint, NATType}; iterate PeerEndpoints in response; for each with non-empty endpoint, construct api.Peer{ID: pe.PeerID, Endpoint: pe.Endpoint} and call updater.UpdatePeer; skip empty endpoints; log errors at warn level but continue processing remaining peers. Include tests in reporter_test.go with mock implementations for: successful report and peer update, skip empty peer endpoint, transient API error logged, peer update error logged but others still processed. (REQ-004)",
+    "[done] 2.3 Implement Run method on Discoverer (in discoverer.go) — Run(ctx context.Context, reporter EndpointReporter, updater PeerUpdater, nodeID string) error: perform initial Discover(); if successful, call reportAndApply(); enter ticker loop at cfg.RefreshInterval; on each tick, re-discover and report; if discovery fails, log warn and keep previous result; if endpoint changed, log info with old/new; on context cancellation, return ctx.Err(). Include tests in discoverer_test.go for: Run executes initial discovery + report, Run refreshes at interval, Run logs endpoint change, Run continues on refresh failure, Run stops on context cancellation, Run skips report when Discover fails. (REQ-004, REQ-005, REQ-009, REQ-010)",
+    "[done] 3.1 Create docs/reference/backend/nat-traversal.md — Reference documentation for internal/nat/ package: Config struct fields and defaults, STUNClient interface and MappedAddress struct, NATType constants (none, full_cone, symmetric, unknown), Discoverer lifecycle (NewDiscoverer → Discover → Run → LastResult), EndpointReporter and PeerUpdater interfaces, reportAndApply flow, STUN protocol details (RFC 5389 binding, XOR-MAPPED-ADDRESS). Include code examples for constructing a Discoverer, running discovery, and integrating with wireguard.Manager and api.ControlPlane. (REQ-001 through REQ-010)"
   ],
   "test_specifications": [
     {
@@ -618,6 +618,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T12:50:55.512846"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T12:52:26.805744"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T13:19:17.534671"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T13:19:17.549356"
     }
   },
   "execution_history": [
@@ -631,6 +643,50 @@
           "name": "prepare",
           "duration": 301.8233549594879,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "73b86b16-c102-4032-8e84-a1157ad416bd",
+      "timestamp": "2026-02-12T13:17:17.839765",
+      "total_duration": 1367.4422883987427,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (3 tasks)",
+          "duration": 439.67508840560913,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (3 tasks)",
+          "duration": 487.4198145866394,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 93.24509763717651,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0006] Code Review",
+          "duration": 113.29381895065308,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0006] Improvements",
+          "duration": 124.19865560531616,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0006] Simplify",
+          "duration": 109.60981321334839,
+          "type": "simplify",
           "status": "done"
         }
       ]
