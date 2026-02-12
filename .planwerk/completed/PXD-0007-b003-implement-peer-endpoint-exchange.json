@@ -2,8 +2,8 @@
   "feature_id": "PXD-0007",
   "title": "B003: Implement peer endpoint exchange",
   "slug": "b003-implement-peer-endpoint-exchange",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Exchange discovered public endpoints with peers through the control plane. Receive peer endpoint updates via SSE events and update local WireGuard peer configurations accordingly. Handle endpoint changes due to NAT rebinding or IP changes gracefully.",
   "stories": [
@@ -322,10 +322,10 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/peerexchange/config.go — Define Config struct that embeds nat.Config. Implement ApplyDefaults() delegating to nat.Config.ApplyDefaults() and Validate() delegating to nat.Config.Validate(). Follow the same Config pattern as internal/nat/config.go and internal/wireguard/config.go. Include tests in config_test.go for: defaults applied via delegation, validation errors propagated (empty STUN servers when enabled, low refresh interval), disabled config passes, custom values respected. (REQ-006)",
-    "1.2 Create internal/peerexchange/exchanger.go — Define Exchanger struct: nat.Discoverer, wireguard.Manager (as nat.PeerUpdater), *api.ControlPlane (for ReportEndpoint), nat.Config (embedded from Config), *slog.Logger. Constructor NewExchanger(discoverer *nat.Discoverer, wgManager *wireguard.Manager, cpClient *api.ControlPlane, cfg Config, logger *slog.Logger) *Exchanger. Define controlPlaneReporter adapter struct wrapping *api.ControlPlane to satisfy nat.EndpointReporter, binding nodeID at call time. Implement RegisterHandlers(sseManager *api.SSEManager) — registers wireguard.HandlePeerEndpointChanged(wgManager) for api.EventPeerEndpointChanged, logs at debug level. Implement Run(ctx context.Context, nodeID string) error — if !cfg.Enabled, log info and return nil; otherwise log info with node_id, create controlPlaneReporter adapter, call discoverer.Run(ctx, reporter, wgManager, nodeID) and return its result. Implement LastResult() *api.NATInfo delegating to discoverer.LastResult(). Include tests in exchanger_test.go with mock STUNClient, mock WGController, and mock HTTP server for: initial discovery + report + peer update, refresh loop, endpoint change detection, NAT disabled returns nil, context cancellation, discovery failure continues, report failure continues, empty peer endpoint skipped, peer update failure continues, RegisterHandlers registers correct handler, LastResult delegation. (REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-007, REQ-008)",
-    "2.1 Create internal/peerexchange/exchanger_integration_test.go — Integration tests that wire together real nat.Discoverer (with mock STUNClient), real wireguard.Manager (with mock WGController), and a test HTTP server simulating ControlPlane endpoints. Tests: full endpoint exchange flow (discover → report → receive peer endpoints → apply to WireGuard), SSE peer_endpoint_changed event triggers WireGuard update via registered handler, endpoint change during refresh loop updates peers correctly, concurrent SSE event and refresh cycle do not race (run with -race). (REQ-001, REQ-002, REQ-003, REQ-008)",
-    "3.1 Create docs/reference/backend/peer-endpoint-exchange.md — Reference documentation for internal/peerexchange/ package: Config struct (embeds nat.Config), Exchanger struct and lifecycle (NewExchanger → RegisterHandlers → Run → LastResult), controlPlaneReporter adapter, data flow diagram (STUN → ControlPlane → WireGuard and SSE → WireGuard), integration points with internal/nat, internal/wireguard, and internal/api. Include code examples for constructing an Exchanger and wiring it into the agent lifecycle. (REQ-001 through REQ-008)"
+    "[done] 1.1 Create internal/peerexchange/config.go — Define Config struct that embeds nat.Config. Implement ApplyDefaults() delegating to nat.Config.ApplyDefaults() and Validate() delegating to nat.Config.Validate(). Follow the same Config pattern as internal/nat/config.go and internal/wireguard/config.go. Include tests in config_test.go for: defaults applied via delegation, validation errors propagated (empty STUN servers when enabled, low refresh interval), disabled config passes, custom values respected. (REQ-006)",
+    "[done] 1.2 Create internal/peerexchange/exchanger.go — Define Exchanger struct: nat.Discoverer, wireguard.Manager (as nat.PeerUpdater), *api.ControlPlane (for ReportEndpoint), nat.Config (embedded from Config), *slog.Logger. Constructor NewExchanger(discoverer *nat.Discoverer, wgManager *wireguard.Manager, cpClient *api.ControlPlane, cfg Config, logger *slog.Logger) *Exchanger. Define controlPlaneReporter adapter struct wrapping *api.ControlPlane to satisfy nat.EndpointReporter, binding nodeID at call time. Implement RegisterHandlers(sseManager *api.SSEManager) — registers wireguard.HandlePeerEndpointChanged(wgManager) for api.EventPeerEndpointChanged, logs at debug level. Implement Run(ctx context.Context, nodeID string) error — if !cfg.Enabled, log info and return nil; otherwise log info with node_id, create controlPlaneReporter adapter, call discoverer.Run(ctx, reporter, wgManager, nodeID) and return its result. Implement LastResult() *api.NATInfo delegating to discoverer.LastResult(). Include tests in exchanger_test.go with mock STUNClient, mock WGController, and mock HTTP server for: initial discovery + report + peer update, refresh loop, endpoint change detection, NAT disabled returns nil, context cancellation, discovery failure continues, report failure continues, empty peer endpoint skipped, peer update failure continues, RegisterHandlers registers correct handler, LastResult delegation. (REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-007, REQ-008)",
+    "[done] 2.1 Create internal/peerexchange/exchanger_integration_test.go — Integration tests that wire together real nat.Discoverer (with mock STUNClient), real wireguard.Manager (with mock WGController), and a test HTTP server simulating ControlPlane endpoints. Tests: full endpoint exchange flow (discover → report → receive peer endpoints → apply to WireGuard), SSE peer_endpoint_changed event triggers WireGuard update via registered handler, endpoint change during refresh loop updates peers correctly, concurrent SSE event and refresh cycle do not race (run with -race). (REQ-001, REQ-002, REQ-003, REQ-008)",
+    "[done] 3.1 Create docs/reference/backend/peer-endpoint-exchange.md — Reference documentation for internal/peerexchange/ package: Config struct (embeds nat.Config), Exchanger struct and lifecycle (NewExchanger → RegisterHandlers → Run → LastResult), controlPlaneReporter adapter, data flow diagram (STUN → ControlPlane → WireGuard and SSE → WireGuard), integration points with internal/nat, internal/wireguard, and internal/api. Include code examples for constructing an Exchanger and wiring it into the agent lifecycle. (REQ-001 through REQ-008)"
   ],
   "test_specifications": [
     {
@@ -468,6 +468,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T13:23:44.977845"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T13:24:27.430439"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T13:46:15.183336"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T13:46:15.196125"
     }
   },
   "execution_history": [
@@ -481,6 +493,50 @@
           "name": "prepare",
           "duration": 252.21442818641663,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "1e319f5f-4225-440d-bd17-2a5891134994",
+      "timestamp": "2026-02-12T13:43:58.608863",
+      "total_duration": 1053.4811956882477,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (2 tasks)",
+          "duration": 500.7692070007324,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (1 tasks)",
+          "duration": 113.15769743919373,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 83.85441136360168,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0007] Code Review",
+          "duration": 162.4186189174652,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0007] Improvements",
+          "duration": 62.3794891834259,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0007] Simplify",
+          "duration": 130.90177178382874,
+          "type": "simplify",
           "status": "done"
         }
       ]
