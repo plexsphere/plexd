@@ -2,8 +2,8 @@
   "feature_id": "PXD-0009",
   "title": "C002: Implement secure access tunneling",
   "slug": "c002-implement-secure-access-tunneling",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Enable platform-mediated access to managed resources. Tunnel SSH sessions to servers/VMs and Kubernetes API access through the mesh without exposing services directly to the internet. The control plane orchestrates access sessions; plexd provides the local tunnel endpoints.",
   "stories": [
@@ -403,13 +403,13 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/tunnel/config.go — Define Config struct with Enabled bool, MaxSessions int, DefaultTimeout time.Duration. Implement ApplyDefaults() (Enabled=true, MaxSessions=10, DefaultTimeout=30m on zero-valued Config) and Validate() (reject MaxSessions<=0 when enabled, reject DefaultTimeout<1m when enabled, pass when disabled). Follow the same Config pattern as internal/wireguard/config.go and internal/policy/config.go. Include tests in config_test.go. (REQ-007)",
-    "1.2 Add API types to internal/api/types.go — Add SSHSessionSetup struct (SessionID, TargetHost string, TargetPort int, AuthorizedKey string, ExpiresAt time.Time), TunnelReadyRequest struct (ListenAddr string), TunnelClosedRequest struct (Reason string, Duration string). Add TunnelReady and TunnelClosed API endpoint methods to internal/api/endpoints.go (POST /v1/nodes/{node_id}/tunnels/{session_id}/ready and /closed). Include tests for the new types in types_test.go. (REQ-001, REQ-006)",
-    "1.3 Create internal/tunnel/session.go — Define Session struct holding SessionID, TargetHost, TargetPort, listener net.Listener, cancel context.CancelFunc, startTime, expiresAt, and active connection tracking (sync.Mutex + net.Conn). Implement Session.Run(ctx) that accepts TCP connections, enforces single-connection limit, dials target, performs bidirectional io.Copy, and closes cleanly on context cancellation. Implement Session.Close(). Include tests in session_test.go covering: bidirectional forwarding, dial failure, single-connection enforcement, context cancellation, mesh IP binding. (REQ-002, REQ-003, REQ-010)",
-    "1.4 Create internal/tunnel/manager.go — Define SessionManager struct wrapping Config, logger, mesh IP, active sessions map (sync.Mutex + map[string]*Session). Implement CreateSession(ctx, setup SSHSessionSetup) (string, error) that validates fields, checks max sessions, checks ExpiresAt > now, caps at DefaultTimeout, opens listener on mesh IP, starts session goroutine. Implement CloseSession(sessionID, reason), Shutdown(), ActiveCount(). Include tests in manager_test.go covering: create session, duplicate rejected, max sessions enforced, close session, shutdown, expired rejected, disabled rejects all, timeout cap. (REQ-001, REQ-003, REQ-005, REQ-009)",
-    "2.1 Create internal/tunnel/handler.go — Define HandleSSHSessionSetup(mgr *SessionManager, reporter TunnelReporter) api.EventHandler that parses the SSE payload, calls mgr.CreateSession, and reports ready status. Define HandleSessionRevoked(mgr *SessionManager, reporter TunnelReporter) api.EventHandler that parses session_id from payload and calls mgr.CloseSession with reason 'revoked'. Define TunnelReporter interface (ReportReady, ReportClosed) matching the API client methods. Include tests in handler_test.go. (REQ-001, REQ-004, REQ-006, REQ-008)",
-    "3.1 Create internal/tunnel/handler_integration_test.go — Integration tests wiring real SessionManager with local TCP test servers. Tests: full tunnel lifecycle (SSE setup → listener → connect → data → expire → cleanup), session revocation during active connection terminates it, max sessions enforced under concurrent ssh_session_setup events with -race, no goroutine leaks via goleak. (REQ-001 through REQ-005, REQ-009)",
-    "4.1 Create docs/reference/backend/secure-access-tunneling.md — Reference documentation for internal/tunnel/ package: Config struct, SessionManager, Session struct, SSE handlers (HandleSSHSessionSetup, HandleSessionRevoked), TunnelReporter interface, API types (SSHSessionSetup, TunnelReadyRequest, TunnelClosedRequest). Include data flow diagram: control plane → ssh_session_setup SSE → SessionManager → Session (listener + forwarder) → target host. Reference integration with internal/api, internal/wireguard. (REQ-001 through REQ-010)"
+    "[done] 1.1 Create internal/tunnel/config.go — Define Config struct with Enabled bool, MaxSessions int, DefaultTimeout time.Duration. Implement ApplyDefaults() (Enabled=true, MaxSessions=10, DefaultTimeout=30m on zero-valued Config) and Validate() (reject MaxSessions<=0 when enabled, reject DefaultTimeout<1m when enabled, pass when disabled). Follow the same Config pattern as internal/wireguard/config.go and internal/policy/config.go. Include tests in config_test.go. (REQ-007)",
+    "[done] 1.2 Add API types to internal/api/types.go — Add SSHSessionSetup struct (SessionID, TargetHost string, TargetPort int, AuthorizedKey string, ExpiresAt time.Time), TunnelReadyRequest struct (ListenAddr string), TunnelClosedRequest struct (Reason string, Duration string). Add TunnelReady and TunnelClosed API endpoint methods to internal/api/endpoints.go (POST /v1/nodes/{node_id}/tunnels/{session_id}/ready and /closed). Include tests for the new types in types_test.go. (REQ-001, REQ-006)",
+    "[done] 1.3 Create internal/tunnel/session.go — Define Session struct holding SessionID, TargetHost, TargetPort, listener net.Listener, cancel context.CancelFunc, startTime, expiresAt, and active connection tracking (sync.Mutex + net.Conn). Implement Session.Run(ctx) that accepts TCP connections, enforces single-connection limit, dials target, performs bidirectional io.Copy, and closes cleanly on context cancellation. Implement Session.Close(). Include tests in session_test.go covering: bidirectional forwarding, dial failure, single-connection enforcement, context cancellation, mesh IP binding. (REQ-002, REQ-003, REQ-010)",
+    "[done] 1.4 Create internal/tunnel/manager.go — Define SessionManager struct wrapping Config, logger, mesh IP, active sessions map (sync.Mutex + map[string]*Session). Implement CreateSession(ctx, setup SSHSessionSetup) (string, error) that validates fields, checks max sessions, checks ExpiresAt > now, caps at DefaultTimeout, opens listener on mesh IP, starts session goroutine. Implement CloseSession(sessionID, reason), Shutdown(), ActiveCount(). Include tests in manager_test.go covering: create session, duplicate rejected, max sessions enforced, close session, shutdown, expired rejected, disabled rejects all, timeout cap. (REQ-001, REQ-003, REQ-005, REQ-009)",
+    "[done] 2.1 Create internal/tunnel/handler.go — Define HandleSSHSessionSetup(mgr *SessionManager, reporter TunnelReporter) api.EventHandler that parses the SSE payload, calls mgr.CreateSession, and reports ready status. Define HandleSessionRevoked(mgr *SessionManager, reporter TunnelReporter) api.EventHandler that parses session_id from payload and calls mgr.CloseSession with reason 'revoked'. Define TunnelReporter interface (ReportReady, ReportClosed) matching the API client methods. Include tests in handler_test.go. (REQ-001, REQ-004, REQ-006, REQ-008)",
+    "[done] 3.1 Create internal/tunnel/handler_integration_test.go — Integration tests wiring real SessionManager with local TCP test servers. Tests: full tunnel lifecycle (SSE setup → listener → connect → data → expire → cleanup), session revocation during active connection terminates it, max sessions enforced under concurrent ssh_session_setup events with -race, no goroutine leaks via goleak. (REQ-001 through REQ-005, REQ-009)",
+    "[done] 4.1 Create docs/reference/backend/secure-access-tunneling.md — Reference documentation for internal/tunnel/ package: Config struct, SessionManager, Session struct, SSE handlers (HandleSSHSessionSetup, HandleSessionRevoked), TunnelReporter interface, API types (SSHSessionSetup, TunnelReadyRequest, TunnelClosedRequest). Include data flow diagram: control plane → ssh_session_setup SSE → SessionManager → Session (listener + forwarder) → target host. Reference integration with internal/api, internal/wireguard. (REQ-001 through REQ-010)"
   ],
   "test_specifications": [
     {
@@ -601,6 +601,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T15:48:31.359785"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T15:49:44.431145"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T16:26:03.116644"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T16:26:03.131308"
     }
   },
   "execution_history": [
@@ -614,6 +626,56 @@
           "name": "prepare",
           "duration": 278.8735432624817,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "7a56f640-e3a2-4c63-aad7-de6396b3fb8c",
+      "timestamp": "2026-02-12T16:17:51.122146",
+      "total_duration": 1566.1028227806091,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 575.9673080444336,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (1 tasks)",
+          "duration": 108.47455072402954,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 212.9912211894989,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (1 tasks)",
+          "duration": 109.0263397693634,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0009] Code Review",
+          "duration": 194.45402693748474,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0009] Improvements",
+          "duration": 182.37795066833496,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0009] Simplify",
+          "duration": 182.811425447464,
+          "type": "simplify",
           "status": "done"
         }
       ]

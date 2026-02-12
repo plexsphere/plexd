@@ -618,6 +618,67 @@ func TestEndpoints_PathParametersEscaped(t *testing.T) {
 	}
 }
 
+func TestTunnelReady_Success(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/nodes/n-001/tunnels/sess-001/ready" {
+			t.Errorf("path = %s, want /v1/nodes/n-001/tunnels/sess-001/ready", r.URL.Path)
+		}
+
+		var req TunnelReadyRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.ListenAddr != "10.42.0.1:34567" {
+			t.Errorf("listen_addr = %q, want %q", req.ListenAddr, "10.42.0.1:34567")
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	now := time.Now().UTC().Truncate(time.Second)
+	err := client.TunnelReady(context.Background(), "n-001", "sess-001", TunnelReadyRequest{
+		ListenAddr: "10.42.0.1:34567",
+		Timestamp:  now,
+	})
+	if err != nil {
+		t.Fatalf("TunnelReady() = %v", err)
+	}
+}
+
+func TestTunnelClosed_Success(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/nodes/n-001/tunnels/sess-001/closed" {
+			t.Errorf("path = %s, want /v1/nodes/n-001/tunnels/sess-001/closed", r.URL.Path)
+		}
+
+		var req TunnelClosedRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.Reason != "expired" {
+			t.Errorf("reason = %q, want %q", req.Reason, "expired")
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	now := time.Now().UTC().Truncate(time.Second)
+	err := client.TunnelClosed(context.Background(), "n-001", "sess-001", TunnelClosedRequest{
+		Reason:    "expired",
+		Duration:  "29m45s",
+		Timestamp: now,
+	})
+	if err != nil {
+		t.Fatalf("TunnelClosed() = %v", err)
+	}
+}
+
 func TestFetchSecret_PathParametersEscaped(t *testing.T) {
 	// Verify both nodeID and key parameters are escaped.
 	var gotPath string

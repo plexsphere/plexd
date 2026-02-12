@@ -1,0 +1,116 @@
+{
+  "feature_id": "PXD-0009",
+  "title": "C002: Implement secure access tunneling",
+  "date": "2026-02-12",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Secure access tunneling implementation is solid and well-structured. All 10 requirements are covered with tests. Config, Session, SessionManager, SSE handlers, API types, endpoints, and documentation are all present and follow existing codebase patterns. Tests pass with -race, goleak verifies no goroutine leaks, and 91% statement coverage. Two medium-severity issues need fixing: (1) net.Dial in session.go doesn't respect context cancellation, and (2) duplicate component=tunnel in session logger.",
+  "tests_checklist": [
+    {"item": "All tests pass with -race", "checked": true},
+    {"item": "Integration tests cover full lifecycle", "checked": true},
+    {"item": "Concurrent MaxSessions test with race detector", "checked": true},
+    {"item": "Goroutine leak detection via goleak", "checked": true},
+    {"item": "91% statement coverage", "checked": true},
+    {"item": "Edge cases: expired session, duplicate ID, disabled config, malformed payload, unknown revocation", "checked": true},
+    {"item": "Bidirectional forwarding verified", "checked": true},
+    {"item": "Single connection enforcement verified", "checked": true},
+    {"item": "Context cancellation verified", "checked": true},
+    {"item": "Mesh IP binding verified", "checked": true},
+    {"item": "API types round-trip serialization verified", "checked": true},
+    {"item": "Endpoint path construction and parameter escaping verified", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Config follows existing ApplyDefaults/Validate pattern (wireguard, policy)", "checked": true},
+    {"item": "API types follow existing types.go conventions", "checked": true},
+    {"item": "Endpoint methods follow existing endpoints.go pattern with url.PathEscape", "checked": true},
+    {"item": "SSE handlers follow api.EventHandler signature", "checked": true},
+    {"item": "Structured logging with log/slog and component key", "checked": true},
+    {"item": "Functions have clear single responsibility", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "No duplicate component=tunnel in logger chain", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "Tunnel listeners bind to mesh IP only, never 0.0.0.0 (REQ-010)", "checked": true},
+    {"item": "MaxSessions enforced under concurrent access (REQ-005)", "checked": true},
+    {"item": "Session expiry enforced with time.AfterFunc (REQ-003)", "checked": true},
+    {"item": "Session revocation terminates active connections (REQ-004)", "checked": true},
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "Path parameters escaped in API endpoints", "checked": true},
+    {"item": "No path traversal vulnerabilities", "checked": true},
+    {"item": "net.Dial uses context for cancellation during pending connections", "checked": false}
+  ],
+  "architecture_checklist": [
+    {"item": "Clean separation: config, session, manager, handler", "checked": true},
+    {"item": "TunnelReporter interface for testability", "checked": true},
+    {"item": "Internal package boundary respected", "checked": true},
+    {"item": "No circular dependencies", "checked": true},
+    {"item": "Solution is as simple as possible", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code", "checked": true},
+    {"item": "No unused exports or dead code", "checked": true},
+    {"item": "No over-abstraction", "checked": true},
+    {"item": "No speculative features", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Input validation in CreateSession (empty fields, expired, disabled)", "checked": true},
+    {"item": "Duplicate session ID rejected", "checked": true},
+    {"item": "MaxSessions checked before opening listener", "checked": true},
+    {"item": "Malformed SSE payloads return errors immediately", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Session.Close() is idempotent", "checked": true},
+    {"item": "Cleanup uses sync.Once in forward()", "checked": true},
+    {"item": "Mutex protects session map and active connection", "checked": true},
+    {"item": "Context cancellation propagates to listener", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [
+    {
+      "severity": "LOW",
+      "description": "handler.go:57-59 directly accesses mgr.mu and mgr.sessions (private fields) from HandleSessionRevoked. While legal in the same package, this breaks the encapsulation boundary between handler and manager. A public method like GetSession(id) or a combined CloseAndReport method would be cleaner.",
+      "location": "internal/tunnel/handler.go:57-59",
+      "fix": "Add a method to SessionManager that returns session metadata needed by the handler, or restructure HandleSessionRevoked to use only public SessionManager methods."
+    },
+    {
+      "severity": "LOW",
+      "description": "manager.go:66-70 holds the mutex during session.Start() which performs net.Listen I/O. Under resource exhaustion, this could block all session operations. Consider starting the session outside the critical section.",
+      "location": "internal/tunnel/manager.go:56-78",
+      "fix": "Move session.Start() outside the lock: lock → check limits → add placeholder → unlock → Start → lock → finalize or remove placeholder on failure."
+    },
+    {
+      "severity": "LOW",
+      "description": "manager.go:66-68 creates context.WithCancel whose cancel func is overwritten by session.Start at session.go:49, leaking the outer context until the parent is canceled. The double-cancel is unnecessary.",
+      "location": "internal/tunnel/manager.go:66-68 and internal/tunnel/session.go:49",
+      "fix": "Either remove the WithCancel in Start() and use the already-cancelable context from the manager, or remove the WithCancel in CreateSession and let Start() own it."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "Q-001",
+      "severity": "major",
+      "check_id": "Q4",
+      "file": "internal/tunnel/session.go",
+      "line": 96,
+      "description": "net.Dial does not use context. If the target host is unreachable, the dial blocks for the system TCP timeout (~2 minutes), ignoring context cancellation. This means session revocation or shutdown cannot interrupt a pending dial.",
+      "fix": "Replace `net.Dial(\"tcp\", targetAddr)` with `(&net.Dialer{}).DialContext(ctx, \"tcp\", targetAddr)` to respect context cancellation during connection establishment."
+    },
+    {
+      "id": "Q-002",
+      "severity": "major",
+      "check_id": "Q4",
+      "file": "internal/tunnel/session.go",
+      "line": 43,
+      "description": "NewSession adds component=tunnel to the logger, but NewSessionManager (manager.go:29) also adds component=tunnel. Since the manager passes its logger to NewSession, the session logger gets component=tunnel duplicated: 'component=tunnel component=tunnel session_id=...' as visible in integration test output.",
+      "fix": "Remove `\"component\", \"tunnel\"` from NewSession's logger.With() call at session.go:43. The logger already has component=tunnel from the manager. Only add session_id."
+    }
+  ],
+  "suggested_improvements": [
+    "Consider adding TargetPort upper bound validation (>65535) in CreateSession for defense in depth, even though the control plane is trusted.",
+    "The HandleSessionRevoked handler reports duration based on time.Since(session.startTime) computed BEFORE calling CloseSession. This is correct but fragile — if CloseSession becomes async in the future, the duration could be stale. Consider having CloseSession return session metadata.",
+    "REQ-009 scenario specifies 'close status is reported for each session with reason shutdown' but Shutdown does not call TunnelReporter.ReportClosed. This is acceptable since Shutdown is a local cleanup operation, but the requirement text should be reconciled."
+  ],
+  "next_steps": [
+    "Fix Q-001: Replace net.Dial with DialContext in session.go:96",
+    "Fix Q-002: Remove duplicate component=tunnel from session logger in session.go:43"
+  ]
+}

@@ -179,3 +179,17 @@ func (c *ControlPlane) FetchArtifact(ctx context.Context, version, goos, arch st
 	}
 	return resp.Body, nil
 }
+
+// TunnelReady reports that a tunnel listener is ready for connections.
+// POST /v1/nodes/{node_id}/tunnels/{session_id}/ready
+func (c *ControlPlane) TunnelReady(ctx context.Context, nodeID, sessionID string, req TunnelReadyRequest) error {
+	path := fmt.Sprintf("/v1/nodes/%s/tunnels/%s/ready", url.PathEscape(nodeID), url.PathEscape(sessionID))
+	return c.doRequest(ctx, http.MethodPost, path, req, nil)
+}
+
+// TunnelClosed reports that a tunnel session has closed.
+// POST /v1/nodes/{node_id}/tunnels/{session_id}/closed
+func (c *ControlPlane) TunnelClosed(ctx context.Context, nodeID, sessionID string, req TunnelClosedRequest) error {
+	path := fmt.Sprintf("/v1/nodes/%s/tunnels/%s/closed", url.PathEscape(nodeID), url.PathEscape(sessionID))
+	return c.doRequest(ctx, http.MethodPost, path, req, nil)
+}

@@ -293,3 +293,30 @@ type KeyRotateRequest struct {
 type KeyRotateResponse struct {
 	UpdatedPeers []Peer `json:"updated_peers"`
 }
+
+// ---------------------------------------------------------------------------
+// Tunnel  POST /v1/nodes/{node_id}/tunnels/{session_id}/ready
+//         POST /v1/nodes/{node_id}/tunnels/{session_id}/closed
+// ---------------------------------------------------------------------------
+
+// SSHSessionSetup is the payload of an ssh_session_setup SSE event.
+type SSHSessionSetup struct {
+	SessionID     string    `json:"session_id"`
+	TargetHost    string    `json:"target_host"`
+	TargetPort    int       `json:"target_port"`
+	AuthorizedKey string    `json:"authorized_key"`
+	ExpiresAt     time.Time `json:"expires_at"`
+}
+
+// TunnelReadyRequest is sent when a tunnel listener is ready.
+type TunnelReadyRequest struct {
+	ListenAddr string    `json:"listen_addr"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
+// TunnelClosedRequest is sent when a tunnel session closes.
+type TunnelClosedRequest struct {
+	Reason    string    `json:"reason"`
+	Duration  string    `json:"duration"`
+	Timestamp time.Time `json:"timestamp"`
+}

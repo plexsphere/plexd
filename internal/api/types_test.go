@@ -251,6 +251,51 @@ func TestTypesExecutionResult(t *testing.T) {
 	}
 }
 
+func TestTypesSSHSessionSetup(t *testing.T) {
+	expires := time.Now().UTC().Truncate(time.Second).Add(30 * time.Minute)
+	orig := SSHSessionSetup{
+		SessionID:     "sess-001",
+		TargetHost:    "10.42.0.5",
+		TargetPort:    22,
+		AuthorizedKey: "ssh-ed25519 AAAAC3...",
+		ExpiresAt:     expires,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"session_id", "target_host", "target_port", "authorized_key", "expires_at"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestTypesTunnelReadyRequest(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := TunnelReadyRequest{
+		ListenAddr: "10.42.0.1:34567",
+		Timestamp:  now,
+	}
+	_, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+}
+
+func TestTypesTunnelClosedRequest(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := TunnelClosedRequest{
+		Reason:    "expired",
+		Duration:  "29m45s",
+		Timestamp: now,
+	}
+	_, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+}
+
 // contains is a simple substring check helper.
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchSubstring(s, substr)
