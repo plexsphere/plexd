@@ -1,0 +1,680 @@
+{
+  "feature_id": "PXD-0013",
+  "title": "D003: Add user access integration",
+  "slug": "d003-add-user-access-integration",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Route user access traffic into the mesh via external VPN clients. Support integration with Tailscale, Netbird, and standard WireGuard clients. Developers, admins, and on-call engineers connect through the bridge to reach resources on the mesh without direct mesh membership.",
+  "stories": [
+    {
+      "title": "User connects to mesh resources through a VPN client via the bridge node",
+      "role": "developer/admin",
+      "want": "to connect to mesh-internal resources using my existing VPN client (Tailscale, Netbird, or standard WireGuard) through a designated bridge node",
+      "so_that": "I can access servers, services, and infrastructure on the mesh without being a direct mesh member",
+      "criteria": [
+        "Bridge node accepts WireGuard peer connections from external VPN clients on a dedicated access-side WireGuard interface",
+        "Traffic from authenticated VPN clients is routed into the mesh network via the bridge's mesh interface",
+        "VPN client receives routes for mesh subnets through the access-side WireGuard interface AllowedIPs",
+        "Multiple concurrent VPN client connections are supported up to a configurable maximum"
+      ]
+    },
+    {
+      "title": "Control plane provisions user access peer configuration on the bridge node",
+      "role": "control plane",
+      "want": "to push user access peer assignments to bridge nodes via SSE events and desired state",
+      "so_that": "new VPN client configurations are applied in real-time without requiring bridge node restart",
+      "criteria": [
+        "user_access_peer_assigned SSE event adds a new WireGuard peer on the access-side interface",
+        "user_access_peer_revoked SSE event removes a WireGuard peer from the access-side interface",
+        "UserAccessConfig in StateResponse contains the full desired set of user access peers for reconciliation",
+        "Peer configuration includes public key, allowed source IPs, and optional pre-shared key"
+      ]
+    },
+    {
+      "title": "Bridge node reconciles user access peer state during reconciliation cycles",
+      "role": "system",
+      "want": "to detect and correct drift in user access peer configuration during reconciliation",
+      "so_that": "user access peers remain correctly configured even if the access-side WireGuard interface is modified externally",
+      "criteria": [
+        "ReconcileHandler compares desired user access peers from StateResponse against currently configured peers",
+        "Stale peers (no longer in desired state) are removed from the access-side WireGuard interface",
+        "Missing peers (in desired state but not configured) are added to the access-side WireGuard interface",
+        "Updated peers (key or allowed IPs changed) are reconfigured on the access-side WireGuard interface"
+      ]
+    },
+    {
+      "title": "Bridge node manages access-side WireGuard interface lifecycle",
+      "role": "system",
+      "want": "to create, configure, and tear down a dedicated WireGuard interface for user access traffic",
+      "so_that": "user access traffic is isolated from the mesh-side WireGuard interface and can be independently managed",
+      "criteria": [
+        "A dedicated WireGuard interface (configurable name, default 'wg-access') is created on bridge startup when user access is enabled",
+        "The access interface has its own listen port, private key, and peer configuration separate from the mesh interface",
+        "IP forwarding is enabled between the access-side WireGuard interface and the mesh-side WireGuard interface",
+        "Teardown removes the access-side WireGuard interface and all associated routing/forwarding rules",
+        "The access interface is not created when user access is disabled"
+      ]
+    },
+    {
+      "title": "Bridge node reports user access status in heartbeats and capabilities in registration",
+      "role": "control plane",
+      "want": "to receive user access status in heartbeats and user access capability during registration",
+      "so_that": "the control plane knows which bridge nodes support user access and can monitor connected user counts",
+      "criteria": [
+        "Heartbeat includes user access status (enabled, active peer count, access interface name)",
+        "Registration capabilities include user_access=true and the access listen port when user access is enabled",
+        "Status is nil/omitted when user access is disabled",
+        "Active peer count reflects the number of currently configured user access peers"
+      ]
+    },
+    {
+      "title": "Platform operator configures user access integration via Config struct",
+      "role": "platform operator",
+      "want": "to enable and configure user access integration through the plexd configuration",
+      "so_that": "I can control which bridge nodes accept VPN client connections, set resource limits, and specify network parameters",
+      "criteria": [
+        "Config struct supports UserAccessEnabled, AccessInterfaceName, AccessListenPort, MaxAccessPeers, AccessSubnets (mesh CIDRs exposed to VPN clients)",
+        "ApplyDefaults sets sensible defaults (UserAccessEnabled=false, AccessInterfaceName='wg-access', AccessListenPort=51822, MaxAccessPeers=50)",
+        "Validate rejects invalid port ranges, non-positive MaxAccessPeers, and empty AccessSubnets when user access is enabled",
+        "Validate rejects UserAccessEnabled=true when bridge mode Enabled=false (user access requires bridge mode)"
+      ]
+    },
+    {
+      "title": "Bridge node handles invalid or expired user access peer assignments gracefully",
+      "role": "system",
+      "want": "to reject malformed peer assignments and handle errors without crashing or corrupting state",
+      "so_that": "the system remains stable even when receiving invalid control plane data",
+      "criteria": [
+        "Malformed SSE payloads (invalid JSON, missing required fields) are logged and the event is discarded",
+        "Duplicate peer assignments (same public key) are rejected with an error",
+        "Exceeding MaxAccessPeers is rejected with an error",
+        "Invalid public keys are rejected at the WGController level and the error is propagated",
+        "Partial failures during reconciliation (e.g., one peer fails to add) do not prevent processing of remaining peers"
+      ]
+    },
+    {
+      "title": "Bridge node performs clean shutdown of user access resources",
+      "role": "system",
+      "want": "to cleanly remove all user access peers and tear down the access-side WireGuard interface on shutdown",
+      "so_that": "no orphaned WireGuard interfaces or peer configurations remain after the agent stops",
+      "criteria": [
+        "Shutdown removes all user access peers from the access-side interface",
+        "Shutdown tears down the access-side WireGuard interface",
+        "Shutdown disables forwarding between access and mesh interfaces",
+        "Shutdown is idempotent — calling it multiple times is safe",
+        "Shutdown errors are logged but do not prevent other cleanup (errors.Join aggregation)"
+      ]
+    },
+    {
+      "title": "Reference documentation covers user access integration package",
+      "role": "developer",
+      "want": "comprehensive reference documentation for the user access integration functionality",
+      "so_that": "future developers can understand the user access architecture, configuration, and integration points",
+      "criteria": [
+        "Documentation covers Config fields with defaults and validation rules",
+        "Documentation covers Manager lifecycle (Setup, AddPeer, RemovePeer, Teardown)",
+        "Documentation covers AccessController interface and its methods",
+        "Documentation covers SSE event handlers and reconcile handler",
+        "Data flow diagram shows VPN client → access WG interface → bridge Manager → mesh WG interface → mesh peers"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The bridge Config struct SHALL be extended with user access fields (UserAccessEnabled, AccessInterfaceName, AccessListenPort, MaxAccessPeers, AccessSubnets) with ApplyDefaults and Validate methods following the established codebase pattern",
+      "priority": "SHALL",
+      "rationale": "Consistency with existing Config pattern (bridge.Config, wireguard.Config) and proper validation prevents misconfiguration",
+      "scenarios": [
+        {
+          "name": "Defaults applied to zero-valued user access fields",
+          "when": "ApplyDefaults is called on a Config with UserAccessEnabled=false and zero-valued user access fields",
+          "then": "AccessInterfaceName defaults to 'wg-access', AccessListenPort defaults to 51822, MaxAccessPeers defaults to 50",
+          "and_then": [
+            "AccessSubnets remains empty"
+          ]
+        },
+        {
+          "name": "Validation passes when user access is disabled",
+          "when": "Validate is called with UserAccessEnabled=false",
+          "then": "no user-access-specific validation errors are returned",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects user access without bridge mode",
+          "when": "Validate is called with UserAccessEnabled=true but Enabled=false",
+          "then": "an error is returned: 'bridge: config: user access requires bridge mode to be enabled'",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects empty AccessSubnets when user access is enabled",
+          "when": "Validate is called with UserAccessEnabled=true and empty AccessSubnets for user access",
+          "then": "an error is returned indicating at least one access subnet is required for user access",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects invalid AccessListenPort",
+          "when": "Validate is called with UserAccessEnabled=true and AccessListenPort outside 1-65535",
+          "then": "an error is returned indicating AccessListenPort must be between 1 and 65535",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects non-positive MaxAccessPeers",
+          "when": "Validate is called with UserAccessEnabled=true and MaxAccessPeers <= 0",
+          "then": "an error is returned indicating MaxAccessPeers must be positive",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The bridge package SHALL define an AccessController interface abstracting WireGuard access-side interface operations for testability",
+      "priority": "SHALL",
+      "rationale": "Follows WGController and RouteController patterns — abstracts OS/wg operations behind an interface so unit tests use mocks",
+      "scenarios": [
+        {
+          "name": "CreateInterface creates a WireGuard access interface",
+          "when": "CreateInterface is called with interface name, listen port, and private key",
+          "then": "a new WireGuard interface is created and configured with the given parameters",
+          "and_then": []
+        },
+        {
+          "name": "RemoveInterface tears down the access interface",
+          "when": "RemoveInterface is called with the interface name",
+          "then": "the WireGuard interface is removed; idempotent (removing non-existent returns nil)",
+          "and_then": []
+        },
+        {
+          "name": "AddPeer adds a WireGuard peer to the access interface",
+          "when": "AddPeer is called with interface name, public key, allowed IPs, and optional PSK",
+          "then": "the peer is added to the WireGuard access interface; idempotent",
+          "and_then": []
+        },
+        {
+          "name": "RemovePeer removes a peer from the access interface",
+          "when": "RemovePeer is called with interface name and public key",
+          "then": "the peer is removed; idempotent (removing non-existent returns nil)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The bridge package SHALL provide a UserAccessManager that manages the lifecycle of the access-side WireGuard interface and its peers",
+      "priority": "SHALL",
+      "rationale": "Central coordinator for user access peer lifecycle, following the Manager pattern used in bridge, tunnel, and wireguard packages",
+      "scenarios": [
+        {
+          "name": "Setup creates access interface and enables forwarding",
+          "when": "UserAccessManager.Setup is called with valid configuration and the mesh interface name",
+          "then": "the access-side WireGuard interface is created, forwarding is enabled between access and mesh interfaces",
+          "and_then": [
+            "the manager is marked active"
+          ]
+        },
+        {
+          "name": "Setup is a no-op when disabled",
+          "when": "UserAccessManager.Setup is called with UserAccessEnabled=false",
+          "then": "no changes are made; nil is returned",
+          "and_then": []
+        },
+        {
+          "name": "AddPeer adds a user access peer with max enforcement",
+          "when": "AddPeer is called with a valid UserAccessPeer and max not reached",
+          "then": "the peer is added to the access interface and tracked internally",
+          "and_then": []
+        },
+        {
+          "name": "AddPeer rejects when max peers reached",
+          "when": "AddPeer is called but MaxAccessPeers limit is already reached",
+          "then": "an error is returned; no peer is added",
+          "and_then": []
+        },
+        {
+          "name": "RemovePeer removes a user access peer by public key",
+          "when": "RemovePeer is called with a known public key",
+          "then": "the peer is removed from the access interface and internal tracking",
+          "and_then": []
+        },
+        {
+          "name": "Teardown cleans up all user access resources",
+          "when": "Teardown is called after successful Setup",
+          "then": "all peers removed, forwarding disabled, access interface removed; errors aggregated",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The api package SHALL include UserAccessConfig, UserAccessPeer, and UserAccessInfo types for control plane communication",
+      "priority": "SHALL",
+      "rationale": "The control plane communicates user access configuration via StateResponse and receives status in heartbeats",
+      "scenarios": [
+        {
+          "name": "UserAccessConfig included in StateResponse",
+          "when": "FetchState returns a response for a bridge node with user access",
+          "then": "StateResponse.UserAccessConfig contains the list of peers",
+          "and_then": []
+        },
+        {
+          "name": "UserAccessInfo included in BridgeInfo",
+          "when": "a bridge node with user access sends a heartbeat",
+          "then": "BridgeInfo includes UserAccess field with enabled status and active peer count",
+          "and_then": []
+        },
+        {
+          "name": "Null UserAccessConfig for non-user-access nodes",
+          "when": "FetchState returns a response for a node without user access",
+          "then": "StateResponse.UserAccessConfig is nil",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The bridge package SHALL provide SSE event handlers for user_access_peer_assigned and user_access_peer_revoked events",
+      "priority": "SHALL",
+      "rationale": "Real-time peer provisioning via SSE events, following the HandleRelaySessionAssigned/Revoked pattern",
+      "scenarios": [
+        {
+          "name": "Peer assigned event adds a peer",
+          "when": "a user_access_peer_assigned SSE event is received with valid payload",
+          "then": "the peer is added to the access-side WireGuard interface via UserAccessManager",
+          "and_then": []
+        },
+        {
+          "name": "Peer revoked event removes a peer",
+          "when": "a user_access_peer_revoked SSE event is received with a public key",
+          "then": "the peer is removed; revoking a non-existent peer is a no-op",
+          "and_then": []
+        },
+        {
+          "name": "Malformed event payload is logged and discarded",
+          "when": "an SSE event with invalid JSON payload is received",
+          "then": "the error is logged and the handler returns an error; no state changes occur",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The bridge package SHALL provide a UserAccessReconcileHandler that reconciles user access peers to match the desired state",
+      "priority": "SHALL",
+      "rationale": "Follows the RelayReconcileHandler pattern: compare desired vs actual and add/remove to converge",
+      "scenarios": [
+        {
+          "name": "No user access config means no action",
+          "when": "desired state has nil UserAccessConfig",
+          "then": "handler returns nil without modifying peers",
+          "and_then": []
+        },
+        {
+          "name": "Missing peers are added",
+          "when": "desired state includes peers not currently configured",
+          "then": "missing peers are added",
+          "and_then": []
+        },
+        {
+          "name": "Stale peers are removed",
+          "when": "currently configured peers are not in the desired state",
+          "then": "stale peers are removed",
+          "and_then": []
+        },
+        {
+          "name": "Partial failures are aggregated",
+          "when": "adding one peer fails during reconciliation",
+          "then": "reconciliation continues for remaining peers; errors returned via errors.Join",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The api package SHALL define SSE event type constants for user_access_peer_assigned, user_access_peer_revoked, and user_access_config_updated",
+      "priority": "SHALL",
+      "rationale": "New SSE event types needed for real-time user access peer provisioning and config change notification",
+      "scenarios": [
+        {
+          "name": "Event constants defined",
+          "when": "the api package is imported",
+          "then": "EventUserAccessPeerAssigned, EventUserAccessPeerRevoked, EventUserAccessConfigUpdated are available as string constants",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The bridge package SHALL provide a HandleUserAccessConfigUpdated SSE event handler that triggers reconciliation",
+      "priority": "SHALL",
+      "rationale": "Follows HandleBridgeConfigUpdated and HandlePolicyUpdated pattern",
+      "scenarios": [
+        {
+          "name": "Event triggers reconcile",
+          "when": "a user_access_config_updated SSE event is received",
+          "then": "TriggerReconcile is called on the Reconciler",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The UserAccessManager SHALL provide UserAccessStatus for heartbeat reporting and UserAccessCapabilities for registration",
+      "priority": "SHALL",
+      "rationale": "Enables control plane visibility into user access state",
+      "scenarios": [
+        {
+          "name": "Active user access returns status",
+          "when": "UserAccessStatus is called when active",
+          "then": "returns non-nil UserAccessInfo with active peer count and interface name",
+          "and_then": []
+        },
+        {
+          "name": "Disabled user access returns nil",
+          "when": "UserAccessStatus is called when disabled",
+          "then": "returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Capabilities returned for registration",
+          "when": "UserAccessCapabilities is called when enabled",
+          "then": "returns capability metadata map with user_access=true and listen port",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "All user access operations SHALL use structured logging with slog and component='bridge'",
+      "priority": "SHALL",
+      "rationale": "Consistency with the existing bridge package logging convention",
+      "scenarios": [
+        {
+          "name": "Logger component field set",
+          "when": "any UserAccessManager method logs",
+          "then": "log entries include component=bridge",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "The UserAccessManager SHALL be concurrent-safe for peer add/remove operations",
+      "priority": "SHALL",
+      "rationale": "SSE events and reconciliation may invoke peer operations concurrently",
+      "scenarios": [
+        {
+          "name": "Concurrent AddPeer calls do not corrupt state",
+          "when": "multiple AddPeer calls are made concurrently",
+          "then": "all valid peers are added without data races; duplicate keys are rejected",
+          "and_then": []
+        },
+        {
+          "name": "Concurrent AddPeer and RemovePeer do not corrupt state",
+          "when": "AddPeer and RemovePeer are called concurrently",
+          "then": "internal peer tracking remains consistent",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Add UserAccessConfig, UserAccessPeer, and UserAccessInfo API types to internal/api/types.go — UserAccessConfig struct (Peers []UserAccessPeer) for StateResponse.UserAccessConfig field. UserAccessPeer struct (PublicKey string, AllowedIPs []string, PSK string). UserAccessInfo struct (Enabled bool, ActivePeers int, AccessInterface string) added to BridgeInfo as UserAccess *UserAccessInfo field. Add UserAccessConfig *UserAccessConfig field to StateResponse. Add SSE event constants EventUserAccessPeerAssigned, EventUserAccessPeerRevoked, EventUserAccessConfigUpdated to envelope.go. Include JSON round-trip tests in types_test.go. (REQ-004, REQ-007)",
+    "1.2 Extend internal/bridge/config.go — Add UserAccessEnabled bool, AccessInterfaceName string, AccessListenPort int, MaxAccessPeers int, UserAccessSubnets []string fields to Config. Extend ApplyDefaults() to set AccessInterfaceName='wg-access', AccessListenPort=51822, MaxAccessPeers=50. Extend Validate() to reject UserAccessEnabled without bridge Enabled, empty UserAccessSubnets, invalid port, non-positive MaxAccessPeers. Include tests in config_test.go. (REQ-001)",
+    "1.3 Create internal/bridge/access_controller.go — AccessController interface with CreateInterface(name string, listenPort int, privateKey string) error, RemoveInterface(name string) error, AddPeer(iface string, publicKey string, allowedIPs []string, psk string) error, RemovePeer(iface string, publicKey string) error. Create mock_access_controller_test.go with mockAccessController for tests. Follow RouteController/WGController interface pattern. (REQ-002)",
+    "1.4 Create internal/bridge/user_access.go — UserAccessManager struct holding AccessController, RouteController, Config, logger, and tracked state (active bool, peers map[string]api.UserAccessPeer, meshIface string). Implement NewUserAccessManager(accessCtrl AccessController, routeCtrl RouteController, cfg Config, logger *slog.Logger) *UserAccessManager. Implement Setup(meshIface string) error (create access interface, enable forwarding between access and mesh interfaces, mark active). Implement AddPeer(peer api.UserAccessPeer) error (enforce max peers, reject duplicates, call accessCtrl.AddPeer, track). Implement RemovePeer(publicKey string) (call accessCtrl.RemovePeer, remove from tracking). Implement Teardown() error (remove all peers, disable forwarding, remove interface; errors.Join). Implement UserAccessStatus() *api.UserAccessInfo and UserAccessCapabilities() map[string]string. Implement PeerPublicKeys() []string for reconcile. Include tests in user_access_test.go. (REQ-003, REQ-009, REQ-010, REQ-011)",
+    "2.1 Create internal/bridge/user_access_handler.go — HandleUserAccessPeerAssigned(mgr *UserAccessManager, logger *slog.Logger) api.EventHandler that parses UserAccessPeer from SSE payload and calls mgr.AddPeer. HandleUserAccessPeerRevoked(mgr *UserAccessManager, logger *slog.Logger) api.EventHandler that parses public key from payload and calls mgr.RemovePeer. HandleUserAccessConfigUpdated(trigger ReconcileTrigger) api.EventHandler that calls trigger.TriggerReconcile(). UserAccessReconcileHandler(mgr *UserAccessManager, logger *slog.Logger) reconcile.ReconcileHandler that reconciles desired vs actual peers. Include tests in user_access_handler_test.go. (REQ-005, REQ-006, REQ-008)",
+    "3.1 Create internal/bridge/user_access_integration_test.go — Integration tests wiring UserAccessManager with mockAccessController and mockRouteController. Test full lifecycle: Setup → AddPeer via SSE handler → reconcile drift → RemovePeer via SSE handler → Teardown. Test concurrent AddPeer/RemovePeer with -race. Test max peers enforcement under concurrent load. Use goleak.VerifyTestMain. (REQ-003, REQ-005, REQ-006, REQ-011)",
+    "4.1 Create docs/reference/backend/user-access-integration.md — Reference documentation for user access integration in internal/bridge package: Config fields with defaults and validation rules, UserAccessManager lifecycle (Setup, AddPeer, RemovePeer, Teardown, UserAccessStatus), AccessController interface, SSE event handlers (HandleUserAccessPeerAssigned, HandleUserAccessPeerRevoked, HandleUserAccessConfigUpdated), UserAccessReconcileHandler, API types (UserAccessConfig, UserAccessPeer, UserAccessInfo). Include data flow diagram: VPN client → access WG interface (wg-access) → bridge node → mesh WG interface (wg0) → mesh peers. Integration points with reconcile, api, bridge packages. (REQ-001 through REQ-011)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults_UserAccess",
+      "story": "Platform operator configures user access integration via Config struct",
+      "expected": "ApplyDefaults sets AccessInterfaceName='wg-access', AccessListenPort=51822, MaxAccessPeers=50 for zero-valued user access fields",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_UserAccessWithoutBridge",
+      "story": "Platform operator configures user access integration via Config struct",
+      "expected": "Validate returns error when UserAccessEnabled=true but Enabled=false",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_UserAccessMissingAccessSubnets",
+      "story": "Platform operator configures user access integration via Config struct",
+      "expected": "Validate returns error when UserAccessEnabled=true and AccessSubnets for user access is empty",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_UserAccessInvalidPort",
+      "story": "Platform operator configures user access integration via Config struct",
+      "expected": "Validate returns error when AccessListenPort is outside 1-65535",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_UserAccessInvalidMaxPeers",
+      "story": "Platform operator configures user access integration via Config struct",
+      "expected": "Validate returns error when MaxAccessPeers <= 0",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_UserAccessValidConfig",
+      "story": "Platform operator configures user access integration via Config struct",
+      "expected": "Validate returns nil for a fully valid user access config with bridge enabled",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/user_access_test.go",
+      "test_function": "TestUserAccessManager_Setup_Enabled",
+      "story": "Bridge node manages access-side WireGuard interface lifecycle",
+      "expected": "Setup creates access interface via AccessController, enables forwarding via RouteController, marks manager active",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/user_access_test.go",
+      "test_function": "TestUserAccessManager_Setup_Disabled",
+      "story": "Bridge node manages access-side WireGuard interface lifecycle",
+      "expected": "Setup with UserAccessEnabled=false makes no AccessController calls and returns nil",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/user_access_test.go",
+      "test_function": "TestUserAccessManager_AddPeer",
+      "story": "User connects to mesh resources through a VPN client via the bridge node",
+      "expected": "AddPeer calls AccessController.AddPeer and tracks the peer internally; active count increments",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/user_access_test.go",
+      "test_function": "TestUserAccessManager_AddPeer_MaxReached",
+      "story": "Bridge node handles invalid or expired user access peer assignments gracefully",
+      "expected": "AddPeer returns error when MaxAccessPeers limit is reached; no peer is added",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/user_access_test.go",
+      "test_function": "TestUserAccessManager_AddPeer_Duplicate",
+      "story": "Bridge node handles invalid or expired user access peer assignments gracefully",
+      "expected": "AddPeer returns error when a peer with the same public key already exists",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/user_access_test.go",
+      "test_function": "TestUserAccessManager_RemovePeer",
+      "story": "User connects to mesh resources through a VPN client via the bridge node",
+      "expected": "RemovePeer calls AccessController.RemovePeer and removes from internal tracking; removing unknown key is no-op",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/user_access_test.go",
+      "test_function": "TestUserAccessManager_Teardown",
+      "story": "Bridge node performs clean shutdown of user access resources",
+      "expected": "Teardown removes all peers, disables forwarding, removes access interface; aggregates errors",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/user_access_test.go",
+      "test_function": "TestUserAccessManager_Teardown_Idempotent",
+      "story": "Bridge node performs clean shutdown of user access resources",
+      "expected": "Teardown on inactive manager returns nil without calling AccessController",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/user_access_test.go",
+      "test_function": "TestUserAccessManager_UserAccessStatus_Active",
+      "story": "Bridge node reports user access status in heartbeats and capabilities in registration",
+      "expected": "UserAccessStatus on active manager returns UserAccessInfo with correct peer count and interface name",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/bridge/user_access_test.go",
+      "test_function": "TestUserAccessManager_UserAccessStatus_Disabled",
+      "story": "Bridge node reports user access status in heartbeats and capabilities in registration",
+      "expected": "UserAccessStatus on disabled manager returns nil",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/bridge/user_access_test.go",
+      "test_function": "TestUserAccessManager_UserAccessCapabilities",
+      "story": "Bridge node reports user access status in heartbeats and capabilities in registration",
+      "expected": "UserAccessCapabilities returns map with user_access=true and access_listen_port when enabled, nil when disabled",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/bridge/user_access_handler_test.go",
+      "test_function": "TestHandleUserAccessPeerAssigned",
+      "story": "Control plane provisions user access peer configuration on the bridge node",
+      "expected": "SSE handler parses payload and calls UserAccessManager.AddPeer successfully",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/user_access_handler_test.go",
+      "test_function": "TestHandleUserAccessPeerAssigned_MalformedPayload",
+      "story": "Bridge node handles invalid or expired user access peer assignments gracefully",
+      "expected": "Malformed JSON payload returns error; no peer is added",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/user_access_handler_test.go",
+      "test_function": "TestHandleUserAccessPeerRevoked",
+      "story": "Control plane provisions user access peer configuration on the bridge node",
+      "expected": "SSE handler parses payload and calls UserAccessManager.RemovePeer successfully",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/user_access_handler_test.go",
+      "test_function": "TestHandleUserAccessPeerRevoked_NonExistent",
+      "story": "Bridge node handles invalid or expired user access peer assignments gracefully",
+      "expected": "Revoking a non-existent peer returns nil (no-op)",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/user_access_handler_test.go",
+      "test_function": "TestHandleUserAccessConfigUpdated",
+      "story": "Control plane provisions user access peer configuration on the bridge node",
+      "expected": "SSE handler calls TriggerReconcile on the Reconciler",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/bridge/user_access_handler_test.go",
+      "test_function": "TestUserAccessReconcileHandler_NoPeers",
+      "story": "Bridge node reconciles user access peer state during reconciliation cycles",
+      "expected": "Handler returns nil when UserAccessConfig is nil in desired state",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/user_access_handler_test.go",
+      "test_function": "TestUserAccessReconcileHandler_AddMissing",
+      "story": "Bridge node reconciles user access peer state during reconciliation cycles",
+      "expected": "Handler adds peers that are in desired state but not in current state",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/user_access_handler_test.go",
+      "test_function": "TestUserAccessReconcileHandler_RemoveStale",
+      "story": "Bridge node reconciles user access peer state during reconciliation cycles",
+      "expected": "Handler removes peers that are in current state but not in desired state",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestUserAccessConfig_JSONRoundTrip",
+      "story": "Control plane provisions user access peer configuration on the bridge node",
+      "expected": "UserAccessConfig and UserAccessPeer serialize/deserialize correctly to/from JSON",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/user_access_integration_test.go",
+      "test_function": "TestUserAccessIntegration_FullLifecycle",
+      "story": "User connects to mesh resources through a VPN client via the bridge node",
+      "expected": "Full lifecycle: setup → add peers via SSE → reconcile → remove peers → teardown. Verify AccessController calls match expectations.",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/user_access_integration_test.go",
+      "test_function": "TestUserAccessIntegration_ReconcileDrift",
+      "story": "Bridge node reconciles user access peer state during reconciliation cycles",
+      "expected": "Reconcile handler detects peer drift between desired and actual state and corrects it",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/user_access_integration_test.go",
+      "test_function": "TestUserAccessIntegration_ConcurrentAccess",
+      "story": "Bridge node handles invalid or expired user access peer assignments gracefully",
+      "expected": "Concurrent AddPeer/RemovePeer operations under -race are safe; max peers enforced correctly",
+      "requirement_id": "REQ-011"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-011) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "AccessController interface follows the same abstraction pattern as RouteController and WGController for testability",
+    "UserAccessReconcileHandler integrates with the existing reconcile.Reconciler via RegisterHandler (same pattern as bridge.ReconcileHandler and relay.RelayReconcileHandler)",
+    "HandleUserAccessConfigUpdated SSE handler delegates to TriggerReconcile rather than applying changes directly (consistency with HandleBridgeConfigUpdated pattern)",
+    "UserAccessManager.Teardown uses errors.Join for error aggregation, continuing cleanup even on partial failure",
+    "UserAccessManager is concurrent-safe: mutex protects internal peer tracking; tests pass with -race flag",
+    "Code follows existing patterns: log/slog with component=bridge, Config with ApplyDefaults/Validate, stdlib-only test dependencies, go.uber.org/goleak in integration tests",
+    "API type additions (UserAccessConfig, UserAccessPeer, UserAccessInfo) use json tags with snake_case and omitempty for optional pointer fields",
+    "Reference documentation covers all public types, methods, data flow diagram, and integration patterns (docs/reference/backend/user-access-integration.md)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package location**: All user access code lives in `internal/bridge/` since user access is a bridge mode sub-feature (depends on S011). Files: user_access.go (UserAccessManager), access_controller.go (AccessController interface), user_access_handler.go (SSE + reconcile handlers), mock_access_controller_test.go (test double), user_access_test.go, user_access_handler_test.go, user_access_integration_test.go.\n\n2. **API type additions**: Three new types added to `internal/api/types.go`: `UserAccessConfig` (control plane → node: list of user access peers), `UserAccessPeer` (individual peer with public key, allowed IPs, PSK), `UserAccessInfo` (node → control plane: user access status). `UserAccessConfig *UserAccessConfig` field added to `StateResponse`. `UserAccess *UserAccessInfo` field added to `BridgeInfo`. Three new SSE event constants added to `envelope.go`: `EventUserAccessPeerAssigned`, `EventUserAccessPeerRevoked`, `EventUserAccessConfigUpdated`.\n\n3. **AccessController interface**: Dedicated interface for access-side WireGuard operations. Five methods: CreateInterface, RemoveInterface, AddPeer, RemovePeer. Production implementation would use wgctrl/netlink — NOT in scope for this feature (interface + mock only, same as RouteController). The production AccessController will be implemented as part of platform-specific packages (Phase 6).\n\n4. **UserAccessManager lifecycle**: NewUserAccessManager → Setup(meshIface) → active → AddPeer/RemovePeer → Teardown. The manager tracks peers by public key in a map[string]api.UserAccessPeer. Setup creates the access-side WireGuard interface (via AccessController.CreateInterface) and enables IP forwarding between the access interface and mesh interface (via RouteController.EnableForwarding). Teardown reverses all operations with errors.Join aggregation.\n\n5. **Reconcile integration**: UserAccessReconcileHandler is registered AFTER the bridge ReconcileHandler. It reads UserAccessConfig from StateResponse, compares desired peers (keyed by PublicKey) against mgr.PeerPublicKeys(), and adds/removes to converge. Pattern matches RelayReconcileHandler exactly.\n\n6. **SSE handlers**: HandleUserAccessPeerAssigned/Revoked follow the HandleRelaySessionAssigned/Revoked pattern — parse JSON payload, call manager method. HandleUserAccessConfigUpdated follows HandleBridgeConfigUpdated — just calls TriggerReconcile.\n\n7. **Concurrency**: UserAccessManager uses sync.Mutex to protect the peers map. SSE events and reconciliation may fire concurrently. Integration tests verify correctness under -race.\n\n8. **Config extension**: User access fields are added to the existing bridge.Config struct rather than creating a separate config type. This keeps the bridge package cohesive and the Config.Validate method can enforce the dependency (user access requires bridge mode). The UserAccessSubnets field defines which mesh CIDRs are advertised to VPN clients as AllowedIPs — these are the mesh subnets the VPN clients can reach through the bridge.\n\n9. **BridgeInfo extension**: Rather than adding a top-level field to HeartbeatRequest, user access status is nested under BridgeInfo as UserAccess *UserAccessInfo. This maintains the existing heartbeat structure where bridge-related info is grouped.\n\n10. **Key files from existing codebase to follow**:\n    - `internal/bridge/config.go` — Config pattern to extend\n    - `internal/bridge/route.go` — RouteController interface pattern for AccessController\n    - `internal/bridge/mock_route_test.go` — Mock pattern for mockAccessController\n    - `internal/bridge/manager.go` — Manager lifecycle pattern for UserAccessManager\n    - `internal/bridge/relay.go` — Session/peer management with mutex pattern\n    - `internal/bridge/relay_handler.go` — SSE handler + ReconcileHandler pattern to follow exactly\n    - `internal/api/types.go` — API type definitions with JSON tags\n    - `internal/api/envelope.go` — SSE event constants\n\n11. **Potential pitfalls**:\n    - UserAccessConfig can be nil in StateResponse for nodes without user access. The reconcile handler must check for nil before acting.\n    - The AccessController.AddPeer needs the access interface name — the manager should track this from config.\n    - Forwarding between two WireGuard interfaces (mesh and access) requires the existing RouteController.EnableForwarding — reuse it rather than adding a new method.\n    - The private key for the access-side WireGuard interface is generated locally and the corresponding public key must be reported to the control plane. For this feature, the key is passed into Setup via config or generated internally. The control plane distributes this public key to VPN clients.\n    - NAT masquerading may or may not be needed for user access traffic — it depends on the mesh IP scheme. The existing bridge NAT config on the access-side network interface is separate from the user access WireGuard interface. We do NOT apply NAT on the user access interface itself.\n    - The existing bridge.Manager handles routing for the physical access-side interface. UserAccessManager handles the WireGuard access-side interface. These are complementary — a bridge node may have both.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.109486"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T19:05:57.610008"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T19:10:56.856122"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "e2787a5e-5838-4ff0-99bc-d70e319285b7",
+      "timestamp": "2026-02-12T19:10:56.856149",
+      "total_duration": 295.61846375465393,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 295.61846375465393,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
