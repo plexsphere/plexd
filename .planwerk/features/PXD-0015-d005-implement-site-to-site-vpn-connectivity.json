@@ -1,0 +1,719 @@
+{
+  "feature_id": "PXD-0015",
+  "title": "D005: Implement site-to-site VPN connectivity",
+  "slug": "d005-implement-site-to-site-vpn-connectivity",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Connect the mesh to external VPN networks for site-to-site connectivity. The bridge node establishes VPN tunnels to partner networks, corporate data centers, or other external environments and routes traffic between the mesh and these external networks.",
+  "stories": [
+    {
+      "title": "Bridge node establishes VPN tunnels to external networks for site-to-site connectivity",
+      "role": "platform operator",
+      "want": "to configure site-to-site VPN connections on a bridge node so that mesh traffic can reach external partner networks, corporate data centers, and other environments",
+      "so_that": "mesh-internal services can communicate bidirectionally with external networks without exposing the mesh directly",
+      "criteria": [
+        "Control plane pushes SiteToSiteConfig in StateResponse containing VPN tunnel definitions",
+        "SiteToSiteManager creates WireGuard tunnels to external endpoints with configured public keys and pre-shared keys",
+        "Traffic from mesh peers is routed to external network subnets through the VPN tunnels",
+        "Traffic from external networks is routed back into the mesh via the bridge node",
+        "Multiple concurrent site-to-site tunnels are supported up to a configurable maximum"
+      ]
+    },
+    {
+      "title": "Control plane provisions site-to-site tunnel configuration on the bridge node",
+      "role": "control plane",
+      "want": "to push site-to-site tunnel assignments to bridge nodes via SSE events and desired state",
+      "so_that": "new VPN tunnel configurations are applied in real-time without requiring bridge node restart",
+      "criteria": [
+        "site_to_site_tunnel_assigned SSE event creates a new WireGuard tunnel to the external endpoint",
+        "site_to_site_tunnel_revoked SSE event tears down a VPN tunnel",
+        "SiteToSiteConfig in StateResponse contains the full desired set of tunnels for reconciliation",
+        "Tunnel configuration includes tunnel ID, remote endpoint, remote public key, PSK, remote subnets, and local listen port"
+      ]
+    },
+    {
+      "title": "Bridge node reconciles site-to-site tunnel state during reconciliation cycles",
+      "role": "system",
+      "want": "to detect and correct drift in site-to-site tunnel configuration during reconciliation",
+      "so_that": "VPN tunnels remain correctly configured even if WireGuard interfaces or routes are modified externally",
+      "criteria": [
+        "SiteToSiteReconcileHandler compares desired tunnels from StateResponse against currently active tunnels",
+        "Stale tunnels (no longer in desired state) are torn down including WireGuard interface and routes",
+        "Missing tunnels (in desired state but not configured) are created with full WireGuard interface and routes",
+        "Updated tunnels (endpoint or key changed) are torn down and re-created with new configuration"
+      ]
+    },
+    {
+      "title": "Bridge node manages site-to-site WireGuard interface and route lifecycle per tunnel",
+      "role": "system",
+      "want": "to create, configure, and tear down a dedicated WireGuard interface and routes for each site-to-site tunnel",
+      "so_that": "each external network connection is isolated with its own interface and routing",
+      "criteria": [
+        "Each tunnel gets a dedicated WireGuard interface (configurable name prefix, default 'wg-s2s-{tunnel_id}')",
+        "The tunnel interface has its own listen port, peer configuration (remote public key, endpoint, allowed IPs), and optional PSK",
+        "Routes for the remote subnets are added pointing to the tunnel interface",
+        "IP forwarding is enabled between the tunnel interface and the mesh interface",
+        "Teardown removes routes, disables forwarding, and removes the tunnel interface"
+      ]
+    },
+    {
+      "title": "Platform operator configures site-to-site VPN via Config struct",
+      "role": "platform operator",
+      "want": "to enable and configure site-to-site VPN functionality through the plexd configuration",
+      "so_that": "I can control which bridge nodes establish VPN tunnels and set resource limits",
+      "criteria": [
+        "Config struct supports SiteToSiteEnabled, MaxSiteToSiteTunnels, SiteToSiteInterfacePrefix fields",
+        "ApplyDefaults sets sensible defaults (SiteToSiteEnabled=false, MaxSiteToSiteTunnels=10, SiteToSiteInterfacePrefix='wg-s2s')",
+        "Validate rejects SiteToSiteEnabled=true when bridge mode Enabled=false",
+        "Validate rejects non-positive MaxSiteToSiteTunnels when site-to-site is enabled",
+        "Validate rejects empty SiteToSiteInterfacePrefix when site-to-site is enabled"
+      ]
+    },
+    {
+      "title": "Bridge node reports site-to-site status in heartbeats and capabilities in registration",
+      "role": "control plane",
+      "want": "to receive site-to-site VPN status in heartbeats and capabilities during registration",
+      "so_that": "the control plane knows which bridge nodes support site-to-site VPN and can monitor tunnel health",
+      "criteria": [
+        "Heartbeat includes site-to-site status (enabled, active tunnel count)",
+        "Registration capabilities include site_to_site=true when site-to-site is enabled",
+        "Status is nil/omitted when site-to-site is disabled",
+        "Active tunnel count reflects the number of currently configured tunnels"
+      ]
+    },
+    {
+      "title": "Bridge node handles invalid tunnel assignments and errors gracefully",
+      "role": "system",
+      "want": "to reject malformed tunnel assignments and handle errors without crashing or corrupting state",
+      "so_that": "the system remains stable even when receiving invalid control plane data",
+      "criteria": [
+        "Malformed SSE payloads (invalid JSON, missing required fields) are logged and the event is discarded",
+        "Duplicate tunnel assignments (same tunnel ID) are rejected with an error",
+        "Exceeding MaxSiteToSiteTunnels is rejected with an error",
+        "Invalid remote endpoints or public keys cause tunnel creation to fail with a descriptive error",
+        "Partial failures during reconciliation do not prevent processing of remaining tunnels"
+      ]
+    },
+    {
+      "title": "Bridge node performs clean shutdown of site-to-site VPN resources",
+      "role": "system",
+      "want": "to cleanly remove all VPN tunnels, routes, and interfaces on shutdown",
+      "so_that": "no orphaned WireGuard interfaces or routes remain after the agent stops",
+      "criteria": [
+        "Shutdown removes all routes for each tunnel's remote subnets",
+        "Shutdown disables forwarding for each tunnel interface",
+        "Shutdown removes all WireGuard tunnel interfaces",
+        "Shutdown is idempotent — calling it multiple times is safe",
+        "Shutdown errors are logged but do not prevent other cleanup (errors.Join aggregation)"
+      ]
+    },
+    {
+      "title": "Reference documentation covers site-to-site VPN connectivity package",
+      "role": "developer",
+      "want": "comprehensive reference documentation for the site-to-site VPN functionality",
+      "so_that": "future developers can understand the VPN architecture, configuration, and integration points",
+      "criteria": [
+        "Documentation covers Config fields with defaults and validation rules",
+        "Documentation covers SiteToSiteManager lifecycle (Setup, AddTunnel, RemoveTunnel, Teardown)",
+        "Documentation covers VPNController interface and its methods",
+        "Documentation covers SSE event handlers and reconcile handler",
+        "Data flow diagram shows external network → s2s WG interface → bridge node → mesh WG interface → mesh peers"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The bridge Config struct SHALL be extended with site-to-site VPN fields (SiteToSiteEnabled, MaxSiteToSiteTunnels, SiteToSiteInterfacePrefix) with ApplyDefaults and Validate methods following the established codebase pattern",
+      "priority": "SHALL",
+      "rationale": "Consistency with existing Config pattern (relay, user access fields) and proper validation prevents misconfiguration",
+      "scenarios": [
+        {
+          "name": "Defaults applied to zero-valued site-to-site fields",
+          "when": "ApplyDefaults is called on a Config with SiteToSiteEnabled=false and zero-valued site-to-site fields",
+          "then": "MaxSiteToSiteTunnels defaults to 10, SiteToSiteInterfacePrefix defaults to 'wg-s2s'",
+          "and_then": []
+        },
+        {
+          "name": "Validation passes when site-to-site is disabled",
+          "when": "Validate is called with SiteToSiteEnabled=false",
+          "then": "no site-to-site-specific validation errors are returned",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects site-to-site without bridge mode",
+          "when": "Validate is called with SiteToSiteEnabled=true but Enabled=false",
+          "then": "an error is returned: 'bridge: config: site-to-site requires bridge mode to be enabled'",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects non-positive MaxSiteToSiteTunnels",
+          "when": "Validate is called with SiteToSiteEnabled=true and MaxSiteToSiteTunnels <= 0",
+          "then": "an error is returned indicating MaxSiteToSiteTunnels must be positive",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects empty SiteToSiteInterfacePrefix",
+          "when": "Validate is called with SiteToSiteEnabled=true and empty SiteToSiteInterfacePrefix",
+          "then": "an error is returned indicating SiteToSiteInterfacePrefix is required when site-to-site is enabled",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The bridge package SHALL define a VPNController interface abstracting WireGuard tunnel operations for external VPN connectivity, following the AccessController pattern",
+      "priority": "SHALL",
+      "rationale": "Follows AccessController and RouteController patterns — abstracts OS/wg operations behind an interface so unit tests use mocks",
+      "scenarios": [
+        {
+          "name": "CreateTunnelInterface creates a WireGuard interface for the tunnel",
+          "when": "CreateTunnelInterface is called with interface name and listen port",
+          "then": "a new WireGuard interface is created and configured",
+          "and_then": []
+        },
+        {
+          "name": "RemoveTunnelInterface tears down the tunnel interface",
+          "when": "RemoveTunnelInterface is called with the interface name",
+          "then": "the WireGuard interface is removed; idempotent (removing non-existent returns nil)",
+          "and_then": []
+        },
+        {
+          "name": "ConfigureTunnelPeer configures the remote peer on the tunnel interface",
+          "when": "ConfigureTunnelPeer is called with interface name, remote public key, endpoint, allowed IPs, and optional PSK",
+          "then": "the remote peer is configured on the WireGuard tunnel interface",
+          "and_then": []
+        },
+        {
+          "name": "RemoveTunnelPeer removes the remote peer from the tunnel interface",
+          "when": "RemoveTunnelPeer is called with interface name and public key",
+          "then": "the peer is removed; idempotent (removing non-existent returns nil)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The bridge package SHALL provide a SiteToSiteManager that manages the lifecycle of site-to-site VPN tunnels including WireGuard interfaces, peer configuration, and routing",
+      "priority": "SHALL",
+      "rationale": "Central coordinator for VPN tunnel lifecycle, following the UserAccessManager pattern used in the bridge package",
+      "scenarios": [
+        {
+          "name": "Setup marks manager active when enabled",
+          "when": "SiteToSiteManager.Setup is called with SiteToSiteEnabled=true",
+          "then": "the manager is marked active and ready to accept tunnels",
+          "and_then": []
+        },
+        {
+          "name": "Setup is a no-op when disabled",
+          "when": "SiteToSiteManager.Setup is called with SiteToSiteEnabled=false",
+          "then": "no changes are made; nil is returned",
+          "and_then": []
+        },
+        {
+          "name": "AddTunnel creates full tunnel stack",
+          "when": "AddTunnel is called with a valid SiteToSiteTunnel and max not reached",
+          "then": "a new WireGuard interface is created, the remote peer is configured, routes for remote subnets are added, and forwarding is enabled between tunnel and mesh interfaces",
+          "and_then": [
+            "the tunnel is tracked internally by tunnel ID"
+          ]
+        },
+        {
+          "name": "AddTunnel rejects when max tunnels reached",
+          "when": "AddTunnel is called but MaxSiteToSiteTunnels limit is already reached",
+          "then": "an error is returned; no tunnel is created",
+          "and_then": []
+        },
+        {
+          "name": "AddTunnel rejects duplicate tunnel ID",
+          "when": "AddTunnel is called with a tunnel ID that already exists",
+          "then": "an error is returned indicating duplicate tunnel",
+          "and_then": []
+        },
+        {
+          "name": "AddTunnel rolls back on partial failure",
+          "when": "AddTunnel creates the interface but route addition fails",
+          "then": "the interface is removed and an error is returned; no partial state remains",
+          "and_then": []
+        },
+        {
+          "name": "RemoveTunnel tears down a tunnel by ID",
+          "when": "RemoveTunnel is called with a known tunnel ID",
+          "then": "routes are removed, forwarding is disabled, interface is removed, and tunnel is untracked",
+          "and_then": []
+        },
+        {
+          "name": "RemoveTunnel is a no-op for unknown tunnel ID",
+          "when": "RemoveTunnel is called with an unknown tunnel ID",
+          "then": "no changes are made; no error",
+          "and_then": []
+        },
+        {
+          "name": "Teardown cleans up all tunnels",
+          "when": "Teardown is called after successful Setup with active tunnels",
+          "then": "all tunnels are removed, manager is marked inactive; errors aggregated via errors.Join",
+          "and_then": []
+        },
+        {
+          "name": "Teardown is idempotent",
+          "when": "Teardown is called on an inactive manager",
+          "then": "nil is returned without any operations",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The api package SHALL include SiteToSiteConfig, SiteToSiteTunnel, and SiteToSiteInfo types for control plane communication",
+      "priority": "SHALL",
+      "rationale": "The control plane communicates site-to-site configuration via StateResponse and receives status in heartbeats",
+      "scenarios": [
+        {
+          "name": "SiteToSiteConfig included in StateResponse",
+          "when": "FetchState returns a response for a bridge node with site-to-site enabled",
+          "then": "StateResponse.SiteToSiteConfig contains the list of tunnels",
+          "and_then": []
+        },
+        {
+          "name": "SiteToSiteInfo included in BridgeInfo",
+          "when": "a bridge node with site-to-site sends a heartbeat",
+          "then": "BridgeInfo includes SiteToSite field with enabled status and active tunnel count",
+          "and_then": []
+        },
+        {
+          "name": "Null SiteToSiteConfig for non-s2s nodes",
+          "when": "FetchState returns a response for a node without site-to-site",
+          "then": "StateResponse.SiteToSiteConfig is nil",
+          "and_then": []
+        },
+        {
+          "name": "SiteToSiteTunnel JSON round-trip preserves all fields",
+          "when": "a SiteToSiteTunnel is marshalled and unmarshalled",
+          "then": "all fields are preserved: TunnelID, RemoteEndpoint, RemotePublicKey, PSK, RemoteSubnets, LocalListenPort",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The bridge package SHALL provide SSE event handlers for site_to_site_tunnel_assigned and site_to_site_tunnel_revoked events following the existing EventHandler pattern",
+      "priority": "SHALL",
+      "rationale": "Real-time tunnel provisioning via SSE follows the established HandleRelaySessionAssigned/Revoked pattern",
+      "scenarios": [
+        {
+          "name": "Tunnel assigned event creates a tunnel",
+          "when": "a site_to_site_tunnel_assigned SSE event is received with valid payload",
+          "then": "SiteToSiteManager.AddTunnel is called with the tunnel from the payload",
+          "and_then": []
+        },
+        {
+          "name": "Tunnel revoked event removes a tunnel",
+          "when": "a site_to_site_tunnel_revoked SSE event is received with a tunnel_id",
+          "then": "SiteToSiteManager.RemoveTunnel is called; revoking non-existent is a no-op",
+          "and_then": []
+        },
+        {
+          "name": "Malformed SSE payload returns error",
+          "when": "event has malformed JSON payload",
+          "then": "error is logged, no tunnel is created, handler returns error",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The bridge package SHALL provide a SiteToSiteReconcileHandler that synchronizes VPN tunnels with the control plane's desired state",
+      "priority": "SHALL",
+      "rationale": "Reconciliation ensures eventual consistency of tunnels, handling cases where SSE events are missed or state drifts",
+      "scenarios": [
+        {
+          "name": "No site-to-site config means no action",
+          "when": "desired state has nil SiteToSiteConfig",
+          "then": "handler returns nil without modifications",
+          "and_then": []
+        },
+        {
+          "name": "Missing tunnels are created",
+          "when": "desired SiteToSiteConfig has tunnels not currently active",
+          "then": "new tunnels are added via SiteToSiteManager.AddTunnel",
+          "and_then": []
+        },
+        {
+          "name": "Stale tunnels are removed",
+          "when": "active tunnels exist that are not in desired SiteToSiteConfig",
+          "then": "those tunnels are removed via SiteToSiteManager.RemoveTunnel",
+          "and_then": []
+        },
+        {
+          "name": "Nil SiteToSiteConfig is no-op",
+          "when": "desired state has nil SiteToSiteConfig",
+          "then": "handler returns nil",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The api package SHALL define SSE event type constants for site_to_site_tunnel_assigned, site_to_site_tunnel_revoked, and site_to_site_config_updated",
+      "priority": "SHALL",
+      "rationale": "New SSE event types needed for real-time VPN tunnel provisioning and config change notification",
+      "scenarios": [
+        {
+          "name": "Event constants defined",
+          "when": "the api package is imported",
+          "then": "EventSiteToSiteTunnelAssigned, EventSiteToSiteTunnelRevoked, EventSiteToSiteConfigUpdated are available as string constants",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The bridge package SHALL provide a HandleSiteToSiteConfigUpdated SSE event handler that triggers reconciliation",
+      "priority": "SHALL",
+      "rationale": "Follows HandleBridgeConfigUpdated and HandleUserAccessConfigUpdated pattern",
+      "scenarios": [
+        {
+          "name": "Event triggers reconcile",
+          "when": "a site_to_site_config_updated SSE event is received",
+          "then": "TriggerReconcile is called on the Reconciler",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The SiteToSiteManager SHALL provide SiteToSiteStatus for heartbeat reporting and SiteToSiteCapabilities for registration",
+      "priority": "SHALL",
+      "rationale": "Enables control plane visibility into site-to-site VPN state",
+      "scenarios": [
+        {
+          "name": "Active site-to-site returns status",
+          "when": "SiteToSiteStatus is called when active with tunnels",
+          "then": "returns non-nil SiteToSiteInfo with enabled flag and active tunnel count",
+          "and_then": []
+        },
+        {
+          "name": "Disabled site-to-site returns nil",
+          "when": "SiteToSiteStatus is called when disabled",
+          "then": "returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Capabilities returned for registration",
+          "when": "SiteToSiteCapabilities is called when enabled",
+          "then": "returns capability metadata map with site_to_site=true",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "All site-to-site operations SHALL use structured logging with slog and component='bridge'",
+      "priority": "SHALL",
+      "rationale": "Consistency with the existing bridge package logging convention",
+      "scenarios": [
+        {
+          "name": "Logger component field set",
+          "when": "any SiteToSiteManager method logs",
+          "then": "log entries include component=bridge",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "The SiteToSiteManager SHALL be concurrent-safe for tunnel add/remove operations",
+      "priority": "SHALL",
+      "rationale": "SSE events and reconciliation may invoke tunnel operations concurrently",
+      "scenarios": [
+        {
+          "name": "Concurrent AddTunnel calls do not corrupt state",
+          "when": "multiple AddTunnel calls are made concurrently",
+          "then": "all valid tunnels are created without data races; duplicate IDs are rejected",
+          "and_then": []
+        },
+        {
+          "name": "Concurrent AddTunnel and RemoveTunnel do not corrupt state",
+          "when": "AddTunnel and RemoveTunnel are called concurrently",
+          "then": "internal tunnel tracking remains consistent",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Add SiteToSiteConfig, SiteToSiteTunnel, and SiteToSiteInfo API types to internal/api/types.go — SiteToSiteConfig struct (Tunnels []SiteToSiteTunnel) for StateResponse.SiteToSiteConfig field. SiteToSiteTunnel struct (TunnelID string, RemoteEndpoint string, RemotePublicKey string, PSK string, RemoteSubnets []string, LocalListenPort int). SiteToSiteInfo struct (Enabled bool, ActiveTunnels int) added to BridgeInfo as SiteToSite *SiteToSiteInfo field. Add SiteToSiteConfig *SiteToSiteConfig field to StateResponse. Add SSE event constants EventSiteToSiteTunnelAssigned, EventSiteToSiteTunnelRevoked, EventSiteToSiteConfigUpdated to envelope.go. Include JSON round-trip tests in types_test.go. (REQ-004, REQ-007)",
+    "1.2 Extend internal/bridge/config.go — Add SiteToSiteEnabled bool, MaxSiteToSiteTunnels int, SiteToSiteInterfacePrefix string fields to Config. Add DefaultMaxSiteToSiteTunnels=10, DefaultSiteToSiteInterfacePrefix='wg-s2s' constants. Extend ApplyDefaults() to set site-to-site defaults. Extend Validate() to reject SiteToSiteEnabled without bridge Enabled, non-positive MaxSiteToSiteTunnels, empty SiteToSiteInterfacePrefix. Include tests in config_test.go. (REQ-001)",
+    "1.3 Create internal/bridge/vpn_controller.go — VPNController interface with CreateTunnelInterface(name string, listenPort int) error, RemoveTunnelInterface(name string) error, ConfigureTunnelPeer(iface string, publicKey string, endpoint string, allowedIPs []string, psk string) error, RemoveTunnelPeer(iface string, publicKey string) error. Create mock_vpn_test.go with mockVPNController for tests following mockAccessController pattern. (REQ-002)",
+    "1.4 Create internal/bridge/site_to_site.go — SiteToSiteManager struct holding VPNController, RouteController, Config, logger, mu sync.Mutex, active bool, activeTunnels map[string]tunnelState (tracks interface name, remote subnets per tunnel), meshIface string. Implement NewSiteToSiteManager(vpnCtrl VPNController, routeCtrl RouteController, cfg Config, logger *slog.Logger) *SiteToSiteManager. Implement Setup(meshIface string) error (mark active, store meshIface; no-op when disabled). Implement AddTunnel(tunnel api.SiteToSiteTunnel) error (enforce max, reject duplicate, create interface via vpnCtrl.CreateTunnelInterface, configure peer via vpnCtrl.ConfigureTunnelPeer, add routes via routeCtrl.AddRoute for each RemoteSubnet, enable forwarding via routeCtrl.EnableForwarding between tunnel iface and mesh iface, track state; rollback interface on failure). Implement RemoveTunnel(tunnelID string) (remove routes, disable forwarding, remove peer, remove interface, untrack; no-op for unknown ID; errors aggregated via errors.Join). Implement Teardown() error (remove all tunnels, mark inactive; idempotent). Implement TunnelIDs() []string, SiteToSiteStatus() *api.SiteToSiteInfo, SiteToSiteCapabilities() map[string]string. Include tests in site_to_site_test.go. (REQ-003, REQ-009, REQ-010, REQ-011)",
+    "2.1 Create internal/bridge/site_to_site_handler.go — HandleSiteToSiteTunnelAssigned(mgr *SiteToSiteManager, logger *slog.Logger) api.EventHandler that parses SiteToSiteTunnel from SSE payload and calls mgr.AddTunnel. HandleSiteToSiteTunnelRevoked(mgr *SiteToSiteManager, logger *slog.Logger) api.EventHandler that parses tunnel_id from payload and calls mgr.RemoveTunnel. HandleSiteToSiteConfigUpdated(trigger ReconcileTrigger) api.EventHandler that calls trigger.TriggerReconcile(). SiteToSiteReconcileHandler(mgr *SiteToSiteManager, logger *slog.Logger) reconcile.ReconcileHandler that reconciles desired vs actual tunnels. Include tests in site_to_site_handler_test.go. (REQ-005, REQ-006, REQ-008)",
+    "3.1 Create internal/bridge/site_to_site_integration_test.go — Integration tests wiring SiteToSiteManager with mockVPNController and mockRouteController. Test full lifecycle: Setup → AddTunnel via SSE handler → reconcile drift → RemoveTunnel via SSE handler → Teardown. Test concurrent AddTunnel/RemoveTunnel with -race. Test max tunnels enforcement under concurrent load. Use goleak.VerifyTestMain. (REQ-003, REQ-005, REQ-006, REQ-011)",
+    "4.1 Create docs/reference/backend/site-to-site-vpn.md — Reference documentation for site-to-site VPN connectivity in internal/bridge package: Config fields with defaults and validation rules, SiteToSiteManager lifecycle (Setup, AddTunnel, RemoveTunnel, Teardown, SiteToSiteStatus), VPNController interface, SSE event handlers (HandleSiteToSiteTunnelAssigned, HandleSiteToSiteTunnelRevoked, HandleSiteToSiteConfigUpdated), SiteToSiteReconcileHandler, API types (SiteToSiteConfig, SiteToSiteTunnel, SiteToSiteInfo). Include data flow diagram: external network → s2s WG interface (wg-s2s-{id}) → bridge node → mesh WG interface (wg0) → mesh peers. Integration points with reconcile, api, bridge packages. (REQ-001 through REQ-011)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults_SiteToSite",
+      "story": "Platform operator configures site-to-site VPN via Config struct",
+      "expected": "ApplyDefaults sets MaxSiteToSiteTunnels=10, SiteToSiteInterfacePrefix='wg-s2s' for zero-valued site-to-site fields",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_SiteToSiteWithoutBridge",
+      "story": "Platform operator configures site-to-site VPN via Config struct",
+      "expected": "Validate returns error when SiteToSiteEnabled=true but Enabled=false",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_SiteToSiteInvalidMaxTunnels",
+      "story": "Platform operator configures site-to-site VPN via Config struct",
+      "expected": "Validate returns error when MaxSiteToSiteTunnels <= 0 with SiteToSiteEnabled=true",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_SiteToSiteEmptyPrefix",
+      "story": "Platform operator configures site-to-site VPN via Config struct",
+      "expected": "Validate returns error when SiteToSiteInterfacePrefix is empty with SiteToSiteEnabled=true",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_SiteToSiteValidConfig",
+      "story": "Platform operator configures site-to-site VPN via Config struct",
+      "expected": "Validate returns nil for a fully valid site-to-site config with bridge enabled",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_SiteToSiteDisabled",
+      "story": "Platform operator configures site-to-site VPN via Config struct",
+      "expected": "Validate returns nil when SiteToSiteEnabled=false regardless of other site-to-site fields",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_Setup_Enabled",
+      "story": "Bridge node establishes VPN tunnels to external networks for site-to-site connectivity",
+      "expected": "Setup with SiteToSiteEnabled=true marks manager active",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_Setup_Disabled",
+      "story": "Bridge node establishes VPN tunnels to external networks for site-to-site connectivity",
+      "expected": "Setup with SiteToSiteEnabled=false is a no-op, returns nil",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_AddTunnel",
+      "story": "Bridge node manages site-to-site WireGuard interface and route lifecycle per tunnel",
+      "expected": "AddTunnel creates WireGuard interface, configures peer, adds routes, enables forwarding, tracks tunnel",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_AddTunnel_MaxReached",
+      "story": "Bridge node handles invalid tunnel assignments and errors gracefully",
+      "expected": "AddTunnel returns error when MaxSiteToSiteTunnels limit is reached",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_AddTunnel_Duplicate",
+      "story": "Bridge node handles invalid tunnel assignments and errors gracefully",
+      "expected": "AddTunnel returns error when tunnel ID already exists",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_AddTunnel_RollbackOnRouteFailure",
+      "story": "Bridge node handles invalid tunnel assignments and errors gracefully",
+      "expected": "AddTunnel rolls back interface creation when route addition fails",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_RemoveTunnel",
+      "story": "Bridge node manages site-to-site WireGuard interface and route lifecycle per tunnel",
+      "expected": "RemoveTunnel removes routes, disables forwarding, removes interface, untracks tunnel",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_RemoveTunnel_NonExistent",
+      "story": "Bridge node manages site-to-site WireGuard interface and route lifecycle per tunnel",
+      "expected": "RemoveTunnel on unknown tunnel ID is a no-op",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_Teardown",
+      "story": "Bridge node performs clean shutdown of site-to-site VPN resources",
+      "expected": "Teardown removes all tunnels, marks manager inactive, aggregates errors",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_Teardown_Idempotent",
+      "story": "Bridge node performs clean shutdown of site-to-site VPN resources",
+      "expected": "Teardown on inactive manager returns nil without calling controllers",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_SiteToSiteStatus_Active",
+      "story": "Bridge node reports site-to-site status in heartbeats and capabilities in registration",
+      "expected": "SiteToSiteStatus on active manager returns SiteToSiteInfo with correct tunnel count",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_SiteToSiteStatus_Disabled",
+      "story": "Bridge node reports site-to-site status in heartbeats and capabilities in registration",
+      "expected": "SiteToSiteStatus on disabled manager returns nil",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_SiteToSiteCapabilities",
+      "story": "Bridge node reports site-to-site status in heartbeats and capabilities in registration",
+      "expected": "SiteToSiteCapabilities returns map with site_to_site=true when enabled, nil when disabled",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_handler_test.go",
+      "test_function": "TestHandleSiteToSiteTunnelAssigned",
+      "story": "Control plane provisions site-to-site tunnel configuration on the bridge node",
+      "expected": "SSE handler parses payload and calls SiteToSiteManager.AddTunnel successfully",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_handler_test.go",
+      "test_function": "TestHandleSiteToSiteTunnelAssigned_MalformedPayload",
+      "story": "Bridge node handles invalid tunnel assignments and errors gracefully",
+      "expected": "Malformed JSON payload returns error; no tunnel is created",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_handler_test.go",
+      "test_function": "TestHandleSiteToSiteTunnelRevoked",
+      "story": "Control plane provisions site-to-site tunnel configuration on the bridge node",
+      "expected": "SSE handler parses payload and calls SiteToSiteManager.RemoveTunnel successfully",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_handler_test.go",
+      "test_function": "TestHandleSiteToSiteTunnelRevoked_NonExistent",
+      "story": "Bridge node handles invalid tunnel assignments and errors gracefully",
+      "expected": "Revoking a non-existent tunnel is a no-op (returns nil)",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_handler_test.go",
+      "test_function": "TestHandleSiteToSiteConfigUpdated",
+      "story": "Control plane provisions site-to-site tunnel configuration on the bridge node",
+      "expected": "SSE handler calls TriggerReconcile on the Reconciler",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_handler_test.go",
+      "test_function": "TestSiteToSiteReconcileHandler_NilConfig",
+      "story": "Bridge node reconciles site-to-site tunnel state during reconciliation cycles",
+      "expected": "Handler returns nil when SiteToSiteConfig is nil in desired state",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_handler_test.go",
+      "test_function": "TestSiteToSiteReconcileHandler_AddMissing",
+      "story": "Bridge node reconciles site-to-site tunnel state during reconciliation cycles",
+      "expected": "Handler adds tunnels that are in desired state but not in current state",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_handler_test.go",
+      "test_function": "TestSiteToSiteReconcileHandler_RemoveStale",
+      "story": "Bridge node reconciles site-to-site tunnel state during reconciliation cycles",
+      "expected": "Handler removes tunnels that are in current state but not in desired state",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestSiteToSiteConfig_JSONRoundTrip",
+      "story": "Control plane provisions site-to-site tunnel configuration on the bridge node",
+      "expected": "SiteToSiteConfig and SiteToSiteTunnel serialize/deserialize correctly to/from JSON",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_integration_test.go",
+      "test_function": "TestSiteToSiteIntegration_FullLifecycle",
+      "story": "Bridge node establishes VPN tunnels to external networks for site-to-site connectivity",
+      "expected": "Full lifecycle: setup → add tunnels via SSE → reconcile → remove tunnels → teardown. Verify VPNController and RouteController calls.",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_integration_test.go",
+      "test_function": "TestSiteToSiteIntegration_ReconcileDrift",
+      "story": "Bridge node reconciles site-to-site tunnel state during reconciliation cycles",
+      "expected": "Reconcile handler detects tunnel drift between desired and actual state and corrects it",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_integration_test.go",
+      "test_function": "TestSiteToSiteIntegration_ConcurrentAccess",
+      "story": "Bridge node handles invalid tunnel assignments and errors gracefully",
+      "expected": "Concurrent AddTunnel/RemoveTunnel operations under -race are safe; max tunnels enforced correctly",
+      "requirement_id": "REQ-011"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-011) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "VPNController interface follows the same abstraction pattern as AccessController and RouteController for testability",
+    "SiteToSiteReconcileHandler integrates with the existing reconcile.Reconciler via RegisterHandler (same pattern as RelayReconcileHandler and UserAccessReconcileHandler)",
+    "HandleSiteToSiteConfigUpdated SSE handler delegates to TriggerReconcile rather than applying changes directly (consistency with HandleBridgeConfigUpdated pattern)",
+    "SiteToSiteManager.Teardown uses errors.Join for error aggregation, continuing cleanup even on partial failure",
+    "SiteToSiteManager is concurrent-safe: mutex protects internal tunnel tracking; tests pass with -race flag",
+    "Code follows existing patterns: log/slog with component=bridge, Config with ApplyDefaults/Validate, stdlib-only test dependencies, go.uber.org/goleak in integration tests",
+    "API type additions (SiteToSiteConfig, SiteToSiteTunnel, SiteToSiteInfo) use json tags with snake_case and omitempty for optional pointer fields",
+    "AddTunnel rolls back on partial failure (removes interface if route/forwarding fails) following Manager.Setup rollback pattern",
+    "Reference documentation covers all public types, methods, data flow diagram, and integration patterns (docs/reference/backend/site-to-site-vpn.md)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package location**: All site-to-site code lives in `internal/bridge/` since site-to-site VPN is a bridge mode sub-feature (depends on S011). Files: site_to_site.go (SiteToSiteManager), vpn_controller.go (VPNController interface), site_to_site_handler.go (SSE + reconcile handlers), mock_vpn_test.go (test double), site_to_site_test.go, site_to_site_handler_test.go, site_to_site_integration_test.go.\n\n2. **API type additions**: Three new types added to `internal/api/types.go`: `SiteToSiteConfig` (control plane → node: list of tunnels), `SiteToSiteTunnel` (individual tunnel with ID, remote endpoint, remote public key, PSK, remote subnets, local listen port), `SiteToSiteInfo` (node → control plane: site-to-site status). `SiteToSiteConfig *SiteToSiteConfig` field added to `StateResponse`. `SiteToSite *SiteToSiteInfo` field added to `BridgeInfo`. Three new SSE event constants added to `envelope.go`: `EventSiteToSiteTunnelAssigned`, `EventSiteToSiteTunnelRevoked`, `EventSiteToSiteConfigUpdated`.\n\n3. **VPNController interface**: Dedicated interface for site-to-site WireGuard tunnel operations. Four methods: CreateTunnelInterface, RemoveTunnelInterface, ConfigureTunnelPeer (includes endpoint parameter unlike AccessController.ConfigurePeer since remote endpoint matters for outbound tunnels), RemoveTunnelPeer. Production implementation would use wgctrl/netlink — NOT in scope for this feature (interface + mock only, same as AccessController).\n\n4. **Key difference from UserAccessManager**: Each site-to-site tunnel gets its own WireGuard interface (wg-s2s-{tunnel_id}) with a single remote peer, plus routes for the remote subnets. UserAccessManager uses a single shared WireGuard interface with multiple peers. This design isolates tunnel failure domains and simplifies per-tunnel lifecycle management.\n\n5. **SiteToSiteManager lifecycle**: NewSiteToSiteManager → Setup(meshIface) → active → AddTunnel/RemoveTunnel → Teardown. The manager tracks tunnels by ID in a map[string]tunnelState where tunnelState stores the interface name and remote subnets for cleanup. AddTunnel creates a dedicated WireGuard interface (via VPNController.CreateTunnelInterface), configures the remote peer (via VPNController.ConfigureTunnelPeer), adds routes for each remote subnet (via RouteController.AddRoute), and enables forwarding between the tunnel interface and mesh interface (via RouteController.EnableForwarding). On partial failure, AddTunnel rolls back by removing the interface.\n\n6. **Interface naming**: Each tunnel interface is named `{SiteToSiteInterfacePrefix}-{tunnelID}` (e.g., `wg-s2s-datacenter1`). The prefix is configurable via Config.SiteToSiteInterfacePrefix. If the generated name exceeds the OS limit (15 chars on Linux), the tunnel ID should be truncated or hashed — but this is a platform-level concern, not in scope.\n\n7. **Reconcile integration**: SiteToSiteReconcileHandler is registered alongside other bridge handlers. It reads SiteToSiteConfig from StateResponse, compares desired tunnels (keyed by TunnelID) against mgr.TunnelIDs(), and adds/removes to converge. Pattern matches RelayReconcileHandler exactly.\n\n8. **SSE handlers**: HandleSiteToSiteTunnelAssigned/Revoked follow the HandleRelaySessionAssigned/Revoked pattern — parse JSON payload, call manager method. HandleSiteToSiteConfigUpdated follows HandleBridgeConfigUpdated — just calls TriggerReconcile.\n\n9. **Concurrency**: SiteToSiteManager uses sync.Mutex to protect the activeTunnels map. SSE events and reconciliation may fire concurrently. Integration tests verify correctness under -race.\n\n10. **Config extension**: Site-to-site fields are added to the existing bridge.Config struct. Validation enforces the dependency (site-to-site requires bridge mode).\n\n11. **BridgeInfo extension**: Site-to-site status is nested under BridgeInfo as SiteToSite *SiteToSiteInfo (pointer, omitempty). This maintains the existing heartbeat structure where bridge-related info is grouped. Non-s2s bridge nodes will have nil here.\n\n12. **Key files from existing codebase to follow**:\n    - `internal/bridge/config.go` — Config pattern to extend\n    - `internal/bridge/access_controller.go` — Interface pattern for VPNController\n    - `internal/bridge/mock_access_test.go` — Mock pattern for mockVPNController\n    - `internal/bridge/user_access.go` — Manager lifecycle pattern for SiteToSiteManager\n    - `internal/bridge/user_access_handler.go` — SSE handler + ReconcileHandler pattern to follow exactly\n    - `internal/bridge/relay_handler.go` — ReconcileHandler diffing pattern\n    - `internal/bridge/manager.go` — Rollback on partial failure pattern in Setup()\n    - `internal/api/types.go` — API type definitions with JSON tags\n    - `internal/api/envelope.go` — SSE event constants\n\n13. **Potential pitfalls**:\n    - SiteToSiteConfig can be nil in StateResponse for nodes without site-to-site. The reconcile handler must check for nil before acting.\n    - Each tunnel has its own WireGuard interface, so VPNController.CreateTunnelInterface must generate a unique private key per interface. The private key generation is a VPNController concern (production impl).\n    - The local listen port for each tunnel should be unique. This is specified per-tunnel in SiteToSiteTunnel.LocalListenPort and validated by the OS (EADDRINUSE on conflict).\n    - RemoveTunnel must clean up routes BEFORE removing the interface — routes reference the interface.\n    - Forwarding between multiple tunnel interfaces and the mesh interface: each EnableForwarding call specifies (tunnelIface, meshIface). DisableForwarding must be per-tunnel to avoid disabling forwarding for other tunnels.\n    - The existing bridge.Manager handles routing for the physical access-side interface. SiteToSiteManager handles the WireGuard tunnel interfaces. These are complementary.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.110413"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T20:58:02.947651"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:03:20.942192"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "432acf68-1e3f-4e75-af02-abce5b38b52c",
+      "timestamp": "2026-02-12T21:03:20.942218",
+      "total_duration": 313.9142301082611,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 313.9142301082611,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
