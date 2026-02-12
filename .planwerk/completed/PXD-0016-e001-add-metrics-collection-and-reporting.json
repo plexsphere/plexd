@@ -2,8 +2,8 @@
   "feature_id": "PXD-0016",
   "title": "E001: Add metrics collection and reporting",
   "slug": "e001-add-metrics-collection-and-reporting",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Collect and report node metrics to the control plane: tunnel health, peer latency, resource utilization (CPU, memory, disk, network), and mesh-specific metrics (handshake success rates, packet loss). Enable centralized monitoring dashboards.",
   "stories": [
@@ -375,14 +375,14 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/metrics/config.go: Config struct with Enabled, CollectInterval, ReportInterval, BatchSize fields; DefaultCollectInterval=30s, DefaultReportInterval=60s, DefaultBatchSize=100 constants; ApplyDefaults and Validate methods following the nat/config.go pattern. Create internal/metrics/config_test.go with tests for ApplyDefaults (zero-valued Config), Validate happy path, Validate rejects low CollectInterval, Validate rejects ReportInterval < CollectInterval, Validate rejects BatchSize=0, Validate skips when Enabled=false (REQ-006)",
-    "1.2 Create internal/metrics/collector.go: Define the Collector interface with method Collect(ctx context.Context) ([]api.MetricPoint, error). Define MetricsReporter interface abstracting ControlPlane.ReportMetrics: ReportMetrics(ctx context.Context, nodeID string, batch api.MetricBatch) error. No tests needed for interface definitions (REQ-007)",
-    "1.3 Create internal/metrics/system.go: SystemCollector struct implementing Collector, using injectable SystemSource interface for reading CPU/memory/disk/network stats (not directly reading /proc for testability). Each Collect call returns []api.MetricPoint with group='system'. Create internal/metrics/system_test.go with mock SystemSource; tests for successful collection, partial failure, and context cancellation (REQ-001)",
-    "1.4 Create internal/metrics/tunnel.go: TunnelCollector struct implementing Collector, using injectable TunnelSource interface (returning per-peer handshake times and transfer counters). StaleThreshold configurable (default 5m). Each Collect call returns []api.MetricPoint with group='tunnel' and peer_id. Create internal/metrics/tunnel_test.go with mock TunnelSource; tests for per-peer metrics, stale handshake detection, no peers returns empty slice (REQ-002)",
-    "1.5 Create internal/metrics/latency.go: LatencyCollector struct implementing Collector, using injectable LatencyProber interface with Probe(ctx, ip string) (time.Duration, error). PeerProvider interface returns current mesh peer IPs+IDs. Each Collect call returns []api.MetricPoint with group='latency' and peer_id. Create internal/metrics/latency_test.go with mock LatencyProber and PeerProvider; tests for successful probe, timeout (rtt_ms=-1, reachable=false), continues on error (REQ-003)",
-    "2.1 Create internal/metrics/manager.go: Manager struct with fields for config, collectors []Collector, reporter MetricsReporter, nodeID, logger. NewManager constructor applies defaults. RegisterCollector method adds to the collector list. Run method implements the dual-ticker loop: collect at CollectInterval, report at ReportInterval. Run returns nil immediately when Enabled=false. Batch management: accumulate metrics in a buffer, send at ReportInterval, respect BatchSize (split into multiple API calls if needed), retain on failure, drop oldest when exceeding 2*BatchSize. Panic recovery per collector (matching reconciler pattern). (REQ-004, REQ-005, REQ-007)",
-    "2.2 Create internal/metrics/manager_test.go: Full test suite for Manager.Run using mock collectors and mock MetricsReporter. Tests: collects and reports on schedule, skips empty batch, retains on report error, drops oldest when over capacity, stops on context cancel, isolates collector error, recovers collector panic, respects BatchSize, returns nil when disabled. Use discardLogger helper, short intervals for fast tests (REQ-004, REQ-005, REQ-007)",
-    "3.1 Write docs/reference/backend/metrics-collection.md: Reference documentation covering Config struct (all fields, types, defaults, validation rules), Collector interface contract, MetricsReporter interface, Manager lifecycle, metric groups (system, tunnel, latency) with JSON data schema examples per group, and the POST /v1/nodes/{node_id}/metrics API contract (REQ-009)"
+    "[done] 1.1 Create internal/metrics/config.go: Config struct with Enabled, CollectInterval, ReportInterval, BatchSize fields; DefaultCollectInterval=30s, DefaultReportInterval=60s, DefaultBatchSize=100 constants; ApplyDefaults and Validate methods following the nat/config.go pattern. Create internal/metrics/config_test.go with tests for ApplyDefaults (zero-valued Config), Validate happy path, Validate rejects low CollectInterval, Validate rejects ReportInterval < CollectInterval, Validate rejects BatchSize=0, Validate skips when Enabled=false (REQ-006)",
+    "[done] 1.2 Create internal/metrics/collector.go: Define the Collector interface with method Collect(ctx context.Context) ([]api.MetricPoint, error). Define MetricsReporter interface abstracting ControlPlane.ReportMetrics: ReportMetrics(ctx context.Context, nodeID string, batch api.MetricBatch) error. No tests needed for interface definitions (REQ-007)",
+    "[done] 1.3 Create internal/metrics/system.go: SystemCollector struct implementing Collector, using injectable SystemSource interface for reading CPU/memory/disk/network stats (not directly reading /proc for testability). Each Collect call returns []api.MetricPoint with group='system'. Create internal/metrics/system_test.go with mock SystemSource; tests for successful collection, partial failure, and context cancellation (REQ-001)",
+    "[done] 1.4 Create internal/metrics/tunnel.go: TunnelCollector struct implementing Collector, using injectable TunnelSource interface (returning per-peer handshake times and transfer counters). StaleThreshold configurable (default 5m). Each Collect call returns []api.MetricPoint with group='tunnel' and peer_id. Create internal/metrics/tunnel_test.go with mock TunnelSource; tests for per-peer metrics, stale handshake detection, no peers returns empty slice (REQ-002)",
+    "[done] 1.5 Create internal/metrics/latency.go: LatencyCollector struct implementing Collector, using injectable LatencyProber interface with Probe(ctx, ip string) (time.Duration, error). PeerProvider interface returns current mesh peer IPs+IDs. Each Collect call returns []api.MetricPoint with group='latency' and peer_id. Create internal/metrics/latency_test.go with mock LatencyProber and PeerProvider; tests for successful probe, timeout (rtt_ms=-1, reachable=false), continues on error (REQ-003)",
+    "[done] 2.1 Create internal/metrics/manager.go: Manager struct with fields for config, collectors []Collector, reporter MetricsReporter, nodeID, logger. NewManager constructor applies defaults. RegisterCollector method adds to the collector list. Run method implements the dual-ticker loop: collect at CollectInterval, report at ReportInterval. Run returns nil immediately when Enabled=false. Batch management: accumulate metrics in a buffer, send at ReportInterval, respect BatchSize (split into multiple API calls if needed), retain on failure, drop oldest when exceeding 2*BatchSize. Panic recovery per collector (matching reconciler pattern). (REQ-004, REQ-005, REQ-007)",
+    "[done] 2.2 Create internal/metrics/manager_test.go: Full test suite for Manager.Run using mock collectors and mock MetricsReporter. Tests: collects and reports on schedule, skips empty batch, retains on report error, drops oldest when over capacity, stops on context cancel, isolates collector error, recovers collector panic, respects BatchSize, returns nil when disabled. Use discardLogger helper, short intervals for fast tests (REQ-004, REQ-005, REQ-007)",
+    "[done] 3.1 Write docs/reference/backend/metrics-collection.md: Reference documentation covering Config struct (all fields, types, defaults, validation rules), Collector interface contract, MetricsReporter interface, Manager lifecycle, metric groups (system, tunnel, latency) with JSON data schema examples per group, and the POST /v1/nodes/{node_id}/metrics API contract (REQ-009)"
   ],
   "test_specifications": [
     {
@@ -574,6 +574,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T21:12:57.762945"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T22:38:33.687940"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T23:11:54.666257"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T23:11:54.681058"
     }
   },
   "execution_history": [
@@ -587,6 +599,50 @@
           "name": "prepare",
           "duration": 215.51641058921814,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "bd34a98f-8a01-41f1-8992-d9cfced53481",
+      "timestamp": "2026-02-12T23:10:51.469900",
+      "total_duration": 1780.6185784339905,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (5 tasks)",
+          "duration": 372.22111558914185,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (2 tasks)",
+          "duration": 339.2364444732666,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 94.52933120727539,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0016] Code Review",
+          "duration": 230.1464445590973,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0016] Improvements",
+          "duration": 619.0982956886292,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0016] Simplify",
+          "duration": 125.3869469165802,
+          "type": "simplify",
           "status": "done"
         }
       ]

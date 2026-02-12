@@ -1,0 +1,198 @@
+{
+  "feature_id": "PXD-0016",
+  "title": "E001: Add metrics collection and reporting",
+  "date": "2026-02-12",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Metrics collection and reporting package with Config, Collector interface, SystemCollector, TunnelCollector, LatencyCollector, Manager, and reference docs. Core architecture is clean and follows existing patterns (injectable interfaces, ticker-based Run loop, structured logging). Tests pass (30/30) and go vet is clean. However, several spec-required features are missing: BatchSize config field, buffer retention on reporter failure, panic recovery per collector, StaleThreshold for tunnel staleness, RegisterCollector method, and batch splitting/capacity management. The flush() method loses buffered data on reporter error, violating the retain-on-failure requirement.",
+  "tests_checklist": [
+    {"item": "Tests exist and pass (30/30, go vet clean)", "checked": true},
+    {"item": "Config validation edge cases covered (low intervals, disabled skip)", "checked": true},
+    {"item": "Collector error isolation tested", "checked": true},
+    {"item": "Context cancellation tested (latency collector)", "checked": true},
+    {"item": "Flush on shutdown tested", "checked": true},
+    {"item": "Empty flush skip tested", "checked": true},
+    {"item": "Multiple collectors tested", "checked": true},
+    {"item": "Retain-on-report-error test exists", "checked": false},
+    {"item": "Drop-oldest-when-over-capacity test exists", "checked": false},
+    {"item": "Collector panic recovery test exists", "checked": false},
+    {"item": "BatchSize splitting test exists", "checked": false},
+    {"item": "Stale handshake detection test exists", "checked": false},
+    {"item": "SystemCollector context cancellation test exists", "checked": false},
+    {"item": "Config validates BatchSize=0 rejection", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing Config ApplyDefaults/Validate pattern (nat/config.go)", "checked": true},
+    {"item": "Follows existing Run-loop pattern (ticker + context cancellation)", "checked": true},
+    {"item": "Dependency injection for all external state (no direct /proc reads)", "checked": true},
+    {"item": "Structured logging with component=metrics", "checked": true},
+    {"item": "Clean separation: one file per collector + manager", "checked": true},
+    {"item": "Functions small and single-responsibility", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "Panic recovery per collector (matching reconciler pattern)", "checked": false},
+    {"item": "RegisterCollector method for runtime extensibility", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "Input validated at config boundary", "checked": true},
+    {"item": "No sensitive data in log messages", "checked": true},
+    {"item": "Context propagation for cancellation", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Collector interface enables adding new metric sources", "checked": true},
+    {"item": "MetricReporter interface abstracts control plane", "checked": true},
+    {"item": "MetricPoint data payloads are valid JSON matching api.MetricPoint schema", "checked": true},
+    {"item": "Buffer management with mutex protection", "checked": true},
+    {"item": "Buffer retention on failure (spec: retain on failure)", "checked": false},
+    {"item": "Batch splitting respecting BatchSize", "checked": false},
+    {"item": "Capacity management (drop oldest at 2*BatchSize)", "checked": false}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code across collectors", "checked": true},
+    {"item": "Mock test helpers properly shared (helpers_test.go)", "checked": true},
+    {"item": "No over-engineering beyond requirements", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config.Validate returns errors early for invalid values", "checked": true},
+    {"item": "Manager.Run returns nil immediately when disabled", "checked": true},
+    {"item": "Collector errors logged and skipped (no cascade)", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Nil/empty slice handling (empty peers, empty stats)", "checked": true},
+    {"item": "Error wrapping with context (fmt.Errorf metrics: subsystem: %w)", "checked": true},
+    {"item": "Mutex protection on shared buffer", "checked": true},
+    {"item": "Data loss prevention on reporter failure", "checked": false}
+  ],
+  "security_findings": [],
+  "architecture_findings": [
+    {
+      "severity": "HIGH",
+      "id": "C1-1",
+      "description": "Missing BatchSize field in Config struct. Spec task 1.1 requires 'Config struct with Enabled, CollectInterval, ReportInterval, BatchSize fields' and 'DefaultBatchSize=100' constant. BatchSize is completely absent.",
+      "location": "internal/metrics/config.go:16-28",
+      "fix": "Add BatchSize int field to Config, DefaultBatchSize=100 constant, default assignment in ApplyDefaults, and validation (reject BatchSize=0) in Validate."
+    },
+    {
+      "severity": "HIGH",
+      "id": "C1-2",
+      "description": "Manager.flush() loses buffered data on reporter error. Buffer is cleared (set to nil) before ReportMetrics is called, so if reporting fails, metrics are permanently lost. Spec task 2.1 requires 'retain on failure, drop oldest when exceeding 2*BatchSize'.",
+      "location": "internal/metrics/manager.go:81-94",
+      "fix": "In flush(), only clear the buffer after successful ReportMetrics. On failure, retain the batch by prepending it back to m.buffer. Implement capacity check: if buffer exceeds 2*BatchSize, drop oldest entries."
+    },
+    {
+      "severity": "HIGH",
+      "id": "C1-3",
+      "description": "Missing panic recovery per collector in Manager.collect(). Spec task 2.1 requires 'Panic recovery per collector (matching reconciler pattern)'. The reconciler uses a safeInvoke() wrapper with defer/recover. A panicking collector would crash the entire Manager goroutine.",
+      "location": "internal/metrics/manager.go:67-78",
+      "fix": "Wrap each collector.Collect() call in a recover-guarded function, similar to reconcile/reconciler.go safeInvoke(). Log the panic and continue to the next collector."
+    },
+    {
+      "severity": "HIGH",
+      "id": "C1-4",
+      "description": "Missing StaleThreshold in TunnelCollector. Spec task 1.4 requires 'StaleThreshold configurable (default 5m)' for stale handshake detection. The TunnelCollector has no staleness logic.",
+      "location": "internal/metrics/tunnel.go:28-36",
+      "fix": "Add StaleThreshold time.Duration field to TunnelCollector (default 5m). In Collect(), compare time.Since(s.LastHandshakeTime) against StaleThreshold and set HandshakeSucceeded=false or add a 'stale' flag when exceeded."
+    },
+    {
+      "severity": "MEDIUM",
+      "id": "C1-5",
+      "description": "Missing RegisterCollector method on Manager. Spec task 2.1 requires 'RegisterCollector method adds to the collector list'. Currently collectors can only be set via constructor.",
+      "location": "internal/metrics/manager.go:30-38",
+      "fix": "Add 'func (m *Manager) RegisterCollector(c Collector)' method that appends to m.collectors (with mutex protection if needed)."
+    },
+    {
+      "severity": "MEDIUM",
+      "id": "C1-6",
+      "description": "Missing batch splitting when exceeding BatchSize. Spec task 2.1 requires 'respect BatchSize (split into multiple API calls if needed)'. The flush method sends all buffered points in a single ReportMetrics call regardless of count.",
+      "location": "internal/metrics/manager.go:81-94",
+      "fix": "In flush(), split the batch into chunks of BatchSize and call ReportMetrics for each chunk. Stop and retain remaining chunks if a call fails."
+    },
+    {
+      "severity": "LOW",
+      "id": "P1-1",
+      "description": "Interface naming deviation: spec says 'MetricsReporter' (plural) but code defines 'MetricReporter' (singular). Minor but inconsistent with spec.",
+      "location": "internal/metrics/manager.go:13",
+      "fix": "Consider renaming to MetricsReporter for spec alignment, or document the deviation."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "C1-1",
+      "severity": "blocker",
+      "check": "C1",
+      "location": "internal/metrics/config.go:16-28",
+      "description": "Missing BatchSize field, DefaultBatchSize constant, and BatchSize validation per spec task 1.1",
+      "fix": "Add BatchSize int to Config, DefaultBatchSize=100 constant, ApplyDefaults logic, Validate rejects BatchSize=0"
+    },
+    {
+      "id": "C1-2",
+      "severity": "blocker",
+      "check": "C2",
+      "location": "internal/metrics/manager.go:81-94",
+      "description": "flush() loses buffered metrics on reporter error. Buffer cleared before send - violates retain-on-failure requirement",
+      "fix": "Only clear buffer after successful report. On failure, re-add batch to buffer. Implement 2*BatchSize capacity limit with oldest-drop."
+    },
+    {
+      "id": "C1-3",
+      "severity": "blocker",
+      "check": "C1",
+      "location": "internal/metrics/manager.go:67-78",
+      "description": "No panic recovery per collector. A panicking collector crashes the entire Manager Run loop.",
+      "fix": "Wrap each Collect() call in defer/recover, log panic with stack trace, continue to next collector."
+    },
+    {
+      "id": "C1-4",
+      "severity": "blocker",
+      "check": "C1",
+      "location": "internal/metrics/tunnel.go:28-36",
+      "description": "Missing StaleThreshold (default 5m) for stale handshake detection per spec task 1.4",
+      "fix": "Add StaleThreshold to TunnelCollector constructor, detect stale handshakes in Collect()."
+    },
+    {
+      "id": "TE2-1",
+      "severity": "major",
+      "check": "TE2",
+      "location": "internal/metrics/manager_test.go",
+      "description": "Missing spec-required tests: retain-on-report-error, drop-oldest-over-capacity, collector-panic-recovery, respects-BatchSize (4 test cases from task 2.2)",
+      "fix": "Implement all four test cases after the corresponding production code is added."
+    },
+    {
+      "id": "TE2-2",
+      "severity": "major",
+      "check": "TE2",
+      "location": "internal/metrics/tunnel_test.go",
+      "description": "Missing stale handshake detection test per spec task 1.4",
+      "fix": "Add test with LastHandshakeTime older than StaleThreshold, verify stale detection behavior."
+    },
+    {
+      "id": "TE2-3",
+      "severity": "major",
+      "check": "TE2",
+      "location": "internal/metrics/system_test.go",
+      "description": "Missing context cancellation test for SystemCollector per spec task 1.3",
+      "fix": "Add test that cancels context before ReadStats returns, verify error propagation."
+    },
+    {
+      "id": "Q4-1",
+      "severity": "minor",
+      "check": "P1",
+      "location": "internal/metrics/manager.go:13",
+      "description": "Interface named MetricReporter (singular) vs spec MetricsReporter (plural). Minor naming deviation.",
+      "fix": "Rename to MetricsReporter for spec alignment or document rationale."
+    }
+  ],
+  "suggested_improvements": [
+    "Consider calling ApplyDefaults in NewManager constructor (matching reconcile/reconciler.go pattern where NewReconciler calls cfg.ApplyDefaults())",
+    "Consider adding an initial collect cycle before waiting for first ticker tick (matching reconciler.go line 82 pattern)",
+    "The latency collector logs warn with slog.String('error', err.Error()) - consider using slog.Any('error', err) for consistency with error wrapping conventions"
+  ],
+  "next_steps": [
+    "Add BatchSize field to Config with DefaultBatchSize=100, ApplyDefaults, and Validate(rejects 0)",
+    "Fix Manager.flush() to retain buffer on reporter failure and implement 2*BatchSize capacity limit",
+    "Add panic recovery per collector in Manager.collect() matching reconciler safeInvoke pattern",
+    "Add StaleThreshold to TunnelCollector (default 5m) with stale handshake detection logic",
+    "Add RegisterCollector method to Manager",
+    "Implement batch splitting in flush() when batch exceeds BatchSize",
+    "Add missing tests: retain-on-error, drop-oldest, panic-recovery, BatchSize-splitting, stale-handshake, system-context-cancel",
+    "Add Config test for BatchSize=0 validation rejection"
+  ]
+}
