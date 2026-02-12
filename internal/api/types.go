@@ -40,14 +40,15 @@ type Peer struct {
 // ---------------------------------------------------------------------------
 
 type HeartbeatRequest struct {
-	NodeID         string    `json:"node_id"`
-	Timestamp      time.Time `json:"timestamp"`
-	Status         string    `json:"status"`
-	Uptime         string    `json:"uptime"`
-	BinaryChecksum string    `json:"binary_checksum"`
-	Mesh           *MeshInfo   `json:"mesh,omitempty"`
-	NAT            *NATInfo    `json:"nat,omitempty"`
-	Bridge         *BridgeInfo `json:"bridge,omitempty"`
+	NodeID         string          `json:"node_id"`
+	Timestamp      time.Time       `json:"timestamp"`
+	Status         string          `json:"status"`
+	Uptime         string          `json:"uptime"`
+	BinaryChecksum string          `json:"binary_checksum"`
+	Mesh           *MeshInfo       `json:"mesh,omitempty"`
+	NAT            *NATInfo        `json:"nat,omitempty"`
+	Bridge         *BridgeInfo     `json:"bridge,omitempty"`
+	UserAccess     *UserAccessInfo `json:"user_access,omitempty"`
 }
 
 type MeshInfo struct {
@@ -71,14 +72,15 @@ type HeartbeatResponse struct {
 // ---------------------------------------------------------------------------
 
 type StateResponse struct {
-	Peers       []Peer            `json:"peers"`
-	Policies    []Policy          `json:"policies"`
-	SigningKeys *SigningKeys       `json:"signing_keys,omitempty"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
-	BridgeConfig *BridgeConfig     `json:"bridge_config,omitempty"`
-	RelayConfig  *RelayConfig      `json:"relay_config,omitempty"`
-	Data         []DataEntry       `json:"data"`
-	SecretRefs   []SecretRef       `json:"secret_refs"`
+	Peers            []Peer            `json:"peers"`
+	Policies         []Policy          `json:"policies"`
+	SigningKeys      *SigningKeys       `json:"signing_keys,omitempty"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
+	BridgeConfig     *BridgeConfig     `json:"bridge_config,omitempty"`
+	RelayConfig      *RelayConfig      `json:"relay_config,omitempty"`
+	UserAccessConfig *UserAccessConfig  `json:"user_access_config,omitempty"`
+	Data             []DataEntry       `json:"data"`
+	SecretRefs       []SecretRef       `json:"secret_refs"`
 }
 
 type Policy struct {
@@ -372,4 +374,32 @@ type RelaySessionAssignment struct {
 	PeerBID       string    `json:"peer_b_id"`
 	PeerBEndpoint string    `json:"peer_b_endpoint"`
 	ExpiresAt     time.Time `json:"expires_at"`
+}
+
+// ---------------------------------------------------------------------------
+// User Access
+// ---------------------------------------------------------------------------
+
+// UserAccessConfig is the user access configuration pushed from the control plane.
+type UserAccessConfig struct {
+	Enabled       bool             `json:"enabled"`
+	InterfaceName string           `json:"interface_name"`
+	ListenPort    int              `json:"listen_port"`
+	Peers         []UserAccessPeer `json:"peers"`
+}
+
+// UserAccessPeer represents a user access peer (external VPN client).
+type UserAccessPeer struct {
+	PublicKey  string   `json:"public_key"`
+	AllowedIPs []string `json:"allowed_ips"`
+	PSK       string   `json:"psk,omitempty"`
+	Label     string   `json:"label"`
+}
+
+// UserAccessInfo is the user access status reported by the node in heartbeats.
+type UserAccessInfo struct {
+	Enabled       bool   `json:"enabled"`
+	InterfaceName string `json:"interface_name"`
+	PeerCount     int    `json:"peer_count"`
+	ListenPort    int    `json:"listen_port"`
 }

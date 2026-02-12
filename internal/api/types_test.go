@@ -562,3 +562,145 @@ func TestStateResponse_WithBridgeConfig(t *testing.T) {
 		t.Errorf("bridge_config should be omitted when nil, got: %s", s)
 	}
 }
+
+func TestUserAccessConfig_JSONRoundTrip(t *testing.T) {
+	orig := UserAccessConfig{
+		Enabled:       true,
+		InterfaceName: "wg-access0",
+		ListenPort:    51830,
+		Peers: []UserAccessPeer{
+			{
+				PublicKey:  "ua-pk-001",
+				AllowedIPs: []string{"10.99.0.1/32"},
+				PSK:        "ua-psk-001",
+				Label:      "alice-laptop",
+			},
+			{
+				PublicKey:  "ua-pk-002",
+				AllowedIPs: []string{"10.99.0.2/32", "10.99.0.3/32"},
+				Label:      "bob-phone",
+			},
+		},
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"enabled", "interface_name", "listen_port", "peers"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestUserAccessPeer_JSONRoundTrip(t *testing.T) {
+	// With PSK set.
+	orig := UserAccessPeer{
+		PublicKey:  "ua-pk-001",
+		AllowedIPs: []string{"10.99.0.1/32"},
+		PSK:        "ua-psk-001",
+		Label:      "alice-laptop",
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"public_key", "allowed_ips", "psk", "label"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+
+	// PSK should be omitted when empty.
+	orig.PSK = ""
+	data2, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data2); contains(s, `"psk"`) {
+		t.Errorf("psk should be omitted when empty, got: %s", s)
+	}
+}
+
+func TestUserAccessInfo_JSONRoundTrip(t *testing.T) {
+	orig := UserAccessInfo{
+		Enabled:       true,
+		InterfaceName: "wg-access0",
+		PeerCount:     5,
+		ListenPort:    51830,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"enabled", "interface_name", "peer_count", "listen_port"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestStateResponse_WithUserAccessConfig(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := StateResponse{
+		Peers:    []Peer{{ID: "n-002", PublicKey: "pk", MeshIP: "10.42.0.2", Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.42.0.2/32"}, PSK: "psk"}},
+		Policies: []Policy{},
+		UserAccessConfig: &UserAccessConfig{
+			Enabled:       true,
+			InterfaceName: "wg-access0",
+			ListenPort:    51830,
+			Peers: []UserAccessPeer{
+				{PublicKey: "ua-pk-001", AllowedIPs: []string{"10.99.0.1/32"}, PSK: "ua-psk", Label: "alice"},
+			},
+		},
+		Data:       []DataEntry{{Key: "k", ContentType: "text/plain", Payload: json.RawMessage(`"v"`), Version: 1, UpdatedAt: now}},
+		SecretRefs: []SecretRef{},
+	}
+	_, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// UserAccessConfig field should be omitted when nil.
+	orig.UserAccessConfig = nil
+	data, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data); contains(s, `"user_access_config"`) {
+		t.Errorf("user_access_config should be omitted when nil, got: %s", s)
+	}
+}
+
+func TestHeartbeatRequest_WithUserAccess(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := HeartbeatRequest{
+		NodeID:         "n-001",
+		Timestamp:      now,
+		Status:         "healthy",
+		Uptime:         "4h15m",
+		BinaryChecksum: "sha256:abc",
+		UserAccess: &UserAccessInfo{
+			Enabled:       true,
+			InterfaceName: "wg-access0",
+			PeerCount:     3,
+			ListenPort:    51830,
+		},
+	}
+	_, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// UserAccess field should be omitted when nil.
+	orig.UserAccess = nil
+	data, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data); contains(s, `"user_access"`) {
+		t.Errorf("user_access should be omitted when nil, got: %s", s)
+	}
+}

@@ -284,3 +284,175 @@ func TestConfig_Validate_RelayValidConfig(t *testing.T) {
 		t.Errorf("Validate should return nil for valid relay config, got: %v", err)
 	}
 }
+
+func TestConfig_ApplyDefaults_UserAccessFields(t *testing.T) {
+	var cfg Config
+	cfg.ApplyDefaults()
+
+	if cfg.UserAccessEnabled {
+		t.Error("UserAccessEnabled should default to false")
+	}
+	if cfg.UserAccessInterfaceName != DefaultUserAccessInterfaceName {
+		t.Errorf("UserAccessInterfaceName = %q, want %q", cfg.UserAccessInterfaceName, DefaultUserAccessInterfaceName)
+	}
+	if cfg.UserAccessListenPort != DefaultUserAccessListenPort {
+		t.Errorf("UserAccessListenPort = %d, want %d", cfg.UserAccessListenPort, DefaultUserAccessListenPort)
+	}
+	if cfg.MaxAccessPeers != DefaultMaxAccessPeers {
+		t.Errorf("MaxAccessPeers = %d, want %d", cfg.MaxAccessPeers, DefaultMaxAccessPeers)
+	}
+}
+
+func TestConfig_Validate_UserAccessWithoutBridge(t *testing.T) {
+	cfg := Config{
+		Enabled:           false,
+		UserAccessEnabled: true,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate should return error when user access enabled without bridge")
+	}
+	want := "bridge: config: user access requires bridge mode to be enabled"
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+func TestConfig_Validate_UserAccessInvalidPort(t *testing.T) {
+	tests := []struct {
+		name string
+		port int
+	}{
+		{"port zero", 0},
+		{"port too high", 70000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:                true,
+				AccessInterface:        "eth1",
+				AccessSubnets:          []string{"10.0.0.0/24"},
+				UserAccessEnabled:      true,
+				UserAccessInterfaceName: "wg-access",
+				UserAccessListenPort:   tt.port,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate should return error for invalid port")
+			}
+			want := "bridge: config: UserAccessListenPort must be between 1 and 65535"
+			if err.Error() != want {
+				t.Errorf("got %q, want %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_UserAccessBoundaryPorts(t *testing.T) {
+	tests := []struct {
+		name    string
+		port    int
+		wantErr bool
+	}{
+		{"port 1 (min valid)", 1, false},
+		{"port 65535 (max valid)", 65535, false},
+		{"port 65536 (just over max)", 65536, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:                true,
+				AccessInterface:        "eth1",
+				AccessSubnets:          []string{"10.0.0.0/24"},
+				UserAccessEnabled:      true,
+				UserAccessInterfaceName: "wg-access",
+				UserAccessListenPort:   tt.port,
+				MaxAccessPeers:         50,
+			}
+			err := cfg.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatal("Validate should return error for out-of-range port")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("Validate should return nil for valid port %d, got: %v", tt.port, err)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_UserAccessValidConfig(t *testing.T) {
+	cfg := Config{
+		Enabled:                true,
+		AccessInterface:        "eth1",
+		AccessSubnets:          []string{"10.0.0.0/24"},
+		UserAccessEnabled:      true,
+		UserAccessInterfaceName: "wg-access",
+		UserAccessListenPort:   51822,
+		MaxAccessPeers:         50,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate should return nil for valid user access config, got: %v", err)
+	}
+}
+
+func TestConfig_Validate_UserAccessMissingAccessSubnets(t *testing.T) {
+	cfg := Config{
+		Enabled:                true,
+		AccessInterface:        "eth1",
+		UserAccessEnabled:      true,
+		UserAccessInterfaceName: "wg-access",
+		UserAccessListenPort:   51822,
+		MaxAccessPeers:         50,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate should return error when AccessSubnets is empty")
+	}
+	want := "bridge: config: at least one AccessSubnet is required when enabled"
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+func TestConfig_Validate_UserAccessInvalidMaxPeers(t *testing.T) {
+	tests := []struct {
+		name     string
+		maxPeers int
+	}{
+		{"zero peers", 0},
+		{"negative peers", -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:                true,
+				AccessInterface:        "eth1",
+				AccessSubnets:          []string{"10.0.0.0/24"},
+				UserAccessEnabled:      true,
+				UserAccessInterfaceName: "wg-access",
+				UserAccessListenPort:   51822,
+				MaxAccessPeers:         tt.maxPeers,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate should return error for invalid MaxAccessPeers")
+			}
+			want := "bridge: config: MaxAccessPeers must be positive when user access is enabled"
+			if err.Error() != want {
+				t.Errorf("got %q, want %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_UserAccessDisabled(t *testing.T) {
+	cfg := Config{
+		Enabled:           true,
+		AccessInterface:   "eth1",
+		AccessSubnets:     []string{"10.0.0.0/24"},
+		UserAccessEnabled: false,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate should return nil when user access is disabled, got: %v", err)
+	}
+}

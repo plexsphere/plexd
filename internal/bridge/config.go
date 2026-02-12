@@ -10,6 +10,10 @@ const (
 	DefaultRelayListenPort  = 51821
 	DefaultMaxRelaySessions = 100
 	DefaultSessionTTL       = 5 * time.Minute
+
+	DefaultUserAccessInterfaceName = "wg-access"
+	DefaultUserAccessListenPort    = 51822
+	DefaultMaxAccessPeers          = 50
 )
 
 // Config holds the configuration for bridge mode.
@@ -44,6 +48,22 @@ type Config struct {
 	// SessionTTL is the time-to-live for relay sessions.
 	// Default: 5m. Minimum: 30s.
 	SessionTTL time.Duration
+
+	// UserAccessEnabled controls whether user access integration is active.
+	// Default: false. Requires Enabled=true.
+	UserAccessEnabled bool
+
+	// UserAccessInterfaceName is the name of the WireGuard interface for user access.
+	// Default: "wg-access"
+	UserAccessInterfaceName string
+
+	// UserAccessListenPort is the UDP port for the user access WireGuard interface.
+	// Default: 51822
+	UserAccessListenPort int
+
+	// MaxAccessPeers is the maximum number of concurrent user access peers.
+	// Default: 50
+	MaxAccessPeers int
 }
 
 // BoolPtr returns a pointer to the given bool value.
@@ -69,6 +89,15 @@ func (c *Config) ApplyDefaults() {
 	if c.SessionTTL == 0 {
 		c.SessionTTL = DefaultSessionTTL
 	}
+	if c.UserAccessInterfaceName == "" {
+		c.UserAccessInterfaceName = DefaultUserAccessInterfaceName
+	}
+	if c.UserAccessListenPort == 0 {
+		c.UserAccessListenPort = DefaultUserAccessListenPort
+	}
+	if c.MaxAccessPeers == 0 {
+		c.MaxAccessPeers = DefaultMaxAccessPeers
+	}
 }
 
 // Validate checks that configuration values are acceptable.
@@ -76,6 +105,9 @@ func (c *Config) ApplyDefaults() {
 func (c *Config) Validate() error {
 	if c.RelayEnabled && !c.Enabled {
 		return fmt.Errorf("bridge: config: relay requires bridge mode to be enabled")
+	}
+	if c.UserAccessEnabled && !c.Enabled {
+		return fmt.Errorf("bridge: config: user access requires bridge mode to be enabled")
 	}
 	if !c.Enabled {
 		return nil
@@ -100,6 +132,17 @@ func (c *Config) Validate() error {
 		}
 		if c.SessionTTL < 30*time.Second {
 			return fmt.Errorf("bridge: config: SessionTTL must be at least 30s")
+		}
+	}
+	if c.UserAccessEnabled {
+		if c.UserAccessListenPort < 1 || c.UserAccessListenPort > 65535 {
+			return fmt.Errorf("bridge: config: UserAccessListenPort must be between 1 and 65535")
+		}
+		if c.UserAccessInterfaceName == "" {
+			return fmt.Errorf("bridge: config: UserAccessInterfaceName is required when user access is enabled")
+		}
+		if c.MaxAccessPeers <= 0 {
+			return fmt.Errorf("bridge: config: MaxAccessPeers must be positive when user access is enabled")
 		}
 	}
 	return nil

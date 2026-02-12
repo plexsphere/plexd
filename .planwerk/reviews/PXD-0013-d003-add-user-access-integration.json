@@ -1,0 +1,107 @@
+{
+  "feature_id": "PXD-0013",
+  "title": "D003: Add user access integration",
+  "date": "2026-02-12",
+  "summary": "Implements user access integration for bridge mode: API types (UserAccessConfig, UserAccessPeer, UserAccessInfo), config extensions with defaults/validation, AccessController interface, UserAccessManager lifecycle (Setup/Teardown/AddPeer/RemovePeer), SSE event handlers, reconcile handler, integration tests with race detection, and reference documentation. Code follows existing relay/bridge patterns closely.",
+  "verdict": "NEEDS_CHANGES",
+  "tests_checklist": [
+    {"item": "Tests exist and pass (go test -race)", "checked": true},
+    {"item": "Happy path tested with realistic data", "checked": true},
+    {"item": "Edge cases covered (empty, nil, boundary, duplicate, max peers)", "checked": true},
+    {"item": "Error cases tested (malformed payload, create interface failure, forwarding failure)", "checked": true},
+    {"item": "Teardown error aggregation tested", "checked": true},
+    {"item": "Integration test covers full lifecycle (Setup → Add → Remove → Teardown)", "checked": true},
+    {"item": "Integration test covers reconcile drift detection", "checked": true},
+    {"item": "Concurrent access test passes with -race flag", "checked": true},
+    {"item": "goleak.VerifyTestMain present in bridge package", "checked": true},
+    {"item": "JSON round-trip tests for all new API types", "checked": true},
+    {"item": "Tests independent (no shared mutable state between tests)", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing relay/bridge handler patterns", "checked": true},
+    {"item": "Uses log/slog with component=bridge", "checked": true},
+    {"item": "Config uses ApplyDefaults/Validate pattern", "checked": true},
+    {"item": "stdlib-only test dependencies (except goleak)", "checked": true},
+    {"item": "Mock follows existing mockRouteController pattern", "checked": true},
+    {"item": "Functions are small and single-responsibility", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "Clear naming (intention-revealing)", "checked": true},
+    {"item": "HandleUserAccessConfigUpdated delegates to TriggerReconcile (correct pattern)", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "Input validated at API boundaries (malformed JSON rejected)", "checked": true},
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "PSK field uses omitempty to avoid leaking empty values", "checked": true},
+    {"item": "Max peers enforced to prevent resource exhaustion", "checked": true},
+    {"item": "Duplicate peer rejection prevents state corruption", "checked": true},
+    {"item": "No SQL injection or path traversal (N/A - no DB or file ops)", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "AccessController interface follows RouteController abstraction pattern", "checked": true},
+    {"item": "UserAccessReconcileHandler integrates via reconcile.RegisterHandler", "checked": true},
+    {"item": "SSE handlers follow HandleRelaySession* pattern exactly", "checked": true},
+    {"item": "API types use json tags with snake_case and omitempty for optional pointer fields", "checked": true},
+    {"item": "Teardown uses errors.Join for error aggregation", "checked": true},
+    {"item": "Setup rolls back interface on forwarding failure", "checked": true},
+    {"item": "Solution is as simple as possible", "checked": true},
+    {"item": "UserAccessManager is concurrent-safe (mutex protects internal state)", "checked": false}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code", "checked": true},
+    {"item": "No unused exports or dead code", "checked": true},
+    {"item": "No future-proofing or speculative features", "checked": true},
+    {"item": "Reuses existing errForKey helper from mock_route_test.go", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Validation rejects invalid config early", "checked": true},
+    {"item": "AddPeer checks duplicate before calling controller", "checked": true},
+    {"item": "AddPeer checks max peers before calling controller", "checked": true},
+    {"item": "Setup returns early when disabled", "checked": true},
+    {"item": "Teardown returns early when inactive", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "All external inputs validated (SSE payloads parsed with error handling)", "checked": true},
+    {"item": "Teardown continues on partial failure (errors.Join)", "checked": true},
+    {"item": "RemovePeer is idempotent (no-op for unknown key)", "checked": true},
+    {"item": "Setup is no-op when disabled", "checked": true},
+    {"item": "Reconcile handler handles nil desired and nil UserAccessConfig", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [
+    {
+      "severity": "CRITICAL",
+      "id": "C3",
+      "description": "UserAccessManager lacks mutex protection for concurrent access. SSE event handlers (HandleUserAccessPeerAssigned, HandleUserAccessPeerRevoked) run on the SSE stream goroutine while UserAccessReconcileHandler runs on the reconcile goroutine. Both access UserAccessManager.activePeers map without synchronization. The existing Relay struct uses sync.RWMutex for exactly this pattern. The comment 'not concurrent-safe; relies on serial invocation from the reconcile loop' is incorrect — SSE handlers are NOT invoked from the reconcile loop; they run from the EventDispatcher on the SSE goroutine.",
+      "location": "internal/bridge/user_access.go:16",
+      "fix": "Add sync.Mutex to UserAccessManager and lock/unlock in AddPeer, RemovePeer, PeerPublicKeys, UserAccessStatus, Setup, and Teardown — matching the pattern used by Relay (internal/bridge/relay.go:85). Update the comment to state 'concurrent-safe via mu'."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "C3",
+      "severity": "critical",
+      "check": "C3 - Edge cases handled",
+      "file": "internal/bridge/user_access.go:16",
+      "description": "Race condition: UserAccessManager has no mutex but is accessed from multiple goroutines (SSE dispatcher goroutine via HandleUserAccessPeerAssigned/HandleUserAccessPeerRevoked and reconcile goroutine via UserAccessReconcileHandler). The Relay struct (relay.go:85) uses sync.RWMutex for the same access pattern.",
+      "fix": "Add sync.Mutex to UserAccessManager struct. Lock in AddPeer, RemovePeer, PeerPublicKeys, UserAccessStatus, Setup, Teardown. Update concurrent integration test to exercise SSE AddPeer/RemovePeer events (not just config update events) to detect the race."
+    },
+    {
+      "id": "TE7",
+      "severity": "major",
+      "check": "TE7 - Assertions specific",
+      "file": "internal/bridge/user_access_integration_test.go:208",
+      "description": "TestUserAccessIntegration_ConcurrentAccess only dispatches EventUserAccessConfigUpdated events (which just call TriggerReconcile). It never tests concurrent AddPeer/RemovePeer from SSE handlers against the reconcile loop. This masks the race condition in UserAccessManager.",
+      "fix": "Add concurrent dispatch of EventUserAccessPeerAssigned and EventUserAccessPeerRevoked events alongside reconcile cycles to properly exercise concurrent access to UserAccessManager."
+    }
+  ],
+  "suggested_improvements": [
+    "Minor: UserAccessReconcileHandler's 'add missing peers' loop (user_access_handler.go:89-102) uses a nested loop over currentKeys for lookup. Could use a map for O(1) lookup, matching RelayReconcileHandler's pattern (relay_handler.go:78-86) which builds currentSet as map[string]bool.",
+    "Minor: Plan task 1.1 specifies UserAccessInfo should be added as 'BridgeInfo.UserAccess *UserAccessInfo' field, but implementation adds it as 'HeartbeatRequest.UserAccess *UserAccessInfo' instead. The HeartbeatRequest placement is arguably cleaner (user access is a separate capability, not a sub-status of bridge). Document this deviation.",
+    "Minor: Plan task 1.2 mentions 'UserAccessSubnets []string' config field and validation for 'empty UserAccessSubnets', but implementation correctly reuses existing AccessSubnets since user access shares the bridge access interface. This simplification is correct but should be noted."
+  ],
+  "next_steps": [
+    "Add sync.Mutex to UserAccessManager and protect all public methods that access activePeers or active flag",
+    "Update TestUserAccessIntegration_ConcurrentAccess to include EventUserAccessPeerAssigned/Revoked dispatches to verify race-free concurrent access",
+    "Update comment on UserAccessManager from 'not concurrent-safe' to 'concurrent-safe via mu'"
+  ]
+}

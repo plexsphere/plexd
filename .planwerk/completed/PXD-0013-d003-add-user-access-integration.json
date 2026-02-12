@@ -2,8 +2,8 @@
   "feature_id": "PXD-0013",
   "title": "D003: Add user access integration",
   "slug": "d003-add-user-access-integration",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Route user access traffic into the mesh via external VPN clients. Support integration with Tailscale, Netbird, and standard WireGuard clients. Developers, admins, and on-call engineers connect through the bridge to reach resources on the mesh without direct mesh membership.",
   "stories": [
@@ -419,13 +419,13 @@
     }
   ],
   "tasks": [
-    "1.1 Add UserAccessConfig, UserAccessPeer, and UserAccessInfo API types to internal/api/types.go — UserAccessConfig struct (Peers []UserAccessPeer) for StateResponse.UserAccessConfig field. UserAccessPeer struct (PublicKey string, AllowedIPs []string, PSK string). UserAccessInfo struct (Enabled bool, ActivePeers int, AccessInterface string) added to BridgeInfo as UserAccess *UserAccessInfo field. Add UserAccessConfig *UserAccessConfig field to StateResponse. Add SSE event constants EventUserAccessPeerAssigned, EventUserAccessPeerRevoked, EventUserAccessConfigUpdated to envelope.go. Include JSON round-trip tests in types_test.go. (REQ-004, REQ-007)",
-    "1.2 Extend internal/bridge/config.go — Add UserAccessEnabled bool, AccessInterfaceName string, AccessListenPort int, MaxAccessPeers int, UserAccessSubnets []string fields to Config. Extend ApplyDefaults() to set AccessInterfaceName='wg-access', AccessListenPort=51822, MaxAccessPeers=50. Extend Validate() to reject UserAccessEnabled without bridge Enabled, empty UserAccessSubnets, invalid port, non-positive MaxAccessPeers. Include tests in config_test.go. (REQ-001)",
-    "1.3 Create internal/bridge/access_controller.go — AccessController interface with CreateInterface(name string, listenPort int, privateKey string) error, RemoveInterface(name string) error, AddPeer(iface string, publicKey string, allowedIPs []string, psk string) error, RemovePeer(iface string, publicKey string) error. Create mock_access_controller_test.go with mockAccessController for tests. Follow RouteController/WGController interface pattern. (REQ-002)",
-    "1.4 Create internal/bridge/user_access.go — UserAccessManager struct holding AccessController, RouteController, Config, logger, and tracked state (active bool, peers map[string]api.UserAccessPeer, meshIface string). Implement NewUserAccessManager(accessCtrl AccessController, routeCtrl RouteController, cfg Config, logger *slog.Logger) *UserAccessManager. Implement Setup(meshIface string) error (create access interface, enable forwarding between access and mesh interfaces, mark active). Implement AddPeer(peer api.UserAccessPeer) error (enforce max peers, reject duplicates, call accessCtrl.AddPeer, track). Implement RemovePeer(publicKey string) (call accessCtrl.RemovePeer, remove from tracking). Implement Teardown() error (remove all peers, disable forwarding, remove interface; errors.Join). Implement UserAccessStatus() *api.UserAccessInfo and UserAccessCapabilities() map[string]string. Implement PeerPublicKeys() []string for reconcile. Include tests in user_access_test.go. (REQ-003, REQ-009, REQ-010, REQ-011)",
-    "2.1 Create internal/bridge/user_access_handler.go — HandleUserAccessPeerAssigned(mgr *UserAccessManager, logger *slog.Logger) api.EventHandler that parses UserAccessPeer from SSE payload and calls mgr.AddPeer. HandleUserAccessPeerRevoked(mgr *UserAccessManager, logger *slog.Logger) api.EventHandler that parses public key from payload and calls mgr.RemovePeer. HandleUserAccessConfigUpdated(trigger ReconcileTrigger) api.EventHandler that calls trigger.TriggerReconcile(). UserAccessReconcileHandler(mgr *UserAccessManager, logger *slog.Logger) reconcile.ReconcileHandler that reconciles desired vs actual peers. Include tests in user_access_handler_test.go. (REQ-005, REQ-006, REQ-008)",
-    "3.1 Create internal/bridge/user_access_integration_test.go — Integration tests wiring UserAccessManager with mockAccessController and mockRouteController. Test full lifecycle: Setup → AddPeer via SSE handler → reconcile drift → RemovePeer via SSE handler → Teardown. Test concurrent AddPeer/RemovePeer with -race. Test max peers enforcement under concurrent load. Use goleak.VerifyTestMain. (REQ-003, REQ-005, REQ-006, REQ-011)",
-    "4.1 Create docs/reference/backend/user-access-integration.md — Reference documentation for user access integration in internal/bridge package: Config fields with defaults and validation rules, UserAccessManager lifecycle (Setup, AddPeer, RemovePeer, Teardown, UserAccessStatus), AccessController interface, SSE event handlers (HandleUserAccessPeerAssigned, HandleUserAccessPeerRevoked, HandleUserAccessConfigUpdated), UserAccessReconcileHandler, API types (UserAccessConfig, UserAccessPeer, UserAccessInfo). Include data flow diagram: VPN client → access WG interface (wg-access) → bridge node → mesh WG interface (wg0) → mesh peers. Integration points with reconcile, api, bridge packages. (REQ-001 through REQ-011)"
+    "[done] 1.1 Add UserAccessConfig, UserAccessPeer, and UserAccessInfo API types to internal/api/types.go — UserAccessConfig struct (Peers []UserAccessPeer) for StateResponse.UserAccessConfig field. UserAccessPeer struct (PublicKey string, AllowedIPs []string, PSK string). UserAccessInfo struct (Enabled bool, ActivePeers int, AccessInterface string) added to BridgeInfo as UserAccess *UserAccessInfo field. Add UserAccessConfig *UserAccessConfig field to StateResponse. Add SSE event constants EventUserAccessPeerAssigned, EventUserAccessPeerRevoked, EventUserAccessConfigUpdated to envelope.go. Include JSON round-trip tests in types_test.go. (REQ-004, REQ-007)",
+    "[done] 1.2 Extend internal/bridge/config.go — Add UserAccessEnabled bool, AccessInterfaceName string, AccessListenPort int, MaxAccessPeers int, UserAccessSubnets []string fields to Config. Extend ApplyDefaults() to set AccessInterfaceName='wg-access', AccessListenPort=51822, MaxAccessPeers=50. Extend Validate() to reject UserAccessEnabled without bridge Enabled, empty UserAccessSubnets, invalid port, non-positive MaxAccessPeers. Include tests in config_test.go. (REQ-001)",
+    "[done] 1.3 Create internal/bridge/access_controller.go — AccessController interface with CreateInterface(name string, listenPort int, privateKey string) error, RemoveInterface(name string) error, AddPeer(iface string, publicKey string, allowedIPs []string, psk string) error, RemovePeer(iface string, publicKey string) error. Create mock_access_controller_test.go with mockAccessController for tests. Follow RouteController/WGController interface pattern. (REQ-002)",
+    "[done] 1.4 Create internal/bridge/user_access.go — UserAccessManager struct holding AccessController, RouteController, Config, logger, and tracked state (active bool, peers map[string]api.UserAccessPeer, meshIface string). Implement NewUserAccessManager(accessCtrl AccessController, routeCtrl RouteController, cfg Config, logger *slog.Logger) *UserAccessManager. Implement Setup(meshIface string) error (create access interface, enable forwarding between access and mesh interfaces, mark active). Implement AddPeer(peer api.UserAccessPeer) error (enforce max peers, reject duplicates, call accessCtrl.AddPeer, track). Implement RemovePeer(publicKey string) (call accessCtrl.RemovePeer, remove from tracking). Implement Teardown() error (remove all peers, disable forwarding, remove interface; errors.Join). Implement UserAccessStatus() *api.UserAccessInfo and UserAccessCapabilities() map[string]string. Implement PeerPublicKeys() []string for reconcile. Include tests in user_access_test.go. (REQ-003, REQ-009, REQ-010, REQ-011)",
+    "[done] 2.1 Create internal/bridge/user_access_handler.go — HandleUserAccessPeerAssigned(mgr *UserAccessManager, logger *slog.Logger) api.EventHandler that parses UserAccessPeer from SSE payload and calls mgr.AddPeer. HandleUserAccessPeerRevoked(mgr *UserAccessManager, logger *slog.Logger) api.EventHandler that parses public key from payload and calls mgr.RemovePeer. HandleUserAccessConfigUpdated(trigger ReconcileTrigger) api.EventHandler that calls trigger.TriggerReconcile(). UserAccessReconcileHandler(mgr *UserAccessManager, logger *slog.Logger) reconcile.ReconcileHandler that reconciles desired vs actual peers. Include tests in user_access_handler_test.go. (REQ-005, REQ-006, REQ-008)",
+    "[done] 3.1 Create internal/bridge/user_access_integration_test.go — Integration tests wiring UserAccessManager with mockAccessController and mockRouteController. Test full lifecycle: Setup → AddPeer via SSE handler → reconcile drift → RemovePeer via SSE handler → Teardown. Test concurrent AddPeer/RemovePeer with -race. Test max peers enforcement under concurrent load. Use goleak.VerifyTestMain. (REQ-003, REQ-005, REQ-006, REQ-011)",
+    "[done] 4.1 Create docs/reference/backend/user-access-integration.md — Reference documentation for user access integration in internal/bridge package: Config fields with defaults and validation rules, UserAccessManager lifecycle (Setup, AddPeer, RemovePeer, Teardown, UserAccessStatus), AccessController interface, SSE event handlers (HandleUserAccessPeerAssigned, HandleUserAccessPeerRevoked, HandleUserAccessConfigUpdated), UserAccessReconcileHandler, API types (UserAccessConfig, UserAccessPeer, UserAccessInfo). Include data flow diagram: VPN client → access WG interface (wg-access) → bridge node → mesh WG interface (wg0) → mesh peers. Integration points with reconcile, api, bridge packages. (REQ-001 through REQ-011)"
   ],
   "test_specifications": [
     {
@@ -659,6 +659,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T19:10:56.856122"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T19:15:57.931061"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T19:54:53.879176"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T19:54:53.894936"
     }
   },
   "execution_history": [
@@ -672,6 +684,56 @@
           "name": "prepare",
           "duration": 295.61846375465393,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "140e4f61-9809-4906-b84b-b878f64cc38a",
+      "timestamp": "2026-02-12T19:53:18.900266",
+      "total_duration": 2131.603456735611,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 571.6550333499908,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (1 tasks)",
+          "duration": 599.4420998096466,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 123.371262550354,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (1 tasks)",
+          "duration": 197.44795513153076,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0013] Code Review",
+          "duration": 265.10692024230957,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0013] Improvements",
+          "duration": 246.8691656589508,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0013] Simplify",
+          "duration": 127.71101999282837,
+          "type": "simplify",
           "status": "done"
         }
       ]

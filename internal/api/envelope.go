@@ -25,8 +25,11 @@ const (
 	EventNodeStateUpdated    = "node_state_updated"
 	EventNodeSecretsUpdated    = "node_secrets_updated"
 	EventBridgeConfigUpdated   = "bridge_config_updated"
-	EventRelaySessionAssigned  = "relay_session_assigned"
-	EventRelaySessionRevoked   = "relay_session_revoked"
+	EventRelaySessionAssigned      = "relay_session_assigned"
+	EventRelaySessionRevoked       = "relay_session_revoked"
+	EventUserAccessConfigUpdated   = "user_access_config_updated"
+	EventUserAccessPeerAssigned    = "user_access_peer_assigned"
+	EventUserAccessPeerRevoked     = "user_access_peer_revoked"
 )
 
 // ---------------------------------------------------------------------------
