@@ -1,0 +1,433 @@
+{
+  "feature_id": "PXD-0023",
+  "title": "Create CI workflow with lint and test jobs",
+  "slug": "create-ci-workflow-with-lint-and-test-jobs",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 📦 medium\n**Category:** infrastructure\n**Priority:** high\n**Source:** Proposed for 'In the current implementation and planning, no'\n\nCreate `.github/workflows/ci.yml` with three parallel jobs:\n\n**Lint job:**\n- `actions/checkout@v4` + `actions/setup-go@v5` with Go 1.24\n- `go mod verify` to validate dependency integrity\n- `go vet ./...` for static analysis\n- `staticcheck ./...` (install via `go install honnef.co/go/tools/cmd/staticcheck@latest`)\n- `golangci/golangci-lint-action@v6` with default config (no `.golangci.yml` needed)\n\n**Unit test job:**\n- `actions/checkout@v4` + `actions/setup-go@v5` with Go 1.24\n- `go test -race -count=1 ./...` — race detection enabled, cache disabled\n\n**Integration test job:**\n- `actions/checkout@v4` + `actions/setup-go@v5` with Go 1.24\n- `go test -race -count=1 -run Integration ./...` — only TestIntegration* functions\n\n**Trigger config:** `push` to `main` branch + all `pull_request` events.\n\nAll three jobs run in parallel on `ubuntu-latest`. `actions/setup-go@v5` handles Go module caching automatically via `go.sum`.\n\n**Rationale:** No CI pipeline exists in the project. Every PR and push to main currently has zero automated quality gates — no lint checks, no test verification, no race detection. This means broken code, lint violations, and race conditions can be merged silently. A CI pipeline is foundational infrastructure that blocks bad code before it reaches main, catches regressions immediately, and establishes quality expectations for all contributors.\n\n**Affected Areas:**\n- .github/workflows/ci.yml",
+  "stories": [
+    {
+      "title": "Developer gets automated lint feedback on every PR and push to main",
+      "role": "developer",
+      "want": "lint checks (go vet, staticcheck, golangci-lint, go mod verify) to run automatically on every pull request and push to main",
+      "so_that": "lint violations, dependency tampering, and static analysis issues are caught before code reaches main",
+      "criteria": [
+        "Lint job runs go mod verify and fails the job if dependency checksums do not match go.sum",
+        "Lint job runs go vet ./... and fails the job if any issues are found",
+        "Lint job runs staticcheck ./... and fails the job if any issues are found",
+        "Lint job runs golangci-lint via golangci/golangci-lint-action@v6 and fails the job if any issues are found",
+        "Lint job uses Go 1.24 via actions/setup-go@v5 with automatic module caching via go.sum",
+        "Lint job triggers on push to main branch and on all pull_request events"
+      ]
+    },
+    {
+      "title": "Developer gets automated unit test feedback on every PR and push to main",
+      "role": "developer",
+      "want": "unit tests to run automatically with race detection on every pull request and push to main",
+      "so_that": "test regressions and data races are caught before code reaches main",
+      "criteria": [
+        "Unit test job runs go test -race -count=1 ./... and fails the job if any test fails",
+        "Race detection is enabled (-race flag) to catch concurrent access bugs",
+        "Test caching is disabled (-count=1) to ensure fresh test runs",
+        "Unit test job uses Go 1.24 via actions/setup-go@v5 with automatic module caching",
+        "Unit test job triggers on push to main branch and on all pull_request events"
+      ]
+    },
+    {
+      "title": "Developer gets automated integration test feedback on every PR and push to main",
+      "role": "developer",
+      "want": "integration tests (TestIntegration* functions) to run automatically with race detection on every pull request and push to main",
+      "so_that": "integration-level regressions and race conditions are caught before code reaches main",
+      "criteria": [
+        "Integration test job runs go test -race -count=1 -run Integration ./... and fails the job if any test fails",
+        "Only test functions matching the Integration pattern are executed (TestIntegration_*, TestRelayIntegration_*, TestBridgeReconcileIntegration_*, TestUserAccessIntegration_*)",
+        "Race detection is enabled (-race flag)",
+        "Test caching is disabled (-count=1)",
+        "Integration test job uses Go 1.24 via actions/setup-go@v5 with automatic module caching",
+        "Integration test job triggers on push to main branch and on all pull_request events"
+      ]
+    },
+    {
+      "title": "All three CI jobs run in parallel for fast feedback",
+      "role": "developer",
+      "want": "lint, unit test, and integration test jobs to run concurrently",
+      "so_that": "CI completes as fast as possible and I get feedback on all dimensions simultaneously",
+      "criteria": [
+        "All three jobs (lint, unit-test, integration-test) start at the same time with no dependencies between them",
+        "Each job runs on ubuntu-latest",
+        "A failure in one job does not prevent the other jobs from completing",
+        "The overall workflow status reflects the combined result of all three jobs"
+      ]
+    },
+    {
+      "title": "CI workflow is triggered only on relevant events",
+      "role": "developer",
+      "want": "the CI workflow to trigger only on push to main and pull_request events",
+      "so_that": "CI resources are not wasted on irrelevant events like pushes to feature branches without PRs",
+      "criteria": [
+        "Workflow triggers on push events only to the main branch",
+        "Workflow triggers on all pull_request events (opened, synchronize, reopened)",
+        "Workflow does NOT trigger on push events to non-main branches",
+        "Workflow does NOT trigger on other events (issues, releases, etc.)"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The CI workflow SHALL define a lint job that validates dependency integrity and runs static analysis",
+      "priority": "SHALL",
+      "rationale": "Static analysis catches bugs, style violations, and dependency tampering before they reach main",
+      "scenarios": [
+        {
+          "name": "Lint job succeeds on clean code",
+          "when": "a PR is opened with code that passes all lint checks",
+          "then": "the lint job completes successfully with exit code 0",
+          "and_then": [
+            "the PR status check shows green for the lint job"
+          ]
+        },
+        {
+          "name": "Lint job fails on go vet violation",
+          "when": "a PR is opened with code that has a go vet issue (e.g., printf format mismatch)",
+          "then": "the lint job fails and reports the specific go vet error",
+          "and_then": [
+            "the PR status check shows red for the lint job"
+          ]
+        },
+        {
+          "name": "Lint job fails on tampered dependencies",
+          "when": "go.sum does not match the actual module checksums",
+          "then": "go mod verify fails and the lint job reports the integrity violation",
+          "and_then": [
+            "the PR status check shows red for the lint job"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The lint job SHALL install and run staticcheck for advanced static analysis",
+      "priority": "SHALL",
+      "rationale": "staticcheck catches bugs that go vet misses, including unused code, deprecated API usage, and correctness issues",
+      "scenarios": [
+        {
+          "name": "staticcheck installed and run successfully",
+          "when": "the lint job executes",
+          "then": "staticcheck is installed via go install honnef.co/go/tools/cmd/staticcheck@latest and runs against ./...",
+          "and_then": [
+            "any staticcheck findings cause the job to fail"
+          ]
+        },
+        {
+          "name": "staticcheck failure blocks merge",
+          "when": "code contains a staticcheck violation (e.g., SA1029 unused result)",
+          "then": "the lint job fails with the specific staticcheck error",
+          "and_then": [
+            "the developer sees which file and line triggered the finding"
+          ]
+        },
+        {
+          "name": "staticcheck passes on clean code",
+          "when": "code has no staticcheck findings",
+          "then": "staticcheck exits with code 0 and the lint job continues",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The lint job SHALL run golangci-lint via the official GitHub Action",
+      "priority": "SHALL",
+      "rationale": "golangci-lint aggregates multiple linters and the official action handles caching and installation",
+      "scenarios": [
+        {
+          "name": "golangci-lint runs with default config",
+          "when": "the lint job executes and no .golangci.yml exists in the repo",
+          "then": "golangci-lint runs with its default linter set",
+          "and_then": [
+            "any findings cause the job to fail"
+          ]
+        },
+        {
+          "name": "golangci-lint respects future config",
+          "when": "a .golangci.yml is added to the repo later",
+          "then": "golangci-lint automatically picks up the config file",
+          "and_then": [
+            "no workflow changes needed to adopt the config"
+          ]
+        },
+        {
+          "name": "golangci-lint action version is pinned",
+          "when": "the workflow is read",
+          "then": "the action version is golangci/golangci-lint-action@v6",
+          "and_then": [
+            "the version is explicit and not floating"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The CI workflow SHALL define a unit test job that runs all tests with race detection and no cache",
+      "priority": "SHALL",
+      "rationale": "Race detection catches concurrent access bugs; disabling cache ensures tests run fresh on every CI run",
+      "scenarios": [
+        {
+          "name": "Unit tests pass",
+          "when": "a PR is opened with code where all tests pass",
+          "then": "go test -race -count=1 ./... exits with code 0",
+          "and_then": [
+            "the PR status check shows green for the unit-test job"
+          ]
+        },
+        {
+          "name": "Unit test failure blocks merge",
+          "when": "a PR is opened with a failing test",
+          "then": "go test reports the failure and exits with non-zero code",
+          "and_then": [
+            "the PR status check shows red for the unit-test job"
+          ]
+        },
+        {
+          "name": "Race condition detected",
+          "when": "a PR introduces a data race detectable by the Go race detector",
+          "then": "go test -race reports the race condition and exits with non-zero code",
+          "and_then": [
+            "the developer sees the race detector output with goroutine stacks"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The CI workflow SHALL define an integration test job that runs only Integration-pattern tests with race detection",
+      "priority": "SHALL",
+      "rationale": "Integration tests verify cross-component behavior and should run separately from unit tests for clear signal",
+      "scenarios": [
+        {
+          "name": "Integration tests selected by -run pattern",
+          "when": "the integration test job executes",
+          "then": "only test functions matching the Integration pattern are run (via -run Integration)",
+          "and_then": [
+            "unit tests (non-Integration prefixed) are NOT executed in this job"
+          ]
+        },
+        {
+          "name": "Integration test failure blocks merge",
+          "when": "an integration test fails",
+          "then": "the job reports the failure and exits with non-zero code",
+          "and_then": [
+            "the PR status check shows red for the integration-test job"
+          ]
+        },
+        {
+          "name": "No integration tests found is not a failure",
+          "when": "a package has no TestIntegration* functions",
+          "then": "go test skips that package gracefully (testing: warning: no tests to run)",
+          "and_then": [
+            "the job does not fail due to missing integration tests"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "All three CI jobs SHALL run in parallel on ubuntu-latest with no inter-job dependencies",
+      "priority": "SHALL",
+      "rationale": "Parallel execution minimizes total CI time; no job should block another",
+      "scenarios": [
+        {
+          "name": "Jobs start simultaneously",
+          "when": "the CI workflow is triggered",
+          "then": "all three jobs (lint, unit-test, integration-test) are scheduled without needs: dependencies",
+          "and_then": [
+            "total CI time equals the duration of the slowest job, not the sum"
+          ]
+        },
+        {
+          "name": "Job failure is independent",
+          "when": "the lint job fails",
+          "then": "the unit-test and integration-test jobs continue to completion",
+          "and_then": [
+            "all three job results are visible in the PR checks"
+          ]
+        },
+        {
+          "name": "All jobs use ubuntu-latest",
+          "when": "the workflow file is inspected",
+          "then": "each job specifies runs-on: ubuntu-latest",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The CI workflow SHALL trigger on push to main and all pull_request events",
+      "priority": "SHALL",
+      "rationale": "Push to main catches post-merge issues; PR events provide pre-merge quality gates",
+      "scenarios": [
+        {
+          "name": "Push to main triggers CI",
+          "when": "a commit is pushed to the main branch",
+          "then": "the CI workflow is triggered and all three jobs run",
+          "and_then": []
+        },
+        {
+          "name": "Pull request triggers CI",
+          "when": "a pull request is opened, synchronized, or reopened",
+          "then": "the CI workflow is triggered and all three jobs run",
+          "and_then": []
+        },
+        {
+          "name": "Push to feature branch does not trigger CI",
+          "when": "a commit is pushed to a branch other than main without an open PR",
+          "then": "the CI workflow is NOT triggered",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "All jobs SHALL use actions/setup-go@v5 with Go 1.24 and automatic module caching",
+      "priority": "SHALL",
+      "rationale": "Consistent Go version across jobs; setup-go@v5 caches modules via go.sum automatically, speeding up subsequent runs",
+      "scenarios": [
+        {
+          "name": "Go version is 1.24",
+          "when": "any CI job runs",
+          "then": "Go 1.24 is installed via actions/setup-go@v5 with go-version: '1.24'",
+          "and_then": [
+            "go version outputs go1.24.x"
+          ]
+        },
+        {
+          "name": "Module cache is utilized",
+          "when": "a CI job runs after a previous run with the same go.sum",
+          "then": "actions/setup-go@v5 restores the cached Go modules automatically",
+          "and_then": [
+            "go mod download is faster due to cache hit"
+          ]
+        },
+        {
+          "name": "All jobs use actions/checkout@v4",
+          "when": "any CI job runs",
+          "then": "the repo is checked out via actions/checkout@v4 as the first step",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create .github/workflows/ci.yml with workflow name 'CI' and trigger config: push to main + all pull_request events (REQ-007)",
+    "1.2 Add lint job to ci.yml: actions/checkout@v4, actions/setup-go@v5 with Go 1.24, go mod verify, go vet ./..., go install staticcheck + staticcheck ./..., golangci/golangci-lint-action@v6 — all on ubuntu-latest (REQ-001, REQ-002, REQ-003, REQ-008)",
+    "1.3 Add unit-test job to ci.yml: actions/checkout@v4, actions/setup-go@v5 with Go 1.24, go test -race -count=1 ./... — on ubuntu-latest, no dependencies on other jobs (REQ-004, REQ-006, REQ-008)",
+    "1.4 Add integration-test job to ci.yml: actions/checkout@v4, actions/setup-go@v5 with Go 1.24, go test -race -count=1 -run Integration ./... — on ubuntu-latest, no dependencies on other jobs (REQ-005, REQ-006, REQ-008)",
+    "1.5 Validate the complete ci.yml: verify YAML syntax is valid, all three jobs are parallel (no needs: keys), action versions are pinned, Go version is consistent across jobs (REQ-001 through REQ-008)",
+    "2.1 Write reference documentation for the CI workflow at docs/reference/backend/ci-workflow.md: document trigger events, job descriptions, lint tools used, test commands, Go version, caching behavior, and how to add new jobs (REQ-001 through REQ-008)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": ".github/workflows/ci.yml",
+      "test_function": "YAML validation: workflow triggers",
+      "story": "CI workflow is triggered only on relevant events",
+      "expected": "on.push.branches contains only 'main'; on.pull_request is present without branch filter",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": ".github/workflows/ci.yml",
+      "test_function": "YAML validation: lint job steps",
+      "story": "Developer gets automated lint feedback on every PR and push to main",
+      "expected": "Lint job contains steps: checkout@v4, setup-go@v5 (go 1.24), go mod verify, go vet ./..., go install staticcheck, staticcheck ./..., golangci-lint-action@v6",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": ".github/workflows/ci.yml",
+      "test_function": "YAML validation: unit-test job steps",
+      "story": "Developer gets automated unit test feedback on every PR and push to main",
+      "expected": "Unit test job contains steps: checkout@v4, setup-go@v5 (go 1.24), go test -race -count=1 ./...",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": ".github/workflows/ci.yml",
+      "test_function": "YAML validation: integration-test job steps",
+      "story": "Developer gets automated integration test feedback on every PR and push to main",
+      "expected": "Integration test job contains steps: checkout@v4, setup-go@v5 (go 1.24), go test -race -count=1 -run Integration ./...",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": ".github/workflows/ci.yml",
+      "test_function": "YAML validation: parallel jobs",
+      "story": "All three CI jobs run in parallel for fast feedback",
+      "expected": "No job has a 'needs' key; all three jobs are independent",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": ".github/workflows/ci.yml",
+      "test_function": "YAML validation: runner OS",
+      "story": "All three CI jobs run in parallel for fast feedback",
+      "expected": "All three jobs specify runs-on: ubuntu-latest",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": ".github/workflows/ci.yml",
+      "test_function": "YAML validation: Go version consistency",
+      "story": "Developer gets automated lint feedback on every PR and push to main",
+      "expected": "All three jobs use actions/setup-go@v5 with go-version '1.24'",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": ".github/workflows/ci.yml",
+      "test_function": "YAML validation: staticcheck install step",
+      "story": "Developer gets automated lint feedback on every PR and push to main",
+      "expected": "Lint job installs staticcheck via go install honnef.co/go/tools/cmd/staticcheck@latest before running staticcheck ./...",
+      "requirement_id": "REQ-002"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "ci.yml is valid YAML that GitHub Actions can parse without errors",
+    "All three jobs (lint, unit-test, integration-test) have no 'needs' key and run in parallel",
+    "All jobs use actions/checkout@v4 and actions/setup-go@v5 with go-version '1.24'",
+    "Lint job includes all five checks in order: go mod verify, go vet, staticcheck install, staticcheck run, golangci-lint",
+    "Unit test job runs exactly: go test -race -count=1 ./...",
+    "Integration test job runs exactly: go test -race -count=1 -run Integration ./...",
+    "Workflow triggers only on push to main and pull_request events",
+    "All jobs run on ubuntu-latest",
+    "Action versions are pinned (checkout@v4, setup-go@v5, golangci-lint-action@v6)",
+    "Reference documentation covers all CI jobs, tools, and trigger configuration"
+  ],
+  "implementation_notes": "This is a pure infrastructure task — a single YAML file at .github/workflows/ci.yml. No Go code changes needed. Key decisions: (1) Go version string '1.24' (not '1.24.0') to get latest patch via setup-go. (2) staticcheck installed via go install rather than a dedicated action for simplicity. (3) golangci-lint uses the official action which handles its own caching and installation. (4) -count=1 disables test caching to ensure every CI run exercises all tests. (5) Integration test -run pattern 'Integration' matches both TestIntegration_* (used in tunnel, peerexchange, policy, integrity packages) and TestRelayIntegration_*, TestBridgeReconcileIntegration_*, TestUserAccessIntegration_* (used in bridge package) since -run does substring matching. (6) No .golangci.yml needed — the action runs with defaults and will auto-detect a config file if one is added later. (7) setup-go@v5 automatically caches Go modules using go.sum as cache key.",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:45:42.102792"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:48:53.197524"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:51:36.580893"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "abac28b8-9d67-4f36-8c2e-0e8cfa440896",
+      "timestamp": "2026-02-12T21:51:36.580929",
+      "total_duration": 159.31805729866028,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 159.31805729866028,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
