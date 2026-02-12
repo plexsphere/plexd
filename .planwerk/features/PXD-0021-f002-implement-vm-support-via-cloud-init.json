@@ -1,0 +1,680 @@
+{
+  "feature_id": "PXD-0021",
+  "title": "F002: Implement VM support via Cloud-Init",
+  "slug": "f002-implement-vm-support-via-cloud-init",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Support automated deployment on virtual machines via Cloud-Init. Provide Cloud-Init user-data templates that install plexd and inject the bootstrap token automatically during VM provisioning. Integrate with cloud provider metadata services where applicable.",
+  "stories": [
+    {
+      "title": "Operator provisions a VM with plexd via Cloud-Init user-data",
+      "role": "platform operator",
+      "want": "to include a Cloud-Init user-data template when provisioning a VM so that plexd is automatically downloaded, installed, and enrolled without manual SSH access",
+      "so_that": "I can provision fleet VMs at scale with zero-touch enrollment into the Plexsphere mesh",
+      "criteria": [
+        "A Cloud-Init user-data YAML template is provided at deploy/cloud-init/user-data.yaml that uses write_files and runcmd modules",
+        "The user-data template writes the bootstrap token to /etc/plexd/bootstrap-token with 0600 permissions via write_files",
+        "The user-data template writes /etc/plexd/environment with PLEXD_API=<api_url> via write_files",
+        "The user-data template downloads and runs the install script (deploy/install.sh from F001) via runcmd",
+        "The install script installs plexd as a systemd service and starts it; plexd reads the pre-provisioned token and registers automatically",
+        "The user-data template includes clear placeholder markers (REPLACE_WITH_TOKEN, REPLACE_WITH_API_URL) for operator customization",
+        "The user-data template is valid Cloud-Init YAML (passes cloud-init schema validate)"
+      ]
+    },
+    {
+      "title": "plexd reads bootstrap token from cloud provider IMDS metadata service",
+      "role": "platform operator",
+      "want": "plexd to automatically read the bootstrap token from the cloud provider's Instance Metadata Service (IMDS) when `token.metadata: true` is set in config",
+      "so_that": "I can inject the bootstrap token via cloud provider instance metadata (user-data or custom metadata tags) instead of writing files, enabling integration with cloud-native provisioning tools",
+      "criteria": [
+        "An IMDSProvider struct implements the MetadataProvider interface from internal/registration/token.go",
+        "IMDSProvider queries the IMDS endpoint at http://169.254.169.254/ with appropriate headers",
+        "IMDSProvider supports IMDSv2 (AWS-style token-based) by first requesting a session token via PUT to /latest/api/token, then using it in subsequent requests",
+        "IMDSProvider reads the bootstrap token from instance user-data at /latest/user-data (common across AWS, GCP, Azure, OpenStack)",
+        "IMDSProvider has a configurable HTTP timeout (default: 2s) to fail fast when IMDS is unavailable (e.g., bare-metal)",
+        "When IMDS is unreachable or returns no token, IMDSProvider returns an error that causes the TokenResolver to fall through to the next source",
+        "IMDSProvider is only used when Config.UseMetadata is true (existing registration config field)"
+      ]
+    },
+    {
+      "title": "plexd reads bootstrap token from cloud provider custom metadata tags",
+      "role": "platform operator",
+      "want": "plexd to support reading the bootstrap token from cloud-specific custom metadata keys (e.g., instance tags or custom metadata)",
+      "so_that": "I can use cloud provider metadata tags to inject the token without using user-data (which may be used for other cloud-init modules)",
+      "criteria": [
+        "IMDSProvider checks a configurable metadata path (default: /latest/meta-data/plexd-bootstrap-token) after checking user-data",
+        "The metadata key path is configurable via Config.MetadataTokenPath",
+        "If the user-data contains the token, the metadata tag check is skipped (user-data takes priority)",
+        "If neither user-data nor metadata tag contains a token, IMDSProvider returns an error",
+        "The metadata path check handles 404 responses gracefully (metadata tag not set)"
+      ]
+    },
+    {
+      "title": "Operator uses Terraform to provision a VM with plexd via Cloud-Init",
+      "role": "platform operator",
+      "want": "example Terraform snippets that show how to pass the Cloud-Init user-data template to cloud providers (AWS, GCP, OpenStack)",
+      "so_that": "I can integrate plexd VM provisioning into my existing Terraform infrastructure-as-code workflows",
+      "criteria": [
+        "A Terraform example for AWS EC2 using user_data with the cloud-init template is provided in deploy/cloud-init/examples/terraform-aws.tf",
+        "A Terraform example for OpenStack using user_data with the cloud-init template is provided in deploy/cloud-init/examples/terraform-openstack.tf",
+        "Each example uses templatefile() to inject the bootstrap token and API URL as variables",
+        "Examples include clear comments explaining each section and required variables",
+        "Examples reference the Cloud-Init user-data template from deploy/cloud-init/user-data.yaml"
+      ]
+    },
+    {
+      "title": "IMDS metadata provider handles edge cases and errors gracefully",
+      "role": "system",
+      "want": "the IMDS provider to handle all error conditions: IMDS unavailable, timeout, empty response, malformed data, non-VM environments",
+      "so_that": "plexd does not hang or crash during startup when running in environments without IMDS (bare-metal, containers)",
+      "criteria": [
+        "When IMDS is unreachable (connection refused, timeout), ReadToken returns an error within the configured timeout (default 2s)",
+        "When IMDS returns an empty body or HTTP error status, ReadToken returns an error",
+        "When the response contains non-printable characters or exceeds max token length, ReadToken returns a validation error",
+        "The provider does not panic or crash on any IMDS response format",
+        "All IMDS HTTP requests use a short timeout to prevent blocking plexd startup",
+        "Errors include context about which IMDS endpoint was queried"
+      ]
+    },
+    {
+      "title": "Cloud-Init configuration supports multiple cloud providers",
+      "role": "platform operator",
+      "want": "the Cloud-Init user-data template to work across major cloud providers (AWS, GCP, Azure, OpenStack) without modification",
+      "so_that": "I can use the same provisioning approach regardless of which cloud provider hosts my VMs",
+      "criteria": [
+        "The user-data template uses only standard Cloud-Init modules (write_files, runcmd, package_update) that are supported across all major cloud providers",
+        "The template does not use cloud-provider-specific features or syntax",
+        "The install script (invoked via runcmd) handles both amd64 and arm64 architectures automatically",
+        "An alternative minimal user-data template is provided that only writes the token and relies on IMDS metadata for the API URL"
+      ]
+    },
+    {
+      "title": "Reference documentation covers IMDS provider and Cloud-Init templates",
+      "role": "developer",
+      "want": "reference documentation for the IMDSProvider implementation, its configuration options, and the Cloud-Init template format",
+      "so_that": "developers can understand the metadata integration and operators can customize the templates",
+      "criteria": [
+        "Documentation describes IMDSProvider behavior: endpoints queried, IMDSv2 support, timeout, fallback order",
+        "Documentation lists all Config fields related to metadata (UseMetadata, MetadataTokenPath, MetadataTimeout)",
+        "Documentation describes the Cloud-Init user-data template structure and all placeholder values",
+        "Documentation lists supported cloud providers and any provider-specific considerations"
+      ]
+    },
+    {
+      "title": "Operator follows a how-to guide to deploy plexd on cloud VMs",
+      "role": "platform operator",
+      "want": "a step-by-step guide to deploy plexd on VMs using Cloud-Init across different cloud providers",
+      "so_that": "I can follow a clear procedure to provision VMs with plexd in my cloud environment",
+      "criteria": [
+        "Guide includes prerequisites (cloud account, VM with Cloud-Init support, bootstrap token from Plexsphere)",
+        "Guide covers the Cloud-Init user-data approach (write token to file, download and install plexd)",
+        "Guide covers the IMDS metadata approach (set metadata tag, enable metadata in plexd config)",
+        "Guide includes verification steps (SSH to VM, check systemctl status, check plexd status)",
+        "Guide includes Terraform examples with step-by-step instructions"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL implement an IMDSProvider that satisfies the MetadataProvider interface and reads bootstrap tokens from the Instance Metadata Service at http://169.254.169.254/",
+      "priority": "SHALL",
+      "rationale": "The MetadataProvider interface in internal/registration/token.go is the established integration point for cloud metadata; implementing it enables zero-touch VM enrollment via the existing TokenResolver priority chain",
+      "scenarios": [
+        {
+          "name": "Token read from user-data",
+          "when": "ReadToken() is called and IMDS returns the token in /latest/user-data",
+          "then": "the token value is returned after whitespace trimming",
+          "and_then": [
+            "no metadata tag endpoint is queried"
+          ]
+        },
+        {
+          "name": "Token read from metadata tag",
+          "when": "ReadToken() is called and user-data is empty but the configured metadata path contains the token",
+          "then": "the token value from the metadata tag is returned",
+          "and_then": []
+        },
+        {
+          "name": "IMDS unreachable returns error",
+          "when": "ReadToken() is called but IMDS at 169.254.169.254 is unreachable",
+          "then": "an error is returned within the configured timeout (default 2s)",
+          "and_then": [
+            "the error message includes the IMDS endpoint URL"
+          ]
+        },
+        {
+          "name": "Empty responses handled",
+          "when": "IMDS returns 200 with empty body for both user-data and metadata tag",
+          "then": "ReadToken() returns an error indicating no token was found in IMDS",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The IMDSProvider SHALL support IMDSv2 token-based authentication by requesting a session token via PUT /latest/api/token before querying metadata endpoints",
+      "priority": "SHALL",
+      "rationale": "AWS IMDSv2 requires a session token for security; supporting it ensures compatibility with AWS instances that have IMDSv1 disabled",
+      "scenarios": [
+        {
+          "name": "IMDSv2 session token obtained",
+          "when": "ReadToken() is called and PUT /latest/api/token returns a session token",
+          "then": "subsequent GET requests include X-aws-ec2-metadata-token header with the session token",
+          "and_then": []
+        },
+        {
+          "name": "IMDSv2 unavailable falls back to IMDSv1",
+          "when": "PUT /latest/api/token fails (non-AWS provider)",
+          "then": "GET requests proceed without the session token header",
+          "and_then": [
+            "no error is returned for the IMDSv2 failure"
+          ]
+        },
+        {
+          "name": "IMDSv2 token TTL set correctly",
+          "when": "PUT /latest/api/token is called",
+          "then": "X-aws-ec2-metadata-token-ttl-seconds header is set to 21600",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The IMDSProvider SHALL use configurable HTTP timeouts to prevent blocking plexd startup when IMDS is unavailable",
+      "priority": "SHALL",
+      "rationale": "On bare-metal and container environments, IMDS is not available; the provider must fail fast to not delay startup",
+      "scenarios": [
+        {
+          "name": "Default timeout of 2 seconds",
+          "when": "IMDSProvider is created with default config (MetadataTimeout=0)",
+          "then": "HTTP requests to IMDS time out after 2 seconds",
+          "and_then": []
+        },
+        {
+          "name": "Custom timeout respected",
+          "when": "IMDSProvider is created with MetadataTimeout=5s",
+          "then": "HTTP requests to IMDS time out after 5 seconds",
+          "and_then": []
+        },
+        {
+          "name": "Context cancellation respected",
+          "when": "ReadToken() is called with a cancelled context",
+          "then": "ReadToken() returns immediately with the context error",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The registration Config SHALL include MetadataTokenPath and MetadataTimeout fields with sensible defaults",
+      "priority": "SHALL",
+      "rationale": "Different cloud providers may use different metadata paths; timeout allows tuning for specific environments",
+      "scenarios": [
+        {
+          "name": "Defaults applied",
+          "when": "Config.ApplyDefaults() is called with zero-valued metadata fields",
+          "then": "MetadataTokenPath is empty (only user-data checked by default) and MetadataTimeout is 2s",
+          "and_then": []
+        },
+        {
+          "name": "Custom metadata path used",
+          "when": "Config.MetadataTokenPath is set to 'plexd-bootstrap-token'",
+          "then": "IMDSProvider queries /latest/meta-data/plexd-bootstrap-token after checking user-data",
+          "and_then": []
+        },
+        {
+          "name": "Existing config fields preserved",
+          "when": "ApplyDefaults() is called with pre-set fields",
+          "then": "all existing fields (DataDir, TokenFile, TokenEnv, UseMetadata) retain their values",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The Cloud-Init user-data template SHALL install plexd and pre-provision the bootstrap token using standard Cloud-Init modules (write_files, runcmd)",
+      "priority": "SHALL",
+      "rationale": "Standard modules ensure compatibility across AWS, GCP, Azure, and OpenStack cloud providers",
+      "scenarios": [
+        {
+          "name": "Token written via write_files",
+          "when": "Cloud-Init processes the user-data template",
+          "then": "/etc/plexd/bootstrap-token is created with the token value and 0600 permissions",
+          "and_then": [
+            "the file is owned by root:root"
+          ]
+        },
+        {
+          "name": "Install script invoked via runcmd",
+          "when": "Cloud-Init processes the runcmd section",
+          "then": "the install script is downloaded and executed with appropriate flags",
+          "and_then": [
+            "plexd is installed as a systemd service and started"
+          ]
+        },
+        {
+          "name": "Template is valid Cloud-Init YAML",
+          "when": "the user-data template is validated against Cloud-Init schema",
+          "then": "no validation errors are reported",
+          "and_then": []
+        },
+        {
+          "name": "Environment file written with API URL",
+          "when": "Cloud-Init processes the user-data template",
+          "then": "/etc/plexd/environment is created with PLEXD_API=<api_url>",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The Cloud-Init user-data template SHALL include clear placeholder markers and inline documentation for operator customization",
+      "priority": "SHALL",
+      "rationale": "Clear placeholders prevent misconfiguration and reduce onboarding friction",
+      "scenarios": [
+        {
+          "name": "Placeholders clearly marked",
+          "when": "operator opens the user-data template",
+          "then": "REPLACE_WITH_BOOTSTRAP_TOKEN and REPLACE_WITH_API_URL placeholders are present with comments",
+          "and_then": []
+        },
+        {
+          "name": "Optional sections documented",
+          "when": "operator reviews the template",
+          "then": "optional sections are commented with descriptions of their purpose",
+          "and_then": []
+        },
+        {
+          "name": "Template header includes version info",
+          "when": "operator reviews the template",
+          "then": "a comment at the top indicates the plexd version and artifact URL variables",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The system SHALL provide a minimal Cloud-Init user-data template that only writes the bootstrap token file",
+      "priority": "SHALL",
+      "rationale": "For environments where plexd is pre-installed in the VM image, a minimal template reduces complexity",
+      "scenarios": [
+        {
+          "name": "Minimal template writes only token",
+          "when": "the minimal user-data template is used",
+          "then": "only the bootstrap token is written to /etc/plexd/bootstrap-token via write_files",
+          "and_then": [
+            "no runcmd is executed"
+          ]
+        },
+        {
+          "name": "Minimal template is valid Cloud-Init",
+          "when": "the minimal user-data template is validated",
+          "then": "it passes Cloud-Init schema validation",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The system SHALL provide Terraform example files for AWS and OpenStack that demonstrate VM provisioning with the Cloud-Init template",
+      "priority": "SHALL",
+      "rationale": "Terraform is the most common IaC tool; examples accelerate adoption for VM fleet provisioning",
+      "scenarios": [
+        {
+          "name": "AWS example uses templatefile",
+          "when": "operator reviews the AWS Terraform example",
+          "then": "aws_instance uses user_data with templatefile() injecting bootstrap_token and api_url variables",
+          "and_then": []
+        },
+        {
+          "name": "OpenStack example uses templatefile",
+          "when": "operator reviews the OpenStack Terraform example",
+          "then": "openstack_compute_instance_v2 uses user_data with templatefile() injecting variables",
+          "and_then": []
+        },
+        {
+          "name": "Examples include provider configuration",
+          "when": "operator reviews the Terraform examples",
+          "then": "required_providers and provider blocks with version constraints are included",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The IMDSProvider SHALL validate token data from IMDS using the same rules as validateToken (<=512 bytes, printable ASCII)",
+      "priority": "SHALL",
+      "rationale": "Consistent validation prevents injection of malformed tokens via IMDS; reuses established rules from internal/registration/token.go",
+      "scenarios": [
+        {
+          "name": "Valid token accepted",
+          "when": "IMDS returns a valid printable ASCII token within 512 bytes",
+          "then": "ReadToken() returns the token",
+          "and_then": []
+        },
+        {
+          "name": "Oversized response rejected",
+          "when": "IMDS returns a response exceeding 512 bytes",
+          "then": "ReadToken() returns a validation error",
+          "and_then": []
+        },
+        {
+          "name": "Binary data rejected",
+          "when": "IMDS returns a response containing non-printable characters",
+          "then": "ReadToken() returns a validation error",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The IMDSProvider SHALL use structured logging (log/slog) with component='registration' for IMDS interactions",
+      "priority": "SHALL",
+      "rationale": "Consistent structured logging following the project convention (component field) enables troubleshooting",
+      "scenarios": [
+        {
+          "name": "Token source logged at debug",
+          "when": "ReadToken() reads a token from IMDS",
+          "then": "a debug log is emitted with the source (user-data or metadata-tag) and component='registration'",
+          "and_then": [
+            "the token value is NOT logged"
+          ]
+        },
+        {
+          "name": "Errors logged at debug",
+          "when": "IMDS requests fail",
+          "then": "a debug log includes the endpoint URL and error with component='registration'",
+          "and_then": []
+        },
+        {
+          "name": "IMDSv2 fallback logged",
+          "when": "IMDSv2 token request fails",
+          "then": "a debug log indicates IMDSv2 fallback to IMDSv1",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "The IMDSProvider SHALL accept an injectable HTTP client for testing without real IMDS access",
+      "priority": "SHALL",
+      "rationale": "Unit tests must run in CI without cloud IMDS; httptest.Server mocks enable full test coverage",
+      "scenarios": [
+        {
+          "name": "Custom HTTP client used",
+          "when": "NewIMDSProvider is called with a custom *http.Client",
+          "then": "all IMDS requests use the provided client",
+          "and_then": []
+        },
+        {
+          "name": "Default client has configured timeout",
+          "when": "NewIMDSProvider is called with nil client",
+          "then": "a default client with MetadataTimeout is created",
+          "and_then": []
+        },
+        {
+          "name": "Tests use httptest.Server",
+          "when": "unit tests run",
+          "then": "httptest.Server simulates IMDS responses without real network calls",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-012",
+      "description": "The system SHALL provide reference documentation for the IMDS provider and Cloud-Init templates",
+      "priority": "SHALL",
+      "rationale": "Operators and developers need documentation for metadata integration and template customization",
+      "scenarios": [
+        {
+          "name": "IMDS reference complete",
+          "when": "documentation is reviewed",
+          "then": "IMDSProvider config fields, endpoint order, IMDSv2 behavior, timeout, and error handling are documented",
+          "and_then": []
+        },
+        {
+          "name": "Cloud-Init reference complete",
+          "when": "documentation is reviewed",
+          "then": "template structure, placeholders, Cloud-Init modules, and provider compatibility are documented",
+          "and_then": []
+        },
+        {
+          "name": "Terraform examples referenced",
+          "when": "documentation is reviewed",
+          "then": "each example is listed with required variables and provider setup",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-013",
+      "description": "The system SHALL provide a how-to guide for deploying plexd on VMs via Cloud-Init",
+      "priority": "SHALL",
+      "rationale": "Step-by-step guidance reduces onboarding friction for cloud VM deployment",
+      "scenarios": [
+        {
+          "name": "Cloud-Init approach documented",
+          "when": "operator reads the guide",
+          "then": "template customization, VM provisioning, and verification steps are documented",
+          "and_then": []
+        },
+        {
+          "name": "IMDS approach documented",
+          "when": "operator reads the guide",
+          "then": "enabling metadata in config and setting metadata tags are documented",
+          "and_then": []
+        },
+        {
+          "name": "Terraform approach documented",
+          "when": "operator reads the guide",
+          "then": "Terraform plan/apply steps with expected output are documented",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Add MetadataTokenPath (string) and MetadataTimeout (time.Duration) fields to Config in internal/registration/config.go. Update ApplyDefaults(): set MetadataTimeout to 2*time.Second when zero, leave MetadataTokenPath empty by default. Add tests in internal/registration/config_test.go: TestConfig_ApplyDefaults_MetadataFields (zero values), TestConfig_CustomMetadataFields (custom values preserved). (REQ-004)",
+    "1.2 Create internal/registration/imds.go: IMDSProvider struct with fields: baseURL string, metadataTokenPath string, client *http.Client, logger *slog.Logger. Constructor NewIMDSProvider(cfg *Config, client *http.Client, logger *slog.Logger) *IMDSProvider: applies defaults (baseURL=http://169.254.169.254, timeout from cfg.MetadataTimeout), creates default client if nil. ReadToken(ctx context.Context) (string, error) method: (1) attempt IMDSv2 PUT /latest/api/token with X-aws-ec2-metadata-token-ttl-seconds:21600, store session token on success, (2) GET /latest/user-data with optional IMDSv2 header, trim whitespace, return if non-empty after validation, (3) if metadataTokenPath is set, GET /latest/meta-data/{metadataTokenPath} with optional IMDSv2 header, trim whitespace, return if non-empty after validation, (4) return error if no token found. Use existing validateToken logic (duplicate the simple function or call it). Create internal/registration/imds_test.go with httptest.Server: test all scenarios from REQ-001, REQ-002, REQ-003, REQ-009, REQ-010, REQ-011. (REQ-001, REQ-002, REQ-003, REQ-009, REQ-010, REQ-011)",
+    "1.3 Update internal/registration/token_test.go: Add TestTokenResolver_FromIMDSProvider (IMDSProvider as MetadataProvider returns token when UseMetadata=true) and TestTokenResolver_IMDSFallsThrough (error from IMDSProvider results in 'no bootstrap token found'). These tests verify the integration between TokenResolver and IMDSProvider via the MetadataProvider interface. (REQ-001)",
+    "2.1 Create deploy/cloud-init/user-data.yaml: Full Cloud-Init user-data template using #cloud-config header. Sections: (1) write_files: write bootstrap token to /etc/plexd/bootstrap-token with permissions '0600', write PLEXD_API to /etc/plexd/environment. (2) runcmd: curl install script and pipe to sh with --api-url and --token-file flags. Include clear REPLACE_WITH_BOOTSTRAP_TOKEN, REPLACE_WITH_API_URL, REPLACE_WITH_VERSION placeholders with inline comments. (REQ-005, REQ-006)",
+    "2.2 Create deploy/cloud-init/user-data-minimal.yaml: Minimal Cloud-Init user-data template that only writes the bootstrap token file via write_files. No runcmd — assumes plexd is pre-installed in the VM image. Include placeholder and comment explaining when to use this template. (REQ-007)",
+    "2.3 Create deploy/cloud-init/examples/terraform-aws.tf: Terraform example for AWS EC2 instance provisioning with Cloud-Init user-data. Use templatefile() to inject bootstrap_token and api_url variables. Include: variable definitions, provider block, aws_instance resource with user_data, output for instance IP. Add comments explaining each section. (REQ-008)",
+    "2.4 Create deploy/cloud-init/examples/terraform-openstack.tf: Terraform example for OpenStack compute instance provisioning with Cloud-Init user-data. Use templatefile() to inject variables. Include: variable definitions, provider block, openstack_compute_instance_v2 resource with user_data, output for instance IP. Add comments explaining each section. (REQ-008)",
+    "3.1 Create docs/reference/backend/cloud-init-vm-deployment.md: Reference documentation covering: IMDSProvider (configuration fields, IMDS endpoints queried in order, IMDSv2 support, timeout, error behavior), Config metadata fields (MetadataTokenPath, MetadataTimeout, UseMetadata), Cloud-Init user-data template structure (modules, placeholders, permissions), Terraform examples (variables, provider setup). Cross-reference docs/reference/backend/registration.md for TokenResolver. (REQ-012)",
+    "3.2 Create docs/how-to/backend/cloud-vm-deployment.md: How-to guide covering: Prerequisites (cloud account, VM with Cloud-Init, bootstrap token), Cloud-Init approach (customize template, provision VM, verify), IMDS approach (enable metadata in config.yaml, set metadata tags per provider), Terraform approach (copy example, set variables, terraform apply), Verification (SSH, systemctl status plexd, plexd status). Cross-reference reference doc. (REQ-013)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/registration/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults_MetadataFields",
+      "story": "plexd reads bootstrap token from cloud provider IMDS metadata service",
+      "expected": "ApplyDefaults sets MetadataTimeout to 2s when zero; MetadataTokenPath remains empty",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/registration/config_test.go",
+      "test_function": "TestConfig_CustomMetadataFields",
+      "story": "plexd reads bootstrap token from cloud provider custom metadata tags",
+      "expected": "Custom MetadataTokenPath and MetadataTimeout are preserved after ApplyDefaults",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_ReadTokenFromUserData",
+      "story": "plexd reads bootstrap token from cloud provider IMDS metadata service",
+      "expected": "ReadToken returns the token from /latest/user-data after trimming whitespace",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_ReadTokenFromMetadataTag",
+      "story": "plexd reads bootstrap token from cloud provider custom metadata tags",
+      "expected": "When user-data is empty and MetadataTokenPath is set, ReadToken returns the token from /latest/meta-data/<path>",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_UserDataTakesPriorityOverMetadataTag",
+      "story": "plexd reads bootstrap token from cloud provider IMDS metadata service",
+      "expected": "When both user-data and metadata tag contain tokens, the user-data token is returned",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_IMDSv2TokenUsed",
+      "story": "plexd reads bootstrap token from cloud provider IMDS metadata service",
+      "expected": "When IMDSv2 PUT succeeds, subsequent GET requests include X-aws-ec2-metadata-token header",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_IMDSv2FallbackToV1",
+      "story": "plexd reads bootstrap token from cloud provider IMDS metadata service",
+      "expected": "When IMDSv2 PUT fails, GET requests proceed without the token header and return the token",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_IMDSv2TokenTTL",
+      "story": "plexd reads bootstrap token from cloud provider IMDS metadata service",
+      "expected": "PUT /latest/api/token includes X-aws-ec2-metadata-token-ttl-seconds: 21600",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_TimeoutOnUnreachable",
+      "story": "IMDS metadata provider handles edge cases and errors gracefully",
+      "expected": "When IMDS is unreachable, ReadToken returns an error within the configured timeout",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_ContextCancellation",
+      "story": "IMDS metadata provider handles edge cases and errors gracefully",
+      "expected": "When context is cancelled, ReadToken returns immediately with context error",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_EmptyUserDataAndNoMetadataPath",
+      "story": "IMDS metadata provider handles edge cases and errors gracefully",
+      "expected": "When user-data is empty and MetadataTokenPath is empty, ReadToken returns error",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_EmptyUserDataAndEmptyMetadataTag",
+      "story": "IMDS metadata provider handles edge cases and errors gracefully",
+      "expected": "When both user-data and metadata tag return empty, ReadToken returns error",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_MetadataTag404",
+      "story": "IMDS metadata provider handles edge cases and errors gracefully",
+      "expected": "When metadata tag endpoint returns 404, ReadToken returns error without crashing",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_TokenValidation_TooLong",
+      "story": "IMDS metadata provider handles edge cases and errors gracefully",
+      "expected": "When IMDS returns a response exceeding 512 bytes, ReadToken returns a validation error",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_TokenValidation_NonPrintable",
+      "story": "IMDS metadata provider handles edge cases and errors gracefully",
+      "expected": "When IMDS returns binary data, ReadToken returns a validation error",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_WhitespaceTrimming",
+      "story": "plexd reads bootstrap token from cloud provider IMDS metadata service",
+      "expected": "ReadToken trims leading/trailing whitespace from the IMDS response",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_HTTPError5xx",
+      "story": "IMDS metadata provider handles edge cases and errors gracefully",
+      "expected": "When IMDS returns 500, ReadToken returns an error with the status code",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/imds_test.go",
+      "test_function": "TestIMDSProvider_CustomTimeout",
+      "story": "IMDS metadata provider handles edge cases and errors gracefully",
+      "expected": "When MetadataTimeout is set to 5s, the HTTP client timeout matches",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/registration/token_test.go",
+      "test_function": "TestTokenResolver_FromIMDSProvider",
+      "story": "plexd reads bootstrap token from cloud provider IMDS metadata service",
+      "expected": "When UseMetadata is true and IMDSProvider returns a token, TokenResolver returns it as the fourth priority source",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/registration/token_test.go",
+      "test_function": "TestTokenResolver_IMDSFallsThrough",
+      "story": "IMDS metadata provider handles edge cases and errors gracefully",
+      "expected": "When IMDSProvider returns error, TokenResolver returns 'no bootstrap token found' error",
+      "requirement_id": "REQ-001"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-013) have corresponding passing tests",
+    "All WHEN/THEN scenarios from requirements are covered by at least one test case in test_specifications",
+    "IMDSProvider implements MetadataProvider interface from internal/registration/token.go correctly",
+    "IMDSv2 support works (PUT for session token, header on GET) and falls back gracefully to IMDSv1",
+    "All IMDS HTTP requests respect the configured timeout and context cancellation",
+    "Token validation in IMDSProvider follows the same rules as validateToken in token.go (<=512 bytes, printable ASCII)",
+    "All unit tests use httptest.Server — no real IMDS calls at 169.254.169.254 in tests",
+    "Cloud-Init user-data templates are valid YAML with #cloud-config header and use only standard modules (write_files, runcmd)",
+    "Placeholders in templates are clearly marked with REPLACE_WITH_ prefix and inline comments",
+    "Terraform examples use templatefile() for variable injection and include provider configuration",
+    "Code follows existing project patterns: Config with ApplyDefaults/Validate, log/slog with component field, injectable dependencies, stdlib-only test assertions",
+    "No sensitive data (tokens) logged at any level; IMDS token values are never included in log messages",
+    "Reference documentation (docs/reference/backend/cloud-init-vm-deployment.md) covers all Config fields, IMDS behavior, template format, and Terraform examples",
+    "How-to guide (docs/how-to/backend/cloud-vm-deployment.md) covers Cloud-Init, IMDS, and Terraform approaches with verification steps"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package location**: The IMDSProvider lives in `internal/registration/imds.go` alongside the existing TokenResolver and MetadataProvider interface. This is the natural home since it implements MetadataProvider and shares token validation logic. No new packages are created.\n\n2. **No new dependencies**: The IMDSProvider uses only stdlib: net/http, context, fmt, strings, io, log/slog. The httptest package is used in tests. No external Go dependencies are added.\n\n3. **IMDSv2 support**: AWS requires IMDSv2 for security best practices. The provider first attempts PUT /latest/api/token to get a session token. If this fails (non-AWS clouds), it falls back to IMDSv1 (plain GET without token header). This pattern works across AWS, GCP, Azure, and OpenStack — all support the /latest/user-data endpoint via their metadata services at 169.254.169.254.\n\n4. **Token resolution priority**: The existing TokenResolver already checks sources in order: direct value > file > env var > metadata. The IMDSProvider plugs into the metadata slot as the 4th priority source. No changes to TokenResolver logic are needed — only the Config gains two new fields.\n\n5. **IMDS endpoint order**: The IMDSProvider checks: (a) /latest/user-data first (the most common Cloud-Init token injection method), then (b) /latest/meta-data/{MetadataTokenPath} if configured (for custom metadata tags). User-data is universally supported; metadata tags vary by provider.\n\n6. **Timeout design**: Default 2s timeout ensures fast fallthrough on non-cloud environments. The HTTP client timeout covers both connection establishment and response read. Context cancellation is also respected via http.NewRequestWithContext.\n\n7. **Token validation**: IMDSProvider reuses the same validateToken rules from token.go. Since validateToken is unexported (lowercase) and in the same package, it can be called directly — no duplication needed.\n\n8. **Cloud-Init templates**: Two templates: (a) Full template: writes token file, writes environment file, downloads and runs install script. (b) Minimal template: writes only token file (for pre-installed plexd images). Templates use only standard Cloud-Init modules for cross-provider compatibility.\n\n9. **Terraform examples**: AWS and OpenStack are the primary targets. Examples use templatefile() for variable injection. The user-data.yaml template uses ${bootstrap_token} and ${api_url} Terraform template syntax in the examples (separate from the standalone template which uses REPLACE_WITH_ placeholders).\n\n10. **Deploy directory structure**: Following the README's project structure, cloud-init artifacts go under deploy/cloud-init/ alongside the existing deploy/systemd/ and deploy/kubernetes/ directories.\n\n11. **Security design**: SECPLAN-1: No authentication for IMDS (link-local network, accessible only from the VM). SECPLAN-2: Token validated after read (same rules as all other sources). SECPLAN-3: Tokens are never logged; only the source is logged at debug level. SECPLAN-4: Trust boundary is the IMDS link-local network (169.254.169.254) — only accessible from within the VM. IMDSv2 session tokens add defense-in-depth against SSRF attacks.\n\n12. **Potential pitfalls**:\n    - Some cloud providers return user-data as base64-encoded; however, Cloud-Init handles the decoding. When plexd reads user-data directly via IMDS, the response is plain text on AWS/GCP/OpenStack. No base64 decoding needed.\n    - The /latest/user-data endpoint may contain the full cloud-init YAML, not just the token. The IMDSProvider should handle this: if the response starts with #cloud-config, it's not a bare token — return error. Only bare token strings are accepted via IMDS user-data.\n    - Connection to 169.254.169.254 on non-cloud environments will time out (no ICMP reject). The 2s timeout prevents this from blocking startup.\n    - OpenStack metadata service may be at a different IP if using config drive instead of HTTP metadata. This is out of scope — config drive users should use the token file approach instead.\n\n13. **Relationship to F001 (bare-metal/systemd)**: The Cloud-Init user-data template invokes the install script created in F001 (deploy/install.sh). The install script handles binary download, checksum verification, and `plexd install`. Cloud-Init only adds the token provisioning and script invocation layers.\n\n14. **Key files from existing codebase**:\n    - `internal/registration/token.go:20-28` — MetadataProvider interface (the contract IMDSProvider implements)\n    - `internal/registration/token.go:98-108` — validateToken function (reused for IMDS token validation)\n    - `internal/registration/config.go` — Config struct to extend with MetadataTokenPath and MetadataTimeout\n    - `internal/registration/registrar.go:44` — SetMetadataProvider (how IMDSProvider is wired into the Registrar)\n    - `internal/registration/token_test.go:81-94` — mockMetadataProvider pattern for testing",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.113133"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:35:16.226284"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:40:56.558168"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "506f8d71-2a0b-439a-9a4c-0dc069710748",
+      "timestamp": "2026-02-12T21:40:56.558194",
+      "total_duration": 336.06751823425293,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 336.06751823425293,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
