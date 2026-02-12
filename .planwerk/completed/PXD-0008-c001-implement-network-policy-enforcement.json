@@ -2,8 +2,8 @@
   "feature_id": "PXD-0008",
   "title": "C001: Implement network policy enforcement",
   "slug": "c001-implement-network-policy-enforcement",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Receive network policies from the control plane and enforce them locally. Implement two enforcement mechanisms: peer visibility filtering (controlling which peers a node can see and connect to) and firewall rules (controlling traffic flow between peers). Policies are reconciled as part of the configuration loop.",
   "stories": [
@@ -391,13 +391,13 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/policy/config.go — Define Config struct with Enabled bool and ChainName string. Implement ApplyDefaults() (Enabled=true, ChainName='plexd-mesh' on zero-valued Config) and Validate() (reject empty ChainName when enabled, pass when disabled). Follow the same Config pattern as internal/wireguard/config.go. Include tests in config_test.go for: defaults applied, validation errors, disabled passes, custom values respected. (REQ-007)",
-    "1.2 Create internal/policy/firewall.go — Define FirewallRule struct (Interface, SrcIP, DstIP, Port int, Protocol, Action string) and FirewallController interface (ApplyRules(chainName string, rules []FirewallRule) error, DeleteChain(chainName string) error). Include mock_firewall_test.go with mockFirewallController following the mockController pattern from internal/wireguard/mock_controller_test.go. (REQ-003)",
-    "1.3 Create internal/policy/engine.go — Define PolicyEngine struct with logger. Implement FilterPeers(nodeMeshIP string, peers []api.Peer, policies []api.Policy) []api.Peer that returns only peers allowed by at least one allow rule (deny-by-default). A peer is visible if its mesh IP appears as Src or Dst in an allow rule (considering wildcards '*'). Implement ComputeFirewallRules(nodeMeshIP string, interfaceName string, policies []api.Policy) []FirewallRule that translates policy rules relevant to this node into FirewallRules, appending a default-deny rule. Invalid protocols are logged and skipped. Port=0 matches all ports, Protocol='*' matches all protocols. Include comprehensive tests in engine_test.go. (REQ-001, REQ-002, REQ-008, REQ-010)",
-    "1.4 Create internal/policy/enforcer.go — Define Enforcer struct wrapping PolicyEngine, FirewallController, wireguard.Manager, Config, and logger. Implement ApplyPolicies(ctx context.Context, nodeMeshIP string, peers []api.Peer, policies []api.Policy) (allowedPeers []api.Peer, err error) that computes and applies firewall rules, then returns filtered peers. Implement Teardown() error that calls FirewallController.DeleteChain. When Config.Enabled=false, return all peers unfiltered. Include tests in enforcer_test.go. (REQ-003, REQ-008, REQ-009)",
-    "2.1 Create internal/policy/handler.go — Define ReconcileHandler(enforcer *Enforcer, wgMgr *wireguard.Manager, nodeMeshIP string) reconcile.ReconcileHandler. The handler: (1) checks if policy or peer changes exist in diff, (2) calls enforcer.ApplyPolicies with full desired state, (3) computes peer visibility diff (currently configured vs. newly allowed), (4) removes disallowed peers via wgMgr.RemovePeerByID, (5) adds newly allowed peers via wgMgr.AddPeer. Also define HandlePolicyUpdated(reconciler *reconcile.Reconciler) api.EventHandler that calls reconciler.TriggerReconcile() on policy_updated events. Include tests in handler_test.go. (REQ-004, REQ-005, REQ-006)",
-    "3.1 Create internal/policy/handler_integration_test.go — Integration tests wiring real PolicyEngine, mock FirewallController, mock WGController, and Reconciler. Tests: full policy enforcement flow (policies arrive → firewall rules applied → peers filtered → WireGuard updated), policy removal revokes access, SSE policy_updated triggers reconcile cycle, concurrent policy and peer changes do not race (run with -race). (REQ-004, REQ-005, REQ-008)",
-    "4.1 Create docs/reference/backend/network-policy.md — Reference documentation for internal/policy/ package: Config struct, PolicyEngine (FilterPeers, ComputeFirewallRules), FirewallController interface, Enforcer struct (ApplyPolicies, Teardown), ReconcileHandler, HandlePolicyUpdated SSE handler. Include data flow diagram: control plane → policies → PolicyEngine → peer visibility + firewall rules → WireGuard + nftables. Reference integration with internal/wireguard, internal/reconcile, internal/api. (REQ-001 through REQ-010)"
+    "[done] 1.1 Create internal/policy/config.go — Define Config struct with Enabled bool and ChainName string. Implement ApplyDefaults() (Enabled=true, ChainName='plexd-mesh' on zero-valued Config) and Validate() (reject empty ChainName when enabled, pass when disabled). Follow the same Config pattern as internal/wireguard/config.go. Include tests in config_test.go for: defaults applied, validation errors, disabled passes, custom values respected. (REQ-007)",
+    "[done] 1.2 Create internal/policy/firewall.go — Define FirewallRule struct (Interface, SrcIP, DstIP, Port int, Protocol, Action string) and FirewallController interface (ApplyRules(chainName string, rules []FirewallRule) error, DeleteChain(chainName string) error). Include mock_firewall_test.go with mockFirewallController following the mockController pattern from internal/wireguard/mock_controller_test.go. (REQ-003)",
+    "[done] 1.3 Create internal/policy/engine.go — Define PolicyEngine struct with logger. Implement FilterPeers(nodeMeshIP string, peers []api.Peer, policies []api.Policy) []api.Peer that returns only peers allowed by at least one allow rule (deny-by-default). A peer is visible if its mesh IP appears as Src or Dst in an allow rule (considering wildcards '*'). Implement ComputeFirewallRules(nodeMeshIP string, interfaceName string, policies []api.Policy) []FirewallRule that translates policy rules relevant to this node into FirewallRules, appending a default-deny rule. Invalid protocols are logged and skipped. Port=0 matches all ports, Protocol='*' matches all protocols. Include comprehensive tests in engine_test.go. (REQ-001, REQ-002, REQ-008, REQ-010)",
+    "[done] 1.4 Create internal/policy/enforcer.go — Define Enforcer struct wrapping PolicyEngine, FirewallController, wireguard.Manager, Config, and logger. Implement ApplyPolicies(ctx context.Context, nodeMeshIP string, peers []api.Peer, policies []api.Policy) (allowedPeers []api.Peer, err error) that computes and applies firewall rules, then returns filtered peers. Implement Teardown() error that calls FirewallController.DeleteChain. When Config.Enabled=false, return all peers unfiltered. Include tests in enforcer_test.go. (REQ-003, REQ-008, REQ-009)",
+    "[done] 2.1 Create internal/policy/handler.go — Define ReconcileHandler(enforcer *Enforcer, wgMgr *wireguard.Manager, nodeMeshIP string) reconcile.ReconcileHandler. The handler: (1) checks if policy or peer changes exist in diff, (2) calls enforcer.ApplyPolicies with full desired state, (3) computes peer visibility diff (currently configured vs. newly allowed), (4) removes disallowed peers via wgMgr.RemovePeerByID, (5) adds newly allowed peers via wgMgr.AddPeer. Also define HandlePolicyUpdated(reconciler *reconcile.Reconciler) api.EventHandler that calls reconciler.TriggerReconcile() on policy_updated events. Include tests in handler_test.go. (REQ-004, REQ-005, REQ-006)",
+    "[done] 3.1 Create internal/policy/handler_integration_test.go — Integration tests wiring real PolicyEngine, mock FirewallController, mock WGController, and Reconciler. Tests: full policy enforcement flow (policies arrive → firewall rules applied → peers filtered → WireGuard updated), policy removal revokes access, SSE policy_updated triggers reconcile cycle, concurrent policy and peer changes do not race (run with -race). (REQ-004, REQ-005, REQ-008)",
+    "[done] 4.1 Create docs/reference/backend/network-policy.md — Reference documentation for internal/policy/ package: Config struct, PolicyEngine (FilterPeers, ComputeFirewallRules), FirewallController interface, Enforcer struct (ApplyPolicies, Teardown), ReconcileHandler, HandlePolicyUpdated SSE handler. Include data flow diagram: control plane → policies → PolicyEngine → peer visibility + firewall rules → WireGuard + nftables. Reference integration with internal/wireguard, internal/reconcile, internal/api. (REQ-001 through REQ-010)"
   ],
   "test_specifications": [
     {
@@ -595,6 +595,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T13:51:12.504792"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T14:02:37.085830"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T15:43:36.939946"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T15:43:36.953823"
     }
   },
   "execution_history": [
@@ -608,6 +620,56 @@
           "name": "prepare",
           "duration": 282.4143753051758,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "c175c74b-c998-4399-82df-b8ed6be2c06a",
+      "timestamp": "2026-02-12T14:31:32.532088",
+      "total_duration": 1545.1763207912445,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 359.6979637145996,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (1 tasks)",
+          "duration": 259.1379060745239,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 209.12356734275818,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (1 tasks)",
+          "duration": 101.75617933273315,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0008] Code Review",
+          "duration": 216.49876427650452,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0008] Improvements",
+          "duration": 288.9667127132416,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0008] Simplify",
+          "duration": 109.99522733688354,
+          "type": "simplify",
           "status": "done"
         }
       ]

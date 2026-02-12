@@ -1,0 +1,152 @@
+{
+  "feature_id": "PXD-0008",
+  "title": "C001: Implement network policy enforcement",
+  "date": "2026-02-12",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Well-structured implementation that correctly follows existing codebase patterns (Config, ReconcileHandler, EventHandler, mock patterns). Clean separation between PolicyEngine (pure logic), Enforcer (orchestration), and ReconcileHandler (reconcile integration). All 42 tests pass with -race, 92.9% coverage, go vet clean. However, three requirement deviations prevent approval: (1) FilterPeers returns all peers on empty policies instead of enforcing deny-by-default as specified by REQ-001/REQ-008, (2) no default-deny firewall rule is appended as required by REQ-002, and (3) invalid protocols are not validated/skipped during rule building as required by REQ-002.",
+  "tests_checklist": [
+    {"item": "All tests pass (42/42 with -race)", "checked": true},
+    {"item": "go vet clean", "checked": true},
+    {"item": "Test coverage >= 90% (92.9%)", "checked": true},
+    {"item": "Config defaults and validation tested", "checked": true},
+    {"item": "FilterPeers edge cases tested (wildcard, bidirectional, deny-only)", "checked": true},
+    {"item": "BuildFirewallRules tested (basic, wildcard src, irrelevant rules)", "checked": true},
+    {"item": "Enforcer disabled/enabled/nil-firewall tested", "checked": true},
+    {"item": "Enforcer error propagation tested (EnsureChain, ApplyRules, Flush)", "checked": true},
+    {"item": "ReconcileHandler drift detection, add/remove/skip tested", "checked": true},
+    {"item": "SSE handler tested (valid + malformed payload)", "checked": true},
+    {"item": "Integration tests: full flow, policy removal, SSE trigger, race detector", "checked": true},
+    {"item": "Empty policies deny-by-default scenario tested per REQ-001/REQ-008", "checked": false},
+    {"item": "Default-deny firewall rule appended per REQ-002", "checked": false},
+    {"item": "Invalid protocol rules logged and skipped per REQ-002", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "Functions are focused and single-responsibility", "checked": true},
+    {"item": "Functions are reasonably sized (<40 lines)", "checked": true},
+    {"item": "Clear, intention-revealing naming", "checked": true},
+    {"item": "No code duplication", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": false},
+    {"item": "Follows existing Config pattern (ApplyDefaults/Validate)", "checked": true},
+    {"item": "Follows existing ReconcileHandler pattern", "checked": true},
+    {"item": "Follows existing EventHandler pattern", "checked": true},
+    {"item": "Follows existing mock pattern for tests", "checked": true},
+    {"item": "Uses log/slog with component key", "checked": true},
+    {"item": "Uses errors.Join for error aggregation", "checked": true},
+    {"item": "stdlib-only test dependencies", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "FirewallRule.Validate validates action, port, protocol", "checked": true},
+    {"item": "Config.Validate rejects empty ChainName when enabled", "checked": true},
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "No sensitive data in logs", "checked": true},
+    {"item": "Deny-by-default enforced for empty policies", "checked": false},
+    {"item": "Default-deny firewall rule prevents unauthorized traffic", "checked": false}
+  ],
+  "architecture_checklist": [
+    {"item": "Clean separation: PolicyEngine (logic) / Enforcer (orchestration) / Handler (integration)", "checked": true},
+    {"item": "FirewallController interface mirrors WGController abstraction", "checked": true},
+    {"item": "ReconcileTrigger interface enables testability of SSE handler", "checked": true},
+    {"item": "Handler uses closure for peer state tracking (same concurrency model as reconciler)", "checked": true},
+    {"item": "SSE handler delegates to reconciler.TriggerReconcile (not direct application)", "checked": true},
+    {"item": "Solution is as simple as possible", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code", "checked": true},
+    {"item": "No premature abstractions", "checked": true},
+    {"item": "No unused exports or functions", "checked": true},
+    {"item": "No future-proofing beyond requirements", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config validated before use", "checked": true},
+    {"item": "Firewall errors propagated immediately", "checked": true},
+    {"item": "Handler skips early on no-drift", "checked": true},
+    {"item": "Enforcer short-circuits when disabled", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Nil firewall handled gracefully", "checked": true},
+    {"item": "Partial failures aggregated via errors.Join", "checked": true},
+    {"item": "Peer processing continues despite firewall failure", "checked": true},
+    {"item": "Malformed SSE payloads don't crash (TriggerReconcile still called)", "checked": true}
+  ],
+  "security_findings": [
+    {
+      "severity": "HIGH",
+      "description": "FilterPeers returns ALL peers when policies list is empty, violating deny-by-default (REQ-001, REQ-008). This means a node with no policies configured can see and connect to every peer in the mesh, which is the opposite of the required security posture.",
+      "location": "internal/policy/engine.go:26-29",
+      "fix": "Change the empty-policies branch to return nil (empty slice) instead of returning all peers. Update TestFilterPeers_NoPoliciesReturnsAll to assert 0 peers returned."
+    },
+    {
+      "severity": "HIGH",
+      "description": "No default-deny firewall rule is appended to the generated rule set (REQ-002). Without a trailing deny-all rule, any traffic not matching an explicit allow rule will be handled by the system default (typically ACCEPT), defeating the purpose of firewall enforcement.",
+      "location": "internal/policy/engine.go:77-123",
+      "fix": "Append a FirewallRule{Interface: iface, Action: \"deny\"} as the last rule in BuildFirewallRules. Add a test TestBuildFirewallRules_DefaultDenyAppended."
+    }
+  ],
+  "architecture_findings": [
+    {
+      "severity": "MEDIUM",
+      "description": "ChainName default is 'PLEXD-POLICY' in code (config.go:7) but the specification/stories consistently say 'plexd-mesh'. Operators following the spec documentation will expect a different chain name.",
+      "location": "internal/policy/config.go:7",
+      "fix": "Align DefaultChainName with the specification: either change to 'plexd-mesh' or update the progress JSON stories to reflect 'PLEXD-POLICY'."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "C1-DENY-DEFAULT",
+      "severity": "blocker",
+      "check_id": "C2",
+      "file": "internal/policy/engine.go",
+      "line": 26,
+      "description": "FilterPeers returns all peers on empty policies (open mesh) instead of returning empty list (deny-by-default). Violates REQ-001 scenario 'Empty policy set denies all peers', REQ-008 scenario 'No policies means no access', and review criteria 'Deny-by-default semantics enforced'.",
+      "fix": "Replace `return peers` with `return nil` in the empty-policies branch. Fix TestFilterPeers_NoPoliciesReturnsAll to assert len(got) == 0."
+    },
+    {
+      "id": "C2-DEFAULT-DENY-RULE",
+      "severity": "blocker",
+      "check_id": "C2",
+      "file": "internal/policy/engine.go",
+      "line": 122,
+      "description": "BuildFirewallRules does not append a default-deny firewall rule. REQ-002 scenario 'Default deny rule appended' requires 'a default deny rule dropping all traffic on the WireGuard interface is appended as the last rule'.",
+      "fix": "Before returning, append: rules = append(rules, FirewallRule{Interface: iface, Action: \"deny\"}). Add test TestBuildFirewallRules_DefaultDenyAppended."
+    },
+    {
+      "id": "C3-INVALID-PROTOCOL",
+      "severity": "major",
+      "check_id": "C3",
+      "file": "internal/policy/engine.go",
+      "line": 82,
+      "description": "BuildFirewallRules does not validate protocols. REQ-002 scenario 'Rules for unknown protocols are skipped' requires invalid protocols to be logged at warn level and skipped. Currently any protocol string passes through unvalidated.",
+      "fix": "Before appending a rule, call FirewallRule.Validate(). If invalid, log at warn level and continue (skip the rule). Add test TestBuildFirewallRules_InvalidProtocolSkipped."
+    },
+    {
+      "id": "Q7-DEAD-CODE",
+      "severity": "minor",
+      "check_id": "Q7",
+      "file": "internal/policy/handler_test.go",
+      "line": 246,
+      "description": "Lines 245-252 contain dead code: desired2 is assigned on line 245, then immediately reassigned on line 253. The comment block documents the design rationale but the initial assignment is unreachable code.",
+      "fix": "Remove the first desired2 assignment (lines 245-252) and keep only the reassigned version with a brief comment explaining why a replacement policy is used instead of empty policies."
+    },
+    {
+      "id": "D1-CHAINNAME-DEFAULT",
+      "severity": "minor",
+      "check_id": "D1",
+      "file": "internal/policy/config.go",
+      "line": 7,
+      "description": "DefaultChainName is 'PLEXD-POLICY' but specification stories say 'plexd-mesh'. Cosmetic mismatch that could confuse operators.",
+      "fix": "Align code and specification. Recommend updating stories to match the code since PLEXD-POLICY is a more conventional iptables chain name format."
+    }
+  ],
+  "suggested_improvements": [
+    "Consider adding a test for BuildFirewallRules with both-wildcards scenario (Src='*', Dst='*') to verify the resolveWildcard path",
+    "Integration test for policy enforcement when Enforcer.Config.Enabled=false (verifying full passthrough behavior end-to-end)",
+    "The Config.ApplyDefaults heuristic (ChainName='' implies zero-value, so Enabled=true) is fragile - document the canonical way to disable enforcement in the reference docs"
+  ],
+  "next_steps": [
+    "Fix FilterPeers to return empty list on empty policies (deny-by-default) - update engine.go:26-29 and TestFilterPeers_NoPoliciesReturnsAll",
+    "Add default-deny FirewallRule at end of BuildFirewallRules output - update engine.go and add test",
+    "Add protocol/port validation in BuildFirewallRules loop with warn logging for invalid rules - update engine.go and add test",
+    "Remove dead code in handler_test.go:245-252",
+    "Align ChainName default between code and specification"
+  ]
+}
