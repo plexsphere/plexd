@@ -45,8 +45,9 @@ type HeartbeatRequest struct {
 	Status         string    `json:"status"`
 	Uptime         string    `json:"uptime"`
 	BinaryChecksum string    `json:"binary_checksum"`
-	Mesh           *MeshInfo `json:"mesh,omitempty"`
-	NAT            *NATInfo  `json:"nat,omitempty"`
+	Mesh           *MeshInfo   `json:"mesh,omitempty"`
+	NAT            *NATInfo    `json:"nat,omitempty"`
+	Bridge         *BridgeInfo `json:"bridge,omitempty"`
 }
 
 type MeshInfo struct {
@@ -73,9 +74,10 @@ type StateResponse struct {
 	Peers       []Peer            `json:"peers"`
 	Policies    []Policy          `json:"policies"`
 	SigningKeys *SigningKeys       `json:"signing_keys,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	Data        []DataEntry       `json:"data"`
-	SecretRefs  []SecretRef       `json:"secret_refs"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+	BridgeConfig *BridgeConfig     `json:"bridge_config,omitempty"`
+	Data         []DataEntry       `json:"data"`
+	SecretRefs   []SecretRef       `json:"secret_refs"`
 }
 
 type Policy struct {
@@ -333,4 +335,22 @@ type IntegrityViolationReport struct {
 	ActualChecksum   string    `json:"actual_checksum"`
 	Detail           string    `json:"detail"`
 	Timestamp        time.Time `json:"timestamp"`
+}
+
+// ---------------------------------------------------------------------------
+// Bridge Mode
+// ---------------------------------------------------------------------------
+
+// BridgeConfig is the bridge configuration pushed from the control plane.
+type BridgeConfig struct {
+	AccessSubnets    []string `json:"access_subnets"`
+	EnableNAT        bool     `json:"enable_nat"`
+	EnableForwarding bool     `json:"enable_forwarding"`
+}
+
+// BridgeInfo is the bridge status reported by the node in heartbeats.
+type BridgeInfo struct {
+	Enabled         bool   `json:"enabled"`
+	AccessInterface string `json:"access_interface"`
+	ActiveRoutes    int    `json:"active_routes"`
 }

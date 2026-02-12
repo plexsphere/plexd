@@ -334,3 +334,96 @@ func searchSubstring(s, substr string) bool {
 	}
 	return false
 }
+
+func TestBridgeConfig_JSONRoundTrip(t *testing.T) {
+	orig := BridgeConfig{
+		AccessSubnets:    []string{"192.168.1.0/24", "10.0.0.0/8"},
+		EnableNAT:        true,
+		EnableForwarding: true,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"access_subnets", "enable_nat", "enable_forwarding"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestBridgeInfo_JSONRoundTrip(t *testing.T) {
+	orig := BridgeInfo{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		ActiveRoutes:    5,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"enabled", "access_interface", "active_routes"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestHeartbeatRequest_WithBridge(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := HeartbeatRequest{
+		NodeID:         "n-001",
+		Timestamp:      now,
+		Status:         "healthy",
+		Uptime:         "1h10m",
+		BinaryChecksum: "sha256:abc",
+		Bridge: &BridgeInfo{
+			Enabled:         true,
+			AccessInterface: "eth1",
+			ActiveRoutes:    3,
+		},
+	}
+	_, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Bridge field should be omitted when nil.
+	orig.Bridge = nil
+	data, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data); contains(s, `"bridge"`) {
+		t.Errorf("bridge should be omitted when nil, got: %s", s)
+	}
+}
+
+func TestStateResponse_WithBridgeConfig(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := StateResponse{
+		Peers:    []Peer{{ID: "n-002", PublicKey: "pk", MeshIP: "10.42.0.2", Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.42.0.2/32"}, PSK: "psk"}},
+		Policies: []Policy{},
+		BridgeConfig: &BridgeConfig{
+			AccessSubnets:    []string{"192.168.1.0/24"},
+			EnableNAT:        true,
+			EnableForwarding: false,
+		},
+		Data:       []DataEntry{{Key: "k", ContentType: "text/plain", Payload: json.RawMessage(`"v"`), Version: 1, UpdatedAt: now}},
+		SecretRefs: []SecretRef{},
+	}
+	_, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// BridgeConfig field should be omitted when nil.
+	orig.BridgeConfig = nil
+	data, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data); contains(s, `"bridge_config"`) {
+		t.Errorf("bridge_config should be omitted when nil, got: %s", s)
+	}
+}

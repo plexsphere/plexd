@@ -1,0 +1,121 @@
+{
+  "feature_id": "PXD-0011",
+  "title": "D001: Implement bridge mode core functionality",
+  "date": "2026-02-12",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Bridge mode implementation provides Config, RouteController interface, Manager lifecycle (Setup/Teardown/UpdateRoutes), ReconcileHandler, and SSE handler. API types (BridgeConfig, BridgeInfo) added with JSON round-trip tests. Integration tests exercise full reconciliation flow, setup/teardown lifecycle, and concurrent race safety. Documentation covers all public types and integration patterns. Two correctness issues found: Setup leaks state on NAT failure, and ApplyDefaults prevents disabling NAT.",
+  "tests_checklist": [
+    {"item": "Tests exist and pass (26 tests, all green, -race clean)", "checked": true},
+    {"item": "Happy path tested (Setup, Teardown, UpdateRoutes, BridgeStatus, BridgeCapabilities)", "checked": true},
+    {"item": "Edge cases covered (disabled config, idempotent teardown, partial failure)", "checked": true},
+    {"item": "Error paths tested (route failure rollback, partial teardown failure)", "checked": true},
+    {"item": "Integration tests with real Reconciler (full flow, setup/teardown, concurrent race)", "checked": true},
+    {"item": "JSON round-trip tests for API types (BridgeConfig, BridgeInfo, omitempty)", "checked": true},
+    {"item": "goleak.VerifyTestMain present (required by project pattern)", "checked": false},
+    {"item": "NAT failure path in Setup tested (routes+forwarding leaked)", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing Config pattern (ApplyDefaults/Validate)", "checked": true},
+    {"item": "RouteController follows WGController/FirewallController abstraction pattern", "checked": true},
+    {"item": "ReconcileHandler follows wireguard.ReconcileHandler pattern", "checked": true},
+    {"item": "HandleBridgeConfigUpdated follows HandlePolicyUpdated SSE pattern", "checked": true},
+    {"item": "Manager uses errors.Join for teardown error aggregation", "checked": true},
+    {"item": "Setup performs rollback on partial route failure", "checked": true},
+    {"item": "Logging uses slog with component key", "checked": true},
+    {"item": "stdlib-only test dependencies (no testify)", "checked": true},
+    {"item": "Mock uses sync.Mutex for concurrent test safety", "checked": true},
+    {"item": "No dead code or unnecessary abstractions", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "CIDR inputs validated via net.ParseCIDR", "checked": true},
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "No path traversal or injection risks", "checked": true},
+    {"item": "Interface names passed through without shell execution", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Clean separation: Config, RouteController interface, Manager, handlers", "checked": true},
+    {"item": "RouteController interface enables full testing without root/kernel", "checked": true},
+    {"item": "ReconcileTrigger interface decouples handler from concrete Reconciler", "checked": true},
+    {"item": "Bridge handler delegates to TriggerReconcile (not direct state mutation)", "checked": true},
+    {"item": "Manager tracks state (activeRoutes, natConfigured) for diff-based updates", "checked": true},
+    {"item": "Solution is as simple as possible (no over-engineering)", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated production code", "checked": true},
+    {"item": "No unused exported types or methods", "checked": true},
+    {"item": "No future-proofing beyond requirements", "checked": true},
+    {"item": "Test helpers (contains/searchSubstring) duplicated from api/types_test.go instead of using strings.Contains", "checked": false}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Validation rejects invalid config early", "checked": true},
+    {"item": "Setup returns immediately when disabled", "checked": true},
+    {"item": "Teardown returns immediately when inactive", "checked": true},
+    {"item": "Setup rolls back on route failure", "checked": true},
+    {"item": "Setup does NOT rollback on NAT failure (routes+forwarding leaked)", "checked": false}
+  ],
+  "defensive_checklist": [
+    {"item": "CIDR validation on all subnet inputs", "checked": true},
+    {"item": "Nil checks on desired state in ReconcileHandler", "checked": true},
+    {"item": "Idempotent Teardown (no-op when inactive)", "checked": true},
+    {"item": "ApplyDefaults cannot produce EnableNAT=false (design flaw)", "checked": false}
+  ],
+  "security_findings": [],
+  "architecture_findings": [
+    {
+      "severity": "MINOR",
+      "description": "Manager is not thread-safe (no mutex on activeRoutes, active, natConfigured). This is consistent with wireguard.Manager and policy.Enforcer patterns which rely on serial invocation from the Reconciler. Acceptable as-is but worth documenting.",
+      "location": "internal/bridge/manager.go:12-22",
+      "fix": "No fix needed — matches existing project pattern. Consider adding a comment noting single-goroutine access assumption."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "C3-1",
+      "severity": "critical",
+      "check_id": "C3",
+      "file": "internal/bridge/manager.go",
+      "line": "87-92",
+      "description": "Setup does not rollback routes and forwarding when AddNATMasquerade fails. After NAT failure: routes are in activeRoutes, forwarding is enabled, but m.active=false. Subsequent Teardown() returns nil due to !m.active guard, permanently leaking routes and forwarding rules.",
+      "fix": "Add rollback logic after NAT failure: remove all added routes (reverse order), disable forwarding, clear activeRoutes. Same pattern as the existing route-failure rollback at lines 60-76."
+    },
+    {
+      "id": "C3-2",
+      "severity": "critical",
+      "check_id": "C3",
+      "file": "internal/bridge/config.go",
+      "line": "27-31",
+      "description": "ApplyDefaults unconditionally sets EnableNAT=true when it is false. Since bool zero-value is false, there is no way to distinguish 'not set' from 'explicitly set to false'. A caller constructing Config{Enabled: true, EnableNAT: false, ...} will have EnableNAT overridden to true by NewManager. Test TestManager_Setup_WithoutNAT works around this by directly mutating mgr.cfg.EnableNAT after construction.",
+      "fix": "Use a *bool or sentinel pattern (like policy.Config uses ChainName==\"\" to detect zero-value), OR change EnableNAT to DisableNAT (invert semantics so zero-value=false means NAT enabled). Simplest: use a pointer *bool where nil means 'use default (true)' and explicit false means 'disabled'."
+    },
+    {
+      "id": "P1-1",
+      "severity": "major",
+      "check_id": "P1",
+      "file": "internal/bridge",
+      "line": "-",
+      "description": "Missing goleak.VerifyTestMain. Every other package with integration tests (api, reconcile, tunnel, integrity) has a leak_test.go with goleak.VerifyTestMain(m). The bridge package launches goroutines via reconciler in integration tests but has no goroutine leak detection.",
+      "fix": "Add internal/bridge/leak_test.go with TestMain calling goleak.VerifyTestMain(m), following the exact pattern from internal/api/leak_test.go."
+    },
+    {
+      "id": "TE7-1",
+      "severity": "major",
+      "check_id": "TE7",
+      "file": "internal/bridge/manager_test.go",
+      "line": "116-143",
+      "description": "TestManager_Setup_WithoutNAT bypasses the public API by directly mutating mgr.cfg.EnableNAT=false after construction. This tests internal state rather than the intended public interface, and masks the ApplyDefaults design flaw (C3-2).",
+      "fix": "After fixing C3-2, rewrite this test to construct Config with EnableNAT explicitly disabled through the public API."
+    }
+  ],
+  "suggested_improvements": [
+    "MINOR (Q3): config_test.go duplicates contains/searchSubstring helpers. Use strings.Contains from stdlib instead — it already exists and is simpler.",
+    "MINOR (D2): Add a brief comment on Manager struct noting it is not concurrent-safe and relies on serial invocation from the reconcile loop, matching the implicit pattern in wireguard/policy packages.",
+    "MINOR: The whitespace alignment changes in types.go (Metadata, Data, SecretRefs field indentation) and envelope.go (EventNodeSecretsUpdated) are cosmetic — consider reverting to minimize diff noise."
+  ],
+  "next_steps": [
+    "Fix C3-1: Add rollback in Setup when AddNATMasquerade fails (remove routes, disable forwarding, clear activeRoutes)",
+    "Fix C3-2: Change EnableNAT to *bool (nil=default true, explicit false=disabled) or invert to DisableNAT",
+    "Fix P1-1: Add internal/bridge/leak_test.go with goleak.VerifyTestMain",
+    "Fix TE7-1: Rewrite TestManager_Setup_WithoutNAT to use public API after C3-2 fix",
+    "Add test for NAT failure path verifying routes and forwarding are cleaned up"
+  ]
+}

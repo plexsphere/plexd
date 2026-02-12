@@ -23,7 +23,8 @@ const (
 	EventRotateKeys          = "rotate_keys"
 	EventSigningKeyRotated   = "signing_key_rotated"
 	EventNodeStateUpdated    = "node_state_updated"
-	EventNodeSecretsUpdated  = "node_secrets_updated"
+	EventNodeSecretsUpdated    = "node_secrets_updated"
+	EventBridgeConfigUpdated   = "bridge_config_updated"
 )
 
 // ---------------------------------------------------------------------------

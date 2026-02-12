@@ -2,8 +2,8 @@
   "feature_id": "PXD-0011",
   "title": "D001: Implement bridge mode core functionality",
   "slug": "d001-implement-bridge-mode-core-functionality",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Implement the bridge/gateway operating mode for plexd. A bridge node has both a mesh-side interface (participating in the WireGuard mesh) and an access-side interface (connecting to external networks). Handle dual-interface routing, traffic forwarding between mesh and external networks, and bridge-specific registration with the control plane.",
   "stories": [
@@ -416,13 +416,13 @@
     }
   ],
   "tasks": [
-    "1.1 Add BridgeConfig and BridgeInfo API types to internal/api/types.go — BridgeConfig struct (AccessSubnets []string, EnableNAT bool, EnableForwarding bool) for StateResponse.BridgeConfig field. BridgeInfo struct (Enabled bool, AccessInterface string, ActiveRoutes int) for HeartbeatRequest.Bridge field. Add BridgeConfig *BridgeConfig field to StateResponse. Add Bridge *BridgeInfo field to HeartbeatRequest. Add bridge_config_updated event constant to envelope.go. Include JSON round-trip tests in types_test.go. (REQ-007, REQ-008)",
-    "1.2 Create internal/bridge/config.go — Config struct with Enabled bool, AccessInterface string, AccessSubnets []string, EnableNAT bool. Implement ApplyDefaults() (Enabled=false, EnableNAT=true for zero-value). Implement Validate() (skip if disabled; reject empty AccessInterface, empty AccessSubnets, invalid CIDR). Follow wireguard.Config/policy.Config pattern. Include tests in config_test.go. (REQ-001)",
-    "1.3 Create internal/bridge/route.go — RouteController interface with EnableForwarding(meshIface, accessIface string) error, DisableForwarding(meshIface, accessIface string) error, AddRoute(subnet, iface string) error, RemoveRoute(subnet, iface string) error, AddNATMasquerade(iface string) error, RemoveNATMasquerade(iface string) error. Create mock_route_test.go with mockRouteController for tests. Follow wireguard.WGController/policy.FirewallController interface pattern. (REQ-002)",
-    "1.4 Create internal/bridge/manager.go — Manager struct holding RouteController, Config, logger, and tracked state (active bool, activeRoutes map[string]struct{}, natConfigured bool). Implement NewManager(ctrl RouteController, cfg Config, logger *slog.Logger) *Manager. Implement Setup(meshIface string) error (enable forwarding, add routes with rollback on failure, add NAT if enabled, mark active). Implement Teardown() error (remove routes, NAT, forwarding with errors.Join aggregation, mark inactive). Implement UpdateRoutes(subnets []string) error (compute diff of current vs desired subnets, add new, remove stale). Implement BridgeStatus() *api.BridgeInfo and BridgeCapabilities() map[string]string. Include tests in manager_test.go. (REQ-003, REQ-004, REQ-009, REQ-010)",
-    "2.1 Create internal/bridge/handler.go — ReconcileHandler(mgr *Manager) reconcile.ReconcileHandler that extracts BridgeConfig from desired state and calls mgr.UpdateRoutes with the desired subnets. HandleBridgeConfigUpdated(trigger ReconcileTrigger) api.EventHandler that calls trigger.TriggerReconcile() on bridge_config_updated events. Define ReconcileTrigger interface matching policy.ReconcileTrigger pattern. Include tests in handler_test.go. (REQ-005, REQ-006)",
-    "3.1 Create internal/bridge/handler_integration_test.go — Integration tests wiring Manager with mock RouteController and real Reconciler. Test full reconciliation flow: state with BridgeConfig → diff computation → bridge handler adds/removes routes. Test setup + reconcile + teardown lifecycle. Test concurrent bridge and peer changes with -race. (REQ-003, REQ-004, REQ-005)",
-    "4.1 Create docs/reference/backend/bridge-mode.md — Reference documentation for internal/bridge package: Config struct with fields and defaults, Manager lifecycle (Setup, Teardown, UpdateRoutes, BridgeStatus), RouteController interface, ReconcileHandler, HandleBridgeConfigUpdated SSE handler. Include data flow diagram: mesh peers → WireGuard interface → bridge Manager → access-side interface → external network. Integration with wireguard, policy, reconcile, api packages. (REQ-001 through REQ-011)"
+    "[done] 1.1 Add BridgeConfig and BridgeInfo API types to internal/api/types.go — BridgeConfig struct (AccessSubnets []string, EnableNAT bool, EnableForwarding bool) for StateResponse.BridgeConfig field. BridgeInfo struct (Enabled bool, AccessInterface string, ActiveRoutes int) for HeartbeatRequest.Bridge field. Add BridgeConfig *BridgeConfig field to StateResponse. Add Bridge *BridgeInfo field to HeartbeatRequest. Add bridge_config_updated event constant to envelope.go. Include JSON round-trip tests in types_test.go. (REQ-007, REQ-008)",
+    "[done] 1.2 Create internal/bridge/config.go — Config struct with Enabled bool, AccessInterface string, AccessSubnets []string, EnableNAT bool. Implement ApplyDefaults() (Enabled=false, EnableNAT=true for zero-value). Implement Validate() (skip if disabled; reject empty AccessInterface, empty AccessSubnets, invalid CIDR). Follow wireguard.Config/policy.Config pattern. Include tests in config_test.go. (REQ-001)",
+    "[done] 1.3 Create internal/bridge/route.go — RouteController interface with EnableForwarding(meshIface, accessIface string) error, DisableForwarding(meshIface, accessIface string) error, AddRoute(subnet, iface string) error, RemoveRoute(subnet, iface string) error, AddNATMasquerade(iface string) error, RemoveNATMasquerade(iface string) error. Create mock_route_test.go with mockRouteController for tests. Follow wireguard.WGController/policy.FirewallController interface pattern. (REQ-002)",
+    "[done] 1.4 Create internal/bridge/manager.go — Manager struct holding RouteController, Config, logger, and tracked state (active bool, activeRoutes map[string]struct{}, natConfigured bool). Implement NewManager(ctrl RouteController, cfg Config, logger *slog.Logger) *Manager. Implement Setup(meshIface string) error (enable forwarding, add routes with rollback on failure, add NAT if enabled, mark active). Implement Teardown() error (remove routes, NAT, forwarding with errors.Join aggregation, mark inactive). Implement UpdateRoutes(subnets []string) error (compute diff of current vs desired subnets, add new, remove stale). Implement BridgeStatus() *api.BridgeInfo and BridgeCapabilities() map[string]string. Include tests in manager_test.go. (REQ-003, REQ-004, REQ-009, REQ-010)",
+    "[done] 2.1 Create internal/bridge/handler.go — ReconcileHandler(mgr *Manager) reconcile.ReconcileHandler that extracts BridgeConfig from desired state and calls mgr.UpdateRoutes with the desired subnets. HandleBridgeConfigUpdated(trigger ReconcileTrigger) api.EventHandler that calls trigger.TriggerReconcile() on bridge_config_updated events. Define ReconcileTrigger interface matching policy.ReconcileTrigger pattern. Include tests in handler_test.go. (REQ-005, REQ-006)",
+    "[done] 3.1 Create internal/bridge/handler_integration_test.go — Integration tests wiring Manager with mock RouteController and real Reconciler. Test full reconciliation flow: state with BridgeConfig → diff computation → bridge handler adds/removes routes. Test setup + reconcile + teardown lifecycle. Test concurrent bridge and peer changes with -race. (REQ-003, REQ-004, REQ-005)",
+    "[done] 4.1 Create docs/reference/backend/bridge-mode.md — Reference documentation for internal/bridge package: Config struct with fields and defaults, Manager lifecycle (Setup, Teardown, UpdateRoutes, BridgeStatus), RouteController interface, ReconcileHandler, HandleBridgeConfigUpdated SSE handler. Include data flow diagram: mesh peers → WireGuard interface → bridge Manager → access-side interface → external network. Integration with wireguard, policy, reconcile, api packages. (REQ-001 through REQ-011)"
   ],
   "test_specifications": [
     {
@@ -629,6 +629,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T17:37:10.175753"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T17:39:03.895767"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T18:11:00.379034"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T18:11:00.394080"
     }
   },
   "execution_history": [
@@ -642,6 +654,56 @@
           "name": "prepare",
           "duration": 340.0516393184662,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "35d6b402-5951-4d87-b62a-ff7df33168e6",
+      "timestamp": "2026-02-12T18:07:38.839741",
+      "total_duration": 1545.4987118244171,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 478.76912355422974,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (1 tasks)",
+          "duration": 109.04365348815918,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 114.12370157241821,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (1 tasks)",
+          "duration": 176.35827136039734,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0011] Code Review",
+          "duration": 201.66757941246033,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0011] Improvements",
+          "duration": 285.1646308898926,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0011] Simplify",
+          "duration": 180.37175154685974,
+          "type": "simplify",
           "status": "done"
         }
       ]
