@@ -1,0 +1,595 @@
+{
+  "feature_id": "PXD-0016",
+  "title": "E001: Add metrics collection and reporting",
+  "slug": "e001-add-metrics-collection-and-reporting",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Collect and report node metrics to the control plane: tunnel health, peer latency, resource utilization (CPU, memory, disk, network), and mesh-specific metrics (handshake success rates, packet loss). Enable centralized monitoring dashboards.",
+  "stories": [
+    {
+      "title": "Platform operator sees node resource utilization metrics in the control plane",
+      "role": "platform operator",
+      "want": "to view CPU, memory, disk, and network utilization metrics collected from each node",
+      "so_that": "I can monitor node health and plan capacity across the fleet",
+      "criteria": [
+        "Collector gathers CPU usage percentage (user, system, idle) via /proc/stat or runtime metrics",
+        "Collector gathers memory usage (total, used, available) via /proc/meminfo or runtime.MemStats",
+        "Collector gathers disk usage (total, used, available) for the root filesystem",
+        "Collector gathers network interface counters (bytes sent/received, packets, errors) for the WireGuard interface",
+        "Each metric point includes a timestamp, group identifier, and JSON data payload matching the api.MetricPoint schema",
+        "Metrics are batched and sent to the control plane via POST /v1/nodes/{node_id}/metrics at a configurable interval"
+      ]
+    },
+    {
+      "title": "Platform operator sees WireGuard tunnel health metrics",
+      "role": "platform operator",
+      "want": "to view per-peer tunnel health metrics including handshake status and transfer counters",
+      "so_that": "I can detect connectivity issues between mesh nodes before they impact workloads",
+      "criteria": [
+        "Collector reports per-peer last handshake timestamp",
+        "Collector reports per-peer transfer bytes (sent/received)",
+        "Collector reports per-peer handshake success rate (successful vs failed over collection window)",
+        "Each per-peer metric point includes the peer_id field in the api.MetricPoint",
+        "Stale handshakes (older than a configurable threshold) are flagged in the metric data"
+      ]
+    },
+    {
+      "title": "Platform operator sees peer latency metrics",
+      "role": "platform operator",
+      "want": "to view measured latency to each mesh peer",
+      "so_that": "I can identify high-latency paths and optimize mesh routing",
+      "criteria": [
+        "Collector performs ICMP or UDP-based latency probes to each peer's mesh IP at a configurable interval",
+        "Latency is reported as round-trip time in milliseconds",
+        "Unreachable peers report latency as -1 with a loss indicator",
+        "Per-peer latency metric points include the peer_id field"
+      ]
+    },
+    {
+      "title": "Platform operator sees packet loss metrics",
+      "role": "platform operator",
+      "want": "to view packet loss rates between mesh peers",
+      "so_that": "I can detect degraded links and investigate network issues",
+      "criteria": [
+        "Collector tracks packets sent and received per peer from WireGuard interface counters",
+        "Packet loss percentage is computed per collection interval",
+        "Metric data includes packets_sent, packets_received, and loss_percent fields"
+      ]
+    },
+    {
+      "title": "Node continues operating normally when metrics reporting fails",
+      "role": "platform operator",
+      "want": "metrics collection failures to not affect core mesh functionality",
+      "so_that": "transient control plane issues do not degrade the mesh",
+      "criteria": [
+        "Collector logs a warning when ReportMetrics fails but does not return an error to the run loop",
+        "Collector continues collecting on the next interval after a reporting failure",
+        "Collector does not accumulate unbounded metric data when the control plane is unreachable",
+        "Collector gracefully stops when its context is cancelled"
+      ]
+    },
+    {
+      "title": "Operator configures metrics collection behavior",
+      "role": "operator",
+      "want": "to configure collection interval, enabled collectors, and batch size",
+      "so_that": "I can tune metrics overhead based on environment constraints",
+      "criteria": [
+        "Config struct has Enabled, CollectInterval, ReportInterval, and BatchSize fields with sensible defaults",
+        "Config.ApplyDefaults() sets CollectInterval=30s, ReportInterval=60s, BatchSize=100",
+        "Config.Validate() rejects CollectInterval < 10s, ReportInterval < CollectInterval, BatchSize < 1",
+        "When Enabled=false, the collector Run method returns immediately without error"
+      ]
+    },
+    {
+      "title": "Developer extends metrics with new collector types",
+      "role": "developer",
+      "want": "a Collector interface that allows adding new metric sources without modifying the core loop",
+      "so_that": "future metrics (e.g., application-level) can be added cleanly",
+      "criteria": [
+        "A Collector interface is defined with a Collect(ctx) ([]api.MetricPoint, error) method",
+        "The Manager accepts multiple Collector implementations and invokes them all during each collection cycle",
+        "Individual collector errors are logged and skipped; other collectors still run",
+        "New collector implementations require no changes to the Manager"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL collect node resource utilization metrics (CPU, memory, disk, network) at the configured CollectInterval",
+      "priority": "SHALL",
+      "rationale": "Resource utilization is essential for capacity planning and health monitoring across the fleet",
+      "scenarios": [
+        {
+          "name": "Resource metrics collected on interval",
+          "when": "the CollectInterval elapses",
+          "then": "the system collects CPU, memory, disk, and network metrics",
+          "and_then": [
+            "each metric is a valid api.MetricPoint with group='system'",
+            "timestamp is set to the collection time"
+          ]
+        },
+        {
+          "name": "Partial collection on source error",
+          "when": "one system metric source fails (e.g., /proc/meminfo unreadable)",
+          "then": "the collector logs a warning and continues collecting other sources",
+          "and_then": [
+            "successfully collected metrics are still returned"
+          ]
+        },
+        {
+          "name": "Collection skipped when disabled",
+          "when": "the config Enabled=false",
+          "then": "no collection occurs and Run returns nil immediately",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The system SHALL collect per-peer WireGuard tunnel health metrics including handshake timestamps and transfer counters",
+      "priority": "SHALL",
+      "rationale": "Tunnel health is the primary indicator of mesh connectivity and must be monitored per-peer",
+      "scenarios": [
+        {
+          "name": "Tunnel metrics collected per peer",
+          "when": "WireGuard peers are configured and the CollectInterval elapses",
+          "then": "the system collects handshake time and transfer bytes for each peer",
+          "and_then": [
+            "each metric is a valid api.MetricPoint with group='tunnel' and peer_id set"
+          ]
+        },
+        {
+          "name": "Stale handshake detected",
+          "when": "a peer's last handshake is older than the configured stale threshold (default 5 minutes)",
+          "then": "the metric data includes handshake_stale=true",
+          "and_then": [
+            "the metric is still reported normally"
+          ]
+        },
+        {
+          "name": "No peers configured",
+          "when": "the WireGuard interface has no peers",
+          "then": "the tunnel collector returns an empty slice",
+          "and_then": [
+            "no error is returned"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The system SHALL measure and report peer latency via network probes",
+      "priority": "SHALL",
+      "rationale": "Latency measurements enable operators to detect slow paths and routing issues in the mesh",
+      "scenarios": [
+        {
+          "name": "Latency probe succeeds",
+          "when": "a UDP or ICMP probe to a peer's mesh IP succeeds",
+          "then": "the metric data includes rtt_ms with the round-trip time in milliseconds",
+          "and_then": [
+            "peer_id is set in the MetricPoint"
+          ]
+        },
+        {
+          "name": "Latency probe times out",
+          "when": "a probe to a peer does not receive a response within the probe timeout",
+          "then": "the metric data includes rtt_ms=-1 and reachable=false",
+          "and_then": [
+            "the collector continues to probe remaining peers"
+          ]
+        },
+        {
+          "name": "Probe error is non-fatal",
+          "when": "the probe encounters a network error",
+          "then": "the error is logged as a warning",
+          "and_then": [
+            "other peers are still probed",
+            "no error propagates to the manager"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The system SHALL batch collected metrics and send them to the control plane at the configured ReportInterval",
+      "priority": "SHALL",
+      "rationale": "Batching reduces API call overhead and is the expected pattern for the POST /v1/nodes/{node_id}/metrics endpoint",
+      "scenarios": [
+        {
+          "name": "Batch sent at report interval",
+          "when": "the ReportInterval elapses and collected metrics exist",
+          "then": "the system sends an api.MetricBatch via ControlPlane.ReportMetrics",
+          "and_then": [
+            "the batch is cleared after successful send",
+            "batch size does not exceed BatchSize"
+          ]
+        },
+        {
+          "name": "Empty batch not sent",
+          "when": "the ReportInterval elapses but no metrics were collected",
+          "then": "no API call is made",
+          "and_then": []
+        },
+        {
+          "name": "Report failure does not lose newest data",
+          "when": "ReportMetrics returns an error",
+          "then": "the failed batch metrics are retained for the next report cycle",
+          "and_then": [
+            "a warning is logged",
+            "if retained metrics exceed 2*BatchSize, the oldest are dropped"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The system SHALL NOT block core mesh operations when metrics collection or reporting fails",
+      "priority": "SHALL",
+      "rationale": "Metrics is an observability layer; failures must not degrade mesh connectivity",
+      "scenarios": [
+        {
+          "name": "Collection error isolated",
+          "when": "a collector returns an error",
+          "then": "the manager logs the error and continues with the next collection cycle",
+          "and_then": [
+            "no panic or goroutine leak occurs"
+          ]
+        },
+        {
+          "name": "Reporting error isolated",
+          "when": "ReportMetrics returns a network error",
+          "then": "the manager logs a warning and retries on the next report interval",
+          "and_then": [
+            "the main context is not cancelled"
+          ]
+        },
+        {
+          "name": "Graceful shutdown",
+          "when": "the manager's context is cancelled",
+          "then": "Run returns ctx.Err() without blocking",
+          "and_then": [
+            "any in-progress collection is abandoned",
+            "no goroutine leaks"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The system SHALL validate all metrics configuration values with clear error messages",
+      "priority": "SHALL",
+      "rationale": "Invalid configuration should fail fast at startup, not silently produce bad behavior",
+      "scenarios": [
+        {
+          "name": "Valid configuration accepted",
+          "when": "all config fields are within acceptable ranges",
+          "then": "Validate returns nil",
+          "and_then": []
+        },
+        {
+          "name": "CollectInterval too low rejected",
+          "when": "CollectInterval is less than 10 seconds",
+          "then": "Validate returns an error containing 'CollectInterval must be at least 10s'",
+          "and_then": []
+        },
+        {
+          "name": "ReportInterval less than CollectInterval rejected",
+          "when": "ReportInterval is less than CollectInterval",
+          "then": "Validate returns an error containing 'ReportInterval must be >= CollectInterval'",
+          "and_then": []
+        },
+        {
+          "name": "BatchSize zero rejected",
+          "when": "BatchSize is 0 or negative",
+          "then": "Validate returns an error containing 'BatchSize must be at least 1'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The system SHALL support a Collector interface for extensible metric sources",
+      "priority": "SHALL",
+      "rationale": "A pluggable collector design enables adding new metric types (e.g., application metrics) without modifying the core loop",
+      "scenarios": [
+        {
+          "name": "Multiple collectors invoked",
+          "when": "the manager has three registered collectors",
+          "then": "all three are called during each collection cycle",
+          "and_then": [
+            "results are aggregated into a single batch"
+          ]
+        },
+        {
+          "name": "Individual collector failure isolated",
+          "when": "one of three collectors returns an error",
+          "then": "the other two collectors' results are still included in the batch",
+          "and_then": [
+            "the error is logged at warn level"
+          ]
+        },
+        {
+          "name": "Collector panics recovered",
+          "when": "a collector panics during collection",
+          "then": "the panic is recovered and logged as an error",
+          "and_then": [
+            "other collectors still run",
+            "the manager does not crash"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The system SHOULD use structured logging with component='metrics' for all log messages",
+      "priority": "SHOULD",
+      "rationale": "Consistent structured logging enables filtering and correlation in centralized log systems",
+      "scenarios": [
+        {
+          "name": "All log messages include component field",
+          "when": "any log message is emitted by the metrics package",
+          "then": "the log message includes the field component='metrics'",
+          "and_then": []
+        },
+        {
+          "name": "Collection cycle logged at debug level",
+          "when": "a collection cycle completes successfully",
+          "then": "a debug log is emitted with metric_count and duration fields",
+          "and_then": []
+        },
+        {
+          "name": "Report cycle logged at info level",
+          "when": "a batch is successfully reported to the control plane",
+          "then": "an info log is emitted with batch_size and duration fields",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The system SHALL provide reference documentation for the metrics module",
+      "priority": "SHALL",
+      "rationale": "Reference documentation enables operators and developers to understand and configure the metrics subsystem",
+      "scenarios": [
+        {
+          "name": "Config reference documented",
+          "when": "an operator reads the metrics reference doc",
+          "then": "all Config fields are listed with types, defaults, and validation constraints",
+          "and_then": []
+        },
+        {
+          "name": "Collector interface documented",
+          "when": "a developer reads the metrics reference doc",
+          "then": "the Collector interface is described with its contract and usage pattern",
+          "and_then": []
+        },
+        {
+          "name": "Metric groups documented",
+          "when": "an operator reads the metrics reference doc",
+          "then": "each metric group (system, tunnel, latency) is described with its JSON data schema",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/metrics/config.go: Config struct with Enabled, CollectInterval, ReportInterval, BatchSize fields; DefaultCollectInterval=30s, DefaultReportInterval=60s, DefaultBatchSize=100 constants; ApplyDefaults and Validate methods following the nat/config.go pattern. Create internal/metrics/config_test.go with tests for ApplyDefaults (zero-valued Config), Validate happy path, Validate rejects low CollectInterval, Validate rejects ReportInterval < CollectInterval, Validate rejects BatchSize=0, Validate skips when Enabled=false (REQ-006)",
+    "1.2 Create internal/metrics/collector.go: Define the Collector interface with method Collect(ctx context.Context) ([]api.MetricPoint, error). Define MetricsReporter interface abstracting ControlPlane.ReportMetrics: ReportMetrics(ctx context.Context, nodeID string, batch api.MetricBatch) error. No tests needed for interface definitions (REQ-007)",
+    "1.3 Create internal/metrics/system.go: SystemCollector struct implementing Collector, using injectable SystemSource interface for reading CPU/memory/disk/network stats (not directly reading /proc for testability). Each Collect call returns []api.MetricPoint with group='system'. Create internal/metrics/system_test.go with mock SystemSource; tests for successful collection, partial failure, and context cancellation (REQ-001)",
+    "1.4 Create internal/metrics/tunnel.go: TunnelCollector struct implementing Collector, using injectable TunnelSource interface (returning per-peer handshake times and transfer counters). StaleThreshold configurable (default 5m). Each Collect call returns []api.MetricPoint with group='tunnel' and peer_id. Create internal/metrics/tunnel_test.go with mock TunnelSource; tests for per-peer metrics, stale handshake detection, no peers returns empty slice (REQ-002)",
+    "1.5 Create internal/metrics/latency.go: LatencyCollector struct implementing Collector, using injectable LatencyProber interface with Probe(ctx, ip string) (time.Duration, error). PeerProvider interface returns current mesh peer IPs+IDs. Each Collect call returns []api.MetricPoint with group='latency' and peer_id. Create internal/metrics/latency_test.go with mock LatencyProber and PeerProvider; tests for successful probe, timeout (rtt_ms=-1, reachable=false), continues on error (REQ-003)",
+    "2.1 Create internal/metrics/manager.go: Manager struct with fields for config, collectors []Collector, reporter MetricsReporter, nodeID, logger. NewManager constructor applies defaults. RegisterCollector method adds to the collector list. Run method implements the dual-ticker loop: collect at CollectInterval, report at ReportInterval. Run returns nil immediately when Enabled=false. Batch management: accumulate metrics in a buffer, send at ReportInterval, respect BatchSize (split into multiple API calls if needed), retain on failure, drop oldest when exceeding 2*BatchSize. Panic recovery per collector (matching reconciler pattern). (REQ-004, REQ-005, REQ-007)",
+    "2.2 Create internal/metrics/manager_test.go: Full test suite for Manager.Run using mock collectors and mock MetricsReporter. Tests: collects and reports on schedule, skips empty batch, retains on report error, drops oldest when over capacity, stops on context cancel, isolates collector error, recovers collector panic, respects BatchSize, returns nil when disabled. Use discardLogger helper, short intervals for fast tests (REQ-004, REQ-005, REQ-007)",
+    "3.1 Write docs/reference/backend/metrics-collection.md: Reference documentation covering Config struct (all fields, types, defaults, validation rules), Collector interface contract, MetricsReporter interface, Manager lifecycle, metric groups (system, tunnel, latency) with JSON data schema examples per group, and the POST /v1/nodes/{node_id}/metrics API contract (REQ-009)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults",
+      "story": "Operator configures metrics collection behavior",
+      "expected": "ApplyDefaults sets CollectInterval=30s, ReportInterval=60s, BatchSize=100 on zero-valued Config",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_Validate_AcceptsValid",
+      "story": "Operator configures metrics collection behavior",
+      "expected": "Validate returns nil for valid config with CollectInterval=30s, ReportInterval=60s, BatchSize=50",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_Validate_RejectsLowCollectInterval",
+      "story": "Operator configures metrics collection behavior",
+      "expected": "Validate returns error when CollectInterval < 10s",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_Validate_RejectsReportIntervalBelowCollect",
+      "story": "Operator configures metrics collection behavior",
+      "expected": "Validate returns error when ReportInterval < CollectInterval",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_Validate_RejectsBatchSizeZero",
+      "story": "Operator configures metrics collection behavior",
+      "expected": "Validate returns error when BatchSize is 0",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_Validate_SkipsWhenDisabled",
+      "story": "Operator configures metrics collection behavior",
+      "expected": "Validate returns nil when Enabled=false regardless of other field values",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/metrics/system_test.go",
+      "test_function": "TestSystemCollector_Collect_ReturnsMetricPoints",
+      "story": "Platform operator sees node resource utilization metrics in the control plane",
+      "expected": "Collect returns MetricPoints with group='system' containing cpu, memory, disk, network data",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/metrics/system_test.go",
+      "test_function": "TestSystemCollector_Collect_HandlesSourceError",
+      "story": "Platform operator sees node resource utilization metrics in the control plane",
+      "expected": "Collect returns partial results and logs warning when one source fails",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/metrics/tunnel_test.go",
+      "test_function": "TestTunnelCollector_Collect_ReturnsPerPeerMetrics",
+      "story": "Platform operator sees WireGuard tunnel health metrics",
+      "expected": "Collect returns one MetricPoint per peer with group='tunnel' and peer_id set",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/metrics/tunnel_test.go",
+      "test_function": "TestTunnelCollector_Collect_DetectsStaleHandshake",
+      "story": "Platform operator sees WireGuard tunnel health metrics",
+      "expected": "Metric data includes handshake_stale=true when last handshake exceeds stale threshold",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/metrics/tunnel_test.go",
+      "test_function": "TestTunnelCollector_Collect_NoPeers",
+      "story": "Platform operator sees WireGuard tunnel health metrics",
+      "expected": "Collect returns empty slice and no error when no peers are configured",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/metrics/latency_test.go",
+      "test_function": "TestLatencyCollector_Collect_ReturnsPerPeerLatency",
+      "story": "Platform operator sees peer latency metrics",
+      "expected": "Collect returns one MetricPoint per peer with group='latency', peer_id, and rtt_ms",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/metrics/latency_test.go",
+      "test_function": "TestLatencyCollector_Collect_TimeoutReportsUnreachable",
+      "story": "Platform operator sees peer latency metrics",
+      "expected": "When probe times out, metric data includes rtt_ms=-1 and reachable=false",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/metrics/latency_test.go",
+      "test_function": "TestLatencyCollector_Collect_ContinuesOnProbeError",
+      "story": "Platform operator sees peer latency metrics",
+      "expected": "When one peer probe fails, remaining peers are still probed",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/metrics/manager_test.go",
+      "test_function": "TestManager_Run_CollectsAndReports",
+      "story": "Platform operator sees node resource utilization metrics in the control plane",
+      "expected": "Manager calls collectors at CollectInterval and reports at ReportInterval via ReportMetrics",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/manager_test.go",
+      "test_function": "TestManager_Run_SkipsEmptyBatch",
+      "story": "Node continues operating normally when metrics reporting fails",
+      "expected": "No ReportMetrics call when all collectors return empty slices",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/manager_test.go",
+      "test_function": "TestManager_Run_RetainsOnReportError",
+      "story": "Node continues operating normally when metrics reporting fails",
+      "expected": "When ReportMetrics fails, metrics are retained and included in the next batch",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/manager_test.go",
+      "test_function": "TestManager_Run_DropsOldestWhenOverCapacity",
+      "story": "Node continues operating normally when metrics reporting fails",
+      "expected": "When retained metrics exceed 2*BatchSize, oldest metrics are dropped",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/manager_test.go",
+      "test_function": "TestManager_Run_StopsOnContextCancel",
+      "story": "Node continues operating normally when metrics reporting fails",
+      "expected": "Run returns ctx.Err() when context is cancelled",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/metrics/manager_test.go",
+      "test_function": "TestManager_Run_IsolatesCollectorError",
+      "story": "Node continues operating normally when metrics reporting fails",
+      "expected": "When one collector returns error, others still contribute to the batch",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/metrics/manager_test.go",
+      "test_function": "TestManager_Run_RecoversCollectorPanic",
+      "story": "Developer extends metrics with new collector types",
+      "expected": "When a collector panics, the panic is recovered, logged, and other collectors still run",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/metrics/manager_test.go",
+      "test_function": "TestManager_Run_DisabledReturnsNil",
+      "story": "Operator configures metrics collection behavior",
+      "expected": "Run returns nil immediately when Enabled=false",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/metrics/manager_test.go",
+      "test_function": "TestManager_Run_BatchSizeRespected",
+      "story": "Platform operator sees node resource utilization metrics in the control plane",
+      "expected": "When collected metrics exceed BatchSize, they are sent in multiple batches of at most BatchSize",
+      "requirement_id": "REQ-004"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-008) have corresponding passing tests in internal/metrics/*_test.go",
+    "All WHEN/THEN scenarios from requirements are covered by at least one test case",
+    "All test_specifications are implemented with matching function names and file paths",
+    "Config follows existing ApplyDefaults/Validate pattern from nat/config.go and reconcile/config.go",
+    "Manager follows Run-loop pattern from nat/discoverer.go and reconcile/reconciler.go (ticker, context cancellation, panic recovery)",
+    "Collector interface uses dependency injection for all external state (no direct /proc reads in production code paths tested by unit tests)",
+    "All log messages use structured logging with component='metrics' field consistent with other packages",
+    "No goroutine leaks: tests use goleak or manual verification of Run return",
+    "MetricPoint data payloads are valid JSON matching the api.MetricPoint schema from internal/api/types.go",
+    "Reference documentation (docs/reference/backend/metrics-collection.md) covers all Config fields, interfaces, and metric group schemas"
+  ],
+  "implementation_notes": "Architecture: New package internal/metrics with the standard module layout (config.go, collector.go, system.go, tunnel.go, latency.go, manager.go). The Manager orchestrates collection and reporting using a dual-ticker pattern: collect at CollectInterval, report at ReportInterval. This decouples collection frequency from reporting frequency, allowing frequent local sampling with less frequent API calls.\n\nKey patterns to follow:\n- Config with ApplyDefaults()/Validate() (see internal/nat/config.go, internal/reconcile/config.go)\n- Run loop with context cancellation and ticker (see internal/nat/discoverer.go:Run, internal/reconcile/reconciler.go:Run)\n- Panic recovery per handler (see internal/reconcile/reconciler.go:safeInvoke)\n- Interface-based dependency injection for testability (see nat.STUNClient, nat.EndpointReporter)\n- Mock test doubles defined in _test.go files with sync.Mutex for concurrency safety\n- discardLogger helper for tests (see internal/nat/mock_stun_test.go)\n\nData flow: Collectors gather raw metrics → Manager accumulates into buffer → Manager sends api.MetricBatch via MetricsReporter at ReportInterval → ControlPlane.ReportMetrics sends POST /v1/nodes/{node_id}/metrics.\n\nAPI types already exist: api.MetricBatch, api.MetricPoint (internal/api/types.go:196-204). API endpoint already exists: ControlPlane.ReportMetrics (internal/api/endpoints.go:152-155). No changes to the api package are needed.\n\nMetric groups:\n- 'system': CPU (user_pct, system_pct, idle_pct), memory (total_bytes, used_bytes, available_bytes), disk (total_bytes, used_bytes, available_bytes), network (bytes_sent, bytes_recv, packets_sent, packets_recv, errors_in, errors_out). Serialized as json.RawMessage in MetricPoint.Data.\n- 'tunnel': Per-peer handshake_time (RFC3339), transfer_sent, transfer_recv, handshake_stale (bool). peer_id set on MetricPoint.\n- 'latency': Per-peer rtt_ms (float64, -1 if unreachable), reachable (bool). peer_id set on MetricPoint.\n\nPotential pitfalls:\n- SystemCollector must use interfaces (SystemSource) rather than directly reading /proc to enable cross-platform testing and unit test isolation.\n- LatencyProber must be injectable; real ICMP requires root privileges, so unit tests must use mocks.\n- Buffer overflow: When the control plane is unreachable, metrics accumulate. Cap at 2*BatchSize and drop oldest to bound memory.\n- TunnelCollector depends on WireGuard peer state; use a TunnelSource interface rather than directly calling WGController to avoid coupling.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.110870"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:09:18.861121"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:12:57.762945"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "ebf29945-eda5-40d5-81e1-d53c1453177e",
+      "timestamp": "2026-02-12T21:12:57.762971",
+      "total_duration": 215.51641058921814,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 215.51641058921814,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
