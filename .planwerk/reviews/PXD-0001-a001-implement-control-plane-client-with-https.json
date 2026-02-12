@@ -1,0 +1,216 @@
+{
+  "feature_id": "PXD-0001",
+  "title": "A001: Implement Control Plane client with HTTPS and SSE",
+  "date": "2026-02-11",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Solid implementation of the control plane client with all 17 API endpoints, SSE parser, reconnect engine with exponential backoff, event dispatcher, and structured error types. Tests pass (89.7% coverage, race-clean). However, the SSE idle timeout is declared but never enforced (REQ-011 violation), there are multiple path injection vulnerabilities in URL construction, and gzip response decompression has no size limit. These must be addressed before merge.",
+  "tests_checklist": [
+    {"item": "Tests exist and pass (go test -race)", "checked": true},
+    {"item": "89.7% statement coverage", "checked": true},
+    {"item": "All 17 endpoint methods tested with httptest.Server", "checked": true},
+    {"item": "All 12 SSE event type constants verified", "checked": true},
+    {"item": "errors.Is/errors.As tested for all error types", "checked": true},
+    {"item": "SSE parser W3C basics: multi-line data, comments, retry, default type", "checked": true},
+    {"item": "ReconnectEngine: backoff, jitter range, failure classification, polling fallback", "checked": true},
+    {"item": "Context cancellation and graceful shutdown tested", "checked": true},
+    {"item": "Thread-safety tested (concurrent SetAuthToken, dispatcher registry)", "checked": true},
+    {"item": "JSON marshalling roundtrips for all types", "checked": true},
+    {"item": "Goroutine leak detection (goleak or equivalent)", "checked": false},
+    {"item": "SSE idle timeout enforcement tested", "checked": false},
+    {"item": "SSE parser advanced edge cases (colon in data, invalid retry, consecutive empty lines)", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows Go stdlib patterns (net/http, log/slog, context)", "checked": true},
+    {"item": "Clean package boundary - no file I/O in internal/api", "checked": true},
+    {"item": "Proper error wrapping with fmt.Errorf %w", "checked": true},
+    {"item": "Named constants for magic values (gzipThreshold, timeouts)", "checked": true},
+    {"item": "Functions ≤40 lines", "checked": false},
+    {"item": "No code duplication (≥3 occurrences)", "checked": false},
+    {"item": "Proper encapsulation (no cross-struct field access)", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "Auth token protected by sync.RWMutex", "checked": true},
+    {"item": "TLS configurable with InsecureSkipVerify warning", "checked": true},
+    {"item": "Error response body limited to 4KB", "checked": true},
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "EventVerifier interface for signature validation", "checked": true},
+    {"item": "URL path parameters escaped against traversal", "checked": false},
+    {"item": "Gzip decompression size-limited", "checked": false},
+    {"item": "SSE idle timeout enforced against slowloris", "checked": false},
+    {"item": "TLS minimum version enforced", "checked": false}
+  ],
+  "architecture_checklist": [
+    {"item": "Clean separation: client, SSE, reconnect, dispatcher, envelope, errors", "checked": true},
+    {"item": "Pluggable EventVerifier interface", "checked": true},
+    {"item": "State machine pattern for reconnect engine", "checked": true},
+    {"item": "Config as value type, no global state", "checked": true},
+    {"item": "SSEManager as top-level orchestrator", "checked": true},
+    {"item": "Solution is as simple as possible", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No unused exports or dead code", "checked": true},
+    {"item": "No over-engineering or speculative features", "checked": true},
+    {"item": "PostJSON/GetJSON generic helpers are useful", "checked": true},
+    {"item": "Endpoint methods share doRequest - no duplication in core path", "checked": true},
+    {"item": "ConnectSSE header setup duplicated with sendRequest", "checked": false}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config validated in constructor", "checked": true},
+    {"item": "Envelope required fields checked in ParseEnvelope", "checked": true},
+    {"item": "Non-2xx responses mapped to errors immediately", "checked": true},
+    {"item": "Permanent failures (403, 404) stop reconnect loop", "checked": true},
+    {"item": "Errors detected early", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "All external inputs validated", "checked": false},
+    {"item": "Context cancellation checked at loop boundaries", "checked": true},
+    {"item": "Nil verifier defaults to NoOpVerifier", "checked": true},
+    {"item": "Malformed SSE events logged and skipped", "checked": true},
+    {"item": "Handler errors isolated - one bad handler doesn't break dispatch", "checked": true}
+  ],
+  "security_findings": [
+    {
+      "severity": "HIGH",
+      "id": "S-01",
+      "description": "SSE idle timeout declared but never enforced. idleTimeout field stored in SSEStream but Connect() blocks indefinitely on parser.Next() with no deadline. Enables slowloris-style connection holding. Violates REQ-011.",
+      "location": "internal/api/sse.go:124,154-208",
+      "fix": "Implement timeout around parser.Next() using goroutine+channel pattern or set read deadline on resp.Body's underlying net.Conn. Reset timer on each event received."
+    },
+    {
+      "severity": "HIGH",
+      "id": "S-02",
+      "description": "No decompression size limit on gzip responses. A crafted 1KB compressed payload could expand to gigabytes, causing OOM.",
+      "location": "internal/api/client.go:102-107",
+      "fix": "Wrap gzip reader: reader = io.LimitReader(gr, maxResponseSize) with const maxResponseSize = 50 * 1024 * 1024"
+    },
+    {
+      "severity": "HIGH",
+      "id": "S-03",
+      "description": "URL path parameters (nodeID, key, version, goos, arch) interpolated via fmt.Sprintf without url.PathEscape(). Enables path traversal if callers pass unsanitized input.",
+      "location": "internal/api/endpoints.go:24,57,67,84,103,121,174",
+      "fix": "Apply url.PathEscape() to all path parameters in Sprintf calls. Import net/url."
+    },
+    {
+      "severity": "MEDIUM",
+      "id": "S-04",
+      "description": "TLS config does not enforce minimum version. Could negotiate TLS 1.0/1.1 with weak ciphers.",
+      "location": "internal/api/client.go:45-47",
+      "fix": "Add MinVersion: tls.VersionTLS12 to tls.Config"
+    },
+    {
+      "severity": "MEDIUM",
+      "id": "S-05",
+      "description": "SSE data lines accumulated without size limit. Malicious server can send unbounded data: lines causing memory exhaustion.",
+      "location": "internal/api/sse.go:103-104",
+      "fix": "Track cumulative data size, reject events exceeding a reasonable limit (e.g. 1MB)."
+    }
+  ],
+  "architecture_findings": [
+    {
+      "severity": "MAJOR",
+      "id": "A-01",
+      "description": "SSEManager directly accesses ReconnectEngine internal fields (mu, baseInterval, maxInterval, currentInterval, pollingFallback, pollInterval) bypassing encapsulation.",
+      "location": "internal/api/manager.go:47-51,55-60",
+      "fix": "Add SetIntervals(base, max) and SetPollingConfig(fallback, interval) methods to ReconnectEngine. Delegate from SSEManager."
+    },
+    {
+      "severity": "MAJOR",
+      "id": "A-02",
+      "description": "ConnectSSE() duplicates header setup logic from sendRequest() - Authorization, User-Agent, and auth token retrieval.",
+      "location": "internal/api/endpoints.go:30-36 vs client.go:167-178",
+      "fix": "Extract setCommonHeaders(req *http.Request) helper or route ConnectSSE through sendRequest path."
+    }
+  ],
+  "issues_found": [
+    {
+      "severity": "blocker",
+      "id": "C2-01",
+      "check": "C2",
+      "description": "SSE idle timeout (REQ-011) not implemented. Config field SSEIdleTimeout exists, SSEStream stores idleTimeout, but Connect() never enforces it. Stream can hang indefinitely on a silent connection.",
+      "location": "internal/api/sse.go:124,154-208",
+      "fix": "Implement idle timeout enforcement in Connect(). Use goroutine reading events with a resettable timer. If no event within idleTimeout, return error to trigger reconnect."
+    },
+    {
+      "severity": "blocker",
+      "id": "S-02",
+      "check": "S6",
+      "description": "Gzip response decompression has no size limit - potential for memory exhaustion via gzip bomb.",
+      "location": "internal/api/client.go:102-107",
+      "fix": "Wrap with io.LimitReader"
+    },
+    {
+      "severity": "blocker",
+      "id": "S-03",
+      "check": "S6",
+      "description": "URL path parameters not escaped - potential path traversal in 7+ endpoint methods.",
+      "location": "internal/api/endpoints.go:24,57,121,174",
+      "fix": "Apply url.PathEscape() to all dynamic path segments"
+    },
+    {
+      "severity": "critical",
+      "id": "S-04",
+      "check": "S1",
+      "description": "TLS minimum version not enforced. Default Go behavior allows TLS 1.0.",
+      "location": "internal/api/client.go:45-47",
+      "fix": "Set MinVersion: tls.VersionTLS12"
+    },
+    {
+      "severity": "critical",
+      "id": "Q-01",
+      "check": "Q2",
+      "description": "ReconnectEngine.Run() is 102 lines with 4+ nesting levels. Too complex for a single function.",
+      "location": "internal/api/reconnect.go:144-245",
+      "fix": "Extract handleTransientError(), handleRateLimitError(), handleAuthError() helper methods."
+    },
+    {
+      "severity": "critical",
+      "id": "A-01",
+      "check": "P1",
+      "description": "SSEManager breaks ReconnectEngine encapsulation by directly accessing internal mutex and fields.",
+      "location": "internal/api/manager.go:47-51,55-60",
+      "fix": "Add proper setter methods to ReconnectEngine."
+    },
+    {
+      "severity": "minor",
+      "id": "TE-01",
+      "check": "TE2",
+      "description": "No goroutine leak detection (goleak) in test suite. Tests spawn goroutines via SSEManager.Start() without verifying cleanup.",
+      "location": "internal/api/*_test.go",
+      "fix": "Add go.uber.org/goleak and TestMain(m *testing.M) with goleak.VerifyTestMain(m)"
+    },
+    {
+      "severity": "minor",
+      "id": "TE-02",
+      "check": "TE2",
+      "description": "SSE parser missing edge case tests: colon in data values, invalid retry field, consecutive empty lines, very long lines.",
+      "location": "internal/api/sse_test.go",
+      "fix": "Add TestSSEParser_DataWithColon, TestSSEParser_InvalidRetry, TestSSEParser_ConsecutiveEmptyLines"
+    },
+    {
+      "severity": "minor",
+      "id": "D-01",
+      "check": "D1",
+      "description": "SSE unbounded data accumulation has no protection. Should document or enforce max event size.",
+      "location": "internal/api/sse.go:103-104",
+      "fix": "Add const maxEventDataSize and reject events exceeding it."
+    }
+  ],
+  "suggested_improvements": [
+    "Add url.PathEscape() to all dynamic URL path segments for defense-in-depth",
+    "Extract generic doRequestWithResponse[T any]() using Go generics to reduce endpoint boilerplate",
+    "Add goleak to test suite for goroutine leak detection",
+    "Consider adding a maxResponseSize constant and using io.LimitReader on all response bodies",
+    "Add SSE parser edge case tests for robustness against malformed server data",
+    "Document EventVerifier nonce tracking requirements for S010 implementer"
+  ],
+  "next_steps": [
+    "MUST: Implement SSE idle timeout enforcement in SSEStream.Connect() (REQ-011)",
+    "MUST: Add io.LimitReader wrapper on gzip response decompression (security)",
+    "MUST: Apply url.PathEscape() to all URL path parameters in endpoints.go (security)",
+    "SHOULD: Set tls.Config MinVersion to tls.VersionTLS12 (security hardening)",
+    "SHOULD: Fix SSEManager encapsulation violation - add proper setters to ReconnectEngine",
+    "SHOULD: Refactor ReconnectEngine.Run() into smaller helper methods",
+    "NICE: Add goleak to test suite",
+    "NICE: Extract shared header setup from ConnectSSE and sendRequest"
+  ]
+}
