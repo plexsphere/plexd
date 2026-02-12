@@ -704,3 +704,173 @@ func TestHeartbeatRequest_WithUserAccess(t *testing.T) {
 		t.Errorf("user_access should be omitted when nil, got: %s", s)
 	}
 }
+
+func TestIngressConfig_JSONRoundTrip(t *testing.T) {
+	orig := IngressConfig{
+		Enabled: true,
+		Rules: []IngressRule{
+			{
+				RuleID:     "rule-001",
+				ListenPort: 443,
+				TargetAddr: "10.42.0.5:8443",
+				Mode:       "passthrough",
+			},
+			{
+				RuleID:     "rule-002",
+				ListenPort: 8080,
+				TargetAddr: "10.42.0.6:80",
+				Mode:       "terminate",
+				CertPEM:    "-----BEGIN CERTIFICATE-----\nMIIB...",
+				KeyPEM:     "-----BEGIN PRIVATE KEY-----\nMIIE...",
+			},
+		},
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"enabled", "rules"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestIngressRule_JSONRoundTrip(t *testing.T) {
+	// With CertPEM and KeyPEM set.
+	orig := IngressRule{
+		RuleID:     "rule-001",
+		ListenPort: 443,
+		TargetAddr: "10.42.0.5:8443",
+		Mode:       "terminate",
+		CertPEM:    "-----BEGIN CERTIFICATE-----\nMIIB...",
+		KeyPEM:     "-----BEGIN PRIVATE KEY-----\nMIIE...",
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"rule_id", "listen_port", "target_addr", "mode", "cert_pem", "key_pem"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+
+	// CertPEM and KeyPEM should be omitted when empty.
+	orig.CertPEM = ""
+	orig.KeyPEM = ""
+	data2, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data2); contains(s, `"cert_pem"`) {
+		t.Errorf("cert_pem should be omitted when empty, got: %s", s)
+	}
+	if s := string(data2); contains(s, `"key_pem"`) {
+		t.Errorf("key_pem should be omitted when empty, got: %s", s)
+	}
+}
+
+func TestIngressInfo_JSONRoundTrip(t *testing.T) {
+	orig := IngressInfo{
+		Enabled:         true,
+		RuleCount:       3,
+		ConnectionCount: 42,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"enabled", "rule_count", "connection_count"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestStateResponse_WithIngressConfig(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := StateResponse{
+		Peers:    []Peer{{ID: "n-002", PublicKey: "pk", MeshIP: "10.42.0.2", Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.42.0.2/32"}, PSK: "psk"}},
+		Policies: []Policy{},
+		IngressConfig: &IngressConfig{
+			Enabled: true,
+			Rules: []IngressRule{
+				{RuleID: "rule-001", ListenPort: 443, TargetAddr: "10.42.0.5:8443", Mode: "passthrough"},
+			},
+		},
+		Data:       []DataEntry{{Key: "k", ContentType: "text/plain", Payload: json.RawMessage(`"v"`), Version: 1, UpdatedAt: now}},
+		SecretRefs: []SecretRef{},
+	}
+	_, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// IngressConfig field should be omitted when nil.
+	orig.IngressConfig = nil
+	data, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data); contains(s, `"ingress_config"`) {
+		t.Errorf("ingress_config should be omitted when nil, got: %s", s)
+	}
+}
+
+func TestHeartbeatRequest_WithIngress(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := HeartbeatRequest{
+		NodeID:         "n-001",
+		Timestamp:      now,
+		Status:         "healthy",
+		Uptime:         "5h20m",
+		BinaryChecksum: "sha256:abc",
+		Ingress: &IngressInfo{
+			Enabled:         true,
+			RuleCount:       2,
+			ConnectionCount: 15,
+		},
+	}
+	_, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Ingress field should be omitted when nil.
+	orig.Ingress = nil
+	data, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data); contains(s, `"ingress"`) {
+		t.Errorf("ingress should be omitted when nil, got: %s", s)
+	}
+}
+
+func TestBridgeInfo_IngressFields_JSONRoundTrip(t *testing.T) {
+	orig := BridgeInfo{
+		Enabled:             true,
+		AccessInterface:     "eth1",
+		ActiveRoutes:        5,
+		RelayEnabled:        true,
+		ActiveRelaySessions: 3,
+		IngressEnabled:      true,
+		ActiveIngressRules:  4,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify ingress-specific snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"ingress_enabled", "active_ingress_rules"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}

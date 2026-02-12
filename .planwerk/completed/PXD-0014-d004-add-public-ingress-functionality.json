@@ -2,8 +2,8 @@
   "feature_id": "PXD-0014",
   "title": "D004: Add public ingress functionality",
   "slug": "d004-add-public-ingress-functionality",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Expose mesh-internal services to public internet traffic through the bridge node. Handle inbound traffic on public IPs and route it to the appropriate mesh peer. Support TLS termination or passthrough as needed.",
   "stories": [
@@ -433,18 +433,18 @@
     }
   ],
   "tasks": [
-    "1.1 Add IngressConfig, IngressRule, and IngressInfo API types to internal/api/types.go. Add SSE event constants (EventIngressConfigUpdated, EventIngressRuleAssigned, EventIngressRuleRevoked) to internal/api/envelope.go. Add IngressConfig field to StateResponse and IngressInfo field to HeartbeatRequest/BridgeInfo. (REQ-004, REQ-007)",
-    "1.2 Extend bridge Config with ingress fields (IngressEnabled, MaxIngressRules, DialTimeout), add defaults in ApplyDefaults, add validation in Validate, and write tests in config_test.go. (REQ-004)",
-    "1.3 Define IngressController interface in internal/bridge/ingress_controller.go with methods: Listen(addr string, tlsCfg *tls.Config) (net.Listener, error), Close(listener net.Listener) error. Create mockIngressController in mock_ingress_test.go. (REQ-001, REQ-002, REQ-003)",
-    "2.1 Implement IngressManager in internal/bridge/ingress.go: struct with IngressController dependency, mu sync.Mutex, activeRules map, active bool. Implement NewIngressManager constructor, Setup (no-op when disabled), Teardown (close all listeners, aggregate errors), AddRule (start listener, track rule), RemoveRule (stop listener, untrack). Write unit tests in ingress_test.go. (REQ-001, REQ-008, REQ-009)",
-    "2.2 Implement TCP proxy logic in IngressManager: accept loop per rule, bidirectional io.Copy relay via goroutines, context cancellation for connection cleanup, dial timeout for target connections. Support passthrough mode (raw TCP) and terminate mode (tls.NewListener wrapper). Write proxy tests in ingress_test.go using real TCP connections on localhost. (REQ-001, REQ-002, REQ-003, REQ-010)",
-    "2.3 Implement IngressStatus and IngressCapabilities methods on IngressManager. IngressStatus returns *api.IngressInfo (nil when inactive). IngressCapabilities returns map[string]string (nil when disabled). Write tests in ingress_test.go. (REQ-007)",
-    "3.1 Implement HandleIngressConfigUpdated, HandleIngressRuleAssigned, and HandleIngressRuleRevoked SSE event handlers in internal/bridge/ingress_handler.go. Follow the HandleUserAccessPeerAssigned/Revoked pattern. Write tests in ingress_handler_test.go. (REQ-006)",
-    "3.2 Implement IngressReconcileHandler in internal/bridge/ingress_handler.go: diff desired IngressConfig.Rules against active rules, add missing, remove stale, restart changed. Follow the UserAccessReconcileHandler pattern. Write tests in ingress_handler_test.go. (REQ-005)",
-    "4.1 Write integration test TestIngressIntegration_FullLifecycle in internal/bridge/ingress_integration_test.go: wire IngressManager with real TCP listeners and connections, verify Setup -> AddRule -> proxy traffic -> RemoveRule -> Teardown lifecycle. (REQ-001, REQ-008)",
-    "4.2 Write integration test TestIngressIntegration_ReconcileDrift in internal/bridge/ingress_integration_test.go: wire IngressManager with real Reconciler, verify rules are added/removed via reconciliation cycle. Follow TestUserAccessIntegration_ReconcileDrift pattern. (REQ-005)",
-    "4.3 Write integration test TestIngressIntegration_ConcurrentAccess in internal/bridge/ingress_integration_test.go: concurrent SSE events + reconcile loop, verify no data races with -race. Follow TestUserAccessIntegration_ConcurrentAccess pattern. (REQ-006)",
-    "5.1 Write reference documentation in docs/reference/backend/public-ingress.md covering: data flow diagram, Config fields, IngressController interface, IngressManager methods/lifecycle, SSE handlers, reconcile handler, API types, error prefixes, logging, integration points. Follow the user-access-integration.md structure. (REQ-001 to REQ-010)"
+    "[done] 1.1 Add IngressConfig, IngressRule, and IngressInfo API types to internal/api/types.go. Add SSE event constants (EventIngressConfigUpdated, EventIngressRuleAssigned, EventIngressRuleRevoked) to internal/api/envelope.go. Add IngressConfig field to StateResponse and IngressInfo field to HeartbeatRequest/BridgeInfo. (REQ-004, REQ-007)",
+    "[done] 1.2 Extend bridge Config with ingress fields (IngressEnabled, MaxIngressRules, DialTimeout), add defaults in ApplyDefaults, add validation in Validate, and write tests in config_test.go. (REQ-004)",
+    "[done] 1.3 Define IngressController interface in internal/bridge/ingress_controller.go with methods: Listen(addr string, tlsCfg *tls.Config) (net.Listener, error), Close(listener net.Listener) error. Create mockIngressController in mock_ingress_test.go. (REQ-001, REQ-002, REQ-003)",
+    "[done] 2.1 Implement IngressManager in internal/bridge/ingress.go: struct with IngressController dependency, mu sync.Mutex, activeRules map, active bool. Implement NewIngressManager constructor, Setup (no-op when disabled), Teardown (close all listeners, aggregate errors), AddRule (start listener, track rule), RemoveRule (stop listener, untrack). Write unit tests in ingress_test.go. (REQ-001, REQ-008, REQ-009)",
+    "[done] 2.2 Implement TCP proxy logic in IngressManager: accept loop per rule, bidirectional io.Copy relay via goroutines, context cancellation for connection cleanup, dial timeout for target connections. Support passthrough mode (raw TCP) and terminate mode (tls.NewListener wrapper). Write proxy tests in ingress_test.go using real TCP connections on localhost. (REQ-001, REQ-002, REQ-003, REQ-010)",
+    "[done] 2.3 Implement IngressStatus and IngressCapabilities methods on IngressManager. IngressStatus returns *api.IngressInfo (nil when inactive). IngressCapabilities returns map[string]string (nil when disabled). Write tests in ingress_test.go. (REQ-007)",
+    "[done] 3.1 Implement HandleIngressConfigUpdated, HandleIngressRuleAssigned, and HandleIngressRuleRevoked SSE event handlers in internal/bridge/ingress_handler.go. Follow the HandleUserAccessPeerAssigned/Revoked pattern. Write tests in ingress_handler_test.go. (REQ-006)",
+    "[done] 3.2 Implement IngressReconcileHandler in internal/bridge/ingress_handler.go: diff desired IngressConfig.Rules against active rules, add missing, remove stale, restart changed. Follow the UserAccessReconcileHandler pattern. Write tests in ingress_handler_test.go. (REQ-005)",
+    "[done] 4.1 Write integration test TestIngressIntegration_FullLifecycle in internal/bridge/ingress_integration_test.go: wire IngressManager with real TCP listeners and connections, verify Setup -> AddRule -> proxy traffic -> RemoveRule -> Teardown lifecycle. (REQ-001, REQ-008)",
+    "[done] 4.2 Write integration test TestIngressIntegration_ReconcileDrift in internal/bridge/ingress_integration_test.go: wire IngressManager with real Reconciler, verify rules are added/removed via reconciliation cycle. Follow TestUserAccessIntegration_ReconcileDrift pattern. (REQ-005)",
+    "[done] 4.3 Write integration test TestIngressIntegration_ConcurrentAccess in internal/bridge/ingress_integration_test.go: concurrent SSE events + reconcile loop, verify no data races with -race. Follow TestUserAccessIntegration_ConcurrentAccess pattern. (REQ-006)",
+    "[done] 5.1 Write reference documentation in docs/reference/backend/public-ingress.md covering: data flow diagram, Config fields, IngressController interface, IngressManager methods/lifecycle, SSE handlers, reconcile handler, API types, error prefixes, logging, integration points. Follow the user-access-integration.md structure. (REQ-001 to REQ-010)"
   ],
   "test_specifications": [
     {
@@ -678,6 +678,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T19:59:03.520023"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T20:57:52.080723"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T22:00:00.989926"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T22:00:01.003815"
     }
   },
   "execution_history": [
@@ -691,6 +703,62 @@
           "name": "prepare",
           "duration": 236.6076204776764,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "096b7dcd-7ed2-49f9-8598-cbe31571bbc6",
+      "timestamp": "2026-02-12T21:55:15.655573",
+      "total_duration": 3328.8112301826477,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (3 tasks)",
+          "duration": 580.5671713352203,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (3 tasks)",
+          "duration": 992.4412896633148,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (2 tasks)",
+          "duration": 594.7405669689178,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (3 tasks)",
+          "duration": 627.7661671638489,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 5 (1 tasks)",
+          "duration": 110.0147454738617,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0014] Code Review",
+          "duration": 168.08472061157227,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0014] Improvements",
+          "duration": 164.4777262210846,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0014] Simplify",
+          "duration": 90.71884274482727,
+          "type": "simplify",
           "status": "done"
         }
       ]

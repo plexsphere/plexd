@@ -30,6 +30,9 @@ const (
 	EventUserAccessConfigUpdated   = "user_access_config_updated"
 	EventUserAccessPeerAssigned    = "user_access_peer_assigned"
 	EventUserAccessPeerRevoked     = "user_access_peer_revoked"
+	EventIngressConfigUpdated      = "ingress_config_updated"
+	EventIngressRuleAssigned       = "ingress_rule_assigned"
+	EventIngressRuleRevoked        = "ingress_rule_revoked"
 )
 
 // ---------------------------------------------------------------------------
