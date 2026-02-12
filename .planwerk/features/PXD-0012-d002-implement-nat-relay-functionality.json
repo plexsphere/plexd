@@ -1,0 +1,717 @@
+{
+  "feature_id": "PXD-0012",
+  "title": "D002: Implement NAT relay functionality",
+  "slug": "d002-implement-nat-relay-functionality",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Serve as a relay for nodes that cannot establish direct P2P tunnels (e.g., both peers behind symmetric NAT). Bridge nodes forward encrypted traffic between unreachable peers. Nodes fall back to relay automatically when direct connectivity fails after STUN-based NAT traversal attempts.",
+  "stories": [
+    {
+      "title": "Node detects symmetric NAT and requests relay assignment from the control plane",
+      "role": "mesh node",
+      "want": "to automatically detect when direct P2P connectivity is impossible (both peers behind symmetric NAT) and request a relay assignment from the control plane",
+      "so_that": "unreachable peers can communicate through a relay bridge node without manual intervention",
+      "criteria": [
+        "After STUN discovery classifies NAT as 'symmetric', the node includes this in its endpoint report to the control plane",
+        "The control plane endpoint response includes relay assignments (relay node ID, relay endpoint) for peers that also have symmetric NAT",
+        "Relay assignments are stored locally and made available to the WireGuard peer configuration logic",
+        "Nodes with NATFullCone or NATNone do NOT receive relay assignments (direct connectivity works)"
+      ]
+    },
+    {
+      "title": "Bridge node accepts relay registration and manages relay sessions",
+      "role": "bridge node (relay)",
+      "want": "to accept relay session assignments from the control plane and manage the lifecycle of relay sessions between unreachable peers",
+      "so_that": "the bridge node can forward encrypted WireGuard traffic between peers that cannot establish direct connections",
+      "criteria": [
+        "Bridge node with relay enabled listens on a configurable UDP port for relay traffic",
+        "Relay sessions are created via SSE event (relay_session_assigned) from the control plane",
+        "Each relay session tracks two peer endpoints and forwards UDP packets bidirectionally between them",
+        "Relay sessions have a configurable TTL and are cleaned up on expiry",
+        "Maximum concurrent relay sessions is configurable and enforced"
+      ]
+    },
+    {
+      "title": "Relay bridge node forwards encrypted UDP traffic between unreachable peers",
+      "role": "mesh node",
+      "want": "to send WireGuard traffic to the relay bridge node's endpoint instead of the unreachable peer's endpoint",
+      "so_that": "encrypted mesh traffic flows seamlessly even when direct P2P tunnels cannot be established",
+      "criteria": [
+        "When a peer has a relay assignment, WireGuard peer endpoint is set to the relay node's UDP listen address",
+        "The relay node receives UDP packets from peer A and forwards them to peer B's registered endpoint, and vice versa",
+        "Traffic remains WireGuard-encrypted end-to-end — the relay only forwards opaque UDP datagrams",
+        "Packet forwarding has minimal added latency (UDP relay, no TCP overhead)"
+      ]
+    },
+    {
+      "title": "Node falls back to relay automatically when direct connectivity fails",
+      "role": "system",
+      "want": "to automatically switch from direct P2P to relay mode when STUN-based NAT traversal determines direct connectivity is not possible",
+      "so_that": "mesh connectivity is maintained without operator intervention in restrictive NAT environments",
+      "criteria": [
+        "Fallback decision is based on NAT type classification from STUN discovery (symmetric NAT triggers fallback)",
+        "Control plane assigns relay when both peers report symmetric NAT or when endpoint exchange fails to produce connectivity",
+        "WireGuard peer endpoint is updated from direct endpoint to relay endpoint via existing UpdatePeer mechanism",
+        "If NAT type changes (e.g., network change from symmetric to full-cone), the relay assignment can be revoked and direct connectivity restored"
+      ]
+    },
+    {
+      "title": "Relay session lifecycle integrates with reconciliation and SSE events",
+      "role": "system",
+      "want": "relay sessions to be managed through the same reconciliation and SSE event patterns used by the rest of the system",
+      "so_that": "relay state is consistent, drift is detected and corrected, and real-time updates are applied promptly",
+      "criteria": [
+        "relay_session_assigned SSE event creates a new relay session on the bridge node",
+        "relay_session_revoked SSE event tears down a relay session on the bridge node",
+        "The relay ReconcileHandler compares desired relay sessions (from StateResponse) against active sessions and corrects drift",
+        "Relay session state is included in the bridge node's heartbeat (active relay count)"
+      ]
+    },
+    {
+      "title": "Platform operator can configure relay mode on bridge nodes",
+      "role": "platform operator",
+      "want": "to enable and configure relay functionality on bridge nodes through the plexd configuration",
+      "so_that": "I can control which bridge nodes serve as relays and set resource limits for relay traffic",
+      "criteria": [
+        "Config struct supports RelayEnabled bool, RelayListenPort int, MaxRelaySessions int, SessionTTL time.Duration",
+        "ApplyDefaults sets sensible defaults (RelayEnabled=false, RelayListenPort=51821, MaxRelaySessions=100, SessionTTL=5m)",
+        "Validate rejects invalid port ranges, non-positive MaxRelaySessions, and SessionTTL below 30s when relay is enabled",
+        "Relay config is part of the bridge.Config struct (relay extends bridge mode)"
+      ]
+    },
+    {
+      "title": "Relay bridge node performs clean shutdown of relay resources",
+      "role": "system",
+      "want": "to cleanly close all relay sessions and stop the UDP listener on shutdown",
+      "so_that": "no orphaned UDP sockets or relay state remains after the agent stops",
+      "criteria": [
+        "Shutdown closes the UDP relay listener",
+        "Shutdown closes all active relay sessions",
+        "Shutdown is idempotent — calling it multiple times is safe",
+        "Shutdown errors are logged but do not prevent other cleanup"
+      ]
+    },
+    {
+      "title": "Relay node reports relay status in heartbeats and capabilities in registration",
+      "role": "control plane",
+      "want": "to receive relay-specific status information in heartbeats and capabilities during registration",
+      "so_that": "the control plane can monitor relay health and discover which nodes can serve as relays",
+      "criteria": [
+        "Heartbeat BridgeInfo includes relay fields: RelayEnabled bool, ActiveRelaySessions int",
+        "Capabilities include relay=true and relay_listen_port when relay is enabled",
+        "Relay info is only included when relay mode is enabled on the bridge node",
+        "Non-relay bridge nodes are unaffected"
+      ]
+    },
+    {
+      "title": "Reference documentation covers NAT relay package",
+      "role": "developer",
+      "want": "comprehensive reference documentation for the relay functionality in internal/bridge",
+      "so_that": "future developers can understand the relay architecture, configuration, session lifecycle, and integration points",
+      "criteria": [
+        "Documentation covers relay Config fields with defaults and validation rules",
+        "Documentation covers Relay struct lifecycle (Start, Stop, session management)",
+        "Documentation covers RelaySession UDP forwarding and TTL management",
+        "Documentation covers SSE event handlers and reconcile integration",
+        "Data flow diagram shows peer A → relay bridge → peer B UDP forwarding path"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The bridge package SHALL extend the Config struct with relay-specific fields (RelayEnabled, RelayListenPort, MaxRelaySessions, SessionTTL) following the established codebase pattern",
+      "priority": "SHALL",
+      "rationale": "Relay is an extension of bridge mode — relay requires bridge mode to be enabled. Config fields follow the same ApplyDefaults/Validate pattern",
+      "scenarios": [
+        {
+          "name": "Defaults applied to zero-valued relay fields",
+          "when": "ApplyDefaults is called on a Config with relay fields at zero values",
+          "then": "RelayEnabled defaults to false, RelayListenPort defaults to 51821, MaxRelaySessions defaults to 100, SessionTTL defaults to 5m",
+          "and_then": []
+        },
+        {
+          "name": "Validation passes when relay is disabled",
+          "when": "Validate is called with RelayEnabled=false",
+          "then": "no relay-specific validation errors are returned",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects relay without bridge enabled",
+          "when": "Validate is called with RelayEnabled=true but Enabled=false",
+          "then": "an error is returned: 'bridge: config: relay requires bridge mode to be enabled'",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects invalid relay listen port",
+          "when": "Validate is called with RelayListenPort outside 1-65535",
+          "then": "an error is returned indicating invalid port range",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects non-positive MaxRelaySessions",
+          "when": "Validate is called with MaxRelaySessions <= 0 and RelayEnabled=true",
+          "then": "an error is returned: 'bridge: config: MaxRelaySessions must be positive when relay is enabled'",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects SessionTTL below 30s",
+          "when": "Validate is called with SessionTTL < 30s and RelayEnabled=true",
+          "then": "an error is returned: 'bridge: config: SessionTTL must be at least 30s'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The bridge package SHALL provide a RelaySession struct that manages bidirectional UDP packet forwarding between two peer endpoints",
+      "priority": "SHALL",
+      "rationale": "Core relay functionality: each session represents two peers that need relay assistance. WireGuard traffic is opaque UDP datagrams forwarded between endpoints",
+      "scenarios": [
+        {
+          "name": "Session forwards packets from peer A to peer B",
+          "when": "a UDP packet arrives from PeerA's registered endpoint",
+          "then": "the packet is forwarded to PeerB's registered endpoint via the relay's UDP socket",
+          "and_then": []
+        },
+        {
+          "name": "Session forwards packets from peer B to peer A",
+          "when": "a UDP packet arrives from PeerB's registered endpoint",
+          "then": "the packet is forwarded to PeerA's registered endpoint",
+          "and_then": []
+        },
+        {
+          "name": "Session rejects packets from unknown sources",
+          "when": "a UDP packet arrives from an address not matching either peer endpoint",
+          "then": "the packet is dropped and a debug-level log is emitted",
+          "and_then": []
+        },
+        {
+          "name": "Session expires after TTL",
+          "when": "SessionTTL elapses without renewal",
+          "then": "the session is automatically closed and removed from the relay",
+          "and_then": []
+        },
+        {
+          "name": "Session close is idempotent",
+          "when": "Close is called on an already-closed session",
+          "then": "nil is returned without side effects",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The bridge package SHALL provide a Relay struct that manages the UDP listener and relay session lifecycle",
+      "priority": "SHALL",
+      "rationale": "Relay orchestrates session creation, packet dispatching, TTL enforcement, and clean shutdown. Follows the SessionManager pattern from internal/tunnel",
+      "scenarios": [
+        {
+          "name": "Start opens UDP listener",
+          "when": "Relay.Start is called with a valid configuration",
+          "then": "a UDP socket is opened on RelayListenPort and the packet dispatch loop begins",
+          "and_then": [
+            "the relay is marked as active"
+          ]
+        },
+        {
+          "name": "Start is a no-op when relay is disabled",
+          "when": "Relay.Start is called with RelayEnabled=false",
+          "then": "no UDP socket is opened, nil is returned",
+          "and_then": []
+        },
+        {
+          "name": "AddSession creates a new relay session",
+          "when": "AddSession is called with two peer endpoints and a session ID",
+          "then": "a new RelaySession is created and registered; incoming packets from either peer are forwarded to the other",
+          "and_then": []
+        },
+        {
+          "name": "AddSession rejects duplicate session IDs",
+          "when": "AddSession is called with a session ID that already exists",
+          "then": "an error is returned indicating duplicate session",
+          "and_then": []
+        },
+        {
+          "name": "AddSession rejects when max sessions reached",
+          "when": "AddSession is called when MaxRelaySessions active sessions exist",
+          "then": "an error is returned indicating max sessions reached",
+          "and_then": []
+        },
+        {
+          "name": "RemoveSession closes and removes a session",
+          "when": "RemoveSession is called with a valid session ID",
+          "then": "the session is closed and removed from the relay; removing a non-existent session returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Stop closes all sessions and the listener",
+          "when": "Relay.Stop is called",
+          "then": "all sessions are closed, the UDP listener is closed, and the relay is marked inactive",
+          "and_then": [
+            "Stop is idempotent"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The bridge package SHALL add RelayConfig and RelaySessionAssignment API types to internal/api/types.go and relay SSE event constants to envelope.go",
+      "priority": "SHALL",
+      "rationale": "The control plane communicates relay session assignments via StateResponse and SSE events. New types and constants are needed for this protocol",
+      "scenarios": [
+        {
+          "name": "RelayConfig included in StateResponse",
+          "when": "FetchState returns a response for a relay-capable bridge node",
+          "then": "StateResponse.RelayConfig contains the list of desired relay sessions",
+          "and_then": []
+        },
+        {
+          "name": "Relay SSE event constants defined",
+          "when": "the api package is imported",
+          "then": "api.EventRelaySessionAssigned equals 'relay_session_assigned' and api.EventRelaySessionRevoked equals 'relay_session_revoked'",
+          "and_then": []
+        },
+        {
+          "name": "RelaySessionAssignment JSON round-trip",
+          "when": "a RelaySessionAssignment is marshalled and unmarshalled",
+          "then": "all fields are preserved: SessionID, PeerAID, PeerAEndpoint, PeerBID, PeerBEndpoint, ExpiresAt",
+          "and_then": []
+        },
+        {
+          "name": "Null RelayConfig for non-relay nodes",
+          "when": "FetchState returns a response for a non-relay node",
+          "then": "StateResponse.RelayConfig is nil (omitted in JSON)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The bridge package SHALL provide SSE event handlers for relay_session_assigned and relay_session_revoked events following the existing EventHandler pattern",
+      "priority": "SHALL",
+      "rationale": "Real-time session management via SSE follows the established HandleSSHSessionSetup/HandleSessionRevoked pattern from internal/tunnel",
+      "scenarios": [
+        {
+          "name": "relay_session_assigned creates a session",
+          "when": "a relay_session_assigned SSE event is received with valid payload",
+          "then": "Relay.AddSession is called with the peer endpoints from the payload",
+          "and_then": []
+        },
+        {
+          "name": "relay_session_assigned with malformed payload",
+          "when": "event has malformed JSON payload",
+          "then": "error is logged, no session is created, handler returns error",
+          "and_then": []
+        },
+        {
+          "name": "relay_session_revoked removes a session",
+          "when": "a relay_session_revoked SSE event is received",
+          "then": "Relay.RemoveSession is called with the session ID from the payload",
+          "and_then": []
+        },
+        {
+          "name": "relay_session_revoked for non-existent session is no-op",
+          "when": "event references a session that doesn't exist",
+          "then": "handler returns nil, debug log emitted",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The bridge package SHALL provide a relay ReconcileHandler that synchronizes relay sessions with the control plane's desired state",
+      "priority": "SHALL",
+      "rationale": "Reconciliation ensures eventual consistency of relay sessions, handling cases where SSE events are missed or state drifts",
+      "scenarios": [
+        {
+          "name": "No changes when sessions match",
+          "when": "desired RelayConfig sessions match active sessions",
+          "then": "handler returns nil without modifications",
+          "and_then": []
+        },
+        {
+          "name": "Missing sessions are created",
+          "when": "desired RelayConfig has sessions not currently active",
+          "then": "new sessions are added via Relay.AddSession",
+          "and_then": []
+        },
+        {
+          "name": "Stale sessions are removed",
+          "when": "active sessions exist that are not in desired RelayConfig",
+          "then": "those sessions are removed via Relay.RemoveSession",
+          "and_then": []
+        },
+        {
+          "name": "Nil RelayConfig is no-op",
+          "when": "desired state has nil RelayConfig",
+          "then": "handler returns nil",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The bridge Manager SHALL update BridgeInfo and BridgeCapabilities to include relay-specific information when relay is enabled",
+      "priority": "SHALL",
+      "rationale": "Control plane needs relay visibility for health monitoring and relay node discovery",
+      "scenarios": [
+        {
+          "name": "BridgeInfo includes relay status",
+          "when": "BridgeStatus is called on a bridge with active relay",
+          "then": "BridgeInfo includes RelayEnabled=true and ActiveRelaySessions count",
+          "and_then": []
+        },
+        {
+          "name": "BridgeCapabilities includes relay metadata",
+          "when": "BridgeCapabilities is called with RelayEnabled=true",
+          "then": "capabilities map includes relay=true and relay_listen_port",
+          "and_then": []
+        },
+        {
+          "name": "No relay info when relay disabled",
+          "when": "BridgeStatus/BridgeCapabilities called with RelayEnabled=false",
+          "then": "no relay-specific fields are included in the output",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The relay UDP forwarding SHALL use pre-allocated buffers and O(1) session lookup for efficient packet processing",
+      "priority": "SHALL",
+      "rationale": "Relay is on the hot path for mesh traffic. Per-packet allocation or linear session search would degrade performance",
+      "scenarios": [
+        {
+          "name": "Read buffer is pre-allocated",
+          "when": "the dispatch loop reads a UDP packet",
+          "then": "the read uses a pre-allocated byte buffer (not allocated per packet)",
+          "and_then": []
+        },
+        {
+          "name": "Session lookup by source address is O(1)",
+          "when": "a packet arrives and the relay identifies the session",
+          "then": "session is found via map[string]*RelaySession keyed by source address string",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "All relay operations SHALL use structured logging with slog and component='bridge'",
+      "priority": "SHALL",
+      "rationale": "Consistency with the bridge package and other packages in the codebase",
+      "scenarios": [
+        {
+          "name": "Logger component field set",
+          "when": "any relay method logs",
+          "then": "log entries include component=bridge",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The relay SHALL handle peer endpoint changes by updating the session's endpoint mappings when packets arrive from new source addresses for known peers",
+      "priority": "SHOULD",
+      "rationale": "NAT rebinding can change a peer's public endpoint. The relay must handle this to maintain connectivity without session recreation",
+      "scenarios": [
+        {
+          "name": "New source address updates session endpoint",
+          "when": "a packet arrives from an unknown address but the relay determines it belongs to a known peer via the packet dispatch logic",
+          "then": "the session updates the peer's endpoint to the new source address and subsequent forwards go to the new address",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Add RelayConfig, RelaySessionAssignment, and RelayInfo API types to internal/api/types.go — RelayConfig struct (Sessions []RelaySessionAssignment) added as *RelayConfig field on StateResponse. RelaySessionAssignment struct (SessionID string, PeerAID string, PeerAEndpoint string, PeerBID string, PeerBEndpoint string, ExpiresAt time.Time). Add RelayEnabled bool and ActiveRelaySessions int fields to BridgeInfo. Add relay_session_assigned and relay_session_revoked event constants to envelope.go. Include JSON round-trip tests in types_test.go. (REQ-004, REQ-007)",
+    "1.2 Extend internal/bridge/config.go — Add relay fields to Config: RelayEnabled bool, RelayListenPort int, MaxRelaySessions int, SessionTTL time.Duration. Add DefaultRelayListenPort=51821, DefaultMaxRelaySessions=100, DefaultSessionTTL=5m constants. Update ApplyDefaults to set relay defaults. Update Validate to check: relay requires bridge enabled, valid port 1-65535, positive MaxRelaySessions, SessionTTL >= 30s. Include tests in config_test.go. (REQ-001)",
+    "1.3 Create internal/bridge/relay.go — RelaySession struct with SessionID, PeerAAddr/PeerBAddr *net.UDPAddr, conn *net.UDPConn (shared relay socket), closed bool, mu sync.Mutex. Implement Forward(srcAddr *net.UDPAddr, data []byte) method that determines the other peer and writes to their endpoint. Implement Close() (idempotent). Relay struct with cfg Config, conn *net.UDPConn, logger *slog.Logger, sessions map[string]*RelaySession, addrIndex map[string]*RelaySession (source addr → session for O(1) lookup), active bool, mu sync.RWMutex. Implement NewRelay(cfg Config, logger *slog.Logger) *Relay. Implement Start(ctx context.Context) error (open UDP socket, start dispatchLoop goroutine). Implement dispatchLoop (read UDP, lookup session by source addr, call Forward). Implement AddSession(assignment api.RelaySessionAssignment) error (parse endpoints, create session, register in addrIndex, start TTL timer). Implement RemoveSession(sessionID string) (close session, remove from maps). Implement UpdateSession(sessionID string, peerAEndpoint, peerBEndpoint string) error. Implement Stop() error (close all sessions, close conn, idempotent). Implement ActiveCount() int. Implement SessionIDs() []string. Include tests in relay_test.go. (REQ-002, REQ-003, REQ-008, REQ-009, REQ-010)",
+    "2.1 Create internal/bridge/relay_handler.go — HandleRelaySessionAssigned(relay *Relay) api.EventHandler: parse RelaySessionAssignment from envelope payload, call relay.AddSession. HandleRelaySessionRevoked(relay *Relay) api.EventHandler: parse session_id from payload, call relay.RemoveSession, no-op if not found. RelayReconcileHandler(relay *Relay) reconcile.ReconcileHandler: compare desired RelayConfig.Sessions against relay.SessionIDs(), add missing via AddSession, remove stale via RemoveSession. Include tests in relay_handler_test.go. (REQ-005, REQ-006)",
+    "2.2 Update internal/bridge/manager.go — Add relay *Relay field to Manager. Update NewManager to create Relay if RelayEnabled. Add StartRelay(ctx context.Context) error that delegates to relay.Start. Add StopRelay() error that delegates to relay.Stop. Update BridgeStatus to include RelayEnabled and ActiveRelaySessions from relay.ActiveCount(). Update BridgeCapabilities to include relay=true and relay_listen_port when RelayEnabled. Update Teardown to call StopRelay. Include tests in manager_test.go. (REQ-007)",
+    "3.1 Create internal/bridge/relay_integration_test.go — TestRelayIntegration_FullFlow: start real UDP relay, add session with two local UDP sockets as peers, send packet from peer A, verify peer B receives it, send from B verify A receives. TestRelayIntegration_ReconcileSessionSync: wire Relay with real Reconciler, verify reconciliation adds/removes relay sessions from desired state. TestRelayIntegration_ConcurrentNoRace: concurrent AddSession/RemoveSession/packet forwarding with -race. (REQ-002, REQ-003, REQ-006)",
+    "4.1 Create docs/reference/backend/nat-relay.md — Reference documentation for relay functionality in internal/bridge: Config relay fields with defaults and validation, Relay struct lifecycle (Start, Stop, AddSession, RemoveSession), RelaySession UDP forwarding, SSE handlers (HandleRelaySessionAssigned, HandleRelaySessionRevoked), RelayReconcileHandler, API types (RelayConfig, RelaySessionAssignment, BridgeInfo relay fields), data flow diagram (Peer A → relay bridge UDP listener → Peer B), integration with reconcile, SSE, and bridge Manager. (REQ-001 through REQ-010)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults_RelayFields",
+      "story": "Platform operator can configure relay mode on bridge nodes",
+      "expected": "ApplyDefaults on zero-valued Config sets RelayEnabled=false, RelayListenPort=51821, MaxRelaySessions=100, SessionTTL=5m",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_RelayDisabled",
+      "story": "Platform operator can configure relay mode on bridge nodes",
+      "expected": "Validate returns nil when RelayEnabled=false regardless of other relay fields",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_RelayWithoutBridge",
+      "story": "Platform operator can configure relay mode on bridge nodes",
+      "expected": "Validate returns error when RelayEnabled=true but Enabled=false",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_RelayInvalidPort",
+      "story": "Platform operator can configure relay mode on bridge nodes",
+      "expected": "Validate returns error when RelayListenPort is 0 or > 65535 with RelayEnabled=true",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_RelayInvalidMaxSessions",
+      "story": "Platform operator can configure relay mode on bridge nodes",
+      "expected": "Validate returns error when MaxRelaySessions <= 0 with RelayEnabled=true",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_RelayInvalidSessionTTL",
+      "story": "Platform operator can configure relay mode on bridge nodes",
+      "expected": "Validate returns error when SessionTTL < 30s with RelayEnabled=true",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_RelayValidConfig",
+      "story": "Platform operator can configure relay mode on bridge nodes",
+      "expected": "Validate returns nil for a fully valid relay config with valid bridge config",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/relay_test.go",
+      "test_function": "TestRelaySession_ForwardAtoB",
+      "story": "Relay bridge node forwards encrypted UDP traffic between unreachable peers",
+      "expected": "Packet from PeerA endpoint is forwarded to PeerB endpoint",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/bridge/relay_test.go",
+      "test_function": "TestRelaySession_ForwardBtoA",
+      "story": "Relay bridge node forwards encrypted UDP traffic between unreachable peers",
+      "expected": "Packet from PeerB endpoint is forwarded to PeerA endpoint",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/bridge/relay_test.go",
+      "test_function": "TestRelaySession_DropUnknownSource",
+      "story": "Relay bridge node forwards encrypted UDP traffic between unreachable peers",
+      "expected": "Packet from unknown address is dropped without forwarding",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/bridge/relay_test.go",
+      "test_function": "TestRelaySession_CloseIdempotent",
+      "story": "Relay bridge node performs clean shutdown of relay resources",
+      "expected": "Calling Close twice returns nil both times without panic",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/bridge/relay_test.go",
+      "test_function": "TestRelay_Start_Disabled",
+      "story": "Platform operator can configure relay mode on bridge nodes",
+      "expected": "Start with RelayEnabled=false opens no listener, returns nil",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/relay_test.go",
+      "test_function": "TestRelay_AddSession",
+      "story": "Bridge node accepts relay registration and manages relay sessions",
+      "expected": "AddSession creates a new session accessible for packet forwarding",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/relay_test.go",
+      "test_function": "TestRelay_AddSession_Duplicate",
+      "story": "Bridge node accepts relay registration and manages relay sessions",
+      "expected": "AddSession with duplicate session ID returns error",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/relay_test.go",
+      "test_function": "TestRelay_AddSession_MaxReached",
+      "story": "Bridge node accepts relay registration and manages relay sessions",
+      "expected": "AddSession when at capacity returns error",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/relay_test.go",
+      "test_function": "TestRelay_RemoveSession",
+      "story": "Bridge node accepts relay registration and manages relay sessions",
+      "expected": "RemoveSession closes and removes the session; non-existent returns nil",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/relay_test.go",
+      "test_function": "TestRelay_Stop",
+      "story": "Relay bridge node performs clean shutdown of relay resources",
+      "expected": "Stop closes all sessions and the listener; idempotent",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/relay_test.go",
+      "test_function": "TestRelay_SessionExpiry",
+      "story": "Bridge node accepts relay registration and manages relay sessions",
+      "expected": "Session is automatically removed after TTL expires",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestRelayConfig_JSONRoundTrip",
+      "story": "Relay session lifecycle integrates with reconciliation and SSE events",
+      "expected": "RelayConfig and RelaySessionAssignment serialize/deserialize correctly to/from JSON",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestBridgeInfo_RelayFields_JSONRoundTrip",
+      "story": "Relay node reports relay status in heartbeats and capabilities in registration",
+      "expected": "BridgeInfo with relay fields serializes/deserializes correctly",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/bridge/relay_handler_test.go",
+      "test_function": "TestHandleRelaySessionAssigned",
+      "story": "Relay session lifecycle integrates with reconciliation and SSE events",
+      "expected": "SSE handler calls Relay.AddSession with parsed peer endpoints",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/relay_handler_test.go",
+      "test_function": "TestHandleRelaySessionAssigned_MalformedPayload",
+      "story": "Relay session lifecycle integrates with reconciliation and SSE events",
+      "expected": "Malformed payload returns error, no session created",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/relay_handler_test.go",
+      "test_function": "TestHandleRelaySessionRevoked",
+      "story": "Relay session lifecycle integrates with reconciliation and SSE events",
+      "expected": "SSE handler calls Relay.RemoveSession with session ID",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/relay_handler_test.go",
+      "test_function": "TestHandleRelaySessionRevoked_NotFound",
+      "story": "Relay session lifecycle integrates with reconciliation and SSE events",
+      "expected": "Revoking non-existent session is no-op, returns nil",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/relay_handler_test.go",
+      "test_function": "TestRelayReconcileHandler_NoChanges",
+      "story": "Relay session lifecycle integrates with reconciliation and SSE events",
+      "expected": "Handler returns nil when desired matches active sessions",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/relay_handler_test.go",
+      "test_function": "TestRelayReconcileHandler_AddMissing",
+      "story": "Relay session lifecycle integrates with reconciliation and SSE events",
+      "expected": "Handler adds sessions from desired state that are not active",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/relay_handler_test.go",
+      "test_function": "TestRelayReconcileHandler_RemoveStale",
+      "story": "Relay session lifecycle integrates with reconciliation and SSE events",
+      "expected": "Handler removes active sessions not in desired state",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/relay_handler_test.go",
+      "test_function": "TestRelayReconcileHandler_NilRelayConfig",
+      "story": "Relay session lifecycle integrates with reconciliation and SSE events",
+      "expected": "Handler returns nil when RelayConfig is nil",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_BridgeStatus_WithRelay",
+      "story": "Relay node reports relay status in heartbeats and capabilities in registration",
+      "expected": "BridgeStatus includes relay fields when relay is active",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_BridgeCapabilities_WithRelay",
+      "story": "Relay node reports relay status in heartbeats and capabilities in registration",
+      "expected": "BridgeCapabilities includes relay=true and relay_listen_port when relay is enabled",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/bridge/relay_integration_test.go",
+      "test_function": "TestRelayIntegration_FullFlow",
+      "story": "Relay bridge node forwards encrypted UDP traffic between unreachable peers",
+      "expected": "End-to-end: start relay, add session, send UDP from peer A, verify peer B receives it, and vice versa",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/bridge/relay_integration_test.go",
+      "test_function": "TestRelayIntegration_ReconcileSessionSync",
+      "story": "Relay session lifecycle integrates with reconciliation and SSE events",
+      "expected": "Reconciliation adds missing sessions and removes stale sessions via a real Reconciler",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/relay_integration_test.go",
+      "test_function": "TestRelayIntegration_ConcurrentNoRace",
+      "story": "Relay session lifecycle integrates with reconciliation and SSE events",
+      "expected": "Concurrent session add/remove/forward operations with -race flag detect no races",
+      "requirement_id": "REQ-003"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-009) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "Relay follows the established bridge package patterns: same package (internal/bridge), Config with ApplyDefaults/Validate, Manager integration, SSE handlers via api.EventHandler, ReconcileHandler via reconcile.ReconcileHandler",
+    "HandleRelaySessionAssigned/Revoked follow the tunnel.HandleSSHSessionSetup/HandleSessionRevoked pattern for SSE event handling",
+    "RelayReconcileHandler follows the bridge.ReconcileHandler pattern (closure returning reconcile.ReconcileHandler)",
+    "UDP packet forwarding uses pre-allocated buffers and O(1) session lookup via address-indexed map (no per-packet allocation)",
+    "Relay.Stop and RelaySession.Close are idempotent following the bridge.Manager.Teardown pattern",
+    "All operations support context-based cancellation where applicable",
+    "Code follows existing patterns: log/slog with component=bridge key, Config with ApplyDefaults/Validate, stdlib-only test dependencies, go.uber.org/goleak in leak tests",
+    "API type additions use json tags with snake_case and omitempty for optional pointer fields",
+    "Reference documentation covers all public types, methods, data flow, and integration patterns (docs/reference/backend/nat-relay.md)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package location**: All relay code lives in `internal/bridge/` since relay is a bridge-mode extension. Files: relay.go (Relay struct, RelaySession, UDP dispatch), relay_handler.go (SSE handlers + reconcile handler), and corresponding _test.go files.\n\n2. **API type additions**: New types in `internal/api/types.go`: `RelayConfig` (control plane → bridge node: list of relay session assignments), `RelaySessionAssignment` (SessionID, PeerAID, PeerAEndpoint, PeerBID, PeerBEndpoint, ExpiresAt). Two new fields on `BridgeInfo`: `RelayEnabled bool` and `ActiveRelaySessions int`. New `RelayConfig *RelayConfig` field on `StateResponse`. Two new event constants in `envelope.go`: `EventRelaySessionAssigned` and `EventRelaySessionRevoked`.\n\n3. **Config extension**: Relay fields are added directly to `bridge.Config` rather than a separate struct, since relay requires bridge mode. New fields: `RelayEnabled bool`, `RelayListenPort int`, `MaxRelaySessions int`, `SessionTTL time.Duration`. Validation enforces: relay requires bridge enabled, valid port range, positive max sessions, TTL >= 30s.\n\n4. **UDP relay architecture**: The Relay struct owns a single `*net.UDPConn` (one UDP socket). All relay sessions share this socket. A dispatch goroutine reads packets and routes them to the correct session via an `addrIndex map[string]*RelaySession` keyed by `net.UDPAddr.String()`. This achieves O(1) lookup per packet. Each RelaySession knows both peer addresses and the shared conn; `Forward` writes to the other peer's address. A pre-allocated byte buffer (e.g., 65535 bytes) is reused across reads to avoid per-packet allocation.\n\n5. **Session lifecycle**: Sessions are created via SSE events (real-time) or reconciliation (drift correction). Each session has a TTL enforced via `time.AfterFunc`. Expired sessions are automatically removed. The reconcile handler computes the diff between desired (StateResponse.RelayConfig.Sessions) and active (relay.SessionIDs()) sessions, adding missing and removing stale ones.\n\n6. **Peer endpoint updates**: NAT rebinding can change peer endpoints. The relay handles this by checking if the source address of an incoming packet doesn't match either registered peer but the packet context (shared UDP socket, correct destination) suggests it belongs to a known session. A simpler initial approach: when a packet arrives from an unregistered address, it's dropped. Explicit endpoint updates come via UpdateSession (called during reconciliation when endpoint info changes).\n\n7. **Manager integration**: The bridge Manager gains a `*Relay` field. StartRelay/StopRelay delegate to Relay.Start/Stop. BridgeStatus and BridgeCapabilities are extended to include relay info. Teardown calls StopRelay before the existing bridge teardown. The relay ReconcileHandler is registered alongside the bridge ReconcileHandler.\n\n8. **Dependencies**: Relay imports only `internal/api` (types), `internal/reconcile` (handler type), `net` (UDP), and standard library. It does NOT import wireguard, nat, or peerexchange — those integrations happen at the orchestration layer.\n\n9. **Key files from existing codebase to follow**:\n    - `internal/bridge/config.go` — Config pattern to extend with relay fields\n    - `internal/bridge/manager.go` — Manager pattern to extend with relay lifecycle\n    - `internal/bridge/handler.go` — ReconcileHandler and SSE handler pattern\n    - `internal/tunnel/session.go` — Session lifecycle pattern (Start, Close, idempotent)\n    - `internal/tunnel/manager.go` — SessionManager pattern (AddSession, RemoveSession, max sessions, TTL)\n    - `internal/tunnel/handler.go` — HandleSSHSessionSetup/HandleSessionRevoked patterns for SSE event handlers\n    - `internal/bridge/mock_route_test.go` — Mock pattern for test doubles\n    - `internal/api/types.go` — API type definitions with JSON tags\n    - `internal/api/envelope.go` — SSE event type constants\n\n10. **Potential pitfalls**:\n    - The relay UDP socket must use `SO_REUSEADDR` if the port might conflict with other services. However, since RelayListenPort is configurable and defaults to 51821 (different from WireGuard's 51820), this is unlikely.\n    - Session TTL timers must be stopped when sessions are explicitly removed to prevent double-removal race conditions.\n    - The addrIndex map must be updated atomically with session creation/removal to prevent stale entries.\n    - UDP ReadFromUDP blocks, so the dispatch loop must check context cancellation via closing the conn (same pattern as TCP listener in tunnel.Session).\n    - BridgeInfo relay fields must be zero-valued (not omitted) when relay is disabled to maintain backward compatibility with existing control plane parsers. Use `json:\"relay_enabled\"` without omitempty.\n    - The reconcile handler for relay sessions should run after the bridge route handler to ensure bridge routing is set up before relay sessions start.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.109058"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T18:11:08.049792"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T18:16:19.833024"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "5d2b3a2c-0c71-457c-9492-e0aac7025549",
+      "timestamp": "2026-02-12T18:16:19.833051",
+      "total_duration": 307.86452078819275,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 307.86452078819275,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
