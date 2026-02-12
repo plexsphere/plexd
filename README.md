@@ -2,6 +2,8 @@
 
 plexd runs on every node in a Plexsphere-managed environment. It connects to the control plane, registers the node, establishes encrypted mesh tunnels to peers, enforces network policies, and continuously reconciles local state against the desired state.
 
+> **MVP / Work in Progress** – This project is under active development. APIs, configuration formats, protocols, and internal interfaces are subject to change without prior notice. Do not rely on current behavior or interfaces for production use.
+
 ## Key Capabilities
 
 - **Self-Registration:** Authenticates with a one-time bootstrap token and enrolls the node with the control plane. Works for platform-provisioned resources (token injected via Cloud-Init / K8s Secret) and manually onboarded resources (token provided by the user).
