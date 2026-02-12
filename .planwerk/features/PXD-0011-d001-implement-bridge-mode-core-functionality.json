@@ -1,0 +1,650 @@
+{
+  "feature_id": "PXD-0011",
+  "title": "D001: Implement bridge mode core functionality",
+  "slug": "d001-implement-bridge-mode-core-functionality",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Implement the bridge/gateway operating mode for plexd. A bridge node has both a mesh-side interface (participating in the WireGuard mesh) and an access-side interface (connecting to external networks). Handle dual-interface routing, traffic forwarding between mesh and external networks, and bridge-specific registration with the control plane.",
+  "stories": [
+    {
+      "title": "Bridge node registers with the control plane declaring bridge capabilities",
+      "role": "platform operator",
+      "want": "a plexd node configured in bridge mode to register with the control plane and advertise its bridge capability (access-side network, supported bridge features)",
+      "so_that": "the control plane knows which nodes can serve as bridge/gateway entry points for external traffic",
+      "criteria": [
+        "Registration request includes bridge capability metadata (access-side interface, access-side subnet)",
+        "Bridge mode is reported in capabilities payload via UpdateCapabilities",
+        "Control plane response includes bridge-specific configuration (access-side routes to advertise)",
+        "Non-bridge nodes are unaffected — bridge capability is only sent when bridge mode is enabled"
+      ]
+    },
+    {
+      "title": "Bridge node sets up dual-interface networking on startup",
+      "role": "platform operator",
+      "want": "a bridge node to configure both a mesh-side WireGuard interface and an access-side network interface with proper routing",
+      "so_that": "the bridge can participate in the mesh and simultaneously connect to external networks",
+      "criteria": [
+        "Mesh-side WireGuard interface is configured identically to a standard mesh node (via existing wireguard.Manager)",
+        "Access-side interface name and subnet are validated from bridge configuration",
+        "IP forwarding is enabled between mesh and access interfaces",
+        "Route entries are created to direct external subnet traffic through the access-side interface",
+        "Route entries are created to direct mesh traffic through the WireGuard interface"
+      ]
+    },
+    {
+      "title": "Bridge node forwards traffic between mesh and external networks",
+      "role": "mesh node",
+      "want": "to reach resources on external networks through the bridge node",
+      "so_that": "mesh-internal nodes can access external services without direct internet connectivity",
+      "criteria": [
+        "Traffic from mesh peers destined for access-side subnets is forwarded through the bridge",
+        "Traffic from external networks destined for mesh IPs is forwarded through the WireGuard interface",
+        "NAT masquerading is applied on the access-side interface for outbound mesh traffic",
+        "Forwarding rules respect network policies (only allowed traffic is forwarded)"
+      ]
+    },
+    {
+      "title": "Bridge node reconciles bridge-specific routing state",
+      "role": "system",
+      "want": "to detect and correct drift in bridge routing configuration during reconciliation cycles",
+      "so_that": "the bridge remains correctly configured even if routes or forwarding rules are accidentally removed",
+      "criteria": [
+        "Bridge reconcile handler is registered with the Reconciler alongside existing handlers",
+        "Reconciliation detects missing forwarding rules and re-applies them",
+        "Reconciliation detects stale routes (subnets no longer assigned) and removes them",
+        "Route changes from the control plane (new access-side subnets) are applied during reconciliation",
+        "Drift corrections are included in the drift report sent to the control plane"
+      ]
+    },
+    {
+      "title": "Bridge node handles bridge_config_updated SSE events",
+      "role": "system",
+      "want": "to react to real-time bridge configuration changes from the control plane via SSE",
+      "so_that": "route and forwarding changes take effect without waiting for the next reconciliation interval",
+      "criteria": [
+        "bridge_config_updated SSE event triggers an immediate reconciliation cycle",
+        "Malformed SSE payloads are logged and do not crash the agent",
+        "The handler follows the existing pattern of delegating to TriggerReconcile"
+      ]
+    },
+    {
+      "title": "Bridge node reports bridge status in heartbeats",
+      "role": "control plane",
+      "want": "to receive bridge-specific status information in node heartbeats",
+      "so_that": "the control plane can monitor bridge health, forwarding statistics, and route state",
+      "criteria": [
+        "Heartbeat includes bridge status (enabled, access interface, active routes count)",
+        "Bridge info is only included when bridge mode is enabled",
+        "Bridge status is gathered from the bridge manager's current state"
+      ]
+    },
+    {
+      "title": "Platform operator can configure bridge mode via Config struct",
+      "role": "platform operator",
+      "want": "to enable and configure bridge mode through the plexd configuration",
+      "so_that": "I can control which nodes act as bridges and what external networks they connect to",
+      "criteria": [
+        "Config struct supports Enabled bool, AccessInterface string, AccessSubnets []string, EnableNAT bool",
+        "ApplyDefaults sets sensible defaults (Enabled=false, EnableNAT=true)",
+        "Validate rejects empty AccessInterface when enabled",
+        "Validate rejects empty AccessSubnets when enabled",
+        "Validate rejects invalid CIDR notation in AccessSubnets"
+      ]
+    },
+    {
+      "title": "Bridge node performs clean shutdown of bridge resources",
+      "role": "system",
+      "want": "to cleanly remove all bridge-specific routing rules and forwarding configuration on shutdown",
+      "so_that": "no orphaned routes or iptables rules remain after the agent stops",
+      "criteria": [
+        "Teardown removes all forwarding rules added by the bridge",
+        "Teardown removes all route entries added by the bridge",
+        "Teardown disables IP forwarding if it was enabled by the bridge",
+        "Teardown is idempotent — calling it multiple times is safe",
+        "Teardown errors are logged but do not prevent other cleanup"
+      ]
+    },
+    {
+      "title": "Reference documentation covers bridge mode package",
+      "role": "developer",
+      "want": "comprehensive reference documentation for the internal/bridge package",
+      "so_that": "future developers can understand the bridge mode architecture, configuration, and integration points",
+      "criteria": [
+        "Documentation covers Config struct with all fields and defaults",
+        "Documentation covers Manager lifecycle (Setup, Teardown, routing)",
+        "Documentation covers RouteController interface and its methods",
+        "Documentation covers integration with wireguard, policy, and reconcile packages",
+        "Data flow diagram shows mesh ↔ bridge ↔ external network traffic path"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The bridge package SHALL provide a Config struct with ApplyDefaults and Validate methods following the established codebase pattern",
+      "priority": "SHALL",
+      "rationale": "Consistency with existing packages (wireguard.Config, policy.Config, tunnel.Config) ensures bridge mode is properly configured",
+      "scenarios": [
+        {
+          "name": "Defaults applied to zero-valued Config",
+          "when": "ApplyDefaults is called on a zero-valued Config",
+          "then": "Enabled defaults to false, EnableNAT defaults to true",
+          "and_then": [
+            "AccessInterface and AccessSubnets remain empty"
+          ]
+        },
+        {
+          "name": "Validation passes when disabled",
+          "when": "Validate is called with Enabled=false",
+          "then": "nil is returned regardless of other field values",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects missing AccessInterface when enabled",
+          "when": "Validate is called with Enabled=true and empty AccessInterface",
+          "then": "an error is returned: 'bridge: config: AccessInterface is required when enabled'",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects empty AccessSubnets when enabled",
+          "when": "Validate is called with Enabled=true and empty AccessSubnets",
+          "then": "an error is returned: 'bridge: config: at least one AccessSubnet is required when enabled'",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects invalid CIDR in AccessSubnets",
+          "when": "Validate is called with an AccessSubnet that is not valid CIDR",
+          "then": "an error is returned indicating the invalid CIDR value",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The bridge package SHALL define a RouteController interface abstracting OS-level routing and forwarding operations for testability",
+      "priority": "SHALL",
+      "rationale": "Follows the WGController and FirewallController patterns — abstracts OS operations behind an interface so unit tests use mocks",
+      "scenarios": [
+        {
+          "name": "EnableForwarding enables IP forwarding between interfaces",
+          "when": "EnableForwarding is called with mesh and access interface names",
+          "then": "IP forwarding is enabled at the OS level for both interfaces",
+          "and_then": []
+        },
+        {
+          "name": "DisableForwarding reverses forwarding setup",
+          "when": "DisableForwarding is called with the same interfaces",
+          "then": "IP forwarding settings are restored",
+          "and_then": []
+        },
+        {
+          "name": "AddRoute adds a route entry",
+          "when": "AddRoute is called with a CIDR subnet and interface",
+          "then": "a route entry is created for that subnet; idempotent (re-adding returns nil)",
+          "and_then": []
+        },
+        {
+          "name": "RemoveRoute removes a route",
+          "when": "RemoveRoute is called with a CIDR subnet",
+          "then": "the route is removed; removing a non-existent route returns nil",
+          "and_then": []
+        },
+        {
+          "name": "AddNATMasquerade configures masquerading",
+          "when": "AddNATMasquerade is called with the access interface",
+          "then": "outbound traffic is masqueraded on that interface",
+          "and_then": []
+        },
+        {
+          "name": "RemoveNATMasquerade removes masquerading",
+          "when": "RemoveNATMasquerade is called with the access interface",
+          "then": "the masquerade rule is removed; idempotent",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The bridge Manager SHALL set up dual-interface routing on startup when enabled",
+      "priority": "SHALL",
+      "rationale": "Core purpose of bridge mode: connect WireGuard mesh to external networks via a second interface",
+      "scenarios": [
+        {
+          "name": "Setup configures forwarding and routes",
+          "when": "Manager.Setup is called with valid bridge configuration",
+          "then": "IP forwarding is enabled, routes are added for all access subnets, NAT masquerade is configured if EnableNAT=true",
+          "and_then": [
+            "the manager tracks active routes for teardown and reconciliation"
+          ]
+        },
+        {
+          "name": "Setup is a no-op when disabled",
+          "when": "Manager.Setup is called with Enabled=false",
+          "then": "no changes are made; nil is returned",
+          "and_then": []
+        },
+        {
+          "name": "Setup rolls back on partial failure",
+          "when": "AddRoute fails for the second of three subnets",
+          "then": "the first route is removed (rollback) and the error is returned",
+          "and_then": [
+            "the bridge is not marked as active"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The bridge Manager SHALL provide a Teardown method that cleanly removes all bridge-specific OS resources",
+      "priority": "SHALL",
+      "rationale": "Prevents orphaned routes and iptables rules after agent shutdown",
+      "scenarios": [
+        {
+          "name": "Teardown removes all bridge resources",
+          "when": "Teardown is called after successful Setup",
+          "then": "all routes removed, NAT masquerade removed, IP forwarding disabled",
+          "and_then": [
+            "manager is marked inactive"
+          ]
+        },
+        {
+          "name": "Teardown is idempotent",
+          "when": "Teardown is called when bridge was never set up",
+          "then": "nil is returned",
+          "and_then": []
+        },
+        {
+          "name": "Teardown continues on partial failure",
+          "when": "RemoveRoute fails for one subnet",
+          "then": "teardown continues; aggregated error returned via errors.Join",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The bridge package SHALL provide a ReconcileHandler for bridge routing drift detection and correction",
+      "priority": "SHALL",
+      "rationale": "Follows the established pattern where each subsystem registers a ReconcileHandler with the Reconciler",
+      "scenarios": [
+        {
+          "name": "No bridge changes means no action",
+          "when": "StateDiff has no bridge-relevant changes",
+          "then": "handler returns nil without modifying routes",
+          "and_then": []
+        },
+        {
+          "name": "New access subnets applied",
+          "when": "desired state includes new access subnets not currently routed",
+          "then": "routes for new subnets are added via RouteController",
+          "and_then": []
+        },
+        {
+          "name": "Removed subnets cleaned up",
+          "when": "desired state no longer includes previously routed subnets",
+          "then": "routes for removed subnets are deleted",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The bridge package SHALL provide an SSE event handler for bridge_config_updated events that triggers reconciliation",
+      "priority": "SHALL",
+      "rationale": "Follows the HandlePolicyUpdated pattern — SSE events trigger reconcile rather than applying changes directly",
+      "scenarios": [
+        {
+          "name": "Event triggers reconcile",
+          "when": "a bridge_config_updated SSE event is received",
+          "then": "TriggerReconcile is called on the Reconciler",
+          "and_then": []
+        },
+        {
+          "name": "Malformed event handled gracefully",
+          "when": "event has malformed payload",
+          "then": "error logged, TriggerReconcile still called",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The bridge package SHALL add BridgeConfig and BridgeInfo API types to internal/api/types.go",
+      "priority": "SHALL",
+      "rationale": "The control plane communicates bridge configuration via StateResponse and receives bridge status in heartbeats",
+      "scenarios": [
+        {
+          "name": "BridgeConfig included in StateResponse",
+          "when": "FetchState returns a response for a bridge node",
+          "then": "StateResponse.BridgeConfig contains access subnets and forwarding settings from the control plane",
+          "and_then": []
+        },
+        {
+          "name": "BridgeInfo included in HeartbeatRequest",
+          "when": "a bridge node sends a heartbeat",
+          "then": "HeartbeatRequest.Bridge contains Enabled, AccessInterface, and ActiveRoutes count",
+          "and_then": []
+        },
+        {
+          "name": "Null BridgeConfig for non-bridge nodes",
+          "when": "FetchState returns a response for a non-bridge node",
+          "then": "StateResponse.BridgeConfig is nil (omitted in JSON)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The bridge package SHALL add bridge_config_updated SSE event type constant and EventBridgeConfigUpdated to internal/api/envelope.go",
+      "priority": "SHALL",
+      "rationale": "New SSE event type needed for the control plane to notify bridge nodes of configuration changes",
+      "scenarios": [
+        {
+          "name": "Event constant defined",
+          "when": "the api package is imported",
+          "then": "api.EventBridgeConfigUpdated equals 'bridge_config_updated'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The bridge Manager SHALL apply NAT masquerading on the access-side interface when EnableNAT is true",
+      "priority": "SHALL",
+      "rationale": "Mesh nodes use private IPs not routable on external networks; NAT translates them to the bridge's access-side IP",
+      "scenarios": [
+        {
+          "name": "NAT masquerade enabled on setup",
+          "when": "Setup is called with EnableNAT=true",
+          "then": "AddNATMasquerade is called for the access interface",
+          "and_then": []
+        },
+        {
+          "name": "NAT masquerade skipped when disabled",
+          "when": "Setup is called with EnableNAT=false",
+          "then": "AddNATMasquerade is NOT called",
+          "and_then": []
+        },
+        {
+          "name": "NAT masquerade removed on teardown",
+          "when": "Teardown is called after NAT was configured",
+          "then": "RemoveNATMasquerade is called",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The bridge Manager SHALL provide BridgeStatus for heartbeat reporting and BridgeCapabilities for registration",
+      "priority": "SHALL",
+      "rationale": "Enables control plane visibility into bridge state and capability discovery",
+      "scenarios": [
+        {
+          "name": "Active bridge returns status",
+          "when": "BridgeStatus is called on an active bridge",
+          "then": "returns non-nil BridgeInfo with interface name and route count",
+          "and_then": []
+        },
+        {
+          "name": "Disabled bridge returns nil",
+          "when": "BridgeStatus is called on a disabled bridge",
+          "then": "returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Bridge capabilities returned for registration",
+          "when": "BridgeCapabilities is called on an enabled bridge",
+          "then": "returns capability metadata including access interface and subnets",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "All bridge operations SHALL use structured logging with slog and component='bridge'",
+      "priority": "SHALL",
+      "rationale": "Consistency with all other packages that use logger.With('component', 'bridge')",
+      "scenarios": [
+        {
+          "name": "Logger component field set",
+          "when": "any bridge Manager method logs",
+          "then": "log entries include component=bridge",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Add BridgeConfig and BridgeInfo API types to internal/api/types.go — BridgeConfig struct (AccessSubnets []string, EnableNAT bool, EnableForwarding bool) for StateResponse.BridgeConfig field. BridgeInfo struct (Enabled bool, AccessInterface string, ActiveRoutes int) for HeartbeatRequest.Bridge field. Add BridgeConfig *BridgeConfig field to StateResponse. Add Bridge *BridgeInfo field to HeartbeatRequest. Add bridge_config_updated event constant to envelope.go. Include JSON round-trip tests in types_test.go. (REQ-007, REQ-008)",
+    "1.2 Create internal/bridge/config.go — Config struct with Enabled bool, AccessInterface string, AccessSubnets []string, EnableNAT bool. Implement ApplyDefaults() (Enabled=false, EnableNAT=true for zero-value). Implement Validate() (skip if disabled; reject empty AccessInterface, empty AccessSubnets, invalid CIDR). Follow wireguard.Config/policy.Config pattern. Include tests in config_test.go. (REQ-001)",
+    "1.3 Create internal/bridge/route.go — RouteController interface with EnableForwarding(meshIface, accessIface string) error, DisableForwarding(meshIface, accessIface string) error, AddRoute(subnet, iface string) error, RemoveRoute(subnet, iface string) error, AddNATMasquerade(iface string) error, RemoveNATMasquerade(iface string) error. Create mock_route_test.go with mockRouteController for tests. Follow wireguard.WGController/policy.FirewallController interface pattern. (REQ-002)",
+    "1.4 Create internal/bridge/manager.go — Manager struct holding RouteController, Config, logger, and tracked state (active bool, activeRoutes map[string]struct{}, natConfigured bool). Implement NewManager(ctrl RouteController, cfg Config, logger *slog.Logger) *Manager. Implement Setup(meshIface string) error (enable forwarding, add routes with rollback on failure, add NAT if enabled, mark active). Implement Teardown() error (remove routes, NAT, forwarding with errors.Join aggregation, mark inactive). Implement UpdateRoutes(subnets []string) error (compute diff of current vs desired subnets, add new, remove stale). Implement BridgeStatus() *api.BridgeInfo and BridgeCapabilities() map[string]string. Include tests in manager_test.go. (REQ-003, REQ-004, REQ-009, REQ-010)",
+    "2.1 Create internal/bridge/handler.go — ReconcileHandler(mgr *Manager) reconcile.ReconcileHandler that extracts BridgeConfig from desired state and calls mgr.UpdateRoutes with the desired subnets. HandleBridgeConfigUpdated(trigger ReconcileTrigger) api.EventHandler that calls trigger.TriggerReconcile() on bridge_config_updated events. Define ReconcileTrigger interface matching policy.ReconcileTrigger pattern. Include tests in handler_test.go. (REQ-005, REQ-006)",
+    "3.1 Create internal/bridge/handler_integration_test.go — Integration tests wiring Manager with mock RouteController and real Reconciler. Test full reconciliation flow: state with BridgeConfig → diff computation → bridge handler adds/removes routes. Test setup + reconcile + teardown lifecycle. Test concurrent bridge and peer changes with -race. (REQ-003, REQ-004, REQ-005)",
+    "4.1 Create docs/reference/backend/bridge-mode.md — Reference documentation for internal/bridge package: Config struct with fields and defaults, Manager lifecycle (Setup, Teardown, UpdateRoutes, BridgeStatus), RouteController interface, ReconcileHandler, HandleBridgeConfigUpdated SSE handler. Include data flow diagram: mesh peers → WireGuard interface → bridge Manager → access-side interface → external network. Integration with wireguard, policy, reconcile, api packages. (REQ-001 through REQ-011)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults",
+      "story": "Platform operator can configure bridge mode via Config struct",
+      "expected": "ApplyDefaults on zero-valued Config sets Enabled=false, EnableNAT=true; AccessInterface and AccessSubnets remain empty",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_Disabled",
+      "story": "Platform operator can configure bridge mode via Config struct",
+      "expected": "Validate returns nil when Enabled=false regardless of other fields",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_MissingAccessInterface",
+      "story": "Platform operator can configure bridge mode via Config struct",
+      "expected": "Validate returns error when Enabled=true and AccessInterface is empty",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_MissingAccessSubnets",
+      "story": "Platform operator can configure bridge mode via Config struct",
+      "expected": "Validate returns error when Enabled=true and AccessSubnets is empty",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_InvalidCIDR",
+      "story": "Platform operator can configure bridge mode via Config struct",
+      "expected": "Validate returns error when AccessSubnets contains invalid CIDR notation",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_ValidConfig",
+      "story": "Platform operator can configure bridge mode via Config struct",
+      "expected": "Validate returns nil for a fully valid enabled config with proper AccessInterface and CIDR subnets",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_Setup_Enabled",
+      "story": "Bridge node sets up dual-interface networking on startup",
+      "expected": "Setup calls EnableForwarding, AddRoute for each subnet, and AddNATMasquerade when EnableNAT=true",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_Setup_Disabled",
+      "story": "Bridge node sets up dual-interface networking on startup",
+      "expected": "Setup with Enabled=false makes no RouteController calls and returns nil",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_Setup_RollbackOnRouteFailure",
+      "story": "Bridge node sets up dual-interface networking on startup",
+      "expected": "When AddRoute fails, previously added routes are removed and error is returned",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_Setup_WithoutNAT",
+      "story": "Bridge node forwards traffic between mesh and external networks",
+      "expected": "Setup with EnableNAT=false skips AddNATMasquerade call",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_Teardown",
+      "story": "Bridge node performs clean shutdown of bridge resources",
+      "expected": "Teardown removes all routes, NAT masquerade, and disables forwarding",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_Teardown_Idempotent",
+      "story": "Bridge node performs clean shutdown of bridge resources",
+      "expected": "Teardown on inactive manager returns nil without calling RouteController",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_Teardown_PartialFailure",
+      "story": "Bridge node performs clean shutdown of bridge resources",
+      "expected": "When RemoveRoute fails for one subnet, teardown continues and returns aggregated error",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_BridgeStatus_Active",
+      "story": "Bridge node reports bridge status in heartbeats",
+      "expected": "BridgeStatus on active bridge returns BridgeInfo with correct interface and route count",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_BridgeStatus_Disabled",
+      "story": "Bridge node reports bridge status in heartbeats",
+      "expected": "BridgeStatus on disabled bridge returns nil",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_BridgeCapabilities",
+      "story": "Bridge node registers with the control plane declaring bridge capabilities",
+      "expected": "BridgeCapabilities returns metadata with access interface and subnets when enabled, nil when disabled",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/bridge/manager_test.go",
+      "test_function": "TestManager_UpdateRoutes",
+      "story": "Bridge node reconciles bridge-specific routing state",
+      "expected": "UpdateRoutes adds new subnets and removes stale subnets compared to current active routes",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/handler_test.go",
+      "test_function": "TestReconcileHandler_NoBridgeChanges",
+      "story": "Bridge node reconciles bridge-specific routing state",
+      "expected": "Handler returns nil without modifying routes when no bridge-related drift exists",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/handler_test.go",
+      "test_function": "TestReconcileHandler_NewSubnets",
+      "story": "Bridge node reconciles bridge-specific routing state",
+      "expected": "Handler adds routes for new access subnets from desired state",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/handler_test.go",
+      "test_function": "TestReconcileHandler_RemovedSubnets",
+      "story": "Bridge node reconciles bridge-specific routing state",
+      "expected": "Handler removes routes for subnets no longer in desired state",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/handler_test.go",
+      "test_function": "TestHandleBridgeConfigUpdated",
+      "story": "Bridge node handles bridge_config_updated SSE events",
+      "expected": "SSE handler calls TriggerReconcile on the Reconciler",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/handler_test.go",
+      "test_function": "TestHandleBridgeConfigUpdated_MalformedPayload",
+      "story": "Bridge node handles bridge_config_updated SSE events",
+      "expected": "Malformed event is logged, TriggerReconcile still called",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestBridgeConfig_JSONRoundTrip",
+      "story": "Bridge node registers with the control plane declaring bridge capabilities",
+      "expected": "BridgeConfig and BridgeInfo serialize/deserialize correctly to/from JSON",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/bridge/handler_integration_test.go",
+      "test_function": "TestBridgeReconcileIntegration_FullFlow",
+      "story": "Bridge node reconciles bridge-specific routing state",
+      "expected": "Full reconciliation cycle: state fetch → diff → bridge handler adds/removes routes → drift reported",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/handler_integration_test.go",
+      "test_function": "TestBridgeReconcileIntegration_SetupTeardown",
+      "story": "Bridge node sets up dual-interface networking on startup",
+      "expected": "Setup followed by Teardown leaves no orphaned routes or forwarding rules",
+      "requirement_id": "REQ-003"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-011) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "RouteController interface follows the same abstraction pattern as wireguard.WGController and policy.FirewallController for testability",
+    "ReconcileHandler integrates with the existing reconcile.Reconciler via RegisterHandler (same pattern as wireguard.ReconcileHandler and policy.ReconcileHandler)",
+    "HandleBridgeConfigUpdated SSE handler delegates to TriggerReconcile rather than applying changes directly (consistency with reconcile loop as source of truth)",
+    "Manager.Setup performs rollback on partial failure — if AddRoute fails, previously added routes in this call are cleaned up",
+    "Manager.Teardown uses errors.Join for error aggregation, continuing cleanup even on partial failure (same as wireguard handler pattern)",
+    "All operations support context-based cancellation where applicable",
+    "Code follows existing patterns: log/slog with component key, Config with ApplyDefaults/Validate, stdlib-only test dependencies, go.uber.org/goleak in tests",
+    "API type additions (BridgeConfig, BridgeInfo) use json tags with snake_case and omitempty for optional pointer fields",
+    "Reference documentation covers all public types, methods, data flow, and integration patterns (docs/reference/backend/bridge-mode.md)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All bridge-specific code lives in `internal/bridge/`. Files: config.go, route.go (RouteController interface + types), manager.go (orchestration), handler.go (reconcile + SSE handlers), and corresponding _test.go files. An integration test file handler_integration_test.go wires components together.\n\n2. **API type additions**: Two new types are added to `internal/api/types.go`: `BridgeConfig` (control plane → node: what subnets to route, NAT/forwarding settings) and `BridgeInfo` (node → control plane: bridge status for heartbeats). A new `BridgeConfig *BridgeConfig` field is added to `StateResponse` and a new `Bridge *BridgeInfo` field to `HeartbeatRequest`. A new event type constant `EventBridgeConfigUpdated = \"bridge_config_updated\"` is added to `envelope.go`. These are the only changes to existing files.\n\n3. **RouteController interface**: Mirrors WGController (wireguard) and FirewallController (policy) patterns. Six methods: EnableForwarding, DisableForwarding, AddRoute, RemoveRoute, AddNATMasquerade, RemoveNATMasquerade. All methods must be idempotent. Production implementation would use netlink and iptables — but the production implementation is NOT in scope for this feature; only the interface and mock. The production RouteController will be implemented as part of platform-specific packages (Phase 6: bare-metal/VM/K8s).\n\n4. **Manager lifecycle**: Setup → active → UpdateRoutes (via reconcile) → Teardown. The Manager tracks state: active bool, activeRoutes (set of subnets currently configured), natConfigured bool. Setup performs an atomic-ish operation: if any route fails, previously added routes are rolled back. Teardown aggregates errors via errors.Join and continues cleanup.\n\n5. **Reconcile integration**: The bridge ReconcileHandler is registered with the Reconciler AFTER the wireguard and policy handlers. It reads the BridgeConfig from the desired state (StateResponse.BridgeConfig) and calls Manager.UpdateRoutes. The handler only acts when BridgeConfig is non-nil. The reconcile.StateDiff does not need bridge-specific fields — the handler compares desired BridgeConfig.AccessSubnets against the Manager's tracked activeRoutes internally.\n\n6. **SSE handler**: HandleBridgeConfigUpdated follows the exact same pattern as policy.HandlePolicyUpdated — it simply calls TriggerReconcile. No payload parsing needed because the reconcile cycle will fetch the full desired state.\n\n7. **Bridge capabilities and status**: BridgeCapabilities() returns a map[string]string suitable for inclusion in the CapabilitiesPayload metadata. BridgeStatus() returns *api.BridgeInfo or nil. These are called by the main agent orchestration code (not in scope for this package).\n\n8. **Dependencies**: The bridge package imports only `internal/api` (for types), `internal/reconcile` (for ReconcileHandler type), and standard library packages. It does NOT import wireguard or policy — those integrations happen at the orchestration layer (main/cmd). The bridge's RouteController is independent of WGController and FirewallController.\n\n9. **Key files from existing codebase to follow**:\n    - `internal/wireguard/config.go` — Config pattern to follow\n    - `internal/wireguard/controller.go` — WGController interface pattern for RouteController\n    - `internal/wireguard/mock_controller_test.go` — Mock pattern for mockRouteController\n    - `internal/wireguard/manager.go` — Manager pattern (constructor, Setup/Teardown, state tracking)\n    - `internal/wireguard/handler.go` — ReconcileHandler pattern (closure returning reconcile.ReconcileHandler)\n    - `internal/policy/handler.go` — HandlePolicyUpdated pattern for HandleBridgeConfigUpdated\n    - `internal/policy/enforcer.go` — errors.Join pattern for partial failure aggregation\n    - `internal/api/types.go` — API type definitions with JSON tags\n    - `internal/api/envelope.go` — SSE event constants\n\n10. **Potential pitfalls**:\n    - The reconcile.StateDiff does not have bridge-specific fields. Rather than adding them (which would require modifying reconcile.ComputeDiff), the bridge handler should compare desired BridgeConfig against the Manager's internal state. This keeps the change footprint minimal.\n    - The BridgeConfig can be nil in StateResponse for non-bridge nodes. The reconcile handler must check for nil before acting.\n    - Route rollback on Setup failure needs careful ordering: routes are removed in reverse order of addition.\n    - Teardown must not fail fatally on individual errors — use errors.Join to aggregate and continue.\n    - The bridge does not manage the WireGuard interface — that's still handled by wireguard.Manager. The bridge only manages routing/forwarding between the WireGuard interface (already up) and the access-side interface.\n    - NAT masquerade is optional (EnableNAT config flag). Some deployments route mesh IPs natively on external networks.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.108596"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T17:31:25.989033"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T17:37:10.175753"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "913bf493-5280-4647-8621-6832a4bde49e",
+      "timestamp": "2026-02-12T17:37:10.175778",
+      "total_duration": 340.0516393184662,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 340.0516393184662,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
