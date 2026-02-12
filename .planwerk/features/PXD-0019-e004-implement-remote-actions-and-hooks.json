@@ -1,0 +1,706 @@
+{
+  "feature_id": "PXD-0019",
+  "title": "E004: Implement remote actions and hooks",
+  "slug": "e004-implement-remote-actions-and-hooks",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Execute platform-triggered actions on nodes. Support built-in operations (diagnostics, service management) and custom hook scripts. Hooks are delivered from the control plane with SHA-256 checksums for integrity verification. Report action results back to the control plane.",
+  "stories": [
+    {
+      "title": "plexd receives and executes a built-in action triggered by the control plane",
+      "role": "plexd agent",
+      "want": "to receive an action_request SSE event from the control plane, identify it as a built-in action (e.g., diagnostics, service restart), execute it locally, and report the result back",
+      "so_that": "platform operators can remotely trigger standardized operations on nodes without SSH access",
+      "criteria": [
+        "HandleActionRequest is an api.EventHandler registered for EventActionRequest that parses the SSE payload into an ActionRequest struct containing ExecutionID, Action (name), Parameters (map[string]string), Timeout, and TriggeredBy",
+        "Upon receiving the event, an ExecutionAck is sent to POST /v1/nodes/{node_id}/executions/{execution_id}/ack with status=accepted (or status=rejected with reason if the action is unknown or parameters are invalid)",
+        "The built-in action is executed asynchronously in a goroutine with a context deadline derived from the Timeout field (capped by Config.MaxActionTimeout)",
+        "After execution completes, an ExecutionResult is sent to POST /v1/nodes/{node_id}/executions/{execution_id}/result with status, exit_code, stdout, stderr, duration, and finished_at",
+        "If the action is unknown (not registered as a built-in or hook), the ack is sent with status=rejected and reason=unknown_action; no execution occurs"
+      ]
+    },
+    {
+      "title": "plexd executes a custom hook script triggered by the control plane",
+      "role": "plexd agent",
+      "want": "to receive an action_request SSE event referencing a custom hook script, verify its integrity via SHA-256 checksum, execute it, and report the result back",
+      "so_that": "platform operators can run custom operational scripts on nodes with cryptographic verification ensuring only authorized code executes",
+      "criteria": [
+        "When an action_request references a hook (identified by looking up the action name in the registered hooks list), the hook script path is resolved from Config.HooksDir and the action name",
+        "Before execution, integrity.Verifier.VerifyHook is called with the hook path and the expected checksum from the ActionRequest; if verification fails, the ack is sent with status=rejected and reason=integrity_check_failed",
+        "Hook scripts are executed as external processes via os/exec.CommandContext with the timeout from the ActionRequest (capped by Config.MaxActionTimeout)",
+        "Parameters from the ActionRequest are passed to the hook script as environment variables with the prefix PLEXD_PARAM_ (e.g., PLEXD_PARAM_target becomes the parameter 'target')",
+        "Stdout and stderr are captured (up to Config.MaxOutputBytes, default 1 MiB) and included in the ExecutionResult sent back to the control plane"
+      ]
+    },
+    {
+      "title": "plexd reports its capabilities (built-in actions and hooks) to the control plane",
+      "role": "plexd agent",
+      "want": "to discover available hook scripts in the hooks directory at startup, compute their checksums, and report all built-in actions and hooks as capabilities to the control plane",
+      "so_that": "the control plane knows which actions are available on each node and can present them to operators",
+      "criteria": [
+        "At startup, the Executor scans Config.HooksDir for executable files and builds a list of HookInfo (name from filename without extension, path, checksum via integrity.HashFile, parameters parsed from a sidecar JSON metadata file if present)",
+        "Built-in actions are registered programmatically with the Executor via RegisterBuiltin(name string, description string, params []api.ActionParam, fn BuiltinFunc)",
+        "The combined capabilities (api.CapabilitiesPayload with BuiltinActions and Hooks) are sent to the control plane via PUT /v1/nodes/{node_id}/capabilities (already exists in endpoints.go)",
+        "If the hooks directory does not exist or is empty, capabilities are reported with only built-in actions and an empty hooks list",
+        "Hook discovery errors (unreadable files, hash failures) are logged at warn level; valid hooks are still reported"
+      ]
+    },
+    {
+      "title": "plexd enforces execution concurrency limits and timeouts",
+      "role": "plexd agent",
+      "want": "to limit the number of concurrent action executions and enforce per-action timeouts to prevent resource exhaustion",
+      "so_that": "a burst of action requests cannot overwhelm the node or cause runaway processes",
+      "criteria": [
+        "Config.MaxConcurrent (default: 5) limits the number of simultaneously running executions; additional requests receive ack with status=rejected and reason=max_concurrent_reached",
+        "Config.MaxActionTimeout (default: 10m) caps the timeout for any single execution regardless of the value requested in the ActionRequest",
+        "If the action timeout expires before execution completes, the process is killed via context cancellation (os/exec.CommandContext), and the result is reported with status=timeout",
+        "The Executor tracks active executions in a sync.Mutex-protected map of executionID to cancel func for cleanup on shutdown",
+        "Duplicate execution IDs are rejected with ack status=rejected and reason=duplicate_execution_id"
+      ]
+    },
+    {
+      "title": "plexd handles execution errors and edge cases gracefully",
+      "role": "platform operator",
+      "want": "all action execution errors to be handled gracefully with proper reporting rather than crashing the agent",
+      "so_that": "plexd remains operational even when actions fail, scripts are missing, or the control plane is unreachable for result reporting",
+      "criteria": [
+        "If a hook script file does not exist at the expected path, the ack is sent with status=rejected and reason=hook_not_found",
+        "If a hook script is not executable, the ack is sent with status=rejected and reason=hook_not_executable",
+        "If the process exits with a non-zero exit code, the result is reported with status=failed, the actual exit code, and captured stdout/stderr",
+        "If reporting the ExecutionResult to the control plane fails (unreachable), the error is logged at warn level but does not affect ongoing executions",
+        "On agent shutdown, all running executions are cancelled via their context and results are reported with status=cancelled if possible"
+      ]
+    },
+    {
+      "title": "plexd provides built-in diagnostics actions",
+      "role": "platform operator",
+      "want": "to trigger pre-built diagnostic actions (ping, connectivity check, gather system info) on nodes remotely",
+      "so_that": "common troubleshooting tasks can be performed without deploying custom hook scripts",
+      "criteria": [
+        "A 'gather_info' built-in action is registered that collects hostname, OS, architecture, Go runtime version, mesh IP, and active peer count and returns them as JSON in stdout",
+        "A 'ping' built-in action is registered that pings a target mesh IP (passed as parameter 'target') and returns the result in stdout with success/failure status",
+        "Built-in actions do not require integrity verification (they are compiled into the binary)",
+        "Built-in actions have access to a NodeInfo provider interface for reading mesh state (mesh IP, peer count, node ID)",
+        "Each built-in action returns (stdout string, stderr string, exitCode int, err error); the Executor wraps these into ExecutionResult"
+      ]
+    },
+    {
+      "title": "Platform operator can configure remote actions and hooks parameters",
+      "role": "platform operator",
+      "want": "to configure execution settings: enable/disable, hooks directory, max concurrent executions, max action timeout, and max output capture size",
+      "so_that": "remote execution can be tuned for different deployment environments or disabled entirely",
+      "criteria": [
+        "Config struct has Enabled bool (default: true), HooksDir string (default: empty), MaxConcurrent int (default: 5), MaxActionTimeout time.Duration (default: 10m), MaxOutputBytes int64 (default: 1 MiB)",
+        "When Enabled is false, the handler acks all action_request events with status=rejected and reason=actions_disabled",
+        "Config.Validate rejects MaxConcurrent < 1 when enabled, MaxActionTimeout < 10s when enabled, and MaxOutputBytes < 1024 when enabled",
+        "Config.ApplyDefaults sets Enabled=true, MaxConcurrent=5, MaxActionTimeout=10m, MaxOutputBytes=1MiB on zero-valued Config"
+      ]
+    },
+    {
+      "title": "Reference documentation for remote actions and hooks",
+      "role": "developer",
+      "want": "comprehensive reference documentation for the internal/actions package",
+      "so_that": "future developers understand the Executor, built-in actions, hook discovery, SSE event handling, and data flow",
+      "criteria": [
+        "Documentation covers Config, Executor, HandleActionRequest, BuiltinFunc, hook discovery, and ActionReporter interface",
+        "Documentation includes data flow: SSE action_request → ack → verify hook → execute → report result",
+        "Documentation references related packages: internal/api (EventActionRequest, ExecutionAck, ExecutionResult, CapabilitiesPayload), internal/integrity (VerifyHook), internal/fsutil",
+        "Documentation is placed at docs/reference/backend/remote-actions-hooks.md"
+      ]
+    },
+    {
+      "title": "How-to guide for adding custom hook scripts",
+      "role": "platform operator",
+      "want": "a step-by-step guide for creating, deploying, and triggering custom hook scripts on nodes",
+      "so_that": "operators can extend plexd functionality without modifying the binary",
+      "criteria": [
+        "Guide covers prerequisites: hook directory setup, script format, metadata file format",
+        "Guide includes numbered steps for creating a hook, deploying it, registering via capabilities, and triggering it from the control plane",
+        "Guide includes verification steps to confirm the hook was discovered and its checksum matches",
+        "Guide is placed at docs/how-to/backend/custom-hook-scripts.md"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The actions package SHALL handle action_request SSE events by parsing the payload, acknowledging receipt to the control plane, and dispatching execution",
+      "priority": "SHALL",
+      "rationale": "Core event-driven architecture: the control plane triggers actions via SSE events; the node must acknowledge and execute them",
+      "scenarios": [
+        {
+          "name": "Valid built-in action request acknowledged and executed",
+          "when": "an action_request SSE event is received with a known built-in action name and valid parameters",
+          "then": "an ExecutionAck with status=accepted is sent to POST /v1/nodes/{node_id}/executions/{execution_id}/ack",
+          "and_then": [
+            "the action is executed asynchronously",
+            "an ExecutionResult is sent to POST /v1/nodes/{node_id}/executions/{execution_id}/result upon completion"
+          ]
+        },
+        {
+          "name": "Unknown action is rejected",
+          "when": "an action_request SSE event references an action name that is not a registered built-in or hook",
+          "then": "an ExecutionAck with status=rejected and reason=unknown_action is sent",
+          "and_then": [
+            "no execution occurs"
+          ]
+        },
+        {
+          "name": "Malformed action_request payload is rejected",
+          "when": "an action_request SSE event has invalid JSON in its payload",
+          "then": "the handler returns an error (logged by the dispatcher)",
+          "and_then": [
+            "no ack or result is sent"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The actions package SHALL verify hook script integrity via SHA-256 checksums before execution using the integrity.Verifier",
+      "priority": "SHALL",
+      "rationale": "Hooks are delivered with SHA-256 checksums; verification prevents execution of tampered or unauthorized scripts",
+      "scenarios": [
+        {
+          "name": "Hook passes integrity verification",
+          "when": "a hook action is requested and the hook file's SHA-256 matches the expected checksum",
+          "then": "the hook is executed",
+          "and_then": []
+        },
+        {
+          "name": "Hook fails integrity verification",
+          "when": "a hook action is requested but the SHA-256 does NOT match",
+          "then": "an ExecutionAck with status=rejected and reason=integrity_check_failed is sent",
+          "and_then": [
+            "the hook is NOT executed"
+          ]
+        },
+        {
+          "name": "Hook file does not exist",
+          "when": "a hook action is requested but the file is not found",
+          "then": "an ExecutionAck with status=rejected and reason=hook_not_found is sent",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The actions package SHALL execute hook scripts as external processes with timeout enforcement and output capture",
+      "priority": "SHALL",
+      "rationale": "Hook scripts must be sandboxed with timeouts and output limits to prevent resource exhaustion",
+      "scenarios": [
+        {
+          "name": "Hook executes successfully",
+          "when": "a verified hook completes within timeout",
+          "then": "ExecutionResult contains status=success, exit_code=0, stdout, stderr, duration",
+          "and_then": []
+        },
+        {
+          "name": "Hook exceeds timeout",
+          "when": "a hook runs longer than the timeout",
+          "then": "process is killed, result has status=timeout",
+          "and_then": []
+        },
+        {
+          "name": "Hook exits non-zero",
+          "when": "a hook returns non-zero exit code",
+          "then": "result has status=failed with the actual exit_code",
+          "and_then": []
+        },
+        {
+          "name": "Output truncated at limit",
+          "when": "a hook produces more output than MaxOutputBytes",
+          "then": "output is truncated to MaxOutputBytes",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The actions package SHALL enforce concurrency limits on simultaneous action executions",
+      "priority": "SHALL",
+      "rationale": "Prevents resource exhaustion from burst action requests",
+      "scenarios": [
+        {
+          "name": "Within concurrency limit",
+          "when": "active executions < MaxConcurrent",
+          "then": "the action is accepted",
+          "and_then": []
+        },
+        {
+          "name": "At concurrency limit",
+          "when": "active executions >= MaxConcurrent",
+          "then": "ack with status=rejected and reason=max_concurrent_reached",
+          "and_then": []
+        },
+        {
+          "name": "Duplicate execution ID",
+          "when": "execution_id is already in progress",
+          "then": "ack with status=rejected and reason=duplicate_execution_id",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The actions package SHALL report execution results back to the control plane",
+      "priority": "SHALL",
+      "rationale": "The control plane needs outcomes for operator visibility and downstream workflows",
+      "scenarios": [
+        {
+          "name": "Result reported successfully",
+          "when": "execution completes and control plane is reachable",
+          "then": "POST /v1/nodes/{node_id}/executions/{execution_id}/result is called",
+          "and_then": []
+        },
+        {
+          "name": "Result reporting fails",
+          "when": "control plane is unreachable",
+          "then": "error logged at warn level; agent continues normally",
+          "and_then": []
+        },
+        {
+          "name": "triggered_by preserved",
+          "when": "action_request includes triggered_by",
+          "then": "ExecutionResult includes the same triggered_by",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The actions package SHALL discover hooks from the hooks directory and report capabilities",
+      "priority": "SHALL",
+      "rationale": "The control plane must know available actions per node",
+      "scenarios": [
+        {
+          "name": "Valid hooks discovered",
+          "when": "hooks directory contains executable scripts",
+          "then": "capabilities include each script with checksum",
+          "and_then": []
+        },
+        {
+          "name": "No hooks directory",
+          "when": "hooks directory does not exist",
+          "then": "capabilities reported with empty hooks list",
+          "and_then": []
+        },
+        {
+          "name": "Metadata sidecar parsed",
+          "when": "hook has a .json sidecar file",
+          "then": "description, parameters, timeout parsed from sidecar",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The actions package SHALL provide built-in diagnostic actions",
+      "priority": "SHALL",
+      "rationale": "Common operations should work without custom hooks",
+      "scenarios": [
+        {
+          "name": "gather_info returns system data",
+          "when": "gather_info action is triggered",
+          "then": "JSON with hostname, OS, arch, Go version, mesh IP, peer count in stdout",
+          "and_then": []
+        },
+        {
+          "name": "ping tests connectivity",
+          "when": "ping action triggered with target parameter",
+          "then": "ping result in stdout with exit_code=0 on success, 1 on failure",
+          "and_then": []
+        },
+        {
+          "name": "Missing required parameter rejected",
+          "when": "built-in action missing required parameter",
+          "then": "ack with status=rejected and reason=missing_required_parameter:{name}",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The actions Config SHALL follow the established Config pattern with ApplyDefaults and Validate methods",
+      "priority": "SHALL",
+      "rationale": "Consistency with existing Config patterns in the codebase",
+      "scenarios": [
+        {
+          "name": "Zero-valued config gets defaults",
+          "when": "ApplyDefaults on zero-valued Config",
+          "then": "Enabled=true, MaxConcurrent=5, MaxActionTimeout=10m, MaxOutputBytes=1MiB",
+          "and_then": []
+        },
+        {
+          "name": "Invalid MaxConcurrent rejected",
+          "when": "Enabled=true and MaxConcurrent < 1",
+          "then": "error returned",
+          "and_then": []
+        },
+        {
+          "name": "Disabled passes validation",
+          "when": "Enabled=false",
+          "then": "nil returned",
+          "and_then": []
+        },
+        {
+          "name": "Invalid MaxActionTimeout rejected",
+          "when": "Enabled=true and MaxActionTimeout < 10s",
+          "then": "error returned",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The actions package SHALL use structured logging with log/slog and component=actions",
+      "priority": "SHALL",
+      "rationale": "Consistency with existing logging patterns",
+      "scenarios": [
+        {
+          "name": "Action accepted logged",
+          "when": "action accepted",
+          "then": "info log with component=actions, execution_id, action",
+          "and_then": []
+        },
+        {
+          "name": "Action rejected logged",
+          "when": "action rejected",
+          "then": "warn log with component=actions, execution_id, reason",
+          "and_then": []
+        },
+        {
+          "name": "Execution completed logged",
+          "when": "execution finishes",
+          "then": "info log with component=actions, execution_id, status, duration",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The actions Executor SHALL perform graceful shutdown, cancelling running executions",
+      "priority": "SHALL",
+      "rationale": "Prevents orphaned processes on agent shutdown",
+      "scenarios": [
+        {
+          "name": "Shutdown cancels running executions",
+          "when": "Shutdown called with active executions",
+          "then": "all execution contexts cancelled",
+          "and_then": [
+            "results with status=cancelled reported"
+          ]
+        },
+        {
+          "name": "Shutdown with no executions",
+          "when": "Shutdown called with no active executions",
+          "then": "completes immediately",
+          "and_then": []
+        },
+        {
+          "name": "Rejected after shutdown",
+          "when": "request after shutdown",
+          "then": "ack with status=rejected and reason=shutting_down",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "The actions package SHALL pass parameters to hook scripts as PLEXD_PARAM_ prefixed environment variables",
+      "priority": "SHALL",
+      "rationale": "Environment variables are the standard mechanism for passing data to shell scripts",
+      "scenarios": [
+        {
+          "name": "Parameters set as env vars",
+          "when": "hook executed with parameters",
+          "then": "PLEXD_PARAM_ prefixed env vars set",
+          "and_then": []
+        },
+        {
+          "name": "Empty parameters clean env",
+          "when": "hook executed with no parameters",
+          "then": "no PLEXD_PARAM_ env vars",
+          "and_then": []
+        },
+        {
+          "name": "Unsafe names sanitized",
+          "when": "parameter name has special characters",
+          "then": "replaced with underscores",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/actions/config.go — Define Config struct with Enabled bool, HooksDir string, MaxConcurrent int, MaxActionTimeout time.Duration, and MaxOutputBytes int64. Implement ApplyDefaults() (Enabled=true, MaxConcurrent=5, MaxActionTimeout=10m, MaxOutputBytes=1MiB on zero-valued Config) and Validate() (reject MaxConcurrent<1, MaxActionTimeout<10s, MaxOutputBytes<1024 when enabled; pass when disabled). Follow same Config pattern as internal/tunnel/config.go and internal/integrity/config.go. Include tests in config_test.go. (REQ-008)",
+    "1.2 Add ActionRequest type to internal/api/types.go — Add ActionRequest struct (ExecutionID string, Action string, Parameters map[string]string, Timeout string, Checksum string, TriggeredBy *TriggeredBy) to the Execution section of types.go. This is the SSE payload for action_request events. Include JSON marshaling test in types_test.go. (REQ-001)",
+    "1.3 Create internal/actions/discovery.go — Implement DiscoverHooks(hooksDir string) ([]api.HookInfo, error) that scans a directory for executable files, computes SHA-256 via integrity.HashFile, and parses optional .json sidecar files for metadata (description, parameters, timeout, sandbox). Returns empty list (not error) if directory does not exist. Include tests in discovery_test.go with: valid directory, missing directory, sidecar metadata, non-executable files skipped. (REQ-006)",
+    "1.4 Create internal/actions/builtins.go — Define BuiltinFunc type: func(ctx context.Context, params map[string]string) (stdout string, stderr string, exitCode int, err error). Define NodeInfoProvider interface (NodeID() string, MeshIP() string, PeerCount() int). Implement GatherInfo(info NodeInfoProvider) BuiltinFunc that returns JSON with hostname, OS, arch, Go version, mesh_ip, peer_count. Implement Ping(info NodeInfoProvider) BuiltinFunc that pings a target mesh IP. Include tests in builtins_test.go with mock NodeInfoProvider. (REQ-007)",
+    "2.1 Create internal/actions/executor.go — Define ActionReporter interface (AckExecution(ctx, nodeID, executionID string, ack api.ExecutionAck) error; ReportResult(ctx, nodeID, executionID string, result api.ExecutionResult) error). Define HookVerifier interface (VerifyHook(ctx, nodeID, hookPath, expectedChecksum string) (bool, error)). Define Executor struct wrapping Config, ActionReporter, HookVerifier, logger, sync.Mutex-protected active map[string]context.CancelFunc, builtins map[string]builtinEntry (name → BuiltinFunc+metadata), hooks []api.HookInfo, and shuttingDown bool. Implement RegisterBuiltin, Execute (dispatches to runBuiltin or runHook based on action name lookup), Shutdown, ActiveCount. Execute sends ack, checks concurrency/duplicate, runs in goroutine, reports result. runHook: resolve path from HooksDir+name, verify integrity, exec.CommandContext with timeout, capture output with io.LimitedReader, pass params as PLEXD_PARAM_ env vars, sanitize param names. runBuiltin: call BuiltinFunc with params, wrap into result. Include executor_test.go with all test specs for REQ-003, REQ-004, REQ-005, REQ-010, REQ-011. (REQ-003, REQ-004, REQ-005, REQ-010, REQ-011)",
+    "2.2 Create internal/actions/handler.go — Implement HandleActionRequest(executor *Executor, nodeID string) api.EventHandler that parses the action_request SSE payload into an ActionRequest, calls executor.Execute. Log at info/warn/error levels with component=actions. Include handler_test.go with all handler test specs for REQ-001, REQ-002: valid builtin, unknown action, malformed payload, hook action, hook integrity failure, hook not found, disabled. (REQ-001, REQ-002, REQ-009)",
+    "3.1 Create internal/actions/handler_integration_test.go — Integration tests with real hook scripts on disk, real Executor with mock ActionReporter and real integrity.Verifier. Tests: full lifecycle (action_request → ack → execute builtin → result), hook integrity and execution lifecycle, concurrent executions with -race, shutdown cancels running executions with no goroutine leaks (goleak). (REQ-001 through REQ-011)",
+    "4.1 Create docs/reference/backend/remote-actions-hooks.md — Reference documentation for internal/actions/ package: Config struct, Executor (RegisterBuiltin/Execute/Shutdown), HandleActionRequest, BuiltinFunc, NodeInfoProvider, ActionReporter/HookVerifier interfaces, DiscoverHooks, hook sidecar format. Include data flow diagram: SSE action_request → parse → ack → verify hook (if hook) → execute → capture output → report result. Reference integration with internal/api (ActionRequest, ExecutionAck, ExecutionResult, CapabilitiesPayload, EventActionRequest), internal/integrity (VerifyHook, HashFile). (REQ-001 through REQ-011)",
+    "4.2 Create docs/how-to/backend/custom-hook-scripts.md — How-to guide for creating and deploying custom hook scripts. Prerequisites: hooks directory configured, script format. Steps: 1) Create script, 2) Create optional .json sidecar, 3) Make executable, 4) Deploy to HooksDir, 5) Restart plexd or wait for capability refresh, 6) Trigger from control plane. Verification: check capabilities endpoint, verify checksum. References docs/reference/backend/remote-actions-hooks.md. (REQ-006)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/actions/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults",
+      "story": "Platform operator can configure remote actions and hooks parameters",
+      "expected": "ApplyDefaults sets Enabled=true, MaxConcurrent=5, MaxActionTimeout=10m, MaxOutputBytes=1MiB on zero-valued Config",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/actions/config_test.go",
+      "test_function": "TestConfig_Validate",
+      "story": "Platform operator can configure remote actions and hooks parameters",
+      "expected": "Validate rejects MaxConcurrent<1, MaxActionTimeout<10s, MaxOutputBytes<1024 when enabled; passes when disabled",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/actions/handler_test.go",
+      "test_function": "TestHandleActionRequest_BuiltinAction",
+      "story": "plexd receives and executes a built-in action triggered by the control plane",
+      "expected": "Receives action_request SSE event, sends accepted ack, executes built-in, reports result with status=success",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/actions/handler_test.go",
+      "test_function": "TestHandleActionRequest_UnknownAction",
+      "story": "plexd receives and executes a built-in action triggered by the control plane",
+      "expected": "Unknown action name sends rejected ack with reason=unknown_action, no execution",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/actions/handler_test.go",
+      "test_function": "TestHandleActionRequest_MalformedPayload",
+      "story": "plexd receives and executes a built-in action triggered by the control plane",
+      "expected": "Malformed JSON returns error, no ack sent",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/actions/handler_test.go",
+      "test_function": "TestHandleActionRequest_HookAction",
+      "story": "plexd executes a custom hook script triggered by the control plane",
+      "expected": "Hook action verifies integrity, executes script, reports result",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/actions/handler_test.go",
+      "test_function": "TestHandleActionRequest_HookIntegrityFailure",
+      "story": "plexd executes a custom hook script triggered by the control plane",
+      "expected": "Hook with integrity failure sends rejected ack with reason=integrity_check_failed, no execution",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/actions/handler_test.go",
+      "test_function": "TestHandleActionRequest_HookNotFound",
+      "story": "plexd handles execution errors and edge cases gracefully",
+      "expected": "Missing hook file sends rejected ack with reason=hook_not_found",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/actions/handler_test.go",
+      "test_function": "TestHandleActionRequest_Disabled",
+      "story": "Platform operator can configure remote actions and hooks parameters",
+      "expected": "When disabled, all action_request events get rejected ack with reason=actions_disabled",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/actions/executor_test.go",
+      "test_function": "TestExecutor_RunHook_Success",
+      "story": "plexd executes a custom hook script triggered by the control plane",
+      "expected": "Verified hook executes, stdout/stderr captured, exit_code=0, result reported",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/actions/executor_test.go",
+      "test_function": "TestExecutor_RunHook_Timeout",
+      "story": "plexd enforces execution concurrency limits and timeouts",
+      "expected": "Hook exceeding timeout is killed, result has status=timeout",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/actions/executor_test.go",
+      "test_function": "TestExecutor_RunHook_NonZeroExit",
+      "story": "plexd handles execution errors and edge cases gracefully",
+      "expected": "Hook with non-zero exit returns status=failed with correct exit_code and captured output",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/actions/executor_test.go",
+      "test_function": "TestExecutor_RunHook_OutputTruncation",
+      "story": "plexd executes a custom hook script triggered by the control plane",
+      "expected": "Output exceeding MaxOutputBytes is truncated",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/actions/executor_test.go",
+      "test_function": "TestExecutor_RunBuiltin_Success",
+      "story": "plexd provides built-in diagnostics actions",
+      "expected": "Built-in action executes, result contains stdout with expected data",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/actions/executor_test.go",
+      "test_function": "TestExecutor_ConcurrencyLimit",
+      "story": "plexd enforces execution concurrency limits and timeouts",
+      "expected": "Requests beyond MaxConcurrent are rejected with reason=max_concurrent_reached",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/actions/executor_test.go",
+      "test_function": "TestExecutor_DuplicateExecutionID",
+      "story": "plexd enforces execution concurrency limits and timeouts",
+      "expected": "Duplicate execution_id rejected with reason=duplicate_execution_id",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/actions/executor_test.go",
+      "test_function": "TestExecutor_Shutdown",
+      "story": "plexd handles execution errors and edge cases gracefully",
+      "expected": "Shutdown cancels running executions and reports cancelled results",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/actions/executor_test.go",
+      "test_function": "TestExecutor_ShutdownRejectsNew",
+      "story": "plexd handles execution errors and edge cases gracefully",
+      "expected": "After shutdown, new requests rejected with reason=shutting_down",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/actions/executor_test.go",
+      "test_function": "TestExecutor_ParameterEnvVars",
+      "story": "plexd executes a custom hook script triggered by the control plane",
+      "expected": "Parameters are passed as PLEXD_PARAM_ environment variables",
+      "requirement_id": "REQ-011"
+    },
+    {
+      "test_file": "internal/actions/executor_test.go",
+      "test_function": "TestExecutor_ParameterSanitization",
+      "story": "plexd executes a custom hook script triggered by the control plane",
+      "expected": "Unsafe parameter names are sanitized to valid env var names",
+      "requirement_id": "REQ-011"
+    },
+    {
+      "test_file": "internal/actions/discovery_test.go",
+      "test_function": "TestDiscoverHooks_ValidDirectory",
+      "story": "plexd reports its capabilities (built-in actions and hooks) to the control plane",
+      "expected": "Executable scripts in hooks dir are discovered with correct names and checksums",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/actions/discovery_test.go",
+      "test_function": "TestDiscoverHooks_MissingDirectory",
+      "story": "plexd reports its capabilities (built-in actions and hooks) to the control plane",
+      "expected": "Missing hooks directory returns empty list without error",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/actions/discovery_test.go",
+      "test_function": "TestDiscoverHooks_SidecarMetadata",
+      "story": "plexd reports its capabilities (built-in actions and hooks) to the control plane",
+      "expected": "Sidecar .json files are parsed for description, parameters, timeout",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/actions/builtins_test.go",
+      "test_function": "TestBuiltinGatherInfo",
+      "story": "plexd provides built-in diagnostics actions",
+      "expected": "gather_info returns JSON with hostname, OS, arch, Go version, mesh IP, peer count",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/actions/builtins_test.go",
+      "test_function": "TestBuiltinPing_Success",
+      "story": "plexd provides built-in diagnostics actions",
+      "expected": "ping with valid target returns success",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/actions/builtins_test.go",
+      "test_function": "TestBuiltinPing_MissingTarget",
+      "story": "plexd provides built-in diagnostics actions",
+      "expected": "ping without target parameter returns error with missing_required_parameter",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/actions/handler_integration_test.go",
+      "test_function": "TestIntegration_FullActionLifecycle",
+      "story": "plexd receives and executes a built-in action triggered by the control plane",
+      "expected": "Full lifecycle: action_request → ack → execute → result reported. Tests built-in and hook paths.",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/actions/handler_integration_test.go",
+      "test_function": "TestIntegration_ConcurrentExecutions",
+      "story": "plexd enforces execution concurrency limits and timeouts",
+      "expected": "Concurrent action requests processed correctly, concurrency limit enforced, no race conditions",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/actions/handler_integration_test.go",
+      "test_function": "TestIntegration_HookIntegrityAndExecution",
+      "story": "plexd executes a custom hook script triggered by the control plane",
+      "expected": "Hook discovered, integrity verified, executed with params as env vars, result reported",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/actions/handler_integration_test.go",
+      "test_function": "TestIntegration_ShutdownCancelsExecutions",
+      "story": "plexd handles execution errors and edge cases gracefully",
+      "expected": "Running executions cancelled on shutdown, cancelled results reported, no goroutine leaks",
+      "requirement_id": "REQ-010"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-011) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "Hook integrity verification uses integrity.Verifier.VerifyHook — same pattern and SHA-256 mechanism as the integrity package (REQ-002)",
+    "Config follows established pattern: ApplyDefaults/Validate with Enabled, same style as tunnel.Config and integrity.Config (REQ-008)",
+    "Code follows existing patterns: log/slog with component=actions, stdlib-only test dependencies, mock interfaces for testability",
+    "Handler follows the same api.EventHandler pattern as tunnel.HandleSSHSessionSetup and tunnel.HandleSessionRevoked",
+    "Concurrent access to Executor.active map and shuttingDown flag is safe under race detector",
+    "Hook parameters passed as PLEXD_PARAM_ environment variables with sanitized names (REQ-011)",
+    "Output capture uses io.LimitedReader to prevent memory exhaustion from verbose scripts (REQ-003)",
+    "Graceful shutdown cancels all running executions and reports cancelled results (REQ-010)",
+    "Reference documentation covers all public types, methods, data flow, and integration patterns",
+    "How-to guide covers full hook creation and deployment workflow with verification steps"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All code lives in `internal/actions/`. Files: config.go (Config struct), discovery.go (hook discovery from filesystem), builtins.go (built-in action implementations and types), executor.go (orchestration: concurrency, execution, reporting), handler.go (SSE event handler), and corresponding _test.go files. An integration test file handler_integration_test.go wires all components.\n\n2. **Two-layer design**: The design separates the SSE event handler (handler.go) from the execution engine (executor.go). The handler parses the SSE event and delegates to the Executor. The Executor manages concurrency, integrity verification, process execution, and result reporting.\n\n3. **ActionRequest type**: Added to `internal/api/types.go` in the existing Execution section (near ExecutionAck/ExecutionResult). Fields: `ExecutionID string`, `Action string`, `Parameters map[string]string`, `Timeout string` (duration string like \"5m\"), `Checksum string` (SHA-256 for hooks), `TriggeredBy *TriggeredBy`. This is the SSE payload for EventActionRequest events.\n\n4. **Executor design**: The Executor holds: Config, ActionReporter interface (wraps ControlPlane.AckExecution + ReportResult), HookVerifier interface (wraps integrity.Verifier.VerifyHook), builtins map (name → BuiltinFunc+metadata), hooks list (from discovery), active map (executionID → cancelFunc), shuttingDown flag. All mutable state protected by sync.Mutex.\n\n5. **Execution flow**: (a) HandleActionRequest receives SSE event → parse ActionRequest → call Executor.Execute. (b) Execute: check shuttingDown → check duplicate executionID → check concurrency limit → look up action in builtins or hooks → send ack (accepted/rejected) → if accepted, run in goroutine with timeout → on completion, send result → remove from active map. (c) For hooks: resolve path → verify integrity → exec.CommandContext → capture stdout/stderr with LimitedReader → build result. (d) For builtins: call BuiltinFunc directly → wrap into result.\n\n6. **Hook execution**: Uses `os/exec.CommandContext` with a context deadline. The hook script path is `filepath.Join(Config.HooksDir, actionName)` (exact filename matching against discovered hooks). Parameters are passed as environment variables with `PLEXD_PARAM_` prefix. Output is captured via `io.LimitedReader` wrapping cmd.StdoutPipe/StderrPipe, limited to Config.MaxOutputBytes. The process inherits a minimal environment (PATH, HOME, PLEXD_NODE_ID, PLEXD_EXECUTION_ID) plus the parameter env vars.\n\n7. **Interfaces for testability**: ActionReporter (AckExecution + ReportResult), HookVerifier (VerifyHook), NodeInfoProvider (NodeID, MeshIP, PeerCount). Tests use mock implementations.\n\n8. **Existing API types already defined**: `api.ExecutionAck` (types.go:165-169), `api.ExecutionResult` (types.go:171-180), `api.TriggeredBy` (types.go:182-187), `api.CapabilitiesPayload` (types.go:237-241), `api.ActionInfo` (types.go:248-252), `api.ActionParam` (types.go:254-259), `api.HookInfo` (types.go:261-269). Existing endpoints: `ControlPlane.AckExecution` (endpoints.go:138-141), `ControlPlane.ReportResult` (endpoints.go:145-148), `ControlPlane.UpdateCapabilities` (endpoints.go:84-87). SSE event type: `EventActionRequest = \"action_request\"` (envelope.go:20).\n\n9. **Security design**:\n   - **SECPLAN-1**: Hook integrity verified via SHA-256 before every execution using integrity.Verifier.VerifyHook\n   - **SECPLAN-2**: Parameters sanitized: only [A-Za-z0-9_] allowed in env var names, unsafe chars replaced with underscore\n   - **SECPLAN-3**: Output capture limited to MaxOutputBytes to prevent memory exhaustion\n   - **SECPLAN-4**: Timeout enforcement via context.WithTimeout prevents runaway processes\n   - Path traversal prevention: hook names validated (no /, \\, ..) before resolving to filesystem paths\n\n10. **Performance design**:\n    - **PERFPLAN-1**: Concurrency limit (MaxConcurrent=5) prevents resource exhaustion\n    - **PERFPLAN-2**: Output streamed via io.LimitedReader, not buffered entirely in memory\n    - **PERFPLAN-3**: Ack sent immediately before execution starts, minimizing latency for the control plane\n\n11. **Observability** (OBSPLAN-1): All operations use `log/slog` with `component=actions`. Key log points: action accepted (info with execution_id, action, triggered_by), action rejected (warn with execution_id, reason), execution started (info), execution completed (info with status, exit_code, duration), result report failed (warn with error).\n\n12. **Key files from existing codebase**:\n    - `internal/api/types.go:165-187` — ExecutionAck, ExecutionResult, TriggeredBy (already exist)\n    - `internal/api/types.go:237-269` — CapabilitiesPayload, ActionInfo, ActionParam, HookInfo (already exist)\n    - `internal/api/endpoints.go:138-148` — AckExecution, ReportResult (already exist)\n    - `internal/api/endpoints.go:84-87` — UpdateCapabilities (already exists)\n    - `internal/api/envelope.go:20` — EventActionRequest constant (already exists)\n    - `internal/integrity/verifier.go:103-133` — Verifier.VerifyHook (already exists, this is the dependency)\n    - `internal/integrity/checker.go:26-38` — HashFile for hook discovery checksums\n    - `internal/tunnel/handler.go` — Handler pattern to follow (EventHandler function returning closure)\n    - `internal/tunnel/config.go` — Config pattern to follow\n\n13. **Potential pitfalls**:\n    - Hook script names must not contain path separators or traversal patterns (..); validate with the same validReportKey-style check from nodeapi/handler.go\n    - On Linux, exec.CommandContext sends SIGKILL on timeout; for graceful shutdown, consider SIGTERM first with a short grace period\n    - Hook scripts may produce binary output; stdout/stderr should be treated as byte slices and converted to string for JSON serialization (invalid UTF-8 will be escaped)\n    - The ActionRequest.Timeout is a string (e.g., \"5m\"); parse via time.ParseDuration and cap at Config.MaxActionTimeout\n    - Concurrent hook execution and discovery: if hooks are re-discovered during execution, the executor should use the hook info snapshot from its startup/last refresh",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.112214"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:23:28.932283"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:28:50.151194"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "167daa60-4edf-4e02-9d77-26dd861bf1bf",
+      "timestamp": "2026-02-12T21:28:50.151223",
+      "total_duration": 317.1541404724121,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 317.1541404724121,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
