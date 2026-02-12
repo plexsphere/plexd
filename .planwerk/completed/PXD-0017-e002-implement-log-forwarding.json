@@ -2,8 +2,8 @@
   "feature_id": "PXD-0017",
   "title": "E002: Implement log forwarding",
   "slug": "e002-implement-log-forwarding",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Stream system and application logs from the node to the control plane for centralized monitoring and troubleshooting. Support structured log formats and efficient transport. Handle log buffering during connectivity interruptions.",
   "stories": [
@@ -379,12 +379,12 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/logfwd/config.go: Config struct with Enabled, CollectInterval, ReportInterval, BatchSize fields; DefaultCollectInterval=10s, DefaultReportInterval=30s, DefaultBatchSize=200 constants; ApplyDefaults and Validate methods following the nat/config.go pattern. Create internal/logfwd/config_test.go with tests for ApplyDefaults (zero-valued Config), Validate happy path, Validate rejects low CollectInterval (<5s), Validate rejects ReportInterval < CollectInterval, Validate rejects BatchSize=0, Validate skips when Enabled=false (REQ-005)",
-    "1.2 Create internal/logfwd/source.go: Define the LogSource interface with method Collect(ctx context.Context) ([]api.LogEntry, error). Define LogReporter interface abstracting ControlPlane.ReportLogs: ReportLogs(ctx context.Context, nodeID string, batch api.LogBatch) error. No tests needed for interface definitions (REQ-006)",
-    "1.3 Create internal/logfwd/journald.go: JournaldSource struct implementing LogSource, using injectable JournalReader interface with method ReadEntries(ctx context.Context) ([]JournalEntry, error). JournalEntry struct with Timestamp, Message, Priority (int), Unit fields. Priority-to-severity mapping function (0=emerg, 1=alert, 2=crit, 3=err, 4=warning, 5=notice, 6=info, 7=debug). Hostname populated at construction time via injectable value. Source field always 'journald'. Create internal/logfwd/journald_test.go with mock JournalReader; tests for correct field mapping, priority-to-severity mapping for all 8 levels, missing _SYSTEMD_UNIT handled, reader error propagated, empty entries returns empty slice (REQ-007)",
-    "2.1 Create internal/logfwd/forwarder.go: Forwarder struct with fields for config, sources []LogSource, reporter LogReporter, nodeID, hostname, logger. NewForwarder constructor applies defaults. RegisterSource method adds to the source list. Run method implements the dual-ticker loop: collect at CollectInterval, report at ReportInterval. Run returns nil immediately when Enabled=false. Buffer management: accumulate entries in a slice, send at ReportInterval, respect BatchSize (split into multiple API calls if needed), retain on failure, drop oldest when exceeding 2*BatchSize. Panic recovery per source (matching reconciler safeInvoke pattern). (REQ-001, REQ-002, REQ-003, REQ-004, REQ-006)",
-    "2.2 Create internal/logfwd/forwarder_test.go: Full test suite for Forwarder.Run using mock LogSource and mock LogReporter. Tests: collects and reports on schedule, skips empty batch, retains on report error, drops oldest when over capacity (with warning log verification), stops on context cancel, isolates source error, recovers source panic, respects BatchSize (splits into multiple calls), returns nil when disabled, multiple sources aggregated. Use discardLogger helper, short intervals for fast tests (REQ-001, REQ-002, REQ-003, REQ-004, REQ-006)",
-    "3.1 Write docs/reference/backend/log-forwarding.md: Reference documentation covering Config struct (all fields, types, defaults, validation rules), LogSource interface contract, LogReporter interface, JournalReader interface, JournaldSource field mapping (including priority-to-severity table), Forwarder lifecycle (NewForwarder, RegisterSource, Run), buffer behavior (capacity, overflow policy), and the POST /v1/nodes/{node_id}/logs API contract with api.LogEntry schema (REQ-009)"
+    "[done] 1.1 Create internal/logfwd/config.go: Config struct with Enabled, CollectInterval, ReportInterval, BatchSize fields; DefaultCollectInterval=10s, DefaultReportInterval=30s, DefaultBatchSize=200 constants; ApplyDefaults and Validate methods following the nat/config.go pattern. Create internal/logfwd/config_test.go with tests for ApplyDefaults (zero-valued Config), Validate happy path, Validate rejects low CollectInterval (<5s), Validate rejects ReportInterval < CollectInterval, Validate rejects BatchSize=0, Validate skips when Enabled=false (REQ-005)",
+    "[done] 1.2 Create internal/logfwd/source.go: Define the LogSource interface with method Collect(ctx context.Context) ([]api.LogEntry, error). Define LogReporter interface abstracting ControlPlane.ReportLogs: ReportLogs(ctx context.Context, nodeID string, batch api.LogBatch) error. No tests needed for interface definitions (REQ-006)",
+    "[done] 1.3 Create internal/logfwd/journald.go: JournaldSource struct implementing LogSource, using injectable JournalReader interface with method ReadEntries(ctx context.Context) ([]JournalEntry, error). JournalEntry struct with Timestamp, Message, Priority (int), Unit fields. Priority-to-severity mapping function (0=emerg, 1=alert, 2=crit, 3=err, 4=warning, 5=notice, 6=info, 7=debug). Hostname populated at construction time via injectable value. Source field always 'journald'. Create internal/logfwd/journald_test.go with mock JournalReader; tests for correct field mapping, priority-to-severity mapping for all 8 levels, missing _SYSTEMD_UNIT handled, reader error propagated, empty entries returns empty slice (REQ-007)",
+    "[done] 2.1 Create internal/logfwd/forwarder.go: Forwarder struct with fields for config, sources []LogSource, reporter LogReporter, nodeID, hostname, logger. NewForwarder constructor applies defaults. RegisterSource method adds to the source list. Run method implements the dual-ticker loop: collect at CollectInterval, report at ReportInterval. Run returns nil immediately when Enabled=false. Buffer management: accumulate entries in a slice, send at ReportInterval, respect BatchSize (split into multiple API calls if needed), retain on failure, drop oldest when exceeding 2*BatchSize. Panic recovery per source (matching reconciler safeInvoke pattern). (REQ-001, REQ-002, REQ-003, REQ-004, REQ-006)",
+    "[done] 2.2 Create internal/logfwd/forwarder_test.go: Full test suite for Forwarder.Run using mock LogSource and mock LogReporter. Tests: collects and reports on schedule, skips empty batch, retains on report error, drops oldest when over capacity (with warning log verification), stops on context cancel, isolates source error, recovers source panic, respects BatchSize (splits into multiple calls), returns nil when disabled, multiple sources aggregated. Use discardLogger helper, short intervals for fast tests (REQ-001, REQ-002, REQ-003, REQ-004, REQ-006)",
+    "[done] 3.1 Write docs/reference/backend/log-forwarding.md: Reference documentation covering Config struct (all fields, types, defaults, validation rules), LogSource interface contract, LogReporter interface, JournalReader interface, JournaldSource field mapping (including priority-to-severity table), Forwarder lifecycle (NewForwarder, RegisterSource, Run), buffer behavior (capacity, overflow policy), and the POST /v1/nodes/{node_id}/logs API contract with api.LogEntry schema (REQ-009)"
   ],
   "test_specifications": [
     {
@@ -562,6 +562,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T21:16:58.836951"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T23:12:09.764608"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T23:36:57.669601"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T23:36:57.684865"
     }
   },
   "execution_history": [
@@ -575,6 +587,50 @@
           "name": "prepare",
           "duration": 216.87911915779114,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "d3f6cf6d-b46c-4da6-8e2e-afe72946b2e8",
+      "timestamp": "2026-02-12T23:34:08.195883",
+      "total_duration": 1170.7283720970154,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (3 tasks)",
+          "duration": 458.187264919281,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (2 tasks)",
+          "duration": 348.5432755947113,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 66.72700071334839,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0017] Code Review",
+          "duration": 118.60394930839539,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0017] Improvements",
+          "duration": 26.001904010772705,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0017] Simplify",
+          "duration": 152.6649775505066,
+          "type": "simplify",
           "status": "done"
         }
       ]

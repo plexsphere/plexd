@@ -1,0 +1,64 @@
+{
+  "feature_id": "PXD-0017",
+  "title": "E002: Implement log forwarding",
+  "date": "2026-02-12",
+  "verdict": "APPROVED",
+  "summary": "Log forwarding package (internal/logfwd) implements structured log collection and reporting from mesh nodes to the control plane. Config follows the established nat/config.go ApplyDefaults/Validate pattern. JournaldSource uses injectable JournalReader for testability with correct priority-to-severity mapping. Forwarder implements the dual-ticker Run loop with mutex-protected buffering, batch splitting, panic recovery per source, and best-effort shutdown flush. All 27 tests pass including race detector. Documentation covers all interfaces, field mappings, and API contract.",
+  "tests_checklist": [
+    {"item": "Tests exist and pass (27/27 PASS)", "checked": true},
+    {"item": "Race detector passes", "checked": true},
+    {"item": "Config: ApplyDefaults zero-valued, preserve existing, preserve explicit disabled, BatchSize", "checked": true},
+    {"item": "Config: Validate happy path, rejects low CollectInterval, rejects ReportInterval < CollectInterval, rejects BatchSize=0, skips when disabled", "checked": true},
+    {"item": "Journald: field mapping, all 8 priority levels, missing unit, reader error, empty entries, out-of-range severity", "checked": true},
+    {"item": "Forwarder: collects and reports, skips empty batch, retains on error, drops oldest over capacity, stops on cancel, isolates source error, recovers panic, respects BatchSize splits, disabled returns nil, multiple sources, drop warning log", "checked": true},
+    {"item": "Edge cases covered (empty batch, missing unit, out-of-range priority, buffer overflow, partial source failure)", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Config follows nat/config.go ApplyDefaults/Validate pattern exactly", "checked": true},
+    {"item": "Forwarder follows metrics Manager dual-ticker pattern (collect/report/cancel)", "checked": true},
+    {"item": "Panic recovery matches reconciler safeInvoke pattern (defer/recover with debug.Stack)", "checked": true},
+    {"item": "Structured logging with component=logfwd consistent with nat, reconcile packages", "checked": true},
+    {"item": "Functions are small and focused (all under 40 lines)", "checked": true},
+    {"item": "No code duplication", "checked": true},
+    {"item": "Clear naming throughout", "checked": true},
+    {"item": "No dead code", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "No user input handling (internal package with injected interfaces)", "checked": true},
+    {"item": "No SQL or path traversal concerns", "checked": true},
+    {"item": "Sensitive data not exposed in logs (only component and error fields)", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "LogSource interface enables adding new sources without modifying forwarder", "checked": true},
+    {"item": "LogReporter interface decouples from api.ControlPlane", "checked": true},
+    {"item": "JournalReader interface enables testing without systemd dependency", "checked": true},
+    {"item": "All external state injected via constructors", "checked": true},
+    {"item": "Solution is minimal - no over-engineering", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code across source files", "checked": true},
+    {"item": "No unnecessary abstractions", "checked": true},
+    {"item": "Test helpers extracted to helpers_test.go (discardLogger)", "checked": true},
+    {"item": "No speculative features beyond requirements", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config.Validate rejects invalid values with clear error messages", "checked": true},
+    {"item": "Source errors logged and isolated per-source", "checked": true},
+    {"item": "Panics recovered with stack trace", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Buffer overflow handled with drop-oldest policy and warning", "checked": true},
+    {"item": "Reporter failures retain unsent data for retry", "checked": true},
+    {"item": "Best-effort flush on shutdown using context.Background()", "checked": true},
+    {"item": "Out-of-range priority values default to info", "checked": true},
+    {"item": "Empty entry slice returns nil without error", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [],
+  "suggested_improvements": [
+    "Minor: Consider adding a goleak.VerifyTestMain leak_test.go for consistency with api, reconcile, and bridge packages. Not blocking since tests verify Run returns correctly and the metrics package also omits goleak."
+  ],
+  "next_steps": []
+}
