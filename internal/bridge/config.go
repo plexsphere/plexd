@@ -14,6 +14,9 @@ const (
 	DefaultUserAccessInterfaceName = "wg-access"
 	DefaultUserAccessListenPort    = 51822
 	DefaultMaxAccessPeers          = 50
+
+	DefaultMaxIngressRules    = 20
+	DefaultIngressDialTimeout = 10 * time.Second
 )
 
 // Config holds the configuration for bridge mode.
@@ -64,6 +67,18 @@ type Config struct {
 	// MaxAccessPeers is the maximum number of concurrent user access peers.
 	// Default: 50
 	MaxAccessPeers int
+
+	// IngressEnabled controls whether public ingress is active.
+	// Default: false. Requires Enabled=true.
+	IngressEnabled bool
+
+	// MaxIngressRules is the maximum number of concurrent ingress rules.
+	// Default: 20
+	MaxIngressRules int
+
+	// IngressDialTimeout is the timeout for dialing target mesh peers.
+	// Default: 10s. Minimum: 1s.
+	IngressDialTimeout time.Duration
 }
 
 // BoolPtr returns a pointer to the given bool value.
@@ -98,6 +113,12 @@ func (c *Config) ApplyDefaults() {
 	if c.MaxAccessPeers == 0 {
 		c.MaxAccessPeers = DefaultMaxAccessPeers
 	}
+	if c.MaxIngressRules == 0 {
+		c.MaxIngressRules = DefaultMaxIngressRules
+	}
+	if c.IngressDialTimeout == 0 {
+		c.IngressDialTimeout = DefaultIngressDialTimeout
+	}
 }
 
 // Validate checks that configuration values are acceptable.
@@ -108,6 +129,9 @@ func (c *Config) Validate() error {
 	}
 	if c.UserAccessEnabled && !c.Enabled {
 		return fmt.Errorf("bridge: config: user access requires bridge mode to be enabled")
+	}
+	if c.IngressEnabled && !c.Enabled {
+		return fmt.Errorf("bridge: config: ingress requires bridge mode to be enabled")
 	}
 	if !c.Enabled {
 		return nil
@@ -143,6 +167,14 @@ func (c *Config) Validate() error {
 		}
 		if c.MaxAccessPeers <= 0 {
 			return fmt.Errorf("bridge: config: MaxAccessPeers must be positive when user access is enabled")
+		}
+	}
+	if c.IngressEnabled {
+		if c.MaxIngressRules <= 0 {
+			return fmt.Errorf("bridge: config: MaxIngressRules must be positive when ingress is enabled")
+		}
+		if c.IngressDialTimeout < 1*time.Second {
+			return fmt.Errorf("bridge: config: IngressDialTimeout must be at least 1s")
 		}
 	}
 	return nil

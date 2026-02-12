@@ -49,6 +49,7 @@ type HeartbeatRequest struct {
 	NAT            *NATInfo        `json:"nat,omitempty"`
 	Bridge         *BridgeInfo     `json:"bridge,omitempty"`
 	UserAccess     *UserAccessInfo `json:"user_access,omitempty"`
+	Ingress        *IngressInfo   `json:"ingress,omitempty"`
 }
 
 type MeshInfo struct {
@@ -79,6 +80,7 @@ type StateResponse struct {
 	BridgeConfig     *BridgeConfig     `json:"bridge_config,omitempty"`
 	RelayConfig      *RelayConfig      `json:"relay_config,omitempty"`
 	UserAccessConfig *UserAccessConfig  `json:"user_access_config,omitempty"`
+	IngressConfig    *IngressConfig    `json:"ingress_config,omitempty"`
 	Data             []DataEntry       `json:"data"`
 	SecretRefs       []SecretRef       `json:"secret_refs"`
 }
@@ -358,6 +360,8 @@ type BridgeInfo struct {
 	ActiveRoutes        int    `json:"active_routes"`
 	RelayEnabled        bool   `json:"relay_enabled"`
 	ActiveRelaySessions int    `json:"active_relay_sessions"`
+	IngressEnabled      bool   `json:"ingress_enabled"`
+	ActiveIngressRules  int    `json:"active_ingress_rules"`
 }
 
 // RelayConfig is the relay configuration pushed from the control plane.
@@ -402,4 +406,31 @@ type UserAccessInfo struct {
 	InterfaceName string `json:"interface_name"`
 	PeerCount     int    `json:"peer_count"`
 	ListenPort    int    `json:"listen_port"`
+}
+
+// ---------------------------------------------------------------------------
+// Public Ingress
+// ---------------------------------------------------------------------------
+
+// IngressConfig is the ingress configuration pushed from the control plane.
+type IngressConfig struct {
+	Enabled bool          `json:"enabled"`
+	Rules   []IngressRule `json:"rules"`
+}
+
+// IngressRule represents a single public ingress rule.
+type IngressRule struct {
+	RuleID     string `json:"rule_id"`
+	ListenPort int    `json:"listen_port"`
+	TargetAddr string `json:"target_addr"`
+	Mode       string `json:"mode"`
+	CertPEM    string `json:"cert_pem,omitempty"`
+	KeyPEM     string `json:"key_pem,omitempty"`
+}
+
+// IngressInfo is the ingress status reported by the node in heartbeats.
+type IngressInfo struct {
+	Enabled         bool `json:"enabled"`
+	RuleCount       int  `json:"rule_count"`
+	ConnectionCount int  `json:"connection_count"`
 }

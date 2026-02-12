@@ -456,3 +456,108 @@ func TestConfig_Validate_UserAccessDisabled(t *testing.T) {
 		t.Errorf("Validate should return nil when user access is disabled, got: %v", err)
 	}
 }
+
+func TestConfig_ApplyDefaults_IngressFields(t *testing.T) {
+	var cfg Config
+	cfg.ApplyDefaults()
+
+	if cfg.IngressEnabled {
+		t.Error("IngressEnabled should default to false")
+	}
+	if cfg.MaxIngressRules != DefaultMaxIngressRules {
+		t.Errorf("MaxIngressRules = %d, want %d", cfg.MaxIngressRules, DefaultMaxIngressRules)
+	}
+	if cfg.IngressDialTimeout != DefaultIngressDialTimeout {
+		t.Errorf("IngressDialTimeout = %v, want %v", cfg.IngressDialTimeout, DefaultIngressDialTimeout)
+	}
+}
+
+func TestConfig_Validate_IngressWithoutBridge(t *testing.T) {
+	cfg := Config{
+		Enabled:        false,
+		IngressEnabled: true,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate should return error when ingress enabled without bridge")
+	}
+	want := "bridge: config: ingress requires bridge mode to be enabled"
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+func TestConfig_Validate_IngressValidConfig(t *testing.T) {
+	cfg := Config{
+		Enabled:            true,
+		AccessInterface:    "eth1",
+		AccessSubnets:      []string{"10.0.0.0/24"},
+		IngressEnabled:     true,
+		MaxIngressRules:    20,
+		IngressDialTimeout: 10 * time.Second,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate should return nil for valid ingress config, got: %v", err)
+	}
+}
+
+func TestConfig_Validate_IngressInvalidMaxRules(t *testing.T) {
+	tests := []struct {
+		name     string
+		maxRules int
+	}{
+		{"zero rules", 0},
+		{"negative rules", -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				Enabled:            true,
+				AccessInterface:    "eth1",
+				AccessSubnets:      []string{"10.0.0.0/24"},
+				IngressEnabled:     true,
+				MaxIngressRules:    tt.maxRules,
+				IngressDialTimeout: 10 * time.Second,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate should return error for invalid MaxIngressRules")
+			}
+			want := "bridge: config: MaxIngressRules must be positive when ingress is enabled"
+			if err.Error() != want {
+				t.Errorf("got %q, want %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_IngressInvalidDialTimeout(t *testing.T) {
+	cfg := Config{
+		Enabled:            true,
+		AccessInterface:    "eth1",
+		AccessSubnets:      []string{"10.0.0.0/24"},
+		IngressEnabled:     true,
+		MaxIngressRules:    20,
+		IngressDialTimeout: 500 * time.Millisecond,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate should return error for IngressDialTimeout below 1s")
+	}
+	want := "bridge: config: IngressDialTimeout must be at least 1s"
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+func TestConfig_Validate_IngressDisabled(t *testing.T) {
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		IngressEnabled:  false,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate should return nil when ingress is disabled, got: %v", err)
+	}
+}
