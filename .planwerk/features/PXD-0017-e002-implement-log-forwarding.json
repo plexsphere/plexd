@@ -1,0 +1,583 @@
+{
+  "feature_id": "PXD-0017",
+  "title": "E002: Implement log forwarding",
+  "slug": "e002-implement-log-forwarding",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Stream system and application logs from the node to the control plane for centralized monitoring and troubleshooting. Support structured log formats and efficient transport. Handle log buffering during connectivity interruptions.",
+  "stories": [
+    {
+      "title": "Platform operator sees node logs streamed to the control plane",
+      "role": "platform operator",
+      "want": "system and application logs from each node forwarded to the control plane in structured format",
+      "so_that": "I can monitor node health, troubleshoot issues, and correlate events across the fleet from a centralized dashboard",
+      "criteria": [
+        "Forwarder reads log entries from an injectable LogSource interface (abstracting journald/syslog/file sources for testability)",
+        "Each log entry is mapped to an api.LogEntry with Timestamp, Source, Unit, Message, Severity, and Hostname fields",
+        "Log entries are batched into api.LogBatch and sent to the control plane via ControlPlane.ReportLogs (POST /v1/nodes/{node_id}/logs) at the configured ReportInterval",
+        "Structured log fields (JSON payloads from journald) are preserved in the Message field",
+        "The forwarder populates Hostname from the system hostname at startup"
+      ]
+    },
+    {
+      "title": "Platform operator sees logs from specific systemd units",
+      "role": "platform operator",
+      "want": "to filter forwarded logs by systemd unit name",
+      "so_that": "I can focus on relevant services without noise from unrelated system daemons",
+      "criteria": [
+        "JournaldSource reads log entries from the systemd journal via an injectable JournalReader interface",
+        "Each log entry includes the Unit field set to the _SYSTEMD_UNIT journal field",
+        "Source field is set to 'journald' for all entries from the journald source",
+        "Severity is mapped from journald PRIORITY field (0-7) to syslog severity strings (emerg, alert, crit, err, warning, notice, info, debug)"
+      ]
+    },
+    {
+      "title": "Node buffers logs during control plane connectivity interruptions",
+      "role": "platform operator",
+      "want": "logs to be buffered when the control plane is unreachable and forwarded when connectivity is restored",
+      "so_that": "I do not lose critical log data during transient network issues",
+      "criteria": [
+        "When ReportLogs fails, the failed batch is retained in a ring buffer for the next report cycle",
+        "Buffer capacity is bounded at 2 * BatchSize entries to prevent unbounded memory growth",
+        "When the buffer exceeds capacity, the oldest entries are dropped first",
+        "On the next successful report, all buffered entries are sent (respecting BatchSize limits per API call)",
+        "A warning log is emitted when entries are dropped due to buffer overflow"
+      ]
+    },
+    {
+      "title": "Node continues operating normally when log forwarding fails",
+      "role": "platform operator",
+      "want": "log forwarding failures to not affect core mesh functionality",
+      "so_that": "transient control plane issues do not degrade the mesh network",
+      "criteria": [
+        "The forwarder logs a warning when ReportLogs fails but does not return an error to the run loop",
+        "The forwarder continues collecting on the next interval after a reporting failure",
+        "The forwarder gracefully stops when its context is cancelled without blocking",
+        "No goroutine leaks occur when the forwarder is stopped"
+      ]
+    },
+    {
+      "title": "Operator configures log forwarding behavior",
+      "role": "operator",
+      "want": "to configure collection interval, report interval, batch size, and source selection",
+      "so_that": "I can tune log forwarding overhead based on environment constraints and compliance needs",
+      "criteria": [
+        "Config struct has Enabled, CollectInterval, ReportInterval, and BatchSize fields with sensible defaults",
+        "Config.ApplyDefaults() sets CollectInterval=10s, ReportInterval=30s, BatchSize=200",
+        "Config.Validate() rejects CollectInterval < 5s, ReportInterval < CollectInterval, BatchSize < 1",
+        "When Enabled=false, the forwarder Run method returns immediately without error"
+      ]
+    },
+    {
+      "title": "Developer extends log forwarding with new log sources",
+      "role": "developer",
+      "want": "a LogSource interface that allows adding new log sources without modifying the core forwarding loop",
+      "so_that": "future log sources (e.g., container logs, application logs) can be added cleanly",
+      "criteria": [
+        "A LogSource interface is defined with a Collect(ctx) ([]api.LogEntry, error) method",
+        "The Forwarder accepts multiple LogSource implementations and invokes them all during each collection cycle",
+        "Individual source errors are logged and skipped; other sources still run",
+        "New LogSource implementations require no changes to the Forwarder"
+      ]
+    },
+    {
+      "title": "Reference documentation covers the log forwarding module",
+      "role": "developer",
+      "want": "complete reference documentation for the logfwd package",
+      "so_that": "operators can configure log forwarding and developers can extend it with new sources",
+      "criteria": [
+        "All Config fields are documented with types, defaults, and validation constraints",
+        "The LogSource interface is described with its contract and usage pattern",
+        "The LogReporter interface is described",
+        "The Forwarder lifecycle (NewForwarder, RegisterSource, Run) is documented",
+        "The POST /v1/nodes/{node_id}/logs API contract is referenced with the api.LogBatch schema"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL collect log entries from registered LogSource implementations at the configured CollectInterval",
+      "priority": "SHALL",
+      "rationale": "Log collection is the primary function of the log forwarding module and must run reliably on schedule",
+      "scenarios": [
+        {
+          "name": "Log entries collected on interval",
+          "when": "the CollectInterval elapses",
+          "then": "the forwarder invokes Collect on all registered LogSource implementations",
+          "and_then": [
+            "results are aggregated into a single buffer",
+            "each entry is a valid api.LogEntry"
+          ]
+        },
+        {
+          "name": "Partial collection on source error",
+          "when": "one of multiple registered LogSource implementations returns an error",
+          "then": "the forwarder logs a warning and continues with other sources",
+          "and_then": [
+            "successfully collected entries from other sources are still buffered"
+          ]
+        },
+        {
+          "name": "Collection skipped when disabled",
+          "when": "the config Enabled=false",
+          "then": "no collection occurs and Run returns nil immediately",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The system SHALL batch collected log entries and send them to the control plane at the configured ReportInterval via POST /v1/nodes/{node_id}/logs",
+      "priority": "SHALL",
+      "rationale": "Batching reduces API call overhead and aligns with the existing api.LogBatch / ControlPlane.ReportLogs contract",
+      "scenarios": [
+        {
+          "name": "Batch sent at report interval",
+          "when": "the ReportInterval elapses and collected log entries exist in the buffer",
+          "then": "the forwarder sends an api.LogBatch via LogReporter.ReportLogs",
+          "and_then": [
+            "the buffer is cleared after successful send",
+            "batch size does not exceed BatchSize per API call"
+          ]
+        },
+        {
+          "name": "Empty buffer not sent",
+          "when": "the ReportInterval elapses but no log entries were collected",
+          "then": "no API call is made",
+          "and_then": []
+        },
+        {
+          "name": "Large batch split into multiple API calls",
+          "when": "the buffer contains more entries than BatchSize",
+          "then": "the forwarder sends multiple api.LogBatch payloads, each at most BatchSize entries",
+          "and_then": [
+            "all entries are eventually sent",
+            "if a partial send fails, remaining entries are retained"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The system SHALL buffer log entries when reporting fails and retry on the next ReportInterval",
+      "priority": "SHALL",
+      "rationale": "Network interruptions are expected in edge environments; buffering prevents data loss during transient outages",
+      "scenarios": [
+        {
+          "name": "Report failure retains entries",
+          "when": "ReportLogs returns an error",
+          "then": "the failed batch entries are retained in the buffer for the next report cycle",
+          "and_then": [
+            "a warning is logged with the error details"
+          ]
+        },
+        {
+          "name": "Buffer overflow drops oldest",
+          "when": "retained entries exceed 2 * BatchSize",
+          "then": "the oldest entries are dropped to bring the buffer within capacity",
+          "and_then": [
+            "a warning is logged indicating entries were dropped with the count"
+          ]
+        },
+        {
+          "name": "Buffered entries sent on recovery",
+          "when": "ReportLogs succeeds after previous failures",
+          "then": "all buffered entries are included in the batch",
+          "and_then": [
+            "the buffer is cleared after successful send"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The system SHALL NOT block core mesh operations when log forwarding fails",
+      "priority": "SHALL",
+      "rationale": "Log forwarding is an observability layer; failures must not degrade mesh connectivity or other node functions",
+      "scenarios": [
+        {
+          "name": "Collection error isolated",
+          "when": "a LogSource returns an error",
+          "then": "the forwarder logs the error and continues with the next collection cycle",
+          "and_then": [
+            "no panic or goroutine leak occurs"
+          ]
+        },
+        {
+          "name": "Reporting error isolated",
+          "when": "ReportLogs returns a network error",
+          "then": "the forwarder logs a warning and retries on the next report interval",
+          "and_then": [
+            "the main context is not cancelled"
+          ]
+        },
+        {
+          "name": "Graceful shutdown",
+          "when": "the forwarder's context is cancelled",
+          "then": "Run returns ctx.Err() without blocking",
+          "and_then": [
+            "any in-progress collection is abandoned",
+            "no goroutine leaks"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The system SHALL validate all log forwarding configuration values with clear error messages",
+      "priority": "SHALL",
+      "rationale": "Invalid configuration should fail fast at startup, not silently produce bad behavior",
+      "scenarios": [
+        {
+          "name": "Valid configuration accepted",
+          "when": "all config fields are within acceptable ranges",
+          "then": "Validate returns nil",
+          "and_then": []
+        },
+        {
+          "name": "CollectInterval too low rejected",
+          "when": "CollectInterval is less than 5 seconds",
+          "then": "Validate returns an error containing 'CollectInterval must be at least 5s'",
+          "and_then": []
+        },
+        {
+          "name": "ReportInterval less than CollectInterval rejected",
+          "when": "ReportInterval is less than CollectInterval",
+          "then": "Validate returns an error containing 'ReportInterval must be >= CollectInterval'",
+          "and_then": []
+        },
+        {
+          "name": "BatchSize zero rejected",
+          "when": "BatchSize is 0 or negative",
+          "then": "Validate returns an error containing 'BatchSize must be at least 1'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The system SHALL support a LogSource interface for extensible log collection",
+      "priority": "SHALL",
+      "rationale": "A pluggable source design enables adding new log types (e.g., container logs, file-based logs) without modifying the core forwarding loop",
+      "scenarios": [
+        {
+          "name": "Multiple sources invoked",
+          "when": "the forwarder has three registered LogSource implementations",
+          "then": "all three are called during each collection cycle",
+          "and_then": [
+            "results are aggregated into a single buffer"
+          ]
+        },
+        {
+          "name": "Individual source failure isolated",
+          "when": "one of three sources returns an error",
+          "then": "the other two sources' results are still included in the buffer",
+          "and_then": [
+            "the error is logged at warn level"
+          ]
+        },
+        {
+          "name": "Source panics recovered",
+          "when": "a LogSource panics during collection",
+          "then": "the panic is recovered and logged as an error",
+          "and_then": [
+            "other sources still run",
+            "the forwarder does not crash"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The JournaldSource SHALL read log entries from the systemd journal with correct field mapping",
+      "priority": "SHALL",
+      "rationale": "systemd journal is the primary log source on Linux systems running plexd as a systemd service",
+      "scenarios": [
+        {
+          "name": "Journal entries mapped correctly",
+          "when": "the JournalReader returns journal entries with MESSAGE, PRIORITY, and _SYSTEMD_UNIT fields",
+          "then": "each entry is mapped to an api.LogEntry with Message, Severity (mapped from PRIORITY), Unit, Source='journald', and Timestamp",
+          "and_then": []
+        },
+        {
+          "name": "Priority mapped to severity string",
+          "when": "a journal entry has PRIORITY=3 (error level)",
+          "then": "the api.LogEntry Severity field is set to 'err'",
+          "and_then": []
+        },
+        {
+          "name": "Missing optional fields handled",
+          "when": "a journal entry is missing the _SYSTEMD_UNIT field",
+          "then": "the Unit field is set to empty string",
+          "and_then": [
+            "the entry is still collected without error"
+          ]
+        },
+        {
+          "name": "Journal read error is non-fatal",
+          "when": "the JournalReader returns an error",
+          "then": "the JournaldSource returns the error wrapped with context",
+          "and_then": [
+            "the Forwarder isolates the error per REQ-006"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The system SHOULD use structured logging with component='logfwd' for all log messages",
+      "priority": "SHOULD",
+      "rationale": "Consistent structured logging enables filtering and correlation in centralized log systems",
+      "scenarios": [
+        {
+          "name": "All log messages include component field",
+          "when": "any log message is emitted by the logfwd package",
+          "then": "the log message includes the field component='logfwd'",
+          "and_then": []
+        },
+        {
+          "name": "Collection cycle logged at debug level",
+          "when": "a collection cycle completes successfully",
+          "then": "a debug log is emitted with entry_count and duration fields",
+          "and_then": []
+        },
+        {
+          "name": "Report cycle logged at info level",
+          "when": "a batch is successfully reported to the control plane",
+          "then": "an info log is emitted with batch_size and duration fields",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The system SHALL provide reference documentation for the log forwarding module",
+      "priority": "SHALL",
+      "rationale": "Reference documentation enables operators and developers to understand and configure the log forwarding subsystem",
+      "scenarios": [
+        {
+          "name": "Config reference documented",
+          "when": "an operator reads the log forwarding reference doc",
+          "then": "all Config fields are listed with types, defaults, and validation constraints",
+          "and_then": []
+        },
+        {
+          "name": "LogSource interface documented",
+          "when": "a developer reads the log forwarding reference doc",
+          "then": "the LogSource interface is described with its contract and usage pattern",
+          "and_then": []
+        },
+        {
+          "name": "LogEntry schema documented",
+          "when": "an operator reads the log forwarding reference doc",
+          "then": "the api.LogEntry fields are described with their data types and source mapping from journald",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/logfwd/config.go: Config struct with Enabled, CollectInterval, ReportInterval, BatchSize fields; DefaultCollectInterval=10s, DefaultReportInterval=30s, DefaultBatchSize=200 constants; ApplyDefaults and Validate methods following the nat/config.go pattern. Create internal/logfwd/config_test.go with tests for ApplyDefaults (zero-valued Config), Validate happy path, Validate rejects low CollectInterval (<5s), Validate rejects ReportInterval < CollectInterval, Validate rejects BatchSize=0, Validate skips when Enabled=false (REQ-005)",
+    "1.2 Create internal/logfwd/source.go: Define the LogSource interface with method Collect(ctx context.Context) ([]api.LogEntry, error). Define LogReporter interface abstracting ControlPlane.ReportLogs: ReportLogs(ctx context.Context, nodeID string, batch api.LogBatch) error. No tests needed for interface definitions (REQ-006)",
+    "1.3 Create internal/logfwd/journald.go: JournaldSource struct implementing LogSource, using injectable JournalReader interface with method ReadEntries(ctx context.Context) ([]JournalEntry, error). JournalEntry struct with Timestamp, Message, Priority (int), Unit fields. Priority-to-severity mapping function (0=emerg, 1=alert, 2=crit, 3=err, 4=warning, 5=notice, 6=info, 7=debug). Hostname populated at construction time via injectable value. Source field always 'journald'. Create internal/logfwd/journald_test.go with mock JournalReader; tests for correct field mapping, priority-to-severity mapping for all 8 levels, missing _SYSTEMD_UNIT handled, reader error propagated, empty entries returns empty slice (REQ-007)",
+    "2.1 Create internal/logfwd/forwarder.go: Forwarder struct with fields for config, sources []LogSource, reporter LogReporter, nodeID, hostname, logger. NewForwarder constructor applies defaults. RegisterSource method adds to the source list. Run method implements the dual-ticker loop: collect at CollectInterval, report at ReportInterval. Run returns nil immediately when Enabled=false. Buffer management: accumulate entries in a slice, send at ReportInterval, respect BatchSize (split into multiple API calls if needed), retain on failure, drop oldest when exceeding 2*BatchSize. Panic recovery per source (matching reconciler safeInvoke pattern). (REQ-001, REQ-002, REQ-003, REQ-004, REQ-006)",
+    "2.2 Create internal/logfwd/forwarder_test.go: Full test suite for Forwarder.Run using mock LogSource and mock LogReporter. Tests: collects and reports on schedule, skips empty batch, retains on report error, drops oldest when over capacity (with warning log verification), stops on context cancel, isolates source error, recovers source panic, respects BatchSize (splits into multiple calls), returns nil when disabled, multiple sources aggregated. Use discardLogger helper, short intervals for fast tests (REQ-001, REQ-002, REQ-003, REQ-004, REQ-006)",
+    "3.1 Write docs/reference/backend/log-forwarding.md: Reference documentation covering Config struct (all fields, types, defaults, validation rules), LogSource interface contract, LogReporter interface, JournalReader interface, JournaldSource field mapping (including priority-to-severity table), Forwarder lifecycle (NewForwarder, RegisterSource, Run), buffer behavior (capacity, overflow policy), and the POST /v1/nodes/{node_id}/logs API contract with api.LogEntry schema (REQ-009)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/logfwd/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults",
+      "story": "Operator configures log forwarding behavior",
+      "expected": "ApplyDefaults sets CollectInterval=10s, ReportInterval=30s, BatchSize=200 on zero-valued Config",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/logfwd/config_test.go",
+      "test_function": "TestConfig_Validate_AcceptsValid",
+      "story": "Operator configures log forwarding behavior",
+      "expected": "Validate returns nil for valid config with CollectInterval=10s, ReportInterval=30s, BatchSize=100",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/logfwd/config_test.go",
+      "test_function": "TestConfig_Validate_RejectsLowCollectInterval",
+      "story": "Operator configures log forwarding behavior",
+      "expected": "Validate returns error when CollectInterval < 5s",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/logfwd/config_test.go",
+      "test_function": "TestConfig_Validate_RejectsReportIntervalBelowCollect",
+      "story": "Operator configures log forwarding behavior",
+      "expected": "Validate returns error when ReportInterval < CollectInterval",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/logfwd/config_test.go",
+      "test_function": "TestConfig_Validate_RejectsBatchSizeZero",
+      "story": "Operator configures log forwarding behavior",
+      "expected": "Validate returns error when BatchSize is 0",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/logfwd/config_test.go",
+      "test_function": "TestConfig_Validate_SkipsWhenDisabled",
+      "story": "Operator configures log forwarding behavior",
+      "expected": "Validate returns nil when Enabled=false regardless of other field values",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/logfwd/journald_test.go",
+      "test_function": "TestJournaldSource_Collect_MapsFieldsCorrectly",
+      "story": "Platform operator sees logs from specific systemd units",
+      "expected": "Collect returns api.LogEntry with Source='journald', Unit from _SYSTEMD_UNIT, Message from MESSAGE, and Severity mapped from PRIORITY",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/logfwd/journald_test.go",
+      "test_function": "TestJournaldSource_Collect_MapsPriorityToSeverity",
+      "story": "Platform operator sees logs from specific systemd units",
+      "expected": "PRIORITY values 0-7 map to emerg, alert, crit, err, warning, notice, info, debug respectively",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/logfwd/journald_test.go",
+      "test_function": "TestJournaldSource_Collect_HandlesMissingUnit",
+      "story": "Platform operator sees logs from specific systemd units",
+      "expected": "When _SYSTEMD_UNIT is absent, Unit field is empty string and entry is still collected",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/logfwd/journald_test.go",
+      "test_function": "TestJournaldSource_Collect_HandlesReaderError",
+      "story": "Platform operator sees logs from specific systemd units",
+      "expected": "When JournalReader returns error, Collect returns wrapped error",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/logfwd/journald_test.go",
+      "test_function": "TestJournaldSource_Collect_ReturnsEmptyOnNoEntries",
+      "story": "Platform operator sees logs from specific systemd units",
+      "expected": "When JournalReader returns no entries, Collect returns empty slice and nil error",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/logfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_CollectsAndReports",
+      "story": "Platform operator sees node logs streamed to the control plane",
+      "expected": "Forwarder calls sources at CollectInterval and reports at ReportInterval via ReportLogs",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/logfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_SkipsEmptyBatch",
+      "story": "Node continues operating normally when log forwarding fails",
+      "expected": "No ReportLogs call when all sources return empty slices",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/logfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_RetainsOnReportError",
+      "story": "Node buffers logs during control plane connectivity interruptions",
+      "expected": "When ReportLogs fails, entries are retained and included in the next batch",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/logfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_DropsOldestWhenOverCapacity",
+      "story": "Node buffers logs during control plane connectivity interruptions",
+      "expected": "When retained entries exceed 2*BatchSize, oldest entries are dropped",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/logfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_StopsOnContextCancel",
+      "story": "Node continues operating normally when log forwarding fails",
+      "expected": "Run returns ctx.Err() when context is cancelled",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/logfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_IsolatesSourceError",
+      "story": "Node continues operating normally when log forwarding fails",
+      "expected": "When one source returns error, others still contribute to the buffer",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/logfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_RecoversSourcePanic",
+      "story": "Developer extends log forwarding with new log sources",
+      "expected": "When a source panics, the panic is recovered, logged, and other sources still run",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/logfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_DisabledReturnsNil",
+      "story": "Operator configures log forwarding behavior",
+      "expected": "Run returns nil immediately when Enabled=false",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/logfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_BatchSizeRespected",
+      "story": "Platform operator sees node logs streamed to the control plane",
+      "expected": "When collected entries exceed BatchSize, they are sent in multiple batches of at most BatchSize",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/logfwd/forwarder_test.go",
+      "test_function": "TestForwarder_Run_DropsOldestLogsWarning",
+      "story": "Node buffers logs during control plane connectivity interruptions",
+      "expected": "When entries are dropped due to buffer overflow, a warning is logged with the count of dropped entries",
+      "requirement_id": "REQ-003"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-009) have corresponding passing tests in internal/logfwd/*_test.go",
+    "All WHEN/THEN scenarios from requirements are covered by at least one test case",
+    "All test_specifications are implemented with matching function names and file paths",
+    "Config follows existing ApplyDefaults/Validate pattern from nat/config.go and reconcile/config.go",
+    "Forwarder follows dual-ticker Run-loop pattern from metrics Manager design (collect at CollectInterval, report at ReportInterval, context cancellation, panic recovery per source)",
+    "LogSource interface uses dependency injection for all external state (no direct journald/syscall access in production code paths tested by unit tests)",
+    "All log messages use structured logging with component='logfwd' field consistent with other packages (nat, reconcile)",
+    "No goroutine leaks: tests use goleak or manual verification of Run return",
+    "LogEntry payloads match the api.LogEntry schema from internal/api/types.go (Timestamp, Source, Unit, Message, Severity, Hostname)",
+    "Reference documentation (docs/reference/backend/log-forwarding.md) covers all Config fields, interfaces, field mappings, and API contract"
+  ],
+  "implementation_notes": "Architecture: New package internal/logfwd with the standard module layout (config.go, source.go, journald.go, forwarder.go). The Forwarder orchestrates collection and reporting using a dual-ticker pattern: collect at CollectInterval, report at ReportInterval. This decouples collection frequency from reporting frequency, allowing frequent local log reading with less frequent API calls to the control plane.\n\nKey patterns to follow:\n- Config with ApplyDefaults()/Validate() (see internal/nat/config.go, internal/reconcile/config.go)\n- Dual-ticker Run loop with context cancellation (see internal/metrics plan for the same pattern; ticker + select on ctx.Done)\n- Panic recovery per source invocation (see internal/reconcile/reconciler.go:safeInvoke)\n- Interface-based dependency injection for testability: JournalReader abstracts systemd journal access, LogReporter abstracts ControlPlane.ReportLogs\n- Mock test doubles defined in _test.go files with sync.Mutex for concurrency safety\n- discardLogger helper for tests (see internal/nat/mock_stun_test.go)\n\nData flow: LogSource.Collect reads entries from journald → Forwarder accumulates into ring buffer → Forwarder sends api.LogBatch via LogReporter.ReportLogs at ReportInterval → ControlPlane.ReportLogs sends POST /v1/nodes/{node_id}/logs.\n\nAPI types already exist: api.LogBatch (alias for []LogEntry), api.LogEntry (internal/api/types.go:206-216). API endpoint already exists: ControlPlane.ReportLogs (internal/api/endpoints.go:159-162). No changes to the api package are needed.\n\nJournald field mapping:\n- MESSAGE → LogEntry.Message\n- PRIORITY (0-7) → LogEntry.Severity (emerg/alert/crit/err/warning/notice/info/debug)\n- _SYSTEMD_UNIT → LogEntry.Unit\n- __REALTIME_TIMESTAMP → LogEntry.Timestamp\n- Source always 'journald' for JournaldSource\n- Hostname set at Forwarder construction (os.Hostname or injected)\n\nBuffer management:\n- Ring buffer with max capacity 2 * BatchSize\n- On report failure: entries retained in buffer\n- On buffer overflow: oldest entries dropped, warning logged with count\n- On successful report: buffer cleared for sent entries\n- Large batches split into multiple API calls of BatchSize each\n\nPotential pitfalls:\n- JournaldSource must use the JournalReader interface rather than directly calling systemd journal C bindings to enable cross-platform testing and unit test isolation.\n- The journald reader cursor must be tracked to avoid re-reading entries. The JournalReader abstraction handles this internally.\n- Buffer overflow: When the control plane is unreachable, entries accumulate. Cap at 2*BatchSize and drop oldest to bound memory.\n- Severity mapping: journald PRIORITY uses syslog levels (0=emergency through 7=debug). Must handle out-of-range values gracefully (default to 'info').\n- Hostname should be resolved once at startup, not per-entry, to avoid unnecessary syscalls.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.111312"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:13:18.007820"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T21:16:58.836951"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "e7f30f50-6c0a-44f6-8e19-6e755ea67918",
+      "timestamp": "2026-02-12T21:16:58.836991",
+      "total_duration": 216.87911915779114,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 216.87911915779114,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
