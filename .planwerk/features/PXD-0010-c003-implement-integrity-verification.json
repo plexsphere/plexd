@@ -1,0 +1,697 @@
+{
+  "feature_id": "PXD-0010",
+  "title": "C003: Implement integrity verification",
+  "slug": "c003-implement-integrity-verification",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "Ensure integrity of the plexd binary itself and any custom hook scripts via SHA-256 checksum verification. Verify checksums on startup, after updates, and before executing hook scripts. Report integrity violations to the control plane.",
+  "stories": [
+    {
+      "title": "plexd verifies the integrity of its own binary on startup using SHA-256 checksums",
+      "role": "plexd agent",
+      "want": "to compute the SHA-256 checksum of the running plexd binary at startup and compare it against an expected checksum provided by the control plane or stored locally",
+      "so_that": "tampered or corrupted binaries are detected before the agent processes any sensitive operations",
+      "criteria": [
+        "Checker.VerifyBinary(binaryPath string) (CheckResult, error) computes the SHA-256 hash of the file at binaryPath and compares it against the expected checksum",
+        "CheckResult contains Path, Expected, Actual (hex-encoded SHA-256), and OK bool indicating match",
+        "If the expected checksum is empty (first run or not yet set), the computed checksum is stored as the baseline and CheckResult.OK is true",
+        "If the binary file does not exist or is unreadable, an error is returned (not a CheckResult with OK=false)",
+        "The binary checksum is computed by reading the file in streaming fashion (io.Copy to hash.Hash) to handle large binaries without loading them entirely into memory"
+      ]
+    },
+    {
+      "title": "plexd verifies the integrity of hook scripts before execution using SHA-256 checksums",
+      "role": "plexd agent",
+      "want": "to compute the SHA-256 checksum of a hook script and compare it against the expected checksum from the control plane before allowing the script to execute",
+      "so_that": "modified or injected hook scripts are detected and blocked, preventing execution of unauthorized code",
+      "criteria": [
+        "Checker.VerifyHook(hookPath string, expectedChecksum string) (CheckResult, error) computes the SHA-256 hash and compares against expectedChecksum",
+        "If expectedChecksum is empty, an error is returned (hooks MUST have a checksum from the control plane)",
+        "If the hook file does not exist or is unreadable, an error is returned",
+        "A checksum mismatch produces CheckResult.OK=false with the mismatched Expected and Actual values",
+        "The verification is performed synchronously before the hook is executed — no hook execution on verification failure"
+      ]
+    },
+    {
+      "title": "plexd re-verifies binary integrity after updates",
+      "role": "plexd agent",
+      "want": "to verify the integrity of a newly downloaded binary against the checksum provided by the control plane before the update is applied",
+      "so_that": "corrupted or tampered downloads are rejected, preventing the node from running a compromised binary",
+      "criteria": [
+        "Checker.VerifyFile(filePath string, expectedChecksum string) (CheckResult, error) is the generic verification method used for both binaries and hooks",
+        "After a successful binary download, VerifyFile is called with the downloaded file path and the expected checksum from the artifact metadata",
+        "If verification fails, the downloaded file is NOT used to replace the running binary",
+        "The verification result is logged at info level (success) or error level (failure) with component=integrity"
+      ]
+    },
+    {
+      "title": "plexd reports integrity violations to the control plane",
+      "role": "plexd agent",
+      "want": "to report integrity verification failures to the control plane via a dedicated API endpoint",
+      "so_that": "the platform can alert operators about potential tampering and take remediation actions",
+      "criteria": [
+        "IntegrityViolationReport struct contains NodeID, Timestamp, Type (binary/hook), Path, ExpectedChecksum, ActualChecksum, and Detail",
+        "POST /v1/nodes/{node_id}/integrity/violations is called when a verification fails",
+        "If the report fails to send (control plane unreachable), the error is logged at warn level but does not block agent operation",
+        "Each violation is reported exactly once per detection (no repeated reporting of the same violation)",
+        "Violations are logged locally at error level with component=integrity regardless of whether the report succeeds"
+      ]
+    },
+    {
+      "title": "plexd stores and manages checksum baselines in a local store",
+      "role": "plexd agent",
+      "want": "to persist known-good checksums in a local JSON file so that verification can work across restarts without requiring control plane connectivity",
+      "so_that": "integrity verification works reliably even during temporary control plane outages or network partitions",
+      "criteria": [
+        "Store persists checksums as a JSON file in the agent's data directory (checksums.json)",
+        "Store.Get(path string) returns the stored checksum for the given path, or empty string if not found",
+        "Store.Set(path string, checksum string) updates the stored checksum for the given path and persists to disk atomically via fsutil.WriteFileAtomic",
+        "Store.Remove(path string) removes a checksum entry (for cleaned-up hooks)",
+        "Store handles concurrent access safely via sync.RWMutex"
+      ]
+    },
+    {
+      "title": "Platform operator can configure integrity verification parameters",
+      "role": "platform operator",
+      "want": "to configure integrity verification: enable/disable, binary path, hooks directory path, and verification interval for periodic checks",
+      "so_that": "integrity verification can be tuned for different deployment environments or disabled entirely",
+      "criteria": [
+        "Config struct has Enabled bool (default: true), BinaryPath string (default: os.Executable() resolved path), HooksDir string (default: empty, no hooks), and VerifyInterval time.Duration (default: 5m for periodic re-checks)",
+        "When Enabled is false, all verification operations return success without computing checksums",
+        "Config.Validate rejects VerifyInterval < 30s when enabled",
+        "Config.ApplyDefaults sets Enabled=true and VerifyInterval=5m on zero-valued Config"
+      ]
+    },
+    {
+      "title": "plexd performs periodic re-verification of binary and hook integrity",
+      "role": "plexd agent",
+      "want": "to periodically re-verify the integrity of the running binary and all registered hook scripts at a configurable interval",
+      "so_that": "runtime tampering of files on disk is detected even after initial startup verification",
+      "criteria": [
+        "Verifier.Run(ctx) starts a periodic loop that re-verifies the binary and all known hooks at Config.VerifyInterval",
+        "Verification failures detected during periodic checks are reported to the control plane via the violation reporting endpoint",
+        "The periodic loop respects context cancellation for graceful shutdown",
+        "Individual hook verification failures do not block verification of other hooks or the binary",
+        "The binary checksum included in heartbeat requests (HeartbeatRequest.BinaryChecksum) is updated from the computed value"
+      ]
+    },
+    {
+      "title": "Integrity verification errors do not crash the agent",
+      "role": "platform operator",
+      "want": "all integrity verification errors to be handled gracefully with logging rather than panics",
+      "so_that": "plexd remains operational even when files are temporarily locked, permissions change, or the filesystem has issues",
+      "criteria": [
+        "File read errors (permission denied, file locked) are logged at error level and returned as errors",
+        "Control plane reporting failures are logged at warn level but do not prevent continued operation",
+        "Store persistence failures are logged at error level but do not prevent in-memory operation",
+        "Concurrent access to the checksum store is safe under all conditions (run with -race)"
+      ]
+    },
+    {
+      "title": "Reference documentation for integrity verification",
+      "role": "developer",
+      "want": "comprehensive reference documentation for the internal/integrity package",
+      "so_that": "future developers understand the Checker, Store, Verifier, SSE event handling, and data flow",
+      "criteria": [
+        "Documentation covers Config, Checker (VerifyFile), Store, Verifier (Run), and ViolationReporter interface",
+        "Documentation includes data flow: startup → compute SHA-256 → compare → report violations → periodic re-check",
+        "Documentation references related packages: internal/api, internal/fsutil, internal/registration",
+        "Documentation is placed at docs/reference/backend/integrity-verification.md"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The integrity package SHALL compute SHA-256 checksums of files and compare them against expected values",
+      "priority": "SHALL",
+      "rationale": "SHA-256 is the cryptographic hash specified in the feature description for verifying file integrity",
+      "scenarios": [
+        {
+          "name": "Binary checksum matches expected",
+          "when": "Checker.VerifyFile is called with a file path and a matching expected checksum",
+          "then": "CheckResult.OK is true with matching Expected and Actual values",
+          "and_then": []
+        },
+        {
+          "name": "Binary checksum does not match",
+          "when": "Checker.VerifyFile is called with a file path and a non-matching expected checksum",
+          "then": "CheckResult.OK is false with the mismatched Expected and Actual hex strings",
+          "and_then": [
+            "the violation is available for reporting to the control plane"
+          ]
+        },
+        {
+          "name": "File does not exist",
+          "when": "Checker.VerifyFile is called with a path to a non-existent file",
+          "then": "an error wrapping os.ErrNotExist is returned",
+          "and_then": [
+            "no CheckResult is produced"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The integrity package SHALL verify the plexd binary on startup before any sensitive operations",
+      "priority": "SHALL",
+      "rationale": "Startup verification catches tampering that occurred while the agent was not running",
+      "scenarios": [
+        {
+          "name": "First startup with no stored baseline",
+          "when": "the agent starts and no checksum baseline exists in the store",
+          "then": "the binary checksum is computed and stored as the baseline; verification passes",
+          "and_then": [
+            "the checksum is available for inclusion in heartbeat requests"
+          ]
+        },
+        {
+          "name": "Startup with matching baseline",
+          "when": "the agent starts and the binary checksum matches the stored baseline",
+          "then": "verification passes silently with an info log",
+          "and_then": []
+        },
+        {
+          "name": "Startup with mismatched baseline",
+          "when": "the agent starts and the binary checksum does NOT match the stored baseline",
+          "then": "an integrity violation is reported to the control plane",
+          "and_then": [
+            "the agent logs the violation at error level with the expected and actual checksums",
+            "the agent continues running (violations are reported, not fatal)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The integrity package SHALL verify hook script checksums before execution using the checksum provided by the control plane",
+      "priority": "SHALL",
+      "rationale": "Hook scripts run arbitrary code on the node; verification prevents execution of tampered scripts",
+      "scenarios": [
+        {
+          "name": "Hook checksum matches control plane value",
+          "when": "VerifyFile is called with a hook path and the expected checksum from api.HookInfo.Checksum",
+          "then": "CheckResult.OK is true and the hook may be executed",
+          "and_then": []
+        },
+        {
+          "name": "Hook checksum does not match",
+          "when": "VerifyFile is called with a hook path and the expected checksum does NOT match",
+          "then": "CheckResult.OK is false",
+          "and_then": [
+            "the hook MUST NOT be executed",
+            "an integrity violation is reported"
+          ]
+        },
+        {
+          "name": "Hook has no expected checksum",
+          "when": "VerifyFile is called with an empty expected checksum for a hook",
+          "then": "an error is returned indicating that hooks require a checksum",
+          "and_then": [
+            "the hook MUST NOT be executed"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The integrity package SHALL verify downloaded binary artifacts against the expected checksum before applying updates",
+      "priority": "SHALL",
+      "rationale": "Download verification ensures corrupted or tampered artifacts are not installed",
+      "scenarios": [
+        {
+          "name": "Downloaded binary matches expected checksum",
+          "when": "VerifyFile is called on a downloaded binary with the artifact's expected checksum",
+          "then": "CheckResult.OK is true and the update may proceed",
+          "and_then": []
+        },
+        {
+          "name": "Downloaded binary does not match",
+          "when": "VerifyFile is called on a downloaded binary and the checksum does not match",
+          "then": "CheckResult.OK is false",
+          "and_then": [
+            "the downloaded file MUST NOT replace the running binary",
+            "an integrity violation is reported"
+          ]
+        },
+        {
+          "name": "Downloaded file is truncated or empty",
+          "when": "VerifyFile is called on a zero-length file",
+          "then": "CheckResult.OK is false (empty file hash will never match a real binary's checksum)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The integrity package SHALL report integrity violations to the control plane via POST /v1/nodes/{node_id}/integrity/violations",
+      "priority": "SHALL",
+      "rationale": "Central visibility into integrity violations enables platform-wide security monitoring and incident response",
+      "scenarios": [
+        {
+          "name": "Violation reported successfully",
+          "when": "a checksum mismatch is detected and the control plane is reachable",
+          "then": "POST /v1/nodes/{node_id}/integrity/violations is sent with Type, Path, ExpectedChecksum, ActualChecksum",
+          "and_then": [
+            "the violation is logged locally at error level"
+          ]
+        },
+        {
+          "name": "Violation reporting fails due to unreachable control plane",
+          "when": "a checksum mismatch is detected but the control plane is unreachable",
+          "then": "the reporting error is logged at warn level",
+          "and_then": [
+            "the violation is still logged locally at error level",
+            "the agent continues operating normally"
+          ]
+        },
+        {
+          "name": "Violation reporting is non-blocking",
+          "when": "a violation is detected during periodic verification",
+          "then": "the reporting does not block the verification loop",
+          "and_then": [
+            "other files continue to be verified"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The integrity package SHALL persist known-good checksums in a local JSON file using atomic writes",
+      "priority": "SHALL",
+      "rationale": "Persistent storage enables verification across restarts and provides a baseline when the control plane is unreachable",
+      "scenarios": [
+        {
+          "name": "Store persists checksums atomically",
+          "when": "Store.Set is called with a path and checksum",
+          "then": "the checksum is written to checksums.json via fsutil.WriteFileAtomic",
+          "and_then": [
+            "concurrent readers never see a partially written file"
+          ]
+        },
+        {
+          "name": "Store loads checksums on initialization",
+          "when": "NewStore is called with a data directory containing an existing checksums.json",
+          "then": "all previously stored checksums are loaded into memory",
+          "and_then": []
+        },
+        {
+          "name": "Store handles missing checksums.json on first run",
+          "when": "NewStore is called with a data directory that has no checksums.json",
+          "then": "an empty store is created without error",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The integrity package SHALL perform periodic re-verification of the binary and all known hooks at a configurable interval",
+      "priority": "SHALL",
+      "rationale": "Periodic verification detects runtime tampering that occurs after startup",
+      "scenarios": [
+        {
+          "name": "Periodic verification detects runtime tampering",
+          "when": "the binary file on disk is modified after startup and the periodic check runs",
+          "then": "the checksum mismatch is detected and reported as a violation",
+          "and_then": []
+        },
+        {
+          "name": "Periodic verification completes within interval",
+          "when": "the verification interval elapses",
+          "then": "the binary and all hooks are verified in a single cycle",
+          "and_then": [
+            "the next cycle starts after another interval elapses"
+          ]
+        },
+        {
+          "name": "Periodic verification stops on context cancellation",
+          "when": "the context is cancelled during periodic verification",
+          "then": "the verification loop exits cleanly",
+          "and_then": [
+            "no goroutine leaks"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The integrity Config SHALL follow the established Config pattern with ApplyDefaults and Validate methods",
+      "priority": "SHALL",
+      "rationale": "Consistency with wireguard.Config, nat.Config, policy.Config, tunnel.Config patterns in the codebase",
+      "scenarios": [
+        {
+          "name": "Zero-valued config gets defaults",
+          "when": "Config.ApplyDefaults is called on a zero-valued Config",
+          "then": "Enabled is set to true, VerifyInterval is set to 5m",
+          "and_then": []
+        },
+        {
+          "name": "Validation rejects too-short interval when enabled",
+          "when": "Config.Validate is called with Enabled=true and VerifyInterval < 30s",
+          "then": "an error is returned: 'integrity: config: VerifyInterval must be at least 30s when enabled'",
+          "and_then": []
+        },
+        {
+          "name": "Disabled config passes validation",
+          "when": "Config.Validate is called with Enabled=false",
+          "then": "nil is returned regardless of other field values",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The integrity package SHALL use structured logging with log/slog and component=integrity",
+      "priority": "SHALL",
+      "rationale": "Operational consistency with existing internal packages (api, wireguard, nat, policy, tunnel) logging patterns",
+      "scenarios": [
+        {
+          "name": "Verification success logged",
+          "when": "a file passes integrity verification",
+          "then": "info log with component=integrity, path, checksum",
+          "and_then": []
+        },
+        {
+          "name": "Verification failure logged",
+          "when": "a file fails integrity verification",
+          "then": "error log with component=integrity, path, expected_checksum, actual_checksum",
+          "and_then": []
+        },
+        {
+          "name": "Periodic check cycle logged",
+          "when": "a periodic verification cycle completes",
+          "then": "info log with component=integrity, files_checked, violations_found, duration",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The integrity package SHALL compute checksums using streaming reads to handle large files efficiently",
+      "priority": "SHALL",
+      "rationale": "Binary files can be large (50MB+); streaming avoids excessive memory allocation",
+      "scenarios": [
+        {
+          "name": "Large file hashed in streaming fashion",
+          "when": "VerifyFile is called on a large binary file",
+          "then": "the file is read via io.Copy into a crypto/sha256 hash.Hash, not loaded entirely into memory",
+          "and_then": []
+        },
+        {
+          "name": "Empty file produces valid hash",
+          "when": "VerifyFile is called on an empty file",
+          "then": "the SHA-256 hash of the empty string is returned (e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855)",
+          "and_then": []
+        },
+        {
+          "name": "File read error during hashing",
+          "when": "a read error occurs mid-stream while computing the hash",
+          "then": "the error is returned and no CheckResult is produced",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "The integrity Verifier SHALL expose the current binary checksum for use in heartbeat requests",
+      "priority": "SHALL",
+      "rationale": "The HeartbeatRequest.BinaryChecksum field already exists in the API; the integrity verifier is the canonical source of this value",
+      "scenarios": [
+        {
+          "name": "Binary checksum available for heartbeat",
+          "when": "the binary has been verified (on startup or periodic check)",
+          "then": "Verifier.BinaryChecksum() returns the hex-encoded SHA-256 of the running binary",
+          "and_then": [
+            "this value is used in HeartbeatRequest.BinaryChecksum"
+          ]
+        },
+        {
+          "name": "Binary checksum before first verification",
+          "when": "BinaryChecksum is called before any verification has run",
+          "then": "an empty string is returned",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/integrity/config.go — Define Config struct with Enabled bool, BinaryPath string, HooksDir string, and VerifyInterval time.Duration. Implement ApplyDefaults() (Enabled=true, VerifyInterval=5m on zero-valued Config) and Validate() (reject VerifyInterval<30s when enabled, pass when disabled). Follow the same Config pattern as internal/tunnel/config.go and internal/policy/config.go. Include tests in config_test.go for: defaults applied, validation errors, disabled passes, custom values respected. (REQ-008)",
+    "1.2 Create internal/integrity/checker.go — Define CheckResult struct (Path, Expected, Actual string, OK bool). Implement HashFile(path string) (string, error) that opens the file, streams its content into crypto/sha256 via io.Copy, and returns the hex-encoded digest. Implement VerifyFile(path string, expectedChecksum string) (CheckResult, error) that calls HashFile and compares the result against expectedChecksum. If expectedChecksum is empty and the file is a hook (indicated by a requireChecksum bool parameter), return an error. Include comprehensive tests in checker_test.go for: correct SHA-256 computation, matching checksums, mismatched checksums, file not found, empty file, empty expected for hooks. (REQ-001, REQ-003, REQ-010)",
+    "1.3 Create internal/integrity/store.go — Define Store struct with dataDir string, checksums map[string]string protected by sync.RWMutex. Implement NewStore(dataDir string) (*Store, error) that loads existing checksums.json or creates empty map. Implement Get(path string) string, Set(path string, checksum string) error (persists via fsutil.WriteFileAtomic), and Remove(path string) error. Include tests in store_test.go for: set+get, get missing, remove, persist+reload from disk, missing file on first run, concurrent access under -race. (REQ-006)",
+    "1.4 Add API types to internal/api/types.go — Add IntegrityViolationReport struct (Type string, Path string, ExpectedChecksum string, ActualChecksum string, Detail string, Timestamp time.Time). Add ReportIntegrityViolation endpoint method to internal/api/endpoints.go (POST /v1/nodes/{node_id}/integrity/violations). Include tests for the new type in types_test.go and endpoint in endpoints_test.go. (REQ-005)",
+    "2.1 Create internal/integrity/verifier.go — Define ViolationReporter interface (ReportViolation(ctx, nodeID string, report api.IntegrityViolationReport) error). Define Verifier struct wrapping Config, Checker funcs (HashFile, VerifyFile), Store, ViolationReporter, logger, and sync.Mutex-protected binaryChecksum string. Implement VerifyBinary(ctx, nodeID string) error: compute binary hash, compare against Store baseline; on first run store baseline; on mismatch report violation. Implement VerifyHook(ctx, nodeID, hookPath, expectedChecksum string) (bool, error): verify hook and report violation on mismatch. Implement BinaryChecksum() string (thread-safe getter). Implement Run(ctx, nodeID string) error: startup binary verification then periodic loop at VerifyInterval. When disabled, Run returns immediately. Include tests in verifier_test.go. (REQ-002, REQ-003, REQ-004, REQ-007, REQ-009, REQ-011)",
+    "3.1 Create internal/integrity/verifier_integration_test.go — Integration tests with real files on disk, real Store, and mock ViolationReporter. Tests: full lifecycle (startup → periodic → tamper → violation), hook verification lifecycle, concurrent verification under -race, context cancellation with no goroutine leaks (goleak). (REQ-001 through REQ-007, REQ-010, REQ-011)",
+    "4.1 Create docs/reference/backend/integrity-verification.md — Reference documentation for internal/integrity/ package: Config struct, CheckResult struct, HashFile/VerifyFile functions, Store (Get/Set/Remove/persistence), Verifier (VerifyBinary/VerifyHook/BinaryChecksum/Run), ViolationReporter interface. Include data flow diagram: startup → HashFile(binary) → compare baseline → report violation → periodic loop → re-verify. Reference integration with internal/api (IntegrityViolationReport, HeartbeatRequest.BinaryChecksum), internal/fsutil (atomic writes), internal/registration (BinaryPath from os.Executable). (REQ-001 through REQ-011)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/integrity/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults",
+      "story": "Platform operator can configure integrity verification parameters",
+      "expected": "Config.ApplyDefaults sets Enabled=true, VerifyInterval=5m on zero-valued Config",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/integrity/config_test.go",
+      "test_function": "TestConfig_Validate",
+      "story": "Platform operator can configure integrity verification parameters",
+      "expected": "Config.Validate rejects VerifyInterval<30s when enabled, passes when disabled, passes with valid values",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/integrity/checker_test.go",
+      "test_function": "TestHashFile_ComputesSHA256",
+      "story": "plexd verifies the integrity of its own binary on startup using SHA-256 checksums",
+      "expected": "HashFile returns the correct hex-encoded SHA-256 hash for a known test file",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/integrity/checker_test.go",
+      "test_function": "TestHashFile_EmptyFile",
+      "story": "plexd verifies the integrity of its own binary on startup using SHA-256 checksums",
+      "expected": "HashFile on empty file returns SHA-256 of empty string (e3b0c44...)",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/integrity/checker_test.go",
+      "test_function": "TestHashFile_FileNotFound",
+      "story": "Integrity verification errors do not crash the agent",
+      "expected": "HashFile on non-existent file returns error wrapping os.ErrNotExist",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/integrity/checker_test.go",
+      "test_function": "TestVerifyFile_MatchingChecksum",
+      "story": "plexd verifies the integrity of its own binary on startup using SHA-256 checksums",
+      "expected": "VerifyFile returns CheckResult.OK=true when expected matches actual",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/integrity/checker_test.go",
+      "test_function": "TestVerifyFile_MismatchedChecksum",
+      "story": "plexd verifies hook scripts before execution",
+      "expected": "VerifyFile returns CheckResult.OK=false with correct Expected and Actual fields",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/integrity/checker_test.go",
+      "test_function": "TestVerifyFile_EmptyExpected",
+      "story": "plexd verifies hook scripts before execution",
+      "expected": "VerifyFile with empty expected returns error for hooks (hooks require checksum)",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/integrity/store_test.go",
+      "test_function": "TestStore_SetAndGet",
+      "story": "plexd stores and manages checksum baselines in a local store",
+      "expected": "Store.Set persists and Store.Get retrieves the checksum correctly",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/integrity/store_test.go",
+      "test_function": "TestStore_GetMissing",
+      "story": "plexd stores and manages checksum baselines in a local store",
+      "expected": "Store.Get for unknown path returns empty string",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/integrity/store_test.go",
+      "test_function": "TestStore_Remove",
+      "story": "plexd stores and manages checksum baselines in a local store",
+      "expected": "Store.Remove removes the entry; subsequent Get returns empty string",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/integrity/store_test.go",
+      "test_function": "TestStore_PersistAndReload",
+      "story": "plexd stores and manages checksum baselines in a local store",
+      "expected": "Checksums stored by one Store instance are loaded by a new Store instance from the same directory",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/integrity/store_test.go",
+      "test_function": "TestStore_MissingFileOnFirstRun",
+      "story": "plexd stores and manages checksum baselines in a local store",
+      "expected": "NewStore on empty directory creates empty store without error",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/integrity/store_test.go",
+      "test_function": "TestStore_ConcurrentAccess",
+      "story": "Integrity verification errors do not crash the agent",
+      "expected": "Concurrent Set/Get operations do not race (verified with -race)",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/integrity/verifier_test.go",
+      "test_function": "TestVerifier_StartupVerification_NoBaseline",
+      "story": "plexd verifies the integrity of its own binary on startup using SHA-256 checksums",
+      "expected": "First startup stores the binary checksum as baseline and reports no violation",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/integrity/verifier_test.go",
+      "test_function": "TestVerifier_StartupVerification_MatchingBaseline",
+      "story": "plexd verifies the integrity of its own binary on startup using SHA-256 checksums",
+      "expected": "Startup with matching baseline passes verification with info log",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/integrity/verifier_test.go",
+      "test_function": "TestVerifier_StartupVerification_MismatchedBaseline",
+      "story": "plexd verifies the integrity of its own binary on startup using SHA-256 checksums",
+      "expected": "Startup with mismatched baseline reports violation to the control plane",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/integrity/verifier_test.go",
+      "test_function": "TestVerifier_VerifyHook_Matching",
+      "story": "plexd verifies the integrity of hook scripts before execution using SHA-256 checksums",
+      "expected": "Hook with matching checksum returns OK=true",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/integrity/verifier_test.go",
+      "test_function": "TestVerifier_VerifyHook_Mismatched",
+      "story": "plexd verifies the integrity of hook scripts before execution using SHA-256 checksums",
+      "expected": "Hook with mismatched checksum returns OK=false and reports violation",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/integrity/verifier_test.go",
+      "test_function": "TestVerifier_VerifyHook_EmptyChecksum",
+      "story": "plexd verifies the integrity of hook scripts before execution using SHA-256 checksums",
+      "expected": "Hook with empty expected checksum returns error",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/integrity/verifier_test.go",
+      "test_function": "TestVerifier_BinaryChecksum",
+      "story": "plexd verifies the integrity of its own binary on startup using SHA-256 checksums",
+      "expected": "BinaryChecksum returns the hex-encoded SHA-256 after startup verification",
+      "requirement_id": "REQ-011"
+    },
+    {
+      "test_file": "internal/integrity/verifier_test.go",
+      "test_function": "TestVerifier_BinaryChecksum_BeforeVerification",
+      "story": "plexd verifies the integrity of its own binary on startup using SHA-256 checksums",
+      "expected": "BinaryChecksum returns empty string before any verification has run",
+      "requirement_id": "REQ-011"
+    },
+    {
+      "test_file": "internal/integrity/verifier_test.go",
+      "test_function": "TestVerifier_Disabled",
+      "story": "Platform operator can configure integrity verification parameters",
+      "expected": "When Config.Enabled=false, startup verification returns success without computing checksums",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/integrity/verifier_test.go",
+      "test_function": "TestVerifier_PeriodicRun_DetectsTampering",
+      "story": "plexd performs periodic re-verification of binary and hook integrity",
+      "expected": "Periodic check detects modified binary and reports violation",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/integrity/verifier_test.go",
+      "test_function": "TestVerifier_PeriodicRun_ContextCancellation",
+      "story": "plexd performs periodic re-verification of binary and hook integrity",
+      "expected": "Periodic loop exits cleanly on context cancellation with no goroutine leaks",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestIntegrityViolationReport_JSON",
+      "story": "plexd reports integrity violations to the control plane",
+      "expected": "IntegrityViolationReport marshals/unmarshals correctly with all fields",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/api/endpoints_test.go",
+      "test_function": "TestControlPlane_ReportIntegrityViolation",
+      "story": "plexd reports integrity violations to the control plane",
+      "expected": "ReportIntegrityViolation sends POST to /v1/nodes/{node_id}/integrity/violations",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/integrity/verifier_integration_test.go",
+      "test_function": "TestIntegration_FullLifecycle",
+      "story": "plexd verifies the integrity of its own binary on startup using SHA-256 checksums",
+      "expected": "Full lifecycle: startup verification → periodic check → binary tampered → violation reported → hook verified → hook tampered → violation reported",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/integrity/verifier_integration_test.go",
+      "test_function": "TestIntegration_ConcurrentVerification",
+      "story": "Integrity verification errors do not crash the agent",
+      "expected": "Concurrent verification requests are safe under race detector",
+      "requirement_id": "REQ-006"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-011) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case in the test_specifications",
+    "SHA-256 checksums computed via streaming io.Copy into crypto/sha256 — no full-file memory load (REQ-010)",
+    "Checksum store uses fsutil.WriteFileAtomic for crash-safe persistence (REQ-006)",
+    "ViolationReporter interface abstracts control plane reporting for testability — same pattern as tunnel.TunnelReporter",
+    "Config follows established pattern: ApplyDefaults/Validate with Enabled, same style as policy.Config and tunnel.Config (REQ-008)",
+    "Code follows existing patterns: log/slog with component=integrity key, stdlib-only test dependencies, no external crypto libraries",
+    "Integrity violations are non-fatal: reported and logged but do not crash the agent (graceful degradation)",
+    "Concurrent access to Store and Verifier.binaryChecksum is safe under race detector",
+    "Reference documentation covers all public types, methods, data flow, and integration patterns (docs/reference/backend/integrity-verification.md)"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Package structure**: All code lives in `internal/integrity/`. Files: config.go (Config struct), checker.go (pure SHA-256 hashing and verification logic), store.go (persistent checksum storage), verifier.go (orchestration: startup + periodic + hook verification), and corresponding _test.go files. An integration test file verifier_integration_test.go wires components with real files.\n\n2. **Two-layer design**: The design separates pure computation (checker.go: HashFile, VerifyFile) from orchestration (verifier.go: Verifier). Checker functions are stateless and easily testable. Verifier orchestrates Checker + Store + ViolationReporter.\n\n3. **CheckResult struct**: `CheckResult{Path string, Expected string, Actual string, OK bool}` is returned by VerifyFile. Path identifies the file. Expected and Actual are hex-encoded SHA-256 strings. OK is true when Expected==Actual. When expectedChecksum is empty and this is a first-run binary check (not a hook), the Actual value is returned with OK=true (baseline establishment).\n\n4. **Store design**: `Store` holds a `map[string]string` (file path → hex checksum) protected by `sync.RWMutex`. Persistence uses `fsutil.WriteFileAtomic(dataDir, \"checksums.json\", ...)` for crash-safe writes. On NewStore, the existing file is loaded; if absent (first run), the map is empty. The store file format is simple JSON: `{\"<path>\": \"<hex-sha256>\", ...}`.\n\n5. **Verifier lifecycle**: (a) VerifyBinary on startup: hash binary → load baseline from Store → compare → if no baseline, store it → if mismatch, report violation. (b) VerifyHook before execution: hash hook → compare against expected from api.HookInfo.Checksum → if mismatch, report violation and return false. (c) Run starts a ticker at VerifyInterval and re-runs VerifyBinary each tick. Hooks are verified on-demand before execution, not periodically (hooks are verified using the checksum provided by the control plane in the action_request SSE event).\n\n6. **ViolationReporter interface**: `ReportViolation(ctx context.Context, nodeID string, report api.IntegrityViolationReport) error` abstracts the control plane API call for testability. The production implementation wraps `ControlPlane.ReportIntegrityViolation`. Tests use a mock recorder.\n\n7. **API types**: Add to `internal/api/types.go`: `IntegrityViolationReport{Type string, Path string, ExpectedChecksum string, ActualChecksum string, Detail string, Timestamp time.Time}`. Type is \"binary\" or \"hook\". Add to `internal/api/endpoints.go`: `ReportIntegrityViolation(ctx, nodeID string, report IntegrityViolationReport) error` → POST `/v1/nodes/{node_id}/integrity/violations`.\n\n8. **HeartbeatRequest.BinaryChecksum integration**: The `HeartbeatRequest.BinaryChecksum` field already exists in `internal/api/types.go:47`. The Verifier exposes `BinaryChecksum() string` which returns the last computed hex SHA-256. The caller (heartbeat sender, likely in a future feature) reads this value. No changes to the heartbeat code are needed now — only the Verifier provides the value.\n\n9. **Security design**:\n   - **SHA-256**: Uses `crypto/sha256` from the Go standard library — no external dependencies (SECPLAN-1)\n   - **Streaming**: Files hashed via `io.Copy(hash, file)` to avoid loading full binaries into memory (SECPLAN-3)\n   - **Atomic writes**: Store uses `fsutil.WriteFileAtomic` to prevent corruption of the checksum database (SECPLAN-2)\n   - **Violation reporting**: Fire-and-forget to control plane; local error logging ensures visibility even if reporting fails (SECPLAN-4)\n\n10. **Key files from existing codebase**:\n    - `internal/api/types.go:42-50` — HeartbeatRequest with BinaryChecksum field (already exists)\n    - `internal/api/types.go:232-264` — CapabilitiesPayload with BinaryInfo.Checksum and HookInfo.Checksum (already exists — these are the expected checksums)\n    - `internal/api/endpoints.go:56-63` — Heartbeat endpoint pattern to follow\n    - `internal/fsutil/atomic.go:10-32` — WriteFileAtomic for store persistence\n    - `internal/tunnel/config.go` — Config pattern to follow (Enabled + ApplyDefaults + Validate)\n    - `internal/policy/config.go` — Config pattern reference\n    - `internal/registration/identity.go:17-23` — NodeIdentity struct\n\n11. **Potential pitfalls**:\n    - The binary path must be resolved at startup via `os.Executable()` followed by `filepath.EvalSymlinks` to get the real path (not a symlink). This is stored in Config.BinaryPath.\n    - On some systems, the binary may be replaced atomically during an update (rename). The checksum will change legitimately after an update. The Verifier should accept a method to update the baseline when an update is intentionally applied: `Verifier.UpdateBinaryBaseline(checksum string)`.\n    - File permissions: the agent process must have read access to hook scripts. If a hook file becomes unreadable, this is an error (not a violation).\n    - Hook checksums come from the control plane (`api.HookInfo.Checksum`), NOT from the local store. The local store is only for the binary baseline. This distinction is important.\n    - The SHA-256 of an empty file is `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`. Tests should verify this.\n\n12. **Observability** (OBSPLAN-1): All operations use `log/slog` with `component=integrity`. Key log points: binary verified on startup (info), violation detected (error with expected/actual), periodic cycle completed (info with stats), store persistence error (error), violation report failed (warn).",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-11T20:39:25.108139"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T16:26:13.749420"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T16:31:06.919800"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "0d3ed61d-76bb-4cdd-935e-8ecca81d44fc",
+      "timestamp": "2026-02-12T16:31:06.919826",
+      "total_duration": 288.9902186393738,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 288.9902186393738,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
