@@ -2,8 +2,8 @@
   "feature_id": "PXD-0004",
   "title": "A004: Implement local node API",
   "slug": "a004-implement-local-node-api",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Expose node state (metadata, configuration data, secrets) to local workloads and scripts. On bare-metal/VM, serve via a Unix socket API. On Kubernetes, expose state via a PlexdNodeState CRD. Supports bidirectional data exchange — downstream from the control plane and upstream reporting from the node.",
   "stories": [
@@ -537,19 +537,19 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/nodeapi/config.go — Define Config struct: SocketPath string (default /var/run/plexd/api.sock), HTTPEnabled bool (default false), HTTPListen string (default 127.0.0.1:9100), HTTPTokenFile string, DebouncePeriod time.Duration (default 5s), ShutdownTimeout time.Duration (default 5s), DataDir string (required). Implement ApplyDefaults() and Validate() following internal/api/config.go and internal/registration/config.go patterns. Export default constants. Include tests in config_test.go for defaults, validation, and custom overrides. (REQ-012)",
-    "1.2 Create internal/nodeapi/cache.go — Define StateCache struct with sync.RWMutex: metadata map[string]string, data map[string]api.DataEntry, secretIndex []api.SecretRef, reports map[string]api.ReportEntry (define ReportEntry: Key, ContentType, Payload json.RawMessage, Version int, UpdatedAt time.Time). Implement NewStateCache(dataDir), Load() error (read from data_dir/state/), UpdateMetadata(m), UpdateData(entries), UpdateSecretIndex(refs), GetMetadata/GetData/GetSecretIndex/GetReports, PutReport(key, contentType, payload, ifMatch *int) (ReportEntry, error) with version increment and optimistic locking (ErrVersionConflict), DeleteReport(key) error (ErrNotFound), persist methods writing to data_dir/state/ atomically. Include tests in cache_test.go for all CRUD, locking, persistence, and concurrent access. (REQ-006, REQ-008)",
-    "1.3 Create internal/nodeapi/decrypt.go — Implement DecryptSecret(nsk []byte, ciphertext string, nonce string) (string, error). Decode base64 ciphertext and nonce, decrypt using crypto/aes + crypto/cipher (AES-256-GCM). Return plaintext string. Return generic error on decryption failure (no crypto details leaked). Include tests in decrypt_test.go: successful decryption roundtrip (encrypt then decrypt), corrupted ciphertext, invalid nonce, wrong key. (REQ-010)",
-    "1.4 Create internal/nodeapi/sync.go — Implement ReportSyncer struct with: client (interface with SyncReports method), nodeID string, debouncePeriod time.Duration, logger *slog.Logger, pending changes buffer (entries []api.ReportEntry, deleted []string) protected by mutex. Implement NotifyChange(entries, deleted) to buffer changes. Implement Run(ctx) that loops: wait for debounce timer after NotifyChange, coalesce all buffered changes, call SyncReports, clear buffer on success, retain on failure. Include tests in sync_test.go: debounce timing, coalescing, retry on failure, context cancellation, no goroutine leaks. (REQ-007)",
-    "2.1 Create internal/nodeapi/handler.go — Implement HTTP handler (using net/http ServeMux or manual routing): routes for GET /v1/state, GET /v1/state/metadata, GET /v1/state/metadata/{key}, GET /v1/state/data, GET /v1/state/data/{key}, GET /v1/state/secrets, GET /v1/state/secrets/{key}, GET /v1/state/report, GET /v1/state/report/{key}, PUT /v1/state/report/{key}, DELETE /v1/state/report/{key}. Each handler reads from StateCache. Secret handler proxies to ControlPlane.FetchSecret and calls DecryptSecret. Report PUT parses If-Match header for optimistic locking. All responses JSON with proper status codes (200, 204, 400, 404, 405, 409, 500, 503). Include tests in handler_test.go using httptest.Server for all endpoints, success and error cases. (REQ-002, REQ-003, REQ-004, REQ-005, REQ-006)",
-    "2.2 Create internal/nodeapi/auth.go — Implement BearerAuthMiddleware(token string) func(http.Handler) http.Handler that checks Authorization: Bearer header on TCP requests. Returns 401 for missing or invalid token. Unix socket requests bypass auth (no middleware applied). Include tests in auth_test.go for valid token, missing token, invalid token, and bypass for socket. (REQ-009)",
-    "2.3 Create internal/nodeapi/events.go — Implement SSE event handlers for node_state_updated and node_secrets_updated. Define NodeStateUpdatePayload struct (Metadata map[string]string, Data []api.DataEntry) and NodeSecretsUpdatePayload struct (SecretRefs []api.SecretRef). Implement HandleNodeStateUpdated(ctx, envelope) error that parses payload and updates the StateCache. Implement HandleNodeSecretsUpdated(ctx, envelope) error that parses payload and updates the secret index. Implement RegisterEventHandlers(dispatcher *api.EventDispatcher, cache *StateCache, logger) that registers both handlers. Include tests in events_test.go for valid payloads, malformed payloads, and cache update verification. (REQ-013)",
-    "3.1 Create internal/nodeapi/server.go — Implement Server struct wiring all components: Config, StateCache, ReportSyncer, ControlPlane client (interface for FetchSecret, SyncReports), NSK []byte, logger. Implement NewServer(cfg, client, nsk, logger). Implement Start(ctx, nodeID) error: (1) create data_dir/state/ if needed, (2) load cache from disk, (3) start ReportSyncer goroutine, (4) set up HTTP routes with handler, (5) open Unix socket listener (remove stale socket first), (6) optionally open TCP listener with auth middleware, (7) start serving. On context cancellation: graceful HTTP shutdown with ShutdownTimeout, close listeners, remove socket file. Implement RegisterEventHandlers(dispatcher) to register SSE handlers. Implement ReconcileHandler() reconcile.ReconcileHandler that updates the cache on drift detection. Include tests in server_test.go using t.TempDir and httptest: Unix socket lifecycle, TCP with auth, graceful shutdown, no goroutine leaks (goleak). (REQ-001, REQ-009, REQ-011)",
-    "4.1 Create docs/reference/backend/nodeapi.md — Reference documentation for internal/nodeapi/ package: Config struct fields and defaults, Server constructor and lifecycle (NewServer, Start, RegisterEventHandlers, ReconcileHandler), StateCache CRUD operations and persistence layout, ReportSyncer debounce and retry behavior, DecryptSecret usage, BearerAuthMiddleware, HTTP API endpoints (paths, methods, request/response schemas, error codes), SSE event handler registration, integration points (ControlPlane client methods, reconcile.ReconcileHandler, api.EventDispatcher). Include examples for constructing a Server, configuring listeners, and making API requests. (REQ-001 through REQ-014)",
-    "4.2 Create docs/how-to/backend/local-node-api.md — How-to guide for using the Local Node API: prerequisites (plexd running, correct group membership), reading metadata and data from the Unix socket with curl examples, writing and deleting report entries with optimistic locking, reading secrets (elevated access requirements), using the optional TCP listener with bearer token, troubleshooting common errors (403, 503). Reference the reference docs. (REQ-001 through REQ-014)",
-    "5.1 Add integration test in internal/nodeapi/server_test.go — TestServer_EndToEndFlow: start server with Unix socket, populate cache with test data, verify GET /v1/state returns summary, GET /v1/state/metadata returns metadata, PUT /v1/state/report creates entry, GET /v1/state/report/{key} returns it, DELETE /v1/state/report/{key} removes it, verify report sync is triggered. (REQ-001 through REQ-008)",
-    "5.2 Add integration test in internal/nodeapi/server_test.go — TestServer_SecretProxy: start server with mock ControlPlane returning NSK-encrypted secrets, verify GET /v1/state/secrets/{key} returns decrypted value, verify 503 when mock returns error, verify 404 when mock returns ErrNotFound. (REQ-005, REQ-010)",
-    "5.3 Add integration test in internal/nodeapi/server_test.go — TestServer_CacheUpdateFromEvents: start server, simulate node_state_updated and node_secrets_updated events via the event handlers, verify cache reflects the updates and GET endpoints return new data. (REQ-008, REQ-013)"
+    "[done] 1.1 Create internal/nodeapi/config.go — Define Config struct: SocketPath string (default /var/run/plexd/api.sock), HTTPEnabled bool (default false), HTTPListen string (default 127.0.0.1:9100), HTTPTokenFile string, DebouncePeriod time.Duration (default 5s), ShutdownTimeout time.Duration (default 5s), DataDir string (required). Implement ApplyDefaults() and Validate() following internal/api/config.go and internal/registration/config.go patterns. Export default constants. Include tests in config_test.go for defaults, validation, and custom overrides. (REQ-012)",
+    "[done] 1.2 Create internal/nodeapi/cache.go — Define StateCache struct with sync.RWMutex: metadata map[string]string, data map[string]api.DataEntry, secretIndex []api.SecretRef, reports map[string]api.ReportEntry (define ReportEntry: Key, ContentType, Payload json.RawMessage, Version int, UpdatedAt time.Time). Implement NewStateCache(dataDir), Load() error (read from data_dir/state/), UpdateMetadata(m), UpdateData(entries), UpdateSecretIndex(refs), GetMetadata/GetData/GetSecretIndex/GetReports, PutReport(key, contentType, payload, ifMatch *int) (ReportEntry, error) with version increment and optimistic locking (ErrVersionConflict), DeleteReport(key) error (ErrNotFound), persist methods writing to data_dir/state/ atomically. Include tests in cache_test.go for all CRUD, locking, persistence, and concurrent access. (REQ-006, REQ-008)",
+    "[done] 1.3 Create internal/nodeapi/decrypt.go — Implement DecryptSecret(nsk []byte, ciphertext string, nonce string) (string, error). Decode base64 ciphertext and nonce, decrypt using crypto/aes + crypto/cipher (AES-256-GCM). Return plaintext string. Return generic error on decryption failure (no crypto details leaked). Include tests in decrypt_test.go: successful decryption roundtrip (encrypt then decrypt), corrupted ciphertext, invalid nonce, wrong key. (REQ-010)",
+    "[done] 1.4 Create internal/nodeapi/sync.go — Implement ReportSyncer struct with: client (interface with SyncReports method), nodeID string, debouncePeriod time.Duration, logger *slog.Logger, pending changes buffer (entries []api.ReportEntry, deleted []string) protected by mutex. Implement NotifyChange(entries, deleted) to buffer changes. Implement Run(ctx) that loops: wait for debounce timer after NotifyChange, coalesce all buffered changes, call SyncReports, clear buffer on success, retain on failure. Include tests in sync_test.go: debounce timing, coalescing, retry on failure, context cancellation, no goroutine leaks. (REQ-007)",
+    "[done] 2.1 Create internal/nodeapi/handler.go — Implement HTTP handler (using net/http ServeMux or manual routing): routes for GET /v1/state, GET /v1/state/metadata, GET /v1/state/metadata/{key}, GET /v1/state/data, GET /v1/state/data/{key}, GET /v1/state/secrets, GET /v1/state/secrets/{key}, GET /v1/state/report, GET /v1/state/report/{key}, PUT /v1/state/report/{key}, DELETE /v1/state/report/{key}. Each handler reads from StateCache. Secret handler proxies to ControlPlane.FetchSecret and calls DecryptSecret. Report PUT parses If-Match header for optimistic locking. All responses JSON with proper status codes (200, 204, 400, 404, 405, 409, 500, 503). Include tests in handler_test.go using httptest.Server for all endpoints, success and error cases. (REQ-002, REQ-003, REQ-004, REQ-005, REQ-006)",
+    "[done] 2.2 Create internal/nodeapi/auth.go — Implement BearerAuthMiddleware(token string) func(http.Handler) http.Handler that checks Authorization: Bearer header on TCP requests. Returns 401 for missing or invalid token. Unix socket requests bypass auth (no middleware applied). Include tests in auth_test.go for valid token, missing token, invalid token, and bypass for socket. (REQ-009)",
+    "[done] 2.3 Create internal/nodeapi/events.go — Implement SSE event handlers for node_state_updated and node_secrets_updated. Define NodeStateUpdatePayload struct (Metadata map[string]string, Data []api.DataEntry) and NodeSecretsUpdatePayload struct (SecretRefs []api.SecretRef). Implement HandleNodeStateUpdated(ctx, envelope) error that parses payload and updates the StateCache. Implement HandleNodeSecretsUpdated(ctx, envelope) error that parses payload and updates the secret index. Implement RegisterEventHandlers(dispatcher *api.EventDispatcher, cache *StateCache, logger) that registers both handlers. Include tests in events_test.go for valid payloads, malformed payloads, and cache update verification. (REQ-013)",
+    "[done] 3.1 Create internal/nodeapi/server.go — Implement Server struct wiring all components: Config, StateCache, ReportSyncer, ControlPlane client (interface for FetchSecret, SyncReports), NSK []byte, logger. Implement NewServer(cfg, client, nsk, logger). Implement Start(ctx, nodeID) error: (1) create data_dir/state/ if needed, (2) load cache from disk, (3) start ReportSyncer goroutine, (4) set up HTTP routes with handler, (5) open Unix socket listener (remove stale socket first), (6) optionally open TCP listener with auth middleware, (7) start serving. On context cancellation: graceful HTTP shutdown with ShutdownTimeout, close listeners, remove socket file. Implement RegisterEventHandlers(dispatcher) to register SSE handlers. Implement ReconcileHandler() reconcile.ReconcileHandler that updates the cache on drift detection. Include tests in server_test.go using t.TempDir and httptest: Unix socket lifecycle, TCP with auth, graceful shutdown, no goroutine leaks (goleak). (REQ-001, REQ-009, REQ-011)",
+    "[done] 4.1 Create docs/reference/backend/nodeapi.md — Reference documentation for internal/nodeapi/ package: Config struct fields and defaults, Server constructor and lifecycle (NewServer, Start, RegisterEventHandlers, ReconcileHandler), StateCache CRUD operations and persistence layout, ReportSyncer debounce and retry behavior, DecryptSecret usage, BearerAuthMiddleware, HTTP API endpoints (paths, methods, request/response schemas, error codes), SSE event handler registration, integration points (ControlPlane client methods, reconcile.ReconcileHandler, api.EventDispatcher). Include examples for constructing a Server, configuring listeners, and making API requests. (REQ-001 through REQ-014)",
+    "[done] 4.2 Create docs/how-to/backend/local-node-api.md — How-to guide for using the Local Node API: prerequisites (plexd running, correct group membership), reading metadata and data from the Unix socket with curl examples, writing and deleting report entries with optimistic locking, reading secrets (elevated access requirements), using the optional TCP listener with bearer token, troubleshooting common errors (403, 503). Reference the reference docs. (REQ-001 through REQ-014)",
+    "[done] 5.1 Add integration test in internal/nodeapi/server_test.go — TestServer_EndToEndFlow: start server with Unix socket, populate cache with test data, verify GET /v1/state returns summary, GET /v1/state/metadata returns metadata, PUT /v1/state/report creates entry, GET /v1/state/report/{key} returns it, DELETE /v1/state/report/{key} removes it, verify report sync is triggered. (REQ-001 through REQ-008)",
+    "[done] 5.2 Add integration test in internal/nodeapi/server_test.go — TestServer_SecretProxy: start server with mock ControlPlane returning NSK-encrypted secrets, verify GET /v1/state/secrets/{key} returns decrypted value, verify 503 when mock returns error, verify 404 when mock returns ErrNotFound. (REQ-005, REQ-010)",
+    "[done] 5.3 Add integration test in internal/nodeapi/server_test.go — TestServer_CacheUpdateFromEvents: start server, simulate node_state_updated and node_secrets_updated events via the event handlers, verify cache reflects the updates and GET endpoints return new data. (REQ-008, REQ-013)"
   ],
   "test_specifications": [
     {
@@ -887,6 +887,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T09:30:52.316392"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T09:35:54.267758"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T10:21:43.387684"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T10:21:43.404752"
     }
   },
   "execution_history": [
@@ -900,6 +912,62 @@
           "name": "prepare",
           "duration": 413.00543236732483,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "62d8e689-dd6d-4e10-a465-0e8e1fc6fdd3",
+      "timestamp": "2026-02-12T10:20:26.017482",
+      "total_duration": 2524.896270751953,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 500.74216771125793,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (3 tasks)",
+          "duration": 499.9766447544098,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 279.96144008636475,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (2 tasks)",
+          "duration": 303.43341183662415,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 5 (3 tasks)",
+          "duration": 195.22356581687927,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0004] Code Review",
+          "duration": 224.99824047088623,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0004] Improvements",
+          "duration": 392.89795303344727,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0004] Simplify",
+          "duration": 127.66284704208374,
+          "type": "simplify",
           "status": "done"
         }
       ]

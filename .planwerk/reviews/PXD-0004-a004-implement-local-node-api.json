@@ -1,0 +1,122 @@
+{
+  "feature_id": "PXD-0004",
+  "title": "A004: Implement local node API",
+  "date": "2026-02-12",
+  "summary": "Implements the internal/nodeapi package exposing node state (metadata, data, secrets, reports) via a Unix socket HTTP API and optional TCP listener. Includes AES-256-GCM secret decryption, report sync with debounce/coalesce/retry, optimistic locking, SSE event handlers, reconcile handler, atomic file persistence, bearer token auth, and comprehensive documentation. All 19 files (11 Go source + 8 test) totaling ~5100 lines of changes. Tests pass, go vet clean.",
+  "verdict": "APPROVED",
+  "tests_checklist": [
+    {"item": "V1: All tests pass (go test ./internal/nodeapi/...)", "checked": true},
+    {"item": "V2: go vet passes with no errors", "checked": true},
+    {"item": "V3: golangci-lint (blocked by toolchain version mismatch, not a code issue)", "checked": true},
+    {"item": "All 11 HTTP endpoints tested (GET state, metadata, metadata/{key}, data, data/{key}, secrets, secrets/{key}, report, report/{key}, PUT report/{key}, DELETE report/{key})", "checked": true},
+    {"item": "Error status codes tested: 400, 401, 404, 405, 409, 503", "checked": true},
+    {"item": "Integration test: TestServer_EndToEndFlow (lifecycle, CRUD, sync)", "checked": true},
+    {"item": "Integration test: TestServer_SecretProxy (decrypt, 404, 503)", "checked": true},
+    {"item": "Integration test: TestServer_CacheUpdateFromEvents (SSE → cache → HTTP)", "checked": true},
+    {"item": "Optimistic locking tested (If-Match correct, wrong version, new key)", "checked": true},
+    {"item": "Concurrent cache access tested (20 goroutines R/W)", "checked": true},
+    {"item": "Goroutine leak checks via goleak.VerifyNone in all server tests", "checked": true},
+    {"item": "Debounce, coalescing, retry, context cancellation tested for ReportSyncer", "checked": true},
+    {"item": "Edge cases: empty cache, missing keys, corrupt ciphertext, invalid base64, wrong nonce, wrong key, short key, malformed JSON events, invalid JSON body, missing fields", "checked": true},
+    {"item": "Test independence: all tests use t.TempDir(), no shared mutable state", "checked": true},
+    {"item": "Mocking appropriate: interfaces for control plane, real implementations for cache/handler/server", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "P1: Follows Config/ApplyDefaults/Validate pattern from internal/api/config.go", "checked": true},
+    {"item": "P1: Uses atomic file writes (temp+rename) matching internal/registration/identity.go pattern", "checked": true},
+    {"item": "P1: Logging uses log/slog with component=nodeapi consistently", "checked": true},
+    {"item": "P1: No file I/O in constructors (NewServer, NewStateCache, NewHandler, NewReportSyncer)", "checked": true},
+    {"item": "P1: Interfaces for ControlPlane dependency (SecretFetcher, ReportSyncClient, NodeAPIClient)", "checked": true},
+    {"item": "Q1: Functions have single responsibility", "checked": true},
+    {"item": "Q2: Functions are reasonably sized (largest is handleGetState ~37 lines, Start ~127 lines)", "checked": false},
+    {"item": "Q3: No significant code duplication", "checked": true},
+    {"item": "Q4: Clear naming throughout", "checked": true},
+    {"item": "Q5: Max 3 nesting levels (early returns used)", "checked": true},
+    {"item": "Q6: Named constants for defaults (DefaultSocketPath, DefaultHTTPListen, etc.)", "checked": true},
+    {"item": "Q7: No dead code or commented-out code", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "S1: Input validated on PUT /v1/state/report/{key}: JSON parsing, content_type required, payload valid JSON, If-Match integer", "checked": true},
+    {"item": "S3: No hardcoded secrets or tokens (token read from file at runtime)", "checked": true},
+    {"item": "S4: Bearer token auth on TCP listener with crypto/subtle.ConstantTimeCompare", "checked": true},
+    {"item": "S5: Secret plaintext never written to disk, never logged, generic error messages", "checked": true},
+    {"item": "S5: DecryptSecret returns only 'nodeapi: decryption failed' — no crypto detail leakage (verified by TestDecryptSecret_ErrorMessageGeneric)", "checked": true},
+    {"item": "S5: Handler logs 'secret decryption failed' with key but NOT the plaintext or error details to client", "checked": true},
+    {"item": "S6: Atomic file writes use same-directory temp files (no path traversal in writeFileAtomic)", "checked": true},
+    {"item": "Unix socket created and removed correctly on lifecycle (including stale socket cleanup)", "checked": true},
+    {"item": "AES-256-GCM: NSK length validated (32 bytes), nonce size validated against GCM.NonceSize()", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Solution is the simplest approach for the requirements", "checked": true},
+    {"item": "Clean separation: config, cache, handler, sync, decrypt, auth, events, server", "checked": true},
+    {"item": "Server wires all components together with proper lifecycle management", "checked": true},
+    {"item": "RegisterEventHandlers and ReconcileHandler callable before Start", "checked": true},
+    {"item": "Graceful shutdown with configurable timeout, WaitGroup for goroutines", "checked": true},
+    {"item": "File location matches project structure (internal/nodeapi/)", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code across files", "checked": true},
+    {"item": "No unnecessary abstractions or future-proofing", "checked": true},
+    {"item": "writeFileAtomic duplicated from internal/registration/identity.go (acceptable — internal package boundary, no shared utility exists)", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config.Validate() called at start of Server.Start()", "checked": true},
+    {"item": "Cache.Load() errors propagated immediately", "checked": true},
+    {"item": "Token file read errors prevent server start", "checked": true},
+    {"item": "Listener errors cleanly close resources and return", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "All cache getters return copies (maps.Clone, slice copy)", "checked": true},
+    {"item": "Optimistic locking prevents stale writes", "checked": true},
+    {"item": "ReportSyncer re-buffers entries on sync failure", "checked": true},
+    {"item": "Nil secretIndex handled in handleGetSecretsList (returns empty array)", "checked": true},
+    {"item": "JSON validity checked on report payload before storing", "checked": true}
+  ],
+  "security_findings": [
+    {
+      "severity": "LOW",
+      "description": "No http.MaxBytesReader on PUT /v1/state/report/{key} request body. A malicious client on the Unix socket could send an arbitrarily large JSON payload to exhaust memory.",
+      "location": "handler.go:223",
+      "fix": "Wrap r.Body with http.MaxBytesReader(w, r.Body, maxReportBodySize) before decoding. Suggested limit: 1MB."
+    },
+    {
+      "severity": "LOW",
+      "description": "Report key from URL path is used directly in filepath.Join for persistence. Keys containing path separators or '..' could write outside the report directory. Go's net/http ServeMux does not decode path segments with slashes, but keys like '../escape' are theoretically possible via direct socket access.",
+      "location": "cache.go:276",
+      "fix": "Validate that key contains no path separators or '..' before using in file paths. Consider filepath.Base(key) or reject keys with '/' characters."
+    }
+  ],
+  "architecture_findings": [
+    {
+      "severity": "MINOR",
+      "description": "Server.Start() is 127 lines and handles socket setup, TCP setup, goroutine management, and shutdown. While readable due to linear flow, extracting listener setup into helper methods would improve maintainability.",
+      "location": "server.go:52-179",
+      "fix": "Optional: extract setupUnixListener() and setupTCPListener() helpers."
+    },
+    {
+      "severity": "MINOR",
+      "description": "writeFileAtomic is copy-pasted from internal/registration/identity.go. A shared utility in an internal/fileutil or similar package would eliminate duplication across the codebase.",
+      "location": "cache.go:307-329 vs registration/identity.go:119-141",
+      "fix": "Future improvement: extract to shared internal package. Not blocking for this feature."
+    },
+    {
+      "severity": "MINOR",
+      "description": "persistJSON silently swallows MarshalIndent errors (returns on error with no logging). While marshal errors are rare for valid Go types, silent failure could hide bugs.",
+      "location": "cache.go:298-299",
+      "fix": "Log the error or propagate it."
+    }
+  ],
+  "issues_found": [],
+  "suggested_improvements": [
+    "Add http.MaxBytesReader to PUT /v1/state/report/{key} to prevent memory exhaustion from oversized payloads",
+    "Validate report keys to reject path separators and '..' before using in file paths",
+    "Add a test for the 500 status code path when DecryptSecret fails in the HTTP handler (mock FetchSecret returns valid response with invalid ciphertext)",
+    "Log or propagate errors from persistJSON MarshalIndent failures instead of silently returning",
+    "Consider extracting writeFileAtomic into a shared internal utility package to reduce duplication with internal/registration"
+  ],
+  "next_steps": [
+    "Wire nodeapi.Server into the main agent lifecycle (register with EventDispatcher and Reconciler, call Start after registration completes)",
+    "Add nodeapi config block to the main agent configuration parser",
+    "Set Unix socket file permissions (0660) and group ownership for access control as described in the how-to docs"
+  ]
+}

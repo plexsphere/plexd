@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/plexsphere/plexd/internal/fsutil"
 )
 
 // NodeIdentity holds the registration identity of a node.
@@ -35,23 +37,23 @@ func SaveIdentity(dataDir string, id *NodeIdentity) error {
 		return fmt.Errorf("registration: save identity: %w", err)
 	}
 
-	if err := writeFileAtomic(dataDir, "identity.json", jsonData, 0600); err != nil {
+	if err := fsutil.WriteFileAtomic(dataDir, "identity.json", jsonData, 0600); err != nil {
 		return fmt.Errorf("registration: save identity: %w", err)
 	}
 
 	// private_key: base64-encoded.
 	privKeyData := []byte(base64.StdEncoding.EncodeToString(id.PrivateKey))
-	if err := writeFileAtomic(dataDir, "private_key", privKeyData, 0600); err != nil {
+	if err := fsutil.WriteFileAtomic(dataDir, "private_key", privKeyData, 0600); err != nil {
 		return fmt.Errorf("registration: save identity: %w", err)
 	}
 
 	// node_secret_key: raw string.
-	if err := writeFileAtomic(dataDir, "node_secret_key", []byte(id.NodeSecretKey), 0600); err != nil {
+	if err := fsutil.WriteFileAtomic(dataDir, "node_secret_key", []byte(id.NodeSecretKey), 0600); err != nil {
 		return fmt.Errorf("registration: save identity: %w", err)
 	}
 
 	// signing_public_key: raw string.
-	if err := writeFileAtomic(dataDir, "signing_public_key", []byte(id.SigningPublicKey), 0600); err != nil {
+	if err := fsutil.WriteFileAtomic(dataDir, "signing_public_key", []byte(id.SigningPublicKey), 0600); err != nil {
 		return fmt.Errorf("registration: save identity: %w", err)
 	}
 
@@ -115,27 +117,3 @@ func LoadIdentity(dataDir string) (*NodeIdentity, error) {
 	return &id, nil
 }
 
-// writeFileAtomic writes data to dir/name atomically using a temp file and rename.
-func writeFileAtomic(dir, name string, data []byte, perm os.FileMode) error {
-	targetPath := filepath.Join(dir, name)
-	tmpPath := filepath.Join(dir, ".tmp-"+name)
-
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmpPath) // clean up on error
-
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, targetPath)
-}
