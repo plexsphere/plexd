@@ -1,0 +1,736 @@
+{
+  "feature_id": "PXD-0025",
+  "title": "G002: Implement CLI entry point and Ed25519 verification",
+  "slug": "g002-implement-cli-entry-point-and-ed25519",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 🏗️ large\n**Category:** backend\n**Priority:** critical\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nImplement the entire CLI entry point and core agent runtime services:\n\n**CLI (`cmd/plexd/main.go`):** Cobra-based CLI with 15+ subcommands: `up`, `join`, `status`, `peers`, `policies`, `logs`, `log-status`, `audit`, `actions`, `actions run`, `hooks list`, `hooks verify`, `hooks reload`, `state`, `state get`, `state report`, `install`, `uninstall`, `deregister`. Wire each subcommand to existing internal packages.\n\n**Ed25519 EventVerifier:** Production implementation of `EventVerifier` interface (replacing `NoOpVerifier` in `envelope.go`). Verify SSE event signatures using control plane's Ed25519 public key. Implement nonce replay protection with in-memory TTL store (5-min staleness window).\n\n**Heartbeat Service:** Background goroutine calling `ControlPlane.Heartbeat()` at 30s intervals. Detect 401 responses and trigger automatic re-registration flow.\n\n**Unix Socket Permissions:** Enforce `plexd` group for metadata/data/report socket access, `plexd-secrets` group for secrets. Implement `SO_PEERCRED` peer credential checking on Unix socket connections.\n\n**Rationale:** Without a CLI entry point, the binary cannot be built or run - this is the #1 blocker. The NoOpVerifier means SSE events are accepted without authentication, a critical security gap. Missing heartbeat service means the agent silently disconnects without recovery. Socket permissions are required for the security model's least-privilege access control.\n\n**Affected Areas:**\n- cmd/plexd/main.go\n- cmd/plexd/cmd/\n- internal/controlplane/envelope.go\n- internal/controlplane/verifier.go\n- internal/agent/heartbeat.go\n- internal/agent/socket.go",
+  "stories": [
+    {
+      "title": "Operator starts the plexd agent via CLI",
+      "role": "operator",
+      "want": "to run `plexd up` from the command line to start the agent daemon",
+      "so_that": "the agent registers, connects to the control plane, and enters steady state",
+      "criteria": [
+        "`plexd up` reads config from --config flag (default /etc/plexd/config.yaml)",
+        "`plexd up` calls registration, starts SSE manager, heartbeat, reconciler, node API, and all subsystems",
+        "`plexd up` handles SIGTERM/SIGINT for graceful shutdown with 30s drain period",
+        "Exit code 0 on clean shutdown, non-zero on startup errors",
+        "Log output respects --log-level flag (debug, info, warn, error)",
+        "--mode flag selects node or bridge operating mode"
+      ]
+    },
+    {
+      "title": "Operator registers a node interactively via CLI",
+      "role": "operator",
+      "want": "to run `plexd join` with various token sources to register the node",
+      "so_that": "I can onboard a node without running the full daemon",
+      "criteria": [
+        "`plexd join` registers the node and exits (does not start subsystems)",
+        "`plexd join --token-file /path` uses the specified file for the bootstrap token",
+        "`plexd join` without flags resolves token from default sources (file, env, metadata)",
+        "Success prints node_id and mesh_ip to stdout",
+        "Error prints descriptive message to stderr with non-zero exit code"
+      ]
+    },
+    {
+      "title": "Operator inspects node status and mesh state via CLI",
+      "role": "operator",
+      "want": "to run `plexd status`, `plexd peers`, and `plexd policies` to inspect the running agent",
+      "so_that": "I can troubleshoot connectivity and policy issues",
+      "criteria": [
+        "`plexd status` shows node ID, mesh IP, connection status, uptime, and version",
+        "`plexd peers` lists connected peers with ID, mesh IP, endpoint, and handshake status",
+        "`plexd policies` shows active network policies with rules",
+        "All status commands connect to the running agent via Unix socket at /var/run/plexd/api.sock",
+        "Commands fail with clear error if the agent is not running"
+      ]
+    },
+    {
+      "title": "Operator manages the agent lifecycle via CLI",
+      "role": "operator",
+      "want": "to run `plexd install`, `plexd uninstall`, and `plexd deregister` for lifecycle management",
+      "so_that": "I can install/remove the systemd service and deregister from the control plane",
+      "criteria": [
+        "`plexd install` delegates to packaging.Installer.Install() with config from flags",
+        "`plexd uninstall` delegates to packaging.Installer.Uninstall()",
+        "`plexd deregister` calls ControlPlane.Deregister() and optionally purges local data with --purge flag",
+        "`plexd deregister --purge` removes data_dir, token file, and disables systemd unit",
+        "All lifecycle commands require root privileges and fail gracefully without root"
+      ]
+    },
+    {
+      "title": "Operator inspects and manages state, logs, audit, actions, and hooks via CLI",
+      "role": "operator",
+      "want": "to use `plexd state`, `plexd logs`, `plexd audit`, `plexd actions`, and `plexd hooks` subcommands",
+      "so_that": "I can inspect local state, observability status, and manage actions/hooks",
+      "criteria": [
+        "`plexd state` shows metadata, data entries, and report entries summary",
+        "`plexd state get <type> <key>` retrieves a specific state entry",
+        "`plexd state report <key> --data <json>` writes a report entry",
+        "`plexd logs` streams agent logs to stdout",
+        "`plexd log-status` shows log forwarding configuration and buffer status",
+        "`plexd audit` shows audit collection status",
+        "`plexd actions` lists available built-in actions and hooks",
+        "`plexd actions run <name> [--param key=value]` executes an action locally",
+        "`plexd hooks list` lists configured hooks with name, source, and checksum",
+        "`plexd hooks verify` verifies all hook checksums and reports results",
+        "`plexd hooks reload` re-scans hooks directory and updates capabilities"
+      ]
+    },
+    {
+      "title": "Agent verifies SSE event signatures using Ed25519",
+      "role": "system",
+      "want": "to verify Ed25519 signatures on all SSE events before processing",
+      "so_that": "forged or tampered events are rejected even if TLS is compromised",
+      "criteria": [
+        "Ed25519Verifier implements EventVerifier interface from internal/api/envelope.go",
+        "Signature is verified over canonical JSON of all fields except `signature`",
+        "Canonical JSON is computed by marshaling event_type, event_id, issued_at, nonce, and payload in deterministic order",
+        "Invalid signatures are rejected with a descriptive error",
+        "The signing public key is loaded from the node identity (registration response)",
+        "Signing key rotation is supported: both current and previous key are accepted during transition period"
+      ]
+    },
+    {
+      "title": "Agent rejects replayed or stale SSE events",
+      "role": "system",
+      "want": "to reject events with duplicate nonces or stale timestamps",
+      "so_that": "replay attacks against the SSE channel are prevented",
+      "criteria": [
+        "Events with `issued_at` older than 5 minutes are rejected as stale",
+        "Events with a previously-seen `nonce` are rejected as replayed",
+        "Nonce store is bounded in memory with automatic TTL-based expiry (5 minutes)",
+        "Nonce store cleanup happens periodically, not on every check",
+        "Events with empty nonce are rejected",
+        "Events with zero issued_at are rejected"
+      ]
+    },
+    {
+      "title": "Agent sends periodic heartbeats to control plane",
+      "role": "system",
+      "want": "to send heartbeats at 30s intervals and handle 401 responses",
+      "so_that": "the control plane knows the node is alive and can trigger re-registration on auth failure",
+      "criteria": [
+        "Heartbeat service calls ControlPlane.Heartbeat() every 30 seconds (configurable)",
+        "Heartbeat payload includes node_id, timestamp, status, uptime, and binary_checksum",
+        "When heartbeat response has reconcile=true, triggers immediate reconciliation",
+        "When heartbeat response has rotate_keys=true, triggers key rotation",
+        "On 401 response, heartbeat service triggers automatic re-registration flow",
+        "On re-registration, the SSE stream reconnects with new auth token",
+        "Heartbeat service stops cleanly on context cancellation"
+      ]
+    },
+    {
+      "title": "Agent enforces Unix socket group permissions for access control",
+      "role": "system",
+      "want": "to enforce group-based access control on the Unix socket",
+      "so_that": "only authorized local processes can access node state and secrets",
+      "criteria": [
+        "Main API socket is created with group `plexd` ownership (GID lookup at startup)",
+        "Socket file permissions are 0660 (owner+group read/write)",
+        "Secret endpoints additionally check for `plexd-secrets` group or root via SO_PEERCRED",
+        "SO_PEERCRED extracts the calling process's UID/GID from the socket connection",
+        "Unauthorized access to secret endpoints returns 403 Forbidden",
+        "If plexd group does not exist, the agent logs a warning and falls back to 0666 permissions",
+        "Group enforcement is skipped when running in HTTP/TCP mode (bearer token is used instead)"
+      ]
+    },
+    {
+      "title": "System handles CLI errors and edge cases gracefully",
+      "role": "system",
+      "want": "CLI commands to provide clear error messages and appropriate exit codes",
+      "so_that": "operators can troubleshoot issues without confusion",
+      "criteria": [
+        "Missing config file produces actionable error message with expected path",
+        "Invalid config values produce specific validation error messages",
+        "Commands that require a running agent detect connection failure and suggest starting the agent",
+        "Commands that require root check privileges and suggest using sudo",
+        "--version flag prints binary version, build date, and commit hash",
+        "--help prints command usage with all flags and subcommands"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The CLI SHALL provide a Cobra-based command hierarchy with `plexd` as the root command and all documented subcommands: up, join, status, peers, policies, logs, log-status, audit, actions, actions run, hooks list, hooks verify, hooks reload, state, state get, state report, install, uninstall, deregister",
+      "priority": "SHALL",
+      "rationale": "Without a CLI entry point the binary cannot be built or run. This is the #1 blocker for the entire project.",
+      "scenarios": [
+        {
+          "name": "Root command shows help",
+          "when": "the user runs `plexd` with no arguments",
+          "then": "the usage text is printed showing all available subcommands",
+          "and_then": [
+            "exit code is 0"
+          ]
+        },
+        {
+          "name": "Up command starts the agent",
+          "when": "the user runs `plexd up` with valid config",
+          "then": "the agent starts all subsystems and runs until interrupted",
+          "and_then": [
+            "exit code is 0 on clean shutdown"
+          ]
+        },
+        {
+          "name": "Unknown subcommand rejected",
+          "when": "the user runs `plexd foobar`",
+          "then": "Cobra shows an error message with available commands",
+          "and_then": [
+            "exit code is non-zero"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The `plexd up` command SHALL wire all existing internal packages (registration, api, reconcile, nodeapi, actions, policy, wireguard, metrics, logfwd, auditfwd, integrity, nat, peerexchange, tunnel, bridge, packaging) into a unified agent lifecycle with correct startup and shutdown ordering",
+      "priority": "SHALL",
+      "rationale": "The agent runtime must orchestrate all subsystems in the correct order. Each subsystem already has its own Config/Run/Stop pattern.",
+      "scenarios": [
+        {
+          "name": "Startup sequence executes in correct order",
+          "when": "`plexd up` is called with valid config",
+          "then": "subsystems start: register → tunnels → SSE → heartbeat → reconciler → node API → observability",
+          "and_then": [
+            "all subsystems share the root context"
+          ]
+        },
+        {
+          "name": "Shutdown is graceful with 30s drain",
+          "when": "SIGTERM is received",
+          "then": "the agent drains in-flight work for 30s, then deregisters and tears down",
+          "and_then": [
+            "exit code is 0"
+          ]
+        },
+        {
+          "name": "Registration failure stops startup",
+          "when": "registration returns a permanent error",
+          "then": "the agent logs the error and exits immediately",
+          "and_then": [
+            "no subsystems are started",
+            "exit code is non-zero"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The Ed25519 EventVerifier SHALL verify the signature of every SSE event envelope using the control plane's Ed25519 signing public key received during registration",
+      "priority": "SHALL",
+      "rationale": "The NoOpVerifier accepts all events without authentication, a critical security gap.",
+      "scenarios": [
+        {
+          "name": "Valid signature accepted",
+          "when": "an event is signed with the correct Ed25519 private key and the signature covers canonical JSON of event_type, event_id, issued_at, nonce, and payload",
+          "then": "Verify returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Invalid signature rejected",
+          "when": "the signature does not match the canonical JSON content",
+          "then": "Verify returns an error",
+          "and_then": [
+            "the error message contains 'signature'"
+          ]
+        },
+        {
+          "name": "Missing signature rejected",
+          "when": "the signature field is empty",
+          "then": "Verify returns an error",
+          "and_then": [
+            "the error message contains 'missing signature'"
+          ]
+        },
+        {
+          "name": "Wrong key rejected",
+          "when": "the event is signed with a different Ed25519 key",
+          "then": "Verify returns an error",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The EventVerifier SHALL reject events with issued_at older than 5 minutes (staleness) or with a previously-seen nonce (replay), using a bounded in-memory nonce store with TTL expiry",
+      "priority": "SHALL",
+      "rationale": "Replay protection prevents attackers from re-sending captured SSE events.",
+      "scenarios": [
+        {
+          "name": "Fresh event with unique nonce accepted",
+          "when": "issued_at is within 5 minutes and nonce is unique",
+          "then": "Verify returns nil and stores the nonce",
+          "and_then": []
+        },
+        {
+          "name": "Stale event rejected",
+          "when": "issued_at is older than 5 minutes",
+          "then": "Verify returns an error containing 'stale'",
+          "and_then": []
+        },
+        {
+          "name": "Duplicate nonce rejected",
+          "when": "the same nonce has been seen before",
+          "then": "Verify returns an error containing 'nonce'",
+          "and_then": []
+        },
+        {
+          "name": "Nonce store bounded in memory",
+          "when": "many unique nonces are processed over time",
+          "then": "expired nonces (older than 5 min) are cleaned up periodically",
+          "and_then": [
+            "memory does not grow unbounded"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The EventVerifier SHALL support signing key rotation: during transition period both current and previous keys are accepted, after transition only the current key is accepted",
+      "priority": "SHALL",
+      "rationale": "Control plane can rotate its Ed25519 signing key. Agents must accept events signed with either key during transition.",
+      "scenarios": [
+        {
+          "name": "Current key always accepted",
+          "when": "an event is signed with the current signing key",
+          "then": "Verify returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Previous key accepted during transition",
+          "when": "an event is signed with the previous key and transition has not expired",
+          "then": "Verify returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Previous key rejected after transition",
+          "when": "the transition period has expired",
+          "then": "Verify returns an error",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The heartbeat service SHALL send POST /v1/nodes/{node_id}/heartbeat at 30s intervals, detect 401 responses and trigger re-registration, and handle reconcile/rotate_keys hints",
+      "priority": "SHALL",
+      "rationale": "Without a heartbeat service the agent silently disconnects without recovery.",
+      "scenarios": [
+        {
+          "name": "Heartbeat sent at 30s interval",
+          "when": "the heartbeat service is running",
+          "then": "ControlPlane.Heartbeat() is called at 30s intervals",
+          "and_then": [
+            "first heartbeat is sent immediately"
+          ]
+        },
+        {
+          "name": "401 triggers re-registration callback",
+          "when": "heartbeat receives 401 Unauthorized",
+          "then": "the onAuthFailure callback is invoked",
+          "and_then": []
+        },
+        {
+          "name": "Reconcile hint triggers reconciliation",
+          "when": "heartbeat response has reconcile=true",
+          "then": "TriggerReconcile is called",
+          "and_then": []
+        },
+        {
+          "name": "Transient errors logged but heartbeats continue",
+          "when": "heartbeat receives 500 or network error",
+          "then": "the error is logged and the next heartbeat fires at normal interval",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The Unix socket SHALL be created with group `plexd` ownership (0660 permissions), and secret endpoints SHALL additionally require membership in group `plexd-secrets` or root, enforced via SO_PEERCRED",
+      "priority": "SHALL",
+      "rationale": "The security model requires least-privilege access control on the local API.",
+      "scenarios": [
+        {
+          "name": "Socket created with plexd group",
+          "when": "the node API server starts and plexd group exists",
+          "then": "socket file is chowned to root:plexd with mode 0660",
+          "and_then": []
+        },
+        {
+          "name": "Secret access denied without plexd-secrets group",
+          "when": "a process in plexd group (but not plexd-secrets) accesses /v1/state/secrets/*",
+          "then": "HTTP 403 Forbidden is returned",
+          "and_then": []
+        },
+        {
+          "name": "Root always has secret access",
+          "when": "a root process accesses /v1/state/secrets/*",
+          "then": "the request succeeds",
+          "and_then": []
+        },
+        {
+          "name": "Missing group falls back gracefully",
+          "when": "plexd group does not exist on the system",
+          "then": "a warning is logged and socket permissions are 0666",
+          "and_then": [
+            "agent starts successfully"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The CLI SHALL parse YAML configuration from --config (default /etc/plexd/config.yaml), map fields to internal Config structs, and allow CLI flag overrides",
+      "priority": "SHALL",
+      "rationale": "All internal packages use Config structs. The CLI must bridge YAML to these structs with flag override support.",
+      "scenarios": [
+        {
+          "name": "Config file parsed successfully",
+          "when": "a valid YAML config is provided",
+          "then": "all sections are mapped to their respective Config structs",
+          "and_then": [
+            "ApplyDefaults and Validate called on each"
+          ]
+        },
+        {
+          "name": "Config validation error reported",
+          "when": "a required field is missing (e.g., api URL)",
+          "then": "the CLI prints the validation error and exits",
+          "and_then": [
+            "exit code is non-zero"
+          ]
+        },
+        {
+          "name": "CLI flags override config file",
+          "when": "--api flag is provided along with api: in config file",
+          "then": "--api flag takes precedence",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "Reference documentation SHALL be created for the CLI subcommands, Ed25519 verifier, heartbeat service, and socket permissions",
+      "priority": "SHALL",
+      "rationale": "New components need reference documentation for operators and developers.",
+      "scenarios": [
+        {
+          "name": "CLI reference doc exists",
+          "when": "a developer looks up CLI documentation",
+          "then": "docs/reference/backend/cli.md contains all subcommands, flags, and examples",
+          "and_then": []
+        },
+        {
+          "name": "Ed25519 verifier reference doc exists",
+          "when": "a developer looks up event verification",
+          "then": "docs/reference/backend/event-verification.md documents the verification flow, canonical JSON format, and key rotation",
+          "and_then": []
+        },
+        {
+          "name": "Heartbeat reference doc exists",
+          "when": "a developer looks up heartbeat service",
+          "then": "docs/reference/backend/heartbeat-service.md documents interval, payload, response handling, and re-registration",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "All new code SHOULD follow existing project conventions: Config structs with ApplyDefaults/Validate, interface-based testability, error format 'package: context: detail', exported constants with doc comments",
+      "priority": "SHOULD",
+      "rationale": "Consistency with existing codebase conventions reduces cognitive load and maintenance cost.",
+      "scenarios": [
+        {
+          "name": "Heartbeat config follows pattern",
+          "when": "heartbeat.Config is created",
+          "then": "it has ApplyDefaults() and Validate() methods with exported default constants",
+          "and_then": []
+        },
+        {
+          "name": "Verifier config follows pattern",
+          "when": "verifier types are created",
+          "then": "errors follow 'api: verifier: detail' format",
+          "and_then": []
+        },
+        {
+          "name": "All external deps abstracted behind interfaces",
+          "when": "the heartbeat service needs to call Heartbeat() on the control plane",
+          "then": "a HeartbeatClient interface is defined with only the methods needed",
+          "and_then": [
+            "tests use mock implementations"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "All new packages SHALL have tests with goroutine leak detection using go.uber.org/goleak where applicable",
+      "priority": "SHALL",
+      "rationale": "Packages with long-running goroutines must use goleak to detect leaks. This is the established pattern.",
+      "scenarios": [
+        {
+          "name": "Heartbeat package uses goleak",
+          "when": "heartbeat tests run",
+          "then": "TestMain calls goleak.VerifyTestMain(m)",
+          "and_then": []
+        },
+        {
+          "name": "All goroutines cleaned up on shutdown",
+          "when": "a test creates and stops a heartbeat service",
+          "then": "no goroutines leak after the test completes",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create internal/api/verifier.go: implement Ed25519Verifier struct implementing EventVerifier interface. Includes canonical JSON computation (deterministic key-sorted marshal of event_type, event_id, issued_at, nonce, payload), ed25519.Verify() call using base64-decoded signature and signing public key. Add NonceStore (sync.Mutex-protected map[string]time.Time with 5-min TTL, periodic cleanup). Verify method checks: (1) non-empty signature, (2) non-empty nonce, (3) non-zero issued_at, (4) staleness < 5min, (5) nonce uniqueness, (6) Ed25519 signature. Support signing key rotation via SetKeys(current, previous ed25519.PublicKey, transitionExpires time.Time). Write tests in internal/api/verifier_test.go covering all REQ-003, REQ-004, REQ-005 scenarios. Use crypto/ed25519.GenerateKey in tests to create real key pairs. (REQ-003, REQ-004, REQ-005)",
+    "1.2 Create internal/agent/heartbeat.go: implement HeartbeatService with Config (Interval, NodeID), Run(ctx) method that sends heartbeats at configurable interval (default 30s). Define HeartbeatClient interface with Heartbeat(ctx, nodeID, req) method. Define ReconcileTrigger interface with TriggerReconcile() method. On 401 error (api.ErrUnauthorized), invoke onAuthFailure callback. On reconcile=true response, call TriggerReconcile(). On rotate_keys=true, call onRotateKeys callback. Add Config with ApplyDefaults/Validate following project conventions. Write tests in internal/agent/heartbeat_test.go with mock client, goleak.VerifyTestMain, api.Clock for deterministic timing. (REQ-006, REQ-010, REQ-011)",
+    "1.3 Create internal/agent/config.go: define top-level AgentConfig struct that embeds/references all subsystem Config structs (api.Config, registration.Config, reconcile.Config, nodeapi.Config, actions.Config, policy.Config, wireguard.Config, metrics.Config, logfwd.Config, auditfwd.Config, integrity.Config, HeartbeatConfig). Add ParseConfig(path string) function that reads YAML and populates AgentConfig. Each subsystem section maps to its Config type. Call ApplyDefaults() and Validate() on each. Write tests in internal/agent/config_test.go covering valid YAML, missing required fields, default values, and unknown fields. (REQ-008)",
+    "1.4 Create internal/nodeapi/auth_unix.go: implement SO_PEERCRED peer credential extraction for Unix sockets on Linux. Add GroupChecker interface with IsInGroup(uid, gid uint32, groupName string) bool. Add SocketPermissions helper that chowns socket file to root:plexd with 0660. Implement SecretAuthMiddleware that extracts peer credentials via unix.GetsockoptUcred, checks for root UID (0) or plexd-secrets group membership. Fallback to 0666 if plexd group doesn't exist (with warning log). Write tests in internal/nodeapi/auth_unix_test.go. (REQ-007)",
+    "2.1 Create cmd/plexd/main.go: minimal main() that calls cmd.Execute(). Set version, commit, and build date via ldflags. Create cmd/plexd/cmd/root.go: Cobra root command with PersistentFlags: --config (default /etc/plexd/config.yaml), --log-level (default info), --api (override), --mode (node/bridge). Add --version flag printing version info. Write test in cmd/plexd/cmd/root_test.go verifying help output, version flag, and unknown subcommand handling. (REQ-001)",
+    "2.2 Create cmd/plexd/cmd/up.go: `plexd up` command that wires all subsystems. Parse config, create ControlPlane client, create Registrar, register, create Ed25519Verifier (using signing key from identity), create SSEManager (with Ed25519Verifier), create HeartbeatService, create Reconciler, create NodeAPI Server, register SSE event handlers, start all services as goroutines with shared context. Handle SIGTERM/SIGINT with 30s drain timeout. Wire heartbeat 401→re-registration via callback that re-runs Registrar.Register() and updates auth token. (REQ-002)",
+    "2.3 Create cmd/plexd/cmd/join.go: `plexd join` command that performs registration only. Parse config, create ControlPlane client, create Registrar with --token-file flag support, call Register(), print node_id and mesh_ip to stdout, exit. (REQ-001)",
+    "2.4 Create cmd/plexd/cmd/install.go and cmd/plexd/cmd/uninstall.go: `plexd install` delegates to packaging.Installer.Install() with flags for --api-url, --token, --token-file. `plexd uninstall` delegates to Installer.Uninstall() with --purge flag. Both check for root privileges first. (REQ-001)",
+    "2.5 Create cmd/plexd/cmd/deregister.go: `plexd deregister` command. Parse config, load identity from disk, create ControlPlane client with auth token, call Deregister(). With --purge flag: remove data_dir, remove token file, disable systemd unit. (REQ-001)",
+    "3.1 Create cmd/plexd/cmd/status.go: `plexd status` command that connects to /var/run/plexd/api.sock via HTTP-over-Unix-socket, fetches /v1/state, and prints formatted node info. Create cmd/plexd/cmd/peers.go: `plexd peers` fetches peer list (future: wire to real endpoint). Create cmd/plexd/cmd/policies.go: `plexd policies` fetches policy list. All detect agent-not-running and print helpful error. (REQ-009)",
+    "3.2 Create cmd/plexd/cmd/state.go: `plexd state` shows summary, `plexd state get <type> <key>` fetches specific entry, `plexd state report <key> --data <json>` writes report entry. All connect via Unix socket to local node API. (REQ-001, REQ-009)",
+    "3.3 Create cmd/plexd/cmd/logs.go, cmd/plexd/cmd/audit.go: `plexd logs` streams agent logs (reads from journald or stdout fallback), `plexd log-status` shows log forwarding config, `plexd audit` shows audit collection status. (REQ-001)",
+    "3.4 Create cmd/plexd/cmd/actions.go: `plexd actions` lists available actions, `plexd actions run <name> [--param key=value]` dispatches to agent via Unix socket. Create cmd/plexd/cmd/hooks.go: `plexd hooks list` lists hooks, `plexd hooks verify` runs integrity verification, `plexd hooks reload` triggers re-scan. (REQ-001, REQ-011)",
+    "4.1 Integrate Ed25519Verifier into SSEManager: update cmd/plexd/cmd/up.go to create Ed25519Verifier with the signing_public_key from NodeIdentity, pass it to NewSSEManager instead of nil. Add SSE event handler for signing_key_rotated that calls verifier.SetKeys() with the new key and transition period. Wire the StateResponse.SigningKeys from reconcile to update the verifier's keys. (REQ-003, REQ-005)",
+    "4.2 Integrate HeartbeatService into agent lifecycle: in cmd/plexd/cmd/up.go, start HeartbeatService after registration. Wire onAuthFailure callback to trigger re-registration (Registrar.Register() again, update auth token on ControlPlane client, reconnect SSE). Wire reconcileTrigger to Reconciler.TriggerReconcile(). Wire HeartbeatRequest payload builder that collects MeshInfo, NATInfo, etc. from running subsystems. (REQ-006, REQ-010)",
+    "4.3 Integrate Unix socket permissions into nodeapi.Server: modify nodeapi/server.go Start() to call SocketPermissions helper after creating the Unix socket. Add SecretAuthMiddleware to the handler chain for /v1/state/secrets/* routes. Ensure TCP listener mode bypasses SO_PEERCRED (uses bearer token auth already). (REQ-007)",
+    "5.1 Create docs/reference/backend/cli.md: document all subcommands with usage, flags, examples, and exit codes. (REQ-009)",
+    "5.2 Create docs/reference/backend/event-verification.md: document Ed25519 verification flow, canonical JSON format, nonce replay protection, staleness window, signing key rotation. (REQ-009)",
+    "5.3 Create docs/reference/backend/heartbeat-service.md: document heartbeat interval, payload structure, response handling (reconcile, rotate_keys), 401 re-registration flow, configuration. (REQ-009)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/api/verifier_test.go",
+      "test_function": "TestEd25519Verifier_ValidSignature",
+      "story": "Agent verifies SSE event signatures using Ed25519",
+      "expected": "A correctly signed envelope should pass verification",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/api/verifier_test.go",
+      "test_function": "TestEd25519Verifier_InvalidSignature",
+      "story": "Agent verifies SSE event signatures using Ed25519",
+      "expected": "A tampered or wrongly-signed envelope should fail verification",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/api/verifier_test.go",
+      "test_function": "TestEd25519Verifier_MissingSignature",
+      "story": "Agent verifies SSE event signatures using Ed25519",
+      "expected": "An envelope with empty signature should fail with 'missing signature' error",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/api/verifier_test.go",
+      "test_function": "TestEd25519Verifier_CanonicalJSON",
+      "story": "Agent verifies SSE event signatures using Ed25519",
+      "expected": "Canonical JSON must be deterministic regardless of input key order",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/api/verifier_test.go",
+      "test_function": "TestEd25519Verifier_StaleEvent",
+      "story": "Agent rejects replayed or stale SSE events",
+      "expected": "Event with issued_at older than 5 minutes should be rejected",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/api/verifier_test.go",
+      "test_function": "TestEd25519Verifier_DuplicateNonce",
+      "story": "Agent rejects replayed or stale SSE events",
+      "expected": "Same nonce submitted twice should fail on second attempt",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/api/verifier_test.go",
+      "test_function": "TestEd25519Verifier_EmptyNonce",
+      "story": "Agent rejects replayed or stale SSE events",
+      "expected": "Empty nonce should be rejected",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/api/verifier_test.go",
+      "test_function": "TestNonceStore_TTLExpiry",
+      "story": "Agent rejects replayed or stale SSE events",
+      "expected": "Nonces older than 5 minutes should be cleaned up and re-usable",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/api/verifier_test.go",
+      "test_function": "TestEd25519Verifier_KeyRotation_CurrentKey",
+      "story": "Agent verifies SSE event signatures using Ed25519",
+      "expected": "Event signed with current key should pass after rotation",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/api/verifier_test.go",
+      "test_function": "TestEd25519Verifier_KeyRotation_PreviousKeyDuringTransition",
+      "story": "Agent verifies SSE event signatures using Ed25519",
+      "expected": "Event signed with previous key should pass during transition period",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/api/verifier_test.go",
+      "test_function": "TestEd25519Verifier_KeyRotation_PreviousKeyAfterTransition",
+      "story": "Agent verifies SSE event signatures using Ed25519",
+      "expected": "Event signed with previous key should fail after transition expires",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/agent/heartbeat_test.go",
+      "test_function": "TestHeartbeatService_SendsAtInterval",
+      "story": "Agent sends periodic heartbeats to control plane",
+      "expected": "Heartbeat should be sent immediately and then at 30s intervals",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/agent/heartbeat_test.go",
+      "test_function": "TestHeartbeatService_ReconcileTrigger",
+      "story": "Agent sends periodic heartbeats to control plane",
+      "expected": "When response has reconcile=true, TriggerReconcile is called",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/agent/heartbeat_test.go",
+      "test_function": "TestHeartbeatService_AuthFailure",
+      "story": "Agent sends periodic heartbeats to control plane",
+      "expected": "401 response should invoke onAuthFailure callback",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/agent/heartbeat_test.go",
+      "test_function": "TestHeartbeatService_TransientError",
+      "story": "Agent sends periodic heartbeats to control plane",
+      "expected": "500 errors should be logged but heartbeats continue",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/agent/heartbeat_test.go",
+      "test_function": "TestHeartbeatService_ContextCancellation",
+      "story": "Agent sends periodic heartbeats to control plane",
+      "expected": "Service should exit cleanly when context is cancelled",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/nodeapi/auth_unix_test.go",
+      "test_function": "TestSocketPermissions_PlexdGroup",
+      "story": "Agent enforces Unix socket group permissions for access control",
+      "expected": "Socket should be created with plexd group ownership and 0660 permissions",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/nodeapi/auth_unix_test.go",
+      "test_function": "TestSecretAccess_RequiresPlexdSecretsGroup",
+      "story": "Agent enforces Unix socket group permissions for access control",
+      "expected": "Secret endpoint should reject requests from processes not in plexd-secrets group",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/nodeapi/auth_unix_test.go",
+      "test_function": "TestSecretAccess_RootAlwaysAllowed",
+      "story": "Agent enforces Unix socket group permissions for access control",
+      "expected": "Root should always have access to secret endpoints",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/agent/config_test.go",
+      "test_function": "TestParseConfig_ValidYAML",
+      "story": "Operator starts the plexd agent via CLI",
+      "expected": "Valid YAML config should be parsed into Config structs correctly",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/agent/config_test.go",
+      "test_function": "TestParseConfig_MissingRequiredField",
+      "story": "System handles CLI errors and edge cases gracefully",
+      "expected": "Missing api URL should produce a validation error",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/agent/config_test.go",
+      "test_function": "TestParseConfig_DefaultValues",
+      "story": "Operator starts the plexd agent via CLI",
+      "expected": "Omitted optional fields should get correct defaults from each package",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "cmd/plexd/cmd/root_test.go",
+      "test_function": "TestRootCommand_Help",
+      "story": "System handles CLI errors and edge cases gracefully",
+      "expected": "Running plexd with no args should print help with all subcommands",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "cmd/plexd/cmd/root_test.go",
+      "test_function": "TestRootCommand_Version",
+      "story": "System handles CLI errors and edge cases gracefully",
+      "expected": "--version should print version, commit, and build date",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "cmd/plexd/cmd/root_test.go",
+      "test_function": "TestRootCommand_UnknownSubcommand",
+      "story": "System handles CLI errors and edge cases gracefully",
+      "expected": "Unknown subcommand should print error with available commands",
+      "requirement_id": "REQ-001"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-008) have corresponding passing tests",
+    "`go build ./...` compiles successfully (cmd/plexd/main.go produces a binary)",
+    "`go test -race ./internal/api/...` passes with Ed25519 verifier tests",
+    "`go test -race ./internal/agent/...` passes with heartbeat service tests",
+    "`go test -race ./cmd/plexd/...` passes with CLI tests",
+    "`go vet ./...` passes without errors",
+    "Ed25519 verification covers all scenarios: valid/invalid signature, staleness, nonce replay, key rotation transition",
+    "Heartbeat service uses goleak.VerifyTestMain and has no goroutine leaks",
+    "Unix socket permissions use SO_PEERCRED (not file-level permission hacks)",
+    "Config parsing maps all YAML sections to existing internal Config structs without modifying them",
+    "All new files follow project conventions: package doc comment, exported type doc comments, Config with ApplyDefaults/Validate",
+    "No new external dependencies except cobra/viper for CLI and gopkg.in/yaml.v3 for config parsing",
+    "Documentation covers CLI subcommands (reference), event verification (reference), and heartbeat service (reference)"
+  ],
+  "implementation_notes": "This feature creates 4 major components: CLI entry point, Ed25519 verifier, heartbeat service, and Unix socket permissions.\n\n**Architecture:**\n- `cmd/plexd/main.go` → `cmd/plexd/cmd/` (Cobra commands) → `internal/agent/` (config, heartbeat) + all existing `internal/` packages\n- The `internal/agent/` package is NEW and serves as the orchestration layer between the CLI and the individual subsystems\n- Ed25519 verifier lives in `internal/api/verifier.go` (same package as `EventVerifier` interface and `NoOpVerifier`)\n- Heartbeat service lives in `internal/agent/heartbeat.go` (new package for agent-level services)\n- Socket permissions live in `internal/nodeapi/auth_unix.go` (same package as the server, Linux-specific with build tag)\n\n**Key Design Decisions:**\n1. **Canonical JSON for signature verification:** Marshal a struct with fields in deterministic order (event_type, event_id, issued_at, nonce, payload) using json.Marshal with struct field ordering. This matches the README spec.\n2. **Nonce store:** Simple map[string]time.Time with sync.Mutex. Cleanup runs periodically (every 60s or on every Nth check) to remove entries older than 5 minutes. No external dependencies needed.\n3. **Signing key rotation:** Ed25519Verifier holds `current` and `previous` ed25519.PublicKey plus `transitionExpires time.Time`. Verify tries current key first, then previous if within transition.\n4. **Heartbeat 401 → re-registration:** The callback clears the existing identity files, re-runs Registrar.Register(), and updates the auth token on the ControlPlane client. The SSE manager automatically reconnects.\n5. **SO_PEERCRED:** Use golang.org/x/sys/unix.GetsockoptUcred to extract UID/GID from the Unix socket connection. This is Linux-specific; use build tags. For testing, use a mock GroupChecker.\n6. **Config parsing:** Use gopkg.in/yaml.v3 to parse the YAML config into a top-level struct. Each subsystem section is a nested struct matching the existing Config types. The YAML field names use snake_case matching the README config section.\n\n**Dependency Graph (within this feature):**\n- Tasks 1.1-1.4 are independent (backend services, can parallelize)\n- Tasks 2.1-2.5 depend on 1.1-1.3 (CLI wires the services)\n- Tasks 3.1-3.4 depend on 2.1 (read-only commands need root command)\n- Tasks 4.1-4.3 depend on 2.2 + respective 1.x tasks (integration)\n- Tasks 5.1-5.3 depend on implementation tasks (docs after code)\n\n**Existing Patterns to Follow:**\n- Config pattern: See `internal/api/config.go`, `internal/registration/config.go`, `internal/nodeapi/config.go`\n- Interface pattern: See `internal/api/envelope.go` (EventVerifier), `internal/actions/executor.go` (ActionReporter, HookVerifier)\n- Test pattern: See `internal/api/envelope_test.go` (table-driven), `internal/registration/registrar_test.go` (httptest.Server, mock clock)\n- Error pattern: `\"package: context: detail\"` (e.g., `\"api: verifier: signature verification failed\"`)\n- Goroutine leak detection: See `internal/api/leak_test.go`, `internal/reconcile/leak_test.go`\n\n**Files to Create:**\n- `cmd/plexd/main.go` - Binary entry point\n- `cmd/plexd/cmd/root.go` - Cobra root command with global flags\n- `cmd/plexd/cmd/up.go` - Agent lifecycle orchestration\n- `cmd/plexd/cmd/join.go` - Registration-only command\n- `cmd/plexd/cmd/status.go` - Status inspection\n- `cmd/plexd/cmd/peers.go` - Peer listing\n- `cmd/plexd/cmd/policies.go` - Policy listing\n- `cmd/plexd/cmd/state.go` - State commands\n- `cmd/plexd/cmd/logs.go` - Log commands\n- `cmd/plexd/cmd/audit.go` - Audit command\n- `cmd/plexd/cmd/actions.go` - Actions commands\n- `cmd/plexd/cmd/hooks.go` - Hooks commands\n- `cmd/plexd/cmd/install.go` - Install command\n- `cmd/plexd/cmd/uninstall.go` - Uninstall command\n- `cmd/plexd/cmd/deregister.go` - Deregister command\n- `internal/api/verifier.go` - Ed25519Verifier + NonceStore\n- `internal/agent/heartbeat.go` - HeartbeatService\n- `internal/agent/config.go` - AgentConfig + YAML parsing\n- `internal/nodeapi/auth_unix.go` - SO_PEERCRED + socket permissions\n\n**Files to Modify:**\n- `internal/nodeapi/server.go` - Add socket permissions and secret auth middleware\n- `go.mod` - Add cobra, yaml.v3 dependencies\n\n**New Dependencies:**\n- `github.com/spf13/cobra` - CLI framework (standard for Go CLIs)\n- `gopkg.in/yaml.v3` - YAML config parsing\n- `golang.org/x/sys/unix` - SO_PEERCRED (may already be transitive)\n\n**Pitfalls:**\n- Canonical JSON must be truly deterministic. Go's encoding/json marshals struct fields in declaration order, which is deterministic. Use a struct (not map) for the canonical form.\n- The nonce store must be thread-safe (concurrent SSE events).\n- SO_PEERCRED is Linux-only. Use `//go:build linux` and provide a no-op fallback for testing on other platforms.\n- The `plexd up` command orchestrates ~12 subsystems. Use errgroup or similar for coordinated goroutine lifecycle.\n- Re-registration on 401 must be atomic: stop SSE, re-register, restart SSE with new token.",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T20:05:02.788015"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T20:26:13.091659"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T20:36:10.560816"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "c6f54ce7-ae75-4419-bfb1-3b10b1ac082a",
+      "timestamp": "2026-02-13T20:36:10.560879",
+      "total_duration": 593.1476640701294,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 593.1476640701294,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
