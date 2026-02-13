@@ -46,14 +46,11 @@ func (r *TokenResolver) Resolve(ctx context.Context) (*TokenResult, error) {
 	// 1b. File.
 	if r.cfg.TokenFile != "" {
 		data, err := os.ReadFile(r.cfg.TokenFile)
-		if err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				return nil, fmt.Errorf("registration: read token file %q: %w", r.cfg.TokenFile, err)
-			}
-			// File not found — fall through to next source.
-		} else {
-			v := strings.TrimSpace(string(data))
-			if v != "" {
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("registration: read token file %q: %w", r.cfg.TokenFile, err)
+		}
+		if err == nil {
+			if v := strings.TrimSpace(string(data)); v != "" {
 				if err := validateToken(v); err != nil {
 					return nil, err
 				}

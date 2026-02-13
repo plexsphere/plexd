@@ -1,0 +1,44 @@
+#cloud-config
+# plexd Cloud-Init user-data template (full)
+#
+# This template installs plexd on a VM via Cloud-Init, configures it with
+# a bootstrap token, API URL, and optional metadata, then enables the
+# systemd service.
+#
+# Variables to replace before use:
+#   PLEXD_API_URL        - Control plane API URL
+#   PLEXD_BOOTSTRAP_TOKEN - Bootstrap token for enrollment
+#   PLEXD_VERSION        - Version to install (default: latest)
+#   PLEXD_HOSTNAME       - Optional hostname override
+#   PLEXD_LOG_LEVEL      - Log level (default: info)
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - curl
+
+write_files:
+  - path: /etc/plexd/config.yaml
+    permissions: "0600"
+    content: |
+      api_url: "${PLEXD_API_URL}"
+      data_dir: /var/lib/plexd
+      use_metadata: true
+      metadata_token_path: /plexd/bootstrap-token
+      metadata_timeout: 2s
+      hostname: "${PLEXD_HOSTNAME}"
+      log_level: "${PLEXD_LOG_LEVEL}"
+
+  - path: /etc/plexd/bootstrap-token
+    permissions: "0600"
+    content: "${PLEXD_BOOTSTRAP_TOKEN}"
+
+runcmd:
+  - |
+    set -eu
+    PLEXD_VERSION="${PLEXD_VERSION:-latest}"
+    curl -fsSL https://get.plexsphere.io/install.sh | sh -s -- \
+      --token "${PLEXD_BOOTSTRAP_TOKEN}" \
+      --api-url "${PLEXD_API_URL}" \
+      --version "${PLEXD_VERSION}"

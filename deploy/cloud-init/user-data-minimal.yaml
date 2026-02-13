@@ -1,0 +1,13 @@
+#cloud-config
+# plexd Cloud-Init user-data template (minimal)
+#
+# Minimal template that only writes the bootstrap token file.
+# No runcmd — assumes plexd is pre-installed.
+#
+# Variables to replace before use:
+#   PLEXD_BOOTSTRAP_TOKEN - Bootstrap token for enrollment
+
+write_files:
+  - path: /etc/plexd/bootstrap-token
+    permissions: "0600"
+    content: "${PLEXD_BOOTSTRAP_TOKEN}"

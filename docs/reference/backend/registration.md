@@ -20,6 +20,8 @@ The `internal/registration` package handles node self-registration and bootstrap
 | `TokenEnv`         | `string`            | `PLEXD_BOOTSTRAP_TOKEN`        | Environment variable for bootstrap token   |
 | `TokenValue`       | `string`            | —                              | Direct token value override                |
 | `UseMetadata`      | `bool`              | `false`                        | Enable cloud metadata token source         |
+| `MetadataTokenPath`| `string`            | `/plexd/bootstrap-token`       | Metadata key path for bootstrap token      |
+| `MetadataTimeout`  | `time.Duration`     | `5s`                           | Timeout for metadata service requests      |
 | `Hostname`         | `string`            | —                              | Hostname override (default: `os.Hostname`)|
 | `Metadata`         | `map[string]string` | —                              | Optional metadata for registration request |
 | `MaxRetryDuration` | `time.Duration`     | `5m`                           | Maximum retry duration for transient errors|
@@ -28,7 +30,7 @@ The `internal/registration` package handles node self-registration and bootstrap
 cfg := registration.Config{
     DataDir: "/var/lib/plexd",
 }
-cfg.ApplyDefaults() // sets TokenFile, TokenEnv, MaxRetryDuration
+cfg.ApplyDefaults() // sets TokenFile, TokenEnv, MetadataTokenPath, MetadataTimeout, MaxRetryDuration
 if err := cfg.Validate(); err != nil {
     log.Fatal(err) // DataDir is required
 }
@@ -70,13 +72,15 @@ if err != nil {
 
 ### MetadataProvider
 
-Pluggable interface for cloud-specific token resolution (Cloud-Init, Kubernetes Secret, cloud metadata service). Concrete implementations are deferred to S020/S021/S022.
+Pluggable interface for cloud-specific token resolution.
 
 ```go
 type MetadataProvider interface {
     ReadToken(ctx context.Context) (string, error)
 }
 ```
+
+The concrete implementation `IMDSProvider` reads tokens from cloud instance metadata services. See [Cloud-Init VM Deployment Reference](cloud-init-vm-deployment.md) for details.
 
 ## GenerateKeypair
 

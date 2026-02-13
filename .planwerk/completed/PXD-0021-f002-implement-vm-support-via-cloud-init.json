@@ -2,8 +2,8 @@
   "feature_id": "PXD-0021",
   "title": "F002: Implement VM support via Cloud-Init",
   "slug": "f002-implement-vm-support-via-cloud-init",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Support automated deployment on virtual machines via Cloud-Init. Provide Cloud-Init user-data templates that install plexd and inject the bootstrap token automatically during VM provisioning. Integrate with cloud provider metadata services where applicable.",
   "stories": [
@@ -476,15 +476,15 @@
     }
   ],
   "tasks": [
-    "1.1 Add MetadataTokenPath (string) and MetadataTimeout (time.Duration) fields to Config in internal/registration/config.go. Update ApplyDefaults(): set MetadataTimeout to 2*time.Second when zero, leave MetadataTokenPath empty by default. Add tests in internal/registration/config_test.go: TestConfig_ApplyDefaults_MetadataFields (zero values), TestConfig_CustomMetadataFields (custom values preserved). (REQ-004)",
-    "1.2 Create internal/registration/imds.go: IMDSProvider struct with fields: baseURL string, metadataTokenPath string, client *http.Client, logger *slog.Logger. Constructor NewIMDSProvider(cfg *Config, client *http.Client, logger *slog.Logger) *IMDSProvider: applies defaults (baseURL=http://169.254.169.254, timeout from cfg.MetadataTimeout), creates default client if nil. ReadToken(ctx context.Context) (string, error) method: (1) attempt IMDSv2 PUT /latest/api/token with X-aws-ec2-metadata-token-ttl-seconds:21600, store session token on success, (2) GET /latest/user-data with optional IMDSv2 header, trim whitespace, return if non-empty after validation, (3) if metadataTokenPath is set, GET /latest/meta-data/{metadataTokenPath} with optional IMDSv2 header, trim whitespace, return if non-empty after validation, (4) return error if no token found. Use existing validateToken logic (duplicate the simple function or call it). Create internal/registration/imds_test.go with httptest.Server: test all scenarios from REQ-001, REQ-002, REQ-003, REQ-009, REQ-010, REQ-011. (REQ-001, REQ-002, REQ-003, REQ-009, REQ-010, REQ-011)",
-    "1.3 Update internal/registration/token_test.go: Add TestTokenResolver_FromIMDSProvider (IMDSProvider as MetadataProvider returns token when UseMetadata=true) and TestTokenResolver_IMDSFallsThrough (error from IMDSProvider results in 'no bootstrap token found'). These tests verify the integration between TokenResolver and IMDSProvider via the MetadataProvider interface. (REQ-001)",
-    "2.1 Create deploy/cloud-init/user-data.yaml: Full Cloud-Init user-data template using #cloud-config header. Sections: (1) write_files: write bootstrap token to /etc/plexd/bootstrap-token with permissions '0600', write PLEXD_API to /etc/plexd/environment. (2) runcmd: curl install script and pipe to sh with --api-url and --token-file flags. Include clear REPLACE_WITH_BOOTSTRAP_TOKEN, REPLACE_WITH_API_URL, REPLACE_WITH_VERSION placeholders with inline comments. (REQ-005, REQ-006)",
-    "2.2 Create deploy/cloud-init/user-data-minimal.yaml: Minimal Cloud-Init user-data template that only writes the bootstrap token file via write_files. No runcmd — assumes plexd is pre-installed in the VM image. Include placeholder and comment explaining when to use this template. (REQ-007)",
-    "2.3 Create deploy/cloud-init/examples/terraform-aws.tf: Terraform example for AWS EC2 instance provisioning with Cloud-Init user-data. Use templatefile() to inject bootstrap_token and api_url variables. Include: variable definitions, provider block, aws_instance resource with user_data, output for instance IP. Add comments explaining each section. (REQ-008)",
-    "2.4 Create deploy/cloud-init/examples/terraform-openstack.tf: Terraform example for OpenStack compute instance provisioning with Cloud-Init user-data. Use templatefile() to inject variables. Include: variable definitions, provider block, openstack_compute_instance_v2 resource with user_data, output for instance IP. Add comments explaining each section. (REQ-008)",
-    "3.1 Create docs/reference/backend/cloud-init-vm-deployment.md: Reference documentation covering: IMDSProvider (configuration fields, IMDS endpoints queried in order, IMDSv2 support, timeout, error behavior), Config metadata fields (MetadataTokenPath, MetadataTimeout, UseMetadata), Cloud-Init user-data template structure (modules, placeholders, permissions), Terraform examples (variables, provider setup). Cross-reference docs/reference/backend/registration.md for TokenResolver. (REQ-012)",
-    "3.2 Create docs/how-to/backend/cloud-vm-deployment.md: How-to guide covering: Prerequisites (cloud account, VM with Cloud-Init, bootstrap token), Cloud-Init approach (customize template, provision VM, verify), IMDS approach (enable metadata in config.yaml, set metadata tags per provider), Terraform approach (copy example, set variables, terraform apply), Verification (SSH, systemctl status plexd, plexd status). Cross-reference reference doc. (REQ-013)"
+    "[done] 1.1 Add MetadataTokenPath (string) and MetadataTimeout (time.Duration) fields to Config in internal/registration/config.go. Update ApplyDefaults(): set MetadataTimeout to 2*time.Second when zero, leave MetadataTokenPath empty by default. Add tests in internal/registration/config_test.go: TestConfig_ApplyDefaults_MetadataFields (zero values), TestConfig_CustomMetadataFields (custom values preserved). (REQ-004)",
+    "[done] 1.2 Create internal/registration/imds.go: IMDSProvider struct with fields: baseURL string, metadataTokenPath string, client *http.Client, logger *slog.Logger. Constructor NewIMDSProvider(cfg *Config, client *http.Client, logger *slog.Logger) *IMDSProvider: applies defaults (baseURL=http://169.254.169.254, timeout from cfg.MetadataTimeout), creates default client if nil. ReadToken(ctx context.Context) (string, error) method: (1) attempt IMDSv2 PUT /latest/api/token with X-aws-ec2-metadata-token-ttl-seconds:21600, store session token on success, (2) GET /latest/user-data with optional IMDSv2 header, trim whitespace, return if non-empty after validation, (3) if metadataTokenPath is set, GET /latest/meta-data/{metadataTokenPath} with optional IMDSv2 header, trim whitespace, return if non-empty after validation, (4) return error if no token found. Use existing validateToken logic (duplicate the simple function or call it). Create internal/registration/imds_test.go with httptest.Server: test all scenarios from REQ-001, REQ-002, REQ-003, REQ-009, REQ-010, REQ-011. (REQ-001, REQ-002, REQ-003, REQ-009, REQ-010, REQ-011)",
+    "[done] 1.3 Update internal/registration/token_test.go: Add TestTokenResolver_FromIMDSProvider (IMDSProvider as MetadataProvider returns token when UseMetadata=true) and TestTokenResolver_IMDSFallsThrough (error from IMDSProvider results in 'no bootstrap token found'). These tests verify the integration between TokenResolver and IMDSProvider via the MetadataProvider interface. (REQ-001)",
+    "[done] 2.1 Create deploy/cloud-init/user-data.yaml: Full Cloud-Init user-data template using #cloud-config header. Sections: (1) write_files: write bootstrap token to /etc/plexd/bootstrap-token with permissions '0600', write PLEXD_API to /etc/plexd/environment. (2) runcmd: curl install script and pipe to sh with --api-url and --token-file flags. Include clear REPLACE_WITH_BOOTSTRAP_TOKEN, REPLACE_WITH_API_URL, REPLACE_WITH_VERSION placeholders with inline comments. (REQ-005, REQ-006)",
+    "[done] 2.2 Create deploy/cloud-init/user-data-minimal.yaml: Minimal Cloud-Init user-data template that only writes the bootstrap token file via write_files. No runcmd — assumes plexd is pre-installed in the VM image. Include placeholder and comment explaining when to use this template. (REQ-007)",
+    "[done] 2.3 Create deploy/cloud-init/examples/terraform-aws.tf: Terraform example for AWS EC2 instance provisioning with Cloud-Init user-data. Use templatefile() to inject bootstrap_token and api_url variables. Include: variable definitions, provider block, aws_instance resource with user_data, output for instance IP. Add comments explaining each section. (REQ-008)",
+    "[done] 2.4 Create deploy/cloud-init/examples/terraform-openstack.tf: Terraform example for OpenStack compute instance provisioning with Cloud-Init user-data. Use templatefile() to inject variables. Include: variable definitions, provider block, openstack_compute_instance_v2 resource with user_data, output for instance IP. Add comments explaining each section. (REQ-008)",
+    "[done] 3.1 Create docs/reference/backend/cloud-init-vm-deployment.md: Reference documentation covering: IMDSProvider (configuration fields, IMDS endpoints queried in order, IMDSv2 support, timeout, error behavior), Config metadata fields (MetadataTokenPath, MetadataTimeout, UseMetadata), Cloud-Init user-data template structure (modules, placeholders, permissions), Terraform examples (variables, provider setup). Cross-reference docs/reference/backend/registration.md for TokenResolver. (REQ-012)",
+    "[done] 3.2 Create docs/how-to/backend/cloud-vm-deployment.md: How-to guide covering: Prerequisites (cloud account, VM with Cloud-Init, bootstrap token), Cloud-Init approach (customize template, provision VM, verify), IMDS approach (enable metadata in config.yaml, set metadata tags per provider), Terraform approach (copy example, set variables, terraform apply), Verification (SSH, systemctl status plexd, plexd status). Cross-reference reference doc. (REQ-013)"
   ],
   "test_specifications": [
     {
@@ -659,6 +659,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T21:40:56.558168"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T09:41:23.275994"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T10:36:02.374067"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T10:36:02.391072"
     }
   },
   "execution_history": [
@@ -672,6 +684,50 @@
           "name": "prepare",
           "duration": 336.06751823425293,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "de1e7b39-b057-4cf6-973e-da2e3070ae56",
+      "timestamp": "2026-02-13T10:02:31.875022",
+      "total_duration": 1116.352462053299,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (3 tasks)",
+          "duration": 208.20171523094177,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (4 tasks)",
+          "duration": 80.62038040161133,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (2 tasks)",
+          "duration": 140.68813824653625,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0021] Code Review",
+          "duration": 190.87363624572754,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0021] Improvements",
+          "duration": 355.4478883743286,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0021] Simplify",
+          "duration": 140.52070355415344,
+          "type": "simplify",
           "status": "done"
         }
       ]

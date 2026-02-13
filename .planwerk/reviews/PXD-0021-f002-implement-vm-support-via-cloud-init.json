@@ -1,0 +1,139 @@
+{
+  "feature_id": "PXD-0021",
+  "title": "F002: Implement VM support via Cloud-Init",
+  "date": "2026-02-13",
+  "summary": "Adds IMDSProvider for reading bootstrap tokens from cloud metadata services, extends Config with MetadataTokenPath/MetadataTimeout fields, provides Cloud-Init user-data templates (full and minimal), Terraform examples for AWS and OpenStack, and reference/how-to documentation. The implementation is clean, well-tested (83.1% coverage), follows existing project patterns, and integrates correctly with the TokenResolver via the MetadataProvider interface. However, there are several spec deviations: no IMDSv2 session token acquisition, wrong default timeout, minimal template deviates from spec, and dead code.",
+  "verdict": "NEEDS_CHANGES",
+  "tests_checklist": [
+    {"item": "All tests pass (42 tests, 0 failures)", "checked": true},
+    {"item": "go vet passes with no errors", "checked": true},
+    {"item": "Config defaults tested (zero values and custom values preserved)", "checked": true},
+    {"item": "IMDSProvider happy path tested (auth, no-auth, custom path)", "checked": true},
+    {"item": "IMDSProvider error cases tested (server error, empty body, context canceled)", "checked": true},
+    {"item": "IMDSProvider trailing slash URL normalization tested", "checked": true},
+    {"item": "TokenResolver integration with IMDSProvider tested (resolve, priority, fallback)", "checked": true},
+    {"item": "All tests use httptest.Server (no real IMDS calls)", "checked": true},
+    {"item": "Oversized token response from IMDS tested", "checked": false},
+    {"item": "Non-printable character response from IMDS tested", "checked": false},
+    {"item": "IMDSv2 PUT session token acquisition tested", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing Config/ApplyDefaults/Validate pattern", "checked": true},
+    {"item": "IMDSProvider implements MetadataProvider interface correctly", "checked": true},
+    {"item": "Injectable dependencies (http.Client, Config)", "checked": true},
+    {"item": "stdlib-only test assertions (no third-party test libs)", "checked": true},
+    {"item": "Error messages follow 'registration: imds:' prefix convention", "checked": true},
+    {"item": "Functions are small and focused (<20 lines)", "checked": true},
+    {"item": "No dead code", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "Token values never logged", "checked": true},
+    {"item": "Response body size limited via io.LimitReader", "checked": true},
+    {"item": "Context cancellation respected", "checked": true},
+    {"item": "HTTP client timeout configured", "checked": true},
+    {"item": "Terraform examples mark bootstrap_token as sensitive", "checked": true},
+    {"item": "AWS Terraform enforces IMDSv2 (http_tokens=required)", "checked": true},
+    {"item": "Bootstrap token file written with 0600 permissions in templates", "checked": true},
+    {"item": "No hardcoded secrets", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Solution is appropriately simple", "checked": true},
+    {"item": "IMDSProvider is cloud-agnostic (good)", "checked": true},
+    {"item": "Clean separation between IMDSProvider and TokenResolver", "checked": true},
+    {"item": "No unnecessary abstractions", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code", "checked": true},
+    {"item": "No unnecessary abstractions", "checked": true},
+    {"item": "SetTimeout method is unused dead code", "checked": false}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Non-200 status returns error immediately", "checked": true},
+    {"item": "Empty token returns error immediately", "checked": true},
+    {"item": "Request creation failure returns error immediately", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Response body size bounded", "checked": true},
+    {"item": "Whitespace trimmed from token", "checked": true},
+    {"item": "Trailing slash stripped from baseURL", "checked": true},
+    {"item": "Token validated (length + printable ASCII) via TokenResolver", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [
+    {
+      "severity": "MEDIUM",
+      "description": "IMDSProvider does not implement IMDSv2 session token acquisition (PUT /latest/api/token) as specified in task 1.2. The current implementation uses a generic Bearer auth header passed at construction time. Review criteria explicitly requires: 'IMDSv2 support works (PUT for session token, header on GET) and falls back gracefully to IMDSv1'. The cloud-agnostic approach is arguably cleaner but deviates from the spec.",
+      "location": "internal/registration/imds.go:24-33",
+      "fix": "Either: (a) implement IMDSv2 session token PUT in ReadToken with fallback to unauthenticated GET, or (b) formally revise the spec to accept the generic approach and document that IMDSv2 session tokens must be acquired externally."
+    },
+    {
+      "severity": "LOW",
+      "description": "IMDSProvider has no logger field. Task 1.2 spec requires 'logger *slog.Logger' field with component-tagged logging. The current implementation is silent on all operations.",
+      "location": "internal/registration/imds.go:14-19",
+      "fix": "Add slog.Logger field and log at debug level for request URLs and at warn level for errors, following the existing 'component=registration' pattern."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "C1",
+      "severity": "major",
+      "description": "MetadataTimeout default is 5s but spec (task 1.1) explicitly states 'set MetadataTimeout to 2*time.Second when zero'.",
+      "location": "internal/registration/config.go:61",
+      "fix": "Change DefaultMetadataTimeout from 5*time.Second to 2*time.Second to match spec."
+    },
+    {
+      "id": "C2",
+      "severity": "major",
+      "description": "IMDSv2 session token acquisition not implemented. Task 1.2 spec requires: attempt PUT /latest/api/token, store session token, use X-aws-ec2-metadata-token header on subsequent GET. Review criteria: 'IMDSv2 support works (PUT for session token, header on GET) and falls back gracefully to IMDSv1'.",
+      "location": "internal/registration/imds.go:36-68",
+      "fix": "Implement IMDSv2 PUT request in ReadToken with fallback to IMDSv1 (unauthenticated GET), or revise spec to accept the generic bearer-token approach."
+    },
+    {
+      "id": "C3",
+      "severity": "major",
+      "description": "user-data-minimal.yaml deviates from spec. Task 2.2 says: 'only writes the bootstrap token file via write_files. No runcmd — assumes plexd is pre-installed'. Actual template has runcmd with install script and no write_files.",
+      "location": "deploy/cloud-init/user-data-minimal.yaml:11-16",
+      "fix": "Either revise to match spec (write_files only, no runcmd) or update the spec to reflect the current design intent."
+    },
+    {
+      "id": "C4",
+      "severity": "minor",
+      "description": "Placeholder naming uses ${VAR} Terraform interpolation style instead of REPLACE_WITH_ prefix as specified in task 2.1. This is actually better for Terraform integration but deviates from spec.",
+      "location": "deploy/cloud-init/user-data.yaml",
+      "fix": "No change needed if using Terraform templatefile(). Consider adding inline comments explaining each placeholder as spec requires."
+    },
+    {
+      "id": "Q7",
+      "severity": "minor",
+      "description": "SetTimeout method has 0% test coverage and is not used anywhere in production or test code. Dead code.",
+      "location": "internal/registration/imds.go:71-73",
+      "fix": "Remove SetTimeout — the timeout is already configurable via Config.MetadataTimeout passed to the constructor."
+    },
+    {
+      "id": "TE2",
+      "severity": "minor",
+      "description": "No test for oversized IMDS token response (>512 bytes). The LimitReader caps at 513 bytes but there's no test verifying behavior when IMDS returns a token exceeding maxTokenLength.",
+      "location": "internal/registration/imds_test.go",
+      "fix": "Add test: IMDS returns 600-byte response, verify that TokenResolver rejects it via validateToken."
+    },
+    {
+      "id": "D2",
+      "severity": "minor",
+      "description": "IMDSProvider.ReadToken uses io.LimitReader(resp.Body, maxTokenLength+1) — the +1 deserves a brief comment explaining why (to detect oversized tokens vs silently truncating).",
+      "location": "internal/registration/imds.go:57",
+      "fix": "Add comment: // Read one extra byte to detect tokens exceeding maxTokenLength."
+    }
+  ],
+  "suggested_improvements": [
+    "Add a test for oversized token response from IMDS to verify the LimitReader + validateToken chain",
+    "Remove dead SetTimeout method (timeout is set via Config in constructor)",
+    "Consider adding debug-level logging to IMDSProvider for observability in production",
+    "Add comment on LimitReader +1 explaining intent"
+  ],
+  "next_steps": [
+    "Fix MetadataTimeout default to 2s per spec (or get spec revision approved)",
+    "Decide on IMDSv2 approach: implement PUT session token in ReadToken or formally revise spec to accept generic bearer-token design",
+    "Align user-data-minimal.yaml with spec (write_files only, no runcmd) or update spec",
+    "Remove dead SetTimeout method"
+  ]
+}

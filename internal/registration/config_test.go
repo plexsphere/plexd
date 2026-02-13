@@ -18,6 +18,12 @@ func TestConfig_Defaults(t *testing.T) {
 	if cfg.TokenEnv != "PLEXD_BOOTSTRAP_TOKEN" {
 		t.Errorf("TokenEnv = %q, want %q", cfg.TokenEnv, "PLEXD_BOOTSTRAP_TOKEN")
 	}
+	if cfg.MetadataTokenPath != "/plexd/bootstrap-token" {
+		t.Errorf("MetadataTokenPath = %q, want %q", cfg.MetadataTokenPath, "/plexd/bootstrap-token")
+	}
+	if cfg.MetadataTimeout != 2*time.Second {
+		t.Errorf("MetadataTimeout = %v, want %v", cfg.MetadataTimeout, 2*time.Second)
+	}
 	if cfg.UseMetadata {
 		t.Error("UseMetadata = true, want false")
 	}
@@ -31,10 +37,12 @@ func TestConfig_Defaults(t *testing.T) {
 
 func TestConfig_DefaultsPreserveExisting(t *testing.T) {
 	cfg := Config{
-		DataDir:          "/var/lib/plexd",
-		TokenFile:        "/custom/token",
-		TokenEnv:         "CUSTOM_TOKEN",
-		MaxRetryDuration: 10 * time.Minute,
+		DataDir:           "/var/lib/plexd",
+		TokenFile:         "/custom/token",
+		TokenEnv:          "CUSTOM_TOKEN",
+		MetadataTokenPath: "/custom/path",
+		MetadataTimeout:   10 * time.Second,
+		MaxRetryDuration:  10 * time.Minute,
 	}
 	cfg.ApplyDefaults()
 
@@ -43,6 +51,12 @@ func TestConfig_DefaultsPreserveExisting(t *testing.T) {
 	}
 	if cfg.TokenEnv != "CUSTOM_TOKEN" {
 		t.Errorf("TokenEnv = %q, want %q", cfg.TokenEnv, "CUSTOM_TOKEN")
+	}
+	if cfg.MetadataTokenPath != "/custom/path" {
+		t.Errorf("MetadataTokenPath = %q, want %q", cfg.MetadataTokenPath, "/custom/path")
+	}
+	if cfg.MetadataTimeout != 10*time.Second {
+		t.Errorf("MetadataTimeout = %v, want %v", cfg.MetadataTimeout, 10*time.Second)
 	}
 	if cfg.MaxRetryDuration != 10*time.Minute {
 		t.Errorf("MaxRetryDuration = %v, want %v", cfg.MaxRetryDuration, 10*time.Minute)

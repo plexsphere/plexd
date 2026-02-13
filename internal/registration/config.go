@@ -26,6 +26,16 @@ type Config struct {
 	// Default: false
 	UseMetadata bool
 
+	// MetadataTokenPath is the metadata key path used to retrieve the
+	// bootstrap token from an instance metadata service (e.g. IMDS).
+	// Default: /plexd/bootstrap-token
+	MetadataTokenPath string
+
+	// MetadataTimeout is the maximum time to wait for a metadata service
+	// response.
+	// Default: 2s
+	MetadataTimeout time.Duration
+
 	// Hostname overrides the system hostname.
 	// Default: empty (uses os.Hostname())
 	Hostname string
@@ -44,6 +54,12 @@ const DefaultTokenFile = "/etc/plexd/bootstrap-token"
 // DefaultTokenEnv is the default environment variable name for the bootstrap token.
 const DefaultTokenEnv = "PLEXD_BOOTSTRAP_TOKEN"
 
+// DefaultMetadataTokenPath is the default metadata key path for the bootstrap token.
+const DefaultMetadataTokenPath = "/plexd/bootstrap-token"
+
+// DefaultMetadataTimeout is the default timeout for metadata service requests.
+const DefaultMetadataTimeout = 2 * time.Second
+
 // DefaultMaxRetryDuration is the default maximum retry duration.
 const DefaultMaxRetryDuration = 5 * time.Minute
 
@@ -54,6 +70,12 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.TokenEnv == "" {
 		c.TokenEnv = DefaultTokenEnv
+	}
+	if c.MetadataTokenPath == "" {
+		c.MetadataTokenPath = DefaultMetadataTokenPath
+	}
+	if c.MetadataTimeout == 0 {
+		c.MetadataTimeout = DefaultMetadataTimeout
 	}
 	if c.MaxRetryDuration == 0 {
 		c.MaxRetryDuration = DefaultMaxRetryDuration
