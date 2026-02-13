@@ -166,6 +166,16 @@ type ReportEntry struct {
 //            POST /v1/nodes/{node_id}/executions/{execution_id}/result
 // ---------------------------------------------------------------------------
 
+// ActionRequest is the SSE payload for action_request events.
+type ActionRequest struct {
+	ExecutionID string            `json:"execution_id"`
+	Action      string            `json:"action"`
+	Parameters  map[string]string `json:"parameters,omitempty"`
+	Timeout     string            `json:"timeout"`
+	Checksum    string            `json:"checksum,omitempty"`
+	TriggeredBy *TriggeredBy      `json:"triggered_by,omitempty"`
+}
+
 type ExecutionAck struct {
 	ExecutionID string `json:"execution_id"`
 	Status      string `json:"status"`

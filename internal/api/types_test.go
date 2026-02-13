@@ -212,6 +212,51 @@ func TestTypesLogEntry(t *testing.T) {
 	requireEqual(t, orig, got)
 }
 
+func TestTypesActionRequest(t *testing.T) {
+	orig := ActionRequest{
+		ExecutionID: "exec-001",
+		Action:      "gather_info",
+		Parameters:  map[string]string{"target": "10.42.0.5"},
+		Timeout:     "5m",
+		Checksum:    "sha256:abc123",
+		TriggeredBy: &TriggeredBy{
+			Type:      "session",
+			SessionID: "sess-abc",
+			UserID:    "u-001",
+			Email:     "admin@example.com",
+		},
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"execution_id", "action", "parameters", "timeout", "checksum", "triggered_by"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+
+	// Parameters should be omitted when nil.
+	orig.Parameters = nil
+	orig.Checksum = ""
+	orig.TriggeredBy = nil
+	data2, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data2); contains(s, `"parameters"`) {
+		t.Errorf("parameters should be omitted when nil, got: %s", s)
+	}
+	if s := string(data2); contains(s, `"checksum"`) {
+		t.Errorf("checksum should be omitted when empty, got: %s", s)
+	}
+	if s := string(data2); contains(s, `"triggered_by"`) {
+		t.Errorf("triggered_by should be omitted when nil, got: %s", s)
+	}
+}
+
 func TestTypesExecutionAck(t *testing.T) {
 	orig := ExecutionAck{
 		ExecutionID: "exec-001",

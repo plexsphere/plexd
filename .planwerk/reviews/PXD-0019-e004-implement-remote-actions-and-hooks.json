@@ -1,0 +1,146 @@
+{
+  "feature_id": "PXD-0019",
+  "title": "E004: Implement remote actions and hooks",
+  "date": "2026-02-13",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Remote actions and hooks implementation is well-structured with proper concurrency control, integrity verification, path traversal prevention, and comprehensive test coverage (84.5%). All tests pass with -race detector. Follows established patterns for Config, EventHandler, and logging. One blocking deviation from spec: output capture uses post-hoc bytes.Buffer truncation instead of io.LimitedReader per REQ-003, allowing unbounded memory allocation before truncation. Shutdown lacks WaitGroup to guarantee goroutine drain (mitigated by goleak in tests). Minor issues with function sizes and a custom contains() helper in tests.",
+  "tests_checklist": [
+    {"item": "Tests exist and pass (go test -race)", "checked": true},
+    {"item": "Config: ApplyDefaults and Validate tested with all scenarios", "checked": true},
+    {"item": "Discovery: valid dir, missing dir, sidecar metadata, non-executable skipped, json skipped, sidecar parse error, directory skipped, empty dir", "checked": true},
+    {"item": "Builtins: GatherInfo output structure, Ping missing/invalid/valid target", "checked": true},
+    {"item": "Executor: builtin success, hook success, hook timeout, hook non-zero exit, output truncation, concurrency limit, duplicate execution ID, shutdown cancels, shutdown rejects new, parameter env vars, parameter sanitization", "checked": true},
+    {"item": "Handler: builtin action, unknown action, malformed payload, hook action, hook integrity failure, hook not found, disabled", "checked": true},
+    {"item": "Integration: full lifecycle (builtin + hook), concurrent executions with -race, hook integrity verification, shutdown cancels with goleak", "checked": true},
+    {"item": "Edge cases covered (empty, nil, boundary values)", "checked": true},
+    {"item": "Goroutine leak detection via goleak.VerifyTestMain", "checked": true},
+    {"item": "Output truncation test verifies result bounded at MaxOutputBytes", "checked": true},
+    {"item": "Output capture uses io.LimitedReader per spec REQ-003", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing Config pattern (ApplyDefaults/Validate)", "checked": true},
+    {"item": "Handler follows api.EventHandler pattern matching tunnel.HandleSSHSessionSetup", "checked": true},
+    {"item": "Logging uses log/slog with component=actions", "checked": true},
+    {"item": "Interfaces minimal and testable (ActionReporter, HookVerifier, NodeInfoProvider)", "checked": true},
+    {"item": "Clear naming (intention-revealing, no cryptic abbreviations)", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "Functions under 40 lines (runAction=105, runHook=59)", "checked": false},
+    {"item": "No code duplication (ack/result logging repeated)", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "Path traversal prevention for hook names (/, \\, .. rejected)", "checked": true},
+    {"item": "Hook integrity verification via SHA-256 before execution", "checked": true},
+    {"item": "Parameter names sanitized for env vars (PLEXD_PARAM_ prefix, non-alphanum replaced)", "checked": true},
+    {"item": "Minimal environment for hook execution (PATH, HOME, PLEXD_NODE_ID, PLEXD_EXECUTION_ID)", "checked": true},
+    {"item": "No shell invocation (exec.CommandContext with direct args)", "checked": true},
+    {"item": "IP validation in Ping builtin via net.ParseIP", "checked": true},
+    {"item": "Concurrent execution limit enforced", "checked": true},
+    {"item": "Per-action timeout enforced (capped by MaxActionTimeout)", "checked": true},
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "Panic recovery prevents agent crash", "checked": true},
+    {"item": "Output bounded before reporting to control plane", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Solution is appropriately simple for the requirements", "checked": true},
+    {"item": "Clean separation: config, discovery, builtins, executor, handler", "checked": true},
+    {"item": "Testability via interfaces (ActionReporter, HookVerifier)", "checked": true},
+    {"item": "Integration with internal/api (EventHandler, types) follows existing patterns", "checked": true},
+    {"item": "Integration with internal/integrity (HashFile, VerifyHook) reuses existing package", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code (minor: ack/result logging repeated 2x each)", "checked": false},
+    {"item": "No unnecessary abstractions or over-engineering", "checked": true},
+    {"item": "No unused exports or dead code", "checked": true},
+    {"item": "Custom contains() helper in builtins_test.go instead of strings.Contains", "checked": false}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Errors detected early (malformed payload, missing execution_id, disabled)", "checked": true},
+    {"item": "Config validation catches invalid ranges before execution", "checked": true},
+    {"item": "Path traversal rejected before file access", "checked": true},
+    {"item": "Integrity verification before hook execution", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "All external inputs validated at handler boundary", "checked": true},
+    {"item": "Panic recovery in goroutine with error result reporting", "checked": true},
+    {"item": "Ack/report failures logged at warn level without crashing", "checked": true},
+    {"item": "Discovery tolerates individual file errors without aborting", "checked": true},
+    {"item": "Shutdown prevents new executions and cancels running ones", "checked": true}
+  ],
+  "security_findings": [
+    {
+      "id": "S-001",
+      "severity": "MEDIUM",
+      "description": "Output capture uses bytes.Buffer with post-hoc truncation instead of io.LimitedReader. A hook producing unbounded output (e.g. 10GB) will allocate that much memory before truncation at line 366. This deviates from REQ-003 spec which requires io.LimitedReader to prevent memory exhaustion.",
+      "location": "internal/actions/executor.go:360-367",
+      "fix": "Replace bytes.Buffer with io.LimitedReader wrapping the buffer: use limitedWriter pattern or pipe stdout/stderr through io.LimitedReader to bound memory allocation during execution, not just the reported result."
+    },
+    {
+      "id": "S-002",
+      "severity": "LOW",
+      "description": "Panic details (which may include file paths, stack traces, internal state) are sent to the control plane in Stderr field of ExecutionResult. This could disclose internal implementation details.",
+      "location": "internal/actions/executor.go:219",
+      "fix": "Send a generic error message in Stderr (e.g. 'internal error during execution') and keep detailed panic info in local logs only."
+    },
+    {
+      "id": "S-003",
+      "severity": "LOW",
+      "description": "No validation of hook name length. Extremely long names (thousands of chars) could cause issues with filesystem limits or excessive logging.",
+      "location": "internal/actions/executor.go:324",
+      "fix": "Add a MaxActionNameLength check (e.g. 255) alongside the existing path traversal validation."
+    }
+  ],
+  "architecture_findings": [
+    {
+      "id": "A-001",
+      "severity": "MEDIUM",
+      "description": "Executor.Shutdown cancels all contexts but does not wait for goroutines to finish (no sync.WaitGroup). While goleak in tests catches leaks, production callers cannot know when all goroutines have drained. This could cause issues during agent restart where results are lost.",
+      "location": "internal/actions/executor.go:167-180",
+      "fix": "Add a sync.WaitGroup to track active goroutines. Increment in Execute before launching goroutine, decrement in runAction defer. Add a Wait() call in Shutdown after cancelling all contexts."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "C-001",
+      "severity": "major",
+      "check": "C2",
+      "description": "REQ-003 specifies io.LimitedReader for output capture to prevent memory exhaustion. Implementation uses unbounded bytes.Buffer with post-hoc truncation, which does not bound memory during execution.",
+      "location": "internal/actions/executor.go:360-367",
+      "fix": "Use a limitedWriter wrapper around bytes.Buffer that stops accepting writes after MaxOutputBytes, or use io.LimitedReader on a pipe."
+    },
+    {
+      "id": "Q-001",
+      "severity": "minor",
+      "check": "Q2",
+      "description": "runAction is 105 lines. runHook is 59 lines. Both exceed the 40-line guideline.",
+      "location": "internal/actions/executor.go:202-306, executor.go:320-378",
+      "fix": "Extract status determination logic into determineStatus() and environment building into buildHookEnv(). Not strictly required as both functions read linearly."
+    },
+    {
+      "id": "Q-002",
+      "severity": "minor",
+      "check": "Q3",
+      "description": "Custom contains() and searchString() helper in builtins_test.go instead of using strings.Contains from stdlib.",
+      "location": "internal/actions/builtins_test.go:140-151",
+      "fix": "Replace with strings.Contains."
+    },
+    {
+      "id": "Q-003",
+      "severity": "minor",
+      "check": "Q6",
+      "description": "Magic number 500ms for cmd.WaitDelay lacks explanation or named constant.",
+      "location": "internal/actions/executor.go:345",
+      "fix": "Define const hookGracefulKillDelay = 500 * time.Millisecond with a comment explaining it's the grace period before SIGKILL."
+    }
+  ],
+  "suggested_improvements": [
+    "Extract status determination logic from runAction into a separate function for readability",
+    "Add truncation indicator suffix when output exceeds MaxOutputBytes to alert operators",
+    "Consider hardcoded minimal PATH for hook execution instead of inheriting agent's PATH",
+    "Replace custom contains() in builtins_test.go with strings.Contains",
+    "Add sync.WaitGroup to Executor for graceful shutdown with drain guarantee"
+  ],
+  "next_steps": [
+    "Replace bytes.Buffer + truncation with io.LimitedReader or limitedWriter pattern to bound memory during hook execution (REQ-003)",
+    "Verify the output capture change with a test that confirms memory is bounded during execution, not just in the result"
+  ]
+}

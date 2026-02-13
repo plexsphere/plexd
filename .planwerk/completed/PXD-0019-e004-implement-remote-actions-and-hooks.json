@@ -2,8 +2,8 @@
   "feature_id": "PXD-0019",
   "title": "E004: Implement remote actions and hooks",
   "slug": "e004-implement-remote-actions-and-hooks",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Execute platform-triggered actions on nodes. Support built-in operations (diagnostics, service management) and custom hook scripts. Hooks are delivered from the control plane with SHA-256 checksums for integrity verification. Report action results back to the control plane.",
   "stories": [
@@ -434,15 +434,15 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/actions/config.go — Define Config struct with Enabled bool, HooksDir string, MaxConcurrent int, MaxActionTimeout time.Duration, and MaxOutputBytes int64. Implement ApplyDefaults() (Enabled=true, MaxConcurrent=5, MaxActionTimeout=10m, MaxOutputBytes=1MiB on zero-valued Config) and Validate() (reject MaxConcurrent<1, MaxActionTimeout<10s, MaxOutputBytes<1024 when enabled; pass when disabled). Follow same Config pattern as internal/tunnel/config.go and internal/integrity/config.go. Include tests in config_test.go. (REQ-008)",
-    "1.2 Add ActionRequest type to internal/api/types.go — Add ActionRequest struct (ExecutionID string, Action string, Parameters map[string]string, Timeout string, Checksum string, TriggeredBy *TriggeredBy) to the Execution section of types.go. This is the SSE payload for action_request events. Include JSON marshaling test in types_test.go. (REQ-001)",
-    "1.3 Create internal/actions/discovery.go — Implement DiscoverHooks(hooksDir string) ([]api.HookInfo, error) that scans a directory for executable files, computes SHA-256 via integrity.HashFile, and parses optional .json sidecar files for metadata (description, parameters, timeout, sandbox). Returns empty list (not error) if directory does not exist. Include tests in discovery_test.go with: valid directory, missing directory, sidecar metadata, non-executable files skipped. (REQ-006)",
-    "1.4 Create internal/actions/builtins.go — Define BuiltinFunc type: func(ctx context.Context, params map[string]string) (stdout string, stderr string, exitCode int, err error). Define NodeInfoProvider interface (NodeID() string, MeshIP() string, PeerCount() int). Implement GatherInfo(info NodeInfoProvider) BuiltinFunc that returns JSON with hostname, OS, arch, Go version, mesh_ip, peer_count. Implement Ping(info NodeInfoProvider) BuiltinFunc that pings a target mesh IP. Include tests in builtins_test.go with mock NodeInfoProvider. (REQ-007)",
-    "2.1 Create internal/actions/executor.go — Define ActionReporter interface (AckExecution(ctx, nodeID, executionID string, ack api.ExecutionAck) error; ReportResult(ctx, nodeID, executionID string, result api.ExecutionResult) error). Define HookVerifier interface (VerifyHook(ctx, nodeID, hookPath, expectedChecksum string) (bool, error)). Define Executor struct wrapping Config, ActionReporter, HookVerifier, logger, sync.Mutex-protected active map[string]context.CancelFunc, builtins map[string]builtinEntry (name → BuiltinFunc+metadata), hooks []api.HookInfo, and shuttingDown bool. Implement RegisterBuiltin, Execute (dispatches to runBuiltin or runHook based on action name lookup), Shutdown, ActiveCount. Execute sends ack, checks concurrency/duplicate, runs in goroutine, reports result. runHook: resolve path from HooksDir+name, verify integrity, exec.CommandContext with timeout, capture output with io.LimitedReader, pass params as PLEXD_PARAM_ env vars, sanitize param names. runBuiltin: call BuiltinFunc with params, wrap into result. Include executor_test.go with all test specs for REQ-003, REQ-004, REQ-005, REQ-010, REQ-011. (REQ-003, REQ-004, REQ-005, REQ-010, REQ-011)",
-    "2.2 Create internal/actions/handler.go — Implement HandleActionRequest(executor *Executor, nodeID string) api.EventHandler that parses the action_request SSE payload into an ActionRequest, calls executor.Execute. Log at info/warn/error levels with component=actions. Include handler_test.go with all handler test specs for REQ-001, REQ-002: valid builtin, unknown action, malformed payload, hook action, hook integrity failure, hook not found, disabled. (REQ-001, REQ-002, REQ-009)",
-    "3.1 Create internal/actions/handler_integration_test.go — Integration tests with real hook scripts on disk, real Executor with mock ActionReporter and real integrity.Verifier. Tests: full lifecycle (action_request → ack → execute builtin → result), hook integrity and execution lifecycle, concurrent executions with -race, shutdown cancels running executions with no goroutine leaks (goleak). (REQ-001 through REQ-011)",
-    "4.1 Create docs/reference/backend/remote-actions-hooks.md — Reference documentation for internal/actions/ package: Config struct, Executor (RegisterBuiltin/Execute/Shutdown), HandleActionRequest, BuiltinFunc, NodeInfoProvider, ActionReporter/HookVerifier interfaces, DiscoverHooks, hook sidecar format. Include data flow diagram: SSE action_request → parse → ack → verify hook (if hook) → execute → capture output → report result. Reference integration with internal/api (ActionRequest, ExecutionAck, ExecutionResult, CapabilitiesPayload, EventActionRequest), internal/integrity (VerifyHook, HashFile). (REQ-001 through REQ-011)",
-    "4.2 Create docs/how-to/backend/custom-hook-scripts.md — How-to guide for creating and deploying custom hook scripts. Prerequisites: hooks directory configured, script format. Steps: 1) Create script, 2) Create optional .json sidecar, 3) Make executable, 4) Deploy to HooksDir, 5) Restart plexd or wait for capability refresh, 6) Trigger from control plane. Verification: check capabilities endpoint, verify checksum. References docs/reference/backend/remote-actions-hooks.md. (REQ-006)"
+    "[done] 1.1 Create internal/actions/config.go — Define Config struct with Enabled bool, HooksDir string, MaxConcurrent int, MaxActionTimeout time.Duration, and MaxOutputBytes int64. Implement ApplyDefaults() (Enabled=true, MaxConcurrent=5, MaxActionTimeout=10m, MaxOutputBytes=1MiB on zero-valued Config) and Validate() (reject MaxConcurrent<1, MaxActionTimeout<10s, MaxOutputBytes<1024 when enabled; pass when disabled). Follow same Config pattern as internal/tunnel/config.go and internal/integrity/config.go. Include tests in config_test.go. (REQ-008)",
+    "[done] 1.2 Add ActionRequest type to internal/api/types.go — Add ActionRequest struct (ExecutionID string, Action string, Parameters map[string]string, Timeout string, Checksum string, TriggeredBy *TriggeredBy) to the Execution section of types.go. This is the SSE payload for action_request events. Include JSON marshaling test in types_test.go. (REQ-001)",
+    "[done] 1.3 Create internal/actions/discovery.go — Implement DiscoverHooks(hooksDir string) ([]api.HookInfo, error) that scans a directory for executable files, computes SHA-256 via integrity.HashFile, and parses optional .json sidecar files for metadata (description, parameters, timeout, sandbox). Returns empty list (not error) if directory does not exist. Include tests in discovery_test.go with: valid directory, missing directory, sidecar metadata, non-executable files skipped. (REQ-006)",
+    "[done] 1.4 Create internal/actions/builtins.go — Define BuiltinFunc type: func(ctx context.Context, params map[string]string) (stdout string, stderr string, exitCode int, err error). Define NodeInfoProvider interface (NodeID() string, MeshIP() string, PeerCount() int). Implement GatherInfo(info NodeInfoProvider) BuiltinFunc that returns JSON with hostname, OS, arch, Go version, mesh_ip, peer_count. Implement Ping(info NodeInfoProvider) BuiltinFunc that pings a target mesh IP. Include tests in builtins_test.go with mock NodeInfoProvider. (REQ-007)",
+    "[done] 2.1 Create internal/actions/executor.go — Define ActionReporter interface (AckExecution(ctx, nodeID, executionID string, ack api.ExecutionAck) error; ReportResult(ctx, nodeID, executionID string, result api.ExecutionResult) error). Define HookVerifier interface (VerifyHook(ctx, nodeID, hookPath, expectedChecksum string) (bool, error)). Define Executor struct wrapping Config, ActionReporter, HookVerifier, logger, sync.Mutex-protected active map[string]context.CancelFunc, builtins map[string]builtinEntry (name → BuiltinFunc+metadata), hooks []api.HookInfo, and shuttingDown bool. Implement RegisterBuiltin, Execute (dispatches to runBuiltin or runHook based on action name lookup), Shutdown, ActiveCount. Execute sends ack, checks concurrency/duplicate, runs in goroutine, reports result. runHook: resolve path from HooksDir+name, verify integrity, exec.CommandContext with timeout, capture output with io.LimitedReader, pass params as PLEXD_PARAM_ env vars, sanitize param names. runBuiltin: call BuiltinFunc with params, wrap into result. Include executor_test.go with all test specs for REQ-003, REQ-004, REQ-005, REQ-010, REQ-011. (REQ-003, REQ-004, REQ-005, REQ-010, REQ-011)",
+    "[done] 2.2 Create internal/actions/handler.go — Implement HandleActionRequest(executor *Executor, nodeID string) api.EventHandler that parses the action_request SSE payload into an ActionRequest, calls executor.Execute. Log at info/warn/error levels with component=actions. Include handler_test.go with all handler test specs for REQ-001, REQ-002: valid builtin, unknown action, malformed payload, hook action, hook integrity failure, hook not found, disabled. (REQ-001, REQ-002, REQ-009)",
+    "[done] 3.1 Create internal/actions/handler_integration_test.go — Integration tests with real hook scripts on disk, real Executor with mock ActionReporter and real integrity.Verifier. Tests: full lifecycle (action_request → ack → execute builtin → result), hook integrity and execution lifecycle, concurrent executions with -race, shutdown cancels running executions with no goroutine leaks (goleak). (REQ-001 through REQ-011)",
+    "[done] 4.1 Create docs/reference/backend/remote-actions-hooks.md — Reference documentation for internal/actions/ package: Config struct, Executor (RegisterBuiltin/Execute/Shutdown), HandleActionRequest, BuiltinFunc, NodeInfoProvider, ActionReporter/HookVerifier interfaces, DiscoverHooks, hook sidecar format. Include data flow diagram: SSE action_request → parse → ack → verify hook (if hook) → execute → capture output → report result. Reference integration with internal/api (ActionRequest, ExecutionAck, ExecutionResult, CapabilitiesPayload, EventActionRequest), internal/integrity (VerifyHook, HashFile). (REQ-001 through REQ-011)",
+    "[done] 4.2 Create docs/how-to/backend/custom-hook-scripts.md — How-to guide for creating and deploying custom hook scripts. Prerequisites: hooks directory configured, script format. Steps: 1) Create script, 2) Create optional .json sidecar, 3) Make executable, 4) Deploy to HooksDir, 5) Restart plexd or wait for capability refresh, 6) Trigger from control plane. Verification: check capabilities endpoint, verify checksum. References docs/reference/backend/remote-actions-hooks.md. (REQ-006)"
   ],
   "test_specifications": [
     {
@@ -685,6 +685,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T21:28:50.151194"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T07:03:12.015659"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T07:47:13.260183"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T07:47:13.275898"
     }
   },
   "execution_history": [
@@ -698,6 +710,56 @@
           "name": "prepare",
           "duration": 317.1541404724121,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "986ac5c1-d19c-44c9-9772-b8c0fb0d4fdd",
+      "timestamp": "2026-02-13T07:43:14.993691",
+      "total_duration": 2256.057461500168,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 595.6852722167969,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (2 tasks)",
+          "duration": 677.8335390090942,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 189.00585651397705,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (2 tasks)",
+          "duration": 179.60785365104675,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0019] Code Review",
+          "duration": 330.63559913635254,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0019] Improvements",
+          "duration": 191.9747383594513,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0019] Simplify",
+          "duration": 91.3146026134491,
+          "type": "simplify",
           "status": "done"
         }
       ]
