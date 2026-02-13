@@ -1,0 +1,22 @@
+[Unit]
+Description=plexd node agent
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/plexd up --config /etc/plexd/config.yaml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+EnvironmentFile=-/etc/plexd/environment
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/plexd /var/run/plexd
+
+[Install]
+WantedBy=multi-user.target

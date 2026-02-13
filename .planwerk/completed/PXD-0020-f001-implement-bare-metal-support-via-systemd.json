@@ -2,8 +2,8 @@
   "feature_id": "PXD-0020",
   "title": "F001: Implement bare-metal support via systemd",
   "slug": "f001-implement-bare-metal-support-via-systemd",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Package plexd as a systemd service for bare-metal Linux servers. Include systemd unit files, installation scripts, and support for both manual enrollment (user provides bootstrap token) and automated enrollment. Support amd64 and arm64 architectures.",
   "stories": [
@@ -528,16 +528,16 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/packaging/config.go: InstallConfig struct with BinaryPath, ConfigDir, DataDir, RunDir, UnitFilePath, ServiceName, APIBaseURL, TokenValue, TokenFile string fields. Default constants: DefaultBinaryPath=/usr/local/bin/plexd, DefaultConfigDir=/etc/plexd, DefaultDataDir=/var/lib/plexd, DefaultRunDir=/var/run/plexd, DefaultServiceName=plexd, DefaultUnitFilePath=/etc/systemd/system/plexd.service. ApplyDefaults() and Validate() following internal/registration/config.go pattern. Create internal/packaging/config_test.go with tests for ApplyDefaults zero-value, custom overrides, Validate. (REQ-008)",
-    "1.2 Create internal/packaging/unitfile.go: GenerateUnitFile(cfg InstallConfig) string function that produces a complete systemd unit file. [Unit]: Description=plexd node agent, After=network-online.target, Wants=network-online.target. [Service]: Type=simple, ExecStart={BinaryPath} up --config {ConfigDir}/config.yaml, Restart=on-failure, RestartSec=5s, StartLimitBurst=5, StartLimitIntervalSec=60, LimitNOFILE=65536, EnvironmentFile=-{ConfigDir}/environment, AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW, CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW, ProtectSystem=full, ProtectHome=true, ReadWritePaths={DataDir} {RunDir}. [Install]: WantedBy=multi-user.target. Create internal/packaging/unitfile_test.go with tests for: default config, security hardening, environment file, custom binary path, crash loop protection, file descriptor limit. (REQ-001)",
-    "1.3 Create internal/packaging/interfaces.go: Define SystemdController interface with methods: IsAvailable() bool, DaemonReload() error, Enable(service string) error, Disable(service string) error, Stop(service string) error, IsActive(service string) bool. Define RootChecker interface with IsRoot() bool. Define FileSystem interface with methods for file/dir operations used by installer (or use os functions directly with mock at higher level). (REQ-010)",
-    "2.1 Create internal/packaging/systemd.go: realSystemdController struct implementing SystemdController using os/exec to call systemctl. IsAvailable checks exec.LookPath(\"systemctl\"). DaemonReload executes `systemctl daemon-reload`. Enable/Disable/Stop execute the corresponding systemctl commands. IsActive uses `systemctl is-active`. Create realRootChecker implementing RootChecker using os.Getuid()==0. Create internal/packaging/systemd_test.go with tests that verify command construction (using a mock exec approach or build-tag-gated integration tests). (REQ-003, REQ-010)",
-    "2.2 Create internal/packaging/installer.go: Installer struct with InstallConfig, SystemdController, RootChecker, logger. NewInstaller constructor applies defaults. Install() error method: (1) check root, (2) check systemd available, (3) create directories, (4) copy binary, (5) write default config if absent, (6) write bootstrap token if provided (validate using registration.validateToken pattern), (7) write unit file, (8) daemon-reload. Uninstall(purge bool) error method: (1) check root, (2) if not installed return nil, (3) stop service, (4) disable service, (5) remove unit file, (6) daemon-reload, (7) remove binary, (8) if purge remove data/config dirs. Create internal/packaging/installer_test.go with mock SystemdController and RootChecker, using t.TempDir() for all file operations. Full test suite per test_specifications. (REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-009)",
-    "2.3 Create internal/packaging/defaultconfig.go: GenerateDefaultConfig(apiBaseURL string) string function that produces a minimal default config.yaml with api URL (or placeholder), data_dir, log_level=info, and token file path. Create internal/packaging/defaultconfig_test.go with tests for: with API URL, without API URL (placeholder), YAML validity. (REQ-002)",
-    "3.1 Create deploy/systemd/plexd.service: The reference systemd unit file template (static copy matching GenerateUnitFile output with default paths). This is the canonical unit file for documentation and manual installation. (REQ-001)",
-    "3.2 Create deploy/install.sh: POSIX-compatible install script that: detects OS (Linux required), detects arch (x86_64->amd64, aarch64->arm64), downloads binary from artifact URL, downloads checksum file, verifies SHA-256, makes binary executable, runs `plexd install` with passthrough flags (--token, --api-url, --no-start). Supports --version flag (default: latest). Cleans up on failure. Create deploy/install_test.sh: Shell-based tests using shellcheck-compatible patterns — test arch detection, test unsupported OS handling, test flag parsing. (REQ-007)",
-    "4.1 Create docs/reference/backend/bare-metal-packaging.md: Reference documentation for internal/packaging module: InstallConfig struct (all fields, types, defaults), GenerateUnitFile() output format with all directives explained, Install()/Uninstall() method behavior, SystemdController and RootChecker interfaces, file paths and permissions table, install script flags. (REQ-011)",
-    "4.2 Create docs/how-to/backend/bare-metal-installation.md: How-to guide: Prerequisites (Linux, root, network to control plane, bootstrap token), Quick Start (curl|sh one-liner with --token and --api-url), Manual Install (download binary, run plexd install --token, systemctl enable --now plexd), Automated Install (pre-provision token file, run install script without --token), Verification (systemctl status plexd, plexd status, journalctl -u plexd), Uninstall (plexd uninstall, plexd uninstall --purge). Cross-references docs/reference/backend/bare-metal-packaging.md. (REQ-012)"
+    "[done] 1.1 Create internal/packaging/config.go: InstallConfig struct with BinaryPath, ConfigDir, DataDir, RunDir, UnitFilePath, ServiceName, APIBaseURL, TokenValue, TokenFile string fields. Default constants: DefaultBinaryPath=/usr/local/bin/plexd, DefaultConfigDir=/etc/plexd, DefaultDataDir=/var/lib/plexd, DefaultRunDir=/var/run/plexd, DefaultServiceName=plexd, DefaultUnitFilePath=/etc/systemd/system/plexd.service. ApplyDefaults() and Validate() following internal/registration/config.go pattern. Create internal/packaging/config_test.go with tests for ApplyDefaults zero-value, custom overrides, Validate. (REQ-008)",
+    "[done] 1.2 Create internal/packaging/unitfile.go: GenerateUnitFile(cfg InstallConfig) string function that produces a complete systemd unit file. [Unit]: Description=plexd node agent, After=network-online.target, Wants=network-online.target. [Service]: Type=simple, ExecStart={BinaryPath} up --config {ConfigDir}/config.yaml, Restart=on-failure, RestartSec=5s, StartLimitBurst=5, StartLimitIntervalSec=60, LimitNOFILE=65536, EnvironmentFile=-{ConfigDir}/environment, AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW, CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW, ProtectSystem=full, ProtectHome=true, ReadWritePaths={DataDir} {RunDir}. [Install]: WantedBy=multi-user.target. Create internal/packaging/unitfile_test.go with tests for: default config, security hardening, environment file, custom binary path, crash loop protection, file descriptor limit. (REQ-001)",
+    "[done] 1.3 Create internal/packaging/interfaces.go: Define SystemdController interface with methods: IsAvailable() bool, DaemonReload() error, Enable(service string) error, Disable(service string) error, Stop(service string) error, IsActive(service string) bool. Define RootChecker interface with IsRoot() bool. Define FileSystem interface with methods for file/dir operations used by installer (or use os functions directly with mock at higher level). (REQ-010)",
+    "[done] 2.1 Create internal/packaging/systemd.go: realSystemdController struct implementing SystemdController using os/exec to call systemctl. IsAvailable checks exec.LookPath(\"systemctl\"). DaemonReload executes `systemctl daemon-reload`. Enable/Disable/Stop execute the corresponding systemctl commands. IsActive uses `systemctl is-active`. Create realRootChecker implementing RootChecker using os.Getuid()==0. Create internal/packaging/systemd_test.go with tests that verify command construction (using a mock exec approach or build-tag-gated integration tests). (REQ-003, REQ-010)",
+    "[done] 2.2 Create internal/packaging/installer.go: Installer struct with InstallConfig, SystemdController, RootChecker, logger. NewInstaller constructor applies defaults. Install() error method: (1) check root, (2) check systemd available, (3) create directories, (4) copy binary, (5) write default config if absent, (6) write bootstrap token if provided (validate using registration.validateToken pattern), (7) write unit file, (8) daemon-reload. Uninstall(purge bool) error method: (1) check root, (2) if not installed return nil, (3) stop service, (4) disable service, (5) remove unit file, (6) daemon-reload, (7) remove binary, (8) if purge remove data/config dirs. Create internal/packaging/installer_test.go with mock SystemdController and RootChecker, using t.TempDir() for all file operations. Full test suite per test_specifications. (REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-009)",
+    "[done] 2.3 Create internal/packaging/defaultconfig.go: GenerateDefaultConfig(apiBaseURL string) string function that produces a minimal default config.yaml with api URL (or placeholder), data_dir, log_level=info, and token file path. Create internal/packaging/defaultconfig_test.go with tests for: with API URL, without API URL (placeholder), YAML validity. (REQ-002)",
+    "[done] 3.1 Create deploy/systemd/plexd.service: The reference systemd unit file template (static copy matching GenerateUnitFile output with default paths). This is the canonical unit file for documentation and manual installation. (REQ-001)",
+    "[done] 3.2 Create deploy/install.sh: POSIX-compatible install script that: detects OS (Linux required), detects arch (x86_64->amd64, aarch64->arm64), downloads binary from artifact URL, downloads checksum file, verifies SHA-256, makes binary executable, runs `plexd install` with passthrough flags (--token, --api-url, --no-start). Supports --version flag (default: latest). Cleans up on failure. Create deploy/install_test.sh: Shell-based tests using shellcheck-compatible patterns — test arch detection, test unsupported OS handling, test flag parsing. (REQ-007)",
+    "[done] 4.1 Create docs/reference/backend/bare-metal-packaging.md: Reference documentation for internal/packaging module: InstallConfig struct (all fields, types, defaults), GenerateUnitFile() output format with all directives explained, Install()/Uninstall() method behavior, SystemdController and RootChecker interfaces, file paths and permissions table, install script flags. (REQ-011)",
+    "[done] 4.2 Create docs/how-to/backend/bare-metal-installation.md: How-to guide: Prerequisites (Linux, root, network to control plane, bootstrap token), Quick Start (curl|sh one-liner with --token and --api-url), Manual Install (download binary, run plexd install --token, systemctl enable --now plexd), Automated Install (pre-provision token file, run install script without --token), Verification (systemctl status plexd, plexd status, journalctl -u plexd), Uninstall (plexd uninstall, plexd uninstall --purge). Cross-references docs/reference/backend/bare-metal-packaging.md. (REQ-012)"
   ],
   "test_specifications": [
     {
@@ -752,6 +752,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T21:35:02.431823"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T08:39:11.096035"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T09:09:21.514878"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T09:09:21.531474"
     }
   },
   "execution_history": [
@@ -765,6 +777,56 @@
           "name": "prepare",
           "duration": 360.6858320236206,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "8ced5155-e3a7-4805-8f0a-11f69581417c",
+      "timestamp": "2026-02-13T09:04:07.039533",
+      "total_duration": 1374.2406704425812,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (3 tasks)",
+          "duration": 315.0999639034271,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (3 tasks)",
+          "duration": 317.4084258079529,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (2 tasks)",
+          "duration": 69.10577249526978,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (2 tasks)",
+          "duration": 189.49660181999207,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0020] Code Review",
+          "duration": 234.2935767173767,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0020] Improvements",
+          "duration": 148.8085014820099,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0020] Simplify",
+          "duration": 100.02782821655273,
+          "type": "simplify",
           "status": "done"
         }
       ]

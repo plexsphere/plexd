@@ -1,0 +1,130 @@
+{
+  "feature_id": "PXD-0020",
+  "title": "F001: Implement bare-metal support via systemd",
+  "date": "2026-02-13",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Solid implementation of systemd packaging for bare-metal servers. All 30 Go tests and 11 shell tests pass. Code follows existing project patterns (Config with ApplyDefaults/Validate, slog with component field, injectable interfaces). Unit file includes all required security hardening directives. Token validation matches registration/token.go rules. Generated unit file matches deploy/systemd/plexd.service. Documentation is complete. Main gaps: missing error-path tests for daemon-reload and token-file-read failures, missing boundary test for 512-byte token, and duplicated token validation logic that could be shared.",
+  "tests_checklist": [
+    {"item": "All 30 Go tests pass (go test ./internal/packaging/ -race)", "checked": true},
+    {"item": "All 11 shell tests pass (sh deploy/install_test.sh)", "checked": true},
+    {"item": "go vet passes with no errors", "checked": true},
+    {"item": "Tests use t.TempDir() for all file operations", "checked": true},
+    {"item": "Tests use mock SystemdController and RootChecker (no real systemctl)", "checked": true},
+    {"item": "Happy path coverage: install, uninstall, config, unitfile, defaultconfig", "checked": true},
+    {"item": "Error path: non-root rejected", "checked": true},
+    {"item": "Error path: no systemd rejected", "checked": true},
+    {"item": "Error path: invalid token (too long, non-printable) rejected", "checked": true},
+    {"item": "Edge case: existing config preserved on reinstall", "checked": true},
+    {"item": "Edge case: uninstall when not installed is idempotent", "checked": true},
+    {"item": "Edge case: token from file read and trimmed", "checked": true},
+    {"item": "Missing: daemon-reload failure during install", "checked": false},
+    {"item": "Missing: daemon-reload failure during uninstall", "checked": false},
+    {"item": "Missing: token file read failure (nonexistent file)", "checked": false},
+    {"item": "Missing: boundary test for exactly 512-byte token", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing Config pattern (ApplyDefaults/Validate)", "checked": true},
+    {"item": "Uses log/slog with component field", "checked": true},
+    {"item": "Stdlib-only dependencies (no external packages)", "checked": true},
+    {"item": "Functions are focused and short (<40 lines)", "checked": true},
+    {"item": "Clear naming throughout", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "Errors wrapped with context using fmt.Errorf %w", "checked": true},
+    {"item": "Token validation logic duplicated from registration/token.go instead of shared", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "Token values never logged (only path logged)", "checked": true},
+    {"item": "Token file written with 0600 permissions", "checked": true},
+    {"item": "DataDir created with 0700 permissions", "checked": true},
+    {"item": "Token validated: <=512 bytes, printable ASCII only (0x20-0x7E)", "checked": true},
+    {"item": "exec.Command uses argument arrays (no shell execution)", "checked": true},
+    {"item": "Binary copy uses filepath.EvalSymlinks to resolve symlinks", "checked": true},
+    {"item": "Unit file includes ProtectSystem=full, ProtectHome=true", "checked": true},
+    {"item": "Capabilities restricted to CAP_NET_ADMIN CAP_NET_RAW", "checked": true},
+    {"item": "Install script verifies SHA-256 checksums", "checked": true},
+    {"item": "Install script uses set -eu for strict error handling", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Injectable interfaces for testability (SystemdController, RootChecker)", "checked": true},
+    {"item": "Clean separation: config, unitfile, installer, systemd, defaultconfig", "checked": true},
+    {"item": "deploy/systemd/plexd.service matches GenerateUnitFile output", "checked": true},
+    {"item": "Install script is POSIX-compatible (sh, not bash)", "checked": true},
+    {"item": "No circular dependencies between packages", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No unused code or over-engineered abstractions", "checked": true},
+    {"item": "No FileSystem interface (uses os directly - simpler)", "checked": true},
+    {"item": "Token validation duplicated instead of shared", "checked": false}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Root check is first operation in Install() and Uninstall()", "checked": true},
+    {"item": "Systemd availability checked before any file operations", "checked": true},
+    {"item": "Token validated before writing to disk", "checked": true},
+    {"item": "Config.Validate() checks all required fields", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "os.ErrNotExist handled for idempotent uninstall", "checked": true},
+    {"item": "Stop errors tolerated during uninstall (service may not be running)", "checked": true},
+    {"item": "Binary copy skipped when src == dst", "checked": true},
+    {"item": "Cleanup trap in install.sh removes temp dir on exit", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [
+    {
+      "severity": "MEDIUM",
+      "id": "Q3",
+      "description": "Token validation logic (validateInstallToken in installer.go:235-244) is a copy-paste of validateToken in internal/registration/token.go:98-108. If validation rules change, both must be updated independently.",
+      "location": "internal/packaging/installer.go:235-244",
+      "fix": "Extract token validation to a shared internal/tokenutil package or internal/validation package that both registration and packaging can import. Alternatively, accept the duplication with a comment linking the two implementations (the implementation_notes already justify this for dependency cycle avoidance)."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "TE2",
+      "severity": "major",
+      "description": "No test for daemon-reload failure during Install(). installer.go:99-101 returns an error on daemon-reload failure but this path is untested.",
+      "location": "internal/packaging/installer_test.go",
+      "fix": "Add TestInstall_FailsOnDaemonReloadError: set mockSystemdController.daemonReloadErr, verify Install() returns error containing 'daemon-reload'."
+    },
+    {
+      "id": "TE2",
+      "severity": "major",
+      "description": "No test for daemon-reload failure during Uninstall(). installer.go:137-139 returns an error on daemon-reload failure but this path is untested.",
+      "location": "internal/packaging/installer_test.go",
+      "fix": "Add TestUninstall_FailsOnDaemonReloadError: set mockSystemdController.daemonReloadErr, pre-create unit file, verify Uninstall() returns error containing 'daemon-reload'."
+    },
+    {
+      "id": "TE3",
+      "severity": "major",
+      "description": "No test for token file read failure. installer.go:211-213 returns an error when TokenFile cannot be read, but this path is untested.",
+      "location": "internal/packaging/installer_test.go",
+      "fix": "Add TestInstall_FailsOnTokenFileReadError: set TokenFile to a nonexistent path, verify Install() returns error containing 'read token file'."
+    },
+    {
+      "id": "TE2",
+      "severity": "minor",
+      "description": "No boundary test for exactly 512-byte token (max allowed). Only tests 513-byte (too long) and non-printable characters. The boundary at exactly maxTokenLength is not tested.",
+      "location": "internal/packaging/installer_test.go:363-397",
+      "fix": "Add a sub-test in TestInstall_RejectsInvalidToken for a 512-byte token that should succeed, verifying the boundary condition."
+    },
+    {
+      "id": "Q3",
+      "severity": "minor",
+      "description": "Validate() does not check UnitFilePath, but it is used in Install() (installer.go:93). If UnitFilePath is empty after ApplyDefaults fails, writing will fail with an unhelpful error.",
+      "location": "internal/packaging/config.go:86-103",
+      "fix": "Add UnitFilePath validation in Validate(), or document that it is intentionally optional since ApplyDefaults always sets it."
+    }
+  ],
+  "suggested_improvements": [
+    "Add 3 missing error-path tests: daemon-reload failure (install and uninstall), token file read failure",
+    "Add boundary test for 512-byte token (max valid length)",
+    "Consider extracting shared token validation to avoid duplication with registration/token.go (or add cross-reference comment)",
+    "Add UnitFilePath to Validate() for completeness",
+    "install.sh: tokens with spaces will break due to unquoted INSTALL_ARGS expansion (line 182). Consider documenting that tokens must not contain spaces, or restructure to avoid word-splitting."
+  ],
+  "next_steps": [
+    "Add 3 error-path tests (daemon-reload x2, token file read) - these are the only blocking issues for APPROVED",
+    "Add 512-byte boundary test for token validation",
+    "Re-run review after test additions"
+  ]
+}
