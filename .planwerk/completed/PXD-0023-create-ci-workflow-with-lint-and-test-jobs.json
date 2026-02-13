@@ -2,8 +2,8 @@
   "feature_id": "PXD-0023",
   "title": "Create CI workflow with lint and test jobs",
   "slug": "create-ci-workflow-with-lint-and-test-jobs",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** infrastructure\n**Priority:** high\n**Source:** Proposed for 'In the current implementation and planning, no'\n\nCreate `.github/workflows/ci.yml` with three parallel jobs:\n\n**Lint job:**\n- `actions/checkout@v4` + `actions/setup-go@v5` with Go 1.24\n- `go mod verify` to validate dependency integrity\n- `go vet ./...` for static analysis\n- `staticcheck ./...` (install via `go install honnef.co/go/tools/cmd/staticcheck@latest`)\n- `golangci/golangci-lint-action@v6` with default config (no `.golangci.yml` needed)\n\n**Unit test job:**\n- `actions/checkout@v4` + `actions/setup-go@v5` with Go 1.24\n- `go test -race -count=1 ./...` — race detection enabled, cache disabled\n\n**Integration test job:**\n- `actions/checkout@v4` + `actions/setup-go@v5` with Go 1.24\n- `go test -race -count=1 -run Integration ./...` — only TestIntegration* functions\n\n**Trigger config:** `push` to `main` branch + all `pull_request` events.\n\nAll three jobs run in parallel on `ubuntu-latest`. `actions/setup-go@v5` handles Go module caching automatically via `go.sum`.\n\n**Rationale:** No CI pipeline exists in the project. Every PR and push to main currently has zero automated quality gates — no lint checks, no test verification, no race detection. This means broken code, lint violations, and race conditions can be merged silently. A CI pipeline is foundational infrastructure that blocks bad code before it reaches main, catches regressions immediately, and establishes quality expectations for all contributors.\n\n**Affected Areas:**\n- .github/workflows/ci.yml",
   "stories": [
@@ -320,12 +320,12 @@
     }
   ],
   "tasks": [
-    "1.1 Create .github/workflows/ci.yml with workflow name 'CI' and trigger config: push to main + all pull_request events (REQ-007)",
-    "1.2 Add lint job to ci.yml: actions/checkout@v4, actions/setup-go@v5 with Go 1.24, go mod verify, go vet ./..., go install staticcheck + staticcheck ./..., golangci/golangci-lint-action@v6 — all on ubuntu-latest (REQ-001, REQ-002, REQ-003, REQ-008)",
-    "1.3 Add unit-test job to ci.yml: actions/checkout@v4, actions/setup-go@v5 with Go 1.24, go test -race -count=1 ./... — on ubuntu-latest, no dependencies on other jobs (REQ-004, REQ-006, REQ-008)",
-    "1.4 Add integration-test job to ci.yml: actions/checkout@v4, actions/setup-go@v5 with Go 1.24, go test -race -count=1 -run Integration ./... — on ubuntu-latest, no dependencies on other jobs (REQ-005, REQ-006, REQ-008)",
-    "1.5 Validate the complete ci.yml: verify YAML syntax is valid, all three jobs are parallel (no needs: keys), action versions are pinned, Go version is consistent across jobs (REQ-001 through REQ-008)",
-    "2.1 Write reference documentation for the CI workflow at docs/reference/backend/ci-workflow.md: document trigger events, job descriptions, lint tools used, test commands, Go version, caching behavior, and how to add new jobs (REQ-001 through REQ-008)"
+    "[done] 1.1 Create .github/workflows/ci.yml with workflow name 'CI' and trigger config: push to main + all pull_request events (REQ-007)",
+    "[done] 1.2 Add lint job to ci.yml: actions/checkout@v4, actions/setup-go@v5 with Go 1.24, go mod verify, go vet ./..., go install staticcheck + staticcheck ./..., golangci/golangci-lint-action@v6 — all on ubuntu-latest (REQ-001, REQ-002, REQ-003, REQ-008)",
+    "[done] 1.3 Add unit-test job to ci.yml: actions/checkout@v4, actions/setup-go@v5 with Go 1.24, go test -race -count=1 ./... — on ubuntu-latest, no dependencies on other jobs (REQ-004, REQ-006, REQ-008)",
+    "[done] 1.4 Add integration-test job to ci.yml: actions/checkout@v4, actions/setup-go@v5 with Go 1.24, go test -race -count=1 -run Integration ./... — on ubuntu-latest, no dependencies on other jobs (REQ-005, REQ-006, REQ-008)",
+    "[done] 1.5 Validate the complete ci.yml: verify YAML syntax is valid, all three jobs are parallel (no needs: keys), action versions are pinned, Go version is consistent across jobs (REQ-001 through REQ-008)",
+    "[done] 2.1 Write reference documentation for the CI workflow at docs/reference/backend/ci-workflow.md: document trigger events, job descriptions, lint tools used, test commands, Go version, caching behavior, and how to add new jobs (REQ-001 through REQ-008)"
   ],
   "test_specifications": [
     {
@@ -412,6 +412,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T21:51:36.580893"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T12:03:41.187961"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T14:24:18.353947"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T14:24:18.370295"
     }
   },
   "execution_history": [
@@ -425,6 +437,44 @@
           "name": "prepare",
           "duration": 159.31805729866028,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "6127318c-251e-48e0-bfd5-09554a8204ae",
+      "timestamp": "2026-02-13T12:10:18.217920",
+      "total_duration": 304.9763722419739,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (5 tasks)",
+          "duration": 91.17198276519775,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (1 tasks)",
+          "duration": 46.01801252365112,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0023] Code Review",
+          "duration": 39.86921000480652,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0023] Improvements",
+          "duration": 96.5552089214325,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0023] Simplify",
+          "duration": 31.361958026885986,
+          "type": "simplify",
           "status": "done"
         }
       ]

@@ -1,0 +1,52 @@
+{
+  "feature_id": "PXD-0023",
+  "title": "Create CI workflow with lint and test jobs",
+  "date": "2026-02-13",
+  "summary": "Adds .github/workflows/ci.yml with three parallel jobs (lint, unit-test, integration-test) on ubuntu-latest with Go 1.24, triggered on push to main and all pull_request events. Reference documentation added at docs/reference/backend/ci-workflow.md.",
+  "verdict": "APPROVED",
+  "tests_checklist": [
+    {"item": "CI workflow YAML is syntactically valid", "checked": true},
+    {"item": "All three jobs run in parallel (no needs: keys)", "checked": true},
+    {"item": "Unit test command matches spec: go test -race -count=1 ./...", "checked": true},
+    {"item": "Integration test command matches spec: go test -race -count=1 -run Integration ./...", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows GitHub Actions conventions (pinned action versions, step names)", "checked": true},
+    {"item": "No duplicated configuration across jobs beyond necessary checkout+setup", "checked": true},
+    {"item": "Lint job includes all five checks in correct order", "checked": true},
+    {"item": "Go version consistent across all jobs (1.24)", "checked": true},
+    {"item": "No dead code or commented-out blocks", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets or tokens", "checked": true},
+    {"item": "Action versions pinned to major versions (v4, v5, v6)", "checked": true},
+    {"item": "No write permissions escalation (uses default read)", "checked": true},
+    {"item": "go mod verify validates dependency integrity", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Solution is minimal — single YAML file with three jobs", "checked": true},
+    {"item": "Jobs are independent and parallel as specified", "checked": true},
+    {"item": "Trigger config matches requirements (push main + PR)", "checked": true},
+    {"item": "Module caching handled by setup-go@v5 automatically", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No unnecessary abstractions or reusable workflows", "checked": true},
+    {"item": "No extra jobs or steps beyond spec", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Each step fails immediately on error (default shell behavior)", "checked": true},
+    {"item": "go mod verify runs first in lint job to catch dependency issues early", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Race detection enabled on both test jobs", "checked": true},
+    {"item": "Test caching disabled with -count=1", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [],
+  "suggested_improvements": [
+    "Consider pinning actions to full SHA hashes (e.g. actions/checkout@<sha>) for supply-chain hardening, though major version tags are acceptable for most projects",
+    "Consider adding a timeout-minutes on each job to prevent runaway CI from consuming unlimited minutes"
+  ],
+  "next_steps": []
+}
