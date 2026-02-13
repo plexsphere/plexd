@@ -1,0 +1,456 @@
+{
+  "feature_id": "PXD-0024",
+  "title": "G001: Fix cross-cutting config and build infrastructure",
+  "slug": "g001-fix-cross-cutting-config-and-build",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 📦 medium\n**Category:** infrastructure\n**Priority:** high\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nFix all configuration inconsistencies and add missing build tooling:\n- Change WireGuard default interface name from `wg0` to `plexd0` in `internal/wireguard/config.go`\n- Change `DefaultCollectInterval` from 30s to 15s in metrics `config.go`\n- Update README.md Go prerequisite from 1.22+ to 1.24+ to match `go.mod`\n- Normalize domain references to `plexsphere.io` across README, install scripts, docs\n- Change systemd service `Restart=on-failure` to `Restart=always`\n- Create root `Makefile` with `build`, `test`, `test-e2e`, `lint` targets\n- Create `deploy/kubernetes/plexd-config-configmap.yaml` manifest (referenced by DaemonSet but missing)\n- All changes are small, isolated fixes that unblock subsequent features\n\n**Rationale:** These are foundational inconsistencies that affect correctness and developer experience. The missing Makefile blocks the documented build workflow. Config defaults diverging from README cause runtime behavior mismatches. The missing ConfigMap manifest means the DaemonSet deployment fails on fresh clusters.\n\n**Affected Areas:**\n- internal/wireguard/config.go\n- internal/metrics/config.go\n- README.md\n- deploy/systemd/plexd.service\n- Makefile\n- deploy/kubernetes/plexd-config-configmap.yaml\n- docs/",
+  "stories": [
+    {
+      "title": "Developer builds plexd from source using Makefile",
+      "role": "developer",
+      "want": "to run `make build`, `make test`, `make test-e2e`, and `make lint` from the project root",
+      "so_that": "I have a single entry point for all build, test, and lint operations matching the README instructions",
+      "criteria": [
+        "`make build` compiles the Go binary via `go build ./...`",
+        "`make test` runs unit tests via `go test -race -count=1 ./...`",
+        "`make test-e2e` runs integration tests via `go test -race -count=1 -run Integration ./...`",
+        "`make lint` runs `go vet ./...` and `golangci-lint run`",
+        "Running `make` with no target defaults to `build`",
+        "All targets match the commands already used in `.github/workflows/ci.yml`"
+      ]
+    },
+    {
+      "title": "Node creates WireGuard interface with correct default name",
+      "role": "system",
+      "want": "the default WireGuard interface name to be `plexd0` instead of `wg0`",
+      "so_that": "the runtime default matches the interface name documented in the README configuration section",
+      "criteria": [
+        "`DefaultInterfaceName` constant in `internal/wireguard/config.go` is `plexd0`",
+        "`Config.ApplyDefaults()` sets `InterfaceName` to `plexd0` when unset",
+        "All tests that verify the default interface name assert `plexd0`",
+        "Custom values (e.g. `mesh0`) are still preserved by `ApplyDefaults()`"
+      ]
+    },
+    {
+      "title": "Metrics collection uses correct default interval",
+      "role": "system",
+      "want": "the default metric collection interval to be 15 seconds instead of 30 seconds",
+      "so_that": "nodes report metrics at a frequency appropriate for real-time monitoring",
+      "criteria": [
+        "`DefaultCollectInterval` constant in `internal/metrics/config.go` is `15 * time.Second`",
+        "`Config.ApplyDefaults()` sets `CollectInterval` to 15s when unset",
+        "All tests that verify the default CollectInterval assert 15s",
+        "Validation still rejects CollectInterval < 5s"
+      ]
+    },
+    {
+      "title": "Developer sees correct Go version prerequisite in README",
+      "role": "developer",
+      "want": "the README to state Go 1.24+ as the prerequisite",
+      "so_that": "I install the correct Go version before building from source",
+      "criteria": [
+        "README `Quick Install > From Source` section states Go 1.24+",
+        "README `Development > Prerequisites` section states Go 1.24+",
+        "The version matches `go.mod` (`go 1.24.0`)"
+      ]
+    },
+    {
+      "title": "Developer sees consistent domain references across documentation",
+      "role": "developer",
+      "want": "all user-facing URLs to use `plexsphere.io` consistently",
+      "so_that": "I use the correct domain when configuring plexd or accessing artifacts",
+      "criteria": [
+        "README install script URL uses `get.plexsphere.io`",
+        "README API URL examples use `api.plexsphere.io`",
+        "No `plexsphere.com` URLs remain in README (K8s API group names `plexd.plexsphere.com` are excluded — they are CRD identifiers, not URLs)",
+        "Docs that reference API URLs use `api.plexsphere.io`"
+      ]
+    },
+    {
+      "title": "Systemd service restarts reliably after any exit",
+      "role": "operator",
+      "want": "the systemd service to restart after any exit, not just failures",
+      "so_that": "plexd recovers from clean exits triggered by update signals or transient conditions",
+      "criteria": [
+        "`deploy/systemd/plexd.service` has `Restart=always`",
+        "`internal/packaging/unitfile.go` generates `Restart=always`",
+        "Unit file tests verify `Restart=always`"
+      ]
+    },
+    {
+      "title": "Operator deploys plexd DaemonSet with ConfigMap on fresh cluster",
+      "role": "operator",
+      "want": "a ConfigMap manifest to exist for the plexd-config volume referenced by the DaemonSet",
+      "so_that": "I can deploy plexd on a fresh Kubernetes cluster without creating the ConfigMap manually",
+      "criteria": [
+        "`deploy/kubernetes/plexd-config-configmap.yaml` exists with correct namespace and labels",
+        "ConfigMap name matches the DaemonSet volume reference (`plexd-config`)",
+        "ConfigMap contains a minimal `config.yaml` with placeholder API URL",
+        "Labels match the DaemonSet label convention (`app.kubernetes.io/name: plexd`, `app.kubernetes.io/part-of: plexsphere`)"
+      ]
+    },
+    {
+      "title": "Documentation reflects all config and infrastructure changes",
+      "role": "developer",
+      "want": "reference docs to match the updated defaults and infrastructure",
+      "so_that": "I do not encounter stale information when consulting documentation",
+      "criteria": [
+        "WireGuard reference doc shows default interface name as `plexd0`",
+        "Metrics reference doc shows default CollectInterval as `15s`",
+        "Bare-metal packaging reference doc shows `Restart=always`",
+        "Makefile targets are documented in a reference doc"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL use `plexd0` as the default WireGuard interface name",
+      "priority": "SHALL",
+      "rationale": "The README configuration section documents `plexd0` as the interface name. The code default must match to avoid runtime behavior mismatches.",
+      "scenarios": [
+        {
+          "name": "Zero-value Config gets plexd0 default",
+          "when": "a zero-valued wireguard.Config has ApplyDefaults() called",
+          "then": "InterfaceName is set to `plexd0`",
+          "and_then": [
+            "the DefaultInterfaceName constant equals `plexd0`"
+          ]
+        },
+        {
+          "name": "Custom interface name preserved",
+          "when": "a Config with InterfaceName=`mesh0` has ApplyDefaults() called",
+          "then": "InterfaceName remains `mesh0`",
+          "and_then": []
+        },
+        {
+          "name": "Manager creates interface with default name",
+          "when": "a Manager is constructed with a zero-valued Config and Setup is called",
+          "then": "CreateInterface is invoked with `plexd0`",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The system SHALL use 15 seconds as the default metric collection interval",
+      "priority": "SHALL",
+      "rationale": "15s provides better monitoring granularity while still being well above the 5s validation minimum.",
+      "scenarios": [
+        {
+          "name": "Zero-value Config gets 15s default",
+          "when": "a zero-valued metrics.Config has ApplyDefaults() called",
+          "then": "CollectInterval is set to 15s",
+          "and_then": [
+            "the DefaultCollectInterval constant equals 15s"
+          ]
+        },
+        {
+          "name": "Custom CollectInterval preserved",
+          "when": "a Config with CollectInterval=20s has ApplyDefaults() called",
+          "then": "CollectInterval remains 20s",
+          "and_then": []
+        },
+        {
+          "name": "Validation still rejects low interval",
+          "when": "CollectInterval is set to 3s and Validate is called",
+          "then": "an error is returned indicating CollectInterval must be at least 5s",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The README SHALL state Go 1.24+ as the version prerequisite",
+      "priority": "SHALL",
+      "rationale": "The go.mod specifies `go 1.24.0`. Stating 1.22+ leads developers to use incompatible Go versions.",
+      "scenarios": [
+        {
+          "name": "From Source section shows 1.24+",
+          "when": "a developer reads the Quick Install > From Source section",
+          "then": "the prerequisite states Go 1.24+",
+          "and_then": []
+        },
+        {
+          "name": "Development Prerequisites section shows 1.24+",
+          "when": "a developer reads the Development > Prerequisites section",
+          "then": "the prerequisite states Go 1.24+",
+          "and_then": []
+        },
+        {
+          "name": "Version matches go.mod",
+          "when": "the go.mod file specifies go 1.24.0",
+          "then": "all README references to Go version are consistent at 1.24+",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "All user-facing URLs SHALL use the `plexsphere.io` domain",
+      "priority": "SHALL",
+      "rationale": "The install script and Cloud-Init templates already use plexsphere.io. README inconsistently uses plexsphere.com for URLs, causing confusion.",
+      "scenarios": [
+        {
+          "name": "Install script URL normalized",
+          "when": "a developer reads the README install instructions",
+          "then": "the curl command uses `get.plexsphere.io`",
+          "and_then": []
+        },
+        {
+          "name": "API URL examples normalized",
+          "when": "a developer reads the README configuration examples",
+          "then": "all API URL examples use `api.plexsphere.io`",
+          "and_then": []
+        },
+        {
+          "name": "K8s API groups unchanged",
+          "when": "CRD definitions reference `plexd.plexsphere.com` as a Kubernetes API group",
+          "then": "the API group name remains `plexd.plexsphere.com` (it is an identifier, not a URL)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The systemd service SHALL use `Restart=always` instead of `Restart=on-failure`",
+      "priority": "SHALL",
+      "rationale": "A node agent must recover from any exit condition, including clean exits from update signals. `Restart=always` ensures the agent is always running.",
+      "scenarios": [
+        {
+          "name": "Static service file uses Restart=always",
+          "when": "an operator inspects deploy/systemd/plexd.service",
+          "then": "the Restart directive is `always`",
+          "and_then": []
+        },
+        {
+          "name": "Generated unit file uses Restart=always",
+          "when": "GenerateUnitFile produces a unit file",
+          "then": "the output contains `Restart=always`",
+          "and_then": [
+            "the output does not contain `Restart=on-failure`"
+          ]
+        },
+        {
+          "name": "Unit file tests verify Restart=always",
+          "when": "unit file generation tests run",
+          "then": "tests assert the presence of `Restart=always`",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The project SHALL have a root Makefile with build, test, test-e2e, and lint targets",
+      "priority": "SHALL",
+      "rationale": "The README documents `make build/test/test-e2e/lint` commands. Without a Makefile, these commands fail.",
+      "scenarios": [
+        {
+          "name": "make build compiles the project",
+          "when": "a developer runs `make build` in the project root",
+          "then": "the Go project compiles via `go build ./...`",
+          "and_then": []
+        },
+        {
+          "name": "make test runs unit tests",
+          "when": "a developer runs `make test`",
+          "then": "unit tests run via `go test -race -count=1 ./...`",
+          "and_then": []
+        },
+        {
+          "name": "make test-e2e runs integration tests",
+          "when": "a developer runs `make test-e2e`",
+          "then": "integration tests run via `go test -race -count=1 -run Integration ./...`",
+          "and_then": []
+        },
+        {
+          "name": "make lint runs linters",
+          "when": "a developer runs `make lint`",
+          "then": "`go vet ./...` and `golangci-lint run` are executed",
+          "and_then": []
+        },
+        {
+          "name": "Default target is build",
+          "when": "a developer runs `make` with no target",
+          "then": "the build target executes",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The project SHALL include a plexd-config ConfigMap manifest for Kubernetes deployment",
+      "priority": "SHALL",
+      "rationale": "The DaemonSet references a configMap named `plexd-config` but no manifest exists, causing deployment failures on fresh clusters.",
+      "scenarios": [
+        {
+          "name": "ConfigMap manifest exists",
+          "when": "an operator lists files in deploy/kubernetes/",
+          "then": "plexd-config-configmap.yaml is present",
+          "and_then": []
+        },
+        {
+          "name": "ConfigMap name matches DaemonSet reference",
+          "when": "the DaemonSet volume references configMap `plexd-config`",
+          "then": "the ConfigMap metadata.name is `plexd-config`",
+          "and_then": [
+            "namespace is `plexd-system`"
+          ]
+        },
+        {
+          "name": "ConfigMap contains minimal config",
+          "when": "an operator applies the ConfigMap",
+          "then": "it contains a `config.yaml` key with a placeholder API URL and sensible defaults",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "Documentation SHALL be updated to reflect all changed defaults and new infrastructure",
+      "priority": "SHALL",
+      "rationale": "Stale documentation causes confusion and incorrect configurations.",
+      "scenarios": [
+        {
+          "name": "WireGuard docs reflect plexd0 default",
+          "when": "a developer reads the WireGuard reference doc",
+          "then": "the default interface name is documented as `plexd0`",
+          "and_then": [
+            "code examples use `plexd0`"
+          ]
+        },
+        {
+          "name": "Metrics docs reflect 15s default",
+          "when": "a developer reads the metrics reference doc",
+          "then": "the default CollectInterval is documented as `15s`",
+          "and_then": [
+            "code examples show 15s"
+          ]
+        },
+        {
+          "name": "Packaging docs reflect Restart=always",
+          "when": "a developer reads the bare-metal packaging reference doc",
+          "then": "the Restart directive is documented as `always`",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Change DefaultInterfaceName from `wg0` to `plexd0` in internal/wireguard/config.go (constant, comment, and doc comment). Update internal/wireguard/config_test.go: TestConfig_Defaults to assert `plexd0`. Update internal/wireguard/manager_test.go: all assertions checking for `wg0` to check for `plexd0` (TestManager_Setup, TestManager_Teardown, TestManager_RemovePeer). Run `go test ./internal/wireguard/...` to verify. (REQ-001)",
+    "1.2 Change DefaultCollectInterval from 30s to 15s in internal/metrics/config.go. Update internal/metrics/config_test.go: TestConfig_Defaults to assert `15*time.Second`. Run `go test ./internal/metrics/...` to verify. (REQ-002)",
+    "1.3 Change `Restart=on-failure` to `Restart=always` in deploy/systemd/plexd.service AND internal/packaging/unitfile.go (the GenerateUnitFile template). Update internal/packaging/unitfile_test.go: TestGenerateUnitFile_DefaultConfig to assert `Restart=always` instead of `Restart=on-failure`. Run `go test ./internal/packaging/...` to verify. (REQ-005)",
+    "1.4 Update README.md: change Go prerequisite from `1.22+` to `1.24+` in both the From Source section (line ~151) and the Development Prerequisites section (line ~1898). (REQ-003)",
+    "1.5 Normalize domain references in README.md: change `get.plexsphere.com` to `get.plexsphere.io` and `api.plexsphere.com` to `api.plexsphere.io` for all URL occurrences. Do NOT change K8s API group names (`plexd.plexsphere.com`). Also update docs/reference/backend/control-plane-client.md and docs/reference/backend/registration.md to use `api.plexsphere.io`. (REQ-004)",
+    "2.1 Create root Makefile with targets: `build` (go build ./...), `test` (go test -race -count=1 ./...), `test-e2e` (go test -race -count=1 -run Integration ./...), `lint` (go vet ./... && golangci-lint run), `vet` (go vet ./...). Default target is `build`. Add `.PHONY` declarations. Verify `make build` and `make test` execute correctly. (REQ-006)",
+    "2.2 Create deploy/kubernetes/plexd-config-configmap.yaml: ConfigMap named `plexd-config` in namespace `plexd-system` with labels matching DaemonSet convention (app.kubernetes.io/name: plexd, app.kubernetes.io/part-of: plexsphere). Contains a `config.yaml` key with placeholder API URL and sensible defaults matching the README config section. (REQ-007)",
+    "3.1 Update docs/reference/backend/wireguard.md: change default interface name from `wg0` to `plexd0` in the Config table, code example, and any prose. Update docs that reference `wg0` as the mesh interface: docs/reference/backend/network-policy.md, docs/reference/backend/bridge-mode.md, docs/reference/backend/site-to-site-vpn.md, docs/reference/backend/public-ingress.md, docs/reference/backend/user-access-integration.md, docs/reference/backend/nat-relay.md. (REQ-008, REQ-001)",
+    "3.2 Update docs/reference/backend/metrics-collection.md: change default CollectInterval from `30s` to `15s` in the Config table and code example. (REQ-008, REQ-002)",
+    "3.3 Update docs/reference/backend/bare-metal-packaging.md: change `Restart` directive from `on-failure` to `always` in the unit file directives table. Add a brief reference for the root Makefile targets. (REQ-008, REQ-005, REQ-006)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/wireguard/config_test.go",
+      "test_function": "TestConfig_Defaults",
+      "story": "Node creates WireGuard interface with correct default name",
+      "expected": "ApplyDefaults sets InterfaceName to `plexd0`",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/wireguard/config_test.go",
+      "test_function": "TestConfig_DefaultsPreserveExisting",
+      "story": "Node creates WireGuard interface with correct default name",
+      "expected": "Custom InterfaceName `mesh0` is preserved after ApplyDefaults",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/wireguard/manager_test.go",
+      "test_function": "TestManager_Setup",
+      "story": "Node creates WireGuard interface with correct default name",
+      "expected": "Manager.Setup calls CreateInterface with `plexd0` when using default Config",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_Defaults",
+      "story": "Metrics collection uses correct default interval",
+      "expected": "ApplyDefaults sets CollectInterval to 15s",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_ValidateRejectsLowCollectInterval",
+      "story": "Metrics collection uses correct default interval",
+      "expected": "Validation rejects CollectInterval < 5s even with new 15s default",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_ValidateAcceptsDefaults",
+      "story": "Metrics collection uses correct default interval",
+      "expected": "Default config (now 15s) passes validation",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/packaging/unitfile_test.go",
+      "test_function": "TestGenerateUnitFile_DefaultConfig",
+      "story": "Systemd service restarts reliably after any exit",
+      "expected": "Generated unit file contains `Restart=always`",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/wireguard/manager_test.go",
+      "test_function": "TestManager_Teardown",
+      "story": "Node creates WireGuard interface with correct default name",
+      "expected": "Manager.Teardown calls DeleteInterface with `plexd0`",
+      "requirement_id": "REQ-001"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-008) have corresponding passing tests or verifiable artifacts",
+    "`go test ./internal/wireguard/...` passes with the new `plexd0` default",
+    "`go test ./internal/metrics/...` passes with the new 15s default",
+    "`go test ./internal/packaging/...` passes with `Restart=always`",
+    "`go vet ./...` passes without errors",
+    "`make build` and `make test` execute correctly from project root",
+    "No `plexsphere.com` URLs remain in README.md (K8s API group identifiers excluded)",
+    "README Go version prerequisite matches go.mod (1.24+)",
+    "ConfigMap manifest name matches DaemonSet configMap volume reference exactly (`plexd-config`)",
+    "All documentation changes match the corresponding code changes (no stale defaults in docs)"
+  ],
+  "implementation_notes": "This feature is a collection of small, isolated fixes with no cross-dependencies between changes. Each task can be implemented independently.\n\n**WireGuard interface rename (REQ-001):** Only `internal/wireguard/config.go` and its tests need the default changed. The wireguard manager_test.go uses a zero-value Config which will pick up the new default — update assertions from `wg0` to `plexd0`. Tests in other packages (policy/, bridge/) hardcode `wg0` as test fixture parameters — these are NOT the config default and are out of scope. They pass the interface name explicitly, so they are unaffected by the default change.\n\n**Metrics interval (REQ-002):** Simple constant change. The ReportInterval (60s) and validation rules are unchanged.\n\n**Systemd restart (REQ-005):** Three places to update: static service file, Go unit file generator, and its tests. The test at unitfile_test.go:30 checks for `Restart=on-failure` — change to `Restart=always`.\n\n**Domain normalization (REQ-004):** Only change actual URLs (`https://get.plexsphere.com`, `https://api.plexsphere.com`) to `.io`. K8s API group names (`plexd.plexsphere.com`) are CRD identifiers following Kubernetes convention and must NOT be changed.\n\n**Makefile (REQ-006):** Targets should mirror what CI already runs (see .github/workflows/ci.yml). Keep it simple — no Docker targets, no install target.\n\n**ConfigMap (REQ-007):** The DaemonSet already marks the configMap as `optional: true`, so a minimal placeholder is appropriate. Match the K8s label conventions used in the other manifests.",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T20:05:02.783931"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T20:05:37.749463"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T20:09:11.900955"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "5b516fa9-115e-4f91-b55d-762126929af3",
+      "timestamp": "2026-02-13T20:09:11.901080",
+      "total_duration": 210.66400146484375,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 210.66400146484375,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
