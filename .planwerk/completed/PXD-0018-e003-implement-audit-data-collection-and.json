@@ -2,8 +2,8 @@
   "feature_id": "PXD-0018",
   "title": "E003: Implement audit data collection and forwarding",
   "slug": "e003-implement-audit-data-collection-and",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Collect and forward audit data from managed resources for compliance and security analysis. On Linux, integrate with auditd. On Kubernetes, collect Kubernetes audit logs. Forward audit events to the control plane with minimal latency.",
   "stories": [
@@ -446,13 +446,13 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/auditfwd/config.go: Config struct with Enabled, CollectInterval, ReportInterval, BatchSize fields; DefaultCollectInterval=5s, DefaultReportInterval=15s, DefaultBatchSize=500 constants; ApplyDefaults and Validate methods following the nat/config.go pattern. Audit uses shorter defaults than metrics/logfwd because the feature description requires 'minimal latency'. Create internal/auditfwd/config_test.go with tests for ApplyDefaults (zero-valued Config), Validate happy path, Validate rejects low CollectInterval (<1s), Validate rejects ReportInterval < CollectInterval, Validate rejects BatchSize=0, Validate skips when Enabled=false (REQ-005)",
-    "1.2 Create internal/auditfwd/source.go: Define the AuditSource interface with method Collect(ctx context.Context) ([]api.AuditEntry, error). Define AuditReporter interface abstracting ControlPlane.ReportAudit: ReportAudit(ctx context.Context, nodeID string, batch api.AuditBatch) error. No tests needed for interface definitions (REQ-006)",
-    "1.3 Create internal/auditfwd/auditd.go: AuditdSource struct implementing AuditSource, using injectable AuditdReader interface with method ReadEvents(ctx context.Context) ([]AuditdEvent, error). AuditdEvent struct with Timestamp (time.Time), Type (string, e.g., SYSCALL/PATH/USER_AUTH), UID/GID/PID (string), Syscall (string), Path (string), Success (string), Raw (string) fields. Field mapping: Subject=json.RawMessage from uid/gid/pid, Object=json.RawMessage from path, Action=syscall (fallback to Type if empty), Result=success field value, EventType=Type, Source='auditd', Raw=original line. Hostname populated at construction time via injectable value. Create internal/auditfwd/auditd_test.go with mock AuditdReader; tests for correct field mapping, Subject JSON serialization, Object JSON serialization, missing syscall handled, reader error propagated, empty events returns empty slice (REQ-007)",
-    "1.4 Create internal/auditfwd/k8saudit.go: K8sAuditSource struct implementing AuditSource, using injectable K8sAuditReader interface with method ReadEvents(ctx context.Context) ([]K8sAuditEvent, error). K8sAuditEvent struct with Timestamp (time.Time), Verb (string), User (K8sUser with Username/Groups/UID), ObjectRef (K8sObjectRef with APIVersion/Resource/Namespace/Name), ResponseStatus (int), RequestURI (string), Raw (string). Field mapping: Subject=json.RawMessage from User, Object=json.RawMessage from ObjectRef, Action=Verb, Result='success' for 2xx codes / 'failure' otherwise, EventType='k8s-audit', Source='k8s-audit'. Hostname populated at construction time. Create internal/auditfwd/k8saudit_test.go with mock K8sAuditReader; tests for correct field mapping, Subject JSON serialization, Object JSON serialization, success/failure result mapping, reader error propagated, empty events returns empty slice (REQ-008)",
-    "2.1 Create internal/auditfwd/forwarder.go: Forwarder struct with fields for config, sources []AuditSource, reporter AuditReporter, nodeID, hostname, logger. NewForwarder constructor applies defaults. RegisterSource method adds to the source list. Run method implements the dual-ticker loop: collect at CollectInterval, report at ReportInterval. Run returns nil immediately when Enabled=false. Buffer management: accumulate entries in a slice, send at ReportInterval, respect BatchSize (split into multiple API calls if needed), retain on failure, drop oldest when exceeding 2*BatchSize. Panic recovery per source (matching reconciler safeInvoke pattern). (REQ-001, REQ-002, REQ-003, REQ-004, REQ-006)",
-    "2.2 Create internal/auditfwd/forwarder_test.go: Full test suite for Forwarder.Run using mock AuditSource and mock AuditReporter. Tests: collects and reports on schedule, skips empty batch, retains on report error, drops oldest when over capacity (with warning log verification), stops on context cancel, isolates source error, recovers source panic, respects BatchSize (splits into multiple calls), returns nil when disabled, multiple sources aggregated. Use discardLogger helper, short intervals for fast tests (REQ-001, REQ-002, REQ-003, REQ-004, REQ-006)",
-    "3.1 Write docs/reference/backend/audit-forwarding.md: Reference documentation covering Config struct (all fields, types, defaults, validation rules), AuditSource interface contract, AuditReporter interface, AuditdReader interface, K8sAuditReader interface, AuditdSource field mapping (auditd type/uid/gid/pid/syscall/path/success to AuditEntry), K8sAuditSource field mapping (verb/user/objectRef/responseStatus to AuditEntry), Forwarder lifecycle (NewForwarder, RegisterSource, Run), buffer behavior (capacity, overflow policy), and the POST /v1/nodes/{node_id}/audit API contract with api.AuditEntry schema (REQ-010)"
+    "[done] 1.1 Create internal/auditfwd/config.go: Config struct with Enabled, CollectInterval, ReportInterval, BatchSize fields; DefaultCollectInterval=5s, DefaultReportInterval=15s, DefaultBatchSize=500 constants; ApplyDefaults and Validate methods following the nat/config.go pattern. Audit uses shorter defaults than metrics/logfwd because the feature description requires 'minimal latency'. Create internal/auditfwd/config_test.go with tests for ApplyDefaults (zero-valued Config), Validate happy path, Validate rejects low CollectInterval (<1s), Validate rejects ReportInterval < CollectInterval, Validate rejects BatchSize=0, Validate skips when Enabled=false (REQ-005)",
+    "[done] 1.2 Create internal/auditfwd/source.go: Define the AuditSource interface with method Collect(ctx context.Context) ([]api.AuditEntry, error). Define AuditReporter interface abstracting ControlPlane.ReportAudit: ReportAudit(ctx context.Context, nodeID string, batch api.AuditBatch) error. No tests needed for interface definitions (REQ-006)",
+    "[done] 1.3 Create internal/auditfwd/auditd.go: AuditdSource struct implementing AuditSource, using injectable AuditdReader interface with method ReadEvents(ctx context.Context) ([]AuditdEvent, error). AuditdEvent struct with Timestamp (time.Time), Type (string, e.g., SYSCALL/PATH/USER_AUTH), UID/GID/PID (string), Syscall (string), Path (string), Success (string), Raw (string) fields. Field mapping: Subject=json.RawMessage from uid/gid/pid, Object=json.RawMessage from path, Action=syscall (fallback to Type if empty), Result=success field value, EventType=Type, Source='auditd', Raw=original line. Hostname populated at construction time via injectable value. Create internal/auditfwd/auditd_test.go with mock AuditdReader; tests for correct field mapping, Subject JSON serialization, Object JSON serialization, missing syscall handled, reader error propagated, empty events returns empty slice (REQ-007)",
+    "[done] 1.4 Create internal/auditfwd/k8saudit.go: K8sAuditSource struct implementing AuditSource, using injectable K8sAuditReader interface with method ReadEvents(ctx context.Context) ([]K8sAuditEvent, error). K8sAuditEvent struct with Timestamp (time.Time), Verb (string), User (K8sUser with Username/Groups/UID), ObjectRef (K8sObjectRef with APIVersion/Resource/Namespace/Name), ResponseStatus (int), RequestURI (string), Raw (string). Field mapping: Subject=json.RawMessage from User, Object=json.RawMessage from ObjectRef, Action=Verb, Result='success' for 2xx codes / 'failure' otherwise, EventType='k8s-audit', Source='k8s-audit'. Hostname populated at construction time. Create internal/auditfwd/k8saudit_test.go with mock K8sAuditReader; tests for correct field mapping, Subject JSON serialization, Object JSON serialization, success/failure result mapping, reader error propagated, empty events returns empty slice (REQ-008)",
+    "[done] 2.1 Create internal/auditfwd/forwarder.go: Forwarder struct with fields for config, sources []AuditSource, reporter AuditReporter, nodeID, hostname, logger. NewForwarder constructor applies defaults. RegisterSource method adds to the source list. Run method implements the dual-ticker loop: collect at CollectInterval, report at ReportInterval. Run returns nil immediately when Enabled=false. Buffer management: accumulate entries in a slice, send at ReportInterval, respect BatchSize (split into multiple API calls if needed), retain on failure, drop oldest when exceeding 2*BatchSize. Panic recovery per source (matching reconciler safeInvoke pattern). (REQ-001, REQ-002, REQ-003, REQ-004, REQ-006)",
+    "[done] 2.2 Create internal/auditfwd/forwarder_test.go: Full test suite for Forwarder.Run using mock AuditSource and mock AuditReporter. Tests: collects and reports on schedule, skips empty batch, retains on report error, drops oldest when over capacity (with warning log verification), stops on context cancel, isolates source error, recovers source panic, respects BatchSize (splits into multiple calls), returns nil when disabled, multiple sources aggregated. Use discardLogger helper, short intervals for fast tests (REQ-001, REQ-002, REQ-003, REQ-004, REQ-006)",
+    "[done] 3.1 Write docs/reference/backend/audit-forwarding.md: Reference documentation covering Config struct (all fields, types, defaults, validation rules), AuditSource interface contract, AuditReporter interface, AuditdReader interface, K8sAuditReader interface, AuditdSource field mapping (auditd type/uid/gid/pid/syscall/path/success to AuditEntry), K8sAuditSource field mapping (verb/user/objectRef/responseStatus to AuditEntry), Forwarder lifecycle (NewForwarder, RegisterSource, Run), buffer behavior (capacity, overflow policy), and the POST /v1/nodes/{node_id}/audit API contract with api.AuditEntry schema (REQ-010)"
   ],
   "test_specifications": [
     {
@@ -694,6 +694,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T21:22:31.213270"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-12T23:37:16.112724"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T07:03:00.477637"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T07:03:00.493886"
     }
   },
   "execution_history": [
@@ -707,6 +719,50 @@
           "name": "prepare",
           "duration": 289.8717896938324,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "0c573259-a116-4fe6-979a-abf71bb6f58f",
+      "timestamp": "2026-02-12T23:57:19.039447",
+      "total_duration": 1070.289479970932,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 175.70100259780884,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (2 tasks)",
+          "duration": 110.14501905441284,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 77.33864283561707,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0018] Code Review",
+          "duration": 224.2363576889038,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0018] Improvements",
+          "duration": 353.3023006916046,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0018] Simplify",
+          "duration": 129.56615710258484,
+          "type": "simplify",
           "status": "done"
         }
       ]

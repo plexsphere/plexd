@@ -1,0 +1,213 @@
+{
+  "feature_id": "PXD-0018",
+  "title": "E003: Implement audit data collection and forwarding",
+  "date": "2026-02-12",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Audit data collection and forwarding package (internal/auditfwd) implements the dual-ticker forwarder pattern from logfwd, AuditSource interface with AuditdSource and K8sAuditSource, Config with ApplyDefaults/Validate, buffer management with overflow protection, panic recovery, and goleak verification. All 31 tests pass, go vet is clean. However, default values deviate from spec (10s/30s/200 vs required 5s/15s/500), AuditdEntry/K8sAuditEntry structs are simplified from spec (missing granular fields like UID/GID/PID, K8sUser, K8sObjectRef, ResponseStatus), K8s Result field passes raw status codes instead of mapping to success/failure as specified, and CollectInterval minimum validation threshold is 5s instead of spec-required 1s.",
+  "tests_checklist": [
+    {"item": "Tests exist and pass (31/31 PASS)", "checked": true},
+    {"item": "Config ApplyDefaults tested for zero-valued Config", "checked": true},
+    {"item": "Config Validate happy path tested", "checked": true},
+    {"item": "Config Validate rejects low CollectInterval", "checked": true},
+    {"item": "Config Validate rejects ReportInterval < CollectInterval", "checked": true},
+    {"item": "Config Validate rejects BatchSize=0", "checked": true},
+    {"item": "Config Validate skips when Enabled=false", "checked": true},
+    {"item": "AuditdSource correct field mapping tested", "checked": true},
+    {"item": "AuditdSource Subject JSON serialization tested", "checked": true},
+    {"item": "AuditdSource Object JSON serialization tested", "checked": true},
+    {"item": "AuditdSource reader error propagated tested", "checked": true},
+    {"item": "AuditdSource empty events returns empty slice tested", "checked": true},
+    {"item": "K8sAuditSource correct field mapping tested", "checked": true},
+    {"item": "K8sAuditSource Subject JSON serialization tested", "checked": true},
+    {"item": "K8sAuditSource Object JSON serialization tested", "checked": true},
+    {"item": "K8sAuditSource reader error propagated tested", "checked": true},
+    {"item": "K8sAuditSource empty events returns empty slice tested", "checked": true},
+    {"item": "K8sAuditSource empty namespace edge case tested", "checked": true},
+    {"item": "Forwarder collects and reports on schedule tested", "checked": true},
+    {"item": "Forwarder skips empty batch tested", "checked": true},
+    {"item": "Forwarder retains on report error tested", "checked": true},
+    {"item": "Forwarder drops oldest when over capacity tested", "checked": true},
+    {"item": "Forwarder stops on context cancel tested", "checked": true},
+    {"item": "Forwarder isolates source error tested", "checked": true},
+    {"item": "Forwarder recovers source panic tested", "checked": true},
+    {"item": "Forwarder respects BatchSize (splits into multiple calls) tested", "checked": true},
+    {"item": "Forwarder returns nil when disabled tested", "checked": true},
+    {"item": "Forwarder multiple sources aggregated tested", "checked": true},
+    {"item": "Goroutine leak detection via goleak.VerifyTestMain", "checked": true},
+    {"item": "AuditdSource missing syscall handled (Action fallback to Type)", "checked": false},
+    {"item": "K8sAuditSource success/failure result mapping (2xx vs non-2xx)", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing logfwd/nat config pattern (ApplyDefaults/Validate)", "checked": true},
+    {"item": "Follows dual-ticker Run-loop pattern from logfwd", "checked": true},
+    {"item": "AuditSource interface uses dependency injection for all external state", "checked": true},
+    {"item": "Structured logging with component='auditfwd' field", "checked": true},
+    {"item": "No goroutine leaks (goleak verified)", "checked": true},
+    {"item": "AuditEntry payloads match api.AuditEntry schema", "checked": true},
+    {"item": "Subject and Object fields are valid json.RawMessage", "checked": true},
+    {"item": "Functions small and single-responsibility", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "Default values match spec (5s/15s/500)", "checked": false},
+    {"item": "AuditdEntry struct matches spec with UID/GID/PID/Syscall/Path/Success fields", "checked": false},
+    {"item": "K8sAuditEntry struct matches spec with K8sUser/K8sObjectRef/ResponseStatus/RequestURI", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "All user inputs validated (Config.Validate)", "checked": true},
+    {"item": "No SQL injection risk", "checked": true},
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "No path traversal vulnerabilities", "checked": true},
+    {"item": "Panic recovery prevents crash propagation", "checked": true},
+    {"item": "Buffer capacity bounded (2*BatchSize)", "checked": true},
+    {"item": "json.Marshal errors silently ignored on simple string values", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Solution follows established package structure (config/source/forwarder)", "checked": true},
+    {"item": "Injectable interfaces for testability (AuditdReader, K8sAuditReader, AuditReporter)", "checked": true},
+    {"item": "Mutex-protected buffer for thread safety", "checked": true},
+    {"item": "Graceful shutdown with best-effort flush", "checked": true},
+    {"item": "Solution is as simple as possible", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code across packages", "checked": true},
+    {"item": "No unused exports or dead code", "checked": true},
+    {"item": "No over-engineered abstractions", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config validation catches invalid values early", "checked": true},
+    {"item": "Errors propagated with context (fmt.Errorf wrapping)", "checked": true},
+    {"item": "Disabled config returns nil immediately without starting goroutines", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "All external reader interfaces validated for errors", "checked": true},
+    {"item": "Panic recovery per source in collect loop", "checked": true},
+    {"item": "Buffer overflow protection with oldest-entry eviction", "checked": true},
+    {"item": "Context cancellation respected in Run loop", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [
+    {
+      "severity": "MAJOR",
+      "id": "C1-1",
+      "description": "Default values deviate from spec. Spec requires DefaultCollectInterval=5s, DefaultReportInterval=15s, DefaultBatchSize=500 for 'minimal latency'. Implementation uses 10s/30s/200 (copied from logfwd).",
+      "location": "internal/auditfwd/config.go:10-16",
+      "fix": "Change constants to: DefaultCollectInterval = 5 * time.Second, DefaultReportInterval = 15 * time.Second, DefaultBatchSize = 500. Update tests and docs accordingly."
+    },
+    {
+      "severity": "MAJOR",
+      "id": "C1-2",
+      "description": "CollectInterval minimum validation is 5s but spec says '<1s' should be rejected (minimum 1s). The higher 5s threshold is stricter than specified and would reject valid configurations between 1s-5s.",
+      "location": "internal/auditfwd/config.go:63",
+      "fix": "Change validation to: c.CollectInterval < 1*time.Second with error message 'CollectInterval must be at least 1s'. Update test TestConfig_ValidateRejectsLowCollectInterval to use <1s test value."
+    },
+    {
+      "severity": "MAJOR",
+      "id": "C1-3",
+      "description": "AuditdEntry struct is simplified from spec. Spec requires granular fields: UID, GID, PID (string), Syscall (string), Path (string), Success (string). Implementation collapses these into Subject, Object, Action, Result strings. Subject should be json.RawMessage built from structured uid/gid/pid object, not a plain string.",
+      "location": "internal/auditfwd/auditd.go:14-22",
+      "fix": "Add UID, GID, PID, Syscall, Path, Success fields to AuditdEntry. In Collect(), build Subject as JSON object from uid/gid/pid, Object from path, Action from syscall with fallback to Type when empty. Update AuditdReader to return the granular struct."
+    },
+    {
+      "severity": "MAJOR",
+      "id": "C1-4",
+      "description": "K8sAuditEntry struct is simplified from spec. Spec requires K8sUser struct (Username/Groups/UID), K8sObjectRef struct (APIVersion/Resource/Namespace/Name), ResponseStatus (int), RequestURI (string). Implementation uses flat string fields and omits ResponseStatus as int and RequestURI entirely.",
+      "location": "internal/auditfwd/k8saudit.go:14-23",
+      "fix": "Define K8sUser struct {Username string; Groups []string; UID string} and K8sObjectRef struct {APIVersion string; Resource string; Namespace string; Name string}. Change K8sAuditEntry to use these structs, add ResponseStatus int and RequestURI string fields. Marshal Subject from K8sUser and Object from K8sObjectRef."
+    },
+    {
+      "severity": "MAJOR",
+      "id": "C1-5",
+      "description": "K8s Result field mapping missing. Spec requires: Result='success' for 2xx status codes, 'failure' otherwise. Implementation passes raw status code string (e.g., '201', '403') directly as Result.",
+      "location": "internal/auditfwd/k8saudit.go:81",
+      "fix": "Add result mapping logic: if ResponseStatus >= 200 && ResponseStatus < 300 then Result = 'success', else Result = 'failure'. Add tests for success/failure mapping boundary cases (199, 200, 299, 300, 403, 500)."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "C1-1",
+      "severity": "major",
+      "check": "C1",
+      "file": "internal/auditfwd/config.go:10-16",
+      "description": "Default constants don't match spec: 10s/30s/200 vs required 5s/15s/500",
+      "fix": "Update DefaultCollectInterval=5s, DefaultReportInterval=15s, DefaultBatchSize=500"
+    },
+    {
+      "id": "C1-2",
+      "severity": "major",
+      "check": "C1",
+      "file": "internal/auditfwd/config.go:63",
+      "description": "CollectInterval minimum validation threshold is 5s, spec says reject <1s",
+      "fix": "Change to c.CollectInterval < 1*time.Second"
+    },
+    {
+      "id": "C1-3",
+      "severity": "major",
+      "check": "C1",
+      "file": "internal/auditfwd/auditd.go:14-22",
+      "description": "AuditdEntry missing granular fields (UID/GID/PID/Syscall/Path/Success). Subject should be structured JSON from uid/gid/pid, not a pre-composed string",
+      "fix": "Add individual fields per spec, build Subject as json.RawMessage from structured object"
+    },
+    {
+      "id": "C1-4",
+      "severity": "major",
+      "check": "C1",
+      "file": "internal/auditfwd/k8saudit.go:14-23",
+      "description": "K8sAuditEntry missing K8sUser/K8sObjectRef structs, ResponseStatus as int, and RequestURI field",
+      "fix": "Define K8sUser and K8sObjectRef structs per spec, add ResponseStatus int and RequestURI string"
+    },
+    {
+      "id": "C1-5",
+      "severity": "major",
+      "check": "C1",
+      "file": "internal/auditfwd/k8saudit.go:81",
+      "description": "K8s Result passes raw HTTP status code instead of mapping to 'success'/'failure' per spec",
+      "fix": "Map ResponseStatus 2xx to 'success', all other to 'failure'"
+    },
+    {
+      "id": "TE2-1",
+      "severity": "major",
+      "check": "TE2",
+      "file": "internal/auditfwd/auditd_test.go",
+      "description": "Missing test for Action fallback to Type when Syscall/Action is empty (spec: 'Action=syscall (fallback to Type if empty)')",
+      "fix": "Add test with empty Action field verifying fallback behavior"
+    },
+    {
+      "id": "TE2-2",
+      "severity": "major",
+      "check": "TE2",
+      "file": "internal/auditfwd/k8saudit_test.go",
+      "description": "Missing test for success/failure result mapping from HTTP status codes (spec requires this mapping)",
+      "fix": "Add tests for 2xx -> 'success' and non-2xx -> 'failure' mapping"
+    },
+    {
+      "id": "Q6-1",
+      "severity": "minor",
+      "check": "Q6",
+      "file": "internal/auditfwd/forwarder.go:103",
+      "description": "Magic number 2 in buffer capacity calculation (2 * BatchSize)",
+      "fix": "Extract as named constant: bufferCapacityMultiplier = 2"
+    },
+    {
+      "id": "P1-1",
+      "severity": "minor",
+      "check": "P1",
+      "file": "internal/auditfwd/auditd.go:26, internal/auditfwd/k8saudit.go:27",
+      "description": "Method named ReadEntries but spec says ReadEvents. Minor naming deviation from spec (consistent internally but differs from task definition)",
+      "fix": "Consider renaming to ReadEvents / AuditdEvent / K8sAuditEvent per spec, or document the deviation"
+    }
+  ],
+  "suggested_improvements": [
+    "Extract buffer capacity multiplier (2) as a named constant with documentation explaining the rationale",
+    "Consider adding context cancellation check between sources in collect() loop for faster shutdown with many sources",
+    "logfwd package has identical pattern - consider noting this follows logfwd exactly (except for the spec-required defaults)"
+  ],
+  "next_steps": [
+    "Fix default constants to match spec: DefaultCollectInterval=5s, DefaultReportInterval=15s, DefaultBatchSize=500",
+    "Change CollectInterval minimum validation from 5s to 1s per spec",
+    "Restructure AuditdEntry with granular fields (UID, GID, PID, Syscall, Path, Success) and build Subject as structured JSON object",
+    "Define K8sUser and K8sObjectRef structs, add ResponseStatus (int) and RequestURI fields to K8sAuditEntry",
+    "Implement K8s Result mapping: 2xx -> 'success', non-2xx -> 'failure'",
+    "Add missing tests: auditd Action fallback to Type, K8s success/failure result mapping",
+    "Update docs/reference/backend/audit-forwarding.md to reflect corrected defaults and struct fields",
+    "Update all existing tests to use corrected default values"
+  ]
+}
