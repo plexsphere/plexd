@@ -27,8 +27,8 @@ func TestGenerateUnitFile_DefaultConfig(t *testing.T) {
 	if !strings.Contains(output, "After=network-online.target") {
 		t.Error("output missing After=network-online.target")
 	}
-	if !strings.Contains(output, "Restart=on-failure") {
-		t.Error("output missing Restart=on-failure")
+	if !strings.Contains(output, "Restart=always") {
+		t.Error("output missing Restart=always")
 	}
 	if !strings.Contains(output, "RestartSec=5s") {
 		t.Error("output missing RestartSec=5s")

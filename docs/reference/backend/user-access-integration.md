@@ -23,7 +23,7 @@ External VPN Clients
 │  ┌───────────────────┐         ┌───────────────────┐           │
 │  │  Access WireGuard │  IP fwd │  Mesh WireGuard   │           │
 │  │  Interface        │────────▶│  Interface        │           │
-│  │  (wg-access)      │         │  (wg0)            │           │
+│  │  (wg-access)      │         │  (plexd0)         │           │
 │  │  port 51822       │         │                   │           │
 │  └───────────────────┘         └─────────┬─────────┘           │
 │         ▲                                │                     │
@@ -40,7 +40,7 @@ External VPN Clients
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Traffic from external VPN clients arrives on the access WireGuard interface (`wg-access`), is forwarded via IP forwarding to the mesh WireGuard interface (`wg0`), and reaches mesh peers. The `RouteController` manages forwarding rules; the `AccessController` manages the WireGuard interface and peer configuration.
+Traffic from external VPN clients arrives on the access WireGuard interface (`wg-access`), is forwarded via IP forwarding to the mesh WireGuard interface (`plexd0`), and reaches mesh peers. The `RouteController` manages forwarding rules; the `AccessController` manages the WireGuard interface and peer configuration.
 
 ## Config
 
@@ -362,7 +362,7 @@ The user access reconcile handler plugs into `internal/reconcile` alongside exis
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
-r.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, nodeID, meshIP, "wg0"))
+r.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, nodeID, meshIP, "plexd0"))
 r.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
 r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))

@@ -230,7 +230,7 @@ Returns `true` if valid identity files exist in `Config.DataDir`.
 ```go
 // Create control plane client
 cpClient, err := api.NewControlPlane(api.Config{
-    BaseURL: "https://api.plexsphere.com",
+    BaseURL: "https://api.plexsphere.io",
 }, "1.0.0", slog.Default())
 if err != nil {
     log.Fatal(err)

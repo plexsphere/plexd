@@ -1,0 +1,95 @@
+{
+  "feature_id": "PXD-0024",
+  "title": "G001: Fix cross-cutting config and build infrastructure",
+  "date": "2026-02-13",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Core Go code changes (wireguard default, metrics interval, systemd restart) are correct with passing tests. ConfigMap and basic Makefile are present. However, 4 issues must be fixed: (1) K8s API group names in README were changed from plexd.plexsphere.com to plexd.plexsphere.io against explicit instructions — this is a breaking change for CRD identifiers; (2) Makefile is missing the test-e2e target and lint does not include go vet as specified; (3) docs/reference/backend/ files for network-policy, bridge-mode, site-to-site-vpn, public-ingress, user-access-integration, and nat-relay still reference wg0 instead of plexd0; (4) docs/reference/backend/control-plane-client.md and registration.md still use api.plexsphere.com.",
+  "tests_checklist": [
+    {"item": "go test ./internal/wireguard/... passes with plexd0 default", "checked": true},
+    {"item": "go test ./internal/metrics/... passes with 15s default", "checked": true},
+    {"item": "go test ./internal/packaging/... passes with Restart=always", "checked": true},
+    {"item": "go vet ./... passes without errors", "checked": true},
+    {"item": "make build executes correctly", "checked": true},
+    {"item": "make test executes correctly (all tests pass with -race)", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing code patterns", "checked": true},
+    {"item": "Changes are minimal and focused", "checked": true},
+    {"item": "Constants and comments updated consistently", "checked": true},
+    {"item": "Test assertions match new defaults", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets in ConfigMap (placeholder URL only)", "checked": true},
+    {"item": "No injection risks in Makefile targets", "checked": true},
+    {"item": "No sensitive data exposed in new files", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "ConfigMap name matches DaemonSet volume reference (plexd-config)", "checked": true},
+    {"item": "ConfigMap namespace matches DaemonSet namespace (plexd-system)", "checked": true},
+    {"item": "ConfigMap labels follow existing convention", "checked": true},
+    {"item": "Makefile targets mirror CI workflow commands", "checked": true},
+    {"item": "Solution is as simple as possible", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code", "checked": true},
+    {"item": "No unnecessary abstractions added", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Errors detected early", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "All external inputs validated", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [
+    {
+      "id": "C2-001",
+      "severity": "critical",
+      "check_id": "C2",
+      "file": "README.md",
+      "description": "K8s API group names changed from plexd.plexsphere.com to plexd.plexsphere.io. Task 1.5 and REQ-004 scenario 'K8s API groups unchanged' explicitly state: 'Do NOT change K8s API group names (plexd.plexsphere.com)'. CRD group names are Kubernetes identifiers, not URLs. Changing them is a breaking change — any existing cluster with CRDs registered under plexd.plexsphere.com would break. All occurrences of plexd.plexsphere.io in README K8s manifests (CRD definitions, apiVersion fields, labels, ownerReferences, ClusterRole apiGroups) must be reverted to plexd.plexsphere.com.",
+      "fix": "Revert all plexd.plexsphere.io back to plexd.plexsphere.com in README.md where the context is a K8s API group, CRD name, apiVersion, label key prefix, or ClusterRole apiGroup. Only actual URLs (get.plexsphere.io, api.plexsphere.io) should use .io domain."
+    },
+    {
+      "id": "C2-002",
+      "severity": "critical",
+      "check_id": "C2",
+      "file": "Makefile",
+      "description": "Missing test-e2e target. Task 2.1 and REQ-006 require a test-e2e target running 'go test -race -count=1 -run Integration ./...'. The Makefile only has build, test, lint, vet. The .PHONY declaration also omits test-e2e.",
+      "fix": "Add test-e2e target: 'go test -race -count=1 -run Integration ./...' and add test-e2e to .PHONY."
+    },
+    {
+      "id": "C2-003",
+      "severity": "major",
+      "check_id": "C2",
+      "file": "Makefile",
+      "description": "lint target does not include 'go vet ./...' as specified. Task 2.1 says lint should run 'go vet ./... && golangci-lint run'. Currently lint only runs 'golangci-lint run' and go vet is a separate target.",
+      "fix": "Change lint target to: 'go vet ./... && golangci-lint run' (or add vet as a prerequisite: 'lint: vet')."
+    },
+    {
+      "id": "C2-004",
+      "severity": "major",
+      "check_id": "C2",
+      "file": "docs/reference/backend/network-policy.md, bridge-mode.md, site-to-site-vpn.md, public-ingress.md, user-access-integration.md, nat-relay.md",
+      "description": "Task 3.1 requires updating wg0 to plexd0 in 6 doc files. None were updated — all still reference wg0 as the mesh interface in code examples and prose.",
+      "fix": "Replace wg0 with plexd0 in all mesh interface references across: network-policy.md (lines 251, 290), bridge-mode.md (lines 23, 133, 268), site-to-site-vpn.md (lines 26, 381), public-ingress.md (lines 26, 377), user-access-integration.md (lines 26, 43, 365), nat-relay.md (line 287)."
+    },
+    {
+      "id": "C2-005",
+      "severity": "major",
+      "check_id": "C2",
+      "file": "docs/reference/backend/control-plane-client.md:26, docs/reference/backend/registration.md:233",
+      "description": "Task 1.5 requires updating control-plane-client.md and registration.md to use api.plexsphere.io. Both still use api.plexsphere.com.",
+      "fix": "Change api.plexsphere.com to api.plexsphere.io in control-plane-client.md (line 26) and registration.md (line 233)."
+    }
+  ],
+  "suggested_improvements": [],
+  "next_steps": [
+    "Revert all K8s API group identifiers (plexd.plexsphere.io) back to plexd.plexsphere.com in README.md",
+    "Add test-e2e target to Makefile and update .PHONY",
+    "Update lint target to include go vet",
+    "Update wg0 to plexd0 in 6 docs/reference/backend/ files per task 3.1",
+    "Update api.plexsphere.com to api.plexsphere.io in control-plane-client.md and registration.md"
+  ]
+}

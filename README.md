@@ -137,7 +137,7 @@ plexd communicates outbound only - no inbound ports or public IPs required on th
 ### Binary
 
 ```bash
-curl -fsSL https://get.plexsphere.com/plexd | sh
+curl -fsSL https://get.plexsphere.io/plexd | sh
 ```
 
 ### Container
@@ -148,7 +148,7 @@ docker pull ghcr.io/plexsphere/plexd:latest
 
 ### From Source
 
-Requires Go 1.22+, WireGuard tools, and nftables.
+Requires Go 1.24+, WireGuard tools, and nftables.
 
 ```bash
 git clone https://github.com/plexsphere/plexd.git
@@ -228,7 +228,7 @@ spec:
                 - NET_RAW
           env:
             - name: PLEXD_API
-              value: "https://api.plexsphere.com"
+              value: "https://api.plexsphere.io"
             - name: PLEXD_BOOTSTRAP_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -257,7 +257,7 @@ services:
     volumes:
       - plexd-data:/var/lib/plexd
     environment:
-      PLEXD_API: "https://api.plexsphere.com"
+      PLEXD_API: "https://api.plexsphere.io"
       PLEXD_BOOTSTRAP_TOKEN_FILE: /run/secrets/bootstrap-token
       PLEXD_MODE: bridge
     secrets:
@@ -311,7 +311,7 @@ Flags:
 # /etc/plexd/config.yaml
 
 # --- Required ---
-api: "https://api.plexsphere.com"
+api: "https://api.plexsphere.io"
 
 # --- Optional ---
 log_level: info         # debug, info, warn, error
@@ -750,7 +750,7 @@ The control plane sends an `action_request` event over the existing SSE stream t
     "include_processes": true
   },
   "timeout": "30s",
-  "callback_url": "https://api.plexsphere.com/v1/nodes/n_abc123/executions/exec_a1b2c3d4"
+  "callback_url": "https://api.plexsphere.io/v1/nodes/n_abc123/executions/exec_a1b2c3d4"
 }
 ```
 
@@ -1895,7 +1895,7 @@ data_dir/state/
 
 ### Prerequisites
 
-- Go 1.22+
+- Go 1.24+
 - WireGuard tools (`wg`, `wg-quick`)
 - nftables
 - Docker (for integration tests)

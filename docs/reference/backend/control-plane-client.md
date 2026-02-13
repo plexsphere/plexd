@@ -23,7 +23,7 @@ The `internal/api` package provides the Go client for communicating with the Ple
 
 ```go
 cfg := api.Config{
-    BaseURL:               "https://api.plexsphere.com",
+    BaseURL:               "https://api.plexsphere.io",
     TLSInsecureSkipVerify: false,
 }
 cfg.ApplyDefaults() // sets zero-valued timeouts to defaults

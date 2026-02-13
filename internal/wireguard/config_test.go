@@ -6,8 +6,8 @@ func TestConfig_Defaults(t *testing.T) {
 	cfg := Config{}
 	cfg.ApplyDefaults()
 
-	if cfg.InterfaceName != "wg0" {
-		t.Errorf("InterfaceName = %q, want %q", cfg.InterfaceName, "wg0")
+	if cfg.InterfaceName != "plexd0" {
+		t.Errorf("InterfaceName = %q, want %q", cfg.InterfaceName, "plexd0")
 	}
 	if cfg.ListenPort != 51820 {
 		t.Errorf("ListenPort = %d, want %d", cfg.ListenPort, 51820)

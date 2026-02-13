@@ -23,7 +23,7 @@ External Network
 |  +-------------------+         +-------------------+           |
 |  |  S2S WireGuard    |  route  |  Mesh WireGuard   |           |
 |  |  Interfaces       |-------->|  Interface        |           |
-|  |  (wg-s2s-{id})    |         |  (wg0)            |           |
+|  |  (wg-s2s-{id})    |         |  (plexd0)         |           |
 |  |  :51823, ...      |         |                   |           |
 |  +-------------------+         +---------+---------+           |
 |         ^                                |                     |
@@ -378,7 +378,7 @@ The site-to-site reconcile handler plugs into `internal/reconcile` alongside exi
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
-r.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, nodeID, meshIP, "wg0"))
+r.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, nodeID, meshIP, "plexd0"))
 r.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
 r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))

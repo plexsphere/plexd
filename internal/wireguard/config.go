@@ -6,7 +6,7 @@ import "errors"
 // Config is passed as a constructor argument — no file I/O in this package.
 type Config struct {
 	// InterfaceName is the WireGuard network interface name.
-	// Default: "wg0"
+	// Default: "plexd0"
 	InterfaceName string
 
 	// ListenPort is the UDP port WireGuard listens on.
@@ -18,7 +18,7 @@ type Config struct {
 }
 
 // DefaultInterfaceName is the default WireGuard interface name.
-const DefaultInterfaceName = "wg0"
+const DefaultInterfaceName = "plexd0"
 
 // DefaultListenPort is the default WireGuard UDP listen port.
 const DefaultListenPort = 51820

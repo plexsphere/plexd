@@ -248,7 +248,7 @@ enforcer := policy.NewEnforcer(engine, fwCtrl, policy.Config{}, logger)
 mgr := wireguard.NewManager(ctrl, wireguard.Config{}, logger)
 
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(policy.ReconcileHandler(enforcer, mgr, nodeID, meshIP, "wg0"))
+r.RegisterHandler(policy.ReconcileHandler(enforcer, mgr, nodeID, meshIP, "plexd0"))
 ```
 
 ## HandlePolicyUpdated
@@ -287,7 +287,7 @@ The policy reconcile handler plugs into `internal/reconcile` alongside the WireG
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(mgr))
-r.RegisterHandler(policy.ReconcileHandler(enforcer, mgr, nodeID, meshIP, "wg0"))
+r.RegisterHandler(policy.ReconcileHandler(enforcer, mgr, nodeID, meshIP, "plexd0"))
 ```
 
 ### SSE Real-Time Updates

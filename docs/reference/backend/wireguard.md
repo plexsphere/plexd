@@ -17,7 +17,7 @@ All OS-level WireGuard operations go through a `WGController` interface, enablin
 
 | Field           | Type     | Default | Description                          |
 |-----------------|----------|---------|--------------------------------------|
-| `InterfaceName` | `string` | `wg0`   | WireGuard network interface name     |
+| `InterfaceName` | `string` | `plexd0`   | WireGuard network interface name     |
 | `ListenPort`    | `int`    | `51820` | UDP listen port                      |
 | `MTU`           | `int`    | `0`     | Interface MTU (0 = system default)   |
 
@@ -25,7 +25,7 @@ All OS-level WireGuard operations go through a `WGController` interface, enablin
 cfg := wireguard.Config{
     ListenPort: 51821,
 }
-cfg.ApplyDefaults() // sets InterfaceName to "wg0", ListenPort stays 51821
+cfg.ApplyDefaults() // sets InterfaceName to "plexd0", ListenPort stays 51821
 if err := cfg.Validate(); err != nil {
     log.Fatal(err) // rejects port <=0 or >65535, negative MTU
 }

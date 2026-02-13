@@ -12,8 +12,8 @@ func TestConfig_Defaults(t *testing.T) {
 	if !cfg.Enabled {
 		t.Error("Enabled = false, want true")
 	}
-	if cfg.CollectInterval != 30*time.Second {
-		t.Errorf("CollectInterval = %v, want %v", cfg.CollectInterval, 30*time.Second)
+	if cfg.CollectInterval != 15*time.Second {
+		t.Errorf("CollectInterval = %v, want %v", cfg.CollectInterval, 15*time.Second)
 	}
 	if cfg.ReportInterval != 60*time.Second {
 		t.Errorf("ReportInterval = %v, want %v", cfg.ReportInterval, 60*time.Second)

@@ -23,7 +23,7 @@ StartLimitIntervalSec=60
 [Service]
 Type=simple
 ExecStart=%s up --config %s
-Restart=on-failure
+Restart=always
 RestartSec=5s
 LimitNOFILE=65536
 EnvironmentFile=-%s

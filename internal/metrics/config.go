@@ -7,7 +7,7 @@ import (
 )
 
 // DefaultCollectInterval is the default interval between metric collection cycles.
-const DefaultCollectInterval = 30 * time.Second
+const DefaultCollectInterval = 15 * time.Second
 
 // DefaultReportInterval is the default interval between reporting metrics to the control plane.
 const DefaultReportInterval = 60 * time.Second

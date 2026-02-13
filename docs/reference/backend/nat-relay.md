@@ -284,7 +284,7 @@ mgr := bridge.NewManager(ctrl, bridge.Config{
 }, logger)
 
 // Setup bridge routing
-mgr.Setup("wg0")
+mgr.Setup("plexd0")
 
 // Start relay UDP listener
 mgr.StartRelay(ctx)

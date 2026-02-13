@@ -43,8 +43,8 @@ func TestManager_Setup(t *testing.T) {
 	if len(ci) != 1 {
 		t.Fatalf("expected 1 CreateInterface call, got %d", len(ci))
 	}
-	if ci[0].Args[0] != "wg0" {
-		t.Errorf("CreateInterface iface = %v, want wg0", ci[0].Args[0])
+	if ci[0].Args[0] != "plexd0" {
+		t.Errorf("CreateInterface iface = %v, want plexd0", ci[0].Args[0])
 	}
 
 	// Verify ConfigureAddress was called with /32 suffix.
@@ -143,8 +143,8 @@ func TestManager_Teardown(t *testing.T) {
 	if len(di) != 1 {
 		t.Fatalf("expected 1 DeleteInterface call, got %d", len(di))
 	}
-	if di[0].Args[0] != "wg0" {
-		t.Errorf("DeleteInterface iface = %v, want wg0", di[0].Args[0])
+	if di[0].Args[0] != "plexd0" {
+		t.Errorf("DeleteInterface iface = %v, want plexd0", di[0].Args[0])
 	}
 }
 
@@ -228,8 +228,8 @@ func TestManager_RemovePeer(t *testing.T) {
 	if len(rp) != 1 {
 		t.Fatalf("expected 1 RemovePeer call, got %d", len(rp))
 	}
-	if rp[0].Args[0] != "wg0" {
-		t.Errorf("RemovePeer iface = %v, want wg0", rp[0].Args[0])
+	if rp[0].Args[0] != "plexd0" {
+		t.Errorf("RemovePeer iface = %v, want plexd0", rp[0].Args[0])
 	}
 	gotKey, ok := rp[0].Args[1].([]byte)
 	if !ok {

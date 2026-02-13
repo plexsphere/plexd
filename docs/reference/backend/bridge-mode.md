@@ -20,7 +20,7 @@ Mesh Peers
 ┌──────────────┐     ┌───────────┐     ┌──────────────────┐
 │  WireGuard   │────▶│  Bridge   │────▶│  Access-Side     │
 │  Interface   │     │  Manager  │     │  Interface       │
-│  (wg0)       │     └─────┬─────┘     │  (eth1)          │
+│  (plexd0)    │     └─────┬─────┘     │  (eth1)          │
 └──────────────┘           │           └────────┬─────────┘
                            │                    │
                     ┌──────┴───────┐             ▼
@@ -130,7 +130,7 @@ mgr := bridge.NewManager(ctrl, bridge.Config{
 }, logger)
 
 // Setup bridge routing
-if err := mgr.Setup("wg0"); err != nil {
+if err := mgr.Setup("plexd0"); err != nil {
     log.Fatal(err)
 }
 
@@ -265,7 +265,7 @@ The bridge reconcile handler plugs into `internal/reconcile` alongside the WireG
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
-r.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, nodeID, meshIP, "wg0"))
+r.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, nodeID, meshIP, "plexd0"))
 r.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
 ```
 

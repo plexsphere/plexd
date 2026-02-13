@@ -47,7 +47,7 @@ Produces a complete systemd unit file. Calls `cfg.ApplyDefaults()` before genera
 |             | `StartLimitIntervalSec`  | `60`                                     | Crash loop protection window (seconds)       |
 | `[Service]` | `Type`                   | `simple`                                 | Process type                                 |
 |             | `ExecStart`              | `{BinaryPath} up --config {ConfigDir}/config.yaml` | Start command                   |
-|             | `Restart`                | `on-failure`                             | Restart on non-zero exit                     |
+|             | `Restart`                | `always`                                 | Restart unconditionally                      |
 |             | `RestartSec`             | `5s`                                     | Delay between restarts                       |
 |             | `LimitNOFILE`            | `65536`                                  | File descriptor limit for WireGuard tunnels  |
 |             | `EnvironmentFile`        | `-{ConfigDir}/environment`               | Optional environment file (dash = optional)  |

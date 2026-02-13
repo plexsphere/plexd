@@ -8,7 +8,7 @@ StartLimitIntervalSec=60
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/plexd up --config /etc/plexd/config.yaml
-Restart=on-failure
+Restart=always
 RestartSec=5s
 LimitNOFILE=65536
 EnvironmentFile=-/etc/plexd/environment

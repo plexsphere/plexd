@@ -23,7 +23,7 @@ Public Internet Clients
 |  +-------------------+         +-------------------+           |
 |  |  TCP Listeners    |  proxy  |  Mesh WireGuard   |           |
 |  |  (per ingress     |-------->|  Interface        |           |
-|  |   rule)           |         |  (wg0)            |           |
+|  |   rule)           |         |  (plexd0)         |           |
 |  |  :8080, :443, ... |         |                   |           |
 |  +-------------------+         +---------+---------+           |
 |         ^                                |                     |
@@ -374,7 +374,7 @@ The ingress reconcile handler plugs into `internal/reconcile` alongside existing
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
-r.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, nodeID, meshIP, "wg0"))
+r.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, nodeID, meshIP, "plexd0"))
 r.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
 r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))

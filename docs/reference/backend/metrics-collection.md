@@ -18,12 +18,12 @@ The `Manager` runs two independent ticker loops in a single goroutine: one for c
 | Field             | Type            | Default | Description                                          |
 |-------------------|-----------------|---------|------------------------------------------------------|
 | `Enabled`         | `bool`          | `true`  | Whether metrics collection is active                 |
-| `CollectInterval` | `time.Duration` | `30s`   | Interval between collection cycles (min 5s)          |
+| `CollectInterval` | `time.Duration` | `15s`   | Interval between collection cycles (min 5s)          |
 | `ReportInterval`  | `time.Duration` | `60s`   | Interval between reporting to control plane (min 10s)|
 
 ```go
 cfg := metrics.Config{}
-cfg.ApplyDefaults() // Enabled=true, CollectInterval=30s, ReportInterval=60s
+cfg.ApplyDefaults() // Enabled=true, CollectInterval=15s, ReportInterval=60s
 if err := cfg.Validate(); err != nil {
     log.Fatal(err)
 }
