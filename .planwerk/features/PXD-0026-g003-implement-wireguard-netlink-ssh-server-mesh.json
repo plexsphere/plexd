@@ -1,0 +1,580 @@
+{
+  "feature_id": "PXD-0026",
+  "title": "G003: Implement WireGuard netlink, SSH server, mesh net",
+  "slug": "g003-implement-wireguard-netlink-ssh-server-mesh",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 🏗️ large\n**Category:** backend\n**Priority:** critical\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nImplement production networking layer replacing interface-only abstractions:\n\n**WireGuard Netlink Controller:** Concrete `WGController` implementation using `golang.zx2c4.com/wireguard/wgctrl` library. Create/delete `plexd0` interface, set private key, add/remove peers with PSK, configure allowed IPs and endpoints. Integrate with existing `Manager` logic in `internal/wireguard/`.\n\n**Real STUN Client:** UDP STUN binding implementation hitting `stun.l.google.com:19302` and `stun.cloudflare.com:3478` for NAT discovery. Replace mock `STUNClient` with production implementation used by `Discoverer`.\n\n**SSH Server:** `golang.org/x/crypto/ssh` based server with JWT authentication callback, Ed25519 host key generation, 30-minute idle timeout, maximum 10 concurrent sessions. Replaces current TCP bidirectional copy in `internal/tunnel/`.\n\n**K8s API Proxy:** Reverse proxy for Kubernetes API access through the secure SSH tunnel, enabling remote cluster management.\n\n**Rationale:** WireGuard controller is the core of mesh networking - without it, no peer-to-peer encrypted tunnels can be established. The SSH server provides the secure remote access channel that all management operations depend on. The STUN client is required for NAT traversal in real network environments. K8s API proxy enables the key use case of remote Kubernetes cluster management.\n\n**Affected Areas:**\n- internal/wireguard/controller_linux.go\n- internal/wireguard/stun.go\n- internal/tunnel/ssh_server.go\n- internal/tunnel/k8s_proxy.go\n- go.mod",
+  "stories": [
+    {
+      "title": "Node establishes WireGuard mesh tunnels via netlink controller",
+      "role": "node agent",
+      "want": "to create and manage WireGuard interfaces and peers using the kernel netlink API via wgctrl",
+      "so_that": "encrypted peer-to-peer mesh tunnels are established without shelling out to external commands",
+      "criteria": [
+        "WGController implementation creates plexd0 interface with private key and listen port via wgctrl",
+        "WGController deletes plexd0 interface idempotently (deleting non-existent interface returns nil)",
+        "AddPeer configures a peer with public key, PSK, endpoint, allowed IPs, and persistent keepalive via netlink",
+        "RemovePeer removes a peer by public key from the interface",
+        "ConfigureAddress assigns the mesh IP address to the interface",
+        "SetInterfaceUp brings the interface up via netlink",
+        "SetMTU configures the interface MTU",
+        "All operations integrate with existing Manager without changes to the Manager itself"
+      ]
+    },
+    {
+      "title": "Node discovers its public endpoint via real STUN binding",
+      "role": "node agent",
+      "want": "to perform UDP STUN binding requests to discover the node's public IP and port mapping",
+      "so_that": "peers behind NAT can establish direct WireGuard connections",
+      "criteria": [
+        "UDPSTUNClient sends STUN Binding Request over UDP to configurable STUN servers",
+        "UDPSTUNClient parses XOR-MAPPED-ADDRESS from the response to extract public IP:port",
+        "STUN requests respect context cancellation and the configured per-server timeout",
+        "UDPSTUNClient implements the existing STUNClient interface (Bind method)",
+        "Default STUN servers are stun.l.google.com:19302 and stun.cloudflare.com:3478 (already configured in nat.Config)",
+        "Integration with existing Discoverer requires no changes to Discoverer"
+      ]
+    },
+    {
+      "title": "Operator accesses node securely via SSH tunnel",
+      "role": "platform operator",
+      "want": "to establish an SSH session to a managed node through the encrypted mesh",
+      "so_that": "I can manage nodes without exposing SSH ports to the public internet",
+      "criteria": [
+        "SSH server listens on the mesh IP with Ed25519 host key",
+        "SSH server authenticates clients via JWT token verification in the SSH auth callback",
+        "SSH server enforces a 30-minute idle timeout and disconnects idle sessions",
+        "SSH server limits concurrent sessions to MaxSessions (default 10)",
+        "SSH server supports direct-tcpip channel forwarding for TCP port forwarding",
+        "Host key is generated at startup using crypto/ed25519 and persisted for session continuity",
+        "SSH server integrates with existing tunnel.SessionManager lifecycle (start/stop/shutdown)"
+      ]
+    },
+    {
+      "title": "Operator accesses Kubernetes API through SSH tunnel",
+      "role": "platform operator",
+      "want": "to proxy Kubernetes API requests through the secure SSH tunnel",
+      "so_that": "I can manage remote Kubernetes clusters without direct API server exposure",
+      "criteria": [
+        "K8s API proxy is a net/http/httputil.ReverseProxy configured with the target K8s API server address",
+        "Proxy forwards requests over the SSH tunnel's direct-tcpip channel to the K8s API server",
+        "Proxy sets appropriate headers (X-Forwarded-For, Host) for correct API server routing",
+        "Proxy handles TLS to the K8s API server (using in-cluster CA or configured CA bundle)",
+        "Proxy integrates as an SSH subsystem or channel handler within the SSH server"
+      ]
+    },
+    {
+      "title": "System handles WireGuard controller errors gracefully",
+      "role": "node agent",
+      "want": "to log and propagate errors from WireGuard netlink operations",
+      "so_that": "operator can diagnose interface creation failures, permission issues, and kernel module unavailability",
+      "criteria": [
+        "CreateInterface returns a descriptive error when WireGuard kernel module is not loaded",
+        "CreateInterface returns a descriptive error when insufficient permissions (non-root)",
+        "AddPeer returns error for invalid public key length (not 32 bytes)",
+        "All error messages follow the 'wireguard: context: detail' pattern from existing conventions",
+        "Errors from netlink operations are wrapped with fmt.Errorf for stack context"
+      ]
+    },
+    {
+      "title": "System handles SSH server authentication failures",
+      "role": "system",
+      "want": "to reject unauthorized SSH connections with clear error logging",
+      "so_that": "only authenticated operators can access nodes and attack attempts are auditable",
+      "criteria": [
+        "SSH auth callback rejects connections with invalid or expired JWT tokens",
+        "SSH auth callback rejects connections with unsupported auth methods (only public-key accepted)",
+        "Failed authentication attempts are logged with source IP and reason",
+        "SSH server does not expose internal error details to unauthenticated clients"
+      ]
+    },
+    {
+      "title": "System handles STUN client network failures gracefully",
+      "role": "node agent",
+      "want": "to handle STUN server unreachability, timeouts, and malformed responses",
+      "so_that": "NAT discovery degrades gracefully when network conditions are poor",
+      "criteria": [
+        "UDPSTUNClient returns error when UDP dial fails (DNS resolution, network unreachable)",
+        "UDPSTUNClient returns error when response is not received within configured timeout",
+        "UDPSTUNClient returns error when response has invalid magic cookie or wrong transaction ID",
+        "Discoverer's existing retry-across-servers logic works with real UDP client (no changes to Discoverer)"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL implement WGController using golang.zx2c4.com/wireguard/wgctrl for all WireGuard netlink operations",
+      "priority": "SHALL",
+      "rationale": "wgctrl provides a stable, well-tested Go interface to the WireGuard kernel module, avoiding unsafe command execution",
+      "scenarios": [
+        {
+          "name": "Interface created successfully",
+          "when": "CreateInterface is called with a valid name, 32-byte private key, and listen port",
+          "then": "a WireGuard interface is created via netlink with the specified private key and listen port",
+          "and_then": [
+            "the interface exists in the kernel network namespace"
+          ]
+        },
+        {
+          "name": "Interface creation fails without WireGuard module",
+          "when": "CreateInterface is called on a system without the WireGuard kernel module",
+          "then": "an error is returned wrapping the underlying netlink/wgctrl error",
+          "and_then": [
+            "no partial state is left in the kernel"
+          ]
+        },
+        {
+          "name": "Peer added with all fields",
+          "when": "AddPeer is called with public key, PSK, endpoint, allowed IPs, and keepalive",
+          "then": "the peer is configured on the WireGuard interface with all specified parameters",
+          "and_then": [
+            "wgctrl's ConfigureDevice is called with ReplaceAllowedIPs=true"
+          ]
+        },
+        {
+          "name": "Interface deletion is idempotent",
+          "when": "DeleteInterface is called for a non-existent interface",
+          "then": "nil is returned without error",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The system SHALL use Linux netlink (rtnetlink) for interface address assignment and link state management",
+      "priority": "SHALL",
+      "rationale": "ConfigureAddress and SetInterfaceUp require rtnetlink operations that wgctrl does not cover; using netlink directly avoids ip command dependency",
+      "scenarios": [
+        {
+          "name": "Address assigned to interface",
+          "when": "ConfigureAddress is called with interface name and CIDR address",
+          "then": "the address is assigned to the interface via rtnetlink addr add",
+          "and_then": [
+            "address is visible via netlink addr list"
+          ]
+        },
+        {
+          "name": "Interface brought up",
+          "when": "SetInterfaceUp is called with interface name",
+          "then": "the interface link state is set to UP via rtnetlink link set",
+          "and_then": [
+            "interface is operational"
+          ]
+        },
+        {
+          "name": "MTU configured on interface",
+          "when": "SetMTU is called with a valid MTU value",
+          "then": "the interface MTU is set via rtnetlink link set",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The system SHALL implement STUNClient using raw UDP sockets for STUN Binding Requests",
+      "priority": "SHALL",
+      "rationale": "A real UDP STUN client is required for production NAT traversal; the existing STUN message building/parsing functions are already implemented and tested",
+      "scenarios": [
+        {
+          "name": "Successful STUN binding",
+          "when": "Bind is called with a reachable STUN server address and local port",
+          "then": "a STUN Binding Request is sent and the XOR-MAPPED-ADDRESS from the response is returned as MappedAddress",
+          "and_then": [
+            "the transaction ID in the response matches the request"
+          ]
+        },
+        {
+          "name": "STUN server unreachable",
+          "when": "Bind is called with an unreachable server address",
+          "then": "an error is returned after the configured timeout",
+          "and_then": [
+            "the UDP connection is closed"
+          ]
+        },
+        {
+          "name": "Context cancellation during STUN request",
+          "when": "the context is cancelled while waiting for a STUN response",
+          "then": "the Bind call returns with the context error",
+          "and_then": [
+            "the UDP connection is closed"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The system SHALL implement an SSH server using golang.org/x/crypto/ssh with Ed25519 host keys",
+      "priority": "SHALL",
+      "rationale": "SSH provides a secure, authenticated channel for remote access that replaces the current plain TCP bidirectional copy in tunnel/session.go",
+      "scenarios": [
+        {
+          "name": "SSH server accepts authenticated connection",
+          "when": "a client connects with a valid JWT token presented via public-key auth",
+          "then": "the SSH handshake succeeds and a session is established",
+          "and_then": [
+            "the session is counted against MaxSessions"
+          ]
+        },
+        {
+          "name": "SSH server rejects invalid token",
+          "when": "a client connects with an invalid or expired JWT token",
+          "then": "the SSH handshake is rejected with auth failure",
+          "and_then": [
+            "the rejection is logged with client IP"
+          ]
+        },
+        {
+          "name": "SSH server enforces idle timeout",
+          "when": "a session has no activity for 30 minutes",
+          "then": "the session is disconnected and removed from active sessions",
+          "and_then": [
+            "the session close is reported via TunnelReporter"
+          ]
+        },
+        {
+          "name": "SSH server enforces max concurrent sessions",
+          "when": "MaxSessions connections are already active and a new connection arrives",
+          "then": "the new connection is rejected",
+          "and_then": [
+            "existing sessions are unaffected"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The SSH server SHALL support direct-tcpip channel requests for TCP port forwarding",
+      "priority": "SHALL",
+      "rationale": "direct-tcpip channels enable the K8s API proxy and general TCP forwarding through the SSH tunnel",
+      "scenarios": [
+        {
+          "name": "Direct-tcpip channel to allowed target",
+          "when": "an authenticated client requests a direct-tcpip channel to an allowed host:port",
+          "then": "the SSH server establishes a TCP connection to the target and proxies data bidirectionally",
+          "and_then": [
+            "data flows in both directions until either side closes"
+          ]
+        },
+        {
+          "name": "Direct-tcpip channel to unreachable target",
+          "when": "an authenticated client requests a direct-tcpip channel to an unreachable host:port",
+          "then": "the channel open request is rejected with SSH_OPEN_CONNECT_FAILED",
+          "and_then": [
+            "the SSH session itself remains active"
+          ]
+        },
+        {
+          "name": "Direct-tcpip channel cleanup on disconnect",
+          "when": "the SSH session is closed while a direct-tcpip channel is active",
+          "then": "all active channels are closed and their TCP connections terminated",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The system SHALL implement a Kubernetes API reverse proxy that operates through the SSH tunnel",
+      "priority": "SHALL",
+      "rationale": "Enables remote Kubernetes cluster management through the secure SSH tunnel without direct API server exposure",
+      "scenarios": [
+        {
+          "name": "Proxy forwards API request to K8s API server",
+          "when": "an HTTP request is received on the proxy listener",
+          "then": "the request is forwarded to the configured K8s API server address with correct headers",
+          "and_then": [
+            "the response is returned to the client"
+          ]
+        },
+        {
+          "name": "Proxy handles K8s API server unreachable",
+          "when": "the K8s API server is unreachable",
+          "then": "the proxy returns HTTP 502 Bad Gateway",
+          "and_then": [
+            "the error is logged with the target address"
+          ]
+        },
+        {
+          "name": "Proxy preserves request path and query parameters",
+          "when": "a request with path /api/v1/pods?namespace=default is proxied",
+          "then": "the forwarded request has the same path and query parameters",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The SSH server SHALL generate and persist Ed25519 host keys",
+      "priority": "SHALL",
+      "rationale": "Persistent host keys prevent SSH host key change warnings on reconnection; Ed25519 is the recommended algorithm for new deployments",
+      "scenarios": [
+        {
+          "name": "Host key generated on first startup",
+          "when": "the SSH server starts and no host key file exists in the data directory",
+          "then": "a new Ed25519 keypair is generated and saved to the data directory with 0600 permissions",
+          "and_then": [
+            "the key is used for the SSH server configuration"
+          ]
+        },
+        {
+          "name": "Host key loaded on subsequent startup",
+          "when": "the SSH server starts and a host key file exists in the data directory",
+          "then": "the existing key is loaded and used",
+          "and_then": [
+            "no new key is generated"
+          ]
+        },
+        {
+          "name": "Host key file has wrong permissions",
+          "when": "the host key file exists but has permissions more permissive than 0600",
+          "then": "a warning is logged and the key is still loaded",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The WireGuard netlink controller SHALL be Linux-only with build tag gating",
+      "priority": "SHALL",
+      "rationale": "WireGuard netlink operations are Linux-specific; build tags ensure compilation only on supported platforms and allow the interface-based mock for testing on other platforms",
+      "scenarios": [
+        {
+          "name": "Controller compiled on Linux",
+          "when": "the project is built with GOOS=linux",
+          "then": "controller_linux.go is included and provides the NetlinkController implementation",
+          "and_then": []
+        },
+        {
+          "name": "Controller not compiled on non-Linux",
+          "when": "the project is built with GOOS=darwin or GOOS=windows",
+          "then": "controller_linux.go is excluded and only the WGController interface is available",
+          "and_then": [
+            "tests using mockController continue to work on all platforms"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "All new code SHALL follow existing error message conventions and structured logging patterns",
+      "priority": "SHALL",
+      "rationale": "Consistency with existing codebase: error messages use 'package: context: detail' format; slog logging uses 'component' key",
+      "scenarios": [
+        {
+          "name": "Error message format",
+          "when": "any operation fails in the new code",
+          "then": "the error message follows 'package: context: detail' format (e.g., 'wireguard: create interface: operation not permitted')",
+          "and_then": []
+        },
+        {
+          "name": "Structured logging format",
+          "when": "any operation logs a message",
+          "then": "the log entry includes a 'component' key identifying the subsystem (e.g., 'wireguard', 'nat', 'tunnel')",
+          "and_then": []
+        },
+        {
+          "name": "Config follows ApplyDefaults/Validate pattern",
+          "when": "new Config structs are created",
+          "then": "they follow the ApplyDefaults() + Validate() pattern used by wireguard.Config, tunnel.Config, and nat.Config",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Add wgctrl and netlink dependencies to go.mod: `go get golang.zx2c4.com/wireguard/wgctrl` and `go get github.com/vishvananda/netlink` — these are required for REQ-001 and REQ-002 (internal/wireguard/controller_linux.go, go.mod)",
+    "1.2 Implement NetlinkController in internal/wireguard/controller_linux.go with build tag `//go:build linux`: CreateInterface (wgctrl.New + netlink.LinkAdd + client.ConfigureDevice), DeleteInterface (netlink.LinkDel with ENODEV→nil), ConfigureAddress (netlink.AddrAdd), SetInterfaceUp (netlink.LinkSetUp), SetMTU (netlink.LinkSetMTU), AddPeer (client.ConfigureDevice with PeerConfig→wgtypes.PeerConfig), RemovePeer (client.ConfigureDevice with Remove=true). Include tests in controller_linux_test.go with build tag. Tests that require root should use t.Skip when not root or use network namespaces. (REQ-001, REQ-002, REQ-008)",
+    "1.3 Implement UDPSTUNClient in internal/nat/udp_stun.go: struct with Timeout field, Bind method creates net.DialTimeout('udp', serverAddr), builds request via existing buildBindingRequest with crypto/rand transaction ID, writes to UDP conn, reads response with deadline from context/timeout, parses via existing parseBindingResponse. Include tests in udp_stun_test.go using a local UDP echo server that sends crafted STUN responses. (REQ-003)",
+    "2.1 Implement Ed25519 host key management in internal/tunnel/hostkey.go: GenerateHostKey generates crypto/ed25519 keypair and converts to ssh.Signer, LoadOrGenerateHostKey checks data directory for existing key file, generates if absent, persists with 0600 permissions using fsutil.WriteFileAtomic pattern from registration package. Include tests in hostkey_test.go. (REQ-007)",
+    "2.2 Implement SSH server core in internal/tunnel/ssh_server.go: SSHServer struct with ssh.ServerConfig, net.Listener, Config (MaxSessions, IdleTimeout, ListenAddr), JWTVerifier interface for auth callback. NewSSHServer constructor takes Config, host key signer, JWTVerifier, logger. Start method: listen on mesh IP, accept loop with semaphore for MaxSessions, handle each connection with ssh.NewServerConn. Auth callback: extract JWT from public key metadata, verify via JWTVerifier. Idle timeout via connection deadline reset on activity. Include tests in ssh_server_test.go with a mock JWTVerifier and real SSH client connections using golang.org/x/crypto/ssh client. (REQ-004, REQ-007)",
+    "2.3 Implement direct-tcpip channel handler in internal/tunnel/ssh_channels.go: handleDirectTCPIP function parses ssh.Request payload for target host:port, dials target via net.DialContext, bidirectional io.Copy between channel and TCP connection (same pattern as existing session.go forward method). Channel rejection returns SSH_OPEN_CONNECT_FAILED on dial error. Include tests in ssh_channels_test.go. (REQ-005)",
+    "2.4 Implement K8s API reverse proxy in internal/tunnel/k8s_proxy.go: K8sProxy struct wrapping httputil.ReverseProxy with target URL. NewK8sProxy takes target URL string, optional TLS config for K8s API CA. Director function rewrites request URL to target, sets X-Forwarded-For and Host headers. ErrorHandler returns 502 on backend failures. Include tests in k8s_proxy_test.go using httptest.NewServer as mock K8s API server. (REQ-006)",
+    "3.1 Integrate SSH server with SessionManager lifecycle in internal/tunnel/ssh_server.go: SSHServer.Shutdown gracefully closes listener and all active connections. Wire into SessionManager or alongside it — SSH server is started when tunneling is enabled. Update tunnel.Config if needed to include SSH-specific fields (SSHListenAddr, HostKeyDir). Ensure Shutdown ordering: close SSH listener first, then drain active sessions. Include integration test in ssh_server_integration_test.go. (REQ-004, REQ-005)",
+    "3.2 Integration test: full SSH tunnel lifecycle in internal/tunnel/ssh_server_integration_test.go — start SSH server with generated host key and mock JWT verifier, connect real SSH client, open direct-tcpip channel to local echo server, verify bidirectional data flow, disconnect, verify session cleanup and goroutine leak check via goleak. (REQ-004, REQ-005)",
+    "3.3 Integration test: K8s proxy through SSH tunnel in internal/tunnel/k8s_proxy_integration_test.go — start SSH server, connect SSH client, open direct-tcpip channel to K8s proxy listener, send HTTP request through the channel, verify response from mock K8s API server. (REQ-005, REQ-006)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/wireguard/controller_linux_test.go",
+      "test_function": "TestNetlinkController_ImplementsInterface",
+      "story": "Node establishes WireGuard mesh tunnels via netlink controller",
+      "expected": "NetlinkController should satisfy the WGController interface at compile time",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/wireguard/controller_linux_test.go",
+      "test_function": "TestNetlinkController_CreateInterface",
+      "story": "Node establishes WireGuard mesh tunnels via netlink controller",
+      "expected": "CreateInterface should create a WireGuard interface via wgctrl (requires root/netns or mock)",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/wireguard/controller_linux_test.go",
+      "test_function": "TestNetlinkController_DeleteInterface_Idempotent",
+      "story": "System handles WireGuard controller errors gracefully",
+      "expected": "DeleteInterface on non-existent interface should return nil",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/wireguard/controller_linux_test.go",
+      "test_function": "TestNetlinkController_AddPeer_AllFields",
+      "story": "Node establishes WireGuard mesh tunnels via netlink controller",
+      "expected": "AddPeer should configure peer with public key, PSK, endpoint, allowed IPs",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/wireguard/controller_linux_test.go",
+      "test_function": "TestNetlinkController_RemovePeer",
+      "story": "Node establishes WireGuard mesh tunnels via netlink controller",
+      "expected": "RemovePeer should remove a peer by public key from the interface",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/nat/udp_stun_test.go",
+      "test_function": "TestUDPSTUNClient_BindSuccess",
+      "story": "Node discovers its public endpoint via real STUN binding",
+      "expected": "Bind should send STUN request over UDP and parse the response into MappedAddress",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/nat/udp_stun_test.go",
+      "test_function": "TestUDPSTUNClient_ContextCancellation",
+      "story": "System handles STUN client network failures gracefully",
+      "expected": "Bind should return context error when context is cancelled during UDP wait",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/nat/udp_stun_test.go",
+      "test_function": "TestUDPSTUNClient_Timeout",
+      "story": "System handles STUN client network failures gracefully",
+      "expected": "Bind should return error after configured timeout when server does not respond",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/nat/udp_stun_test.go",
+      "test_function": "TestUDPSTUNClient_InvalidResponse",
+      "story": "System handles STUN client network failures gracefully",
+      "expected": "Bind should return error when response has wrong magic cookie or transaction ID",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/tunnel/ssh_server_test.go",
+      "test_function": "TestSSHServer_AcceptsAuthenticatedConnection",
+      "story": "Operator accesses node securely via SSH tunnel",
+      "expected": "SSH server should accept connections with valid JWT token via public-key auth callback",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/tunnel/ssh_server_test.go",
+      "test_function": "TestSSHServer_RejectsInvalidToken",
+      "story": "System handles SSH server authentication failures",
+      "expected": "SSH server should reject connections with invalid JWT token",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/tunnel/ssh_server_test.go",
+      "test_function": "TestSSHServer_EnforcesMaxSessions",
+      "story": "Operator accesses node securely via SSH tunnel",
+      "expected": "SSH server should reject new connections when MaxSessions is reached",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/tunnel/ssh_server_test.go",
+      "test_function": "TestSSHServer_IdleTimeout",
+      "story": "Operator accesses node securely via SSH tunnel",
+      "expected": "SSH server should disconnect sessions with no activity for 30 minutes",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/tunnel/ssh_server_test.go",
+      "test_function": "TestSSHServer_DirectTCPIP",
+      "story": "Operator accesses node securely via SSH tunnel",
+      "expected": "SSH server should handle direct-tcpip channel requests for TCP forwarding",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/tunnel/ssh_server_test.go",
+      "test_function": "TestSSHServer_HostKeyGeneration",
+      "story": "Operator accesses node securely via SSH tunnel",
+      "expected": "SSH server should generate and persist Ed25519 host key on first startup",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/tunnel/ssh_server_test.go",
+      "test_function": "TestSSHServer_HostKeyPersistence",
+      "story": "Operator accesses node securely via SSH tunnel",
+      "expected": "SSH server should load existing host key on subsequent startups",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/tunnel/k8s_proxy_test.go",
+      "test_function": "TestK8sProxy_ForwardsRequest",
+      "story": "Operator accesses Kubernetes API through SSH tunnel",
+      "expected": "Proxy should forward HTTP requests to the target K8s API server and return responses",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/tunnel/k8s_proxy_test.go",
+      "test_function": "TestK8sProxy_HandlesUnreachableTarget",
+      "story": "Operator accesses Kubernetes API through SSH tunnel",
+      "expected": "Proxy should return 502 when K8s API server is unreachable",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/tunnel/k8s_proxy_test.go",
+      "test_function": "TestK8sProxy_PreservesPathAndQuery",
+      "story": "Operator accesses Kubernetes API through SSH tunnel",
+      "expected": "Proxy should preserve request path and query parameters in forwarded requests",
+      "requirement_id": "REQ-006"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-009) have corresponding passing tests",
+    "NetlinkController satisfies the WGController interface at compile time (var _ WGController = (*NetlinkController)(nil))",
+    "UDPSTUNClient satisfies the STUNClient interface at compile time",
+    "SSH server tests use real golang.org/x/crypto/ssh client connections, not mocked SSH protocol",
+    "controller_linux.go uses //go:build linux tag; tests with t.Skip for non-root execution",
+    "All error messages follow 'package: context: detail' convention matching existing codebase",
+    "All slog calls include 'component' key matching existing logging conventions",
+    "No changes to existing Manager, Discoverer, or SessionManager — new code provides implementations of existing interfaces",
+    "go.mod updated with correct dependency versions; go.sum updated via go mod tidy",
+    "goleak.VerifyTestMain used in all test packages with goroutine-spawning code",
+    "Config structs follow ApplyDefaults() + Validate() pattern",
+    "All tests pass with -race flag"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **NetlinkController** implements the existing WGController interface defined in controller.go. The Manager already accepts WGController — no Manager changes needed. Use wgctrl.New() for WireGuard-specific operations and vishvananda/netlink for rtnetlink operations (addr, link up, MTU). Linux-only via build tag.\n\n2. **UDPSTUNClient** implements the existing STUNClient interface defined in stun.go. The Discoverer already accepts STUNClient — no Discoverer changes needed. Reuse existing buildBindingRequest and parseBindingResponse functions. Use net.DialTimeout for UDP connections with context-aware deadlines.\n\n3. **SSH Server** is a new component in the tunnel package. It listens on the mesh IP and authenticates via JWT tokens presented through SSH public-key auth (the 'public key' payload carries the JWT). Uses golang.org/x/crypto/ssh which is already in go.mod. Host keys use Ed25519 via crypto/ed25519 standard library.\n\n4. **K8s Proxy** is a thin wrapper around httputil.ReverseProxy. It listens locally and forwards requests to the K8s API server. The proxy is accessed through the SSH tunnel's direct-tcpip channel forwarding — the operator connects SSH, then uses the SSH channel to reach the proxy.\n\n5. **Dependency additions**: golang.zx2c4.com/wireguard/wgctrl (WireGuard control), github.com/vishvananda/netlink (rtnetlink operations). golang.org/x/crypto is already present for SSH.\n\nKey files to create:\n- internal/wireguard/controller_linux.go — NetlinkController implementing WGController\n- internal/nat/udp_stun.go — UDPSTUNClient implementing STUNClient  \n- internal/tunnel/ssh_server.go — SSHServer with JWT auth\n- internal/tunnel/ssh_channels.go — direct-tcpip channel handling\n- internal/tunnel/hostkey.go — Ed25519 host key generation/persistence\n- internal/tunnel/k8s_proxy.go — K8s API reverse proxy\n\nKey patterns to follow:\n- internal/wireguard/mock_controller_test.go — mockController pattern for test doubles\n- internal/nat/mock_stun_test.go — mockSTUNClient pattern for test doubles\n- internal/tunnel/session.go — bidirectional forwarding pattern (io.Copy, sync.Once cleanup)\n- internal/registration/identity.go — file persistence pattern (fsutil.WriteFileAtomic, 0600 perms)\n- internal/tunnel/config.go — Config struct with ApplyDefaults/Validate pattern\n\nRisks:\n- NetlinkController tests require root privileges or network namespaces for real kernel operations — use t.Skip pattern\n- wgctrl dependency may pull in cgo; prefer wireguard-go/wgctrl-go pure Go variant\n- SSH idle timeout implementation needs careful goroutine management to avoid leaks\n- JWT verification interface design must align with control plane token format (define interface, defer implementation)",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T20:05:02.789912"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T21:34:57.307832"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T21:38:56.337203"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "d3fc50b2-5853-435d-81b0-630a79b5c47f",
+      "timestamp": "2026-02-13T21:38:56.337261",
+      "total_duration": 234.34061574935913,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 234.34061574935913,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
