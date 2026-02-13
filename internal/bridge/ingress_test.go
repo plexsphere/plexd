@@ -125,7 +125,7 @@ func TestIngressManager_AddRule_StartsListener(t *testing.T) {
 	}
 
 	// Cleanup.
-	mgr.Teardown()
+	_ = mgr.Teardown()
 }
 
 func TestIngressManager_AddRule_DuplicateRejects(t *testing.T) {
@@ -165,7 +165,7 @@ func TestIngressManager_AddRule_DuplicateRejects(t *testing.T) {
 	}
 
 	// Cleanup.
-	mgr.Teardown()
+	_ = mgr.Teardown()
 }
 
 func TestIngressManager_AddRule_MaxRulesReject(t *testing.T) {
@@ -214,7 +214,7 @@ func TestIngressManager_AddRule_MaxRulesReject(t *testing.T) {
 	}
 
 	// Cleanup.
-	mgr.Teardown()
+	_ = mgr.Teardown()
 }
 
 func TestIngressManager_RemoveRule_StopsListener(t *testing.T) {
@@ -479,7 +479,7 @@ func TestIngressManager_IngressStatus_Active(t *testing.T) {
 	}
 
 	// Cleanup.
-	mgr.Teardown()
+	_ = mgr.Teardown()
 }
 
 func TestIngressManager_IngressStatus_Inactive(t *testing.T) {
@@ -631,7 +631,7 @@ func TestIngressManager_AddRule_TLSTerminate_ValidCert(t *testing.T) {
 	}
 
 	// Cleanup.
-	mgr.Teardown()
+	_ = mgr.Teardown()
 }
 
 func TestIngressManager_AddRule_InactiveRejects(t *testing.T) {
@@ -708,7 +708,7 @@ func TestIngressManager_GetRule(t *testing.T) {
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	rule := api.IngressRule{
 		RuleID:     "rule-get",

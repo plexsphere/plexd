@@ -231,7 +231,7 @@ func TestSiteToSiteIntegration_ReconcileDrift(t *testing.T) {
 	<-done
 
 	// Clean up.
-	mgr.Teardown()
+	_ = mgr.Teardown()
 }
 
 // TestSiteToSiteIntegration_ConcurrentAccess exercises concurrent SSE events
@@ -360,7 +360,7 @@ func TestSiteToSiteIntegration_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Clean up.
-	mgr.Teardown()
+	_ = mgr.Teardown()
 
 	// Test passes if no race detected. Verify some activity occurred.
 	if n := fetcher.getFetchCount(); n < 2 {

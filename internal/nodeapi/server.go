@@ -128,7 +128,7 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		syncer.Run(syncCtx)
+		_ = syncer.Run(syncCtx)
 	}()
 
 	// Unix socket serve goroutine.
@@ -160,9 +160,9 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
 	defer shutdownCancel()
 
-	unixServer.Shutdown(shutdownCtx)
+	_ = unixServer.Shutdown(shutdownCtx)
 	if tcpServer != nil {
-		tcpServer.Shutdown(shutdownCtx)
+		_ = tcpServer.Shutdown(shutdownCtx)
 	}
 
 	// Stop syncer.

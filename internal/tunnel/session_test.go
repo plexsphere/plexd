@@ -26,7 +26,7 @@ func startEchoServer(t *testing.T) string {
 			}
 			go func() {
 				defer conn.Close()
-				io.Copy(conn, conn)
+				_, _ = io.Copy(conn, conn)
 			}()
 		}
 	}()
@@ -78,7 +78,7 @@ func TestSession_ForwardBidirectional(t *testing.T) {
 	}
 
 	buf := make([]byte, len(msg))
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		t.Fatalf("ReadFull() error: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestSession_DialFailureClosesClient(t *testing.T) {
 	defer conn.Close()
 
 	// The session should close the client connection when dial to target fails.
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 1)
 	_, err = conn.Read(buf)
 	if err == nil {
@@ -143,7 +143,7 @@ func TestSession_SingleConnection(t *testing.T) {
 	if _, err := conn1.Write([]byte("x")); err != nil {
 		t.Fatalf("Write() first connection error: %v", err)
 	}
-	conn1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn1.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn1, buf); err != nil {
 		t.Fatalf("ReadFull() first connection error: %v", err)
@@ -156,7 +156,7 @@ func TestSession_SingleConnection(t *testing.T) {
 	}
 	defer conn2.Close()
 
-	conn2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn2.SetReadDeadline(time.Now().Add(2 * time.Second))
 	_, err = conn2.Read(make([]byte, 1))
 	if err == nil {
 		t.Fatal("expected second connection to be closed, but read succeeded")
@@ -226,7 +226,7 @@ func TestSession_DialRespectsContextCancellation(t *testing.T) {
 	cancel()
 
 	// The client connection should be closed because DialContext failed.
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	_, err = conn.Read(make([]byte, 1))
 	if err == nil {
 		t.Fatal("expected read error after context cancellation during dial")

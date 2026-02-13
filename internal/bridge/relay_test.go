@@ -29,7 +29,7 @@ func startTestRelay(t *testing.T, maxSessions int, sessionTTL time.Duration) *Re
 	if err := relay.Start(ctx); err != nil {
 		t.Fatalf("start relay: %v", err)
 	}
-	t.Cleanup(func() { relay.Stop() })
+	t.Cleanup(func() { _ = relay.Stop() })
 	return relay
 }
 
@@ -59,7 +59,7 @@ func TestRelaySession_ForwardAtoB(t *testing.T) {
 	}
 
 	buf := make([]byte, 1024)
-	peerB.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = peerB.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, _, err := peerB.ReadFromUDP(buf)
 	if err != nil {
 		t.Fatalf("read: %v", err)
@@ -95,7 +95,7 @@ func TestRelaySession_ForwardBtoA(t *testing.T) {
 	}
 
 	buf := make([]byte, 1024)
-	peerA.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = peerA.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, _, err := peerA.ReadFromUDP(buf)
 	if err != nil {
 		t.Fatalf("read: %v", err)
@@ -131,14 +131,14 @@ func TestRelaySession_DropUnknownSource(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	peerA.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_ = peerA.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	buf := make([]byte, 1024)
 	_, _, err = peerA.ReadFromUDP(buf)
 	if err == nil {
 		t.Error("peer A should not receive packet from unknown source")
 	}
 
-	peerB.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_ = peerB.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	_, _, err = peerB.ReadFromUDP(buf)
 	if err == nil {
 		t.Error("peer B should not receive packet from unknown source")

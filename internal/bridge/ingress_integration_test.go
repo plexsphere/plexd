@@ -81,7 +81,7 @@ func TestIngressIntegration_FullLifecycle(t *testing.T) {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
-				io.Copy(c, c)
+				_, _ = io.Copy(c, c)
 			}(conn)
 		}
 	}()
@@ -110,7 +110,7 @@ func TestIngressIntegration_FullLifecycle(t *testing.T) {
 	}
 	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	msg := []byte("hello")
 	if _, err := conn.Write(msg); err != nil {
@@ -238,7 +238,7 @@ func TestIngressIntegration_ReconcileDrift(t *testing.T) {
 	<-done
 
 	// Clean up any remaining listeners/goroutines.
-	mgr.Teardown()
+	_ = mgr.Teardown()
 }
 
 // TestIngressIntegration_ConcurrentAccess exercises concurrent SSE events
@@ -361,7 +361,7 @@ func TestIngressIntegration_ConcurrentAccess(t *testing.T) {
 	<-done
 
 	// Clean up any remaining listeners/goroutines.
-	mgr.Teardown()
+	_ = mgr.Teardown()
 
 	// Test passes if no race detected. Verify some activity occurred.
 	if n := fetcher.getFetchCount(); n < 2 {

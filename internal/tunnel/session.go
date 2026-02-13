@@ -131,13 +131,13 @@ func (s *Session) forward(ctx context.Context, clientConn net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		io.Copy(targetConn, clientConn)
+		_, _ = io.Copy(targetConn, clientConn)
 		cleanup()
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(clientConn, targetConn)
+		_, _ = io.Copy(clientConn, targetConn)
 		cleanup()
 	}()
 

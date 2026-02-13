@@ -198,7 +198,7 @@ func TestTokenResolver_FileReadError(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		os.Chmod(tokenFile, 0o600) // restore so TempDir cleanup works
+		_ = os.Chmod(tokenFile, 0o600) // restore so TempDir cleanup works
 	})
 
 	cfg := &Config{

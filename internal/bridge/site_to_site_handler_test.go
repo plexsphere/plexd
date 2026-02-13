@@ -129,7 +129,7 @@ func TestHandleSiteToSiteTunnelAssigned(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	handler := HandleSiteToSiteTunnelAssigned(mgr, discardLogger())
 
@@ -163,7 +163,7 @@ func TestHandleSiteToSiteTunnelAssigned_MalformedPayload(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	handler := HandleSiteToSiteTunnelAssigned(mgr, discardLogger())
 
@@ -187,7 +187,7 @@ func TestHandleSiteToSiteTunnelRevoked(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	// Add a tunnel first.
 	tunnel := testTunnel("tun-revoke")
@@ -215,7 +215,7 @@ func TestHandleSiteToSiteTunnelRevoked_NonExistent(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	handler := HandleSiteToSiteTunnelRevoked(mgr, discardLogger())
 
@@ -231,7 +231,7 @@ func TestHandleSiteToSiteTunnelRevoked_MalformedPayload(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	handler := HandleSiteToSiteTunnelRevoked(mgr, discardLogger())
 
@@ -255,7 +255,7 @@ func TestSiteToSiteReconcileHandler_NilConfig(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	handler := SiteToSiteReconcileHandler(mgr, discardLogger())
 
@@ -279,7 +279,7 @@ func TestSiteToSiteReconcileHandler_AddsNewTunnels(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	handler := SiteToSiteReconcileHandler(mgr, discardLogger())
 
@@ -314,7 +314,7 @@ func TestSiteToSiteReconcileHandler_RemovesStaleTunnels(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	// Pre-populate with two tunnels.
 	if err := mgr.AddTunnel(testTunnel("tun-1")); err != nil {
@@ -363,7 +363,7 @@ func TestSiteToSiteReconcileHandler_DetectsChangedTunnels(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	// Pre-populate with a tunnel.
 	original := testTunnel("tun-1")
@@ -415,7 +415,7 @@ func TestSiteToSiteReconcileHandler_UnchangedTunnelsUntouched(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	// Pre-populate with a tunnel.
 	tunnel := testTunnel("tun-1")
@@ -454,7 +454,7 @@ func TestSiteToSiteReconcileHandler_Mixed(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	// Pre-populate with two tunnels.
 	if err := mgr.AddTunnel(testTunnel("tun-keep")); err != nil {

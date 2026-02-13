@@ -31,7 +31,7 @@ func (h *imdsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		w.Write([]byte(h.sessionToken))
+		_, _ = w.Write([]byte(h.sessionToken))
 
 	case r.Method == http.MethodGet && r.URL.Path == h.tokenPath:
 		h.getCalled = true
@@ -40,7 +40,7 @@ func (h *imdsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		w.Write([]byte(h.bootstrapToken))
+		_, _ = w.Write([]byte(h.bootstrapToken))
 
 	default:
 		http.NotFound(w, r)
@@ -166,7 +166,7 @@ func TestIMDSProvider_ReadToken_EmptyBody(t *testing.T) {
 
 func TestIMDSProvider_ReadToken_ContextCanceled(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("token"))
+		_, _ = w.Write([]byte("token"))
 	}))
 	defer srv.Close()
 
@@ -256,7 +256,7 @@ func TestTokenResolver_FromIMDSProvider(t *testing.T) {
 
 func TestTokenResolver_IMDSProvider_DirectValueTakesPriority(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("imds-token"))
+		_, _ = w.Write([]byte("imds-token"))
 	}))
 	defer srv.Close()
 

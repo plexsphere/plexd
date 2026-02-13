@@ -235,7 +235,7 @@ func TestHTTPTokenReviewClient_Review(t *testing.T) {
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 
@@ -276,7 +276,7 @@ func TestHTTPTokenReviewClient_Review(t *testing.T) {
 func TestHTTPTokenReviewClient_Review_APIError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("internal error"))
+		_, _ = w.Write([]byte("internal error"))
 	}))
 	defer server.Close()
 
@@ -314,7 +314,7 @@ func TestHTTPTokenReviewClient_Review_MissingTokenFile(t *testing.T) {
 func TestHTTPTokenReviewClient_Review_MalformedJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte("not valid json at all"))
+		_, _ = w.Write([]byte("not valid json at all"))
 	}))
 	defer server.Close()
 
@@ -348,7 +348,7 @@ func TestHTTPTokenReviewClient_Review_APIErrorField(t *testing.T) {
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
 

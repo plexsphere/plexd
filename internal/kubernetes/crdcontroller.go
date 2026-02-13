@@ -57,7 +57,9 @@ func (c *CRDController) Start(ctx context.Context) error {
 		return fmt.Errorf("kubernetes: crd: start: %w", err)
 	}
 
+	c.mu.Lock()
 	ctx, c.cancel = context.WithCancel(ctx)
+	c.mu.Unlock()
 
 	watchCh, err := c.client.WatchNodeState(ctx, c.namespace, c.resourceName)
 	if err != nil {
@@ -85,8 +87,11 @@ func (c *CRDController) Start(ctx context.Context) error {
 
 // Stop cancels the status watch and returns.
 func (c *CRDController) Stop() {
-	if c.cancel != nil {
-		c.cancel()
+	c.mu.Lock()
+	cancel := c.cancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 

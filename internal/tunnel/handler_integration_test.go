@@ -99,7 +99,7 @@ func TestIntegration_FullTunnelLifecycle(t *testing.T) {
 	}
 
 	buf := make([]byte, len(msg))
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		t.Fatalf("ReadFull() error: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestIntegration_SessionRevocationDuringActiveConnection(t *testing.T) {
 	if _, err := conn.Write([]byte("x")); err != nil {
 		t.Fatalf("Write() error: %v", err)
 	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	oneByte := make([]byte, 1)
 	if _, err := io.ReadFull(conn, oneByte); err != nil {
 		t.Fatalf("ReadFull() error: %v", err)
@@ -184,7 +184,7 @@ func TestIntegration_SessionRevocationDuringActiveConnection(t *testing.T) {
 	}
 
 	// The client connection should be terminated — reads should fail.
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	_, err = conn.Read(make([]byte, 1))
 	if err == nil {
 		t.Error("expected read error on revoked connection, got nil")

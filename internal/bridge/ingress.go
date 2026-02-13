@@ -277,13 +277,13 @@ func (m *IngressManager) proxyConnection(ctx context.Context, rule api.IngressRu
 	clientToTarget := make(chan struct{})
 	go func() {
 		defer close(clientToTarget)
-		io.Copy(targetConn, clientConn)
+		_, _ = io.Copy(targetConn, clientConn)
 	}()
 
 	targetToClient := make(chan struct{})
 	go func() {
 		defer close(targetToClient)
-		io.Copy(clientConn, targetConn)
+		_, _ = io.Copy(clientConn, targetConn)
 	}()
 
 	// When context is cancelled or either copy finishes, close both sides.

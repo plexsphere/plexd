@@ -46,7 +46,7 @@ func TestRelayIntegration_FullFlow(t *testing.T) {
 	}
 
 	buf := make([]byte, 1024)
-	peerB.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = peerB.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, _, err := peerB.ReadFromUDP(buf)
 	if err != nil {
 		t.Fatalf("peerB read: %v", err)
@@ -61,7 +61,7 @@ func TestRelayIntegration_FullFlow(t *testing.T) {
 		t.Fatalf("peerB write: %v", err)
 	}
 
-	peerA.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = peerA.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, _, err = peerA.ReadFromUDP(buf)
 	if err != nil {
 		t.Fatalf("peerA read: %v", err)
@@ -85,7 +85,7 @@ func TestRelayIntegration_FullFlow(t *testing.T) {
 	if _, err := peerA.WriteToUDP([]byte("dropped"), relayAddr); err != nil {
 		t.Fatalf("peerA write after remove: %v", err)
 	}
-	peerB.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_ = peerB.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	_, _, err = peerB.ReadFromUDP(buf)
 	if err == nil {
 		t.Error("peerB should not receive packet after session removal")
@@ -247,7 +247,7 @@ func TestRelayIntegration_ConcurrentNoRace(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			msg := []byte(fmt.Sprintf("data-%d", idx))
-			peers[idx].a.WriteToUDP(msg, relayAddr)
+			_, _ = peers[idx].a.WriteToUDP(msg, relayAddr)
 		}(i)
 
 		// Remove odd-numbered sessions concurrently with forwarding.

@@ -616,7 +616,7 @@ func TestServer_EndToEndFlow(t *testing.T) {
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	var meta map[string]string
-	json.Unmarshal(body, &meta)
+	_ = json.Unmarshal(body, &meta)
 	if meta["region"] != "eu-west-1" {
 		t.Errorf("metadata[region] = %q, want %q", meta["region"], "eu-west-1")
 	}
@@ -637,7 +637,7 @@ func TestServer_EndToEndFlow(t *testing.T) {
 	}
 
 	var createdReport ReportEntry
-	json.Unmarshal(body, &createdReport)
+	_ = json.Unmarshal(body, &createdReport)
 	if createdReport.Version != 1 {
 		t.Errorf("report version = %d, want 1", createdReport.Version)
 	}
@@ -655,7 +655,7 @@ func TestServer_EndToEndFlow(t *testing.T) {
 	}
 
 	var gotReport ReportEntry
-	json.Unmarshal(body, &gotReport)
+	_ = json.Unmarshal(body, &gotReport)
 	if gotReport.Key != "health" || gotReport.Version != 1 {
 		t.Errorf("GET report = %+v, want key=health version=1", gotReport)
 	}
@@ -773,7 +773,7 @@ func TestServer_SecretProxy(t *testing.T) {
 	}
 
 	var secretResp map[string]any
-	json.Unmarshal(body, &secretResp)
+	_ = json.Unmarshal(body, &secretResp)
 	if secretResp["key"] != "db-password" {
 		t.Errorf("secret key = %v, want db-password", secretResp["key"])
 	}
@@ -878,7 +878,7 @@ func TestServer_CacheUpdateFromEvents(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	var meta map[string]string
-	json.Unmarshal(body, &meta)
+	_ = json.Unmarshal(body, &meta)
 	if meta["env"] != "production" {
 		t.Errorf("metadata[env] = %q, want %q", meta["env"], "production")
 	}
@@ -895,7 +895,7 @@ func TestServer_CacheUpdateFromEvents(t *testing.T) {
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	var metaKey map[string]string
-	json.Unmarshal(body, &metaKey)
+	_ = json.Unmarshal(body, &metaKey)
 	if metaKey["value"] != "production" {
 		t.Errorf("metadata/env value = %q, want %q", metaKey["value"], "production")
 	}
@@ -909,7 +909,7 @@ func TestServer_CacheUpdateFromEvents(t *testing.T) {
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	var dataKeys []dataKeySummary
-	json.Unmarshal(body, &dataKeys)
+	_ = json.Unmarshal(body, &dataKeys)
 	if len(dataKeys) != 2 {
 		t.Errorf("data entries count = %d, want 2", len(dataKeys))
 	}
@@ -926,7 +926,7 @@ func TestServer_CacheUpdateFromEvents(t *testing.T) {
 		t.Fatalf("GET data/wireguard.conf status = %d, want 200", resp.StatusCode)
 	}
 	var dataEntry api.DataEntry
-	json.Unmarshal(body, &dataEntry)
+	_ = json.Unmarshal(body, &dataEntry)
 	if dataEntry.Key != "wireguard.conf" {
 		t.Errorf("data entry key = %q, want %q", dataEntry.Key, "wireguard.conf")
 	}
@@ -943,7 +943,7 @@ func TestServer_CacheUpdateFromEvents(t *testing.T) {
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	var secretKeys []secretKeySummary
-	json.Unmarshal(body, &secretKeys)
+	_ = json.Unmarshal(body, &secretKeys)
 	if len(secretKeys) != 2 {
 		t.Errorf("secret keys count = %d, want 2", len(secretKeys))
 	}
@@ -968,7 +968,7 @@ func TestServer_CacheUpdateFromEvents(t *testing.T) {
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	var summary StateSummary
-	json.Unmarshal(body, &summary)
+	_ = json.Unmarshal(body, &summary)
 	if len(summary.Metadata) != 2 {
 		t.Errorf("summary metadata count = %d, want 2", len(summary.Metadata))
 	}

@@ -120,7 +120,7 @@ func TestHandleIngressConfigUpdated_MalformedPayload(t *testing.T) {
 func TestHandleIngressRuleAssigned(t *testing.T) {
 	ctrl := &mockIngressController{}
 	mgr := newTestIngressManager(t, ctrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	handler := HandleIngressRuleAssigned(mgr, discardLogger())
 
@@ -158,7 +158,7 @@ func TestHandleIngressRuleAssigned(t *testing.T) {
 func TestHandleIngressRuleAssigned_MalformedPayload(t *testing.T) {
 	ctrl := &mockIngressController{}
 	mgr := newTestIngressManager(t, ctrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	handler := HandleIngressRuleAssigned(mgr, discardLogger())
 
@@ -181,7 +181,7 @@ func TestHandleIngressRuleAssigned_MalformedPayload(t *testing.T) {
 func TestHandleIngressRuleRevoked(t *testing.T) {
 	ctrl := &mockIngressController{}
 	mgr := newTestIngressManager(t, ctrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	// Add a rule first.
 	rule := api.IngressRule{
@@ -213,7 +213,7 @@ func TestHandleIngressRuleRevoked(t *testing.T) {
 func TestHandleIngressRuleRevoked_MalformedPayload(t *testing.T) {
 	ctrl := &mockIngressController{}
 	mgr := newTestIngressManager(t, ctrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	handler := HandleIngressRuleRevoked(mgr, discardLogger())
 
@@ -236,7 +236,7 @@ func TestHandleIngressRuleRevoked_MalformedPayload(t *testing.T) {
 func TestIngressReconcileHandler_NilConfig(t *testing.T) {
 	ctrl := &mockIngressController{}
 	mgr := newTestIngressManager(t, ctrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	handler := IngressReconcileHandler(mgr, discardLogger())
 
@@ -259,7 +259,7 @@ func TestIngressReconcileHandler_NilConfig(t *testing.T) {
 func TestIngressReconcileHandler_AddsNewRules(t *testing.T) {
 	ctrl := &mockIngressController{}
 	mgr := newTestIngressManager(t, ctrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	handler := IngressReconcileHandler(mgr, discardLogger())
 
@@ -293,7 +293,7 @@ func TestIngressReconcileHandler_AddsNewRules(t *testing.T) {
 func TestIngressReconcileHandler_RemovesStaleRules(t *testing.T) {
 	ctrl := &mockIngressController{}
 	mgr := newTestIngressManager(t, ctrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	// Pre-populate with two rules.
 	if err := mgr.AddRule(api.IngressRule{RuleID: "rule-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"}); err != nil {
@@ -340,7 +340,7 @@ func TestIngressReconcileHandler_RemovesStaleRules(t *testing.T) {
 func TestIngressReconcileHandler_DetectsChangedRules(t *testing.T) {
 	ctrl := &mockIngressController{}
 	mgr := newTestIngressManager(t, ctrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	// Pre-populate with a rule targeting port 8080.
 	original := api.IngressRule{RuleID: "rule-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"}
@@ -389,7 +389,7 @@ func TestIngressReconcileHandler_DetectsChangedRules(t *testing.T) {
 func TestIngressReconcileHandler_UnchangedRulesUntouched(t *testing.T) {
 	ctrl := &mockIngressController{}
 	mgr := newTestIngressManager(t, ctrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	// Pre-populate with a rule.
 	rule := api.IngressRule{RuleID: "rule-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"}
@@ -426,7 +426,7 @@ func TestIngressReconcileHandler_UnchangedRulesUntouched(t *testing.T) {
 func TestIngressReconcileHandler_Mixed(t *testing.T) {
 	ctrl := &mockIngressController{}
 	mgr := newTestIngressManager(t, ctrl)
-	defer mgr.Teardown()
+	defer func() { _ = mgr.Teardown() }()
 
 	// Pre-populate with two rules.
 	if err := mgr.AddRule(api.IngressRule{RuleID: "rule-keep", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"}); err != nil {
