@@ -52,19 +52,6 @@ func (m *mockSTUNClient) Bind(ctx context.Context, serverAddr string, localPort 
 	return MappedAddress{}, defaultErr
 }
 
-// callsFor returns all recorded calls for the given server address.
-func (m *mockSTUNClient) callsFor(serverAddr string) []mockBindCall {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var result []mockBindCall
-	for _, c := range m.calls {
-		if c.ServerAddr == serverAddr {
-			result = append(result, c)
-		}
-	}
-	return result
-}
-
 // allCalls returns all recorded Bind calls.
 func (m *mockSTUNClient) allCalls() []mockBindCall {
 	m.mu.Lock()

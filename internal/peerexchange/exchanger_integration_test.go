@@ -46,12 +46,6 @@ func (s *sequenceSTUNClient) Bind(ctx context.Context, serverAddr string, localP
 	return r.Addr, r.Err
 }
 
-func (s *sequenceSTUNClient) totalCalls() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.calls
-}
-
 // trackingWGController is a mock WGController that records AddPeer calls
 // and supports optional per-call errors.
 type trackingWGController struct {
