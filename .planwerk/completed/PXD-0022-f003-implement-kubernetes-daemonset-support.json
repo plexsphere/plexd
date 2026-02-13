@@ -2,8 +2,8 @@
   "feature_id": "PXD-0022",
   "title": "F003: Implement Kubernetes DaemonSet support",
   "slug": "f003-implement-kubernetes-daemonset-support",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "Deploy plexd as a DaemonSet on Kubernetes clusters. Bootstrap token is injected via Kubernetes Secret. Auto-detect Kubernetes environment and enable K8s-specific features: PlexdNodeState CRD for the local node API, Kubernetes audit log collection, and integration with the cluster's networking stack.",
   "stories": [
@@ -522,18 +522,18 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/kubernetes/detect.go: KubernetesEnvironment struct with InCluster (bool), Namespace (string), NodeName (string), PodName (string). EnvironmentDetector interface with Detect() KubernetesEnvironment. DefaultDetector implementation: checks os.Getenv('KUBERNETES_SERVICE_HOST') non-empty AND os.Stat('/var/run/secrets/kubernetes.io/serviceaccount/token') succeeds; reads namespace from /var/run/secrets/kubernetes.io/serviceaccount/namespace; NodeName from NODE_NAME env; PodName from HOSTNAME env. Logs result at debug with component='kubernetes'. Create internal/kubernetes/detect_test.go: tests with mock filesystem/env injection for InCluster, NotInCluster, PartialEnvironment scenarios. (REQ-001)",
-    "1.2 Create internal/kubernetes/config.go: Config struct with Enabled (bool), Namespace (string), AuditLogPath (string), CRDEnabled (bool). DefaultAuditLogPath = /var/log/kubernetes/audit/audit.log. ApplyDefaults(env KubernetesEnvironment) sets Enabled=env.InCluster when not explicitly set, Namespace=env.Namespace when empty and enabled, AuditLogPath=DefaultAuditLogPath when empty, CRDEnabled=true when enabled. Validate() rejects empty Namespace when Enabled. Create internal/kubernetes/config_test.go with tests for all scenarios in REQ-002. (REQ-002)",
-    "1.3 Create internal/kubernetes/interfaces.go: Define KubeClient interface with methods for CRD CRUD: CreateNodeState(ctx, namespace string, state *PlexdNodeState) error, UpdateNodeStateSpec(ctx, namespace, name string, spec PlexdNodeStateSpec) error, GetNodeState(ctx, namespace, name string) (*PlexdNodeState, error), WatchNodeState(ctx, namespace, name string) (<-chan PlexdNodeStateEvent, error), CreateSecret(ctx, namespace string, secret *KubeSecret) error, UpdateSecret(ctx, namespace, name string, secret *KubeSecret) error, DeleteSecret(ctx, namespace, name string) error. Define TokenReviewClient interface with method: Review(ctx context.Context, token string) (*TokenReviewResult, error). Define PlexdNodeState, PlexdNodeStateSpec, PlexdNodeStateStatus, KubeSecret, TokenReviewResult types matching README schema. (REQ-009)",
-    "1.4 Create internal/kubernetes/auth.go: TokenReviewAuthenticator struct with TokenReviewClient and logger. Authenticate(ctx, token string) (*AuthIdentity, error) method: reject empty token, call Review, return AuthIdentity{Username, Namespace, Groups} on success, error on failure. TokenReviewMiddleware(auth *TokenReviewAuthenticator) func(http.Handler) http.Handler: extract Bearer token from Authorization header, call Authenticate, return 401 on failure, attach identity to context on success. Create internal/kubernetes/auth_test.go with mock TokenReviewClient: valid token, invalid token, API unavailable, empty token, middleware integration. (REQ-005)",
-    "2.1 Create internal/kubernetes/crdcontroller.go: CRDController struct with fields: kubeClient KubeClient, cache *nodeapi.StateCache, reportSyncer *nodeapi.ReportSyncer, nodeID, meshIP, namespace, resourceName string, logger. NewCRDController constructor. Start(ctx) error: get-or-create PlexdNodeState resource, populate spec from cache, start status watcher goroutine. UpdateMetadata(m), UpdateData(entries), UpdateSecretIndex(refs) methods that patch the CRD spec via kubeClient and manage Secrets with ownerReferences. handleStatusChange(event) detects new/changed report entries and syncs to cache + reportSyncer. Stop() cancels watcher. Create internal/kubernetes/crdcontroller_test.go with mock KubeClient: all scenarios from REQ-004 (create, update existing, metadata update, data update, secret creation/deletion with ownerRefs, status watch detection, graceful shutdown). (REQ-004, REQ-009, REQ-010)",
-    "2.2 Create internal/kubernetes/auditreader.go: K8sAuditLogReader struct implementing the auditfwd.K8sAuditReader interface. Fields: path string, offset int64, logger. ReadEvents(ctx) ([]auditfwd.K8sAuditEvent, error): open file, seek to offset, read new lines, parse JSON per line (skip malformed with debug log), detect truncation (file size < offset → reset), update offset. Create internal/kubernetes/auditreader_test.go using t.TempDir() for file operations: tests for all scenarios in REQ-006 (parse JSON lines, track position, handle rotation, missing file, malformed lines, empty file). (REQ-006)",
-    "3.1 Create deploy/kubernetes/namespace.yaml: Namespace manifest for plexd-system. Create deploy/kubernetes/crds/plexdnodestate-crd.yaml: CRD definition matching README exactly — group plexd.plexsphere.com, kind PlexdNodeState, version v1alpha1, spec/status schema, status subresource, printer columns, short name 'pns'. (REQ-003)",
-    "3.2 Create deploy/kubernetes/serviceaccount.yaml: ServiceAccount 'plexd' in plexd-system. Create deploy/kubernetes/rbac.yaml: ClusterRole for plexd SA with plexdnodestates CRUD+status, secrets CRUD, tokenreviews create. ClusterRoleBinding binding SA to role. Consumer roles: plexd-state-reader (get/list/watch plexdnodestates), plexd-state-reporter (get/patch plexdnodestates/status), plexd-secrets-reader (get secrets). No wildcard permissions. (REQ-008)",
-    "3.3 Create deploy/kubernetes/daemonset.yaml: DaemonSet manifest for plexd in plexd-system. hostNetwork: true, serviceAccountName: plexd, NET_ADMIN+NET_RAW capabilities, hostPath /var/lib/plexd (DirectoryOrCreate), hostPath /var/log/kubernetes/audit (ReadOnly), PLEXD_BOOTSTRAP_TOKEN from plexd-bootstrap Secret, PLEXD_API env var, NODE_NAME from fieldRef spec.nodeName. Match the README example plus additions for audit log mount and NODE_NAME. (REQ-007)",
-    "3.4 Create deploy/kubernetes/secret.yaml: Example Secret manifest template for plexd-bootstrap in plexd-system with placeholder token value and a comment about ESO for production. (REQ-007)",
-    "4.1 Create docs/reference/backend/kubernetes-deployment.md: Reference documentation covering: KubernetesConfig struct (all fields, types, defaults, auto-detection), KubernetesEnvironment detection logic, PlexdNodeState CRD schema (spec + status fields with types and constraints), CRDController lifecycle (Start, Update*, Stop), TokenReviewAuthenticator behavior, K8sAuditLogReader behavior (file tailing, position tracking, rotation handling), all manifest files in deploy/kubernetes/ with descriptions, RBAC roles (plexd SA role and consumer roles with permissions tables), KubeClient and TokenReviewClient interfaces. Cross-reference docs/reference/backend/nodeapi.md and docs/reference/backend/audit-forwarding.md. (REQ-011)",
-    "4.2 Create docs/how-to/backend/kubernetes-deployment.md: How-to guide covering: Prerequisites (Kubernetes 1.25+, kubectl, bootstrap token, cluster-admin for CRD), Deployment steps (kubectl create namespace plexd-system, kubectl apply CRD, kubectl apply RBAC, kubectl create secret, kubectl apply DaemonSet), Verification (kubectl get pods, kubectl get pns, kubectl logs), Workload access (applying consumer RBAC roles, reading PlexdNodeState, writing reports via status patch, accessing secrets via node-local API), Troubleshooting (CRD not found, pods CrashLoopBackOff, token issues). Cross-reference reference doc. (REQ-012)"
+    "[done] 1.1 Create internal/kubernetes/detect.go: KubernetesEnvironment struct with InCluster (bool), Namespace (string), NodeName (string), PodName (string). EnvironmentDetector interface with Detect() KubernetesEnvironment. DefaultDetector implementation: checks os.Getenv('KUBERNETES_SERVICE_HOST') non-empty AND os.Stat('/var/run/secrets/kubernetes.io/serviceaccount/token') succeeds; reads namespace from /var/run/secrets/kubernetes.io/serviceaccount/namespace; NodeName from NODE_NAME env; PodName from HOSTNAME env. Logs result at debug with component='kubernetes'. Create internal/kubernetes/detect_test.go: tests with mock filesystem/env injection for InCluster, NotInCluster, PartialEnvironment scenarios. (REQ-001)",
+    "[done] 1.2 Create internal/kubernetes/config.go: Config struct with Enabled (bool), Namespace (string), AuditLogPath (string), CRDEnabled (bool). DefaultAuditLogPath = /var/log/kubernetes/audit/audit.log. ApplyDefaults(env KubernetesEnvironment) sets Enabled=env.InCluster when not explicitly set, Namespace=env.Namespace when empty and enabled, AuditLogPath=DefaultAuditLogPath when empty, CRDEnabled=true when enabled. Validate() rejects empty Namespace when Enabled. Create internal/kubernetes/config_test.go with tests for all scenarios in REQ-002. (REQ-002)",
+    "[done] 1.3 Create internal/kubernetes/interfaces.go: Define KubeClient interface with methods for CRD CRUD: CreateNodeState(ctx, namespace string, state *PlexdNodeState) error, UpdateNodeStateSpec(ctx, namespace, name string, spec PlexdNodeStateSpec) error, GetNodeState(ctx, namespace, name string) (*PlexdNodeState, error), WatchNodeState(ctx, namespace, name string) (<-chan PlexdNodeStateEvent, error), CreateSecret(ctx, namespace string, secret *KubeSecret) error, UpdateSecret(ctx, namespace, name string, secret *KubeSecret) error, DeleteSecret(ctx, namespace, name string) error. Define TokenReviewClient interface with method: Review(ctx context.Context, token string) (*TokenReviewResult, error). Define PlexdNodeState, PlexdNodeStateSpec, PlexdNodeStateStatus, KubeSecret, TokenReviewResult types matching README schema. (REQ-009)",
+    "[done] 1.4 Create internal/kubernetes/auth.go: TokenReviewAuthenticator struct with TokenReviewClient and logger. Authenticate(ctx, token string) (*AuthIdentity, error) method: reject empty token, call Review, return AuthIdentity{Username, Namespace, Groups} on success, error on failure. TokenReviewMiddleware(auth *TokenReviewAuthenticator) func(http.Handler) http.Handler: extract Bearer token from Authorization header, call Authenticate, return 401 on failure, attach identity to context on success. Create internal/kubernetes/auth_test.go with mock TokenReviewClient: valid token, invalid token, API unavailable, empty token, middleware integration. (REQ-005)",
+    "[done] 2.1 Create internal/kubernetes/crdcontroller.go: CRDController struct with fields: kubeClient KubeClient, cache *nodeapi.StateCache, reportSyncer *nodeapi.ReportSyncer, nodeID, meshIP, namespace, resourceName string, logger. NewCRDController constructor. Start(ctx) error: get-or-create PlexdNodeState resource, populate spec from cache, start status watcher goroutine. UpdateMetadata(m), UpdateData(entries), UpdateSecretIndex(refs) methods that patch the CRD spec via kubeClient and manage Secrets with ownerReferences. handleStatusChange(event) detects new/changed report entries and syncs to cache + reportSyncer. Stop() cancels watcher. Create internal/kubernetes/crdcontroller_test.go with mock KubeClient: all scenarios from REQ-004 (create, update existing, metadata update, data update, secret creation/deletion with ownerRefs, status watch detection, graceful shutdown). (REQ-004, REQ-009, REQ-010)",
+    "[done] 2.2 Create internal/kubernetes/auditreader.go: K8sAuditLogReader struct implementing the auditfwd.K8sAuditReader interface. Fields: path string, offset int64, logger. ReadEvents(ctx) ([]auditfwd.K8sAuditEvent, error): open file, seek to offset, read new lines, parse JSON per line (skip malformed with debug log), detect truncation (file size < offset → reset), update offset. Create internal/kubernetes/auditreader_test.go using t.TempDir() for file operations: tests for all scenarios in REQ-006 (parse JSON lines, track position, handle rotation, missing file, malformed lines, empty file). (REQ-006)",
+    "[done] 3.1 Create deploy/kubernetes/namespace.yaml: Namespace manifest for plexd-system. Create deploy/kubernetes/crds/plexdnodestate-crd.yaml: CRD definition matching README exactly — group plexd.plexsphere.com, kind PlexdNodeState, version v1alpha1, spec/status schema, status subresource, printer columns, short name 'pns'. (REQ-003)",
+    "[done] 3.2 Create deploy/kubernetes/serviceaccount.yaml: ServiceAccount 'plexd' in plexd-system. Create deploy/kubernetes/rbac.yaml: ClusterRole for plexd SA with plexdnodestates CRUD+status, secrets CRUD, tokenreviews create. ClusterRoleBinding binding SA to role. Consumer roles: plexd-state-reader (get/list/watch plexdnodestates), plexd-state-reporter (get/patch plexdnodestates/status), plexd-secrets-reader (get secrets). No wildcard permissions. (REQ-008)",
+    "[done] 3.3 Create deploy/kubernetes/daemonset.yaml: DaemonSet manifest for plexd in plexd-system. hostNetwork: true, serviceAccountName: plexd, NET_ADMIN+NET_RAW capabilities, hostPath /var/lib/plexd (DirectoryOrCreate), hostPath /var/log/kubernetes/audit (ReadOnly), PLEXD_BOOTSTRAP_TOKEN from plexd-bootstrap Secret, PLEXD_API env var, NODE_NAME from fieldRef spec.nodeName. Match the README example plus additions for audit log mount and NODE_NAME. (REQ-007)",
+    "[done] 3.4 Create deploy/kubernetes/secret.yaml: Example Secret manifest template for plexd-bootstrap in plexd-system with placeholder token value and a comment about ESO for production. (REQ-007)",
+    "[done] 4.1 Create docs/reference/backend/kubernetes-deployment.md: Reference documentation covering: KubernetesConfig struct (all fields, types, defaults, auto-detection), KubernetesEnvironment detection logic, PlexdNodeState CRD schema (spec + status fields with types and constraints), CRDController lifecycle (Start, Update*, Stop), TokenReviewAuthenticator behavior, K8sAuditLogReader behavior (file tailing, position tracking, rotation handling), all manifest files in deploy/kubernetes/ with descriptions, RBAC roles (plexd SA role and consumer roles with permissions tables), KubeClient and TokenReviewClient interfaces. Cross-reference docs/reference/backend/nodeapi.md and docs/reference/backend/audit-forwarding.md. (REQ-011)",
+    "[done] 4.2 Create docs/how-to/backend/kubernetes-deployment.md: How-to guide covering: Prerequisites (Kubernetes 1.25+, kubectl, bootstrap token, cluster-admin for CRD), Deployment steps (kubectl create namespace plexd-system, kubectl apply CRD, kubectl apply RBAC, kubectl create secret, kubectl apply DaemonSet), Verification (kubectl get pods, kubectl get pns, kubectl logs), Workload access (applying consumer RBAC roles, reading PlexdNodeState, writing reports via status patch, accessing secrets via node-local API), Troubleshooting (CRD not found, pods CrashLoopBackOff, token issues). Cross-reference reference doc. (REQ-012)"
   ],
   "test_specifications": [
     {
@@ -758,6 +758,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-12T21:48:34.632112"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T11:07:24.239099"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T12:03:33.966273"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T12:03:33.981947"
     }
   },
   "execution_history": [
@@ -771,6 +783,56 @@
           "name": "prepare",
           "duration": 399.4981529712677,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "d5c91329-1ee6-4b87-81e3-6315a53b1400",
+      "timestamp": "2026-02-13T11:56:59.594358",
+      "total_duration": 2721.913439512253,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 462.38164949417114,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (2 tasks)",
+          "duration": 384.92846632003784,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (4 tasks)",
+          "duration": 86.99660015106201,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (2 tasks)",
+          "duration": 138.23948287963867,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0022] Code Review",
+          "duration": 351.4695270061493,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0022] Improvements",
+          "duration": 1062.9451186656952,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0022] Simplify",
+          "duration": 234.95259499549866,
+          "type": "simplify",
           "status": "done"
         }
       ]

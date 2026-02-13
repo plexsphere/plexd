@@ -1,0 +1,289 @@
+{
+  "feature_id": "PXD-0022",
+  "title": "F003: Implement Kubernetes DaemonSet support",
+  "date": "2026-02-13",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Core Go components (detect, config, auth, auditreader, crdcontroller, interfaces) are well-structured and follow project patterns. All tests pass (83.1% coverage). Go vet passes. However, there are significant deviations from the task specification in both Kubernetes manifests and Go implementation scope: the CRDController is simplified (missing UpdateMetadata/UpdateData/UpdateSecretIndex, status watcher, Secret management with ownerReferences), the RBAC manifest is incomplete (missing Secrets CRUD and consumer roles), the CRD lacks the status subresource, and several test_specifications are not implemented with matching function names. The code that exists is clean and correct but the feature is only partially implemented relative to the acceptance criteria.",
+  "tests_checklist": [
+    {"item": "All tests pass (go test ./internal/kubernetes/...)", "checked": true},
+    {"item": "go vet passes without errors", "checked": true},
+    {"item": "Coverage is acceptable (83.1%)", "checked": true},
+    {"item": "CRDController uses mock KubeClient (no real K8s calls)", "checked": true},
+    {"item": "TokenReviewAuthenticator uses mock TokenReviewClient", "checked": true},
+    {"item": "K8sAuditLogReader uses t.TempDir() for file operations", "checked": true},
+    {"item": "Edge cases covered (empty token, missing file, truncation, malformed JSON, nil objectRef, nil responseStatus)", "checked": true},
+    {"item": "Test function names match test_specifications", "checked": false},
+    {"item": "All test_specifications implemented", "checked": false},
+    {"item": "CRDController tests cover UpdateMetadata/UpdateData/UpdateSecretIndex per REQ-004", "checked": false},
+    {"item": "CRDController tests cover status watch detection per REQ-004", "checked": false},
+    {"item": "TokenReviewMiddleware integration test per REQ-005", "checked": false},
+    {"item": "Detect tests cover partial environment (KUBERNETES_SERVICE_HOST set but SA token missing) per REQ-001", "checked": false},
+    {"item": "Config test for empty Namespace rejection when Enabled per REQ-002", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing Config ApplyDefaults/Validate pattern", "checked": true},
+    {"item": "Uses log/slog with component field", "checked": true},
+    {"item": "Injectable interfaces (KubeClient, TokenReviewClient, EnvironmentDetector, StateProvider)", "checked": true},
+    {"item": "Stdlib-only test assertions (no testify)", "checked": true},
+    {"item": "Sentinel errors with errors.Is support", "checked": true},
+    {"item": "Functions are focused and small (all under 40 lines)", "checked": true},
+    {"item": "Clear naming throughout", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "Config has CRDEnabled field per REQ-002", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "Tokens never logged in auth.go (only username/UID logged)", "checked": true},
+    {"item": "Empty token rejected before API call", "checked": true},
+    {"item": "TLS 1.2 minimum enforced for API server communication", "checked": true},
+    {"item": "readOnlyRootFilesystem in DaemonSet", "checked": true},
+    {"item": "No hardcoded secrets in Go code or manifests", "checked": true},
+    {"item": "No wildcard RBAC permissions", "checked": true},
+    {"item": "RBAC follows least privilege", "checked": false},
+    {"item": "DaemonSet has allowPrivilegeEscalation: false", "checked": false},
+    {"item": "DaemonSet drops ALL capabilities before adding NET_ADMIN/NET_RAW", "checked": false},
+    {"item": "HTTP client has timeout configured", "checked": false}
+  ],
+  "architecture_checklist": [
+    {"item": "CRDController uses StateProvider interface (not concrete cache)", "checked": true},
+    {"item": "Clean separation: detect, config, interfaces, auth, crdcontroller, auditreader", "checked": true},
+    {"item": "No external Kubernetes client-go dependency", "checked": true},
+    {"item": "CRD sync uses ticker-based reconciliation loop", "checked": true},
+    {"item": "CRDController manages Secrets with ownerReferences per REQ-004", "checked": false},
+    {"item": "CRDController watches status subresource per REQ-004", "checked": false}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code across files", "checked": true},
+    {"item": "No unused exports", "checked": true},
+    {"item": "No over-engineering in existing code", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config.Validate rejects invalid values early", "checked": true},
+    {"item": "Empty token rejected in Authenticate before API call", "checked": true},
+    {"item": "ErrNotFound/ErrAlreadyExists used for flow control in CRDController", "checked": true},
+    {"item": "Audit reader gracefully handles missing file (nil, nil return)", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Nil objectRef handled in audit reader", "checked": true},
+    {"item": "Nil responseStatus handled in audit reader", "checked": true},
+    {"item": "File truncation detected and offset reset", "checked": true},
+    {"item": "Create-already-exists race handled in CRDController.sync", "checked": true},
+    {"item": "CA cert read failure handled gracefully (falls back to system certs)", "checked": true}
+  ],
+  "security_findings": [
+    {
+      "severity": "MEDIUM",
+      "description": "HTTP response body included in error string at auth.go:207. If the API server returns token data in error responses, it could leak into logs via the error chain.",
+      "location": "internal/kubernetes/auth.go:207",
+      "fix": "Truncate respBody to max 200 chars in the error message, or omit it entirely and log only the status code."
+    },
+    {
+      "severity": "MEDIUM",
+      "description": "DaemonSet security context is missing allowPrivilegeEscalation: false and does not drop ALL capabilities before adding NET_ADMIN/NET_RAW.",
+      "location": "deploy/kubernetes/daemonset.yaml:37-42",
+      "fix": "Add: capabilities.drop: [ALL], allowPrivilegeEscalation: false, seccompProfile.type: RuntimeDefault."
+    },
+    {
+      "severity": "LOW",
+      "description": "HTTPTokenReviewClient has no HTTP client timeout. Slow/hanging API server could block indefinitely.",
+      "location": "internal/kubernetes/auth.go:159-164",
+      "fix": "Add Timeout: 30 * time.Second to the http.Client."
+    },
+    {
+      "severity": "LOW",
+      "description": "Malformed audit log lines are logged in full at Warn level (auditreader.go:101-102). Audit log lines may contain sensitive data.",
+      "location": "internal/kubernetes/auditreader.go:101-102",
+      "fix": "Log only line length or a truncated preview instead of the full line."
+    }
+  ],
+  "architecture_findings": [
+    {
+      "severity": "CRITICAL",
+      "description": "CRDController is significantly simplified vs the task specification. Missing: UpdateMetadata(), UpdateData(), UpdateSecretIndex() methods, Secret management with ownerReferences, status watcher goroutine for workload-written reports. The controller only does periodic sync via StateProvider; it doesn't support the event-driven update model specified in REQ-004.",
+      "location": "internal/kubernetes/crdcontroller.go",
+      "fix": "Implement the missing methods: UpdateMetadata, UpdateData, UpdateSecretIndex (with Secret creation using ownerReferences), and a status watcher goroutine that detects workload-written report entries."
+    },
+    {
+      "severity": "CRITICAL",
+      "description": "KubeClient interface is simplified vs task spec. Missing: WatchNodeState, CreateSecret, UpdateSecret, DeleteSecret methods. PlexdNodeStateSpec, PlexdNodeStateStatus, KubeSecret types not defined. The interface currently only supports CRUD for PlexdNodeState.",
+      "location": "internal/kubernetes/interfaces.go",
+      "fix": "Add WatchNodeState, CreateSecret, UpdateSecret, DeleteSecret to KubeClient. Define PlexdNodeStateSpec, PlexdNodeStateStatus, KubeSecret types."
+    },
+    {
+      "severity": "CRITICAL",
+      "description": "Missing TokenReviewMiddleware HTTP middleware per task 1.4 and REQ-005. Only the authenticator is implemented; there is no middleware function that extracts Bearer token from Authorization header, calls Authenticate, and attaches identity to context.",
+      "location": "internal/kubernetes/auth.go",
+      "fix": "Add TokenReviewMiddleware(auth *TokenReviewAuthenticator) func(http.Handler) http.Handler."
+    },
+    {
+      "severity": "CRITICAL",
+      "description": "CRD manifest is missing the status subresource (subresources: status: {}). Without this, the status subresource endpoint (/status) is not available and RBAC cannot separately control spec vs status access. The CRD schema also puts 'status' as a field inside spec.properties instead of as a separate top-level section.",
+      "location": "deploy/kubernetes/namespace.yaml:26-75",
+      "fix": "Add 'subresources: status: {}' under the version. Move status-related fields out of spec.properties into a separate status.properties section."
+    },
+    {
+      "severity": "CRITICAL",
+      "description": "RBAC manifest is missing Secrets CRUD permissions per REQ-008. The plexd SA needs create/get/update/delete for secrets to manage CRD-associated secrets.",
+      "location": "deploy/kubernetes/serviceaccount.yaml:17-23",
+      "fix": "Add rule: apiGroups: [''], resources: ['secrets'], verbs: ['create', 'get', 'update', 'delete']."
+    },
+    {
+      "severity": "CRITICAL",
+      "description": "Missing consumer RBAC roles per REQ-008 and task 3.2: plexd-state-reader (get/list/watch plexdnodestates), plexd-state-reporter (get/patch plexdnodestates/status), plexd-secrets-reader (get secrets).",
+      "location": "deploy/kubernetes/serviceaccount.yaml",
+      "fix": "Add three additional ClusterRole definitions for consumer roles."
+    },
+    {
+      "severity": "MAJOR",
+      "description": "Config struct is missing CRDEnabled field per task 1.2 and REQ-002. The task specifies CRDEnabled (bool) to allow disabling CRD management independently of overall K8s enablement.",
+      "location": "internal/kubernetes/config.go:15-35",
+      "fix": "Add CRDEnabled bool field to Config, default to true in ApplyDefaults when Enabled is true."
+    },
+    {
+      "severity": "MAJOR",
+      "description": "Config.Validate() does not reject empty Namespace when Enabled is true, per task 1.2 and REQ-002 scenario 'Missing namespace when enabled rejects'.",
+      "location": "internal/kubernetes/config.go:51-65",
+      "fix": "Add validation: if Enabled && Namespace == '' return error."
+    },
+    {
+      "severity": "MAJOR",
+      "description": "Config.ApplyDefaults() does not accept a KubernetesEnvironment parameter per task 1.2. The spec says ApplyDefaults(env KubernetesEnvironment) should set Enabled=env.InCluster when not explicitly set, and Namespace=env.Namespace.",
+      "location": "internal/kubernetes/config.go:38-48",
+      "fix": "Change ApplyDefaults to accept env *KubernetesEnvironment and set Enabled and Namespace from it."
+    },
+    {
+      "severity": "MAJOR",
+      "description": "DefaultDetector.Detect() does not check for the SA token file existence per REQ-001. The spec says detection should check 'KUBERNETES_SERVICE_HOST non-empty AND os.Stat SA token file succeeds'. Currently only checks KUBERNETES_SERVICE_HOST. The 'partial environment' scenario (env var set but token missing) is not handled.",
+      "location": "internal/kubernetes/detect.go:53-67",
+      "fix": "Add os.Stat(DefaultTokenPath) check. Return nil (not in cluster) if the token file is missing."
+    },
+    {
+      "severity": "MAJOR",
+      "description": "CRD file is inside namespace.yaml instead of deploy/kubernetes/crds/plexdnodestate-crd.yaml as specified in task 3.1.",
+      "location": "deploy/kubernetes/namespace.yaml",
+      "fix": "Move CRD definition to deploy/kubernetes/crds/plexdnodestate-crd.yaml."
+    },
+    {
+      "severity": "MINOR",
+      "description": "PLEXD_API env var missing from DaemonSet per task 3.3. The spec says the DaemonSet should include PLEXD_API as an environment variable.",
+      "location": "deploy/kubernetes/daemonset.yaml:43-52",
+      "fix": "Add PLEXD_API env var (value can be a placeholder or ConfigMap reference)."
+    },
+    {
+      "severity": "MINOR",
+      "description": "Detect.go uses MY_NODE_NAME env var while REQ-001 and task 1.1 specify NODE_NAME. The DaemonSet YAML and docs are consistent with MY_NODE_NAME, but the original spec says NODE_NAME.",
+      "location": "internal/kubernetes/detect.go:64",
+      "fix": "Clarify intended env var name. The implementation is self-consistent with MY_NODE_NAME."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "C2-01",
+      "severity": "critical",
+      "check": "C2",
+      "description": "CRDController missing UpdateMetadata/UpdateData/UpdateSecretIndex/status watcher per REQ-004",
+      "location": "internal/kubernetes/crdcontroller.go",
+      "fix": "Implement the missing methods and status watcher goroutine"
+    },
+    {
+      "id": "C2-02",
+      "severity": "critical",
+      "check": "C2",
+      "description": "KubeClient interface missing WatchNodeState, Secret CRUD methods per REQ-009",
+      "location": "internal/kubernetes/interfaces.go",
+      "fix": "Add missing interface methods and types"
+    },
+    {
+      "id": "C2-03",
+      "severity": "critical",
+      "check": "C2",
+      "description": "Missing TokenReviewMiddleware per REQ-005 task 1.4",
+      "location": "internal/kubernetes/auth.go",
+      "fix": "Add HTTP middleware function"
+    },
+    {
+      "id": "C2-04",
+      "severity": "critical",
+      "check": "C2",
+      "description": "CRD manifest missing status subresource per REQ-003",
+      "location": "deploy/kubernetes/namespace.yaml",
+      "fix": "Add subresources: status: {} and separate status schema"
+    },
+    {
+      "id": "C2-05",
+      "severity": "critical",
+      "check": "C2",
+      "description": "RBAC missing Secrets CRUD and consumer roles per REQ-008",
+      "location": "deploy/kubernetes/serviceaccount.yaml",
+      "fix": "Add secrets permissions and consumer role definitions"
+    },
+    {
+      "id": "C1-01",
+      "severity": "major",
+      "check": "C1",
+      "description": "Config missing CRDEnabled field and Namespace validation per REQ-002",
+      "location": "internal/kubernetes/config.go",
+      "fix": "Add CRDEnabled field, Namespace empty rejection, and env-aware ApplyDefaults"
+    },
+    {
+      "id": "C1-02",
+      "severity": "major",
+      "check": "C1",
+      "description": "DefaultDetector.Detect() does not check SA token file existence per REQ-001",
+      "location": "internal/kubernetes/detect.go:53-67",
+      "fix": "Add os.Stat(DefaultTokenPath) check before returning InCluster=true"
+    },
+    {
+      "id": "TE1-01",
+      "severity": "major",
+      "check": "TE1",
+      "description": "Test function names do not match test_specifications. Expected names like TestCRDController_Start_CreatesResource but actual is TestCRDController_SyncCreatesWhenNotFound.",
+      "location": "internal/kubernetes/crdcontroller_test.go",
+      "fix": "Rename test functions to match test_specifications or update test_specifications"
+    },
+    {
+      "id": "TE2-01",
+      "severity": "major",
+      "check": "TE2",
+      "description": "Missing tests for CRDController sync with update error path (GetNodeState succeeds but UpdateNodeState fails)",
+      "location": "internal/kubernetes/crdcontroller_test.go",
+      "fix": "Add TestCRDController_SyncHandlesUpdateError test"
+    },
+    {
+      "id": "TE3-01",
+      "severity": "major",
+      "check": "TE3",
+      "description": "Missing test for HTTPTokenReviewClient with malformed JSON response and API error field in response",
+      "location": "internal/kubernetes/auth_test.go",
+      "fix": "Add tests for JSON unmarshal failure and trResp.Status.Error != '' paths"
+    },
+    {
+      "id": "P5-01",
+      "severity": "major",
+      "check": "P5",
+      "description": "CRD file location does not match task spec: should be deploy/kubernetes/crds/plexdnodestate-crd.yaml",
+      "location": "deploy/kubernetes/namespace.yaml",
+      "fix": "Move CRD to its own file in deploy/kubernetes/crds/"
+    }
+  ],
+  "suggested_improvements": [
+    "Add HTTP client timeout (30s) to HTTPTokenReviewClient to prevent indefinite blocking",
+    "Truncate response body in error message at auth.go:207 to prevent potential token leakage",
+    "Add allowPrivilegeEscalation: false and capabilities.drop: [ALL] to DaemonSet security context",
+    "Log malformed audit lines by length rather than full content to avoid potential sensitive data exposure",
+    "Add CRD field validation constraints (minLength, pattern, minimum) to the OpenAPI schema",
+    "Consider adding seccompProfile: type: RuntimeDefault to DaemonSet pod security context"
+  ],
+  "next_steps": [
+    "Implement missing CRDController methods: UpdateMetadata, UpdateData, UpdateSecretIndex with Secret management and ownerReferences",
+    "Add status watcher goroutine to CRDController for workload-written report detection",
+    "Expand KubeClient interface with WatchNodeState, CreateSecret, UpdateSecret, DeleteSecret and associated types",
+    "Implement TokenReviewMiddleware HTTP middleware function",
+    "Add CRD status subresource and separate status schema to CRD manifest",
+    "Add Secrets CRUD permissions and consumer RBAC roles to serviceaccount.yaml",
+    "Add CRDEnabled field to Config and Namespace validation in Validate()",
+    "Add SA token file check to DefaultDetector.Detect()",
+    "Move CRD definition to deploy/kubernetes/crds/plexdnodestate-crd.yaml",
+    "Add missing test cases: CRD update error, malformed JSON response, API error field response",
+    "Rename test functions to match test_specifications or update specifications"
+  ]
+}
