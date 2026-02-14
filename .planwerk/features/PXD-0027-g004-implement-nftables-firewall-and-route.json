@@ -1,0 +1,586 @@
+{
+  "feature_id": "PXD-0027",
+  "title": "G004: Implement nftables firewall and route controller",
+  "slug": "g004-implement-nftables-firewall-and-route",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 📦 medium\n**Category:** backend\n**Priority:** high\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nImplement production policy enforcement backends:\n\n**nftables FirewallController:** Concrete implementation using `google/nftables` library. Manages nftables chains and rules with diff-based updates (add/remove only changed rules). Integrates with existing `Enforcer` in `internal/policy/firewall.go` which currently degrades gracefully when controller is nil.\n\n**RouteController:** Concrete implementation using `vishvananda/netlink` for Linux routing operations. Enable IP forwarding via sysctl, add/remove routes for mesh peers, configure NAT masquerade for bridge traffic. Implements the interface defined in `internal/bridge/route.go`.\n\n**Rationale:** Without firewall enforcement, mesh network policies defined in the control plane have no effect - any traffic flows freely between peers. Without route controller, bridge mode cannot forward traffic between networks, breaking the core site-to-site and user-access use cases.\n\n**Affected Areas:**\n- internal/policy/nftables.go\n- internal/bridge/route_linux.go\n- go.mod",
+  "stories": [
+    {
+      "title": "Mesh firewall rules are enforced via nftables",
+      "role": "node operator",
+      "want": "network policy firewall rules to be enforced at the kernel level via nftables when plexd has policy enforcement enabled",
+      "so_that": "mesh traffic between peers is restricted according to control plane policies, preventing unauthorized communication",
+      "criteria": [
+        "NftablesController creates the plexd table in nftables TableFamilyIPv4 if it does not exist",
+        "EnsureChain creates a named chain within the plexd table, idempotent on re-creation",
+        "ApplyRules flushes the chain and atomically replaces all rules matching the FirewallRule slice via conn.Flush()",
+        "Each FirewallRule with Action=allow translates to an nftables rule with VerdictAccept; Action=deny translates to VerdictDrop",
+        "Rules with Port>0 and Protocol set generate protocol-matching (L4PROTO) + destination port payload expressions",
+        "Rules with SrcIP set generate source IP payload match; DstIP generates destination IP payload match",
+        "Rules with Interface set generate interface name (MetaKeyIIFNAME) match expression",
+        "FlushChain removes all rules from the named chain without deleting the chain itself",
+        "DeleteChain deletes the named chain; idempotent when chain does not exist (returns nil)"
+      ]
+    },
+    {
+      "title": "nftables controller handles errors gracefully",
+      "role": "node operator",
+      "want": "the nftables firewall controller to return meaningful errors and degrade gracefully when nftables operations fail",
+      "so_that": "failures are logged and diagnosed without crashing the node agent",
+      "criteria": [
+        "EnsureChain returns a wrapped error with 'nftables: ensure chain:' prefix on failure",
+        "ApplyRules returns a wrapped error with 'nftables: apply rules:' prefix if conn.Flush() fails",
+        "FlushChain returns a wrapped error with 'nftables: flush chain:' prefix on failure",
+        "DeleteChain returns nil when the chain does not exist (idempotent guarantee)",
+        "All errors wrap the underlying nftables library error via fmt.Errorf with %w"
+      ]
+    },
+    {
+      "title": "Route controller manages IP forwarding and routes via netlink",
+      "role": "bridge node operator",
+      "want": "the route controller to manage IP forwarding, routes, and NAT masquerade via Linux netlink and sysctl",
+      "so_that": "bridge mode can forward traffic between mesh and access-side networks on Linux",
+      "criteria": [
+        "EnableForwarding writes '1' to /proc/sys/net/ipv4/conf/{meshIface}/forwarding and /proc/sys/net/ipv4/conf/{accessIface}/forwarding",
+        "DisableForwarding writes '0' to both sysctl paths",
+        "AddRoute adds a route for the given CIDR subnet via the given interface using netlink.RouteAdd",
+        "AddRoute is idempotent: adding an already-existing route returns nil (EEXIST is suppressed)",
+        "RemoveRoute removes the route using netlink.RouteDel; idempotent when route does not exist (ESRCH suppressed)",
+        "AddNATMasquerade creates an nftables NAT masquerade rule for outgoing traffic on the given interface",
+        "RemoveNATMasquerade removes the NAT masquerade rule; idempotent when rule does not exist"
+      ]
+    },
+    {
+      "title": "Route controller handles errors gracefully",
+      "role": "bridge node operator",
+      "want": "the route controller to return meaningful errors when Linux routing operations fail",
+      "so_that": "bridge setup failures are diagnosed and the manager's rollback logic can function correctly",
+      "criteria": [
+        "EnableForwarding returns a wrapped error with 'route: enable forwarding:' prefix on sysctl write failure",
+        "AddRoute returns a wrapped error with 'route: add route:' prefix when netlink.RouteAdd fails (excluding EEXIST)",
+        "RemoveRoute returns a wrapped error with 'route: remove route:' prefix when netlink.RouteDel fails (excluding ESRCH)",
+        "AddNATMasquerade returns a wrapped error with 'route: add nat:' prefix on failure",
+        "All errors wrap the underlying system error via fmt.Errorf with %w"
+      ]
+    },
+    {
+      "title": "Enforcer integrates with nftables controller for production policy enforcement",
+      "role": "mesh node",
+      "want": "the existing Enforcer to use the NftablesController as its FirewallController backend",
+      "so_that": "policy rules from the control plane are translated into real nftables rules at the kernel level",
+      "criteria": [
+        "NftablesController implements the FirewallController interface (EnsureChain, ApplyRules, FlushChain, DeleteChain)",
+        "NewEnforcer accepts a non-nil NftablesController and uses it for rule application",
+        "The existing Enforcer.ApplyFirewallRules flow works end-to-end: engine builds rules, NftablesController applies them",
+        "The existing Enforcer.Teardown flow works: FlushChain then DeleteChain via NftablesController"
+      ]
+    },
+    {
+      "title": "Bridge manager integrates with netlink route controller for production routing",
+      "role": "bridge node",
+      "want": "the existing bridge Manager to use the NetlinkRouteController as its RouteController backend",
+      "so_that": "bridge mode routing, forwarding, and NAT are applied to the Linux kernel for real traffic forwarding",
+      "criteria": [
+        "NetlinkRouteController implements the RouteController interface (EnableForwarding, DisableForwarding, AddRoute, RemoveRoute, AddNATMasquerade, RemoveNATMasquerade)",
+        "NewManager accepts a non-nil NetlinkRouteController and uses it for all routing operations",
+        "The existing Manager.Setup flow works end-to-end with NetlinkRouteController",
+        "The existing Manager.Teardown flow works end-to-end with NetlinkRouteController"
+      ]
+    },
+    {
+      "title": "Reference documentation covers nftables and route controller implementations",
+      "role": "developer",
+      "want": "reference documentation for the nftables FirewallController and netlink RouteController implementations",
+      "so_that": "future developers understand the production implementations, their dependencies, and operational requirements",
+      "criteria": [
+        "Documentation covers NftablesController constructor, methods, nftables table/chain naming, and required Linux capabilities",
+        "Documentation covers NetlinkRouteController constructor, methods, sysctl paths, and netlink operations",
+        "Documentation includes data flow diagrams showing how controllers integrate with Enforcer and Manager",
+        "Documentation lists required dependencies (google/nftables, vishvananda/netlink, golang.org/x/sys)"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The policy package SHALL provide an NftablesController that implements FirewallController using the google/nftables library",
+      "priority": "SHALL",
+      "rationale": "Without a concrete firewall backend, policy rules have no kernel-level enforcement and traffic flows freely between peers",
+      "scenarios": [
+        {
+          "name": "EnsureChain creates chain if absent",
+          "when": "EnsureChain is called with chain name 'plexd-mesh' and the chain does not exist",
+          "then": "the chain is created within the plexd nftables table and conn.Flush() succeeds",
+          "and_then": [
+            "subsequent EnsureChain with same name returns nil (idempotent)"
+          ]
+        },
+        {
+          "name": "ApplyRules replaces all rules atomically",
+          "when": "ApplyRules is called with a slice of FirewallRule entries",
+          "then": "the chain is flushed and new rules are added atomically via a single conn.Flush()",
+          "and_then": [
+            "each allow rule maps to VerdictAccept",
+            "each deny rule maps to VerdictDrop"
+          ]
+        },
+        {
+          "name": "DeleteChain is idempotent",
+          "when": "DeleteChain is called for a chain that does not exist",
+          "then": "nil is returned without error",
+          "and_then": [
+            "no panic or nftables error is propagated"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The NftablesController SHALL translate FirewallRule fields to correct nftables expressions for source IP, destination IP, port, protocol, interface, and action",
+      "priority": "SHALL",
+      "rationale": "Incorrect expression mapping would result in rules that don't match intended traffic, silently failing policy enforcement",
+      "scenarios": [
+        {
+          "name": "Rule with port and protocol generates correct expressions",
+          "when": "a FirewallRule has Port=443, Protocol='tcp', Action='allow'",
+          "then": "the nftables rule contains MetaKeyL4PROTO=TCP, PayloadBaseTransportHeader offset=2 with port 443, and VerdictAccept",
+          "and_then": []
+        },
+        {
+          "name": "Rule with source and destination IP generates correct payload matches",
+          "when": "a FirewallRule has SrcIP='10.0.0.1' and DstIP='10.0.0.2'",
+          "then": "the nftables rule contains PayloadBaseNetworkHeader offset=12 (src) and offset=16 (dst) with 4-byte IP comparisons",
+          "and_then": []
+        },
+        {
+          "name": "Rule with CIDR source generates prefix match",
+          "when": "a FirewallRule has SrcIP='10.0.0.0/8'",
+          "then": "the nftables rule uses a bitwise mask + comparison to match the CIDR prefix",
+          "and_then": []
+        },
+        {
+          "name": "Rule with interface generates iifname match",
+          "when": "a FirewallRule has Interface='plexd0'",
+          "then": "the nftables rule contains MetaKeyIIFNAME comparison for 'plexd0'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The NftablesController SHALL manage a dedicated 'plexd' nftables table to avoid conflicts with host firewall rules",
+      "priority": "SHALL",
+      "rationale": "Using a dedicated table prevents plexd from interfering with the host's existing iptables/nftables configuration",
+      "scenarios": [
+        {
+          "name": "Dedicated table created on first use",
+          "when": "EnsureChain is called for the first time",
+          "then": "a table named 'plexd' with TableFamilyIPv4 is created",
+          "and_then": [
+            "all chains and rules are scoped to this table"
+          ]
+        },
+        {
+          "name": "Table persists across chain operations",
+          "when": "DeleteChain removes the last chain from the table",
+          "then": "the plexd table remains",
+          "and_then": []
+        },
+        {
+          "name": "Flush does not affect other tables",
+          "when": "ApplyRules flushes and replaces rules in the plexd chain",
+          "then": "rules in other nftables tables are not affected",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The bridge package SHALL provide a NetlinkRouteController that implements RouteController using vishvananda/netlink and sysctl",
+      "priority": "SHALL",
+      "rationale": "Without a concrete route controller, bridge mode cannot forward traffic between mesh and access-side networks",
+      "scenarios": [
+        {
+          "name": "EnableForwarding enables IP forwarding for both interfaces",
+          "when": "EnableForwarding('plexd0', 'eth1') is called",
+          "then": "/proc/sys/net/ipv4/conf/plexd0/forwarding and /proc/sys/net/ipv4/conf/eth1/forwarding are set to '1'",
+          "and_then": [
+            "repeated calls return nil (idempotent)"
+          ]
+        },
+        {
+          "name": "AddRoute adds a kernel route",
+          "when": "AddRoute('192.168.1.0/24', 'eth1') is called",
+          "then": "a route for 192.168.1.0/24 via eth1 is added using netlink.RouteAdd",
+          "and_then": [
+            "AddRoute with same args returns nil (EEXIST suppressed)"
+          ]
+        },
+        {
+          "name": "RemoveRoute is idempotent",
+          "when": "RemoveRoute is called for a route that does not exist",
+          "then": "nil is returned (ESRCH suppressed)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The NetlinkRouteController SHALL manage NAT masquerade via nftables for bridge traffic",
+      "priority": "SHALL",
+      "rationale": "NAT masquerading is required for bridge mode so access-side traffic appears to originate from the bridge node",
+      "scenarios": [
+        {
+          "name": "AddNATMasquerade creates masquerade rule",
+          "when": "AddNATMasquerade('eth1') is called",
+          "then": "an nftables NAT postrouting rule with masquerade is created for interface eth1 in a dedicated plexd-nat table",
+          "and_then": []
+        },
+        {
+          "name": "RemoveNATMasquerade is idempotent",
+          "when": "RemoveNATMasquerade is called for an interface without masquerade configured",
+          "then": "nil is returned without error",
+          "and_then": []
+        },
+        {
+          "name": "NAT rule scoped to specified interface",
+          "when": "masquerade is configured for 'eth1'",
+          "then": "only traffic leaving via eth1 is masqueraded; other interfaces unaffected",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "All controller errors SHALL wrap the underlying system error and use the package-prefixed error format",
+      "priority": "SHALL",
+      "rationale": "Consistent error wrapping enables errors.Is/errors.As inspection and follows project error conventions",
+      "scenarios": [
+        {
+          "name": "NftablesController errors follow pattern",
+          "when": "any NftablesController method fails",
+          "then": "the error message follows 'nftables: <method>: <detail>' format and wraps the original error",
+          "and_then": [
+            "errors.Is(err, originalErr) returns true"
+          ]
+        },
+        {
+          "name": "NetlinkRouteController errors follow pattern",
+          "when": "any NetlinkRouteController method fails",
+          "then": "the error message follows 'route: <method>: <detail>' format and wraps the original error",
+          "and_then": [
+            "errors.Is(err, originalErr) returns true"
+          ]
+        },
+        {
+          "name": "Sysctl errors include the file path",
+          "when": "EnableForwarding fails to write to a sysctl path",
+          "then": "the error includes the sysctl file path that failed",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "Both implementations SHALL use build tags to restrict compilation to Linux only",
+      "priority": "SHALL",
+      "rationale": "nftables and netlink are Linux-specific kernel interfaces; compilation on other platforms must not fail",
+      "scenarios": [
+        {
+          "name": "Linux build tag on nftables implementation",
+          "when": "the project is built on Linux",
+          "then": "internal/policy/nftables_linux.go is compiled",
+          "and_then": [
+            "building on macOS/Windows skips the file"
+          ]
+        },
+        {
+          "name": "Linux build tag on route controller implementation",
+          "when": "the project is built on Linux",
+          "then": "internal/bridge/route_linux.go is compiled",
+          "and_then": [
+            "building on macOS/Windows skips the file"
+          ]
+        },
+        {
+          "name": "Test files use the same build tag",
+          "when": "tests are run on Linux",
+          "then": "nftables_linux_test.go and route_linux_test.go are compiled and executed",
+          "and_then": [
+            "tests are skipped on non-Linux platforms"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The go.mod SHALL include google/nftables, vishvananda/netlink, and golang.org/x/sys as dependencies",
+      "priority": "SHALL",
+      "rationale": "These are the required libraries for the production implementations",
+      "scenarios": [
+        {
+          "name": "Dependencies added to go.mod",
+          "when": "go mod tidy is run after adding the implementation files",
+          "then": "google/nftables, vishvananda/netlink, and golang.org/x/sys appear in go.mod require block",
+          "and_then": [
+            "go.sum is updated with checksums"
+          ]
+        },
+        {
+          "name": "Project builds successfully with new dependencies",
+          "when": "go build ./... is run",
+          "then": "the build succeeds without errors",
+          "and_then": []
+        },
+        {
+          "name": "Existing tests still pass",
+          "when": "go test ./... is run",
+          "then": "all existing tests pass without regression",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The NftablesController SHOULD support CIDR prefix matching for source and destination IP rules",
+      "priority": "SHOULD",
+      "rationale": "PolicyEngine.BuildFirewallRules produces wildcard rules with '0.0.0.0/0' CIDR that require prefix matching",
+      "scenarios": [
+        {
+          "name": "Single IP generates exact match",
+          "when": "a rule has SrcIP='10.0.0.1' (no CIDR notation)",
+          "then": "the nftables rule uses an exact 4-byte comparison at offset 12",
+          "and_then": []
+        },
+        {
+          "name": "CIDR generates prefix match with bitwise mask",
+          "when": "a rule has SrcIP='10.0.0.0/8'",
+          "then": "the nftables rule uses a bitwise expression with mask 255.0.0.0 followed by comparison",
+          "and_then": []
+        },
+        {
+          "name": "0.0.0.0/0 skips IP matching entirely",
+          "when": "a rule has SrcIP='0.0.0.0/0'",
+          "then": "no source IP expressions are added to the nftables rule (matches all sources)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "Reference documentation SHALL cover both production controller implementations",
+      "priority": "SHALL",
+      "rationale": "Developers need to understand the production backends, required capabilities, and integration points",
+      "scenarios": [
+        {
+          "name": "NftablesController documentation complete",
+          "when": "a developer reads docs/reference/backend/nftables-firewall.md",
+          "then": "they understand table/chain structure, rule expression mapping, required capabilities (CAP_NET_ADMIN), and integration with Enforcer",
+          "and_then": []
+        },
+        {
+          "name": "NetlinkRouteController documentation complete",
+          "when": "a developer reads docs/reference/backend/netlink-route-controller.md",
+          "then": "they understand sysctl paths, netlink route operations, NAT masquerade setup, and integration with Manager",
+          "and_then": []
+        },
+        {
+          "name": "Data flow diagrams included",
+          "when": "documentation is rendered",
+          "then": "diagrams show rule flow from PolicyEngine through NftablesController to kernel and from Manager through netlink to kernel",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Add google/nftables, vishvananda/netlink, and golang.org/x/sys dependencies to go.mod: run `go get github.com/google/nftables github.com/vishvananda/netlink golang.org/x/sys` then `go mod tidy`. Verify go build ./... succeeds. (REQ-008)",
+    "1.2 Create internal/policy/nftables_linux.go — NftablesController struct with `//go:build linux` tag. Constructor NewNftablesController(logger *slog.Logger) that creates nftables.Conn and defines the plexd table (TableFamilyIPv4, name 'plexd'). Implement EnsureChain: AddTable + AddChain (type ChainTypeFilter, hook ChainHookForward, priority ChainPriorityFilter) + Flush(). Idempotent: AddTable and AddChain are inherently idempotent in google/nftables. Implement FlushChain: conn.FlushChain on the named chain + Flush(). Implement DeleteChain: conn.DelChain + Flush(), suppressing 'not found' errors for idempotency. All errors follow 'nftables: <method>: <detail>' wrapping pattern. (REQ-001, REQ-003, REQ-006)",
+    "1.3 Implement ApplyRules in internal/policy/nftables_linux.go — Method on NftablesController. Flush the chain first (conn.FlushChain), then for each FirewallRule: build nftables expression slice using helper buildRuleExprs(rule FirewallRule) []expr.Any. Expression logic: (1) if Interface set, add MetaKeyIIFNAME + Cmp; (2) if SrcIP set and not '0.0.0.0/0', parse IP/CIDR, add PayloadBaseNetworkHeader offset=12 + Cmp or Bitwise+Cmp for CIDR; (3) if DstIP set and not '0.0.0.0/0', same at offset=16; (4) if Protocol set, add MetaKeyL4PROTO + Cmp with unix.IPPROTO_TCP or IPPROTO_UDP; (5) if Port>0, add PayloadBaseTransportHeader offset=2 len=2 + Cmp with BigEndian port; (6) add Verdict (VerdictAccept for 'allow', VerdictDrop for 'deny'). Call conn.AddRule for each. Final conn.Flush(). (REQ-002, REQ-009)",
+    "1.4 Create internal/policy/nftables_linux_test.go — Tests with `//go:build linux` tag. Use nftables.New(nftables.AsLasting()) for network-namespace-isolated testing (or skip if root unavailable). Tests: TestNftablesController_EnsureChain (create + idempotent), TestNftablesController_ApplyRules (allow+deny rules, verify via GetRules), TestNftablesController_ApplyRulesWithPortAndProtocol (Port=443 Protocol=tcp), TestNftablesController_ApplyRulesWithIPAddresses (SrcIP+DstIP), TestNftablesController_ApplyRulesWithCIDR (CIDR prefix match, 0.0.0.0/0 skip), TestNftablesController_ApplyRulesWithInterface (iifname match), TestNftablesController_FlushChain, TestNftablesController_DeleteChainIdempotent, TestNftablesController_DedicatedTable (verify table name='plexd'), TestNftablesController_ErrorWrapping. (REQ-001, REQ-002, REQ-003, REQ-006, REQ-009)",
+    "2.1 Create internal/bridge/route_linux.go — NetlinkRouteController struct with `//go:build linux` tag. Constructor NewNetlinkRouteController(logger *slog.Logger). Implement EnableForwarding(meshIface, accessIface): write '1' to /proc/sys/net/ipv4/conf/{iface}/forwarding for both interfaces via os.WriteFile. Implement DisableForwarding: write '0' to same paths. Errors follow 'route: enable forwarding: <path>: <detail>' pattern. (REQ-004, REQ-006)",
+    "2.2 Implement AddRoute and RemoveRoute in internal/bridge/route_linux.go — AddRoute: parse CIDR via net.ParseCIDR, look up interface index via netlink.LinkByName, create netlink.Route{Dst: subnet, LinkIndex: idx}, call netlink.RouteAdd. Suppress syscall.EEXIST for idempotency. RemoveRoute: same parse logic, call netlink.RouteDel, suppress syscall.ESRCH. Errors follow 'route: add route: <subnet>: <detail>' pattern. (REQ-004, REQ-006)",
+    "2.3 Implement AddNATMasquerade and RemoveNATMasquerade in internal/bridge/route_linux.go — Use google/nftables for NAT: create/reuse plexd-nat table (TableFamilyIPv4), add postrouting chain (ChainTypeNAT, ChainHookPostrouting, ChainPriorityNATSource). AddNATMasquerade: add rule matching MetaKeyOIFNAME for given interface + expr.Masq{} + Flush(). Track active masquerade rules. RemoveNATMasquerade: flush chain or delete matching rule + Flush(). Idempotent when no rule exists. (REQ-005, REQ-006)",
+    "2.4 Create internal/bridge/route_linux_test.go — Tests with `//go:build linux` tag. Test with network namespace isolation or skip if insufficient privileges. Tests: TestNetlinkRouteController_EnableForwarding, TestNetlinkRouteController_DisableForwarding, TestNetlinkRouteController_AddRoute (add + idempotent EEXIST), TestNetlinkRouteController_RemoveRouteIdempotent, TestNetlinkRouteController_AddNATMasquerade, TestNetlinkRouteController_RemoveNATMasqueradeIdempotent, TestNetlinkRouteController_ErrorWrapping, TestNetlinkRouteController_EnableForwardingError. (REQ-004, REQ-005, REQ-006)",
+    "3.1 Create docs/reference/backend/nftables-firewall.md — Reference documentation for NftablesController. Include: frontmatter (title, quadrant, package, feature), overview of nftables vs iptables, data flow diagram (PolicyEngine → Enforcer → NftablesController → kernel nftables), constructor signature and parameters, method reference table (EnsureChain, ApplyRules, FlushChain, DeleteChain with signatures and behavior), table/chain naming ('plexd' table, user-specified chain names), expression mapping table (FirewallRule field → nftables expression), required Linux capabilities (CAP_NET_ADMIN), dependency list (google/nftables, golang.org/x/sys/unix). Follow existing docs/reference/backend/network-policy.md format. (REQ-010)",
+    "3.2 Create docs/reference/backend/netlink-route-controller.md — Reference documentation for NetlinkRouteController. Include: frontmatter (title, quadrant, package, feature), overview of netlink route management, data flow diagram (Manager → NetlinkRouteController → kernel routing table / sysctl), constructor signature, method reference table (EnableForwarding, DisableForwarding, AddRoute, RemoveRoute, AddNATMasquerade, RemoveNATMasquerade with signatures, behavior, idempotency guarantees), sysctl paths table, NAT implementation details (plexd-nat table, postrouting chain), required Linux capabilities (CAP_NET_ADMIN, CAP_NET_RAW), dependency list (vishvananda/netlink, google/nftables for NAT). Follow existing docs/reference/backend/bridge-mode.md format. (REQ-010)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/policy/nftables_linux_test.go",
+      "test_function": "TestNftablesController_EnsureChain",
+      "story": "Mesh firewall rules are enforced via nftables",
+      "expected": "EnsureChain creates the plexd table and named chain; idempotent on second call",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/policy/nftables_linux_test.go",
+      "test_function": "TestNftablesController_ApplyRules",
+      "story": "Mesh firewall rules are enforced via nftables",
+      "expected": "ApplyRules flushes chain and adds rules with correct expressions for allow/deny actions",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/policy/nftables_linux_test.go",
+      "test_function": "TestNftablesController_ApplyRulesWithPortAndProtocol",
+      "story": "Mesh firewall rules are enforced via nftables",
+      "expected": "Rules with Port=443 Protocol=tcp produce L4PROTO+port expressions with VerdictAccept",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/policy/nftables_linux_test.go",
+      "test_function": "TestNftablesController_ApplyRulesWithIPAddresses",
+      "story": "Mesh firewall rules are enforced via nftables",
+      "expected": "Rules with SrcIP and DstIP produce correct IPv4 payload match expressions",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/policy/nftables_linux_test.go",
+      "test_function": "TestNftablesController_ApplyRulesWithCIDR",
+      "story": "Mesh firewall rules are enforced via nftables",
+      "expected": "Rules with CIDR SrcIP produce bitwise mask + comparison; 0.0.0.0/0 omits IP match",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/policy/nftables_linux_test.go",
+      "test_function": "TestNftablesController_ApplyRulesWithInterface",
+      "story": "Mesh firewall rules are enforced via nftables",
+      "expected": "Rules with Interface set produce MetaKeyIIFNAME match expression",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/policy/nftables_linux_test.go",
+      "test_function": "TestNftablesController_FlushChain",
+      "story": "Mesh firewall rules are enforced via nftables",
+      "expected": "FlushChain removes all rules from the chain without deleting it",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/policy/nftables_linux_test.go",
+      "test_function": "TestNftablesController_DeleteChainIdempotent",
+      "story": "nftables controller handles errors gracefully",
+      "expected": "DeleteChain on non-existent chain returns nil",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/policy/nftables_linux_test.go",
+      "test_function": "TestNftablesController_DedicatedTable",
+      "story": "Mesh firewall rules are enforced via nftables",
+      "expected": "All chains are created within the 'plexd' table, not the default filter table",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/policy/nftables_linux_test.go",
+      "test_function": "TestNftablesController_ErrorWrapping",
+      "story": "nftables controller handles errors gracefully",
+      "expected": "Errors follow 'nftables: <method>: <detail>' format and wrap underlying errors",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/route_linux_test.go",
+      "test_function": "TestNetlinkRouteController_EnableForwarding",
+      "story": "Route controller manages IP forwarding and routes via netlink",
+      "expected": "EnableForwarding writes '1' to sysctl forwarding paths for both interfaces",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/route_linux_test.go",
+      "test_function": "TestNetlinkRouteController_DisableForwarding",
+      "story": "Route controller manages IP forwarding and routes via netlink",
+      "expected": "DisableForwarding writes '0' to sysctl forwarding paths for both interfaces",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/route_linux_test.go",
+      "test_function": "TestNetlinkRouteController_AddRoute",
+      "story": "Route controller manages IP forwarding and routes via netlink",
+      "expected": "AddRoute adds a kernel route via netlink; idempotent on EEXIST",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/route_linux_test.go",
+      "test_function": "TestNetlinkRouteController_RemoveRouteIdempotent",
+      "story": "Route controller manages IP forwarding and routes via netlink",
+      "expected": "RemoveRoute returns nil when route does not exist (ESRCH suppressed)",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/route_linux_test.go",
+      "test_function": "TestNetlinkRouteController_AddNATMasquerade",
+      "story": "Route controller manages IP forwarding and routes via netlink",
+      "expected": "AddNATMasquerade creates nftables NAT postrouting masquerade rule for given interface",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/route_linux_test.go",
+      "test_function": "TestNetlinkRouteController_RemoveNATMasqueradeIdempotent",
+      "story": "Route controller manages IP forwarding and routes via netlink",
+      "expected": "RemoveNATMasquerade returns nil when masquerade is not configured",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/route_linux_test.go",
+      "test_function": "TestNetlinkRouteController_ErrorWrapping",
+      "story": "Route controller handles errors gracefully",
+      "expected": "Errors follow 'route: <method>: <detail>' format and wrap underlying errors",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/route_linux_test.go",
+      "test_function": "TestNetlinkRouteController_EnableForwardingError",
+      "story": "Route controller handles errors gracefully",
+      "expected": "EnableForwarding returns wrapped error including sysctl path on write failure",
+      "requirement_id": "REQ-006"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-008) have corresponding passing tests",
+    "NftablesController implements all 4 methods of FirewallController interface (EnsureChain, ApplyRules, FlushChain, DeleteChain)",
+    "NetlinkRouteController implements all 6 methods of RouteController interface (EnableForwarding, DisableForwarding, AddRoute, RemoveRoute, AddNATMasquerade, RemoveNATMasquerade)",
+    "All files have correct `//go:build linux` build tags and corresponding test files also have linux tags",
+    "Error messages follow project convention: 'package: context: detail' format with %w wrapping",
+    "Idempotency guarantees met: EnsureChain, DeleteChain, AddRoute (EEXIST), RemoveRoute (ESRCH), RemoveNATMasquerade",
+    "go vet ./... passes with no errors on Linux",
+    "go build ./... succeeds on Linux with new dependencies",
+    "Existing tests (go test ./...) pass without regression",
+    "Reference documentation covers NftablesController (docs/reference/backend/nftables-firewall.md) with data flow, method signatures, and capabilities",
+    "Reference documentation covers NetlinkRouteController (docs/reference/backend/netlink-route-controller.md) with sysctl paths, method signatures, and capabilities",
+    "No modifications to existing FirewallController or RouteController interfaces — implementations satisfy existing contracts",
+    "Dedicated nftables tables ('plexd' for firewall, 'plexd-nat' for NAT) prevent conflicts with host firewall"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **Dedicated nftables tables**: Both NftablesController (firewall) and NetlinkRouteController (NAT) use dedicated nftables tables ('plexd' and 'plexd-nat') to avoid conflicts with host iptables/nftables. This follows the principle of least surprise — plexd never modifies the host's existing firewall rules.\n\n2. **Atomic rule replacement**: ApplyRules uses flush-then-add-all within a single nftables transaction (conn.Flush()). This ensures the chain is never in a partial state. The alternative of diff-based updates (add/remove only changed rules) adds complexity without benefit since nftables transactions are already atomic.\n\n3. **Sysctl for IP forwarding**: IP forwarding is managed via direct sysctl writes (/proc/sys/net/ipv4/conf/{iface}/forwarding) rather than via netlink. This is the standard Linux approach and avoids the complexity of rtnetlink forwarding configuration.\n\n4. **NAT via nftables**: NAT masquerading uses nftables (not iptables-legacy) since the firewall controller already uses nftables. This avoids mixing iptables and nftables which can cause conflicts on modern kernels.\n\n5. **Build tag isolation**: All Linux-specific code uses `//go:build linux` to ensure the project compiles on non-Linux platforms (e.g., developer macOS). The interfaces remain platform-agnostic.\n\n6. **Error suppression for idempotency**: AddRoute suppresses syscall.EEXIST, RemoveRoute suppresses syscall.ESRCH, DeleteChain suppresses 'not found' errors. This matches the idempotency contracts defined in the RouteController and FirewallController interfaces.\n\n7. **No constructor injection changes**: Both implementations are concrete types that satisfy existing interfaces. They are wired at the composition root (cmd/plexd/main.go, when it exists) — no changes to Enforcer or Manager constructors needed.\n\nKey files to follow:\n- internal/wireguard/controller.go — WGController interface pattern (same abstraction approach)\n- internal/wireguard/mock_controller_test.go — mock pattern for testing\n- internal/policy/firewall.go — FirewallController interface contract\n- internal/bridge/route.go — RouteController interface contract\n- internal/policy/enforcer.go — Enforcer wiring (firewall may be nil)\n- internal/bridge/manager.go — Manager wiring (ctrl RouteController)\n\nPotential pitfalls:\n- nftables library requires CAP_NET_ADMIN; tests must either run as root or use network namespaces for isolation\n- netlink.RouteAdd/RouteDel require the interface to exist; tests must create dummy interfaces or mock at the netlink level\n- The nftables Conn is not thread-safe; NftablesController should document this and rely on the Enforcer's serial invocation pattern\n- CIDR parsing: '10.0.0.1' without /32 suffix must be handled as a single host (net.ParseCIDR requires CIDR notation, so use net.ParseIP for bare IPs)\n- NAT masquerade cleanup: RemoveNATMasquerade must handle the case where the plexd-nat table doesn't exist yet",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T20:05:02.791569"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T10:12:05.932355"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T10:16:49.216662"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "4b1581f0-5bf9-4998-ad31-88e07bfd2688",
+      "timestamp": "2026-02-14T10:16:49.216740",
+      "total_duration": 280.0476667881012,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 280.0476667881012,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
