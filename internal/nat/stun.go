@@ -93,7 +93,7 @@ func parseBindingResponse(data []byte, transactionID [12]byte) (MappedAddress, e
 	// Parse attributes.
 	attrs := data[20:]
 	if int(msgLen) > len(attrs) {
-		return MappedAddress{}, errors.New("nat: stun: attributes truncated")
+		return MappedAddress{}, errors.New("nat: stun: response body shorter than declared message length")
 	}
 	attrs = attrs[:msgLen]
 
