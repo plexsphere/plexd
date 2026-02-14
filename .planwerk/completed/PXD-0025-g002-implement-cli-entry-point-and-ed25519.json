@@ -2,8 +2,8 @@
   "feature_id": "PXD-0025",
   "title": "G002: Implement CLI entry point and Ed25519 verification",
   "slug": "g002-implement-cli-entry-point-and-ed25519",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 🏗️ large\n**Category:** backend\n**Priority:** critical\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nImplement the entire CLI entry point and core agent runtime services:\n\n**CLI (`cmd/plexd/main.go`):** Cobra-based CLI with 15+ subcommands: `up`, `join`, `status`, `peers`, `policies`, `logs`, `log-status`, `audit`, `actions`, `actions run`, `hooks list`, `hooks verify`, `hooks reload`, `state`, `state get`, `state report`, `install`, `uninstall`, `deregister`. Wire each subcommand to existing internal packages.\n\n**Ed25519 EventVerifier:** Production implementation of `EventVerifier` interface (replacing `NoOpVerifier` in `envelope.go`). Verify SSE event signatures using control plane's Ed25519 public key. Implement nonce replay protection with in-memory TTL store (5-min staleness window).\n\n**Heartbeat Service:** Background goroutine calling `ControlPlane.Heartbeat()` at 30s intervals. Detect 401 responses and trigger automatic re-registration flow.\n\n**Unix Socket Permissions:** Enforce `plexd` group for metadata/data/report socket access, `plexd-secrets` group for secrets. Implement `SO_PEERCRED` peer credential checking on Unix socket connections.\n\n**Rationale:** Without a CLI entry point, the binary cannot be built or run - this is the #1 blocker. The NoOpVerifier means SSE events are accepted without authentication, a critical security gap. Missing heartbeat service means the agent silently disconnects without recovery. Socket permissions are required for the security model's least-privilege access control.\n\n**Affected Areas:**\n- cmd/plexd/main.go\n- cmd/plexd/cmd/\n- internal/controlplane/envelope.go\n- internal/controlplane/verifier.go\n- internal/agent/heartbeat.go\n- internal/agent/socket.go",
   "stories": [
@@ -488,25 +488,25 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/api/verifier.go: implement Ed25519Verifier struct implementing EventVerifier interface. Includes canonical JSON computation (deterministic key-sorted marshal of event_type, event_id, issued_at, nonce, payload), ed25519.Verify() call using base64-decoded signature and signing public key. Add NonceStore (sync.Mutex-protected map[string]time.Time with 5-min TTL, periodic cleanup). Verify method checks: (1) non-empty signature, (2) non-empty nonce, (3) non-zero issued_at, (4) staleness < 5min, (5) nonce uniqueness, (6) Ed25519 signature. Support signing key rotation via SetKeys(current, previous ed25519.PublicKey, transitionExpires time.Time). Write tests in internal/api/verifier_test.go covering all REQ-003, REQ-004, REQ-005 scenarios. Use crypto/ed25519.GenerateKey in tests to create real key pairs. (REQ-003, REQ-004, REQ-005)",
-    "1.2 Create internal/agent/heartbeat.go: implement HeartbeatService with Config (Interval, NodeID), Run(ctx) method that sends heartbeats at configurable interval (default 30s). Define HeartbeatClient interface with Heartbeat(ctx, nodeID, req) method. Define ReconcileTrigger interface with TriggerReconcile() method. On 401 error (api.ErrUnauthorized), invoke onAuthFailure callback. On reconcile=true response, call TriggerReconcile(). On rotate_keys=true, call onRotateKeys callback. Add Config with ApplyDefaults/Validate following project conventions. Write tests in internal/agent/heartbeat_test.go with mock client, goleak.VerifyTestMain, api.Clock for deterministic timing. (REQ-006, REQ-010, REQ-011)",
-    "1.3 Create internal/agent/config.go: define top-level AgentConfig struct that embeds/references all subsystem Config structs (api.Config, registration.Config, reconcile.Config, nodeapi.Config, actions.Config, policy.Config, wireguard.Config, metrics.Config, logfwd.Config, auditfwd.Config, integrity.Config, HeartbeatConfig). Add ParseConfig(path string) function that reads YAML and populates AgentConfig. Each subsystem section maps to its Config type. Call ApplyDefaults() and Validate() on each. Write tests in internal/agent/config_test.go covering valid YAML, missing required fields, default values, and unknown fields. (REQ-008)",
-    "1.4 Create internal/nodeapi/auth_unix.go: implement SO_PEERCRED peer credential extraction for Unix sockets on Linux. Add GroupChecker interface with IsInGroup(uid, gid uint32, groupName string) bool. Add SocketPermissions helper that chowns socket file to root:plexd with 0660. Implement SecretAuthMiddleware that extracts peer credentials via unix.GetsockoptUcred, checks for root UID (0) or plexd-secrets group membership. Fallback to 0666 if plexd group doesn't exist (with warning log). Write tests in internal/nodeapi/auth_unix_test.go. (REQ-007)",
-    "2.1 Create cmd/plexd/main.go: minimal main() that calls cmd.Execute(). Set version, commit, and build date via ldflags. Create cmd/plexd/cmd/root.go: Cobra root command with PersistentFlags: --config (default /etc/plexd/config.yaml), --log-level (default info), --api (override), --mode (node/bridge). Add --version flag printing version info. Write test in cmd/plexd/cmd/root_test.go verifying help output, version flag, and unknown subcommand handling. (REQ-001)",
-    "2.2 Create cmd/plexd/cmd/up.go: `plexd up` command that wires all subsystems. Parse config, create ControlPlane client, create Registrar, register, create Ed25519Verifier (using signing key from identity), create SSEManager (with Ed25519Verifier), create HeartbeatService, create Reconciler, create NodeAPI Server, register SSE event handlers, start all services as goroutines with shared context. Handle SIGTERM/SIGINT with 30s drain timeout. Wire heartbeat 401→re-registration via callback that re-runs Registrar.Register() and updates auth token. (REQ-002)",
-    "2.3 Create cmd/plexd/cmd/join.go: `plexd join` command that performs registration only. Parse config, create ControlPlane client, create Registrar with --token-file flag support, call Register(), print node_id and mesh_ip to stdout, exit. (REQ-001)",
-    "2.4 Create cmd/plexd/cmd/install.go and cmd/plexd/cmd/uninstall.go: `plexd install` delegates to packaging.Installer.Install() with flags for --api-url, --token, --token-file. `plexd uninstall` delegates to Installer.Uninstall() with --purge flag. Both check for root privileges first. (REQ-001)",
-    "2.5 Create cmd/plexd/cmd/deregister.go: `plexd deregister` command. Parse config, load identity from disk, create ControlPlane client with auth token, call Deregister(). With --purge flag: remove data_dir, remove token file, disable systemd unit. (REQ-001)",
-    "3.1 Create cmd/plexd/cmd/status.go: `plexd status` command that connects to /var/run/plexd/api.sock via HTTP-over-Unix-socket, fetches /v1/state, and prints formatted node info. Create cmd/plexd/cmd/peers.go: `plexd peers` fetches peer list (future: wire to real endpoint). Create cmd/plexd/cmd/policies.go: `plexd policies` fetches policy list. All detect agent-not-running and print helpful error. (REQ-009)",
-    "3.2 Create cmd/plexd/cmd/state.go: `plexd state` shows summary, `plexd state get <type> <key>` fetches specific entry, `plexd state report <key> --data <json>` writes report entry. All connect via Unix socket to local node API. (REQ-001, REQ-009)",
-    "3.3 Create cmd/plexd/cmd/logs.go, cmd/plexd/cmd/audit.go: `plexd logs` streams agent logs (reads from journald or stdout fallback), `plexd log-status` shows log forwarding config, `plexd audit` shows audit collection status. (REQ-001)",
-    "3.4 Create cmd/plexd/cmd/actions.go: `plexd actions` lists available actions, `plexd actions run <name> [--param key=value]` dispatches to agent via Unix socket. Create cmd/plexd/cmd/hooks.go: `plexd hooks list` lists hooks, `plexd hooks verify` runs integrity verification, `plexd hooks reload` triggers re-scan. (REQ-001, REQ-011)",
-    "4.1 Integrate Ed25519Verifier into SSEManager: update cmd/plexd/cmd/up.go to create Ed25519Verifier with the signing_public_key from NodeIdentity, pass it to NewSSEManager instead of nil. Add SSE event handler for signing_key_rotated that calls verifier.SetKeys() with the new key and transition period. Wire the StateResponse.SigningKeys from reconcile to update the verifier's keys. (REQ-003, REQ-005)",
-    "4.2 Integrate HeartbeatService into agent lifecycle: in cmd/plexd/cmd/up.go, start HeartbeatService after registration. Wire onAuthFailure callback to trigger re-registration (Registrar.Register() again, update auth token on ControlPlane client, reconnect SSE). Wire reconcileTrigger to Reconciler.TriggerReconcile(). Wire HeartbeatRequest payload builder that collects MeshInfo, NATInfo, etc. from running subsystems. (REQ-006, REQ-010)",
-    "4.3 Integrate Unix socket permissions into nodeapi.Server: modify nodeapi/server.go Start() to call SocketPermissions helper after creating the Unix socket. Add SecretAuthMiddleware to the handler chain for /v1/state/secrets/* routes. Ensure TCP listener mode bypasses SO_PEERCRED (uses bearer token auth already). (REQ-007)",
-    "5.1 Create docs/reference/backend/cli.md: document all subcommands with usage, flags, examples, and exit codes. (REQ-009)",
-    "5.2 Create docs/reference/backend/event-verification.md: document Ed25519 verification flow, canonical JSON format, nonce replay protection, staleness window, signing key rotation. (REQ-009)",
-    "5.3 Create docs/reference/backend/heartbeat-service.md: document heartbeat interval, payload structure, response handling (reconcile, rotate_keys), 401 re-registration flow, configuration. (REQ-009)"
+    "[done] 1.1 Create internal/api/verifier.go: implement Ed25519Verifier struct implementing EventVerifier interface. Includes canonical JSON computation (deterministic key-sorted marshal of event_type, event_id, issued_at, nonce, payload), ed25519.Verify() call using base64-decoded signature and signing public key. Add NonceStore (sync.Mutex-protected map[string]time.Time with 5-min TTL, periodic cleanup). Verify method checks: (1) non-empty signature, (2) non-empty nonce, (3) non-zero issued_at, (4) staleness < 5min, (5) nonce uniqueness, (6) Ed25519 signature. Support signing key rotation via SetKeys(current, previous ed25519.PublicKey, transitionExpires time.Time). Write tests in internal/api/verifier_test.go covering all REQ-003, REQ-004, REQ-005 scenarios. Use crypto/ed25519.GenerateKey in tests to create real key pairs. (REQ-003, REQ-004, REQ-005)",
+    "[done] 1.2 Create internal/agent/heartbeat.go: implement HeartbeatService with Config (Interval, NodeID), Run(ctx) method that sends heartbeats at configurable interval (default 30s). Define HeartbeatClient interface with Heartbeat(ctx, nodeID, req) method. Define ReconcileTrigger interface with TriggerReconcile() method. On 401 error (api.ErrUnauthorized), invoke onAuthFailure callback. On reconcile=true response, call TriggerReconcile(). On rotate_keys=true, call onRotateKeys callback. Add Config with ApplyDefaults/Validate following project conventions. Write tests in internal/agent/heartbeat_test.go with mock client, goleak.VerifyTestMain, api.Clock for deterministic timing. (REQ-006, REQ-010, REQ-011)",
+    "[done] 1.3 Create internal/agent/config.go: define top-level AgentConfig struct that embeds/references all subsystem Config structs (api.Config, registration.Config, reconcile.Config, nodeapi.Config, actions.Config, policy.Config, wireguard.Config, metrics.Config, logfwd.Config, auditfwd.Config, integrity.Config, HeartbeatConfig). Add ParseConfig(path string) function that reads YAML and populates AgentConfig. Each subsystem section maps to its Config type. Call ApplyDefaults() and Validate() on each. Write tests in internal/agent/config_test.go covering valid YAML, missing required fields, default values, and unknown fields. (REQ-008)",
+    "[done] 1.4 Create internal/nodeapi/auth_unix.go: implement SO_PEERCRED peer credential extraction for Unix sockets on Linux. Add GroupChecker interface with IsInGroup(uid, gid uint32, groupName string) bool. Add SocketPermissions helper that chowns socket file to root:plexd with 0660. Implement SecretAuthMiddleware that extracts peer credentials via unix.GetsockoptUcred, checks for root UID (0) or plexd-secrets group membership. Fallback to 0666 if plexd group doesn't exist (with warning log). Write tests in internal/nodeapi/auth_unix_test.go. (REQ-007)",
+    "[done] 2.1 Create cmd/plexd/main.go: minimal main() that calls cmd.Execute(). Set version, commit, and build date via ldflags. Create cmd/plexd/cmd/root.go: Cobra root command with PersistentFlags: --config (default /etc/plexd/config.yaml), --log-level (default info), --api (override), --mode (node/bridge). Add --version flag printing version info. Write test in cmd/plexd/cmd/root_test.go verifying help output, version flag, and unknown subcommand handling. (REQ-001)",
+    "[done] 2.2 Create cmd/plexd/cmd/up.go: `plexd up` command that wires all subsystems. Parse config, create ControlPlane client, create Registrar, register, create Ed25519Verifier (using signing key from identity), create SSEManager (with Ed25519Verifier), create HeartbeatService, create Reconciler, create NodeAPI Server, register SSE event handlers, start all services as goroutines with shared context. Handle SIGTERM/SIGINT with 30s drain timeout. Wire heartbeat 401→re-registration via callback that re-runs Registrar.Register() and updates auth token. (REQ-002)",
+    "[done] 2.3 Create cmd/plexd/cmd/join.go: `plexd join` command that performs registration only. Parse config, create ControlPlane client, create Registrar with --token-file flag support, call Register(), print node_id and mesh_ip to stdout, exit. (REQ-001)",
+    "[done] 2.4 Create cmd/plexd/cmd/install.go and cmd/plexd/cmd/uninstall.go: `plexd install` delegates to packaging.Installer.Install() with flags for --api-url, --token, --token-file. `plexd uninstall` delegates to Installer.Uninstall() with --purge flag. Both check for root privileges first. (REQ-001)",
+    "[done] 2.5 Create cmd/plexd/cmd/deregister.go: `plexd deregister` command. Parse config, load identity from disk, create ControlPlane client with auth token, call Deregister(). With --purge flag: remove data_dir, remove token file, disable systemd unit. (REQ-001)",
+    "[done] 3.1 Create cmd/plexd/cmd/status.go: `plexd status` command that connects to /var/run/plexd/api.sock via HTTP-over-Unix-socket, fetches /v1/state, and prints formatted node info. Create cmd/plexd/cmd/peers.go: `plexd peers` fetches peer list (future: wire to real endpoint). Create cmd/plexd/cmd/policies.go: `plexd policies` fetches policy list. All detect agent-not-running and print helpful error. (REQ-009)",
+    "[done] 3.2 Create cmd/plexd/cmd/state.go: `plexd state` shows summary, `plexd state get <type> <key>` fetches specific entry, `plexd state report <key> --data <json>` writes report entry. All connect via Unix socket to local node API. (REQ-001, REQ-009)",
+    "[done] 3.3 Create cmd/plexd/cmd/logs.go, cmd/plexd/cmd/audit.go: `plexd logs` streams agent logs (reads from journald or stdout fallback), `plexd log-status` shows log forwarding config, `plexd audit` shows audit collection status. (REQ-001)",
+    "[done] 3.4 Create cmd/plexd/cmd/actions.go: `plexd actions` lists available actions, `plexd actions run <name> [--param key=value]` dispatches to agent via Unix socket. Create cmd/plexd/cmd/hooks.go: `plexd hooks list` lists hooks, `plexd hooks verify` runs integrity verification, `plexd hooks reload` triggers re-scan. (REQ-001, REQ-011)",
+    "[done] 4.1 Integrate Ed25519Verifier into SSEManager: update cmd/plexd/cmd/up.go to create Ed25519Verifier with the signing_public_key from NodeIdentity, pass it to NewSSEManager instead of nil. Add SSE event handler for signing_key_rotated that calls verifier.SetKeys() with the new key and transition period. Wire the StateResponse.SigningKeys from reconcile to update the verifier's keys. (REQ-003, REQ-005)",
+    "[done] 4.2 Integrate HeartbeatService into agent lifecycle: in cmd/plexd/cmd/up.go, start HeartbeatService after registration. Wire onAuthFailure callback to trigger re-registration (Registrar.Register() again, update auth token on ControlPlane client, reconnect SSE). Wire reconcileTrigger to Reconciler.TriggerReconcile(). Wire HeartbeatRequest payload builder that collects MeshInfo, NATInfo, etc. from running subsystems. (REQ-006, REQ-010)",
+    "[done] 4.3 Integrate Unix socket permissions into nodeapi.Server: modify nodeapi/server.go Start() to call SocketPermissions helper after creating the Unix socket. Add SecretAuthMiddleware to the handler chain for /v1/state/secrets/* routes. Ensure TCP listener mode bypasses SO_PEERCRED (uses bearer token auth already). (REQ-007)",
+    "[done] 5.1 Create docs/reference/backend/cli.md: document all subcommands with usage, flags, examples, and exit codes. (REQ-009)",
+    "[done] 5.2 Create docs/reference/backend/event-verification.md: document Ed25519 verification flow, canonical JSON format, nonce replay protection, staleness window, signing key rotation. (REQ-009)",
+    "[done] 5.3 Create docs/reference/backend/heartbeat-service.md: document heartbeat interval, payload structure, response handling (reconcile, rotate_keys), 401 re-registration flow, configuration. (REQ-009)"
   ],
   "test_specifications": [
     {
@@ -715,6 +715,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-13T20:36:10.560816"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T10:11:58.874356"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T15:49:30.260751"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T15:49:30.307717"
     }
   },
   "execution_history": [
@@ -728,6 +740,56 @@
           "name": "prepare",
           "duration": 593.1476640701294,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "65e9086f-e026-48b5-ae87-57b7b5e543f5",
+      "timestamp": "2026-02-14T15:44:29.876168",
+      "total_duration": 1761.118435382843,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 2 (5 tasks)",
+          "duration": 111.57910943031311,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (4 tasks)",
+          "duration": 229.11500430107117,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (3 tasks)",
+          "duration": 382.854043006897,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 5 (3 tasks)",
+          "duration": 225.6651964187622,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0025] Code Review",
+          "duration": 437.7728898525238,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0025] Improvements",
+          "duration": 260.3042006492615,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0025] Simplify",
+          "duration": 113.82799172401428,
+          "type": "simplify",
           "status": "done"
         }
       ]
