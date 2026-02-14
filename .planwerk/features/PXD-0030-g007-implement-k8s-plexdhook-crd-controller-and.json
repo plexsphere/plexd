@@ -1,0 +1,615 @@
+{
+  "feature_id": "PXD-0030",
+  "title": "G007: Implement K8s PlexdHook CRD controller and extensions",
+  "slug": "g007-implement-k8s-plexdhook-crd-controller-and",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 📦 medium\n**Category:** infrastructure\n**Priority:** high\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nComplete Kubernetes platform support:\n\n**PlexdHook CRD:** Create CRD YAML manifest for `plexdhooks.plexd.plexsphere.com` with `jobTemplate`, `parameters`, `privileged` fields. Add to `deploy/kubernetes/crds/`.\n\n**PlexdHook Controller:** K8s controller watching `PlexdHook` custom resources. Creates Jobs for hook execution with node pinning (nodeSelector/affinity), owner references for garbage collection, dedicated service account. Integrate with existing controller infrastructure in `internal/kubernetes/` alongside the PlexdNodeState CRD controller.\n\n**Wire into DaemonSet:** Ensure DaemonSet manifest includes proper RBAC for PlexdHook resources (get, list, watch, create jobs).\n\n**Rationale:** The PlexdHook CRD is the Kubernetes-native mechanism for executing operational hooks as Jobs. Without it, Kubernetes deployments cannot leverage the hook system for maintenance tasks, upgrades, or diagnostics. The existing codebase only has PlexdNodeState CRD support - PlexdHook is the second core CRD required for full K8s integration.\n\n**Affected Areas:**\n- deploy/kubernetes/crds/plexdhook-crd.yaml\n- internal/kubernetes/plexdhook_controller.go\n- internal/kubernetes/plexdhook_types.go\n- deploy/kubernetes/rbac.yaml\n- deploy/kubernetes/daemonset.yaml",
+  "stories": [
+    {
+      "title": "Platform operator can define PlexdHook resources in Kubernetes",
+      "role": "platform operator",
+      "want": "to create PlexdHook custom resources that define hook scripts with job templates, parameters, and privilege settings",
+      "so_that": "operational hooks (maintenance, upgrades, diagnostics) can be managed declaratively via the Kubernetes API",
+      "criteria": [
+        "PlexdHook CRD is installable via kubectl apply -f deploy/kubernetes/crds/plexdhook-crd.yaml",
+        "CRD validates required fields: spec.hookName is required and non-empty",
+        "CRD allows optional fields: spec.jobTemplate, spec.parameters, spec.privileged with correct types",
+        "CRD uses API group plexd.plexsphere.com, version v1alpha1, scope Namespaced",
+        "CRD has printer columns showing Hook Name, Privileged, and Age"
+      ]
+    },
+    {
+      "title": "PlexdHook controller watches and processes custom resources",
+      "role": "platform operator",
+      "want": "a controller running in the plexd DaemonSet that watches PlexdHook resources and creates Kubernetes Jobs for hook execution",
+      "so_that": "creating a PlexdHook resource automatically triggers hook execution as a Kubernetes Job on the target node",
+      "criteria": [
+        "Controller starts watching PlexdHook resources in its namespace on startup",
+        "Controller creates a Job for each new PlexdHook resource with ADDED event",
+        "Job uses the jobTemplate from the PlexdHook spec if provided, with sensible defaults otherwise",
+        "Job has ownerReferences pointing to the PlexdHook resource for automatic garbage collection",
+        "Controller updates PlexdHook status with job name and execution state"
+      ]
+    },
+    {
+      "title": "Jobs created by PlexdHook controller are pinned to the correct node",
+      "role": "platform operator",
+      "want": "hook Jobs to execute on the same node where the plexd DaemonSet pod is running",
+      "so_that": "node-specific hooks (diagnostics, maintenance) run on the intended node",
+      "criteria": [
+        "Job spec includes nodeSelector matching the current node name",
+        "Job uses the plexd service account for RBAC permissions",
+        "Job containers have appropriate security context based on spec.privileged flag",
+        "Job has restartPolicy: Never to prevent retry loops on failure"
+      ]
+    },
+    {
+      "title": "PlexdHook controller handles error conditions gracefully",
+      "role": "platform operator",
+      "want": "the controller to handle errors without crashing and to report meaningful status",
+      "so_that": "I can troubleshoot failed hook executions through PlexdHook resource status",
+      "criteria": [
+        "Controller logs errors at warn/error level with component=plexdhook-controller",
+        "Job creation failures are reflected in PlexdHook status with error message",
+        "Controller continues processing other PlexdHook resources when one fails",
+        "Controller handles API server connectivity issues with retry logging"
+      ]
+    },
+    {
+      "title": "PlexdHook resources are cleaned up via owner references",
+      "role": "platform operator",
+      "want": "Jobs to be automatically garbage-collected when their parent PlexdHook resource is deleted",
+      "so_that": "I do not accumulate orphaned Jobs in the cluster",
+      "criteria": [
+        "Job has ownerReferences with controller=true and blockOwnerDeletion=true",
+        "Deleting a PlexdHook resource cascades to delete the associated Job",
+        "OwnerReference UID matches the PlexdHook resource UID",
+        "OwnerReference apiVersion and kind are set correctly for PlexdHook"
+      ]
+    },
+    {
+      "title": "DaemonSet RBAC permits PlexdHook operations",
+      "role": "cluster administrator",
+      "want": "the plexd ClusterRole to include permissions for PlexdHook resources and Job creation",
+      "so_that": "the plexd DaemonSet can watch PlexdHook CRDs and create Jobs without authorization errors",
+      "criteria": [
+        "ClusterRole includes get, list, watch on plexdhooks resource in plexd.plexsphere.com group",
+        "ClusterRole includes get, update, patch on plexdhooks/status subresource",
+        "ClusterRole includes create, get, list, watch on batch/v1 jobs resource",
+        "Existing RBAC permissions for PlexdNodeState and secrets remain unchanged"
+      ]
+    },
+    {
+      "title": "Reference documentation covers PlexdHook CRD and controller",
+      "role": "developer",
+      "want": "comprehensive reference documentation for the PlexdHook CRD schema, controller behavior, and RBAC requirements",
+      "so_that": "I can understand the complete PlexdHook lifecycle without reading source code",
+      "criteria": [
+        "Documentation covers CRD schema with field descriptions and types",
+        "Documentation covers controller lifecycle (watch, create Job, update status)",
+        "Documentation covers RBAC permissions required",
+        "Documentation includes example PlexdHook YAML manifest"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL provide a PlexdHook CRD manifest at deploy/kubernetes/crds/plexdhook-crd.yaml with group plexd.plexsphere.com, version v1alpha1, scope Namespaced",
+      "priority": "SHALL",
+      "rationale": "The CRD defines the Kubernetes-native API surface for hook execution, following the same API group and versioning as PlexdNodeState",
+      "scenarios": [
+        {
+          "name": "CRD is valid and installable",
+          "when": "kubectl apply -f deploy/kubernetes/crds/plexdhook-crd.yaml is run on a Kubernetes cluster",
+          "then": "the CRD is accepted without validation errors",
+          "and_then": [
+            "kubectl get crd plexdhooks.plexd.plexsphere.com returns the installed CRD"
+          ]
+        },
+        {
+          "name": "CRD validates required fields",
+          "when": "a PlexdHook resource is created without spec.hookName",
+          "then": "the Kubernetes API server rejects the resource with a validation error",
+          "and_then": [
+            "error message indicates hookName is required"
+          ]
+        },
+        {
+          "name": "CRD accepts valid resource with all fields",
+          "when": "a PlexdHook resource is created with hookName, jobTemplate, parameters, and privileged",
+          "then": "the resource is accepted and persisted",
+          "and_then": [
+            "resource can be retrieved via kubectl get plexdhooks"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The system SHALL define Go types for PlexdHook CRD spec, status, and related structures in internal/kubernetes/plexdhook_types.go",
+      "priority": "SHALL",
+      "rationale": "Go types enable type-safe interaction with the PlexdHook CRD from the controller code, following the same pattern as PlexdNodeState types in interfaces.go",
+      "scenarios": [
+        {
+          "name": "Types serialize to JSON matching CRD schema",
+          "when": "a PlexdHook struct is marshaled to JSON",
+          "then": "the JSON field names match the CRD openAPIV3Schema property names",
+          "and_then": [
+            "optional fields with zero values are omitted via omitempty"
+          ]
+        },
+        {
+          "name": "Types deserialize from Kubernetes API responses",
+          "when": "a JSON response from the Kubernetes API for a PlexdHook resource is unmarshaled",
+          "then": "all fields are correctly populated in the Go struct",
+          "and_then": [
+            "nested jobTemplate fields are correctly mapped"
+          ]
+        },
+        {
+          "name": "Status types capture execution state",
+          "when": "the controller updates PlexdHook status",
+          "then": "status includes jobName, phase (Pending/Running/Succeeded/Failed), and message",
+          "and_then": [
+            "timestamps are in RFC3339 format"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The KubeClient interface SHALL be extended with methods for PlexdHook CRUD and Job management operations",
+      "priority": "SHALL",
+      "rationale": "The KubeClient abstraction enables testability by allowing mock implementations, following the established pattern for PlexdNodeState operations",
+      "scenarios": [
+        {
+          "name": "GetPlexdHook returns existing resource",
+          "when": "GetPlexdHook is called with a valid namespace and name for an existing resource",
+          "then": "the PlexdHook struct is returned with all fields populated",
+          "and_then": [
+            "no error is returned"
+          ]
+        },
+        {
+          "name": "GetPlexdHook returns ErrNotFound for missing resource",
+          "when": "GetPlexdHook is called with a name that does not exist",
+          "then": "ErrNotFound sentinel error is returned",
+          "and_then": [
+            "the error can be checked with errors.Is"
+          ]
+        },
+        {
+          "name": "CreateJob creates a batch/v1 Job with owner references",
+          "when": "CreateJob is called with a valid Job specification",
+          "then": "the Job is created in the target namespace",
+          "and_then": [
+            "ErrAlreadyExists is returned if the Job already exists"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The PlexdHookController SHALL watch PlexdHook resources and create Jobs for hook execution with node pinning and owner references",
+      "priority": "SHALL",
+      "rationale": "The controller is the core component bridging PlexdHook CRD resources to Kubernetes Job execution, enabling declarative hook management",
+      "scenarios": [
+        {
+          "name": "Controller creates Job on new PlexdHook",
+          "when": "a new PlexdHook resource is created (ADDED watch event)",
+          "then": "the controller creates a Kubernetes Job with nodeSelector matching the current node",
+          "and_then": [
+            "Job has ownerReferences pointing to the PlexdHook resource",
+            "PlexdHook status is updated with jobName"
+          ]
+        },
+        {
+          "name": "Controller skips already-processed PlexdHook",
+          "when": "a PlexdHook resource is received that already has a status.jobName set",
+          "then": "the controller does not create a duplicate Job",
+          "and_then": [
+            "no error is logged"
+          ]
+        },
+        {
+          "name": "Controller handles Job creation failure",
+          "when": "the Kubernetes API returns an error when creating a Job",
+          "then": "the error is logged at error level with the PlexdHook name",
+          "and_then": [
+            "PlexdHook status is updated with phase=Failed and error message",
+            "controller continues watching for other events"
+          ]
+        },
+        {
+          "name": "Controller handles watch channel closure",
+          "when": "the watch channel is closed by the API server",
+          "then": "the controller returns nil (clean exit)",
+          "and_then": [
+            "no panic or unhandled error occurs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "Jobs created by the PlexdHookController SHALL include proper node affinity, service account, security context, and owner references",
+      "priority": "SHALL",
+      "rationale": "Node pinning ensures hooks run on the intended node; owner references enable garbage collection; security context respects the privileged flag",
+      "scenarios": [
+        {
+          "name": "Non-privileged hook creates restricted Job",
+          "when": "a PlexdHook with privileged=false is processed",
+          "then": "the Job container security context has allowPrivilegeEscalation=false and drops ALL capabilities",
+          "and_then": [
+            "readOnlyRootFilesystem is set to true"
+          ]
+        },
+        {
+          "name": "Privileged hook creates elevated Job",
+          "when": "a PlexdHook with privileged=true is processed",
+          "then": "the Job container security context allows privilege escalation",
+          "and_then": [
+            "the container can access host resources as needed"
+          ]
+        },
+        {
+          "name": "Job uses plexd service account",
+          "when": "any PlexdHook is processed",
+          "then": "the Job spec sets serviceAccountName to plexd",
+          "and_then": [
+            "Job inherits RBAC permissions from the plexd service account"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The RBAC manifest SHALL include permissions for PlexdHook resources and batch/v1 Jobs in the plexd ClusterRole",
+      "priority": "SHALL",
+      "rationale": "Without proper RBAC, the plexd DaemonSet cannot watch PlexdHook resources or create Jobs, resulting in authorization errors at runtime",
+      "scenarios": [
+        {
+          "name": "PlexdHook watch permission granted",
+          "when": "the plexd ClusterRole is applied",
+          "then": "the role includes get, list, watch verbs for plexdhooks in the plexd.plexsphere.com API group",
+          "and_then": [
+            "plexdhooks/status includes get, update, patch verbs"
+          ]
+        },
+        {
+          "name": "Job creation permission granted",
+          "when": "the plexd ClusterRole is applied",
+          "then": "the role includes create, get, list, watch verbs for jobs in the batch API group",
+          "and_then": [
+            "existing PlexdNodeState and secrets permissions remain unchanged"
+          ]
+        },
+        {
+          "name": "Consumer role for PlexdHook reading",
+          "when": "a workload needs to read PlexdHook resources",
+          "then": "the plexd-hook-reader ClusterRole provides get, list, watch on plexdhooks",
+          "and_then": [
+            "workloads can be bound to this role without plexd's full permissions"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The PlexdHookController SHALL use structured logging with component=plexdhook-controller following existing logging conventions",
+      "priority": "SHALL",
+      "rationale": "Consistent structured logging enables centralized monitoring and troubleshooting, following the established pattern in CRDController",
+      "scenarios": [
+        {
+          "name": "Controller startup logged",
+          "when": "the PlexdHookController starts watching",
+          "then": "an info-level log entry is emitted with component=plexdhook-controller, namespace, and node name",
+          "and_then": []
+        },
+        {
+          "name": "Job creation logged",
+          "when": "a Job is successfully created for a PlexdHook",
+          "then": "an info-level log entry includes the PlexdHook name, Job name, and node name",
+          "and_then": []
+        },
+        {
+          "name": "Errors logged with context",
+          "when": "an error occurs during PlexdHook processing",
+          "then": "a warn or error-level log entry includes the PlexdHook name, operation, and error message",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The PlexdHookController SHALL follow the lifecycle pattern of Start(ctx)/Stop() established by CRDController",
+      "priority": "SHALL",
+      "rationale": "Consistent lifecycle management enables clean integration with the plexd agent startup/shutdown sequence",
+      "scenarios": [
+        {
+          "name": "Start blocks until context cancelled",
+          "when": "Start(ctx) is called with a valid context",
+          "then": "the method blocks, watching PlexdHook resources and processing events",
+          "and_then": [
+            "returns ctx.Err() when the context is cancelled"
+          ]
+        },
+        {
+          "name": "Stop cancels the watch",
+          "when": "Stop() is called while the controller is running",
+          "then": "the internal context is cancelled, causing Start to return",
+          "and_then": [
+            "no goroutine leak occurs"
+          ]
+        },
+        {
+          "name": "Start returns error on watch failure",
+          "when": "the KubeClient.WatchPlexdHooks call fails",
+          "then": "Start returns the wrapped error immediately",
+          "and_then": [
+            "error message includes kubernetes: plexdhook: watch prefix"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The PlexdHook CRD spec SHALL support parameters as an array of name/value pairs passed to the hook Job as environment variables",
+      "priority": "SHOULD",
+      "rationale": "Parameters enable hooks to be configurable at invocation time, matching the parameter passing pattern used by the actions executor",
+      "scenarios": [
+        {
+          "name": "Parameters passed as environment variables",
+          "when": "a PlexdHook resource has spec.parameters with entries",
+          "then": "the Job container environment includes PLEXD_PARAM_{NAME}={VALUE} for each parameter",
+          "and_then": [
+            "parameter names are uppercased and sanitized following the existing sanitizeParamName pattern"
+          ]
+        },
+        {
+          "name": "Empty parameters produce no extra env vars",
+          "when": "a PlexdHook resource has no spec.parameters",
+          "then": "the Job container environment includes only base variables (PLEXD_NODE_ID, etc.)",
+          "and_then": []
+        },
+        {
+          "name": "Base environment variables always set",
+          "when": "any PlexdHook Job is created",
+          "then": "the Job container includes PLEXD_NODE_ID and PLEXD_HOOK_NAME environment variables",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "Reference documentation SHALL be provided for the PlexdHook CRD, controller, and RBAC additions",
+      "priority": "SHALL",
+      "rationale": "Documentation enables platform operators to deploy and use PlexdHook resources without reading source code",
+      "scenarios": [
+        {
+          "name": "CRD schema documented",
+          "when": "a platform operator reads the PlexdHook reference documentation",
+          "then": "they find a complete field table with types, defaults, and validation rules",
+          "and_then": [
+            "an example PlexdHook YAML manifest is included"
+          ]
+        },
+        {
+          "name": "Controller behavior documented",
+          "when": "a platform operator reads the controller documentation",
+          "then": "they understand the watch-create-status lifecycle and Job creation details",
+          "and_then": [
+            "error handling behavior is documented"
+          ]
+        },
+        {
+          "name": "RBAC additions documented",
+          "when": "a cluster administrator reads the RBAC documentation",
+          "then": "they find the new permissions for PlexdHook and Jobs listed",
+          "and_then": [
+            "the plexd-hook-reader consumer role is documented"
+          ]
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create PlexdHook Go types (PlexdHook, PlexdHookSpec, PlexdHookStatus, PlexdHookJobTemplate, PlexdHookParam, PlexdHookEvent) in internal/kubernetes/plexdhook_types.go with JSON tags matching CRD schema, and tests for JSON round-trip and field omission in plexdhook_types_test.go (REQ-002)",
+    "1.2 Extend KubeClient interface in internal/kubernetes/interfaces.go with WatchPlexdHooks(ctx, namespace) (<-chan PlexdHookEvent, error), UpdatePlexdHookStatus(ctx, hook *PlexdHook) error, CreateJob(ctx, job *PlexdJob) error methods, and add PlexdJob type with ownerReferences, nodeSelector, env, securityContext fields (REQ-003)",
+    "1.3 Implement PlexdHookController in internal/kubernetes/plexdhook_controller.go: constructor NewPlexdHookController(client, cfg, namespace, nodeName, logger), Start(ctx)/Stop() lifecycle, watch loop processing ADDED events, buildJob() method for Job construction with nodeSelector, ownerReferences, serviceAccount, security context, parameters-to-env conversion, and status update logic. Include tests in plexdhook_controller_test.go using mock KubeClient with test cases for: create Job on new hook, skip already-processed, handle create error, watch error, graceful shutdown, context cancellation, ErrAlreadyExists handling (REQ-004, REQ-005, REQ-007, REQ-008, REQ-009)",
+    "2.1 Create PlexdHook CRD YAML manifest at deploy/kubernetes/crds/plexdhook-crd.yaml following the PlexdNodeState CRD pattern: apiVersion apiextensions.k8s.io/v1, group plexd.plexsphere.com, kind PlexdHook, plural plexdhooks, short name ph, scope Namespaced, version v1alpha1, with spec fields hookName (required string), jobTemplate (optional object with image, command, args), parameters (optional array of name/value pairs), privileged (optional boolean default false), status subresource with jobName, phase, message, startedAt, completedAt fields, and printer columns for Hook Name, Privileged, Phase, Age (REQ-001)",
+    "2.2 Update deploy/kubernetes/rbac.yaml: add plexdhooks get/list/watch and plexdhooks/status get/update/patch to the plexd ClusterRole, add batch jobs create/get/list/watch to the plexd ClusterRole, add plexd-hook-reader consumer ClusterRole with get/list/watch on plexdhooks. Preserve all existing rules unchanged (REQ-006)",
+    "3.1 Write reference documentation at docs/reference/backend/plexdhook-crd.md covering: CRD schema field table, controller lifecycle, Job creation details (nodeSelector, ownerReferences, security context, parameters), RBAC permissions, example PlexdHook YAML manifest, status field meanings, and integration with existing Kubernetes deployment (REQ-010)",
+    "3.2 Update existing docs/reference/backend/kubernetes-deployment.md to add PlexdHook CRD to the manifests table, add plexdhooks and jobs RBAC entries to the RBAC permissions table, and cross-reference the new PlexdHook reference doc (REQ-010)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/kubernetes/plexdhook_types_test.go",
+      "test_function": "TestPlexdHook_JSONRoundTrip",
+      "story": "Platform operator can define PlexdHook resources in Kubernetes",
+      "expected": "PlexdHook struct marshals to JSON and back with all fields preserved, matching CRD schema field names",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_types_test.go",
+      "test_function": "TestPlexdHook_JSONOmitsEmptyOptionals",
+      "story": "Platform operator can define PlexdHook resources in Kubernetes",
+      "expected": "Zero-value optional fields (jobTemplate, parameters, privileged) are omitted from JSON output",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_types_test.go",
+      "test_function": "TestPlexdHook_StatusJSONRoundTrip",
+      "story": "PlexdHook controller watches and processes custom resources",
+      "expected": "PlexdHookStatus with jobName, phase, message, and timestamps serializes correctly",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_types_test.go",
+      "test_function": "TestPlexdHookJobSpec_JSONFieldNames",
+      "story": "Platform operator can define PlexdHook resources in Kubernetes",
+      "expected": "JobTemplate spec fields use correct JSON keys (image, command, args)",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_Start_CreatesJobOnNewHook",
+      "story": "PlexdHook controller watches and processes custom resources",
+      "expected": "When a PlexdHook ADDED event is received, CreateJob is called with correct nodeSelector and ownerReferences",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_Start_SkipsAlreadyProcessedHook",
+      "story": "PlexdHook controller watches and processes custom resources",
+      "expected": "When a PlexdHook with non-empty status.jobName is received, no Job is created",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_Start_HandlesCreateJobError",
+      "story": "PlexdHook controller handles error conditions gracefully",
+      "expected": "When CreateJob fails, the controller updates PlexdHook status with phase=Failed and continues watching",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_Start_WatchError",
+      "story": "PlexdHook controller handles error conditions gracefully",
+      "expected": "When WatchPlexdHooks returns an error, Start returns the wrapped error immediately",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_Stop_GracefulShutdown",
+      "story": "PlexdHook controller handles error conditions gracefully",
+      "expected": "Stop() causes Start() to return with context.Canceled error within 2 seconds",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_BuildJob_NodeSelector",
+      "story": "Jobs created by PlexdHook controller are pinned to the correct node",
+      "expected": "Built Job has nodeSelector with kubernetes.io/hostname matching the controller's nodeName",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_BuildJob_OwnerReferences",
+      "story": "PlexdHook resources are cleaned up via owner references",
+      "expected": "Built Job ownerReferences include the PlexdHook UID, apiVersion, kind, controller=true, blockOwnerDeletion=true",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_BuildJob_NonPrivileged",
+      "story": "Jobs created by PlexdHook controller are pinned to the correct node",
+      "expected": "Non-privileged hook produces Job with restrictive security context (drop ALL, no escalation, read-only fs)",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_BuildJob_Privileged",
+      "story": "Jobs created by PlexdHook controller are pinned to the correct node",
+      "expected": "Privileged hook produces Job with elevated security context",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_BuildJob_Parameters",
+      "story": "PlexdHook controller watches and processes custom resources",
+      "expected": "Parameters from PlexdHook spec are converted to PLEXD_PARAM_* env vars in the Job container",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_BuildJob_ServiceAccount",
+      "story": "Jobs created by PlexdHook controller are pinned to the correct node",
+      "expected": "Built Job has serviceAccountName set to plexd",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_Start_ContextCancellation",
+      "story": "PlexdHook controller handles error conditions gracefully",
+      "expected": "Start returns ctx.Err() when the parent context is cancelled",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_BuildJob_RestartPolicyNever",
+      "story": "Jobs created by PlexdHook controller are pinned to the correct node",
+      "expected": "Built Job has restartPolicy set to Never",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_BuildJob_DefaultJobTemplate",
+      "story": "PlexdHook controller watches and processes custom resources",
+      "expected": "When no jobTemplate is provided, the Job uses a sensible default container image and command",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_HandleAlreadyExistsJob",
+      "story": "PlexdHook controller handles error conditions gracefully",
+      "expected": "When CreateJob returns ErrAlreadyExists, the controller updates status without error",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/kubernetes/plexdhook_controller_test.go",
+      "test_function": "TestPlexdHookController_BuildJob_Labels",
+      "story": "PlexdHook controller watches and processes custom resources",
+      "expected": "Built Job has labels app.kubernetes.io/managed-by=plexd and plexd.plexsphere.com/hook-name={hookName}",
+      "requirement_id": "REQ-005"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-010) have corresponding passing tests",
+    "PlexdHook Go types in plexdhook_types.go follow the same struct/JSON tag pattern as PlexdNodeState in interfaces.go",
+    "PlexdHookController in plexdhook_controller.go follows the same Start(ctx)/Stop() lifecycle pattern as CRDController in crdcontroller.go",
+    "CRD YAML manifest in plexdhook-crd.yaml follows the same structure as plexdnodestate-crd.yaml (same group, version, labels, printer columns pattern)",
+    "RBAC changes in rbac.yaml are additive only — all existing PlexdNodeState, secrets, and tokenreviews rules remain unchanged",
+    "Mock KubeClient in plexdhook_controller_test.go extends the existing mockKubeClient pattern from crdcontroller_test.go",
+    "All test cases pass with go test -race ./internal/kubernetes/",
+    "All code passes go vet ./internal/kubernetes/",
+    "Reference documentation includes complete field tables, example YAML, and cross-references to existing K8s deployment docs",
+    "Job construction includes proper security context (restricted for non-privileged, elevated for privileged) following DaemonSet container security patterns"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **PlexdHook types in separate file**: Create plexdhook_types.go rather than adding to interfaces.go to keep file sizes manageable and maintain separation of concerns. The PlexdHook types are structurally different from PlexdNodeState (Job-oriented vs state-oriented).\n\n2. **KubeClient interface extension**: Add PlexdHook and Job methods to the existing KubeClient interface in interfaces.go rather than creating a separate interface. This keeps the mock surface unified and follows the existing pattern where KubeClient is the single abstraction for all K8s API operations.\n\n3. **Controller pattern**: Follow the exact CRDController pattern: constructor with config/namespace/logger, Start(ctx) blocking with watch loop, Stop() canceling internal context. The PlexdHookController is simpler than CRDController because it only needs to watch for ADDED events and create Jobs (no update reconciliation needed).\n\n4. **Job construction**: The buildJob() method constructs a PlexdJob struct (not a raw k8s Job) to maintain the abstraction. The PlexdJob type in interfaces.go captures the fields needed for Job creation: name, namespace, labels, ownerReferences, nodeSelector, serviceAccountName, containers (image, command, args, env, securityContext), restartPolicy.\n\n5. **Parameter passing**: Reuse the sanitizeParamName pattern from internal/actions/executor.go for converting PlexdHook spec.parameters to PLEXD_PARAM_* environment variables.\n\n6. **Owner references**: Set controller=true and blockOwnerDeletion=true on Job ownerReferences to enable Kubernetes garbage collection when the PlexdHook resource is deleted.\n\n7. **Idempotency**: Handle ErrAlreadyExists on Job creation gracefully (log and update status) to support controller restart scenarios.\n\nKey files to reference:\n- internal/kubernetes/crdcontroller.go — lifecycle and watch loop pattern\n- internal/kubernetes/interfaces.go — KubeClient interface, type definitions, sentinel errors\n- internal/kubernetes/crdcontroller_test.go — mockKubeClient pattern, test structure\n- deploy/kubernetes/crds/plexdnodestate-crd.yaml — CRD YAML structure\n- deploy/kubernetes/rbac.yaml — RBAC rule structure\n- internal/actions/executor.go — sanitizeParamName for parameter env var conversion\n\nPotential pitfalls:\n- Adding methods to KubeClient interface requires updating the existing mockKubeClient in crdcontroller_test.go to satisfy the interface (add stub methods)\n- The CRD YAML must use correct openAPIV3Schema validation types — boolean for privileged, not string\n- Owner references require the PlexdHook UID which is only available after the resource is created/fetched from the API",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T20:05:02.795957"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T20:08:23.515303"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T20:13:26.447574"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "e5420708-b7ee-4145-bd75-09b7c5215346",
+      "timestamp": "2026-02-14T20:13:26.447599",
+      "total_duration": 298.5633792877197,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 298.5633792877197,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
