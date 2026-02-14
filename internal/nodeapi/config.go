@@ -33,6 +33,12 @@ type Config struct {
 
 	// DataDir is the path to the data directory (required).
 	DataDir string
+
+	// SecretAuthEnabled enables SO_PEERCRED-based authentication for
+	// /v1/state/secrets/* routes on the Unix socket. When enabled, only
+	// root (UID 0) or plexd-secrets group members may access secrets.
+	// Default: false (enabled by cmd/plexd/cmd/up.go in production).
+	SecretAuthEnabled bool
 }
 
 // DefaultSocketPath is the default Unix domain socket path.

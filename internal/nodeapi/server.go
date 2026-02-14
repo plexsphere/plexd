@@ -86,7 +86,20 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 		return fmt.Errorf("nodeapi: listen unix %s: %w", s.cfg.SocketPath, err)
 	}
 
-	unixServer := &http.Server{Handler: wrappedMux}
+	// Set socket ownership and permissions (Linux: root:plexd 0660).
+	applySocketPermissions(s.cfg.SocketPath, s.logger)
+
+	// Wrap secret routes with peer credential auth (Linux: SO_PEERCRED).
+	// Only enabled when SecretAuthEnabled is set (requires root to set socket perms).
+	var unixHandler http.Handler = wrappedMux
+	if s.cfg.SecretAuthEnabled {
+		unixHandler = wrapSecretAuth(wrappedMux, s.logger)
+	}
+
+	unixServer := &http.Server{
+		Handler:     unixHandler,
+		ConnContext: connContextWithPeerCred(s.logger),
+	}
 
 	var tcpServer *http.Server
 	var tcpLn net.Listener

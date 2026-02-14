@@ -1,0 +1,138 @@
+{
+  "feature_id": "PXD-0025",
+  "title": "G002: Implement CLI entry point and Ed25519 verification",
+  "date": "2026-02-14",
+  "verdict": "APPROVED",
+  "summary": "Implements the complete CLI entry point (cmd/plexd/main.go) with 15+ Cobra subcommands, Ed25519 event signature verification with nonce replay protection, heartbeat service with 401 re-registration, Unix socket SO_PEERCRED-based secret access control, and top-level YAML config aggregation. All tests pass with -race (4 packages, 0 failures). go build and go vet pass cleanly. New dependencies limited to cobra, yaml.v3, and golang.org/x/sys. Implementation follows existing project conventions (ApplyDefaults/Validate, error prefix patterns, interface-driven design). Several minor security hardening opportunities identified as suggestions.",
+  "tests_checklist": [
+    {"item": "All tests pass (go test -race ./internal/api/... ./internal/agent/... ./cmd/plexd/... ./internal/nodeapi/...)", "checked": true},
+    {"item": "Ed25519 verifier covers valid/invalid signature, staleness, nonce replay, key rotation", "checked": true},
+    {"item": "Heartbeat service tests cover interval, reconcile trigger, auth failure, transient errors, context cancellation", "checked": true},
+    {"item": "goleak.VerifyTestMain present in internal/agent/leak_test.go (covers heartbeat tests)", "checked": true},
+    {"item": "Unix socket auth tests cover root access, group membership, denial, credential errors", "checked": true},
+    {"item": "Config parsing tests cover valid YAML, missing fields, defaults, invalid YAML, file not found", "checked": true},
+    {"item": "CLI tests cover help output, version flag, unknown subcommand, agent-not-running errors", "checked": true},
+    {"item": "Edge cases covered (empty nonce, zero issued_at, duplicate nonce, stale event)", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing code patterns (ApplyDefaults/Validate, error prefixes, interface design)", "checked": true},
+    {"item": "Functions are focused and reasonably sized (largest is runUp at ~180 lines as orchestrator)", "checked": true},
+    {"item": "No dead code, commented-out code, or TODO/FIXME markers", "checked": true},
+    {"item": "Named constants for all magic values (DefaultStalenessWindow, nonceTTL, drainTimeout, etc.)", "checked": true},
+    {"item": "Package doc comments on new packages (cmd, agent)", "checked": true},
+    {"item": "Exported types have doc comments", "checked": true},
+    {"item": "sockutil.go extracts shared Unix socket HTTP client logic", "checked": true},
+    {"item": "Platform-specific code properly separated with build tags (socket_perms_linux.go, socket_perms_other.go)", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "Ed25519 signature verification uses crypto/ed25519 standard library", "checked": true},
+    {"item": "Nonce replay protection with TTL-based expiry", "checked": true},
+    {"item": "Event staleness window (5 min) prevents old event replay", "checked": true},
+    {"item": "Key rotation supports transition period with dual-key verification", "checked": true},
+    {"item": "SO_PEERCRED used for Unix socket peer credential extraction (not file permissions)", "checked": true},
+    {"item": "Secret routes protected by plexd-secrets group membership check", "checked": true},
+    {"item": "Root (UID 0) always granted secret access", "checked": true},
+    {"item": "Heartbeat 401 triggers re-registration (not silent failure)", "checked": true},
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "Sensitive data not leaked in error messages (generic 'signature verification failed')", "checked": true},
+    {"item": "Graceful fallback to 0666 socket permissions when plexd group absent (with warning log)", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Config aggregation without modifying subsystem Config structs", "checked": true},
+    {"item": "Ed25519Verifier implements existing EventVerifier interface", "checked": true},
+    {"item": "HeartbeatClient/ReconcileTrigger interfaces for testability", "checked": true},
+    {"item": "GroupChecker/PeerCredGetter interfaces for mock injection in tests", "checked": true},
+    {"item": "Clean separation: verifier in api package, heartbeat in agent package, socket auth in nodeapi package", "checked": true},
+    {"item": "CLI commands delegate to internal packages (no business logic in cmd)", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code across CLI commands (sockutil.go shared)", "checked": true},
+    {"item": "Stub commands (actions, hooks, peers, policies) connect to agent socket for liveness check", "checked": true},
+    {"item": "No unnecessary abstractions or future-proofing", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config validation runs at startup before any services start", "checked": true},
+    {"item": "Registration failure aborts agent startup", "checked": true},
+    {"item": "Invalid signing key base64 aborts agent startup", "checked": true},
+    {"item": "CLI commands detect agent-not-running and return helpful errors", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Verifier checks: empty signature, empty nonce, zero issued_at, staleness, nonce uniqueness, Ed25519 signature", "checked": true},
+    {"item": "HeartbeatConfig.Validate requires NodeID", "checked": true},
+    {"item": "AgentConfig.Validate checks mode is node or bridge", "checked": true},
+    {"item": "State get validates entry type (metadata, data, report)", "checked": true},
+    {"item": "State report validates --data is valid JSON", "checked": true},
+    {"item": "30s drain timeout on SIGTERM/SIGINT", "checked": true}
+  ],
+  "security_findings": [
+    {
+      "severity": "MEDIUM",
+      "description": "Nonce consumed before signature verification. NonceStore.Add() is called at verifier.go:124 before Ed25519 signature check at line 150. An attacker who can inject events into the SSE stream (requires TLS compromise) could pre-consume nonces with invalid signatures, preventing legitimate events with the same nonce from being processed.",
+      "location": "internal/api/verifier.go:124",
+      "fix": "Move nonce check after signature verification: first verify Ed25519 signature, then check nonce uniqueness. This ensures only cryptographically valid events consume nonces."
+    },
+    {
+      "severity": "LOW",
+      "description": "Future-dated events are accepted. time.Since(envelope.IssuedAt) returns a negative duration for future timestamps, which will never exceed DefaultStalenessWindow. An attacker with a valid signing key could create events with far-future timestamps that remain valid indefinitely in the nonce store.",
+      "location": "internal/api/verifier.go:121",
+      "fix": "Add a check: if envelope.IssuedAt.After(time.Now().Add(allowedClockSkew)) return error. Use a small clock skew tolerance (e.g., 30s) to account for legitimate clock drift."
+    },
+    {
+      "severity": "LOW",
+      "description": "No Ed25519 public key length validation before use. The decoded signing key from identity.SigningPublicKey is cast to ed25519.PublicKey without verifying it is exactly 32 bytes. ed25519.Verify panics on invalid key length.",
+      "location": "cmd/plexd/cmd/up.go:97",
+      "fix": "Add validation: if len(sigKey) != ed25519.PublicKeySize { return error }. The key comes from the trusted control plane, but defensive validation prevents panics if the control plane returns malformed data."
+    }
+  ],
+  "architecture_findings": [],
+  "issues_found": [
+    {
+      "id": "TE6",
+      "severity": "minor",
+      "description": "up_test.go only tests the decodeSigningKeys helper. The runUp orchestrator function (180 lines) has no test coverage. While integration-testing the full startup is complex, key error paths (missing config, registration failure) could be covered.",
+      "location": "cmd/plexd/cmd/up_test.go",
+      "fix": "Add tests for runUp error cases: missing config file, invalid config, registration failure with mock client."
+    },
+    {
+      "id": "TE2",
+      "severity": "minor",
+      "description": "No test for invalid base64 signature input to Ed25519Verifier.Verify(). The error path at verifier.go:129-131 is untested.",
+      "location": "internal/api/verifier_test.go",
+      "fix": "Add TestEd25519Verifier_InvalidBase64Signature with Signature set to 'not-valid-base64!!!' and verify 'signature verification failed' error."
+    },
+    {
+      "id": "TE1",
+      "severity": "minor",
+      "description": "HeartbeatService.SetBuildRequest callback (heartbeat.go:95-97) is not tested. The callback customizes heartbeat payloads but no test verifies it is invoked.",
+      "location": "internal/agent/heartbeat_test.go",
+      "fix": "Add TestHeartbeatService_BuildRequest that sets a callback and verifies it is called during Run()."
+    },
+    {
+      "id": "TE7",
+      "severity": "minor",
+      "description": "Socket permission test uses weak assertion (info.Mode().Perm()&0600 == 0) instead of checking exact 0666 fallback permission.",
+      "location": "internal/nodeapi/socket_perms_linux_test.go:39",
+      "fix": "Assert info.Mode().Perm() == 0666 for the no-plexd-group fallback case."
+    },
+    {
+      "id": "Q2",
+      "severity": "minor",
+      "description": "AgentConfig.Validate() at 53 lines is repetitive with 16 sequential error checks. Could use a helper, but this follows the explicit style used elsewhere in the project.",
+      "location": "internal/agent/config.go:101-153",
+      "fix": "Acceptable as-is given project conventions. Consider a validateAll(validators ...interface{ Validate() error }) helper if more subsystems are added."
+    }
+  ],
+  "suggested_improvements": [
+    "Move nonce check after Ed25519 signature verification in verifier.go to prevent nonce exhaustion attacks",
+    "Add future-timestamp rejection with configurable clock skew tolerance in verifier.go",
+    "Add Ed25519 public key length validation (== 32 bytes) in up.go before creating verifier",
+    "Add invalid base64 signature test case to verifier_test.go",
+    "Add BuildRequest callback test to heartbeat_test.go",
+    "Consider making socket path configurable via CLI flag to enable full command integration tests"
+  ],
+  "next_steps": [
+    "Address MEDIUM security finding: reorder nonce check after signature verification in verifier.go",
+    "Add suggested test cases for improved coverage (invalid base64, BuildRequest callback)",
+    "Wire remaining stub commands (actions, hooks, peers, policies) to real node API endpoints in future iterations"
+  ]
+}
