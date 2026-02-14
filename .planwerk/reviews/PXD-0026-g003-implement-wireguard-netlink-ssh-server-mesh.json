@@ -1,0 +1,166 @@
+{
+  "feature_id": "PXD-0026",
+  "title": "G003: Implement WireGuard netlink, SSH server, mesh net",
+  "date": "2026-02-14",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Solid implementation of WireGuard netlink controller, UDP STUN client, SSH mesh server with JWT auth, direct-tcpip channel forwarding, K8s API reverse proxy, and MeshServer lifecycle. All tests pass with -race flag. Go vet clean. Interfaces satisfied at compile time. Existing Manager/Discoverer/SessionManager untouched. Config follows ApplyDefaults()+Validate() pattern. Three blocking lint errors in production code (unchecked Reject returns) and several in test code require fixes before merge.",
+  "tests_checklist": [
+    {"item": "All tests pass (go test -race ./internal/nat/ ./internal/tunnel/ ./internal/wireguard/)", "checked": true},
+    {"item": "go vet passes on all packages", "checked": true},
+    {"item": "golangci-lint passes on all packages", "checked": false},
+    {"item": "Compile-time interface checks: var _ WGController = (*NetlinkController)(nil)", "checked": true},
+    {"item": "Compile-time interface checks: var _ STUNClient = (*UDPSTUNClient)(nil)", "checked": true},
+    {"item": "controller_linux.go uses //go:build linux tag", "checked": true},
+    {"item": "controller_linux_test.go uses t.Skip for non-root execution", "checked": true},
+    {"item": "SSH server tests use real golang.org/x/crypto/ssh client connections", "checked": true},
+    {"item": "STUN tests use local UDP server with crafted responses", "checked": true},
+    {"item": "Integration test: full SSH tunnel lifecycle with bidirectional data flow", "checked": true},
+    {"item": "Integration test: K8s proxy through SSH tunnel", "checked": true},
+    {"item": "goleak.VerifyTestMain in tunnel package (via handler_integration_test.go)", "checked": true},
+    {"item": "Edge cases tested (timeout, invalid payload, unreachable target, max sessions)", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing code patterns (ApplyDefaults/Validate, error format, slog component key)", "checked": true},
+    {"item": "No modifications to existing Manager, Discoverer, or SessionManager", "checked": true},
+    {"item": "Error messages follow 'package: context: detail' convention", "checked": true},
+    {"item": "slog calls include 'component' key (via logger.With)", "checked": true},
+    {"item": "Config structs follow ApplyDefaults() + Validate() pattern", "checked": true},
+    {"item": "Functions do one thing (SRP)", "checked": true},
+    {"item": "No dead code", "checked": true},
+    {"item": "Clear naming throughout", "checked": true},
+    {"item": "File location matches project structure", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "Host key persisted with 0600 permissions via fsutil.WriteFileAtomic", "checked": true},
+    {"item": "SSH auth rejects invalid JWT tokens with logging", "checked": true},
+    {"item": "SSH max sessions enforced", "checked": true},
+    {"item": "Private keys not exposed in logs", "checked": true},
+    {"item": "STUN response validation: magic cookie, transaction ID, message type, attribute bounds", "checked": true},
+    {"item": "K8s proxy returns 502 on backend failures", "checked": true},
+    {"item": "Context cancellation respected in STUN client", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "NetlinkController implements WGController interface", "checked": true},
+    {"item": "UDPSTUNClient implements STUNClient interface", "checked": true},
+    {"item": "MeshServer composes SSHServer + SessionManager lifecycle", "checked": true},
+    {"item": "Shutdown ordering: SSH listener first, then session drain", "checked": true},
+    {"item": "go.mod updated with wgctrl and netlink dependencies", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code (wgctrl.New() appears 3x — acceptable per-method client creation)", "checked": true},
+    {"item": "No over-engineering or future-proofing", "checked": true},
+    {"item": "No unnecessary abstractions", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config validated before use", "checked": true},
+    {"item": "Context checked at entry in STUN Bind()", "checked": true},
+    {"item": "SSH handshake failure logged and connection closed", "checked": true},
+    {"item": "DeleteInterface idempotent (ENODEV returns nil)", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "STUN response length validated before slicing", "checked": true},
+    {"item": "SSH payload unmarshaled safely", "checked": true},
+    {"item": "URL parsed and validated in K8s proxy constructor", "checked": true},
+    {"item": "Host key directory created with MkdirAll if missing", "checked": true}
+  ],
+  "security_findings": [
+    {
+      "severity": "MEDIUM",
+      "description": "SSH max sessions check has TOCTOU race between atomic.LoadInt32 and atomic.AddInt32 (lines 152-163). Under concurrent connection attempts, the limit can be briefly exceeded. Use atomic.CompareAndSwapInt32 or a semaphore channel for strict enforcement.",
+      "location": "internal/tunnel/ssh_server.go:152-163",
+      "fix": "Replace Load+check+Add with a CAS loop: `for { current := atomic.LoadInt32(&s.activeSessions); if int(current) >= s.cfg.MaxSessions { reject; break }; if atomic.CompareAndSwapInt32(&s.activeSessions, current, current+1) { handle; break } }`"
+    },
+    {
+      "severity": "LOW",
+      "description": "Host key file with incorrect permissions (e.g. 0644) is only warned about, not rejected. A world-readable key could be stolen by other users on the system.",
+      "location": "internal/tunnel/hostkey.go:41-46",
+      "fix": "Consider returning an error instead of a warning for permissions != 0600, or document the trade-off."
+    }
+  ],
+  "architecture_findings": [
+    {
+      "severity": "MEDIUM",
+      "description": "direct-tcpip channel handler accepts arbitrary destination addresses without filtering. While the SSH server only listens on the mesh network and requires JWT auth, an authenticated user could connect to any reachable host:port (SSRF potential). Consider adding an optional destination allowlist for defense-in-depth.",
+      "location": "internal/tunnel/ssh_channels.go:36-46",
+      "fix": "Add optional AllowedDestinations field to SSHServerConfig. If set, validate destAddr against the allowlist before dialing. This is a suggestion for future hardening, not a blocker for the initial implementation."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "V3-1",
+      "severity": "blocking",
+      "check_id": "V3",
+      "file": "internal/tunnel/ssh_channels.go:28",
+      "description": "golangci-lint errcheck: Error return value of newChannel.Reject is not checked",
+      "fix": "Capture and log the error: `if err := newChannel.Reject(...); err != nil { logger.Debug(\"reject failed\", \"error\", err) }`"
+    },
+    {
+      "id": "V3-2",
+      "severity": "blocking",
+      "check_id": "V3",
+      "file": "internal/tunnel/ssh_channels.go:48",
+      "description": "golangci-lint errcheck: Error return value of newChannel.Reject is not checked",
+      "fix": "Capture and log the error: `if err := newChannel.Reject(...); err != nil { logger.Debug(\"reject failed\", \"error\", err) }`"
+    },
+    {
+      "id": "V3-3",
+      "severity": "blocking",
+      "check_id": "V3",
+      "file": "internal/tunnel/ssh_server.go:204",
+      "description": "golangci-lint errcheck: Error return value of newChannel.Reject is not checked",
+      "fix": "Capture and log the error: `if err := newChannel.Reject(...); err != nil { s.logger.Debug(\"reject failed\", \"error\", err) }`"
+    },
+    {
+      "id": "V3-4",
+      "severity": "blocking",
+      "check_id": "V3",
+      "file": "internal/tunnel/k8s_proxy_test.go:43",
+      "description": "golangci-lint errcheck: Error return value of w.Write is not checked in test",
+      "fix": "Use `_, _ = w.Write(...)` or assign to variable"
+    },
+    {
+      "id": "V3-5",
+      "severity": "blocking",
+      "check_id": "V3",
+      "file": "internal/tunnel/k8s_proxy_integration_test.go:33,151",
+      "description": "golangci-lint errcheck: Error return value of json.Encoder.Encode not checked in test handlers",
+      "fix": "Use `_ = json.NewEncoder(w).Encode(resp)` or check error"
+    },
+    {
+      "id": "V3-6",
+      "severity": "blocking",
+      "check_id": "V3",
+      "file": "internal/tunnel/k8s_proxy_integration_test.go:49,165",
+      "description": "golangci-lint errcheck: Error return value of proxySrv.Serve not checked",
+      "fix": "Use `go func() { _ = proxySrv.Serve(proxyLn) }()`"
+    },
+    {
+      "id": "V3-7",
+      "severity": "blocking",
+      "check_id": "V3",
+      "file": "internal/tunnel/k8s_proxy_integration_test.go:72,185 and ssh_server_integration_test.go:45,146,204",
+      "description": "golangci-lint errcheck: Error return value of srv.Shutdown/sshSrv.Shutdown not checked in defer",
+      "fix": "Use `defer func() { _ = srv.Shutdown() }()` or assign to named return"
+    },
+    {
+      "id": "P1-1",
+      "severity": "minor",
+      "check_id": "P1",
+      "file": "internal/tunnel/ssh_channels.go:29,39,49,60",
+      "description": "Log messages include redundant 'tunnel: direct-tcpip:' prefix when logger already has component='tunnel' set via the SSHServer's logger. Other handlers (e.g. manager.go) use clean messages like 'peer added' without package prefix.",
+      "fix": "Remove 'tunnel: direct-tcpip:' prefix from log messages. Use: 'failed to parse direct-tcpip payload', 'opening direct-tcpip connection', 'failed to dial target', 'failed to accept channel'"
+    }
+  ],
+  "suggested_improvements": [
+    "Consider using a buffered channel semaphore instead of atomic int32 for SSH max sessions — simpler and race-free: `sem := make(chan struct{}, cfg.MaxSessions)`",
+    "K8s proxy X-Forwarded-For header includes RemoteAddr with port (e.g. '10.0.0.1:12345'). Consider stripping port with net.SplitHostPort for cleaner header values.",
+    "The wgctrl.New() call appears in CreateInterface, AddPeer, and RemovePeer. Consider caching the client as a field if frequent peer operations are expected, or document why per-call creation is preferred.",
+    "STUN error message on line stun.go:96 says 'attributes truncated' — consider 'response body shorter than declared message length' for clarity."
+  ],
+  "next_steps": [
+    "Fix all golangci-lint errcheck violations in ssh_channels.go:28,48 and ssh_server.go:204 (production code — blocking)",
+    "Fix golangci-lint errcheck violations in test files (k8s_proxy_test.go, k8s_proxy_integration_test.go, ssh_server_integration_test.go)",
+    "Re-run golangci-lint to confirm clean"
+  ]
+}

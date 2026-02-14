@@ -2,8 +2,8 @@
   "feature_id": "PXD-0026",
   "title": "G003: Implement WireGuard netlink, SSH server, mesh net",
   "slug": "g003-implement-wireguard-netlink-ssh-server-mesh",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 🏗️ large\n**Category:** backend\n**Priority:** critical\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nImplement production networking layer replacing interface-only abstractions:\n\n**WireGuard Netlink Controller:** Concrete `WGController` implementation using `golang.zx2c4.com/wireguard/wgctrl` library. Create/delete `plexd0` interface, set private key, add/remove peers with PSK, configure allowed IPs and endpoints. Integrate with existing `Manager` logic in `internal/wireguard/`.\n\n**Real STUN Client:** UDP STUN binding implementation hitting `stun.l.google.com:19302` and `stun.cloudflare.com:3478` for NAT discovery. Replace mock `STUNClient` with production implementation used by `Discoverer`.\n\n**SSH Server:** `golang.org/x/crypto/ssh` based server with JWT authentication callback, Ed25519 host key generation, 30-minute idle timeout, maximum 10 concurrent sessions. Replaces current TCP bidirectional copy in `internal/tunnel/`.\n\n**K8s API Proxy:** Reverse proxy for Kubernetes API access through the secure SSH tunnel, enabling remote cluster management.\n\n**Rationale:** WireGuard controller is the core of mesh networking - without it, no peer-to-peer encrypted tunnels can be established. The SSH server provides the secure remote access channel that all management operations depend on. The STUN client is required for NAT traversal in real network environments. K8s API proxy enables the key use case of remote Kubernetes cluster management.\n\n**Affected Areas:**\n- internal/wireguard/controller_linux.go\n- internal/wireguard/stun.go\n- internal/tunnel/ssh_server.go\n- internal/tunnel/k8s_proxy.go\n- go.mod",
   "stories": [
@@ -384,16 +384,16 @@
     }
   ],
   "tasks": [
-    "1.1 Add wgctrl and netlink dependencies to go.mod: `go get golang.zx2c4.com/wireguard/wgctrl` and `go get github.com/vishvananda/netlink` — these are required for REQ-001 and REQ-002 (internal/wireguard/controller_linux.go, go.mod)",
-    "1.2 Implement NetlinkController in internal/wireguard/controller_linux.go with build tag `//go:build linux`: CreateInterface (wgctrl.New + netlink.LinkAdd + client.ConfigureDevice), DeleteInterface (netlink.LinkDel with ENODEV→nil), ConfigureAddress (netlink.AddrAdd), SetInterfaceUp (netlink.LinkSetUp), SetMTU (netlink.LinkSetMTU), AddPeer (client.ConfigureDevice with PeerConfig→wgtypes.PeerConfig), RemovePeer (client.ConfigureDevice with Remove=true). Include tests in controller_linux_test.go with build tag. Tests that require root should use t.Skip when not root or use network namespaces. (REQ-001, REQ-002, REQ-008)",
-    "1.3 Implement UDPSTUNClient in internal/nat/udp_stun.go: struct with Timeout field, Bind method creates net.DialTimeout('udp', serverAddr), builds request via existing buildBindingRequest with crypto/rand transaction ID, writes to UDP conn, reads response with deadline from context/timeout, parses via existing parseBindingResponse. Include tests in udp_stun_test.go using a local UDP echo server that sends crafted STUN responses. (REQ-003)",
-    "2.1 Implement Ed25519 host key management in internal/tunnel/hostkey.go: GenerateHostKey generates crypto/ed25519 keypair and converts to ssh.Signer, LoadOrGenerateHostKey checks data directory for existing key file, generates if absent, persists with 0600 permissions using fsutil.WriteFileAtomic pattern from registration package. Include tests in hostkey_test.go. (REQ-007)",
-    "2.2 Implement SSH server core in internal/tunnel/ssh_server.go: SSHServer struct with ssh.ServerConfig, net.Listener, Config (MaxSessions, IdleTimeout, ListenAddr), JWTVerifier interface for auth callback. NewSSHServer constructor takes Config, host key signer, JWTVerifier, logger. Start method: listen on mesh IP, accept loop with semaphore for MaxSessions, handle each connection with ssh.NewServerConn. Auth callback: extract JWT from public key metadata, verify via JWTVerifier. Idle timeout via connection deadline reset on activity. Include tests in ssh_server_test.go with a mock JWTVerifier and real SSH client connections using golang.org/x/crypto/ssh client. (REQ-004, REQ-007)",
-    "2.3 Implement direct-tcpip channel handler in internal/tunnel/ssh_channels.go: handleDirectTCPIP function parses ssh.Request payload for target host:port, dials target via net.DialContext, bidirectional io.Copy between channel and TCP connection (same pattern as existing session.go forward method). Channel rejection returns SSH_OPEN_CONNECT_FAILED on dial error. Include tests in ssh_channels_test.go. (REQ-005)",
-    "2.4 Implement K8s API reverse proxy in internal/tunnel/k8s_proxy.go: K8sProxy struct wrapping httputil.ReverseProxy with target URL. NewK8sProxy takes target URL string, optional TLS config for K8s API CA. Director function rewrites request URL to target, sets X-Forwarded-For and Host headers. ErrorHandler returns 502 on backend failures. Include tests in k8s_proxy_test.go using httptest.NewServer as mock K8s API server. (REQ-006)",
-    "3.1 Integrate SSH server with SessionManager lifecycle in internal/tunnel/ssh_server.go: SSHServer.Shutdown gracefully closes listener and all active connections. Wire into SessionManager or alongside it — SSH server is started when tunneling is enabled. Update tunnel.Config if needed to include SSH-specific fields (SSHListenAddr, HostKeyDir). Ensure Shutdown ordering: close SSH listener first, then drain active sessions. Include integration test in ssh_server_integration_test.go. (REQ-004, REQ-005)",
-    "3.2 Integration test: full SSH tunnel lifecycle in internal/tunnel/ssh_server_integration_test.go — start SSH server with generated host key and mock JWT verifier, connect real SSH client, open direct-tcpip channel to local echo server, verify bidirectional data flow, disconnect, verify session cleanup and goroutine leak check via goleak. (REQ-004, REQ-005)",
-    "3.3 Integration test: K8s proxy through SSH tunnel in internal/tunnel/k8s_proxy_integration_test.go — start SSH server, connect SSH client, open direct-tcpip channel to K8s proxy listener, send HTTP request through the channel, verify response from mock K8s API server. (REQ-005, REQ-006)"
+    "[done] 1.1 Add wgctrl and netlink dependencies to go.mod: `go get golang.zx2c4.com/wireguard/wgctrl` and `go get github.com/vishvananda/netlink` — these are required for REQ-001 and REQ-002 (internal/wireguard/controller_linux.go, go.mod)",
+    "[done] 1.2 Implement NetlinkController in internal/wireguard/controller_linux.go with build tag `//go:build linux`: CreateInterface (wgctrl.New + netlink.LinkAdd + client.ConfigureDevice), DeleteInterface (netlink.LinkDel with ENODEV→nil), ConfigureAddress (netlink.AddrAdd), SetInterfaceUp (netlink.LinkSetUp), SetMTU (netlink.LinkSetMTU), AddPeer (client.ConfigureDevice with PeerConfig→wgtypes.PeerConfig), RemovePeer (client.ConfigureDevice with Remove=true). Include tests in controller_linux_test.go with build tag. Tests that require root should use t.Skip when not root or use network namespaces. (REQ-001, REQ-002, REQ-008)",
+    "[done] 1.3 Implement UDPSTUNClient in internal/nat/udp_stun.go: struct with Timeout field, Bind method creates net.DialTimeout('udp', serverAddr), builds request via existing buildBindingRequest with crypto/rand transaction ID, writes to UDP conn, reads response with deadline from context/timeout, parses via existing parseBindingResponse. Include tests in udp_stun_test.go using a local UDP echo server that sends crafted STUN responses. (REQ-003)",
+    "[done] 2.1 Implement Ed25519 host key management in internal/tunnel/hostkey.go: GenerateHostKey generates crypto/ed25519 keypair and converts to ssh.Signer, LoadOrGenerateHostKey checks data directory for existing key file, generates if absent, persists with 0600 permissions using fsutil.WriteFileAtomic pattern from registration package. Include tests in hostkey_test.go. (REQ-007)",
+    "[done] 2.2 Implement SSH server core in internal/tunnel/ssh_server.go: SSHServer struct with ssh.ServerConfig, net.Listener, Config (MaxSessions, IdleTimeout, ListenAddr), JWTVerifier interface for auth callback. NewSSHServer constructor takes Config, host key signer, JWTVerifier, logger. Start method: listen on mesh IP, accept loop with semaphore for MaxSessions, handle each connection with ssh.NewServerConn. Auth callback: extract JWT from public key metadata, verify via JWTVerifier. Idle timeout via connection deadline reset on activity. Include tests in ssh_server_test.go with a mock JWTVerifier and real SSH client connections using golang.org/x/crypto/ssh client. (REQ-004, REQ-007)",
+    "[done] 2.3 Implement direct-tcpip channel handler in internal/tunnel/ssh_channels.go: handleDirectTCPIP function parses ssh.Request payload for target host:port, dials target via net.DialContext, bidirectional io.Copy between channel and TCP connection (same pattern as existing session.go forward method). Channel rejection returns SSH_OPEN_CONNECT_FAILED on dial error. Include tests in ssh_channels_test.go. (REQ-005)",
+    "[done] 2.4 Implement K8s API reverse proxy in internal/tunnel/k8s_proxy.go: K8sProxy struct wrapping httputil.ReverseProxy with target URL. NewK8sProxy takes target URL string, optional TLS config for K8s API CA. Director function rewrites request URL to target, sets X-Forwarded-For and Host headers. ErrorHandler returns 502 on backend failures. Include tests in k8s_proxy_test.go using httptest.NewServer as mock K8s API server. (REQ-006)",
+    "[done] 3.1 Integrate SSH server with SessionManager lifecycle in internal/tunnel/ssh_server.go: SSHServer.Shutdown gracefully closes listener and all active connections. Wire into SessionManager or alongside it — SSH server is started when tunneling is enabled. Update tunnel.Config if needed to include SSH-specific fields (SSHListenAddr, HostKeyDir). Ensure Shutdown ordering: close SSH listener first, then drain active sessions. Include integration test in ssh_server_integration_test.go. (REQ-004, REQ-005)",
+    "[done] 3.2 Integration test: full SSH tunnel lifecycle in internal/tunnel/ssh_server_integration_test.go — start SSH server with generated host key and mock JWT verifier, connect real SSH client, open direct-tcpip channel to local echo server, verify bidirectional data flow, disconnect, verify session cleanup and goroutine leak check via goleak. (REQ-004, REQ-005)",
+    "[done] 3.3 Integration test: K8s proxy through SSH tunnel in internal/tunnel/k8s_proxy_integration_test.go — start SSH server, connect SSH client, open direct-tcpip channel to K8s proxy listener, send HTTP request through the channel, verify response from mock K8s API server. (REQ-005, REQ-006)"
   ],
   "test_specifications": [
     {
@@ -559,6 +559,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-13T21:38:56.337203"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T15:51:57.871278"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T19:02:20.640665"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T19:02:20.714993"
     }
   },
   "execution_history": [
@@ -572,6 +584,38 @@
           "name": "prepare",
           "duration": 234.34061574935913,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "4f0d0e45-db6e-4d99-9914-d8101e6dfab0",
+      "timestamp": "2026-02-14T17:41:07.679323",
+      "total_duration": 867.8063793182373,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 3 (3 tasks)",
+          "duration": 131.6498041152954,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0026] Code Review",
+          "duration": 354.6212787628174,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0026] Improvements",
+          "duration": 285.4779908657074,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0026] Simplify",
+          "duration": 96.05730557441711,
+          "type": "simplify",
           "status": "done"
         }
       ]

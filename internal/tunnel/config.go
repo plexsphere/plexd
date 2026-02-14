@@ -25,6 +25,14 @@ type Config struct {
 	// DefaultTimeout is the default/maximum session timeout.
 	// Default: 30m
 	DefaultTimeout time.Duration
+
+	// SSHListenAddr is the address for the SSH mesh server to listen on.
+	// If empty, the SSH server is not started.
+	SSHListenAddr string
+
+	// HostKeyDir is the directory for storing the SSH host key.
+	// If empty, a transient key is generated (not persisted).
+	HostKeyDir string
 }
 
 // ApplyDefaults sets default values for zero-valued fields.
