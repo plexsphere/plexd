@@ -1,0 +1,735 @@
+{
+  "feature_id": "PXD-0029",
+  "title": "G006: Implement observability actions hooks and log forwa...",
+  "slug": "g006-implement-observability-actions-hooks-and",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 🏗️ large\n**Category:** backend\n**Priority:** high\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nComplete the observability and operations layer:\n\n**9 Missing Built-in Actions:** Implement `diagnostics.collect`, `diagnostics.traceroute_peer`, `service.restart`, `service.reload_config`, `service.upgrade`, `health.check`, `mesh.reconnect`, `config.dump`, `logs.snapshot` in `internal/actions/`.\n\n**Hook File Watcher:** fsnotify-based watcher on hook directory for dynamic registration. Recalculate checksums on file change, emit integrity alerts. Replace one-time startup discovery in `discovery.go`.\n\n**Unix Socket Action Server + CLI Client:** Local action execution via Unix socket. Server-side in agent, client-side in `plexd actions run` CLI command.\n\n**SystemReader Impl:** Concrete implementation reading `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`, disk stats via `syscall.Statfs`.\n\n**JournalReader Impl:** Concrete implementation using sd_journal or journald socket for live log reading.\n\n**File-based LogSource:** File path reader with glob support (e.g., `/var/log/app/*.log`). Enforce 16 KiB max line truncation with `[truncated]` suffix.\n\n**Log Filtering:** Path-based, severity-based, and unit-based filtering in the log forwarding pipeline.\n\n**Metrics Collectors:** `agent_stats` collector (goroutine count, heap memory, GC stats, uptime, reconnect count). Add load average to SystemReader. Add packet loss measurement to TunnelCollector.\n\n**Rationale:** Only 2 of 11 built-in actions exist - operators cannot perform diagnostics, service management, or config inspection remotely. Missing hook watcher means hooks added after startup are invisible. Missing SystemReader/JournalReader means metrics and logs are interface-only with no real data collection. File-based log source is critical for applications that don't use journald.\n\n**Affected Areas:**\n- internal/actions/builtin/\n- internal/hooks/discovery.go\n- internal/hooks/watcher.go\n- internal/agent/action_server.go\n- internal/metrics/system_reader_linux.go\n- internal/logfwd/journal_reader_linux.go\n- internal/logfwd/file_source.go\n- internal/logfwd/filter.go\n- internal/metrics/agent_stats.go\n- internal/metrics/collectors.go",
+  "stories": [
+    {
+      "title": "Operator can run diagnostic and service management actions remotely",
+      "role": "platform operator",
+      "want": "to execute built-in actions like diagnostics.collect, service.restart, health.check, config.dump, and logs.snapshot on remote nodes",
+      "so_that": "I can troubleshoot issues and manage node lifecycle without SSH access",
+      "criteria": [
+        "All 9 missing built-in actions (diagnostics.collect, diagnostics.traceroute_peer, service.restart, service.reload_config, service.upgrade, health.check, mesh.reconnect, config.dump, logs.snapshot) are registered in the Executor and reported in capabilities",
+        "Each action validates required parameters and returns a descriptive error when parameters are missing",
+        "Each action returns structured JSON output in stdout for programmatic consumption",
+        "Each action respects context cancellation and timeout deadlines"
+      ]
+    },
+    {
+      "title": "Operator can run actions locally via CLI",
+      "role": "platform operator",
+      "want": "to run actions locally on a node using 'plexd actions run <name>' and 'plexd actions list'",
+      "so_that": "I can test and invoke actions without going through the control plane",
+      "criteria": [
+        "The node API server exposes POST /v1/actions/run and GET /v1/actions endpoints on the Unix socket",
+        "The CLI command 'plexd actions list' displays available builtin actions and hooks in tabular format",
+        "The CLI command 'plexd actions run <name> --param key=value' dispatches the action and streams stdout/stderr to the terminal",
+        "The action server rejects unknown actions with HTTP 404 and returns execution results as JSON"
+      ]
+    },
+    {
+      "title": "Hook scripts are dynamically detected when added or modified at runtime",
+      "role": "platform operator",
+      "want": "hooks added to the hooks directory after agent startup to be automatically detected and registered",
+      "so_that": "I don't need to restart the agent to deploy new hook scripts",
+      "criteria": [
+        "An fsnotify-based watcher monitors the configured HooksDir for file create, write, remove, and rename events",
+        "When a new executable file is added, its checksum is computed and it is registered as a hook",
+        "When an existing hook file is modified, the checksum is recalculated and the hook metadata is updated",
+        "When a hook file is deleted, it is removed from the hooks list",
+        "Checksum changes on watched files trigger an integrity alert via the ViolationReporter",
+        "The watcher replaces the one-time startup discovery with continuous monitoring",
+        "Updated capabilities are reported to the control plane after each hook change"
+      ]
+    },
+    {
+      "title": "System metrics are collected from real Linux proc filesystem",
+      "role": "monitoring system",
+      "want": "the SystemReader to read actual CPU, memory, disk, network, and load average stats from /proc",
+      "so_that": "the metrics pipeline reports real system data instead of requiring a mock",
+      "criteria": [
+        "SystemReader implementation reads /proc/stat for CPU usage percentage calculation across two samples",
+        "SystemReader reads /proc/meminfo for MemTotal and MemAvailable to compute used memory",
+        "SystemReader reads /proc/loadavg for 1-minute, 5-minute, and 15-minute load averages",
+        "SystemReader uses syscall.Statfs on configurable mount points for disk usage",
+        "SystemReader reads /proc/net/dev for network rx/tx byte counters",
+        "The SystemStats struct is extended with LoadAvg1, LoadAvg5, LoadAvg15 float64 fields"
+      ]
+    },
+    {
+      "title": "Journal logs are collected from real systemd journal",
+      "role": "monitoring system",
+      "want": "the JournalReader to read actual journal entries via the journald socket",
+      "so_that": "the log forwarding pipeline collects real system logs",
+      "criteria": [
+        "JournalReader connects to the journald socket at /run/systemd/journal/stdout or uses sd_journal API",
+        "JournalReader tracks cursor position to avoid re-reading entries across collection cycles",
+        "JournalReader maps journal fields (MESSAGE, PRIORITY, _SYSTEMD_UNIT, __REALTIME_TIMESTAMP) to JournalEntry",
+        "JournalReader returns an empty slice when no new entries are available since last cursor"
+      ]
+    },
+    {
+      "title": "Application logs are collected from log files on disk",
+      "role": "platform operator",
+      "want": "to forward logs from arbitrary log files (e.g., /var/log/app/*.log) to the control plane",
+      "so_that": "applications that don't use journald can still have their logs collected",
+      "criteria": [
+        "FileSource accepts a glob pattern (e.g., /var/log/app/*.log) and reads all matching files",
+        "FileSource tracks read offsets per file to only collect new lines since last collection cycle",
+        "Lines exceeding 16 KiB are truncated with a '[truncated]' suffix appended",
+        "FileSource handles file rotation (detected by inode change) by resetting the offset",
+        "Each log entry has Source='file', Unit set to the file path, and Severity='info' by default",
+        "FileSource returns an empty slice when no new lines are available"
+      ]
+    },
+    {
+      "title": "Log entries can be filtered before forwarding",
+      "role": "platform operator",
+      "want": "to filter logs by path pattern, severity level, and unit name",
+      "so_that": "only relevant logs are forwarded to the control plane, reducing noise and bandwidth",
+      "criteria": [
+        "A LogFilter wraps a LogSource and applies include/exclude rules before returning entries",
+        "Path-based filtering matches log entry Source+Unit against glob patterns",
+        "Severity-based filtering accepts a minimum severity level and drops entries below it",
+        "Unit-based filtering accepts a list of included or excluded unit names",
+        "Filters are composable and configured via logfwd.Config",
+        "Empty filter configuration means all entries pass through (no filtering)"
+      ]
+    },
+    {
+      "title": "Agent runtime metrics are collected and reported",
+      "role": "monitoring system",
+      "want": "to collect Go runtime metrics (goroutine count, heap memory, GC stats) and agent-specific metrics (uptime, reconnect count)",
+      "so_that": "operators can monitor agent health and resource consumption",
+      "criteria": [
+        "AgentStatsCollector implements the Collector interface and returns a MetricPoint with Group='agent'",
+        "Stats include: goroutine_count, heap_alloc_bytes, heap_sys_bytes, gc_pause_total_ns, gc_num_gc, uptime_seconds",
+        "reconnect_count is sourced from an injectable counter interface",
+        "Packet loss measurement is added to TunnelCollector via periodic probe and reported as packet_loss_percent per peer",
+        "The new 'agent' group constant is added to collector.go"
+      ]
+    },
+    {
+      "title": "Hook watcher emits integrity alerts on unexpected file changes",
+      "role": "security system",
+      "want": "to be alerted when hook script checksums change unexpectedly",
+      "so_that": "I can detect potential tampering or unauthorized modifications",
+      "criteria": [
+        "When a hook file is modified and its checksum changes, an IntegrityViolationReport is sent to the control plane",
+        "The violation report includes type='hook', path, expected and actual checksums, and timestamp",
+        "Only checksum changes trigger alerts; permission-only changes do not",
+        "Alert is sent before updating the internal hook registry with the new checksum"
+      ]
+    },
+    {
+      "title": "System handles errors gracefully across all new components",
+      "role": "system",
+      "want": "all new components to handle errors without crashing the agent",
+      "so_that": "partial failures don't bring down the entire node agent",
+      "criteria": [
+        "SystemReader returns a wrapped error when /proc files are unreadable and the collector logs a warning",
+        "JournalReader returns a wrapped error when the journal socket is unavailable",
+        "FileSource skips unreadable files with a warning log and continues with other matched files",
+        "Hook watcher handles fsnotify errors by logging and continuing to watch",
+        "Action server returns structured JSON error responses for all failure cases",
+        "All new goroutines have panic recovery and don't leak on shutdown"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL implement all 9 missing built-in actions with proper parameter validation and structured JSON output",
+      "priority": "SHALL",
+      "rationale": "Only 2 of 11 specified built-in actions exist. Operators cannot perform remote diagnostics or service management.",
+      "scenarios": [
+        {
+          "name": "diagnostics.collect returns structured system info",
+          "when": "diagnostics.collect is invoked with no parameters",
+          "then": "stdout contains JSON with hostname, os, arch, cpu_count, memory_total, disk_total, load_avg, kernel_version",
+          "and_then": [
+            "exit code is 0"
+          ]
+        },
+        {
+          "name": "traceroute_peer validates target parameter",
+          "when": "diagnostics.traceroute_peer is invoked without target parameter",
+          "then": "error is returned: 'missing required parameter: target'",
+          "and_then": [
+            "exit code is 1"
+          ]
+        },
+        {
+          "name": "config.dump redacts secrets",
+          "when": "config.dump is invoked",
+          "then": "output YAML has secret fields replaced with '[REDACTED]'",
+          "and_then": [
+            "no actual token or key values appear in output"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The system SHALL provide an fsnotify-based hook directory watcher with checksum recalculation and integrity alerts",
+      "priority": "SHALL",
+      "rationale": "One-time startup discovery means hooks added at runtime are invisible to the agent.",
+      "scenarios": [
+        {
+          "name": "File creation triggers hook registration",
+          "when": "an executable file is created in hooksDir",
+          "then": "the file is hashed, added to hooks registry, and capabilities re-reported",
+          "and_then": []
+        },
+        {
+          "name": "File modification triggers integrity alert",
+          "when": "an existing hook file content changes",
+          "then": "an IntegrityViolationReport is sent to control plane with old and new checksums",
+          "and_then": [
+            "the hook entry is updated with the new checksum"
+          ]
+        },
+        {
+          "name": "Watcher handles rapid successive events via debounce",
+          "when": "a file is written to multiple times within 200ms",
+          "then": "only one hash/registration cycle occurs",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The system SHALL expose local action execution via HTTP on the Unix socket with GET /v1/actions and POST /v1/actions/run",
+      "priority": "SHALL",
+      "rationale": "The CLI stubs exist but are non-functional. Operators need local action execution.",
+      "scenarios": [
+        {
+          "name": "GET /v1/actions returns actions list",
+          "when": "a GET request is made to /v1/actions",
+          "then": "HTTP 200 with JSON body containing builtin_actions and hooks arrays",
+          "and_then": []
+        },
+        {
+          "name": "POST /v1/actions/run executes builtin",
+          "when": "POST /v1/actions/run with {\"action\":\"health.check\"} is sent",
+          "then": "HTTP 200 with JSON body containing stdout, stderr, exit_code, status, duration",
+          "and_then": []
+        },
+        {
+          "name": "POST /v1/actions/run with unknown action returns 404",
+          "when": "POST /v1/actions/run with {\"action\":\"nonexistent\"} is sent",
+          "then": "HTTP 404 with error message 'unknown action'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The system SHALL provide a Linux SystemReader reading from /proc/stat, /proc/meminfo, /proc/loadavg, and syscall.Statfs",
+      "priority": "SHALL",
+      "rationale": "SystemReader interface has no concrete implementation; metrics pipeline cannot collect real data.",
+      "scenarios": [
+        {
+          "name": "All fields populated on Linux",
+          "when": "ReadStats is called on a Linux system",
+          "then": "all SystemStats fields including new LoadAvg1/5/15 are non-zero",
+          "and_then": []
+        },
+        {
+          "name": "CPU percentage calculated from delta",
+          "when": "ReadStats samples /proc/stat twice with 100ms delay",
+          "then": "CPUUsagePercent represents the CPU busy percentage between samples",
+          "and_then": [
+            "value is between 0.0 and 100.0"
+          ]
+        },
+        {
+          "name": "Error on missing /proc/stat",
+          "when": "/proc/stat is unreadable",
+          "then": "error returned with context 'metrics: system: read /proc/stat'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The system SHALL provide a JournalReader implementation reading from the systemd journal via journalctl subprocess",
+      "priority": "SHALL",
+      "rationale": "JournalReader interface has no concrete implementation; log forwarding has no real data source.",
+      "scenarios": [
+        {
+          "name": "Entries returned since last cursor",
+          "when": "ReadEntries is called after previous call returned entries with cursor",
+          "then": "only entries after the stored cursor are returned",
+          "and_then": []
+        },
+        {
+          "name": "First call reads recent entries",
+          "when": "ReadEntries is called for the first time",
+          "then": "entries from the last N seconds (configurable, default 60s) are returned",
+          "and_then": []
+        },
+        {
+          "name": "Journal unavailable returns error",
+          "when": "journalctl is not available on the system",
+          "then": "error returned with prefix 'logfwd: journal:'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The system SHALL provide a file-based LogSource with glob support, offset tracking, rotation detection, and 16 KiB line truncation",
+      "priority": "SHALL",
+      "rationale": "Applications not using journald need file-based log collection. File source is critical for containers and custom apps.",
+      "scenarios": [
+        {
+          "name": "Glob matches files",
+          "when": "pattern '/var/log/*.log' matches 3 files",
+          "then": "new lines from all 3 files are collected",
+          "and_then": []
+        },
+        {
+          "name": "Line truncation at 16 KiB",
+          "when": "a line exceeds 16384 bytes",
+          "then": "it is truncated to 16384 bytes with '[truncated]' suffix",
+          "and_then": []
+        },
+        {
+          "name": "File rotation detected",
+          "when": "a file is rotated (inode changes)",
+          "then": "reading starts from offset 0 of the new file",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The system SHALL support severity-based, unit-based, and path-based log filtering in the forwarding pipeline",
+      "priority": "SHALL",
+      "rationale": "Without filtering, all logs are forwarded indiscriminately, wasting bandwidth.",
+      "scenarios": [
+        {
+          "name": "Severity filter drops below threshold",
+          "when": "min_severity='warning' and 'info' entry arrives",
+          "then": "'info' entry is dropped",
+          "and_then": []
+        },
+        {
+          "name": "Unit include filter",
+          "when": "include_units=['sshd.service'] and 'cron.service' entry arrives",
+          "then": "'cron.service' entry is dropped",
+          "and_then": []
+        },
+        {
+          "name": "No filter config passes all entries",
+          "when": "filter config is empty/nil",
+          "then": "all entries pass through unchanged",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The system SHALL provide an agent_stats Collector reporting Go runtime and agent health metrics",
+      "priority": "SHALL",
+      "rationale": "Operators need visibility into agent resource consumption for capacity planning.",
+      "scenarios": [
+        {
+          "name": "Runtime metrics collected",
+          "when": "Collect is called",
+          "then": "MetricPoint Group='agent' with goroutine_count, heap_alloc_bytes, etc. is returned",
+          "and_then": []
+        },
+        {
+          "name": "Uptime calculated from start time",
+          "when": "agent has been running 120 seconds",
+          "then": "uptime_seconds is approximately 120",
+          "and_then": []
+        },
+        {
+          "name": "Reconnect count from injectable provider",
+          "when": "reconnect counter is 5",
+          "then": "reconnect_count is 5 in output",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The system SHALL extend SystemStats with load average fields and TunnelStats with packet loss percentage",
+      "priority": "SHALL",
+      "rationale": "Load average and packet loss are critical operational metrics missing from the current pipeline.",
+      "scenarios": [
+        {
+          "name": "Load average in SystemStats",
+          "when": "SystemCollector collects on Linux",
+          "then": "Data JSON includes load_avg_1, load_avg_5, load_avg_15",
+          "and_then": []
+        },
+        {
+          "name": "Packet loss in TunnelStats",
+          "when": "TunnelCollector collects",
+          "then": "each peer's TunnelStats includes packet_loss_percent",
+          "and_then": []
+        },
+        {
+          "name": "Packet loss unavailable defaults to -1",
+          "when": "loss probe fails",
+          "then": "packet_loss_percent is -1.0",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "All new goroutines SHALL shut down cleanly on context cancellation with no goroutine leaks",
+      "priority": "SHALL",
+      "rationale": "Agent must shut down cleanly during service restarts. Goroutine leaks degrade long-running agents.",
+      "scenarios": [
+        {
+          "name": "Hook watcher exits on cancel",
+          "when": "parent context is cancelled",
+          "then": "fsnotify watcher is closed, goroutine exits",
+          "and_then": [
+            "goleak detects no leaks"
+          ]
+        },
+        {
+          "name": "Action server drains on shutdown",
+          "when": "server shutdown is called",
+          "then": "in-flight requests complete, new requests rejected",
+          "and_then": []
+        },
+        {
+          "name": "FileSource handles cancelled context",
+          "when": "Collect called with cancelled context",
+          "then": "returns promptly",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "The system SHOULD follow existing codebase conventions for error messages, logging tags, and config patterns",
+      "priority": "SHOULD",
+      "rationale": "Consistency reduces cognitive load and maintenance burden across the project.",
+      "scenarios": [
+        {
+          "name": "Error prefix convention",
+          "when": "error occurs in logfwd package",
+          "then": "error message starts with 'logfwd: context: detail' format",
+          "and_then": []
+        },
+        {
+          "name": "Logger tagged with component",
+          "when": "new component creates a logger",
+          "then": "logger.With('component', 'name') pattern is used",
+          "and_then": []
+        },
+        {
+          "name": "Config struct pattern",
+          "when": "new config struct is created",
+          "then": "it has ApplyDefaults() and Validate() error methods following existing pattern",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Implement 9 missing built-in actions in internal/actions/builtins.go — DiagnosticsCollect (system info JSON), DiagnosticsTraceroutePeer (traceroute via exec), ServiceRestart (systemctl restart plexd.service), ServiceReloadConfig (SIGHUP to self), ServiceUpgrade (placeholder returning upgrade-not-available), HealthCheck (JSON with tunnel/peer/heartbeat status from injectable HealthProvider interface), MeshReconnect (reconnect via injectable MeshReconnector interface), ConfigDump (sanitized YAML config from injectable ConfigProvider), LogsSnapshot (last N lines from injectable LogProvider). Each action includes parameter validation and tests. (REQ-001)",
+    "1.2 Define injectable interfaces for built-in actions — HealthProvider (TunnelCount, ConnectedPeers, Uptime, LastHeartbeat, LastReconcile), MeshReconnector (Reconnect(ctx) error), ConfigProvider (DumpConfig() string), LogProvider (RecentLines(n int) []string). Place in internal/actions/builtins.go alongside existing NodeInfoProvider. Tests verify each action with mock providers. (REQ-001)",
+    "1.3 Implement fsnotify-based HookWatcher in internal/actions/watcher.go — Watch(ctx, hooksDir) method starts fsnotify watcher, debounces events (200ms), filters for executable files, computes checksums via integrity.HashFile, calls OnHookChanged callback (add/update/remove). Supports OnIntegrityAlert callback for checksum changes. Tests use temp directories with goleak. (REQ-002, REQ-010)",
+    "1.4 Integrate HookWatcher with Executor — Replace one-time DiscoverHooks call with HookWatcher.Watch goroutine in agent startup. OnHookChanged updates Executor.SetHooks. OnIntegrityAlert calls integrity.Verifier.ReportViolation (or a ViolationReporter). Watcher triggers capabilities re-report via injectable CapabilitiesReporter. Integration test verifies dynamic hook add/remove/modify lifecycle. (REQ-002)",
+    "2.1 Add action execution endpoints to nodeapi Handler — Add GET /v1/actions returning {builtin_actions: [], hooks: []} from Executor.Capabilities. Add POST /v1/actions/run accepting {action: string, parameters: map, timeout: string} and returning {stdout, stderr, exit_code, status, duration}. Handler holds *actions.Executor reference. Action runs synchronously with HTTP timeout. Tests in internal/nodeapi/handler_test.go. (REQ-003)",
+    "2.2 Wire CLI 'plexd actions' and 'plexd actions run' to Unix socket endpoints — Update cmd/plexd/cmd/actions.go: runActions calls GET /v1/actions and formats output as table. runActionsRun calls POST /v1/actions/run with action name and --param flags, prints stdout/stderr, exits with action's exit code. Add socketPost helper to sockutil.go. Tests in cmd/plexd/cmd/actions_test.go. (REQ-003)",
+    "2.3 Wire CLI 'plexd hooks list/verify/reload' to Unix socket — Update cmd/plexd/cmd/hooks.go: runHooksList calls GET /v1/actions and filters hooks. runHooksVerify calls POST /v1/actions/run with verify-all-hooks (new internal action). runHooksReload calls POST /v1/hooks/reload (trigger watcher rescan). Add GET /v1/hooks/reload endpoint. Tests in cmd/plexd/cmd/hooks_test.go. (REQ-003)",
+    "3.1 Implement Linux SystemReader in internal/metrics/system_reader_linux.go — LinuxSystemReader.ReadStats reads /proc/stat (CPU delta over 100ms), /proc/meminfo (MemTotal, MemAvailable), /proc/loadavg, /proc/net/dev (rx/tx bytes), syscall.Statfs (disk). Configurable mount point and network interface via constructor params. Tests with real /proc access on Linux (build-tagged). (REQ-004)",
+    "3.2 Extend SystemStats with LoadAvg fields — Add LoadAvg1, LoadAvg5, LoadAvg15 float64 fields to SystemStats struct in internal/metrics/system.go with JSON tags load_avg_1, load_avg_5, load_avg_15. Update SystemCollector tests to verify new fields are present in output JSON. Update docs/reference/backend/metrics-collection.md. (REQ-009)",
+    "3.3 Implement AgentStatsCollector in internal/metrics/agent_stats.go — Collects runtime.NumGoroutine, runtime.MemStats (HeapAlloc, HeapSys, PauseTotalNs, NumGC), time.Since(startTime), reconnect count from injectable ReconnectCounter interface. Returns MetricPoint with Group='agent'. Add GroupAgent constant. Tests verify all fields present and uptime increases. (REQ-008)",
+    "3.4 Add PacketLossPercent to TunnelStats and TunnelStatsReader — Extend TunnelStats struct with PacketLossPercent float64 field (json tag packet_loss_percent). TunnelStatsReader implementations provide this from periodic ICMP probes or default to -1 when unavailable. Update existing TunnelCollector tests for the new field. (REQ-009)",
+    "4.1 Implement JournalReader via journalctl subprocess in internal/logfwd/journal_reader_linux.go — JournalctlReader.ReadEntries runs 'journalctl --output=json --since=<cursor> --no-pager' and parses JSON output. Tracks cursor via __CURSOR field. First call uses --since='60 seconds ago'. Build-tagged for Linux. Tests mock exec.Command pattern or use integration tag. (REQ-005)",
+    "4.2 Implement FileSource in internal/logfwd/file_source.go — FileSource.Collect globs pattern, opens each matched file, seeks to stored offset, reads new lines with bufio.Scanner. Lines > MaxLineBytes (16384) truncated with '[truncated]' suffix. Detects rotation via os.Stat inode comparison. Stores offsets and inodes in a map[string]fileState. Tests with temp files. (REQ-006)",
+    "4.3 Implement LogFilter in internal/logfwd/filter.go — FilterConfig struct with MinSeverity string, IncludeUnits []string, ExcludeUnits []string. FilteringSource wraps a LogSource, calls inner Collect, then applies filters. Severity comparison uses priority order (emerg=0 > debug=7). Empty config = passthrough. Tests for each filter type and combination. (REQ-007)",
+    "4.4 Add filter configuration to logfwd.Config — Add FilterConfig field to logfwd.Config struct. Forwarder wraps sources with FilteringSource when filter config is non-empty. Update config_test.go. (REQ-007)",
+    "5.1 Wire all new components in cmd/plexd/cmd/up.go — Wire SystemReader (LinuxSystemReader on linux, nil on other), AgentStatsCollector, HookWatcher goroutine, action server endpoints in nodeapi. Pass Executor to nodeapi.Handler. Register new built-in actions with provider interfaces. Add FileSource and JournalctlReader to log forwarder when configured. (REQ-001 through REQ-010)",
+    "5.2 Integration tests for action server + CLI round-trip — Test in cmd/plexd/cmd/actions_test.go: start a nodeapi server with Executor (registered builtins), run CLI commands against it, verify output. Tests for list, run success, run failure, unknown action. (REQ-003)",
+    "5.3 Integration tests for hook watcher lifecycle — Test in internal/actions/watcher_test.go: start watcher on temp dir, add/modify/remove files, verify callbacks invoked in order. Verify capabilities re-report. goleak check. (REQ-002, REQ-010)",
+    "6.1 Update docs/reference/backend/remote-actions-hooks.md — Add documentation for all 9 new built-in actions (parameters, output format, error cases), HookWatcher (config, behavior, lifecycle), Unix socket action server (API contract), and updated CLI commands. (REQ-001, REQ-002, REQ-003)",
+    "6.2 Update docs/reference/backend/metrics-collection.md — Document SystemReader implementation (Linux /proc sources), new LoadAvg fields in SystemStats, AgentStatsCollector (Group='agent', fields), PacketLossPercent in TunnelStats. (REQ-004, REQ-008, REQ-009)",
+    "6.3 Update docs/reference/backend/log-forwarding.md — Document JournalReader implementation (journalctl subprocess, cursor tracking), FileSource (glob, offset tracking, rotation, truncation), LogFilter (severity/unit/path filtering, config). (REQ-005, REQ-006, REQ-007)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/actions/builtins_test.go",
+      "test_function": "TestBuiltinDiagnosticsCollect",
+      "story": "Operator can run diagnostic and service management actions remotely",
+      "expected": "diagnostics.collect returns valid JSON with system info, exit code 0",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/actions/builtins_test.go",
+      "test_function": "TestBuiltinTraceroutePeer_MissingTarget",
+      "story": "Operator can run diagnostic and service management actions remotely",
+      "expected": "diagnostics.traceroute_peer returns error when target parameter is missing",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/actions/builtins_test.go",
+      "test_function": "TestBuiltinHealthCheck",
+      "story": "Operator can run diagnostic and service management actions remotely",
+      "expected": "health.check returns JSON with tunnel_count, uptime, etc.",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/actions/builtins_test.go",
+      "test_function": "TestBuiltinConfigDump_RedactsSecrets",
+      "story": "Operator can run diagnostic and service management actions remotely",
+      "expected": "config.dump output contains [REDACTED] for sensitive fields, no actual secrets",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/actions/builtins_test.go",
+      "test_function": "TestBuiltinLogsSnapshot",
+      "story": "Operator can run diagnostic and service management actions remotely",
+      "expected": "logs.snapshot returns recent log lines, respects lines parameter",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/actions/builtins_test.go",
+      "test_function": "TestBuiltinMeshReconnect",
+      "story": "Operator can run diagnostic and service management actions remotely",
+      "expected": "mesh.reconnect triggers reconnect via provider interface and returns status",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/actions/watcher_test.go",
+      "test_function": "TestWatcher_NewFileRegistered",
+      "story": "Hook scripts are dynamically detected when added or modified at runtime",
+      "expected": "Creating an executable file in watched dir triggers hook registration callback",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/actions/watcher_test.go",
+      "test_function": "TestWatcher_ModifiedFileUpdatesChecksum",
+      "story": "Hook scripts are dynamically detected when added or modified at runtime",
+      "expected": "Modifying a hook file triggers checksum update and integrity alert callback",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/actions/watcher_test.go",
+      "test_function": "TestWatcher_DeletedFileUnregistered",
+      "story": "Hook scripts are dynamically detected when added or modified at runtime",
+      "expected": "Deleting a hook file triggers hook removal callback",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/actions/watcher_test.go",
+      "test_function": "TestWatcher_NonExecutableIgnored",
+      "story": "Hook scripts are dynamically detected when added or modified at runtime",
+      "expected": "Non-executable files and .json sidecars are not registered as hooks",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/actions/watcher_test.go",
+      "test_function": "TestWatcher_ShutdownClean",
+      "story": "Hook scripts are dynamically detected when added or modified at runtime",
+      "expected": "Context cancellation closes fsnotify watcher with no goroutine leaks (goleak)",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestActionsList_ReturnsActionsAndHooks",
+      "story": "Operator can run actions locally via CLI",
+      "expected": "GET /v1/actions returns JSON with builtin_actions and hooks arrays",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestActionsRun_ExecutesBuiltin",
+      "story": "Operator can run actions locally via CLI",
+      "expected": "POST /v1/actions/run executes action and returns result JSON with stdout, exit_code, status",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/nodeapi/handler_test.go",
+      "test_function": "TestActionsRun_UnknownAction_Returns404",
+      "story": "Operator can run actions locally via CLI",
+      "expected": "POST /v1/actions/run with unknown action returns HTTP 404",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "cmd/plexd/cmd/actions_test.go",
+      "test_function": "TestActionsListCommand_OutputsTable",
+      "story": "Operator can run actions locally via CLI",
+      "expected": "plexd actions command connects to socket and prints action list",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/metrics/system_reader_linux_test.go",
+      "test_function": "TestLinuxSystemReader_ReadStats",
+      "story": "System metrics are collected from real Linux proc filesystem",
+      "expected": "ReadStats returns non-zero values for CPU, memory, disk, load average on Linux",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/system_reader_linux_test.go",
+      "test_function": "TestLinuxSystemReader_CPUPercentRange",
+      "story": "System metrics are collected from real Linux proc filesystem",
+      "expected": "CPUUsagePercent is between 0.0 and 100.0",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/system_reader_linux_test.go",
+      "test_function": "TestLinuxSystemReader_LoadAvgPopulated",
+      "story": "System metrics are collected from real Linux proc filesystem",
+      "expected": "LoadAvg1, LoadAvg5, LoadAvg15 are all >= 0",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/logfwd/journal_reader_linux_test.go",
+      "test_function": "TestJournalctlReader_ReadEntries",
+      "story": "Journal logs are collected from real systemd journal",
+      "expected": "ReadEntries returns journal entries with correct field mapping",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/logfwd/journal_reader_linux_test.go",
+      "test_function": "TestJournalctlReader_CursorTracking",
+      "story": "Journal logs are collected from real systemd journal",
+      "expected": "Second call only returns entries after stored cursor",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/logfwd/file_source_test.go",
+      "test_function": "TestFileSource_GlobMatch",
+      "story": "Application logs are collected from log files on disk",
+      "expected": "FileSource collects lines from all files matching glob pattern",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/logfwd/file_source_test.go",
+      "test_function": "TestFileSource_OffsetTracking",
+      "story": "Application logs are collected from log files on disk",
+      "expected": "Second Collect only returns new lines appended since last call",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/logfwd/file_source_test.go",
+      "test_function": "TestFileSource_LineTruncation16KiB",
+      "story": "Application logs are collected from log files on disk",
+      "expected": "Lines exceeding 16384 bytes are truncated with '[truncated]' suffix",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/logfwd/file_source_test.go",
+      "test_function": "TestFileSource_FileRotationDetection",
+      "story": "Application logs are collected from log files on disk",
+      "expected": "After file rotation (inode change), reading starts from beginning of new file",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/logfwd/filter_test.go",
+      "test_function": "TestLogFilter_SeverityFilter",
+      "story": "Log entries can be filtered before forwarding",
+      "expected": "Entries below minimum severity are dropped",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/logfwd/filter_test.go",
+      "test_function": "TestLogFilter_UnitIncludeFilter",
+      "story": "Log entries can be filtered before forwarding",
+      "expected": "Only entries matching included units pass through",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/logfwd/filter_test.go",
+      "test_function": "TestLogFilter_EmptyConfigPassesAll",
+      "story": "Log entries can be filtered before forwarding",
+      "expected": "Empty filter config passes all entries unchanged",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/metrics/agent_stats_test.go",
+      "test_function": "TestAgentStatsCollector_Collect",
+      "story": "Agent runtime metrics are collected and reported",
+      "expected": "Returns MetricPoint with Group='agent' containing runtime stats",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/metrics/agent_stats_test.go",
+      "test_function": "TestAgentStatsCollector_UptimeIncreases",
+      "story": "Agent runtime metrics are collected and reported",
+      "expected": "uptime_seconds increases between successive Collect calls",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/metrics/tunnel_test.go",
+      "test_function": "TestTunnelCollector_PacketLossField",
+      "story": "Agent runtime metrics are collected and reported",
+      "expected": "TunnelStats includes packet_loss_percent field per peer",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/metrics/system_test.go",
+      "test_function": "TestSystemCollector_LoadAvgInOutput",
+      "story": "System metrics are collected from real Linux proc filesystem",
+      "expected": "SystemStats JSON includes load_avg_1, load_avg_5, load_avg_15 fields",
+      "requirement_id": "REQ-009"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All 9 missing built-in actions are registered in the Executor and each has at least 2 unit tests (happy path + error case)",
+    "HookWatcher uses fsnotify, debounces events, and has tests verifying create/modify/delete hooks with goleak checks",
+    "Unix socket action endpoints (GET /v1/actions, POST /v1/actions/run) are functional with HTTP tests",
+    "CLI commands 'plexd actions list' and 'plexd actions run' are wired to real socket endpoints (not stubs)",
+    "LinuxSystemReader reads from /proc/stat, /proc/meminfo, /proc/loadavg and has build-tagged tests that pass on Linux",
+    "JournalctlReader tracks cursor position and has tests (integration-tagged or mocked)",
+    "FileSource supports glob, offset tracking, 16 KiB line truncation, rotation detection, with tests using temp files",
+    "LogFilter implements severity, unit-include, and unit-exclude filtering with composable tests",
+    "AgentStatsCollector reports goroutine_count, heap_alloc_bytes, uptime_seconds with tests",
+    "SystemStats extended with LoadAvg1/5/15 fields; TunnelStats extended with PacketLossPercent field",
+    "All new goroutines (HookWatcher, action server) have clean shutdown behavior verified with goleak",
+    "No security vulnerabilities: config.dump redacts secrets, hook watcher validates executable permission, action server validates input",
+    "All error messages follow existing 'package: context: detail' convention",
+    "Reference docs updated for all new APIs, types, and behaviors",
+    "All tests pass with -race flag"
+  ],
+  "implementation_notes": "Architectural decisions: (1) Built-in actions use injectable interfaces (HealthProvider, MeshReconnector, ConfigProvider, LogProvider) for testability, following the existing NodeInfoProvider pattern. (2) HookWatcher lives in internal/actions/ alongside discovery.go since it replaces the one-time DiscoverHooks function. Uses fsnotify with 200ms debounce to coalesce rapid file changes. (3) Action server endpoints are added to the existing nodeapi.Handler mux, not a separate server. The Handler receives a *actions.Executor reference. Local actions bypass the SSE/control-plane path and execute synchronously. (4) LinuxSystemReader is build-tagged (_linux.go) and reads from /proc directly. CPU usage requires two samples 100ms apart. (5) JournalctlReader uses journalctl subprocess (not cgo sd_journal) to avoid cgo dependency. Cursor-based pagination prevents re-reading. (6) FileSource stores per-file state (offset, inode) in memory. Rotation is detected by comparing os.Stat().Sys().(*syscall.Stat_t).Ino. MaxLineBytes=16384 with truncation suffix '[truncated]'. (7) LogFilter wraps any LogSource as a decorator pattern. Severity comparison uses a precedence map matching priorityToSeverity. (8) AgentStatsCollector uses runtime.NumGoroutine() and runtime.ReadMemStats(). Start time recorded at construction. ReconnectCounter is an interface with a single Count() int method.\n\nKey risks: (1) journalctl may not be available in all environments; JournalctlReader should return a clear error. (2) /proc filesystem may differ between kernel versions; parsing should be defensive. (3) fsnotify has known limitations on some filesystems (NFS, FUSE); document as known limitation. (4) ServiceRestart action calls systemctl which requires root; document privilege requirements.",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T20:05:02.794487"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T17:40:33.944453"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T17:46:53.614784"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "3bbb30e1-3cb4-4a4a-afe7-84a0db1c0093",
+      "timestamp": "2026-02-14T17:46:53.614834",
+      "total_duration": 376.42427372932434,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 376.42427372932434,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
