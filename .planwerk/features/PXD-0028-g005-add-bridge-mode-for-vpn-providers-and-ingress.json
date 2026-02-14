@@ -1,0 +1,665 @@
+{
+  "feature_id": "PXD-0028",
+  "title": "G005: Add bridge mode for VPN providers and ingress",
+  "slug": "g005-add-bridge-mode-for-vpn-providers-and-ingress",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 🏗️ large\n**Category:** backend\n**Priority:** high\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nImplement all bridge mode connectivity providers and ingress:\n\n**Tailscale Integration:** VPN provider for bridge user access. Configure via `auth_key_env: TS_AUTHKEY`. Manage Tailscale daemon lifecycle, advertise routes, handle auth key rotation.\n\n**Netbird Integration:** VPN provider for bridge user access. Configure via `setup_key_env: NB_SETUP_KEY`. Manage Netbird client lifecycle and route advertisement.\n\n**ACME/Let's Encrypt:** Auto-certificate provisioning for public ingress endpoints (`listen: 0.0.0.0:443`). Use `golang.org/x/crypto/acme/autocert` for automatic certificate issuance and renewal.\n\n**SNI-Based Routing:** TLS SNI inspection for routing incoming connections to correct backend services through the bridge.\n\n**IPsec TunnelProvider:** Site-to-site VPN implementation behind existing `TunnelProvider` interface in `internal/bridge/site_to_site.go`.\n\n**OpenVPN TunnelProvider:** Alternative site-to-site VPN implementation behind same `TunnelProvider` interface.\n\n**Rationale:** Bridge mode is a primary use case - connecting users to private networks and linking sites together. Without VPN providers (Tailscale/Netbird), user access doesn't work. Without ACME/SNI, public ingress requires manual certificate management. Without IPsec/OpenVPN, site-to-site tunnels are limited to WireGuard only.\n\n**Affected Areas:**\n- internal/bridge/tailscale.go\n- internal/bridge/netbird.go\n- internal/bridge/acme.go\n- internal/bridge/sni.go\n- internal/bridge/ipsec.go\n- internal/bridge/openvpn.go\n- internal/bridge/site_to_site.go\n- go.mod",
+  "stories": [
+    {
+      "title": "Operator connects users to mesh via Tailscale VPN",
+      "role": "platform operator",
+      "want": "to configure a Tailscale VPN provider on a bridge node so external users connect via Tailscale and reach mesh resources",
+      "so_that": "developers and admins can access private mesh services through Tailscale without direct mesh membership",
+      "criteria": [
+        "TailscaleProvider implements a VPN provider interface with Start, Stop, Status, and AdvertiseRoutes methods",
+        "Config accepts auth_key_env field referencing an environment variable (e.g. TS_AUTHKEY) and reads the key at startup",
+        "TailscaleProvider manages the tailscale daemon lifecycle: start, authenticate, advertise routes, stop",
+        "Status is reported via heartbeat including provider type, connection state, and advertised routes",
+        "Auth key rotation is handled by re-authenticating when the key changes via SSE event or reconcile",
+        "Errors during daemon start or route advertisement are logged and returned without crashing the bridge"
+      ]
+    },
+    {
+      "title": "Operator connects users to mesh via Netbird VPN",
+      "role": "platform operator",
+      "want": "to configure a Netbird VPN provider on a bridge node so external users connect via Netbird and reach mesh resources",
+      "so_that": "an alternative to Tailscale is available for organizations using Netbird infrastructure",
+      "criteria": [
+        "NetbirdProvider implements the same VPN provider interface as TailscaleProvider",
+        "Config accepts setup_key_env field referencing an environment variable (e.g. NB_SETUP_KEY)",
+        "NetbirdProvider manages the netbird client lifecycle: start with setup key, advertise routes, stop",
+        "Status is reported via heartbeat including provider type and connection state",
+        "Errors during client start or route advertisement are logged and returned",
+        "Both Tailscale and Netbird providers share the same interface so they can be swapped via config"
+      ]
+    },
+    {
+      "title": "Bridge auto-provisions TLS certificates for public ingress",
+      "role": "platform operator",
+      "want": "automatic TLS certificate provisioning via ACME/Let's Encrypt for public ingress endpoints",
+      "so_that": "public HTTPS services are accessible without manual certificate management",
+      "criteria": [
+        "ACMEManager uses golang.org/x/crypto/acme/autocert for certificate issuance and renewal",
+        "Certificates are cached to a configurable directory to survive restarts",
+        "ACMEManager provides a tls.Config that can be used by IngressManager for TLS listeners",
+        "Certificate renewal happens automatically before expiry without service disruption",
+        "ACME challenge validation works via TLS-ALPN-01 on port 443",
+        "Config accepts acme_email, acme_cache_dir, and allowed hostnames for the autocert policy"
+      ]
+    },
+    {
+      "title": "Bridge routes TLS connections based on SNI hostname",
+      "role": "platform operator",
+      "want": "incoming TLS connections to be routed to different backend services based on the SNI hostname",
+      "so_that": "multiple HTTPS services can share a single public IP and port",
+      "criteria": [
+        "SNIRouter inspects the TLS ClientHello to extract the SNI hostname without terminating TLS",
+        "SNIRouter routes connections to the correct backend based on a hostname-to-target mapping",
+        "Unknown hostnames result in connection close with appropriate logging",
+        "SNIRouter integrates with IngressManager as an alternative to per-rule listeners",
+        "Routing table is updated dynamically via SSE events or reconciliation",
+        "Connection proxying uses bidirectional io.Copy like existing ingress proxy"
+      ]
+    },
+    {
+      "title": "Operator establishes site-to-site tunnels via IPsec",
+      "role": "platform operator",
+      "want": "to establish site-to-site VPN tunnels using IPsec protocol through the existing tunnel provider interface",
+      "so_that": "the bridge can connect to enterprise networks that require IPsec rather than WireGuard",
+      "criteria": [
+        "IPsecProvider implements a TunnelProvider interface with CreateTunnel, RemoveTunnel, and Status methods",
+        "TunnelProvider interface is defined alongside the existing VPNController for site-to-site use",
+        "IPsecProvider manages IPsec tunnel lifecycle via strongSwan/libreswan CLI or netlink",
+        "Tunnel configuration includes remote endpoint, PSK/certificate auth, local/remote subnets, IKE/ESP proposals",
+        "SiteToSiteManager can be configured to use IPsecProvider instead of WireGuard-based VPNController",
+        "Status reporting includes tunnel state (up/down), negotiated parameters, and traffic counters"
+      ]
+    },
+    {
+      "title": "Operator establishes site-to-site tunnels via OpenVPN",
+      "role": "platform operator",
+      "want": "to establish site-to-site VPN tunnels using OpenVPN protocol as an alternative to WireGuard and IPsec",
+      "so_that": "the bridge supports legacy networks using OpenVPN for site-to-site connectivity",
+      "criteria": [
+        "OpenVPNProvider implements the same TunnelProvider interface as IPsecProvider",
+        "OpenVPNProvider manages OpenVPN process lifecycle: config generation, start, stop, reconnect",
+        "Tunnel configuration includes remote endpoint, certificates/keys, cipher settings, local/remote subnets",
+        "Provider creates a TUN interface and configures routing for remote subnets",
+        "Status reporting includes process state, connection state, and data transfer stats",
+        "Clean shutdown terminates the OpenVPN process and removes routes"
+      ]
+    },
+    {
+      "title": "System handles VPN provider errors gracefully",
+      "role": "system",
+      "want": "VPN provider failures to be handled without crashing the bridge or affecting other bridge functionality",
+      "so_that": "partial failures in one provider do not cascade to other bridge subsystems",
+      "criteria": [
+        "VPN provider startup failure logs the error and reports degraded status in heartbeat",
+        "Auth key or setup key not found in environment returns a clear error message with the expected env var name",
+        "Provider restart after failure is attempted with exponential backoff",
+        "Teardown of a failed provider is a no-op and does not return errors",
+        "Heartbeat status accurately reflects provider state: inactive, connecting, connected, error"
+      ]
+    },
+    {
+      "title": "System handles ACME certificate errors gracefully",
+      "role": "system",
+      "want": "ACME certificate provisioning failures to be handled gracefully with clear logging",
+      "so_that": "operators can diagnose certificate issues and the bridge continues serving existing certificates",
+      "criteria": [
+        "ACME challenge failure is logged with domain name, error details, and retry timing",
+        "Existing cached certificates continue to serve traffic even when renewal fails",
+        "Invalid or missing ACME email configuration returns a validation error at config time",
+        "Rate limit errors from Let's Encrypt are logged with recommended wait time",
+        "Cache directory permission errors are detected and reported at startup"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL define a UserAccessProvider interface for VPN provider abstraction in bridge user access",
+      "priority": "SHALL",
+      "rationale": "Both Tailscale and Netbird serve the same purpose (VPN user access) and must be interchangeable via a common interface",
+      "scenarios": [
+        {
+          "name": "Provider interface defines lifecycle methods",
+          "when": "a VPN provider implementation is created",
+          "then": "it must implement Start(ctx context.Context, routes []string) error, Stop() error, Status() ProviderStatus, and Name() string",
+          "and_then": [
+            "compile-time interface satisfaction check via var _ UserAccessProvider = (*TailscaleProvider)(nil)"
+          ]
+        },
+        {
+          "name": "Provider is selected via config",
+          "when": "bridge config specifies UserAccessProvider field as 'tailscale' or 'netbird'",
+          "then": "the correct provider implementation is instantiated",
+          "and_then": [
+            "unknown provider type returns a validation error from Config.Validate()"
+          ]
+        },
+        {
+          "name": "Provider status is reported in heartbeat",
+          "when": "the VPN provider is running",
+          "then": "UserAccessInfo includes ProviderName and ProviderStatus fields",
+          "and_then": [
+            "nil status returned when no provider is configured"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The system SHALL implement TailscaleProvider managing the Tailscale daemon lifecycle for bridge user access",
+      "priority": "SHALL",
+      "rationale": "Tailscale is a primary VPN provider specified in the feature description, configured via auth_key_env",
+      "scenarios": [
+        {
+          "name": "Tailscale starts with auth key from environment",
+          "when": "TailscaleProvider.Start is called with auth_key_env=TS_AUTHKEY configured and TS_AUTHKEY set in env",
+          "then": "the auth key is read from os.Getenv, and tailscaled is started via exec.Command",
+          "and_then": [
+            "routes are advertised via 'tailscale set --advertise-routes=...'"
+          ]
+        },
+        {
+          "name": "Missing auth key returns error",
+          "when": "the configured environment variable TS_AUTHKEY is empty or not set",
+          "then": "Start returns error 'bridge: tailscale: auth key not found in env: TS_AUTHKEY'",
+          "and_then": [
+            "provider status reports ProviderStatusError"
+          ]
+        },
+        {
+          "name": "Tailscale stop is idempotent",
+          "when": "TailscaleProvider.Stop is called on an already-stopped provider",
+          "then": "Stop returns nil without error",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The system SHALL implement NetbirdProvider managing the Netbird client lifecycle for bridge user access",
+      "priority": "SHALL",
+      "rationale": "Netbird is an alternative VPN provider specified in the feature description, configured via setup_key_env",
+      "scenarios": [
+        {
+          "name": "Netbird starts with setup key from environment",
+          "when": "NetbirdProvider.Start is called with setup_key_env=NB_SETUP_KEY and NB_SETUP_KEY set in env",
+          "then": "the setup key is read from os.Getenv, and netbird client is started via exec.Command",
+          "and_then": [
+            "routes are advertised via 'netbird routes add ...'"
+          ]
+        },
+        {
+          "name": "Missing setup key returns error",
+          "when": "the configured environment variable NB_SETUP_KEY is empty or not set",
+          "then": "Start returns error 'bridge: netbird: setup key not found in env: NB_SETUP_KEY'",
+          "and_then": [
+            "provider status reports ProviderStatusError"
+          ]
+        },
+        {
+          "name": "Netbird stop is idempotent",
+          "when": "NetbirdProvider.Stop is called on an already-stopped provider",
+          "then": "Stop returns nil without error",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The system SHALL implement ACMEManager for automatic TLS certificate provisioning using golang.org/x/crypto/acme/autocert",
+      "priority": "SHALL",
+      "rationale": "ACME/Let's Encrypt eliminates manual certificate management for public ingress endpoints",
+      "scenarios": [
+        {
+          "name": "ACME manager provides TLS config",
+          "when": "ACMEManager is created with valid email, cache dir, and allowed hostnames",
+          "then": "TLSConfig() returns a *tls.Config with GetCertificate set to autocert.Manager.GetCertificate",
+          "and_then": [
+            "the NextProtos field includes 'h2' and 'http/1.1' and the ACME protocol"
+          ]
+        },
+        {
+          "name": "Certificates are cached to disk",
+          "when": "a certificate is obtained for a hostname",
+          "then": "the certificate is stored in ACMECacheDir via autocert.DirCache",
+          "and_then": [
+            "subsequent TLS handshakes for the same hostname use the cached cert without ACME request"
+          ]
+        },
+        {
+          "name": "Hostname not in allowed list is rejected",
+          "when": "a TLS ClientHello arrives for a hostname not in the ACMEHosts list",
+          "then": "autocert HostPolicy returns an error and the connection is rejected",
+          "and_then": [
+            "no ACME request is made for unauthorized hostnames"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The system SHALL implement SNIRouter for TLS SNI-based connection routing to backend services",
+      "priority": "SHALL",
+      "rationale": "SNI routing enables multiple services behind a single IP:port, essential for production multi-tenant ingress",
+      "scenarios": [
+        {
+          "name": "Connection routed by SNI hostname",
+          "when": "a TLS ClientHello with SNI 'api.example.com' arrives on the SNI listener",
+          "then": "the SNIRouter extracts the hostname via tls.Server with GetConfigForClient, looks up the target, and proxies the full connection (including the ClientHello bytes) to the backend",
+          "and_then": [
+            "bidirectional io.Copy relay is established between client and backend"
+          ]
+        },
+        {
+          "name": "Unknown SNI hostname closes connection",
+          "when": "a TLS ClientHello arrives with hostname 'unknown.example.com' not in the routing table",
+          "then": "the connection is closed and a debug-level log is emitted with the hostname",
+          "and_then": [
+            "no backend dial is attempted"
+          ]
+        },
+        {
+          "name": "Routing table updated dynamically",
+          "when": "SNIRouter.SetRoutes is called with an updated hostname-to-target map",
+          "then": "subsequent connections use the new routing table",
+          "and_then": [
+            "existing connections are not affected"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The system SHALL define a TunnelProvider interface for pluggable site-to-site VPN protocol support (IPsec, OpenVPN)",
+      "priority": "SHALL",
+      "rationale": "IPsec and OpenVPN provide alternatives to WireGuard for environments that require these protocols",
+      "scenarios": [
+        {
+          "name": "TunnelProvider interface defines tunnel lifecycle",
+          "when": "a tunnel provider implementation is created",
+          "then": "it must implement CreateTunnel(cfg TunnelConfig) (string, error), RemoveTunnel(id string) error, TunnelStatus(id string) TunnelStatus, and Protocol() string",
+          "and_then": [
+            "CreateTunnel returns the created interface name for route management"
+          ]
+        },
+        {
+          "name": "SiteToSiteManager uses TunnelProvider for non-WireGuard tunnels",
+          "when": "a SiteToSiteTunnel specifies Protocol='ipsec'",
+          "then": "SiteToSiteManager delegates interface creation to the registered TunnelProvider for ipsec",
+          "and_then": [
+            "route management still uses RouteController as before"
+          ]
+        },
+        {
+          "name": "Unknown protocol returns error",
+          "when": "a SiteToSiteTunnel specifies an unsupported protocol",
+          "then": "AddTunnel returns error 'bridge: site-to-site: unsupported protocol: <protocol>'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The system SHALL implement IPsecProvider behind the TunnelProvider interface for IPsec site-to-site tunnels",
+      "priority": "SHALL",
+      "rationale": "IPsec is the most widely deployed site-to-site VPN protocol in enterprise networks",
+      "scenarios": [
+        {
+          "name": "IPsec tunnel created via strongSwan CLI",
+          "when": "CreateTunnel is called with IPsec config",
+          "then": "a strongSwan connection config is generated and loaded via 'swanctl --load-conns'",
+          "and_then": [
+            "the tunnel is initiated via 'swanctl --initiate' and the created interface name is returned"
+          ]
+        },
+        {
+          "name": "IPsec tunnel removal cleans up state",
+          "when": "RemoveTunnel is called for an active IPsec tunnel",
+          "then": "the connection is terminated via 'swanctl --terminate' and config is unloaded",
+          "and_then": [
+            "idempotent: removing a non-existent tunnel returns nil"
+          ]
+        },
+        {
+          "name": "IPsec status reports negotiated state",
+          "when": "TunnelStatus is called",
+          "then": "status includes state (established/connecting/down)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The system SHALL implement OpenVPNProvider behind the TunnelProvider interface for OpenVPN site-to-site tunnels",
+      "priority": "SHALL",
+      "rationale": "OpenVPN supports legacy VPN deployments and provides TCP fallback capability",
+      "scenarios": [
+        {
+          "name": "OpenVPN tunnel created via process management",
+          "when": "CreateTunnel is called with OpenVPN config",
+          "then": "an OpenVPN config file is written to a temp directory and the openvpn process is started",
+          "and_then": [
+            "the created TUN interface name is returned"
+          ]
+        },
+        {
+          "name": "OpenVPN tunnel removal stops process",
+          "when": "RemoveTunnel is called for an active OpenVPN tunnel",
+          "then": "the openvpn process is sent SIGTERM, waited for, and the config file is removed",
+          "and_then": [
+            "idempotent: removing a non-existent tunnel returns nil"
+          ]
+        },
+        {
+          "name": "OpenVPN process crash is detected",
+          "when": "the openvpn process exits unexpectedly",
+          "then": "the provider detects the exit via process.Wait() and marks status as down",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The bridge Config SHALL validate all new VPN provider, ACME, and tunnel provider configuration fields",
+      "priority": "SHALL",
+      "rationale": "Invalid configuration must be caught at startup, not at runtime when providers fail",
+      "scenarios": [
+        {
+          "name": "Valid Tailscale config passes",
+          "when": "config specifies UserAccessProviderType='tailscale' and AuthKeyEnv='TS_AUTHKEY'",
+          "then": "Validate() returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Unsupported provider type rejected",
+          "when": "config specifies UserAccessProviderType='unknown'",
+          "then": "Validate() returns 'bridge: config: unsupported user access provider: unknown'",
+          "and_then": []
+        },
+        {
+          "name": "ACME without email rejected",
+          "when": "ACMEEnabled=true but ACMEEmail=''",
+          "then": "Validate() returns 'bridge: config: ACMEEmail is required when ACME is enabled'",
+          "and_then": []
+        },
+        {
+          "name": "ACME without cache dir rejected",
+          "when": "ACMEEnabled=true but ACMECacheDir=''",
+          "then": "Validate() returns 'bridge: config: ACMECacheDir is required when ACME is enabled'",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The system SHALL extend heartbeat and capability reporting with VPN provider, ACME, and tunnel provider status",
+      "priority": "SHALL",
+      "rationale": "The control plane needs visibility into which providers are active and their operational state",
+      "scenarios": [
+        {
+          "name": "VPN provider status in UserAccessInfo",
+          "when": "a Tailscale provider is running and connected",
+          "then": "UserAccessInfo includes ProviderName='tailscale' and ProviderStatus='connected'",
+          "and_then": []
+        },
+        {
+          "name": "ACME status in IngressCapabilities",
+          "when": "ACME is enabled with hostnames",
+          "then": "IngressCapabilities includes acme_enabled='true'",
+          "and_then": []
+        },
+        {
+          "name": "Tunnel protocols in SiteToSiteCapabilities",
+          "when": "IPsec and WireGuard providers are available",
+          "then": "SiteToSiteCapabilities includes supported_protocols='wireguard,ipsec'",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Define UserAccessProvider interface and ProviderStatus type in internal/bridge/user_access_provider.go with Start, Stop, Status, Name methods. Define CommandExecutor interface for testability of exec.Command calls. Add compile-time interface checks. (REQ-001)",
+    "1.2 Implement TailscaleProvider in internal/bridge/tailscale.go: Start reads auth key from env var, invokes tailscaled via CommandExecutor, advertises routes; Stop shuts down daemon; Status returns connection state. Include tests in internal/bridge/tailscale_test.go using mock CommandExecutor. (REQ-002)",
+    "1.3 Implement NetbirdProvider in internal/bridge/netbird.go: Start reads setup key from env var, invokes netbird client via CommandExecutor, advertises routes; Stop shuts down client; Status returns connection state. Include tests in internal/bridge/netbird_test.go using mock CommandExecutor. (REQ-003)",
+    "1.4 Define TunnelProvider interface and TunnelConfig/TunnelStatus types in internal/bridge/tunnel_provider.go with CreateTunnel, RemoveTunnel, TunnelStatus, Protocol methods. Add Protocol field to api.SiteToSiteTunnel. (REQ-006)",
+    "1.5 Implement IPsecProvider in internal/bridge/ipsec.go behind TunnelProvider interface: CreateTunnel generates strongSwan config and invokes swanctl CLI via CommandExecutor; RemoveTunnel terminates connection; TunnelStatus returns state. Include tests in internal/bridge/ipsec_test.go. (REQ-007)",
+    "1.6 Implement OpenVPNProvider in internal/bridge/openvpn.go behind TunnelProvider interface: CreateTunnel generates config file and starts openvpn process via CommandExecutor; RemoveTunnel sends SIGTERM and cleans up; TunnelStatus returns process state. Include tests in internal/bridge/openvpn_test.go. (REQ-008)",
+    "2.1 Implement ACMEManager in internal/bridge/acme.go: wraps autocert.Manager with DirCache, HostWhitelist policy, TLS-ALPN-01; exposes TLSConfig() *tls.Config for IngressManager use. Include tests in internal/bridge/acme_test.go verifying TLS config construction, host policy, and cache dir usage. Add golang.org/x/crypto/acme/autocert to go.mod. (REQ-004)",
+    "2.2 Implement SNIRouter in internal/bridge/sni.go: accepts TCP connections, peeks at TLS ClientHello to extract SNI hostname via readClientHello helper, looks up target in sync.RWMutex-protected routing map, proxies full connection (including buffered ClientHello bytes) to backend via bidirectional io.Copy. Exposes SetRoutes(map[string]string) for dynamic updates. Include tests in internal/bridge/sni_test.go with real TCP connections. (REQ-005)",
+    "3.1 Extend bridge Config with new fields: UserAccessProviderType (string), AuthKeyEnv (string), SetupKeyEnv (string), ACMEEnabled (bool), ACMEEmail (string), ACMECacheDir (string), ACMEHosts ([]string), SNIEnabled (bool). Add ApplyDefaults for ACMECacheDir. Add Validate rules for provider type, ACME email, ACME cache dir. Include tests in internal/bridge/config_test.go. (REQ-009)",
+    "3.2 Extend api.UserAccessInfo with ProviderName and ProviderStatus string fields. Extend api.SiteToSiteTunnel with Protocol string field. Extend api.IngressInfo with ACMEEnabled bool field. Update api.SiteToSiteInfo with SupportedProtocols []string field. Include serialization tests in internal/api/types_test.go. (REQ-010, REQ-006)",
+    "3.3 Extend SiteToSiteManager to accept a map[string]TunnelProvider in constructor. In AddTunnel, check tunnel.Protocol: if empty or 'wireguard', use existing VPNController flow; otherwise delegate to the matching TunnelProvider. RemoveTunnel likewise delegates based on stored protocol. Update SiteToSiteCapabilities to include supported protocols. Include tests for protocol dispatch in internal/bridge/site_to_site_test.go. (REQ-006)",
+    "3.4 Extend UserAccessManager to accept an optional UserAccessProvider. In Setup, after creating WireGuard interface, start the provider with mesh routes. In Teardown, stop the provider. Update UserAccessStatus to include provider name and status. Include tests in internal/bridge/user_access_test.go with a mock UserAccessProvider. (REQ-001, REQ-010)",
+    "3.5 Extend IngressManager to accept an optional ACMEManager. When ACME is enabled and a rule uses mode='acme', use ACMEManager.TLSConfig() instead of per-rule certificates. When SNIEnabled, create a single SNIRouter listener instead of per-rule listeners for passthrough rules sharing a port. Include tests in internal/bridge/ingress_test.go. (REQ-004, REQ-005)",
+    "4.1 Write reference documentation in docs/reference/backend/vpn-providers.md covering UserAccessProvider interface, TailscaleProvider config and lifecycle, NetbirdProvider config and lifecycle, error handling, and heartbeat status fields (REQ-001, REQ-002, REQ-003)",
+    "4.2 Write reference documentation in docs/reference/backend/acme-sni.md covering ACMEManager config, TLS config generation, host policy, certificate caching, SNIRouter routing table, connection flow, and integration with IngressManager (REQ-004, REQ-005)",
+    "4.3 Write reference documentation in docs/reference/backend/tunnel-providers.md covering TunnelProvider interface, IPsecProvider strongSwan integration, OpenVPNProvider process management, protocol selection, and SiteToSiteManager dispatch (REQ-006, REQ-007, REQ-008)",
+    "5.1 Integration tests in internal/bridge/provider_integration_test.go: test UserAccessManager with mock UserAccessProvider lifecycle (start, status check, stop), VPN provider selection from config, and heartbeat status propagation (REQ-001, REQ-002, REQ-003, REQ-010)",
+    "5.2 Integration tests in internal/bridge/acme_integration_test.go: test ACMEManager TLS config with real TCP listener, SNIRouter with multiple backends, SNI routing with unknown hostname, and SNIRouter route updates during active connections (REQ-004, REQ-005)",
+    "5.3 Integration tests in internal/bridge/tunnel_provider_integration_test.go: test SiteToSiteManager with mock TunnelProvider for IPsec/OpenVPN protocol dispatch, fallback to VPNController for WireGuard, mixed-protocol tunnel set reconciliation, and unsupported protocol error handling (REQ-006, REQ-007, REQ-008)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/bridge/provider_test.go",
+      "test_function": "TestTailscaleProvider_Start_Success",
+      "story": "Operator connects users to mesh via Tailscale VPN",
+      "expected": "TailscaleProvider.Start should read auth key from env, invoke tailscaled, and advertise routes",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/bridge/provider_test.go",
+      "test_function": "TestTailscaleProvider_Start_MissingAuthKey",
+      "story": "System handles VPN provider errors gracefully",
+      "expected": "TailscaleProvider.Start should return error when auth key env var is not set",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/bridge/provider_test.go",
+      "test_function": "TestTailscaleProvider_Stop_Idempotent",
+      "story": "Operator connects users to mesh via Tailscale VPN",
+      "expected": "Calling Stop twice should return nil both times",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/bridge/provider_test.go",
+      "test_function": "TestTailscaleProvider_Status",
+      "story": "Operator connects users to mesh via Tailscale VPN",
+      "expected": "Status should return correct state reflecting provider lifecycle",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/bridge/provider_test.go",
+      "test_function": "TestNetbirdProvider_Start_Success",
+      "story": "Operator connects users to mesh via Netbird VPN",
+      "expected": "NetbirdProvider.Start should read setup key from env, invoke netbird, and advertise routes",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/provider_test.go",
+      "test_function": "TestNetbirdProvider_Start_MissingSetupKey",
+      "story": "System handles VPN provider errors gracefully",
+      "expected": "NetbirdProvider.Start should return error when setup key env var is not set",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/provider_test.go",
+      "test_function": "TestNetbirdProvider_Stop_Idempotent",
+      "story": "Operator connects users to mesh via Netbird VPN",
+      "expected": "Calling Stop twice should return nil both times",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/bridge/acme_test.go",
+      "test_function": "TestACMEManager_TLSConfig",
+      "story": "Bridge auto-provisions TLS certificates for public ingress",
+      "expected": "TLSConfig returns a *tls.Config with GetCertificate set from autocert.Manager",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/acme_test.go",
+      "test_function": "TestACMEManager_HostPolicy_AllowedHost",
+      "story": "Bridge auto-provisions TLS certificates for public ingress",
+      "expected": "HostPolicy allows hostnames in the configured list",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/acme_test.go",
+      "test_function": "TestACMEManager_HostPolicy_RejectedHost",
+      "story": "System handles ACME certificate errors gracefully",
+      "expected": "HostPolicy rejects hostnames not in the configured list",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/bridge/sni_test.go",
+      "test_function": "TestSNIRouter_RouteByHostname",
+      "story": "Bridge routes TLS connections based on SNI hostname",
+      "expected": "Connection with SNI hostname should be proxied to the correct backend target",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/sni_test.go",
+      "test_function": "TestSNIRouter_UnknownHostname",
+      "story": "Bridge routes TLS connections based on SNI hostname",
+      "expected": "Connection with unknown SNI hostname should be closed",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/sni_test.go",
+      "test_function": "TestSNIRouter_SetRoutes_UpdatesRouting",
+      "story": "Bridge routes TLS connections based on SNI hostname",
+      "expected": "SetRoutes should update routing table for subsequent connections",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/bridge/tunnel_provider_test.go",
+      "test_function": "TestIPsecProvider_CreateTunnel",
+      "story": "Operator establishes site-to-site tunnels via IPsec",
+      "expected": "CreateTunnel should invoke strongSwan CLI and return the interface name",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/bridge/tunnel_provider_test.go",
+      "test_function": "TestIPsecProvider_RemoveTunnel_Idempotent",
+      "story": "Operator establishes site-to-site tunnels via IPsec",
+      "expected": "Removing a non-existent tunnel should return nil",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/bridge/tunnel_provider_test.go",
+      "test_function": "TestOpenVPNProvider_CreateTunnel",
+      "story": "Operator establishes site-to-site tunnels via OpenVPN",
+      "expected": "CreateTunnel should generate config, start openvpn process, and return interface name",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/bridge/tunnel_provider_test.go",
+      "test_function": "TestOpenVPNProvider_RemoveTunnel_Idempotent",
+      "story": "Operator establishes site-to-site tunnels via OpenVPN",
+      "expected": "Removing a non-existent tunnel should return nil",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_UserAccessProvider",
+      "story": "System handles VPN provider errors gracefully",
+      "expected": "Validate should reject unknown provider types and accept tailscale/netbird",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_Validate_ACME",
+      "story": "System handles ACME certificate errors gracefully",
+      "expected": "Validate should reject ACME config without email or cache dir",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/bridge/config_test.go",
+      "test_function": "TestConfig_ApplyDefaults_NewFields",
+      "story": "System handles VPN provider errors gracefully",
+      "expected": "ApplyDefaults should set ACMECacheDir default when ACME is enabled",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestUserAccessInfo_ProviderFields",
+      "story": "Operator connects users to mesh via Tailscale VPN",
+      "expected": "UserAccessInfo should serialize ProviderName and ProviderStatus fields correctly",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestSiteToSiteTunnel_ProtocolField",
+      "story": "Operator establishes site-to-site tunnels via IPsec",
+      "expected": "SiteToSiteTunnel should serialize Protocol field correctly",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_AddTunnel_WithTunnelProvider",
+      "story": "Operator establishes site-to-site tunnels via IPsec",
+      "expected": "AddTunnel with protocol='ipsec' should delegate to TunnelProvider instead of VPNController",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/bridge/site_to_site_test.go",
+      "test_function": "TestSiteToSiteManager_AddTunnel_UnsupportedProtocol",
+      "story": "Operator establishes site-to-site tunnels via IPsec",
+      "expected": "AddTunnel with unsupported protocol should return error",
+      "requirement_id": "REQ-006"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-010) have corresponding passing tests",
+    "All WHEN/THEN scenarios are covered by at least one test case",
+    "All test_specifications are implemented and linked to requirement_id",
+    "Implementation follows existing interface patterns: UserAccessProvider mirrors AccessController/VPNController style, TunnelProvider mirrors VPNController style",
+    "All new interfaces have compile-time satisfaction checks (var _ Interface = (*Impl)(nil))",
+    "Mock test doubles follow existing pattern: struct with mu sync.Mutex, calls []mockCall, per-key error injection, callsFor helper",
+    "Error messages follow existing prefix convention: 'bridge: <component>: <detail>'",
+    "Logging follows existing convention: component=bridge key, structured slog fields",
+    "Config validation follows existing Validate() pattern: skip when disabled, check dependencies on Enabled=true",
+    "All external command execution is abstracted behind CommandExecutor interface for testability",
+    "No new dependencies beyond golang.org/x/crypto/acme/autocert (already have golang.org/x/crypto)",
+    "Reference documentation tasks completed for all new interfaces, providers, and integration points"
+  ],
+  "implementation_notes": "Architectural decisions:\n\n1. **UserAccessProvider interface**: Defined in bridge package alongside existing AccessController. Both Tailscale and Netbird implement the same interface. The provider is optional — UserAccessManager continues to work without a provider (WireGuard-only user access). Provider is started after WireGuard interface setup and stopped before teardown.\n\n2. **CommandExecutor abstraction**: All VPN providers (Tailscale, Netbird) and tunnel providers (IPsec, OpenVPN) shell out to external CLIs. A CommandExecutor interface (Run(ctx, name, args) ([]byte, error)) enables full unit testing without real binaries installed.\n\n3. **TunnelProvider interface**: Defined alongside VPNController in bridge package. The SiteToSiteManager accepts an optional map[string]TunnelProvider keyed by protocol name. When a tunnel's Protocol field is empty or 'wireguard', existing VPNController flow is used. Otherwise, the matching TunnelProvider handles interface creation/removal. Route management via RouteController is shared across all protocols.\n\n4. **Protocol field in SiteToSiteTunnel**: Adding Protocol string field to api.SiteToSiteTunnel. Empty string defaults to 'wireguard' for backward compatibility. Control plane pushes the protocol per tunnel.\n\n5. **ACMEManager**: Thin wrapper around autocert.Manager. Provides TLSConfig() for IngressManager to use when mode='acme'. Uses DirCache for disk persistence. HostWhitelist for domain authorization. golang.org/x/crypto/acme/autocert is already available as a subpackage of the existing golang.org/x/crypto dependency.\n\n6. **SNIRouter**: Reads the TLS ClientHello to extract SNI without consuming the bytes (using a bufio.Reader and Peek). The full connection (including ClientHello) is proxied to the backend. Uses sync.RWMutex for concurrent route table access. Integrates with IngressManager — when SNI is enabled, passthrough rules sharing a port can use a single SNIRouter instead of separate listeners.\n\n7. **Config extensions**: New fields added to existing Config struct following the same pattern as existing fields. ApplyDefaults and Validate extended. No breaking changes to existing config.\n\n8. **API type extensions**: New fields added to existing api types with json tags and omitempty where appropriate. Backward compatible — missing fields default to zero values.\n\nKey files to follow:\n- internal/bridge/vpn_controller.go — interface pattern for TunnelProvider\n- internal/bridge/access_controller.go — interface pattern for UserAccessProvider  \n- internal/bridge/mock_vpn_test.go — mock pattern for new test doubles\n- internal/bridge/config.go — config extension pattern\n- internal/bridge/user_access.go — manager pattern for provider integration\n- internal/bridge/site_to_site.go — manager pattern for protocol dispatch\n- internal/api/types.go — API type extension pattern\n\nRisks:\n- Tailscale/Netbird CLI availability: providers must handle missing binaries gracefully (error at Start, not at construction)\n- strongSwan/openvpn CLI availability: same pattern — error at CreateTunnel, not construction\n- ACME rate limits: production usage must respect Let's Encrypt rate limits; staging URL should be configurable\n- SNI peek buffer: must read enough bytes for ClientHello but handle short reads and non-TLS connections\n- Protocol backward compatibility: empty Protocol field must default to wireguard for existing tunnels",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-13T20:05:02.793060"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T15:54:26.916343"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T15:59:45.160946"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "27ca3b33-7c4e-413d-bbdc-4aa0769fbd2a",
+      "timestamp": "2026-02-14T15:59:45.161005",
+      "total_duration": 314.4055895805359,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 314.4055895805359,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
