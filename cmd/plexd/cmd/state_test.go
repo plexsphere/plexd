@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"bytes"
 	"strings"
 	"testing"
 
@@ -9,27 +8,11 @@ import (
 )
 
 func TestStateCommand_AgentNotRunning(t *testing.T) {
-	buf := new(bytes.Buffer)
-	rootCmd.SetOut(buf)
-	rootCmd.SetErr(buf)
-	rootCmd.SetArgs([]string{"state"})
-
-	err := rootCmd.Execute()
-	if err == nil {
-		t.Fatal("expected error when agent is not running")
-	}
-	if !strings.Contains(err.Error(), "plexd state") {
-		t.Errorf("error should mention 'plexd state', got: %v", err)
-	}
+	assertCmdError(t, "plexd state", "state")
 }
 
 func TestStateGetCommand_RequiresArgs(t *testing.T) {
-	buf := new(bytes.Buffer)
-	rootCmd.SetOut(buf)
-	rootCmd.SetErr(buf)
-	rootCmd.SetArgs([]string{"state", "get"})
-
-	err := rootCmd.Execute()
+	_, err := executeCmd(t, "state", "get")
 	if err == nil {
 		t.Fatal("expected error for missing args")
 	}
@@ -46,19 +29,7 @@ func TestStateGetCommand_InvalidType(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Validate that the type check works by calling runStateGet logic.
-	buf := new(bytes.Buffer)
-	rootCmd.SetOut(buf)
-	rootCmd.SetErr(buf)
-	rootCmd.SetArgs([]string{"state", "get", "invalid", "key"})
-
-	err = rootCmd.Execute()
-	if err == nil {
-		t.Fatal("expected error for invalid type")
-	}
-	if !strings.Contains(err.Error(), "unknown type") {
-		t.Errorf("error should mention 'unknown type', got: %v", err)
-	}
+	assertCmdError(t, "unknown type", "state", "get", "invalid", "key")
 }
 
 func TestStateGetCommand_Success(t *testing.T) {
@@ -94,35 +65,21 @@ func TestStateGetCommand_NotFound(t *testing.T) {
 }
 
 func TestStateReportCommand_MissingData(t *testing.T) {
-	buf := new(bytes.Buffer)
-	rootCmd.SetOut(buf)
-	rootCmd.SetErr(buf)
-	rootCmd.SetArgs([]string{"state", "report", "mykey"})
-
-	err := rootCmd.Execute()
-	if err == nil {
-		t.Fatal("expected error for missing --data")
-	}
-	if !strings.Contains(err.Error(), "--data is required") {
-		t.Errorf("error should mention '--data is required', got: %v", err)
-	}
+	assertCmdError(t, "--data is required", "state", "report", "mykey")
 }
 
 func TestStateReportCommand_InvalidJSON(t *testing.T) {
-	buf := new(bytes.Buffer)
-	rootCmd.SetOut(buf)
-	rootCmd.SetErr(buf)
-	stateReportData = "not-json"
-	rootCmd.SetArgs([]string{"state", "report", "mykey", "--data", "not-json"})
+	oldData := stateReportData
+	t.Cleanup(func() { stateReportData = oldData })
 
-	err := rootCmd.Execute()
+	stateReportData = "not-json"
+	_, err := executeCmd(t, "state", "report", "mykey", "--data", "not-json")
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
 	if !strings.Contains(err.Error(), "valid JSON") {
 		t.Errorf("error should mention 'valid JSON', got: %v", err)
 	}
-	stateReportData = "" // reset
 }
 
 func TestStateReportCommand_Success(t *testing.T) {
@@ -137,14 +94,7 @@ func TestStateReportCommand_Success(t *testing.T) {
 }
 
 func TestStateCommand_Help(t *testing.T) {
-	buf := new(bytes.Buffer)
-	rootCmd.SetOut(buf)
-	rootCmd.SetErr(buf)
-	rootCmd.SetArgs([]string{"state", "--help"})
-
-	_ = rootCmd.Execute()
-
-	output := buf.String()
+	output := executeHelp(t, "state", "--help")
 	if !strings.Contains(output, "get") {
 		t.Errorf("help should list 'get' subcommand, got: %s", output)
 	}

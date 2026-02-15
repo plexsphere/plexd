@@ -1,0 +1,149 @@
+{
+  "summary": "9 new test files created for audit, deregister, hooks, install, join, peers, policies, sockutil, and uninstall CLI commands. All files compile and tests pass. However, the 'success path' tests for audit/peers/policies/hooks bypass command logic entirely by calling socketGet/socketPost directly instead of invoking RunE, leaving actual command output formatting untested. hooks_test.go lacks required table-driven tests. Helper function duplication exists between sockutil_test.go and status_test.go.",
+  "verdict": "NEEDS_CHANGES",
+  "tests_checklist": [
+    {"item": "All 9 test files exist and compile", "checked": true},
+    {"item": "go test ./cmd/plexd/cmd/ -v -count=1 reports PASS", "checked": true},
+    {"item": "No regressions in existing tests", "checked": true},
+    {"item": "No duplicate test function names", "checked": true},
+    {"item": "go vet reports no errors", "checked": true},
+    {"item": "golangci-lint reports no errors", "checked": true},
+    {"item": "No external test framework imports", "checked": true},
+    {"item": "Test helpers use t.Helper(), t.TempDir(), t.Cleanup()", "checked": true},
+    {"item": "deregister_test.go and join_test.go clean up package-level variables with t.Cleanup", "checked": false},
+    {"item": "Table-driven tests in hooks_test.go for list/verify scenarios", "checked": false},
+    {"item": "Success-path tests actually invoke command RunE logic", "checked": false},
+    {"item": "Tests verify command output strings, not just HTTP status codes", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing test patterns from status_test.go, state_test.go", "checked": false},
+    {"item": "No code duplication between test helpers", "checked": false},
+    {"item": "Clear, intention-revealing test names", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "Consistent help-testing pattern (rootCmd.SetArgs vs cmd.Help())", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets in test files", "checked": true},
+    {"item": "No sensitive data in test assertions", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Test files co-located with source in cmd/plexd/cmd/", "checked": true},
+    {"item": "All tests in package cmd (not cmd_test)", "checked": true},
+    {"item": "Reuses existing test helpers", "checked": false}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated test helper functions", "checked": false},
+    {"item": "No unnecessary test infrastructure", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "t.Fatal used for setup failures", "checked": true},
+    {"item": "t.Error used for assertion failures", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "resp.Body.Close() called via defer", "checked": true},
+    {"item": "Server cleanup via t.Cleanup", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [
+    {
+      "severity": "MAJOR",
+      "description": "startTestSocketServer() in sockutil_test.go duplicates startFakeAgent() from status_test.go. Both create Unix socket HTTP servers with identical lifecycle management (t.TempDir, t.Cleanup, polling readiness loop). startTestSocketServer accepts a generic http.Handler while startFakeAgent takes a StateSummary — the former is more general but creates unnecessary duplication.",
+      "location": "cmd/plexd/cmd/sockutil_test.go:121-155",
+      "fix": "Remove startTestSocketServer. Use startFakeAgent where StateSummary is needed, or refactor startFakeAgent to optionally accept an http.Handler parameter."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "TE1-1",
+      "severity": "major",
+      "check": "TE1",
+      "file": "cmd/plexd/cmd/audit_test.go:9-22",
+      "description": "TestAuditCommand_SuccessPath does not test runAudit(). It creates a fake agent then calls socketGet() directly, verifying HTTP 200. This tests sockutil.go, not audit.go. The actual audit command output ('audit collection status not yet available') is never verified.",
+      "fix": "Either inject the socket path into runAudit (requires refactoring audit.go to accept a socket path) or test the full command via rootCmd.Execute() with a socket path override. At minimum, verify the output string."
+    },
+    {
+      "id": "TE1-2",
+      "severity": "major",
+      "check": "TE1",
+      "file": "cmd/plexd/cmd/peers_test.go:31-44",
+      "description": "TestPeersCommand_SuccessPath is identical to TestAuditCommand_SuccessPath — calls socketGet('/v1/state') directly, never invokes runPeers(). Does not verify 'peer listing not yet available' output.",
+      "fix": "Same as TE1-1. The test should verify command-specific output, not just that an HTTP server responds with 200."
+    },
+    {
+      "id": "TE1-3",
+      "severity": "major",
+      "check": "TE1",
+      "file": "cmd/plexd/cmd/policies_test.go:31-44",
+      "description": "TestPoliciesCommand_SuccessPath is identical to audit and peers — calls socketGet('/v1/state') directly, never invokes runPolicies(). Does not verify 'policy listing not yet available' output.",
+      "fix": "Same as TE1-1."
+    },
+    {
+      "id": "TE1-4",
+      "severity": "major",
+      "check": "TE1",
+      "file": "cmd/plexd/cmd/hooks_test.go:13-166",
+      "description": "All hooks tests (list empty, list with hooks, verify, reload) call socketGet/socketPost directly instead of invoking runHooksList/runHooksVerify/runHooksReload. The actual command logic is untested: tabwriter formatting (hooks.go:75-84), checksum truncation >12 chars (hooks.go:79-81), verify WARN/OK output (hooks.go:118-123), reload Status/Hooks count output (hooks.go:160-161).",
+      "fix": "Tests should invoke the RunE functions or the command via rootCmd.Execute(). Verify actual formatted output: tabwriter columns, truncated checksums, WARN/OK lines, status/hooks count."
+    },
+    {
+      "id": "TE7-1",
+      "severity": "major",
+      "check": "TE7",
+      "file": "cmd/plexd/cmd/hooks_test.go:51-79",
+      "description": "TestHooksListCommand_RunE claims to test RunE but actually just decodes a JSON response from a mock server. Assertion checks len(got)==1 and got[0].Name=='hook-a' — this tests json.Decode, not the command's tabwriter output.",
+      "fix": "Replace with a test that calls runHooksList and captures the tabwriter-formatted output buffer."
+    },
+    {
+      "id": "C2-1",
+      "severity": "major",
+      "check": "C2",
+      "file": "cmd/plexd/cmd/hooks_test.go",
+      "description": "Review criteria requires 'Table-driven tests used in hooks_test.go for list/verify scenarios with multiple hook configurations'. hooks_test.go contains zero table-driven tests — each scenario is a separate function.",
+      "fix": "Refactor hooks list and verify tests to use table-driven pattern: []struct{name string, hooks []api.HookInfo, wantOutput string} with t.Run subtests."
+    },
+    {
+      "id": "Q3-1",
+      "severity": "major",
+      "check": "Q3",
+      "file": "cmd/plexd/cmd/sockutil_test.go:121-155",
+      "description": "startTestSocketServer duplicates startFakeAgent from status_test.go. Both functions: create tmpDir via t.TempDir(), listen on Unix socket, start http.Server in goroutine, register t.Cleanup for shutdown+remove, poll for socket readiness.",
+      "fix": "Remove startTestSocketServer. Either reuse startFakeAgent where applicable, or extract a shared helper to a test_helpers_test.go file that both can use."
+    },
+    {
+      "id": "P1-1",
+      "severity": "minor",
+      "check": "P1",
+      "file": "cmd/plexd/cmd/peers_test.go:11, deregister_test.go:9, hooks_test.go:152, install_test.go:9, join_test.go:9, uninstall_test.go:9",
+      "description": "Help tests use cmd.Help() directly (e.g., peersCmd.Help()), while existing tests (logs_test.go:9, status_test.go:60, root_test.go:9) use rootCmd.SetArgs(['cmd', '--help']) then rootCmd.Execute(). Inconsistent pattern.",
+      "fix": "Use the existing pattern: rootCmd.SetArgs(['peers', '--help']); rootCmd.Execute() for consistency."
+    },
+    {
+      "id": "P1-2",
+      "severity": "minor",
+      "check": "P1",
+      "file": "cmd/plexd/cmd/deregister_test.go:41-56, join_test.go:41-56",
+      "description": "ConfigError tests set rootCmd.SetOut/SetErr but don't reset to nil after rootCmd.Execute() returns error. Other tests in the same files (Help tests) DO reset. The existing pattern in status_test.go:18-31 also doesn't reset, so this is consistent with pre-existing code, but inconsistent within the same file.",
+      "fix": "Add defer to reset: defer func() { rootCmd.SetOut(nil); rootCmd.SetErr(nil) }() after SetOut/SetErr calls."
+    },
+    {
+      "id": "TE4-1",
+      "severity": "minor",
+      "check": "TE4",
+      "file": "cmd/plexd/cmd/deregister_test.go:41, cmd/plexd/cmd/join_test.go:41",
+      "description": "Tests that call rootCmd.Execute() with '--config /nonexistent/path' modify the package-level cfgFile variable via cobra flag parsing. No t.Cleanup restores the default value. While existing tests have the same issue, the review criteria explicitly required cleanup for these tests.",
+      "fix": "Add t.Cleanup to save and restore cfgFile: old := cfgFile; t.Cleanup(func() { cfgFile = old })"
+    }
+  ],
+  "suggested_improvements": [
+    "Extract a shared test helper (e.g., in helpers_test.go) that can create either a generic HTTP Unix socket server or a StateSummary-based fake agent, replacing both startFakeAgent and startTestSocketServer",
+    "For commands that use defaultSocketPath() (audit, peers, policies, hooks), consider adding a package-level var socketPathOverride that tests can set via t.Cleanup to enable full command execution testing",
+    "Add output-assertion tests that verify the actual printed strings: 'audit collection status not yet available', 'peer listing not yet available', 'policy listing not yet available', tabwriter-formatted hooks output",
+    "Add a TestHooksList_ChecksumTruncation test verifying checksums >12 chars are truncated with '...' (hooks.go:79-81)"
+  ],
+  "next_steps": [
+    "Fix TE1-1 through TE1-4: Rewrite success-path tests for audit, peers, policies, and hooks to actually invoke command RunE functions and verify output",
+    "Fix C2-1: Add table-driven tests to hooks_test.go for list/verify with multiple hook configurations",
+    "Fix Q3-1: Consolidate startTestSocketServer and startFakeAgent into a shared helper",
+    "Fix TE4-1: Add t.Cleanup for package-level variable restoration in deregister_test.go and join_test.go"
+  ]
+}

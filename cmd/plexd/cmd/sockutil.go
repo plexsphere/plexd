@@ -46,7 +46,14 @@ func socketPost(socketPath, path, contentType string, body io.Reader) (*http.Res
 	return resp, nil
 }
 
+// socketPathOverride allows tests to redirect socket-based commands to a
+// temporary Unix socket. Production code leaves this empty.
+var socketPathOverride string
+
 // defaultSocketPath returns the configured or default socket path.
 func defaultSocketPath() string {
+	if socketPathOverride != "" {
+		return socketPathOverride
+	}
 	return nodeapi.DefaultSocketPath
 }
