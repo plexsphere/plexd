@@ -129,7 +129,9 @@ func TestHeartbeatService_SendsAtInterval(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Millisecond)
 	defer cancel()
 
-	svc.Run(ctx)
+	if err := svc.Run(ctx); err != nil && ctx.Err() == nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
 
 	calls := client.getCalls()
 	// Expect immediate heartbeat + at least 2 ticker heartbeats.
@@ -153,7 +155,9 @@ func TestHeartbeatService_ReconcileTrigger(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	svc.Run(ctx)
+	if err := svc.Run(ctx); err != nil && ctx.Err() == nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
 
 	if got := rt.getCalls(); got != 1 {
 		t.Errorf("TriggerReconcile calls = %d, want 1", got)
@@ -181,7 +185,9 @@ func TestHeartbeatService_RotateKeys(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	svc.Run(ctx)
+	if err := svc.Run(ctx); err != nil && ctx.Err() == nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
 
 	mu.Lock()
 	got := rotated
@@ -213,7 +219,9 @@ func TestHeartbeatService_AuthFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	svc.Run(ctx)
+	if err := svc.Run(ctx); err != nil && ctx.Err() == nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
 
 	mu.Lock()
 	got := authFails
@@ -239,7 +247,9 @@ func TestHeartbeatService_TransientError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Millisecond)
 	defer cancel()
 
-	svc.Run(ctx)
+	if err := svc.Run(ctx); err != nil && ctx.Err() == nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
 
 	calls := client.getCalls()
 	// Heartbeats must continue past the first error.
@@ -295,7 +305,9 @@ func TestHeartbeatService_BuildRequest(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	svc.Run(ctx)
+	if err := svc.Run(ctx); err != nil && ctx.Err() == nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
 
 	reqs := client.getRequests()
 	if len(reqs) == 0 {
