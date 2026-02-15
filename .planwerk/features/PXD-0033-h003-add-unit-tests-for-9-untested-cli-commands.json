@@ -430,100 +430,16 @@
     }
   ],
   "tasks": [
-    {
-      "id": "1.1",
-      "title": "Create sockutil_test.go with tests for socket helper functions (REQ-001, REQ-008, REQ-009)",
-      "description": "Create cmd/plexd/cmd/sockutil_test.go with tests for: (1) TestSocketURL verifies socketURL('/v1/state') returns 'http://localhost/v1/state', (2) TestSocketGet_Success creates a temp Unix socket with net.Listen('unix', ...) serving HTTP 200 JSON at /v1/test, calls socketGet and verifies StatusCode and body, (3) TestSocketGet_ConnectionRefused calls socketGet with /tmp/nonexistent.sock and verifies error contains 'agent not running or socket unavailable at', (4) TestSocketPost_Success same as GET but with socketPost and POST body, (5) TestSocketPost_ConnectionRefused, (6) TestDefaultSocketPath verifies defaultSocketPath() == nodeapi.DefaultSocketPath. Use t.TempDir() for socket paths. Import net, net/http, testing, strings, io, path/filepath, github.com/plexsphere/plexd/internal/nodeapi.",
-      "file": "cmd/plexd/cmd/sockutil_test.go",
-      "depends_on": [],
-      "level": 1
-    },
-    {
-      "id": "1.2",
-      "title": "Create audit_test.go with success-path test (REQ-001, REQ-002, REQ-003, REQ-009)",
-      "description": "Create cmd/plexd/cmd/audit_test.go with: (1) TestAuditCommand_SuccessPath — calls startFakeAgent(t, nodeapi.StateSummary{}) to get socketPath, then calls socketGet(socketPath, '/v1/state') and verifies no error and response status 200 (same pattern as TestStatusCommand_Success in status_test.go). NOTE: TestAuditCommand_AgentNotRunning and TestAuditCommand_Help already exist in logs_test.go — do NOT duplicate them. Add a comment at top of file referencing the existing tests. (2) TestAuditCommand_SuccessOutput — use startFakeAgent, call socketGet directly, verify the response is valid JSON matching nodeapi.StateSummary. The audit command's actual output 'audit collection status not yet available' can only be tested if we can override defaultSocketPath() — since we can't, test the socket interaction layer directly.",
-      "file": "cmd/plexd/cmd/audit_test.go",
-      "depends_on": [],
-      "level": 1
-    },
-    {
-      "id": "1.3",
-      "title": "Create peers_test.go with help and success-path tests (REQ-001, REQ-002, REQ-003, REQ-009)",
-      "description": "Create cmd/plexd/cmd/peers_test.go with: (1) TestPeersCommand_Help — rootCmd.SetArgs(['peers', '--help']), verify output contains 'peers' and 'Unix socket'. (2) TestPeersCommand_SuccessPath — startFakeAgent with empty StateSummary, call socketGet(socketPath, '/v1/state'), verify response 200. NOTE: TestPeersCommand_AgentNotRunning exists in status_test.go — do NOT duplicate. Add a comment.",
-      "file": "cmd/plexd/cmd/peers_test.go",
-      "depends_on": [],
-      "level": 1
-    },
-    {
-      "id": "1.4",
-      "title": "Create policies_test.go with help and success-path tests (REQ-001, REQ-002, REQ-003, REQ-009)",
-      "description": "Create cmd/plexd/cmd/policies_test.go with: (1) TestPoliciesCommand_Help — rootCmd.SetArgs(['policies', '--help']), verify output contains 'policies' and 'Unix socket'. (2) TestPoliciesCommand_SuccessPath — startFakeAgent with empty StateSummary, call socketGet(socketPath, '/v1/state'), verify response 200. NOTE: TestPoliciesCommand_AgentNotRunning exists in status_test.go — do NOT duplicate. Add a comment.",
-      "file": "cmd/plexd/cmd/policies_test.go",
-      "depends_on": [],
-      "level": 1
-    },
-    {
-      "id": "2.1",
-      "title": "Create hooks_test.go with dedicated success-path tests for list, verify, reload (REQ-001, REQ-002, REQ-004, REQ-009)",
-      "description": "Create cmd/plexd/cmd/hooks_test.go. NOTE: existing tests (TestHooksCommand_Help, TestHooksListCommand_AgentNotRunning, TestHooksVerifyCommand_AgentNotRunning, TestHooksReloadCommand_AgentNotRunning) are in actions_test.go — do NOT duplicate. This new file focuses on success-path tests that require a fake agent.\n\nCreate startFakeHooksAgent(t, hooks []api.HookInfo) helper: starts HTTP server on temp Unix socket serving:\n- GET /v1/hooks → JSON-encode the hooks slice, return 200\n- POST /v1/hooks/reload → JSON-encode hooksReloadResponseMsg{Status: 'reloaded', Hooks: hooks}, return 200\n\nTests:\n(1) TestHooksList_EmptyHooks — startFakeHooksAgent with empty slice, socketGet /v1/hooks, parse response, verify len==0\n(2) TestHooksList_MultipleHooks — 2 hooks (one with long checksum >12 chars), verify JSON response contains both hooks\n(3) TestHooksVerify_AllChecksums — 2 hooks with checksums, socketGet /v1/hooks, verify all have non-empty Checksum field\n(4) TestHooksVerify_MissingChecksum — 1 hook with empty checksum, verify it has Checksum==''\n(5) TestHooksReload_Success — socketPost /v1/hooks/reload, parse hooksReloadResponseMsg, verify Status=='reloaded'\n(6) TestHooksList_NonOKStatus — fake agent returns 500, verify error from non-200 response path",
-      "file": "cmd/plexd/cmd/hooks_test.go",
-      "depends_on": [],
-      "level": 2
-    },
-    {
-      "id": "2.2",
-      "title": "Create install_test.go with help and error-path tests (REQ-001, REQ-002, REQ-007, REQ-009)",
-      "description": "Create cmd/plexd/cmd/install_test.go with: (1) TestInstallCommand_Help — rootCmd.SetArgs(['install', '--help']), verify output contains 'install', '--api-url', '--token', '--token-file'. (2) TestInstallCommand_ErrorPrefix — rootCmd.SetArgs(['install']), call rootCmd.Execute(), expect error, verify error string contains 'plexd install:'. This will fail because NewRootChecker().IsRoot() returns false in CI → packaging.NewInstaller returns 'not root' error wrapped with the prefix. (3) TestInstallCommand_FlagRegistration — access installCmd.Flags() directly and verify the three flags exist by calling Lookup('api-url'), Lookup('token'), Lookup('token-file') and checking non-nil.",
-      "file": "cmd/plexd/cmd/install_test.go",
-      "depends_on": [],
-      "level": 2
-    },
-    {
-      "id": "2.3",
-      "title": "Create uninstall_test.go with help and error-path tests (REQ-001, REQ-002, REQ-007, REQ-009)",
-      "description": "Create cmd/plexd/cmd/uninstall_test.go with: (1) TestUninstallCommand_Help — rootCmd.SetArgs(['uninstall', '--help']), verify output contains 'uninstall' and '--purge'. (2) TestUninstallCommand_ErrorPrefix — rootCmd.SetArgs(['uninstall']), call rootCmd.Execute(), expect error, verify error contains 'plexd uninstall:'. (3) TestUninstallCommand_FlagRegistration — verify uninstallCmd.Flags().Lookup('purge') is non-nil.",
-      "file": "cmd/plexd/cmd/uninstall_test.go",
-      "depends_on": [],
-      "level": 2
-    },
-    {
-      "id": "3.1",
-      "title": "Create deregister_test.go with config, identity, and API error tests plus success path (REQ-001, REQ-002, REQ-005, REQ-006, REQ-009)",
-      "description": "Create cmd/plexd/cmd/deregister_test.go. This is the most complex test file.\n\nHelper: writeMinimalConfig(t, dir, apiBaseURL, dataDir, tokenFile string) string — writes a minimal YAML config to dir/config.yaml with api.base_url, data_dir, and registration.token_file, returns the config file path.\n\nHelper: writeIdentity(t, dataDir, nodeID, meshIP, secretKey string) — writes identity.json to dataDir with node_id, mesh_ip fields and creates a dummy private key file.\n\nTests:\n(1) TestDeregisterCommand_Help — verify help contains 'deregister' and '--purge'\n(2) TestDeregisterCommand_FlagRegistration — verify deregisterCmd.Flags().Lookup('purge') non-nil\n(3) TestDeregisterCommand_MissingConfig — rootCmd.SetArgs(['deregister', '--config', '/tmp/nonexistent.yaml']), verify error contains 'plexd deregister:'\n(4) TestDeregisterCommand_MissingIdentity — write config with valid data_dir but no identity files, rootCmd.SetArgs(['deregister', '--config', cfgPath]), verify error contains 'load identity'\n(5) TestDeregisterCommand_Success — write config + identity, start httptest.NewServer handling POST /v1/nodes/{id}/deregister with 200, set cfgFile to temp config path, set apiURL to test server URL, call runDeregister directly with a cobra.Command that has OutOrStdout set to buffer, verify output contains 'node <id> deregistered', verify data_dir still exists (no --purge)\n(6) TestDeregisterCommand_SuccessWithPurge — same as above but set deregisterPurge=true, verify data_dir is removed and output contains 'local data purged', reset deregisterPurge in t.Cleanup\n(7) TestDeregisterCommand_APIFailure — start httptest.NewServer returning 500, verify error contains 'plexd deregister:'\n\nIMPORTANT: Tests 5-7 call runDeregister directly (not through rootCmd.Execute) to avoid global state issues with cfgFile. Set package-level vars (cfgFile, apiURL, deregisterPurge) with t.Cleanup to restore original values.",
-      "file": "cmd/plexd/cmd/deregister_test.go",
-      "depends_on": [
-        "1.1"
-      ],
-      "level": 3
-    },
-    {
-      "id": "3.2",
-      "title": "Create join_test.go with config error, API error, and success-path tests (REQ-001, REQ-002, REQ-005, REQ-009)",
-      "description": "Create cmd/plexd/cmd/join_test.go.\n\nReuse the writeMinimalConfig helper pattern from deregister_test.go (or define a similar local one).\n\nTests:\n(1) TestJoinCommand_Help — verify help contains 'join' and '--token-file'\n(2) TestJoinCommand_FlagRegistration — verify joinCmd.Flags().Lookup('token-file') non-nil\n(3) TestJoinCommand_MissingConfig — rootCmd.SetArgs(['join', '--config', '/tmp/nonexistent.yaml']), verify error contains 'plexd join:'\n(4) TestJoinCommand_CreateClientFailure — write config with invalid api.base_url (empty string), call runJoin, verify error contains 'plexd join:' (api.Config.Validate will fail with empty BaseURL)\n(5) TestJoinCommand_Success — write config with api.base_url pointing to httptest.NewServer, server handles POST /v1/nodes with registration response JSON (node_id, mesh_ip, signing keys), write a bootstrap token file, set package-level vars (cfgFile, apiURL, joinTokenFile) with t.Cleanup, call runJoin directly, verify output contains 'node_id:' and 'mesh_ip:'\n\nNOTE: Success path for join is complex because registration.NewRegistrar + registrar.Register involves: reading token file, generating keys, making HTTP registration call, and persisting identity to disk. The test server must return a valid registration.RegisterResponse JSON. Study internal/registration/registrar_test.go for the expected request/response format.",
-      "file": "cmd/plexd/cmd/join_test.go",
-      "depends_on": [
-        "1.1"
-      ],
-      "level": 3
-    },
-    {
-      "id": "4.1",
-      "title": "Verify all tests pass and no regressions (REQ-010)",
-      "description": "Run the full test suite: go test ./cmd/plexd/cmd/ -v -count=1. Verify: (1) All new tests pass, (2) All existing tests pass unchanged, (3) No test name conflicts. Run go vet ./cmd/plexd/cmd/ and verify clean. Run golangci-lint run ./cmd/plexd/cmd/ and verify clean. Fix any issues found.",
-      "file": null,
-      "depends_on": [
-        "1.1",
-        "1.2",
-        "1.3",
-        "1.4",
-        "2.1",
-        "2.2",
-        "2.3",
-        "3.1",
-        "3.2"
-      ],
-      "level": 4
-    }
+    "1.1 Create sockutil_test.go with tests for socket helper functions (REQ-001, REQ-008, REQ-009)",
+    "1.2 Create audit_test.go with success-path test (REQ-001, REQ-002, REQ-003, REQ-009)",
+    "1.3 Create peers_test.go with help and success-path tests (REQ-001, REQ-002, REQ-003, REQ-009)",
+    "1.4 Create policies_test.go with help and success-path tests (REQ-001, REQ-002, REQ-003, REQ-009)",
+    "2.1 Create hooks_test.go with dedicated success-path tests for list, verify, reload (REQ-001, REQ-002, REQ-004, REQ-009)",
+    "2.2 Create install_test.go with help and error-path tests (REQ-001, REQ-002, REQ-007, REQ-009)",
+    "2.3 Create uninstall_test.go with help and error-path tests (REQ-001, REQ-002, REQ-007, REQ-009)",
+    "3.1 Create deregister_test.go with config, identity, and API error tests plus success path (REQ-001, REQ-002, REQ-005, REQ-006, REQ-009)",
+    "3.2 Create join_test.go with config error, API error, and success-path tests (REQ-001, REQ-002, REQ-005, REQ-009)",
+    "4.1 Verify all tests pass and no regressions (REQ-010)"
   ],
   "test_specifications": [
     {
