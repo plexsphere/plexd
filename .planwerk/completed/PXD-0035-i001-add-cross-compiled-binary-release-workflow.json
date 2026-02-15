@@ -2,8 +2,8 @@
   "feature_id": "PXD-0035",
   "title": "I001: Add cross-compiled binary release workflow",
   "slug": "i001-add-cross-compiled-binary-release-workflow",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** infrastructure\n**Priority:** high\n**Source:** Proposed for 'There are currently no GitHub Actions for the bui'\n\nCreate `.github/workflows/release.yml` that triggers on tag push (`v*`) to cross-compile `plexd` for linux/amd64 and linux/arm64, generate `checksums.sha256`, and create a GitHub Release with auto-generated notes.\n\nWorkflow steps:\n1. Checkout code + setup Go (version from go.mod)\n2. Build matrix for linux/amd64 and linux/arm64 using `GOOS`/`GOARCH` env vars\n3. Inject version metadata via ldflags (`VERSION` from tag, `COMMIT` from SHA, `DATE` from build time) — match existing Makefile/Dockerfile patterns\n4. Output binaries named `plexd-linux-amd64` and `plexd-linux-arm64` (must match `install.sh` convention)\n5. Generate `checksums.sha256` via `sha256sum` over all binaries\n6. Create GitHub Release using `gh release create` with `--generate-notes`, upload all 3 artifacts\n\nKey actions: `actions/checkout`, `actions/setup-go`, `actions/upload-artifact` (for inter-job transfer if needed), `gh release create` via GitHub CLI.\n\nReference existing files (read-only): `Makefile` for ldflags pattern, `deploy/install.sh` for expected artifact names (`plexd-linux-{arch}`, `checksums.sha256`).\n\n**Rationale:** The install.sh script and Makefile reference binary artifacts (plexd-linux-amd64, plexd-linux-arm64, checksums.sha256) that nothing in CI currently produces. Users cannot install plexd via the documented install script because no GitHub Release with these artifacts exists. This blocks the entire binary distribution channel.\n\n**Affected Areas:**\n- .github/workflows/release.yml",
   "stories": [
@@ -403,11 +403,11 @@
     }
   ],
   "tasks": [
-    "1.1 Create `.github/workflows/release.yml` with workflow metadata, trigger configuration (`on.push.tags: ['v*']`), and permissions block (`contents: write`). File location: `.github/workflows/release.yml`. (REQ-001, REQ-008)",
-    "1.2 Add `build` job with matrix strategy (`strategy.matrix.goarch: [amd64, arm64]`), checkout, setup-go (Go 1.24, SHA-pinned), and cross-compilation step using `CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} go build -ldflags '-s -w -X main.version=... -X main.commit=... -X main.date=...' -o plexd-linux-${{ matrix.goarch }} ./cmd/plexd`. Upload binary via `actions/upload-artifact`. (REQ-002, REQ-003, REQ-004, REQ-007, REQ-009, REQ-010)",
-    "1.3 Add `release` job with `needs: build`, download all artifacts via `actions/download-artifact`, generate `checksums.sha256` via `sha256sum plexd-linux-* > checksums.sha256`, and create GitHub Release via `gh release create ${{ github.ref_name }} --generate-notes plexd-linux-amd64 plexd-linux-arm64 checksums.sha256` with `GH_TOKEN: ${{ github.token }}`. (REQ-005, REQ-006, REQ-010)",
-    "2.1 Create `.github/workflows/test_release_workflow.sh` test script that validates: YAML syntax, trigger config (tag push v* only), build matrix (amd64+arm64), ldflags pattern (version/commit/date), binary naming convention, sha256sum generation, gh release create command, SHA-pinned actions matching ci.yml, permissions block, CGO_ENABLED=0, timeout-minutes, and job dependency chain. Follow the pattern of `deploy/docker/test_dockerfile.sh` for structure. (REQ-001 through REQ-010)",
-    "3.1 Create reference documentation at `docs/reference/backend/release-workflow.md` covering: trigger events, job structure (build matrix + release), build arguments and ldflags, artifact naming, checksum format, permissions, action versions table, and how to create a release (push a tag). Follow the format of `docs/reference/backend/ci-workflow.md`. (REQ-001 through REQ-010)"
+    "[done] 1.1 Create `.github/workflows/release.yml` with workflow metadata, trigger configuration (`on.push.tags: ['v*']`), and permissions block (`contents: write`). File location: `.github/workflows/release.yml`. (REQ-001, REQ-008)",
+    "[done] 1.2 Add `build` job with matrix strategy (`strategy.matrix.goarch: [amd64, arm64]`), checkout, setup-go (Go 1.24, SHA-pinned), and cross-compilation step using `CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} go build -ldflags '-s -w -X main.version=... -X main.commit=... -X main.date=...' -o plexd-linux-${{ matrix.goarch }} ./cmd/plexd`. Upload binary via `actions/upload-artifact`. (REQ-002, REQ-003, REQ-004, REQ-007, REQ-009, REQ-010)",
+    "[done] 1.3 Add `release` job with `needs: build`, download all artifacts via `actions/download-artifact`, generate `checksums.sha256` via `sha256sum plexd-linux-* > checksums.sha256`, and create GitHub Release via `gh release create ${{ github.ref_name }} --generate-notes plexd-linux-amd64 plexd-linux-arm64 checksums.sha256` with `GH_TOKEN: ${{ github.token }}`. (REQ-005, REQ-006, REQ-010)",
+    "[done] 2.1 Create `.github/workflows/test_release_workflow.sh` test script that validates: YAML syntax, trigger config (tag push v* only), build matrix (amd64+arm64), ldflags pattern (version/commit/date), binary naming convention, sha256sum generation, gh release create command, SHA-pinned actions matching ci.yml, permissions block, CGO_ENABLED=0, timeout-minutes, and job dependency chain. Follow the pattern of `deploy/docker/test_dockerfile.sh` for structure. (REQ-001 through REQ-010)",
+    "[done] 3.1 Create reference documentation at `docs/reference/backend/release-workflow.md` covering: trigger events, job structure (build matrix + release), build arguments and ldflags, artifact naming, checksum format, permissions, action versions table, and how to create a release (push a tag). Follow the format of `docs/reference/backend/ci-workflow.md`. (REQ-001 through REQ-010)"
   ],
   "test_specifications": [
     {
@@ -556,6 +556,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-15T20:40:02.180411"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T21:20:38.621510"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T21:39:03.683073"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T21:39:03.724282"
     }
   },
   "execution_history": [
@@ -569,6 +581,50 @@
           "name": "prepare",
           "duration": 314.7325882911682,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "5009a0ab-67b9-45df-ae15-50f5be040467",
+      "timestamp": "2026-02-15T21:38:07.274234",
+      "total_duration": 924.0053160190582,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (3 tasks)",
+          "duration": 250.68053030967712,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (1 tasks)",
+          "duration": 175.92067766189575,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 69.32465052604675,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0035] Code Review",
+          "duration": 185.94123554229736,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0035] Improvements",
+          "duration": 140.57376503944397,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0035] Simplify",
+          "duration": 101.56445693969727,
+          "type": "simplify",
           "status": "done"
         }
       ]

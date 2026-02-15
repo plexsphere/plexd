@@ -1,0 +1,114 @@
+{
+  "feature_id": "PXD-0035",
+  "title": "I001: Add cross-compiled binary release workflow",
+  "date": "2026-02-15",
+  "summary": "Adds `.github/workflows/release.yml` triggered on `v*` tag push that cross-compiles `plexd` for linux/amd64 and linux/arm64 via build matrix, generates SHA-256 checksums, and creates a GitHub Release via `softprops/action-gh-release`. All actions are SHA-pinned (checkout/setup-go match ci.yml). Includes 17 shell tests in `test_release_workflow.sh` and 9 Go tests in `internal/cicheck/release_workflow_test.go`. Reference docs at `docs/reference/backend/release-workflow.md` follow ci-workflow.md format.",
+  "verdict": "NEEDS_CHANGES",
+  "tests_checklist": [
+    {"item": "Shell tests exist and all 17 pass", "checked": true},
+    {"item": "Go tests exist and all 9 pass", "checked": true},
+    {"item": "YAML syntax validation tested", "checked": true},
+    {"item": "Trigger config (v* tag push only) tested", "checked": true},
+    {"item": "Build matrix (amd64+arm64) tested", "checked": true},
+    {"item": "Ldflags (version/commit/date) tested", "checked": true},
+    {"item": "Binary naming convention tested", "checked": true},
+    {"item": "SHA-pinned actions tested", "checked": true},
+    {"item": "CI pin match (checkout/setup-go) tested", "checked": true},
+    {"item": "Permissions least-privilege tested", "checked": true},
+    {"item": "CGO_ENABLED=0 tested", "checked": true},
+    {"item": "Timeout-minutes on both jobs tested", "checked": true},
+    {"item": "Job dependency chain tested", "checked": true},
+    {"item": "Combined checksums.sha256 file NOT tested (missing from tests)", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "Workflow YAML is clean and minimal (65 lines)", "checked": true},
+    {"item": "Follows ci.yml patterns (runner, Go version, SHA pins)", "checked": true},
+    {"item": "Shell test script follows test_dockerfile.sh structure", "checked": true},
+    {"item": "Go tests use structured YAML parsing (not string grep)", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "Clear naming throughout", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "Permissions block declares only contents: write", "checked": true},
+    {"item": "All 5 actions pinned to full 40-char SHA", "checked": true},
+    {"item": "checkout and setup-go SHAs match ci.yml exactly", "checked": true},
+    {"item": "No hardcoded secrets or PATs", "checked": true},
+    {"item": "Uses GITHUB_TOKEN (implicit via softprops/action-gh-release)", "checked": true},
+    {"item": "No path traversal or injection vectors", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Two-job design (build matrix + release) is appropriate", "checked": true},
+    {"item": "Cross-compilation via GOOS/GOARCH (no native runners needed)", "checked": true},
+    {"item": "Artifact transfer via upload/download-artifact", "checked": true},
+    {"item": "Ldflags pattern matches Dockerfile exactly", "checked": true},
+    {"item": "Solution is as simple as possible", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated configuration", "checked": true},
+    {"item": "No unnecessary abstractions", "checked": true},
+    {"item": "No future-proofing or unused features", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Build job failure prevents release job (needs: build)", "checked": true},
+    {"item": "Go tests use t.Fatal for critical setup failures", "checked": true},
+    {"item": "Shell tests exit 1 on any failure", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Timeout-minutes set on both jobs (15 and 10)", "checked": true},
+    {"item": "CGO_ENABLED=0 ensures static linking", "checked": true},
+    {"item": "retention-days: 1 on upload-artifact prevents storage bloat", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [
+    {
+      "severity": "MEDIUM",
+      "description": "Implementation uses softprops/action-gh-release instead of gh release create as specified in plan task 1.3. This adds a third-party action dependency but is SHA-pinned and well-maintained. Acceptable alternative.",
+      "location": ".github/workflows/release.yml:57",
+      "fix": "No fix required — acceptable deviation. The action provides more robust release creation than raw CLI."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "C2-1",
+      "severity": "critical",
+      "check_id": "C2",
+      "description": "Missing combined checksums.sha256 file. Plan task 1.3 requires: 'generate checksums.sha256 via sha256sum plexd-linux-* > checksums.sha256'. The implementation generates per-binary .sha256 files (plexd-linux-amd64.sha256, plexd-linux-arm64.sha256) instead of a single combined checksums.sha256. install.sh:156 downloads checksums.sha256 by that exact name and greps for the binary name (line 90). The per-binary format is incompatible.",
+      "location": ".github/workflows/release.yml:37,60-64",
+      "fix": "In the release job, after downloading artifacts, add a step to concatenate per-binary checksums: 'cat plexd-linux-*.sha256 > checksums.sha256'. Add checksums.sha256 to the files list in softprops/action-gh-release. The per-binary .sha256 files can optionally be kept as additional assets or removed."
+    },
+    {
+      "id": "FC1-1",
+      "severity": "critical",
+      "check_id": "FC1",
+      "description": "Plan task 1.3 specifies uploading 3 artifacts (plexd-linux-amd64, plexd-linux-arm64, checksums.sha256). The implementation uploads 4 artifacts (two binaries + two per-binary .sha256 files) but NOT the combined checksums.sha256 required by the plan and install.sh.",
+      "location": ".github/workflows/release.yml:60-64",
+      "fix": "Same as C2-1: generate combined checksums.sha256 in release job and include it in release assets."
+    },
+    {
+      "id": "TE2-1",
+      "severity": "major",
+      "check_id": "TE2",
+      "description": "Neither shell tests nor Go tests verify that a combined checksums.sha256 file would be produced. Shell test test_checksum_generation only checks for sha256sum command presence, not the output filename convention. Go test TestReleaseWorkflow_ReleaseSteps checks for per-binary .sha256 files but not for combined checksums.sha256.",
+      "location": ".github/workflows/test_release_workflow.sh:102-108, internal/cicheck/release_workflow_test.go:232-262",
+      "fix": "After fixing the workflow, add test assertions verifying: (1) release job has a step that produces checksums.sha256, (2) checksums.sha256 is listed in release files."
+    },
+    {
+      "id": "DA3-1",
+      "severity": "major",
+      "check_id": "DA3",
+      "description": "docs/reference/backend/release-workflow.md documents per-binary .sha256 files (lines 85-89, 95-101) which is consistent with the current (incorrect) implementation but inconsistent with the plan spec. After fixing the workflow, docs must be updated to reflect the combined checksums.sha256.",
+      "location": "docs/reference/backend/release-workflow.md:85-101",
+      "fix": "After fixing the workflow, update the Artifact Naming and Checksum Format sections to document the combined checksums.sha256 file alongside per-binary files (if kept)."
+    }
+  ],
+  "suggested_improvements": [
+    "Consider adding darwin/amd64 and darwin/arm64 to the build matrix in a future iteration if macOS support is desired",
+    "Consider adding a workflow_dispatch trigger for manual release creation during testing"
+  ],
+  "next_steps": [
+    "Fix release job: add step to generate combined checksums.sha256 from per-binary .sha256 files",
+    "Add checksums.sha256 to softprops/action-gh-release files list",
+    "Update shell test and Go test to verify combined checksums.sha256 is produced and uploaded",
+    "Update release-workflow.md to document combined checksums.sha256 format"
+  ]
+}
