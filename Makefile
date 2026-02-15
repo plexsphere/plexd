@@ -1,4 +1,4 @@
-.PHONY: build test test-e2e lint vet
+.PHONY: build test test-e2e lint vet docker-build
 
 build:
 	go build ./...
@@ -14,3 +14,10 @@ lint: vet
 
 vet:
 	go vet ./...
+
+docker-build:
+	docker build -f deploy/docker/Dockerfile \
+		--build-arg VERSION=$(shell git describe --tags --always 2>/dev/null || echo dev) \
+		--build-arg COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo none) \
+		--build-arg DATE=$(shell date -u +%Y-%m-%dT%H:%M:%SZ) \
+		-t ghcr.io/plexsphere/plexd:dev .

@@ -1,0 +1,17 @@
+.git/
+.github/
+.planwerk/
+.claude/
+.serena/
+docs/
+deploy/systemd/
+deploy/kubernetes/
+deploy/cloud-init/
+deploy/install.sh
+deploy/install_test.sh
+*_test.go
+*_test.sh
+*.md
+!go.mod
+!go.sum
+LICENSE
