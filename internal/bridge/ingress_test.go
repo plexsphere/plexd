@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,7 +32,7 @@ func TestIngressManager_Setup_Disabled(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -53,7 +54,7 @@ func TestIngressManager_Setup_Enabled(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -84,7 +85,7 @@ func TestIngressManager_AddRule_StartsListener(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -142,7 +143,7 @@ func TestIngressManager_AddRule_DuplicateRejects(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -183,7 +184,7 @@ func TestIngressManager_AddRule_MaxRulesReject(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -231,7 +232,7 @@ func TestIngressManager_RemoveRule_StopsListener(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -278,7 +279,7 @@ func TestIngressManager_RemoveRule_NonexistentNoop(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -307,7 +308,7 @@ func TestIngressManager_Teardown(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -358,7 +359,7 @@ func TestIngressManager_Teardown_Idempotent(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	// Teardown when not active should return nil.
 	if err := mgr.Teardown(); err != nil {
@@ -406,7 +407,7 @@ func TestIngressManager_Teardown_AggregatesErrors(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -447,7 +448,7 @@ func TestIngressManager_IngressStatus_Active(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -492,7 +493,7 @@ func TestIngressManager_IngressStatus_Inactive(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if status := mgr.IngressStatus(); status != nil {
 		t.Errorf("IngressStatus should be nil when not active, got %+v", status)
@@ -510,7 +511,7 @@ func TestIngressManager_IngressCapabilities(t *testing.T) {
 		}
 		cfg.ApplyDefaults()
 
-		mgr := NewIngressManager(ctrl, cfg, discardLogger())
+		mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 		caps := mgr.IngressCapabilities()
 		if caps == nil {
@@ -534,7 +535,7 @@ func TestIngressManager_IngressCapabilities(t *testing.T) {
 		}
 		cfg.ApplyDefaults()
 
-		mgr := NewIngressManager(ctrl, cfg, discardLogger())
+		mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 		if caps := mgr.IngressCapabilities(); caps != nil {
 			t.Errorf("IngressCapabilities should be nil when disabled, got %v", caps)
@@ -556,7 +557,7 @@ func TestIngressManager_AddRule_TLSTerminate_InvalidCert(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -606,7 +607,7 @@ func TestIngressManager_AddRule_TLSTerminate_ValidCert(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -648,7 +649,7 @@ func TestIngressManager_AddRule_InactiveRejects(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	// Do NOT call Setup — manager is inactive.
 	rule := api.IngressRule{
@@ -679,7 +680,7 @@ func TestIngressManager_RemoveRule_InactiveNoop(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	// Do NOT call Setup — manager is inactive.
 	// Should not panic or call Close.
@@ -704,7 +705,7 @@ func TestIngressManager_GetRule(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -765,4 +766,236 @@ func generateSelfSignedCert(t *testing.T) (certPEM string, keyPEM string) {
 	keyBlock := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
 	return string(certBlock), string(keyBlock)
+}
+
+// ---------------------------------------------------------------------------
+// ACME mode tests
+// ---------------------------------------------------------------------------
+
+func TestIngressManager_AddRule_ACMEMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	acmeCfg := ACMEConfig{
+		Enabled:          true,
+		CacheDir:         tmpDir,
+		AllowedHosts:     []string{"example.com"},
+		ACMEDirectoryURL: "https://acme-staging-v02.api.letsencrypt.org/directory",
+	}
+	am := NewACMEManager(acmeCfg, discardLogger())
+	if err := am.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = am.Teardown() }()
+
+	ctrl := &mockIngressController{
+		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
+			if tlsCfg == nil {
+				t.Error("expected non-nil TLS config for acme mode")
+			}
+			return net.Listen("tcp", "127.0.0.1:0")
+		},
+	}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		IngressEnabled:  true,
+	}
+	cfg.ApplyDefaults()
+
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), am)
+
+	if err := mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	defer func() { _ = mgr.Teardown() }()
+
+	rule := api.IngressRule{
+		RuleID:     "acme-rule-1",
+		ListenPort: 0,
+		TargetAddr: "10.0.0.5:443",
+		Mode:       "acme",
+		Hostname:   "example.com",
+	}
+
+	if err := mgr.AddRule(rule); err != nil {
+		t.Fatalf("AddRule with ACME mode: %v", err)
+	}
+
+	// Verify Listen was called.
+	listenCalls := ctrl.ingressCallsFor("Listen")
+	if len(listenCalls) != 1 {
+		t.Fatalf("expected 1 Listen call, got %d", len(listenCalls))
+	}
+
+	// Verify rule is tracked.
+	ids := mgr.RuleIDs()
+	if len(ids) != 1 || ids[0] != "acme-rule-1" {
+		t.Errorf("RuleIDs = %v, want [acme-rule-1]", ids)
+	}
+
+	got, ok := mgr.GetRule("acme-rule-1")
+	if !ok {
+		t.Fatal("GetRule should return true for acme-rule-1")
+	}
+	if got.Mode != "acme" {
+		t.Errorf("Mode = %q, want %q", got.Mode, "acme")
+	}
+	if got.Hostname != "example.com" {
+		t.Errorf("Hostname = %q, want %q", got.Hostname, "example.com")
+	}
+}
+
+func TestIngressManager_AddRule_ACMEMode_NoManager(t *testing.T) {
+	ctrl := &mockIngressController{
+		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
+			return net.Listen("tcp", "127.0.0.1:0")
+		},
+	}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		IngressEnabled:  true,
+	}
+	cfg.ApplyDefaults()
+
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
+
+	if err := mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	defer func() { _ = mgr.Teardown() }()
+
+	rule := api.IngressRule{
+		RuleID:     "acme-no-mgr",
+		ListenPort: 0,
+		TargetAddr: "10.0.0.5:443",
+		Mode:       "acme",
+		Hostname:   "example.com",
+	}
+
+	err := mgr.AddRule(rule)
+	if err == nil {
+		t.Fatal("AddRule should return error when ACMEManager is nil")
+	}
+	if !strings.Contains(err.Error(), "ACME mode requires ACMEManager") {
+		t.Errorf("error = %q, want substring %q", err, "ACME mode requires ACMEManager")
+	}
+
+	// Verify no listener was created.
+	if len(ctrl.ingressCallsFor("Listen")) != 0 {
+		t.Error("Listen should not be called when ACMEManager is nil")
+	}
+}
+
+func TestIngressManager_AddRule_ACMEMode_NoHostname(t *testing.T) {
+	tmpDir := t.TempDir()
+	acmeCfg := ACMEConfig{
+		Enabled:          true,
+		CacheDir:         tmpDir,
+		AllowedHosts:     []string{"example.com"},
+		ACMEDirectoryURL: "https://acme-staging-v02.api.letsencrypt.org/directory",
+	}
+	am := NewACMEManager(acmeCfg, discardLogger())
+	if err := am.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = am.Teardown() }()
+
+	ctrl := &mockIngressController{
+		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
+			return net.Listen("tcp", "127.0.0.1:0")
+		},
+	}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		IngressEnabled:  true,
+	}
+	cfg.ApplyDefaults()
+
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), am)
+
+	if err := mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	defer func() { _ = mgr.Teardown() }()
+
+	rule := api.IngressRule{
+		RuleID:     "acme-no-host",
+		ListenPort: 0,
+		TargetAddr: "10.0.0.5:443",
+		Mode:       "acme",
+		Hostname:   "",
+	}
+
+	err := mgr.AddRule(rule)
+	if err == nil {
+		t.Fatal("AddRule should return error when hostname is empty for acme mode")
+	}
+	if !strings.Contains(err.Error(), "hostname is required") {
+		t.Errorf("error = %q, want substring %q", err, "hostname is required")
+	}
+
+	// Verify no listener was created.
+	if len(ctrl.ingressCallsFor("Listen")) != 0 {
+		t.Error("Listen should not be called when hostname is empty")
+	}
+}
+
+func TestIngressManager_AddRule_ACMEMode_InactiveACME(t *testing.T) {
+	acmeCfg := ACMEConfig{
+		Enabled:          false,
+		CacheDir:         t.TempDir(),
+		AllowedHosts:     []string{"example.com"},
+		ACMEDirectoryURL: "https://acme-staging-v02.api.letsencrypt.org/directory",
+	}
+	am := NewACMEManager(acmeCfg, discardLogger())
+	// Call Setup — but since Enabled=false, the manager stays inactive.
+	if err := am.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = am.Teardown() }()
+
+	ctrl := &mockIngressController{
+		listenFn: func(addr string, tlsCfg *tls.Config) (net.Listener, error) {
+			return net.Listen("tcp", "127.0.0.1:0")
+		},
+	}
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		IngressEnabled:  true,
+	}
+	cfg.ApplyDefaults()
+
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), am)
+
+	if err := mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	defer func() { _ = mgr.Teardown() }()
+
+	rule := api.IngressRule{
+		RuleID:     "acme-inactive",
+		ListenPort: 0,
+		TargetAddr: "10.0.0.5:443",
+		Mode:       "acme",
+		Hostname:   "example.com",
+	}
+
+	err := mgr.AddRule(rule)
+	if err == nil {
+		t.Fatal("AddRule should return error when ACME manager is not active")
+	}
+	if !strings.Contains(err.Error(), "ACME manager is not active") {
+		t.Errorf("error = %q, want substring %q", err, "ACME manager is not active")
+	}
+
+	// Verify no listener was created.
+	if len(ctrl.ingressCallsFor("Listen")) != 0 {
+		t.Error("Listen should not be called when ACME manager is inactive")
+	}
 }

@@ -60,7 +60,7 @@ func newTestIngressManager(t *testing.T, ctrl *mockIngressController) *IngressMa
 		return net.Listen("tcp", "127.0.0.1:0")
 	}
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}

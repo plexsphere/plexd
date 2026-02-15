@@ -10,19 +10,19 @@ import (
 // ---------------------------------------------------------------------------
 
 type RegisterRequest struct {
-	Token        string              `json:"token"`
-	PublicKey    string              `json:"public_key"`
-	Hostname     string              `json:"hostname"`
-	Metadata     map[string]string   `json:"metadata,omitempty"`
+	Token        string               `json:"token"`
+	PublicKey    string               `json:"public_key"`
+	Hostname     string               `json:"hostname"`
+	Metadata     map[string]string    `json:"metadata,omitempty"`
 	Capabilities *CapabilitiesPayload `json:"capabilities,omitempty"`
 }
 
 type RegisterResponse struct {
-	NodeID        string `json:"node_id"`
-	MeshIP        string `json:"mesh_ip"`
+	NodeID           string `json:"node_id"`
+	MeshIP           string `json:"mesh_ip"`
 	SigningPublicKey string `json:"signing_public_key"`
-	NodeSecretKey string `json:"node_secret_key"`
-	Peers         []Peer `json:"peers"`
+	NodeSecretKey    string `json:"node_secret_key"`
+	Peers            []Peer `json:"peers"`
 }
 
 // Peer is used in registration responses and state responses.
@@ -76,11 +76,11 @@ type HeartbeatResponse struct {
 type StateResponse struct {
 	Peers            []Peer            `json:"peers"`
 	Policies         []Policy          `json:"policies"`
-	SigningKeys      *SigningKeys       `json:"signing_keys,omitempty"`
+	SigningKeys      *SigningKeys      `json:"signing_keys,omitempty"`
 	Metadata         map[string]string `json:"metadata,omitempty"`
 	BridgeConfig     *BridgeConfig     `json:"bridge_config,omitempty"`
 	RelayConfig      *RelayConfig      `json:"relay_config,omitempty"`
-	UserAccessConfig *UserAccessConfig  `json:"user_access_config,omitempty"`
+	UserAccessConfig *UserAccessConfig `json:"user_access_config,omitempty"`
 	IngressConfig    *IngressConfig    `json:"ingress_config,omitempty"`
 	SiteToSiteConfig *SiteToSiteConfig `json:"site_to_site_config,omitempty"`
 	Data             []DataEntry       `json:"data"`
@@ -367,11 +367,11 @@ type BridgeConfig struct {
 
 // BridgeInfo is the bridge status reported by the node in heartbeats.
 type BridgeInfo struct {
-	Enabled             bool   `json:"enabled"`
-	AccessInterface     string `json:"access_interface"`
-	ActiveRoutes        int    `json:"active_routes"`
-	RelayEnabled        bool   `json:"relay_enabled"`
-	ActiveRelaySessions int    `json:"active_relay_sessions"`
+	Enabled                 bool   `json:"enabled"`
+	AccessInterface         string `json:"access_interface"`
+	ActiveRoutes            int    `json:"active_routes"`
+	RelayEnabled            bool   `json:"relay_enabled"`
+	ActiveRelaySessions     int    `json:"active_relay_sessions"`
 	IngressEnabled          bool   `json:"ingress_enabled"`
 	ActiveIngressRules      int    `json:"active_ingress_rules"`
 	SiteToSiteEnabled       bool   `json:"site_to_site_enabled"`
@@ -410,16 +410,18 @@ type UserAccessConfig struct {
 type UserAccessPeer struct {
 	PublicKey  string   `json:"public_key"`
 	AllowedIPs []string `json:"allowed_ips"`
-	PSK       string   `json:"psk,omitempty"`
-	Label     string   `json:"label"`
+	PSK        string   `json:"psk,omitempty"`
+	Label      string   `json:"label"`
 }
 
 // UserAccessInfo is the user access status reported by the node in heartbeats.
 type UserAccessInfo struct {
-	Enabled       bool   `json:"enabled"`
-	InterfaceName string `json:"interface_name"`
-	PeerCount     int    `json:"peer_count"`
-	ListenPort    int    `json:"listen_port"`
+	Enabled        bool   `json:"enabled"`
+	InterfaceName  string `json:"interface_name"`
+	PeerCount      int    `json:"peer_count"`
+	ListenPort     int    `json:"listen_port"`
+	ProviderName   string `json:"provider_name,omitempty"`
+	ProviderStatus string `json:"provider_status,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -437,9 +439,12 @@ type IngressRule struct {
 	RuleID     string `json:"rule_id"`
 	ListenPort int    `json:"listen_port"`
 	TargetAddr string `json:"target_addr"`
-	Mode       string `json:"mode"`
-	CertPEM    string `json:"cert_pem,omitempty"`
-	KeyPEM     string `json:"key_pem,omitempty"`
+	// Mode is the TLS handling mode: "tcp" (passthrough), "terminate" (static cert),
+	// or "acme" (automatic certificate via ACME).
+	Mode     string `json:"mode"`
+	CertPEM  string `json:"cert_pem,omitempty"`
+	KeyPEM   string `json:"key_pem,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
 }
 
 // IngressInfo is the ingress status reported by the node in heartbeats.
@@ -447,6 +452,7 @@ type IngressInfo struct {
 	Enabled         bool `json:"enabled"`
 	RuleCount       int  `json:"rule_count"`
 	ConnectionCount int  `json:"connection_count"`
+	ACMEEnabled     bool `json:"acme_enabled"`
 }
 
 // ---------------------------------------------------------------------------
@@ -469,10 +475,15 @@ type SiteToSiteTunnel struct {
 	PSK             string   `json:"psk,omitempty"`
 	InterfaceName   string   `json:"interface_name"`
 	ListenPort      int      `json:"listen_port"`
+	// ProviderType specifies which tunnel provider to use for this tunnel.
+	// Empty or "wireguard" means the default WireGuard-based approach.
+	// Other values (e.g. "ipsec", "openvpn") delegate to the corresponding TunnelProvider.
+	ProviderType string `json:"provider_type,omitempty"`
 }
 
 // SiteToSiteInfo is the site-to-site VPN status reported by the node in heartbeats.
 type SiteToSiteInfo struct {
-	Enabled     bool `json:"enabled"`
-	TunnelCount int  `json:"tunnel_count"`
+	Enabled             bool     `json:"enabled"`
+	TunnelCount         int      `json:"tunnel_count"`
+	TunnelProviderNames []string `json:"tunnel_provider_names,omitempty"`
 }

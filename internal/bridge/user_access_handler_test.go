@@ -56,7 +56,7 @@ func newTestUserAccessManager(t *testing.T, ctrl *mockAccessController, routes *
 		UserAccessListenPort:    51822,
 	}
 	cfg.ApplyDefaults()
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}

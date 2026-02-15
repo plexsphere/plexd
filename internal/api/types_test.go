@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -71,10 +72,10 @@ func TestTypesRegisterRequest(t *testing.T) {
 
 func TestTypesRegisterResponse(t *testing.T) {
 	orig := RegisterResponse{
-		NodeID:          "n-001",
-		MeshIP:          "10.42.0.1",
+		NodeID:           "n-001",
+		MeshIP:           "10.42.0.1",
 		SigningPublicKey: "spk-abc",
-		NodeSecretKey:   "nsk-xyz",
+		NodeSecretKey:    "nsk-xyz",
 		Peers: []Peer{
 			{
 				ID:         "n-002",
@@ -185,7 +186,7 @@ func TestTypesMetricPoint(t *testing.T) {
 	requireEqual(t, orig, got)
 
 	// PeerID should be omitted when empty.
-	if s := string(data); contains(s, `"peer_id"`) {
+	if s := string(data); strings.Contains(s, `"peer_id"`) {
 		t.Errorf("peer_id should be omitted when empty, got: %s", s)
 	}
 
@@ -193,7 +194,7 @@ func TestTypesMetricPoint(t *testing.T) {
 	orig.PeerID = "n-002"
 	data2, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data2); !contains(s, `"peer_id"`) {
+	if s := string(data2); !strings.Contains(s, `"peer_id"`) {
 		t.Errorf("peer_id should be present when set, got: %s", s)
 	}
 }
@@ -246,13 +247,13 @@ func TestTypesActionRequest(t *testing.T) {
 	orig.TriggeredBy = nil
 	data2, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data2); contains(s, `"parameters"`) {
+	if s := string(data2); strings.Contains(s, `"parameters"`) {
 		t.Errorf("parameters should be omitted when nil, got: %s", s)
 	}
-	if s := string(data2); contains(s, `"checksum"`) {
+	if s := string(data2); strings.Contains(s, `"checksum"`) {
 		t.Errorf("checksum should be omitted when empty, got: %s", s)
 	}
-	if s := string(data2); contains(s, `"triggered_by"`) {
+	if s := string(data2); strings.Contains(s, `"triggered_by"`) {
 		t.Errorf("triggered_by should be omitted when nil, got: %s", s)
 	}
 }
@@ -291,7 +292,7 @@ func TestTypesExecutionResult(t *testing.T) {
 	orig.TriggeredBy = nil
 	data, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data); contains(s, `"triggered_by"`) {
+	if s := string(data); strings.Contains(s, `"triggered_by"`) {
 		t.Errorf("triggered_by should be omitted when nil, got: %s", s)
 	}
 }
@@ -366,20 +367,6 @@ func TestTypesIntegrityViolationReport(t *testing.T) {
 	}
 }
 
-// contains is a simple substring check helper.
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchSubstring(s, substr)
-}
-
-func searchSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
 func TestBridgeConfig_JSONRoundTrip(t *testing.T) {
 	orig := BridgeConfig{
 		AccessSubnets:    []string{"192.168.1.0/24", "10.0.0.0/8"},
@@ -443,7 +430,7 @@ func TestHeartbeatRequest_WithBridge(t *testing.T) {
 	orig.Bridge = nil
 	data, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data); contains(s, `"bridge"`) {
+	if s := string(data); strings.Contains(s, `"bridge"`) {
 		t.Errorf("bridge should be omitted when nil, got: %s", s)
 	}
 }
@@ -558,7 +545,7 @@ func TestStateResponse_WithRelayConfig(t *testing.T) {
 	orig.RelayConfig = nil
 	data, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data); contains(s, `"relay_config"`) {
+	if s := string(data); strings.Contains(s, `"relay_config"`) {
 		t.Errorf("relay_config should be omitted when nil, got: %s", s)
 	}
 }
@@ -603,7 +590,7 @@ func TestStateResponse_WithBridgeConfig(t *testing.T) {
 	orig.BridgeConfig = nil
 	data, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data); contains(s, `"bridge_config"`) {
+	if s := string(data); strings.Contains(s, `"bridge_config"`) {
 		t.Errorf("bridge_config should be omitted when nil, got: %s", s)
 	}
 }
@@ -668,7 +655,7 @@ func TestUserAccessPeer_JSONRoundTrip(t *testing.T) {
 	orig.PSK = ""
 	data2, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data2); contains(s, `"psk"`) {
+	if s := string(data2); strings.Contains(s, `"psk"`) {
 		t.Errorf("psk should be omitted when empty, got: %s", s)
 	}
 }
@@ -718,7 +705,7 @@ func TestStateResponse_WithUserAccessConfig(t *testing.T) {
 	orig.UserAccessConfig = nil
 	data, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data); contains(s, `"user_access_config"`) {
+	if s := string(data); strings.Contains(s, `"user_access_config"`) {
 		t.Errorf("user_access_config should be omitted when nil, got: %s", s)
 	}
 }
@@ -745,7 +732,7 @@ func TestHeartbeatRequest_WithUserAccess(t *testing.T) {
 	orig.UserAccess = nil
 	data, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data); contains(s, `"user_access"`) {
+	if s := string(data); strings.Contains(s, `"user_access"`) {
 		t.Errorf("user_access should be omitted when nil, got: %s", s)
 	}
 }
@@ -814,10 +801,10 @@ func TestIngressRule_JSONRoundTrip(t *testing.T) {
 	orig.KeyPEM = ""
 	data2, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data2); contains(s, `"cert_pem"`) {
+	if s := string(data2); strings.Contains(s, `"cert_pem"`) {
 		t.Errorf("cert_pem should be omitted when empty, got: %s", s)
 	}
-	if s := string(data2); contains(s, `"key_pem"`) {
+	if s := string(data2); strings.Contains(s, `"key_pem"`) {
 		t.Errorf("key_pem should be omitted when empty, got: %s", s)
 	}
 }
@@ -827,6 +814,7 @@ func TestIngressInfo_JSONRoundTrip(t *testing.T) {
 		Enabled:         true,
 		RuleCount:       3,
 		ConnectionCount: 42,
+		ACMEEnabled:     true,
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
@@ -836,7 +824,7 @@ func TestIngressInfo_JSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"enabled", "rule_count", "connection_count"} {
+	for _, key := range []string{"enabled", "rule_count", "connection_count", "acme_enabled"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
@@ -864,7 +852,7 @@ func TestStateResponse_WithIngressConfig(t *testing.T) {
 	orig.IngressConfig = nil
 	data, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data); contains(s, `"ingress_config"`) {
+	if s := string(data); strings.Contains(s, `"ingress_config"`) {
 		t.Errorf("ingress_config should be omitted when nil, got: %s", s)
 	}
 }
@@ -890,7 +878,7 @@ func TestHeartbeatRequest_WithIngress(t *testing.T) {
 	orig.Ingress = nil
 	data, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data); contains(s, `"ingress"`) {
+	if s := string(data); strings.Contains(s, `"ingress"`) {
 		t.Errorf("ingress should be omitted when nil, got: %s", s)
 	}
 }
@@ -990,8 +978,41 @@ func TestSiteToSiteTunnel_JSONRoundTrip(t *testing.T) {
 	orig.PSK = ""
 	data2, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data2); contains(s, `"psk"`) {
+	if s := string(data2); strings.Contains(s, `"psk"`) {
 		t.Errorf("psk should be omitted when empty, got: %s", s)
+	}
+}
+
+func TestSiteToSiteTunnel_ProviderType_JSONRoundTrip(t *testing.T) {
+	// With ProviderType set.
+	orig := SiteToSiteTunnel{
+		TunnelID:        "tun-ipsec-001",
+		RemoteEndpoint:  "203.0.113.5:500",
+		RemotePublicKey: "",
+		LocalSubnets:    []string{"192.168.1.0/24"},
+		RemoteSubnets:   []string{"10.0.0.0/8"},
+		PSK:             "ipsec-psk",
+		InterfaceName:   "",
+		ListenPort:      0,
+		ProviderType:    "ipsec",
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify provider_type key present.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["provider_type"]; !ok {
+		t.Errorf("expected JSON key %q", "provider_type")
+	}
+
+	// ProviderType should be omitted when empty.
+	orig.ProviderType = ""
+	data2, _ := roundTrip(t, orig)
+	if s := string(data2); strings.Contains(s, `"provider_type"`) {
+		t.Errorf("provider_type should be omitted when empty, got: %s", s)
 	}
 }
 
@@ -1012,6 +1033,88 @@ func TestSiteToSiteInfo_JSONRoundTrip(t *testing.T) {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
+	}
+}
+
+func TestSiteToSiteInfo_TunnelProviderNames_JSONRoundTrip(t *testing.T) {
+	// With TunnelProviderNames set.
+	orig := SiteToSiteInfo{
+		Enabled:             true,
+		TunnelCount:         5,
+		TunnelProviderNames: []string{"ipsec", "openvpn"},
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify tunnel_provider_names key present.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["tunnel_provider_names"]; !ok {
+		t.Errorf("expected JSON key %q", "tunnel_provider_names")
+	}
+
+	// TunnelProviderNames should be omitted when nil.
+	orig.TunnelProviderNames = nil
+	data2, _ := roundTrip(t, orig)
+	if s := string(data2); strings.Contains(s, `"tunnel_provider_names"`) {
+		t.Errorf("tunnel_provider_names should be omitted when nil, got: %s", s)
+	}
+}
+
+func TestIngressRule_Hostname_JSONRoundTrip(t *testing.T) {
+	// With Hostname set (ACME mode).
+	orig := IngressRule{
+		RuleID:     "rule-acme-001",
+		ListenPort: 443,
+		TargetAddr: "10.42.0.5:8443",
+		Mode:       "acme",
+		Hostname:   "app.example.com",
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify hostname key present.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["hostname"]; !ok {
+		t.Errorf("expected JSON key %q", "hostname")
+	}
+
+	// Hostname should be omitted when empty.
+	orig.Hostname = ""
+	data2, _ := roundTrip(t, orig)
+	if s := string(data2); strings.Contains(s, `"hostname"`) {
+		t.Errorf("hostname should be omitted when empty, got: %s", s)
+	}
+}
+
+func TestIngressInfo_ACMEEnabled_JSONRoundTrip(t *testing.T) {
+	orig := IngressInfo{
+		Enabled:         true,
+		RuleCount:       2,
+		ConnectionCount: 10,
+		ACMEEnabled:     true,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["acme_enabled"]; !ok {
+		t.Errorf("expected JSON key %q", "acme_enabled")
+	}
+
+	// ACMEEnabled false should still be present (not omitempty).
+	orig.ACMEEnabled = false
+	data2, _ := roundTrip(t, orig)
+	if s := string(data2); !strings.Contains(s, `"acme_enabled"`) {
+		t.Errorf("acme_enabled should be present even when false, got: %s", s)
 	}
 }
 
@@ -1036,7 +1139,7 @@ func TestStateResponse_WithSiteToSiteConfig(t *testing.T) {
 	orig.SiteToSiteConfig = nil
 	data, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data); contains(s, `"site_to_site_config"`) {
+	if s := string(data); strings.Contains(s, `"site_to_site_config"`) {
 		t.Errorf("site_to_site_config should be omitted when nil, got: %s", s)
 	}
 }
@@ -1061,7 +1164,7 @@ func TestHeartbeatRequest_WithSiteToSite(t *testing.T) {
 	orig.SiteToSite = nil
 	data, got2 := roundTrip(t, orig)
 	requireEqual(t, orig, got2)
-	if s := string(data); contains(s, `"site_to_site"`) {
+	if s := string(data); strings.Contains(s, `"site_to_site"`) {
 		t.Errorf("site_to_site should be omitted when nil, got: %s", s)
 	}
 }

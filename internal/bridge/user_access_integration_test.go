@@ -33,7 +33,7 @@ func TestUserAccessIntegration_FullLifecycle(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	// Setup.
 	if err := mgr.Setup(); err != nil {
@@ -125,7 +125,7 @@ func TestUserAccessIntegration_ReconcileDrift(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestUserAccessIntegration_ConcurrentAccess(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}

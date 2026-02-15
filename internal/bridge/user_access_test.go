@@ -1,11 +1,75 @@
 package bridge
 
 import (
+	"context"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
+
+// ---------------------------------------------------------------------------
+// mockUserAccessProvider
+// ---------------------------------------------------------------------------
+
+// mockUserAccessProvider is a test double for UserAccessProvider.
+type mockUserAccessProvider struct {
+	mu       sync.Mutex
+	calls    []string
+	name     string
+	startErr error
+	stopErr  error
+	status   ProviderStatus
+}
+
+func newMockUserAccessProvider(name string) *mockUserAccessProvider {
+	return &mockUserAccessProvider{name: name}
+}
+
+func (p *mockUserAccessProvider) Name() string { return p.name }
+
+func (p *mockUserAccessProvider) Start(_ context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, "Start")
+	if p.startErr != nil {
+		return p.startErr
+	}
+	p.status = ProviderStatus{Running: true, InterfaceName: p.name + "0", IP: "100.64.0.1"}
+	return nil
+}
+
+func (p *mockUserAccessProvider) Stop() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, "Stop")
+	if p.stopErr != nil {
+		return p.stopErr
+	}
+	p.status = ProviderStatus{}
+	return nil
+}
+
+func (p *mockUserAccessProvider) Status() ProviderStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.status
+}
+
+func (p *mockUserAccessProvider) hasCalled(method string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, c := range p.calls {
+		if c == method {
+			return true
+		}
+	}
+	return false
+}
+
+// Verify mockUserAccessProvider satisfies UserAccessProvider at compile time.
+var _ UserAccessProvider = (*mockUserAccessProvider)(nil)
 
 // ---------------------------------------------------------------------------
 // UserAccessManager tests
@@ -24,7 +88,7 @@ func TestUserAccessManager_Setup_Enabled(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -66,7 +130,7 @@ func TestUserAccessManager_Setup_Disabled(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -96,7 +160,7 @@ func TestUserAccessManager_Setup_CreateInterfaceError(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	err := mgr.Setup()
 	if err == nil {
@@ -123,7 +187,7 @@ func TestUserAccessManager_Setup_EnableForwardingError(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	err := mgr.Setup()
 	if err == nil {
@@ -154,7 +218,7 @@ func TestUserAccessManager_Teardown(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -219,7 +283,7 @@ func TestUserAccessManager_Teardown_AggregatesErrors(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -250,7 +314,7 @@ func TestUserAccessManager_Teardown_Idempotent(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	// Teardown when not active should return nil.
 	if err := mgr.Teardown(); err != nil {
@@ -279,7 +343,7 @@ func TestUserAccessManager_AddPeer(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -321,7 +385,7 @@ func TestUserAccessManager_AddPeer_MaxReached(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -355,7 +419,7 @@ func TestUserAccessManager_AddPeer_Duplicate(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -386,7 +450,7 @@ func TestUserAccessManager_RemovePeer(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -434,7 +498,7 @@ func TestUserAccessManager_UserAccessStatus_Active(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -469,7 +533,7 @@ func TestUserAccessManager_UserAccessStatus_Disabled(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	if status := mgr.UserAccessStatus(); status != nil {
 		t.Errorf("UserAccessStatus should be nil when not active, got %+v", status)
@@ -493,7 +557,7 @@ func TestUserAccessManager_UserAccessCapabilities_Enabled(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	caps := mgr.UserAccessCapabilities()
 	if caps == nil {
@@ -518,9 +582,246 @@ func TestUserAccessManager_UserAccessCapabilities_Disabled(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger())
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
 
 	if caps := mgr.UserAccessCapabilities(); caps != nil {
 		t.Errorf("UserAccessCapabilities should be nil when disabled, got %v", caps)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Provider integration tests
+// ---------------------------------------------------------------------------
+
+func TestUserAccessManager_Setup_WithProvider(t *testing.T) {
+	ctrl := &mockAccessController{}
+	routes := &mockRouteController{}
+	provider := newMockUserAccessProvider("tailscale")
+	cfg := Config{
+		Enabled:                 true,
+		AccessInterface:         "eth1",
+		AccessSubnets:           []string{"10.0.0.0/24"},
+		UserAccessEnabled:       true,
+		UserAccessInterfaceName: "wg-access",
+		UserAccessListenPort:    51822,
+	}
+	cfg.ApplyDefaults()
+
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), provider)
+
+	if err := mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	// Verify provider Start was called.
+	if !provider.hasCalled("Start") {
+		t.Error("provider.Start should have been called")
+	}
+
+	// Verify status includes provider info.
+	status := mgr.UserAccessStatus()
+	if status == nil {
+		t.Fatal("UserAccessStatus should not be nil when active")
+	}
+	if status.ProviderName != "tailscale" {
+		t.Errorf("ProviderName = %q, want %q", status.ProviderName, "tailscale")
+	}
+	if status.ProviderStatus != "running" {
+		t.Errorf("ProviderStatus = %q, want %q", status.ProviderStatus, "running")
+	}
+}
+
+func TestUserAccessManager_Setup_ProviderError(t *testing.T) {
+	ctrl := &mockAccessController{}
+	routes := &mockRouteController{}
+	provider := newMockUserAccessProvider("tailscale")
+	provider.startErr = fmt.Errorf("auth key expired")
+	cfg := Config{
+		Enabled:                 true,
+		AccessInterface:         "eth1",
+		AccessSubnets:           []string{"10.0.0.0/24"},
+		UserAccessEnabled:       true,
+		UserAccessInterfaceName: "wg-access",
+		UserAccessListenPort:    51822,
+	}
+	cfg.ApplyDefaults()
+
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), provider)
+
+	err := mgr.Setup()
+	if err == nil {
+		t.Fatal("Setup should return error when provider.Start fails")
+	}
+
+	// Verify rollback: interface removed and forwarding disabled.
+	removeCalls := ctrl.accessCallsFor("RemoveInterface")
+	if len(removeCalls) != 1 {
+		t.Errorf("expected 1 RemoveInterface rollback call, got %d", len(removeCalls))
+	}
+	fwdCalls := routes.callsFor("DisableForwarding")
+	if len(fwdCalls) != 1 {
+		t.Errorf("expected 1 DisableForwarding rollback call, got %d", len(fwdCalls))
+	}
+
+	// Manager should be inactive.
+	if mgr.UserAccessStatus() != nil {
+		t.Error("UserAccessStatus should be nil after failed setup")
+	}
+}
+
+func TestUserAccessManager_Teardown_WithProvider(t *testing.T) {
+	ctrl := &mockAccessController{}
+	routes := &mockRouteController{}
+	provider := newMockUserAccessProvider("netbird")
+	cfg := Config{
+		Enabled:                 true,
+		AccessInterface:         "eth1",
+		AccessSubnets:           []string{"10.0.0.0/24"},
+		UserAccessEnabled:       true,
+		UserAccessInterfaceName: "wg-access",
+		UserAccessListenPort:    51822,
+	}
+	cfg.ApplyDefaults()
+
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), provider)
+
+	if err := mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+
+	// Verify provider Stop was called.
+	if !provider.hasCalled("Stop") {
+		t.Error("provider.Stop should have been called")
+	}
+
+	// Status should be nil after teardown.
+	if mgr.UserAccessStatus() != nil {
+		t.Error("UserAccessStatus should be nil after teardown")
+	}
+}
+
+func TestUserAccessManager_Teardown_ProviderStopError(t *testing.T) {
+	ctrl := &mockAccessController{}
+	routes := &mockRouteController{}
+	provider := newMockUserAccessProvider("tailscale")
+	provider.stopErr = fmt.Errorf("daemon not responding")
+	cfg := Config{
+		Enabled:                 true,
+		AccessInterface:         "eth1",
+		AccessSubnets:           []string{"10.0.0.0/24"},
+		UserAccessEnabled:       true,
+		UserAccessInterfaceName: "wg-access",
+		UserAccessListenPort:    51822,
+	}
+	cfg.ApplyDefaults()
+
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), provider)
+
+	if err := mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	err := mgr.Teardown()
+	if err == nil {
+		t.Fatal("Teardown should return error when provider.Stop fails")
+	}
+
+	// Despite error, teardown should still complete (interface removed, forwarding disabled).
+	removeCalls := ctrl.accessCallsFor("RemoveInterface")
+	if len(removeCalls) != 1 {
+		t.Errorf("expected 1 RemoveInterface call, got %d", len(removeCalls))
+	}
+	fwdCalls := routes.callsFor("DisableForwarding")
+	if len(fwdCalls) != 1 {
+		t.Errorf("expected 1 DisableForwarding call, got %d", len(fwdCalls))
+	}
+
+	// Manager should be inactive.
+	if mgr.UserAccessStatus() != nil {
+		t.Error("UserAccessStatus should be nil after teardown even with errors")
+	}
+}
+
+func TestUserAccessManager_UserAccessStatus_WithProvider(t *testing.T) {
+	ctrl := &mockAccessController{}
+	routes := &mockRouteController{}
+	provider := newMockUserAccessProvider("tailscale")
+	cfg := Config{
+		Enabled:                 true,
+		AccessInterface:         "eth1",
+		AccessSubnets:           []string{"10.0.0.0/24"},
+		UserAccessEnabled:       true,
+		UserAccessInterfaceName: "wg-access",
+		UserAccessListenPort:    51822,
+	}
+	cfg.ApplyDefaults()
+
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), provider)
+
+	if err := mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	status := mgr.UserAccessStatus()
+	if status == nil {
+		t.Fatal("UserAccessStatus should not be nil when active")
+	}
+	if status.ProviderName != "tailscale" {
+		t.Errorf("ProviderName = %q, want %q", status.ProviderName, "tailscale")
+	}
+	if status.ProviderStatus != "running" {
+		t.Errorf("ProviderStatus = %q, want %q", status.ProviderStatus, "running")
+	}
+
+	// After teardown, status should be nil.
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if mgr.UserAccessStatus() != nil {
+		t.Error("UserAccessStatus should be nil after teardown")
+	}
+}
+
+func TestUserAccessManager_Setup_WithoutProvider(t *testing.T) {
+	ctrl := &mockAccessController{}
+	routes := &mockRouteController{}
+	cfg := Config{
+		Enabled:                 true,
+		AccessInterface:         "eth1",
+		AccessSubnets:           []string{"10.0.0.0/24"},
+		UserAccessEnabled:       true,
+		UserAccessInterfaceName: "wg-access",
+		UserAccessListenPort:    51822,
+	}
+	cfg.ApplyDefaults()
+
+	mgr := NewUserAccessManager(ctrl, routes, cfg, discardLogger(), nil)
+
+	if err := mgr.Setup(); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	// Verify standard setup calls happened.
+	if len(ctrl.accessCallsFor("CreateInterface")) != 1 {
+		t.Error("expected 1 CreateInterface call")
+	}
+	if len(routes.callsFor("EnableForwarding")) != 1 {
+		t.Error("expected 1 EnableForwarding call")
+	}
+
+	// Verify status has no provider info.
+	status := mgr.UserAccessStatus()
+	if status == nil {
+		t.Fatal("UserAccessStatus should not be nil when active")
+	}
+	if status.ProviderName != "" {
+		t.Errorf("ProviderName = %q, want empty", status.ProviderName)
+	}
+	if status.ProviderStatus != "" {
+		t.Errorf("ProviderStatus = %q, want empty", status.ProviderStatus)
 	}
 }

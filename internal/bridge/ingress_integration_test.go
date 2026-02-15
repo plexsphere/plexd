@@ -29,7 +29,7 @@ func TestIngressIntegration_FullLifecycle(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 
 	// Setup.
 	if err := mgr.Setup(); err != nil {
@@ -163,7 +163,7 @@ func TestIngressIntegration_ReconcileDrift(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestIngressIntegration_ConcurrentAccess(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewIngressManager(ctrl, cfg, discardLogger())
+	mgr := NewIngressManager(ctrl, cfg, discardLogger(), nil)
 	if err := mgr.Setup(); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}

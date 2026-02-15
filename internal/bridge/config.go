@@ -72,6 +72,18 @@ type Config struct {
 	// Default: 50
 	MaxAccessPeers int
 
+	// UserAccessProviderType selects the external VPN provider for user access.
+	// Supported values: "tailscale", "netbird", or "" (disabled).
+	UserAccessProviderType string
+
+	// AuthKeyEnv is the environment variable name containing the auth key
+	// for the user access provider (e.g. "PLEXD_TAILSCALE_AUTH_KEY").
+	AuthKeyEnv string
+
+	// SetupKeyEnv is the environment variable name containing the setup key
+	// for the user access provider (e.g. "PLEXD_NETBIRD_SETUP_KEY").
+	SetupKeyEnv string
+
 	// IngressEnabled controls whether public ingress is active.
 	// Default: false. Requires Enabled=true.
 	IngressEnabled bool
@@ -101,6 +113,27 @@ type Config struct {
 	// MaxSiteToSiteTunnels is the maximum number of concurrent site-to-site tunnels.
 	// Default: 10
 	MaxSiteToSiteTunnels int
+
+	// TunnelProviders lists the tunnel provider types to enable for site-to-site connectivity.
+	// Supported values: "ipsec", "openvpn". Empty means WireGuard-only.
+	TunnelProviders []string
+
+	// ACMEEnabled controls whether ACME certificate management is active for ingress.
+	// Default: false. Requires IngressEnabled=true.
+	ACMEEnabled bool
+
+	// ACMECacheDir is the directory for caching ACME certificates.
+	ACMECacheDir string
+
+	// ACMEAllowedHosts is the whitelist of hostnames for ACME certificate issuance.
+	ACMEAllowedHosts []string
+
+	// ACMEEmail is the contact email for the ACME account.
+	ACMEEmail string
+
+	// ACMEDirectoryURL overrides the default ACME directory URL.
+	// Empty means the default (Let's Encrypt production).
+	ACMEDirectoryURL string
 }
 
 // BoolPtr returns a pointer to the given bool value.
@@ -203,12 +236,39 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("bridge: config: MaxAccessPeers must be positive when user access is enabled")
 		}
 	}
+	if c.UserAccessProviderType != "" {
+		switch c.UserAccessProviderType {
+		case "tailscale", "netbird":
+			// valid
+		default:
+			return fmt.Errorf("bridge: config: unsupported UserAccessProviderType %q", c.UserAccessProviderType)
+		}
+	}
 	if c.IngressEnabled {
 		if c.MaxIngressRules <= 0 {
 			return fmt.Errorf("bridge: config: MaxIngressRules must be positive when ingress is enabled")
 		}
 		if c.IngressDialTimeout < 1*time.Second {
 			return fmt.Errorf("bridge: config: IngressDialTimeout must be at least 1s")
+		}
+	}
+	for _, tp := range c.TunnelProviders {
+		switch tp {
+		case "ipsec", "openvpn":
+			// valid
+		default:
+			return fmt.Errorf("bridge: config: unsupported TunnelProvider %q", tp)
+		}
+	}
+	if c.ACMEEnabled {
+		if !c.IngressEnabled {
+			return fmt.Errorf("bridge: config: ACME requires ingress to be enabled")
+		}
+		if c.ACMECacheDir == "" {
+			return fmt.Errorf("bridge: config: ACMECacheDir is required when ACME is enabled")
+		}
+		if len(c.ACMEAllowedHosts) == 0 {
+			return fmt.Errorf("bridge: config: at least one ACMEAllowedHosts is required when ACME is enabled")
 		}
 	}
 	if c.SiteToSiteEnabled {

@@ -715,3 +715,182 @@ func TestConfig_Validate_SiteToSiteDisabled(t *testing.T) {
 		t.Errorf("Validate should return nil when site-to-site is disabled, got: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// UserAccessProviderType validation tests
+// ---------------------------------------------------------------------------
+
+func TestConfig_Validate_UserAccessProviderType_Valid(t *testing.T) {
+	for _, pt := range []string{"tailscale", "netbird"} {
+		t.Run(pt, func(t *testing.T) {
+			cfg := Config{
+				Enabled:                true,
+				AccessInterface:        "eth1",
+				AccessSubnets:          []string{"10.0.0.0/24"},
+				UserAccessProviderType: pt,
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate should accept provider type %q, got: %v", pt, err)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_UserAccessProviderType_Empty(t *testing.T) {
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate should accept empty provider type, got: %v", err)
+	}
+}
+
+func TestConfig_Validate_UserAccessProviderType_Invalid(t *testing.T) {
+	cfg := Config{
+		Enabled:                true,
+		AccessInterface:        "eth1",
+		AccessSubnets:          []string{"10.0.0.0/24"},
+		UserAccessProviderType: "wireguard",
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate should return error for unsupported provider type")
+	}
+	want := `bridge: config: unsupported UserAccessProviderType "wireguard"`
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TunnelProviders validation tests
+// ---------------------------------------------------------------------------
+
+func TestConfig_Validate_TunnelProviders_Valid(t *testing.T) {
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		TunnelProviders: []string{"ipsec", "openvpn"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate should accept valid tunnel providers, got: %v", err)
+	}
+}
+
+func TestConfig_Validate_TunnelProviders_Invalid(t *testing.T) {
+	cfg := Config{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		AccessSubnets:   []string{"10.0.0.0/24"},
+		TunnelProviders: []string{"ipsec", "gre"},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate should return error for unsupported tunnel provider")
+	}
+	want := `bridge: config: unsupported TunnelProvider "gre"`
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ACME validation tests
+// ---------------------------------------------------------------------------
+
+func TestConfig_Validate_ACME_Valid(t *testing.T) {
+	cfg := Config{
+		Enabled:            true,
+		AccessInterface:    "eth1",
+		AccessSubnets:      []string{"10.0.0.0/24"},
+		IngressEnabled:     true,
+		MaxIngressRules:    20,
+		IngressDialTimeout: 10 * time.Second,
+		ACMEEnabled:        true,
+		ACMECacheDir:       "/var/cache/acme",
+		ACMEAllowedHosts:   []string{"example.com"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate should accept valid ACME config, got: %v", err)
+	}
+}
+
+func TestConfig_Validate_ACME_RequiresIngress(t *testing.T) {
+	cfg := Config{
+		Enabled:          true,
+		AccessInterface:  "eth1",
+		AccessSubnets:    []string{"10.0.0.0/24"},
+		IngressEnabled:   false,
+		ACMEEnabled:      true,
+		ACMECacheDir:     "/var/cache/acme",
+		ACMEAllowedHosts: []string{"example.com"},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate should return error when ACME enabled without ingress")
+	}
+	want := "bridge: config: ACME requires ingress to be enabled"
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+func TestConfig_Validate_ACME_MissingCacheDir(t *testing.T) {
+	cfg := Config{
+		Enabled:            true,
+		AccessInterface:    "eth1",
+		AccessSubnets:      []string{"10.0.0.0/24"},
+		IngressEnabled:     true,
+		MaxIngressRules:    20,
+		IngressDialTimeout: 10 * time.Second,
+		ACMEEnabled:        true,
+		ACMEAllowedHosts:   []string{"example.com"},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate should return error when ACME CacheDir is empty")
+	}
+	want := "bridge: config: ACMECacheDir is required when ACME is enabled"
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+func TestConfig_Validate_ACME_MissingAllowedHosts(t *testing.T) {
+	cfg := Config{
+		Enabled:            true,
+		AccessInterface:    "eth1",
+		AccessSubnets:      []string{"10.0.0.0/24"},
+		IngressEnabled:     true,
+		MaxIngressRules:    20,
+		IngressDialTimeout: 10 * time.Second,
+		ACMEEnabled:        true,
+		ACMECacheDir:       "/var/cache/acme",
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate should return error when ACME AllowedHosts is empty")
+	}
+	want := "bridge: config: at least one ACMEAllowedHosts is required when ACME is enabled"
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+func TestConfig_Validate_ACME_Disabled(t *testing.T) {
+	cfg := Config{
+		Enabled:            true,
+		AccessInterface:    "eth1",
+		AccessSubnets:      []string{"10.0.0.0/24"},
+		IngressEnabled:     true,
+		MaxIngressRules:    20,
+		IngressDialTimeout: 10 * time.Second,
+		ACMEEnabled:        false,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate should pass when ACME is disabled, got: %v", err)
+	}
+}

@@ -29,7 +29,7 @@ func TestSiteToSiteIntegration_FullLifecycle(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), nil)
 
 	// Setup.
 	if err := mgr.Setup("wg0"); err != nil {
@@ -155,7 +155,7 @@ func TestSiteToSiteIntegration_ReconcileDrift(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), nil)
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestSiteToSiteIntegration_ConcurrentAccess(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), nil)
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}

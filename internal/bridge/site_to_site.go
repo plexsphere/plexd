@@ -1,9 +1,11 @@
 package bridge
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -12,18 +14,20 @@ import (
 
 // activeTunnel holds the state of a running site-to-site tunnel.
 type activeTunnel struct {
-	tunnel api.SiteToSiteTunnel
-	iface  string
+	tunnel       api.SiteToSiteTunnel
+	iface        string
+	providerName string // non-empty if managed by a TunnelProvider rather than WireGuard
 }
 
 // SiteToSiteManager manages site-to-site VPN tunnels — WireGuard interfaces
 // that establish VPN connections to external networks via a bridge node.
 // SiteToSiteManager is concurrent-safe via mu.
 type SiteToSiteManager struct {
-	ctrl   VPNController
-	routes RouteController
-	cfg    Config
-	logger *slog.Logger
+	ctrl            VPNController
+	routes          RouteController
+	cfg             Config
+	logger          *slog.Logger
+	tunnelProviders map[string]TunnelProvider // keyed by provider name (e.g. "ipsec", "openvpn")
 
 	// mu protects active, activeTunnels from concurrent access.
 	mu sync.Mutex
@@ -35,13 +39,18 @@ type SiteToSiteManager struct {
 }
 
 // NewSiteToSiteManager creates a new SiteToSiteManager.
-func NewSiteToSiteManager(ctrl VPNController, routes RouteController, cfg Config, logger *slog.Logger) *SiteToSiteManager {
+// tunnelProviders can be nil (meaning WireGuard-only mode).
+func NewSiteToSiteManager(ctrl VPNController, routes RouteController, cfg Config, logger *slog.Logger, tunnelProviders map[string]TunnelProvider) *SiteToSiteManager {
+	if tunnelProviders == nil {
+		tunnelProviders = make(map[string]TunnelProvider)
+	}
 	return &SiteToSiteManager{
-		ctrl:          ctrl,
-		routes:        routes,
-		cfg:           cfg,
-		logger:        logger.With("component", "bridge"),
-		activeTunnels: make(map[string]*activeTunnel),
+		ctrl:            ctrl,
+		routes:          routes,
+		cfg:             cfg,
+		logger:          logger.With("component", "bridge"),
+		tunnelProviders: tunnelProviders,
+		activeTunnels:   make(map[string]*activeTunnel),
 	}
 }
 
@@ -81,7 +90,16 @@ func (m *SiteToSiteManager) Teardown() error {
 	var errs []error
 
 	for id, at := range m.activeTunnels {
-		// Remove routes for remote subnets.
+		if at.providerName != "" {
+			// Provider-managed tunnel: delegate removal to the provider.
+			if provider, ok := m.tunnelProviders[at.providerName]; ok {
+				if err := provider.RemoveTunnel(id); err != nil {
+					errs = append(errs, fmt.Errorf("bridge: site-to-site: provider %s remove tunnel %s: %w", at.providerName, id, err))
+				}
+			}
+			continue
+		}
+		// WireGuard-managed tunnel: remove routes, forwarding, and interface.
 		for _, subnet := range at.tunnel.RemoteSubnets {
 			if err := m.routes.RemoveRoute(subnet, at.iface); err != nil {
 				errs = append(errs, fmt.Errorf("bridge: site-to-site: remove route %s for tunnel %s: %w", subnet, id, err))
@@ -94,6 +112,13 @@ func (m *SiteToSiteManager) Teardown() error {
 		// Remove the tunnel interface.
 		if err := m.ctrl.RemoveTunnelInterface(at.iface); err != nil {
 			errs = append(errs, fmt.Errorf("bridge: site-to-site: remove interface for tunnel %s: %w", id, err))
+		}
+	}
+
+	// Stop all tunnel providers.
+	for name, provider := range m.tunnelProviders {
+		if err := provider.Stop(); err != nil {
+			errs = append(errs, fmt.Errorf("bridge: site-to-site: stop provider %s: %w", name, err))
 		}
 	}
 
@@ -124,6 +149,40 @@ func (m *SiteToSiteManager) AddTunnel(tunnel api.SiteToSiteTunnel) error {
 	}
 	if len(m.activeTunnels) >= m.cfg.MaxSiteToSiteTunnels {
 		return fmt.Errorf("bridge: site-to-site: max tunnels reached (%d)", m.cfg.MaxSiteToSiteTunnels)
+	}
+
+	// Provider delegation: if ProviderType is non-empty and not "wireguard",
+	// delegate to the matching TunnelProvider.
+	if tunnel.ProviderType != "" && tunnel.ProviderType != "wireguard" {
+		provider, ok := m.tunnelProviders[tunnel.ProviderType]
+		if !ok {
+			return fmt.Errorf("bridge: site-to-site: unsupported provider type: %s", tunnel.ProviderType)
+		}
+
+		cfg := TunnelConfig{
+			TunnelID:       tunnel.TunnelID,
+			LocalSubnets:   tunnel.LocalSubnets,
+			RemoteSubnets:  tunnel.RemoteSubnets,
+			RemoteEndpoint: tunnel.RemoteEndpoint,
+			PSK:            tunnel.PSK,
+		}
+		if err := provider.CreateTunnel(context.Background(), cfg); err != nil {
+			return fmt.Errorf("bridge: site-to-site: provider %s create tunnel %s: %w", tunnel.ProviderType, tunnel.TunnelID, err)
+		}
+
+		m.activeTunnels[tunnel.TunnelID] = &activeTunnel{
+			tunnel:       tunnel,
+			providerName: tunnel.ProviderType,
+		}
+
+		m.logger.Info("site-to-site tunnel added via provider",
+			"tunnel_id", tunnel.TunnelID,
+			"provider", tunnel.ProviderType,
+			"remote_endpoint", tunnel.RemoteEndpoint,
+			"remote_subnets", tunnel.RemoteSubnets,
+		)
+
+		return nil
 	}
 
 	iface := tunnel.InterfaceName
@@ -195,6 +254,26 @@ func (m *SiteToSiteManager) RemoveTunnel(tunnelID string) {
 		return
 	}
 
+	// Provider-managed tunnel: delegate removal to the provider.
+	if at.providerName != "" {
+		if provider, ok := m.tunnelProviders[at.providerName]; ok {
+			if err := provider.RemoveTunnel(tunnelID); err != nil {
+				m.logger.Error("bridge: site-to-site: provider remove tunnel failed",
+					"tunnel_id", tunnelID,
+					"provider", at.providerName,
+					"error", err,
+				)
+			}
+		}
+		delete(m.activeTunnels, tunnelID)
+		m.logger.Info("site-to-site tunnel removed via provider",
+			"tunnel_id", tunnelID,
+			"provider", at.providerName,
+		)
+		return
+	}
+
+	// WireGuard-managed tunnel removal.
 	// Remove routes for remote subnets.
 	for _, subnet := range at.tunnel.RemoteSubnets {
 		if err := m.routes.RemoveRoute(subnet, at.iface); err != nil {
@@ -269,9 +348,17 @@ func (m *SiteToSiteManager) SiteToSiteStatus() *api.SiteToSiteInfo {
 	if !m.active {
 		return nil
 	}
+
+	var providerNames []string
+	for name := range m.tunnelProviders {
+		providerNames = append(providerNames, name)
+	}
+	sort.Strings(providerNames)
+
 	return &api.SiteToSiteInfo{
-		Enabled:     true,
-		TunnelCount: len(m.activeTunnels),
+		Enabled:             true,
+		TunnelCount:         len(m.activeTunnels),
+		TunnelProviderNames: providerNames,
 	}
 }
 

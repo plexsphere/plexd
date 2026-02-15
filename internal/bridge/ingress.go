@@ -32,6 +32,7 @@ type IngressManager struct {
 	cfg         Config
 	logger      *slog.Logger
 	dialTimeout time.Duration
+	acme        *ACMEManager // optional, may be nil
 
 	// mu protects active, activeRules from concurrent access by
 	// SSE event handlers and the reconcile loop.
@@ -44,12 +45,14 @@ type IngressManager struct {
 }
 
 // NewIngressManager creates a new IngressManager.
-func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger) *IngressManager {
+// The acme parameter is optional and may be nil.
+func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, acme *ACMEManager) *IngressManager {
 	return &IngressManager{
 		ctrl:        ctrl,
 		cfg:         cfg,
 		logger:      logger,
 		dialTimeout: cfg.IngressDialTimeout,
+		acme:        acme,
 		activeRules: make(map[string]*activeRule),
 	}
 }
@@ -135,9 +138,10 @@ func (m *IngressManager) AddRule(rule api.IngressRule) error {
 		return fmt.Errorf("bridge: ingress: max rules reached (%d)", m.cfg.MaxIngressRules)
 	}
 
-	// Build TLS config for terminate mode.
+	// Build TLS config for terminate or acme mode.
 	var tlsCfg *tls.Config
-	if rule.Mode == "terminate" {
+	switch rule.Mode {
+	case "terminate":
 		cert, err := tls.X509KeyPair([]byte(rule.CertPEM), []byte(rule.KeyPEM))
 		if err != nil {
 			return fmt.Errorf("bridge: ingress: rule %s: load TLS certificate: %w", rule.RuleID, err)
@@ -145,6 +149,17 @@ func (m *IngressManager) AddRule(rule api.IngressRule) error {
 		tlsCfg = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
+		}
+	case "acme":
+		if m.acme == nil {
+			return fmt.Errorf("bridge: ingress: rule %s: ACME mode requires ACMEManager", rule.RuleID)
+		}
+		if rule.Hostname == "" {
+			return fmt.Errorf("bridge: ingress: rule %s: hostname is required for ACME mode", rule.RuleID)
+		}
+		tlsCfg = m.acme.TLSConfig()
+		if tlsCfg == nil {
+			return fmt.Errorf("bridge: ingress: rule %s: ACME manager is not active", rule.RuleID)
 		}
 	}
 
@@ -307,6 +322,7 @@ func (m *IngressManager) IngressStatus() *api.IngressInfo {
 		Enabled:         true,
 		RuleCount:       len(m.activeRules),
 		ConnectionCount: int(m.connCount.Load()),
+		ACMEEnabled:     m.acme != nil,
 	}
 }
 

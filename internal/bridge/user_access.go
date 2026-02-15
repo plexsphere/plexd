@@ -2,6 +2,7 @@
 package bridge
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,10 +16,11 @@ import (
 // that allows external VPN clients to reach the mesh via a bridge node.
 // UserAccessManager is concurrent-safe via mu.
 type UserAccessManager struct {
-	ctrl   AccessController
-	routes RouteController
-	cfg    Config
-	logger *slog.Logger
+	ctrl     AccessController
+	routes   RouteController
+	cfg      Config
+	logger   *slog.Logger
+	provider UserAccessProvider // optional, may be nil
 
 	// mu protects active and activePeers from concurrent access by
 	// SSE event handlers and the reconcile loop.
@@ -29,13 +31,15 @@ type UserAccessManager struct {
 	activePeers map[string]struct{} // keyed by public key
 }
 
-// NewUserAccessManager creates a new UserAccessManager.
-func NewUserAccessManager(ctrl AccessController, routes RouteController, cfg Config, logger *slog.Logger) *UserAccessManager {
+// NewUserAccessManager creates a new UserAccessManager. The provider parameter
+// is optional — pass nil when no external VPN provider is used.
+func NewUserAccessManager(ctrl AccessController, routes RouteController, cfg Config, logger *slog.Logger, provider UserAccessProvider) *UserAccessManager {
 	return &UserAccessManager{
 		ctrl:        ctrl,
 		routes:      routes,
 		cfg:         cfg,
 		logger:      logger,
+		provider:    provider,
 		activePeers: make(map[string]struct{}),
 	}
 }
@@ -62,6 +66,21 @@ func (m *UserAccessManager) Setup() error {
 
 	m.active = true
 
+	if m.provider != nil {
+		if err := m.provider.Start(context.Background()); err != nil {
+			// Best-effort rollback: disable forwarding and remove interface.
+			_ = m.routes.DisableForwarding(m.cfg.UserAccessInterfaceName, m.cfg.AccessInterface)
+			_ = m.ctrl.RemoveInterface(m.cfg.UserAccessInterfaceName)
+			m.active = false
+			return fmt.Errorf("bridge: user access: start provider: %w", err)
+		}
+
+		m.logger.Info("user access provider started",
+			"component", "bridge",
+			"provider", m.provider.Name(),
+		)
+	}
+
 	m.logger.Info("user access interface created",
 		"component", "bridge",
 		"interface", m.cfg.UserAccessInterfaceName,
@@ -84,6 +103,12 @@ func (m *UserAccessManager) Teardown() error {
 	}
 
 	var errs []error
+
+	if m.provider != nil {
+		if err := m.provider.Stop(); err != nil {
+			errs = append(errs, fmt.Errorf("bridge: user access: stop provider: %w", err))
+		}
+	}
 
 	// Remove all tracked peers individually.
 	for pk := range m.activePeers {
@@ -177,12 +202,24 @@ func (m *UserAccessManager) UserAccessStatus() *api.UserAccessInfo {
 	if !m.active {
 		return nil
 	}
-	return &api.UserAccessInfo{
+	info := &api.UserAccessInfo{
 		Enabled:       true,
 		InterfaceName: m.cfg.UserAccessInterfaceName,
 		PeerCount:     len(m.activePeers),
 		ListenPort:    m.cfg.UserAccessListenPort,
 	}
+	if m.provider != nil {
+		info.ProviderName = m.provider.Name()
+		status := m.provider.Status()
+		if status.Running {
+			info.ProviderStatus = "running"
+		} else if status.Error != "" {
+			info.ProviderStatus = "error"
+		} else {
+			info.ProviderStatus = "stopped"
+		}
+	}
+	return info
 }
 
 // UserAccessCapabilities returns capability metadata for registration.

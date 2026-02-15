@@ -2,8 +2,8 @@
   "feature_id": "PXD-0028",
   "title": "G005: Add bridge mode for VPN providers and ingress",
   "slug": "g005-add-bridge-mode-for-vpn-providers-and-ingress",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 🏗️ large\n**Category:** backend\n**Priority:** high\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nImplement all bridge mode connectivity providers and ingress:\n\n**Tailscale Integration:** VPN provider for bridge user access. Configure via `auth_key_env: TS_AUTHKEY`. Manage Tailscale daemon lifecycle, advertise routes, handle auth key rotation.\n\n**Netbird Integration:** VPN provider for bridge user access. Configure via `setup_key_env: NB_SETUP_KEY`. Manage Netbird client lifecycle and route advertisement.\n\n**ACME/Let's Encrypt:** Auto-certificate provisioning for public ingress endpoints (`listen: 0.0.0.0:443`). Use `golang.org/x/crypto/acme/autocert` for automatic certificate issuance and renewal.\n\n**SNI-Based Routing:** TLS SNI inspection for routing incoming connections to correct backend services through the bridge.\n\n**IPsec TunnelProvider:** Site-to-site VPN implementation behind existing `TunnelProvider` interface in `internal/bridge/site_to_site.go`.\n\n**OpenVPN TunnelProvider:** Alternative site-to-site VPN implementation behind same `TunnelProvider` interface.\n\n**Rationale:** Bridge mode is a primary use case - connecting users to private networks and linking sites together. Without VPN providers (Tailscale/Netbird), user access doesn't work. Without ACME/SNI, public ingress requires manual certificate management. Without IPsec/OpenVPN, site-to-site tunnels are limited to WireGuard only.\n\n**Affected Areas:**\n- internal/bridge/tailscale.go\n- internal/bridge/netbird.go\n- internal/bridge/acme.go\n- internal/bridge/sni.go\n- internal/bridge/ipsec.go\n- internal/bridge/openvpn.go\n- internal/bridge/site_to_site.go\n- go.mod",
   "stories": [
@@ -425,25 +425,25 @@
     }
   ],
   "tasks": [
-    "1.1 Define UserAccessProvider interface and ProviderStatus type in internal/bridge/user_access_provider.go with Start, Stop, Status, Name methods. Define CommandExecutor interface for testability of exec.Command calls. Add compile-time interface checks. (REQ-001)",
-    "1.2 Implement TailscaleProvider in internal/bridge/tailscale.go: Start reads auth key from env var, invokes tailscaled via CommandExecutor, advertises routes; Stop shuts down daemon; Status returns connection state. Include tests in internal/bridge/tailscale_test.go using mock CommandExecutor. (REQ-002)",
-    "1.3 Implement NetbirdProvider in internal/bridge/netbird.go: Start reads setup key from env var, invokes netbird client via CommandExecutor, advertises routes; Stop shuts down client; Status returns connection state. Include tests in internal/bridge/netbird_test.go using mock CommandExecutor. (REQ-003)",
-    "1.4 Define TunnelProvider interface and TunnelConfig/TunnelStatus types in internal/bridge/tunnel_provider.go with CreateTunnel, RemoveTunnel, TunnelStatus, Protocol methods. Add Protocol field to api.SiteToSiteTunnel. (REQ-006)",
-    "1.5 Implement IPsecProvider in internal/bridge/ipsec.go behind TunnelProvider interface: CreateTunnel generates strongSwan config and invokes swanctl CLI via CommandExecutor; RemoveTunnel terminates connection; TunnelStatus returns state. Include tests in internal/bridge/ipsec_test.go. (REQ-007)",
-    "1.6 Implement OpenVPNProvider in internal/bridge/openvpn.go behind TunnelProvider interface: CreateTunnel generates config file and starts openvpn process via CommandExecutor; RemoveTunnel sends SIGTERM and cleans up; TunnelStatus returns process state. Include tests in internal/bridge/openvpn_test.go. (REQ-008)",
-    "2.1 Implement ACMEManager in internal/bridge/acme.go: wraps autocert.Manager with DirCache, HostWhitelist policy, TLS-ALPN-01; exposes TLSConfig() *tls.Config for IngressManager use. Include tests in internal/bridge/acme_test.go verifying TLS config construction, host policy, and cache dir usage. Add golang.org/x/crypto/acme/autocert to go.mod. (REQ-004)",
-    "2.2 Implement SNIRouter in internal/bridge/sni.go: accepts TCP connections, peeks at TLS ClientHello to extract SNI hostname via readClientHello helper, looks up target in sync.RWMutex-protected routing map, proxies full connection (including buffered ClientHello bytes) to backend via bidirectional io.Copy. Exposes SetRoutes(map[string]string) for dynamic updates. Include tests in internal/bridge/sni_test.go with real TCP connections. (REQ-005)",
-    "3.1 Extend bridge Config with new fields: UserAccessProviderType (string), AuthKeyEnv (string), SetupKeyEnv (string), ACMEEnabled (bool), ACMEEmail (string), ACMECacheDir (string), ACMEHosts ([]string), SNIEnabled (bool). Add ApplyDefaults for ACMECacheDir. Add Validate rules for provider type, ACME email, ACME cache dir. Include tests in internal/bridge/config_test.go. (REQ-009)",
-    "3.2 Extend api.UserAccessInfo with ProviderName and ProviderStatus string fields. Extend api.SiteToSiteTunnel with Protocol string field. Extend api.IngressInfo with ACMEEnabled bool field. Update api.SiteToSiteInfo with SupportedProtocols []string field. Include serialization tests in internal/api/types_test.go. (REQ-010, REQ-006)",
-    "3.3 Extend SiteToSiteManager to accept a map[string]TunnelProvider in constructor. In AddTunnel, check tunnel.Protocol: if empty or 'wireguard', use existing VPNController flow; otherwise delegate to the matching TunnelProvider. RemoveTunnel likewise delegates based on stored protocol. Update SiteToSiteCapabilities to include supported protocols. Include tests for protocol dispatch in internal/bridge/site_to_site_test.go. (REQ-006)",
-    "3.4 Extend UserAccessManager to accept an optional UserAccessProvider. In Setup, after creating WireGuard interface, start the provider with mesh routes. In Teardown, stop the provider. Update UserAccessStatus to include provider name and status. Include tests in internal/bridge/user_access_test.go with a mock UserAccessProvider. (REQ-001, REQ-010)",
-    "3.5 Extend IngressManager to accept an optional ACMEManager. When ACME is enabled and a rule uses mode='acme', use ACMEManager.TLSConfig() instead of per-rule certificates. When SNIEnabled, create a single SNIRouter listener instead of per-rule listeners for passthrough rules sharing a port. Include tests in internal/bridge/ingress_test.go. (REQ-004, REQ-005)",
-    "4.1 Write reference documentation in docs/reference/backend/vpn-providers.md covering UserAccessProvider interface, TailscaleProvider config and lifecycle, NetbirdProvider config and lifecycle, error handling, and heartbeat status fields (REQ-001, REQ-002, REQ-003)",
-    "4.2 Write reference documentation in docs/reference/backend/acme-sni.md covering ACMEManager config, TLS config generation, host policy, certificate caching, SNIRouter routing table, connection flow, and integration with IngressManager (REQ-004, REQ-005)",
-    "4.3 Write reference documentation in docs/reference/backend/tunnel-providers.md covering TunnelProvider interface, IPsecProvider strongSwan integration, OpenVPNProvider process management, protocol selection, and SiteToSiteManager dispatch (REQ-006, REQ-007, REQ-008)",
-    "5.1 Integration tests in internal/bridge/provider_integration_test.go: test UserAccessManager with mock UserAccessProvider lifecycle (start, status check, stop), VPN provider selection from config, and heartbeat status propagation (REQ-001, REQ-002, REQ-003, REQ-010)",
-    "5.2 Integration tests in internal/bridge/acme_integration_test.go: test ACMEManager TLS config with real TCP listener, SNIRouter with multiple backends, SNI routing with unknown hostname, and SNIRouter route updates during active connections (REQ-004, REQ-005)",
-    "5.3 Integration tests in internal/bridge/tunnel_provider_integration_test.go: test SiteToSiteManager with mock TunnelProvider for IPsec/OpenVPN protocol dispatch, fallback to VPNController for WireGuard, mixed-protocol tunnel set reconciliation, and unsupported protocol error handling (REQ-006, REQ-007, REQ-008)"
+    "[done] 1.1 Define UserAccessProvider interface and ProviderStatus type in internal/bridge/user_access_provider.go with Start, Stop, Status, Name methods. Define CommandExecutor interface for testability of exec.Command calls. Add compile-time interface checks. (REQ-001)",
+    "[done] 1.2 Implement TailscaleProvider in internal/bridge/tailscale.go: Start reads auth key from env var, invokes tailscaled via CommandExecutor, advertises routes; Stop shuts down daemon; Status returns connection state. Include tests in internal/bridge/tailscale_test.go using mock CommandExecutor. (REQ-002)",
+    "[done] 1.3 Implement NetbirdProvider in internal/bridge/netbird.go: Start reads setup key from env var, invokes netbird client via CommandExecutor, advertises routes; Stop shuts down client; Status returns connection state. Include tests in internal/bridge/netbird_test.go using mock CommandExecutor. (REQ-003)",
+    "[done] 1.4 Define TunnelProvider interface and TunnelConfig/TunnelStatus types in internal/bridge/tunnel_provider.go with CreateTunnel, RemoveTunnel, TunnelStatus, Protocol methods. Add Protocol field to api.SiteToSiteTunnel. (REQ-006)",
+    "[done] 1.5 Implement IPsecProvider in internal/bridge/ipsec.go behind TunnelProvider interface: CreateTunnel generates strongSwan config and invokes swanctl CLI via CommandExecutor; RemoveTunnel terminates connection; TunnelStatus returns state. Include tests in internal/bridge/ipsec_test.go. (REQ-007)",
+    "[done] 1.6 Implement OpenVPNProvider in internal/bridge/openvpn.go behind TunnelProvider interface: CreateTunnel generates config file and starts openvpn process via CommandExecutor; RemoveTunnel sends SIGTERM and cleans up; TunnelStatus returns process state. Include tests in internal/bridge/openvpn_test.go. (REQ-008)",
+    "[done] 2.1 Implement ACMEManager in internal/bridge/acme.go: wraps autocert.Manager with DirCache, HostWhitelist policy, TLS-ALPN-01; exposes TLSConfig() *tls.Config for IngressManager use. Include tests in internal/bridge/acme_test.go verifying TLS config construction, host policy, and cache dir usage. Add golang.org/x/crypto/acme/autocert to go.mod. (REQ-004)",
+    "[done] 2.2 Implement SNIRouter in internal/bridge/sni.go: accepts TCP connections, peeks at TLS ClientHello to extract SNI hostname via readClientHello helper, looks up target in sync.RWMutex-protected routing map, proxies full connection (including buffered ClientHello bytes) to backend via bidirectional io.Copy. Exposes SetRoutes(map[string]string) for dynamic updates. Include tests in internal/bridge/sni_test.go with real TCP connections. (REQ-005)",
+    "[done] 3.1 Extend bridge Config with new fields: UserAccessProviderType (string), AuthKeyEnv (string), SetupKeyEnv (string), ACMEEnabled (bool), ACMEEmail (string), ACMECacheDir (string), ACMEHosts ([]string), SNIEnabled (bool). Add ApplyDefaults for ACMECacheDir. Add Validate rules for provider type, ACME email, ACME cache dir. Include tests in internal/bridge/config_test.go. (REQ-009)",
+    "[done] 3.2 Extend api.UserAccessInfo with ProviderName and ProviderStatus string fields. Extend api.SiteToSiteTunnel with Protocol string field. Extend api.IngressInfo with ACMEEnabled bool field. Update api.SiteToSiteInfo with SupportedProtocols []string field. Include serialization tests in internal/api/types_test.go. (REQ-010, REQ-006)",
+    "[done] 3.3 Extend SiteToSiteManager to accept a map[string]TunnelProvider in constructor. In AddTunnel, check tunnel.Protocol: if empty or 'wireguard', use existing VPNController flow; otherwise delegate to the matching TunnelProvider. RemoveTunnel likewise delegates based on stored protocol. Update SiteToSiteCapabilities to include supported protocols. Include tests for protocol dispatch in internal/bridge/site_to_site_test.go. (REQ-006)",
+    "[done] 3.4 Extend UserAccessManager to accept an optional UserAccessProvider. In Setup, after creating WireGuard interface, start the provider with mesh routes. In Teardown, stop the provider. Update UserAccessStatus to include provider name and status. Include tests in internal/bridge/user_access_test.go with a mock UserAccessProvider. (REQ-001, REQ-010)",
+    "[done] 3.5 Extend IngressManager to accept an optional ACMEManager. When ACME is enabled and a rule uses mode='acme', use ACMEManager.TLSConfig() instead of per-rule certificates. When SNIEnabled, create a single SNIRouter listener instead of per-rule listeners for passthrough rules sharing a port. Include tests in internal/bridge/ingress_test.go. (REQ-004, REQ-005)",
+    "[done] 4.1 Write reference documentation in docs/reference/backend/vpn-providers.md covering UserAccessProvider interface, TailscaleProvider config and lifecycle, NetbirdProvider config and lifecycle, error handling, and heartbeat status fields (REQ-001, REQ-002, REQ-003)",
+    "[done] 4.2 Write reference documentation in docs/reference/backend/acme-sni.md covering ACMEManager config, TLS config generation, host policy, certificate caching, SNIRouter routing table, connection flow, and integration with IngressManager (REQ-004, REQ-005)",
+    "[done] 4.3 Write reference documentation in docs/reference/backend/tunnel-providers.md covering TunnelProvider interface, IPsecProvider strongSwan integration, OpenVPNProvider process management, protocol selection, and SiteToSiteManager dispatch (REQ-006, REQ-007, REQ-008)",
+    "[done] 5.1 Integration tests in internal/bridge/provider_integration_test.go: test UserAccessManager with mock UserAccessProvider lifecycle (start, status check, stop), VPN provider selection from config, and heartbeat status propagation (REQ-001, REQ-002, REQ-003, REQ-010)",
+    "[done] 5.2 Integration tests in internal/bridge/acme_integration_test.go: test ACMEManager TLS config with real TCP listener, SNIRouter with multiple backends, SNI routing with unknown hostname, and SNIRouter route updates during active connections (REQ-004, REQ-005)",
+    "[done] 5.3 Integration tests in internal/bridge/tunnel_provider_integration_test.go: test SiteToSiteManager with mock TunnelProvider for IPsec/OpenVPN protocol dispatch, fallback to VPNController for WireGuard, mixed-protocol tunnel set reconciliation, and unsupported protocol error handling (REQ-006, REQ-007, REQ-008)"
   ],
   "test_specifications": [
     {
@@ -644,6 +644,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-14T15:59:45.160946"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T10:30:18.269260"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T11:41:05.327047"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T11:41:05.383182"
     }
   },
   "execution_history": [
@@ -657,6 +669,62 @@
           "name": "prepare",
           "duration": 314.4055895805359,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "c612c941-d8e7-4cc9-bd9e-5672117f5b2f",
+      "timestamp": "2026-02-15T11:32:16.479194",
+      "total_duration": 3561.719914674759,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (6 tasks)",
+          "duration": 733.1884195804596,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (2 tasks)",
+          "duration": 448.0088346004486,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (5 tasks)",
+          "duration": 486.6572036743164,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (3 tasks)",
+          "duration": 331.2877690792084,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 5 (3 tasks)",
+          "duration": 369.46128582954407,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0028] Code Review",
+          "duration": 414.49296522140503,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0028] Improvements",
+          "duration": 483.32231640815735,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0028] Simplify",
+          "duration": 295.3011202812195,
+          "type": "simplify",
           "status": "done"
         }
       ]

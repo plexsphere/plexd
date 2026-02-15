@@ -54,7 +54,7 @@ func newTestSiteToSiteManager(t *testing.T, vpnCtrl *mockVPNController, routeCtr
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), nil)
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}

@@ -1,7 +1,9 @@
 package bridge
 
 import (
+	"context"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -22,7 +24,7 @@ func TestSiteToSiteManager_Setup_Disabled(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -45,7 +47,7 @@ func TestSiteToSiteManager_Setup_Enabled(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -78,7 +80,7 @@ func TestSiteToSiteManager_Teardown_Inactive(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	// Teardown when not active should return nil.
 	if err := mgr.Teardown(); err != nil {
@@ -101,7 +103,7 @@ func TestSiteToSiteManager_Teardown_Active(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -183,7 +185,7 @@ func TestSiteToSiteManager_Teardown_AggregatesErrors(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -228,7 +230,7 @@ func TestSiteToSiteManager_AddTunnel_Success(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -331,7 +333,7 @@ func TestSiteToSiteManager_AddTunnel_Inactive(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	// Do NOT call Setup — manager is inactive.
 	tunnel := api.SiteToSiteTunnel{
@@ -366,7 +368,7 @@ func TestSiteToSiteManager_AddTunnel_Duplicate(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -404,7 +406,7 @@ func TestSiteToSiteManager_AddTunnel_MaxReached(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -454,7 +456,7 @@ func TestSiteToSiteManager_AddTunnel_CreateInterfaceError(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -502,7 +504,7 @@ func TestSiteToSiteManager_AddTunnel_ConfigurePeerError(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -564,7 +566,7 @@ func TestSiteToSiteManager_AddTunnel_AddRouteError(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -627,7 +629,7 @@ func TestSiteToSiteManager_AddTunnel_EnableForwardingError(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -680,7 +682,7 @@ func TestSiteToSiteManager_AddTunnel_EmptyRemoteSubnets(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -752,7 +754,7 @@ func TestSiteToSiteManager_RemoveTunnel_Success(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -833,7 +835,7 @@ func TestSiteToSiteManager_RemoveTunnel_NotFound(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -864,7 +866,7 @@ func TestSiteToSiteManager_RemoveTunnel_Inactive(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	// Do NOT call Setup — manager is inactive.
 	// Should not panic or call controller.
@@ -890,7 +892,7 @@ func TestSiteToSiteManager_GetTunnel_Exists(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -931,7 +933,7 @@ func TestSiteToSiteManager_GetTunnel_NotFound(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -957,7 +959,7 @@ func TestSiteToSiteManager_TunnelIDs(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -1013,7 +1015,7 @@ func TestSiteToSiteManager_SiteToSiteStatus_Active(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -1056,7 +1058,7 @@ func TestSiteToSiteManager_SiteToSiteStatus_Inactive(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if status := mgr.SiteToSiteStatus(); status != nil {
 		t.Errorf("SiteToSiteStatus should be nil when not active, got %+v", status)
@@ -1078,7 +1080,7 @@ func TestSiteToSiteManager_SiteToSiteCapabilities_Enabled(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	caps := mgr.SiteToSiteCapabilities()
 	if caps == nil {
@@ -1103,9 +1105,444 @@ func TestSiteToSiteManager_SiteToSiteCapabilities_Disabled(t *testing.T) {
 	}
 	cfg.ApplyDefaults()
 
-	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger())
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
 
 	if caps := mgr.SiteToSiteCapabilities(); caps != nil {
 		t.Errorf("SiteToSiteCapabilities should be nil when disabled, got %v", caps)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// mockTunnelProvider — test double for TunnelProvider
+// ---------------------------------------------------------------------------
+
+type mockTunnelProvider struct {
+	mu        sync.Mutex
+	calls     []mockCall
+	createErr error
+	removeErr error
+	stopErr   error
+	tunnels   map[string]bool
+}
+
+func newMockTunnelProvider() *mockTunnelProvider {
+	return &mockTunnelProvider{tunnels: make(map[string]bool)}
+}
+
+func (p *mockTunnelProvider) Name() string { return "mock-tunnel" }
+
+func (p *mockTunnelProvider) CreateTunnel(_ context.Context, cfg TunnelConfig) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, mockCall{Method: "CreateTunnel", Args: []interface{}{cfg.TunnelID}})
+	if p.createErr != nil {
+		return p.createErr
+	}
+	p.tunnels[cfg.TunnelID] = true
+	return nil
+}
+
+func (p *mockTunnelProvider) RemoveTunnel(tunnelID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, mockCall{Method: "RemoveTunnel", Args: []interface{}{tunnelID}})
+	if p.removeErr != nil {
+		return p.removeErr
+	}
+	delete(p.tunnels, tunnelID)
+	return nil
+}
+
+func (p *mockTunnelProvider) TunnelStatus(tunnelID string) TunnelStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.tunnels[tunnelID] {
+		return TunnelStatus{TunnelID: tunnelID, Running: true}
+	}
+	return TunnelStatus{TunnelID: tunnelID}
+}
+
+func (p *mockTunnelProvider) ActiveTunnels() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var ids []string
+	for id := range p.tunnels {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (p *mockTunnelProvider) Stop() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, mockCall{Method: "Stop"})
+	return p.stopErr
+}
+
+func (p *mockTunnelProvider) callsFor(method string) []mockCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var result []mockCall
+	for _, c := range p.calls {
+		if c.Method == method {
+			result = append(result, c)
+		}
+	}
+	return result
+}
+
+// Verify mockTunnelProvider satisfies TunnelProvider at compile time.
+var _ TunnelProvider = (*mockTunnelProvider)(nil)
+
+// ---------------------------------------------------------------------------
+// SiteToSiteManager TunnelProvider delegation tests
+// ---------------------------------------------------------------------------
+
+func TestSiteToSiteManager_AddTunnel_ProviderDelegation(t *testing.T) {
+	vpn := &mockVPNController{}
+	routes := &mockRouteController{}
+	provider := newMockTunnelProvider()
+	cfg := Config{
+		Enabled:           true,
+		AccessInterface:   "eth1",
+		AccessSubnets:     []string{"10.0.0.0/24"},
+		SiteToSiteEnabled: true,
+	}
+	cfg.ApplyDefaults()
+
+	providers := map[string]TunnelProvider{
+		"ipsec": provider,
+	}
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), providers)
+
+	if err := mgr.Setup("wg0"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	vpn.resetVPN()
+	routes.reset()
+
+	tunnel := api.SiteToSiteTunnel{
+		TunnelID:       "t-ipsec-1",
+		RemoteEndpoint: "203.0.113.1:500",
+		LocalSubnets:   []string{"10.0.0.0/24"},
+		RemoteSubnets:  []string{"10.1.0.0/24"},
+		PSK:            "shared-secret",
+		ProviderType:   "ipsec",
+	}
+	if err := mgr.AddTunnel(tunnel); err != nil {
+		t.Fatalf("AddTunnel: %v", err)
+	}
+
+	// Verify provider.CreateTunnel was called.
+	createCalls := provider.callsFor("CreateTunnel")
+	if len(createCalls) != 1 {
+		t.Fatalf("expected 1 CreateTunnel call, got %d", len(createCalls))
+	}
+	if createCalls[0].Args[0] != "t-ipsec-1" {
+		t.Errorf("CreateTunnel tunnelID = %v, want t-ipsec-1", createCalls[0].Args[0])
+	}
+
+	// Verify NO VPNController calls were made.
+	if len(vpn.vpnCallsFor("CreateTunnelInterface")) != 0 {
+		t.Error("CreateTunnelInterface should not be called for provider-managed tunnel")
+	}
+	if len(vpn.vpnCallsFor("ConfigureTunnelPeer")) != 0 {
+		t.Error("ConfigureTunnelPeer should not be called for provider-managed tunnel")
+	}
+
+	// Verify NO RouteController calls were made.
+	if len(routes.callsFor("EnableForwarding")) != 0 {
+		t.Error("EnableForwarding should not be called for provider-managed tunnel")
+	}
+	if len(routes.callsFor("AddRoute")) != 0 {
+		t.Error("AddRoute should not be called for provider-managed tunnel")
+	}
+
+	// Verify tunnel is tracked.
+	ids := mgr.TunnelIDs()
+	if len(ids) != 1 || ids[0] != "t-ipsec-1" {
+		t.Errorf("TunnelIDs = %v, want [t-ipsec-1]", ids)
+	}
+
+	// Verify GetTunnel returns the tunnel.
+	got, ok := mgr.GetTunnel("t-ipsec-1")
+	if !ok {
+		t.Fatal("GetTunnel should return true for provider-managed tunnel")
+	}
+	if got.ProviderType != "ipsec" {
+		t.Errorf("GetTunnel ProviderType = %q, want %q", got.ProviderType, "ipsec")
+	}
+}
+
+func TestSiteToSiteManager_AddTunnel_ProviderNotFound(t *testing.T) {
+	vpn := &mockVPNController{}
+	routes := &mockRouteController{}
+	cfg := Config{
+		Enabled:           true,
+		AccessInterface:   "eth1",
+		AccessSubnets:     []string{"10.0.0.0/24"},
+		SiteToSiteEnabled: true,
+	}
+	cfg.ApplyDefaults()
+
+	// No providers registered.
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), nil)
+
+	if err := mgr.Setup("wg0"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	tunnel := api.SiteToSiteTunnel{
+		TunnelID:       "t-unknown-1",
+		RemoteEndpoint: "203.0.113.1:500",
+		LocalSubnets:   []string{"10.0.0.0/24"},
+		RemoteSubnets:  []string{"10.1.0.0/24"},
+		ProviderType:   "unknown",
+	}
+
+	err := mgr.AddTunnel(tunnel)
+	if err == nil {
+		t.Fatal("AddTunnel should return error for unsupported provider type")
+	}
+
+	// Verify error message mentions the unsupported provider type.
+	want := "unsupported provider type: unknown"
+	if got := err.Error(); !contains(got, want) {
+		t.Errorf("error = %q, want to contain %q", got, want)
+	}
+
+	// Verify no tunnel is tracked.
+	if len(mgr.TunnelIDs()) != 0 {
+		t.Error("no tunnel should be tracked after unsupported provider error")
+	}
+}
+
+func TestSiteToSiteManager_AddTunnel_ProviderError(t *testing.T) {
+	vpn := &mockVPNController{}
+	routes := &mockRouteController{}
+	provider := newMockTunnelProvider()
+	provider.createErr = fmt.Errorf("provider create failed")
+	cfg := Config{
+		Enabled:           true,
+		AccessInterface:   "eth1",
+		AccessSubnets:     []string{"10.0.0.0/24"},
+		SiteToSiteEnabled: true,
+	}
+	cfg.ApplyDefaults()
+
+	providers := map[string]TunnelProvider{
+		"ipsec": provider,
+	}
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), providers)
+
+	if err := mgr.Setup("wg0"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	tunnel := api.SiteToSiteTunnel{
+		TunnelID:       "t-fail-1",
+		RemoteEndpoint: "203.0.113.1:500",
+		LocalSubnets:   []string{"10.0.0.0/24"},
+		RemoteSubnets:  []string{"10.1.0.0/24"},
+		ProviderType:   "ipsec",
+	}
+
+	err := mgr.AddTunnel(tunnel)
+	if err == nil {
+		t.Fatal("AddTunnel should return error when provider.CreateTunnel fails")
+	}
+
+	// Verify no tunnel is tracked.
+	if len(mgr.TunnelIDs()) != 0 {
+		t.Error("no tunnel should be tracked after provider create error")
+	}
+
+	// Verify NO VPNController calls were made.
+	if len(vpn.vpnCallsFor("CreateTunnelInterface")) != 0 {
+		t.Error("CreateTunnelInterface should not be called when provider fails")
+	}
+}
+
+func TestSiteToSiteManager_RemoveTunnel_ProviderDelegation(t *testing.T) {
+	vpn := &mockVPNController{}
+	routes := &mockRouteController{}
+	provider := newMockTunnelProvider()
+	cfg := Config{
+		Enabled:           true,
+		AccessInterface:   "eth1",
+		AccessSubnets:     []string{"10.0.0.0/24"},
+		SiteToSiteEnabled: true,
+	}
+	cfg.ApplyDefaults()
+
+	providers := map[string]TunnelProvider{
+		"ipsec": provider,
+	}
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), providers)
+
+	if err := mgr.Setup("wg0"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	// Add a provider-managed tunnel.
+	tunnel := api.SiteToSiteTunnel{
+		TunnelID:       "t-ipsec-rm",
+		RemoteEndpoint: "203.0.113.1:500",
+		LocalSubnets:   []string{"10.0.0.0/24"},
+		RemoteSubnets:  []string{"10.1.0.0/24"},
+		ProviderType:   "ipsec",
+	}
+	if err := mgr.AddTunnel(tunnel); err != nil {
+		t.Fatalf("AddTunnel: %v", err)
+	}
+	vpn.resetVPN()
+	routes.reset()
+
+	// Remove the tunnel.
+	mgr.RemoveTunnel("t-ipsec-rm")
+
+	// Verify provider.RemoveTunnel was called.
+	removeCalls := provider.callsFor("RemoveTunnel")
+	if len(removeCalls) != 1 {
+		t.Fatalf("expected 1 RemoveTunnel call, got %d", len(removeCalls))
+	}
+	if removeCalls[0].Args[0] != "t-ipsec-rm" {
+		t.Errorf("RemoveTunnel tunnelID = %v, want t-ipsec-rm", removeCalls[0].Args[0])
+	}
+
+	// Verify NO VPNController calls were made.
+	if len(vpn.vpnCallsFor("RemoveTunnelInterface")) != 0 {
+		t.Error("RemoveTunnelInterface should not be called for provider-managed tunnel")
+	}
+	if len(vpn.vpnCallsFor("RemoveTunnelPeer")) != 0 {
+		t.Error("RemoveTunnelPeer should not be called for provider-managed tunnel")
+	}
+
+	// Verify NO RouteController calls were made.
+	if len(routes.callsFor("RemoveRoute")) != 0 {
+		t.Error("RemoveRoute should not be called for provider-managed tunnel")
+	}
+	if len(routes.callsFor("DisableForwarding")) != 0 {
+		t.Error("DisableForwarding should not be called for provider-managed tunnel")
+	}
+
+	// Verify tunnel is no longer tracked.
+	if ids := mgr.TunnelIDs(); len(ids) != 0 {
+		t.Errorf("TunnelIDs = %v, want empty", ids)
+	}
+}
+
+func TestSiteToSiteManager_Teardown_StopsProviders(t *testing.T) {
+	vpn := &mockVPNController{}
+	routes := &mockRouteController{}
+	provider := newMockTunnelProvider()
+	cfg := Config{
+		Enabled:           true,
+		AccessInterface:   "eth1",
+		AccessSubnets:     []string{"10.0.0.0/24"},
+		SiteToSiteEnabled: true,
+	}
+	cfg.ApplyDefaults()
+
+	providers := map[string]TunnelProvider{
+		"ipsec": provider,
+	}
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), providers)
+
+	if err := mgr.Setup("wg0"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	// Add a provider-managed tunnel.
+	tunnel := api.SiteToSiteTunnel{
+		TunnelID:       "t-ipsec-td",
+		RemoteEndpoint: "203.0.113.1:500",
+		LocalSubnets:   []string{"10.0.0.0/24"},
+		RemoteSubnets:  []string{"10.1.0.0/24"},
+		ProviderType:   "ipsec",
+	}
+	if err := mgr.AddTunnel(tunnel); err != nil {
+		t.Fatalf("AddTunnel: %v", err)
+	}
+
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+
+	// Verify provider.RemoveTunnel was called for the active tunnel.
+	removeCalls := provider.callsFor("RemoveTunnel")
+	if len(removeCalls) != 1 {
+		t.Fatalf("expected 1 RemoveTunnel call, got %d", len(removeCalls))
+	}
+	if removeCalls[0].Args[0] != "t-ipsec-td" {
+		t.Errorf("RemoveTunnel tunnelID = %v, want t-ipsec-td", removeCalls[0].Args[0])
+	}
+
+	// Verify provider.Stop was called.
+	stopCalls := provider.callsFor("Stop")
+	if len(stopCalls) != 1 {
+		t.Fatalf("expected 1 Stop call, got %d", len(stopCalls))
+	}
+
+	// Verify manager is inactive.
+	if mgr.SiteToSiteStatus() != nil {
+		t.Error("SiteToSiteStatus should be nil after teardown")
+	}
+}
+
+func TestSiteToSiteManager_SiteToSiteStatus_WithProviders(t *testing.T) {
+	vpn := &mockVPNController{}
+	routes := &mockRouteController{}
+	ipsecProvider := newMockTunnelProvider()
+	openvpnProvider := newMockTunnelProvider()
+	cfg := Config{
+		Enabled:           true,
+		AccessInterface:   "eth1",
+		AccessSubnets:     []string{"10.0.0.0/24"},
+		SiteToSiteEnabled: true,
+	}
+	cfg.ApplyDefaults()
+
+	providers := map[string]TunnelProvider{
+		"openvpn": openvpnProvider,
+		"ipsec":   ipsecProvider,
+	}
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, discardLogger(), providers)
+
+	if err := mgr.Setup("wg0"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	status := mgr.SiteToSiteStatus()
+	if status == nil {
+		t.Fatal("SiteToSiteStatus should not be nil when active")
+	}
+	if !status.Enabled {
+		t.Error("Enabled should be true")
+	}
+
+	// Verify TunnelProviderNames is populated and sorted.
+	if len(status.TunnelProviderNames) != 2 {
+		t.Fatalf("TunnelProviderNames count = %d, want 2", len(status.TunnelProviderNames))
+	}
+	if status.TunnelProviderNames[0] != "ipsec" {
+		t.Errorf("TunnelProviderNames[0] = %q, want %q", status.TunnelProviderNames[0], "ipsec")
+	}
+	if status.TunnelProviderNames[1] != "openvpn" {
+		t.Errorf("TunnelProviderNames[1] = %q, want %q", status.TunnelProviderNames[1], "openvpn")
+	}
+}
+
+// contains reports whether s contains substr.
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && searchSubstring(s, substr)
+}
+
+func searchSubstring(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

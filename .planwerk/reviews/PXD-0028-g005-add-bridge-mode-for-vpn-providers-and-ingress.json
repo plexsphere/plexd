@@ -1,0 +1,231 @@
+{
+  "summary": "Implements bridge mode VPN providers (Tailscale, Netbird), ACME certificate management, SNI-based routing, and tunnel providers (IPsec, OpenVPN) with comprehensive tests and documentation. All 24 tasks completed. Interfaces are well-designed and follow existing patterns. Security review found TunnelID injection risk and PSK-on-disk concerns that need addressing.",
+  "verdict": "NEEDS_CHANGES",
+  "tests_checklist": [
+    {"item": "V1: All tests pass (go test ./internal/bridge/... and ./internal/api/...)", "checked": true},
+    {"item": "V2: go vet passes with no errors", "checked": true},
+    {"item": "V3: go build ./... succeeds", "checked": true},
+    {"item": "TE1: Happy paths tested with realistic data for all providers", "checked": true},
+    {"item": "TE2: Edge cases tested (empty keys, duplicate IDs, boundary ports, truncated SNI)", "checked": true},
+    {"item": "TE3: Error cases tested with specific error message validation", "checked": true},
+    {"item": "TE4: Tests independent with fresh mocks and no shared mutable state", "checked": true},
+    {"item": "TE5: Test naming follows Test<Type>_<Method>_<Scenario> convention", "checked": true},
+    {"item": "TE6: Mocking appropriate - only external deps mocked, integration tests use real components", "checked": true},
+    {"item": "TE7: Assertions specific - exact values, error prefixes, state verification", "checked": true},
+    {"item": "All interfaces have compile-time satisfaction checks (var _ Interface = (*Impl)(nil))", "checked": true},
+    {"item": "Mock test doubles follow existing pattern (mu, calls, per-key errors, callsFor)", "checked": true},
+    {"item": "Task 3.2: Serialization tests in internal/api/types_test.go for new fields", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "P1: Follows existing error message convention (bridge: component: detail)", "checked": true},
+    {"item": "P1: Follows existing logging convention (component=bridge, structured slog fields)", "checked": true},
+    {"item": "P1: Config validation follows Validate() pattern (skip when disabled)", "checked": true},
+    {"item": "P2: Uses existing RouteController, VPNController, AccessController interfaces", "checked": true},
+    {"item": "P5: Files in internal/bridge/ matching project structure", "checked": true},
+    {"item": "Q1: Functions have single responsibility", "checked": true},
+    {"item": "Q2: Functions <=40 lines (some exceptions in SNI parser and config generation)", "checked": false},
+    {"item": "Q3: No excessive code duplication", "checked": false},
+    {"item": "Q4: Clear naming throughout", "checked": true},
+    {"item": "Q5: Max 3 nesting levels", "checked": true},
+    {"item": "Q7: No dead code", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "S1: Config inputs validated at API boundary (Validate method)", "checked": true},
+    {"item": "S2: No SQL injection (not applicable)", "checked": true},
+    {"item": "S3: No hardcoded secrets - auth keys read from env vars", "checked": true},
+    {"item": "S4: External commands abstracted behind CommandExecutor for testability", "checked": true},
+    {"item": "S5: Auth keys not logged directly (only key length logged for netbird)", "checked": true},
+    {"item": "S6: TLS MinVersion set to 1.2 in ACME and ingress TLS configs", "checked": true},
+    {"item": "S6: TunnelID not validated for path traversal before use in file paths", "checked": false},
+    {"item": "S6: PSK written to /tmp as plaintext config files", "checked": false}
+  ],
+  "architecture_checklist": [
+    {"item": "UserAccessProvider interface mirrors AccessController style", "checked": true},
+    {"item": "TunnelProvider interface mirrors VPNController style", "checked": true},
+    {"item": "CommandExecutor abstraction enables full testability", "checked": true},
+    {"item": "ACMEManager wraps autocert.Manager cleanly", "checked": true},
+    {"item": "SNIRouter is self-contained with proper lifecycle management", "checked": true},
+    {"item": "SiteToSiteManager dispatches correctly between WireGuard and TunnelProviders", "checked": true},
+    {"item": "No new direct dependencies beyond golang.org/x/crypto (already existed)", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No unused code or YAGNI violations", "checked": true},
+    {"item": "IPsec/OpenVPN providers share structural similarity but not excessive duplication", "checked": true},
+    {"item": "Tailscale/Netbird providers are appropriately distinct", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Config.Validate() catches invalid configuration early", "checked": true},
+    {"item": "Provider Start() fails fast on missing auth/setup keys", "checked": true},
+    {"item": "Tunnel creation fails fast on duplicate IDs", "checked": true},
+    {"item": "ACME Setup() validates cache dir and allowed hosts", "checked": true},
+    {"item": "SNI AddRoute validates hostname and backend address", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "All provider methods are concurrent-safe via sync.Mutex", "checked": true},
+    {"item": "Rollback on partial failures in CreateTunnel, AddTunnel, Setup", "checked": true},
+    {"item": "Idempotent Stop/Remove/Teardown across all components", "checked": true},
+    {"item": "Error aggregation in Teardown methods (errors.Join)", "checked": true},
+    {"item": "Best-effort cleanup in error paths", "checked": true}
+  ],
+  "security_findings": [
+    {
+      "severity": "HIGH",
+      "description": "S6: TunnelID used directly in file paths without validation. A TunnelID containing '../' or shell metacharacters could cause path traversal in config file writes (e.g., '/tmp/plexd-ipsec-../../etc/cron.d/backdoor.conf'). The TunnelID also flows into swanctl CLI arguments without sanitization.",
+      "location": "internal/bridge/ipsec.go:54, internal/bridge/openvpn.go:56",
+      "fix": "Add TunnelID validation in TunnelConfig or at the SiteToSiteManager.AddTunnel boundary: reject IDs containing '/', '..', or non-alphanumeric characters beyond hyphens and underscores. Example: regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(tunnelID)"
+    },
+    {
+      "severity": "HIGH",
+      "description": "S5: PSK secrets written to plaintext files in /tmp with 0600 permissions. While file permissions restrict access, /tmp is world-readable on many systems and files persist until explicitly removed. Config files containing PSKs are cleaned up on RemoveTunnel but remain on disk during tunnel lifetime and survive crashes.",
+      "location": "internal/bridge/ipsec.go:57 (generateSwanctlConfig writes PSK), internal/bridge/openvpn.go:59 (generateOpenVPNConfig writes PSK)",
+      "fix": "Use os.MkdirTemp with a plexd-specific prefix for isolation. Consider using a tmpfs mount point if available. At minimum, ensure cleanup happens via defer even on panics. Document the security trade-off if plaintext files are unavoidable due to strongSwan/OpenVPN requirements."
+    },
+    {
+      "severity": "MEDIUM",
+      "description": "S5: Netbird provider logs command output that may contain sensitive information. The output of 'netbird up' and 'netbird down' is logged at INFO level which could include auth tokens or network details in production.",
+      "location": "internal/bridge/netbird.go:64, internal/bridge/netbird.go:117",
+      "fix": "Log command output at DEBUG level instead of INFO, or omit the output field entirely. Only log structured status fields (connected, IP, interface)."
+    },
+    {
+      "severity": "MEDIUM",
+      "description": "SNI router has no read timeout on TLS ClientHello peek. A slowloris-style attack could hold connections indefinitely by sending data very slowly during the SNI peek phase.",
+      "location": "internal/bridge/sni.go:199-204",
+      "fix": "Set a read deadline on the connection before the SNI peek: conn.SetReadDeadline(time.Now().Add(5*time.Second)). Reset it after successful peek."
+    }
+  ],
+  "architecture_findings": [
+    {
+      "severity": "MINOR",
+      "description": "FC1: api.IngressInfo missing ACMEEnabled field. Task 3.2 specifies 'Extend api.IngressInfo with ACMEEnabled bool field' but this field was not added. IngressStatus() in ingress.go does not report ACME state.",
+      "location": "internal/api/types.go:451-455, internal/bridge/ingress.go:314-326",
+      "fix": "Add ACMEEnabled bool field to api.IngressInfo and populate it in IngressManager.IngressStatus() based on whether m.acme is non-nil and active."
+    },
+    {
+      "severity": "MINOR",
+      "description": "Task 3.2 specifies serialization tests in internal/api/types_test.go for new fields (ProviderName, ProviderStatus, ProviderType, TunnelProviderNames, Hostname) but no changes were made to that file.",
+      "location": "internal/api/types_test.go",
+      "fix": "Add JSON round-trip tests for UserAccessInfo (with ProviderName/ProviderStatus), IngressRule (with Hostname), SiteToSiteTunnel (with ProviderType), and SiteToSiteInfo (with TunnelProviderNames) to verify serialization of new fields."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "S6-001",
+      "severity": "blocker",
+      "check_id": "S6",
+      "file": "internal/bridge/ipsec.go:54",
+      "description": "TunnelID used in fmt.Sprintf(\"/tmp/plexd-ipsec-%s.conf\", cfg.TunnelID) without validation — path traversal risk",
+      "fix": "Validate TunnelID with ^[a-zA-Z0-9_-]+$ regex at SiteToSiteManager.AddTunnel or TunnelConfig level"
+    },
+    {
+      "id": "S6-002",
+      "severity": "blocker",
+      "check_id": "S6",
+      "file": "internal/bridge/openvpn.go:56",
+      "description": "Same TunnelID path traversal risk as ipsec.go",
+      "fix": "Same fix as S6-001"
+    },
+    {
+      "id": "S5-001",
+      "severity": "critical",
+      "check_id": "S5",
+      "file": "internal/bridge/ipsec.go:57",
+      "description": "PSK written to /tmp plaintext config file — survives crashes, visible in /tmp",
+      "fix": "Use isolated temp directory with restrictive permissions; document trade-off if unavoidable"
+    },
+    {
+      "id": "S5-002",
+      "severity": "critical",
+      "check_id": "S5",
+      "file": "internal/bridge/openvpn.go:59",
+      "description": "Same PSK-on-disk issue as ipsec.go",
+      "fix": "Same fix as S5-001"
+    },
+    {
+      "id": "S5-003",
+      "severity": "major",
+      "check_id": "S5",
+      "file": "internal/bridge/netbird.go:64",
+      "description": "Command output logged at INFO may contain sensitive data",
+      "fix": "Log at DEBUG level or omit output field"
+    },
+    {
+      "id": "FC1-001",
+      "severity": "major",
+      "check_id": "FC1",
+      "file": "internal/api/types.go:451-455",
+      "description": "api.IngressInfo missing ACMEEnabled field specified in task 3.2",
+      "fix": "Add ACMEEnabled bool json:\"acme_enabled\" to IngressInfo; populate in IngressStatus()"
+    },
+    {
+      "id": "TE3-001",
+      "severity": "major",
+      "check_id": "TE3",
+      "file": "internal/api/types_test.go",
+      "description": "Missing serialization tests for new API type fields (task 3.2)",
+      "fix": "Add JSON marshal/unmarshal round-trip tests for ProviderName, ProviderStatus, ProviderType, TunnelProviderNames, Hostname"
+    },
+    {
+      "id": "SEC-SNI-001",
+      "severity": "major",
+      "check_id": "S1",
+      "file": "internal/bridge/sni.go:199",
+      "description": "No read timeout on TLS ClientHello peek — slowloris DoS vector",
+      "fix": "Set conn.SetReadDeadline(time.Now().Add(5*time.Second)) before Read"
+    },
+    {
+      "id": "S1-001",
+      "severity": "major",
+      "check_id": "S1",
+      "file": "internal/bridge/ipsec.go:204-231, internal/bridge/openvpn.go:197-218",
+      "description": "TunnelConfig fields (RemoteEndpoint, LocalSubnets, RemoteSubnets, PSK) interpolated into config files without validation — newline injection enables config injection in strongSwan/OpenVPN configs",
+      "fix": "Add validateTunnelConfig() that checks RemoteEndpoint is valid host:port, subnets are valid CIDRs via net.ParseCIDR, and PSK contains no control characters"
+    },
+    {
+      "id": "Q2-001",
+      "severity": "minor",
+      "check_id": "Q2",
+      "file": "internal/bridge/sni.go:286-379",
+      "description": "extractSNI function is 93 lines — complex TLS parsing logic",
+      "fix": "Consider extracting sub-parsers for ClientHello body parsing and extension iteration"
+    },
+    {
+      "id": "Q3-001",
+      "severity": "minor",
+      "check_id": "Q3",
+      "file": "internal/bridge/ipsec.go and openvpn.go",
+      "description": "~70% structural similarity between IPsec and OpenVPN providers (CreateTunnel, RemoveTunnel, removeTunnelLocked, ActiveTunnels, Stop)",
+      "fix": "Consider extracting shared tunnel lifecycle logic into a baseTunnelProvider or helper functions if a third provider is ever added"
+    }
+  ],
+  "suggested_improvements": [
+    "Add TunnelID validation regex at the SiteToSiteManager boundary to prevent path traversal across all providers",
+    "Use a dedicated temp directory (e.g., /run/plexd/tunnels/) for config files instead of /tmp to isolate secrets",
+    "Set read deadline on SNI router connections before TLS ClientHello peek to prevent slowloris",
+    "Add ACMEEnabled field to api.IngressInfo and populate in IngressStatus()",
+    "Add serialization tests for new API type fields in internal/api/types_test.go",
+    "Downgrade netbird command output logging from INFO to DEBUG",
+    "Consider extracting shared tunnel provider lifecycle code if adding more providers in future"
+  ],
+  "next_steps": [
+    "Fix blockers: Add TunnelID validation (S6-001, S6-002) — simple regex check at AddTunnel boundary",
+    "Fix critical: Isolate PSK config files in dedicated temp directory with restrictive permissions (S5-001, S5-002)",
+    "Fix major: Add ACMEEnabled to api.IngressInfo (FC1-001)",
+    "Fix major: Add serialization tests for new API fields (TE3-001)",
+    "Fix major: Add read deadline to SNI router peek (SEC-SNI-001)",
+    "Fix major: Validate TunnelConfig fields before config generation (S1-001)",
+    "Fix major: Downgrade netbird output logging (S5-003)",
+    "Re-request review after addressing blockers and majors"
+  ],
+  "metadata": {
+    "feature_id": "PXD-0028",
+    "title": "G005: Add bridge mode for VPN providers and ingress",
+    "date": "2026-02-15",
+    "verdict": "NEEDS_CHANGES",
+    "files_reviewed": 40,
+    "lines_added": 8382,
+    "lines_removed": 128,
+    "tests_pass": true,
+    "go_vet_clean": true,
+    "build_clean": true
+  }
+}
