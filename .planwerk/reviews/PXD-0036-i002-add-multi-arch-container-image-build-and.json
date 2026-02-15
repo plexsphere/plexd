@@ -1,0 +1,84 @@
+{
+  "feature_id": "PXD-0036",
+  "title": "I002: Add multi-arch container image build and push workflow",
+  "date": "2026-02-15",
+  "verdict": "BLOCKED",
+  "summary": "Implementation is fundamentally incomplete. The primary deliverable (.github/workflows/container.yml) and the test script (.github/workflows/test_container_workflow.sh) do not exist on the branch. Only the documentation file (docs/reference/backend/container-workflow.md) was created. The progress JSON incorrectly marks all 3 tasks as done despite 2 of 3 files being absent. The branch diff shows only 2 files changed: the planwerk progress JSON and the docs file. This is a BLOCKED verdict — the core workflow cannot be reviewed because it was never written.",
+  "tests_checklist": [
+    {"item": "Tests exist and pass", "checked": false, "note": "FC2: .github/workflows/test_container_workflow.sh does not exist on disk. Cannot run tests."},
+    {"item": "Edge cases are covered", "checked": false, "note": "No test file exists to evaluate."},
+    {"item": "Test script follows deploy/docker/test_dockerfile.sh pattern", "checked": false, "note": "File missing entirely."}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing code patterns", "checked": false, "note": "FC3: Primary deliverable container.yml does not exist. Cannot evaluate pattern adherence."},
+    {"item": "Actions SHA-pinned matching ci.yml conventions", "checked": false, "note": "No workflow file to verify."},
+    {"item": "YAML syntax valid", "checked": false, "note": "No workflow file to validate."}
+  ],
+  "security_checklist": [
+    {"item": "Permissions are least-privilege (packages: write, contents: read)", "checked": false, "note": "S3: Cannot verify — workflow file missing."},
+    {"item": "GITHUB_TOKEN used (no PATs or custom secrets)", "checked": false, "note": "Cannot verify — workflow file missing."},
+    {"item": "All actions SHA-pinned for supply-chain hardening", "checked": false, "note": "Cannot verify — workflow file missing."}
+  ],
+  "architecture_checklist": [
+    {"item": "Solution is as simple as possible", "checked": false, "note": "Cannot evaluate — no implementation exists."},
+    {"item": "Single-job Buildx approach (no matrix)", "checked": false, "note": "Cannot evaluate — no implementation exists."}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code", "checked": false, "note": "Cannot evaluate — no implementation exists."},
+    {"item": "No unnecessary features beyond spec", "checked": false, "note": "Cannot evaluate — no implementation exists."}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Errors detected early", "checked": false, "note": "Cannot evaluate — no implementation exists."}
+  ],
+  "defensive_checklist": [
+    {"item": "All external inputs validated", "checked": false, "note": "Cannot evaluate — no implementation exists."}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [
+    {
+      "id": "FC1-001",
+      "severity": "blocker",
+      "check_id": "FC1",
+      "file": ".github/workflows/container.yml",
+      "description": "Primary deliverable missing. The workflow file .github/workflows/container.yml does not exist on the branch. Task 1.1 is marked [done] in the progress JSON but the file was never committed. This is the core output of the entire feature — without it, nothing works.",
+      "fix": "Create .github/workflows/container.yml as specified in task 1.1 with all required triggers, steps, SHA-pinned actions, build args, and permissions."
+    },
+    {
+      "id": "FC2-001",
+      "severity": "blocker",
+      "check_id": "FC2",
+      "file": ".github/workflows/test_container_workflow.sh",
+      "description": "Test script missing. The test file .github/workflows/test_container_workflow.sh does not exist on the branch. Task 2.1 is marked [done] in the progress JSON but the file was never committed. Without tests, the workflow cannot be validated.",
+      "fix": "Create .github/workflows/test_container_workflow.sh as specified in task 2.1 with all 20 test functions following the deploy/docker/test_dockerfile.sh pattern."
+    },
+    {
+      "id": "FC3-001",
+      "severity": "blocker",
+      "check_id": "FC3",
+      "file": ".planwerk/progress/PXD-0036-i002-add-multi-arch-container-image-build-and.json",
+      "description": "Progress tracking is inaccurate. All 3 tasks are marked [done] but only 1 of 3 deliverables (docs/reference/backend/container-workflow.md) actually exists on the branch. Tasks 1.1 and 2.1 must be reverted to not-done status.",
+      "fix": "Re-mark tasks 1.1 and 2.1 as pending/not-done. Only task 3.1 (docs) should remain done."
+    },
+    {
+      "id": "DA2-001",
+      "severity": "major",
+      "check_id": "DA2",
+      "file": "docs/reference/backend/container-workflow.md",
+      "description": "Documentation describes a non-existent workflow. The docs file references .github/workflows/container.yml, specific SHA pins, step configurations, and tagging strategies for a workflow that does not exist. While the docs content appears correct per the spec, it documents vapor.",
+      "fix": "No change needed to the docs file itself — it should be accurate once the workflow is created. However, docs should not be marked as complete until the artifact they document exists."
+    }
+  ],
+  "suggested_improvements": [
+    "Implement the actual workflow file (.github/workflows/container.yml) as the first priority — it is the primary deliverable",
+    "Implement the test script (.github/workflows/test_container_workflow.sh) and verify all 20 test functions pass against the workflow",
+    "Verify the docs file remains accurate after the workflow is created (the current docs content looks correct per the specification)",
+    "Fix progress tracking to reflect actual file existence, not intended completion"
+  ],
+  "next_steps": [
+    "Create .github/workflows/container.yml per task 1.1 specification",
+    "Create .github/workflows/test_container_workflow.sh per task 2.1 specification",
+    "Run test_container_workflow.sh and verify all tests pass",
+    "Re-run review after both files are committed"
+  ]
+}
