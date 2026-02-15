@@ -2,8 +2,8 @@
   "feature_id": "PXD-0034",
   "title": "H004: Add fsutil test coverage and reference docs",
   "slug": "h004-add-fsutil-test-coverage-and-reference-docs",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 🔧 small\n**Category:** testing\n**Priority:** medium\n**Source:** Proposed for 'Perform a GAP analysis. The README.md as well as'\n\nCreate internal/fsutil/atomic_test.go with tests covering atomic file write operations (successful write, permission errors, partial write recovery, concurrent access). Create docs/reference/backend/fsutil.md following the existing pattern of other docs/reference/backend/*.md files, documenting the atomic file operations API, usage examples, and error handling semantics.\n\n**Rationale:** internal/fsutil/atomic.go has zero test coverage — atomic file operations are critical for data integrity (config files, state persistence). A bug here silently corrupts data. Additionally, fsutil is the only internal package without a reference doc page, breaking documentation completeness.\n\n**Affected Areas:**\n- internal/fsutil/atomic_test.go\n- docs/reference/backend/fsutil.md",
   "stories": [
@@ -344,20 +344,20 @@
     }
   ],
   "tasks": [
-    "1.1 Create internal/fsutil/atomic_test.go: TestWriteFileAtomic_Success — write data to t.TempDir(), read back, assert content equality, permission mode, and absence of .tmp- file (REQ-001, REQ-006)",
-    "1.2 Add TestWriteFileAtomic_Overwrite — write file twice with different content/permissions, assert second content and permissions win (REQ-001, REQ-005, REQ-006)",
-    "1.3 Add TestWriteFileAtomic_EmptyData — write zero-length data, assert file exists with size 0 and correct permissions (REQ-005)",
-    "1.4 Add TestWriteFileAtomic_LargePayload — write 1 MB, read back, assert byte-for-byte equality (REQ-005)",
-    "1.5 Add TestWriteFileAtomic_PermissionDenied — use read-only directory (chmod 0500), assert error returned, no target or temp file created (REQ-002)",
-    "1.6 Add TestWriteFileAtomic_NonExistentDir — call with non-existent directory path, assert error returned (REQ-002)",
-    "1.7 Add TestWriteFileAtomic_PreservesOriginalOnFailure — write file successfully, make dir read-only, attempt second write, assert original content preserved (REQ-003)",
-    "1.8 Add TestWriteFileAtomic_ConcurrentAccess — 20 goroutines x 50 iterations writing to same dir/name, assert no errors, file exists with valid content, no leftover .tmp- files (REQ-004)",
-    "1.9 Add TestWriteFileAtomic_Permissions — write with 0600 and 0644, verify each file mode matches the requested perm (REQ-006)",
-    "2.1 Create docs/reference/backend/fsutil.md with YAML front matter (title: File System Utilities, quadrant: backend, package: internal/fsutil, feature: PXD-0034) and introductory paragraph (REQ-007)",
-    "2.2 Document WriteFileAtomic: function signature, parameter table (dir, name, data, perm), return value, atomicity guarantee via temp-file-and-rename, fsync before rename (REQ-007, REQ-008)",
-    "2.3 Add usage examples section showing typical call pattern with error handling, matching real callers (registration, integrity, nodeapi) (REQ-007, REQ-008)",
-    "2.4 Add error handling section documenting failure modes (permission denied, non-existent dir, disk full), temp file cleanup, and concurrency safety note (REQ-008)",
-    "2.5 Add callers section listing packages that import fsutil with their use cases: registration (identity files), integrity (checksum store), nodeapi (cache persistence), tunnel (host keys) (REQ-007)"
+    "[done] 1.1 Create internal/fsutil/atomic_test.go: TestWriteFileAtomic_Success — write data to t.TempDir(), read back, assert content equality, permission mode, and absence of .tmp- file (REQ-001, REQ-006)",
+    "[done] 1.2 Add TestWriteFileAtomic_Overwrite — write file twice with different content/permissions, assert second content and permissions win (REQ-001, REQ-005, REQ-006)",
+    "[done] 1.3 Add TestWriteFileAtomic_EmptyData — write zero-length data, assert file exists with size 0 and correct permissions (REQ-005)",
+    "[done] 1.4 Add TestWriteFileAtomic_LargePayload — write 1 MB, read back, assert byte-for-byte equality (REQ-005)",
+    "[done] 1.5 Add TestWriteFileAtomic_PermissionDenied — use read-only directory (chmod 0500), assert error returned, no target or temp file created (REQ-002)",
+    "[done] 1.6 Add TestWriteFileAtomic_NonExistentDir — call with non-existent directory path, assert error returned (REQ-002)",
+    "[done] 1.7 Add TestWriteFileAtomic_PreservesOriginalOnFailure — write file successfully, make dir read-only, attempt second write, assert original content preserved (REQ-003)",
+    "[done] 1.8 Add TestWriteFileAtomic_ConcurrentAccess — 20 goroutines x 50 iterations writing to same dir/name, assert no errors, file exists with valid content, no leftover .tmp- files (REQ-004)",
+    "[done] 1.9 Add TestWriteFileAtomic_Permissions — write with 0600 and 0644, verify each file mode matches the requested perm (REQ-006)",
+    "[done] 2.1 Create docs/reference/backend/fsutil.md with YAML front matter (title: File System Utilities, quadrant: backend, package: internal/fsutil, feature: PXD-0034) and introductory paragraph (REQ-007)",
+    "[done] 2.2 Document WriteFileAtomic: function signature, parameter table (dir, name, data, perm), return value, atomicity guarantee via temp-file-and-rename, fsync before rename (REQ-007, REQ-008)",
+    "[done] 2.3 Add usage examples section showing typical call pattern with error handling, matching real callers (registration, integrity, nodeapi) (REQ-007, REQ-008)",
+    "[done] 2.4 Add error handling section documenting failure modes (permission denied, non-existent dir, disk full), temp file cleanup, and concurrency safety note (REQ-008)",
+    "[done] 2.5 Add callers section listing packages that import fsutil with their use cases: registration (identity files), integrity (checksum store), nodeapi (cache persistence), tunnel (host keys) (REQ-007)"
   ],
   "test_specifications": [
     {
@@ -449,6 +449,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-15T20:04:47.910791"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T21:09:23.618038"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T21:18:28.703258"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T21:18:28.754696"
     }
   },
   "execution_history": [
@@ -462,6 +474,44 @@
           "name": "prepare",
           "duration": 167.70892810821533,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "63f92074-7e96-4791-8a68-7ec252a88412",
+      "timestamp": "2026-02-15T21:17:47.370526",
+      "total_duration": 392.88483142852783,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (9 tasks)",
+          "duration": 91.3943555355072,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (5 tasks)",
+          "duration": 64.5011658668518,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0034] Code Review",
+          "duration": 99.63524556159973,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0034] Improvements",
+          "duration": 72.68434810638428,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0034] Simplify",
+          "duration": 64.66971635818481,
+          "type": "simplify",
           "status": "done"
         }
       ]
