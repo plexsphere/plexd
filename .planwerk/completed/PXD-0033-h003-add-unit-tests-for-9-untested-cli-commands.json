@@ -2,8 +2,8 @@
   "feature_id": "PXD-0033",
   "title": "H003: Add unit tests for 9 untested CLI commands",
   "slug": "h003-add-unit-tests-for-9-untested-cli-commands",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** testing\n**Priority:** high\n**Source:** Proposed for 'Perform a GAP analysis. The README.md as well as'\n\nCreate test files for all 9 untested CLI commands with mocked dependencies, following patterns from the 6 already-tested commands in cmd/plexd/cmd/. Commands to test: audit, deregister, hooks, install, join, peers, policies, sockutil, uninstall. Each test file should cover: cobra command construction, flag parsing and validation, error paths for missing/invalid arguments, and mocked external calls (API client, system operations). Use table-driven tests where appropriate. This brings CLI test coverage from 40% (6/15) to 100% (15/15).\n\n**Rationale:** 9 of 15 CLI command files have zero test coverage. CLI commands are the primary user interface — untested commands risk regressions in flag handling, argument validation, and error messages. With 60% of commands untested, any refactoring is high-risk.\n\n**Affected Areas:**\n- cmd/plexd/cmd/audit_test.go\n- cmd/plexd/cmd/deregister_test.go\n- cmd/plexd/cmd/hooks_test.go\n- cmd/plexd/cmd/install_test.go\n- cmd/plexd/cmd/join_test.go\n- cmd/plexd/cmd/peers_test.go\n- cmd/plexd/cmd/policies_test.go\n- cmd/plexd/cmd/sockutil_test.go\n- cmd/plexd/cmd/uninstall_test.go",
   "stories": [
@@ -430,16 +430,15 @@
     }
   ],
   "tasks": [
-    "1.1 Create sockutil_test.go with tests for socket helper functions (REQ-001, REQ-008, REQ-009)",
-    "1.2 Create audit_test.go with success-path test (REQ-001, REQ-002, REQ-003, REQ-009)",
-    "1.3 Create peers_test.go with help and success-path tests (REQ-001, REQ-002, REQ-003, REQ-009)",
-    "1.4 Create policies_test.go with help and success-path tests (REQ-001, REQ-002, REQ-003, REQ-009)",
-    "2.1 Create hooks_test.go with dedicated success-path tests for list, verify, reload (REQ-001, REQ-002, REQ-004, REQ-009)",
-    "2.2 Create install_test.go with help and error-path tests (REQ-001, REQ-002, REQ-007, REQ-009)",
-    "2.3 Create uninstall_test.go with help and error-path tests (REQ-001, REQ-002, REQ-007, REQ-009)",
-    "3.1 Create deregister_test.go with config, identity, and API error tests plus success path (REQ-001, REQ-002, REQ-005, REQ-006, REQ-009)",
-    "3.2 Create join_test.go with config error, API error, and success-path tests (REQ-001, REQ-002, REQ-005, REQ-009)",
-    "4.1 Verify all tests pass and no regressions (REQ-010)"
+    "[done] 1.1 Create sockutil_test.go with tests for socket helper functions (REQ-001, REQ-008, REQ-009)",
+    "[done] 1.2 Create audit_test.go with success-path test (REQ-001, REQ-002, REQ-003, REQ-009)",
+    "[done] 1.3 Create peers_test.go with help and success-path tests (REQ-001, REQ-002, REQ-003, REQ-009)",
+    "[done] 1.4 Create policies_test.go with help and success-path tests (REQ-001, REQ-002, REQ-003, REQ-009)",
+    "[done] 2.1 Create hooks_test.go with dedicated success-path tests for list, verify, reload (REQ-001, REQ-002, REQ-004, REQ-009)",
+    "[done] 2.2 Create install_test.go with help and error-path tests (REQ-001, REQ-002, REQ-007, REQ-009)",
+    "[done] 2.3 Create uninstall_test.go with help and error-path tests (REQ-001, REQ-002, REQ-007, REQ-009)",
+    "[done] 3.1 Create deregister_test.go with config, identity, and API error tests plus success path (REQ-001, REQ-002, REQ-005, REQ-006, REQ-009)",
+    "[done] 3.2 Create join_test.go with config error, API error, and success-path tests (REQ-001, REQ-002, REQ-005, REQ-009)"
   ],
   "test_specifications": [
     {
@@ -701,6 +700,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-15T19:57:55.122766"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T20:25:48.187126"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T21:06:30.986541"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T21:06:31.033849"
     }
   },
   "execution_history": [
@@ -714,6 +725,50 @@
           "name": "prepare",
           "duration": 700.8866755962372,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "0517a911-8f24-4632-9bd3-510340b03b90",
+      "timestamp": "2026-02-15T21:05:35.898534",
+      "total_duration": 2246.340520143509,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 463.49748396873474,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (3 tasks)",
+          "duration": 141.8715090751648,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (2 tasks)",
+          "duration": 223.31594276428223,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0033] Code Review",
+          "duration": 349.11589312553406,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0033] Improvements",
+          "duration": 733.2489528656006,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0033] Simplify",
+          "duration": 335.2907383441925,
+          "type": "simplify",
           "status": "done"
         }
       ]
