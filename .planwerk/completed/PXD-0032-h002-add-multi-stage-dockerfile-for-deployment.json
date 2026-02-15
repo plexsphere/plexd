@@ -2,8 +2,8 @@
   "feature_id": "PXD-0032",
   "title": "H002: Add multi-stage Dockerfile for deployment",
   "slug": "h002-add-multi-stage-dockerfile-for-deployment",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 🔧 small\n**Category:** infrastructure\n**Priority:** high\n**Source:** Proposed for 'Perform a GAP analysis. The README.md as well as'\n\nCreate deploy/docker/Dockerfile with a standard multi-stage Go build: Stage 1 uses golang:1.22-alpine (or current Go version) as builder with module cache optimization and CGO_DISABLED=1 static build. Stage 2 uses gcr.io/distroless/static or alpine:3.19 as minimal runtime, copies the plexd binary, sets appropriate user/group, exposes relevant ports, and defines the entrypoint. Include a .dockerignore file to exclude .git, docs, and test files from the build context.\n\n**Rationale:** The README documents docker pull instructions but no Dockerfile exists in the repository. Users and CI/CD pipelines cannot build container images. This is a ship-blocking gap between documentation and deliverables.\n\n**Affected Areas:**\n- deploy/docker/Dockerfile\n- deploy/docker/.dockerignore",
   "stories": [
@@ -371,13 +371,13 @@
     }
   ],
   "tasks": [
-    "1.1 Create .dockerignore at the repository root (REQ-006, REQ-009): Exclude .git/, .github/, docs/, deploy/systemd/, deploy/kubernetes/, deploy/cloud-init/, .planwerk/, .claude/, .serena/, *.md (except go.mod/go.sum which aren't .md), *_test.go, *_test.sh, LICENSE. Ensure go.mod, go.sum, cmd/, internal/, Makefile remain included. File: .dockerignore",
-    "1.2 Create deploy/docker/Dockerfile with multi-stage build (REQ-001, REQ-002, REQ-003): Stage 1 (builder) — FROM golang:1.24-alpine AS builder, WORKDIR /build, COPY go.mod go.sum then RUN go mod download, COPY . ., ARG VERSION=dev COMMIT=none DATE=unknown, RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags \"-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.date=$DATE\" -o /build/plexd ./cmd/plexd. Stage 2 (runtime) — FROM gcr.io/distroless/static-debian12, COPY --from=builder /build/plexd /usr/local/bin/plexd, create directories, set user/ports/entrypoint per REQ-004, REQ-005. File: deploy/docker/Dockerfile",
-    "1.3 Set non-root user, create data directories, expose ports, define entrypoint in Dockerfile runtime stage (REQ-004, REQ-005): Use COPY --chmod for binary. Create /var/lib/plexd, /var/run/plexd, /etc/plexd directories. USER 65534:65534 (nobody). EXPOSE 9100 51820/udp. ENTRYPOINT [\"/usr/local/bin/plexd\"]. File: deploy/docker/Dockerfile (same file as 1.2, this is the runtime stage portion)",
-    "1.4 Add multi-platform support using TARGETOS and TARGETARCH build args (REQ-008): Add ARG TARGETOS=linux and ARG TARGETARCH=amd64 in the builder stage. Use GOOS=$TARGETOS GOARCH=$TARGETARCH in the go build command. File: deploy/docker/Dockerfile",
-    "2.1 Add Dockerfile build test script (REQ-001, REQ-003, REQ-004, REQ-005, REQ-007): Create deploy/docker/test_dockerfile.sh that: (a) runs hadolint on the Dockerfile, (b) builds the image with docker build, (c) verifies the image runs and responds to --version, (d) verifies the image runs as non-root (UID 65534), (e) verifies the binary is statically linked. File: deploy/docker/test_dockerfile.sh",
-    "2.2 Add docker-build Makefile target (REQ-001): Add `docker-build` target to Makefile that runs `docker build -f deploy/docker/Dockerfile --build-arg VERSION=$(git describe --tags --always) --build-arg COMMIT=$(git rev-parse --short HEAD) --build-arg DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) -t ghcr.io/plexsphere/plexd:dev .`. File: Makefile",
-    "3.1 Write reference documentation for the Dockerfile (REQ-001 through REQ-009): Create docs/reference/backend/dockerfile.md documenting: build command, build arguments (VERSION, COMMIT, DATE), multi-platform build with buildx, exposed ports, runtime user, directory layout, base images, and .dockerignore contents. File: docs/reference/backend/dockerfile.md"
+    "[done] 1.1 Create .dockerignore at the repository root (REQ-006, REQ-009): Exclude .git/, .github/, docs/, deploy/systemd/, deploy/kubernetes/, deploy/cloud-init/, .planwerk/, .claude/, .serena/, *.md (except go.mod/go.sum which aren't .md), *_test.go, *_test.sh, LICENSE. Ensure go.mod, go.sum, cmd/, internal/, Makefile remain included. File: .dockerignore",
+    "[done] 1.2 Create deploy/docker/Dockerfile with multi-stage build (REQ-001, REQ-002, REQ-003): Stage 1 (builder) — FROM golang:1.24-alpine AS builder, WORKDIR /build, COPY go.mod go.sum then RUN go mod download, COPY . ., ARG VERSION=dev COMMIT=none DATE=unknown, RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags \"-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.date=$DATE\" -o /build/plexd ./cmd/plexd. Stage 2 (runtime) — FROM gcr.io/distroless/static-debian12, COPY --from=builder /build/plexd /usr/local/bin/plexd, create directories, set user/ports/entrypoint per REQ-004, REQ-005. File: deploy/docker/Dockerfile",
+    "[done] 1.3 Set non-root user, create data directories, expose ports, define entrypoint in Dockerfile runtime stage (REQ-004, REQ-005): Use COPY --chmod for binary. Create /var/lib/plexd, /var/run/plexd, /etc/plexd directories. USER 65534:65534 (nobody). EXPOSE 9100 51820/udp. ENTRYPOINT [\"/usr/local/bin/plexd\"]. File: deploy/docker/Dockerfile (same file as 1.2, this is the runtime stage portion)",
+    "[done] 1.4 Add multi-platform support using TARGETOS and TARGETARCH build args (REQ-008): Add ARG TARGETOS=linux and ARG TARGETARCH=amd64 in the builder stage. Use GOOS=$TARGETOS GOARCH=$TARGETARCH in the go build command. File: deploy/docker/Dockerfile",
+    "[done] 2.1 Add Dockerfile build test script (REQ-001, REQ-003, REQ-004, REQ-005, REQ-007): Create deploy/docker/test_dockerfile.sh that: (a) runs hadolint on the Dockerfile, (b) builds the image with docker build, (c) verifies the image runs and responds to --version, (d) verifies the image runs as non-root (UID 65534), (e) verifies the binary is statically linked. File: deploy/docker/test_dockerfile.sh",
+    "[done] 2.2 Add docker-build Makefile target (REQ-001): Add `docker-build` target to Makefile that runs `docker build -f deploy/docker/Dockerfile --build-arg VERSION=$(git describe --tags --always) --build-arg COMMIT=$(git rev-parse --short HEAD) --build-arg DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) -t ghcr.io/plexsphere/plexd:dev .`. File: Makefile",
+    "[done] 3.1 Write reference documentation for the Dockerfile (REQ-001 through REQ-009): Create docs/reference/backend/dockerfile.md documenting: build command, build arguments (VERSION, COMMIT, DATE), multi-platform build with buildx, exposed ports, runtime user, directory layout, base images, and .dockerignore contents. File: docs/reference/backend/dockerfile.md"
   ],
   "test_specifications": [
     {
@@ -485,6 +485,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-15T19:45:44.383520"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T20:01:46.683580"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T20:16:57.259447"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T20:16:57.300375"
     }
   },
   "execution_history": [
@@ -498,6 +510,50 @@
           "name": "prepare",
           "duration": 220.06469750404358,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "8113ba19-2c3a-4a79-8c62-a00eb40eef7c",
+      "timestamp": "2026-02-15T20:14:21.013376",
+      "total_duration": 641.7985849380493,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 180.77529621124268,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (2 tasks)",
+          "duration": 123.61503553390503,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 62.89740777015686,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0032] Code Review",
+          "duration": 141.71733736991882,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0032] Improvements",
+          "duration": 49.05921697616577,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0032] Simplify",
+          "duration": 83.73429107666016,
+          "type": "simplify",
           "status": "done"
         }
       ]
