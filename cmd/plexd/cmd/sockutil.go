@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 
@@ -29,6 +30,16 @@ func socketURL(path string) string {
 func socketGet(socketPath, path string) (*http.Response, error) {
 	client := newSocketClient(socketPath)
 	resp, err := client.Get(socketURL(path))
+	if err != nil {
+		return nil, fmt.Errorf("agent not running or socket unavailable at %s: %w", socketPath, err)
+	}
+	return resp, nil
+}
+
+// socketPost performs a POST request to the local agent via Unix socket.
+func socketPost(socketPath, path, contentType string, body io.Reader) (*http.Response, error) {
+	client := newSocketClient(socketPath)
+	resp, err := client.Post(socketURL(path), contentType, body)
 	if err != nil {
 		return nil, fmt.Errorf("agent not running or socket unavailable at %s: %w", socketPath, err)
 	}

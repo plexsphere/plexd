@@ -141,3 +141,21 @@ func TestConfig_DefaultsBatchSizePreservesExisting(t *testing.T) {
 		t.Errorf("BatchSize = %d, want 50", cfg.BatchSize)
 	}
 }
+
+func TestConfig_FilterConfigZeroValue(t *testing.T) {
+	cfg := Config{}
+	cfg.ApplyDefaults()
+	if !cfg.Filter.IsEmpty() {
+		t.Error("zero-value Filter should be empty")
+	}
+}
+
+func TestConfig_FilterConfigPreserved(t *testing.T) {
+	cfg := Config{
+		Filter: FilterConfig{MinSeverity: "warning"},
+	}
+	cfg.ApplyDefaults()
+	if cfg.Filter.MinSeverity != "warning" {
+		t.Errorf("Filter.MinSeverity = %q, want %q", cfg.Filter.MinSeverity, "warning")
+	}
+}

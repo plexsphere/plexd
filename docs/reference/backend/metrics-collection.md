@@ -53,11 +53,12 @@ type Collector interface {
 
 ### Metric Groups
 
-| Constant       | Value       | Collector          | Description                    |
-|----------------|-------------|--------------------|--------------------------------|
-| `GroupSystem`  | `"system"`  | `SystemCollector`  | CPU, memory, disk, network     |
-| `GroupTunnel`  | `"tunnel"`  | `TunnelCollector`  | Per-peer tunnel health         |
-| `GroupLatency` | `"latency"` | `LatencyCollector` | Per-peer round-trip latency    |
+| Constant       | Value       | Collector              | Description                          |
+|----------------|-------------|------------------------|--------------------------------------|
+| `GroupSystem`  | `"system"`  | `SystemCollector`      | CPU, memory, disk, network, load avg |
+| `GroupTunnel`  | `"tunnel"`  | `TunnelCollector`      | Per-peer tunnel health + packet loss |
+| `GroupLatency` | `"latency"` | `LatencyCollector`     | Per-peer round-trip latency          |
+| `GroupAgent`   | `"agent"`   | `AgentStatsCollector`  | Go runtime, uptime, reconnects       |
 
 ## SystemCollector
 
@@ -82,6 +83,9 @@ type SystemStats struct {
     DiskTotalBytes   uint64  `json:"disk_total_bytes"`
     NetworkRxBytes   uint64  `json:"network_rx_bytes"`
     NetworkTxBytes   uint64  `json:"network_tx_bytes"`
+    LoadAvg1         float64 `json:"load_avg_1"`
+    LoadAvg5         float64 `json:"load_avg_5"`
+    LoadAvg15        float64 `json:"load_avg_15"`
 }
 ```
 
@@ -105,11 +109,42 @@ Returns a single `MetricPoint` with `Group="system"`. The `Data` field contains 
   "disk_used_bytes": 53687091200,
   "disk_total_bytes": 107374182400,
   "network_rx_bytes": 1048576,
-  "network_tx_bytes": 524288
+  "network_tx_bytes": 524288,
+  "load_avg_1": 1.5,
+  "load_avg_5": 1.2,
+  "load_avg_15": 0.9
 }
 ```
 
 On reader error, returns `nil, fmt.Errorf("metrics: system: %w", err)`.
+
+### LinuxSystemReader
+
+Concrete `SystemReader` implementation for Linux, reading from `/proc` and `syscall.Statfs`.
+
+```go
+func NewLinuxSystemReader(mountPoint, netIface string) *LinuxSystemReader
+```
+
+| Parameter    | Default | Description                                              |
+|--------------|---------|----------------------------------------------------------|
+| `mountPoint` | `"/"`   | Filesystem path for disk stats via `syscall.Statfs`      |
+| `netIface`   | `""`    | Network interface for rx/tx bytes; empty sums all (excl. lo) |
+
+**Data Sources:**
+
+| Field              | Source                | Method                                    |
+|--------------------|-----------------------|-------------------------------------------|
+| `CPUUsagePercent`  | `/proc/stat`          | Two samples 100ms apart, delta busy/total |
+| `MemoryUsedBytes`  | `/proc/meminfo`       | `MemTotal - MemAvailable`                 |
+| `MemoryTotalBytes` | `/proc/meminfo`       | `MemTotal` (kB × 1024)                   |
+| `DiskUsedBytes`    | `syscall.Statfs`      | `(Blocks - Bfree) × Bsize`               |
+| `DiskTotalBytes`   | `syscall.Statfs`      | `Blocks × Bsize`                         |
+| `NetworkRxBytes`   | `/proc/net/dev`       | Sum of rx bytes (field 0) per interface   |
+| `NetworkTxBytes`   | `/proc/net/dev`       | Sum of tx bytes (field 8) per interface   |
+| `LoadAvg1/5/15`    | `/proc/loadavg`       | First three space-separated fields        |
+
+Build-tagged `//go:build linux`.
 
 ## TunnelCollector
 
@@ -132,8 +167,12 @@ type TunnelStats struct {
     RxBytes            uint64    `json:"rx_bytes"`
     TxBytes            uint64    `json:"tx_bytes"`
     HandshakeSucceeded bool      `json:"handshake_succeeded"`
+    HandshakeStale     bool      `json:"handshake_stale"`
+    PacketLossPercent  float64   `json:"packet_loss_percent"`
 }
 ```
+
+`PacketLossPercent` is provided by the `TunnelStatsReader` implementation. When packet loss measurement is unavailable, the value is `-1`.
 
 ### Constructor
 
@@ -153,7 +192,9 @@ Returns one `MetricPoint` per peer with `Group="tunnel"` and `PeerID` set. Each 
   "last_handshake_time": "2026-02-12T10:30:00Z",
   "rx_bytes": 104857600,
   "tx_bytes": 52428800,
-  "handshake_succeeded": true
+  "handshake_succeeded": true,
+  "handshake_stale": false,
+  "packet_loss_percent": 0.5
 }
 ```
 
@@ -213,6 +254,58 @@ Returns one `MetricPoint` per peer with `Group="latency"` and `PeerID` set. When
 {
   "peer_id": "peer-xyz-789",
   "rtt_nano": -1
+}
+```
+
+## AgentStatsCollector
+
+Collects Go runtime and agent health metrics.
+
+### ReconnectCounter
+
+```go
+type ReconnectCounter interface {
+    ReconnectCount() int
+}
+```
+
+### AgentStats
+
+```go
+type AgentStats struct {
+    GoroutineCount int     `json:"goroutine_count"`
+    HeapAllocBytes uint64  `json:"heap_alloc_bytes"`
+    HeapSysBytes   uint64  `json:"heap_sys_bytes"`
+    GCPauseTotalNs uint64  `json:"gc_pause_total_ns"`
+    GCNumGC        uint32  `json:"gc_num_gc"`
+    UptimeSeconds  float64 `json:"uptime_seconds"`
+    ReconnectCount int     `json:"reconnect_count"`
+}
+```
+
+### Constructor
+
+```go
+func NewAgentStatsCollector(startTime time.Time, reconnects ReconnectCounter, logger *slog.Logger) *AgentStatsCollector
+```
+
+The `reconnects` parameter may be nil if reconnect counting is not available; `reconnect_count` defaults to 0.
+
+### Collect Behavior
+
+Returns a single `MetricPoint` with `Group="agent"`. Uses `runtime.NumGoroutine()` and `runtime.ReadMemStats()` for Go runtime metrics. Uptime is calculated as `time.Since(startTime)`.
+
+**Example JSON data:**
+
+```json
+{
+  "goroutine_count": 42,
+  "heap_alloc_bytes": 8388608,
+  "heap_sys_bytes": 16777216,
+  "gc_pause_total_ns": 1500000,
+  "gc_num_gc": 12,
+  "uptime_seconds": 3600.5,
+  "reconnect_count": 3
 }
 ```
 
@@ -301,7 +394,10 @@ Reports a batch of metric points to the control plane.
       "disk_used_bytes": 53687091200,
       "disk_total_bytes": 107374182400,
       "network_rx_bytes": 1048576,
-      "network_tx_bytes": 524288
+      "network_tx_bytes": 524288,
+      "load_avg_1": 1.5,
+      "load_avg_5": 1.2,
+      "load_avg_15": 0.9
     }
   },
   {
@@ -313,7 +409,9 @@ Reports a batch of metric points to the control plane.
       "last_handshake_time": "2026-02-12T10:29:55Z",
       "rx_bytes": 104857600,
       "tx_bytes": 52428800,
-      "handshake_succeeded": true
+      "handshake_succeeded": true,
+      "handshake_stale": false,
+      "packet_loss_percent": 0.5
     }
   },
   {
@@ -333,7 +431,7 @@ Reports a batch of metric points to the control plane.
 ```go
 type MetricPoint struct {
     Timestamp time.Time       `json:"timestamp"`
-    Group     string          `json:"group"`              // "system", "tunnel", "latency"
+    Group     string          `json:"group"`              // "system", "tunnel", "latency", "agent"
     PeerID    string          `json:"peer_id,omitempty"`  // set for tunnel and latency groups
     Data      json.RawMessage `json:"data"`               // group-specific JSON payload
 }

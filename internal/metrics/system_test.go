@@ -71,6 +71,9 @@ func TestSystemCollector_CollectData(t *testing.T) {
 		DiskTotalBytes:   16384,
 		NetworkRxBytes:   500,
 		NetworkTxBytes:   600,
+		LoadAvg1:         1.5,
+		LoadAvg5:         2.0,
+		LoadAvg15:        1.8,
 	}
 	reader := &mockSystemReader{stats: want}
 	c := NewSystemCollector(reader, discardLogger())
@@ -104,6 +107,43 @@ func TestSystemCollector_CollectData(t *testing.T) {
 	}
 	if got.NetworkTxBytes != want.NetworkTxBytes {
 		t.Errorf("NetworkTxBytes = %v, want %v", got.NetworkTxBytes, want.NetworkTxBytes)
+	}
+	if got.LoadAvg1 != want.LoadAvg1 {
+		t.Errorf("LoadAvg1 = %v, want %v", got.LoadAvg1, want.LoadAvg1)
+	}
+	if got.LoadAvg5 != want.LoadAvg5 {
+		t.Errorf("LoadAvg5 = %v, want %v", got.LoadAvg5, want.LoadAvg5)
+	}
+	if got.LoadAvg15 != want.LoadAvg15 {
+		t.Errorf("LoadAvg15 = %v, want %v", got.LoadAvg15, want.LoadAvg15)
+	}
+}
+
+func TestSystemCollector_LoadAvgInOutput(t *testing.T) {
+	reader := &mockSystemReader{
+		stats: &SystemStats{
+			CPUUsagePercent: 10.0,
+			LoadAvg1:        0.5,
+			LoadAvg5:        1.2,
+			LoadAvg15:       0.9,
+		},
+	}
+	c := NewSystemCollector(reader, discardLogger())
+
+	points, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+
+	// Verify the JSON output contains load_avg fields.
+	var raw map[string]interface{}
+	if err := json.Unmarshal(points[0].Data, &raw); err != nil {
+		t.Fatalf("json.Unmarshal(Data) error = %v", err)
+	}
+	for _, key := range []string{"load_avg_1", "load_avg_5", "load_avg_15"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("JSON output missing key %q", key)
+		}
 	}
 }
 

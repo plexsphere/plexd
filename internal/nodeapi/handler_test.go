@@ -633,3 +633,357 @@ func TestHandler_MethodNotAllowed(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+// --- Action/Hook endpoint tests ---
+
+type mockActionProvider struct {
+	actions []api.ActionInfo
+	hooks   []api.HookInfo
+}
+
+func (m *mockActionProvider) Capabilities() ([]api.ActionInfo, []api.HookInfo) {
+	return m.actions, m.hooks
+}
+
+type mockActionRunner struct {
+	mockActionProvider
+	stdout   string
+	stderr   string
+	exitCode int
+	err      error
+}
+
+func (m *mockActionRunner) RunLocal(_ context.Context, _ string, _ map[string]string) (string, string, int, error) {
+	return m.stdout, m.stderr, m.exitCode, m.err
+}
+
+type mockHookReloader struct {
+	hooks []api.HookInfo
+}
+
+func (m *mockHookReloader) Hooks() []api.HookInfo {
+	return m.hooks
+}
+
+func newTestHandlerWithActions(t *testing.T, provider ActionProvider, reloader HookReloader) *httptest.Server {
+	t.Helper()
+	dir := t.TempDir()
+	cache := NewStateCache(dir, discardLogger())
+	if err := cache.Load(); err != nil {
+		t.Fatalf("cache.Load: %v", err)
+	}
+
+	nsk := testKey(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := NewHandler(cache, &mockSecretFetcher{}, "node-1", nsk, logger)
+	h.SetActionProvider(provider)
+	h.SetHookReloader(reloader)
+	srv := httptest.NewServer(h.Mux())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestHandler_GetActions(t *testing.T) {
+	provider := &mockActionProvider{
+		actions: []api.ActionInfo{
+			{Name: "gather_info", Description: "Gather system info"},
+			{Name: "health_check", Description: "Check health"},
+		},
+		hooks: []api.HookInfo{
+			{Name: "deploy.sh", Source: "local", Checksum: "abc123", Description: "Deploy"},
+		},
+	}
+	srv := newTestHandlerWithActions(t, provider, nil)
+
+	resp := mustGet(t, srv.URL+"/v1/actions")
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var result struct {
+		BuiltinActions []api.ActionInfo `json:"builtin_actions"`
+		Hooks          []api.HookInfo   `json:"hooks"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if len(result.BuiltinActions) != 2 {
+		t.Errorf("builtin_actions len = %d, want 2", len(result.BuiltinActions))
+	}
+	if len(result.Hooks) != 1 {
+		t.Errorf("hooks len = %d, want 1", len(result.Hooks))
+	}
+	if result.Hooks[0].Name != "deploy.sh" {
+		t.Errorf("hook name = %q, want %q", result.Hooks[0].Name, "deploy.sh")
+	}
+}
+
+func TestHandler_GetActions_NoProvider(t *testing.T) {
+	srv := newTestHandlerWithActions(t, nil, nil)
+
+	resp := mustGet(t, srv.URL+"/v1/actions")
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var result struct {
+		BuiltinActions []api.ActionInfo `json:"builtin_actions"`
+		Hooks          []api.HookInfo   `json:"hooks"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if len(result.BuiltinActions) != 0 {
+		t.Errorf("builtin_actions len = %d, want 0", len(result.BuiltinActions))
+	}
+	if len(result.Hooks) != 0 {
+		t.Errorf("hooks len = %d, want 0", len(result.Hooks))
+	}
+}
+
+func TestHandler_RunAction_Success(t *testing.T) {
+	runner := &mockActionRunner{
+		mockActionProvider: mockActionProvider{
+			actions: []api.ActionInfo{{Name: "gather_info"}},
+		},
+		stdout:   `{"hostname":"node-1"}`,
+		exitCode: 0,
+	}
+	srv := newTestHandlerWithActions(t, runner, nil)
+
+	body := `{"action":"gather_info","parameters":{"key":"value"}}`
+	req, err := http.NewRequest("POST", srv.URL+"/v1/actions/run", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var result struct {
+		Status   string `json:"status"`
+		ExitCode int    `json:"exit_code"`
+		Stdout   string `json:"stdout"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if result.Status != "success" {
+		t.Errorf("status = %q, want %q", result.Status, "success")
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("exit_code = %d, want 0", result.ExitCode)
+	}
+	if result.Stdout != `{"hostname":"node-1"}` {
+		t.Errorf("stdout = %q, want JSON output", result.Stdout)
+	}
+}
+
+func TestHandler_RunAction_Failed(t *testing.T) {
+	runner := &mockActionRunner{
+		mockActionProvider: mockActionProvider{
+			actions: []api.ActionInfo{{Name: "test_action"}},
+		},
+		stdout:   "",
+		stderr:   "something went wrong",
+		exitCode: 1,
+	}
+	srv := newTestHandlerWithActions(t, runner, nil)
+
+	body := `{"action":"test_action"}`
+	req, err := http.NewRequest("POST", srv.URL+"/v1/actions/run", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var result struct {
+		Status   string `json:"status"`
+		ExitCode int    `json:"exit_code"`
+		Stderr   string `json:"stderr"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if result.Status != "failed" {
+		t.Errorf("status = %q, want %q", result.Status, "failed")
+	}
+	if result.ExitCode != 1 {
+		t.Errorf("exit_code = %d, want 1", result.ExitCode)
+	}
+}
+
+func TestHandler_RunAction_MissingAction(t *testing.T) {
+	runner := &mockActionRunner{
+		mockActionProvider: mockActionProvider{},
+	}
+	srv := newTestHandlerWithActions(t, runner, nil)
+
+	body := `{"parameters":{"key":"value"}}`
+	req, err := http.NewRequest("POST", srv.URL+"/v1/actions/run", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 400 {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestHandler_RunAction_InvalidJSON(t *testing.T) {
+	runner := &mockActionRunner{
+		mockActionProvider: mockActionProvider{},
+	}
+	srv := newTestHandlerWithActions(t, runner, nil)
+
+	req, err := http.NewRequest("POST", srv.URL+"/v1/actions/run", strings.NewReader("not json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 400 {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestHandler_RunAction_NoProvider(t *testing.T) {
+	srv := newTestHandlerWithActions(t, nil, nil)
+
+	body := `{"action":"gather_info"}`
+	req, err := http.NewRequest("POST", srv.URL+"/v1/actions/run", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 503 {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestHandler_GetHooks(t *testing.T) {
+	provider := &mockActionProvider{
+		hooks: []api.HookInfo{
+			{Name: "alpha.sh", Source: "local", Checksum: "aaa", Description: "Alpha hook"},
+			{Name: "beta.sh", Source: "local", Checksum: "bbb", Description: "Beta hook"},
+		},
+	}
+	srv := newTestHandlerWithActions(t, provider, nil)
+
+	resp := mustGet(t, srv.URL+"/v1/hooks")
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var hooks []api.HookInfo
+	decodeJSON(t, resp, &hooks)
+
+	if len(hooks) != 2 {
+		t.Fatalf("hooks len = %d, want 2", len(hooks))
+	}
+	if hooks[0].Name != "alpha.sh" {
+		t.Errorf("hooks[0].Name = %q, want %q", hooks[0].Name, "alpha.sh")
+	}
+	if hooks[1].Name != "beta.sh" {
+		t.Errorf("hooks[1].Name = %q, want %q", hooks[1].Name, "beta.sh")
+	}
+}
+
+func TestHandler_GetHooks_NoProvider(t *testing.T) {
+	srv := newTestHandlerWithActions(t, nil, nil)
+
+	resp := mustGet(t, srv.URL+"/v1/hooks")
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var hooks []api.HookInfo
+	decodeJSON(t, resp, &hooks)
+
+	if len(hooks) != 0 {
+		t.Errorf("hooks len = %d, want 0", len(hooks))
+	}
+}
+
+func TestHandler_ReloadHooks(t *testing.T) {
+	reloader := &mockHookReloader{
+		hooks: []api.HookInfo{
+			{Name: "refreshed.sh", Source: "local", Checksum: "xyz"},
+		},
+	}
+	srv := newTestHandlerWithActions(t, nil, reloader)
+
+	req, err := http.NewRequest("POST", srv.URL+"/v1/hooks/reload", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var result struct {
+		Status string         `json:"status"`
+		Hooks  []api.HookInfo `json:"hooks"`
+	}
+	decodeJSON(t, resp, &result)
+
+	if result.Status != "reloaded" {
+		t.Errorf("status = %q, want %q", result.Status, "reloaded")
+	}
+	if len(result.Hooks) != 1 {
+		t.Fatalf("hooks len = %d, want 1", len(result.Hooks))
+	}
+	if result.Hooks[0].Name != "refreshed.sh" {
+		t.Errorf("hook name = %q, want %q", result.Hooks[0].Name, "refreshed.sh")
+	}
+}
+
+func TestHandler_ReloadHooks_NoReloader(t *testing.T) {
+	srv := newTestHandlerWithActions(t, nil, nil)
+
+	req, err := http.NewRequest("POST", srv.URL+"/v1/hooks/reload", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 503 {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+	resp.Body.Close()
+}

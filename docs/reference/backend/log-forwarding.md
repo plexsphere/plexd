@@ -21,6 +21,8 @@ The `Forwarder` runs two independent ticker loops in a single goroutine: one for
 | `CollectInterval` | `time.Duration` | `10s`   | Interval between collection cycles (min 5s)    |
 | `ReportInterval`  | `time.Duration` | `30s`   | Interval between reporting to control plane    |
 | `BatchSize`       | `int`           | `200`   | Maximum log entries per report batch (min 1)   |
+| `FilePatterns`    | `[]string`      | `nil`   | Glob patterns for file-based log collection    |
+| `Filter`          | `FilterConfig`  | _(empty)_ | Log filtering rules (see LogFilter section)  |
 
 ```go
 cfg := logfwd.Config{}
@@ -128,6 +130,140 @@ Out-of-range priority values default to `"info"`.
 ### Collect Behavior
 
 Returns one `api.LogEntry` per journal entry. On reader error, returns `nil, fmt.Errorf("logfwd: journald: %w", err)`. Returns `nil, nil` when no entries are available.
+
+## JournalctlReader
+
+Concrete `JournalReader` implementation for Linux that reads entries by running the `journalctl` subprocess with JSON output.
+
+```go
+func NewJournalctlReader() *JournalctlReader
+```
+
+Build-tagged `//go:build linux`.
+
+### Cursor Tracking
+
+On the first call, reads entries from the last 60 seconds (`--since=60 seconds ago`). Subsequent calls use `--after-cursor=<cursor>` to avoid re-reading entries. The cursor is extracted from the `__CURSOR` field of each JSON entry.
+
+### journalctl Invocation
+
+```
+journalctl --output=json --no-pager -n 1000 [--since=60 seconds ago | --after-cursor=<cursor>]
+```
+
+### JSON Field Parsing
+
+| journalctl JSON Field      | JournalEntry Field | Parsing                                   |
+|----------------------------|--------------------|--------------------------------------------|
+| `MESSAGE`                  | `Message`          | Direct string                              |
+| `_SYSTEMD_UNIT`            | `Unit`             | Direct string                              |
+| `PRIORITY`                 | `Priority`         | String → int via `strconv.Atoi`            |
+| `__REALTIME_TIMESTAMP`     | `Timestamp`        | Microseconds since epoch → `time.Time`     |
+| `__CURSOR`                 | _(internal)_       | Stored for next call                       |
+
+Malformed JSON lines are silently skipped. If timestamp parsing fails, `time.Now()` is used as fallback. Returns error if `journalctl` is not found (`exec.ErrNotFound`).
+
+## FileSource
+
+Reads new lines from log files matching a glob pattern, with offset tracking and rotation detection.
+
+### Constructor
+
+```go
+func NewFileSource(pattern, hostname string, logger *slog.Logger) *FileSource
+```
+
+| Parameter  | Description                                           |
+|------------|-------------------------------------------------------|
+| `pattern`  | Glob expression (e.g., `"/var/log/app/*.log"`)       |
+| `hostname` | Node hostname included in every log entry             |
+| `logger`   | Structured logger (`log/slog`)                        |
+
+### Collect Behavior
+
+1. Expand glob pattern to matching files
+2. For each file, check inode and size against tracked state
+3. **Rotation detection**: if inode changed or file is smaller than stored offset, reset offset to 0
+4. Read new lines from the stored offset using `bufio.Scanner`
+5. Lines exceeding 16 KiB are truncated with `[truncated]` suffix
+6. Empty lines are skipped
+7. Each line produces an `api.LogEntry` with `Source="file"`, `Unit=<filepath>`, `Severity="info"`
+8. Update stored offset after reading
+
+### Log Entry Fields
+
+| Field       | Value                                     |
+|-------------|-------------------------------------------|
+| `Timestamp` | `time.Now()` at read time                |
+| `Source`    | `"file"`                                  |
+| `Unit`      | Full file path                            |
+| `Message`   | Line content (truncated at 16 KiB)       |
+| `Severity`  | `"info"` (always)                         |
+| `Hostname`  | Set at construction time                  |
+
+### Error Handling
+
+- Glob errors return an error
+- Individual file read failures are logged at warn level; other files continue
+- Partial results are returned on context cancellation
+
+## LogFilter
+
+The `FilteringSource` wraps a `LogSource` and applies filter rules to its output. The `Forwarder` automatically wraps all sources with `FilteringSource` when `Config.Filter` is non-empty.
+
+### FilterConfig
+
+```go
+type FilterConfig struct {
+    MinSeverity  string    // Drop entries below this severity level (empty = no filter)
+    IncludeUnits []string  // Only pass entries matching these unit names (empty = all)
+    ExcludeUnits []string  // Drop entries matching any of these unit names
+}
+```
+
+Configured via `Config.Filter`:
+
+```go
+cfg := logfwd.Config{
+    Filter: logfwd.FilterConfig{
+        MinSeverity:  "warning",
+        IncludeUnits: []string{"plexd.service", "sshd.service"},
+        ExcludeUnits: []string{"systemd-resolved.service"},
+    },
+}
+```
+
+### Severity Filtering
+
+Uses syslog priority ordering (lower number = more severe):
+
+| Priority | Severity  | Passes `MinSeverity="warning"`? |
+|----------|-----------|---------------------------------|
+| 0        | `emerg`   | yes                             |
+| 1        | `alert`   | yes                             |
+| 2        | `crit`    | yes                             |
+| 3        | `err`     | yes                             |
+| 4        | `warning` | yes (threshold)                 |
+| 5        | `notice`  | no                              |
+| 6        | `info`    | no                              |
+| 7        | `debug`   | no                              |
+
+Unknown severity values default to `"info"` priority (6).
+
+### Filter Evaluation Order
+
+1. **Severity filter**: if `MinSeverity` is set and entry severity is less severe, drop
+2. **Include filter**: if `IncludeUnits` is non-empty and entry unit is not in the list, drop
+3. **Exclude filter**: if entry unit matches any `ExcludeUnits`, drop
+4. Entry passes all filters → included in output
+
+### Constructor
+
+```go
+func NewFilteringSource(inner LogSource, config FilterConfig) *FilteringSource
+```
+
+When `FilterConfig.IsEmpty()` returns true (all fields are zero/empty), the filter is a no-op passthrough.
 
 ## Forwarder
 

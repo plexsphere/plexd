@@ -32,6 +32,14 @@ type Config struct {
 	// BatchSize is the maximum number of log entries per report batch.
 	// Must be at least 1. Default: 200.
 	BatchSize int
+
+	// FilePatterns is a list of glob patterns for file-based log collection.
+	// Example: ["/var/log/app/*.log", "/var/log/syslog"]
+	FilePatterns []string
+
+	// Filter defines optional log filtering rules.
+	// When non-empty, the Forwarder wraps sources with a FilteringSource.
+	Filter FilterConfig
 }
 
 // ApplyDefaults sets default values for zero-valued fields.

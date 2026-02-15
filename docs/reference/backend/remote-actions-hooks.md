@@ -250,6 +250,240 @@ Tests connectivity to a target IP address. Requires a `target` parameter contain
 
 Returns exit code 0 on success, 1 on failure.
 
+### diagnostics.collect
+
+Collects system diagnostics (hostname, OS, architecture, CPU count, memory, disk, load average, kernel version) and returns them as JSON. Gracefully handles missing `/proc` data by using fallback values.
+
+```json
+{
+  "hostname": "edge-us-west-42",
+  "os": "linux",
+  "arch": "amd64",
+  "cpu_count": 4,
+  "memory_total": 8589934592,
+  "disk_total": 107374182400,
+  "load_avg": "1.50 1.20 0.90 2/150 12345",
+  "kernel_version": "6.1.0-amd64"
+}
+```
+
+No parameters required.
+
+### diagnostics.traceroute_peer
+
+Runs `traceroute` to a target IP address. Requires a `target` parameter containing a valid IP address. Uses `-n -m 15 -w 3` flags.
+
+| Parameter | Type   | Required | Description       |
+|-----------|--------|----------|-------------------|
+| `target`  | string | yes      | Target IP address |
+
+Returns traceroute output in stdout. Exit code 1 if `traceroute` is not installed.
+
+### service.restart
+
+Restarts the plexd service via `systemctl restart plexd.service`. No parameters required. Exit code 1 if `systemctl` is not available.
+
+### service.reload_config
+
+Sends `SIGHUP` to the current process to trigger a configuration reload.
+
+```json
+{
+  "status": "reload_signal_sent",
+  "pid": 12345
+}
+```
+
+No parameters required.
+
+### service.upgrade
+
+Placeholder for in-place upgrade functionality. Currently returns a message indicating that in-place upgrade is not supported.
+
+```json
+{
+  "status": "upgrade_not_available",
+  "message": "in-place upgrade not supported; use package manager or control plane"
+}
+```
+
+No parameters required.
+
+### health.check
+
+Reports the node's health status. Requires a `HealthProvider` dependency.
+
+```json
+{
+  "tunnel_count": 3,
+  "connected_peers": 5,
+  "uptime": "2h30m15s",
+  "last_heartbeat": "2026-02-15T10:30:00Z",
+  "last_reconcile": "2026-02-15T10:25:00Z",
+  "status": "healthy"
+}
+```
+
+Status is `"healthy"` if `tunnel_count > 0`, otherwise `"degraded"`. No parameters required.
+
+### mesh.reconnect
+
+Triggers mesh reconnection via the `MeshReconnector` interface. On success, returns `{"status": "reconnected"}`. On failure, returns exit code 1 with `{"status": "failed", "error": "..."}`.
+
+No parameters required.
+
+### config.dump
+
+Outputs the sanitized configuration via the `ConfigProvider` interface. Returns the config string in stdout. No parameters required.
+
+### logs.snapshot
+
+Retrieves recent log lines via the `LogProvider` interface.
+
+| Parameter | Type   | Required | Description                    |
+|-----------|--------|----------|--------------------------------|
+| `lines`   | string | no       | Number of lines (default: 100, max: 10000) |
+
+Returns newline-separated log lines in stdout.
+
+## HookWatcher
+
+Monitors a hooks directory for filesystem changes using `fsnotify`. Replaces the one-time `DiscoverHooks` call with a continuous watch loop.
+
+### Constructor
+
+```go
+func NewHookWatcher(hooksDir string, onChange HookChangeCallback, onIntegrity IntegrityAlertCallback, logger *slog.Logger) *HookWatcher
+```
+
+| Parameter     | Description                                          |
+|---------------|------------------------------------------------------|
+| `hooksDir`    | Directory containing hook scripts                    |
+| `onChange`    | Callback invoked with the full hooks list on change  |
+| `onIntegrity` | Callback invoked when a hook's checksum changes     |
+| `logger`      | Structured logger (`log/slog`)                      |
+
+### Callbacks
+
+```go
+type HookChangeCallback func(hooks []api.HookInfo)
+type IntegrityAlertCallback func(hookName, oldChecksum, newChecksum string)
+```
+
+### Methods
+
+| Method  | Signature                                 | Description                                       |
+|---------|-------------------------------------------|---------------------------------------------------|
+| `Watch` | `(ctx context.Context) error`             | Monitor directory; blocks until ctx is cancelled   |
+| `Hooks` | `() []api.HookInfo`                       | Return sorted snapshot of current hooks            |
+
+### Watch Lifecycle
+
+1. Create hooks directory if it does not exist
+2. Perform initial scan: read all executable files, compute checksums, call `onChange`
+3. Start `fsnotify` watcher on the hooks directory
+4. On file create/write/chmod: debounce (200ms), then re-read file, compute checksum, update hooks map, call `onChange`
+5. On file remove/rename: debounce, remove from hooks map, call `onChange`
+6. On `.json` sidecar change: debounce, re-read the parent hook's metadata
+7. On checksum change for an existing hook: call `onIntegrity` with old and new checksums
+8. On context cancellation: stop all timers, return nil
+
+### Integration with Executor
+
+In `cmd/plexd/cmd/up.go`, the watcher is wired to the executor:
+
+```go
+hookWatcher := actions.NewHookWatcher(cfg.Actions.HooksDir, executor.SetHooks, onIntegrityAlert, logger)
+```
+
+When hooks change, `executor.SetHooks` is called, updating `Capabilities()` output. The `Hooks()` method satisfies the `nodeapi.HookReloader` interface.
+
+## Local API Endpoints
+
+The node API server (`internal/nodeapi`) exposes action and hook management endpoints over the Unix socket.
+
+### GET /v1/actions
+
+Lists all registered built-in actions and hooks.
+
+**Response:**
+
+```json
+{
+  "builtin_actions": [
+    {"name": "diagnostics.collect", "description": "Collect system diagnostics"}
+  ],
+  "hooks": [
+    {"name": "deploy.sh", "source": "local", "checksum": "sha256:abc...", "description": "Deploy"}
+  ]
+}
+```
+
+### POST /v1/actions/run
+
+Runs a built-in action synchronously and returns the result. The action provider must implement the `LocalActionRunner` interface (satisfied by `Executor`).
+
+**Request:**
+
+```json
+{
+  "action": "diagnostics.collect",
+  "parameters": {}
+}
+```
+
+**Response:**
+
+```json
+{
+  "status": "success",
+  "exit_code": 0,
+  "stdout": "{...}",
+  "stderr": ""
+}
+```
+
+Status values: `success` (exit 0), `failed` (non-zero exit), `error` (internal error).
+
+### GET /v1/hooks
+
+Lists all registered hooks (subset of GET /v1/actions response).
+
+### POST /v1/hooks/reload
+
+Triggers a re-scan of hooks via the `HookReloader` interface (satisfied by `HookWatcher.Hooks()`).
+
+**Response:**
+
+```json
+{
+  "status": "reloaded",
+  "hooks": [...]
+}
+```
+
+## CLI Commands
+
+### plexd actions
+
+Lists available actions via `GET /v1/actions` over Unix socket. Output is a tab-separated table with TYPE, NAME, and DESCRIPTION columns.
+
+### plexd actions run \<name\>
+
+Runs an action via `POST /v1/actions/run`. Accepts `--param key=value` flags for passing parameters.
+
+### plexd hooks list
+
+Lists hooks via `GET /v1/hooks`. Shows NAME, SOURCE, CHECKSUM (truncated to 12 chars), and DESCRIPTION.
+
+### plexd hooks verify
+
+Reads hooks via `GET /v1/hooks` and checks that each hook has a checksum. Reports `OK` or `WARN` per hook.
+
+### plexd hooks reload
+
+Triggers a hook re-scan via `POST /v1/hooks/reload`. Reports the status and hook count.
+
 ## DiscoverHooks
 
 Scans a directory for executable hook scripts and builds metadata.
@@ -414,25 +648,33 @@ cfg.ApplyDefaults()
 exec := actions.NewExecutor(cfg, reporter, verifier, logger)
 
 // 3. Register built-in actions
-exec.RegisterBuiltin("gather_info", "Gather system info", nil, actions.GatherInfo(nodeInfo))
-exec.RegisterBuiltin("ping", "Ping target", pingParams, actions.Ping(nodeInfo))
+exec.RegisterBuiltin("gather_info", "Collect system and mesh info", nil, actions.GatherInfo(nodeInfo))
+exec.RegisterBuiltin("ping", "Test connectivity", targetParam, actions.Ping(nodeInfo))
+exec.RegisterBuiltin("diagnostics.collect", "Collect diagnostics", nil, actions.DiagnosticsCollect())
+exec.RegisterBuiltin("diagnostics.traceroute_peer", "Traceroute to peer", targetParam, actions.DiagnosticsTraceroutePeer(nodeInfo))
+exec.RegisterBuiltin("service.restart", "Restart service", nil, actions.ServiceRestart())
+exec.RegisterBuiltin("service.reload_config", "Reload config", nil, actions.ServiceReloadConfig())
+exec.RegisterBuiltin("service.upgrade", "Upgrade (placeholder)", nil, actions.ServiceUpgrade())
+exec.RegisterBuiltin("health.check", "Check health", nil, actions.HealthCheck(healthProvider))
+exec.RegisterBuiltin("mesh.reconnect", "Reconnect mesh", nil, actions.MeshReconnect(reconnector))
+exec.RegisterBuiltin("config.dump", "Dump config", nil, actions.ConfigDump(configProvider))
+exec.RegisterBuiltin("logs.snapshot", "Snapshot logs", linesParam, actions.LogsSnapshot(logProvider))
 
-// 4. Discover and set hooks
-hooks, err := actions.DiscoverHooks(cfg.HooksDir, logger)
-exec.SetHooks(hooks)
-
-// 5. Report capabilities
-builtins, hookList := exec.Capabilities()
-_ = client.UpdateCapabilities(ctx, nodeID, api.CapabilitiesPayload{
-    BuiltinActions: builtins,
-    Hooks:          hookList,
-})
-
-// 6. Register SSE handler
-dispatcher.Register(api.EventActionRequest,
+// 4. Register SSE handler
+sseMgr.RegisterHandler(api.EventActionRequest,
     actions.HandleActionRequest(exec, nodeID, logger))
 
-// 7. On shutdown
+// 5. Create hook watcher (replaces one-time DiscoverHooks)
+watcher := actions.NewHookWatcher(cfg.HooksDir, exec.SetHooks, onIntegrityAlert, logger)
+
+// 6. Wire to nodeapi
+nodeAPISrv.SetActionProvider(exec)
+nodeAPISrv.SetHookReloader(watcher)
+
+// 7. Start watcher goroutine
+go watcher.Watch(ctx)
+
+// 8. On shutdown
 exec.Shutdown(ctx)
 ```
 

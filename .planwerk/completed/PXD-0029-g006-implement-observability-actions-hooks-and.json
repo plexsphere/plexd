@@ -2,8 +2,8 @@
   "feature_id": "PXD-0029",
   "title": "G006: Implement observability actions hooks and log forwa...",
   "slug": "g006-implement-observability-actions-hooks-and",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 🏗️ large\n**Category:** backend\n**Priority:** high\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nComplete the observability and operations layer:\n\n**9 Missing Built-in Actions:** Implement `diagnostics.collect`, `diagnostics.traceroute_peer`, `service.restart`, `service.reload_config`, `service.upgrade`, `health.check`, `mesh.reconnect`, `config.dump`, `logs.snapshot` in `internal/actions/`.\n\n**Hook File Watcher:** fsnotify-based watcher on hook directory for dynamic registration. Recalculate checksums on file change, emit integrity alerts. Replace one-time startup discovery in `discovery.go`.\n\n**Unix Socket Action Server + CLI Client:** Local action execution via Unix socket. Server-side in agent, client-side in `plexd actions run` CLI command.\n\n**SystemReader Impl:** Concrete implementation reading `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`, disk stats via `syscall.Statfs`.\n\n**JournalReader Impl:** Concrete implementation using sd_journal or journald socket for live log reading.\n\n**File-based LogSource:** File path reader with glob support (e.g., `/var/log/app/*.log`). Enforce 16 KiB max line truncation with `[truncated]` suffix.\n\n**Log Filtering:** Path-based, severity-based, and unit-based filtering in the log forwarding pipeline.\n\n**Metrics Collectors:** `agent_stats` collector (goroutine count, heap memory, GC stats, uptime, reconnect count). Add load average to SystemReader. Add packet loss measurement to TunnelCollector.\n\n**Rationale:** Only 2 of 11 built-in actions exist - operators cannot perform diagnostics, service management, or config inspection remotely. Missing hook watcher means hooks added after startup are invisible. Missing SystemReader/JournalReader means metrics and logs are interface-only with no real data collection. File-based log source is critical for applications that don't use journald.\n\n**Affected Areas:**\n- internal/actions/builtin/\n- internal/hooks/discovery.go\n- internal/hooks/watcher.go\n- internal/agent/action_server.go\n- internal/metrics/system_reader_linux.go\n- internal/logfwd/journal_reader_linux.go\n- internal/logfwd/file_source.go\n- internal/logfwd/filter.go\n- internal/metrics/agent_stats.go\n- internal/metrics/collectors.go",
   "stories": [
@@ -441,27 +441,27 @@
     }
   ],
   "tasks": [
-    "1.1 Implement 9 missing built-in actions in internal/actions/builtins.go — DiagnosticsCollect (system info JSON), DiagnosticsTraceroutePeer (traceroute via exec), ServiceRestart (systemctl restart plexd.service), ServiceReloadConfig (SIGHUP to self), ServiceUpgrade (placeholder returning upgrade-not-available), HealthCheck (JSON with tunnel/peer/heartbeat status from injectable HealthProvider interface), MeshReconnect (reconnect via injectable MeshReconnector interface), ConfigDump (sanitized YAML config from injectable ConfigProvider), LogsSnapshot (last N lines from injectable LogProvider). Each action includes parameter validation and tests. (REQ-001)",
-    "1.2 Define injectable interfaces for built-in actions — HealthProvider (TunnelCount, ConnectedPeers, Uptime, LastHeartbeat, LastReconcile), MeshReconnector (Reconnect(ctx) error), ConfigProvider (DumpConfig() string), LogProvider (RecentLines(n int) []string). Place in internal/actions/builtins.go alongside existing NodeInfoProvider. Tests verify each action with mock providers. (REQ-001)",
-    "1.3 Implement fsnotify-based HookWatcher in internal/actions/watcher.go — Watch(ctx, hooksDir) method starts fsnotify watcher, debounces events (200ms), filters for executable files, computes checksums via integrity.HashFile, calls OnHookChanged callback (add/update/remove). Supports OnIntegrityAlert callback for checksum changes. Tests use temp directories with goleak. (REQ-002, REQ-010)",
-    "1.4 Integrate HookWatcher with Executor — Replace one-time DiscoverHooks call with HookWatcher.Watch goroutine in agent startup. OnHookChanged updates Executor.SetHooks. OnIntegrityAlert calls integrity.Verifier.ReportViolation (or a ViolationReporter). Watcher triggers capabilities re-report via injectable CapabilitiesReporter. Integration test verifies dynamic hook add/remove/modify lifecycle. (REQ-002)",
-    "2.1 Add action execution endpoints to nodeapi Handler — Add GET /v1/actions returning {builtin_actions: [], hooks: []} from Executor.Capabilities. Add POST /v1/actions/run accepting {action: string, parameters: map, timeout: string} and returning {stdout, stderr, exit_code, status, duration}. Handler holds *actions.Executor reference. Action runs synchronously with HTTP timeout. Tests in internal/nodeapi/handler_test.go. (REQ-003)",
-    "2.2 Wire CLI 'plexd actions' and 'plexd actions run' to Unix socket endpoints — Update cmd/plexd/cmd/actions.go: runActions calls GET /v1/actions and formats output as table. runActionsRun calls POST /v1/actions/run with action name and --param flags, prints stdout/stderr, exits with action's exit code. Add socketPost helper to sockutil.go. Tests in cmd/plexd/cmd/actions_test.go. (REQ-003)",
-    "2.3 Wire CLI 'plexd hooks list/verify/reload' to Unix socket — Update cmd/plexd/cmd/hooks.go: runHooksList calls GET /v1/actions and filters hooks. runHooksVerify calls POST /v1/actions/run with verify-all-hooks (new internal action). runHooksReload calls POST /v1/hooks/reload (trigger watcher rescan). Add GET /v1/hooks/reload endpoint. Tests in cmd/plexd/cmd/hooks_test.go. (REQ-003)",
-    "3.1 Implement Linux SystemReader in internal/metrics/system_reader_linux.go — LinuxSystemReader.ReadStats reads /proc/stat (CPU delta over 100ms), /proc/meminfo (MemTotal, MemAvailable), /proc/loadavg, /proc/net/dev (rx/tx bytes), syscall.Statfs (disk). Configurable mount point and network interface via constructor params. Tests with real /proc access on Linux (build-tagged). (REQ-004)",
-    "3.2 Extend SystemStats with LoadAvg fields — Add LoadAvg1, LoadAvg5, LoadAvg15 float64 fields to SystemStats struct in internal/metrics/system.go with JSON tags load_avg_1, load_avg_5, load_avg_15. Update SystemCollector tests to verify new fields are present in output JSON. Update docs/reference/backend/metrics-collection.md. (REQ-009)",
-    "3.3 Implement AgentStatsCollector in internal/metrics/agent_stats.go — Collects runtime.NumGoroutine, runtime.MemStats (HeapAlloc, HeapSys, PauseTotalNs, NumGC), time.Since(startTime), reconnect count from injectable ReconnectCounter interface. Returns MetricPoint with Group='agent'. Add GroupAgent constant. Tests verify all fields present and uptime increases. (REQ-008)",
-    "3.4 Add PacketLossPercent to TunnelStats and TunnelStatsReader — Extend TunnelStats struct with PacketLossPercent float64 field (json tag packet_loss_percent). TunnelStatsReader implementations provide this from periodic ICMP probes or default to -1 when unavailable. Update existing TunnelCollector tests for the new field. (REQ-009)",
-    "4.1 Implement JournalReader via journalctl subprocess in internal/logfwd/journal_reader_linux.go — JournalctlReader.ReadEntries runs 'journalctl --output=json --since=<cursor> --no-pager' and parses JSON output. Tracks cursor via __CURSOR field. First call uses --since='60 seconds ago'. Build-tagged for Linux. Tests mock exec.Command pattern or use integration tag. (REQ-005)",
-    "4.2 Implement FileSource in internal/logfwd/file_source.go — FileSource.Collect globs pattern, opens each matched file, seeks to stored offset, reads new lines with bufio.Scanner. Lines > MaxLineBytes (16384) truncated with '[truncated]' suffix. Detects rotation via os.Stat inode comparison. Stores offsets and inodes in a map[string]fileState. Tests with temp files. (REQ-006)",
-    "4.3 Implement LogFilter in internal/logfwd/filter.go — FilterConfig struct with MinSeverity string, IncludeUnits []string, ExcludeUnits []string. FilteringSource wraps a LogSource, calls inner Collect, then applies filters. Severity comparison uses priority order (emerg=0 > debug=7). Empty config = passthrough. Tests for each filter type and combination. (REQ-007)",
-    "4.4 Add filter configuration to logfwd.Config — Add FilterConfig field to logfwd.Config struct. Forwarder wraps sources with FilteringSource when filter config is non-empty. Update config_test.go. (REQ-007)",
-    "5.1 Wire all new components in cmd/plexd/cmd/up.go — Wire SystemReader (LinuxSystemReader on linux, nil on other), AgentStatsCollector, HookWatcher goroutine, action server endpoints in nodeapi. Pass Executor to nodeapi.Handler. Register new built-in actions with provider interfaces. Add FileSource and JournalctlReader to log forwarder when configured. (REQ-001 through REQ-010)",
-    "5.2 Integration tests for action server + CLI round-trip — Test in cmd/plexd/cmd/actions_test.go: start a nodeapi server with Executor (registered builtins), run CLI commands against it, verify output. Tests for list, run success, run failure, unknown action. (REQ-003)",
-    "5.3 Integration tests for hook watcher lifecycle — Test in internal/actions/watcher_test.go: start watcher on temp dir, add/modify/remove files, verify callbacks invoked in order. Verify capabilities re-report. goleak check. (REQ-002, REQ-010)",
-    "6.1 Update docs/reference/backend/remote-actions-hooks.md — Add documentation for all 9 new built-in actions (parameters, output format, error cases), HookWatcher (config, behavior, lifecycle), Unix socket action server (API contract), and updated CLI commands. (REQ-001, REQ-002, REQ-003)",
-    "6.2 Update docs/reference/backend/metrics-collection.md — Document SystemReader implementation (Linux /proc sources), new LoadAvg fields in SystemStats, AgentStatsCollector (Group='agent', fields), PacketLossPercent in TunnelStats. (REQ-004, REQ-008, REQ-009)",
-    "6.3 Update docs/reference/backend/log-forwarding.md — Document JournalReader implementation (journalctl subprocess, cursor tracking), FileSource (glob, offset tracking, rotation, truncation), LogFilter (severity/unit/path filtering, config). (REQ-005, REQ-006, REQ-007)"
+    "[done] 1.1 Implement 9 missing built-in actions in internal/actions/builtins.go — DiagnosticsCollect (system info JSON), DiagnosticsTraceroutePeer (traceroute via exec), ServiceRestart (systemctl restart plexd.service), ServiceReloadConfig (SIGHUP to self), ServiceUpgrade (placeholder returning upgrade-not-available), HealthCheck (JSON with tunnel/peer/heartbeat status from injectable HealthProvider interface), MeshReconnect (reconnect via injectable MeshReconnector interface), ConfigDump (sanitized YAML config from injectable ConfigProvider), LogsSnapshot (last N lines from injectable LogProvider). Each action includes parameter validation and tests. (REQ-001)",
+    "[done] 1.2 Define injectable interfaces for built-in actions — HealthProvider (TunnelCount, ConnectedPeers, Uptime, LastHeartbeat, LastReconcile), MeshReconnector (Reconnect(ctx) error), ConfigProvider (DumpConfig() string), LogProvider (RecentLines(n int) []string). Place in internal/actions/builtins.go alongside existing NodeInfoProvider. Tests verify each action with mock providers. (REQ-001)",
+    "[done] 1.3 Implement fsnotify-based HookWatcher in internal/actions/watcher.go — Watch(ctx, hooksDir) method starts fsnotify watcher, debounces events (200ms), filters for executable files, computes checksums via integrity.HashFile, calls OnHookChanged callback (add/update/remove). Supports OnIntegrityAlert callback for checksum changes. Tests use temp directories with goleak. (REQ-002, REQ-010)",
+    "[done] 1.4 Integrate HookWatcher with Executor — Replace one-time DiscoverHooks call with HookWatcher.Watch goroutine in agent startup. OnHookChanged updates Executor.SetHooks. OnIntegrityAlert calls integrity.Verifier.ReportViolation (or a ViolationReporter). Watcher triggers capabilities re-report via injectable CapabilitiesReporter. Integration test verifies dynamic hook add/remove/modify lifecycle. (REQ-002)",
+    "[done] 2.1 Add action execution endpoints to nodeapi Handler — Add GET /v1/actions returning {builtin_actions: [], hooks: []} from Executor.Capabilities. Add POST /v1/actions/run accepting {action: string, parameters: map, timeout: string} and returning {stdout, stderr, exit_code, status, duration}. Handler holds *actions.Executor reference. Action runs synchronously with HTTP timeout. Tests in internal/nodeapi/handler_test.go. (REQ-003)",
+    "[done] 2.2 Wire CLI 'plexd actions' and 'plexd actions run' to Unix socket endpoints — Update cmd/plexd/cmd/actions.go: runActions calls GET /v1/actions and formats output as table. runActionsRun calls POST /v1/actions/run with action name and --param flags, prints stdout/stderr, exits with action's exit code. Add socketPost helper to sockutil.go. Tests in cmd/plexd/cmd/actions_test.go. (REQ-003)",
+    "[done] 2.3 Wire CLI 'plexd hooks list/verify/reload' to Unix socket — Update cmd/plexd/cmd/hooks.go: runHooksList calls GET /v1/actions and filters hooks. runHooksVerify calls POST /v1/actions/run with verify-all-hooks (new internal action). runHooksReload calls POST /v1/hooks/reload (trigger watcher rescan). Add GET /v1/hooks/reload endpoint. Tests in cmd/plexd/cmd/hooks_test.go. (REQ-003)",
+    "[done] 3.1 Implement Linux SystemReader in internal/metrics/system_reader_linux.go — LinuxSystemReader.ReadStats reads /proc/stat (CPU delta over 100ms), /proc/meminfo (MemTotal, MemAvailable), /proc/loadavg, /proc/net/dev (rx/tx bytes), syscall.Statfs (disk). Configurable mount point and network interface via constructor params. Tests with real /proc access on Linux (build-tagged). (REQ-004)",
+    "[done] 3.2 Extend SystemStats with LoadAvg fields — Add LoadAvg1, LoadAvg5, LoadAvg15 float64 fields to SystemStats struct in internal/metrics/system.go with JSON tags load_avg_1, load_avg_5, load_avg_15. Update SystemCollector tests to verify new fields are present in output JSON. Update docs/reference/backend/metrics-collection.md. (REQ-009)",
+    "[done] 3.3 Implement AgentStatsCollector in internal/metrics/agent_stats.go — Collects runtime.NumGoroutine, runtime.MemStats (HeapAlloc, HeapSys, PauseTotalNs, NumGC), time.Since(startTime), reconnect count from injectable ReconnectCounter interface. Returns MetricPoint with Group='agent'. Add GroupAgent constant. Tests verify all fields present and uptime increases. (REQ-008)",
+    "[done] 3.4 Add PacketLossPercent to TunnelStats and TunnelStatsReader — Extend TunnelStats struct with PacketLossPercent float64 field (json tag packet_loss_percent). TunnelStatsReader implementations provide this from periodic ICMP probes or default to -1 when unavailable. Update existing TunnelCollector tests for the new field. (REQ-009)",
+    "[done] 4.1 Implement JournalReader via journalctl subprocess in internal/logfwd/journal_reader_linux.go — JournalctlReader.ReadEntries runs 'journalctl --output=json --since=<cursor> --no-pager' and parses JSON output. Tracks cursor via __CURSOR field. First call uses --since='60 seconds ago'. Build-tagged for Linux. Tests mock exec.Command pattern or use integration tag. (REQ-005)",
+    "[done] 4.2 Implement FileSource in internal/logfwd/file_source.go — FileSource.Collect globs pattern, opens each matched file, seeks to stored offset, reads new lines with bufio.Scanner. Lines > MaxLineBytes (16384) truncated with '[truncated]' suffix. Detects rotation via os.Stat inode comparison. Stores offsets and inodes in a map[string]fileState. Tests with temp files. (REQ-006)",
+    "[done] 4.3 Implement LogFilter in internal/logfwd/filter.go — FilterConfig struct with MinSeverity string, IncludeUnits []string, ExcludeUnits []string. FilteringSource wraps a LogSource, calls inner Collect, then applies filters. Severity comparison uses priority order (emerg=0 > debug=7). Empty config = passthrough. Tests for each filter type and combination. (REQ-007)",
+    "[done] 4.4 Add filter configuration to logfwd.Config — Add FilterConfig field to logfwd.Config struct. Forwarder wraps sources with FilteringSource when filter config is non-empty. Update config_test.go. (REQ-007)",
+    "[done] 5.1 Wire all new components in cmd/plexd/cmd/up.go — Wire SystemReader (LinuxSystemReader on linux, nil on other), AgentStatsCollector, HookWatcher goroutine, action server endpoints in nodeapi. Pass Executor to nodeapi.Handler. Register new built-in actions with provider interfaces. Add FileSource and JournalctlReader to log forwarder when configured. (REQ-001 through REQ-010)",
+    "[done] 5.2 Integration tests for action server + CLI round-trip — Test in cmd/plexd/cmd/actions_test.go: start a nodeapi server with Executor (registered builtins), run CLI commands against it, verify output. Tests for list, run success, run failure, unknown action. (REQ-003)",
+    "[done] 5.3 Integration tests for hook watcher lifecycle — Test in internal/actions/watcher_test.go: start watcher on temp dir, add/modify/remove files, verify callbacks invoked in order. Verify capabilities re-report. goleak check. (REQ-002, REQ-010)",
+    "[done] 6.1 Update docs/reference/backend/remote-actions-hooks.md — Add documentation for all 9 new built-in actions (parameters, output format, error cases), HookWatcher (config, behavior, lifecycle), Unix socket action server (API contract), and updated CLI commands. (REQ-001, REQ-002, REQ-003)",
+    "[done] 6.2 Update docs/reference/backend/metrics-collection.md — Document SystemReader implementation (Linux /proc sources), new LoadAvg fields in SystemStats, AgentStatsCollector (Group='agent', fields), PacketLossPercent in TunnelStats. (REQ-004, REQ-008, REQ-009)",
+    "[done] 6.3 Update docs/reference/backend/log-forwarding.md — Document JournalReader implementation (journalctl subprocess, cursor tracking), FileSource (glob, offset tracking, rotation, truncation), LogFilter (severity/unit/path filtering, config). (REQ-005, REQ-006, REQ-007)"
   ],
   "test_specifications": [
     {
@@ -714,6 +714,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-14T17:46:53.614784"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T11:57:04.018785"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T18:35:23.236780"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T18:35:23.286857"
     }
   },
   "execution_history": [
@@ -727,6 +739,68 @@
           "name": "prepare",
           "duration": 376.42427372932434,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "1c07956b-92a9-4095-aad7-379fc3921cfb",
+      "timestamp": "2026-02-15T18:17:42.829872",
+      "total_duration": 3934.2550020217896,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 261.17631006240845,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (3 tasks)",
+          "duration": 416.3252007961273,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (4 tasks)",
+          "duration": 415.8875632286072,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (4 tasks)",
+          "duration": 373.8369724750519,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 5 (3 tasks)",
+          "duration": 1056.3835816383362,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 6 (3 tasks)",
+          "duration": 248.20766305923462,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0029] Code Review",
+          "duration": 432.1689991950989,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0029] Improvements",
+          "duration": 563.9067997932434,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0029] Simplify",
+          "duration": 166.36191177368164,
+          "type": "simplify",
           "status": "done"
         }
       ]

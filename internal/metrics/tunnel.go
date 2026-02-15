@@ -21,6 +21,7 @@ type TunnelStats struct {
 	TxBytes            uint64    `json:"tx_bytes"`
 	HandshakeSucceeded bool      `json:"handshake_succeeded"`
 	HandshakeStale     bool      `json:"handshake_stale"`
+	PacketLossPercent  float64   `json:"packet_loss_percent"`
 }
 
 // TunnelStatsReader abstracts WireGuard tunnel stats retrieval.

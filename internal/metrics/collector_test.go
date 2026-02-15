@@ -12,4 +12,7 @@ func TestGroupConstants(t *testing.T) {
 	if GroupLatency != "latency" {
 		t.Errorf("GroupLatency = %q, want %q", GroupLatency, "latency")
 	}
+	if GroupAgent != "agent" {
+		t.Errorf("GroupAgent = %q, want %q", GroupAgent, "agent")
+	}
 }

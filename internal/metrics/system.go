@@ -19,6 +19,9 @@ type SystemStats struct {
 	DiskTotalBytes   uint64  `json:"disk_total_bytes"`
 	NetworkRxBytes   uint64  `json:"network_rx_bytes"`
 	NetworkTxBytes   uint64  `json:"network_tx_bytes"`
+	LoadAvg1         float64 `json:"load_avg_1"`
+	LoadAvg5         float64 `json:"load_avg_5"`
+	LoadAvg15        float64 `json:"load_avg_15"`
 }
 
 // SystemReader abstracts OS-level system metrics retrieval.

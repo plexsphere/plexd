@@ -17,13 +17,25 @@ type SecretFetcher interface {
 	FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
 }
 
+// ActionProvider supplies action and hook information to the local API.
+type ActionProvider interface {
+	Capabilities() ([]api.ActionInfo, []api.HookInfo)
+}
+
+// HookReloader triggers a re-scan of hooks from the filesystem.
+type HookReloader interface {
+	Hooks() []api.HookInfo
+}
+
 // Handler provides HTTP handlers for the local node API.
 type Handler struct {
-	cache         *StateCache
-	secretFetcher SecretFetcher
-	nodeID        string
-	nsk           []byte
-	logger        *slog.Logger
+	cache          *StateCache
+	secretFetcher  SecretFetcher
+	actionProvider ActionProvider
+	hookReloader   HookReloader
+	nodeID         string
+	nsk            []byte
+	logger         *slog.Logger
 }
 
 // NewHandler creates a new Handler.
@@ -35,6 +47,16 @@ func NewHandler(cache *StateCache, secretFetcher SecretFetcher, nodeID string, n
 		nsk:           nsk,
 		logger:        logger.With("component", "nodeapi"),
 	}
+}
+
+// SetActionProvider sets the action provider for action/hook endpoints.
+func (h *Handler) SetActionProvider(provider ActionProvider) {
+	h.actionProvider = provider
+}
+
+// SetHookReloader sets the hook reloader for the reload endpoint.
+func (h *Handler) SetHookReloader(reloader HookReloader) {
+	h.hookReloader = reloader
 }
 
 // Mux returns a configured ServeMux with all local node API routes.
@@ -51,6 +73,10 @@ func (h *Handler) Mux() *http.ServeMux {
 	mux.HandleFunc("GET /v1/state/report/{key}", h.handleGetReportKey)
 	mux.HandleFunc("PUT /v1/state/report/{key}", h.handlePutReport)
 	mux.HandleFunc("DELETE /v1/state/report/{key}", h.handleDeleteReport)
+	mux.HandleFunc("GET /v1/actions", h.handleGetActions)
+	mux.HandleFunc("POST /v1/actions/run", h.handleRunAction)
+	mux.HandleFunc("GET /v1/hooks", h.handleGetHooks)
+	mux.HandleFunc("POST /v1/hooks/reload", h.handleReloadHooks)
 	return mux
 }
 
@@ -298,6 +324,136 @@ func (h *Handler) handleDeleteReport(w http.ResponseWriter, r *http.Request) {
 // directory reference '.'.
 func validReportKey(key string) bool {
 	return key != "" && key != "." && key != ".." && !strings.ContainsAny(key, "/\\")
+}
+
+// actionsResponse is the response for GET /v1/actions.
+type actionsResponse struct {
+	BuiltinActions []api.ActionInfo `json:"builtin_actions"`
+	Hooks          []api.HookInfo   `json:"hooks"`
+}
+
+func (h *Handler) handleGetActions(w http.ResponseWriter, _ *http.Request) {
+	if h.actionProvider == nil {
+		writeJSON(w, http.StatusOK, actionsResponse{
+			BuiltinActions: []api.ActionInfo{},
+			Hooks:          []api.HookInfo{},
+		})
+		return
+	}
+	actions, hooks := h.actionProvider.Capabilities()
+	if actions == nil {
+		actions = []api.ActionInfo{}
+	}
+	if hooks == nil {
+		hooks = []api.HookInfo{}
+	}
+	writeJSON(w, http.StatusOK, actionsResponse{
+		BuiltinActions: actions,
+		Hooks:          hooks,
+	})
+}
+
+// maxRunActionBodyBytes is the maximum allowed request body for POST /v1/actions/run.
+const maxRunActionBodyBytes = 64 << 10 // 64 KiB
+
+// runActionRequest is the request body for POST /v1/actions/run.
+type runActionRequest struct {
+	Action     string            `json:"action"`
+	Parameters map[string]string `json:"parameters,omitempty"`
+	Timeout    string            `json:"timeout,omitempty"`
+}
+
+// runActionResponse is the response for POST /v1/actions/run.
+type runActionResponse struct {
+	Status   string `json:"status"`
+	ExitCode int    `json:"exit_code"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+}
+
+// LocalActionRunner runs a built-in action synchronously and returns output.
+type LocalActionRunner interface {
+	RunLocal(ctx context.Context, action string, params map[string]string) (stdout, stderr string, exitCode int, err error)
+}
+
+func (h *Handler) handleRunAction(w http.ResponseWriter, r *http.Request) {
+	if h.actionProvider == nil {
+		writeError(w, http.StatusServiceUnavailable, "actions not available")
+		return
+	}
+
+	runner, ok := h.actionProvider.(LocalActionRunner)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "local action execution not available")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxRunActionBodyBytes)
+
+	var req runActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Action == "" {
+		writeError(w, http.StatusBadRequest, "action is required")
+		return
+	}
+
+	stdout, stderr, exitCode, err := runner.RunLocal(r.Context(), req.Action, req.Parameters)
+	if err != nil {
+		writeJSON(w, http.StatusOK, runActionResponse{
+			Status:   "error",
+			ExitCode: exitCode,
+			Stdout:   stdout,
+			Stderr:   err.Error(),
+		})
+		return
+	}
+
+	status := "success"
+	if exitCode != 0 {
+		status = "failed"
+	}
+	writeJSON(w, http.StatusOK, runActionResponse{
+		Status:   status,
+		ExitCode: exitCode,
+		Stdout:   stdout,
+		Stderr:   stderr,
+	})
+}
+
+func (h *Handler) handleGetHooks(w http.ResponseWriter, _ *http.Request) {
+	if h.actionProvider == nil {
+		writeJSON(w, http.StatusOK, []api.HookInfo{})
+		return
+	}
+	_, hooks := h.actionProvider.Capabilities()
+	if hooks == nil {
+		hooks = []api.HookInfo{}
+	}
+	writeJSON(w, http.StatusOK, hooks)
+}
+
+// hooksReloadResponse is the response for POST /v1/hooks/reload.
+type hooksReloadResponse struct {
+	Status string         `json:"status"`
+	Hooks  []api.HookInfo `json:"hooks"`
+}
+
+func (h *Handler) handleReloadHooks(w http.ResponseWriter, _ *http.Request) {
+	if h.hookReloader == nil {
+		writeError(w, http.StatusServiceUnavailable, "hook reloader not available")
+		return
+	}
+	hooks := h.hookReloader.Hooks()
+	if hooks == nil {
+		hooks = []api.HookInfo{}
+	}
+	writeJSON(w, http.StatusOK, hooksReloadResponse{
+		Status: "reloaded",
+		Hooks:  hooks,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

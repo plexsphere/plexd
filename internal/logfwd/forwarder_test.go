@@ -466,6 +466,64 @@ func TestForwarder_Run_MultipleSources(t *testing.T) {
 	}
 }
 
+func TestForwarder_Run_FilterWrapsSource(t *testing.T) {
+	cfg := Config{
+		Enabled:         true,
+		CollectInterval: time.Hour,
+		ReportInterval:  time.Hour,
+		BatchSize:       100,
+		Filter:          FilterConfig{MinSeverity: "warning"},
+	}
+	entries := []api.LogEntry{
+		{Timestamp: time.Now(), Source: "test", Severity: "err", Message: "keep"},
+		{Timestamp: time.Now(), Source: "test", Severity: "debug", Message: "drop"},
+		{Timestamp: time.Now(), Source: "test", Severity: "warning", Message: "keep2"},
+	}
+	src := &mockLogSource{entries: entries}
+	rep := &mockLogReporter{}
+	f := NewForwarder(cfg, []LogSource{src}, rep, "node-1", "host-1", discardLogger())
+
+	// Collect directly.
+	f.collect(context.Background())
+
+	f.mu.Lock()
+	bufLen := len(f.buffer)
+	var msgs []string
+	for _, e := range f.buffer {
+		msgs = append(msgs, e.Message)
+	}
+	f.mu.Unlock()
+
+	if bufLen != 2 {
+		t.Fatalf("buffer len = %d, want 2 (debug filtered out), msgs = %v", bufLen, msgs)
+	}
+}
+
+func TestForwarder_Run_NoFilterWhenEmpty(t *testing.T) {
+	cfg := Config{
+		Enabled:         true,
+		CollectInterval: time.Hour,
+		ReportInterval:  time.Hour,
+		BatchSize:       100,
+	}
+	entries := []api.LogEntry{
+		{Timestamp: time.Now(), Source: "test", Severity: "debug", Message: "keep"},
+	}
+	src := &mockLogSource{entries: entries}
+	rep := &mockLogReporter{}
+	f := NewForwarder(cfg, []LogSource{src}, rep, "node-1", "host-1", discardLogger())
+
+	f.collect(context.Background())
+
+	f.mu.Lock()
+	bufLen := len(f.buffer)
+	f.mu.Unlock()
+
+	if bufLen != 1 {
+		t.Fatalf("buffer len = %d, want 1 (no filter applied)", bufLen)
+	}
+}
+
 func TestForwarder_Run_DropsOldestLogsWarning(t *testing.T) {
 	handler := &capturingHandler{}
 	logger := slog.New(handler)

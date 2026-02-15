@@ -29,6 +29,9 @@ type Server struct {
 	nsk    []byte
 	logger *slog.Logger
 	cache  *StateCache
+
+	actionProvider ActionProvider
+	hookReloader   HookReloader
 }
 
 // NewServer creates a new Server. Config defaults are applied automatically.
@@ -49,6 +52,18 @@ func NewServer(cfg Config, client NodeAPIClient, nsk []byte, logger *slog.Logger
 	}
 }
 
+// SetActionProvider sets the action provider for action/hook endpoints.
+// Must be called before Start.
+func (s *Server) SetActionProvider(provider ActionProvider) {
+	s.actionProvider = provider
+}
+
+// SetHookReloader sets the hook reloader for the reload endpoint.
+// Must be called before Start.
+func (s *Server) SetHookReloader(reloader HookReloader) {
+	s.hookReloader = reloader
+}
+
 // Start initializes and runs the server. It blocks until ctx is cancelled.
 func (s *Server) Start(ctx context.Context, nodeID string) error {
 	if err := s.cfg.Validate(); err != nil {
@@ -65,6 +80,8 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 
 	// Set up HTTP handler.
 	handler := NewHandler(s.cache, s.client, nodeID, s.nsk, s.logger)
+	handler.SetActionProvider(s.actionProvider)
+	handler.SetHookReloader(s.hookReloader)
 	mux := handler.Mux()
 
 	// Wrap mux with a report-sync notifier.

@@ -25,8 +25,19 @@ type Forwarder struct {
 }
 
 // NewForwarder creates a new Forwarder. Config defaults are applied automatically.
+// When cfg.Filter is non-empty, all sources are wrapped with a FilteringSource.
 func NewForwarder(cfg Config, sources []LogSource, reporter LogReporter, nodeID string, hostname string, logger *slog.Logger) *Forwarder {
 	cfg.ApplyDefaults()
+
+	// Wrap sources with filter when configured.
+	if !cfg.Filter.IsEmpty() {
+		wrapped := make([]LogSource, len(sources))
+		for i, s := range sources {
+			wrapped[i] = NewFilteringSource(s, cfg.Filter)
+		}
+		sources = wrapped
+	}
+
 	return &Forwarder{
 		cfg:      cfg,
 		sources:  sources,

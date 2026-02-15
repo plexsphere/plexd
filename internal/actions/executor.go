@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -245,14 +246,16 @@ func (e *Executor) runAction(ctx context.Context, nodeID string, req api.ActionR
 
 	defer func() {
 		if r := recover(); r != nil {
+			stack := debug.Stack()
 			e.logger.Error("panic in action execution",
 				"execution_id", req.ExecutionID,
 				"panic", fmt.Sprintf("%v", r),
+				"stack", string(stack),
 			)
 			result := api.ExecutionResult{
 				ExecutionID: req.ExecutionID,
 				Status:      "error",
-				Stderr:      fmt.Sprintf("panic: %v", r),
+				Stderr:      fmt.Sprintf("panic: %v\n%s", r, stack),
 				FinishedAt:  time.Now().UTC(),
 				TriggeredBy: req.TriggeredBy,
 			}
@@ -318,6 +321,21 @@ func (e *Executor) runAction(ctx context.Context, nodeID string, req api.ActionR
 		"status", status,
 		"duration", duration,
 	)
+}
+
+// RunLocal executes a built-in action synchronously and returns the output.
+// This is used by the local node API for CLI-triggered action execution.
+// Only built-in actions are supported; hook execution requires control plane checksum.
+func (e *Executor) RunLocal(ctx context.Context, action string, params map[string]string) (string, string, int, error) {
+	e.mu.Lock()
+	_, ok := e.builtins[action]
+	e.mu.Unlock()
+
+	if !ok {
+		return "", "", 1, fmt.Errorf("unknown builtin action: %s", action)
+	}
+
+	return e.runBuiltin(ctx, action, params)
 }
 
 func (e *Executor) runBuiltin(ctx context.Context, name string, params map[string]string) (string, string, int, error) {

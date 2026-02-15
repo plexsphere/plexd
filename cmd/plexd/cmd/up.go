@@ -9,14 +9,21 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/spf13/cobra"
 
+	"github.com/plexsphere/plexd/internal/actions"
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/integrity"
+	"github.com/plexsphere/plexd/internal/logfwd"
+	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/nodeapi"
 	"github.com/plexsphere/plexd/internal/reconcile"
 	"github.com/plexsphere/plexd/internal/registration"
@@ -141,11 +148,65 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		reconciler.TriggerReconcile()
 	})
 
-	// 9. Create node API server.
+	// 9. Create integrity verifier for hook execution.
+	integrityStore, err := integrity.NewStore(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("plexd up: integrity store: %w", err)
+	}
+	integrityVerifier := integrity.NewVerifier(cfg.Integrity, integrityStore, &controlPlaneReporter{cp: client}, logger)
+
+	// Record start time for uptime calculations.
+	startTime := time.Now()
+
+	// 10. Create action executor and register built-in actions.
+	executor := actions.NewExecutor(cfg.Actions, client, integrityVerifier, logger)
+
+	nodeInfo := &agentNodeInfo{nodeID: identity.NodeID, meshIP: identity.MeshIP}
+	executor.RegisterBuiltin("gather_info", "Collect system and mesh info", nil, actions.GatherInfo(nodeInfo))
+	executor.RegisterBuiltin("ping", "Test connectivity to a target IP",
+		[]api.ActionParam{{Name: "target", Type: "string", Required: true, Description: "Target IP address"}},
+		actions.Ping(nodeInfo))
+	executor.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics", nil, actions.DiagnosticsCollect())
+	executor.RegisterBuiltin("diagnostics.traceroute_peer", "Traceroute to a peer",
+		[]api.ActionParam{{Name: "target", Type: "string", Required: true, Description: "Target IP address"}},
+		actions.DiagnosticsTraceroutePeer(nodeInfo))
+	executor.RegisterBuiltin("service.restart", "Restart plexd service", nil, actions.ServiceRestart())
+	executor.RegisterBuiltin("service.reload_config", "Reload configuration (SIGHUP)", nil, actions.ServiceReloadConfig())
+	executor.RegisterBuiltin("service.upgrade", "Upgrade plexd (placeholder)", nil, actions.ServiceUpgrade())
+	executor.RegisterBuiltin("health.check", "Check node health status", nil,
+		actions.HealthCheck(&agentHealthProvider{startTime: startTime}))
+	executor.RegisterBuiltin("mesh.reconnect", "Reconnect mesh tunnels", nil,
+		actions.MeshReconnect(&agentMeshReconnector{reconciler: reconciler}))
+	executor.RegisterBuiltin("config.dump", "Dump sanitized configuration", nil,
+		actions.ConfigDump(&agentConfigProvider{cfg: cfg}))
+	executor.RegisterBuiltin("logs.snapshot", "Snapshot recent log lines",
+		[]api.ActionParam{{Name: "lines", Type: "string", Required: false, Description: "Number of lines (default 100, max 10000)"}},
+		actions.LogsSnapshot(&agentLogProvider{}))
+
+	// Register action_request SSE handler.
+	sseMgr.RegisterHandler(api.EventActionRequest, actions.HandleActionRequest(executor, identity.NodeID, logger))
+
+	// 11. Create hook watcher.
+	hookWatcher := actions.NewHookWatcher(
+		cfg.Actions.HooksDir,
+		executor.SetHooks,
+		func(hookName, oldChecksum, newChecksum string) {
+			logger.Warn("hook integrity change detected",
+				"hook", hookName,
+				"old_checksum", oldChecksum,
+				"new_checksum", newChecksum,
+			)
+		},
+		logger,
+	)
+
+	// 12. Create node API server.
 	cfg.NodeAPI.DataDir = cfg.DataDir
 	cfg.NodeAPI.SecretAuthEnabled = true
 	nsk := []byte(identity.NodeSecretKey)
 	nodeAPISrv := nodeapi.NewServer(cfg.NodeAPI, client, nsk, logger)
+	nodeAPISrv.SetActionProvider(executor)
+	nodeAPISrv.SetHookReloader(hookWatcher)
 
 	// Register nodeapi reconcile handler so cache updates on drift.
 	reconciler.RegisterHandler(nodeAPISrv.ReconcileHandler())
@@ -160,10 +221,29 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		return nil
 	})
 
+	// 13. Create metrics collectors and manager.
+	var metricsCollectors []metrics.Collector
+	if sysReader := newSystemReader(); sysReader != nil {
+		metricsCollectors = append(metricsCollectors, metrics.NewSystemCollector(sysReader, logger))
+	}
+	metricsCollectors = append(metricsCollectors, metrics.NewAgentStatsCollector(startTime, nil, logger))
+	metricsMgr := metrics.NewManager(cfg.Metrics, metricsCollectors, client, identity.NodeID, logger)
+
+	// 14. Create log forwarding sources and forwarder.
+	hostname, _ := os.Hostname()
+	var logSources []logfwd.LogSource
+	if journalReader := newJournalReader(); journalReader != nil {
+		logSources = append(logSources, logfwd.NewJournaldSource(journalReader, hostname, logger))
+	}
+	for _, pattern := range cfg.LogFwd.FilePatterns {
+		logSources = append(logSources, logfwd.NewFileSource(pattern, hostname, logger))
+	}
+	logForwarder := logfwd.NewForwarder(cfg.LogFwd, logSources, client, identity.NodeID, hostname, logger)
+
 	// Wait group for all goroutines.
 	var wg sync.WaitGroup
 
-	// 10. Start SSE manager.
+	// 15. Start SSE manager.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -172,14 +252,14 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// 11. Start heartbeat.
+	// 16. Start heartbeat.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		_ = heartbeat.Run(ctx)
 	}()
 
-	// 12. Start reconciler.
+	// 17. Start reconciler.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -188,7 +268,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// 13. Start node API server.
+	// 18. Start node API server.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -197,12 +277,40 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
+	// 19. Start hook watcher.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := hookWatcher.Watch(ctx); err != nil {
+			logger.Error("hook watcher stopped", "error", err)
+		}
+	}()
+
+	// 20. Start metrics manager.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := metricsMgr.Run(ctx); err != nil {
+			logger.Error("metrics manager stopped", "error", err)
+		}
+	}()
+
+	// 21. Start log forwarder.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := logForwarder.Run(ctx); err != nil {
+			logger.Error("log forwarder stopped", "error", err)
+		}
+	}()
+
 	// Wait for shutdown signal.
 	<-ctx.Done()
 	logger.Info("shutting down", "reason", ctx.Err())
 
-	// Graceful drain: stop SSE manager and wait for goroutines.
+	// Graceful drain: stop subsystems and wait for goroutines.
 	sseMgr.Shutdown()
+	executor.Shutdown(context.Background())
 
 	done := make(chan struct{})
 	go func() {
@@ -220,6 +328,90 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	logger.Info("plexd stopped")
 	return nil
 }
+
+// agentNodeInfo adapts agent identity to actions.NodeInfoProvider.
+type agentNodeInfo struct {
+	nodeID    string
+	meshIP    string
+	peerCount int
+}
+
+func (a *agentNodeInfo) NodeID() string { return a.nodeID }
+func (a *agentNodeInfo) MeshIP() string { return a.meshIP }
+func (a *agentNodeInfo) PeerCount() int { return a.peerCount }
+
+// agentHealthProvider adapts agent state to actions.HealthProvider.
+type agentHealthProvider struct {
+	startTime time.Time
+}
+
+func (a *agentHealthProvider) TunnelCount() int        { return 0 }
+func (a *agentHealthProvider) ConnectedPeers() int     { return 0 }
+func (a *agentHealthProvider) Uptime() time.Duration   { return time.Since(a.startTime) }
+func (a *agentHealthProvider) LastHeartbeat() time.Time { return time.Time{} }
+func (a *agentHealthProvider) LastReconcile() time.Time { return time.Time{} }
+
+// agentMeshReconnector adapts the reconciler to actions.MeshReconnector.
+type agentMeshReconnector struct {
+	reconciler *reconcile.Reconciler
+}
+
+func (a *agentMeshReconnector) Reconnect(_ context.Context) error {
+	a.reconciler.TriggerReconcile()
+	return nil
+}
+
+// agentConfigProvider adapts agent config to actions.ConfigProvider.
+type agentConfigProvider struct {
+	cfg *agent.AgentConfig
+}
+
+func (a *agentConfigProvider) DumpConfig() string {
+	data, err := yaml.Marshal(a.cfg)
+	if err != nil {
+		return "# error dumping config: " + err.Error()
+	}
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		lines[i] = redactSensitiveLine(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// sensitiveKeywords are YAML key substrings that trigger value redaction.
+var sensitiveKeywords = []string{"secret", "token", "key", "password"}
+
+// redactSensitiveLine replaces the value portion of a YAML line if its key
+// contains a sensitive keyword. Lines without a colon or with empty/quoted-empty
+// values are returned unchanged.
+func redactSensitiveLine(line string) string {
+	if !strings.Contains(line, ":") {
+		return line
+	}
+	lower := strings.ToLower(line)
+	for _, kw := range sensitiveKeywords {
+		if !strings.Contains(lower, kw) {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			return line
+		}
+		val := strings.TrimSpace(parts[1])
+		if val == "" || val == "''" || val == `""` {
+			return line
+		}
+		return parts[0] + ": '[REDACTED]'"
+	}
+	return line
+}
+
+// agentLogProvider adapts to actions.LogProvider.
+// Currently returns an empty snapshot; will be wired to a ring buffer
+// when the log capture component is available.
+type agentLogProvider struct{}
+
+func (a *agentLogProvider) RecentLines(_ int) []string { return nil }
 
 // decodeSigningKeys decodes base64-encoded signing keys from an api.SigningKeys
 // struct into ed25519 public keys for use with the Ed25519Verifier.
@@ -244,6 +436,13 @@ func decodeSigningKeys(keys api.SigningKeys, logger *slog.Logger) (current, prev
 		transitionExpires = *keys.TransitionExpires
 	}
 	return current, previous, transitionExpires
+}
+
+// controlPlaneReporter adapts api.ControlPlane to the integrity.ViolationReporter interface.
+type controlPlaneReporter struct{ cp *api.ControlPlane }
+
+func (r *controlPlaneReporter) ReportViolation(ctx context.Context, nodeID string, report api.IntegrityViolationReport) error {
+	return r.cp.ReportIntegrityViolation(ctx, nodeID, report)
 }
 
 func setupLogger(level string) *slog.Logger {

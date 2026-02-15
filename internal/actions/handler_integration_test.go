@@ -617,3 +617,114 @@ func TestIntegration_ShutdownCancelsExecutions(t *testing.T) {
 	}
 }
 
+// TestIntegration_WatcherFeedsExecutor verifies that HookWatcher dynamically
+// updates the Executor's hooks list via the onChange → SetHooks integration.
+func TestIntegration_WatcherFeedsExecutor(t *testing.T) {
+	hooksDir := t.TempDir()
+
+	reporter := &integrationReporter{}
+	verifier := newRealVerifier(t)
+
+	cfg := Config{
+		Enabled:          true,
+		HooksDir:         hooksDir,
+		MaxConcurrent:    5,
+		MaxActionTimeout: 10 * time.Minute,
+		MaxOutputBytes:   1 << 20,
+	}
+	exec := NewExecutor(cfg, reporter, verifier, integrationLogger())
+
+	// Wire HookWatcher onChange to executor.SetHooks — this is the integration point.
+	watcher := NewHookWatcher(hooksDir, exec.SetHooks, nil, integrationLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	watchDone := make(chan error, 1)
+	go func() { watchDone <- watcher.Watch(ctx) }()
+
+	// Wait for initial scan (empty directory).
+	time.Sleep(200 * time.Millisecond)
+
+	// Executor should have no hooks.
+	_, hooks := exec.Capabilities()
+	if len(hooks) != 0 {
+		t.Fatalf("initial hooks = %d, want 0", len(hooks))
+	}
+
+	// --- Add a hook file ---
+	hookContent := "#!/bin/sh\necho watcher-integration\n"
+	hookPath := filepath.Join(hooksDir, "watcher-hook")
+	if err := os.WriteFile(hookPath, []byte(hookContent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	hookChecksum, err := integrity.HashFile(hookPath)
+	if err != nil {
+		t.Fatalf("hash hook: %v", err)
+	}
+
+	// Wait for watcher debounce + processing.
+	time.Sleep(500 * time.Millisecond)
+
+	// Executor should now have the hook.
+	_, hooks = exec.Capabilities()
+	if len(hooks) != 1 {
+		t.Fatalf("hooks after add = %d, want 1", len(hooks))
+	}
+	if hooks[0].Name != "watcher-hook" {
+		t.Errorf("hook name = %q, want %q", hooks[0].Name, "watcher-hook")
+	}
+	if hooks[0].Checksum != hookChecksum {
+		t.Errorf("hook checksum = %q, want %q", hooks[0].Checksum, hookChecksum)
+	}
+
+	// --- Execute the hook through the handler ---
+	handler := HandleActionRequest(exec, "node-watcher", integrationLogger())
+	req := api.ActionRequest{
+		ExecutionID: "integ-watcher-001",
+		Action:      "watcher-hook",
+		Timeout:     "30s",
+		Checksum:    hookChecksum,
+	}
+	if err := handler(context.Background(), integrationEnvelope(t, req)); err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+
+	integrationWaitFor(t, 5*time.Second, func() bool {
+		return reporter.resultCount() > 0
+	})
+
+	results := reporter.getResults()
+	if results[0].Status != "success" {
+		t.Errorf("result status = %q, want success", results[0].Status)
+	}
+	if !strings.Contains(results[0].Stdout, "watcher-integration") {
+		t.Errorf("stdout = %q, want to contain 'watcher-integration'", results[0].Stdout)
+	}
+
+	// --- Remove the hook file ---
+	if err := os.Remove(hookPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for watcher debounce + processing.
+	time.Sleep(500 * time.Millisecond)
+
+	// Executor should have no hooks again.
+	_, hooks = exec.Capabilities()
+	if len(hooks) != 0 {
+		t.Fatalf("hooks after remove = %d, want 0", len(hooks))
+	}
+
+	cancel()
+	select {
+	case err := <-watchDone:
+		if err != nil {
+			t.Fatalf("Watch() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher did not exit")
+	}
+}
+

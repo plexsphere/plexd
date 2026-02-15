@@ -212,3 +212,74 @@ func TestTunnelCollector_CustomThresholdNegativeFallsBack(t *testing.T) {
 		t.Errorf("staleThreshold = %v, want %v (fallback for negative)", c.staleThreshold, DefaultStaleThreshold)
 	}
 }
+
+func TestTunnelCollector_PacketLossField(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	reader := &mockTunnelStatsReader{
+		stats: []TunnelStats{
+			{
+				PeerID:            "peer-measured",
+				LastHandshakeTime: now,
+				PacketLossPercent: 2.5,
+			},
+			{
+				PeerID:            "peer-unavailable",
+				LastHandshakeTime: now,
+				PacketLossPercent: -1,
+			},
+		},
+	}
+	c := NewTunnelCollector(reader, discardLogger())
+
+	points, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	if len(points) != 2 {
+		t.Fatalf("len(points) = %d, want 2", len(points))
+	}
+
+	// Peer with measured packet loss.
+	var measured TunnelStats
+	if err := json.Unmarshal(points[0].Data, &measured); err != nil {
+		t.Fatalf("unmarshal peer-measured: %v", err)
+	}
+	if measured.PacketLossPercent != 2.5 {
+		t.Errorf("PacketLossPercent = %v, want 2.5", measured.PacketLossPercent)
+	}
+
+	// Peer with unavailable packet loss (-1).
+	var unavailable TunnelStats
+	if err := json.Unmarshal(points[1].Data, &unavailable); err != nil {
+		t.Fatalf("unmarshal peer-unavailable: %v", err)
+	}
+	if unavailable.PacketLossPercent != -1 {
+		t.Errorf("PacketLossPercent = %v, want -1", unavailable.PacketLossPercent)
+	}
+}
+
+func TestTunnelCollector_PacketLossInJSON(t *testing.T) {
+	reader := &mockTunnelStatsReader{
+		stats: []TunnelStats{
+			{
+				PeerID:            "peer-a",
+				LastHandshakeTime: time.Now(),
+				PacketLossPercent: 0,
+			},
+		},
+	}
+	c := NewTunnelCollector(reader, discardLogger())
+
+	points, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal(points[0].Data, &raw); err != nil {
+		t.Fatalf("json.Unmarshal(Data) error = %v", err)
+	}
+	if _, ok := raw["packet_loss_percent"]; !ok {
+		t.Error("JSON output missing key \"packet_loss_percent\"")
+	}
+}

@@ -11,6 +11,7 @@ const (
 	GroupSystem  = "system"
 	GroupTunnel  = "tunnel"
 	GroupLatency = "latency"
+	GroupAgent   = "agent"
 )
 
 // Collector collects metrics from a specific subsystem.
