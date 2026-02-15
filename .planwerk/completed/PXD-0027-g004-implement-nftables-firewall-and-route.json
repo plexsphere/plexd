@@ -2,8 +2,8 @@
   "feature_id": "PXD-0027",
   "title": "G004: Implement nftables firewall and route controller",
   "slug": "g004-implement-nftables-firewall-and-route",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** backend\n**Priority:** high\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nImplement production policy enforcement backends:\n\n**nftables FirewallController:** Concrete implementation using `google/nftables` library. Manages nftables chains and rules with diff-based updates (add/remove only changed rules). Integrates with existing `Enforcer` in `internal/policy/firewall.go` which currently degrades gracefully when controller is nil.\n\n**RouteController:** Concrete implementation using `vishvananda/netlink` for Linux routing operations. Enable IP forwarding via sysctl, add/remove routes for mesh peers, configure NAT masquerade for bridge traffic. Implements the interface defined in `internal/bridge/route.go`.\n\n**Rationale:** Without firewall enforcement, mesh network policies defined in the control plane have no effect - any traffic flows freely between peers. Without route controller, bridge mode cannot forward traffic between networks, breaking the core site-to-site and user-access use cases.\n\n**Affected Areas:**\n- internal/policy/nftables.go\n- internal/bridge/route_linux.go\n- go.mod",
   "stories": [
@@ -396,16 +396,16 @@
     }
   ],
   "tasks": [
-    "1.1 Add google/nftables, vishvananda/netlink, and golang.org/x/sys dependencies to go.mod: run `go get github.com/google/nftables github.com/vishvananda/netlink golang.org/x/sys` then `go mod tidy`. Verify go build ./... succeeds. (REQ-008)",
-    "1.2 Create internal/policy/nftables_linux.go — NftablesController struct with `//go:build linux` tag. Constructor NewNftablesController(logger *slog.Logger) that creates nftables.Conn and defines the plexd table (TableFamilyIPv4, name 'plexd'). Implement EnsureChain: AddTable + AddChain (type ChainTypeFilter, hook ChainHookForward, priority ChainPriorityFilter) + Flush(). Idempotent: AddTable and AddChain are inherently idempotent in google/nftables. Implement FlushChain: conn.FlushChain on the named chain + Flush(). Implement DeleteChain: conn.DelChain + Flush(), suppressing 'not found' errors for idempotency. All errors follow 'nftables: <method>: <detail>' wrapping pattern. (REQ-001, REQ-003, REQ-006)",
-    "1.3 Implement ApplyRules in internal/policy/nftables_linux.go — Method on NftablesController. Flush the chain first (conn.FlushChain), then for each FirewallRule: build nftables expression slice using helper buildRuleExprs(rule FirewallRule) []expr.Any. Expression logic: (1) if Interface set, add MetaKeyIIFNAME + Cmp; (2) if SrcIP set and not '0.0.0.0/0', parse IP/CIDR, add PayloadBaseNetworkHeader offset=12 + Cmp or Bitwise+Cmp for CIDR; (3) if DstIP set and not '0.0.0.0/0', same at offset=16; (4) if Protocol set, add MetaKeyL4PROTO + Cmp with unix.IPPROTO_TCP or IPPROTO_UDP; (5) if Port>0, add PayloadBaseTransportHeader offset=2 len=2 + Cmp with BigEndian port; (6) add Verdict (VerdictAccept for 'allow', VerdictDrop for 'deny'). Call conn.AddRule for each. Final conn.Flush(). (REQ-002, REQ-009)",
-    "1.4 Create internal/policy/nftables_linux_test.go — Tests with `//go:build linux` tag. Use nftables.New(nftables.AsLasting()) for network-namespace-isolated testing (or skip if root unavailable). Tests: TestNftablesController_EnsureChain (create + idempotent), TestNftablesController_ApplyRules (allow+deny rules, verify via GetRules), TestNftablesController_ApplyRulesWithPortAndProtocol (Port=443 Protocol=tcp), TestNftablesController_ApplyRulesWithIPAddresses (SrcIP+DstIP), TestNftablesController_ApplyRulesWithCIDR (CIDR prefix match, 0.0.0.0/0 skip), TestNftablesController_ApplyRulesWithInterface (iifname match), TestNftablesController_FlushChain, TestNftablesController_DeleteChainIdempotent, TestNftablesController_DedicatedTable (verify table name='plexd'), TestNftablesController_ErrorWrapping. (REQ-001, REQ-002, REQ-003, REQ-006, REQ-009)",
-    "2.1 Create internal/bridge/route_linux.go — NetlinkRouteController struct with `//go:build linux` tag. Constructor NewNetlinkRouteController(logger *slog.Logger). Implement EnableForwarding(meshIface, accessIface): write '1' to /proc/sys/net/ipv4/conf/{iface}/forwarding for both interfaces via os.WriteFile. Implement DisableForwarding: write '0' to same paths. Errors follow 'route: enable forwarding: <path>: <detail>' pattern. (REQ-004, REQ-006)",
-    "2.2 Implement AddRoute and RemoveRoute in internal/bridge/route_linux.go — AddRoute: parse CIDR via net.ParseCIDR, look up interface index via netlink.LinkByName, create netlink.Route{Dst: subnet, LinkIndex: idx}, call netlink.RouteAdd. Suppress syscall.EEXIST for idempotency. RemoveRoute: same parse logic, call netlink.RouteDel, suppress syscall.ESRCH. Errors follow 'route: add route: <subnet>: <detail>' pattern. (REQ-004, REQ-006)",
-    "2.3 Implement AddNATMasquerade and RemoveNATMasquerade in internal/bridge/route_linux.go — Use google/nftables for NAT: create/reuse plexd-nat table (TableFamilyIPv4), add postrouting chain (ChainTypeNAT, ChainHookPostrouting, ChainPriorityNATSource). AddNATMasquerade: add rule matching MetaKeyOIFNAME for given interface + expr.Masq{} + Flush(). Track active masquerade rules. RemoveNATMasquerade: flush chain or delete matching rule + Flush(). Idempotent when no rule exists. (REQ-005, REQ-006)",
-    "2.4 Create internal/bridge/route_linux_test.go — Tests with `//go:build linux` tag. Test with network namespace isolation or skip if insufficient privileges. Tests: TestNetlinkRouteController_EnableForwarding, TestNetlinkRouteController_DisableForwarding, TestNetlinkRouteController_AddRoute (add + idempotent EEXIST), TestNetlinkRouteController_RemoveRouteIdempotent, TestNetlinkRouteController_AddNATMasquerade, TestNetlinkRouteController_RemoveNATMasqueradeIdempotent, TestNetlinkRouteController_ErrorWrapping, TestNetlinkRouteController_EnableForwardingError. (REQ-004, REQ-005, REQ-006)",
-    "3.1 Create docs/reference/backend/nftables-firewall.md — Reference documentation for NftablesController. Include: frontmatter (title, quadrant, package, feature), overview of nftables vs iptables, data flow diagram (PolicyEngine → Enforcer → NftablesController → kernel nftables), constructor signature and parameters, method reference table (EnsureChain, ApplyRules, FlushChain, DeleteChain with signatures and behavior), table/chain naming ('plexd' table, user-specified chain names), expression mapping table (FirewallRule field → nftables expression), required Linux capabilities (CAP_NET_ADMIN), dependency list (google/nftables, golang.org/x/sys/unix). Follow existing docs/reference/backend/network-policy.md format. (REQ-010)",
-    "3.2 Create docs/reference/backend/netlink-route-controller.md — Reference documentation for NetlinkRouteController. Include: frontmatter (title, quadrant, package, feature), overview of netlink route management, data flow diagram (Manager → NetlinkRouteController → kernel routing table / sysctl), constructor signature, method reference table (EnableForwarding, DisableForwarding, AddRoute, RemoveRoute, AddNATMasquerade, RemoveNATMasquerade with signatures, behavior, idempotency guarantees), sysctl paths table, NAT implementation details (plexd-nat table, postrouting chain), required Linux capabilities (CAP_NET_ADMIN, CAP_NET_RAW), dependency list (vishvananda/netlink, google/nftables for NAT). Follow existing docs/reference/backend/bridge-mode.md format. (REQ-010)"
+    "[done] 1.1 Add google/nftables and golang.org/x/sys dependencies to go.mod: run `go get github.com/google/nftables golang.org/x/sys` then `go mod tidy`. Note: vishvananda/netlink is already present from PXD-0026. Verify go build ./... succeeds. (REQ-008)",
+    "[done] 1.2 Create internal/policy/nftables_linux.go — NftablesController struct with `//go:build linux` tag. Constructor NewNftablesController(logger *slog.Logger) that creates nftables.Conn and defines the plexd table (TableFamilyIPv4, name 'plexd'). Implement EnsureChain: AddTable + AddChain (type ChainTypeFilter, hook ChainHookForward, priority ChainPriorityFilter) + Flush(). Idempotent: AddTable and AddChain are inherently idempotent in google/nftables. Implement FlushChain: conn.FlushChain on the named chain + Flush(). Implement DeleteChain: conn.DelChain + Flush(), suppressing 'not found' errors for idempotency. All errors follow 'nftables: <method>: <detail>' wrapping pattern. (REQ-001, REQ-003, REQ-006)",
+    "[done] 1.3 Implement ApplyRules in internal/policy/nftables_linux.go — Method on NftablesController. Flush the chain first (conn.FlushChain), then for each FirewallRule: build nftables expression slice using helper buildRuleExprs(rule FirewallRule) []expr.Any. Expression logic: (1) if Interface set, add MetaKeyIIFNAME + Cmp; (2) if SrcIP set and not '0.0.0.0/0', parse IP/CIDR, add PayloadBaseNetworkHeader offset=12 + Cmp or Bitwise+Cmp for CIDR; (3) if DstIP set and not '0.0.0.0/0', same at offset=16; (4) if Protocol set, add MetaKeyL4PROTO + Cmp with unix.IPPROTO_TCP or IPPROTO_UDP; (5) if Port>0, add PayloadBaseTransportHeader offset=2 len=2 + Cmp with BigEndian port; (6) add Verdict (VerdictAccept for 'allow', VerdictDrop for 'deny'). Call conn.AddRule for each. Final conn.Flush(). (REQ-002, REQ-009)",
+    "[done] 1.4 Create internal/policy/nftables_linux_test.go — Tests with `//go:build linux` tag. Use nftables.New(nftables.AsLasting()) for network-namespace-isolated testing (or skip if root unavailable). Tests: TestNftablesController_EnsureChain (create + idempotent), TestNftablesController_ApplyRules (allow+deny rules, verify via GetRules), TestNftablesController_ApplyRulesWithPortAndProtocol (Port=443 Protocol=tcp), TestNftablesController_ApplyRulesWithIPAddresses (SrcIP+DstIP), TestNftablesController_ApplyRulesWithCIDR (CIDR prefix match, 0.0.0.0/0 skip), TestNftablesController_ApplyRulesWithInterface (iifname match), TestNftablesController_FlushChain, TestNftablesController_DeleteChainIdempotent, TestNftablesController_DedicatedTable (verify table name='plexd'), TestNftablesController_ErrorWrapping. (REQ-001, REQ-002, REQ-003, REQ-006, REQ-009)",
+    "[done] 2.1 Create internal/bridge/route_linux.go — NetlinkRouteController struct with `//go:build linux` tag. Constructor NewNetlinkRouteController(logger *slog.Logger). Implement EnableForwarding(meshIface, accessIface): write '1' to /proc/sys/net/ipv4/conf/{iface}/forwarding for both interfaces via os.WriteFile. Implement DisableForwarding: write '0' to same paths. Errors follow 'route: enable forwarding: <path>: <detail>' pattern. (REQ-004, REQ-006)",
+    "[done] 2.2 Implement AddRoute and RemoveRoute in internal/bridge/route_linux.go — AddRoute: parse CIDR via net.ParseCIDR, look up interface index via netlink.LinkByName, create netlink.Route{Dst: subnet, LinkIndex: idx}, call netlink.RouteAdd. Suppress syscall.EEXIST for idempotency. RemoveRoute: same parse logic, call netlink.RouteDel, suppress syscall.ESRCH. Errors follow 'route: add route: <subnet>: <detail>' pattern. (REQ-004, REQ-006)",
+    "[done] 2.3 Implement AddNATMasquerade and RemoveNATMasquerade in internal/bridge/route_linux.go — Use google/nftables for NAT: create/reuse plexd-nat table (TableFamilyIPv4), add postrouting chain (ChainTypeNAT, ChainHookPostrouting, ChainPriorityNATSource). AddNATMasquerade: add rule matching MetaKeyOIFNAME for given interface + expr.Masq{} + Flush(). Track active masquerade rules. RemoveNATMasquerade: flush chain or delete matching rule + Flush(). Idempotent when no rule exists. (REQ-005, REQ-006)",
+    "[done] 2.4 Create internal/bridge/route_linux_test.go — Tests with `//go:build linux` tag. Test with network namespace isolation or skip if insufficient privileges. Tests: TestNetlinkRouteController_EnableForwarding, TestNetlinkRouteController_DisableForwarding, TestNetlinkRouteController_AddRoute (add + idempotent EEXIST), TestNetlinkRouteController_RemoveRouteIdempotent, TestNetlinkRouteController_AddNATMasquerade, TestNetlinkRouteController_RemoveNATMasqueradeIdempotent, TestNetlinkRouteController_ErrorWrapping, TestNetlinkRouteController_EnableForwardingError. (REQ-004, REQ-005, REQ-006)",
+    "[done] 3.1 Create docs/reference/backend/nftables-firewall.md — Reference documentation for NftablesController. Include: frontmatter (title, quadrant, package, feature), overview of nftables vs iptables, data flow diagram (PolicyEngine → Enforcer → NftablesController → kernel nftables), constructor signature and parameters, method reference table (EnsureChain, ApplyRules, FlushChain, DeleteChain with signatures and behavior), table/chain naming ('plexd' table, user-specified chain names), expression mapping table (FirewallRule field → nftables expression), required Linux capabilities (CAP_NET_ADMIN), dependency list (google/nftables, golang.org/x/sys/unix). Follow existing docs/reference/backend/network-policy.md format. (REQ-010)",
+    "[done] 3.2 Create docs/reference/backend/netlink-route-controller.md — Reference documentation for NetlinkRouteController. Include: frontmatter (title, quadrant, package, feature), overview of netlink route management, data flow diagram (Manager → NetlinkRouteController → kernel routing table / sysctl), constructor signature, method reference table (EnableForwarding, DisableForwarding, AddRoute, RemoveRoute, AddNATMasquerade, RemoveNATMasquerade with signatures, behavior, idempotency guarantees), sysctl paths table, NAT implementation details (plexd-nat table, postrouting chain), required Linux capabilities (CAP_NET_ADMIN, CAP_NET_RAW), dependency list (vishvananda/netlink, google/nftables for NAT). Follow existing docs/reference/backend/bridge-mode.md format. (REQ-010)"
   ],
   "test_specifications": [
     {
@@ -565,6 +565,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-14T10:16:49.216662"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-14T23:05:52.214141"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T08:40:53.618318"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T08:40:53.665966"
     }
   },
   "execution_history": [
@@ -578,6 +590,50 @@
           "name": "prepare",
           "duration": 280.0476667881012,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "a39baa67-ac0f-439d-85c3-51dbdc27eb87",
+      "timestamp": "2026-02-14T23:30:52.255909",
+      "total_duration": 1312.3624279499054,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 352.81895685195923,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (4 tasks)",
+          "duration": 166.31028199195862,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (2 tasks)",
+          "duration": 123.51507639884949,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0027] Code Review",
+          "duration": 247.18733716011047,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0027] Improvements",
+          "duration": 266.73757696151733,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0027] Simplify",
+          "duration": 155.79319858551025,
+          "type": "simplify",
           "status": "done"
         }
       ]

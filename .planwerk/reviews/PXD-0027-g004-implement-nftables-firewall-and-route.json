@@ -1,0 +1,172 @@
+{
+  "feature_id": "PXD-0027",
+  "title": "G004: Implement nftables firewall and route controller",
+  "date": "2026-02-14",
+  "verdict": "BLOCKED",
+  "summary": "NftablesController and NetlinkRouteController implement the FirewallController and RouteController interfaces respectively. go build, go vet, and all tests pass. Dependencies are correct. Documentation is comprehensive. However, two blocking defects render the firewall subsystem non-functional: (1) EnsureChain creates a regular (non-base) chain with no netfilter hook, so rules are never evaluated by the kernel for any traffic; (2) buildRuleExprs ignores the FirewallRule.Interface field, so rules are not scoped to the WireGuard interface. Both are explicitly required by the spec (task 1.2 and 1.3) and acceptance criteria (REQ-002 scenario 'Rule with interface generates iifname match').",
+  "tests_checklist": [
+    {"item": "go build ./... passes", "checked": true},
+    {"item": "go vet ./... passes", "checked": true},
+    {"item": "go test ./... passes (all packages)", "checked": true},
+    {"item": "Compile-time interface checks present (var _ FirewallController = ...)", "checked": true},
+    {"item": "Compile-time interface checks present (var _ RouteController = ...)", "checked": true},
+    {"item": "buildRuleExprs unit tests cover allow/deny/protocol/port/IP/CIDR/wildcard", "checked": true},
+    {"item": "buildRuleExprs test covers Interface field (MetaKeyIIFNAME)", "checked": false},
+    {"item": "Round-trip integration tests (ensure+delete, apply+flush, add+remove route, add+remove NAT)", "checked": true},
+    {"item": "Error format validation tests", "checked": true},
+    {"item": "TestNftablesController_ApplyRulesWithInterface exists per spec", "checked": false},
+    {"item": "TestNftablesController_DedicatedTable exists per spec", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "//go:build linux tags on all implementation and test files", "checked": true},
+    {"item": "Functions are focused and ≤40 lines", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "Clear naming throughout", "checked": true},
+    {"item": "Follows project error wrapping convention (package: context: detail with %w)", "checked": true},
+    {"item": "Constants used for table/chain names (no magic strings)", "checked": true},
+    {"item": "Helper functions properly extracted (buildRuleExprs, buildIPMatchExprs, protocolNumber, portBytes)", "checked": true},
+    {"item": "No modifications to existing interfaces", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets", "checked": true},
+    {"item": "No SQL injection risk (N/A)", "checked": true},
+    {"item": "setSysctl interface name is not validated for path traversal", "checked": false},
+    {"item": "CAP_NET_ADMIN requirement documented", "checked": true},
+    {"item": "Dedicated nftables tables prevent host firewall conflicts", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Implements existing interfaces without modifying them", "checked": true},
+    {"item": "Separated nftables tables (plexd for firewall, plexd-nat for NAT)", "checked": true},
+    {"item": "Atomic rule replacement via single Flush()", "checked": true},
+    {"item": "Idempotency guarantees implemented (EEXIST, ESRCH, non-existent chain/table)", "checked": true},
+    {"item": "EnsureChain creates base chain with forward hook per spec", "checked": false},
+    {"item": "All FirewallRule fields are handled in expression builder", "checked": false}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated logic between packages", "checked": true},
+    {"item": "No over-engineering or unused abstractions", "checked": true},
+    {"item": "Counter expression added for observability (appropriate addition)", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Invalid action rejected early in buildRuleExprs", "checked": true},
+    {"item": "Invalid protocol rejected early", "checked": true},
+    {"item": "Invalid IP/CIDR rejected before Flush()", "checked": true},
+    {"item": "CIDR parse errors caught at API boundary", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "nil error check in isErrno", "checked": true},
+    {"item": "IPv6 addresses rejected (To4() check)", "checked": true},
+    {"item": "0.0.0.0/0 wildcard handled correctly (skip IP match)", "checked": true},
+    {"item": "Idempotent deletions (chain, route, NAT)", "checked": true}
+  ],
+  "security_findings": [
+    {
+      "severity": "MEDIUM",
+      "description": "S6: setSysctl constructs a filesystem path using unsanitized interface name. If iface contains path separators (e.g. '../../../etc/cron.d/evil'), it could write to arbitrary files. While the caller controls input, defensive validation should reject names containing '/' or '..'.",
+      "location": "internal/bridge/route_linux.go:69",
+      "fix": "Add validation: if strings.ContainsAny(iface, \"/.\") || len(iface) == 0 || len(iface) > 15 { return error }. Linux IFNAMSIZ is 16 (including null), so valid interface names are 1-15 chars with no slashes."
+    }
+  ],
+  "architecture_findings": [
+    {
+      "severity": "BLOCKER",
+      "id": "FC3",
+      "description": "EnsureChain creates a regular (non-base) chain with no netfilter hook. Task 1.2 spec requires: 'type ChainTypeFilter, hook ChainHookForward, priority ChainPriorityFilter'. A regular chain is never evaluated by the kernel unless explicitly jumped to from a base chain. No such jump exists anywhere in the codebase. The firewall rules will have ZERO effect on traffic.",
+      "location": "internal/policy/nftables_linux.go:39-42",
+      "fix": "Add Type, Hooknum, and Priority to the chain: conn.AddChain(&nftables.Chain{Name: chain, Table: table, Type: nftables.ChainTypeFilter, Hooknum: nftables.ChainHookForward, Priority: nftables.ChainPriorityFilter})"
+    },
+    {
+      "severity": "BLOCKER",
+      "id": "C1",
+      "description": "buildRuleExprs completely ignores FirewallRule.Interface field. Task 1.3 spec step (1) explicitly requires: 'if Interface set, add MetaKeyIIFNAME + Cmp'. The PolicyEngine.BuildFirewallRules (engine.go:114-115) sets Interface on EVERY rule. Without iifname matching, rules apply to ALL interfaces instead of only the WireGuard tunnel interface, which is both incorrect and a security risk.",
+      "location": "internal/policy/nftables_linux.go:174",
+      "fix": "Add at the beginning of buildRuleExprs: if rule.Interface != \"\" { ifData := ifaceNameBytes(rule.Interface); exprs = append(exprs, &expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifData}) }. Note: ifaceNameBytes exists in route_linux.go but would need to be either moved to a shared location or duplicated."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "FC3-1",
+      "severity": "blocker",
+      "check_id": "FC3",
+      "file": "internal/policy/nftables_linux.go",
+      "line": 39,
+      "description": "EnsureChain creates regular chain (no hook) — firewall rules never evaluated by kernel",
+      "fix": "Set ChainTypeFilter, ChainHookForward, ChainPriorityFilter on the chain"
+    },
+    {
+      "id": "C1-1",
+      "severity": "blocker",
+      "check_id": "C1",
+      "file": "internal/policy/nftables_linux.go",
+      "line": 174,
+      "description": "buildRuleExprs ignores FirewallRule.Interface — rules not scoped to WireGuard interface",
+      "fix": "Add MetaKeyIIFNAME + Cmp expression when rule.Interface is set"
+    },
+    {
+      "id": "FC2-1",
+      "severity": "blocker",
+      "check_id": "FC2",
+      "file": "internal/policy/nftables_linux_test.go",
+      "line": 0,
+      "description": "Missing test TestNftablesController_ApplyRulesWithInterface — spec requires testing iifname match (task 1.4)",
+      "fix": "Add test that verifies buildRuleExprs generates MetaKeyIIFNAME expressions when Interface is set"
+    },
+    {
+      "id": "FC2-2",
+      "severity": "blocker",
+      "check_id": "FC2",
+      "file": "internal/policy/nftables_linux_test.go",
+      "line": 0,
+      "description": "Missing test TestNftablesController_DedicatedTable — spec requires testing table name='plexd' (task 1.4)",
+      "fix": "Add test that verifies the table name constant is 'plexd'"
+    },
+    {
+      "id": "Q5-1",
+      "severity": "major",
+      "check_id": "Q5",
+      "file": "internal/bridge/route_linux.go",
+      "line": 266,
+      "description": "isErrno uses strings.Contains fallback instead of errors.Is. This is fragile — if an error message coincidentally contains 'file exists' it would match incorrectly. The project convention is errors.Is (see internal/packaging/installer.go, internal/nodeapi/).",
+      "fix": "Replace isErrno body with: return errors.Is(err, errno). Import 'errors' package. syscall.Errno implements the error interface and errors.Is handles unwrapping."
+    },
+    {
+      "id": "DA3-1",
+      "severity": "major",
+      "check_id": "DA3",
+      "file": "docs/reference/backend/nftables-firewall.md",
+      "line": 55,
+      "description": "Documentation states 'regular (non-base) chain' which contradicts the spec requirement for a base chain with forward hook. Once the chain is fixed to be a base chain, documentation must be updated to reflect ChainTypeFilter/ChainHookForward.",
+      "fix": "Update after fixing the implementation to describe the base chain with forward hook"
+    },
+    {
+      "id": "S6-1",
+      "severity": "minor",
+      "check_id": "S6",
+      "file": "internal/bridge/route_linux.go",
+      "line": 69,
+      "description": "setSysctl does not validate interface name for path traversal characters. While input comes from operator config, defensive validation is good practice for filesystem path construction.",
+      "fix": "Add: if strings.ContainsAny(iface, \"/.\\x00\") || len(iface) == 0 || len(iface) > 15 { return fmt.Errorf(\"invalid interface name %q\", iface) }"
+    },
+    {
+      "id": "Q3-1",
+      "severity": "minor",
+      "check_id": "Q3",
+      "file": "internal/policy/nftables_linux_test.go",
+      "line": 10,
+      "description": "discardLogger helper is duplicated across both test files (nopWriterNft in nftables_linux_test.go, nopWriterRoute in route_linux_test.go). Could use slog.New(slog.NewTextHandler(io.Discard, nil)) instead.",
+      "fix": "Replace custom nopWriter with io.Discard from stdlib: slog.New(slog.NewTextHandler(io.Discard, nil))"
+    }
+  ],
+  "suggested_improvements": [
+    "Consider adding an ifaceNameBytes helper to a shared package (e.g., internal/fsutil or a new internal/nftutil) since both route_linux.go and nftables_linux.go (after fix) will need null-terminated interface name encoding for nftables expressions",
+    "The NftablesController could benefit from a connection pool or reuse pattern if performance under high reconciliation frequency becomes a concern (each method opens a new netlink connection)"
+  ],
+  "next_steps": [
+    "BLOCKER FIX: Add ChainTypeFilter, ChainHookForward, ChainPriorityFilter to EnsureChain and ApplyRules chain creation in nftables_linux.go",
+    "BLOCKER FIX: Add MetaKeyIIFNAME + Cmp expression handling for FirewallRule.Interface in buildRuleExprs",
+    "BLOCKER FIX: Add TestNftablesController_ApplyRulesWithInterface and TestNftablesController_DedicatedTable tests",
+    "MAJOR FIX: Replace isErrno string comparison with errors.Is in route_linux.go",
+    "MAJOR FIX: Update nftables-firewall.md documentation to describe base chain with forward hook (after implementation fix)",
+    "Re-request review after all blocker and major fixes are applied"
+  ]
+}

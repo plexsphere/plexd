@@ -3,6 +3,7 @@ module github.com/plexsphere/plexd
 go 1.24.0
 
 require (
+	github.com/google/nftables v0.3.0
 	github.com/spf13/cobra v1.10.2
 	github.com/vishvananda/netlink v1.3.1
 	go.uber.org/goleak v1.3.0
@@ -15,10 +16,9 @@ require (
 require (
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/josharian/native v1.1.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mdlayher/genetlink v1.3.2 // indirect
-	github.com/mdlayher/netlink v1.7.2 // indirect
+	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
