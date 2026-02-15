@@ -1,24 +1,537 @@
 {
   "feature_id": "PXD-0038",
-  "title": "J002: Implement Docker E2E test with compose orchestration",
+  "title": "J002: Implement Docker E2E test with compose",
   "slug": "j002-implement-docker-e2e-test-with-compose",
-  "status": "proposed",
+  "status": "prepared",
   "phase": null,
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** testing\n**Priority:** high\n**Source:** Proposed for 'After binary builds, Docker image builds, etc. are now in place'\n\nCreate Docker-based E2E test infrastructure. Build test/e2e/docker-compose.yml with mock-api and plexd services on a shared bridge network; mock-api starts first with healthcheck on /v1/ping, plexd configured via PLEXD_API_URL env var. Create test/e2e/docker/test.sh orchestration script that starts compose, polls /test/assertions endpoint with ~30s timeout, asserts registration_count >= 1, heartbeat_count >= 1, metadata_fetch_count >= 1, and exits non-zero on failure. Add Makefile target test-e2e-docker that handles build + run + teardown as a self-contained operation.\n\n**Rationale:** Validates that the plexd Docker image builds correctly and the containerized agent can successfully register, heartbeat, and fetch metadata from a real API server. Catches Dockerfile issues, entrypoint problems, and container networking regressions.\n\n**Affected Areas:**\n- test/e2e/docker-compose.yml\n- test/e2e/docker/test.sh\n- Makefile",
-  "stories": [],
-  "requirements": [],
-  "tasks": [],
-  "test_specifications": [],
+  "stories": [
+    {
+      "title": "CI engineer runs Docker E2E test via Makefile",
+      "role": "CI engineer",
+      "want": "to run a single `make test-e2e-docker` command that builds images, starts containers, validates plexd registers/heartbeats/fetches metadata, and tears down",
+      "so_that": "Docker image regressions (broken Dockerfile, bad entrypoint, missing dependencies) are caught before merge",
+      "criteria": [
+        "`make test-e2e-docker` builds both plexd and mock-api Docker images from source",
+        "`make test-e2e-docker` starts both containers via docker compose on a shared bridge network",
+        "`make test-e2e-docker` exits 0 when all assertion counters meet thresholds",
+        "`make test-e2e-docker` tears down all containers and networks on success or failure",
+        "`make test-e2e-docker` exits non-zero and prints diagnostic output when assertions fail"
+      ]
+    },
+    {
+      "title": "Docker compose orchestrates mock-api and plexd with correct startup order",
+      "role": "test infrastructure",
+      "want": "mock-api to be healthy before plexd starts, so plexd can immediately register",
+      "so_that": "the test does not fail due to race conditions in container startup ordering",
+      "criteria": [
+        "mock-api service has a healthcheck on GET /v1/ping",
+        "plexd service has a depends_on condition that waits for mock-api healthcheck to pass",
+        "plexd is configured with PLEXD_API_URL pointing to mock-api's container hostname and port",
+        "Both services share the same Docker bridge network"
+      ]
+    },
+    {
+      "title": "Test script validates plexd lifecycle via assertion counters",
+      "role": "test verifier",
+      "want": "to poll the mock-api /test/assertions endpoint and verify plexd has registered, heartbeated, and fetched metadata",
+      "so_that": "the full plexd agent lifecycle is validated in a containerized environment",
+      "criteria": [
+        "Test script polls /test/assertions with a ~30s timeout and 1-2s intervals",
+        "Test asserts registration_count >= 1",
+        "Test asserts heartbeat_count >= 1",
+        "Test asserts metadata_count >= 1",
+        "Test exits non-zero with clear error message if any counter does not meet threshold within timeout"
+      ]
+    },
+    {
+      "title": "Test teardown is reliable regardless of test outcome",
+      "role": "CI engineer",
+      "want": "compose resources to be cleaned up even when tests fail or the script is interrupted",
+      "so_that": "CI runners do not accumulate orphaned containers, networks, or volumes",
+      "criteria": [
+        "docker compose down is called in a trap handler on EXIT",
+        "Compose project name is deterministic to avoid conflicts with parallel runs",
+        "No dangling containers or networks remain after test completion"
+      ]
+    },
+    {
+      "title": "Developer can understand test failures from script output",
+      "role": "developer",
+      "want": "clear diagnostic output when the Docker E2E test fails",
+      "so_that": "I can quickly identify whether the failure is in the Dockerfile, container networking, plexd startup, or API communication",
+      "criteria": [
+        "Test script prints container logs on failure before tearing down",
+        "Test script prints the actual assertion counter values vs expected thresholds",
+        "Test script prints which specific assertion(s) failed",
+        "Exit code is non-zero on any failure"
+      ]
+    },
+    {
+      "title": "Documentation covers Docker E2E test setup and usage",
+      "role": "developer",
+      "want": "reference documentation explaining the Docker E2E test architecture, how to run it, and how to debug failures",
+      "so_that": "new contributors can understand and extend the E2E test infrastructure",
+      "criteria": [
+        "Reference doc describes the docker-compose.yml service topology",
+        "Reference doc describes the test.sh assertion logic and timeout behavior",
+        "Reference doc describes the Makefile target and how it chains build + test + teardown",
+        "Reference doc describes how plexd is configured in the container (env vars, config file, bootstrap token)"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL provide a docker-compose.yml at test/e2e/docker-compose.yml defining mock-api and plexd services on a shared bridge network",
+      "priority": "SHALL",
+      "rationale": "Docker Compose orchestration is the foundation of the E2E test, enabling service discovery via container names and controlled startup ordering",
+      "scenarios": [
+        {
+          "name": "Services start on shared network",
+          "when": "docker compose up -d is executed",
+          "then": "both mock-api and plexd containers are running on the same Docker bridge network",
+          "and_then": [
+            "plexd can reach mock-api via the service hostname 'mock-api'"
+          ]
+        },
+        {
+          "name": "mock-api starts before plexd",
+          "when": "docker compose up is executed",
+          "then": "mock-api healthcheck passes before plexd container starts",
+          "and_then": [
+            "plexd does not attempt registration against an unavailable API"
+          ]
+        },
+        {
+          "name": "Compose uses locally-built images",
+          "when": "docker compose up --build is executed",
+          "then": "both images are built from local Dockerfiles without pulling from a registry",
+          "and_then": [
+            "mock-api is built from test/e2e/mockapi/Dockerfile",
+            "plexd is built from deploy/docker/Dockerfile"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The mock-api service SHALL have a healthcheck configured on GET /v1/ping",
+      "priority": "SHALL",
+      "rationale": "The healthcheck ensures mock-api is ready to accept requests before plexd starts, preventing race conditions",
+      "scenarios": [
+        {
+          "name": "Healthcheck passes when mock-api is ready",
+          "when": "mock-api container starts and the HTTP server is listening",
+          "then": "the healthcheck on /v1/ping returns HTTP 200",
+          "and_then": [
+            "the container status transitions to 'healthy'"
+          ]
+        },
+        {
+          "name": "Healthcheck uses appropriate intervals",
+          "when": "the healthcheck is configured",
+          "then": "it polls at reasonable intervals (2-5s) with a short timeout (2-3s)",
+          "and_then": [
+            "retries are configured to handle slow container startup"
+          ]
+        },
+        {
+          "name": "Healthcheck does not require shell in distroless image",
+          "when": "the mock-api Dockerfile uses distroless base",
+          "then": "the healthcheck uses an approach compatible with shell-less containers (wget in builder or CMD-SHELL with appropriate workaround)",
+          "and_then": [
+            "compose healthcheck may need to use docker-compose healthcheck test with curl/wget from outside or an alternative approach"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The plexd service SHALL be configured via environment variables to connect to mock-api",
+      "priority": "SHALL",
+      "rationale": "Environment-based configuration allows the compose file to wire plexd to mock-api without modifying the plexd image",
+      "scenarios": [
+        {
+          "name": "plexd connects to mock-api via --api flag",
+          "when": "the plexd container starts with the --api flag pointing to http://mock-api:8080",
+          "then": "plexd sends registration request to mock-api",
+          "and_then": [
+            "registration_count increments on mock-api"
+          ]
+        },
+        {
+          "name": "plexd has bootstrap token available",
+          "when": "the plexd container starts",
+          "then": "a bootstrap token is available via PLEXD_BOOTSTRAP_TOKEN env var or token file",
+          "and_then": [
+            "registration proceeds without error"
+          ]
+        },
+        {
+          "name": "plexd has required data directories",
+          "when": "the plexd container starts",
+          "then": "required directories (/var/lib/plexd, /etc/plexd) exist and are writable",
+          "and_then": [
+            "plexd can write registration state to /var/lib/plexd"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The test/e2e/docker/test.sh script SHALL poll /test/assertions and assert registration_count >= 1, heartbeat_count >= 1, metadata_count >= 1",
+      "priority": "SHALL",
+      "rationale": "These three counters validate the core plexd lifecycle: register, heartbeat, and metadata fetch",
+      "scenarios": [
+        {
+          "name": "All counters meet thresholds within timeout",
+          "when": "plexd successfully registers, heartbeats, and fetches metadata within 30s",
+          "then": "the test script exits with code 0",
+          "and_then": [
+            "a success message is printed"
+          ]
+        },
+        {
+          "name": "Counters do not meet thresholds within timeout",
+          "when": "one or more counters remain at 0 after 30s",
+          "then": "the test script exits with non-zero code",
+          "and_then": [
+            "the script prints which counters failed and their actual values",
+            "container logs are printed for debugging"
+          ]
+        },
+        {
+          "name": "mock-api is unreachable from test script",
+          "when": "the test script cannot connect to mock-api's assertion endpoint",
+          "then": "the script retries until timeout then exits non-zero",
+          "and_then": [
+            "an appropriate error message indicates the connection failure"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The test.sh script SHALL start compose, run assertions, and tear down as a self-contained operation",
+      "priority": "SHALL",
+      "rationale": "Self-contained operation ensures the test can run in CI without external setup or manual cleanup",
+      "scenarios": [
+        {
+          "name": "Script builds and starts compose services",
+          "when": "test.sh is executed",
+          "then": "it runs docker compose up --build -d to build images and start services",
+          "and_then": [
+            "both containers are running before assertion polling begins"
+          ]
+        },
+        {
+          "name": "Script tears down on success",
+          "when": "all assertions pass",
+          "then": "docker compose down is called to remove containers and networks",
+          "and_then": [
+            "no orphaned resources remain"
+          ]
+        },
+        {
+          "name": "Script tears down on failure",
+          "when": "assertions fail or script is interrupted",
+          "then": "a trap handler calls docker compose down",
+          "and_then": [
+            "container logs are captured before teardown"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The Makefile SHALL provide a test-e2e-docker target that invokes the test script",
+      "priority": "SHALL",
+      "rationale": "A Makefile target provides a standard entry point consistent with existing make targets (test, test-e2e, docker-build)",
+      "scenarios": [
+        {
+          "name": "make test-e2e-docker runs the test",
+          "when": "make test-e2e-docker is executed",
+          "then": "it invokes test/e2e/docker/test.sh",
+          "and_then": [
+            "exit code propagates to make"
+          ]
+        },
+        {
+          "name": "Target is phony",
+          "when": "test-e2e-docker is listed in .PHONY",
+          "then": "it always executes regardless of file existence",
+          "and_then": []
+        },
+        {
+          "name": "Target is self-contained",
+          "when": "make test-e2e-docker is executed",
+          "then": "no prerequisite targets need to be run manually beforehand",
+          "and_then": [
+            "the test script handles image building internally"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The test script SHALL print container logs on failure for debugging",
+      "priority": "SHALL",
+      "rationale": "Without container logs, diagnosing E2E test failures requires manual reproduction, which slows down development",
+      "scenarios": [
+        {
+          "name": "Logs printed on assertion failure",
+          "when": "assertion polling times out",
+          "then": "docker compose logs is executed and output is printed to stderr",
+          "and_then": [
+            "both mock-api and plexd logs are included"
+          ]
+        },
+        {
+          "name": "Logs not printed on success",
+          "when": "all assertions pass",
+          "then": "container logs are not printed",
+          "and_then": [
+            "only a success message is shown"
+          ]
+        },
+        {
+          "name": "Actual vs expected values printed",
+          "when": "a specific counter does not meet its threshold",
+          "then": "the script prints the counter name, actual value, and expected threshold",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The docker-compose.yml SHALL handle the distroless healthcheck constraint for mock-api",
+      "priority": "SHALL",
+      "rationale": "The mock-api Dockerfile uses gcr.io/distroless/static-debian12 which has no shell, so standard CMD-SHELL healthchecks won't work",
+      "scenarios": [
+        {
+          "name": "Healthcheck works with distroless base",
+          "when": "mock-api uses distroless runtime image without shell",
+          "then": "the compose healthcheck uses an approach that works without a shell inside the container",
+          "and_then": [
+            "Options: use wget/curl binary copied in builder stage, or use docker exec from host, or use compose's native HTTP healthcheck if supported"
+          ]
+        },
+        {
+          "name": "Healthcheck detects mock-api readiness",
+          "when": "mock-api is healthy",
+          "then": "plexd container starts only after mock-api healthcheck passes",
+          "and_then": []
+        },
+        {
+          "name": "Alternative: add minimal health binary to mock-api image",
+          "when": "distroless prevents shell-based healthcheck",
+          "then": "a static health-check binary or wget is copied from builder stage into the runtime image",
+          "and_then": [
+            "the healthcheck CMD uses this binary to probe /v1/ping"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The plexd container SHALL have a minimal config file and bootstrap token for E2E testing",
+      "priority": "SHALL",
+      "rationale": "plexd requires a config file with api.base_url set and a bootstrap token to register; these must be provided in the compose environment",
+      "scenarios": [
+        {
+          "name": "Config file is mounted or generated",
+          "when": "the plexd container starts",
+          "then": "a minimal config.yaml with api.base_url pointing to mock-api is available at /etc/plexd/config.yaml",
+          "and_then": [
+            "the config file is created via a volume mount, config map, or entrypoint wrapper"
+          ]
+        },
+        {
+          "name": "Bootstrap token is provided",
+          "when": "plexd attempts registration",
+          "then": "a dummy bootstrap token is available via PLEXD_BOOTSTRAP_TOKEN environment variable",
+          "and_then": [
+            "mock-api accepts any token value"
+          ]
+        },
+        {
+          "name": "Data directory is writable",
+          "when": "plexd writes registration state",
+          "then": "/var/lib/plexd is writable by the container user",
+          "and_then": [
+            "plexd can persist its node identity"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "Reference documentation SHALL describe the Docker E2E test architecture and usage",
+      "priority": "SHALL",
+      "rationale": "Documentation enables contributors to understand, run, debug, and extend the E2E test infrastructure",
+      "scenarios": [
+        {
+          "name": "Reference doc covers compose topology",
+          "when": "a developer reads the reference doc",
+          "then": "the document describes services, networks, healthcheck, environment variables, and startup ordering",
+          "and_then": []
+        },
+        {
+          "name": "Reference doc covers test.sh behavior",
+          "when": "a developer needs to understand or debug the test",
+          "then": "the document describes polling logic, assertion thresholds, timeout, and failure diagnostics",
+          "and_then": []
+        },
+        {
+          "name": "Reference doc covers Makefile target",
+          "when": "a developer wants to run the test",
+          "then": "the document shows the make test-e2e-docker command and explains what it does",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Create test/e2e/docker-compose.yml with mock-api and plexd services (REQ-001, REQ-002, REQ-003, REQ-008, REQ-009): Define a docker-compose.yml with two services — mock-api (built from test/e2e/mockapi/Dockerfile, exposed on port 8080, healthcheck on /v1/ping) and plexd (built from deploy/docker/Dockerfile, depends_on mock-api healthy condition). Both on a shared bridge network 'e2e-net'. mock-api healthcheck must work with distroless — add a static wget binary in the mock-api Dockerfile builder stage and copy it to the runtime image for use as healthcheck CMD. plexd configured with --api http://mock-api:8080 via command override, PLEXD_BOOTSTRAP_TOKEN=e2e-test-token env var, and a minimal config.yaml mounted via a bind mount or generated in an init container/entrypoint wrapper. Include a tmpfs mount for /var/lib/plexd for writable data directory.",
+    "1.2 Update test/e2e/mockapi/Dockerfile to include wget for healthcheck (REQ-002, REQ-008): Add a step in the builder stage to download a static wget binary (or use the alpine wget), copy it to the runtime image at /usr/local/bin/wget. This enables docker compose healthcheck to run 'wget --spider -q http://localhost:8080/v1/ping' inside the distroless container. Alternatively, install wget in builder and copy the binary.",
+    "2.1 Create test/e2e/docker/test.sh orchestration script (REQ-004, REQ-005, REQ-007): Write a bash script that: (a) sets -euo pipefail, (b) determines SCRIPT_DIR and COMPOSE_FILE path, (c) sets a cleanup trap that runs docker compose down -v on EXIT, (d) runs docker compose up --build -d, (e) waits for mock-api healthcheck to pass, (f) polls http://localhost:<mapped-port>/test/assertions every 2s for up to 30s, (g) parses JSON response using jq or grep to extract registration_count, heartbeat_count, metadata_count, (h) asserts each >= 1, (i) on failure: prints actual values, runs docker compose logs, exits 1, (j) on success: prints success message, exits 0. The mock-api port must be mapped to host for the test script to reach /test/assertions.",
+    "2.2 Create test/e2e/docker/plexd-e2e.yaml minimal config file (REQ-009): Create a minimal YAML config file for plexd in the Docker E2E test context. Must contain: api.base_url: http://mock-api:8080, registration.token_value: e2e-test-token, and any other required fields with sensible defaults. This file is bind-mounted into the plexd container at /etc/plexd/config.yaml.",
+    "3.1 Add test-e2e-docker target to Makefile (REQ-006): Add a .PHONY target 'test-e2e-docker' that runs 'bash test/e2e/docker/test.sh'. The target should be self-contained with no prerequisites. Add test-e2e-docker to the existing .PHONY declaration list.",
+    "4.1 Create docs/reference/backend/docker-e2e-test.md reference documentation (REQ-010): Write reference documentation covering: (a) overview of the Docker E2E test purpose and what it validates, (b) docker-compose.yml service topology (mock-api, plexd, shared network, healthcheck, startup ordering), (c) test.sh assertion logic (polling endpoint, timeout, counter thresholds), (d) plexd configuration in the container (config file, env vars, --api flag), (e) Makefile target usage (make test-e2e-docker), (f) debugging failures (reading container logs, common failure modes), (g) key files listing.",
+    "5.1 Integration test: run make test-e2e-docker end-to-end (REQ-001 through REQ-009): Execute make test-e2e-docker in a Docker-capable environment to validate the complete flow: image builds, compose startup, mock-api healthcheck, plexd registration/heartbeat/metadata, assertion polling, and teardown. Verify exit code 0 and clean resource state after completion."
+  ],
+  "test_specifications": [
+    {
+      "test_file": "test/e2e/docker/test.sh",
+      "test_function": "assertion_polling_success",
+      "story": "Test script validates plexd lifecycle via assertion counters",
+      "expected": "When plexd registers, heartbeats, and fetches metadata within 30s, test.sh exits 0",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "test/e2e/docker/test.sh",
+      "test_function": "assertion_polling_timeout",
+      "story": "Test script validates plexd lifecycle via assertion counters",
+      "expected": "When counters do not meet thresholds within 30s, test.sh exits non-zero with diagnostic output",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "test/e2e/docker-compose.yml",
+      "test_function": "compose_services_start",
+      "story": "Docker compose orchestrates mock-api and plexd with correct startup order",
+      "expected": "docker compose up starts both services; mock-api healthy before plexd starts",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/docker-compose.yml",
+      "test_function": "mock_api_healthcheck",
+      "story": "Docker compose orchestrates mock-api and plexd with correct startup order",
+      "expected": "mock-api healthcheck on /v1/ping transitions container to 'healthy' status",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/docker/test.sh",
+      "test_function": "teardown_on_failure",
+      "story": "Test teardown is reliable regardless of test outcome",
+      "expected": "docker compose down is executed even when assertions fail (via trap handler)",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "test/e2e/docker/test.sh",
+      "test_function": "logs_on_failure",
+      "story": "Developer can understand test failures from script output",
+      "expected": "Container logs are printed to stderr when assertions fail, showing actual vs expected counter values",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "test/e2e/docker-compose.yml",
+      "test_function": "plexd_config_and_token",
+      "story": "Docker compose orchestrates mock-api and plexd with correct startup order",
+      "expected": "plexd container has /etc/plexd/config.yaml with api.base_url=http://mock-api:8080 and PLEXD_BOOTSTRAP_TOKEN set",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "Makefile",
+      "test_function": "test_e2e_docker_target",
+      "story": "CI engineer runs Docker E2E test via Makefile",
+      "expected": "make test-e2e-docker invokes test/e2e/docker/test.sh and propagates exit code",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "test/e2e/docker/test.sh",
+      "test_function": "registration_count_assertion",
+      "story": "Test script validates plexd lifecycle via assertion counters",
+      "expected": "registration_count >= 1 is asserted from /test/assertions JSON response",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "test/e2e/docker/test.sh",
+      "test_function": "heartbeat_count_assertion",
+      "story": "Test script validates plexd lifecycle via assertion counters",
+      "expected": "heartbeat_count >= 1 is asserted from /test/assertions JSON response",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "test/e2e/docker/test.sh",
+      "test_function": "metadata_count_assertion",
+      "story": "Test script validates plexd lifecycle via assertion counters",
+      "expected": "metadata_count >= 1 is asserted from /test/assertions JSON response",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "docs/reference/backend/docker-e2e-test.md",
+      "test_function": "reference_documentation_exists",
+      "story": "Documentation covers Docker E2E test setup and usage",
+      "expected": "Reference doc exists at docs/reference/backend/docker-e2e-test.md with compose topology, test.sh behavior, and Makefile usage",
+      "requirement_id": "REQ-010"
+    }
+  ],
   "affected_files": [],
   "similar_patterns": [],
-  "review_criteria": [],
-  "implementation_notes": "",
+  "review_criteria": [
+    "docker-compose.yml defines mock-api and plexd services on a shared bridge network with correct build contexts",
+    "mock-api healthcheck on /v1/ping works with distroless runtime image (verified by compose health status)",
+    "plexd starts only after mock-api is healthy (depends_on with condition: service_healthy)",
+    "test.sh asserts registration_count >= 1, heartbeat_count >= 1, metadata_count >= 1 from /test/assertions",
+    "test.sh has trap-based cleanup that runs docker compose down on EXIT regardless of test outcome",
+    "test.sh prints container logs and actual assertion values on failure for debugging",
+    "Makefile test-e2e-docker target invokes test/e2e/docker/test.sh and propagates exit code",
+    "plexd container has valid config file and bootstrap token for connecting to mock-api",
+    "No hardcoded absolute paths in test.sh — uses relative paths from script directory",
+    "Reference documentation at docs/reference/backend/docker-e2e-test.md covers compose topology, test behavior, and Makefile usage",
+    "make test-e2e-docker passes end-to-end in a Docker-capable environment"
+  ],
+  "implementation_notes": "Architecture: The Docker E2E test uses docker compose to orchestrate two containers — mock-api (existing Go mock server from PXD-0037) and plexd (the real agent built from deploy/docker/Dockerfile). The mock-api container starts first with a healthcheck on /v1/ping; once healthy, the plexd container starts and runs `plexd up` with --api pointing to http://mock-api:8080. plexd registers, heartbeats, fetches state/metadata as part of its normal lifecycle. The test script (test.sh) polls mock-api's /test/assertions endpoint from the host to verify counters meet thresholds.\n\nKey design decisions:\n1. **Healthcheck with distroless**: mock-api uses distroless base which has no shell. We need to either (a) copy a static wget/curl binary from the builder stage or (b) use a non-shell healthcheck approach. Option (a) is simplest — copy wget from alpine builder.\n2. **plexd configuration**: plexd needs a config file at /etc/plexd/config.yaml with api.base_url set. A minimal YAML file is bind-mounted from test/e2e/docker/plexd-e2e.yaml. The bootstrap token is set via PLEXD_BOOTSTRAP_TOKEN env var. The --api CLI flag can also override the base URL.\n3. **Port mapping**: mock-api port 8080 must be mapped to the host so test.sh can reach /test/assertions. plexd reaches mock-api via the docker compose internal DNS (service name 'mock-api').\n4. **Assertion fields**: The actual JSON field names from mockapi.AssertionCounters are registration_count, heartbeat_count, state_count, metadata_count. The feature description mentions metadata_fetch_count but the actual code uses metadata_count.\n5. **Data directories**: plexd needs /var/lib/plexd writable — use a tmpfs mount in compose. The distroless plexd image already has these directories created.\n6. **.dockerignore impact**: The plexd Dockerfile's .dockerignore excludes test files, so the docker-compose.yml must use separate build contexts for each service.\n\nPotential pitfalls:\n- plexd may fail if it cannot create WireGuard interfaces (requires NET_ADMIN). The E2E test only validates registration/heartbeat/metadata — WireGuard failures are expected and should not prevent the test from passing. plexd's error handling should allow it to continue heartbeating even if tunnel setup fails.\n- The signing key from mock-api's RegisterResponse (ed25519-mock-signing-pub-key) is not a valid base64-encoded Ed25519 key. plexd's up command decodes it — this may cause a startup failure after registration. If so, the mock-api fixture needs to return a valid base64-encoded 32-byte key.\n- The test timeout (30s) must be long enough for image builds on cold cache + container startup + plexd registration cycle.",
   "status_history": {
     "proposed": {
       "github_account": "berendt",
       "timestamp": "2026-02-15T22:00:43.564412"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T22:31:48.466891"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T22:35:46.467605"
     }
   },
-  "elaboration": "\n\n**Size:** 🏗️ large\n**Category:** infrastructure\n**Priority:** high\n\n## Open Questions\n\nNo remaining open questions — the user has resolved all ambiguities:\n- **Mock API scope:** Read-only stubs returning fixture data\n- **Trigger strategy:** Path-filtered triggers\n\n## Summary\n\nAdd end-to-end test workflows in GitHub Actions that validate plexd's Docker image, Kubernetes DaemonSet deployment, and systemd service installation against a fully simulated Plexsphere Central API. A lightweight Go mock server implementing the critical API endpoints (`/v1/register`, `/v1/nodes/{id}/heartbeat`, `/v1/nodes/{id}/state`, `/v1/nodes/{id}/metadata`, SSE `/v1/nodes/{id}/events`) runs as the test backend, allowing plexd to execute its real registration, heartbeat, metadata fetch, and reconciliation flows in each deployment mode.\n\n## Scope\n\n**Included:**\n- Go mock server binary (`net/http`, no frameworks) implementing: `/v1/ping`, `/v1/register`, `/v1/nodes/{id}/heartbeat`, `/v1/nodes/{id}/state`, `/v1/nodes/{id}/metadata`, `/v1/nodes/{id}/events` (SSE), plus `/test/assertions` for programmatic verification — all read-only stubs returning fixture data with in-memory call counters\n- **Docker E2E job** — build image, start mock API + plexd container via compose, verify registration + heartbeat + metadata fetch\n- **Kubernetes E2E job** — `kind` cluster, apply all `deploy/kubernetes/` manifests (namespace, RBAC, CRDs, serviceaccount, secret, configmap, DaemonSet), verify DaemonSet pod readiness + plexd registers and heartbeats against mock API\n- **systemd E2E job** — systemd-in-Docker container, install plexd binary + `deploy/systemd/plexd.service` unit file, start service, verify registration + heartbeat + metadata fetch\n- Makefile targets: `test-e2e-docker`, `test-e2e-k8s`, `test-e2e-systemd` for local execution\n\n**Excluded (YAGNI):**\n- Full 18-endpoint mock — only core lifecycle + metadata endpoints; rest is unit-tested\n- WireGuard mesh validation — requires `NET_ADMIN` + kernel module; infeasible on GHA runners\n- Performance/load testing — separate concern\n- Multi-arch E2E (arm64) — GHA arm64 runners are slow/limited; amd64 validates deployment patterns\n- Cloud-init E2E — requires VM provisioning; too heavy for CI\n- Helm chart — none exists in the project\n- Docker image push to registry — handled by release workflow\n\n## Visualization\n\n```mermaid\nflowchart TD\n    subgraph GHA[\"GitHub Actions - e2e.yml\"]\n        direction TB\n        trigger[\"Push / PR trigger<br/>path filter: cmd/, internal/, deploy/,<br/>test/e2e/, Dockerfile, workflows\"]\n\n        subgraph docker_e2e[\"Docker E2E Job\"]\n            d1[\"Build plexd image\"]\n            d2[\"Build mock-api image\"]\n            d3[\"docker compose up\"]\n            d4[\"Wait for registration\"]\n            d5[\"Assert heartbeat + metadata\"]\n            d6[\"Tear down\"]\n            d1 --> d3\n            d2 --> d3\n            d3 --> d4 --> d5 --> d6\n        end\n\n        subgraph k8s_e2e[\"Kubernetes E2E Job\"]\n            k1[\"Create kind cluster\"]\n            k2[\"Load plexd + mock-api images\"]\n            k3[\"Apply deploy/kubernetes/ manifests\"]\n            k4[\"Deploy mock-api as Service\"]\n            k5[\"Wait DaemonSet ready\"]\n            k6[\"Verify via /test/assertions\"]\n            k7[\"Delete kind cluster\"]\n            k1 --> k2 --> k3 --> k4 --> k5 --> k6 --> k7\n        end\n\n        subgraph systemd_e2e[\"systemd E2E Job\"]\n            s1[\"Start systemd container\"]\n            s2[\"Start mock-api container\"]\n            s3[\"Install plexd binary + unit file\"]\n            s4[\"systemctl start plexd\"]\n            s5[\"Verify registration + heartbeat + metadata\"]\n            s6[\"systemctl stop plexd\"]\n            s1 --> s3\n            s2 --> s3\n            s3 --> s4 --> s5 --> s6\n        end\n\n        trigger --> docker_e2e\n        trigger --> k8s_e2e\n        trigger --> systemd_e2e\n    end\n```\n\n```mermaid\nsequenceDiagram\n    participant plexd as plexd agent\n    participant mock as Mock Central API\n    participant verify as Test Verifier\n\n    plexd->>mock: GET /v1/ping\n    mock-->>plexd: 200 OK\n    plexd->>mock: POST /v1/register\n    mock-->>plexd: 200 {node_id, mesh_ip, peers}\n    plexd->>mock: POST /v1/nodes/{id}/heartbeat\n    mock-->>plexd: 200 {reconcile: true}\n    plexd->>mock: GET /v1/nodes/{id}/state\n    mock-->>plexd: 200 {peers, policies}\n    plexd->>mock: GET /v1/nodes/{id}/metadata\n    mock-->>plexd: 200 {metadata blob}\n    verify->>mock: GET /test/assertions\n    mock-->>verify: {reg_count, hb_count, meta_count}\n```\n\n```mermaid\nflowchart LR\n    subgraph mock_server[\"Mock API Server - test/e2e/mockapi\"]\n        ping[\"/v1/ping\"]\n        reg[\"/v1/register\"]\n        hb[\"/v1/nodes/{id}/heartbeat\"]\n        st[\"/v1/nodes/{id}/state\"]\n        meta[\"/v1/nodes/{id}/metadata\"]\n        events[\"/v1/nodes/{id}/events SSE\"]\n        assert[\"/test/assertions\"]\n    end\n\n    subgraph counters[\"In-Memory Counters\"]\n        rc[\"Registration count\"]\n        hc[\"Heartbeat count\"]\n        mc[\"Metadata fetch count\"]\n        sc[\"State fetch count\"]\n    end\n\n    reg --> rc\n    hb --> hc\n    meta --> mc\n    st --> sc\n    assert --> counters\n```\n\n## Key Components\n\n- **`test/e2e/mockapi/`** — Go mock server binary (`main.go` + `Dockerfile`). Implements 7 endpoints with read-only fixture responses. Tracks call counts in-memory via atomic counters. Exposes `/test/assertions` returning JSON `{registration_count, heartbeat_count, metadata_fetch_count, state_fetch_count, last_heartbeat_at}`.\n- **`test/e2e/docker-compose.yml`** — Compose file with `mock-api` and `plexd` services on shared bridge network. Mock API starts first (healthcheck on `/v1/ping`), plexd configured via `PLEXD_API_URL` env var.\n- **`test/e2e/docker/`** — Docker E2E test script: starts compose, polls `/test/assertions` with timeout, asserts `registration_count >= 1`, `heartbeat_count >= 1`, `metadata_fetch_count >= 1`. Exits non-zero on failure.\n- **`test/e2e/kubernetes/`** — K8s E2E test script + mock-api Kubernetes manifests (Deployment + ClusterIP Service). Uses `kind create cluster`, loads locally-built images, applies `deploy/kubernetes/` manifests + mock-api manifests, waits for DaemonSet rollout, port-forwards to mock-api, validates assertions.\n- **`test/e2e/systemd/`** — systemd E2E test script + systemd-enabled Dockerfile. Copies plexd binary + `deploy/systemd/plexd.service` into container, configures `PLEXD_API_URL` via environment drop-in, starts service via `systemctl`, validates against mock-api on same Docker network.\n- **`.github/workflows/e2e.yml`** — Single workflow with three parallel jobs (`docker-e2e`, `kubernetes-e2e`, `systemd-e2e`). Path-filtered on `cmd/`, `internal/`, `deploy/`, `test/e2e/`, `Dockerfile`, and workflow files. Runs on `ubuntu-latest`. Uploads logs as artifacts on failure.\n- **`Makefile` additions** — Three targets: `test-e2e-docker`, `test-e2e-k8s`, `test-e2e-systemd`. Each self-contained with build + run + teardown."
+  "execution_history": [
+    {
+      "run_id": "6fdee880-504f-4df3-8e4e-38977c22c3c2",
+      "timestamp": "2026-02-15T22:35:46.467667",
+      "total_duration": 234.79157638549805,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 234.79157638549805,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
 }
