@@ -2,8 +2,8 @@
   "feature_id": "PXD-0031",
   "title": "H001: Fix README.md project structure accuracy",
   "slug": "h001-fix-readme-md-project-structure-accuracy",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 🔧 small\n**Category:** docs\n**Priority:** critical\n**Source:** Proposed for 'Perform a GAP analysis. The README.md as well as'\n\nCorrect the README.md project structure tree (~lines 1912–1945): fix 12 incorrect package names (e.g. internal/mesh→internal/tunnel, internal/observe→internal/metrics, internal/logs→internal/logfwd, internal/audit→internal/auditfwd, internal/access→internal/tunnel, internal/crypto→internal/api verifier), remove 2 phantom directories (pkg/, deploy/docker/ placeholder), add 7 missing packages (fsutil, integrity, kubernetes, metrics, packaging, peerexchange, wireguard), and add missing deploy entries (cloud-init/, install.sh). Remove references to internal/auth, internal/hooks, internal/execution which don't exist as standalone packages.\n\n**Rationale:** README is the primary onboarding document. Currently ~60% of the project structure is wrong — new developers and contributors will be confused by phantom directories and wrong package names. This is ship-blocking for any public/team-facing release.\n\n**Affected Areas:**\n- README.md",
   "stories": [
@@ -296,9 +296,9 @@
     }
   ],
   "tasks": [
-    "1.1 Audit current README project structure tree against filesystem: diff each entry in lines 1912-1945 against actual directories, produce a checklist of corrections needed (REQ-001, REQ-002, REQ-003)",
-    "1.2 Replace the project structure tree (lines 1914-1945) with corrected tree containing all 19 internal/ packages with accurate descriptions, corrected deploy/ subtree (cloud-init/, install.sh, kubernetes/crds/, systemd/), docs/ subtree (reference/, how-to/), removal of pkg/ and deploy/docker/, and consistent ASCII formatting (REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-008)",
-    "1.3 Scan README.md prose sections outside the project structure tree for stale references to phantom packages (internal/mesh, internal/observe, internal/logs, internal/audit, internal/access, internal/auth, internal/crypto, internal/hooks, internal/execution) and correct or remove them (REQ-007)"
+    "[done] 1.1 Audit current README project structure tree against filesystem: diff each entry in lines 1912-1945 against actual directories, produce a checklist of corrections needed (REQ-001, REQ-002, REQ-003)",
+    "[done] 1.2 Replace the project structure tree (lines 1914-1945) with corrected tree containing all 19 internal/ packages with accurate descriptions, corrected deploy/ subtree (cloud-init/, install.sh, kubernetes/crds/, systemd/), docs/ subtree (reference/, how-to/), removal of pkg/ and deploy/docker/, and consistent ASCII formatting (REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-008)",
+    "[done] 1.3 Scan README.md prose sections outside the project structure tree for stale references to phantom packages (internal/mesh, internal/observe, internal/logs, internal/audit, internal/access, internal/auth, internal/crypto, internal/hooks, internal/execution) and correct or remove them (REQ-007)"
   ],
   "test_specifications": [
     {
@@ -395,6 +395,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-15T19:40:23.249721"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T19:41:49.637080"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T19:58:41.433910"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T19:58:41.483398"
     }
   },
   "execution_history": [
@@ -408,6 +420,38 @@
           "name": "prepare",
           "duration": 167.09771084785461,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "e9774647-6869-404c-9a9b-252b40884f2c",
+      "timestamp": "2026-02-15T19:48:11.675565",
+      "total_duration": 283.3667314052582,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (3 tasks)",
+          "duration": 103.81482219696045,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0031] Code Review",
+          "duration": 115.65578269958496,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0031] Improvements",
+          "duration": 28.774487733840942,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0031] Simplify",
+          "duration": 35.121638774871826,
+          "type": "simplify",
           "status": "done"
         }
       ]

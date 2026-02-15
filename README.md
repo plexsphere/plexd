@@ -1913,33 +1913,37 @@ make lint         # Run linter
 
 ```
 plexd/
-├── cmd/                  # CLI entrypoints
+├── cmd/                    # CLI entrypoints
 │   └── plexd/
 ├── internal/
-│   ├── agent/            # Core agent lifecycle
-│   ├── api/              # Control plane API client
-│   ├── mesh/             # Tunnel management
-│   ├── nat/              # STUN-based NAT traversal and endpoint discovery
-│   ├── policy/           # Policy evaluation and firewall rules
-│   ├── reconcile/        # State reconciliation loop
-│   ├── registration/     # Token handling and enrollment
-│   ├── observe/          # Metrics collection and reporting
-│   ├── logs/             # Log collection and forwarding
-│   ├── audit/            # System audit collection (auditd, K8s audit logs)
-│   ├── access/           # SSH and Kubernetes API access proxy
-│   ├── auth/             # Session JWT validation, token revocation, scope matching
-│   ├── crypto/           # Ed25519 signature verification, signing key management and rotation
-│   ├── actions/          # Built-in action definitions and dispatcher
-│   ├── hooks/            # Hook configuration, checksum verification, file watcher
-│   ├── execution/        # Action/hook execution engine, sandbox, callbacks
-│   ├── bridge/           # Bridge mode: user access, public ingress, site-to-site, relay
-│   └── nodeapi/          # Local Node API server, state cache, report sync
-├── pkg/                  # Shared library packages
+│   ├── actions/            # Remote actions, hook execution, file watcher
+│   ├── agent/              # Core agent lifecycle and heartbeat
+│   ├── api/                # Control plane API client, SSE, event verification
+│   ├── auditfwd/           # Audit log collection and forwarding (auditd, K8s)
+│   ├── bridge/             # Bridge mode: user access, public ingress, site-to-site, relay
+│   ├── fsutil/             # Atomic file operations
+│   ├── integrity/          # Binary and file integrity verification
+│   ├── kubernetes/         # K8s detection, CRD controller, PlexdHook types
+│   ├── logfwd/             # Log collection and forwarding (journald, file sources)
+│   ├── metrics/            # Metrics collection, system stats, tunnel stats
+│   ├── nat/                # STUN-based NAT traversal and endpoint discovery
+│   ├── nodeapi/            # Local Node API server, state cache, report sync
+│   ├── packaging/          # Bare-metal installer, systemd unit generation
+│   ├── peerexchange/       # Peer endpoint exchange protocol
+│   ├── policy/             # Network policy evaluation, nftables firewall rules
+│   ├── reconcile/          # Configuration reconciliation loop
+│   ├── registration/       # Token handling, enrollment, Ed25519 key management
+│   ├── tunnel/             # SSH server, secure access tunneling, K8s API proxy
+│   └── wireguard/          # WireGuard interface management via netlink
 ├── deploy/
-│   ├── docker/           # Dockerfiles
-│   ├── systemd/          # Unit files
-│   └── kubernetes/       # DaemonSet manifests, CRDs, RBAC
+│   ├── cloud-init/         # Cloud-init templates and Terraform examples
+│   ├── install.sh          # Bare-metal installer script
+│   ├── kubernetes/         # DaemonSet manifests, RBAC
+│   │   └── crds/           # Custom Resource Definitions (PlexdHook, PlexdNodeState)
+│   └── systemd/            # Unit files
 ├── docs/
+│   ├── how-to/             # Task-oriented guides
+│   └── reference/          # API and configuration reference
 ├── Makefile
 └── README.md
 ```
@@ -2129,16 +2133,15 @@ PSKs are rotated together with the main key pairs and whenever a peer is removed
 | Module | Responsibility |
 |---|---|
 | `internal/registration/` | Generate key pair, exchange bootstrap token for node identity |
-| `internal/api/` | SSE stream, receive peer updates with public keys and PSKs |
-| `internal/mesh/` | WireGuard interface management, apply key and peer configuration |
+| `internal/api/` | SSE stream, receive peer updates with public keys and PSKs, Ed25519 event signature verification |
+| `internal/wireguard/` | WireGuard interface management via netlink, apply key and peer configuration |
 | `internal/nat/` | STUN discovery, report and receive endpoint updates |
+| `internal/peerexchange/` | Peer endpoint exchange protocol |
 | `internal/reconcile/` | Periodic full-state comparison: local WireGuard config vs. control plane |
-| `internal/auth/` | Session JWT validation, token revocation set, action scope matching |
-| `internal/crypto/` | Ed25519 event signature verification, signing key storage and rotation |
-| `internal/actions/` | Built-in action definitions, action dispatcher, Unix socket listener |
-| `internal/hooks/` | Hook configuration, checksum computation, inotify file watcher, CRD controller |
-| `internal/execution/` | Action/hook execution engine, sandbox setup, callback delivery |
-| `internal/nodeapi/` | Local Node API server (Unix socket + optional TCP), state cache, report sync, PlexdNodeState CRD controller (Kubernetes) |
+| `internal/actions/` | Remote actions, hook execution engine, checksum verification, file watcher |
+| `internal/tunnel/` | SSH server, secure access tunneling, K8s API proxy |
+| `internal/nodeapi/` | Local Node API server (Unix socket + optional TCP), auth, state cache, report sync |
+| `internal/kubernetes/` | K8s detection, CRD controller, PlexdHook types |
 
 ### Control Plane API Endpoints
 
