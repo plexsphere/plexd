@@ -1,0 +1,416 @@
+{
+  "feature_id": "PXD-0031",
+  "title": "H001: Fix README.md project structure accuracy",
+  "slug": "h001-fix-readme-md-project-structure-accuracy",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 🔧 small\n**Category:** docs\n**Priority:** critical\n**Source:** Proposed for 'Perform a GAP analysis. The README.md as well as'\n\nCorrect the README.md project structure tree (~lines 1912–1945): fix 12 incorrect package names (e.g. internal/mesh→internal/tunnel, internal/observe→internal/metrics, internal/logs→internal/logfwd, internal/audit→internal/auditfwd, internal/access→internal/tunnel, internal/crypto→internal/api verifier), remove 2 phantom directories (pkg/, deploy/docker/ placeholder), add 7 missing packages (fsutil, integrity, kubernetes, metrics, packaging, peerexchange, wireguard), and add missing deploy entries (cloud-init/, install.sh). Remove references to internal/auth, internal/hooks, internal/execution which don't exist as standalone packages.\n\n**Rationale:** README is the primary onboarding document. Currently ~60% of the project structure is wrong — new developers and contributors will be confused by phantom directories and wrong package names. This is ship-blocking for any public/team-facing release.\n\n**Affected Areas:**\n- README.md",
+  "stories": [
+    {
+      "title": "New developer reads accurate project structure in README",
+      "role": "new developer",
+      "want": "the README project structure tree to exactly match the actual directories and packages in the codebase",
+      "so_that": "I can navigate the codebase confidently without encountering phantom directories or missing packages",
+      "criteria": [
+        "Every directory listed in the README project structure tree exists in the repository",
+        "Every internal/ package that exists in the repository is listed in the tree",
+        "No phantom directories (pkg/, deploy/docker/) appear in the tree",
+        "Package descriptions accurately reflect what the package does based on its doc comment"
+      ]
+    },
+    {
+      "title": "Contributor sees correct package name mappings",
+      "role": "contributor",
+      "want": "incorrect package names like internal/mesh, internal/observe, internal/logs to be replaced with their actual names (internal/tunnel, internal/metrics, internal/logfwd)",
+      "so_that": "I can find the right source code when reading about a feature in the README",
+      "criteria": [
+        "internal/mesh is replaced with internal/tunnel",
+        "internal/observe is replaced with internal/metrics",
+        "internal/logs is replaced with internal/logfwd",
+        "internal/audit is replaced with internal/auditfwd",
+        "internal/access, internal/auth, internal/crypto, internal/hooks, internal/execution are removed as they don't exist as standalone packages"
+      ]
+    },
+    {
+      "title": "Developer sees all 19 internal packages in README",
+      "role": "developer",
+      "want": "all 19 actual internal packages listed with accurate one-line descriptions",
+      "so_that": "I have a complete map of the codebase architecture at a glance",
+      "criteria": [
+        "All 19 packages are listed: actions, agent, api, auditfwd, bridge, fsutil, integrity, kubernetes, logfwd, metrics, nat, nodeapi, packaging, peerexchange, policy, reconcile, registration, tunnel, wireguard",
+        "Each package has a description matching its actual Go package doc comment or purpose",
+        "Packages are listed in alphabetical order for easy scanning",
+        "No duplicate entries exist"
+      ]
+    },
+    {
+      "title": "Developer sees accurate deploy/ tree in README",
+      "role": "developer",
+      "want": "the deploy/ section to reflect the actual deployment artifacts including cloud-init/, install.sh, and kubernetes/crds/",
+      "so_that": "I know what deployment options are available without browsing the filesystem",
+      "criteria": [
+        "deploy/cloud-init/ is listed with a description",
+        "deploy/install.sh is listed",
+        "deploy/kubernetes/ includes the crds/ subdirectory",
+        "deploy/systemd/ is listed",
+        "deploy/docker/ is removed (does not exist)",
+        "pkg/ directory is removed (does not exist)"
+      ]
+    },
+    {
+      "title": "Reviewer can verify README accuracy against codebase",
+      "role": "reviewer",
+      "want": "a 1:1 correspondence between the README project structure and actual filesystem",
+      "so_that": "I can approve the change with confidence that no discrepancies remain",
+      "criteria": [
+        "Running 'ls internal/' produces the same set of directories listed in README",
+        "Running 'ls deploy/' produces the same entries listed in README",
+        "No references to internal/auth, internal/hooks, internal/execution remain in the project structure tree",
+        "The tree format is consistent with markdown code block rendering"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The README project structure tree SHALL list all 19 actual internal/ packages with accurate names",
+      "priority": "SHALL",
+      "rationale": "Incorrect package names (mesh, observe, logs, audit, access) mislead developers into looking for non-existent directories",
+      "scenarios": [
+        {
+          "name": "All actual packages present",
+          "when": "a developer reads the project structure section of README.md",
+          "then": "every directory under internal/ in the filesystem has a corresponding entry in the tree",
+          "and_then": [
+            "the 19 packages are: actions, agent, api, auditfwd, bridge, fsutil, integrity, kubernetes, logfwd, metrics, nat, nodeapi, packaging, peerexchange, policy, reconcile, registration, tunnel, wireguard"
+          ]
+        },
+        {
+          "name": "Incorrect names removed",
+          "when": "a developer searches the README for 'internal/mesh', 'internal/observe', 'internal/logs', 'internal/audit', 'internal/access'",
+          "then": "none of these phantom names appear in the project structure tree",
+          "and_then": [
+            "they are replaced by their actual counterparts: tunnel, metrics, logfwd, auditfwd"
+          ]
+        },
+        {
+          "name": "Non-existent standalone packages removed",
+          "when": "a developer searches the README project structure for 'internal/auth', 'internal/hooks', 'internal/execution', 'internal/crypto'",
+          "then": "none of these appear as entries in the project structure tree",
+          "and_then": [
+            "functionality is documented via the packages that actually contain it (api, actions, etc.)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The README project structure tree SHALL NOT reference directories that do not exist in the repository",
+      "priority": "SHALL",
+      "rationale": "Phantom directories (pkg/, deploy/docker/) confuse developers who try to find them",
+      "scenarios": [
+        {
+          "name": "pkg/ directory removed",
+          "when": "a developer reads the project structure tree",
+          "then": "there is no entry for pkg/ since this directory does not exist",
+          "and_then": []
+        },
+        {
+          "name": "deploy/docker/ removed",
+          "when": "a developer reads the deploy/ subtree",
+          "then": "there is no entry for deploy/docker/ since this directory does not exist",
+          "and_then": []
+        },
+        {
+          "name": "Every listed directory is verifiable",
+          "when": "a developer runs ls on any directory listed in the tree",
+          "then": "the directory exists and is non-empty",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The README project structure tree SHALL include all actual deploy/ entries including cloud-init/ and install.sh",
+      "priority": "SHALL",
+      "rationale": "Missing deploy entries hide available deployment options from developers",
+      "scenarios": [
+        {
+          "name": "cloud-init listed",
+          "when": "a developer reads the deploy/ subtree in the README",
+          "then": "deploy/cloud-init/ is listed with its description",
+          "and_then": []
+        },
+        {
+          "name": "install.sh listed",
+          "when": "a developer reads the deploy/ subtree",
+          "then": "deploy/install.sh is listed",
+          "and_then": []
+        },
+        {
+          "name": "kubernetes/crds/ listed",
+          "when": "a developer reads the deploy/kubernetes/ subtree",
+          "then": "the crds/ subdirectory is visible",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "Each package entry in the project structure tree SHALL have a one-line description that accurately reflects the package's actual purpose",
+      "priority": "SHALL",
+      "rationale": "Descriptions like 'Tunnel management' for internal/mesh are misleading when the actual package is internal/tunnel",
+      "scenarios": [
+        {
+          "name": "Description matches package doc comment",
+          "when": "a developer reads the description for any internal/ package in the tree",
+          "then": "the description aligns with the package's Go doc comment or actual functionality",
+          "and_then": [
+            "descriptions are concise (under 60 characters)"
+          ]
+        },
+        {
+          "name": "New packages have descriptions",
+          "when": "a previously unlisted package (fsutil, integrity, kubernetes, packaging, peerexchange, wireguard) is added to the tree",
+          "then": "it has an accurate one-line description",
+          "and_then": []
+        },
+        {
+          "name": "No misleading descriptions",
+          "when": "a developer reads 'internal/tunnel' in the tree",
+          "then": "the description says 'Secure access tunneling' not 'Tunnel management' or similar vague text",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The project structure tree SHALL maintain consistent formatting using ASCII tree characters",
+      "priority": "SHALL",
+      "rationale": "Consistent formatting ensures readability in markdown renderers and terminal displays",
+      "scenarios": [
+        {
+          "name": "Tree uses standard characters",
+          "when": "the project structure is rendered in any markdown viewer",
+          "then": "it uses ├──, └──, and │ characters consistently",
+          "and_then": [
+            "indentation is uniform at each nesting level"
+          ]
+        },
+        {
+          "name": "Descriptions are aligned",
+          "when": "a developer scans the tree vertically",
+          "then": "the # comment descriptions start at approximately the same column",
+          "and_then": [
+            "no lines wrap at 80 characters"
+          ]
+        },
+        {
+          "name": "Code block is properly fenced",
+          "when": "the tree is inside a markdown code block",
+          "then": "it starts and ends with triple backticks",
+          "and_then": [
+            "no markdown formatting is applied inside the code block"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The README project structure tree SHALL be ordered alphabetically within each directory level",
+      "priority": "SHOULD",
+      "rationale": "Alphabetical ordering makes it easy to find a specific package by scanning",
+      "scenarios": [
+        {
+          "name": "internal/ packages ordered A-Z",
+          "when": "a developer reads the internal/ subtree",
+          "then": "packages are listed alphabetically: actions, agent, api, auditfwd, bridge, fsutil, ..., wireguard",
+          "and_then": []
+        },
+        {
+          "name": "deploy/ entries ordered",
+          "when": "a developer reads the deploy/ subtree",
+          "then": "entries are in alphabetical order",
+          "and_then": []
+        },
+        {
+          "name": "Top-level entries ordered",
+          "when": "a developer reads the top-level tree",
+          "then": "cmd/, deploy/, docs/, internal/ are in alphabetical order followed by files",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The README SHALL NOT contain references to non-existent standalone packages outside the project structure tree",
+      "priority": "SHOULD",
+      "rationale": "If phantom package names appear elsewhere in README prose, developers will still be confused",
+      "scenarios": [
+        {
+          "name": "No stale package references in prose",
+          "when": "a developer searches README.md for 'internal/mesh' or 'internal/observe' etc.",
+          "then": "these strings do not appear anywhere in the README outside of change-history or migration context",
+          "and_then": []
+        },
+        {
+          "name": "Prose references match tree entries",
+          "when": "the README mentions an internal package by path in descriptive text",
+          "then": "that package path matches an entry in the project structure tree",
+          "and_then": []
+        },
+        {
+          "name": "No broken cross-references",
+          "when": "the README references a file or directory path",
+          "then": "that path exists in the repository",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The docs/ entry in the project structure tree SHALL reflect the actual documentation structure",
+      "priority": "SHOULD",
+      "rationale": "The docs/ directory has reference/ and how-to/ subdirectories that should be visible",
+      "scenarios": [
+        {
+          "name": "docs/ subtree shown",
+          "when": "a developer reads the project structure tree",
+          "then": "docs/ shows its subdirectories: reference/ and how-to/",
+          "and_then": []
+        },
+        {
+          "name": "Accurate nesting",
+          "when": "docs/ is expanded in the tree",
+          "then": "each subdirectory listed actually exists",
+          "and_then": []
+        },
+        {
+          "name": "Not over-expanded",
+          "when": "the tree shows docs/",
+          "then": "individual .md files are not listed (only subdirectories for brevity)",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    "1.1 Audit current README project structure tree against filesystem: diff each entry in lines 1912-1945 against actual directories, produce a checklist of corrections needed (REQ-001, REQ-002, REQ-003)",
+    "1.2 Replace the project structure tree (lines 1914-1945) with corrected tree containing all 19 internal/ packages with accurate descriptions, corrected deploy/ subtree (cloud-init/, install.sh, kubernetes/crds/, systemd/), docs/ subtree (reference/, how-to/), removal of pkg/ and deploy/docker/, and consistent ASCII formatting (REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-008)",
+    "1.3 Scan README.md prose sections outside the project structure tree for stale references to phantom packages (internal/mesh, internal/observe, internal/logs, internal/audit, internal/access, internal/auth, internal/crypto, internal/hooks, internal/execution) and correct or remove them (REQ-007)"
+  ],
+  "test_specifications": [
+    {
+      "test_file": "manual_verification",
+      "test_function": "verify_all_tree_entries_exist_on_filesystem",
+      "story": "New developer reads accurate project structure in README",
+      "expected": "Every directory listed in the README tree should exist when checked with ls",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "manual_verification",
+      "test_function": "verify_no_phantom_directories_in_tree",
+      "story": "Developer sees accurate deploy/ tree in README",
+      "expected": "pkg/ and deploy/docker/ should not appear in the project structure tree",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "manual_verification",
+      "test_function": "verify_deploy_entries_complete",
+      "story": "Developer sees accurate deploy/ tree in README",
+      "expected": "deploy/cloud-init/, deploy/install.sh, deploy/kubernetes/crds/, deploy/systemd/ all listed",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "manual_verification",
+      "test_function": "verify_package_descriptions_accurate",
+      "story": "Developer sees all 19 internal packages in README",
+      "expected": "Each package description aligns with its Go doc comment or actual purpose",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "manual_verification",
+      "test_function": "verify_tree_formatting_consistent",
+      "story": "New developer reads accurate project structure in README",
+      "expected": "Tree uses consistent ASCII characters and alignment throughout",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "manual_verification",
+      "test_function": "verify_alphabetical_ordering",
+      "story": "Developer sees all 19 internal packages in README",
+      "expected": "Packages within internal/ are in A-Z order, deploy/ entries in A-Z order",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "manual_verification",
+      "test_function": "verify_no_stale_prose_references",
+      "story": "Contributor sees correct package name mappings",
+      "expected": "Searching README for phantom package paths returns zero results outside the git history context",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "manual_verification",
+      "test_function": "verify_docs_subtree_accurate",
+      "story": "New developer reads accurate project structure in README",
+      "expected": "docs/ entry shows reference/ and how-to/ subdirectories",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "manual_verification",
+      "test_function": "verify_internal_package_count",
+      "story": "Developer sees all 19 internal packages in README",
+      "expected": "Exactly 19 entries under internal/ in the tree, matching ls output",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "manual_verification",
+      "test_function": "verify_tree_entry_filesystem_1to1",
+      "story": "Reviewer can verify README accuracy against codebase",
+      "expected": "The set of directories listed in the tree equals the set of directories on disk",
+      "requirement_id": "REQ-001"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "Every directory in the README project structure tree exists in the repository (verified by ls)",
+    "Every actual directory under internal/ and deploy/ has a corresponding entry in the tree",
+    "No phantom directories remain: pkg/, deploy/docker/, internal/mesh, internal/observe, internal/logs, internal/audit, internal/access, internal/auth, internal/crypto, internal/hooks, internal/execution",
+    "Package descriptions are accurate and concise, matching Go doc comments",
+    "Tree formatting is consistent (ASCII characters, alignment, indentation)",
+    "No stale package path references remain in README prose outside the project structure tree"
+  ],
+  "implementation_notes": "This is a documentation-only change to README.md. The project structure tree at lines 1912-1945 needs to be completely replaced. The corrected tree must list all 19 actual internal/ packages (alphabetically): actions, agent, api, auditfwd, bridge, fsutil, integrity, kubernetes, logfwd, metrics, nat, nodeapi, packaging, peerexchange, policy, reconcile, registration, tunnel, wireguard. The deploy/ subtree must show: cloud-init/ (cloud-init templates and Terraform examples), install.sh (installer script), kubernetes/ (DaemonSet manifests, CRDs, RBAC), systemd/ (unit files). The phantom pkg/ and deploy/docker/ entries must be removed. The docs/ entry should show reference/ and how-to/ subdirectories. After editing the tree, scan the rest of README.md for any prose references to the old phantom package names and update them to use the correct package names. Key mapping: mesh→tunnel, observe→metrics, logs→logfwd, audit→auditfwd, access→tunnel (SSH/K8s access proxy is in tunnel package), crypto→api (verifier is in api package). auth, hooks, execution don't exist as standalone packages — their functionality is in api, actions, and actions respectively.",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T19:37:24.452942"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T19:37:32.975840"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T19:40:23.249721"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "4b261df0-c51e-42e9-98ad-2a57170fc8fc",
+      "timestamp": "2026-02-15T19:40:23.249788",
+      "total_duration": 167.09771084785461,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 167.09771084785461,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
