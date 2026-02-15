@@ -73,6 +73,18 @@ func (m *mockKubeClient) DeleteSecret(_ context.Context, _, name string) error {
 	return m.deleteSecretErr
 }
 
+func (m *mockKubeClient) WatchPlexdHooks(_ context.Context, _ string) (<-chan PlexdHookEvent, error) {
+	return nil, nil
+}
+
+func (m *mockKubeClient) UpdatePlexdHookStatus(_ context.Context, _ *PlexdHook) error {
+	return nil
+}
+
+func (m *mockKubeClient) CreateJob(_ context.Context, _ *PlexdJob) error {
+	return nil
+}
+
 type mockReportNotifier struct {
 	called int
 }

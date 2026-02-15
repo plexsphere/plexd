@@ -2,8 +2,8 @@
   "feature_id": "PXD-0030",
   "title": "G007: Implement K8s PlexdHook CRD controller and extensions",
   "slug": "g007-implement-k8s-plexdhook-crd-controller-and",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** infrastructure\n**Priority:** high\n**Source:** Proposed for 'The first implementation (see PLAN.md) is complete'\n\nComplete Kubernetes platform support:\n\n**PlexdHook CRD:** Create CRD YAML manifest for `plexdhooks.plexd.plexsphere.com` with `jobTemplate`, `parameters`, `privileged` fields. Add to `deploy/kubernetes/crds/`.\n\n**PlexdHook Controller:** K8s controller watching `PlexdHook` custom resources. Creates Jobs for hook execution with node pinning (nodeSelector/affinity), owner references for garbage collection, dedicated service account. Integrate with existing controller infrastructure in `internal/kubernetes/` alongside the PlexdNodeState CRD controller.\n\n**Wire into DaemonSet:** Ensure DaemonSet manifest includes proper RBAC for PlexdHook resources (get, list, watch, create jobs).\n\n**Rationale:** The PlexdHook CRD is the Kubernetes-native mechanism for executing operational hooks as Jobs. Without it, Kubernetes deployments cannot leverage the hook system for maintenance tasks, upgrades, or diagnostics. The existing codebase only has PlexdNodeState CRD support - PlexdHook is the second core CRD required for full K8s integration.\n\n**Affected Areas:**\n- deploy/kubernetes/crds/plexdhook-crd.yaml\n- internal/kubernetes/plexdhook_controller.go\n- internal/kubernetes/plexdhook_types.go\n- deploy/kubernetes/rbac.yaml\n- deploy/kubernetes/daemonset.yaml",
   "stories": [
@@ -417,13 +417,13 @@
     }
   ],
   "tasks": [
-    "1.1 Create PlexdHook Go types (PlexdHook, PlexdHookSpec, PlexdHookStatus, PlexdHookJobTemplate, PlexdHookParam, PlexdHookEvent) in internal/kubernetes/plexdhook_types.go with JSON tags matching CRD schema, and tests for JSON round-trip and field omission in plexdhook_types_test.go (REQ-002)",
-    "1.2 Extend KubeClient interface in internal/kubernetes/interfaces.go with WatchPlexdHooks(ctx, namespace) (<-chan PlexdHookEvent, error), UpdatePlexdHookStatus(ctx, hook *PlexdHook) error, CreateJob(ctx, job *PlexdJob) error methods, and add PlexdJob type with ownerReferences, nodeSelector, env, securityContext fields (REQ-003)",
-    "1.3 Implement PlexdHookController in internal/kubernetes/plexdhook_controller.go: constructor NewPlexdHookController(client, cfg, namespace, nodeName, logger), Start(ctx)/Stop() lifecycle, watch loop processing ADDED events, buildJob() method for Job construction with nodeSelector, ownerReferences, serviceAccount, security context, parameters-to-env conversion, and status update logic. Include tests in plexdhook_controller_test.go using mock KubeClient with test cases for: create Job on new hook, skip already-processed, handle create error, watch error, graceful shutdown, context cancellation, ErrAlreadyExists handling (REQ-004, REQ-005, REQ-007, REQ-008, REQ-009)",
-    "2.1 Create PlexdHook CRD YAML manifest at deploy/kubernetes/crds/plexdhook-crd.yaml following the PlexdNodeState CRD pattern: apiVersion apiextensions.k8s.io/v1, group plexd.plexsphere.com, kind PlexdHook, plural plexdhooks, short name ph, scope Namespaced, version v1alpha1, with spec fields hookName (required string), jobTemplate (optional object with image, command, args), parameters (optional array of name/value pairs), privileged (optional boolean default false), status subresource with jobName, phase, message, startedAt, completedAt fields, and printer columns for Hook Name, Privileged, Phase, Age (REQ-001)",
-    "2.2 Update deploy/kubernetes/rbac.yaml: add plexdhooks get/list/watch and plexdhooks/status get/update/patch to the plexd ClusterRole, add batch jobs create/get/list/watch to the plexd ClusterRole, add plexd-hook-reader consumer ClusterRole with get/list/watch on plexdhooks. Preserve all existing rules unchanged (REQ-006)",
-    "3.1 Write reference documentation at docs/reference/backend/plexdhook-crd.md covering: CRD schema field table, controller lifecycle, Job creation details (nodeSelector, ownerReferences, security context, parameters), RBAC permissions, example PlexdHook YAML manifest, status field meanings, and integration with existing Kubernetes deployment (REQ-010)",
-    "3.2 Update existing docs/reference/backend/kubernetes-deployment.md to add PlexdHook CRD to the manifests table, add plexdhooks and jobs RBAC entries to the RBAC permissions table, and cross-reference the new PlexdHook reference doc (REQ-010)"
+    "[done] 1.1 Create PlexdHook Go types (PlexdHook, PlexdHookSpec, PlexdHookStatus, PlexdHookJobTemplate, PlexdHookParam, PlexdHookEvent) in internal/kubernetes/plexdhook_types.go with JSON tags matching CRD schema, and tests for JSON round-trip and field omission in plexdhook_types_test.go (REQ-002)",
+    "[done] 1.2 Extend KubeClient interface in internal/kubernetes/interfaces.go with WatchPlexdHooks(ctx, namespace) (<-chan PlexdHookEvent, error), UpdatePlexdHookStatus(ctx, hook *PlexdHook) error, CreateJob(ctx, job *PlexdJob) error methods, and add PlexdJob type with ownerReferences, nodeSelector, env, securityContext fields (REQ-003)",
+    "[done] 1.3 Implement PlexdHookController in internal/kubernetes/plexdhook_controller.go: constructor NewPlexdHookController(client, cfg, namespace, nodeName, logger), Start(ctx)/Stop() lifecycle, watch loop processing ADDED events, buildJob() method for Job construction with nodeSelector, ownerReferences, serviceAccount, security context, parameters-to-env conversion, and status update logic. Include tests in plexdhook_controller_test.go using mock KubeClient with test cases for: create Job on new hook, skip already-processed, handle create error, watch error, graceful shutdown, context cancellation, ErrAlreadyExists handling (REQ-004, REQ-005, REQ-007, REQ-008, REQ-009)",
+    "[done] 2.1 Create PlexdHook CRD YAML manifest at deploy/kubernetes/crds/plexdhook-crd.yaml following the PlexdNodeState CRD pattern: apiVersion apiextensions.k8s.io/v1, group plexd.plexsphere.com, kind PlexdHook, plural plexdhooks, short name ph, scope Namespaced, version v1alpha1, with spec fields hookName (required string), jobTemplate (optional object with image, command, args), parameters (optional array of name/value pairs), privileged (optional boolean default false), status subresource with jobName, phase, message, startedAt, completedAt fields, and printer columns for Hook Name, Privileged, Phase, Age (REQ-001)",
+    "[done] 2.2 Update deploy/kubernetes/rbac.yaml: add plexdhooks get/list/watch and plexdhooks/status get/update/patch to the plexd ClusterRole, add batch jobs create/get/list/watch to the plexd ClusterRole, add plexd-hook-reader consumer ClusterRole with get/list/watch on plexdhooks. Preserve all existing rules unchanged (REQ-006)",
+    "[done] 3.1 Write reference documentation at docs/reference/backend/plexdhook-crd.md covering: CRD schema field table, controller lifecycle, Job creation details (nodeSelector, ownerReferences, security context, parameters), RBAC permissions, example PlexdHook YAML manifest, status field meanings, and integration with existing Kubernetes deployment (REQ-010)",
+    "[done] 3.2 Update existing docs/reference/backend/kubernetes-deployment.md to add PlexdHook CRD to the manifests table, add plexdhooks and jobs RBAC entries to the RBAC permissions table, and cross-reference the new PlexdHook reference doc (REQ-010)"
   ],
   "test_specifications": [
     {
@@ -594,6 +594,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-14T20:13:26.447574"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T18:37:35.917557"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T19:05:25.719478"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T19:05:25.773604"
     }
   },
   "execution_history": [
@@ -607,6 +619,50 @@
           "name": "prepare",
           "duration": 298.5633792877197,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "9fe40b94-5521-4071-bb3c-a31ad9232d1f",
+      "timestamp": "2026-02-15T18:59:33.863077",
+      "total_duration": 1187.3501811027527,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (3 tasks)",
+          "duration": 561.8378303050995,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (2 tasks)",
+          "duration": 136.66100215911865,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (2 tasks)",
+          "duration": 135.15708422660828,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0030] Code Review",
+          "duration": 110.14471125602722,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0030] Improvements",
+          "duration": 56.384652853012085,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0030] Simplify",
+          "duration": 187.16490030288696,
+          "type": "simplify",
           "status": "done"
         }
       ]

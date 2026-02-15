@@ -261,6 +261,7 @@ All manifests are in `deploy/kubernetes/`.
 |-------------------------|----------------------------------------------|
 | `namespace.yaml`        | `Namespace` (plexd-system)                   |
 | `crds/plexdnodestate-crd.yaml` | `CustomResourceDefinition` (PlexdNodeState) |
+| `crds/plexdhook-crd.yaml`     | `CustomResourceDefinition` (PlexdHook)      |
 | `serviceaccount.yaml`   | `ServiceAccount`                             |
 | `rbac.yaml`             | `ClusterRole` + `ClusterRoleBinding` + consumer roles |
 | `daemonset.yaml`        | `DaemonSet` with host networking and capabilities |
@@ -275,6 +276,9 @@ The `plexd` ClusterRole grants:
 | `plexd.plexsphere.com` | `plexdnodestates`         | get, list, watch, create, update, patch, delete |
 | `plexd.plexsphere.com` | `plexdnodestates/status`  | get, patch, update                             |
 | (core)                 | `secrets`                 | create, get, update, delete                    |
+| `plexd.plexsphere.com` | `plexdhooks`              | get, list, watch                               |
+| `plexd.plexsphere.com` | `plexdhooks/status`       | get, update, patch                             |
+| `batch`                | `jobs`                    | create, get, list, watch                       |
 | `authentication.k8s.io`| `tokenreviews`            | create                                         |
 
 Consumer RBAC roles:
@@ -284,6 +288,7 @@ Consumer RBAC roles:
 | `plexd-state-reader`    | `plexdnodestates`         | get, list, watch   |
 | `plexd-state-reporter`  | `plexdnodestates/status`  | get, patch         |
 | `plexd-secrets-reader`  | `secrets`                 | get                |
+| `plexd-hook-reader`     | `plexdhooks`              | get, list, watch   |
 
 ### DaemonSet configuration
 
@@ -326,6 +331,7 @@ Consumer RBAC roles:
 ## See also
 
 - [Kubernetes Deployment Guide](../../how-to/backend/kubernetes-deployment.md) — Step-by-step deployment guide
+- [PlexdHook CRD Reference](plexdhook-crd.md) — Hook execution via Kubernetes Jobs
 - [Audit Forwarding Reference](audit-forwarding.md) — Audit data collection and forwarding
 - [Local Node API Reference](nodeapi.md) — Node state API
 - [Registration Reference](registration.md) — Node registration

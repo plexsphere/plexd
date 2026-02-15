@@ -167,6 +167,142 @@ func TestKubeSecret_JSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPlexdJob_JSONRoundTrip(t *testing.T) {
+	job := PlexdJob{
+		Name:               "hook-job-abc123",
+		Namespace:          "plexd-system",
+		Labels:             map[string]string{"app": "plexd", "hook": "post-join"},
+		OwnerReferences:    []PlexdJobOwnerRef{{APIVersion: "plexd.plexsphere.com/v1", Kind: "PlexdHook", Name: "hook-1", UID: "uid-hook-1", Controller: true, BlockOwnerDeletion: true}},
+		NodeSelector:       map[string]string{"kubernetes.io/hostname": "node-1"},
+		ServiceAccountName: "plexd-hook-runner",
+		Containers:         []PlexdJobContainer{{Name: "run", Image: "busybox:latest", Command: []string{"/bin/sh"}, Args: []string{"-c", "echo hello"}, Env: map[string]string{"FOO": "bar"}, Privileged: false, ReadOnlyRootFS: true, DropCapabilities: []string{"ALL"}}},
+		RestartPolicy:      "Never",
+	}
+
+	data, err := json.Marshal(job)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+
+	var got PlexdJob
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+
+	if got.Name != job.Name {
+		t.Errorf("Name = %q, want %q", got.Name, job.Name)
+	}
+	if got.Namespace != job.Namespace {
+		t.Errorf("Namespace = %q, want %q", got.Namespace, job.Namespace)
+	}
+	if got.Labels["app"] != "plexd" {
+		t.Errorf("Labels[app] = %q, want %q", got.Labels["app"], "plexd")
+	}
+	if len(got.OwnerReferences) != 1 || got.OwnerReferences[0].Name != "hook-1" {
+		t.Errorf("OwnerReferences unexpected: %+v", got.OwnerReferences)
+	}
+	if got.NodeSelector["kubernetes.io/hostname"] != "node-1" {
+		t.Errorf("NodeSelector unexpected: %+v", got.NodeSelector)
+	}
+	if got.ServiceAccountName != job.ServiceAccountName {
+		t.Errorf("ServiceAccountName = %q, want %q", got.ServiceAccountName, job.ServiceAccountName)
+	}
+	if len(got.Containers) != 1 || got.Containers[0].Name != "run" {
+		t.Errorf("Containers unexpected: %+v", got.Containers)
+	}
+	if got.RestartPolicy != job.RestartPolicy {
+		t.Errorf("RestartPolicy = %q, want %q", got.RestartPolicy, job.RestartPolicy)
+	}
+}
+
+func TestPlexdJobContainer_JSONRoundTrip(t *testing.T) {
+	container := PlexdJobContainer{
+		Name:             "worker",
+		Image:            "alpine:3.19",
+		Command:          []string{"/bin/sh"},
+		Args:             []string{"-c", "sleep 10"},
+		Env:              map[string]string{"NODE_ID": "n1", "MODE": "hook"},
+		Privileged:       true,
+		ReadOnlyRootFS:   true,
+		DropCapabilities: []string{"NET_RAW", "SYS_ADMIN"},
+	}
+
+	data, err := json.Marshal(container)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+
+	var got PlexdJobContainer
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+
+	if got.Name != container.Name {
+		t.Errorf("Name = %q, want %q", got.Name, container.Name)
+	}
+	if got.Image != container.Image {
+		t.Errorf("Image = %q, want %q", got.Image, container.Image)
+	}
+	if len(got.Command) != 1 || got.Command[0] != "/bin/sh" {
+		t.Errorf("Command unexpected: %+v", got.Command)
+	}
+	if len(got.Args) != 2 || got.Args[1] != "sleep 10" {
+		t.Errorf("Args unexpected: %+v", got.Args)
+	}
+	if got.Env["NODE_ID"] != "n1" {
+		t.Errorf("Env[NODE_ID] = %q, want %q", got.Env["NODE_ID"], "n1")
+	}
+	if !got.Privileged {
+		t.Error("Privileged = false, want true")
+	}
+	if !got.ReadOnlyRootFS {
+		t.Error("ReadOnlyRootFS = false, want true")
+	}
+	if len(got.DropCapabilities) != 2 || got.DropCapabilities[0] != "NET_RAW" {
+		t.Errorf("DropCapabilities unexpected: %+v", got.DropCapabilities)
+	}
+}
+
+func TestPlexdJobOwnerRef_JSONRoundTrip(t *testing.T) {
+	ref := PlexdJobOwnerRef{
+		APIVersion:         "plexd.plexsphere.com/v1",
+		Kind:               "PlexdHook",
+		Name:               "hook-post-join",
+		UID:                "uid-456",
+		Controller:         true,
+		BlockOwnerDeletion: true,
+	}
+
+	data, err := json.Marshal(ref)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+
+	var got PlexdJobOwnerRef
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+
+	if got.APIVersion != ref.APIVersion {
+		t.Errorf("APIVersion = %q, want %q", got.APIVersion, ref.APIVersion)
+	}
+	if got.Kind != ref.Kind {
+		t.Errorf("Kind = %q, want %q", got.Kind, ref.Kind)
+	}
+	if got.Name != ref.Name {
+		t.Errorf("Name = %q, want %q", got.Name, ref.Name)
+	}
+	if got.UID != ref.UID {
+		t.Errorf("UID = %q, want %q", got.UID, ref.UID)
+	}
+	if !got.Controller {
+		t.Error("Controller = false, want true")
+	}
+	if !got.BlockOwnerDeletion {
+		t.Error("BlockOwnerDeletion = false, want true")
+	}
+}
+
 func TestSentinelErrors_ErrorsIs(t *testing.T) {
 	tests := []struct {
 		name   string

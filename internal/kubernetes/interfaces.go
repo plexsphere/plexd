@@ -75,6 +75,40 @@ type KubeSecret struct {
 	OwnerRefUID     string            `json:"ownerRefUID,omitempty"`
 }
 
+// PlexdJobContainer represents a container in a PlexdJob.
+type PlexdJobContainer struct {
+	Name             string            `json:"name"`
+	Image            string            `json:"image"`
+	Command          []string          `json:"command,omitempty"`
+	Args             []string          `json:"args,omitempty"`
+	Env              map[string]string `json:"env,omitempty"`
+	Privileged       bool              `json:"privileged,omitempty"`
+	ReadOnlyRootFS   bool              `json:"readOnlyRootFilesystem,omitempty"`
+	DropCapabilities []string          `json:"dropCapabilities,omitempty"`
+}
+
+// PlexdJobOwnerRef represents an owner reference for a PlexdJob.
+type PlexdJobOwnerRef struct {
+	APIVersion         string `json:"apiVersion"`
+	Kind               string `json:"kind"`
+	Name               string `json:"name"`
+	UID                string `json:"uid"`
+	Controller         bool   `json:"controller"`
+	BlockOwnerDeletion bool   `json:"blockOwnerDeletion"`
+}
+
+// PlexdJob represents a Kubernetes batch/v1 Job managed by plexd.
+type PlexdJob struct {
+	Name               string              `json:"name"`
+	Namespace          string              `json:"namespace"`
+	Labels             map[string]string   `json:"labels,omitempty"`
+	OwnerReferences    []PlexdJobOwnerRef  `json:"ownerReferences,omitempty"`
+	NodeSelector       map[string]string   `json:"nodeSelector,omitempty"`
+	ServiceAccountName string              `json:"serviceAccountName,omitempty"`
+	Containers         []PlexdJobContainer `json:"containers"`
+	RestartPolicy      string              `json:"restartPolicy"`
+}
+
 // KubeClient abstracts Kubernetes API interactions for testability.
 // All methods that modify state must be idempotent: repeating an operation
 // that is already applied returns nil.
@@ -110,4 +144,16 @@ type KubeClient interface {
 	// DeleteSecret deletes a Kubernetes Secret.
 	// Returns nil if the secret does not exist (idempotent).
 	DeleteSecret(ctx context.Context, namespace, name string) error
+
+	// WatchPlexdHooks starts a watch on PlexdHook resources in the given namespace.
+	// Returns a channel that receives events until the context is cancelled.
+	WatchPlexdHooks(ctx context.Context, namespace string) (<-chan PlexdHookEvent, error)
+
+	// UpdatePlexdHookStatus updates the status subresource of a PlexdHook resource.
+	// Returns ErrNotFound if the resource does not exist.
+	UpdatePlexdHookStatus(ctx context.Context, hook *PlexdHook) error
+
+	// CreateJob creates a Kubernetes batch/v1 Job.
+	// Returns ErrAlreadyExists if the Job already exists.
+	CreateJob(ctx context.Context, job *PlexdJob) error
 }
