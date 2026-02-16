@@ -1,0 +1,68 @@
+# Kubernetes manifests for the mock Central API used by the Kubernetes E2E test.
+# Deploys a single-replica Deployment and a ClusterIP Service so that plexd
+# DaemonSet pods can reach the mock API at http://mock-api.plexd-e2e:8080.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-api
+  namespace: plexd-e2e
+  labels:
+    app.kubernetes.io/name: mock-api
+    app.kubernetes.io/part-of: plexd-e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mock-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mock-api
+        app.kubernetes.io/part-of: plexd-e2e
+    spec:
+      containers:
+        - name: mock-api
+          image: mockapi:e2e
+          imagePullPolicy: Never
+          args: ["-addr", ":8080"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /v1/ping
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /v1/ping
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-api
+  namespace: plexd-e2e
+  labels:
+    app.kubernetes.io/name: mock-api
+    app.kubernetes.io/part-of: plexd-e2e
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mock-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
