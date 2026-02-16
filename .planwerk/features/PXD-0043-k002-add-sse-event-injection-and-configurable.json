@@ -1,0 +1,724 @@
+{
+  "feature_id": "PXD-0043",
+  "title": "K002: Add SSE event injection and configurable state",
+  "slug": "k002-add-sse-event-injection-and-configurable",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 📦 medium\n**Category:** testing\n**Priority:** high\n**Source:** Proposed for 'With the latest commits/features, E2E tests were added'\n\nThree additions to test/e2e/mockapi/mockapi.go: (1) SSE Event Injection — add broadcast channel slice to Server struct for connected SSE clients, modify existing SSE handler to register/deregister clients on fan-out list, implement POST /test/inject-event that accepts {event_type, payload} JSON, wraps in SSE wire format, broadcasts to all connected clients. (2) Configurable State — add mutable StateResponse field to Server (sync.RWMutex-protected), implement POST /test/configure-state that replaces the active state fixture at runtime, modify handleState to read from mutable fixture instead of hardcoded default. (3) State Fixture Enrichment — extend default StateResponse with SigningKeys (current + previous pub keys), BridgeConfig{Enabled: false}, RelayConfig{Sessions: []}, UserAccessConfig{Enabled: false}, IngressConfig{Enabled: false}, SiteToSiteConfig{Enabled: false}, 2 sample Data entries, 1 sample SecretRef.\n\n**Rationale:** The SSE stream currently only emits node_state_updated while the agent handles 25 event types — there's no way to test execution flows (action_request → ack → result) or other event-driven behaviors. The state fixture lacks SigningKeys, BridgeConfig, RelayConfig, and other fields, so reconciliation code paths for these features are never exercised. Configurable state enables test scripts to set up specific scenarios without rebuilding the mock.\n\n**Affected Areas:**\n- test/e2e/mockapi/mockapi.go",
+  "stories": [
+    {
+      "title": "Test author can inject arbitrary SSE events into connected clients",
+      "role": "test author",
+      "want": "to inject arbitrary SSE events (any of the 25 event types) into connected mock API SSE clients at runtime",
+      "so_that": "I can test event-driven agent behaviors (e.g. action_request → ack → result) without rebuilding the mock",
+      "criteria": [
+        "POST /test/inject-event accepts {event_type, payload} JSON and returns 200",
+        "Injected event is delivered to all connected SSE clients in SignedEnvelope wire format",
+        "Multiple concurrent SSE clients each receive the injected event",
+        "POST /test/inject-event returns 400 when request body is invalid JSON",
+        "POST /test/inject-event returns 200 even when no SSE clients are connected (no-op broadcast)"
+      ]
+    },
+    {
+      "title": "Test author can replace the state fixture at runtime",
+      "role": "test author",
+      "want": "to replace the active StateResponse fixture via HTTP at runtime",
+      "so_that": "I can set up specific reconciliation scenarios without rebuilding or restarting the mock server",
+      "criteria": [
+        "POST /test/configure-state accepts a full api.StateResponse JSON body and returns 200",
+        "Subsequent GET /v1/nodes/{id}/state returns the configured state instead of the default",
+        "State replacement is atomic — concurrent readers never see a partial update",
+        "POST /test/configure-state returns 400 when request body is invalid JSON",
+        "After configure-state, the state_count counter still increments on each GET /v1/nodes/{id}/state call"
+      ]
+    },
+    {
+      "title": "Test author sees enriched default state fixture covering all config fields",
+      "role": "test author",
+      "want": "the default StateResponse fixture to include SigningKeys, BridgeConfig, RelayConfig, UserAccessConfig, IngressConfig, SiteToSiteConfig, sample Data entries, and a sample SecretRef",
+      "so_that": "reconciliation code paths for all features are exercised even without explicit state configuration",
+      "criteria": [
+        "Default state includes SigningKeys with current and previous public key strings",
+        "Default state includes BridgeConfig with Enabled=false and empty AccessSubnets",
+        "Default state includes RelayConfig with empty Sessions slice",
+        "Default state includes UserAccessConfig with Enabled=false",
+        "Default state includes IngressConfig with Enabled=false and empty Rules",
+        "Default state includes SiteToSiteConfig with Enabled=false and empty Tunnels",
+        "Default state includes 2 DataEntry items with distinct keys, content types, and payloads",
+        "Default state includes 1 SecretRef with a key and version"
+      ]
+    },
+    {
+      "title": "SSE handler supports fan-out to multiple concurrent clients",
+      "role": "system",
+      "want": "the SSE handler to register and deregister clients on a fan-out list so injected events reach all connected clients",
+      "so_that": "multi-client E2E scenarios can be tested and client disconnects are handled cleanly",
+      "criteria": [
+        "Each SSE client connection is registered on the Server broadcast list",
+        "Client disconnection (context cancellation) removes the client from the broadcast list",
+        "Injected events are delivered to all registered clients without blocking the injector",
+        "No goroutine leak when clients connect and disconnect repeatedly"
+      ]
+    },
+    {
+      "title": "Existing mock API behavior is preserved after changes",
+      "role": "test author",
+      "want": "all existing endpoints and test behavior to remain unchanged after adding new features",
+      "so_that": "existing E2E tests continue to pass without modification",
+      "criteria": [
+        "All existing unit tests pass without modification",
+        "GET /v1/nodes/{id}/events still sends the initial node_state_updated event on connection",
+        "SSE keep-alive comments continue at KeepAliveInterval",
+        "GET /test/assertions still returns all existing counter fields",
+        "Concurrent counter tests still pass under race detector"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The mock server SHALL maintain a thread-safe broadcast list of connected SSE clients on the Server struct",
+      "priority": "SHALL",
+      "rationale": "Fan-out broadcast requires tracking connected clients so injected events can be delivered to all of them",
+      "scenarios": [
+        {
+          "name": "Client registers on connect",
+          "when": "an SSE client connects to GET /v1/nodes/{id}/events",
+          "then": "a buffered channel is added to the Server's broadcast client slice",
+          "and_then": [
+            "the client receives the initial node_state_updated event as before"
+          ]
+        },
+        {
+          "name": "Client deregisters on disconnect",
+          "when": "an SSE client disconnects (context cancelled)",
+          "then": "the client's channel is removed from the broadcast slice",
+          "and_then": [
+            "the goroutine exits cleanly with no leak"
+          ]
+        },
+        {
+          "name": "Concurrent client registration is safe",
+          "when": "multiple SSE clients connect and disconnect concurrently",
+          "then": "the broadcast slice is modified under mutex protection without data races",
+          "and_then": [
+            "go test -race detects no issues"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The mock server SHALL implement POST /test/inject-event that broadcasts a SignedEnvelope to all connected SSE clients",
+      "priority": "SHALL",
+      "rationale": "Enables test scripts to trigger any of the 25 event types to exercise event-driven agent behaviors",
+      "scenarios": [
+        {
+          "name": "Valid injection with connected clients",
+          "when": "POST /test/inject-event receives {\"event_type\":\"action_request\",\"payload\":{\"action_id\":\"a1\"}} and clients are connected",
+          "then": "the server wraps the input in a SignedEnvelope with generated event_id, issued_at, nonce, and mock signature, formats as SSE wire format, and sends to all connected clients",
+          "and_then": [
+            "returns HTTP 200 with empty JSON body"
+          ]
+        },
+        {
+          "name": "Valid injection with no connected clients",
+          "when": "POST /test/inject-event receives valid JSON but no SSE clients are connected",
+          "then": "the server returns HTTP 200 (no-op broadcast)",
+          "and_then": [
+            "no error occurs"
+          ]
+        },
+        {
+          "name": "Invalid JSON body",
+          "when": "POST /test/inject-event receives invalid JSON",
+          "then": "the server returns HTTP 400 with error message",
+          "and_then": [
+            "no event is broadcast"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The mock server SHALL implement POST /test/configure-state that replaces the active StateResponse fixture at runtime using sync.RWMutex",
+      "priority": "SHALL",
+      "rationale": "Enables test scripts to configure specific state scenarios without rebuilding the mock",
+      "scenarios": [
+        {
+          "name": "Valid state replacement",
+          "when": "POST /test/configure-state receives a valid api.StateResponse JSON body",
+          "then": "the server replaces the mutable state fixture (write-locked) and returns HTTP 200",
+          "and_then": [
+            "subsequent GET /v1/nodes/{id}/state returns the new state"
+          ]
+        },
+        {
+          "name": "Invalid JSON body",
+          "when": "POST /test/configure-state receives invalid JSON",
+          "then": "the server returns HTTP 400 with error message",
+          "and_then": [
+            "the active state fixture is unchanged"
+          ]
+        },
+        {
+          "name": "Concurrent state reads during replacement",
+          "when": "GET /v1/nodes/{id}/state is called concurrently with POST /test/configure-state",
+          "then": "readers see either the old or new complete state (never partial)",
+          "and_then": [
+            "no data race under go test -race"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The handleState handler SHALL read from the mutable state fixture protected by sync.RWMutex read-lock",
+      "priority": "SHALL",
+      "rationale": "Required for configurable state to take effect on state endpoint responses",
+      "scenarios": [
+        {
+          "name": "Default state returned before configuration",
+          "when": "GET /v1/nodes/{id}/state is called before any POST /test/configure-state",
+          "then": "the enriched default fixture is returned",
+          "and_then": [
+            "state_count increments"
+          ]
+        },
+        {
+          "name": "Configured state returned after replacement",
+          "when": "POST /test/configure-state sets a custom state, then GET /v1/nodes/{id}/state is called",
+          "then": "the custom state is returned",
+          "and_then": [
+            "state_count still increments"
+          ]
+        },
+        {
+          "name": "Counter increments regardless of fixture source",
+          "when": "GET /v1/nodes/{id}/state is called multiple times",
+          "then": "state_count increments on every call regardless of which fixture is active",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The default StateResponse fixture SHALL include SigningKeys with current and previous mock public key strings",
+      "priority": "SHALL",
+      "rationale": "Exercises the signing key reconciliation code path in the agent's Ed25519Verifier",
+      "scenarios": [
+        {
+          "name": "SigningKeys present in default state",
+          "when": "GET /v1/nodes/{id}/state is called with default fixture",
+          "then": "response includes signing_keys with non-empty current and previous strings",
+          "and_then": []
+        },
+        {
+          "name": "SigningKeys omitted when nil via configure-state",
+          "when": "POST /test/configure-state sets a StateResponse with nil SigningKeys",
+          "then": "the signing_keys field is omitted from JSON response (omitempty)",
+          "and_then": []
+        },
+        {
+          "name": "Previous key string differs from current",
+          "when": "the default fixture signing keys are inspected",
+          "then": "current and previous are distinct mock public key strings",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The default StateResponse SHALL include disabled BridgeConfig, empty RelayConfig, disabled UserAccessConfig, disabled IngressConfig, and disabled SiteToSiteConfig",
+      "priority": "SHALL",
+      "rationale": "Exercises reconciliation code paths for all feature modules even when features are disabled",
+      "scenarios": [
+        {
+          "name": "All config sections present in default state",
+          "when": "GET /v1/nodes/{id}/state is called with default fixture",
+          "then": "bridge_config has empty access_subnets and false flags; relay_config has empty sessions; user_access_config has enabled=false; ingress_config has enabled=false and empty rules; site_to_site_config has enabled=false and empty tunnels",
+          "and_then": []
+        },
+        {
+          "name": "JSON field names match internal/api types",
+          "when": "the response JSON is inspected",
+          "then": "field names are: bridge_config, relay_config, user_access_config, ingress_config, site_to_site_config",
+          "and_then": []
+        },
+        {
+          "name": "Configs can be replaced via configure-state",
+          "when": "POST /test/configure-state sets enabled configs",
+          "then": "GET returns the configured state with enabled configs",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The default StateResponse SHALL include 2 sample DataEntry items and 1 sample SecretRef",
+      "priority": "SHALL",
+      "rationale": "Exercises data distribution and secret reference reconciliation code paths that were previously untested",
+      "scenarios": [
+        {
+          "name": "Data entries present with required fields",
+          "when": "GET /v1/nodes/{id}/state is called with default fixture",
+          "then": "response includes 2 DataEntry items with distinct keys, content_type, non-empty payload, version >= 1, and valid updated_at",
+          "and_then": []
+        },
+        {
+          "name": "SecretRef present with required fields",
+          "when": "GET /v1/nodes/{id}/state is called with default fixture",
+          "then": "response includes 1 SecretRef with non-empty key and version >= 1",
+          "and_then": []
+        },
+        {
+          "name": "Data and SecretRefs are non-nil slices",
+          "when": "the response is deserialized",
+          "then": "Data and SecretRefs are non-nil slices (not null in JSON)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "Injected SSE events SHALL use standard SSE wire format with SignedEnvelope JSON data",
+      "priority": "SHALL",
+      "rationale": "The agent SSE client (internal/api/sse.go) expects id:, event:, data: fields with JSON SignedEnvelope",
+      "scenarios": [
+        {
+          "name": "Correct SSE wire format",
+          "when": "an event is injected and received by an SSE client",
+          "then": "the output contains 'id: <event_id>\\nevent: <event_type>\\ndata: <json>\\n\\n'",
+          "and_then": []
+        },
+        {
+          "name": "SignedEnvelope has generated fields",
+          "when": "an event is injected with event_type and payload",
+          "then": "the SignedEnvelope includes generated event_id, current issued_at, nonce, and mock signature",
+          "and_then": []
+        },
+        {
+          "name": "Payload preserved in envelope",
+          "when": "POST /test/inject-event sends a specific payload",
+          "then": "the SignedEnvelope payload field contains the exact JSON from the request",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "All new mutable state on Server struct SHALL be safe for concurrent access",
+      "priority": "SHALL",
+      "rationale": "The mock server handles concurrent HTTP requests; new fields must avoid data races",
+      "scenarios": [
+        {
+          "name": "Concurrent SSE inject + client connect/disconnect",
+          "when": "POST /test/inject-event and SSE client connections happen concurrently",
+          "then": "no data race or panic occurs under go test -race",
+          "and_then": []
+        },
+        {
+          "name": "Concurrent configure-state + state reads",
+          "when": "POST /test/configure-state and GET /v1/nodes/{id}/state happen concurrently",
+          "then": "no data race under go test -race",
+          "and_then": []
+        },
+        {
+          "name": "Inject event counter atomic",
+          "when": "inject event counter for assertions is incremented concurrently",
+          "then": "counter value is accurate",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "All existing mock API behavior SHALL remain unchanged",
+      "priority": "SHALL",
+      "rationale": "Existing E2E tests depend on current behavior; regressions would break CI",
+      "scenarios": [
+        {
+          "name": "Initial SSE event still sent",
+          "when": "SSE client connects",
+          "then": "the initial node_state_updated event is sent before any injected events",
+          "and_then": [
+            "keep-alive comments continue"
+          ]
+        },
+        {
+          "name": "Existing assertion counters preserved",
+          "when": "GET /test/assertions is called",
+          "then": "response includes registration_count, heartbeat_count, state_count, metadata_count",
+          "and_then": []
+        },
+        {
+          "name": "Existing tests pass unmodified",
+          "when": "go test ./test/e2e/mockapi/ -race is run",
+          "then": "all pre-existing tests pass",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "1.1",
+      "title": "Add SSE broadcast infrastructure to Server struct (REQ-001, REQ-009)",
+      "description": "Add to Server struct: `sseClients []chan []byte` (broadcast channel slice), `sseMu sync.Mutex` (protects sseClients), `injectCount atomic.Int64` (assertion counter). Add helper methods: `addSSEClient(ch chan []byte)`, `removeSSEClient(ch chan []byte)`, `broadcastSSE(data []byte)`. broadcastSSE iterates sseClients under lock, does non-blocking send (select with default to skip slow clients). Use buffered channels (cap 16). Add `InjectEventCount` field to AssertionCounters JSON.",
+      "files": [
+        "test/e2e/mockapi/mockapi.go"
+      ],
+      "level": 1,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-001",
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "1.2",
+      "title": "Add mutable state fixture field to Server struct with RWMutex (REQ-003, REQ-004, REQ-009)",
+      "description": "Add to Server struct: `stateMu sync.RWMutex`, `stateFixture api.StateResponse`. In New(), initialize stateFixture with the enriched default (task 1.3 value). Add helper: `getState() api.StateResponse` (read-locks, copies, returns), `setState(s api.StateResponse)` (write-locks, replaces). Modify handleState to call getState() instead of building inline.",
+      "files": [
+        "test/e2e/mockapi/mockapi.go"
+      ],
+      "level": 1,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-003",
+        "REQ-004",
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "1.3",
+      "title": "Enrich default StateResponse fixture with all config sections, data, and secret refs (REQ-005, REQ-006, REQ-007)",
+      "description": "Create a `defaultStateFixture()` function returning api.StateResponse with: existing Peers (fixturePeers), existing Policies (1 policy with 2 rules), existing Metadata, new SigningKeys{Current: 'mock-signing-current-pub-key-base64==', Previous: 'mock-signing-previous-pub-key-base64=='}, BridgeConfig{AccessSubnets: []string{}, EnableNAT: false, EnableForwarding: false}, RelayConfig{Sessions: []RelaySessionAssignment{}}, UserAccessConfig{Enabled: false, InterfaceName: '', ListenPort: 0, Peers: []UserAccessPeer{}}, IngressConfig{Enabled: false, Rules: []IngressRule{}}, SiteToSiteConfig{Enabled: false, Tunnels: []SiteToSiteTunnel{}}, 2 DataEntry items (key='config/app.json', content_type='application/json', payload='{\"debug\":true}', version=1 / key='templates/welcome.txt', content_type='text/plain', payload='\"Welcome to PlexD\"', version=1), 1 SecretRef{Key: 'db/credentials', Version: 1}. Use time.Date(2025,1,1,0,0,0,0,time.UTC) for updated_at.",
+      "files": [
+        "test/e2e/mockapi/mockapi.go"
+      ],
+      "level": 1,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-005",
+        "REQ-006",
+        "REQ-007"
+      ]
+    },
+    {
+      "id": "2.1",
+      "title": "Modify handleEvents to register/deregister SSE clients on broadcast list (REQ-001, REQ-010)",
+      "description": "Modify handleEvents: after sending initial event, create buffered chan []byte (cap 16), call addSSEClient(ch), defer removeSSEClient(ch). In the select loop, add case for receiving from ch — write received bytes to ResponseWriter and flush. Keep existing keep-alive tick case and context done case. Initial node_state_updated event still sent first (before registering on broadcast list). This preserves all existing behavior.",
+      "files": [
+        "test/e2e/mockapi/mockapi.go"
+      ],
+      "level": 2,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-001",
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "2.2",
+      "title": "Implement POST /test/inject-event handler (REQ-002, REQ-008)",
+      "description": "Create handleInjectEvent handler: decode JSON body with fields {event_type string, payload json.RawMessage}. On decode error, return 400. Increment injectCount. Build SignedEnvelope{EventType: req.EventType, EventID: fmt.Sprintf('evt-inject-%03d', injectCount.Load()), IssuedAt: time.Now().UTC(), Nonce: fmt.Sprintf('nonce-inject-%03d', injectCount.Load()), Payload: req.Payload, Signature: 'mock-signature-injected'}. Marshal to JSON. Format as SSE wire: 'id: %s\\nevent: %s\\ndata: %s\\n\\n'. Call broadcastSSE(formatted). Return 200 with {}. Register route: s.mux.HandleFunc('POST /test/inject-event', s.handleInjectEvent).",
+      "files": [
+        "test/e2e/mockapi/mockapi.go"
+      ],
+      "level": 2,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-002",
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "2.3",
+      "title": "Implement POST /test/configure-state handler (REQ-003)",
+      "description": "Create handleConfigureState handler: decode JSON body into api.StateResponse. On decode error, return 400. Call setState(decoded). Return 200 with {}. Register route: s.mux.HandleFunc('POST /test/configure-state', s.handleConfigureState).",
+      "files": [
+        "test/e2e/mockapi/mockapi.go"
+      ],
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.4",
+      "title": "Update AssertionCounters and handleAssertions for inject_event_count (REQ-002)",
+      "description": "Add InjectEventCount int64 `json:\"inject_event_count\"` to AssertionCounters. Update Assertions() method to include InjectEventCount: s.injectCount.Load().",
+      "files": [
+        "test/e2e/mockapi/mockapi.go"
+      ],
+      "level": 2,
+      "estimate_minutes": 5,
+      "requirements": [
+        "REQ-002"
+      ]
+    },
+    {
+      "id": "3.1",
+      "title": "Write unit tests for enriched default state fixture (REQ-005, REQ-006, REQ-007, REQ-010)",
+      "description": "Add tests: TestState_DefaultFixture_HasSigningKeys — verify signing_keys.current and signing_keys.previous are non-empty and distinct. TestState_DefaultFixture_HasDisabledConfigs — verify bridge_config, relay_config, user_access_config, ingress_config, site_to_site_config all present with disabled/empty fields. TestState_DefaultFixture_HasDataAndSecretRefs — verify 2 DataEntry with distinct keys and valid fields, 1 SecretRef. TestState_DefaultFixture_BackwardCompatible — verify existing peers (2), policies (1 with 2 rules), metadata still present. Update existing TestState_ReturnsFixturePeersAndPolicies to expect 2 Data entries and 1 SecretRef instead of 0.",
+      "files": [
+        "test/e2e/mockapi/mockapi_test.go"
+      ],
+      "test_files": [
+        "test/e2e/mockapi/mockapi_test.go"
+      ],
+      "level": 3,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-005",
+        "REQ-006",
+        "REQ-007",
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "3.2",
+      "title": "Write unit tests for POST /test/configure-state (REQ-003, REQ-004)",
+      "description": "Add tests: TestConfigureState_ReplacesActiveFixture — POST a custom StateResponse, then GET state and verify it matches. TestConfigureState_InvalidJSON_Returns400 — POST invalid body, verify 400. TestConfigureState_CounterStillIncrements — POST configure-state, then GET state twice, verify state_count = 2.",
+      "files": [
+        "test/e2e/mockapi/mockapi_test.go"
+      ],
+      "test_files": [
+        "test/e2e/mockapi/mockapi_test.go"
+      ],
+      "level": 3,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-003",
+        "REQ-004"
+      ]
+    },
+    {
+      "id": "3.3",
+      "title": "Write unit tests for POST /test/inject-event (REQ-002, REQ-008)",
+      "description": "Add tests: TestInjectEvent_DeliversToConnectedClient — connect SSE client, POST inject-event with event_type='action_request', read from SSE stream, verify the injected event appears after initial event with correct SSE wire format. TestInjectEvent_SSEWireFormat — verify id:, event:, data: fields. TestInjectEvent_SignedEnvelopeFields — parse the data JSON, verify event_id starts with 'evt-inject-', issued_at is recent, nonce non-empty, signature is 'mock-signature-injected', payload matches request. TestInjectEvent_NoClients_Returns200 — POST inject-event with no SSE clients, verify 200. TestInjectEvent_InvalidJSON_Returns400 — POST invalid body, verify 400.",
+      "files": [
+        "test/e2e/mockapi/mockapi_test.go"
+      ],
+      "test_files": [
+        "test/e2e/mockapi/mockapi_test.go"
+      ],
+      "level": 3,
+      "estimate_minutes": 30,
+      "requirements": [
+        "REQ-002",
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "3.4",
+      "title": "Write unit tests for SSE fan-out: multiple clients, disconnect cleanup (REQ-001)",
+      "description": "Add tests: TestInjectEvent_MultipleClients — connect 2 SSE clients, inject one event, verify both receive it. TestEvents_ClientDeregisterOnDisconnect — connect client, cancel context, inject event, verify no panic/block. TestEvents_InitialEventStillSentAfterFanout — connect SSE client, verify first event is still node_state_updated.",
+      "files": [
+        "test/e2e/mockapi/mockapi_test.go"
+      ],
+      "test_files": [
+        "test/e2e/mockapi/mockapi_test.go"
+      ],
+      "level": 3,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-001"
+      ]
+    },
+    {
+      "id": "3.5",
+      "title": "Write concurrency test for inject-event + configure-state (REQ-009)",
+      "description": "Add TestConcurrentInjectAndConfigureState: spawn goroutines concurrently doing: 50x POST inject-event, 50x POST configure-state, 50x GET state, 10x SSE connect+read+disconnect. Use sync.WaitGroup, verify no panics, verify counters are consistent. Run with -race.",
+      "files": [
+        "test/e2e/mockapi/mockapi_test.go"
+      ],
+      "test_files": [
+        "test/e2e/mockapi/mockapi_test.go"
+      ],
+      "level": 3,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "4.1",
+      "title": "Update mock API reference documentation (REQ-002, REQ-003, REQ-005, REQ-006, REQ-007)",
+      "description": "Update docs/reference/backend/mock-api-server.md: add sections for POST /test/inject-event (request format, response, behavior), POST /test/configure-state (request format, response, behavior). Update state endpoint section to document enriched default fixture including all new fields. Add inject_event_count to the call counters table. Update wire compatibility section to mention new types used.",
+      "files": [
+        "docs/reference/backend/mock-api-server.md"
+      ],
+      "level": 4,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-002",
+        "REQ-003",
+        "REQ-005",
+        "REQ-006",
+        "REQ-007"
+      ]
+    }
+  ],
+  "test_specifications": [
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestInjectEvent_DeliversToConnectedClient",
+      "story": "Test author can inject arbitrary SSE events into connected clients",
+      "expected": "POST /test/inject-event should deliver the event in SSE wire format to a connected SSE client, with correct id:, event:, data: fields containing a valid SignedEnvelope",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestInjectEvent_MultipleClients",
+      "story": "Test author can inject arbitrary SSE events into connected clients",
+      "expected": "POST /test/inject-event should deliver the event to all connected SSE clients simultaneously",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestInjectEvent_NoClients_Returns200",
+      "story": "Test author can inject arbitrary SSE events into connected clients",
+      "expected": "POST /test/inject-event returns 200 even when no SSE clients are connected",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestInjectEvent_InvalidJSON_Returns400",
+      "story": "Test author can inject arbitrary SSE events into connected clients",
+      "expected": "POST /test/inject-event returns 400 when body is not valid JSON",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestConfigureState_ReplacesActiveFixture",
+      "story": "Test author can replace the state fixture at runtime",
+      "expected": "After POST /test/configure-state with a custom StateResponse, GET /v1/nodes/{id}/state returns the custom state",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestConfigureState_InvalidJSON_Returns400",
+      "story": "Test author can replace the state fixture at runtime",
+      "expected": "POST /test/configure-state returns 400 when body is not valid JSON, active fixture unchanged",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestConfigureState_CounterStillIncrements",
+      "story": "Test author can replace the state fixture at runtime",
+      "expected": "state_count increments on GET /v1/nodes/{id}/state after configure-state",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestState_DefaultFixture_HasSigningKeys",
+      "story": "Test author sees enriched default state fixture covering all config fields",
+      "expected": "Default state response includes non-nil SigningKeys with distinct current and previous strings",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestState_DefaultFixture_HasDisabledConfigs",
+      "story": "Test author sees enriched default state fixture covering all config fields",
+      "expected": "Default state includes BridgeConfig, RelayConfig, UserAccessConfig, IngressConfig, SiteToSiteConfig all present but disabled/empty",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestState_DefaultFixture_HasDataAndSecretRefs",
+      "story": "Test author sees enriched default state fixture covering all config fields",
+      "expected": "Default state includes 2 DataEntry items with valid fields and 1 SecretRef with valid fields",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestInjectEvent_SSEWireFormat",
+      "story": "Test author can inject arbitrary SSE events into connected clients",
+      "expected": "Injected event SSE output has 'id:', 'event:', 'data:' fields with valid SignedEnvelope JSON in data",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestEvents_ClientDeregisterOnDisconnect",
+      "story": "SSE handler supports fan-out to multiple concurrent clients",
+      "expected": "After SSE client disconnects, subsequent inject-event does not block or panic",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestConcurrentInjectAndConfigureState",
+      "story": "Existing mock API behavior is preserved after changes",
+      "expected": "Concurrent inject-event, configure-state, SSE connect/disconnect, and state reads all pass under -race",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestState_DefaultFixture_BackwardCompatible",
+      "story": "Existing mock API behavior is preserved after changes",
+      "expected": "Default state still includes existing peers (2), policies (1), and metadata fields — enrichment is additive",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestEvents_InitialEventStillSentAfterFanout",
+      "story": "Existing mock API behavior is preserved after changes",
+      "expected": "SSE client still receives node_state_updated as first event after connecting, even with fan-out changes",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestInjectEvent_SignedEnvelopeFields",
+      "story": "Test author can inject arbitrary SSE events into connected clients",
+      "expected": "The SignedEnvelope in injected event has generated event_id starting with 'evt-inject-', current issued_at, non-empty nonce, and mock signature",
+      "requirement_id": "REQ-008"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All existing unit tests in mockapi_test.go pass without modification (except TestState_ReturnsFixturePeersAndPolicies which must be updated for enriched Data/SecretRefs)",
+    "go test ./test/e2e/mockapi/ -race passes with zero data races",
+    "POST /test/inject-event delivers events in correct SSE wire format (id:/event:/data: with SignedEnvelope JSON) to all connected clients",
+    "POST /test/configure-state atomically replaces the state fixture; concurrent GET /v1/nodes/{id}/state never sees partial state",
+    "Default StateResponse includes all enriched fields: SigningKeys, BridgeConfig, RelayConfig, UserAccessConfig, IngressConfig, SiteToSiteConfig, 2 DataEntry, 1 SecretRef",
+    "All new code follows existing patterns: atomic.Int64 for counters, sync.RWMutex for mutable state, writeJSON helper for responses, httptest.NewServer for tests",
+    "No goroutine leaks: SSE client channels are properly deregistered on disconnect",
+    "inject_event_count appears in GET /test/assertions response",
+    "Documentation updated in docs/reference/backend/mock-api-server.md covering all 3 new features"
+  ],
+  "implementation_notes": "Architecture: The Server struct gains 3 new field groups: (1) SSE broadcast — `sseClients []chan []byte` + `sseMu sync.Mutex` for client fan-out, (2) Mutable state — `stateFixture api.StateResponse` + `stateMu sync.RWMutex` for configurable state, (3) Inject counter — `injectCount atomic.Int64`. The broadcast uses buffered channels (cap 16) with non-blocking sends to avoid slow-client back-pressure blocking the injector. The state fixture is initialized with defaultStateFixture() in New() and replaced atomically via setState(). handleState switches from inline construction to getState() read. handleEvents adds a broadcast channel case to its select loop alongside keep-alive and context-done. Key patterns from codebase: sync.RWMutex usage in internal/api/client.go (SetAuthToken/getAuthToken) and internal/api/verifier.go (SetKeys/Verify) — same Lock/Unlock, RLock/RUnlock pattern. Atomic counters follow existing atomic.Int64 pattern. SSE wire format follows existing handleEvents: 'id: %s\\nevent: %s\\ndata: %s\\n\\n'. Risks: (1) Slow SSE client could fill channel buffer — mitigated by non-blocking send with select/default. (2) State fixture is copied on each read — acceptable for test server. (3) Enriched fixture changes existing test assertions for Data/SecretRefs length — TestState_ReturnsFixturePeersAndPolicies must be updated from expecting 0 to expecting 2/1.",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T11:41:26.881831"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T18:55:05.365733"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T19:00:32.207916"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "c601f23e-74b0-40de-8181-9d9e9685df39",
+      "timestamp": "2026-02-16T19:00:32.207974",
+      "total_duration": 322.505078792572,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 322.505078792572,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
