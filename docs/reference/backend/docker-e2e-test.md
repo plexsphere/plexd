@@ -7,7 +7,7 @@ feature: PXD-0038
 
 # Docker E2E Test
 
-Validates that a containerised plexd agent successfully registers, sends heartbeats, and retrieves metadata from the Central API. The test uses docker compose to orchestrate two services — `mock-api` (a fixture-based mock of the Central API) and `plexd` (the agent under test) — on an isolated bridge network.
+Validates that a containerised plexd agent successfully registers, sends heartbeats, retrieves state, reports capabilities, detects drift, and forwards metrics, logs, and audit events to the Central API. The test uses docker compose to orchestrate two services — `mock-api` (a fixture-based mock of the Central API) and `plexd` (the agent under test) — on an isolated bridge network.
 
 ## Service Topology
 
@@ -41,18 +41,27 @@ The test script polls `GET http://localhost:18080/test/assertions` every 2 secon
 {
   "registration_count": 1,
   "heartbeat_count": 1,
-  "state_count": 0,
-  "metadata_count": 1
+  "state_count": 1,
+  "capabilities_count": 1,
+  "drift_count": 1,
+  "metrics_count": 1,
+  "logs_count": 1,
+  "audit_count": 1
 }
 ```
 
-The test passes when all three counters are >= 1:
+The test passes when all eight counters are >= 1:
 
 | Counter | Meaning |
 |---------|---------|
 | `registration_count` | plexd called `POST /v1/register` |
 | `heartbeat_count` | plexd called `POST /v1/nodes/{id}/heartbeat` |
-| `metadata_count` | plexd called `GET /v1/nodes/{id}/metadata` |
+| `state_count` | plexd called `GET /v1/nodes/{id}/state` |
+| `capabilities_count` | plexd called `PUT /v1/nodes/{id}/capabilities` |
+| `drift_count` | plexd called `POST /v1/nodes/{id}/drift` |
+| `metrics_count` | plexd called `POST /v1/nodes/{id}/metrics` |
+| `logs_count` | plexd called `POST /v1/nodes/{id}/logs` |
+| `audit_count` | plexd called `POST /v1/nodes/{id}/audit` |
 
 ## plexd Configuration
 

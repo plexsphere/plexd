@@ -7,7 +7,7 @@ feature: PXD-0040
 
 # Systemd E2E Test
 
-Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, and metadata calls, then verifies clean shutdown.
+Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, drift detection, and observability forwarding (metrics, logs, audit), then verifies clean shutdown.
 
 ## Container Topology
 
@@ -70,18 +70,27 @@ The test polls `GET http://localhost:18080/test/assertions` which returns JSON c
 {
   "registration_count": 1,
   "heartbeat_count": 1,
-  "state_count": 0,
-  "metadata_count": 1
+  "state_count": 1,
+  "capabilities_count": 1,
+  "drift_count": 1,
+  "metrics_count": 1,
+  "logs_count": 1,
+  "audit_count": 1
 }
 ```
 
-The test passes when all three counters are >= 1:
+The test passes when all eight counters are >= 1:
 
 | Counter | Meaning |
 |---------|---------|
 | `registration_count` | plexd called `POST /v1/register` |
 | `heartbeat_count` | plexd called `POST /v1/nodes/{id}/heartbeat` |
-| `metadata_count` | plexd called `GET /v1/nodes/{id}/metadata` |
+| `state_count` | plexd called `GET /v1/nodes/{id}/state` |
+| `capabilities_count` | plexd called `PUT /v1/nodes/{id}/capabilities` |
+| `drift_count` | plexd called `POST /v1/nodes/{id}/drift` |
+| `metrics_count` | plexd called `POST /v1/nodes/{id}/metrics` |
+| `logs_count` | plexd called `POST /v1/nodes/{id}/logs` |
+| `audit_count` | plexd called `POST /v1/nodes/{id}/audit` |
 
 ## plexd Configuration
 

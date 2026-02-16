@@ -2,8 +2,8 @@
   "feature_id": "PXD-0045",
   "title": "K004: Extend E2E test assertions across deployments",
   "slug": "k004-extend-e2e-test-assertions-across-deployments",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** testing\n**Priority:** high\n**Source:** Proposed for 'With the latest commits/features, E2E tests were added'\n\nExtend all three E2E test scripts with additional counter assertions. Docker (test/e2e/docker/test.sh): add capabilities_count >= 1, drift_count >= 1, metrics_count >= 1, logs_count >= 1, audit_count >= 1 after existing 3 assertions (total 8+). Systemd (test/e2e/systemd/test.sh): same 5 additional counter assertions within existing 60s timeout / 3s polling. Kubernetes (test/e2e/kubernetes/test.sh): add state_count >= 1 (currently missing), plus same 5 additional counters (total 8+ from current 2). All assertions query the expanded /test/assertions JSON response using the same jq-based pattern already established in each script.\n\n**Rationale:** Current E2E tests only verify registration, heartbeat, and state (Docker/systemd) or just registration and heartbeat (Kubernetes). The agent performs capabilities reporting, drift detection, and observability forwarding on every lifecycle iteration, but none of these are asserted. This means broken capabilities, drift, metrics, logs, or audit pipelines would not be caught by E2E tests. Adding assertions is low-effort and high-impact since the mock handlers from K001 already increment the counters.\n\n**Affected Areas:**\n- test/e2e/docker/test.sh\n- test/e2e/systemd/test.sh\n- test/e2e/kubernetes/test.sh",
   "stories": [
@@ -332,6 +332,7 @@
       "description": "In test/e2e/docker/test.sh, add jq extractions for capabilities_count, drift_count, metrics_count, logs_count, audit_count after the existing STATE_COUNT extraction (line 60). Extend the if condition (line 62) to include all 5 new counters with -ge 1 checks. Add 5 new echo lines in the SUCCESS block (after line 66) to print each new counter value.",
       "level": 1,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-005",
@@ -344,6 +345,7 @@
       "description": "In test/e2e/docker/test.sh, add jq extractions and check_assertion calls for the 5 new counters in the failure block (after line 83). Follow the existing check_assertion pattern: check_assertion 'counter_name' '${VAR}' 1.",
       "level": 1,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-006"
@@ -355,6 +357,7 @@
       "description": "In test/e2e/systemd/test.sh, add jq extractions for capabilities_count, drift_count, metrics_count, logs_count, audit_count after the existing STATE_COUNT extraction (line 199). Extend the if condition (line 201) to include all 5 new counters. Add 5 new PASS echo lines in the success block (after line 205).",
       "level": 1,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-002",
         "REQ-005",
@@ -367,6 +370,7 @@
       "description": "In test/e2e/systemd/test.sh, add jq extractions and echo lines for the 5 new counters in the failure block (after line 223). Follow the existing format: 'counter_name=${VAR} (want >= 1)'.",
       "level": 1,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-002",
         "REQ-006"
@@ -378,6 +382,7 @@
       "description": "In test/e2e/kubernetes/test.sh, add STATE_COUNT jq extraction after HB_COUNT (line 158). Add STATE_COUNT -ge 1 to the if condition (line 160). Add PASS echo line for state_count in the success block (after line 163).",
       "level": 1,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-003",
         "REQ-005"
@@ -389,6 +394,7 @@
       "description": "In test/e2e/kubernetes/test.sh, add jq extractions for capabilities_count, drift_count, metrics_count, logs_count, audit_count after STATE_COUNT. Extend the if condition to include all 8 counters. Add 5 new PASS echo lines in the success block.",
       "level": 1,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-004",
         "REQ-005",
@@ -401,6 +407,7 @@
       "description": "In test/e2e/kubernetes/test.sh, add jq extractions and FAIL echo lines for state_count and the 5 new counters in the failure block (after line 179). Follow the existing format: 'FAIL: counter_name=${VAR} (want >= 1)'.",
       "level": 1,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-003",
         "REQ-004",
@@ -413,6 +420,7 @@
       "description": "Update docs/reference/backend/docker-e2e-test.md: expand the JSON example in 'Assertion Logic' to include all 8 counter fields, update the counter table to list all 8 counters with their meanings (capabilities_count → plexd called PUT /v1/nodes/{id}/capabilities, drift_count → plexd called POST /v1/nodes/{id}/drift, metrics_count → plexd called POST /v1/nodes/{id}/metrics, logs_count → plexd called POST /v1/nodes/{id}/logs, audit_count → plexd called POST /v1/nodes/{id}/audit), update the introductory paragraph to say 'eight counters' instead of 'three'.",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-008"
       ]
@@ -423,6 +431,7 @@
       "description": "Update docs/reference/backend/systemd-e2e-test.md: expand the JSON example to include all 8 counter fields, update the counter table to list all 8 counters with their meanings, update text to say 'eight counters' instead of 'three'.",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-008"
       ]
@@ -433,6 +442,7 @@
       "description": "Update docs/reference/backend/kubernetes-e2e-test.md: expand the JSON example to include all 8 counter fields, update the counter table from 2 to 8 counters with their meanings, update text to say 'eight counters' instead of 'both counters'.",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-008"
       ]
@@ -564,6 +574,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-16T19:40:55.680167"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T21:00:14.422963"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T21:12:07.043163"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T21:12:07.092799"
     }
   },
   "execution_history": [
@@ -577,6 +599,44 @@
           "name": "prepare",
           "duration": 305.1307370662689,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "0922c1d0-f259-4032-beb2-032d8f9083a7",
+      "timestamp": "2026-02-16T21:11:38.016466",
+      "total_duration": 558.9236688613892,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (7 tasks)",
+          "duration": 220.18050241470337,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (3 tasks)",
+          "duration": 27.611244201660156,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0045] Code Review",
+          "duration": 103.64538669586182,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0045] Improvements",
+          "duration": 23.259847164154053,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0045] Simplify",
+          "duration": 184.22668838500977,
+          "type": "simplify",
           "status": "done"
         }
       ]

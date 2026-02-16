@@ -2,7 +2,7 @@
 # Kubernetes E2E test orchestration script.
 # Uses kind to create a local cluster, deploys the mock-api and plexd as a
 # DaemonSet, then polls the mock-api assertion endpoint to verify plexd
-# performed registration, heartbeat, and metadata calls.
+# performed registration, heartbeat, state, capabilities, drift, metrics, logs, and audit calls.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,6 +17,38 @@ MOCKAPI_DOCKERFILE="${REPO_ROOT}/test/e2e/mockapi/Dockerfile"
 PLEXD_DOCKERFILE="${REPO_ROOT}/deploy/docker/Dockerfile"
 PF_PID=""
 TEST_FAILED=1
+
+# Counter JSON keys (shared across extraction, checking, and reporting).
+COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count drift_count metrics_count logs_count audit_count)
+
+# Extract all counter values from a JSON response into COUNTER_VALUES.
+extract_counters() {
+    local response=$1
+    COUNTER_VALUES=()
+    for key in "${COUNTER_KEYS[@]}"; do
+        COUNTER_VALUES+=("$(echo "${response}" | jq -r ".${key} // 0")")
+    done
+}
+
+# Check whether all counters meet their minimum (>= 1). Returns 0 if all pass.
+all_counters_pass() {
+    for val in "${COUNTER_VALUES[@]}"; do
+        [ "${val}" -ge 1 ] || return 1
+    done
+}
+
+# Print each counter with PASS/FAIL prefix based on threshold.
+print_counter_results() {
+    local prefix=$1
+    for i in "${!COUNTER_KEYS[@]}"; do
+        local val="${COUNTER_VALUES[$i]}"
+        if [ "${val}" -ge 1 ]; then
+            echo "  PASS: ${COUNTER_KEYS[$i]}=${val} >= 1"
+        else
+            echo "  ${prefix}: ${COUNTER_KEYS[$i]}=${val} (want >= 1)"
+        fi
+    done
+}
 
 # --- Diagnostics function (REQ-008) ---
 print_diagnostics() {
@@ -154,13 +186,10 @@ POLL_ELAPSED=0
 while [ "${POLL_ELAPSED}" -lt "${POLL_TIMEOUT}" ]; do
     RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
     if [ -n "${RESPONSE}" ]; then
-        REG_COUNT=$(echo "${RESPONSE}" | jq -r '.registration_count // 0')
-        HB_COUNT=$(echo "${RESPONSE}" | jq -r '.heartbeat_count // 0')
-
-        if [ "${REG_COUNT}" -ge 1 ] && [ "${HB_COUNT}" -ge 1 ]; then
+        extract_counters "${RESPONSE}"
+        if all_counters_pass; then
             echo "=== PASS ==="
-            echo "  PASS: registration_count=${REG_COUNT} >= 1"
-            echo "  PASS: heartbeat_count=${HB_COUNT} >= 1"
+            print_counter_results "FAIL"
             TEST_FAILED=0
             exit 0
         fi
@@ -173,10 +202,8 @@ echo "=== FAIL: assertions not met within ${POLL_TIMEOUT}s ==="
 if [ -z "${RESPONSE:-}" ]; then
     echo "FAIL: no response from assertion endpoint"
 else
-    REG_COUNT=$(echo "${RESPONSE}" | jq -r '.registration_count // 0')
-    HB_COUNT=$(echo "${RESPONSE}" | jq -r '.heartbeat_count // 0')
-    echo "  FAIL: registration_count=${REG_COUNT} (want >= 1)"
-    echo "  FAIL: heartbeat_count=${HB_COUNT} (want >= 1)"
+    extract_counters "${RESPONSE}"
+    print_counter_results "FAIL"
 fi
 print_diagnostics
 exit 1

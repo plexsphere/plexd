@@ -17,11 +17,36 @@ SYSTEMD_IMAGE="plexd-systemd:e2e"
 TIMEOUT="${TIMEOUT:-60}"
 TEST_FAILED=1
 
-# --- Helper: print message, dump diagnostics, and exit 1 ---
-fail() {
-    echo "FAIL: $1"
-    print_diagnostics
-    exit 1
+# Counter JSON keys (shared across extraction, checking, and reporting).
+COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count drift_count metrics_count logs_count audit_count)
+
+# Extract all counter values from a JSON response into COUNTER_VALUES.
+extract_counters() {
+    local response=$1
+    COUNTER_VALUES=()
+    for key in "${COUNTER_KEYS[@]}"; do
+        COUNTER_VALUES+=("$(echo "${response}" | jq -r ".${key} // 0")")
+    done
+}
+
+# Check whether all counters meet their minimum (>= 1). Returns 0 if all pass.
+all_counters_pass() {
+    for val in "${COUNTER_VALUES[@]}"; do
+        [ "${val}" -ge 1 ] || return 1
+    done
+}
+
+# Print each counter with PASS/FAIL prefix based on threshold.
+print_counter_results() {
+    local prefix=$1
+    for i in "${!COUNTER_KEYS[@]}"; do
+        local val="${COUNTER_VALUES[$i]}"
+        if [ "${val}" -ge 1 ]; then
+            echo "  PASS: ${COUNTER_KEYS[$i]}=${val} >= 1"
+        else
+            echo "  ${prefix}: ${COUNTER_KEYS[$i]}=${val} (want >= 1)"
+        fi
+    done
 }
 
 # --- Diagnostics function (REQ-008) ---
@@ -44,6 +69,13 @@ print_diagnostics() {
     echo "==> Systemd container /usr/local/bin/plexd:"
     docker exec "${SYSTEMD_CONTAINER}" ls -la /usr/local/bin/plexd 2>/dev/null || true
     echo "--- End diagnostics ---"
+}
+
+# --- Helper: print message, dump diagnostics, and exit 1 ---
+fail() {
+    echo "FAIL: $1"
+    print_diagnostics
+    exit 1
 }
 
 # --- Cleanup trap (REQ-002, REQ-006) ---
@@ -194,15 +226,10 @@ POLL_ELAPSED=0
 while [ "${POLL_ELAPSED}" -lt "${TIMEOUT}" ]; do
     RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
     if [ -n "${RESPONSE}" ]; then
-        REG_COUNT=$(echo "${RESPONSE}" | jq -r '.registration_count // 0')
-        HB_COUNT=$(echo "${RESPONSE}" | jq -r '.heartbeat_count // 0')
-        STATE_COUNT=$(echo "${RESPONSE}" | jq -r '.state_count // 0')
-
-        if [ "${REG_COUNT}" -ge 1 ] && [ "${HB_COUNT}" -ge 1 ] && [ "${STATE_COUNT}" -ge 1 ]; then
+        extract_counters "${RESPONSE}"
+        if all_counters_pass; then
             echo "=== Assertions passed ==="
-            echo "  PASS: registration_count=${REG_COUNT} >= 1"
-            echo "  PASS: heartbeat_count=${HB_COUNT} >= 1"
-            echo "  PASS: state_count=${STATE_COUNT} >= 1"
+            print_counter_results "FAIL"
             break
         fi
     fi
@@ -215,12 +242,8 @@ if [ "${POLL_ELAPSED}" -ge "${TIMEOUT}" ]; then
     if [ -z "${RESPONSE:-}" ]; then
         echo "  no response from assertion endpoint"
     else
-        REG_COUNT=$(echo "${RESPONSE}" | jq -r '.registration_count // 0')
-        HB_COUNT=$(echo "${RESPONSE}" | jq -r '.heartbeat_count // 0')
-        STATE_COUNT=$(echo "${RESPONSE}" | jq -r '.state_count // 0')
-        echo "  registration_count=${REG_COUNT} (want >= 1)"
-        echo "  heartbeat_count=${HB_COUNT} (want >= 1)"
-        echo "  state_count=${STATE_COUNT} (want >= 1)"
+        extract_counters "${RESPONSE}"
+        print_counter_results "FAIL"
     fi
     fail "assertions not met within ${TIMEOUT}s"
 fi

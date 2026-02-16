@@ -2,7 +2,7 @@
 # Docker E2E test orchestration script.
 # Builds and runs the mock-api and plexd containers via docker compose,
 # then polls the mock-api assertion endpoint to verify plexd performed
-# registration, heartbeat, and metadata calls.
+# registration, heartbeat, state, capabilities, drift, metrics, logs, and audit calls.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,13 +11,36 @@ PROJECT_NAME="plexd-e2e"
 
 dc() { docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" "$@"; }
 
-check_assertion() {
-    local label=$1 actual=$2 min=$3
-    if [ "${actual}" -ge "${min}" ]; then
-        echo "  PASS: ${label}=${actual} >= ${min}"
-    else
-        echo "  FAIL: ${label}=${actual} < ${min}"
-    fi
+# Counter JSON keys (shared across extraction, checking, and reporting).
+COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count drift_count metrics_count logs_count audit_count)
+
+# Extract all counter values from a JSON response into COUNTER_VALUES.
+extract_counters() {
+    local response=$1
+    COUNTER_VALUES=()
+    for key in "${COUNTER_KEYS[@]}"; do
+        COUNTER_VALUES+=("$(echo "${response}" | jq -r ".${key} // 0")")
+    done
+}
+
+# Check whether all counters meet their minimum (>= 1). Returns 0 if all pass.
+all_counters_pass() {
+    for val in "${COUNTER_VALUES[@]}"; do
+        [ "${val}" -ge 1 ] || return 1
+    done
+}
+
+# Print each counter with PASS/FAIL prefix based on threshold.
+print_counter_results() {
+    local prefix=$1
+    for i in "${!COUNTER_KEYS[@]}"; do
+        local val="${COUNTER_VALUES[$i]}"
+        if [ "${val}" -ge 1 ]; then
+            echo "  PASS: ${COUNTER_KEYS[$i]}=${val} >= 1"
+        else
+            echo "  ${prefix}: ${COUNTER_KEYS[$i]}=${val} < 1"
+        fi
+    done
 }
 
 cleanup() {
@@ -55,15 +78,10 @@ POLL_ELAPSED=0
 while [ "${POLL_ELAPSED}" -lt "${POLL_TIMEOUT}" ]; do
     RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
     if [ -n "${RESPONSE}" ]; then
-        REG_COUNT=$(echo "${RESPONSE}" | jq -r '.registration_count // 0')
-        HB_COUNT=$(echo "${RESPONSE}" | jq -r '.heartbeat_count // 0')
-        STATE_COUNT=$(echo "${RESPONSE}" | jq -r '.state_count // 0')
-
-        if [ "${REG_COUNT}" -ge 1 ] && [ "${HB_COUNT}" -ge 1 ] && [ "${STATE_COUNT}" -ge 1 ]; then
+        extract_counters "${RESPONSE}"
+        if all_counters_pass; then
             echo "=== SUCCESS ==="
-            echo "  registration_count: ${REG_COUNT}"
-            echo "  heartbeat_count:    ${HB_COUNT}"
-            echo "  state_count:        ${STATE_COUNT}"
+            print_counter_results "FAIL"
             exit 0
         fi
     fi
@@ -75,12 +93,8 @@ echo "=== FAIL: assertions not met within ${POLL_TIMEOUT}s ==="
 if [ -z "${RESPONSE}" ]; then
     echo "FAIL: no response from assertion endpoint"
 else
-    REG_COUNT=$(echo "${RESPONSE}" | jq -r '.registration_count // 0')
-    HB_COUNT=$(echo "${RESPONSE}" | jq -r '.heartbeat_count // 0')
-    STATE_COUNT=$(echo "${RESPONSE}" | jq -r '.state_count // 0')
-    check_assertion "registration_count" "${REG_COUNT}" 1
-    check_assertion "heartbeat_count" "${HB_COUNT}" 1
-    check_assertion "state_count" "${STATE_COUNT}" 1
+    extract_counters "${RESPONSE}"
+    print_counter_results "FAIL"
 fi
 echo "--- Container logs ---"
 dc logs
