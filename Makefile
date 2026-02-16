@@ -1,4 +1,4 @@
-.PHONY: build test test-e2e lint vet docker-build
+.PHONY: build test test-e2e test-e2e-docker lint vet docker-build
 
 build:
 	go build ./...
@@ -8,6 +8,9 @@ test:
 
 test-e2e:
 	go test -race -count=1 -run Integration ./...
+
+test-e2e-docker:
+	bash test/e2e/docker/test.sh
 
 lint: vet
 	golangci-lint run

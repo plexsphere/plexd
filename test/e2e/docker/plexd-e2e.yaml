@@ -1,0 +1,14 @@
+# Minimal plexd config for Docker E2E tests.
+# The --api flag overrides api.baseurl at the CLI level.
+# PLEXD_BOOTSTRAP_TOKEN env var provides the token via registration.tokenenv.
+api:
+  baseurl: http://mock-api:8080
+
+registration:
+  datadir: /var/lib/plexd
+
+node_api:
+  datadir: /var/lib/plexd
+
+heartbeat:
+  nodeid: e2e-node-1

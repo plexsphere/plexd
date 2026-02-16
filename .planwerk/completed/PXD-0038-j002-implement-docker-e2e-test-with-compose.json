@@ -2,8 +2,8 @@
   "feature_id": "PXD-0038",
   "title": "J002: Implement Docker E2E test with compose",
   "slug": "j002-implement-docker-e2e-test-with-compose",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** testing\n**Priority:** high\n**Source:** Proposed for 'After binary builds, Docker image builds, etc. are now in place'\n\nCreate Docker-based E2E test infrastructure. Build test/e2e/docker-compose.yml with mock-api and plexd services on a shared bridge network; mock-api starts first with healthcheck on /v1/ping, plexd configured via PLEXD_API_URL env var. Create test/e2e/docker/test.sh orchestration script that starts compose, polls /test/assertions endpoint with ~30s timeout, asserts registration_count >= 1, heartbeat_count >= 1, metadata_fetch_count >= 1, and exits non-zero on failure. Add Makefile target test-e2e-docker that handles build + run + teardown as a self-contained operation.\n\n**Rationale:** Validates that the plexd Docker image builds correctly and the containerized agent can successfully register, heartbeat, and fetch metadata from a real API server. Catches Dockerfile issues, entrypoint problems, and container networking regressions.\n\n**Affected Areas:**\n- test/e2e/docker-compose.yml\n- test/e2e/docker/test.sh\n- Makefile",
   "stories": [
@@ -394,13 +394,12 @@
     }
   ],
   "tasks": [
-    "1.1 Create test/e2e/docker-compose.yml with mock-api and plexd services (REQ-001, REQ-002, REQ-003, REQ-008, REQ-009): Define a docker-compose.yml with two services — mock-api (built from test/e2e/mockapi/Dockerfile, exposed on port 8080, healthcheck on /v1/ping) and plexd (built from deploy/docker/Dockerfile, depends_on mock-api healthy condition). Both on a shared bridge network 'e2e-net'. mock-api healthcheck must work with distroless — add a static wget binary in the mock-api Dockerfile builder stage and copy it to the runtime image for use as healthcheck CMD. plexd configured with --api http://mock-api:8080 via command override, PLEXD_BOOTSTRAP_TOKEN=e2e-test-token env var, and a minimal config.yaml mounted via a bind mount or generated in an init container/entrypoint wrapper. Include a tmpfs mount for /var/lib/plexd for writable data directory.",
-    "1.2 Update test/e2e/mockapi/Dockerfile to include wget for healthcheck (REQ-002, REQ-008): Add a step in the builder stage to download a static wget binary (or use the alpine wget), copy it to the runtime image at /usr/local/bin/wget. This enables docker compose healthcheck to run 'wget --spider -q http://localhost:8080/v1/ping' inside the distroless container. Alternatively, install wget in builder and copy the binary.",
-    "2.1 Create test/e2e/docker/test.sh orchestration script (REQ-004, REQ-005, REQ-007): Write a bash script that: (a) sets -euo pipefail, (b) determines SCRIPT_DIR and COMPOSE_FILE path, (c) sets a cleanup trap that runs docker compose down -v on EXIT, (d) runs docker compose up --build -d, (e) waits for mock-api healthcheck to pass, (f) polls http://localhost:<mapped-port>/test/assertions every 2s for up to 30s, (g) parses JSON response using jq or grep to extract registration_count, heartbeat_count, metadata_count, (h) asserts each >= 1, (i) on failure: prints actual values, runs docker compose logs, exits 1, (j) on success: prints success message, exits 0. The mock-api port must be mapped to host for the test script to reach /test/assertions.",
-    "2.2 Create test/e2e/docker/plexd-e2e.yaml minimal config file (REQ-009): Create a minimal YAML config file for plexd in the Docker E2E test context. Must contain: api.base_url: http://mock-api:8080, registration.token_value: e2e-test-token, and any other required fields with sensible defaults. This file is bind-mounted into the plexd container at /etc/plexd/config.yaml.",
-    "3.1 Add test-e2e-docker target to Makefile (REQ-006): Add a .PHONY target 'test-e2e-docker' that runs 'bash test/e2e/docker/test.sh'. The target should be self-contained with no prerequisites. Add test-e2e-docker to the existing .PHONY declaration list.",
-    "4.1 Create docs/reference/backend/docker-e2e-test.md reference documentation (REQ-010): Write reference documentation covering: (a) overview of the Docker E2E test purpose and what it validates, (b) docker-compose.yml service topology (mock-api, plexd, shared network, healthcheck, startup ordering), (c) test.sh assertion logic (polling endpoint, timeout, counter thresholds), (d) plexd configuration in the container (config file, env vars, --api flag), (e) Makefile target usage (make test-e2e-docker), (f) debugging failures (reading container logs, common failure modes), (g) key files listing.",
-    "5.1 Integration test: run make test-e2e-docker end-to-end (REQ-001 through REQ-009): Execute make test-e2e-docker in a Docker-capable environment to validate the complete flow: image builds, compose startup, mock-api healthcheck, plexd registration/heartbeat/metadata, assertion polling, and teardown. Verify exit code 0 and clean resource state after completion."
+    "[done] 1.1 Create test/e2e/docker-compose.yml with mock-api and plexd services (REQ-001, REQ-002, REQ-003, REQ-008, REQ-009): Define a docker-compose.yml with two services — mock-api (built from test/e2e/mockapi/Dockerfile, exposed on port 8080, healthcheck on /v1/ping) and plexd (built from deploy/docker/Dockerfile, depends_on mock-api healthy condition). Both on a shared bridge network 'e2e-net'. mock-api healthcheck must work with distroless — add a static wget binary in the mock-api Dockerfile builder stage and copy it to the runtime image for use as healthcheck CMD. plexd configured with --api http://mock-api:8080 via command override, PLEXD_BOOTSTRAP_TOKEN=e2e-test-token env var, and a minimal config.yaml mounted via a bind mount or generated in an init container/entrypoint wrapper. Include a tmpfs mount for /var/lib/plexd for writable data directory.",
+    "[done] 1.2 Update test/e2e/mockapi/Dockerfile to include wget for healthcheck (REQ-002, REQ-008): Add a step in the builder stage to download a static wget binary (or use the alpine wget), copy it to the runtime image at /usr/local/bin/wget. This enables docker compose healthcheck to run 'wget --spider -q http://localhost:8080/v1/ping' inside the distroless container. Alternatively, install wget in builder and copy the binary.",
+    "[done] 2.1 Create test/e2e/docker/test.sh orchestration script (REQ-004, REQ-005, REQ-007): Write a bash script that: (a) sets -euo pipefail, (b) determines SCRIPT_DIR and COMPOSE_FILE path, (c) sets a cleanup trap that runs docker compose down -v on EXIT, (d) runs docker compose up --build -d, (e) waits for mock-api healthcheck to pass, (f) polls http://localhost:<mapped-port>/test/assertions every 2s for up to 30s, (g) parses JSON response using jq or grep to extract registration_count, heartbeat_count, metadata_count, (h) asserts each >= 1, (i) on failure: prints actual values, runs docker compose logs, exits 1, (j) on success: prints success message, exits 0. The mock-api port must be mapped to host for the test script to reach /test/assertions.",
+    "[done] 2.2 Create test/e2e/docker/plexd-e2e.yaml minimal config file (REQ-009): Create a minimal YAML config file for plexd in the Docker E2E test context. Must contain: api.base_url: http://mock-api:8080, registration.token_value: e2e-test-token, and any other required fields with sensible defaults. This file is bind-mounted into the plexd container at /etc/plexd/config.yaml.",
+    "[done] 3.1 Add test-e2e-docker target to Makefile (REQ-006): Add a .PHONY target 'test-e2e-docker' that runs 'bash test/e2e/docker/test.sh'. The target should be self-contained with no prerequisites. Add test-e2e-docker to the existing .PHONY declaration list.",
+    "[done] 4.1 Create docs/reference/backend/docker-e2e-test.md reference documentation (REQ-010): Write reference documentation covering: (a) overview of the Docker E2E test purpose and what it validates, (b) docker-compose.yml service topology (mock-api, plexd, shared network, healthcheck, startup ordering), (c) test.sh assertion logic (polling endpoint, timeout, counter thresholds), (d) plexd configuration in the container (config file, env vars, --api flag), (e) Makefile target usage (make test-e2e-docker), (f) debugging failures (reading container logs, common failure modes), (g) key files listing."
   ],
   "test_specifications": [
     {
@@ -516,6 +515,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-15T22:35:46.467605"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-15T22:36:10.715454"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T07:47:17.346829"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T07:47:17.396113"
     }
   },
   "execution_history": [
@@ -529,6 +540,56 @@
           "name": "prepare",
           "duration": 234.79157638549805,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "fc4919a5-d7b6-40b1-bd6d-dbc56b5a5905",
+      "timestamp": "2026-02-15T22:50:44.393328",
+      "total_duration": 760.2781012058258,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (2 tasks)",
+          "duration": 194.25221371650696,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (2 tasks)",
+          "duration": 194.01012444496155,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 33.491432905197144,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (1 tasks)",
+          "duration": 30.01577854156494,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0038] Code Review",
+          "duration": 159.5273838043213,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0038] Improvements",
+          "duration": 46.02708601951599,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0038] Simplify",
+          "duration": 102.95408177375793,
+          "type": "simplify",
           "status": "done"
         }
       ]
