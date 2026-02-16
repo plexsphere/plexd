@@ -1,4 +1,4 @@
-.PHONY: build test test-e2e test-e2e-docker test-e2e-k8s lint vet docker-build
+.PHONY: build test test-e2e test-e2e-docker test-e2e-k8s test-e2e-systemd lint vet docker-build
 
 build:
 	go build ./...
@@ -14,6 +14,9 @@ test-e2e-docker:
 
 test-e2e-k8s:
 	bash test/e2e/kubernetes/test.sh
+
+test-e2e-systemd:
+	bash test/e2e/systemd/test.sh
 
 lint: vet
 	golangci-lint run

@@ -1,0 +1,143 @@
+{
+  "feature_id": "PXD-0040",
+  "title": "J004: Add systemd E2E test with Docker validation",
+  "date": "2026-02-16",
+  "verdict": "BLOCKED",
+  "summary": "Dockerfile and test.sh core structure are solid — systemd-in-Docker approach is correct, cleanup trap works, assertion polling follows existing patterns. However, 4 blocking issues prevent approval: Makefile target test-e2e-systemd is missing entirely, docs/reference/backend/systemd-e2e-test.md does not exist, metadata_count assertion is absent (violating REQ-004 and diverging from docker/k8s tests), and crash indicator grep in shutdown verification is missing (REQ-005, task 1.6). All 4 are marked [done] in the progress file but not implemented.",
+  "tests_checklist": [
+    {"item": "Dockerfile builds (verified syntax, ubuntu:24.04 base, systemd as PID 1)", "checked": true},
+    {"item": "test.sh cleanup trap handles success and failure paths", "checked": true},
+    {"item": "Assertion polling checks registration_count >= 1", "checked": true},
+    {"item": "Assertion polling checks heartbeat_count >= 1", "checked": true},
+    {"item": "Assertion polling checks metadata_count >= 1 (REQ-004)", "checked": false},
+    {"item": "Crash indicator check in shutdown verification (REQ-005, task 1.6)", "checked": false},
+    {"item": "Clean shutdown verified (systemctl stop, is-active=inactive, exit code)", "checked": true},
+    {"item": "Diagnostic output on failure includes journalctl, systemctl status, container logs", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing E2E test patterns (docker/kubernetes)", "checked": true},
+    {"item": "All shell variables properly quoted", "checked": true},
+    {"item": "set -euo pipefail at script start", "checked": true},
+    {"item": "Pre-flight checks for required commands", "checked": true},
+    {"item": "Idempotent — handles pre-existing containers/network from killed runs", "checked": false},
+    {"item": "Consistent function naming with other E2E tests (print_diagnostics vs dump_diagnostics)", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "No real secrets — e2e-test-token is a test fixture (consistent with docker/k8s tests)", "checked": true},
+    {"item": "No command injection risks — all variables properly quoted", "checked": true},
+    {"item": "No path traversal — paths derived from cd+pwd canonical resolution", "checked": true},
+    {"item": "Privileged container is documented necessity for systemd-in-Docker", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Uses real deploy/systemd/plexd.service via volume mount (not a copy)", "checked": true},
+    {"item": "Systemd container architecture matches requirements (ubuntu:24.04, systemd PID 1)", "checked": true},
+    {"item": "Docker network isolates test containers", "checked": true},
+    {"item": "Binary built inside golang container for reproducibility", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code within the script", "checked": true},
+    {"item": "No unnecessary features beyond requirements", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Pre-flight checks exit early on missing commands", "checked": true},
+    {"item": "Mock-API readiness wait with timeout and failure exit", "checked": true},
+    {"item": "Systemd boot wait with timeout and failure exit", "checked": true},
+    {"item": "Service is-active check before polling assertions", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Cleanup trap registered for EXIT signal", "checked": true},
+    {"item": "All docker/exec commands use || true in cleanup to avoid masking errors", "checked": true},
+    {"item": "Build artifact (plexd-linux-amd64) cleaned up on exit", "checked": true}
+  ],
+  "security_findings": [
+    {
+      "severity": "LOW",
+      "description": "Environment file /etc/plexd/environment written with default permissions (world-readable). Token is a test fixture, but pattern may be copied for production deployments.",
+      "location": "test/e2e/systemd/test.sh:162",
+      "fix": "Add chmod 600: docker exec bash -c '... > /etc/plexd/environment && chmod 600 /etc/plexd/environment'"
+    }
+  ],
+  "architecture_findings": [
+    {
+      "severity": "LOW",
+      "description": "Hardcoded golang:1.24-alpine in test.sh for binary build. If project Go version changes, this is another place to update beyond go.mod and Dockerfile.",
+      "location": "test/e2e/systemd/test.sh:74",
+      "fix": "Consider extracting GO_VERSION from go.mod or using the same build approach as the Docker E2E test."
+    }
+  ],
+  "issues_found": [
+    {
+      "id": "FC1-1",
+      "severity": "blocker",
+      "check": "FC1",
+      "file": "Makefile",
+      "line": "1-30",
+      "description": "Makefile target test-e2e-systemd is completely missing. Task 2.1 is marked [done] but neither the .PHONY line nor a target definition exist. make test-e2e-systemd will fail with 'No rule to make target'.",
+      "fix": "Add to .PHONY line and add target: test-e2e-systemd:\\n\\tbash test/e2e/systemd/test.sh (following test-e2e-docker and test-e2e-k8s pattern)"
+    },
+    {
+      "id": "FC1-2",
+      "severity": "blocker",
+      "check": "FC1",
+      "file": "docs/reference/backend/systemd-e2e-test.md",
+      "line": "N/A",
+      "description": "Documentation file docs/reference/backend/systemd-e2e-test.md does not exist. Task 3.1 is marked [done] but the file was never created. Review criteria requires reference documentation covering architecture, usage, and troubleshooting.",
+      "fix": "Create docs/reference/backend/systemd-e2e-test.md following the conventions of existing docs/reference/backend/docker-e2e-test.md and kubernetes-e2e-test.md."
+    },
+    {
+      "id": "FC2-1",
+      "severity": "blocker",
+      "check": "FC2",
+      "file": "test/e2e/systemd/test.sh",
+      "line": "187-190",
+      "description": "metadata_count assertion is completely absent. Plan task 1.5 requires checking 'metadata_count >= 1'. Story criteria (line 20 of progress) state 'The test validates that plexd fetches metadata (metadata_count >= 1)'. Both docker (test/e2e/docker/test.sh:62-64) and kubernetes tests check metadata_count. The systemd test only checks registration_count and heartbeat_count.",
+      "fix": "Add META_COUNT=$(echo \"${RESPONSE}\" | jq -r '.metadata_count // 0') and include [ \"${META_COUNT}\" -ge 1 ] in the success condition. Also add to the timeout failure output."
+    },
+    {
+      "id": "FC2-2",
+      "severity": "blocker",
+      "check": "FC2",
+      "file": "test/e2e/systemd/test.sh",
+      "line": "219-235",
+      "description": "Crash indicator check missing from shutdown verification. Task 1.6 explicitly requires: 'Check journalctl -u plexd for absence of crash indicators: grep for core dumped, segfault, SIGABRT, SIGKILL. If any crash indicators found, print diagnostic output and exit 1.' The current implementation only checks service state (inactive) and exit code, but never greps journalctl for crash indicators.",
+      "fix": "After verifying SERVICE_STATE=inactive, add: CRASH_LOG=$(docker exec \"${SYSTEMD_CONTAINER}\" journalctl -u plexd --no-pager 2>/dev/null || true); for indicator in 'core dumped' 'segfault' 'SIGABRT' 'SIGKILL'; do if echo \"${CRASH_LOG}\" | grep -qi \"${indicator}\"; then echo \"FAIL: crash indicator '${indicator}' found in journal\"; dump_diagnostics; exit 1; fi; done"
+    },
+    {
+      "id": "TE2-1",
+      "severity": "major",
+      "check": "TE2",
+      "file": "test/e2e/systemd/test.sh",
+      "line": "79",
+      "description": "Script is not idempotent — no pre-cleanup of containers/network before starting. If a previous run was killed with SIGKILL (trap doesn't fire), docker network create and docker run --name will fail with 'already exists'. The K8s test handles this with kind delete cluster before creating (line 57).",
+      "fix": "Add pre-cleanup before network creation: docker rm -f \"${MOCKAPI_CONTAINER}\" 2>/dev/null || true; docker rm -f \"${SYSTEMD_CONTAINER}\" 2>/dev/null || true; docker network rm \"${NETWORK_NAME}\" 2>/dev/null || true"
+    },
+    {
+      "id": "P1-1",
+      "severity": "major",
+      "check": "P1",
+      "file": "test/e2e/systemd/test.sh",
+      "line": "21",
+      "description": "Diagnostics function named dump_diagnostics() while K8s test (test/e2e/kubernetes/test.sh:22) uses print_diagnostics(). Inconsistent naming across the E2E test suite.",
+      "fix": "Rename to print_diagnostics() for consistency with test/e2e/kubernetes/test.sh."
+    },
+    {
+      "id": "P1-2",
+      "severity": "minor",
+      "check": "P1",
+      "file": "test/e2e/systemd/Dockerfile",
+      "line": "33",
+      "description": "Directory /var/lib/plexd created with default permissions (0755). Task 1.1 specifies /var/lib/plexd should be 0700 since it contains sensitive data (registration state).",
+      "fix": "Change to: RUN mkdir -p /var/lib/plexd /var/run/plexd /etc/plexd && chmod 700 /var/lib/plexd"
+    }
+  ],
+  "suggested_improvements": [
+    "Extract GO_VERSION from go.mod or use a shared variable to avoid hardcoded golang:1.24-alpine in test.sh:74",
+    "Add chmod 600 to environment file creation (test.sh:162) as defense-in-depth",
+    "Consider adding a .dockerignore in test/e2e/systemd/ to prevent accidental context bloat"
+  ],
+  "next_steps": [
+    "Fix 4 blockers: add Makefile target, create docs file, add metadata_count assertion, add crash indicator check",
+    "Fix 2 major issues: add pre-cleanup for idempotency, rename dump_diagnostics to print_diagnostics",
+    "Re-request review after fixes"
+  ]
+}
