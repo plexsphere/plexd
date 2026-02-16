@@ -1,0 +1,1213 @@
+{
+  "feature_id": "PXD-0044",
+  "title": "K003: Add comprehensive mock API unit tests",
+  "slug": "k003-add-comprehensive-mock-api-unit-tests",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 🏗️ large\n**Category:** testing\n**Priority:** high\n**Source:** Proposed for 'With the latest commits/features, E2E tests were added'\n\nAdd ~45+ new test functions to test/e2e/mockapi/mockapi_test.go following existing patterns. Per new handler (15 handlers): happy path request returns expected status, counter increments by 1, invalid body returns 400 (for POST/PUT endpoints), wrong HTTP method returns 405. Additional test groups: SSE injection — test that injected event is delivered to a connected SSE client; state configuration — test that POST /test/configure-state replaces fixture and subsequent GET /v1/nodes/{id}/state returns new state; request body capture — test that POST to an endpoint stores body and GET /test/last-request/{endpoint} returns it; concurrent counter atomicity — parallel requests to new endpoints produce correct counter totals.\n\n**Rationale:** New handlers from K001 and K002 add significant logic (method validation, body capture, SSE fan-out, mutex-protected state replacement). Without unit tests, regressions in the mock itself could produce false-positive E2E results. The existing test file establishes clear patterns that should be extended consistently.\n\n**Affected Areas:**\n- test/e2e/mockapi/mockapi_test.go",
+  "stories": [
+    {
+      "title": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "role": "test author",
+      "want": "each of the 15 new mock API handlers to have a happy-path unit test that verifies the HTTP status code, response content, and counter increment",
+      "so_that": "regressions in handler logic (wrong status, missing counter, malformed response) are caught before E2E tests run",
+      "criteria": [
+        "Each handler test sends a valid request and asserts the expected HTTP status (204 for fire-and-forget, 200 for endpoints returning data)",
+        "Each handler test verifies the dedicated counter incremented by 1 via getAssertions()",
+        "Handlers returning JSON (keys/rotate, endpoint, secrets, artifacts) have response body assertions verifying fixture fields",
+        "204 handlers are verified to return empty response body"
+      ]
+    },
+    {
+      "title": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "role": "test author",
+      "want": "each handler that accepts a request body to return 400 Bad Request when given invalid JSON",
+      "so_that": "body validation logic is proven correct and consistent across all handlers",
+      "criteria": [
+        "Each POST/PUT handler has a test sending 'not-json' as body and asserting 400 status",
+        "The counter is NOT incremented on invalid body (verified via getAssertions())",
+        "The error response body contains {\"error\": \"invalid request body\"}"
+      ]
+    },
+    {
+      "title": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "role": "test author",
+      "want": "each new endpoint to return 405 Method Not Allowed when called with the wrong HTTP method",
+      "so_that": "method validation via the registered fallback handlers is proven correct",
+      "criteria": [
+        "POST endpoints have a test sending GET and asserting 405",
+        "PUT endpoints have a test sending POST and asserting 405",
+        "GET endpoints have a test sending POST and asserting 405",
+        "The counter is NOT incremented on wrong method"
+      ]
+    },
+    {
+      "title": "Test author verifies SSE event injection delivers events to connected clients",
+      "role": "test author",
+      "want": "unit tests proving POST /test/inject-event broadcasts a correctly formatted SignedEnvelope to all connected SSE clients",
+      "so_that": "the SSE fan-out and injection mechanism is proven correct before E2E tests depend on it",
+      "criteria": [
+        "Test connects an SSE client, injects an event, and reads the injected event from the SSE stream",
+        "Injected event is in correct SSE wire format (id:, event:, data: fields)",
+        "SignedEnvelope in data has generated event_id, issued_at, nonce, mock signature, and original payload",
+        "Multiple connected clients each receive the injected event",
+        "Inject with no connected clients returns 200 without error",
+        "Invalid JSON body returns 400"
+      ]
+    },
+    {
+      "title": "Test author verifies configurable state replaces the fixture and state endpoint returns new data",
+      "role": "test author",
+      "want": "unit tests proving POST /test/configure-state replaces the active StateResponse and subsequent GET /v1/nodes/{id}/state returns the new state",
+      "so_that": "the mutable state fixture mechanism is proven correct",
+      "criteria": [
+        "POST /test/configure-state with valid StateResponse JSON returns 200",
+        "Subsequent GET /v1/nodes/{id}/state returns the configured state instead of the default",
+        "state_count counter still increments after state configuration",
+        "Invalid JSON body returns 400 and leaves state unchanged"
+      ]
+    },
+    {
+      "title": "Test author verifies enriched default state fixture includes all new config sections",
+      "role": "test author",
+      "want": "unit tests verifying the default StateResponse includes SigningKeys, BridgeConfig, RelayConfig, UserAccessConfig, IngressConfig, SiteToSiteConfig, sample Data entries, and sample SecretRef",
+      "so_that": "reconciliation code paths for all features are exercised even without explicit state configuration",
+      "criteria": [
+        "Test verifies SigningKeys with distinct current and previous public key strings",
+        "Test verifies BridgeConfig, RelayConfig, UserAccessConfig, IngressConfig, SiteToSiteConfig present with disabled/empty values",
+        "Test verifies 2 DataEntry items with distinct keys, content types, and non-empty payloads",
+        "Test verifies 1 SecretRef with non-empty key and version >= 1",
+        "Test verifies existing peers (2), policies (1 with 2 rules), and metadata still present"
+      ]
+    },
+    {
+      "title": "Test author verifies request body capture stores and retrieves raw bytes",
+      "role": "test author",
+      "want": "unit tests proving POST to an endpoint stores the request body and GET /test/last-request/{endpoint} returns the exact raw bytes",
+      "so_that": "E2E tests can rely on body capture for payload assertions",
+      "criteria": [
+        "POST to an endpoint, then GET /test/last-request/{endpoint} returns the raw body bytes with status 200",
+        "GET /test/last-request/{endpoint} returns 404 when no body has been captured yet",
+        "Content-Type of captured body response is application/octet-stream",
+        "Body capture does not interfere with normal handler processing (counter still increments, response is correct)"
+      ]
+    },
+    {
+      "title": "Test author verifies concurrent counter atomicity for all 19 endpoint types",
+      "role": "test author",
+      "want": "the extended concurrent counter test to exercise all 19 counter-incrementing endpoints with 100 goroutines each",
+      "so_that": "atomic counter correctness is verified under concurrent load matching CI conditions",
+      "criteria": [
+        "100 goroutines per endpoint type across all 19 endpoint types (19 × 100 = 1900 goroutines)",
+        "All 19 counters equal exactly 100 after WaitGroup completes",
+        "Test passes with go test -race without data races"
+      ]
+    },
+    {
+      "title": "Test author verifies assertion endpoint returns all 19+ counter fields",
+      "role": "test author",
+      "want": "the assertion endpoint to return all counter fields including the 15 new ones plus inject_event_count",
+      "so_that": "E2E scripts can query any counter by name via jq",
+      "criteria": [
+        "TestAssertions_InitialZero extended to verify all counter fields are 0 on fresh server",
+        "TestAssertions_ReturnsCorrectCountsAfterMixedCalls extended to include new endpoints",
+        "All JSON field names use snake_case consistently"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "Each of the 15 new handlers SHALL have a happy-path test verifying HTTP status, response content, and counter increment",
+      "priority": "SHALL",
+      "rationale": "Ensures each handler works correctly in isolation before integration testing",
+      "scenarios": [
+        {
+          "name": "204 handler returns correct status and increments counter",
+          "when": "a valid request is sent to a 204 handler (e.g. POST /v1/nodes/node-1/deregister)",
+          "then": "response status is 204, body is empty, and the dedicated counter is 1 in assertions",
+          "and_then": []
+        },
+        {
+          "name": "200 handler returns fixture data and increments counter",
+          "when": "a valid request is sent to a 200 handler (e.g. POST /v1/keys/rotate)",
+          "then": "response status is 200, body contains expected fixture JSON, and the dedicated counter is 1",
+          "and_then": []
+        },
+        {
+          "name": "Artifact handler returns binary data",
+          "when": "GET /v1/artifacts/plexd/1.0.0/linux/amd64 is sent",
+          "then": "response is 200 with Content-Type application/octet-stream and non-empty body",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "Each new POST/PUT handler (except deregister) SHALL have a test verifying 400 response for invalid JSON body",
+      "priority": "SHALL",
+      "rationale": "Consistent invalid-body handling matches existing register/heartbeat pattern",
+      "scenarios": [
+        {
+          "name": "Invalid body returns 400",
+          "when": "'not-json' is sent as request body to a POST/PUT handler",
+          "then": "response status is 400",
+          "and_then": [
+            "counter is NOT incremented"
+          ]
+        },
+        {
+          "name": "Counter not incremented on invalid body",
+          "when": "invalid body is sent",
+          "then": "getAssertions() shows counter is still 0",
+          "and_then": []
+        },
+        {
+          "name": "Deregister excluded",
+          "when": "deregister handler is considered",
+          "then": "no invalid body test because deregister accepts nil body per endpoints.go:69",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "Each new endpoint SHALL have a test verifying 405 response for wrong HTTP method",
+      "priority": "SHALL",
+      "rationale": "Validates method-not-allowed fallback handler registration for each new route",
+      "scenarios": [
+        {
+          "name": "POST endpoint rejects GET",
+          "when": "GET is sent to a POST-only endpoint",
+          "then": "response status is 405",
+          "and_then": []
+        },
+        {
+          "name": "PUT endpoint rejects POST",
+          "when": "POST is sent to a PUT-only endpoint",
+          "then": "response status is 405",
+          "and_then": []
+        },
+        {
+          "name": "GET endpoint rejects POST",
+          "when": "POST is sent to a GET-only endpoint",
+          "then": "response status is 405",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "Tests SHALL verify POST /test/inject-event delivers SSE events to connected clients in correct wire format",
+      "priority": "SHALL",
+      "rationale": "SSE injection is the primary mechanism for testing event-driven agent behaviors in E2E",
+      "scenarios": [
+        {
+          "name": "Single client receives injected event",
+          "when": "SSE client is connected, then POST /test/inject-event is called",
+          "then": "client reads the injected event from the SSE stream with correct id:, event:, data: fields",
+          "and_then": [
+            "SignedEnvelope in data has generated event_id, issued_at, nonce, signature, and original payload"
+          ]
+        },
+        {
+          "name": "Multiple clients receive the same event",
+          "when": "2 SSE clients connected, then event injected",
+          "then": "both clients receive it",
+          "and_then": []
+        },
+        {
+          "name": "No clients returns 200",
+          "when": "inject-event called with no SSE clients",
+          "then": "200 returned, no error",
+          "and_then": []
+        },
+        {
+          "name": "Invalid JSON returns 400",
+          "when": "inject-event called with invalid JSON",
+          "then": "400 returned",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "Tests SHALL verify POST /test/configure-state replaces the active StateResponse and counter still increments",
+      "priority": "SHALL",
+      "rationale": "Configurable state enables test scripts to set up specific reconciliation scenarios",
+      "scenarios": [
+        {
+          "name": "Configure replaces fixture",
+          "when": "POST /test/configure-state with custom state, then GET /v1/nodes/node-1/state",
+          "then": "response matches configured state",
+          "and_then": []
+        },
+        {
+          "name": "Counter still increments",
+          "when": "GET state called twice after configure",
+          "then": "state_count is 2",
+          "and_then": []
+        },
+        {
+          "name": "Invalid JSON returns 400",
+          "when": "POST /test/configure-state with invalid JSON",
+          "then": "400 returned, default fixture unchanged",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "Tests SHALL verify the enriched default StateResponse includes SigningKeys, config sections, Data entries, and SecretRef",
+      "priority": "SHALL",
+      "rationale": "Exercises reconciliation code paths for all feature modules",
+      "scenarios": [
+        {
+          "name": "SigningKeys present and distinct",
+          "when": "GET state returns default fixture",
+          "then": "signing_keys.current and signing_keys.previous are non-empty and different",
+          "and_then": []
+        },
+        {
+          "name": "Config sections present and disabled",
+          "when": "GET state returns default fixture",
+          "then": "bridge_config, relay_config, user_access_config, ingress_config, site_to_site_config present",
+          "and_then": []
+        },
+        {
+          "name": "Data and SecretRefs present",
+          "when": "GET state returns default fixture",
+          "then": "2 DataEntry items with distinct keys, 1 SecretRef",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "Tests SHALL verify request body capture via GET /test/last-request/{endpoint}",
+      "priority": "SHALL",
+      "rationale": "Enables E2E tests to assert on request payload contents",
+      "scenarios": [
+        {
+          "name": "Captured body retrievable",
+          "when": "POST to endpoint, then GET /test/last-request/{endpoint}",
+          "then": "raw bytes returned with 200",
+          "and_then": []
+        },
+        {
+          "name": "404 when uncaptured",
+          "when": "GET /test/last-request/drift before any request",
+          "then": "404 returned",
+          "and_then": []
+        },
+        {
+          "name": "Capture preserves handler function",
+          "when": "POST with valid body",
+          "then": "counter increments, response correct",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "TestConcurrentCounters SHALL be extended to cover all 19 endpoint types with 100 goroutines each",
+      "priority": "SHALL",
+      "rationale": "Proves atomic counter correctness for all endpoints under concurrent access",
+      "scenarios": [
+        {
+          "name": "All 19 counters equal 100 after concurrent calls",
+          "when": "100 goroutines × 19 endpoint types run concurrently",
+          "then": "all counters equal 100",
+          "and_then": []
+        },
+        {
+          "name": "No data races",
+          "when": "test runs with -race",
+          "then": "zero data races",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "TestAssertions_InitialZero SHALL verify all counter fields are 0 on fresh server",
+      "priority": "SHALL",
+      "rationale": "Proves all counters start at zero, including 15 new + inject_event_count",
+      "scenarios": [
+        {
+          "name": "All counters zero on fresh server",
+          "when": "fresh server created, GET /test/assertions called",
+          "then": "all counter fields are 0",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "Existing TestState_ReturnsFixturePeersAndPolicies SHALL be updated to match enriched default fixture",
+      "priority": "SHALL",
+      "rationale": "K002 changes default Data from 0 to 2 items and SecretRefs from 0 to 1",
+      "scenarios": [
+        {
+          "name": "Data assertions updated",
+          "when": "existing test runs after K002",
+          "then": "expects len(Data) == 2",
+          "and_then": []
+        },
+        {
+          "name": "SecretRefs assertions updated",
+          "when": "existing test runs after K002",
+          "then": "expects len(SecretRefs) == 1",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-011",
+      "description": "All tests SHALL follow existing patterns using newTestServer(), getAssertions(), and standard library testing",
+      "priority": "SHALL",
+      "rationale": "Consistency in test file structure and patterns",
+      "scenarios": [
+        {
+          "name": "Test helpers reused",
+          "when": "new tests are written",
+          "then": "use newTestServer(), getAssertions(), existing body constants pattern",
+          "and_then": []
+        },
+        {
+          "name": "No new external dependencies",
+          "when": "new tests import packages",
+          "then": "only standard library, internal/api, and test/e2e/mockapi",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-012",
+      "description": "Tests SHALL verify SSE client disconnect cleanup for fan-out infrastructure",
+      "priority": "SHALL",
+      "rationale": "Ensures no goroutine leaks or panics when SSE clients disconnect",
+      "scenarios": [
+        {
+          "name": "Disconnect does not block inject",
+          "when": "SSE client disconnects, then event is injected",
+          "then": "no panic, no block, inject returns 200",
+          "and_then": []
+        },
+        {
+          "name": "Initial event still sent after fan-out changes",
+          "when": "SSE client connects",
+          "then": "first event is still node_state_updated",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "1.1",
+      "title": "Add test body constants for all 15 new endpoint types (REQ-011)",
+      "description": "Add const declarations at the top of mockapi_test.go for valid JSON bodies used in tests, following the existing registerBody/heartbeatBody pattern. Constants: keyRotateBody (KeyRotateRequest), capabilitiesBody (CapabilitiesPayload with binary info and empty actions/hooks), endpointBody (EndpointReport), driftBody (DriftReport with 1 correction), reportBody (ReportSyncRequest with 1 entry), executionAckBody (ExecutionAck), executionResultBody (ExecutionResult), metricsBatchBody (MetricBatch with 1 MetricPoint), logsBatchBody (LogBatch with 1 LogEntry), auditBatchBody (AuditBatch with 1 AuditEntry), tunnelReadyBody (TunnelReadyRequest), tunnelClosedBody (TunnelClosedRequest), integrityViolationBody (IntegrityViolationReport). Add doPut helper function for PUT request tests: func doPut(t *testing.T, url string, body string) *http.Response.",
+      "level": 1,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-011"
+      ]
+    },
+    {
+      "id": "2.1",
+      "title": "Add tests for POST /v1/nodes/{id}/deregister: happy path + wrong method (REQ-001, REQ-003)",
+      "description": "Add TestDeregister_Returns204AndCounterIncrements: POST /v1/nodes/node-1/deregister with nil body, assert status 204, assert empty body, assert deregister_count=1 via getAssertions(). Add TestDeregister_WrongMethod_Returns405: GET /v1/nodes/node-1/deregister, assert 405. No invalid body test because deregister accepts nil body (endpoints.go:69).",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.2",
+      "title": "Add tests for POST /v1/keys/rotate: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestKeyRotate_ReturnsFixtureAndCounter: POST /v1/keys/rotate with keyRotateBody, assert 200, decode api.KeyRotateResponse, verify UpdatedPeers has 2 entries with non-empty fields, assert key_rotate_count=1. Add TestKeyRotate_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestKeyRotate_WrongMethod_Returns405: GET /v1/keys/rotate, assert 405.",
+      "level": 2,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.3",
+      "title": "Add tests for PUT /v1/nodes/{id}/capabilities: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestCapabilities_Returns204AndCounter: PUT /v1/nodes/node-1/capabilities with capabilitiesBody using doPut helper, assert 204, assert capabilities_count=1. Add TestCapabilities_InvalidBody_Returns400: PUT with 'not-json', assert 400. Add TestCapabilities_WrongMethod_Returns405: POST /v1/nodes/node-1/capabilities, assert 405.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.4",
+      "title": "Add tests for PUT /v1/nodes/{id}/endpoint: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestEndpoint_ReturnsFixtureAndCounter: PUT with endpointBody, assert 200, decode api.EndpointResponse, verify PeerEndpoints has 2 entries with correct PeerID and Endpoint, assert endpoint_count=1. Add TestEndpoint_InvalidBody_Returns400: PUT with 'not-json', assert 400. Add TestEndpoint_WrongMethod_Returns405: POST, assert 405.",
+      "level": 2,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.5",
+      "title": "Add tests for POST /v1/nodes/{id}/drift: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestDrift_Returns204AndCounter: POST with driftBody, assert 204, assert drift_count=1. Add TestDrift_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestDrift_WrongMethod_Returns405: GET, assert 405.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.6",
+      "title": "Add tests for GET /v1/nodes/{id}/secrets/{key}: happy path + wrong method (REQ-001, REQ-003)",
+      "description": "Add TestSecrets_ReturnsFixtureWithPathKey: GET /v1/nodes/node-1/secrets/db-password, assert 200, decode api.SecretResponse, verify Key='db-password', Ciphertext non-empty, Nonce non-empty, Version >= 1, assert secrets_count=1. Add TestSecrets_WrongMethod_Returns405: POST /v1/nodes/node-1/secrets/db-password, assert 405. No invalid body test — GET endpoint.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.7",
+      "title": "Add tests for POST /v1/nodes/{id}/report: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestReport_Returns204AndCounter: POST with reportBody, assert 204, assert report_count=1. Add TestReport_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestReport_WrongMethod_Returns405: GET, assert 405.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.8",
+      "title": "Add tests for POST /v1/nodes/{id}/executions/{eid}/ack: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestExecutionAck_Returns204AndCounter: POST /v1/nodes/node-1/executions/exec-001/ack with executionAckBody, assert 204, assert execution_ack_count=1. Add TestExecutionAck_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestExecutionAck_WrongMethod_Returns405: GET, assert 405.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.9",
+      "title": "Add tests for POST /v1/nodes/{id}/executions/{eid}/result: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestExecutionResult_Returns204AndCounter: POST /v1/nodes/node-1/executions/exec-001/result with executionResultBody, assert 204, assert execution_result_count=1. Add TestExecutionResult_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestExecutionResult_WrongMethod_Returns405: GET, assert 405.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.10",
+      "title": "Add tests for POST /v1/nodes/{id}/metrics: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestMetrics_Returns204AndCounter: POST /v1/nodes/node-1/metrics with metricsBatchBody, assert 204, assert metrics_count=1. Add TestMetrics_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestMetrics_WrongMethod_Returns405: GET, assert 405.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.11",
+      "title": "Add tests for POST /v1/nodes/{id}/logs: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestLogs_Returns204AndCounter: POST /v1/nodes/node-1/logs with logsBatchBody, assert 204, assert logs_count=1. Add TestLogs_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestLogs_WrongMethod_Returns405: GET, assert 405.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.12",
+      "title": "Add tests for POST /v1/nodes/{id}/audit: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestAudit_Returns204AndCounter: POST /v1/nodes/node-1/audit with auditBatchBody, assert 204, assert audit_count=1. Add TestAudit_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestAudit_WrongMethod_Returns405: GET, assert 405.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.13",
+      "title": "Add tests for GET /v1/artifacts/plexd/{ver}/{os}/{arch}: happy path + wrong method (REQ-001, REQ-003)",
+      "description": "Add TestArtifact_ReturnsBinaryAndCounter: GET /v1/artifacts/plexd/1.0.0/linux/amd64, assert 200, assert Content-Type application/octet-stream, assert body non-empty (read and check len > 0), assert artifact_count=1. Add TestArtifact_WrongMethod_Returns405: POST same path, assert 405. No invalid body test — GET endpoint.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.14",
+      "title": "Add tests for POST /v1/nodes/{id}/tunnels/{sid}/ready: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestTunnelReady_Returns204AndCounter: POST /v1/nodes/node-1/tunnels/sess-001/ready with tunnelReadyBody, assert 204, assert tunnel_ready_count=1. Add TestTunnelReady_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestTunnelReady_WrongMethod_Returns405: GET, assert 405.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.15",
+      "title": "Add tests for POST /v1/nodes/{id}/tunnels/{sid}/closed: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestTunnelClosed_Returns204AndCounter: POST /v1/nodes/node-1/tunnels/sess-001/closed with tunnelClosedBody, assert 204, assert tunnel_closed_count=1. Add TestTunnelClosed_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestTunnelClosed_WrongMethod_Returns405: GET, assert 405.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.16",
+      "title": "Add tests for POST /v1/nodes/{id}/integrity/violations: happy path + invalid body + wrong method (REQ-001, REQ-002, REQ-003)",
+      "description": "Add TestIntegrityViolation_Returns204AndCounter: POST /v1/nodes/node-1/integrity/violations with integrityViolationBody, assert 204, assert integrity_violation_count=1. Add TestIntegrityViolation_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestIntegrityViolation_WrongMethod_Returns405: GET, assert 405.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "3.1",
+      "title": "Add tests for SSE event injection: delivery, wire format, envelope fields, no-clients, invalid JSON (REQ-004)",
+      "description": "Add TestInjectEvent_DeliversToConnectedClient: connect SSE client via GET /v1/nodes/node-1/events, read initial event, POST /test/inject-event with {\"event_type\":\"action_request\",\"payload\":{\"action_id\":\"a1\"}}, read from SSE stream, verify the injected event appears with correct SSE wire format. Add TestInjectEvent_SSEWireFormat: verify output contains 'id:', 'event:', 'data:' fields. Add TestInjectEvent_SignedEnvelopeFields: parse data JSON, verify event_id starts with 'evt-inject-', issued_at is recent UTC, nonce non-empty, signature='mock-signature-injected', payload matches request. Add TestInjectEvent_NoClients_Returns200: POST inject-event with no SSE clients, assert 200. Add TestInjectEvent_InvalidJSON_Returns400: POST inject-event with 'not-json', assert 400.",
+      "level": 3,
+      "estimate_minutes": 30,
+      "requirements": [
+        "REQ-004"
+      ]
+    },
+    {
+      "id": "3.2",
+      "title": "Add tests for SSE fan-out: multiple clients, disconnect cleanup, initial event preserved (REQ-004, REQ-012)",
+      "description": "Add TestInjectEvent_MultipleClients: connect 2 SSE clients, inject one event, verify both receive it. Add TestEvents_ClientDeregisterOnDisconnect: connect SSE client, cancel context, then inject event, verify no panic or block. Add TestEvents_InitialEventStillSentAfterFanout: connect SSE client, verify first event is still node_state_updated (initial event before fan-out registration).",
+      "level": 3,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-004",
+        "REQ-012"
+      ]
+    },
+    {
+      "id": "3.3",
+      "title": "Add tests for POST /test/configure-state: replace fixture, invalid JSON, counter preservation (REQ-005)",
+      "description": "Add TestConfigureState_ReplacesActiveFixture: POST /test/configure-state with a minimal custom StateResponse (different peers), then GET /v1/nodes/node-1/state, verify response matches custom state (e.g. different peer IDs). Add TestConfigureState_InvalidJSON_Returns400: POST with 'not-json', verify 400, then GET state and verify default fixture still active. Add TestConfigureState_CounterStillIncrements: POST configure-state, then GET state twice, verify state_count=2 via getAssertions().",
+      "level": 3,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-005"
+      ]
+    },
+    {
+      "id": "3.4",
+      "title": "Add tests for enriched default state fixture: signing keys, config sections, data, secret refs (REQ-006, REQ-010)",
+      "description": "Add TestState_DefaultFixture_HasSigningKeys: GET state, decode, verify SigningKeys non-nil, Current and Previous non-empty and distinct. Add TestState_DefaultFixture_HasDisabledConfigs: verify BridgeConfig (non-nil, Enabled=false), RelayConfig (non-nil, Sessions empty), UserAccessConfig (non-nil, Enabled=false), IngressConfig (non-nil, Enabled=false, Rules empty), SiteToSiteConfig (non-nil, Enabled=false, Tunnels empty). Add TestState_DefaultFixture_HasDataAndSecretRefs: verify len(Data)==2 with distinct keys, non-empty content types and payloads, Version >= 1; verify len(SecretRefs)==1 with non-empty key and Version >= 1. Update existing TestState_ReturnsFixturePeersAndPolicies assertions: change Data check from 'len == 0' to 'len == 2' and SecretRefs check from 'len == 0' to 'len == 1'.",
+      "level": 3,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-006",
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "3.5",
+      "title": "Add tests for request body capture: capture + retrieve, 404 uncaptured, register body captured (REQ-007)",
+      "description": "Add TestLastRequest_Returns404WhenNoCapturedBody: GET /test/last-request/drift on fresh server, assert 404. Add TestLastRequest_ReturnsCapturedBody: POST /v1/nodes/node-1/drift with driftBody, then GET /test/last-request/drift, assert 200, assert Content-Type application/octet-stream, assert body matches driftBody bytes. Add TestLastRequest_RegisterBodyCaptured: POST /v1/register with registerBody, then GET /test/last-request/register, assert 200, assert body matches registerBody bytes.",
+      "level": 3,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-007"
+      ]
+    },
+    {
+      "id": "4.1",
+      "title": "Extend TestAssertions_InitialZero for all 19+ counter fields (REQ-009)",
+      "description": "Update TestAssertions_InitialZero to verify all counter fields are 0 on fresh server. The existing test checks RegisterCount, HeartbeatCount, StateCount, MetadataCount. Add checks for: DeregisterCount, KeyRotateCount, CapabilitiesCount, EndpointCount, DriftCount, SecretsCount, ReportCount, ExecutionAckCount, ExecutionResultCount, MetricsCount, LogsCount, AuditCount, ArtifactCount, TunnelReadyCount, TunnelClosedCount, IntegrityViolationCount, InjectEventCount. Decode into mockapi.AssertionCounters struct (which will have the new fields after K001/K002).",
+      "level": 4,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "4.2",
+      "title": "Extend TestAssertions_ReturnsCorrectCountsAfterMixedCalls for new endpoints (REQ-010)",
+      "description": "Extend TestAssertions_ReturnsCorrectCountsAfterMixedCalls to also call: PUT capabilities once, POST drift once, POST metrics once, POST logs once, POST audit once. Then verify all 19+ counter values: existing 4 counters unchanged, new 5 counters = 1, remaining new counters = 0. Uses doPut helper for PUT requests.",
+      "level": 4,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "4.3",
+      "title": "Extend TestConcurrentCounters for all 19 endpoint types (REQ-008)",
+      "description": "Extend TestConcurrentCounters to add 100 goroutines each for: deregister, key_rotate, capabilities (PUT), endpoint (PUT), drift, secrets (GET), report, execution_ack, execution_result, metrics, logs, audit, artifact (GET), tunnel_ready, tunnel_closed, integrity_violation. Use appropriate HTTP methods (PUT for capabilities/endpoint, GET for secrets/artifact, POST for rest). After wg.Wait(), verify all 19 counters equal 100. Use defined body constants for request bodies. Total goroutines: 19 × 100 = 1900.",
+      "level": 4,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "4.4",
+      "title": "Add concurrency stress test for inject-event + configure-state interactions (REQ-004, REQ-005, REQ-012)",
+      "description": "Add TestConcurrentInjectAndConfigureState: spawn goroutines concurrently doing: 50× POST /test/inject-event, 50× POST /test/configure-state with valid StateResponse, 50× GET /v1/nodes/node-1/state, 10× SSE client connect → read initial event → disconnect. Use sync.WaitGroup. Verify no panics, no goroutine leaks (all goroutines complete). Verify counters are consistent (inject_event_count >= 50, state_count >= 50). Test must pass with -race flag.",
+      "level": 4,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-004",
+        "REQ-005",
+        "REQ-012"
+      ]
+    }
+  ],
+  "test_specifications": [
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestDeregister_Returns204AndCounterIncrements",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "POST /v1/nodes/node-1/deregister returns 204, body empty, deregister_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestDeregister_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "GET /v1/nodes/node-1/deregister returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestKeyRotate_ReturnsFixtureAndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "POST /v1/keys/rotate returns 200 with KeyRotateResponse containing 2 UpdatedPeers, key_rotate_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestKeyRotate_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "POST /v1/keys/rotate with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestKeyRotate_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "GET /v1/keys/rotate returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestCapabilities_Returns204AndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "PUT /v1/nodes/node-1/capabilities returns 204, capabilities_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestCapabilities_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "PUT /v1/nodes/node-1/capabilities with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestCapabilities_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "POST /v1/nodes/node-1/capabilities returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestEndpoint_ReturnsFixtureAndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "PUT /v1/nodes/node-1/endpoint returns 200 with 2 PeerEndpoints, endpoint_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestEndpoint_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "PUT /v1/nodes/node-1/endpoint with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestEndpoint_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "POST /v1/nodes/node-1/endpoint returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestDrift_Returns204AndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "POST /v1/nodes/node-1/drift returns 204, drift_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestDrift_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "POST /v1/nodes/node-1/drift with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestDrift_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "GET /v1/nodes/node-1/drift returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestSecrets_ReturnsFixtureWithPathKey",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "GET /v1/nodes/node-1/secrets/db-password returns 200 with Key='db-password', secrets_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestSecrets_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "POST /v1/nodes/node-1/secrets/db-password returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestReport_Returns204AndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "POST /v1/nodes/node-1/report returns 204, report_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestReport_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "POST /v1/nodes/node-1/report with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestReport_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "GET /v1/nodes/node-1/report returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestExecutionAck_Returns204AndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "POST /v1/nodes/node-1/executions/exec-001/ack returns 204, execution_ack_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestExecutionAck_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "POST with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestExecutionAck_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "GET /v1/nodes/node-1/executions/exec-001/ack returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestExecutionResult_Returns204AndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "POST /v1/nodes/node-1/executions/exec-001/result returns 204, execution_result_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestExecutionResult_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "POST with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestExecutionResult_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "GET /v1/nodes/node-1/executions/exec-001/result returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestMetrics_Returns204AndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "POST /v1/nodes/node-1/metrics returns 204, metrics_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestMetrics_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "POST with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestMetrics_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "GET /v1/nodes/node-1/metrics returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestLogs_Returns204AndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "POST /v1/nodes/node-1/logs returns 204, logs_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestLogs_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "POST with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestLogs_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "GET /v1/nodes/node-1/logs returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestAudit_Returns204AndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "POST /v1/nodes/node-1/audit returns 204, audit_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestAudit_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "POST with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestAudit_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "GET /v1/nodes/node-1/audit returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestArtifact_ReturnsBinaryAndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "GET /v1/artifacts/plexd/1.0.0/linux/amd64 returns 200, Content-Type application/octet-stream, non-empty body, artifact_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestArtifact_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "POST /v1/artifacts/plexd/1.0.0/linux/amd64 returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestTunnelReady_Returns204AndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "POST /v1/nodes/node-1/tunnels/sess-001/ready returns 204, tunnel_ready_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestTunnelReady_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "POST with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestTunnelReady_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "GET /v1/nodes/node-1/tunnels/sess-001/ready returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestTunnelClosed_Returns204AndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "POST /v1/nodes/node-1/tunnels/sess-001/closed returns 204, tunnel_closed_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestTunnelClosed_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "POST with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestTunnelClosed_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "GET /v1/nodes/node-1/tunnels/sess-001/closed returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestIntegrityViolation_Returns204AndCounter",
+      "story": "Test author verifies all 15 new endpoint handlers return correct status and increment counters",
+      "expected": "POST /v1/nodes/node-1/integrity/violations returns 204, integrity_violation_count=1",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestIntegrityViolation_InvalidBody_Returns400",
+      "story": "Test author verifies POST/PUT handlers reject invalid JSON bodies with 400",
+      "expected": "POST with 'not-json' returns 400",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestIntegrityViolation_WrongMethod_Returns405",
+      "story": "Test author verifies all new endpoints reject wrong HTTP methods with 405",
+      "expected": "GET /v1/nodes/node-1/integrity/violations returns 405",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestInjectEvent_DeliversToConnectedClient",
+      "story": "Test author verifies SSE event injection delivers events to connected clients",
+      "expected": "POST /test/inject-event delivers event in SSE wire format to connected client with valid SignedEnvelope",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestInjectEvent_SSEWireFormat",
+      "story": "Test author verifies SSE event injection delivers events to connected clients",
+      "expected": "Injected event output contains 'id:', 'event:', 'data:' fields",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestInjectEvent_SignedEnvelopeFields",
+      "story": "Test author verifies SSE event injection delivers events to connected clients",
+      "expected": "SignedEnvelope has event_id starting with 'evt-inject-', recent issued_at, non-empty nonce, mock signature, and correct payload",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestInjectEvent_MultipleClients",
+      "story": "Test author verifies SSE event injection delivers events to connected clients",
+      "expected": "Both connected SSE clients receive the injected event",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestInjectEvent_NoClients_Returns200",
+      "story": "Test author verifies SSE event injection delivers events to connected clients",
+      "expected": "POST /test/inject-event returns 200 with no SSE clients connected",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestInjectEvent_InvalidJSON_Returns400",
+      "story": "Test author verifies SSE event injection delivers events to connected clients",
+      "expected": "POST /test/inject-event with invalid JSON returns 400",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestEvents_ClientDeregisterOnDisconnect",
+      "story": "Test author verifies SSE event injection delivers events to connected clients",
+      "expected": "After SSE client disconnects, inject-event does not block or panic",
+      "requirement_id": "REQ-012"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestEvents_InitialEventStillSentAfterFanout",
+      "story": "Test author verifies SSE event injection delivers events to connected clients",
+      "expected": "SSE client still receives node_state_updated as first event after fan-out changes",
+      "requirement_id": "REQ-012"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestConfigureState_ReplacesActiveFixture",
+      "story": "Test author verifies configurable state replaces the fixture and state endpoint returns new data",
+      "expected": "After POST /test/configure-state, GET /v1/nodes/{id}/state returns the configured state",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestConfigureState_InvalidJSON_Returns400",
+      "story": "Test author verifies configurable state replaces the fixture and state endpoint returns new data",
+      "expected": "POST /test/configure-state with invalid JSON returns 400, state unchanged",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestConfigureState_CounterStillIncrements",
+      "story": "Test author verifies configurable state replaces the fixture and state endpoint returns new data",
+      "expected": "state_count increments on GET state after configure-state",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestState_DefaultFixture_HasSigningKeys",
+      "story": "Test author verifies enriched default state fixture includes all new config sections",
+      "expected": "Default state has non-nil SigningKeys with distinct current and previous strings",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestState_DefaultFixture_HasDisabledConfigs",
+      "story": "Test author verifies enriched default state fixture includes all new config sections",
+      "expected": "Default state has BridgeConfig, RelayConfig, UserAccessConfig, IngressConfig, SiteToSiteConfig all disabled/empty",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestState_DefaultFixture_HasDataAndSecretRefs",
+      "story": "Test author verifies enriched default state fixture includes all new config sections",
+      "expected": "Default state has 2 DataEntry with distinct keys and 1 SecretRef",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestLastRequest_Returns404WhenNoCapturedBody",
+      "story": "Test author verifies request body capture stores and retrieves raw bytes",
+      "expected": "GET /test/last-request/drift returns 404 before any drift call",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestLastRequest_ReturnsCapturedBody",
+      "story": "Test author verifies request body capture stores and retrieves raw bytes",
+      "expected": "After POST /v1/nodes/node-1/drift, GET /test/last-request/drift returns raw body bytes",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestLastRequest_RegisterBodyCaptured",
+      "story": "Test author verifies request body capture stores and retrieves raw bytes",
+      "expected": "After POST /v1/register, GET /test/last-request/register returns raw body bytes",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestAssertions_InitialZero",
+      "story": "Test author verifies assertion endpoint returns all 19+ counter fields",
+      "expected": "All 19+ counter fields are 0 on fresh server including new ones",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestAssertions_ReturnsCorrectCountsAfterMixedCalls",
+      "story": "Test author verifies assertion endpoint returns all 19+ counter fields",
+      "expected": "Mixed calls to old and new endpoints produce correct assertion counts for all fields",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestConcurrentCounters",
+      "story": "Test author verifies concurrent counter atomicity for all 19 endpoint types",
+      "expected": "After 100 concurrent calls per endpoint type across all 19 types, all counters = 100",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "test/e2e/mockapi/mockapi_test.go",
+      "test_function": "TestConcurrentInjectAndConfigureState",
+      "story": "Test author verifies concurrent counter atomicity for all 19 endpoint types",
+      "expected": "Concurrent inject-event, configure-state, state reads, and SSE connect/disconnect pass under -race",
+      "requirement_id": "REQ-004"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All 15 new handlers have at minimum: 1 happy-path test (status + counter + fixture verification) and 1 wrong-method test (405). POST/PUT handlers (except deregister) additionally have invalid-body test (400). Total: ~45 new test functions.",
+    "TestConcurrentCounters extended to cover all 19 endpoint types with 100 goroutines each, passes with go test -race",
+    "TestAssertions_InitialZero extended to verify all 19+ counter fields are zero on fresh server",
+    "TestAssertions_ReturnsCorrectCountsAfterMixedCalls extended to include new endpoint calls",
+    "SSE injection tests verify: single client delivery, multiple client fan-out, no-client 200, invalid JSON 400, SignedEnvelope wire format, disconnect cleanup",
+    "Configure-state tests verify: fixture replacement, counter preservation, invalid JSON rejection",
+    "Enriched default state tests verify: SigningKeys (distinct current/previous), all 5 config sections (disabled/empty), 2 DataEntry, 1 SecretRef",
+    "Request body capture tests verify: capture+retrieve, 404 when uncaptured, register body captured",
+    "Existing TestState_ReturnsFixturePeersAndPolicies updated for enriched Data (2 items) and SecretRefs (1 item)",
+    "All tests use existing helpers (newTestServer, getAssertions), no new external dependencies, standard library testing only",
+    "go test -race -v ./test/e2e/mockapi/... passes with zero data races and all tests green",
+    "No changes to files outside test/e2e/mockapi/mockapi_test.go"
+  ],
+  "implementation_notes": "**Scope:** This feature is test-only — it adds ~45+ new test functions to test/e2e/mockapi/mockapi_test.go. It tests the handlers and infrastructure implemented by K001 (PXD-0042: 15 new endpoint handlers, body capture, expanded counters) and K002 (PXD-0043: SSE injection, configurable state, enriched state fixture). No production code changes.\n\n**Dependencies:** K003 depends on K001 and K002 being implemented first. K001 adds the 15 handlers, counters, body capture, and /test/last-request endpoint. K002 adds SSE fan-out, /test/inject-event, /test/configure-state, enriched default state fixture, and inject_event_count.\n\n**Test Patterns (from existing code):**\n- Helper: newTestServer(t) → (*mockapi.Server, *httptest.Server) using httptest\n- Helper: getAssertions(t, baseURL) → mockapi.AssertionCounters via GET /test/assertions\n- Body constants: const registerBody, heartbeatBody at file top\n- Naming: TestEndpoint_Behavior (e.g. TestPing_ReturnsOK, TestRegister_InvalidBody_Returns400)\n- Happy path: send request → assert status → decode body → verify fields → verify counter via getAssertions()\n- Invalid body: POST/PUT with 'not-json' → assert 400\n- Wrong method: send wrong HTTP method → assert 405\n- Concurrent: sync.WaitGroup with 100 goroutines per endpoint type\n- SSE tests: context.WithTimeout, http.NewRequestWithContext, read buf, parse SSE fields\n\n**New helper needed:** doPut(t, url, body) for PUT request tests since http.Post only does POST.\n\n**Key decisions:**\n- Deregister has NO invalid body test because endpoints.go:69 passes nil body\n- Secrets and artifact have NO invalid body test because they are GET endpoints\n- Body constants use minimal valid JSON matching internal/api types\n- MetricBatch/LogBatch/AuditBatch are slice type aliases — body constants wrap items in JSON arrays\n- SSE injection tests need careful timing: connect SSE client → wait for initial event → inject → read injected event with timeout\n\n**Risks:**\n- SSE timing: tests use short timeouts and buffered reads; may need small sleep to ensure SSE client is registered before injection\n- Concurrent test duration: 1900 goroutines is fine for httptest server but verify it completes within default test timeout\n- Enriched state fixture changes break TestState_ReturnsFixturePeersAndPolicies assertions for Data/SecretRefs — must update existing test\n\n**Key files:**\n- test/e2e/mockapi/mockapi_test.go (only file modified)\n- test/e2e/mockapi/mockapi.go (read-only reference for handler behavior)\n- internal/api/types.go (read-only reference for request/response types)\n- internal/api/envelope.go (read-only reference for SignedEnvelope, EventType constants)\n- internal/api/endpoints.go (read-only reference for HTTP methods, paths, nil body patterns)",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T11:41:26.883939"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T19:28:22.104144"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T19:34:52.464348"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "6652a683-4da1-4216-a123-a14df00c0eec",
+      "timestamp": "2026-02-16T19:34:52.464416",
+      "total_duration": 386.5574355125427,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 386.5574355125427,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
