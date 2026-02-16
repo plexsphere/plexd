@@ -2,8 +2,8 @@
   "feature_id": "PXD-0039",
   "title": "J003: Add Kubernetes E2E test with kind and DaemonSet",
   "slug": "j003-add-kubernetes-e2e-test-with-kind-and",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 🏗️ large\n**Category:** testing\n**Priority:** high\n**Source:** Proposed for 'After binary builds, Docker image builds, etc. are now in place'\n\nCreate Kubernetes E2E test that validates all deploy/kubernetes/ manifests work on a real cluster. Build test/e2e/kubernetes/mock-api-manifests.yaml (Deployment + ClusterIP Service for mock-api). Create test/e2e/kubernetes/test.sh orchestration script that: creates a kind cluster, builds and loads plexd + mock-api images into kind, applies all deploy/kubernetes/ manifests (namespace, RBAC, CRDs, serviceaccount, secret, configmap, DaemonSet), applies mock-api manifests, waits for DaemonSet rollout, port-forwards to mock-api, validates /test/assertions counters, then deletes the kind cluster on cleanup. Add Makefile target test-e2e-k8s.\n\n**Rationale:** The Kubernetes DaemonSet deployment is the primary production deployment mode. Without E2E testing, RBAC misconfigurations, missing CRDs, incorrect serviceaccount references, or DaemonSet scheduling issues would only be caught in production. This validates the entire manifest stack end-to-end.\n\n**Affected Areas:**\n- test/e2e/kubernetes/mock-api-manifests.yaml\n- test/e2e/kubernetes/test.sh\n- deploy/kubernetes/\n- Makefile",
   "stories": [
@@ -405,17 +405,17 @@
     }
   ],
   "tasks": [
-    "1.1 Create test/e2e/kubernetes/mock-api-manifests.yaml with Deployment + ClusterIP Service for mock-api (REQ-004, REQ-010): Create a YAML file containing a Deployment (1 replica, mockapi:e2e image, readiness probe on GET /v1/ping:8080, resource limits) and a ClusterIP Service (port 8080 -> targetPort 8080), both in plexd-system namespace with app.kubernetes.io/name: mock-api labels. The Deployment should use imagePullPolicy: Never for kind compatibility.",
-    "1.2 Create the E2E-specific plexd configmap override in test/e2e/kubernetes/test.sh inline (REQ-004): The test script will create a ConfigMap plexd-config in plexd-system with config.yaml containing api: 'http://mock-api.plexd-system.svc.cluster.local:8080' instead of applying the default deploy/kubernetes/plexd-config-configmap.yaml. This is part of the test script, not a separate file.",
-    "2.1 Create test/e2e/kubernetes/test.sh orchestration script — prerequisite checks and configuration (REQ-001, REQ-009): Script header with set -euo pipefail, CLUSTER_NAME=plexd-e2e, TIMEOUT=120s. Check for required tools (docker, kind, kubectl). Define cleanup() trap function that kills port-forward PID, prints diagnostics, and runs 'kind delete cluster'. Set trap on EXIT.",
-    "2.2 Create test/e2e/kubernetes/test.sh — image build step (REQ-002): Build plexd image using deploy/docker/Dockerfile tagged as ghcr.io/plexsphere/plexd:e2e. Build mock-api image using test/e2e/mockapi/Dockerfile tagged as mockapi:e2e. Both builds use the repository root as build context.",
-    "2.3 Create test/e2e/kubernetes/test.sh — kind cluster creation and image loading (REQ-001, REQ-002): Delete any pre-existing cluster with same name. Create kind cluster with 'kind create cluster --name $CLUSTER_NAME'. Load both images with 'kind load docker-image'.",
-    "2.4 Create test/e2e/kubernetes/test.sh — manifest application step (REQ-003, REQ-004): Apply manifests in order: namespace.yaml, crds/plexdnodestate-crd.yaml, crds/plexdhook-crd.yaml, serviceaccount.yaml, rbac.yaml. Create bootstrap secret via kubectl create secret generic. Apply E2E configmap (overriding api URL). Apply mock-api-manifests.yaml. Apply daemonset.yaml with image overridden to ghcr.io/plexsphere/plexd:e2e and imagePullPolicy: Never via kubectl patch or kustomize-style sed.",
-    "2.5 Create test/e2e/kubernetes/test.sh — wait for readiness step (REQ-005): Wait for mock-api deployment rollout. Wait for plexd DaemonSet rollout with --timeout=120s. On timeout, call diagnostics function.",
-    "2.6 Create test/e2e/kubernetes/test.sh — port-forward and assertion validation (REQ-006, REQ-007): Start kubectl port-forward svc/mock-api in background. Wait for port-forward readiness. Poll GET /test/assertions with curl, retry up to 60s at 5s intervals. Parse JSON counters with jq or grep. Assert registration_count >= 1 and heartbeat_count >= 1. Print PASS/FAIL for each assertion.",
-    "2.7 Create test/e2e/kubernetes/test.sh — diagnostics function (REQ-008): Define print_diagnostics() that outputs: kubectl get pods -n plexd-system, kubectl describe daemonset/plexd -n plexd-system, kubectl logs -n plexd-system -l app.kubernetes.io/name=plexd --tail=50, kubectl logs -n plexd-system -l app.kubernetes.io/name=mock-api --tail=50.",
-    "3.1 Add test-e2e-k8s target to Makefile (REQ-009): Add test-e2e-k8s to .PHONY line. Add target that runs test/e2e/kubernetes/test.sh.",
-    "4.1 Create reference documentation for Kubernetes E2E test at docs/reference/backend/kubernetes-e2e-test.md (REQ-001 to REQ-010): Document the test script structure, manifest application order, assertion validation logic, configuration options (CLUSTER_NAME, TIMEOUT), required tools, and troubleshooting steps. Reference the mock-api manifests and the test.sh script."
+    "[done] 1.1 Create test/e2e/kubernetes/mock-api-manifests.yaml with Deployment + ClusterIP Service for mock-api (REQ-004, REQ-010): Create a YAML file containing a Deployment (1 replica, mockapi:e2e image, readiness probe on GET /v1/ping:8080, resource limits) and a ClusterIP Service (port 8080 -> targetPort 8080), both in plexd-system namespace with app.kubernetes.io/name: mock-api labels. The Deployment should use imagePullPolicy: Never for kind compatibility.",
+    "[done] 1.2 Create the E2E-specific plexd configmap override in test/e2e/kubernetes/test.sh inline (REQ-004): The test script will create a ConfigMap plexd-config in plexd-system with config.yaml containing api: 'http://mock-api.plexd-system.svc.cluster.local:8080' instead of applying the default deploy/kubernetes/plexd-config-configmap.yaml. This is part of the test script, not a separate file.",
+    "[done] 2.1 Create test/e2e/kubernetes/test.sh orchestration script — prerequisite checks and configuration (REQ-001, REQ-009): Script header with set -euo pipefail, CLUSTER_NAME=plexd-e2e, TIMEOUT=120s. Check for required tools (docker, kind, kubectl). Define cleanup() trap function that kills port-forward PID, prints diagnostics, and runs 'kind delete cluster'. Set trap on EXIT.",
+    "[done] 2.2 Create test/e2e/kubernetes/test.sh — image build step (REQ-002): Build plexd image using deploy/docker/Dockerfile tagged as ghcr.io/plexsphere/plexd:e2e. Build mock-api image using test/e2e/mockapi/Dockerfile tagged as mockapi:e2e. Both builds use the repository root as build context.",
+    "[done] 2.3 Create test/e2e/kubernetes/test.sh — kind cluster creation and image loading (REQ-001, REQ-002): Delete any pre-existing cluster with same name. Create kind cluster with 'kind create cluster --name $CLUSTER_NAME'. Load both images with 'kind load docker-image'.",
+    "[done] 2.4 Create test/e2e/kubernetes/test.sh — manifest application step (REQ-003, REQ-004): Apply manifests in order: namespace.yaml, crds/plexdnodestate-crd.yaml, crds/plexdhook-crd.yaml, serviceaccount.yaml, rbac.yaml. Create bootstrap secret via kubectl create secret generic. Apply E2E configmap (overriding api URL). Apply mock-api-manifests.yaml. Apply daemonset.yaml with image overridden to ghcr.io/plexsphere/plexd:e2e and imagePullPolicy: Never via kubectl patch or kustomize-style sed.",
+    "[done] 2.5 Create test/e2e/kubernetes/test.sh — wait for readiness step (REQ-005): Wait for mock-api deployment rollout. Wait for plexd DaemonSet rollout with --timeout=120s. On timeout, call diagnostics function.",
+    "[done] 2.6 Create test/e2e/kubernetes/test.sh — port-forward and assertion validation (REQ-006, REQ-007): Start kubectl port-forward svc/mock-api in background. Wait for port-forward readiness. Poll GET /test/assertions with curl, retry up to 60s at 5s intervals. Parse JSON counters with jq or grep. Assert registration_count >= 1 and heartbeat_count >= 1. Print PASS/FAIL for each assertion.",
+    "[done] 2.7 Create test/e2e/kubernetes/test.sh — diagnostics function (REQ-008): Define print_diagnostics() that outputs: kubectl get pods -n plexd-system, kubectl describe daemonset/plexd -n plexd-system, kubectl logs -n plexd-system -l app.kubernetes.io/name=plexd --tail=50, kubectl logs -n plexd-system -l app.kubernetes.io/name=mock-api --tail=50.",
+    "[done] 3.1 Add test-e2e-k8s target to Makefile (REQ-009): Add test-e2e-k8s to .PHONY line. Add target that runs test/e2e/kubernetes/test.sh.",
+    "[done] 4.1 Create reference documentation for Kubernetes E2E test at docs/reference/backend/kubernetes-e2e-test.md (REQ-001 to REQ-010): Document the test script structure, manifest application order, assertion validation logic, configuration options (CLUSTER_NAME, TIMEOUT), required tools, and troubleshooting steps. Reference the mock-api manifests and the test.sh script."
   ],
   "test_specifications": [
     {
@@ -530,6 +530,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-15T22:41:01.171124"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T07:47:29.725314"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T08:21:16.800352"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T08:21:16.855298"
     }
   },
   "execution_history": [
@@ -543,6 +555,56 @@
           "name": "prepare",
           "duration": 278.12515234947205,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "69b8f4d2-981a-455d-91a5-36c89edbad9d",
+      "timestamp": "2026-02-16T08:01:29.027143",
+      "total_duration": 702.7011179924011,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (2 tasks)",
+          "duration": 159.03374218940735,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (7 tasks)",
+          "duration": 119.7567846775055,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 41.42843794822693,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (1 tasks)",
+          "duration": 109.72025227546692,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0039] Code Review",
+          "duration": 140.1922287940979,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0039] Improvements",
+          "duration": 82.03106117248535,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0039] Simplify",
+          "duration": 50.53861093521118,
+          "type": "simplify",
           "status": "done"
         }
       ]
