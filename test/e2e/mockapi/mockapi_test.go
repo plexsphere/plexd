@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -100,6 +101,51 @@ func getCapturedBody(t *testing.T, baseURL, endpoint string) []byte {
 		t.Fatalf("read last-request/%s body: %v", endpoint, err)
 	}
 	return data
+}
+
+// assertAllCountersEqual checks that every field in the AssertionCounters struct
+// equals the expected value. Useful for InitialZero and ConcurrentCounters tests.
+func assertAllCountersEqual(t *testing.T, a mockapi.AssertionCounters, want int64) {
+	t.Helper()
+	v := reflect.ValueOf(a)
+	typ := v.Type()
+	for i := 0; i < v.NumField(); i++ {
+		got := v.Field(i).Int()
+		if got != want {
+			t.Errorf("%s = %d, want %d", typ.Field(i).Name, got, want)
+		}
+	}
+}
+
+// makeEnvelope creates a SignedEnvelope with the given event type and ID.
+func makeEnvelope(eventType, eventID string, payload json.RawMessage) api.SignedEnvelope {
+	return api.SignedEnvelope{
+		EventType: eventType,
+		EventID:   eventID,
+		IssuedAt:  time.Now().UTC(),
+		Nonce:     "nonce-" + eventID,
+		Payload:   payload,
+		Signature: "sig-" + eventID,
+	}
+}
+
+// connectSSE opens an SSE connection to /v1/nodes/{nodeID}/events and returns
+// the response. The caller must close resp.Body. The context timeout controls
+// the connection lifetime.
+func connectSSE(t *testing.T, baseURL, nodeID string, timeout time.Duration) *http.Response {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/nodes/"+nodeID+"/events", nil)
+	if err != nil {
+		t.Fatalf("create SSE request: %v", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET events: %v", err)
+	}
+	return resp
 }
 
 // ---------------------------------------------------------------------------
@@ -403,19 +449,7 @@ func TestMetadata_ReturnsFixtureAndCounterIncrements(t *testing.T) {
 func TestEvents_SSEStream(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/nodes/node-1/events", nil)
-	if err != nil {
-		t.Fatalf("create request: %v", err)
-	}
-	req.Header.Set("Accept", "text/event-stream")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET events: %v", err)
-	}
+	resp := connectSSE(t, ts.URL, "node-1", 3*time.Second)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -454,19 +488,7 @@ func TestEvents_SSEKeepAlive(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/nodes/node-1/events", nil)
-	if err != nil {
-		t.Fatalf("create request: %v", err)
-	}
-	req.Header.Set("Accept", "text/event-stream")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET events: %v", err)
-	}
+	resp := connectSSE(t, ts.URL, "node-1", 2*time.Second)
 	defer resp.Body.Close()
 
 	// Read initial event + at least one keep-alive comment.
@@ -495,16 +517,7 @@ func TestEvents_SSEKeepAlive(t *testing.T) {
 func TestEvents_ClientDisconnect(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/nodes/n1/events", nil)
-	req.Header.Set("Accept", "text/event-stream")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET events: %v", err)
-	}
+	resp := connectSSE(t, ts.URL, "n1", 500*time.Millisecond)
 	resp.Body.Close()
 
 	// If we got here without panicking, disconnect was handled gracefully.
@@ -587,6 +600,11 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/integrity/violations", integrityViolationBody)
 	resp.Body.Close()
 
+	// Inject one SSE event.
+	envJSON, _ := json.Marshal(makeEnvelope("test_mixed", "evt-mixed-001", json.RawMessage(`{}`)))
+	resp = doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", string(envJSON))
+	resp.Body.Close()
+
 	// Verify all counters via /test/assertions.
 	a := getAssertions(t, ts.URL)
 	if a.RegisterCount != 1 {
@@ -649,72 +667,16 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	if a.IntegrityViolationCount != 1 {
 		t.Errorf("integrity_violation_count = %d, want 1", a.IntegrityViolationCount)
 	}
+	if a.InjectEventCount != 1 {
+		t.Errorf("inject_event_count = %d, want 1", a.InjectEventCount)
+	}
 }
 
 func TestAssertions_InitialZero(t *testing.T) {
 	_, ts := newTestServer(t)
 
 	a := getAssertions(t, ts.URL)
-	if a.RegisterCount != 0 {
-		t.Errorf("registration_count = %d, want 0", a.RegisterCount)
-	}
-	if a.HeartbeatCount != 0 {
-		t.Errorf("heartbeat_count = %d, want 0", a.HeartbeatCount)
-	}
-	if a.StateCount != 0 {
-		t.Errorf("state_count = %d, want 0", a.StateCount)
-	}
-	if a.MetadataCount != 0 {
-		t.Errorf("metadata_count = %d, want 0", a.MetadataCount)
-	}
-	if a.DeregisterCount != 0 {
-		t.Errorf("deregister_count = %d, want 0", a.DeregisterCount)
-	}
-	if a.KeyRotateCount != 0 {
-		t.Errorf("key_rotate_count = %d, want 0", a.KeyRotateCount)
-	}
-	if a.CapabilitiesCount != 0 {
-		t.Errorf("capabilities_count = %d, want 0", a.CapabilitiesCount)
-	}
-	if a.EndpointCount != 0 {
-		t.Errorf("endpoint_count = %d, want 0", a.EndpointCount)
-	}
-	if a.DriftCount != 0 {
-		t.Errorf("drift_count = %d, want 0", a.DriftCount)
-	}
-	if a.SecretsCount != 0 {
-		t.Errorf("secrets_count = %d, want 0", a.SecretsCount)
-	}
-	if a.ReportCount != 0 {
-		t.Errorf("report_count = %d, want 0", a.ReportCount)
-	}
-	if a.ExecutionAckCount != 0 {
-		t.Errorf("execution_ack_count = %d, want 0", a.ExecutionAckCount)
-	}
-	if a.ExecutionResultCount != 0 {
-		t.Errorf("execution_result_count = %d, want 0", a.ExecutionResultCount)
-	}
-	if a.MetricsCount != 0 {
-		t.Errorf("metrics_count = %d, want 0", a.MetricsCount)
-	}
-	if a.LogsCount != 0 {
-		t.Errorf("logs_count = %d, want 0", a.LogsCount)
-	}
-	if a.AuditCount != 0 {
-		t.Errorf("audit_count = %d, want 0", a.AuditCount)
-	}
-	if a.ArtifactCount != 0 {
-		t.Errorf("artifact_count = %d, want 0", a.ArtifactCount)
-	}
-	if a.TunnelReadyCount != 0 {
-		t.Errorf("tunnel_ready_count = %d, want 0", a.TunnelReadyCount)
-	}
-	if a.TunnelClosedCount != 0 {
-		t.Errorf("tunnel_closed_count = %d, want 0", a.TunnelClosedCount)
-	}
-	if a.IntegrityViolationCount != 0 {
-		t.Errorf("integrity_violation_count = %d, want 0", a.IntegrityViolationCount)
-	}
+	assertAllCountersEqual(t, a, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +714,7 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPost, "/v1/nodes/node-1/tunnels/sess-001/ready", tunnelReadyBody},
 		{http.MethodPost, "/v1/nodes/node-1/tunnels/sess-001/closed", tunnelClosedBody},
 		{http.MethodPost, "/v1/nodes/node-1/integrity/violations", integrityViolationBody},
+		{http.MethodPost, "/test/inject-event", `{"event_type":"conc","event_id":"e1","nonce":"n","payload":{},"signature":"s"}`},
 	}
 
 	var wg sync.WaitGroup
@@ -784,66 +747,7 @@ func TestConcurrentCounters(t *testing.T) {
 	wg.Wait()
 
 	a := getAssertions(t, ts.URL)
-	if a.RegisterCount != n {
-		t.Errorf("registration_count = %d, want %d", a.RegisterCount, n)
-	}
-	if a.HeartbeatCount != n {
-		t.Errorf("heartbeat_count = %d, want %d", a.HeartbeatCount, n)
-	}
-	if a.StateCount != n {
-		t.Errorf("state_count = %d, want %d", a.StateCount, n)
-	}
-	if a.MetadataCount != n {
-		t.Errorf("metadata_count = %d, want %d", a.MetadataCount, n)
-	}
-	if a.DeregisterCount != n {
-		t.Errorf("deregister_count = %d, want %d", a.DeregisterCount, n)
-	}
-	if a.KeyRotateCount != n {
-		t.Errorf("key_rotate_count = %d, want %d", a.KeyRotateCount, n)
-	}
-	if a.CapabilitiesCount != n {
-		t.Errorf("capabilities_count = %d, want %d", a.CapabilitiesCount, n)
-	}
-	if a.EndpointCount != n {
-		t.Errorf("endpoint_count = %d, want %d", a.EndpointCount, n)
-	}
-	if a.DriftCount != n {
-		t.Errorf("drift_count = %d, want %d", a.DriftCount, n)
-	}
-	if a.SecretsCount != n {
-		t.Errorf("secrets_count = %d, want %d", a.SecretsCount, n)
-	}
-	if a.ReportCount != n {
-		t.Errorf("report_count = %d, want %d", a.ReportCount, n)
-	}
-	if a.ExecutionAckCount != n {
-		t.Errorf("execution_ack_count = %d, want %d", a.ExecutionAckCount, n)
-	}
-	if a.ExecutionResultCount != n {
-		t.Errorf("execution_result_count = %d, want %d", a.ExecutionResultCount, n)
-	}
-	if a.MetricsCount != n {
-		t.Errorf("metrics_count = %d, want %d", a.MetricsCount, n)
-	}
-	if a.LogsCount != n {
-		t.Errorf("logs_count = %d, want %d", a.LogsCount, n)
-	}
-	if a.AuditCount != n {
-		t.Errorf("audit_count = %d, want %d", a.AuditCount, n)
-	}
-	if a.ArtifactCount != n {
-		t.Errorf("artifact_count = %d, want %d", a.ArtifactCount, n)
-	}
-	if a.TunnelReadyCount != n {
-		t.Errorf("tunnel_ready_count = %d, want %d", a.TunnelReadyCount, n)
-	}
-	if a.TunnelClosedCount != n {
-		t.Errorf("tunnel_closed_count = %d, want %d", a.TunnelClosedCount, n)
-	}
-	if a.IntegrityViolationCount != n {
-		t.Errorf("integrity_violation_count = %d, want %d", a.IntegrityViolationCount, n)
-	}
+	assertAllCountersEqual(t, a, n)
 }
 
 // ---------------------------------------------------------------------------
@@ -1572,6 +1476,39 @@ func TestLastRequest_ReturnsCapturedBody(t *testing.T) {
 	}
 }
 
+func TestLastRequest_RegisterBodyCaptured(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	// Send a register request to capture the body.
+	resp, err := http.Post(ts.URL+"/v1/register", "application/json", strings.NewReader(registerBody))
+	if err != nil {
+		t.Fatalf("POST register: %v", err)
+	}
+	resp.Body.Close()
+
+	// Retrieve the captured body via the HTTP endpoint.
+	resp, err = http.Get(ts.URL + "/test/last-request/register")
+	if err != nil {
+		t.Fatalf("GET last-request/register: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/octet-stream" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/octet-stream")
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != registerBody {
+		t.Errorf("captured body = %q, want %q", string(body), registerBody)
+	}
+}
+
 func TestLastRequestBody_InitiallyEmpty(t *testing.T) {
 	srv, _ := newTestServer(t)
 
@@ -1658,23 +1595,14 @@ func readSSEEvent(t *testing.T, body io.Reader, timeout time.Duration) string {
 	}
 }
 
-func TestInjectEvent_BroadcastsToConnectedClient(t *testing.T) {
+func TestInjectEvent_DeliversToConnectedClient(t *testing.T) {
 	srv := mockapi.New()
 	srv.KeepAliveInterval = 10 * time.Second // long interval so keep-alives don't interfere
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
 	// Connect an SSE client.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/nodes/node-1/events", nil)
-	if err != nil {
-		t.Fatalf("create SSE request: %v", err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET events: %v", err)
-	}
+	resp := connectSSE(t, ts.URL, "node-1", 5*time.Second)
 	defer resp.Body.Close()
 
 	// Read the initial event (node_state_updated sent on connect).
@@ -1684,15 +1612,7 @@ func TestInjectEvent_BroadcastsToConnectedClient(t *testing.T) {
 	}
 
 	// Inject an event via POST /test/inject-event.
-	envelope := api.SignedEnvelope{
-		EventType: "test_injected",
-		EventID:   "evt-inject-001",
-		IssuedAt:  time.Now().UTC(),
-		Nonce:     "nonce-inject-001",
-		Payload:   json.RawMessage(`{"action":"test"}`),
-		Signature: "sig-inject-001",
-	}
-	envJSON, _ := json.Marshal(envelope)
+	envJSON, _ := json.Marshal(makeEnvelope("test_injected", "evt-inject-001", json.RawMessage(`{"action":"test"}`)))
 	injectResp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", string(envJSON))
 	defer injectResp.Body.Close()
 	if injectResp.StatusCode != http.StatusNoContent {
@@ -1715,15 +1635,7 @@ func TestInjectEvent_BroadcastsToConnectedClient(t *testing.T) {
 func TestInjectEvent_CounterIncrements(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	envelope := api.SignedEnvelope{
-		EventType: "test_counter",
-		EventID:   "evt-counter-001",
-		IssuedAt:  time.Now().UTC(),
-		Nonce:     "nonce-counter",
-		Payload:   json.RawMessage(`{}`),
-		Signature: "sig-counter",
-	}
-	envJSON, _ := json.Marshal(envelope)
+	envJSON, _ := json.Marshal(makeEnvelope("test_counter", "evt-counter-001", json.RawMessage(`{}`)))
 
 	// Inject twice.
 	for i := 0; i < 2; i++ {
@@ -1747,44 +1659,24 @@ func TestInjectEvent_MultipleClients(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	// Connect two SSE clients.
-	type sseClient struct {
-		resp *http.Response
-	}
-	clients := make([]sseClient, 2)
+	clients := make([]*http.Response, 2)
 	for i := range clients {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/nodes/node-1/events", nil)
-		if err != nil {
-			t.Fatalf("create SSE request #%d: %v", i, err)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("GET events #%d: %v", i, err)
-		}
+		resp := connectSSE(t, ts.URL, "node-1", 5*time.Second)
 		defer resp.Body.Close()
-		clients[i] = sseClient{resp: resp}
+		clients[i] = resp
 
 		// Consume the initial event.
 		readSSEEvent(t, resp.Body, 3*time.Second)
 	}
 
 	// Inject one event.
-	envelope := api.SignedEnvelope{
-		EventType: "multi_test",
-		EventID:   "evt-multi-001",
-		IssuedAt:  time.Now().UTC(),
-		Nonce:     "nonce-multi",
-		Payload:   json.RawMessage(`{"multi":true}`),
-		Signature: "sig-multi",
-	}
-	envJSON, _ := json.Marshal(envelope)
+	envJSON, _ := json.Marshal(makeEnvelope("multi_test", "evt-multi-001", json.RawMessage(`{"multi":true}`)))
 	injectResp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", string(envJSON))
 	injectResp.Body.Close()
 
 	// Both clients should receive the event.
 	for i, c := range clients {
-		evt := readSSEEvent(t, c.resp.Body, 3*time.Second)
+		evt := readSSEEvent(t, c.Body, 3*time.Second)
 		if !strings.Contains(evt, "multi_test") {
 			t.Errorf("client %d: expected multi_test event, got: %q", i, evt)
 		}
@@ -2037,15 +1929,7 @@ func TestState_ReturnsSecretRefs(t *testing.T) {
 func TestInjectEvent_NoClients_Succeeds(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	envelope := api.SignedEnvelope{
-		EventType: "no_clients_test",
-		EventID:   "evt-noclient-001",
-		IssuedAt:  time.Now().UTC(),
-		Nonce:     "nonce-noclient",
-		Payload:   json.RawMessage(`{}`),
-		Signature: "sig-noclient",
-	}
-	envJSON, _ := json.Marshal(envelope)
+	envJSON, _ := json.Marshal(makeEnvelope("no_clients_test", "evt-noclient-001", json.RawMessage(`{}`)))
 	resp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", string(envJSON))
 	defer resp.Body.Close()
 
@@ -2062,31 +1946,14 @@ func TestBroadcastSSE_Programmatic(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	// Connect an SSE client.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/nodes/node-1/events", nil)
-	if err != nil {
-		t.Fatalf("create SSE request: %v", err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET events: %v", err)
-	}
+	resp := connectSSE(t, ts.URL, "node-1", 5*time.Second)
 	defer resp.Body.Close()
 
 	// Consume initial event.
 	readSSEEvent(t, resp.Body, 3*time.Second)
 
 	// Use the Go API directly instead of the HTTP endpoint.
-	envelope := api.SignedEnvelope{
-		EventType: "programmatic_test",
-		EventID:   "evt-prog-001",
-		IssuedAt:  time.Now().UTC(),
-		Nonce:     "nonce-prog",
-		Payload:   json.RawMessage(`{"via":"go_api"}`),
-		Signature: "sig-prog",
-	}
-	srv.BroadcastSSE(envelope)
+	srv.BroadcastSSE(makeEnvelope("programmatic_test", "evt-prog-001", json.RawMessage(`{"via":"go_api"}`)))
 
 	// Read the broadcast event.
 	evt := readSSEEvent(t, resp.Body, 3*time.Second)
@@ -2481,16 +2348,7 @@ func TestConcurrent_InjectEventAndConfigureState(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	// Connect an SSE client so BroadcastSSE has a target.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/nodes/node-1/events", nil)
-	if err != nil {
-		t.Fatalf("create SSE request: %v", err)
-	}
-	sseResp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET events: %v", err)
-	}
+	sseResp := connectSSE(t, ts.URL, "node-1", 10*time.Second)
 	defer sseResp.Body.Close()
 
 	// Drain the initial event.

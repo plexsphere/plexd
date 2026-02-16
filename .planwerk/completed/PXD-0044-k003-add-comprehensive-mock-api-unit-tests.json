@@ -2,8 +2,8 @@
   "feature_id": "PXD-0044",
   "title": "K003: Add comprehensive mock API unit tests",
   "slug": "k003-add-comprehensive-mock-api-unit-tests",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 🏗️ large\n**Category:** testing\n**Priority:** high\n**Source:** Proposed for 'With the latest commits/features, E2E tests were added'\n\nAdd ~45+ new test functions to test/e2e/mockapi/mockapi_test.go following existing patterns. Per new handler (15 handlers): happy path request returns expected status, counter increments by 1, invalid body returns 400 (for POST/PUT endpoints), wrong HTTP method returns 405. Additional test groups: SSE injection — test that injected event is delivered to a connected SSE client; state configuration — test that POST /test/configure-state replaces fixture and subsequent GET /v1/nodes/{id}/state returns new state; request body capture — test that POST to an endpoint stores body and GET /test/last-request/{endpoint} returns it; concurrent counter atomicity — parallel requests to new endpoints produce correct counter totals.\n\n**Rationale:** New handlers from K001 and K002 add significant logic (method validation, body capture, SSE fan-out, mutex-protected state replacement). Without unit tests, regressions in the mock itself could produce false-positive E2E results. The existing test file establishes clear patterns that should be extended consistently.\n\n**Affected Areas:**\n- test/e2e/mockapi/mockapi_test.go",
   "stories": [
@@ -411,6 +411,7 @@
       "description": "Add const declarations at the top of mockapi_test.go for valid JSON bodies used in tests, following the existing registerBody/heartbeatBody pattern. Constants: keyRotateBody (KeyRotateRequest), capabilitiesBody (CapabilitiesPayload with binary info and empty actions/hooks), endpointBody (EndpointReport), driftBody (DriftReport with 1 correction), reportBody (ReportSyncRequest with 1 entry), executionAckBody (ExecutionAck), executionResultBody (ExecutionResult), metricsBatchBody (MetricBatch with 1 MetricPoint), logsBatchBody (LogBatch with 1 LogEntry), auditBatchBody (AuditBatch with 1 AuditEntry), tunnelReadyBody (TunnelReadyRequest), tunnelClosedBody (TunnelClosedRequest), integrityViolationBody (IntegrityViolationReport). Add doPut helper function for PUT request tests: func doPut(t *testing.T, url string, body string) *http.Response.",
       "level": 1,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-011"
       ]
@@ -421,6 +422,7 @@
       "description": "Add TestDeregister_Returns204AndCounterIncrements: POST /v1/nodes/node-1/deregister with nil body, assert status 204, assert empty body, assert deregister_count=1 via getAssertions(). Add TestDeregister_WrongMethod_Returns405: GET /v1/nodes/node-1/deregister, assert 405. No invalid body test because deregister accepts nil body (endpoints.go:69).",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-003"
@@ -432,6 +434,7 @@
       "description": "Add TestKeyRotate_ReturnsFixtureAndCounter: POST /v1/keys/rotate with keyRotateBody, assert 200, decode api.KeyRotateResponse, verify UpdatedPeers has 2 entries with non-empty fields, assert key_rotate_count=1. Add TestKeyRotate_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestKeyRotate_WrongMethod_Returns405: GET /v1/keys/rotate, assert 405.",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -444,6 +447,7 @@
       "description": "Add TestCapabilities_Returns204AndCounter: PUT /v1/nodes/node-1/capabilities with capabilitiesBody using doPut helper, assert 204, assert capabilities_count=1. Add TestCapabilities_InvalidBody_Returns400: PUT with 'not-json', assert 400. Add TestCapabilities_WrongMethod_Returns405: POST /v1/nodes/node-1/capabilities, assert 405.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -456,6 +460,7 @@
       "description": "Add TestEndpoint_ReturnsFixtureAndCounter: PUT with endpointBody, assert 200, decode api.EndpointResponse, verify PeerEndpoints has 2 entries with correct PeerID and Endpoint, assert endpoint_count=1. Add TestEndpoint_InvalidBody_Returns400: PUT with 'not-json', assert 400. Add TestEndpoint_WrongMethod_Returns405: POST, assert 405.",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -468,6 +473,7 @@
       "description": "Add TestDrift_Returns204AndCounter: POST with driftBody, assert 204, assert drift_count=1. Add TestDrift_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestDrift_WrongMethod_Returns405: GET, assert 405.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -480,6 +486,7 @@
       "description": "Add TestSecrets_ReturnsFixtureWithPathKey: GET /v1/nodes/node-1/secrets/db-password, assert 200, decode api.SecretResponse, verify Key='db-password', Ciphertext non-empty, Nonce non-empty, Version >= 1, assert secrets_count=1. Add TestSecrets_WrongMethod_Returns405: POST /v1/nodes/node-1/secrets/db-password, assert 405. No invalid body test — GET endpoint.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-003"
@@ -491,6 +498,7 @@
       "description": "Add TestReport_Returns204AndCounter: POST with reportBody, assert 204, assert report_count=1. Add TestReport_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestReport_WrongMethod_Returns405: GET, assert 405.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -503,6 +511,7 @@
       "description": "Add TestExecutionAck_Returns204AndCounter: POST /v1/nodes/node-1/executions/exec-001/ack with executionAckBody, assert 204, assert execution_ack_count=1. Add TestExecutionAck_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestExecutionAck_WrongMethod_Returns405: GET, assert 405.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -515,6 +524,7 @@
       "description": "Add TestExecutionResult_Returns204AndCounter: POST /v1/nodes/node-1/executions/exec-001/result with executionResultBody, assert 204, assert execution_result_count=1. Add TestExecutionResult_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestExecutionResult_WrongMethod_Returns405: GET, assert 405.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -527,6 +537,7 @@
       "description": "Add TestMetrics_Returns204AndCounter: POST /v1/nodes/node-1/metrics with metricsBatchBody, assert 204, assert metrics_count=1. Add TestMetrics_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestMetrics_WrongMethod_Returns405: GET, assert 405.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -539,6 +550,7 @@
       "description": "Add TestLogs_Returns204AndCounter: POST /v1/nodes/node-1/logs with logsBatchBody, assert 204, assert logs_count=1. Add TestLogs_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestLogs_WrongMethod_Returns405: GET, assert 405.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -551,6 +563,7 @@
       "description": "Add TestAudit_Returns204AndCounter: POST /v1/nodes/node-1/audit with auditBatchBody, assert 204, assert audit_count=1. Add TestAudit_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestAudit_WrongMethod_Returns405: GET, assert 405.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -563,6 +576,7 @@
       "description": "Add TestArtifact_ReturnsBinaryAndCounter: GET /v1/artifacts/plexd/1.0.0/linux/amd64, assert 200, assert Content-Type application/octet-stream, assert body non-empty (read and check len > 0), assert artifact_count=1. Add TestArtifact_WrongMethod_Returns405: POST same path, assert 405. No invalid body test — GET endpoint.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-003"
@@ -574,6 +588,7 @@
       "description": "Add TestTunnelReady_Returns204AndCounter: POST /v1/nodes/node-1/tunnels/sess-001/ready with tunnelReadyBody, assert 204, assert tunnel_ready_count=1. Add TestTunnelReady_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestTunnelReady_WrongMethod_Returns405: GET, assert 405.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -586,6 +601,7 @@
       "description": "Add TestTunnelClosed_Returns204AndCounter: POST /v1/nodes/node-1/tunnels/sess-001/closed with tunnelClosedBody, assert 204, assert tunnel_closed_count=1. Add TestTunnelClosed_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestTunnelClosed_WrongMethod_Returns405: GET, assert 405.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -598,6 +614,7 @@
       "description": "Add TestIntegrityViolation_Returns204AndCounter: POST /v1/nodes/node-1/integrity/violations with integrityViolationBody, assert 204, assert integrity_violation_count=1. Add TestIntegrityViolation_InvalidBody_Returns400: POST with 'not-json', assert 400. Add TestIntegrityViolation_WrongMethod_Returns405: GET, assert 405.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -610,6 +627,7 @@
       "description": "Add TestInjectEvent_DeliversToConnectedClient: connect SSE client via GET /v1/nodes/node-1/events, read initial event, POST /test/inject-event with {\"event_type\":\"action_request\",\"payload\":{\"action_id\":\"a1\"}}, read from SSE stream, verify the injected event appears with correct SSE wire format. Add TestInjectEvent_SSEWireFormat: verify output contains 'id:', 'event:', 'data:' fields. Add TestInjectEvent_SignedEnvelopeFields: parse data JSON, verify event_id starts with 'evt-inject-', issued_at is recent UTC, nonce non-empty, signature='mock-signature-injected', payload matches request. Add TestInjectEvent_NoClients_Returns200: POST inject-event with no SSE clients, assert 200. Add TestInjectEvent_InvalidJSON_Returns400: POST inject-event with 'not-json', assert 400.",
       "level": 3,
       "estimate_minutes": 30,
+      "status": "done",
       "requirements": [
         "REQ-004"
       ]
@@ -620,6 +638,7 @@
       "description": "Add TestInjectEvent_MultipleClients: connect 2 SSE clients, inject one event, verify both receive it. Add TestEvents_ClientDeregisterOnDisconnect: connect SSE client, cancel context, then inject event, verify no panic or block. Add TestEvents_InitialEventStillSentAfterFanout: connect SSE client, verify first event is still node_state_updated (initial event before fan-out registration).",
       "level": 3,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-004",
         "REQ-012"
@@ -631,6 +650,7 @@
       "description": "Add TestConfigureState_ReplacesActiveFixture: POST /test/configure-state with a minimal custom StateResponse (different peers), then GET /v1/nodes/node-1/state, verify response matches custom state (e.g. different peer IDs). Add TestConfigureState_InvalidJSON_Returns400: POST with 'not-json', verify 400, then GET state and verify default fixture still active. Add TestConfigureState_CounterStillIncrements: POST configure-state, then GET state twice, verify state_count=2 via getAssertions().",
       "level": 3,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-005"
       ]
@@ -641,6 +661,7 @@
       "description": "Add TestState_DefaultFixture_HasSigningKeys: GET state, decode, verify SigningKeys non-nil, Current and Previous non-empty and distinct. Add TestState_DefaultFixture_HasDisabledConfigs: verify BridgeConfig (non-nil, Enabled=false), RelayConfig (non-nil, Sessions empty), UserAccessConfig (non-nil, Enabled=false), IngressConfig (non-nil, Enabled=false, Rules empty), SiteToSiteConfig (non-nil, Enabled=false, Tunnels empty). Add TestState_DefaultFixture_HasDataAndSecretRefs: verify len(Data)==2 with distinct keys, non-empty content types and payloads, Version >= 1; verify len(SecretRefs)==1 with non-empty key and Version >= 1. Update existing TestState_ReturnsFixturePeersAndPolicies assertions: change Data check from 'len == 0' to 'len == 2' and SecretRefs check from 'len == 0' to 'len == 1'.",
       "level": 3,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-006",
         "REQ-010"
@@ -652,6 +673,7 @@
       "description": "Add TestLastRequest_Returns404WhenNoCapturedBody: GET /test/last-request/drift on fresh server, assert 404. Add TestLastRequest_ReturnsCapturedBody: POST /v1/nodes/node-1/drift with driftBody, then GET /test/last-request/drift, assert 200, assert Content-Type application/octet-stream, assert body matches driftBody bytes. Add TestLastRequest_RegisterBodyCaptured: POST /v1/register with registerBody, then GET /test/last-request/register, assert 200, assert body matches registerBody bytes.",
       "level": 3,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-007"
       ]
@@ -662,6 +684,7 @@
       "description": "Update TestAssertions_InitialZero to verify all counter fields are 0 on fresh server. The existing test checks RegisterCount, HeartbeatCount, StateCount, MetadataCount. Add checks for: DeregisterCount, KeyRotateCount, CapabilitiesCount, EndpointCount, DriftCount, SecretsCount, ReportCount, ExecutionAckCount, ExecutionResultCount, MetricsCount, LogsCount, AuditCount, ArtifactCount, TunnelReadyCount, TunnelClosedCount, IntegrityViolationCount, InjectEventCount. Decode into mockapi.AssertionCounters struct (which will have the new fields after K001/K002).",
       "level": 4,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-009"
       ]
@@ -672,6 +695,7 @@
       "description": "Extend TestAssertions_ReturnsCorrectCountsAfterMixedCalls to also call: PUT capabilities once, POST drift once, POST metrics once, POST logs once, POST audit once. Then verify all 19+ counter values: existing 4 counters unchanged, new 5 counters = 1, remaining new counters = 0. Uses doPut helper for PUT requests.",
       "level": 4,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-010"
       ]
@@ -682,6 +706,7 @@
       "description": "Extend TestConcurrentCounters to add 100 goroutines each for: deregister, key_rotate, capabilities (PUT), endpoint (PUT), drift, secrets (GET), report, execution_ack, execution_result, metrics, logs, audit, artifact (GET), tunnel_ready, tunnel_closed, integrity_violation. Use appropriate HTTP methods (PUT for capabilities/endpoint, GET for secrets/artifact, POST for rest). After wg.Wait(), verify all 19 counters equal 100. Use defined body constants for request bodies. Total goroutines: 19 × 100 = 1900.",
       "level": 4,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-008"
       ]
@@ -692,6 +717,7 @@
       "description": "Add TestConcurrentInjectAndConfigureState: spawn goroutines concurrently doing: 50× POST /test/inject-event, 50× POST /test/configure-state with valid StateResponse, 50× GET /v1/nodes/node-1/state, 10× SSE client connect → read initial event → disconnect. Use sync.WaitGroup. Verify no panics, no goroutine leaks (all goroutines complete). Verify counters are consistent (inject_event_count >= 50, state_count >= 50). Test must pass with -race flag.",
       "level": 4,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-004",
         "REQ-005",
@@ -1192,6 +1218,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-16T19:34:52.464348"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T20:36:21.105917"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T20:59:45.447258"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T20:59:45.510471"
     }
   },
   "execution_history": [
@@ -1205,6 +1243,56 @@
           "name": "prepare",
           "duration": 386.5574355125427,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "a85976af-05d0-4035-8485-680a564db766",
+      "timestamp": "2026-02-16T20:58:38.865228",
+      "total_duration": 1202.215936422348,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (1 tasks)",
+          "duration": 287.4313232898712,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (16 tasks)",
+          "duration": 65.8454921245575,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (5 tasks)",
+          "duration": 103.17132472991943,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (4 tasks)",
+          "duration": 90.06513571739197,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0044] Code Review",
+          "duration": 174.70573115348816,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0044] Improvements",
+          "duration": 118.47085905075073,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0044] Simplify",
+          "duration": 362.526070356369,
+          "type": "simplify",
           "status": "done"
         }
       ]
