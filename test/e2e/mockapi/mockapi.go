@@ -4,11 +4,14 @@
 package mockapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,10 +20,26 @@ import (
 
 // AssertionCounters holds call counters for each tracked endpoint.
 type AssertionCounters struct {
-	RegisterCount  int64 `json:"registration_count"`
-	HeartbeatCount int64 `json:"heartbeat_count"`
-	StateCount     int64 `json:"state_count"`
-	MetadataCount  int64 `json:"metadata_count"`
+	RegisterCount          int64 `json:"registration_count"`
+	HeartbeatCount         int64 `json:"heartbeat_count"`
+	StateCount             int64 `json:"state_count"`
+	MetadataCount          int64 `json:"metadata_count"`
+	DeregisterCount        int64 `json:"deregister_count"`
+	KeyRotateCount         int64 `json:"key_rotate_count"`
+	CapabilitiesCount      int64 `json:"capabilities_count"`
+	EndpointCount          int64 `json:"endpoint_count"`
+	DriftCount             int64 `json:"drift_count"`
+	SecretsCount           int64 `json:"secrets_count"`
+	ReportCount            int64 `json:"report_count"`
+	ExecutionAckCount      int64 `json:"execution_ack_count"`
+	ExecutionResultCount   int64 `json:"execution_result_count"`
+	MetricsCount           int64 `json:"metrics_count"`
+	LogsCount              int64 `json:"logs_count"`
+	AuditCount             int64 `json:"audit_count"`
+	ArtifactCount          int64 `json:"artifact_count"`
+	TunnelReadyCount       int64 `json:"tunnel_ready_count"`
+	TunnelClosedCount      int64 `json:"tunnel_closed_count"`
+	IntegrityViolationCount int64 `json:"integrity_violation_count"`
 }
 
 // DefaultKeepAliveInterval is the default interval between SSE keep-alive comments.
@@ -32,17 +51,38 @@ type Server struct {
 	// Defaults to DefaultKeepAliveInterval (15s). Set before calling Handler().
 	KeepAliveInterval time.Duration
 
-	registerCount  atomic.Int64
-	heartbeatCount atomic.Int64
-	stateCount     atomic.Int64
-	metadataCount  atomic.Int64
-	mux            *http.ServeMux
+	registerCount          atomic.Int64
+	heartbeatCount         atomic.Int64
+	stateCount             atomic.Int64
+	metadataCount          atomic.Int64
+	deregisterCount        atomic.Int64
+	keyRotateCount         atomic.Int64
+	capabilitiesCount      atomic.Int64
+	endpointCount          atomic.Int64
+	driftCount             atomic.Int64
+	secretsCount           atomic.Int64
+	reportCount            atomic.Int64
+	executionAckCount      atomic.Int64
+	executionResultCount   atomic.Int64
+	metricsCount           atomic.Int64
+	logsCount              atomic.Int64
+	auditCount             atomic.Int64
+	artifactCount          atomic.Int64
+	tunnelReadyCount       atomic.Int64
+	tunnelClosedCount      atomic.Int64
+	integrityViolationCount atomic.Int64
+
+	lastRequests   map[string][]byte
+	lastRequestsMu sync.RWMutex
+
+	mux *http.ServeMux
 }
 
 // New creates a new mock API server with all routes registered.
 func New() *Server {
 	s := &Server{
 		KeepAliveInterval: DefaultKeepAliveInterval,
+		lastRequests:      make(map[string][]byte),
 		mux:               http.NewServeMux(),
 	}
 	s.registerRoutes()
@@ -57,10 +97,26 @@ func (s *Server) Handler() http.Handler {
 // Assertions returns a snapshot of the current call counters.
 func (s *Server) Assertions() AssertionCounters {
 	return AssertionCounters{
-		RegisterCount:  s.registerCount.Load(),
-		HeartbeatCount: s.heartbeatCount.Load(),
-		StateCount:     s.stateCount.Load(),
-		MetadataCount:  s.metadataCount.Load(),
+		RegisterCount:          s.registerCount.Load(),
+		HeartbeatCount:         s.heartbeatCount.Load(),
+		StateCount:             s.stateCount.Load(),
+		MetadataCount:          s.metadataCount.Load(),
+		DeregisterCount:        s.deregisterCount.Load(),
+		KeyRotateCount:         s.keyRotateCount.Load(),
+		CapabilitiesCount:      s.capabilitiesCount.Load(),
+		EndpointCount:          s.endpointCount.Load(),
+		DriftCount:             s.driftCount.Load(),
+		SecretsCount:           s.secretsCount.Load(),
+		ReportCount:            s.reportCount.Load(),
+		ExecutionAckCount:      s.executionAckCount.Load(),
+		ExecutionResultCount:   s.executionResultCount.Load(),
+		MetricsCount:           s.metricsCount.Load(),
+		LogsCount:              s.logsCount.Load(),
+		AuditCount:             s.auditCount.Load(),
+		ArtifactCount:          s.artifactCount.Load(),
+		TunnelReadyCount:       s.tunnelReadyCount.Load(),
+		TunnelClosedCount:      s.tunnelClosedCount.Load(),
+		IntegrityViolationCount: s.integrityViolationCount.Load(),
 	}
 }
 
@@ -85,6 +141,7 @@ var fixturePeers = []api.Peer{
 }
 
 func (s *Server) registerRoutes() {
+	// Existing endpoints.
 	s.mux.HandleFunc("GET /v1/ping", s.handlePing)
 	s.mux.HandleFunc("POST /v1/register", s.handleRegister)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/heartbeat", s.handleHeartbeat)
@@ -93,10 +150,83 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /v1/nodes/{id}/events", s.handleEvents)
 	s.mux.HandleFunc("GET /test/assertions", s.handleAssertions)
 
-	// Method-not-allowed handlers for routes that only accept specific methods.
+	// New endpoints.
+	s.mux.HandleFunc("POST /v1/nodes/{id}/deregister", s.handleDeregister)
+	s.mux.HandleFunc("POST /v1/keys/rotate", s.handleKeyRotate)
+	s.mux.HandleFunc("PUT /v1/nodes/{id}/capabilities", s.handleCapabilities)
+	s.mux.HandleFunc("PUT /v1/nodes/{id}/endpoint", s.handleEndpoint)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/drift", s.handleDrift)
+	s.mux.HandleFunc("GET /v1/nodes/{id}/secrets/{key}", s.handleSecrets)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/report", s.handleReport)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/executions/{eid}/ack", s.handleExecutionAck)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/executions/{eid}/result", s.handleExecutionResult)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/metrics", s.handleMetrics)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/logs", s.handleLogs)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/audit", s.handleAudit)
+	s.mux.HandleFunc("GET /v1/artifacts/plexd/{version}/{os}/{arch}", s.handleArtifact)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/tunnels/{sid}/ready", s.handleTunnelReady)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/tunnels/{sid}/closed", s.handleTunnelClosed)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/integrity/violations", s.handleIntegrityViolation)
+
+	// Test control endpoint for request body inspection.
+	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
+
+	// Method-not-allowed fallbacks.
 	s.mux.HandleFunc("/v1/ping", methodNotAllowed)
 	s.mux.HandleFunc("/v1/register", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/heartbeat", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/deregister", methodNotAllowed)
+	s.mux.HandleFunc("/v1/keys/rotate", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/capabilities", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/endpoint", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/drift", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/secrets/{key}", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/report", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/executions/{eid}/ack", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/executions/{eid}/result", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/metrics", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/logs", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/audit", methodNotAllowed)
+	s.mux.HandleFunc("/v1/artifacts/plexd/{version}/{os}/{arch}", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/tunnels/{sid}/ready", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/tunnels/{sid}/closed", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/integrity/violations", methodNotAllowed)
+}
+
+// captureBody reads the full request body, stores the raw bytes in lastRequests
+// under the given endpoint name, and returns the bytes for further processing.
+func (s *Server) captureBody(endpoint string, r *http.Request) ([]byte, error) {
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	s.lastRequestsMu.Lock()
+	s.lastRequests[endpoint] = data
+	s.lastRequestsMu.Unlock()
+	return data, nil
+}
+
+// decodeBody captures the request body for the given endpoint and JSON-decodes
+// it into v. Returns false and writes a 400 response if either step fails.
+func (s *Server) decodeBody(w http.ResponseWriter, r *http.Request, endpoint string, v any) bool {
+	data, err := s.captureBody(endpoint, r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return false
+	}
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(v); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return false
+	}
+	return true
+}
+
+// LastRequestBody returns the last captured request body for the given endpoint.
+func (s *Server) LastRequestBody(endpoint string) ([]byte, bool) {
+	s.lastRequestsMu.RLock()
+	defer s.lastRequestsMu.RUnlock()
+	data, ok := s.lastRequests[endpoint]
+	return data, ok
 }
 
 // ---------------------------------------------------------------------------
@@ -111,8 +241,7 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 // handleRegister handles POST /v1/register (REQ-002).
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req api.RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !s.decodeBody(w, r, "register", &req) {
 		return
 	}
 
@@ -131,8 +260,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 // handleHeartbeat handles POST /v1/nodes/{id}/heartbeat (REQ-003).
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var req api.HeartbeatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !s.decodeBody(w, r, "heartbeat", &req) {
 		return
 	}
 
@@ -252,6 +380,194 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 // handleAssertions handles GET /test/assertions (REQ-007).
 func (s *Server) handleAssertions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.Assertions())
+}
+
+// handleDeregister handles POST /v1/nodes/{id}/deregister.
+// The client sends a nil body (see endpoints.go), so we only capture for
+// test observability — there is no payload to decode.
+func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.captureBody("deregister", r); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	s.deregisterCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleKeyRotate handles POST /v1/keys/rotate.
+func (s *Server) handleKeyRotate(w http.ResponseWriter, r *http.Request) {
+	var req api.KeyRotateRequest
+	if !s.decodeBody(w, r, "key_rotate", &req) {
+		return
+	}
+	s.keyRotateCount.Add(1)
+	writeJSON(w, http.StatusOK, api.KeyRotateResponse{UpdatedPeers: fixturePeers})
+}
+
+// handleCapabilities handles PUT /v1/nodes/{id}/capabilities.
+func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	var req api.CapabilitiesPayload
+	if !s.decodeBody(w, r, "capabilities", &req) {
+		return
+	}
+	s.capabilitiesCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleEndpoint handles PUT /v1/nodes/{id}/endpoint.
+func (s *Server) handleEndpoint(w http.ResponseWriter, r *http.Request) {
+	var req api.EndpointReport
+	if !s.decodeBody(w, r, "endpoint", &req) {
+		return
+	}
+	s.endpointCount.Add(1)
+	resp := api.EndpointResponse{
+		PeerEndpoints: []api.PeerEndpoint{
+			{PeerID: "peer-001", Endpoint: "203.0.113.1:51820"},
+			{PeerID: "peer-002", Endpoint: "203.0.113.2:51820"},
+		},
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleDrift handles POST /v1/nodes/{id}/drift.
+func (s *Server) handleDrift(w http.ResponseWriter, r *http.Request) {
+	var req api.DriftReport
+	if !s.decodeBody(w, r, "drift", &req) {
+		return
+	}
+	s.driftCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleSecrets handles GET /v1/nodes/{id}/secrets/{key}.
+func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
+	s.secretsCount.Add(1)
+	key := r.PathValue("key")
+	resp := api.SecretResponse{
+		Key:        key,
+		Ciphertext: "bW9jay1jaXBoZXJ0ZXh0",
+		Nonce:      "bW9jay1ub25jZQ==",
+		Version:    1,
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleReport handles POST /v1/nodes/{id}/report.
+func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
+	var req api.ReportSyncRequest
+	if !s.decodeBody(w, r, "report", &req) {
+		return
+	}
+	s.reportCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleExecutionAck handles POST /v1/nodes/{id}/executions/{eid}/ack.
+func (s *Server) handleExecutionAck(w http.ResponseWriter, r *http.Request) {
+	var req api.ExecutionAck
+	if !s.decodeBody(w, r, "execution_ack", &req) {
+		return
+	}
+	s.executionAckCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleExecutionResult handles POST /v1/nodes/{id}/executions/{eid}/result.
+func (s *Server) handleExecutionResult(w http.ResponseWriter, r *http.Request) {
+	var req api.ExecutionResult
+	if !s.decodeBody(w, r, "execution_result", &req) {
+		return
+	}
+	s.executionResultCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleMetrics handles POST /v1/nodes/{id}/metrics.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	var req api.MetricBatch
+	if !s.decodeBody(w, r, "metrics", &req) {
+		return
+	}
+	s.metricsCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleLogs handles POST /v1/nodes/{id}/logs.
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	var req api.LogBatch
+	if !s.decodeBody(w, r, "logs", &req) {
+		return
+	}
+	s.logsCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleAudit handles POST /v1/nodes/{id}/audit.
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
+	var req api.AuditBatch
+	if !s.decodeBody(w, r, "audit", &req) {
+		return
+	}
+	s.auditCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleArtifact handles GET /v1/artifacts/plexd/{version}/{os}/{arch}.
+func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
+	s.artifactCount.Add(1)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write([]byte("mock-plexd-binary-v0.0.0")); err != nil {
+		slog.Error("handleArtifact: write failed", "error", err)
+	}
+}
+
+// handleTunnelReady handles POST /v1/nodes/{id}/tunnels/{sid}/ready.
+func (s *Server) handleTunnelReady(w http.ResponseWriter, r *http.Request) {
+	var req api.TunnelReadyRequest
+	if !s.decodeBody(w, r, "tunnel_ready", &req) {
+		return
+	}
+	s.tunnelReadyCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleTunnelClosed handles POST /v1/nodes/{id}/tunnels/{sid}/closed.
+func (s *Server) handleTunnelClosed(w http.ResponseWriter, r *http.Request) {
+	var req api.TunnelClosedRequest
+	if !s.decodeBody(w, r, "tunnel_closed", &req) {
+		return
+	}
+	s.tunnelClosedCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleIntegrityViolation handles POST /v1/nodes/{id}/integrity/violations.
+func (s *Server) handleIntegrityViolation(w http.ResponseWriter, r *http.Request) {
+	var req api.IntegrityViolationReport
+	if !s.decodeBody(w, r, "integrity_violation", &req) {
+		return
+	}
+	s.integrityViolationCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleLastRequest handles GET /test/last-request/{endpoint}.
+func (s *Server) handleLastRequest(w http.ResponseWriter, r *http.Request) {
+	endpoint := r.PathValue("endpoint")
+	s.lastRequestsMu.RLock()
+	data, ok := s.lastRequests[endpoint]
+	s.lastRequestsMu.RUnlock()
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no captured request for endpoint"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(data); err != nil {
+		slog.Error("handleLastRequest: write failed", "error", err)
+	}
 }
 
 // ---------------------------------------------------------------------------

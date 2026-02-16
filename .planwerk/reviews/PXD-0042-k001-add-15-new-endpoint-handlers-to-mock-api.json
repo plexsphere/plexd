@@ -1,0 +1,95 @@
+{
+  "feature_id": "PXD-0042",
+  "title": "K001: Add 15 new endpoint handlers to mock API",
+  "date": "2026-02-16",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "All 16 new handlers registered with method-prefixed patterns and method-not-allowed fallbacks. 20 atomic counters (4 existing + 16 new) declared, loaded in Assertions(), serialized with snake_case JSON tags. Request body capture infrastructure (captureBody, LastRequestBody, GET /test/last-request/{endpoint}) implemented correctly with RWMutex protection. Existing register/heartbeat handlers updated to use captureBody. 67 tests pass with -race, 0 failures. go vet clean. golangci-lint reports 3 errcheck violations that must be fixed before merge.",
+  "tests_checklist": [
+    {"item": "All 67 tests pass with -race flag", "checked": true},
+    {"item": "Each new handler has happy-path + wrong-method tests", "checked": true},
+    {"item": "POST/PUT handlers have invalid-body (400) tests", "checked": true},
+    {"item": "TestAssertions_InitialZero covers all 20 counter fields", "checked": true},
+    {"item": "TestAssertions_ReturnsCorrectCountsAfterMixedCalls covers all 20 counters", "checked": true},
+    {"item": "TestConcurrentCounters extended to 20 endpoint types x 100 goroutines", "checked": true},
+    {"item": "TestLastRequest_Returns404WhenNoCapturedBody tests missing capture", "checked": true},
+    {"item": "TestLastRequest_ReturnsCapturedBody verifies round-trip capture", "checked": true},
+    {"item": "TestLastRequestBody_InitiallyEmpty and TestLastRequestBody_StoredAfterCapture test programmatic API", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing handler pattern (captureBody -> decode -> increment -> respond)", "checked": true},
+    {"item": "New handlers use writeJSON() for consistent JSON responses", "checked": true},
+    {"item": "204 handlers use w.WriteHeader(http.StatusNoContent) with no body", "checked": true},
+    {"item": "snake_case JSON tags on all AssertionCounters fields", "checked": true},
+    {"item": "Test body constants follow registerBody/heartbeatBody naming pattern", "checked": true},
+    {"item": "doRequest helper reduces test boilerplate for PUT requests", "checked": true},
+    {"item": "No code duplication beyond acceptable handler boilerplate", "checked": true},
+    {"item": "golangci-lint clean (no errcheck violations)", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets (mock values only in test code)", "checked": true},
+    {"item": "No SQL injection risk (no database access)", "checked": true},
+    {"item": "No path traversal risk (path values used as map keys only)", "checked": true},
+    {"item": "io.ReadAll on request body (acceptable for test mock, not production)", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Changes scoped to test/e2e/mockapi/ only", "checked": true},
+    {"item": "No production code modified", "checked": true},
+    {"item": "Solution is minimal - handlers follow existing pattern", "checked": true},
+    {"item": "Request body capture is cleanly separated from handler logic", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No unnecessary abstractions", "checked": true},
+    {"item": "No unused code or dead code", "checked": true},
+    {"item": "Handler boilerplate is acceptable for this pattern", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "captureBody errors return 400 immediately", "checked": true},
+    {"item": "JSON decode errors return 400 immediately", "checked": true},
+    {"item": "Method-not-allowed fallbacks return 405", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "RWMutex protects lastRequests map", "checked": true},
+    {"item": "atomic.Int64 for all counters (race-safe)", "checked": true},
+    {"item": "Map initialized in New() (no nil map panic)", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [
+    {
+      "id": "V3-1",
+      "severity": "blocking",
+      "check_id": "V3",
+      "file": "test/e2e/mockapi/mockapi.go",
+      "line": 384,
+      "description": "golangci-lint errcheck: return value of s.captureBody('deregister', r) is not checked. handleDeregister ignores the error from captureBody, unlike all other handlers that check it.",
+      "fix": "Add error check: `if _, err := s.captureBody(\"deregister\", r); err != nil { writeJSON(w, http.StatusBadRequest, map[string]string{\"error\": \"invalid request body\"}); return }` — or simply assign to `_, _ =` if intentionally ignoring (deregister has no body to decode). Preferred: use `_, _ = s.captureBody(\"deregister\", r)` to explicitly discard since deregister sends no body per the plan."
+    },
+    {
+      "id": "V3-2",
+      "severity": "blocking",
+      "check_id": "V3",
+      "file": "test/e2e/mockapi/mockapi.go",
+      "line": 573,
+      "description": "golangci-lint errcheck: return value of w.Write in handleArtifact is not checked.",
+      "fix": "Assign to blank identifier: `_, _ = w.Write([]byte(\"mock-plexd-binary-v0.0.0\"))` — consistent with how writeJSON handles the encoder error via slog, but for a test mock, explicitly discarding is acceptable."
+    },
+    {
+      "id": "V3-3",
+      "severity": "blocking",
+      "check_id": "V3",
+      "file": "test/e2e/mockapi/mockapi.go",
+      "line": 636,
+      "description": "golangci-lint errcheck: return value of w.Write in handleLastRequest is not checked.",
+      "fix": "Assign to blank identifier: `_, _ = w.Write(data)`"
+    }
+  ],
+  "suggested_improvements": [
+    "Minor: The plan references '19 counters' but implementation has 20 (4 existing + 16 new). The plan's count appears to be off-by-one — the code is correct with all listed endpoints covered.",
+    "Minor (D2): handleDeregister could benefit from a one-line comment explaining why it doesn't decode a request body (client sends nil body per endpoints.go:67-70)."
+  ],
+  "next_steps": [
+    "Fix 3 errcheck violations in mockapi.go:384, :573, :636 — add `_, _ =` prefix or proper error handling",
+    "Re-run `golangci-lint run ./test/e2e/mockapi/...` to confirm clean",
+    "Re-run `go test -race ./test/e2e/mockapi/...` to confirm tests still pass after fixes"
+  ]
+}
