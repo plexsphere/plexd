@@ -21,15 +21,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -o /build/mockapi \
     ./test/e2e/mockapi/cmd/mockapi
 
-# Copy busybox wget from alpine for healthcheck in distroless runtime.
-# On alpine, /usr/bin/wget is a symlink to /bin/busybox (statically linked).
-RUN cp /bin/busybox /build/wget
-
 # Runtime stage — minimal distroless image (no shell, no package manager)
 FROM gcr.io/distroless/static-debian12
 
 COPY --from=builder --chown=65534:65534 /build/mockapi /usr/local/bin/mockapi
-COPY --from=builder --chown=65534:65534 /build/wget /usr/local/bin/wget
 
 # Run as non-root (nobody)
 USER 65534:65534

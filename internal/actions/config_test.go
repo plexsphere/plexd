@@ -12,6 +12,9 @@ func TestConfig_ApplyDefaults(t *testing.T) {
 	if !cfg.Enabled {
 		t.Error("Enabled = false, want true")
 	}
+	if cfg.HooksDir != DefaultHooksDir {
+		t.Errorf("HooksDir = %q, want %q", cfg.HooksDir, DefaultHooksDir)
+	}
 	if cfg.MaxConcurrent != DefaultMaxConcurrent {
 		t.Errorf("MaxConcurrent = %d, want %d", cfg.MaxConcurrent, DefaultMaxConcurrent)
 	}
@@ -38,11 +41,15 @@ func TestConfig_DefaultsPreserveExplicitDisabled(t *testing.T) {
 func TestConfig_DefaultsPreserveExisting(t *testing.T) {
 	cfg := Config{
 		MaxConcurrent: 10,
+		HooksDir:      "/custom/hooks",
 	}
 	cfg.ApplyDefaults()
 
 	if cfg.MaxConcurrent != 10 {
 		t.Errorf("MaxConcurrent = %d, want 10", cfg.MaxConcurrent)
+	}
+	if cfg.HooksDir != "/custom/hooks" {
+		t.Errorf("HooksDir = %q, want %q", cfg.HooksDir, "/custom/hooks")
 	}
 }
 

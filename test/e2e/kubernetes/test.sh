@@ -83,8 +83,7 @@ kubectl get crd plexdnodestates.plexd.plexsphere.com
 kubectl get crd plexdhooks.plexd.plexsphere.com
 
 echo "=== Applying ServiceAccount ==="
-kubectl -n "${NAMESPACE}" apply -f "${DAEMONSET_DIR}/serviceaccount.yaml" --dry-run=client -o yaml \
-    | sed "s/namespace: plexd-system/namespace: ${NAMESPACE}/" \
+sed "s/namespace: plexd-system/namespace: ${NAMESPACE}/" "${DAEMONSET_DIR}/serviceaccount.yaml" \
     | kubectl apply -f -
 
 echo "=== Applying RBAC ==="
@@ -116,12 +115,19 @@ CONFIGEOF
 echo "=== Deploying mock-api ==="
 kubectl apply -f "${MOCKAPI_MANIFEST}"
 
+echo "=== Pre-creating host directories with correct ownership ==="
+docker exec "${CLUSTER_NAME}-control-plane" sh -c \
+    'mkdir -p /var/lib/plexd /var/run/plexd && chown 65534:65534 /var/lib/plexd /var/run/plexd'
+
 echo "=== Deploying plexd DaemonSet ==="
-kubectl -n "${NAMESPACE}" apply -f "${DAEMONSET_DIR}/daemonset.yaml" --dry-run=client -o yaml \
-    | sed "s/namespace: plexd-system/namespace: ${NAMESPACE}/" \
+sed "s/namespace: plexd-system/namespace: ${NAMESPACE}/" "${DAEMONSET_DIR}/daemonset.yaml" \
     | sed "s|image: ghcr.io/plexsphere/plexd:latest|image: plexd:e2e|" \
     | sed 's/imagePullPolicy: Always/imagePullPolicy: Never/' \
     | kubectl apply -f -
+
+# Remove liveness/readiness probes (health endpoints not yet implemented).
+kubectl -n "${NAMESPACE}" patch daemonset plexd --type=json \
+    -p='[{"op":"remove","path":"/spec/template/spec/containers/0/livenessProbe"},{"op":"remove","path":"/spec/template/spec/containers/0/readinessProbe"}]'
 
 # --- Wait for readiness (REQ-005) ---
 echo "=== Waiting for mock-api to be ready ==="

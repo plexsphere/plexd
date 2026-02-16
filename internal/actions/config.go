@@ -15,6 +15,9 @@ const DefaultMaxActionTimeout = 10 * time.Minute
 // DefaultMaxOutputBytes is the default maximum output size per action (1 MiB).
 const DefaultMaxOutputBytes = 1 << 20
 
+// DefaultHooksDir is the default directory for hook scripts.
+const DefaultHooksDir = "/etc/plexd/hooks"
+
 // Config holds the configuration for remote action execution.
 type Config struct {
 	// Enabled controls whether action execution is active.
@@ -22,7 +25,8 @@ type Config struct {
 	Enabled bool
 
 	// HooksDir is the directory containing hook scripts.
-	HooksDir string
+	// Default: /etc/plexd/hooks
+	HooksDir string `yaml:"hooks_dir"`
 
 	// MaxConcurrent is the maximum number of actions that can run concurrently.
 	// Must be at least 1 when enabled. Default: 5.
@@ -46,6 +50,9 @@ func (c *Config) ApplyDefaults() {
 	// If any field is non-zero, the caller constructed the config explicitly and we respect Enabled as-is.
 	if c.MaxConcurrent == 0 && c.MaxActionTimeout == 0 && c.MaxOutputBytes == 0 {
 		c.Enabled = true
+	}
+	if c.HooksDir == "" {
+		c.HooksDir = DefaultHooksDir
 	}
 	if c.MaxConcurrent == 0 {
 		c.MaxConcurrent = DefaultMaxConcurrent

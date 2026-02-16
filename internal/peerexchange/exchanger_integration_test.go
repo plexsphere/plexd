@@ -306,12 +306,13 @@ func TestIntegration_EndpointChangeDuringRefreshLoop(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- exchanger.Run(ctx, "node-1") }()
 
-	// Wait for at least 2 reports (initial + refresh with changed endpoint).
+	// Wait for at least 2 reports AND 2 AddPeer calls (initial + refresh with changed endpoint).
+	// Both conditions must be met to avoid a race between reporting and peer application.
 	waitFor(t, 2*time.Second, func() bool {
 		mu.Lock()
 		n := len(reportedEndpoints)
 		mu.Unlock()
-		return n >= 2
+		return n >= 2 && ctrl.addPeerCount() >= 2
 	})
 
 	cancel()

@@ -1,0 +1,104 @@
+name: E2E
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'deploy/**'
+      - 'test/e2e/**'
+      - 'Dockerfile'
+      - '.github/workflows/e2e.yml'
+  pull_request:
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'deploy/**'
+      - 'test/e2e/**'
+      - 'Dockerfile'
+      - '.github/workflows/e2e.yml'
+
+jobs:
+  docker-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.24'
+
+      - name: Run Docker E2E tests
+        run: make test-e2e-docker
+
+      - name: Capture logs on failure
+        if: failure()
+        run: |
+          docker compose -f test/e2e/docker-compose.yml -p plexd-e2e logs > docker-e2e-logs.txt 2>&1 || true
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: docker-e2e-logs
+          path: docker-e2e-logs.txt
+
+  kubernetes-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.24'
+
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.27.0
+
+      - name: Run Kubernetes E2E tests
+        run: make test-e2e-k8s
+
+      - name: Capture logs on failure
+        if: failure()
+        run: |
+          kubectl logs -n plexd-e2e -l app.kubernetes.io/name=plexd --tail=200 > kubernetes-e2e-logs.txt 2>&1 || true
+          kubectl logs -n plexd-e2e -l app.kubernetes.io/name=mock-api --tail=200 >> kubernetes-e2e-logs.txt 2>&1 || true
+          kubectl describe daemonset/plexd -n plexd-e2e >> kubernetes-e2e-logs.txt 2>&1 || true
+          kubectl get pods -n plexd-e2e -o wide >> kubernetes-e2e-logs.txt 2>&1 || true
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kubernetes-e2e-logs
+          path: kubernetes-e2e-logs.txt
+
+  systemd-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.24'
+
+      - name: Run systemd E2E tests
+        run: make test-e2e-systemd
+
+      - name: Capture logs on failure
+        if: failure()
+        run: |
+          docker logs plexd-e2e-mockapi > systemd-e2e-logs.txt 2>&1 || true
+          docker logs plexd-e2e-systemd >> systemd-e2e-logs.txt 2>&1 || true
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: systemd-e2e-logs
+          path: systemd-e2e-logs.txt

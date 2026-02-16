@@ -121,7 +121,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	resp := api.RegisterResponse{
 		NodeID:          "node-mock-001",
 		MeshIP:          "10.99.0.1",
-		SigningPublicKey: "ed25519-mock-signing-pub-key",
+		SigningPublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
 		NodeSecretKey:   "mock-node-secret-key-abc123",
 		Peers:           fixturePeers,
 	}
@@ -213,7 +213,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	envelope := api.SignedEnvelope{
 		EventType: api.EventNodeStateUpdated,
 		EventID:   "evt-mock-001",
-		IssuedAt:  time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IssuedAt:  time.Now().UTC(),
 		Nonce:     "mock-nonce-001",
 		Payload:   json.RawMessage(fmt.Sprintf(`{"node_id":%q}`, nodeID)),
 		Signature: "mock-signature-placeholder",

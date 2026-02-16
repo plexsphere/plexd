@@ -17,7 +17,17 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":0", "listen address (host:port)")
+	check := flag.String("check", "", "healthcheck URL (GET and exit 0/1)")
 	flag.Parse()
+
+	// Healthcheck mode: GET the URL and exit with 0 (ok) or 1 (fail).
+	if *check != "" {
+		resp, err := http.Get(*check)
+		if err != nil || resp.StatusCode >= 400 {
+			os.Exit(1)
+		}
+		return
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 

@@ -33,9 +33,7 @@ echo "=== Waiting for mock-api healthcheck ==="
 HEALTH_TIMEOUT=30
 HEALTH_ELAPSED=0
 while [ "${HEALTH_ELAPSED}" -lt "${HEALTH_TIMEOUT}" ]; do
-    STATUS=$(dc ps --format json mock-api 2>/dev/null \
-        | jq -r '.[0].Health // .Health // empty' 2>/dev/null || true)
-    if [ "${STATUS}" = "healthy" ]; then
+    if curl -sf http://localhost:18080/v1/ping >/dev/null 2>&1; then
         echo "mock-api is healthy"
         break
     fi
@@ -59,13 +57,13 @@ while [ "${POLL_ELAPSED}" -lt "${POLL_TIMEOUT}" ]; do
     if [ -n "${RESPONSE}" ]; then
         REG_COUNT=$(echo "${RESPONSE}" | jq -r '.registration_count // 0')
         HB_COUNT=$(echo "${RESPONSE}" | jq -r '.heartbeat_count // 0')
-        META_COUNT=$(echo "${RESPONSE}" | jq -r '.metadata_count // 0')
+        STATE_COUNT=$(echo "${RESPONSE}" | jq -r '.state_count // 0')
 
-        if [ "${REG_COUNT}" -ge 1 ] && [ "${HB_COUNT}" -ge 1 ] && [ "${META_COUNT}" -ge 1 ]; then
+        if [ "${REG_COUNT}" -ge 1 ] && [ "${HB_COUNT}" -ge 1 ] && [ "${STATE_COUNT}" -ge 1 ]; then
             echo "=== SUCCESS ==="
             echo "  registration_count: ${REG_COUNT}"
             echo "  heartbeat_count:    ${HB_COUNT}"
-            echo "  metadata_count:     ${META_COUNT}"
+            echo "  state_count:        ${STATE_COUNT}"
             exit 0
         fi
     fi
@@ -79,10 +77,10 @@ if [ -z "${RESPONSE}" ]; then
 else
     REG_COUNT=$(echo "${RESPONSE}" | jq -r '.registration_count // 0')
     HB_COUNT=$(echo "${RESPONSE}" | jq -r '.heartbeat_count // 0')
-    META_COUNT=$(echo "${RESPONSE}" | jq -r '.metadata_count // 0')
+    STATE_COUNT=$(echo "${RESPONSE}" | jq -r '.state_count // 0')
     check_assertion "registration_count" "${REG_COUNT}" 1
     check_assertion "heartbeat_count" "${HB_COUNT}" 1
-    check_assertion "metadata_count" "${META_COUNT}" 1
+    check_assertion "state_count" "${STATE_COUNT}" 1
 fi
 echo "--- Container logs ---"
 dc logs

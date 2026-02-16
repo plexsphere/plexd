@@ -6,7 +6,7 @@ services:
     ports:
       - "18080:8080"
     healthcheck:
-      test: ["/usr/local/bin/wget", "--spider", "-q", "http://localhost:8080/v1/ping"]
+      test: ["CMD", "/usr/local/bin/mockapi", "-check", "http://localhost:8080/v1/ping"]
       interval: 2s
       timeout: 2s
       retries: 10
@@ -24,7 +24,7 @@ services:
     volumes:
       - ./docker/plexd-e2e.yaml:/etc/plexd/config.yaml:ro
     tmpfs:
-      - /var/lib/plexd
+      - /var/lib/plexd:uid=65534,gid=65534
     depends_on:
       mock-api:
         condition: service_healthy

@@ -170,6 +170,9 @@ EOF"
 # Write environment file with bootstrap token.
 docker exec "${SYSTEMD_CONTAINER}" bash -c 'echo "PLEXD_BOOTSTRAP_TOKEN=e2e-test-token" > /etc/plexd/environment && chmod 600 /etc/plexd/environment'
 
+# Pre-create hooks directory (ProtectSystem=full makes /etc read-only for the service).
+docker exec "${SYSTEMD_CONTAINER}" mkdir -p /etc/plexd/hooks
+
 # --- Start service and poll assertions (REQ-003, REQ-004) ---
 echo "=== Enabling and starting plexd service ==="
 docker exec "${SYSTEMD_CONTAINER}" systemctl daemon-reload
@@ -193,13 +196,13 @@ while [ "${POLL_ELAPSED}" -lt "${TIMEOUT}" ]; do
     if [ -n "${RESPONSE}" ]; then
         REG_COUNT=$(echo "${RESPONSE}" | jq -r '.registration_count // 0')
         HB_COUNT=$(echo "${RESPONSE}" | jq -r '.heartbeat_count // 0')
-        META_COUNT=$(echo "${RESPONSE}" | jq -r '.metadata_count // 0')
+        STATE_COUNT=$(echo "${RESPONSE}" | jq -r '.state_count // 0')
 
-        if [ "${REG_COUNT}" -ge 1 ] && [ "${HB_COUNT}" -ge 1 ] && [ "${META_COUNT}" -ge 1 ]; then
+        if [ "${REG_COUNT}" -ge 1 ] && [ "${HB_COUNT}" -ge 1 ] && [ "${STATE_COUNT}" -ge 1 ]; then
             echo "=== Assertions passed ==="
             echo "  PASS: registration_count=${REG_COUNT} >= 1"
             echo "  PASS: heartbeat_count=${HB_COUNT} >= 1"
-            echo "  PASS: metadata_count=${META_COUNT} >= 1"
+            echo "  PASS: state_count=${STATE_COUNT} >= 1"
             break
         fi
     fi
@@ -214,10 +217,10 @@ if [ "${POLL_ELAPSED}" -ge "${TIMEOUT}" ]; then
     else
         REG_COUNT=$(echo "${RESPONSE}" | jq -r '.registration_count // 0')
         HB_COUNT=$(echo "${RESPONSE}" | jq -r '.heartbeat_count // 0')
-        META_COUNT=$(echo "${RESPONSE}" | jq -r '.metadata_count // 0')
+        STATE_COUNT=$(echo "${RESPONSE}" | jq -r '.state_count // 0')
         echo "  registration_count=${REG_COUNT} (want >= 1)"
         echo "  heartbeat_count=${HB_COUNT} (want >= 1)"
-        echo "  metadata_count=${META_COUNT} (want >= 1)"
+        echo "  state_count=${STATE_COUNT} (want >= 1)"
     fi
     fail "assertions not met within ${TIMEOUT}s"
 fi

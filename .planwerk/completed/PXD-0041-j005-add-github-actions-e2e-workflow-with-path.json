@@ -2,8 +2,8 @@
   "feature_id": "PXD-0041",
   "title": "J005: Add GitHub Actions E2E workflow with path triggers",
   "slug": "j005-add-github-actions-e2e-workflow-with-path",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** infrastructure\n**Priority:** high\n**Source:** Proposed for 'After binary builds, Docker image builds, etc. are now in place'\n\nCreate .github/workflows/e2e.yml as a single workflow with three parallel jobs: docker-e2e (runs make test-e2e-docker), kubernetes-e2e (installs kind, runs make test-e2e-k8s), and systemd-e2e (runs make test-e2e-systemd). All jobs run on ubuntu-latest. Configure path-filtered triggers on push and pull_request for: cmd/, internal/, deploy/, test/e2e/, Dockerfile, and .github/workflows/e2e.yml. The kubernetes-e2e job must install kind as a setup step. All jobs upload container/pod logs as GitHub Actions artifacts on failure for debugging. Ensure proper cleanup in all failure paths (compose down, kind delete cluster, container stop).\n\n**Rationale:** Ties all three E2E test suites into CI so deployment regressions are caught automatically on every relevant code change. Path filtering avoids wasting CI minutes on unrelated changes. Artifact upload on failure enables debugging without re-running workflows.\n\n**Affected Areas:**\n- .github/workflows/e2e.yml\n- Makefile",
   "stories": [
@@ -402,12 +402,12 @@
     }
   ],
   "tasks": [
-    "1.1 Create .github/workflows/e2e.yml — workflow header with path-filtered triggers (REQ-001, REQ-007). Create the workflow file with name: E2E, on: push (branches: [main], paths: [cmd/**, internal/**, deploy/**, test/e2e/**, Dockerfile, .github/workflows/e2e.yml]) and on: pull_request (same paths). This task only creates the workflow name and trigger section.",
-    "1.2 Create .github/workflows/e2e.yml — docker-e2e job (REQ-002, REQ-003, REQ-006, REQ-007, REQ-009). Add the docker-e2e job: runs-on ubuntu-latest, timeout-minutes 30. Steps: (1) checkout with pinned SHA, (2) setup-go with go-version 1.24, (3) run make test-e2e-docker, (4) capture logs on failure: run 'docker compose -f test/e2e/docker-compose.yml -p plexd-e2e logs > ${{ github.workspace }}/docker-e2e-logs.txt 2>&1 || true' with if: failure(), (5) upload-artifact with pinned SHA, name docker-e2e-logs, path docker-e2e-logs.txt, if: failure().",
-    "1.3 Create .github/workflows/e2e.yml — kubernetes-e2e job (REQ-002, REQ-004, REQ-006, REQ-007, REQ-009). Add the kubernetes-e2e job: runs-on ubuntu-latest, timeout-minutes 30. Steps: (1) checkout with pinned SHA, (2) setup-go with go-version 1.24, (3) install kind (go install sigs.k8s.io/kind@latest or download binary), (4) run make test-e2e-k8s, (5) capture logs on failure: run 'kubectl logs -n plexd-system -l app.kubernetes.io/name=plexd --tail=200 > ${{ github.workspace }}/kubernetes-e2e-logs.txt 2>&1; kubectl logs -n plexd-system -l app.kubernetes.io/name=mock-api --tail=200 >> ${{ github.workspace }}/kubernetes-e2e-logs.txt 2>&1; kubectl describe daemonset/plexd -n plexd-system >> ${{ github.workspace }}/kubernetes-e2e-logs.txt 2>&1; kubectl get pods -n plexd-system -o wide >> ${{ github.workspace }}/kubernetes-e2e-logs.txt 2>&1 || true' with if: failure(), (6) upload-artifact with pinned SHA, name kubernetes-e2e-logs, path kubernetes-e2e-logs.txt, if: failure().",
-    "1.4 Create .github/workflows/e2e.yml — systemd-e2e job (REQ-002, REQ-005, REQ-006, REQ-007, REQ-009). Add the systemd-e2e job: runs-on ubuntu-latest, timeout-minutes 30. Steps: (1) checkout with pinned SHA, (2) setup-go with go-version 1.24, (3) run make test-e2e-systemd, (4) capture logs on failure: run 'docker logs plexd-systemd > ${{ github.workspace }}/systemd-e2e-logs.txt 2>&1; docker logs mockapi-systemd >> ${{ github.workspace }}/systemd-e2e-logs.txt 2>&1 || true' with if: failure(), (5) upload-artifact with pinned SHA, name systemd-e2e-logs, path systemd-e2e-logs.txt, if: failure().",
-    "2.1 Add test-e2e-k8s and test-e2e-systemd targets to Makefile (REQ-008). Add both targets to the .PHONY declaration. Add test-e2e-k8s target that runs 'bash test/e2e/kubernetes/test.sh'. Add test-e2e-systemd target that runs 'bash test/e2e/systemd/test.sh'. Follow the existing test-e2e-docker pattern.",
-    "3.1 Write docs/reference/backend/e2e-workflow.md — reference documentation (REQ-010). Document: workflow name and file path, trigger configuration (push/pull_request with path filters), path filter rationale, three parallel jobs with descriptions, kind installation step for kubernetes-e2e, log capture and artifact upload mechanism (if: failure()), action versions and pinning convention, timeout configuration, Makefile targets referenced, relationship to individual E2E test docs (docker-e2e-test.md, kubernetes-e2e-test.md, systemd-e2e-test.md)."
+    "[done] 1.1 Create .github/workflows/e2e.yml — workflow header with path-filtered triggers (REQ-001, REQ-007). Create the workflow file with name: E2E, on: push (branches: [main], paths: [cmd/**, internal/**, deploy/**, test/e2e/**, Dockerfile, .github/workflows/e2e.yml]) and on: pull_request (same paths). This task only creates the workflow name and trigger section.",
+    "[done] 1.2 Create .github/workflows/e2e.yml — docker-e2e job (REQ-002, REQ-003, REQ-006, REQ-007, REQ-009). Add the docker-e2e job: runs-on ubuntu-latest, timeout-minutes 30. Steps: (1) checkout with pinned SHA, (2) setup-go with go-version 1.24, (3) run make test-e2e-docker, (4) capture logs on failure: run 'docker compose -f test/e2e/docker-compose.yml -p plexd-e2e logs > ${{ github.workspace }}/docker-e2e-logs.txt 2>&1 || true' with if: failure(), (5) upload-artifact with pinned SHA, name docker-e2e-logs, path docker-e2e-logs.txt, if: failure().",
+    "[done] 1.3 Create .github/workflows/e2e.yml — kubernetes-e2e job (REQ-002, REQ-004, REQ-006, REQ-007, REQ-009). Add the kubernetes-e2e job: runs-on ubuntu-latest, timeout-minutes 30. Steps: (1) checkout with pinned SHA, (2) setup-go with go-version 1.24, (3) install kind (go install sigs.k8s.io/kind@latest or download binary), (4) run make test-e2e-k8s, (5) capture logs on failure: run 'kubectl logs -n plexd-system -l app.kubernetes.io/name=plexd --tail=200 > ${{ github.workspace }}/kubernetes-e2e-logs.txt 2>&1; kubectl logs -n plexd-system -l app.kubernetes.io/name=mock-api --tail=200 >> ${{ github.workspace }}/kubernetes-e2e-logs.txt 2>&1; kubectl describe daemonset/plexd -n plexd-system >> ${{ github.workspace }}/kubernetes-e2e-logs.txt 2>&1; kubectl get pods -n plexd-system -o wide >> ${{ github.workspace }}/kubernetes-e2e-logs.txt 2>&1 || true' with if: failure(), (6) upload-artifact with pinned SHA, name kubernetes-e2e-logs, path kubernetes-e2e-logs.txt, if: failure().",
+    "[done] 1.4 Create .github/workflows/e2e.yml — systemd-e2e job (REQ-002, REQ-005, REQ-006, REQ-007, REQ-009). Add the systemd-e2e job: runs-on ubuntu-latest, timeout-minutes 30. Steps: (1) checkout with pinned SHA, (2) setup-go with go-version 1.24, (3) run make test-e2e-systemd, (4) capture logs on failure: run 'docker logs plexd-systemd > ${{ github.workspace }}/systemd-e2e-logs.txt 2>&1; docker logs mockapi-systemd >> ${{ github.workspace }}/systemd-e2e-logs.txt 2>&1 || true' with if: failure(), (5) upload-artifact with pinned SHA, name systemd-e2e-logs, path systemd-e2e-logs.txt, if: failure().",
+    "[done] 2.1 Add test-e2e-k8s and test-e2e-systemd targets to Makefile (REQ-008). Add both targets to the .PHONY declaration. Add test-e2e-k8s target that runs 'bash test/e2e/kubernetes/test.sh'. Add test-e2e-systemd target that runs 'bash test/e2e/systemd/test.sh'. Follow the existing test-e2e-docker pattern.",
+    "[done] 3.1 Write docs/reference/backend/e2e-workflow.md — reference documentation (REQ-010). Document: workflow name and file path, trigger configuration (push/pull_request with path filters), path filter rationale, three parallel jobs with descriptions, kind installation step for kubernetes-e2e, log capture and artifact upload mechanism (if: failure()), action versions and pinning convention, timeout configuration, Makefile targets referenced, relationship to individual E2E test docs (docker-e2e-test.md, kubernetes-e2e-test.md, systemd-e2e-test.md)."
   ],
   "test_specifications": [
     {
@@ -599,6 +599,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-16T07:51:55.173849"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T08:45:41.811316"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T09:02:47.052047"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T09:02:47.099992"
     }
   },
   "execution_history": [
@@ -612,6 +624,50 @@
           "name": "prepare",
           "duration": 252.31746625900269,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "12d17a2d-8a89-4871-aa78-8eb13b3d3ec8",
+      "timestamp": "2026-02-16T08:54:38.933128",
+      "total_duration": 409.9536061286926,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 140.36756658554077,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (1 tasks)",
+          "duration": 40.782901763916016,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 42.85118842124939,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0041] Code Review",
+          "duration": 104.13555312156677,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0041] Improvements",
+          "duration": 6.058230876922607,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0041] Simplify",
+          "duration": 75.75816535949707,
+          "type": "simplify",
           "status": "done"
         }
       ]
