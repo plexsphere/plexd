@@ -54,11 +54,29 @@ Copies the plexd binary and the production `deploy/systemd/plexd.service` unit f
 
 Polls `GET http://localhost:18080/test/assertions` every 3 seconds for up to 60 seconds (configurable via `TIMEOUT`).
 
-### 7. Shutdown verification
+### 7. Request body validation
 
-Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, and checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`).
+Uses `GET /test/last-request/{endpoint}` to verify the content of request payloads:
 
-### 8. Cleanup
+| Endpoint | Validated Fields |
+|----------|-----------------|
+| `register` | `token` (non-empty), `hostname` (non-empty) |
+| `heartbeat` | Valid JSON with `timestamp` field |
+| `capabilities` | `builtin_actions` (array with >= 1 entry) |
+
+### 8. Periodic loop verification
+
+Waits up to 60 seconds for `heartbeat_count`, `metrics_count`, and `logs_count` to reach >= 2, proving that periodic loops run continuously. Logs work via journald in the systemd container. Audit is tested separately via restart.
+
+### 9. Audit forwarding via service restart
+
+The `ProcessSource` uses `sync.Once` to emit a single `process_start` audit entry per process lifetime. The test restarts the plexd service via `systemctl restart plexd`, creating a new process with a fresh `ProcessSource`, and verifies `audit_count` increases.
+
+### 10. Shutdown verification
+
+Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged.
+
+### 11. Cleanup
 
 The `cleanup` function runs on `EXIT` trap (both success and failure). It prints diagnostics on failure, then removes both containers and the Docker network.
 
@@ -105,6 +123,20 @@ node_api:
   data_dir: /var/lib/plexd
 heartbeat:
   node_id: e2e-systemd-node
+metrics:
+  enabled: true
+  collect_interval: 5s
+  report_interval: 10s
+log_fwd:
+  enabled: true
+  collect_interval: 5s
+  report_interval: 10s
+  file_patterns:
+    - "/var/log/plexd/*.log"
+audit_fwd:
+  enabled: true
+  collect_interval: 5s
+  report_interval: 10s
 ```
 
 The bootstrap token is set via the environment file at `/etc/plexd/environment` (`PLEXD_BOOTSTRAP_TOKEN=e2e-test-token`).

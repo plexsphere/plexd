@@ -70,11 +70,34 @@ The DaemonSet manifest is patched at apply time using `--dry-run=client -o yaml 
 - mock-api Deployment: `kubectl rollout status` with 60s timeout.
 - plexd DaemonSet: `kubectl rollout status` with configurable timeout (default 120s).
 
-### 6. Port-forward and assertions
+### 6. Port-forward and initial assertions
 
-Port-forward from `localhost:18080` to `svc/mock-api:8080` is started in the background. The script polls `GET /test/assertions` every 5 seconds for up to 60 seconds.
+Port-forward from `localhost:18080` to `svc/mock-api:8080` is started in the background. The script polls `GET /test/assertions` every 5 seconds for up to 60 seconds until all 8 counters are >= 1.
 
-### 7. Cleanup
+### 7. Request body validation
+
+Uses `GET /test/last-request/{endpoint}` to verify the content of request payloads:
+
+| Endpoint | Validated Fields |
+|----------|-----------------|
+| `register` | `token` (non-empty), `hostname` (non-empty) |
+| `heartbeat` | Valid JSON with `timestamp` field |
+| `capabilities` | `builtin_actions` (array with >= 1 entry) |
+
+### 8. Periodic loop verification
+
+Waits up to 60 seconds for `heartbeat_count` and `metrics_count` to reach >= 2, proving that self-generating periodic loops run continuously. Logs and audit are tested via pod restart.
+
+### 9. Pod restart resilience
+
+Deletes the plexd pod and waits for the DaemonSet controller to schedule a new pod. Verifies:
+- New pod becomes ready within 60 seconds
+- Heartbeat resumes (agent loads persisted identity from hostPath and enters steady state)
+- `audit_count` increases (new `ProcessSource` fires `process_start` in the new pod)
+
+Note: `registration_count` does not increase because the identity persists via the `hostPath` volume at `/var/lib/plexd`. This is correct production behavior — the agent reuses its existing registration.
+
+### 10. Cleanup
 
 The `cleanup` function runs on `EXIT` trap (both success and failure). It kills the port-forward process, prints diagnostics, and deletes the kind cluster.
 

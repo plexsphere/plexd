@@ -9,6 +9,16 @@ feature: PXD-0038
 
 Validates that a containerised plexd agent successfully registers, sends heartbeats, retrieves state, reports capabilities, detects drift, and forwards metrics, logs, and audit events to the Central API. The test uses docker compose to orchestrate two services — `mock-api` (a fixture-based mock of the Central API) and `plexd` (the agent under test) — on an isolated bridge network.
 
+The test runs eight phases:
+
+1. **Initial assertions** — all 8 counters >= 1 (agent started and contacted all endpoints)
+2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, metrics data, and drift timestamp
+3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously)
+4. **Log injection** — injects a log file via `docker cp`, verifies logs_count increases (FileSource pipeline works)
+5. **Agent restart for audit** — restarts plexd container, verifies audit_count increases (ProcessSource fires per-process)
+6. **SSE event injection** — injects a `node_state_updated` event and verifies state_count increases (proves SSE stream is connected)
+7. **Graceful shutdown** — stops plexd container, verifies exit code 0 and no crash indicators in logs
+
 ## Service Topology
 
 ```
@@ -34,6 +44,8 @@ Validates that a containerised plexd agent successfully registers, sends heartbe
 3. `plexd` starts with `depends_on: mock-api (service_healthy)`.
 
 ## Assertion Logic
+
+### Phase 1: Counter Polling
 
 The test script polls `GET http://localhost:18080/test/assertions` every 2 seconds for up to 30 seconds. The endpoint returns JSON counters:
 
@@ -62,6 +74,41 @@ The test passes when all eight counters are >= 1:
 | `metrics_count` | plexd called `POST /v1/nodes/{id}/metrics` |
 | `logs_count` | plexd called `POST /v1/nodes/{id}/logs` |
 | `audit_count` | plexd called `POST /v1/nodes/{id}/audit` |
+
+### Phase 2: Request Body Validation
+
+Uses `GET /test/last-request/{endpoint}` to verify the content of request payloads:
+
+| Endpoint | Validated Fields |
+|----------|-----------------|
+| `register` | `token` (non-empty), `hostname` (non-empty), `public_key` (non-empty) |
+| `heartbeat` | Valid JSON with `timestamp` field (node_id is in URL path, not body) |
+| `capabilities` | `builtin_actions` (array with >= 1 entry) |
+| `metrics` | Array with >= 1 data point |
+| `drift` | `timestamp` (non-empty) |
+
+### Phase 3: Periodic Loop Verification
+
+Waits up to 60 seconds for `heartbeat_count` and `metrics_count` to reach >= 2. These are self-generating periodic loops. Logs and audit are tested separately via injection and restart.
+
+### Phase 4: Log Injection
+
+Injects a log file into the plexd container via `docker cp` (the container is distroless with no shell). The `FileSource` discovers the new file via glob, reads it, and the forwarder reports it to the API. Verifies `logs_count` increases.
+
+### Phase 5: Agent Restart for Audit
+
+The `ProcessSource` uses `sync.Once` to emit a single `process_start` audit entry per process lifetime. Restarting the plexd container creates a new process with a fresh `ProcessSource`, verifying `audit_count` increases.
+
+### Phase 6: SSE Event Injection
+
+Injects a `node_state_updated` event via `POST /test/inject-event` and verifies that `state_count` increases, proving the SSE stream is connected and event-driven reconciliation works.
+
+### Phase 7: Graceful Shutdown
+
+Stops the plexd container via `docker compose stop` (sends SIGTERM) and verifies:
+- Exit code is 0
+- No crash indicators in logs (`panic:`, `fatal error:`, `SIGABRT`, `SIGKILL`, `runtime error:`)
+- Shutdown message is logged
 
 ## plexd Configuration
 
