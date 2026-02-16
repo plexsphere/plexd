@@ -91,7 +91,23 @@ Returns a fixture `HeartbeatResponse` signaling that reconciliation is needed. A
 
 ### `GET /v1/nodes/{id}/state`
 
-Returns a fixture `StateResponse` with two peers, one policy containing two rules, and metadata.
+Returns the active `StateResponse` fixture. By default this is an enriched fixture containing two peers, one policy with two rules, metadata, signing keys, all feature config sections, sample data entries, and secret references. The active fixture can be replaced at runtime via `POST /test/configure-state`.
+
+**Default fixture fields:**
+
+| Field | Default Value |
+|-------|---------------|
+| `peers` | 2 mesh peers (`peer-001`, `peer-002`) |
+| `policies` | 1 policy (`policy-001`) with 2 rules |
+| `metadata` | `{"environment":"e2e-test","region":"mock-region-1"}` |
+| `signing_keys` | `current`: base64 Ed25519 mock key |
+| `bridge_config` | `enabled: true`, `access_subnets: ["192.168.100.0/24"]`, NAT and forwarding enabled |
+| `relay_config` | 1 relay session assignment (`relay-sess-001`) |
+| `user_access_config` | `enabled: true`, interface `wg-access0`, 1 peer |
+| `ingress_config` | `enabled: true`, 1 rule (`ingress-001`, port 443) |
+| `site_to_site_config` | `enabled: true`, 1 tunnel (`s2s-001`) |
+| `data` | 2 entries: `app/config` (JSON) and `certs/ca` (PEM) |
+| `secret_refs` | 2 refs: `db-password` (v1) and `tls-private-key` (v3) |
 
 **Response:** `200 OK`
 
@@ -136,16 +152,95 @@ Returns a fixture `StateResponse` with two peers, one policy containing two rule
       ]
     }
   ],
+  "signing_keys": {
+    "current": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  },
   "metadata": {
     "environment": "e2e-test",
     "region": "mock-region-1"
-  }
+  },
+  "bridge_config": {
+    "access_subnets": ["192.168.100.0/24"],
+    "enable_nat": true,
+    "enable_forwarding": true
+  },
+  "relay_config": {
+    "sessions": [
+      {
+        "session_id": "relay-sess-001",
+        "peer_a_id": "peer-001",
+        "peer_a_endpoint": "203.0.113.1:51820",
+        "peer_b_id": "peer-003",
+        "peer_b_endpoint": "203.0.113.3:51820",
+        "expires_at": "2099-12-31T23:59:59Z"
+      }
+    ]
+  },
+  "user_access_config": {
+    "enabled": true,
+    "interface_name": "wg-access0",
+    "listen_port": 51821,
+    "peers": [
+      {
+        "public_key": "ua-pub-key-001",
+        "allowed_ips": ["10.100.0.1/32"],
+        "label": "admin-laptop"
+      }
+    ]
+  },
+  "ingress_config": {
+    "enabled": true,
+    "rules": [
+      {
+        "rule_id": "ingress-001",
+        "listen_port": 443,
+        "target_addr": "10.99.0.2:8443",
+        "mode": "tcp"
+      }
+    ]
+  },
+  "site_to_site_config": {
+    "enabled": true,
+    "tunnels": [
+      {
+        "tunnel_id": "s2s-001",
+        "remote_endpoint": "198.51.100.1:51820",
+        "remote_public_key": "s2s-remote-pub-key-001",
+        "local_subnets": ["10.99.0.0/24"],
+        "remote_subnets": ["172.16.0.0/16"],
+        "interface_name": "wg-s2s0",
+        "listen_port": 51822
+      }
+    ]
+  },
+  "data": [
+    {
+      "key": "app/config",
+      "content_type": "application/json",
+      "payload": {"log_level": "info", "max_conns": 100},
+      "version": 1,
+      "updated_at": "2025-01-01T00:00:00Z"
+    },
+    {
+      "key": "certs/ca",
+      "content_type": "application/x-pem-file",
+      "payload": "-----BEGIN CERTIFICATE-----\nmock-ca-cert\n-----END CERTIFICATE-----",
+      "version": 2,
+      "updated_at": "2025-01-15T12:00:00Z"
+    }
+  ],
+  "secret_refs": [
+    {"key": "db-password", "version": 1},
+    {"key": "tls-private-key", "version": 3}
+  ]
 }
 ```
 
 **Content-Type:** `application/json`
 
 **Counter:** Increments `state_count` on each call.
+
+**Concurrency:** The active fixture is protected by `sync.RWMutex`. Reads never block other reads. A write via `POST /test/configure-state` blocks reads briefly during replacement. Readers always see a complete fixture (never a partial update).
 
 ### `GET /v1/nodes/{id}/metadata`
 
@@ -168,7 +263,7 @@ Returns a fixture metadata map with four key-value pairs.
 
 ### `GET /v1/nodes/{id}/events`
 
-Server-Sent Events (SSE) endpoint. Sends an initial `SignedEnvelope` event, then holds the connection open with periodic keep-alive comments until the client disconnects.
+Server-Sent Events (SSE) endpoint. Sends an initial `SignedEnvelope` event, then registers the client on the server's broadcast list for injected events, and holds the connection open with periodic keep-alive comments until the client disconnects.
 
 **Headers:**
 
@@ -188,7 +283,9 @@ data: {"event_type":"node_state_updated","event_id":"evt-mock-001","issued_at":"
 
 **Keep-alive:** Sends `: keep-alive` comment every 15 seconds.
 
-**Disconnect:** The server detects client disconnect via context cancellation and cleans up the goroutine.
+**Fan-out:** After the initial event, the client is registered on the server's broadcast list. Events injected via `POST /test/inject-event` are delivered to all registered clients. Each client has a buffered channel (capacity 16); slow clients that fall behind have events dropped silently to prevent blocking the injector.
+
+**Disconnect:** The server detects client disconnect via context cancellation, removes the client from the broadcast list, and cleans up the goroutine.
 
 ### `GET /test/assertions`
 
@@ -201,11 +298,100 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "registration_count": 0,
   "heartbeat_count": 0,
   "state_count": 0,
-  "metadata_count": 0
+  "metadata_count": 0,
+  "deregister_count": 0,
+  "key_rotate_count": 0,
+  "capabilities_count": 0,
+  "endpoint_count": 0,
+  "drift_count": 0,
+  "secrets_count": 0,
+  "report_count": 0,
+  "execution_ack_count": 0,
+  "execution_result_count": 0,
+  "metrics_count": 0,
+  "logs_count": 0,
+  "audit_count": 0,
+  "artifact_count": 0,
+  "tunnel_ready_count": 0,
+  "tunnel_closed_count": 0,
+  "integrity_violation_count": 0,
+  "inject_event_count": 0
 }
 ```
 
 **Content-Type:** `application/json`
+
+### `POST /test/inject-event`
+
+Broadcasts a `SignedEnvelope` to all connected SSE clients. The request body is a full `SignedEnvelope` JSON object. The server delivers it in SSE wire format (`id:`, `event:`, `data:` fields) to every registered client.
+
+**Request body:**
+
+```json
+{
+  "event_type": "action_request",
+  "event_id": "evt-inject-001",
+  "issued_at": "2025-01-01T00:00:00Z",
+  "nonce": "test-nonce",
+  "payload": {"action_id": "a1"},
+  "signature": "mock-signature"
+}
+```
+
+**Response:** `204 No Content`
+
+**Behavior:**
+
+- The envelope is broadcast to all connected SSE clients in SSE wire format
+- If no SSE clients are connected, the call succeeds silently (no-op broadcast)
+- Non-blocking send: slow clients with full channel buffers have the event dropped
+- Increments `inject_event_count` on each call
+- Request body is captured and retrievable via `GET /test/last-request/inject_event`
+
+**Error:** Returns `400` if the request body is not valid JSON. Returns `405` if the HTTP method is not `POST`.
+
+### `POST /test/configure-state`
+
+Replaces the active `StateResponse` fixture at runtime. Subsequent calls to `GET /v1/nodes/{id}/state` return the configured state instead of the default. The `state_count` counter continues to increment regardless of which fixture is active.
+
+**Request body:** A full `api.StateResponse` JSON object (same schema as the `GET /v1/nodes/{id}/state` response).
+
+```json
+{
+  "peers": [],
+  "policies": [],
+  "metadata": {"custom": "value"}
+}
+```
+
+**Response:** `204 No Content`
+
+**Behavior:**
+
+- The replacement is atomic — concurrent readers never see a partial update
+- The state fixture is protected by `sync.RWMutex`
+- Any valid `StateResponse` JSON is accepted, including minimal objects with empty fields
+- Request body is captured and retrievable via `GET /test/last-request/configure_state`
+
+**Error:** Returns `400` if the request body is not valid JSON. Returns `405` if the HTTP method is not `POST`.
+
+**Go API:** The `Server` also exposes `SetState(api.StateResponse)` and `GetState() api.StateResponse` methods for direct use in Go test code without HTTP.
+
+### `PUT /test/state`
+
+Alias for `POST /test/configure-state`. Same behavior.
+
+**Response:** `204 No Content`
+
+### `GET /test/last-request/{endpoint}`
+
+Returns the raw request body captured from the last call to the specified endpoint. Useful for asserting that the client sent the correct payload.
+
+**Path parameter:** `endpoint` — the capture key (e.g., `register`, `heartbeat`, `inject_event`).
+
+**Response:** `200 OK` with `Content-Type: application/octet-stream` and the raw body bytes.
+
+**Error:** Returns `404` if no request has been captured for the given endpoint.
 
 ## Call Counters
 
@@ -217,6 +403,23 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `heartbeat_count` | `POST /v1/nodes/{id}/heartbeat` |
 | `state_count` | `GET /v1/nodes/{id}/state` |
 | `metadata_count` | `GET /v1/nodes/{id}/metadata` |
+| `deregister_count` | `POST /v1/nodes/{id}/deregister` |
+| `key_rotate_count` | `POST /v1/keys/rotate` |
+| `capabilities_count` | `PUT /v1/nodes/{id}/capabilities` |
+| `endpoint_count` | `PUT /v1/nodes/{id}/endpoint` |
+| `drift_count` | `POST /v1/nodes/{id}/drift` |
+| `secrets_count` | `GET /v1/nodes/{id}/secrets/{key}` |
+| `report_count` | `POST /v1/nodes/{id}/report` |
+| `execution_ack_count` | `POST /v1/nodes/{id}/executions/{eid}/ack` |
+| `execution_result_count` | `POST /v1/nodes/{id}/executions/{eid}/result` |
+| `metrics_count` | `POST /v1/nodes/{id}/metrics` |
+| `logs_count` | `POST /v1/nodes/{id}/logs` |
+| `audit_count` | `POST /v1/nodes/{id}/audit` |
+| `artifact_count` | `GET /v1/artifacts/plexd/{version}/{os}/{arch}` |
+| `tunnel_ready_count` | `POST /v1/nodes/{id}/tunnels/{sid}/ready` |
+| `tunnel_closed_count` | `POST /v1/nodes/{id}/tunnels/{sid}/closed` |
+| `integrity_violation_count` | `POST /v1/nodes/{id}/integrity/violations` |
+| `inject_event_count` | `POST /test/inject-event` |
 
 Query current values via `GET /test/assertions`.
 
@@ -230,6 +433,14 @@ All responses use the same JSON field names as the types in `internal/api`:
 - `SignedEnvelope` — `internal/api.SignedEnvelope`
 - `Peer` — `internal/api.Peer`
 - `Policy` / `PolicyRule` — `internal/api.Policy` / `internal/api.PolicyRule`
+- `SigningKeys` — `internal/api.SigningKeys`
+- `BridgeConfig` — `internal/api.BridgeConfig`
+- `RelayConfig` / `RelaySessionAssignment` — `internal/api.RelayConfig` / `internal/api.RelaySessionAssignment`
+- `UserAccessConfig` / `UserAccessPeer` — `internal/api.UserAccessConfig` / `internal/api.UserAccessPeer`
+- `IngressConfig` / `IngressRule` — `internal/api.IngressConfig` / `internal/api.IngressRule`
+- `SiteToSiteConfig` / `SiteToSiteTunnel` — `internal/api.SiteToSiteConfig` / `internal/api.SiteToSiteTunnel`
+- `DataEntry` — `internal/api.DataEntry`
+- `SecretRef` — `internal/api.SecretRef`
 
 ## Dockerfile
 

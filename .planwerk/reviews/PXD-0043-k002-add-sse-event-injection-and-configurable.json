@@ -1,0 +1,130 @@
+{
+  "feature_id": "PXD-0043",
+  "title": "K002: Add SSE event injection and configurable state",
+  "date": "2026-02-16",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Adds SSE event injection (POST /test/inject-event) with fan-out broadcast to all connected SSE clients, configurable state fixture (POST /test/configure-state, PUT /test/state) with RWMutex protection, and enriched default StateResponse with all config sections, data entries, and secret refs. Implementation is clean, well-tested (88 tests, all passing with -race), and follows existing patterns. Two issues require attention: (1) handleSetState does not capture request body, contradicting documentation, and (2) SigningKeys.Previous field is missing from fixture contrary to plan spec.",
+
+  "verification": {
+    "go_test_race": "PASS — 88 tests, 0 failures, 0 data races (go test -v -race -count=1 ./test/e2e/mockapi/)",
+    "go_vet": "PASS — no issues",
+    "golangci_lint": "not available in environment"
+  },
+
+  "tests_checklist": [
+    {"item": "All existing tests pass without modification (except planned TestState update)", "checked": true},
+    {"item": "go test -race passes with zero data races", "checked": true},
+    {"item": "SSE broadcast to single client tested", "checked": true},
+    {"item": "SSE broadcast to multiple clients tested", "checked": true},
+    {"item": "inject-event with no clients returns 200", "checked": true},
+    {"item": "inject-event invalid body returns 400", "checked": true},
+    {"item": "inject-event counter increments", "checked": true},
+    {"item": "Programmatic BroadcastSSE tested", "checked": true},
+    {"item": "configure-state replaces active fixture", "checked": true},
+    {"item": "configure-state invalid JSON returns 400", "checked": true},
+    {"item": "configure-state counter still increments", "checked": true},
+    {"item": "SetState via Go API tested", "checked": true},
+    {"item": "SetState via HTTP PUT tested", "checked": true},
+    {"item": "GetState returns copy (mutation safety)", "checked": true},
+    {"item": "Concurrent inject-event + configure-state + state-reads tested", "checked": true},
+    {"item": "Default state backward-compatible (peers, policies, metadata)", "checked": true},
+    {"item": "All enriched fields individually tested (SigningKeys, BridgeConfig, etc.)", "checked": true},
+    {"item": "Method-not-allowed for all new endpoints tested", "checked": true}
+  ],
+
+  "code_quality_checklist": [
+    {"item": "Follows existing patterns (atomic.Int64, sync.RWMutex, writeJSON, httptest)", "checked": true},
+    {"item": "Functions are focused and small (single responsibility)", "checked": true},
+    {"item": "No code duplication", "checked": true},
+    {"item": "Clear naming (SetState, GetState, BroadcastSSE, handleInjectEvent)", "checked": true},
+    {"item": "No dead code or commented-out code", "checked": true},
+    {"item": "sync.Map used appropriately for SSE client registry", "checked": true}
+  ],
+
+  "security_checklist": [
+    {"item": "JSON decode errors return 400 (input validation at boundary)", "checked": true},
+    {"item": "No hardcoded secrets (mock keys only)", "checked": true},
+    {"item": "No path traversal vulnerabilities", "checked": true},
+    {"item": "No sensitive data in logs", "checked": true},
+    {"item": "Non-blocking channel send prevents goroutine starvation", "checked": true}
+  ],
+
+  "architecture_checklist": [
+    {"item": "sync.Map for SSE clients (appropriate for disjoint key access pattern)", "checked": true},
+    {"item": "RWMutex for state fixture (reads don't block each other)", "checked": true},
+    {"item": "Typed SignedEnvelope channels (avoids double-marshaling)", "checked": true},
+    {"item": "SSE client deregistration via defer (cleanup on disconnect)", "checked": true},
+    {"item": "Exported SetState/GetState/BroadcastSSE for programmatic use in tests", "checked": true}
+  ],
+
+  "dry_yagni_checklist": [
+    {"item": "No duplicated code", "checked": true},
+    {"item": "No unnecessary abstractions", "checked": true},
+    {"item": "PUT /test/state alias is justified (RESTful alternative)", "checked": true}
+  ],
+
+  "fail_fast_checklist": [
+    {"item": "JSON decode errors caught and returned as 400 immediately", "checked": true},
+    {"item": "Channel buffer overflow handled (non-blocking send with default)", "checked": true}
+  ],
+
+  "defensive_checklist": [
+    {"item": "Metadata deep-copied in GetState to prevent mutation of server state", "checked": true},
+    {"item": "SSE client cleanup via defer on disconnect", "checked": true},
+    {"item": "handleSetState does NOT use captureBody (docs inconsistency)", "checked": false}
+  ],
+
+  "security_findings": [],
+
+  "architecture_findings": [
+    {
+      "severity": "INFO",
+      "description": "sync.Map used instead of plan-specified []chan + sync.Mutex. This is a valid improvement for the concurrent client registry pattern where keys are mostly disjoint.",
+      "location": "test/e2e/mockapi/mockapi.go:77",
+      "fix": "No action needed — design improvement over plan."
+    },
+    {
+      "severity": "INFO",
+      "description": "inject-event accepts full SignedEnvelope instead of plan-specified {event_type, payload} with server-generated fields. This gives test authors full control over all envelope fields, which is more flexible.",
+      "location": "test/e2e/mockapi/mockapi.go:712-721",
+      "fix": "No action needed — design improvement. Test authors can set event_id, nonce, signature to specific values for assertions."
+    }
+  ],
+
+  "issues_found": [
+    {
+      "id": "DA3-1",
+      "severity": "major",
+      "check_id": "DA3",
+      "description": "Documentation claims POST /test/configure-state body is captured and retrievable via GET /test/last-request/configure_state, but handleSetState uses json.NewDecoder directly instead of decodeBody, so the body is never stored in lastRequests. The inject-event handler correctly uses decodeBody for capture.",
+      "location": "test/e2e/mockapi/mockapi.go:689-697 (handleSetState) and docs/reference/backend/mock-api-server.md:374",
+      "fix": "Either (a) change handleSetState to use s.decodeBody(w, r, \"configure_state\", &state) like other handlers, or (b) remove the body capture claim from the documentation at line 374."
+    },
+    {
+      "id": "C1-1",
+      "severity": "minor",
+      "check_id": "C1",
+      "description": "Plan task 1.3 specifies SigningKeys with both Current and Previous pub keys. Implementation only sets Current. The Previous field exists on the api.SigningKeys type but is omitempty and not populated in the fixture.",
+      "location": "test/e2e/mockapi/mockapi.go:119-121",
+      "fix": "Add Previous field: SigningKeys: &api.SigningKeys{Current: \"AAAAAAA...\", Previous: \"BBBBBBB...\"}. This enables testing key rotation code paths."
+    },
+    {
+      "id": "C1-2",
+      "severity": "minor",
+      "check_id": "C1",
+      "description": "Plan task 1.3 specified all config sections as disabled/empty (BridgeConfig{Enabled:false}, UserAccessConfig{Enabled:false}, etc.), but implementation has them enabled with populated data. This is arguably better for testing but deviates from plan.",
+      "location": "test/e2e/mockapi/mockapi.go:126-179",
+      "fix": "No action required — enabled configs with realistic data are more useful for testing reconciliation paths. Document this intentional deviation if needed."
+    }
+  ],
+
+  "suggested_improvements": [
+    "Consider adding Previous field to SigningKeys fixture to enable key rotation test scenarios",
+    "GetState only deep-copies Metadata map; slices (Peers, Policies, Data, SecretRefs) share underlying arrays. For a test mock this is acceptable since the returned value is typically serialized immediately, but consider full deep-copy if mutation safety becomes important"
+  ],
+
+  "next_steps": [
+    "Fix DA3-1: Either update handleSetState to use decodeBody for body capture, or remove the body capture claim from docs line 374",
+    "Optionally populate SigningKeys.Previous in the default fixture"
+  ]
+}

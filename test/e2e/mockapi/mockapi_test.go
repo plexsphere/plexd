@@ -83,6 +83,25 @@ func getAssertions(t *testing.T, baseURL string) mockapi.AssertionCounters {
 	return a
 }
 
+// getCapturedBody fetches the last captured request body for the given endpoint
+// key via GET /test/last-request/{endpoint} and returns the raw bytes.
+func getCapturedBody(t *testing.T, baseURL, endpoint string) []byte {
+	t.Helper()
+	resp, err := http.Get(baseURL + "/test/last-request/" + endpoint)
+	if err != nil {
+		t.Fatalf("GET last-request/%s: %v", endpoint, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET last-request/%s status = %d, want %d", endpoint, resp.StatusCode, http.StatusOK)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read last-request/%s body: %v", endpoint, err)
+	}
+	return data
+}
+
 // ---------------------------------------------------------------------------
 // REQ-001: GET /v1/ping (Task 2.1)
 // ---------------------------------------------------------------------------
@@ -329,18 +348,6 @@ func TestState_ReturnsFixturePeersAndPolicies(t *testing.T) {
 				t.Errorf("policy %q rule has empty fields", pol.ID)
 			}
 		}
-	}
-
-	// Verify Data and SecretRefs are empty slices (not nil).
-	if state.Data == nil {
-		t.Error("Data is nil, want empty slice")
-	} else if len(state.Data) != 0 {
-		t.Errorf("len(Data) = %d, want 0", len(state.Data))
-	}
-	if state.SecretRefs == nil {
-		t.Error("SecretRefs is nil, want empty slice")
-	} else if len(state.SecretRefs) != 0 {
-		t.Errorf("len(SecretRefs) = %d, want 0", len(state.SecretRefs))
 	}
 
 	// Verify state_count increments.
@@ -1611,5 +1618,952 @@ func TestHandler_NotNil(t *testing.T) {
 	srv := mockapi.New()
 	if srv.Handler() == nil {
 		t.Error("Handler() returned nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SSE broadcast / inject-event (Task 1.1)
+// ---------------------------------------------------------------------------
+
+// readSSEEvent reads the next SSE event from an SSE response body.
+// It returns the raw text of the event block (up to and including the blank line).
+func readSSEEvent(t *testing.T, body io.Reader, timeout time.Duration) string {
+	t.Helper()
+	ch := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 8192)
+		var accumulated string
+		for {
+			n, err := body.Read(buf)
+			if n > 0 {
+				accumulated += string(buf[:n])
+			}
+			// An SSE event ends with a double newline.
+			if idx := strings.Index(accumulated, "\n\n"); idx >= 0 {
+				ch <- accumulated[:idx+2]
+				return
+			}
+			if err != nil {
+				ch <- accumulated
+				return
+			}
+		}
+	}()
+	select {
+	case data := <-ch:
+		return data
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for SSE event")
+		return ""
+	}
+}
+
+func TestInjectEvent_BroadcastsToConnectedClient(t *testing.T) {
+	srv := mockapi.New()
+	srv.KeepAliveInterval = 10 * time.Second // long interval so keep-alives don't interfere
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	// Connect an SSE client.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/nodes/node-1/events", nil)
+	if err != nil {
+		t.Fatalf("create SSE request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET events: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read the initial event (node_state_updated sent on connect).
+	initialEvt := readSSEEvent(t, resp.Body, 3*time.Second)
+	if !strings.Contains(initialEvt, "node_state_updated") {
+		t.Fatalf("expected initial node_state_updated event, got: %q", initialEvt)
+	}
+
+	// Inject an event via POST /test/inject-event.
+	envelope := api.SignedEnvelope{
+		EventType: "test_injected",
+		EventID:   "evt-inject-001",
+		IssuedAt:  time.Now().UTC(),
+		Nonce:     "nonce-inject-001",
+		Payload:   json.RawMessage(`{"action":"test"}`),
+		Signature: "sig-inject-001",
+	}
+	envJSON, _ := json.Marshal(envelope)
+	injectResp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", string(envJSON))
+	defer injectResp.Body.Close()
+	if injectResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("POST /test/inject-event status = %d, want %d", injectResp.StatusCode, http.StatusNoContent)
+	}
+
+	// Read the injected event from the SSE stream.
+	injectedEvt := readSSEEvent(t, resp.Body, 3*time.Second)
+	if !strings.Contains(injectedEvt, "test_injected") {
+		t.Errorf("expected injected event type, got: %q", injectedEvt)
+	}
+	if !strings.Contains(injectedEvt, "evt-inject-001") {
+		t.Errorf("expected injected event ID, got: %q", injectedEvt)
+	}
+	if !strings.Contains(injectedEvt, `"action":"test"`) {
+		t.Errorf("expected injected payload in data, got: %q", injectedEvt)
+	}
+}
+
+func TestInjectEvent_CounterIncrements(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	envelope := api.SignedEnvelope{
+		EventType: "test_counter",
+		EventID:   "evt-counter-001",
+		IssuedAt:  time.Now().UTC(),
+		Nonce:     "nonce-counter",
+		Payload:   json.RawMessage(`{}`),
+		Signature: "sig-counter",
+	}
+	envJSON, _ := json.Marshal(envelope)
+
+	// Inject twice.
+	for i := 0; i < 2; i++ {
+		resp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", string(envJSON))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("inject #%d: status = %d, want %d", i+1, resp.StatusCode, http.StatusNoContent)
+		}
+	}
+
+	a := getAssertions(t, ts.URL)
+	if a.InjectEventCount != 2 {
+		t.Errorf("inject_event_count = %d, want 2", a.InjectEventCount)
+	}
+}
+
+func TestInjectEvent_MultipleClients(t *testing.T) {
+	srv := mockapi.New()
+	srv.KeepAliveInterval = 10 * time.Second
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	// Connect two SSE clients.
+	type sseClient struct {
+		resp *http.Response
+	}
+	clients := make([]sseClient, 2)
+	for i := range clients {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/nodes/node-1/events", nil)
+		if err != nil {
+			t.Fatalf("create SSE request #%d: %v", i, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET events #%d: %v", i, err)
+		}
+		defer resp.Body.Close()
+		clients[i] = sseClient{resp: resp}
+
+		// Consume the initial event.
+		readSSEEvent(t, resp.Body, 3*time.Second)
+	}
+
+	// Inject one event.
+	envelope := api.SignedEnvelope{
+		EventType: "multi_test",
+		EventID:   "evt-multi-001",
+		IssuedAt:  time.Now().UTC(),
+		Nonce:     "nonce-multi",
+		Payload:   json.RawMessage(`{"multi":true}`),
+		Signature: "sig-multi",
+	}
+	envJSON, _ := json.Marshal(envelope)
+	injectResp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", string(envJSON))
+	injectResp.Body.Close()
+
+	// Both clients should receive the event.
+	for i, c := range clients {
+		evt := readSSEEvent(t, c.resp.Body, 3*time.Second)
+		if !strings.Contains(evt, "multi_test") {
+			t.Errorf("client %d: expected multi_test event, got: %q", i, evt)
+		}
+		if !strings.Contains(evt, "evt-multi-001") {
+			t.Errorf("client %d: expected event ID evt-multi-001, got: %q", i, evt)
+		}
+	}
+}
+
+func TestInjectEvent_InvalidBody_Returns400(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", "not-json")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// State enriched fixture tests (Task 1.3)
+// ---------------------------------------------------------------------------
+
+func getState(t *testing.T, baseURL string) api.StateResponse {
+	t.Helper()
+	resp, err := http.Get(baseURL + "/v1/nodes/node-1/state")
+	if err != nil {
+		t.Fatalf("GET state: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var state api.StateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return state
+}
+
+func TestState_ReturnsSigningKeys(t *testing.T) {
+	_, ts := newTestServer(t)
+	state := getState(t, ts.URL)
+
+	if state.SigningKeys == nil {
+		t.Fatal("SigningKeys is nil")
+	}
+	if state.SigningKeys.Current == "" {
+		t.Error("SigningKeys.Current is empty")
+	}
+	if state.SigningKeys.Previous == "" {
+		t.Error("SigningKeys.Previous is empty")
+	}
+}
+
+func TestState_ReturnsBridgeConfig(t *testing.T) {
+	_, ts := newTestServer(t)
+	state := getState(t, ts.URL)
+
+	if state.BridgeConfig == nil {
+		t.Fatal("BridgeConfig is nil")
+	}
+	if len(state.BridgeConfig.AccessSubnets) == 0 {
+		t.Error("BridgeConfig.AccessSubnets is empty")
+	}
+	if !state.BridgeConfig.EnableNAT {
+		t.Error("BridgeConfig.EnableNAT = false, want true")
+	}
+	if !state.BridgeConfig.EnableForwarding {
+		t.Error("BridgeConfig.EnableForwarding = false, want true")
+	}
+}
+
+func TestState_ReturnsRelayConfig(t *testing.T) {
+	_, ts := newTestServer(t)
+	state := getState(t, ts.URL)
+
+	if state.RelayConfig == nil {
+		t.Fatal("RelayConfig is nil")
+	}
+	if len(state.RelayConfig.Sessions) != 1 {
+		t.Fatalf("len(RelayConfig.Sessions) = %d, want 1", len(state.RelayConfig.Sessions))
+	}
+	sess := state.RelayConfig.Sessions[0]
+	if sess.SessionID == "" {
+		t.Error("RelayConfig.Sessions[0].SessionID is empty")
+	}
+	if sess.PeerAID == "" || sess.PeerBID == "" {
+		t.Error("RelayConfig.Sessions[0] has empty peer IDs")
+	}
+	if sess.PeerAEndpoint == "" || sess.PeerBEndpoint == "" {
+		t.Error("RelayConfig.Sessions[0] has empty peer endpoints")
+	}
+	if sess.ExpiresAt.IsZero() {
+		t.Error("RelayConfig.Sessions[0].ExpiresAt is zero")
+	}
+}
+
+func TestState_ReturnsUserAccessConfig(t *testing.T) {
+	_, ts := newTestServer(t)
+	state := getState(t, ts.URL)
+
+	if state.UserAccessConfig == nil {
+		t.Fatal("UserAccessConfig is nil")
+	}
+	if !state.UserAccessConfig.Enabled {
+		t.Error("UserAccessConfig.Enabled = false, want true")
+	}
+	if state.UserAccessConfig.InterfaceName == "" {
+		t.Error("UserAccessConfig.InterfaceName is empty")
+	}
+	if state.UserAccessConfig.ListenPort == 0 {
+		t.Error("UserAccessConfig.ListenPort = 0")
+	}
+	if len(state.UserAccessConfig.Peers) != 1 {
+		t.Fatalf("len(UserAccessConfig.Peers) = %d, want 1", len(state.UserAccessConfig.Peers))
+	}
+	uaPeer := state.UserAccessConfig.Peers[0]
+	if uaPeer.PublicKey == "" {
+		t.Error("UserAccessConfig.Peers[0].PublicKey is empty")
+	}
+	if len(uaPeer.AllowedIPs) == 0 {
+		t.Error("UserAccessConfig.Peers[0].AllowedIPs is empty")
+	}
+	if uaPeer.Label == "" {
+		t.Error("UserAccessConfig.Peers[0].Label is empty")
+	}
+}
+
+func TestState_ReturnsIngressConfig(t *testing.T) {
+	_, ts := newTestServer(t)
+	state := getState(t, ts.URL)
+
+	if state.IngressConfig == nil {
+		t.Fatal("IngressConfig is nil")
+	}
+	if !state.IngressConfig.Enabled {
+		t.Error("IngressConfig.Enabled = false, want true")
+	}
+	if len(state.IngressConfig.Rules) != 1 {
+		t.Fatalf("len(IngressConfig.Rules) = %d, want 1", len(state.IngressConfig.Rules))
+	}
+	rule := state.IngressConfig.Rules[0]
+	if rule.RuleID == "" {
+		t.Error("IngressConfig.Rules[0].RuleID is empty")
+	}
+	if rule.ListenPort == 0 {
+		t.Error("IngressConfig.Rules[0].ListenPort = 0")
+	}
+	if rule.TargetAddr == "" {
+		t.Error("IngressConfig.Rules[0].TargetAddr is empty")
+	}
+	if rule.Mode == "" {
+		t.Error("IngressConfig.Rules[0].Mode is empty")
+	}
+}
+
+func TestState_ReturnsSiteToSiteConfig(t *testing.T) {
+	_, ts := newTestServer(t)
+	state := getState(t, ts.URL)
+
+	if state.SiteToSiteConfig == nil {
+		t.Fatal("SiteToSiteConfig is nil")
+	}
+	if !state.SiteToSiteConfig.Enabled {
+		t.Error("SiteToSiteConfig.Enabled = false, want true")
+	}
+	if len(state.SiteToSiteConfig.Tunnels) != 1 {
+		t.Fatalf("len(SiteToSiteConfig.Tunnels) = %d, want 1", len(state.SiteToSiteConfig.Tunnels))
+	}
+	tunnel := state.SiteToSiteConfig.Tunnels[0]
+	if tunnel.TunnelID == "" {
+		t.Error("SiteToSiteConfig.Tunnels[0].TunnelID is empty")
+	}
+	if tunnel.RemoteEndpoint == "" {
+		t.Error("SiteToSiteConfig.Tunnels[0].RemoteEndpoint is empty")
+	}
+	if tunnel.RemotePublicKey == "" {
+		t.Error("SiteToSiteConfig.Tunnels[0].RemotePublicKey is empty")
+	}
+	if len(tunnel.LocalSubnets) == 0 {
+		t.Error("SiteToSiteConfig.Tunnels[0].LocalSubnets is empty")
+	}
+	if len(tunnel.RemoteSubnets) == 0 {
+		t.Error("SiteToSiteConfig.Tunnels[0].RemoteSubnets is empty")
+	}
+	if tunnel.InterfaceName == "" {
+		t.Error("SiteToSiteConfig.Tunnels[0].InterfaceName is empty")
+	}
+	if tunnel.ListenPort == 0 {
+		t.Error("SiteToSiteConfig.Tunnels[0].ListenPort = 0")
+	}
+}
+
+func TestState_ReturnsDataEntries(t *testing.T) {
+	_, ts := newTestServer(t)
+	state := getState(t, ts.URL)
+
+	if len(state.Data) != 2 {
+		t.Fatalf("len(Data) = %d, want 2", len(state.Data))
+	}
+
+	keys := map[string]bool{}
+	for _, d := range state.Data {
+		keys[d.Key] = true
+		if d.ContentType == "" {
+			t.Errorf("Data entry %q has empty ContentType", d.Key)
+		}
+		if len(d.Payload) == 0 {
+			t.Errorf("Data entry %q has empty Payload", d.Key)
+		}
+		if d.Version == 0 {
+			t.Errorf("Data entry %q has Version 0", d.Key)
+		}
+		if d.UpdatedAt.IsZero() {
+			t.Errorf("Data entry %q has zero UpdatedAt", d.Key)
+		}
+	}
+	if !keys["app/config"] {
+		t.Error("Data missing key 'app/config'")
+	}
+	if !keys["certs/ca"] {
+		t.Error("Data missing key 'certs/ca'")
+	}
+}
+
+func TestState_ReturnsSecretRefs(t *testing.T) {
+	_, ts := newTestServer(t)
+	state := getState(t, ts.URL)
+
+	if len(state.SecretRefs) != 2 {
+		t.Fatalf("len(SecretRefs) = %d, want 2", len(state.SecretRefs))
+	}
+
+	keys := map[string]bool{}
+	for _, sr := range state.SecretRefs {
+		keys[sr.Key] = true
+		if sr.Version == 0 {
+			t.Errorf("SecretRef %q has Version 0", sr.Key)
+		}
+	}
+	if !keys["db-password"] {
+		t.Error("SecretRefs missing key 'db-password'")
+	}
+	if !keys["tls-private-key"] {
+		t.Error("SecretRefs missing key 'tls-private-key'")
+	}
+}
+
+func TestInjectEvent_NoClients_Succeeds(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	envelope := api.SignedEnvelope{
+		EventType: "no_clients_test",
+		EventID:   "evt-noclient-001",
+		IssuedAt:  time.Now().UTC(),
+		Nonce:     "nonce-noclient",
+		Payload:   json.RawMessage(`{}`),
+		Signature: "sig-noclient",
+	}
+	envJSON, _ := json.Marshal(envelope)
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", string(envJSON))
+	defer resp.Body.Close()
+
+	// Should succeed even with no connected clients.
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+func TestBroadcastSSE_Programmatic(t *testing.T) {
+	srv := mockapi.New()
+	srv.KeepAliveInterval = 10 * time.Second
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	// Connect an SSE client.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/nodes/node-1/events", nil)
+	if err != nil {
+		t.Fatalf("create SSE request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET events: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Consume initial event.
+	readSSEEvent(t, resp.Body, 3*time.Second)
+
+	// Use the Go API directly instead of the HTTP endpoint.
+	envelope := api.SignedEnvelope{
+		EventType: "programmatic_test",
+		EventID:   "evt-prog-001",
+		IssuedAt:  time.Now().UTC(),
+		Nonce:     "nonce-prog",
+		Payload:   json.RawMessage(`{"via":"go_api"}`),
+		Signature: "sig-prog",
+	}
+	srv.BroadcastSSE(envelope)
+
+	// Read the broadcast event.
+	evt := readSSEEvent(t, resp.Body, 3*time.Second)
+	if !strings.Contains(evt, "programmatic_test") {
+		t.Errorf("expected programmatic_test event, got: %q", evt)
+	}
+	if !strings.Contains(evt, "evt-prog-001") {
+		t.Errorf("expected event ID evt-prog-001, got: %q", evt)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SetState / GetState (Task 1.2)
+// ---------------------------------------------------------------------------
+
+func TestSetState_UpdatesStateResponse(t *testing.T) {
+	srv, ts := newTestServer(t)
+
+	newState := api.StateResponse{
+		Peers: []api.Peer{
+			{
+				ID:         "peer-new",
+				PublicKey:  "new-pub-key",
+				MeshIP:     "10.99.1.1",
+				Endpoint:   "198.51.100.1:51820",
+				AllowedIPs: []string{"10.99.1.1/32"},
+				PSK:        "new-psk",
+			},
+		},
+		Policies:   []api.Policy{},
+		Metadata:   map[string]string{"env": "updated"},
+		Data:       []api.DataEntry{},
+		SecretRefs: []api.SecretRef{},
+	}
+	srv.SetState(newState)
+
+	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/state")
+	if err != nil {
+		t.Fatalf("GET state: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var got api.StateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got.Peers) != 1 {
+		t.Fatalf("len(Peers) = %d, want 1", len(got.Peers))
+	}
+	if got.Peers[0].ID != "peer-new" {
+		t.Errorf("Peers[0].ID = %q, want %q", got.Peers[0].ID, "peer-new")
+	}
+	if got.Metadata["env"] != "updated" {
+		t.Errorf("Metadata[env] = %q, want %q", got.Metadata["env"], "updated")
+	}
+}
+
+func TestSetState_ViaHTTP(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	newState := api.StateResponse{
+		Peers: []api.Peer{
+			{
+				ID:         "peer-http",
+				PublicKey:  "http-pub-key",
+				MeshIP:     "10.99.2.1",
+				Endpoint:   "198.51.100.2:51820",
+				AllowedIPs: []string{"10.99.2.1/32"},
+				PSK:        "http-psk",
+			},
+		},
+		Policies:   []api.Policy{},
+		Metadata:   map[string]string{"source": "http"},
+		Data:       []api.DataEntry{},
+		SecretRefs: []api.SecretRef{},
+	}
+	body, err := json.Marshal(newState)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := doRequest(t, http.MethodPut, ts.URL+"/test/state", string(body))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("PUT /test/state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	// Now GET state and verify the update.
+	getResp, err := http.Get(ts.URL + "/v1/nodes/node-1/state")
+	if err != nil {
+		t.Fatalf("GET state: %v", err)
+	}
+	defer getResp.Body.Close()
+
+	var got api.StateResponse
+	if err := json.NewDecoder(getResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got.Peers) != 1 {
+		t.Fatalf("len(Peers) = %d, want 1", len(got.Peers))
+	}
+	if got.Peers[0].ID != "peer-http" {
+		t.Errorf("Peers[0].ID = %q, want %q", got.Peers[0].ID, "peer-http")
+	}
+}
+
+func TestSetState_DefaultMatchesOriginal(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/state")
+	if err != nil {
+		t.Fatalf("GET state: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var state api.StateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Check peers match original fixture.
+	if len(state.Peers) != 2 {
+		t.Fatalf("len(Peers) = %d, want 2", len(state.Peers))
+	}
+	if state.Peers[0].ID != "peer-001" {
+		t.Errorf("Peers[0].ID = %q, want %q", state.Peers[0].ID, "peer-001")
+	}
+	if state.Peers[1].ID != "peer-002" {
+		t.Errorf("Peers[1].ID = %q, want %q", state.Peers[1].ID, "peer-002")
+	}
+
+	// Check policies.
+	if len(state.Policies) != 1 {
+		t.Fatalf("len(Policies) = %d, want 1", len(state.Policies))
+	}
+	if state.Policies[0].ID != "policy-001" {
+		t.Errorf("Policies[0].ID = %q, want %q", state.Policies[0].ID, "policy-001")
+	}
+	if len(state.Policies[0].Rules) != 2 {
+		t.Errorf("len(Rules) = %d, want 2", len(state.Policies[0].Rules))
+	}
+
+	// Check metadata.
+	if state.Metadata["environment"] != "e2e-test" {
+		t.Errorf("Metadata[environment] = %q, want %q", state.Metadata["environment"], "e2e-test")
+	}
+	if state.Metadata["region"] != "mock-region-1" {
+		t.Errorf("Metadata[region] = %q, want %q", state.Metadata["region"], "mock-region-1")
+	}
+
+	// Check rich config fields are present (from expanded fixture).
+	if state.SigningKeys == nil {
+		t.Error("SigningKeys is nil")
+	}
+	if state.BridgeConfig == nil {
+		t.Error("BridgeConfig is nil")
+	}
+	if state.RelayConfig == nil {
+		t.Error("RelayConfig is nil")
+	}
+	if state.UserAccessConfig == nil {
+		t.Error("UserAccessConfig is nil")
+	}
+	if state.IngressConfig == nil {
+		t.Error("IngressConfig is nil")
+	}
+	if state.SiteToSiteConfig == nil {
+		t.Error("SiteToSiteConfig is nil")
+	}
+
+	// Data and SecretRefs should have entries.
+	if len(state.Data) != 2 {
+		t.Errorf("len(Data) = %d, want 2", len(state.Data))
+	}
+	if len(state.SecretRefs) != 2 {
+		t.Errorf("len(SecretRefs) = %d, want 2", len(state.SecretRefs))
+	}
+}
+
+func TestGetState_ReturnsCopy(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	state1 := srv.GetState()
+	state1.Metadata["mutated"] = "yes"
+
+	state2 := srv.GetState()
+	if _, ok := state2.Metadata["mutated"]; ok {
+		t.Error("GetState returned a reference instead of a copy: mutating the result affected server state")
+	}
+}
+
+func TestSetState_ConcurrentSafe(t *testing.T) {
+	srv, ts := newTestServer(t)
+
+	const n = 100
+	var wg sync.WaitGroup
+	wg.Add(n * 2) // n writers + n readers
+
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			srv.SetState(api.StateResponse{
+				Peers: []api.Peer{
+					{ID: fmt.Sprintf("peer-%d", i), PublicKey: "pk", MeshIP: "10.0.0.1",
+						Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.0.0.1/32"}, PSK: "psk"},
+				},
+				Data:       []api.DataEntry{},
+				SecretRefs: []api.SecretRef{},
+			})
+		}(i)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Get(ts.URL + "/v1/nodes/node-1/state")
+			if err != nil {
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+
+	wg.Wait()
+}
+
+func TestSetState_InvalidBody_Returns400(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodPut, ts.URL+"/test/state", "not-json")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestSetState_WrongMethod_Returns405(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/test/state")
+	if err != nil {
+		t.Fatalf("GET /test/state: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /test/configure-state (REQ-003)
+// ---------------------------------------------------------------------------
+
+func TestConfigureState_ReplacesActiveFixture(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	customState := api.StateResponse{
+		Peers: []api.Peer{{
+			ID:        "custom-peer",
+			PublicKey: "custom-key",
+			MeshIP:    "10.0.0.99",
+		}},
+		Metadata: map[string]string{"env": "custom"},
+	}
+	body, err := json.Marshal(customState)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", string(body))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("POST /test/configure-state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	// Verify GET /v1/nodes/{id}/state returns the custom state.
+	stateResp := doRequest(t, http.MethodGet, ts.URL+"/v1/nodes/node-1/state", "")
+	defer stateResp.Body.Close()
+	var got api.StateResponse
+	if err := json.NewDecoder(stateResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	if len(got.Peers) != 1 || got.Peers[0].ID != "custom-peer" {
+		t.Errorf("peers = %v, want 1 peer with ID custom-peer", got.Peers)
+	}
+	if got.Metadata["env"] != "custom" {
+		t.Errorf("metadata[env] = %q, want %q", got.Metadata["env"], "custom")
+	}
+}
+
+func TestConfigureState_InvalidJSON_Returns400(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", "not-json")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestConfigureState_CounterStillIncrements(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	// Configure a custom state.
+	customState := api.StateResponse{
+		Peers:    []api.Peer{{ID: "p1", PublicKey: "k1", MeshIP: "10.0.0.1"}},
+		Metadata: map[string]string{"test": "counter"},
+	}
+	body, _ := json.Marshal(customState)
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", string(body))
+	resp.Body.Close()
+
+	// Call GET /v1/nodes/{id}/state twice.
+	for i := 0; i < 2; i++ {
+		r := doRequest(t, http.MethodGet, ts.URL+"/v1/nodes/node-1/state", "")
+		r.Body.Close()
+	}
+
+	a := getAssertions(t, ts.URL)
+	if a.StateCount != 2 {
+		t.Errorf("state_count = %d, want 2", a.StateCount)
+	}
+}
+
+func TestConfigureState_WrongMethod_Returns405(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/test/configure-state")
+	if err != nil {
+		t.Fatalf("GET /test/configure-state: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestConfigureState_CapturesRequestBody(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	customState := api.StateResponse{
+		Metadata: map[string]string{"capture": "test"},
+	}
+	body, err := json.Marshal(customState)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", string(body))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("POST /test/configure-state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	captured := getCapturedBody(t, ts.URL, "configure_state")
+	if string(captured) != string(body) {
+		t.Errorf("captured body = %q, want %q", string(captured), string(body))
+	}
+}
+
+func TestSetState_PutCapturesRequestBody(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	customState := api.StateResponse{
+		Metadata: map[string]string{"put-capture": "test"},
+	}
+	body, err := json.Marshal(customState)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := doRequest(t, http.MethodPut, ts.URL+"/test/state", string(body))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("PUT /test/state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	// Both PUT /test/state and POST /test/configure-state share the same capture key.
+	captured := getCapturedBody(t, ts.URL, "configure_state")
+	if string(captured) != string(body) {
+		t.Errorf("captured body = %q, want %q", string(captured), string(body))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency: inject-event + configure-state (Task 3.5, REQ-009)
+// ---------------------------------------------------------------------------
+
+func TestConcurrent_InjectEventAndConfigureState(t *testing.T) {
+	srv := mockapi.New()
+	srv.KeepAliveInterval = 10 * time.Second
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	// Connect an SSE client so BroadcastSSE has a target.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/nodes/node-1/events", nil)
+	if err != nil {
+		t.Fatalf("create SSE request: %v", err)
+	}
+	sseResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET events: %v", err)
+	}
+	defer sseResp.Body.Close()
+
+	// Drain the initial event.
+	readSSEEvent(t, sseResp.Body, 3*time.Second)
+
+	const n = 50
+	var wg sync.WaitGroup
+	wg.Add(n * 3) // n inject-event + n configure-state + n state-reads
+
+	// Concurrent inject-event calls.
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			env := api.SignedEnvelope{
+				EventType: "concurrent_test",
+				EventID:   fmt.Sprintf("evt-conc-%d", i),
+				Nonce:     fmt.Sprintf("nonce-conc-%d", i),
+				Payload:   json.RawMessage(`{"i":` + fmt.Sprint(i) + `}`),
+				Signature: "sig",
+			}
+			body, _ := json.Marshal(env)
+			resp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", string(body))
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNoContent {
+				t.Errorf("inject #%d: status = %d, want %d", i, resp.StatusCode, http.StatusNoContent)
+			}
+		}(i)
+	}
+
+	// Concurrent configure-state calls.
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			state := api.StateResponse{
+				Peers: []api.Peer{{
+					ID:        fmt.Sprintf("conc-peer-%d", i),
+					PublicKey: "pk",
+					MeshIP:    fmt.Sprintf("10.0.%d.1", i%256),
+				}},
+			}
+			body, _ := json.Marshal(state)
+			resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", string(body))
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNoContent {
+				t.Errorf("configure-state #%d: status = %d, want %d", i, resp.StatusCode, http.StatusNoContent)
+			}
+		}(i)
+	}
+
+	// Concurrent state reads.
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			resp, err := http.Get(ts.URL + "/v1/nodes/node-1/state")
+			if err != nil {
+				return
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("state read: status = %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// All inject-event calls should have been counted.
+	a := getAssertions(t, ts.URL)
+	if a.InjectEventCount != int64(n) {
+		t.Errorf("inject_event_count = %d, want %d", a.InjectEventCount, n)
+	}
+	// State reads should be at least n (concurrent readers) plus any from configure-state.
+	if a.StateCount < int64(n) {
+		t.Errorf("state_count = %d, want >= %d", a.StateCount, n)
 	}
 }

@@ -2,8 +2,8 @@
   "feature_id": "PXD-0043",
   "title": "K002: Add SSE event injection and configurable state",
   "slug": "k002-add-sse-event-injection-and-configurable",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** testing\n**Priority:** high\n**Source:** Proposed for 'With the latest commits/features, E2E tests were added'\n\nThree additions to test/e2e/mockapi/mockapi.go: (1) SSE Event Injection — add broadcast channel slice to Server struct for connected SSE clients, modify existing SSE handler to register/deregister clients on fan-out list, implement POST /test/inject-event that accepts {event_type, payload} JSON, wraps in SSE wire format, broadcasts to all connected clients. (2) Configurable State — add mutable StateResponse field to Server (sync.RWMutex-protected), implement POST /test/configure-state that replaces the active state fixture at runtime, modify handleState to read from mutable fixture instead of hardcoded default. (3) State Fixture Enrichment — extend default StateResponse with SigningKeys (current + previous pub keys), BridgeConfig{Enabled: false}, RelayConfig{Sessions: []}, UserAccessConfig{Enabled: false}, IngressConfig{Enabled: false}, SiteToSiteConfig{Enabled: false}, 2 sample Data entries, 1 sample SecretRef.\n\n**Rationale:** The SSE stream currently only emits node_state_updated while the agent handles 25 event types — there's no way to test execution flows (action_request → ack → result) or other event-driven behaviors. The state fixture lacks SigningKeys, BridgeConfig, RelayConfig, and other fields, so reconciliation code paths for these features are never exercised. Configurable state enables test scripts to set up specific scenarios without rebuilding the mock.\n\n**Affected Areas:**\n- test/e2e/mockapi/mockapi.go",
   "stories": [
@@ -366,11 +366,9 @@
       "id": "1.1",
       "title": "Add SSE broadcast infrastructure to Server struct (REQ-001, REQ-009)",
       "description": "Add to Server struct: `sseClients []chan []byte` (broadcast channel slice), `sseMu sync.Mutex` (protects sseClients), `injectCount atomic.Int64` (assertion counter). Add helper methods: `addSSEClient(ch chan []byte)`, `removeSSEClient(ch chan []byte)`, `broadcastSSE(data []byte)`. broadcastSSE iterates sseClients under lock, does non-blocking send (select with default to skip slow clients). Use buffered channels (cap 16). Add `InjectEventCount` field to AssertionCounters JSON.",
-      "files": [
-        "test/e2e/mockapi/mockapi.go"
-      ],
       "level": 1,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-009"
@@ -380,11 +378,9 @@
       "id": "1.2",
       "title": "Add mutable state fixture field to Server struct with RWMutex (REQ-003, REQ-004, REQ-009)",
       "description": "Add to Server struct: `stateMu sync.RWMutex`, `stateFixture api.StateResponse`. In New(), initialize stateFixture with the enriched default (task 1.3 value). Add helper: `getState() api.StateResponse` (read-locks, copies, returns), `setState(s api.StateResponse)` (write-locks, replaces). Modify handleState to call getState() instead of building inline.",
-      "files": [
-        "test/e2e/mockapi/mockapi.go"
-      ],
       "level": 1,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-003",
         "REQ-004",
@@ -395,11 +391,9 @@
       "id": "1.3",
       "title": "Enrich default StateResponse fixture with all config sections, data, and secret refs (REQ-005, REQ-006, REQ-007)",
       "description": "Create a `defaultStateFixture()` function returning api.StateResponse with: existing Peers (fixturePeers), existing Policies (1 policy with 2 rules), existing Metadata, new SigningKeys{Current: 'mock-signing-current-pub-key-base64==', Previous: 'mock-signing-previous-pub-key-base64=='}, BridgeConfig{AccessSubnets: []string{}, EnableNAT: false, EnableForwarding: false}, RelayConfig{Sessions: []RelaySessionAssignment{}}, UserAccessConfig{Enabled: false, InterfaceName: '', ListenPort: 0, Peers: []UserAccessPeer{}}, IngressConfig{Enabled: false, Rules: []IngressRule{}}, SiteToSiteConfig{Enabled: false, Tunnels: []SiteToSiteTunnel{}}, 2 DataEntry items (key='config/app.json', content_type='application/json', payload='{\"debug\":true}', version=1 / key='templates/welcome.txt', content_type='text/plain', payload='\"Welcome to PlexD\"', version=1), 1 SecretRef{Key: 'db/credentials', Version: 1}. Use time.Date(2025,1,1,0,0,0,0,time.UTC) for updated_at.",
-      "files": [
-        "test/e2e/mockapi/mockapi.go"
-      ],
       "level": 1,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-005",
         "REQ-006",
@@ -410,11 +404,9 @@
       "id": "2.1",
       "title": "Modify handleEvents to register/deregister SSE clients on broadcast list (REQ-001, REQ-010)",
       "description": "Modify handleEvents: after sending initial event, create buffered chan []byte (cap 16), call addSSEClient(ch), defer removeSSEClient(ch). In the select loop, add case for receiving from ch — write received bytes to ResponseWriter and flush. Keep existing keep-alive tick case and context done case. Initial node_state_updated event still sent first (before registering on broadcast list). This preserves all existing behavior.",
-      "files": [
-        "test/e2e/mockapi/mockapi.go"
-      ],
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-010"
@@ -424,11 +416,9 @@
       "id": "2.2",
       "title": "Implement POST /test/inject-event handler (REQ-002, REQ-008)",
       "description": "Create handleInjectEvent handler: decode JSON body with fields {event_type string, payload json.RawMessage}. On decode error, return 400. Increment injectCount. Build SignedEnvelope{EventType: req.EventType, EventID: fmt.Sprintf('evt-inject-%03d', injectCount.Load()), IssuedAt: time.Now().UTC(), Nonce: fmt.Sprintf('nonce-inject-%03d', injectCount.Load()), Payload: req.Payload, Signature: 'mock-signature-injected'}. Marshal to JSON. Format as SSE wire: 'id: %s\\nevent: %s\\ndata: %s\\n\\n'. Call broadcastSSE(formatted). Return 200 with {}. Register route: s.mux.HandleFunc('POST /test/inject-event', s.handleInjectEvent).",
-      "files": [
-        "test/e2e/mockapi/mockapi.go"
-      ],
       "level": 2,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-002",
         "REQ-008"
@@ -438,11 +428,9 @@
       "id": "2.3",
       "title": "Implement POST /test/configure-state handler (REQ-003)",
       "description": "Create handleConfigureState handler: decode JSON body into api.StateResponse. On decode error, return 400. Call setState(decoded). Return 200 with {}. Register route: s.mux.HandleFunc('POST /test/configure-state', s.handleConfigureState).",
-      "files": [
-        "test/e2e/mockapi/mockapi.go"
-      ],
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-003"
       ]
@@ -451,11 +439,9 @@
       "id": "2.4",
       "title": "Update AssertionCounters and handleAssertions for inject_event_count (REQ-002)",
       "description": "Add InjectEventCount int64 `json:\"inject_event_count\"` to AssertionCounters. Update Assertions() method to include InjectEventCount: s.injectCount.Load().",
-      "files": [
-        "test/e2e/mockapi/mockapi.go"
-      ],
       "level": 2,
       "estimate_minutes": 5,
+      "status": "done",
       "requirements": [
         "REQ-002"
       ]
@@ -464,14 +450,9 @@
       "id": "3.1",
       "title": "Write unit tests for enriched default state fixture (REQ-005, REQ-006, REQ-007, REQ-010)",
       "description": "Add tests: TestState_DefaultFixture_HasSigningKeys — verify signing_keys.current and signing_keys.previous are non-empty and distinct. TestState_DefaultFixture_HasDisabledConfigs — verify bridge_config, relay_config, user_access_config, ingress_config, site_to_site_config all present with disabled/empty fields. TestState_DefaultFixture_HasDataAndSecretRefs — verify 2 DataEntry with distinct keys and valid fields, 1 SecretRef. TestState_DefaultFixture_BackwardCompatible — verify existing peers (2), policies (1 with 2 rules), metadata still present. Update existing TestState_ReturnsFixturePeersAndPolicies to expect 2 Data entries and 1 SecretRef instead of 0.",
-      "files": [
-        "test/e2e/mockapi/mockapi_test.go"
-      ],
-      "test_files": [
-        "test/e2e/mockapi/mockapi_test.go"
-      ],
       "level": 3,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-005",
         "REQ-006",
@@ -483,14 +464,9 @@
       "id": "3.2",
       "title": "Write unit tests for POST /test/configure-state (REQ-003, REQ-004)",
       "description": "Add tests: TestConfigureState_ReplacesActiveFixture — POST a custom StateResponse, then GET state and verify it matches. TestConfigureState_InvalidJSON_Returns400 — POST invalid body, verify 400. TestConfigureState_CounterStillIncrements — POST configure-state, then GET state twice, verify state_count = 2.",
-      "files": [
-        "test/e2e/mockapi/mockapi_test.go"
-      ],
-      "test_files": [
-        "test/e2e/mockapi/mockapi_test.go"
-      ],
       "level": 3,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-003",
         "REQ-004"
@@ -500,14 +476,9 @@
       "id": "3.3",
       "title": "Write unit tests for POST /test/inject-event (REQ-002, REQ-008)",
       "description": "Add tests: TestInjectEvent_DeliversToConnectedClient — connect SSE client, POST inject-event with event_type='action_request', read from SSE stream, verify the injected event appears after initial event with correct SSE wire format. TestInjectEvent_SSEWireFormat — verify id:, event:, data: fields. TestInjectEvent_SignedEnvelopeFields — parse the data JSON, verify event_id starts with 'evt-inject-', issued_at is recent, nonce non-empty, signature is 'mock-signature-injected', payload matches request. TestInjectEvent_NoClients_Returns200 — POST inject-event with no SSE clients, verify 200. TestInjectEvent_InvalidJSON_Returns400 — POST invalid body, verify 400.",
-      "files": [
-        "test/e2e/mockapi/mockapi_test.go"
-      ],
-      "test_files": [
-        "test/e2e/mockapi/mockapi_test.go"
-      ],
       "level": 3,
       "estimate_minutes": 30,
+      "status": "done",
       "requirements": [
         "REQ-002",
         "REQ-008"
@@ -517,14 +488,9 @@
       "id": "3.4",
       "title": "Write unit tests for SSE fan-out: multiple clients, disconnect cleanup (REQ-001)",
       "description": "Add tests: TestInjectEvent_MultipleClients — connect 2 SSE clients, inject one event, verify both receive it. TestEvents_ClientDeregisterOnDisconnect — connect client, cancel context, inject event, verify no panic/block. TestEvents_InitialEventStillSentAfterFanout — connect SSE client, verify first event is still node_state_updated.",
-      "files": [
-        "test/e2e/mockapi/mockapi_test.go"
-      ],
-      "test_files": [
-        "test/e2e/mockapi/mockapi_test.go"
-      ],
       "level": 3,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-001"
       ]
@@ -533,14 +499,9 @@
       "id": "3.5",
       "title": "Write concurrency test for inject-event + configure-state (REQ-009)",
       "description": "Add TestConcurrentInjectAndConfigureState: spawn goroutines concurrently doing: 50x POST inject-event, 50x POST configure-state, 50x GET state, 10x SSE connect+read+disconnect. Use sync.WaitGroup, verify no panics, verify counters are consistent. Run with -race.",
-      "files": [
-        "test/e2e/mockapi/mockapi_test.go"
-      ],
-      "test_files": [
-        "test/e2e/mockapi/mockapi_test.go"
-      ],
       "level": 3,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-009"
       ]
@@ -549,11 +510,9 @@
       "id": "4.1",
       "title": "Update mock API reference documentation (REQ-002, REQ-003, REQ-005, REQ-006, REQ-007)",
       "description": "Update docs/reference/backend/mock-api-server.md: add sections for POST /test/inject-event (request format, response, behavior), POST /test/configure-state (request format, response, behavior). Update state endpoint section to document enriched default fixture including all new fields. Add inject_event_count to the call counters table. Update wire compatibility section to mention new types used.",
-      "files": [
-        "docs/reference/backend/mock-api-server.md"
-      ],
       "level": 4,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-002",
         "REQ-003",
@@ -703,6 +662,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-16T19:00:32.207916"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T19:43:00.504247"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T20:14:15.553267"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-16T20:14:15.617716"
     }
   },
   "execution_history": [
@@ -716,6 +687,56 @@
           "name": "prepare",
           "duration": 322.505078792572,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "d371acd8-39b3-45a6-b17a-0b6a6613db0f",
+      "timestamp": "2026-02-16T20:13:33.875537",
+      "total_duration": 1557.383390903473,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (3 tasks)",
+          "duration": 590.0682265758514,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (4 tasks)",
+          "duration": 158.6614122390747,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (5 tasks)",
+          "duration": 111.13018703460693,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (1 tasks)",
+          "duration": 196.82941126823425,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0043] Code Review",
+          "duration": 174.56485390663147,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0043] Improvements",
+          "duration": 205.1791422367096,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0043] Simplify",
+          "duration": 120.9501576423645,
+          "type": "simplify",
           "status": "done"
         }
       ]

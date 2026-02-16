@@ -40,6 +40,7 @@ type AssertionCounters struct {
 	TunnelReadyCount       int64 `json:"tunnel_ready_count"`
 	TunnelClosedCount      int64 `json:"tunnel_closed_count"`
 	IntegrityViolationCount int64 `json:"integrity_violation_count"`
+	InjectEventCount        int64 `json:"inject_event_count"`
 }
 
 // DefaultKeepAliveInterval is the default interval between SSE keep-alive comments.
@@ -71,9 +72,17 @@ type Server struct {
 	tunnelReadyCount       atomic.Int64
 	tunnelClosedCount      atomic.Int64
 	integrityViolationCount atomic.Int64
+	injectEventCount        atomic.Int64
+
+	sseClients sync.Map // map[uint64]chan api.SignedEnvelope
+
+	stateFixture   api.StateResponse
+	stateFixtureMu sync.RWMutex
 
 	lastRequests   map[string][]byte
 	lastRequestsMu sync.RWMutex
+
+	sseClientID atomic.Uint64
 
 	mux *http.ServeMux
 }
@@ -84,6 +93,112 @@ func New() *Server {
 		KeepAliveInterval: DefaultKeepAliveInterval,
 		lastRequests:      make(map[string][]byte),
 		mux:               http.NewServeMux(),
+		stateFixture: api.StateResponse{
+			Peers: fixturePeers,
+			Policies: []api.Policy{
+				{
+					ID: "policy-001",
+					Rules: []api.PolicyRule{
+						{
+							Src:      "10.99.0.0/24",
+							Dst:      "10.99.0.0/24",
+							Port:     0,
+							Protocol: "any",
+							Action:   "allow",
+						},
+						{
+							Src:      "10.99.0.0/24",
+							Dst:      "0.0.0.0/0",
+							Port:     443,
+							Protocol: "tcp",
+							Action:   "allow",
+						},
+					},
+				},
+			},
+			SigningKeys: &api.SigningKeys{
+				Current:  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+				Previous: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+			},
+			Metadata: map[string]string{
+				"environment": "e2e-test",
+				"region":      "mock-region-1",
+			},
+			BridgeConfig: &api.BridgeConfig{
+				AccessSubnets:    []string{"192.168.100.0/24"},
+				EnableNAT:        true,
+				EnableForwarding: true,
+			},
+			RelayConfig: &api.RelayConfig{
+				Sessions: []api.RelaySessionAssignment{
+					{
+						SessionID:     "relay-sess-001",
+						PeerAID:       "peer-001",
+						PeerAEndpoint: "203.0.113.1:51820",
+						PeerBID:       "peer-003",
+						PeerBEndpoint: "203.0.113.3:51820",
+						ExpiresAt:     time.Date(2099, 12, 31, 23, 59, 59, 0, time.UTC),
+					},
+				},
+			},
+			UserAccessConfig: &api.UserAccessConfig{
+				Enabled:       true,
+				InterfaceName: "wg-access0",
+				ListenPort:    51821,
+				Peers: []api.UserAccessPeer{
+					{
+						PublicKey:  "ua-pub-key-001",
+						AllowedIPs: []string{"10.100.0.1/32"},
+						Label:      "admin-laptop",
+					},
+				},
+			},
+			IngressConfig: &api.IngressConfig{
+				Enabled: true,
+				Rules: []api.IngressRule{
+					{
+						RuleID:     "ingress-001",
+						ListenPort: 443,
+						TargetAddr: "10.99.0.2:8443",
+						Mode:       "tcp",
+					},
+				},
+			},
+			SiteToSiteConfig: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{
+					{
+						TunnelID:        "s2s-001",
+						RemoteEndpoint:  "198.51.100.1:51820",
+						RemotePublicKey: "s2s-remote-pub-key-001",
+						LocalSubnets:    []string{"10.99.0.0/24"},
+						RemoteSubnets:   []string{"172.16.0.0/16"},
+						InterfaceName:   "wg-s2s0",
+						ListenPort:      51822,
+					},
+				},
+			},
+			Data: []api.DataEntry{
+				{
+					Key:         "app/config",
+					ContentType: "application/json",
+					Payload:     json.RawMessage(`{"log_level":"info","max_conns":100}`),
+					Version:     1,
+					UpdatedAt:   time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+				},
+				{
+					Key:         "certs/ca",
+					ContentType: "application/x-pem-file",
+					Payload:     json.RawMessage(`"-----BEGIN CERTIFICATE-----\nmock-ca-cert\n-----END CERTIFICATE-----"`),
+					Version:     2,
+					UpdatedAt:   time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			SecretRefs: []api.SecretRef{
+				{Key: "db-password", Version: 1},
+				{Key: "tls-private-key", Version: 3},
+			},
+		},
 	}
 	s.registerRoutes()
 	return s
@@ -117,6 +232,7 @@ func (s *Server) Assertions() AssertionCounters {
 		TunnelReadyCount:       s.tunnelReadyCount.Load(),
 		TunnelClosedCount:      s.tunnelClosedCount.Load(),
 		IntegrityViolationCount: s.integrityViolationCount.Load(),
+		InjectEventCount:        s.injectEventCount.Load(),
 	}
 }
 
@@ -168,7 +284,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/nodes/{id}/tunnels/{sid}/closed", s.handleTunnelClosed)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/integrity/violations", s.handleIntegrityViolation)
 
-	// Test control endpoint for request body inspection.
+	// Test control endpoints.
+	s.mux.HandleFunc("PUT /test/state", s.handleSetState)
+	s.mux.HandleFunc("POST /test/configure-state", s.handleSetState)
+	s.mux.HandleFunc("POST /test/inject-event", s.handleInjectEvent)
 	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
 
 	// Method-not-allowed fallbacks.
@@ -191,6 +310,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/tunnels/{sid}/ready", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/tunnels/{sid}/closed", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/integrity/violations", methodNotAllowed)
+	s.mux.HandleFunc("/test/state", methodNotAllowed)
+	s.mux.HandleFunc("/test/configure-state", methodNotAllowed)
+	s.mux.HandleFunc("/test/inject-event", methodNotAllowed)
 }
 
 // captureBody reads the full request body, stores the raw bytes in lastRequests
@@ -276,38 +398,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 // handleState handles GET /v1/nodes/{id}/state (REQ-004).
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.stateCount.Add(1)
-
-	resp := api.StateResponse{
-		Peers: fixturePeers,
-		Policies: []api.Policy{
-			{
-				ID: "policy-001",
-				Rules: []api.PolicyRule{
-					{
-						Src:      "10.99.0.0/24",
-						Dst:      "10.99.0.0/24",
-						Port:     0,
-						Protocol: "any",
-						Action:   "allow",
-					},
-					{
-						Src:      "10.99.0.0/24",
-						Dst:      "0.0.0.0/0",
-						Port:     443,
-						Protocol: "tcp",
-						Action:   "allow",
-					},
-				},
-			},
-		},
-		Metadata: map[string]string{
-			"environment": "e2e-test",
-			"region":      "mock-region-1",
-		},
-		Data:       []api.DataEntry{},
-		SecretRefs: []api.SecretRef{},
-	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, s.GetState())
 }
 
 // handleMetadata handles GET /v1/nodes/{id}/metadata (REQ-005).
@@ -361,7 +452,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "\n")
 	flusher.Flush()
 
+	// Register this client for broadcast events.
+	clientID := s.sseClientID.Add(1)
+	clientCh := make(chan api.SignedEnvelope, 16)
+	s.sseClients.Store(clientID, clientCh)
+	defer s.sseClients.Delete(clientID)
+
 	// Send keep-alive comments at KeepAliveInterval until client disconnects.
+	// Also listen for injected events on the client channel.
 	ticker := time.NewTicker(s.KeepAliveInterval)
 	defer ticker.Stop()
 	for {
@@ -372,6 +470,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if _, err := fmt.Fprint(w, ": keep-alive\n"); err != nil {
 				return
 			}
+			flusher.Flush()
+		case env := <-clientCh:
+			evtData, err := json.Marshal(env)
+			if err != nil {
+				return
+			}
+			fmt.Fprintf(w, "id: %s\n", env.EventID)
+			fmt.Fprintf(w, "event: %s\n", env.EventType)
+			for _, line := range strings.Split(string(evtData), "\n") {
+				fmt.Fprintf(w, "data: %s\n", line)
+			}
+			fmt.Fprint(w, "\n")
 			flusher.Flush()
 		}
 	}
@@ -550,6 +660,63 @@ func (s *Server) handleIntegrityViolation(w http.ResponseWriter, r *http.Request
 		return
 	}
 	s.integrityViolationCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// SetState updates the mutable state fixture returned by GET /v1/nodes/{id}/state.
+func (s *Server) SetState(state api.StateResponse) {
+	s.stateFixtureMu.Lock()
+	s.stateFixture = state
+	s.stateFixtureMu.Unlock()
+}
+
+// GetState returns a copy of the current state fixture.
+func (s *Server) GetState() api.StateResponse {
+	s.stateFixtureMu.RLock()
+	state := s.stateFixture
+	s.stateFixtureMu.RUnlock()
+	// Deep-copy the Metadata map so callers cannot mutate server state.
+	if state.Metadata != nil {
+		cp := make(map[string]string, len(state.Metadata))
+		for k, v := range state.Metadata {
+			cp[k] = v
+		}
+		state.Metadata = cp
+	}
+	return state
+}
+
+// handleSetState handles PUT /test/state and POST /test/configure-state.
+func (s *Server) handleSetState(w http.ResponseWriter, r *http.Request) {
+	var state api.StateResponse
+	if !s.decodeBody(w, r, "configure_state", &state) {
+		return
+	}
+	s.SetState(state)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// BroadcastSSE sends an SSE event to all connected SSE clients.
+func (s *Server) BroadcastSSE(envelope api.SignedEnvelope) {
+	s.sseClients.Range(func(key, value any) bool {
+		ch := value.(chan api.SignedEnvelope)
+		select {
+		case ch <- envelope:
+		default:
+			// Client channel full, skip to avoid blocking.
+		}
+		return true
+	})
+}
+
+// handleInjectEvent handles POST /test/inject-event.
+func (s *Server) handleInjectEvent(w http.ResponseWriter, r *http.Request) {
+	var envelope api.SignedEnvelope
+	if !s.decodeBody(w, r, "inject_event", &envelope) {
+		return
+	}
+	s.injectEventCount.Add(1)
+	s.BroadcastSSE(envelope)
 	w.WriteHeader(http.StatusNoContent)
 }
 
