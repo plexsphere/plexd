@@ -5,6 +5,7 @@ package mockapi
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -317,8 +318,18 @@ func (s *Server) registerRoutes() {
 
 // captureBody reads the full request body, stores the raw bytes in lastRequests
 // under the given endpoint name, and returns the bytes for further processing.
+// Handles gzip-compressed request bodies transparently.
 func (s *Server) captureBody(endpoint string, r *http.Request) ([]byte, error) {
-	data, err := io.ReadAll(r.Body)
+	var reader io.Reader = r.Body
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
+		gr, err := gzip.NewReader(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		defer gr.Close()
+		reader = gr
+	}
+	data, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, err
 	}

@@ -29,7 +29,9 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
 # Create empty directories for the runtime stage (distroless has no shell/mkdir)
 RUN mkdir -p /runtime-dirs/var/lib/plexd \
     /runtime-dirs/var/run/plexd \
-    /runtime-dirs/etc/plexd && \
+    /runtime-dirs/etc/plexd \
+    /runtime-dirs/var/log/plexd && \
+    echo "plexd container started" > /runtime-dirs/var/log/plexd/startup.log && \
     chown -R 65534:65534 /runtime-dirs
 
 # Runtime stage — minimal distroless image (no shell, no package manager)

@@ -21,6 +21,7 @@ import (
 	"github.com/plexsphere/plexd/internal/actions"
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/auditfwd"
 	"github.com/plexsphere/plexd/internal/integrity"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
@@ -186,6 +187,17 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		[]api.ActionParam{{Name: "lines", Type: "string", Required: false, Description: "Number of lines (default 100, max 10000)"}},
 		actions.LogsSnapshot(&agentLogProvider{}))
 
+	// Report capabilities to the control plane.
+	caps := api.CapabilitiesPayload{
+		Binary: &api.BinaryInfo{Version: buildVersion},
+	}
+	capsActions, capsHooks := executor.Capabilities()
+	caps.BuiltinActions = capsActions
+	caps.Hooks = capsHooks
+	if err := client.UpdateCapabilities(ctx, identity.NodeID, caps); err != nil {
+		logger.Warn("capabilities report failed", "error", err)
+	}
+
 	// Register action_request SSE handler.
 	sseMgr.RegisterHandler(api.EventActionRequest, actions.HandleActionRequest(executor, identity.NodeID, logger))
 
@@ -242,6 +254,11 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		logSources = append(logSources, logfwd.NewFileSource(pattern, hostname, logger))
 	}
 	logForwarder := logfwd.NewForwarder(cfg.LogFwd, logSources, client, identity.NodeID, hostname, logger)
+
+	// 15. Create audit forwarding sources and forwarder.
+	var auditSources []auditfwd.AuditSource
+	auditSources = append(auditSources, auditfwd.NewProcessSource(hostname))
+	auditForwarder := auditfwd.NewForwarder(cfg.AuditFwd, auditSources, client, identity.NodeID, hostname, logger)
 
 	// Wait group for all goroutines.
 	var wg sync.WaitGroup
@@ -304,6 +321,15 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		defer wg.Done()
 		if err := logForwarder.Run(ctx); err != nil {
 			logger.Error("log forwarder stopped", "error", err)
+		}
+	}()
+
+	// 22. Start audit forwarder.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := auditForwarder.Run(ctx); err != nil {
+			logger.Error("audit forwarder stopped", "error", err)
 		}
 	}()
 

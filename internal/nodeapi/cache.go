@@ -305,6 +305,10 @@ func (sc *StateCache) persistJSON(path string, v any) {
 	}
 	dir := filepath.Dir(path)
 	name := filepath.Base(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		sc.logger.Error("persist mkdir failed", "path", path, "error", err)
+		return
+	}
 	if err := fsutil.WriteFileAtomic(dir, name, data, 0600); err != nil {
 		sc.logger.Error("persist write failed", "path", path, "error", err)
 	}

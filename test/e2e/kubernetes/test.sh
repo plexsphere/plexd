@@ -141,6 +141,23 @@ node_api:
 
 heartbeat:
   node_id: e2e-k8s-node
+
+metrics:
+  enabled: true
+  collect_interval: 5s
+  report_interval: 10s
+
+log_fwd:
+  enabled: true
+  collect_interval: 5s
+  report_interval: 10s
+  file_patterns:
+    - "/var/log/plexd/*.log"
+
+audit_fwd:
+  enabled: true
+  collect_interval: 5s
+  report_interval: 10s
 CONFIGEOF
 )"
 
