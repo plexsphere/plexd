@@ -16,23 +16,23 @@ const DefaultTimeout = 30 * time.Minute
 type Config struct {
 	// Enabled controls whether tunneling is active.
 	// Default: true (set by ApplyDefaults).
-	Enabled bool
+	Enabled bool `yaml:"enabled"`
 
 	// MaxSessions is the maximum number of concurrent tunnel sessions.
 	// Default: 10
-	MaxSessions int
+	MaxSessions int `yaml:"max_sessions"`
 
 	// DefaultTimeout is the default/maximum session timeout.
 	// Default: 30m
-	DefaultTimeout time.Duration
+	DefaultTimeout time.Duration `yaml:"default_timeout"`
 
 	// SSHListenAddr is the address for the SSH mesh server to listen on.
 	// If empty, the SSH server is not started.
-	SSHListenAddr string
+	SSHListenAddr string `yaml:"ssh_listen_addr"`
 
 	// HostKeyDir is the directory for storing the SSH host key.
 	// If empty, a transient key is generated (not persisted).
-	HostKeyDir string
+	HostKeyDir string `yaml:"host_key_dir"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.

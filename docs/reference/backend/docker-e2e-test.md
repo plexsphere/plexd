@@ -69,7 +69,7 @@ The container receives configuration from three sources:
 
 | Source | Value | Purpose |
 |--------|-------|---------|
-| Config file (`/etc/plexd/config.yaml`) | Bind-mounted from `test/e2e/docker/plexd-e2e.yaml` | Sets `api.baseurl`, `registration.datadir`, `node_api.datadir`, `heartbeat.nodeid` |
+| Config file (`/etc/plexd/config.yaml`) | Bind-mounted from `test/e2e/docker/plexd-e2e.yaml` | Sets `api.base_url`, `registration.data_dir`, `node_api.data_dir`, `heartbeat.node_id` |
 | CLI flag `--api` | `http://mock-api:8080` | Overrides API base URL (redundant with config, belt-and-suspenders) |
 | Env var `PLEXD_BOOTSTRAP_TOKEN` | `e2e-test-token` | Bootstrap token for registration |
 
@@ -109,7 +109,7 @@ docker compose -f test/e2e/docker-compose.yml -p plexd-e2e logs plexd
 ```
 
 Common causes:
-- Config file parse error — check YAML field names match Go struct lowercased names (e.g. `baseurl`, not `base_url`).
+- Config file parse error — check YAML field names use snake_case tags (e.g. `base_url`, not `baseurl`).
 - Network connectivity — both services must be on the `e2e-net` bridge network.
 - Missing bootstrap token — `PLEXD_BOOTSTRAP_TOKEN` must be set in the plexd service environment.
 

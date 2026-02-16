@@ -28,112 +28,112 @@ const (
 type Config struct {
 	// Enabled controls whether bridge mode is active.
 	// Default: false
-	Enabled bool
+	Enabled bool `yaml:"enabled"`
 
 	// AccessInterface is the name of the access-side network interface.
-	AccessInterface string
+	AccessInterface string `yaml:"access_interface"`
 
 	// AccessSubnets are the CIDR subnets reachable via the access-side interface.
-	AccessSubnets []string
+	AccessSubnets []string `yaml:"access_subnets"`
 
 	// EnableNAT controls whether NAT masquerading is applied on the access-side interface.
 	// nil means use default (true); explicit false disables NAT.
-	EnableNAT *bool
+	EnableNAT *bool `yaml:"enable_nat"`
 
 	// RelayEnabled controls whether the bridge node serves as a relay.
 	// Default: false. Requires Enabled=true.
-	RelayEnabled bool
+	RelayEnabled bool `yaml:"relay_enabled"`
 
 	// RelayListenPort is the UDP port for relay traffic.
 	// Default: 51821
-	RelayListenPort int
+	RelayListenPort int `yaml:"relay_listen_port"`
 
 	// MaxRelaySessions is the maximum number of concurrent relay sessions.
 	// Default: 100
-	MaxRelaySessions int
+	MaxRelaySessions int `yaml:"max_relay_sessions"`
 
 	// SessionTTL is the time-to-live for relay sessions.
 	// Default: 5m. Minimum: 30s.
-	SessionTTL time.Duration
+	SessionTTL time.Duration `yaml:"session_ttl"`
 
 	// UserAccessEnabled controls whether user access integration is active.
 	// Default: false. Requires Enabled=true.
-	UserAccessEnabled bool
+	UserAccessEnabled bool `yaml:"user_access_enabled"`
 
 	// UserAccessInterfaceName is the name of the WireGuard interface for user access.
 	// Default: "wg-access"
-	UserAccessInterfaceName string
+	UserAccessInterfaceName string `yaml:"user_access_interface_name"`
 
 	// UserAccessListenPort is the UDP port for the user access WireGuard interface.
 	// Default: 51822
-	UserAccessListenPort int
+	UserAccessListenPort int `yaml:"user_access_listen_port"`
 
 	// MaxAccessPeers is the maximum number of concurrent user access peers.
 	// Default: 50
-	MaxAccessPeers int
+	MaxAccessPeers int `yaml:"max_access_peers"`
 
 	// UserAccessProviderType selects the external VPN provider for user access.
 	// Supported values: "tailscale", "netbird", or "" (disabled).
-	UserAccessProviderType string
+	UserAccessProviderType string `yaml:"user_access_provider_type"`
 
 	// AuthKeyEnv is the environment variable name containing the auth key
 	// for the user access provider (e.g. "PLEXD_TAILSCALE_AUTH_KEY").
-	AuthKeyEnv string
+	AuthKeyEnv string `yaml:"auth_key_env"`
 
 	// SetupKeyEnv is the environment variable name containing the setup key
 	// for the user access provider (e.g. "PLEXD_NETBIRD_SETUP_KEY").
-	SetupKeyEnv string
+	SetupKeyEnv string `yaml:"setup_key_env"`
 
 	// IngressEnabled controls whether public ingress is active.
 	// Default: false. Requires Enabled=true.
-	IngressEnabled bool
+	IngressEnabled bool `yaml:"ingress_enabled"`
 
 	// MaxIngressRules is the maximum number of concurrent ingress rules.
 	// Default: 20
-	MaxIngressRules int
+	MaxIngressRules int `yaml:"max_ingress_rules"`
 
 	// IngressDialTimeout is the timeout for dialing target mesh peers.
 	// Default: 10s. Minimum: 1s.
-	IngressDialTimeout time.Duration
+	IngressDialTimeout time.Duration `yaml:"ingress_dial_timeout"`
 
 	// SiteToSiteEnabled controls whether site-to-site VPN connectivity is active.
 	// Default: false. Requires Enabled=true.
-	SiteToSiteEnabled bool
+	SiteToSiteEnabled bool `yaml:"site_to_site_enabled"`
 
 	// SiteToSiteInterfacePrefix is the prefix for WireGuard interfaces used by site-to-site tunnels.
 	// Each tunnel gets an interface named {prefix}{index}.
 	// Default: "wg-s2s-"
-	SiteToSiteInterfacePrefix string
+	SiteToSiteInterfacePrefix string `yaml:"site_to_site_interface_prefix"`
 
 	// SiteToSiteListenPort is the base UDP port for site-to-site WireGuard interfaces.
 	// Each tunnel uses this port + tunnel index offset.
 	// Default: 51823
-	SiteToSiteListenPort int
+	SiteToSiteListenPort int `yaml:"site_to_site_listen_port"`
 
 	// MaxSiteToSiteTunnels is the maximum number of concurrent site-to-site tunnels.
 	// Default: 10
-	MaxSiteToSiteTunnels int
+	MaxSiteToSiteTunnels int `yaml:"max_site_to_site_tunnels"`
 
 	// TunnelProviders lists the tunnel provider types to enable for site-to-site connectivity.
 	// Supported values: "ipsec", "openvpn". Empty means WireGuard-only.
-	TunnelProviders []string
+	TunnelProviders []string `yaml:"tunnel_providers"`
 
 	// ACMEEnabled controls whether ACME certificate management is active for ingress.
 	// Default: false. Requires IngressEnabled=true.
-	ACMEEnabled bool
+	ACMEEnabled bool `yaml:"acme_enabled"`
 
 	// ACMECacheDir is the directory for caching ACME certificates.
-	ACMECacheDir string
+	ACMECacheDir string `yaml:"acme_cache_dir"`
 
 	// ACMEAllowedHosts is the whitelist of hostnames for ACME certificate issuance.
-	ACMEAllowedHosts []string
+	ACMEAllowedHosts []string `yaml:"acme_allowed_hosts"`
 
 	// ACMEEmail is the contact email for the ACME account.
-	ACMEEmail string
+	ACMEEmail string `yaml:"acme_email"`
 
 	// ACMEDirectoryURL overrides the default ACME directory URL.
 	// Empty means the default (Let's Encrypt production).
-	ACMEDirectoryURL string
+	ACMEDirectoryURL string `yaml:"acme_directory_url"`
 }
 
 // BoolPtr returns a pointer to the given bool value.

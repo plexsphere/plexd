@@ -22,13 +22,13 @@ var severityPriority = map[string]int{
 type FilterConfig struct {
 	// MinSeverity drops entries below this severity level.
 	// Empty string means no severity filtering.
-	MinSeverity string
+	MinSeverity string `yaml:"min_severity"`
 
 	// IncludeUnits, if non-empty, only passes entries matching one of these unit names.
-	IncludeUnits []string
+	IncludeUnits []string `yaml:"include_units"`
 
 	// ExcludeUnits drops entries matching any of these unit names.
-	ExcludeUnits []string
+	ExcludeUnits []string `yaml:"exclude_units"`
 }
 
 // IsEmpty returns true if no filtering rules are configured.

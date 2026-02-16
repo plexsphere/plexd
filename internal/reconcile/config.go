@@ -10,7 +10,7 @@ import (
 type Config struct {
 	// Interval is the time between reconciliation cycles.
 	// Default: 60s
-	Interval time.Duration
+	Interval time.Duration `yaml:"interval"`
 }
 
 // DefaultInterval is the default reconciliation interval.

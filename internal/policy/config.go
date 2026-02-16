@@ -10,10 +10,10 @@ const DefaultChainName = "plexd-mesh"
 type Config struct {
 	// Enabled controls whether policy enforcement is active.
 	// Default: true (set by ApplyDefaults).
-	Enabled bool
+	Enabled bool `yaml:"enabled"`
 
 	// ChainName is the iptables chain name for firewall rules.
-	ChainName string
+	ChainName string `yaml:"chain_name"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.

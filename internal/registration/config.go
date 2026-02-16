@@ -9,43 +9,43 @@ import (
 // Config is passed as a constructor argument — no file I/O in this package.
 type Config struct {
 	// DataDir is the path to the data directory (required).
-	DataDir string
+	DataDir string `yaml:"data_dir"`
 
 	// TokenFile is the path to the bootstrap token file.
 	// Default: /etc/plexd/bootstrap-token
-	TokenFile string
+	TokenFile string `yaml:"token_file"`
 
 	// TokenEnv is the environment variable name for the bootstrap token.
 	// Default: PLEXD_BOOTSTRAP_TOKEN
-	TokenEnv string
+	TokenEnv string `yaml:"token_env"`
 
 	// TokenValue is a direct token value override.
-	TokenValue string
+	TokenValue string `yaml:"token_value"`
 
 	// UseMetadata enables cloud metadata service for registration.
 	// Default: false
-	UseMetadata bool
+	UseMetadata bool `yaml:"use_metadata"`
 
 	// MetadataTokenPath is the metadata key path used to retrieve the
 	// bootstrap token from an instance metadata service (e.g. IMDS).
 	// Default: /plexd/bootstrap-token
-	MetadataTokenPath string
+	MetadataTokenPath string `yaml:"metadata_token_path"`
 
 	// MetadataTimeout is the maximum time to wait for a metadata service
 	// response.
 	// Default: 2s
-	MetadataTimeout time.Duration
+	MetadataTimeout time.Duration `yaml:"metadata_timeout"`
 
 	// Hostname overrides the system hostname.
 	// Default: empty (uses os.Hostname())
-	Hostname string
+	Hostname string `yaml:"hostname"`
 
 	// Metadata holds optional key-value pairs for the registration request.
-	Metadata map[string]string
+	Metadata map[string]string `yaml:"metadata"`
 
 	// MaxRetryDuration is the maximum duration to retry registration.
 	// Default: 5m
-	MaxRetryDuration time.Duration
+	MaxRetryDuration time.Duration `yaml:"max_retry_duration"`
 }
 
 // DefaultTokenFile is the default path to the bootstrap token file.

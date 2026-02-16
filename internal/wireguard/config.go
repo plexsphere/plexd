@@ -7,14 +7,14 @@ import "errors"
 type Config struct {
 	// InterfaceName is the WireGuard network interface name.
 	// Default: "plexd0"
-	InterfaceName string
+	InterfaceName string `yaml:"interface_name"`
 
 	// ListenPort is the UDP port WireGuard listens on.
 	// Default: 51820
-	ListenPort int
+	ListenPort int `yaml:"listen_port"`
 
 	// MTU is the interface MTU. 0 means system default.
-	MTU int
+	MTU int `yaml:"mtu"`
 }
 
 // DefaultInterfaceName is the default WireGuard interface name.

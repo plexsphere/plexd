@@ -19,19 +19,19 @@ const DefaultBatchSize = 100
 type Config struct {
 	// Enabled controls whether metrics collection is active.
 	// Default: true (set by ApplyDefaults).
-	Enabled bool
+	Enabled bool `yaml:"enabled"`
 
 	// CollectInterval is the interval between collection cycles.
 	// Must be at least 5s.
-	CollectInterval time.Duration
+	CollectInterval time.Duration `yaml:"collect_interval"`
 
 	// ReportInterval is the interval between reporting to the control plane.
 	// Must be at least 10s and >= CollectInterval.
-	ReportInterval time.Duration
+	ReportInterval time.Duration `yaml:"report_interval"`
 
 	// BatchSize is the maximum number of metric points per report batch.
 	// Must be > 0. Default: 100.
-	BatchSize int
+	BatchSize int `yaml:"batch_size"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.

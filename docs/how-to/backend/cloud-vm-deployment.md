@@ -120,11 +120,13 @@ write_files:
   - path: /etc/plexd/config.yaml
     permissions: "0600"
     content: |
-      api_url: "https://api.your-plexsphere.io"
+      api:
+        base_url: "https://api.your-plexsphere.io"
       data_dir: /var/lib/plexd
-      use_metadata: true
-      metadata_token_path: /plexd/bootstrap-token
-      metadata_timeout: 2s
+      registration:
+        use_metadata: true
+        metadata_token_path: /plexd/bootstrap-token
+        metadata_timeout: 2s
 ```
 
 plexd will query the IMDS at `{base_url}/plexd/bootstrap-token` during registration.

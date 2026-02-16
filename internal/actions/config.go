@@ -22,7 +22,7 @@ const DefaultHooksDir = "/etc/plexd/hooks"
 type Config struct {
 	// Enabled controls whether action execution is active.
 	// Default: true (set by ApplyDefaults).
-	Enabled bool
+	Enabled bool `yaml:"enabled"`
 
 	// HooksDir is the directory containing hook scripts.
 	// Default: /etc/plexd/hooks
@@ -30,15 +30,15 @@ type Config struct {
 
 	// MaxConcurrent is the maximum number of actions that can run concurrently.
 	// Must be at least 1 when enabled. Default: 5.
-	MaxConcurrent int
+	MaxConcurrent int `yaml:"max_concurrent"`
 
 	// MaxActionTimeout is the maximum duration for a single action.
 	// Must be at least 10s when enabled. Default: 10m.
-	MaxActionTimeout time.Duration
+	MaxActionTimeout time.Duration `yaml:"max_action_timeout"`
 
 	// MaxOutputBytes is the maximum output size per action in bytes.
 	// Must be at least 1024 when enabled. Default: 1 MiB.
-	MaxOutputBytes int64
+	MaxOutputBytes int64 `yaml:"max_output_bytes"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.

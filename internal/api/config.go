@@ -10,24 +10,24 @@ import (
 type Config struct {
 	// BaseURL is the control plane API base URL (required).
 	// Example: "https://api.plexsphere.com"
-	BaseURL string
+	BaseURL string `yaml:"base_url"`
 
 	// TLSInsecureSkipVerify disables TLS certificate verification.
 	// WARNING: Only use for development/testing.
-	TLSInsecureSkipVerify bool
+	TLSInsecureSkipVerify bool `yaml:"tls_insecure_skip_verify"`
 
 	// ConnectTimeout is the maximum time to wait for a TCP connection.
 	// Default: 10s
-	ConnectTimeout time.Duration
+	ConnectTimeout time.Duration `yaml:"connect_timeout"`
 
 	// RequestTimeout is the maximum time for a complete HTTP request/response cycle.
 	// Default: 30s
-	RequestTimeout time.Duration
+	RequestTimeout time.Duration `yaml:"request_timeout"`
 
 	// SSEIdleTimeout is the maximum time to wait for any data on the SSE stream
 	// before considering the connection stale and reconnecting.
 	// Default: 90s
-	SSEIdleTimeout time.Duration
+	SSEIdleTimeout time.Duration `yaml:"sse_idle_timeout"`
 }
 
 // DefaultConnectTimeout is the default TCP connect timeout.

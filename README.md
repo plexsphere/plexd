@@ -311,23 +311,25 @@ Flags:
 # /etc/plexd/config.yaml
 
 # --- Required ---
-api: "https://api.plexsphere.io"
+api:
+  base_url: "https://api.plexsphere.io"
 
 # --- Optional ---
 log_level: info         # debug, info, warn, error
 mode: node              # node | bridge
 data_dir: /var/lib/plexd
 
-# Mesh (WireGuard)
-mesh:
-  interface: plexd0     # WireGuard interface name
-  listen_port: 51820    # UDP port for mesh traffic
+# WireGuard tunnel management
+wireguard:
+  interface_name: plexd0  # WireGuard interface name
+  listen_port: 51820      # UDP port for mesh traffic
+  mtu: 0                  # 0 = system default
 
-# Token source (checked in order, first match wins)
-token:
-  file: /etc/plexd/bootstrap-token
-  env: PLEXD_BOOTSTRAP_TOKEN
-  metadata: true        # Read from cloud provider metadata service
+# Registration & bootstrap token
+registration:
+  token_file: /etc/plexd/bootstrap-token
+  token_env: PLEXD_BOOTSTRAP_TOKEN
+  use_metadata: true      # Read from cloud provider metadata service
 
 # Reconciliation
 reconcile:
@@ -335,8 +337,8 @@ reconcile:
 
 # Policy enforcement
 policy:
-  default: deny          # deny | allow (default deny-all for mesh traffic)
-  log_denied: true       # Log denied packets at debug level
+  enabled: true
+  chain_name: plexd-mesh  # nftables chain name
 ```
 
 **Policy enforcement behavior (preliminary - subject to change):**
@@ -352,34 +354,37 @@ policy:
 
 ```yaml
 # NAT Traversal
-nat_traversal:
+nat:
   enabled: true
   stun_servers:
     - stun.l.google.com:19302
     - stun.cloudflare.com:3478
   refresh_interval: 60s
-  fallback: relay       # Route through bridge nodes when P2P fails
+  timeout: 5s
 
 # Heartbeat
 heartbeat:
   interval: 30s
 
-# Observability
-observe:
+# Metrics collection & reporting
+metrics:
   enabled: true
-  interval: 15s
-  batch_interval: 10s
-  batch_max_size: 500
-  metrics:
-    - node_resources    # CPU, memory, disk
-    - tunnel_health     # Handshake status, packet loss
-    - peer_latency      # RTT to each peer
-    - agent_stats       # Goroutines, memory, uptime
+  collect_interval: 15s
+  report_interval: 60s
+  batch_size: 100
+
+# Peer endpoint exchange
+peer_exchange:
+  enabled: true
+  stun_servers:
+    - stun.l.google.com:19302
+    - stun.cloudflare.com:3478
+  refresh_interval: 60s
 ```
 
 **Observability behavior:**
 
-plexd collects the following metric groups at the configured `interval`:
+plexd collects the following metric groups at the configured `collect_interval`:
 
 | Metric Group | Data Points |
 |---|---|
@@ -388,29 +393,28 @@ plexd collects the following metric groups at the configured `interval`:
 | `peer_latency` | Per-peer RTT (ms) via ICMP echo over the mesh interface |
 | `agent_stats` | plexd goroutine count, heap memory, GC stats, uptime, reconnect count |
 
-Metrics are delivered to the control plane as **batch POST requests** (JSON array, gzip-compressed) at `batch_interval` (default 10s) or when `batch_max_size` (default 500 data points) is reached, whichever comes first. There is no local Prometheus or OpenTelemetry exposition endpoint - all metrics flow exclusively to the control plane.
+Metrics are delivered to the control plane as **batch POST requests** (JSON array, gzip-compressed) at `report_interval` (default 60s) or when `batch_size` (default 100 data points) is reached, whichever comes first. There is no local Prometheus or OpenTelemetry exposition endpoint - all metrics flow exclusively to the control plane.
 
 ```yaml
 # Log forwarding
-logs:
+log_fwd:
   enabled: true
-  sources:
-    - journald          # System journal
+  collect_interval: 10s
+  report_interval: 30s
+  batch_size: 200
+  file_patterns:
     - /var/log/syslog
-  filters:
-    - unit: plexd       # Always included
-    - unit: sshd
-    - path: /var/log/app/*.log
-    - severity: warn     # Minimum severity (debug, info, warn, error)
-  batch_interval: 10s    # Flush interval
-  batch_max_size: 1000   # Max lines per batch
-  buffer_size: 10000     # Ringbuffer entries when control plane is unreachable
-  max_line_size: 16384   # 16 KiB, lines exceeding this are truncated
+    - /var/log/app/*.log
+  filter:
+    min_severity: warn
+    include_units:
+      - plexd
+      - sshd
 ```
 
 **Log forwarding behavior:**
 
-Logs are collected from the configured sources and delivered to the control plane as **batch POST requests** using JSON Lines format, gzip-compressed. Batches are flushed at `batch_interval` (default 10s) or when `batch_max_size` (default 1000 lines) is reached.
+Logs are collected from the configured sources and delivered to the control plane as **batch POST requests** using JSON Lines format, gzip-compressed. Batches are flushed at `report_interval` (default 30s) or when `batch_size` (default 200 entries) is reached.
 
 Each log line is serialized as:
 
@@ -425,20 +429,17 @@ Each log line is serialized as:
 }
 ```
 
-- **Max line size:** 16 KiB. Lines exceeding this limit are truncated with a `[truncated]` suffix.
-- **Filtering:** Unit-based (systemd unit name), path-based (file glob), and severity-level filters are applied before batching. The `plexd` unit is always included regardless of filter configuration.
-- **Offline buffering:** When the control plane is unreachable, log entries are buffered in a bounded ringbuffer (`buffer_size`, default 10000 entries). Oldest entries are evicted when the buffer is full. Buffered entries are drained on reconnection.
+- **Filtering:** Severity-level filters (`min_severity`), unit inclusion lists (`include_units`), and unit exclusion lists (`exclude_units`) are applied before batching.
+- **File patterns:** Glob patterns in `file_patterns` specify additional log files to monitor beyond journald.
+- **Offline buffering:** When the control plane is unreachable, log entries are buffered internally. Buffered entries are drained on reconnection.
 
 ```yaml
-# Audit
-audit:
+# Audit data forwarding
+audit_fwd:
   enabled: true
-  sources:
-    - auditd            # Linux audit daemon
-    - kubernetes        # Kubernetes audit logs (auto-detected on K8s nodes)
-  batch_interval: 10s
-  batch_max_size: 500
-  buffer_size: 10000     # Ringbuffer entries when control plane is unreachable
+  collect_interval: 5s
+  report_interval: 15s
+  batch_size: 500
 ```
 
 **Audit collection behavior:**
@@ -462,25 +463,21 @@ All audit events are normalized into a unified JSON schema:
 }
 ```
 
-Delivery follows the same batch model as log forwarding: **batch POST** (JSON Lines, gzip-compressed) at `batch_interval` with its own independent ringbuffer for offline buffering.
+Delivery follows the same batch model as log forwarding: **batch POST** (JSON Lines, gzip-compressed) at `report_interval` (default 15s) with its own independent buffer for offline operation.
 
 ```yaml
-# Access proxy
-access:
-  ssh:
-    enabled: true
-    host_key_file: /var/lib/plexd/ssh_host_key
-    idle_timeout: 30m    # Close session after inactivity
-    max_sessions: 10     # Max concurrent SSH sessions per node
-  kubernetes:
-    enabled: false       # Auto-detected on K8s nodes
-    api_server: ""       # Auto-discovered if empty
-    idle_timeout: 15m
+# Secure access tunneling (SSH & Kubernetes API proxy)
+tunnel:
+  enabled: true
+  max_sessions: 10       # Max concurrent tunnel sessions per node
+  default_timeout: 30m   # Session timeout
+  ssh_listen_addr: ""    # SSH mesh server listen address (empty = auto)
+  host_key_dir: /var/lib/plexd  # Directory for SSH host key storage
 ```
 
-**Access proxy behavior:**
+**Secure access tunneling behavior:**
 
-plexd provides platform-mediated access to managed resources without exposing services directly.
+plexd provides platform-mediated access to managed resources without exposing services directly. The `tunnel:` config section controls this behavior.
 
 **SSH access flow:**
 
@@ -488,66 +485,66 @@ plexd provides platform-mediated access to managed resources without exposing se
 2. Control plane verifies RBAC permissions and issues a session JWT scoped to the target node and allowed actions.
 3. Control plane sends an `ssh_session_setup` event via SSE to the target node, including the session token.
 4. plexd opens a TCP listener on the mesh interface and tunnels the SSH connection through the encrypted mesh.
-5. The SSH session uses the node's managed host key (`host_key_file`). If the key file does not exist, plexd generates an Ed25519 host key on first use and reports its fingerprint to the control plane.
+5. The SSH session uses the node's managed host key (stored in `host_key_dir`). If the key file does not exist, plexd generates an Ed25519 host key on first use and reports its fingerprint to the control plane.
 6. Session environment is injected with `PLEXD_SESSION_TOKEN` for local action authorization.
-7. On disconnect or `idle_timeout`, plexd tears down the session and notifies the control plane.
+7. On disconnect or `default_timeout`, plexd tears down the session and notifies the control plane.
 
 **Kubernetes API proxy flow:**
 
 1. User requests kubectl access through the platform.
 2. Control plane issues a scoped kubeconfig with a short-lived token.
 3. plexd proxies the Kubernetes API request through the mesh to the target cluster's API server (auto-discovered via kubelet config or configured explicitly).
-4. The proxy terminates on `idle_timeout` (default 15m) if no requests are received.
+4. The proxy terminates on `default_timeout` if no requests are received.
 
 ```yaml
-# Actions
+# Actions & hooks
 actions:
   enabled: true
-  max_concurrent: 5           # Max parallel action executions
-  socket: /var/run/plexd.sock # Unix socket for local action requests
-  local_auth:
-    require_root: true        # --local flag requires root or plexd user
+  hooks_dir: /etc/plexd/hooks   # Directory for hook scripts
+  max_concurrent: 5             # Max parallel action executions
+  max_action_timeout: 10m       # Max duration for a single action
+  max_output_bytes: 1048576     # Max output size per action (1 MiB)
 
-# Hooks
-hooks:
+# Integrity verification
+integrity:
   enabled: true
-  dir: /etc/plexd/hooks.d
-  definitions:
-    - name: backup
-      path: /etc/plexd/hooks.d/backup.sh
-      description: "Run incremental backup"
-      timeout: 300s
-      user: backup-agent
-      sandbox: namespaced
+  binary_path: ""               # Path to plexd binary (auto-detected)
+  hooks_dir: /etc/plexd/hooks   # Directory containing hook scripts to verify
+  verify_interval: 5m           # Interval between periodic verification runs
+  watch_enabled: true           # Use inotify for real-time file change detection
 
 # Bridge-specific (only when mode: bridge)
 bridge:
-  # User access layer
-  access:
-    - type: tailscale
-      auth_key_env: TS_AUTHKEY
-    - type: netbird
-      setup_key_env: NB_SETUP_KEY
-    - type: wireguard
-      listen_port: 51821
-
-  # Public ingress
-  ingress:
-    enabled: false
-    listen: 0.0.0.0:443
+  enabled: true
+  access_interface: eth1
+  access_subnets:
+    - 10.0.0.0/8
 
   # NAT relay for nodes that cannot establish direct P2P tunnels
-  relay:
-    enabled: true
-    listen_port: 51820   # UDP relay port (shared with mesh listen_port)
+  relay_enabled: true
+  relay_listen_port: 51821
+  max_relay_sessions: 100
+  session_ttl: 5m
 
-  # Site-to-Site VPN peerings
-  site_to_site:
-    - name: partner-network
-      type: wireguard   # wireguard, ipsec, openvpn
-      remote_endpoint: vpn.partner.example:51820
-      remote_subnets:
-        - 172.16.0.0/16
+  # User access layer
+  user_access_enabled: true
+  user_access_provider_type: tailscale  # tailscale | netbird
+  user_access_interface_name: wg-access
+  user_access_listen_port: 51822
+  max_access_peers: 50
+  auth_key_env: PLEXD_TAILSCALE_AUTH_KEY
+
+  # Public ingress
+  ingress_enabled: false
+  max_ingress_rules: 20
+  ingress_dial_timeout: 10s
+
+  # Site-to-Site VPN connectivity
+  site_to_site_enabled: false
+  site_to_site_interface_prefix: wg-s2s-
+  site_to_site_listen_port: 51823
+  max_site_to_site_tunnels: 10
+  tunnel_providers: []  # ipsec, openvpn
 ```
 
 **Bridge mode behavior:**
@@ -573,19 +570,19 @@ The bridge establishes VPN tunnels to external networks (partner networks, cloud
 ```yaml
 # Local Node API
 node_api:
-  enabled: true
-  socket: /var/run/plexd/api.sock   # Unix socket path
-  http:
-    enabled: false                   # Optional TCP listener
-    listen: 127.0.0.1:9100
-    token_file: /etc/plexd/node-api-token
+  socket_path: /var/run/plexd/api.sock  # Unix socket path
+  http_enabled: false                    # Optional TCP listener
+  http_listen: 127.0.0.1:9100
+  http_token_file: /etc/plexd/node-api-token
+  debounce_period: 5s
+  data_dir: /var/lib/plexd
 ```
 
 **Node API behavior:**
 
-The local Node API provides read/write access to node state for local workloads and scripts. When `node_api.enabled` is `true`, plexd opens a Unix socket at the configured path. The socket is created with group `plexd` ownership so that processes in the `plexd` group can access metadata and data entries. Secret access requires membership in the `plexd-secrets` group or root privileges.
+The local Node API provides read/write access to node state for local workloads and scripts. plexd opens a Unix socket at the configured `socket_path`. The socket is created with group `plexd` ownership so that processes in the `plexd` group can access metadata and data entries. Secret access requires membership in the `plexd-secrets` group or root privileges.
 
-When `node_api.http.enabled` is `true`, plexd additionally listens on the configured TCP address (default `127.0.0.1:9100`). TCP requests must include a `Authorization: Bearer <token>` header. The token is read from `token_file` at startup. This mode is intended for environments where Unix socket access is impractical (e.g. containers without socket mounts).
+When `http_enabled` is `true`, plexd additionally listens on the configured TCP address (`http_listen`, default `127.0.0.1:9100`). TCP requests must include a `Authorization: Bearer <token>` header. The token is read from `http_token_file` at startup. This mode is intended for environments where Unix socket access is impractical (e.g. containers without socket mounts).
 
 Metadata and data entries are cached locally in `data_dir/state/` and survive agent restarts. The cache is populated from the control plane on first connect and kept in sync via SSE events. Report entries written via the API are buffered locally and synced upstream with debounce (default 5s) and retry on failure.
 
@@ -595,21 +592,20 @@ On Kubernetes, plexd manages a `PlexdNodeState` custom resource for metadata, da
 
 ## Environment Variables
 
-All configuration options can also be set via environment variables. These take precedence over the config file.
+Core settings can be set via environment variables. Environment variables take precedence over the config file. CLI flags take precedence over environment variables.
 
 | Variable | Description | Default |
 |---|---|---|
-| `PLEXD_API` | Control plane API URL | - |
-| `PLEXD_BOOTSTRAP_TOKEN` | Bootstrap token value | - |
-| `PLEXD_BOOTSTRAP_TOKEN_FILE` | Path to file containing bootstrap token | - |
+| `PLEXD_CONFIG` | Path to config file | `/etc/plexd/config.yaml` |
+| `PLEXD_API` | Control plane API URL (overrides `api.base_url`) | - |
 | `PLEXD_MODE` | Agent mode (`node`, `bridge`) | `node` |
 | `PLEXD_LOG_LEVEL` | Log verbosity (`debug`, `info`, `warn`, `error`) | `info` |
-| `PLEXD_CONFIG` | Path to config file | `/etc/plexd/config.yaml` |
-| `PLEXD_ACTIONS_ENABLED` | Enable built-in actions | `true` |
-| `PLEXD_HOOKS_ENABLED` | Enable custom hooks | `true` |
-| `PLEXD_HOOKS_DIR` | Directory for hook scripts | `/etc/plexd/hooks.d` |
+| `PLEXD_BOOTSTRAP_TOKEN` | Bootstrap token value (checked via `registration.token_env`) | - |
+| `PLEXD_BOOTSTRAP_TOKEN_FILE` | Override path to bootstrap token file | `/etc/plexd/bootstrap-token` |
+| `PLEXD_ACTIONS_ENABLED` | Enable action execution (`true`/`false`) | `true` |
+| `PLEXD_HOOKS_ENABLED` | Enable hook file watching (`true`/`false`) | `true` |
+| `PLEXD_HOOKS_DIR` | Directory for hook scripts (overrides `actions.hooks_dir`) | `/etc/plexd/hooks` |
 | `PLEXD_ACTIONS_MAX_CONCURRENT` | Max parallel action executions | `5` |
-| `PLEXD_NODE_API_ENABLED` | Enable the local Node API | `true` |
 | `PLEXD_NODE_API_SOCKET` | Unix socket path for the Node API | `/var/run/plexd/api.sock` |
 | `PLEXD_NODE_API_HTTP_ENABLED` | Enable TCP listener for the Node API | `false` |
 | `PLEXD_NODE_API_HTTP_LISTEN` | TCP listen address for the Node API | `127.0.0.1:9100` |

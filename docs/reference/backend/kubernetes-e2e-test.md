@@ -114,13 +114,13 @@ The ConfigMap is created inline by the test script (not from `deploy/kubernetes/
 
 ```yaml
 api:
-  baseurl: http://mock-api.plexd-e2e:8080
+  base_url: http://mock-api.plexd-e2e:8080
 registration:
-  datadir: /var/lib/plexd
+  data_dir: /var/lib/plexd
 node_api:
-  datadir: /var/lib/plexd
+  data_dir: /var/lib/plexd
 heartbeat:
-  nodeid: e2e-k8s-node
+  node_id: e2e-k8s-node
 ```
 
 The bootstrap token is set via `kubectl create secret generic plexd-bootstrap --from-literal=token=e2e-test-token`.
@@ -177,7 +177,7 @@ kubectl -n plexd-e2e logs -l app.kubernetes.io/name=mock-api --tail=50
 
 Common causes:
 - DNS resolution failure — verify `dnsPolicy: ClusterFirstWithHostNet` is set on the DaemonSet.
-- ConfigMap not mounted — check that the plexd pod has `/etc/plexd/config.yaml` with the correct `api.baseurl`.
+- ConfigMap not mounted — check that the plexd pod has `/etc/plexd/config.yaml` with the correct `api.base_url`.
 - Missing bootstrap token — the `PLEXD_BOOTSTRAP_TOKEN` env var must resolve from the `plexd-bootstrap` Secret.
 
 **Port-forward not reachable:**

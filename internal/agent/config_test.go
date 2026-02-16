@@ -35,13 +35,13 @@ mode: bridge
 log_level: debug
 data_dir: /tmp/plexd
 api:
-  baseurl: "https://example.com"
+  base_url: "https://example.com"
 registration:
-  datadir: /tmp/plexd
+  data_dir: /tmp/plexd
 node_api:
-  datadir: /tmp/plexd
+  data_dir: /tmp/plexd
 heartbeat:
-  nodeid: "node-1"
+  node_id: "node-1"
 `
 	path := writeTemp(t, yaml)
 	cfg, err := ParseConfig(path)
@@ -67,11 +67,11 @@ func TestParseConfig_MissingRequiredField(t *testing.T) {
 	yaml := `
 mode: node
 registration:
-  datadir: /tmp/plexd
+  data_dir: /tmp/plexd
 node_api:
-  datadir: /tmp/plexd
+  data_dir: /tmp/plexd
 heartbeat:
-  nodeid: "node-1"
+  node_id: "node-1"
 `
 	path := writeTemp(t, yaml)
 	_, err := ParseConfig(path)
@@ -84,13 +84,13 @@ func TestParseConfig_DefaultValues(t *testing.T) {
 	// Minimal YAML with only required fields; verify defaults are applied.
 	yaml := `
 api:
-  baseurl: "https://example.com"
+  base_url: "https://example.com"
 registration:
-  datadir: /tmp/plexd
+  data_dir: /tmp/plexd
 node_api:
-  datadir: /tmp/plexd
+  data_dir: /tmp/plexd
 heartbeat:
-  nodeid: "node-1"
+  node_id: "node-1"
 `
 	path := writeTemp(t, yaml)
 	cfg, err := ParseConfig(path)

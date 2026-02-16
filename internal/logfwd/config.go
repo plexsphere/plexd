@@ -19,27 +19,27 @@ const DefaultBatchSize = 200
 type Config struct {
 	// Enabled controls whether log forwarding is active.
 	// Default: true (set by ApplyDefaults).
-	Enabled bool
+	Enabled bool `yaml:"enabled"`
 
 	// CollectInterval is the interval between collection cycles.
 	// Must be at least 5s.
-	CollectInterval time.Duration
+	CollectInterval time.Duration `yaml:"collect_interval"`
 
 	// ReportInterval is the interval between reporting to the control plane.
 	// Must be >= CollectInterval.
-	ReportInterval time.Duration
+	ReportInterval time.Duration `yaml:"report_interval"`
 
 	// BatchSize is the maximum number of log entries per report batch.
 	// Must be at least 1. Default: 200.
-	BatchSize int
+	BatchSize int `yaml:"batch_size"`
 
 	// FilePatterns is a list of glob patterns for file-based log collection.
 	// Example: ["/var/log/app/*.log", "/var/log/syslog"]
-	FilePatterns []string
+	FilePatterns []string `yaml:"file_patterns"`
 
 	// Filter defines optional log filtering rules.
 	// When non-empty, the Forwarder wraps sources with a FilteringSource.
-	Filter FilterConfig
+	Filter FilterConfig `yaml:"filter"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.

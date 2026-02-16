@@ -13,18 +13,24 @@ const DefaultVerifyInterval = 5 * time.Minute
 type Config struct {
 	// Enabled controls whether integrity verification is active.
 	// Default: true (set by ApplyDefaults).
-	Enabled bool
+	Enabled bool `yaml:"enabled"`
 
 	// BinaryPath is the path to the plexd binary to verify.
-	BinaryPath string
+	BinaryPath string `yaml:"binary_path"`
 
 	// HooksDir is the directory containing hook scripts to verify.
-	HooksDir string
+	HooksDir string `yaml:"hooks_dir"`
 
 	// VerifyInterval is the interval between integrity verification runs.
 	// Must be at least 30s when enabled.
 	// Default: 5m
-	VerifyInterval time.Duration
+	VerifyInterval time.Duration `yaml:"verify_interval"`
+
+	// WatchEnabled controls whether inotify file watching is active.
+	// When enabled, file changes in HooksDir trigger immediate checksum
+	// recomputation instead of waiting for the next periodic verification.
+	// Default: true (set by ApplyDefaults).
+	WatchEnabled bool `yaml:"watch_enabled"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.
@@ -36,6 +42,7 @@ func (c *Config) ApplyDefaults() {
 	// constructed the config intentionally and we respect Enabled as-is.
 	if c.VerifyInterval == 0 {
 		c.Enabled = true
+		c.WatchEnabled = true
 		c.VerifyInterval = DefaultVerifyInterval
 	}
 }

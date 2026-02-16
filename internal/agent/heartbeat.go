@@ -17,10 +17,10 @@ const DefaultHeartbeatInterval = 30 * time.Second
 type HeartbeatConfig struct {
 	// Interval is the heartbeat send interval.
 	// Default: 30s
-	Interval time.Duration
+	Interval time.Duration `yaml:"interval"`
 
 	// NodeID is the node identifier (required).
-	NodeID string
+	NodeID string `yaml:"node_id"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.

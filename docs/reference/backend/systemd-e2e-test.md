@@ -98,13 +98,13 @@ The config is written directly into the container (not via the installer script)
 
 ```yaml
 api:
-  baseurl: http://plexd-e2e-mockapi:8080
+  base_url: http://plexd-e2e-mockapi:8080
 registration:
-  datadir: /var/lib/plexd
+  data_dir: /var/lib/plexd
 node_api:
-  datadir: /var/lib/plexd
+  data_dir: /var/lib/plexd
 heartbeat:
-  nodeid: e2e-systemd-node
+  node_id: e2e-systemd-node
 ```
 
 The bootstrap token is set via the environment file at `/etc/plexd/environment` (`PLEXD_BOOTSTRAP_TOKEN=e2e-test-token`).
@@ -157,7 +157,7 @@ docker exec plexd-e2e-systemd systemctl status plexd
 
 Common causes:
 - Binary not executable — check that `chmod +x` was applied to `/usr/local/bin/plexd`.
-- Config YAML parse error — field names must use lowercased Go struct names (e.g. `baseurl`, not `base_url`).
+- Config YAML parse error — field names must use snake_case YAML tags (e.g. `base_url`, not `baseurl`).
 - Missing bootstrap token — the environment file must set `PLEXD_BOOTSTRAP_TOKEN`.
 
 **Assertions not met (counters stay at 0):**

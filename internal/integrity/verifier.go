@@ -3,9 +3,12 @@ package integrity
 import (
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/plexsphere/plexd/internal/api"
 )
 
@@ -132,13 +135,78 @@ func (v *Verifier) VerifyHook(ctx context.Context, nodeID, hookPath, expectedChe
 	return false, nil
 }
 
-// Run performs startup binary verification and then periodically re-verifies
-// at the configured interval. When the config is disabled, Run returns immediately.
-// Run blocks until the context is cancelled.
+// VerifyHooksDir computes checksums for all files in the hooks directory,
+// compares against stored baselines, and reports violations on mismatch.
+func (v *Verifier) VerifyHooksDir(ctx context.Context, nodeID string) {
+	if v.cfg.HooksDir == "" {
+		return
+	}
+
+	entries, err := os.ReadDir(v.cfg.HooksDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			v.logger.Warn("hooks dir read failed", "path", v.cfg.HooksDir, "error", err)
+		}
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		hookPath := filepath.Join(v.cfg.HooksDir, entry.Name())
+		actual, err := HashFile(hookPath)
+		if err != nil {
+			v.logger.Warn("hook hash failed", "path", hookPath, "error", err)
+			continue
+		}
+
+		expected := v.store.Get(hookPath)
+		if expected == "" {
+			v.logger.Info("hook baseline established", "path", hookPath, "checksum", actual)
+			if err := v.store.Set(hookPath, actual); err != nil {
+				v.logger.Warn("failed to store hook baseline", "path", hookPath, "error", err)
+			}
+			continue
+		}
+
+		if actual == expected {
+			continue
+		}
+
+		v.logger.Error("hook integrity violation",
+			"path", hookPath,
+			"expected_checksum", expected,
+			"actual_checksum", actual,
+		)
+
+		report := api.IntegrityViolationReport{
+			Type:             ViolationTypeHook,
+			Path:             hookPath,
+			ExpectedChecksum: expected,
+			ActualChecksum:   actual,
+			Detail:           "hook file checksum changed",
+			Timestamp:        time.Now().UTC(),
+		}
+		if err := v.reporter.ReportViolation(ctx, nodeID, report); err != nil {
+			v.logger.Warn("failed to report hook violation", "error", err)
+		}
+	}
+}
+
+// Run performs periodic integrity verification for the binary and hooks directory.
+// When WatchEnabled is true, it also monitors the hooks directory via inotify
+// for real-time change detection. Run blocks until the context is cancelled.
 func (v *Verifier) Run(ctx context.Context, nodeID string) error {
 	if !v.cfg.Enabled {
 		v.logger.Info("integrity verification disabled")
 		return nil
+	}
+
+	// Start fsnotify watcher if enabled and hooks dir is configured.
+	if v.cfg.WatchEnabled && v.cfg.HooksDir != "" {
+		go v.watchHooksDir(ctx, nodeID)
 	}
 
 	ticker := time.NewTicker(v.cfg.VerifyInterval)
@@ -152,6 +220,74 @@ func (v *Verifier) Run(ctx context.Context, nodeID string) error {
 			if err := v.VerifyBinary(ctx, nodeID); err != nil {
 				v.logger.Error("periodic binary verification failed", "error", err)
 			}
+			v.VerifyHooksDir(ctx, nodeID)
+		}
+	}
+}
+
+// watchHooksDir monitors the hooks directory for file changes using fsnotify.
+// On any file modification, checksums are recomputed immediately.
+func (v *Verifier) watchHooksDir(ctx context.Context, nodeID string) {
+	if err := os.MkdirAll(v.cfg.HooksDir, 0o755); err != nil {
+		v.logger.Warn("integrity: failed to create hooks dir for watching", "path", v.cfg.HooksDir, "error", err)
+		return
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		v.logger.Warn("integrity: failed to create fsnotify watcher", "error", err)
+		return
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(v.cfg.HooksDir); err != nil {
+		v.logger.Warn("integrity: failed to watch hooks dir", "path", v.cfg.HooksDir, "error", err)
+		return
+	}
+
+	v.logger.Info("integrity: watching hooks dir for changes", "path", v.cfg.HooksDir)
+
+	// Debounce timer to coalesce rapid changes.
+	var debounceTimer *time.Timer
+	const debouncePeriod = 200 * time.Millisecond
+
+	for {
+		select {
+		case <-ctx.Done():
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+			}
+			return
+
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+
+			isRelevant := event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename|fsnotify.Chmod) != 0
+			if !isRelevant {
+				continue
+			}
+
+			v.logger.Debug("integrity: hook file change detected",
+				"path", event.Name,
+				"op", event.Op.String(),
+			)
+
+			// Debounce: reset timer on each event.
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+			}
+			debounceTimer = time.AfterFunc(debouncePeriod, func() {
+				v.logger.Info("integrity: recomputing hook checksums after file change")
+				v.VerifyHooksDir(ctx, nodeID)
+			})
+
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			v.logger.Warn("integrity: fsnotify error", "error", err)
 		}
 	}
 }

@@ -62,6 +62,9 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		cfg.LogLevel = logLevel
 	}
 
+	// Apply environment variable overrides.
+	applyEnvOverrides(cfg)
+
 	// 2. Set up structured logger.
 	logger := setupLogger(cfg.LogLevel)
 
@@ -443,6 +446,44 @@ type controlPlaneReporter struct{ cp *api.ControlPlane }
 
 func (r *controlPlaneReporter) ReportViolation(ctx context.Context, nodeID string, report api.IntegrityViolationReport) error {
 	return r.cp.ReportIntegrityViolation(ctx, nodeID, report)
+}
+
+// applyEnvOverrides applies PLEXD_* environment variable overrides to the config.
+// Environment variables take precedence over the config file but not CLI flags
+// (CLI flags are applied separately and may have already overridden values).
+func applyEnvOverrides(cfg *agent.AgentConfig) {
+	if v := os.Getenv("PLEXD_BOOTSTRAP_TOKEN_FILE"); v != "" {
+		cfg.Registration.TokenFile = v
+	}
+	if v := os.Getenv("PLEXD_ACTIONS_ENABLED"); v != "" {
+		cfg.Actions.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("PLEXD_HOOKS_ENABLED"); v != "" {
+		cfg.Integrity.WatchEnabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("PLEXD_HOOKS_DIR"); v != "" {
+		cfg.Actions.HooksDir = v
+		cfg.Integrity.HooksDir = v
+	}
+	if v := os.Getenv("PLEXD_ACTIONS_MAX_CONCURRENT"); v != "" {
+		if n, err := fmt.Sscanf(v, "%d", &cfg.Actions.MaxConcurrent); n != 1 || err != nil {
+			slog.Warn("invalid PLEXD_ACTIONS_MAX_CONCURRENT", "value", v)
+		}
+	}
+	if v := os.Getenv("PLEXD_NODE_API_ENABLED"); v != "" {
+		// Node API doesn't have an Enabled field; it's always active.
+		// This env var is documented but effectively a no-op in current code.
+		_ = v
+	}
+	if v := os.Getenv("PLEXD_NODE_API_SOCKET"); v != "" {
+		cfg.NodeAPI.SocketPath = v
+	}
+	if v := os.Getenv("PLEXD_NODE_API_HTTP_ENABLED"); v != "" {
+		cfg.NodeAPI.HTTPEnabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("PLEXD_NODE_API_HTTP_LISTEN"); v != "" {
+		cfg.NodeAPI.HTTPListen = v
+	}
 }
 
 func setupLogger(level string) *slog.Logger {

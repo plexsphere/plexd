@@ -68,12 +68,12 @@ Produces a minimal default `config.yaml`. When `apiBaseURL` is empty, writes a c
 
 ### Output fields
 
-| Field        | Value                           | Description               |
-|--------------|---------------------------------|---------------------------|
-| `api_url`    | Provided URL or `# api_url: …` | Control plane API URL     |
-| `data_dir`   | `/var/lib/plexd`                | Data directory            |
-| `log_level`  | `info`                          | Log verbosity             |
-| `token_file` | `/etc/plexd/bootstrap-token`    | Bootstrap token file path |
+| Field                      | Value                                  | Description               |
+|----------------------------|----------------------------------------|---------------------------|
+| `api.base_url`             | Provided URL or `# api: base_url: …`  | Control plane API URL     |
+| `data_dir`                 | `/var/lib/plexd`                       | Data directory            |
+| `log_level`                | `info`                                 | Log verbosity             |
+| `registration.token_file`  | `/etc/plexd/bootstrap-token`           | Bootstrap token file path |
 
 ## Installer
 

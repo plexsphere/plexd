@@ -8,18 +8,19 @@ metadata:
     app.kubernetes.io/part-of: plexsphere
 data:
   config.yaml: |
-    api: "https://api.plexsphere.io"
+    api:
+      base_url: "https://api.plexsphere.io"
     log_level: info
     mode: node
     data_dir: /var/lib/plexd
 
-    mesh:
-      interface: plexd0
+    wireguard:
+      interface_name: plexd0
       listen_port: 51820
 
     reconcile:
       interval: 60s
 
     policy:
-      default: deny
-      log_denied: true
+      enabled: true
+      chain_name: plexd-mesh

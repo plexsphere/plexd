@@ -370,6 +370,164 @@ func TestVerifier_PeriodicRun_DetectsTampering(t *testing.T) {
 	}
 }
 
+func TestVerifier_WatchHooksDir_DetectsChange(t *testing.T) {
+	dir := t.TempDir()
+	hooksDir := filepath.Join(dir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	binaryPath := writeTempFile(t, dir, "plexd", "binary-content")
+
+	// Create an initial hook file.
+	hookContent := "#!/bin/sh\necho original"
+	writeTempFile(t, hooksDir, "test-hook.sh", hookContent)
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	// Store the original baseline for the hook.
+	hookPath := filepath.Join(hooksDir, "test-hook.sh")
+	originalChecksum := sha256Hex(hookContent)
+	if err := store.Set(hookPath, originalChecksum); err != nil {
+		t.Fatalf("store set: %v", err)
+	}
+
+	reporter := &mockReporter{}
+	v := NewVerifier(Config{
+		Enabled:        true,
+		BinaryPath:     binaryPath,
+		HooksDir:       hooksDir,
+		VerifyInterval: 1 * time.Hour, // long interval; we rely on the watcher
+		WatchEnabled:   true,
+	}, store, reporter, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start the verifier (which starts the watcher goroutine).
+	done := make(chan error, 1)
+	go func() {
+		done <- v.Run(ctx, "node-1")
+	}()
+
+	// Give watcher time to initialize.
+	time.Sleep(200 * time.Millisecond)
+
+	// Modify the hook file.
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\necho tampered"), 0o644); err != nil {
+		t.Fatalf("write tampered hook: %v", err)
+	}
+
+	// Wait for the watcher to detect the change and report a violation.
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("timed out waiting for hook violation from watcher")
+		default:
+		}
+		if viol := reporter.get(); len(viol) > 0 {
+			found := false
+			for _, v := range viol {
+				if v.Type == "hook" && v.Path == hookPath {
+					found = true
+					break
+				}
+			}
+			if found {
+				cancel()
+				<-done
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestVerifier_VerifyHooksDir_NoViolation(t *testing.T) {
+	dir := t.TempDir()
+	hooksDir := filepath.Join(dir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	binaryPath := writeTempFile(t, dir, "plexd", "binary-content")
+	hookContent := "#!/bin/sh\necho hello"
+	writeTempFile(t, hooksDir, "hook.sh", hookContent)
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	// Store matching baseline.
+	hookPath := filepath.Join(hooksDir, "hook.sh")
+	if err := store.Set(hookPath, sha256Hex(hookContent)); err != nil {
+		t.Fatalf("store set: %v", err)
+	}
+
+	reporter := &mockReporter{}
+	v := NewVerifier(Config{
+		Enabled:        true,
+		BinaryPath:     binaryPath,
+		HooksDir:       hooksDir,
+		VerifyInterval: DefaultVerifyInterval,
+	}, store, reporter, slog.Default())
+
+	v.VerifyHooksDir(context.Background(), "node-1")
+
+	if viol := reporter.get(); len(viol) != 0 {
+		t.Errorf("unexpected violations: %v", viol)
+	}
+}
+
+func TestVerifier_VerifyHooksDir_DetectsViolation(t *testing.T) {
+	dir := t.TempDir()
+	hooksDir := filepath.Join(dir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	binaryPath := writeTempFile(t, dir, "plexd", "binary-content")
+	writeTempFile(t, hooksDir, "hook.sh", "#!/bin/sh\necho tampered")
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	// Store a different baseline.
+	hookPath := filepath.Join(hooksDir, "hook.sh")
+	if err := store.Set(hookPath, sha256Hex("#!/bin/sh\necho original")); err != nil {
+		t.Fatalf("store set: %v", err)
+	}
+
+	reporter := &mockReporter{}
+	v := NewVerifier(Config{
+		Enabled:        true,
+		BinaryPath:     binaryPath,
+		HooksDir:       hooksDir,
+		VerifyInterval: DefaultVerifyInterval,
+	}, store, reporter, slog.Default())
+
+	v.VerifyHooksDir(context.Background(), "node-1")
+
+	viol := reporter.get()
+	if len(viol) != 1 {
+		t.Fatalf("got %d violations, want 1", len(viol))
+	}
+	if viol[0].Type != "hook" {
+		t.Errorf("violation type = %q, want %q", viol[0].Type, "hook")
+	}
+	if viol[0].Path != hookPath {
+		t.Errorf("violation path = %q, want %q", viol[0].Path, hookPath)
+	}
+}
+
 func TestVerifier_PeriodicRun_ContextCancellation(t *testing.T) {
 	dir := t.TempDir()
 	binaryContent := "binary-cancel-test"

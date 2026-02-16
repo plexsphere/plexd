@@ -131,16 +131,16 @@ echo "=== Creating plexd E2E configmap (REQ-004) ==="
 kubectl -n "${NAMESPACE}" create configmap plexd-config \
     --from-literal=config.yaml="$(cat <<'CONFIGEOF'
 api:
-  baseurl: http://mock-api.plexd-e2e:8080
+  base_url: http://mock-api.plexd-e2e:8080
 
 registration:
-  datadir: /var/lib/plexd
+  data_dir: /var/lib/plexd
 
 node_api:
-  datadir: /var/lib/plexd
+  data_dir: /var/lib/plexd
 
 heartbeat:
-  nodeid: e2e-k8s-node
+  node_id: e2e-k8s-node
 CONFIGEOF
 )"
 

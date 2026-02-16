@@ -187,16 +187,16 @@ docker exec "${SYSTEMD_CONTAINER}" bash -c \
 # Write plexd config pointing at mock-api (REQ-004).
 docker exec "${SYSTEMD_CONTAINER}" bash -c "cat > /etc/plexd/config.yaml <<EOF
 api:
-  baseurl: http://${MOCKAPI_CONTAINER}:8080
+  base_url: http://${MOCKAPI_CONTAINER}:8080
 
 registration:
-  datadir: /var/lib/plexd
+  data_dir: /var/lib/plexd
 
 node_api:
-  datadir: /var/lib/plexd
+  data_dir: /var/lib/plexd
 
 heartbeat:
-  nodeid: e2e-systemd-node
+  node_id: e2e-systemd-node
 EOF"
 
 # Write environment file with bootstrap token.

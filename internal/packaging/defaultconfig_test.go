@@ -8,8 +8,8 @@ import (
 func TestGenerateDefaultConfig_WithAPIURL(t *testing.T) {
 	output := GenerateDefaultConfig("https://api.example.com")
 
-	if !strings.Contains(output, "api_url: https://api.example.com") {
-		t.Errorf("output missing api_url, got:\n%s", output)
+	if !strings.Contains(output, "api:\n  base_url: https://api.example.com") {
+		t.Errorf("output missing api.base_url, got:\n%s", output)
 	}
 	if !strings.Contains(output, "data_dir: /var/lib/plexd") {
 		t.Error("output missing data_dir")
@@ -17,22 +17,25 @@ func TestGenerateDefaultConfig_WithAPIURL(t *testing.T) {
 	if !strings.Contains(output, "log_level: info") {
 		t.Error("output missing log_level")
 	}
-	if !strings.Contains(output, "token_file: /etc/plexd/bootstrap-token") {
-		t.Error("output missing token_file")
+	if !strings.Contains(output, "registration:\n  token_file: /etc/plexd/bootstrap-token") {
+		t.Errorf("output missing registration.token_file, got:\n%s", output)
 	}
 }
 
 func TestGenerateDefaultConfig_WithoutAPIURL(t *testing.T) {
 	output := GenerateDefaultConfig("")
 
-	if !strings.Contains(output, "# api_url:") {
-		t.Errorf("output missing commented api_url placeholder, got:\n%s", output)
+	if !strings.Contains(output, "# api:") {
+		t.Errorf("output missing commented api placeholder, got:\n%s", output)
 	}
-	// Should NOT contain an uncommented api_url line
+	if !strings.Contains(output, "#   base_url:") {
+		t.Errorf("output missing commented base_url placeholder, got:\n%s", output)
+	}
+	// Should NOT contain an uncommented api: section
 	for _, line := range strings.Split(output, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "api_url:") {
-			t.Errorf("output contains uncommented api_url line: %q", line)
+		if trimmed == "api:" {
+			t.Errorf("output contains uncommented api: line: %q", line)
 		}
 	}
 	if !strings.Contains(output, "data_dir: /var/lib/plexd") {
@@ -44,15 +47,15 @@ func TestGenerateDefaultConfig_WithoutAPIURL(t *testing.T) {
 }
 
 func TestGenerateDefaultConfig_YAMLValidity(t *testing.T) {
-	// Verify basic YAML structure: all non-comment, non-empty lines have key: value format
+	// Verify basic YAML structure: all non-comment, non-empty lines have key: value or key:\n format
 	output := GenerateDefaultConfig("https://api.example.com")
 	for _, line := range strings.Split(output, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		if !strings.Contains(trimmed, ": ") {
-			t.Errorf("non-comment line missing key-value format: %q", trimmed)
+		if !strings.Contains(trimmed, ":") {
+			t.Errorf("non-comment line missing key format: %q", trimmed)
 		}
 	}
 }

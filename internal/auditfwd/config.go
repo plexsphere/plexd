@@ -19,19 +19,19 @@ const DefaultBatchSize = 500
 type Config struct {
 	// Enabled controls whether audit forwarding is active.
 	// Default: true (set by ApplyDefaults).
-	Enabled bool
+	Enabled bool `yaml:"enabled"`
 
 	// CollectInterval is the interval between collection cycles.
 	// Must be at least 1s.
-	CollectInterval time.Duration
+	CollectInterval time.Duration `yaml:"collect_interval"`
 
 	// ReportInterval is the interval between reporting to the control plane.
 	// Must be >= CollectInterval.
-	ReportInterval time.Duration
+	ReportInterval time.Duration `yaml:"report_interval"`
 
 	// BatchSize is the maximum number of audit entries per report batch.
 	// Must be at least 1. Default: 500.
-	BatchSize int
+	BatchSize int `yaml:"batch_size"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.

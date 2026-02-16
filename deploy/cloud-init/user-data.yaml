@@ -22,12 +22,14 @@ write_files:
   - path: /etc/plexd/config.yaml
     permissions: "0600"
     content: |
-      api_url: "${PLEXD_API_URL}"
+      api:
+        base_url: "${PLEXD_API_URL}"
       data_dir: /var/lib/plexd
-      use_metadata: true
-      metadata_token_path: /plexd/bootstrap-token
-      metadata_timeout: 2s
-      hostname: "${PLEXD_HOSTNAME}"
+      registration:
+        use_metadata: true
+        metadata_token_path: /plexd/bootstrap-token
+        metadata_timeout: 2s
+        hostname: "${PLEXD_HOSTNAME}"
       log_level: "${PLEXD_LOG_LEVEL}"
 
   - path: /etc/plexd/bootstrap-token

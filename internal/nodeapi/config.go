@@ -10,35 +10,35 @@ import (
 type Config struct {
 	// SocketPath is the path to the Unix domain socket.
 	// Default: /var/run/plexd/api.sock
-	SocketPath string
+	SocketPath string `yaml:"socket_path"`
 
 	// HTTPEnabled enables the optional HTTP listener.
 	// Default: false
-	HTTPEnabled bool
+	HTTPEnabled bool `yaml:"http_enabled"`
 
 	// HTTPListen is the HTTP listen address.
 	// Default: 127.0.0.1:9100
-	HTTPListen string
+	HTTPListen string `yaml:"http_listen"`
 
 	// HTTPTokenFile is the path to the HTTP bearer token file.
-	HTTPTokenFile string
+	HTTPTokenFile string `yaml:"http_token_file"`
 
 	// DebouncePeriod is the debounce period for coalescing events.
 	// Default: 5s
-	DebouncePeriod time.Duration
+	DebouncePeriod time.Duration `yaml:"debounce_period"`
 
 	// ShutdownTimeout is the maximum time to wait for a graceful shutdown.
 	// Default: 5s
-	ShutdownTimeout time.Duration
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 
 	// DataDir is the path to the data directory (required).
-	DataDir string
+	DataDir string `yaml:"data_dir"`
 
 	// SecretAuthEnabled enables SO_PEERCRED-based authentication for
 	// /v1/state/secrets/* routes on the Unix socket. When enabled, only
 	// root (UID 0) or plexd-secrets group members may access secrets.
 	// Default: false (enabled by cmd/plexd/cmd/up.go in production).
-	SecretAuthEnabled bool
+	SecretAuthEnabled bool `yaml:"secret_auth_enabled"`
 }
 
 // DefaultSocketPath is the default Unix domain socket path.

@@ -3,9 +3,19 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 )
+
+// envOrDefault returns the value of the environment variable named by key,
+// or defaultVal if the variable is not set or empty.
+func envOrDefault(key, defaultVal string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return defaultVal
+}
 
 var (
 	cfgFile  string
@@ -40,10 +50,10 @@ var rootCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "/etc/plexd/config.yaml", "config file path")
-	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
-	rootCmd.PersistentFlags().StringVar(&apiURL, "api", "", "control plane API URL (overrides config)")
-	rootCmd.PersistentFlags().StringVar(&mode, "mode", "", "operating mode: node or bridge (overrides config)")
+	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", envOrDefault("PLEXD_CONFIG", "/etc/plexd/config.yaml"), "config file path")
+	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", envOrDefault("PLEXD_LOG_LEVEL", "info"), "log level (debug, info, warn, error)")
+	rootCmd.PersistentFlags().StringVar(&apiURL, "api", os.Getenv("PLEXD_API"), "control plane API URL (overrides config)")
+	rootCmd.PersistentFlags().StringVar(&mode, "mode", envOrDefault("PLEXD_MODE", ""), "operating mode: node or bridge (overrides config)")
 
 	rootCmd.Version = buildVersion
 	rootCmd.SetVersionTemplate(fmt.Sprintf("plexd version {{.Version}}\ncommit: %s\nbuilt: %s\n", buildCommit, buildDate))

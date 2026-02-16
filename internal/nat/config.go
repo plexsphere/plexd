@@ -22,18 +22,18 @@ var DefaultSTUNServers = []string{
 type Config struct {
 	// Enabled controls whether NAT traversal is active.
 	// Default: true (set by ApplyDefaults).
-	Enabled bool
+	Enabled bool `yaml:"enabled"`
 
 	// STUNServers is the list of STUN server addresses (host:port).
-	STUNServers []string
+	STUNServers []string `yaml:"stun_servers"`
 
 	// RefreshInterval is the interval between STUN binding refreshes.
 	// Must be at least 10s.
-	RefreshInterval time.Duration
+	RefreshInterval time.Duration `yaml:"refresh_interval"`
 
 	// Timeout is the per-server STUN request timeout.
 	// Must be positive.
-	Timeout time.Duration
+	Timeout time.Duration `yaml:"timeout"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.
