@@ -1,0 +1,36 @@
+services:
+  mock-api:
+    build:
+      context: ../..
+      dockerfile: test/e2e/mockapi/Dockerfile
+    ports:
+      - "18080:8080"
+    healthcheck:
+      test: ["/usr/local/bin/wget", "--spider", "-q", "http://localhost:8080/v1/ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
+    networks:
+      - e2e-net
+
+  plexd:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    command: ["up", "--api", "http://mock-api:8080", "--config", "/etc/plexd/config.yaml"]
+    environment:
+      PLEXD_BOOTSTRAP_TOKEN: e2e-test-token
+    volumes:
+      - ./docker/plexd-e2e.yaml:/etc/plexd/config.yaml:ro
+    tmpfs:
+      - /var/lib/plexd
+    depends_on:
+      mock-api:
+        condition: service_healthy
+    networks:
+      - e2e-net
+
+networks:
+  e2e-net:
+    driver: bridge
