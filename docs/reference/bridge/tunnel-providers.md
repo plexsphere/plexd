@@ -160,7 +160,7 @@ Returns `"ipsec"`.
 ### CreateTunnel
 
 1. Rejects duplicate tunnel IDs (`bridge: ipsec: tunnel "..." already exists`)
-2. Generates swanctl config file at `/tmp/plexd-ipsec-{id}.conf` (PSK auth, `local_ts`/`remote_ts` from subnets)
+2. Generates swanctl config file at `/run/plexd/tunnels/plexd-ipsec-{id}.conf` (PSK auth, `local_ts`/`remote_ts` from subnets)
 3. Runs `swanctl --load-conns --file {confPath}` to load the connection configuration
 4. Runs `swanctl --initiate --child {id}` to establish the tunnel
 5. Adds routes for each remote subnet via `RouteController.AddRoute` with interface name `ipsec-{id}`
@@ -179,7 +179,7 @@ Idempotent. For a non-existent tunnel, returns `nil`.
 
 1. Terminates the connection via `swanctl --terminate --child {id}`
 2. Removes routes for each remote subnet via `RouteController.RemoveRoute`
-3. Removes the config file at `/tmp/plexd-ipsec-{id}.conf`
+3. Removes the config file at `/run/plexd/tunnels/plexd-ipsec-{id}.conf`
 4. Deletes the tunnel from the internal map
 
 Errors during removal are logged but do not prevent cleanup of remaining resources.
@@ -239,7 +239,7 @@ Returns `"openvpn"`.
 ### CreateTunnel
 
 1. Rejects duplicate tunnel IDs (`bridge: openvpn: tunnel "..." already exists`)
-2. Generates OpenVPN config at `/tmp/plexd-openvpn-{id}.conf` (client mode, static key inline)
+2. Generates OpenVPN config at `/run/plexd/tunnels/plexd-openvpn-{id}.conf` (client mode, static key inline)
 3. Starts the OpenVPN process via `exec.Start("openvpn", "--config", confPath)` (long-running, returns `CommandHandle`)
 4. Adds routes for each remote subnet via `RouteController.AddRoute` with interface name `tun-{id}`
 5. Tracks the tunnel (including `CommandHandle`) in the internal map
@@ -256,7 +256,7 @@ Idempotent. For a non-existent tunnel, returns `nil`.
 
 1. Stops the OpenVPN process via `handle.Stop()`
 2. Removes routes for each remote subnet via `RouteController.RemoveRoute`
-3. Removes the config file at `/tmp/plexd-openvpn-{id}.conf`
+3. Removes the config file at `/run/plexd/tunnels/plexd-openvpn-{id}.conf`
 4. Deletes the tunnel from the internal map
 
 Errors during removal are logged but do not prevent cleanup of remaining resources.

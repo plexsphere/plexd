@@ -19,10 +19,11 @@ The `Manager` runs two independent ticker loops in a single goroutine: one for c
 | `Enabled`         | `bool`          | `true`  | Whether metrics collection is active                 |
 | `CollectInterval` | `time.Duration` | `15s`   | Interval between collection cycles (min 5s)          |
 | `ReportInterval`  | `time.Duration` | `60s`   | Interval between reporting to control plane (min 10s)|
+| `BatchSize`       | `int`           | `100`   | Max metric points per report batch (must be > 0)     |
 
 ```go
 cfg := metrics.Config{}
-cfg.ApplyDefaults() // Enabled=true, CollectInterval=15s, ReportInterval=60s
+cfg.ApplyDefaults() // Enabled=true, CollectInterval=15s, ReportInterval=60s, BatchSize=100
 if err := cfg.Validate(); err != nil {
     log.Fatal(err)
 }
@@ -37,6 +38,7 @@ if err := cfg.Validate(); err != nil {
 | `CollectInterval` | >= 5s                        | `metrics: config: CollectInterval must be at least 5s`     |
 | `ReportInterval`  | >= 10s                       | `metrics: config: ReportInterval must be at least 10s`     |
 | `ReportInterval`  | >= `CollectInterval`         | `metrics: config: ReportInterval must be >= CollectInterval`|
+| `BatchSize`       | > 0                          | `metrics: config: BatchSize must be > 0`                   |
 
 When `Enabled=false`, validation is skipped entirely.
 

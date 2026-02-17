@@ -173,7 +173,7 @@ Comparison logic by category:
 | Peers        | `Peer.ID`     | Yes               | Endpoint, PublicKey, MeshIP, AllowedIPs, PSK   |
 | Policies     | `Policy.ID`   | Yes               | —                                               |
 | SigningKeys  | —             | nil ↔ non-nil     | Current or Previous string changed              |
-| Metadata     | map key       | —                 | `reflect.DeepEqual` on full map                 |
+| Metadata     | map key       | —                 | `maps.Equal` on full map                        |
 | Data         | `DataEntry.Key`| Yes              | Version changed                                 |
 | SecretRefs   | `SecretRef.Key`| Yes              | Version changed                                 |
 

@@ -58,8 +58,9 @@ The `Ed25519Verifier.Verify()` method performs these checks in order:
 2. **Nonce present** — envelope must have a non-empty `nonce` field
 3. **Timestamp present** — `issued_at` must be non-zero
 4. **Staleness check** — `time.Since(issued_at)` must be within 5 minutes (`DefaultStalenessWindow`)
-5. **Nonce uniqueness** — nonce must not have been seen before (replay protection)
+5. **Future timestamp check** — `issued_at` must not be more than `DefaultStalenessWindow` in the future
 6. **Ed25519 signature** — `ed25519.Verify(publicKey, canonicalJSON, signatureBytes)` must return true
+7. **Nonce uniqueness** — nonce must not have been seen before (replay protection; recorded only after signature verification to prevent nonce exhaustion via forged envelopes)
 
 If any check fails, the event is rejected with a descriptive error.
 

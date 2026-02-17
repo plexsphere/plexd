@@ -313,14 +313,14 @@ volumes), an optional TCP listener can be enabled.
 
 ### Enable TCP in the plexd configuration
 
-Set `HTTPEnabled` to `true` in the node API configuration. The default listen
+Set `http_enabled` to `true` in the node API configuration. The default listen
 address is `127.0.0.1:9100`.
 
-| Field           | Default             | Description                         |
-|-----------------|---------------------|-------------------------------------|
-| `HTTPEnabled`   | `false`             | Enable the TCP listener             |
-| `HTTPListen`    | `127.0.0.1:9100`   | TCP listen address                  |
-| `HTTPTokenFile` | (none)              | Path to file containing the bearer token |
+| Field            | Default             | Description                         |
+|------------------|---------------------|-------------------------------------|
+| `http_enabled`   | `false`             | Enable the TCP listener             |
+| `http_listen`    | `127.0.0.1:9100`   | TCP listen address                  |
+| `http_token_file`| (none)              | Path to file containing the bearer token |
 
 ### Create a token file
 

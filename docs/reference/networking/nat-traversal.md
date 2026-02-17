@@ -31,7 +31,7 @@ if err := cfg.Validate(); err != nil {
 }
 ```
 
-`ApplyDefaults` always sets `Enabled=true`. To disable NAT traversal, set `Enabled=false` after calling `ApplyDefaults`.
+`ApplyDefaults` sets `Enabled=true` on a zero-valued Config (when `STUNServers == nil && RefreshInterval == 0 && Timeout == 0`). If any field is already set, `Enabled` is left as-is. To disable NAT traversal, set `Enabled=false` after calling `ApplyDefaults`.
 
 ### Validation Rules
 

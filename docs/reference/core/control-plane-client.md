@@ -78,6 +78,9 @@ All methods accept a `context.Context` for cancellation and return typed respons
 | `ReportLogs`          | `POST`          | `/v1/nodes/{node_id}/logs`                        | `LogBatch`           | —                     |
 | `ReportAudit`         | `POST`          | `/v1/nodes/{node_id}/audit`                       | `AuditBatch`         | —                     |
 | `FetchArtifact`       | `GET`           | `/v1/artifacts/plexd/{version}/{os}/{arch}`        | —                    | `io.ReadCloser`       |
+| `TunnelReady`         | `POST`          | `/v1/nodes/{node_id}/tunnels/{session_id}/ready`   | `TunnelReadyRequest` | —                     |
+| `TunnelClosed`        | `POST`          | `/v1/nodes/{node_id}/tunnels/{session_id}/closed`  | `TunnelClosedRequest`| —                     |
+| `ReportIntegrityViolation` | `POST`     | `/v1/nodes/{node_id}/integrity/violations`         | `IntegrityViolationReport` | —              |
 
 ### Generic Helpers
 
@@ -178,22 +181,34 @@ Routes verified events to registered handlers by `event_type`.
 
 ## Event Type Constants
 
-All 12 SSE event types from the control plane:
+All 21 SSE event types from the control plane:
 
-| Constant                    | Value                     |
-|-----------------------------|---------------------------|
-| `EventPeerAdded`            | `peer_added`              |
-| `EventPeerRemoved`          | `peer_removed`            |
-| `EventPeerKeyRotated`       | `peer_key_rotated`        |
-| `EventPeerEndpointChanged`  | `peer_endpoint_changed`   |
-| `EventPolicyUpdated`        | `policy_updated`          |
-| `EventActionRequest`        | `action_request`          |
-| `EventSessionRevoked`       | `session_revoked`         |
-| `EventSSHSessionSetup`      | `ssh_session_setup`       |
-| `EventRotateKeys`           | `rotate_keys`             |
-| `EventSigningKeyRotated`    | `signing_key_rotated`     |
-| `EventNodeStateUpdated`     | `node_state_updated`      |
-| `EventNodeSecretsUpdated`   | `node_secrets_updated`    |
+| Constant                         | Value                          |
+|----------------------------------|--------------------------------|
+| `EventPeerAdded`                 | `peer_added`                   |
+| `EventPeerRemoved`               | `peer_removed`                 |
+| `EventPeerKeyRotated`            | `peer_key_rotated`             |
+| `EventPeerEndpointChanged`       | `peer_endpoint_changed`        |
+| `EventPolicyUpdated`             | `policy_updated`               |
+| `EventActionRequest`             | `action_request`               |
+| `EventSessionRevoked`            | `session_revoked`              |
+| `EventSSHSessionSetup`           | `ssh_session_setup`            |
+| `EventRotateKeys`                | `rotate_keys`                  |
+| `EventSigningKeyRotated`         | `signing_key_rotated`          |
+| `EventNodeStateUpdated`          | `node_state_updated`           |
+| `EventNodeSecretsUpdated`        | `node_secrets_updated`         |
+| `EventBridgeConfigUpdated`       | `bridge_config_updated`        |
+| `EventRelaySessionAssigned`      | `relay_session_assigned`       |
+| `EventRelaySessionRevoked`       | `relay_session_revoked`        |
+| `EventUserAccessConfigUpdated`   | `user_access_config_updated`   |
+| `EventUserAccessPeerAssigned`    | `user_access_peer_assigned`    |
+| `EventUserAccessPeerRevoked`     | `user_access_peer_revoked`     |
+| `EventIngressConfigUpdated`      | `ingress_config_updated`       |
+| `EventIngressRuleAssigned`       | `ingress_rule_assigned`        |
+| `EventIngressRuleRevoked`        | `ingress_rule_revoked`         |
+| `EventSiteToSiteConfigUpdated`   | `site_to_site_config_updated`  |
+| `EventSiteToSiteTunnelAssigned`  | `site_to_site_tunnel_assigned` |
+| `EventSiteToSiteTunnelRevoked`   | `site_to_site_tunnel_revoked`  |
 
 ## ReconnectEngine
 

@@ -20,6 +20,7 @@ The `internal/nodeapi` package exposes node state to local consumers (sidecar ag
 | `HTTPTokenFile`   | `string`        | —                          | Path to file containing HTTP bearer token    |
 | `DebouncePeriod`  | `time.Duration` | `5s`                       | Debounce period for report sync coalescing   |
 | `ShutdownTimeout` | `time.Duration` | `5s`                       | Maximum time to wait for graceful shutdown   |
+| `SecretAuthEnabled`| `bool`         | `false`                    | SO_PEERCRED-based auth for secret routes     |
 | `DataDir`         | `string`        | —                          | Data directory for cache persistence (required) |
 
 ```go

@@ -111,7 +111,7 @@ Central coordinator for public ingress lifecycle. Concurrent-safe via `sync.Mute
 ### Constructor
 
 ```go
-func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger) *IngressManager
+func NewIngressManager(ctrl IngressController, cfg Config, logger *slog.Logger, acme *ACMEManager) *IngressManager
 ```
 
 ### Methods
@@ -208,7 +208,8 @@ Each accepted connection spawns a `proxyConnection` goroutine:
 | Mode          | Behavior                                                                           |
 |---------------|------------------------------------------------------------------------------------|
 | `passthrough` | Raw TCP bytes forwarded without decryption; no certificates required               |
-| `terminate`   | Bridge performs TLS handshake with `tls.Config`; plaintext forwarded to target     |
+| `terminate`   | Bridge performs TLS handshake with static `tls.Config`; plaintext forwarded to target |
+| `acme`        | Automatic certificate via ACME (Let's Encrypt); requires `Hostname` on the rule   |
 
 TLS terminate mode enforces minimum TLS 1.2 via `tls.Config.MinVersion`.
 
@@ -305,6 +306,7 @@ type IngressRule struct {
     Mode       string `json:"mode"`
     CertPEM    string `json:"cert_pem,omitempty"`
     KeyPEM     string `json:"key_pem,omitempty"`
+    Hostname   string `json:"hostname,omitempty"`
 }
 ```
 
@@ -313,9 +315,10 @@ type IngressRule struct {
 | `RuleID`     | Unique identifier for the rule                                          |
 | `ListenPort` | Public TCP port to listen on                                            |
 | `TargetAddr` | Mesh peer address to proxy traffic to (host:port)                       |
-| `Mode`       | TLS mode: `passthrough` (raw TCP) or `terminate` (TLS at bridge)        |
-| `CertPEM`    | PEM-encoded certificate for terminate mode (optional for passthrough)   |
-| `KeyPEM`     | PEM-encoded private key for terminate mode (optional for passthrough)   |
+| `Mode`       | TLS mode: `passthrough` (raw TCP), `terminate` (static cert), or `acme` (automatic cert) |
+| `CertPEM`    | PEM-encoded certificate for terminate mode (optional for passthrough/acme) |
+| `KeyPEM`     | PEM-encoded private key for terminate mode (optional for passthrough/acme) |
+| `Hostname`   | Hostname for ACME mode certificate provisioning (optional for other modes) |
 
 ### IngressInfo
 
@@ -326,6 +329,7 @@ type IngressInfo struct {
     Enabled         bool `json:"enabled"`
     RuleCount       int  `json:"rule_count"`
     ConnectionCount int  `json:"connection_count"`
+    ACMEEnabled     bool `json:"acme_enabled"`
 }
 ```
 

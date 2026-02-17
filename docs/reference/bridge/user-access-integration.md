@@ -115,7 +115,7 @@ Central coordinator for user access lifecycle. Concurrent-safe via `sync.Mutex` 
 ### Constructor
 
 ```go
-func NewUserAccessManager(ctrl AccessController, routes RouteController, cfg Config, logger *slog.Logger) *UserAccessManager
+func NewUserAccessManager(ctrl AccessController, routes RouteController, cfg Config, logger *slog.Logger, provider UserAccessProvider) *UserAccessManager
 ```
 
 ### Methods

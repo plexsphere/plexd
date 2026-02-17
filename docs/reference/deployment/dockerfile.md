@@ -99,6 +99,7 @@ The container runs as non-root user `65534:65534` (nobody). This can be overridd
 | `/usr/local/bin/plexd` | Statically compiled plexd binary |
 | `/var/lib/plexd` | Persistent data (state cache, node state) |
 | `/var/run/plexd` | Runtime files (Unix socket, PID) |
+| `/var/log/plexd` | Log files (startup log) |
 | `/etc/plexd` | Configuration files |
 
 All directories are created during the build with ownership set to `65534:65534`. In Kubernetes, these paths are typically backed by volume mounts (see `deploy/kubernetes/daemonset.yaml`).

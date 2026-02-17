@@ -78,12 +78,13 @@ Startup
 | `BinaryPath`     | `string`        | —       | Path to the plexd binary to verify       |
 | `HooksDir`       | `string`        | —       | Directory containing hook scripts        |
 | `VerifyInterval` | `time.Duration` | `5m`    | Interval between periodic re-checks      |
+| `WatchEnabled`   | `bool`          | `true`  | Enable inotify file watching on HooksDir |
 
 ```go
 cfg := integrity.Config{
     BinaryPath: "/usr/local/bin/plexd",
 }
-cfg.ApplyDefaults() // Enabled=true, VerifyInterval=5m
+cfg.ApplyDefaults() // Enabled=true, WatchEnabled=true, VerifyInterval=5m
 if err := cfg.Validate(); err != nil {
     log.Fatal(err)
 }

@@ -33,14 +33,17 @@ The heartbeat request is built by an optional `buildRequest` function. If not se
 
 ```go
 type HeartbeatRequest struct {
-    NodeID         string     `json:"node_id"`
-    Timestamp      time.Time  `json:"timestamp"`
-    Status         string     `json:"status"`
-    Uptime         int64      `json:"uptime"`
-    BinaryChecksum string     `json:"binary_checksum"`
-    MeshInfo       *MeshInfo  `json:"mesh_info,omitempty"`
-    NATInfo        *NATInfo   `json:"nat_info,omitempty"`
-    BridgeInfo     *BridgeInfo `json:"bridge_info,omitempty"`
+    NodeID         string          `json:"node_id"`
+    Timestamp      time.Time       `json:"timestamp"`
+    Status         string          `json:"status"`
+    Uptime         string          `json:"uptime"`
+    BinaryChecksum string          `json:"binary_checksum"`
+    Mesh           *MeshInfo       `json:"mesh,omitempty"`
+    NAT            *NATInfo        `json:"nat,omitempty"`
+    Bridge         *BridgeInfo     `json:"bridge,omitempty"`
+    UserAccess     *UserAccessInfo `json:"user_access,omitempty"`
+    Ingress        *IngressInfo    `json:"ingress,omitempty"`
+    SiteToSite     *SiteToSiteInfo `json:"site_to_site,omitempty"`
 }
 ```
 

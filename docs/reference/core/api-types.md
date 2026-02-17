@@ -56,8 +56,12 @@ All request/response types for the 17 control plane API endpoints, organized by 
 | `Status`         | `string`    | `"status"`            | Node status                    |
 | `Uptime`         | `string`    | `"uptime"`            | Node uptime                    |
 | `BinaryChecksum` | `string`    | `"binary_checksum"`   | Running binary checksum        |
-| `Mesh`           | `*MeshInfo` | `"mesh,omitempty"`    | Optional mesh status           |
-| `NAT`            | `*NATInfo`  | `"nat,omitempty"`     | Optional NAT information       |
+| `Mesh`           | `*MeshInfo`       | `"mesh,omitempty"`         | Optional mesh status           |
+| `NAT`            | `*NATInfo`        | `"nat,omitempty"`          | Optional NAT information       |
+| `Bridge`         | `*BridgeInfo`     | `"bridge,omitempty"`       | Optional bridge status         |
+| `UserAccess`     | `*UserAccessInfo` | `"user_access,omitempty"`  | Optional user access status    |
+| `Ingress`        | `*IngressInfo`    | `"ingress,omitempty"`      | Optional ingress status        |
+| `SiteToSite`     | `*SiteToSiteInfo` | `"site_to_site,omitempty"` | Optional site-to-site status   |
 
 **MeshInfo**
 
@@ -93,6 +97,11 @@ All request/response types for the 17 control plane API endpoints, organized by 
 | `Policies`   | `[]Policy`          | `"policies"`              | Network policies         |
 | `SigningKeys` | `*SigningKeys`     | `"signing_keys,omitempty"`| Signing key material     |
 | `Metadata`   | `map[string]string` | `"metadata,omitempty"`    | Node metadata            |
+| `BridgeConfig`     | `*BridgeConfig`     | `"bridge_config,omitempty"`      | Bridge configuration           |
+| `RelayConfig`      | `*RelayConfig`      | `"relay_config,omitempty"`       | Relay configuration            |
+| `UserAccessConfig` | `*UserAccessConfig` | `"user_access_config,omitempty"` | User access configuration      |
+| `IngressConfig`    | `*IngressConfig`    | `"ingress_config,omitempty"`     | Ingress configuration          |
+| `SiteToSiteConfig` | `*SiteToSiteConfig` | `"site_to_site_config,omitempty"`| Site-to-site VPN configuration |
 | `Data`       | `[]DataEntry`       | `"data"`                  | Arbitrary data entries   |
 | `SecretRefs` | `[]SecretRef`       | `"secret_refs"`           | Secret references        |
 
@@ -402,3 +411,15 @@ Returns `text/event-stream` with signed event envelopes.
 | `EventSigningKeyRotated`    | `signing_key_rotated`     | Signing key rotated            |
 | `EventNodeStateUpdated`     | `node_state_updated`      | Node state changed             |
 | `EventNodeSecretsUpdated`   | `node_secrets_updated`    | Node secrets changed           |
+| `EventBridgeConfigUpdated`  | `bridge_config_updated`   | Bridge configuration changed   |
+| `EventRelaySessionAssigned` | `relay_session_assigned`  | Relay session assigned         |
+| `EventRelaySessionRevoked`  | `relay_session_revoked`   | Relay session revoked          |
+| `EventUserAccessConfigUpdated` | `user_access_config_updated` | User access config changed |
+| `EventUserAccessPeerAssigned`  | `user_access_peer_assigned`  | User access peer assigned  |
+| `EventUserAccessPeerRevoked`   | `user_access_peer_revoked`   | User access peer revoked   |
+| `EventIngressConfigUpdated`    | `ingress_config_updated`     | Ingress config changed     |
+| `EventIngressRuleAssigned`     | `ingress_rule_assigned`      | Ingress rule assigned      |
+| `EventIngressRuleRevoked`      | `ingress_rule_revoked`       | Ingress rule revoked       |
+| `EventSiteToSiteConfigUpdated`   | `site_to_site_config_updated`   | Site-to-site config changed   |
+| `EventSiteToSiteTunnelAssigned`  | `site_to_site_tunnel_assigned`  | Site-to-site tunnel assigned  |
+| `EventSiteToSiteTunnelRevoked`   | `site_to_site_tunnel_revoked`   | Site-to-site tunnel revoked   |

@@ -20,7 +20,7 @@ The `internal/registration` package handles node self-registration and bootstrap
 | `TokenValue`       | `string`            | —                              | Direct token value override                |
 | `UseMetadata`      | `bool`              | `false`                        | Enable cloud metadata token source         |
 | `MetadataTokenPath`| `string`            | `/plexd/bootstrap-token`       | Metadata key path for bootstrap token      |
-| `MetadataTimeout`  | `time.Duration`     | `5s`                           | Timeout for metadata service requests      |
+| `MetadataTimeout`  | `time.Duration`     | `2s`                           | Timeout for metadata service requests      |
 | `Hostname`         | `string`            | —                              | Hostname override (default: `os.Hostname`)|
 | `Metadata`         | `map[string]string` | —                              | Optional metadata for registration request |
 | `MaxRetryDuration` | `time.Duration`     | `5m`                           | Maximum retry duration for transient errors|

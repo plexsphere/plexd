@@ -63,6 +63,8 @@ Control Plane
 | `Enabled`        | `bool`          | `true`  | Whether tunneling is active                    |
 | `MaxSessions`    | `int`           | `10`    | Maximum concurrent tunnel sessions             |
 | `DefaultTimeout` | `time.Duration` | `30m`   | Default/maximum session timeout                |
+| `SSHListenAddr`  | `string`        | —       | SSH mesh server listen address (empty = no SSH server) |
+| `HostKeyDir`     | `string`        | —       | Directory for SSH host key (empty = transient key)     |
 
 ```go
 cfg := tunnel.Config{
@@ -146,7 +148,7 @@ func NewSessionManager(cfg Config, meshIP string, logger *slog.Logger) *SessionM
 | Method         | Signature                                                        | Description                                              |
 |----------------|------------------------------------------------------------------|----------------------------------------------------------|
 | `CreateSession`| `(ctx context.Context, setup api.SSHSessionSetup) (string, error)` | Validates, creates, and starts a tunnel session          |
-| `CloseSession` | `(sessionID string, reason string)`                              | Closes and removes a session by ID                       |
+| `CloseSession` | `(sessionID string, reason string) *ClosedSessionInfo`           | Closes and removes a session by ID; returns session info |
 | `Shutdown`     | `()`                                                             | Closes all active sessions                               |
 | `ActiveCount`  | `() int`                                                         | Returns number of active sessions                        |
 

@@ -66,7 +66,7 @@ This creates:
 - `plexd` ServiceAccount in `plexd-system`
 - `plexd` ClusterRole with permissions for CRD management, Secrets, and TokenReview
 - `plexd` ClusterRoleBinding
-- Consumer roles: `plexd-state-reader`, `plexd-state-reporter`, `plexd-secrets-reader`
+- Consumer roles: `plexd-state-reader`, `plexd-state-reporter`, `plexd-secrets-reader`, `plexd-hook-reader`
 
 Verify:
 
@@ -170,7 +170,7 @@ Or using the short name:
 kubectl get pns -n plexd-system
 ```
 
-Expected output shows each node's ID, mesh IP, status, and peer count.
+Expected output shows each node's ID, mesh IP, and age.
 
 ### View logs
 

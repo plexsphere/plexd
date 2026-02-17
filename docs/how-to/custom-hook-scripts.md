@@ -17,9 +17,8 @@ For the full reference of types and internals, see
 
 1. **plexd is running** on the node with actions enabled (default).
 
-2. **Hooks directory** is configured. The default is empty (no hooks directory).
-   Set `HooksDir` in the actions configuration to a directory path, e.g.
-   `/etc/plexd/hooks`.
+2. **Hooks directory** is configured. The default is `/etc/plexd/hooks`.
+   Set `hooks_dir` in the actions configuration to override.
 
 3. **Shell access** to the node for deploying the script (or a deployment
    pipeline that places files in the hooks directory).
@@ -137,21 +136,20 @@ ls -la /etc/plexd/hooks/
 > **Note**: The hook name used in action requests is the filename (without
 > extension). In this example, the action name is `restart-service`.
 
-## Step 4: Restart plexd for Discovery
+## Step 4: Hook Discovery
 
-plexd discovers hooks at startup by scanning the hooks directory. Restart the
-agent to pick up the new hook.
+plexd automatically discovers new and changed hooks using the `HookWatcher`,
+which monitors the hooks directory with `fsnotify`. No restart is required.
 
-```bash
-sudo systemctl restart plexd
-```
+When a hook file is added, modified, or removed, plexd:
 
-On startup, plexd:
+1. Detects the filesystem event (with debouncing)
+2. Scans the file for executability
+3. Computes the SHA-256 checksum
+4. Parses the sidecar metadata file (if present)
+5. Reports updated capabilities to the control plane
 
-1. Scans the hooks directory for executable files
-2. Computes the SHA-256 checksum for each hook
-3. Parses sidecar metadata files
-4. Reports capabilities (builtins + hooks) to the control plane
+The initial scan at startup also follows this process for all existing hooks.
 
 ## Step 5: Verify Discovery
 
@@ -222,7 +220,7 @@ Control Plane                          Node (plexd)
 | Symptom                    | Cause                                   | Fix                                                |
 |----------------------------|-----------------------------------------|----------------------------------------------------|
 | Hook missing from capabilities | File not executable              | `chmod +x /etc/plexd/hooks/my-hook`              |
-| Hook missing from capabilities | HooksDir not configured          | Set `HooksDir` in actions config                   |
+| Hook missing from capabilities | `hooks_dir` not configured       | Set `hooks_dir` in actions config                   |
 | Hook missing from capabilities | File has `.json` extension       | Remove `.json` extension from the script filename  |
 | Hook missing from capabilities | File is in a subdirectory        | Move to the hooks directory root (subdirs skipped) |
 
@@ -231,7 +229,7 @@ Control Plane                          Node (plexd)
 | Symptom                        | Cause                             | Fix                                                |
 |--------------------------------|-----------------------------------|----------------------------------------------------|
 | Status `error`, integrity fail | Checksum mismatch                 | Re-deploy hook and wait for capability refresh     |
-| Status `error`, file not found | Hook in capabilities but missing  | Verify file exists at `HooksDir/<action-name>`     |
+| Status `error`, file not found | Hook in capabilities but missing  | Verify file exists at `hooks_dir/<action-name>`     |
 | Status `timeout`               | Script exceeds timeout            | Optimize script or increase timeout in request     |
 | Status `failed`, exit code > 0 | Script returned non-zero exit     | Check stderr in result for error details           |
 | Empty stdout                   | Script writes to file, not stdout | Write output to stdout (`echo`) for capture        |

@@ -25,7 +25,7 @@ Configuration struct for packaging and installing plexd.
 ### Methods
 
 - **`ApplyDefaults()`** — Sets default values for zero-valued fields.
-- **`Validate() error`** — Returns an error if any required field (`BinaryPath`, `ConfigDir`, `DataDir`, `RunDir`, `ServiceName`) is empty.
+- **`Validate() error`** — Returns an error if any required field (`BinaryPath`, `ConfigDir`, `DataDir`, `RunDir`, `ServiceName`, `UnitFilePath`) is empty.
 
 ## GenerateUnitFile
 

@@ -118,14 +118,14 @@ Central coordinator for site-to-site VPN lifecycle. Concurrent-safe via `sync.Mu
 ### Constructor
 
 ```go
-func NewSiteToSiteManager(ctrl VPNController, routes RouteController, cfg Config, logger *slog.Logger) *SiteToSiteManager
+func NewSiteToSiteManager(ctrl VPNController, routes RouteController, cfg Config, logger *slog.Logger, tunnelProviders map[string]TunnelProvider) *SiteToSiteManager
 ```
 
 ### Methods
 
 | Method                       | Signature                                       | Description                                                     |
 |------------------------------|--------------------------------------------------|-----------------------------------------------------------------|
-| `Setup`                      | `() error`                                       | Marks manager active; no-op when disabled                       |
+| `Setup`                      | `(meshIface string) error`                       | Marks manager active; no-op when disabled                       |
 | `Teardown`                   | `() error`                                       | Removes all tunnels, routes, interfaces; aggregates errors      |
 | `AddTunnel`                  | `(tunnel api.SiteToSiteTunnel) error`            | Creates interface, configures peer, adds routes; full rollback  |
 | `RemoveTunnel`               | `(tunnelID string)`                              | Removes routes, peer, interface; no-op if not found             |
@@ -179,9 +179,11 @@ When `SiteToSiteEnabled` is `false`, `Setup` is a no-op. When enabled, it marks 
 
 Teardown removes all active tunnels, their routes, and interfaces:
 
-1. Remove routes for each tunnel's remote subnets via `RouteController.RemoveRoute`
-2. Remove each tunnel's WireGuard interface via `VPNController.RemoveTunnelInterface`
-3. Mark manager as inactive and clear the tunnel map
+1. Disable forwarding for each WireGuard tunnel via `VPNController.DisableForwarding`
+2. Remove routes for each tunnel's remote subnets via `RouteController.RemoveRoute`
+3. Remove each tunnel's WireGuard interface via `VPNController.RemoveTunnelInterface`
+4. Stop all registered tunnel providers via `provider.Stop()`
+5. Mark manager as inactive and clear the tunnel map
 
 Errors are aggregated via `errors.Join` — cleanup continues even when individual operations fail. Calling `Teardown` when the manager is inactive is a no-op (idempotent).
 

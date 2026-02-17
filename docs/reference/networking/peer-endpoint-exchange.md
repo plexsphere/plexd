@@ -78,7 +78,7 @@ func NewExchanger(
 
 ```go
 // 1. Create dependencies
-stunClient := nat.NewUDPSTUNClient(natCfg)
+stunClient := &nat.UDPSTUNClient{Timeout: natCfg.Timeout}
 discoverer := nat.NewDiscoverer(stunClient, natCfg, wgCfg.ListenPort, logger)
 wgManager  := wireguard.NewManager(ctrl, wgCfg, logger)
 cpClient, _ := api.NewControlPlane(apiCfg, version, logger)

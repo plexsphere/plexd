@@ -47,6 +47,7 @@ Configuration for Kubernetes integration. Passed as a constructor argument; no f
 | Field             | Type            | Default                                      | Description                                  |
 |-------------------|-----------------|----------------------------------------------|----------------------------------------------|
 | `Enabled`         | `bool`          | `false`                                      | Must be explicitly enabled                   |
+| `CRDEnabled`      | `bool`          | `true` (when `Enabled`)                      | Whether CRD management is active             |
 | `Namespace`       | `string`        | *(empty — auto-detected)*                    | Override namespace                           |
 | `AuditLogPath`    | `string`        | `/var/log/kubernetes/audit/audit.log`        | Path to Kubernetes audit log                 |
 | `CRDSyncInterval` | `time.Duration` | `10s`                                        | Interval for CRD state reconciliation        |
@@ -54,8 +55,8 @@ Configuration for Kubernetes integration. Passed as a constructor argument; no f
 
 ### Methods
 
-- **`ApplyDefaults()`** — Sets default values for zero-valued fields. Does not set `Enabled` to `true`.
-- **`Validate() error`** — Skips validation when `Enabled` is `false`. Validates `AuditLogPath` non-empty, `CRDSyncInterval >= 1s`, `TokenPath` non-empty.
+- **`ApplyDefaults(env *KubernetesEnvironment)`** — Sets default values for zero-valued fields. When `env` is non-nil and `InCluster` is true, sets `Enabled=true`, `CRDEnabled=true`, and auto-detects `Namespace`.
+- **`Validate() error`** — Skips validation when `Enabled` is `false`. Validates `Namespace` non-empty, `AuditLogPath` non-empty, `CRDSyncInterval >= 1s`, `TokenPath` non-empty.
 
 ## PlexdNodeState CRD
 
@@ -63,16 +64,26 @@ The `PlexdNodeState` custom resource definition exposes node state to the Kubern
 
 ```go
 type PlexdNodeState struct {
-    Name       string            `json:"name"`
-    Namespace  string            `json:"namespace"`
-    NodeID     string            `json:"node_id"`
-    MeshIP     string            `json:"mesh_ip"`
+    Name            string               `json:"name"`
+    Namespace       string               `json:"namespace"`
+    UID             string               `json:"uid,omitempty"`
+    ResourceVersion string               `json:"resourceVersion,omitempty"`
+    Labels          map[string]string    `json:"labels,omitempty"`
+    Spec            PlexdNodeStateSpec   `json:"spec"`
+    Status          PlexdNodeStateStatus `json:"status,omitempty"`
+    LastUpdate      time.Time            `json:"lastUpdate"`
+}
+
+type PlexdNodeStateSpec struct {
+    NodeID     string            `json:"nodeId"`
+    MeshIP     string            `json:"meshIp,omitempty"`
     Metadata   map[string]string `json:"metadata,omitempty"`
-    Data       map[string]string `json:"data,omitempty"`
-    Reports    map[string]string `json:"reports,omitempty"`
-    PeerCount  int               `json:"peer_count"`
-    Status     string            `json:"status"`
-    LastUpdate time.Time         `json:"last_update"`
+    Data       []DataEntry       `json:"data,omitempty"`
+    SecretRefs []SecretRef       `json:"secretRefs,omitempty"`
+}
+
+type PlexdNodeStateStatus struct {
+    Report []DataEntry `json:"report,omitempty"`
 }
 ```
 
@@ -87,7 +98,7 @@ type PlexdNodeState struct {
 | Scope          | `Namespaced`                   |
 | Version        | `v1alpha1`                     |
 
-**Printer columns:** Node ID, Mesh IP, Status, Peers, Age.
+**Printer columns:** Node ID, Mesh IP, Age.
 
 ## KubeClient interface
 
@@ -99,7 +110,13 @@ type KubeClient interface {
     CreateNodeState(ctx context.Context, state *PlexdNodeState) error
     UpdateNodeState(ctx context.Context, state *PlexdNodeState) error
     DeleteNodeState(ctx context.Context, namespace, name string) error
-    ListNodeStates(ctx context.Context, namespace string) ([]PlexdNodeState, error)
+    WatchNodeState(ctx context.Context, namespace, name string) (<-chan PlexdNodeStateEvent, error)
+    CreateSecret(ctx context.Context, secret *KubeSecret) error
+    UpdateSecret(ctx context.Context, secret *KubeSecret) error
+    DeleteSecret(ctx context.Context, namespace, name string) error
+    WatchPlexdHooks(ctx context.Context, namespace string) (<-chan PlexdHookEvent, error)
+    UpdatePlexdHookStatus(ctx context.Context, hook *PlexdHook) error
+    CreateJob(ctx context.Context, job *PlexdJob) error
 }
 ```
 
@@ -117,54 +134,49 @@ Periodically syncs local node state to a `PlexdNodeState` CRD resource.
 
 ```go
 type CRDController struct {
-    client    KubeClient
-    provider  StateProvider
-    cfg       Config
-    namespace string
-    name      string
-    logger    *slog.Logger
+    client         KubeClient
+    reportNotifier ReportNotifier
+    cfg            Config
+    namespace      string
+    nodeID         string
+    meshIP         string
+    resourceName   string // "node-{node_id}"
+    logger         *slog.Logger
 }
 ```
 
 ### Constructor
 
 ```go
-func NewCRDController(client KubeClient, provider StateProvider, cfg Config, namespace, name string, logger *slog.Logger) *CRDController
+func NewCRDController(client KubeClient, cfg Config, nodeID, meshIP, namespace string, reportNotifier ReportNotifier, logger *slog.Logger) *CRDController
 ```
 
 Config defaults are applied automatically.
 
-### StateProvider interface
+### ReportNotifier interface
 
 ```go
-type StateProvider interface {
-    NodeID() string
-    MeshIP() string
-    GetMetadata() map[string]string
-    GetPeerCount() int
-    GetStatus() string
+type ReportNotifier interface {
+    NotifyChange()
 }
 ```
 
-### Run
+Called when the CRDController detects new or changed report entries in the status subresource.
+
+### Start
 
 ```go
-func (c *CRDController) Run(ctx context.Context) error
+func (c *CRDController) Start(ctx context.Context) error
 ```
 
-Starts the CRD sync loop. First sync runs immediately; subsequent syncs run at `cfg.CRDSyncInterval`. Blocks until `ctx` is cancelled.
+Creates or updates the PlexdNodeState resource and starts the status watcher goroutine. Blocks until `ctx` is cancelled.
 
-### Sync behavior
+### Start behavior
 
-Each sync cycle:
-
-1. Reads state from `StateProvider`
-2. Builds a `PlexdNodeState` with current time as `LastUpdate`
-3. Calls `GetNodeState` to check if the resource exists
-4. If `ErrNotFound`: creates the resource; if create returns `ErrAlreadyExists` (race), falls back to update
-5. If exists: updates the resource
-
-Errors are logged but do not stop the loop.
+1. Ensures the CRD resource exists (create or update)
+2. Starts a watch on the resource for status changes
+3. When status report entries change, calls `ReportNotifier.NotifyChange()`
+4. Blocks until context is cancelled
 
 ## K8sAuditLogReader
 
@@ -193,7 +205,7 @@ func (r *K8sAuditLogReader) ReadEvents(ctx context.Context) ([]auditfwd.K8sAudit
 **Behavior:**
 
 - Reads from `r.offset` to end of file; only new entries since last call are returned
-- If the file does not exist, returns `nil, nil`
+- If the file does not exist or cannot be opened, returns an error
 - If the file was truncated (offset > file size), resets offset to 0 and reads from the beginning
 - Malformed JSON lines are skipped with a warning log
 - Timestamp is parsed from `stageTimestamp`, falling back to `requestReceivedTimestamp`
