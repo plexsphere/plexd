@@ -4,6 +4,8 @@ title: Architecture & Agent Lifecycle
 
 # Architecture & Agent Lifecycle
 
+> For a visual, diagram-driven overview of communication channels and mesh topology, see [Platform Communication & Mesh](/guide/platform-communication).
+
 ## Supported Platforms
 
 | Platform | Mode | Notes |
