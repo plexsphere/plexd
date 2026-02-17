@@ -6,6 +6,8 @@ feature: PXD-0027
 
 # Netlink Route Controller
 
+> **Note: This subsystem is not active in the current release.** The code in `internal/bridge` is implemented and its configuration section (`bridge`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
+
 `NetlinkRouteController` is the Linux production implementation of the `RouteController` interface defined in `internal/bridge`. It manages IP routes via netlink, IP forwarding via sysctl, and NAT masquerading via nftables. It requires `CAP_NET_ADMIN` and the `//go:build linux` constraint.
 
 ## Architecture

@@ -6,6 +6,8 @@ feature: PXD-0011
 
 # Bridge Mode
 
+> **Note: This subsystem is not active in the current release.** The code in `internal/bridge` is implemented and its configuration section (`bridge`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
+
 The `internal/bridge` package manages bridge mode routing between a WireGuard mesh interface and an access-side network interface. A bridge node acts as a gateway, forwarding traffic from the mesh to external subnets reachable via the access interface.
 
 All OS-level routing and forwarding operations go through a `RouteController` interface, enabling full unit testing without root privileges or kernel configuration.

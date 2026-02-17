@@ -6,6 +6,8 @@ feature: PXD-0006
 
 # NAT Traversal via STUN
 
+> **Note: This subsystem is not active in the current release.** The code in `internal/nat` is implemented and its configuration section (`nat`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
+
 The `internal/nat` package discovers a node's public endpoint using STUN servers, classifies the NAT type, and reports the result to the control plane. Peers behind NAT use the discovered endpoints to establish direct WireGuard connections.
 
 All STUN network operations go through a `STUNClient` interface, enabling full unit testing without real STUN servers or UDP sockets. The STUN protocol implementation covers RFC 5389 Binding requests and XOR-MAPPED-ADDRESS parsing using only the Go standard library.

@@ -6,6 +6,8 @@ feature: PXD-0028
 
 # ACME and SNI Routing
 
+> **Note: This subsystem is not active in the current release.** The code in `internal/bridge` is implemented and its configuration section (`bridge`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
+
 `ACMEManager` provides automatic TLS certificate management via the ACME protocol (Let's Encrypt). `SNIRouter` provides hostname-based TCP routing by peeking at TLS ClientHello SNI extensions. Both extend the bridge mode ingress capabilities in `internal/bridge`.
 
 ## Data Flow

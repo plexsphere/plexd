@@ -6,6 +6,8 @@ feature: PXD-0012
 
 # NAT Relay
 
+> **Note: This subsystem is not active in the current release.** The code in `internal/bridge` is implemented and its configuration section (`bridge`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
+
 The NAT relay functionality extends bridge mode (`internal/bridge`) to forward UDP packets between peers that cannot establish direct peer-to-peer WireGuard tunnels. A bridge node configured as a relay opens a UDP listener and relays packets between assigned peer pairs based on session assignments from the control plane.
 
 ## Data Flow

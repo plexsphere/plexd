@@ -6,6 +6,8 @@ feature: PXD-0009
 
 # Secure Access Tunneling
 
+> **Note: This subsystem is not active in the current release.** The code in `internal/tunnel` is implemented and its configuration section (`tunnel`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
+
 The `internal/tunnel` package enables platform-mediated SSH access to mesh nodes through WireGuard tunnels without exposing services to the public internet. The control plane orchestrates session lifecycle via SSE events; the node agent opens a local TCP listener bound to the mesh IP, forwards connections to the target host, and reports status back to the control plane.
 
 ## Data Flow

@@ -6,6 +6,8 @@ feature: PXD-0027
 
 # nftables Firewall Controller
 
+> **Note: This subsystem is not active in the current release.** The code in `internal/policy` is implemented and its configuration section (`policy`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
+
 `NftablesController` is the Linux production implementation of the `FirewallController` interface defined in `internal/policy`. It translates `FirewallRule` entries into nftables expressions and manages them via the `github.com/google/nftables` netlink library.
 
 The controller operates on a single IPv4 table (`plexd`) and creates base chains with a forward hook (`ChainTypeFilter`, `ChainHookForward`, `ChainPriorityFilter`) so that rules are evaluated by the kernel for forwarded traffic. It requires `CAP_NET_ADMIN` and the `//go:build linux` constraint.

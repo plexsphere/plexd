@@ -6,6 +6,8 @@ feature: PXD-0014
 
 # Public Ingress
 
+> **Note: This subsystem is not active in the current release.** The code in `internal/bridge` is implemented and its configuration section (`bridge`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
+
 The public ingress feature extends bridge mode (`internal/bridge`) to expose mesh-internal services to public internet traffic through the bridge node. The bridge node accepts TCP connections on configured public ports and proxies them to target mesh peers. TLS can be terminated at the bridge or passed through transparently.
 
 ## Data Flow

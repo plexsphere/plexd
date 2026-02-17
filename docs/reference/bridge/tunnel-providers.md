@@ -6,6 +6,8 @@ feature: PXD-0028
 
 # Tunnel Providers
 
+> **Note: This subsystem is not active in the current release.** The code in `internal/bridge` is implemented and its configuration section (`bridge`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
+
 The tunnel providers feature extends site-to-site VPN connectivity (`internal/bridge`) to support non-WireGuard tunnel technologies (IPsec, OpenVPN). A `TunnelProvider` interface abstracts lifecycle management of external tunnel daemons, enabling heterogeneous site-to-site connectivity alongside the existing WireGuard-based approach. The `SiteToSiteManager` delegates to the appropriate provider based on the `ProviderType` field of each tunnel definition.
 
 ## Data Flow

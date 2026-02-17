@@ -6,6 +6,8 @@ feature: PXD-0028
 
 # VPN Providers
 
+> **Note: This subsystem is not active in the current release.** The code in `internal/bridge` is implemented and its configuration section (`bridge`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
+
 The VPN providers feature extends user access integration (`internal/bridge`) with a `UserAccessProvider` interface for external VPN provider integration. Concrete implementations for Tailscale and Netbird enable external VPN users to access mesh resources through the bridge node via their provider's overlay network.
 
 ## Data Flow

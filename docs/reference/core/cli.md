@@ -36,16 +36,29 @@ Start the agent daemon. Registers with the control plane, connects to the SSE ev
 plexd up [--config /path/to/config.yaml] [--log-level debug]
 ```
 
-**Lifecycle:**
+**Initialization (15 steps):**
 
-1. Parse config and apply CLI flag overrides
-2. Register (or load existing identity) with control plane
-3. Create Ed25519 verifier from signing public key
-4. Start SSE manager with signing key rotation handler
-5. Start heartbeat service (30s default interval)
-6. Start reconciler (60s default interval)
-7. Start local node API server on Unix socket
-8. Wait for SIGTERM/SIGINT, then graceful drain (30s timeout)
+1. Parse config, apply CLI flag overrides, apply `PLEXD_*` env overrides
+2. Set up structured logger
+3. Create control plane client
+4. Register (or load existing identity) — fatal on failure
+5. Create Ed25519 verifier from the control plane's signing public key
+6. Create SSE manager with `signing_key_rotated` handler
+7. Create reconciler
+8. Create heartbeat service with auth-failure (re-registration) and key-rotation callbacks
+9. Create integrity store + verifier
+10. Create action executor, register 11 built-in actions, register `action_request` SSE handler, report capabilities
+11. Create hook watcher
+12. Create node API server, wire reconcile handler
+13. Create metrics collectors + manager
+14. Create log sources + forwarder
+15. Create audit sources + forwarder
+
+**Goroutines (8):** SSE, Heartbeat, Reconciler, Node API, Hook Watcher, Metrics, Log Forwarder, Audit Forwarder.
+
+**Shutdown:** On SIGTERM/SIGINT — cancel context, `sseMgr.Shutdown()`, `executor.Shutdown()`, wait for goroutines with 30s drain timeout.
+
+For the full startup and shutdown sequence, see [Architecture and Concepts](../../concepts.md).
 
 **Exit codes:** 0 on clean shutdown, 1 on error.
 
@@ -217,6 +230,22 @@ plexd actions run restart-service --param name=nginx --param force=true
 |-----------|---------|-------------------------------------|
 | `--param` | —       | Action parameter in `key=value` format (repeatable) |
 
+**Built-in actions:**
+
+| Name | Description | Parameters |
+|------|-------------|------------|
+| `gather_info` | Collect system and mesh info | — |
+| `ping` | Test connectivity to a target IP | `target` (required) |
+| `diagnostics.collect` | Collect system diagnostics | — |
+| `diagnostics.traceroute_peer` | Traceroute to a peer | `target` (required) |
+| `service.restart` | Restart plexd via systemctl | — |
+| `service.reload_config` | Send SIGHUP to reload config | — |
+| `service.upgrade` | Upgrade plexd (placeholder) | — |
+| `health.check` | Check node health status | — |
+| `mesh.reconnect` | Trigger reconciliation | — |
+| `config.dump` | Dump sanitized configuration | — |
+| `logs.snapshot` | Snapshot recent log lines | `lines` (optional) |
+
 ### `plexd hooks`
 
 Manage action hooks.
@@ -239,4 +268,4 @@ Commands that query local agent state (`status`, `peers`, `policies`, `state`, `
 
 ## Configuration File
 
-The default configuration file location is `/etc/plexd/config.yaml`. See `internal/agent/config.go` for the full `AgentConfig` schema and subsystem sections.
+The default configuration file is `/etc/plexd/config.yaml`. For the full YAML schema, see [Configuration Reference](configuration.md). For environment variable overrides, see [Environment Variables](environment-variables.md).
