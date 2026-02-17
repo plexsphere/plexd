@@ -24,10 +24,15 @@ services:
     cap_add:
       - NET_ADMIN
     command: ["up", "--api", "http://mock-api:8080", "--config", "/etc/plexd/config.yaml"]
+    ports:
+      - "19100:9100"
     environment:
       PLEXD_BOOTSTRAP_TOKEN: e2e-test-token
+      PLEXD_NODE_API_HTTP_ENABLED: "true"
+      PLEXD_NODE_API_HTTP_LISTEN: "0.0.0.0:9100"
     volumes:
       - ./docker/plexd-e2e.yaml:/etc/plexd/config.yaml:ro
+      - ./docker/nodeapi-token:/etc/plexd/nodeapi-token:ro
     tmpfs:
       - /var/lib/plexd
       - /var/run/plexd

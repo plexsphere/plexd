@@ -9,6 +9,7 @@ registration:
 
 node_api:
   data_dir: /var/lib/plexd
+  http_token_file: /etc/plexd/nodeapi-token
 
 heartbeat:
   node_id: e2e-node-1
