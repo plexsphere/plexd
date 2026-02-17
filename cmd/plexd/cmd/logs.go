@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 
@@ -53,10 +55,32 @@ func runLogs(cmd *cobra.Command, _ []string) error {
 }
 
 func runLogStatus(cmd *cobra.Command, _ []string) error {
-	_, err := socketGet(defaultSocketPath(), "/v1/state")
+	resp, err := socketGet(defaultSocketPath(), "/v1/log-status")
 	if err != nil {
 		return fmt.Errorf("plexd log-status: %w", err)
 	}
-	fmt.Fprintln(cmd.OutOrStdout(), "log forwarding status not yet available")
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("plexd log-status: read response: %w", err)
+	}
+
+	var status forwarderStatusResp
+	if err := json.Unmarshal(body, &status); err != nil {
+		return fmt.Errorf("plexd log-status: parse response: %w", err)
+	}
+
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "Log Forwarding Status\n")
+	fmt.Fprintf(out, "  Enabled:       %v\n", status.Enabled)
+	fmt.Fprintf(out, "  Sources:       %d\n", status.SourceCount)
+	fmt.Fprintf(out, "  Buffer size:   %d\n", status.BufferSize)
+	fmt.Fprintf(out, "  Errors:        %d\n", status.ErrorCount)
+	if status.LastReportAt != "" {
+		fmt.Fprintf(out, "  Last report:   %s\n", status.LastReportAt)
+	} else {
+		fmt.Fprintf(out, "  Last report:   never\n")
+	}
 	return nil
 }

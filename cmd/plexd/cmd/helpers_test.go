@@ -75,6 +75,22 @@ func startFakeAgent(t *testing.T, summary nodeapi.StateSummary) string {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("GET /v1/peers", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]nodeapi.PeerStatus{})
+	})
+	mux.HandleFunc("GET /v1/policies", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]any{})
+	})
+	mux.HandleFunc("GET /v1/log-status", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(nodeapi.ForwarderStatus{Enabled: true, SourceCount: 1})
+	})
+	mux.HandleFunc("GET /v1/audit/status", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(nodeapi.ForwarderStatus{Enabled: true, SourceCount: 2})
+	})
 
 	return startTestSocketServer(t, mux)
 }

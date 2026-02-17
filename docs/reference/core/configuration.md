@@ -36,7 +36,7 @@ Control plane HTTP client configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `base_url` | string | — (required) | Control plane API base URL, e.g. `https://api.plexsphere.com` |
+| `base_url` | string | — (required) | Control plane API base URL, e.g. `https://api.plexsphere.io` |
 | `tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification. **WARNING:** Only for development/testing. |
 | `connect_timeout` | duration | `10s` | Maximum time to wait for a TCP connection |
 | `request_timeout` | duration | `30s` | Maximum time for a complete HTTP request/response cycle |
@@ -200,7 +200,7 @@ WireGuard interface and peer management. See [WireGuard Tunnel Management](../ne
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `interface_name` | string | `wg-plexd` | Name of the WireGuard interface |
+| `interface_name` | string | `plexd0` | Name of the WireGuard interface |
 | `listen_port` | int | `51820` | UDP listen port for WireGuard |
 | `mtu` | int | `0` | MTU for the WireGuard interface. `0` means use system default. |
 
@@ -216,7 +216,7 @@ STUN-based NAT traversal. See [NAT Traversal via STUN](../networking/nat-travers
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable NAT traversal |
 | `stun_servers` | []string | (built-in list) | List of STUN server addresses (host:port) |
-| `refresh_interval` | duration | `30s` | Interval between STUN binding refreshes. Minimum: `10s`. |
+| `refresh_interval` | duration | `60s` | Interval between STUN binding refreshes. Minimum: `10s`. |
 | `timeout` | duration | `5s` | Per-server STUN request timeout |
 
 Source: `internal/nat/config.go`
@@ -239,7 +239,8 @@ Network policy enforcement and firewall rules. See [Network Policy Enforcement](
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `chain_name` | string | `plexd-policy` | Name of the nftables chain for policy rules |
+| `enabled` | bool | `true` | Enable policy enforcement. Defaults to `true` when `chain_name` is empty (zero-value heuristic). |
+| `chain_name` | string | `plexd-mesh` | Name of the nftables chain for policy rules |
 
 Source: `internal/policy/config.go`
 
@@ -254,7 +255,7 @@ Secure tunnel access for services. See [Secure Access Tunneling](../networking/s
 | `enabled` | bool | `true` | Enable secure access tunneling |
 | `max_sessions` | int | `10` | Maximum concurrent tunnel sessions |
 | `default_timeout` | duration | `30m` | Default session timeout |
-| `ssh_listen_addr` | string | `:2222` | SSH server listen address |
+| `ssh_listen_addr` | string | — | SSH server listen address. If empty, the SSH server is not started. |
 | `host_key_dir` | string | — | Directory for the host key (defaults to `data_dir`) |
 
 Source: `internal/tunnel/config.go`
@@ -276,16 +277,19 @@ Gateway bridge mode operation. Active when `mode: bridge` and `bridge.enabled: t
 | `max_relay_sessions` | int | `100` | Maximum concurrent relay sessions |
 | `session_ttl` | duration | `5m` | Relay session TTL |
 | `ingress_enabled` | bool | `false` | Enable public ingress |
-| `max_ingress_rules` | int | `50` | Maximum ingress rules |
-| `ingress_dial_timeout` | duration | `5s` | Timeout for dialing backend targets |
+| `max_ingress_rules` | int | `20` | Maximum ingress rules |
+| `ingress_dial_timeout` | duration | `10s` | Timeout for dialing backend targets |
 | `user_access_enabled` | bool | `false` | Enable user access VPN integration |
 | `user_access_interface_name` | string | `wg-access` | WireGuard interface for user access |
 | `user_access_listen_port` | int | `51822` | User access WireGuard listen port |
 | `max_access_peers` | int | `50` | Maximum user access peers |
+| `user_access_provider_type` | string | — | External VPN provider for user access: `tailscale`, `netbird`, or empty (disabled) |
+| `auth_key_env` | string | — | Environment variable name containing the auth key for the user access provider (e.g. `PLEXD_TAILSCALE_AUTH_KEY`) |
 | `site_to_site_enabled` | bool | `false` | Enable site-to-site VPN |
 | `site_to_site_interface_prefix` | string | `wg-s2s-` | Prefix for site-to-site WireGuard interfaces |
 | `site_to_site_listen_port` | int | `51823` | Base listen port for site-to-site tunnels |
 | `max_site_to_site_tunnels` | int | `10` | Maximum site-to-site tunnels |
+| `tunnel_providers` | []string | — | Tunnel provider types for site-to-site: `ipsec`, `openvpn`. Empty means WireGuard-only. |
 | `acme_enabled` | bool | `false` | Enable ACME TLS certificate management |
 | `acme_cache_dir` | string | — | Directory for ACME certificate caching |
 | `acme_allowed_hosts` | []string | — | Hostnames allowed for ACME certificates |
@@ -306,7 +310,7 @@ log_level: info     # debug | info | warn | error (default: info)
 data_dir: /var/lib/plexd  # persistent data directory (default: /var/lib/plexd)
 
 api:
-  base_url: https://api.plexsphere.com  # required
+  base_url: https://api.plexsphere.io  # required
   tls_insecure_skip_verify: false
   connect_timeout: 10s
   request_timeout: 30s
@@ -378,29 +382,29 @@ audit_fwd:
   batch_size: 500            # min: 1
 
 wireguard:
-  interface_name: wg-plexd
+  interface_name: plexd0
   listen_port: 51820
   # mtu: 0                  # 0 = system default
 
 nat:
   enabled: true
   # stun_servers:            # default built-in list
-  refresh_interval: 30s      # min: 10s
+  refresh_interval: 60s      # min: 10s
   timeout: 5s
 
 peer_exchange:
   enabled: true
-  refresh_interval: 30s
+  refresh_interval: 60s
   timeout: 5s
 
 policy:
-  chain_name: plexd-policy
+  chain_name: plexd-mesh
 
 tunnel:
   enabled: true
   max_sessions: 10
   default_timeout: 30m
-  ssh_listen_addr: ":2222"
+  # ssh_listen_addr: ""       # empty = SSH server not started
   # host_key_dir: ""         # defaults to data_dir
 
 # bridge:                    # uncomment for bridge mode

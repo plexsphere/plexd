@@ -488,3 +488,313 @@ The server uses two control plane methods via the `NodeAPIClient` interface:
 |----------------|-----------------------------------------------|---------------------------------------|
 | `FetchSecret`  | `GET /v1/state/secrets/{key}` handler         | Fetches encrypted secret on demand    |
 | `SyncReports`  | `ReportSyncer` (background)                   | Syncs report mutations to control plane|
+
+## Kubernetes: PlexdNodeState CRD
+
+On Kubernetes, plexd manages a `PlexdNodeState` custom resource for metadata, data, and report entries. Workloads interact with non-secret state through the standard Kubernetes API. For secrets, plexd exposes a node-local decryption API -- Kubernetes Secrets referenced by the CRD contain only NSK-encrypted ciphertext, not plaintext.
+
+### CRD Definition
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: plexdnodestates.plexd.plexsphere.com
+spec:
+  group: plexd.plexsphere.com
+  names:
+    kind: PlexdNodeState
+    listKind: PlexdNodeStateList
+    plural: plexdnodestates
+    singular: plexdnodestate
+    shortNames:
+      - pns
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                nodeId:
+                  type: string
+                meshIp:
+                  type: string
+                metadata:
+                  type: object
+                  additionalProperties:
+                    type: string
+                data:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      key:
+                        type: string
+                      contentType:
+                        type: string
+                      payload:
+                        x-kubernetes-preserve-unknown-fields: true
+                      version:
+                        type: integer
+                      updatedAt:
+                        type: string
+                        format: date-time
+                secretRefs:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      key:
+                        type: string
+                      secretName:
+                        type: string
+                      version:
+                        type: integer
+            status:
+              type: object
+              properties:
+                report:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      key:
+                        type: string
+                      contentType:
+                        type: string
+                      payload:
+                        x-kubernetes-preserve-unknown-fields: true
+                      version:
+                        type: integer
+                      updatedAt:
+                        type: string
+                        format: date-time
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Node ID
+          type: string
+          jsonPath: .spec.nodeId
+        - name: Mesh IP
+          type: string
+          jsonPath: .spec.meshIp
+        - name: Data Entries
+          type: integer
+          jsonPath: .spec.data[*].key
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+```
+
+### Example PlexdNodeState CR
+
+```yaml
+apiVersion: plexd.plexsphere.com/v1alpha1
+kind: PlexdNodeState
+metadata:
+  name: node-n-abc123
+  namespace: plexd-system
+  labels:
+    plexd.plexsphere.com/node-id: n_abc123
+spec:
+  nodeId: n_abc123
+  meshIp: 10.100.1.5
+  metadata:
+    environment: production
+    region: eu-west-1
+    role: worker
+  data:
+    - key: database-config
+      contentType: application/json
+      payload:
+        host: db.internal
+        port: 5432
+        database: myapp
+      version: 3
+      updatedAt: "2025-01-15T10:30:00Z"
+    - key: feature-flags
+      contentType: application/json
+      payload:
+        enable_new_ui: true
+        max_connections: 100
+      version: 7
+      updatedAt: "2025-01-15T11:00:00Z"
+  secretRefs:
+    - key: tls-cert
+      secretName: plexd-secret-n-abc123-tls-cert
+      version: 2
+    - key: api-token
+      secretName: plexd-secret-n-abc123-api-token
+      version: 1
+status:
+  report:
+    - key: app-health
+      contentType: application/json
+      payload:
+        status: healthy
+        checked_at: "2025-01-15T10:30:00Z"
+      version: 12
+      updatedAt: "2025-01-15T10:30:00Z"
+```
+
+### K8s Secret Structure
+
+Secrets are stored as native Kubernetes Secrets with `ownerReferences` pointing to the `PlexdNodeState` resource. This ensures secrets are garbage-collected when the node state is deleted. **Important:** The Kubernetes Secret contains the NSK-encrypted ciphertext, not the plaintext value. Reading the Secret directly yields unusable encrypted data.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: plexd-secret-n-abc123-tls-cert
+  namespace: plexd-system
+  ownerReferences:
+    - apiVersion: plexd.plexsphere.com/v1alpha1
+      kind: PlexdNodeState
+      name: node-n-abc123
+      uid: <uid>
+  annotations:
+    plexd.plexsphere.com/encrypted: "true"
+    plexd.plexsphere.com/encryption-algorithm: AES-256-GCM
+type: Opaque
+data:
+  value: <base64-encoded-NSK-encrypted-ciphertext>
+  nonce: <base64-encoded-GCM-nonce>
+```
+
+The `PlexdNodeState` `.spec.secretRefs` array lists the secret names and versions. To obtain plaintext values, workloads must call plexd's node-local decryption API rather than reading the Kubernetes Secret directly.
+
+### Node-Local Decryption API
+
+On Kubernetes, plexd's DaemonSet pod exposes a decryption endpoint for workloads on the same node. This follows the same pattern as node-local DNS or kube-proxy:
+
+| Access method | Configuration | Use case |
+|---|---|---|
+| Host-network socket | `/var/run/plexd/api.sock` mounted via `hostPath` | Pods with host path access |
+| Node-local HTTP | `http://<node-ip>:9100/v1/state/secrets/{key}` via `hostPort` | General pod access, requires bearer token |
+
+Workloads call `GET /v1/state/secrets/{key}` on the node-local endpoint. plexd verifies the caller's authorization (bearer token or ServiceAccount identity), fetches the encrypted value from the control plane in real-time, decrypts with the NSK, and returns the plaintext. Like on bare-metal, the call fails with `503` if the control plane is unreachable.
+
+```bash
+# From a pod on the same node (using the Kubernetes node internal IP)
+curl -H "Authorization: Bearer $(cat /var/run/secrets/plexd/token)" \
+  http://${NODE_IP}:9100/v1/state/secrets/tls-cert
+```
+
+plexd validates the bearer token against the Kubernetes TokenReview API to verify the caller's ServiceAccount and namespace before serving the decrypted secret.
+
+### RBAC Roles
+
+```yaml
+# Read access to PlexdNodeState spec (metadata, data, secretRefs)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: plexd-state-reader
+  namespace: plexd-system
+rules:
+  - apiGroups: ["plexd.plexsphere.com"]
+    resources: ["plexdnodestates"]
+    verbs: ["get", "list", "watch"]
+
+---
+# Write access to PlexdNodeState status (report entries)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: plexd-state-reporter
+  namespace: plexd-system
+rules:
+  - apiGroups: ["plexd.plexsphere.com"]
+    resources: ["plexdnodestates/status"]
+    verbs: ["get", "patch"]
+
+---
+# Read access to plexd-managed secrets (encrypted ciphertext only -- plaintext requires decryption API)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: plexd-secrets-reader
+  namespace: plexd-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: []  # Scoped to specific secret names by the operator
+    verbs: ["get"]
+```
+
+> **Note:** The `plexd-secrets-reader` role grants access to the Kubernetes Secret objects, but these contain only NSK-encrypted ciphertext. For plaintext access, workloads must call plexd's node-local decryption API with a valid bearer token. This two-layer model ensures that neither Kubernetes RBAC alone nor socket/network access alone is sufficient to read secret values.
+
+The `.spec` (including `nodeId`, `meshIp`, `metadata`, `data`, `secretRefs`) is managed exclusively by plexd. Workloads write upstream data by patching `.status.report` via the status subresource, which has separate RBAC from the main resource.
+
+## Data Sync Protocol
+
+### Downstream Sync (Control Plane to Node)
+
+1. On initial connect, plexd fetches the full node state from `GET /v1/nodes/{node_id}/state` (the same reconciliation endpoint, extended with `metadata`, `data`, and `secretRefs` fields). Secret values are not included -- only names and versions.
+2. During steady state, the control plane pushes `node_state_updated` and `node_secrets_updated` SSE events when state changes.
+3. `node_state_updated` contains the updated metadata and data entries inline (same signed envelope as all SSE events).
+4. `node_secrets_updated` contains only secret names and versions - **never secret values** (neither plaintext nor ciphertext). This event updates the local secret index so that listing endpoints reflect the current state.
+5. Secret values are fetched **on demand** when a consumer requests them via `GET /v1/state/secrets/{key}`. plexd proxies to `GET /v1/nodes/{node_id}/secrets/{key}` on the control plane, which returns the NSK-encrypted ciphertext. plexd decrypts with the local NSK and returns the plaintext to the authorized caller. No plaintext is persisted.
+6. The reconciliation loop compares local state cache (metadata, data, secret index) against the control plane, correcting any drift. Secret values are not part of reconciliation -- they are always fetched live.
+
+### Upstream Sync (Node to Control Plane)
+
+1. When a workload writes a report entry (via Unix socket API or CRD status patch), plexd buffers the change locally.
+2. After a debounce period (default 5s), plexd syncs the report to the control plane via `POST /v1/nodes/{node_id}/report`.
+3. If the control plane is unreachable, report entries are buffered in `data_dir/state/report/` and drained when connectivity is restored.
+4. The sync payload includes all changed report entries since the last successful sync.
+
+### Offline Behavior
+
+- The local state cache in `data_dir/state/` survives agent restarts and control plane outages
+- Workloads can read cached metadata and data entries even when the control plane is unreachable
+- **Secrets are unavailable offline** -- since secret values are fetched in real-time from the control plane and never cached in plaintext, `GET /v1/state/secrets/{key}` returns `503 Service Unavailable` when the control plane is unreachable. This is an explicit security trade-off.
+- Report entries are buffered locally and synced when connectivity is restored
+- On Kubernetes, the `PlexdNodeState` resource (metadata, data, report) persists in etcd independently of the control plane. Kubernetes Secrets contain only encrypted ciphertext and remain in etcd, but cannot be decrypted without the control plane (since decryption requires a live fetch to verify authorization).
+
+## File Cache Structure
+
+```
+data_dir/state/
+├── metadata.json          # Cached metadata key-value pairs
+├── data/
+│   ├── database-config.json
+│   └── feature-flags.json
+├── secrets.json           # Secret index only (names + versions, NO values)
+└── report/
+    └── app-health.json    # Locally written, pending sync
+```
+
+> **Note:** Secret values are never written to the file cache. Only the secret index (names and versions) is persisted for the listing endpoint. Plaintext values exist only in memory during the brief window between decryption and response delivery.
+
+## Socket API vs CRD Comparison
+
+| Aspect | Unix Socket API | PlexdNodeState CRD |
+|---|---|---|
+| **Platform** | Bare-metal, VM | Kubernetes |
+| **Read access** | `curl --unix-socket` / HTTP client | `kubectl get pns` / client-go / watch |
+| **Write access (report)** | `PUT /v1/state/report/{key}` | Status subresource patch |
+| **Secret access** | Real-time fetch via plexd proxy, `plexd-secrets` group or bearer token | Real-time fetch via plexd node-local API, bearer token (K8s Secrets contain only NSK-encrypted ciphertext) |
+| **Access control** | File permissions (groups) | Kubernetes RBAC |
+| **Offline resilience** | File cache in `data_dir/state/` | CRD persists in etcd |
+| **Change notification** | Poll or watch `Last-Modified` header | Kubernetes watch on CRD |
+| **Concurrency control** | `If-Match` header (optimistic) | Kubernetes resource version (optimistic) |
+
+## Security Considerations
+
+- **Envelope encryption (NSK)** - All secret values are encrypted with a per-node AES-256-GCM key (Node Secret Key) before leaving the control plane. The NSK is generated during registration and delivered to the node over authenticated TLS. Even if TLS is compromised or an attacker gains access to the Unix socket, CRD, or Kubernetes Secret objects, they only see ciphertext without the NSK.
+- **No plaintext at rest** - Secret values are never written to disk or etcd in plaintext. The file cache stores only the secret index (names + versions). On Kubernetes, Secret objects contain NSK-encrypted ciphertext. Plaintext exists only transiently in plexd's process memory during decryption and response delivery.
+- **Real-time fetch** - Secret values are fetched from the control plane on every access, not cached. This ensures the control plane remains the authoritative source and can enforce access policies, audit access, and revoke secrets in real-time. The trade-off is that secrets are unavailable when the control plane is unreachable (503).
+- **Two-layer access control** - Access to decrypted secrets requires both: (1) authorization at the plexd API level (Unix socket group membership or bearer token), and (2) live connectivity to the control plane. Neither layer alone is sufficient. On Kubernetes, even RBAC access to the K8s Secret objects only yields encrypted ciphertext.
+- **Transport security** - All control plane communication (state fetch, secret fetch, report sync) uses TLS-encrypted HTTPS. The NSK encryption layer provides defense-in-depth: secrets remain protected even if TLS is compromised. The Unix socket is local-only and protected by filesystem permissions.
+- **Least privilege** - The CRD splits `.spec` (plexd-managed) from `.status` (workload-writable) using the Kubernetes status subresource. Workloads that need to write reports do not need write access to the node's metadata, data, or secret references.
+- **Secret rotation** - When secrets are updated on the control plane, `node_secrets_updated` updates the local secret index. Since values are fetched in real-time, the next access automatically returns the new value. No local cache invalidation is needed.
+- **NSK rotation** - The NSK is rotated together with mesh keys via the `rotate_keys` flow, or independently via a dedicated `rotate_nsk` control plane API. During rotation, the control plane re-encrypts all secrets for the node with the new NSK.
+- **Owner references** - On Kubernetes, plexd-managed Secrets have `ownerReferences` to the `PlexdNodeState` resource, ensuring cleanup on node deregistration.
+- **Cache integrity** - The file cache in `data_dir/state/` inherits the `data_dir` permissions (`0700`, owned by `plexd` user). The NSK is stored in `data_dir` with `0600` permissions, accessible only to the plexd process.

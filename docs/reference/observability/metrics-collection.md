@@ -10,6 +10,19 @@ The `internal/metrics` package collects node metrics (system resources, tunnel h
 
 The `Manager` runs two independent ticker loops in a single goroutine: one for collection and one for reporting. Collected metrics are buffered in memory and flushed to the control plane at the configured report interval.
 
+## Metric Groups
+
+plexd collects the following metric groups at the configured `collect_interval`:
+
+| Metric Group | Data Points |
+|---|---|
+| `node_resources` | CPU usage (%), memory used/total, disk used/total, load average |
+| `tunnel_health` | Per-peer handshake age, TX/RX bytes, packet loss (%), last handshake timestamp |
+| `peer_latency` | Per-peer RTT (ms) via ICMP echo over the mesh interface |
+| `agent_stats` | plexd goroutine count, heap memory, GC stats, uptime, reconnect count |
+
+Metrics are delivered to the control plane as **batch POST requests** (JSON array, gzip-compressed) at `report_interval` (default 60s) or when `batch_size` (default 100 data points) is reached, whichever comes first. There is no local Prometheus or OpenTelemetry exposition endpoint — all metrics flow exclusively to the control plane.
+
 ## Config
 
 `Config` holds metrics collection and reporting parameters.

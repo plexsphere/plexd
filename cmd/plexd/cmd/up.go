@@ -241,6 +241,13 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// 7. Create reconciler.
 	reconciler := reconcile.NewReconciler(client, cfg.Reconcile, logger)
 
+	// Register rotate_keys SSE handler (triggers reconcile, same as heartbeat-driven rotation).
+	sseMgr.RegisterHandler(api.EventRotateKeys, func(_ context.Context, _ api.SignedEnvelope) error {
+		logger.Info("rotate_keys received via SSE, triggering reconcile")
+		reconciler.TriggerReconcile()
+		return nil
+	})
+
 	// Register policy SSE handler (needs reconciler as trigger).
 	sseMgr.RegisterHandler(api.EventPolicyUpdated, policy.HandlePolicyUpdated(reconciler))
 
@@ -331,26 +338,43 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	executor := actions.NewExecutor(cfg.Actions, client, integrityVerifier, logger)
 
 	nodeInfo := &agentNodeInfo{nodeID: identity.NodeID, meshIP: identity.MeshIP}
-	executor.RegisterBuiltin("gather_info", "Collect system and mesh info", nil, actions.GatherInfo(nodeInfo))
-	executor.RegisterBuiltin("ping", "Test connectivity to a target IP",
-		[]api.ActionParam{{Name: "target", Type: "string", Required: true, Description: "Target IP address"}},
-		actions.Ping(nodeInfo))
-	executor.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics", nil, actions.DiagnosticsCollect())
-	executor.RegisterBuiltin("diagnostics.traceroute_peer", "Traceroute to a peer",
-		[]api.ActionParam{{Name: "target", Type: "string", Required: true, Description: "Target IP address"}},
-		actions.DiagnosticsTraceroutePeer(nodeInfo))
-	executor.RegisterBuiltin("service.restart", "Restart plexd service", nil, actions.ServiceRestart())
-	executor.RegisterBuiltin("service.reload_config", "Reload configuration (SIGHUP)", nil, actions.ServiceReloadConfig())
-	executor.RegisterBuiltin("service.upgrade", "Upgrade plexd (placeholder)", nil, actions.ServiceUpgrade())
-	executor.RegisterBuiltin("health.check", "Check node health status", nil,
-		actions.HealthCheck(&agentHealthProvider{startTime: startTime, wgMgr: wgMgr, meshServer: meshServer}))
-	executor.RegisterBuiltin("mesh.reconnect", "Reconnect mesh tunnels", nil,
+	executor.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics (CPU, memory, disk, network)",
+		[]api.ActionParam{
+			{Name: "include_network", Type: "bool", Required: false, Default: "true", Description: "Include network interface info"},
+			{Name: "include_processes", Type: "bool", Required: false, Default: "true", Description: "Include process listing"},
+		}, actions.DiagnosticsCollect())
+	executor.RegisterBuiltin("diagnostics.ping_peer", "Ping a mesh peer and report latency",
+		[]api.ActionParam{
+			{Name: "peer_id", Type: "string", Required: true, Description: "Peer mesh IP address"},
+			{Name: "count", Type: "string", Required: false, Default: "1", Description: "Number of pings"},
+		}, actions.PingPeer(nodeInfo))
+	executor.RegisterBuiltin("diagnostics.traceroute_peer", "Traceroute to a mesh peer",
+		[]api.ActionParam{
+			{Name: "peer_id", Type: "string", Required: true, Description: "Peer mesh IP address"},
+			{Name: "max_hops", Type: "string", Required: false, Default: "15", Description: "Maximum number of hops"},
+		}, actions.DiagnosticsTraceroutePeer(nodeInfo))
+	executor.RegisterBuiltin("service.restart", "Restart the plexd service", nil, actions.ServiceRestart())
+	executor.RegisterBuiltin("service.reload_config", "Reload configuration without restart", nil, actions.ServiceReloadConfig())
+	executor.RegisterBuiltin("service.upgrade", "Upgrade plexd to a specified version",
+		[]api.ActionParam{
+			{Name: "version", Type: "string", Required: true, Description: "Target version"},
+			{Name: "checksum", Type: "string", Required: true, Description: "Expected SHA-256 checksum"},
+		}, actions.ServiceUpgrade(client))
+	executor.RegisterBuiltin("system.info", "Report OS, kernel, hardware, and runtime info", nil, actions.GatherInfo(nodeInfo))
+	executor.RegisterBuiltin("health.check", "Run all health checks and report status",
+		[]api.ActionParam{
+			{Name: "include_peers", Type: "bool", Required: false, Default: "true", Description: "Include per-peer status"},
+		}, actions.HealthCheck(&agentHealthProvider{startTime: startTime, wgMgr: wgMgr, meshServer: meshServer}))
+	executor.RegisterBuiltin("mesh.reconnect", "Tear down and re-establish all mesh tunnels", nil,
 		actions.MeshReconnect(&agentMeshReconnector{reconciler: reconciler}))
-	executor.RegisterBuiltin("config.dump", "Dump sanitized configuration", nil,
+	executor.RegisterBuiltin("config.dump", "Return current effective configuration (secrets redacted)", nil,
 		actions.ConfigDump(&agentConfigProvider{cfg: cfg}))
-	executor.RegisterBuiltin("logs.snapshot", "Snapshot recent log lines",
-		[]api.ActionParam{{Name: "lines", Type: "string", Required: false, Description: "Number of lines (default 100, max 10000)"}},
-		actions.LogsSnapshot(&agentLogProvider{}))
+	logRingBuffer := logfwd.NewRingBuffer(logfwd.DefaultRingBufferCapacity)
+	executor.RegisterBuiltin("logs.snapshot", "Capture recent logs and return as compressed archive",
+		[]api.ActionParam{
+			{Name: "lines", Type: "string", Required: false, Description: "Number of lines (default 100, max 10000)"},
+			{Name: "since", Type: "string", Required: false, Description: "Duration filter (e.g. 5m, 1h)"},
+		}, actions.LogsSnapshot(&agentLogProvider{ringBuffer: logRingBuffer}))
 
 	// Report capabilities to the control plane.
 	caps := api.CapabilitiesPayload{
@@ -388,6 +412,21 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	nodeAPISrv.SetActionProvider(executor)
 	nodeAPISrv.SetHookReloader(hookWatcher)
 
+	// Set up peer and policy snapshot providers for the node API.
+	peerSnap := &peerSnapshot{}
+	policySnap := &policySnapshot{}
+	nodeAPISrv.SetPeerProvider(peerSnap)
+	nodeAPISrv.SetPolicyProvider(policySnap)
+
+	// Register node_state_updated and node_secrets_updated SSE handlers for
+	// real-time cache updates (in addition to reconcile-loop fallback).
+	sseMgr.RegisterHandler(api.EventNodeStateUpdated, func(ctx context.Context, env api.SignedEnvelope) error {
+		return nodeapi.HandleNodeStateUpdated(nodeAPISrv.Cache(), logger, env)
+	})
+	sseMgr.RegisterHandler(api.EventNodeSecretsUpdated, func(ctx context.Context, env api.SignedEnvelope) error {
+		return nodeapi.HandleNodeSecretsUpdated(nodeAPISrv.Cache(), logger, env)
+	})
+
 	// Register nodeapi reconcile handler so cache updates on drift.
 	reconciler.RegisterHandler(nodeAPISrv.ReconcileHandler())
 
@@ -406,6 +445,13 @@ func runUp(cmd *cobra.Command, _ []string) error {
 
 	// Register policy reconcile handler.
 	reconciler.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, identity.NodeID, identity.MeshIP, cfg.WireGuard.InterfaceName))
+
+	// Register peer/policy snapshot reconcile handler for node API queries.
+	reconciler.RegisterHandler(func(_ context.Context, desired *api.StateResponse, _ reconcile.StateDiff) error {
+		peerSnap.update(desired.Peers)
+		policySnap.update(desired.Policies)
+		return nil
+	})
 
 	// Register bridge reconcile handlers (conditional).
 	if bridgeMgr != nil {
@@ -442,11 +488,16 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		logSources = append(logSources, logfwd.NewFileSource(pattern, hostname, logger))
 	}
 	logForwarder := logfwd.NewForwarder(cfg.LogFwd, logSources, client, identity.NodeID, hostname, logger)
+	logForwarder.SetRingBuffer(logRingBuffer)
 
 	// 15. Create audit forwarding sources and forwarder.
 	var auditSources []auditfwd.AuditSource
 	auditSources = append(auditSources, auditfwd.NewProcessSource(hostname))
 	auditForwarder := auditfwd.NewForwarder(cfg.AuditFwd, auditSources, client, identity.NodeID, hostname, logger)
+
+	// Wire forwarder status providers to the node API server.
+	nodeAPISrv.SetLogStatus(&logForwarderStatus{fwd: logForwarder})
+	nodeAPISrv.SetAuditStatus(&auditForwarderStatus{fwd: auditForwarder})
 
 	// Wait group for all goroutines.
 	var wg sync.WaitGroup
@@ -700,12 +751,102 @@ func redactSensitiveLine(line string) string {
 	return line
 }
 
-// agentLogProvider adapts to actions.LogProvider.
-// Currently returns an empty snapshot; will be wired to a ring buffer
-// when the log capture component is available.
-type agentLogProvider struct{}
+// agentLogProvider adapts the log forwarder's ring buffer to actions.LogProvider.
+type agentLogProvider struct {
+	ringBuffer *logfwd.RingBuffer
+}
 
-func (a *agentLogProvider) RecentLines(_ int) []string { return nil }
+func (a *agentLogProvider) RecentLines(n int) []string {
+	if a.ringBuffer == nil {
+		return nil
+	}
+	return a.ringBuffer.RecentLines(n)
+}
+
+// peerSnapshot implements nodeapi.PeerProvider with a thread-safe cached peer list.
+type peerSnapshot struct {
+	mu    sync.RWMutex
+	peers []nodeapi.PeerStatus
+}
+
+func (ps *peerSnapshot) PeerStatuses() []nodeapi.PeerStatus {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.peers
+}
+
+func (ps *peerSnapshot) update(apiPeers []api.Peer) {
+	statuses := make([]nodeapi.PeerStatus, len(apiPeers))
+	for i, p := range apiPeers {
+		statuses[i] = nodeapi.PeerStatus{
+			ID:       p.ID,
+			PublicKey: p.PublicKey,
+			MeshIP:   p.MeshIP,
+			Endpoint: p.Endpoint,
+		}
+	}
+	ps.mu.Lock()
+	ps.peers = statuses
+	ps.mu.Unlock()
+}
+
+// policySnapshot implements nodeapi.PolicyProvider with a thread-safe cached policy list.
+type policySnapshot struct {
+	mu       sync.RWMutex
+	policies []api.Policy
+}
+
+func (ps *policySnapshot) ActivePolicies() []api.Policy {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.policies
+}
+
+func (ps *policySnapshot) update(policies []api.Policy) {
+	ps.mu.Lock()
+	ps.policies = policies
+	ps.mu.Unlock()
+}
+
+// logForwarderStatus adapts logfwd.Forwarder to nodeapi.ForwarderStatusProvider.
+type logForwarderStatus struct {
+	fwd *logfwd.Forwarder
+}
+
+func (s *logForwarderStatus) ForwarderStatus() nodeapi.ForwarderStatus {
+	enabled, bufSize, srcCount, errCount, lastReport := s.fwd.Status()
+	var lastReportStr string
+	if !lastReport.IsZero() {
+		lastReportStr = lastReport.Format(time.RFC3339)
+	}
+	return nodeapi.ForwarderStatus{
+		Enabled:      enabled,
+		BufferSize:   bufSize,
+		SourceCount:  srcCount,
+		ErrorCount:   errCount,
+		LastReportAt: lastReportStr,
+	}
+}
+
+// auditForwarderStatus adapts auditfwd.Forwarder to nodeapi.ForwarderStatusProvider.
+type auditForwarderStatus struct {
+	fwd *auditfwd.Forwarder
+}
+
+func (s *auditForwarderStatus) ForwarderStatus() nodeapi.ForwarderStatus {
+	enabled, bufSize, srcCount, errCount, lastReport := s.fwd.Status()
+	var lastReportStr string
+	if !lastReport.IsZero() {
+		lastReportStr = lastReport.Format(time.RFC3339)
+	}
+	return nodeapi.ForwarderStatus{
+		Enabled:      enabled,
+		BufferSize:   bufSize,
+		SourceCount:  srcCount,
+		ErrorCount:   errCount,
+		LastReportAt: lastReportStr,
+	}
+}
 
 // controlPlaneTunnelReporter reports tunnel session lifecycle events to the control plane.
 type controlPlaneTunnelReporter struct {

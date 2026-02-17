@@ -27,12 +27,48 @@ type HookReloader interface {
 	Hooks() []api.HookInfo
 }
 
+// PeerStatus describes a single mesh peer's status.
+type PeerStatus struct {
+	ID       string `json:"id"`
+	PublicKey string `json:"public_key"`
+	MeshIP   string `json:"mesh_ip"`
+	Endpoint string `json:"endpoint"`
+}
+
+// PeerProvider supplies mesh peer information.
+type PeerProvider interface {
+	PeerStatuses() []PeerStatus
+}
+
+// PolicyProvider supplies active network policies.
+type PolicyProvider interface {
+	ActivePolicies() []api.Policy
+}
+
+// ForwarderStatus describes the operational status of a log or audit forwarder.
+type ForwarderStatus struct {
+	Enabled      bool   `json:"enabled"`
+	BufferSize   int    `json:"buffer_size"`
+	SourceCount  int    `json:"source_count"`
+	ErrorCount   int    `json:"error_count"`
+	LastReportAt string `json:"last_report_at,omitempty"`
+}
+
+// ForwarderStatusProvider supplies forwarder status information.
+type ForwarderStatusProvider interface {
+	ForwarderStatus() ForwarderStatus
+}
+
 // Handler provides HTTP handlers for the local node API.
 type Handler struct {
 	cache          *StateCache
 	secretFetcher  SecretFetcher
 	actionProvider ActionProvider
 	hookReloader   HookReloader
+	peerProvider   PeerProvider
+	policyProvider PolicyProvider
+	logStatus      ForwarderStatusProvider
+	auditStatus    ForwarderStatusProvider
 	nodeID         string
 	nsk            []byte
 	logger         *slog.Logger
@@ -59,6 +95,26 @@ func (h *Handler) SetHookReloader(reloader HookReloader) {
 	h.hookReloader = reloader
 }
 
+// SetPeerProvider sets the peer status provider.
+func (h *Handler) SetPeerProvider(p PeerProvider) {
+	h.peerProvider = p
+}
+
+// SetPolicyProvider sets the policy provider.
+func (h *Handler) SetPolicyProvider(p PolicyProvider) {
+	h.policyProvider = p
+}
+
+// SetLogStatus sets the log forwarder status provider.
+func (h *Handler) SetLogStatus(p ForwarderStatusProvider) {
+	h.logStatus = p
+}
+
+// SetAuditStatus sets the audit forwarder status provider.
+func (h *Handler) SetAuditStatus(p ForwarderStatusProvider) {
+	h.auditStatus = p
+}
+
 // Mux returns a configured ServeMux with all local node API routes.
 func (h *Handler) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
@@ -77,6 +133,10 @@ func (h *Handler) Mux() *http.ServeMux {
 	mux.HandleFunc("POST /v1/actions/run", h.handleRunAction)
 	mux.HandleFunc("GET /v1/hooks", h.handleGetHooks)
 	mux.HandleFunc("POST /v1/hooks/reload", h.handleReloadHooks)
+	mux.HandleFunc("GET /v1/peers", h.handleGetPeers)
+	mux.HandleFunc("GET /v1/policies", h.handleGetPolicies)
+	mux.HandleFunc("GET /v1/log-status", h.handleGetLogStatus)
+	mux.HandleFunc("GET /v1/audit/status", h.handleGetAuditStatus)
 	return mux
 }
 
@@ -454,6 +514,46 @@ func (h *Handler) handleReloadHooks(w http.ResponseWriter, _ *http.Request) {
 		Status: "reloaded",
 		Hooks:  hooks,
 	})
+}
+
+func (h *Handler) handleGetPeers(w http.ResponseWriter, _ *http.Request) {
+	if h.peerProvider == nil {
+		writeJSON(w, http.StatusOK, []PeerStatus{})
+		return
+	}
+	peers := h.peerProvider.PeerStatuses()
+	if peers == nil {
+		peers = []PeerStatus{}
+	}
+	writeJSON(w, http.StatusOK, peers)
+}
+
+func (h *Handler) handleGetPolicies(w http.ResponseWriter, _ *http.Request) {
+	if h.policyProvider == nil {
+		writeJSON(w, http.StatusOK, []api.Policy{})
+		return
+	}
+	policies := h.policyProvider.ActivePolicies()
+	if policies == nil {
+		policies = []api.Policy{}
+	}
+	writeJSON(w, http.StatusOK, policies)
+}
+
+func (h *Handler) handleGetLogStatus(w http.ResponseWriter, _ *http.Request) {
+	if h.logStatus == nil {
+		writeError(w, http.StatusServiceUnavailable, "log status not available")
+		return
+	}
+	writeJSON(w, http.StatusOK, h.logStatus.ForwarderStatus())
+}
+
+func (h *Handler) handleGetAuditStatus(w http.ResponseWriter, _ *http.Request) {
+	if h.auditStatus == nil {
+		writeError(w, http.StatusServiceUnavailable, "audit status not available")
+		return
+	}
+	writeJSON(w, http.StatusOK, h.auditStatus.ForwarderStatus())
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

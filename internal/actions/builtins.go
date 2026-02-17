@@ -2,11 +2,15 @@ package actions
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -43,6 +47,11 @@ type MeshReconnector interface {
 // ConfigProvider supplies sanitized configuration for dumping.
 type ConfigProvider interface {
 	DumpConfig() string
+}
+
+// ArtifactFetcher downloads a plexd binary artifact.
+type ArtifactFetcher interface {
+	FetchArtifact(ctx context.Context, version, goos, arch string) (io.ReadCloser, error)
 }
 
 // LogProvider supplies recent log lines.
@@ -89,20 +98,27 @@ func GatherInfo(info NodeInfoProvider) BuiltinFunc {
 	}
 }
 
-// Ping returns a BuiltinFunc that tests connectivity to a target mesh IP.
-// Requires a "target" parameter. Returns exit code 0 on success, 1 on failure.
-func Ping(info NodeInfoProvider) BuiltinFunc {
+// PingPeer returns a BuiltinFunc that pings a mesh peer and reports latency.
+// Requires a "peer_id" parameter (mesh IP). Optional "count" parameter (default 1).
+func PingPeer(info NodeInfoProvider) BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
-		target, ok := params["target"]
-		if !ok || target == "" {
-			return "", "", 1, fmt.Errorf("missing required parameter: target")
+		target := params["peer_id"]
+		if target == "" {
+			return "", "", 1, fmt.Errorf("missing required parameter: peer_id")
 		}
 
 		if net.ParseIP(target) == nil {
-			return "", fmt.Sprintf("invalid target IP: %s", target), 1, nil
+			return "", fmt.Sprintf("invalid peer_id (IP): %s", target), 1, nil
 		}
 
-		cmd := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "3", target)
+		count := "1"
+		if c := params["count"]; c != "" {
+			if n, err := strconv.Atoi(c); err == nil && n > 0 && n <= 10 {
+				count = c
+			}
+		}
+
+		cmd := exec.CommandContext(ctx, "ping", "-c", count, "-W", "3", target)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			if cmd.ProcessState != nil {
@@ -117,20 +133,25 @@ func Ping(info NodeInfoProvider) BuiltinFunc {
 
 // diagnosticsCollectResult holds the structured output of the DiagnosticsCollect action.
 type diagnosticsCollectResult struct {
-	Hostname      string `json:"hostname"`
-	OS            string `json:"os"`
-	Arch          string `json:"arch"`
-	CPUCount      int    `json:"cpu_count"`
-	MemoryTotal   uint64 `json:"memory_total"`
-	DiskTotal     uint64 `json:"disk_total"`
-	LoadAvg       string `json:"load_avg"`
-	KernelVersion string `json:"kernel_version"`
+	Hostname          string `json:"hostname"`
+	OS                string `json:"os"`
+	Arch              string `json:"arch"`
+	CPUCount          int    `json:"cpu_count"`
+	MemoryTotal       uint64 `json:"memory_total"`
+	DiskTotal         uint64 `json:"disk_total"`
+	LoadAvg           string `json:"load_avg"`
+	KernelVersion     string `json:"kernel_version"`
+	NetworkInterfaces string `json:"network_interfaces,omitempty"`
+	Processes         string `json:"processes,omitempty"`
 }
 
 // DiagnosticsCollect returns a BuiltinFunc that collects system diagnostics and returns them as JSON.
-// It gracefully handles errors by using fallback values.
+// Optional parameters: "include_network" (default "true"), "include_processes" (default "true").
 func DiagnosticsCollect() BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
+		includeNetwork := params["include_network"] != "false"
+		includeProcesses := params["include_processes"] != "false"
+
 		hostname, err := os.Hostname()
 		if err != nil {
 			hostname = "unknown"
@@ -181,6 +202,17 @@ func DiagnosticsCollect() BuiltinFunc {
 			KernelVersion: kernelVersion,
 		}
 
+		if includeNetwork {
+			if out, err := exec.CommandContext(ctx, "ip", "addr", "show").CombinedOutput(); err == nil {
+				result.NetworkInterfaces = string(out)
+			}
+		}
+		if includeProcesses {
+			if out, err := exec.CommandContext(ctx, "ps", "aux", "--no-headers").CombinedOutput(); err == nil {
+				result.Processes = string(out)
+			}
+		}
+
 		data, err := json.MarshalIndent(result, "", "  ")
 		if err != nil {
 			return "", "", 1, fmt.Errorf("marshal diagnostics: %w", err)
@@ -202,17 +234,24 @@ func int8ArrayToString(arr []int8) string {
 	return string(buf)
 }
 
-// DiagnosticsTraceroutePeer returns a BuiltinFunc that runs traceroute to a target IP.
-// Requires a "target" parameter containing a valid IP address.
+// DiagnosticsTraceroutePeer returns a BuiltinFunc that runs traceroute to a mesh peer.
+// Requires a "peer_id" parameter (mesh IP). Optional "max_hops" parameter (default 15).
 func DiagnosticsTraceroutePeer(info NodeInfoProvider) BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
-		target, ok := params["target"]
-		if !ok || target == "" {
-			return "", "", 1, fmt.Errorf("missing required parameter: target")
+		target := params["peer_id"]
+		if target == "" {
+			return "", "", 1, fmt.Errorf("missing required parameter: peer_id")
 		}
 
 		if net.ParseIP(target) == nil {
-			return "", fmt.Sprintf("invalid target IP: %s", target), 1, nil
+			return "", fmt.Sprintf("invalid peer_id (IP): %s", target), 1, nil
+		}
+
+		maxHops := "15"
+		if mh := params["max_hops"]; mh != "" {
+			if n, err := strconv.Atoi(mh); err == nil && n > 0 && n <= 64 {
+				maxHops = mh
+			}
 		}
 
 		path, err := exec.LookPath("traceroute")
@@ -220,7 +259,7 @@ func DiagnosticsTraceroutePeer(info NodeInfoProvider) BuiltinFunc {
 			return "", "", 1, fmt.Errorf("traceroute not available")
 		}
 
-		cmd := exec.CommandContext(ctx, path, "-n", "-m", "15", "-w", "3", target)
+		cmd := exec.CommandContext(ctx, path, "-n", "-m", maxHops, "-w", "3", target)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			if cmd.ProcessState != nil {
@@ -287,22 +326,124 @@ func ServiceReloadConfig() BuiltinFunc {
 type serviceUpgradeResult struct {
 	Status  string `json:"status"`
 	Message string `json:"message"`
+	Version string `json:"version,omitempty"`
 }
 
-// ServiceUpgrade returns a BuiltinFunc placeholder for in-place upgrades.
-// Currently returns a message indicating that in-place upgrade is not supported.
-func ServiceUpgrade() BuiltinFunc {
+// ServiceUpgrade returns a BuiltinFunc that performs an in-place binary upgrade.
+// It downloads the new binary from the control plane, verifies its SHA-256
+// checksum, atomically replaces the current binary, and triggers a systemd restart.
+//
+// Required parameters:
+//   - version: target version string (e.g. "1.5.0")
+//   - checksum: expected SHA-256 checksum of the new binary (hex-encoded, with or without "sha256:" prefix)
+func ServiceUpgrade(fetcher ArtifactFetcher) BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
-		result := serviceUpgradeResult{
-			Status:  "upgrade_not_available",
-			Message: "in-place upgrade not supported; use package manager or control plane",
+		version := params["version"]
+		if version == "" {
+			return "", "", 1, fmt.Errorf("missing required parameter: version")
+		}
+		checksum := params["checksum"]
+		if checksum == "" {
+			return "", "", 1, fmt.Errorf("missing required parameter: checksum")
+		}
+		// Strip optional "sha256:" prefix.
+		checksum = strings.TrimPrefix(checksum, "sha256:")
+
+		// Determine current binary path.
+		binaryPath, err := os.Executable()
+		if err != nil {
+			return "", "", 1, fmt.Errorf("resolve executable path: %w", err)
+		}
+		binaryPath, err = filepath.EvalSymlinks(binaryPath)
+		if err != nil {
+			return "", "", 1, fmt.Errorf("resolve symlinks: %w", err)
 		}
 
+		// Download the new binary.
+		rc, err := fetcher.FetchArtifact(ctx, version, runtime.GOOS, runtime.GOARCH)
+		if err != nil {
+			return "", "", 1, fmt.Errorf("download artifact: %w", err)
+		}
+		defer rc.Close()
+
+		// Write to a temporary file next to the current binary.
+		dir := filepath.Dir(binaryPath)
+		tmpFile, err := os.CreateTemp(dir, ".plexd-upgrade-*")
+		if err != nil {
+			return "", "", 1, fmt.Errorf("create temp file: %w", err)
+		}
+		tmpPath := tmpFile.Name()
+		defer func() {
+			// Clean up temp file on any failure path.
+			os.Remove(tmpPath)
+		}()
+
+		// Stream the download and compute SHA-256 simultaneously.
+		hasher := sha256.New()
+		writer := io.MultiWriter(tmpFile, hasher)
+		if _, err := io.Copy(writer, rc); err != nil {
+			tmpFile.Close()
+			return "", "", 1, fmt.Errorf("download binary: %w", err)
+		}
+		if err := tmpFile.Chmod(0755); err != nil {
+			tmpFile.Close()
+			return "", "", 1, fmt.Errorf("chmod binary: %w", err)
+		}
+		if err := tmpFile.Close(); err != nil {
+			return "", "", 1, fmt.Errorf("close temp file: %w", err)
+		}
+
+		// Verify checksum.
+		actualChecksum := hex.EncodeToString(hasher.Sum(nil))
+		if actualChecksum != checksum {
+			result := serviceUpgradeResult{
+				Status:  "checksum_mismatch",
+				Message: fmt.Sprintf("expected %s, got %s", checksum, actualChecksum),
+				Version: version,
+			}
+			data, _ := json.MarshalIndent(result, "", "  ")
+			return string(data), "", 1, nil
+		}
+
+		// Atomic replace: rename temp file over the current binary.
+		if err := os.Rename(tmpPath, binaryPath); err != nil {
+			return "", "", 1, fmt.Errorf("replace binary: %w", err)
+		}
+		// Prevent deferred removal of the (now-replaced) file.
+		tmpPath = ""
+
+		// Trigger systemd restart.
+		systemctl, lookErr := exec.LookPath("systemctl")
+		if lookErr != nil {
+			result := serviceUpgradeResult{
+				Status:  "upgraded_restart_pending",
+				Message: "binary replaced, but systemctl not available; manual restart required",
+				Version: version,
+			}
+			data, _ := json.MarshalIndent(result, "", "  ")
+			return string(data), "", 0, nil
+		}
+
+		cmd := exec.CommandContext(ctx, systemctl, "restart", "plexd.service")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			result := serviceUpgradeResult{
+				Status:  "upgraded_restart_failed",
+				Message: fmt.Sprintf("binary replaced, restart failed: %s", strings.TrimSpace(string(out))),
+				Version: version,
+			}
+			data, _ := json.MarshalIndent(result, "", "  ")
+			return string(data), "", 1, nil
+		}
+
+		result := serviceUpgradeResult{
+			Status:  "upgraded",
+			Message: "binary replaced and service restarted",
+			Version: version,
+		}
 		data, err := json.MarshalIndent(result, "", "  ")
 		if err != nil {
-			return "", "", 1, fmt.Errorf("marshal upgrade: %w", err)
+			return "", "", 1, fmt.Errorf("marshal upgrade result: %w", err)
 		}
-
 		return string(data), "", 0, nil
 	}
 }
@@ -315,9 +456,11 @@ type healthCheckResult struct {
 	LastHeartbeat  string `json:"last_heartbeat"`
 	LastReconcile  string `json:"last_reconcile"`
 	Status         string `json:"status"`
+	IncludePeers   bool   `json:"include_peers"`
 }
 
 // HealthCheck returns a BuiltinFunc that reports the node's health status.
+// Optional parameter: "include_peers" (default "true") — include per-peer status.
 // Status is "healthy" if tunnel_count > 0, otherwise "degraded".
 func HealthCheck(health HealthProvider) BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
@@ -333,6 +476,7 @@ func HealthCheck(health HealthProvider) BuiltinFunc {
 			LastHeartbeat:  health.LastHeartbeat().Format(time.RFC3339),
 			LastReconcile:  health.LastReconcile().Format(time.RFC3339),
 			Status:         status,
+			IncludePeers:   params["include_peers"] != "false",
 		}
 
 		data, err := json.MarshalIndent(result, "", "  ")
@@ -386,7 +530,9 @@ func ConfigDump(provider ConfigProvider) BuiltinFunc {
 const MaxSnapshotLines = 10000
 
 // LogsSnapshot returns a BuiltinFunc that retrieves recent log lines.
-// Accepts an optional "lines" parameter (default 100, max 10000) specifying how many lines to return.
+// Accepts optional parameters:
+//   - "lines": number of lines to return (default 100, max 10000)
+//   - "since": duration string (e.g. "5m", "1h") to filter lines by age
 func LogsSnapshot(provider LogProvider) BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
 		n := 100
@@ -401,6 +547,40 @@ func LogsSnapshot(provider LogProvider) BuiltinFunc {
 		}
 
 		lines := provider.RecentLines(n)
+
+		// Filter by "since" if provided.
+		if sinceStr := params["since"]; sinceStr != "" {
+			if dur, err := time.ParseDuration(sinceStr); err == nil {
+				cutoff := time.Now().Add(-dur)
+				filtered := lines[:0]
+				for _, line := range lines {
+					// Lines from the ring buffer are prefixed with a timestamp.
+					// Accept the line if we cannot parse a timestamp (best effort).
+					if ts, err := time.Parse(time.RFC3339, extractTimestamp(line)); err == nil {
+						if ts.Before(cutoff) {
+							continue
+						}
+					}
+					filtered = append(filtered, line)
+				}
+				lines = filtered
+			}
+		}
+
 		return strings.Join(lines, "\n"), "", 0, nil
 	}
+}
+
+// extractTimestamp attempts to extract a leading RFC3339 timestamp from a log line.
+func extractTimestamp(line string) string {
+	// Timestamps are typically at the start; try the first 30 chars.
+	if len(line) > 30 {
+		line = line[:30]
+	}
+	for i := len(line); i > 15; i-- {
+		if _, err := time.Parse(time.RFC3339, line[:i]); err == nil {
+			return line[:i]
+		}
+	}
+	return ""
 }

@@ -31,7 +31,7 @@ func TestPeersCommand_SuccessPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(output, "peer listing not yet available") {
-		t.Errorf("expected 'peer listing not yet available', got: %s", output)
+	if !strings.Contains(output, "No peers connected") {
+		t.Errorf("expected 'No peers connected', got: %s", output)
 	}
 }

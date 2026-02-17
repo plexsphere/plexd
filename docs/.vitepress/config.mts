@@ -8,6 +8,7 @@ export default defineConfig({
   themeConfig: {
     nav: [
       { text: 'Home', link: '/' },
+      { text: 'Guide', link: '/guide/installation' },
       { text: 'Concepts', link: '/concepts' },
       { text: 'How-To', link: '/how-to/bare-metal-installation' },
       { text: 'Reference', link: '/reference/core/cli' },
@@ -19,6 +20,15 @@ export default defineConfig({
         items: [
           { text: 'Overview', link: '/' },
           { text: 'Architecture & Concepts', link: '/concepts' },
+        ],
+      },
+      {
+        text: 'Guide',
+        items: [
+          { text: 'Installation & Quick Start', link: '/guide/installation' },
+          { text: 'Architecture & Agent Lifecycle', link: '/guide/architecture' },
+          { text: 'Security & Trust Model', link: '/guide/security' },
+          { text: 'Troubleshooting', link: '/guide/troubleshooting' },
         ],
       },
       {
@@ -48,6 +58,8 @@ export default defineConfig({
               { text: 'Reconciliation', link: '/reference/core/reconciliation' },
               { text: 'Heartbeat Service', link: '/reference/core/heartbeat-service' },
               { text: 'Local Node API', link: '/reference/core/nodeapi' },
+              { text: 'Control Plane API Endpoints', link: '/reference/core/api-endpoints' },
+              { text: 'Key Storage', link: '/reference/core/key-storage' },
             ],
           },
           {
@@ -91,6 +103,8 @@ export default defineConfig({
             collapsed: true,
             items: [
               { text: 'Remote Actions & Hooks', link: '/reference/actions/remote-actions-hooks' },
+              { text: 'Session Authorization', link: '/reference/actions/session-authorization' },
+              { text: 'Sandbox Options', link: '/reference/actions/sandbox-options' },
               { text: 'PlexdHook CRD', link: '/reference/actions/plexdhook-crd' },
               { text: 'Integrity Verification', link: '/reference/actions/integrity-verification' },
             ],
@@ -109,6 +123,7 @@ export default defineConfig({
             text: 'Development',
             collapsed: true,
             items: [
+              { text: 'Getting Started', link: '/reference/development/getting-started' },
               { text: 'CI Workflow', link: '/reference/development/ci-workflow' },
               { text: 'Container Workflow', link: '/reference/development/container-workflow' },
               { text: 'Release Workflow', link: '/reference/development/release-workflow' },

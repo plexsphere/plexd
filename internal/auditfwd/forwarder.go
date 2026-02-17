@@ -25,8 +25,10 @@ type Forwarder struct {
 	hostname string
 	logger   *slog.Logger
 
-	mu     sync.Mutex
-	buffer []api.AuditEntry
+	mu           sync.Mutex
+	buffer       []api.AuditEntry
+	lastReportAt time.Time
+	reportErrors int
 }
 
 // NewForwarder creates a new Forwarder. Config defaults are applied automatically.
@@ -134,6 +136,7 @@ func (f *Forwarder) flush(ctx context.Context) {
 			// Retain unsent data: put remaining batch back into buffer.
 			f.mu.Lock()
 			f.buffer = append(batch, f.buffer...)
+			f.reportErrors++
 			f.enforceCapacity()
 			f.mu.Unlock()
 			return
@@ -141,4 +144,15 @@ func (f *Forwarder) flush(ctx context.Context) {
 
 		batch = batch[len(chunk):]
 	}
+
+	f.mu.Lock()
+	f.lastReportAt = time.Now()
+	f.mu.Unlock()
+}
+
+// Status returns a snapshot of the forwarder's operational status.
+func (f *Forwarder) Status() (enabled bool, bufferSize, sourceCount, errorCount int, lastReport time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cfg.Enabled, len(f.buffer), len(f.sources), f.reportErrors, f.lastReportAt
 }

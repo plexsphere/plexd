@@ -32,6 +32,10 @@ type Server struct {
 
 	actionProvider ActionProvider
 	hookReloader   HookReloader
+	peerProvider   PeerProvider
+	policyProvider PolicyProvider
+	logStatus      ForwarderStatusProvider
+	auditStatus    ForwarderStatusProvider
 }
 
 // NewServer creates a new Server. Config defaults are applied automatically.
@@ -64,6 +68,31 @@ func (s *Server) SetHookReloader(reloader HookReloader) {
 	s.hookReloader = reloader
 }
 
+// SetPeerProvider sets the peer status provider. Must be called before Start.
+func (s *Server) SetPeerProvider(p PeerProvider) {
+	s.peerProvider = p
+}
+
+// SetPolicyProvider sets the policy provider. Must be called before Start.
+func (s *Server) SetPolicyProvider(p PolicyProvider) {
+	s.policyProvider = p
+}
+
+// SetLogStatus sets the log forwarder status provider. Must be called before Start.
+func (s *Server) SetLogStatus(p ForwarderStatusProvider) {
+	s.logStatus = p
+}
+
+// SetAuditStatus sets the audit forwarder status provider. Must be called before Start.
+func (s *Server) SetAuditStatus(p ForwarderStatusProvider) {
+	s.auditStatus = p
+}
+
+// Cache returns the server's state cache for use by SSE event handlers.
+func (s *Server) Cache() *StateCache {
+	return s.cache
+}
+
 // Start initializes and runs the server. It blocks until ctx is cancelled.
 func (s *Server) Start(ctx context.Context, nodeID string) error {
 	if err := s.cfg.Validate(); err != nil {
@@ -82,6 +111,10 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 	handler := NewHandler(s.cache, s.client, nodeID, s.nsk, s.logger)
 	handler.SetActionProvider(s.actionProvider)
 	handler.SetHookReloader(s.hookReloader)
+	handler.SetPeerProvider(s.peerProvider)
+	handler.SetPolicyProvider(s.policyProvider)
+	handler.SetLogStatus(s.logStatus)
+	handler.SetAuditStatus(s.auditStatus)
 	mux := handler.Mux()
 
 	// Wrap mux with a report-sync notifier.

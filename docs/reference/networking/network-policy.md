@@ -277,6 +277,17 @@ dispatcher := api.NewEventDispatcher(logger)
 dispatcher.Register(api.EventPolicyUpdated, policy.HandlePolicyUpdated(reconciler))
 ```
 
+## Enforcement Behavior
+
+> **Note:** The policy enforcement model is under active development. The behavior described here reflects the current design and may change in future versions.
+
+- Policies are pushed by the control plane via the `policy_updated` SSE event. plexd does not poll for policy changes — they are applied as soon as received (and verified via signature).
+- Filtering operates at **L3/L4** (IP, port, protocol) on the `plexd0` mesh interface using **nftables** rules.
+- The default stance is **deny-all**: no mesh traffic is permitted unless explicitly allowed by a policy rule.
+- **Peer visibility filtering:** In addition to firewall rules, plexd controls which peers are configured in the WireGuard interface. Peers not authorized by policy are not added to the interface, preventing even handshake-level communication.
+- Policy rules are scoped to mesh IPs (10.100.x.x/32) and cannot reference external IPs or hostnames.
+- On policy update, plexd computes a diff against the current nftables ruleset and applies only the changes (add/remove rules), minimizing disruption.
+
 ## Integration Points
 
 ### Reconciliation Loop

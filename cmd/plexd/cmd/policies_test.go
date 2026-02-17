@@ -31,7 +31,7 @@ func TestPoliciesCommand_SuccessPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(output, "policy listing not yet available") {
-		t.Errorf("expected 'policy listing not yet available', got: %s", output)
+	if !strings.Contains(output, "No policies active") {
+		t.Errorf("expected 'No policies active', got: %s", output)
 	}
 }

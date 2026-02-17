@@ -269,6 +269,7 @@ type ActionParam struct {
 	Name        string `json:"name"`
 	Type        string `json:"type"`
 	Required    bool   `json:"required"`
+	Default     string `json:"default,omitempty"`
 	Description string `json:"description"`
 }
 

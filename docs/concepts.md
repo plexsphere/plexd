@@ -12,6 +12,7 @@ plexd is the Plexsphere node agent — a lightweight daemon that runs on every m
 - **State Reconciliation** — periodically fetches desired state and applies drift corrections
 - **Remote Actions** — executes built-in and hook-based actions requested via SSE events
 - **Observability** — collects and forwards metrics, logs, and audit events to the control plane
+- **Local Node API** — exposes node state (metadata, data, secrets) to local workloads via Unix socket API or PlexdNodeState CRD
 - **Integrity** — verifies checksums of the plexd binary and hook scripts
 - **Bridge Mode** — optional gateway mode with NAT relay, public ingress, user access, and site-to-site VPN
 

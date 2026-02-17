@@ -10,6 +10,27 @@ The `internal/logfwd` package forwards system and application logs from plexd me
 
 The `Forwarder` runs two independent ticker loops in a single goroutine: one for collection and one for reporting. Collected log entries are buffered in memory and flushed to the control plane at the configured report interval.
 
+## Log Format and Delivery
+
+Logs are collected from the configured sources and delivered to the control plane as **batch POST requests** using JSON Lines format, gzip-compressed. Batches are flushed at `report_interval` (default 30s) or when `batch_size` (default 200 entries) is reached.
+
+Each log line is serialized as:
+
+```json
+{
+  "timestamp": "2025-01-15T10:30:00.123Z",
+  "source": "journald",
+  "unit": "plexd",
+  "message": "reconciliation completed, 0 drifts corrected",
+  "severity": "info",
+  "hostname": "web-01"
+}
+```
+
+- **Filtering:** Severity-level filters (`min_severity`), unit inclusion lists (`include_units`), and unit exclusion lists (`exclude_units`) are applied before batching.
+- **File patterns:** Glob patterns in `file_patterns` specify additional log files to monitor beyond journald.
+- **Offline buffering:** When the control plane is unreachable, log entries are buffered internally. Buffered entries are drained on reconnection.
+
 ## Config
 
 `Config` holds log forwarding parameters.

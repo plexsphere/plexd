@@ -79,6 +79,12 @@ PLEXD_NODE_API_HTTP_ENABLED=true PLEXD_NODE_API_HTTP_LISTEN=0.0.0.0:9200 plexd u
 PLEXD_LOG_LEVEL=debug PLEXD_API=https://api.example.com plexd up
 ```
 
+## Session Token Variable
+
+| Variable | Description |
+|----------|-------------|
+| `PLEXD_SESSION_TOKEN` | JWT token injected by plexd into SSH sessions for action authorization. This token is set automatically when an SSH session is established via the access proxy. It is used by `plexd actions run` to authenticate and authorize action execution within the session. The JWT is signed with the control plane's Ed25519 key and contains claims for `sub` (user ID), `node_id`, `session_id`, `actions` (scoped action list), and `exp` (expiration). plexd validates this token locally without a control plane roundtrip. |
+
 ## See Also
 
 - [Configuration Reference](configuration.md) — Full YAML configuration schema

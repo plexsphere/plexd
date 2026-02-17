@@ -6,6 +6,15 @@ plexd is the Plexsphere node agent — a lightweight daemon that runs on every m
 
 - [Architecture and Concepts](concepts.md) — How plexd works, subsystem map, startup lifecycle
 
+## Guide
+
+In-depth guides covering installation, architecture, and security.
+
+- [Installation & Quick Start](guide/installation.md) — Install plexd and get running
+- [Architecture & Agent Lifecycle](guide/architecture.md) — Platform support, architecture diagrams, agent lifecycle, heartbeat, SSE, deregistration
+- [Security & Trust Model](guide/security.md) — Key exchange, threat model, network requirements
+- [Troubleshooting](guide/troubleshooting.md) — Common issues and diagnostics
+
 ## How-To Guides
 
 Step-by-step guides for common operational tasks.
@@ -34,6 +43,8 @@ Agent core, CLI, API client, and registration.
 - [Configuration Reconciliation](reference/core/reconciliation.md) — State reconciliation with the control plane
 - [Heartbeat Service](reference/core/heartbeat-service.md) — Periodic heartbeat reporting
 - [Local Node API](reference/core/nodeapi.md) — Unix socket and TCP API for local node state access
+- [Control Plane API Endpoints](reference/core/api-endpoints.md) — Full control plane REST API reference
+- [Key Storage](reference/core/key-storage.md) — Private keys, PSKs, NSK, and signing key storage
 
 ### Networking
 
@@ -73,6 +84,8 @@ Metrics, logs, and audit event forwarding.
 Remote actions, hooks, and integrity verification.
 
 - [Remote Actions and Hooks](reference/actions/remote-actions-hooks.md) — Remote action execution and hook system
+- [Session-Based Action Authorization](reference/actions/session-authorization.md) — Session JWT authorization for SSH-triggered actions
+- [Sandbox Options](reference/actions/sandbox-options.md) — Sandbox levels for hook execution
 - [PlexdHook CRD Reference](reference/actions/plexdhook-crd.md) — Kubernetes CRD for declarative hook execution
 - [Integrity Verification](reference/actions/integrity-verification.md) — Hook integrity verification via checksums
 
@@ -89,6 +102,7 @@ Packaging, container images, and deployment manifests.
 
 CI/CD workflows, E2E tests, and utilities.
 
+- [Getting Started (Development)](reference/development/getting-started.md) — Prerequisites, build, project structure
 - [CI Workflow](reference/development/ci-workflow.md) — Continuous integration workflow
 - [Container Workflow](reference/development/container-workflow.md) — Container image build workflow
 - [Release Workflow](reference/development/release-workflow.md) — Release and versioning workflow

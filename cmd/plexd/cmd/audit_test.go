@@ -21,8 +21,11 @@ func TestAuditCommand_SuccessPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(output, "audit collection status not yet available") {
-		t.Errorf("expected 'audit collection status not yet available', got: %s", output)
+	if !strings.Contains(output, "Audit Forwarding Status") {
+		t.Errorf("expected 'Audit Forwarding Status', got: %s", output)
+	}
+	if !strings.Contains(output, "Enabled") {
+		t.Errorf("expected 'Enabled', got: %s", output)
 	}
 }
 

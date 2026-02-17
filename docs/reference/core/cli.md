@@ -239,17 +239,17 @@ plexd actions run restart-service --param name=nginx --param force=true
 
 | Name | Description | Parameters |
 |------|-------------|------------|
-| `gather_info` | Collect system and mesh info | — |
-| `ping` | Test connectivity to a target IP | `target` (required) |
-| `diagnostics.collect` | Collect system diagnostics | — |
-| `diagnostics.traceroute_peer` | Traceroute to a peer | `target` (required) |
+| `diagnostics.collect` | Collect system diagnostics (CPU, memory, disk, network) | `include_network`, `include_processes` |
+| `diagnostics.ping_peer` | Ping a mesh peer and report latency | `peer_id` (required), `count` |
+| `diagnostics.traceroute_peer` | Traceroute to a mesh peer | `peer_id` (required), `max_hops` |
 | `service.restart` | Restart plexd via systemctl | — |
 | `service.reload_config` | Send SIGHUP to reload config | — |
-| `service.upgrade` | Upgrade plexd (placeholder) | — |
-| `health.check` | Check node health status | — |
-| `mesh.reconnect` | Trigger reconciliation | — |
-| `config.dump` | Dump sanitized configuration | — |
-| `logs.snapshot` | Snapshot recent log lines | `lines` (optional) |
+| `service.upgrade` | Upgrade plexd to a specified version | `version` (required), `checksum` (required) |
+| `system.info` | Report OS, kernel, hardware, and runtime info | — |
+| `health.check` | Run all health checks and report status | `include_peers` |
+| `mesh.reconnect` | Tear down and re-establish all mesh tunnels | — |
+| `config.dump` | Return current effective configuration (secrets redacted) | — |
+| `logs.snapshot` | Capture recent logs from ring buffer | `lines`, `since` |
 
 ### `plexd hooks`
 

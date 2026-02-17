@@ -10,6 +10,29 @@ The `internal/auditfwd` package collects and forwards audit data from plexd mesh
 
 The `Forwarder` runs two independent ticker loops in a single goroutine: one for collection and one for reporting. Collected audit entries are buffered in memory and flushed to the control plane at the configured report interval.
 
+## Collection Sources and Format
+
+- **auditd:** plexd opens a Netlink socket (`AF_AUDIT`) to receive real-time audit events from the Linux kernel. This avoids file-based polling and ensures no events are missed.
+- **Kubernetes:** plexd tails the Kubernetes audit log file, auto-detected via the kubelet configuration (typically `/var/log/kubernetes/audit/audit.log`). The path can be overridden in the config.
+
+All audit events are normalized into a unified JSON schema:
+
+```json
+{
+  "timestamp": "2025-01-15T10:30:00.456Z",
+  "source": "auditd",
+  "event_type": "SYSCALL",
+  "subject": { "uid": 1000, "pid": 4523, "comm": "sshd" },
+  "object": { "path": "/etc/shadow" },
+  "action": "open",
+  "result": "denied",
+  "hostname": "web-01",
+  "raw": "..."
+}
+```
+
+Delivery follows the same batch model as log forwarding: **batch POST** (JSON Lines, gzip-compressed) at `report_interval` (default 15s) with its own independent buffer for offline operation.
+
 ## Config
 
 `Config` holds audit forwarding parameters.

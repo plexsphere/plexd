@@ -223,35 +223,14 @@ type NodeInfoProvider interface {
 
 ## Built-in Actions
 
-### gather_info
-
-Collects system information and returns it as JSON in stdout.
-
-```json
-{
-  "hostname": "edge-us-west-42",
-  "os": "linux",
-  "arch": "amd64",
-  "go_version": "go1.24.0",
-  "mesh_ip": "10.100.0.5",
-  "peer_count": 12,
-  "node_id": "node-abc123"
-}
-```
-
-### ping
-
-Tests connectivity to a target IP address. Requires a `target` parameter containing a valid IP address. Uses the system `ping` command with `-c 1 -W 3`.
-
-| Parameter | Type   | Required | Description       |
-|-----------|--------|----------|-------------------|
-| `target`  | string | yes      | Target IP address |
-
-Returns exit code 0 on success, 1 on failure.
-
 ### diagnostics.collect
 
-Collects system diagnostics (hostname, OS, architecture, CPU count, memory, disk, load average, kernel version) and returns them as JSON. Gracefully handles missing `/proc` data by using fallback values.
+Collects system diagnostics (hostname, OS, architecture, CPU count, memory, disk, load average, kernel version, network interfaces, processes) and returns them as JSON. Gracefully handles missing `/proc` data by using fallback values.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `include_network` | bool | no | `true` | Include network interface info |
+| `include_processes` | bool | no | `true` | Include process listing |
 
 ```json
 {
@@ -262,19 +241,31 @@ Collects system diagnostics (hostname, OS, architecture, CPU count, memory, disk
   "memory_total": 8589934592,
   "disk_total": 107374182400,
   "load_avg": "1.50 1.20 0.90 2/150 12345",
-  "kernel_version": "6.1.0-amd64"
+  "kernel_version": "6.1.0-amd64",
+  "network_interfaces": "...",
+  "processes": "..."
 }
 ```
 
-No parameters required.
+### diagnostics.ping_peer
+
+Pings a mesh peer and reports latency. Uses the system `ping` command with `-c <count> -W 3`.
+
+| Parameter | Type   | Required | Default | Description              |
+|-----------|--------|----------|---------|--------------------------|
+| `peer_id` | string | yes      | —       | Peer mesh IP address     |
+| `count`   | string | no       | `1`     | Number of pings (max 10) |
+
+Returns ping output in stdout. Exit code 0 on success, 1 on failure (unreachable or invalid IP).
 
 ### diagnostics.traceroute_peer
 
-Runs `traceroute` to a target IP address. Requires a `target` parameter containing a valid IP address. Uses `-n -m 15 -w 3` flags.
+Traceroute to a mesh peer. Uses the system `traceroute` command with `-n -m <max_hops> -w 3` flags.
 
-| Parameter | Type   | Required | Description       |
-|-----------|--------|----------|-------------------|
-| `target`  | string | yes      | Target IP address |
+| Parameter  | Type   | Required | Default | Description              |
+|------------|--------|----------|---------|--------------------------|
+| `peer_id`  | string | yes      | —       | Peer mesh IP address     |
+| `max_hops` | string | no       | `15`    | Maximum number of hops   |
 
 Returns traceroute output in stdout. Exit code 1 if `traceroute` is not installed.
 
@@ -297,12 +288,46 @@ No parameters required.
 
 ### service.upgrade
 
-Placeholder for in-place upgrade functionality. Currently returns a message indicating that in-place upgrade is not supported.
+Upgrades plexd to a specified version. Downloads the new binary from the control plane's artifact store (`GET /v1/artifacts/plexd/{version}/{os}/{arch}`), verifies the SHA-256 checksum, atomically replaces the current binary, and triggers a systemd restart.
+
+| Parameter  | Type   | Required | Description                                      |
+|------------|--------|----------|--------------------------------------------------|
+| `version`  | string | yes      | Target version (e.g. `1.5.0`)                    |
+| `checksum` | string | yes      | Expected SHA-256 checksum (hex, optional `sha256:` prefix) |
+
+On checksum mismatch, the upgrade is aborted and the original binary is preserved:
 
 ```json
 {
-  "status": "upgrade_not_available",
-  "message": "in-place upgrade not supported; use package manager or control plane"
+  "status": "checksum_mismatch",
+  "message": "expected abc123..., got def456...",
+  "version": "1.5.0"
+}
+```
+
+On success:
+
+```json
+{
+  "status": "upgraded",
+  "version": "1.5.0",
+  "message": "binary replaced, restarting service"
+}
+```
+
+### system.info
+
+Reports OS, kernel, hardware, and runtime info as JSON.
+
+```json
+{
+  "hostname": "edge-us-west-42",
+  "os": "linux",
+  "arch": "amd64",
+  "go_version": "go1.24.0",
+  "mesh_ip": "10.100.0.5",
+  "peer_count": 12,
+  "node_id": "node-abc123"
 }
 ```
 
@@ -310,7 +335,11 @@ No parameters required.
 
 ### health.check
 
-Reports the node's health status. Requires a `HealthProvider` dependency.
+Reports the node's health status.
+
+| Parameter       | Type | Required | Default | Description              |
+|-----------------|------|----------|---------|--------------------------|
+| `include_peers` | bool | no       | `true`  | Include per-peer status  |
 
 ```json
 {
@@ -323,25 +352,26 @@ Reports the node's health status. Requires a `HealthProvider` dependency.
 }
 ```
 
-Status is `"healthy"` if `tunnel_count > 0`, otherwise `"degraded"`. No parameters required.
+Status is `"healthy"` if `tunnel_count > 0`, otherwise `"degraded"`.
 
 ### mesh.reconnect
 
-Triggers mesh reconnection via the `MeshReconnector` interface. On success, returns `{"status": "reconnected"}`. On failure, returns exit code 1 with `{"status": "failed", "error": "..."}`.
+Triggers mesh reconnection via the reconciler. On success, returns `{"status": "reconnected"}`. On failure, returns exit code 1 with `{"status": "failed", "error": "..."}`.
 
 No parameters required.
 
 ### config.dump
 
-Outputs the sanitized configuration via the `ConfigProvider` interface. Returns the config string in stdout. No parameters required.
+Returns the current effective configuration with sensitive values redacted. Returns the config string in stdout. No parameters required.
 
 ### logs.snapshot
 
-Retrieves recent log lines via the `LogProvider` interface.
+Captures recent logs from the in-memory ring buffer and returns them as newline-separated text.
 
-| Parameter | Type   | Required | Description                    |
-|-----------|--------|----------|--------------------------------|
-| `lines`   | string | no       | Number of lines (default: 100, max: 10000) |
+| Parameter | Type   | Required | Default | Description                              |
+|-----------|--------|----------|---------|------------------------------------------|
+| `lines`   | string | no       | `100`   | Number of lines (max: 10000)             |
+| `since`   | string | no       | —       | Duration filter (e.g. `5m`, `1h`)        |
 
 Returns newline-separated log lines in stdout.
 
@@ -647,17 +677,17 @@ cfg.ApplyDefaults()
 exec := actions.NewExecutor(cfg, reporter, verifier, logger)
 
 // 3. Register built-in actions
-exec.RegisterBuiltin("gather_info", "Collect system and mesh info", nil, actions.GatherInfo(nodeInfo))
-exec.RegisterBuiltin("ping", "Test connectivity", targetParam, actions.Ping(nodeInfo))
-exec.RegisterBuiltin("diagnostics.collect", "Collect diagnostics", nil, actions.DiagnosticsCollect())
-exec.RegisterBuiltin("diagnostics.traceroute_peer", "Traceroute to peer", targetParam, actions.DiagnosticsTraceroutePeer(nodeInfo))
+exec.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics", collectParams, actions.DiagnosticsCollect())
+exec.RegisterBuiltin("diagnostics.ping_peer", "Ping a mesh peer", peerIDParam, actions.PingPeer(nodeInfo))
+exec.RegisterBuiltin("diagnostics.traceroute_peer", "Traceroute to peer", peerIDParam, actions.DiagnosticsTraceroutePeer(nodeInfo))
 exec.RegisterBuiltin("service.restart", "Restart service", nil, actions.ServiceRestart())
 exec.RegisterBuiltin("service.reload_config", "Reload config", nil, actions.ServiceReloadConfig())
-exec.RegisterBuiltin("service.upgrade", "Upgrade (placeholder)", nil, actions.ServiceUpgrade())
-exec.RegisterBuiltin("health.check", "Check health", nil, actions.HealthCheck(healthProvider))
+exec.RegisterBuiltin("service.upgrade", "Upgrade plexd binary", upgradeParams, actions.ServiceUpgrade(apiClient))
+exec.RegisterBuiltin("system.info", "Report system and runtime info", nil, actions.SystemInfo(nodeInfo))
+exec.RegisterBuiltin("health.check", "Check health", healthParams, actions.HealthCheck(healthProvider))
 exec.RegisterBuiltin("mesh.reconnect", "Reconnect mesh", nil, actions.MeshReconnect(reconnector))
 exec.RegisterBuiltin("config.dump", "Dump config", nil, actions.ConfigDump(configProvider))
-exec.RegisterBuiltin("logs.snapshot", "Snapshot logs", linesParam, actions.LogsSnapshot(logProvider))
+exec.RegisterBuiltin("logs.snapshot", "Snapshot logs", snapshotParams, actions.LogsSnapshot(logProvider))
 
 // 4. Register SSE handler
 sseMgr.RegisterHandler(api.EventActionRequest,
@@ -707,3 +737,229 @@ All log entries use `component=actions`.
 | `Error` | Payload parse failed          | `event_id`, `error`                         |
 | `Error` | Missing execution_id          | `event_id`                                  |
 | `Warn`  | Actions disabled              | `execution_id`, `action`                    |
+
+## SSE Event: `action_request`
+
+The control plane sends an `action_request` event over the existing SSE stream to trigger an action on a node. Like all SSE events, it is wrapped in a signed envelope and verified before processing.
+
+### Payload
+
+```json
+{
+  "execution_id": "exec_a1b2c3d4",
+  "action": "diagnostics.collect",
+  "type": "builtin",
+  "parameters": {
+    "include_network": true,
+    "include_processes": true
+  },
+  "timeout": "30s",
+  "callback_url": "https://api.plexsphere.io/v1/nodes/n_abc123/executions/exec_a1b2c3d4"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `execution_id` | string | Unique identifier for this execution |
+| `action` | string | Action name (e.g. `diagnostics.collect`, `hooks/backup`) |
+| `type` | string | `builtin` or `hook` |
+| `parameters` | object | Key-value parameters passed to the action |
+| `timeout` | duration | Maximum execution time (default: 30s) |
+| `callback_url` | string | URL for ACK/NACK and result delivery |
+
+The `issued_at`, `nonce`, and `signature` fields are part of the signed event envelope and apply to all SSE events uniformly.
+
+## ACK/NACK and Result Formats
+
+### ACK/NACK (immediate)
+
+```
+POST {callback_url}/ack
+
+{
+  "execution_id": "exec_a1b2c3d4",
+  "status": "accepted",       // or "rejected"
+  "reason": ""                 // Reason if rejected (e.g. "unknown action", "integrity violation")
+}
+```
+
+### Result (asynchronous)
+
+```
+POST {callback_url}/result
+
+{
+  "execution_id": "exec_a1b2c3d4",
+  "status": "success",         // success, failure, timeout, cancelled
+  "exit_code": 0,
+  "stdout": "...",             // Truncated to 64 KiB
+  "stderr": "...",             // Truncated to 64 KiB
+  "duration": "2.34s",
+  "finished_at": "2025-01-15T10:30:02Z"
+}
+```
+
+## Retry and Persistence
+
+- If the callback POST fails, plexd retries with exponential backoff (1s, 2s, 4s, ... up to 5 minutes).
+- Pending results are persisted to `data_dir` and re-delivered when the SSE connection is re-established.
+
+## Capability Announcement
+
+When plexd registers or when its capabilities change (e.g. hooks added/removed, binary updated), it announces its full capability set to the control plane.
+
+### Registration Flow
+
+During `POST /v1/register`, the `capabilities` field is included in the registration payload:
+
+```json
+{
+  "token": "plx_enroll_a8f3c7...",
+  "public_key": "...",
+  "hostname": "web-01",
+  "metadata": { },
+  "capabilities": {
+    "binary": {
+      "version": "1.4.2",
+      "checksum": "sha256:a1b2c3d4e5f6..."
+    },
+    "builtin_actions": [
+      {
+        "name": "diagnostics.collect",
+        "description": "Collect system diagnostics",
+        "parameters": [
+          { "name": "include_network", "type": "bool", "required": false, "default": "true" },
+          { "name": "include_processes", "type": "bool", "required": false, "default": "true" }
+        ]
+      }
+    ],
+    "hooks": [
+      {
+        "name": "backup",
+        "description": "Run incremental backup of application data",
+        "source": "script",
+        "checksum": "sha256:f7e8d9c0b1a2...",
+        "parameters": [
+          { "name": "target", "type": "string", "required": true },
+          { "name": "compress", "type": "bool", "required": false, "default": "true" }
+        ],
+        "timeout": "300s",
+        "sandbox": "namespaced"
+      },
+      {
+        "name": "db-backup",
+        "description": "PostgreSQL backup to S3",
+        "source": "crd",
+        "checksum": "sha256:abc123...",
+        "parameters": [
+          { "name": "bucket", "type": "string", "required": true },
+          { "name": "compress", "type": "bool", "required": false, "default": "true" }
+        ],
+        "timeout": "600s",
+        "privileged": false
+      }
+    ]
+  }
+}
+```
+
+### Runtime Capability Update
+
+```
+PUT /v1/nodes/{node_id}/capabilities
+```
+
+Used when capabilities change after initial registration (e.g. hook files added/removed/modified, `PlexdHook` CRs created/updated/deleted, plexd binary updated). Same `capabilities` payload structure as in the registration request.
+
+### Data Model
+
+| Type | Fields |
+|---|---|
+| `BinaryInfo` | `version`, `checksum` |
+| `ActionCapability` | `name`, `description`, `parameters[]` |
+| `HookCapability` | `name`, `description`, `source` (`script` or `crd`), `checksum`, `parameters[]`, `timeout`, `sandbox` (script) / `privileged` (crd) |
+| `ParameterDef` | `name`, `type`, `required`, `default`, `description` |
+
+## Kubernetes CRD Hooks
+
+When plexd runs as a DaemonSet in Kubernetes, hooks are defined as `PlexdHook` custom resources instead of script files. On `action_request`, plexd creates a Kubernetes Job on the target node.
+
+### Generated Job YAML
+
+When `action_request` arrives with `action: hooks/db-backup`, plexd creates:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: plexd-db-backup-exec-a1b2c3d4
+  namespace: plexd-system
+  labels:
+    plexd.plexsphere.com/hook: db-backup
+    plexd.plexsphere.com/execution-id: exec_a1b2c3d4
+  ownerReferences:
+    - apiVersion: plexd.plexsphere.com/v1alpha1
+      kind: PlexdHook
+      name: db-backup
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: worker-03
+      serviceAccountName: plexd-hook-runner
+      containers:
+        - name: backup
+          image: registry.example.com/tools/pg-backup:2.1@sha256:abc123...
+          command: ["/usr/local/bin/pg-backup.sh"]
+          env:
+            - name: PLEXD_PARAM_BUCKET
+              value: "s3://backups/prod"
+            - name: PLEXD_PARAM_COMPRESS
+              value: "true"
+            - name: PLEXD_EXECUTION_ID
+              value: "exec_a1b2c3d4"
+            - name: PLEXD_ACTION_NAME
+              value: "db-backup"
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql
+              readOnly: true
+      volumes:
+        - name: pgdata
+          hostPath:
+            path: /var/lib/postgresql
+      restartPolicy: Never
+```
+
+plexd pins the Job to the target node via `nodeSelector`, injects parameters as `PLEXD_PARAM_*` environment variables, and sets an `ownerReference` to the `PlexdHook` CR for garbage collection.
+
+### Result Mapping
+
+plexd watches the Job and maps its status to the action callback:
+
+| Job Condition | Callback Status | Notes |
+|---|---|---|
+| Succeeded | `success` | Exit code 0 |
+| Failed | `failure` | Exit code from container termination state |
+| `activeDeadlineSeconds` exceeded | `timeout` | Job killed by Kubernetes |
+
+Stdout and stderr are captured from the pod logs via the Kubernetes API.
+
+## Security Considerations
+
+- **Signed delivery** -- All SSE events (including `action_request`, `peer_added`, `peer_removed`, `rotate_keys`, etc.) are signed with the control plane's Ed25519 key. plexd verifies every signature before processing. Local action requests via Unix socket require a valid session JWT.
+- **Replay protection** -- Every SSE event includes `issued_at` (max staleness: 5 minutes) and `nonce` (tracked in bounded set). Signature verification, staleness, and nonce checks are applied uniformly to all event types.
+- **Hook file permissions** -- plexd verifies that hook files are owned by root and not group- or other-writable before execution.
+- **Symlink protection** -- Hook paths are resolved and validated to prevent symlink escape outside the configured hooks directory.
+- **Checksum enforcement** -- Hook checksums are verified before every execution. Binary checksums are reported continuously. On Kubernetes, image digests serve as checksums -- hooks without pinned digest (`@sha256:...`) are rejected.
+- **Resource isolation** -- Hooks run with cgroup limits at minimum; higher sandbox levels add namespace or container isolation. On Kubernetes, hooks always run as separate Pods with native resource limits.
+- **CRD privilege control** -- Kubernetes hooks requiring host-level access (`hostPID`, `hostNetwork`, `privileged`) must declare `privileged: true` in the `PlexdHook` spec. The platform can enforce approval policies.
+- **Session token scoping** -- JWTs are bound to a specific node (`node_id` claim) and a specific set of actions (`actions` claim). Tokens cannot be used on other nodes or for unauthorized actions.
+- **Session revocation** -- When an SSH session ends, the control plane pushes `session_revoked` via SSE. plexd maintains a local revocation set to reject tokens from terminated sessions.
+- **Local emergency access** -- `plexd actions run --local` requires root or plexd user, bypasses JWT authorization, but is logged as `local_emergency` and reported to the control plane.

@@ -302,6 +302,25 @@ Call `SessionManager.Shutdown()` on context cancellation to close all active ses
 mgr.Shutdown()
 ```
 
+## Access Flows
+
+### SSH Access Flow
+
+1. User requests SSH access through the platform UI/CLI.
+2. Control plane verifies RBAC permissions and issues a session JWT scoped to the target node and allowed actions.
+3. Control plane sends an `ssh_session_setup` event via SSE to the target node, including the session token.
+4. plexd opens a TCP listener on the mesh interface and tunnels the SSH connection through the encrypted mesh.
+5. The SSH session uses the node's managed host key (stored in `host_key_dir`). If the key file does not exist, plexd generates an Ed25519 host key on first use and reports its fingerprint to the control plane.
+6. Session environment is injected with `PLEXD_SESSION_TOKEN` for local action authorization.
+7. On disconnect or `default_timeout`, plexd tears down the session and notifies the control plane.
+
+### Kubernetes API Proxy Flow
+
+1. User requests kubectl access through the platform.
+2. Control plane issues a scoped kubeconfig with a short-lived token.
+3. plexd proxies the Kubernetes API request through the mesh to the target cluster's API server (auto-discovered via kubelet config or configured explicitly).
+4. The proxy terminates on `default_timeout` if no requests are received.
+
 ## Logging
 
 All log entries use `component=tunnel`. Session-scoped entries add `session_id`.

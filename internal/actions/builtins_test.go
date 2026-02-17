@@ -112,36 +112,36 @@ func TestBuiltinGatherInfo(t *testing.T) {
 	}
 }
 
-func TestBuiltinPing_MissingTarget(t *testing.T) {
+func TestBuiltinPingPeer_MissingPeerID(t *testing.T) {
 	info := &mockNodeInfo{
 		nodeID:    "node-1",
 		meshIP:    "10.99.0.1",
 		peerCount: 1,
 	}
 
-	fn := Ping(info)
+	fn := PingPeer(info)
 	_, _, exitCode, err := fn(context.Background(), map[string]string{})
 
 	if err == nil {
-		t.Fatal("expected error for missing target")
+		t.Fatal("expected error for missing peer_id")
 	}
 	if exitCode != 1 {
 		t.Errorf("expected exit code 1, got %d", exitCode)
 	}
-	if err.Error() != "missing required parameter: target" {
+	if err.Error() != "missing required parameter: peer_id" {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
 
-func TestBuiltinPing_InvalidTarget(t *testing.T) {
+func TestBuiltinPingPeer_InvalidPeerID(t *testing.T) {
 	info := &mockNodeInfo{
 		nodeID:    "node-1",
 		meshIP:    "10.99.0.1",
 		peerCount: 1,
 	}
 
-	fn := Ping(info)
-	_, stderr, exitCode, err := fn(context.Background(), map[string]string{"target": "not-an-ip"})
+	fn := PingPeer(info)
+	_, stderr, exitCode, err := fn(context.Background(), map[string]string{"peer_id": "not-an-ip"})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -149,12 +149,12 @@ func TestBuiltinPing_InvalidTarget(t *testing.T) {
 	if exitCode != 1 {
 		t.Errorf("expected exit code 1, got %d", exitCode)
 	}
-	if stderr == "" || !strings.Contains(stderr, "invalid target IP") {
-		t.Errorf("expected stderr to contain 'invalid target IP', got %q", stderr)
+	if stderr == "" || !strings.Contains(stderr, "invalid peer_id") {
+		t.Errorf("expected stderr to contain 'invalid peer_id', got %q", stderr)
 	}
 }
 
-func TestBuiltinPing_ValidTarget(t *testing.T) {
+func TestBuiltinPingPeer_ValidTarget(t *testing.T) {
 	if _, err := exec.LookPath("ping"); err != nil {
 		t.Skip("ping not available")
 	}
@@ -165,8 +165,8 @@ func TestBuiltinPing_ValidTarget(t *testing.T) {
 		peerCount: 1,
 	}
 
-	fn := Ping(info)
-	stdout, _, exitCode, err := fn(context.Background(), map[string]string{"target": "127.0.0.1"})
+	fn := PingPeer(info)
+	stdout, _, exitCode, err := fn(context.Background(), map[string]string{"peer_id": "127.0.0.1"})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -216,7 +216,7 @@ func TestBuiltinDiagnosticsCollect(t *testing.T) {
 	}
 }
 
-func TestBuiltinTraceroutePeer_MissingTarget(t *testing.T) {
+func TestBuiltinTraceroutePeer_MissingPeerID(t *testing.T) {
 	info := &mockNodeInfo{
 		nodeID:    "node-1",
 		meshIP:    "10.99.0.1",
@@ -227,17 +227,17 @@ func TestBuiltinTraceroutePeer_MissingTarget(t *testing.T) {
 	_, _, exitCode, err := fn(context.Background(), map[string]string{})
 
 	if err == nil {
-		t.Fatal("expected error for missing target")
+		t.Fatal("expected error for missing peer_id")
 	}
 	if exitCode != 1 {
 		t.Errorf("expected exit code 1, got %d", exitCode)
 	}
-	if err.Error() != "missing required parameter: target" {
+	if err.Error() != "missing required parameter: peer_id" {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
 
-func TestBuiltinTraceroutePeer_InvalidTarget(t *testing.T) {
+func TestBuiltinTraceroutePeer_InvalidPeerID(t *testing.T) {
 	info := &mockNodeInfo{
 		nodeID:    "node-1",
 		meshIP:    "10.99.0.1",
@@ -245,7 +245,7 @@ func TestBuiltinTraceroutePeer_InvalidTarget(t *testing.T) {
 	}
 
 	fn := DiagnosticsTraceroutePeer(info)
-	_, stderr, exitCode, err := fn(context.Background(), map[string]string{"target": "not-an-ip"})
+	_, stderr, exitCode, err := fn(context.Background(), map[string]string{"peer_id": "not-an-ip"})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -253,8 +253,8 @@ func TestBuiltinTraceroutePeer_InvalidTarget(t *testing.T) {
 	if exitCode != 1 {
 		t.Errorf("expected exit code 1, got %d", exitCode)
 	}
-	if stderr == "" || !strings.Contains(stderr, "invalid target IP") {
-		t.Errorf("expected stderr to contain 'invalid target IP', got %q", stderr)
+	if stderr == "" || !strings.Contains(stderr, "invalid peer_id") {
+		t.Errorf("expected stderr to contain 'invalid peer_id', got %q", stderr)
 	}
 }
 
@@ -292,30 +292,28 @@ func TestBuiltinServiceReloadConfig(t *testing.T) {
 	}
 }
 
-func TestBuiltinServiceUpgrade(t *testing.T) {
-	fn := ServiceUpgrade()
-	stdout, stderr, exitCode, err := fn(context.Background(), nil)
+func TestBuiltinServiceUpgrade_MissingVersion(t *testing.T) {
+	fn := ServiceUpgrade(nil)
+	_, _, exitCode, err := fn(context.Background(), nil)
 
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected error for missing version parameter")
 	}
-	if exitCode != 0 {
-		t.Fatalf("expected exit code 0, got %d", exitCode)
+	if exitCode != 1 {
+		t.Fatalf("expected exit code 1, got %d", exitCode)
 	}
-	if stderr != "" {
-		t.Fatalf("expected empty stderr, got %q", stderr)
-	}
+}
 
-	var result map[string]any
-	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
-		t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
-	}
+func TestBuiltinServiceUpgrade_MissingChecksum(t *testing.T) {
+	fn := ServiceUpgrade(nil)
+	params := map[string]string{"version": "1.5.0"}
+	_, _, exitCode, err := fn(context.Background(), params)
 
-	if result["status"] != "upgrade_not_available" {
-		t.Errorf("expected status='upgrade_not_available', got %q", result["status"])
+	if err == nil {
+		t.Fatal("expected error for missing checksum parameter")
 	}
-	if _, ok := result["message"]; !ok {
-		t.Error("missing key 'message' in JSON output")
+	if exitCode != 1 {
+		t.Fatalf("expected exit code 1, got %d", exitCode)
 	}
 }
 
