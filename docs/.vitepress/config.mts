@@ -12,6 +12,7 @@ export default withMermaid(defineConfig({
       { text: 'Guide', link: '/guide/installation' },
       { text: 'How-To', link: '/how-to/bare-metal-installation' },
       { text: 'Reference', link: '/reference/core/cli' },
+      { text: 'Internals', link: '/concepts' },
     ],
 
     sidebar: [
@@ -43,23 +44,48 @@ export default withMermaid(defineConfig({
       {
         text: 'Reference',
         items: [
+          { text: 'CLI', link: '/reference/core/cli' },
+          { text: 'Configuration', link: '/reference/core/configuration' },
+          { text: 'Environment Variables', link: '/reference/core/environment-variables' },
+          { text: 'Key Storage', link: '/reference/core/key-storage' },
+          { text: 'API Endpoints', link: '/reference/core/api-endpoints' },
+          { text: 'Node API', link: '/reference/core/nodeapi' },
+          {
+            text: 'Actions',
+            collapsed: true,
+            items: [
+              { text: 'Remote Actions & Hooks', link: '/reference/actions/remote-actions-hooks' },
+              { text: 'Session Authorization', link: '/reference/actions/session-authorization' },
+              { text: 'Sandbox Options', link: '/reference/actions/sandbox-options' },
+              { text: 'PlexdHook CRD', link: '/reference/actions/plexdhook-crd' },
+            ],
+          },
+          {
+            text: 'Deployment',
+            collapsed: true,
+            items: [
+              { text: 'Bare-Metal Packaging', link: '/reference/deployment/bare-metal-packaging' },
+              { text: 'Cloud-Init VM', link: '/reference/deployment/cloud-init-vm-deployment' },
+              { text: 'Kubernetes DaemonSet', link: '/reference/deployment/kubernetes-deployment' },
+              { text: 'Dockerfile', link: '/reference/deployment/dockerfile' },
+            ],
+          },
+        ],
+      },
+      {
+        text: 'Internals',
+        items: [
+          { text: 'Agent Internals', link: '/concepts' },
           {
             text: 'Core',
-            collapsed: false,
+            collapsed: true,
             items: [
-              { text: 'Agent Internals', link: '/concepts' },
-              { text: 'CLI', link: '/reference/core/cli' },
-              { text: 'Configuration', link: '/reference/core/configuration' },
-              { text: 'Environment Variables', link: '/reference/core/environment-variables' },
               { text: 'Control Plane Client', link: '/reference/core/control-plane-client' },
               { text: 'API Types', link: '/reference/core/api-types' },
               { text: 'Event Verification', link: '/reference/core/event-verification' },
               { text: 'Registration', link: '/reference/core/registration' },
               { text: 'Reconciliation', link: '/reference/core/reconciliation' },
               { text: 'Heartbeat Service', link: '/reference/core/heartbeat-service' },
-              { text: 'Local Node API', link: '/reference/core/nodeapi' },
-              { text: 'Control Plane API Endpoints', link: '/reference/core/api-endpoints' },
-              { text: 'Key Storage', link: '/reference/core/key-storage' },
             ],
           },
           {
@@ -98,27 +124,7 @@ export default withMermaid(defineConfig({
               { text: 'Audit Forwarding', link: '/reference/observability/audit-forwarding' },
             ],
           },
-          {
-            text: 'Actions',
-            collapsed: true,
-            items: [
-              { text: 'Remote Actions & Hooks', link: '/reference/actions/remote-actions-hooks' },
-              { text: 'Session Authorization', link: '/reference/actions/session-authorization' },
-              { text: 'Sandbox Options', link: '/reference/actions/sandbox-options' },
-              { text: 'PlexdHook CRD', link: '/reference/actions/plexdhook-crd' },
-              { text: 'Integrity Verification', link: '/reference/actions/integrity-verification' },
-            ],
-          },
-          {
-            text: 'Deployment',
-            collapsed: true,
-            items: [
-              { text: 'Bare-Metal Packaging', link: '/reference/deployment/bare-metal-packaging' },
-              { text: 'Cloud-Init VM', link: '/reference/deployment/cloud-init-vm-deployment' },
-              { text: 'Kubernetes DaemonSet', link: '/reference/deployment/kubernetes-deployment' },
-              { text: 'Dockerfile', link: '/reference/deployment/dockerfile' },
-            ],
-          },
+          { text: 'Integrity Verification', link: '/reference/actions/integrity-verification' },
           {
             text: 'Development',
             collapsed: true,
