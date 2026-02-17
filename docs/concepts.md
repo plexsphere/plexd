@@ -147,4 +147,4 @@ The SSE manager processes these event types:
 - [Configuration Reference](reference/core/configuration.md) — Full YAML configuration schema
 - [CLI Reference](reference/core/cli.md) — Command-line interface and subcommands
 - [Environment Variables Reference](reference/core/environment-variables.md) — All `PLEXD_*` overrides
-- [README](../README.md) — Project overview and quick start
+- [README](https://github.com/plexsphere/plexd#readme) — Project overview and quick start

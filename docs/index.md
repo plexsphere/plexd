@@ -1,6 +1,6 @@
 # plexd Documentation
 
-plexd is the Plexsphere node agent — a lightweight daemon that runs on every managed node, handles registration, state reconciliation, remote actions, and observability forwarding. For architecture and component overview, see [Architecture and Concepts](concepts.md). For build instructions and quick start, see the [README](../README.md).
+plexd is the Plexsphere node agent — a lightweight daemon that runs on every managed node, handles registration, state reconciliation, remote actions, and observability forwarding. For architecture and component overview, see [Architecture and Concepts](concepts.md). For build instructions and quick start, see the [README](https://github.com/plexsphere/plexd#readme).
 
 ## Getting Started
 

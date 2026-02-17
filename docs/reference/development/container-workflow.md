@@ -42,11 +42,13 @@ Single job on `ubuntu-latest` with `timeout-minutes: 30`. No matrix strategy —
 
 ### Login
 
+::: v-pre
 Authenticates to `ghcr.io` using:
 
 - **registry:** `ghcr.io`
 - **username:** `${{ github.actor }}`
 - **password:** `${{ secrets.GITHUB_TOKEN }}`
+:::
 
 ### Metadata
 
@@ -56,15 +58,18 @@ The metadata step (id: `meta`) configures image name and tag rules:
 
 ### Build and Push
 
+::: v-pre
 - **context:** `.` (repository root)
 - **file:** `deploy/docker/Dockerfile`
 - **platforms:** `linux/amd64,linux/arm64`
 - **push:** `true`
 - **tags:** `${{ steps.meta.outputs.tags }}`
 - **labels:** `${{ steps.meta.outputs.labels }}`
+:::
 
 ## Image Tagging Strategy
 
+::: v-pre
 | Trigger            | Tag Rule                                  | Example Input | Example Tags                  |
 |--------------------|-------------------------------------------|---------------|-------------------------------|
 | Tag push `v1.2.3`  | `type=semver,pattern={{version}}`          | `v1.2.3`      | `1.2.3`                       |
@@ -74,9 +79,11 @@ The metadata step (id: `meta`) configures image name and tag rules:
 | Main push          | `type=raw,value=dev,enable={{is_default_branch}}` | (any)  | `dev`                         |
 
 For non-prerelease semver tags, `metadata-action` automatically adds a `latest` tag (default behavior). Main-branch pushes produce only the `dev` tag — no semver tags and no `latest`.
+:::
 
 ## Build Arguments
 
+::: v-pre
 The build step passes version metadata as Docker build arguments, matching the `ARG` declarations in `deploy/docker/Dockerfile`:
 
 | Build Arg  | Source                                                                       | Dockerfile Default |
@@ -86,6 +93,7 @@ The build step passes version metadata as Docker build arguments, matching the `
 | `DATE`     | `${{ github.event.head_commit.timestamp \|\| github.event.repository.updated_at }}` | `unknown`   |
 
 These are injected into the binary via `-ldflags` targeting `main.version`, `main.commit`, and `main.date`.
+:::
 
 ## Platforms
 
