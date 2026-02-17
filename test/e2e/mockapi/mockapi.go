@@ -6,6 +6,8 @@ package mockapi
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -80,20 +82,39 @@ type Server struct {
 	stateFixture   api.StateResponse
 	stateFixtureMu sync.RWMutex
 
+	heartbeatFixture   api.HeartbeatResponse
+	heartbeatFixtureMu sync.RWMutex
+
 	lastRequests   map[string][]byte
 	lastRequestsMu sync.RWMutex
 
 	sseClientID atomic.Uint64
+
+	signingPrivateKey ed25519.PrivateKey
+	signingPublicKeyB64 string
 
 	mux *http.ServeMux
 }
 
 // New creates a new mock API server with all routes registered.
 func New() *Server {
+	// Generate a real ed25519 key pair for event signing.
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		panic("mockapi: generate signing key: " + err.Error())
+	}
+	pubB64 := base64.StdEncoding.EncodeToString(pub)
+
 	s := &Server{
-		KeepAliveInterval: DefaultKeepAliveInterval,
-		lastRequests:      make(map[string][]byte),
-		mux:               http.NewServeMux(),
+		KeepAliveInterval:   DefaultKeepAliveInterval,
+		lastRequests:        make(map[string][]byte),
+		mux:                 http.NewServeMux(),
+		signingPrivateKey:   priv,
+		signingPublicKeyB64: pubB64,
+		heartbeatFixture: api.HeartbeatResponse{
+			Reconcile:  true,
+			RotateKeys: false,
+		},
 		stateFixture: api.StateResponse{
 			Peers: fixturePeers,
 			Policies: []api.Policy{
@@ -118,8 +139,8 @@ func New() *Server {
 				},
 			},
 			SigningKeys: &api.SigningKeys{
-				Current:  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-				Previous: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+				Current:  pubB64,
+				Previous: pubB64,
 			},
 			Metadata: map[string]string{
 				"environment": "e2e-test",
@@ -288,6 +309,7 @@ func (s *Server) registerRoutes() {
 	// Test control endpoints.
 	s.mux.HandleFunc("PUT /test/state", s.handleSetState)
 	s.mux.HandleFunc("POST /test/configure-state", s.handleSetState)
+	s.mux.HandleFunc("POST /test/configure-heartbeat", s.handleConfigureHeartbeat)
 	s.mux.HandleFunc("POST /test/inject-event", s.handleInjectEvent)
 	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
 
@@ -313,6 +335,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/integrity/violations", methodNotAllowed)
 	s.mux.HandleFunc("/test/state", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-state", methodNotAllowed)
+	s.mux.HandleFunc("/test/configure-heartbeat", methodNotAllowed)
 	s.mux.HandleFunc("/test/inject-event", methodNotAllowed)
 }
 
@@ -383,7 +406,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	resp := api.RegisterResponse{
 		NodeID:          "node-mock-001",
 		MeshIP:          "10.99.0.1",
-		SigningPublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		SigningPublicKey: s.signingPublicKeyB64,
 		NodeSecretKey:   "mock-node-secret-key-abc123",
 		Peers:           fixturePeers,
 	}
@@ -399,10 +422,9 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	s.heartbeatCount.Add(1)
 
-	resp := api.HeartbeatResponse{
-		Reconcile:  true,
-		RotateKeys: false,
-	}
+	s.heartbeatFixtureMu.RLock()
+	resp := s.heartbeatFixture
+	s.heartbeatFixtureMu.RUnlock()
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -440,14 +462,15 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nodeID := r.PathValue("id")
+	nonce := fmt.Sprintf("mock-nonce-%d", time.Now().UnixNano())
 	envelope := api.SignedEnvelope{
 		EventType: api.EventNodeStateUpdated,
 		EventID:   "evt-mock-001",
 		IssuedAt:  time.Now().UTC(),
-		Nonce:     "mock-nonce-001",
+		Nonce:     nonce,
 		Payload:   json.RawMessage(fmt.Sprintf(`{"node_id":%q}`, nodeID)),
-		Signature: "mock-signature-placeholder",
 	}
+	s.signEnvelope(&envelope)
 
 	data, err := json.Marshal(envelope)
 	if err != nil {
@@ -707,6 +730,23 @@ func (s *Server) handleSetState(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// SetHeartbeatResponse updates the mutable heartbeat response fixture.
+func (s *Server) SetHeartbeatResponse(resp api.HeartbeatResponse) {
+	s.heartbeatFixtureMu.Lock()
+	s.heartbeatFixture = resp
+	s.heartbeatFixtureMu.Unlock()
+}
+
+// handleConfigureHeartbeat handles POST /test/configure-heartbeat.
+func (s *Server) handleConfigureHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var resp api.HeartbeatResponse
+	if !s.decodeBody(w, r, "configure_heartbeat", &resp) {
+		return
+	}
+	s.SetHeartbeatResponse(resp)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // BroadcastSSE sends an SSE event to all connected SSE clients.
 func (s *Server) BroadcastSSE(envelope api.SignedEnvelope) {
 	s.sseClients.Range(func(key, value any) bool {
@@ -721,14 +761,45 @@ func (s *Server) BroadcastSSE(envelope api.SignedEnvelope) {
 }
 
 // handleInjectEvent handles POST /test/inject-event.
+// It sets issued_at to the current time and computes a valid ed25519 signature
+// so the agent's verifier accepts the event.
 func (s *Server) handleInjectEvent(w http.ResponseWriter, r *http.Request) {
 	var envelope api.SignedEnvelope
 	if !s.decodeBody(w, r, "inject_event", &envelope) {
 		return
 	}
+
+	// Override timestamp and sign the envelope so it passes verification.
+	envelope.IssuedAt = time.Now().UTC()
+	s.signEnvelope(&envelope)
+
 	s.injectEventCount.Add(1)
 	s.BroadcastSSE(envelope)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// signEnvelope computes a valid ed25519 signature for the envelope using the
+// mock API's signing key. The canonical form matches internal/api/verifier.go.
+func (s *Server) signEnvelope(envelope *api.SignedEnvelope) {
+	type canonicalEnvelope struct {
+		EventType string          `json:"event_type"`
+		EventID   string          `json:"event_id"`
+		IssuedAt  time.Time       `json:"issued_at"`
+		Nonce     string          `json:"nonce"`
+		Payload   json.RawMessage `json:"payload"`
+	}
+	canonical, err := json.Marshal(canonicalEnvelope{
+		EventType: envelope.EventType,
+		EventID:   envelope.EventID,
+		IssuedAt:  envelope.IssuedAt,
+		Nonce:     envelope.Nonce,
+		Payload:   envelope.Payload,
+	})
+	if err != nil {
+		panic("mockapi: marshal canonical envelope: " + err.Error())
+	}
+	sig := ed25519.Sign(s.signingPrivateKey, canonical)
+	envelope.Signature = base64.StdEncoding.EncodeToString(sig)
 }
 
 // handleLastRequest handles GET /test/last-request/{endpoint}.

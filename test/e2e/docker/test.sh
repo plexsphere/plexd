@@ -10,6 +10,9 @@
 #   - Log injection (docker cp into container, verify logs_count increases)
 #   - Agent restart for audit verification (ProcessSource fires per-process)
 #   - SSE event injection triggers reconciliation (state_count increases)
+#   - Action execution via SSE (action_request → ack + result)
+#   - Heartbeat-triggered reconcile via RotateKeys flag
+#   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Graceful shutdown (exit code 0, no crash indicators)
 set -euo pipefail
 
@@ -406,7 +409,275 @@ fi
 echo "=== Phase 7 PASSED: SSE event injection ==="
 
 # ===================================================================
-# Phase 8: Graceful shutdown verification
+# Phase 8: Action execution via SSE injection
+# ===================================================================
+echo "=== Testing action execution via SSE ==="
+
+# Record current execution counters.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+ACK_BEFORE=$(get_counter "${RESPONSE}" "execution_ack_count")
+RESULT_BEFORE=$(get_counter "${RESPONSE}" "execution_result_count")
+echo "  execution_ack_count before: ${ACK_BEFORE}"
+echo "  execution_result_count before: ${RESULT_BEFORE}"
+
+# Inject an action_request SSE event for the builtin "system.info" action.
+ACTION_PAYLOAD=$(cat <<'ACTEOF'
+{
+    "event_type": "action_request",
+    "event_id": "evt-e2e-action-001",
+    "issued_at": "2099-01-01T00:00:00Z",
+    "nonce": "e2e-action-nonce-001",
+    "payload": {
+        "execution_id": "exec-e2e-001",
+        "action": "system.info",
+        "timeout": "30s"
+    },
+    "signature": "mock-signature"
+}
+ACTEOF
+)
+ACTION_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${ACTION_PAYLOAD}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${ACTION_STATUS}" != "204" ]; then
+    fail "action_request event injection returned status ${ACTION_STATUS}, want 204"
+fi
+echo "  action_request event injected successfully"
+
+# Poll for execution_ack_count and execution_result_count to increase.
+ACTION_TIMEOUT=30
+ACTION_ELAPSED=0
+ACK_PASSED=0
+RESULT_PASSED=0
+while [ "${ACTION_ELAPSED}" -lt "${ACTION_TIMEOUT}" ]; do
+    sleep 2
+    ACTION_ELAPSED=$((ACTION_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        ACK_AFTER=$(get_counter "${RESPONSE}" "execution_ack_count")
+        RESULT_AFTER=$(get_counter "${RESPONSE}" "execution_result_count")
+        if [ "${ACK_AFTER}" -gt "${ACK_BEFORE}" ] && [ "${ACK_PASSED}" -eq 0 ]; then
+            echo "  PASS: execution_ack_count increased from ${ACK_BEFORE} to ${ACK_AFTER}"
+            ACK_PASSED=1
+        fi
+        if [ "${RESULT_AFTER}" -gt "${RESULT_BEFORE}" ] && [ "${RESULT_PASSED}" -eq 0 ]; then
+            echo "  PASS: execution_result_count increased from ${RESULT_BEFORE} to ${RESULT_AFTER}"
+            RESULT_PASSED=1
+        fi
+        if [ "${ACK_PASSED}" -eq 1 ] && [ "${RESULT_PASSED}" -eq 1 ]; then
+            break
+        fi
+    fi
+done
+
+if [ "${ACK_PASSED}" -eq 0 ]; then
+    ACK_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_ack_count")
+    fail "execution_ack_count did not increase (before=${ACK_BEFORE}, after=${ACK_AFTER})"
+fi
+if [ "${RESULT_PASSED}" -eq 0 ]; then
+    RESULT_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_result_count")
+    fail "execution_result_count did not increase (before=${RESULT_BEFORE}, after=${RESULT_AFTER})"
+fi
+
+# Validate execution_ack request body.
+ACK_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_ack" 2>/dev/null || true)
+if [ -n "${ACK_BODY}" ]; then
+    ACK_EID=$(echo "${ACK_BODY}" | jq -r '.execution_id // empty')
+    ACK_STATUS_VAL=$(echo "${ACK_BODY}" | jq -r '.status // empty')
+    if [ "${ACK_EID}" = "exec-e2e-001" ]; then
+        echo "  PASS: execution_ack execution_id matches"
+    else
+        echo "  WARN: execution_ack execution_id = '${ACK_EID}', expected 'exec-e2e-001'"
+    fi
+    if [ "${ACK_STATUS_VAL}" = "accepted" ]; then
+        echo "  PASS: execution_ack status = accepted"
+    else
+        echo "  WARN: execution_ack status = '${ACK_STATUS_VAL}', expected 'accepted'"
+    fi
+fi
+
+# Validate execution_result request body.
+RESULT_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_result" 2>/dev/null || true)
+if [ -n "${RESULT_BODY}" ]; then
+    RES_EID=$(echo "${RESULT_BODY}" | jq -r '.execution_id // empty')
+    RES_STATUS_VAL=$(echo "${RESULT_BODY}" | jq -r '.status // empty')
+    RES_STDOUT=$(echo "${RESULT_BODY}" | jq -r '.stdout // empty')
+    if [ "${RES_EID}" = "exec-e2e-001" ]; then
+        echo "  PASS: execution_result execution_id matches"
+    else
+        echo "  WARN: execution_result execution_id = '${RES_EID}', expected 'exec-e2e-001'"
+    fi
+    if [ "${RES_STATUS_VAL}" = "success" ]; then
+        echo "  PASS: execution_result status = success"
+    else
+        echo "  WARN: execution_result status = '${RES_STATUS_VAL}', expected 'success'"
+    fi
+    if [ -n "${RES_STDOUT}" ]; then
+        echo "  PASS: execution_result has stdout output"
+    fi
+fi
+
+echo "=== Phase 8 PASSED: action execution ==="
+
+# ===================================================================
+# Phase 9: Heartbeat-triggered reconcile (RotateKeys flag)
+# ===================================================================
+echo "=== Testing heartbeat-triggered reconcile via RotateKeys ==="
+
+# Record current state_count before enabling RotateKeys.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+STATE_BEFORE_KR=$(get_counter "${RESPONSE}" "state_count")
+echo "  state_count before: ${STATE_BEFORE_KR}"
+
+# Configure mock API to return RotateKeys: true in heartbeat responses.
+# This should trigger a reconcile cycle, which re-fetches state.
+KR_CONFIG='{"reconcile":true,"rotate_keys":true}'
+KR_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${KR_CONFIG}" \
+    "http://localhost:18080/test/configure-heartbeat" 2>/dev/null || true)
+if [ "${KR_STATUS}" != "204" ]; then
+    fail "configure-heartbeat returned status ${KR_STATUS}, want 204"
+fi
+echo "  heartbeat response configured with rotate_keys=true"
+
+# Wait for state_count to increase (proving the RotateKeys flag triggered a reconcile).
+KR_TIMEOUT=60
+KR_ELAPSED=0
+while [ "${KR_ELAPSED}" -lt "${KR_TIMEOUT}" ]; do
+    sleep 3
+    KR_ELAPSED=$((KR_ELAPSED + 3))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        STATE_AFTER_KR=$(get_counter "${RESPONSE}" "state_count")
+        if [ "${STATE_AFTER_KR}" -gt "${STATE_BEFORE_KR}" ]; then
+            echo "  PASS: state_count increased from ${STATE_BEFORE_KR} to ${STATE_AFTER_KR} (reconcile triggered)"
+            break
+        fi
+    fi
+done
+
+if [ "${KR_ELAPSED}" -ge "${KR_TIMEOUT}" ]; then
+    STATE_AFTER_KR=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    fail "state_count did not increase after RotateKeys=true (before=${STATE_BEFORE_KR}, after=${STATE_AFTER_KR})"
+fi
+
+# Reset heartbeat response to not rotate keys (avoid triggering continuously).
+curl -sf -X POST -H "Content-Type: application/json" \
+    -d '{"reconcile":true,"rotate_keys":false}' \
+    "http://localhost:18080/test/configure-heartbeat" >/dev/null 2>&1 || true
+
+echo "=== Phase 9 PASSED: heartbeat-triggered reconcile ==="
+
+# ===================================================================
+# Phase 10: Deeper body validation
+# ===================================================================
+echo "=== Deeper body validation ==="
+
+# 10a. Metrics body: validate MetricPoint fields (timestamp, group, data).
+METRICS_BODY=$(curl -sf "http://localhost:18080/test/last-request/metrics" 2>/dev/null || true)
+if [ -n "${METRICS_BODY}" ]; then
+    FIRST_METRIC=$(echo "${METRICS_BODY}" | jq '.[0]')
+    MET_TS=$(echo "${FIRST_METRIC}" | jq -r '.timestamp // empty')
+    MET_GROUP=$(echo "${FIRST_METRIC}" | jq -r '.group // empty')
+    MET_DATA=$(echo "${FIRST_METRIC}" | jq -r '.data // empty')
+    if [ -n "${MET_TS}" ]; then
+        echo "  PASS: metric[0] has timestamp"
+    else
+        fail "metric[0] missing 'timestamp' field"
+    fi
+    if [ -n "${MET_GROUP}" ]; then
+        echo "  PASS: metric[0] has group='${MET_GROUP}'"
+    else
+        fail "metric[0] missing 'group' field"
+    fi
+    if [ -n "${MET_DATA}" ] && [ "${MET_DATA}" != "null" ]; then
+        echo "  PASS: metric[0] has data payload"
+    else
+        fail "metric[0] missing 'data' field"
+    fi
+else
+    echo "  WARN: no metrics body captured"
+fi
+
+# 10b. Audit body: validate AuditEntry fields (timestamp, source, event_type, action, result).
+AUDIT_BODY=$(curl -sf "http://localhost:18080/test/last-request/audit" 2>/dev/null || true)
+if [ -n "${AUDIT_BODY}" ]; then
+    FIRST_AUDIT=$(echo "${AUDIT_BODY}" | jq '.[0]')
+    AUD_TS=$(echo "${FIRST_AUDIT}" | jq -r '.timestamp // empty')
+    AUD_SRC=$(echo "${FIRST_AUDIT}" | jq -r '.source // empty')
+    AUD_EVT=$(echo "${FIRST_AUDIT}" | jq -r '.event_type // empty')
+    AUD_ACT=$(echo "${FIRST_AUDIT}" | jq -r '.action // empty')
+    AUD_RES=$(echo "${FIRST_AUDIT}" | jq -r '.result // empty')
+    if [ -n "${AUD_TS}" ]; then
+        echo "  PASS: audit[0] has timestamp"
+    else
+        fail "audit[0] missing 'timestamp' field"
+    fi
+    if [ -n "${AUD_SRC}" ]; then
+        echo "  PASS: audit[0] has source='${AUD_SRC}'"
+    else
+        fail "audit[0] missing 'source' field"
+    fi
+    if [ -n "${AUD_EVT}" ]; then
+        echo "  PASS: audit[0] has event_type='${AUD_EVT}'"
+    else
+        fail "audit[0] missing 'event_type' field"
+    fi
+    if [ -n "${AUD_ACT}" ]; then
+        echo "  PASS: audit[0] has action='${AUD_ACT}'"
+    else
+        echo "  WARN: audit[0] missing 'action' field (may be omitted for some sources)"
+    fi
+    if [ -n "${AUD_RES}" ]; then
+        echo "  PASS: audit[0] has result='${AUD_RES}'"
+    else
+        echo "  WARN: audit[0] missing 'result' field (may be omitted for some sources)"
+    fi
+else
+    echo "  WARN: no audit body captured"
+fi
+
+# 10c. Capabilities: validate specific builtin action names.
+CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
+if [ -n "${CAPS_BODY}" ]; then
+    # Verify known builtin actions are present.
+    for expected_action in "diagnostics.collect" "system.info" "service.restart" "health.check" "config.dump"; do
+        HAS_ACTION=$(echo "${CAPS_BODY}" | jq --arg name "${expected_action}" \
+            '[.builtin_actions[] | select(.name == $name)] | length')
+        if [ "${HAS_ACTION}" -ge 1 ]; then
+            echo "  PASS: capabilities includes builtin '${expected_action}'"
+        else
+            echo "  WARN: capabilities missing builtin '${expected_action}'"
+        fi
+    done
+
+    # Verify builtin actions have required fields (name, description).
+    BAD_ACTIONS=$(echo "${CAPS_BODY}" | jq '[.builtin_actions[] | select(.name == "" or .description == "")] | length')
+    if [ "${BAD_ACTIONS}" -eq 0 ]; then
+        echo "  PASS: all builtin_actions have name and description"
+    else
+        fail "found ${BAD_ACTIONS} builtin_actions without name or description"
+    fi
+fi
+
+# 10d. Drift body: validate corrections array exists.
+DRIFT_BODY=$(curl -sf "http://localhost:18080/test/last-request/drift" 2>/dev/null || true)
+if [ -n "${DRIFT_BODY}" ]; then
+    HAS_CORRECTIONS=$(echo "${DRIFT_BODY}" | jq 'has("corrections")')
+    if [ "${HAS_CORRECTIONS}" = "true" ]; then
+        CORR_LEN=$(echo "${DRIFT_BODY}" | jq '.corrections | length')
+        echo "  PASS: drift body has corrections array (length=${CORR_LEN})"
+    else
+        fail "drift body missing 'corrections' field"
+    fi
+fi
+
+echo "=== Phase 10 PASSED: deeper body validation ==="
+
+# ===================================================================
+# Phase 11: Graceful shutdown verification
 # ===================================================================
 echo "=== Testing graceful shutdown ==="
 
@@ -451,7 +722,7 @@ else
     echo "  WARN: no explicit shutdown message found in plexd logs"
 fi
 
-echo "=== Phase 8 PASSED: graceful shutdown ==="
+echo "=== Phase 11 PASSED: graceful shutdown ==="
 
 TEST_FAILED=0
 echo "=== ALL TESTS PASSED ==="

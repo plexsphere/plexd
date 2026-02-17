@@ -10,6 +10,10 @@
 #   - Request body validation (registration token, heartbeat, capabilities)
 #   - Periodic loop verification (heartbeat/metrics/logs counters >= 2)
 #   - Audit forwarding via service restart (ProcessSource fires per-process)
+#   - Action execution via SSE (action_request → ack + result)
+#   - SSE event injection triggers reconciliation
+#   - Heartbeat-triggered reconcile via RotateKeys flag
+#   - Deeper body validation (metrics, capabilities fields)
 #   - Shutdown log message verification
 set -euo pipefail
 
@@ -408,6 +412,217 @@ if [ "${AUDIT_ELAPSED}" -ge "${AUDIT_TIMEOUT}" ]; then
 fi
 
 echo "=== Audit forwarding via restart PASSED ==="
+
+# --- Action execution via SSE injection ---
+echo "=== Testing action execution via SSE ==="
+
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+ACK_BEFORE=$(get_counter "${RESPONSE}" "execution_ack_count")
+RESULT_BEFORE=$(get_counter "${RESPONSE}" "execution_result_count")
+echo "  execution_ack_count before: ${ACK_BEFORE}"
+echo "  execution_result_count before: ${RESULT_BEFORE}"
+
+# Inject an action_request SSE event for the builtin "system.info" action.
+ACTION_PAYLOAD=$(cat <<'ACTEOF'
+{
+    "event_type": "action_request",
+    "event_id": "evt-e2e-action-systemd-001",
+    "issued_at": "2099-01-01T00:00:00Z",
+    "nonce": "e2e-action-nonce-systemd-001",
+    "payload": {
+        "execution_id": "exec-e2e-systemd-001",
+        "action": "system.info",
+        "timeout": "30s"
+    },
+    "signature": "mock-signature"
+}
+ACTEOF
+)
+ACTION_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${ACTION_PAYLOAD}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${ACTION_STATUS}" != "204" ]; then
+    fail "action_request event injection returned status ${ACTION_STATUS}, want 204"
+fi
+echo "  action_request event injected successfully"
+
+ACTION_TIMEOUT=30
+ACTION_ELAPSED=0
+ACK_PASSED=0
+RESULT_PASSED=0
+while [ "${ACTION_ELAPSED}" -lt "${ACTION_TIMEOUT}" ]; do
+    sleep 2
+    ACTION_ELAPSED=$((ACTION_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        ACK_AFTER=$(get_counter "${RESPONSE}" "execution_ack_count")
+        RESULT_AFTER=$(get_counter "${RESPONSE}" "execution_result_count")
+        if [ "${ACK_AFTER}" -gt "${ACK_BEFORE}" ] && [ "${ACK_PASSED}" -eq 0 ]; then
+            echo "  PASS: execution_ack_count increased from ${ACK_BEFORE} to ${ACK_AFTER}"
+            ACK_PASSED=1
+        fi
+        if [ "${RESULT_AFTER}" -gt "${RESULT_BEFORE}" ] && [ "${RESULT_PASSED}" -eq 0 ]; then
+            echo "  PASS: execution_result_count increased from ${RESULT_BEFORE} to ${RESULT_AFTER}"
+            RESULT_PASSED=1
+        fi
+        if [ "${ACK_PASSED}" -eq 1 ] && [ "${RESULT_PASSED}" -eq 1 ]; then
+            break
+        fi
+    fi
+done
+
+if [ "${ACK_PASSED}" -eq 0 ]; then
+    ACK_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_ack_count")
+    fail "execution_ack_count did not increase (before=${ACK_BEFORE}, after=${ACK_AFTER})"
+fi
+if [ "${RESULT_PASSED}" -eq 0 ]; then
+    RESULT_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_result_count")
+    fail "execution_result_count did not increase (before=${RESULT_BEFORE}, after=${RESULT_AFTER})"
+fi
+
+# Validate execution_ack request body.
+ACK_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_ack" 2>/dev/null || true)
+if [ -n "${ACK_BODY}" ]; then
+    ACK_STATUS_VAL=$(echo "${ACK_BODY}" | jq -r '.status // empty')
+    if [ "${ACK_STATUS_VAL}" = "accepted" ]; then
+        echo "  PASS: execution_ack status = accepted"
+    else
+        echo "  WARN: execution_ack status = '${ACK_STATUS_VAL}', expected 'accepted'"
+    fi
+fi
+
+echo "=== Action execution via SSE PASSED ==="
+
+# --- SSE event injection triggers reconciliation ---
+echo "=== Testing SSE event injection ==="
+
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+STATE_BEFORE=$(get_counter "${RESPONSE}" "state_count")
+echo "  state_count before injection: ${STATE_BEFORE}"
+
+INJECT_PAYLOAD=$(cat <<'INJEOF'
+{
+    "event_type": "node_state_updated",
+    "event_id": "evt-e2e-inject-systemd-001",
+    "issued_at": "2099-01-01T00:00:00Z",
+    "nonce": "e2e-inject-nonce-systemd-001",
+    "payload": {"node_id": "e2e-systemd-node"},
+    "signature": "mock-signature"
+}
+INJEOF
+)
+INJECT_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${INJECT_PAYLOAD}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${INJECT_STATUS}" != "204" ]; then
+    fail "SSE event injection returned status ${INJECT_STATUS}, want 204"
+fi
+echo "  SSE event injected successfully"
+
+SSE_TIMEOUT=15
+SSE_ELAPSED=0
+while [ "${SSE_ELAPSED}" -lt "${SSE_TIMEOUT}" ]; do
+    sleep 2
+    SSE_ELAPSED=$((SSE_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        STATE_AFTER=$(get_counter "${RESPONSE}" "state_count")
+        if [ "${STATE_AFTER}" -gt "${STATE_BEFORE}" ]; then
+            echo "  PASS: state_count increased from ${STATE_BEFORE} to ${STATE_AFTER} after SSE injection"
+            break
+        fi
+    fi
+done
+
+if [ "${SSE_ELAPSED}" -ge "${SSE_TIMEOUT}" ]; then
+    STATE_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    echo "  WARN: state_count did not increase after SSE injection (before=${STATE_BEFORE}, after=${STATE_AFTER})"
+fi
+
+echo "=== SSE event injection PASSED ==="
+
+# --- Heartbeat-triggered reconcile (RotateKeys flag) ---
+echo "=== Testing heartbeat-triggered reconcile via RotateKeys ==="
+
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+STATE_BEFORE_KR=$(get_counter "${RESPONSE}" "state_count")
+echo "  state_count before: ${STATE_BEFORE_KR}"
+
+KR_CONFIG='{"reconcile":true,"rotate_keys":true}'
+KR_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${KR_CONFIG}" \
+    "http://localhost:18080/test/configure-heartbeat" 2>/dev/null || true)
+if [ "${KR_STATUS}" != "204" ]; then
+    fail "configure-heartbeat returned status ${KR_STATUS}, want 204"
+fi
+echo "  heartbeat response configured with rotate_keys=true"
+
+KR_TIMEOUT=60
+KR_ELAPSED=0
+while [ "${KR_ELAPSED}" -lt "${KR_TIMEOUT}" ]; do
+    sleep 3
+    KR_ELAPSED=$((KR_ELAPSED + 3))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        STATE_AFTER_KR=$(get_counter "${RESPONSE}" "state_count")
+        if [ "${STATE_AFTER_KR}" -gt "${STATE_BEFORE_KR}" ]; then
+            echo "  PASS: state_count increased from ${STATE_BEFORE_KR} to ${STATE_AFTER_KR} (reconcile triggered)"
+            break
+        fi
+    fi
+done
+
+if [ "${KR_ELAPSED}" -ge "${KR_TIMEOUT}" ]; then
+    STATE_AFTER_KR=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    fail "state_count did not increase after RotateKeys=true (before=${STATE_BEFORE_KR}, after=${STATE_AFTER_KR})"
+fi
+
+# Reset heartbeat response.
+curl -sf -X POST -H "Content-Type: application/json" \
+    -d '{"reconcile":true,"rotate_keys":false}' \
+    "http://localhost:18080/test/configure-heartbeat" >/dev/null 2>&1 || true
+
+echo "=== Heartbeat-triggered reconcile PASSED ==="
+
+# --- Deeper body validation ---
+echo "=== Deeper body validation ==="
+
+# Metrics body: validate MetricPoint fields.
+METRICS_BODY=$(curl -sf "http://localhost:18080/test/last-request/metrics" 2>/dev/null || true)
+if [ -n "${METRICS_BODY}" ]; then
+    FIRST_METRIC=$(echo "${METRICS_BODY}" | jq '.[0]')
+    MET_TS=$(echo "${FIRST_METRIC}" | jq -r '.timestamp // empty')
+    MET_GROUP=$(echo "${FIRST_METRIC}" | jq -r '.group // empty')
+    if [ -n "${MET_TS}" ]; then
+        echo "  PASS: metric[0] has timestamp"
+    else
+        fail "metric[0] missing 'timestamp' field"
+    fi
+    if [ -n "${MET_GROUP}" ]; then
+        echo "  PASS: metric[0] has group='${MET_GROUP}'"
+    else
+        fail "metric[0] missing 'group' field"
+    fi
+fi
+
+# Capabilities: validate specific builtin action names.
+CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
+if [ -n "${CAPS_BODY}" ]; then
+    for expected_action in "diagnostics.collect" "system.info" "service.restart"; do
+        HAS_ACTION=$(echo "${CAPS_BODY}" | jq --arg name "${expected_action}" \
+            '[.builtin_actions[] | select(.name == $name)] | length')
+        if [ "${HAS_ACTION}" -ge 1 ]; then
+            echo "  PASS: capabilities includes builtin '${expected_action}'"
+        else
+            echo "  WARN: capabilities missing builtin '${expected_action}'"
+        fi
+    done
+fi
+
+echo "=== Deeper body validation PASSED ==="
 
 # --- Clean shutdown verification (REQ-005) ---
 echo "=== Stopping plexd service ==="

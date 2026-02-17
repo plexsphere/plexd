@@ -2425,3 +2425,113 @@ func TestConcurrent_InjectEventAndConfigureState(t *testing.T) {
 		t.Errorf("state_count = %d, want >= %d", a.StateCount, n)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// POST /test/configure-heartbeat
+// ---------------------------------------------------------------------------
+
+func TestConfigureHeartbeat_UpdatesResponse(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	// Default heartbeat response should have Reconcile=true, RotateKeys=false.
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/heartbeat", heartbeatBody)
+	defer resp.Body.Close()
+	var hb api.HeartbeatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&hb); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !hb.Reconcile {
+		t.Errorf("default Reconcile = false, want true")
+	}
+	if hb.RotateKeys {
+		t.Errorf("default RotateKeys = true, want false")
+	}
+
+	// Configure heartbeat to return RotateKeys=true.
+	configBody := `{"reconcile":true,"rotate_keys":true}`
+	cfgResp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-heartbeat", configBody)
+	defer cfgResp.Body.Close()
+	if cfgResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("POST /test/configure-heartbeat status = %d, want %d", cfgResp.StatusCode, http.StatusNoContent)
+	}
+
+	// Verify heartbeat response changed.
+	resp2 := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/heartbeat", heartbeatBody)
+	defer resp2.Body.Close()
+	var hb2 api.HeartbeatResponse
+	if err := json.NewDecoder(resp2.Body).Decode(&hb2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !hb2.RotateKeys {
+		t.Errorf("RotateKeys = false after configure, want true")
+	}
+	if !hb2.Reconcile {
+		t.Errorf("Reconcile = false after configure, want true")
+	}
+}
+
+func TestConfigureHeartbeat_InvalidBody(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-heartbeat", "not-json")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("POST /test/configure-heartbeat with invalid body: status = %d, want %d",
+			resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestConfigureHeartbeat_WrongMethod(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/test/configure-heartbeat")
+	if err != nil {
+		t.Fatalf("GET /test/configure-heartbeat: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET /test/configure-heartbeat: status = %d, want %d",
+			resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestConfigureHeartbeat_ResetToDefault(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	// Set RotateKeys=true.
+	cfgResp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-heartbeat",
+		`{"reconcile":true,"rotate_keys":true}`)
+	defer cfgResp.Body.Close()
+
+	// Reset to default.
+	resetResp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-heartbeat",
+		`{"reconcile":true,"rotate_keys":false}`)
+	defer resetResp.Body.Close()
+
+	// Verify heartbeat is back to default.
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/heartbeat", heartbeatBody)
+	defer resp.Body.Close()
+	var hb api.HeartbeatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&hb); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if hb.RotateKeys {
+		t.Errorf("RotateKeys = true after reset, want false")
+	}
+}
+
+func TestConfigureHeartbeat_CapturesRequestBody(t *testing.T) {
+	srv, ts := newTestServer(t)
+
+	body := `{"reconcile":false,"rotate_keys":true}`
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-heartbeat", body)
+	defer resp.Body.Close()
+
+	data, ok := srv.LastRequestBody("configure_heartbeat")
+	if !ok {
+		t.Fatal("no captured configure_heartbeat body")
+	}
+	if string(data) != body {
+		t.Errorf("captured body = %q, want %q", string(data), body)
+	}
+}
