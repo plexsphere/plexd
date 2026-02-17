@@ -18,13 +18,19 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
+    # Run as root with NET_ADMIN so WireGuard (netlink), nftables, and tunnel
+    # subsystems can create interfaces and firewall rules inside the container.
+    user: "0:0"
+    cap_add:
+      - NET_ADMIN
     command: ["up", "--api", "http://mock-api:8080", "--config", "/etc/plexd/config.yaml"]
     environment:
       PLEXD_BOOTSTRAP_TOKEN: e2e-test-token
     volumes:
       - ./docker/plexd-e2e.yaml:/etc/plexd/config.yaml:ro
     tmpfs:
-      - /var/lib/plexd:uid=65534,gid=65534
+      - /var/lib/plexd
+      - /var/run/plexd
     depends_on:
       mock-api:
         condition: service_healthy

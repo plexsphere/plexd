@@ -24,7 +24,7 @@ plexd reads its configuration from a YAML file (default: `/etc/plexd/config.yaml
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `mode` | string | `node` | Operating mode: `node` or `bridge`. Bridge mode is parsed but not started (see [Inactive Subsystem Config Sections](#inactive-subsystem-config-sections)). |
+| `mode` | string | `node` | Operating mode: `node` or `bridge`. Bridge mode enables bridge-specific subsystems when `bridge.enabled: true`. |
 | `log_level` | string | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `data_dir` | string | `/var/lib/plexd` | Directory for persistent agent data. Propagated to `registration.data_dir` and `node_api.data_dir` at runtime. |
 
@@ -194,40 +194,112 @@ Source: `internal/auditfwd/config.go`
 
 ---
 
-## Inactive Subsystem Config Sections
-
-The following configuration sections are parsed and validated by `ParseConfig()` and `ApplyDefaults()`/`Validate()`, but the corresponding subsystems are **not started** by `plexd up`. Configuring these sections has no runtime effect in the current release.
-
-### wireguard (parsed, not started)
+## wireguard
 
 WireGuard interface and peer management. See [WireGuard Tunnel Management](../networking/wireguard.md).
 
-### nat (parsed, not started)
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `interface_name` | string | `wg-plexd` | Name of the WireGuard interface |
+| `listen_port` | int | `51820` | UDP listen port for WireGuard |
+| `mtu` | int | `0` | MTU for the WireGuard interface. `0` means use system default. |
+
+Source: `internal/wireguard/config.go`
+
+---
+
+## nat
 
 STUN-based NAT traversal. See [NAT Traversal via STUN](../networking/nat-traversal.md).
 
-### peer_exchange (parsed, not started)
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Enable NAT traversal |
+| `stun_servers` | []string | (built-in list) | List of STUN server addresses (host:port) |
+| `refresh_interval` | duration | `30s` | Interval between STUN binding refreshes. Minimum: `10s`. |
+| `timeout` | duration | `5s` | Per-server STUN request timeout |
+
+Source: `internal/nat/config.go`
+
+---
+
+## peer_exchange
 
 Peer endpoint discovery and exchange. See [Peer Endpoint Exchange](../networking/peer-endpoint-exchange.md).
 
-### policy (parsed, not started)
+Embeds `nat.Config` — inherits all NAT fields.
+
+Source: `internal/peerexchange/config.go`
+
+---
+
+## policy
 
 Network policy enforcement and firewall rules. See [Network Policy Enforcement](../networking/network-policy.md).
 
-### tunnel (parsed, not started)
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `chain_name` | string | `plexd-policy` | Name of the nftables chain for policy rules |
+
+Source: `internal/policy/config.go`
+
+---
+
+## tunnel
 
 Secure tunnel access for services. See [Secure Access Tunneling](../networking/secure-access-tunneling.md).
 
-### bridge (parsed, not started)
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Enable secure access tunneling |
+| `max_sessions` | int | `10` | Maximum concurrent tunnel sessions |
+| `default_timeout` | duration | `30m` | Default session timeout |
+| `ssh_listen_addr` | string | `:2222` | SSH server listen address |
+| `host_key_dir` | string | — | Directory for the host key (defaults to `data_dir`) |
 
-Gateway bridge mode operation. See [Bridge Mode](../bridge/bridge-mode.md).
+Source: `internal/tunnel/config.go`
+
+---
+
+## bridge
+
+Gateway bridge mode operation. Active when `mode: bridge` and `bridge.enabled: true`. See [Bridge Mode](../bridge/bridge-mode.md).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable bridge mode |
+| `access_interface` | string | `eth1` | Access-side network interface |
+| `access_subnets` | []string | — | Subnets routable via the access interface |
+| `enable_nat` | bool | `false` | Enable NAT masquerading on the access interface |
+| `relay_enabled` | bool | `false` | Enable UDP relay for NAT traversal |
+| `relay_listen_port` | int | `51821` | Relay UDP listen port |
+| `max_relay_sessions` | int | `100` | Maximum concurrent relay sessions |
+| `session_ttl` | duration | `5m` | Relay session TTL |
+| `ingress_enabled` | bool | `false` | Enable public ingress |
+| `max_ingress_rules` | int | `50` | Maximum ingress rules |
+| `ingress_dial_timeout` | duration | `5s` | Timeout for dialing backend targets |
+| `user_access_enabled` | bool | `false` | Enable user access VPN integration |
+| `user_access_interface_name` | string | `wg-access` | WireGuard interface for user access |
+| `user_access_listen_port` | int | `51822` | User access WireGuard listen port |
+| `max_access_peers` | int | `50` | Maximum user access peers |
+| `site_to_site_enabled` | bool | `false` | Enable site-to-site VPN |
+| `site_to_site_interface_prefix` | string | `wg-s2s-` | Prefix for site-to-site WireGuard interfaces |
+| `site_to_site_listen_port` | int | `51823` | Base listen port for site-to-site tunnels |
+| `max_site_to_site_tunnels` | int | `10` | Maximum site-to-site tunnels |
+| `acme_enabled` | bool | `false` | Enable ACME TLS certificate management |
+| `acme_cache_dir` | string | — | Directory for ACME certificate caching |
+| `acme_allowed_hosts` | []string | — | Hostnames allowed for ACME certificates |
+| `acme_email` | string | — | ACME account contact email |
+| `acme_directory_url` | string | — | Override ACME directory URL (default: Let's Encrypt production) |
+
+Source: `internal/bridge/config.go`
 
 ---
 
 ## Complete Annotated Example
 
 ```yaml
-# /etc/plexd/config.yaml — Complete example with all active sections
+# /etc/plexd/config.yaml — Complete example with all sections
 
 mode: node          # "node" or "bridge" (default: node)
 log_level: info     # debug | info | warn | error (default: info)
@@ -305,19 +377,43 @@ audit_fwd:
   report_interval: 15s       # >= collect_interval
   batch_size: 500            # min: 1
 
-# --- Inactive subsystems (parsed but not started) ---
-# wireguard:
-#   ...  # see reference/networking/wireguard.md
-# nat:
-#   ...  # see reference/networking/nat-traversal.md
-# peer_exchange:
-#   ...  # see reference/networking/peer-endpoint-exchange.md
-# policy:
-#   ...  # see reference/networking/network-policy.md
-# tunnel:
-#   ...  # see reference/networking/secure-access-tunneling.md
-# bridge:
-#   ...  # see reference/bridge/bridge-mode.md
+wireguard:
+  interface_name: wg-plexd
+  listen_port: 51820
+  # mtu: 0                  # 0 = system default
+
+nat:
+  enabled: true
+  # stun_servers:            # default built-in list
+  refresh_interval: 30s      # min: 10s
+  timeout: 5s
+
+peer_exchange:
+  enabled: true
+  refresh_interval: 30s
+  timeout: 5s
+
+policy:
+  chain_name: plexd-policy
+
+tunnel:
+  enabled: true
+  max_sessions: 10
+  default_timeout: 30m
+  ssh_listen_addr: ":2222"
+  # host_key_dir: ""         # defaults to data_dir
+
+# bridge:                    # uncomment for bridge mode
+#   enabled: true
+#   access_interface: eth1
+#   access_subnets:
+#     - 10.0.0.0/24
+#   enable_nat: false
+#   relay_enabled: false
+#   ingress_enabled: false
+#   user_access_enabled: false
+#   site_to_site_enabled: false
+#   acme_enabled: false
 ```
 
 ## See Also

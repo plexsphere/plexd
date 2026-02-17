@@ -61,3 +61,10 @@ func (p *PeerIndex) LoadFromPeers(peers []api.Peer) {
 		p.index[peer.ID] = peer.PublicKey
 	}
 }
+
+// Count returns the number of peers in the index.
+func (p *PeerIndex) Count() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.index)
+}

@@ -22,12 +22,18 @@ import (
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/auditfwd"
+	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/integrity"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
+	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
+	"github.com/plexsphere/plexd/internal/peerexchange"
+	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/reconcile"
 	"github.com/plexsphere/plexd/internal/registration"
+	"github.com/plexsphere/plexd/internal/tunnel"
+	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
 // drainTimeout is the maximum time for graceful shutdown.
@@ -110,6 +116,100 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	}
 	verifier := api.NewEd25519Verifier(ed25519.PublicKey(sigKey))
 
+	// 5a. Initialize WireGuard subsystem.
+	wgCtrl := newWGController(logger)
+	wgMgr := wireguard.NewManager(wgCtrl, cfg.WireGuard, logger)
+	if wgCtrl != nil {
+		if err := wgMgr.Setup(ctx, identity); err != nil {
+			logger.Warn("wireguard setup failed, continuing without WireGuard",
+				"error", err,
+			)
+		}
+	}
+
+	// 5b. Initialize NAT traversal and peer exchange.
+	stunClient := &nat.UDPSTUNClient{Timeout: cfg.NAT.Timeout}
+	natDiscoverer := nat.NewDiscoverer(stunClient, cfg.NAT, cfg.WireGuard.ListenPort, logger)
+	exchanger := peerexchange.NewExchanger(natDiscoverer, wgMgr, client, cfg.PeerExchange, logger)
+
+	// 5c. Initialize network policy engine.
+	policyEngine := policy.NewPolicyEngine(logger)
+	fwCtrl := newFirewallController(logger)
+	enforcer := policy.NewEnforcer(policyEngine, fwCtrl, cfg.Policy, logger)
+
+	// 5d. Initialize tunnel subsystem.
+	hostKey, err := tunnel.LoadOrGenerateHostKey(cfg.DataDir, logger)
+	if err != nil {
+		return fmt.Errorf("plexd up: tunnel host key: %w", err)
+	}
+	jwtVerifier := tunnel.NewEd25519JWTVerifier(ed25519.PublicKey(sigKey))
+	meshServer := tunnel.NewMeshServer(cfg.Tunnel, hostKey, jwtVerifier, logger)
+	tunnelReporter := &controlPlaneTunnelReporter{cp: client, nodeID: identity.NodeID}
+
+	// 5e. Initialize bridge subsystem (conditional on bridge mode).
+	var (
+		bridgeMgr     *bridge.Manager
+		ingressMgr    *bridge.IngressManager
+		userAccessMgr *bridge.UserAccessManager
+		s2sMgr        *bridge.SiteToSiteManager
+		acmeMgr       *bridge.ACMEManager
+	)
+	if cfg.Mode == "bridge" && cfg.Bridge.Enabled {
+		routeCtrl := newRouteController(logger)
+		bridgeMgr = bridge.NewManager(routeCtrl, cfg.Bridge, logger)
+		if err := bridgeMgr.Setup(cfg.WireGuard.InterfaceName); err != nil {
+			return fmt.Errorf("plexd up: bridge setup: %w", err)
+		}
+
+		// ACME manager (before ingress, which may need TLS config).
+		if cfg.Bridge.ACMEEnabled {
+			acmeMgr = bridge.NewACMEManager(bridge.ACMEConfig{
+				Enabled:          cfg.Bridge.ACMEEnabled,
+				CacheDir:         cfg.Bridge.ACMECacheDir,
+				AllowedHosts:     cfg.Bridge.ACMEAllowedHosts,
+				Email:            cfg.Bridge.ACMEEmail,
+				ACMEDirectoryURL: cfg.Bridge.ACMEDirectoryURL,
+			}, logger)
+			if err := acmeMgr.Setup(); err != nil {
+				return fmt.Errorf("plexd up: acme setup: %w", err)
+			}
+		}
+
+		// Ingress manager.
+		if cfg.Bridge.IngressEnabled {
+			ingressCtrl := bridge.NewStdIngressController(logger)
+			ingressMgr = bridge.NewIngressManager(ingressCtrl, cfg.Bridge, logger, acmeMgr)
+			if err := ingressMgr.Setup(); err != nil {
+				return fmt.Errorf("plexd up: ingress setup: %w", err)
+			}
+		}
+
+		// User access manager.
+		if cfg.Bridge.UserAccessEnabled {
+			accessCtrl := newAccessController(logger)
+			userAccessMgr = bridge.NewUserAccessManager(accessCtrl, routeCtrl, cfg.Bridge, logger, nil)
+			if err := userAccessMgr.Setup(); err != nil {
+				return fmt.Errorf("plexd up: user access setup: %w", err)
+			}
+		}
+
+		// Site-to-site VPN manager.
+		if cfg.Bridge.SiteToSiteEnabled {
+			vpnCtrl := newVPNController(logger)
+			s2sMgr = bridge.NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg.Bridge, logger, nil)
+			if err := s2sMgr.Setup(cfg.WireGuard.InterfaceName); err != nil {
+				return fmt.Errorf("plexd up: site-to-site setup: %w", err)
+			}
+		}
+
+		logger.Info("bridge subsystem initialized",
+			"relay", cfg.Bridge.RelayEnabled,
+			"ingress", cfg.Bridge.IngressEnabled,
+			"user_access", cfg.Bridge.UserAccessEnabled,
+			"site_to_site", cfg.Bridge.SiteToSiteEnabled,
+		)
+	}
+
 	// 6. Create SSE manager.
 	sseMgr := api.NewSSEManager(client, verifier, logger)
 
@@ -126,8 +226,48 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		return nil
 	})
 
+	// Register WireGuard SSE handlers.
+	sseMgr.RegisterHandler(api.EventPeerAdded, wireguard.HandlePeerAdded(wgMgr))
+	sseMgr.RegisterHandler(api.EventPeerRemoved, wireguard.HandlePeerRemoved(wgMgr))
+	sseMgr.RegisterHandler(api.EventPeerKeyRotated, wireguard.HandlePeerKeyRotated(wgMgr))
+
+	// Register peer exchange SSE handler (peer_endpoint_changed).
+	exchanger.RegisterHandlers(sseMgr)
+
+	// Register tunnel SSE handlers.
+	sseMgr.RegisterHandler(api.EventSSHSessionSetup, tunnel.HandleSSHSessionSetup(meshServer.SessionManager(), tunnelReporter))
+	sseMgr.RegisterHandler(api.EventSessionRevoked, tunnel.HandleSessionRevoked(meshServer.SessionManager(), tunnelReporter))
+
 	// 7. Create reconciler.
 	reconciler := reconcile.NewReconciler(client, cfg.Reconcile, logger)
+
+	// Register policy SSE handler (needs reconciler as trigger).
+	sseMgr.RegisterHandler(api.EventPolicyUpdated, policy.HandlePolicyUpdated(reconciler))
+
+	// Register bridge SSE handlers (needs reconciler and bridge managers).
+	if bridgeMgr != nil {
+		sseMgr.RegisterHandler(api.EventBridgeConfigUpdated, bridge.HandleBridgeConfigUpdated(reconciler))
+
+		if relay := bridgeMgr.Relay(); relay != nil {
+			sseMgr.RegisterHandler(api.EventRelaySessionAssigned, bridge.HandleRelaySessionAssigned(relay, logger))
+			sseMgr.RegisterHandler(api.EventRelaySessionRevoked, bridge.HandleRelaySessionRevoked(relay, logger))
+		}
+		if ingressMgr != nil {
+			sseMgr.RegisterHandler(api.EventIngressRuleAssigned, bridge.HandleIngressRuleAssigned(ingressMgr, logger))
+			sseMgr.RegisterHandler(api.EventIngressRuleRevoked, bridge.HandleIngressRuleRevoked(ingressMgr, logger))
+			sseMgr.RegisterHandler(api.EventIngressConfigUpdated, bridge.HandleIngressConfigUpdated(reconciler))
+		}
+		if userAccessMgr != nil {
+			sseMgr.RegisterHandler(api.EventUserAccessPeerAssigned, bridge.HandleUserAccessPeerAssigned(userAccessMgr, logger))
+			sseMgr.RegisterHandler(api.EventUserAccessPeerRevoked, bridge.HandleUserAccessPeerRevoked(userAccessMgr, logger))
+			sseMgr.RegisterHandler(api.EventUserAccessConfigUpdated, bridge.HandleUserAccessConfigUpdated(reconciler))
+		}
+		if s2sMgr != nil {
+			sseMgr.RegisterHandler(api.EventSiteToSiteTunnelAssigned, bridge.HandleSiteToSiteTunnelAssigned(s2sMgr, logger))
+			sseMgr.RegisterHandler(api.EventSiteToSiteTunnelRevoked, bridge.HandleSiteToSiteTunnelRevoked(s2sMgr, logger))
+			sseMgr.RegisterHandler(api.EventSiteToSiteConfigUpdated, bridge.HandleSiteToSiteConfigUpdated(reconciler))
+		}
+	}
 
 	// 8. Create heartbeat service.
 	hbCfg := agent.HeartbeatConfig{
@@ -150,6 +290,31 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	heartbeat.SetOnRotateKeys(func() {
 		logger.Info("heartbeat signaled key rotation, triggering reconcile")
 		reconciler.TriggerReconcile()
+	})
+
+	// Enrich heartbeat with subsystem status.
+	heartbeat.SetBuildRequest(func() api.HeartbeatRequest {
+		req := api.HeartbeatRequest{
+			Mesh: &api.MeshInfo{
+				Interface:  cfg.WireGuard.InterfaceName,
+				PeerCount:  wgMgr.PeerIndex().Count(),
+				ListenPort: cfg.WireGuard.ListenPort,
+			},
+			NAT: exchanger.LastResult(),
+		}
+		if bridgeMgr != nil {
+			req.Bridge = bridgeMgr.BridgeStatus()
+		}
+		if ingressMgr != nil {
+			req.Ingress = ingressMgr.IngressStatus()
+		}
+		if userAccessMgr != nil {
+			req.UserAccess = userAccessMgr.UserAccessStatus()
+		}
+		if s2sMgr != nil {
+			req.SiteToSite = s2sMgr.SiteToSiteStatus()
+		}
+		return req
 	})
 
 	// 9. Create integrity verifier for hook execution.
@@ -178,7 +343,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	executor.RegisterBuiltin("service.reload_config", "Reload configuration (SIGHUP)", nil, actions.ServiceReloadConfig())
 	executor.RegisterBuiltin("service.upgrade", "Upgrade plexd (placeholder)", nil, actions.ServiceUpgrade())
 	executor.RegisterBuiltin("health.check", "Check node health status", nil,
-		actions.HealthCheck(&agentHealthProvider{startTime: startTime}))
+		actions.HealthCheck(&agentHealthProvider{startTime: startTime, wgMgr: wgMgr, meshServer: meshServer}))
 	executor.RegisterBuiltin("mesh.reconnect", "Reconnect mesh tunnels", nil,
 		actions.MeshReconnect(&agentMeshReconnector{reconciler: reconciler}))
 	executor.RegisterBuiltin("config.dump", "Dump sanitized configuration", nil,
@@ -236,6 +401,29 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		return nil
 	})
 
+	// Register WireGuard reconcile handler.
+	reconciler.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
+
+	// Register policy reconcile handler.
+	reconciler.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, identity.NodeID, identity.MeshIP, cfg.WireGuard.InterfaceName))
+
+	// Register bridge reconcile handlers (conditional).
+	if bridgeMgr != nil {
+		reconciler.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
+		if relay := bridgeMgr.Relay(); relay != nil {
+			reconciler.RegisterHandler(bridge.RelayReconcileHandler(relay, logger))
+		}
+		if ingressMgr != nil {
+			reconciler.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
+		}
+		if userAccessMgr != nil {
+			reconciler.RegisterHandler(bridge.UserAccessReconcileHandler(userAccessMgr, logger))
+		}
+		if s2sMgr != nil {
+			reconciler.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
+		}
+	}
+
 	// 13. Create metrics collectors and manager.
 	var metricsCollectors []metrics.Collector
 	if sysReader := newSystemReader(); sysReader != nil {
@@ -263,7 +451,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// Wait group for all goroutines.
 	var wg sync.WaitGroup
 
-	// 15. Start SSE manager.
+	// 16. Start SSE manager.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -272,14 +460,14 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// 16. Start heartbeat.
+	// 17. Start heartbeat.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		_ = heartbeat.Run(ctx)
 	}()
 
-	// 17. Start reconciler.
+	// 18. Start reconciler.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -288,7 +476,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// 18. Start node API server.
+	// 19. Start node API server.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -297,7 +485,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// 19. Start hook watcher.
+	// 20. Start hook watcher.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -306,7 +494,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// 20. Start metrics manager.
+	// 21. Start metrics manager.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -315,7 +503,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// 21. Start log forwarder.
+	// 22. Start log forwarder.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -324,7 +512,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// 22. Start audit forwarder.
+	// 23. Start audit forwarder.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -333,13 +521,78 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
+	// 24. Start peer exchange loop.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := exchanger.Run(ctx, identity.NodeID); err != nil {
+			logger.Error("peer exchange stopped", "error", err)
+		}
+	}()
+
+	// 25. Start tunnel mesh server.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := meshServer.Start(ctx); err != nil {
+			logger.Error("mesh server stopped", "error", err)
+		}
+	}()
+
+	// 26. Start bridge relay (bridge mode only).
+	if bridgeMgr != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := bridgeMgr.StartRelay(ctx); err != nil {
+				logger.Error("bridge relay stopped", "error", err)
+			}
+		}()
+	}
+
 	// Wait for shutdown signal.
 	<-ctx.Done()
 	logger.Info("shutting down", "reason", ctx.Err())
 
-	// Graceful drain: stop subsystems and wait for goroutines.
+	// Graceful drain: stop subsystems in reverse dependency order.
 	sseMgr.Shutdown()
 	executor.Shutdown(context.Background())
+
+	if err := meshServer.Shutdown(); err != nil {
+		logger.Error("mesh server shutdown error", "error", err)
+	}
+	if ingressMgr != nil {
+		if err := ingressMgr.Teardown(); err != nil {
+			logger.Error("ingress teardown error", "error", err)
+		}
+	}
+	if userAccessMgr != nil {
+		if err := userAccessMgr.Teardown(); err != nil {
+			logger.Error("user access teardown error", "error", err)
+		}
+	}
+	if s2sMgr != nil {
+		if err := s2sMgr.Teardown(); err != nil {
+			logger.Error("site-to-site teardown error", "error", err)
+		}
+	}
+	if acmeMgr != nil {
+		if err := acmeMgr.Teardown(); err != nil {
+			logger.Error("acme teardown error", "error", err)
+		}
+	}
+	if bridgeMgr != nil {
+		if err := bridgeMgr.Teardown(); err != nil {
+			logger.Error("bridge teardown error", "error", err)
+		}
+	}
+	if err := enforcer.Teardown(); err != nil {
+		logger.Error("policy enforcer teardown error", "error", err)
+	}
+	// WireGuard last — other subsystems depend on the interface being up.
+	if err := wgMgr.Teardown(); err != nil {
+		logger.Error("wireguard teardown error", "error", err)
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -371,11 +624,23 @@ func (a *agentNodeInfo) PeerCount() int { return a.peerCount }
 
 // agentHealthProvider adapts agent state to actions.HealthProvider.
 type agentHealthProvider struct {
-	startTime time.Time
+	startTime  time.Time
+	wgMgr      *wireguard.Manager
+	meshServer *tunnel.MeshServer
 }
 
-func (a *agentHealthProvider) TunnelCount() int        { return 0 }
-func (a *agentHealthProvider) ConnectedPeers() int     { return 0 }
+func (a *agentHealthProvider) TunnelCount() int {
+	if a.meshServer != nil {
+		return a.meshServer.SessionManager().ActiveCount()
+	}
+	return 0
+}
+func (a *agentHealthProvider) ConnectedPeers() int {
+	if a.wgMgr != nil {
+		return a.wgMgr.PeerIndex().Count()
+	}
+	return 0
+}
 func (a *agentHealthProvider) Uptime() time.Duration   { return time.Since(a.startTime) }
 func (a *agentHealthProvider) LastHeartbeat() time.Time { return time.Time{} }
 func (a *agentHealthProvider) LastReconcile() time.Time { return time.Time{} }
@@ -441,6 +706,31 @@ func redactSensitiveLine(line string) string {
 type agentLogProvider struct{}
 
 func (a *agentLogProvider) RecentLines(_ int) []string { return nil }
+
+// controlPlaneTunnelReporter reports tunnel session lifecycle events to the control plane.
+type controlPlaneTunnelReporter struct {
+	cp     *api.ControlPlane
+	nodeID string
+}
+
+func (r *controlPlaneTunnelReporter) ReportReady(ctx context.Context, sessionID, listenAddr string) {
+	if err := r.cp.TunnelReady(ctx, r.nodeID, sessionID, api.TunnelReadyRequest{
+		ListenAddr: listenAddr,
+		Timestamp:  time.Now(),
+	}); err != nil {
+		slog.Error("tunnel ready report failed", "session_id", sessionID, "error", err)
+	}
+}
+
+func (r *controlPlaneTunnelReporter) ReportClosed(ctx context.Context, sessionID, reason string, duration time.Duration) {
+	if err := r.cp.TunnelClosed(ctx, r.nodeID, sessionID, api.TunnelClosedRequest{
+		Reason:    reason,
+		Duration:  duration.String(),
+		Timestamp: time.Now(),
+	}); err != nil {
+		slog.Error("tunnel closed report failed", "session_id", sessionID, "error", err)
+	}
+}
 
 // decodeSigningKeys decodes base64-encoded signing keys from an api.SigningKeys
 // struct into ed25519 public keys for use with the Ed25519Verifier.

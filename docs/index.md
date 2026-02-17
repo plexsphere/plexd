@@ -39,8 +39,6 @@ Agent core, CLI, API client, and registration.
 
 WireGuard mesh, NAT traversal, and network policy enforcement.
 
-> **Note:** The subsystems in this section have code in the repository but are not active in the current release. Their configuration is parsed but the subsystems are not started. See individual pages for details.
-
 - [WireGuard Tunnel Management](reference/networking/wireguard.md) — WireGuard interface and peer management
 - [NAT Traversal via STUN](reference/networking/nat-traversal.md) — STUN-based NAT traversal for mesh connectivity
 - [Peer Endpoint Exchange](reference/networking/peer-endpoint-exchange.md) — Peer endpoint discovery and exchange
@@ -51,8 +49,6 @@ WireGuard mesh, NAT traversal, and network policy enforcement.
 ### Bridge
 
 Gateway/bridge mode, NAT relay, VPN and tunnel providers, and ingress.
-
-> **Note:** The subsystems in this section have code in the repository but are not active in the current release. Their configuration is parsed but the subsystems are not started. See individual pages for details.
 
 - [Bridge Mode](reference/bridge/bridge-mode.md) — Gateway bridge mode operation
 - [NAT Relay](reference/bridge/nat-relay.md) — NAT relay for indirect connectivity

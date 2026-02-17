@@ -6,8 +6,6 @@ feature: PXD-0005
 
 # WireGuard Tunnel Management
 
-> **Note: This subsystem is not active in the current release.** The code in `internal/wireguard` is implemented and its configuration section (`wireguard`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
-
 The `internal/wireguard` package creates, configures, and manages WireGuard interfaces and peer entries. It establishes direct encrypted tunnels to all authorized peers within the same tenant, handles peer configuration lifecycle, and integrates with the reconciliation loop and SSE event stream for continuous convergence.
 
 All OS-level WireGuard operations go through a `WGController` interface, enabling full unit testing without root privileges or kernel modules.

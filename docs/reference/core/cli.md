@@ -36,16 +36,21 @@ Start the agent daemon. Registers with the control plane, connects to the SSE ev
 plexd up [--config /path/to/config.yaml] [--log-level debug]
 ```
 
-**Initialization (15 steps):**
+**Initialization:**
 
 1. Parse config, apply CLI flag overrides, apply `PLEXD_*` env overrides
 2. Set up structured logger
 3. Create control plane client
 4. Register (or load existing identity) — fatal on failure
 5. Create Ed25519 verifier from the control plane's signing public key
-6. Create SSE manager with `signing_key_rotated` handler
-7. Create reconciler
-8. Create heartbeat service with auth-failure (re-registration) and key-rotation callbacks
+5a. Initialize WireGuard — create interface, configure address, bring up
+5b. Initialize NAT traversal and peer exchange
+5c. Initialize network policy engine and enforcer
+5d. Initialize tunnel mesh server with JWT verifier
+5e. Initialize bridge subsystem (bridge mode only — ACME, ingress, user access, site-to-site)
+6. Create SSE manager with handlers for signing keys, WireGuard peers, tunnel, policy, and bridge events
+7. Create reconciler with handlers for WireGuard, policy, and bridge reconciliation
+8. Create heartbeat service with subsystem status enrichment, auth-failure, and key-rotation callbacks
 9. Create integrity store + verifier
 10. Create action executor, register 11 built-in actions, register `action_request` SSE handler, report capabilities
 11. Create hook watcher
@@ -54,9 +59,9 @@ plexd up [--config /path/to/config.yaml] [--log-level debug]
 14. Create log sources + forwarder
 15. Create audit sources + forwarder
 
-**Goroutines (8):** SSE, Heartbeat, Reconciler, Node API, Hook Watcher, Metrics, Log Forwarder, Audit Forwarder.
+**Goroutines (10 node mode, 11 bridge mode):** SSE, Heartbeat, Reconciler, Node API, Hook Watcher, Metrics, Log Forwarder, Audit Forwarder, Peer Exchange, Mesh Server, Bridge Relay (bridge mode only).
 
-**Shutdown:** On SIGTERM/SIGINT — cancel context, `sseMgr.Shutdown()`, `executor.Shutdown()`, wait for goroutines with 30s drain timeout.
+**Shutdown:** On SIGTERM/SIGINT — cancel context, `sseMgr.Shutdown()`, `executor.Shutdown()`, mesh server shutdown, bridge teardowns (bridge mode), policy enforcer teardown, WireGuard teardown, wait for goroutines with 30s drain timeout.
 
 For the full startup and shutdown sequence, see [Architecture and Concepts](../../concepts.md).
 

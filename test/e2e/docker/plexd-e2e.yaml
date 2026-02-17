@@ -13,6 +13,24 @@ node_api:
 heartbeat:
   node_id: e2e-node-1
 
+wireguard:
+  interface_name: wg-plexd
+  listen_port: 51820
+
+nat:
+  enabled: true
+  refresh_interval: 30s
+  timeout: 5s
+
+policy:
+  chain_name: plexd-policy
+
+tunnel:
+  enabled: true
+  max_sessions: 10
+  default_timeout: 30m
+  ssh_listen_addr: ":2222"
+
 metrics:
   enabled: true
   collect_interval: 5s

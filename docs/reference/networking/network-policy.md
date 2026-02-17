@@ -6,8 +6,6 @@ feature: PXD-0008
 
 # Network Policy Enforcement
 
-> **Note: This subsystem is not active in the current release.** The code in `internal/policy` is implemented and its configuration section (`policy`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
-
 The `internal/policy` package enforces network policies on mesh nodes. It evaluates policies from the control plane to determine peer visibility (which peers a node can communicate with) and generates iptables firewall rules for packet-level enforcement.
 
 The package integrates with `internal/reconcile` for periodic convergence and with `internal/api` for real-time SSE-driven policy updates.

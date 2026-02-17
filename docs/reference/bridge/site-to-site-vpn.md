@@ -6,8 +6,6 @@ feature: PXD-0015
 
 # Site-to-Site VPN
 
-> **Note: This subsystem is not active in the current release.** The code in `internal/bridge` is implemented and its configuration section (`bridge`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
-
 The site-to-site VPN feature extends bridge mode (`internal/bridge`) to establish WireGuard tunnels between a bridge node and external networks. Each tunnel creates a dedicated WireGuard interface, configures a remote peer, and installs OS-level routes for the remote subnets. The bridge node acts as a gateway between the mesh network and the external site.
 
 ## Data Flow

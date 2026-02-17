@@ -6,8 +6,6 @@ feature: PXD-0007
 
 # Peer Endpoint Exchange
 
-> **Note: This subsystem is not active in the current release.** The code in `internal/peerexchange` is implemented and its configuration section (`peer_exchange`) is parsed and validated on startup, but the subsystem is not started by `plexd up`. Configuring this section has no runtime effect. See [Architecture and Concepts](../../concepts.md) for the list of active subsystems.
-
 The `internal/peerexchange` package orchestrates the exchange of discovered public endpoints between mesh peers. It wires together STUN-based NAT discovery (`internal/nat`), control plane endpoint reporting (`internal/api`), and WireGuard peer configuration (`internal/wireguard`) into a single lifecycle component.
 
 The Exchanger is a thin orchestration layer. It delegates STUN discovery and the refresh loop to `nat.Discoverer.Run`, SSE event handling to `wireguard.HandlePeerEndpointChanged`, and endpoint reporting to `api.ControlPlane.ReportEndpoint`. No discovery, reporting, or WireGuard logic is duplicated.
