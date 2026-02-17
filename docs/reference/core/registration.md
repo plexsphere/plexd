@@ -181,6 +181,35 @@ func (r *Registrar) Register(ctx context.Context) (*NodeIdentity, error)
 
 Orchestration flow:
 
+```mermaid
+sequenceDiagram
+    participant R as Registrar
+    participant TR as TokenResolver
+    participant CP as Control Plane
+    participant D as Disk
+
+    R->>D: LoadIdentity()
+    alt Identity exists
+        D-->>R: NodeIdentity
+        R->>CP: SetAuthToken(NSK)
+        R-->>R: Return (cached)
+    else Not registered
+        D-->>R: ErrNotRegistered
+        R->>TR: Resolve()
+        TR-->>R: Token + source
+        R->>R: GenerateKeypair()
+        R->>CP: SetAuthToken(bootstrap token)
+        loop Retry with backoff (max 5m)
+            R->>CP: POST /v1/register
+        end
+        CP-->>R: node_id, mesh_ip, signing_key, NSK, peers
+        R->>R: Build NodeIdentity
+        R->>D: SaveIdentity() (atomic write)
+        R->>D: Delete token file (if file-based)
+        R->>CP: SetAuthToken(NSK)
+    end
+```
+
 1. **Load existing identity** — if valid, set auth token and return (idempotent)
 2. **Corrupt identity** — log warning, proceed with fresh registration
 3. **Resolve bootstrap token** — via `TokenResolver`
@@ -229,7 +258,7 @@ Returns `true` if valid identity files exist in `Config.DataDir`.
 ```go
 // Create control plane client
 cpClient, err := api.NewControlPlane(api.Config{
-    BaseURL: "https://api.plexsphere.io",
+    BaseURL: "https://api.plexsphere.com",
 }, "1.0.0", slog.Default())
 if err != nil {
     log.Fatal(err)

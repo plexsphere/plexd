@@ -1,6 +1,7 @@
 import { defineConfig } from 'vitepress'
+import { withMermaid } from 'vitepress-plugin-mermaid'
 
-export default defineConfig({
+export default withMermaid(defineConfig({
   title: 'plexd',
   description: 'Plexsphere Node Agent Documentation',
   base: '/plexd/',
@@ -9,7 +10,6 @@ export default defineConfig({
     nav: [
       { text: 'Home', link: '/' },
       { text: 'Guide', link: '/guide/installation' },
-      { text: 'Concepts', link: '/concepts' },
       { text: 'How-To', link: '/how-to/bare-metal-installation' },
       { text: 'Reference', link: '/reference/core/cli' },
     ],
@@ -19,13 +19,12 @@ export default defineConfig({
         text: 'Getting Started',
         items: [
           { text: 'Overview', link: '/' },
-          { text: 'Architecture & Concepts', link: '/concepts' },
+          { text: 'Installation & Quick Start', link: '/guide/installation' },
         ],
       },
       {
         text: 'Guide',
         items: [
-          { text: 'Installation & Quick Start', link: '/guide/installation' },
           { text: 'Architecture & Agent Lifecycle', link: '/guide/architecture' },
           { text: 'Security & Trust Model', link: '/guide/security' },
           { text: 'Troubleshooting', link: '/guide/troubleshooting' },
@@ -48,6 +47,7 @@ export default defineConfig({
             text: 'Core',
             collapsed: false,
             items: [
+              { text: 'Agent Internals', link: '/concepts' },
               { text: 'CLI', link: '/reference/core/cli' },
               { text: 'Configuration', link: '/reference/core/configuration' },
               { text: 'Environment Variables', link: '/reference/core/environment-variables' },
@@ -151,4 +151,4 @@ export default defineConfig({
       level: [2, 3],
     },
   },
-})
+}))

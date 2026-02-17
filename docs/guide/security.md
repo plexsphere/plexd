@@ -40,26 +40,20 @@ Bootstrap Token (one-time, short TTL)
 
 During registration the node generates its Curve25519 key pair locally. Only the public key is sent to the control plane. The private key never leaves the node.
 
-```
-Client                                    Control Plane
-  │                                              │
-  │── Generate Curve25519 keypair                │
-  │                                              │
-  │── POST /v1/register ────────────────────────►│
-  │   { token, public_key, hostname,             │── Validate token (one-time)
-  │     metadata, capabilities }                 │
-  │                                              │── Assign mesh IP (10.100.x.x)
-  │                                              │── Store public key
-  │                                              │── Generate PSK per peer pair
-  │                                              │── Generate Node Secret Key (NSK)
-  │◄─────────────────────────────────────────────│
-  │   { node_id, mesh_ip,                        │
-  │     signing_public_key,                      │
-  │     node_secret_key,                         │
-  │     peers: [                                 │
-  │       { id, public_key, mesh_ip,             │
-  │         endpoint, allowed_ips, psk }         │
-  │     ] }                                      │
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant CP as Control Plane
+
+    C->>C: Generate Curve25519 keypair
+    C->>CP: POST /v1/register<br/>{token, public_key, hostname, metadata, capabilities}
+    CP->>CP: Validate token (one-time)
+    CP->>CP: Assign mesh IP (10.100.x.x)
+    CP->>CP: Store public key
+    CP->>CP: Generate PSK per peer pair
+    CP->>CP: Generate Node Secret Key (NSK)
+    CP-->>C: {node_id, mesh_ip, signing_public_key, node_secret_key, peers[]}
+    C->>C: Set NSK as auth token
 ```
 
 ### Phase 2: Tunnel Setup
@@ -128,23 +122,21 @@ This ensures that even if the TLS connection is compromised (e.g. through a rogu
 
 Key rotation is triggered by the control plane - either on a schedule, by admin action, or in response to a compromised node. The `rotate_keys` SSE event is signed like all other events and verified before processing.
 
-```
-Client                                    Control Plane
-  │                                              │
-  │◄── SSE: rotate_keys (signed) ────────────────│
-  │                                              │
-  │── Verify signature                           │
-  │── Generate new Curve25519 keypair            │
-  │                                              │
-  │── POST /v1/keys/rotate ─────────────────────►│
-  │   { node_id, new_public_key }                │── Store new public key
-  │                                              │── Generate new PSKs
-  │                                              │── Push new key to all peers
-  │◄─────────────────────────────────────────────│
-  │   { updated_peers }                          │
-  │                                              │
-  │── Replace private key on WireGuard interface │
-  │── Update all peer PSKs                       │
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant CP as Control Plane
+
+    CP->>C: SSE: rotate_keys (signed)
+    C->>C: Verify signature
+    C->>C: Generate new Curve25519 keypair
+    C->>CP: POST /v1/keys/rotate<br/>{node_id, new_public_key}
+    CP->>CP: Store new public key
+    CP->>CP: Generate new PSKs
+    CP->>CP: Push new key to all peers
+    CP-->>C: {updated_peers}
+    C->>C: Replace private key on WireGuard interface
+    C->>C: Update all peer PSKs
 ```
 
 When a node is force-removed from the control plane, all peers that had a tunnel to the compromised node receive a `peer_removed` event followed by fresh PSKs for their remaining peer pairs.
@@ -153,22 +145,16 @@ When a node is force-removed from the control plane, all peers that had a tunnel
 
 The control plane's Ed25519 signing key (used for SSE event signatures and session JWTs) can be rotated independently of WireGuard mesh keys. During rotation, both the old and the new key are valid for a transition period.
 
-```
-Client                                    Control Plane
-  │                                             │
-  │◄── SSE: signing_key_rotated ────────────────│
-  │   { new_signing_public_key,                 │── Signed with CURRENT key
-  │     valid_from,                             │
-  │     transition_period: "24h" }              │
-  │                                             │
-  │── Store new key, keep old key               │
-  │   for transition_period                     │
-  │                                             │
-  │   During transition: accept events          │
-  │   signed with either key                    │
-  │                                             │
-  │   After transition: remove old key,         │
-  │   only accept new key                       │
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant CP as Control Plane
+
+    CP->>C: SSE: signing_key_rotated (signed with current key)<br/>{new_signing_public_key, valid_from, transition_period: "24h"}
+    C->>C: Verify with current key
+    C->>C: Store new key, keep old key
+    Note over C: During transition period:<br/>accept events signed with either key
+    Note over C: After transition:<br/>remove old key, only accept new key
 ```
 
 The `signing_key_rotated` event is signed with the **current** (old) key, which the node already trusts. This creates a chain of trust - each key vouches for its successor.

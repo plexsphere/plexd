@@ -18,9 +18,9 @@ Step-by-step guide for installing plexd on a bare-metal Linux server.
 Install plexd with a single command:
 
 ```sh
-curl -fsSL https://get.plexsphere.io/install.sh | sh -s -- \
+curl -fsSL https://get.plexsphere.com/install.sh | sh -s -- \
   --token <YOUR_BOOTSTRAP_TOKEN> \
-  --api-url https://api.your-plexsphere.io
+  --api-url https://api.plexsphere.com
 ```
 
 This downloads the binary, verifies its checksum, installs plexd as a systemd service, and starts it.
@@ -40,10 +40,10 @@ This downloads the binary, verifies its checksum, installs plexd as a systemd se
 
 ```sh
 # For amd64
-curl -fsSL -o /tmp/plexd https://artifacts.plexsphere.io/plexd/latest/plexd-linux-amd64
+curl -fsSL -o /tmp/plexd https://artifacts.plexsphere.com/plexd/latest/plexd-linux-amd64
 
 # For arm64
-curl -fsSL -o /tmp/plexd https://artifacts.plexsphere.io/plexd/latest/plexd-linux-arm64
+curl -fsSL -o /tmp/plexd https://artifacts.plexsphere.com/plexd/latest/plexd-linux-arm64
 
 chmod +x /tmp/plexd
 ```
@@ -88,8 +88,8 @@ chmod 600 /etc/plexd/bootstrap-token
 ### 2. Run the install script without --token
 
 ```sh
-curl -fsSL https://get.plexsphere.io/install.sh | sh -s -- \
-  --api-url https://api.your-plexsphere.io
+curl -fsSL https://get.plexsphere.com/install.sh | sh -s -- \
+  --api-url https://api.plexsphere.com
 ```
 
 plexd reads the pre-provisioned token file on startup and registers automatically.

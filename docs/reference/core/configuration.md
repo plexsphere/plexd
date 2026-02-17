@@ -36,7 +36,7 @@ Control plane HTTP client configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `base_url` | string | — (required) | Control plane API base URL, e.g. `https://api.plexsphere.io` |
+| `base_url` | string | — (required) | Control plane API base URL, e.g. `https://api.plexsphere.com` |
 | `tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification. **WARNING:** Only for development/testing. |
 | `connect_timeout` | duration | `10s` | Maximum time to wait for a TCP connection |
 | `request_timeout` | duration | `30s` | Maximum time for a complete HTTP request/response cycle |
@@ -310,7 +310,7 @@ log_level: info     # debug | info | warn | error (default: info)
 data_dir: /var/lib/plexd  # persistent data directory (default: /var/lib/plexd)
 
 api:
-  base_url: https://api.plexsphere.io  # required
+  base_url: https://api.plexsphere.com  # required
   tls_insecure_skip_verify: false
   connect_timeout: 10s
   request_timeout: 30s

@@ -9,7 +9,7 @@ title: Installation & Quick Start
 ### Binary
 
 ```bash
-curl -fsSL https://get.plexsphere.io/plexd | sh
+curl -fsSL https://get.plexsphere.com/plexd | sh
 ```
 
 ### Container
@@ -100,7 +100,7 @@ spec:
                 - NET_RAW
           env:
             - name: PLEXD_API
-              value: "https://api.plexsphere.io"
+              value: "https://api.plexsphere.com"
             - name: PLEXD_BOOTSTRAP_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -129,7 +129,7 @@ services:
     volumes:
       - plexd-data:/var/lib/plexd
     environment:
-      PLEXD_API: "https://api.plexsphere.io"
+      PLEXD_API: "https://api.plexsphere.com"
       PLEXD_BOOTSTRAP_TOKEN_FILE: /run/secrets/bootstrap-token
       PLEXD_MODE: bridge
     secrets:

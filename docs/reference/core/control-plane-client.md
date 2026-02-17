@@ -22,7 +22,7 @@ The `internal/api` package provides the Go client for communicating with the Ple
 
 ```go
 cfg := api.Config{
-    BaseURL:               "https://api.plexsphere.io",
+    BaseURL:               "https://api.plexsphere.com",
     TLSInsecureSkipVerify: false,
 }
 cfg.ApplyDefaults() // sets zero-valued timeouts to defaults
@@ -236,10 +236,16 @@ Manages SSE reconnection with exponential backoff and polling fallback.
 
 ### State Machine
 
-```
-Disconnected → Connecting → Connected → (drop) → Connecting
-                         ↘ Backoff → Connecting
-                                   ↘ Polling → Connecting (periodic SSE retry)
+```mermaid
+stateDiagram-v2
+    [*] --> Disconnected
+    Disconnected --> Connecting
+    Connecting --> Connected
+    Connecting --> Backoff : transient error
+    Connected --> Connecting : connection dropped
+    Backoff --> Connecting : delay elapsed
+    Backoff --> Polling : threshold exceeded (5 min)
+    Polling --> Connecting : periodic SSE retry
 ```
 
 ## SSE Parser

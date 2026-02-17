@@ -1,14 +1,29 @@
-# plexd Documentation
+# Plexsphere Node Agent Documentation
 
-plexd is the Plexsphere node agent — a lightweight daemon that runs on every managed node, handles registration, state reconciliation, remote actions, and observability forwarding. For architecture and component overview, see [Architecture and Concepts](concepts.md). For build instructions and quick start, see the [README](https://github.com/plexsphere/plexd#readme).
+## Capabilities
 
-## Getting Started
+The Plexsphere node agent (`plexd`) is a lightweight daemon that runs on every managed node. It handles:
 
-- [Architecture and Concepts](concepts.md) — How plexd works, subsystem map, startup lifecycle
+- **Registration** — self-registers with the control plane using a bootstrap token
+- **WireGuard Mesh** — creates and manages WireGuard interfaces and encrypted peer tunnels
+- **NAT Traversal** — discovers public endpoints via STUN and exchanges them with peers
+- **Network Policy** — enforces peer visibility rules and firewall policies via nftables
+- **Secure Tunneling** — provides SSH-based secure access tunnels through the mesh
+- **State Reconciliation** — periodically fetches desired state and applies drift corrections
+- **Remote Actions** — executes built-in and hook-based actions requested via SSE events
+- **Observability** — collects and forwards metrics, logs, and audit events to the control plane
+- **Local Node API** — exposes node state (metadata, data, secrets) to local workloads via Unix socket API or PlexdNodeState CRD
+- **Integrity** — verifies checksums of the plexd binary and hook scripts
+- **Bridge Mode** — optional gateway mode with NAT relay, public ingress, user access, and site-to-site VPN
+
+## Operating Modes
+
+| Mode | Status | Description |
+|------|--------|-------------|
+| `node` | **Active** | Default mode. Runs all core subsystems. |
+| `bridge` | **Active** | Extends node mode with bridge-specific subsystems (relay, ingress, user access, site-to-site). Enabled when `mode: bridge` and `bridge.enabled: true`. |
 
 ## Guide
-
-In-depth guides covering installation, architecture, and security.
 
 - [Installation & Quick Start](guide/installation.md) — Install plexd and get running
 - [Architecture & Agent Lifecycle](guide/architecture.md) — Platform support, architecture diagrams, agent lifecycle, heartbeat, SSE, deregistration

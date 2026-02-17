@@ -162,7 +162,7 @@ The install script (`deploy/install.sh`) is a POSIX-compatible shell script.
 ### Usage
 
 ```sh
-curl -fsSL https://get.plexsphere.io/install.sh | sh -s -- [OPTIONS]
+curl -fsSL https://get.plexsphere.com/install.sh | sh -s -- [OPTIONS]
 ```
 
 ### Flags
@@ -188,4 +188,4 @@ curl -fsSL https://get.plexsphere.io/install.sh | sh -s -- [OPTIONS]
 
 | Variable              | Description                       | Default                                      |
 |-----------------------|-----------------------------------|----------------------------------------------|
-| `PLEXD_ARTIFACT_URL`  | Base URL for binary artifacts     | `https://artifacts.plexsphere.io/plexd`      |
+| `PLEXD_ARTIFACT_URL`  | Base URL for binary artifacts     | `https://artifacts.plexsphere.com/plexd`      |

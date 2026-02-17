@@ -754,7 +754,7 @@ The control plane sends an `action_request` event over the existing SSE stream t
     "include_processes": true
   },
   "timeout": "30s",
-  "callback_url": "https://api.plexsphere.io/v1/nodes/n_abc123/executions/exec_a1b2c3d4"
+  "callback_url": "https://api.plexsphere.com/v1/nodes/n_abc123/executions/exec_a1b2c3d4"
 }
 ```
 

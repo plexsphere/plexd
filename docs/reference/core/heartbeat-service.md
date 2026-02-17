@@ -19,6 +19,33 @@ The `internal/agent` package implements the `HeartbeatService`, which sends peri
 
 `HeartbeatService.Run(ctx)` operates as follows:
 
+```mermaid
+sequenceDiagram
+    participant HS as HeartbeatService
+    participant CP as Control Plane
+
+    HS->>HS: Send initial heartbeat
+    loop Every 30s (configurable)
+        HS->>HS: Build HeartbeatRequest
+        HS->>CP: POST /v1/nodes/{id}/heartbeat
+        alt 200 OK
+            CP-->>HS: HeartbeatResponse
+            opt reconcile = true
+                HS->>HS: TriggerReconcile()
+            end
+            opt rotate_keys = true
+                HS->>HS: onRotateKeys()
+            end
+        else 401 Unauthorized
+            CP-->>HS: ErrUnauthorized
+            HS->>HS: onAuthFailure() → re-register
+        else Other error
+            CP-->>HS: Error
+            HS->>HS: Log error, continue
+        end
+    end
+```
+
 1. Send one heartbeat immediately on start
 2. Start a ticker at the configured interval (default 30s)
 3. On each tick, build and send a `HeartbeatRequest`

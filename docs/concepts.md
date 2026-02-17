@@ -1,29 +1,6 @@
-# Architecture and Concepts
+# Agent Internals
 
-## What plexd Does
-
-plexd is the Plexsphere node agent — a lightweight daemon that runs on every managed node. It handles:
-
-- **Registration** — self-registers with the control plane using a bootstrap token
-- **WireGuard Mesh** — creates and manages WireGuard interfaces and encrypted peer tunnels
-- **NAT Traversal** — discovers public endpoints via STUN and exchanges them with peers
-- **Network Policy** — enforces peer visibility rules and firewall policies via nftables
-- **Secure Tunneling** — provides SSH-based secure access tunnels through the mesh
-- **State Reconciliation** — periodically fetches desired state and applies drift corrections
-- **Remote Actions** — executes built-in and hook-based actions requested via SSE events
-- **Observability** — collects and forwards metrics, logs, and audit events to the control plane
-- **Local Node API** — exposes node state (metadata, data, secrets) to local workloads via Unix socket API or PlexdNodeState CRD
-- **Integrity** — verifies checksums of the plexd binary and hook scripts
-- **Bridge Mode** — optional gateway mode with NAT relay, public ingress, user access, and site-to-site VPN
-
-## Operating Modes
-
-| Mode | Status | Description |
-|------|--------|-------------|
-| `node` | **Active** | Default mode. Runs all core subsystems listed below. |
-| `bridge` | **Active** | Extends node mode with bridge-specific subsystems (relay, ingress, user access, site-to-site). Enabled when `mode: bridge` and `bridge.enabled: true`. |
-
-## Active Subsystems
+## Subsystems
 
 These subsystems are initialized and started by `plexd up`:
 
@@ -53,6 +30,48 @@ These subsystems are initialized and started by `plexd up`:
 The `runUp` function in `cmd/plexd/cmd/up.go` performs initialization before entering steady state:
 
 **Initialization:**
+
+```mermaid
+flowchart TD
+    subgraph Config/Logger
+        A1[Parse config] --> A2[Set up logger]
+    end
+
+    subgraph Registration
+        A2 --> A3[Create control plane client]
+        A3 --> A4[Register node]
+        A4 --> A5[Create Ed25519 verifier]
+    end
+
+    subgraph Networking
+        A5 --> A6[Initialize WireGuard]
+        A5 --> A7[Initialize NAT + Peer Exchange]
+        A5 --> A8[Initialize Network Policy]
+        A5 --> A9[Initialize Tunnel]
+        A5 --> A10[Initialize Bridge]
+    end
+
+    subgraph Core Services
+        A6 & A7 & A8 & A9 & A10 --> A11[Create SSE manager]
+        A11 --> A12[Create reconciler]
+        A12 --> A13[Create heartbeat service]
+    end
+
+    subgraph Actions/NodeAPI
+        A13 --> A14[Create action executor + hook watcher]
+        A14 --> A15[Create node API server]
+    end
+
+    subgraph Observability
+        A15 --> A16[Create metrics collectors]
+        A16 --> A17[Create log forwarder]
+        A17 --> A18[Create audit forwarder]
+    end
+
+    A18 --> G[Launch goroutines via WaitGroup]
+
+    style A10 stroke-dasharray: 5 5
+```
 
 1. **Parse config** — read YAML, apply CLI flag overrides, apply `PLEXD_*` env overrides
 2. **Set up logger** — structured `slog` logger with configured level
@@ -94,6 +113,34 @@ After initialization, goroutines are started via a `sync.WaitGroup`:
 ## Shutdown Sequence
 
 On SIGTERM or SIGINT:
+
+```mermaid
+flowchart TD
+    SIG[SIGTERM / SIGINT] --> C1[Cancel context]
+    C1 --> C2[SSE shutdown]
+    C1 --> C3[Drain actions]
+    C2 & C3 --> C4[Mesh server shutdown]
+
+    subgraph Bridge teardown
+        C4 --> C5[Ingress teardown]
+        C5 --> C6[User access teardown]
+        C6 --> C7[Site-to-site teardown]
+        C7 --> C8[ACME teardown]
+        C8 --> C9[Bridge teardown]
+    end
+
+    C9 --> C10[Firewall teardown]
+    C10 --> C11[WireGuard teardown]
+    C11 --> C12{WaitGroup done<br/>within 30s?}
+    C12 -->|Yes| EXIT[Exit 0]
+    C12 -->|No| FORCE[Force exit]
+
+    style C5 stroke-dasharray: 5 5
+    style C6 stroke-dasharray: 5 5
+    style C7 stroke-dasharray: 5 5
+    style C8 stroke-dasharray: 5 5
+    style C9 stroke-dasharray: 5 5
+```
 
 1. **Context cancel** — the signal-notify context is cancelled, which signals all goroutines to stop
 2. **`sseMgr.Shutdown()`** — close the SSE connection
@@ -145,7 +192,7 @@ The SSE manager processes these event types:
 
 ## See Also
 
+- [Architecture & Agent Lifecycle](guide/architecture.md) — High-level architecture, lifecycle diagrams, operational behavior
 - [Configuration Reference](reference/core/configuration.md) — Full YAML configuration schema
 - [CLI Reference](reference/core/cli.md) — Command-line interface and subcommands
 - [Environment Variables Reference](reference/core/environment-variables.md) — All `PLEXD_*` overrides
-- [README](https://github.com/plexsphere/plexd#readme) — Project overview and quick start

@@ -106,6 +106,25 @@ cancel()
 
 Each cycle follows this sequence:
 
+```mermaid
+flowchart TD
+    START([Tick / Trigger]) --> FETCH[FetchState]
+    FETCH -->|error| SKIP_ERR[Log warn, skip cycle]
+    FETCH -->|ok| DIFF[ComputeDiff]
+    DIFF --> EMPTY{Diff empty?}
+    EMPTY -->|yes| DONE([Wait for next tick])
+    EMPTY -->|no| HANDLERS[Invoke handlers sequentially]
+    HANDLERS -->|handler error| LOG_ERR[Log error, continue next handler]
+    LOG_ERR --> HANDLERS
+    HANDLERS --> REPORT[BuildDriftReport]
+    REPORT --> SEND[ReportDrift]
+    SEND -->|error| LOG_WARN[Log warn]
+    SEND -->|ok| SNAPSHOT[Update snapshot]
+    LOG_WARN --> DONE
+    SNAPSHOT --> DONE
+    SKIP_ERR --> DONE
+```
+
 1. **FetchState** — `GET /v1/nodes/{node_id}/state` via `StateFetcher`
 2. **ComputeDiff** — compare desired state against local snapshot
 3. **Skip if empty** — no handlers invoked, no drift reported

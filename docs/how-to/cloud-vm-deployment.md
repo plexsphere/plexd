@@ -22,9 +22,9 @@ Use the minimal cloud-init template to deploy a VM with plexd:
 runcmd:
   - |
     set -eu
-    curl -fsSL https://get.plexsphere.io/install.sh | sh -s -- \
+    curl -fsSL https://get.plexsphere.com/install.sh | sh -s -- \
       --token <YOUR_BOOTSTRAP_TOKEN> \
-      --api-url https://api.your-plexsphere.io
+      --api-url https://api.plexsphere.com
 ```
 
 Paste this as the user-data when launching a VM in your cloud provider.
@@ -64,7 +64,7 @@ The minimal template only runs the install script with token and API URL. plexd 
 2. Provide the required variables:
 
 ```hcl
-plexd_api_url         = "https://api.your-plexsphere.io"
+plexd_api_url         = "https://api.plexsphere.com"
 plexd_bootstrap_token = "your-token-here"
 ami_id                = "ami-0abcdef1234567890"  # Ubuntu 22.04
 subnet_id             = "subnet-0123456789abcdef0"
@@ -85,7 +85,7 @@ The instance enforces IMDSv2 (`http_tokens = "required"`) for security.
 2. Provide the required variables:
 
 ```hcl
-plexd_api_url         = "https://api.your-plexsphere.io"
+plexd_api_url         = "https://api.plexsphere.com"
 plexd_bootstrap_token = "your-token-here"
 image_name            = "Ubuntu 22.04"
 network_name          = "internal-network"
@@ -120,7 +120,7 @@ write_files:
     permissions: "0600"
     content: |
       api:
-        base_url: "https://api.your-plexsphere.io"
+        base_url: "https://api.plexsphere.com"
       data_dir: /var/lib/plexd
       registration:
         use_metadata: true
