@@ -2,8 +2,8 @@
   "feature_id": "PXD-0047",
   "title": "L002: Add LocalReporter and MultiReporter with credentials",
   "slug": "l002-add-localreporter-and-multireporter-with",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 🏗️ large\n**Category:** backend\n**Priority:** critical\n**Source:** Proposed for 'It should be possible in Metrics, Log Forwarding u'\n\nImplement per-pipeline `LocalReporter` (metrics, logfwd, auditfwd) — an HTTP client implementing the respective reporter interface that POSTs identical JSON batch payloads (MetricBatch/LogBatch/AuditBatch) to the configured local URL with bearer token authentication. Implement per-pipeline `MultiReporter` fan-out wrapper that dispatches to both platform reporter and local reporter in parallel goroutines, collecting and logging errors independently (local endpoint failure never blocks platform delivery). Credential resolution at flush time via existing `SecretFetcher.FetchSecret()` → `DecryptSecret()` (AES-256-GCM) with an in-memory TTL cache to avoid per-flush secret lookups. Includes comprehensive unit tests: LocalReporter HTTP behavior, MultiReporter parallel dispatch, credential caching TTL expiry, error isolation between targets.\n\n**Rationale:** Core business logic of the feature. The MultiReporter pattern ensures zero impact on existing platform delivery while enabling local endpoint support. In-memory credential caching avoids expensive secret decryption on every flush cycle. Independent error handling is critical — a down local SIEM must never cause data loss to the platform.\n\n**Affected Areas:**\n- src/internal/metrics/local_reporter.go\n- src/internal/metrics/multi_reporter.go\n- src/internal/logfwd/local_reporter.go\n- src/internal/logfwd/multi_reporter.go\n- src/internal/auditfwd/local_reporter.go\n- src/internal/auditfwd/multi_reporter.go\n- src/internal/metrics/local_reporter_test.go\n- src/internal/metrics/multi_reporter_test.go\n- src/internal/logfwd/local_reporter_test.go\n- src/internal/logfwd/multi_reporter_test.go\n- src/internal/auditfwd/local_reporter_test.go\n- src/internal/auditfwd/multi_reporter_test.go",
   "stories": [
@@ -423,6 +423,7 @@
       "description": "Create `internal/metrics/local_reporter.go`: struct implementing MetricsReporter interface with fields for http.Client, URL, SecretFetcher, NSK, secretKey, logger, and cached credential (token string + fetchedAt time.Time protected by sync.RWMutex). Constructor `NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) *LocalReporter` creates http.Client with TLS config from cfg.TLSInsecureSkipVerify and 10s timeout. `ReportMetrics(ctx, nodeID, batch)` resolves credential (check cache TTL 5min, fetch+decrypt if expired, fallback to stale on error), then POSTs JSON-serialized batch to cfg.URL with Authorization: Bearer header. Define `SecretFetcher` interface in this package (matching nodeapi pattern). Create `internal/metrics/local_reporter_test.go`: tests using httptest.NewTLSServer for HTTP behavior (correct method, path, Content-Type, Authorization header, request body), credential caching (second call within TTL doesn't call fetcher), credential refresh (call after TTL triggers fetcher), stale fallback (fetch error with cached token uses stale), no-cache error (fetch error with no cache returns error), non-2xx handling, connection error handling. Use mock SecretFetcher returning pre-encrypted test secrets.",
       "level": 1,
       "estimate_minutes": 30,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -439,6 +440,7 @@
       "description": "Create `internal/metrics/multi_reporter.go`: struct implementing MetricsReporter with fields for platform MetricsReporter, local MetricsReporter, and logger. Constructor `NewMultiReporter(platform, local MetricsReporter, logger *slog.Logger) *MultiReporter`. `ReportMetrics(ctx, nodeID, batch)` launches two goroutines (one for platform, one for local), waits for both via sync.WaitGroup, returns platform error only, logs local error as warning with component=metrics. Create `internal/metrics/multi_reporter_test.go`: tests using mock reporters for both-succeed, platform-fail-local-succeed (returns platform error), platform-succeed-local-fail (returns nil, logs warning), both-fail (returns platform error, logs local warning), slow-local-doesn't-block-platform (verify timing), context-cancellation-propagated, both-receive-same-arguments.",
       "level": 1,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-005",
         "REQ-006"
@@ -450,6 +452,7 @@
       "description": "Create `internal/logfwd/local_reporter.go`: struct implementing LogReporter interface, same credential resolution and HTTP POST pattern as metrics LocalReporter. Constructor `NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) *LocalReporter`. `ReportLogs(ctx, nodeID, batch)` resolves credential then POSTs api.LogBatch JSON to cfg.URL with bearer auth. Define SecretFetcher interface in logfwd package. Create `internal/logfwd/local_reporter_test.go`: same test structure as metrics — HTTP behavior, credential caching TTL, stale fallback, error handling. Verify LogEntry fields (Timestamp, Source, Unit, Message, Severity, Hostname) are preserved in POST body.",
       "level": 1,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -466,6 +469,7 @@
       "description": "Create `internal/logfwd/multi_reporter.go`: struct implementing LogReporter with platform and local LogReporter fields. Constructor `NewMultiReporter(platform, local LogReporter, logger *slog.Logger) *MultiReporter`. `ReportLogs(ctx, nodeID, batch)` dispatches in parallel, returns platform error only, logs local error. Create `internal/logfwd/multi_reporter_test.go`: same test scenarios as metrics MultiReporter adapted for LogReporter interface.",
       "level": 1,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-005",
         "REQ-006"
@@ -477,6 +481,7 @@
       "description": "Create `internal/auditfwd/local_reporter.go`: struct implementing AuditReporter interface, same credential resolution and HTTP POST pattern as metrics/logfwd. Constructor `NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) *LocalReporter`. `ReportAudit(ctx, nodeID, batch)` resolves credential then POSTs api.AuditBatch JSON to cfg.URL with bearer auth. Define SecretFetcher interface in auditfwd package. Create `internal/auditfwd/local_reporter_test.go`: HTTP behavior, credential caching, verify AuditEntry fields including json.RawMessage Subject/Object are preserved.",
       "level": 1,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -493,6 +498,7 @@
       "description": "Create `internal/auditfwd/multi_reporter.go`: struct implementing AuditReporter with platform and local AuditReporter fields. Constructor `NewMultiReporter(platform, local AuditReporter, logger *slog.Logger) *MultiReporter`. `ReportAudit(ctx, nodeID, batch)` dispatches in parallel, returns platform error only, logs local error. Create `internal/auditfwd/multi_reporter_test.go`: same test scenarios as metrics MultiReporter adapted for AuditReporter interface.",
       "level": 1,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-005",
         "REQ-006"
@@ -504,6 +510,7 @@
       "description": "Modify `cmd/plexd/cmd/up.go`: For each pipeline (metrics, logfwd, auditfwd), add conditional wrapping. Before the pipeline manager constructor, check if `cfg.<Pipeline>.LocalEndpoint.URL != \"\"`. If set: construct LocalReporter with (cfg.LocalEndpoint, client (as SecretFetcher), nsk, identity.NodeID, logger), then construct MultiReporter wrapping (client, localReporter, logger), pass MultiReporter as the reporter argument. If not set: pass client directly (existing behavior). Log info message when local endpoint is enabled: 'local endpoint enabled' with url field. Ensure NSK ([]byte(identity.NodeSecretKey)) is available before pipeline construction. The ControlPlane client implements SecretFetcher (has FetchSecret method), so it can be passed directly.",
       "level": 2,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-008"
       ]
@@ -514,6 +521,7 @@
       "description": "Add edge case tests to `internal/metrics/local_reporter_test.go` (representative for all three pipelines): (1) TTL boundary — set fetchedAt to exactly 5min ago, verify refresh is triggered. (2) Concurrent Report calls — launch 10 goroutines calling ReportMetrics simultaneously, verify no data races (run with -race), verify SecretFetcher is called at most once for initial resolution. (3) Stale fallback under repeated failures — fetch fails 3 times with stale cache, verify stale token is used each time and warning logged each time. (4) Token never appears in log output — use capturingHandler to capture all log records, verify none contain the test token string. (5) Empty batch handling — verify LocalReporter still makes the POST (consistent with platform reporter behavior).",
       "level": 2,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-004",
         "REQ-010"
@@ -525,6 +533,7 @@
       "description": "Add edge case tests to `internal/metrics/local_reporter_test.go`: (1) TLS skip verify — create httptest.NewTLSServer, connect with TLSInsecureSkipVerify=true, verify success. Connect with TLSInsecureSkipVerify=false, verify TLS error. (2) Request timeout — create test server that sleeps 15s, verify LocalReporter returns timeout error within ~10s. (3) Large batch — create batch with 1000 MetricPoints, verify all are serialized and sent correctly. (4) Server closes connection mid-response — verify error is returned cleanly.",
       "level": 2,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-007",
         "REQ-009"
@@ -536,6 +545,7 @@
       "description": "Create or extend documentation in the docs/ directory covering the LocalReporter and MultiReporter architecture. Reference doc should include: (1) LocalReporter: purpose, constructor parameters, HTTP behavior (POST, JSON, bearer auth), credential resolution flow (SecretFetcher → DecryptSecret → cache), TTL caching semantics, TLS configuration. (2) MultiReporter: purpose, parallel dispatch pattern, error isolation semantics (platform error returned, local error logged), constructor parameters. (3) Configuration: YAML examples for each pipeline's local_endpoint block. (4) Wiring: how MultiReporter is conditionally created in up.go. (5) Error handling: what happens when local endpoint is down, when credentials fail, when TLS fails. Update existing reference docs in docs/reference/observability/ for metrics-collection.md, log-forwarding.md, and audit-forwarding.md to include LocalReporter and MultiReporter sections.",
       "level": 3,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-005",
@@ -755,6 +765,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-18T08:32:09.318165"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T08:33:00.601734"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T10:46:18.932318"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T10:46:18.949061"
     }
   },
   "execution_history": [
@@ -768,6 +790,50 @@
           "name": "prepare",
           "duration": 421.84987235069275,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "0f5473cb-66dc-4f22-9d56-b1fe098442d5",
+      "timestamp": "2026-02-18T09:21:56.047945",
+      "total_duration": 2782.334202528,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (6 tasks)",
+          "duration": 1256.9372148513794,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (3 tasks)",
+          "duration": 251.1784565448761,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 211.60095047950745,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0047] Code Review",
+          "duration": 472.531368970871,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0047] Improvements",
+          "duration": 430.1261968612671,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0047] Simplify",
+          "duration": 159.96001482009888,
+          "type": "simplify",
           "status": "done"
         }
       ]
