@@ -2,8 +2,8 @@
   "feature_id": "PXD-0050",
   "title": "L005: Document local endpoint configuration",
   "slug": "l005-document-local-endpoint-configuration",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** docs\n**Priority:** medium\n**Source:** Proposed for 'It should be possible in Metrics, Log Forwarding u'\n\nDocument the new `local_endpoint` configuration fields for all three observability pipelines. Create or update config reference pages for metrics, log forwarding, and audit forwarding to include the `local_endpoint.url`, `local_endpoint.secret_key`, and `local_endpoint.tls_insecure_skip_verify` fields with descriptions, types, defaults, and validation rules. Add a guide page explaining how to set up local endpoint delivery: configuring the endpoint URL, creating and referencing secrets for bearer token auth via the existing encrypted secret mechanism, common use cases (forwarding to local Prometheus/Grafana, Loki, Elasticsearch/SIEM), and troubleshooting (TLS issues, credential errors, verifying delivery).\n\n**Rationale:** Users need clear documentation to adopt local endpoints correctly. The credential setup via SecretRef is non-obvious and requires step-by-step guidance. Without docs, support burden increases and adoption is limited to users who can reverse-engineer the config schema.\n\n**Affected Areas:**\n- docs/reference/metrics-config.md\n- docs/reference/log-forwarding-config.md\n- docs/reference/audit-forwarding-config.md\n- docs/guides/local-endpoint-setup.md",
   "stories": [
@@ -323,6 +323,7 @@
       "description": "Read metrics-collection.md, log-forwarding.md, and audit-forwarding.md. Verify each contains: Local Endpoint field table, validation rules, YAML example, LocalReporter, MultiReporter, credential resolution, and integration point sections. Identify any gaps or inconsistencies. These pages were already updated in PXD-0047/PXD-0048 — this task audits completeness.",
       "level": 1,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-001"
       ]
@@ -333,6 +334,7 @@
       "description": "Read configuration.md. Verify metrics, log_fwd, and audit_fwd sections include local_endpoint.url, local_endpoint.secret_key, and local_endpoint.tls_insecure_skip_verify rows. Verify the Complete Annotated Example includes commented-out local_endpoint blocks for all three pipelines. These were added during the implementation features — audit for completeness.",
       "level": 1,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-002"
       ]
@@ -343,6 +345,7 @@
       "description": "Create docs/how-to/local-endpoint-setup.md with frontmatter, title, introduction, and prerequisites section. Follow the pattern established in docs/how-to/local-node-api.md and docs/how-to/custom-hook-scripts.md. Include: overview of local endpoint dual delivery (data sent to both platform and local endpoint in parallel), error isolation semantics (local failures logged but never block platform), fire-and-forget delivery model.",
       "level": 2,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-003",
         "REQ-009"
@@ -354,6 +357,7 @@
       "description": "Add a section to the guide explaining the credential flow in user-facing terms: (1) operator creates a secret in the Plexsphere control plane containing the bearer token for the local endpoint, (2) operator sets secret_key in the YAML config to the secret's name, (3) at runtime, plexd calls FetchSecret via the control plane API, (4) decrypts the response with the NSK using AES-256-GCM, (5) uses the plaintext as a Bearer token in HTTP Authorization header. Mention 5-minute TTL cache and stale-cache fallback.",
       "level": 2,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-004"
       ]
@@ -364,6 +368,7 @@
       "description": "Add numbered steps to the guide: Step 1 — create the bearer token secret in the control plane. Step 2 — add local_endpoint block to the pipeline config in /etc/plexd/config.yaml (show YAML examples for metrics, log_fwd, and audit_fwd). Step 3 — restart plexd (systemctl restart plexd). Step 4 — verify delivery by checking logs (journalctl -u plexd | grep 'local endpoint enabled'). Include complete YAML snippets for each pipeline.",
       "level": 2,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-003"
       ]
@@ -374,6 +379,7 @@
       "description": "Add a 'Common Use Cases' section with three examples: (1) Forwarding metrics to a local Prometheus/Mimir instance — show endpoint URL format, note that the payload is JSON (not Prometheus remote-write format) and may need a receiver adapter. (2) Forwarding logs to Grafana Loki — show endpoint URL format, note JSON payload format. (3) Forwarding audit data to Elasticsearch/SIEM — show endpoint URL format, note JSON payload format. Clarify that the local endpoint receives identical JSON payloads to what the control plane receives.",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-006"
       ]
@@ -384,6 +390,7 @@
       "description": "Add a troubleshooting table to the guide covering: TLS handshake failure (self-signed cert → use tls_insecure_skip_verify or install CA cert, with warning about production use), credential fetch failure (wrong secret_key name → verify name in control plane), decryption failure (NSK mismatch → check if key rotation occurred), HTTP 4xx/5xx from local endpoint (check endpoint logs, verify URL path), no 'local endpoint enabled' log message (verify URL is non-empty and pipeline is enabled), delivery verification steps.",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-005"
       ]
@@ -394,6 +401,7 @@
       "description": "Add a 'Reference' section at the bottom of the how-to guide linking to: Metrics Collection reference, Log Forwarding reference, Audit Forwarding reference, Configuration Reference, Key Storage reference (for NSK context). Follow the pattern from docs/how-to/local-node-api.md which ends with a Reference section.",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-008"
       ]
@@ -404,6 +412,7 @@
       "description": "Add a cross-reference link in the Local Endpoint subsection of each observability reference page (metrics-collection.md, log-forwarding.md, audit-forwarding.md) pointing to the new how-to guide. Use the pattern: 'For a step-by-step setup guide, see [Setting Up Local Endpoint Delivery](../../how-to/local-endpoint-setup.md).' Place the link after the Local Endpoint field table or at the beginning of the section.",
       "level": 3,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-008"
       ]
@@ -414,6 +423,7 @@
       "description": "Add a note in the metrics, log_fwd, and audit_fwd sections of configuration.md pointing to the how-to guide. Use pattern: 'For a step-by-step setup guide, see [Setting Up Local Endpoint Delivery](../../how-to/local-endpoint-setup.md).' Place after or below the local_endpoint field rows in each section.",
       "level": 3,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-008"
       ]
@@ -424,6 +434,7 @@
       "description": "Edit docs/.vitepress/config.mts to add: (1) { text: 'Local Endpoint Setup', link: '/how-to/local-endpoint-setup' } in the 'How-To Guides' sidebar section, after the 'Custom Hook Scripts' entry. (2) { text: 'Local Endpoint Integration Tests', link: '/reference/development/local-endpoint-integration-tests' } in the 'Development' sidebar section, after the 'Systemd E2E Test' entry.",
       "level": 3,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-007"
       ]
@@ -434,6 +445,7 @@
       "description": "Run the VitePress build (npm run docs:build or equivalent) to verify all new and modified markdown files render without errors. Verify the sidebar entries resolve to valid pages. Check that all cross-links are valid relative paths.",
       "level": 4,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-003",
         "REQ-007"
@@ -445,6 +457,7 @@
       "description": "Manually verify: (1) each observability reference page links to the how-to guide, (2) the how-to guide links back to each reference page, (3) the Configuration Reference links to the how-to guide, (4) the how-to guide links to the Configuration Reference. Ensure no broken links or circular references.",
       "level": 4,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-008"
       ]
@@ -577,6 +590,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-18T14:44:49.146083"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T14:45:42.311562"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T15:07:18.941847"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T15:07:18.958963"
     }
   },
   "execution_history": [
@@ -590,6 +615,56 @@
           "name": "prepare",
           "duration": 264.9331135749817,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "d54f3554-ab10-42b4-ac2e-2323979a70c8",
+      "timestamp": "2026-02-18T15:00:48.190673",
+      "total_duration": 766.9039146900177,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (2 tasks)",
+          "duration": 65.410635471344,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (6 tasks)",
+          "duration": 225.5485987663269,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (3 tasks)",
+          "duration": 48.277669191360474,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (2 tasks)",
+          "duration": 88.25206923484802,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0050] Code Review",
+          "duration": 193.49721312522888,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0050] Improvements",
+          "duration": 105.99052476882935,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0050] Simplify",
+          "duration": 39.92720413208008,
+          "type": "simplify",
           "status": "done"
         }
       ]

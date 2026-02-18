@@ -41,6 +41,7 @@ export default withMermaid(defineConfig({
           { text: 'Kubernetes Deployment', link: '/how-to/kubernetes-deployment' },
           { text: 'Local Node API', link: '/how-to/local-node-api' },
           { text: 'Custom Hook Scripts', link: '/how-to/custom-hook-scripts' },
+          { text: 'Local Endpoint Setup', link: '/how-to/local-endpoint-setup' },
         ],
       },
       {
@@ -141,6 +142,7 @@ export default withMermaid(defineConfig({
               { text: 'Systemd E2E Test', link: '/reference/development/systemd-e2e-test' },
               { text: 'Mock API Server', link: '/reference/development/mock-api-server' },
               { text: 'File System Utilities', link: '/reference/development/fsutil' },
+              { text: 'Local Endpoint Integration Tests', link: '/reference/development/local-endpoint-integration-tests' },
             ],
           },
         ],

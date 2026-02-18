@@ -159,6 +159,8 @@ System metrics collection and reporting.
 | `local_endpoint.secret_key` | string | — | Authentication credential for the local endpoint. Required when `url` is set. Redacted in config dumps. |
 | `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. |
 
+> For a step-by-step guide to configuring local endpoints, see [Setting Up Local Endpoint Delivery](../../how-to/local-endpoint-setup.md).
+
 Source: `internal/metrics/config.go`
 
 ---
@@ -181,6 +183,8 @@ Log collection and forwarding.
 | `local_endpoint.secret_key` | string | — | Authentication credential for the local endpoint. Required when `url` is set. Redacted in config dumps. |
 | `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. |
 
+> For a step-by-step guide to configuring local endpoints, see [Setting Up Local Endpoint Delivery](../../how-to/local-endpoint-setup.md).
+
 Source: `internal/logfwd/config.go`, `internal/logfwd/filter.go`
 
 ---
@@ -198,6 +202,8 @@ Audit event collection and forwarding.
 | `local_endpoint.url` | string | — | HTTPS URL for a local audit forwarding endpoint. Must use `https://` scheme. Empty means not configured. |
 | `local_endpoint.secret_key` | string | — | Authentication credential for the local endpoint. Required when `url` is set. Redacted in config dumps. |
 | `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. |
+
+> For a step-by-step guide to configuring local endpoints, see [Setting Up Local Endpoint Delivery](../../how-to/local-endpoint-setup.md).
 
 Source: `internal/auditfwd/config.go`
 

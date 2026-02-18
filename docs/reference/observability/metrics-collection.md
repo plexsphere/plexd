@@ -58,6 +58,8 @@ When `Enabled=false`, validation is skipped entirely (including `LocalEndpoint` 
 
 ### Local Endpoint
 
+> For a step-by-step setup guide, see [Setting Up Local Endpoint Delivery](../../how-to/local-endpoint-setup.md).
+
 `LocalEndpoint` allows metrics to be sent to an additional local endpoint alongside the control plane. The type is `api.LocalEndpointConfig`, defined once in `internal/api/types.go` and shared across all three observability pipelines.
 
 | Field                    | Type     | YAML Key                     | Description                                        |
