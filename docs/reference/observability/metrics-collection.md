@@ -33,6 +33,7 @@ Metrics are delivered to the control plane as **batch POST requests** (JSON arra
 | `CollectInterval` | `time.Duration` | `15s`   | Interval between collection cycles (min 5s)          |
 | `ReportInterval`  | `time.Duration` | `60s`   | Interval between reporting to control plane (min 10s)|
 | `BatchSize`       | `int`           | `100`   | Max metric points per report batch (must be > 0)     |
+| `LocalEndpoint`   | `api.LocalEndpointConfig` | _(zero)_ | Optional local endpoint for dual-destination delivery (see below) |
 
 ```go
 cfg := metrics.Config{}
@@ -53,7 +54,39 @@ if err := cfg.Validate(); err != nil {
 | `ReportInterval`  | >= `CollectInterval`         | `metrics: config: ReportInterval must be >= CollectInterval`|
 | `BatchSize`       | > 0                          | `metrics: config: BatchSize must be > 0`                   |
 
-When `Enabled=false`, validation is skipped entirely.
+When `Enabled=false`, validation is skipped entirely (including `LocalEndpoint` validation).
+
+### Local Endpoint
+
+`LocalEndpoint` allows metrics to be sent to an additional local endpoint alongside the control plane. The type is `api.LocalEndpointConfig`, defined once in `internal/api/types.go` and shared across all three observability pipelines.
+
+| Field                    | Type     | YAML Key                     | Description                                        |
+|--------------------------|----------|------------------------------|----------------------------------------------------|
+| `URL`                    | `string` | `local_endpoint.url`         | HTTPS endpoint URL. Empty means not configured.    |
+| `SecretKey`              | `string` | `local_endpoint.secret_key`  | Auth credential. Required when URL is set. Redacted in config dumps. |
+| `TLSInsecureSkipVerify`  | `bool`   | `local_endpoint.tls_insecure_skip_verify` | Disable TLS certificate verification. |
+
+**Validation rules** (applied only when `Enabled=true` and `URL` is non-empty):
+
+| Rule                       | Error Message                                                       |
+|----------------------------|---------------------------------------------------------------------|
+| URL must be parseable      | `metrics: config: local_endpoint: invalid URL "<url>"`              |
+| Scheme must be `https`     | `metrics: config: local_endpoint: URL must be HTTPS, got "<scheme>"`|
+| SecretKey must be non-empty| `metrics: config: local_endpoint: SecretKey is required when URL is set` |
+
+A zero-valued `LocalEndpointConfig` (all fields empty/false) is valid and means "not configured".
+
+```yaml
+metrics:
+  enabled: true
+  collect_interval: 15s
+  report_interval: 60s
+  batch_size: 100
+  local_endpoint:
+    url: https://metrics.local:9090/ingest
+    secret_key: local-metrics-token
+    tls_insecure_skip_verify: false
+```
 
 ## Collector
 

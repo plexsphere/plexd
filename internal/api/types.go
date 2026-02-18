@@ -2,6 +2,8 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/url"
 	"time"
 )
 
@@ -487,4 +489,42 @@ type SiteToSiteInfo struct {
 	Enabled             bool     `json:"enabled"`
 	TunnelCount         int      `json:"tunnel_count"`
 	TunnelProviderNames []string `json:"tunnel_provider_names,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Local Endpoint Configuration (shared by metrics, logfwd, auditfwd)
+// ---------------------------------------------------------------------------
+
+// LocalEndpointConfig holds the configuration for a local data-plane endpoint
+// that a pipeline can send data to in addition to the platform.
+// A zero-valued LocalEndpointConfig means "not configured" and passes validation.
+type LocalEndpointConfig struct {
+	// URL is the HTTPS endpoint URL. Must use the https:// scheme when set.
+	URL string `yaml:"url"`
+
+	// SecretKey is the authentication credential for the local endpoint.
+	// Required when URL is non-empty.
+	SecretKey string `yaml:"secret_key"`
+
+	// TLSInsecureSkipVerify disables TLS certificate verification.
+	TLSInsecureSkipVerify bool `yaml:"tls_insecure_skip_verify"`
+}
+
+// Validate checks that the local endpoint configuration is well-formed.
+// The prefix is prepended to error messages for context (e.g. "metrics").
+func (c *LocalEndpointConfig) Validate(prefix string) error {
+	if c.URL == "" {
+		return nil
+	}
+	u, err := url.Parse(c.URL)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("%s: config: local_endpoint: invalid URL %q", prefix, c.URL)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("%s: config: local_endpoint: URL must be HTTPS, got %q", prefix, u.Scheme)
+	}
+	if c.SecretKey == "" {
+		return fmt.Errorf("%s: config: local_endpoint: SecretKey is required when URL is set", prefix)
+	}
+	return nil
 }

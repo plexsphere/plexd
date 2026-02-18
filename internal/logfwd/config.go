@@ -4,6 +4,8 @@ package logfwd
 import (
 	"errors"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/api"
 )
 
 // DefaultCollectInterval is the default interval between log collection cycles.
@@ -40,6 +42,9 @@ type Config struct {
 	// Filter defines optional log filtering rules.
 	// When non-empty, the Forwarder wraps sources with a FilteringSource.
 	Filter FilterConfig `yaml:"filter"`
+
+	// LocalEndpoint configures an optional local data-plane endpoint.
+	LocalEndpoint api.LocalEndpointConfig `yaml:"local_endpoint"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.
@@ -76,6 +81,9 @@ func (c *Config) Validate() error {
 	}
 	if c.BatchSize < 1 {
 		return errors.New("logfwd: config: BatchSize must be at least 1")
+	}
+	if err := c.LocalEndpoint.Validate("logfwd"); err != nil {
+		return err
 	}
 	return nil
 }

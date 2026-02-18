@@ -1169,6 +1169,67 @@ func TestHeartbeatRequest_WithSiteToSite(t *testing.T) {
 	}
 }
 
+func TestLocalEndpointConfig_Validate(t *testing.T) {
+	tests := []struct {
+		name       string
+		cfg        LocalEndpointConfig
+		wantErr    bool
+		errContain string
+	}{
+		{
+			name: "zero value is valid",
+			cfg:  LocalEndpointConfig{},
+		},
+		{
+			name: "valid HTTPS with secret key",
+			cfg: LocalEndpointConfig{
+				URL:       "https://metrics.local:9090/ingest",
+				SecretKey: "my-secret-token",
+			},
+		},
+		{
+			name:       "rejects HTTP scheme",
+			cfg:        LocalEndpointConfig{URL: "http://metrics.local:9090/ingest", SecretKey: "my-secret-token"},
+			wantErr:    true,
+			errContain: "must be HTTPS",
+		},
+		{
+			name:       "rejects malformed URL",
+			cfg:        LocalEndpointConfig{URL: "://bad", SecretKey: "my-secret-token"},
+			wantErr:    true,
+			errContain: "invalid",
+		},
+		{
+			name:       "requires secret key when URL is set",
+			cfg:        LocalEndpointConfig{URL: "https://metrics.local:9090/ingest"},
+			wantErr:    true,
+			errContain: "SecretKey is required",
+		},
+		{
+			name: "secret key without URL is harmless no-op",
+			cfg:  LocalEndpointConfig{SecretKey: "orphaned-secret"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate("test")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Validate() = nil, want error containing %q", tt.errContain)
+				}
+				if !strings.Contains(err.Error(), tt.errContain) {
+					t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.errContain)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
 func TestBridgeInfo_SiteToSiteFields_JSONRoundTrip(t *testing.T) {
 	orig := BridgeInfo{
 		Enabled:                 true,

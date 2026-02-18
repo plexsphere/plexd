@@ -155,6 +155,9 @@ System metrics collection and reporting.
 | `collect_interval` | duration | `15s` | Interval between collection cycles. Minimum: `5s`. |
 | `report_interval` | duration | `60s` | Interval between reporting to the control plane. Minimum: `10s`. Must be >= `collect_interval`. |
 | `batch_size` | int | `100` | Maximum number of metric points per report batch. Minimum: `1`. |
+| `local_endpoint.url` | string | — | HTTPS URL for a local metrics endpoint. Must use `https://` scheme. Empty means not configured. |
+| `local_endpoint.secret_key` | string | — | Authentication credential for the local endpoint. Required when `url` is set. Redacted in config dumps. |
+| `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. |
 
 Source: `internal/metrics/config.go`
 
@@ -174,6 +177,9 @@ Log collection and forwarding.
 | `filter.min_severity` | string | — | Drop log entries below this severity level (syslog severities: `emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug`) |
 | `filter.include_units` | []string | — | Only pass entries matching one of these unit names |
 | `filter.exclude_units` | []string | — | Drop entries matching any of these unit names. Takes precedence over `include_units`. |
+| `local_endpoint.url` | string | — | HTTPS URL for a local log forwarding endpoint. Must use `https://` scheme. Empty means not configured. |
+| `local_endpoint.secret_key` | string | — | Authentication credential for the local endpoint. Required when `url` is set. Redacted in config dumps. |
+| `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. |
 
 Source: `internal/logfwd/config.go`, `internal/logfwd/filter.go`
 
@@ -189,6 +195,9 @@ Audit event collection and forwarding.
 | `collect_interval` | duration | `5s` | Interval between collection cycles. Minimum: `1s`. |
 | `report_interval` | duration | `15s` | Interval between reporting to the control plane. Must be >= `collect_interval`. |
 | `batch_size` | int | `500` | Maximum number of audit entries per report batch. Minimum: `1`. |
+| `local_endpoint.url` | string | — | HTTPS URL for a local audit forwarding endpoint. Must use `https://` scheme. Empty means not configured. |
+| `local_endpoint.secret_key` | string | — | Authentication credential for the local endpoint. Required when `url` is set. Redacted in config dumps. |
+| `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. |
 
 Source: `internal/auditfwd/config.go`
 
@@ -360,6 +369,10 @@ metrics:
   collect_interval: 15s      # min: 5s
   report_interval: 60s       # min: 10s, >= collect_interval
   batch_size: 100            # min: 1
+  # local_endpoint:
+  #   url: https://metrics.local:9090/ingest
+  #   secret_key: local-metrics-token
+  #   tls_insecure_skip_verify: false
 
 log_fwd:
   enabled: true
@@ -374,12 +387,20 @@ log_fwd:
   #     - sshd.service
   #   exclude_units:
   #     - cron.service
+  # local_endpoint:
+  #   url: https://logs.local:9090/ingest
+  #   secret_key: local-logs-token
+  #   tls_insecure_skip_verify: false
 
 audit_fwd:
   enabled: true
   collect_interval: 5s       # min: 1s
   report_interval: 15s       # >= collect_interval
   batch_size: 500            # min: 1
+  # local_endpoint:
+  #   url: https://audit.local:9090/ingest
+  #   secret_key: local-audit-token
+  #   tls_insecure_skip_verify: false
 
 wireguard:
   interface_name: plexd0

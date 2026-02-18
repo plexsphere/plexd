@@ -43,6 +43,7 @@ Each log line is serialized as:
 | `BatchSize`       | `int`           | `200`   | Maximum log entries per report batch (min 1)   |
 | `FilePatterns`    | `[]string`      | `nil`   | Glob patterns for file-based log collection    |
 | `Filter`          | `FilterConfig`  | _(empty)_ | Log filtering rules (see LogFilter section)  |
+| `LocalEndpoint`   | `api.LocalEndpointConfig` | _(zero)_ | Optional local endpoint for dual-destination delivery (see below) |
 
 ```go
 cfg := logfwd.Config{}
@@ -62,7 +63,39 @@ if err := cfg.Validate(); err != nil {
 | `ReportInterval`  | >= `CollectInterval` | `logfwd: config: ReportInterval must be >= CollectInterval` |
 | `BatchSize`       | >= 1                 | `logfwd: config: BatchSize must be at least 1`              |
 
-When `Enabled=false`, validation is skipped entirely.
+When `Enabled=false`, validation is skipped entirely (including `LocalEndpoint` validation).
+
+### Local Endpoint
+
+`LocalEndpoint` allows logs to be sent to an additional local endpoint alongside the control plane. The type is `api.LocalEndpointConfig`, defined once in `internal/api/types.go` and shared across all three observability pipelines.
+
+| Field                    | Type     | YAML Key                     | Description                                        |
+|--------------------------|----------|------------------------------|----------------------------------------------------|
+| `URL`                    | `string` | `local_endpoint.url`         | HTTPS endpoint URL. Empty means not configured.    |
+| `SecretKey`              | `string` | `local_endpoint.secret_key`  | Auth credential. Required when URL is set. Redacted in config dumps. |
+| `TLSInsecureSkipVerify`  | `bool`   | `local_endpoint.tls_insecure_skip_verify` | Disable TLS certificate verification. |
+
+**Validation rules** (applied only when `Enabled=true` and `URL` is non-empty):
+
+| Rule                       | Error Message                                                       |
+|----------------------------|---------------------------------------------------------------------|
+| URL must be parseable      | `logfwd: config: local_endpoint: invalid URL "<url>"`               |
+| Scheme must be `https`     | `logfwd: config: local_endpoint: URL must be HTTPS, got "<scheme>"` |
+| SecretKey must be non-empty| `logfwd: config: local_endpoint: SecretKey is required when URL is set` |
+
+A zero-valued `LocalEndpointConfig` (all fields empty/false) is valid and means "not configured".
+
+```yaml
+log_fwd:
+  enabled: true
+  collect_interval: 10s
+  report_interval: 30s
+  batch_size: 200
+  local_endpoint:
+    url: https://logs.local:9090/ingest
+    secret_key: local-logs-token
+    tls_insecure_skip_verify: false
+```
 
 ## LogSource
 

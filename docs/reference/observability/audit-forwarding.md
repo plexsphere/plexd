@@ -43,6 +43,7 @@ Delivery follows the same batch model as log forwarding: **batch POST** (JSON Li
 | `CollectInterval` | `time.Duration` | `5s`    | Interval between collection cycles (min 1s)    |
 | `ReportInterval`  | `time.Duration` | `15s`   | Interval between reporting to control plane    |
 | `BatchSize`       | `int`           | `500`   | Maximum audit entries per report batch (min 1) |
+| `LocalEndpoint`   | `api.LocalEndpointConfig` | _(zero)_ | Optional local endpoint for dual-destination delivery (see below) |
 
 ```go
 cfg := auditfwd.Config{}
@@ -62,7 +63,39 @@ if err := cfg.Validate(); err != nil {
 | `ReportInterval`  | >= `CollectInterval` | `auditfwd: config: ReportInterval must be >= CollectInterval` |
 | `BatchSize`       | >= 1                 | `auditfwd: config: BatchSize must be at least 1`              |
 
-When `Enabled=false`, validation is skipped entirely.
+When `Enabled=false`, validation is skipped entirely (including `LocalEndpoint` validation).
+
+### Local Endpoint
+
+`LocalEndpoint` allows audit data to be sent to an additional local endpoint alongside the control plane. The type is `api.LocalEndpointConfig`, defined once in `internal/api/types.go` and shared across all three observability pipelines.
+
+| Field                    | Type     | YAML Key                     | Description                                        |
+|--------------------------|----------|------------------------------|----------------------------------------------------|
+| `URL`                    | `string` | `local_endpoint.url`         | HTTPS endpoint URL. Empty means not configured.    |
+| `SecretKey`              | `string` | `local_endpoint.secret_key`  | Auth credential. Required when URL is set. Redacted in config dumps. |
+| `TLSInsecureSkipVerify`  | `bool`   | `local_endpoint.tls_insecure_skip_verify` | Disable TLS certificate verification. |
+
+**Validation rules** (applied only when `Enabled=true` and `URL` is non-empty):
+
+| Rule                       | Error Message                                                        |
+|----------------------------|----------------------------------------------------------------------|
+| URL must be parseable      | `auditfwd: config: local_endpoint: invalid URL "<url>"`              |
+| Scheme must be `https`     | `auditfwd: config: local_endpoint: URL must be HTTPS, got "<scheme>"`|
+| SecretKey must be non-empty| `auditfwd: config: local_endpoint: SecretKey is required when URL is set` |
+
+A zero-valued `LocalEndpointConfig` (all fields empty/false) is valid and means "not configured".
+
+```yaml
+audit_fwd:
+  enabled: true
+  collect_interval: 5s
+  report_interval: 15s
+  batch_size: 500
+  local_endpoint:
+    url: https://audit.local:9090/ingest
+    secret_key: local-audit-token
+    tls_insecure_skip_verify: false
+```
 
 ## AuditSource
 

@@ -4,6 +4,8 @@ package metrics
 import (
 	"errors"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/api"
 )
 
 // DefaultCollectInterval is the default interval between metric collection cycles.
@@ -32,6 +34,9 @@ type Config struct {
 	// BatchSize is the maximum number of metric points per report batch.
 	// Must be > 0. Default: 100.
 	BatchSize int `yaml:"batch_size"`
+
+	// LocalEndpoint configures an optional local data-plane endpoint.
+	LocalEndpoint api.LocalEndpointConfig `yaml:"local_endpoint"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.
@@ -71,6 +76,9 @@ func (c *Config) Validate() error {
 	}
 	if c.BatchSize <= 0 {
 		return errors.New("metrics: config: BatchSize must be > 0")
+	}
+	if err := c.LocalEndpoint.Validate("metrics"); err != nil {
+		return err
 	}
 	return nil
 }

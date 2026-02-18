@@ -2,8 +2,8 @@
   "feature_id": "PXD-0046",
   "title": "L001: Add shared LocalEndpointConfig type and pipeline in...",
   "slug": "l001-add-shared-localendpointconfig-type-and",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** backend\n**Priority:** critical\n**Source:** Proposed for 'It should be possible in Metrics, Log Forwarding u'\n\nDefine a shared `LocalEndpointConfig` struct in `internal/api/types.go` with fields: URL (string), SecretKey (string, references encrypted secret), TLSInsecureSkipVerify (bool). Embed this struct as `LocalEndpoint` field in `metrics.Config`, `logfwd.Config`, and `auditfwd.Config`. Extend each pipeline's `Validate()` method to enforce: URL must be valid HTTPS format when set, SecretKey is required when URL is non-empty. Config redaction is automatic — existing redaction logic in `up.go` already catches keys containing `secret`/`key`. Includes unit tests for config validation rules across all three pipelines.\n\n**Rationale:** Foundation for all subsequent work. The shared config type ensures consistency across pipelines and prevents divergent configuration schemas. Without this, each pipeline would need its own incompatible config structure. Config validation at this layer prevents runtime failures from misconfiguration.\n\n**Affected Areas:**\n- src/internal/api/types.go\n- src/internal/metrics/config.go\n- src/internal/logfwd/config.go\n- src/internal/auditfwd/config.go\n- src/internal/metrics/config_test.go\n- src/internal/logfwd/config_test.go\n- src/internal/auditfwd/config_test.go",
   "stories": [
@@ -323,6 +323,7 @@
       "title": "Define LocalEndpointConfig struct in internal/api/types.go with Validate() method and unit tests (REQ-001, REQ-002, REQ-003)",
       "level": 1,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -334,6 +335,7 @@
       "title": "Embed LocalEndpointConfig in metrics.Config and extend Validate() with tests (REQ-004)",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-004"
       ]
@@ -343,6 +345,7 @@
       "title": "Embed LocalEndpointConfig in logfwd.Config and extend Validate() with tests (REQ-005)",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-005"
       ]
@@ -352,6 +355,7 @@
       "title": "Embed LocalEndpointConfig in auditfwd.Config and extend Validate() with tests (REQ-006)",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-006"
       ]
@@ -361,6 +365,7 @@
       "title": "Verify config redaction covers secret_key automatically (REQ-007)",
       "level": 3,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-007"
       ]
@@ -370,6 +375,7 @@
       "title": "Update configuration reference documentation (REQ-001, REQ-004, REQ-005, REQ-006)",
       "level": 4,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-004",
@@ -532,6 +538,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-18T06:28:42.342278"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T08:07:41.762673"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T08:24:46.780666"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T08:24:46.798302"
     }
   },
   "execution_history": [
@@ -545,6 +563,56 @@
           "name": "prepare",
           "duration": 193.79095816612244,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "e644c682-ca80-4f62-b6a0-6d569d217085",
+      "timestamp": "2026-02-18T08:22:18.058268",
+      "total_duration": 772.2964468002319,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (1 tasks)",
+          "duration": 248.35368943214417,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (3 tasks)",
+          "duration": 35.79717302322388,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (1 tasks)",
+          "duration": 90.2479875087738,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (1 tasks)",
+          "duration": 130.63481450080872,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0046] Code Review",
+          "duration": 118.67941498756409,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0046] Improvements",
+          "duration": 18.78409457206726,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0046] Simplify",
+          "duration": 129.79927277565002,
+          "type": "simplify",
           "status": "done"
         }
       ]

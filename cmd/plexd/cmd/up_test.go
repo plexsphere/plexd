@@ -10,6 +10,51 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 )
 
+// TestRedactSensitiveLine_SecretKey verifies that the existing redaction logic
+// automatically covers the secret_key YAML key used by LocalEndpointConfig.
+func TestRedactSensitiveLine_SecretKey(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want string
+	}{
+		{
+			name: "secret_key with value is redacted",
+			line: "    secret_key: my-secret-token",
+			want: "    secret_key: '[REDACTED]'",
+		},
+		{
+			name: "secret_key with empty value is unchanged",
+			line: "    secret_key: ",
+			want: "    secret_key: ",
+		},
+		{
+			name: "secret_key with quoted empty is unchanged",
+			line: `    secret_key: ""`,
+			want: `    secret_key: ""`,
+		},
+		{
+			name: "url is not redacted",
+			line: "    url: https://metrics.local:9090/ingest",
+			want: "    url: https://metrics.local:9090/ingest",
+		},
+		{
+			name: "tls_insecure_skip_verify is not redacted",
+			line: "    tls_insecure_skip_verify: false",
+			want: "    tls_insecure_skip_verify: false",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := redactSensitiveLine(tt.line)
+			if got != tt.want {
+				t.Errorf("redactSensitiveLine(%q) = %q, want %q", tt.line, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDecodeSigningKeys_CurrentOnly(t *testing.T) {
 	pub, _, err := ed25519.GenerateKey(nil)
 	if err != nil {

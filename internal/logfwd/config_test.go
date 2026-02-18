@@ -1,8 +1,11 @@
 package logfwd
 
 import (
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/api"
 )
 
 func TestConfig_ApplyDefaults(t *testing.T) {
@@ -157,5 +160,69 @@ func TestConfig_FilterConfigPreserved(t *testing.T) {
 	cfg.ApplyDefaults()
 	if cfg.Filter.MinSeverity != "warning" {
 		t.Errorf("Filter.MinSeverity = %q, want %q", cfg.Filter.MinSeverity, "warning")
+	}
+}
+
+func TestConfig_ValidateLocalEndpoint(t *testing.T) {
+	validBase := Config{
+		Enabled:         true,
+		CollectInterval: 10 * time.Second,
+		ReportInterval:  30 * time.Second,
+		BatchSize:       200,
+	}
+
+	tests := []struct {
+		name       string
+		endpoint   api.LocalEndpointConfig
+		enabled    bool
+		wantErr    bool
+		errContain string
+	}{
+		{
+			name:     "valid HTTPS endpoint",
+			enabled:  true,
+			endpoint: api.LocalEndpointConfig{URL: "https://logs.local:9090/ingest", SecretKey: "local-log-token"},
+		},
+		{
+			name:       "rejects HTTP endpoint",
+			enabled:    true,
+			endpoint:   api.LocalEndpointConfig{URL: "http://logs.local:9090/ingest", SecretKey: "local-log-token"},
+			wantErr:    true,
+			errContain: "logfwd",
+		},
+		{
+			name:       "requires secret key",
+			enabled:    true,
+			endpoint:   api.LocalEndpointConfig{URL: "https://logs.local:9090/ingest"},
+			wantErr:    true,
+			errContain: "SecretKey",
+		},
+		{
+			name:     "disabled config skips endpoint validation",
+			enabled:  false,
+			endpoint: api.LocalEndpointConfig{URL: "http://invalid-but-disabled"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validBase
+			cfg.Enabled = tt.enabled
+			cfg.LocalEndpoint = tt.endpoint
+
+			err := cfg.Validate()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Validate() = nil, want error containing %q", tt.errContain)
+				}
+				if !strings.Contains(err.Error(), tt.errContain) {
+					t.Errorf("Validate() error = %q, want error containing %q", err.Error(), tt.errContain)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
 	}
 }

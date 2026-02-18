@@ -4,6 +4,8 @@ package auditfwd
 import (
 	"errors"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/api"
 )
 
 // DefaultCollectInterval is the default interval between audit collection cycles.
@@ -32,6 +34,9 @@ type Config struct {
 	// BatchSize is the maximum number of audit entries per report batch.
 	// Must be at least 1. Default: 500.
 	BatchSize int `yaml:"batch_size"`
+
+	// LocalEndpoint configures an optional local data-plane endpoint.
+	LocalEndpoint api.LocalEndpointConfig `yaml:"local_endpoint"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.
@@ -68,6 +73,9 @@ func (c *Config) Validate() error {
 	}
 	if c.BatchSize < 1 {
 		return errors.New("auditfwd: config: BatchSize must be at least 1")
+	}
+	if err := c.LocalEndpoint.Validate("auditfwd"); err != nil {
+		return err
 	}
 	return nil
 }
