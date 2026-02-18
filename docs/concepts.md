@@ -192,7 +192,8 @@ The SSE manager processes these event types:
 
 ## See Also
 
-- [Architecture & Agent Lifecycle](guide/architecture.md) — High-level architecture, lifecycle diagrams, operational behavior
+- [Architecture](guide/architecture.md) — High-level architecture diagrams, platform support
+- [Agent Lifecycle](guide/agent-lifecycle.md) — Lifecycle phases, operational behavior, deregistration
 - [Configuration Reference](reference/core/configuration.md) — Full YAML configuration schema
 - [CLI Reference](reference/core/cli.md) — Command-line interface and subcommands
 - [Environment Variables Reference](reference/core/environment-variables.md) — All `PLEXD_*` overrides

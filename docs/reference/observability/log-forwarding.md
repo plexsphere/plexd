@@ -117,6 +117,78 @@ type LogReporter interface {
 }
 ```
 
+## LocalReporter
+
+`LocalReporter` implements `LogReporter` by POSTing log batches to a locally-configured HTTPS endpoint with bearer-token authentication. It operates independently from the control plane client—with its own `http.Client`, TLS settings, and credential cache.
+
+### Constructor
+
+```go
+func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) *LocalReporter
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `cfg` | Local endpoint configuration (URL, secret key, TLS settings) |
+| `fetcher` | SecretFetcher for retrieving encrypted credentials (satisfied by `api.ControlPlane`) |
+| `nsk` | Node secret key bytes for AES-256-GCM decryption via `nodeapi.DecryptSecret` |
+| `nodeID` | Node identifier passed to `SecretFetcher.FetchSecret` |
+| `logger` | Structured logger (`log/slog`) |
+
+### SecretFetcher
+
+```go
+type SecretFetcher interface {
+    FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
+}
+```
+
+Defined in the `logfwd` package. The `api.ControlPlane` client satisfies this interface.
+
+### HTTP Client
+
+| Setting | Value | Notes |
+|---------|-------|-------|
+| Timeout | 10s | Per-request timeout |
+| TLS | Configurable | `TLSInsecureSkipVerify` controls certificate validation for this client only |
+| Compression | None | Batches are sent as uncompressed JSON |
+
+### Credential Resolution
+
+Same flow as `metrics.LocalReporter`: check cache (5-minute TTL) → `FetchSecret` → `DecryptSecret` → update cache. Falls back to stale cached token on fetch/decrypt failure. Protected by `sync.RWMutex` with double-checked locking.
+
+### ReportLogs Behavior
+
+```go
+func (r *LocalReporter) ReportLogs(ctx context.Context, nodeID string, batch api.LogBatch) error
+```
+
+1. Resolve bearer token
+2. JSON-marshal the `LogBatch` (identical JSON body to what the platform receives)
+3. `POST` to `cfg.URL` with `Content-Type: application/json` and `Authorization: Bearer {token}`
+4. Return `nil` on 2xx; return error containing the status code on non-2xx
+
+## MultiReporter
+
+`MultiReporter` implements `LogReporter` by dispatching to both a platform and a local reporter concurrently.
+
+### Constructor
+
+```go
+func NewMultiReporter(platform, local LogReporter, logger *slog.Logger) *MultiReporter
+```
+
+### Error Semantics
+
+| Platform result | Local result | Return value | Side effect |
+|-----------------|--------------|--------------|-------------|
+| success | success | `nil` | — |
+| error | success | platform error | — |
+| success | error | `nil` | Local error logged as warning |
+| error | error | platform error | Local error logged as warning |
+
+Only the platform error is returned. The `Forwarder` uses the return value for retry/retain decisions—local failures must not trigger batch retention.
+
 ## JournalReader
 
 Interface abstracting systemd journal access for testability.
@@ -458,6 +530,9 @@ All log entries use `component=logfwd`.
 | `Warn` | Source failed                      | `component`, `error`        |
 | `Warn` | Log report failed                  | `component`, `error`        |
 | `Warn` | Buffer overflow, dropping entries  | `component`, `dropped`      |
+| `Warn` | Using cached credential            | `component`, `error`        |
+| `Warn` | Local log report failed            | `component`, `error`        |
+| `Info` | Local endpoint enabled             | `pipeline`, `url`           |
 
 ## Integration Points
 
@@ -472,3 +547,19 @@ controlPlane, _ := api.NewControlPlane(apiCfg, "1.0.0", logger)
 fwd := logfwd.NewForwarder(cfg, sources, controlPlane, nodeID, hostname, logger)
 fwd.Run(ctx)
 ```
+
+### With LocalReporter and MultiReporter
+
+When `LocalEndpoint.URL` is configured, the `Forwarder` receives a `MultiReporter` instead of the control plane client directly:
+
+```go
+var logReporter logfwd.LogReporter = controlPlane
+if cfg.LogFwd.LocalEndpoint.URL != "" {
+    localReporter := logfwd.NewLocalReporter(cfg.LogFwd.LocalEndpoint, controlPlane, nsk, identity.NodeID, logger)
+    logReporter = logfwd.NewMultiReporter(controlPlane, localReporter, logger)
+    logger.Info("local endpoint enabled", "pipeline", "logfwd", "url", cfg.LogFwd.LocalEndpoint.URL)
+}
+fwd := logfwd.NewForwarder(cfg.LogFwd, sources, logReporter, identity.NodeID, hostname, logger)
+```
+
+When `LocalEndpoint.URL` is empty, no `MultiReporter` is created and behavior is identical to the single-reporter pipeline.

@@ -1,8 +1,8 @@
 ---
-title: Architecture & Agent Lifecycle
+title: Architecture
 ---
 
-# Architecture & Agent Lifecycle
+# Architecture
 
 > For a visual, diagram-driven overview of communication channels and mesh topology, see [Platform Communication & Mesh](/guide/platform-communication).
 
@@ -17,48 +17,9 @@ title: Architecture & Agent Lifecycle
 
 **OS:** Linux (amd64, arm64)
 
-## Architecture
+## Detailed Architecture
 
-### High-Level Overview
-
-```
-                              ┌───────────────────────┐
-                              │  Plexsphere           │
-                              │  Control Plane        │
-                              └───────────┬───────────┘
-                                          │
-                            HTTPS + SSE (outbound only)
-                                          │
-       ┌──────────────┬───────────────────┼──────────────────┬──────────────┐
-       ▼              ▼                   ▼                  ▼              ▼
-┌────────────┐ ┌────────────┐      ┌────────────┐    ┌────────────┐ ┌────────────┐
-│ Bare-Metal │ │     VM     │      │     VM     │    │    K8s     │ │  Bridge /  │
-│            │ │            │      │            │    │  Cluster   │ │  Gateway   │
-└─────┬──────┘ └─────┬──────┘      └─────┬──────┘    └─────┬──────┘ └──┬──────┬──┘
-      │              │                   │                 │           │      │
-      │◄════ Encrypted Mesh (direct P2P + NAT Traversal) ═════════════►│      │
-      │              │                   │                 │           │      │
-      └──────────────┴───────────────────┴─────────────────┘      ┌────┘      └────┐
-                                                                  │                │
-                                                                  ▼                ▼
-                                                           ┌──────────┐     ┌────────────┐
-                                                           │  User    │     │  External  │
-                                                           │  Access  │     │  Traffic   │
-                                                           │          │     │            │
-                                                           │ Tailscale│     │ Public IPs │
-                                                           │ Netbird  │     │ Site-to-   │
-                                                           │ WireGuard│     │ Site VPN   │
-                                                           └────┬─────┘     └──────┬─────┘
-                                                                │                  │
-                                                                ▼                  ▼
-                                                          ┌───────────┐   ┌──────────────┐
-                                                          │ Developers│   │ Public       │
-                                                          │ Admins    │   │ Internet     │
-                                                          │ On-Call   │   │ Partner Nets │
-                                                          └───────────┘   └──────────────┘
-```
-
-### Detailed Architecture
+This diagram expands the [high-level overview](/) to show the control plane's internal components, the mesh IP addressing, and the bridge node's dual-interface design.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────┐
@@ -117,163 +78,16 @@ title: Architecture & Agent Lifecycle
                                                    └─────────┘ └──────────┘ └───────────┘
 ```
 
-plexd communicates outbound only - no inbound ports or public IPs required on the node side. Nodes behind NAT discover their public endpoints via STUN and exchange them through the control plane to establish direct peer-to-peer tunnels. When direct connectivity is not possible, traffic is relayed through bridge nodes. The control plane pushes peer updates via SSE; the agent pulls full state periodically as a consistency fallback.
+**Control plane** — The four components at the top handle distinct responsibilities: the **Registration API** bootstraps new nodes, the **Key & Peer Manager** distributes WireGuard public keys and pre-shared keys, the **Policy Engine** evaluates visibility and firewall rules, and the **Event Bus (SSE)** pushes real-time updates (peer changes, policy updates, action requests, key rotations) to connected nodes.
 
-## Agent Lifecycle
+**Node mesh** — Each node receives a unique mesh IP from the `10.100.0.0/16` range at registration (e.g. `10.100.1.1/32`). All nodes form a **full-mesh WireGuard topology** with direct peer-to-peer tunnels. Nodes behind NAT discover their public endpoints via STUN and exchange them through the control plane. When direct connectivity is not possible, traffic is relayed through bridge nodes.
 
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                                                                               │
-│   ┌─────────┐    ┌──────────┐    ┌───────────┐    ┌─────────────┐             │
-│   │  Start  │    │          │    │ Configure │    │     NAT     │             │
-│   │ Binary  ├───▶│ Register ├───▶│  Tunnels  ├───▶│  Discovery  │             │
-│   │ Checksum│    │          │    │           │    │   (STUN)    │             │
-│   │ Hook    │    └──────────┘    └───────────┘    └──────┬──────┘             │
-│   │ Scan    │                                            │                    │
-│   └─────────┘                                            ▼                    │
-│                                                                               │
-│   ┌────────────┐                 ┌─────────────────────────────────────┐      │
-│   │            │  On shutdown    │            Connected                │      │
-│   │ Deregister │◀── or command ──┤                                     │      │
-│   │            │                 │  ┌─────────────┐ ┌───────────────┐  │      │
-│   └────────────┘                 │  │ Heartbeat   │ │ Reconcile     │  │      │
-│                                  │  │ NAT Refresh │ │ SSE Stream    │  │      │
-│   • Notify control plane         │  └─────────────┘ └───────────────┘  │      │
-│   • Tear down tunnels            │  ┌─────────────┐ ┌───────────────┐  │      │
-│   • Wait for in-flight           │  │ Policy      │ │ Observe       │  │      │
-│     action executions            │  │ Enforce     │ │ Logs, Audit   │  │      │
-│   • Clean up local state         │  └─────────────┘ └───────────────┘  │      │
-│                                  │  ┌─────────────┐ ┌───────────────┐  │      │
-│                                  │  │ Access      │ │ Action        │  │      │
-│                                  │  │ Proxy       │ │ Dispatcher    │  │      │
-│                                  │  └─────────────┘ └───────────────┘  │      │
-│                                  │  ┌─────────────┐ ┌───────────────┐  │      │
-│                                  │  │ Hook File   │ │ Node API      │  │      │
-│                                  │  │ Watcher     │ │ Server        │  │      │
-│                                  │  └─────────────┘ └───────────────┘  │      │
-│                                  └─────────────────────────────────────┘      │
-│                                                                               │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
+**Bridge node** — A bridge operates with two interfaces. The **mesh side** (`10.100.1.250`) participates in the WireGuard mesh like any regular node and additionally serves as a NAT relay for peers that cannot reach each other directly. The **access side** exposes three services to external consumers: user access (Tailscale, Netbird, or standalone WireGuard), public ingress with ACME certificates and SNI routing, and site-to-site VPN for partner or customer networks.
 
-1. **Start** - Read config, locate bootstrap token, compute binary SHA-256 checksum, scan and checksum all declared hooks.
-2. **Register** - POST token to control plane, receive node identity, keys, and initial peer list. Include capabilities (binary info, available actions, hooks with checksums).
-3. **Configure Tunnels** - Set up mesh interfaces and establish tunnels to all authorized peers.
-4. **NAT Discovery** - Determine public endpoint via STUN, report it to the control plane, receive NAT-discovered endpoints of peers.
-5. **Connected** - Enter steady state: send heartbeats, stream peer/policy/action/state updates via SSE, report observability data, forward logs, collect audit data, serve access requests, dispatch actions, watch hook files for changes, serve node API, refresh STUN endpoints, reconcile periodically.
-6. **Deregister** - On shutdown or explicit command: graceful shutdown with cleanup (see details below).
+**Data path separation** — The control plane coordinates identity, keys, policies, and events but never touches mesh traffic. All data flows directly between nodes over the encrypted WireGuard tunnels.
 
-### Phase 3 Details: Steady State
+## See Also
 
-**Heartbeat protocol:**
-
-plexd sends a heartbeat to the control plane at `heartbeat.interval` (default 30s) via `POST /v1/nodes/{node_id}/heartbeat`.
-
-Heartbeat payload:
-
-```json
-{
-  "node_id": "n_abc123",
-  "timestamp": "2025-01-15T10:30:00Z",
-  "status": "healthy",
-  "uptime": "72h15m",
-  "binary_checksum": "sha256:a1b2c3d4e5f6...",
-  "mesh": {
-    "interface": "plexd0",
-    "peer_count": 12,
-    "listen_port": 51820
-  },
-  "nat": {
-    "public_endpoint": "203.0.113.10:51820",
-    "type": "full_cone"
-  }
-}
-```
-
-The control plane responds with one of:
-
-| Response | Meaning |
-|---|---|
-| `200 OK` | Heartbeat acknowledged, no action required |
-| `200 OK` + `{ "reconcile": true }` | Trigger immediate reconciliation (out-of-band hint) |
-| `200 OK` + `{ "rotate_keys": true }` | Trigger key rotation (redundant with SSE, serves as fallback) |
-| `401 Unauthorized` | Node identity invalid, re-register |
-
-If a node misses **3 consecutive heartbeats** (i.e. no heartbeat received for `3 x heartbeat.interval`), the control plane marks the node as `unreachable` and notifies peer nodes. After **10 consecutive missed heartbeats**, the node is marked `offline` and its peers remove it from their active tunnel configuration. The node re-establishes tunnels automatically when it comes back online and resumes heartbeats.
-
-**SSE reconnection:**
-
-The SSE stream is the primary channel for real-time updates. When the connection drops:
-
-1. plexd detects the disconnect and begins reconnection with **exponential backoff**: 1s, 2s, 4s, 8s, ... up to a maximum of 60s.
-2. **Jitter** of +/-25% is applied to each backoff interval to prevent thundering herd effects when many nodes reconnect simultaneously (e.g. after a control plane restart).
-3. On reconnection, plexd sends the `Last-Event-ID` header (from the last successfully processed SSE event) so the control plane can replay missed events.
-4. After a successful reconnect, plexd triggers an **immediate reconciliation** to catch any updates that may have been missed during the disconnect window.
-5. If the SSE stream cannot be re-established after 5 minutes, plexd falls back to polling the full state at `reconcile.interval` until the SSE stream recovers.
-
-### Deregistration Details
-
-When plexd receives a shutdown signal (`SIGTERM`, `SIGINT`) or the `plexd deregister` command is run:
-
-1. **Stop accepting new work** - Stop accepting new action requests and SSE events.
-2. **Drain in-flight executions** - Wait for all running action/hook executions to complete (up to 30s grace period). After the grace period, running executions are cancelled and reported as `cancelled` to the control plane.
-3. **Notify control plane** - Send `POST /v1/nodes/{node_id}/deregister` to inform the control plane. The control plane removes the node from peer lists and pushes `peer_removed` events to all peers.
-4. **Tear down tunnels** - Remove all WireGuard peers from the `plexd0` interface and delete the interface.
-5. **Stop subsystems** - Stop log forwarding, audit collection, observability reporting, access proxy, and heartbeat.
-6. **Clean up local state** - Optionally (when `--purge` is passed) remove all data from `data_dir`, including private keys and cached state. Without `--purge`, state is preserved for potential re-registration.
-
-On `plexd deregister --purge`, the bootstrap token file is also removed if it still exists, and the systemd unit is disabled.
-
-## Operational Behavior
-
-### Offline Behavior
-
-plexd is designed to remain functional when the control plane is temporarily unreachable:
-
-- **Mesh connectivity persists:** Established WireGuard tunnels continue to operate independently of the control plane. Peers can communicate as long as the tunnels are up.
-- **Configuration is cached:** The last known peer list, policies, and signing keys are persisted to `data_dir`. On restart without control plane connectivity, plexd restores the cached state and establishes tunnels to known peers.
-- **Buffered telemetry:** Log, audit, and observability data are buffered in local ringbuffers and drained when connectivity is restored.
-- **No new peers:** New peers cannot be added while offline, as peer key exchange requires the control plane. Existing peers continue to work.
-- **Heartbeat failure:** After 3 missed heartbeats, the control plane marks the node as `unreachable`. This does not affect the node's local operation.
-- **Actions are unavailable:** SSE-triggered actions cannot be received while offline. Local actions via `plexd actions run --local` remain available.
-- **Secrets are unavailable:** Secret values are fetched in real-time from the control plane and never cached in plaintext. When the control plane is unreachable, secret read requests return `503 Service Unavailable`. Metadata and data entries remain available from the local cache.
-
-### Upgrade Process
-
-plexd supports in-place upgrades triggered by the control plane via the `service.upgrade` built-in action:
-
-1. Control plane sends `action_request` with `action: service.upgrade`, including the target `version` and expected binary `checksum`.
-2. plexd downloads the new binary from the control plane's artifact store, verifies the SHA-256 checksum, and places it alongside the current binary.
-3. plexd signals the systemd service to restart (or re-execs in non-systemd environments).
-4. On startup, the new binary computes its own checksum and reports it in the registration/heartbeat. The control plane verifies the upgrade succeeded.
-5. If the new binary fails to start (crash loop), systemd's `RestartSec` and `StartLimitBurst` prevent excessive restarts. Manual intervention or rollback via the control plane is required.
-
-Rollback is a new `service.upgrade` action pointing to the previous version.
-
-### Mesh IP Allocation
-
-Each node receives a unique mesh IP from the `10.100.0.0/16` range during registration. IPs are assigned by the control plane and are stable for the lifetime of the node's registration.
-
-- **Format:** `10.100.x.y/32` (single host address per node)
-- **Uniqueness:** Guaranteed by the control plane within a tenant
-- **Persistence:** The mesh IP is stored in `data_dir` and reused across restarts
-- **Deregistration:** When a node deregisters, its mesh IP is returned to the pool after a cooldown period (to avoid conflicts with cached peer configurations on other nodes)
-- **Bridge nodes:** Typically assigned from a reserved range (e.g. `10.100.255.x`) by convention, but this is a control plane policy, not enforced by plexd
-
-### Reconciliation Details
-
-The reconciliation loop (`reconcile.interval`, default 60s) ensures that the local state matches the control plane's desired state. It acts as a consistency fallback for the real-time SSE event stream.
-
-Each reconciliation cycle:
-
-1. **Pull full state** from `GET /v1/nodes/{node_id}/state` - includes peer list, policies, signing keys, pending actions, node metadata, data entries, and secret references.
-2. **Diff** the received state against the local WireGuard configuration, nftables rules, signing key store, and node state cache.
-3. **Apply corrections** for any detected drift:
-   - Add/remove WireGuard peers
-   - Update endpoints, allowed IPs, PSKs
-   - Add/remove nftables rules
-   - Update signing keys
-   - Update node metadata, data entries, and secret references
-4. **Report drift** to the control plane for observability (`POST /v1/nodes/{node_id}/drift`), including what was corrected.
-
-Reconciliation is also triggered immediately after SSE reconnection (see [SSE reconnection](#phase-3-details-steady-state)).
+- [Agent Lifecycle](/guide/agent-lifecycle) — Startup phases, steady-state protocols, deregistration, operational behavior
+- [Platform Communication & Mesh](/guide/platform-communication) — Visual, diagram-driven overview of communication channels
+- [Security & Trust Model](/guide/security) — Authentication, encryption, and trust boundaries

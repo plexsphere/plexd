@@ -366,6 +366,109 @@ type MetricReporter interface {
 }
 ```
 
+## LocalReporter
+
+`LocalReporter` implements `MetricsReporter` by POSTing metric batches to a locally-configured HTTPS endpoint with bearer-token authentication. It operates independently from the control plane client—with its own `http.Client`, TLS settings, and credential cache.
+
+### Constructor
+
+```go
+func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) *LocalReporter
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `cfg` | Local endpoint configuration (URL, secret key, TLS settings) |
+| `fetcher` | SecretFetcher for retrieving encrypted credentials (satisfied by `api.ControlPlane`) |
+| `nsk` | Node secret key bytes for AES-256-GCM decryption via `nodeapi.DecryptSecret` |
+| `nodeID` | Node identifier passed to `SecretFetcher.FetchSecret` |
+| `logger` | Structured logger (`log/slog`) |
+
+### SecretFetcher
+
+```go
+type SecretFetcher interface {
+    FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
+}
+```
+
+Defined in the `metrics` package. The `api.ControlPlane` client satisfies this interface.
+
+### HTTP Client
+
+Each `LocalReporter` creates its own `http.Client` at construction time:
+
+| Setting | Value | Notes |
+|---------|-------|-------|
+| Timeout | 10s | Per-request timeout including connection, TLS handshake, and response body |
+| TLS | Configurable | `TLSInsecureSkipVerify` controls certificate validation for this client only |
+| Compression | None | Batches are sent as uncompressed JSON (unlike the gzip-compressed control plane client) |
+
+### Credential Resolution
+
+On each `ReportMetrics` call, `LocalReporter` resolves a bearer token via the following flow:
+
+1. **Check cache** (read lock): if `cachedToken` is non-empty and `fetchedAt` is within the 5-minute TTL, return the cached token immediately.
+2. **Acquire write lock** and double-check the cache (another goroutine may have refreshed it).
+3. **Fetch secret**: call `SecretFetcher.FetchSecret(ctx, nodeID, secretKey)` to retrieve the encrypted credential.
+4. **Decrypt**: call `nodeapi.DecryptSecret(nsk, resp.Ciphertext, resp.Nonce)` to obtain the plaintext token.
+5. **Update cache**: store the plaintext token and current timestamp.
+
+**Failure modes:**
+
+| Scenario | Behavior |
+|----------|----------|
+| Fetch or decrypt fails, stale cache exists | Log warning, return stale cached token |
+| Fetch or decrypt fails, no cache | Return error, no HTTP POST is made |
+
+The cache is protected by `sync.RWMutex` with a double-checked locking pattern, making it safe for concurrent `ReportMetrics` calls.
+
+### ReportMetrics Behavior
+
+```go
+func (r *LocalReporter) ReportMetrics(ctx context.Context, nodeID string, batch api.MetricBatch) error
+```
+
+1. Resolve bearer token (see above)
+2. JSON-marshal the `MetricBatch`
+3. `POST` to `cfg.URL` with headers:
+   - `Content-Type: application/json`
+   - `Authorization: Bearer {token}`
+4. Return `nil` on 2xx response; return error containing the status code on non-2xx
+
+## MultiReporter
+
+`MultiReporter` implements `MetricsReporter` by dispatching to both a platform and a local reporter concurrently. It is the adapter that enables dual-destination delivery without modifying the `Manager`.
+
+### Constructor
+
+```go
+func NewMultiReporter(platform, local MetricsReporter, logger *slog.Logger) *MultiReporter
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `platform` | Primary reporter (typically `api.ControlPlane`) — its error is returned to the caller |
+| `local` | Secondary reporter (typically `LocalReporter`) — its error is logged but not returned |
+| `logger` | Structured logger (`log/slog`) |
+
+### Error Semantics
+
+`ReportMetrics` dispatches to both reporters in parallel goroutines and waits for both to complete.
+
+| Platform result | Local result | Return value | Side effect |
+|-----------------|--------------|--------------|-------------|
+| success | success | `nil` | — |
+| error | success | platform error | — |
+| success | error | `nil` | Local error logged as warning |
+| error | error | platform error | Local error logged as warning |
+
+Only the platform error is returned. This is critical because the `Manager` uses the return value to decide whether to retain the batch in its buffer for retry. Local endpoint failures must not trigger batch retention.
+
+### Concurrency
+
+A slow or hanging local endpoint does **not** delay the availability of the platform result. Both goroutines run independently; `MultiReporter` waits for both via `sync.WaitGroup` before returning.
+
 ## Manager
 
 Orchestrates metric collection and reporting via two independent ticker loops.
@@ -513,6 +616,9 @@ All log entries use `component=metrics`.
 | `Warn` | Collector failed           | `component`, `error` |
 | `Warn` | Metrics report failed      | `component`, `error` |
 | `Warn` | Latency ping failed        | `peer_id`, `error` |
+| `Warn` | Using cached credential    | `component`, `error` |
+| `Warn` | Local metrics report failed| `component`, `error` |
+| `Info` | Local endpoint enabled     | `pipeline`, `url`  |
 
 ## Integration Points
 
@@ -526,6 +632,22 @@ controlPlane, _ := api.NewControlPlane(apiCfg, "1.0.0", logger)
 // controlPlane.ReportMetrics matches MetricReporter.ReportMetrics
 mgr := metrics.NewManager(cfg, collectors, controlPlane, nodeID, logger)
 mgr.Run(ctx)
+```
+
+### With LocalReporter and MultiReporter
+
+When `LocalEndpoint.URL` is configured, the pipeline manager receives a `MultiReporter` that wraps both the control plane client and a `LocalReporter`. When not configured, the control plane client is passed directly—no extra goroutines, no `SecretFetcher` calls, no `MultiReporter` wrapping.
+
+```go
+nsk := []byte(identity.NodeSecretKey)
+
+var metricsReporter metrics.MetricsReporter = controlPlane
+if cfg.Metrics.LocalEndpoint.URL != "" {
+    localReporter := metrics.NewLocalReporter(cfg.Metrics.LocalEndpoint, controlPlane, nsk, identity.NodeID, logger)
+    metricsReporter = metrics.NewMultiReporter(controlPlane, localReporter, logger)
+    logger.Info("local endpoint enabled", "pipeline", "metrics", "url", cfg.Metrics.LocalEndpoint.URL)
+}
+mgr := metrics.NewManager(cfg.Metrics, collectors, metricsReporter, identity.NodeID, logger)
 ```
 
 ### With wireguard.Manager

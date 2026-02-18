@@ -26,7 +26,8 @@ export default withMermaid(defineConfig({
       {
         text: 'Guide',
         items: [
-          { text: 'Architecture & Agent Lifecycle', link: '/guide/architecture' },
+          { text: 'Architecture', link: '/guide/architecture' },
+          { text: 'Agent Lifecycle', link: '/guide/agent-lifecycle' },
           { text: 'Platform Communication & Mesh', link: '/guide/platform-communication' },
           { text: 'Security & Trust Model', link: '/guide/security' },
           { text: 'Troubleshooting', link: '/guide/troubleshooting' },
