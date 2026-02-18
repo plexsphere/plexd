@@ -79,7 +79,7 @@ type MetadataProvider interface {
 }
 ```
 
-The concrete implementation `IMDSProvider` reads tokens from cloud instance metadata services. See [Cloud-Init VM Deployment Reference](../deployment/cloud-init-vm-deployment.md) for details.
+The concrete implementation `IMDSProvider` reads tokens from cloud instance metadata services. See [Cloud-Init Deployment Reference](../deployment/cloud-init-deployment.md) for details.
 
 ## GenerateKeypair
 

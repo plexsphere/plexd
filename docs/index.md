@@ -114,7 +114,7 @@ Operator and admin reference for configuring and deploying plexd.
 ### Deployment
 
 - [Bare-Metal Packaging Reference](reference/deployment/bare-metal-packaging.md) — Systemd service installation and packaging
-- [Cloud-Init VM Deployment Reference](reference/deployment/cloud-init-vm-deployment.md) — IMDS provider, cloud-init templates, and Terraform examples
+- [Cloud-Init Deployment Reference](reference/deployment/cloud-init-deployment.md) — IMDS provider, cloud-init templates, and Terraform examples
 - [Kubernetes DaemonSet Deployment Reference](reference/deployment/kubernetes-deployment.md) — Kubernetes manifests, RBAC, and DaemonSet configuration
 - [Container Image (Dockerfile) Reference](reference/deployment/dockerfile.md) — Container image build and configuration
 

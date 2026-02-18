@@ -1,10 +1,10 @@
 ---
-title: Cloud-Init VM Deployment Reference
+title: Cloud-Init Deployment Reference
 package: internal/registration
 feature: PXD-0021
 ---
 
-# Cloud-Init VM Deployment Reference
+# Cloud-Init Deployment Reference
 
 Reference documentation for deploying plexd on virtual machines using Cloud-Init. Covers the IMDS provider, metadata-related configuration fields, cloud-init templates, and Terraform examples.
 

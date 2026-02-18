@@ -67,7 +67,7 @@ export default withMermaid(defineConfig({
             collapsed: true,
             items: [
               { text: 'Bare-Metal Packaging', link: '/reference/deployment/bare-metal-packaging' },
-              { text: 'Cloud-Init VM', link: '/reference/deployment/cloud-init-vm-deployment' },
+              { text: 'Cloud-Init', link: '/reference/deployment/cloud-init-deployment' },
               { text: 'Kubernetes DaemonSet', link: '/reference/deployment/kubernetes-deployment' },
               { text: 'Dockerfile', link: '/reference/deployment/dockerfile' },
             ],

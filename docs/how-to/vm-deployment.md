@@ -211,6 +211,6 @@ If using metadata-based token delivery and plexd reports "no bootstrap token fou
 
 ## See also
 
-- [Cloud-Init VM Deployment Reference](../reference/deployment/cloud-init-vm-deployment.md) — Full reference for IMDSProvider, config fields, and templates
+- [Cloud-Init Deployment Reference](../reference/deployment/cloud-init-deployment.md) — Full reference for IMDSProvider, config fields, and templates
 - [Bare-Metal Installation Guide](bare-metal-installation.md) — Bare-metal server installation
 - [Registration Reference](../reference/core/registration.md) — Registration package documentation
