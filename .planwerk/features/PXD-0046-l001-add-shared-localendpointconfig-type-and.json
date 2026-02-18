@@ -1,0 +1,553 @@
+{
+  "feature_id": "PXD-0046",
+  "title": "L001: Add shared LocalEndpointConfig type and pipeline in...",
+  "slug": "l001-add-shared-localendpointconfig-type-and",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 📦 medium\n**Category:** backend\n**Priority:** critical\n**Source:** Proposed for 'It should be possible in Metrics, Log Forwarding u'\n\nDefine a shared `LocalEndpointConfig` struct in `internal/api/types.go` with fields: URL (string), SecretKey (string, references encrypted secret), TLSInsecureSkipVerify (bool). Embed this struct as `LocalEndpoint` field in `metrics.Config`, `logfwd.Config`, and `auditfwd.Config`. Extend each pipeline's `Validate()` method to enforce: URL must be valid HTTPS format when set, SecretKey is required when URL is non-empty. Config redaction is automatic — existing redaction logic in `up.go` already catches keys containing `secret`/`key`. Includes unit tests for config validation rules across all three pipelines.\n\n**Rationale:** Foundation for all subsequent work. The shared config type ensures consistency across pipelines and prevents divergent configuration schemas. Without this, each pipeline would need its own incompatible config structure. Config validation at this layer prevents runtime failures from misconfiguration.\n\n**Affected Areas:**\n- src/internal/api/types.go\n- src/internal/metrics/config.go\n- src/internal/logfwd/config.go\n- src/internal/auditfwd/config.go\n- src/internal/metrics/config_test.go\n- src/internal/logfwd/config_test.go\n- src/internal/auditfwd/config_test.go",
+  "stories": [
+    {
+      "title": "Operator configures a local metrics endpoint via YAML config",
+      "role": "operator",
+      "want": "to add a local_endpoint section to my metrics config with URL, secret_key, and tls_insecure_skip_verify",
+      "so_that": "the metrics pipeline can later be wired to send data to both the platform and a local endpoint",
+      "criteria": [
+        "metrics.Config accepts a LocalEndpoint field of type api.LocalEndpointConfig",
+        "YAML key is local_endpoint with sub-keys url, secret_key, tls_insecure_skip_verify",
+        "Zero-valued LocalEndpointConfig (all fields empty/false) is valid and means 'not configured'",
+        "Config round-trips correctly through YAML marshal/unmarshal"
+      ]
+    },
+    {
+      "title": "Operator configures a local log forwarding endpoint via YAML config",
+      "role": "operator",
+      "want": "to add a local_endpoint section to my log_fwd config with URL, secret_key, and tls_insecure_skip_verify",
+      "so_that": "the log forwarding pipeline can later be wired to send data to both the platform and a local endpoint",
+      "criteria": [
+        "logfwd.Config accepts a LocalEndpoint field of type api.LocalEndpointConfig",
+        "YAML key is local_endpoint with sub-keys url, secret_key, tls_insecure_skip_verify",
+        "Zero-valued LocalEndpointConfig is valid and means 'not configured'",
+        "Config round-trips correctly through YAML marshal/unmarshal"
+      ]
+    },
+    {
+      "title": "Operator configures a local audit forwarding endpoint via YAML config",
+      "role": "operator",
+      "want": "to add a local_endpoint section to my audit_fwd config with URL, secret_key, and tls_insecure_skip_verify",
+      "so_that": "the audit forwarding pipeline can later be wired to send data to both the platform and a local endpoint",
+      "criteria": [
+        "auditfwd.Config accepts a LocalEndpoint field of type api.LocalEndpointConfig",
+        "YAML key is local_endpoint with sub-keys url, secret_key, tls_insecure_skip_verify",
+        "Zero-valued LocalEndpointConfig is valid and means 'not configured'",
+        "Config round-trips correctly through YAML marshal/unmarshal"
+      ]
+    },
+    {
+      "title": "System rejects invalid local endpoint URL at config validation time",
+      "role": "system",
+      "want": "to reject local endpoint URLs that are not valid HTTPS URLs during Validate()",
+      "so_that": "misconfigured endpoints are caught at startup rather than causing runtime failures",
+      "criteria": [
+        "URL with http:// scheme is rejected with a clear error message",
+        "URL with no scheme is rejected",
+        "URL with invalid format (e.g. '://bad') is rejected",
+        "Valid https:// URL passes validation",
+        "Empty URL passes validation (means 'not configured')"
+      ]
+    },
+    {
+      "title": "System requires SecretKey when local endpoint URL is set",
+      "role": "system",
+      "want": "to enforce that SecretKey is non-empty whenever URL is non-empty",
+      "so_that": "the local endpoint always has credentials configured and cannot be accidentally left unauthenticated",
+      "criteria": [
+        "URL set + SecretKey empty -> validation error",
+        "URL set + SecretKey set -> validation passes",
+        "URL empty + SecretKey empty -> validation passes (not configured)",
+        "URL empty + SecretKey set -> validation passes (no-op, harmless)"
+      ]
+    },
+    {
+      "title": "Operator sees secret_key redacted in config dump",
+      "role": "operator",
+      "want": "the secret_key field in local_endpoint to be automatically redacted when running config.dump",
+      "so_that": "sensitive credential references are never exposed in diagnostic output",
+      "criteria": [
+        "Existing redaction logic in up.go already catches 'secret_key' (contains 'secret' and 'key')",
+        "No new redaction code is needed — verified by existing behavior",
+        "Config dump shows secret_key: '[REDACTED]' when value is set"
+      ]
+    },
+    {
+      "title": "Developer has a single shared type for local endpoint configuration",
+      "role": "developer",
+      "want": "a LocalEndpointConfig struct defined once in internal/api/types.go",
+      "so_that": "all three pipelines use the same struct and adding fields later only requires one change",
+      "criteria": [
+        "LocalEndpointConfig is defined in package api",
+        "Struct has URL (string), SecretKey (string), TLSInsecureSkipVerify (bool) fields",
+        "Struct has yaml tags matching the YAML config convention",
+        "Struct has a Validate() method that enforces URL format and SecretKey requirement",
+        "All three pipeline configs embed the same type"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL define a LocalEndpointConfig struct in internal/api/types.go with fields URL (string), SecretKey (string), and TLSInsecureSkipVerify (bool), each with appropriate yaml struct tags",
+      "priority": "SHALL",
+      "rationale": "Single source of truth for local endpoint configuration across all three observability pipelines",
+      "scenarios": [
+        {
+          "name": "Struct exists with correct fields",
+          "when": "a developer imports api.LocalEndpointConfig",
+          "then": "the struct has URL, SecretKey, and TLSInsecureSkipVerify fields with yaml tags url, secret_key, tls_insecure_skip_verify",
+          "and_then": []
+        },
+        {
+          "name": "Zero-valued struct is valid",
+          "when": "LocalEndpointConfig{} is validated",
+          "then": "Validate() returns nil (not configured is valid)",
+          "and_then": []
+        },
+        {
+          "name": "Struct embeds correctly in pipeline configs",
+          "when": "metrics.Config, logfwd.Config, or auditfwd.Config includes a LocalEndpoint field",
+          "then": "the field is of type api.LocalEndpointConfig with yaml tag local_endpoint",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The system SHALL validate that LocalEndpointConfig.URL is a valid HTTPS URL when non-empty",
+      "priority": "SHALL",
+      "rationale": "HTTPS is required for secure credential transmission; invalid URLs cause runtime failures",
+      "scenarios": [
+        {
+          "name": "Valid HTTPS URL accepted",
+          "when": "URL is 'https://metrics.local:9090/ingest'",
+          "then": "Validate() returns nil",
+          "and_then": []
+        },
+        {
+          "name": "HTTP URL rejected",
+          "when": "URL is 'http://metrics.local:9090/ingest'",
+          "then": "Validate() returns error containing 'must be HTTPS'",
+          "and_then": []
+        },
+        {
+          "name": "Malformed URL rejected",
+          "when": "URL is '://not-a-url'",
+          "then": "Validate() returns error about invalid URL format",
+          "and_then": []
+        },
+        {
+          "name": "Empty URL accepted",
+          "when": "URL is empty string",
+          "then": "Validate() returns nil (not configured)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The system SHALL require SecretKey to be non-empty when URL is non-empty in LocalEndpointConfig",
+      "priority": "SHALL",
+      "rationale": "Prevents accidentally configuring an endpoint without credentials, which would fail at runtime",
+      "scenarios": [
+        {
+          "name": "URL and SecretKey both set",
+          "when": "URL is 'https://local:9090' and SecretKey is 'my-secret-ref'",
+          "then": "Validate() returns nil",
+          "and_then": []
+        },
+        {
+          "name": "URL set but SecretKey empty",
+          "when": "URL is 'https://local:9090' and SecretKey is empty",
+          "then": "Validate() returns error containing 'SecretKey is required'",
+          "and_then": []
+        },
+        {
+          "name": "Both empty (not configured)",
+          "when": "URL is empty and SecretKey is empty",
+          "then": "Validate() returns nil",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "metrics.Config SHALL embed api.LocalEndpointConfig as a LocalEndpoint field and its Validate() SHALL call LocalEndpoint.Validate()",
+      "priority": "SHALL",
+      "rationale": "Ensures metrics pipeline validates local endpoint configuration consistently",
+      "scenarios": [
+        {
+          "name": "Valid metrics config with local endpoint",
+          "when": "metrics.Config has Enabled=true, valid intervals, and LocalEndpoint with valid HTTPS URL and SecretKey",
+          "then": "Validate() returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Invalid local endpoint URL in metrics config",
+          "when": "metrics.Config has LocalEndpoint.URL='http://bad'",
+          "then": "metrics.Config.Validate() returns error about HTTPS requirement",
+          "and_then": [
+            "error message includes 'metrics' prefix for context"
+          ]
+        },
+        {
+          "name": "Disabled metrics skips local endpoint validation",
+          "when": "metrics.Config has Enabled=false and LocalEndpoint.URL='http://bad'",
+          "then": "Validate() returns nil (disabled configs skip all validation)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "logfwd.Config SHALL embed api.LocalEndpointConfig as a LocalEndpoint field and its Validate() SHALL call LocalEndpoint.Validate()",
+      "priority": "SHALL",
+      "rationale": "Ensures log forwarding pipeline validates local endpoint configuration consistently",
+      "scenarios": [
+        {
+          "name": "Valid logfwd config with local endpoint",
+          "when": "logfwd.Config has Enabled=true, valid intervals, and LocalEndpoint with valid HTTPS URL and SecretKey",
+          "then": "Validate() returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Missing SecretKey in logfwd config",
+          "when": "logfwd.Config has LocalEndpoint.URL='https://logs.local' and SecretKey is empty",
+          "then": "logfwd.Config.Validate() returns error about SecretKey being required",
+          "and_then": [
+            "error message includes 'logfwd' prefix for context"
+          ]
+        },
+        {
+          "name": "Disabled logfwd skips local endpoint validation",
+          "when": "logfwd.Config has Enabled=false and LocalEndpoint.URL='not-valid'",
+          "then": "Validate() returns nil",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "auditfwd.Config SHALL embed api.LocalEndpointConfig as a LocalEndpoint field and its Validate() SHALL call LocalEndpoint.Validate()",
+      "priority": "SHALL",
+      "rationale": "Ensures audit forwarding pipeline validates local endpoint configuration consistently",
+      "scenarios": [
+        {
+          "name": "Valid auditfwd config with local endpoint",
+          "when": "auditfwd.Config has Enabled=true, valid intervals, and LocalEndpoint with valid HTTPS URL and SecretKey",
+          "then": "Validate() returns nil",
+          "and_then": []
+        },
+        {
+          "name": "Invalid URL in auditfwd config",
+          "when": "auditfwd.Config has LocalEndpoint.URL='ftp://bad'",
+          "then": "auditfwd.Config.Validate() returns error about HTTPS requirement",
+          "and_then": [
+            "error message includes 'auditfwd' prefix for context"
+          ]
+        },
+        {
+          "name": "Disabled auditfwd skips local endpoint validation",
+          "when": "auditfwd.Config has Enabled=false and invalid LocalEndpoint",
+          "then": "Validate() returns nil",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The system SHALL automatically redact LocalEndpointConfig.SecretKey in config dump output",
+      "priority": "SHALL",
+      "rationale": "SecretKey references must not appear in diagnostic output",
+      "scenarios": [
+        {
+          "name": "Redaction catches secret_key field",
+          "when": "config dump contains a YAML line with key 'secret_key' and a non-empty value",
+          "then": "the value is replaced with '[REDACTED]' by existing redactSensitiveLine logic",
+          "and_then": []
+        },
+        {
+          "name": "Empty secret_key not redacted",
+          "when": "config dump contains secret_key with empty value",
+          "then": "the line is left unchanged (empty values are not redacted)",
+          "and_then": []
+        },
+        {
+          "name": "Existing redaction keywords cover the field",
+          "when": "sensitiveKeywords list is checked",
+          "then": "it includes 'secret' and 'key', both of which match 'secret_key'",
+          "and_then": [
+            "no new redaction code is needed"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "Each pipeline's Validate() error messages SHALL include the pipeline package prefix for diagnostic context",
+      "priority": "SHALL",
+      "rationale": "When AgentConfig.Validate() chains sub-config validation, operators need to know which pipeline has the invalid config",
+      "scenarios": [
+        {
+          "name": "Metrics local endpoint error includes prefix",
+          "when": "metrics.Config.Validate() fails due to invalid LocalEndpoint",
+          "then": "the error message starts with 'metrics: config: local_endpoint:'",
+          "and_then": []
+        },
+        {
+          "name": "Logfwd local endpoint error includes prefix",
+          "when": "logfwd.Config.Validate() fails due to invalid LocalEndpoint",
+          "then": "the error message starts with 'logfwd: config: local_endpoint:'",
+          "and_then": []
+        },
+        {
+          "name": "Auditfwd local endpoint error includes prefix",
+          "when": "auditfwd.Config.Validate() fails due to invalid LocalEndpoint",
+          "then": "the error message starts with 'auditfwd: config: local_endpoint:'",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "1.1",
+      "title": "Define LocalEndpointConfig struct in internal/api/types.go with Validate() method and unit tests (REQ-001, REQ-002, REQ-003)",
+      "level": 1,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.1",
+      "title": "Embed LocalEndpointConfig in metrics.Config and extend Validate() with tests (REQ-004)",
+      "level": 2,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-004"
+      ]
+    },
+    {
+      "id": "2.2",
+      "title": "Embed LocalEndpointConfig in logfwd.Config and extend Validate() with tests (REQ-005)",
+      "level": 2,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-005"
+      ]
+    },
+    {
+      "id": "2.3",
+      "title": "Embed LocalEndpointConfig in auditfwd.Config and extend Validate() with tests (REQ-006)",
+      "level": 2,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-006"
+      ]
+    },
+    {
+      "id": "3.1",
+      "title": "Verify config redaction covers secret_key automatically (REQ-007)",
+      "level": 3,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-007"
+      ]
+    },
+    {
+      "id": "4.1",
+      "title": "Update configuration reference documentation (REQ-001, REQ-004, REQ-005, REQ-006)",
+      "level": 4,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-001",
+        "REQ-004",
+        "REQ-005",
+        "REQ-006"
+      ]
+    }
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestLocalEndpointConfig_ValidateZeroValue",
+      "story": "Developer has a single shared type for local endpoint configuration",
+      "expected": "Zero-valued LocalEndpointConfig should pass validation (not configured)",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestLocalEndpointConfig_ValidateValidHTTPS",
+      "story": "System rejects invalid local endpoint URL at config validation time",
+      "expected": "Valid HTTPS URL with SecretKey should pass validation",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestLocalEndpointConfig_ValidateRejectsHTTP",
+      "story": "System rejects invalid local endpoint URL at config validation time",
+      "expected": "HTTP URL should be rejected with error containing 'must be HTTPS'",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestLocalEndpointConfig_ValidateRejectsMalformedURL",
+      "story": "System rejects invalid local endpoint URL at config validation time",
+      "expected": "Malformed URL should be rejected with error about invalid URL",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestLocalEndpointConfig_ValidateRequiresSecretKeyWhenURLSet",
+      "story": "System requires SecretKey when local endpoint URL is set",
+      "expected": "URL set + SecretKey empty should return error containing 'SecretKey is required'",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/api/types_test.go",
+      "test_function": "TestLocalEndpointConfig_ValidateAcceptsSecretKeyWithoutURL",
+      "story": "System requires SecretKey when local endpoint URL is set",
+      "expected": "Empty URL + non-empty SecretKey should pass validation (harmless no-op)",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_ValidateLocalEndpointValid",
+      "story": "Operator configures a local metrics endpoint via YAML config",
+      "expected": "Valid metrics config with valid local endpoint should pass validation",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_ValidateLocalEndpointInvalidURL",
+      "story": "System rejects invalid local endpoint URL at config validation time",
+      "expected": "metrics.Config with HTTP local endpoint URL should fail with 'metrics' in error",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_ValidateLocalEndpointMissingSecretKey",
+      "story": "System requires SecretKey when local endpoint URL is set",
+      "expected": "metrics.Config with URL set but SecretKey empty should fail validation",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/config_test.go",
+      "test_function": "TestConfig_ValidateDisabledSkipsLocalEndpoint",
+      "story": "Operator configures a local metrics endpoint via YAML config",
+      "expected": "Disabled metrics config with invalid local endpoint should pass (validation skipped)",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/logfwd/config_test.go",
+      "test_function": "TestConfig_ValidateLocalEndpointValid",
+      "story": "Operator configures a local log forwarding endpoint via YAML config",
+      "expected": "Valid logfwd config with valid local endpoint should pass validation",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/logfwd/config_test.go",
+      "test_function": "TestConfig_ValidateLocalEndpointInvalidURL",
+      "story": "System rejects invalid local endpoint URL at config validation time",
+      "expected": "logfwd.Config with HTTP local endpoint URL should fail with 'logfwd' in error",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/logfwd/config_test.go",
+      "test_function": "TestConfig_ValidateLocalEndpointMissingSecretKey",
+      "story": "System requires SecretKey when local endpoint URL is set",
+      "expected": "logfwd.Config with URL set but SecretKey empty should fail validation",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/logfwd/config_test.go",
+      "test_function": "TestConfig_ValidateDisabledSkipsLocalEndpoint",
+      "story": "Operator configures a local log forwarding endpoint via YAML config",
+      "expected": "Disabled logfwd config with invalid local endpoint should pass (validation skipped)",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/auditfwd/config_test.go",
+      "test_function": "TestConfig_ValidateLocalEndpointValid",
+      "story": "Operator configures a local audit forwarding endpoint via YAML config",
+      "expected": "Valid auditfwd config with valid local endpoint should pass validation",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/auditfwd/config_test.go",
+      "test_function": "TestConfig_ValidateLocalEndpointInvalidURL",
+      "story": "System rejects invalid local endpoint URL at config validation time",
+      "expected": "auditfwd.Config with HTTP URL should fail with 'auditfwd' in error",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/auditfwd/config_test.go",
+      "test_function": "TestConfig_ValidateLocalEndpointMissingSecretKey",
+      "story": "System requires SecretKey when local endpoint URL is set",
+      "expected": "auditfwd.Config with URL set but SecretKey empty should fail validation",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/auditfwd/config_test.go",
+      "test_function": "TestConfig_ValidateDisabledSkipsLocalEndpoint",
+      "story": "Operator configures a local audit forwarding endpoint via YAML config",
+      "expected": "Disabled auditfwd config with invalid local endpoint should pass (validation skipped)",
+      "requirement_id": "REQ-006"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "LocalEndpointConfig struct is defined exactly once in internal/api/types.go with URL, SecretKey, TLSInsecureSkipVerify fields and yaml tags",
+    "LocalEndpointConfig.Validate(prefix) validates URL scheme is HTTPS when non-empty and requires SecretKey when URL is set",
+    "All three pipeline configs (metrics, logfwd, auditfwd) embed api.LocalEndpointConfig as LocalEndpoint field with yaml tag local_endpoint",
+    "All three pipeline Validate() methods call LocalEndpoint.Validate() with correct package prefix and only when Enabled=true",
+    "Error messages follow existing pattern: 'package: config: local_endpoint: detail'",
+    "All test specifications are implemented and pass — minimum 6 tests for LocalEndpointConfig, 4 tests per pipeline config",
+    "No existing tests are broken by the changes",
+    "Config redaction of secret_key is verified by at least one test (existing redaction logic covers it automatically)",
+    "Documentation in docs/reference/core/configuration.md and observability docs is updated with new local_endpoint fields"
+  ],
+  "implementation_notes": "Architecture: LocalEndpointConfig is a plain struct (not an interface) with a Validate(prefix string) method. The prefix parameter allows each pipeline's Validate() to prepend its package name for contextual error messages (e.g. 'metrics: config: local_endpoint: URL must be HTTPS'). This follows the existing error message pattern used throughout the codebase.\n\nValidation strategy: LocalEndpointConfig.Validate() uses net/url.Parse to validate URLs. The check is: if URL is empty, return nil (not configured). Otherwise, parse the URL and verify scheme == 'https'. Then check SecretKey is non-empty. Each pipeline's Validate() calls LocalEndpoint.Validate() after the Enabled check, so disabled pipelines skip all validation including local endpoint.\n\nYAML structure: The local_endpoint is a nested YAML object under each pipeline:\n```yaml\nmetrics:\n  local_endpoint:\n    url: https://metrics.local:9090/ingest\n    secret_key: local-metrics-token\n    tls_insecure_skip_verify: false\n```\n\nRedaction: The existing sensitiveKeywords list in cmd/plexd/cmd/up.go includes 'secret' and 'key'. The YAML key 'secret_key' contains both, so redaction is automatic. No code changes needed.\n\nKey files to modify:\n- internal/api/types.go — add LocalEndpointConfig struct and Validate method\n- internal/api/types_test.go — new file with LocalEndpointConfig validation tests\n- internal/metrics/config.go — add LocalEndpoint field, extend Validate()\n- internal/metrics/config_test.go — add local endpoint validation tests\n- internal/logfwd/config.go — add LocalEndpoint field, extend Validate()\n- internal/logfwd/config_test.go — add local endpoint validation tests\n- internal/auditfwd/config.go — add LocalEndpoint field, extend Validate()\n- internal/auditfwd/config_test.go — add local endpoint validation tests\n- docs/reference/core/configuration.md — add local_endpoint docs\n- docs/reference/observability/metrics-collection.md — add LocalEndpoint to config table\n- docs/reference/observability/log-forwarding.md — add LocalEndpoint to config table\n- docs/reference/observability/audit-forwarding.md — add LocalEndpoint to config table\n\nRisks:\n- Adding 'net/url' import to internal/api/types.go (currently only imports encoding/json and time) — minimal risk\n- Adding api import to logfwd and auditfwd config.go files — may not currently import api; check for import cycles (api -> types.go is fine, pipeline configs importing api is the standard pattern seen in agent/config.go)",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T06:24:23.325644"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T06:25:24.706184"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T06:28:42.342278"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "d0f95906-9346-41f3-af47-f7773ecb3d63",
+      "timestamp": "2026-02-18T06:28:42.342305",
+      "total_duration": 193.79095816612244,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 193.79095816612244,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
