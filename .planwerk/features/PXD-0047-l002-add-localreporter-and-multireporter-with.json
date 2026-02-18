@@ -1,0 +1,776 @@
+{
+  "feature_id": "PXD-0047",
+  "title": "L002: Add LocalReporter and MultiReporter with credentials",
+  "slug": "l002-add-localreporter-and-multireporter-with",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 🏗️ large\n**Category:** backend\n**Priority:** critical\n**Source:** Proposed for 'It should be possible in Metrics, Log Forwarding u'\n\nImplement per-pipeline `LocalReporter` (metrics, logfwd, auditfwd) — an HTTP client implementing the respective reporter interface that POSTs identical JSON batch payloads (MetricBatch/LogBatch/AuditBatch) to the configured local URL with bearer token authentication. Implement per-pipeline `MultiReporter` fan-out wrapper that dispatches to both platform reporter and local reporter in parallel goroutines, collecting and logging errors independently (local endpoint failure never blocks platform delivery). Credential resolution at flush time via existing `SecretFetcher.FetchSecret()` → `DecryptSecret()` (AES-256-GCM) with an in-memory TTL cache to avoid per-flush secret lookups. Includes comprehensive unit tests: LocalReporter HTTP behavior, MultiReporter parallel dispatch, credential caching TTL expiry, error isolation between targets.\n\n**Rationale:** Core business logic of the feature. The MultiReporter pattern ensures zero impact on existing platform delivery while enabling local endpoint support. In-memory credential caching avoids expensive secret decryption on every flush cycle. Independent error handling is critical — a down local SIEM must never cause data loss to the platform.\n\n**Affected Areas:**\n- src/internal/metrics/local_reporter.go\n- src/internal/metrics/multi_reporter.go\n- src/internal/logfwd/local_reporter.go\n- src/internal/logfwd/multi_reporter.go\n- src/internal/auditfwd/local_reporter.go\n- src/internal/auditfwd/multi_reporter.go\n- src/internal/metrics/local_reporter_test.go\n- src/internal/metrics/multi_reporter_test.go\n- src/internal/logfwd/local_reporter_test.go\n- src/internal/logfwd/multi_reporter_test.go\n- src/internal/auditfwd/local_reporter_test.go\n- src/internal/auditfwd/multi_reporter_test.go",
+  "stories": [
+    {
+      "title": "Platform operator delivers metrics to a local SIEM endpoint",
+      "role": "platform operator",
+      "want": "to configure a local HTTPS endpoint so that metrics are delivered to both the Plexsphere platform and my local SIEM in parallel",
+      "so_that": "I can ingest metrics into my own monitoring stack without disrupting platform telemetry",
+      "criteria": [
+        "When local_endpoint.url is set in metrics config, MetricBatch payloads are POSTed to the local URL in addition to the platform",
+        "The local HTTP POST uses Content-Type: application/json and includes an Authorization: Bearer header with the resolved secret",
+        "Platform delivery succeeds even when the local endpoint is unreachable",
+        "When local_endpoint.url is empty, behavior is identical to the existing single-reporter pipeline"
+      ]
+    },
+    {
+      "title": "Platform operator delivers logs to a local SIEM endpoint",
+      "role": "platform operator",
+      "want": "to configure a local HTTPS endpoint so that forwarded logs are delivered to both the platform and my local log aggregator in parallel",
+      "so_that": "I can search and analyze logs in my own tooling alongside platform log forwarding",
+      "criteria": [
+        "When local_endpoint.url is set in logfwd config, LogBatch payloads are POSTed to the local URL in addition to the platform",
+        "The local HTTP POST body is identical JSON to what the platform receives",
+        "Log forwarding to the platform is unaffected by local endpoint availability",
+        "Local endpoint errors are logged with component=logfwd but not propagated to the forwarder"
+      ]
+    },
+    {
+      "title": "Platform operator delivers audit events to a local SIEM endpoint",
+      "role": "platform operator",
+      "want": "to configure a local HTTPS endpoint so that audit events are delivered to both the platform and my local audit store in parallel",
+      "so_that": "I can maintain a local copy of audit trails for compliance requirements",
+      "criteria": [
+        "When local_endpoint.url is set in auditfwd config, AuditBatch payloads are POSTed to the local URL in addition to the platform",
+        "Subject and Object json.RawMessage fields are preserved unchanged in the local POST body",
+        "Audit forwarding to the platform continues normally even if the local endpoint returns errors",
+        "The audit forwarder's Status() method still reflects platform-level error counts, not local"
+      ]
+    },
+    {
+      "title": "Local SIEM is unreachable but platform delivery continues",
+      "role": "platform operator",
+      "want": "platform telemetry delivery to be completely unaffected when my local SIEM is down or slow",
+      "so_that": "a misconfigured or failing local endpoint never causes data loss to the Plexsphere platform",
+      "criteria": [
+        "MultiReporter dispatches to platform and local reporter in parallel goroutines",
+        "Platform reporter error is returned to the pipeline manager (preserving existing retry/retain semantics)",
+        "Local reporter error is logged as a warning but not returned to the pipeline manager",
+        "A slow local endpoint (hanging HTTP request) does not delay platform delivery or block the flush cycle"
+      ]
+    },
+    {
+      "title": "Credential resolution caches bearer token with TTL",
+      "role": "system",
+      "want": "to resolve the local endpoint bearer token via SecretFetcher and cache it in memory with a TTL",
+      "so_that": "per-flush secret lookups and AES-256-GCM decryption are avoided while still supporting secret rotation",
+      "criteria": [
+        "On first Report call, LocalReporter fetches the secret via SecretFetcher.FetchSecret() and decrypts via DecryptSecret()",
+        "Subsequent Report calls within the TTL window reuse the cached plaintext token",
+        "After TTL expiry, the next Report call triggers a fresh FetchSecret+DecryptSecret cycle",
+        "If credential fetch fails but a stale cached token exists, the stale token is used and a warning is logged"
+      ]
+    },
+    {
+      "title": "No local endpoint configured — existing behavior preserved",
+      "role": "platform operator",
+      "want": "no behavioral change when I have not configured a local endpoint",
+      "so_that": "upgrading to this version has zero impact on existing deployments",
+      "criteria": [
+        "When LocalEndpoint.URL is empty, the pipeline manager receives the ControlPlane client directly (no MultiReporter wrapping)",
+        "No additional goroutines are spawned for local reporting",
+        "No SecretFetcher calls are made for credential resolution",
+        "Pipeline startup logs do not mention local endpoint when not configured"
+      ]
+    },
+    {
+      "title": "TLS configuration respected for local endpoint",
+      "role": "platform operator",
+      "want": "to control TLS certificate verification for the local endpoint independently",
+      "so_that": "I can connect to internal endpoints with self-signed certificates during initial setup",
+      "criteria": [
+        "When tls_insecure_skip_verify is false (default), TLS certificate verification is enforced",
+        "When tls_insecure_skip_verify is true, certificate verification is skipped for the local endpoint only",
+        "The platform ControlPlane client's TLS settings are never affected by local endpoint TLS config",
+        "LocalReporter creates its own http.Client with the configured TLS settings"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "LocalReporter SHALL POST the identical JSON batch payload to the configured local HTTPS URL",
+      "priority": "SHALL",
+      "rationale": "The local endpoint receives the same data format as the platform, enabling consistent ingestion without payload transformation",
+      "scenarios": [
+        {
+          "name": "Successful POST to local endpoint",
+          "when": "LocalReporter.Report*(ctx, nodeID, batch) is called with a valid batch",
+          "then": "an HTTP POST is made to the configured URL with the batch JSON-serialized as the request body",
+          "and_then": [
+            "Content-Type header is application/json",
+            "HTTP method is POST",
+            "request body deserializes to the same batch type"
+          ]
+        },
+        {
+          "name": "Local endpoint returns non-2xx status",
+          "when": "the local endpoint responds with HTTP 500",
+          "then": "LocalReporter returns an error describing the status code",
+          "and_then": [
+            "the error includes the HTTP status code",
+            "no retry is attempted within the same Report call"
+          ]
+        },
+        {
+          "name": "Local endpoint is unreachable",
+          "when": "the local endpoint URL cannot be connected to (connection refused, DNS failure)",
+          "then": "LocalReporter returns a connection error",
+          "and_then": [
+            "the error wraps the underlying net/http error"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "LocalReporter SHALL include the resolved bearer token in the Authorization header of every request",
+      "priority": "SHALL",
+      "rationale": "Bearer token authentication is the only supported auth mechanism for local endpoints, ensuring secure access",
+      "scenarios": [
+        {
+          "name": "Authorization header present on POST",
+          "when": "LocalReporter makes an HTTP POST to the local endpoint",
+          "then": "the request includes an Authorization header with value 'Bearer {resolved_token}'",
+          "and_then": [
+            "the token is the plaintext result of DecryptSecret, not the ciphertext or secret key name"
+          ]
+        },
+        {
+          "name": "Credential resolution failure — no cached token",
+          "when": "credential resolution fails and no cached token is available",
+          "then": "LocalReporter returns an error and does not make the HTTP POST",
+          "and_then": [
+            "no request is sent to the local endpoint without authentication"
+          ]
+        },
+        {
+          "name": "Credential resolution failure — stale cached token available",
+          "when": "credential resolution fails but a previously cached token exists (expired TTL)",
+          "then": "LocalReporter uses the stale cached token and logs a warning",
+          "and_then": [
+            "the HTTP POST is still attempted with the stale token",
+            "a warning log includes the fetch error"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "Credential resolution SHALL use the existing SecretFetcher.FetchSecret() → DecryptSecret() pipeline",
+      "priority": "SHALL",
+      "rationale": "Reuses the established encrypted secret delivery mechanism without introducing a parallel credential flow",
+      "scenarios": [
+        {
+          "name": "First credential resolution",
+          "when": "LocalReporter resolves credentials for the first time",
+          "then": "it calls SecretFetcher.FetchSecret(ctx, nodeID, secretKey) then DecryptSecret(nsk, ciphertext, nonce)",
+          "and_then": [
+            "the resolved plaintext is stored as the bearer token",
+            "the cache timestamp is set to now"
+          ]
+        },
+        {
+          "name": "DecryptSecret returns error",
+          "when": "FetchSecret succeeds but DecryptSecret returns an error (corrupt ciphertext, wrong NSK)",
+          "then": "credential resolution fails with a wrapped error",
+          "and_then": [
+            "no partial state is cached",
+            "the error message does not leak cryptographic details"
+          ]
+        },
+        {
+          "name": "FetchSecret returns error",
+          "when": "FetchSecret returns a network or API error",
+          "then": "credential resolution fails with a wrapped error",
+          "and_then": [
+            "the caller can distinguish fetch failure from decrypt failure via error wrapping"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "LocalReporter SHALL cache the resolved bearer token in memory with a TTL of 5 minutes",
+      "priority": "SHALL",
+      "rationale": "Avoids expensive per-flush SecretFetcher calls and AES-256-GCM decryption while supporting credential rotation within a bounded window",
+      "scenarios": [
+        {
+          "name": "Cache hit within TTL",
+          "when": "Report* is called within 5 minutes of the last successful credential resolution",
+          "then": "the cached token is used without calling SecretFetcher",
+          "and_then": [
+            "no FetchSecret or DecryptSecret calls are made"
+          ]
+        },
+        {
+          "name": "Cache miss after TTL expiry",
+          "when": "Report* is called more than 5 minutes after the last successful credential resolution",
+          "then": "a new FetchSecret+DecryptSecret cycle is triggered",
+          "and_then": [
+            "the cache is updated with the new token and timestamp"
+          ]
+        },
+        {
+          "name": "Concurrent Report calls share cache",
+          "when": "multiple goroutines call Report* simultaneously while the cache is valid",
+          "then": "all goroutines read the same cached token without data races",
+          "and_then": [
+            "sync.RWMutex protects cache access"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "MultiReporter SHALL dispatch to platform reporter and local reporter in parallel goroutines",
+      "priority": "SHALL",
+      "rationale": "Parallel dispatch ensures that a slow local endpoint does not delay platform delivery",
+      "scenarios": [
+        {
+          "name": "Both targets succeed",
+          "when": "both platform and local reporter return nil error",
+          "then": "MultiReporter returns nil error",
+          "and_then": [
+            "both reporters received the same nodeID and batch arguments"
+          ]
+        },
+        {
+          "name": "Slow local endpoint does not delay platform",
+          "when": "the local reporter takes 5 seconds to respond while the platform reporter responds instantly",
+          "then": "the platform reporter's result is available immediately (not blocked by local)",
+          "and_then": [
+            "MultiReporter waits for both to complete before returning"
+          ]
+        },
+        {
+          "name": "Context cancellation propagated to both",
+          "when": "the context is cancelled while both reporters are in-flight",
+          "then": "both reporters receive the cancelled context",
+          "and_then": [
+            "MultiReporter returns the platform reporter's error (context.Canceled)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "MultiReporter SHALL return only the platform reporter's error; local reporter errors SHALL be logged independently",
+      "priority": "SHALL",
+      "rationale": "The pipeline manager's retry/retain logic must only respond to platform delivery failures; local endpoint failures are informational",
+      "scenarios": [
+        {
+          "name": "Platform succeeds, local fails",
+          "when": "platform reporter returns nil but local reporter returns an error",
+          "then": "MultiReporter returns nil (success)",
+          "and_then": [
+            "the local error is logged as a warning with the component name"
+          ]
+        },
+        {
+          "name": "Platform fails, local succeeds",
+          "when": "platform reporter returns an error but local reporter returns nil",
+          "then": "MultiReporter returns the platform error",
+          "and_then": [
+            "the pipeline manager retains the batch for retry (existing behavior)"
+          ]
+        },
+        {
+          "name": "Both fail",
+          "when": "both platform and local reporter return errors",
+          "then": "MultiReporter returns the platform error only",
+          "and_then": [
+            "the local error is logged as a warning",
+            "the platform error triggers the pipeline's retry/retain logic"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "LocalReporter SHALL create its own http.Client with TLS settings from LocalEndpointConfig",
+      "priority": "SHALL",
+      "rationale": "The local endpoint's TLS configuration (including skip-verify) must be independent of the platform client's TLS settings",
+      "scenarios": [
+        {
+          "name": "Default TLS verification",
+          "when": "TLSInsecureSkipVerify is false",
+          "then": "the HTTP client verifies the server's TLS certificate against system roots",
+          "and_then": [
+            "connections to endpoints with invalid certificates fail with a TLS error"
+          ]
+        },
+        {
+          "name": "Skip TLS verification",
+          "when": "TLSInsecureSkipVerify is true",
+          "then": "the HTTP client skips certificate verification",
+          "and_then": [
+            "connections to endpoints with self-signed certificates succeed"
+          ]
+        },
+        {
+          "name": "Reasonable request timeout",
+          "when": "the local endpoint is unresponsive",
+          "then": "the HTTP client times out after a reasonable duration (e.g., 10 seconds)",
+          "and_then": [
+            "the timeout error is returned to the caller"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "Pipeline wiring SHALL only create MultiReporter when LocalEndpoint.URL is non-empty",
+      "priority": "SHALL",
+      "rationale": "Zero-impact on existing deployments that do not configure a local endpoint",
+      "scenarios": [
+        {
+          "name": "Local endpoint configured",
+          "when": "cfg.<pipeline>.LocalEndpoint.URL is non-empty at startup",
+          "then": "a LocalReporter and MultiReporter are constructed, and the MultiReporter is passed to the pipeline manager as the reporter",
+          "and_then": [
+            "startup log indicates local endpoint is enabled with the target URL"
+          ]
+        },
+        {
+          "name": "Local endpoint not configured",
+          "when": "cfg.<pipeline>.LocalEndpoint.URL is empty (default)",
+          "then": "the ControlPlane client is passed directly to the pipeline manager (no wrapping)",
+          "and_then": [
+            "no LocalReporter or MultiReporter is instantiated",
+            "no startup log about local endpoint"
+          ]
+        },
+        {
+          "name": "All three pipelines wired independently",
+          "when": "only metrics has a local endpoint configured (logfwd and auditfwd do not)",
+          "then": "only the metrics pipeline uses a MultiReporter; logfwd and auditfwd use the ControlPlane client directly",
+          "and_then": [
+            "each pipeline's local endpoint configuration is independent"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "LocalReporter SHALL use a dedicated HTTP request timeout of 10 seconds",
+      "priority": "SHALL",
+      "rationale": "Prevents a hanging local endpoint from consuming resources indefinitely; shorter than the platform client's 30s timeout since local endpoints are expected to be on the same network",
+      "scenarios": [
+        {
+          "name": "Request completes within timeout",
+          "when": "the local endpoint responds within 10 seconds",
+          "then": "the response is processed normally",
+          "and_then": []
+        },
+        {
+          "name": "Request exceeds timeout",
+          "when": "the local endpoint does not respond within 10 seconds",
+          "then": "the HTTP client cancels the request and returns a timeout error",
+          "and_then": [
+            "the error is returned to the caller (MultiReporter logs it)"
+          ]
+        },
+        {
+          "name": "Context deadline shorter than timeout",
+          "when": "the parent context has a deadline of 3 seconds",
+          "then": "the request is cancelled at 3 seconds (context deadline takes precedence)",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "LocalReporter credential resolution SHALL NOT log or expose the plaintext bearer token",
+      "priority": "SHALL",
+      "rationale": "Security requirement: bearer tokens are sensitive credentials that must not appear in logs, error messages, or debug output",
+      "scenarios": [
+        {
+          "name": "Successful credential resolution",
+          "when": "credential resolution succeeds",
+          "then": "no log entry contains the plaintext token value",
+          "and_then": [
+            "log entries may reference the secret key name but not the resolved value"
+          ]
+        },
+        {
+          "name": "Credential resolution failure",
+          "when": "credential resolution fails",
+          "then": "the error message does not contain any ciphertext, nonce, or token fragments",
+          "and_then": [
+            "error messages use generic phrasing like 'credential resolution failed'"
+          ]
+        },
+        {
+          "name": "Stale token fallback",
+          "when": "stale token is used after TTL expiry",
+          "then": "the warning log mentions 'using cached credential' without revealing the token value",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "1.1",
+      "title": "Implement metrics LocalReporter with HTTP POST, bearer auth, credential caching, and unit tests (REQ-001, REQ-002, REQ-003, REQ-004, REQ-007, REQ-009, REQ-010)",
+      "description": "Create `internal/metrics/local_reporter.go`: struct implementing MetricsReporter interface with fields for http.Client, URL, SecretFetcher, NSK, secretKey, logger, and cached credential (token string + fetchedAt time.Time protected by sync.RWMutex). Constructor `NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) *LocalReporter` creates http.Client with TLS config from cfg.TLSInsecureSkipVerify and 10s timeout. `ReportMetrics(ctx, nodeID, batch)` resolves credential (check cache TTL 5min, fetch+decrypt if expired, fallback to stale on error), then POSTs JSON-serialized batch to cfg.URL with Authorization: Bearer header. Define `SecretFetcher` interface in this package (matching nodeapi pattern). Create `internal/metrics/local_reporter_test.go`: tests using httptest.NewTLSServer for HTTP behavior (correct method, path, Content-Type, Authorization header, request body), credential caching (second call within TTL doesn't call fetcher), credential refresh (call after TTL triggers fetcher), stale fallback (fetch error with cached token uses stale), no-cache error (fetch error with no cache returns error), non-2xx handling, connection error handling. Use mock SecretFetcher returning pre-encrypted test secrets.",
+      "level": 1,
+      "estimate_minutes": 30,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-007",
+        "REQ-009",
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "1.2",
+      "title": "Implement metrics MultiReporter with parallel dispatch, error isolation, and unit tests (REQ-005, REQ-006)",
+      "description": "Create `internal/metrics/multi_reporter.go`: struct implementing MetricsReporter with fields for platform MetricsReporter, local MetricsReporter, and logger. Constructor `NewMultiReporter(platform, local MetricsReporter, logger *slog.Logger) *MultiReporter`. `ReportMetrics(ctx, nodeID, batch)` launches two goroutines (one for platform, one for local), waits for both via sync.WaitGroup, returns platform error only, logs local error as warning with component=metrics. Create `internal/metrics/multi_reporter_test.go`: tests using mock reporters for both-succeed, platform-fail-local-succeed (returns platform error), platform-succeed-local-fail (returns nil, logs warning), both-fail (returns platform error, logs local warning), slow-local-doesn't-block-platform (verify timing), context-cancellation-propagated, both-receive-same-arguments.",
+      "level": 1,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-005",
+        "REQ-006"
+      ]
+    },
+    {
+      "id": "1.3",
+      "title": "Implement logfwd LocalReporter with HTTP POST, bearer auth, credential caching, and unit tests (REQ-001, REQ-002, REQ-003, REQ-004, REQ-007, REQ-009, REQ-010)",
+      "description": "Create `internal/logfwd/local_reporter.go`: struct implementing LogReporter interface, same credential resolution and HTTP POST pattern as metrics LocalReporter. Constructor `NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) *LocalReporter`. `ReportLogs(ctx, nodeID, batch)` resolves credential then POSTs api.LogBatch JSON to cfg.URL with bearer auth. Define SecretFetcher interface in logfwd package. Create `internal/logfwd/local_reporter_test.go`: same test structure as metrics — HTTP behavior, credential caching TTL, stale fallback, error handling. Verify LogEntry fields (Timestamp, Source, Unit, Message, Severity, Hostname) are preserved in POST body.",
+      "level": 1,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-007",
+        "REQ-009",
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "1.4",
+      "title": "Implement logfwd MultiReporter with parallel dispatch, error isolation, and unit tests (REQ-005, REQ-006)",
+      "description": "Create `internal/logfwd/multi_reporter.go`: struct implementing LogReporter with platform and local LogReporter fields. Constructor `NewMultiReporter(platform, local LogReporter, logger *slog.Logger) *MultiReporter`. `ReportLogs(ctx, nodeID, batch)` dispatches in parallel, returns platform error only, logs local error. Create `internal/logfwd/multi_reporter_test.go`: same test scenarios as metrics MultiReporter adapted for LogReporter interface.",
+      "level": 1,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-005",
+        "REQ-006"
+      ]
+    },
+    {
+      "id": "1.5",
+      "title": "Implement auditfwd LocalReporter with HTTP POST, bearer auth, credential caching, and unit tests (REQ-001, REQ-002, REQ-003, REQ-004, REQ-007, REQ-009, REQ-010)",
+      "description": "Create `internal/auditfwd/local_reporter.go`: struct implementing AuditReporter interface, same credential resolution and HTTP POST pattern as metrics/logfwd. Constructor `NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []byte, nodeID string, logger *slog.Logger) *LocalReporter`. `ReportAudit(ctx, nodeID, batch)` resolves credential then POSTs api.AuditBatch JSON to cfg.URL with bearer auth. Define SecretFetcher interface in auditfwd package. Create `internal/auditfwd/local_reporter_test.go`: HTTP behavior, credential caching, verify AuditEntry fields including json.RawMessage Subject/Object are preserved.",
+      "level": 1,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-007",
+        "REQ-009",
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "1.6",
+      "title": "Implement auditfwd MultiReporter with parallel dispatch, error isolation, and unit tests (REQ-005, REQ-006)",
+      "description": "Create `internal/auditfwd/multi_reporter.go`: struct implementing AuditReporter with platform and local AuditReporter fields. Constructor `NewMultiReporter(platform, local AuditReporter, logger *slog.Logger) *MultiReporter`. `ReportAudit(ctx, nodeID, batch)` dispatches in parallel, returns platform error only, logs local error. Create `internal/auditfwd/multi_reporter_test.go`: same test scenarios as metrics MultiReporter adapted for AuditReporter interface.",
+      "level": 1,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-005",
+        "REQ-006"
+      ]
+    },
+    {
+      "id": "2.1",
+      "title": "Wire MultiReporter into up.go for all three pipelines when LocalEndpoint.URL is non-empty (REQ-008)",
+      "description": "Modify `cmd/plexd/cmd/up.go`: For each pipeline (metrics, logfwd, auditfwd), add conditional wrapping. Before the pipeline manager constructor, check if `cfg.<Pipeline>.LocalEndpoint.URL != \"\"`. If set: construct LocalReporter with (cfg.LocalEndpoint, client (as SecretFetcher), nsk, identity.NodeID, logger), then construct MultiReporter wrapping (client, localReporter, logger), pass MultiReporter as the reporter argument. If not set: pass client directly (existing behavior). Log info message when local endpoint is enabled: 'local endpoint enabled' with url field. Ensure NSK ([]byte(identity.NodeSecretKey)) is available before pipeline construction. The ControlPlane client implements SecretFetcher (has FetchSecret method), so it can be passed directly.",
+      "level": 2,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "2.2",
+      "title": "Credential cache edge case tests: TTL boundary, concurrent access, stale fallback under load (REQ-004, REQ-010)",
+      "description": "Add edge case tests to `internal/metrics/local_reporter_test.go` (representative for all three pipelines): (1) TTL boundary — set fetchedAt to exactly 5min ago, verify refresh is triggered. (2) Concurrent Report calls — launch 10 goroutines calling ReportMetrics simultaneously, verify no data races (run with -race), verify SecretFetcher is called at most once for initial resolution. (3) Stale fallback under repeated failures — fetch fails 3 times with stale cache, verify stale token is used each time and warning logged each time. (4) Token never appears in log output — use capturingHandler to capture all log records, verify none contain the test token string. (5) Empty batch handling — verify LocalReporter still makes the POST (consistent with platform reporter behavior).",
+      "level": 2,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-004",
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "2.3",
+      "title": "HTTP edge case tests: TLS skip verify, request timeout, large batch (REQ-007, REQ-009)",
+      "description": "Add edge case tests to `internal/metrics/local_reporter_test.go`: (1) TLS skip verify — create httptest.NewTLSServer, connect with TLSInsecureSkipVerify=true, verify success. Connect with TLSInsecureSkipVerify=false, verify TLS error. (2) Request timeout — create test server that sleeps 15s, verify LocalReporter returns timeout error within ~10s. (3) Large batch — create batch with 1000 MetricPoints, verify all are serialized and sent correctly. (4) Server closes connection mid-response — verify error is returned cleanly.",
+      "level": 2,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-007",
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "3.1",
+      "title": "Reference documentation for LocalReporter and MultiReporter pattern",
+      "description": "Create or extend documentation in the docs/ directory covering the LocalReporter and MultiReporter architecture. Reference doc should include: (1) LocalReporter: purpose, constructor parameters, HTTP behavior (POST, JSON, bearer auth), credential resolution flow (SecretFetcher → DecryptSecret → cache), TTL caching semantics, TLS configuration. (2) MultiReporter: purpose, parallel dispatch pattern, error isolation semantics (platform error returned, local error logged), constructor parameters. (3) Configuration: YAML examples for each pipeline's local_endpoint block. (4) Wiring: how MultiReporter is conditionally created in up.go. (5) Error handling: what happens when local endpoint is down, when credentials fail, when TLS fails. Update existing reference docs in docs/reference/observability/ for metrics-collection.md, log-forwarding.md, and audit-forwarding.md to include LocalReporter and MultiReporter sections.",
+      "level": 3,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-001",
+        "REQ-005",
+        "REQ-008"
+      ]
+    }
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/metrics/local_reporter_test.go",
+      "test_function": "TestLocalReporter_PostsJSONBatchToConfiguredURL",
+      "story": "Platform operator delivers metrics to a local SIEM endpoint",
+      "expected": "HTTP POST to configured URL with JSON-serialized MetricBatch body, Content-Type: application/json",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/metrics/local_reporter_test.go",
+      "test_function": "TestLocalReporter_IncludesBearerTokenInAuthHeader",
+      "story": "Platform operator delivers metrics to a local SIEM endpoint",
+      "expected": "Authorization header is 'Bearer {resolved_plaintext_token}'",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/metrics/local_reporter_test.go",
+      "test_function": "TestLocalReporter_ResolvesCredentialViaFetchAndDecrypt",
+      "story": "Credential resolution caches bearer token with TTL",
+      "expected": "First call invokes SecretFetcher.FetchSecret then DecryptSecret; resolved token used as bearer",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/metrics/local_reporter_test.go",
+      "test_function": "TestLocalReporter_CachesTokenWithinTTL",
+      "story": "Credential resolution caches bearer token with TTL",
+      "expected": "Second Report call within 5min reuses cached token; SecretFetcher not called again",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/local_reporter_test.go",
+      "test_function": "TestLocalReporter_RefreshesTokenAfterTTLExpiry",
+      "story": "Credential resolution caches bearer token with TTL",
+      "expected": "Report call after 5min triggers new FetchSecret+DecryptSecret; cache updated",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/local_reporter_test.go",
+      "test_function": "TestLocalReporter_UsesStaleCacheOnFetchError",
+      "story": "Credential resolution caches bearer token with TTL",
+      "expected": "When fetch fails but stale token exists, stale token is used and warning logged",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/metrics/local_reporter_test.go",
+      "test_function": "TestLocalReporter_ReturnsErrorWhenNoCacheAndFetchFails",
+      "story": "Credential resolution caches bearer token with TTL",
+      "expected": "When fetch fails with no cached token, error returned and no HTTP POST made",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/metrics/local_reporter_test.go",
+      "test_function": "TestLocalReporter_NonSuccessStatusReturnsError",
+      "story": "Platform operator delivers metrics to a local SIEM endpoint",
+      "expected": "HTTP 500 from local endpoint results in error return containing status code",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/metrics/local_reporter_test.go",
+      "test_function": "TestLocalReporter_TLSInsecureSkipVerify",
+      "story": "TLS configuration respected for local endpoint",
+      "expected": "With skip_verify=true, connection to self-signed cert succeeds; with false, it fails",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "internal/metrics/local_reporter_test.go",
+      "test_function": "TestLocalReporter_RequestTimeout",
+      "story": "TLS configuration respected for local endpoint",
+      "expected": "Unresponsive server triggers timeout error within ~10s",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/metrics/local_reporter_test.go",
+      "test_function": "TestLocalReporter_ConcurrentAccessSafe",
+      "story": "Credential resolution caches bearer token with TTL",
+      "expected": "10 concurrent Report calls with -race flag pass without data races",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/local_reporter_test.go",
+      "test_function": "TestLocalReporter_TokenNotInLogs",
+      "story": "Credential resolution caches bearer token with TTL",
+      "expected": "Captured log output does not contain the plaintext token string",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "internal/metrics/multi_reporter_test.go",
+      "test_function": "TestMultiReporter_BothSucceed",
+      "story": "Platform operator delivers metrics to a local SIEM endpoint",
+      "expected": "Both reporters called with same args, nil returned",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/metrics/multi_reporter_test.go",
+      "test_function": "TestMultiReporter_PlatformFailLocalSucceed",
+      "story": "Local SIEM is unreachable but platform delivery continues",
+      "expected": "Platform error returned to caller",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/metrics/multi_reporter_test.go",
+      "test_function": "TestMultiReporter_PlatformSucceedLocalFail",
+      "story": "Local SIEM is unreachable but platform delivery continues",
+      "expected": "Nil returned (success); local error logged as warning",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/metrics/multi_reporter_test.go",
+      "test_function": "TestMultiReporter_BothFail",
+      "story": "Local SIEM is unreachable but platform delivery continues",
+      "expected": "Platform error returned; local error logged as warning",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/metrics/multi_reporter_test.go",
+      "test_function": "TestMultiReporter_SlowLocalDoesNotBlockPlatform",
+      "story": "Local SIEM is unreachable but platform delivery continues",
+      "expected": "Platform result available quickly despite slow local; MultiReporter waits for both",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/metrics/multi_reporter_test.go",
+      "test_function": "TestMultiReporter_ContextCancellation",
+      "story": "Local SIEM is unreachable but platform delivery continues",
+      "expected": "Both reporters receive cancelled context",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/logfwd/local_reporter_test.go",
+      "test_function": "TestLocalReporter_PostsLogBatchWithBearerAuth",
+      "story": "Platform operator delivers logs to a local SIEM endpoint",
+      "expected": "HTTP POST with JSON LogBatch body and Authorization: Bearer header",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/logfwd/local_reporter_test.go",
+      "test_function": "TestLocalReporter_CachesAndRefreshesCredential",
+      "story": "Credential resolution caches bearer token with TTL",
+      "expected": "Second call reuses cache; call after TTL triggers refresh",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/logfwd/multi_reporter_test.go",
+      "test_function": "TestMultiReporter_ErrorIsolation",
+      "story": "Platform operator delivers logs to a local SIEM endpoint",
+      "expected": "Local failure returns nil (platform succeeded); platform failure returns error",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/logfwd/multi_reporter_test.go",
+      "test_function": "TestMultiReporter_ParallelDispatch",
+      "story": "Platform operator delivers logs to a local SIEM endpoint",
+      "expected": "Both reporters receive identical args and run in parallel",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/auditfwd/local_reporter_test.go",
+      "test_function": "TestLocalReporter_PostsAuditBatchPreservingRawMessage",
+      "story": "Platform operator delivers audit events to a local SIEM endpoint",
+      "expected": "HTTP POST with JSON AuditBatch body; Subject/Object json.RawMessage fields preserved",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/auditfwd/local_reporter_test.go",
+      "test_function": "TestLocalReporter_CredentialResolutionAndCaching",
+      "story": "Credential resolution caches bearer token with TTL",
+      "expected": "FetchSecret+DecryptSecret called on first use; cached on subsequent; refreshed after TTL",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/auditfwd/multi_reporter_test.go",
+      "test_function": "TestMultiReporter_ErrorIsolation",
+      "story": "Platform operator delivers audit events to a local SIEM endpoint",
+      "expected": "Local failure returns nil; platform failure returns error; both logged independently",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/auditfwd/multi_reporter_test.go",
+      "test_function": "TestMultiReporter_ParallelDispatch",
+      "story": "Platform operator delivers audit events to a local SIEM endpoint",
+      "expected": "Both reporters called in parallel goroutines with identical args",
+      "requirement_id": "REQ-005"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-010) have corresponding passing unit tests",
+    "All WHEN/THEN scenarios in requirements are covered by at least one test case",
+    "LocalReporter in each pipeline (metrics, logfwd, auditfwd) implements the correct reporter interface (MetricsReporter, LogReporter, AuditReporter)",
+    "MultiReporter dispatches to both targets in parallel goroutines and returns only platform error",
+    "Credential cache uses sync.RWMutex and passes `go test -race` without data races",
+    "Bearer token plaintext never appears in log output (verified by capturingHandler test)",
+    "When LocalEndpoint.URL is empty, pipeline behavior is identical to before (no MultiReporter wrapping)",
+    "LocalReporter creates its own http.Client with TLS settings from LocalEndpointConfig, independent of ControlPlane client",
+    "Error messages from credential resolution do not leak cryptographic details (ciphertext, nonce, NSK)",
+    "All new code follows existing package conventions: doc comments on exported types/methods, error format 'package: context: detail'",
+    "Reference documentation updated in docs/reference/observability/ for all three pipeline docs"
+  ],
+  "implementation_notes": "**Architecture**: Each pipeline (metrics, logfwd, auditfwd) gets its own LocalReporter and MultiReporter in its own package, following the codebase's self-contained package convention. The code structure is intentionally duplicated across packages rather than extracted into a shared package, because: (1) each pipeline has a different reporter interface, (2) the codebase favors narrow, focused packages over shared utility packages, (3) the duplication is small (~100 lines per LocalReporter, ~40 lines per MultiReporter).\n\n**Credential Resolution Flow**: LocalReporter.resolveToken() checks cache (sync.RWMutex protected). If cache is valid (token non-empty and fetchedAt within 5min TTL), returns cached token. Otherwise calls SecretFetcher.FetchSecret(ctx, nodeID, cfg.SecretKey) to get SecretResponse, then DecryptSecret(nsk, resp.Ciphertext, resp.Nonce) to get plaintext. On success, updates cache. On failure with existing stale cache, logs warning and returns stale token. On failure with no cache, returns error.\n\n**SecretFetcher Interface**: Defined per-pipeline (not shared) to match the codebase's pattern of defining interfaces where they're consumed. The interface matches nodeapi.SecretFetcher but is defined independently. The ControlPlane client satisfies this interface.\n\n**HTTP Client**: Each LocalReporter creates its own http.Client in the constructor with: TLSClientConfig from LocalEndpointConfig.TLSInsecureSkipVerify, Timeout of 10 seconds. This is separate from the ControlPlane client's http.Client.\n\n**MultiReporter Error Semantics**: The MultiReporter returns only the platform reporter's error. This is critical because the pipeline manager (Manager/Forwarder) uses the error to decide whether to retain the batch in the buffer for retry. Local endpoint errors should not trigger batch retention.\n\n**Wiring Pattern in up.go**: For each pipeline, before the manager constructor call, add: `var metricsReporter metrics.MetricsReporter = client` then `if cfg.Metrics.LocalEndpoint.URL != \"\" { localReporter := metrics.NewLocalReporter(...); metricsReporter = metrics.NewMultiReporter(client, localReporter, logger) }` then pass `metricsReporter` to `metrics.NewManager()`.\n\n**Key Files to Follow**: internal/api/endpoints.go (ControlPlane reporter pattern), internal/api/client.go (HTTP client construction pattern), internal/nodeapi/decrypt.go (DecryptSecret), internal/nodeapi/handler.go (SecretFetcher interface), internal/metrics/manager.go (MetricsReporter interface), internal/logfwd/source.go (LogReporter interface), internal/auditfwd/source.go (AuditReporter interface), internal/metrics/mock_manager_test.go (mock reporter test pattern), internal/api/types.go (batch types and LocalEndpointConfig).\n\n**Potential Pitfalls**: (1) The NSK is identity.NodeSecretKey as string, must be converted to []byte for DecryptSecret. (2) The ControlPlane client's FetchSecret takes (ctx, nodeID, key) - nodeID must be passed correctly. (3) json.Marshal of batch types uses type aliases (MetricBatch = []MetricPoint) so marshaling works directly. (4) AuditEntry.Subject and Object are json.RawMessage - ensure they survive marshal/unmarshal round-trip. (5) The HTTP POST should not use gzip compression (unlike ControlPlane client) to keep LocalReporter simple.",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T06:24:23.326320"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T08:25:03.439217"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T08:32:09.318165"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "0d8775e2-b806-403e-ba05-6a4e09e146c6",
+      "timestamp": "2026-02-18T08:32:09.318192",
+      "total_duration": 421.84987235069275,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 421.84987235069275,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
