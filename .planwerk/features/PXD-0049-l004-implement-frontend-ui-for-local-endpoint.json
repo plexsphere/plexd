@@ -1,0 +1,784 @@
+{
+  "feature_id": "PXD-0049",
+  "title": "L004: Implement frontend UI for local endpoint configuration",
+  "slug": "l004-implement-frontend-ui-for-local-endpoint",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 🏗️ large\n**Category:** frontend\n**Priority:** high\n**Source:** Proposed for 'It should be possible in Metrics, Log Forwarding u'\n\nAdd local endpoint configuration sections to the existing settings forms for Metrics, Log Forwarding, and Audit Forwarding in the frontend. Each section includes: URL text input (validated as HTTPS URL), secret key reference selector/dropdown (populated from available secrets), TLS insecure skip-verify toggle with warning tooltip. Form validation mirrors backend rules: secret key required when URL is set, URL format validation. Fields are conditionally shown/collapsed when local endpoint is not configured. The UI should follow existing form patterns and component library conventions used in the settings pages.\n\n**Rationale:** Without a UI, operators must hand-edit config files to use local endpoints, which is error-prone and inconsistent with how other pipeline settings are managed. The frontend provides discoverability, validation feedback, and a consistent configuration experience across all three pipelines.\n\n**Affected Areas:**\n- frontend/src/components/metrics/MetricsSettings.tsx\n- frontend/src/components/logfwd/LogForwardingSettings.tsx\n- frontend/src/components/auditfwd/AuditForwardingSettings.tsx\n- frontend/src/components/shared/LocalEndpointForm.tsx\n- frontend/src/types/config.ts",
+  "stories": [
+    {
+      "title": "Operator configures a local endpoint for Metrics pipeline",
+      "role": "operator",
+      "want": "to configure a local metrics endpoint (URL, secret key, TLS skip-verify) via the Metrics settings form",
+      "so_that": "metrics data is delivered to both the platform and my local monitoring stack without hand-editing config files",
+      "criteria": [
+        "LocalEndpointForm section appears within MetricsSettings when expanded",
+        "URL input accepts valid HTTPS URLs and rejects non-HTTPS/invalid URLs inline",
+        "Secret key dropdown is populated from available secrets via the node API",
+        "TLS insecure skip-verify toggle renders a warning tooltip when enabled",
+        "Form submits the LocalEndpointConfig fields as part of the metrics config payload"
+      ]
+    },
+    {
+      "title": "Operator configures a local endpoint for Log Forwarding pipeline",
+      "role": "operator",
+      "want": "to configure a local log forwarding endpoint via the Log Forwarding settings form",
+      "so_that": "logs are also forwarded to my local log aggregator alongside the platform",
+      "criteria": [
+        "LocalEndpointForm section appears within LogForwardingSettings",
+        "URL, secret key, and TLS skip-verify controls behave identically to the Metrics form",
+        "Form validation mirrors backend rules: secret key required when URL is set",
+        "Saving with valid data submits the local_endpoint fields nested under log_fwd config"
+      ]
+    },
+    {
+      "title": "Operator configures a local endpoint for Audit Forwarding pipeline",
+      "role": "operator",
+      "want": "to configure a local audit forwarding endpoint via the Audit Forwarding settings form",
+      "so_that": "audit data is also sent to my local SIEM alongside the platform",
+      "criteria": [
+        "LocalEndpointForm section appears within AuditForwardingSettings",
+        "URL, secret key, and TLS skip-verify controls behave identically to other pipelines",
+        "Form validation mirrors backend rules: secret key required when URL is set",
+        "Saving with valid data submits the local_endpoint fields nested under audit_fwd config"
+      ]
+    },
+    {
+      "title": "Operator sees validation errors for invalid local endpoint configuration",
+      "role": "operator",
+      "want": "to see clear inline validation errors when I enter invalid local endpoint data",
+      "so_that": "I can correct mistakes before submitting and avoid backend validation errors",
+      "criteria": [
+        "Entering a non-HTTPS URL shows inline error 'URL must use HTTPS scheme'",
+        "Entering an unparseable URL shows inline error 'Invalid URL format'",
+        "Setting a URL without selecting a secret key shows inline error 'Secret key is required when URL is set'",
+        "Clearing the URL also clears the validation requirement for secret key",
+        "Validation errors clear when the user corrects the input"
+      ]
+    },
+    {
+      "title": "Operator collapses/expands the local endpoint section",
+      "role": "operator",
+      "want": "the local endpoint section to be collapsed by default when not configured, and expanded when a URL is set",
+      "so_that": "the form is not cluttered with optional fields that most nodes don't use",
+      "criteria": [
+        "When LocalEndpointConfig is empty (zero-valued), the section renders collapsed with a summary like 'Not configured'",
+        "When LocalEndpointConfig has a URL set, the section renders expanded showing all fields",
+        "Clicking the section header toggles collapsed/expanded state",
+        "Collapsed state shows the configured URL as a summary when set"
+      ]
+    },
+    {
+      "title": "Operator removes a previously configured local endpoint",
+      "role": "operator",
+      "want": "to clear all local endpoint fields to disable the local endpoint",
+      "so_that": "the pipeline stops sending data to the local endpoint",
+      "criteria": [
+        "A 'Clear' or 'Remove' action is available when a URL is configured",
+        "Clearing the URL field resets secret key and TLS skip-verify to defaults",
+        "Submitting the form with empty URL sends a zero-valued LocalEndpointConfig to the backend",
+        "The section collapses after clearing"
+      ]
+    },
+    {
+      "title": "Reference documentation for LocalEndpointForm component",
+      "role": "developer",
+      "want": "reference documentation describing the LocalEndpointForm component props, validation rules, and integration",
+      "so_that": "other developers can integrate the component into new pipeline settings forms",
+      "criteria": [
+        "Docs describe the component props interface with all field types",
+        "Docs list all validation rules and their error messages",
+        "Docs include a usage example showing integration into a parent settings form",
+        "Docs reference the backend LocalEndpointConfig struct and validation rules"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The frontend SHALL provide a reusable LocalEndpointForm component with URL input, secret key selector, and TLS skip-verify toggle",
+      "priority": "SHALL",
+      "rationale": "All three pipelines use identical LocalEndpointConfig fields; a shared component prevents duplication and ensures consistency",
+      "scenarios": [
+        {
+          "name": "Component renders all three fields",
+          "when": "LocalEndpointForm is rendered with an empty config",
+          "then": "the URL text input, secret key dropdown, and TLS skip-verify toggle are all present",
+          "and_then": [
+            "URL input has placeholder text indicating HTTPS requirement",
+            "secret key dropdown shows 'Select a secret...' placeholder"
+          ]
+        },
+        {
+          "name": "Component renders with existing values",
+          "when": "LocalEndpointForm is rendered with a populated LocalEndpointConfig",
+          "then": "all fields display the current values from the config",
+          "and_then": [
+            "URL field shows the configured URL",
+            "secret key dropdown shows the selected key name",
+            "TLS toggle reflects the current skip-verify state"
+          ]
+        },
+        {
+          "name": "Component calls onChange on any field update",
+          "when": "the operator modifies any field in the form",
+          "then": "the onChange callback is invoked with the updated LocalEndpointConfig",
+          "and_then": [
+            "parent form receives the updated config without needing to track individual fields"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The frontend SHALL validate the URL field as a valid HTTPS URL with inline error display",
+      "priority": "SHALL",
+      "rationale": "Frontend validation mirrors backend rules (api.LocalEndpointConfig.Validate) to provide immediate feedback before submission",
+      "scenarios": [
+        {
+          "name": "Valid HTTPS URL accepted",
+          "when": "operator enters 'https://metrics.local:9090/ingest' in the URL field",
+          "then": "no validation error is displayed",
+          "and_then": [
+            "the URL field shows a valid state indicator"
+          ]
+        },
+        {
+          "name": "Non-HTTPS URL rejected",
+          "when": "operator enters 'http://metrics.local:9090/ingest' in the URL field",
+          "then": "an inline error 'URL must use HTTPS scheme' is displayed below the field",
+          "and_then": [
+            "the form submit button remains disabled while the error exists"
+          ]
+        },
+        {
+          "name": "Unparseable URL rejected",
+          "when": "operator enters 'not a valid url' in the URL field",
+          "then": "an inline error 'Invalid URL format' is displayed below the field",
+          "and_then": []
+        },
+        {
+          "name": "Empty URL is valid (means not configured)",
+          "when": "the URL field is empty",
+          "then": "no validation error is shown",
+          "and_then": [
+            "the secret key and TLS fields are either hidden or disabled"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The frontend SHALL require a secret key selection when the URL field is non-empty",
+      "priority": "SHALL",
+      "rationale": "Backend validation requires SecretKey when URL is set; frontend must mirror this to prevent server-side 400 errors",
+      "scenarios": [
+        {
+          "name": "Secret key required when URL is set",
+          "when": "operator enters a valid HTTPS URL but does not select a secret key",
+          "then": "an inline error 'Secret key is required when URL is set' is displayed on the secret key field",
+          "and_then": [
+            "the form cannot be submitted until a secret key is selected"
+          ]
+        },
+        {
+          "name": "Secret key not required when URL is empty",
+          "when": "the URL field is empty",
+          "then": "the secret key field shows no validation error regardless of selection state",
+          "and_then": []
+        },
+        {
+          "name": "Clearing URL clears secret key requirement",
+          "when": "operator has a URL and secret key set, then clears the URL",
+          "then": "the secret key validation error is removed",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The frontend SHALL populate the secret key dropdown from the node's available secrets",
+      "priority": "SHALL",
+      "rationale": "Secret keys reference existing secrets in the node's secret store; the dropdown prevents typos and shows available options",
+      "scenarios": [
+        {
+          "name": "Dropdown populated from secrets API",
+          "when": "the LocalEndpointForm mounts and the URL field is non-empty or the section is expanded",
+          "then": "the secret key dropdown is populated with secret key names from the node's secret index",
+          "and_then": [
+            "each option displays the secret key name"
+          ]
+        },
+        {
+          "name": "Empty secrets list shows placeholder",
+          "when": "the node has no secrets configured",
+          "then": "the dropdown shows a message 'No secrets available' and is effectively empty",
+          "and_then": []
+        },
+        {
+          "name": "Loading state while fetching secrets",
+          "when": "the secrets list is being fetched from the API",
+          "then": "the dropdown shows a loading indicator",
+          "and_then": [
+            "the dropdown becomes interactive once loading completes"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The frontend SHALL display a warning tooltip when TLS insecure skip-verify is enabled",
+      "priority": "SHALL",
+      "rationale": "Disabling TLS verification is a security-sensitive operation; operators should be warned about the implications",
+      "scenarios": [
+        {
+          "name": "Warning tooltip on toggle enable",
+          "when": "operator enables the TLS insecure skip-verify toggle",
+          "then": "a warning tooltip or inline message appears explaining the security implications",
+          "and_then": [
+            "the warning text states that TLS certificate verification will be disabled for this endpoint"
+          ]
+        },
+        {
+          "name": "No warning when toggle is off",
+          "when": "the TLS insecure skip-verify toggle is off (default)",
+          "then": "no warning is displayed",
+          "and_then": []
+        },
+        {
+          "name": "Toggle defaults to off",
+          "when": "LocalEndpointForm renders with a zero-valued config",
+          "then": "the TLS insecure skip-verify toggle is off",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The frontend SHALL conditionally show/collapse the local endpoint section based on configuration state",
+      "priority": "SHALL",
+      "rationale": "Most nodes don't use local endpoints; collapsed UI reduces visual noise while keeping the option discoverable",
+      "scenarios": [
+        {
+          "name": "Collapsed when not configured",
+          "when": "the LocalEndpointConfig has an empty URL",
+          "then": "the section is rendered in collapsed state showing 'Local Endpoint: Not configured'",
+          "and_then": [
+            "clicking the section header expands it to show all fields"
+          ]
+        },
+        {
+          "name": "Expanded when configured",
+          "when": "the LocalEndpointConfig has a non-empty URL",
+          "then": "the section is rendered in expanded state showing all fields with current values",
+          "and_then": [
+            "the collapsed summary shows the configured URL"
+          ]
+        },
+        {
+          "name": "Toggle expand/collapse",
+          "when": "operator clicks the section header",
+          "then": "the section toggles between collapsed and expanded states",
+          "and_then": [
+            "animation or transition is smooth and follows existing component library patterns"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The frontend SHALL integrate the LocalEndpointForm into all three pipeline settings forms (Metrics, LogForwarding, AuditForwarding)",
+      "priority": "SHALL",
+      "rationale": "All three observability pipelines support local endpoints with identical configuration structure",
+      "scenarios": [
+        {
+          "name": "MetricsSettings includes LocalEndpointForm",
+          "when": "the operator opens the Metrics settings page",
+          "then": "a 'Local Endpoint' section appears with the LocalEndpointForm component",
+          "and_then": [
+            "the form reads from and writes to metrics.local_endpoint config fields"
+          ]
+        },
+        {
+          "name": "LogForwardingSettings includes LocalEndpointForm",
+          "when": "the operator opens the Log Forwarding settings page",
+          "then": "a 'Local Endpoint' section appears with the LocalEndpointForm component",
+          "and_then": [
+            "the form reads from and writes to log_fwd.local_endpoint config fields"
+          ]
+        },
+        {
+          "name": "AuditForwardingSettings includes LocalEndpointForm",
+          "when": "the operator opens the Audit Forwarding settings page",
+          "then": "a 'Local Endpoint' section appears with the LocalEndpointForm component",
+          "and_then": [
+            "the form reads from and writes to audit_fwd.local_endpoint config fields"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The frontend SHALL define TypeScript types matching the backend LocalEndpointConfig struct",
+      "priority": "SHALL",
+      "rationale": "Type-safe frontend code must match the backend YAML/JSON config structure for correct serialization",
+      "scenarios": [
+        {
+          "name": "LocalEndpointConfig interface matches backend struct",
+          "when": "the TypeScript interface is defined in frontend/src/types/config.ts",
+          "then": "it includes url (string), secret_key (string), and tls_insecure_skip_verify (boolean) fields",
+          "and_then": [
+            "field names match the YAML keys used by the Go struct tags"
+          ]
+        },
+        {
+          "name": "Config types integrate with existing pipeline config interfaces",
+          "when": "MetricsConfig, LogFwdConfig, and AuditFwdConfig TypeScript interfaces are defined",
+          "then": "each includes an optional local_endpoint field of type LocalEndpointConfig",
+          "and_then": [
+            "the existing pipeline config fields remain unchanged"
+          ]
+        },
+        {
+          "name": "Zero-valued LocalEndpointConfig serializes correctly",
+          "when": "the user has not configured a local endpoint",
+          "then": "the LocalEndpointConfig serializes as an object with empty string url, empty string secret_key, and false tls_insecure_skip_verify",
+          "and_then": [
+            "or omitted entirely if the backend accepts missing fields as zero values"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The frontend SHOULD handle API errors gracefully when saving local endpoint configuration",
+      "priority": "SHOULD",
+      "rationale": "Backend validation may reject configuration that passes frontend validation (edge cases); errors must be surfaced",
+      "scenarios": [
+        {
+          "name": "Backend validation error displayed",
+          "when": "the form submits a config that the backend rejects with a validation error",
+          "then": "the error message from the backend is displayed to the operator inline or as a toast notification",
+          "and_then": [
+            "the form fields retain their values so the operator can correct them"
+          ]
+        },
+        {
+          "name": "Network error handled",
+          "when": "the save request fails due to a network error",
+          "then": "a retry-able error message is shown to the operator",
+          "and_then": [
+            "the form does not reset to previous values"
+          ]
+        },
+        {
+          "name": "Success feedback provided",
+          "when": "the configuration is saved successfully",
+          "then": "a success notification is shown",
+          "and_then": [
+            "the form reflects the saved state"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "The frontend SHOULD follow existing form patterns and component library conventions",
+      "priority": "SHOULD",
+      "rationale": "Visual and interaction consistency with existing settings pages improves operator experience",
+      "scenarios": [
+        {
+          "name": "Component uses existing form controls",
+          "when": "the LocalEndpointForm renders",
+          "then": "it uses the same input, select/dropdown, toggle, and tooltip components as other settings forms",
+          "and_then": [
+            "styling is consistent with existing settings pages"
+          ]
+        },
+        {
+          "name": "Form layout follows existing patterns",
+          "when": "the local endpoint section is part of a pipeline settings form",
+          "then": "label placement, spacing, error message positioning, and section grouping match existing form sections",
+          "and_then": []
+        },
+        {
+          "name": "Collapsible section follows existing patterns",
+          "when": "the settings pages have existing collapsible sections",
+          "then": "the local endpoint section uses the same collapsible component/pattern",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "1.1",
+      "title": "Define TypeScript types for LocalEndpointConfig and extend pipeline config interfaces (REQ-008)",
+      "description": "Create LocalEndpointConfig interface in frontend/src/types/config.ts with fields: url (string), secret_key (string), tls_insecure_skip_verify (boolean). Extend existing MetricsConfig, LogFwdConfig, and AuditFwdConfig interfaces with optional local_endpoint: LocalEndpointConfig field. Field names must match the backend Go struct YAML tags. Include JSDoc comments referencing the backend api.LocalEndpointConfig in internal/api/types.go.",
+      "level": 1,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "1.2",
+      "title": "Implement validateLocalEndpoint utility function with URL and secret key rules (REQ-002, REQ-003)",
+      "description": "Create a validation utility in frontend/src/utils/validateLocalEndpoint.ts (or alongside existing validation utils). Function accepts LocalEndpointConfig and returns a map of field-to-error-message. Validation rules: (1) if URL is non-empty, must be parseable and must have https:// scheme, (2) if URL is non-empty, secret_key must be non-empty. Error messages mirror backend: 'URL must use HTTPS scheme', 'Invalid URL format', 'Secret key is required when URL is set'. Write unit tests covering all validation scenarios: valid HTTPS URL, HTTP URL, unparseable URL, empty URL (valid), URL set without secret key, URL set with secret key, empty config.",
+      "level": 1,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-002",
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "1.3",
+      "title": "Create useSecrets hook to fetch available secret keys from the node API (REQ-004)",
+      "description": "Create a hook (e.g., useSecrets) that fetches the node's secret index from the platform API. The hook returns { secrets: SecretRef[], isLoading: boolean, error: Error | null }. The SecretRef type already exists with key and version fields. Follow existing hook patterns (SWR/React Query or custom fetch pattern used by the project). Write unit tests: loading state, success with secrets, empty list, error handling.",
+      "level": 1,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-004"
+      ]
+    },
+    {
+      "id": "2.1",
+      "title": "Implement LocalEndpointForm shared component with all three input controls (REQ-001, REQ-005, REQ-006)",
+      "description": "Create frontend/src/components/shared/LocalEndpointForm.tsx. Props: value (LocalEndpointConfig), onChange (callback), secrets (SecretRef[]), secretsLoading (boolean), disabled (boolean), pipeline (string for error message prefix). Component includes: (1) Collapsible section header showing 'Local Endpoint' with configured URL summary or 'Not configured', (2) URL text input with HTTPS placeholder, (3) Secret key dropdown populated from secrets prop with loading state, (4) TLS insecure skip-verify toggle with warning tooltip when enabled. Section is collapsed by default when URL is empty, expanded when URL is set. Inline validation errors from validateLocalEndpoint are shown on blur/change. Uses existing form components from the project's component library. Write component tests: renders collapsed when empty, renders expanded with values, shows validation errors, shows TLS warning tooltip, calls onChange on field updates, collapses/expands on header click.",
+      "level": 2,
+      "estimate_minutes": 30,
+      "requirements": [
+        "REQ-001",
+        "REQ-005",
+        "REQ-006"
+      ]
+    },
+    {
+      "id": "2.2",
+      "title": "Ensure LocalEndpointForm uses existing form components and layout patterns (REQ-010)",
+      "description": "Audit the existing settings forms (MetricsSettings, LogForwardingSettings, AuditForwardingSettings) to identify the exact form control components, layout patterns, collapsible section components, and tooltip components in use. Update LocalEndpointForm to use these exact components rather than custom implementations. Verify label placement, spacing, error message positioning, and section grouping match existing form sections. If the project has a Storybook or component showcase, add LocalEndpointForm stories. Write tests: component renders using the same form control components as existing settings pages, layout matches existing section patterns.",
+      "level": 2,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "3.1",
+      "title": "Integrate LocalEndpointForm into MetricsSettings page (REQ-007)",
+      "description": "Add LocalEndpointForm as a section within the existing MetricsSettings.tsx component. Wire the value and onChange to the metrics config's local_endpoint field. Use useSecrets hook for the secrets dropdown. Ensure the local endpoint fields are included in the form's save payload. Position the section after the existing metrics fields (enabled, collect_interval, report_interval, batch_size). Write component tests: LocalEndpointForm is rendered within MetricsSettings, changes to local endpoint fields update the parent form state, form save includes local_endpoint in payload.",
+      "level": 3,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-007"
+      ]
+    },
+    {
+      "id": "3.2",
+      "title": "Integrate LocalEndpointForm into LogForwardingSettings page (REQ-007)",
+      "description": "Add LocalEndpointForm as a section within the existing LogForwardingSettings.tsx component. Wire the value and onChange to the log_fwd config's local_endpoint field. Use useSecrets hook. Position after existing log forwarding fields. Write component tests: renders, updates state, includes in save payload.",
+      "level": 3,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-007"
+      ]
+    },
+    {
+      "id": "3.3",
+      "title": "Integrate LocalEndpointForm into AuditForwardingSettings page (REQ-007)",
+      "description": "Add LocalEndpointForm as a section within the existing AuditForwardingSettings.tsx component. Wire the value and onChange to the audit_fwd config's local_endpoint field. Use useSecrets hook. Position after existing audit forwarding fields. Write component tests: renders, updates state, includes in save payload.",
+      "level": 3,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-007"
+      ]
+    },
+    {
+      "id": "3.4",
+      "title": "Implement form-level save error handling for local endpoint backend validation errors (REQ-009)",
+      "description": "Extend the save handlers in all three settings pages to handle backend validation errors related to local_endpoint. When the backend returns a validation error matching the patterns 'local_endpoint: invalid URL', 'local_endpoint: URL must be HTTPS', or 'local_endpoint: SecretKey is required', map these to inline errors on the appropriate LocalEndpointForm fields. For non-field-specific errors, show a toast notification. Ensure the form retains field values after a failed save. Write tests: backend validation error maps to inline error, network error shows toast, successful save shows success toast.",
+      "level": 3,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "4.1",
+      "title": "Write reference documentation for LocalEndpointForm component (REQ-001, REQ-010)",
+      "description": "Create docs/reference/frontend/local-endpoint-form.md. Include: component props table (value, onChange, secrets, secretsLoading, disabled, pipeline), validation rules table matching backend rules, usage example showing integration into a settings form, field-to-backend mapping table showing how TypeScript LocalEndpointConfig maps to Go api.LocalEndpointConfig YAML tags. Reference the backend configuration docs at docs/reference/core/configuration.md.",
+      "level": 4,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-001",
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "5.1",
+      "title": "End-to-end test: configure local endpoint via Metrics settings and verify config save (REQ-001 through REQ-009)",
+      "description": "Write E2E/integration tests covering the full flow for the Metrics pipeline: (1) Open Metrics settings, verify local endpoint section is collapsed, (2) Expand section, enter valid HTTPS URL, select a secret key from dropdown, (3) Enable TLS skip-verify and verify warning tooltip appears, (4) Save form and verify the request payload includes correct local_endpoint fields, (5) Reload page and verify the saved values persist, (6) Clear URL and save, verify local_endpoint is reset. Also test validation: enter HTTP URL and verify error, enter URL without secret key and verify error.",
+      "level": 5,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-005",
+        "REQ-006",
+        "REQ-007",
+        "REQ-008",
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "5.2",
+      "title": "End-to-end test: verify consistent behavior across all three pipeline settings forms (REQ-007)",
+      "description": "Write E2E/integration tests verifying that Log Forwarding and Audit Forwarding settings forms have identical local endpoint behavior to Metrics: (1) Section appears in both forms, (2) Validation rules are identical (HTTPS URL, secret key required), (3) Save payload includes local_endpoint under the correct config path (log_fwd.local_endpoint, audit_fwd.local_endpoint), (4) Collapse/expand behavior is consistent across all three forms.",
+      "level": 5,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-007"
+      ]
+    }
+  ],
+  "test_specifications": [
+    {
+      "test_file": "frontend/src/utils/__tests__/validateLocalEndpoint.test.ts",
+      "test_function": "test_validates_valid_https_url",
+      "story": "Operator sees validation errors for invalid local endpoint configuration",
+      "expected": "Should return no errors for a valid HTTPS URL with secret key set",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "frontend/src/utils/__tests__/validateLocalEndpoint.test.ts",
+      "test_function": "test_rejects_http_url",
+      "story": "Operator sees validation errors for invalid local endpoint configuration",
+      "expected": "Should return URL error 'URL must use HTTPS scheme' for an HTTP URL",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "frontend/src/utils/__tests__/validateLocalEndpoint.test.ts",
+      "test_function": "test_rejects_unparseable_url",
+      "story": "Operator sees validation errors for invalid local endpoint configuration",
+      "expected": "Should return URL error 'Invalid URL format' for an unparseable URL string",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "frontend/src/utils/__tests__/validateLocalEndpoint.test.ts",
+      "test_function": "test_requires_secret_key_when_url_set",
+      "story": "Operator sees validation errors for invalid local endpoint configuration",
+      "expected": "Should return secret_key error 'Secret key is required when URL is set' when URL is non-empty and secret_key is empty",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "frontend/src/utils/__tests__/validateLocalEndpoint.test.ts",
+      "test_function": "test_empty_config_is_valid",
+      "story": "Operator sees validation errors for invalid local endpoint configuration",
+      "expected": "Should return no errors for a zero-valued config (all empty)",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "frontend/src/components/shared/__tests__/LocalEndpointForm.test.tsx",
+      "test_function": "test_renders_collapsed_when_url_empty",
+      "story": "Operator collapses/expands the local endpoint section",
+      "expected": "Should render the section in collapsed state showing 'Not configured' when URL is empty",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "frontend/src/components/shared/__tests__/LocalEndpointForm.test.tsx",
+      "test_function": "test_renders_expanded_when_url_set",
+      "story": "Operator collapses/expands the local endpoint section",
+      "expected": "Should render the section expanded with all fields when URL is non-empty",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "frontend/src/components/shared/__tests__/LocalEndpointForm.test.tsx",
+      "test_function": "test_shows_tls_warning_when_enabled",
+      "story": "Operator configures a local endpoint for Metrics pipeline",
+      "expected": "Should show a warning tooltip/message when TLS insecure skip-verify toggle is enabled",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "frontend/src/components/shared/__tests__/LocalEndpointForm.test.tsx",
+      "test_function": "test_populates_secret_key_dropdown",
+      "story": "Operator configures a local endpoint for Metrics pipeline",
+      "expected": "Should populate the secret key dropdown with the provided secrets array",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "frontend/src/components/shared/__tests__/LocalEndpointForm.test.tsx",
+      "test_function": "test_calls_onChange_on_field_update",
+      "story": "Operator configures a local endpoint for Metrics pipeline",
+      "expected": "Should call onChange with the updated LocalEndpointConfig when any field changes",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "frontend/src/components/shared/__tests__/LocalEndpointForm.test.tsx",
+      "test_function": "test_shows_inline_validation_errors",
+      "story": "Operator sees validation errors for invalid local endpoint configuration",
+      "expected": "Should show inline errors for invalid URL and missing secret key on blur",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "frontend/src/components/shared/__tests__/LocalEndpointForm.test.tsx",
+      "test_function": "test_shows_loading_state_for_secrets",
+      "story": "Operator configures a local endpoint for Metrics pipeline",
+      "expected": "Should show a loading indicator in the secret key dropdown when secretsLoading is true",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "frontend/src/hooks/__tests__/useSecrets.test.ts",
+      "test_function": "test_fetches_secret_index",
+      "story": "Operator configures a local endpoint for Metrics pipeline",
+      "expected": "Should fetch and return the list of available secret keys from the API",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "frontend/src/hooks/__tests__/useSecrets.test.ts",
+      "test_function": "test_handles_fetch_error",
+      "story": "Operator configures a local endpoint for Metrics pipeline",
+      "expected": "Should set error state when the secrets API call fails",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "frontend/src/components/metrics/__tests__/MetricsSettings.test.tsx",
+      "test_function": "test_includes_local_endpoint_form",
+      "story": "Operator configures a local endpoint for Metrics pipeline",
+      "expected": "Should render LocalEndpointForm within the MetricsSettings page",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "frontend/src/components/metrics/__tests__/MetricsSettings.test.tsx",
+      "test_function": "test_save_includes_local_endpoint_in_payload",
+      "story": "Operator configures a local endpoint for Metrics pipeline",
+      "expected": "Should include local_endpoint fields in the save request payload",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "frontend/src/components/logfwd/__tests__/LogForwardingSettings.test.tsx",
+      "test_function": "test_includes_local_endpoint_form",
+      "story": "Operator configures a local endpoint for Log Forwarding pipeline",
+      "expected": "Should render LocalEndpointForm within the LogForwardingSettings page",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "frontend/src/components/auditfwd/__tests__/AuditForwardingSettings.test.tsx",
+      "test_function": "test_includes_local_endpoint_form",
+      "story": "Operator configures a local endpoint for Audit Forwarding pipeline",
+      "expected": "Should render LocalEndpointForm within the AuditForwardingSettings page",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "frontend/src/types/__tests__/config.test.ts",
+      "test_function": "test_local_endpoint_config_serialization",
+      "story": "Reference documentation for LocalEndpointForm component",
+      "expected": "Should serialize LocalEndpointConfig to JSON matching backend YAML field names",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "frontend/src/types/__tests__/config.test.ts",
+      "test_function": "test_zero_valued_config_serialization",
+      "story": "Operator removes a previously configured local endpoint",
+      "expected": "Should serialize a zero-valued LocalEndpointConfig correctly (empty strings and false)",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "frontend/src/components/shared/__tests__/LocalEndpointForm.test.tsx",
+      "test_function": "test_renders_all_three_controls",
+      "story": "Operator configures a local endpoint for Metrics pipeline",
+      "expected": "Should render URL input, secret key dropdown, and TLS skip-verify toggle when section is expanded",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "frontend/src/utils/__tests__/validateLocalEndpoint.test.ts",
+      "test_function": "test_clearing_url_removes_secret_key_requirement",
+      "story": "Operator removes a previously configured local endpoint",
+      "expected": "Should return no errors when URL is cleared even if secret_key is also empty",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "frontend/src/components/shared/__tests__/LocalEndpointForm.test.tsx",
+      "test_function": "test_tls_toggle_defaults_to_off",
+      "story": "Operator configures a local endpoint for Metrics pipeline",
+      "expected": "Should render TLS insecure skip-verify toggle in off state for a zero-valued config",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "frontend/src/components/metrics/__tests__/MetricsSettings.test.tsx",
+      "test_function": "test_displays_backend_validation_error_on_save",
+      "story": "Operator sees validation errors for invalid local endpoint configuration",
+      "expected": "Should display backend validation error inline on the form when save returns a validation error for local_endpoint",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "frontend/src/components/metrics/__tests__/MetricsSettings.test.tsx",
+      "test_function": "test_shows_success_notification_on_save",
+      "story": "Operator configures a local endpoint for Metrics pipeline",
+      "expected": "Should show a success toast notification when the configuration is saved successfully",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "frontend/src/components/shared/__tests__/LocalEndpointForm.test.tsx",
+      "test_function": "test_uses_existing_form_controls",
+      "story": "Reference documentation for LocalEndpointForm component",
+      "expected": "Should render using the same input, dropdown, and toggle components used by other settings forms",
+      "requirement_id": "REQ-010"
+    },
+    {
+      "test_file": "frontend/src/components/shared/__tests__/LocalEndpointForm.test.tsx",
+      "test_function": "test_collapsible_section_matches_existing_pattern",
+      "story": "Operator collapses/expands the local endpoint section",
+      "expected": "Should use the same collapsible section component/pattern as existing settings page sections",
+      "requirement_id": "REQ-010"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-008) have corresponding passing tests",
+    "LocalEndpointForm component is reusable across all three pipeline settings forms with no pipeline-specific logic inside",
+    "Frontend validation rules exactly mirror backend LocalEndpointConfig.Validate() rules: HTTPS scheme required, SecretKey required when URL is set, empty config is valid",
+    "TypeScript LocalEndpointConfig field names match Go struct YAML tags (url, secret_key, tls_insecure_skip_verify)",
+    "Collapsible section correctly auto-expands when config has a URL and collapses when empty",
+    "TLS skip-verify toggle shows security warning tooltip that mentions disabling certificate verification",
+    "Secret key dropdown fetches from the secrets API and handles loading/empty/error states",
+    "All three settings pages (Metrics, LogForwarding, AuditForwarding) include the LocalEndpointForm with correct config path binding",
+    "Backend validation errors are surfaced to the user via inline errors or toast notifications",
+    "No pipeline-specific validation logic duplicated — all validation is in the shared validateLocalEndpoint utility"
+  ],
+  "implementation_notes": "This feature adds frontend UI for configuring local data-plane endpoints across the three observability pipelines (Metrics, Log Forwarding, Audit Forwarding). The backend support already exists (PXD-0048): api.LocalEndpointConfig in internal/api/types.go, per-pipeline LocalReporter and MultiReporter, wiring in cmd/plexd/cmd/up.go, config validation, and integration tests.\n\n**Architecture decisions:**\n- Single shared LocalEndpointForm component (frontend/src/components/shared/LocalEndpointForm.tsx) rather than three separate forms, since all pipelines use identical api.LocalEndpointConfig fields\n- Validation utility separate from the component for testability and reuse\n- useSecrets hook encapsulates API call for fetching available secret references (GET /v1/state/secrets returns the secret index with key names and versions, never values)\n- Collapsible section pattern to keep optional config out of the way for most users\n\n**Backend config structure (reference for frontend types):**\n- api.LocalEndpointConfig (internal/api/types.go): URL (string, yaml:\"url\"), SecretKey (string, yaml:\"secret_key\"), TLSInsecureSkipVerify (bool, yaml:\"tls_insecure_skip_verify\")\n- Validation: empty URL = valid (not configured), non-empty URL requires https scheme and non-empty SecretKey\n- Embedded in metrics.Config.LocalEndpoint, logfwd.Config.LocalEndpoint, auditfwd.Config.LocalEndpoint\n\n**Secret key resolution flow:**\n- The secret_key field is a reference to a secret name in the node's secret store\n- At runtime, the LocalReporter calls SecretFetcher.FetchSecret() with this key to get encrypted ciphertext, then DecryptSecret() to get the bearer token\n- The frontend dropdown should show available secret key names from the node's secret index (SecretRef[].Key)\n- The frontend does NOT handle secret values — it only selects the key name\n\n**Pitfalls to avoid:**\n- Don't confuse secret_key (a reference name like 'local-metrics-token') with actual secret values (bearer tokens). The frontend only deals with the reference name.\n- TLS skip-verify must default to false. The warning tooltip is critical because self-signed cert connections are a security risk in production.\n- The save payload must nest local_endpoint under the correct pipeline config key: metrics.local_endpoint, log_fwd.local_endpoint, audit_fwd.local_endpoint.\n- Empty URL means 'not configured' and must not send validation errors for secret_key.",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T06:24:23.327498"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T11:17:14.054869"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T11:25:32.213947"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "f5cd76e7-f856-41fd-84ef-662dbc05e72a",
+      "timestamp": "2026-02-18T11:25:32.213974",
+      "total_duration": 494.01698327064514,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 494.01698327064514,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
