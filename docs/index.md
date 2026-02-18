@@ -23,6 +23,47 @@ The Plexsphere node agent (`plexd`) is a lightweight daemon that runs on every m
 | `node` | **Active** | Default mode. Runs all core subsystems. |
 | `bridge` | **Active** | Extends node mode with bridge-specific subsystems (relay, ingress, user access, site-to-site). Enabled when `mode: bridge` and `bridge.enabled: true`. |
 
+## High-Level Overview
+
+```
+                              ┌───────────────────────┐
+                              │  Plexsphere           │
+                              │  Control Plane        │
+                              └───────────┬───────────┘
+                                          │
+                            HTTPS + SSE (outbound only)
+                                          │
+       ┌──────────────┬───────────────────┼──────────────────┬──────────────┐
+       ▼              ▼                   ▼                  ▼              ▼
+┌────────────┐ ┌────────────┐      ┌────────────┐    ┌────────────┐ ┌────────────┐
+│ Bare-Metal │ │     VM     │      │     VM     │    │    K8s     │ │  Bridge /  │
+│            │ │            │      │            │    │  Cluster   │ │  Gateway   │
+└─────┬──────┘ └─────┬──────┘      └─────┬──────┘    └─────┬──────┘ └──┬──────┬──┘
+      │              │                   │                 │           │      │
+      │◄════ Encrypted Mesh (direct P2P + NAT Traversal) ═════════════►│      │
+      │              │                   │                 │           │      │
+      └──────────────┴───────────────────┴─────────────────┘      ┌────┘      └────┐
+                                                                  │                │
+                                                                  ▼                ▼
+                                                           ┌──────────┐     ┌────────────┐
+                                                           │  User    │     │  External  │
+                                                           │  Access  │     │  Traffic   │
+                                                           │          │     │            │
+                                                           │ Tailscale│     │ Public IPs │
+                                                           │ Netbird  │     │ Site-to-   │
+                                                           │ WireGuard│     │ Site VPN   │
+                                                           └────┬─────┘     └──────┬─────┘
+                                                                │                  │
+                                                                ▼                  ▼
+                                                          ┌───────────┐   ┌──────────────┐
+                                                          │ Developers│   │ Public       │
+                                                          │ Admins    │   │ Internet     │
+                                                          │ On-Call   │   │ Partner Nets │
+                                                          └───────────┘   └──────────────┘
+```
+
+plexd communicates outbound only — no inbound ports or public IPs required on the node side. For detailed architecture diagrams, see [Architecture](guide/architecture.md).
+
 ## Guide
 
 - [Installation & Quick Start](guide/installation.md) — Install plexd and get running

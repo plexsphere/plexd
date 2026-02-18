@@ -17,45 +17,6 @@ title: Architecture
 
 **OS:** Linux (amd64, arm64)
 
-## High-Level Overview
-
-```
-                              ┌───────────────────────┐
-                              │  Plexsphere           │
-                              │  Control Plane        │
-                              └───────────┬───────────┘
-                                          │
-                            HTTPS + SSE (outbound only)
-                                          │
-       ┌──────────────┬───────────────────┼──────────────────┬──────────────┐
-       ▼              ▼                   ▼                  ▼              ▼
-┌────────────┐ ┌────────────┐      ┌────────────┐    ┌────────────┐ ┌────────────┐
-│ Bare-Metal │ │     VM     │      │     VM     │    │    K8s     │ │  Bridge /  │
-│            │ │            │      │            │    │  Cluster   │ │  Gateway   │
-└─────┬──────┘ └─────┬──────┘      └─────┬──────┘    └─────┬──────┘ └──┬──────┬──┘
-      │              │                   │                 │           │      │
-      │◄════ Encrypted Mesh (direct P2P + NAT Traversal) ═════════════►│      │
-      │              │                   │                 │           │      │
-      └──────────────┴───────────────────┴─────────────────┘      ┌────┘      └────┐
-                                                                  │                │
-                                                                  ▼                ▼
-                                                           ┌──────────┐     ┌────────────┐
-                                                           │  User    │     │  External  │
-                                                           │  Access  │     │  Traffic   │
-                                                           │          │     │            │
-                                                           │ Tailscale│     │ Public IPs │
-                                                           │ Netbird  │     │ Site-to-   │
-                                                           │ WireGuard│     │ Site VPN   │
-                                                           └────┬─────┘     └──────┬─────┘
-                                                                │                  │
-                                                                ▼                  ▼
-                                                          ┌───────────┐   ┌──────────────┐
-                                                          │ Developers│   │ Public       │
-                                                          │ Admins    │   │ Internet     │
-                                                          │ On-Call   │   │ Partner Nets │
-                                                          └───────────┘   └──────────────┘
-```
-
 ## Detailed Architecture
 
 ```
