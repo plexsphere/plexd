@@ -308,4 +308,4 @@ kubectl exec -n plexd-system <pod-name> -- ss -tlnp | grep 9100
 - [Kubernetes DaemonSet Deployment Reference](../reference/deployment/kubernetes-deployment.md) — Full reference for all types, interfaces, and manifests
 - [Audit Forwarding Reference](../reference/observability/audit-forwarding.md) — Audit data collection
 - [Bare-Metal Installation Guide](bare-metal-installation.md) — Bare-metal server installation
-- [Cloud VM Deployment Guide](cloud-vm-deployment.md) — Cloud VM deployment
+- [VM Deployment Guide](vm-deployment.md) — VM deployment

@@ -1,8 +1,8 @@
 ---
-title: Cloud VM Deployment Guide
+title: VM Deployment Guide
 ---
 
-# Cloud VM Deployment Guide
+# VM Deployment Guide
 
 Step-by-step guide for deploying plexd on cloud virtual machines using Cloud-Init.
 

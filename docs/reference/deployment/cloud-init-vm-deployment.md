@@ -189,4 +189,4 @@ Reference table for common cloud provider IMDS base URLs:
 
 - [Registration Reference](../core/registration.md) — Full registration package documentation
 - [Bare-Metal Installation Guide](../../how-to/bare-metal-installation.md) — Bare-metal server installation
-- [Cloud VM Deployment Guide](../../how-to/cloud-vm-deployment.md) — Step-by-step VM deployment guide
+- [VM Deployment Guide](../../how-to/vm-deployment.md) — Step-by-step VM deployment guide

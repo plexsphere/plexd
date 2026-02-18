@@ -88,7 +88,7 @@ For a detailed view of the control plane components, mesh topology, and bridge i
 Step-by-step guides for common operational tasks.
 
 - [Bare-Metal Installation](how-to/bare-metal-installation.md) — Install plexd on a bare-metal Linux server
-- [Cloud VM Deployment](how-to/cloud-vm-deployment.md) — Deploy plexd on cloud VMs using Cloud-Init
+- [VM Deployment](how-to/vm-deployment.md) — Deploy plexd on cloud VMs using Cloud-Init
 - [Kubernetes Deployment](how-to/kubernetes-deployment.md) — Deploy plexd as a DaemonSet on Kubernetes
 - [Using the Local Node API](how-to/local-node-api.md) — Read node state and write reports via the local API
 - [Creating Custom Hook Scripts](how-to/custom-hook-scripts.md) — Extend plexd with custom hook scripts for remote actions

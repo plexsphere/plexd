@@ -37,7 +37,7 @@ export default withMermaid(defineConfig({
         text: 'How-To Guides',
         items: [
           { text: 'Bare-Metal Installation', link: '/how-to/bare-metal-installation' },
-          { text: 'Cloud VM Deployment', link: '/how-to/cloud-vm-deployment' },
+          { text: 'VM Deployment', link: '/how-to/vm-deployment' },
           { text: 'Kubernetes Deployment', link: '/how-to/kubernetes-deployment' },
           { text: 'Local Node API', link: '/how-to/local-node-api' },
           { text: 'Custom Hook Scripts', link: '/how-to/custom-hook-scripts' },
