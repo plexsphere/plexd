@@ -26,7 +26,8 @@ The Plexsphere node agent (`plexd`) is a lightweight daemon that runs on every m
 ## Guide
 
 - [Installation & Quick Start](guide/installation.md) — Install plexd and get running
-- [Architecture & Agent Lifecycle](guide/architecture.md) — Platform support, architecture diagrams, agent lifecycle, heartbeat, SSE, deregistration
+- [Architecture](guide/architecture.md) — Platform support, architecture diagrams, mesh topology
+- [Agent Lifecycle](guide/agent-lifecycle.md) — Startup phases, heartbeat, SSE, deregistration, operational behavior
 - [Platform Communication & Mesh](guide/platform-communication.md) — Communication channels, node lifecycle, mesh topology, and capabilities
 - [Security & Trust Model](guide/security.md) — Key exchange, threat model, network requirements
 - [Troubleshooting](guide/troubleshooting.md) — Common issues and diagnostics

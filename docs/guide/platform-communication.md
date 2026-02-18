@@ -106,7 +106,7 @@ flowchart TD
     end
 ```
 
-See [Architecture & Agent Lifecycle](/guide/architecture) for the full startup sequence and shutdown details.
+See [Agent Lifecycle](/guide/agent-lifecycle) for the full startup sequence and shutdown details.
 
 ## The Encrypted Mesh Network
 
@@ -212,7 +212,8 @@ flowchart LR
 
 ## See Also
 
-- [Architecture & Agent Lifecycle](/guide/architecture) — full startup sequence, detailed ASCII diagrams, operational behavior
+- [Architecture](/guide/architecture) — detailed ASCII diagrams, platform support, mesh topology
+- [Agent Lifecycle](/guide/agent-lifecycle) — full startup sequence, operational behavior, deregistration
 - [Security & Trust Model](/guide/security) — key exchange, trust chain, threat model, network requirements
 - [Agent Internals](/concepts) — subsystem overview, goroutine map, shutdown sequence
 - [Control Plane Client](/reference/core/control-plane-client) — HTTP client implementation details
