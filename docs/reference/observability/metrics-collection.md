@@ -650,6 +650,10 @@ if cfg.Metrics.LocalEndpoint.URL != "" {
 mgr := metrics.NewManager(cfg.Metrics, collectors, metricsReporter, identity.NodeID, logger)
 ```
 
+### Integration Tests
+
+See [Local Endpoint Integration Tests](../development/local-endpoint-integration-tests.md) for the full integration test suite covering dual delivery, error isolation, credential resolution, and TLS skip-verify across all three pipelines.
+
 ### With wireguard.Manager
 
 `wireguard.Manager.PeerIndex()` can serve as the basis for a `PeerLister` implementation, providing the list of active peer IDs to the `LatencyCollector`.
