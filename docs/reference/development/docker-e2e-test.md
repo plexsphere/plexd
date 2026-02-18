@@ -8,7 +8,7 @@ feature: PXD-0038
 
 Validates that a containerised plexd agent successfully registers, sends heartbeats, retrieves state, reports capabilities, detects drift, and forwards metrics, logs, and audit events to the Central API. The test uses docker compose to orchestrate two services — `mock-api` (a fixture-based mock of the Central API) and `plexd` (the agent under test) — on an isolated bridge network.
 
-The test runs eight phases:
+The test runs ten phases:
 
 1. **Initial assertions** — all 8 counters >= 1 (agent started and contacted all endpoints)
 2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, metrics data, and drift timestamp
@@ -16,15 +16,18 @@ The test runs eight phases:
 4. **Log injection** — injects a log file via `docker cp`, verifies logs_count increases (FileSource pipeline works)
 5. **Agent restart for audit** — restarts plexd container, verifies audit_count increases (ProcessSource fires per-process)
 6. **SSE event injection** — injects a `node_state_updated` event and verifies state_count increases (proves SSE stream is connected)
-7. **Graceful shutdown** — stops plexd container, verifies exit code 0 and no crash indicators in logs
+7. **Local endpoint delivery** — all 3 local endpoint counters >= 1 (dual delivery to HTTPS local endpoint works)
+8. **Local endpoint body validation** — verifies non-empty JSON arrays received at each local endpoint
+9. **Dual delivery verification** — both platform and local counters >= 1 simultaneously (proves parallel delivery)
+10. **Graceful shutdown** — stops plexd container, verifies exit code 0 and no crash indicators in logs
 
 ## Service Topology
 
 ```
 ┌──────────────┐       ┌──────────────┐
 │   mock-api   │◄──────│    plexd     │
-│  :8080       │       │  (agent)     │
-│  healthcheck │       │  depends_on  │
+│  :8080 (HTTP)│       │  (agent)     │
+│  :8443 (TLS) │       │  depends_on  │
 │  /v1/ping    │       │  mock-api    │
 └──────────────┘       └──────────────┘
         │                      │
@@ -33,7 +36,7 @@ The test runs eight phases:
 
 | Service | Image | Port | Purpose |
 |---------|-------|------|---------|
-| `mock-api` | Built from `test/e2e/mockapi/Dockerfile` | 8080 (host: 18080) | Returns fixture responses, tracks call counters |
+| `mock-api` | Built from `test/e2e/mockapi/Dockerfile` | 8080 (host: 18080), 8443 (host: 18443) | Returns fixture responses, tracks call counters, TLS local endpoint |
 | `plexd` | Built from `deploy/docker/Dockerfile` | — | Agent under test, connects to mock-api |
 
 ### Startup Ordering
@@ -57,11 +60,14 @@ The test script polls `GET http://localhost:18080/test/assertions` every 2 secon
   "drift_count": 1,
   "metrics_count": 1,
   "logs_count": 1,
-  "audit_count": 1
+  "audit_count": 1,
+  "local_metrics_count": 1,
+  "local_logs_count": 1,
+  "local_audit_count": 1
 }
 ```
 
-The test passes when all eight counters are >= 1:
+Phase 1 passes when all eight platform counters are >= 1. Local endpoint counters are verified separately in Phases 7-9:
 
 | Counter | Meaning |
 |---------|---------|
@@ -73,6 +79,9 @@ The test passes when all eight counters are >= 1:
 | `metrics_count` | plexd called `POST /v1/nodes/{id}/metrics` |
 | `logs_count` | plexd called `POST /v1/nodes/{id}/logs` |
 | `audit_count` | plexd called `POST /v1/nodes/{id}/audit` |
+| `local_metrics_count` | plexd sent metrics to `POST /local/metrics` (TLS) |
+| `local_logs_count` | plexd sent logs to `POST /local/logs` (TLS) |
+| `local_audit_count` | plexd sent audit to `POST /local/audit` (TLS) |
 
 ### Phase 2: Request Body Validation
 
@@ -102,7 +111,19 @@ The `ProcessSource` uses `sync.Once` to emit a single `process_start` audit entr
 
 Injects a `node_state_updated` event via `POST /test/inject-event` and verifies that `state_count` increases, proving the SSE stream is connected and event-driven reconciliation works.
 
-### Phase 7: Graceful Shutdown
+### Phase 7: Local Endpoint Delivery
+
+Polls `GET /test/assertions` until `local_metrics_count`, `local_logs_count`, and `local_audit_count` are all >= 1 (timeout: 60s). This validates the full local endpoint credential chain: registration (32-byte NSK) → secret fetch → AES-256-GCM decryption → Bearer token → HTTPS POST to mock-api's TLS listener on `:8443`.
+
+### Phase 8: Local Endpoint Body Validation
+
+Uses `GET /test/last-request/local_{metrics,logs,audit}` to verify each local endpoint received a non-empty JSON array payload.
+
+### Phase 9: Dual Delivery Verification
+
+Asserts that both platform counters (`metrics_count`, `logs_count`, `audit_count`) and local counters (`local_metrics_count`, `local_logs_count`, `local_audit_count`) are all >= 1, proving parallel delivery to both the central API and the local endpoint.
+
+### Phase 10: Graceful Shutdown
 
 Stops the plexd container via `docker compose stop` (sends SIGTERM) and verifies:
 - Exit code is 0
@@ -115,7 +136,7 @@ The container receives configuration from three sources:
 
 | Source | Value | Purpose |
 |--------|-------|---------|
-| Config file (`/etc/plexd/config.yaml`) | Bind-mounted from `test/e2e/docker/plexd-e2e.yaml` | Sets `api.base_url`, `registration.data_dir`, `node_api.data_dir`, `heartbeat.node_id` |
+| Config file (`/etc/plexd/config.yaml`) | Bind-mounted from `test/e2e/docker/plexd-e2e.yaml` | Sets `api.base_url`, `registration.data_dir`, `node_api.data_dir`, `heartbeat.node_id`, `local_endpoint` blocks for metrics/log_fwd/audit_fwd |
 | CLI flag `--api` | `http://mock-api:8080` | Overrides API base URL (redundant with config, belt-and-suspenders) |
 | Env var `PLEXD_BOOTSTRAP_TOKEN` | `e2e-test-token` | Bootstrap token for registration |
 

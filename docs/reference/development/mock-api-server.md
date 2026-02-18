@@ -13,6 +13,7 @@ A fixture-based mock of the Central API for end-to-end testing. Returns static r
 | Option | Flag | Environment Variable | Default | Description |
 |--------|------|---------------------|---------|-------------|
 | Listen address | `-addr` | — | `:0` | TCP address (`host:port`) to listen on |
+| TLS listen address | `-tls-addr` | — | `:8443` | TLS address (`host:port`) for local endpoint handlers |
 
 The binary prints `MOCKAPI_ADDR=<address>` to stdout on startup, which allows test scripts to discover the dynamically assigned port when using `:0`.
 
@@ -41,7 +42,7 @@ Returns a fixture `RegisterResponse` with a node identity and two mesh peers. Ac
   "node_id": "node-mock-001",
   "mesh_ip": "10.99.0.1",
   "signing_public_key": "ed25519-mock-signing-pub-key",
-  "node_secret_key": "mock-node-secret-key-abc123",
+  "node_secret_key": "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
   "peers": [
     {
       "id": "peer-001",
@@ -314,7 +315,10 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "tunnel_ready_count": 0,
   "tunnel_closed_count": 0,
   "integrity_violation_count": 0,
-  "inject_event_count": 0
+  "inject_event_count": 0,
+  "local_metrics_count": 0,
+  "local_logs_count": 0,
+  "local_audit_count": 0
 }
 ```
 
@@ -392,6 +396,65 @@ Returns the raw request body captured from the last call to the specified endpoi
 
 **Error:** Returns `404` if no request has been captured for the given endpoint.
 
+## TLS Listener (Local Endpoints)
+
+The server runs a second listener on the TLS address (`-tls-addr`, default `:8443`) with a self-signed ECDSA P-256 certificate (DNS names: `mock-api`, `localhost`). This listener serves local endpoint handlers that simulate a secondary on-premises HTTPS endpoint with Bearer token authentication.
+
+The TLS certificate is generated at startup by `GenerateSelfSignedTLSConfig()` and is valid for 24 hours. Clients must use `tls_insecure_skip_verify: true` since the certificate is self-signed.
+
+The TLS listener serves a separate `http.ServeMux` (`TLSHandler()`) with the following routes:
+
+- `POST /local/metrics`
+- `POST /local/logs`
+- `POST /local/audit`
+- `GET /test/assertions` (same counters as the HTTP listener)
+- `GET /test/last-request/{endpoint}` (same capture store as the HTTP listener)
+
+### `POST /local/metrics`
+
+Accepts a metrics payload on the local endpoint. Requires Bearer token authentication.
+
+**Authentication:** `Authorization: Bearer e2e-local-bearer-token`
+
+**Response:** `204 No Content`
+
+**Counter:** Increments `local_metrics_count` on each successful call.
+
+**Error:** Returns `401 Unauthorized` if the `Authorization` header is missing, malformed, or contains the wrong token.
+
+### `POST /local/logs`
+
+Accepts a log payload on the local endpoint. Requires Bearer token authentication.
+
+**Authentication:** `Authorization: Bearer e2e-local-bearer-token`
+
+**Response:** `204 No Content`
+
+**Counter:** Increments `local_logs_count` on each successful call.
+
+**Error:** Returns `401 Unauthorized` if the `Authorization` header is missing, malformed, or contains the wrong token.
+
+### `POST /local/audit`
+
+Accepts an audit payload on the local endpoint. Requires Bearer token authentication.
+
+**Authentication:** `Authorization: Bearer e2e-local-bearer-token`
+
+**Response:** `204 No Content`
+
+**Counter:** Increments `local_audit_count` on each successful call.
+
+**Error:** Returns `401 Unauthorized` if the `Authorization` header is missing, malformed, or contains the wrong token.
+
+### Bearer Token Resolution
+
+The expected bearer token (`e2e-local-bearer-token`) is provisioned through the same credential chain that plexd uses in production:
+
+1. **Registration** — `POST /v1/register` returns `node_secret_key` (32 bytes, `ABCDEFGHIJKLMNOPQRSTUVWXYZ012345`)
+2. **Secret fetch** — `GET /v1/nodes/{id}/secrets/{key}` returns `ciphertext` and `nonce` (AES-256-GCM encrypted with the NSK)
+3. **Decryption** — plexd decrypts the ciphertext using `nodeapi.DecryptSecret(nsk, ciphertext, nonce)` to recover the bearer token
+4. **Authentication** — plexd sends `Authorization: Bearer e2e-local-bearer-token` on each request to the local endpoint
+
 ## Call Counters
 
 The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint increments its counter atomically before writing the response, ensuring accurate counts under concurrent access.
@@ -419,6 +482,9 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `tunnel_closed_count` | `POST /v1/nodes/{id}/tunnels/{sid}/closed` |
 | `integrity_violation_count` | `POST /v1/nodes/{id}/integrity/violations` |
 | `inject_event_count` | `POST /test/inject-event` |
+| `local_metrics_count` | `POST /local/metrics` (TLS) |
+| `local_logs_count` | `POST /local/logs` (TLS) |
+| `local_audit_count` | `POST /local/audit` (TLS) |
 
 Query current values via `GET /test/assertions`.
 
@@ -471,7 +537,7 @@ docker buildx build -f test/e2e/mockapi/Dockerfile \
 | Property | Value |
 |----------|-------|
 | User | `65534:65534` (nobody) |
-| Exposed port | `8080` |
+| Exposed ports | `8080` (HTTP), `8443` (TLS) |
 | Entrypoint | `/usr/local/bin/mockapi` |
 | Default CMD | `["-addr", ":8080"]` |
 
@@ -495,6 +561,20 @@ ts := httptest.NewServer(srv.Handler())
 defer ts.Close()
 
 // Use ts.URL as the base URL for plexd's API client
+```
+
+For TLS local endpoint testing:
+
+```go
+srv := mockapi.New()
+tlsCfg := mockapi.GenerateSelfSignedTLSConfig()
+ts := httptest.NewUnstartedServer(srv.TLSHandler())
+ts.TLS = tlsCfg
+ts.StartTLS()
+defer ts.Close()
+
+// srv.NSK() returns the 32-byte node secret key
+// srv.ExpectedBearerToken() returns "e2e-local-bearer-token"
 ```
 
 ## Source

@@ -13,9 +13,9 @@ Validates that plexd runs correctly as a systemd service by deploying it inside 
 ```
 ┌──────────────┐       ┌─────────────────────────┐
 │   mock-api   │◄──────│   systemd container     │
-│  :8080       │       │  (Ubuntu 24.04)         │
-│  /v1/ping    │       │  systemd PID 1          │
-│              │       │  plexd.service managed   │
+│  :8080 (HTTP)│       │  (Ubuntu 24.04)         │
+│  :8443 (TLS) │       │  systemd PID 1          │
+│  /v1/ping    │       │  plexd.service managed   │
 └──────────────┘       └─────────────────────────┘
         │                          │
         └──── plexd-systemd-e2e ───┘
@@ -71,11 +71,15 @@ Waits up to 60 seconds for `heartbeat_count`, `metrics_count`, and `logs_count` 
 
 The `ProcessSource` uses `sync.Once` to emit a single `process_start` audit entry per process lifetime. The test restarts the plexd service via `systemctl restart plexd`, creating a new process with a fresh `ProcessSource`, and verifies `audit_count` increases.
 
-### 10. Shutdown verification
+### 10. Local endpoint delivery
+
+Polls `GET /test/assertions` until `local_metrics_count`, `local_logs_count`, and `local_audit_count` are all >= 1 (timeout: 60s). Validates that the local endpoint credential chain works with systemd: NSK from registration → secret fetch → AES-256-GCM decryption → Bearer token → HTTPS POST to `plexd-e2e-mockapi:8443`.
+
+### 11. Shutdown verification
 
 Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged.
 
-### 11. Cleanup
+### 12. Cleanup
 
 The `cleanup` function runs on `EXIT` trap (both success and failure). It prints diagnostics on failure, then removes both containers and the Docker network.
 
@@ -92,11 +96,14 @@ The test polls `GET http://localhost:18080/test/assertions` which returns JSON c
   "drift_count": 1,
   "metrics_count": 1,
   "logs_count": 1,
-  "audit_count": 1
+  "audit_count": 1,
+  "local_metrics_count": 1,
+  "local_logs_count": 1,
+  "local_audit_count": 1
 }
 ```
 
-The test passes when all eight counters are >= 1:
+The test passes when all eight platform counters are >= 1 (initial assertions), and separately verifies that all three local endpoint counters are >= 1 (Phase 10):
 
 | Counter | Meaning |
 |---------|---------|
@@ -108,6 +115,9 @@ The test passes when all eight counters are >= 1:
 | `metrics_count` | plexd called `POST /v1/nodes/{id}/metrics` |
 | `logs_count` | plexd called `POST /v1/nodes/{id}/logs` |
 | `audit_count` | plexd called `POST /v1/nodes/{id}/audit` |
+| `local_metrics_count` | plexd sent metrics to `POST /local/metrics` (TLS) |
+| `local_logs_count` | plexd sent logs to `POST /local/logs` (TLS) |
+| `local_audit_count` | plexd sent audit to `POST /local/audit` (TLS) |
 
 ## plexd Configuration
 
@@ -126,16 +136,28 @@ metrics:
   enabled: true
   collect_interval: 5s
   report_interval: 10s
+  local_endpoint:
+    url: https://plexd-e2e-mockapi:8443/local/metrics
+    secret_key: local-bearer-token
+    tls_insecure_skip_verify: true
 log_fwd:
   enabled: true
   collect_interval: 5s
   report_interval: 10s
   file_patterns:
     - "/var/log/plexd/*.log"
+  local_endpoint:
+    url: https://plexd-e2e-mockapi:8443/local/logs
+    secret_key: local-bearer-token
+    tls_insecure_skip_verify: true
 audit_fwd:
   enabled: true
   collect_interval: 5s
   report_interval: 10s
+  local_endpoint:
+    url: https://plexd-e2e-mockapi:8443/local/audit
+    secret_key: local-bearer-token
+    tls_insecure_skip_verify: true
 ```
 
 The bootstrap token is set via the environment file at `/etc/plexd/environment` (`PLEXD_BOOTSTRAP_TOKEN=e2e-test-token`).
