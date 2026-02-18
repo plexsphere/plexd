@@ -1,0 +1,598 @@
+{
+  "feature_id": "PXD-0050",
+  "title": "L005: Document local endpoint configuration",
+  "slug": "l005-document-local-endpoint-configuration",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 📦 medium\n**Category:** docs\n**Priority:** medium\n**Source:** Proposed for 'It should be possible in Metrics, Log Forwarding u'\n\nDocument the new `local_endpoint` configuration fields for all three observability pipelines. Create or update config reference pages for metrics, log forwarding, and audit forwarding to include the `local_endpoint.url`, `local_endpoint.secret_key`, and `local_endpoint.tls_insecure_skip_verify` fields with descriptions, types, defaults, and validation rules. Add a guide page explaining how to set up local endpoint delivery: configuring the endpoint URL, creating and referencing secrets for bearer token auth via the existing encrypted secret mechanism, common use cases (forwarding to local Prometheus/Grafana, Loki, Elasticsearch/SIEM), and troubleshooting (TLS issues, credential errors, verifying delivery).\n\n**Rationale:** Users need clear documentation to adopt local endpoints correctly. The credential setup via SecretRef is non-obvious and requires step-by-step guidance. Without docs, support burden increases and adoption is limited to users who can reverse-engineer the config schema.\n\n**Affected Areas:**\n- docs/reference/metrics-config.md\n- docs/reference/log-forwarding-config.md\n- docs/reference/audit-forwarding-config.md\n- docs/guides/local-endpoint-setup.md",
+  "stories": [
+    {
+      "title": "Operator finds local_endpoint config fields in observability reference docs",
+      "role": "operator",
+      "want": "to see local_endpoint.url, local_endpoint.secret_key, and local_endpoint.tls_insecure_skip_verify documented in the metrics, log forwarding, and audit forwarding reference pages",
+      "so_that": "I can understand the field types, defaults, validation rules, and YAML structure without reading source code",
+      "criteria": [
+        "Each of the three observability reference pages (metrics-collection.md, log-forwarding.md, audit-forwarding.md) includes a 'Local Endpoint' subsection with a field table listing URL, SecretKey, and TLSInsecureSkipVerify with types, YAML keys, and descriptions",
+        "Each page includes validation rules table showing URL parsing, HTTPS scheme requirement, and SecretKey requirement",
+        "Each page includes a YAML snippet showing local_endpoint configuration within that pipeline's config block",
+        "The LocalEndpointConfig type is documented as shared across all three pipelines (defined in internal/api/types.go)"
+      ]
+    },
+    {
+      "title": "Operator finds local_endpoint fields in the Configuration Reference",
+      "role": "operator",
+      "want": "to see local_endpoint sub-fields listed in the metrics, log_fwd, and audit_fwd sections of the central Configuration Reference page",
+      "so_that": "I have a single source of truth for all plexd configuration without consulting multiple pages",
+      "criteria": [
+        "The metrics section in configuration.md includes local_endpoint.url, local_endpoint.secret_key, and local_endpoint.tls_insecure_skip_verify rows",
+        "The log_fwd section includes the same three local_endpoint rows",
+        "The audit_fwd section includes the same three local_endpoint rows",
+        "The complete annotated YAML example includes uncommented local_endpoint blocks for all three pipelines"
+      ]
+    },
+    {
+      "title": "Operator follows a step-by-step guide to set up local endpoint delivery",
+      "role": "operator",
+      "want": "a how-to guide that walks me through configuring local endpoint delivery from start to finish",
+      "so_that": "I can forward metrics, logs, or audit data to my local infrastructure (Prometheus, Loki, Elasticsearch) without reverse-engineering the config schema",
+      "criteria": [
+        "Guide includes prerequisites section (plexd running, HTTPS endpoint available, secret created in control plane)",
+        "Guide explains the credential flow: secret_key references a secret name in the control plane, which is fetched via FetchSecret and decrypted with the NSK to produce a bearer token",
+        "Guide includes numbered steps: create secret in control plane, configure local_endpoint in YAML, restart plexd, verify delivery",
+        "Guide covers all three pipelines (metrics, logs, audit) with pipeline-specific YAML examples"
+      ]
+    },
+    {
+      "title": "Operator troubleshoots local endpoint delivery failures",
+      "role": "operator",
+      "want": "a troubleshooting section covering common local endpoint issues (TLS errors, credential failures, delivery verification)",
+      "so_that": "I can diagnose and fix problems without opening a support ticket",
+      "criteria": [
+        "Troubleshooting table covers TLS handshake failures (self-signed certs, wrong CA, tls_insecure_skip_verify)",
+        "Troubleshooting table covers credential errors (missing secret, wrong secret key name, decryption failure)",
+        "Troubleshooting table covers delivery verification (checking plexd logs for 'local endpoint enabled', HTTP status codes)",
+        "Each troubleshooting entry includes symptom, cause, and fix columns"
+      ]
+    },
+    {
+      "title": "Operator understands common use cases for local endpoints",
+      "role": "operator",
+      "want": "to see examples of forwarding to popular observability tools (Prometheus, Grafana, Loki, Elasticsearch/SIEM)",
+      "so_that": "I can adapt the configuration to my specific monitoring stack",
+      "criteria": [
+        "Guide includes a use-cases section with at least three concrete examples",
+        "Each use case shows the specific YAML config and explains the endpoint URL format for that tool",
+        "Use cases cover metrics (Prometheus remote-write), logs (Loki), and audit (Elasticsearch/SIEM)",
+        "Examples clarify that the local endpoint receives the same JSON payload as the platform"
+      ]
+    },
+    {
+      "title": "Operator navigates to local endpoint docs from sidebar and cross-references",
+      "role": "operator",
+      "want": "the new how-to guide to appear in the VitePress sidebar and be cross-linked from reference pages",
+      "so_that": "I can discover the guide through normal documentation navigation",
+      "criteria": [
+        "The how-to guide appears in the 'How-To Guides' sidebar section in config.mts",
+        "Each observability reference page links to the how-to guide in its 'Local Endpoint' section",
+        "The how-to guide links back to each observability reference page for detailed field documentation",
+        "The Configuration Reference page links to the how-to guide from the local_endpoint field descriptions"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The three observability reference pages SHALL already contain complete Local Endpoint documentation",
+      "priority": "SHALL",
+      "rationale": "These pages were already updated as part of PXD-0047/PXD-0048. This feature verifies completeness and adds cross-links.",
+      "scenarios": [
+        {
+          "name": "Metrics reference is complete",
+          "when": "operator reads metrics-collection.md",
+          "then": "the page includes Local Endpoint field table, validation rules, LocalReporter, MultiReporter, credential resolution, and integration points sections",
+          "and_then": []
+        },
+        {
+          "name": "Log forwarding reference is complete",
+          "when": "operator reads log-forwarding.md",
+          "then": "the page includes the same Local Endpoint documentation structure",
+          "and_then": []
+        },
+        {
+          "name": "Audit forwarding reference is complete",
+          "when": "operator reads audit-forwarding.md",
+          "then": "the page includes the same Local Endpoint documentation structure",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The Configuration Reference page SHALL include local_endpoint fields in metrics, log_fwd, and audit_fwd sections",
+      "priority": "SHALL",
+      "rationale": "The config reference is the single source of truth for all YAML fields.",
+      "scenarios": [
+        {
+          "name": "All three pipeline sections include local_endpoint fields",
+          "when": "operator reads configuration.md",
+          "then": "the metrics, log_fwd, and audit_fwd tables each include local_endpoint.url, local_endpoint.secret_key, and local_endpoint.tls_insecure_skip_verify",
+          "and_then": []
+        },
+        {
+          "name": "Annotated YAML example includes local_endpoint",
+          "when": "operator reads the Complete Annotated Example",
+          "then": "each pipeline section shows a commented-out local_endpoint block",
+          "and_then": []
+        },
+        {
+          "name": "Types match source code",
+          "when": "operator compares config reference fields to source code",
+          "then": "the documented types (string, string, bool), YAML keys, and defaults match the LocalEndpointConfig struct in internal/api/types.go",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "A how-to guide SHALL be created at docs/how-to/local-endpoint-setup.md",
+      "priority": "SHALL",
+      "rationale": "Step-by-step guidance is essential for the non-obvious credential setup via SecretRef.",
+      "scenarios": [
+        {
+          "name": "Guide file exists",
+          "when": "the docs build runs",
+          "then": "docs/how-to/local-endpoint-setup.md exists and is valid markdown with frontmatter",
+          "and_then": []
+        },
+        {
+          "name": "Guide follows existing how-to pattern",
+          "when": "operator reads the guide",
+          "then": "the guide follows the same structure as docs/how-to/local-node-api.md: Prerequisites, numbered steps, Troubleshooting, Reference",
+          "and_then": []
+        },
+        {
+          "name": "Guide is self-contained",
+          "when": "operator follows the guide without reading reference docs",
+          "then": "the guide provides enough context to complete the setup, while linking to reference docs for deeper detail",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The how-to guide SHALL explain the credential resolution flow in user-facing terms",
+      "priority": "SHALL",
+      "rationale": "secret_key references a control plane secret name, not a literal token — this is the primary source of operator confusion.",
+      "scenarios": [
+        {
+          "name": "Credential flow explained",
+          "when": "operator reads the credential section",
+          "then": "the guide explains: secret_key = name of secret in control plane → plexd calls FetchSecret → decrypts with NSK → uses as bearer token",
+          "and_then": []
+        },
+        {
+          "name": "Secret creation step included",
+          "when": "operator follows the numbered steps",
+          "then": "the guide includes a step to create the secret in the control plane with the bearer token value",
+          "and_then": []
+        },
+        {
+          "name": "Cache behavior mentioned",
+          "when": "operator reads about token caching",
+          "then": "the guide mentions 5-minute TTL cache and stale-cache fallback",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The how-to guide SHALL include a troubleshooting section",
+      "priority": "SHALL",
+      "rationale": "Common failure modes need clear diagnostic steps to reduce support burden.",
+      "scenarios": [
+        {
+          "name": "TLS errors covered",
+          "when": "operator encounters TLS handshake failures",
+          "then": "the troubleshooting table lists: self-signed cert rejection, CA trust missing, tls_insecure_skip_verify usage and warning",
+          "and_then": []
+        },
+        {
+          "name": "Credential errors covered",
+          "when": "operator sees credential-related errors in logs",
+          "then": "the troubleshooting table lists: wrong secret_key name, secret not created, NSK mismatch",
+          "and_then": []
+        },
+        {
+          "name": "Delivery verification covered",
+          "when": "operator wants to confirm delivery is working",
+          "then": "the guide explains how to check plexd logs and verify the local endpoint is receiving data",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The how-to guide SHALL include use-case examples for popular observability tools",
+      "priority": "SHALL",
+      "rationale": "Concrete examples for Prometheus, Loki, and Elasticsearch reduce time-to-value.",
+      "scenarios": [
+        {
+          "name": "At least three use cases included",
+          "when": "operator reads the use-cases section",
+          "then": "the guide includes examples for metrics (Prometheus-compatible), logs (Loki-compatible), and audit (Elasticsearch/SIEM)",
+          "and_then": []
+        },
+        {
+          "name": "Each use case has YAML config",
+          "when": "operator reads a specific use case",
+          "then": "the use case includes a complete YAML config snippet and notes about the target tool's ingest endpoint",
+          "and_then": []
+        },
+        {
+          "name": "Payload format clarified",
+          "when": "operator wonders about data format",
+          "then": "the guide clarifies that the local endpoint receives identical JSON payloads to what the control plane receives",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The VitePress sidebar SHALL include the new how-to guide and the integration test reference page",
+      "priority": "SHALL",
+      "rationale": "Pages not in the sidebar are not discoverable through normal navigation.",
+      "scenarios": [
+        {
+          "name": "How-to guide in sidebar",
+          "when": "operator views the sidebar",
+          "then": "the 'How-To Guides' section includes a 'Local Endpoint Setup' entry linking to /how-to/local-endpoint-setup",
+          "and_then": []
+        },
+        {
+          "name": "Integration tests in sidebar",
+          "when": "operator views the Development section in sidebar",
+          "then": "a 'Local Endpoint Integration Tests' entry links to /reference/development/local-endpoint-integration-tests",
+          "and_then": []
+        },
+        {
+          "name": "Sidebar order is logical",
+          "when": "operator views the How-To section",
+          "then": "the Local Endpoint Setup guide is placed after the existing how-to guides in a logical order",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "Cross-links SHALL connect how-to guide, reference pages, and Configuration Reference bidirectionally",
+      "priority": "SHALL",
+      "rationale": "Diataxis framework requires cross-referencing between reference and how-to docs.",
+      "scenarios": [
+        {
+          "name": "Reference pages link to how-to",
+          "when": "operator reads any observability reference page's Local Endpoint section",
+          "then": "a cross-reference link to the how-to guide is present",
+          "and_then": []
+        },
+        {
+          "name": "How-to links to reference pages",
+          "when": "operator reads the Reference section of the how-to guide",
+          "then": "links to all three observability reference pages and the Configuration Reference are present",
+          "and_then": []
+        },
+        {
+          "name": "Configuration Reference links to how-to",
+          "when": "operator reads local_endpoint fields in configuration.md",
+          "then": "a note directs to the how-to guide for step-by-step setup instructions",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "The how-to guide SHALL document error isolation semantics",
+      "priority": "SHALL",
+      "rationale": "Operators need to know that local endpoint failures do not affect platform delivery.",
+      "scenarios": [
+        {
+          "name": "Error isolation stated clearly",
+          "when": "operator reads the guide",
+          "then": "the guide explicitly states that local endpoint failures are logged as warnings but never block or affect platform delivery",
+          "and_then": []
+        },
+        {
+          "name": "Parallel delivery explained",
+          "when": "operator reads about dual delivery",
+          "then": "the guide explains that data is sent to both targets concurrently and independently",
+          "and_then": []
+        },
+        {
+          "name": "No-retry semantics documented",
+          "when": "operator wonders about retry behavior",
+          "then": "the guide notes that local endpoint delivery is fire-and-forget without retry/backoff",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "1.1",
+      "title": "Verify and audit existing Local Endpoint documentation in observability reference pages (REQ-001)",
+      "description": "Read metrics-collection.md, log-forwarding.md, and audit-forwarding.md. Verify each contains: Local Endpoint field table, validation rules, YAML example, LocalReporter, MultiReporter, credential resolution, and integration point sections. Identify any gaps or inconsistencies. These pages were already updated in PXD-0047/PXD-0048 — this task audits completeness.",
+      "level": 1,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-001"
+      ]
+    },
+    {
+      "id": "1.2",
+      "title": "Verify existing local_endpoint fields in Configuration Reference (REQ-002)",
+      "description": "Read configuration.md. Verify metrics, log_fwd, and audit_fwd sections include local_endpoint.url, local_endpoint.secret_key, and local_endpoint.tls_insecure_skip_verify rows. Verify the Complete Annotated Example includes commented-out local_endpoint blocks for all three pipelines. These were added during the implementation features — audit for completeness.",
+      "level": 1,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-002"
+      ]
+    },
+    {
+      "id": "2.1",
+      "title": "Create how-to guide: docs/how-to/local-endpoint-setup.md — prerequisites and overview (REQ-003, REQ-009)",
+      "description": "Create docs/how-to/local-endpoint-setup.md with frontmatter, title, introduction, and prerequisites section. Follow the pattern established in docs/how-to/local-node-api.md and docs/how-to/custom-hook-scripts.md. Include: overview of local endpoint dual delivery (data sent to both platform and local endpoint in parallel), error isolation semantics (local failures logged but never block platform), fire-and-forget delivery model.",
+      "level": 2,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-003",
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "2.2",
+      "title": "Write how-to guide: credential resolution flow section (REQ-004)",
+      "description": "Add a section to the guide explaining the credential flow in user-facing terms: (1) operator creates a secret in the Plexsphere control plane containing the bearer token for the local endpoint, (2) operator sets secret_key in the YAML config to the secret's name, (3) at runtime, plexd calls FetchSecret via the control plane API, (4) decrypts the response with the NSK using AES-256-GCM, (5) uses the plaintext as a Bearer token in HTTP Authorization header. Mention 5-minute TTL cache and stale-cache fallback.",
+      "level": 2,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-004"
+      ]
+    },
+    {
+      "id": "2.3",
+      "title": "Write how-to guide: step-by-step configuration for all three pipelines (REQ-003)",
+      "description": "Add numbered steps to the guide: Step 1 — create the bearer token secret in the control plane. Step 2 — add local_endpoint block to the pipeline config in /etc/plexd/config.yaml (show YAML examples for metrics, log_fwd, and audit_fwd). Step 3 — restart plexd (systemctl restart plexd). Step 4 — verify delivery by checking logs (journalctl -u plexd | grep 'local endpoint enabled'). Include complete YAML snippets for each pipeline.",
+      "level": 2,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "2.4",
+      "title": "Write how-to guide: common use cases section (REQ-006)",
+      "description": "Add a 'Common Use Cases' section with three examples: (1) Forwarding metrics to a local Prometheus/Mimir instance — show endpoint URL format, note that the payload is JSON (not Prometheus remote-write format) and may need a receiver adapter. (2) Forwarding logs to Grafana Loki — show endpoint URL format, note JSON payload format. (3) Forwarding audit data to Elasticsearch/SIEM — show endpoint URL format, note JSON payload format. Clarify that the local endpoint receives identical JSON payloads to what the control plane receives.",
+      "level": 2,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-006"
+      ]
+    },
+    {
+      "id": "2.5",
+      "title": "Write how-to guide: troubleshooting section (REQ-005)",
+      "description": "Add a troubleshooting table to the guide covering: TLS handshake failure (self-signed cert → use tls_insecure_skip_verify or install CA cert, with warning about production use), credential fetch failure (wrong secret_key name → verify name in control plane), decryption failure (NSK mismatch → check if key rotation occurred), HTTP 4xx/5xx from local endpoint (check endpoint logs, verify URL path), no 'local endpoint enabled' log message (verify URL is non-empty and pipeline is enabled), delivery verification steps.",
+      "level": 2,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-005"
+      ]
+    },
+    {
+      "id": "2.6",
+      "title": "Write how-to guide: reference links section (REQ-008)",
+      "description": "Add a 'Reference' section at the bottom of the how-to guide linking to: Metrics Collection reference, Log Forwarding reference, Audit Forwarding reference, Configuration Reference, Key Storage reference (for NSK context). Follow the pattern from docs/how-to/local-node-api.md which ends with a Reference section.",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "3.1",
+      "title": "Add cross-links from observability reference pages to how-to guide (REQ-008)",
+      "description": "Add a cross-reference link in the Local Endpoint subsection of each observability reference page (metrics-collection.md, log-forwarding.md, audit-forwarding.md) pointing to the new how-to guide. Use the pattern: 'For a step-by-step setup guide, see [Setting Up Local Endpoint Delivery](../../how-to/local-endpoint-setup.md).' Place the link after the Local Endpoint field table or at the beginning of the section.",
+      "level": 3,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "3.2",
+      "title": "Add cross-link from Configuration Reference to how-to guide (REQ-008)",
+      "description": "Add a note in the metrics, log_fwd, and audit_fwd sections of configuration.md pointing to the how-to guide. Use pattern: 'For a step-by-step setup guide, see [Setting Up Local Endpoint Delivery](../../how-to/local-endpoint-setup.md).' Place after or below the local_endpoint field rows in each section.",
+      "level": 3,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "3.3",
+      "title": "Update VitePress sidebar config to include new how-to guide and integration test reference (REQ-007)",
+      "description": "Edit docs/.vitepress/config.mts to add: (1) { text: 'Local Endpoint Setup', link: '/how-to/local-endpoint-setup' } in the 'How-To Guides' sidebar section, after the 'Custom Hook Scripts' entry. (2) { text: 'Local Endpoint Integration Tests', link: '/reference/development/local-endpoint-integration-tests' } in the 'Development' sidebar section, after the 'Systemd E2E Test' entry.",
+      "level": 3,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-007"
+      ]
+    },
+    {
+      "id": "4.1",
+      "title": "Verify all documentation builds and renders correctly",
+      "description": "Run the VitePress build (npm run docs:build or equivalent) to verify all new and modified markdown files render without errors. Verify the sidebar entries resolve to valid pages. Check that all cross-links are valid relative paths.",
+      "level": 4,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-003",
+        "REQ-007"
+      ]
+    },
+    {
+      "id": "4.2",
+      "title": "Review all cross-links and verify bidirectional navigation",
+      "description": "Manually verify: (1) each observability reference page links to the how-to guide, (2) the how-to guide links back to each reference page, (3) the Configuration Reference links to the how-to guide, (4) the how-to guide links to the Configuration Reference. Ensure no broken links or circular references.",
+      "level": 4,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-008"
+      ]
+    }
+  ],
+  "test_specifications": [
+    {
+      "test_file": "docs/how-to/local-endpoint-setup.md",
+      "test_function": "manual_review_guide_structure",
+      "story": "Operator follows a step-by-step guide to set up local endpoint delivery",
+      "expected": "Guide follows the pattern of existing how-to guides: Prerequisites, numbered Steps, Troubleshooting table, Reference section",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "docs/how-to/local-endpoint-setup.md",
+      "test_function": "manual_review_credential_flow",
+      "story": "Operator follows a step-by-step guide to set up local endpoint delivery",
+      "expected": "Guide explains secret_key → FetchSecret → DecryptSecret → bearer token flow in user-facing terms",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "docs/how-to/local-endpoint-setup.md",
+      "test_function": "manual_review_troubleshooting",
+      "story": "Operator troubleshoots local endpoint delivery failures",
+      "expected": "Troubleshooting section covers TLS errors, credential failures, and delivery verification with Symptom/Cause/Fix columns",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "docs/how-to/local-endpoint-setup.md",
+      "test_function": "manual_review_use_cases",
+      "story": "Operator understands common use cases for local endpoints",
+      "expected": "Use cases section includes at least three examples (Prometheus, Loki, Elasticsearch) with YAML config snippets",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "docs/.vitepress/config.mts",
+      "test_function": "manual_review_sidebar_entries",
+      "story": "Operator navigates to local endpoint docs from sidebar and cross-references",
+      "expected": "Sidebar includes 'Local Endpoint Setup' in How-To section and 'Local Endpoint Integration Tests' in Development section",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": "docs/reference/observability/metrics-collection.md",
+      "test_function": "manual_review_cross_link_to_howto",
+      "story": "Operator navigates to local endpoint docs from sidebar and cross-references",
+      "expected": "Local Endpoint section includes a link to docs/how-to/local-endpoint-setup.md",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "docs/reference/observability/log-forwarding.md",
+      "test_function": "manual_review_cross_link_to_howto",
+      "story": "Operator navigates to local endpoint docs from sidebar and cross-references",
+      "expected": "Local Endpoint section includes a link to docs/how-to/local-endpoint-setup.md",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "docs/reference/observability/audit-forwarding.md",
+      "test_function": "manual_review_cross_link_to_howto",
+      "story": "Operator navigates to local endpoint docs from sidebar and cross-references",
+      "expected": "Local Endpoint section includes a link to docs/how-to/local-endpoint-setup.md",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "docs/reference/core/configuration.md",
+      "test_function": "manual_review_cross_link_to_howto",
+      "story": "Operator finds local_endpoint fields in the Configuration Reference",
+      "expected": "Metrics, log_fwd, and audit_fwd sections link to the how-to guide",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "docs/how-to/local-endpoint-setup.md",
+      "test_function": "manual_review_reference_links",
+      "story": "Operator navigates to local endpoint docs from sidebar and cross-references",
+      "expected": "Reference section links to all three observability reference pages and the Configuration Reference",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": "docs/how-to/local-endpoint-setup.md",
+      "test_function": "manual_review_error_isolation",
+      "story": "Operator follows a step-by-step guide to set up local endpoint delivery",
+      "expected": "Guide documents error isolation (local failures logged, never block platform), parallel delivery, and fire-and-forget semantics",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "docs/reference/observability/metrics-collection.md",
+      "test_function": "manual_review_local_endpoint_completeness",
+      "story": "Operator finds local_endpoint config fields in observability reference docs",
+      "expected": "Page contains Local Endpoint field table, validation rules, YAML example, LocalReporter, MultiReporter, and integration points",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "docs/reference/core/configuration.md",
+      "test_function": "manual_review_local_endpoint_fields",
+      "story": "Operator finds local_endpoint fields in the Configuration Reference",
+      "expected": "All three pipeline sections include local_endpoint.url, local_endpoint.secret_key, local_endpoint.tls_insecure_skip_verify fields with correct types",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "build_output",
+      "test_function": "vitepress_build_succeeds",
+      "story": "Operator navigates to local endpoint docs from sidebar and cross-references",
+      "expected": "VitePress build completes without errors; all pages resolve correctly",
+      "requirement_id": "REQ-007"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All local_endpoint fields (url, secret_key, tls_insecure_skip_verify) are documented in the three observability reference pages with field tables, types, and validation rules",
+    "Configuration Reference page includes local_endpoint fields in metrics, log_fwd, and audit_fwd sections with correct types matching internal/api/types.go LocalEndpointConfig struct",
+    "How-to guide at docs/how-to/local-endpoint-setup.md follows established patterns (Prerequisites → Steps → Troubleshooting → Reference) and is self-contained",
+    "Credential resolution flow (secret_key → FetchSecret → DecryptSecret → bearer token) is explained in user-facing terms without requiring source code knowledge",
+    "Troubleshooting table covers the three main failure categories: TLS errors, credential failures, and delivery verification",
+    "Cross-links are bidirectional: reference pages → how-to guide, how-to guide → reference pages, Configuration Reference → how-to guide",
+    "VitePress sidebar in config.mts includes the new how-to guide and the local endpoint integration tests reference page",
+    "VitePress build completes without errors and all new pages render correctly",
+    "All YAML examples use correct key names matching the actual config structure (local_endpoint.url, not localEndpoint.url)",
+    "No documentation refers to features or behaviors not implemented in the codebase (e.g., no mention of retry, mTLS, or OTLP)"
+  ],
+  "implementation_notes": "This is a documentation-only feature. No Go code changes are required.\n\n**Key architectural context for the guide writer:**\n- `LocalEndpointConfig` is defined once in `internal/api/types.go` and shared across all three pipelines (metrics, logfwd, auditfwd)\n- The `secret_key` field is a reference to a secret NAME in the control plane, NOT a literal token. The credential resolution flow is: FetchSecret(nodeID, secretKey) → DecryptSecret(nsk, ciphertext, nonce) → bearer token\n- The token is cached in memory with a 5-minute TTL; stale cached tokens are used as fallback when fetch/decrypt fails\n- Each pipeline has its own LocalReporter, MultiReporter, and SecretFetcher — they are not shared instances\n- The existing reference docs (metrics-collection.md, log-forwarding.md, audit-forwarding.md) already contain comprehensive Local Endpoint documentation added in PXD-0047 and PXD-0048\n- The Configuration Reference (configuration.md) already includes local_endpoint fields — added during the implementation features\n- The primary new content is the how-to guide (docs/how-to/local-endpoint-setup.md), cross-links, and sidebar updates\n\n**Patterns to follow:**\n- How-to guide structure: see docs/how-to/local-node-api.md and docs/how-to/custom-hook-scripts.md\n- Cross-reference pattern: see how reference pages link to each other (e.g., 'See [X Reference](../path)') \n- VitePress sidebar pattern: see existing entries in docs/.vitepress/config.mts\n\n**Important pitfalls to avoid:**\n- Do NOT document retry/backoff for local endpoints — it is explicitly fire-and-forget\n- Do NOT document mTLS or Basic auth — only bearer token auth is supported\n- Do NOT document payload transformation — local endpoint receives identical JSON to what the platform receives\n- The guide should clarify that the JSON payload format is specific to plexd, not a standard format like Prometheus remote-write or OpenTelemetry — a receiving adapter may be needed",
+  "status_history": {
+    "proposed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T06:24:23.328095"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T14:40:21.126741"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T14:44:49.146083"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "2eb09498-bcba-4c38-bd3f-e98452d30ba6",
+      "timestamp": "2026-02-18T14:44:49.146110",
+      "total_duration": 264.9331135749817,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 264.9331135749817,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}
