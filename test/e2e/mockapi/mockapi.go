@@ -6,12 +6,22 @@ package mockapi
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"strings"
 	"sync"
@@ -44,6 +54,9 @@ type AssertionCounters struct {
 	TunnelClosedCount      int64 `json:"tunnel_closed_count"`
 	IntegrityViolationCount int64 `json:"integrity_violation_count"`
 	InjectEventCount        int64 `json:"inject_event_count"`
+	LocalMetricsCount       int64 `json:"local_metrics_count"`
+	LocalLogsCount          int64 `json:"local_logs_count"`
+	LocalAuditCount         int64 `json:"local_audit_count"`
 }
 
 // DefaultKeepAliveInterval is the default interval between SSE keep-alive comments.
@@ -76,6 +89,9 @@ type Server struct {
 	tunnelClosedCount      atomic.Int64
 	integrityViolationCount atomic.Int64
 	injectEventCount        atomic.Int64
+	localMetricsCount       atomic.Int64
+	localLogsCount          atomic.Int64
+	localAuditCount         atomic.Int64
 
 	sseClients sync.Map // map[uint64]chan api.SignedEnvelope
 
@@ -92,6 +108,9 @@ type Server struct {
 
 	signingPrivateKey ed25519.PrivateKey
 	signingPublicKeyB64 string
+
+	nsk                []byte // 32-byte AES-256-GCM key for secret encryption
+	expectedBearerToken string // plaintext bearer token for local endpoint auth
 
 	mux *http.ServeMux
 }
@@ -111,6 +130,8 @@ func New() *Server {
 		mux:                 http.NewServeMux(),
 		signingPrivateKey:   priv,
 		signingPublicKeyB64: pubB64,
+		nsk:                 []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"), // exactly 32 bytes
+		expectedBearerToken: "e2e-local-bearer-token",
 		heartbeatFixture: api.HeartbeatResponse{
 			Reconcile:  true,
 			RotateKeys: false,
@@ -255,6 +276,9 @@ func (s *Server) Assertions() AssertionCounters {
 		TunnelClosedCount:      s.tunnelClosedCount.Load(),
 		IntegrityViolationCount: s.integrityViolationCount.Load(),
 		InjectEventCount:        s.injectEventCount.Load(),
+		LocalMetricsCount:       s.localMetricsCount.Load(),
+		LocalLogsCount:          s.localLogsCount.Load(),
+		LocalAuditCount:         s.localAuditCount.Load(),
 	}
 }
 
@@ -407,7 +431,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		NodeID:          "node-mock-001",
 		MeshIP:          "10.99.0.1",
 		SigningPublicKey: s.signingPublicKeyB64,
-		NodeSecretKey:   "mock-node-secret-key-abc123",
+		NodeSecretKey:   string(s.nsk),
 		Peers:           fixturePeers,
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -588,10 +612,11 @@ func (s *Server) handleDrift(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 	s.secretsCount.Add(1)
 	key := r.PathValue("key")
+	ct, nc := encryptSecret(s.nsk, s.expectedBearerToken)
 	resp := api.SecretResponse{
 		Key:        key,
-		Ciphertext: "bW9jay1jaXBoZXJ0ZXh0",
-		Nonce:      "bW9jay1ub25jZQ==",
+		Ciphertext: ct,
+		Nonce:      nc,
 		Version:    1,
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -818,6 +843,147 @@ func (s *Server) handleLastRequest(w http.ResponseWriter, r *http.Request) {
 		slog.Error("handleLastRequest: write failed", "error", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Local Endpoint Handlers (HTTPS :8443)
+// ---------------------------------------------------------------------------
+
+// encryptSecret encrypts plaintext using AES-256-GCM with the given NSK,
+// returning base64-encoded ciphertext and nonce.
+func encryptSecret(nsk []byte, plaintext string) (ciphertext, nonce string) {
+	block, err := aes.NewCipher(nsk)
+	if err != nil {
+		panic("mockapi: aes.NewCipher: " + err.Error())
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		panic("mockapi: cipher.NewGCM: " + err.Error())
+	}
+	nonceBytes := make([]byte, gcm.NonceSize())
+	ct := gcm.Seal(nil, nonceBytes, []byte(plaintext), nil)
+	return base64.StdEncoding.EncodeToString(ct), base64.StdEncoding.EncodeToString(nonceBytes)
+}
+
+// validateLocalAuth checks the Authorization header for the expected bearer token.
+// Returns true if valid, false (with 401 written) if invalid.
+func (s *Server) validateLocalAuth(w http.ResponseWriter, r *http.Request) bool {
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return false
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(auth, prefix) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return false
+	}
+	token := auth[len(prefix):]
+	if token != s.expectedBearerToken {
+		w.WriteHeader(http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+// handleLocalMetrics handles POST /local/metrics on the TLS listener.
+func (s *Server) handleLocalMetrics(w http.ResponseWriter, r *http.Request) {
+	if !s.validateLocalAuth(w, r) {
+		return
+	}
+	if _, err := s.captureBody("local_metrics", r); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.localMetricsCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleLocalLogs handles POST /local/logs on the TLS listener.
+func (s *Server) handleLocalLogs(w http.ResponseWriter, r *http.Request) {
+	if !s.validateLocalAuth(w, r) {
+		return
+	}
+	if _, err := s.captureBody("local_logs", r); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.localLogsCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleLocalAudit handles POST /local/audit on the TLS listener.
+func (s *Server) handleLocalAudit(w http.ResponseWriter, r *http.Request) {
+	if !s.validateLocalAuth(w, r) {
+		return
+	}
+	if _, err := s.captureBody("local_audit", r); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.localAuditCount.Add(1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// TLSHandler returns an http.Handler for the local endpoint TLS listener.
+// It registers local endpoint routes plus test assertion/last-request routes.
+func (s *Server) TLSHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /local/metrics", s.handleLocalMetrics)
+	mux.HandleFunc("POST /local/logs", s.handleLocalLogs)
+	mux.HandleFunc("POST /local/audit", s.handleLocalAudit)
+	mux.HandleFunc("GET /test/assertions", s.handleAssertions)
+	mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
+	return mux
+}
+
+// GenerateSelfSignedTLSConfig creates a self-signed TLS configuration with an
+// ECDSA key and X.509 certificate valid for "mock-api" and "localhost".
+func GenerateSelfSignedTLSConfig() *tls.Config {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic("mockapi: generate ECDSA key: " + err.Error())
+	}
+
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		panic("mockapi: generate serial number: " + err.Error())
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject:      pkix.Name{Organization: []string{"plexd-e2e-mock"}},
+		DNSNames:     []string{"mock-api", "localhost"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		panic("mockapi: create certificate: " + err.Error())
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		panic("mockapi: marshal ECDSA key: " + err.Error())
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		panic("mockapi: load X509 key pair: " + err.Error())
+	}
+
+	return &tls.Config{Certificates: []tls.Certificate{cert}}
+}
+
+// NSK returns the server's 32-byte node secret key (for testing).
+func (s *Server) NSK() []byte { return s.nsk }
+
+// ExpectedBearerToken returns the expected bearer token (for testing).
+func (s *Server) ExpectedBearerToken() string { return s.expectedBearerToken }
 
 // ---------------------------------------------------------------------------
 // Helpers

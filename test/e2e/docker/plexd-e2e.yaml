@@ -36,6 +36,10 @@ metrics:
   enabled: true
   collect_interval: 5s
   report_interval: 10s
+  local_endpoint:
+    url: https://mock-api:8443/local/metrics
+    secret_key: local-bearer-token
+    tls_insecure_skip_verify: true
 
 log_fwd:
   enabled: true
@@ -43,8 +47,16 @@ log_fwd:
   report_interval: 10s
   file_patterns:
     - "/var/log/plexd/*.log"
+  local_endpoint:
+    url: https://mock-api:8443/local/logs
+    secret_key: local-bearer-token
+    tls_insecure_skip_verify: true
 
 audit_fwd:
   enabled: true
   collect_interval: 5s
   report_interval: 10s
+  local_endpoint:
+    url: https://mock-api:8443/local/audit
+    secret_key: local-bearer-token
+    tls_insecure_skip_verify: true

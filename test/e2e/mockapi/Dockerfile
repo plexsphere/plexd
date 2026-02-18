@@ -31,6 +31,8 @@ USER 65534:65534
 
 # Mock Central API server port
 EXPOSE 8080
+# Local endpoint TLS port
+EXPOSE 8443
 
 ENTRYPOINT ["/usr/local/bin/mockapi"]
 CMD ["-addr", ":8080"]

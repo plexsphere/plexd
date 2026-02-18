@@ -5,6 +5,7 @@ services:
       dockerfile: test/e2e/mockapi/Dockerfile
     ports:
       - "18080:8080"
+      - "18443:8443"
     healthcheck:
       test: ["CMD", "/usr/local/bin/mockapi", "-check", "http://localhost:8080/v1/ping"]
       interval: 2s

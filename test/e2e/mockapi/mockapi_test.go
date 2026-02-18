@@ -2,6 +2,7 @@ package mockapi_test
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/nodeapi"
 	"github.com/plexsphere/plexd/test/e2e/mockapi"
 )
 
@@ -103,16 +105,30 @@ func getCapturedBody(t *testing.T, baseURL, endpoint string) []byte {
 	return data
 }
 
+// localCounterFields contains the JSON field names of local endpoint counters
+// that are only incremented via the TLS handler (not the main HTTP mux).
+var localCounterFields = map[string]bool{
+	"LocalMetricsCount": true,
+	"LocalLogsCount":    true,
+	"LocalAuditCount":   true,
+}
+
 // assertAllCountersEqual checks that every field in the AssertionCounters struct
 // equals the expected value. Useful for InitialZero and ConcurrentCounters tests.
+// Fields in localCounterFields are excluded from this check when want != 0
+// because they are only incremented via the TLS handler.
 func assertAllCountersEqual(t *testing.T, a mockapi.AssertionCounters, want int64) {
 	t.Helper()
 	v := reflect.ValueOf(a)
 	typ := v.Type()
 	for i := 0; i < v.NumField(); i++ {
+		name := typ.Field(i).Name
+		if want != 0 && localCounterFields[name] {
+			continue
+		}
 		got := v.Field(i).Int()
 		if got != want {
-			t.Errorf("%s = %d, want %d", typ.Field(i).Name, got, want)
+			t.Errorf("%s = %d, want %d", name, got, want)
 		}
 	}
 }
@@ -2533,5 +2549,178 @@ func TestConfigureHeartbeat_CapturesRequestBody(t *testing.T) {
 	}
 	if string(data) != body {
 		t.Errorf("captured body = %q, want %q", string(data), body)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Local Endpoint Tests
+// ---------------------------------------------------------------------------
+
+// newTLSTestServer creates a test server with the TLSHandler for local endpoints.
+func newTLSTestServer(t *testing.T) (*mockapi.Server, *httptest.Server) {
+	t.Helper()
+	srv := mockapi.New()
+	ts := httptest.NewTLSServer(srv.TLSHandler())
+	t.Cleanup(ts.Close)
+	return srv, ts
+}
+
+// tlsClient returns an HTTP client that skips TLS verification.
+func tlsClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+}
+
+func TestAssertions_IncludesLocalCounters(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/test/assertions")
+	if err != nil {
+		t.Fatalf("GET /test/assertions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, key := range []string{"local_metrics_count", "local_logs_count", "local_audit_count"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("assertions JSON missing key %q", key)
+		}
+	}
+}
+
+func TestLocalEndpoint_RequiresAuth(t *testing.T) {
+	_, ts := newTLSTestServer(t)
+	client := tlsClient()
+
+	for _, path := range []string{"/local/metrics", "/local/logs", "/local/audit"} {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(`[{"test":true}]`))
+		req.Header.Set("Content-Type", "application/json")
+		// No Authorization header.
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("POST %s without auth: status = %d, want %d", path, resp.StatusCode, http.StatusUnauthorized)
+		}
+	}
+}
+
+func TestLocalEndpoint_AcceptsValidAuth(t *testing.T) {
+	srv, ts := newTLSTestServer(t)
+	client := tlsClient()
+	token := srv.ExpectedBearerToken()
+
+	endpoints := []struct {
+		path    string
+		counter func() int64
+	}{
+		{"/local/metrics", func() int64 { return srv.Assertions().LocalMetricsCount }},
+		{"/local/logs", func() int64 { return srv.Assertions().LocalLogsCount }},
+		{"/local/audit", func() int64 { return srv.Assertions().LocalAuditCount }},
+	}
+
+	for _, ep := range endpoints {
+		before := ep.counter()
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+ep.path, strings.NewReader(`[{"test":true}]`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", ep.path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Errorf("POST %s with valid auth: status = %d, want %d", ep.path, resp.StatusCode, http.StatusNoContent)
+		}
+		after := ep.counter()
+		if after != before+1 {
+			t.Errorf("POST %s: counter = %d, want %d", ep.path, after, before+1)
+		}
+	}
+}
+
+func TestLocalEndpoint_RejectsWrongToken(t *testing.T) {
+	srv, ts := newTLSTestServer(t)
+	client := tlsClient()
+
+	endpoints := []struct {
+		path    string
+		counter func() int64
+	}{
+		{"/local/metrics", func() int64 { return srv.Assertions().LocalMetricsCount }},
+		{"/local/logs", func() int64 { return srv.Assertions().LocalLogsCount }},
+		{"/local/audit", func() int64 { return srv.Assertions().LocalAuditCount }},
+	}
+
+	for _, ep := range endpoints {
+		before := ep.counter()
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+ep.path, strings.NewReader(`[{"test":true}]`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer wrong-token-value")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", ep.path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("POST %s with wrong token: status = %d, want %d", ep.path, resp.StatusCode, http.StatusUnauthorized)
+		}
+		after := ep.counter()
+		if after != before {
+			t.Errorf("POST %s with wrong token: counter changed from %d to %d", ep.path, before, after)
+		}
+	}
+}
+
+func TestHandleSecrets_ReturnsDecryptableResponse(t *testing.T) {
+	srv, ts := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/secrets/local-bearer-token")
+	if err != nil {
+		t.Fatalf("GET secrets: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var secret api.SecretResponse
+	if err := json.NewDecoder(resp.Body).Decode(&secret); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	plaintext, err := nodeapi.DecryptSecret(srv.NSK(), secret.Ciphertext, secret.Nonce)
+	if err != nil {
+		t.Fatalf("DecryptSecret: %v", err)
+	}
+	if plaintext != srv.ExpectedBearerToken() {
+		t.Errorf("decrypted = %q, want %q", plaintext, srv.ExpectedBearerToken())
+	}
+}
+
+func TestRegister_Returns32ByteNSK(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Post(ts.URL+"/v1/register", "application/json", strings.NewReader(registerBody))
+	if err != nil {
+		t.Fatalf("POST /v1/register: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var reg api.RegisterResponse
+	if err := json.NewDecoder(resp.Body).Decode(&reg); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(reg.NodeSecretKey) != 32 {
+		t.Errorf("len(NodeSecretKey) = %d, want 32", len(reg.NodeSecretKey))
 	}
 }

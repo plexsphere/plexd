@@ -29,6 +29,9 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            - name: https
+              containerPort: 8443
+              protocol: TCP
           readinessProbe:
             httpGet:
               path: /v1/ping
@@ -65,4 +68,8 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+      protocol: TCP
+    - name: https
+      port: 8443
+      targetPort: https
       protocol: TCP

@@ -220,6 +220,10 @@ metrics:
   enabled: true
   collect_interval: 5s
   report_interval: 10s
+  local_endpoint:
+    url: https://${MOCKAPI_CONTAINER}:8443/local/metrics
+    secret_key: local-bearer-token
+    tls_insecure_skip_verify: true
 
 log_fwd:
   enabled: true
@@ -227,11 +231,19 @@ log_fwd:
   report_interval: 10s
   file_patterns:
     - \"/var/log/plexd/*.log\"
+  local_endpoint:
+    url: https://${MOCKAPI_CONTAINER}:8443/local/logs
+    secret_key: local-bearer-token
+    tls_insecure_skip_verify: true
 
 audit_fwd:
   enabled: true
   collect_interval: 5s
   report_interval: 10s
+  local_endpoint:
+    url: https://${MOCKAPI_CONTAINER}:8443/local/audit
+    secret_key: local-bearer-token
+    tls_insecure_skip_verify: true
 EOF"
 
 # Write environment file with bootstrap token.
@@ -623,6 +635,39 @@ if [ -n "${CAPS_BODY}" ]; then
 fi
 
 echo "=== Deeper body validation PASSED ==="
+
+# --- Local Endpoint Delivery ---
+echo "=== Polling for local endpoint delivery ==="
+LOCAL_TIMEOUT=60
+LOCAL_ELAPSED=0
+
+while [ "${LOCAL_ELAPSED}" -lt "${LOCAL_TIMEOUT}" ]; do
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        LOCAL_METRICS=$(get_counter "${RESPONSE}" "local_metrics_count")
+        LOCAL_LOGS=$(get_counter "${RESPONSE}" "local_logs_count")
+        LOCAL_AUDIT=$(get_counter "${RESPONSE}" "local_audit_count")
+        if [ "${LOCAL_METRICS}" -ge 1 ] && [ "${LOCAL_LOGS}" -ge 1 ] && [ "${LOCAL_AUDIT}" -ge 1 ]; then
+            echo "  PASS: local_metrics_count=${LOCAL_METRICS} >= 1"
+            echo "  PASS: local_logs_count=${LOCAL_LOGS} >= 1"
+            echo "  PASS: local_audit_count=${LOCAL_AUDIT} >= 1"
+            break
+        fi
+    fi
+    sleep 3
+    LOCAL_ELAPSED=$((LOCAL_ELAPSED + 3))
+done
+
+if [ "${LOCAL_ELAPSED}" -ge "${LOCAL_TIMEOUT}" ]; then
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    LOCAL_METRICS=$(get_counter "${RESPONSE}" "local_metrics_count")
+    LOCAL_LOGS=$(get_counter "${RESPONSE}" "local_logs_count")
+    LOCAL_AUDIT=$(get_counter "${RESPONSE}" "local_audit_count")
+    echo "  local_metrics_count=${LOCAL_METRICS}, local_logs_count=${LOCAL_LOGS}, local_audit_count=${LOCAL_AUDIT}"
+    fail "local endpoint delivery not met within ${LOCAL_TIMEOUT}s"
+fi
+
+echo "=== Local endpoint delivery PASSED ==="
 
 # --- Clean shutdown verification (REQ-005) ---
 echo "=== Stopping plexd service ==="

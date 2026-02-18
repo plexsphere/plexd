@@ -1391,6 +1391,116 @@ fi
 echo "=== Phase 13 PASSED: state mutation drift detection ==="
 
 # ===================================================================
+# Phase 14: Local Endpoint Delivery
+# ===================================================================
+echo "=== Polling for local endpoint delivery ==="
+LOCAL_TIMEOUT=60
+LOCAL_ELAPSED=0
+
+while [ "${LOCAL_ELAPSED}" -lt "${LOCAL_TIMEOUT}" ]; do
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        LOCAL_METRICS=$(get_counter "${RESPONSE}" "local_metrics_count")
+        LOCAL_LOGS=$(get_counter "${RESPONSE}" "local_logs_count")
+        LOCAL_AUDIT=$(get_counter "${RESPONSE}" "local_audit_count")
+        if [ "${LOCAL_METRICS}" -ge 1 ] && [ "${LOCAL_LOGS}" -ge 1 ] && [ "${LOCAL_AUDIT}" -ge 1 ]; then
+            echo "  PASS: local_metrics_count=${LOCAL_METRICS} >= 1"
+            echo "  PASS: local_logs_count=${LOCAL_LOGS} >= 1"
+            echo "  PASS: local_audit_count=${LOCAL_AUDIT} >= 1"
+            break
+        fi
+    fi
+    sleep 3
+    LOCAL_ELAPSED=$((LOCAL_ELAPSED + 3))
+done
+
+if [ "${LOCAL_ELAPSED}" -ge "${LOCAL_TIMEOUT}" ]; then
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    LOCAL_METRICS=$(get_counter "${RESPONSE}" "local_metrics_count")
+    LOCAL_LOGS=$(get_counter "${RESPONSE}" "local_logs_count")
+    LOCAL_AUDIT=$(get_counter "${RESPONSE}" "local_audit_count")
+    echo "  local_metrics_count=${LOCAL_METRICS}, local_logs_count=${LOCAL_LOGS}, local_audit_count=${LOCAL_AUDIT}"
+    fail "local endpoint delivery not met within ${LOCAL_TIMEOUT}s"
+fi
+
+echo "=== Phase 14 PASSED: local endpoint delivery ==="
+
+# ===================================================================
+# Phase 15: Local Endpoint Body Validation
+# ===================================================================
+echo "=== Validating local endpoint request bodies ==="
+
+# Local metrics body must be a JSON array with at least one entry.
+LOCAL_METRICS_BODY=$(curl -sf "http://localhost:18080/test/last-request/local_metrics" 2>/dev/null || true)
+if [ -z "${LOCAL_METRICS_BODY}" ]; then
+    fail "no captured local_metrics request body"
+fi
+LOCAL_METRICS_LEN=$(echo "${LOCAL_METRICS_BODY}" | jq 'if type == "array" then length else 1 end')
+if [ "${LOCAL_METRICS_LEN}" -ge 1 ]; then
+    echo "  PASS: local_metrics body has ${LOCAL_METRICS_LEN} entries"
+else
+    fail "local_metrics body is empty"
+fi
+
+# Local logs body must be a JSON array with at least one entry.
+LOCAL_LOGS_BODY=$(curl -sf "http://localhost:18080/test/last-request/local_logs" 2>/dev/null || true)
+if [ -z "${LOCAL_LOGS_BODY}" ]; then
+    fail "no captured local_logs request body"
+fi
+LOCAL_LOGS_LEN=$(echo "${LOCAL_LOGS_BODY}" | jq 'if type == "array" then length else 1 end')
+if [ "${LOCAL_LOGS_LEN}" -ge 1 ]; then
+    echo "  PASS: local_logs body has ${LOCAL_LOGS_LEN} entries"
+else
+    fail "local_logs body is empty"
+fi
+
+# Local audit body must be a JSON array with at least one entry.
+LOCAL_AUDIT_BODY=$(curl -sf "http://localhost:18080/test/last-request/local_audit" 2>/dev/null || true)
+if [ -z "${LOCAL_AUDIT_BODY}" ]; then
+    fail "no captured local_audit request body"
+fi
+LOCAL_AUDIT_LEN=$(echo "${LOCAL_AUDIT_BODY}" | jq 'if type == "array" then length else 1 end')
+if [ "${LOCAL_AUDIT_LEN}" -ge 1 ]; then
+    echo "  PASS: local_audit body has ${LOCAL_AUDIT_LEN} entries"
+else
+    fail "local_audit body is empty"
+fi
+
+echo "=== Phase 15 PASSED: local endpoint body validation ==="
+
+# ===================================================================
+# Phase 16: Dual Delivery Verification
+# ===================================================================
+echo "=== Verifying dual delivery (platform + local) ==="
+
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+PLAT_METRICS=$(get_counter "${RESPONSE}" "metrics_count")
+PLAT_LOGS=$(get_counter "${RESPONSE}" "logs_count")
+PLAT_AUDIT=$(get_counter "${RESPONSE}" "audit_count")
+LOCAL_METRICS=$(get_counter "${RESPONSE}" "local_metrics_count")
+LOCAL_LOGS=$(get_counter "${RESPONSE}" "local_logs_count")
+LOCAL_AUDIT=$(get_counter "${RESPONSE}" "local_audit_count")
+
+DUAL_PASS=1
+for pair in "metrics_count:${PLAT_METRICS}:local_metrics_count:${LOCAL_METRICS}" \
+            "logs_count:${PLAT_LOGS}:local_logs_count:${LOCAL_LOGS}" \
+            "audit_count:${PLAT_AUDIT}:local_audit_count:${LOCAL_AUDIT}"; do
+    IFS=: read -r plat_key plat_val local_key local_val <<< "${pair}"
+    if [ "${plat_val}" -ge 1 ] && [ "${local_val}" -ge 1 ]; then
+        echo "  PASS: ${plat_key}=${plat_val} >= 1 AND ${local_key}=${local_val} >= 1"
+    else
+        echo "  FAIL: ${plat_key}=${plat_val}, ${local_key}=${local_val} (both must be >= 1)"
+        DUAL_PASS=0
+    fi
+done
+
+if [ "${DUAL_PASS}" -eq 0 ]; then
+    fail "dual delivery verification failed"
+fi
+
+echo "=== Phase 16 PASSED: dual delivery verification ==="
+
+# ===================================================================
 # Phase 11: Graceful shutdown verification
 # ===================================================================
 echo "=== Testing graceful shutdown ==="
