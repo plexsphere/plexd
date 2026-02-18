@@ -563,3 +563,7 @@ fwd := logfwd.NewForwarder(cfg.LogFwd, sources, logReporter, identity.NodeID, ho
 ```
 
 When `LocalEndpoint.URL` is empty, no `MultiReporter` is created and behavior is identical to the single-reporter pipeline.
+
+### Integration Tests
+
+See [Local Endpoint Integration Tests](../development/local-endpoint-integration-tests.md) for the full integration test suite covering dual delivery, error isolation, credential resolution, and TLS skip-verify across all three pipelines.

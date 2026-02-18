@@ -2,8 +2,8 @@
   "feature_id": "PXD-0048",
   "title": "L003: Wire MultiReporter in up.go with integration tests",
   "slug": "l003-wire-multireporter-in-up-go-with-integration",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "approved",
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** backend\n**Priority:** high\n**Source:** Proposed for 'It should be possible in Metrics, Log Forwarding u'\n\nWire the MultiReporter into the main application startup in `up.go`: when `cfg.<Pipeline>.LocalEndpoint.URL` is non-empty, construct a `LocalReporter` with the configured URL and secret key, then wrap `[platformReporter, localReporter]` into a `MultiReporter` before passing to the pipeline's constructor. When URL is empty, behavior is unchanged (platform-only reporter). Add integration/E2E tests that spin up a mock local HTTP server alongside the platform mock, configure dual delivery, and verify both targets receive the correct JSON batches. Test error scenarios: local endpoint down (platform still receives data), invalid credentials, TLS skip-verify behavior.\n\n**Rationale:** Connects L001 config and L002 reporters into the running application. Integration tests validate the full path from config parsing through credential resolution to dual HTTP delivery, catching wiring bugs that unit tests miss. This is where the feature becomes functional end-to-end.\n\n**Affected Areas:**\n- src/cmd/up.go\n- src/internal/metrics/metrics.go\n- src/internal/logfwd/logfwd.go\n- src/internal/auditfwd/auditfwd.go\n- src/tests/integration/local_endpoint_test.go",
   "stories": [
@@ -399,6 +399,7 @@
       "title": "Create metrics pipeline integration test: dual delivery happy path (REQ-001, REQ-003, REQ-005, REQ-008)",
       "level": 1,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-003",
@@ -411,6 +412,7 @@
       "title": "Create logfwd pipeline integration test: dual delivery happy path (REQ-001, REQ-003, REQ-005, REQ-008)",
       "level": 1,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-003",
@@ -423,6 +425,7 @@
       "title": "Create auditfwd pipeline integration test: dual delivery happy path (REQ-001, REQ-003, REQ-005, REQ-008)",
       "level": 1,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-003",
@@ -435,6 +438,7 @@
       "title": "Add metrics integration test: local endpoint down, platform unaffected (REQ-004, REQ-009)",
       "level": 2,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-004",
         "REQ-009"
@@ -445,6 +449,7 @@
       "title": "Add logfwd integration test: local endpoint failure isolation (REQ-004, REQ-009)",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-004",
         "REQ-009"
@@ -455,6 +460,7 @@
       "title": "Add auditfwd integration test: local endpoint failure isolation (REQ-004, REQ-009)",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-004",
         "REQ-009"
@@ -465,6 +471,7 @@
       "title": "Add metrics integration test: credential resolution failure (REQ-005, REQ-009)",
       "level": 3,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-005",
         "REQ-009"
@@ -475,6 +482,7 @@
       "title": "Add metrics integration test: TLS skip-verify behavior (REQ-006, REQ-010)",
       "level": 3,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-006",
         "REQ-010"
@@ -485,6 +493,7 @@
       "title": "Add metrics integration test: platform-only when URL empty (REQ-002)",
       "level": 3,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-002"
       ]
@@ -494,6 +503,7 @@
       "title": "Add integration tests: selective pipeline configuration (REQ-002)",
       "level": 3,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-002"
       ]
@@ -503,6 +513,7 @@
       "title": "Add logfwd integration test: credential failure and TLS skip-verify (REQ-005, REQ-006, REQ-009, REQ-010)",
       "level": 4,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-005",
         "REQ-006",
@@ -515,6 +526,7 @@
       "title": "Add auditfwd integration test: credential failure and TLS skip-verify (REQ-005, REQ-006, REQ-009, REQ-010)",
       "level": 4,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-005",
         "REQ-006",
@@ -527,6 +539,7 @@
       "title": "Update Reference documentation for MultiReporter wiring and integration test patterns (REQ-001 to REQ-010)",
       "level": 5,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -687,6 +700,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-18T10:51:54.077531"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T10:52:09.523458"
+    },
+    "approved": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T11:16:59.946437"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T11:16:59.961641"
     }
   },
   "execution_history": [
@@ -700,6 +725,62 @@
           "name": "prepare",
           "duration": 289.6758110523224,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "febf71cb-2217-47d7-8c98-3ee1348bf573",
+      "timestamp": "2026-02-18T11:13:45.035669",
+      "total_duration": 1152.55237698555,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (3 tasks)",
+          "duration": 600.8563435077667,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (3 tasks)",
+          "duration": 29.577001571655273,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (4 tasks)",
+          "duration": 36.75609540939331,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 4 (2 tasks)",
+          "duration": 29.299720287322998,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 5 (1 tasks)",
+          "duration": 132.53243780136108,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0048] Code Review",
+          "duration": 156.17627382278442,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0048] Improvements",
+          "duration": 103.43801665306091,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[PXD-0048] Simplify",
+          "duration": 63.9164879322052,
+          "type": "simplify",
           "status": "done"
         }
       ]
