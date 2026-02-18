@@ -2,23 +2,707 @@
   "feature_id": "PXD-0048",
   "title": "L003: Wire MultiReporter in up.go with integration tests",
   "slug": "l003-wire-multireporter-in-up-go-with-integration",
-  "status": "proposed",
+  "status": "prepared",
   "phase": null,
   "summary": "",
   "description": "**Size:** 📦 medium\n**Category:** backend\n**Priority:** high\n**Source:** Proposed for 'It should be possible in Metrics, Log Forwarding u'\n\nWire the MultiReporter into the main application startup in `up.go`: when `cfg.<Pipeline>.LocalEndpoint.URL` is non-empty, construct a `LocalReporter` with the configured URL and secret key, then wrap `[platformReporter, localReporter]` into a `MultiReporter` before passing to the pipeline's constructor. When URL is empty, behavior is unchanged (platform-only reporter). Add integration/E2E tests that spin up a mock local HTTP server alongside the platform mock, configure dual delivery, and verify both targets receive the correct JSON batches. Test error scenarios: local endpoint down (platform still receives data), invalid credentials, TLS skip-verify behavior.\n\n**Rationale:** Connects L001 config and L002 reporters into the running application. Integration tests validate the full path from config parsing through credential resolution to dual HTTP delivery, catching wiring bugs that unit tests miss. This is where the feature becomes functional end-to-end.\n\n**Affected Areas:**\n- src/cmd/up.go\n- src/internal/metrics/metrics.go\n- src/internal/logfwd/logfwd.go\n- src/internal/auditfwd/auditfwd.go\n- src/tests/integration/local_endpoint_test.go",
-  "stories": [],
-  "requirements": [],
-  "tasks": [],
-  "test_specifications": [],
+  "stories": [
+    {
+      "title": "Platform receives data when local endpoint is not configured",
+      "role": "operator",
+      "want": "the three observability pipelines (metrics, logs, audit) to continue delivering data exclusively to the platform when no local endpoint URL is configured",
+      "so_that": "existing deployments with no local_endpoint config are unaffected by the MultiReporter wiring",
+      "criteria": [
+        "When cfg.Metrics.LocalEndpoint.URL is empty, the Manager receives the raw ControlPlane client (not a MultiReporter)",
+        "When cfg.LogFwd.LocalEndpoint.URL is empty, the Forwarder receives the raw ControlPlane client",
+        "When cfg.AuditFwd.LocalEndpoint.URL is empty, the Forwarder receives the raw ControlPlane client",
+        "No SecretFetcher calls are made when local endpoints are unconfigured"
+      ]
+    },
+    {
+      "title": "Both platform and local endpoint receive identical batches",
+      "role": "operator",
+      "want": "metrics, logs, and audit data to be delivered to both the platform and my local endpoint simultaneously when local_endpoint.url is configured",
+      "so_that": "I can ingest observability data into my own monitoring stack alongside the Plexsphere platform",
+      "criteria": [
+        "The platform mock and the local mock HTTP server both receive the same JSON batch body",
+        "Both targets receive the correct Authorization header (platform: node secret key, local: bearer token from SecretFetcher)",
+        "Delivery to both targets happens concurrently (not sequentially)",
+        "The log message 'local endpoint enabled' is emitted with pipeline name and URL for each configured pipeline"
+      ]
+    },
+    {
+      "title": "Platform delivery continues when local endpoint is down",
+      "role": "operator",
+      "want": "platform delivery to succeed even when my local endpoint is unreachable or returns errors",
+      "so_that": "a local infrastructure failure does not degrade my platform monitoring",
+      "criteria": [
+        "When local endpoint returns HTTP 500, platform still receives the batch successfully",
+        "When local endpoint is unreachable (connection refused), platform delivery is unaffected",
+        "Local endpoint errors are logged at WARN level with component name",
+        "The return value of ReportMetrics/ReportLogs/ReportAudit is the platform error (nil when platform succeeds)"
+      ]
+    },
+    {
+      "title": "Local endpoint receives bearer token from credential resolution",
+      "role": "operator",
+      "want": "the local endpoint to be authenticated with a bearer token resolved from the platform secret store",
+      "so_that": "my local endpoint is securely authenticated using the existing secret delivery mechanism",
+      "criteria": [
+        "LocalReporter calls SecretFetcher.FetchSecret with the configured secret_key name",
+        "The resolved token is sent as 'Authorization: Bearer {token}' header",
+        "Token is cached and reused within the 5-minute TTL",
+        "When SecretFetcher fails but a stale token exists, the stale token is used with a warning log"
+      ]
+    },
+    {
+      "title": "TLS skip-verify is respected for local endpoints",
+      "role": "operator",
+      "want": "to be able to configure tls_insecure_skip_verify for local endpoints using self-signed certificates",
+      "so_that": "I can use internal CA certificates or self-signed certs in development without TLS errors",
+      "criteria": [
+        "When tls_insecure_skip_verify is true, LocalReporter connects to endpoints with self-signed TLS certs without error",
+        "When tls_insecure_skip_verify is false (default), self-signed cert endpoints cause a TLS error",
+        "The TLS configuration only affects the local endpoint's HTTP client, not the platform client"
+      ]
+    },
+    {
+      "title": "Invalid credential causes local delivery failure without affecting platform",
+      "role": "operator",
+      "want": "the system to gracefully handle credential resolution failures for local endpoints",
+      "so_that": "a misconfigured secret_key does not prevent platform data delivery",
+      "criteria": [
+        "When FetchSecret returns an error and no cached token exists, the local reporter returns an error",
+        "The MultiReporter logs the local error as a warning but returns nil if platform succeeded",
+        "Platform data delivery is not blocked by credential resolution for local endpoint",
+        "Error messages include the pipeline component name for troubleshooting"
+      ]
+    },
+    {
+      "title": "Integration test validates end-to-end dual delivery for all three pipelines",
+      "role": "developer",
+      "want": "integration tests that exercise the full path from config parsing through MultiReporter wiring to dual HTTP delivery",
+      "so_that": "wiring bugs in up.go that unit tests cannot catch are detected before release",
+      "criteria": [
+        "Tests spin up mock HTTP servers for both platform and local endpoints",
+        "Tests configure the pipeline with LocalEndpoint.URL pointing to the mock local server",
+        "Tests verify that both servers receive the correct JSON payloads",
+        "Tests cover all three pipelines: metrics, logfwd, auditfwd"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The system SHALL construct a MultiReporter wrapping platform and local reporters when cfg.<Pipeline>.LocalEndpoint.URL is non-empty",
+      "priority": "SHALL",
+      "rationale": "Core wiring logic that enables dual-destination delivery",
+      "scenarios": [
+        {
+          "name": "Metrics MultiReporter wired when URL configured",
+          "when": "cfg.Metrics.LocalEndpoint.URL is 'https://metrics.local:9090/ingest'",
+          "then": "the Manager receives a MultiReporter that dispatches to both ControlPlane and LocalReporter",
+          "and_then": [
+            "logger.Info is called with pipeline=metrics and the configured URL"
+          ]
+        },
+        {
+          "name": "LogFwd MultiReporter wired when URL configured",
+          "when": "cfg.LogFwd.LocalEndpoint.URL is 'https://logs.local:9090/ingest'",
+          "then": "the Forwarder receives a MultiReporter that dispatches to both ControlPlane and LocalReporter",
+          "and_then": [
+            "logger.Info is called with pipeline=logfwd and the configured URL"
+          ]
+        },
+        {
+          "name": "AuditFwd MultiReporter wired when URL configured",
+          "when": "cfg.AuditFwd.LocalEndpoint.URL is 'https://audit.local:9090/ingest'",
+          "then": "the Forwarder receives a MultiReporter that dispatches to both ControlPlane and LocalReporter",
+          "and_then": [
+            "logger.Info is called with pipeline=auditfwd and the configured URL"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The system SHALL pass the platform reporter directly (not MultiReporter) when cfg.<Pipeline>.LocalEndpoint.URL is empty",
+      "priority": "SHALL",
+      "rationale": "Zero-overhead when local endpoints are not configured",
+      "scenarios": [
+        {
+          "name": "Empty URL uses platform-only reporter",
+          "when": "cfg.Metrics.LocalEndpoint.URL is empty",
+          "then": "the Manager receives the ControlPlane client directly as its MetricsReporter",
+          "and_then": [
+            "no 'local endpoint enabled' log message is emitted"
+          ]
+        },
+        {
+          "name": "Zero-valued LocalEndpointConfig uses platform-only reporter",
+          "when": "cfg.LogFwd.LocalEndpoint is a zero-valued struct",
+          "then": "the Forwarder receives the ControlPlane client directly as its LogReporter",
+          "and_then": [
+            "no LocalReporter is constructed"
+          ]
+        },
+        {
+          "name": "All pipelines independent",
+          "when": "only cfg.Metrics.LocalEndpoint.URL is configured, logfwd and auditfwd are empty",
+          "then": "only the metrics pipeline uses MultiReporter; logfwd and auditfwd use platform-only",
+          "and_then": [
+            "each pipeline is independently configurable"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The system SHALL deliver identical JSON batches to both platform and local endpoints concurrently",
+      "priority": "SHALL",
+      "rationale": "The local endpoint must receive the exact same payload as the platform for data consistency",
+      "scenarios": [
+        {
+          "name": "Both targets receive same metrics batch",
+          "when": "the metrics Manager flushes a batch of 3 MetricPoints",
+          "then": "both the platform and local HTTP servers receive a POST with the same 3-element JSON array",
+          "and_then": [
+            "Content-Type is application/json on both requests"
+          ]
+        },
+        {
+          "name": "Both targets receive same log batch",
+          "when": "the log Forwarder flushes a batch of 5 LogEntries",
+          "then": "both platform and local receive POST requests with identical 5-element JSON arrays",
+          "and_then": []
+        },
+        {
+          "name": "Both targets receive same audit batch",
+          "when": "the audit Forwarder flushes a batch of 2 AuditEntries",
+          "then": "both platform and local receive POST requests with identical 2-element JSON arrays",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The system SHALL continue platform delivery when the local endpoint fails",
+      "priority": "SHALL",
+      "rationale": "Local endpoint failures must never degrade platform data delivery",
+      "scenarios": [
+        {
+          "name": "Local endpoint returns HTTP 500",
+          "when": "the local endpoint returns HTTP 500 for a metrics batch",
+          "then": "ReportMetrics returns nil (platform succeeded) and logs a warning about local failure",
+          "and_then": [
+            "the platform received the batch successfully"
+          ]
+        },
+        {
+          "name": "Local endpoint connection refused",
+          "when": "the local endpoint is unreachable (connection refused)",
+          "then": "ReportMetrics returns nil (platform succeeded) and logs a warning",
+          "and_then": [
+            "no retry is attempted for the local endpoint"
+          ]
+        },
+        {
+          "name": "Local endpoint slow does not block platform",
+          "when": "the local endpoint takes 5 seconds to respond but platform responds in 10ms",
+          "then": "MultiReporter still waits for both but returns the platform result",
+          "and_then": [
+            "total time is bounded by the slower endpoint"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "The system SHALL authenticate local endpoint requests with a bearer token resolved from SecretFetcher",
+      "priority": "SHALL",
+      "rationale": "Credentials are resolved through the existing encrypted secret delivery pipeline for security",
+      "scenarios": [
+        {
+          "name": "Bearer token in Authorization header",
+          "when": "LocalReporter sends a POST to the local endpoint",
+          "then": "the request includes 'Authorization: Bearer {decrypted_token}' header",
+          "and_then": [
+            "the token was obtained via FetchSecret + DecryptSecret"
+          ]
+        },
+        {
+          "name": "Credential resolution failure with no cache",
+          "when": "FetchSecret returns an error and no cached token exists",
+          "then": "LocalReporter returns an error and no HTTP POST is made",
+          "and_then": [
+            "MultiReporter logs the error and returns nil if platform succeeded"
+          ]
+        },
+        {
+          "name": "Stale cache used on fetch failure",
+          "when": "FetchSecret fails but a previous token is cached (expired TTL)",
+          "then": "the stale cached token is used and a warning is logged",
+          "and_then": [
+            "the HTTP POST is made with the stale token"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The system SHALL respect tls_insecure_skip_verify for local endpoint connections",
+      "priority": "SHALL",
+      "rationale": "Operators may use self-signed certificates for internal local endpoints",
+      "scenarios": [
+        {
+          "name": "Skip verify allows self-signed certs",
+          "when": "tls_insecure_skip_verify is true and the local endpoint has a self-signed TLS certificate",
+          "then": "the HTTP POST succeeds without TLS verification errors",
+          "and_then": []
+        },
+        {
+          "name": "Default verify rejects self-signed certs",
+          "when": "tls_insecure_skip_verify is false and the local endpoint has a self-signed certificate",
+          "then": "the HTTP POST fails with a TLS certificate verification error",
+          "and_then": [
+            "the error is logged as a warning by MultiReporter"
+          ]
+        },
+        {
+          "name": "TLS settings are per-client",
+          "when": "tls_insecure_skip_verify is true for the local endpoint",
+          "then": "only the LocalReporter's HTTP client has InsecureSkipVerify=true",
+          "and_then": [
+            "the platform client's TLS settings are unaffected"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The system SHALL construct LocalReporter with the correct parameters from config and runtime identity",
+      "priority": "SHALL",
+      "rationale": "Wiring correctness: LocalReporter must receive the endpoint config, the ControlPlane as SecretFetcher, the NSK bytes, and the node ID",
+      "scenarios": [
+        {
+          "name": "LocalReporter receives correct config",
+          "when": "cfg.Metrics.LocalEndpoint has URL, SecretKey, and TLSInsecureSkipVerify set",
+          "then": "NewLocalReporter is called with that config, the ControlPlane client as fetcher, identity NSK, and identity NodeID",
+          "and_then": []
+        },
+        {
+          "name": "NSK bytes passed correctly",
+          "when": "the node secret key is used for LocalReporter construction",
+          "then": "[]byte(identity.NodeSecretKey) is passed as the nsk parameter",
+          "and_then": [
+            "the same NSK is used for DecryptSecret to resolve bearer tokens"
+          ]
+        },
+        {
+          "name": "Each pipeline gets its own LocalReporter",
+          "when": "all three pipelines have local endpoints configured",
+          "then": "three separate LocalReporter instances are created, each with its pipeline-specific config",
+          "and_then": [
+            "each LocalReporter has its own HTTP client and credential cache"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "Integration tests SHALL validate end-to-end dual delivery including credential resolution",
+      "priority": "SHALL",
+      "rationale": "Integration tests catch wiring bugs that unit tests miss",
+      "scenarios": [
+        {
+          "name": "Metrics dual delivery E2E",
+          "when": "a metrics Manager is configured with a LocalEndpoint pointing to a mock HTTPS server",
+          "then": "both the platform mock and the local mock receive the same metric batch via HTTP POST",
+          "and_then": [
+            "the local server receives a valid Authorization: Bearer header"
+          ]
+        },
+        {
+          "name": "LogFwd dual delivery E2E",
+          "when": "a log Forwarder is configured with a LocalEndpoint pointing to a mock HTTPS server",
+          "then": "both platform and local mocks receive the same log batch",
+          "and_then": [
+            "batches are JSON-decoded and field counts match"
+          ]
+        },
+        {
+          "name": "AuditFwd dual delivery E2E",
+          "when": "an audit Forwarder is configured with a LocalEndpoint pointing to a mock HTTPS server",
+          "then": "both platform and local mocks receive the same audit batch",
+          "and_then": [
+            "each mock server received exactly one POST request"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "Integration tests SHALL verify error isolation when local endpoint fails",
+      "priority": "SHALL",
+      "rationale": "Error isolation is the most critical behavioral guarantee",
+      "scenarios": [
+        {
+          "name": "Local endpoint down, platform receives data",
+          "when": "the local endpoint mock is stopped during a metrics flush",
+          "then": "the platform mock still receives the metric batch and the Manager does not retry",
+          "and_then": [
+            "a warning log is emitted about the local failure"
+          ]
+        },
+        {
+          "name": "Local endpoint returns 401, platform unaffected",
+          "when": "the local endpoint returns HTTP 401 Unauthorized",
+          "then": "the platform mock receives the batch, and a warning is logged about the 401",
+          "and_then": []
+        },
+        {
+          "name": "Local credential resolution fails",
+          "when": "the SecretFetcher returns an error for the local endpoint credential",
+          "then": "the platform mock still receives the batch",
+          "and_then": [
+            "a warning log mentions the credential resolution failure"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-010",
+      "description": "Integration tests SHALL verify TLS skip-verify behavior end-to-end",
+      "priority": "SHALL",
+      "rationale": "TLS configuration must be verified in an integration context with real TLS servers",
+      "scenarios": [
+        {
+          "name": "Skip-verify succeeds against self-signed server",
+          "when": "a LocalReporter is configured with tls_insecure_skip_verify=true against an httptest.NewTLSServer",
+          "then": "the POST request succeeds and the local server receives the batch",
+          "and_then": []
+        },
+        {
+          "name": "Strict verify fails against self-signed server",
+          "when": "a LocalReporter is configured with tls_insecure_skip_verify=false against an httptest.NewTLSServer",
+          "then": "the POST request fails with a TLS error",
+          "and_then": [
+            "platform delivery is unaffected"
+          ]
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "1.1",
+      "title": "Create metrics pipeline integration test: dual delivery happy path (REQ-001, REQ-003, REQ-005, REQ-008)",
+      "level": 1,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-001",
+        "REQ-003",
+        "REQ-005",
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "1.2",
+      "title": "Create logfwd pipeline integration test: dual delivery happy path (REQ-001, REQ-003, REQ-005, REQ-008)",
+      "level": 1,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-001",
+        "REQ-003",
+        "REQ-005",
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "1.3",
+      "title": "Create auditfwd pipeline integration test: dual delivery happy path (REQ-001, REQ-003, REQ-005, REQ-008)",
+      "level": 1,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-001",
+        "REQ-003",
+        "REQ-005",
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "2.1",
+      "title": "Add metrics integration test: local endpoint down, platform unaffected (REQ-004, REQ-009)",
+      "level": 2,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-004",
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "2.2",
+      "title": "Add logfwd integration test: local endpoint failure isolation (REQ-004, REQ-009)",
+      "level": 2,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-004",
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "2.3",
+      "title": "Add auditfwd integration test: local endpoint failure isolation (REQ-004, REQ-009)",
+      "level": 2,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-004",
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "3.1",
+      "title": "Add metrics integration test: credential resolution failure (REQ-005, REQ-009)",
+      "level": 3,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-005",
+        "REQ-009"
+      ]
+    },
+    {
+      "id": "3.2",
+      "title": "Add metrics integration test: TLS skip-verify behavior (REQ-006, REQ-010)",
+      "level": 3,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-006",
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "3.3",
+      "title": "Add metrics integration test: platform-only when URL empty (REQ-002)",
+      "level": 3,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-002"
+      ]
+    },
+    {
+      "id": "3.4",
+      "title": "Add integration tests: selective pipeline configuration (REQ-002)",
+      "level": 3,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-002"
+      ]
+    },
+    {
+      "id": "4.1",
+      "title": "Add logfwd integration test: credential failure and TLS skip-verify (REQ-005, REQ-006, REQ-009, REQ-010)",
+      "level": 4,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-005",
+        "REQ-006",
+        "REQ-009",
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "4.2",
+      "title": "Add auditfwd integration test: credential failure and TLS skip-verify (REQ-005, REQ-006, REQ-009, REQ-010)",
+      "level": 4,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-005",
+        "REQ-006",
+        "REQ-009",
+        "REQ-010"
+      ]
+    },
+    {
+      "id": "5.1",
+      "title": "Update Reference documentation for MultiReporter wiring and integration test patterns (REQ-001 to REQ-010)",
+      "level": 5,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-005",
+        "REQ-006",
+        "REQ-007",
+        "REQ-008",
+        "REQ-009",
+        "REQ-010"
+      ]
+    }
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/metrics/integration_test.go",
+      "test_function": "TestIntegration_DualDelivery_BothReceiveSameBatch",
+      "story": "Both platform and local endpoint receive identical batches",
+      "expected": "Platform and local mock servers both receive POST with identical MetricBatch JSON body, local with Bearer auth header",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/metrics/integration_test.go",
+      "test_function": "TestIntegration_DualDelivery_CredentialResolution",
+      "story": "Local endpoint receives bearer token from credential resolution",
+      "expected": "Local mock server receives Authorization: Bearer {decrypted_token} header, token resolved via FetchSecret+DecryptSecret",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/metrics/integration_test.go",
+      "test_function": "TestIntegration_LocalDown_PlatformUnaffected",
+      "story": "Platform delivery continues when local endpoint is down",
+      "expected": "Platform mock receives batch when local server is stopped; no error returned from Manager.Run",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/integration_test.go",
+      "test_function": "TestIntegration_LocalHTTP500_PlatformUnaffected",
+      "story": "Platform delivery continues when local endpoint is down",
+      "expected": "Platform mock receives batch when local returns 500; warning logged",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/metrics/integration_test.go",
+      "test_function": "TestIntegration_CredentialFailure_PlatformStillReceives",
+      "story": "Invalid credential causes local delivery failure without affecting platform",
+      "expected": "Platform receives batch when SecretFetcher fails; local mock receives no POST",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/metrics/integration_test.go",
+      "test_function": "TestIntegration_TLSSkipVerify_SelfSignedSucceeds",
+      "story": "TLS skip-verify is respected for local endpoints",
+      "expected": "Local mock with self-signed cert receives batch when skip_verify=true",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/metrics/integration_test.go",
+      "test_function": "TestIntegration_TLSStrictVerify_SelfSignedFails",
+      "story": "TLS skip-verify is respected for local endpoints",
+      "expected": "Local POST fails with TLS error when skip_verify=false against self-signed; platform unaffected",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/metrics/integration_test.go",
+      "test_function": "TestIntegration_PlatformOnly_WhenURLEmpty",
+      "story": "Platform receives data when local endpoint is not configured",
+      "expected": "Manager works normally with platform-only reporter when LocalEndpoint.URL is empty",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/metrics/integration_test.go",
+      "test_function": "TestIntegration_ConditionalWiring_Pattern",
+      "story": "Platform receives data when local endpoint is not configured",
+      "expected": "Conditional wiring pattern from up.go correctly selects platform-only vs MultiReporter",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": "internal/logfwd/integration_test.go",
+      "test_function": "TestIntegration_DualDelivery_BothReceiveSameLogBatch",
+      "story": "Both platform and local endpoint receive identical batches",
+      "expected": "Platform and local mock servers both receive POST with identical LogBatch JSON body",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/logfwd/integration_test.go",
+      "test_function": "TestIntegration_LocalDown_PlatformReceivesLogs",
+      "story": "Platform delivery continues when local endpoint is down",
+      "expected": "Platform mock receives log batch when local server returns 500",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/logfwd/integration_test.go",
+      "test_function": "TestIntegration_CredentialFailure_LogFwd",
+      "story": "Invalid credential causes local delivery failure without affecting platform",
+      "expected": "Platform receives logs when credential resolution fails for local endpoint",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/logfwd/integration_test.go",
+      "test_function": "TestIntegration_TLSSkipVerify_LogFwd",
+      "story": "TLS skip-verify is respected for local endpoints",
+      "expected": "Self-signed cert accepted when skip_verify=true for logfwd local endpoint",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": "internal/auditfwd/integration_test.go",
+      "test_function": "TestIntegration_DualDelivery_BothReceiveSameAuditBatch",
+      "story": "Both platform and local endpoint receive identical batches",
+      "expected": "Platform and local mock servers both receive POST with identical AuditBatch JSON body",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/auditfwd/integration_test.go",
+      "test_function": "TestIntegration_LocalDown_PlatformReceivesAudit",
+      "story": "Platform delivery continues when local endpoint is down",
+      "expected": "Platform mock receives audit batch when local server returns 500",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/auditfwd/integration_test.go",
+      "test_function": "TestIntegration_CredentialFailure_AuditFwd",
+      "story": "Invalid credential causes local delivery failure without affecting platform",
+      "expected": "Platform receives audit data when credential resolution fails for local endpoint",
+      "requirement_id": "REQ-009"
+    },
+    {
+      "test_file": "internal/auditfwd/integration_test.go",
+      "test_function": "TestIntegration_TLSSkipVerify_AuditFwd",
+      "story": "TLS skip-verify is respected for local endpoints",
+      "expected": "Self-signed cert accepted when skip_verify=true for auditfwd local endpoint",
+      "requirement_id": "REQ-006"
+    }
+  ],
   "affected_files": [],
   "similar_patterns": [],
-  "review_criteria": [],
-  "implementation_notes": "",
+  "review_criteria": [
+    "All integration tests pass with `go test -race ./internal/metrics/ ./internal/logfwd/ ./internal/auditfwd/` — no data races",
+    "Each pipeline (metrics, logfwd, auditfwd) has integration tests covering: dual delivery happy path, local endpoint failure isolation, credential resolution failure, TLS skip-verify",
+    "Integration tests use httptest.NewTLSServer for realistic TLS behavior and verify actual HTTP requests (method, headers, body)",
+    "Integration tests verify identical JSON payloads delivered to both platform and local endpoints by deserializing and comparing batch element counts",
+    "Error isolation verified: platform receives data in all local-failure scenarios (connection refused, HTTP 500, credential failure)",
+    "No modifications to production code (up.go wiring is already implemented) — this feature is integration-test-only",
+    "Tests follow existing conventions: table-driven where appropriate, discardLogger helper, testNSK/encryptTestSecret helpers reused from local_reporter_test.go",
+    "Test file naming follows project convention: integration_test.go in each pipeline package"
+  ],
+  "implementation_notes": "CRITICAL FINDING: The MultiReporter wiring in up.go (lines 480-515) is ALREADY IMPLEMENTED for all three pipelines. The code currently:\n\n1. metrics (lines 480-486): `var metricsReporter metrics.MetricsReporter = client; if cfg.Metrics.LocalEndpoint.URL != \"\" { localMetrics := metrics.NewLocalReporter(...); metricsReporter = metrics.NewMultiReporter(client, localMetrics, logger) }`\n2. logfwd (lines 497-502): Same pattern with `logfwd.NewLocalReporter → logfwd.NewMultiReporter`\n3. auditfwd (lines 509-514): Same pattern with `auditfwd.NewLocalReporter → auditfwd.NewMultiReporter`\n\nAll three pass `client` (ControlPlane) as the SecretFetcher, `nsk` ([]byte of identity.NodeSecretKey) as the NSK, and `identity.NodeID` as the node ID.\n\nTherefore, this feature (L003) is entirely about INTEGRATION TESTS that validate the full end-to-end path from config parsing through credential resolution to dual HTTP delivery. No production code changes are needed.\n\nKey architectural decisions:\n- Integration tests should be in each pipeline's package (internal tests) to access internal types and helpers\n- Tests should use httptest.NewTLSServer for both platform and local mocks to exercise real HTTP/TLS\n- The mockSecretFetcher from local_reporter_test.go can be reused (it's package-internal)\n- Tests should run the full Manager/Forwarder.Run loop with short intervals rather than calling ReportMetrics directly, to validate the complete flush path\n- The conditional wiring pattern (platform-only vs MultiReporter) should be tested explicitly\n\nRisks:\n- Integration tests with real HTTP servers and tickers need careful timeout management to avoid flaky tests\n- Tests must use `go test -race` to catch any concurrency issues in the MultiReporter fan-out\n- httptest.NewTLSServer uses self-signed certs, which is perfect for testing TLS skip-verify behavior",
   "status_history": {
     "proposed": {
       "github_account": "berendt",
       "timestamp": "2026-02-18T06:24:23.326925"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T10:47:00.034495"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-18T10:51:54.077531"
     }
   },
-  "elaboration": "\n\n**Size:** 🏗️ large\n**Category:** backend\n**Priority:** high\n\n## Summary\n\nAdd a configurable local endpoint to each of the three observability pipelines (Metrics, Log Forwarding, Audit Forwarding). When configured, the forwarder sends data to **both** the Platform (existing `ControlPlane` client) and the local endpoint in parallel. Credentials for local endpoints are referenced by secret key name, leveraging the existing encrypted secret delivery mechanism (`SecretRef` → `FetchSecret` → `DecryptSecret` via AES-256-GCM).\n\n## Scope\n\n**Included:**\n- New `LocalEndpointConfig` shared struct (URL, secret key reference for bearer token, TLS skip-verify flag)\n- Embedding `LocalEndpointConfig` in `metrics.Config`, `logfwd.Config`, and `auditfwd.Config`\n- A `LocalReporter` HTTP client per pipeline that POSTs the same JSON batch payloads to the configured local URL with bearer token auth\n- A `MultiReporter` fan-out wrapper per pipeline that dispatches to platform + local reporter in parallel goroutines\n- Credential resolution via existing `SecretFetcher`/`DecryptSecret` pipeline with in-memory caching\n- Config validation (URL format, secret key required when URL is set)\n- Config redaction (automatic — existing redaction logic catches keys containing `secret`/`key`)\n- Independent error handling per target (local endpoint failure logged, never blocks platform delivery)\n- Wiring in `up.go`: construct `MultiReporter` when `LocalEndpoint.URL` is non-empty\n\n**Excluded (YAGNI):**\n- **Multiple local endpoints** — One per pipeline is sufficient; fan-out to N targets adds unnecessary complexity\n- **Protocol alternatives (OTLP, gRPC, syslog)** — HTTPS+JSON matches existing transport\n- **Payload transformation** — Local endpoint receives identical `api.MetricBatch`/`LogBatch`/`AuditBatch` JSON\n- **Retry/backoff for local endpoints** — Fire-and-forget, consistent with platform reporter semantics\n- **Per-endpoint buffering** — Single shared buffer; data may be lost for a failed target\n- **mTLS / Basic auth** — Bearer token covers the common case\n- **UI/CLI for managing local endpoints** — Config-file-only\n\n## Visualization\n\n```mermaid\nflowchart TD\n    subgraph Collection\n        SC[\"SystemCollector\"]\n        TC[\"TunnelCollector\"]\n        LC[\"LatencyCollector\"]\n        AC[\"AgentStatsCollector\"]\n        JS[\"JournaldSource\"]\n        FS[\"FileSource\"]\n        KS[\"K8sAuditSource\"]\n        AS[\"AuditdSource\"]\n    end\n\n    subgraph Forwarders\n        MM[\"Metrics Manager\"]\n        LF[\"Log Forwarder\"]\n        AF[\"Audit Forwarder\"]\n    end\n\n    subgraph Reporting [\"Fan-out Reporter #40;new#41;\"]\n        MR[\"MultiReporter\"]\n    end\n\n    subgraph Targets\n        CP[\"ControlPlane #40;existing#41;\"]\n        LE[\"Local Endpoint #40;new#41;\"]\n    end\n\n    subgraph Credentials [\"Credential Resolution\"]\n        SR[\"SecretRef in Config\"]\n        SF[\"SecretFetcher\"]\n        DS[\"DecryptSecret #40;AES-256-GCM#41;\"]\n    end\n\n    SC & TC & LC & AC --> MM\n    JS & FS --> LF\n    KS & AS --> AF\n\n    MM & LF & AF --> MR\n    MR --> CP\n    MR --> LE\n\n    SR --> SF --> DS --> LE\n```\n\n```mermaid\nsequenceDiagram\n    participant F as Forwarder\n    participant MR as MultiReporter\n    participant CP as ControlPlane\n    participant LE as Local Endpoint\n    participant SF as SecretFetcher\n    participant D as DecryptSecret\n\n    Note over F: Report ticker fires\n    F->>MR: ReportMetrics#40;batch#41;\n\n    par Platform delivery\n        MR->>CP: POST /v1/nodes/{id}/metrics\n        CP-->>MR: 200 OK\n    and Local delivery\n        MR->>SF: FetchSecret#40;secretKey#41;\n        SF-->>MR: SecretResponse\n        MR->>D: DecryptSecret#40;nsk, ciphertext, nonce#41;\n        D-->>MR: bearer token\n        MR->>LE: POST {local_url} + Authorization header\n        LE-->>MR: 200 OK\n    end\n\n    MR-->>F: errors #40;if any, logged independently#41;\n```\n\n```mermaid\nflowchart LR\n    subgraph Config [\"YAML Config #40;metrics example#41;\"]\n        E[\"metrics.local_endpoint.url\"]\n        SK[\"metrics.local_endpoint.secret_key\"]\n        TLS[\"metrics.local_endpoint.tls_insecure_skip_verify\"]\n    end\n\n    subgraph Runtime\n        SR2[\"SecretRef lookup\"]\n        FE[\"FetchSecret from Platform\"]\n        DE[\"DecryptSecret via NSK\"]\n        BT[\"Bearer Token\"]\n    end\n\n    SK --> SR2 --> FE --> DE --> BT\n    E --> LE2[\"HTTP POST to local URL\"]\n    BT --> LE2\n```\n\n## Key Components\n\n- **`LocalEndpointConfig`** (new, shared struct in `internal/api/types.go`): URL, secret key name, `TLSInsecureSkipVerify` flag. Embedded by all three pipeline configs.\n- **`LocalReporter`** (new, one per package: `metrics`, `logfwd`, `auditfwd`): HTTP client implementing the respective reporter interface. POSTs JSON batches to the configured local URL with a bearer token resolved from the secret store. Token is cached in memory with a TTL to avoid per-flush secret lookups.\n- **`MultiReporter`** (new, one per package): Wraps platform reporter + local reporter. Calls both in parallel via goroutines, collects and logs errors independently, never blocks one target on another.\n- **`metrics.Config.LocalEndpoint`** / **`logfwd.Config.LocalEndpoint`** / **`auditfwd.Config.LocalEndpoint`**: New optional field on each existing config struct.\n- **Credential resolution**: At flush time (with caching), the local reporter calls `SecretFetcher.FetchSecret()` → `DecryptSecret()` to obtain the bearer token.\n- **Config validation**: Each pipeline's `Validate()` extended to check URL format and require `secret_key` when URL is set.\n- **Config redaction**: Automatic — existing redaction logic in `up.go` already catches keys containing `secret` or `key`.\n- **Wiring in `up.go`**: When `cfg.<Pipeline>.LocalEndpoint.URL` is non-empty, construct a `LocalReporter` and wrap `[platformClient, localReporter]` into a `MultiReporter` before passing to the pipeline's constructor."
+  "execution_history": [
+    {
+      "run_id": "9432f45c-38d6-4243-9ffa-c499a995c6ad",
+      "timestamp": "2026-02-18T10:51:54.077573",
+      "total_duration": 289.6758110523224,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 289.6758110523224,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
 }
