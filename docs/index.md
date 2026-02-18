@@ -25,6 +25,8 @@ The Plexsphere node agent (`plexd`) is a lightweight daemon that runs on every m
 
 ## High-Level Overview
 
+The diagram below shows the three layers of a plexd deployment: the central control plane, the managed nodes, and the external access provided by bridge nodes.
+
 ```
                               ┌───────────────────────┐
                               │  Plexsphere           │
@@ -62,7 +64,13 @@ The Plexsphere node agent (`plexd`) is a lightweight daemon that runs on every m
                                                           └───────────┘   └──────────────┘
 ```
 
-plexd communicates outbound only — no inbound ports or public IPs required on the node side. For detailed architecture diagrams, see [Architecture](guide/architecture.md).
+All communication between nodes and the control plane is **outbound-only** — nodes initiate HTTPS and SSE connections; no inbound ports or public IPs are required on the node side.
+
+Between nodes, plexd forms an **encrypted WireGuard mesh**. Every node establishes direct peer-to-peer tunnels with all authorized peers. NAT traversal is handled automatically via STUN. The control plane coordinates key exchange and peer discovery but never sits in the data path.
+
+**Bridge nodes** serve a dual role: they participate in the mesh like any other node, but additionally provide external connectivity — user access (Tailscale, Netbird, WireGuard), public ingress, and site-to-site VPN — making internal services reachable from outside the mesh.
+
+For a detailed view of the control plane components, mesh topology, and bridge internals, see [Architecture](guide/architecture.md).
 
 ## Guide
 

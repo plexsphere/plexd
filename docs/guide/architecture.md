@@ -19,6 +19,8 @@ title: Architecture
 
 ## Detailed Architecture
 
+This diagram expands the [high-level overview](/) to show the control plane's internal components, the mesh IP addressing, and the bridge node's dual-interface design.
+
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────┐
 │                             Plexsphere Control Plane                             │
@@ -76,7 +78,13 @@ title: Architecture
                                                    └─────────┘ └──────────┘ └───────────┘
 ```
 
-plexd communicates outbound only - no inbound ports or public IPs required on the node side. Nodes behind NAT discover their public endpoints via STUN and exchange them through the control plane to establish direct peer-to-peer tunnels. When direct connectivity is not possible, traffic is relayed through bridge nodes. The control plane pushes peer updates via SSE; the agent pulls full state periodically as a consistency fallback.
+**Control plane** — The four components at the top handle distinct responsibilities: the **Registration API** bootstraps new nodes, the **Key & Peer Manager** distributes WireGuard public keys and pre-shared keys, the **Policy Engine** evaluates visibility and firewall rules, and the **Event Bus (SSE)** pushes real-time updates (peer changes, policy updates, action requests, key rotations) to connected nodes.
+
+**Node mesh** — Each node receives a unique mesh IP from the `10.100.0.0/16` range at registration (e.g. `10.100.1.1/32`). All nodes form a **full-mesh WireGuard topology** with direct peer-to-peer tunnels. Nodes behind NAT discover their public endpoints via STUN and exchange them through the control plane. When direct connectivity is not possible, traffic is relayed through bridge nodes.
+
+**Bridge node** — A bridge operates with two interfaces. The **mesh side** (`10.100.1.250`) participates in the WireGuard mesh like any regular node and additionally serves as a NAT relay for peers that cannot reach each other directly. The **access side** exposes three services to external consumers: user access (Tailscale, Netbird, or standalone WireGuard), public ingress with ACME certificates and SNI routing, and site-to-site VPN for partner or customer networks.
+
+**Data path separation** — The control plane coordinates identity, keys, policies, and events but never touches mesh traffic. All data flows directly between nodes over the encrypted WireGuard tunnels.
 
 ## See Also
 
