@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# Build stage — Go version must match go.mod (currently 1.24)
-FROM golang:1.24-alpine AS builder
+# Build stage — Go version must match go.mod (currently 1.26)
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /build
 

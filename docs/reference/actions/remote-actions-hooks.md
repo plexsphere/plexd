@@ -324,7 +324,7 @@ Reports OS, kernel, hardware, and runtime info as JSON.
   "hostname": "edge-us-west-42",
   "os": "linux",
   "arch": "amd64",
-  "go_version": "go1.24.0",
+  "go_version": "go1.26.0",
   "mesh_ip": "10.100.0.5",
   "peer_count": 12,
   "node_id": "node-abc123"

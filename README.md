@@ -151,7 +151,7 @@ docker pull ghcr.io/plexsphere/plexd:latest
 
 ### From Source
 
-Requires Go 1.24+, WireGuard tools, and nftables.
+Requires Go 1.26+, WireGuard tools, and nftables.
 
 ```bash
 git clone https://github.com/plexsphere/plexd.git
@@ -1894,7 +1894,7 @@ data_dir/state/
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.26+
 - WireGuard tools (`wg`, `wg-quick`)
 - nftables
 - Docker (for integration tests)

@@ -29,7 +29,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.24'
+          go-version: '1.26'
 
       - name: Run Docker E2E tests
         run: make test-e2e-docker
@@ -54,7 +54,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.24'
+          go-version: '1.26'
 
       - name: Install kind
         run: go install sigs.k8s.io/kind@v0.27.0
@@ -85,7 +85,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.24'
+          go-version: '1.26'
 
       - name: Run systemd E2E tests
         run: make test-e2e-systemd
