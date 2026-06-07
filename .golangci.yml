@@ -1,0 +1,28 @@
+# golangci-lint v2 configuration.
+#
+# Restores the linting behavior that golangci-lint v1 provided out of the box
+# before the Go 1.26 toolchain bump forced the move to v2 (v1 binaries are
+# built with Go 1.24 and refuse to run against a 1.26 go.mod).
+#
+# v2 dropped the implicit default exclusions and folded gosimple/stylecheck
+# into staticcheck, surfacing checks that were not active under v1. The presets
+# below re-enable v1's default exclusions; the staticcheck `checks` setting
+# disables the newly bundled quickfix (QF) suggestions that v1 never ran.
+version: "2"
+
+linters:
+  # default: standard -> errcheck, govet, ineffassign, staticcheck, unused
+  settings:
+    staticcheck:
+      checks:
+        - all
+        - -QF1003 # tagged switch suggestion
+        - -QF1006 # lift declaration into loop condition
+        - -QF1011 # omit redundant type from declaration
+        - -ST1023 # omit redundant type from declaration
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
