@@ -8,7 +8,7 @@ feature: PXD-0026
 
 ## Prerequisites
 
-- Go 1.24+
+- Go 1.26+
 - WireGuard tools (`wg`, `wg-quick`)
 - nftables
 - Docker (for integration tests)

@@ -513,7 +513,7 @@ Multi-stage build at `test/e2e/mockapi/Dockerfile`.
 
 | Stage | Image | Purpose |
 |-------|-------|---------|
-| Builder | `golang:1.24-alpine` | Compile the mock server binary |
+| Builder | `golang:1.26-alpine` | Compile the mock server binary |
 | Runtime | `gcr.io/distroless/static-debian12` | Minimal runtime with no shell |
 
 ### Build

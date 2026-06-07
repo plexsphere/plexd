@@ -11,7 +11,7 @@ Reference documentation for the multi-stage Dockerfile at `deploy/docker/Dockerf
 
 | Stage | Image | Purpose |
 |-------|-------|---------|
-| Builder | `golang:1.24-alpine` | Go toolchain for compiling plexd (matches `go.mod` Go version) |
+| Builder | `golang:1.26-alpine` | Go toolchain for compiling plexd (matches `go.mod` Go version) |
 | Runtime | `gcr.io/distroless/static-debian12` | Minimal runtime with no shell, no package manager, includes CA certificates |
 
 ## Build Command

@@ -34,7 +34,7 @@ Runs the Docker Compose-based E2E test.
 | Step | Action |
 |------|--------|
 | Checkout | `actions/checkout` (pinned SHA) |
-| Setup Go | `actions/setup-go` with `go-version: '1.24'` |
+| Setup Go | `actions/setup-go` with `go-version: '1.26'` |
 | Run tests | `make test-e2e-docker` |
 | Capture logs | `docker compose logs` (on failure) |
 | Upload artifact | `docker-e2e-logs` (on failure) |
@@ -46,7 +46,7 @@ Runs the kind-based Kubernetes E2E test.
 | Step | Action |
 |------|--------|
 | Checkout | `actions/checkout` (pinned SHA) |
-| Setup Go | `actions/setup-go` with `go-version: '1.24'` |
+| Setup Go | `actions/setup-go` with `go-version: '1.26'` |
 | Install kind | `go install sigs.k8s.io/kind@v0.27.0` |
 | Run tests | `make test-e2e-k8s` |
 | Capture logs | `kubectl logs` + `kubectl describe` (on failure) |
@@ -59,7 +59,7 @@ Runs the systemd-in-Docker E2E test.
 | Step | Action |
 |------|--------|
 | Checkout | `actions/checkout` (pinned SHA) |
-| Setup Go | `actions/setup-go` with `go-version: '1.24'` |
+| Setup Go | `actions/setup-go` with `go-version: '1.26'` |
 | Run tests | `make test-e2e-systemd` |
 | Capture logs | `docker logs` for both containers (on failure) |
 | Upload artifact | `systemd-e2e-logs` (on failure) |

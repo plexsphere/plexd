@@ -4,7 +4,7 @@
 plexd is a node agent for the Plexsphere platform. It runs on every node in a managed environment, connecting to the control plane, registering nodes, establishing encrypted WireGuard mesh tunnels, enforcing network policies, and reconciling local state.
 
 ## Tech Stack
-- **Language:** Go 1.24.0
+- **Language:** Go 1.26.0
 - **Module:** github.com/plexsphere/plexd
 - **Dependencies:** go.uber.org/goleak, golang.org/x/crypto
 - **Platform:** Linux (amd64, arm64)

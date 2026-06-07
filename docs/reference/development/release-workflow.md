@@ -37,7 +37,7 @@ Cross-compiles a static binary for each target architecture and uploads it with 
 | Step              | Command / Action                                           | Purpose                                        |
 |-------------------|------------------------------------------------------------|------------------------------------------------|
 | Checkout          | `actions/checkout@v4`                                      | Clone repository at the tagged commit          |
-| Setup Go          | `actions/setup-go@v5` (`go-version: '1.24'`)              | Install Go with module caching                 |
+| Setup Go          | `actions/setup-go@v5` (`go-version: '1.26'`)              | Install Go with module caching                 |
 | Build binary      | `go build -ldflags "..." -o plexd-linux-$GOARCH ./cmd/plexd` | Cross-compile static binary                  |
 | Generate checksum | `sha256sum plexd-linux-$GOARCH > plexd-linux-$GOARCH.sha256` | Create per-artifact checksum file            |
 | Upload artifact   | `actions/upload-artifact@v4`                               | Upload binary and checksum for release job     |

@@ -108,7 +108,7 @@ Docker Buildx sets `TARGETOS` and `TARGETARCH` automatically for each platform. 
 
 The workflow builds from `deploy/docker/Dockerfile`, a multi-stage image:
 
-1. **Builder stage** (`golang:1.24-alpine`): downloads modules, cross-compiles the `plexd` binary with version ldflags
+1. **Builder stage** (`golang:1.26-alpine`): downloads modules, cross-compiles the `plexd` binary with version ldflags
 2. **Runtime stage** (`gcr.io/distroless/static-debian12`): copies the binary to `/usr/local/bin/plexd`, runs as non-root (UID 65534)
 
 ## DaemonSet Relationship

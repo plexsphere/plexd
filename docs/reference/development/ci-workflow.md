@@ -19,7 +19,7 @@ Pushes to non-main branches without an open PR do not trigger the workflow.
 
 ## Jobs
 
-All jobs use `actions/checkout@v4` and `actions/setup-go@v5` with Go 1.24, pinned to full SHA hashes for supply-chain hardening. Each job sets `timeout-minutes` to prevent runaway CI from consuming unlimited minutes. Module caching is handled automatically by `setup-go@v5` using `go.sum` as the cache key.
+All jobs use `actions/checkout@v4` and `actions/setup-go@v5` with Go 1.26, pinned to full SHA hashes for supply-chain hardening. Each job sets `timeout-minutes` to prevent runaway CI from consuming unlimited minutes. Module caching is handled automatically by `setup-go@v5` using `go.sum` as the cache key.
 
 ### lint
 
@@ -28,7 +28,7 @@ Static analysis and dependency verification.
 | Step                   | Command / Action                                           | Purpose                              |
 |------------------------|------------------------------------------------------------|--------------------------------------|
 | Checkout               | `actions/checkout@v4`                                      | Clone repository                     |
-| Setup Go               | `actions/setup-go@v5` (`go-version: '1.24'`)              | Install Go with module caching       |
+| Setup Go               | `actions/setup-go@v5` (`go-version: '1.26'`)              | Install Go with module caching       |
 | Verify dependencies    | `go mod verify`                                            | Validate checksums against `go.sum`  |
 | Run go vet             | `go vet ./...`                                             | Built-in static analysis             |
 | Install staticcheck    | `go install honnef.co/go/tools/cmd/staticcheck@latest`     | Install advanced static analyzer     |
@@ -44,7 +44,7 @@ Runs all tests with race detection and cache disabled.
 | Step           | Command / Action                            | Purpose                                  |
 |----------------|---------------------------------------------|------------------------------------------|
 | Checkout       | `actions/checkout@v4`                       | Clone repository                         |
-| Setup Go       | `actions/setup-go@v5` (`go-version: '1.24'`)| Install Go with module caching          |
+| Setup Go       | `actions/setup-go@v5` (`go-version: '1.26'`)| Install Go with module caching          |
 | Run unit tests | `go test -race -count=1 ./...`              | Execute all tests, detect data races     |
 
 The `-count=1` flag disables test caching to ensure every CI run exercises all tests. The `-race` flag enables the Go race detector.
@@ -56,14 +56,14 @@ Runs only test functions matching the `Integration` pattern.
 | Step                   | Command / Action                                      | Purpose                                      |
 |------------------------|-------------------------------------------------------|----------------------------------------------|
 | Checkout               | `actions/checkout@v4`                                 | Clone repository                             |
-| Setup Go               | `actions/setup-go@v5` (`go-version: '1.24'`)         | Install Go with module caching               |
+| Setup Go               | `actions/setup-go@v5` (`go-version: '1.26'`)         | Install Go with module caching               |
 | Run integration tests  | `go test -race -count=1 -run Integration ./...`       | Execute integration tests with race detection|
 
 The `-run Integration` flag performs substring matching, selecting test functions such as `TestIntegration_*`, `TestRelayIntegration_*`, `TestBridgeReconcileIntegration_*`, and `TestUserAccessIntegration_*`. Packages with no matching tests are skipped gracefully.
 
 ## Go Version
 
-All jobs pin Go 1.24 via `go-version: '1.24'` (not `1.24.0`), which resolves to the latest patch release. This matches the version specified in `go.mod`.
+All jobs pin Go 1.26 via `go-version: '1.26'` (not `1.26.0`), which resolves to the latest patch release. This matches the version specified in `go.mod`.
 
 ## Module Caching
 
