@@ -33,9 +33,9 @@ Static analysis and dependency verification.
 | Run go vet             | `go vet ./...`                                             | Built-in static analysis             |
 | Install staticcheck    | `go install honnef.co/go/tools/cmd/staticcheck@latest`     | Install advanced static analyzer     |
 | Run staticcheck        | `staticcheck ./...`                                        | Detect bugs and deprecated patterns  |
-| Run golangci-lint      | `golangci/golangci-lint-action@v6`                         | Aggregated linter suite              |
+| Run golangci-lint      | `golangci/golangci-lint-action@v9` (`version: v2.12.2`)    | Aggregated linter suite              |
 
-The `golangci-lint` action uses default linters when no `.golangci.yml` exists. Adding a `.golangci.yml` to the repository root will be picked up automatically without workflow changes.
+The `golangci-lint` action runs golangci-lint v2 (pinned via the `version` input), configured by `.golangci.yml` in the repository root. The config restores the default exclusions that golangci-lint v1 applied implicitly, since v2 dropped them. golangci-lint v2 is required because v1 binaries are built with Go 1.24 and refuse to run against the `go 1.26.0` directive in `go.mod`.
 
 ### unit-test
 
@@ -86,4 +86,4 @@ All actions are pinned to full SHA hashes for supply-chain hardening. The versio
 |----------------------------------|----------|----------------------------------------------|-----------------------------------|
 | `actions/checkout`               | `v4.3.1` | `34e114876b0b11c390a56381ad16ebd13914f8d5`   | Repository checkout               |
 | `actions/setup-go`               | `v5.6.0` | `40f1582b2485089dde7abd97c1529aa768e1baff`   | Go installation and module cache  |
-| `golangci/golangci-lint-action`  | `v6.5.2` | `55c2c1448f86e01eaae002a5a3a9624417608d84`   | golangci-lint installation and run|
+| `golangci/golangci-lint-action`  | `v9.2.1` | `82606bf257cbaff209d206a39f5134f0cfbfd2ee`   | golangci-lint installation and run|
