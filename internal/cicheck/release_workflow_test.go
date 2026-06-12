@@ -124,22 +124,34 @@ func TestReleaseWorkflow_BuildMatrix(t *testing.T) {
 	if build.Strategy == nil {
 		t.Fatal("build job has no strategy")
 	}
-	goarchRaw, ok := build.Strategy.Matrix["goarch"]
+	includeRaw, ok := build.Strategy.Matrix["include"]
 	if !ok {
-		t.Fatal("build matrix missing goarch")
+		t.Fatal("build matrix missing include")
 	}
-	goarchList, ok := goarchRaw.([]any)
+	includeList, ok := includeRaw.([]any)
 	if !ok {
-		t.Fatalf("matrix.goarch is %T, want []any", goarchRaw)
+		t.Fatalf("matrix.include is %T, want []any", includeRaw)
 	}
-	arches := make(map[string]bool)
-	for _, v := range goarchList {
-		s, _ := v.(string)
-		arches[s] = true
+	arches := make(map[string]map[string]any)
+	for i, v := range includeList {
+		entry, ok := v.(map[string]any)
+		if !ok {
+			t.Fatalf("matrix.include[%d] is %T, want map", i, v)
+		}
+		goarch, _ := entry["goarch"].(string)
+		if goarch == "" {
+			t.Fatalf("matrix.include[%d] missing goarch", i)
+		}
+		arches[goarch] = entry
 	}
-	for _, want := range []string{"amd64", "arm64"} {
-		if !arches[want] {
-			t.Errorf("matrix.goarch missing %q", want)
+	for _, want := range []string{"amd64", "arm64", "mipsle"} {
+		if _, ok := arches[want]; !ok {
+			t.Errorf("matrix.include missing goarch %q", want)
+		}
+	}
+	if mipsle, ok := arches["mipsle"]; ok {
+		if gomips, _ := mipsle["gomips"].(string); gomips != "softfloat" {
+			t.Errorf("mipsle gomips = %q, want %q", gomips, "softfloat")
 		}
 	}
 }
@@ -286,7 +298,7 @@ func TestReleaseWorkflow_ReleaseSteps(t *testing.T) {
 			t.Fatal("missing gh-release step")
 		}
 		files, _ := step.With["files"].(string)
-		for _, arch := range []string{"amd64", "arm64"} {
+		for _, arch := range []string{"amd64", "arm64", "mipsle"} {
 			binary := "plexd-linux-" + arch
 			if !strings.Contains(files, binary) {
 				t.Errorf("release files missing %s", binary)
