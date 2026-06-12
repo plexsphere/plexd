@@ -30,8 +30,9 @@ plexd runs on every node in a Plexsphere-managed environment. It connects to the
 | Virtual machines | `node` | Cloud-Init support for automated token injection |
 | Kubernetes clusters | `node` | DaemonSet deployment, auto-detects K8s audit logs |
 | Bridge / Gateway | `bridge` | User access, public ingress, site-to-site VPN, NAT relay |
+| OpenWRT routers | `node` | Manual install with procd init script, see [deploy/openwrt](deploy/openwrt/) |
 
-**OS:** Linux (amd64, arm64)
+**OS:** Linux (amd64, arm64, mipsle)
 
 ## Architecture
 
@@ -148,6 +149,13 @@ curl -fsSL https://get.plexsphere.io/plexd | sh
 ```bash
 docker pull ghcr.io/plexsphere/plexd:latest
 ```
+
+### OpenWRT
+
+No opkg package yet - download the release binary for your package
+architecture (e.g. `plexd-linux-mipsle` for `mipsel_24kc` devices) and manage
+it with the procd init script from [deploy/openwrt](deploy/openwrt/). See the
+README there for requirements and step-by-step instructions.
 
 ### From Source
 
