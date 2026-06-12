@@ -14,8 +14,9 @@ title: Architecture
 | Virtual machines | `node` | Cloud-Init support for automated token injection |
 | Kubernetes clusters | `node` | DaemonSet deployment, auto-detects K8s audit logs |
 | Bridge / Gateway | `bridge` | User access, public ingress, site-to-site VPN, NAT relay |
+| OpenWRT routers | `node` | Manual install with procd init script, see `deploy/openwrt/` |
 
-**OS:** Linux (amd64, arm64)
+**OS:** Linux (amd64, arm64, mipsle)
 
 ## Detailed Architecture
 

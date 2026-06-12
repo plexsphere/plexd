@@ -317,6 +317,7 @@ All request/response types for the 17 control plane API endpoints, organized by 
 | `Name`       | `string`| `"name"`       | Parameter name           |
 | `Type`       | `string`| `"type"`       | Parameter type           |
 | `Required`   | `bool` | `"required"`    | Whether required         |
+| `Default`    | `string`| `"default,omitempty"` | Default value for optional parameters |
 | `Description`| `string`| `"description"`| Parameter description   |
 
 **HookInfo**

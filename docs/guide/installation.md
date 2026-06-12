@@ -18,6 +18,13 @@ curl -fsSL https://get.plexsphere.com/plexd | sh
 docker pull ghcr.io/plexsphere/plexd:latest
 ```
 
+### OpenWRT
+
+No opkg package yet - download the release binary for your package
+architecture (e.g. `plexd-linux-mipsle` for `mipsel_24kc` devices) and manage
+it with the procd init script from `deploy/openwrt/` in the repository. See
+the README there for requirements and step-by-step instructions.
+
 ### From Source
 
 Requires Go 1.26+, WireGuard tools, and nftables.

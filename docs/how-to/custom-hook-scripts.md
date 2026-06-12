@@ -110,6 +110,7 @@ Each parameter entry:
 | `name`        | `string` | Parameter name                        |
 | `type`        | `string` | Type hint (`string`, `bool`, `int`)   |
 | `required`    | `bool`   | Whether the parameter is required     |
+| `default`     | `string` | Default value for optional parameters |
 | `description` | `string` | Human-readable description            |
 
 The sidecar file is optional. If missing or malformed, the hook is still
