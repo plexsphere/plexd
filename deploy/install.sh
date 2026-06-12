@@ -1,6 +1,6 @@
 #!/bin/sh
 # plexd install script
-# Usage: curl -fsSL https://get.plexsphere.io/install.sh | sh -s -- [OPTIONS]
+# Usage: curl -fsSL https://get.plexsphere.com/install.sh | sh -s -- [OPTIONS]
 #
 # Options:
 #   --token VALUE     Bootstrap token for enrollment
@@ -11,7 +11,7 @@
 set -eu
 
 # --- Configuration ---
-PLEXD_ARTIFACT_URL="${PLEXD_ARTIFACT_URL:-https://artifacts.plexsphere.io/plexd}"
+PLEXD_ARTIFACT_URL="${PLEXD_ARTIFACT_URL:-https://artifacts.plexsphere.com/plexd}"
 VERSION="latest"
 TOKEN=""
 API_URL=""

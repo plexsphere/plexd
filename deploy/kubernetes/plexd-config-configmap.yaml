@@ -9,7 +9,7 @@ metadata:
 data:
   config.yaml: |
     api:
-      base_url: "https://api.plexsphere.io"
+      base_url: "https://api.plexsphere.com"
     log_level: info
     mode: node
     data_dir: /var/lib/plexd

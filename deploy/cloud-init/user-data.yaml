@@ -40,7 +40,7 @@ runcmd:
   - |
     set -eu
     PLEXD_VERSION="${PLEXD_VERSION:-latest}"
-    curl -fsSL https://get.plexsphere.io/install.sh | sh -s -- \
+    curl -fsSL https://get.plexsphere.com/install.sh | sh -s -- \
       --token "${PLEXD_BOOTSTRAP_TOKEN}" \
       --api-url "${PLEXD_API_URL}" \
       --version "${PLEXD_VERSION}"
