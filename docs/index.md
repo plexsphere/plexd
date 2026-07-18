@@ -92,6 +92,7 @@ Step-by-step guides for common operational tasks.
 - [Kubernetes Deployment](how-to/kubernetes-deployment.md) — Deploy plexd as a DaemonSet on Kubernetes
 - [Using the Local Node API](how-to/local-node-api.md) — Read node state and write reports via the local API
 - [Creating Custom Hook Scripts](how-to/custom-hook-scripts.md) — Extend plexd with custom hook scripts for remote actions
+- [Cutting a Release](how-to/cutting-a-release.md) — Tag-driven release flow and versioning policy
 
 ## Reference
 

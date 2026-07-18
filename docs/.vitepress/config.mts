@@ -42,6 +42,7 @@ export default withMermaid(defineConfig({
           { text: 'Local Node API', link: '/how-to/local-node-api' },
           { text: 'Custom Hook Scripts', link: '/how-to/custom-hook-scripts' },
           { text: 'Local Endpoint Setup', link: '/how-to/local-endpoint-setup' },
+          { text: 'Cutting a Release', link: '/how-to/cutting-a-release' },
         ],
       },
       {
