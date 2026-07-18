@@ -6,7 +6,7 @@ feature: PXD-0035
 
 # Release Workflow
 
-The `.github/workflows/release.yml` workflow builds cross-compiled static binaries for linux/amd64 and linux/arm64, generates a combined SHA-256 checksums file, and publishes them as a GitHub Release when a version tag is pushed.
+The `.github/workflows/release.yml` workflow builds cross-compiled static binaries for linux/amd64, linux/arm64, and linux/mipsle, generates a combined SHA-256 checksums file, and publishes them as a GitHub Release when a version tag is pushed.
 
 ## Trigger Events
 
@@ -46,9 +46,13 @@ The build step sets `CGO_ENABLED=0`, `GOOS=linux`, and `GOARCH` from the matrix,
 
 **Matrix strategy:**
 
-| Parameter | Values             |
-|-----------|--------------------|
-| `goarch`  | `amd64`, `arm64`   |
+| `goarch`  | `gomips`     |
+|-----------|--------------|
+| `amd64`   | (unset)      |
+| `arm64`   | (unset)      |
+| `mipsle`  | `softfloat`  |
+
+The matrix uses an `include` list so each entry can set its own parameters. The `mipsle` build sets `GOMIPS=softfloat` for OpenWRT hardware without an FPU.
 
 Each matrix entry produces one artifact named `plexd-linux-{arch}` containing both the binary and its `.sha256` checksum file.
 
@@ -85,6 +89,7 @@ The build step injects version metadata via Go linker flags matching the pattern
 |------------------------------|----------------------------------|
 | `plexd-linux-amd64`          | Static binary for x86_64         |
 | `plexd-linux-arm64`          | Static binary for ARM64          |
+| `plexd-linux-mipsle`         | Static binary for MIPS little-endian (softfloat) |
 | `checksums.sha256`           | Combined SHA-256 checksums for all binaries |
 
 Binary names follow the `plexd-linux-{arch}` convention expected by `install.sh`.
@@ -96,6 +101,7 @@ The `checksums.sha256` file contains one line per binary in standard `sha256sum`
 ```
 <64-char hex hash>  plexd-linux-amd64
 <64-char hex hash>  plexd-linux-arm64
+<64-char hex hash>  plexd-linux-mipsle
 ```
 
 Two spaces separate the hash from the filename. This format is compatible with `sha256sum --check` for verification and with `install.sh`, which downloads `checksums.sha256` and greps for the target binary name.
@@ -114,11 +120,4 @@ All actions are pinned to full SHA hashes for supply-chain hardening. The `check
 
 ## Creating a Release
 
-To publish a new release:
-
-```bash
-git tag v1.2.3
-git push origin v1.2.3
-```
-
-The workflow builds binaries for both architectures, generates a combined `checksums.sha256` file, and creates a GitHub Release with auto-generated release notes from the commit history since the previous tag. Three files (two binaries and `checksums.sha256`) are attached as release assets.
+See [Cutting a Release](../../how-to/cutting-a-release.md) for the tag-driven release procedure and the versioning policy.
