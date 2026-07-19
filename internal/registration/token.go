@@ -10,15 +10,17 @@ import (
 
 const maxTokenLength = 512
 
+const maxValueLength = 4096
+
 // TokenResult holds the resolved token and its source metadata.
 type TokenResult struct {
 	Value    string // the token value
 	FilePath string // non-empty if the token was read from a file (for cleanup)
 }
 
-// MetadataProvider reads a bootstrap token from a cloud metadata service.
+// MetadataProvider reads a value from a cloud metadata service at a given path.
 type MetadataProvider interface {
-	ReadToken(ctx context.Context) (string, error)
+	ReadValue(ctx context.Context, path string) (string, error)
 }
 
 // TokenResolver resolves the bootstrap token from multiple sources.
@@ -69,9 +71,16 @@ func (r *TokenResolver) Resolve(ctx context.Context) (*TokenResult, error) {
 		}
 	}
 
-	// 1d. Metadata service.
+	// 1d. Metadata service. The token is the one input whose absence stops
+	// registration, so a read error must surface — reporting a transient IMDS
+	// failure or a misconfigured path as "no token found" sends the operator to
+	// audit the wrong thing. Only ErrMetadataNotFound ("not provisioned") falls
+	// through to the next source.
 	if r.cfg.UseMetadata && r.metadata != nil {
-		token, err := r.metadata.ReadToken(ctx)
+		token, err := r.metadata.ReadValue(ctx, r.cfg.MetadataTokenPath)
+		if err != nil && !errors.Is(err, ErrMetadataNotFound) {
+			return nil, fmt.Errorf("registration: read token from metadata: %w", err)
+		}
 		if err == nil {
 			v := strings.TrimSpace(token)
 			if v != "" {
@@ -92,13 +101,51 @@ func (r *TokenResolver) Resolve(ctx context.Context) (*TokenResult, error) {
 		r.cfg.TokenFile, r.cfg.TokenEnv, metadataStatus)
 }
 
-func validateToken(token string) error {
-	if len(token) > maxTokenLength {
-		return fmt.Errorf("registration: token exceeds maximum length of %d bytes", maxTokenLength)
+// ResolveValue resolves the registration input named name from a direct
+// setting or the cloud metadata service. A non-empty trimmed direct value
+// always wins; otherwise, when metadata is enabled and a provider is set, the
+// value at metadataPath is read. A path the metadata service does not serve
+// (ErrMetadataNotFound) means "not provisioned" and yields an empty string, so
+// optional inputs stay optional. Every other read error is returned: a
+// transient IMDS failure must not be reported as a missing config setting.
+func (r *TokenResolver) ResolveValue(ctx context.Context, name, direct, metadataPath string) (string, error) {
+	if v := strings.TrimSpace(direct); v != "" {
+		if err := validateValue(name, v, maxValueLength); err != nil {
+			return "", err
+		}
+		return v, nil
 	}
-	for i := 0; i < len(token); i++ {
-		if token[i] < 0x20 || token[i] > 0x7E {
-			return errors.New("registration: token contains non-printable characters")
+
+	if r.cfg.UseMetadata && r.metadata != nil {
+		raw, err := r.metadata.ReadValue(ctx, metadataPath)
+		switch {
+		case errors.Is(err, ErrMetadataNotFound):
+			return "", nil
+		case err != nil:
+			return "", fmt.Errorf("registration: read %s from metadata: %w", name, err)
+		}
+		if v := strings.TrimSpace(raw); v != "" {
+			if err := validateValue(name, v, maxValueLength); err != nil {
+				return "", err
+			}
+			return v, nil
+		}
+	}
+
+	return "", nil
+}
+
+func validateToken(token string) error {
+	return validateValue("token", token, maxTokenLength)
+}
+
+func validateValue(name, v string, maxLen int) error {
+	if len(v) > maxLen {
+		return fmt.Errorf("registration: %s exceeds maximum length of %d bytes", name, maxLen)
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] < 0x20 || v[i] > 0x7E {
+			return fmt.Errorf("registration: %s contains non-printable characters", name)
 		}
 	}
 	return nil

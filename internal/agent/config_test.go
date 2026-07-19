@@ -38,6 +38,9 @@ api:
   base_url: "https://example.com"
 registration:
   data_dir: /tmp/plexd
+  project_id: 11111111-2222-3333-4444-555555555555
+  resource_handle: my-resource
+  requested_resource_id: substrate-id-1
 node_api:
   data_dir: /tmp/plexd
 heartbeat:
@@ -59,6 +62,15 @@ heartbeat:
 	}
 	if cfg.API.BaseURL != "https://example.com" {
 		t.Errorf("API.BaseURL = %q, want %q", cfg.API.BaseURL, "https://example.com")
+	}
+	if cfg.Registration.ProjectID != "11111111-2222-3333-4444-555555555555" {
+		t.Errorf("Registration.ProjectID = %q, want %q", cfg.Registration.ProjectID, "11111111-2222-3333-4444-555555555555")
+	}
+	if cfg.Registration.ResourceHandle != "my-resource" {
+		t.Errorf("Registration.ResourceHandle = %q, want %q", cfg.Registration.ResourceHandle, "my-resource")
+	}
+	if cfg.Registration.RequestedResourceID != "substrate-id-1" {
+		t.Errorf("Registration.RequestedResourceID = %q, want %q", cfg.Registration.RequestedResourceID, "substrate-id-1")
 	}
 }
 

@@ -23,13 +23,13 @@ type IMDSProvider struct {
 ### Constructor
 
 ```go
-func NewIMDSProvider(cfg *Config, baseURL string) *IMDSProvider
+func NewIMDSProvider(timeout time.Duration, baseURL string) *IMDSProvider
 ```
 
-| Parameter | Type      | Description                                          |
-|-----------|-----------|------------------------------------------------------|
-| `cfg`     | `*Config` | Registration config (reads `MetadataTokenPath`, `MetadataTimeout`) |
-| `baseURL` | `string`  | IMDS base URL (trailing slashes stripped)             |
+| Parameter | Type            | Description                                |
+|-----------|-----------------|--------------------------------------------|
+| `timeout` | `time.Duration` | HTTP client timeout                        |
+| `baseURL` | `string`        | IMDS base URL (trailing slashes stripped)  |
 
 ### ReadToken
 
@@ -91,7 +91,7 @@ cfg := &registration.Config{
 }
 cfg.ApplyDefaults()
 
-provider := registration.NewIMDSProvider(cfg, "http://169.254.169.254")
+provider := registration.NewIMDSProvider(cfg.MetadataTimeout, "http://169.254.169.254")
 resolver := registration.NewTokenResolver(cfg, provider)
 result, err := resolver.Resolve(ctx)
 ```

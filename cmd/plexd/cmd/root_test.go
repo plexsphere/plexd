@@ -23,6 +23,16 @@ func TestRootCommand_Help(t *testing.T) {
 	}
 }
 
+func TestRootCommand_RegistrationFlags(t *testing.T) {
+	output := executeHelp(t, "--help")
+
+	for _, flag := range []string{"--project-id", "--resource-handle", "--requested-resource-id"} {
+		if !strings.Contains(output, flag) {
+			t.Errorf("help output should contain %q, got: %s", flag, output)
+		}
+	}
+}
+
 func TestRootCommand_Version(t *testing.T) {
 	SetVersionInfo("1.2.3", "abc123", "2025-01-01")
 

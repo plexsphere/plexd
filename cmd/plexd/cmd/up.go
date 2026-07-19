@@ -68,6 +68,15 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	if logLevel != "" {
 		cfg.LogLevel = logLevel
 	}
+	if projectID != "" {
+		cfg.Registration.ProjectID = projectID
+	}
+	if resourceHandle != "" {
+		cfg.Registration.ResourceHandle = resourceHandle
+	}
+	if requestedResourceID != "" {
+		cfg.Registration.RequestedResourceID = requestedResourceID
+	}
 
 	// Apply environment variable overrides.
 	applyEnvOverrides(cfg)
@@ -88,7 +97,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 
 	// 4. Register (or load existing identity).
 	cfg.Registration.DataDir = cfg.DataDir
-	registrar := registration.NewRegistrar(client, cfg.Registration, logger)
+	registrar := newRegistrar(client, cfg.Registration, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -975,4 +984,19 @@ func setupLogger(level string) *slog.Logger {
 		lvl = slog.LevelInfo
 	}
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+}
+
+// imdsBaseURL is the link-local address of the cloud instance metadata service.
+const imdsBaseURL = "http://169.254.169.254"
+
+// newRegistrar builds a Registrar and, when use_metadata is enabled, attaches
+// the IMDS provider. Without it the metadata sources for the bootstrap token,
+// project_id, resource_handle, and requested_resource_id are never consulted.
+func newRegistrar(client *api.ControlPlane, cfg registration.Config, logger *slog.Logger) *registration.Registrar {
+	registrar := registration.NewRegistrar(client, cfg, logger)
+	if cfg.UseMetadata {
+		cfg.ApplyDefaults()
+		registrar.SetMetadataProvider(registration.NewIMDSProvider(cfg.MetadataTimeout, imdsBaseURL))
+	}
+	return registrar
 }

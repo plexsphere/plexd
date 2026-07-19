@@ -10,7 +10,6 @@ import (
 
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
-	"github.com/plexsphere/plexd/internal/registration"
 )
 
 var joinTokenFile string
@@ -48,8 +47,17 @@ func runJoin(cmd *cobra.Command, _ []string) error {
 	if joinTokenFile != "" {
 		regCfg.TokenFile = joinTokenFile
 	}
+	if projectID != "" {
+		regCfg.ProjectID = projectID
+	}
+	if resourceHandle != "" {
+		regCfg.ResourceHandle = resourceHandle
+	}
+	if requestedResourceID != "" {
+		regCfg.RequestedResourceID = requestedResourceID
+	}
 
-	registrar := registration.NewRegistrar(client, regCfg, logger)
+	registrar := newRegistrar(client, regCfg, logger)
 
 	identity, err := registrar.Register(context.Background())
 	if err != nil {
