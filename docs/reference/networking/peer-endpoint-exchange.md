@@ -59,7 +59,7 @@ func NewExchanger(
 | Parameter    | Description                                       |
 |--------------|---------------------------------------------------|
 | `discoverer` | NAT discoverer (created with the WireGuard listen port) |
-| `wgManager`  | WireGuard manager (satisfies `nat.PeerUpdater`)   |
+| `wgManager`  | WireGuard manager (applies inbound `peer_endpoint_changed` SSE updates) |
 | `cpClient`   | Control plane client (wrapped as `nat.EndpointReporter`) |
 | `cfg`        | Endpoint exchange configuration                   |
 | `logger`     | Structured logger (`log/slog`)                    |
@@ -72,7 +72,7 @@ func NewExchanger(
 |--------------------|----------------------------------------------------|--------------------------------------------------------------------|
 | `RegisterHandlers` | `(sseManager *api.SSEManager)`                     | Registers `peer_endpoint_changed` SSE handler                      |
 | `Run`              | `(ctx context.Context, nodeID string) error`       | Starts discovery + reporting loop (blocks until context cancelled)  |
-| `LastResult`       | `() *api.NATInfo`                                  | Most recent NAT info (thread-safe, nil before first discovery)     |
+| `LastResult`       | `() *nat.DiscoveryResult`                          | Most recent NAT info (thread-safe, nil before first discovery)     |
 
 ### Lifecycle
 
@@ -108,27 +108,29 @@ When `Enabled=true`:
 
 1. Log info with `component=exchange` and `node_id`
 2. Create a `controlPlaneReporter` adapter wrapping `cpClient`
-3. Call `discoverer.Run(ctx, reporter, wgManager, nodeID)` — blocks until context cancelled
+3. Call `discoverer.Run(ctx, reporter, nodeID)` — blocks until context cancelled
 
 When `Enabled=false`:
 
 1. Log info indicating NAT traversal is disabled
 2. Return nil immediately
 
-The full discovery/report/refresh loop is handled by `nat.Discoverer.Run`:
+The full discovery/report loop is handled by `nat.Discoverer.Run`:
 
 1. Initial STUN discovery — returns error if all servers fail
-2. Report endpoint to control plane, apply peer endpoints from response
-3. Ticker loop at `RefreshInterval`: re-discover, report, apply updates
+2. Report the endpoint to the control plane; the response's `stale_after` schedules the next report
+3. Deadline-driven loop: re-discover, report, reschedule from `stale_after`
 4. Context cancellation stops the loop
 
 ### LastResult
 
-Delegates to `nat.Discoverer.LastResult()`. Returns `*api.NATInfo` for heartbeat integration:
+Delegates to `nat.Discoverer.LastResult()`. Returns `*nat.DiscoveryResult`, which the heartbeat builder folds into `nat_summary`:
 
 ```go
-heartbeat := api.HeartbeatRequest{
-    NAT: exchanger.LastResult(), // nil-safe
+summary := map[string]any{}
+if info := exchanger.LastResult(); info != nil {
+    summary["endpoint"] = info.Endpoint
+    summary["nat_type"] = info.NATType.Wire()
 }
 ```
 
@@ -141,62 +143,51 @@ type controlPlaneReporter struct {
     client *api.ControlPlane
 }
 
-func (r *controlPlaneReporter) ReportEndpoint(ctx context.Context, nodeID string, req api.EndpointReport) (*api.EndpointResponse, error) {
+func (r *controlPlaneReporter) ReportEndpoint(ctx context.Context, nodeID string, req api.EndpointRequest) (*api.EndpointResponse, error) {
     return r.client.ReportEndpoint(ctx, nodeID, req)
 }
 ```
 
 The adapter is created inside `Run` with the `cpClient` from the Exchanger. The `nodeID` flows through the `nat.Discoverer.Run` call, which passes it to `EndpointReporter.ReportEndpoint` on each cycle.
 
-`wireguard.Manager` satisfies `nat.PeerUpdater` directly — no adapter is needed.
-
 ## Data Flow
 
 ```
-                          Outbound (STUN refresh loop)
-                         ┌──────────────────────────────────────────┐
-                         │                                          │
-                         ▼                                          │
-                  ┌─────────────┐    ReportEndpoint     ┌──────────┴───┐
-  STUN Servers ──▶│ Discoverer  │──────────────────────▶│ Control Plane│
-                  │ (nat pkg)   │                       │ (api pkg)    │
-                  └─────────────┘                       └──────┬───────┘
-                         │                                     │
-                         │ (same cycle)         PeerEndpoints  │
-                         │                     in response     │
-                         ▼                                     ▼
-                  ┌─────────────┐    UpdatePeer      ┌─────────────────┐
-                  │ Exchanger   │───────────────────▶│ WireGuard       │
-                  │ (this pkg)  │                    │ Manager         │
-                  └─────────────┘                    │ (wireguard pkg) │
-                                                     └────────▲────────┘
-                          Inbound (SSE events)                 │
-                         ┌─────────────────────────────────────┘
-                         │
-              ┌──────────┴──────────┐
-              │ SSEManager          │
-              │ peer_endpoint_      │
-              │ changed event       │
-              │ (api pkg)           │
-              └─────────────────────┘
+  Outbound (STUN report loop)
+  ┌─────────────┐   ReportEndpoint    ┌──────────────┐
+  │ Discoverer  │────────────────────▶│ Control Plane│
+  │ (nat pkg)   │◀────────────────────│ (api pkg)    │
+  └─────────────┘   stale_after        └──────────────┘
+        ▲              deadline
+        │ STUN
+  ┌─────┴───────┐
+  │ STUN Servers│
+  └─────────────┘
+
+  Inbound (SSE events)
+  ┌──────────────┐  peer_endpoint_    ┌──────────────┐  UpdatePeer  ┌─────────────────┐
+  │ Control Plane│  changed (SSE)     │ SSEManager   │─────────────▶│ WireGuard       │
+  │ (api pkg)    │───────────────────▶│ (api pkg)    │              │ Manager         │
+  └──────────────┘                    └──────────────┘              │ (wireguard pkg) │
+                                                                    └─────────────────┘
 ```
 
-**Outbound path** (refresh loop): STUN discovery produces the node's public endpoint. The Exchanger reports it to the control plane via `controlPlaneReporter`. The control plane response contains peer endpoints, which are applied to WireGuard via `Manager.UpdatePeer`.
+**Outbound path** (report loop): STUN discovery produces the node's public endpoint. The Exchanger reports it to the control plane via `controlPlaneReporter` and receives a `stale_after` freshness deadline that schedules the next report. The response no longer carries peer endpoints.
 
-**Inbound path** (SSE): When a remote peer discovers a new endpoint, the control plane pushes a `peer_endpoint_changed` SSE event. The registered `wireguard.HandlePeerEndpointChanged` handler updates WireGuard immediately, without waiting for the next refresh cycle.
+**Inbound path** (SSE): When a remote peer discovers a new endpoint, the control plane pushes a `peer_endpoint_changed` SSE event. The registered `wireguard.HandlePeerEndpointChanged` handler updates WireGuard immediately, without waiting for the next report cycle. Once issue #20 lands, the reconciliation state pull carries peer endpoints too.
 
 ## Integration Points
 
 ### With internal/nat
 
-- `nat.Discoverer` performs STUN discovery and runs the refresh loop
+- `nat.Discoverer` performs STUN discovery and runs the report loop
 - `nat.Config` provides all configuration (embedded in `peerexchange.Config`)
 - `nat.EndpointReporter` interface satisfied by `controlPlaneReporter` adapter
-- `nat.PeerUpdater` interface satisfied by `wireguard.Manager` directly
+- `nat.DiscoveryResult` is the return type of `LastResult`
 
 ### With internal/wireguard
 
-- `wireguard.Manager` receives peer endpoint updates via `UpdatePeer`
+- `wireguard.Manager` applies inbound peer endpoint updates driven by the SSE handler
 - `wireguard.HandlePeerEndpointChanged` provides the SSE event handler
 
 ### With internal/api
@@ -204,7 +195,6 @@ The adapter is created inside `Run` with the `cpClient` from the Exchanger. The 
 - `api.ControlPlane.ReportEndpoint` reports endpoints (wrapped by adapter)
 - `api.SSEManager.RegisterHandler` registers the SSE handler
 - `api.EventPeerEndpointChanged` is the event type constant
-- `api.NATInfo` is the return type of `LastResult`
 
 ## Error Handling
 
@@ -212,8 +202,7 @@ The adapter is created inside `Run` with the `cpClient` from the Exchanger. The 
 |---------------------------------|--------------------------------------------------------|
 | All STUN servers fail (initial) | `Run` returns error from `nat.Discoverer.Run`          |
 | STUN refresh failure            | Log warn, keep previous endpoint, retry next cycle     |
-| Endpoint report failure         | Log warn, continue refresh loop                        |
-| Individual peer update failure  | Log warn, continue processing remaining peers          |
+| Endpoint report failure         | Log warn, continue report loop                         |
 | Context cancellation            | Clean abort, return `ctx.Err()`                        |
 | NAT disabled                    | `Run` returns nil immediately                          |
 

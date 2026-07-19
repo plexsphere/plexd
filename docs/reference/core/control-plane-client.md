@@ -68,7 +68,7 @@ All methods accept a `context.Context` for cancellation and return typed respons
 | `ConnectSSE`          | `GET`           | `/v1/nodes/{node_id}/events`                      | —                    | `*http.Response`      |
 | `RotateKeys`          | `POST`          | `/v1/keys/rotate`                                 | `KeyRotateRequest`   | `*KeyRotateResponse`  |
 | `UpdateCapabilities`  | `PUT`           | `/v1/nodes/{node_id}/capabilities`                | `CapabilitiesPayload`| —                     |
-| `ReportEndpoint`      | `PUT`           | `/v1/nodes/{node_id}/endpoint`                    | `EndpointReport`     | `*EndpointResponse`   |
+| `ReportEndpoint`      | `PUT`           | `/v1/nodes/{node_id}/endpoint`                    | `EndpointRequest`    | `*EndpointResponse`   |
 | `ReportDrift`         | `POST`          | `/v1/nodes/{node_id}/drift`                       | `DriftReport`        | —                     |
 | `FetchSecret`         | `GET`           | `/v1/nodes/{node_id}/secrets/{key}`               | —                    | `*SecretResponse`     |
 | `SyncReports`         | `POST`          | `/v1/nodes/{node_id}/report`                      | `ReportSyncRequest`  | —                     |

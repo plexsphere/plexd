@@ -74,41 +74,28 @@ in use for `GET /v1/nodes/{node_id}/state` and `POST /v1/keys/rotate` until issu
 
 **HeartbeatRequest**
 
-| Field            | Type        | JSON Tag              | Description                    |
-|------------------|-------------|-----------------------|--------------------------------|
-| `NodeID`         | `string`    | `"node_id"`           | Node identifier                |
-| `Timestamp`      | `time.Time` | `"timestamp"`         | Heartbeat timestamp            |
-| `Status`         | `string`    | `"status"`            | Node status                    |
-| `Uptime`         | `string`    | `"uptime"`            | Node uptime                    |
-| `BinaryChecksum` | `string`    | `"binary_checksum"`   | Running binary checksum        |
-| `Mesh`           | `*MeshInfo`       | `"mesh,omitempty"`         | Optional mesh status           |
-| `NAT`            | `*NATInfo`        | `"nat,omitempty"`          | Optional NAT information       |
-| `Bridge`         | `*BridgeInfo`     | `"bridge,omitempty"`       | Optional bridge status         |
-| `UserAccess`     | `*UserAccessInfo` | `"user_access,omitempty"`  | Optional user access status    |
-| `Ingress`        | `*IngressInfo`    | `"ingress,omitempty"`      | Optional ingress status        |
-| `SiteToSite`     | `*SiteToSiteInfo` | `"site_to_site,omitempty"` | Optional site-to-site status   |
+| Field            | Type             | JSON Tag            | Description                    |
+|------------------|------------------|---------------------|--------------------------------|
+| `ClientNow`      | `time.Time`      | `"client_now"`      | RFC 3339 UTC send time, stamped fresh per request; the server rejects a skew above 60s |
+| `BinaryChecksum` | `string`         | `"binary_checksum"` | SHA-256 of the running binary (64-char hex or 44-char base64 of 32 bytes) |
+| `BinaryVersion`  | `string`         | `"binary_version"`  | Build version (`dev` when unset); never empty |
+| `NATSummary`     | `map[string]any` | `"nat_summary"`     | Always a JSON object: `{}` before discovery, else `{"endpoint", "nat_type"}` |
 
-**MeshInfo**
+`nat_summary` is a `map[string]any` rather than a nil-able pointer so it always
+marshals to an object: a nil map would emit `null`, which the control plane
+rejects with `malformed_heartbeat_request`.
 
-| Field        | Type   | JSON Tag        | Description            |
-|--------------|--------|-----------------|------------------------|
-| `Interface`  | `string`| `"interface"`  | WireGuard interface    |
-| `PeerCount`  | `int`  | `"peer_count"`  | Connected peer count   |
-| `ListenPort` | `int`  | `"listen_port"` | WireGuard listen port  |
-
-**NATInfo**
-
-| Field            | Type   | JSON Tag            | Description          |
-|------------------|--------|---------------------|----------------------|
-| `PublicEndpoint`  | `string`| `"public_endpoint"`| Public endpoint      |
-| `Type`           | `string`| `"type"`           | NAT type             |
+The in-memory NAT discovery result that feeds `nat_summary` is
+[`nat.DiscoveryResult`](../networking/nat-traversal.md#discoveryresult); it is
+never serialized on its own.
 
 **HeartbeatResponse**
 
-| Field        | Type   | JSON Tag       | Description                       |
-|--------------|--------|----------------|-----------------------------------|
-| `Reconcile`  | `bool` | `"reconcile"`  | Whether to trigger reconciliation |
-| `RotateKeys` | `bool` | `"rotate_keys"`| Whether to rotate keys            |
+| Field        | Type        | JSON Tag        | Description                       |
+|--------------|-------------|-----------------|-----------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | Server receive time (used for skew estimation) |
+| `Reconcile`  | `bool`      | `"reconcile"`   | Whether to trigger reconciliation |
+| `RotateKeys` | `bool`      | `"rotate_keys"` | Whether to rotate keys            |
 
 ## State
 
@@ -361,25 +348,23 @@ in use for `GET /v1/nodes/{node_id}/state` and `POST /v1/keys/rotate` until issu
 
 ### `PUT /v1/nodes/{node_id}/endpoint`
 
-**EndpointReport**
+**EndpointRequest**
 
-| Field            | Type   | JSON Tag            | Description          |
-|------------------|--------|---------------------|----------------------|
-| `PublicEndpoint`  | `string`| `"public_endpoint"`| Public endpoint      |
-| `NATType`        | `string`| `"nat_type"`       | NAT type             |
+| Field        | Type        | JSON Tag        | Description                            |
+|--------------|-------------|-----------------|----------------------------------------|
+| `Endpoint`   | `string`    | `"endpoint"`    | Discovered public endpoint (`ip:port`) |
+| `NATType`    | `string`    | `"nat_type"`    | Wire NAT type (`full_cone`, `restricted`, `port_restricted`, `symmetric`, `unknown`) |
+| `ReportedAt` | `time.Time` | `"reported_at"` | RFC 3339 UTC, stamped fresh per attempt |
 
 **EndpointResponse**
 
-| Field          | Type             | JSON Tag           | Description          |
-|----------------|------------------|--------------------|----------------------|
-| `PeerEndpoints`| `[]PeerEndpoint` | `"peer_endpoints"` | Updated peer endpoints|
+| Field        | Type        | JSON Tag        | Description                            |
+|--------------|-------------|-----------------|----------------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | Server receive time                    |
+| `StaleAfter` | `time.Time` | `"stale_after"` | Deadline after which the endpoint is stale; drives the re-report cadence |
 
-**PeerEndpoint**
-
-| Field    | Type   | JSON Tag    | Description      |
-|----------|--------|-------------|------------------|
-| `PeerID` | `string`| `"peer_id"`| Peer node ID     |
-| `Endpoint`| `string`| `"endpoint"`| Peer endpoint   |
+The response no longer carries peer endpoints. Inbound peer endpoint updates
+arrive via the `peer_endpoint_changed` SSE event.
 
 ## Key Rotation
 

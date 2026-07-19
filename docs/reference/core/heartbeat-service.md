@@ -60,19 +60,16 @@ The heartbeat request is built by an optional `buildRequest` function. If not se
 
 ```go
 type HeartbeatRequest struct {
-    NodeID         string          `json:"node_id"`
-    Timestamp      time.Time       `json:"timestamp"`
-    Status         string          `json:"status"`
-    Uptime         string          `json:"uptime"`
-    BinaryChecksum string          `json:"binary_checksum"`
-    Mesh           *MeshInfo       `json:"mesh,omitempty"`
-    NAT            *NATInfo        `json:"nat,omitempty"`
-    Bridge         *BridgeInfo     `json:"bridge,omitempty"`
-    UserAccess     *UserAccessInfo `json:"user_access,omitempty"`
-    Ingress        *IngressInfo    `json:"ingress,omitempty"`
-    SiteToSite     *SiteToSiteInfo `json:"site_to_site,omitempty"`
+    ClientNow      time.Time      `json:"client_now"`
+    BinaryChecksum string         `json:"binary_checksum"`
+    BinaryVersion  string         `json:"binary_version"`
+    NATSummary     map[string]any `json:"nat_summary"`
 }
 ```
+
+`NATSummary` is always a non-nil map so it marshals as a JSON object: `{}`
+before NAT discovery has a result, otherwise `{"endpoint", "nat_type"}`. A
+`null` value is rejected by the control plane.
 
 ## Response Handling
 
@@ -80,10 +77,15 @@ The control plane returns a `HeartbeatResponse` with directive flags:
 
 ```go
 type HeartbeatResponse struct {
-    Reconcile  bool `json:"reconcile"`
-    RotateKeys bool `json:"rotate_keys"`
+    AcceptedAt time.Time `json:"accepted_at"`
+    Reconcile  bool      `json:"reconcile"`
+    RotateKeys bool      `json:"rotate_keys"`
 }
 ```
+
+On acceptance, `accepted_at` is logged at **debug** level alongside the local
+send time so operators can estimate the clock skew between the node and the
+control plane.
 
 | Flag          | Action                                              |
 |---------------|-----------------------------------------------------|
@@ -101,6 +103,10 @@ When the heartbeat receives a 401 error (`api.ErrUnauthorized`), the `onAuthFail
 3. Log the re-registration result
 
 If re-registration fails, the error is logged and the heartbeat continues retrying on the next tick.
+
+### Clock Skew
+
+When the heartbeat is rejected with the `clock_skew` problem code — the control plane found `client_now` more than 60s from its own time — the service logs at **error** level, instructing the operator to synchronize the system clock via NTP. There is no extra retry; the next attempt is the next 30s tick.
 
 ### Other Errors
 
