@@ -39,28 +39,34 @@ func TestRegister_Success(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-		if req.Token != "boot-token" {
-			t.Errorf("token = %q, want %q", req.Token, "boot-token")
+		if req.ProjectID != "proj-1" {
+			t.Errorf("project_id = %q, want %q", req.ProjectID, "proj-1")
 		}
-		if req.Hostname != "node-1" {
-			t.Errorf("hostname = %q, want %q", req.Hostname, "node-1")
+		if req.ResourceHandle != "edge-router-01" {
+			t.Errorf("resource_handle = %q, want %q", req.ResourceHandle, "edge-router-01")
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(RegisterResponse{
-			NodeID:        "n1",
-			MeshIP:        "10.0.0.1",
-			NodeSecretKey: "secret-key",
-			Peers: []Peer{
-				{ID: "p1", MeshIP: "10.0.0.2"},
+			NodeID:           "n1",
+			MeshIP:           "10.0.0.1",
+			SigningPublicKey: "signing-pub",
+			SigningKeyID:     "did:web:plexsphere.com#key-1",
+			NSK:              "secret-key",
+			DomainMeshCIDR:   "100.64.0.0/10",
+			PeerSnapshot: []RegisterPeer{
+				{NodeID: "p1", MeshIP: "10.0.0.2", PublicKey: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=", FallbackEndpoint: "203.0.113.1:51820"},
 			},
 		})
 	})
 
 	resp, err := client.Register(context.Background(), RegisterRequest{
-		Token:    "boot-token",
-		Hostname: "node-1",
+		ProjectID:      "proj-1",
+		ResourceHandle: "edge-router-01",
+		BootstrapToken: "psb_test_e2eproject_node_aaaaaaaaaaaaaaaaaaaaaa",
+		Nonce:          "f3f8c0b8-7a0a-8a0a-a0a0-a0a0a0a0a0a0",
+		PublicKey:      "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
 	})
 	if err != nil {
 		t.Fatalf("Register: %v", err)
@@ -71,34 +77,62 @@ func TestRegister_Success(t *testing.T) {
 	if resp.MeshIP != "10.0.0.1" {
 		t.Errorf("MeshIP = %q, want %q", resp.MeshIP, "10.0.0.1")
 	}
-	if len(resp.Peers) != 1 {
-		t.Fatalf("len(Peers) = %d, want 1", len(resp.Peers))
+	if resp.SigningPublicKey != "signing-pub" {
+		t.Errorf("SigningPublicKey = %q, want %q", resp.SigningPublicKey, "signing-pub")
 	}
-	if resp.Peers[0].ID != "p1" {
-		t.Errorf("Peers[0].ID = %q, want %q", resp.Peers[0].ID, "p1")
+	if resp.SigningKeyID != "did:web:plexsphere.com#key-1" {
+		t.Errorf("SigningKeyID = %q, want %q", resp.SigningKeyID, "did:web:plexsphere.com#key-1")
+	}
+	if resp.NSK != "secret-key" {
+		t.Errorf("NSK = %q, want %q", resp.NSK, "secret-key")
+	}
+	if resp.DomainMeshCIDR != "100.64.0.0/10" {
+		t.Errorf("DomainMeshCIDR = %q, want %q", resp.DomainMeshCIDR, "100.64.0.0/10")
+	}
+	if len(resp.PeerSnapshot) != 1 {
+		t.Fatalf("len(PeerSnapshot) = %d, want 1", len(resp.PeerSnapshot))
+	}
+	if resp.PeerSnapshot[0].NodeID != "p1" {
+		t.Errorf("PeerSnapshot[0].NodeID = %q, want %q", resp.PeerSnapshot[0].NodeID, "p1")
+	}
+	if resp.PeerSnapshot[0].FallbackEndpoint != "203.0.113.1:51820" {
+		t.Errorf("PeerSnapshot[0].FallbackEndpoint = %q, want %q", resp.PeerSnapshot[0].FallbackEndpoint, "203.0.113.1:51820")
 	}
 }
 
-func TestRegister_UsesBootstrapToken(t *testing.T) {
-	var gotAuth string
+// POST /v1/register is security: [] — it must never carry the shared bearer
+// token, and it must not blank that token on the client the heartbeat, SSE, and
+// reconcile paths share. Otherwise those concurrent requests would go out
+// unauthenticated during a re-registration and, for SSE, exit for good on the
+// resulting 401.
+func TestRegister_OmitsAuthHeaderAndPreservesToken(t *testing.T) {
+	var registerAuth, followupAuth string
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("Authorization")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(RegisterResponse{NodeID: "n1"})
+		if r.URL.Path == "/v1/register" {
+			registerAuth = r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(RegisterResponse{NodeID: "n1", MeshIP: "10.0.0.1"})
+			return
+		}
+		followupAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
 	})
+	// newEndpointTestClient already set a bearer token on the client.
 
-	client.SetAuthToken("bootstrap-token-xyz")
-
-	_, err := client.Register(context.Background(), RegisterRequest{
-		Token:    "bootstrap-token-xyz",
-		Hostname: "node-1",
-	})
-	if err != nil {
+	if _, err := client.Register(context.Background(), RegisterRequest{ProjectID: "p"}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if gotAuth != "Bearer bootstrap-token-xyz" {
-		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer bootstrap-token-xyz")
+	if registerAuth != "" {
+		t.Errorf("register Authorization = %q, want empty", registerAuth)
+	}
+
+	// The shared token is untouched, so later calls still authenticate.
+	if err := client.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	if followupAuth != "Bearer test-token" {
+		t.Errorf("follow-up Authorization = %q, want %q", followupAuth, "Bearer test-token")
 	}
 }
 

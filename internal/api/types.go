@@ -12,19 +12,32 @@ import (
 // ---------------------------------------------------------------------------
 
 type RegisterRequest struct {
-	Token        string               `json:"token"`
-	PublicKey    string               `json:"public_key"`
-	Hostname     string               `json:"hostname"`
-	Metadata     map[string]string    `json:"metadata,omitempty"`
-	Capabilities *CapabilitiesPayload `json:"capabilities,omitempty"`
+	ProjectID           string `json:"project_id"`
+	ResourceHandle      string `json:"resource_handle"`
+	BootstrapToken      string `json:"bootstrap_token"`
+	Nonce               string `json:"nonce"`
+	PublicKey           string `json:"public_key"`
+	RequestedResourceID string `json:"requested_resource_id,omitempty"`
 }
 
 type RegisterResponse struct {
+	NodeID           string         `json:"node_id"`
+	MeshIP           string         `json:"mesh_ip"`
+	SigningPublicKey string         `json:"signing_public_key"`
+	SigningKeyID     string         `json:"signing_key_id"`
+	NSK              string         `json:"nsk"`
+	PeerSnapshot     []RegisterPeer `json:"peer_snapshot"`
+	DomainMeshCIDR   string         `json:"domain_mesh_cidr"`
+}
+
+// RegisterPeer is the initial peer snapshot entry returned by POST /v1/register.
+// It is deliberately narrow: it carries NO psk, allowed_ips, or endpoint. The
+// richer reconciliation peer shapes belong to issue #20.
+type RegisterPeer struct {
 	NodeID           string `json:"node_id"`
 	MeshIP           string `json:"mesh_ip"`
-	SigningPublicKey string `json:"signing_public_key"`
-	NodeSecretKey    string `json:"node_secret_key"`
-	Peers            []Peer `json:"peers"`
+	PublicKey        string `json:"public_key"`
+	FallbackEndpoint string `json:"fallback_endpoint,omitempty"`
 }
 
 // Peer is used in registration responses and state responses.

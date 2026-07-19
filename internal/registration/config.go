@@ -48,13 +48,6 @@ type Config struct {
 	// Default: 2s
 	MetadataTimeout time.Duration `yaml:"metadata_timeout"`
 
-	// Hostname overrides the system hostname.
-	// Default: empty (uses os.Hostname())
-	Hostname string `yaml:"hostname"`
-
-	// Metadata holds optional key-value pairs for the registration request.
-	Metadata map[string]string `yaml:"metadata"`
-
 	// MaxRetryDuration is the maximum duration to retry registration.
 	// Default: 5m
 	MaxRetryDuration time.Duration `yaml:"max_retry_duration"`

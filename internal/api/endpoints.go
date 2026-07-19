@@ -9,10 +9,11 @@ import (
 )
 
 // Register sends a registration request to the control plane.
-// POST /v1/register
+// POST /v1/register is security: [] — the bootstrap token travels in the body,
+// so the request never carries the shared bearer token even if one is set.
 func (c *ControlPlane) Register(ctx context.Context, req RegisterRequest) (*RegisterResponse, error) {
 	var resp RegisterResponse
-	if err := c.doRequest(ctx, http.MethodPost, "/v1/register", req, &resp); err != nil {
+	if err := c.doRequest(withoutAuth(ctx), http.MethodPost, "/v1/register", req, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil

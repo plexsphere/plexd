@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,25 +34,25 @@ import (
 
 // AssertionCounters holds call counters for each tracked endpoint.
 type AssertionCounters struct {
-	RegisterCount          int64 `json:"registration_count"`
-	HeartbeatCount         int64 `json:"heartbeat_count"`
-	StateCount             int64 `json:"state_count"`
-	MetadataCount          int64 `json:"metadata_count"`
-	DeregisterCount        int64 `json:"deregister_count"`
-	KeyRotateCount         int64 `json:"key_rotate_count"`
-	CapabilitiesCount      int64 `json:"capabilities_count"`
-	EndpointCount          int64 `json:"endpoint_count"`
-	DriftCount             int64 `json:"drift_count"`
-	SecretsCount           int64 `json:"secrets_count"`
-	ReportCount            int64 `json:"report_count"`
-	ExecutionAckCount      int64 `json:"execution_ack_count"`
-	ExecutionResultCount   int64 `json:"execution_result_count"`
-	MetricsCount           int64 `json:"metrics_count"`
-	LogsCount              int64 `json:"logs_count"`
-	AuditCount             int64 `json:"audit_count"`
-	ArtifactCount          int64 `json:"artifact_count"`
-	TunnelReadyCount       int64 `json:"tunnel_ready_count"`
-	TunnelClosedCount      int64 `json:"tunnel_closed_count"`
+	RegisterCount           int64 `json:"registration_count"`
+	HeartbeatCount          int64 `json:"heartbeat_count"`
+	StateCount              int64 `json:"state_count"`
+	MetadataCount           int64 `json:"metadata_count"`
+	DeregisterCount         int64 `json:"deregister_count"`
+	KeyRotateCount          int64 `json:"key_rotate_count"`
+	CapabilitiesCount       int64 `json:"capabilities_count"`
+	EndpointCount           int64 `json:"endpoint_count"`
+	DriftCount              int64 `json:"drift_count"`
+	SecretsCount            int64 `json:"secrets_count"`
+	ReportCount             int64 `json:"report_count"`
+	ExecutionAckCount       int64 `json:"execution_ack_count"`
+	ExecutionResultCount    int64 `json:"execution_result_count"`
+	MetricsCount            int64 `json:"metrics_count"`
+	LogsCount               int64 `json:"logs_count"`
+	AuditCount              int64 `json:"audit_count"`
+	ArtifactCount           int64 `json:"artifact_count"`
+	TunnelReadyCount        int64 `json:"tunnel_ready_count"`
+	TunnelClosedCount       int64 `json:"tunnel_closed_count"`
 	IntegrityViolationCount int64 `json:"integrity_violation_count"`
 	InjectEventCount        int64 `json:"inject_event_count"`
 	LocalMetricsCount       int64 `json:"local_metrics_count"`
@@ -68,25 +69,25 @@ type Server struct {
 	// Defaults to DefaultKeepAliveInterval (15s). Set before calling Handler().
 	KeepAliveInterval time.Duration
 
-	registerCount          atomic.Int64
-	heartbeatCount         atomic.Int64
-	stateCount             atomic.Int64
-	metadataCount          atomic.Int64
-	deregisterCount        atomic.Int64
-	keyRotateCount         atomic.Int64
-	capabilitiesCount      atomic.Int64
-	endpointCount          atomic.Int64
-	driftCount             atomic.Int64
-	secretsCount           atomic.Int64
-	reportCount            atomic.Int64
-	executionAckCount      atomic.Int64
-	executionResultCount   atomic.Int64
-	metricsCount           atomic.Int64
-	logsCount              atomic.Int64
-	auditCount             atomic.Int64
-	artifactCount          atomic.Int64
-	tunnelReadyCount       atomic.Int64
-	tunnelClosedCount      atomic.Int64
+	registerCount           atomic.Int64
+	heartbeatCount          atomic.Int64
+	stateCount              atomic.Int64
+	metadataCount           atomic.Int64
+	deregisterCount         atomic.Int64
+	keyRotateCount          atomic.Int64
+	capabilitiesCount       atomic.Int64
+	endpointCount           atomic.Int64
+	driftCount              atomic.Int64
+	secretsCount            atomic.Int64
+	reportCount             atomic.Int64
+	executionAckCount       atomic.Int64
+	executionResultCount    atomic.Int64
+	metricsCount            atomic.Int64
+	logsCount               atomic.Int64
+	auditCount              atomic.Int64
+	artifactCount           atomic.Int64
+	tunnelReadyCount        atomic.Int64
+	tunnelClosedCount       atomic.Int64
 	integrityViolationCount atomic.Int64
 	injectEventCount        atomic.Int64
 	localMetricsCount       atomic.Int64
@@ -106,11 +107,14 @@ type Server struct {
 
 	sseClientID atomic.Uint64
 
-	signingPrivateKey ed25519.PrivateKey
+	signingPrivateKey   ed25519.PrivateKey
 	signingPublicKeyB64 string
 
-	nsk                []byte // 32-byte AES-256-GCM key for secret encryption
+	nsk                 []byte // 32-byte AES-256-GCM key for secret encryption
 	expectedBearerToken string // plaintext bearer token for local endpoint auth
+
+	consumedNonces   map[string]struct{} // key: projectID+"|"+nonce, recorded only on 201
+	consumedNoncesMu sync.Mutex
 
 	mux *http.ServeMux
 }
@@ -130,8 +134,12 @@ func New() *Server {
 		mux:                 http.NewServeMux(),
 		signingPrivateKey:   priv,
 		signingPublicKeyB64: pubB64,
-		nsk:                 []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"), // exactly 32 bytes
+		// A deterministic 32-byte key that is deliberately not valid UTF-8, so
+		// the suite cannot pass by accident if nsk ever regresses to being
+		// emitted as a raw string instead of base64.
+		nsk:                 mockNSK,
 		expectedBearerToken: "e2e-local-bearer-token",
+		consumedNonces:      make(map[string]struct{}),
 		heartbeatFixture: api.HeartbeatResponse{
 			Reconcile:  true,
 			RotateKeys: false,
@@ -255,25 +263,25 @@ func (s *Server) Handler() http.Handler {
 // Assertions returns a snapshot of the current call counters.
 func (s *Server) Assertions() AssertionCounters {
 	return AssertionCounters{
-		RegisterCount:          s.registerCount.Load(),
-		HeartbeatCount:         s.heartbeatCount.Load(),
-		StateCount:             s.stateCount.Load(),
-		MetadataCount:          s.metadataCount.Load(),
-		DeregisterCount:        s.deregisterCount.Load(),
-		KeyRotateCount:         s.keyRotateCount.Load(),
-		CapabilitiesCount:      s.capabilitiesCount.Load(),
-		EndpointCount:          s.endpointCount.Load(),
-		DriftCount:             s.driftCount.Load(),
-		SecretsCount:           s.secretsCount.Load(),
-		ReportCount:            s.reportCount.Load(),
-		ExecutionAckCount:      s.executionAckCount.Load(),
-		ExecutionResultCount:   s.executionResultCount.Load(),
-		MetricsCount:           s.metricsCount.Load(),
-		LogsCount:              s.logsCount.Load(),
-		AuditCount:             s.auditCount.Load(),
-		ArtifactCount:          s.artifactCount.Load(),
-		TunnelReadyCount:       s.tunnelReadyCount.Load(),
-		TunnelClosedCount:      s.tunnelClosedCount.Load(),
+		RegisterCount:           s.registerCount.Load(),
+		HeartbeatCount:          s.heartbeatCount.Load(),
+		StateCount:              s.stateCount.Load(),
+		MetadataCount:           s.metadataCount.Load(),
+		DeregisterCount:         s.deregisterCount.Load(),
+		KeyRotateCount:          s.keyRotateCount.Load(),
+		CapabilitiesCount:       s.capabilitiesCount.Load(),
+		EndpointCount:           s.endpointCount.Load(),
+		DriftCount:              s.driftCount.Load(),
+		SecretsCount:            s.secretsCount.Load(),
+		ReportCount:             s.reportCount.Load(),
+		ExecutionAckCount:       s.executionAckCount.Load(),
+		ExecutionResultCount:    s.executionResultCount.Load(),
+		MetricsCount:            s.metricsCount.Load(),
+		LogsCount:               s.logsCount.Load(),
+		AuditCount:              s.auditCount.Load(),
+		ArtifactCount:           s.artifactCount.Load(),
+		TunnelReadyCount:        s.tunnelReadyCount.Load(),
+		TunnelClosedCount:       s.tunnelClosedCount.Load(),
 		IntegrityViolationCount: s.integrityViolationCount.Load(),
 		InjectEventCount:        s.injectEventCount.Load(),
 		LocalMetricsCount:       s.localMetricsCount.Load(),
@@ -282,7 +290,7 @@ func (s *Server) Assertions() AssertionCounters {
 	}
 }
 
-// fixturePeers is the shared peer fixture used by both register and state handlers.
+// fixturePeers is the state-fixture peer set used by the state handler.
 var fixturePeers = []api.Peer{
 	{
 		ID:         "peer-001",
@@ -299,6 +307,46 @@ var fixturePeers = []api.Peer{
 		Endpoint:   "203.0.113.2:51820",
 		AllowedIPs: []string{"10.99.0.3/32"},
 		PSK:        "mock-psk-002",
+	},
+}
+
+// Register contract fixtures and validators (issue #18).
+const (
+	mockProjectID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0"
+	mockNodeID    = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3"
+)
+
+var (
+	// mockNSK is the fixture NodeSecretKey: 32 bytes of high-bit data that is
+	// not valid UTF-8, matching the entropy a real control plane returns.
+	mockNSK = []byte{
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		0x80, 0x91, 0xa2, 0xb3, 0xc4, 0xd5, 0xe6, 0xf7,
+		0xf8, 0xe9, 0xda, 0xcb, 0xbc, 0xad, 0x9e, 0x8f,
+	}
+	// pubKeyRe matches a standard-padded base64 X25519 public key (44 chars).
+	pubKeyRe = regexp.MustCompile("^[A-Za-z0-9+/]{43}=$")
+	// tokenRe matches a bootstrap token and captures its kind (node|bridge).
+	tokenRe = regexp.MustCompile("^psb_[a-z]+_[a-z2-7]+_(node|bridge)_[a-z2-7]{20,}$")
+	// uuidRe matches a canonical 8-4-4-4-12 hex UUID (any version).
+	uuidRe = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+)
+
+// fixtureRegisterPeers is the initial peer snapshot returned by the register
+// handler. It is deliberately narrow (see api.RegisterPeer) and is distinct
+// from fixturePeers, which the state handler serves.
+var fixtureRegisterPeers = []api.RegisterPeer{
+	{
+		NodeID:           "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+		MeshIP:           "10.99.0.2",
+		PublicKey:        "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+		FallbackEndpoint: "203.0.113.1:51820",
+	},
+	{
+		NodeID:    "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+		MeshIP:    "10.99.0.3",
+		PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
 	},
 }
 
@@ -363,18 +411,23 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/test/inject-event", methodNotAllowed)
 }
 
-// captureBody reads the full request body, stores the raw bytes in lastRequests
-// under the given endpoint name, and returns the bytes for further processing.
-// Handles gzip-compressed request bodies transparently.
+// maxCapturedBody bounds how many bytes captureBody keeps per request. The
+// mock is published on all interfaces by test/e2e/docker-compose.yml, so the
+// decompressed stream must be bounded too: gzip expands arbitrarily.
+const maxCapturedBody = 1 << 20
+
+// captureBody reads the request body up to maxCapturedBody, stores the raw
+// bytes in lastRequests under the given endpoint name, and returns the bytes
+// for further processing. Handles gzip-compressed request bodies transparently.
 func (s *Server) captureBody(endpoint string, r *http.Request) ([]byte, error) {
-	var reader io.Reader = r.Body
+	var reader io.Reader = io.LimitReader(r.Body, maxCapturedBody)
 	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
 		gr, err := gzip.NewReader(r.Body)
 		if err != nil {
 			return nil, err
 		}
 		defer gr.Close()
-		reader = gr
+		reader = io.LimitReader(gr, maxCapturedBody)
 	}
 	data, err := io.ReadAll(reader)
 	if err != nil {
@@ -418,23 +471,149 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct{}{})
 }
 
-// handleRegister handles POST /v1/register (REQ-002).
+// handleRegister handles POST /v1/register (REQ-002). It enforces the full
+// registration contract from issue #18: success is 201, and every denial is an
+// RFC 9457 application/problem+json body mirroring the platform taxonomy. The
+// bootstrap token is consumed (its nonce recorded) only on the 201 branch.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	s.registerCount.Add(1)
+
+	// 1. Body decode (400, no code).
+	r.Body = http.MaxBytesReader(w, r.Body, maxCapturedBody)
+	data, err := s.captureBody("register", r)
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, "", "invalid request body")
+		return
+	}
 	var req api.RegisterRequest
-	if !s.decodeBody(w, r, "register", &req) {
+	if err := json.Unmarshal(data, &req); err != nil {
+		writeProblem(w, http.StatusBadRequest, "", "invalid request body")
 		return
 	}
 
-	s.registerCount.Add(1)
+	// 2. Invariants (422, no code).
+	switch {
+	case req.BootstrapToken == "":
+		writeProblem(w, http.StatusUnprocessableEntity, "", "bootstrap_token is required")
+		return
+	case req.Nonce == "":
+		writeProblem(w, http.StatusUnprocessableEntity, "", "nonce is required")
+		return
+	case req.ResourceHandle == "":
+		writeProblem(w, http.StatusUnprocessableEntity, "", "resource_handle is required")
+		return
+	case req.ProjectID == "" || req.ProjectID == "00000000-0000-0000-0000-000000000000" || !uuidRe.MatchString(req.ProjectID):
+		writeProblem(w, http.StatusUnprocessableEntity, "", "project_id must be a non-zero UUID")
+		return
+	}
+	for _, f := range []string{req.ProjectID, req.ResourceHandle, req.BootstrapToken, req.Nonce, req.RequestedResourceID} {
+		if len(f) > 4096 {
+			writeProblem(w, http.StatusUnprocessableEntity, "", "field exceeds maximum length of 4096")
+			return
+		}
+	}
+
+	// 3. Public key (400, public_key_invalid) — shape, then reject the zero key.
+	if !pubKeyRe.MatchString(req.PublicKey) {
+		writeProblem(w, http.StatusBadRequest, "public_key_invalid", "public_key must be 44-char standard base64")
+		return
+	}
+	if raw, err := base64.StdEncoding.DecodeString(req.PublicKey); err == nil && isAllZero(raw) {
+		writeProblem(w, http.StatusBadRequest, "public_key_invalid", "public_key must not be the zero key")
+		return
+	}
+
+	// 4. Token (403).
+	m := tokenRe.FindStringSubmatch(req.BootstrapToken)
+	if m == nil {
+		writeProblem(w, http.StatusForbidden, "", "bootstrap_token is malformed")
+		return
+	}
+	if m[1] == "bridge" {
+		writeProblem(w, http.StatusForbidden, "kind_mismatch", "bootstrap_token kind does not match node registration")
+		return
+	}
+	// The random segment is the trailing field after the kind. tokenRe has
+	// already anchored the format to exactly four underscores, so index 4 is
+	// safe. Token layout: psb_<env>_<project>_<kind>_<random>.
+	random := strings.Split(req.BootstrapToken, "_")[4]
+	switch {
+	case strings.Contains(random, "consumed"):
+		writeProblem(w, http.StatusForbidden, "token_consumed", "bootstrap_token already consumed")
+		return
+	case strings.Contains(random, "expired"):
+		writeProblem(w, http.StatusForbidden, "token_expired", "bootstrap_token expired")
+		return
+	case strings.Contains(random, "revoked"):
+		writeProblem(w, http.StatusForbidden, "token_revoked", "bootstrap_token revoked")
+		return
+	}
+
+	// 5. Project match (403).
+	if req.ProjectID != mockProjectID {
+		writeProblem(w, http.StatusForbidden, "project_mismatch", "project_id does not match the bootstrap token")
+		return
+	}
+
+	// 6. Nonce replay (403).
+	nonceKey := req.ProjectID + "|" + req.Nonce
+	s.consumedNoncesMu.Lock()
+	_, replayed := s.consumedNonces[nonceKey]
+	s.consumedNoncesMu.Unlock()
+	if replayed {
+		writeProblem(w, http.StatusForbidden, "nonce_collision", "nonce has already been used")
+		return
+	}
+
+	// 7. Resource resolution (404).
+	if req.ResourceHandle == "unknown-resource" {
+		writeProblem(w, http.StatusNotFound, "resource_not_found", "resource handle could not be resolved")
+		return
+	}
+
+	// 8. Magic handles for allocator/server failures.
+	switch req.ResourceHandle {
+	case "exhausted-pool":
+		writeProblem(w, http.StatusServiceUnavailable, "pool_exhausted", "address pool exhausted")
+		return
+	case "exhausted-subrange":
+		writeProblem(w, http.StatusServiceUnavailable, "subrange_exhausted", "address subrange exhausted")
+		return
+	case "contended-allocator":
+		writeProblem(w, http.StatusServiceUnavailable, "allocator_contention", "allocator contention, retry")
+		return
+	case "boom-internal":
+		writeProblem(w, http.StatusInternalServerError, "", "internal server error")
+		return
+	}
+
+	// 9. Success (201). Claim the nonce only here — the token is never consumed
+	// on any error branch. Check-and-set under one lock: the read in step 6 is
+	// a fast path, so two concurrent registrations sharing a nonce would
+	// otherwise both observe it free and both be granted an identity.
+	s.consumedNoncesMu.Lock()
+	_, replayed = s.consumedNonces[nonceKey]
+	if !replayed {
+		s.consumedNonces[nonceKey] = struct{}{}
+	}
+	s.consumedNoncesMu.Unlock()
+	if replayed {
+		writeProblem(w, http.StatusForbidden, "nonce_collision", "nonce has already been used")
+		return
+	}
 
 	resp := api.RegisterResponse{
-		NodeID:          "node-mock-001",
-		MeshIP:          "10.99.0.1",
+		NodeID:           mockNodeID,
+		MeshIP:           "10.99.0.1",
 		SigningPublicKey: s.signingPublicKeyB64,
-		NodeSecretKey:   string(s.nsk),
-		Peers:           fixturePeers,
+		SigningKeyID:     "did:web:plexsphere.com#key-e2e",
+		// NSK is standard-padded base64 per the register contract; plexd
+		// decodes it back into the 32-byte AES-256-GCM key.
+		NSK:            base64.StdEncoding.EncodeToString(s.nsk),
+		PeerSnapshot:   fixtureRegisterPeers,
+		DomainMeshCIDR: "10.99.0.0/24",
 	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 // handleHeartbeat handles POST /v1/nodes/{id}/heartbeat (REQ-003).
@@ -995,6 +1174,38 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		slog.Error("writeJSON: encode failed", "error", err)
 	}
+}
+
+// writeProblem writes an RFC 9457 application/problem+json error response. The
+// type member is a well-known problem URI when code is non-empty, else
+// about:blank; the code member is omitted when code is empty.
+func writeProblem(w http.ResponseWriter, status int, code, detail string) {
+	problem := map[string]any{
+		"type":     "about:blank",
+		"title":    http.StatusText(status),
+		"status":   status,
+		"detail":   detail,
+		"instance": "/v1/register",
+	}
+	if code != "" {
+		problem["type"] = "https://api.plexsphere.com/problems/" + code
+		problem["code"] = code
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(problem); err != nil {
+		slog.Error("writeProblem: encode failed", "error", err)
+	}
+}
+
+// isAllZero reports whether every byte in b is zero.
+func isAllZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func methodNotAllowed(w http.ResponseWriter, r *http.Request) {

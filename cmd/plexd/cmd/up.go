@@ -416,7 +416,10 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// 12. Create node API server.
 	cfg.NodeAPI.DataDir = cfg.DataDir
 	cfg.NodeAPI.SecretAuthEnabled = true
-	nsk := []byte(identity.NodeSecretKey)
+	nsk, err := identity.SecretKey()
+	if err != nil {
+		return fmt.Errorf("plexd up: %w", err)
+	}
 	nodeAPISrv := nodeapi.NewServer(cfg.NodeAPI, client, nsk, logger)
 	nodeAPISrv.SetActionProvider(executor)
 	nodeAPISrv.SetHookReloader(hookWatcher)

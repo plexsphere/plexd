@@ -1,8 +1,10 @@
 package mockapi_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,8 +30,38 @@ func newTestServer(t *testing.T) (*mockapi.Server, *httptest.Server) {
 	return srv, ts
 }
 
-// registerBody is a valid JSON body for POST /v1/register.
-const registerBody = `{"token":"tok_123","public_key":"pk_abc","hostname":"node-1"}`
+// Register contract fixtures (issue #18). These mirror the mock's unexported
+// constants; the mock package is imported as an external test package.
+const (
+	testMockProjectID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0"
+	testMockNodeID    = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3"
+	testNodeToken     = "psb_test_e2eproject_node_aaaaaaaaaaaaaaaaaaaaaa"
+	testValidPubKey   = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+)
+
+// registerBody is a valid new-contract JSON body for POST /v1/register.
+const registerBody = `{"project_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","resource_handle":"edge-router-01","bootstrap_token":"psb_test_e2eproject_node_aaaaaaaaaaaaaaaaaaaaaa","nonce":"11111111-1111-4111-8111-111111111111","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}`
+
+// nonceCounter yields unique nonces for register tests that need distinct ones.
+var nonceCounter atomic.Uint64
+
+// freshNonce returns a unique, canonically-shaped UUID nonce.
+func freshNonce() string {
+	n := nonceCounter.Add(1)
+	return fmt.Sprintf("%08x-0000-4000-8000-%012x", n, n)
+}
+
+// validRegisterFields returns a mutable map of valid register request fields,
+// including a fresh nonce.
+func validRegisterFields() map[string]any {
+	return map[string]any{
+		"project_id":      testMockProjectID,
+		"resource_handle": "edge-router-01",
+		"bootstrap_token": testNodeToken,
+		"nonce":           freshNonce(),
+		"public_key":      testValidPubKey,
+	}
+}
 
 // heartbeatBody is a valid JSON body for POST /v1/nodes/{id}/heartbeat.
 const heartbeatBody = `{"node_id":"node-1","timestamp":"2025-01-01T00:00:00Z","status":"healthy","uptime":"1h","binary_checksum":"abc123"}`
@@ -206,16 +239,20 @@ func TestPing_WrongMethod_Returns405(t *testing.T) {
 func TestRegister_ReturnsFixtureAndCounterViaHTTP(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	// Call register twice.
+	// Call register twice with fresh nonces (each nonce is single-use).
 	for i := 0; i < 2; i++ {
-		resp, err := http.Post(ts.URL+"/v1/register", "application/json", strings.NewReader(registerBody))
+		body, err := json.Marshal(validRegisterFields())
+		if err != nil {
+			t.Fatalf("marshal request: %v", err)
+		}
+		resp, err := http.Post(ts.URL+"/v1/register", "application/json", strings.NewReader(string(body)))
 		if err != nil {
 			t.Fatalf("POST /v1/register #%d: %v", i+1, err)
 		}
 
-		if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode != http.StatusCreated {
 			resp.Body.Close()
-			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusCreated)
 		}
 
 		var reg api.RegisterResponse
@@ -225,30 +262,40 @@ func TestRegister_ReturnsFixtureAndCounterViaHTTP(t *testing.T) {
 		}
 		resp.Body.Close()
 
-		// Verify fixture fields on first call.
+		// Verify every response field on the first call.
 		if i == 0 {
-			if reg.NodeID == "" {
-				t.Error("NodeID is empty")
+			if reg.NodeID != testMockNodeID {
+				t.Errorf("NodeID = %q, want %q", reg.NodeID, testMockNodeID)
 			}
-			if reg.MeshIP == "" {
-				t.Error("MeshIP is empty")
+			if reg.MeshIP != "10.99.0.1" {
+				t.Errorf("MeshIP = %q, want %q", reg.MeshIP, "10.99.0.1")
 			}
 			if reg.SigningPublicKey == "" {
 				t.Error("SigningPublicKey is empty")
 			}
-			if reg.NodeSecretKey == "" {
-				t.Error("NodeSecretKey is empty")
+			if reg.SigningKeyID != "did:web:plexsphere.com#key-e2e" {
+				t.Errorf("SigningKeyID = %q, want %q", reg.SigningKeyID, "did:web:plexsphere.com#key-e2e")
 			}
-			if len(reg.Peers) != 2 {
-				t.Errorf("len(Peers) = %d, want 2", len(reg.Peers))
+			if len(reg.NSK) != 44 {
+				t.Errorf("len(NSK) = %d, want 44 (standard-padded base64)", len(reg.NSK))
 			}
-			for _, p := range reg.Peers {
-				if p.ID == "" || p.PublicKey == "" || p.MeshIP == "" || p.Endpoint == "" || p.PSK == "" {
-					t.Errorf("peer %q has empty fields", p.ID)
+			if reg.DomainMeshCIDR != "10.99.0.0/24" {
+				t.Errorf("DomainMeshCIDR = %q, want %q", reg.DomainMeshCIDR, "10.99.0.0/24")
+			}
+			if len(reg.PeerSnapshot) != 2 {
+				t.Fatalf("len(PeerSnapshot) = %d, want 2", len(reg.PeerSnapshot))
+			}
+			for _, p := range reg.PeerSnapshot {
+				if p.NodeID == "" || p.PublicKey == "" || p.MeshIP == "" {
+					t.Errorf("peer %q has empty required fields", p.NodeID)
 				}
-				if len(p.AllowedIPs) == 0 {
-					t.Errorf("peer %q has no AllowedIPs", p.ID)
-				}
+			}
+			// The first peer has a fallback endpoint; the second does not.
+			if reg.PeerSnapshot[0].FallbackEndpoint == "" {
+				t.Error("PeerSnapshot[0].FallbackEndpoint is empty, want set")
+			}
+			if reg.PeerSnapshot[1].FallbackEndpoint != "" {
+				t.Errorf("PeerSnapshot[1].FallbackEndpoint = %q, want empty", reg.PeerSnapshot[1].FallbackEndpoint)
 			}
 		}
 	}
@@ -272,6 +319,173 @@ func TestRegister_InvalidBody_Returns400(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
 	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+	}
+}
+
+func TestRegister_DenialTaxonomy(t *testing.T) {
+	longStr := strings.Repeat("a", 4097)
+	// 43 'A' + '=' decodes to 32 zero bytes: a shape-valid but forbidden key.
+	zeroKey := strings.Repeat("A", 43) + "="
+
+	tests := []struct {
+		name       string
+		rawBody    string // used verbatim when non-empty (undecodable body case)
+		mutate     func(map[string]any)
+		wantStatus int
+		wantCode   string // "" means the code member must be absent
+	}{
+		{name: "invalid_body", rawBody: "not-json", wantStatus: http.StatusBadRequest},
+		{name: "empty_bootstrap_token", mutate: func(m map[string]any) { m["bootstrap_token"] = "" }, wantStatus: http.StatusUnprocessableEntity},
+		{name: "empty_nonce", mutate: func(m map[string]any) { m["nonce"] = "" }, wantStatus: http.StatusUnprocessableEntity},
+		{name: "empty_resource_handle", mutate: func(m map[string]any) { m["resource_handle"] = "" }, wantStatus: http.StatusUnprocessableEntity},
+		{name: "zero_project_id", mutate: func(m map[string]any) { m["project_id"] = "00000000-0000-0000-0000-000000000000" }, wantStatus: http.StatusUnprocessableEntity},
+		{name: "non_uuid_project_id", mutate: func(m map[string]any) { m["project_id"] = "not-a-uuid" }, wantStatus: http.StatusUnprocessableEntity},
+		{name: "field_too_long", mutate: func(m map[string]any) { m["requested_resource_id"] = longStr }, wantStatus: http.StatusUnprocessableEntity},
+		{name: "public_key_bad_shape", mutate: func(m map[string]any) { m["public_key"] = "short" }, wantStatus: http.StatusBadRequest, wantCode: "public_key_invalid"},
+		{name: "public_key_all_zero", mutate: func(m map[string]any) { m["public_key"] = zeroKey }, wantStatus: http.StatusBadRequest, wantCode: "public_key_invalid"},
+		{name: "malformed_token", mutate: func(m map[string]any) { m["bootstrap_token"] = "not-a-psb-token" }, wantStatus: http.StatusForbidden},
+		{name: "kind_mismatch", mutate: func(m map[string]any) { m["bootstrap_token"] = "psb_test_e2eproject_bridge_aaaaaaaaaaaaaaaaaaaaaa" }, wantStatus: http.StatusForbidden, wantCode: "kind_mismatch"},
+		{name: "token_consumed", mutate: func(m map[string]any) { m["bootstrap_token"] = "psb_test_e2eproject_node_consumedaaaaaaaaaaaaaa" }, wantStatus: http.StatusForbidden, wantCode: "token_consumed"},
+		{name: "token_expired", mutate: func(m map[string]any) { m["bootstrap_token"] = "psb_test_e2eproject_node_expiredaaaaaaaaaaaaaaa" }, wantStatus: http.StatusForbidden, wantCode: "token_expired"},
+		{name: "token_revoked", mutate: func(m map[string]any) { m["bootstrap_token"] = "psb_test_e2eproject_node_revokedaaaaaaaaaaaaaaa" }, wantStatus: http.StatusForbidden, wantCode: "token_revoked"},
+		{name: "project_mismatch", mutate: func(m map[string]any) { m["project_id"] = "11111111-1111-1111-1111-111111111111" }, wantStatus: http.StatusForbidden, wantCode: "project_mismatch"},
+		{name: "resource_not_found", mutate: func(m map[string]any) { m["resource_handle"] = "unknown-resource" }, wantStatus: http.StatusNotFound, wantCode: "resource_not_found"},
+		{name: "pool_exhausted", mutate: func(m map[string]any) { m["resource_handle"] = "exhausted-pool" }, wantStatus: http.StatusServiceUnavailable, wantCode: "pool_exhausted"},
+		{name: "subrange_exhausted", mutate: func(m map[string]any) { m["resource_handle"] = "exhausted-subrange" }, wantStatus: http.StatusServiceUnavailable, wantCode: "subrange_exhausted"},
+		{name: "allocator_contention", mutate: func(m map[string]any) { m["resource_handle"] = "contended-allocator" }, wantStatus: http.StatusServiceUnavailable, wantCode: "allocator_contention"},
+		{name: "boom_internal", mutate: func(m map[string]any) { m["resource_handle"] = "boom-internal" }, wantStatus: http.StatusInternalServerError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			body := tt.rawBody
+			if body == "" {
+				m := validRegisterFields()
+				if tt.mutate != nil {
+					tt.mutate(m)
+				}
+				b, err := json.Marshal(m)
+				if err != nil {
+					t.Fatalf("marshal: %v", err)
+				}
+				body = string(b)
+			}
+
+			resp := doRequest(t, http.MethodPost, ts.URL+"/v1/register", body)
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+				t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+			}
+
+			var problem map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			// RFC 9457 required members.
+			for _, member := range []string{"type", "title", "status", "detail", "instance"} {
+				if _, ok := problem[member]; !ok {
+					t.Errorf("problem missing required member %q", member)
+				}
+			}
+			if tt.wantCode == "" {
+				if _, ok := problem["code"]; ok {
+					t.Errorf("problem should omit code member, got %v", problem["code"])
+				}
+			} else if problem["code"] != tt.wantCode {
+				t.Errorf("code = %v, want %q", problem["code"], tt.wantCode)
+			}
+		})
+	}
+}
+
+func TestRegister_NonceCollision(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	m := validRegisterFields()
+	nonce := freshNonce()
+	m["nonce"] = nonce
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// First registration with the nonce succeeds.
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/register", string(body))
+	if resp.StatusCode != http.StatusCreated {
+		resp.Body.Close()
+		t.Fatalf("first register status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	resp.Body.Close()
+
+	// Replaying the same nonce is rejected with nonce_collision.
+	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/register", string(body))
+	if resp.StatusCode != http.StatusForbidden {
+		resp.Body.Close()
+		t.Fatalf("replay status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	var problem map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	resp.Body.Close()
+	if problem["code"] != "nonce_collision" {
+		t.Errorf("replay code = %v, want %q", problem["code"], "nonce_collision")
+	}
+
+	// A different nonce succeeds again — only the used nonce is blocked.
+	m["nonce"] = freshNonce()
+	body2, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/register", string(body2))
+	if resp.StatusCode != http.StatusCreated {
+		resp.Body.Close()
+		t.Fatalf("fresh-nonce status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	resp.Body.Close()
+}
+
+func TestRegister_DeniedRequestDoesNotConsumeNonce(t *testing.T) {
+	_, ts := newTestServer(t)
+	nonce := freshNonce()
+
+	// A 404 denial (unknown resource) must NOT record the nonce.
+	m := validRegisterFields()
+	m["nonce"] = nonce
+	m["resource_handle"] = "unknown-resource"
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/register", string(body))
+	if resp.StatusCode != http.StatusNotFound {
+		resp.Body.Close()
+		t.Fatalf("denied status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+	resp.Body.Close()
+
+	// Reusing the same nonce on an otherwise-valid request now succeeds.
+	m2 := validRegisterFields()
+	m2["nonce"] = nonce
+	body2, err := json.Marshal(m2)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/register", string(body2))
+	if resp.StatusCode != http.StatusCreated {
+		resp.Body.Close()
+		t.Fatalf("reuse-after-denial status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	resp.Body.Close()
 }
 
 func TestRegister_WrongMethod_Returns405(t *testing.T) {
@@ -2707,8 +2921,11 @@ func TestHandleSecrets_ReturnsDecryptableResponse(t *testing.T) {
 	}
 }
 
-func TestRegister_Returns32ByteNSK(t *testing.T) {
-	_, ts := newTestServer(t)
+// nsk must be served in the standard-padded base64 form the register contract
+// specifies, decoding to the 32-byte AES-256-GCM key. Serving the raw bytes
+// instead would let the suite pass against a shape production never sends.
+func TestRegister_ReturnsBase64EncodedNSK(t *testing.T) {
+	s, ts := newTestServer(t)
 
 	resp, err := http.Post(ts.URL+"/v1/register", "application/json", strings.NewReader(registerBody))
 	if err != nil {
@@ -2720,7 +2937,17 @@ func TestRegister_Returns32ByteNSK(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&reg); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(reg.NodeSecretKey) != 32 {
-		t.Errorf("len(NodeSecretKey) = %d, want 32", len(reg.NodeSecretKey))
+	if len(reg.NSK) != 44 {
+		t.Errorf("len(NSK) = %d, want 44 (standard-padded base64)", len(reg.NSK))
+	}
+	raw, err := base64.StdEncoding.DecodeString(reg.NSK)
+	if err != nil {
+		t.Fatalf("nsk is not standard base64: %v", err)
+	}
+	if len(raw) != 32 {
+		t.Errorf("decoded nsk = %d bytes, want 32", len(raw))
+	}
+	if !bytes.Equal(raw, s.NSK()) {
+		t.Errorf("decoded nsk = %x, want %x", raw, s.NSK())
 	}
 }
