@@ -303,7 +303,7 @@ if [ -z "${REG_NONCE}" ]; then
 fi
 echo "  PASS: registration body contains nonce"
 
-# Heartbeat body must be valid JSON with expected structure.
+# Heartbeat body must carry the real v1 heartbeat fields.
 # Note: node_id is passed as a URL path parameter, not in the body.
 HB_BODY=$(curl -sf "http://localhost:18080/test/last-request/heartbeat" 2>/dev/null || true)
 if [ -z "${HB_BODY}" ]; then
@@ -317,13 +317,38 @@ if ! echo "${HB_BODY}" | jq empty 2>/dev/null; then
     exit 1
 fi
 echo "  PASS: heartbeat body is valid JSON"
-HB_HAS_TS=$(echo "${HB_BODY}" | jq 'has("timestamp")')
-if [ "${HB_HAS_TS}" != "true" ]; then
-    echo "FAIL: heartbeat body missing 'timestamp' field"
+
+HB_CLIENT_NOW=$(echo "${HB_BODY}" | jq -r '.client_now // empty')
+if ! echo "${HB_CLIENT_NOW}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+.*(Z|[+-][0-9]{2}:[0-9]{2})$'; then
+    echo "FAIL: heartbeat client_now='${HB_CLIENT_NOW}' is not an RFC 3339 timestamp"
     print_diagnostics
     exit 1
 fi
-echo "  PASS: heartbeat body has expected structure"
+echo "  PASS: heartbeat body client_now='${HB_CLIENT_NOW}' matches RFC 3339"
+
+HB_CHECKSUM=$(echo "${HB_BODY}" | jq -r '.binary_checksum // empty')
+if ! echo "${HB_CHECKSUM}" | grep -Eq '^[0-9a-f]{64}$'; then
+    echo "FAIL: heartbeat binary_checksum='${HB_CHECKSUM}' is not 64-char lowercase hex"
+    print_diagnostics
+    exit 1
+fi
+echo "  PASS: heartbeat body binary_checksum is 64-char lowercase hex"
+
+HB_VERSION=$(echo "${HB_BODY}" | jq -r '.binary_version // empty')
+if [ -z "${HB_VERSION}" ]; then
+    echo "FAIL: heartbeat body missing 'binary_version' field"
+    print_diagnostics
+    exit 1
+fi
+echo "  PASS: heartbeat body binary_version='${HB_VERSION}'"
+
+HB_NAT_SUMMARY_TYPE=$(echo "${HB_BODY}" | jq -r '.nat_summary | type')
+if [ "${HB_NAT_SUMMARY_TYPE}" != "object" ]; then
+    echo "FAIL: heartbeat nat_summary type='${HB_NAT_SUMMARY_TYPE}', want 'object'"
+    print_diagnostics
+    exit 1
+fi
+echo "  PASS: heartbeat body nat_summary is a JSON object"
 
 # Capabilities body must contain builtin_actions array.
 CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)

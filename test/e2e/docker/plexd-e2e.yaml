@@ -22,7 +22,7 @@ wireguard:
 
 nat:
   enabled: true
-  refresh_interval: 30s
+  refresh_interval: 120s
   timeout: 5s
 
 policy:
