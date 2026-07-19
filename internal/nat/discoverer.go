@@ -7,8 +7,6 @@ import (
 	"log/slog"
 	"sync"
 	"time"
-
-	"github.com/plexsphere/plexd/internal/api"
 )
 
 // endpointReportMargin is how far before the server-side stale_after deadline
@@ -37,7 +35,7 @@ type Discoverer struct {
 	logger    *slog.Logger
 
 	mu         sync.RWMutex
-	lastResult *api.NATInfo
+	lastResult *DiscoveryResult
 
 	// rejections counts consecutive control-plane endpoint rejections. It is
 	// owned by the Run loop and never read concurrently.
@@ -131,9 +129,9 @@ func (d *Discoverer) Discover(ctx context.Context) (*DiscoveryResult, error) {
 
 func (d *Discoverer) updateLastResult(endpoint string, natType NATType, stunServer string) {
 	d.mu.Lock()
-	d.lastResult = &api.NATInfo{
-		PublicEndpoint: endpoint,
-		Type:           string(natType),
+	d.lastResult = &DiscoveryResult{
+		Endpoint: endpoint,
+		NATType:  natType,
 	}
 	d.mu.Unlock()
 
@@ -175,7 +173,7 @@ func (d *Discoverer) reportEndpoint(ctx context.Context, reporter EndpointReport
 }
 
 // LastResult returns the most recently discovered NAT info, or nil if no discovery has succeeded.
-func (d *Discoverer) LastResult() *api.NATInfo {
+func (d *Discoverer) LastResult() *DiscoveryResult {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.lastResult

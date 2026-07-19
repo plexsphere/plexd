@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/nat"
 )
 
 // TestRedactSensitiveLine_SecretKey verifies that the existing redaction logic
@@ -94,15 +95,15 @@ func TestBuildHeartbeatRequest(t *testing.T) {
 	})
 
 	t.Run("populated NAT info maps through Wire", func(t *testing.T) {
-		req := buildHeartbeatRequest("checksum-abc", "1.2.3", &api.NATInfo{
-			PublicEndpoint: "203.0.113.9:51820",
-			Type:           "none",
+		req := buildHeartbeatRequest("checksum-abc", "1.2.3", &nat.DiscoveryResult{
+			Endpoint: "203.0.113.9:51820",
+			NATType:  nat.NATNone,
 		})
 
 		if got := req.NATSummary["endpoint"]; got != "203.0.113.9:51820" {
 			t.Errorf("summary endpoint = %v, want %q", got, "203.0.113.9:51820")
 		}
-		// Type "none" maps through Wire() to the full_cone traversal posture.
+		// NATNone maps through Wire() to the full_cone traversal posture.
 		if got := req.NATSummary["nat_type"]; got != "full_cone" {
 			t.Errorf("summary nat_type = %v, want %q", got, "full_cone")
 		}

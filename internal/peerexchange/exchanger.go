@@ -56,7 +56,7 @@ func (e *Exchanger) Run(ctx context.Context, nodeID string) error {
 }
 
 // LastResult returns the most recently discovered NAT info.
-func (e *Exchanger) LastResult() *api.NATInfo {
+func (e *Exchanger) LastResult() *nat.DiscoveryResult {
 	return e.discoverer.LastResult()
 }
 

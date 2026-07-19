@@ -61,11 +61,6 @@ type HeartbeatRequest struct {
 	NATSummary     map[string]any `json:"nat_summary"`
 }
 
-type NATInfo struct {
-	PublicEndpoint string `json:"public_endpoint"`
-	Type           string `json:"type"`
-}
-
 type HeartbeatResponse struct {
 	AcceptedAt time.Time `json:"accepted_at"`
 	Reconcile  bool      `json:"reconcile"`
