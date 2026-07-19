@@ -28,7 +28,7 @@ services:
     ports:
       - "19100:9100"
     environment:
-      PLEXD_BOOTSTRAP_TOKEN: e2e-test-token
+      PLEXD_BOOTSTRAP_TOKEN: psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22
       PLEXD_NODE_API_HTTP_ENABLED: "true"
       PLEXD_NODE_API_HTTP_LISTEN: "0.0.0.0:9100"
     volumes:

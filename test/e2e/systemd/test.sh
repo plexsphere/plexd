@@ -209,6 +209,8 @@ api:
 
 registration:
   data_dir: /var/lib/plexd
+  project_id: 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0
+  resource_handle: e2e-systemd-node
 
 node_api:
   data_dir: /var/lib/plexd
@@ -247,7 +249,7 @@ audit_fwd:
 EOF"
 
 # Write environment file with bootstrap token.
-docker exec "${SYSTEMD_CONTAINER}" bash -c 'echo "PLEXD_BOOTSTRAP_TOKEN=e2e-test-token" > /etc/plexd/environment && chmod 600 /etc/plexd/environment'
+docker exec "${SYSTEMD_CONTAINER}" bash -c 'echo "PLEXD_BOOTSTRAP_TOKEN=psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22" > /etc/plexd/environment && chmod 600 /etc/plexd/environment'
 
 # Pre-create hooks directory (ProtectSystem=full makes /etc read-only for the service).
 docker exec "${SYSTEMD_CONTAINER}" mkdir -p /etc/plexd/hooks
@@ -298,22 +300,34 @@ fi
 # --- Request body validation ---
 echo "=== Validating request bodies ==="
 
-# Registration body must contain token and hostname.
+# Registration body must carry the real POST /v1/register fields.
 REG_BODY=$(curl -sf "http://localhost:18080/test/last-request/register" 2>/dev/null || true)
 if [ -z "${REG_BODY}" ]; then
     fail "no captured registration request body"
 fi
-REG_TOKEN=$(echo "${REG_BODY}" | jq -r '.token // empty')
+REG_TOKEN=$(echo "${REG_BODY}" | jq -r '.bootstrap_token // empty')
 if [ -z "${REG_TOKEN}" ]; then
-    fail "registration body missing 'token' field"
+    fail "registration body missing 'bootstrap_token' field"
 fi
-echo "  PASS: registration body contains token"
+echo "  PASS: registration body contains bootstrap_token"
 
-REG_HOSTNAME=$(echo "${REG_BODY}" | jq -r '.hostname // empty')
-if [ -z "${REG_HOSTNAME}" ]; then
-    fail "registration body missing 'hostname' field"
+REG_PROJECT_ID=$(echo "${REG_BODY}" | jq -r '.project_id // empty')
+if [ -z "${REG_PROJECT_ID}" ]; then
+    fail "registration body missing 'project_id' field"
 fi
-echo "  PASS: registration body contains hostname='${REG_HOSTNAME}'"
+echo "  PASS: registration body contains project_id='${REG_PROJECT_ID}'"
+
+REG_RESOURCE_HANDLE=$(echo "${REG_BODY}" | jq -r '.resource_handle // empty')
+if [ -z "${REG_RESOURCE_HANDLE}" ]; then
+    fail "registration body missing 'resource_handle' field"
+fi
+echo "  PASS: registration body contains resource_handle='${REG_RESOURCE_HANDLE}'"
+
+REG_NONCE=$(echo "${REG_BODY}" | jq -r '.nonce // empty')
+if [ -z "${REG_NONCE}" ]; then
+    fail "registration body missing 'nonce' field"
+fi
+echo "  PASS: registration body contains nonce"
 
 # Heartbeat body must be valid JSON with expected structure.
 # Note: node_id is passed as a URL path parameter, not in the body.

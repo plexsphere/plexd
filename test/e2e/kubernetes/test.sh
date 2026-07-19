@@ -141,7 +141,7 @@ kubectl patch clusterrolebinding plexd --type=json \
 
 echo "=== Creating bootstrap secret ==="
 kubectl -n "${NAMESPACE}" create secret generic plexd-bootstrap \
-    --from-literal=token=e2e-test-token
+    --from-literal=token=psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22
 
 echo "=== Creating plexd E2E configmap (REQ-004) ==="
 kubectl -n "${NAMESPACE}" create configmap plexd-config \
@@ -151,6 +151,8 @@ api:
 
 registration:
   data_dir: /var/lib/plexd
+  project_id: 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0
+  resource_handle: e2e-k8s-node
 
 node_api:
   data_dir: /var/lib/plexd
@@ -262,28 +264,44 @@ fi
 # ===================================================================
 echo "=== Validating request bodies ==="
 
-# Registration body must contain token and hostname.
+# Registration body must carry the real POST /v1/register fields.
 REG_BODY=$(curl -sf "http://localhost:18080/test/last-request/register" 2>/dev/null || true)
 if [ -z "${REG_BODY}" ]; then
     echo "FAIL: no captured registration request body"
     print_diagnostics
     exit 1
 fi
-REG_TOKEN=$(echo "${REG_BODY}" | jq -r '.token // empty')
+REG_TOKEN=$(echo "${REG_BODY}" | jq -r '.bootstrap_token // empty')
 if [ -z "${REG_TOKEN}" ]; then
-    echo "FAIL: registration body missing 'token' field"
+    echo "FAIL: registration body missing 'bootstrap_token' field"
     print_diagnostics
     exit 1
 fi
-echo "  PASS: registration body contains token"
+echo "  PASS: registration body contains bootstrap_token"
 
-REG_HOSTNAME=$(echo "${REG_BODY}" | jq -r '.hostname // empty')
-if [ -z "${REG_HOSTNAME}" ]; then
-    echo "FAIL: registration body missing 'hostname' field"
+REG_PROJECT_ID=$(echo "${REG_BODY}" | jq -r '.project_id // empty')
+if [ -z "${REG_PROJECT_ID}" ]; then
+    echo "FAIL: registration body missing 'project_id' field"
     print_diagnostics
     exit 1
 fi
-echo "  PASS: registration body contains hostname='${REG_HOSTNAME}'"
+echo "  PASS: registration body contains project_id='${REG_PROJECT_ID}'"
+
+REG_RESOURCE_HANDLE=$(echo "${REG_BODY}" | jq -r '.resource_handle // empty')
+if [ -z "${REG_RESOURCE_HANDLE}" ]; then
+    echo "FAIL: registration body missing 'resource_handle' field"
+    print_diagnostics
+    exit 1
+fi
+echo "  PASS: registration body contains resource_handle='${REG_RESOURCE_HANDLE}'"
+
+REG_NONCE=$(echo "${REG_BODY}" | jq -r '.nonce // empty')
+if [ -z "${REG_NONCE}" ]; then
+    echo "FAIL: registration body missing 'nonce' field"
+    print_diagnostics
+    exit 1
+fi
+echo "  PASS: registration body contains nonce"
 
 # Heartbeat body must be valid JSON with expected structure.
 # Note: node_id is passed as a URL path parameter, not in the body.
