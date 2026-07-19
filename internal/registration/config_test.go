@@ -27,9 +27,6 @@ func TestConfig_Defaults(t *testing.T) {
 	if cfg.UseMetadata {
 		t.Error("UseMetadata = true, want false")
 	}
-	if cfg.Hostname != "" {
-		t.Errorf("Hostname = %q, want empty", cfg.Hostname)
-	}
 	if cfg.TokenValue != "" {
 		t.Errorf("TokenValue = %q, want empty", cfg.TokenValue)
 	}

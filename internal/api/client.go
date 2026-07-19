@@ -81,6 +81,24 @@ func (c *ControlPlane) SetAuthToken(token string) {
 	c.authToken = token
 }
 
+// noAuthKey marks a request context that must not carry the Authorization
+// header, regardless of the shared token.
+type noAuthKey struct{}
+
+// withoutAuth returns a context that suppresses the Authorization header for
+// the request built from it. It scopes token suppression to a single call so
+// unauthenticated endpoints (POST /v1/register is security: []) never leak the
+// shared bearer token — and never have to blank it on the live client, which
+// would strand every concurrent request that depends on that token.
+func withoutAuth(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noAuthKey{}, struct{}{})
+}
+
+// authSuppressed reports whether ctx was marked by withoutAuth.
+func authSuppressed(ctx context.Context) bool {
+	return ctx.Value(noAuthKey{}) != nil
+}
+
 // getAuthToken returns the current bearer token.
 func (c *ControlPlane) getAuthToken() string {
 	c.mu.RLock()
@@ -177,7 +195,7 @@ func (c *ControlPlane) sendRequest(ctx context.Context, method, path string, bod
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Encoding", "gzip")
-	if token := c.getAuthToken(); token != "" {
+	if token := c.getAuthToken(); token != "" && !authSuppressed(ctx) {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	req.Header.Set("User-Agent", userAgentPrefix+c.version)

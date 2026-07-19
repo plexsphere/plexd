@@ -40,20 +40,13 @@ func requireEqual(t *testing.T, want, got any) {
 }
 
 func TestTypesRegisterRequest(t *testing.T) {
+	// Spec request example (issue #18 contract).
 	orig := RegisterRequest{
-		Token:     "tok-abc",
-		PublicKey: "pk-xyz",
-		Hostname:  "node-1",
-		Metadata:  map[string]string{"env": "prod"},
-		Capabilities: &CapabilitiesPayload{
-			Binary: &BinaryInfo{Version: "1.0.0", Checksum: "sha256:abc"},
-			BuiltinActions: []ActionInfo{
-				{Name: "reboot", Description: "reboot node", Parameters: []ActionParam{
-					{Name: "force", Type: "bool", Required: false, Description: "force reboot"},
-				}},
-			},
-			Hooks: []HookInfo{},
-		},
+		ProjectID:      "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0",
+		ResourceHandle: "edge-router-01",
+		BootstrapToken: "psb_prod_aebagbafaydqqbrhibbsa3kqaq_node_xxxxxxxxxxxxxxxxxxxxxxxxxx",
+		Nonce:          "f3f8c0b8-7a0a-8a0a-a0a0-a0a0a0a0a0a0",
+		PublicKey:      "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
@@ -63,32 +56,80 @@ func TestTypesRegisterRequest(t *testing.T) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"token", "public_key", "hostname", "metadata", "capabilities"} {
+	for _, key := range []string{"project_id", "resource_handle", "bootstrap_token", "nonce", "public_key"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+
+	// requested_resource_id is omitted when empty.
+	if _, ok := raw["requested_resource_id"]; ok {
+		t.Error("requested_resource_id should be omitted when empty")
+	}
+
+	// requested_resource_id is present when set.
+	orig.RequestedResourceID = "substrate-42"
+	data2, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data2); !strings.Contains(s, `"requested_resource_id"`) {
+		t.Errorf("requested_resource_id should be present when set, got: %s", s)
+	}
+}
+
+func TestTypesRegisterResponse(t *testing.T) {
+	// Spec response example (issue #18 contract).
+	orig := RegisterResponse{
+		NodeID:           "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3",
+		MeshIP:           "100.64.0.1",
+		SigningPublicKey: "MCowBQYDK2VwAyEA0123456789abcdefghijklmnopqrstuvwxyz0123=",
+		SigningKeyID:     "did:web:plexsphere.com#key-2026-04",
+		NSK:              "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+		PeerSnapshot:     []RegisterPeer{},
+		DomainMeshCIDR:   "100.64.0.0/10",
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys, including the new fields.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"node_id", "mesh_ip", "signing_public_key", "signing_key_id", "nsk", "peer_snapshot", "domain_mesh_cidr"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
 	}
 }
 
-func TestTypesRegisterResponse(t *testing.T) {
-	orig := RegisterResponse{
-		NodeID:           "n-001",
-		MeshIP:           "10.42.0.1",
-		SigningPublicKey: "spk-abc",
-		NodeSecretKey:    "nsk-xyz",
-		Peers: []Peer{
-			{
-				ID:         "n-002",
-				PublicKey:  "pk-002",
-				MeshIP:     "10.42.0.2",
-				Endpoint:   "1.2.3.4:51820",
-				AllowedIPs: []string{"10.42.0.2/32"},
-				PSK:        "psk-shared",
-			},
-		},
+func TestTypesRegisterPeer(t *testing.T) {
+	orig := RegisterPeer{
+		NodeID:           "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+		MeshIP:           "100.64.0.2",
+		PublicKey:        "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+		FallbackEndpoint: "203.0.113.1:51820",
 	}
-	_, got := roundTrip(t, orig)
+	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
+
+	// Verify snake_case keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"node_id", "mesh_ip", "public_key", "fallback_endpoint"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+
+	// fallback_endpoint is omitted when empty.
+	orig.FallbackEndpoint = ""
+	data2, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data2); strings.Contains(s, `"fallback_endpoint"`) {
+		t.Errorf("fallback_endpoint should be omitted when empty, got: %s", s)
+	}
 }
 
 func TestTypesHeartbeatRequest(t *testing.T) {

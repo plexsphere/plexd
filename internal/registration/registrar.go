@@ -2,6 +2,7 @@ package registration
 
 import (
 	"context"
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -25,7 +26,6 @@ type Registrar struct {
 	cfg      Config
 	logger   *slog.Logger
 	metadata MetadataProvider
-	caps     *api.CapabilitiesPayload
 	clock    api.Clock
 }
 
@@ -42,9 +42,6 @@ func NewRegistrar(client *api.ControlPlane, cfg Config, logger *slog.Logger) *Re
 
 // SetMetadataProvider sets an optional metadata provider for token resolution.
 func (r *Registrar) SetMetadataProvider(mp MetadataProvider) { r.metadata = mp }
-
-// SetCapabilities sets the optional capabilities payload for registration.
-func (r *Registrar) SetCapabilities(caps *api.CapabilitiesPayload) { r.caps = caps }
 
 // SetClock sets a custom clock for testing.
 func (r *Registrar) SetClock(c api.Clock) { r.clock = c }
@@ -63,8 +60,9 @@ func (r *Registrar) Register(ctx context.Context) (*NodeIdentity, error) {
 		r.logger.Warn("corrupt identity files, proceeding with fresh registration", "error", err)
 	}
 
-	// 2. Resolve bootstrap token.
-	tokenResult, err := NewTokenResolver(&r.cfg, r.metadata).Resolve(ctx)
+	// 2. Resolve bootstrap token. Reuse the resolver for the other inputs.
+	resolver := NewTokenResolver(&r.cfg, r.metadata)
+	tokenResult, err := resolver.Resolve(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("registration: resolve token: %w", err)
 	}
@@ -75,56 +73,92 @@ func (r *Registrar) Register(ctx context.Context) (*NodeIdentity, error) {
 		return nil, fmt.Errorf("registration: generate keypair: %w", err)
 	}
 
-	// 4. Resolve hostname.
-	hostname := r.cfg.Hostname
-	if hostname == "" {
-		hostname, err = os.Hostname()
-		if err != nil {
-			return nil, fmt.Errorf("registration: resolve hostname: %w", err)
-		}
+	// 4. Resolve project_id, resource_handle, and requested_resource_id. Each
+	// resolution may itself hit the metadata service, so check a required
+	// input as soon as it is resolved rather than paying for the later
+	// lookups when the request is already guaranteed to fail.
+	projectID, err := resolver.ResolveValue(ctx, "project_id", r.cfg.ProjectID, DefaultMetadataProjectIDPath)
+	if err != nil {
+		return nil, fmt.Errorf("registration: resolve project_id: %w", err)
+	}
+	if projectID == "" {
+		return nil, errors.New("registration: project_id is required (set registration.project_id, --project-id, or PLEXD_PROJECT_ID)")
+	}
+	resourceHandle, err := resolver.ResolveValue(ctx, "resource_handle", r.cfg.ResourceHandle, DefaultMetadataResourceHandlePath)
+	if err != nil {
+		return nil, fmt.Errorf("registration: resolve resource_handle: %w", err)
+	}
+	if resourceHandle == "" {
+		return nil, errors.New("registration: resource_handle is required (set registration.resource_handle, --resource-handle, or PLEXD_RESOURCE_HANDLE)")
+	}
+	requestedResourceID, err := resolver.ResolveValue(ctx, "requested_resource_id", r.cfg.RequestedResourceID, DefaultMetadataRequestedResourceIDPath)
+	if err != nil {
+		return nil, fmt.Errorf("registration: resolve requested_resource_id: %w", err)
 	}
 
-	// 5. Set bootstrap token as auth.
-	r.client.SetAuthToken(tokenResult.Value)
-
-	// 6. Build request.
+	// 5. Build request. The nonce is server-side replay protection, not an
+	// idempotency key: a nonce the control plane has already recorded is
+	// answered with 403 nonce_collision, never with the committed result. One
+	// nonce per logical registration, so a retry of a request that may already
+	// have been committed is denied rather than granted a second node. It is
+	// deliberately not persisted — reusing it after a restart could only ever
+	// produce that denial.
+	nonce, err := newNonce()
+	if err != nil {
+		return nil, err
+	}
 	req := api.RegisterRequest{
-		Token:        tokenResult.Value,
-		PublicKey:    keypair.EncodePublicKey(),
-		Hostname:     hostname,
-		Metadata:     r.cfg.Metadata,
-		Capabilities: r.caps,
+		ProjectID:           projectID,
+		ResourceHandle:      resourceHandle,
+		BootstrapToken:      tokenResult.Value,
+		Nonce:               nonce,
+		PublicKey:           keypair.EncodePublicKey(),
+		RequestedResourceID: requestedResourceID,
 	}
 
-	// 7. Register with retry.
+	// 6. Register with retry.
 	resp, err := r.registerWithRetry(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("registration: register: %w", err)
 	}
 
-	// 8. Build identity from response.
+	// 7. Build identity from response. nsk is standard-padded base64 per the
+	// register contract; reject anything that does not decode to an
+	// AES-256-GCM key before it is persisted and used to open secrets.
+	if _, err := decodeNSK(resp.NSK); err != nil {
+		return nil, err
+	}
 	identity = &NodeIdentity{
-		NodeID:          resp.NodeID,
-		MeshIP:          resp.MeshIP,
+		NodeID:           resp.NodeID,
+		MeshIP:           resp.MeshIP,
 		SigningPublicKey: resp.SigningPublicKey,
-		NodeSecretKey:   resp.NodeSecretKey,
-		PrivateKey:      keypair.PrivateKey,
+		SigningKeyID:     resp.SigningKeyID,
+		DomainMeshCIDR:   resp.DomainMeshCIDR,
+		NodeSecretKey:    resp.NSK,
+		PrivateKey:       keypair.PrivateKey,
 	}
 
-	// 9. Persist identity.
+	// 8. Persist identity. The control plane has already allocated the node and
+	// consumed the bootstrap token at this point, so a write failure strands an
+	// orphan record holding a mesh IP that no retry can reclaim: the nsk exists
+	// only in this process. Say so explicitly — recovery needs an operator.
 	if err := SaveIdentity(r.cfg.DataDir, identity); err != nil {
+		r.logger.Error("node allocated but not persisted, manual cleanup required",
+			"node_id", identity.NodeID, "mesh_ip", identity.MeshIP,
+			"data_dir", r.cfg.DataDir, "error", err)
 		return nil, fmt.Errorf("registration: save identity: %w", err)
 	}
 
-	// 10. Delete token file if applicable.
+	// 9. Delete token file if applicable.
 	if tokenResult.FilePath != "" {
 		if err := os.Remove(tokenResult.FilePath); err != nil {
 			r.logger.Warn("failed to delete token file", "path", tokenResult.FilePath, "error", err)
 		}
 	}
 
-	// 11. Set node_secret_key as auth token.
-	r.client.SetAuthToken(resp.NodeSecretKey)
+	// 10. Set nsk as auth token so subsequent calls on the shared client
+	// authenticate as the newly registered node.
+	r.client.SetAuthToken(resp.NSK)
 
 	r.logger.Info("registration successful", "node_id", identity.NodeID, "mesh_ip", identity.MeshIP)
 	return identity, nil
@@ -171,7 +205,10 @@ func (r *Registrar) registerWithRetry(ctx context.Context, req api.RegisterReque
 			return nil, fmt.Errorf("registration: retry timeout after %v: %w", r.cfg.MaxRetryDuration, err)
 		}
 
-		// Determine delay.
+		// Determine delay. Retry-After is server-controlled and unbounded, and
+		// the deadline above is only checked between attempts — so cap the wait
+		// at what is left of the budget, or a single "Retry-After: 86400" would
+		// park registration for a day that MaxRetryDuration never interrupts.
 		var delay time.Duration
 		if action == api.RespectServer {
 			var apiErr *api.APIError
@@ -179,6 +216,9 @@ func (r *Registrar) registerWithRetry(ctx context.Context, req api.RegisterReque
 				delay = apiErr.RetryAfter
 			} else {
 				delay = currentInterval
+			}
+			if remaining := r.cfg.MaxRetryDuration - r.clock.Now().Sub(start); delay > remaining {
+				delay = remaining
 			}
 		} else {
 			delay = jitter(currentInterval, 0.25)
@@ -200,6 +240,18 @@ func (r *Registrar) registerWithRetry(ctx context.Context, req api.RegisterReque
 			float64(60*time.Second),
 		))
 	}
+}
+
+// newNonce returns a fresh random UUIDv4 in canonical 8-4-4-4-12 hex form,
+// used for server-side replay protection on POST /v1/register.
+func newNonce() (string, error) {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("registration: generate nonce: %w", err)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
 // jitter adds random jitter (plus or minus fraction) to a duration.

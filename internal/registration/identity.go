@@ -15,15 +15,49 @@ import (
 
 // NodeIdentity holds the registration identity of a node.
 type NodeIdentity struct {
-	NodeID          string `json:"node_id"`
-	MeshIP          string `json:"mesh_ip"`
+	NodeID           string `json:"node_id"`
+	MeshIP           string `json:"mesh_ip"`
 	SigningPublicKey string `json:"signing_public_key"`
-	PrivateKey      []byte `json:"-"` // never serialized to JSON
-	NodeSecretKey   string `json:"-"` // never serialized to JSON
+	SigningKeyID     string `json:"signing_key_id"`
+	DomainMeshCIDR   string `json:"domain_mesh_cidr"`
+	PrivateKey       []byte `json:"-"` // never serialized to JSON
+	NodeSecretKey    string `json:"-"` // never serialized to JSON
 }
 
 // ErrNotRegistered indicates that no valid identity files exist in data_dir.
 var ErrNotRegistered = errors.New("registration: node is not registered")
+
+// nskSize is the length in bytes of a decoded node secret key. It doubles as
+// the AES-256-GCM key for secret envelopes, so the size is fixed.
+const nskSize = 32
+
+// SecretKey decodes NodeSecretKey into the raw AES-256-GCM key used to open
+// secret envelopes. Per the register contract nsk travels — and is stored — as
+// standard-padded base64; the bearer credential sent in the Authorization
+// header stays the encoded string.
+func (id *NodeIdentity) SecretKey() ([]byte, error) {
+	return decodeNSK(id.NodeSecretKey)
+}
+
+// decodeNSK decodes a base64 nsk and enforces its fixed length. Identities
+// written before nsk became base64 hold the raw 32-byte secret, which earlier
+// versions used verbatim as the AES-256-GCM key — accept that form so an
+// upgraded node keeps its identity. Rejecting it would be terminal, not a
+// fallback: the fresh registration it forces cannot succeed because the
+// bootstrap token file was deleted during the original registration.
+func decodeNSK(nsk string) ([]byte, error) {
+	if len(nsk) == nskSize {
+		return []byte(nsk), nil // legacy pre-base64 identity
+	}
+	raw, err := base64.StdEncoding.DecodeString(nsk)
+	if err != nil {
+		return nil, fmt.Errorf("registration: decode nsk: %w", err)
+	}
+	if len(raw) != nskSize {
+		return nil, fmt.Errorf("registration: nsk must decode to %d bytes, got %d", nskSize, len(raw))
+	}
+	return raw, nil
+}
 
 // SaveIdentity persists the node identity atomically to dataDir.
 func SaveIdentity(dataDir string, id *NodeIdentity) error {
@@ -37,7 +71,15 @@ func SaveIdentity(dataDir string, id *NodeIdentity) error {
 		return fmt.Errorf("registration: save identity: %w", err)
 	}
 
-	if err := fsutil.WriteFileAtomic(dataDir, "identity.json", jsonData, 0600); err != nil {
+	// Each write is atomic on its own, but the group is not. identity.json is
+	// what LoadIdentity keys "registered" off. On re-registration it may still
+	// be on disk from a previous run, so clear it first: writing it last only
+	// prevents a torn identity when it did not already exist. Removing it up
+	// front means a partially written key group can never combine with a stale
+	// marker (old node_id/mesh_ip, new private_key/node_secret_key), and a
+	// failed write leaves no identity.json — the next start reports
+	// ErrNotRegistered and registers cleanly instead of loading a torn identity.
+	if err := os.Remove(filepath.Join(dataDir, "identity.json")); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("registration: save identity: %w", err)
 	}
 
@@ -54,6 +96,10 @@ func SaveIdentity(dataDir string, id *NodeIdentity) error {
 
 	// signing_public_key: raw string.
 	if err := fsutil.WriteFileAtomic(dataDir, "signing_public_key", []byte(id.SigningPublicKey), 0600); err != nil {
+		return fmt.Errorf("registration: save identity: %w", err)
+	}
+
+	if err := fsutil.WriteFileAtomic(dataDir, "identity.json", jsonData, 0600); err != nil {
 		return fmt.Errorf("registration: save identity: %w", err)
 	}
 
@@ -113,7 +159,14 @@ func LoadIdentity(dataDir string) (*NodeIdentity, error) {
 	if id.MeshIP == "" {
 		return nil, fmt.Errorf("registration: load identity: mesh_ip is empty")
 	}
+	// nsk is required by everything that follows: it is the bearer credential
+	// and, decoded, the AES-256-GCM key for secret envelopes. Reject an
+	// undecodable one here so the caller takes the fresh-registration path,
+	// rather than surfacing a decode error deep inside startup. Identities
+	// written before nsk became base64 hold a raw 32-byte secret and land here.
+	if _, err := decodeNSK(id.NodeSecretKey); err != nil {
+		return nil, fmt.Errorf("registration: load identity: %w", err)
+	}
 
 	return &id, nil
 }
-

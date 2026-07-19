@@ -13,11 +13,11 @@ func TestSaveIdentity_CreatesDataDir(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "nested", "data")
 
 	id := &NodeIdentity{
-		NodeID:          "node-1",
-		MeshIP:          "100.64.0.1",
+		NodeID:           "node-1",
+		MeshIP:           "100.64.0.1",
 		SigningPublicKey: "spk",
-		PrivateKey:      []byte("01234567890123456789012345678901"),
-		NodeSecretKey:   "nsk",
+		PrivateKey:       []byte("01234567890123456789012345678901"),
+		NodeSecretKey:    "nsk",
 	}
 
 	if err := SaveIdentity(dir, id); err != nil {
@@ -40,11 +40,11 @@ func TestSaveIdentity_AtomicWrite(t *testing.T) {
 	dir := t.TempDir()
 
 	id := &NodeIdentity{
-		NodeID:          "node-abc",
-		MeshIP:          "100.64.0.2",
+		NodeID:           "node-abc",
+		MeshIP:           "100.64.0.2",
 		SigningPublicKey: "sign-key-123",
-		PrivateKey:      []byte("AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH"),
-		NodeSecretKey:   "secret-val",
+		PrivateKey:       []byte("AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH"),
+		NodeSecretKey:    "secret-val",
 	}
 
 	if err := SaveIdentity(dir, id); err != nil {
@@ -121,11 +121,11 @@ func TestLoadIdentity_Success(t *testing.T) {
 	dir := t.TempDir()
 
 	original := &NodeIdentity{
-		NodeID:          "node-roundtrip",
-		MeshIP:          "100.64.1.1",
+		NodeID:           "node-roundtrip",
+		MeshIP:           "100.64.1.1",
 		SigningPublicKey: "spk-roundtrip",
-		PrivateKey:      []byte("abcdefghijklmnopqrstuvwxyz012345"),
-		NodeSecretKey:   "nsk-roundtrip",
+		PrivateKey:       []byte("abcdefghijklmnopqrstuvwxyz012345"),
+		NodeSecretKey:    testNSK,
 	}
 
 	if err := SaveIdentity(dir, original); err != nil {
@@ -187,11 +187,11 @@ func TestSaveAndLoad_Roundtrip(t *testing.T) {
 	dir := t.TempDir()
 
 	original := &NodeIdentity{
-		NodeID:          "node-abc123",
-		MeshIP:          "100.64.0.1",
-		PrivateKey:      make([]byte, 32),
+		NodeID:           "node-abc123",
+		MeshIP:           "100.64.0.1",
+		PrivateKey:       make([]byte, 32),
 		SigningPublicKey: "base64-key",
-		NodeSecretKey:   "secret-key-value",
+		NodeSecretKey:    testNSK,
 	}
 	// Fill PrivateKey with deterministic but non-trivial bytes.
 	for i := range original.PrivateKey {
@@ -224,15 +224,219 @@ func TestSaveAndLoad_Roundtrip(t *testing.T) {
 	}
 }
 
+func TestSaveAndLoad_RoundtripNewFields(t *testing.T) {
+	dir := t.TempDir()
+
+	original := &NodeIdentity{
+		NodeID:           "node-newfields",
+		MeshIP:           "100.64.0.1",
+		SigningPublicKey: "spk",
+		SigningKeyID:     "did:web:plexsphere.com#key-2026-04",
+		DomainMeshCIDR:   "100.64.0.0/10",
+		PrivateKey:       make([]byte, 32),
+		NodeSecretKey:    testNSK,
+	}
+
+	if err := SaveIdentity(dir, original); err != nil {
+		t.Fatalf("SaveIdentity: %v", err)
+	}
+
+	// identity.json must persist the new keys.
+	jsonData, err := os.ReadFile(filepath.Join(dir, "identity.json"))
+	if err != nil {
+		t.Fatalf("read identity.json: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(jsonData, &parsed); err != nil {
+		t.Fatalf("unmarshal identity.json: %v", err)
+	}
+	if parsed["signing_key_id"] != "did:web:plexsphere.com#key-2026-04" {
+		t.Errorf("signing_key_id = %v, want %q", parsed["signing_key_id"], "did:web:plexsphere.com#key-2026-04")
+	}
+	if parsed["domain_mesh_cidr"] != "100.64.0.0/10" {
+		t.Errorf("domain_mesh_cidr = %v, want %q", parsed["domain_mesh_cidr"], "100.64.0.0/10")
+	}
+
+	// The loaded struct must round-trip the new fields.
+	loaded, err := LoadIdentity(dir)
+	if err != nil {
+		t.Fatalf("LoadIdentity: %v", err)
+	}
+	if loaded.SigningKeyID != original.SigningKeyID {
+		t.Errorf("SigningKeyID = %q, want %q", loaded.SigningKeyID, original.SigningKeyID)
+	}
+	if loaded.DomainMeshCIDR != original.DomainMeshCIDR {
+		t.Errorf("DomainMeshCIDR = %q, want %q", loaded.DomainMeshCIDR, original.DomainMeshCIDR)
+	}
+}
+
+func TestLoadIdentity_LegacyWithoutNewKeys(t *testing.T) {
+	dir := t.TempDir()
+
+	// A legacy identity.json predating signing_key_id / domain_mesh_cidr.
+	legacyJSON := `{"node_id":"legacy-node","mesh_ip":"100.64.0.7","signing_public_key":"legacy-spk"}`
+	if err := os.WriteFile(filepath.Join(dir, "identity.json"), []byte(legacyJSON), 0600); err != nil {
+		t.Fatalf("write identity.json: %v", err)
+	}
+	// Provide the sidecar files LoadIdentity requires.
+	if err := os.WriteFile(filepath.Join(dir, "private_key"), []byte(base64.StdEncoding.EncodeToString(make([]byte, 32))), 0600); err != nil {
+		t.Fatalf("write private_key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "node_secret_key"), []byte(testNSK), 0600); err != nil {
+		t.Fatalf("write node_secret_key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "signing_public_key"), []byte("legacy-spk"), 0600); err != nil {
+		t.Fatalf("write signing_public_key: %v", err)
+	}
+
+	loaded, err := LoadIdentity(dir)
+	if err != nil {
+		t.Fatalf("LoadIdentity legacy: %v", err)
+	}
+	if loaded.NodeID != "legacy-node" {
+		t.Errorf("NodeID = %q, want %q", loaded.NodeID, "legacy-node")
+	}
+	if loaded.SigningKeyID != "" {
+		t.Errorf("SigningKeyID = %q, want empty for legacy identity", loaded.SigningKeyID)
+	}
+	if loaded.DomainMeshCIDR != "" {
+		t.Errorf("DomainMeshCIDR = %q, want empty for legacy identity", loaded.DomainMeshCIDR)
+	}
+}
+
+func TestLoadIdentity_AcceptsLegacyRawNSK(t *testing.T) {
+	dir := t.TempDir()
+
+	// Identities written before nsk became base64 hold the raw 32-byte secret.
+	// This is the exact value the pre-contract mock issued and earlier plexd
+	// used verbatim as the AES-256-GCM key. LoadIdentity must accept it so an
+	// upgraded node keeps its identity: forcing fresh registration would brick
+	// the node because the bootstrap token file is already gone.
+	const legacyNSK = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+	writeIdentityFiles(t, dir, legacyNSK)
+
+	loaded, err := LoadIdentity(dir)
+	if err != nil {
+		t.Fatalf("LoadIdentity with legacy raw nsk: %v", err)
+	}
+	if loaded.NodeSecretKey != legacyNSK {
+		t.Errorf("NodeSecretKey = %q, want %q", loaded.NodeSecretKey, legacyNSK)
+	}
+	// The raw secret doubles as the AES-256-GCM key, so SecretKey returns it
+	// unchanged rather than base64-decoding it.
+	key, err := loaded.SecretKey()
+	if err != nil {
+		t.Fatalf("SecretKey: %v", err)
+	}
+	if string(key) != legacyNSK {
+		t.Errorf("SecretKey = %q, want %q", key, legacyNSK)
+	}
+}
+
+func TestSaveIdentity_PartialWriteLeavesNoIdentityJSON(t *testing.T) {
+	dir := t.TempDir()
+
+	// Block the node_secret_key write: WriteFileAtomic renames its temp file
+	// over the target, and renaming a file over a directory always fails.
+	if err := os.Mkdir(filepath.Join(dir, "node_secret_key"), 0700); err != nil {
+		t.Fatalf("mkdir node_secret_key: %v", err)
+	}
+
+	id := &NodeIdentity{
+		NodeID:           "node-partial",
+		MeshIP:           "100.64.0.5",
+		SigningPublicKey: "spk-partial",
+		PrivateKey:       make([]byte, 32),
+		NodeSecretKey:    testNSK,
+	}
+	if err := SaveIdentity(dir, id); err == nil {
+		t.Fatal("SaveIdentity: expected error, got nil")
+	}
+
+	// identity.json is what marks a node registered, so a torn write must not
+	// leave one behind: the next start registers cleanly instead of loading a
+	// partial identity.
+	if _, err := os.Stat(filepath.Join(dir, "identity.json")); !os.IsNotExist(err) {
+		t.Errorf("Stat(identity.json) = %v, want os.IsNotExist", err)
+	}
+	if _, err := LoadIdentity(dir); !errors.Is(err, ErrNotRegistered) {
+		t.Errorf("LoadIdentity = %v, want ErrNotRegistered", err)
+	}
+}
+
+func TestSaveIdentity_PartialReRegistrationLeavesNoStaleIdentity(t *testing.T) {
+	dir := t.TempDir()
+
+	// A node registered once, so identity.json is already on disk.
+	first := &NodeIdentity{
+		NodeID:           "old-node",
+		MeshIP:           "100.64.0.9",
+		SigningPublicKey: "spk-old",
+		PrivateKey:       make([]byte, 32),
+		NodeSecretKey:    testNSK,
+	}
+	if err := SaveIdentity(dir, first); err != nil {
+		t.Fatalf("SaveIdentity (first): %v", err)
+	}
+
+	// Re-registration writes a new key group but fails part-way: block the
+	// node_secret_key write by turning it into a directory.
+	if err := os.RemoveAll(filepath.Join(dir, "node_secret_key")); err != nil {
+		t.Fatalf("remove node_secret_key: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "node_secret_key"), 0700); err != nil {
+		t.Fatalf("mkdir node_secret_key: %v", err)
+	}
+
+	second := &NodeIdentity{
+		NodeID:           "new-node",
+		MeshIP:           "100.64.0.10",
+		SigningPublicKey: "spk-new",
+		PrivateKey:       make([]byte, 32),
+		NodeSecretKey:    testNSKAlt,
+	}
+	if err := SaveIdentity(dir, second); err == nil {
+		t.Fatal("SaveIdentity (second): expected error, got nil")
+	}
+
+	// The stale identity.json (old node_id/mesh_ip) must not survive alongside
+	// the partially written new key group — otherwise the node would announce
+	// old-node while holding new-node's secret. No identity.json means the next
+	// start re-registers cleanly.
+	if _, err := os.Stat(filepath.Join(dir, "identity.json")); !os.IsNotExist(err) {
+		t.Errorf("Stat(identity.json) = %v, want os.IsNotExist", err)
+	}
+	if _, err := LoadIdentity(dir); !errors.Is(err, ErrNotRegistered) {
+		t.Errorf("LoadIdentity = %v, want ErrNotRegistered", err)
+	}
+}
+
+// writeIdentityFiles writes the four files LoadIdentity reads, using nsk
+// verbatim as the node_secret_key contents.
+func writeIdentityFiles(t *testing.T, dir, nsk string) {
+	t.Helper()
+	files := map[string]string{
+		"identity.json":      `{"node_id":"node-legacy","mesh_ip":"100.64.0.7","signing_public_key":"spk"}`,
+		"private_key":        base64.StdEncoding.EncodeToString(make([]byte, 32)),
+		"node_secret_key":    nsk,
+		"signing_public_key": "spk",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+}
+
 func TestSaveIdentity_Permissions(t *testing.T) {
 	dir := t.TempDir()
 
 	id := &NodeIdentity{
-		NodeID:          "node-perm",
-		MeshIP:          "100.64.0.3",
+		NodeID:           "node-perm",
+		MeshIP:           "100.64.0.3",
 		SigningPublicKey: "spk-perm",
-		PrivateKey:      []byte("01234567890123456789012345678901"),
-		NodeSecretKey:   "nsk-perm",
+		PrivateKey:       []byte("01234567890123456789012345678901"),
+		NodeSecretKey:    "nsk-perm",
 	}
 
 	if err := SaveIdentity(dir, id); err != nil {
