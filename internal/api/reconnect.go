@@ -36,6 +36,8 @@ func ClassifyError(err error) FailureAction {
 		return RetryAuth
 	case errors.Is(err, ErrRateLimit):
 		return RespectServer
+	// 422 is deliberately absent: on a long-running SSE connection it signals
+	// deploy skew, which clears on its own. Registration stops on it locally.
 	case errors.Is(err, ErrForbidden), errors.Is(err, ErrNotFound):
 		return PermanentFailure
 	case errors.Is(err, ErrServer):
