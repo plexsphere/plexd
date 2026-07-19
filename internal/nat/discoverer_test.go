@@ -62,9 +62,11 @@ func TestDiscover_ClassifiesSymmetric(t *testing.T) {
 }
 
 func TestDiscover_ClassifiesNone(t *testing.T) {
+	// The mapped port matching the local port is what marks "no NAT"; the IP
+	// must still be routable to be publishable as an endpoint.
 	client := &mockSTUNClient{
 		results: map[string]mockBindResult{
-			"stun1:3478": {Addr: MappedAddress{IP: net.IPv4(127, 0, 0, 1), Port: 51820}},
+			"stun1:3478": {Addr: MappedAddress{IP: net.IPv4(198, 51, 100, 7), Port: 51820}},
 		},
 	}
 	d := newTestDiscoverer(client, []string{"stun1:3478"}, 51820)
@@ -114,6 +116,58 @@ func TestDiscover_FallbackToSecondServer(t *testing.T) {
 	}
 	if result.Endpoint != "198.51.100.5:9999" {
 		t.Errorf("unexpected endpoint: %s", result.Endpoint)
+	}
+}
+
+// A STUN response is unauthenticated, so a hostile server or an on-path
+// attacker can name any address. Publishing one would point every peer's
+// WireGuard handshake at it, so a non-routable address must be treated like
+// a failed binding rather than becoming the node's endpoint.
+func TestDiscover_RejectsNonRoutableMappedAddress(t *testing.T) {
+	poisoned := []struct {
+		name string
+		addr MappedAddress
+	}{
+		{"loopback", MappedAddress{IP: net.IPv4(127, 0, 0, 1), Port: 12345}},
+		{"unspecified", MappedAddress{IP: net.IPv4zero, Port: 12345}},
+		{"link_local", MappedAddress{IP: net.IPv4(169, 254, 1, 1), Port: 12345}},
+		{"zero_port", MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: 0}},
+	}
+
+	for _, tt := range poisoned {
+		t.Run(tt.name+"_falls_back_to_next_server", func(t *testing.T) {
+			client := &mockSTUNClient{
+				results: map[string]mockBindResult{
+					"hostile:3478": {Addr: tt.addr},
+					"stun2:3478":   {Addr: MappedAddress{IP: net.IPv4(198, 51, 100, 5), Port: 9999}},
+				},
+			}
+			d := newTestDiscoverer(client, []string{"hostile:3478", "stun2:3478"}, 51820)
+
+			result, err := d.Discover(context.Background())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Endpoint != "198.51.100.5:9999" {
+				t.Errorf("endpoint = %q, want the routable address from the second server", result.Endpoint)
+			}
+		})
+
+		t.Run(tt.name+"_alone_fails_discovery", func(t *testing.T) {
+			client := &mockSTUNClient{
+				results: map[string]mockBindResult{
+					"hostile:3478": {Addr: tt.addr},
+				},
+			}
+			d := newTestDiscoverer(client, []string{"hostile:3478"}, 51820)
+
+			if _, err := d.Discover(context.Background()); err == nil {
+				t.Fatal("expected discovery to fail, got nil error")
+			}
+			if d.LastResult() != nil {
+				t.Errorf("LastResult = %+v, want nil; a rejected address must not reach the heartbeat", d.LastResult())
+			}
+		})
 	}
 }
 
