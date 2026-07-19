@@ -40,7 +40,7 @@ type RegisterPeer struct {
 	FallbackEndpoint string `json:"fallback_endpoint,omitempty"`
 }
 
-// Peer is used in registration responses and state responses.
+// Peer is used in state responses and key-rotation responses.
 type Peer struct {
 	ID         string   `json:"id"`
 	PublicKey  string   `json:"public_key"`
