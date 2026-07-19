@@ -140,22 +140,40 @@ fi
 # ===================================================================
 echo "=== Validating request bodies ==="
 
-# 3a. Registration body must contain token.
+# 3a. Registration body must carry the real POST /v1/register fields.
 REG_BODY=$(curl -sf "http://localhost:18080/test/last-request/register" 2>/dev/null || true)
 if [ -z "${REG_BODY}" ]; then
     fail "no captured registration request body"
 fi
-REG_TOKEN=$(echo "${REG_BODY}" | jq -r '.token // empty')
+REG_TOKEN=$(echo "${REG_BODY}" | jq -r '.bootstrap_token // empty')
 if [ -z "${REG_TOKEN}" ]; then
-    fail "registration body missing 'token' field"
+    fail "registration body missing 'bootstrap_token' field"
 fi
-echo "  PASS: registration body contains token"
+echo "  PASS: registration body contains bootstrap_token"
 
-REG_HOSTNAME=$(echo "${REG_BODY}" | jq -r '.hostname // empty')
-if [ -z "${REG_HOSTNAME}" ]; then
-    fail "registration body missing 'hostname' field"
+REG_PROJECT_ID=$(echo "${REG_BODY}" | jq -r '.project_id // empty')
+if [ -z "${REG_PROJECT_ID}" ]; then
+    fail "registration body missing 'project_id' field"
 fi
-echo "  PASS: registration body contains hostname='${REG_HOSTNAME}'"
+if [ "${REG_PROJECT_ID}" != "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0" ]; then
+    fail "registration body project_id='${REG_PROJECT_ID}', want '0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0'"
+fi
+echo "  PASS: registration body contains project_id='${REG_PROJECT_ID}'"
+
+REG_RESOURCE_HANDLE=$(echo "${REG_BODY}" | jq -r '.resource_handle // empty')
+if [ -z "${REG_RESOURCE_HANDLE}" ]; then
+    fail "registration body missing 'resource_handle' field"
+fi
+if [ "${REG_RESOURCE_HANDLE}" != "e2e-node-1" ]; then
+    fail "registration body resource_handle='${REG_RESOURCE_HANDLE}', want 'e2e-node-1'"
+fi
+echo "  PASS: registration body contains resource_handle='${REG_RESOURCE_HANDLE}'"
+
+REG_NONCE=$(echo "${REG_BODY}" | jq -r '.nonce // empty')
+if [ -z "${REG_NONCE}" ]; then
+    fail "registration body missing 'nonce' field"
+fi
+echo "  PASS: registration body contains nonce"
 
 REG_PUBKEY=$(echo "${REG_BODY}" | jq -r '.public_key // empty')
 if [ -z "${REG_PUBKEY}" ]; then
@@ -220,6 +238,103 @@ fi
 echo "  PASS: drift body contains timestamp"
 
 echo "=== Phase 3 PASSED: request body validation ==="
+
+# ===================================================================
+# Phase 3b: register denial taxonomy
+# ===================================================================
+# Drive POST /v1/register directly with crafted bodies and assert the mock's
+# RFC 9457 denial contract. This runs AFTER Phase 3a because every register
+# call overwrites the captured last-request/register body.
+echo "=== Testing register denial taxonomy ==="
+
+REGISTER_URL="http://localhost:18080/v1/register"
+
+# POST a register body and assert the HTTP status, that the response is an
+# RFC 9457 application/problem+json body carrying all mandatory members, and
+# that the problem 'code' member equals want_code ("" => code absent/empty).
+# Args: name, want_status, want_code, json_body
+assert_denial() {
+    local name=$1 want_status=$2 want_code=$3 body=$4
+    local resp status ctype json code member
+    resp=$(curl -s -w '\n%{http_code}\n%{content_type}' -X POST \
+        -H 'Content-Type: application/json' -d "${body}" \
+        "${REGISTER_URL}")
+    ctype=$(echo "${resp}" | tail -n1)
+    status=$(echo "${resp}" | tail -n2 | head -n1)
+    json=$(echo "${resp}" | sed '$d' | sed '$d')
+
+    if [ "${status}" != "${want_status}" ]; then
+        fail "${name}: status=${status}, want ${want_status} (body: ${json})"
+    fi
+    case "${ctype}" in
+        application/problem+json*) ;;
+        *) fail "${name}: content-type='${ctype}', want application/problem+json" ;;
+    esac
+    # Every RFC 9457 problem body carries these five members.
+    for member in type title status detail instance; do
+        if [ "$(echo "${json}" | jq --arg m "${member}" 'has($m)')" != "true" ]; then
+            fail "${name}: problem body missing '${member}' member"
+        fi
+    done
+    code=$(echo "${json}" | jq -r '.code // empty')
+    if [ "${code}" != "${want_code}" ]; then
+        fail "${name}: code='${code}', want '${want_code}'"
+    fi
+    echo "  PASS: ${name} -> ${status} (code='${code}')"
+}
+
+# Denial cases (each varies one field of the valid base body and uses a
+# unique nonce so no nonce is accidentally consumed and replayed).
+assert_denial "public_key_invalid" 400 public_key_invalid \
+    '{"project_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","resource_handle":"e2e-denial","bootstrap_token":"psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22","nonce":"denial-nonce-01","public_key":"short"}'
+assert_denial "empty_resource_handle" 422 "" \
+    '{"project_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","resource_handle":"","bootstrap_token":"psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22","nonce":"denial-nonce-02","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}'
+assert_denial "malformed_token" 403 "" \
+    '{"project_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","resource_handle":"e2e-denial","bootstrap_token":"not-a-psb-token","nonce":"denial-nonce-03","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}'
+assert_denial "kind_mismatch" 403 kind_mismatch \
+    '{"project_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","resource_handle":"e2e-denial","bootstrap_token":"psb_test_e2eproject_bridge_e2ee2ee2ee2ee2ee2ee2e22","nonce":"denial-nonce-04","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}'
+assert_denial "token_consumed" 403 token_consumed \
+    '{"project_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","resource_handle":"e2e-denial","bootstrap_token":"psb_test_e2eproject_node_consumedaaaaaaaaaaaaaa","nonce":"denial-nonce-05","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}'
+assert_denial "token_expired" 403 token_expired \
+    '{"project_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","resource_handle":"e2e-denial","bootstrap_token":"psb_test_e2eproject_node_expiredaaaaaaaaaaaaaaa","nonce":"denial-nonce-06","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}'
+assert_denial "token_revoked" 403 token_revoked \
+    '{"project_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","resource_handle":"e2e-denial","bootstrap_token":"psb_test_e2eproject_node_revokedaaaaaaaaaaaaaaa","nonce":"denial-nonce-07","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}'
+assert_denial "project_mismatch" 403 project_mismatch \
+    '{"project_id":"11111111-2222-4333-8444-555555555555","resource_handle":"e2e-denial","bootstrap_token":"psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22","nonce":"denial-nonce-08","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}'
+assert_denial "resource_not_found" 404 resource_not_found \
+    '{"project_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","resource_handle":"unknown-resource","bootstrap_token":"psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22","nonce":"denial-nonce-09","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}'
+assert_denial "pool_exhausted" 503 pool_exhausted \
+    '{"project_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","resource_handle":"exhausted-pool","bootstrap_token":"psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22","nonce":"denial-nonce-10","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}'
+assert_denial "boom_internal" 500 "" \
+    '{"project_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","resource_handle":"boom-internal","bootstrap_token":"psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22","nonce":"denial-nonce-11","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}'
+
+# Happy path, then nonce collision: a valid body succeeds with 201 and its
+# (project_id, nonce) pair is consumed, so replaying the identical body with
+# the same nonce is rejected with nonce_collision.
+OK_BODY='{"project_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","resource_handle":"e2e-denial-ok","bootstrap_token":"psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22","nonce":"denial-nonce-ok","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}'
+
+OK_RESP=$(curl -s -w '\n%{http_code}' -X POST \
+    -H 'Content-Type: application/json' -d "${OK_BODY}" \
+    "${REGISTER_URL}")
+OK_STATUS=$(echo "${OK_RESP}" | tail -n1)
+OK_JSON=$(echo "${OK_RESP}" | sed '$d')
+if [ "${OK_STATUS}" != "201" ]; then
+    fail "denial happy-path: status=${OK_STATUS}, want 201 (body: ${OK_JSON})"
+fi
+for field in nsk signing_key_id domain_mesh_cidr; do
+    val=$(echo "${OK_JSON}" | jq -r ".${field} // empty")
+    if [ -z "${val}" ]; then
+        fail "denial happy-path: 201 body missing '${field}'"
+    fi
+done
+if [ "$(echo "${OK_JSON}" | jq 'has("peer_snapshot")')" != "true" ]; then
+    fail "denial happy-path: 201 body missing 'peer_snapshot'"
+fi
+echo "  PASS: denial happy-path -> 201 with nsk/signing_key_id/domain_mesh_cidr/peer_snapshot"
+
+assert_denial "nonce_collision" 403 nonce_collision "${OK_BODY}"
+
+echo "=== Phase 3b PASSED: register denial taxonomy ==="
 
 # ===================================================================
 # Phase 4: Periodic loop verification (counters >= 2)
@@ -588,10 +703,10 @@ if [ -n "${RESULT_BODY}" ]; then
             fi
 
             INFO_NODE_ID=$(echo "${RES_STDOUT}" | jq -r '.node_id // empty')
-            if [ "${INFO_NODE_ID}" = "node-mock-001" ]; then
-                echo "  PASS: system.info stdout node_id='node-mock-001'"
+            if [ "${INFO_NODE_ID}" = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3" ]; then
+                echo "  PASS: system.info stdout node_id='0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3'"
             else
-                fail "system.info stdout node_id='${INFO_NODE_ID}', want 'node-mock-001'"
+                fail "system.info stdout node_id='${INFO_NODE_ID}', want '0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3'"
             fi
 
             INFO_MESH_IP=$(echo "${RES_STDOUT}" | jq -r '.mesh_ip // empty')

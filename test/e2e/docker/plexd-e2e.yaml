@@ -6,6 +6,8 @@ api:
 
 registration:
   data_dir: /var/lib/plexd
+  project_id: 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0
+  resource_handle: e2e-node-1
 
 node_api:
   data_dir: /var/lib/plexd
