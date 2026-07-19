@@ -63,14 +63,33 @@ func validRegisterFields() map[string]any {
 	}
 }
 
-// heartbeatBody is a valid JSON body for POST /v1/nodes/{id}/heartbeat.
-const heartbeatBody = `{"node_id":"node-1","timestamp":"2025-01-01T00:00:00Z","status":"healthy","uptime":"1h","binary_checksum":"abc123"}`
+// validHexChecksum is a shape-valid 64-char lowercase hex SHA-256 digest.
+var validHexChecksum = strings.Repeat("ab", 32)
+
+// validHeartbeatBody builds a contract-valid heartbeat request body with a
+// fresh client_now so it never trips the mock's clock-skew check. nat_summary
+// is an empty object, matching what the agent sends before NAT discovery.
+func validHeartbeatBody() string {
+	return fmt.Sprintf(
+		`{"client_now":%q,"binary_checksum":%q,"binary_version":"1.2.3","nat_summary":{}}`,
+		time.Now().UTC().Format(time.RFC3339),
+		validHexChecksum,
+	)
+}
+
+// validEndpointBody builds a contract-valid endpoint request body with a fresh
+// reported_at so it never trips the mock's clock-skew check.
+func validEndpointBody() string {
+	return fmt.Sprintf(
+		`{"endpoint":"203.0.113.10:51820","nat_type":"full_cone","reported_at":%q}`,
+		time.Now().UTC().Format(time.RFC3339),
+	)
+}
 
 // Test body constants for new endpoints.
 const (
 	keyRotateBody          = `{"node_id":"node-1","new_public_key":"new-pk-abc"}`
 	capabilitiesBody       = `{"builtin_actions":[],"hooks":[]}`
-	endpointBody           = `{"public_endpoint":"203.0.113.10:51820","nat_type":"full_cone"}`
 	driftBody              = `{"timestamp":"2025-01-01T00:00:00Z","corrections":[{"type":"tunnel","detail":"recreated"}]}`
 	reportBody             = `{"entries":[],"deleted":[]}`
 	executionAckBody       = `{"execution_id":"exec-001","status":"accepted","reason":""}`
@@ -511,7 +530,7 @@ func TestHeartbeat_ReturnsReconcileTrueAndCounterIncrements(t *testing.T) {
 
 	// Call heartbeat 3 times.
 	for i := 0; i < 3; i++ {
-		resp, err := http.Post(ts.URL+"/v1/nodes/node-1/heartbeat", "application/json", strings.NewReader(heartbeatBody))
+		resp, err := http.Post(ts.URL+"/v1/nodes/node-1/heartbeat", "application/json", strings.NewReader(validHeartbeatBody()))
 		if err != nil {
 			t.Fatalf("POST heartbeat #%d: %v", i+1, err)
 		}
@@ -528,6 +547,9 @@ func TestHeartbeat_ReturnsReconcileTrueAndCounterIncrements(t *testing.T) {
 		}
 		resp.Body.Close()
 
+		if hb.AcceptedAt.IsZero() {
+			t.Errorf("call #%d: AcceptedAt is zero, want a fresh timestamp", i+1)
+		}
 		if !hb.Reconcile {
 			t.Errorf("call #%d: Reconcile = false, want true", i+1)
 		}
@@ -561,8 +583,7 @@ func TestHeartbeat_AcceptsAnyNodeID(t *testing.T) {
 	_, ts := newTestServer(t)
 
 	for _, id := range []string{"node-1", "node-2", "node-abc"} {
-		body := fmt.Sprintf(`{"node_id":"%s","timestamp":"2025-01-01T00:00:00Z","status":"ok","uptime":"1m","binary_checksum":"x"}`, id)
-		resp, err := http.Post(ts.URL+"/v1/nodes/"+id+"/heartbeat", "application/json", strings.NewReader(body))
+		resp, err := http.Post(ts.URL+"/v1/nodes/"+id+"/heartbeat", "application/json", strings.NewReader(validHeartbeatBody()))
 		if err != nil {
 			t.Fatalf("POST heartbeat %s: %v", id, err)
 		}
@@ -570,6 +591,88 @@ func TestHeartbeat_AcceptsAnyNodeID(t *testing.T) {
 			t.Errorf("heartbeat %s: status = %d, want %d", id, resp.StatusCode, http.StatusOK)
 		}
 		resp.Body.Close()
+	}
+}
+
+func TestHeartbeat_DenialTaxonomy(t *testing.T) {
+	const path = "/v1/nodes/node-1/heartbeat"
+	base64Checksum := base64.StdEncoding.EncodeToString(make([]byte, 32))
+
+	tests := []struct {
+		name       string
+		mutate     func(map[string]any)
+		wantStatus int
+		wantCode   string // asserted for rejections (wantStatus != 200)
+	}{
+		{name: "unknown_field", mutate: func(m map[string]any) { m["surprise"] = "x" }, wantStatus: http.StatusBadRequest, wantCode: "malformed_heartbeat_request"},
+		{name: "nat_summary_null", mutate: func(m map[string]any) { m["nat_summary"] = nil }, wantStatus: http.StatusBadRequest, wantCode: "malformed_heartbeat_request"},
+		{name: "client_now_ahead", mutate: func(m map[string]any) { m["client_now"] = time.Now().UTC().Add(61 * time.Second).Format(time.RFC3339) }, wantStatus: http.StatusBadRequest, wantCode: "clock_skew"},
+		{name: "client_now_behind", mutate: func(m map[string]any) { m["client_now"] = time.Now().UTC().Add(-61 * time.Second).Format(time.RFC3339) }, wantStatus: http.StatusBadRequest, wantCode: "clock_skew"},
+		{name: "malformed_checksum", mutate: func(m map[string]any) { m["binary_checksum"] = "zz" }, wantStatus: http.StatusBadRequest, wantCode: "binary_checksum_empty"},
+		{name: "blank_version", mutate: func(m map[string]any) { m["binary_version"] = "   " }, wantStatus: http.StatusBadRequest, wantCode: "binary_version_empty"},
+		// Both checksum wire forms are accepted.
+		{name: "base64_checksum_accepted", mutate: func(m map[string]any) { m["binary_checksum"] = base64Checksum }, wantStatus: http.StatusOK},
+		{name: "fully_valid", mutate: nil, wantStatus: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			m := map[string]any{
+				"client_now":      time.Now().UTC().Format(time.RFC3339),
+				"binary_checksum": validHexChecksum,
+				"binary_version":  "1.2.3",
+				"nat_summary":     map[string]any{},
+			}
+			if tt.mutate != nil {
+				tt.mutate(m)
+			}
+			body, err := json.Marshal(m)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+
+			resp := doRequest(t, http.MethodPost, ts.URL+path, string(body))
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+
+			if tt.wantStatus == http.StatusOK {
+				var hb api.HeartbeatResponse
+				if err := json.NewDecoder(resp.Body).Decode(&hb); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if hb.AcceptedAt.IsZero() {
+					t.Error("AcceptedAt is zero, want a fresh timestamp")
+				}
+				if !hb.Reconcile || hb.RotateKeys {
+					t.Errorf("flags = {Reconcile:%v RotateKeys:%v}, want {true false}", hb.Reconcile, hb.RotateKeys)
+				}
+				return
+			}
+
+			if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+				t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+			}
+			var problem map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			for _, member := range []string{"type", "title", "status", "detail", "instance"} {
+				if _, ok := problem[member]; !ok {
+					t.Errorf("problem missing required member %q", member)
+				}
+			}
+			if problem["code"] != tt.wantCode {
+				t.Errorf("code = %v, want %q", problem["code"], tt.wantCode)
+			}
+			if problem["instance"] != path {
+				t.Errorf("instance = %v, want %q", problem["instance"], path)
+			}
+		})
 	}
 }
 
@@ -769,7 +872,7 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 
 	// Call heartbeat twice.
 	for i := 0; i < 2; i++ {
-		resp, err := http.Post(ts.URL+"/v1/nodes/n1/heartbeat", "application/json", strings.NewReader(heartbeatBody))
+		resp, err := http.Post(ts.URL+"/v1/nodes/n1/heartbeat", "application/json", strings.NewReader(validHeartbeatBody()))
 		if err != nil {
 			t.Fatalf("POST heartbeat #%d: %v", i+1, err)
 		}
@@ -797,7 +900,7 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/n1/capabilities", capabilitiesBody)
 	resp.Body.Close()
-	resp = doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/n1/endpoint", endpointBody)
+	resp = doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/n1/endpoint", validEndpointBody())
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/drift", driftBody)
 	resp.Body.Close()
@@ -925,13 +1028,13 @@ func TestConcurrentCounters(t *testing.T) {
 	}
 	endpoints := []endpointDef{
 		{http.MethodPost, "/v1/register", registerBody},
-		{http.MethodPost, "/v1/nodes/node-1/heartbeat", heartbeatBody},
+		{http.MethodPost, "/v1/nodes/node-1/heartbeat", validHeartbeatBody()},
 		{http.MethodGet, "/v1/nodes/node-1/state", ""},
 		{http.MethodGet, "/v1/nodes/node-1/metadata", ""},
 		{http.MethodPost, "/v1/nodes/node-1/deregister", ""},
 		{http.MethodPost, "/v1/keys/rotate", keyRotateBody},
 		{http.MethodPut, "/v1/nodes/node-1/capabilities", capabilitiesBody},
-		{http.MethodPut, "/v1/nodes/node-1/endpoint", endpointBody},
+		{http.MethodPut, "/v1/nodes/node-1/endpoint", validEndpointBody()},
 		{http.MethodPost, "/v1/nodes/node-1/drift", driftBody},
 		{http.MethodGet, "/v1/nodes/node-1/secrets/key1", ""},
 		{http.MethodPost, "/v1/nodes/node-1/report", reportBody},
@@ -1108,7 +1211,7 @@ func TestCapabilities_WrongMethod_Returns405(t *testing.T) {
 func TestEndpoint_ReturnsFixtureAndCounter(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/endpoint", endpointBody)
+	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/endpoint", validEndpointBody())
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
@@ -1118,8 +1221,14 @@ func TestEndpoint_ReturnsFixtureAndCounter(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(er.PeerEndpoints) != 2 {
-		t.Errorf("len(PeerEndpoints) = %d, want 2", len(er.PeerEndpoints))
+	if er.AcceptedAt.IsZero() {
+		t.Error("AcceptedAt is zero, want a fresh timestamp")
+	}
+	if er.StaleAfter.IsZero() {
+		t.Error("StaleAfter is zero, want a deadline")
+	}
+	if !er.StaleAfter.After(er.AcceptedAt) {
+		t.Errorf("StaleAfter %v, want after AcceptedAt %v", er.StaleAfter, er.AcceptedAt)
 	}
 
 	a := getAssertions(t, ts.URL)
@@ -1136,6 +1245,16 @@ func TestEndpoint_InvalidBody_Returns400(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
 	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+	}
+	var problem map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem["code"] != "malformed_endpoint_request" {
+		t.Errorf("code = %v, want %q", problem["code"], "malformed_endpoint_request")
+	}
 }
 
 func TestEndpoint_WrongMethod_Returns405(t *testing.T) {
@@ -1145,6 +1264,134 @@ func TestEndpoint_WrongMethod_Returns405(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestEndpoint_DenialTaxonomy(t *testing.T) {
+	const path = "/v1/nodes/node-1/endpoint"
+
+	tests := []struct {
+		name       string
+		mutate     func(map[string]any)
+		wantStatus int
+		wantCode   string // asserted for rejections (wantStatus != 200)
+	}{
+		// The oversized body must expand a KNOWN field so strict decoding is not
+		// what trips first — the 4 KiB cap is.
+		{name: "body_too_large", mutate: func(m map[string]any) { m["endpoint"] = strings.Repeat("a", 5000) }, wantStatus: http.StatusRequestEntityTooLarge, wantCode: "endpoint_body_too_large"},
+		{name: "unknown_field", mutate: func(m map[string]any) { m["surprise"] = "x" }, wantStatus: http.StatusBadRequest, wantCode: "malformed_endpoint_request"},
+		{name: "nat_type_outside_enum", mutate: func(m map[string]any) { m["nat_type"] = "cone" }, wantStatus: http.StatusBadRequest, wantCode: "malformed_endpoint_request"},
+		{name: "reported_at_skew", mutate: func(m map[string]any) { m["reported_at"] = time.Now().UTC().Add(61 * time.Second).Format(time.RFC3339) }, wantStatus: http.StatusBadRequest, wantCode: "endpoint_clock_skew"},
+		{name: "loopback_host", mutate: func(m map[string]any) { m["endpoint"] = "127.0.0.1:51820" }, wantStatus: http.StatusBadRequest, wantCode: "endpoint_unparseable"},
+		{name: "link_local_host", mutate: func(m map[string]any) { m["endpoint"] = "169.254.10.9:51820" }, wantStatus: http.StatusBadRequest, wantCode: "endpoint_unparseable"},
+		{name: "unspecified_host", mutate: func(m map[string]any) { m["endpoint"] = "0.0.0.0:51820" }, wantStatus: http.StatusBadRequest, wantCode: "endpoint_unparseable"},
+		{name: "zero_port", mutate: func(m map[string]any) { m["endpoint"] = "203.0.113.5:0" }, wantStatus: http.StatusBadRequest, wantCode: "endpoint_unparseable"},
+		{name: "portless", mutate: func(m map[string]any) { m["endpoint"] = "203.0.113.5" }, wantStatus: http.StatusBadRequest, wantCode: "endpoint_unparseable"},
+		{name: "valid", mutate: nil, wantStatus: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			m := map[string]any{
+				"endpoint":    "203.0.113.10:51820",
+				"nat_type":    "full_cone",
+				"reported_at": time.Now().UTC().Format(time.RFC3339),
+			}
+			if tt.mutate != nil {
+				tt.mutate(m)
+			}
+			body, err := json.Marshal(m)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+
+			resp := doRequest(t, http.MethodPut, ts.URL+path, string(body))
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+
+			if tt.wantStatus == http.StatusOK {
+				var er api.EndpointResponse
+				if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				// Default TTL is 5 minutes.
+				if !er.AcceptedAt.Add(5 * time.Minute).Equal(er.StaleAfter) {
+					t.Errorf("stale_after = %v, want accepted_at + 5m (%v)", er.StaleAfter, er.AcceptedAt.Add(5*time.Minute))
+				}
+				return
+			}
+
+			if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+				t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+			}
+			var problem map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			for _, member := range []string{"type", "title", "status", "detail", "instance"} {
+				if _, ok := problem[member]; !ok {
+					t.Errorf("problem missing required member %q", member)
+				}
+			}
+			if problem["code"] != tt.wantCode {
+				t.Errorf("code = %v, want %q", problem["code"], tt.wantCode)
+			}
+			if problem["instance"] != path {
+				t.Errorf("instance = %v, want %q", problem["instance"], path)
+			}
+		})
+	}
+}
+
+func TestEndpoint_ConfigureTTL(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	// Configure a 40s TTL.
+	cfg := doRequest(t, http.MethodPost, ts.URL+"/test/configure-endpoint", `{"ttl_seconds":40}`)
+	if cfg.StatusCode != http.StatusNoContent {
+		cfg.Body.Close()
+		t.Fatalf("configure-endpoint status = %d, want %d", cfg.StatusCode, http.StatusNoContent)
+	}
+	cfg.Body.Close()
+
+	// A subsequent report reflects the new TTL.
+	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/endpoint", validEndpointBody())
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("endpoint status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var er api.EndpointResponse
+	if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := er.StaleAfter.Sub(er.AcceptedAt); got != 40*time.Second {
+		t.Errorf("stale_after - accepted_at = %v, want %v", got, 40*time.Second)
+	}
+
+	// Invalid bodies are rejected with 400.
+	for _, body := range []string{`{"ttl_seconds":0}`, "garbage"} {
+		bad := doRequest(t, http.MethodPost, ts.URL+"/test/configure-endpoint", body)
+		if bad.StatusCode != http.StatusBadRequest {
+			bad.Body.Close()
+			t.Errorf("configure-endpoint(%q) status = %d, want %d", body, bad.StatusCode, http.StatusBadRequest)
+			continue
+		}
+		bad.Body.Close()
+	}
+
+	// Wrong method is rejected with 405.
+	wrong, err := http.Get(ts.URL + "/test/configure-endpoint")
+	if err != nil {
+		t.Fatalf("GET configure-endpoint: %v", err)
+	}
+	defer wrong.Body.Close()
+	if wrong.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET configure-endpoint status = %d, want %d", wrong.StatusCode, http.StatusMethodNotAllowed)
 	}
 }
 
@@ -2664,7 +2911,7 @@ func TestConfigureHeartbeat_UpdatesResponse(t *testing.T) {
 	_, ts := newTestServer(t)
 
 	// Default heartbeat response should have Reconcile=true, RotateKeys=false.
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/heartbeat", heartbeatBody)
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/heartbeat", validHeartbeatBody())
 	defer resp.Body.Close()
 	var hb api.HeartbeatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&hb); err != nil {
@@ -2686,7 +2933,7 @@ func TestConfigureHeartbeat_UpdatesResponse(t *testing.T) {
 	}
 
 	// Verify heartbeat response changed.
-	resp2 := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/heartbeat", heartbeatBody)
+	resp2 := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/heartbeat", validHeartbeatBody())
 	defer resp2.Body.Close()
 	var hb2 api.HeartbeatResponse
 	if err := json.NewDecoder(resp2.Body).Decode(&hb2); err != nil {
@@ -2739,7 +2986,7 @@ func TestConfigureHeartbeat_ResetToDefault(t *testing.T) {
 	defer resetResp.Body.Close()
 
 	// Verify heartbeat is back to default.
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/heartbeat", heartbeatBody)
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/heartbeat", validHeartbeatBody())
 	defer resp.Body.Close()
 	var hb api.HeartbeatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&hb); err != nil {

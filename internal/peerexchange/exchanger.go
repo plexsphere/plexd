@@ -52,7 +52,7 @@ func (e *Exchanger) Run(ctx context.Context, nodeID string) error {
 	e.logger.Info("starting endpoint exchange", "component", "exchange", "node_id", nodeID)
 
 	reporter := &controlPlaneReporter{client: e.cpClient}
-	return e.discoverer.Run(ctx, reporter, e.wgManager, nodeID)
+	return e.discoverer.Run(ctx, reporter, nodeID)
 }
 
 // LastResult returns the most recently discovered NAT info.
@@ -65,6 +65,6 @@ type controlPlaneReporter struct {
 	client *api.ControlPlane
 }
 
-func (r *controlPlaneReporter) ReportEndpoint(ctx context.Context, nodeID string, req api.EndpointReport) (*api.EndpointResponse, error) {
+func (r *controlPlaneReporter) ReportEndpoint(ctx context.Context, nodeID string, req api.EndpointRequest) (*api.EndpointResponse, error) {
 	return r.client.ReportEndpoint(ctx, nodeID, req)
 }

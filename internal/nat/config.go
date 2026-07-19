@@ -12,6 +12,10 @@ const DefaultRefreshInterval = 60 * time.Second
 // DefaultTimeout is the default per-server STUN request timeout.
 const DefaultTimeout = 5 * time.Second
 
+// DefaultMinReportInterval is the default floor on the deadline-driven
+// endpoint report cadence.
+const DefaultMinReportInterval = 10 * time.Second
+
 // DefaultSTUNServers is the default list of STUN servers used for NAT traversal.
 var DefaultSTUNServers = []string{
 	"stun.l.google.com:19302",
@@ -34,6 +38,14 @@ type Config struct {
 	// Timeout is the per-server STUN request timeout.
 	// Must be positive.
 	Timeout time.Duration `yaml:"timeout"`
+
+	// MinReportInterval is the floor on the endpoint report cadence derived
+	// from the control plane's stale_after deadline. A short deadline can
+	// otherwise drive STUN queries and endpoint reports well above
+	// RefreshInterval; raising this bounds how far the server may accelerate
+	// the loop. Must be positive.
+	// Default: 10s (set by ApplyDefaults).
+	MinReportInterval time.Duration `yaml:"min_report_interval"`
 }
 
 // ApplyDefaults sets default values for zero-valued fields.
@@ -43,7 +55,7 @@ func (c *Config) ApplyDefaults() {
 	// Enabled defaults to true for zero-valued Config. Since bool zero is false,
 	// we use a heuristic: if all fields are zero, the caller wants defaults (including Enabled=true).
 	// If any field is non-zero, the caller constructed the config explicitly and we respect Enabled as-is.
-	if c.STUNServers == nil && c.RefreshInterval == 0 && c.Timeout == 0 {
+	if c.STUNServers == nil && c.RefreshInterval == 0 && c.Timeout == 0 && c.MinReportInterval == 0 {
 		c.Enabled = true
 	}
 	if c.STUNServers == nil {
@@ -54,6 +66,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Timeout == 0 {
 		c.Timeout = DefaultTimeout
+	}
+	if c.MinReportInterval == 0 {
+		c.MinReportInterval = DefaultMinReportInterval
 	}
 }
 
@@ -70,6 +85,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Timeout <= 0 {
 		return errors.New("nat: config: Timeout must be positive")
+	}
+	if c.MinReportInterval <= 0 {
+		return errors.New("nat: config: MinReportInterval must be positive")
 	}
 	return nil
 }

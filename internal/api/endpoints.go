@@ -89,7 +89,7 @@ func (c *ControlPlane) UpdateCapabilities(ctx context.Context, nodeID string, ca
 
 // ReportEndpoint reports the node's NAT endpoint information.
 // PUT /v1/nodes/{node_id}/endpoint
-func (c *ControlPlane) ReportEndpoint(ctx context.Context, nodeID string, req EndpointReport) (*EndpointResponse, error) {
+func (c *ControlPlane) ReportEndpoint(ctx context.Context, nodeID string, req EndpointRequest) (*EndpointResponse, error) {
 	var resp EndpointResponse
 	path := fmt.Sprintf("/v1/nodes/%s/endpoint", url.PathEscape(nodeID))
 	if err := c.doRequest(ctx, http.MethodPut, path, req, &resp); err != nil {

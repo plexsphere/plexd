@@ -18,12 +18,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
+	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -102,6 +105,9 @@ type Server struct {
 	heartbeatFixture   api.HeartbeatResponse
 	heartbeatFixtureMu sync.RWMutex
 
+	endpointTTL   time.Duration
+	endpointTTLMu sync.RWMutex
+
 	lastRequests   map[string][]byte
 	lastRequestsMu sync.RWMutex
 
@@ -140,6 +146,7 @@ func New() *Server {
 		nsk:                 mockNSK,
 		expectedBearerToken: "e2e-local-bearer-token",
 		consumedNonces:      make(map[string]struct{}),
+		endpointTTL:         5 * time.Minute,
 		heartbeatFixture: api.HeartbeatResponse{
 			Reconcile:  true,
 			RotateKeys: false,
@@ -382,6 +389,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /test/state", s.handleSetState)
 	s.mux.HandleFunc("POST /test/configure-state", s.handleSetState)
 	s.mux.HandleFunc("POST /test/configure-heartbeat", s.handleConfigureHeartbeat)
+	s.mux.HandleFunc("POST /test/configure-endpoint", s.handleConfigureEndpoint)
 	s.mux.HandleFunc("POST /test/inject-event", s.handleInjectEvent)
 	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
 
@@ -408,6 +416,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/test/state", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-state", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-heartbeat", methodNotAllowed)
+	s.mux.HandleFunc("/test/configure-endpoint", methodNotAllowed)
 	s.mux.HandleFunc("/test/inject-event", methodNotAllowed)
 }
 
@@ -482,55 +491,55 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxCapturedBody)
 	data, err := s.captureBody("register", r)
 	if err != nil {
-		writeProblem(w, http.StatusBadRequest, "", "invalid request body")
+		writeProblem(w, r, http.StatusBadRequest, "", "invalid request body")
 		return
 	}
 	var req api.RegisterRequest
 	if err := json.Unmarshal(data, &req); err != nil {
-		writeProblem(w, http.StatusBadRequest, "", "invalid request body")
+		writeProblem(w, r, http.StatusBadRequest, "", "invalid request body")
 		return
 	}
 
 	// 2. Invariants (422, no code).
 	switch {
 	case req.BootstrapToken == "":
-		writeProblem(w, http.StatusUnprocessableEntity, "", "bootstrap_token is required")
+		writeProblem(w, r, http.StatusUnprocessableEntity, "", "bootstrap_token is required")
 		return
 	case req.Nonce == "":
-		writeProblem(w, http.StatusUnprocessableEntity, "", "nonce is required")
+		writeProblem(w, r, http.StatusUnprocessableEntity, "", "nonce is required")
 		return
 	case req.ResourceHandle == "":
-		writeProblem(w, http.StatusUnprocessableEntity, "", "resource_handle is required")
+		writeProblem(w, r, http.StatusUnprocessableEntity, "", "resource_handle is required")
 		return
 	case req.ProjectID == "" || req.ProjectID == "00000000-0000-0000-0000-000000000000" || !uuidRe.MatchString(req.ProjectID):
-		writeProblem(w, http.StatusUnprocessableEntity, "", "project_id must be a non-zero UUID")
+		writeProblem(w, r, http.StatusUnprocessableEntity, "", "project_id must be a non-zero UUID")
 		return
 	}
 	for _, f := range []string{req.ProjectID, req.ResourceHandle, req.BootstrapToken, req.Nonce, req.RequestedResourceID} {
 		if len(f) > 4096 {
-			writeProblem(w, http.StatusUnprocessableEntity, "", "field exceeds maximum length of 4096")
+			writeProblem(w, r, http.StatusUnprocessableEntity, "", "field exceeds maximum length of 4096")
 			return
 		}
 	}
 
 	// 3. Public key (400, public_key_invalid) — shape, then reject the zero key.
 	if !pubKeyRe.MatchString(req.PublicKey) {
-		writeProblem(w, http.StatusBadRequest, "public_key_invalid", "public_key must be 44-char standard base64")
+		writeProblem(w, r, http.StatusBadRequest, "public_key_invalid", "public_key must be 44-char standard base64")
 		return
 	}
 	if raw, err := base64.StdEncoding.DecodeString(req.PublicKey); err == nil && isAllZero(raw) {
-		writeProblem(w, http.StatusBadRequest, "public_key_invalid", "public_key must not be the zero key")
+		writeProblem(w, r, http.StatusBadRequest, "public_key_invalid", "public_key must not be the zero key")
 		return
 	}
 
 	// 4. Token (403).
 	m := tokenRe.FindStringSubmatch(req.BootstrapToken)
 	if m == nil {
-		writeProblem(w, http.StatusForbidden, "", "bootstrap_token is malformed")
+		writeProblem(w, r, http.StatusForbidden, "", "bootstrap_token is malformed")
 		return
 	}
 	if m[1] == "bridge" {
-		writeProblem(w, http.StatusForbidden, "kind_mismatch", "bootstrap_token kind does not match node registration")
+		writeProblem(w, r, http.StatusForbidden, "kind_mismatch", "bootstrap_token kind does not match node registration")
 		return
 	}
 	// The random segment is the trailing field after the kind. tokenRe has
@@ -539,19 +548,19 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	random := strings.Split(req.BootstrapToken, "_")[4]
 	switch {
 	case strings.Contains(random, "consumed"):
-		writeProblem(w, http.StatusForbidden, "token_consumed", "bootstrap_token already consumed")
+		writeProblem(w, r, http.StatusForbidden, "token_consumed", "bootstrap_token already consumed")
 		return
 	case strings.Contains(random, "expired"):
-		writeProblem(w, http.StatusForbidden, "token_expired", "bootstrap_token expired")
+		writeProblem(w, r, http.StatusForbidden, "token_expired", "bootstrap_token expired")
 		return
 	case strings.Contains(random, "revoked"):
-		writeProblem(w, http.StatusForbidden, "token_revoked", "bootstrap_token revoked")
+		writeProblem(w, r, http.StatusForbidden, "token_revoked", "bootstrap_token revoked")
 		return
 	}
 
 	// 5. Project match (403).
 	if req.ProjectID != mockProjectID {
-		writeProblem(w, http.StatusForbidden, "project_mismatch", "project_id does not match the bootstrap token")
+		writeProblem(w, r, http.StatusForbidden, "project_mismatch", "project_id does not match the bootstrap token")
 		return
 	}
 
@@ -561,29 +570,29 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	_, replayed := s.consumedNonces[nonceKey]
 	s.consumedNoncesMu.Unlock()
 	if replayed {
-		writeProblem(w, http.StatusForbidden, "nonce_collision", "nonce has already been used")
+		writeProblem(w, r, http.StatusForbidden, "nonce_collision", "nonce has already been used")
 		return
 	}
 
 	// 7. Resource resolution (404).
 	if req.ResourceHandle == "unknown-resource" {
-		writeProblem(w, http.StatusNotFound, "resource_not_found", "resource handle could not be resolved")
+		writeProblem(w, r, http.StatusNotFound, "resource_not_found", "resource handle could not be resolved")
 		return
 	}
 
 	// 8. Magic handles for allocator/server failures.
 	switch req.ResourceHandle {
 	case "exhausted-pool":
-		writeProblem(w, http.StatusServiceUnavailable, "pool_exhausted", "address pool exhausted")
+		writeProblem(w, r, http.StatusServiceUnavailable, "pool_exhausted", "address pool exhausted")
 		return
 	case "exhausted-subrange":
-		writeProblem(w, http.StatusServiceUnavailable, "subrange_exhausted", "address subrange exhausted")
+		writeProblem(w, r, http.StatusServiceUnavailable, "subrange_exhausted", "address subrange exhausted")
 		return
 	case "contended-allocator":
-		writeProblem(w, http.StatusServiceUnavailable, "allocator_contention", "allocator contention, retry")
+		writeProblem(w, r, http.StatusServiceUnavailable, "allocator_contention", "allocator contention, retry")
 		return
 	case "boom-internal":
-		writeProblem(w, http.StatusInternalServerError, "", "internal server error")
+		writeProblem(w, r, http.StatusInternalServerError, "", "internal server error")
 		return
 	}
 
@@ -598,7 +607,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	s.consumedNoncesMu.Unlock()
 	if replayed {
-		writeProblem(w, http.StatusForbidden, "nonce_collision", "nonce has already been used")
+		writeProblem(w, r, http.StatusForbidden, "nonce_collision", "nonce has already been used")
 		return
 	}
 
@@ -616,10 +625,50 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, resp)
 }
 
-// handleHeartbeat handles POST /v1/nodes/{id}/heartbeat (REQ-003).
+// handleHeartbeat handles POST /v1/nodes/{id}/heartbeat (REQ-003). It enforces
+// the v1 heartbeat contract: strict decoding, a required nat_summary object,
+// clock-skew tolerance, and checksum/version shape. The counter increments only
+// when every check passes, so invalid requests do not count.
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	data, err := s.captureBody("heartbeat", r)
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_heartbeat_request", "invalid request body")
+		return
+	}
+
 	var req api.HeartbeatRequest
-	if !s.decodeBody(w, r, "heartbeat", &req) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_heartbeat_request", "heartbeat body is malformed")
+		return
+	}
+
+	// nat_summary is a required object: reject absent, null, or non-object. This
+	// is what proves the agent sends {} rather than null when NAT discovery has
+	// not produced a result yet.
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawFields); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_heartbeat_request", "heartbeat body is malformed")
+		return
+	}
+	if natRaw, ok := rawFields["nat_summary"]; !ok || !isJSONObject(natRaw) {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_heartbeat_request", "nat_summary must be a JSON object")
+		return
+	}
+
+	// Clock skew: client_now must be within 60s of server time either way.
+	if skew := time.Since(req.ClientNow); skew > 60*time.Second || skew < -60*time.Second {
+		writeProblem(w, r, http.StatusBadRequest, "clock_skew", "client_now is outside the accepted tolerance")
+		return
+	}
+
+	if !validBinaryChecksum(req.BinaryChecksum) {
+		writeProblem(w, r, http.StatusBadRequest, "binary_checksum_empty", "binary_checksum must be 64-char hex or base64 of 32 bytes")
+		return
+	}
+	if strings.TrimSpace(req.BinaryVersion) == "" {
+		writeProblem(w, r, http.StatusBadRequest, "binary_version_empty", "binary_version is required")
 		return
 	}
 
@@ -628,6 +677,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	s.heartbeatFixtureMu.RLock()
 	resp := s.heartbeatFixture
 	s.heartbeatFixtureMu.RUnlock()
+	resp.AcceptedAt = time.Now().UTC()
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -761,20 +811,54 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleEndpoint handles PUT /v1/nodes/{id}/endpoint.
+// handleEndpoint handles PUT /v1/nodes/{id}/endpoint. It enforces the v1
+// endpoint contract: a 4 KiB body cap, strict decoding, a closed nat_type enum,
+// clock-skew tolerance, and a routable ip:port. The counter increments only
+// when every check passes.
 func (s *Server) handleEndpoint(w http.ResponseWriter, r *http.Request) {
-	var req api.EndpointReport
-	if !s.decodeBody(w, r, "endpoint", &req) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	data, err := s.captureBody("endpoint", r)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, "endpoint_body_too_large", "endpoint body exceeds 4 KiB")
+			return
+		}
+		writeProblem(w, r, http.StatusBadRequest, "malformed_endpoint_request", "invalid request body")
 		return
 	}
-	s.endpointCount.Add(1)
-	resp := api.EndpointResponse{
-		PeerEndpoints: []api.PeerEndpoint{
-			{PeerID: "peer-001", Endpoint: "203.0.113.1:51820"},
-			{PeerID: "peer-002", Endpoint: "203.0.113.2:51820"},
-		},
+
+	var req api.EndpointRequest
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_endpoint_request", "endpoint body is malformed")
+		return
 	}
-	writeJSON(w, http.StatusOK, resp)
+
+	if !validNATType(req.NATType) {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_endpoint_request", "nat_type is outside the accepted enum")
+		return
+	}
+
+	// Clock skew: reported_at must be within 60s of server time either way.
+	if skew := time.Since(req.ReportedAt); skew > 60*time.Second || skew < -60*time.Second {
+		writeProblem(w, r, http.StatusBadRequest, "endpoint_clock_skew", "reported_at is outside the accepted tolerance")
+		return
+	}
+
+	if !routableEndpoint(req.Endpoint) {
+		writeProblem(w, r, http.StatusBadRequest, "endpoint_unparseable", "endpoint must be a routable ip:port")
+		return
+	}
+
+	s.endpointCount.Add(1)
+
+	now := time.Now().UTC()
+	writeJSON(w, http.StatusOK, api.EndpointResponse{
+		AcceptedAt: now,
+		StaleAfter: now.Add(s.getEndpointTTL()),
+	})
 }
 
 // handleDrift handles POST /v1/nodes/{id}/drift.
@@ -948,6 +1032,37 @@ func (s *Server) handleConfigureHeartbeat(w http.ResponseWriter, r *http.Request
 		return
 	}
 	s.SetHeartbeatResponse(resp)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// SetEndpointTTL updates the stale_after TTL applied by the endpoint handler.
+func (s *Server) SetEndpointTTL(d time.Duration) {
+	s.endpointTTLMu.Lock()
+	s.endpointTTL = d
+	s.endpointTTLMu.Unlock()
+}
+
+// getEndpointTTL returns the current stale_after TTL.
+func (s *Server) getEndpointTTL() time.Duration {
+	s.endpointTTLMu.RLock()
+	defer s.endpointTTLMu.RUnlock()
+	return s.endpointTTL
+}
+
+// handleConfigureEndpoint handles POST /test/configure-endpoint. It sets the
+// endpoint stale_after TTL from {"ttl_seconds": N}; N must be positive.
+func (s *Server) handleConfigureEndpoint(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		TTLSeconds int `json:"ttl_seconds"`
+	}
+	if !s.decodeBody(w, r, "configure_endpoint", &body) {
+		return
+	}
+	if body.TTLSeconds <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ttl_seconds must be positive"})
+		return
+	}
+	s.SetEndpointTTL(time.Duration(body.TTLSeconds) * time.Second)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1178,14 +1293,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 // writeProblem writes an RFC 9457 application/problem+json error response. The
 // type member is a well-known problem URI when code is non-empty, else
-// about:blank; the code member is omitted when code is empty.
-func writeProblem(w http.ResponseWriter, status int, code, detail string) {
+// about:blank; the code member is omitted when code is empty. The instance
+// member identifies the specific occurrence via the request path.
+func writeProblem(w http.ResponseWriter, r *http.Request, status int, code, detail string) {
 	problem := map[string]any{
 		"type":     "about:blank",
 		"title":    http.StatusText(status),
 		"status":   status,
 		"detail":   detail,
-		"instance": "/v1/register",
+		"instance": r.URL.Path,
 	}
 	if code != "" {
 		problem["type"] = "https://api.plexsphere.com/problems/" + code
@@ -1204,6 +1320,63 @@ func isAllZero(b []byte) bool {
 		if c != 0 {
 			return false
 		}
+	}
+	return true
+}
+
+// binaryChecksumHexRe matches a 64-char lowercase hex SHA-256 digest.
+var binaryChecksumHexRe = regexp.MustCompile("^[0-9a-f]{64}$")
+
+// validBinaryChecksum accepts either a 64-char lowercase hex digest or the
+// 44-char standard-padded base64 encoding of exactly 32 bytes — the two wire
+// forms a real control plane tolerates for a SHA-256 binary checksum.
+func validBinaryChecksum(cs string) bool {
+	if binaryChecksumHexRe.MatchString(cs) {
+		return true
+	}
+	if len(cs) == 44 {
+		if raw, err := base64.StdEncoding.DecodeString(cs); err == nil && len(raw) == 32 {
+			return true
+		}
+	}
+	return false
+}
+
+// isJSONObject reports whether raw is a JSON object ({...}), rejecting null,
+// arrays, strings, and numbers.
+func isJSONObject(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && trimmed[0] == '{'
+}
+
+// validNATType reports whether t is inside the closed endpoint nat_type enum.
+func validNATType(t string) bool {
+	switch t {
+	case "full_cone", "restricted", "port_restricted", "symmetric", "unknown":
+		return true
+	default:
+		return false
+	}
+}
+
+// routableEndpoint reports whether endpoint is a routable ip:port: a numeric
+// port in 1..65535 and an IP that is not loopback, link-local (unicast or
+// multicast), or unspecified.
+func routableEndpoint(endpoint string) bool {
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return false
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 1 || p > 65535 {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return false
 	}
 	return true
 }

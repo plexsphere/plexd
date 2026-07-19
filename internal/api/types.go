@@ -55,23 +55,10 @@ type Peer struct {
 // ---------------------------------------------------------------------------
 
 type HeartbeatRequest struct {
-	NodeID         string          `json:"node_id"`
-	Timestamp      time.Time       `json:"timestamp"`
-	Status         string          `json:"status"`
-	Uptime         string          `json:"uptime"`
-	BinaryChecksum string          `json:"binary_checksum"`
-	Mesh           *MeshInfo       `json:"mesh,omitempty"`
-	NAT            *NATInfo        `json:"nat,omitempty"`
-	Bridge         *BridgeInfo     `json:"bridge,omitempty"`
-	UserAccess     *UserAccessInfo `json:"user_access,omitempty"`
-	Ingress        *IngressInfo    `json:"ingress,omitempty"`
-	SiteToSite     *SiteToSiteInfo `json:"site_to_site,omitempty"`
-}
-
-type MeshInfo struct {
-	Interface  string `json:"interface"`
-	PeerCount  int    `json:"peer_count"`
-	ListenPort int    `json:"listen_port"`
+	ClientNow      time.Time      `json:"client_now"`
+	BinaryChecksum string         `json:"binary_checksum"`
+	BinaryVersion  string         `json:"binary_version"`
+	NATSummary     map[string]any `json:"nat_summary"`
 }
 
 type NATInfo struct {
@@ -80,8 +67,9 @@ type NATInfo struct {
 }
 
 type HeartbeatResponse struct {
-	Reconcile  bool `json:"reconcile"`
-	RotateKeys bool `json:"rotate_keys"`
+	AcceptedAt time.Time `json:"accepted_at"`
+	Reconcile  bool      `json:"reconcile"`
+	RotateKeys bool      `json:"rotate_keys"`
 }
 
 // ---------------------------------------------------------------------------
@@ -302,18 +290,15 @@ type HookInfo struct {
 // NAT Endpoint  PUT /v1/nodes/{node_id}/endpoint
 // ---------------------------------------------------------------------------
 
-type EndpointReport struct {
-	PublicEndpoint string `json:"public_endpoint"`
-	NATType        string `json:"nat_type"`
+type EndpointRequest struct {
+	Endpoint   string    `json:"endpoint"`
+	NATType    string    `json:"nat_type"`
+	ReportedAt time.Time `json:"reported_at"`
 }
 
 type EndpointResponse struct {
-	PeerEndpoints []PeerEndpoint `json:"peer_endpoints"`
-}
-
-type PeerEndpoint struct {
-	PeerID   string `json:"peer_id"`
-	Endpoint string `json:"endpoint"`
+	AcceptedAt time.Time `json:"accepted_at"`
+	StaleAfter time.Time `json:"stale_after"`
 }
 
 // ---------------------------------------------------------------------------

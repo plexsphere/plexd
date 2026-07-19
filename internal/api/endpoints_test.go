@@ -145,15 +145,30 @@ func TestHeartbeat_ParsesReconcileFlag(t *testing.T) {
 			t.Errorf("path = %s, want /v1/nodes/n1/heartbeat", r.URL.Path)
 		}
 
+		// The serialized body must carry exactly the four contract keys.
+		var raw map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if len(raw) != 4 {
+			t.Errorf("request keys = %d, want 4: %v", len(raw), raw)
+		}
+		for _, key := range []string{"client_now", "binary_checksum", "binary_version", "nat_summary"} {
+			if _, ok := raw[key]; !ok {
+				t.Errorf("request missing key %q", key)
+			}
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(HeartbeatResponse{Reconcile: true})
 	})
 
 	resp, err := client.Heartbeat(context.Background(), "n1", HeartbeatRequest{
-		NodeID:    "n1",
-		Timestamp: time.Now(),
-		Status:    "healthy",
+		ClientNow:      time.Now().UTC(),
+		BinaryChecksum: "abc123",
+		BinaryVersion:  "1.2.3",
+		NATSummary:     map[string]any{},
 	})
 	if err != nil {
 		t.Fatalf("Heartbeat: %v", err)
@@ -327,6 +342,10 @@ func TestUpdateCapabilities_Success(t *testing.T) {
 }
 
 func TestReportEndpoint_Success(t *testing.T) {
+	reportedAt := time.Now().UTC().Truncate(time.Second)
+	acceptedAt := reportedAt.Add(time.Second)
+	staleAfter := reportedAt.Add(5 * time.Minute)
+
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			t.Errorf("method = %s, want PUT", r.Method)
@@ -335,33 +354,41 @@ func TestReportEndpoint_Success(t *testing.T) {
 			t.Errorf("path = %s, want /v1/nodes/n1/endpoint", r.URL.Path)
 		}
 
-		var req EndpointReport
+		var req EndpointRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-		if req.PublicEndpoint != "1.2.3.4:51820" {
-			t.Errorf("PublicEndpoint = %q, want %q", req.PublicEndpoint, "1.2.3.4:51820")
+		if req.Endpoint != "1.2.3.4:51820" {
+			t.Errorf("Endpoint = %q, want %q", req.Endpoint, "1.2.3.4:51820")
+		}
+		if req.NATType != "full_cone" {
+			t.Errorf("NATType = %q, want %q", req.NATType, "full_cone")
+		}
+		if !req.ReportedAt.Equal(reportedAt) {
+			t.Errorf("ReportedAt = %v, want %v", req.ReportedAt, reportedAt)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(EndpointResponse{
-			PeerEndpoints: []PeerEndpoint{{PeerID: "p1", Endpoint: "5.6.7.8:51820"}},
+			AcceptedAt: acceptedAt,
+			StaleAfter: staleAfter,
 		})
 	})
 
-	resp, err := client.ReportEndpoint(context.Background(), "n1", EndpointReport{
-		PublicEndpoint: "1.2.3.4:51820",
-		NATType:        "full-cone",
+	resp, err := client.ReportEndpoint(context.Background(), "n1", EndpointRequest{
+		Endpoint:   "1.2.3.4:51820",
+		NATType:    "full_cone",
+		ReportedAt: reportedAt,
 	})
 	if err != nil {
 		t.Fatalf("ReportEndpoint: %v", err)
 	}
-	if len(resp.PeerEndpoints) != 1 {
-		t.Fatalf("len(PeerEndpoints) = %d, want 1", len(resp.PeerEndpoints))
+	if !resp.AcceptedAt.Equal(acceptedAt) {
+		t.Errorf("AcceptedAt = %v, want %v", resp.AcceptedAt, acceptedAt)
 	}
-	if resp.PeerEndpoints[0].Endpoint != "5.6.7.8:51820" {
-		t.Errorf("PeerEndpoints[0].Endpoint = %q, want %q", resp.PeerEndpoints[0].Endpoint, "5.6.7.8:51820")
+	if !resp.StaleAfter.Equal(staleAfter) {
+		t.Errorf("StaleAfter = %v, want %v", resp.StaleAfter, staleAfter)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -212,29 +213,29 @@ func TestExchanger_Run_InitialDiscoveryAndReport(t *testing.T) {
 		},
 	}
 
-	peerPubKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
-
+	var reportReceived atomic.Bool
+	now := time.Now().UTC()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			t.Errorf("method = %s, want PUT", r.Method)
 		}
 
-		var req api.EndpointReport
+		var req api.EndpointRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode request: %v", err)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		if req.PublicEndpoint != "203.0.113.1:12345" {
-			t.Errorf("PublicEndpoint = %q, want %q", req.PublicEndpoint, "203.0.113.1:12345")
+		if req.Endpoint != "203.0.113.1:12345" {
+			t.Errorf("Endpoint = %q, want %q", req.Endpoint, "203.0.113.1:12345")
 		}
+		reportReceived.Store(true)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(api.EndpointResponse{
-			PeerEndpoints: []api.PeerEndpoint{
-				{PeerID: "peer-1", Endpoint: "5.6.7.8:51820"},
-			},
+			AcceptedAt: now,
+			StaleAfter: now.Add(5 * time.Minute),
 		})
 	}))
 	defer ts.Close()
@@ -242,15 +243,12 @@ func TestExchanger_Run_InitialDiscoveryAndReport(t *testing.T) {
 	ctrl := &mockWGController{}
 	e := newTestExchanger(t, stunClient, ts, ctrl)
 
-	// Pre-populate the WG manager's peer index so UpdatePeer can resolve the key.
-	e.wgManager.PeerIndex().Add("peer-1", peerPubKey)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- e.Run(ctx, "node-1") }()
 
-	// Wait for WG AddPeer call (from UpdatePeer via reportAndApply).
-	waitFor(t, 2*time.Second, func() bool { return ctrl.addPeerCalls() >= 1 })
+	// Wait for the endpoint report to reach the control plane.
+	waitFor(t, 2*time.Second, func() bool { return reportReceived.Load() })
 
 	cancel()
 	err := <-done
@@ -268,10 +266,14 @@ func TestExchanger_Run_ContextCancellation(t *testing.T) {
 		},
 	}
 
+	now := time.Now().UTC()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(api.EndpointResponse{})
+		_ = json.NewEncoder(w).Encode(api.EndpointResponse{
+			AcceptedAt: now,
+			StaleAfter: now.Add(5 * time.Minute),
+		})
 	}))
 	defer ts.Close()
 
@@ -411,6 +413,10 @@ func TestExchanger_LastResult(t *testing.T) {
 }
 
 func TestExchanger_EndpointReporterAdapter(t *testing.T) {
+	reportedAt := time.Now().UTC().Truncate(time.Second)
+	acceptedAt := reportedAt.Add(time.Second)
+	staleAfter := reportedAt.Add(5 * time.Minute)
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			t.Errorf("method = %s, want PUT", r.Method)
@@ -419,14 +425,14 @@ func TestExchanger_EndpointReporterAdapter(t *testing.T) {
 			t.Errorf("path = %s, want /v1/nodes/node-1/endpoint", r.URL.Path)
 		}
 
-		var req api.EndpointReport
+		var req api.EndpointRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode request: %v", err)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		if req.PublicEndpoint != "1.2.3.4:51820" {
-			t.Errorf("PublicEndpoint = %q, want %q", req.PublicEndpoint, "1.2.3.4:51820")
+		if req.Endpoint != "1.2.3.4:51820" {
+			t.Errorf("Endpoint = %q, want %q", req.Endpoint, "1.2.3.4:51820")
 		}
 		if req.NATType != "full_cone" {
 			t.Errorf("NATType = %q, want %q", req.NATType, "full_cone")
@@ -435,9 +441,8 @@ func TestExchanger_EndpointReporterAdapter(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(api.EndpointResponse{
-			PeerEndpoints: []api.PeerEndpoint{
-				{PeerID: "peer-1", Endpoint: "5.6.7.8:51820"},
-			},
+			AcceptedAt: acceptedAt,
+			StaleAfter: staleAfter,
 		})
 	}))
 	defer ts.Close()
@@ -445,69 +450,18 @@ func TestExchanger_EndpointReporterAdapter(t *testing.T) {
 	cpClient := newTestControlPlane(t, ts)
 	reporter := &controlPlaneReporter{client: cpClient}
 
-	resp, err := reporter.ReportEndpoint(context.Background(), "node-1", api.EndpointReport{
-		PublicEndpoint: "1.2.3.4:51820",
-		NATType:        "full_cone",
+	resp, err := reporter.ReportEndpoint(context.Background(), "node-1", api.EndpointRequest{
+		Endpoint:   "1.2.3.4:51820",
+		NATType:    "full_cone",
+		ReportedAt: reportedAt,
 	})
 	if err != nil {
 		t.Fatalf("ReportEndpoint: %v", err)
 	}
-	if len(resp.PeerEndpoints) != 1 {
-		t.Fatalf("len(PeerEndpoints) = %d, want 1", len(resp.PeerEndpoints))
+	if !resp.AcceptedAt.Equal(acceptedAt) {
+		t.Errorf("AcceptedAt = %v, want %v", resp.AcceptedAt, acceptedAt)
 	}
-	if resp.PeerEndpoints[0].PeerID != "peer-1" {
-		t.Errorf("PeerID = %q, want %q", resp.PeerEndpoints[0].PeerID, "peer-1")
-	}
-	if resp.PeerEndpoints[0].Endpoint != "5.6.7.8:51820" {
-		t.Errorf("Endpoint = %q, want %q", resp.PeerEndpoints[0].Endpoint, "5.6.7.8:51820")
-	}
-}
-
-func TestExchanger_Run_SkipsEmptyPeerEndpoint(t *testing.T) {
-	addr := nat.MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: 12345}
-	stunClient := &mockSTUNClient{
-		results: map[string]mockBindResult{
-			"stun1:3478": {Addr: addr},
-			"stun2:3478": {Addr: addr},
-		},
-	}
-
-	peerPubKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(api.EndpointResponse{
-			PeerEndpoints: []api.PeerEndpoint{
-				{PeerID: "peer-empty", Endpoint: ""},           // should be skipped
-				{PeerID: "peer-valid", Endpoint: "1.2.3.4:51820"}, // should be applied
-			},
-		})
-	}))
-	defer ts.Close()
-
-	ctrl := &mockWGController{}
-	e := newTestExchanger(t, stunClient, ts, ctrl)
-
-	// Pre-populate peer index for both peers.
-	e.wgManager.PeerIndex().Add("peer-empty", peerPubKey)
-	e.wgManager.PeerIndex().Add("peer-valid", peerPubKey)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- e.Run(ctx, "node-1") }()
-
-	// Wait for exactly 1 AddPeer call (peer-valid only, peer-empty skipped).
-	waitFor(t, 2*time.Second, func() bool { return ctrl.addPeerCalls() >= 1 })
-
-	// Give a small window to ensure no extra calls arrive.
-	time.Sleep(50 * time.Millisecond)
-
-	cancel()
-	<-done
-
-	// Only peer-valid should have triggered an AddPeer call.
-	if n := ctrl.addPeerCalls(); n != 1 {
-		t.Errorf("expected 1 AddPeer call (peer-valid only), got %d", n)
+	if !resp.StaleAfter.Equal(staleAfter) {
+		t.Errorf("StaleAfter = %v, want %v", resp.StaleAfter, staleAfter)
 	}
 }

@@ -82,6 +82,7 @@ func TestConfig_ValidateAcceptsCustomValues(t *testing.T) {
 	cfg.STUNServers = []string{"stun.example.com:3478"}
 	cfg.RefreshInterval = 30 * time.Second
 	cfg.Timeout = 10 * time.Second
+	cfg.MinReportInterval = 15 * time.Second
 
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() = %v, want nil", err)

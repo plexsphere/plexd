@@ -1,9 +1,12 @@
 package nat
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,10 +16,11 @@ import (
 
 func newTestDiscoverer(client *mockSTUNClient, servers []string, localPort int) *Discoverer {
 	cfg := Config{
-		Enabled:         true,
-		STUNServers:     servers,
-		RefreshInterval: 60 * time.Second,
-		Timeout:         5 * time.Second,
+		Enabled:           true,
+		STUNServers:       servers,
+		RefreshInterval:   60 * time.Second,
+		Timeout:           5 * time.Second,
+		MinReportInterval: DefaultMinReportInterval,
 	}
 	return NewDiscoverer(client, cfg, localPort, discardLogger())
 }
@@ -328,7 +332,6 @@ func TestRun_InitialDiscoveryAndReport(t *testing.T) {
 		},
 	}
 	reporter := &mockReporter{response: &api.EndpointResponse{}}
-	updater := &mockUpdater{}
 
 	cfg := Config{
 		Enabled:         true,
@@ -341,7 +344,7 @@ func TestRun_InitialDiscoveryAndReport(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx, reporter, updater, "node-1") }()
+	go func() { done <- d.Run(ctx, reporter, "node-1") }()
 
 	// Wait for the reporter to be called.
 	deadline := time.After(2 * time.Second)
@@ -372,8 +375,8 @@ func TestRun_InitialDiscoveryAndReport(t *testing.T) {
 		t.Fatal("expected at least 1 report call")
 	}
 	call := reporter.calls[0]
-	if call.Report.PublicEndpoint != "203.0.113.1:12345" {
-		t.Errorf("expected endpoint 203.0.113.1:12345, got %s", call.Report.PublicEndpoint)
+	if call.Report.Endpoint != "203.0.113.1:12345" {
+		t.Errorf("expected endpoint 203.0.113.1:12345, got %s", call.Report.Endpoint)
 	}
 	if call.Report.NATType != string(NATFullCone) {
 		t.Errorf("expected nat type full_cone, got %s", call.Report.NATType)
@@ -389,7 +392,6 @@ func TestRun_RefreshesAtInterval(t *testing.T) {
 	}
 
 	reporter := &mockReporter{response: &api.EndpointResponse{}}
-	updater := &mockUpdater{}
 
 	cfg := Config{
 		Enabled:         true,
@@ -402,7 +404,7 @@ func TestRun_RefreshesAtInterval(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 
-	_ = d.Run(ctx, reporter, updater, "node-1")
+	_ = d.Run(ctx, reporter, "node-1")
 
 	// Initial discover + at least 1 refresh means >= 2 bind calls.
 	calls := client.totalCalls()
@@ -423,7 +425,6 @@ func TestRun_LogsEndpointChange(t *testing.T) {
 	}
 
 	reporter := &mockReporter{response: &api.EndpointResponse{}}
-	updater := &mockUpdater{}
 
 	cfg := Config{
 		Enabled:         true,
@@ -436,7 +437,7 @@ func TestRun_LogsEndpointChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx, reporter, updater, "node-1") }()
+	go func() { done <- d.Run(ctx, reporter, "node-1") }()
 
 	// Wait until reporter has been called at least twice (initial + refresh with new endpoint).
 	deadline := time.After(2 * time.Second)
@@ -461,11 +462,11 @@ func TestRun_LogsEndpointChange(t *testing.T) {
 	reporter.mu.Lock()
 	defer reporter.mu.Unlock()
 
-	if reporter.calls[0].Report.PublicEndpoint != "203.0.113.1:12345" {
-		t.Errorf("first report: expected 203.0.113.1:12345, got %s", reporter.calls[0].Report.PublicEndpoint)
+	if reporter.calls[0].Report.Endpoint != "203.0.113.1:12345" {
+		t.Errorf("first report: expected 203.0.113.1:12345, got %s", reporter.calls[0].Report.Endpoint)
 	}
-	if reporter.calls[1].Report.PublicEndpoint != "198.51.100.2:54321" {
-		t.Errorf("second report: expected 198.51.100.2:54321, got %s", reporter.calls[1].Report.PublicEndpoint)
+	if reporter.calls[1].Report.Endpoint != "198.51.100.2:54321" {
+		t.Errorf("second report: expected 198.51.100.2:54321, got %s", reporter.calls[1].Report.Endpoint)
 	}
 }
 
@@ -482,7 +483,6 @@ func TestRun_ContinuesOnRefreshFailure(t *testing.T) {
 	}
 
 	reporter := &mockReporter{response: &api.EndpointResponse{}}
-	updater := &mockUpdater{}
 
 	cfg := Config{
 		Enabled:         true,
@@ -495,7 +495,7 @@ func TestRun_ContinuesOnRefreshFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx, reporter, updater, "node-1") }()
+	go func() { done <- d.Run(ctx, reporter, "node-1") }()
 
 	// Wait for at least 2 report calls: initial + third discovery (second refresh succeeds).
 	deadline := time.After(2 * time.Second)
@@ -524,8 +524,8 @@ func TestRun_ContinuesOnRefreshFailure(t *testing.T) {
 		t.Fatalf("expected at least 2 report calls, got %d", len(reporter.calls))
 	}
 	// The second report should correspond to addrC (the third discovery, since second failed).
-	if reporter.calls[1].Report.PublicEndpoint != "203.0.113.1:12345" {
-		t.Errorf("expected endpoint 203.0.113.1:12345, got %s", reporter.calls[1].Report.PublicEndpoint)
+	if reporter.calls[1].Report.Endpoint != "203.0.113.1:12345" {
+		t.Errorf("expected endpoint 203.0.113.1:12345, got %s", reporter.calls[1].Report.Endpoint)
 	}
 }
 
@@ -538,7 +538,6 @@ func TestRun_StopsOnContextCancellation(t *testing.T) {
 		},
 	}
 	reporter := &mockReporter{response: &api.EndpointResponse{}}
-	updater := &mockUpdater{}
 
 	cfg := Config{
 		Enabled:         true,
@@ -551,7 +550,7 @@ func TestRun_StopsOnContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx, reporter, updater, "node-1") }()
+	go func() { done <- d.Run(ctx, reporter, "node-1") }()
 
 	// Let it run briefly, then cancel.
 	time.Sleep(100 * time.Millisecond)
@@ -572,7 +571,6 @@ func TestRun_ReturnsErrorOnInitialDiscoveryFailure(t *testing.T) {
 		defaultErr: errors.New("all servers unreachable"),
 	}
 	reporter := &mockReporter{response: &api.EndpointResponse{}}
-	updater := &mockUpdater{}
 
 	cfg := Config{
 		Enabled:         true,
@@ -582,7 +580,7 @@ func TestRun_ReturnsErrorOnInitialDiscoveryFailure(t *testing.T) {
 	}
 	d := NewDiscoverer(client, cfg, 51820, discardLogger())
 
-	err := d.Run(context.Background(), reporter, updater, "node-1")
+	err := d.Run(context.Background(), reporter, "node-1")
 	if err == nil {
 		t.Fatal("expected error from initial discovery failure, got nil")
 	}
@@ -592,5 +590,91 @@ func TestRun_ReturnsErrorOnInitialDiscoveryFailure(t *testing.T) {
 	defer reporter.mu.Unlock()
 	if len(reporter.calls) != 0 {
 		t.Errorf("expected 0 report calls, got %d", len(reporter.calls))
+	}
+}
+
+// A control plane that keeps rejecting the endpoint leaves the node
+// unreachable for peers behind symmetric NAT while every other health signal
+// stays green. The condition must not stay a quiet per-cycle Warn forever.
+func TestReportEndpoint_EscalatesConsecutiveRejections(t *testing.T) {
+	var buf bytes.Buffer
+	d := &Discoverer{
+		cfg:    Config{RefreshInterval: time.Minute, MinReportInterval: 10 * time.Second},
+		logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	}
+	reporter := &mockReporter{}
+	result := &DiscoveryResult{Endpoint: "203.0.113.1:12345", NATType: NATFullCone}
+
+	for i := 1; i <= endpointRejectionEscalation; i++ {
+		reporter.errs = append(reporter.errs, &api.APIError{StatusCode: 404, Code: "endpoint_peer_not_found"})
+	}
+
+	for i := 1; i < endpointRejectionEscalation; i++ {
+		buf.Reset()
+		d.reportEndpoint(context.Background(), reporter, "node-1", result)
+		if got := buf.String(); !strings.Contains(got, "level=WARN") {
+			t.Errorf("rejection %d logged %q, want WARN", i, got)
+		}
+	}
+
+	buf.Reset()
+	d.reportEndpoint(context.Background(), reporter, "node-1", result)
+	logged := buf.String()
+	if !strings.Contains(logged, "level=ERROR") {
+		t.Errorf("rejection %d logged %q, want ERROR escalation", endpointRejectionEscalation, logged)
+	}
+	if !strings.Contains(logged, "consecutive_rejections=3") {
+		t.Errorf("log %q, want it to carry consecutive_rejections=3", logged)
+	}
+
+	// A successful report clears the streak.
+	reporter.response = &api.EndpointResponse{}
+	d.reportEndpoint(context.Background(), reporter, "node-1", result)
+	if d.rejections != 0 {
+		t.Errorf("rejections = %d after success, want 0", d.rejections)
+	}
+}
+
+func TestNextDelay(t *testing.T) {
+	tests := []struct {
+		name              string
+		minReportInterval time.Duration
+		offset            time.Duration // staleAfter relative to now
+		zero              bool          // when true, pass the zero time
+		want              time.Duration
+		wantWarn          bool
+	}{
+		{name: "deadline far ahead capped at refresh interval", minReportInterval: 10 * time.Second, offset: 5 * time.Minute, want: 60 * time.Second},
+		{name: "deadline near margin floored at minimum", minReportInterval: 10 * time.Second, offset: 40 * time.Second, want: 10 * time.Second, wantWarn: true},
+		{name: "zero deadline falls back to refresh interval", minReportInterval: 10 * time.Second, zero: true, want: 60 * time.Second},
+		{name: "deadline inside margin floored at minimum", minReportInterval: 10 * time.Second, offset: 20 * time.Second, want: 10 * time.Second, wantWarn: true},
+		// An operator who raises the floor caps how far a short server-side
+		// TTL can accelerate the STUN and report loop.
+		{name: "configured floor bounds a short deadline", minReportInterval: 45 * time.Second, offset: 40 * time.Second, want: 45 * time.Second, wantWarn: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			d := &Discoverer{
+				cfg:    Config{RefreshInterval: 60 * time.Second, MinReportInterval: tt.minReportInterval},
+				logger: slog.New(slog.NewTextHandler(&buf, nil)),
+			}
+
+			var staleAfter time.Time
+			if !tt.zero {
+				staleAfter = time.Now().Add(tt.offset)
+			}
+			got := d.nextDelay(staleAfter)
+			// Allow for tiny elapsed time between computing staleAfter and the
+			// call; the result never exceeds want.
+			if got > tt.want || got < tt.want-time.Second {
+				t.Errorf("nextDelay = %v, want within [%v, %v]", got, tt.want-time.Second, tt.want)
+			}
+			// A server-shortened cadence must be visible to the operator.
+			if gotWarn := strings.Contains(buf.String(), "level=WARN"); gotWarn != tt.wantWarn {
+				t.Errorf("warn logged = %v, want %v (log: %s)", gotWarn, tt.wantWarn, buf.String())
+			}
+		})
 	}
 }

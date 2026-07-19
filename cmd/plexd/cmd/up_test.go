@@ -3,7 +3,9 @@ package cmd
 import (
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,6 +55,58 @@ func TestRedactSensitiveLine_SecretKey(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildHeartbeatRequest(t *testing.T) {
+	t.Run("nil NAT info yields empty non-nil summary", func(t *testing.T) {
+		req := buildHeartbeatRequest("checksum-abc", "1.2.3", nil)
+
+		if req.NATSummary == nil {
+			t.Fatal("NATSummary = nil, want non-nil empty map")
+		}
+		if len(req.NATSummary) != 0 {
+			t.Errorf("NATSummary = %v, want empty", req.NATSummary)
+		}
+
+		data, err := json.Marshal(req)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if !strings.Contains(string(data), `"nat_summary":{}`) {
+			t.Errorf("marshaled request should contain nat_summary as {}, got: %s", data)
+		}
+		if strings.Contains(string(data), `"nat_summary":null`) {
+			t.Errorf("marshaled request must not contain nat_summary as null, got: %s", data)
+		}
+
+		if req.ClientNow.IsZero() {
+			t.Error("ClientNow is zero, want a fresh timestamp")
+		}
+		if req.ClientNow.Location() != time.UTC {
+			t.Errorf("ClientNow location = %v, want UTC", req.ClientNow.Location())
+		}
+		if req.BinaryChecksum != "checksum-abc" {
+			t.Errorf("BinaryChecksum = %q, want %q", req.BinaryChecksum, "checksum-abc")
+		}
+		if req.BinaryVersion != "1.2.3" {
+			t.Errorf("BinaryVersion = %q, want %q", req.BinaryVersion, "1.2.3")
+		}
+	})
+
+	t.Run("populated NAT info maps through Wire", func(t *testing.T) {
+		req := buildHeartbeatRequest("checksum-abc", "1.2.3", &api.NATInfo{
+			PublicEndpoint: "203.0.113.9:51820",
+			Type:           "none",
+		})
+
+		if got := req.NATSummary["endpoint"]; got != "203.0.113.9:51820" {
+			t.Errorf("summary endpoint = %v, want %q", got, "203.0.113.9:51820")
+		}
+		// Type "none" maps through Wire() to the full_cone traversal posture.
+		if got := req.NATSummary["nat_type"]; got != "full_cone" {
+			t.Errorf("summary nat_type = %v, want %q", got, "full_cone")
+		}
+	})
 }
 
 func TestDecodeSigningKeys_CurrentOnly(t *testing.T) {

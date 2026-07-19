@@ -285,6 +285,11 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
+	selfChecksum, err := integrity.SelfChecksum()
+	if err != nil {
+		return fmt.Errorf("plexd up: binary checksum: %w", err)
+	}
+
 	// 8. Create heartbeat service.
 	hbCfg := agent.HeartbeatConfig{
 		Interval: cfg.Heartbeat.Interval,
@@ -308,29 +313,8 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		reconciler.TriggerReconcile()
 	})
 
-	// Enrich heartbeat with subsystem status.
 	heartbeat.SetBuildRequest(func() api.HeartbeatRequest {
-		req := api.HeartbeatRequest{
-			Mesh: &api.MeshInfo{
-				Interface:  cfg.WireGuard.InterfaceName,
-				PeerCount:  wgMgr.PeerIndex().Count(),
-				ListenPort: cfg.WireGuard.ListenPort,
-			},
-			NAT: exchanger.LastResult(),
-		}
-		if bridgeMgr != nil {
-			req.Bridge = bridgeMgr.BridgeStatus()
-		}
-		if ingressMgr != nil {
-			req.Ingress = ingressMgr.IngressStatus()
-		}
-		if userAccessMgr != nil {
-			req.UserAccess = userAccessMgr.UserAccessStatus()
-		}
-		if s2sMgr != nil {
-			req.SiteToSite = s2sMgr.SiteToSiteStatus()
-		}
-		return req
+		return buildHeartbeatRequest(selfChecksum, buildVersion, exchanger.LastResult())
 	})
 
 	// 9. Create integrity verifier for hook execution.
@@ -723,7 +707,7 @@ func (a *agentHealthProvider) ConnectedPeers() int {
 	}
 	return 0
 }
-func (a *agentHealthProvider) Uptime() time.Duration   { return time.Since(a.startTime) }
+func (a *agentHealthProvider) Uptime() time.Duration    { return time.Since(a.startTime) }
 func (a *agentHealthProvider) LastHeartbeat() time.Time { return time.Time{} }
 func (a *agentHealthProvider) LastReconcile() time.Time { return time.Time{} }
 
@@ -810,10 +794,10 @@ func (ps *peerSnapshot) update(apiPeers []api.Peer) {
 	statuses := make([]nodeapi.PeerStatus, len(apiPeers))
 	for i, p := range apiPeers {
 		statuses[i] = nodeapi.PeerStatus{
-			ID:       p.ID,
+			ID:        p.ID,
 			PublicKey: p.PublicKey,
-			MeshIP:   p.MeshIP,
-			Endpoint: p.Endpoint,
+			MeshIP:    p.MeshIP,
+			Endpoint:  p.Endpoint,
 		}
 	}
 	ps.mu.Lock()
@@ -901,6 +885,24 @@ func (r *controlPlaneTunnelReporter) ReportClosed(ctx context.Context, sessionID
 		Timestamp: time.Now(),
 	}); err != nil {
 		slog.Error("tunnel closed report failed", "session_id", sessionID, "error", err)
+	}
+}
+
+// buildHeartbeatRequest assembles the v1 heartbeat request. NATSummary is
+// an empty non-nil map when NAT discovery has not produced a result yet:
+// the contract requires nat_summary as an object, and a nil map marshals
+// to null, which the server rejects as malformed.
+func buildHeartbeatRequest(checksum, version string, natInfo *api.NATInfo) api.HeartbeatRequest {
+	summary := map[string]any{}
+	if natInfo != nil {
+		summary["endpoint"] = natInfo.PublicEndpoint
+		summary["nat_type"] = nat.NATType(natInfo.Type).Wire()
+	}
+	return api.HeartbeatRequest{
+		ClientNow:      time.Now().UTC(),
+		BinaryChecksum: checksum,
+		BinaryVersion:  version,
+		NATSummary:     summary,
 	}
 }
 

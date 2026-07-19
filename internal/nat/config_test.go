@@ -26,6 +26,9 @@ func TestConfig_Defaults(t *testing.T) {
 	if cfg.Timeout != 5*time.Second {
 		t.Errorf("Timeout = %v, want %v", cfg.Timeout, 5*time.Second)
 	}
+	if cfg.MinReportInterval != DefaultMinReportInterval {
+		t.Errorf("MinReportInterval = %v, want %v", cfg.MinReportInterval, DefaultMinReportInterval)
+	}
 }
 
 func TestConfig_DefaultsPreserveExplicitDisabled(t *testing.T) {
@@ -118,6 +121,24 @@ func TestConfig_ValidateRejectsNonPositiveTimeout(t *testing.T) {
 	}
 }
 
+func TestConfig_ValidateRejectsNonPositiveMinReportInterval(t *testing.T) {
+	cfg := Config{
+		Enabled:           true,
+		STUNServers:       DefaultSTUNServers,
+		RefreshInterval:   60 * time.Second,
+		Timeout:           5 * time.Second,
+		MinReportInterval: 0,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() = nil, want error for zero MinReportInterval")
+	}
+	want := "nat: config: MinReportInterval must be positive"
+	if err.Error() != want {
+		t.Errorf("Validate() error = %q, want %q", err.Error(), want)
+	}
+}
+
 func TestConfig_ValidateDisabledSkipsSTUNValidation(t *testing.T) {
 	cfg := Config{
 		Enabled:         false,
@@ -140,10 +161,11 @@ func TestConfig_ValidateAcceptsDefaults(t *testing.T) {
 
 func TestConfig_ValidateAcceptsCustomValues(t *testing.T) {
 	cfg := Config{
-		Enabled:         true,
-		STUNServers:     []string{"stun.example.com:3478"},
-		RefreshInterval: 30 * time.Second,
-		Timeout:         10 * time.Second,
+		Enabled:           true,
+		STUNServers:       []string{"stun.example.com:3478"},
+		RefreshInterval:   30 * time.Second,
+		Timeout:           10 * time.Second,
+		MinReportInterval: 15 * time.Second,
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() = %v, want nil", err)
