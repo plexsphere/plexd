@@ -2,6 +2,7 @@ package nat
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -10,9 +11,21 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 )
 
+// endpointReportMargin is how far before the server-side stale_after deadline
+// the node re-reports its endpoint, leaving headroom for request latency.
+const endpointReportMargin = 30 * time.Second
+
+// endpointRejectionEscalation is how many consecutive control-plane
+// rejections the report loop tolerates at Warn before escalating to Error. A
+// rejection means the control plane no longer holds this node's peer record,
+// and re-reporting cannot clear that: the node stays unreachable for peers
+// behind symmetric NAT while every other health signal remains green. A
+// persistent run needs operator attention, not another quiet retry.
+const endpointRejectionEscalation = 3
+
 // DiscoveryResult holds the outcome of a STUN discovery cycle.
 type DiscoveryResult struct {
-	Endpoint string  // "ip:port" format
+	Endpoint string // "ip:port" format
 	NATType  NATType
 }
 
@@ -25,6 +38,10 @@ type Discoverer struct {
 
 	mu         sync.RWMutex
 	lastResult *api.NATInfo
+
+	// rejections counts consecutive control-plane endpoint rejections. It is
+	// owned by the Run loop and never read concurrently.
+	rejections int
 }
 
 // NewDiscoverer creates a new Discoverer.
@@ -128,6 +145,35 @@ func (d *Discoverer) updateLastResult(endpoint string, natType NATType, stunServ
 	)
 }
 
+// reportEndpoint reports result and returns the server's stale_after
+// deadline, logging any failure. Consecutive rejections are counted so a
+// control plane that has forgotten this node's peer record cannot stay a
+// silent per-cycle Warn forever: after endpointRejectionEscalation cycles
+// the condition is logged at Error, which is alertable. A successful report
+// clears the streak; a transient failure leaves it intact, since it says
+// nothing about whether the peer record came back.
+func (d *Discoverer) reportEndpoint(ctx context.Context, reporter EndpointReporter, nodeID string, result *DiscoveryResult) time.Time {
+	staleAfter, err := report(ctx, reporter, nodeID, result)
+	switch {
+	case err == nil:
+		d.rejections = 0
+	case errors.Is(err, errEndpointRejected):
+		d.rejections++
+		level := slog.LevelWarn
+		if d.rejections >= endpointRejectionEscalation {
+			level = slog.LevelError
+		}
+		d.logger.Log(ctx, level, "endpoint report rejected, this node is not registered as a peer",
+			"component", "nat",
+			"error", err,
+			"consecutive_rejections", d.rejections,
+		)
+	default:
+		d.logger.Warn("endpoint report failed", "component", "nat", "error", err)
+	}
+	return staleAfter
+}
+
 // LastResult returns the most recently discovered NAT info, or nil if no discovery has succeeded.
 func (d *Discoverer) LastResult() *api.NATInfo {
 	d.mu.RLock()
@@ -137,29 +183,28 @@ func (d *Discoverer) LastResult() *api.NATInfo {
 
 // Run performs initial STUN discovery, reports the endpoint, then enters a refresh loop.
 // It blocks until ctx is cancelled or an unrecoverable error occurs.
-func (d *Discoverer) Run(ctx context.Context, reporter EndpointReporter, updater PeerUpdater, nodeID string) error {
+func (d *Discoverer) Run(ctx context.Context, reporter EndpointReporter, nodeID string) error {
 	result, err := d.Discover(ctx)
 	if err != nil {
 		return fmt.Errorf("nat: initial discovery: %w", err)
 	}
 
-	if err := reportAndApply(ctx, reporter, updater, nodeID, result, d.logger); err != nil {
-		d.logger.Warn("endpoint report failed", "component", "nat", "error", err)
-	}
+	staleAfter := d.reportEndpoint(ctx, reporter, nodeID, result)
 
 	prevEndpoint := result.Endpoint
 
-	ticker := time.NewTicker(d.cfg.RefreshInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(d.nextDelay(staleAfter))
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
 			result, err := d.Discover(ctx)
 			if err != nil {
 				d.logger.Warn("STUN refresh failed", "component", "nat", "error", err)
+				timer.Reset(d.nextDelay(time.Time{}))
 				continue
 			}
 
@@ -172,9 +217,40 @@ func (d *Discoverer) Run(ctx context.Context, reporter EndpointReporter, updater
 			}
 			prevEndpoint = result.Endpoint
 
-			if err := reportAndApply(ctx, reporter, updater, nodeID, result, d.logger); err != nil {
-				d.logger.Warn("endpoint report failed", "component", "nat", "error", err)
-			}
+			staleAfter := d.reportEndpoint(ctx, reporter, nodeID, result)
+			timer.Reset(d.nextDelay(staleAfter))
 		}
 	}
+}
+
+// nextDelay computes the wait before the next report cycle. A zero
+// staleAfter (absent deadline or failed report) falls back to the
+// configured refresh interval. Otherwise the node re-reports
+// endpointReportMargin before the server-side deadline, floored at
+// MinReportInterval; the refresh interval caps the delay. The floor applies
+// to the deadline term only so sub-interval configurations keep working.
+//
+// A deadline shorter than the configured refresh interval means the control
+// plane — not the operator — is setting the cadence, driving both the STUN
+// queries and the endpoint PUTs above the configured rate. That is
+// legitimate when the server's TTL is genuinely short, but it is also what a
+// misconfigured or hostile control plane would do to the whole fleet, so
+// each shortened cycle is logged and MinReportInterval bounds how far it can
+// go.
+func (d *Discoverer) nextDelay(staleAfter time.Time) time.Duration {
+	if staleAfter.IsZero() {
+		return d.cfg.RefreshInterval
+	}
+	deadlineDelay := time.Until(staleAfter) - endpointReportMargin
+	delay := min(d.cfg.RefreshInterval, max(d.cfg.MinReportInterval, deadlineDelay))
+	if delay < d.cfg.RefreshInterval {
+		d.logger.Warn("control plane deadline shortens the endpoint report cadence",
+			"component", "nat",
+			"delay", delay,
+			"refresh_interval", d.cfg.RefreshInterval,
+			"min_report_interval", d.cfg.MinReportInterval,
+			"stale_after", staleAfter,
+		)
+	}
+	return delay
 }

@@ -135,32 +135,119 @@ func TestTypesRegisterPeer(t *testing.T) {
 func TestTypesHeartbeatRequest(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	orig := HeartbeatRequest{
-		NodeID:         "n-001",
-		Timestamp:      now,
-		Status:         "healthy",
-		Uptime:         "3h25m",
-		BinaryChecksum: "sha256:def",
-		Mesh: &MeshInfo{
-			Interface:  "wg0",
-			PeerCount:  3,
-			ListenPort: 51820,
-		},
-		NAT: &NATInfo{
-			PublicEndpoint: "1.2.3.4:51820",
-			Type:           "full-cone",
+		ClientNow:      now,
+		BinaryChecksum: "3b0c4429b1a4f1d2e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7081920",
+		BinaryVersion:  "1.2.3",
+		NATSummary: map[string]any{
+			"endpoint": "203.0.113.9:51820",
+			"nat_type": "full_cone",
 		},
 	}
-	_, got := roundTrip(t, orig)
+	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
+
+	// Exactly the four contract keys, nothing more.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 4 {
+		t.Errorf("expected exactly 4 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"client_now", "binary_checksum", "binary_version", "nat_summary"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+
+	// A nil NATSummary marshals as JSON null, while an empty non-nil map
+	// marshals as {}. The contract requires nat_summary to be an object, so
+	// builders must pass a non-nil map to avoid emitting null.
+	nilData, err := json.Marshal(HeartbeatRequest{ClientNow: now})
+	if err != nil {
+		t.Fatalf("marshal nil summary: %v", err)
+	}
+	if !strings.Contains(string(nilData), `"nat_summary":null`) {
+		t.Errorf("nil NATSummary should marshal as null, got: %s", nilData)
+	}
+	emptyData, err := json.Marshal(HeartbeatRequest{ClientNow: now, NATSummary: map[string]any{}})
+	if err != nil {
+		t.Fatalf("marshal empty summary: %v", err)
+	}
+	if !strings.Contains(string(emptyData), `"nat_summary":{}`) {
+		t.Errorf("empty NATSummary should marshal as {}, got: %s", emptyData)
+	}
 }
 
 func TestTypesHeartbeatResponse(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
 	orig := HeartbeatResponse{
+		AcceptedAt: now,
 		Reconcile:  true,
 		RotateKeys: false,
 	}
-	_, got := roundTrip(t, orig)
+	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 3 {
+		t.Errorf("expected exactly 3 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"accepted_at", "reconcile", "rotate_keys"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestTypesEndpointRequest(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := EndpointRequest{
+		Endpoint:   "203.0.113.9:51820",
+		NATType:    "full_cone",
+		ReportedAt: now,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 3 {
+		t.Errorf("expected exactly 3 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"endpoint", "nat_type", "reported_at"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestTypesEndpointResponse(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := EndpointResponse{
+		AcceptedAt: now,
+		StaleAfter: now.Add(5 * time.Minute),
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 2 {
+		t.Errorf("expected exactly 2 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"accepted_at", "stale_after"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
 }
 
 func TestTypesStateResponse(t *testing.T) {
@@ -450,30 +537,29 @@ func TestBridgeInfo_JSONRoundTrip(t *testing.T) {
 	}
 }
 
-func TestHeartbeatRequest_WithBridge(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := HeartbeatRequest{
-		NodeID:         "n-001",
-		Timestamp:      now,
-		Status:         "healthy",
-		Uptime:         "1h10m",
-		BinaryChecksum: "sha256:abc",
-		Bridge: &BridgeInfo{
-			Enabled:         true,
-			AccessInterface: "eth1",
-			ActiveRoutes:    3,
-		},
+// TestTypesBridgeInfo round-trips BridgeInfo directly. Bridge managers still
+// produce this type (issue #23 reuses it), so its wire shape must stay covered
+// even though it no longer travels in the heartbeat request.
+func TestTypesBridgeInfo(t *testing.T) {
+	// Base case.
+	orig := BridgeInfo{
+		Enabled:         true,
+		AccessInterface: "eth1",
+		ActiveRoutes:    3,
 	}
 	_, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Bridge field should be omitted when nil.
-	orig.Bridge = nil
-	data, got2 := roundTrip(t, orig)
-	requireEqual(t, orig, got2)
-	if s := string(data); strings.Contains(s, `"bridge"`) {
-		t.Errorf("bridge should be omitted when nil, got: %s", s)
+	// Relay-fields variant.
+	relay := BridgeInfo{
+		Enabled:             true,
+		AccessInterface:     "eth1",
+		ActiveRoutes:        3,
+		RelayEnabled:        true,
+		ActiveRelaySessions: 2,
 	}
+	_, gotRelay := roundTrip(t, relay)
+	requireEqual(t, relay, gotRelay)
 }
 
 func TestRelayConfig_JSONRoundTrip(t *testing.T) {
@@ -589,26 +675,6 @@ func TestStateResponse_WithRelayConfig(t *testing.T) {
 	if s := string(data); strings.Contains(s, `"relay_config"`) {
 		t.Errorf("relay_config should be omitted when nil, got: %s", s)
 	}
-}
-
-func TestHeartbeatRequest_WithBridgeRelay(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := HeartbeatRequest{
-		NodeID:         "n-001",
-		Timestamp:      now,
-		Status:         "healthy",
-		Uptime:         "2h30m",
-		BinaryChecksum: "sha256:abc",
-		Bridge: &BridgeInfo{
-			Enabled:             true,
-			AccessInterface:     "eth1",
-			ActiveRoutes:        3,
-			RelayEnabled:        true,
-			ActiveRelaySessions: 2,
-		},
-	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
 }
 
 func TestStateResponse_WithBridgeConfig(t *testing.T) {
@@ -751,31 +817,17 @@ func TestStateResponse_WithUserAccessConfig(t *testing.T) {
 	}
 }
 
-func TestHeartbeatRequest_WithUserAccess(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := HeartbeatRequest{
-		NodeID:         "n-001",
-		Timestamp:      now,
-		Status:         "healthy",
-		Uptime:         "4h15m",
-		BinaryChecksum: "sha256:abc",
-		UserAccess: &UserAccessInfo{
-			Enabled:       true,
-			InterfaceName: "wg-access0",
-			PeerCount:     3,
-			ListenPort:    51830,
-		},
+// TestTypesUserAccessInfo round-trips UserAccessInfo directly. The user-access
+// manager still produces this type; it no longer travels in the heartbeat.
+func TestTypesUserAccessInfo(t *testing.T) {
+	orig := UserAccessInfo{
+		Enabled:       true,
+		InterfaceName: "wg-access0",
+		PeerCount:     3,
+		ListenPort:    51830,
 	}
 	_, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
-
-	// UserAccess field should be omitted when nil.
-	orig.UserAccess = nil
-	data, got2 := roundTrip(t, orig)
-	requireEqual(t, orig, got2)
-	if s := string(data); strings.Contains(s, `"user_access"`) {
-		t.Errorf("user_access should be omitted when nil, got: %s", s)
-	}
 }
 
 func TestIngressConfig_JSONRoundTrip(t *testing.T) {
@@ -898,30 +950,16 @@ func TestStateResponse_WithIngressConfig(t *testing.T) {
 	}
 }
 
-func TestHeartbeatRequest_WithIngress(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := HeartbeatRequest{
-		NodeID:         "n-001",
-		Timestamp:      now,
-		Status:         "healthy",
-		Uptime:         "5h20m",
-		BinaryChecksum: "sha256:abc",
-		Ingress: &IngressInfo{
-			Enabled:         true,
-			RuleCount:       2,
-			ConnectionCount: 15,
-		},
+// TestTypesIngressInfo round-trips IngressInfo directly. The ingress manager
+// still produces this type; it no longer travels in the heartbeat.
+func TestTypesIngressInfo(t *testing.T) {
+	orig := IngressInfo{
+		Enabled:         true,
+		RuleCount:       2,
+		ConnectionCount: 15,
 	}
 	_, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
-
-	// Ingress field should be omitted when nil.
-	orig.Ingress = nil
-	data, got2 := roundTrip(t, orig)
-	requireEqual(t, orig, got2)
-	if s := string(data); strings.Contains(s, `"ingress"`) {
-		t.Errorf("ingress should be omitted when nil, got: %s", s)
-	}
 }
 
 func TestBridgeInfo_IngressFields_JSONRoundTrip(t *testing.T) {
@@ -1185,29 +1223,16 @@ func TestStateResponse_WithSiteToSiteConfig(t *testing.T) {
 	}
 }
 
-func TestHeartbeatRequest_WithSiteToSite(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := HeartbeatRequest{
-		NodeID:         "n-001",
-		Timestamp:      now,
-		Status:         "healthy",
-		Uptime:         "6h45m",
-		BinaryChecksum: "sha256:abc",
-		SiteToSite: &SiteToSiteInfo{
-			Enabled:     true,
-			TunnelCount: 2,
-		},
+// TestTypesSiteToSiteInfo round-trips SiteToSiteInfo directly. The
+// site-to-site manager still produces this type; it no longer travels in the
+// heartbeat.
+func TestTypesSiteToSiteInfo(t *testing.T) {
+	orig := SiteToSiteInfo{
+		Enabled:     true,
+		TunnelCount: 2,
 	}
 	_, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
-
-	// SiteToSite field should be omitted when nil.
-	orig.SiteToSite = nil
-	data, got2 := roundTrip(t, orig)
-	requireEqual(t, orig, got2)
-	if s := string(data); strings.Contains(s, `"site_to_site"`) {
-		t.Errorf("site_to_site should be omitted when nil, got: %s", s)
-	}
 }
 
 func TestLocalEndpointConfig_Validate(t *testing.T) {

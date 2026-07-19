@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -297,8 +299,9 @@ func TestHeartbeatService_BuildRequest(t *testing.T) {
 	svc := NewHeartbeatService(cfg, client, testLogger())
 	svc.SetBuildRequest(func() api.HeartbeatRequest {
 		return api.HeartbeatRequest{
-			Status:         "healthy",
 			BinaryChecksum: "abc123",
+			BinaryVersion:  "1.2.3",
+			NATSummary:     map[string]any{},
 		}
 	})
 
@@ -313,10 +316,47 @@ func TestHeartbeatService_BuildRequest(t *testing.T) {
 	if len(reqs) == 0 {
 		t.Fatal("expected at least one heartbeat request")
 	}
-	if reqs[0].Status != "healthy" {
-		t.Errorf("request Status = %q, want %q", reqs[0].Status, "healthy")
-	}
 	if reqs[0].BinaryChecksum != "abc123" {
 		t.Errorf("request BinaryChecksum = %q, want %q", reqs[0].BinaryChecksum, "abc123")
+	}
+	if reqs[0].BinaryVersion != "1.2.3" {
+		t.Errorf("request BinaryVersion = %q, want %q", reqs[0].BinaryVersion, "1.2.3")
+	}
+}
+
+// TestHeartbeatService_ClockSkew verifies that a clock_skew rejection logs an
+// operator-facing error naming clock synchronization and does not trigger an
+// immediate retry — the next attempt is the next interval tick.
+func TestHeartbeatService_ClockSkew(t *testing.T) {
+	client := &mockHeartbeatClient{
+		errors: []error{
+			&api.APIError{StatusCode: 400, Code: "clock_skew", Message: "client_now outside tolerance"},
+		},
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	cfg := HeartbeatConfig{NodeID: "node-1", Interval: time.Hour}
+	svc := NewHeartbeatService(cfg, client, logger)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	if err := svc.Run(ctx); err != nil && ctx.Err() == nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
+
+	// Exactly one send within the window — no immediate retry on skew.
+	if calls := client.getCalls(); calls != 1 {
+		t.Errorf("heartbeat calls = %d, want 1 (no immediate retry on clock skew)", calls)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "level=ERROR") {
+		t.Errorf("expected ERROR-level log, got: %s", logged)
+	}
+	if !strings.Contains(logged, "clock skew") || !strings.Contains(logged, "synchronize") {
+		t.Errorf("expected log naming clock skew and synchronization, got: %s", logged)
 	}
 }

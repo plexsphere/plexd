@@ -121,6 +121,7 @@ func (s *HeartbeatService) sendHeartbeat(ctx context.Context) {
 		req = s.buildRequest()
 	}
 
+	sentAt := time.Now().UTC()
 	resp, err := s.client.Heartbeat(ctx, s.cfg.NodeID, req)
 	if err != nil {
 		if errors.Is(err, api.ErrUnauthorized) {
@@ -130,9 +131,16 @@ func (s *HeartbeatService) sendHeartbeat(ctx context.Context) {
 			}
 			return
 		}
+		var apiErr *api.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "clock_skew" {
+			s.logger.ErrorContext(ctx, "agent: heartbeat: rejected for clock skew, synchronize the system clock via NTP", "error", err)
+			return
+		}
 		s.logger.ErrorContext(ctx, "agent: heartbeat: send failed", "error", err)
 		return
 	}
+
+	s.logger.DebugContext(ctx, "agent: heartbeat: accepted", "accepted_at", resp.AcceptedAt, "sent_at", sentAt)
 
 	if resp.Reconcile && s.reconciler != nil {
 		s.reconciler.TriggerReconcile()

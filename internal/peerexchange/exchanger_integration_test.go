@@ -108,31 +108,31 @@ func TestIntegration_FullEndpointExchangeFlow(t *testing.T) {
 		},
 	}
 
-	pubKey := peerKey()
-
 	var reportReceived atomic.Bool
+	now := time.Now().UTC()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req api.EndpointReport
+		var req api.EndpointRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
-		// Verify the endpoint was reported correctly.
-		if req.PublicEndpoint != "203.0.113.1:12345" {
-			t.Errorf("reported endpoint = %q, want %q", req.PublicEndpoint, "203.0.113.1:12345")
+		// Verify the endpoint contract body was reported correctly.
+		if req.Endpoint != "203.0.113.1:12345" {
+			t.Errorf("reported endpoint = %q, want %q", req.Endpoint, "203.0.113.1:12345")
 		}
 		if req.NATType != "full_cone" {
 			t.Errorf("reported NAT type = %q, want %q", req.NATType, "full_cone")
+		}
+		if req.ReportedAt.IsZero() {
+			t.Error("reported_at is zero, want a fresh timestamp")
 		}
 		reportReceived.Store(true)
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(api.EndpointResponse{
-			PeerEndpoints: []api.PeerEndpoint{
-				{PeerID: "peer-a", Endpoint: "198.51.100.1:51820"},
-				{PeerID: "peer-b", Endpoint: "198.51.100.2:51820"},
-			},
+			AcceptedAt: now,
+			StaleAfter: now.Add(5 * time.Minute),
 		})
 	}))
 	defer ts.Close()
@@ -140,8 +140,6 @@ func TestIntegration_FullEndpointExchangeFlow(t *testing.T) {
 	logger := discardLogger()
 	ctrl := &trackingWGController{}
 	wgMgr := wireguard.NewManager(ctrl, wireguard.Config{}, logger)
-	wgMgr.PeerIndex().Add("peer-a", pubKey)
-	wgMgr.PeerIndex().Add("peer-b", pubKey)
 
 	natCfg := nat.Config{
 		Enabled:         true,
@@ -163,8 +161,12 @@ func TestIntegration_FullEndpointExchangeFlow(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- exchanger.Run(ctx, "node-1") }()
 
-	// Wait for both peers to be updated.
-	waitFor(t, 2*time.Second, func() bool { return ctrl.addPeerCount() >= 2 })
+	// Wait for the endpoint report to reach the control plane.
+	waitFor(t, 2*time.Second, func() bool { return reportReceived.Load() })
+
+	// Give the report response a moment to be processed. The report response
+	// carries only stale_after now — it must NOT drive any WireGuard update.
+	time.Sleep(50 * time.Millisecond)
 
 	cancel()
 	<-done
@@ -172,8 +174,10 @@ func TestIntegration_FullEndpointExchangeFlow(t *testing.T) {
 	if !reportReceived.Load() {
 		t.Error("endpoint report was never received by the control plane")
 	}
-	if n := ctrl.addPeerCount(); n < 2 {
-		t.Errorf("expected at least 2 AddPeer calls, got %d", n)
+	// Peer endpoint updates arrive only via SSE peer_endpoint_changed events,
+	// never from the report response.
+	if n := ctrl.addPeerCount(); n != 0 {
+		t.Errorf("report response drove %d WireGuard peer updates, want 0", n)
 	}
 
 	// Verify LastResult is populated.
@@ -258,26 +262,24 @@ func TestIntegration_EndpointChangeDuringRefreshLoop(t *testing.T) {
 		},
 	}
 
-	pubKey := peerKey()
-
 	var mu sync.Mutex
 	var reportedEndpoints []string
+	now := time.Now().UTC()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req api.EndpointReport
+		var req api.EndpointRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
 		mu.Lock()
-		reportedEndpoints = append(reportedEndpoints, req.PublicEndpoint)
+		reportedEndpoints = append(reportedEndpoints, req.Endpoint)
 		mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(api.EndpointResponse{
-			PeerEndpoints: []api.PeerEndpoint{
-				{PeerID: "peer-1", Endpoint: "10.0.0.99:51820"},
-			},
+			AcceptedAt: now,
+			StaleAfter: now.Add(5 * time.Minute),
 		})
 	}))
 	defer ts.Close()
@@ -285,7 +287,6 @@ func TestIntegration_EndpointChangeDuringRefreshLoop(t *testing.T) {
 	logger := discardLogger()
 	ctrl := &trackingWGController{}
 	wgMgr := wireguard.NewManager(ctrl, wireguard.Config{}, logger)
-	wgMgr.PeerIndex().Add("peer-1", pubKey)
 
 	natCfg := nat.Config{
 		Enabled:         true,
@@ -306,13 +307,12 @@ func TestIntegration_EndpointChangeDuringRefreshLoop(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- exchanger.Run(ctx, "node-1") }()
 
-	// Wait for at least 2 reports AND 2 AddPeer calls (initial + refresh with changed endpoint).
-	// Both conditions must be met to avoid a race between reporting and peer application.
+	// Wait for at least 2 reports (initial + refresh with the changed endpoint).
 	waitFor(t, 2*time.Second, func() bool {
 		mu.Lock()
 		n := len(reportedEndpoints)
 		mu.Unlock()
-		return n >= 2 && ctrl.addPeerCount() >= 2
+		return n >= 2
 	})
 
 	cancel()
@@ -330,11 +330,6 @@ func TestIntegration_EndpointChangeDuringRefreshLoop(t *testing.T) {
 	if reportedEndpoints[1] != "198.51.100.9:54321" {
 		t.Errorf("second reported endpoint = %q, want %q", reportedEndpoints[1], "198.51.100.9:54321")
 	}
-
-	// Verify WireGuard was updated on both cycles.
-	if n := ctrl.addPeerCount(); n < 2 {
-		t.Errorf("expected at least 2 AddPeer calls, got %d", n)
-	}
 }
 
 // TestIntegration_ConcurrentSSEAndRefreshNoRace exercises the Exchanger
@@ -350,12 +345,12 @@ func TestIntegration_ConcurrentSSEAndRefreshNoRace(t *testing.T) {
 
 	pubKey := peerKey()
 
+	now := time.Now().UTC()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(api.EndpointResponse{
-			PeerEndpoints: []api.PeerEndpoint{
-				{PeerID: "peer-1", Endpoint: "10.0.0.1:51820"},
-			},
+			AcceptedAt: now,
+			StaleAfter: now.Add(5 * time.Minute),
 		})
 	}))
 	defer ts.Close()
