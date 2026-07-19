@@ -185,8 +185,8 @@ func TestIntegration_FullEndpointExchangeFlow(t *testing.T) {
 	if info == nil {
 		t.Fatal("LastResult = nil after full exchange flow")
 	}
-	if info.PublicEndpoint != "203.0.113.1:12345" {
-		t.Errorf("LastResult.PublicEndpoint = %q, want %q", info.PublicEndpoint, "203.0.113.1:12345")
+	if info.Endpoint != "203.0.113.1:12345" {
+		t.Errorf("LastResult.Endpoint = %q, want %q", info.Endpoint, "203.0.113.1:12345")
 	}
 }
 

@@ -892,11 +892,11 @@ func (r *controlPlaneTunnelReporter) ReportClosed(ctx context.Context, sessionID
 // an empty non-nil map when NAT discovery has not produced a result yet:
 // the contract requires nat_summary as an object, and a nil map marshals
 // to null, which the server rejects as malformed.
-func buildHeartbeatRequest(checksum, version string, natInfo *api.NATInfo) api.HeartbeatRequest {
+func buildHeartbeatRequest(checksum, version string, natInfo *nat.DiscoveryResult) api.HeartbeatRequest {
 	summary := map[string]any{}
 	if natInfo != nil {
-		summary["endpoint"] = natInfo.PublicEndpoint
-		summary["nat_type"] = nat.NATType(natInfo.Type).Wire()
+		summary["endpoint"] = natInfo.Endpoint
+		summary["nat_type"] = natInfo.NATType.Wire()
 	}
 	return api.HeartbeatRequest{
 		ClientNow:      time.Now().UTC(),

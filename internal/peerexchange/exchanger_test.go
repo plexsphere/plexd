@@ -404,11 +404,11 @@ func TestExchanger_LastResult(t *testing.T) {
 	if info == nil {
 		t.Fatal("expected non-nil LastResult after discovery")
 	}
-	if info.PublicEndpoint != "203.0.113.1:12345" {
-		t.Errorf("PublicEndpoint = %q, want %q", info.PublicEndpoint, "203.0.113.1:12345")
+	if info.Endpoint != "203.0.113.1:12345" {
+		t.Errorf("Endpoint = %q, want %q", info.Endpoint, "203.0.113.1:12345")
 	}
-	if info.Type != "full_cone" {
-		t.Errorf("Type = %q, want %q", info.Type, "full_cone")
+	if info.NATType != nat.NATFullCone {
+		t.Errorf("NATType = %q, want %q", info.NATType, nat.NATFullCone)
 	}
 }
 

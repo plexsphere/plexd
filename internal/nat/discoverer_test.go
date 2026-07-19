@@ -259,11 +259,11 @@ func TestLastResult_AfterDiscovery(t *testing.T) {
 	if info == nil {
 		t.Fatal("expected non-nil LastResult after Discover")
 	}
-	if info.PublicEndpoint != "203.0.113.1:12345" {
-		t.Errorf("unexpected PublicEndpoint: %s", info.PublicEndpoint)
+	if info.Endpoint != "203.0.113.1:12345" {
+		t.Errorf("unexpected Endpoint: %s", info.Endpoint)
 	}
-	if info.Type != string(NATFullCone) {
-		t.Errorf("unexpected Type: %s", info.Type)
+	if info.NATType != NATFullCone {
+		t.Errorf("unexpected NATType: %s", info.NATType)
 	}
 }
 
