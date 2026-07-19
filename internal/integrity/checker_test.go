@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 )
 
@@ -66,6 +67,30 @@ func TestHashFile_FileNotFound(t *testing.T) {
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("HashFile error = %v, want wrapping os.ErrNotExist", err)
+	}
+}
+
+func TestSelfChecksum(t *testing.T) {
+	got, err := SelfChecksum()
+	if err != nil {
+		t.Fatalf("SelfChecksum() unexpected error: %v", err)
+	}
+
+	hexRe := regexp.MustCompile(`^[0-9a-f]{64}$`)
+	if !hexRe.MatchString(got) {
+		t.Errorf("SelfChecksum() = %q, want 64 lowercase-hex chars", got)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() unexpected error: %v", err)
+	}
+	want, err := HashFile(exe)
+	if err != nil {
+		t.Fatalf("HashFile(%q) unexpected error: %v", exe, err)
+	}
+	if got != want {
+		t.Errorf("SelfChecksum() = %s, want %s (HashFile of %q)", got, want, exe)
 	}
 }
 
