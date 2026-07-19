@@ -32,51 +32,61 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 
 ### POST /v1/register
 
-Authenticated via one-time bootstrap token (not node identity).
+Unauthenticated (`security: []`): the one-time bootstrap token travels in the
+request body, not an `Authorization` header. plexd sends no `Authorization`
+header for this call.
 
 **Request body:**
 
 ```json
 {
-  "token": "plx_enroll_a8f3c7...",
-  "public_key": "base64-encoded-curve25519-public-key",
-  "hostname": "web-01",
-  "metadata": { "os": "linux", "arch": "amd64", "kernel": "6.1.0" },
-  "capabilities": {
-    "binary": { "version": "1.4.2", "checksum": "sha256:a1b2c3d4e5f6..." },
-    "builtin_actions": [ { "name": "...", "description": "...", "parameters": [] } ],
-    "hooks": [ { "name": "...", "description": "...", "source": "script", "checksum": "sha256:...", "parameters": [], "timeout": "300s", "sandbox": "namespaced" } ]
-  }
+  "project_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0",
+  "resource_handle": "edge-router-01",
+  "bootstrap_token": "psb_prod_aebagbafaydqqbrhibbsa3kqaq_node_xxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "nonce": "f3f8c0b8-7a0a-8a0a-a0a0-a0a0a0a0a0a0",
+  "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 }
 ```
+
+`requested_resource_id` may be added as an optional field. `hostname`,
+`metadata`, and `capabilities` are no longer sent — capabilities are published
+after registration via `PUT /v1/nodes/{node_id}/capabilities`.
 
 **Response** (`201 Created`):
 
 ```json
 {
-  "node_id": "n_abc123",
-  "mesh_ip": "10.100.1.1",
-  "signing_public_key": "base64-encoded-ed25519-public-key",
-  "node_secret_key": "base64-encoded-aes-256-key",
-  "peers": [
-    {
-      "id": "n_peer456",
-      "public_key": "base64-encoded-curve25519-public-key",
-      "mesh_ip": "10.100.1.2",
-      "endpoint": "203.0.113.10:51820",
-      "allowed_ips": ["10.100.1.2/32"],
-      "psk": "base64-encoded-psk"
-    }
-  ]
+  "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3",
+  "mesh_ip": "100.64.0.1",
+  "signing_public_key": "MCowBQYDK2VwAyEA0123456789abcdefghijklmnopqrstuvwxyz0123=",
+  "signing_key_id": "did:web:plexsphere.com#key-2026-04",
+  "nsk": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "peer_snapshot": [],
+  "domain_mesh_cidr": "100.64.0.0/10"
 }
 ```
 
-| Response | Meaning |
-|---|---|
-| `201 Created` | Registration successful |
-| `400 Bad Request` | Invalid payload (missing fields, malformed key) |
-| `401 Unauthorized` | Invalid, expired, or already-used bootstrap token |
-| `409 Conflict` | Node with this hostname already registered in the tenant |
+Each `peer_snapshot` entry is a narrow `RegisterPeer` (`node_id`, `mesh_ip`,
+`public_key`, optional `fallback_endpoint`) — no `psk`, `allowed_ips`, or
+`endpoint`.
+
+**Errors** are RFC 9457 `application/problem+json` bodies (`type`, `title`,
+`status`, `detail`, `instance`, and an optional machine-readable `code`). plexd
+classifies each failure on the HTTP status and `code`; unknown codes are
+tolerated. The bootstrap token is **never consumed on an error branch**.
+
+| Status | Problem `code`(s) | Meaning | plexd behavior |
+|---|---|---|---|
+| `201 Created` | — | Registration successful | — |
+| `400 Bad Request` | `public_key_invalid` (or none) | Malformed public key, or an undecodable body | Stop |
+| `401 Unauthorized` | — | Bootstrap token rejected | Stop |
+| `403 Forbidden` | `kind_mismatch`, `project_mismatch`, `token_consumed`, `token_expired`, `token_revoked`, `nonce_collision` | Terminal denial: wrong token kind or project, spent/expired/revoked token, or replayed nonce | Stop |
+| `404 Not Found` | `resource_not_found` | Resource handle could not be resolved | Stop |
+| `409 Conflict` | — | Conflicting registration | Stop |
+| `422 Unprocessable Entity` | — | Request invariant violation (empty/oversized field, non-UUID `project_id`) | Stop |
+| `429 Too Many Requests` | — | Rate limited | Retry, honoring `Retry-After` |
+| `503 Service Unavailable` | `pool_exhausted`, `subrange_exhausted`, `allocator_contention` | Address allocation temporarily unavailable | Retry with backoff |
+| `500 Internal Server Error` | — | Server error | Retry with backoff |
 
 ## SSE Event Stream
 

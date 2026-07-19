@@ -12,28 +12,34 @@ The `internal/registration` package handles node self-registration and bootstrap
 
 `Config` holds registration parameters passed to the `Registrar` constructor. Config loading is the caller's responsibility.
 
-| Field              | Type                | Default                        | Description                                |
-|--------------------|---------------------|--------------------------------|--------------------------------------------|
-| `DataDir`          | `string`            | —                              | Data directory for identity files (required)|
-| `TokenFile`        | `string`            | `/etc/plexd/bootstrap-token`   | Path to bootstrap token file               |
-| `TokenEnv`         | `string`            | `PLEXD_BOOTSTRAP_TOKEN`        | Environment variable for bootstrap token   |
-| `TokenValue`       | `string`            | —                              | Direct token value override                |
-| `UseMetadata`      | `bool`              | `false`                        | Enable cloud metadata token source         |
-| `MetadataTokenPath`| `string`            | `/plexd/bootstrap-token`       | Metadata key path for bootstrap token      |
-| `MetadataTimeout`  | `time.Duration`     | `2s`                           | Timeout for metadata service requests      |
-| `Hostname`         | `string`            | —                              | Hostname override (default: `os.Hostname`)|
-| `Metadata`         | `map[string]string` | —                              | Optional metadata for registration request |
-| `MaxRetryDuration` | `time.Duration`     | `5m`                           | Maximum retry duration for transient errors|
+| Field                             | Type            | Default                        | Description                                |
+|-----------------------------------|-----------------|--------------------------------|--------------------------------------------|
+| `DataDir`                         | `string`        | —                              | Data directory for identity files (required)|
+| `ProjectID`                       | `string`        | —                              | Platform project UUID to register into (required for fresh registration)|
+| `ResourceHandle`                  | `string`        | —                              | Platform Resource handle to bind to (required for fresh registration)|
+| `RequestedResourceID`             | `string`        | —                              | Optional resource ID override when substrate naming differs from the handle|
+| `TokenFile`                       | `string`        | `/etc/plexd/bootstrap-token`   | Path to bootstrap token file               |
+| `TokenEnv`                        | `string`        | `PLEXD_BOOTSTRAP_TOKEN`        | Environment variable for bootstrap token   |
+| `TokenValue`                      | `string`        | —                              | Direct token value override                |
+| `UseMetadata`                     | `bool`          | `false`                        | Enable cloud metadata source for registration inputs|
+| `MetadataTokenPath`               | `string`        | `/plexd/bootstrap-token`       | Metadata key path for bootstrap token      |
+| `MetadataTimeout`                 | `time.Duration` | `2s`                           | Timeout for metadata service requests      |
+| `MaxRetryDuration`                | `time.Duration` | `5m`                           | Maximum retry duration for transient errors|
 
 ```go
 cfg := registration.Config{
     DataDir: "/var/lib/plexd",
 }
-cfg.ApplyDefaults() // sets TokenFile, TokenEnv, MetadataTokenPath, MetadataTimeout, MaxRetryDuration
+cfg.ApplyDefaults() // sets TokenFile, TokenEnv, the metadata paths, MetadataTimeout, MaxRetryDuration
 if err := cfg.Validate(); err != nil {
     log.Fatal(err) // DataDir is required
 }
 ```
+
+`Validate` only enforces `DataDir`. `ProjectID` and `ResourceHandle` are
+required inputs but are validated at fresh-registration time, not during config
+parsing: if either is missing, `Register` fails before any HTTP call with an
+error naming the config key, CLI flag, and environment variable.
 
 ## TokenResolver
 
@@ -71,15 +77,30 @@ if err != nil {
 
 ### MetadataProvider
 
-Pluggable interface for cloud-specific token resolution.
+Pluggable interface for cloud-specific value resolution. A single call reads one
+value (bootstrap token, project ID, resource handle, or requested resource ID)
+from the metadata service at the given path.
 
 ```go
 type MetadataProvider interface {
-    ReadToken(ctx context.Context) (string, error)
+    ReadValue(ctx context.Context, path string) (string, error)
 }
 ```
 
-The concrete implementation `IMDSProvider` reads tokens from cloud instance metadata services. See [Cloud-Init Deployment Reference](../deployment/cloud-init-deployment.md) for details.
+The concrete implementation `IMDSProvider` reads the value at any metadata path
+from cloud instance metadata services (IMDSv2 with IMDSv1 fallback). See [Cloud-Init Deployment Reference](../deployment/cloud-init-deployment.md) for details.
+
+`ResolveValue` layers config over metadata for `project_id`, `resource_handle`,
+and `requested_resource_id`: a non-empty direct config value always wins;
+otherwise, when `UseMetadata` is `true`, the value at the corresponding
+metadata path is read. A path the metadata service does not serve
+(`ErrMetadataNotFound`) means "not provisioned" and yields an empty string, so
+optional inputs stay optional. Every other read error is returned — a transient
+IMDS failure must not be reported as a missing config setting.
+
+`plexd up` and `plexd join` attach an `IMDSProvider` automatically when
+`use_metadata` is `true`; no wiring is required to provision registration
+inputs through instance metadata.
 
 ## GenerateKeypair
 
@@ -113,14 +134,22 @@ Holds the registration identity of a node after successful enrollment.
 | `NodeID`           | `string` | `"node_id"`          | `identity.json`         |
 | `MeshIP`           | `string` | `"mesh_ip"`          | `identity.json`         |
 | `SigningPublicKey`  | `string` | `"signing_public_key"`| `identity.json` + `signing_public_key` |
+| `SigningKeyID`     | `string` | `"signing_key_id"`   | `identity.json`         |
+| `DomainMeshCIDR`   | `string` | `"domain_mesh_cidr"` | `identity.json`         |
 | `PrivateKey`       | `[]byte` | `"-"` (excluded)     | `private_key` (base64)  |
 | `NodeSecretKey`    | `string` | `"-"` (excluded)     | `node_secret_key`       |
+
+`SigningKeyID` is the key id used for rotation-aware verification of control
+plane signatures (e.g. `did:web:plexsphere.com#key-2026-04`); `DomainMeshCIDR`
+is the domain mesh address range (e.g. `100.64.0.0/10`). Both are read from the
+`POST /v1/register` response. Legacy `identity.json` files written before these
+keys existed still load — the missing fields decode as empty strings.
 
 ### Data Directory Layout
 
 ```
 {data_dir}/
-├── identity.json        (0600) — NodeID, MeshIP, SigningPublicKey
+├── identity.json        (0600) — NodeID, MeshIP, SigningPublicKey, SigningKeyID, DomainMeshCIDR
 ├── private_key          (0600) — base64-encoded Curve25519 private key
 ├── node_secret_key      (0600) — bearer token for post-registration API calls
 └── signing_public_key   (0600) — control plane signing public key
@@ -171,7 +200,9 @@ func NewRegistrar(client *api.ControlPlane, cfg Config, logger *slog.Logger) *Re
 
 - Applies config defaults
 - Logger tagged with `component=registration`
-- Optional: call `SetMetadataProvider`, `SetCapabilities`, `SetClock` after construction
+- Optional: call `SetMetadataProvider`, `SetClock` after construction (the
+  `plexd up` / `plexd join` commands call `SetMetadataProvider` for you when
+  `use_metadata` is enabled)
 
 ### Register
 
@@ -195,14 +226,18 @@ sequenceDiagram
         R-->>R: Return (cached)
     else Not registered
         D-->>R: ErrNotRegistered
-        R->>TR: Resolve()
+        R->>TR: Resolve() (bootstrap token)
         TR-->>R: Token + source
         R->>R: GenerateKeypair()
-        R->>CP: SetAuthToken(bootstrap token)
+        R->>TR: ResolveValue() (project_id, resource_handle, requested_resource_id)
+        TR-->>R: values (config or IMDS)
+        R->>R: Fail fast if project_id or resource_handle missing
+        R->>CP: SetAuthToken("") (register is unauthenticated)
+        R->>R: One nonce for the whole registration
         loop Retry with backoff (max 5m)
-            R->>CP: POST /v1/register
+            R->>CP: POST /v1/register (bootstrap token in body)
         end
-        CP-->>R: node_id, mesh_ip, signing_key, NSK, peers
+        CP-->>R: node_id, mesh_ip, signing_public_key, signing_key_id, nsk, peer_snapshot, domain_mesh_cidr
         R->>R: Build NodeIdentity
         R->>D: SaveIdentity() (atomic write)
         R->>D: Delete token file (if file-based)
@@ -212,28 +247,37 @@ sequenceDiagram
 
 1. **Load existing identity** — if valid, set auth token and return (idempotent)
 2. **Corrupt identity** — log warning, proceed with fresh registration
-3. **Resolve bootstrap token** — via `TokenResolver`
+3. **Resolve bootstrap token** — via `TokenResolver.Resolve`
 4. **Generate Curve25519 keypair**
-5. **Resolve hostname** — `Config.Hostname` or `os.Hostname()`
-6. **Set bootstrap token as auth** — `client.SetAuthToken(token)`
-7. **POST /v1/register with retry** — exponential backoff on transient errors
-8. **Build NodeIdentity** from response + private key
-9. **Persist identity** atomically to data directory
-10. **Delete token file** if token was file-based (failure logged, not fatal)
-11. **Set node_secret_key as auth** — `client.SetAuthToken(nsk)`
+5. **Resolve registration inputs** — `project_id`, `resource_handle`, and `requested_resource_id` via `ResolveValue` (direct config value, else IMDS). Each required input is checked as soon as it resolves, so a missing `project_id` fails before the later metadata lookups run
+6. **Fail fast** — return an error before any HTTP call if `project_id` or `resource_handle` is empty
+7. **Clear the auth token** — `client.SetAuthToken("")`. `POST /v1/register` is unauthenticated (`security: []`); the bootstrap token travels in the request body. Clearing also drops a stale NSK on the re-registration path. The previous token is restored unless registration completes, so a failed re-registration does not leave the shared client unauthenticated.
+8. **POST /v1/register with retry** — one UUIDv4 nonce per logical registration, reused across attempts; exponential backoff on transient errors. The nonce is replay protection, not an idempotency key: a nonce the control plane has already recorded is answered with `403 nonce_collision`, so retrying a request that may already have been committed is denied rather than granted a second node. The nonce is never persisted — after a restart it could only produce that denial, so a fresh registration starts with a fresh nonce
+9. **Build NodeIdentity** from response + private key — `nsk` must decode from standard-padded base64 to a 32-byte AES-256-GCM key, or registration fails before anything is persisted
+10. **Persist identity** atomically to data directory
+11. **Delete token file** if token was file-based (failure logged, not fatal)
+12. **Set node_secret_key (nsk) as auth** — `client.SetAuthToken(nsk)`
 
 ### Retry Logic
 
-Registration retries on transient failures using `api.ClassifyError` for error classification.
+The control plane returns errors as RFC 9457 `application/problem+json`. plexd
+classifies each failure on its HTTP status and optional machine-readable `code`
+member (via `api.ClassifyError`); unknown codes are tolerated. The bootstrap
+token is **never consumed on an error branch** — a stopped or retried attempt
+leaves the token spendable.
 
-| Error Type              | Action                                    |
-|-------------------------|-------------------------------------------|
-| Network errors / 5xx    | Retry with exponential backoff            |
-| 429 Rate Limited        | Respect `Retry-After` header              |
-| 401 Unauthorized        | Fail immediately (invalid bootstrap token)|
-| 403 Forbidden           | Fail immediately                          |
-| 409 Conflict            | Fail immediately (hostname registered)    |
-| 400 Bad Request         | Fail immediately                          |
+| Status | Problem `code`(s) | plexd behavior |
+|--------|-------------------|----------------|
+| `400` | `public_key_invalid` (or none) | Stop — invalid request |
+| `401` | — | Stop — bootstrap token rejected |
+| `403` | `kind_mismatch`, `project_mismatch`, `token_consumed`, `token_expired`, `token_revoked`, `nonce_collision` | Stop — terminal denial |
+| `404` | `resource_not_found` | Stop — resource unresolved |
+| `409` | — | Stop |
+| `422` | — | Stop — invariant violation |
+| `429` | — | Retry, honoring the `Retry-After` header |
+| `503` | `pool_exhausted`, `subrange_exhausted`, `allocator_contention` | Retry with backoff |
+| `500` | — | Retry with backoff |
+| Network / transport error | — | Retry with backoff |
 
 Backoff parameters (consistent with `internal/api/ReconnectEngine`):
 
@@ -266,9 +310,9 @@ if err != nil {
 
 // Create registrar
 reg := registration.NewRegistrar(cpClient, registration.Config{
-    DataDir:  "/var/lib/plexd",
-    Hostname: "node-01",
-    Metadata: map[string]string{"region": "us-east-1"},
+    DataDir:        "/var/lib/plexd",
+    ProjectID:      "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0",
+    ResourceHandle: "edge-router-01",
 }, slog.Default())
 
 // Run registration (idempotent — skips if already registered)
@@ -285,7 +329,7 @@ log.Printf("registered as %s with mesh IP %s", identity.NodeID, identity.MeshIP)
 
 | Phase                    | Auth Token Value        |
 |--------------------------|-------------------------|
-| Before registration      | Bootstrap token         |
-| During POST /v1/register | Bootstrap token (Bearer)|
+| Before registration      | Bootstrap token (resolved, not yet sent)|
+| During POST /v1/register | none (unauthenticated; bootstrap token in body)|
 | After registration       | `NodeSecretKey`         |
 | On restart (cached)      | `NodeSecretKey` from disk|

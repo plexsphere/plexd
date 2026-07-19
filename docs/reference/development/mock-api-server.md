@@ -33,42 +33,97 @@ Health check probe. Returns immediately with no blocking operations.
 
 ### `POST /v1/register`
 
-Returns a fixture `RegisterResponse` with a node identity and two mesh peers. Accepts any valid JSON body without validation.
+Enforces the full `POST /v1/register` contract (issue #18). Success is `201
+Created`; every denial is an RFC 9457 `application/problem+json` body mirroring
+the platform taxonomy. The bootstrap token's nonce is recorded (the token
+"consumed") only on the `201` branch — never on an error branch.
 
-**Response:** `200 OK`
+**Validation order.** The handler checks in this sequence, returning at the
+first failure:
+
+1. **Body decode** → `400` (no `code`) if the body is not valid JSON.
+2. **Invariants** → `422` (no `code`): empty `bootstrap_token`, `nonce`, or `resource_handle`; a `project_id` that is empty, the zero UUID, or not a UUID; any field longer than 4096 characters.
+3. **Public key** → `400` `public_key_invalid` if `public_key` fails `^[A-Za-z0-9+/]{43}=$` or decodes to the all-zero key.
+4. **Bootstrap token** → `403`: malformed token (fails `^psb_[a-z]+_[a-z2-7]+_(node|bridge)_[a-z2-7]{20,}$`) has no `code`; a `bridge`-kind token yields `kind_mismatch`; a trailing random segment containing `consumed`, `expired`, or `revoked` yields `token_consumed`, `token_expired`, or `token_revoked`.
+5. **Project match** → `403` `project_mismatch` if `project_id` is not the mock project UUID.
+6. **Nonce replay** → `403` `nonce_collision` if `(project_id, nonce)` was already recorded on a prior `201`.
+7. **Resource resolution** → `404` `resource_not_found` for the reserved handle `unknown-resource`.
+8. **Allocator / server triggers** → magic resource handles (below).
+9. **Success** → `201` with the fixture below; the nonce is recorded.
+
+**Magic triggers.** Reserved inputs force specific branches:
+
+| Trigger | Where | Result |
+|---------|-------|--------|
+| `project_id` = `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0` | request | Accepted project; any other UUID → `403` `project_mismatch` |
+| bridge-kind token (`psb_..._bridge_...`) | `bootstrap_token` | `403` `kind_mismatch` |
+| `consumed` / `expired` / `revoked` in the trailing random segment | `bootstrap_token` | `403` `token_consumed` / `token_expired` / `token_revoked` |
+| `unknown-resource` | `resource_handle` | `404` `resource_not_found` |
+| `exhausted-pool` | `resource_handle` | `503` `pool_exhausted` |
+| `exhausted-subrange` | `resource_handle` | `503` `subrange_exhausted` |
+| `contended-allocator` | `resource_handle` | `503` `allocator_contention` |
+| `boom-internal` | `resource_handle` | `500` (no `code`) |
+
+**Problem format.** Error bodies are `application/problem+json`:
 
 ```json
 {
-  "node_id": "node-mock-001",
-  "mesh_ip": "10.99.0.1",
-  "signing_public_key": "ed25519-mock-signing-pub-key",
-  "node_secret_key": "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
-  "peers": [
-    {
-      "id": "peer-001",
-      "public_key": "wg-pub-key-peer-001",
-      "mesh_ip": "10.99.0.2",
-      "endpoint": "203.0.113.1:51820",
-      "allowed_ips": ["10.99.0.2/32"],
-      "psk": "mock-psk-001"
-    },
-    {
-      "id": "peer-002",
-      "public_key": "wg-pub-key-peer-002",
-      "mesh_ip": "10.99.0.3",
-      "endpoint": "203.0.113.2:51820",
-      "allowed_ips": ["10.99.0.3/32"],
-      "psk": "mock-psk-002"
-    }
-  ]
+  "type": "https://api.plexsphere.com/problems/token_expired",
+  "title": "Forbidden",
+  "status": 403,
+  "detail": "bootstrap_token expired",
+  "instance": "/v1/register",
+  "code": "token_expired"
 }
 ```
+
+`type` is `https://api.plexsphere.com/problems/<code>` when a `code` is present,
+otherwise `about:blank` (and the `code` member is omitted); `title` is the HTTP
+status text; `instance` is always `/v1/register`.
+
+**Response:** `201 Created`
+
+```json
+{
+  "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3",
+  "mesh_ip": "10.99.0.1",
+  "signing_public_key": "<base64 Ed25519 public key, generated per server start>",
+  "signing_key_id": "did:web:plexsphere.com#key-e2e",
+  "nsk": "AAECAwQFBgcICQoLDA0OD4CRorPE1eb3+Onay7ytno8=",
+  "peer_snapshot": [
+    {
+      "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+      "mesh_ip": "10.99.0.2",
+      "public_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+      "fallback_endpoint": "203.0.113.1:51820"
+    },
+    {
+      "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+      "mesh_ip": "10.99.0.3",
+      "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+    }
+  ],
+  "domain_mesh_cidr": "10.99.0.0/24"
+}
+```
+
+The `peer_snapshot` uses the narrow `RegisterPeer` shape (no `psk`,
+`allowed_ips`, or `endpoint`); the second entry omits `fallback_endpoint`.
+
+`nsk` is the mock NodeSecretKey in the standard-padded base64 form the
+register contract specifies (44 characters). plexd decodes it back into the
+32-byte AES-256-GCM key it uses to open secret envelopes.
 
 **Content-Type:** `application/json`
 
 **Counter:** Increments `registration_count` on each call.
 
-**Error:** Returns `400` if the request body is not valid JSON. Returns `405` if the HTTP method is not `POST`.
+**Nonce store.** Consumed nonces are held in an in-memory map keyed by
+`project_id + "|" + nonce`, recorded only on the `201` branch and forgotten when
+the server restarts.
+
+**Error:** Denials use `application/problem+json` as described above. Returns
+`405` if the HTTP method is not `POST`.
 
 ### `POST /v1/nodes/{id}/heartbeat`
 
@@ -450,7 +505,7 @@ Accepts an audit payload on the local endpoint. Requires Bearer token authentica
 
 The expected bearer token (`e2e-local-bearer-token`) is provisioned through the same credential chain that plexd uses in production:
 
-1. **Registration** — `POST /v1/register` returns `node_secret_key` (32 bytes, `ABCDEFGHIJKLMNOPQRSTUVWXYZ012345`)
+1. **Registration** — `POST /v1/register` returns `nsk` as 44-char standard-padded base64; plexd decodes it into the 32-byte AES-256-GCM key
 2. **Secret fetch** — `GET /v1/nodes/{id}/secrets/{key}` returns `ciphertext` and `nonce` (AES-256-GCM encrypted with the NSK)
 3. **Decryption** — plexd decrypts the ciphertext using `nodeapi.DecryptSecret(nsk, ciphertext, nonce)` to recover the bearer token
 4. **Authentication** — plexd sends `Authorization: Bearer e2e-local-bearer-token` on each request to the local endpoint
@@ -493,6 +548,7 @@ Query current values via `GET /test/assertions`.
 All responses use the same JSON field names as the types in `internal/api`:
 
 - `RegisterResponse` — `internal/api.RegisterResponse`
+- `RegisterPeer` — `internal/api.RegisterPeer`
 - `HeartbeatResponse` — `internal/api.HeartbeatResponse`
 - `StateResponse` — `internal/api.StateResponse`
 - `SignedEnvelope` — `internal/api.SignedEnvelope`
@@ -573,7 +629,7 @@ ts.TLS = tlsCfg
 ts.StartTLS()
 defer ts.Close()
 
-// srv.NSK() returns the 32-byte node secret key
+// srv.NSK() returns the raw 32-byte node secret key (the response encodes it as base64)
 // srv.ExpectedBearerToken() returns "e2e-local-bearer-token"
 ```
 

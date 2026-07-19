@@ -31,33 +31,35 @@ func NewIMDSProvider(timeout time.Duration, baseURL string) *IMDSProvider
 | `timeout` | `time.Duration` | HTTP client timeout                        |
 | `baseURL` | `string`        | IMDS base URL (trailing slashes stripped)  |
 
-### ReadToken
+### ReadValue
 
 ```go
-func (p *IMDSProvider) ReadToken(ctx context.Context) (string, error)
+func (p *IMDSProvider) ReadValue(ctx context.Context, path string) (string, error)
 ```
 
-Fetches `{baseURL}{tokenPath}` via HTTP GET. Before the GET, attempts IMDSv2 session token acquisition via PUT to `/latest/api/token`. If IMDSv2 is unavailable, falls back to unauthenticated IMDSv1 GET.
+Fetches `{baseURL}{path}` via HTTP GET. Before the GET, attempts IMDSv2 session token acquisition via PUT to `/latest/api/token`. If IMDSv2 is unavailable, falls back to unauthenticated IMDSv1 GET.
 
 **Request behavior:**
 
-- IMDSv2 session: `PUT {baseURL}/latest/api/token` with `X-aws-ec2-metadata-token-ttl-seconds: 21600`
+- IMDSv2 session: `PUT {baseURL}/latest/api/token` with `X-aws-ec2-metadata-token-ttl-seconds: 21600`. The token is cached and reused across reads until it approaches expiry, so resolving several inputs costs one PUT rather than one per value. Failed acquisitions are not cached, preserving the IMDSv1 fallback
 - Method: `GET`
-- URL: `baseURL + cfg.MetadataTokenPath`
+- URL: `baseURL + path`
 - Auth: `X-aws-ec2-metadata-token: {sessionToken}` (omitted if IMDSv2 session acquisition failed)
 - Timeout: `cfg.MetadataTimeout` (HTTP client timeout)
-- Body limit: 513 bytes (`maxTokenLength + 1`) — reads one byte beyond the limit to detect oversized responses without silently truncating
+- Body limit: 4097 bytes (`maxValueLength + 1`) — reads one byte beyond the limit and rejects anything longer, so an oversized response fails instead of being silently truncated
 - Context: request is context-aware and cancellable
 
 **Error conditions:**
 
-| Condition            | Error message                                |
-|----------------------|----------------------------------------------|
-| Request creation     | `registration: imds: create request: {err}`  |
-| HTTP failure         | `registration: imds: request failed: {err}`  |
-| Non-200 status       | `registration: imds: unexpected status {code}`|
-| Body read failure    | `registration: imds: read body: {err}`       |
-| Empty response       | `registration: imds: empty token`            |
+| Condition            | Error message                                          |
+|----------------------|--------------------------------------------------------|
+| Request creation     | `registration: imds: create request: {err}`            |
+| HTTP failure         | `registration: imds: request failed: {err}`            |
+| 404 status           | `ErrMetadataNotFound` (sentinel: "not provisioned")    |
+| Other non-200 status | `registration: imds: unexpected status {code}`         |
+| Body read failure    | `registration: imds: read body: {err}`                 |
+| Oversized response   | `registration: imds: value exceeds maximum length of {n} bytes` |
+| Empty response       | `registration: imds: empty value`                      |
 
 ## Config fields (metadata)
 
@@ -73,12 +75,12 @@ These fields were added to `registration.Config` for IMDS support:
 
 ## Token resolution with IMDS
 
-When `UseMetadata` is `true` and an `IMDSProvider` (or any `MetadataProvider`) is set, the metadata source is checked as the fourth priority:
+When `UseMetadata` is `true`, the metadata source is checked as the fourth priority. The `plexd up` and `plexd join` commands attach an `IMDSProvider` automatically, so setting `use_metadata: true` in the config is all an image needs; the constructor below is for embedding the package directly.
 
 1. Direct value (`Config.TokenValue`)
 2. File (`Config.TokenFile`)
 3. Environment variable (`Config.TokenEnv`)
-4. **Metadata service** (`MetadataProvider.ReadToken`)
+4. **Metadata service** (`MetadataProvider.ReadValue` at `Config.MetadataTokenPath`)
 
 If the metadata service returns an error, the resolver falls through to the "no token found" error. Metadata errors are not propagated — they are treated as "source unavailable."
 
