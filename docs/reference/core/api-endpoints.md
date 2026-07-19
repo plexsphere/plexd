@@ -127,29 +127,40 @@ Sent at `heartbeat.interval` (default 30s).
 
 ```json
 {
-  "node_id": "n_abc123",
-  "timestamp": "2025-01-15T10:30:00Z",
-  "status": "healthy",
-  "uptime": "72h15m",
-  "binary_checksum": "sha256:a1b2c3d4e5f6...",
-  "mesh": {
-    "interface": "plexd0",
-    "peer_count": 12,
-    "listen_port": 51820
-  },
-  "nat": {
-    "public_endpoint": "203.0.113.10:51820",
-    "type": "full_cone"
-  }
+  "client_now": "2026-07-19T19:32:35Z",
+  "binary_checksum": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "binary_version": "1.2.3",
+  "nat_summary": { "endpoint": "203.0.113.7:51820", "nat_type": "full_cone" }
 }
 ```
 
-| Response | Meaning |
-|---|---|
-| `200 OK` | Heartbeat acknowledged |
-| `200 OK` + `{ "reconcile": true }` | Trigger immediate reconciliation |
-| `200 OK` + `{ "rotate_keys": true }` | Trigger key rotation |
-| `401 Unauthorized` | Node identity invalid, re-register |
+- `client_now` — RFC 3339 UTC timestamp, stamped fresh per request. The server rejects a skew greater than 60s in either direction.
+- `binary_checksum` — SHA-256 of the running binary, computed once at startup. Accepted as 64-char lowercase hex or 44-char standard base64 of 32 bytes.
+- `binary_version` — build version (`dev` when unset); never empty.
+- `nat_summary` — **always** a JSON object: `{}` before NAT discovery has produced a result, otherwise `{ "endpoint": <public endpoint>, "nat_type": <wire enum> }`. A `null` value is rejected.
+
+**Response** (`200 OK`):
+
+```json
+{
+  "accepted_at": "2026-07-19T19:32:35Z",
+  "reconcile": false,
+  "rotate_keys": false
+}
+```
+
+`accepted_at` is the server receive time; the agent logs it next to the local send time to estimate clock skew. `reconcile` triggers an immediate reconciliation; `rotate_keys` also triggers a reconcile.
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `200 OK` | — | Heartbeat acknowledged |
+| `400 Bad Request` | `malformed_heartbeat_request` | Strict-decode failure, or `nat_summary` absent, `null`, or not an object |
+| `400 Bad Request` | `clock_skew` | `client_now` more than 60s from server time |
+| `400 Bad Request` | `binary_checksum_empty` | `binary_checksum` missing or not a valid SHA-256 encoding |
+| `400 Bad Request` | `binary_version_empty` | `binary_version` missing |
+| `401 Unauthorized` | — | Node identity invalid, re-register |
 
 ## Deregistration
 
@@ -211,29 +222,44 @@ Request body: Same `capabilities` structure as in `POST /v1/register`.
 
 ### PUT /v1/nodes/{node_id}/endpoint
 
-Called after STUN discovery and periodically at `nat_traversal.refresh_interval` (default 60s).
+Called after STUN discovery, then on a deadline derived from the response (see below). The response no longer carries peer endpoints — those arrive via the `peer_endpoint_changed` SSE event.
 
 **Request body:**
 
 ```json
 {
-  "public_endpoint": "203.0.113.10:51820",
-  "nat_type": "full_cone"
+  "endpoint": "203.0.113.7:51820",
+  "nat_type": "full_cone",
+  "reported_at": "2026-07-19T19:32:35Z"
 }
 ```
+
+- `endpoint` — the discovered public endpoint as `ip:port`.
+- `nat_type` — one of `full_cone`, `restricted`, `port_restricted`, `symmetric`, `unknown`.
+- `reported_at` — RFC 3339 UTC, stamped fresh per attempt.
 
 **Response** (`200 OK`):
 
 ```json
 {
-  "peer_endpoints": [
-    {
-      "peer_id": "n_peer456",
-      "endpoint": "198.51.100.5:51820"
-    }
-  ]
+  "accepted_at": "2026-07-19T19:32:35Z",
+  "stale_after": "2026-07-19T19:37:35Z"
 }
 ```
+
+`stale_after` is the deadline after which the server considers the endpoint stale. The node re-reports 30s before `stale_after` (floored at `nat.min_report_interval`, default `10s`), capped by `nat.refresh_interval`; a zero or absent `stale_after` falls back to the refresh interval. A deadline that shortens the cadence below `refresh_interval` is logged at `Warn` on the node.
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `200 OK` | — | Endpoint accepted |
+| `400 Bad Request` | `malformed_endpoint_request` | Strict-decode failure, or `nat_type` outside the enum |
+| `400 Bad Request` | `endpoint_clock_skew` | `reported_at` more than 60s from server time |
+| `400 Bad Request` | `endpoint_unparseable` | `endpoint` is not a routable `ip:port` (bad port, or loopback/link-local/unspecified host) |
+| `404 Not Found` | `endpoint_peer_not_found` | Node is not a known peer; heals via re-registration |
+| `410 Gone` | `endpoint_peer_gone` | Node was removed; heals via re-registration |
+| `413 Payload Too Large` | `endpoint_body_too_large` | Body exceeds 4 KiB |
 
 ## Reconciliation & State
 

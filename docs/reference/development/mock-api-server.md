@@ -127,22 +127,78 @@ the server restarts.
 
 ### `POST /v1/nodes/{id}/heartbeat`
 
-Returns a fixture `HeartbeatResponse` signaling that reconciliation is needed. Accepts any node ID in the path.
+Enforces the v1 heartbeat contract: strict JSON decoding (unknown fields
+rejected), a required `nat_summary` **object**, clock-skew tolerance, and
+checksum/version shape. `heartbeat_count` increments only when every check
+passes, so invalid requests are not counted. The success response is the
+configurable `HeartbeatResponse` fixture (defaults to `reconcile: true`,
+`rotate_keys: false`) with a fresh `accepted_at` stamped per call.
+
+**Validation order.** The handler returns at the first failure:
+
+1. **Body decode** → `400` `malformed_heartbeat_request` if the body is unreadable or strict decoding fails.
+2. **`nat_summary` object** → `400` `malformed_heartbeat_request` if `nat_summary` is absent, `null`, or not a JSON object. This is what proves the agent sends `{}` — not `null` — before NAT discovery has a result.
+3. **Clock skew** → `400` `clock_skew` if `client_now` is more than 60s from server time in either direction.
+4. **Binary checksum** → `400` `binary_checksum_empty` unless `binary_checksum` is a 64-char lowercase hex digest or the 44-char standard base64 of 32 bytes.
+5. **Binary version** → `400` `binary_version_empty` if `binary_version` is empty.
 
 **Response:** `200 OK`
 
 ```json
 {
+  "accepted_at": "2026-07-19T19:32:35Z",
   "reconcile": true,
   "rotate_keys": false
 }
 ```
 
-**Content-Type:** `application/json`
+**Content-Type:** `application/json` (errors use `application/problem+json`).
 
-**Counter:** Increments `heartbeat_count` on each call.
+**Counter:** Increments `heartbeat_count` only when every check passes.
 
-**Error:** Returns `405` if the HTTP method is not `POST`.
+**Error:** Denials use `application/problem+json` with the codes above. Returns `405` if the HTTP method is not `POST`.
+
+### `PUT /v1/nodes/{id}/endpoint`
+
+Enforces the v1 endpoint contract: a 4 KiB body cap, strict JSON decoding, a
+closed `nat_type` enum, clock-skew tolerance, and a routable `ip:port`.
+`endpoint_count` increments only when every check passes.
+
+**Validation order.** The handler returns at the first failure:
+
+1. **Body size** → `413` `endpoint_body_too_large` if the body exceeds 4 KiB.
+2. **Body decode** → `400` `malformed_endpoint_request` if strict decoding fails.
+3. **NAT type** → `400` `malformed_endpoint_request` if `nat_type` is outside `full_cone`, `restricted`, `port_restricted`, `symmetric`, `unknown`.
+4. **Clock skew** → `400` `endpoint_clock_skew` if `reported_at` is more than 60s from server time in either direction.
+5. **Routable endpoint** → `400` `endpoint_unparseable` if `endpoint` is not `ip:port` with a port in 1–65535 and a non-loopback, non-link-local, non-unspecified host.
+
+**Request body:**
+
+```json
+{
+  "endpoint": "203.0.113.7:51820",
+  "nat_type": "full_cone",
+  "reported_at": "2026-07-19T19:32:35Z"
+}
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "accepted_at": "2026-07-19T19:32:35Z",
+  "stale_after": "2026-07-19T19:37:35Z"
+}
+```
+
+`stale_after` is `accepted_at` plus the configured TTL (default 5m, set via
+`POST /test/configure-endpoint`). The response carries no peer endpoints.
+
+**Content-Type:** `application/json` (errors use `application/problem+json`).
+
+**Counter:** Increments `endpoint_count` only when every check passes.
+
+**Error:** Denials use `application/problem+json` with the codes above. Returns `405` if the HTTP method is not `PUT`.
 
 ### `GET /v1/nodes/{id}/state`
 
@@ -440,6 +496,30 @@ Replaces the active `StateResponse` fixture at runtime. Subsequent calls to `GET
 Alias for `POST /test/configure-state`. Same behavior.
 
 **Response:** `204 No Content`
+
+### `POST /test/configure-endpoint`
+
+Sets the `stale_after` TTL applied by `PUT /v1/nodes/{id}/endpoint`. Lets a test
+shorten the TTL below the refresh interval to exercise the deadline-driven
+re-report path.
+
+**Request body:**
+
+```json
+{ "ttl_seconds": 90 }
+```
+
+**Response:** `204 No Content` when `ttl_seconds` is positive.
+
+**Behavior:**
+
+- `ttl_seconds` must be greater than 0; otherwise the handler returns `400` with `{"error": "ttl_seconds must be positive"}`.
+- The TTL defaults to 5 minutes and is protected by `sync.RWMutex`.
+- Request body is captured and retrievable via `GET /test/last-request/configure_endpoint`.
+
+**Error:** Returns `400` if the body is not valid JSON or `ttl_seconds` is not positive. Returns `405` if the HTTP method is not `POST`.
+
+**Go API:** The `Server` also exposes `SetEndpointTTL(time.Duration)` for direct use in Go test code.
 
 ### `GET /test/last-request/{endpoint}`
 

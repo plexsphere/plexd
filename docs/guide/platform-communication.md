@@ -34,8 +34,8 @@ sequenceDiagram
 
     rect rgb(240, 240, 240)
     Note over N,CP: 3. Heartbeat (every 30s)
-    N->>CP: POST /v1/nodes/{id}/heartbeat {status, uptime, mesh, nat}
-    CP-->>N: 200 OK (optional: reconcile, rotate_keys flags)
+    N->>CP: POST /v1/nodes/{id}/heartbeat {client_now, binary_checksum, binary_version, nat_summary}
+    CP-->>N: 200 OK (accepted_at; optional reconcile, rotate_keys flags)
     end
 
     rect rgb(240, 240, 240)
@@ -83,7 +83,7 @@ flowchart TD
         B5 --> T1[Create WireGuard interface plexd0]
         T1 --> T2[Add peers with public keys, PSKs, allowed IPs]
         T2 --> T3[STUN discovery of public endpoint]
-        T3 --> T4[Exchange endpoints with peers via control plane]
+        T3 --> T4[Report endpoint, receive freshness deadline]
     end
 
     subgraph Steady State
@@ -170,7 +170,7 @@ flowchart LR
     MESH["WireGuard Mesh<br/>(all nodes)"]
 
     MESH --> C1["P2P Communication<br/>Direct encrypted tunnels"]
-    MESH --> C2["NAT Traversal<br/>STUN + endpoint exchange"]
+    MESH --> C2["NAT Traversal<br/>STUN + endpoint reporting"]
     MESH --> C3["Network Policy<br/>Peer visibility rules via nftables"]
     MESH --> C4["Secure Tunnels<br/>SSH-based access through mesh"]
     MESH --> C5["Remote Actions<br/>SSE-triggered execution"]

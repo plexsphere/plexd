@@ -44,7 +44,7 @@ title: Agent Lifecycle
 1. **Start** - Read config, locate bootstrap token, compute binary SHA-256 checksum, scan and checksum all declared hooks.
 2. **Register** - POST token to control plane, receive node identity, keys, and initial peer list. Include capabilities (binary info, available actions, hooks with checksums).
 3. **Configure Tunnels** - Set up mesh interfaces and establish tunnels to all authorized peers.
-4. **NAT Discovery** - Determine public endpoint via STUN, report it to the control plane, receive NAT-discovered endpoints of peers.
+4. **NAT Discovery** - Determine public endpoint via STUN and report it to the control plane, which returns a freshness deadline (`stale_after`) that schedules the next report. Peer endpoints arrive separately via SSE.
 5. **Connected** - Enter steady state: send heartbeats, stream peer/policy/action/state updates via SSE, report observability data, forward logs, collect audit data, serve access requests, dispatch actions, watch hook files for changes, serve node API, refresh STUN endpoints, reconcile periodically.
 6. **Deregister** - On shutdown or explicit command: graceful shutdown with cleanup (see details below).
 
@@ -58,30 +58,21 @@ Heartbeat payload:
 
 ```json
 {
-  "node_id": "n_abc123",
-  "timestamp": "2025-01-15T10:30:00Z",
-  "status": "healthy",
-  "uptime": "72h15m",
-  "binary_checksum": "sha256:a1b2c3d4e5f6...",
-  "mesh": {
-    "interface": "plexd0",
-    "peer_count": 12,
-    "listen_port": 51820
-  },
-  "nat": {
-    "public_endpoint": "203.0.113.10:51820",
-    "type": "full_cone"
-  }
+  "client_now": "2026-07-19T19:32:35Z",
+  "binary_checksum": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "binary_version": "1.2.3",
+  "nat_summary": { "endpoint": "203.0.113.10:51820", "nat_type": "full_cone" }
 }
 ```
 
-The control plane responds with one of:
+`nat_summary` is always a JSON object — `{}` before NAT discovery has a result. The control plane responds with `accepted_at` (its receive time, used to estimate clock skew) plus the directive flags below:
 
 | Response | Meaning |
 |---|---|
 | `200 OK` | Heartbeat acknowledged, no action required |
 | `200 OK` + `{ "reconcile": true }` | Trigger immediate reconciliation (out-of-band hint) |
 | `200 OK` + `{ "rotate_keys": true }` | Trigger key rotation (redundant with SSE, serves as fallback) |
+| `400 Bad Request` + `{ "code": "clock_skew" }` | `client_now` drifted more than 60s from the control plane; sync the system clock via NTP |
 | `401 Unauthorized` | Node identity invalid, re-register |
 
 If a node misses **3 consecutive heartbeats** (i.e. no heartbeat received for `3 x heartbeat.interval`), the control plane marks the node as `unreachable` and notifies peer nodes. After **10 consecutive missed heartbeats**, the node is marked `offline` and its peers remove it from their active tunnel configuration. The node re-establishes tunnels automatically when it comes back online and resumes heartbeats.

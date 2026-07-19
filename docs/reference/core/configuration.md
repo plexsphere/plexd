@@ -234,6 +234,7 @@ STUN-based NAT traversal. See [NAT Traversal via STUN](../networking/nat-travers
 | `stun_servers` | []string | (built-in list) | List of STUN server addresses (host:port) |
 | `refresh_interval` | duration | `60s` | Interval between STUN binding refreshes. Minimum: `10s`. |
 | `timeout` | duration | `5s` | Per-server STUN request timeout |
+| `min_report_interval` | duration | `10s` | Floor on the endpoint report cadence derived from the control plane's `stale_after`. A short server-side deadline can otherwise drive STUN queries and endpoint reports above `refresh_interval`; raise this to bound how far the control plane may accelerate the loop. Must be positive. |
 
 Source: `internal/nat/config.go`
 
@@ -420,6 +421,7 @@ nat:
   # stun_servers:            # default built-in list
   refresh_interval: 60s      # min: 10s
   timeout: 5s
+  min_report_interval: 10s   # floor on the stale_after-driven cadence
 
 peer_exchange:
   enabled: true
