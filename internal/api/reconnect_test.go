@@ -397,6 +397,35 @@ func TestClassifyError_403(t *testing.T) {
 	}
 }
 
+func TestClassifyError_404(t *testing.T) {
+	err := &APIError{StatusCode: 404, Message: "not found"}
+	action := ClassifyError(err)
+	if action != PermanentFailure {
+		t.Errorf("expected PermanentFailure, got %v", action)
+	}
+}
+
+// ClassifyError also drives the long-running SSE ReconnectEngine, where a 422
+// means the control plane tightened body validation on an endpoint this build
+// predates. That clears when the server is rolled back, so it must stay
+// transient here: PermanentFailure would stop the whole fleet from reconnecting
+// at once, with no recovery short of restarting every process. Registration
+// stops on 422 locally instead — see registerWithRetry.
+func TestClassifyError_422(t *testing.T) {
+	err := &APIError{StatusCode: 422, Message: "unprocessable entity"}
+	action := ClassifyError(err)
+	if action != RetryTransient {
+		t.Errorf("expected RetryTransient, got %v", action)
+	}
+}
+
+func TestClassifyError_ErrUnprocessable(t *testing.T) {
+	action := ClassifyError(ErrUnprocessable)
+	if action != RetryTransient {
+		t.Errorf("expected RetryTransient, got %v", action)
+	}
+}
+
 func TestClassifyError_5xx(t *testing.T) {
 	err := &APIError{StatusCode: 502, Message: "bad gateway"}
 	action := ClassifyError(err)

@@ -160,7 +160,9 @@ func (r *Registrar) registerWithRetry(ctx context.Context, req api.RegisterReque
 		if action == api.RetryAuth || action == api.PermanentFailure {
 			return nil, err
 		}
-		if errors.Is(err, api.ErrConflict) || errors.Is(err, api.ErrBadRequest) {
+		// Request-shape errors: the same body will fail the same way.
+		if errors.Is(err, api.ErrConflict) || errors.Is(err, api.ErrBadRequest) ||
+			errors.Is(err, api.ErrUnprocessable) {
 			return nil, err
 		}
 
