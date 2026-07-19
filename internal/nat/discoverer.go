@@ -37,6 +37,22 @@ func NewDiscoverer(client STUNClient, cfg Config, localPort int, logger *slog.Lo
 	}
 }
 
+// bind performs a STUN binding against server and rejects a mapped address
+// that is not usable as a public endpoint. STUN responses are
+// unauthenticated (see MappedAddress.Routable), so a non-routable address is
+// treated exactly like a failed binding: the caller falls through to the
+// next server rather than publishing it.
+func (d *Discoverer) bind(ctx context.Context, server string) (MappedAddress, error) {
+	addr, err := d.client.Bind(ctx, server, d.localPort)
+	if err != nil {
+		return MappedAddress{}, err
+	}
+	if !addr.Routable() {
+		return MappedAddress{}, fmt.Errorf("nat: stun: non-routable mapped address %s", addr)
+	}
+	return addr, nil
+}
+
 // Discover performs STUN binding requests to discover the public endpoint and classify NAT type.
 func (d *Discoverer) Discover(ctx context.Context) (*DiscoveryResult, error) {
 	var firstAddr MappedAddress
@@ -46,7 +62,7 @@ func (d *Discoverer) Discover(ctx context.Context) (*DiscoveryResult, error) {
 	// Try each STUN server in order to get a first successful binding.
 	remainingStart := 0
 	for i, server := range d.cfg.STUNServers {
-		addr, err := d.client.Bind(ctx, server, d.localPort)
+		addr, err := d.bind(ctx, server)
 		if err != nil {
 			d.logger.Warn("STUN binding failed", "component", "nat", "server", server, "error", err)
 			continue
@@ -73,7 +89,7 @@ func (d *Discoverer) Discover(ctx context.Context) (*DiscoveryResult, error) {
 	// Try remaining servers to get a second binding for NAT classification.
 	natType := NATUnknown
 	for _, server := range d.cfg.STUNServers[remainingStart:] {
-		secondAddr, err := d.client.Bind(ctx, server, d.localPort)
+		secondAddr, err := d.bind(ctx, server)
 		if err != nil {
 			d.logger.Warn("STUN binding failed", "component", "nat", "server", server, "error", err)
 			continue

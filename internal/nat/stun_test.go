@@ -190,6 +190,83 @@ func TestParseBindingResponse_RejectsWrongMagicCookie(t *testing.T) {
 	}
 }
 
+func TestNATTypeWire(t *testing.T) {
+	tests := []struct {
+		name string
+		in   NATType
+		want string
+	}{
+		{"none maps to full_cone", NATNone, "full_cone"},
+		{"full_cone", NATFullCone, "full_cone"},
+		{"symmetric", NATSymmetric, "symmetric"},
+		{"unknown", NATUnknown, "unknown"},
+		{"unrecognized maps to unknown", NATType("restricted_weird"), "unknown"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.in.Wire(); got != tt.want {
+				t.Errorf("NATType(%q).Wire() = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMappedAddressString(t *testing.T) {
+	tests := []struct {
+		name string
+		addr MappedAddress
+		want string
+	}{
+		{
+			name: "IPv4",
+			addr: MappedAddress{IP: net.ParseIP("203.0.113.7"), Port: 51820},
+			want: "203.0.113.7:51820",
+		},
+		{
+			name: "IPv6 is bracketed",
+			addr: MappedAddress{IP: net.ParseIP("2001:db8::1"), Port: 51820},
+			want: "[2001:db8::1]:51820",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.addr.String(); got != tt.want {
+				t.Errorf("MappedAddress.String() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMappedAddressRoutable(t *testing.T) {
+	tests := []struct {
+		name string
+		addr MappedAddress
+		want bool
+	}{
+		{"public IPv4", MappedAddress{IP: net.ParseIP("203.0.113.7"), Port: 51820}, true},
+		{"private IPv4 is routable within a mesh", MappedAddress{IP: net.ParseIP("10.1.2.3"), Port: 51820}, true},
+		{"public IPv6", MappedAddress{IP: net.ParseIP("2001:db8::1"), Port: 51820}, true},
+		{"loopback", MappedAddress{IP: net.ParseIP("127.0.0.1"), Port: 51820}, false},
+		{"IPv6 loopback", MappedAddress{IP: net.ParseIP("::1"), Port: 51820}, false},
+		{"unspecified", MappedAddress{IP: net.IPv4zero, Port: 51820}, false},
+		{"link-local unicast", MappedAddress{IP: net.ParseIP("169.254.1.1"), Port: 51820}, false},
+		{"link-local multicast", MappedAddress{IP: net.ParseIP("224.0.0.1"), Port: 51820}, false},
+		{"nil IP", MappedAddress{Port: 51820}, false},
+		{"zero port", MappedAddress{IP: net.ParseIP("203.0.113.7"), Port: 0}, false},
+		{"port above range", MappedAddress{IP: net.ParseIP("203.0.113.7"), Port: 65536}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.addr.Routable(); got != tt.want {
+				t.Errorf("MappedAddress.Routable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // buildTestResponse constructs a minimal STUN response for testing.
 func buildTestResponse(msgType uint16, txID [12]byte, attributes []byte) []byte {
 	header := make([]byte, 20)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 )
 
 // STUNClient abstracts STUN binding operations for testability.
@@ -20,9 +21,32 @@ type MappedAddress struct {
 	Port int
 }
 
-// String returns the address in "ip:port" format.
+// String returns the address in canonical "host:port" form; IPv6 hosts
+// are bracketed per RFC 5952.
 func (m MappedAddress) String() string {
-	return fmt.Sprintf("%s:%d", m.IP, m.Port)
+	return net.JoinHostPort(m.IP.String(), strconv.Itoa(m.Port))
+}
+
+// Routable reports whether the address can serve as this node's public
+// endpoint: a port in 1..65535 and an IP that is neither loopback,
+// link-local, nor unspecified.
+//
+// A STUN Binding Response is unauthenticated, so the mapped address it
+// carries is attacker-influenceable: an on-path attacker or the operator of
+// a configured STUN server can name any address. The control plane hands
+// that address to every mesh peer, which would then aim WireGuard
+// handshakes at it — traffic redirection and a reflection primitive against
+// a third party. A loopback or unspecified value instead blackholes the
+// node. Neither is ever a legitimate public endpoint, so both are rejected
+// before the address is published.
+func (m MappedAddress) Routable() bool {
+	if m.Port < 1 || m.Port > 65535 {
+		return false
+	}
+	if m.IP == nil || m.IP.IsUnspecified() || m.IP.IsLoopback() {
+		return false
+	}
+	return !m.IP.IsLinkLocalUnicast() && !m.IP.IsLinkLocalMulticast()
 }
 
 // NATType represents the classified NAT behavior.
@@ -34,6 +58,20 @@ const (
 	NATSymmetric NATType = "symmetric"
 	NATUnknown   NATType = "unknown"
 )
+
+// Wire returns the control-plane wire representation of the NAT type.
+// The wire enum has no "none": an un-NATed endpoint is directly reachable
+// with no filtering, which is the full_cone traversal posture.
+func (t NATType) Wire() string {
+	switch t {
+	case NATNone:
+		return string(NATFullCone)
+	case NATFullCone, NATSymmetric:
+		return string(t)
+	default:
+		return string(NATUnknown)
+	}
+}
 
 // stunMagicCookie is the fixed magic cookie value per RFC 5389.
 const stunMagicCookie uint32 = 0x2112A442
