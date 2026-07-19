@@ -20,6 +20,12 @@ func TestGenerateDefaultConfig_WithAPIURL(t *testing.T) {
 	if !strings.Contains(output, "registration:\n  token_file: /etc/plexd/bootstrap-token") {
 		t.Errorf("output missing registration.token_file, got:\n%s", output)
 	}
+	if !strings.Contains(output, "# project_id: <project uuid>") {
+		t.Errorf("output missing project_id placeholder, got:\n%s", output)
+	}
+	if !strings.Contains(output, "# resource_handle: <platform resource handle>") {
+		t.Errorf("output missing resource_handle placeholder, got:\n%s", output)
+	}
 }
 
 func TestGenerateDefaultConfig_WithoutAPIURL(t *testing.T) {

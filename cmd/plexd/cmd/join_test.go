@@ -13,6 +13,11 @@ func TestJoinCommand_Help(t *testing.T) {
 	if !strings.Contains(output, "control plane") {
 		t.Errorf("help should mention 'control plane', got: %s", output)
 	}
+	for _, flag := range []string{"--project-id", "--resource-handle", "--requested-resource-id"} {
+		if !strings.Contains(output, flag) {
+			t.Errorf("join help should contain global flag %q, got: %s", flag, output)
+		}
+	}
 }
 
 func TestJoinCommand_TokenFileFlag(t *testing.T) {

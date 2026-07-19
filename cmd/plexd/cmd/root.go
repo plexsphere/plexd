@@ -22,6 +22,10 @@ var (
 	logLevel string
 	apiURL   string
 	mode     string
+
+	projectID           string
+	resourceHandle      string
+	requestedResourceID string
 )
 
 // Build info set from main.
@@ -54,6 +58,9 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", envOrDefault("PLEXD_LOG_LEVEL", "info"), "log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().StringVar(&apiURL, "api", os.Getenv("PLEXD_API"), "control plane API URL (overrides config)")
 	rootCmd.PersistentFlags().StringVar(&mode, "mode", envOrDefault("PLEXD_MODE", ""), "operating mode: node or bridge (overrides config)")
+	rootCmd.PersistentFlags().StringVar(&projectID, "project-id", envOrDefault("PLEXD_PROJECT_ID", ""), "platform project UUID for registration (overrides config)")
+	rootCmd.PersistentFlags().StringVar(&resourceHandle, "resource-handle", envOrDefault("PLEXD_RESOURCE_HANDLE", ""), "platform resource handle for registration (overrides config)")
+	rootCmd.PersistentFlags().StringVar(&requestedResourceID, "requested-resource-id", envOrDefault("PLEXD_REQUESTED_RESOURCE_ID", ""), "override resource id when substrate naming differs (overrides config)")
 
 	rootCmd.Version = buildVersion
 	rootCmd.SetVersionTemplate(fmt.Sprintf("plexd version {{.Version}}\ncommit: %s\nbuilt: %s\n", buildCommit, buildDate))

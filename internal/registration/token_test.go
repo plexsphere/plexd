@@ -10,11 +10,13 @@ import (
 )
 
 type mockMetadataProvider struct {
-	token string
-	err   error
+	token    string
+	err      error
+	lastPath string
 }
 
-func (m *mockMetadataProvider) ReadToken(ctx context.Context) (string, error) {
+func (m *mockMetadataProvider) ReadValue(_ context.Context, path string) (string, error) {
+	m.lastPath = path
 	return m.token, m.err
 }
 
@@ -266,6 +268,10 @@ func TestTokenResolver_WhitespaceTrimming(t *testing.T) {
 	}
 }
 
+// The token is the one input whose absence stops registration, so a genuine
+// metadata read error (a transient IMDS failure, a misconfigured path) must
+// surface — not be reported as "no token found", which sends the operator to
+// audit the wrong thing.
 func TestTokenResolver_MetadataError(t *testing.T) {
 	meta := &mockMetadataProvider{err: errors.New("metadata unavailable")}
 	cfg := &Config{
@@ -274,9 +280,176 @@ func TestTokenResolver_MetadataError(t *testing.T) {
 	r := NewTokenResolver(cfg, meta)
 	_, err := r.Resolve(context.Background())
 	if err == nil {
+		t.Fatal("expected error for failed metadata read, got nil")
+	}
+	if !strings.Contains(err.Error(), "read token from metadata") {
+		t.Fatalf("error should name the metadata token read, got: %s", err.Error())
+	}
+	if !strings.Contains(err.Error(), "metadata unavailable") {
+		t.Fatalf("error should wrap the provider error, got: %s", err.Error())
+	}
+	if strings.Contains(err.Error(), "no bootstrap token found") {
+		t.Fatalf("a real read error must not be reported as a missing token, got: %s", err.Error())
+	}
+}
+
+// ErrMetadataNotFound means the service serves no token at the path ("not
+// provisioned"), so it falls through to the terminal no-source error rather
+// than surfacing as a read failure.
+func TestTokenResolver_MetadataNotFoundFallsThrough(t *testing.T) {
+	meta := &mockMetadataProvider{err: ErrMetadataNotFound}
+	cfg := &Config{UseMetadata: true}
+	r := NewTokenResolver(cfg, meta)
+	_, err := r.Resolve(context.Background())
+	if err == nil {
 		t.Fatal("expected error when no sources available, got nil")
 	}
 	if !strings.Contains(err.Error(), "no bootstrap token found") {
 		t.Fatalf("error should mention 'no bootstrap token found', got: %s", err.Error())
+	}
+}
+
+func TestResolveValue_DirectWins(t *testing.T) {
+	meta := &mockMetadataProvider{token: "metadata-value"}
+	cfg := &Config{UseMetadata: true}
+	r := NewTokenResolver(cfg, meta)
+
+	v, err := r.ResolveValue(context.Background(), "project_id", "  direct-value  ", "/plexd/project-id")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != "direct-value" {
+		t.Fatalf("got value %q, want %q (trimmed direct value)", v, "direct-value")
+	}
+	if meta.lastPath != "" {
+		t.Fatalf("provider should not be consulted when a direct value is set, got path %q", meta.lastPath)
+	}
+}
+
+func TestResolveValue_MetadataFallback(t *testing.T) {
+	meta := &mockMetadataProvider{token: "  metadata-value\n"}
+	cfg := &Config{UseMetadata: true}
+	r := NewTokenResolver(cfg, meta)
+
+	v, err := r.ResolveValue(context.Background(), "resource_handle", "", "/plexd/resource-handle")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != "metadata-value" {
+		t.Fatalf("got value %q, want %q (trimmed metadata value)", v, "metadata-value")
+	}
+	if meta.lastPath != "/plexd/resource-handle" {
+		t.Fatalf("provider received path %q, want %q", meta.lastPath, "/plexd/resource-handle")
+	}
+}
+
+func TestResolveValue_MetadataDisabled(t *testing.T) {
+	meta := &mockMetadataProvider{token: "metadata-value"}
+	cfg := &Config{UseMetadata: false}
+	r := NewTokenResolver(cfg, meta)
+
+	v, err := r.ResolveValue(context.Background(), "project_id", "", "/plexd/project-id")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != "" {
+		t.Fatalf("got value %q, want empty when metadata disabled", v)
+	}
+	if meta.lastPath != "" {
+		t.Fatalf("provider should not be consulted when metadata disabled, got path %q", meta.lastPath)
+	}
+}
+
+func TestResolveValue_NilProvider(t *testing.T) {
+	cfg := &Config{UseMetadata: true}
+	r := NewTokenResolver(cfg, nil)
+
+	v, err := r.ResolveValue(context.Background(), "project_id", "", "/plexd/project-id")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != "" {
+		t.Fatalf("got value %q, want empty when provider is nil", v)
+	}
+}
+
+// A failing metadata read must surface as an error. Collapsing it to an empty
+// string reports a transient IMDS outage as a missing config setting and skips
+// the retry loop entirely.
+func TestResolveValue_MetadataReadError(t *testing.T) {
+	meta := &mockMetadataProvider{err: errors.New("metadata unavailable")}
+	cfg := &Config{UseMetadata: true}
+	r := NewTokenResolver(cfg, meta)
+
+	_, err := r.ResolveValue(context.Background(), "project_id", "", "/plexd/project-id")
+	if err == nil {
+		t.Fatal("expected error for failed metadata read, got nil")
+	}
+	if !strings.Contains(err.Error(), "read project_id from metadata") {
+		t.Fatalf("error should name the field being read, got: %s", err.Error())
+	}
+	if !strings.Contains(err.Error(), "metadata unavailable") {
+		t.Fatalf("error should wrap the provider error, got: %s", err.Error())
+	}
+}
+
+// A path the metadata service does not serve means "not provisioned", so
+// optional inputs such as requested_resource_id stay optional.
+func TestResolveValue_MetadataNotFound(t *testing.T) {
+	meta := &mockMetadataProvider{err: ErrMetadataNotFound}
+	cfg := &Config{UseMetadata: true}
+	r := NewTokenResolver(cfg, meta)
+
+	v, err := r.ResolveValue(context.Background(), "requested_resource_id", "", "/plexd/requested-resource-id")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != "" {
+		t.Fatalf("got value %q, want empty when metadata serves no value", v)
+	}
+}
+
+// validateValue is shared by project_id, resource_handle, and
+// requested_resource_id — the message must name the field that actually failed
+// rather than sending the operator to audit their bootstrap token.
+func TestResolveValue_ErrorNamesField(t *testing.T) {
+	cfg := &Config{}
+	r := NewTokenResolver(cfg, nil)
+
+	_, err := r.ResolveValue(context.Background(), "resource_handle", "bad\x00handle", "/plexd/resource-handle")
+	if err == nil {
+		t.Fatal("expected error for non-printable value, got nil")
+	}
+	if !strings.Contains(err.Error(), "resource_handle") {
+		t.Fatalf("error should name resource_handle, got: %s", err.Error())
+	}
+	if strings.Contains(err.Error(), "token") {
+		t.Fatalf("error must not blame the bootstrap token, got: %s", err.Error())
+	}
+}
+
+func TestResolveValue_OversizedDirect(t *testing.T) {
+	cfg := &Config{}
+	r := NewTokenResolver(cfg, nil)
+
+	_, err := r.ResolveValue(context.Background(), "project_id", strings.Repeat("a", maxValueLength+1), "/plexd/project-id")
+	if err == nil {
+		t.Fatal("expected error for oversized direct value, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum length") {
+		t.Fatalf("error should mention 'exceeds maximum length', got: %s", err.Error())
+	}
+}
+
+func TestResolveValue_NonPrintableDirect(t *testing.T) {
+	cfg := &Config{}
+	r := NewTokenResolver(cfg, nil)
+
+	_, err := r.ResolveValue(context.Background(), "resource_handle", "value\x01here", "/plexd/project-id")
+	if err == nil {
+		t.Fatal("expected error for non-printable direct value, got nil")
+	}
+	if !strings.Contains(err.Error(), "non-printable characters") {
+		t.Fatalf("error should mention 'non-printable characters', got: %s", err.Error())
 	}
 }

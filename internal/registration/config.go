@@ -11,6 +11,18 @@ type Config struct {
 	// DataDir is the path to the data directory (required).
 	DataDir string `yaml:"data_dir"`
 
+	// ProjectID is the platform project UUID the node registers into
+	// (required for fresh registration).
+	ProjectID string `yaml:"project_id"`
+
+	// ResourceHandle is the platform Resource handle the node binds to
+	// (required for fresh registration).
+	ResourceHandle string `yaml:"resource_handle"`
+
+	// RequestedResourceID is an optional override used when substrate naming
+	// differs from the platform handle.
+	RequestedResourceID string `yaml:"requested_resource_id"`
+
 	// TokenFile is the path to the bootstrap token file.
 	// Default: /etc/plexd/bootstrap-token
 	TokenFile string `yaml:"token_file"`
@@ -56,6 +68,15 @@ const DefaultTokenEnv = "PLEXD_BOOTSTRAP_TOKEN"
 
 // DefaultMetadataTokenPath is the default metadata key path for the bootstrap token.
 const DefaultMetadataTokenPath = "/plexd/bootstrap-token"
+
+// DefaultMetadataProjectIDPath is the default metadata key path for the project ID.
+const DefaultMetadataProjectIDPath = "/plexd/project-id"
+
+// DefaultMetadataResourceHandlePath is the default metadata key path for the resource handle.
+const DefaultMetadataResourceHandlePath = "/plexd/resource-handle"
+
+// DefaultMetadataRequestedResourceIDPath is the default metadata key path for the requested resource ID.
+const DefaultMetadataRequestedResourceIDPath = "/plexd/requested-resource-id"
 
 // DefaultMetadataTimeout is the default timeout for metadata service requests.
 const DefaultMetadataTimeout = 2 * time.Second

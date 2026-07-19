@@ -20,5 +20,7 @@ log_level: info
 
 registration:
   token_file: /etc/plexd/bootstrap-token
+  # project_id: <project uuid>
+  # resource_handle: <platform resource handle>
 `, apiSection)
 }
