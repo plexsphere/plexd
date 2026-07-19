@@ -52,14 +52,15 @@ Node registration and bootstrap authentication.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `project_id` | string | — | Platform project UUID to register into. Required for fresh registration (validated at registration time, not config parse). |
+| `resource_handle` | string | — | Platform Resource handle to bind to. Required for fresh registration. |
+| `requested_resource_id` | string | — | Optional resource ID override used when substrate naming differs from the platform handle. |
 | `token_file` | string | `/etc/plexd/bootstrap-token` | Path to the bootstrap token file |
 | `token_env` | string | `PLEXD_BOOTSTRAP_TOKEN` | Environment variable name for the bootstrap token |
 | `token_value` | string | — | Direct token value override |
-| `use_metadata` | bool | `false` | Enable cloud metadata service for registration |
+| `use_metadata` | bool | `false` | Enable the cloud metadata service (IMDS) as a fallback source for registration inputs |
 | `metadata_token_path` | string | `/plexd/bootstrap-token` | Metadata key path for the bootstrap token (e.g. IMDS) |
 | `metadata_timeout` | duration | `2s` | Maximum time to wait for a metadata service response |
-| `hostname` | string | — | Override system hostname. Empty uses `os.Hostname()`. |
-| `metadata` | map[string]string | — | Optional key-value pairs for the registration request |
 | `max_retry_duration` | duration | `5m` | Maximum duration to retry registration |
 
 > `data_dir` is propagated from the top-level `data_dir` at runtime. It does not appear in the YAML.
@@ -332,14 +333,15 @@ api:
   sse_idle_timeout: 90s
 
 registration:
+  # project_id: ""            # platform project UUID (required for registration)
+  # resource_handle: ""       # platform resource handle (required for registration)
+  # requested_resource_id: "" # optional resource id override
   token_file: /etc/plexd/bootstrap-token
   token_env: PLEXD_BOOTSTRAP_TOKEN
   # token_value: ""          # direct token override
   use_metadata: false
   metadata_token_path: /plexd/bootstrap-token
   metadata_timeout: 2s
-  # hostname: ""             # empty = os.Hostname()
-  # metadata: {}             # optional key-value pairs
   max_retry_duration: 5m
 
 heartbeat:

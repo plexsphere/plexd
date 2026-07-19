@@ -16,6 +16,9 @@ The `plexd` binary is a single static executable providing node agent lifecycle 
 | `--log-level` | `info`                      | Log level: `debug`, `info`, `warn`, `error`|
 | `--api`       | —                           | Control plane API URL (overrides config)   |
 | `--mode`      | —                           | Operating mode: `node` or `bridge`         |
+| `--project-id` | —                          | Platform project UUID for registration (env `PLEXD_PROJECT_ID`; overrides config) |
+| `--resource-handle` | —                     | Platform resource handle for registration (env `PLEXD_RESOURCE_HANDLE`; overrides config) |
+| `--requested-resource-id` | —               | Resource ID override when substrate naming differs (env `PLEXD_REQUESTED_RESOURCE_ID`; overrides config) |
 | `--version`   | —                           | Print version, commit hash, and build date |
 
 ## Build-Time Variables

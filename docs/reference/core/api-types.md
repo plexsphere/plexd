@@ -12,25 +12,50 @@ All request/response types for the 17 control plane API endpoints, organized by 
 
 ### `POST /v1/register`
 
+Unauthenticated (`security: []`): the bootstrap token travels in the request
+body, not an `Authorization` header. Success is `201 Created`; errors use RFC
+9457 `application/problem+json`. See [Control Plane API Endpoints](api-endpoints.md)
+for the wire examples and error taxonomy.
+
 **RegisterRequest**
 
-| Field          | Type                   | JSON Tag                   | Description                     |
-|----------------|------------------------|----------------------------|---------------------------------|
-| `Token`        | `string`               | `"token"`                  | Bootstrap authentication token  |
-| `PublicKey`     | `string`               | `"public_key"`             | Node's WireGuard public key     |
-| `Hostname`     | `string`               | `"hostname"`               | Node hostname                   |
-| `Metadata`     | `map[string]string`    | `"metadata,omitempty"`     | Optional key-value metadata     |
-| `Capabilities` | `*CapabilitiesPayload` | `"capabilities,omitempty"` | Optional initial capabilities   |
+| Field                 | Type     | JSON Tag                            | Constraints                     |
+|-----------------------|----------|-------------------------------------|---------------------------------|
+| `ProjectID`           | `string` | `"project_id"`                      | Required. Platform project UUID. |
+| `ResourceHandle`      | `string` | `"resource_handle"`                 | Required. Platform Resource handle. |
+| `BootstrapToken`      | `string` | `"bootstrap_token"`                 | Required. Format `psb_<env>_<project>_<kind>_<random>`, matching `^psb_[a-z]+_[a-z2-7]+_(node\|bridge)_[a-z2-7]{20,}$`. |
+| `Nonce`               | `string` | `"nonce"`                           | Required. Fresh UUIDv4 generated per registration attempt (server-side replay protection). |
+| `PublicKey`           | `string` | `"public_key"`                      | Required. Curve25519 public key as 44-char standard base64, matching `^[A-Za-z0-9+/]{43}=$`. |
+| `RequestedResourceID` | `string` | `"requested_resource_id,omitempty"` | Optional. Resource ID override when substrate naming differs from the handle. |
 
-**RegisterResponse**
+`hostname`, `metadata`, and `capabilities` are no longer part of registration.
+Capabilities are published after registration via `PUT /v1/nodes/{node_id}/capabilities`.
 
-| Field             | Type     | JSON Tag             | Description                        |
-|-------------------|----------|----------------------|------------------------------------|
-| `NodeID`          | `string` | `"node_id"`          | Assigned node identifier           |
-| `MeshIP`          | `string` | `"mesh_ip"`          | Assigned mesh IP address           |
-| `SigningPublicKey` | `string` | `"signing_public_key"` | Control plane signing public key |
-| `NodeSecretKey`   | `string` | `"node_secret_key"`  | Node identity secret key           |
-| `Peers`           | `[]Peer` | `"peers"`            | Initial peer list                  |
+**RegisterResponse** (`201 Created`)
+
+| Field              | Type            | JSON Tag               | Description                        |
+|--------------------|-----------------|------------------------|------------------------------------|
+| `NodeID`           | `string`        | `"node_id"`            | Assigned node identifier (UUID)    |
+| `MeshIP`           | `string`        | `"mesh_ip"`            | Assigned mesh IP address           |
+| `SigningPublicKey` | `string`        | `"signing_public_key"` | Control plane signing public key   |
+| `SigningKeyID`     | `string`        | `"signing_key_id"`     | Signing key id for rotation-aware signature verification (e.g. `did:web:plexsphere.com#key-2026-04`) |
+| `NSK`              | `string`        | `"nsk"`                | Node secret key, returned exactly once: 44-char standard-padded base64 that decodes to the 32-byte AES-256-GCM key. Sent verbatim as the bearer credential; decoded before use as a key |
+| `PeerSnapshot`     | `[]RegisterPeer`| `"peer_snapshot"`      | Initial peer snapshot              |
+| `DomainMeshCIDR`   | `string`        | `"domain_mesh_cidr"`   | Domain mesh address range (e.g. `100.64.0.0/10`) |
+
+**RegisterPeer**
+
+| Field              | Type     | JSON Tag                       | Description                     |
+|--------------------|----------|--------------------------------|---------------------------------|
+| `NodeID`           | `string` | `"node_id"`                    | Peer node ID                    |
+| `MeshIP`           | `string` | `"mesh_ip"`                    | Peer mesh IP address            |
+| `PublicKey`        | `string` | `"public_key"`                 | Peer Curve25519 public key      |
+| `FallbackEndpoint` | `string` | `"fallback_endpoint,omitempty"`| Optional fallback WireGuard endpoint |
+
+`RegisterPeer` is deliberately narrow: it carries **no** `psk`, `allowed_ips`, or
+`endpoint`. The richer `Peer` shape (below) is the state-path shape and remains
+in use for `GET /v1/nodes/{node_id}/state` and `POST /v1/keys/rotate` until issue
+#20 reshapes the reconciliation peer contract.
 
 **Peer**
 

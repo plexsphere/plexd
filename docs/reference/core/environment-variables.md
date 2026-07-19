@@ -18,6 +18,9 @@ These variables are read via `envOrDefault()` in `cmd/plexd/cmd/root.go` and app
 | `PLEXD_LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error`. Equivalent to `--log-level`. |
 | `PLEXD_API` | — | Control plane API URL. Equivalent to `--api`. |
 | `PLEXD_MODE` | — | Operating mode: `node` or `bridge`. Equivalent to `--mode`. |
+| `PLEXD_PROJECT_ID` | — | Platform project UUID for registration. Overrides `registration.project_id`. Equivalent to `--project-id`. |
+| `PLEXD_RESOURCE_HANDLE` | — | Platform resource handle for registration. Overrides `registration.resource_handle`. Equivalent to `--resource-handle`. |
+| `PLEXD_REQUESTED_RESOURCE_ID` | — | Resource ID override for registration. Overrides `registration.requested_resource_id`. Equivalent to `--requested-resource-id`. |
 
 ## plexd up Variables
 
