@@ -104,6 +104,20 @@ if [ "${HEALTH_ELAPSED}" -ge "${HEALTH_TIMEOUT}" ]; then
 fi
 
 # ===================================================================
+# Configure a short endpoint TTL (40s) so plexd re-reports on the
+# stale_after deadline rather than the 120s nat.refresh_interval ticker.
+# ===================================================================
+echo "=== Configuring short endpoint TTL (40s) ==="
+EP_TTL_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"ttl_seconds": 40}' \
+    "http://localhost:18080/test/configure-endpoint" 2>/dev/null || true)
+if [ "${EP_TTL_STATUS}" != "204" ]; then
+    fail "configure-endpoint returned status ${EP_TTL_STATUS}, want 204"
+fi
+echo "  endpoint TTL set to 40s (stale_after-driven re-report cadence)"
+
+# ===================================================================
 # Phase 2: Initial assertion polling (all 8 counters >= 1)
 # ===================================================================
 echo "=== Polling assertion endpoint (all counters >= 1) ==="
@@ -181,9 +195,8 @@ if [ -z "${REG_PUBKEY}" ]; then
 fi
 echo "  PASS: registration body contains public_key"
 
-# 3b. Heartbeat body must be valid JSON with expected structure.
+# 3b. Heartbeat body must carry the real v1 heartbeat fields.
 # Note: node_id is passed as a URL path parameter, not in the body.
-# The body may contain zero-valued fields since SetBuildRequest is optional.
 HB_BODY=$(curl -sf "http://localhost:18080/test/last-request/heartbeat" 2>/dev/null || true)
 if [ -z "${HB_BODY}" ]; then
     fail "no captured heartbeat request body"
@@ -193,12 +206,83 @@ if ! echo "${HB_BODY}" | jq empty 2>/dev/null; then
 fi
 echo "  PASS: heartbeat body is valid JSON"
 
-# Verify the body has the expected heartbeat structure (timestamp field exists).
-HB_HAS_TS=$(echo "${HB_BODY}" | jq 'has("timestamp")')
-if [ "${HB_HAS_TS}" != "true" ]; then
-    fail "heartbeat body missing 'timestamp' field"
+# client_now must be present and an RFC 3339 timestamp.
+HB_CLIENT_NOW=$(echo "${HB_BODY}" | jq -r '.client_now // empty')
+if [ -z "${HB_CLIENT_NOW}" ]; then
+    fail "heartbeat body missing 'client_now' field"
 fi
-echo "  PASS: heartbeat body has expected structure"
+if ! echo "${HB_CLIENT_NOW}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+.*(Z|[+-][0-9]{2}:[0-9]{2})$'; then
+    fail "heartbeat client_now='${HB_CLIENT_NOW}' is not an RFC 3339 timestamp"
+fi
+echo "  PASS: heartbeat body client_now='${HB_CLIENT_NOW}' matches RFC 3339"
+
+# binary_checksum must be 64-char lowercase hex.
+HB_CHECKSUM=$(echo "${HB_BODY}" | jq -r '.binary_checksum // empty')
+if ! echo "${HB_CHECKSUM}" | grep -Eq '^[0-9a-f]{64}$'; then
+    fail "heartbeat binary_checksum='${HB_CHECKSUM}' is not 64-char lowercase hex"
+fi
+echo "  PASS: heartbeat body binary_checksum is 64-char lowercase hex"
+
+# binary_version must be present and non-empty.
+HB_VERSION=$(echo "${HB_BODY}" | jq -r '.binary_version // empty')
+if [ -z "${HB_VERSION}" ]; then
+    fail "heartbeat body missing 'binary_version' field"
+fi
+echo "  PASS: heartbeat body binary_version='${HB_VERSION}'"
+
+# nat_summary must always be a JSON object ({} when NAT discovery has no result).
+HB_NAT_SUMMARY_TYPE=$(echo "${HB_BODY}" | jq -r '.nat_summary | type')
+if [ "${HB_NAT_SUMMARY_TYPE}" != "object" ]; then
+    fail "heartbeat nat_summary type='${HB_NAT_SUMMARY_TYPE}', want 'object'"
+fi
+echo "  PASS: heartbeat body nat_summary is a JSON object"
+
+# 3f. Endpoint report body must carry {endpoint, nat_type, reported_at}.
+# STUN discovery must complete before plexd can report an endpoint, so this
+# can lag the heartbeat; poll the endpoint_count assertion counter first.
+echo "  --- endpoint report body ---"
+EP_COUNT=0
+EP_BODY_TIMEOUT=90
+EP_BODY_ELAPSED=0
+while [ "${EP_BODY_ELAPSED}" -lt "${EP_BODY_TIMEOUT}" ]; do
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        EP_COUNT=$(get_counter "${RESPONSE}" "endpoint_count")
+        if [ "${EP_COUNT}" -ge 1 ]; then
+            break
+        fi
+    fi
+    sleep 3
+    EP_BODY_ELAPSED=$((EP_BODY_ELAPSED + 3))
+done
+if [ "${EP_COUNT}" -lt 1 ]; then
+    fail "endpoint_count did not reach 1 within ${EP_BODY_TIMEOUT}s (STUN may be unreachable from the compose network; outbound UDP to stun.l.google.com/stun.cloudflare.com is required)"
+fi
+echo "  PASS: endpoint_count=${EP_COUNT} >= 1"
+
+EP_BODY=$(curl -sf "http://localhost:18080/test/last-request/endpoint" 2>/dev/null || true)
+if [ -z "${EP_BODY}" ]; then
+    fail "no captured endpoint request body"
+fi
+EP_ENDPOINT=$(echo "${EP_BODY}" | jq -r '.endpoint // empty')
+if [ -z "${EP_ENDPOINT}" ]; then
+    fail "endpoint body missing 'endpoint' field"
+fi
+echo "  PASS: endpoint body endpoint='${EP_ENDPOINT}'"
+
+EP_NAT_TYPE=$(echo "${EP_BODY}" | jq -r '.nat_type // empty')
+case "${EP_NAT_TYPE}" in
+    full_cone|restricted|port_restricted|symmetric|unknown)
+        echo "  PASS: endpoint body nat_type='${EP_NAT_TYPE}'" ;;
+    *)
+        fail "endpoint body nat_type='${EP_NAT_TYPE}', want one of full_cone|restricted|port_restricted|symmetric|unknown" ;;
+esac
+
+EP_REPORTED_AT=$(echo "${EP_BODY}" | jq -r '.reported_at // empty')
+if [ -z "${EP_REPORTED_AT}" ]; then
+    fail "endpoint body missing 'reported_at' field"
+fi
+echo "  PASS: endpoint body reported_at='${EP_REPORTED_AT}'"
 
 # 3c. Capabilities body must contain builtin_actions array.
 CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
@@ -1227,61 +1311,36 @@ if [ -n "${DRIFT_BODY}" ]; then
     fi
 fi
 
-# 10e. Heartbeat body richness (GAP-02): validate key fields from BuildRequest.
-# The SetBuildRequest callback populates mesh info (interface, listen_port, peer_count).
-# status, uptime, binary_checksum fields exist in the struct but are not populated
-# by the current BuildRequest callback, so those are soft checks only.
+# 10e. Heartbeat body richness: re-validate the four v1 heartbeat fields on the
+# latest captured heartbeat, confirming the contract holds across the run.
 HB_BODY=$(curl -sf "http://localhost:18080/test/last-request/heartbeat" 2>/dev/null || true)
 if [ -n "${HB_BODY}" ]; then
-    HB_MESH_IF=$(echo "${HB_BODY}" | jq -r '.mesh.interface // empty')
-    if [ "${HB_MESH_IF}" = "wg-plexd" ]; then
-        echo "  PASS: heartbeat mesh.interface = 'wg-plexd'"
+    HB_CLIENT_NOW=$(echo "${HB_BODY}" | jq -r '.client_now // empty')
+    if echo "${HB_CLIENT_NOW}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+.*(Z|[+-][0-9]{2}:[0-9]{2})$'; then
+        echo "  PASS: heartbeat client_now='${HB_CLIENT_NOW}' matches RFC 3339"
     else
-        fail "heartbeat mesh.interface = '${HB_MESH_IF}', want 'wg-plexd'"
-    fi
-
-    HB_MESH_PORT=$(echo "${HB_BODY}" | jq -r '.mesh.listen_port // empty')
-    if [ "${HB_MESH_PORT}" = "51820" ]; then
-        echo "  PASS: heartbeat mesh.listen_port = 51820"
-    else
-        fail "heartbeat mesh.listen_port = '${HB_MESH_PORT}', want 51820"
-    fi
-
-    HB_MESH_PEERS=$(echo "${HB_BODY}" | jq '.mesh.peer_count // -1')
-    if [ "${HB_MESH_PEERS}" != "-1" ] && [ "${HB_MESH_PEERS}" != "null" ]; then
-        echo "  PASS: heartbeat mesh.peer_count = ${HB_MESH_PEERS}"
-    else
-        fail "heartbeat body missing 'mesh.peer_count' field"
-    fi
-
-    # Verify mesh object is present (non-null).
-    HB_HAS_MESH=$(echo "${HB_BODY}" | jq 'has("mesh") and (.mesh != null)')
-    if [ "${HB_HAS_MESH}" = "true" ]; then
-        echo "  PASS: heartbeat body has mesh object"
-    else
-        fail "heartbeat body missing 'mesh' object"
-    fi
-
-    # Soft checks for fields not yet populated by BuildRequest.
-    HB_STATUS=$(echo "${HB_BODY}" | jq -r '.status // empty')
-    if [ -n "${HB_STATUS}" ]; then
-        echo "  PASS: heartbeat body has status='${HB_STATUS}'"
-    else
-        echo "  INFO: heartbeat body status is empty (not set by BuildRequest)"
-    fi
-
-    HB_UPTIME=$(echo "${HB_BODY}" | jq -r '.uptime // empty')
-    if [ -n "${HB_UPTIME}" ]; then
-        echo "  PASS: heartbeat body has uptime='${HB_UPTIME}'"
-    else
-        echo "  INFO: heartbeat body uptime is empty (not set by BuildRequest)"
+        fail "heartbeat client_now='${HB_CLIENT_NOW}' is not an RFC 3339 timestamp"
     fi
 
     HB_CHECKSUM=$(echo "${HB_BODY}" | jq -r '.binary_checksum // empty')
-    if [ -n "${HB_CHECKSUM}" ]; then
-        echo "  PASS: heartbeat body has binary_checksum"
+    if echo "${HB_CHECKSUM}" | grep -Eq '^[0-9a-f]{64}$'; then
+        echo "  PASS: heartbeat binary_checksum is 64-char lowercase hex"
     else
-        echo "  INFO: heartbeat body binary_checksum is empty (not set by BuildRequest)"
+        fail "heartbeat binary_checksum='${HB_CHECKSUM}' is not 64-char lowercase hex"
+    fi
+
+    HB_VERSION=$(echo "${HB_BODY}" | jq -r '.binary_version // empty')
+    if [ -n "${HB_VERSION}" ]; then
+        echo "  PASS: heartbeat binary_version='${HB_VERSION}'"
+    else
+        fail "heartbeat body missing 'binary_version' field"
+    fi
+
+    HB_NAT_SUMMARY_TYPE=$(echo "${HB_BODY}" | jq -r '.nat_summary | type')
+    if [ "${HB_NAT_SUMMARY_TYPE}" = "object" ]; then
+        echo "  PASS: heartbeat nat_summary is a JSON object"
+    else
+        fail "heartbeat nat_summary type='${HB_NAT_SUMMARY_TYPE}', want 'object'"
     fi
 else
     fail "no captured heartbeat request body for richness validation"
@@ -1504,6 +1563,81 @@ if [ "${MUT_DRIFT_PASSED}" -eq 1 ]; then
 fi
 
 echo "=== Phase 13 PASSED: state mutation drift detection ==="
+
+# ===================================================================
+# Phase 13b: stale_after-driven endpoint re-report cadence
+# ===================================================================
+# The endpoint TTL was set to 40s during setup while nat.refresh_interval is
+# 120s. plexd schedules its next report at
+# min(refresh_interval, stale_after - now - 30s) floored at 10s, so the 40s TTL
+# forces a ~10s cadence that the 120s ticker alone could never produce.
+echo "=== Testing stale_after-driven endpoint re-report cadence ==="
+
+# (a) Absorb one pickup cycle: if plexd's very first report raced ahead of the
+#     configure-endpoint call, it carried the default TTL and the next report
+#     lands ~120s later. Wait for one increment so the 40s TTL is in effect.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+EP_START=$(get_counter "${RESPONSE}" "endpoint_count")
+echo "  endpoint_count at phase start: ${EP_START}"
+PICKUP_TIMEOUT=130
+PICKUP_ELAPSED=0
+PICKUP_PASSED=0
+while [ "${PICKUP_ELAPSED}" -lt "${PICKUP_TIMEOUT}" ]; do
+    sleep 3
+    PICKUP_ELAPSED=$((PICKUP_ELAPSED + 3))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        EP_NOW=$(get_counter "${RESPONSE}" "endpoint_count")
+        if [ "${EP_NOW}" -ge $((EP_START + 1)) ]; then
+            echo "  PASS: endpoint_count advanced to ${EP_NOW} (short TTL in effect)"
+            PICKUP_PASSED=1
+            break
+        fi
+    fi
+done
+if [ "${PICKUP_PASSED}" -eq 0 ]; then
+    EP_NOW=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "endpoint_count")
+    fail "endpoint_count did not advance past ${EP_START} within ${PICKUP_TIMEOUT}s (before=${EP_START}, after=${EP_NOW})"
+fi
+
+# (b) With the short TTL confirmed, two further reports must land within 40s.
+#     Impossible at the 120s ticker; guaranteed at the 10s deadline cadence
+#     (40s TTL - 30s margin -> 10s, floored at 10s).
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+EP_BASELINE=$(get_counter "${RESPONSE}" "endpoint_count")
+echo "  endpoint_count baseline for cadence check: ${EP_BASELINE}"
+CADENCE_TIMEOUT=40
+CADENCE_ELAPSED=0
+CADENCE_PASSED=0
+while [ "${CADENCE_ELAPSED}" -lt "${CADENCE_TIMEOUT}" ]; do
+    sleep 3
+    CADENCE_ELAPSED=$((CADENCE_ELAPSED + 3))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        EP_NOW=$(get_counter "${RESPONSE}" "endpoint_count")
+        if [ "${EP_NOW}" -ge $((EP_BASELINE + 2)) ]; then
+            echo "  PASS: endpoint_count reached ${EP_NOW} (>= baseline+2) within ${CADENCE_ELAPSED}s"
+            CADENCE_PASSED=1
+            break
+        fi
+    fi
+done
+if [ "${CADENCE_PASSED}" -eq 0 ]; then
+    EP_NOW=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "endpoint_count")
+    fail "endpoint_count only reached ${EP_NOW} within ${CADENCE_TIMEOUT}s (want >= $((EP_BASELINE + 2))); stale_after deadline did not drive fast re-reporting"
+fi
+
+# (c) Restore a long TTL so later phases are unaffected by the fast cadence.
+EP_RESET_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"ttl_seconds": 300}' \
+    "http://localhost:18080/test/configure-endpoint" 2>/dev/null || true)
+if [ "${EP_RESET_STATUS}" != "204" ]; then
+    fail "configure-endpoint reset returned status ${EP_RESET_STATUS}, want 204"
+fi
+echo "  endpoint TTL reset to 300s"
+
+echo "=== Phase 13b PASSED: stale_after-driven endpoint re-report cadence ==="
 
 # ===================================================================
 # Phase 14: Local Endpoint Delivery
