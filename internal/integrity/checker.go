@@ -37,6 +37,15 @@ func HashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// SelfChecksum computes the SHA-256 checksum of the currently running binary.
+func SelfChecksum() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("integrity: self checksum: %w", err)
+	}
+	return HashFile(exe)
+}
+
 // VerifyFile computes the SHA-256 checksum of the file at path and compares it
 // against expectedChecksum. When requireChecksum is true and expectedChecksum is
 // empty, an error is returned (hooks must have a control-plane-provided checksum).
