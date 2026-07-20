@@ -69,6 +69,62 @@ func TestManager_Setup(t *testing.T) {
 	}
 }
 
+func TestManager_Setup_InterfaceAddressPrefix(t *testing.T) {
+	tests := []struct {
+		name           string
+		domainMeshCIDR string
+		wantAddress    string
+	}{
+		{
+			name:           "cidr containing the mesh ip sets the interface prefix",
+			domainMeshCIDR: "10.0.0.0/16",
+			wantAddress:    "10.0.0.1/16",
+		},
+		{
+			name:           "empty cidr falls back to /32",
+			domainMeshCIDR: "",
+			wantAddress:    "10.0.0.1/32",
+		},
+		{
+			name:           "invalid cidr falls back to /32",
+			domainMeshCIDR: "not-a-cidr",
+			wantAddress:    "10.0.0.1/32",
+		},
+		{
+			name:           "cidr not containing the mesh ip falls back to /32",
+			domainMeshCIDR: "192.168.0.0/16",
+			wantAddress:    "10.0.0.1/32",
+		},
+		{
+			name:           "overly broad cidr falls back to /32",
+			domainMeshCIDR: "0.0.0.0/0",
+			wantAddress:    "10.0.0.1/32",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := &mockController{}
+			mgr := NewManager(ctrl, Config{}, discardLogger())
+
+			identity := testIdentity()
+			identity.DomainMeshCIDR = tt.domainMeshCIDR
+
+			if err := mgr.Setup(context.Background(), identity); err != nil {
+				t.Fatalf("Setup() returned error: %v", err)
+			}
+
+			ca := ctrl.callsFor("ConfigureAddress")
+			if len(ca) != 1 {
+				t.Fatalf("expected 1 ConfigureAddress call, got %d", len(ca))
+			}
+			if ca[0].Args[1] != tt.wantAddress {
+				t.Errorf("ConfigureAddress address = %v, want %v", ca[0].Args[1], tt.wantAddress)
+			}
+		})
+	}
+}
+
 func TestManager_Setup_WithMTU(t *testing.T) {
 	ctrl := &mockController{}
 	mgr := NewManager(ctrl, Config{MTU: 1420}, discardLogger())
