@@ -97,10 +97,10 @@ The verifier supports zero-downtime key rotation by holding two keys simultaneou
 
 Keys are updated from two sources:
 
-- **SSE event** — `signing_key_rotated` event handler calls `verifier.SetKeys()` immediately
-- **Reconcile loop** — when `StateDiff.SigningKeysChanged` is true, the reconcile handler decodes and applies the new keys
+- **Registration** — the initial verifier key comes from the registration response's `signing_public_key`
+- **SSE event** — the `signing_key_rotated` event handler decodes the rotated keys and calls `verifier.SetKeys()` immediately
 
-Both sources decode base64-encoded keys from `api.SigningKeys`:
+Signing keys no longer ride the state snapshot: the reconcile loop has no signing-keys handler. The `signing_key_rotated` SSE payload decodes base64-encoded keys from `api.SigningKeys`:
 
 ```go
 type SigningKeys struct {

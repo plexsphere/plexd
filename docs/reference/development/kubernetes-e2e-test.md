@@ -6,7 +6,7 @@ feature: PXD-0039
 
 # Kubernetes E2E Test
 
-Validates that plexd deployed as a Kubernetes DaemonSet successfully registers, sends heartbeats, retrieves state, reports capabilities, detects drift, and forwards metrics, logs, and audit events to the Central API. The test uses [kind](https://kind.sigs.k8s.io/) to create a local single-node cluster, applies all production manifests from `deploy/kubernetes/`, deploys a mock-api as a ClusterIP Service, and polls the assertion endpoint to verify plexd's lifecycle calls.
+Validates that plexd deployed as a Kubernetes DaemonSet successfully registers, sends heartbeats, retrieves state, reports capabilities, converges to desired state, and forwards metrics, logs, and audit events to the Central API. The test uses [kind](https://kind.sigs.k8s.io/) to create a local single-node cluster, applies all production manifests from `deploy/kubernetes/`, deploys a mock-api as a ClusterIP Service, and polls the assertion endpoint to verify plexd's lifecycle calls.
 
 ## Cluster Topology
 
@@ -115,7 +115,6 @@ The test polls `GET http://localhost:18080/test/assertions` which returns JSON c
   "heartbeat_count": 3,
   "state_count": 1,
   "capabilities_count": 1,
-  "drift_count": 1,
   "metrics_count": 1,
   "logs_count": 1,
   "audit_count": 1,
@@ -125,7 +124,7 @@ The test polls `GET http://localhost:18080/test/assertions` which returns JSON c
 }
 ```
 
-The test passes when all eight platform counters are >= 1 (initial assertions), and separately verifies that all three local endpoint counters are >= 1 (Phase 10):
+The test passes when all seven platform counters are >= 1 (initial assertions), and separately verifies that all three local endpoint counters are >= 1 (Phase 10):
 
 | Counter | Meaning |
 |---------|---------|
@@ -133,7 +132,6 @@ The test passes when all eight platform counters are >= 1 (initial assertions), 
 | `heartbeat_count` | plexd called `POST /v1/nodes/{id}/heartbeat` |
 | `state_count` | plexd called `GET /v1/nodes/{id}/state` |
 | `capabilities_count` | plexd called `PUT /v1/nodes/{id}/capabilities` |
-| `drift_count` | plexd called `POST /v1/nodes/{id}/drift` |
 | `metrics_count` | plexd called `POST /v1/nodes/{id}/metrics` |
 | `logs_count` | plexd called `POST /v1/nodes/{id}/logs` |
 | `audit_count` | plexd called `POST /v1/nodes/{id}/audit` |

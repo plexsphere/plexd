@@ -53,11 +53,14 @@ Capabilities are published after registration via `PUT /v1/nodes/{node_id}/capab
 | `FallbackEndpoint` | `string` | `"fallback_endpoint,omitempty"`| Optional fallback WireGuard endpoint |
 
 `RegisterPeer` is deliberately narrow: it carries **no** `psk`, `allowed_ips`, or
-`endpoint`. The richer `Peer` shape (below) is the state-path shape and remains
-in use for `GET /v1/nodes/{node_id}/state` and `POST /v1/keys/rotate` until issue
-#20 reshapes the reconciliation peer contract.
+`endpoint`. The reconciliation peer shape is `SnapshotPeer` (see
+[State](#state)), used by `GET /v1/nodes/{node_id}/state`.
 
 **Peer**
+
+`Peer` is the WireGuard peer shape used **only** for the SSE `peer_*` payloads and
+`KeyRotateResponse`; it no longer appears on the state pull. It remains until
+issues #21/#25 migrate those contracts.
 
 | Field        | Type       | JSON Tag       | Description                |
 |--------------|------------|----------------|----------------------------|
@@ -101,38 +104,108 @@ never serialized on its own.
 
 ### `GET /v1/nodes/{node_id}/state`
 
-**StateResponse**
+**NodeStateSnapshot**
 
-| Field        | Type                | JSON Tag                  | Description              |
-|--------------|---------------------|---------------------------|--------------------------|
-| `Peers`      | `[]Peer`            | `"peers"`                 | Desired peer list        |
-| `Policies`   | `[]Policy`          | `"policies"`              | Network policies         |
-| `SigningKeys` | `*SigningKeys`     | `"signing_keys,omitempty"`| Signing key material     |
-| `Metadata`   | `map[string]string` | `"metadata,omitempty"`    | Node metadata            |
-| `BridgeConfig`     | `*BridgeConfig`     | `"bridge_config,omitempty"`      | Bridge configuration           |
-| `RelayConfig`      | `*RelayConfig`      | `"relay_config,omitempty"`       | Relay configuration            |
-| `UserAccessConfig` | `*UserAccessConfig` | `"user_access_config,omitempty"` | User access configuration      |
-| `IngressConfig`    | `*IngressConfig`    | `"ingress_config,omitempty"`     | Ingress configuration          |
-| `SiteToSiteConfig` | `*SiteToSiteConfig` | `"site_to_site_config,omitempty"`| Site-to-site VPN configuration |
-| `Data`       | `[]DataEntry`       | `"data"`                  | Arbitrary data entries   |
-| `SecretRefs` | `[]SecretRef`       | `"secret_refs"`           | Secret references        |
+The desired-state envelope. Every block key is **always present on the wire**: a
+`null` value means "block not populated", never "field absent", so the differ
+distinguishes a nil pointer from a populated block. None of the six fields carry
+`omitempty`.
 
-**Policy**
+| Field          | Type              | JSON Tag         | Description                                              |
+|----------------|-------------------|------------------|---------------------------------------------------------|
+| `Peers`        | `[]SnapshotPeer`  | `"peers"`        | Desired peers; `[]` when empty, node_id ascending, self excluded |
+| `Reachability` | `json.RawMessage` | `"reachability"` | The node's own health projection, carried opaquely (unconsumed) |
+| `Policy`       | `*PolicySnapshot` | `"policy"`       | Merged network policy block                             |
+| `Bridge`       | `*BridgeSnapshot` | `"bridge"`       | Bridge subtrees                                         |
+| `State`        | `*NodeStateBlock` | `"state"`        | Node state buckets                                     |
+| `Reports`      | `*NodeStateBlock` | `"reports"`      | Mirrors `state` today (forward-compat split)           |
 
-| Field   | Type           | JSON Tag  | Description      |
-|---------|----------------|-----------|------------------|
-| `ID`    | `string`       | `"id"`    | Policy ID        |
-| `Rules` | `[]PolicyRule` | `"rules"` | Policy rules     |
+**SnapshotPeer**
+
+Carries **no** `psk`, `allowed_ips`, or `endpoint`. plexd derives `AllowedIPs`
+locally as `mesh_ip/32`, programs `fallback_endpoint` as the WireGuard endpoint
+(relay target), and configures peers without a preshared key.
+
+| Field              | Type     | JSON Tag                        | Description                   |
+|--------------------|----------|---------------------------------|-------------------------------|
+| `NodeID`           | `string` | `"node_id"`                     | Peer node ID                  |
+| `MeshIP`           | `string` | `"mesh_ip"`                     | Peer mesh IP address          |
+| `PublicKey`        | `string` | `"public_key"`                  | Peer WireGuard public key     |
+| `FallbackEndpoint` | `string` | `"fallback_endpoint,omitempty"` | Optional relay/fallback endpoint |
+
+**PolicySnapshot**
+
+The single merged policy block.
+
+| Field         | Type           | JSON Tag          | Description                                                     |
+|---------------|----------------|-------------------|-----------------------------------------------------------------|
+| `RevisionID`  | `string`       | `"revision_id"`   | Policy revision identifier                                      |
+| `Fingerprint` | `string`       | `"fingerprint"`   | 44-char base64 SHA-256 over the server's canonical rule stream; plexd compares it byte-for-byte and never re-derives it |
+| `Rules`       | `[]PolicyRule` | `"rules"`         | Ordered firewall rules                                          |
 
 **PolicyRule**
 
-| Field      | Type   | JSON Tag     | Description        |
-|------------|--------|--------------|--------------------|
-| `Src`      | `string`| `"src"`     | Source CIDR/ID     |
-| `Dst`      | `string`| `"dst"`     | Destination CIDR/ID|
-| `Port`     | `int`  | `"port"`     | Port number        |
-| `Protocol` | `string`| `"protocol"`| Protocol (tcp/udp) |
-| `Action`   | `string`| `"action"`  | allow/deny         |
+A five-tuple firewall rule. `Ports` is present iff `Protocol` is `tcp` or `udp`.
+
+| Field             | Type         | JSON Tag             | Description                              |
+|-------------------|--------------|----------------------|------------------------------------------|
+| `Action`          | `string`     | `"action"`           | `allow`, `deny`, or `log`                |
+| `Protocol`        | `string`     | `"protocol"`         | `tcp`, `udp`, `icmp`, or `any`           |
+| `SourceCIDR`      | `string`     | `"source_cidr"`      | Source CIDR                              |
+| `DestinationCIDR` | `string`     | `"destination_cidr"` | Destination CIDR                        |
+| `Ports`           | `*PortRange` | `"ports,omitempty"`  | Inclusive destination port range        |
+
+**PortRange**
+
+A single inclusive destination port range (`from <= to`).
+
+| Field  | Type  | JSON Tag  | Description       |
+|--------|-------|-----------|-------------------|
+| `From` | `int` | `"from"`  | Range start port  |
+| `To`   | `int` | `"to"`    | Range end port    |
+
+**BridgeSnapshot**
+
+Carries the four bridge subtrees. Each child is present-but-nullable; there are
+no base fields on the wire. Inner shapes (`RelayConfig`, `UserAccessConfig`,
+`IngressConfig`, `SiteToSiteConfig`) are documented under
+[Bridge Mode](/reference/bridge/bridge-mode).
+
+| Field        | Type                | JSON Tag           | Description                     |
+|--------------|---------------------|--------------------|---------------------------------|
+| `Relay`      | `*RelayConfig`      | `"relay"`          | Relay session assignments       |
+| `UserAccess` | `*UserAccessConfig` | `"user_access"`    | User access configuration       |
+| `Ingress`    | `*IngressConfig`    | `"ingress"`        | Public ingress configuration    |
+| `SiteToSite` | `*SiteToSiteConfig` | `"site_to_site"`   | Site-to-site VPN configuration  |
+
+**NodeStateBlock**
+
+A three-bucket state block. Each bucket is a required array (never `null` when the
+block is populated), with entries ordered by key ascending.
+
+| Field      | Type          | JSON Tag     | Description        |
+|------------|---------------|--------------|--------------------|
+| `Metadata` | `[]StateEntry`| `"metadata"` | Metadata entries   |
+| `Data`     | `[]StateEntry`| `"data"`     | Data entries       |
+| `Reports`  | `[]StateEntry`| `"reports"`  | Report entries     |
+
+**StateEntry**
+
+`Value` is an opaque string; `WorkloadTag` is absent/empty when the entry is
+unattributed.
+
+| Field         | Type     | JSON Tag                    | Description             |
+|---------------|----------|-----------------------------|-------------------------|
+| `Key`         | `string` | `"key"`                     | Entry key               |
+| `Value`       | `string` | `"value"`                   | Opaque string value     |
+| `WorkloadTag` | `string` | `"workload_tag,omitempty"`  | Owning workload, if any |
+
+### Supporting types
+
+These types are still part of the API but no longer ride the state snapshot.
+`SigningKeys` arrives via the `signing_key_rotated` SSE event; `SecretRef` feeds
+the secret index via the `node_secrets_updated` SSE event; `DataEntry` is the
+shape the local node API serves for cached data entries.
 
 **SigningKeys**
 
@@ -171,24 +244,6 @@ never serialized on its own.
 | `Ciphertext`| `string`| `"ciphertext"`| Encrypted secret value|
 | `Nonce`     | `string`| `"nonce"`    | Encryption nonce       |
 | `Version`   | `int`  | `"version"`   | Secret version         |
-
-## Drift
-
-### `POST /v1/nodes/{node_id}/drift`
-
-**DriftReport**
-
-| Field        | Type                | JSON Tag        | Description              |
-|--------------|---------------------|-----------------|--------------------------|
-| `Timestamp`  | `time.Time`         | `"timestamp"`   | Report timestamp         |
-| `Corrections`| `[]DriftCorrection` | `"corrections"` | Applied corrections      |
-
-**DriftCorrection**
-
-| Field   | Type   | JSON Tag  | Description          |
-|---------|--------|-----------|----------------------|
-| `Type`  | `string`| `"type"` | Correction type      |
-| `Detail`| `string`| `"detail"`| Correction details  |
 
 ## Reports
 

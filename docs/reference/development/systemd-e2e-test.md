@@ -6,7 +6,7 @@ feature: PXD-0040
 
 # Systemd E2E Test
 
-Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, drift detection, and observability forwarding (metrics, logs, audit), then verifies clean shutdown.
+Validates that plexd runs correctly as a systemd service by deploying it inside a privileged Ubuntu container with systemd as PID 1. The test installs the plexd binary and the production `plexd.service` unit file, starts the service via `systemctl`, polls the mock-api assertion endpoint to verify registration, heartbeat, state retrieval, capabilities reporting, state convergence, and observability forwarding (metrics, logs, audit), then verifies clean shutdown.
 
 ## Container Topology
 
@@ -93,7 +93,6 @@ The test polls `GET http://localhost:18080/test/assertions` which returns JSON c
   "heartbeat_count": 1,
   "state_count": 1,
   "capabilities_count": 1,
-  "drift_count": 1,
   "metrics_count": 1,
   "logs_count": 1,
   "audit_count": 1,
@@ -103,7 +102,7 @@ The test polls `GET http://localhost:18080/test/assertions` which returns JSON c
 }
 ```
 
-The test passes when all eight platform counters are >= 1 (initial assertions), and separately verifies that all three local endpoint counters are >= 1 (Phase 10):
+The test passes when all seven platform counters are >= 1 (initial assertions), and separately verifies that all three local endpoint counters are >= 1 (Phase 10):
 
 | Counter | Meaning |
 |---------|---------|
@@ -111,7 +110,6 @@ The test passes when all eight platform counters are >= 1 (initial assertions), 
 | `heartbeat_count` | plexd called `POST /v1/nodes/{id}/heartbeat` |
 | `state_count` | plexd called `GET /v1/nodes/{id}/state` |
 | `capabilities_count` | plexd called `PUT /v1/nodes/{id}/capabilities` |
-| `drift_count` | plexd called `POST /v1/nodes/{id}/drift` |
 | `metrics_count` | plexd called `POST /v1/nodes/{id}/metrics` |
 | `logs_count` | plexd called `POST /v1/nodes/{id}/logs` |
 | `audit_count` | plexd called `POST /v1/nodes/{id}/audit` |

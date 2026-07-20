@@ -41,9 +41,8 @@ sequenceDiagram
     rect rgb(240, 240, 240)
     Note over N,CP: 4. Reconciliation (every 60s)
     N->>CP: GET /v1/nodes/{id}/state
-    CP-->>N: {peers, policies, signing_keys, actions, metadata}
-    N->>N: Diff and apply corrections
-    N->>CP: POST /v1/nodes/{id}/drift (if drift detected)
+    CP-->>N: {peers, reachability, policy, bridge, state, reports}
+    N->>N: Diff by presence and apply corrections
     end
 
     rect rgb(240, 240, 240)
@@ -61,7 +60,7 @@ sequenceDiagram
 | Registration | Node → CP | HTTPS POST | Once | Bootstrap identity, receive keys and peers |
 | SSE Stream | Node ← CP | HTTPS SSE | Persistent | Real-time peer, policy, action, and key events |
 | Heartbeat | Node → CP | HTTPS POST | Every 30s | Liveness, status reporting, reconcile/rotate hints |
-| Reconciliation | Node → CP | HTTPS GET/POST | Every 60s | State consistency fallback, drift correction |
+| Reconciliation | Node → CP | HTTPS GET | Every 60s | State consistency fallback; pulls the desired-state snapshot |
 | Observability | Node → CP | HTTPS POST | Periodic | Metrics, logs, and audit event uploads |
 
 The SSE stream is the primary real-time channel. Reconciliation acts as a consistency fallback — if an SSE event is missed, the next reconciliation cycle detects and corrects the drift. See [Heartbeat Service](/reference/core/heartbeat-service) and [Reconciliation](/reference/core/reconciliation) for protocol details.

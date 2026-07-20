@@ -79,7 +79,7 @@ func NewServer(cfg Config, client NodeAPIClient, nsk []byte, logger *slog.Logger
 |-------------------------|------------------------------------------------------------------|---------------------------------------------------------------------|
 | `Start`                 | `(ctx context.Context, nodeID string) error`                     | Blocking; runs listeners and syncer until context cancelled         |
 | `RegisterEventHandlers` | `(dispatcher *api.EventDispatcher)`                              | Registers SSE handlers for cache updates (call before SSE start)    |
-| `ReconcileHandler`      | `() reconcile.ReconcileHandler`                                  | Returns a handler that updates cache on metadata/data/secret drift  |
+| `ReconcileHandler`      | `() reconcile.ReconcileHandler`                                  | Returns a handler that feeds the cache from the snapshot `state` block |
 
 ### Lifecycle
 
@@ -421,6 +421,24 @@ Deletes a report entry and its persisted file.
 | `404`  | Key not found  |
 | `500`  | Internal error |
 
+### GET /v1/policies
+
+Returns the active merged policy block — a single
+`{revision_id, fingerprint, rules[]}` object, not an array. Returns an empty
+object `{}` when no policy is active (or no policy provider is wired).
+
+**Response** `200 OK`:
+
+```json
+{
+  "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
+  "fingerprint": "j7Hn2mF0oQ9rXcV8yZ1aB4cD6eF8gH0iJ2kL4mN6oM=",
+  "rules": [
+    { "action": "allow", "protocol": "tcp", "source_cidr": "10.99.0.0/24", "destination_cidr": "0.0.0.0/0", "ports": { "from": 443, "to": 443 } }
+  ]
+}
+```
+
 ## SSE Event Handlers
 
 `RegisterEventHandlers` registers two SSE event handlers with an `api.EventDispatcher`:
@@ -472,13 +490,18 @@ Register the reconcile handler before starting the reconciliation loop:
 reconciler.RegisterHandler(srv.ReconcileHandler())
 ```
 
-The handler updates the cache when drift is detected in:
+The handler runs when `diff.StateChanged` and feeds the cache from the snapshot
+`state` block:
 
-| Diff Field          | Cache Update         |
-|---------------------|----------------------|
-| `MetadataChanged`   | `UpdateMetadata`     |
-| `DataChanged`       | `UpdateData`         |
-| `SecretRefsChanged` | `UpdateSecretIndex`  |
+| Snapshot input          | Cache Update       | Conversion                                                        |
+|-------------------------|--------------------|-------------------------------------------------------------------|
+| `state.metadata` bucket | `UpdateMetadata`   | Entry `key`/`value` pairs become the metadata map                 |
+| `state.data` bucket     | `UpdateData`       | Each opaque string `value` is JSON-encoded into a `DataEntry` payload with content type `text/plain; charset=utf-8` |
+
+A `null` `state` block authoritatively clears both the metadata map and the data
+entries. The secret index is **not** fed here — it no longer rides the snapshot
+and is updated only by the `node_secrets_updated` SSE event until the envelope
+issues #24/#25 land.
 
 ### ControlPlane Client
 
@@ -736,12 +759,12 @@ The `.spec` (including `nodeId`, `meshIp`, `metadata`, `data`, `secretRefs`) is 
 
 ### Downstream Sync (Control Plane to Node)
 
-1. On initial connect, plexd fetches the full node state from `GET /v1/nodes/{node_id}/state` (the same reconciliation endpoint, extended with `metadata`, `data`, and `secretRefs` fields). Secret values are not included -- only names and versions.
+1. On initial connect, plexd fetches the node state from `GET /v1/nodes/{node_id}/state` (the reconciliation endpoint). The `NodeStateSnapshot` `state` block feeds the cache: its `metadata` bucket becomes the metadata map and its `data` bucket becomes the cached data entries. Secret references no longer ride the snapshot.
 2. During steady state, the control plane pushes `node_state_updated` and `node_secrets_updated` SSE events when state changes.
 3. `node_state_updated` contains the updated metadata and data entries inline (same signed envelope as all SSE events).
 4. `node_secrets_updated` contains only secret names and versions - **never secret values** (neither plaintext nor ciphertext). This event updates the local secret index so that listing endpoints reflect the current state.
 5. Secret values are fetched **on demand** when a consumer requests them via `GET /v1/state/secrets/{key}`. plexd proxies to `GET /v1/nodes/{node_id}/secrets/{key}` on the control plane, which returns the NSK-encrypted ciphertext. plexd decrypts with the local NSK and returns the plaintext to the authorized caller. No plaintext is persisted.
-6. The reconciliation loop compares local state cache (metadata, data, secret index) against the control plane, correcting any drift. Secret values are not part of reconciliation -- they are always fetched live.
+6. The reconciliation loop compares the local state cache (metadata and data, from the snapshot `state` block) against the control plane, correcting any drift. The secret index is fed by the `node_secrets_updated` SSE event, not by reconciliation, and secret values are always fetched live.
 
 ### Upstream Sync (Node to Control Plane)
 

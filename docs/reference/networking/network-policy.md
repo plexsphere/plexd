@@ -6,9 +6,11 @@ feature: PXD-0008
 
 # Network Policy Enforcement
 
-The `internal/policy` package enforces network policies on mesh nodes. It evaluates policies from the control plane to determine peer visibility (which peers a node can communicate with) and generates iptables firewall rules for packet-level enforcement.
+The `internal/policy` package enforces network policies on mesh nodes. It translates the control plane's merged policy — a single `{revision_id, fingerprint, rules[]}` block on the `NodeStateSnapshot` envelope — into concrete nftables firewall rules for packet-level enforcement.
 
 The package integrates with `internal/reconcile` for periodic convergence and with `internal/api` for real-time SSE-driven policy updates.
+
+> **Peer membership is not a policy concern.** WireGuard peer visibility comes solely from the snapshot `peers` block, applied by `wireguard.ReconcileHandler`. The policy package no longer filters peers: node-ID rule matching and `FilterPeers` have been removed, and policy rules are CIDR-scoped rather than node-ID-scoped.
 
 ## Data Flow
 
@@ -16,25 +18,22 @@ The package integrates with `internal/reconcile` for periodic convergence and wi
 Control Plane
       │
       ▼
-┌─────────────┐     ┌──────────────┐
-│ StateResponse│────▶│ PolicyEngine │
-│  .Policies   │     └──────┬───────┘
-│  .Peers      │            │
-└─────────────┘     ┌───────┴────────┐
-                    │                │
-                    ▼                ▼
-            ┌────────────┐   ┌────────────────┐
-            │ FilterPeers│   │BuildFirewallRules│
-            └─────┬──────┘   └───────┬─────────┘
-                  │                  │
-                  ▼                  ▼
-            ┌──────────┐     ┌──────────────────┐
-            │ WireGuard│     │FirewallController │
-            │ Manager  │     │  (iptables/nft)   │
-            └──────────┘     └──────────────────┘
+┌──────────────────┐     ┌──────────────┐
+│ NodeStateSnapshot│────▶│ PolicyEngine │
+│  .Policy         │     └──────┬───────┘
+│  (merged block)  │            │
+└──────────────────┘            ▼
+                        ┌──────────────────┐
+                        │BuildFirewallRules│
+                        └───────┬──────────┘
+                                ▼
+                        ┌──────────────────┐
+                        │FirewallController │
+                        │      (nft)        │
+                        └──────────────────┘
 ```
 
-Policies flow from the control plane via `api.StateResponse`. The `PolicyEngine` evaluates them to produce two outputs: a filtered peer list (fed to `wireguard.Manager`) and firewall rules (applied via `FirewallController`). The `Enforcer` orchestrates both paths, and `ReconcileHandler` wires it into the reconciliation loop.
+The merged policy flows from the control plane via `NodeStateSnapshot.Policy`. The `PolicyEngine` converts its five-tuple rules into `FirewallRule` entries, and the `Enforcer` applies them via the `FirewallController`. `ReconcileHandler` wires it into the reconciliation loop, rebuilding the ruleset only when the policy fingerprint changes.
 
 ## Config
 
@@ -75,19 +74,23 @@ type FirewallRule struct {
     SrcIP     string // source IP (CIDR or single IP)
     DstIP     string // destination IP (CIDR or single IP)
     Port      int    // destination port (0 = any)
-    Protocol  string // "tcp", "udp", or "" (any)
+    PortTo    int    // inclusive end of a destination port range, 0 means single-Port match
+    Protocol  string // "tcp", "udp", "icmp", or "" (any)
     Action    string // "allow" or "deny"
 }
 ```
 
+`PortTo` carries the inclusive end of a destination port range, mapping to an nftables range match; `0` means a single-port match on `Port`.
+
 ### Validation Rules
 
-| Field      | Rule                                 | Error Message                                      |
-|------------|--------------------------------------|----------------------------------------------------|
-| `Action`   | Must be `"allow"` or `"deny"`        | `policy: firewall rule: invalid action "..."`      |
-| `Port`     | Must be 0–65535                      | `policy: firewall rule: invalid port N`            |
-| `Protocol` | Must be `""`, `"tcp"`, or `"udp"`    | `policy: firewall rule: invalid protocol "..."`    |
-| `Port`     | Requires protocol if > 0            | `policy: firewall rule: port N requires a protocol`|
+| Field      | Rule                                          | Error Message                                                    |
+|------------|-----------------------------------------------|------------------------------------------------------------------|
+| `Action`   | Must be `"allow"` or `"deny"`                 | `policy: firewall rule: invalid action "..."`                    |
+| `Port`     | Must be 0–65535                               | `policy: firewall rule: invalid port N`                          |
+| `Protocol` | Must be `""`, `"tcp"`, `"udp"`, or `"icmp"`   | `policy: firewall rule: invalid protocol "..."`                  |
+| `Port`     | Requires `tcp`/`udp` if > 0                   | `policy: firewall rule: port N requires protocol tcp or udp`     |
+| `PortTo`   | Requires a start port and `Port ≤ PortTo ≤ 65535` | `policy: firewall rule: port range end N requires a start port` / `... invalid port range end N` |
 
 ## FirewallController
 
@@ -111,7 +114,7 @@ type FirewallController interface {
 
 ## PolicyEngine
 
-Evaluates network policies to determine peer visibility and generate firewall rules.
+Translates the merged policy's rules into concrete firewall rules for the local node.
 
 ### Constructor
 
@@ -121,42 +124,18 @@ func NewPolicyEngine(logger *slog.Logger) *PolicyEngine
 
 Logger is tagged with `component=policy`.
 
-### FilterPeers
-
-```go
-func (e *PolicyEngine) FilterPeers(peers []api.Peer, policies []api.Policy, localNodeID string) []api.Peer
-```
-
-Returns the subset of peers the local node is allowed to communicate with.
-
-| Scenario           | Behavior                                                    |
-|--------------------|-------------------------------------------------------------|
-| No policies        | No peers returned (deny-by-default)                         |
-| Allow rules exist  | Only peers matching a bidirectional allow rule are returned  |
-| Deny-only rules    | No peers returned (deny does not grant visibility)          |
-| Wildcard `"*"`     | Matches any node ID in src or dst position                  |
-
-**Bidirectional matching**: A peer is visible if any allow rule references both the local node and the peer in either `Src`/`Dst` direction. This means `{Src: "node-A", Dst: "node-B", Action: "allow"}` allows communication in both directions.
-
 ### BuildFirewallRules
 
 ```go
-func (e *PolicyEngine) BuildFirewallRules(
-    policies []api.Policy,
-    localNodeID string,
-    iface string,
-    peersByID map[string]string,
-) []FirewallRule
+func (e *PolicyEngine) BuildFirewallRules(rules []api.PolicyRule, iface string) []FirewallRule
 ```
 
-Converts `api.PolicyRule` entries into concrete `FirewallRule` entries for the local node.
+Converts the merged policy's five-tuple `api.PolicyRule` entries into concrete `FirewallRule` entries for the local node. Each `PolicyRule` carries `{action, protocol, source_cidr, destination_cidr, ports?}`; the CIDR fields map directly to `SrcIP`/`DstIP`, and the `{from, to}` port range maps to `Port`/`PortTo` (a single port when `from == to`).
 
-- `peersByID` maps peer IDs to mesh IPs for address resolution
-- Only rules where `Src` or `Dst` matches `localNodeID` (or `"*"`) are included
-- Wildcard `"*"` resolves to `"0.0.0.0/0"` in the generated firewall rule
-- Rules with invalid protocols (not `""`, `"tcp"`, or `"udp"`) are skipped with a warning log
-- A default-deny rule dropping all traffic on the interface is appended as the last rule
-- Rules referencing unknown peer IDs produce rules with empty IP fields
+- **Action** — `allow` and `deny` are kept. A `log` action is observational only: nftables has no log verdict and skipping it cannot change the accept/drop outcome, so `log` rules are **skipped with a warning**. Unknown actions are also skipped.
+- **Protocol** — `tcp`, `udp`, and `icmp` are kept; `any` maps to `""` (match all); unknown protocols are skipped with a warning.
+- **Ports** — valid only for `tcp`/`udp`. A rule that sets `ports` on a portless protocol (`icmp`/`any`) violates the contract and is skipped with a warning.
+- A default-deny rule dropping all traffic on the interface is always appended as the last rule — including when `rules` is empty or `nil` — giving a deny-by-default posture.
 
 ## Enforcer
 
@@ -174,23 +153,24 @@ func NewEnforcer(
 ```
 
 - Applies config defaults via `cfg.ApplyDefaults()`
-- `firewall` may be `nil` — only peer filtering is functional in that case
+- `firewall` may be `nil` — `ApplyFirewallRules` is a no-op in that case
 
 ### Methods
 
-| Method              | Signature                                                                                  | Description                                             |
-|---------------------|--------------------------------------------------------------------------------------------|---------------------------------------------------------|
-| `FilterPeers`       | `(peers []api.Peer, policies []api.Policy, localNodeID string) []api.Peer`                | Filters peers; passthrough when disabled                |
-| `ApplyFirewallRules` | `(policies []api.Policy, localNodeID string, iface string, peersByID map[string]string) error` | Builds and applies rules; no-op when disabled or nil firewall |
-| `Teardown`          | `() error`                                                                                 | Flushes and deletes firewall chain; safe with nil firewall |
+| Method              | Signature                                                     | Description                                                        |
+|---------------------|---------------------------------------------------------------|-------------------------------------------------------------------|
+| `ApplyFirewallRules` | `(policy *api.PolicySnapshot, iface string) (bool, error)`   | Builds and applies rules; no-op when disabled or nil firewall. A `nil` policy yields the default-deny-only ruleset. The `bool` reports whether the ruleset actually reached the kernel |
+| `Teardown`          | `() error`                                                    | Flushes and deletes firewall chain; safe with nil firewall        |
+
+The `bool` exists so callers cannot log an enforcement that never happened: both no-op paths return `(false, nil)`, which is indistinguishable from a successful apply on the error value alone.
 
 ### Behavior by State
 
-| `Enabled` | `firewall` | `FilterPeers`        | `ApplyFirewallRules` | `Teardown`  |
-|-----------|------------|----------------------|----------------------|-------------|
-| `true`    | non-nil    | Engine-filtered      | Rules applied        | Chain removed |
-| `true`    | `nil`      | Engine-filtered      | No-op (warn logged)  | No-op       |
-| `false`   | any        | All peers returned   | No-op                | No-op/chain removed |
+| `Enabled` | `firewall` | `ApplyFirewallRules` | `Teardown`          |
+|-----------|------------|----------------------|---------------------|
+| `true`    | non-nil    | Rules applied, `(true, nil)`  | Chain removed       |
+| `true`    | `nil`      | No-op, `(false, nil)`         | No-op               |
+| `false`   | any        | No-op, `(false, nil)`         | No-op/chain removed |
 
 ### Error Prefixes
 
@@ -199,55 +179,42 @@ func NewEnforcer(
 | `ApplyFirewallRules`| `policy: enforce: ` |
 | `Teardown`          | `policy: teardown: `|
 
+A ruleset the engine refuses to translate is additionally wrapped in the sentinel `ErrInvalidRuleset`, so callers can distinguish a permanently broken revision (`errors.Is(err, policy.ErrInvalidRuleset)`) from a transient netlink failure. The backend is never touched in that case — the previously installed chain stays in place.
+
 ## ReconcileHandler
 
-Factory function returning a `reconcile.ReconcileHandler` that enforces policies during reconciliation cycles.
+Factory function returning a `reconcile.ReconcileHandler` that rebuilds the firewall ruleset during reconciliation cycles.
 
 ```go
-func ReconcileHandler(
-    enforcer *Enforcer,
-    wgMgr *wireguard.Manager,
-    localNodeID, localMeshIP, iface string,
-) reconcile.ReconcileHandler
+func ReconcileHandler(enforcer *Enforcer, iface string) reconcile.ReconcileHandler
 ```
 
-The returned handler maintains an internal `allowedPeers` map (closure state) that tracks which peers are currently added to WireGuard, enabling incremental add/remove across cycles.
+The handler does not touch WireGuard peers — peer membership is owned by `wireguard.ReconcileHandler`. It only rebuilds nftables rules from the merged policy.
 
 ### Processing Order
 
-1. **Skip check** — if `StateDiff` contains no policy or peer changes, return `nil`
-2. **Filter peers** — evaluate policies via `Enforcer.FilterPeers`
-3. **Apply firewall rules** — via `Enforcer.ApplyFirewallRules`
-4. **Remove revoked peers** — peers in `allowedPeers` but not in the new filtered set are removed via `wgMgr.RemovePeerByID`
-5. **Add new peers** — peers in the new filtered set but not in `allowedPeers` are added via `wgMgr.AddPeer`
-6. **Update state** — `allowedPeers` is replaced with the new set
+1. **Skip check** — if `!diff.PolicyChanged`, return `nil`
+2. **Fingerprint check** — a populated policy block with an empty `fingerprint` logs a warning: the differ treats it as always-changed, so the ruleset is rebuilt every cycle
+3. **Apply firewall rules** — call `Enforcer.ApplyFirewallRules(desired.Policy, iface)`
+4. **Log** — emit `"policy ruleset applied"` with `revision_id`, `fingerprint`, and rule count, but **only** when the enforcer reports the ruleset reached the kernel. A disabled config or a missing firewall backend logs at debug level instead, so the applied-log never claims an enforcement that did not happen
 
-### Drift Detection
+### Fingerprint Short-Circuit
 
-The handler checks `StateDiff` for any of:
-
-| Field              | Triggers Handler |
-|--------------------|-----------------|
-| `PeersToAdd`       | Yes             |
-| `PeersToRemove`    | Yes             |
-| `PeersToUpdate`    | Yes             |
-| `PoliciesToAdd`    | Yes             |
-| `PoliciesToRemove` | Yes             |
-
-If none of these fields are populated, the handler is a no-op.
+`diff.PolicyChanged` is set by the differ, which compares the policy `Fingerprint` byte-for-byte and **never re-derives it from the rules**. A revision-only bump (same fingerprint) leaves `PolicyChanged` false, so this handler — and its `"policy ruleset applied"` log — does not fire and the ruleset is not rebuilt. Only a genuine fingerprint change reapplies rules.
 
 ### Error Handling
 
-Individual failures (firewall apply, peer remove, peer add) are collected and returned as an aggregated error via `errors.Join`. This ensures the reconciler marks the cycle as failed and retries.
+Transient `ApplyFirewallRules` failures (netlink, chain creation) propagate so the reconciler holds the snapshot back and retries the ruleset next cycle.
+
+`ErrInvalidRuleset` does **not** propagate. Rules the engine cannot translate are a permanent property of the revision, so returning the error would hold the snapshot back and re-run every handler at the reconcile interval forever, with no chance of the same rules parsing on a later attempt. The handler logs `"policy revision rejected, keeping previous ruleset"` at error level and returns `nil` so the rest of the snapshot converges. The firewall keeps the last successfully applied ruleset, which is fail-closed; the rejected revision is retried only when the control plane publishes a new fingerprint.
 
 ### Registration
 
 ```go
 enforcer := policy.NewEnforcer(engine, fwCtrl, policy.Config{}, logger)
-mgr := wireguard.NewManager(ctrl, wireguard.Config{}, logger)
 
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(policy.ReconcileHandler(enforcer, mgr, nodeID, meshIP, "plexd0"))
+r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
 ```
 
 ## HandlePolicyUpdated
@@ -281,12 +248,11 @@ dispatcher.Register(api.EventPolicyUpdated, policy.HandlePolicyUpdated(reconcile
 
 > **Note:** The policy enforcement model is under active development. The behavior described here reflects the current design and may change in future versions.
 
-- Policies are pushed by the control plane via the `policy_updated` SSE event. plexd does not poll for policy changes — they are applied as soon as received (and verified via signature).
-- Filtering operates at **L3/L4** (IP, port, protocol) on the `plexd0` mesh interface using **nftables** rules.
-- The default stance is **deny-all**: no mesh traffic is permitted unless explicitly allowed by a policy rule.
-- **Peer visibility filtering:** In addition to firewall rules, plexd controls which peers are configured in the WireGuard interface. Peers not authorized by policy are not added to the interface, preventing even handshake-level communication.
-- Policy rules are scoped to mesh IPs (10.100.x.x/32) and cannot reference external IPs or hostnames.
-- On policy update, plexd computes a diff against the current nftables ruleset and applies only the changes (add/remove rules), minimizing disruption.
+- Policy changes are signalled by the control plane via the `policy_updated` SSE event, which triggers a reconcile; the merged policy itself is pulled in the `NodeStateSnapshot` envelope.
+- Filtering operates at **L3/L4** (CIDR, port, protocol) on the `plexd0` mesh interface using **nftables** rules.
+- The default stance is **deny-all**: the ruleset always ends with a default-deny rule, and a `null` policy applies the default-deny-only ruleset.
+- Peer membership is **not** governed by policy — it comes from the snapshot `peers` block via `wireguard.ReconcileHandler`. Policy rules are CIDR-scoped five-tuples, not node-ID references.
+- On a genuine policy change (fingerprint mismatch), plexd rebuilds the nftables ruleset from the merged policy. Revision-only bumps short-circuit and leave the ruleset untouched.
 
 ## Integration Points
 
@@ -297,32 +263,23 @@ The policy reconcile handler plugs into `internal/reconcile` alongside the WireG
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(mgr))
-r.RegisterHandler(policy.ReconcileHandler(enforcer, mgr, nodeID, meshIP, "plexd0"))
+r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
 ```
 
 ### SSE Real-Time Updates
 
-`HandlePolicyUpdated` triggers reconciliation when the control plane pushes a `policy_updated` event. The reconciliation cycle then fetches fresh state and re-evaluates all policies.
-
-### WireGuard Manager
-
-The policy handler uses `wireguard.Manager` to add and remove peers:
-
-| Manager Method    | Used When                                |
-|-------------------|------------------------------------------|
-| `AddPeer`         | A peer becomes allowed by policy change  |
-| `RemovePeerByID`  | A peer is revoked by policy change       |
+`HandlePolicyUpdated` triggers reconciliation when the control plane pushes a `policy_updated` event. The reconciliation cycle then pulls a fresh snapshot and re-applies the merged policy if its fingerprint changed.
 
 ### Control Plane Types
 
-| Type             | Package        | Usage                              |
-|------------------|----------------|------------------------------------|
-| `api.Peer`       | `internal/api` | Peer identity and WireGuard config |
-| `api.Policy`     | `internal/api` | Policy with ID and rules           |
-| `api.PolicyRule` | `internal/api` | Src, Dst, Port, Protocol, Action   |
-| `api.StateResponse` | `internal/api` | Desired state from control plane |
-| `api.SignedEnvelope` | `internal/api` | SSE event wrapper                |
-| `api.EventPolicyUpdated` | `internal/api` | Event type constant `"policy_updated"` |
+| Type             | Package        | Usage                                                     |
+|------------------|----------------|-----------------------------------------------------------|
+| `api.PolicySnapshot` | `internal/api` | Merged policy block `{revision_id, fingerprint, rules[]}` |
+| `api.PolicyRule` | `internal/api` | Five-tuple: `action`, `protocol`, `source_cidr`, `destination_cidr`, `ports?` |
+| `api.PortRange`  | `internal/api` | Inclusive destination port range `{from, to}`             |
+| `api.NodeStateSnapshot` | `internal/api` | Desired-state envelope from the control plane        |
+| `api.SignedEnvelope` | `internal/api` | SSE event wrapper                                     |
+| `api.EventPolicyUpdated` | `internal/api` | Event type constant `"policy_updated"`            |
 
 ### Graceful Shutdown
 

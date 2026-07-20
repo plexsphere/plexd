@@ -202,23 +202,29 @@ closed `nat_type` enum, clock-skew tolerance, and a routable `ip:port`.
 
 ### `GET /v1/nodes/{id}/state`
 
-Returns the active `StateResponse` fixture. By default this is an enriched fixture containing two peers, one policy with two rules, metadata, signing keys, all feature config sections, sample data entries, and secret references. The active fixture can be replaced at runtime via `POST /test/configure-state`.
+Returns the active `NodeStateSnapshot` fixture built by `newStateFixture`. By
+default it is an enriched envelope containing two peers, a merged policy with two
+rules, the `reachability` projection, all four bridge subtrees, and the `state`
+and `reports` blocks (which mirror one another). The active fixture can be
+replaced at runtime via `POST /test/configure-state`.
 
-**Default fixture fields:**
+**Default fixture blocks:**
 
-| Field | Default Value |
+| Block | Default Value |
 |-------|---------------|
-| `peers` | 2 mesh peers (`peer-001`, `peer-002`) |
-| `policies` | 1 policy (`policy-001`) with 2 rules |
-| `metadata` | `{"environment":"e2e-test","region":"mock-region-1"}` |
-| `signing_keys` | `current`: base64 Ed25519 mock key |
-| `bridge_config` | `enabled: true`, `access_subnets: ["192.168.100.0/24"]`, NAT and forwarding enabled |
-| `relay_config` | 1 relay session assignment (`relay-sess-001`) |
-| `user_access_config` | `enabled: true`, interface `wg-access0`, 1 peer |
-| `ingress_config` | `enabled: true`, 1 rule (`ingress-001`, port 443) |
-| `site_to_site_config` | `enabled: true`, 1 tunnel (`s2s-001`) |
-| `data` | 2 entries: `app/config` (JSON) and `certs/ca` (PEM) |
-| `secret_refs` | 2 refs: `db-password` (v1) and `tls-private-key` (v3) |
+| `peers` | 2 mesh peers (node_id ascending), no `psk`/`allowed_ips`/`endpoint` |
+| `reachability` | opaque `{"state":"healthy", ...}` projection |
+| `policy` | merged block: 2 rules, `fingerprint` from `policyFingerprint` |
+| `bridge.relay` | 1 relay session assignment (`relay-sess-001`) |
+| `bridge.user_access` | `enabled: true`, interface `wg-access0`, 1 peer |
+| `bridge.ingress` | `enabled: true`, 1 rule (`ingress-001`, port 443) |
+| `bridge.site_to_site` | `enabled: true`, 1 tunnel (`s2s-001`) |
+| `state` / `reports` | `metadata` (2 entries), `data` (2 entries), `reports` (`[]`) |
+
+The `fingerprint` is produced by the mock-internal `policyFingerprint` helper — a
+44-char base64 SHA-256 over the compact-JSON encoding of the rules slice. This
+canonicalization is mock-internal: plexd treats the fingerprint as an opaque
+comparison key and never re-derives it from the rules.
 
 **Response:** `200 OK`
 
@@ -226,124 +232,110 @@ Returns the active `StateResponse` fixture. By default this is an enriched fixtu
 {
   "peers": [
     {
-      "id": "peer-001",
-      "public_key": "wg-pub-key-peer-001",
+      "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
       "mesh_ip": "10.99.0.2",
-      "endpoint": "203.0.113.1:51820",
-      "allowed_ips": ["10.99.0.2/32"],
-      "psk": "mock-psk-001"
+      "public_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+      "fallback_endpoint": "203.0.113.1:51820"
     },
     {
-      "id": "peer-002",
-      "public_key": "wg-pub-key-peer-002",
+      "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
       "mesh_ip": "10.99.0.3",
-      "endpoint": "203.0.113.2:51820",
-      "allowed_ips": ["10.99.0.3/32"],
-      "psk": "mock-psk-002"
+      "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
     }
   ],
-  "policies": [
-    {
-      "id": "policy-001",
+  "reachability": {"state": "healthy", "changed_at": "2026-01-01T00:00:00Z"},
+  "policy": {
+    "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
+    "fingerprint": "<44-char base64 SHA-256>",
+    "rules": [
+      {
+        "action": "allow",
+        "protocol": "any",
+        "source_cidr": "10.99.0.0/24",
+        "destination_cidr": "10.99.0.0/24"
+      },
+      {
+        "action": "allow",
+        "protocol": "tcp",
+        "source_cidr": "10.99.0.0/24",
+        "destination_cidr": "0.0.0.0/0",
+        "ports": {"from": 443, "to": 443}
+      }
+    ]
+  },
+  "bridge": {
+    "relay": {
+      "sessions": [
+        {
+          "session_id": "relay-sess-001",
+          "peer_a_id": "peer-001",
+          "peer_a_endpoint": "203.0.113.1:51820",
+          "peer_b_id": "peer-003",
+          "peer_b_endpoint": "203.0.113.3:51820",
+          "expires_at": "2099-12-31T23:59:59Z"
+        }
+      ]
+    },
+    "user_access": {
+      "enabled": true,
+      "interface_name": "wg-access0",
+      "listen_port": 51821,
+      "peers": [
+        {
+          "public_key": "ua-pub-key-001",
+          "allowed_ips": ["10.100.0.1/32"],
+          "label": "admin-laptop"
+        }
+      ]
+    },
+    "ingress": {
+      "enabled": true,
       "rules": [
         {
-          "src": "10.99.0.0/24",
-          "dst": "10.99.0.0/24",
-          "port": 0,
-          "protocol": "any",
-          "action": "allow"
-        },
+          "rule_id": "ingress-001",
+          "listen_port": 443,
+          "target_addr": "10.99.0.2:8443",
+          "mode": "tcp"
+        }
+      ]
+    },
+    "site_to_site": {
+      "enabled": true,
+      "tunnels": [
         {
-          "src": "10.99.0.0/24",
-          "dst": "0.0.0.0/0",
-          "port": 443,
-          "protocol": "tcp",
-          "action": "allow"
+          "tunnel_id": "s2s-001",
+          "remote_endpoint": "198.51.100.1:51820",
+          "remote_public_key": "s2s-remote-pub-key-001",
+          "local_subnets": ["10.99.0.0/24"],
+          "remote_subnets": ["172.16.0.0/16"],
+          "interface_name": "wg-s2s0",
+          "listen_port": 51822
         }
       ]
     }
-  ],
-  "signing_keys": {
-    "current": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
   },
-  "metadata": {
-    "environment": "e2e-test",
-    "region": "mock-region-1"
+  "state": {
+    "metadata": [
+      {"key": "environment", "value": "e2e-test"},
+      {"key": "region", "value": "mock-region-1"}
+    ],
+    "data": [
+      {"key": "app/config", "value": "{\"log_level\":\"info\",\"max_conns\":100}"},
+      {"key": "certs/ca", "value": "-----BEGIN CERTIFICATE-----\nmock-ca-cert\n-----END CERTIFICATE-----"}
+    ],
+    "reports": []
   },
-  "bridge_config": {
-    "access_subnets": ["192.168.100.0/24"],
-    "enable_nat": true,
-    "enable_forwarding": true
-  },
-  "relay_config": {
-    "sessions": [
-      {
-        "session_id": "relay-sess-001",
-        "peer_a_id": "peer-001",
-        "peer_a_endpoint": "203.0.113.1:51820",
-        "peer_b_id": "peer-003",
-        "peer_b_endpoint": "203.0.113.3:51820",
-        "expires_at": "2099-12-31T23:59:59Z"
-      }
-    ]
-  },
-  "user_access_config": {
-    "enabled": true,
-    "interface_name": "wg-access0",
-    "listen_port": 51821,
-    "peers": [
-      {
-        "public_key": "ua-pub-key-001",
-        "allowed_ips": ["10.100.0.1/32"],
-        "label": "admin-laptop"
-      }
-    ]
-  },
-  "ingress_config": {
-    "enabled": true,
-    "rules": [
-      {
-        "rule_id": "ingress-001",
-        "listen_port": 443,
-        "target_addr": "10.99.0.2:8443",
-        "mode": "tcp"
-      }
-    ]
-  },
-  "site_to_site_config": {
-    "enabled": true,
-    "tunnels": [
-      {
-        "tunnel_id": "s2s-001",
-        "remote_endpoint": "198.51.100.1:51820",
-        "remote_public_key": "s2s-remote-pub-key-001",
-        "local_subnets": ["10.99.0.0/24"],
-        "remote_subnets": ["172.16.0.0/16"],
-        "interface_name": "wg-s2s0",
-        "listen_port": 51822
-      }
-    ]
-  },
-  "data": [
-    {
-      "key": "app/config",
-      "content_type": "application/json",
-      "payload": {"log_level": "info", "max_conns": 100},
-      "version": 1,
-      "updated_at": "2025-01-01T00:00:00Z"
-    },
-    {
-      "key": "certs/ca",
-      "content_type": "application/x-pem-file",
-      "payload": "-----BEGIN CERTIFICATE-----\nmock-ca-cert\n-----END CERTIFICATE-----",
-      "version": 2,
-      "updated_at": "2025-01-15T12:00:00Z"
-    }
-  ],
-  "secret_refs": [
-    {"key": "db-password", "version": 1},
-    {"key": "tls-private-key", "version": 3}
-  ]
+  "reports": {
+    "metadata": [
+      {"key": "environment", "value": "e2e-test"},
+      {"key": "region", "value": "mock-region-1"}
+    ],
+    "data": [
+      {"key": "app/config", "value": "{\"log_level\":\"info\",\"max_conns\":100}"},
+      {"key": "certs/ca", "value": "-----BEGIN CERTIFICATE-----\nmock-ca-cert\n-----END CERTIFICATE-----"}
+    ],
+    "reports": []
+  }
 }
 ```
 
@@ -414,7 +406,6 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "key_rotate_count": 0,
   "capabilities_count": 0,
   "endpoint_count": 0,
-  "drift_count": 0,
   "secrets_count": 0,
   "report_count": 0,
   "execution_ack_count": 0,
@@ -466,15 +457,18 @@ Broadcasts a `SignedEnvelope` to all connected SSE clients. The request body is 
 
 ### `POST /test/configure-state`
 
-Replaces the active `StateResponse` fixture at runtime. Subsequent calls to `GET /v1/nodes/{id}/state` return the configured state instead of the default. The `state_count` counter continues to increment regardless of which fixture is active.
+Replaces the active `NodeStateSnapshot` fixture at runtime. Subsequent calls to `GET /v1/nodes/{id}/state` return the configured state instead of the default. The `state_count` counter continues to increment regardless of which fixture is active.
 
-**Request body:** A full `api.StateResponse` JSON object (same schema as the `GET /v1/nodes/{id}/state` response).
+**Request body:** A full `api.NodeStateSnapshot` JSON object (same schema as the `GET /v1/nodes/{id}/state` response).
 
 ```json
 {
   "peers": [],
-  "policies": [],
-  "metadata": {"custom": "value"}
+  "reachability": null,
+  "policy": null,
+  "bridge": null,
+  "state": {"metadata": [{"key": "custom", "value": "value"}], "data": [], "reports": []},
+  "reports": null
 }
 ```
 
@@ -484,12 +478,12 @@ Replaces the active `StateResponse` fixture at runtime. Subsequent calls to `GET
 
 - The replacement is atomic — concurrent readers never see a partial update
 - The state fixture is protected by `sync.RWMutex`
-- Any valid `StateResponse` JSON is accepted, including minimal objects with empty fields
+- Any valid `NodeStateSnapshot` JSON is accepted, including minimal objects with `null` blocks
 - Request body is captured and retrievable via `GET /test/last-request/configure_state`
 
 **Error:** Returns `400` if the request body is not valid JSON. Returns `405` if the HTTP method is not `POST`.
 
-**Go API:** The `Server` also exposes `SetState(api.StateResponse)` and `GetState() api.StateResponse` methods for direct use in Go test code without HTTP.
+**Go API:** The `Server` also exposes `SetState(api.NodeStateSnapshot)` and `GetState() api.NodeStateSnapshot` methods for direct use in Go test code without HTTP.
 
 ### `PUT /test/state`
 
@@ -604,7 +598,6 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `key_rotate_count` | `POST /v1/keys/rotate` |
 | `capabilities_count` | `PUT /v1/nodes/{id}/capabilities` |
 | `endpoint_count` | `PUT /v1/nodes/{id}/endpoint` |
-| `drift_count` | `POST /v1/nodes/{id}/drift` |
 | `secrets_count` | `GET /v1/nodes/{id}/secrets/{key}` |
 | `report_count` | `POST /v1/nodes/{id}/report` |
 | `execution_ack_count` | `POST /v1/nodes/{id}/executions/{eid}/ack` |
@@ -630,18 +623,17 @@ All responses use the same JSON field names as the types in `internal/api`:
 - `RegisterResponse` — `internal/api.RegisterResponse`
 - `RegisterPeer` — `internal/api.RegisterPeer`
 - `HeartbeatResponse` — `internal/api.HeartbeatResponse`
-- `StateResponse` — `internal/api.StateResponse`
+- `NodeStateSnapshot` — `internal/api.NodeStateSnapshot`
+- `SnapshotPeer` — `internal/api.SnapshotPeer`
+- `PolicySnapshot` / `PolicyRule` / `PortRange` — `internal/api.PolicySnapshot` / `internal/api.PolicyRule` / `internal/api.PortRange`
+- `BridgeSnapshot` — `internal/api.BridgeSnapshot`
+- `NodeStateBlock` / `StateEntry` — `internal/api.NodeStateBlock` / `internal/api.StateEntry`
 - `SignedEnvelope` — `internal/api.SignedEnvelope`
 - `Peer` — `internal/api.Peer`
-- `Policy` / `PolicyRule` — `internal/api.Policy` / `internal/api.PolicyRule`
-- `SigningKeys` — `internal/api.SigningKeys`
-- `BridgeConfig` — `internal/api.BridgeConfig`
 - `RelayConfig` / `RelaySessionAssignment` — `internal/api.RelayConfig` / `internal/api.RelaySessionAssignment`
 - `UserAccessConfig` / `UserAccessPeer` — `internal/api.UserAccessConfig` / `internal/api.UserAccessPeer`
 - `IngressConfig` / `IngressRule` — `internal/api.IngressConfig` / `internal/api.IngressRule`
 - `SiteToSiteConfig` / `SiteToSiteTunnel` — `internal/api.SiteToSiteConfig` / `internal/api.SiteToSiteTunnel`
-- `DataEntry` — `internal/api.DataEntry`
-- `SecretRef` — `internal/api.SecretRef`
 
 ## Dockerfile
 

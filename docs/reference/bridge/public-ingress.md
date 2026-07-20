@@ -263,10 +263,10 @@ dispatcher.Register(api.EventIngressConfigUpdated,
 func IngressReconcileHandler(mgr *IngressManager, logger *slog.Logger) reconcile.ReconcileHandler
 ```
 
-Returns a `reconcile.ReconcileHandler` that synchronizes ingress rules to match the desired `IngressConfig`:
+Returns a `reconcile.ReconcileHandler` that synchronizes ingress rules to match the desired bridge ingress subtree. The handler is **presence-aware**: a `null` `Bridge` or `null` `Ingress` child means "not populated", so it reconciles against an empty desired set and tears down stale rules.
 
-1. If `desired.IngressConfig` is nil, returns nil (no-op)
-2. Builds a desired set from `desired.IngressConfig.Rules` keyed by `RuleID`
+1. Reads rules from `desired.Bridge.Ingress.Rules` (empty when `Bridge` or `Ingress` is nil)
+2. Builds a desired set keyed by `RuleID`
 3. Removes stale rules: current rule IDs not in the desired set
 4. Adds missing rules: desired rules not in the current set
 5. Aggregates `AddRule` errors via `errors.Join`
@@ -275,7 +275,6 @@ Returns a `reconcile.ReconcileHandler` that synchronizes ingress rules to match 
 
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
 r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
@@ -285,7 +284,7 @@ r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 
 ### IngressConfig
 
-Pushed from the control plane in `api.StateResponse.IngressConfig`.
+Pushed from the control plane in the snapshot `bridge.ingress` subtree (`api.BridgeSnapshot.Ingress`), present-but-nullable — a `null` value tears down active rules.
 
 ```go
 type IngressConfig struct {
@@ -377,8 +376,7 @@ The ingress reconcile handler plugs into `internal/reconcile` alongside existing
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
-r.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, nodeID, meshIP, "plexd0"))
-r.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
+r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
 r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
@@ -395,7 +393,7 @@ Rule-level events (`rule_assigned`/`rule_revoked`) enable immediate response to 
 | `api.IngressConfig`                  | `internal/api` | Desired ingress config from control plane     |
 | `api.IngressRule`                    | `internal/api` | Individual ingress rule definition            |
 | `api.IngressInfo`                    | `internal/api` | Ingress status in heartbeats                  |
-| `api.StateResponse`                  | `internal/api` | Desired state (contains `IngressConfig`)      |
+| `api.BridgeSnapshot`                 | `internal/api` | Snapshot `bridge` subtree (contains `Ingress`)|
 | `api.HeartbeatRequest`               | `internal/api` | Heartbeat payload (contains `IngressInfo`)    |
 | `api.SignedEnvelope`                 | `internal/api` | SSE event wrapper                             |
 | `api.EventIngressConfigUpdated`      | `internal/api` | Event type `"ingress_config_updated"`         |

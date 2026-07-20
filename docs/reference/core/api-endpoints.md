@@ -17,16 +17,15 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 5 | `POST` | `/v1/keys/rotate` | Key rotation |
 | 6 | `PUT` | `/v1/nodes/{node_id}/capabilities` | Capability update |
 | 7 | `PUT` | `/v1/nodes/{node_id}/endpoint` | NAT endpoint reporting |
-| 8 | `GET` | `/v1/nodes/{node_id}/state` | Full state pull (reconciliation) |
-| 9 | `POST` | `/v1/nodes/{node_id}/drift` | Drift reporting |
-| 10 | `GET` | `/v1/nodes/{node_id}/secrets/{key}` | Secret fetch (NSK-encrypted) |
-| 11 | `POST` | `/v1/nodes/{node_id}/report` | Report entry sync |
-| 12 | `POST` | `/v1/nodes/{node_id}/executions/{execution_id}/ack` | Action ACK/NACK |
-| 13 | `POST` | `/v1/nodes/{node_id}/executions/{execution_id}/result` | Action result |
-| 14 | `POST` | `/v1/nodes/{node_id}/metrics` | Metrics batch |
-| 15 | `POST` | `/v1/nodes/{node_id}/logs` | Log batch |
-| 16 | `POST` | `/v1/nodes/{node_id}/audit` | Audit batch |
-| 17 | `GET` | `/v1/artifacts/plexd/{version}/{os}/{arch}` | Binary download |
+| 8 | `GET` | `/v1/nodes/{node_id}/state` | State snapshot pull (reconciliation) |
+| 9 | `GET` | `/v1/nodes/{node_id}/secrets/{key}` | Secret fetch (NSK-encrypted) |
+| 10 | `POST` | `/v1/nodes/{node_id}/report` | Report entry sync |
+| 11 | `POST` | `/v1/nodes/{node_id}/executions/{execution_id}/ack` | Action ACK/NACK |
+| 12 | `POST` | `/v1/nodes/{node_id}/executions/{execution_id}/result` | Action result |
+| 13 | `POST` | `/v1/nodes/{node_id}/metrics` | Metrics batch |
+| 14 | `POST` | `/v1/nodes/{node_id}/logs` | Log batch |
+| 15 | `POST` | `/v1/nodes/{node_id}/audit` | Audit batch |
+| 16 | `GET` | `/v1/artifacts/plexd/{version}/{os}/{arch}` | Binary download |
 
 ## Registration & Identity
 
@@ -265,7 +264,10 @@ Called after STUN discovery, then on a deadline derived from the response (see b
 
 ### GET /v1/nodes/{node_id}/state
 
-Called at `reconcile.interval` (default 60s) and on SSE reconnection.
+Called at `reconcile.interval` (default 60s) and on SSE reconnection. Returns the
+`NodeStateSnapshot` envelope. Every block key is always present; a `null` value
+means "block not populated" — the differ compares by presence, not by field
+absence.
 
 **Response** (`200 OK`):
 
@@ -273,48 +275,47 @@ Called at `reconcile.interval` (default 60s) and on SSE reconnection.
 {
   "peers": [
     {
-      "id": "n_peer456",
-      "public_key": "...",
-      "mesh_ip": "10.100.1.2",
-      "endpoint": "203.0.113.10:51820",
-      "allowed_ips": ["10.100.1.2/32"],
-      "psk": "..."
-    }
-  ],
-  "policies": [
+      "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+      "mesh_ip": "10.99.0.2",
+      "public_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+      "fallback_endpoint": "203.0.113.1:51820"
+    },
     {
-      "id": "pol_abc",
-      "rules": [ { "src": "10.100.1.0/24", "dst": "10.100.1.5/32", "port": 443, "protocol": "tcp", "action": "allow" } ]
+      "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+      "mesh_ip": "10.99.0.3",
+      "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
     }
   ],
-  "signing_keys": {
-    "current": "base64-encoded-ed25519-public-key",
-    "previous": "base64-encoded-ed25519-public-key-or-null",
-    "transition_expires": "2025-01-16T10:30:00Z"
+  "reachability": { "state": "healthy", "changed_at": "2026-01-01T00:00:00Z" },
+  "policy": {
+    "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
+    "fingerprint": "j7Hn2mF0oQ9rXcV8yZ1aB4cD6eF8gH0iJ2kL4mN6oM=",
+    "rules": [
+      { "action": "allow", "protocol": "any", "source_cidr": "10.99.0.0/24", "destination_cidr": "10.99.0.0/24" },
+      { "action": "allow", "protocol": "tcp", "source_cidr": "10.99.0.0/24", "destination_cidr": "0.0.0.0/0", "ports": { "from": 443, "to": 443 } }
+    ]
   },
-  "metadata": { "environment": "production", "region": "eu-west-1" },
-  "data": [
-    { "key": "database-config", "content_type": "application/json", "payload": { "host": "db.internal", "port": 5432 }, "version": 3, "updated_at": "2025-01-15T10:30:00Z" }
-  ],
-  "secret_refs": [
-    { "key": "tls-cert", "version": 2 }
-  ]
-}
-```
-
-### POST /v1/nodes/{node_id}/drift
-
-Reports what was corrected during reconciliation.
-
-**Request body:**
-
-```json
-{
-  "timestamp": "2025-01-15T10:31:00Z",
-  "corrections": [
-    { "type": "peer_added", "detail": "n_peer789 was missing from WireGuard config" },
-    { "type": "policy_rule_removed", "detail": "Stale rule for 10.100.1.99/32 removed" }
-  ]
+  "bridge": {
+    "relay": { "sessions": [] },
+    "user_access": null,
+    "ingress": null,
+    "site_to_site": null
+  },
+  "state": {
+    "metadata": [
+      { "key": "environment", "value": "production" },
+      { "key": "region", "value": "eu-west-1" }
+    ],
+    "data": [
+      { "key": "app/config", "value": "{\"log_level\":\"info\",\"max_conns\":100}" }
+    ],
+    "reports": []
+  },
+  "reports": {
+    "metadata": [],
+    "data": [],
+    "reports": []
+  }
 }
 ```
 

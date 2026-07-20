@@ -44,7 +44,7 @@ External Network
 +-----------------------------------------------------------------+
 ```
 
-Traffic between the external site and mesh peers flows through per-tunnel WireGuard interfaces (`wg-s2s-{id}`). The `VPNController` manages WireGuard interface and peer operations. The `RouteController` manages OS-level routes for remote subnets. The control plane pushes tunnel definitions via `SiteToSiteConfig` in `api.StateResponse`.
+Traffic between the external site and mesh peers flows through per-tunnel WireGuard interfaces (`wg-s2s-{id}`). The `VPNController` manages WireGuard interface and peer operations. The `RouteController` manages OS-level routes for remote subnets. The control plane pushes tunnel definitions via the snapshot `bridge.site_to_site` subtree (`api.BridgeSnapshot.SiteToSite`).
 
 ## Config
 
@@ -259,10 +259,10 @@ dispatcher.Register(api.EventSiteToSiteConfigUpdated,
 func SiteToSiteReconcileHandler(mgr *SiteToSiteManager, logger *slog.Logger) reconcile.ReconcileHandler
 ```
 
-Returns a `reconcile.ReconcileHandler` that synchronizes tunnels to match the desired `SiteToSiteConfig`:
+Returns a `reconcile.ReconcileHandler` that synchronizes tunnels to match the desired bridge site-to-site subtree. The handler is **presence-aware**: a `null` `Bridge` or `null` `SiteToSite` child means "not populated", so it reconciles against an empty desired set and tears down stale tunnels.
 
-1. If `desired.SiteToSiteConfig` is nil, returns nil (no-op)
-2. Builds a desired set from `desired.SiteToSiteConfig.Tunnels` keyed by `TunnelID`
+1. Reads tunnels from `desired.Bridge.SiteToSite.Tunnels` (empty when `Bridge` or `SiteToSite` is nil)
+2. Builds a desired set keyed by `TunnelID`
 3. Removes stale tunnels: current tunnel IDs not in the desired set
 4. Detects changed tunnels: same tunnel ID but different config (uses `reflect.DeepEqual`) — removes and re-adds
 5. Adds missing tunnels: desired tunnels not in the current set
@@ -272,7 +272,6 @@ Returns a `reconcile.ReconcileHandler` that synchronizes tunnels to match the de
 
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
 r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
@@ -283,7 +282,7 @@ r.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
 
 ### SiteToSiteConfig
 
-Pushed from the control plane in `api.StateResponse.SiteToSiteConfig`.
+Pushed from the control plane in the snapshot `bridge.site_to_site` subtree (`api.BridgeSnapshot.SiteToSite`), present-but-nullable — a `null` value tears down active tunnels.
 
 ```go
 type SiteToSiteConfig struct {
@@ -379,8 +378,7 @@ The site-to-site reconcile handler plugs into `internal/reconcile` alongside exi
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
-r.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, nodeID, meshIP, "plexd0"))
-r.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
+r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
 r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
@@ -398,7 +396,7 @@ Tunnel-level events (`tunnel_assigned`/`tunnel_revoked`) enable immediate respon
 | `api.SiteToSiteConfig`                    | `internal/api` | Desired site-to-site config from control plane  |
 | `api.SiteToSiteTunnel`                    | `internal/api` | Individual tunnel definition                    |
 | `api.SiteToSiteInfo`                      | `internal/api` | Site-to-site status in heartbeats               |
-| `api.StateResponse`                       | `internal/api` | Desired state (contains `SiteToSiteConfig`)     |
+| `api.BridgeSnapshot`                      | `internal/api` | Snapshot `bridge` subtree (contains `SiteToSite`) |
 | `api.HeartbeatRequest`                    | `internal/api` | Heartbeat payload (contains `SiteToSiteInfo`)   |
 | `api.SignedEnvelope`                      | `internal/api` | SSE event wrapper                               |
 | `api.EventSiteToSiteConfigUpdated`        | `internal/api` | Event type `"site_to_site_config_updated"`      |

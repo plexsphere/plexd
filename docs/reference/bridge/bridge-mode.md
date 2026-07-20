@@ -31,7 +31,7 @@ Mesh Peers
               └──────────┘  └─────────┘
 ```
 
-The control plane pushes `BridgeConfig` via `api.StateResponse`. The `ReconcileHandler` feeds desired subnets to the `Manager`, which diffs against currently active routes and calls `RouteController` to add/remove routes. `HandleBridgeConfigUpdated` triggers immediate reconciliation on SSE events.
+Access-subnet routes come from **local YAML config** (`Config.AccessSubnets`), programmed by the `Manager` at bridge setup via `RouteController`. The old `bridge_config` block (`access_subnets`/`enable_nat`/`enable_forwarding`) no longer rides the state snapshot, and the top-level bridge routes reconcile handler has been removed. The snapshot's `bridge` subtree carries only the four feature children (`relay`, `user_access`, `ingress`, `site_to_site`), each reconciled by its own handler. `HandleBridgeConfigUpdated` still triggers an immediate reconciliation on `bridge_config_updated` SSE events.
 
 ## Config
 
@@ -203,30 +203,16 @@ All log entries use `component=bridge`.
 | `Error` | NAT masquerade failed      | `error`                                                |
 | `Error` | Forwarding operation failed| `error`                                                |
 
-## ReconcileHandler
+## Access-Subnet Routes
 
-Factory function returning a `reconcile.ReconcileHandler` that updates bridge routes when the desired `BridgeConfig` changes.
-
-```go
-func ReconcileHandler(mgr *Manager) reconcile.ReconcileHandler
-```
-
-The returned handler:
-
-1. Checks if `desired.BridgeConfig` is non-nil
-2. If nil, returns `nil` (no-op)
-3. If present, calls `mgr.UpdateRoutes(desired.BridgeConfig.AccessSubnets)`
-
-The handler does **not** inspect `StateDiff` — it relies on being invoked whenever any drift is detected by the reconciler (peers, policies, metadata, etc.) and internally diffs the desired subnets against the Manager's tracked active routes.
-
-### Registration
-
-```go
-mgr := bridge.NewManager(ctrl, bridge.Config{...}, logger)
-
-r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.ReconcileHandler(mgr))
-```
+Access-subnet routes are **not** reconciled from the control plane. The `Manager`
+programs them once from local `Config.AccessSubnets` when `Setup(meshIface)` runs,
+adding each subnet via `RouteController` (with rollback on partial failure) and
+tracking them as active routes. The former top-level `bridge.ReconcileHandler`
+that fed `desired.BridgeConfig.AccessSubnets` into `Manager.UpdateRoutes` has been
+removed together with the `bridge_config` block. `Manager.UpdateRoutes` remains
+available for programmatic route changes but is no longer wired into the
+reconciliation loop.
 
 ## HandleBridgeConfigUpdated
 
@@ -259,29 +245,32 @@ dispatcher.Register(api.EventBridgeConfigUpdated, bridge.HandleBridgeConfigUpdat
 
 ### Reconciliation Loop
 
-The bridge reconcile handler plugs into `internal/reconcile` alongside the WireGuard and policy handlers:
+The bridge feature sub-handlers plug into `internal/reconcile` alongside the WireGuard and policy handlers. There is no longer a top-level bridge handler:
 
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
-r.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, nodeID, meshIP, "plexd0"))
-r.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
+r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
+r.RegisterHandler(bridge.RelayReconcileHandler(relay, logger))
+r.RegisterHandler(bridge.UserAccessReconcileHandler(uaMgr, logger))
+r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
+r.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
 ```
 
 ### SSE Real-Time Updates
 
-`HandleBridgeConfigUpdated` triggers reconciliation when the control plane pushes a `bridge_config_updated` event. The reconciliation cycle then fetches fresh state and re-evaluates the bridge configuration.
+`HandleBridgeConfigUpdated` triggers reconciliation when the control plane pushes a `bridge_config_updated` event. The reconciliation cycle then pulls fresh state and re-evaluates the four bridge subtrees.
 
 ### Control Plane Types
 
-| Type                           | Package        | Usage                                           |
-|--------------------------------|----------------|-------------------------------------------------|
-| `api.BridgeConfig`             | `internal/api` | Desired bridge config from control plane        |
-| `api.BridgeInfo`               | `internal/api` | Bridge status reported in heartbeats            |
-| `api.StateResponse`            | `internal/api` | Desired state (contains `BridgeConfig`)         |
-| `api.HeartbeatRequest`         | `internal/api` | Heartbeat payload (contains `BridgeInfo`)       |
-| `api.SignedEnvelope`           | `internal/api` | SSE event wrapper                               |
-| `api.EventBridgeConfigUpdated` | `internal/api` | Event type constant `"bridge_config_updated"`   |
+| Type                           | Package        | Usage                                                     |
+|--------------------------------|----------------|-----------------------------------------------------------|
+| `api.BridgeSnapshot`           | `internal/api` | The snapshot `bridge` subtree (`relay`, `user_access`, `ingress`, `site_to_site`) |
+| `api.BridgeInfo`               | `internal/api` | Bridge status reported in heartbeats                      |
+| `api.NodeStateSnapshot`        | `internal/api` | Desired-state envelope (contains `Bridge`)                |
+| `api.HeartbeatRequest`         | `internal/api` | Heartbeat payload (contains `BridgeInfo`)                 |
+| `api.SignedEnvelope`           | `internal/api` | SSE event wrapper                                         |
+| `api.EventBridgeConfigUpdated` | `internal/api` | Event type constant `"bridge_config_updated"`             |
 
 ### Heartbeat Reporting
 

@@ -6,20 +6,22 @@ feature: PXD-0038
 
 # Docker E2E Test
 
-Validates that a containerised plexd agent successfully registers, sends heartbeats, retrieves state, reports capabilities, detects drift, and forwards metrics, logs, and audit events to the Central API. The test uses docker compose to orchestrate two services — `mock-api` (a fixture-based mock of the Central API) and `plexd` (the agent under test) — on an isolated bridge network.
+Validates that a containerised plexd agent successfully registers, sends heartbeats, retrieves state, reports capabilities, converges to desired state, and forwards metrics, logs, and audit events to the Central API. The test uses docker compose to orchestrate two services — `mock-api` (a fixture-based mock of the Central API) and `plexd` (the agent under test) — on an isolated bridge network.
 
-The test runs ten phases:
+The test runs twelve phases:
 
-1. **Initial assertions** — all 8 counters >= 1 (agent started and contacted all endpoints)
-2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, metrics data, and drift timestamp
+1. **Initial assertions** — all 7 counters >= 1 (agent started and contacted all endpoints)
+2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, and metrics data
 3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously)
 4. **Log injection** — injects a log file via `docker cp`, verifies logs_count increases (FileSource pipeline works)
 5. **Agent restart for audit** — restarts plexd container, verifies audit_count increases (ProcessSource fires per-process)
 6. **SSE event injection** — injects a `node_state_updated` event and verifies state_count increases (proves SSE stream is connected)
-7. **Local endpoint delivery** — all 3 local endpoint counters >= 1 (dual delivery to HTTPS local endpoint works)
-8. **Local endpoint body validation** — verifies non-empty JSON arrays received at each local endpoint
-9. **Dual delivery verification** — both platform and local counters >= 1 simultaneously (proves parallel delivery)
-10. **Graceful shutdown** — stops plexd container, verifies exit code 0 and no crash indicators in logs
+7. **Convergence cycle** — posts a mutated `NodeStateSnapshot` envelope via `/test/configure-state`, verifies `state_count` advances AND a reconcile cycle reports `policy` drift
+8. **Policy fingerprint no-op** — re-posts the envelope with only `revision_id` bumped (same fingerprint), verifies `state_count` advances but no cycle reports `policy` drift (the differ's fingerprint short-circuit holds)
+9. **Local endpoint delivery** — all 3 local endpoint counters >= 1 (dual delivery to HTTPS local endpoint works)
+10. **Local endpoint body validation** — verifies non-empty JSON arrays received at each local endpoint
+11. **Dual delivery verification** — both platform and local counters >= 1 simultaneously (proves parallel delivery)
+12. **Graceful shutdown** — stops plexd container, verifies exit code 0 and no crash indicators in logs
 
 ## Service Topology
 
@@ -57,7 +59,6 @@ The test script polls `GET http://localhost:18080/test/assertions` every 2 secon
   "heartbeat_count": 1,
   "state_count": 1,
   "capabilities_count": 1,
-  "drift_count": 1,
   "metrics_count": 1,
   "logs_count": 1,
   "audit_count": 1,
@@ -67,7 +68,7 @@ The test script polls `GET http://localhost:18080/test/assertions` every 2 secon
 }
 ```
 
-Phase 1 passes when all eight platform counters are >= 1. Local endpoint counters are verified separately in Phases 7-9:
+Phase 1 passes when all seven platform counters are >= 1. Local endpoint counters are verified separately in Phases 9-11:
 
 | Counter | Meaning |
 |---------|---------|
@@ -75,7 +76,6 @@ Phase 1 passes when all eight platform counters are >= 1. Local endpoint counter
 | `heartbeat_count` | plexd called `POST /v1/nodes/{id}/heartbeat` |
 | `state_count` | plexd called `GET /v1/nodes/{id}/state` |
 | `capabilities_count` | plexd called `PUT /v1/nodes/{id}/capabilities` |
-| `drift_count` | plexd called `POST /v1/nodes/{id}/drift` |
 | `metrics_count` | plexd called `POST /v1/nodes/{id}/metrics` |
 | `logs_count` | plexd called `POST /v1/nodes/{id}/logs` |
 | `audit_count` | plexd called `POST /v1/nodes/{id}/audit` |
@@ -93,7 +93,6 @@ Uses `GET /test/last-request/{endpoint}` to verify the content of request payloa
 | `heartbeat` | Valid JSON with `timestamp` field (node_id is in URL path, not body) |
 | `capabilities` | `builtin_actions` (array with >= 1 entry) |
 | `metrics` | Array with >= 1 data point |
-| `drift` | `timestamp` (non-empty) |
 
 ### Phase 3: Periodic Loop Verification
 
@@ -111,19 +110,29 @@ The `ProcessSource` uses `sync.Once` to emit a single `process_start` audit entr
 
 Injects a `node_state_updated` event via `POST /test/inject-event` and verifies that `state_count` increases, proving the SSE stream is connected and event-driven reconciliation works.
 
-### Phase 7: Local Endpoint Delivery
+### Phase 7: Convergence Cycle
+
+Posts a full mutated `NodeStateSnapshot` envelope to `POST /test/configure-state` (a new policy fingerprint and new state values), then polls until **both** hard conditions hold: `state_count` advances (the agent re-fetched the snapshot) and the count of `"reconciliation cycle completed"` lines whose `drift` summary contains `policy` increases (the differ reported `PolicyChanged`, so the policy handler ran). Both fixture peers are surfaced and asserted through the node API `GET /v1/peers`.
+
+The assertion deliberately gates on the reconciler drift summary rather than on `"policy ruleset applied"`. The test container's kernel exposes no nftables backend, so policy enforcement stays disabled there and no rule can reach the kernel; the applied-log is emitted only on a real apply and would never fire. Proving rule installation requires an environment with a working nftables backend.
+
+### Phase 8: Policy Fingerprint No-Op
+
+Re-posts the envelope with only `revision_id` bumped and a metadata value changed — the policy `fingerprint` stays identical. The test asserts `state_count` advances (the no-op envelope was fetched) but the policy-drift cycle count is **unchanged**, exercising the differ's fingerprint short-circuit: a revision-only bump must not report `PolicyChanged`.
+
+### Phase 9: Local Endpoint Delivery
 
 Polls `GET /test/assertions` until `local_metrics_count`, `local_logs_count`, and `local_audit_count` are all >= 1 (timeout: 60s). This validates the full local endpoint credential chain: registration (32-byte NSK) → secret fetch → AES-256-GCM decryption → Bearer token → HTTPS POST to mock-api's TLS listener on `:8443`.
 
-### Phase 8: Local Endpoint Body Validation
+### Phase 10: Local Endpoint Body Validation
 
 Uses `GET /test/last-request/local_{metrics,logs,audit}` to verify each local endpoint received a non-empty JSON array payload.
 
-### Phase 9: Dual Delivery Verification
+### Phase 11: Dual Delivery Verification
 
 Asserts that both platform counters (`metrics_count`, `logs_count`, `audit_count`) and local counters (`local_metrics_count`, `local_logs_count`, `local_audit_count`) are all >= 1, proving parallel delivery to both the central API and the local endpoint.
 
-### Phase 10: Graceful Shutdown
+### Phase 12: Graceful Shutdown
 
 Stops the plexd container via `docker compose stop` (sends SIGTERM) and verifies:
 - Exit code is 0
