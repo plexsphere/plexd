@@ -633,7 +633,7 @@ func TestEndpoints_PathParametersEscaped(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"peers":[],"policies":[],"data":[],"secret_refs":[]}`))
+		_, _ = w.Write([]byte(`{"peers":[],"reachability":null,"policy":null,"bridge":null,"state":null,"reports":null}`))
 	})
 
 	_, err := client.FetchState(context.Background(), maliciousNodeID)
