@@ -42,7 +42,7 @@ func TestDiscover_ClassifiesFullCone(t *testing.T) {
 	if result.NATType != NATFullCone {
 		t.Errorf("expected NATFullCone, got %s", result.NATType)
 	}
-	if result.Endpoint != "203.0.113.1:12345" {
+	if result.Endpoint != "203.0.113.1:51820" {
 		t.Errorf("unexpected endpoint: %s", result.Endpoint)
 	}
 }
@@ -66,11 +66,11 @@ func TestDiscover_ClassifiesSymmetric(t *testing.T) {
 }
 
 func TestDiscover_ClassifiesNone(t *testing.T) {
-	// The mapped port matching the local port is what marks "no NAT"; the IP
-	// must still be routable to be publishable as an endpoint.
+	// The mapped port matching the STUN source port is what marks "no NAT";
+	// the IP must still be routable to be publishable as an endpoint.
 	client := &mockSTUNClient{
 		results: map[string]mockBindResult{
-			"stun1:3478": {Addr: MappedAddress{IP: net.IPv4(198, 51, 100, 7), Port: 51820}},
+			"stun1:3478": {Addr: MappedAddress{IP: net.IPv4(198, 51, 100, 7), Port: mockEphemeralPort}},
 		},
 	}
 	d := newTestDiscoverer(client, []string{"stun1:3478"}, 51820)
@@ -81,6 +81,9 @@ func TestDiscover_ClassifiesNone(t *testing.T) {
 	}
 	if result.NATType != NATNone {
 		t.Errorf("expected NATNone, got %s", result.NATType)
+	}
+	if result.Endpoint != "198.51.100.7:51820" {
+		t.Errorf("unexpected endpoint: %s", result.Endpoint)
 	}
 }
 
@@ -100,7 +103,7 @@ func TestDiscover_ClassifiesUnknownOnPartialFailure(t *testing.T) {
 	if result.NATType != NATUnknown {
 		t.Errorf("expected NATUnknown, got %s", result.NATType)
 	}
-	if result.Endpoint != "203.0.113.1:12345" {
+	if result.Endpoint != "203.0.113.1:51820" {
 		t.Errorf("unexpected endpoint: %s", result.Endpoint)
 	}
 }
@@ -118,7 +121,7 @@ func TestDiscover_FallbackToSecondServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Endpoint != "198.51.100.5:9999" {
+	if result.Endpoint != "198.51.100.5:51820" {
 		t.Errorf("unexpected endpoint: %s", result.Endpoint)
 	}
 }
@@ -152,7 +155,7 @@ func TestDiscover_RejectsNonRoutableMappedAddress(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if result.Endpoint != "198.51.100.5:9999" {
+			if result.Endpoint != "198.51.100.5:51820" {
 				t.Errorf("endpoint = %q, want the routable address from the second server", result.Endpoint)
 			}
 		})
@@ -191,27 +194,37 @@ func TestDiscover_AllServersFail(t *testing.T) {
 	}
 }
 
-func TestDiscover_UsesConfiguredListenPort(t *testing.T) {
+// The kernel WireGuard socket owns the listen port, so STUN must never bind
+// it: the first binding lets the OS pick an ephemeral port, later bindings
+// in the same cycle reuse that port, and the listen port appears only in the
+// published endpoint.
+func TestDiscover_EphemeralSourcePortAdvertisesListenPort(t *testing.T) {
+	addr := MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: 12345}
 	client := &mockSTUNClient{
 		results: map[string]mockBindResult{
-			"stun1:3478": {Addr: MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: 12345}},
+			"stun1:3478": {Addr: addr},
+			"stun2:3478": {Addr: addr},
 		},
 	}
-	d := newTestDiscoverer(client, []string{"stun1:3478"}, 44444)
+	d := newTestDiscoverer(client, []string{"stun1:3478", "stun2:3478"}, 44444)
 
-	_, err := d.Discover(context.Background())
+	result, err := d.Discover(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	calls := client.allCalls()
-	if len(calls) == 0 {
-		t.Fatal("expected at least one Bind call")
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 Bind calls, got %d", len(calls))
 	}
-	for _, c := range calls {
-		if c.LocalPort != 44444 {
-			t.Errorf("expected localPort 44444, got %d", c.LocalPort)
-		}
+	if calls[0].LocalPort != 0 {
+		t.Errorf("first Bind localPort = %d, want 0 (ephemeral, never the WireGuard listen port)", calls[0].LocalPort)
+	}
+	if calls[1].LocalPort != mockEphemeralPort {
+		t.Errorf("second Bind localPort = %d, want %d (reuse the cycle's ephemeral port)", calls[1].LocalPort, mockEphemeralPort)
+	}
+	if result.Endpoint != "203.0.113.1:44444" {
+		t.Errorf("endpoint = %q, want the mapped IP with the advertised listen port", result.Endpoint)
 	}
 }
 
@@ -259,7 +272,7 @@ func TestLastResult_AfterDiscovery(t *testing.T) {
 	if info == nil {
 		t.Fatal("expected non-nil LastResult after Discover")
 	}
-	if info.Endpoint != "203.0.113.1:12345" {
+	if info.Endpoint != "203.0.113.1:51820" {
 		t.Errorf("unexpected Endpoint: %s", info.Endpoint)
 	}
 	if info.NATType != NATFullCone {
@@ -301,7 +314,7 @@ type sequenceMockSTUN struct {
 	calls   []mockBindCall
 }
 
-func (s *sequenceMockSTUN) Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, error) {
+func (s *sequenceMockSTUN) Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, int, error) {
 	s.mu.Lock()
 	s.calls = append(s.calls, mockBindCall{ServerAddr: serverAddr, LocalPort: localPort})
 	i := s.idx
@@ -312,9 +325,13 @@ func (s *sequenceMockSTUN) Bind(ctx context.Context, serverAddr string, localPor
 	s.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
-		return MappedAddress{}, err
+		return MappedAddress{}, 0, err
 	}
-	return r.Addr, r.Err
+	usedPort := localPort
+	if usedPort == 0 {
+		usedPort = mockEphemeralPort
+	}
+	return r.Addr, usedPort, r.Err
 }
 
 func (s *sequenceMockSTUN) totalCalls() int {
@@ -375,8 +392,8 @@ func TestRun_InitialDiscoveryAndReport(t *testing.T) {
 		t.Fatal("expected at least 1 report call")
 	}
 	call := reporter.calls[0]
-	if call.Report.Endpoint != "203.0.113.1:12345" {
-		t.Errorf("expected endpoint 203.0.113.1:12345, got %s", call.Report.Endpoint)
+	if call.Report.Endpoint != "203.0.113.1:51820" {
+		t.Errorf("expected endpoint 203.0.113.1:51820, got %s", call.Report.Endpoint)
 	}
 	if call.Report.NATType != string(NATFullCone) {
 		t.Errorf("expected nat type full_cone, got %s", call.Report.NATType)
@@ -462,11 +479,11 @@ func TestRun_LogsEndpointChange(t *testing.T) {
 	reporter.mu.Lock()
 	defer reporter.mu.Unlock()
 
-	if reporter.calls[0].Report.Endpoint != "203.0.113.1:12345" {
-		t.Errorf("first report: expected 203.0.113.1:12345, got %s", reporter.calls[0].Report.Endpoint)
+	if reporter.calls[0].Report.Endpoint != "203.0.113.1:51820" {
+		t.Errorf("first report: expected 203.0.113.1:51820, got %s", reporter.calls[0].Report.Endpoint)
 	}
-	if reporter.calls[1].Report.Endpoint != "198.51.100.2:54321" {
-		t.Errorf("second report: expected 198.51.100.2:54321, got %s", reporter.calls[1].Report.Endpoint)
+	if reporter.calls[1].Report.Endpoint != "198.51.100.2:51820" {
+		t.Errorf("second report: expected 198.51.100.2:51820, got %s", reporter.calls[1].Report.Endpoint)
 	}
 }
 
@@ -524,8 +541,8 @@ func TestRun_ContinuesOnRefreshFailure(t *testing.T) {
 		t.Fatalf("expected at least 2 report calls, got %d", len(reporter.calls))
 	}
 	// The second report should correspond to addrC (the third discovery, since second failed).
-	if reporter.calls[1].Report.Endpoint != "203.0.113.1:12345" {
-		t.Errorf("expected endpoint 203.0.113.1:12345, got %s", reporter.calls[1].Report.Endpoint)
+	if reporter.calls[1].Report.Endpoint != "203.0.113.1:51820" {
+		t.Errorf("expected endpoint 203.0.113.1:51820, got %s", reporter.calls[1].Report.Endpoint)
 	}
 }
 

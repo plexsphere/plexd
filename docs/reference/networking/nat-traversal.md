@@ -45,18 +45,20 @@ When `Enabled=false`, validation is skipped entirely.
 
 ## STUNClient
 
-Interface abstracting the UDP STUN binding round trip. The production implementation creates a UDP socket bound to the WireGuard listen port (using `SO_REUSEADDR`/`SO_REUSEPORT`), sends a STUN Binding Request, and parses the response.
+Interface abstracting the UDP STUN binding round trip. The production implementation opens a UDP socket on `localPort` (0 for an OS-assigned ephemeral port), sends a STUN Binding Request, parses the response, and returns the mapped address together with the local port actually used.
+
+STUN never runs on the WireGuard listen port. The kernel WireGuard socket owns that port, and UDP port sharing would require `SO_REUSEPORT` on both sockets — the kernel side does not set it, so binding it fails with `EADDRINUSE` on every node whose WireGuard interface is up. Discovery therefore measures the mapping of its own ephemeral socket, and the published endpoint combines the mapped IP with the WireGuard listen port (see Discoverer).
 
 ```go
 type STUNClient interface {
-    Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, error)
+    Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, int, error)
 }
 ```
 
-| Parameter    | Description                                    |
-|--------------|------------------------------------------------|
-| `serverAddr` | STUN server address (host:port)                |
-| `localPort`  | Local UDP source port (must match WireGuard)   |
+| Parameter    | Description                                              |
+|--------------|----------------------------------------------------------|
+| `serverAddr` | STUN server address (host:port)                          |
+| `localPort`  | Local UDP source port (0 for an OS-assigned ephemeral)   |
 
 ## MappedAddress
 
@@ -77,16 +79,16 @@ Classified NAT behavior based on comparing mapped addresses from multiple STUN s
 
 | Constant       | Value         | Meaning                                                           |
 |----------------|---------------|-------------------------------------------------------------------|
-| `NATNone`      | `"none"`      | Mapped port matches local port — node has a public IP             |
+| `NATNone`      | `"none"`      | Mapped port matches the STUN source port — no port translation    |
 | `NATFullCone`  | `"full_cone"` | Same mapped address from different servers — consistent NAT       |
 | `NATSymmetric` | `"symmetric"` | Different mapped addresses — per-destination NAT, relay needed    |
 | `NATUnknown`   | `"unknown"`   | Only one server responded — classification incomplete             |
 
 ### Classification Logic
 
-1. Send STUN binding to first reachable server → `firstAddr`
-2. If `firstAddr.Port == localPort` → `NATNone` (no NAT detected)
-3. Send binding to a second server → `secondAddr`
+1. Send STUN binding to the first reachable server from an ephemeral source port → `firstAddr`; the cycle keeps that port
+2. If `firstAddr.Port` equals the source port → `NATNone` (no port translation)
+3. Send binding to a second server from the same source port → `secondAddr`
 4. If `firstAddr == secondAddr` → `NATFullCone`
 5. If `firstAddr != secondAddr` → `NATSymmetric`
 6. If no second server responded → `NATUnknown`
@@ -105,18 +107,20 @@ The wire enum also includes `restricted` and `port_restricted`, which this class
 
 Central coordinator for STUN discovery, NAT classification, and endpoint reporting.
 
+The published endpoint is the STUN-mapped IP joined with `advertisePort` — the WireGuard listen port peers must dial — not the mapped port, which describes the discovery socket's own mapping. That endpoint is exact wherever the NAT preserves or forwards the port; where it translates ports per-mapping, the reported `nat_type` (`symmetric`) signals that direct dialing is unreliable.
+
 ### Constructor
 
 ```go
-func NewDiscoverer(client STUNClient, cfg Config, localPort int, logger *slog.Logger) *Discoverer
+func NewDiscoverer(client STUNClient, cfg Config, advertisePort int, logger *slog.Logger) *Discoverer
 ```
 
-| Parameter   | Description                                           |
-|-------------|-------------------------------------------------------|
-| `client`    | STUN client implementation                            |
-| `cfg`       | NAT traversal configuration                           |
-| `localPort` | WireGuard listen port (used as STUN source port)      |
-| `logger`    | Structured logger (`log/slog`)                        |
+| Parameter       | Description                                                  |
+|-----------------|--------------------------------------------------------------|
+| `client`        | STUN client implementation                                   |
+| `cfg`           | NAT traversal configuration                                  |
+| `advertisePort` | WireGuard listen port carried in every published endpoint    |
+| `logger`        | Structured logger (`log/slog`)                               |
 
 ### Methods
 
@@ -140,7 +144,7 @@ type DiscoveryResult struct {
 ```go
 logger := slog.Default()
 
-// Create discoverer with WireGuard listen port
+// Create discoverer; the WireGuard listen port is advertised in endpoints
 disc := nat.NewDiscoverer(stunClient, natCfg, wireguard.DefaultListenPort, logger)
 
 // Option A: Single discovery
@@ -199,7 +203,7 @@ type EndpointReporter interface {
 ```go
 // Request: PUT /v1/nodes/{node_id}/endpoint
 type EndpointRequest struct {
-    Endpoint   string    `json:"endpoint"`    // "203.0.113.5:54321"
+    Endpoint   string    `json:"endpoint"`    // "203.0.113.5:51820"
     NATType    string    `json:"nat_type"`    // "full_cone", "restricted", "port_restricted", "symmetric", "unknown"
     ReportedAt time.Time `json:"reported_at"` // RFC 3339 UTC, fresh per attempt
 }
@@ -318,4 +322,4 @@ All log entries use `component=nat`.
 | `Warn`  | Endpoint report failed              | `error`                                |
 | `Warn`  | Control plane deadline shortens the report cadence | `delay`, `refresh_interval`, `min_report_interval`, `stale_after` |
 | `Warn`/`Error` | Endpoint report rejected     | `error`, `consecutive_rejections` (404/410; `Error` from the third in a row) |
-| `Debug` | STUN binding succeeded              | `server`, `endpoint`                   |
+| `Debug` | STUN binding succeeded              | `server`, `mapped_address`             |

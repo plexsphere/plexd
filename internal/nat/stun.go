@@ -11,8 +11,14 @@ import (
 )
 
 // STUNClient abstracts STUN binding operations for testability.
+//
+// Bind sends a Binding Request to serverAddr from localPort and returns the
+// mapped address together with the local port the request was actually sent
+// from. A localPort of 0 lets the OS pick an ephemeral port; the returned
+// port tells the caller which one, so a discovery cycle can reuse it across
+// servers and compare their mapped addresses meaningfully.
 type STUNClient interface {
-	Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, error)
+	Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, int, error)
 }
 
 // MappedAddress represents a STUN XOR-MAPPED-ADDRESS result.

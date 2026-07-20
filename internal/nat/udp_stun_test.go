@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -55,7 +56,7 @@ func TestUDPSTUNClient_Bind_Success(t *testing.T) {
 	}()
 
 	client := &UDPSTUNClient{Timeout: 5 * time.Second}
-	addr, err := client.Bind(context.Background(), serverAddr, 0)
+	addr, boundPort, err := client.Bind(context.Background(), serverAddr, 0)
 	if err != nil {
 		t.Fatalf("Bind() error = %v", err)
 	}
@@ -65,6 +66,9 @@ func TestUDPSTUNClient_Bind_Success(t *testing.T) {
 	}
 	if addr.Port != wantPort {
 		t.Errorf("Port = %d, want %d", addr.Port, wantPort)
+	}
+	if boundPort == 0 {
+		t.Error("boundPort = 0, want the ephemeral port the OS assigned")
 	}
 
 	// Ensure the server goroutine finishes.
@@ -82,7 +86,7 @@ func TestUDPSTUNClient_Bind_Timeout(t *testing.T) {
 	serverAddr := serverConn.LocalAddr().String()
 
 	client := &UDPSTUNClient{Timeout: 50 * time.Millisecond}
-	_, err = client.Bind(context.Background(), serverAddr, 0)
+	_, _, err = client.Bind(context.Background(), serverAddr, 0)
 	if err == nil {
 		t.Fatal("Bind() = nil error, want timeout error")
 	}
@@ -95,7 +99,7 @@ func TestUDPSTUNClient_Bind_ContextCancel(t *testing.T) {
 	client := &UDPSTUNClient{Timeout: 10 * time.Second}
 
 	// A pre-cancelled context should return immediately.
-	_, err := client.Bind(ctx, "127.0.0.1:3478", 0)
+	_, _, err := client.Bind(ctx, "127.0.0.1:3478", 0)
 	if err == nil {
 		t.Fatal("Bind() = nil error, want error from cancelled context")
 	}
@@ -103,10 +107,69 @@ func TestUDPSTUNClient_Bind_ContextCancel(t *testing.T) {
 
 func TestUDPSTUNClient_Bind_InvalidServer(t *testing.T) {
 	client := &UDPSTUNClient{Timeout: time.Second}
-	_, err := client.Bind(context.Background(), "not-a-valid-address", 0)
+	_, _, err := client.Bind(context.Background(), "not-a-valid-address", 0)
 	if err == nil {
 		t.Fatal("Bind() = nil error, want error for invalid server address")
 	}
+}
+
+// Discovery must succeed while another socket owns the WireGuard listen
+// port — on a real node the kernel WireGuard socket always does, and binding
+// it for STUN fails with EADDRINUSE. This drives a real UDPSTUNClient
+// through Discover with the advertised port deliberately occupied.
+func TestDiscover_SucceedsWhileListenPortIsHeld(t *testing.T) {
+	// Stand-in for the kernel WireGuard socket.
+	wgConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer wgConn.Close()
+	wgPort := wgConn.LocalAddr().(*net.UDPAddr).Port
+
+	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer serverConn.Close()
+	serverAddr := serverConn.LocalAddr().String()
+
+	wantIP := net.IPv4(203, 0, 113, 9)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		buf := make([]byte, 1024)
+		n, clientAddr, err := serverConn.ReadFrom(buf)
+		if err != nil || n < 20 {
+			return
+		}
+		var txID [12]byte
+		copy(txID[:], buf[8:20])
+		// A mapped port unequal to the source port, so classification takes
+		// the NAT path rather than the no-NAT shortcut.
+		resp := buildUDPTestResponse(txID, wantIP, 23456)
+		_, _ = serverConn.WriteTo(resp, clientAddr)
+	}()
+
+	client := &UDPSTUNClient{Timeout: 5 * time.Second}
+	cfg := Config{
+		Enabled:           true,
+		STUNServers:       []string{serverAddr},
+		RefreshInterval:   60 * time.Second,
+		Timeout:           5 * time.Second,
+		MinReportInterval: DefaultMinReportInterval,
+	}
+	d := NewDiscoverer(client, cfg, wgPort, discardLogger())
+
+	result, err := d.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("Discover() error = %v, want success from an ephemeral source port", err)
+	}
+	wantEndpoint := net.JoinHostPort(wantIP.String(), strconv.Itoa(wgPort))
+	if result.Endpoint != wantEndpoint {
+		t.Errorf("endpoint = %q, want %q (mapped IP with the held listen port)", result.Endpoint, wantEndpoint)
+	}
+
+	<-serverDone
 }
 
 // buildUDPTestResponse constructs a STUN Binding Success Response with an

@@ -58,7 +58,7 @@ func NewExchanger(
 
 | Parameter    | Description                                       |
 |--------------|---------------------------------------------------|
-| `discoverer` | NAT discoverer (created with the WireGuard listen port) |
+| `discoverer` | NAT discoverer (advertises the WireGuard listen port in reported endpoints) |
 | `wgManager`  | WireGuard manager (applies inbound `peer_endpoint_changed` SSE updates) |
 | `cpClient`   | Control plane client (wrapped as `nat.EndpointReporter`) |
 | `cfg`        | Endpoint exchange configuration                   |

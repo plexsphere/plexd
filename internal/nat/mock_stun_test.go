@@ -18,6 +18,10 @@ type mockBindResult struct {
 	Err  error
 }
 
+// mockEphemeralPort is the local port mock STUN clients report for a Bind
+// call with localPort 0, standing in for the OS's ephemeral choice.
+const mockEphemeralPort = 40000
+
 // mockSTUNClient is a test double for STUNClient.
 // It records all Bind calls and supports configurable results per server address.
 type mockSTUNClient struct {
@@ -33,7 +37,7 @@ type mockSTUNClient struct {
 	defaultErr error
 }
 
-func (m *mockSTUNClient) Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, error) {
+func (m *mockSTUNClient) Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, int, error) {
 	m.mu.Lock()
 	m.calls = append(m.calls, mockBindCall{ServerAddr: serverAddr, LocalPort: localPort})
 	results := m.results
@@ -41,15 +45,19 @@ func (m *mockSTUNClient) Bind(ctx context.Context, serverAddr string, localPort 
 	m.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
-		return MappedAddress{}, err
+		return MappedAddress{}, 0, err
 	}
 
+	usedPort := localPort
+	if usedPort == 0 {
+		usedPort = mockEphemeralPort
+	}
 	if results != nil {
 		if r, ok := results[serverAddr]; ok {
-			return r.Addr, r.Err
+			return r.Addr, usedPort, r.Err
 		}
 	}
-	return MappedAddress{}, defaultErr
+	return MappedAddress{}, 0, defaultErr
 }
 
 // allCalls returns all recorded Bind calls.
