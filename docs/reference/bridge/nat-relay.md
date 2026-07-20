@@ -222,10 +222,10 @@ dispatcher.Register(api.EventRelaySessionRevoked,
 func RelayReconcileHandler(relay *Relay, logger *slog.Logger) reconcile.ReconcileHandler
 ```
 
-Returns a `reconcile.ReconcileHandler` that synchronizes relay sessions to match the desired `RelayConfig`:
+Returns a `reconcile.ReconcileHandler` that synchronizes relay sessions to match the desired bridge relay subtree. The handler is **presence-aware**: a `null` `Bridge` or `null` `Relay` child means "not populated", so it reconciles against an empty desired set and tears down stale sessions.
 
-1. If `desired.RelayConfig` is nil, returns nil (no-op)
-2. Builds a desired set from `desired.RelayConfig.Sessions` keyed by `SessionID`
+1. Reads sessions from `desired.Bridge.Relay.Sessions` (empty when `Bridge` or `Relay` is nil)
+2. Builds a desired set keyed by `SessionID`
 3. Removes stale sessions: current IDs not in the desired set
 4. Adds missing sessions: desired sessions not in the current set
 5. Aggregates `AddSession` errors via `errors.Join`
@@ -234,7 +234,6 @@ Returns a `reconcile.ReconcileHandler` that synchronizes relay sessions to match
 
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
 r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
 ```
 
@@ -290,7 +289,6 @@ mgr.StartRelay(ctx)
 
 // Register handlers
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.ReconcileHandler(mgr))
 r.RegisterHandler(bridge.RelayReconcileHandler(mgr.Relay(), logger))
 
 dispatcher := api.NewEventDispatcher(logger)
@@ -313,7 +311,7 @@ mgr.Teardown() // stops relay, removes routes, disables forwarding
 
 ### RelayConfig
 
-Pushed from the control plane in `api.StateResponse.RelayConfig`.
+Pushed from the control plane in the snapshot `bridge.relay` subtree (`api.BridgeSnapshot.Relay`), present-but-nullable — a `null` value tears down active sessions.
 
 ```go
 type RelayConfig struct {

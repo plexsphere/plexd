@@ -248,10 +248,10 @@ dispatcher.Register(api.EventUserAccessConfigUpdated,
 func UserAccessReconcileHandler(mgr *UserAccessManager, logger *slog.Logger) reconcile.ReconcileHandler
 ```
 
-Returns a `reconcile.ReconcileHandler` that synchronizes user access peers to match the desired `UserAccessConfig`:
+Returns a `reconcile.ReconcileHandler` that synchronizes user access peers to match the desired bridge user-access subtree. The handler is **presence-aware**: a `null` `Bridge` or `null` `UserAccess` child means "not populated", so it reconciles against an empty desired set and tears down stale peers.
 
-1. If `desired.UserAccessConfig` is nil, returns nil (no-op)
-2. Builds a desired set from `desired.UserAccessConfig.Peers` keyed by `PublicKey`
+1. Reads peers from `desired.Bridge.UserAccess.Peers` (empty when `Bridge` or `UserAccess` is nil)
+2. Builds a desired set keyed by `PublicKey`
 3. Removes stale peers: current keys not in the desired set
 4. Adds missing peers: desired peers not in the current set
 5. Aggregates `AddPeer` errors via `errors.Join`
@@ -260,7 +260,6 @@ Returns a `reconcile.ReconcileHandler` that synchronizes user access peers to ma
 
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 ```
 
@@ -268,7 +267,7 @@ r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 
 ### UserAccessConfig
 
-Pushed from the control plane in `api.StateResponse.UserAccessConfig`.
+Pushed from the control plane in the snapshot `bridge.user_access` subtree (`api.BridgeSnapshot.UserAccess`), present-but-nullable — a `null` value tears down active peers.
 
 ```go
 type UserAccessConfig struct {
@@ -361,8 +360,7 @@ The user access reconcile handler plugs into `internal/reconcile` alongside exis
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
-r.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, nodeID, meshIP, "plexd0"))
-r.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
+r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
 r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 ```
@@ -378,7 +376,7 @@ Peer-level events (`peer_assigned`/`peer_revoked`) enable immediate response to 
 | `api.UserAccessConfig`                 | `internal/api` | Desired user access config from control plane   |
 | `api.UserAccessPeer`                   | `internal/api` | Individual peer definition                      |
 | `api.UserAccessInfo`                   | `internal/api` | User access status in heartbeats                |
-| `api.StateResponse`                    | `internal/api` | Desired state (contains `UserAccessConfig`)     |
+| `api.BridgeSnapshot`                   | `internal/api` | Snapshot `bridge` subtree (contains `UserAccess`) |
 | `api.HeartbeatRequest`                 | `internal/api` | Heartbeat payload (contains `UserAccessInfo`)   |
 | `api.SignedEnvelope`                   | `internal/api` | SSE event wrapper                               |
 | `api.EventUserAccessConfigUpdated`     | `internal/api` | Event type `"user_access_config_updated"`       |

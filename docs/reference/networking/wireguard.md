@@ -113,7 +113,7 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 
 | Method          | Signature                                                                    | Description                                                    |
 |-----------------|------------------------------------------------------------------------------|----------------------------------------------------------------|
-| `Setup`         | `(ctx context.Context, identity *registration.NodeIdentity) error`           | Creates interface, assigns mesh IP/32, sets MTU if > 0, brings up |
+| `Setup`         | `(ctx context.Context, identity *registration.NodeIdentity) error`           | Creates interface, assigns the mesh IP with the `domain_mesh_cidr` prefix (fallback `/32`), sets MTU if > 0, brings up |
 | `Teardown`      | `() error`                                                                   | Deletes the WireGuard interface                                |
 | `AddPeer`       | `(peer api.Peer) error`                                                      | Translates and adds peer; updates index                        |
 | `RemovePeer`    | `(publicKey []byte) error`                                                   | Removes peer by raw public key                                 |
@@ -155,7 +155,7 @@ if err := mgr.Teardown(); err != nil {
 ### Setup Sequence
 
 1. `CreateInterface(name, privateKey, listenPort)` — create WireGuard interface with node's private key
-2. `ConfigureAddress(name, meshIP+"/32")` — assign mesh IP as point-to-point address
+2. `ConfigureAddress(name, meshIP+"/<prefix>")` — assign the mesh IP. The prefix length comes from the registration `domain_mesh_cidr`, so the kernel installs an on-link route for the whole mesh (which the snapshot peers, advertised as `mesh_ip/32`, rely on). Identities without the field, or with an unparseable value, fall back to a host `/32` (the unparseable case is logged as a warning)
 3. `SetMTU(name, mtu)` — only if `Config.MTU > 0`
 4. `SetInterfaceUp(name)` — bring the interface up
 
@@ -181,7 +181,7 @@ All log entries use `component=wireguard`. Private keys and PSKs are never logge
 
 ## ReconcileHandler
 
-Factory function returning a `reconcile.ReconcileHandler` that applies peer changes from the `StateDiff`.
+Factory function returning a `reconcile.ReconcileHandler` that applies peer changes from the `StateDiff`. Peer membership comes solely from the snapshot `peers` block.
 
 ```go
 func ReconcileHandler(mgr *Manager) reconcile.ReconcileHandler
@@ -189,9 +189,15 @@ func ReconcileHandler(mgr *Manager) reconcile.ReconcileHandler
 
 ### Processing Order
 
-1. **Removes** — `diff.PeersToRemove` via `RemovePeerByID`
+1. **Removes** — `diff.PeersToRemove` (node IDs) via `RemovePeerByID`
 2. **Updates** — `diff.PeersToUpdate` via `UpdatePeer`
 3. **Adds** — `diff.PeersToAdd` via `AddPeer`
+
+Adds and updates carry `api.SnapshotPeer` entries, converted to the WireGuard `api.Peer` by `peerFromSnapshot`:
+
+- `AllowedIPs` is derived locally as `mesh_ip/32` — the snapshot never sends allowed IPs.
+- `Endpoint` is the peer's `fallback_endpoint` (the relay target). Direct endpoints keep arriving via the untouched `peer_endpoint_changed` SSE path.
+- **No PSK is fabricated** — peers are configured without a preshared key. PSK distribution is deferred until the control plane exposes one.
 
 Individual failures are logged and collected. The handler returns an aggregated error via `errors.Join` (nil if all succeed). This ensures the reconciler marks the cycle as failed and retries on the next tick.
 
@@ -203,6 +209,8 @@ mgr := wireguard.NewManager(ctrl, wireguard.Config{}, logger)
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(mgr))
 ```
+
+The agent registers this handler **only when WireGuard `Setup` succeeded**. On hosts without a programmable WireGuard stack the interface fails to come up, the agent continues without WireGuard, and the peer reconcile handler is skipped — a handler that failed every cycle would hold the reconciler snapshot back and prevent convergence (for example, the policy fingerprint short-circuit could never hold).
 
 ## SSE Event Handlers
 

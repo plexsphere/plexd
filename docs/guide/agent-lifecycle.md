@@ -142,17 +142,15 @@ The reconciliation loop (`reconcile.interval`, default 60s) ensures that the loc
 
 Each reconciliation cycle:
 
-1. **Pull full state** from `GET /v1/nodes/{node_id}/state` - includes peer list, policies, signing keys, pending actions, node metadata, data entries, and secret references.
-2. **Diff** the received state against the local WireGuard configuration, nftables rules, signing key store, and node state cache.
+1. **Pull the state snapshot** from `GET /v1/nodes/{node_id}/state` — the `NodeStateSnapshot` envelope with its always-present blocks (`peers`, `reachability`, `policy`, `bridge`, `state`, `reports`). A `null` block means "not populated".
+2. **Diff** the snapshot against the local snapshot by presence: peer add/remove/update, and per-block change flags for policy, bridge, and the state/reports buckets.
 3. **Apply corrections** for any detected drift:
-   - Add/remove WireGuard peers
-   - Update endpoints, allowed IPs, PSKs
-   - Add/remove nftables rules
-   - Update signing keys
-   - Update node metadata, data entries, and secret references
-4. **Report drift** to the control plane for observability (`POST /v1/nodes/{node_id}/drift`), including what was corrected.
+   - Add/remove WireGuard peers (membership comes from the `peers` block; AllowedIPs derived as `mesh_ip/32`, no PSK)
+   - Rebuild nftables rules from the merged `policy` block, but only when its fingerprint changed
+   - Reconcile the bridge subtrees (relay, user access, ingress, site-to-site)
+   - Feed the node state cache from the `state` block
 
-Reconciliation is also triggered immediately after SSE reconnection (see [SSE Reconnection](#sse-reconnection)).
+The pull is one-way — plexd does not report drift back to the control plane. Applied-correction visibility will return as node-authored state reports (issue #23). Reconciliation is also triggered immediately after SSE reconnection (see [SSE Reconnection](#sse-reconnection)).
 
 ## See Also
 

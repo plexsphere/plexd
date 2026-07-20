@@ -130,7 +130,7 @@ HeartbeatService
 ├── client: ControlPlane (sends heartbeat RPCs)
 ├── reconcileTrigger: Reconciler (triggers state reconciliation)
 ├── onAuthFailure: re-registers → updates auth token
-└── onRotateKeys: triggers reconcile (fetches new signing keys)
+└── onRotateKeys: triggers reconcile (key material itself arrives via the signing_key_rotated SSE event)
 ```
 
 ## Interfaces
