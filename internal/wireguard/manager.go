@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"net/netip"
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/registration"
@@ -35,7 +36,7 @@ func (m *Manager) Setup(ctx context.Context, identity *registration.NodeIdentity
 		return fmt.Errorf("wireguard: setup: %w", err)
 	}
 
-	if err := m.ctrl.ConfigureAddress(m.cfg.InterfaceName, identity.MeshIP+"/32"); err != nil {
+	if err := m.ctrl.ConfigureAddress(m.cfg.InterfaceName, m.interfaceAddress(identity)); err != nil {
 		return fmt.Errorf("wireguard: setup: %w", err)
 	}
 
@@ -57,6 +58,42 @@ func (m *Manager) Setup(ctx context.Context, identity *registration.NodeIdentity
 	)
 
 	return nil
+}
+
+// interfaceAddress derives the interface address from the node identity. The
+// prefix length comes from the registration domain_mesh_cidr so the kernel
+// installs an on-link route for the whole mesh; identities without the field
+// (pre-#18) or with an unparseable one fall back to a host /32.
+//
+// The prefix is only trusted when it actually contains MeshIP and is not
+// absurdly broad. The control plane's value flows in unchecked: a "0.0.0.0/0"
+// would install an on-link route for all of IPv4 pointed at wg0 (blackholing
+// the node's own control-plane connectivity), and a prefix that does not contain
+// MeshIP (e.g. 192.168.0.0/16 with a 10.0.0.5 mesh IP) would hijack an unrelated
+// subnet — possibly the node's real LAN. Both fall back to a host /32.
+func (m *Manager) interfaceAddress(identity *registration.NodeIdentity) string {
+	if identity.DomainMeshCIDR == "" {
+		return identity.MeshIP + "/32"
+	}
+	prefix, err := netip.ParsePrefix(identity.DomainMeshCIDR)
+	if err != nil {
+		m.logger.Warn("invalid domain mesh cidr, falling back to /32",
+			"component", "wireguard",
+			"domain_mesh_cidr", identity.DomainMeshCIDR,
+			"error", err,
+		)
+		return identity.MeshIP + "/32"
+	}
+	addr, addrErr := netip.ParseAddr(identity.MeshIP)
+	if addrErr != nil || !prefix.Addr().Is4() || !prefix.Contains(addr) || prefix.Bits() < 8 {
+		m.logger.Warn("domain mesh cidr does not contain mesh ip or is too broad, falling back to /32",
+			"component", "wireguard",
+			"domain_mesh_cidr", identity.DomainMeshCIDR,
+			"mesh_ip", identity.MeshIP,
+		)
+		return identity.MeshIP + "/32"
+	}
+	return fmt.Sprintf("%s/%d", identity.MeshIP, prefix.Bits())
 }
 
 // Teardown deletes the WireGuard interface.
