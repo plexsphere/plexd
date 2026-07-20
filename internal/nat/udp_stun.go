@@ -13,24 +13,26 @@ type UDPSTUNClient struct {
 	Timeout time.Duration
 }
 
-// Bind sends a STUN Binding Request to serverAddr from localPort and returns
-// the mapped address from the response.
-func (c *UDPSTUNClient) Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, error) {
+// Bind sends a STUN Binding Request to serverAddr from localPort (0 for an
+// OS-assigned ephemeral port) and returns the mapped address from the
+// response along with the local port the socket was bound to.
+func (c *UDPSTUNClient) Bind(ctx context.Context, serverAddr string, localPort int) (MappedAddress, int, error) {
 	if err := ctx.Err(); err != nil {
-		return MappedAddress{}, fmt.Errorf("nat: udp stun: %w", err)
+		return MappedAddress{}, 0, fmt.Errorf("nat: udp stun: %w", err)
 	}
 
 	remoteAddr, err := net.ResolveUDPAddr("udp4", serverAddr)
 	if err != nil {
-		return MappedAddress{}, fmt.Errorf("nat: udp stun: resolve: %w", err)
+		return MappedAddress{}, 0, fmt.Errorf("nat: udp stun: resolve: %w", err)
 	}
 
 	localAddr := net.UDPAddr{Port: localPort}
 	conn, err := net.DialUDP("udp4", &localAddr, remoteAddr)
 	if err != nil {
-		return MappedAddress{}, fmt.Errorf("nat: udp stun: dial: %w", err)
+		return MappedAddress{}, 0, fmt.Errorf("nat: udp stun: dial: %w", err)
 	}
 	defer conn.Close()
+	boundPort := conn.LocalAddr().(*net.UDPAddr).Port
 
 	// Use the earlier of Timeout or context deadline.
 	deadline := time.Now().Add(c.Timeout)
@@ -38,29 +40,29 @@ func (c *UDPSTUNClient) Bind(ctx context.Context, serverAddr string, localPort i
 		deadline = ctxDeadline
 	}
 	if err := conn.SetDeadline(deadline); err != nil {
-		return MappedAddress{}, fmt.Errorf("nat: udp stun: set deadline: %w", err)
+		return MappedAddress{}, 0, fmt.Errorf("nat: udp stun: set deadline: %w", err)
 	}
 
 	var txID [12]byte
 	if _, err := rand.Read(txID[:]); err != nil {
-		return MappedAddress{}, fmt.Errorf("nat: udp stun: random tx id: %w", err)
+		return MappedAddress{}, 0, fmt.Errorf("nat: udp stun: random tx id: %w", err)
 	}
 
 	req := buildBindingRequest(txID)
 	if _, err := conn.Write(req); err != nil {
-		return MappedAddress{}, fmt.Errorf("nat: udp stun: write: %w", err)
+		return MappedAddress{}, 0, fmt.Errorf("nat: udp stun: write: %w", err)
 	}
 
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
-		return MappedAddress{}, fmt.Errorf("nat: udp stun: read: %w", err)
+		return MappedAddress{}, 0, fmt.Errorf("nat: udp stun: read: %w", err)
 	}
 
 	addr, err := parseBindingResponse(buf[:n], txID)
 	if err != nil {
-		return MappedAddress{}, fmt.Errorf("nat: udp stun: parse: %w", err)
+		return MappedAddress{}, 0, fmt.Errorf("nat: udp stun: parse: %w", err)
 	}
 
-	return addr, nil
+	return addr, boundPort, nil
 }

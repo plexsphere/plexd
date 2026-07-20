@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -28,11 +30,24 @@ type DiscoveryResult struct {
 }
 
 // Discoverer performs STUN-based NAT traversal to discover the node's public endpoint.
+//
+// STUN runs on its own ephemeral UDP socket, never on the WireGuard listen
+// port: the kernel WireGuard socket owns that port, and UDP port sharing
+// would require SO_REUSEPORT on both sockets, which the kernel side does not
+// set — a bind attempt fails with EADDRINUSE on every node whose WireGuard
+// interface is up. The mapped address therefore describes the STUN socket's
+// mapping, and the published endpoint carries the mapped IP with the
+// advertised WireGuard listen port instead. That endpoint is exact wherever
+// the NAT preserves or forwards the port; where it translates ports
+// per-mapping, nat_type (symmetric) remains the signal that direct dialing
+// is unreliable.
 type Discoverer struct {
-	client    STUNClient
-	cfg       Config
-	localPort int
-	logger    *slog.Logger
+	client STUNClient
+	cfg    Config
+	// advertisePort is the WireGuard listen port published in the reported
+	// endpoint. It is not used as a STUN source port.
+	advertisePort int
+	logger        *slog.Logger
 
 	mu         sync.RWMutex
 	lastResult *DiscoveryResult
@@ -42,30 +57,37 @@ type Discoverer struct {
 	rejections int
 }
 
-// NewDiscoverer creates a new Discoverer.
-func NewDiscoverer(client STUNClient, cfg Config, localPort int, logger *slog.Logger) *Discoverer {
+// NewDiscoverer creates a new Discoverer. advertisePort is the WireGuard
+// listen port carried in every published endpoint.
+func NewDiscoverer(client STUNClient, cfg Config, advertisePort int, logger *slog.Logger) *Discoverer {
 	return &Discoverer{
-		client:    client,
-		cfg:       cfg,
-		localPort: localPort,
-		logger:    logger,
+		client:        client,
+		cfg:           cfg,
+		advertisePort: advertisePort,
+		logger:        logger,
 	}
 }
 
-// bind performs a STUN binding against server and rejects a mapped address
-// that is not usable as a public endpoint. STUN responses are
+// bind performs a STUN binding against server from localPort and rejects a
+// mapped address that is not usable as a public endpoint. STUN responses are
 // unauthenticated (see MappedAddress.Routable), so a non-routable address is
 // treated exactly like a failed binding: the caller falls through to the
 // next server rather than publishing it.
-func (d *Discoverer) bind(ctx context.Context, server string) (MappedAddress, error) {
-	addr, err := d.client.Bind(ctx, server, d.localPort)
+func (d *Discoverer) bind(ctx context.Context, server string, localPort int) (MappedAddress, int, error) {
+	addr, usedPort, err := d.client.Bind(ctx, server, localPort)
 	if err != nil {
-		return MappedAddress{}, err
+		return MappedAddress{}, 0, err
 	}
 	if !addr.Routable() {
-		return MappedAddress{}, fmt.Errorf("nat: stun: non-routable mapped address %s", addr)
+		return MappedAddress{}, 0, fmt.Errorf("nat: stun: non-routable mapped address %s", addr)
 	}
-	return addr, nil
+	return addr, usedPort, nil
+}
+
+// advertisedEndpoint is the endpoint published for this node: the
+// STUN-mapped IP joined with the advertised WireGuard listen port.
+func (d *Discoverer) advertisedEndpoint(addr MappedAddress) string {
+	return net.JoinHostPort(addr.IP.String(), strconv.Itoa(d.advertisePort))
 }
 
 // Discover performs STUN binding requests to discover the public endpoint and classify NAT type.
@@ -74,19 +96,26 @@ func (d *Discoverer) Discover(ctx context.Context) (*DiscoveryResult, error) {
 	var firstServer string
 	firstFound := false
 
+	// stunPort is this cycle's STUN source port. The first successful
+	// binding lets the OS pick it (localPort 0); the remaining bindings
+	// reuse it so mapped addresses from different servers describe the same
+	// local socket and can be compared for classification.
+	stunPort := 0
+
 	// Try each STUN server in order to get a first successful binding.
 	remainingStart := 0
 	for i, server := range d.cfg.STUNServers {
-		addr, err := d.bind(ctx, server)
+		addr, usedPort, err := d.bind(ctx, server, stunPort)
 		if err != nil {
 			d.logger.Warn("STUN binding failed", "component", "nat", "server", server, "error", err)
 			continue
 		}
 		firstAddr = addr
 		firstServer = server
+		stunPort = usedPort
 		firstFound = true
 		remainingStart = i + 1
-		d.logger.Debug("STUN binding succeeded", "component", "nat", "server", server, "endpoint", addr.String())
+		d.logger.Debug("STUN binding succeeded", "component", "nat", "server", server, "mapped_address", addr.String())
 		break
 	}
 
@@ -94,9 +123,9 @@ func (d *Discoverer) Discover(ctx context.Context) (*DiscoveryResult, error) {
 		return nil, fmt.Errorf("nat: discover: all STUN servers failed")
 	}
 
-	// Check if mapped port matches local port — indicates no NAT.
-	if firstAddr.Port == d.localPort {
-		endpoint := firstAddr.String()
+	// A mapped port equal to the source port means no port translation — no NAT.
+	if firstAddr.Port == stunPort {
+		endpoint := d.advertisedEndpoint(firstAddr)
 		d.updateLastResult(endpoint, NATNone, firstServer)
 		return &DiscoveryResult{Endpoint: endpoint, NATType: NATNone}, nil
 	}
@@ -104,7 +133,7 @@ func (d *Discoverer) Discover(ctx context.Context) (*DiscoveryResult, error) {
 	// Try remaining servers to get a second binding for NAT classification.
 	natType := NATUnknown
 	for _, server := range d.cfg.STUNServers[remainingStart:] {
-		secondAddr, err := d.bind(ctx, server)
+		secondAddr, _, err := d.bind(ctx, server, stunPort)
 		if err != nil {
 			d.logger.Warn("STUN binding failed", "component", "nat", "server", server, "error", err)
 			continue
@@ -122,7 +151,7 @@ func (d *Discoverer) Discover(ctx context.Context) (*DiscoveryResult, error) {
 		d.logger.Warn("NAT classification incomplete: no second STUN server responded", "component", "nat")
 	}
 
-	endpoint := firstAddr.String()
+	endpoint := d.advertisedEndpoint(firstAddr)
 	d.updateLastResult(endpoint, natType, firstServer)
 	return &DiscoveryResult{Endpoint: endpoint, NATType: natType}, nil
 }

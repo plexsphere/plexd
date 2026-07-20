@@ -30,7 +30,7 @@ type sequenceSTUNClient struct {
 	calls   int
 }
 
-func (s *sequenceSTUNClient) Bind(ctx context.Context, serverAddr string, localPort int) (nat.MappedAddress, error) {
+func (s *sequenceSTUNClient) Bind(ctx context.Context, serverAddr string, localPort int) (nat.MappedAddress, int, error) {
 	s.mu.Lock()
 	s.calls++
 	i := s.idx
@@ -41,9 +41,13 @@ func (s *sequenceSTUNClient) Bind(ctx context.Context, serverAddr string, localP
 	s.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
-		return nat.MappedAddress{}, err
+		return nat.MappedAddress{}, 0, err
 	}
-	return r.Addr, r.Err
+	usedPort := localPort
+	if usedPort == 0 {
+		usedPort = 40000 // stands in for the OS's ephemeral choice
+	}
+	return r.Addr, usedPort, r.Err
 }
 
 // trackingWGController is a mock WGController that records AddPeer calls
@@ -118,8 +122,8 @@ func TestIntegration_FullEndpointExchangeFlow(t *testing.T) {
 		}
 
 		// Verify the endpoint contract body was reported correctly.
-		if req.Endpoint != "203.0.113.1:12345" {
-			t.Errorf("reported endpoint = %q, want %q", req.Endpoint, "203.0.113.1:12345")
+		if req.Endpoint != "203.0.113.1:51820" {
+			t.Errorf("reported endpoint = %q, want %q", req.Endpoint, "203.0.113.1:51820")
 		}
 		if req.NATType != "full_cone" {
 			t.Errorf("reported NAT type = %q, want %q", req.NATType, "full_cone")
@@ -185,8 +189,8 @@ func TestIntegration_FullEndpointExchangeFlow(t *testing.T) {
 	if info == nil {
 		t.Fatal("LastResult = nil after full exchange flow")
 	}
-	if info.Endpoint != "203.0.113.1:12345" {
-		t.Errorf("LastResult.Endpoint = %q, want %q", info.Endpoint, "203.0.113.1:12345")
+	if info.Endpoint != "203.0.113.1:51820" {
+		t.Errorf("LastResult.Endpoint = %q, want %q", info.Endpoint, "203.0.113.1:51820")
 	}
 }
 
@@ -324,11 +328,11 @@ func TestIntegration_EndpointChangeDuringRefreshLoop(t *testing.T) {
 	if len(reportedEndpoints) < 2 {
 		t.Fatalf("expected at least 2 reported endpoints, got %d", len(reportedEndpoints))
 	}
-	if reportedEndpoints[0] != "203.0.113.1:12345" {
-		t.Errorf("first reported endpoint = %q, want %q", reportedEndpoints[0], "203.0.113.1:12345")
+	if reportedEndpoints[0] != "203.0.113.1:51820" {
+		t.Errorf("first reported endpoint = %q, want %q", reportedEndpoints[0], "203.0.113.1:51820")
 	}
-	if reportedEndpoints[1] != "198.51.100.9:54321" {
-		t.Errorf("second reported endpoint = %q, want %q", reportedEndpoints[1], "198.51.100.9:54321")
+	if reportedEndpoints[1] != "198.51.100.9:51820" {
+		t.Errorf("second reported endpoint = %q, want %q", reportedEndpoints[1], "198.51.100.9:51820")
 	}
 }
 

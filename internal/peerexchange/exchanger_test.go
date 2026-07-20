@@ -49,7 +49,7 @@ type mockBindResult struct {
 	Err  error
 }
 
-func (m *mockSTUNClient) Bind(ctx context.Context, serverAddr string, localPort int) (nat.MappedAddress, error) {
+func (m *mockSTUNClient) Bind(ctx context.Context, serverAddr string, localPort int) (nat.MappedAddress, int, error) {
 	m.mu.Lock()
 	m.calls = append(m.calls, mockBindCall{ServerAddr: serverAddr, LocalPort: localPort})
 	results := m.results
@@ -57,15 +57,19 @@ func (m *mockSTUNClient) Bind(ctx context.Context, serverAddr string, localPort 
 	m.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
-		return nat.MappedAddress{}, err
+		return nat.MappedAddress{}, 0, err
 	}
 
+	usedPort := localPort
+	if usedPort == 0 {
+		usedPort = 40000 // stands in for the OS's ephemeral choice
+	}
 	if results != nil {
 		if r, ok := results[serverAddr]; ok {
-			return r.Addr, r.Err
+			return r.Addr, usedPort, r.Err
 		}
 	}
-	return nat.MappedAddress{}, defaultErr
+	return nat.MappedAddress{}, 0, defaultErr
 }
 
 // mockWGController is a test double for wireguard.WGController.
@@ -226,8 +230,8 @@ func TestExchanger_Run_InitialDiscoveryAndReport(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		if req.Endpoint != "203.0.113.1:12345" {
-			t.Errorf("Endpoint = %q, want %q", req.Endpoint, "203.0.113.1:12345")
+		if req.Endpoint != "203.0.113.1:51820" {
+			t.Errorf("Endpoint = %q, want %q", req.Endpoint, "203.0.113.1:51820")
 		}
 		reportReceived.Store(true)
 
@@ -404,8 +408,8 @@ func TestExchanger_LastResult(t *testing.T) {
 	if info == nil {
 		t.Fatal("expected non-nil LastResult after discovery")
 	}
-	if info.Endpoint != "203.0.113.1:12345" {
-		t.Errorf("Endpoint = %q, want %q", info.Endpoint, "203.0.113.1:12345")
+	if info.Endpoint != "203.0.113.1:51820" {
+		t.Errorf("Endpoint = %q, want %q", info.Endpoint, "203.0.113.1:51820")
 	}
 	if info.NATType != nat.NATFullCone {
 		t.Errorf("NATType = %q, want %q", info.NATType, nat.NATFullCone)
