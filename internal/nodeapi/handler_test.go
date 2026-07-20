@@ -987,3 +987,69 @@ func TestHandler_ReloadHooks_NoReloader(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+// --- Policy endpoint tests ---
+
+type mockPolicyProvider struct {
+	policy *api.PolicySnapshot
+}
+
+func (m *mockPolicyProvider) ActivePolicy() *api.PolicySnapshot { return m.policy }
+
+func newTestHandlerWithPolicy(t *testing.T, provider PolicyProvider) *httptest.Server {
+	t.Helper()
+	dir := t.TempDir()
+	cache := NewStateCache(dir, discardLogger())
+	if err := cache.Load(); err != nil {
+		t.Fatalf("cache.Load: %v", err)
+	}
+	nsk := testKey(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := NewHandler(cache, &mockSecretFetcher{}, "node-1", nsk, logger)
+	if provider != nil {
+		h.SetPolicyProvider(provider)
+	}
+	srv := httptest.NewServer(h.Mux())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestHandler_GetPolicies_MergedBlock(t *testing.T) {
+	provider := &mockPolicyProvider{policy: &api.PolicySnapshot{
+		RevisionID:  "rev-1",
+		Fingerprint: "fp-1",
+		Rules: []api.PolicyRule{
+			{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
+		},
+	}}
+	srv := newTestHandlerWithPolicy(t, provider)
+
+	resp := mustGet(t, srv.URL+"/v1/policies")
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var got api.PolicySnapshot
+	decodeJSON(t, resp, &got)
+	if got.Fingerprint != "fp-1" {
+		t.Errorf("fingerprint = %q, want %q", got.Fingerprint, "fp-1")
+	}
+	if len(got.Rules) != 1 || got.Rules[0].Ports == nil || got.Rules[0].Ports.From != 443 {
+		t.Errorf("rules = %+v, want a single tcp/443 rule", got.Rules)
+	}
+}
+
+func TestHandler_GetPolicies_EmptyWhenAbsent(t *testing.T) {
+	// Both a nil provider and a nil policy serve an empty JSON object.
+	for _, provider := range []PolicyProvider{nil, &mockPolicyProvider{policy: nil}} {
+		srv := newTestHandlerWithPolicy(t, provider)
+		resp := mustGet(t, srv.URL+"/v1/policies")
+		if resp.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if strings.TrimSpace(string(body)) != "{}" {
+			t.Errorf("absent policy body = %q, want {}", strings.TrimSpace(string(body)))
+		}
+	}
+}

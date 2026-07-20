@@ -281,6 +281,16 @@ func TestServer_ReconcileHandler(t *testing.T) {
 		t.Fatal("socket did not appear")
 	}
 
+	// Pre-seed the secret index so we can assert reconcile leaves it untouched
+	// (secret refs no longer ride the snapshot).
+	srv.cache.UpdateSecretIndex([]api.SecretRef{{Key: "db-pass", Version: 2}})
+
+	// Pre-seed an SSE-delivered data entry so we can assert the pull path does
+	// not clobber it with a fabricated content_type/version.
+	srv.cache.UpdateData([]api.DataEntry{
+		{Key: "cfg", ContentType: "application/json", Payload: json.RawMessage(`{"a":1}`), Version: 7},
+	})
+
 	// Get the reconcile handler.
 	handler := srv.ReconcileHandler()
 	if handler == nil {
@@ -288,44 +298,71 @@ func TestServer_ReconcileHandler(t *testing.T) {
 		t.Fatal("ReconcileHandler returned nil")
 	}
 
-	// Call it with state that has metadata/data/secret changes.
-	desired := &api.StateResponse{
-		Metadata: map[string]string{"env": "prod"},
-		Data: []api.DataEntry{
-			{Key: "cfg", ContentType: "application/json", Payload: json.RawMessage(`{}`), Version: 1},
-		},
-		SecretRefs: []api.SecretRef{
-			{Key: "db-pass", Version: 2},
+	// StateChanged feeds the metadata map. The snapshot's opaque data bucket is
+	// deliberately ignored — the versioned data store is SSE-owned.
+	desired := &api.NodeStateSnapshot{
+		State: &api.NodeStateBlock{
+			Metadata: []api.StateEntry{{Key: "env", Value: "prod"}},
+			Data:     []api.StateEntry{{Key: "cfg", Value: "hello"}},
+			Reports:  []api.StateEntry{},
 		},
 	}
-	diff := reconcile.StateDiff{
-		MetadataChanged:   true,
-		DataChanged:       true,
-		SecretRefsChanged: true,
-	}
+	diff := reconcile.StateDiff{StateChanged: true}
 
 	if err := handler(ctx, desired, diff); err != nil {
 		cancel()
 		t.Fatalf("reconcile handler: %v", err)
 	}
 
-	// Verify cache updated.
+	// Verify metadata bucket became the cache metadata map.
 	meta := srv.cache.GetMetadata()
 	if meta["env"] != "prod" {
 		cancel()
 		t.Errorf("metadata[env] = %q, want %q", meta["env"], "prod")
 	}
 
+	// The SSE-delivered data entry must survive the pull untouched: its real
+	// content_type and version are not overwritten with fabricated values.
 	data := srv.cache.GetData()
-	if _, ok := data["cfg"]; !ok {
+	entry, ok := data["cfg"]
+	if !ok {
 		cancel()
-		t.Error("data entry 'cfg' not found")
+		t.Fatal("SSE-delivered data entry 'cfg' was removed by reconcile")
+	}
+	if entry.ContentType != "application/json" {
+		cancel()
+		t.Errorf("data content_type = %q, want %q (clobbered by pull)", entry.ContentType, "application/json")
+	}
+	if entry.Version != 7 {
+		cancel()
+		t.Errorf("data version = %d, want 7 (clobbered by pull)", entry.Version)
 	}
 
+	// Reconcile must NOT touch the secret index.
 	secrets := srv.cache.GetSecretIndex()
-	if len(secrets) != 1 || secrets[0].Key != "db-pass" {
+	if len(secrets) != 1 || secrets[0].Key != "db-pass" || secrets[0].Version != 2 {
 		cancel()
-		t.Errorf("secret index = %v, want [{db-pass 2}]", secrets)
+		t.Errorf("secret index changed by reconcile: %v", secrets)
+	}
+
+	// A nil State block authoritatively clears the pull-owned metadata map but
+	// leaves the SSE-owned data store intact.
+	if err := handler(ctx, &api.NodeStateSnapshot{State: nil}, reconcile.StateDiff{StateChanged: true}); err != nil {
+		cancel()
+		t.Fatalf("reconcile handler (nil state): %v", err)
+	}
+	if len(srv.cache.GetMetadata()) != 0 {
+		cancel()
+		t.Errorf("metadata not cleared on nil state: %v", srv.cache.GetMetadata())
+	}
+	if _, ok := srv.cache.GetData()["cfg"]; !ok {
+		cancel()
+		t.Errorf("SSE-owned data cleared by nil state block")
+	}
+	// The secret index remains untouched by the clear.
+	if len(srv.cache.GetSecretIndex()) != 1 {
+		cancel()
+		t.Errorf("secret index touched by state clear: %v", srv.cache.GetSecretIndex())
 	}
 
 	cancel()

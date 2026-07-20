@@ -8,7 +8,8 @@ type FirewallRule struct {
 	SrcIP     string // source IP (CIDR or single IP)
 	DstIP     string // destination IP (CIDR or single IP)
 	Port      int    // destination port (0 = any)
-	Protocol  string // "tcp", "udp", or "" (any)
+	PortTo    int    // inclusive end of a destination port range, 0 means single-Port match
+	Protocol  string // "tcp", "udp", "icmp", or "" (any)
 	Action    string // "allow" or "deny"
 }
 
@@ -21,11 +22,19 @@ func (r *FirewallRule) Validate() error {
 	if r.Port < 0 || r.Port > 65535 {
 		return fmt.Errorf("policy: firewall rule: invalid port %d", r.Port)
 	}
-	if r.Protocol != "" && r.Protocol != "tcp" && r.Protocol != "udp" {
+	if r.Protocol != "" && r.Protocol != "tcp" && r.Protocol != "udp" && r.Protocol != "icmp" {
 		return fmt.Errorf("policy: firewall rule: invalid protocol %q", r.Protocol)
 	}
-	if r.Port > 0 && r.Protocol == "" {
-		return fmt.Errorf("policy: firewall rule: port %d requires a protocol", r.Port)
+	if r.Port > 0 && r.Protocol != "tcp" && r.Protocol != "udp" {
+		return fmt.Errorf("policy: firewall rule: port %d requires protocol tcp or udp", r.Port)
+	}
+	if r.PortTo != 0 {
+		if r.Port <= 0 {
+			return fmt.Errorf("policy: firewall rule: port range end %d requires a start port", r.PortTo)
+		}
+		if r.PortTo < r.Port || r.PortTo > 65535 {
+			return fmt.Errorf("policy: firewall rule: invalid port range end %d", r.PortTo)
+		}
 	}
 	return nil
 }

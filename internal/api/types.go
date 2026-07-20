@@ -32,7 +32,7 @@ type RegisterResponse struct {
 
 // RegisterPeer is the initial peer snapshot entry returned by POST /v1/register.
 // It is deliberately narrow: it carries NO psk, allowed_ips, or endpoint. The
-// richer reconciliation peer shapes belong to issue #20.
+// reconciliation peer shape is SnapshotPeer.
 type RegisterPeer struct {
 	NodeID           string `json:"node_id"`
 	MeshIP           string `json:"mesh_ip"`
@@ -40,7 +40,8 @@ type RegisterPeer struct {
 	FallbackEndpoint string `json:"fallback_endpoint,omitempty"`
 }
 
-// Peer is used in state responses and key-rotation responses.
+// Peer is the WireGuard peer shape used only for SSE peer_* payloads and
+// KeyRotateResponse until issues #21/#25 migrate those contracts.
 type Peer struct {
 	ID         string   `json:"id"`
 	PublicKey  string   `json:"public_key"`
@@ -71,31 +72,81 @@ type HeartbeatResponse struct {
 // State  GET /v1/nodes/{node_id}/state
 // ---------------------------------------------------------------------------
 
-type StateResponse struct {
-	Peers            []Peer            `json:"peers"`
-	Policies         []Policy          `json:"policies"`
-	SigningKeys      *SigningKeys      `json:"signing_keys,omitempty"`
-	Metadata         map[string]string `json:"metadata,omitempty"`
-	BridgeConfig     *BridgeConfig     `json:"bridge_config,omitempty"`
-	RelayConfig      *RelayConfig      `json:"relay_config,omitempty"`
-	UserAccessConfig *UserAccessConfig `json:"user_access_config,omitempty"`
-	IngressConfig    *IngressConfig    `json:"ingress_config,omitempty"`
-	SiteToSiteConfig *SiteToSiteConfig `json:"site_to_site_config,omitempty"`
-	Data             []DataEntry       `json:"data"`
-	SecretRefs       []SecretRef       `json:"secret_refs"`
+// NodeStateSnapshot is the desired-state envelope returned by
+// GET /v1/nodes/{node_id}/state. Every block key is always present on the wire:
+// a null value means "block not populated", never "field absent". The differ
+// therefore distinguishes a nil pointer from a populated block, so none of the
+// six fields carry omitempty.
+type NodeStateSnapshot struct {
+	Peers        []SnapshotPeer  `json:"peers"`
+	Reachability json.RawMessage `json:"reachability"`
+	Policy       *PolicySnapshot `json:"policy"`
+	Bridge       *BridgeSnapshot `json:"bridge"`
+	State        *NodeStateBlock `json:"state"`
+	Reports      *NodeStateBlock `json:"reports"`
 }
 
-type Policy struct {
-	ID    string       `json:"id"`
-	Rules []PolicyRule `json:"rules"`
+// SnapshotPeer is a reconciliation peer entry in NodeStateSnapshot. It is a
+// separate type from RegisterPeer (one Go type per contract schema) and carries
+// NO psk, allowed_ips, or endpoint: AllowedIPs are derived locally as
+// mesh_ip/32, fallback_endpoint is the relay target programmed as the WireGuard
+// endpoint, and no preshared key is fabricated.
+type SnapshotPeer struct {
+	NodeID           string `json:"node_id"`
+	MeshIP           string `json:"mesh_ip"`
+	PublicKey        string `json:"public_key"`
+	FallbackEndpoint string `json:"fallback_endpoint,omitempty"`
 }
 
+// PolicySnapshot is the single merged policy block. Fingerprint is a 44-char
+// base64 SHA-256 over the server's canonical rule byte stream; plexd treats it
+// as an opaque comparison key and never re-derives it from Rules.
+type PolicySnapshot struct {
+	RevisionID  string       `json:"revision_id"`
+	Fingerprint string       `json:"fingerprint"`
+	Rules       []PolicyRule `json:"rules"`
+}
+
+// PolicyRule is a five-tuple firewall rule. Ports is present iff Protocol is
+// tcp or udp and is absent for icmp/any.
 type PolicyRule struct {
-	Src      string `json:"src"`
-	Dst      string `json:"dst"`
-	Port     int    `json:"port"`
-	Protocol string `json:"protocol"`
-	Action   string `json:"action"`
+	Action          string     `json:"action"`
+	Protocol        string     `json:"protocol"`
+	SourceCIDR      string     `json:"source_cidr"`
+	DestinationCIDR string     `json:"destination_cidr"`
+	Ports           *PortRange `json:"ports,omitempty"`
+}
+
+// PortRange is a single inclusive destination port range (from <= to).
+type PortRange struct {
+	From int `json:"from"`
+	To   int `json:"to"`
+}
+
+// BridgeSnapshot carries the four bridge subtrees. Each child is
+// present-but-nullable; there are no base fields on the wire.
+type BridgeSnapshot struct {
+	Relay      *RelayConfig      `json:"relay"`
+	UserAccess *UserAccessConfig `json:"user_access"`
+	Ingress    *IngressConfig    `json:"ingress"`
+	SiteToSite *SiteToSiteConfig `json:"site_to_site"`
+}
+
+// NodeStateBlock is a three-bucket state block. Each bucket is a required array
+// (never null when the block is populated), with entries ordered by key
+// ascending.
+type NodeStateBlock struct {
+	Metadata []StateEntry `json:"metadata"`
+	Data     []StateEntry `json:"data"`
+	Reports  []StateEntry `json:"reports"`
+}
+
+// StateEntry is a single state entry. Value is an opaque string; WorkloadTag is
+// absent/empty when the entry is unattributed.
+type StateEntry struct {
+	Key         string `json:"key"`
+	Value       string `json:"value"`
+	WorkloadTag string `json:"workload_tag,omitempty"`
 }
 
 type SigningKeys struct {
@@ -115,20 +166,6 @@ type DataEntry struct {
 type SecretRef struct {
 	Key     string `json:"key"`
 	Version int    `json:"version"`
-}
-
-// ---------------------------------------------------------------------------
-// Drift  POST /v1/nodes/{node_id}/drift
-// ---------------------------------------------------------------------------
-
-type DriftReport struct {
-	Timestamp   time.Time         `json:"timestamp"`
-	Corrections []DriftCorrection `json:"corrections"`
-}
-
-type DriftCorrection struct {
-	Type   string `json:"type"`
-	Detail string `json:"detail"`
 }
 
 // ---------------------------------------------------------------------------
@@ -353,13 +390,6 @@ type IntegrityViolationReport struct {
 // ---------------------------------------------------------------------------
 // Bridge Mode
 // ---------------------------------------------------------------------------
-
-// BridgeConfig is the bridge configuration pushed from the control plane.
-type BridgeConfig struct {
-	AccessSubnets    []string `json:"access_subnets"`
-	EnableNAT        bool     `json:"enable_nat"`
-	EnableForwarding bool     `json:"enable_forwarding"`
-}
 
 // BridgeInfo is the bridge status reported by the node in heartbeats.
 type BridgeInfo struct {

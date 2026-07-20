@@ -233,17 +233,15 @@ func TestHandleIngressRuleRevoked_MalformedPayload(t *testing.T) {
 // IngressReconcileHandler tests
 // ---------------------------------------------------------------------------
 
-func TestIngressReconcileHandler_NilConfig(t *testing.T) {
+func TestIngressReconcileHandler_NilBridge(t *testing.T) {
 	ctrl := &mockIngressController{}
 	mgr := newTestIngressManager(t, ctrl)
 	defer func() { _ = mgr.Teardown() }()
 
 	handler := IngressReconcileHandler(mgr, discardLogger())
 
-	// Desired state has nil IngressConfig — no changes.
-	desired := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk", MeshIP: "10.42.0.2"}},
-	}
+	// A nil Bridge means "not populated": reconcile against an empty desired set.
+	desired := &api.NodeStateSnapshot{}
 	diff := reconcile.StateDiff{}
 
 	err := handler(context.Background(), desired, diff)
@@ -252,7 +250,7 @@ func TestIngressReconcileHandler_NilConfig(t *testing.T) {
 	}
 
 	if len(ctrl.ingressCallsFor("Listen")) != 0 {
-		t.Error("Listen should not be called when IngressConfig is nil")
+		t.Error("Listen should not be called when Bridge is nil")
 	}
 }
 
@@ -263,12 +261,14 @@ func TestIngressReconcileHandler_AddsNewRules(t *testing.T) {
 
 	handler := IngressReconcileHandler(mgr, discardLogger())
 
-	desired := &api.StateResponse{
-		IngressConfig: &api.IngressConfig{
-			Enabled: true,
-			Rules: []api.IngressRule{
-				{RuleID: "rule-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"},
-				{RuleID: "rule-2", ListenPort: 0, TargetAddr: "10.0.0.6:8080", Mode: "tcp"},
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Ingress: &api.IngressConfig{
+				Enabled: true,
+				Rules: []api.IngressRule{
+					{RuleID: "rule-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"},
+					{RuleID: "rule-2", ListenPort: 0, TargetAddr: "10.0.0.6:8080", Mode: "tcp"},
+				},
 			},
 		},
 	}
@@ -307,11 +307,13 @@ func TestIngressReconcileHandler_RemovesStaleRules(t *testing.T) {
 	handler := IngressReconcileHandler(mgr, discardLogger())
 
 	// Desired state: only rule-1 remains.
-	desired := &api.StateResponse{
-		IngressConfig: &api.IngressConfig{
-			Enabled: true,
-			Rules: []api.IngressRule{
-				{RuleID: "rule-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"},
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Ingress: &api.IngressConfig{
+				Enabled: true,
+				Rules: []api.IngressRule{
+					{RuleID: "rule-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"},
+				},
 			},
 		},
 	}
@@ -353,10 +355,12 @@ func TestIngressReconcileHandler_DetectsChangedRules(t *testing.T) {
 
 	// Desired state: same rule ID but different TargetAddr.
 	changed := api.IngressRule{RuleID: "rule-1", ListenPort: 0, TargetAddr: "10.0.0.5:9090", Mode: "tcp"}
-	desired := &api.StateResponse{
-		IngressConfig: &api.IngressConfig{
-			Enabled: true,
-			Rules:   []api.IngressRule{changed},
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Ingress: &api.IngressConfig{
+				Enabled: true,
+				Rules:   []api.IngressRule{changed},
+			},
 		},
 	}
 	diff := reconcile.StateDiff{}
@@ -401,10 +405,12 @@ func TestIngressReconcileHandler_UnchangedRulesUntouched(t *testing.T) {
 	handler := IngressReconcileHandler(mgr, discardLogger())
 
 	// Desired state: same rule, unchanged.
-	desired := &api.StateResponse{
-		IngressConfig: &api.IngressConfig{
-			Enabled: true,
-			Rules:   []api.IngressRule{rule},
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Ingress: &api.IngressConfig{
+				Enabled: true,
+				Rules:   []api.IngressRule{rule},
+			},
 		},
 	}
 	diff := reconcile.StateDiff{}
@@ -440,12 +446,14 @@ func TestIngressReconcileHandler_Mixed(t *testing.T) {
 	handler := IngressReconcileHandler(mgr, discardLogger())
 
 	// Desired: keep rule-keep, add rule-new, remove rule-stale.
-	desired := &api.StateResponse{
-		IngressConfig: &api.IngressConfig{
-			Enabled: true,
-			Rules: []api.IngressRule{
-				{RuleID: "rule-keep", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"},
-				{RuleID: "rule-new", ListenPort: 0, TargetAddr: "10.0.0.7:8080", Mode: "tcp"},
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Ingress: &api.IngressConfig{
+				Enabled: true,
+				Rules: []api.IngressRule{
+					{RuleID: "rule-keep", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"},
+					{RuleID: "rule-new", ListenPort: 0, TargetAddr: "10.0.0.7:8080", Mode: "tcp"},
+				},
 			},
 		},
 	}
@@ -486,5 +494,32 @@ func TestIngressReconcileHandler_Mixed(t *testing.T) {
 	}
 	if _, ok := idSet["rule-stale"]; ok {
 		t.Error("rule-stale should have been removed")
+	}
+}
+
+func TestIngressReconcileHandler_TeardownOnNilBridge(t *testing.T) {
+	// A populated ingress manager reconciled against a nil Bridge (and against a
+	// nil Ingress child) tears down its existing rules — null means "not populated".
+	for name, desired := range map[string]*api.NodeStateSnapshot{
+		"nil bridge":  {},
+		"nil ingress": {Bridge: &api.BridgeSnapshot{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctrl := &mockIngressController{}
+			mgr := newTestIngressManager(t, ctrl)
+			defer func() { _ = mgr.Teardown() }()
+
+			if err := mgr.AddRule(api.IngressRule{RuleID: "rule-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"}); err != nil {
+				t.Fatalf("AddRule: %v", err)
+			}
+
+			handler := IngressReconcileHandler(mgr, discardLogger())
+			if err := handler(context.Background(), desired, reconcile.StateDiff{}); err != nil {
+				t.Fatalf("handler error = %v, want nil", err)
+			}
+			if n := len(mgr.RuleIDs()); n != 0 {
+				t.Errorf("RuleIDs count = %d, want 0 (stale rule torn down)", n)
+			}
+		})
 	}
 }

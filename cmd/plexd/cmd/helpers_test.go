@@ -81,7 +81,9 @@ func startFakeAgent(t *testing.T, summary nodeapi.StateSummary) string {
 	})
 	mux.HandleFunc("GET /v1/policies", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode([]any{})
+		// Mirror the real handler: the merged policy is served as an object
+		// ({} when no policy is active), never as an array.
+		_ = json.NewEncoder(w).Encode(struct{}{})
 	})
 	mux.HandleFunc("GET /v1/log-status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

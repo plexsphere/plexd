@@ -146,6 +146,23 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	fwCtrl := newFirewallController(logger)
 	enforcer := policy.NewEnforcer(policyEngine, fwCtrl, cfg.Policy, logger)
 
+	// Install the deny-by-default baseline immediately, independent of the
+	// reconcile diff. A nil policy yields a default-deny-only ruleset, so the
+	// node is never left unfiltered while waiting for the control plane to
+	// publish its first policy revision (the differ short-circuits when both
+	// snapshots lack a policy block, so the reconcile handler alone would never
+	// install a chain). The reconcile handler replaces this baseline once a
+	// policy revision arrives.
+	//
+	// Failure aborts startup. ApplyFirewallRules only returns an error once
+	// enforcement was actually requested and a backend exists — the disabled
+	// and no-backend cases are no-ops that return nil — so continuing here
+	// would bring up WireGuard and join the mesh with no chain installed,
+	// exactly the unfiltered state this call exists to prevent.
+	if _, err := enforcer.ApplyFirewallRules(nil, cfg.WireGuard.InterfaceName); err != nil {
+		return fmt.Errorf("plexd up: install deny-by-default firewall baseline: %w", err)
+	}
+
 	// 5d. Initialize tunnel subsystem.
 	hostKey, err := tunnel.LoadOrGenerateHostKey(cfg.DataDir, logger)
 	if err != nil {
@@ -426,32 +443,21 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// Register nodeapi reconcile handler so cache updates on drift.
 	reconciler.RegisterHandler(nodeAPISrv.ReconcileHandler())
 
-	// Register signing keys reconcile handler to update verifier on drift.
-	reconciler.RegisterHandler(func(_ context.Context, desired *api.StateResponse, diff reconcile.StateDiff) error {
-		if diff.SigningKeysChanged && diff.NewSigningKeys != nil {
-			current, prev, expires := decodeSigningKeys(*diff.NewSigningKeys, logger)
-			verifier.SetKeys(current, prev, expires)
-			logger.Info("signing keys updated via reconcile")
-		}
-		return nil
-	})
-
 	// Register WireGuard reconcile handler.
 	reconciler.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
 
 	// Register policy reconcile handler.
-	reconciler.RegisterHandler(policy.ReconcileHandler(enforcer, wgMgr, identity.NodeID, identity.MeshIP, cfg.WireGuard.InterfaceName))
+	reconciler.RegisterHandler(policy.ReconcileHandler(enforcer, cfg.WireGuard.InterfaceName))
 
 	// Register peer/policy snapshot reconcile handler for node API queries.
-	reconciler.RegisterHandler(func(_ context.Context, desired *api.StateResponse, _ reconcile.StateDiff) error {
+	reconciler.RegisterHandler(func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
 		peerSnap.update(desired.Peers)
-		policySnap.update(desired.Policies)
+		policySnap.update(desired.Policy)
 		return nil
 	})
 
 	// Register bridge reconcile handlers (conditional).
 	if bridgeMgr != nil {
-		reconciler.RegisterHandler(bridge.ReconcileHandler(bridgeMgr))
 		if relay := bridgeMgr.Relay(); relay != nil {
 			reconciler.RegisterHandler(bridge.RelayReconcileHandler(relay, logger))
 		}
@@ -790,14 +796,14 @@ func (ps *peerSnapshot) PeerStatuses() []nodeapi.PeerStatus {
 	return ps.peers
 }
 
-func (ps *peerSnapshot) update(apiPeers []api.Peer) {
+func (ps *peerSnapshot) update(apiPeers []api.SnapshotPeer) {
 	statuses := make([]nodeapi.PeerStatus, len(apiPeers))
 	for i, p := range apiPeers {
 		statuses[i] = nodeapi.PeerStatus{
-			ID:        p.ID,
+			ID:        p.NodeID,
 			PublicKey: p.PublicKey,
 			MeshIP:    p.MeshIP,
-			Endpoint:  p.Endpoint,
+			Endpoint:  p.FallbackEndpoint,
 		}
 	}
 	ps.mu.Lock()
@@ -805,21 +811,22 @@ func (ps *peerSnapshot) update(apiPeers []api.Peer) {
 	ps.mu.Unlock()
 }
 
-// policySnapshot implements nodeapi.PolicyProvider with a thread-safe cached policy list.
+// policySnapshot implements nodeapi.PolicyProvider with a thread-safe cached
+// merged policy.
 type policySnapshot struct {
-	mu       sync.RWMutex
-	policies []api.Policy
+	mu     sync.RWMutex
+	policy *api.PolicySnapshot
 }
 
-func (ps *policySnapshot) ActivePolicies() []api.Policy {
+func (ps *policySnapshot) ActivePolicy() *api.PolicySnapshot {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
-	return ps.policies
+	return ps.policy
 }
 
-func (ps *policySnapshot) update(policies []api.Policy) {
+func (ps *policySnapshot) update(policy *api.PolicySnapshot) {
 	ps.mu.Lock()
-	ps.policies = policies
+	ps.policy = policy
 	ps.mu.Unlock()
 }
 

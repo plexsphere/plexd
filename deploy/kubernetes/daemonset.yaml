@@ -35,6 +35,13 @@ spec:
             - --config
             - /etc/plexd/config.yaml
           securityContext:
+            # plexd programs the kernel over netlink: the WireGuard interface
+            # and the nftables chain. Capabilities added to a non-root
+            # container reach the bounding set only — execve clears permitted
+            # and effective — so the image's unprivileged USER would leave
+            # every netlink call at EPERM.
+            runAsUser: 0
+            runAsGroup: 0
             allowPrivilegeEscalation: false
             capabilities:
               drop:

@@ -185,14 +185,13 @@ func TestHandleRelaySessionRevoked_NonExistent(t *testing.T) {
 // RelayReconcileHandler tests
 // ---------------------------------------------------------------------------
 
-func TestRelayReconcileHandler_NilRelayConfig(t *testing.T) {
+func TestRelayReconcileHandler_NilBridge(t *testing.T) {
 	relay := NewRelay(0, 100, 5*time.Minute, discardLogger())
 
 	handler := RelayReconcileHandler(relay, discardLogger())
 
-	desired := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk", MeshIP: "10.42.0.2"}},
-	}
+	// A nil Bridge means "not populated": reconcile against an empty desired set.
+	desired := &api.NodeStateSnapshot{}
 	diff := reconcile.StateDiff{}
 
 	err := handler(context.Background(), desired, diff)
@@ -210,24 +209,26 @@ func TestRelayReconcileHandler_AddMissing(t *testing.T) {
 
 	handler := RelayReconcileHandler(relay, discardLogger())
 
-	desired := &api.StateResponse{
-		RelayConfig: &api.RelayConfig{
-			Sessions: []api.RelaySessionAssignment{
-				{
-					SessionID:     "sess-1",
-					PeerAID:       "peer-a",
-					PeerAEndpoint: "127.0.0.1:5000",
-					PeerBID:       "peer-b",
-					PeerBEndpoint: "127.0.0.1:5001",
-					ExpiresAt:     time.Now().Add(5 * time.Minute),
-				},
-				{
-					SessionID:     "sess-2",
-					PeerAID:       "peer-c",
-					PeerAEndpoint: "127.0.0.1:5002",
-					PeerBID:       "peer-d",
-					PeerBEndpoint: "127.0.0.1:5003",
-					ExpiresAt:     time.Now().Add(5 * time.Minute),
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Relay: &api.RelayConfig{
+				Sessions: []api.RelaySessionAssignment{
+					{
+						SessionID:     "sess-1",
+						PeerAID:       "peer-a",
+						PeerAEndpoint: "127.0.0.1:5000",
+						PeerBID:       "peer-b",
+						PeerBEndpoint: "127.0.0.1:5001",
+						ExpiresAt:     time.Now().Add(5 * time.Minute),
+					},
+					{
+						SessionID:     "sess-2",
+						PeerAID:       "peer-c",
+						PeerAEndpoint: "127.0.0.1:5002",
+						PeerBID:       "peer-d",
+						PeerBEndpoint: "127.0.0.1:5003",
+						ExpiresAt:     time.Now().Add(5 * time.Minute),
+					},
 				},
 			},
 		},
@@ -266,9 +267,11 @@ func TestRelayReconcileHandler_RemoveStale(t *testing.T) {
 	handler := RelayReconcileHandler(relay, discardLogger())
 
 	// Desired state has no sessions — stale session should be removed.
-	desired := &api.StateResponse{
-		RelayConfig: &api.RelayConfig{
-			Sessions: []api.RelaySessionAssignment{},
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Relay: &api.RelayConfig{
+				Sessions: []api.RelaySessionAssignment{},
+			},
 		},
 	}
 	diff := reconcile.StateDiff{}
@@ -280,6 +283,37 @@ func TestRelayReconcileHandler_RemoveStale(t *testing.T) {
 
 	if relay.ActiveCount() != 0 {
 		t.Errorf("ActiveCount = %d, want 0", relay.ActiveCount())
+	}
+}
+
+func TestRelayReconcileHandler_TeardownOnNilBridge(t *testing.T) {
+	// A populated relay reconciled against a nil Bridge (and against a nil Relay
+	// child) tears down its existing sessions — null means "not populated".
+	for name, desired := range map[string]*api.NodeStateSnapshot{
+		"nil bridge": {},
+		"nil relay":  {Bridge: &api.BridgeSnapshot{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			relay := NewRelay(0, 100, 5*time.Minute, discardLogger())
+			if err := relay.AddSession(api.RelaySessionAssignment{
+				SessionID:     "sess-1",
+				PeerAID:       "peer-a",
+				PeerAEndpoint: "127.0.0.1:5000",
+				PeerBID:       "peer-b",
+				PeerBEndpoint: "127.0.0.1:5001",
+				ExpiresAt:     time.Now().Add(5 * time.Minute),
+			}); err != nil {
+				t.Fatalf("AddSession: %v", err)
+			}
+
+			handler := RelayReconcileHandler(relay, discardLogger())
+			if err := handler(context.Background(), desired, reconcile.StateDiff{}); err != nil {
+				t.Fatalf("handler error = %v, want nil", err)
+			}
+			if relay.ActiveCount() != 0 {
+				t.Errorf("ActiveCount = %d, want 0 (stale session torn down)", relay.ActiveCount())
+			}
+		})
 	}
 }
 
@@ -316,17 +350,19 @@ func TestRelayReconcileHandler_Mixed(t *testing.T) {
 	handler := RelayReconcileHandler(relay, discardLogger())
 
 	// Desired: keep "keep-sess", add "new-sess", remove "stale-sess".
-	desired := &api.StateResponse{
-		RelayConfig: &api.RelayConfig{
-			Sessions: []api.RelaySessionAssignment{
-				keep,
-				{
-					SessionID:     "new-sess",
-					PeerAID:       "peer-e",
-					PeerAEndpoint: "127.0.0.1:5004",
-					PeerBID:       "peer-f",
-					PeerBEndpoint: "127.0.0.1:5005",
-					ExpiresAt:     time.Now().Add(5 * time.Minute),
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Relay: &api.RelayConfig{
+				Sessions: []api.RelaySessionAssignment{
+					keep,
+					{
+						SessionID:     "new-sess",
+						PeerAID:       "peer-e",
+						PeerAEndpoint: "127.0.0.1:5004",
+						PeerBID:       "peer-f",
+						PeerBEndpoint: "127.0.0.1:5005",
+						ExpiresAt:     time.Now().Add(5 * time.Minute),
+					},
 				},
 			},
 		},

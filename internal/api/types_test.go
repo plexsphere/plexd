@@ -250,45 +250,134 @@ func TestTypesEndpointResponse(t *testing.T) {
 	}
 }
 
-func TestTypesStateResponse(t *testing.T) {
+func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	expires := now.Add(24 * time.Hour)
-	orig := StateResponse{
-		Peers: []Peer{
-			{ID: "n-002", PublicKey: "pk", MeshIP: "10.42.0.2", Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.42.0.2/32"}, PSK: "psk"},
+	orig := NodeStateSnapshot{
+		Peers: []SnapshotPeer{
+			{NodeID: "n-002", MeshIP: "10.42.0.2", PublicKey: "pk", FallbackEndpoint: "1.2.3.4:51820"},
 		},
-		Policies: []Policy{
-			{ID: "pol-1", Rules: []PolicyRule{
-				{Src: "10.42.0.0/24", Dst: "10.42.0.1/32", Port: 443, Protocol: "tcp", Action: "allow"},
-			}},
+		Reachability: json.RawMessage(`{"state":"healthy","changed_at":"2026-01-01T00:00:00Z"}`),
+		Policy: &PolicySnapshot{
+			RevisionID:  "rev-1",
+			Fingerprint: "0123456789012345678901234567890123456789012=",
+			Rules: []PolicyRule{
+				{Action: "allow", Protocol: "tcp", SourceCIDR: "10.42.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &PortRange{From: 443, To: 443}},
+			},
 		},
-		SigningKeys: &SigningKeys{
-			Current:           "key-current",
-			Previous:          "key-prev",
-			TransitionExpires: &expires,
+		Bridge: &BridgeSnapshot{
+			Relay: &RelayConfig{Sessions: []RelaySessionAssignment{{SessionID: "r1", ExpiresAt: now}}},
 		},
-		Metadata: map[string]string{"region": "us-east"},
-		Data: []DataEntry{
-			{Key: "config/app", ContentType: "application/json", Payload: json.RawMessage(`{"k":"v"}`), Version: 1, UpdatedAt: now},
+		State: &NodeStateBlock{
+			Metadata: []StateEntry{{Key: "region", Value: "us-east"}},
+			Data:     []StateEntry{{Key: "app/config", Value: "x"}},
+			Reports:  []StateEntry{},
 		},
-		SecretRefs: []SecretRef{
-			{Key: "db-password", Version: 2},
+		Reports: &NodeStateBlock{
+			Metadata: []StateEntry{},
+			Data:     []StateEntry{},
+			Reports:  []StateEntry{},
 		},
 	}
-	_, got := roundTrip(t, orig)
+	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
+
+	// Exactly the six contract keys must appear.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 6 {
+		t.Errorf("expected exactly 6 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
 }
 
-func TestTypesDriftReport(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := DriftReport{
-		Timestamp: now,
-		Corrections: []DriftCorrection{
-			{Type: "peer_missing", Detail: "re-added peer n-003"},
-		},
+func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
+	// Decoding explicit nulls yields nil pointers.
+	const nullBlocks = `{"peers":[],"reachability":null,"policy":null,"bridge":null,"state":null,"reports":null}`
+	var snap NodeStateSnapshot
+	if err := json.Unmarshal([]byte(nullBlocks), &snap); err != nil {
+		t.Fatalf("unmarshal null blocks: %v", err)
 	}
-	_, got := roundTrip(t, orig)
+	if snap.Policy != nil || snap.Bridge != nil || snap.State != nil || snap.Reports != nil {
+		t.Errorf("null blocks should decode to nil pointers, got %+v", snap)
+	}
+	if snap.Peers == nil || len(snap.Peers) != 0 {
+		t.Errorf("peers = %v, want empty non-nil slice", snap.Peers)
+	}
+
+	// A populated zero-value block decodes to a NON-nil pointer — distinct from
+	// a null block.
+	const populatedPolicy = `{"peers":[],"reachability":null,"policy":{},"bridge":null,"state":null,"reports":null}`
+	var snap2 NodeStateSnapshot
+	if err := json.Unmarshal([]byte(populatedPolicy), &snap2); err != nil {
+		t.Fatalf("unmarshal populated policy: %v", err)
+	}
+	if snap2.Policy == nil {
+		t.Error("policy:{} should decode to a non-nil pointer, distinct from null")
+	}
+
+	// Marshalling nil blocks emits literal null with all six keys PRESENT.
+	out, err := json.Marshal(NodeStateSnapshot{})
+	if err != nil {
+		t.Fatalf("marshal zero value: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(out, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports"} {
+		v, ok := raw[key]
+		if !ok {
+			t.Errorf("key %q absent, want present with null value", key)
+			continue
+		}
+		if key == "peers" {
+			continue // nil slice marshals as null; presence is what matters
+		}
+		if string(v) != "null" {
+			t.Errorf("key %q = %s, want null", key, v)
+		}
+	}
+}
+
+func TestSnapshotPeer_OmitsEmptyFallbackEndpoint(t *testing.T) {
+	orig := SnapshotPeer{NodeID: "n-002", MeshIP: "10.42.0.2", PublicKey: "pk"}
+	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
+	if s := string(data); strings.Contains(s, `"fallback_endpoint"`) {
+		t.Errorf("fallback_endpoint should be omitted when empty, got: %s", s)
+	}
+
+	orig.FallbackEndpoint = "203.0.113.1:51820"
+	data2, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data2); !strings.Contains(s, `"fallback_endpoint"`) {
+		t.Errorf("fallback_endpoint should be present when set, got: %s", s)
+	}
+}
+
+func TestPolicyRule_PortsOmittedWhenNil(t *testing.T) {
+	// Nil Ports → no "ports" key (icmp carries no ports).
+	orig := PolicyRule{Action: "allow", Protocol: "icmp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+	if s := string(data); strings.Contains(s, `"ports"`) {
+		t.Errorf("ports should be omitted when nil, got: %s", s)
+	}
+
+	// Set Ports → {"from":443,"to":443}.
+	orig.Protocol = "tcp"
+	orig.Ports = &PortRange{From: 443, To: 443}
+	data2, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data2); !strings.Contains(s, `"ports":{"from":443,"to":443}`) {
+		t.Errorf(`ports should serialize as {"from":443,"to":443}, got: %s`, s)
+	}
 }
 
 func TestTypesSecretResponse(t *testing.T) {
@@ -495,27 +584,6 @@ func TestTypesIntegrityViolationReport(t *testing.T) {
 	}
 }
 
-func TestBridgeConfig_JSONRoundTrip(t *testing.T) {
-	orig := BridgeConfig{
-		AccessSubnets:    []string{"192.168.1.0/24", "10.0.0.0/8"},
-		EnableNAT:        true,
-		EnableForwarding: true,
-	}
-	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// Verify snake_case keys.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-	for _, key := range []string{"access_subnets", "enable_nat", "enable_forwarding"} {
-		if _, ok := raw[key]; !ok {
-			t.Errorf("expected JSON key %q", key)
-		}
-	}
-}
-
 func TestBridgeInfo_JSONRoundTrip(t *testing.T) {
 	orig := BridgeInfo{
 		Enabled:         true,
@@ -645,63 +713,6 @@ func TestBridgeInfo_RelayFields_JSONRoundTrip(t *testing.T) {
 	}
 }
 
-func TestStateResponse_WithRelayConfig(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := StateResponse{
-		Peers:    []Peer{{ID: "n-002", PublicKey: "pk", MeshIP: "10.42.0.2", Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.42.0.2/32"}, PSK: "psk"}},
-		Policies: []Policy{},
-		RelayConfig: &RelayConfig{
-			Sessions: []RelaySessionAssignment{
-				{
-					SessionID:     "relay-001",
-					PeerAID:       "n-001",
-					PeerAEndpoint: "1.2.3.4:51820",
-					PeerBID:       "n-002",
-					PeerBEndpoint: "5.6.7.8:51820",
-					ExpiresAt:     now.Add(1 * time.Hour),
-				},
-			},
-		},
-		Data:       []DataEntry{{Key: "k", ContentType: "text/plain", Payload: json.RawMessage(`"v"`), Version: 1, UpdatedAt: now}},
-		SecretRefs: []SecretRef{},
-	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// RelayConfig field should be omitted when nil.
-	orig.RelayConfig = nil
-	data, got2 := roundTrip(t, orig)
-	requireEqual(t, orig, got2)
-	if s := string(data); strings.Contains(s, `"relay_config"`) {
-		t.Errorf("relay_config should be omitted when nil, got: %s", s)
-	}
-}
-
-func TestStateResponse_WithBridgeConfig(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := StateResponse{
-		Peers:    []Peer{{ID: "n-002", PublicKey: "pk", MeshIP: "10.42.0.2", Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.42.0.2/32"}, PSK: "psk"}},
-		Policies: []Policy{},
-		BridgeConfig: &BridgeConfig{
-			AccessSubnets:    []string{"192.168.1.0/24"},
-			EnableNAT:        true,
-			EnableForwarding: false,
-		},
-		Data:       []DataEntry{{Key: "k", ContentType: "text/plain", Payload: json.RawMessage(`"v"`), Version: 1, UpdatedAt: now}},
-		SecretRefs: []SecretRef{},
-	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// BridgeConfig field should be omitted when nil.
-	orig.BridgeConfig = nil
-	data, got2 := roundTrip(t, orig)
-	requireEqual(t, orig, got2)
-	if s := string(data); strings.Contains(s, `"bridge_config"`) {
-		t.Errorf("bridge_config should be omitted when nil, got: %s", s)
-	}
-}
-
 func TestUserAccessConfig_JSONRoundTrip(t *testing.T) {
 	orig := UserAccessConfig{
 		Enabled:       true,
@@ -786,34 +797,6 @@ func TestUserAccessInfo_JSONRoundTrip(t *testing.T) {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
-	}
-}
-
-func TestStateResponse_WithUserAccessConfig(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := StateResponse{
-		Peers:    []Peer{{ID: "n-002", PublicKey: "pk", MeshIP: "10.42.0.2", Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.42.0.2/32"}, PSK: "psk"}},
-		Policies: []Policy{},
-		UserAccessConfig: &UserAccessConfig{
-			Enabled:       true,
-			InterfaceName: "wg-access0",
-			ListenPort:    51830,
-			Peers: []UserAccessPeer{
-				{PublicKey: "ua-pk-001", AllowedIPs: []string{"10.99.0.1/32"}, PSK: "ua-psk", Label: "alice"},
-			},
-		},
-		Data:       []DataEntry{{Key: "k", ContentType: "text/plain", Payload: json.RawMessage(`"v"`), Version: 1, UpdatedAt: now}},
-		SecretRefs: []SecretRef{},
-	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// UserAccessConfig field should be omitted when nil.
-	orig.UserAccessConfig = nil
-	data, got2 := roundTrip(t, orig)
-	requireEqual(t, orig, got2)
-	if s := string(data); strings.Contains(s, `"user_access_config"`) {
-		t.Errorf("user_access_config should be omitted when nil, got: %s", s)
 	}
 }
 
@@ -921,32 +904,6 @@ func TestIngressInfo_JSONRoundTrip(t *testing.T) {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
-	}
-}
-
-func TestStateResponse_WithIngressConfig(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := StateResponse{
-		Peers:    []Peer{{ID: "n-002", PublicKey: "pk", MeshIP: "10.42.0.2", Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.42.0.2/32"}, PSK: "psk"}},
-		Policies: []Policy{},
-		IngressConfig: &IngressConfig{
-			Enabled: true,
-			Rules: []IngressRule{
-				{RuleID: "rule-001", ListenPort: 443, TargetAddr: "10.42.0.5:8443", Mode: "passthrough"},
-			},
-		},
-		Data:       []DataEntry{{Key: "k", ContentType: "text/plain", Payload: json.RawMessage(`"v"`), Version: 1, UpdatedAt: now}},
-		SecretRefs: []SecretRef{},
-	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// IngressConfig field should be omitted when nil.
-	orig.IngressConfig = nil
-	data, got2 := roundTrip(t, orig)
-	requireEqual(t, orig, got2)
-	if s := string(data); strings.Contains(s, `"ingress_config"`) {
-		t.Errorf("ingress_config should be omitted when nil, got: %s", s)
 	}
 }
 
@@ -1194,32 +1151,6 @@ func TestIngressInfo_ACMEEnabled_JSONRoundTrip(t *testing.T) {
 	data2, _ := roundTrip(t, orig)
 	if s := string(data2); !strings.Contains(s, `"acme_enabled"`) {
 		t.Errorf("acme_enabled should be present even when false, got: %s", s)
-	}
-}
-
-func TestStateResponse_WithSiteToSiteConfig(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := StateResponse{
-		Peers:    []Peer{{ID: "n-002", PublicKey: "pk", MeshIP: "10.42.0.2", Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.42.0.2/32"}, PSK: "psk"}},
-		Policies: []Policy{},
-		SiteToSiteConfig: &SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []SiteToSiteTunnel{
-				{TunnelID: "tun-001", RemoteEndpoint: "203.0.113.1:51820", RemotePublicKey: "rpk-001", LocalSubnets: []string{"192.168.1.0/24"}, RemoteSubnets: []string{"10.0.0.0/8"}, InterfaceName: "wg-s2s0", ListenPort: 51830},
-			},
-		},
-		Data:       []DataEntry{{Key: "k", ContentType: "text/plain", Payload: json.RawMessage(`"v"`), Version: 1, UpdatedAt: now}},
-		SecretRefs: []SecretRef{},
-	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// SiteToSiteConfig field should be omitted when nil.
-	orig.SiteToSiteConfig = nil
-	data, got2 := roundTrip(t, orig)
-	requireEqual(t, orig, got2)
-	if s := string(data); strings.Contains(s, `"site_to_site_config"`) {
-		t.Errorf("site_to_site_config should be omitted when nil, got: %s", s)
 	}
 }
 

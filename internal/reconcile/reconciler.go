@@ -11,14 +11,13 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// StateFetcher retrieves desired state and reports drift to the control plane.
+// StateFetcher retrieves the desired-state snapshot from the control plane.
 type StateFetcher interface {
-	FetchState(ctx context.Context, nodeID string) (*api.StateResponse, error)
-	ReportDrift(ctx context.Context, nodeID string, req api.DriftReport) error
+	FetchState(ctx context.Context, nodeID string) (*api.NodeStateSnapshot, error)
 }
 
 // ReconcileHandler is a function invoked when drift is detected.
-type ReconcileHandler func(ctx context.Context, desired *api.StateResponse, diff StateDiff) error
+type ReconcileHandler func(ctx context.Context, desired *api.NodeStateSnapshot, diff StateDiff) error
 
 // Reconciler periodically compares desired state against a local snapshot
 // and invokes registered handlers to correct drift.
@@ -104,7 +103,7 @@ func (r *Reconciler) Run(ctx context.Context, nodeID string) error {
 	}
 }
 
-// runCycle performs a single reconciliation cycle: fetch → diff → handle → report → update snapshot.
+// runCycle performs a single reconciliation cycle: fetch → diff → handle → update snapshot.
 func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 	start := time.Now()
 
@@ -136,18 +135,6 @@ func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 	// Invoke all handlers, tracking which had errors.
 	handlerFailed := r.invokeHandlers(ctx, desired, diff)
 
-	// Build and report drift.
-	report := BuildDriftReport(diff)
-	if err := r.client.ReportDrift(ctx, nodeID, report); err != nil {
-		if ctx.Err() == nil {
-			r.logger.Warn("ReportDrift failed",
-				"component", "reconcile",
-				"node_id", nodeID,
-				"error", err,
-			)
-		}
-	}
-
 	// Update snapshot only if no handler failed.
 	if !handlerFailed {
 		r.snapshot.Update(desired)
@@ -156,7 +143,7 @@ func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 	r.logger.Info("reconciliation cycle completed",
 		"component", "reconcile",
 		"node_id", nodeID,
-		"drift_count", len(report.Corrections),
+		"drift", diff.Summary(),
 		"duration", time.Since(start),
 		"handler_failed", handlerFailed,
 	)
@@ -164,7 +151,7 @@ func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 
 // invokeHandlers calls each registered handler with panic recovery.
 // Returns true if any handler returned an error or panicked.
-func (r *Reconciler) invokeHandlers(ctx context.Context, desired *api.StateResponse, diff StateDiff) bool {
+func (r *Reconciler) invokeHandlers(ctx context.Context, desired *api.NodeStateSnapshot, diff StateDiff) bool {
 	anyFailed := false
 	for i, handler := range r.handlers {
 		if err := r.safeInvoke(ctx, handler, desired, diff); err != nil {
@@ -180,7 +167,7 @@ func (r *Reconciler) invokeHandlers(ctx context.Context, desired *api.StateRespo
 }
 
 // safeInvoke calls a handler with panic recovery.
-func (r *Reconciler) safeInvoke(ctx context.Context, handler ReconcileHandler, desired *api.StateResponse, diff StateDiff) (err error) {
+func (r *Reconciler) safeInvoke(ctx context.Context, handler ReconcileHandler, desired *api.NodeStateSnapshot, diff StateDiff) (err error) {
 	defer func() {
 		if v := recover(); v != nil {
 			err = fmt.Errorf("handler panicked: %v\n%s", v, debug.Stack())

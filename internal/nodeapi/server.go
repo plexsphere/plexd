@@ -248,18 +248,37 @@ func (s *Server) RegisterEventHandlers(dispatcher *api.EventDispatcher) {
 }
 
 // ReconcileHandler returns a reconcile.ReconcileHandler that updates the cache
-// when drift is detected in metadata, data, or secret refs.
+// when the desired state block changes. The block's metadata bucket becomes the
+// cache metadata map (both representations are a faithful map[string]string, so
+// the pull round-trips it). A nil state block authoritatively clears the
+// metadata map.
+//
+// The versioned data store (GET /v1/state/data, api.DataEntry with a real
+// content_type and version) is owned by the node_state_updated SSE feed, not by
+// this pull path. The snapshot's data bucket carries only opaque key/value
+// strings (api.StateEntry) — it has no source for content_type or version, so
+// converting it here would have to fabricate both, pinning every entry to
+// version 1 and clobbering the SSE-delivered content_type/version that consumers
+// poll for change detection. The pull therefore leaves the data store to its SSE
+// owner, mirroring how secret refs already ride the node_secrets_updated feed.
 func (s *Server) ReconcileHandler() reconcile.ReconcileHandler {
-	return func(ctx context.Context, desired *api.StateResponse, diff reconcile.StateDiff) error {
-		if diff.MetadataChanged {
-			s.cache.UpdateMetadata(desired.Metadata)
+	return func(ctx context.Context, desired *api.NodeStateSnapshot, diff reconcile.StateDiff) error {
+		if !diff.StateChanged {
+			return nil
 		}
-		if diff.DataChanged {
-			s.cache.UpdateData(desired.Data)
+
+		if desired.State == nil {
+			// Authoritative clear of the metadata map the pull owns; the
+			// SSE-owned data store is left intact.
+			s.cache.UpdateMetadata(map[string]string{})
+			return nil
 		}
-		if diff.SecretRefsChanged {
-			s.cache.UpdateSecretIndex(desired.SecretRefs)
+
+		metadata := make(map[string]string, len(desired.State.Metadata))
+		for _, e := range desired.State.Metadata {
+			metadata[e.Key] = e.Value
 		}
+		s.cache.UpdateMetadata(metadata)
 		return nil
 	}
 }

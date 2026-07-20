@@ -170,15 +170,15 @@ func TestIngressIntegration_ReconcileDrift(t *testing.T) {
 	ctrl.resetIngress()
 
 	// Initial state: one ingress rule.
-	state1 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		IngressConfig: &api.IngressConfig{
-			Enabled: true,
-			Rules: []api.IngressRule{
-				{RuleID: "rule-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"},
+	state1 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Ingress: &api.IngressConfig{
+				Enabled: true,
+				Rules: []api.IngressRule{
+					{RuleID: "rule-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"},
+				},
 			},
 		},
-		Metadata: map[string]string{"version": "1"},
 	}
 	fetcher := &integrationStateFetcher{state: state1}
 
@@ -196,17 +196,17 @@ func TestIngressIntegration_ReconcileDrift(t *testing.T) {
 		return len(ctrl.ingressCallsFor("Listen")) >= 1
 	})
 
-	// Update: replace rule-1 with rule-2 and rule-3, bump metadata.
-	state2 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		IngressConfig: &api.IngressConfig{
-			Enabled: true,
-			Rules: []api.IngressRule{
-				{RuleID: "rule-2", ListenPort: 0, TargetAddr: "10.0.0.6:9090", Mode: "tcp"},
-				{RuleID: "rule-3", ListenPort: 0, TargetAddr: "10.0.0.7:3000", Mode: "tcp"},
+	// Update: replace rule-1 with rule-2 and rule-3.
+	state2 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Ingress: &api.IngressConfig{
+				Enabled: true,
+				Rules: []api.IngressRule{
+					{RuleID: "rule-2", ListenPort: 0, TargetAddr: "10.0.0.6:9090", Mode: "tcp"},
+					{RuleID: "rule-3", ListenPort: 0, TargetAddr: "10.0.0.7:3000", Mode: "tcp"},
+				},
 			},
 		},
-		Metadata: map[string]string{"version": "2"},
 	}
 	fetcher.setState(state2)
 	rec.TriggerReconcile()
@@ -218,13 +218,13 @@ func TestIngressIntegration_ReconcileDrift(t *testing.T) {
 	})
 
 	// Update: empty rules — all removed.
-	state3 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		IngressConfig: &api.IngressConfig{
-			Enabled: true,
-			Rules:   []api.IngressRule{},
+	state3 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Ingress: &api.IngressConfig{
+				Enabled: true,
+				Rules:   []api.IngressRule{},
+			},
 		},
-		Metadata: map[string]string{"version": "3"},
 	}
 	fetcher.setState(state3)
 	rec.TriggerReconcile()
@@ -258,23 +258,25 @@ func TestIngressIntegration_ConcurrentAccess(t *testing.T) {
 	}
 
 	var cycle atomic.Int32
-	states := []*api.StateResponse{
+	states := []*api.NodeStateSnapshot{
 		{
-			Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-			IngressConfig: &api.IngressConfig{
-				Enabled: true,
-				Rules: []api.IngressRule{
-					{RuleID: "rule-conc-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"},
+			Bridge: &api.BridgeSnapshot{
+				Ingress: &api.IngressConfig{
+					Enabled: true,
+					Rules: []api.IngressRule{
+						{RuleID: "rule-conc-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"},
+					},
 				},
 			},
 		},
 		{
-			Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-			IngressConfig: &api.IngressConfig{
-				Enabled: true,
-				Rules: []api.IngressRule{
-					{RuleID: "rule-conc-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"},
-					{RuleID: "rule-conc-2", ListenPort: 0, TargetAddr: "10.0.0.6:9090", Mode: "tcp"},
+			Bridge: &api.BridgeSnapshot{
+				Ingress: &api.IngressConfig{
+					Enabled: true,
+					Rules: []api.IngressRule{
+						{RuleID: "rule-conc-1", ListenPort: 0, TargetAddr: "10.0.0.5:8080", Mode: "tcp"},
+						{RuleID: "rule-conc-2", ListenPort: 0, TargetAddr: "10.0.0.6:9090", Mode: "tcp"},
+					},
 				},
 			},
 		},
@@ -367,4 +369,26 @@ func TestIngressIntegration_ConcurrentAccess(t *testing.T) {
 	if n := fetcher.getFetchCount(); n < 2 {
 		t.Errorf("FetchState calls = %d, want >= 2", n)
 	}
+}
+
+// alternatingBridgeFetcher returns different states on each fetch for race testing.
+type alternatingBridgeFetcher struct {
+	mu         sync.Mutex
+	states     []*api.NodeStateSnapshot
+	cycle      *atomic.Int32
+	fetchCount int
+}
+
+func (f *alternatingBridgeFetcher) FetchState(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fetchCount++
+	idx := int(f.cycle.Add(1)-1) % len(f.states)
+	return f.states[idx], nil
+}
+
+func (f *alternatingBridgeFetcher) getFetchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fetchCount
 }

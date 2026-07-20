@@ -453,21 +453,21 @@ func TestACMEIntegration_IngressReconcileWithACME(t *testing.T) {
 	ctrl.resetIngress()
 
 	// Initial state: one ACME ingress rule.
-	state1 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		IngressConfig: &api.IngressConfig{
-			Enabled: true,
-			Rules: []api.IngressRule{
-				{
-					RuleID:     "acme-reconcile-1",
-					ListenPort: 0,
-					TargetAddr: "10.0.0.5:8080",
-					Mode:       "acme",
-					Hostname:   "app.example.com",
+	state1 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Ingress: &api.IngressConfig{
+				Enabled: true,
+				Rules: []api.IngressRule{
+					{
+						RuleID:     "acme-reconcile-1",
+						ListenPort: 0,
+						TargetAddr: "10.0.0.5:8080",
+						Mode:       "acme",
+						Hostname:   "app.example.com",
+					},
 				},
 			},
 		},
-		Metadata: map[string]string{"version": "1"},
 	}
 	fetcher := &integrationStateFetcher{state: state1}
 
@@ -491,21 +491,21 @@ func TestACMEIntegration_IngressReconcileWithACME(t *testing.T) {
 	}
 
 	// Update state: remove acme-reconcile-1, add acme-reconcile-2.
-	state2 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		IngressConfig: &api.IngressConfig{
-			Enabled: true,
-			Rules: []api.IngressRule{
-				{
-					RuleID:     "acme-reconcile-2",
-					ListenPort: 0,
-					TargetAddr: "10.0.0.6:9090",
-					Mode:       "acme",
-					Hostname:   "api.example.com",
+	state2 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Ingress: &api.IngressConfig{
+				Enabled: true,
+				Rules: []api.IngressRule{
+					{
+						RuleID:     "acme-reconcile-2",
+						ListenPort: 0,
+						TargetAddr: "10.0.0.6:9090",
+						Mode:       "acme",
+						Hostname:   "api.example.com",
+					},
 				},
 			},
 		},
-		Metadata: map[string]string{"version": "2"},
 	}
 	fetcher.setState(state2)
 	rec.TriggerReconcile()

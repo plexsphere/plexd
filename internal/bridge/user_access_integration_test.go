@@ -132,17 +132,17 @@ func TestUserAccessIntegration_ReconcileDrift(t *testing.T) {
 	ctrl.resetAccess()
 
 	// Initial state: one peer.
-	state1 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		UserAccessConfig: &api.UserAccessConfig{
-			Enabled:       true,
-			InterfaceName: "wg-access",
-			ListenPort:    51822,
-			Peers: []api.UserAccessPeer{
-				{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
+	state1 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			UserAccess: &api.UserAccessConfig{
+				Enabled:       true,
+				InterfaceName: "wg-access",
+				ListenPort:    51822,
+				Peers: []api.UserAccessPeer{
+					{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
+				},
 			},
 		},
-		Metadata: map[string]string{"version": "1"},
 	}
 	fetcher := &integrationStateFetcher{state: state1}
 
@@ -160,19 +160,19 @@ func TestUserAccessIntegration_ReconcileDrift(t *testing.T) {
 		return len(ctrl.accessCallsFor("ConfigurePeer")) >= 1
 	})
 
-	// Update: replace pk-1 with pk-2 and pk-3, bump metadata.
-	state2 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		UserAccessConfig: &api.UserAccessConfig{
-			Enabled:       true,
-			InterfaceName: "wg-access",
-			ListenPort:    51822,
-			Peers: []api.UserAccessPeer{
-				{PublicKey: "pk-2", AllowedIPs: []string{"10.99.0.2/32"}, Label: "bob"},
-				{PublicKey: "pk-3", AllowedIPs: []string{"10.99.0.3/32"}, Label: "charlie"},
+	// Update: replace pk-1 with pk-2 and pk-3.
+	state2 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			UserAccess: &api.UserAccessConfig{
+				Enabled:       true,
+				InterfaceName: "wg-access",
+				ListenPort:    51822,
+				Peers: []api.UserAccessPeer{
+					{PublicKey: "pk-2", AllowedIPs: []string{"10.99.0.2/32"}, Label: "bob"},
+					{PublicKey: "pk-3", AllowedIPs: []string{"10.99.0.3/32"}, Label: "charlie"},
+				},
 			},
 		},
-		Metadata: map[string]string{"version": "2"},
 	}
 	fetcher.setState(state2)
 	rec.TriggerReconcile()
@@ -184,15 +184,15 @@ func TestUserAccessIntegration_ReconcileDrift(t *testing.T) {
 	})
 
 	// Update: empty peers — all removed.
-	state3 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		UserAccessConfig: &api.UserAccessConfig{
-			Enabled:       true,
-			InterfaceName: "wg-access",
-			ListenPort:    51822,
-			Peers:         []api.UserAccessPeer{},
+	state3 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			UserAccess: &api.UserAccessConfig{
+				Enabled:       true,
+				InterfaceName: "wg-access",
+				ListenPort:    51822,
+				Peers:         []api.UserAccessPeer{},
+			},
 		},
-		Metadata: map[string]string{"version": "3"},
 	}
 	fetcher.setState(state3)
 	rec.TriggerReconcile()
@@ -228,27 +228,29 @@ func TestUserAccessIntegration_ConcurrentAccess(t *testing.T) {
 	}
 
 	var cycle atomic.Int32
-	states := []*api.StateResponse{
+	states := []*api.NodeStateSnapshot{
 		{
-			Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-			UserAccessConfig: &api.UserAccessConfig{
-				Enabled:       true,
-				InterfaceName: "wg-access",
-				ListenPort:    51822,
-				Peers: []api.UserAccessPeer{
-					{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
+			Bridge: &api.BridgeSnapshot{
+				UserAccess: &api.UserAccessConfig{
+					Enabled:       true,
+					InterfaceName: "wg-access",
+					ListenPort:    51822,
+					Peers: []api.UserAccessPeer{
+						{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
+					},
 				},
 			},
 		},
 		{
-			Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-			UserAccessConfig: &api.UserAccessConfig{
-				Enabled:       true,
-				InterfaceName: "wg-access",
-				ListenPort:    51822,
-				Peers: []api.UserAccessPeer{
-					{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
-					{PublicKey: "pk-2", AllowedIPs: []string{"10.99.0.2/32"}, Label: "bob"},
+			Bridge: &api.BridgeSnapshot{
+				UserAccess: &api.UserAccessConfig{
+					Enabled:       true,
+					InterfaceName: "wg-access",
+					ListenPort:    51822,
+					Peers: []api.UserAccessPeer{
+						{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
+						{PublicKey: "pk-2", AllowedIPs: []string{"10.99.0.2/32"}, Label: "bob"},
+					},
 				},
 			},
 		},

@@ -19,15 +19,12 @@ func TestMain(m *testing.M) {
 
 // mockFetcher is a test double for StateFetcher.
 type mockFetcher struct {
-	mu          sync.Mutex
-	fetchCount  int
-	fetchFunc   func(ctx context.Context, nodeID string) (*api.StateResponse, error)
-	driftCount  int
-	driftFunc   func(ctx context.Context, nodeID string, req api.DriftReport) error
-	lastDrift   *api.DriftReport
+	mu         sync.Mutex
+	fetchCount int
+	fetchFunc  func(ctx context.Context, nodeID string) (*api.NodeStateSnapshot, error)
 }
 
-func (m *mockFetcher) FetchState(ctx context.Context, nodeID string) (*api.StateResponse, error) {
+func (m *mockFetcher) FetchState(ctx context.Context, nodeID string) (*api.NodeStateSnapshot, error) {
 	m.mu.Lock()
 	m.fetchCount++
 	fn := m.fetchFunc
@@ -35,37 +32,13 @@ func (m *mockFetcher) FetchState(ctx context.Context, nodeID string) (*api.State
 	if fn != nil {
 		return fn(ctx, nodeID)
 	}
-	return &api.StateResponse{}, nil
-}
-
-func (m *mockFetcher) ReportDrift(ctx context.Context, nodeID string, req api.DriftReport) error {
-	m.mu.Lock()
-	m.driftCount++
-	m.lastDrift = &req
-	fn := m.driftFunc
-	m.mu.Unlock()
-	if fn != nil {
-		return fn(ctx, nodeID, req)
-	}
-	return nil
+	return &api.NodeStateSnapshot{}, nil
 }
 
 func (m *mockFetcher) getFetchCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.fetchCount
-}
-
-func (m *mockFetcher) getDriftCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.driftCount
-}
-
-func (m *mockFetcher) getLastDrift() *api.DriftReport {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.lastDrift
 }
 
 func discardLogger() *slog.Logger {
@@ -78,9 +51,9 @@ func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
 
 func TestReconciler_FirstReconcileImmediate(t *testing.T) {
 	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
-			return &api.StateResponse{
-				Peers: []api.Peer{{ID: "p1", MeshIP: "10.0.0.1"}},
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+			return &api.NodeStateSnapshot{
+				Peers: []api.SnapshotPeer{{NodeID: "p1", MeshIP: "10.0.0.1"}},
 			}, nil
 		},
 	}
@@ -110,8 +83,8 @@ func TestReconciler_FirstReconcileImmediate(t *testing.T) {
 
 func TestReconciler_PeriodicFetch(t *testing.T) {
 	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
-			return &api.StateResponse{}, nil
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+			return &api.NodeStateSnapshot{}, nil
 		},
 	}
 
@@ -135,11 +108,11 @@ func TestReconciler_PeriodicFetch(t *testing.T) {
 }
 
 func TestReconciler_HandlerInvokedOnDrift(t *testing.T) {
-	desired := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", MeshIP: "10.0.0.1"}},
+	desired := &api.NodeStateSnapshot{
+		Peers: []api.SnapshotPeer{{NodeID: "p1", MeshIP: "10.0.0.1"}},
 	}
 	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
 			return desired, nil
 		},
 	}
@@ -148,10 +121,10 @@ func TestReconciler_HandlerInvokedOnDrift(t *testing.T) {
 
 	var handlerCalled atomic.Int64
 	var gotDiff StateDiff
-	var gotDesired *api.StateResponse
+	var gotDesired *api.NodeStateSnapshot
 	var mu sync.Mutex
 
-	r.RegisterHandler(func(_ context.Context, d *api.StateResponse, diff StateDiff) error {
+	r.RegisterHandler(func(_ context.Context, d *api.NodeStateSnapshot, diff StateDiff) error {
 		mu.Lock()
 		gotDesired = d
 		gotDiff = diff
@@ -187,9 +160,9 @@ func TestReconciler_HandlerInvokedOnDrift(t *testing.T) {
 
 func TestReconciler_MultipleHandlers(t *testing.T) {
 	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
-			return &api.StateResponse{
-				Peers: []api.Peer{{ID: "p1", MeshIP: "10.0.0.1"}},
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+			return &api.NodeStateSnapshot{
+				Peers: []api.SnapshotPeer{{NodeID: "p1", MeshIP: "10.0.0.1"}},
 			}, nil
 		},
 	}
@@ -199,11 +172,11 @@ func TestReconciler_MultipleHandlers(t *testing.T) {
 	var called1, called2 atomic.Int64
 
 	// First handler returns error — should not prevent second handler.
-	r.RegisterHandler(func(_ context.Context, _ *api.StateResponse, _ StateDiff) error {
+	r.RegisterHandler(func(_ context.Context, _ *api.NodeStateSnapshot, _ StateDiff) error {
 		called1.Add(1)
 		return errors.New("handler1 error")
 	})
-	r.RegisterHandler(func(_ context.Context, _ *api.StateResponse, _ StateDiff) error {
+	r.RegisterHandler(func(_ context.Context, _ *api.NodeStateSnapshot, _ StateDiff) error {
 		called2.Add(1)
 		return nil
 	})
@@ -228,9 +201,9 @@ func TestReconciler_MultipleHandlers(t *testing.T) {
 
 func TestReconciler_HandlerPanicRecovered(t *testing.T) {
 	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
-			return &api.StateResponse{
-				Peers: []api.Peer{{ID: "p1", MeshIP: "10.0.0.1"}},
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+			return &api.NodeStateSnapshot{
+				Peers: []api.SnapshotPeer{{NodeID: "p1", MeshIP: "10.0.0.1"}},
 			}, nil
 		},
 	}
@@ -239,11 +212,11 @@ func TestReconciler_HandlerPanicRecovered(t *testing.T) {
 
 	var panicHandlerCalls, safeHandlerCalls atomic.Int64
 
-	r.RegisterHandler(func(_ context.Context, _ *api.StateResponse, _ StateDiff) error {
+	r.RegisterHandler(func(_ context.Context, _ *api.NodeStateSnapshot, _ StateDiff) error {
 		panicHandlerCalls.Add(1)
 		panic("test panic")
 	})
-	r.RegisterHandler(func(_ context.Context, _ *api.StateResponse, _ StateDiff) error {
+	r.RegisterHandler(func(_ context.Context, _ *api.NodeStateSnapshot, _ StateDiff) error {
 		safeHandlerCalls.Add(1)
 		return nil
 	})
@@ -267,123 +240,10 @@ func TestReconciler_HandlerPanicRecovered(t *testing.T) {
 	}
 }
 
-func TestReconciler_DriftReported(t *testing.T) {
-	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
-			return &api.StateResponse{
-				Peers: []api.Peer{{ID: "p1", MeshIP: "10.0.0.1"}},
-			}, nil
-		},
-	}
-
-	r := NewReconciler(fetcher, Config{Interval: time.Hour}, discardLogger())
-	r.RegisterHandler(func(_ context.Context, _ *api.StateResponse, _ StateDiff) error {
-		return nil
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- r.Run(ctx, "node-1")
-	}()
-
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-	<-done
-
-	if fetcher.getDriftCount() < 1 {
-		t.Fatalf("ReportDrift called %d times, want >= 1", fetcher.getDriftCount())
-	}
-
-	report := fetcher.getLastDrift()
-	if report == nil {
-		t.Fatal("no drift report received")
-	}
-
-	found := false
-	for _, c := range report.Corrections {
-		if c.Type == "peer_added" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("expected peer_added correction, got %v", report.Corrections)
-	}
-}
-
-func TestReconciler_NoDriftNoReport(t *testing.T) {
-	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
-			return &api.StateResponse{}, nil
-		},
-	}
-
-	r := NewReconciler(fetcher, Config{Interval: 20 * time.Millisecond}, discardLogger())
-	r.RegisterHandler(func(_ context.Context, _ *api.StateResponse, _ StateDiff) error {
-		return nil
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- r.Run(ctx, "node-1")
-	}()
-
-	// After first cycle (which adds everything from empty snapshot), subsequent
-	// cycles with same state should produce empty diff → no drift report.
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-	<-done
-
-	// First cycle reports drift (empty snapshot → full desired).
-	// But since desired is also empty, no drift at all.
-	if fetcher.getDriftCount() != 0 {
-		t.Errorf("ReportDrift called %d times, want 0 (no drift)", fetcher.getDriftCount())
-	}
-}
-
-func TestReconciler_DriftReportFailureIgnored(t *testing.T) {
-	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
-			return &api.StateResponse{
-				Peers: []api.Peer{{ID: "p1", MeshIP: "10.0.0.1"}},
-			}, nil
-		},
-		driftFunc: func(_ context.Context, _ string, _ api.DriftReport) error {
-			return errors.New("drift report failed")
-		},
-	}
-
-	r := NewReconciler(fetcher, Config{Interval: 20 * time.Millisecond}, discardLogger())
-	r.RegisterHandler(func(_ context.Context, _ *api.StateResponse, _ StateDiff) error {
-		return nil
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- r.Run(ctx, "node-1")
-	}()
-
-	// Run enough cycles to verify the loop continues despite ReportDrift errors.
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-
-	err := <-done
-	if err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run returned unexpected error: %v", err)
-	}
-
-	if fetcher.getFetchCount() < 2 {
-		t.Errorf("FetchState called %d times, want >= 2 (loop should continue despite drift error)", fetcher.getFetchCount())
-	}
-}
-
 func TestReconciler_TriggerReconcile(t *testing.T) {
 	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
-			return &api.StateResponse{}, nil
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+			return &api.NodeStateSnapshot{}, nil
 		},
 	}
 
@@ -415,9 +275,9 @@ func TestReconciler_TriggerReconcile(t *testing.T) {
 func TestReconciler_TriggerCoalesced(t *testing.T) {
 	var fetchCh = make(chan struct{}, 10)
 	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
 			fetchCh <- struct{}{}
-			return &api.StateResponse{}, nil
+			return &api.NodeStateSnapshot{}, nil
 		},
 	}
 
@@ -450,11 +310,11 @@ func TestReconciler_TriggerCoalesced(t *testing.T) {
 }
 
 func TestReconciler_SnapshotUpdatedOnSuccess(t *testing.T) {
-	desired := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", MeshIP: "10.0.0.1"}},
+	desired := &api.NodeStateSnapshot{
+		Peers: []api.SnapshotPeer{{NodeID: "p1", MeshIP: "10.0.0.1"}},
 	}
 	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
 			return desired, nil
 		},
 	}
@@ -462,7 +322,7 @@ func TestReconciler_SnapshotUpdatedOnSuccess(t *testing.T) {
 	r := NewReconciler(fetcher, Config{Interval: 20 * time.Millisecond}, discardLogger())
 
 	var handlerCalls atomic.Int64
-	r.RegisterHandler(func(_ context.Context, _ *api.StateResponse, diff StateDiff) error {
+	r.RegisterHandler(func(_ context.Context, _ *api.NodeStateSnapshot, diff StateDiff) error {
 		handlerCalls.Add(1)
 		return nil
 	})
@@ -487,11 +347,11 @@ func TestReconciler_SnapshotUpdatedOnSuccess(t *testing.T) {
 }
 
 func TestReconciler_SnapshotNotUpdatedOnHandlerError(t *testing.T) {
-	desired := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", MeshIP: "10.0.0.1"}},
+	desired := &api.NodeStateSnapshot{
+		Peers: []api.SnapshotPeer{{NodeID: "p1", MeshIP: "10.0.0.1"}},
 	}
 	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
 			return desired, nil
 		},
 	}
@@ -499,7 +359,7 @@ func TestReconciler_SnapshotNotUpdatedOnHandlerError(t *testing.T) {
 	r := NewReconciler(fetcher, Config{Interval: 20 * time.Millisecond}, discardLogger())
 
 	var handlerCalls atomic.Int64
-	r.RegisterHandler(func(_ context.Context, _ *api.StateResponse, _ StateDiff) error {
+	r.RegisterHandler(func(_ context.Context, _ *api.NodeStateSnapshot, _ StateDiff) error {
 		handlerCalls.Add(1)
 		return errors.New("handler error")
 	})
@@ -524,8 +384,8 @@ func TestReconciler_SnapshotNotUpdatedOnHandlerError(t *testing.T) {
 
 func TestReconciler_ContextCancellation(t *testing.T) {
 	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
-			return &api.StateResponse{}, nil
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+			return &api.NodeStateSnapshot{}, nil
 		},
 	}
 
@@ -554,7 +414,7 @@ func TestReconciler_ContextCancellation(t *testing.T) {
 func TestReconciler_ContextCancelDuringFetch(t *testing.T) {
 	// Block FetchState until context is cancelled.
 	fetcher := &mockFetcher{
-		fetchFunc: func(ctx context.Context, _ string) (*api.StateResponse, error) {
+		fetchFunc: func(ctx context.Context, _ string) (*api.NodeStateSnapshot, error) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		},
@@ -584,7 +444,7 @@ func TestReconciler_ContextCancelDuringFetch(t *testing.T) {
 func TestReconciler_FetchStateErrorSkipsTick(t *testing.T) {
 	var fetchCalls atomic.Int64
 	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
 			fetchCalls.Add(1)
 			return nil, errors.New("fetch error")
 		},
@@ -593,7 +453,7 @@ func TestReconciler_FetchStateErrorSkipsTick(t *testing.T) {
 	r := NewReconciler(fetcher, Config{Interval: 20 * time.Millisecond}, discardLogger())
 
 	var handlerCalled atomic.Int64
-	r.RegisterHandler(func(_ context.Context, _ *api.StateResponse, _ StateDiff) error {
+	r.RegisterHandler(func(_ context.Context, _ *api.NodeStateSnapshot, _ StateDiff) error {
 		handlerCalled.Add(1)
 		return nil
 	})
@@ -627,13 +487,13 @@ func TestReconciler_NoGoroutineLeaks(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
 	fetcher := &mockFetcher{
-		fetchFunc: func(_ context.Context, _ string) (*api.StateResponse, error) {
-			return &api.StateResponse{}, nil
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+			return &api.NodeStateSnapshot{}, nil
 		},
 	}
 
 	r := NewReconciler(fetcher, Config{Interval: 20 * time.Millisecond}, discardLogger())
-	r.RegisterHandler(func(_ context.Context, _ *api.StateResponse, _ StateDiff) error {
+	r.RegisterHandler(func(_ context.Context, _ *api.NodeStateSnapshot, _ StateDiff) error {
 		return nil
 	})
 

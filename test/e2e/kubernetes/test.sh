@@ -194,9 +194,13 @@ CONFIGEOF
 echo "=== Deploying mock-api ==="
 kubectl apply -f "${MOCKAPI_MANIFEST}"
 
+# Match what kubelet's DirectoryOrCreate produces on a real node: root-owned.
+# plexd runs as uid 0 with ALL capabilities dropped but CAP_DAC_OVERRIDE not
+# among those added back, so it is subject to ordinary permission checks and
+# cannot write a directory owned by anyone else.
 echo "=== Pre-creating host directories with correct ownership ==="
 docker exec "${CLUSTER_NAME}-control-plane" sh -c \
-    'mkdir -p /var/lib/plexd /var/run/plexd && chown 65534:65534 /var/lib/plexd /var/run/plexd'
+    'mkdir -p /var/lib/plexd /var/run/plexd && chown 0:0 /var/lib/plexd /var/run/plexd'
 
 echo "=== Deploying plexd DaemonSet ==="
 sed "s/namespace: plexd-system/namespace: ${NAMESPACE}/" "${DAEMONSET_DIR}/daemonset.yaml" \

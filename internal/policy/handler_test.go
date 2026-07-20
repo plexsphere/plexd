@@ -1,83 +1,28 @@
 package policy
 
 import (
+	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/reconcile"
-	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
-// mockWGController implements wireguard.WGController for handler tests.
-type mockWGController struct {
-	calls          []mockWGCall
-	addPeerErr     error
-	removePeerErr  error
-	removePeerErrs map[string]error // per-peerID errors for RemovePeer
+func newEnabledEnforcer(fw FirewallController) *Enforcer {
+	return NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{Enabled: true, ChainName: "TEST"}, testLogger())
 }
 
-type mockWGCall struct {
-	Method string
-	Args   []interface{}
-}
-
-func (m *mockWGController) CreateInterface(string, []byte, int) error { return nil }
-func (m *mockWGController) DeleteInterface(string) error             { return nil }
-func (m *mockWGController) ConfigureAddress(string, string) error    { return nil }
-func (m *mockWGController) SetInterfaceUp(string) error              { return nil }
-func (m *mockWGController) SetMTU(string, int) error                 { return nil }
-
-func (m *mockWGController) AddPeer(iface string, cfg wireguard.PeerConfig) error {
-	m.calls = append(m.calls, mockWGCall{Method: "AddPeer", Args: []interface{}{iface, cfg}})
-	return m.addPeerErr
-}
-
-func (m *mockWGController) RemovePeer(iface string, publicKey []byte) error {
-	m.calls = append(m.calls, mockWGCall{Method: "RemovePeer", Args: []interface{}{iface, publicKey}})
-	if m.removePeerErrs != nil {
-		// Match by public key base64 for per-peer errors
-		b64 := base64.StdEncoding.EncodeToString(publicKey)
-		if err, ok := m.removePeerErrs[b64]; ok {
-			return err
-		}
-	}
-	return m.removePeerErr
-}
-
-func (m *mockWGController) callsFor(method string) []mockWGCall {
-	var result []mockWGCall
-	for _, c := range m.calls {
-		if c.Method == method {
-			result = append(result, c)
-		}
-	}
-	return result
-}
-
-func testPeer(id, meshIP string) api.Peer {
-	return api.Peer{
-		ID:         id,
-		PublicKey:  base64.StdEncoding.EncodeToString([]byte(id + "-key-padding-to-32b")),
-		MeshIP:     meshIP,
-		Endpoint:   "1.2.3.4:51820",
-		AllowedIPs: []string{meshIP + "/32"},
-	}
-}
-
-func newTestWGManager(ctrl wireguard.WGController) *wireguard.Manager {
-	return wireguard.NewManager(ctrl, wireguard.Config{}, testLogger())
-}
-
-func newTestEnforcer(fw FirewallController) *Enforcer {
-	return NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{}, testLogger())
+func policySnapshot(fingerprint string, rules ...api.PolicyRule) *api.PolicySnapshot {
+	return &api.PolicySnapshot{RevisionID: "rev-1", Fingerprint: fingerprint, Rules: rules}
 }
 
 // mockReconcileTrigger records TriggerReconcile calls.
@@ -93,208 +38,127 @@ func (m *mockReconcileTrigger) TriggerReconcile() {
 // ReconcileHandler tests
 // ---------------------------------------------------------------------------
 
-func TestReconcileHandler_PolicyChange(t *testing.T) {
-	wgCtrl := &mockWGController{}
-	wgMgr := newTestWGManager(wgCtrl)
+func TestReconcileHandler_PolicyUnchangedSkips(t *testing.T) {
 	fwCtrl := &mockFirewallController{}
-	enforcer := newTestEnforcer(fwCtrl)
+	enforcer := newEnabledEnforcer(fwCtrl)
+	handler := ReconcileHandler(enforcer, "wg0")
 
-	handler := ReconcileHandler(enforcer, wgMgr, "node-a", "10.0.0.1", "wg0")
+	desired := &api.NodeStateSnapshot{Policy: policySnapshot("fp")}
+	diff := reconcile.StateDiff{} // PolicyChanged is false.
 
-	desired := &api.StateResponse{
-		Peers: []api.Peer{
-			testPeer("peer-b", "10.0.0.2"),
-			testPeer("peer-c", "10.0.0.3"),
-		},
-		Policies: []api.Policy{
-			{
-				ID: "pol-1",
-				Rules: []api.PolicyRule{
-					{Src: "node-a", Dst: "peer-b", Action: "allow"},
-				},
-			},
-		},
-	}
-	diff := reconcile.StateDiff{
-		PoliciesToAdd: []api.Policy{desired.Policies[0]},
-	}
-
-	err := handler(context.Background(), desired, diff)
-	if err != nil {
+	if err := handler(context.Background(), desired, diff); err != nil {
 		t.Fatalf("handler error = %v, want nil", err)
 	}
+	if len(fwCtrl.ensureChainCalls) != 0 || len(fwCtrl.applyRulesCalls) != 0 {
+		t.Errorf("enforcer touched despite PolicyChanged=false: ensure=%d apply=%d",
+			len(fwCtrl.ensureChainCalls), len(fwCtrl.applyRulesCalls))
+	}
+}
 
-	// Firewall rules should have been applied.
+func TestReconcileHandler_PolicyChangedApplies(t *testing.T) {
+	fwCtrl := &mockFirewallController{}
+	enforcer := newEnabledEnforcer(fwCtrl)
+	handler := ReconcileHandler(enforcer, "wg0")
+
+	desired := &api.NodeStateSnapshot{
+		Policy: policySnapshot("fp",
+			api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
+		),
+	}
+	diff := reconcile.StateDiff{PolicyChanged: true}
+
+	if err := handler(context.Background(), desired, diff); err != nil {
+		t.Fatalf("handler error = %v, want nil", err)
+	}
 	if len(fwCtrl.ensureChainCalls) != 1 {
 		t.Errorf("EnsureChain calls = %d, want 1", len(fwCtrl.ensureChainCalls))
 	}
 	if len(fwCtrl.applyRulesCalls) != 1 {
-		t.Errorf("ApplyRules calls = %d, want 1", len(fwCtrl.applyRulesCalls))
+		t.Fatalf("ApplyRules calls = %d, want 1", len(fwCtrl.applyRulesCalls))
 	}
-
-	// Only peer-b should be added (peer-c is not allowed by policy).
-	addCalls := wgCtrl.callsFor("AddPeer")
-	if len(addCalls) != 1 {
-		t.Fatalf("AddPeer calls = %d, want 1", len(addCalls))
+	// 1 policy rule + trailing default-deny.
+	if got := len(fwCtrl.applyRulesCalls[0].Rules); got != 2 {
+		t.Errorf("applied rules = %d, want 2", got)
 	}
 }
 
-func TestReconcileHandler_PeerChangeWithPolicies(t *testing.T) {
-	wgCtrl := &mockWGController{}
-	wgMgr := newTestWGManager(wgCtrl)
+func TestReconcileHandler_NilPolicyAppliesDefaultDeny(t *testing.T) {
 	fwCtrl := &mockFirewallController{}
-	enforcer := newTestEnforcer(fwCtrl)
+	enforcer := newEnabledEnforcer(fwCtrl)
+	handler := ReconcileHandler(enforcer, "wg0")
 
-	handler := ReconcileHandler(enforcer, wgMgr, "node-a", "10.0.0.1", "wg0")
+	// Policy transitioned populated→nil: PolicyChanged is true, desired.Policy nil.
+	desired := &api.NodeStateSnapshot{Policy: nil}
+	diff := reconcile.StateDiff{PolicyChanged: true}
 
-	// First call: establish initial state with policy allowing peer-b.
-	desired1 := &api.StateResponse{
-		Peers: []api.Peer{testPeer("peer-b", "10.0.0.2")},
-		Policies: []api.Policy{
-			{
-				ID:    "pol-1",
-				Rules: []api.PolicyRule{{Src: "node-a", Dst: "peer-b", Action: "allow"}},
-			},
-		},
-	}
-	diff1 := reconcile.StateDiff{
-		PoliciesToAdd: desired1.Policies,
-		PeersToAdd:    desired1.Peers,
-	}
-	_ = handler(context.Background(), desired1, diff1)
-	wgCtrl.calls = nil // reset
-
-	// Second call: new peer-c added, but not allowed by policy.
-	desired2 := &api.StateResponse{
-		Peers: []api.Peer{
-			testPeer("peer-b", "10.0.0.2"),
-			testPeer("peer-c", "10.0.0.3"),
-		},
-		Policies: desired1.Policies, // same policy — only peer-b allowed
-	}
-	diff2 := reconcile.StateDiff{
-		PeersToAdd: []api.Peer{testPeer("peer-c", "10.0.0.3")},
-	}
-
-	err := handler(context.Background(), desired2, diff2)
-	if err != nil {
+	if err := handler(context.Background(), desired, diff); err != nil {
 		t.Fatalf("handler error = %v, want nil", err)
 	}
-
-	// peer-c should NOT be added (not allowed by policy).
-	addCalls := wgCtrl.callsFor("AddPeer")
-	if len(addCalls) != 0 {
-		t.Errorf("AddPeer calls = %d, want 0 (peer-c not allowed)", len(addCalls))
+	if len(fwCtrl.applyRulesCalls) != 1 {
+		t.Fatalf("ApplyRules calls = %d, want 1", len(fwCtrl.applyRulesCalls))
+	}
+	rules := fwCtrl.applyRulesCalls[0].Rules
+	if len(rules) != 1 || rules[0].Action != "deny" {
+		t.Errorf("nil policy should apply default-deny only, got %+v", rules)
 	}
 }
 
-func TestReconcileHandler_NoDriftSkips(t *testing.T) {
-	wgCtrl := &mockWGController{}
-	wgMgr := newTestWGManager(wgCtrl)
-	fwCtrl := &mockFirewallController{}
-	enforcer := newTestEnforcer(fwCtrl)
+func TestReconcileHandler_EnforcerErrorPropagates(t *testing.T) {
+	fwCtrl := &mockFirewallController{ensureChainErr: errors.New("firewall error")}
+	enforcer := newEnabledEnforcer(fwCtrl)
+	handler := ReconcileHandler(enforcer, "wg0")
 
-	handler := ReconcileHandler(enforcer, wgMgr, "node-a", "10.0.0.1", "wg0")
+	desired := &api.NodeStateSnapshot{Policy: policySnapshot("fp")}
+	diff := reconcile.StateDiff{PolicyChanged: true}
 
-	desired := &api.StateResponse{
-		Peers:    []api.Peer{testPeer("peer-b", "10.0.0.2")},
-		Policies: []api.Policy{{ID: "pol-1", Rules: []api.PolicyRule{{Src: "*", Dst: "*", Action: "allow"}}}},
-	}
-	// Empty diff — no policy or peer changes.
-	diff := reconcile.StateDiff{}
-
-	err := handler(context.Background(), desired, diff)
-	if err != nil {
-		t.Fatalf("handler error = %v, want nil", err)
-	}
-
-	// No firewall calls.
-	if len(fwCtrl.ensureChainCalls) != 0 {
-		t.Errorf("EnsureChain calls = %d, want 0", len(fwCtrl.ensureChainCalls))
-	}
-	// No WG calls.
-	if len(wgCtrl.calls) != 0 {
-		t.Errorf("WG controller calls = %d, want 0", len(wgCtrl.calls))
-	}
-}
-
-func TestReconcileHandler_RemovedPolicyRevokesPeer(t *testing.T) {
-	wgCtrl := &mockWGController{}
-	wgMgr := newTestWGManager(wgCtrl)
-	fwCtrl := &mockFirewallController{}
-	enforcer := newTestEnforcer(fwCtrl)
-
-	handler := ReconcileHandler(enforcer, wgMgr, "node-a", "10.0.0.1", "wg0")
-
-	// First call: peer-b allowed by policy.
-	peerB := testPeer("peer-b", "10.0.0.2")
-	desired1 := &api.StateResponse{
-		Peers: []api.Peer{peerB},
-		Policies: []api.Policy{
-			{ID: "pol-1", Rules: []api.PolicyRule{{Src: "node-a", Dst: "peer-b", Action: "allow"}}},
-		},
-	}
-	diff1 := reconcile.StateDiff{
-		PoliciesToAdd: desired1.Policies,
-		PeersToAdd:    desired1.Peers,
-	}
-	_ = handler(context.Background(), desired1, diff1)
-	wgCtrl.calls = nil // reset
-
-	// Second call: policy removed — peer-b should be revoked (deny-by-default).
-	desired2 := &api.StateResponse{
-		Peers:    []api.Peer{peerB},
-		Policies: nil,
-	}
-	diff2 := reconcile.StateDiff{
-		PoliciesToRemove: []string{"pol-1"},
-	}
-
-	err := handler(context.Background(), desired2, diff2)
-	if err != nil {
-		t.Fatalf("handler error = %v, want nil", err)
-	}
-
-	// peer-b should be removed from WG.
-	removeCalls := wgCtrl.callsFor("RemovePeer")
-	if len(removeCalls) != 1 {
-		t.Fatalf("RemovePeer calls = %d, want 1", len(removeCalls))
-	}
-}
-
-func TestReconcileHandler_PartialFailureAggregated(t *testing.T) {
-	wgCtrl := &mockWGController{}
-	wgMgr := newTestWGManager(wgCtrl)
-	fwCtrl := &mockFirewallController{
-		ensureChainErr: errors.New("firewall error"),
-	}
-	enforcer := newTestEnforcer(fwCtrl)
-
-	handler := ReconcileHandler(enforcer, wgMgr, "node-a", "10.0.0.1", "wg0")
-
-	desired := &api.StateResponse{
-		Peers: []api.Peer{
-			testPeer("peer-b", "10.0.0.2"),
-			testPeer("peer-c", "10.0.0.3"),
-		},
-		Policies: []api.Policy{
-			{ID: "pol-1", Rules: []api.PolicyRule{{Src: "*", Dst: "*", Action: "allow"}}},
-		},
-	}
-	diff := reconcile.StateDiff{
-		PoliciesToAdd: desired.Policies,
-		PeersToAdd:    desired.Peers,
-	}
-
-	err := handler(context.Background(), desired, diff)
-	if err == nil {
+	if err := handler(context.Background(), desired, diff); err == nil {
 		t.Fatal("handler error = nil, want error (firewall failed)")
 	}
+}
 
-	// Despite firewall error, peers should still be processed.
-	addCalls := wgCtrl.callsFor("AddPeer")
-	if len(addCalls) != 2 {
-		t.Errorf("AddPeer calls = %d, want 2 (should still process peers despite firewall error)", len(addCalls))
+func TestReconcileHandler_InvalidRulesetDoesNotWedgeSnapshot(t *testing.T) {
+	fwCtrl := &mockFirewallController{}
+	enforcer := newEnabledEnforcer(fwCtrl)
+	handler := ReconcileHandler(enforcer, "wg0")
+
+	// One rule the engine cannot translate. Returning the error would hold the
+	// reconciler snapshot back, so the identical revision would be re-diffed and
+	// every handler re-run at the reconcile interval forever.
+	desired := &api.NodeStateSnapshot{
+		Policy: policySnapshot("fp-bad",
+			api.PolicyRule{Action: "quarantine", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
+		),
+	}
+	diff := reconcile.StateDiff{PolicyChanged: true}
+
+	if err := handler(context.Background(), desired, diff); err != nil {
+		t.Fatalf("handler error = %v, want nil (rejected revision must not wedge the snapshot)", err)
+	}
+	// Fail-closed: the previously applied ruleset stays in place.
+	if len(fwCtrl.applyRulesCalls) != 0 {
+		t.Errorf("ApplyRules calls = %d, want 0", len(fwCtrl.applyRulesCalls))
+	}
+}
+
+func TestReconcileHandler_DisabledEnforcementDoesNotClaimApplied(t *testing.T) {
+	var logs bytes.Buffer
+	enforcer := NewEnforcer(
+		NewPolicyEngine(testLogger()),
+		&mockFirewallController{},
+		Config{Enabled: false, ChainName: "TEST"},
+		slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	)
+	handler := ReconcileHandler(enforcer, "wg0")
+
+	desired := &api.NodeStateSnapshot{Policy: policySnapshot("fp")}
+	diff := reconcile.StateDiff{PolicyChanged: true}
+
+	if err := handler(context.Background(), desired, diff); err != nil {
+		t.Fatalf("handler error = %v, want nil", err)
+	}
+	if strings.Contains(logs.String(), "policy ruleset applied") {
+		t.Errorf("handler logged %q with enforcement disabled; nothing was applied:\n%s",
+			"policy ruleset applied", logs.String())
 	}
 }
 
@@ -337,7 +201,7 @@ func TestSSEHandler_PolicyUpdated_MalformedPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handler error = %v, want nil", err)
 	}
-	// TriggerReconcile should still be called despite malformed payload.
+	// TriggerReconcile should still be called despite a malformed payload.
 	if mock.triggered != 1 {
 		t.Errorf("TriggerReconcile calls = %d, want 1", mock.triggered)
 	}
