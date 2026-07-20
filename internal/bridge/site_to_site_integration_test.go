@@ -97,10 +97,12 @@ func TestSiteToSiteIntegration_FullLifecycle(t *testing.T) {
 	routeCtrl.reset()
 
 	reconcileHandler := SiteToSiteReconcileHandler(mgr, discardLogger())
-	desired := &api.StateResponse{
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{tunnel1, tunnel2},
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{tunnel1, tunnel2},
+			},
 		},
 	}
 	if err := reconcileHandler(context.Background(), desired, reconcile.StateDiff{}); err != nil {
@@ -163,15 +165,15 @@ func TestSiteToSiteIntegration_ReconcileDrift(t *testing.T) {
 	routeCtrl.reset()
 
 	// Initial state: one tunnel.
-	state1 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{
-				testTunnel("tun-1"),
+	state1 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{
+					testTunnel("tun-1"),
+				},
 			},
 		},
-		Metadata: map[string]string{"version": "1"},
 	}
 	fetcher := &integrationStateFetcher{state: state1}
 
@@ -189,17 +191,17 @@ func TestSiteToSiteIntegration_ReconcileDrift(t *testing.T) {
 		return len(vpnCtrl.vpnCallsFor("CreateTunnelInterface")) >= 1
 	})
 
-	// Update: replace tun-1 with tun-2 and tun-3, bump metadata.
-	state2 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{
-				testTunnel("tun-2"),
-				testTunnel("tun-3"),
+	// Update: replace tun-1 with tun-2 and tun-3.
+	state2 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{
+					testTunnel("tun-2"),
+					testTunnel("tun-3"),
+				},
 			},
 		},
-		Metadata: map[string]string{"version": "2"},
 	}
 	fetcher.setState(state2)
 	rec.TriggerReconcile()
@@ -211,13 +213,13 @@ func TestSiteToSiteIntegration_ReconcileDrift(t *testing.T) {
 	})
 
 	// Update: empty tunnels — all removed.
-	state3 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{},
+	state3 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{},
+			},
 		},
-		Metadata: map[string]string{"version": "3"},
 	}
 	fetcher.setState(state3)
 	rec.TriggerReconcile()
@@ -254,23 +256,25 @@ func TestSiteToSiteIntegration_ConcurrentAccess(t *testing.T) {
 	}
 
 	var cycle atomic.Int32
-	states := []*api.StateResponse{
+	states := []*api.NodeStateSnapshot{
 		{
-			Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-			SiteToSiteConfig: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{
-					testTunnel("tun-conc-1"),
+			Bridge: &api.BridgeSnapshot{
+				SiteToSite: &api.SiteToSiteConfig{
+					Enabled: true,
+					Tunnels: []api.SiteToSiteTunnel{
+						testTunnel("tun-conc-1"),
+					},
 				},
 			},
 		},
 		{
-			Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-			SiteToSiteConfig: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{
-					testTunnel("tun-conc-1"),
-					testTunnel("tun-conc-2"),
+			Bridge: &api.BridgeSnapshot{
+				SiteToSite: &api.SiteToSiteConfig{
+					Enabled: true,
+					Tunnels: []api.SiteToSiteTunnel{
+						testTunnel("tun-conc-1"),
+						testTunnel("tun-conc-2"),
+					},
 				},
 			},
 		},

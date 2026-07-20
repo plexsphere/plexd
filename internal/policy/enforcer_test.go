@@ -46,69 +46,21 @@ func (m *mockFirewallController) DeleteChain(chain string) error {
 	return m.deleteChainErr
 }
 
-func TestEnforcer_FilterPeersDisabled(t *testing.T) {
-	eng := NewPolicyEngine(testLogger())
-	cfg := Config{Enabled: false, ChainName: "TEST"}
-	enf := NewEnforcer(eng, nil, cfg, testLogger())
-
-	peers := []api.Peer{
-		{ID: "peer-a", MeshIP: "10.0.0.2"},
-		{ID: "peer-b", MeshIP: "10.0.0.3"},
-	}
-	policies := []api.Policy{
-		{
-			ID: "pol-1",
-			Rules: []api.PolicyRule{
-				{Src: "node-a", Dst: "peer-a", Action: "allow"},
-			},
-		},
-	}
-
-	got := enf.FilterPeers(peers, policies, "node-a")
-	if len(got) != len(peers) {
-		t.Fatalf("FilterPeers() returned %d peers, want %d (disabled should return all)", len(got), len(peers))
-	}
-}
-
-func TestEnforcer_FilterPeersEnabled(t *testing.T) {
-	eng := NewPolicyEngine(testLogger())
-	cfg := Config{Enabled: true, ChainName: "TEST"}
-	enf := NewEnforcer(eng, nil, cfg, testLogger())
-
-	peers := []api.Peer{
-		{ID: "peer-a", MeshIP: "10.0.0.2"},
-		{ID: "peer-b", MeshIP: "10.0.0.3"},
-	}
-	policies := []api.Policy{
-		{
-			ID: "pol-1",
-			Rules: []api.PolicyRule{
-				{Src: "node-a", Dst: "peer-a", Action: "allow"},
-			},
-		},
-	}
-
-	got := enf.FilterPeers(peers, policies, "node-a")
-	if len(got) != 1 {
-		t.Fatalf("FilterPeers() returned %d peers, want 1", len(got))
-	}
-	if got[0].ID != "peer-a" {
-		t.Errorf("FilterPeers()[0].ID = %q, want %q", got[0].ID, "peer-a")
-	}
-}
-
 func TestEnforcer_ApplyFirewallRulesDisabled(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
 	mock := &mockFirewallController{}
 	cfg := Config{Enabled: false, ChainName: "TEST"}
 	enf := NewEnforcer(eng, mock, cfg, testLogger())
 
-	err := enf.ApplyFirewallRules(nil, "node-a", "wg0", nil)
+	applied, err := enf.ApplyFirewallRules(nil, "wg0")
 	if err != nil {
 		t.Fatalf("ApplyFirewallRules() error = %v, want nil", err)
 	}
+	if applied {
+		t.Error("ApplyFirewallRules() applied = true, want false (enforcement disabled)")
+	}
 	if len(mock.ensureChainCalls) != 0 {
-		t.Errorf("EnsureChain called %d times, want 0", len(mock.ensureChainCalls))
+		t.Errorf("EnsureChain called %d times, want 0 (disabled)", len(mock.ensureChainCalls))
 	}
 }
 
@@ -117,9 +69,35 @@ func TestEnforcer_ApplyFirewallRulesNilFirewall(t *testing.T) {
 	cfg := Config{Enabled: true, ChainName: "TEST"}
 	enf := NewEnforcer(eng, nil, cfg, testLogger())
 
-	err := enf.ApplyFirewallRules(nil, "node-a", "wg0", nil)
+	applied, err := enf.ApplyFirewallRules(nil, "wg0")
 	if err != nil {
 		t.Fatalf("ApplyFirewallRules() error = %v, want nil", err)
+	}
+	if applied {
+		t.Error("ApplyFirewallRules() applied = true, want false (no firewall backend)")
+	}
+}
+
+func TestEnforcer_ApplyFirewallRulesNilPolicyDefaultDeny(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+	mock := &mockFirewallController{}
+	cfg := Config{Enabled: true, ChainName: "TEST-CHAIN"}
+	enf := NewEnforcer(eng, mock, cfg, testLogger())
+
+	// A nil policy yields the default-deny-only ruleset.
+	applied, err := enf.ApplyFirewallRules(nil, "wg0")
+	if err != nil {
+		t.Fatalf("ApplyFirewallRules() error = %v, want nil", err)
+	}
+	if !applied {
+		t.Error("ApplyFirewallRules() applied = false, want true")
+	}
+	if len(mock.applyRulesCalls) != 1 {
+		t.Fatalf("ApplyRules called %d times, want 1", len(mock.applyRulesCalls))
+	}
+	rules := mock.applyRulesCalls[0].Rules
+	if len(rules) != 1 || rules[0].Action != "deny" {
+		t.Errorf("nil policy should apply default-deny only, got %+v", rules)
 	}
 }
 
@@ -129,22 +107,20 @@ func TestEnforcer_ApplyFirewallRulesSuccess(t *testing.T) {
 	cfg := Config{Enabled: true, ChainName: "TEST-CHAIN"}
 	enf := NewEnforcer(eng, mock, cfg, testLogger())
 
-	policies := []api.Policy{
-		{
-			ID: "pol-1",
-			Rules: []api.PolicyRule{
-				{Src: "node-a", Dst: "peer-b", Port: 443, Protocol: "tcp", Action: "allow"},
-			},
+	policy := &api.PolicySnapshot{
+		RevisionID:  "rev-1",
+		Fingerprint: "fp-1",
+		Rules: []api.PolicyRule{
+			{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
 		},
 	}
-	peersByID := map[string]string{
-		"node-a": "10.0.0.1",
-		"peer-b": "10.0.0.2",
-	}
 
-	err := enf.ApplyFirewallRules(policies, "node-a", "wg0", peersByID)
+	applied, err := enf.ApplyFirewallRules(policy, "wg0")
 	if err != nil {
 		t.Fatalf("ApplyFirewallRules() error = %v, want nil", err)
+	}
+	if !applied {
+		t.Error("ApplyFirewallRules() applied = false, want true")
 	}
 
 	if len(mock.ensureChainCalls) != 1 {
@@ -160,7 +136,7 @@ func TestEnforcer_ApplyFirewallRulesSuccess(t *testing.T) {
 	if mock.applyRulesCalls[0].Chain != "TEST-CHAIN" {
 		t.Errorf("ApplyRules chain = %q, want %q", mock.applyRulesCalls[0].Chain, "TEST-CHAIN")
 	}
-	// 1 policy rule + 1 default-deny = 2
+	// 1 policy rule + 1 default-deny = 2.
 	if len(mock.applyRulesCalls[0].Rules) != 2 {
 		t.Errorf("ApplyRules rules count = %d, want 2", len(mock.applyRulesCalls[0].Rules))
 	}
@@ -174,7 +150,7 @@ func TestEnforcer_ApplyFirewallRulesEnsureChainError(t *testing.T) {
 	cfg := Config{Enabled: true, ChainName: "TEST"}
 	enf := NewEnforcer(eng, mock, cfg, testLogger())
 
-	err := enf.ApplyFirewallRules(nil, "node-a", "wg0", nil)
+	_, err := enf.ApplyFirewallRules(nil, "wg0")
 	if err == nil {
 		t.Fatal("ApplyFirewallRules() error = nil, want error")
 	}
@@ -195,7 +171,7 @@ func TestEnforcer_ApplyFirewallRulesApplyRulesError(t *testing.T) {
 	cfg := Config{Enabled: true, ChainName: "TEST"}
 	enf := NewEnforcer(eng, mock, cfg, testLogger())
 
-	err := enf.ApplyFirewallRules(nil, "node-a", "wg0", nil)
+	_, err := enf.ApplyFirewallRules(nil, "wg0")
 	if err == nil {
 		t.Fatal("ApplyFirewallRules() error = nil, want error")
 	}
@@ -205,6 +181,37 @@ func TestEnforcer_ApplyFirewallRulesApplyRulesError(t *testing.T) {
 	want := "policy: enforce: apply failed"
 	if err.Error() != want {
 		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestEnforcer_ApplyFirewallRulesInvalidRuleset(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+	mock := &mockFirewallController{}
+	cfg := Config{Enabled: true, ChainName: "TEST"}
+	enf := NewEnforcer(eng, mock, cfg, testLogger())
+
+	policy := &api.PolicySnapshot{
+		RevisionID:  "rev-bad",
+		Fingerprint: "fp-bad",
+		Rules: []api.PolicyRule{
+			{Action: "quarantine", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
+		},
+	}
+
+	applied, err := enf.ApplyFirewallRules(policy, "wg0")
+	if err == nil {
+		t.Fatal("ApplyFirewallRules() error = nil, want error")
+	}
+	if applied {
+		t.Error("ApplyFirewallRules() applied = true, want false")
+	}
+	if !errors.Is(err, ErrInvalidRuleset) {
+		t.Errorf("error does not wrap ErrInvalidRuleset: %v", err)
+	}
+	// The previously installed chain must be left untouched — a revision that
+	// does not translate never reaches the backend.
+	if len(mock.applyRulesCalls) != 0 {
+		t.Errorf("ApplyRules called %d times, want 0", len(mock.applyRulesCalls))
 	}
 }
 

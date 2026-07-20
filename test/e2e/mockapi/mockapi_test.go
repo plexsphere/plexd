@@ -3,6 +3,7 @@ package mockapi_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -90,7 +91,6 @@ func validEndpointBody() string {
 const (
 	keyRotateBody          = `{"node_id":"node-1","new_public_key":"new-pk-abc"}`
 	capabilitiesBody       = `{"builtin_actions":[],"hooks":[]}`
-	driftBody              = `{"timestamp":"2025-01-01T00:00:00Z","corrections":[{"type":"tunnel","detail":"recreated"}]}`
 	reportBody             = `{"entries":[],"deleted":[]}`
 	executionAckBody       = `{"execution_id":"exec-001","status":"accepted","reason":""}`
 	executionResultBody    = `{"execution_id":"exec-001","status":"success","exit_code":0,"stdout":"ok","stderr":"","duration":"1s","finished_at":"2025-01-01T00:00:01Z"}`
@@ -680,7 +680,20 @@ func TestHeartbeat_DenialTaxonomy(t *testing.T) {
 // REQ-004: GET /v1/nodes/{id}/state (Task 2.4)
 // ---------------------------------------------------------------------------
 
-func TestState_ReturnsFixturePeersAndPolicies(t *testing.T) {
+// policyFingerprint mirrors the mock's MOCK-INTERNAL canonicalization so the
+// test can assert the served policy.fingerprint equals base64(sha256(compact
+// JSON of the rules)). plexd itself never re-derives it — this is test-only.
+func policyFingerprint(t *testing.T, rules []api.PolicyRule) string {
+	t.Helper()
+	data, err := json.Marshal(rules)
+	if err != nil {
+		t.Fatalf("marshal rules: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func TestState_ReturnsPeersAndPolicy(t *testing.T) {
 	_, ts := newTestServer(t)
 
 	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/state")
@@ -693,40 +706,60 @@ func TestState_ReturnsFixturePeersAndPolicies(t *testing.T) {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 
-	var state api.StateResponse
-	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+	// Capture the raw envelope so we can assert on exact JSON keys.
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	// All six envelope keys must be present, even when a block is unpopulated.
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports"} {
+		if _, ok := envelope[key]; !ok {
+			t.Errorf("envelope missing key %q", key)
+		}
+	}
+
+	// The peers JSON must never carry psk/allowed_ips/endpoint.
+	for _, forbidden := range []string{`"psk"`, `"allowed_ips"`, `"endpoint"`} {
+		if bytes.Contains(envelope["peers"], []byte(forbidden)) {
+			t.Errorf("peers JSON must not contain %s: %s", forbidden, envelope["peers"])
+		}
+	}
+
+	var state api.NodeStateSnapshot
+	if err := json.Unmarshal(raw, &state); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 
-	// Verify peers.
-	if len(state.Peers) < 2 {
-		t.Errorf("len(Peers) = %d, want >= 2", len(state.Peers))
+	// Peers: exactly two, node_id ascending, with 44-char base64 keys.
+	if len(state.Peers) != 2 {
+		t.Fatalf("len(Peers) = %d, want 2", len(state.Peers))
+	}
+	if state.Peers[0].NodeID >= state.Peers[1].NodeID {
+		t.Errorf("peers not node_id ascending: %q, %q", state.Peers[0].NodeID, state.Peers[1].NodeID)
 	}
 	for _, p := range state.Peers {
-		if p.ID == "" || p.PublicKey == "" || p.MeshIP == "" || p.Endpoint == "" || p.PSK == "" {
-			t.Errorf("peer %q has empty fields", p.ID)
+		if p.NodeID == "" || p.PublicKey == "" || p.MeshIP == "" {
+			t.Errorf("peer %q has empty required fields", p.NodeID)
 		}
-		if len(p.AllowedIPs) == 0 {
-			t.Errorf("peer %q has no AllowedIPs", p.ID)
+		if len(p.PublicKey) != 44 {
+			t.Errorf("peer %q public key len = %d, want 44 (base64)", p.NodeID, len(p.PublicKey))
 		}
 	}
 
-	// Verify policies.
-	if len(state.Policies) < 1 {
-		t.Errorf("len(Policies) = %d, want >= 1", len(state.Policies))
+	// Policy: one merged block; the fingerprint is the base64 SHA-256 of the rules.
+	if state.Policy == nil {
+		t.Fatal("Policy is nil")
 	}
-	for _, pol := range state.Policies {
-		if pol.ID == "" {
-			t.Error("policy has empty ID")
-		}
-		if len(pol.Rules) < 2 {
-			t.Errorf("policy %q: len(Rules) = %d, want >= 2", pol.ID, len(pol.Rules))
-		}
-		for _, r := range pol.Rules {
-			if r.Src == "" || r.Dst == "" || r.Protocol == "" || r.Action == "" {
-				t.Errorf("policy %q rule has empty fields", pol.ID)
-			}
-		}
+	if len(state.Policy.Rules) != 2 {
+		t.Fatalf("len(Policy.Rules) = %d, want 2", len(state.Policy.Rules))
+	}
+	if want := policyFingerprint(t, state.Policy.Rules); state.Policy.Fingerprint != want {
+		t.Errorf("policy.fingerprint = %q, want %q", state.Policy.Fingerprint, want)
 	}
 
 	// Verify state_count increments.
@@ -902,8 +935,6 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/n1/endpoint", validEndpointBody())
 	resp.Body.Close()
-	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/drift", driftBody)
-	resp.Body.Close()
 	resp, err = http.Get(ts.URL + "/v1/nodes/n1/secrets/db-password")
 	if err != nil {
 		t.Fatalf("GET secrets: %v", err)
@@ -963,9 +994,6 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	}
 	if a.EndpointCount != 1 {
 		t.Errorf("endpoint_count = %d, want 1", a.EndpointCount)
-	}
-	if a.DriftCount != 1 {
-		t.Errorf("drift_count = %d, want 1", a.DriftCount)
 	}
 	if a.SecretsCount != 1 {
 		t.Errorf("secrets_count = %d, want 1", a.SecretsCount)
@@ -1035,7 +1063,6 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPost, "/v1/keys/rotate", keyRotateBody},
 		{http.MethodPut, "/v1/nodes/node-1/capabilities", capabilitiesBody},
 		{http.MethodPut, "/v1/nodes/node-1/endpoint", validEndpointBody()},
-		{http.MethodPost, "/v1/nodes/node-1/drift", driftBody},
 		{http.MethodGet, "/v1/nodes/node-1/secrets/key1", ""},
 		{http.MethodPost, "/v1/nodes/node-1/report", reportBody},
 		{http.MethodPost, "/v1/nodes/node-1/executions/exec-001/ack", executionAckBody},
@@ -1396,44 +1423,17 @@ func TestEndpoint_ConfigureTTL(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Drift endpoint
+// Drift endpoint removed (no POST /v1/nodes/{id}/drift upstream)
 // ---------------------------------------------------------------------------
 
-func TestDrift_Returns204AndCounter(t *testing.T) {
+func TestDrift_RouteRemoved_Returns404(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/drift", driftBody)
+	// The drift route no longer exists, so a POST falls through the mux default.
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/drift", `{}`)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
-	}
-
-	a := getAssertions(t, ts.URL)
-	if a.DriftCount != 1 {
-		t.Errorf("drift_count = %d, want 1", a.DriftCount)
-	}
-}
-
-func TestDrift_InvalidBody_Returns400(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/drift", "not-json")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
-	}
-}
-
-func TestDrift_WrongMethod_Returns405(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/drift")
-	if err != nil {
-		t.Fatalf("GET drift: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
 	}
 }
 
@@ -1926,12 +1926,12 @@ func TestLastRequest_Returns404WhenNoCapturedBody(t *testing.T) {
 func TestLastRequest_ReturnsCapturedBody(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	// Send a drift request to capture the body.
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/drift", driftBody)
+	// Send a capabilities request to capture the body.
+	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", capabilitiesBody)
 	resp.Body.Close()
 
 	// Retrieve the captured body.
-	resp, err := http.Get(ts.URL + "/test/last-request/drift")
+	resp, err := http.Get(ts.URL + "/test/last-request/capabilities")
 	if err != nil {
 		t.Fatalf("GET last-request: %v", err)
 	}
@@ -1948,8 +1948,8 @@ func TestLastRequest_ReturnsCapturedBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read body: %v", err)
 	}
-	if string(body) != driftBody {
-		t.Errorf("captured body = %q, want %q", string(body), driftBody)
+	if string(body) != capabilitiesBody {
+		t.Errorf("captured body = %q, want %q", string(body), capabilitiesBody)
 	}
 }
 
@@ -1998,15 +1998,15 @@ func TestLastRequestBody_InitiallyEmpty(t *testing.T) {
 func TestLastRequestBody_StoredAfterCapture(t *testing.T) {
 	srv, ts := newTestServer(t)
 
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/drift", driftBody)
+	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", capabilitiesBody)
 	resp.Body.Close()
 
-	data, ok := srv.LastRequestBody("drift")
+	data, ok := srv.LastRequestBody("capabilities")
 	if !ok {
 		t.Fatal("expected captured body")
 	}
-	if string(data) != driftBody {
-		t.Errorf("captured body = %q, want %q", string(data), driftBody)
+	if string(data) != capabilitiesBody {
+		t.Errorf("captured body = %q, want %q", string(data), capabilitiesBody)
 	}
 }
 
@@ -2177,7 +2177,7 @@ func TestInjectEvent_InvalidBody_Returns400(t *testing.T) {
 // State enriched fixture tests (Task 1.3)
 // ---------------------------------------------------------------------------
 
-func getState(t *testing.T, baseURL string) api.StateResponse {
+func getState(t *testing.T, baseURL string) api.NodeStateSnapshot {
 	t.Helper()
 	resp, err := http.Get(baseURL + "/v1/nodes/node-1/state")
 	if err != nil {
@@ -2187,219 +2187,202 @@ func getState(t *testing.T, baseURL string) api.StateResponse {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
-	var state api.StateResponse
+	var state api.NodeStateSnapshot
 	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	return state
 }
 
-func TestState_ReturnsSigningKeys(t *testing.T) {
+func TestState_ReturnsBridgeSubtree(t *testing.T) {
 	_, ts := newTestServer(t)
 	state := getState(t, ts.URL)
 
-	if state.SigningKeys == nil {
-		t.Fatal("SigningKeys is nil")
+	if state.Bridge == nil {
+		t.Fatal("Bridge is nil")
 	}
-	if state.SigningKeys.Current == "" {
-		t.Error("SigningKeys.Current is empty")
+	// The bridge subtree carries the four children.
+	if state.Bridge.Relay == nil {
+		t.Error("Bridge.Relay is nil")
 	}
-	if state.SigningKeys.Previous == "" {
-		t.Error("SigningKeys.Previous is empty")
+	if state.Bridge.UserAccess == nil {
+		t.Error("Bridge.UserAccess is nil")
+	}
+	if state.Bridge.Ingress == nil {
+		t.Error("Bridge.Ingress is nil")
+	}
+	if state.Bridge.SiteToSite == nil {
+		t.Error("Bridge.SiteToSite is nil")
 	}
 }
 
-func TestState_ReturnsBridgeConfig(t *testing.T) {
+func TestState_ReturnsRelayChild(t *testing.T) {
 	_, ts := newTestServer(t)
 	state := getState(t, ts.URL)
 
-	if state.BridgeConfig == nil {
-		t.Fatal("BridgeConfig is nil")
+	if state.Bridge == nil || state.Bridge.Relay == nil {
+		t.Fatal("Bridge.Relay is nil")
 	}
-	if len(state.BridgeConfig.AccessSubnets) == 0 {
-		t.Error("BridgeConfig.AccessSubnets is empty")
+	if len(state.Bridge.Relay.Sessions) != 1 {
+		t.Fatalf("len(Relay.Sessions) = %d, want 1", len(state.Bridge.Relay.Sessions))
 	}
-	if !state.BridgeConfig.EnableNAT {
-		t.Error("BridgeConfig.EnableNAT = false, want true")
-	}
-	if !state.BridgeConfig.EnableForwarding {
-		t.Error("BridgeConfig.EnableForwarding = false, want true")
-	}
-}
-
-func TestState_ReturnsRelayConfig(t *testing.T) {
-	_, ts := newTestServer(t)
-	state := getState(t, ts.URL)
-
-	if state.RelayConfig == nil {
-		t.Fatal("RelayConfig is nil")
-	}
-	if len(state.RelayConfig.Sessions) != 1 {
-		t.Fatalf("len(RelayConfig.Sessions) = %d, want 1", len(state.RelayConfig.Sessions))
-	}
-	sess := state.RelayConfig.Sessions[0]
+	sess := state.Bridge.Relay.Sessions[0]
 	if sess.SessionID == "" {
-		t.Error("RelayConfig.Sessions[0].SessionID is empty")
+		t.Error("Relay.Sessions[0].SessionID is empty")
 	}
 	if sess.PeerAID == "" || sess.PeerBID == "" {
-		t.Error("RelayConfig.Sessions[0] has empty peer IDs")
+		t.Error("Relay.Sessions[0] has empty peer IDs")
 	}
 	if sess.PeerAEndpoint == "" || sess.PeerBEndpoint == "" {
-		t.Error("RelayConfig.Sessions[0] has empty peer endpoints")
+		t.Error("Relay.Sessions[0] has empty peer endpoints")
 	}
 	if sess.ExpiresAt.IsZero() {
-		t.Error("RelayConfig.Sessions[0].ExpiresAt is zero")
+		t.Error("Relay.Sessions[0].ExpiresAt is zero")
 	}
 }
 
-func TestState_ReturnsUserAccessConfig(t *testing.T) {
+func TestState_ReturnsUserAccessChild(t *testing.T) {
 	_, ts := newTestServer(t)
 	state := getState(t, ts.URL)
 
-	if state.UserAccessConfig == nil {
-		t.Fatal("UserAccessConfig is nil")
+	if state.Bridge == nil || state.Bridge.UserAccess == nil {
+		t.Fatal("Bridge.UserAccess is nil")
 	}
-	if !state.UserAccessConfig.Enabled {
-		t.Error("UserAccessConfig.Enabled = false, want true")
+	ua := state.Bridge.UserAccess
+	if !ua.Enabled {
+		t.Error("UserAccess.Enabled = false, want true")
 	}
-	if state.UserAccessConfig.InterfaceName == "" {
-		t.Error("UserAccessConfig.InterfaceName is empty")
+	if ua.InterfaceName == "" {
+		t.Error("UserAccess.InterfaceName is empty")
 	}
-	if state.UserAccessConfig.ListenPort == 0 {
-		t.Error("UserAccessConfig.ListenPort = 0")
+	if ua.ListenPort == 0 {
+		t.Error("UserAccess.ListenPort = 0")
 	}
-	if len(state.UserAccessConfig.Peers) != 1 {
-		t.Fatalf("len(UserAccessConfig.Peers) = %d, want 1", len(state.UserAccessConfig.Peers))
+	if len(ua.Peers) != 1 {
+		t.Fatalf("len(UserAccess.Peers) = %d, want 1", len(ua.Peers))
 	}
-	uaPeer := state.UserAccessConfig.Peers[0]
+	uaPeer := ua.Peers[0]
 	if uaPeer.PublicKey == "" {
-		t.Error("UserAccessConfig.Peers[0].PublicKey is empty")
+		t.Error("UserAccess.Peers[0].PublicKey is empty")
 	}
 	if len(uaPeer.AllowedIPs) == 0 {
-		t.Error("UserAccessConfig.Peers[0].AllowedIPs is empty")
+		t.Error("UserAccess.Peers[0].AllowedIPs is empty")
 	}
 	if uaPeer.Label == "" {
-		t.Error("UserAccessConfig.Peers[0].Label is empty")
+		t.Error("UserAccess.Peers[0].Label is empty")
 	}
 }
 
-func TestState_ReturnsIngressConfig(t *testing.T) {
+func TestState_ReturnsIngressChild(t *testing.T) {
 	_, ts := newTestServer(t)
 	state := getState(t, ts.URL)
 
-	if state.IngressConfig == nil {
-		t.Fatal("IngressConfig is nil")
+	if state.Bridge == nil || state.Bridge.Ingress == nil {
+		t.Fatal("Bridge.Ingress is nil")
 	}
-	if !state.IngressConfig.Enabled {
-		t.Error("IngressConfig.Enabled = false, want true")
+	ing := state.Bridge.Ingress
+	if !ing.Enabled {
+		t.Error("Ingress.Enabled = false, want true")
 	}
-	if len(state.IngressConfig.Rules) != 1 {
-		t.Fatalf("len(IngressConfig.Rules) = %d, want 1", len(state.IngressConfig.Rules))
+	if len(ing.Rules) != 1 {
+		t.Fatalf("len(Ingress.Rules) = %d, want 1", len(ing.Rules))
 	}
-	rule := state.IngressConfig.Rules[0]
+	rule := ing.Rules[0]
 	if rule.RuleID == "" {
-		t.Error("IngressConfig.Rules[0].RuleID is empty")
+		t.Error("Ingress.Rules[0].RuleID is empty")
 	}
 	if rule.ListenPort == 0 {
-		t.Error("IngressConfig.Rules[0].ListenPort = 0")
+		t.Error("Ingress.Rules[0].ListenPort = 0")
 	}
 	if rule.TargetAddr == "" {
-		t.Error("IngressConfig.Rules[0].TargetAddr is empty")
+		t.Error("Ingress.Rules[0].TargetAddr is empty")
 	}
 	if rule.Mode == "" {
-		t.Error("IngressConfig.Rules[0].Mode is empty")
+		t.Error("Ingress.Rules[0].Mode is empty")
 	}
 }
 
-func TestState_ReturnsSiteToSiteConfig(t *testing.T) {
+func TestState_ReturnsSiteToSiteChild(t *testing.T) {
 	_, ts := newTestServer(t)
 	state := getState(t, ts.URL)
 
-	if state.SiteToSiteConfig == nil {
-		t.Fatal("SiteToSiteConfig is nil")
+	if state.Bridge == nil || state.Bridge.SiteToSite == nil {
+		t.Fatal("Bridge.SiteToSite is nil")
 	}
-	if !state.SiteToSiteConfig.Enabled {
-		t.Error("SiteToSiteConfig.Enabled = false, want true")
+	s2s := state.Bridge.SiteToSite
+	if !s2s.Enabled {
+		t.Error("SiteToSite.Enabled = false, want true")
 	}
-	if len(state.SiteToSiteConfig.Tunnels) != 1 {
-		t.Fatalf("len(SiteToSiteConfig.Tunnels) = %d, want 1", len(state.SiteToSiteConfig.Tunnels))
+	if len(s2s.Tunnels) != 1 {
+		t.Fatalf("len(SiteToSite.Tunnels) = %d, want 1", len(s2s.Tunnels))
 	}
-	tunnel := state.SiteToSiteConfig.Tunnels[0]
+	tunnel := s2s.Tunnels[0]
 	if tunnel.TunnelID == "" {
-		t.Error("SiteToSiteConfig.Tunnels[0].TunnelID is empty")
+		t.Error("SiteToSite.Tunnels[0].TunnelID is empty")
 	}
 	if tunnel.RemoteEndpoint == "" {
-		t.Error("SiteToSiteConfig.Tunnels[0].RemoteEndpoint is empty")
+		t.Error("SiteToSite.Tunnels[0].RemoteEndpoint is empty")
 	}
 	if tunnel.RemotePublicKey == "" {
-		t.Error("SiteToSiteConfig.Tunnels[0].RemotePublicKey is empty")
+		t.Error("SiteToSite.Tunnels[0].RemotePublicKey is empty")
 	}
 	if len(tunnel.LocalSubnets) == 0 {
-		t.Error("SiteToSiteConfig.Tunnels[0].LocalSubnets is empty")
+		t.Error("SiteToSite.Tunnels[0].LocalSubnets is empty")
 	}
 	if len(tunnel.RemoteSubnets) == 0 {
-		t.Error("SiteToSiteConfig.Tunnels[0].RemoteSubnets is empty")
+		t.Error("SiteToSite.Tunnels[0].RemoteSubnets is empty")
 	}
 	if tunnel.InterfaceName == "" {
-		t.Error("SiteToSiteConfig.Tunnels[0].InterfaceName is empty")
+		t.Error("SiteToSite.Tunnels[0].InterfaceName is empty")
 	}
 	if tunnel.ListenPort == 0 {
-		t.Error("SiteToSiteConfig.Tunnels[0].ListenPort = 0")
+		t.Error("SiteToSite.Tunnels[0].ListenPort = 0")
 	}
 }
 
-func TestState_ReturnsDataEntries(t *testing.T) {
+func TestState_ReturnsStateBlockEntries(t *testing.T) {
 	_, ts := newTestServer(t)
 	state := getState(t, ts.URL)
 
-	if len(state.Data) != 2 {
-		t.Fatalf("len(Data) = %d, want 2", len(state.Data))
+	if state.State == nil {
+		t.Fatal("State block is nil")
+	}
+	if len(state.State.Data) != 2 {
+		t.Fatalf("len(State.Data) = %d, want 2", len(state.State.Data))
 	}
 
 	keys := map[string]bool{}
-	for _, d := range state.Data {
+	for _, d := range state.State.Data {
 		keys[d.Key] = true
-		if d.ContentType == "" {
-			t.Errorf("Data entry %q has empty ContentType", d.Key)
-		}
-		if len(d.Payload) == 0 {
-			t.Errorf("Data entry %q has empty Payload", d.Key)
-		}
-		if d.Version == 0 {
-			t.Errorf("Data entry %q has Version 0", d.Key)
-		}
-		if d.UpdatedAt.IsZero() {
-			t.Errorf("Data entry %q has zero UpdatedAt", d.Key)
+		if d.Value == "" {
+			t.Errorf("State data entry %q has empty Value", d.Key)
 		}
 	}
 	if !keys["app/config"] {
-		t.Error("Data missing key 'app/config'")
+		t.Error("State data missing key 'app/config'")
 	}
 	if !keys["certs/ca"] {
-		t.Error("Data missing key 'certs/ca'")
+		t.Error("State data missing key 'certs/ca'")
+	}
+
+	// Metadata bucket carries the two entries, key-ascending.
+	if len(state.State.Metadata) != 2 {
+		t.Fatalf("len(State.Metadata) = %d, want 2", len(state.State.Metadata))
+	}
+	if state.State.Metadata[0].Key >= state.State.Metadata[1].Key {
+		t.Errorf("State.Metadata not key-ascending: %q, %q", state.State.Metadata[0].Key, state.State.Metadata[1].Key)
 	}
 }
 
-func TestState_ReturnsSecretRefs(t *testing.T) {
+func TestState_ReportsMirrorsState(t *testing.T) {
 	_, ts := newTestServer(t)
 	state := getState(t, ts.URL)
 
-	if len(state.SecretRefs) != 2 {
-		t.Fatalf("len(SecretRefs) = %d, want 2", len(state.SecretRefs))
+	if state.State == nil || state.Reports == nil {
+		t.Fatal("State and Reports blocks must both be populated")
 	}
-
-	keys := map[string]bool{}
-	for _, sr := range state.SecretRefs {
-		keys[sr.Key] = true
-		if sr.Version == 0 {
-			t.Errorf("SecretRef %q has Version 0", sr.Key)
-		}
-	}
-	if !keys["db-password"] {
-		t.Error("SecretRefs missing key 'db-password'")
-	}
-	if !keys["tls-private-key"] {
-		t.Error("SecretRefs missing key 'tls-private-key'")
+	if !reflect.DeepEqual(state.State, state.Reports) {
+		t.Errorf("reports block does not mirror state block:\nstate=%+v\nreports=%+v", state.State, state.Reports)
 	}
 }
 
@@ -2446,24 +2429,14 @@ func TestBroadcastSSE_Programmatic(t *testing.T) {
 // SetState / GetState (Task 1.2)
 // ---------------------------------------------------------------------------
 
-func TestSetState_UpdatesStateResponse(t *testing.T) {
+func TestSetState_UpdatesSnapshot(t *testing.T) {
 	srv, ts := newTestServer(t)
 
-	newState := api.StateResponse{
-		Peers: []api.Peer{
-			{
-				ID:         "peer-new",
-				PublicKey:  "new-pub-key",
-				MeshIP:     "10.99.1.1",
-				Endpoint:   "198.51.100.1:51820",
-				AllowedIPs: []string{"10.99.1.1/32"},
-				PSK:        "new-psk",
-			},
+	newState := api.NodeStateSnapshot{
+		Peers: []api.SnapshotPeer{
+			{NodeID: "peer-new", PublicKey: "new-pub-key", MeshIP: "10.99.1.1", FallbackEndpoint: "198.51.100.1:51820"},
 		},
-		Policies:   []api.Policy{},
-		Metadata:   map[string]string{"env": "updated"},
-		Data:       []api.DataEntry{},
-		SecretRefs: []api.SecretRef{},
+		Policy: &api.PolicySnapshot{RevisionID: "rev-x", Fingerprint: "fp-x"},
 	}
 	srv.SetState(newState)
 
@@ -2473,7 +2446,7 @@ func TestSetState_UpdatesStateResponse(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	var got api.StateResponse
+	var got api.NodeStateSnapshot
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -2481,32 +2454,21 @@ func TestSetState_UpdatesStateResponse(t *testing.T) {
 	if len(got.Peers) != 1 {
 		t.Fatalf("len(Peers) = %d, want 1", len(got.Peers))
 	}
-	if got.Peers[0].ID != "peer-new" {
-		t.Errorf("Peers[0].ID = %q, want %q", got.Peers[0].ID, "peer-new")
+	if got.Peers[0].NodeID != "peer-new" {
+		t.Errorf("Peers[0].NodeID = %q, want %q", got.Peers[0].NodeID, "peer-new")
 	}
-	if got.Metadata["env"] != "updated" {
-		t.Errorf("Metadata[env] = %q, want %q", got.Metadata["env"], "updated")
+	if got.Policy == nil || got.Policy.Fingerprint != "fp-x" {
+		t.Errorf("Policy = %+v, want fingerprint fp-x", got.Policy)
 	}
 }
 
 func TestSetState_ViaHTTP(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	newState := api.StateResponse{
-		Peers: []api.Peer{
-			{
-				ID:         "peer-http",
-				PublicKey:  "http-pub-key",
-				MeshIP:     "10.99.2.1",
-				Endpoint:   "198.51.100.2:51820",
-				AllowedIPs: []string{"10.99.2.1/32"},
-				PSK:        "http-psk",
-			},
+	newState := api.NodeStateSnapshot{
+		Peers: []api.SnapshotPeer{
+			{NodeID: "peer-http", PublicKey: "http-pub-key", MeshIP: "10.99.2.1", FallbackEndpoint: "198.51.100.2:51820"},
 		},
-		Policies:   []api.Policy{},
-		Metadata:   map[string]string{"source": "http"},
-		Data:       []api.DataEntry{},
-		SecretRefs: []api.SecretRef{},
 	}
 	body, err := json.Marshal(newState)
 	if err != nil {
@@ -2519,14 +2481,14 @@ func TestSetState_ViaHTTP(t *testing.T) {
 		t.Errorf("PUT /test/state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
 	}
 
-	// Now GET state and verify the update.
+	// Now GET state and verify the update round-tripped.
 	getResp, err := http.Get(ts.URL + "/v1/nodes/node-1/state")
 	if err != nil {
 		t.Fatalf("GET state: %v", err)
 	}
 	defer getResp.Body.Close()
 
-	var got api.StateResponse
+	var got api.NodeStateSnapshot
 	if err := json.NewDecoder(getResp.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -2534,93 +2496,108 @@ func TestSetState_ViaHTTP(t *testing.T) {
 	if len(got.Peers) != 1 {
 		t.Fatalf("len(Peers) = %d, want 1", len(got.Peers))
 	}
-	if got.Peers[0].ID != "peer-http" {
-		t.Errorf("Peers[0].ID = %q, want %q", got.Peers[0].ID, "peer-http")
+	if got.Peers[0].NodeID != "peer-http" {
+		t.Errorf("Peers[0].NodeID = %q, want %q", got.Peers[0].NodeID, "peer-http")
 	}
 }
 
 func TestSetState_DefaultMatchesOriginal(t *testing.T) {
 	_, ts := newTestServer(t)
+	state := getState(t, ts.URL)
 
-	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/state")
-	if err != nil {
-		t.Fatalf("GET state: %v", err)
-	}
-	defer resp.Body.Close()
-
-	var state api.StateResponse
-	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-
-	// Check peers match original fixture.
+	// Peers mirror the register fixture, node_id ascending.
 	if len(state.Peers) != 2 {
 		t.Fatalf("len(Peers) = %d, want 2", len(state.Peers))
 	}
-	if state.Peers[0].ID != "peer-001" {
-		t.Errorf("Peers[0].ID = %q, want %q", state.Peers[0].ID, "peer-001")
+	if state.Peers[0].NodeID != "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1" {
+		t.Errorf("Peers[0].NodeID = %q", state.Peers[0].NodeID)
 	}
-	if state.Peers[1].ID != "peer-002" {
-		t.Errorf("Peers[1].ID = %q, want %q", state.Peers[1].ID, "peer-002")
-	}
-
-	// Check policies.
-	if len(state.Policies) != 1 {
-		t.Fatalf("len(Policies) = %d, want 1", len(state.Policies))
-	}
-	if state.Policies[0].ID != "policy-001" {
-		t.Errorf("Policies[0].ID = %q, want %q", state.Policies[0].ID, "policy-001")
-	}
-	if len(state.Policies[0].Rules) != 2 {
-		t.Errorf("len(Rules) = %d, want 2", len(state.Policies[0].Rules))
+	if state.Peers[1].NodeID != "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2" {
+		t.Errorf("Peers[1].NodeID = %q", state.Peers[1].NodeID)
 	}
 
-	// Check metadata.
-	if state.Metadata["environment"] != "e2e-test" {
-		t.Errorf("Metadata[environment] = %q, want %q", state.Metadata["environment"], "e2e-test")
+	// Merged policy with two rules.
+	if state.Policy == nil {
+		t.Fatal("Policy is nil")
 	}
-	if state.Metadata["region"] != "mock-region-1" {
-		t.Errorf("Metadata[region] = %q, want %q", state.Metadata["region"], "mock-region-1")
-	}
-
-	// Check rich config fields are present (from expanded fixture).
-	if state.SigningKeys == nil {
-		t.Error("SigningKeys is nil")
-	}
-	if state.BridgeConfig == nil {
-		t.Error("BridgeConfig is nil")
-	}
-	if state.RelayConfig == nil {
-		t.Error("RelayConfig is nil")
-	}
-	if state.UserAccessConfig == nil {
-		t.Error("UserAccessConfig is nil")
-	}
-	if state.IngressConfig == nil {
-		t.Error("IngressConfig is nil")
-	}
-	if state.SiteToSiteConfig == nil {
-		t.Error("SiteToSiteConfig is nil")
+	if len(state.Policy.Rules) != 2 {
+		t.Errorf("len(Policy.Rules) = %d, want 2", len(state.Policy.Rules))
 	}
 
-	// Data and SecretRefs should have entries.
-	if len(state.Data) != 2 {
-		t.Errorf("len(Data) = %d, want 2", len(state.Data))
+	// Bridge subtree and its four children populated.
+	if state.Bridge == nil {
+		t.Fatal("Bridge is nil")
 	}
-	if len(state.SecretRefs) != 2 {
-		t.Errorf("len(SecretRefs) = %d, want 2", len(state.SecretRefs))
+	if state.Bridge.Relay == nil || state.Bridge.UserAccess == nil || state.Bridge.Ingress == nil || state.Bridge.SiteToSite == nil {
+		t.Error("Bridge subtree missing a child")
+	}
+
+	// State block metadata and data entries.
+	if state.State == nil {
+		t.Fatal("State block is nil")
+	}
+	if len(state.State.Metadata) != 2 {
+		t.Errorf("len(State.Metadata) = %d, want 2", len(state.State.Metadata))
+	}
+	if len(state.State.Data) != 2 {
+		t.Errorf("len(State.Data) = %d, want 2", len(state.State.Data))
 	}
 }
 
-func TestGetState_ReturnsCopy(t *testing.T) {
+func TestGetState_NormalizesEmptyPeers(t *testing.T) {
 	srv, _ := newTestServer(t)
 
-	state1 := srv.GetState()
-	state1.Metadata["mutated"] = "yes"
+	// A fixture with nil peers must still return a non-nil (empty) slice so it
+	// serializes as [] rather than null.
+	srv.SetState(api.NodeStateSnapshot{})
+	got := srv.GetState()
+	if got.Peers == nil {
+		t.Error("GetState().Peers is nil, want a non-nil empty slice")
+	}
+	if len(got.Peers) != 0 {
+		t.Errorf("GetState().Peers = %v, want empty", got.Peers)
+	}
+}
 
-	state2 := srv.GetState()
-	if _, ok := state2.Metadata["mutated"]; ok {
-		t.Error("GetState returned a reference instead of a copy: mutating the result affected server state")
+func TestState_EmptyPeersSerializeAsArray(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	// configure-state with an envelope carrying nil peers and nil blocks.
+	body, err := json.Marshal(api.NodeStateSnapshot{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", string(body))
+	resp.Body.Close()
+
+	getResp, err := http.Get(ts.URL + "/v1/nodes/node-1/state")
+	if err != nil {
+		t.Fatalf("GET state: %v", err)
+	}
+	defer getResp.Body.Close()
+	raw, err := io.ReadAll(getResp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports"} {
+		if _, ok := envelope[key]; !ok {
+			t.Errorf("envelope missing key %q", key)
+		}
+	}
+	// peers is [] (never null) even when emptied.
+	if string(envelope["peers"]) != "[]" {
+		t.Errorf("peers = %s, want [] (never null)", envelope["peers"])
+	}
+	// Unpopulated blocks serialize as null.
+	for _, key := range []string{"policy", "bridge", "state", "reports"} {
+		if string(envelope[key]) != "null" {
+			t.Errorf("%s = %s, want null (unpopulated)", key, envelope[key])
+		}
 	}
 }
 
@@ -2634,13 +2611,10 @@ func TestSetState_ConcurrentSafe(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			defer wg.Done()
-			srv.SetState(api.StateResponse{
-				Peers: []api.Peer{
-					{ID: fmt.Sprintf("peer-%d", i), PublicKey: "pk", MeshIP: "10.0.0.1",
-						Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.0.0.1/32"}, PSK: "psk"},
+			srv.SetState(api.NodeStateSnapshot{
+				Peers: []api.SnapshotPeer{
+					{NodeID: fmt.Sprintf("peer-%d", i), PublicKey: "pk", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820"},
 				},
-				Data:       []api.DataEntry{},
-				SecretRefs: []api.SecretRef{},
 			})
 		}(i)
 		go func() {
@@ -2686,13 +2660,13 @@ func TestSetState_WrongMethod_Returns405(t *testing.T) {
 func TestConfigureState_ReplacesActiveFixture(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	customState := api.StateResponse{
-		Peers: []api.Peer{{
-			ID:        "custom-peer",
+	customState := api.NodeStateSnapshot{
+		Peers: []api.SnapshotPeer{{
+			NodeID:    "custom-peer",
 			PublicKey: "custom-key",
 			MeshIP:    "10.0.0.99",
 		}},
-		Metadata: map[string]string{"env": "custom"},
+		Policy: &api.PolicySnapshot{RevisionID: "rev-c", Fingerprint: "fp-c"},
 	}
 	body, err := json.Marshal(customState)
 	if err != nil {
@@ -2708,15 +2682,15 @@ func TestConfigureState_ReplacesActiveFixture(t *testing.T) {
 	// Verify GET /v1/nodes/{id}/state returns the custom state.
 	stateResp := doRequest(t, http.MethodGet, ts.URL+"/v1/nodes/node-1/state", "")
 	defer stateResp.Body.Close()
-	var got api.StateResponse
+	var got api.NodeStateSnapshot
 	if err := json.NewDecoder(stateResp.Body).Decode(&got); err != nil {
 		t.Fatalf("decode state: %v", err)
 	}
-	if len(got.Peers) != 1 || got.Peers[0].ID != "custom-peer" {
-		t.Errorf("peers = %v, want 1 peer with ID custom-peer", got.Peers)
+	if len(got.Peers) != 1 || got.Peers[0].NodeID != "custom-peer" {
+		t.Errorf("peers = %v, want 1 peer with node_id custom-peer", got.Peers)
 	}
-	if got.Metadata["env"] != "custom" {
-		t.Errorf("metadata[env] = %q, want %q", got.Metadata["env"], "custom")
+	if got.Policy == nil || got.Policy.Fingerprint != "fp-c" {
+		t.Errorf("policy = %+v, want fingerprint fp-c", got.Policy)
 	}
 }
 
@@ -2730,13 +2704,53 @@ func TestConfigureState_InvalidJSON_Returns400(t *testing.T) {
 	}
 }
 
+func TestConfigureState_UnknownField_Returns400(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	// A typo in a block key ("policies" for "policy") must not be accepted:
+	// otherwise the fixture stores Policy == nil while the caller believes it
+	// configured a fingerprint, and every downstream policy assertion becomes
+	// indistinguishable from "no policy block at all".
+	const typo = `{"peers":[],"reachability":null,"policies":{"revision_id":"rev-c","fingerprint":"fp-c","rules":[]},"bridge":null,"state":null,"reports":null}`
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", typo)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	// The rejected payload must not have replaced the fixture.
+	stateResp := doRequest(t, http.MethodGet, ts.URL+"/v1/nodes/node-1/state", "")
+	defer stateResp.Body.Close()
+	var got api.NodeStateSnapshot
+	if err := json.NewDecoder(stateResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	if got.Policy == nil {
+		t.Error("policy = nil, want the default fixture policy retained")
+	}
+}
+
+func TestConfigureState_UnknownNestedField_Returns400(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	// Strictness must reach nested blocks too, so a renamed PolicySnapshot json
+	// tag cannot silently degrade the stored fingerprint.
+	const typo = `{"peers":[],"reachability":null,"policy":{"revision_id":"rev-c","finger_print":"fp-c","rules":[]},"bridge":null,"state":null,"reports":null}`
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", typo)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
 func TestConfigureState_CounterStillIncrements(t *testing.T) {
 	_, ts := newTestServer(t)
 
 	// Configure a custom state.
-	customState := api.StateResponse{
-		Peers:    []api.Peer{{ID: "p1", PublicKey: "k1", MeshIP: "10.0.0.1"}},
-		Metadata: map[string]string{"test": "counter"},
+	customState := api.NodeStateSnapshot{
+		Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "k1", MeshIP: "10.0.0.1"}},
 	}
 	body, _ := json.Marshal(customState)
 	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", string(body))
@@ -2770,8 +2784,8 @@ func TestConfigureState_WrongMethod_Returns405(t *testing.T) {
 func TestConfigureState_CapturesRequestBody(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	customState := api.StateResponse{
-		Metadata: map[string]string{"capture": "test"},
+	customState := api.NodeStateSnapshot{
+		Policy: &api.PolicySnapshot{Fingerprint: "capture"},
 	}
 	body, err := json.Marshal(customState)
 	if err != nil {
@@ -2793,8 +2807,8 @@ func TestConfigureState_CapturesRequestBody(t *testing.T) {
 func TestSetState_PutCapturesRequestBody(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	customState := api.StateResponse{
-		Metadata: map[string]string{"put-capture": "test"},
+	customState := api.NodeStateSnapshot{
+		Policy: &api.PolicySnapshot{Fingerprint: "put-capture"},
 	}
 	body, err := json.Marshal(customState)
 	if err != nil {
@@ -2859,9 +2873,9 @@ func TestConcurrent_InjectEventAndConfigureState(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			defer wg.Done()
-			state := api.StateResponse{
-				Peers: []api.Peer{{
-					ID:        fmt.Sprintf("conc-peer-%d", i),
+			state := api.NodeStateSnapshot{
+				Peers: []api.SnapshotPeer{{
+					NodeID:    fmt.Sprintf("conc-peer-%d", i),
 					PublicKey: "pk",
 					MeshIP:    fmt.Sprintf("10.0.%d.1", i%256),
 				}},

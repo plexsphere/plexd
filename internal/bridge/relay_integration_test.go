@@ -104,21 +104,21 @@ func TestRelayIntegration_ReconcileSessionSync(t *testing.T) {
 	peerD := newTestUDPConn(t)
 
 	// Initial desired state: one session.
-	state1 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		RelayConfig: &api.RelayConfig{
-			Sessions: []api.RelaySessionAssignment{
-				{
-					SessionID:     "reconcile-sess-1",
-					PeerAID:       "peer-a",
-					PeerAEndpoint: peerA.LocalAddr().String(),
-					PeerBID:       "peer-b",
-					PeerBEndpoint: peerB.LocalAddr().String(),
-					ExpiresAt:     time.Now().Add(5 * time.Minute),
+	state1 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Relay: &api.RelayConfig{
+				Sessions: []api.RelaySessionAssignment{
+					{
+						SessionID:     "reconcile-sess-1",
+						PeerAID:       "peer-a",
+						PeerAEndpoint: peerA.LocalAddr().String(),
+						PeerBID:       "peer-b",
+						PeerBEndpoint: peerB.LocalAddr().String(),
+						ExpiresAt:     time.Now().Add(5 * time.Minute),
+					},
 				},
 			},
 		},
-		Metadata: map[string]string{"version": "1"},
 	}
 
 	fetcher := &integrationStateFetcher{state: state1}
@@ -139,22 +139,22 @@ func TestRelayIntegration_ReconcileSessionSync(t *testing.T) {
 		t.Errorf("SessionIDs = %v, want [reconcile-sess-1]", ids)
 	}
 
-	// Update state: replace sess-1 with sess-2, bump metadata.
-	state2 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		RelayConfig: &api.RelayConfig{
-			Sessions: []api.RelaySessionAssignment{
-				{
-					SessionID:     "reconcile-sess-2",
-					PeerAID:       "peer-c",
-					PeerAEndpoint: peerC.LocalAddr().String(),
-					PeerBID:       "peer-d",
-					PeerBEndpoint: peerD.LocalAddr().String(),
-					ExpiresAt:     time.Now().Add(5 * time.Minute),
+	// Update state: replace sess-1 with sess-2.
+	state2 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Relay: &api.RelayConfig{
+				Sessions: []api.RelaySessionAssignment{
+					{
+						SessionID:     "reconcile-sess-2",
+						PeerAID:       "peer-c",
+						PeerAEndpoint: peerC.LocalAddr().String(),
+						PeerBID:       "peer-d",
+						PeerBEndpoint: peerD.LocalAddr().String(),
+						ExpiresAt:     time.Now().Add(5 * time.Minute),
+					},
 				},
 			},
 		},
-		Metadata: map[string]string{"version": "2"},
 	}
 	fetcher.setState(state2)
 	rec.TriggerReconcile()
@@ -170,12 +170,12 @@ func TestRelayIntegration_ReconcileSessionSync(t *testing.T) {
 	}
 
 	// Update state: empty sessions — all removed.
-	state3 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		RelayConfig: &api.RelayConfig{
-			Sessions: []api.RelaySessionAssignment{},
+	state3 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Relay: &api.RelayConfig{
+				Sessions: []api.RelaySessionAssignment{},
+			},
 		},
-		Metadata: map[string]string{"version": "3"},
 	}
 	fetcher.setState(state3)
 	rec.TriggerReconcile()

@@ -7,20 +7,20 @@ import (
 )
 
 func TestComputeDiff_PeersAdded(t *testing.T) {
-	desired := &api.StateResponse{
-		Peers: []api.Peer{
-			{ID: "p1", PublicKey: "pk1", Endpoint: "1.2.3.4:51820"},
+	desired := &api.NodeStateSnapshot{
+		Peers: []api.SnapshotPeer{
+			{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820"},
 		},
 	}
-	current := &api.StateResponse{}
+	current := &api.NodeStateSnapshot{}
 
 	diff := ComputeDiff(desired, current)
 
 	if len(diff.PeersToAdd) != 1 {
 		t.Fatalf("expected 1 peer to add, got %d", len(diff.PeersToAdd))
 	}
-	if diff.PeersToAdd[0].ID != "p1" {
-		t.Errorf("expected peer ID p1, got %s", diff.PeersToAdd[0].ID)
+	if diff.PeersToAdd[0].NodeID != "p1" {
+		t.Errorf("expected peer node ID p1, got %s", diff.PeersToAdd[0].NodeID)
 	}
 	if len(diff.PeersToRemove) != 0 {
 		t.Errorf("expected 0 peers to remove, got %d", len(diff.PeersToRemove))
@@ -28,20 +28,20 @@ func TestComputeDiff_PeersAdded(t *testing.T) {
 }
 
 func TestComputeDiff_PeersRemoved(t *testing.T) {
-	desired := &api.StateResponse{}
-	current := &api.StateResponse{
-		Peers: []api.Peer{
-			{ID: "p1", PublicKey: "pk1", Endpoint: "1.2.3.4:51820"},
+	// An explicit empty desired peers list against a populated current removes
+	// every peer.
+	desired := &api.NodeStateSnapshot{Peers: []api.SnapshotPeer{}}
+	current := &api.NodeStateSnapshot{
+		Peers: []api.SnapshotPeer{
+			{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1"},
+			{NodeID: "p2", PublicKey: "pk2", MeshIP: "10.0.0.2"},
 		},
 	}
 
 	diff := ComputeDiff(desired, current)
 
-	if len(diff.PeersToRemove) != 1 {
-		t.Fatalf("expected 1 peer to remove, got %d", len(diff.PeersToRemove))
-	}
-	if diff.PeersToRemove[0] != "p1" {
-		t.Errorf("expected peer ID p1, got %s", diff.PeersToRemove[0])
+	if len(diff.PeersToRemove) != 2 {
+		t.Fatalf("expected 2 peers to remove, got %d", len(diff.PeersToRemove))
 	}
 	if len(diff.PeersToAdd) != 0 {
 		t.Errorf("expected 0 peers to add, got %d", len(diff.PeersToAdd))
@@ -49,270 +49,250 @@ func TestComputeDiff_PeersRemoved(t *testing.T) {
 }
 
 func TestComputeDiff_PeersUpdated(t *testing.T) {
-	desired := &api.StateResponse{
-		Peers: []api.Peer{
-			{ID: "p1", PublicKey: "pk1", Endpoint: "5.6.7.8:51820", MeshIP: "10.0.0.1"},
-		},
-	}
-	current := &api.StateResponse{
-		Peers: []api.Peer{
-			{ID: "p1", PublicKey: "pk1", Endpoint: "1.2.3.4:51820", MeshIP: "10.0.0.1"},
-		},
-	}
-
-	diff := ComputeDiff(desired, current)
-
-	if len(diff.PeersToUpdate) != 1 {
-		t.Fatalf("expected 1 peer to update, got %d", len(diff.PeersToUpdate))
-	}
-	if diff.PeersToUpdate[0].Endpoint != "5.6.7.8:51820" {
-		t.Errorf("expected updated endpoint 5.6.7.8:51820, got %s", diff.PeersToUpdate[0].Endpoint)
-	}
-	if len(diff.PeersToAdd) != 0 {
-		t.Errorf("expected 0 peers to add, got %d", len(diff.PeersToAdd))
-	}
-	if len(diff.PeersToRemove) != 0 {
-		t.Errorf("expected 0 peers to remove, got %d", len(diff.PeersToRemove))
-	}
-}
-
-func TestComputeDiff_PeersUpdatedAllowedIPs(t *testing.T) {
-	t.Run("reordered AllowedIPs should not count as update", func(t *testing.T) {
-		desired := &api.StateResponse{
-			Peers: []api.Peer{
-				{ID: "p1", PublicKey: "pk1", AllowedIPs: []string{"10.0.0.0/24", "192.168.1.0/24"}},
-			},
+	t.Run("public key change is an update", func(t *testing.T) {
+		desired := &api.NodeStateSnapshot{
+			Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk-new", MeshIP: "10.0.0.1"}},
 		}
-		current := &api.StateResponse{
-			Peers: []api.Peer{
-				{ID: "p1", PublicKey: "pk1", AllowedIPs: []string{"192.168.1.0/24", "10.0.0.0/24"}},
-			},
-		}
-
-		diff := ComputeDiff(desired, current)
-
-		if len(diff.PeersToUpdate) != 0 {
-			t.Errorf("reordered AllowedIPs should not produce update, got %d updates", len(diff.PeersToUpdate))
-		}
-	})
-
-	t.Run("different AllowedIPs should count as update", func(t *testing.T) {
-		desired := &api.StateResponse{
-			Peers: []api.Peer{
-				{ID: "p1", PublicKey: "pk1", AllowedIPs: []string{"10.0.0.0/24", "172.16.0.0/16"}},
-			},
-		}
-		current := &api.StateResponse{
-			Peers: []api.Peer{
-				{ID: "p1", PublicKey: "pk1", AllowedIPs: []string{"10.0.0.0/24", "192.168.1.0/24"}},
-			},
+		current := &api.NodeStateSnapshot{
+			Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk-old", MeshIP: "10.0.0.1"}},
 		}
 
 		diff := ComputeDiff(desired, current)
 
 		if len(diff.PeersToUpdate) != 1 {
-			t.Fatalf("different AllowedIPs should produce update, got %d updates", len(diff.PeersToUpdate))
+			t.Fatalf("expected 1 peer to update, got %d", len(diff.PeersToUpdate))
+		}
+		if diff.PeersToUpdate[0].PublicKey != "pk-new" {
+			t.Errorf("expected updated public key pk-new, got %s", diff.PeersToUpdate[0].PublicKey)
+		}
+	})
+
+	t.Run("fallback_endpoint-only change is an update", func(t *testing.T) {
+		desired := &api.NodeStateSnapshot{
+			Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", FallbackEndpoint: "5.6.7.8:51820"}},
+		}
+		current := &api.NodeStateSnapshot{
+			Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820"}},
+		}
+
+		diff := ComputeDiff(desired, current)
+
+		if len(diff.PeersToUpdate) != 1 {
+			t.Fatalf("expected 1 peer to update on fallback_endpoint change, got %d", len(diff.PeersToUpdate))
+		}
+		if diff.PeersToUpdate[0].FallbackEndpoint != "5.6.7.8:51820" {
+			t.Errorf("expected updated fallback endpoint, got %s", diff.PeersToUpdate[0].FallbackEndpoint)
+		}
+		if len(diff.PeersToAdd) != 0 || len(diff.PeersToRemove) != 0 {
+			t.Errorf("expected no adds/removes, got add=%d remove=%d", len(diff.PeersToAdd), len(diff.PeersToRemove))
+		}
+	})
+
+	t.Run("identical peer is not an update", func(t *testing.T) {
+		peer := api.SnapshotPeer{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820"}
+		desired := &api.NodeStateSnapshot{Peers: []api.SnapshotPeer{peer}}
+		current := &api.NodeStateSnapshot{Peers: []api.SnapshotPeer{peer}}
+
+		diff := ComputeDiff(desired, current)
+
+		if len(diff.PeersToUpdate) != 0 {
+			t.Errorf("identical peer should not update, got %d", len(diff.PeersToUpdate))
 		}
 	})
 }
 
-func TestComputeDiff_PoliciesAddedAndRemoved(t *testing.T) {
-	desired := &api.StateResponse{
-		Policies: []api.Policy{
-			{ID: "pol-new", Rules: []api.PolicyRule{{Src: "10.0.0.1", Dst: "10.0.0.2", Action: "allow"}}},
-		},
-	}
-	current := &api.StateResponse{
-		Policies: []api.Policy{
-			{ID: "pol-old", Rules: []api.PolicyRule{{Src: "10.0.0.3", Dst: "10.0.0.4", Action: "deny"}}},
-		},
-	}
+func TestComputeDiff_PolicyFingerprintShortCircuit(t *testing.T) {
+	t.Run("different rules but equal fingerprint is not a change", func(t *testing.T) {
+		desired := &api.NodeStateSnapshot{
+			Policy: &api.PolicySnapshot{
+				RevisionID:  "rev-2",
+				Fingerprint: "fp-same",
+				Rules: []api.PolicyRule{
+					{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
+				},
+			},
+		}
+		current := &api.NodeStateSnapshot{
+			Policy: &api.PolicySnapshot{
+				RevisionID:  "rev-1",
+				Fingerprint: "fp-same",
+				Rules:       []api.PolicyRule{}, // deliberately different rule set
+			},
+		}
+
+		diff := ComputeDiff(desired, current)
+
+		if diff.PolicyChanged {
+			t.Error("equal fingerprint must short-circuit: PolicyChanged should be false despite differing rules")
+		}
+	})
+
+	t.Run("revision-only bump is not a change", func(t *testing.T) {
+		rules := []api.PolicyRule{{Action: "deny", Protocol: "any", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"}}
+		desired := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{RevisionID: "rev-2", Fingerprint: "fp", Rules: rules}}
+		current := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{RevisionID: "rev-1", Fingerprint: "fp", Rules: rules}}
+
+		diff := ComputeDiff(desired, current)
+
+		if diff.PolicyChanged {
+			t.Error("revision-only bump should not change policy")
+		}
+	})
+
+	t.Run("fingerprint change is a change", func(t *testing.T) {
+		rules := []api.PolicyRule{{Action: "deny", Protocol: "any", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"}}
+		desired := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{RevisionID: "rev-1", Fingerprint: "fp-new", Rules: rules}}
+		current := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{RevisionID: "rev-1", Fingerprint: "fp-old", Rules: rules}}
+
+		diff := ComputeDiff(desired, current)
+
+		if !diff.PolicyChanged {
+			t.Error("fingerprint change should set PolicyChanged")
+		}
+	})
+}
+
+func TestComputeDiff_PolicyNullToPopulated(t *testing.T) {
+	desired := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{Fingerprint: "fp"}}
+	current := &api.NodeStateSnapshot{Policy: nil}
 
 	diff := ComputeDiff(desired, current)
 
-	if len(diff.PoliciesToAdd) != 1 {
-		t.Fatalf("expected 1 policy to add, got %d", len(diff.PoliciesToAdd))
-	}
-	if diff.PoliciesToAdd[0].ID != "pol-new" {
-		t.Errorf("expected policy ID pol-new, got %s", diff.PoliciesToAdd[0].ID)
-	}
-	if len(diff.PoliciesToRemove) != 1 {
-		t.Fatalf("expected 1 policy to remove, got %d", len(diff.PoliciesToRemove))
-	}
-	if diff.PoliciesToRemove[0] != "pol-old" {
-		t.Errorf("expected policy ID pol-old, got %s", diff.PoliciesToRemove[0])
+	if !diff.PolicyChanged {
+		t.Error("nil→populated policy should set PolicyChanged")
 	}
 }
 
-func TestComputeDiff_SigningKeysChanged(t *testing.T) {
-	desired := &api.StateResponse{
-		SigningKeys: &api.SigningKeys{Current: "key-new", Previous: "key-old"},
-	}
-	current := &api.StateResponse{
-		SigningKeys: &api.SigningKeys{Current: "key-old", Previous: ""},
-	}
+// An empty desired fingerprint must not be treated as a valid comparison key:
+// "" == "" would read as "no change" forever and freeze the firewall at the
+// first applied revision.
+func TestComputeDiff_PolicyEmptyFingerprintAlwaysChanged(t *testing.T) {
+	rules := []api.PolicyRule{{Action: "allow", Protocol: "tcp"}}
+	desired := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{Fingerprint: "", Rules: rules}}
+	current := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{Fingerprint: "", Rules: rules}}
 
 	diff := ComputeDiff(desired, current)
 
-	if !diff.SigningKeysChanged {
-		t.Fatal("expected SigningKeysChanged to be true")
-	}
-	if diff.NewSigningKeys == nil {
-		t.Fatal("expected NewSigningKeys to be non-nil")
-	}
-	if diff.NewSigningKeys.Current != "key-new" {
-		t.Errorf("expected new current key key-new, got %s", diff.NewSigningKeys.Current)
+	if !diff.PolicyChanged {
+		t.Error("empty desired fingerprint should set PolicyChanged, not short-circuit")
 	}
 }
 
-func TestComputeDiff_SigningKeysNilToNonNil(t *testing.T) {
-	desired := &api.StateResponse{
-		SigningKeys: &api.SigningKeys{Current: "key-new"},
-	}
-	current := &api.StateResponse{
-		SigningKeys: nil,
-	}
+func TestComputeDiff_PolicyPopulatedToNull(t *testing.T) {
+	desired := &api.NodeStateSnapshot{Policy: nil}
+	current := &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{Fingerprint: "fp"}}
 
 	diff := ComputeDiff(desired, current)
 
-	if !diff.SigningKeysChanged {
-		t.Fatal("expected SigningKeysChanged to be true when going from nil to non-nil")
-	}
-	if diff.NewSigningKeys == nil || diff.NewSigningKeys.Current != "key-new" {
-		t.Error("expected NewSigningKeys to reflect desired")
+	if !diff.PolicyChanged {
+		t.Error("populated→nil policy should set PolicyChanged")
 	}
 }
 
-func TestComputeDiff_SigningKeysNilBoth(t *testing.T) {
-	desired := &api.StateResponse{SigningKeys: nil}
-	current := &api.StateResponse{SigningKeys: nil}
+func TestComputeDiff_BridgeTransitions(t *testing.T) {
+	populated := &api.BridgeSnapshot{Relay: &api.RelayConfig{Sessions: []api.RelaySessionAssignment{{SessionID: "r1"}}}}
+	changed := &api.BridgeSnapshot{Relay: &api.RelayConfig{Sessions: []api.RelaySessionAssignment{{SessionID: "r2"}}}}
 
-	diff := ComputeDiff(desired, current)
+	tests := []struct {
+		name    string
+		desired *api.BridgeSnapshot
+		current *api.BridgeSnapshot
+		want    bool
+	}{
+		{"nil to nil", nil, nil, false},
+		{"nil to populated", populated, nil, true},
+		{"populated to nil", nil, populated, true},
+		{"populated deep change", changed, populated, true},
+		{"populated no change", populated, populated, false},
+	}
 
-	if diff.SigningKeysChanged {
-		t.Error("expected no signing key change when both are nil")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diff := ComputeDiff(&api.NodeStateSnapshot{Bridge: tt.desired}, &api.NodeStateSnapshot{Bridge: tt.current})
+			if diff.BridgeChanged != tt.want {
+				t.Errorf("BridgeChanged = %v, want %v", diff.BridgeChanged, tt.want)
+			}
+		})
 	}
 }
 
-func TestComputeDiff_MetadataChanged(t *testing.T) {
-	desired := &api.StateResponse{
-		Metadata: map[string]string{"env": "prod", "region": "us-east"},
-	}
-	current := &api.StateResponse{
-		Metadata: map[string]string{"env": "staging"},
-	}
+func TestComputeDiff_StateTransitions(t *testing.T) {
+	populated := &api.NodeStateBlock{Metadata: []api.StateEntry{{Key: "env", Value: "prod"}}}
+	changed := &api.NodeStateBlock{Metadata: []api.StateEntry{{Key: "env", Value: "staging"}}}
 
-	diff := ComputeDiff(desired, current)
-
-	if !diff.MetadataChanged {
-		t.Fatal("expected MetadataChanged to be true")
-	}
-}
-
-func TestComputeDiff_DataEntriesChanged(t *testing.T) {
-	desired := &api.StateResponse{
-		Data: []api.DataEntry{
-			{Key: "config", Version: 3},
-		},
-	}
-	current := &api.StateResponse{
-		Data: []api.DataEntry{
-			{Key: "config", Version: 2},
-		},
+	tests := []struct {
+		name    string
+		desired *api.NodeStateBlock
+		current *api.NodeStateBlock
+		want    bool
+	}{
+		{"nil to nil", nil, nil, false},
+		{"nil to populated", populated, nil, true},
+		{"populated to nil", nil, populated, true},
+		{"populated deep change", changed, populated, true},
+		{"populated no change", populated, populated, false},
 	}
 
-	diff := ComputeDiff(desired, current)
-
-	if !diff.DataChanged {
-		t.Fatal("expected DataChanged to be true when versions differ")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diff := ComputeDiff(&api.NodeStateSnapshot{State: tt.desired}, &api.NodeStateSnapshot{State: tt.current})
+			if diff.StateChanged != tt.want {
+				t.Errorf("StateChanged = %v, want %v", diff.StateChanged, tt.want)
+			}
+		})
 	}
 }
 
-func TestComputeDiff_SecretRefsChanged(t *testing.T) {
-	desired := &api.StateResponse{
-		SecretRefs: []api.SecretRef{
-			{Key: "db-password", Version: 5},
-		},
-	}
-	current := &api.StateResponse{
-		SecretRefs: []api.SecretRef{
-			{Key: "db-password", Version: 4},
-		},
+func TestComputeDiff_ReportsTransitions(t *testing.T) {
+	populated := &api.NodeStateBlock{Data: []api.StateEntry{{Key: "k", Value: "v1"}}}
+	changed := &api.NodeStateBlock{Data: []api.StateEntry{{Key: "k", Value: "v2"}}}
+
+	tests := []struct {
+		name    string
+		desired *api.NodeStateBlock
+		current *api.NodeStateBlock
+		want    bool
+	}{
+		{"nil to nil", nil, nil, false},
+		{"nil to populated", populated, nil, true},
+		{"populated to nil", nil, populated, true},
+		{"populated deep change", changed, populated, true},
+		{"populated no change", populated, populated, false},
 	}
 
-	diff := ComputeDiff(desired, current)
-
-	if !diff.SecretRefsChanged {
-		t.Fatal("expected SecretRefsChanged to be true when versions differ")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diff := ComputeDiff(&api.NodeStateSnapshot{Reports: tt.desired}, &api.NodeStateSnapshot{Reports: tt.current})
+			if diff.ReportsChanged != tt.want {
+				t.Errorf("ReportsChanged = %v, want %v", diff.ReportsChanged, tt.want)
+			}
+		})
 	}
 }
 
-func TestComputeDiff_NoDrift(t *testing.T) {
-	state := &api.StateResponse{
-		Peers: []api.Peer{
-			{ID: "p1", PublicKey: "pk1", Endpoint: "1.2.3.4:51820", AllowedIPs: []string{"10.0.0.0/24"}},
-		},
-		Policies: []api.Policy{
-			{ID: "pol1", Rules: []api.PolicyRule{{Src: "10.0.0.1", Dst: "10.0.0.2", Action: "allow"}}},
-		},
-		SigningKeys: &api.SigningKeys{Current: "key1"},
-		Metadata:    map[string]string{"env": "prod"},
-		Data: []api.DataEntry{
-			{Key: "config", Version: 1},
-		},
-		SecretRefs: []api.SecretRef{
-			{Key: "secret", Version: 1},
-		},
-	}
-
-	diff := ComputeDiff(state, state)
-
+func TestComputeDiff_NilDesired(t *testing.T) {
+	diff := ComputeDiff(nil, &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{Fingerprint: "fp"}})
 	if !diff.IsEmpty() {
-		t.Fatal("expected empty diff for identical states")
+		t.Error("nil desired should yield an empty diff")
 	}
 }
 
-func TestComputeDiff_EmptySnapshot(t *testing.T) {
-	desired := &api.StateResponse{
-		Peers: []api.Peer{
-			{ID: "p1", PublicKey: "pk1"},
-			{ID: "p2", PublicKey: "pk2"},
-		},
-		Policies: []api.Policy{
-			{ID: "pol1"},
-		},
-		SigningKeys: &api.SigningKeys{Current: "key1"},
-		Metadata:    map[string]string{"env": "prod"},
-		Data: []api.DataEntry{
-			{Key: "config", Version: 1},
-		},
-		SecretRefs: []api.SecretRef{
-			{Key: "secret", Version: 1},
-		},
+func TestComputeDiff_NilCurrent(t *testing.T) {
+	desired := &api.NodeStateSnapshot{
+		Peers:   []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1"}},
+		Policy:  &api.PolicySnapshot{Fingerprint: "fp"},
+		Bridge:  &api.BridgeSnapshot{},
+		State:   &api.NodeStateBlock{},
+		Reports: &api.NodeStateBlock{},
 	}
 
 	diff := ComputeDiff(desired, nil)
 
-	if len(diff.PeersToAdd) != 2 {
-		t.Errorf("expected 2 peers to add, got %d", len(diff.PeersToAdd))
+	if len(diff.PeersToAdd) != 1 {
+		t.Errorf("expected 1 peer to add against nil current, got %d", len(diff.PeersToAdd))
 	}
-	if len(diff.PeersToRemove) != 0 {
-		t.Errorf("expected 0 peers to remove, got %d", len(diff.PeersToRemove))
-	}
-	if len(diff.PoliciesToAdd) != 1 {
-		t.Errorf("expected 1 policy to add, got %d", len(diff.PoliciesToAdd))
-	}
-	if !diff.SigningKeysChanged {
-		t.Error("expected signing keys changed")
-	}
-	if !diff.MetadataChanged {
-		t.Error("expected metadata changed")
-	}
-	if !diff.DataChanged {
-		t.Error("expected data changed")
-	}
-	if !diff.SecretRefsChanged {
-		t.Error("expected secret refs changed")
+	if !diff.PolicyChanged || !diff.BridgeChanged || !diff.StateChanged || !diff.ReportsChanged {
+		t.Errorf("all populated blocks should be changed against nil current: %+v", diff)
 	}
 }
 
@@ -321,13 +301,25 @@ func TestStateDiff_IsEmpty(t *testing.T) {
 	if !diff.IsEmpty() {
 		t.Fatal("zero-value StateDiff should be empty")
 	}
+	if got := diff.Summary(); got != "none" {
+		t.Errorf("empty Summary = %q, want %q", got, "none")
+	}
 }
 
-func TestStateDiff_IsEmptyWithPeersToAdd(t *testing.T) {
+func TestStateDiff_Summary(t *testing.T) {
 	diff := StateDiff{
-		PeersToAdd: []api.Peer{{ID: "p1"}},
+		PeersToAdd:     []api.SnapshotPeer{{NodeID: "p1"}},
+		PeersToUpdate:  []api.SnapshotPeer{{NodeID: "p2"}, {NodeID: "p3"}},
+		PolicyChanged:  true,
+		BridgeChanged:  true,
+		StateChanged:   true,
+		ReportsChanged: true,
 	}
 	if diff.IsEmpty() {
-		t.Fatal("StateDiff with PeersToAdd should not be empty")
+		t.Fatal("populated StateDiff should not be empty")
+	}
+	want := "peers+1-0~2 policy bridge state reports"
+	if got := diff.Summary(); got != want {
+		t.Errorf("Summary = %q, want %q", got, want)
 	}
 }

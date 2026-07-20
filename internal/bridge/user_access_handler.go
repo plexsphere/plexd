@@ -63,18 +63,25 @@ func HandleUserAccessConfigUpdated(trigger ReconcileTrigger) api.EventHandler {
 }
 
 // UserAccessReconcileHandler returns a reconcile.ReconcileHandler that updates
-// user access peers when the desired UserAccessConfig changes. It diffs the
-// desired peers against the currently active peers, adding missing and removing
-// stale peers.
+// user access peers when the desired bridge user-access subtree changes. It
+// diffs the desired peers against the currently active peers, adding missing
+// and removing stale peers. The handler is presence-aware: a nil Bridge or nil
+// UserAccess child means "not populated", so it reconciles against an empty
+// desired set and tears down stale peers.
 func UserAccessReconcileHandler(mgr *UserAccessManager, logger *slog.Logger) reconcile.ReconcileHandler {
-	return func(_ context.Context, desired *api.StateResponse, _ reconcile.StateDiff) error {
-		if desired == nil || desired.UserAccessConfig == nil {
+	return func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
+		if desired == nil {
 			return nil
 		}
 
+		var peers []api.UserAccessPeer
+		if desired.Bridge != nil && desired.Bridge.UserAccess != nil {
+			peers = desired.Bridge.UserAccess.Peers
+		}
+
 		// Build desired and current sets for diffing.
-		desiredSet := make(map[string]api.UserAccessPeer, len(desired.UserAccessConfig.Peers))
-		for _, p := range desired.UserAccessConfig.Peers {
+		desiredSet := make(map[string]api.UserAccessPeer, len(peers))
+		for _, p := range peers {
 			desiredSet[p.PublicKey] = p
 		}
 
@@ -93,7 +100,7 @@ func UserAccessReconcileHandler(mgr *UserAccessManager, logger *slog.Logger) rec
 
 		// Add missing peers (present in desired state but not locally).
 		var errs []error
-		for _, peer := range desired.UserAccessConfig.Peers {
+		for _, peer := range peers {
 			if _, ok := currentSet[peer.PublicKey]; ok {
 				continue
 			}

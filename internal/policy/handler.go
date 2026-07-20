@@ -6,7 +6,6 @@ import (
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/reconcile"
-	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
 // ReconcileTrigger is satisfied by *reconcile.Reconciler.
@@ -14,88 +13,73 @@ type ReconcileTrigger interface {
 	TriggerReconcile()
 }
 
-// ReconcileHandler returns a reconcile.ReconcileHandler that enforces network
-// policies. When policy or peer drift is detected it:
-//  1. Filters peers through the enforcer's policy engine.
-//  2. Applies firewall rules via the enforcer.
-//  3. Removes peers that are no longer allowed from WireGuard.
-//  4. Adds newly allowed peers to WireGuard.
-func ReconcileHandler(enforcer *Enforcer, wgMgr *wireguard.Manager, localNodeID, localMeshIP, iface string) reconcile.ReconcileHandler {
-	allowedPeers := make(map[string]struct{})
-
-	return func(ctx context.Context, desired *api.StateResponse, diff reconcile.StateDiff) error {
-		if !hasPolicyOrPeerChanges(diff) {
+// ReconcileHandler returns a reconcile.ReconcileHandler that applies the merged
+// policy's firewall ruleset when the policy fingerprint changes. It returns nil
+// unless diff.PolicyChanged.
+//
+// The fingerprint short-circuit lives in the differ (PolicyChanged stays false
+// on a fingerprint match), so this handler — and its "policy ruleset applied"
+// log — never fires for revision-only bumps. That log is emitted only once the
+// enforcer confirms the ruleset reached the kernel, so it cannot claim an
+// enforcement that a disabled config or a missing firewall backend skipped.
+//
+// A transient apply failure propagates so the reconciler holds the snapshot back
+// and retries next cycle. ErrInvalidRuleset does not: the rejected rules are a
+// permanent property of the revision, so propagating it would hold the snapshot
+// back and re-run every handler at the reconcile interval forever with no
+// chance of the same rules parsing. Such a revision is logged and swallowed so
+// the rest of the snapshot converges; the firewall keeps the last successfully
+// applied ruleset, which is fail-closed.
+func ReconcileHandler(enforcer *Enforcer, iface string) reconcile.ReconcileHandler {
+	return func(_ context.Context, desired *api.NodeStateSnapshot, diff reconcile.StateDiff) error {
+		if !diff.PolicyChanged {
 			return nil
 		}
 
-		// Filter peers through policy engine.
-		filtered := enforcer.FilterPeers(desired.Peers, desired.Policies, localNodeID)
-
-		// Build peersByID map for firewall rule IP resolution.
-		peersByID := make(map[string]string, len(desired.Peers)+1)
-		peersByID[localNodeID] = localMeshIP
-		for _, p := range desired.Peers {
-			peersByID[p.ID] = p.MeshIP
+		revisionID, fingerprint, ruleCount := "", "", 0
+		if desired.Policy != nil {
+			revisionID = desired.Policy.RevisionID
+			fingerprint = desired.Policy.Fingerprint
+			ruleCount = len(desired.Policy.Rules)
+			if fingerprint == "" {
+				// The differ treats a missing fingerprint as always-changed, so
+				// the chain is flushed and rebuilt every cycle. Name that
+				// explicitly — otherwise the churn is indistinguishable from
+				// real revisions.
+				enforcer.logger.Warn("policy snapshot carries no fingerprint, ruleset rebuilds every cycle",
+					"revision_id", revisionID,
+				)
+			}
 		}
 
-		var errs []error
-
-		// Apply firewall rules.
-		if err := enforcer.ApplyFirewallRules(desired.Policies, localNodeID, iface, peersByID); err != nil {
-			enforcer.logger.Error("reconcile: apply firewall rules failed",
-				"error", err,
+		applied, err := enforcer.ApplyFirewallRules(desired.Policy, iface)
+		if err != nil {
+			if errors.Is(err, ErrInvalidRuleset) {
+				enforcer.logger.Error("policy revision rejected, keeping previous ruleset",
+					"revision_id", revisionID,
+					"fingerprint", fingerprint,
+					"error", err,
+				)
+				return nil
+			}
+			enforcer.logger.Error("reconcile: apply firewall rules failed", "error", err)
+			return err
+		}
+		if !applied {
+			enforcer.logger.Debug("policy enforcement inactive, ruleset not applied",
+				"revision_id", revisionID,
+				"fingerprint", fingerprint,
 			)
-			errs = append(errs, err)
+			return nil
 		}
 
-		// Compute new allowed set.
-		newAllowed := make(map[string]struct{}, len(filtered))
-		filteredByID := make(map[string]api.Peer, len(filtered))
-		for _, p := range filtered {
-			newAllowed[p.ID] = struct{}{}
-			filteredByID[p.ID] = p
-		}
-
-		// Remove peers that were allowed but are no longer.
-		for peerID := range allowedPeers {
-			if _, ok := newAllowed[peerID]; !ok {
-				if err := wgMgr.RemovePeerByID(peerID); err != nil {
-					enforcer.logger.Error("reconcile: remove disallowed peer failed",
-						"peer_id", peerID,
-						"error", err,
-					)
-					errs = append(errs, err)
-				}
-			}
-		}
-
-		// Add newly allowed peers.
-		for peerID, peer := range filteredByID {
-			if _, ok := allowedPeers[peerID]; !ok {
-				if err := wgMgr.AddPeer(peer); err != nil {
-					enforcer.logger.Error("reconcile: add allowed peer failed",
-						"peer_id", peerID,
-						"error", err,
-					)
-					errs = append(errs, err)
-				}
-			}
-		}
-
-		// Update tracked set.
-		allowedPeers = newAllowed
-
-		return errors.Join(errs...)
+		enforcer.logger.Info("policy ruleset applied",
+			"revision_id", revisionID,
+			"fingerprint", fingerprint,
+			"rules", ruleCount,
+		)
+		return nil
 	}
-}
-
-// hasPolicyOrPeerChanges returns true if the diff contains any policy or peer changes.
-func hasPolicyOrPeerChanges(diff reconcile.StateDiff) bool {
-	return len(diff.PoliciesToAdd) > 0 ||
-		len(diff.PoliciesToRemove) > 0 ||
-		len(diff.PeersToAdd) > 0 ||
-		len(diff.PeersToRemove) > 0 ||
-		len(diff.PeersToUpdate) > 0
 }
 
 // HandlePolicyUpdated returns an api.EventHandler that triggers reconciliation

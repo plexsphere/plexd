@@ -40,9 +40,9 @@ type PeerProvider interface {
 	PeerStatuses() []PeerStatus
 }
 
-// PolicyProvider supplies active network policies.
+// PolicyProvider supplies the active merged network policy.
 type PolicyProvider interface {
-	ActivePolicies() []api.Policy
+	ActivePolicy() *api.PolicySnapshot
 }
 
 // ForwarderStatus describes the operational status of a log or audit forwarder.
@@ -530,14 +530,15 @@ func (h *Handler) handleGetPeers(w http.ResponseWriter, _ *http.Request) {
 
 func (h *Handler) handleGetPolicies(w http.ResponseWriter, _ *http.Request) {
 	if h.policyProvider == nil {
-		writeJSON(w, http.StatusOK, []api.Policy{})
+		writeJSON(w, http.StatusOK, struct{}{})
 		return
 	}
-	policies := h.policyProvider.ActivePolicies()
-	if policies == nil {
-		policies = []api.Policy{}
+	policy := h.policyProvider.ActivePolicy()
+	if policy == nil {
+		writeJSON(w, http.StatusOK, struct{}{})
+		return
 	}
-	writeJSON(w, http.StatusOK, policies)
+	writeJSON(w, http.StatusOK, policy)
 }
 
 func (h *Handler) handleGetLogStatus(w http.ResponseWriter, _ *http.Request) {

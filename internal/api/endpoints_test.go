@@ -178,7 +178,7 @@ func TestHeartbeat_ParsesReconcileFlag(t *testing.T) {
 	}
 }
 
-func TestFetchState_ReturnsFullState(t *testing.T) {
+func TestFetchState_ReturnsSnapshot(t *testing.T) {
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Errorf("method = %s, want GET", r.Method)
@@ -189,18 +189,14 @@ func TestFetchState_ReturnsFullState(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(StateResponse{
-			Peers: []Peer{
-				{ID: "p1", MeshIP: "10.0.0.2"},
-				{ID: "p2", MeshIP: "10.0.0.3"},
-			},
-			Policies: []Policy{
-				{ID: "pol1", Rules: []PolicyRule{{Src: "10.0.0.1", Dst: "10.0.0.2", Port: 443, Protocol: "tcp", Action: "allow"}}},
-			},
-			SecretRefs: []SecretRef{
-				{Key: "tls-cert", Version: 1},
-			},
-		})
+		// A full envelope: populated peers and policy, null bridge/state/reports.
+		_, _ = w.Write([]byte(`{` +
+			`"peers":[{"node_id":"p1","mesh_ip":"10.0.0.2","public_key":"pk1"},` +
+			`{"node_id":"p2","mesh_ip":"10.0.0.3","public_key":"pk2","fallback_endpoint":"203.0.113.1:51820"}],` +
+			`"reachability":{"state":"healthy","changed_at":"2026-01-01T00:00:00Z"},` +
+			`"policy":{"revision_id":"rev-1","fingerprint":"fp","rules":[` +
+			`{"action":"allow","protocol":"tcp","source_cidr":"10.0.0.1/32","destination_cidr":"10.0.0.2/32","ports":{"from":443,"to":443}}]},` +
+			`"bridge":null,"state":null,"reports":null}`))
 	})
 
 	resp, err := client.FetchState(context.Background(), "n1")
@@ -213,14 +209,21 @@ func TestFetchState_ReturnsFullState(t *testing.T) {
 	if resp.Peers[0].MeshIP != "10.0.0.2" {
 		t.Errorf("Peers[0].MeshIP = %q, want %q", resp.Peers[0].MeshIP, "10.0.0.2")
 	}
-	if len(resp.Policies) != 1 {
-		t.Fatalf("len(Policies) = %d, want 1", len(resp.Policies))
+	if resp.Peers[1].FallbackEndpoint != "203.0.113.1:51820" {
+		t.Errorf("Peers[1].FallbackEndpoint = %q, want %q", resp.Peers[1].FallbackEndpoint, "203.0.113.1:51820")
 	}
-	if resp.Policies[0].Rules[0].Port != 443 {
-		t.Errorf("Policies[0].Rules[0].Port = %d, want 443", resp.Policies[0].Rules[0].Port)
+	if resp.Policy == nil {
+		t.Fatal("Policy = nil, want populated")
 	}
-	if len(resp.SecretRefs) != 1 {
-		t.Fatalf("len(SecretRefs) = %d, want 1", len(resp.SecretRefs))
+	if len(resp.Policy.Rules) != 1 {
+		t.Fatalf("len(Policy.Rules) = %d, want 1", len(resp.Policy.Rules))
+	}
+	if resp.Policy.Rules[0].Ports == nil || resp.Policy.Rules[0].Ports.From != 443 {
+		t.Errorf("Policy.Rules[0].Ports = %+v, want from 443", resp.Policy.Rules[0].Ports)
+	}
+	// Null blocks decode to nil pointers.
+	if resp.Bridge != nil || resp.State != nil || resp.Reports != nil {
+		t.Errorf("null blocks should decode to nil, got bridge=%v state=%v reports=%v", resp.Bridge, resp.State, resp.Reports)
 	}
 }
 
@@ -389,37 +392,6 @@ func TestReportEndpoint_Success(t *testing.T) {
 	}
 	if !resp.StaleAfter.Equal(staleAfter) {
 		t.Errorf("StaleAfter = %v, want %v", resp.StaleAfter, staleAfter)
-	}
-}
-
-func TestReportDrift_Success(t *testing.T) {
-	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s, want POST", r.Method)
-		}
-		if r.URL.Path != "/v1/nodes/n1/drift" {
-			t.Errorf("path = %s, want /v1/nodes/n1/drift", r.URL.Path)
-		}
-
-		var req DriftReport
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-		if len(req.Corrections) != 1 {
-			t.Errorf("len(Corrections) = %d, want 1", len(req.Corrections))
-		}
-
-		w.WriteHeader(http.StatusOK)
-	})
-
-	err := client.ReportDrift(context.Background(), "n1", DriftReport{
-		Timestamp: time.Now(),
-		Corrections: []DriftCorrection{
-			{Type: "peer-added", Detail: "added peer p2"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("ReportDrift: %v", err)
 	}
 }
 

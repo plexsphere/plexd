@@ -98,22 +98,15 @@ func (c *ControlPlane) ReportEndpoint(ctx context.Context, nodeID string, req En
 	return &resp, nil
 }
 
-// FetchState retrieves the full desired state for a node.
+// FetchState retrieves the desired-state snapshot for a node.
 // GET /v1/nodes/{node_id}/state
-func (c *ControlPlane) FetchState(ctx context.Context, nodeID string) (*StateResponse, error) {
-	var resp StateResponse
+func (c *ControlPlane) FetchState(ctx context.Context, nodeID string) (*NodeStateSnapshot, error) {
+	var resp NodeStateSnapshot
 	path := fmt.Sprintf("/v1/nodes/%s/state", url.PathEscape(nodeID))
 	if err := c.doRequest(ctx, http.MethodGet, path, nil, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
-}
-
-// ReportDrift reports drift corrections performed by the node.
-// POST /v1/nodes/{node_id}/drift
-func (c *ControlPlane) ReportDrift(ctx context.Context, nodeID string, req DriftReport) error {
-	path := fmt.Sprintf("/v1/nodes/%s/drift", url.PathEscape(nodeID))
-	return c.doRequest(ctx, http.MethodPost, path, req, nil)
 }
 
 // FetchSecret retrieves a specific secret for the node.

@@ -12,6 +12,7 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -45,7 +46,6 @@ type AssertionCounters struct {
 	KeyRotateCount          int64 `json:"key_rotate_count"`
 	CapabilitiesCount       int64 `json:"capabilities_count"`
 	EndpointCount           int64 `json:"endpoint_count"`
-	DriftCount              int64 `json:"drift_count"`
 	SecretsCount            int64 `json:"secrets_count"`
 	ReportCount             int64 `json:"report_count"`
 	ExecutionAckCount       int64 `json:"execution_ack_count"`
@@ -80,7 +80,6 @@ type Server struct {
 	keyRotateCount          atomic.Int64
 	capabilitiesCount       atomic.Int64
 	endpointCount           atomic.Int64
-	driftCount              atomic.Int64
 	secretsCount            atomic.Int64
 	reportCount             atomic.Int64
 	executionAckCount       atomic.Int64
@@ -99,7 +98,7 @@ type Server struct {
 
 	sseClients sync.Map // map[uint64]chan api.SignedEnvelope
 
-	stateFixture   api.StateResponse
+	stateFixture   api.NodeStateSnapshot
 	stateFixtureMu sync.RWMutex
 
 	heartbeatFixture   api.HeartbeatResponse
@@ -151,112 +150,7 @@ func New() *Server {
 			Reconcile:  true,
 			RotateKeys: false,
 		},
-		stateFixture: api.StateResponse{
-			Peers: fixturePeers,
-			Policies: []api.Policy{
-				{
-					ID: "policy-001",
-					Rules: []api.PolicyRule{
-						{
-							Src:      "10.99.0.0/24",
-							Dst:      "10.99.0.0/24",
-							Port:     0,
-							Protocol: "any",
-							Action:   "allow",
-						},
-						{
-							Src:      "10.99.0.0/24",
-							Dst:      "0.0.0.0/0",
-							Port:     443,
-							Protocol: "tcp",
-							Action:   "allow",
-						},
-					},
-				},
-			},
-			SigningKeys: &api.SigningKeys{
-				Current:  pubB64,
-				Previous: pubB64,
-			},
-			Metadata: map[string]string{
-				"environment": "e2e-test",
-				"region":      "mock-region-1",
-			},
-			BridgeConfig: &api.BridgeConfig{
-				AccessSubnets:    []string{"192.168.100.0/24"},
-				EnableNAT:        true,
-				EnableForwarding: true,
-			},
-			RelayConfig: &api.RelayConfig{
-				Sessions: []api.RelaySessionAssignment{
-					{
-						SessionID:     "relay-sess-001",
-						PeerAID:       "peer-001",
-						PeerAEndpoint: "203.0.113.1:51820",
-						PeerBID:       "peer-003",
-						PeerBEndpoint: "203.0.113.3:51820",
-						ExpiresAt:     time.Date(2099, 12, 31, 23, 59, 59, 0, time.UTC),
-					},
-				},
-			},
-			UserAccessConfig: &api.UserAccessConfig{
-				Enabled:       true,
-				InterfaceName: "wg-access0",
-				ListenPort:    51821,
-				Peers: []api.UserAccessPeer{
-					{
-						PublicKey:  "ua-pub-key-001",
-						AllowedIPs: []string{"10.100.0.1/32"},
-						Label:      "admin-laptop",
-					},
-				},
-			},
-			IngressConfig: &api.IngressConfig{
-				Enabled: true,
-				Rules: []api.IngressRule{
-					{
-						RuleID:     "ingress-001",
-						ListenPort: 443,
-						TargetAddr: "10.99.0.2:8443",
-						Mode:       "tcp",
-					},
-				},
-			},
-			SiteToSiteConfig: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{
-					{
-						TunnelID:        "s2s-001",
-						RemoteEndpoint:  "198.51.100.1:51820",
-						RemotePublicKey: "s2s-remote-pub-key-001",
-						LocalSubnets:    []string{"10.99.0.0/24"},
-						RemoteSubnets:   []string{"172.16.0.0/16"},
-						InterfaceName:   "wg-s2s0",
-						ListenPort:      51822,
-					},
-				},
-			},
-			Data: []api.DataEntry{
-				{
-					Key:         "app/config",
-					ContentType: "application/json",
-					Payload:     json.RawMessage(`{"log_level":"info","max_conns":100}`),
-					Version:     1,
-					UpdatedAt:   time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-				},
-				{
-					Key:         "certs/ca",
-					ContentType: "application/x-pem-file",
-					Payload:     json.RawMessage(`"-----BEGIN CERTIFICATE-----\nmock-ca-cert\n-----END CERTIFICATE-----"`),
-					Version:     2,
-					UpdatedAt:   time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC),
-				},
-			},
-			SecretRefs: []api.SecretRef{
-				{Key: "db-password", Version: 1},
-				{Key: "tls-private-key", Version: 3},
-			},
-		},
+		stateFixture: newStateFixture(),
 	}
 	s.registerRoutes()
 	return s
@@ -278,7 +172,6 @@ func (s *Server) Assertions() AssertionCounters {
 		KeyRotateCount:          s.keyRotateCount.Load(),
 		CapabilitiesCount:       s.capabilitiesCount.Load(),
 		EndpointCount:           s.endpointCount.Load(),
-		DriftCount:              s.driftCount.Load(),
 		SecretsCount:            s.secretsCount.Load(),
 		ReportCount:             s.reportCount.Load(),
 		ExecutionAckCount:       s.executionAckCount.Load(),
@@ -297,24 +190,117 @@ func (s *Server) Assertions() AssertionCounters {
 	}
 }
 
-// fixturePeers is the state-fixture peer set used by the state handler.
-var fixturePeers = []api.Peer{
-	{
-		ID:         "peer-001",
-		PublicKey:  "wg-pub-key-peer-001",
-		MeshIP:     "10.99.0.2",
-		Endpoint:   "203.0.113.1:51820",
-		AllowedIPs: []string{"10.99.0.2/32"},
-		PSK:        "mock-psk-001",
-	},
-	{
-		ID:         "peer-002",
-		PublicKey:  "wg-pub-key-peer-002",
-		MeshIP:     "10.99.0.3",
-		Endpoint:   "203.0.113.2:51820",
-		AllowedIPs: []string{"10.99.0.3/32"},
-		PSK:        "mock-psk-002",
-	},
+// newStateFixture builds the desired-state NodeStateSnapshot envelope served by
+// GET /v1/nodes/{id}/state. The two peers mirror fixtureRegisterPeers (node_id
+// ascending, self excluded) and carry no psk/allowed_ips/endpoint; the merged
+// policy fingerprint is derived with policyFingerprint; the bridge subtree
+// carries the four child configs; and both state and reports mirror one another
+// (the contract splits them for forward compatibility).
+func newStateFixture() api.NodeStateSnapshot {
+	rules := []api.PolicyRule{
+		{Action: "allow", Protocol: "any", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "10.99.0.0/24"},
+		{Action: "allow", Protocol: "tcp", SourceCIDR: "10.99.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
+	}
+	block := func() *api.NodeStateBlock {
+		return &api.NodeStateBlock{
+			Metadata: []api.StateEntry{
+				{Key: "environment", Value: "e2e-test"},
+				{Key: "region", Value: "mock-region-1"},
+			},
+			Data: []api.StateEntry{
+				{Key: "app/config", Value: `{"log_level":"info","max_conns":100}`},
+				{Key: "certs/ca", Value: "-----BEGIN CERTIFICATE-----\nmock-ca-cert\n-----END CERTIFICATE-----"},
+			},
+			Reports: []api.StateEntry{},
+		}
+	}
+	return api.NodeStateSnapshot{
+		Peers: []api.SnapshotPeer{
+			{
+				NodeID:           "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+				MeshIP:           "10.99.0.2",
+				PublicKey:        "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+				FallbackEndpoint: "203.0.113.1:51820",
+			},
+			{
+				NodeID:    "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+				MeshIP:    "10.99.0.3",
+				PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+			},
+		},
+		Reachability: json.RawMessage(`{"state":"healthy","changed_at":"2026-01-01T00:00:00Z"}`),
+		Policy: &api.PolicySnapshot{
+			RevisionID:  "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
+			Fingerprint: policyFingerprint(rules),
+			Rules:       rules,
+		},
+		Bridge: &api.BridgeSnapshot{
+			Relay: &api.RelayConfig{
+				Sessions: []api.RelaySessionAssignment{
+					{
+						SessionID:     "relay-sess-001",
+						PeerAID:       "peer-001",
+						PeerAEndpoint: "203.0.113.1:51820",
+						PeerBID:       "peer-003",
+						PeerBEndpoint: "203.0.113.3:51820",
+						ExpiresAt:     time.Date(2099, 12, 31, 23, 59, 59, 0, time.UTC),
+					},
+				},
+			},
+			UserAccess: &api.UserAccessConfig{
+				Enabled:       true,
+				InterfaceName: "wg-access0",
+				ListenPort:    51821,
+				Peers: []api.UserAccessPeer{
+					{
+						PublicKey:  "ua-pub-key-001",
+						AllowedIPs: []string{"10.100.0.1/32"},
+						Label:      "admin-laptop",
+					},
+				},
+			},
+			Ingress: &api.IngressConfig{
+				Enabled: true,
+				Rules: []api.IngressRule{
+					{
+						RuleID:     "ingress-001",
+						ListenPort: 443,
+						TargetAddr: "10.99.0.2:8443",
+						Mode:       "tcp",
+					},
+				},
+			},
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{
+					{
+						TunnelID:        "s2s-001",
+						RemoteEndpoint:  "198.51.100.1:51820",
+						RemotePublicKey: "s2s-remote-pub-key-001",
+						LocalSubnets:    []string{"10.99.0.0/24"},
+						RemoteSubnets:   []string{"172.16.0.0/16"},
+						InterfaceName:   "wg-s2s0",
+						ListenPort:      51822,
+					},
+				},
+			},
+		},
+		State:   block(),
+		Reports: block(),
+	}
+}
+
+// policyFingerprint returns the 44-char base64 SHA-256 over the compact-JSON
+// encoding of the rules slice. This canonicalization is MOCK-INTERNAL: plexd
+// treats the fingerprint as an opaque comparison key and never re-derives it
+// from the rules.
+func policyFingerprint(rules []api.PolicyRule) string {
+	data, err := json.Marshal(rules)
+	if err != nil {
+		panic("mockapi: marshal policy rules: " + err.Error())
+	}
+	sum := sha256.Sum256(data)
+	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
 // Register contract fixtures and validators (issue #18).
@@ -372,7 +358,6 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/keys/rotate", s.handleKeyRotate)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/capabilities", s.handleCapabilities)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/endpoint", s.handleEndpoint)
-	s.mux.HandleFunc("POST /v1/nodes/{id}/drift", s.handleDrift)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/secrets/{key}", s.handleSecrets)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/report", s.handleReport)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/executions/{eid}/ack", s.handleExecutionAck)
@@ -401,7 +386,6 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/keys/rotate", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/capabilities", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/endpoint", methodNotAllowed)
-	s.mux.HandleFunc("/v1/nodes/{id}/drift", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/secrets/{key}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/report", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/executions/{eid}/ack", methodNotAllowed)
@@ -791,6 +775,28 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// fixturePeers is the api.Peer set returned by handleKeyRotate. The key-rotation
+// response contract is deferred to issue #21, so it deliberately keeps the
+// mock-era api.Peer shape (with psk/allowed_ips/endpoint).
+var fixturePeers = []api.Peer{
+	{
+		ID:         "peer-001",
+		PublicKey:  "wg-pub-key-peer-001",
+		MeshIP:     "10.99.0.2",
+		Endpoint:   "203.0.113.1:51820",
+		AllowedIPs: []string{"10.99.0.2/32"},
+		PSK:        "mock-psk-001",
+	},
+	{
+		ID:         "peer-002",
+		PublicKey:  "wg-pub-key-peer-002",
+		MeshIP:     "10.99.0.3",
+		Endpoint:   "203.0.113.2:51820",
+		AllowedIPs: []string{"10.99.0.3/32"},
+		PSK:        "mock-psk-002",
+	},
+}
+
 // handleKeyRotate handles POST /v1/keys/rotate.
 func (s *Server) handleKeyRotate(w http.ResponseWriter, r *http.Request) {
 	var req api.KeyRotateRequest
@@ -859,16 +865,6 @@ func (s *Server) handleEndpoint(w http.ResponseWriter, r *http.Request) {
 		AcceptedAt: now,
 		StaleAfter: now.Add(s.getEndpointTTL()),
 	})
-}
-
-// handleDrift handles POST /v1/nodes/{id}/drift.
-func (s *Server) handleDrift(w http.ResponseWriter, r *http.Request) {
-	var req api.DriftReport
-	if !s.decodeBody(w, r, "drift", &req) {
-		return
-	}
-	s.driftCount.Add(1)
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleSecrets handles GET /v1/nodes/{id}/secrets/{key}.
@@ -986,32 +982,49 @@ func (s *Server) handleIntegrityViolation(w http.ResponseWriter, r *http.Request
 }
 
 // SetState updates the mutable state fixture returned by GET /v1/nodes/{id}/state.
-func (s *Server) SetState(state api.StateResponse) {
+func (s *Server) SetState(state api.NodeStateSnapshot) {
 	s.stateFixtureMu.Lock()
 	s.stateFixture = state
 	s.stateFixtureMu.Unlock()
 }
 
-// GetState returns a copy of the current state fixture.
-func (s *Server) GetState() api.StateResponse {
+// GetState returns the current state fixture with the peers slice normalized to
+// non-nil so it always serializes as [] rather than null. The six envelope
+// blocks carry no omitempty, so all keys are emitted (null for unpopulated
+// blocks).
+//
+// The result is a SHALLOW copy: the policy, bridge, state, and reports pointers
+// and the peers backing array alias the live fixture. Reading is safe — SetState
+// replaces the whole struct under the mutex, so no caller observes a half-written
+// fixture — but callers must NOT mutate through the returned pointers or slice,
+// which would race the state handler serving a concurrent request. Change the
+// fixture with SetState instead.
+func (s *Server) GetState() api.NodeStateSnapshot {
 	s.stateFixtureMu.RLock()
 	state := s.stateFixture
 	s.stateFixtureMu.RUnlock()
-	// Deep-copy the Metadata map so callers cannot mutate server state.
-	if state.Metadata != nil {
-		cp := make(map[string]string, len(state.Metadata))
-		for k, v := range state.Metadata {
-			cp[k] = v
-		}
-		state.Metadata = cp
+	if state.Peers == nil {
+		state.Peers = []api.SnapshotPeer{}
 	}
 	return state
 }
 
 // handleSetState handles PUT /test/state and POST /test/configure-state.
+// Decoding is strict: a misspelled or renamed key anywhere in the envelope is a
+// 400, not a 204 that silently stores a zero-valued block. Without this, a typo
+// in a caller's "policy" key would leave Policy nil while the caller believes it
+// configured a fingerprint.
 func (s *Server) handleSetState(w http.ResponseWriter, r *http.Request) {
-	var state api.StateResponse
-	if !s.decodeBody(w, r, "configure_state", &state) {
+	data, err := s.captureBody("configure_state", r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	var state api.NodeStateSnapshot
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&state); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
 	s.SetState(state)

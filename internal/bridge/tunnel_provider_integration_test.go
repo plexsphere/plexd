@@ -409,13 +409,13 @@ func TestTunnelProviderIntegration_ReconcileWithProviders(t *testing.T) {
 		ProviderType:   "ipsec",
 	}
 
-	state1 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{wgTunnel, ipsecTunnel},
+	state1 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{wgTunnel, ipsecTunnel},
+			},
 		},
-		Metadata: map[string]string{"version": "1"},
 	}
 	fetcher := &integrationStateFetcher{state: state1}
 
@@ -449,13 +449,13 @@ func TestTunnelProviderIntegration_ReconcileWithProviders(t *testing.T) {
 		PSK:            "shared-secret-2",
 		ProviderType:   "ipsec",
 	}
-	state2 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{ipsecTunnel, ipsecTunnel2},
+	state2 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{ipsecTunnel, ipsecTunnel2},
+			},
 		},
-		Metadata: map[string]string{"version": "2"},
 	}
 	fetcher.setState(state2)
 	rec.TriggerReconcile()
@@ -532,25 +532,27 @@ func TestTunnelProviderIntegration_ConcurrentAccessWithProviders(t *testing.T) {
 		ProviderType:   "ipsec",
 	}
 
-	states := []*api.StateResponse{
+	states := []*api.NodeStateSnapshot{
 		{
-			Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-			SiteToSiteConfig: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{
-					testTunnel("tun-conc-wg-1"),
-					ipsecTunnelA,
+			Bridge: &api.BridgeSnapshot{
+				SiteToSite: &api.SiteToSiteConfig{
+					Enabled: true,
+					Tunnels: []api.SiteToSiteTunnel{
+						testTunnel("tun-conc-wg-1"),
+						ipsecTunnelA,
+					},
 				},
 			},
 		},
 		{
-			Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-			SiteToSiteConfig: &api.SiteToSiteConfig{
-				Enabled: true,
-				Tunnels: []api.SiteToSiteTunnel{
-					testTunnel("tun-conc-wg-1"),
-					testTunnel("tun-conc-wg-2"),
-					ipsecTunnelB,
+			Bridge: &api.BridgeSnapshot{
+				SiteToSite: &api.SiteToSiteConfig{
+					Enabled: true,
+					Tunnels: []api.SiteToSiteTunnel{
+						testTunnel("tun-conc-wg-1"),
+						testTunnel("tun-conc-wg-2"),
+						ipsecTunnelB,
+					},
 				},
 			},
 		},
@@ -717,13 +719,13 @@ func TestTunnelProviderIntegration_ReconcileChangedProviderTunnel(t *testing.T) 
 		ProviderType:   "ipsec",
 	}
 
-	state1 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{ipsecTunnel},
+	state1 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{ipsecTunnel},
+			},
 		},
-		Metadata: map[string]string{"version": "1"},
 	}
 	fetcher := &integrationStateFetcher{state: state1}
 
@@ -753,13 +755,13 @@ func TestTunnelProviderIntegration_ReconcileChangedProviderTunnel(t *testing.T) 
 	// Update state: same TunnelID but different RemoteEndpoint.
 	changedTunnel := ipsecTunnel
 	changedTunnel.RemoteEndpoint = "203.0.113.99:500"
-	state2 := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk1", MeshIP: "10.42.0.2"}},
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{changedTunnel},
+	state2 := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{changedTunnel},
+			},
 		},
-		Metadata: map[string]string{"version": "2"},
 	}
 	fetcher.setState(state2)
 	rec.TriggerReconcile()

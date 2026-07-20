@@ -12,151 +12,32 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func TestFilterPeers_NoPoliciesDeniesAll(t *testing.T) {
+func TestBuildFirewallRules_FiveTupleMapping(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
-	peers := []api.Peer{
-		{ID: "peer-a", MeshIP: "10.0.0.2"},
-		{ID: "peer-b", MeshIP: "10.0.0.3"},
+	rules := []api.PolicyRule{
+		{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
 	}
 
-	got := eng.FilterPeers(peers, nil, "node-a")
-	if len(got) != 0 {
-		t.Fatalf("FilterPeers() returned %d peers, want 0 (deny-by-default)", len(got))
+	got, err := eng.BuildFirewallRules(rules, "wg0")
+	if err != nil {
+		t.Fatalf("BuildFirewallRules() error = %v", err)
 	}
-}
-
-func TestFilterPeers_EmptyPoliciesDeniesAll(t *testing.T) {
-	eng := NewPolicyEngine(testLogger())
-	peers := []api.Peer{
-		{ID: "peer-a", MeshIP: "10.0.0.2"},
-		{ID: "peer-b", MeshIP: "10.0.0.3"},
-	}
-
-	got := eng.FilterPeers(peers, []api.Policy{}, "node-a")
-	if len(got) != 0 {
-		t.Fatalf("FilterPeers() returned %d peers, want 0 (deny-by-default)", len(got))
-	}
-}
-
-func TestFilterPeers_AllowSpecificPeer(t *testing.T) {
-	eng := NewPolicyEngine(testLogger())
-	peers := []api.Peer{
-		{ID: "peer-b", MeshIP: "10.0.0.2"},
-		{ID: "peer-c", MeshIP: "10.0.0.3"},
-	}
-	policies := []api.Policy{
-		{
-			ID: "pol-1",
-			Rules: []api.PolicyRule{
-				{Src: "node-a", Dst: "peer-b", Port: 0, Protocol: "", Action: "allow"},
-			},
-		},
-	}
-
-	got := eng.FilterPeers(peers, policies, "node-a")
-	if len(got) != 1 {
-		t.Fatalf("FilterPeers() returned %d peers, want 1", len(got))
-	}
-	if got[0].ID != "peer-b" {
-		t.Errorf("FilterPeers()[0].ID = %q, want %q", got[0].ID, "peer-b")
-	}
-}
-
-func TestFilterPeers_WildcardAllowsAll(t *testing.T) {
-	eng := NewPolicyEngine(testLogger())
-	peers := []api.Peer{
-		{ID: "peer-a", MeshIP: "10.0.0.2"},
-		{ID: "peer-b", MeshIP: "10.0.0.3"},
-		{ID: "peer-c", MeshIP: "10.0.0.4"},
-	}
-	policies := []api.Policy{
-		{
-			ID: "pol-open",
-			Rules: []api.PolicyRule{
-				{Src: "*", Dst: "*", Port: 0, Protocol: "", Action: "allow"},
-			},
-		},
-	}
-
-	got := eng.FilterPeers(peers, policies, "node-a")
-	if len(got) != len(peers) {
-		t.Fatalf("FilterPeers() returned %d peers, want %d", len(got), len(peers))
-	}
-}
-
-func TestFilterPeers_DenyDoesNotGrantVisibility(t *testing.T) {
-	eng := NewPolicyEngine(testLogger())
-	peers := []api.Peer{
-		{ID: "peer-b", MeshIP: "10.0.0.2"},
-	}
-	policies := []api.Policy{
-		{
-			ID: "pol-deny",
-			Rules: []api.PolicyRule{
-				{Src: "node-a", Dst: "peer-b", Port: 0, Protocol: "", Action: "deny"},
-			},
-		},
-	}
-
-	got := eng.FilterPeers(peers, policies, "node-a")
-	if len(got) != 0 {
-		t.Fatalf("FilterPeers() returned %d peers, want 0", len(got))
-	}
-}
-
-func TestFilterPeers_BidirectionalAllow(t *testing.T) {
-	eng := NewPolicyEngine(testLogger())
-	peers := []api.Peer{
-		{ID: "peer-b", MeshIP: "10.0.0.2"},
-	}
-	// Rule is Src=peer-b, Dst=node-a — reverse direction but should still allow visibility.
-	policies := []api.Policy{
-		{
-			ID: "pol-reverse",
-			Rules: []api.PolicyRule{
-				{Src: "peer-b", Dst: "node-a", Port: 443, Protocol: "tcp", Action: "allow"},
-			},
-		},
-	}
-
-	got := eng.FilterPeers(peers, policies, "node-a")
-	if len(got) != 1 {
-		t.Fatalf("FilterPeers() returned %d peers, want 1", len(got))
-	}
-	if got[0].ID != "peer-b" {
-		t.Errorf("FilterPeers()[0].ID = %q, want %q", got[0].ID, "peer-b")
-	}
-}
-
-func TestBuildFirewallRules_BasicRule(t *testing.T) {
-	eng := NewPolicyEngine(testLogger())
-	policies := []api.Policy{
-		{
-			ID: "pol-1",
-			Rules: []api.PolicyRule{
-				{Src: "node-a", Dst: "peer-b", Port: 443, Protocol: "tcp", Action: "allow"},
-			},
-		},
-	}
-	peersByID := map[string]string{
-		"node-a": "10.0.0.1",
-		"peer-b": "10.0.0.2",
-	}
-
-	got := eng.BuildFirewallRules(policies, "node-a", "wg0", peersByID)
-	// 1 policy rule + 1 default-deny = 2
+	// 1 rule + default-deny.
 	if len(got) != 2 {
 		t.Fatalf("BuildFirewallRules() returned %d rules, want 2", len(got))
 	}
 	r := got[0]
-	if r.SrcIP != "10.0.0.1" {
-		t.Errorf("SrcIP = %q, want %q", r.SrcIP, "10.0.0.1")
+	if r.SrcIP != "10.0.0.0/24" {
+		t.Errorf("SrcIP = %q, want %q", r.SrcIP, "10.0.0.0/24")
 	}
-	if r.DstIP != "10.0.0.2" {
-		t.Errorf("DstIP = %q, want %q", r.DstIP, "10.0.0.2")
+	if r.DstIP != "0.0.0.0/0" {
+		t.Errorf("DstIP = %q, want %q", r.DstIP, "0.0.0.0/0")
 	}
 	if r.Port != 443 {
 		t.Errorf("Port = %d, want 443", r.Port)
+	}
+	if r.PortTo != 0 {
+		t.Errorf("PortTo = %d, want 0 (single-port range)", r.PortTo)
 	}
 	if r.Protocol != "tcp" {
 		t.Errorf("Protocol = %q, want %q", r.Protocol, "tcp")
@@ -169,146 +50,205 @@ func TestBuildFirewallRules_BasicRule(t *testing.T) {
 	}
 }
 
-func TestBuildFirewallRules_WildcardSrc(t *testing.T) {
+func TestBuildFirewallRules_PortRangeMapping(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
-	policies := []api.Policy{
-		{
-			ID: "pol-wildcard",
-			Rules: []api.PolicyRule{
-				{Src: "*", Dst: "node-a", Port: 80, Protocol: "tcp", Action: "allow"},
-			},
-		},
-	}
-	peersByID := map[string]string{
-		"node-a": "10.0.0.1",
-	}
 
-	got := eng.BuildFirewallRules(policies, "node-a", "wg0", peersByID)
-	// 1 policy rule + 1 default-deny = 2
-	if len(got) != 2 {
-		t.Fatalf("BuildFirewallRules() returned %d rules, want 2", len(got))
+	t.Run("single-port range collapses to Port with PortTo 0", func(t *testing.T) {
+		got, err := eng.BuildFirewallRules([]api.PolicyRule{
+			{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}},
+		}, "wg0")
+		if err != nil {
+			t.Fatalf("BuildFirewallRules() error = %v", err)
+		}
+		if got[0].Port != 443 || got[0].PortTo != 0 {
+			t.Errorf("Port/PortTo = %d/%d, want 443/0", got[0].Port, got[0].PortTo)
+		}
+	})
+
+	t.Run("multi-port range keeps PortTo", func(t *testing.T) {
+		got, err := eng.BuildFirewallRules([]api.PolicyRule{
+			{Action: "allow", Protocol: "udp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 1000, To: 2000}},
+		}, "wg0")
+		if err != nil {
+			t.Fatalf("BuildFirewallRules() error = %v", err)
+		}
+		if got[0].Port != 1000 || got[0].PortTo != 2000 {
+			t.Errorf("Port/PortTo = %d/%d, want 1000/2000", got[0].Port, got[0].PortTo)
+		}
+	})
+}
+
+func TestBuildFirewallRules_PortlessRule(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+	got, err := eng.BuildFirewallRules([]api.PolicyRule{
+		{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"},
+	}, "wg0")
+	if err != nil {
+		t.Fatalf("BuildFirewallRules() error = %v", err)
 	}
-	if got[0].SrcIP != "0.0.0.0/0" {
-		t.Errorf("SrcIP = %q, want %q", got[0].SrcIP, "0.0.0.0/0")
-	}
-	if got[0].DstIP != "10.0.0.1" {
-		t.Errorf("DstIP = %q, want %q", got[0].DstIP, "10.0.0.1")
+	if got[0].Port != 0 || got[0].PortTo != 0 {
+		t.Errorf("Port/PortTo = %d/%d, want 0/0 for a portless rule", got[0].Port, got[0].PortTo)
 	}
 }
 
-func TestBuildFirewallRules_SkipsIrrelevantRules(t *testing.T) {
+func TestBuildFirewallRules_AnyProtocolMapsToEmpty(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
-	policies := []api.Policy{
-		{
-			ID: "pol-other",
-			Rules: []api.PolicyRule{
-				{Src: "peer-x", Dst: "peer-y", Port: 22, Protocol: "tcp", Action: "allow"},
-			},
-		},
+	got, err := eng.BuildFirewallRules([]api.PolicyRule{
+		{Action: "allow", Protocol: "any", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.0/24"},
+	}, "wg0")
+	if err != nil {
+		t.Fatalf("BuildFirewallRules() error = %v", err)
 	}
-	peersByID := map[string]string{
-		"node-a": "10.0.0.1",
-		"peer-x": "10.0.0.5",
-		"peer-y": "10.0.0.6",
+	if got[0].Protocol != "" {
+		t.Errorf("Protocol = %q, want \"\" (any maps to empty)", got[0].Protocol)
 	}
+}
 
-	got := eng.BuildFirewallRules(policies, "node-a", "wg0", peersByID)
-	// Only the default-deny rule should be present (no relevant policy rules).
+func TestBuildFirewallRules_ICMPPassesThrough(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+	got, err := eng.BuildFirewallRules([]api.PolicyRule{
+		{Action: "allow", Protocol: "icmp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.0/24"},
+	}, "wg0")
+	if err != nil {
+		t.Fatalf("BuildFirewallRules() error = %v", err)
+	}
+	if got[0].Protocol != "icmp" {
+		t.Errorf("Protocol = %q, want %q", got[0].Protocol, "icmp")
+	}
+	if got[0].Port != 0 {
+		t.Errorf("icmp rule Port = %d, want 0", got[0].Port)
+	}
+}
+
+func TestBuildFirewallRules_LogActionSkipped(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+	got, err := eng.BuildFirewallRules([]api.PolicyRule{
+		{Action: "log", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 80, To: 80}},
+	}, "wg0")
+	if err != nil {
+		t.Fatalf("BuildFirewallRules() error = %v", err)
+	}
+	// The log rule is observational and non-terminating; only the trailing
+	// default-deny remains.
 	if len(got) != 1 {
-		t.Fatalf("BuildFirewallRules() returned %d rules, want 1 (default-deny only)", len(got))
+		t.Fatalf("BuildFirewallRules() returned %d rules, want 1 (log rule skipped)", len(got))
 	}
 	if got[0].Action != "deny" {
-		t.Errorf("rule[0].Action = %q, want %q (default-deny)", got[0].Action, "deny")
+		t.Errorf("remaining rule Action = %q, want %q (default-deny)", got[0].Action, "deny")
 	}
 }
 
-func TestBuildFirewallRules_DefaultDenyAppended(t *testing.T) {
+// An unknown action must abort the whole ruleset: nftables verdicts are terminal
+// and order-sensitive, so silently dropping one rule out of an ordered ACL can
+// flip the verdict for the traffic it covered (a deny carving an exception out
+// of a following broad allow would fail open).
+func TestBuildFirewallRules_UnknownActionErrors(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
-	policies := []api.Policy{
-		{
-			ID: "pol-1",
-			Rules: []api.PolicyRule{
-				{Src: "node-a", Dst: "peer-b", Port: 443, Protocol: "tcp", Action: "allow"},
-			},
-		},
-	}
-	peersByID := map[string]string{
-		"node-a": "10.0.0.1",
-		"peer-b": "10.0.0.2",
-	}
-
-	got := eng.BuildFirewallRules(policies, "node-a", "wg0", peersByID)
-	if len(got) < 2 {
-		t.Fatalf("BuildFirewallRules() returned %d rules, want at least 2", len(got))
-	}
-
-	last := got[len(got)-1]
-	if last.Action != "deny" {
-		t.Errorf("last rule Action = %q, want %q", last.Action, "deny")
-	}
-	if last.SrcIP != "0.0.0.0/0" {
-		t.Errorf("last rule SrcIP = %q, want %q", last.SrcIP, "0.0.0.0/0")
-	}
-	if last.DstIP != "0.0.0.0/0" {
-		t.Errorf("last rule DstIP = %q, want %q", last.DstIP, "0.0.0.0/0")
-	}
-	if last.Interface != "wg0" {
-		t.Errorf("last rule Interface = %q, want %q", last.Interface, "wg0")
+	_, err := eng.BuildFirewallRules([]api.PolicyRule{
+		{Action: "deny", Protocol: "tcp", SourceCIDR: "10.0.0.99/32", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 22, To: 22}},
+		{Action: "reject", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0"},
+	}, "wg0")
+	if err == nil {
+		t.Fatal("BuildFirewallRules() error = nil, want error for unknown action")
 	}
 }
 
-func TestBuildFirewallRules_InvalidProtocolSkipped(t *testing.T) {
+func TestBuildFirewallRules_UnknownProtocolErrors(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
-	policies := []api.Policy{
-		{
-			ID: "pol-1",
-			Rules: []api.PolicyRule{
-				{Src: "node-a", Dst: "peer-b", Port: 443, Protocol: "sctp", Action: "allow"},
-				{Src: "node-a", Dst: "peer-b", Port: 80, Protocol: "tcp", Action: "allow"},
-			},
-		},
-	}
-	peersByID := map[string]string{
-		"node-a": "10.0.0.1",
-		"peer-b": "10.0.0.2",
-	}
-
-	got := eng.BuildFirewallRules(policies, "node-a", "wg0", peersByID)
-	// 1 valid rule + 1 default-deny = 2 (invalid "sctp" rule skipped)
-	if len(got) != 2 {
-		t.Fatalf("BuildFirewallRules() returned %d rules, want 2 (invalid protocol skipped)", len(got))
-	}
-	if got[0].Protocol != "tcp" {
-		t.Errorf("rule[0].Protocol = %q, want %q", got[0].Protocol, "tcp")
-	}
-	if got[0].Port != 80 {
-		t.Errorf("rule[0].Port = %d, want 80", got[0].Port)
+	_, err := eng.BuildFirewallRules([]api.PolicyRule{
+		{Action: "deny", Protocol: "sctp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.99.0.5/32"},
+		{Action: "allow", Protocol: "any", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "0.0.0.0/0"},
+	}, "wg0")
+	if err == nil {
+		t.Fatal("BuildFirewallRules() error = nil, want error for unknown protocol")
 	}
 }
 
-func TestBuildFirewallRules_BothWildcards(t *testing.T) {
+func TestBuildFirewallRules_PortsOnICMPErrors(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
-	policies := []api.Policy{
+	_, err := eng.BuildFirewallRules([]api.PolicyRule{
+		{Action: "allow", Protocol: "icmp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "10.0.0.0/24", Ports: &api.PortRange{From: 80, To: 80}},
+	}, "wg0")
+	if err == nil {
+		t.Fatal("BuildFirewallRules() error = nil, want error for ports on a portless protocol")
+	}
+}
+
+// Port and CIDR bounds: every out-of-contract value widens or mis-targets a rule
+// once it reaches nftables (a zero/out-of-range port drops the port match, an
+// out-of-range port wraps through uint16, an empty CIDR matches every address),
+// so each must abort the build rather than be silently coerced.
+func TestBuildFirewallRules_PortAndCIDRBounds(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+
+	tests := []struct {
+		name string
+		rule api.PolicyRule
+	}{
 		{
-			ID: "pol-open",
-			Rules: []api.PolicyRule{
-				{Src: "*", Dst: "*", Port: 0, Protocol: "", Action: "allow"},
-			},
+			name: "zero from port",
+			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: 0, To: 0}},
+		},
+		{
+			name: "negative from port",
+			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: -1, To: -1}},
+		},
+		{
+			name: "from port above 65535 truncates through uint16",
+			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: 70000, To: 70000}},
+		},
+		{
+			name: "to port above 65535",
+			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: 65558, To: 65558}},
+		},
+		{
+			name: "inverted range collapses to single port",
+			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "0.0.0.0/0", DestinationCIDR: "10.0.0.7/32", Ports: &api.PortRange{From: 1000, To: 80}},
+		},
+		{
+			name: "empty source cidr matches every address",
+			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "", DestinationCIDR: "10.99.0.5/32", Ports: &api.PortRange{From: 22, To: 22}},
+		},
+		{
+			name: "empty destination cidr matches every address",
+			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "10.99.0.5/32", DestinationCIDR: "", Ports: &api.PortRange{From: 22, To: 22}},
+		},
+		{
+			name: "non-ipv4 source cidr",
+			rule: api.PolicyRule{Action: "allow", Protocol: "tcp", SourceCIDR: "fd00::/32", DestinationCIDR: "10.99.0.5/32", Ports: &api.PortRange{From: 22, To: 22}},
 		},
 	}
-	peersByID := map[string]string{
-		"node-a": "10.0.0.1",
-	}
 
-	got := eng.BuildFirewallRules(policies, "node-a", "wg0", peersByID)
-	// 1 wildcard rule + 1 default-deny = 2
-	if len(got) != 2 {
-		t.Fatalf("BuildFirewallRules() returned %d rules, want 2", len(got))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := eng.BuildFirewallRules([]api.PolicyRule{tt.rule}, "wg0"); err == nil {
+				t.Fatalf("BuildFirewallRules() error = nil, want error for %s", tt.name)
+			}
+		})
 	}
-	if got[0].SrcIP != "0.0.0.0/0" {
-		t.Errorf("rule[0].SrcIP = %q, want %q", got[0].SrcIP, "0.0.0.0/0")
-	}
-	if got[0].DstIP != "0.0.0.0/0" {
-		t.Errorf("rule[0].DstIP = %q, want %q", got[0].DstIP, "0.0.0.0/0")
+}
+
+func TestBuildFirewallRules_DefaultDenyAlwaysAppended(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+
+	for _, rules := range [][]api.PolicyRule{
+		nil,
+		{},
+		{{Action: "allow", Protocol: "tcp", SourceCIDR: "10.0.0.0/24", DestinationCIDR: "0.0.0.0/0", Ports: &api.PortRange{From: 443, To: 443}}},
+	} {
+		got, err := eng.BuildFirewallRules(rules, "wg0")
+		if err != nil {
+			t.Fatalf("BuildFirewallRules() error = %v", err)
+		}
+		if len(got) == 0 {
+			t.Fatal("BuildFirewallRules() returned no rules, want at least the default-deny")
+		}
+		last := got[len(got)-1]
+		if last.Action != "deny" || last.SrcIP != "0.0.0.0/0" || last.DstIP != "0.0.0.0/0" {
+			t.Errorf("trailing rule = %+v, want default-deny 0.0.0.0/0", last)
+		}
+		if last.Interface != "wg0" {
+			t.Errorf("trailing rule Interface = %q, want %q", last.Interface, "wg0")
+		}
 	}
 }

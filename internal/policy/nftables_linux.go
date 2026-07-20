@@ -78,6 +78,9 @@ func (c *NftablesController) ApplyRules(chain string, rules []FirewallRule) erro
 	conn.FlushChain(nftChain)
 
 	for _, rule := range rules {
+		if err := rule.Validate(); err != nil {
+			return fmt.Errorf("policy: nftables: apply rules: %w", err)
+		}
 		exprs, err := buildRuleExprs(rule)
 		if err != nil {
 			return fmt.Errorf("policy: nftables: apply rules: build expressions: %w", err)
@@ -230,19 +233,33 @@ func buildRuleExprs(rule FirewallRule) ([]expr.Any, error) {
 
 	// Match destination port if specified.
 	if rule.Port > 0 {
-		exprs = append(exprs,
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseTransportHeader,
-				Offset:       2, // TCP/UDP destination port offset
-				Len:          2,
-			},
-			&expr.Cmp{
+		exprs = append(exprs, &expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseTransportHeader,
+			Offset:       2, // TCP/UDP destination port offset
+			Len:          2,
+		})
+		if rule.PortTo > rule.Port {
+			// Inclusive range match: Port <= dport <= PortTo.
+			exprs = append(exprs,
+				&expr.Cmp{
+					Op:       expr.CmpOpGte,
+					Register: 1,
+					Data:     portBytes(uint16(rule.Port)),
+				},
+				&expr.Cmp{
+					Op:       expr.CmpOpLte,
+					Register: 1,
+					Data:     portBytes(uint16(rule.PortTo)),
+				},
+			)
+		} else {
+			exprs = append(exprs, &expr.Cmp{
 				Op:       expr.CmpOpEq,
 				Register: 1,
 				Data:     portBytes(uint16(rule.Port)),
-			},
-		)
+			})
+		}
 	}
 
 	// Append counter for observability.
@@ -332,6 +349,8 @@ func protocolNumber(proto string) (byte, error) {
 		return unix.IPPROTO_TCP, nil
 	case "udp":
 		return unix.IPPROTO_UDP, nil
+	case "icmp":
+		return unix.IPPROTO_ICMP, nil
 	default:
 		return 0, fmt.Errorf("unsupported protocol %q", proto)
 	}

@@ -251,7 +251,7 @@ func TestHandleSiteToSiteTunnelRevoked_MalformedPayload(t *testing.T) {
 // SiteToSiteReconcileHandler tests
 // ---------------------------------------------------------------------------
 
-func TestSiteToSiteReconcileHandler_NilConfig(t *testing.T) {
+func TestSiteToSiteReconcileHandler_NilBridge(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
@@ -259,10 +259,8 @@ func TestSiteToSiteReconcileHandler_NilConfig(t *testing.T) {
 
 	handler := SiteToSiteReconcileHandler(mgr, discardLogger())
 
-	// Desired state has nil SiteToSiteConfig — no changes.
-	desired := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk", MeshIP: "10.42.0.2"}},
-	}
+	// A nil Bridge means "not populated": reconcile against an empty desired set.
+	desired := &api.NodeStateSnapshot{}
 	diff := reconcile.StateDiff{}
 
 	err := handler(context.Background(), desired, diff)
@@ -271,7 +269,7 @@ func TestSiteToSiteReconcileHandler_NilConfig(t *testing.T) {
 	}
 
 	if len(vpnCtrl.vpnCallsFor("CreateTunnelInterface")) != 0 {
-		t.Error("CreateTunnelInterface should not be called when SiteToSiteConfig is nil")
+		t.Error("CreateTunnelInterface should not be called when Bridge is nil")
 	}
 }
 
@@ -283,12 +281,14 @@ func TestSiteToSiteReconcileHandler_AddsNewTunnels(t *testing.T) {
 
 	handler := SiteToSiteReconcileHandler(mgr, discardLogger())
 
-	desired := &api.StateResponse{
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{
-				testTunnel("tun-1"),
-				testTunnel("tun-2"),
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{
+					testTunnel("tun-1"),
+					testTunnel("tun-2"),
+				},
 			},
 		},
 	}
@@ -329,11 +329,13 @@ func TestSiteToSiteReconcileHandler_RemovesStaleTunnels(t *testing.T) {
 	handler := SiteToSiteReconcileHandler(mgr, discardLogger())
 
 	// Desired state: only tun-1 remains.
-	desired := &api.StateResponse{
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{
-				testTunnel("tun-1"),
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{
+					testTunnel("tun-1"),
+				},
 			},
 		},
 	}
@@ -378,10 +380,12 @@ func TestSiteToSiteReconcileHandler_DetectsChangedTunnels(t *testing.T) {
 	// Desired state: same tunnel ID but different RemoteEndpoint.
 	changed := testTunnel("tun-1")
 	changed.RemoteEndpoint = "203.0.113.99:51820"
-	desired := &api.StateResponse{
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{changed},
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{changed},
+			},
 		},
 	}
 	diff := reconcile.StateDiff{}
@@ -428,10 +432,12 @@ func TestSiteToSiteReconcileHandler_UnchangedTunnelsUntouched(t *testing.T) {
 	handler := SiteToSiteReconcileHandler(mgr, discardLogger())
 
 	// Desired state: same tunnel, unchanged.
-	desired := &api.StateResponse{
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{tunnel},
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{tunnel},
+			},
 		},
 	}
 	diff := reconcile.StateDiff{}
@@ -469,12 +475,14 @@ func TestSiteToSiteReconcileHandler_Mixed(t *testing.T) {
 	handler := SiteToSiteReconcileHandler(mgr, discardLogger())
 
 	// Desired: keep tun-keep, add tun-new, remove tun-stale.
-	desired := &api.StateResponse{
-		SiteToSiteConfig: &api.SiteToSiteConfig{
-			Enabled: true,
-			Tunnels: []api.SiteToSiteTunnel{
-				testTunnel("tun-keep"),
-				testTunnel("tun-new"),
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			SiteToSite: &api.SiteToSiteConfig{
+				Enabled: true,
+				Tunnels: []api.SiteToSiteTunnel{
+					testTunnel("tun-keep"),
+					testTunnel("tun-new"),
+				},
 			},
 		},
 	}
@@ -515,5 +523,33 @@ func TestSiteToSiteReconcileHandler_Mixed(t *testing.T) {
 	}
 	if _, ok := idSet["tun-stale"]; ok {
 		t.Error("tun-stale should have been removed")
+	}
+}
+
+func TestSiteToSiteReconcileHandler_TeardownOnNilBridge(t *testing.T) {
+	// A populated site-to-site manager reconciled against a nil Bridge (and against
+	// a nil SiteToSite child) tears down its existing tunnels — null means "not populated".
+	for name, desired := range map[string]*api.NodeStateSnapshot{
+		"nil bridge":       {},
+		"nil site to site": {Bridge: &api.BridgeSnapshot{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			vpnCtrl := &mockVPNController{}
+			routeCtrl := &mockRouteController{}
+			mgr := newTestSiteToSiteManager(t, vpnCtrl, routeCtrl)
+			defer func() { _ = mgr.Teardown() }()
+
+			if err := mgr.AddTunnel(testTunnel("tun-1")); err != nil {
+				t.Fatalf("AddTunnel: %v", err)
+			}
+
+			handler := SiteToSiteReconcileHandler(mgr, discardLogger())
+			if err := handler(context.Background(), desired, reconcile.StateDiff{}); err != nil {
+				t.Fatalf("handler error = %v, want nil", err)
+			}
+			if n := len(mgr.TunnelIDs()); n != 0 {
+				t.Errorf("TunnelIDs count = %d, want 0 (stale tunnel torn down)", n)
+			}
+		})
 	}
 }

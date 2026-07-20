@@ -52,17 +52,24 @@ func HandleRelaySessionRevoked(relay *Relay, logger *slog.Logger) api.EventHandl
 }
 
 // RelayReconcileHandler returns a reconcile.ReconcileHandler that reconciles
-// relay sessions to match the desired RelayConfig. Sessions not in the desired
-// state are removed; missing sessions are added.
+// relay sessions to match the desired bridge relay subtree. Sessions not in the
+// desired state are removed; missing sessions are added. The handler is
+// presence-aware: a nil Bridge or nil Relay child means "not populated", so it
+// reconciles against an empty desired set and tears down stale sessions.
 func RelayReconcileHandler(relay *Relay, logger *slog.Logger) reconcile.ReconcileHandler {
-	return func(_ context.Context, desired *api.StateResponse, _ reconcile.StateDiff) error {
-		if desired == nil || desired.RelayConfig == nil {
+	return func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
+		if desired == nil {
 			return nil
 		}
 
+		var sessions []api.RelaySessionAssignment
+		if desired.Bridge != nil && desired.Bridge.Relay != nil {
+			sessions = desired.Bridge.Relay.Sessions
+		}
+
 		// Build desired set keyed by SessionID.
-		desiredSet := make(map[string]api.RelaySessionAssignment, len(desired.RelayConfig.Sessions))
-		for _, s := range desired.RelayConfig.Sessions {
+		desiredSet := make(map[string]api.RelaySessionAssignment, len(sessions))
+		for _, s := range sessions {
 			desiredSet[s.SessionID] = s
 		}
 

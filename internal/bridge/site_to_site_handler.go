@@ -64,18 +64,26 @@ func HandleSiteToSiteConfigUpdated(trigger ReconcileTrigger) api.EventHandler {
 }
 
 // SiteToSiteReconcileHandler returns a reconcile.ReconcileHandler that updates
-// site-to-site tunnels when the desired SiteToSiteConfig changes. It diffs the
-// desired tunnels against the currently active tunnels: adding missing tunnels,
-// removing stale tunnels, and restarting changed tunnels (same ID, different config).
+// site-to-site tunnels when the desired bridge site-to-site subtree changes. It
+// diffs the desired tunnels against the currently active tunnels: adding missing
+// tunnels, removing stale tunnels, and restarting changed tunnels (same ID,
+// different config). The handler is presence-aware: a nil Bridge or nil
+// SiteToSite child means "not populated", so it reconciles against an empty
+// desired set and tears down stale tunnels.
 func SiteToSiteReconcileHandler(mgr *SiteToSiteManager, logger *slog.Logger) reconcile.ReconcileHandler {
-	return func(_ context.Context, desired *api.StateResponse, _ reconcile.StateDiff) error {
-		if desired == nil || desired.SiteToSiteConfig == nil {
+	return func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
+		if desired == nil {
 			return nil
 		}
 
+		var tunnels []api.SiteToSiteTunnel
+		if desired.Bridge != nil && desired.Bridge.SiteToSite != nil {
+			tunnels = desired.Bridge.SiteToSite.Tunnels
+		}
+
 		// Build desired set for diffing.
-		desiredSet := make(map[string]api.SiteToSiteTunnel, len(desired.SiteToSiteConfig.Tunnels))
-		for _, t := range desired.SiteToSiteConfig.Tunnels {
+		desiredSet := make(map[string]api.SiteToSiteTunnel, len(tunnels))
+		for _, t := range tunnels {
 			desiredSet[t.TunnelID] = t
 		}
 
@@ -104,7 +112,7 @@ func SiteToSiteReconcileHandler(mgr *SiteToSiteManager, logger *slog.Logger) rec
 
 		// Add missing and changed tunnels.
 		var errs []error
-		for _, tunnel := range desired.SiteToSiteConfig.Tunnels {
+		for _, tunnel := range tunnels {
 			if _, ok := currentSet[tunnel.TunnelID]; ok {
 				continue
 			}

@@ -268,17 +268,15 @@ func TestHandleUserAccessConfigUpdated_MalformedPayload(t *testing.T) {
 // UserAccessReconcileHandler tests
 // ---------------------------------------------------------------------------
 
-func TestUserAccessReconcileHandler_NilConfig(t *testing.T) {
+func TestUserAccessReconcileHandler_NilBridge(t *testing.T) {
 	ctrl := &mockAccessController{}
 	routes := &mockRouteController{}
 	mgr := newTestUserAccessManager(t, ctrl, routes)
 
 	handler := UserAccessReconcileHandler(mgr, discardLogger())
 
-	// Desired state has nil UserAccessConfig — no changes.
-	desired := &api.StateResponse{
-		Peers: []api.Peer{{ID: "p1", PublicKey: "pk", MeshIP: "10.42.0.2"}},
-	}
+	// A nil Bridge means "not populated": reconcile against an empty desired set.
+	desired := &api.NodeStateSnapshot{}
 	diff := reconcile.StateDiff{}
 
 	err := handler(context.Background(), desired, diff)
@@ -287,7 +285,7 @@ func TestUserAccessReconcileHandler_NilConfig(t *testing.T) {
 	}
 
 	if len(ctrl.accessCallsFor("ConfigurePeer")) != 0 {
-		t.Error("ConfigurePeer should not be called when UserAccessConfig is nil")
+		t.Error("ConfigurePeer should not be called when Bridge is nil")
 	}
 }
 
@@ -298,14 +296,16 @@ func TestUserAccessReconcileHandler_AddMissing(t *testing.T) {
 
 	handler := UserAccessReconcileHandler(mgr, discardLogger())
 
-	desired := &api.StateResponse{
-		UserAccessConfig: &api.UserAccessConfig{
-			Enabled:       true,
-			InterfaceName: "wg-access",
-			ListenPort:    51822,
-			Peers: []api.UserAccessPeer{
-				{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
-				{PublicKey: "pk-2", AllowedIPs: []string{"10.99.0.2/32"}, Label: "bob"},
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			UserAccess: &api.UserAccessConfig{
+				Enabled:       true,
+				InterfaceName: "wg-access",
+				ListenPort:    51822,
+				Peers: []api.UserAccessPeer{
+					{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
+					{PublicKey: "pk-2", AllowedIPs: []string{"10.99.0.2/32"}, Label: "bob"},
+				},
 			},
 		},
 	}
@@ -343,13 +343,15 @@ func TestUserAccessReconcileHandler_RemoveStale(t *testing.T) {
 	handler := UserAccessReconcileHandler(mgr, discardLogger())
 
 	// Desired state: only pk-1 remains.
-	desired := &api.StateResponse{
-		UserAccessConfig: &api.UserAccessConfig{
-			Enabled:       true,
-			InterfaceName: "wg-access",
-			ListenPort:    51822,
-			Peers: []api.UserAccessPeer{
-				{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			UserAccess: &api.UserAccessConfig{
+				Enabled:       true,
+				InterfaceName: "wg-access",
+				ListenPort:    51822,
+				Peers: []api.UserAccessPeer{
+					{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
+				},
 			},
 		},
 	}
@@ -390,14 +392,16 @@ func TestUserAccessReconcileHandler_Mixed(t *testing.T) {
 	handler := UserAccessReconcileHandler(mgr, discardLogger())
 
 	// Desired: keep pk-keep, add pk-new, remove pk-stale.
-	desired := &api.StateResponse{
-		UserAccessConfig: &api.UserAccessConfig{
-			Enabled:       true,
-			InterfaceName: "wg-access",
-			ListenPort:    51822,
-			Peers: []api.UserAccessPeer{
-				{PublicKey: "pk-keep", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
-				{PublicKey: "pk-new", AllowedIPs: []string{"10.99.0.3/32"}, Label: "charlie"},
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			UserAccess: &api.UserAccessConfig{
+				Enabled:       true,
+				InterfaceName: "wg-access",
+				ListenPort:    51822,
+				Peers: []api.UserAccessPeer{
+					{PublicKey: "pk-keep", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"},
+					{PublicKey: "pk-new", AllowedIPs: []string{"10.99.0.3/32"}, Label: "charlie"},
+				},
 			},
 		},
 	}
@@ -428,5 +432,32 @@ func TestUserAccessReconcileHandler_Mixed(t *testing.T) {
 
 	if mgr.UserAccessStatus().PeerCount != 2 {
 		t.Errorf("PeerCount = %d, want 2", mgr.UserAccessStatus().PeerCount)
+	}
+}
+
+func TestUserAccessReconcileHandler_TeardownOnNilBridge(t *testing.T) {
+	// A populated user-access manager reconciled against a nil Bridge (and against
+	// a nil UserAccess child) tears down its existing peers — null means "not populated".
+	for name, desired := range map[string]*api.NodeStateSnapshot{
+		"nil bridge":      {},
+		"nil user access": {Bridge: &api.BridgeSnapshot{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctrl := &mockAccessController{}
+			routes := &mockRouteController{}
+			mgr := newTestUserAccessManager(t, ctrl, routes)
+
+			if err := mgr.AddPeer(api.UserAccessPeer{PublicKey: "pk-1", AllowedIPs: []string{"10.99.0.1/32"}, Label: "alice"}); err != nil {
+				t.Fatalf("AddPeer: %v", err)
+			}
+
+			handler := UserAccessReconcileHandler(mgr, discardLogger())
+			if err := handler(context.Background(), desired, reconcile.StateDiff{}); err != nil {
+				t.Fatalf("handler error = %v, want nil", err)
+			}
+			if n := mgr.UserAccessStatus().PeerCount; n != 0 {
+				t.Errorf("PeerCount = %d, want 0 (stale peer torn down)", n)
+			}
+		})
 	}
 }

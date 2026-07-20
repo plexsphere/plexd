@@ -63,18 +63,26 @@ func HandleIngressConfigUpdated(trigger ReconcileTrigger) api.EventHandler {
 }
 
 // IngressReconcileHandler returns a reconcile.ReconcileHandler that updates
-// ingress rules when the desired IngressConfig changes. It diffs the desired
-// rules against the currently active rules: adding missing rules, removing
-// stale rules, and restarting changed rules (same ID, different config).
+// ingress rules when the desired bridge ingress subtree changes. It diffs the
+// desired rules against the currently active rules: adding missing rules,
+// removing stale rules, and restarting changed rules (same ID, different
+// config). The handler is presence-aware: a nil Bridge or nil Ingress child
+// means "not populated", so it reconciles against an empty desired set and
+// tears down stale rules.
 func IngressReconcileHandler(mgr *IngressManager, logger *slog.Logger) reconcile.ReconcileHandler {
-	return func(_ context.Context, desired *api.StateResponse, _ reconcile.StateDiff) error {
-		if desired == nil || desired.IngressConfig == nil {
+	return func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
+		if desired == nil {
 			return nil
 		}
 
+		var rules []api.IngressRule
+		if desired.Bridge != nil && desired.Bridge.Ingress != nil {
+			rules = desired.Bridge.Ingress.Rules
+		}
+
 		// Build desired set for diffing.
-		desiredSet := make(map[string]api.IngressRule, len(desired.IngressConfig.Rules))
-		for _, r := range desired.IngressConfig.Rules {
+		desiredSet := make(map[string]api.IngressRule, len(rules))
+		for _, r := range rules {
 			desiredSet[r.RuleID] = r
 		}
 
@@ -103,7 +111,7 @@ func IngressReconcileHandler(mgr *IngressManager, logger *slog.Logger) reconcile
 
 		// Add missing and changed rules.
 		var errs []error
-		for _, rule := range desired.IngressConfig.Rules {
+		for _, rule := range rules {
 			if _, ok := currentSet[rule.RuleID]; ok {
 				continue
 			}

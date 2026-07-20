@@ -1,13 +1,15 @@
 package policy
 
 import (
+	"fmt"
 	"log/slog"
+	"net/netip"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// PolicyEngine evaluates network policies to determine peer visibility
-// and to generate firewall rules for the local node.
+// PolicyEngine translates the control plane's merged policy rules into concrete
+// firewall rules for the local node.
 type PolicyEngine struct {
 	logger *slog.Logger
 }
@@ -19,111 +21,98 @@ func NewPolicyEngine(logger *slog.Logger) *PolicyEngine {
 	}
 }
 
-// FilterPeers returns the subset of peers that the local node is allowed to
-// communicate with according to the provided policies. If no policies are
-// supplied, no peers are returned (deny-by-default).
-func (e *PolicyEngine) FilterPeers(peers []api.Peer, policies []api.Policy, localNodeID string) []api.Peer {
-	if len(policies) == 0 {
-		e.logger.Debug("no policies defined, denying all peers (deny-by-default)")
-		return nil
-	}
+// BuildFirewallRules converts the merged policy's five-tuple rules into concrete
+// FirewallRule entries for the local node.
+//
+// The ruleset is ordered and nftables verdicts are terminal: the first matching
+// rule decides accept or drop. Dropping one rule out of the middle therefore
+// changes the verdict for the traffic it covered rather than merely omitting an
+// entry — a deny that carves an exception out of a following broad allow would
+// fail open. Every unparseable rule is therefore an error for the whole set, so
+// the caller keeps the previously installed ruleset and retries.
+//
+// Actions allow and deny are kept and a log action is the sole skip: it is
+// observational only (the nftables layer has no log verdict) and non-terminating
+// in the control plane's policy language, so omitting it cannot change the
+// accept/drop outcome. Protocols tcp/udp/icmp are kept and any maps to ""
+// (match all). Both CIDRs must be parseable IPv4 prefixes — an empty string
+// reaches nftables as "match any address" and would silently widen the rule.
+// Ports are valid only for tcp/udp and must be a bounded, non-inverted range;
+// a zero or out-of-range port would drop the port match entirely (widening the
+// rule to every port) or wrap through uint16 onto an unrelated port.
+//
+// The trailing default-deny rule is always appended — including when rules is
+// empty or nil — for a deny-by-default posture.
+func (e *PolicyEngine) BuildFirewallRules(rules []api.PolicyRule, iface string) ([]FirewallRule, error) {
+	var fwRules []FirewallRule
 
-	var allowed []api.Peer
-	for _, p := range peers {
-		if p.ID == localNodeID {
+	for i, r := range rules {
+		var action string
+		switch r.Action {
+		case "allow", "deny":
+			action = r.Action
+		case "log":
+			e.logger.Warn("skipping log rule (observational only)",
+				"action", r.Action,
+			)
 			continue
+		default:
+			return nil, fmt.Errorf("policy: rule %d: unsupported action %q", i, r.Action)
 		}
-		if e.peerAllowed(p.ID, localNodeID, policies) {
-			allowed = append(allowed, p)
+
+		var proto string
+		switch r.Protocol {
+		case "tcp", "udp", "icmp":
+			proto = r.Protocol
+		case "any":
+			proto = ""
+		default:
+			return nil, fmt.Errorf("policy: rule %d: unsupported protocol %q", i, r.Protocol)
 		}
+
+		if err := validateCIDR(r.SourceCIDR); err != nil {
+			return nil, fmt.Errorf("policy: rule %d: source_cidr: %w", i, err)
+		}
+		if err := validateCIDR(r.DestinationCIDR); err != nil {
+			return nil, fmt.Errorf("policy: rule %d: destination_cidr: %w", i, err)
+		}
+
+		// Ports are only valid for tcp/udp; a portless protocol with ports set
+		// violates the contract.
+		if r.Ports != nil && proto != "tcp" && proto != "udp" {
+			return nil, fmt.Errorf("policy: rule %d: ports set on portless protocol %q", i, r.Protocol)
+		}
+
+		var port, portTo int
+		if r.Ports != nil {
+			if r.Ports.From < 1 || r.Ports.From > 65535 || r.Ports.To < r.Ports.From || r.Ports.To > 65535 {
+				return nil, fmt.Errorf("policy: rule %d: port range %d-%d out of bounds",
+					i, r.Ports.From, r.Ports.To)
+			}
+			port = r.Ports.From
+			if r.Ports.To > r.Ports.From {
+				portTo = r.Ports.To
+			}
+		}
+
+		fw := FirewallRule{
+			Interface: iface,
+			SrcIP:     r.SourceCIDR,
+			DstIP:     r.DestinationCIDR,
+			Port:      port,
+			PortTo:    portTo,
+			Protocol:  proto,
+			Action:    action,
+		}
+		if err := fw.Validate(); err != nil {
+			return nil, fmt.Errorf("policy: rule %d: %w", i, err)
+		}
+		fwRules = append(fwRules, fw)
 	}
 
-	e.logger.Debug("filtered peers by policy",
-		"total", len(peers),
-		"allowed", len(allowed),
-		"local_node", localNodeID,
-	)
-	return allowed
-}
-
-// peerAllowed returns true if any allow rule in any policy references both
-// the local node and the peer (in either direction). The wildcard "*" matches
-// any node ID.
-func (e *PolicyEngine) peerAllowed(peerID, localNodeID string, policies []api.Policy) bool {
-	for _, pol := range policies {
-		for _, r := range pol.Rules {
-			if r.Action != "allow" {
-				continue
-			}
-			srcMatchesLocal := r.Src == localNodeID || r.Src == "*"
-			dstMatchesPeer := r.Dst == peerID || r.Dst == "*"
-			if srcMatchesLocal && dstMatchesPeer {
-				return true
-			}
-
-			srcMatchesPeer := r.Src == peerID || r.Src == "*"
-			dstMatchesLocal := r.Dst == localNodeID || r.Dst == "*"
-			if srcMatchesPeer && dstMatchesLocal {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// BuildFirewallRules converts policy rules into concrete FirewallRule entries
-// for the local node. peersByID maps peer IDs to their mesh IPs. Only rules
-// that reference localNodeID (or the wildcard "*") are included.
-func (e *PolicyEngine) BuildFirewallRules(policies []api.Policy, localNodeID string, iface string, peersByID map[string]string) []FirewallRule {
-	localIP := peersByID[localNodeID]
-	var rules []FirewallRule
-
-	for _, pol := range policies {
-		for _, r := range pol.Rules {
-			if !isValidProtocol(r.Protocol) {
-				e.logger.Warn("skipping rule with invalid protocol",
-					"policy_id", pol.ID,
-					"protocol", r.Protocol,
-				)
-				continue
-			}
-
-			srcMatchesLocal := r.Src == localNodeID || r.Src == "*"
-			dstMatchesLocal := r.Dst == localNodeID || r.Dst == "*"
-
-			if !srcMatchesLocal && !dstMatchesLocal {
-				continue
-			}
-
-			var srcIP, dstIP string
-
-			if srcMatchesLocal && !dstMatchesLocal {
-				// Outbound: local → peer
-				srcIP = localIP
-				dstIP = e.resolveIP(r.Dst, peersByID)
-			} else if dstMatchesLocal && !srcMatchesLocal {
-				// Inbound: peer → local
-				srcIP = e.resolveIP(r.Src, peersByID)
-				dstIP = localIP
-			} else {
-				// Both match local (e.g. wildcard on both sides)
-				srcIP = e.resolveWildcard(r.Src, localIP)
-				dstIP = e.resolveWildcard(r.Dst, localIP)
-			}
-
-			rules = append(rules, FirewallRule{
-				Interface: iface,
-				SrcIP:     srcIP,
-				DstIP:     dstIP,
-				Port:      r.Port,
-				Protocol:  r.Protocol,
-				Action:    r.Action,
-			})
-		}
-	}
-
-	// Append default-deny rule as the last rule to drop all unmatched traffic.
-	rules = append(rules, FirewallRule{
+	// Append the default-deny rule as the last rule to drop all unmatched
+	// traffic (deny-by-default posture).
+	fwRules = append(fwRules, FirewallRule{
 		Interface: iface,
 		SrcIP:     "0.0.0.0/0",
 		DstIP:     "0.0.0.0/0",
@@ -133,30 +122,26 @@ func (e *PolicyEngine) BuildFirewallRules(policies []api.Policy, localNodeID str
 	})
 
 	e.logger.Debug("built firewall rules",
-		"count", len(rules),
-		"local_node", localNodeID,
+		"count", len(fwRules),
 		"interface", iface,
 	)
-	return rules
+	return fwRules, nil
 }
 
-// isValidProtocol returns true if the protocol is one of the supported values.
-func isValidProtocol(proto string) bool {
-	return proto == "" || proto == "tcp" || proto == "udp"
-}
-
-// resolveIP returns the mesh IP for a peer ID, or "0.0.0.0/0" for the wildcard "*".
-func (e *PolicyEngine) resolveIP(id string, peersByID map[string]string) string {
-	if id == "*" {
-		return "0.0.0.0/0"
+// validateCIDR checks that a policy rule address is a parseable IPv4 prefix.
+// The zero value is rejected explicitly: the nftables backend reads an empty
+// address as "match any", so an omitted field would widen the rule instead of
+// narrowing it.
+func validateCIDR(cidr string) error {
+	if cidr == "" {
+		return fmt.Errorf("policy: firewall rule: address is empty")
 	}
-	return peersByID[id]
-}
-
-// resolveWildcard returns "0.0.0.0/0" for "*", otherwise the given fallback IP.
-func (e *PolicyEngine) resolveWildcard(id, fallback string) string {
-	if id == "*" {
-		return "0.0.0.0/0"
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return fmt.Errorf("policy: firewall rule: invalid address %q: %w", cidr, err)
 	}
-	return fallback
+	if !prefix.Addr().Is4() {
+		return fmt.Errorf("policy: firewall rule: non-IPv4 address %q", cidr)
+	}
+	return nil
 }

@@ -185,10 +185,78 @@ func TestBuildRuleExprsInvalidAction(t *testing.T) {
 }
 
 func TestBuildRuleExprsInvalidProtocol(t *testing.T) {
-	rule := FirewallRule{Protocol: "icmp", Action: "allow"}
+	rule := FirewallRule{Protocol: "sctp", Action: "allow"}
 	_, err := buildRuleExprs(rule)
 	if err == nil {
 		t.Fatal("expected error for unsupported protocol")
+	}
+}
+
+func TestBuildRuleExprsICMP(t *testing.T) {
+	rule := FirewallRule{DstIP: "10.0.0.1", Protocol: "icmp", Action: "allow"}
+	exprs, err := buildRuleExprs(rule)
+	if err != nil {
+		t.Fatalf("buildRuleExprs returned error for icmp: %v", err)
+	}
+	if len(exprs) == 0 {
+		t.Fatal("buildRuleExprs returned empty expressions for icmp")
+	}
+}
+
+func TestBuildRuleExprsPortRange(t *testing.T) {
+	rule := FirewallRule{
+		DstIP:    "10.0.0.1",
+		Port:     1000,
+		PortTo:   2000,
+		Protocol: "tcp",
+		Action:   "allow",
+	}
+
+	exprs, err := buildRuleExprs(rule)
+	if err != nil {
+		t.Fatalf("buildRuleExprs returned error: %v", err)
+	}
+
+	// A range emits exactly one Gte and one Lte comparison on the dport payload.
+	var gte, lte *expr.Cmp
+	for _, e := range exprs {
+		cmp, ok := e.(*expr.Cmp)
+		if !ok {
+			continue
+		}
+		switch cmp.Op {
+		case expr.CmpOpGte:
+			gte = cmp
+		case expr.CmpOpLte:
+			lte = cmp
+		}
+	}
+	if gte == nil || lte == nil {
+		t.Fatalf("expected both CmpOpGte and CmpOpLte for a port range, got gte=%v lte=%v", gte, lte)
+	}
+	wantLo := portBytes(1000)
+	if len(gte.Data) != 2 || gte.Data[0] != wantLo[0] || gte.Data[1] != wantLo[1] {
+		t.Errorf("Gte data = %v, want %v (port 1000)", gte.Data, wantLo)
+	}
+	wantHi := portBytes(2000)
+	if len(lte.Data) != 2 || lte.Data[0] != wantHi[0] || lte.Data[1] != wantHi[1] {
+		t.Errorf("Lte data = %v, want %v (port 2000)", lte.Data, wantHi)
+	}
+}
+
+func TestBuildRuleExprsSinglePortUsesEq(t *testing.T) {
+	rule := FirewallRule{DstIP: "10.0.0.1", Port: 443, Protocol: "tcp", Action: "allow"}
+	exprs, err := buildRuleExprs(rule)
+	if err != nil {
+		t.Fatalf("buildRuleExprs returned error: %v", err)
+	}
+	// A single port must not emit range comparisons.
+	for _, e := range exprs {
+		if cmp, ok := e.(*expr.Cmp); ok {
+			if cmp.Op == expr.CmpOpGte || cmp.Op == expr.CmpOpLte {
+				t.Errorf("single-port rule emitted a range comparison Op=%v", cmp.Op)
+			}
+		}
 	}
 }
 
@@ -341,7 +409,8 @@ func TestProtocolNumber(t *testing.T) {
 	}{
 		{"tcp", 6, false},
 		{"udp", 17, false},
-		{"icmp", 0, true},
+		{"icmp", 1, false},
+		{"sctp", 0, true},
 		{"", 0, true},
 	}
 
