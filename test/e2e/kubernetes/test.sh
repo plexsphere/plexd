@@ -2,7 +2,7 @@
 # Kubernetes E2E test orchestration script.
 # Uses kind to create a local cluster, deploys the mock-api and plexd as a
 # DaemonSet, then polls the mock-api assertion endpoint to verify plexd
-# performed registration, heartbeat, state, capabilities, drift, metrics, logs, and audit calls.
+# performed registration, heartbeat, state, capabilities, metrics, logs, and audit calls.
 #
 # Extended tests:
 #   - Request body validation (registration token, heartbeat node_id, capabilities)
@@ -33,7 +33,7 @@ get_counter() {
 }
 
 # Counter JSON keys (shared across extraction, checking, and reporting).
-COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count drift_count metrics_count logs_count audit_count)
+COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count metrics_count logs_count audit_count)
 
 # Extract all counter values from a JSON response into COUNTER_VALUES.
 extract_counters() {

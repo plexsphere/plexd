@@ -34,7 +34,7 @@ get_counter() {
 }
 
 # Counter JSON keys (shared across extraction, checking, and reporting).
-COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count drift_count metrics_count logs_count audit_count)
+COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count metrics_count logs_count audit_count)
 
 # Extract all counter values from a JSON response into COUNTER_VALUES.
 extract_counters() {

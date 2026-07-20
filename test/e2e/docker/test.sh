@@ -2,7 +2,7 @@
 # Docker E2E test orchestration script.
 # Builds and runs the mock-api and plexd containers via docker compose,
 # then polls the mock-api assertion endpoint to verify plexd performed
-# registration, heartbeat, state, capabilities, drift, metrics, logs, and audit calls.
+# registration, heartbeat, state, capabilities, metrics, logs, and audit calls.
 #
 # Extended tests:
 #   - Periodic loop verification (counters >= 2 after additional wait)
@@ -31,7 +31,7 @@ get_counter() {
 }
 
 # Counter JSON keys (shared across extraction, checking, and reporting).
-COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count drift_count metrics_count logs_count audit_count)
+COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count metrics_count logs_count audit_count)
 
 # Extract all counter values from a JSON response into COUNTER_VALUES.
 extract_counters() {
@@ -309,17 +309,6 @@ if [ "${METRICS_LEN}" -lt 1 ]; then
     fail "metrics body is empty (want >= 1 data point)"
 fi
 echo "  PASS: metrics body contains ${METRICS_LEN} data points"
-
-# 3e. Drift report body must contain timestamp.
-DRIFT_BODY=$(curl -sf "http://localhost:18080/test/last-request/drift" 2>/dev/null || true)
-if [ -z "${DRIFT_BODY}" ]; then
-    fail "no captured drift request body"
-fi
-DRIFT_TS=$(echo "${DRIFT_BODY}" | jq -r '.timestamp // empty')
-if [ -z "${DRIFT_TS}" ]; then
-    fail "drift body missing 'timestamp' field"
-fi
-echo "  PASS: drift body contains timestamp"
 
 echo "=== Phase 3 PASSED: request body validation ==="
 
@@ -1299,19 +1288,7 @@ if [ -n "${CAPS_BODY}" ]; then
     fi
 fi
 
-# 10d. Drift body: validate corrections array exists.
-DRIFT_BODY=$(curl -sf "http://localhost:18080/test/last-request/drift" 2>/dev/null || true)
-if [ -n "${DRIFT_BODY}" ]; then
-    HAS_CORRECTIONS=$(echo "${DRIFT_BODY}" | jq 'has("corrections")')
-    if [ "${HAS_CORRECTIONS}" = "true" ]; then
-        CORR_LEN=$(echo "${DRIFT_BODY}" | jq '.corrections | length')
-        echo "  PASS: drift body has corrections array (length=${CORR_LEN})"
-    else
-        fail "drift body missing 'corrections' field"
-    fi
-fi
-
-# 10e. Heartbeat body richness: re-validate the four v1 heartbeat fields on the
+# 10d. Heartbeat body richness: re-validate the four v1 heartbeat fields on the
 # latest captured heartbeat, confirming the contract holds across the run.
 HB_BODY=$(curl -sf "http://localhost:18080/test/last-request/heartbeat" 2>/dev/null || true)
 if [ -n "${HB_BODY}" ]; then
@@ -1370,7 +1347,9 @@ while [ "${NAPI_ELAPSED}" -lt "${NAPI_TIMEOUT}" ]; do
 done
 
 if [ "${NAPI_ELAPSED}" -ge "${NAPI_TIMEOUT}" ]; then
-    echo "  WARN: node API not available within ${NAPI_TIMEOUT}s, skipping Phase 12"
+    # Skipping here would step straight to "Phase 12 PASSED" with none of the
+    # assertions below executed. An unreachable node API is itself a regression.
+    fail "node API not available within ${NAPI_TIMEOUT}s"
 else
     # 12a. GET /v1/state -- returns JSON with metadata and node_id.
     STATE_RESP=$(curl -sf "${NAPI_AUTH[@]}" "${NODE_API_URL}/v1/state" 2>/dev/null || true)
@@ -1401,12 +1380,22 @@ else
         fail "GET /v1/actions returned invalid response"
     fi
 
-    # 12c. GET /v1/peers -- returns peer list (may be empty in e2e).
-    PEERS_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "${NAPI_AUTH[@]}" "${NODE_API_URL}/v1/peers" 2>/dev/null || true)
-    if [ "${PEERS_STATUS}" = "200" ]; then
-        echo "  PASS: GET /v1/peers returns 200"
+    # 12c. GET /v1/peers -- lists both fixture peers by node ID (json field "id").
+    # The reconcile snapshot handler mirrors the served fixture's SnapshotPeer
+    # node_ids into the node API peer list, so both must be present by now.
+    PEERS_RESP=$(curl -sf "${NAPI_AUTH[@]}" "${NODE_API_URL}/v1/peers" 2>/dev/null || true)
+    if [ -n "${PEERS_RESP}" ] && echo "${PEERS_RESP}" | jq empty 2>/dev/null; then
+        echo "  PASS: GET /v1/peers returns valid JSON"
+        for peer_id in "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1" "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2"; do
+            HAS_PEER=$(echo "${PEERS_RESP}" | jq --arg id "${peer_id}" '[.[] | select(.id == $id)] | length')
+            if [ "${HAS_PEER}" -ge 1 ]; then
+                echo "  PASS: /v1/peers lists peer id='${peer_id}'"
+            else
+                fail "/v1/peers missing peer id='${peer_id}' (response: ${PEERS_RESP})"
+            fi
+        done
     else
-        echo "  WARN: GET /v1/peers returned status ${PEERS_STATUS}"
+        fail "GET /v1/peers returned invalid response"
     fi
 
     # 12d. GET /v1/policies -- returns policy list.
@@ -1447,122 +1436,224 @@ fi
 echo "=== Phase 12 PASSED: Node API verification ==="
 
 # ===================================================================
-# Phase 13: State mutation triggers drift detection (GAP-10)
+# Phase 13: Converge cycle (full envelope mutation)
 # ===================================================================
-echo "=== Testing state mutation drift detection ==="
+# POST a mutated NodeStateSnapshot whose policy fingerprint differs from the
+# served fixture, then assert the agent converges: state_count advances and the
+# differ reports policy drift, so the policy handler runs. The fingerprint is
+# opaque to plexd, so a fresh constant forces PolicyChanged.
+#
+# This gates on the reconciler's own drift summary, NOT on "policy ruleset
+# applied". This container's kernel exposes no nftables backend, so no rule can
+# reach the kernel here and the handler no longer claims an apply it did not
+# perform — the drift summary is the signal that actually holds. Proving rule
+# installation needs an environment with a working nftables backend.
+POLICY_DRIFT_RE='reconciliation cycle completed.*drift=("[^"]*policy|policy)'
+# grep -c exits 1 when it finds nothing, so tolerate that with '|| true'.
+policy_drift_count() { dc logs plexd 2>&1 | grep -cE "${POLICY_DRIFT_RE}" || true; }
 
-# Record current drift_count and state_count.
+echo "=== Testing converge cycle (full envelope mutation) ==="
+
+# Record state_count and the current policy-drift cycle count.
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
-DRIFT_BEFORE_MUT=$(get_counter "${RESPONSE}" "drift_count")
-STATE_BEFORE_MUT=$(get_counter "${RESPONSE}" "state_count")
-echo "  drift_count before: ${DRIFT_BEFORE_MUT}"
-echo "  state_count before: ${STATE_BEFORE_MUT}"
+STATE_BEFORE_CONV=$(get_counter "${RESPONSE}" "state_count")
+PDRIFT_BEFORE_CONV=$(policy_drift_count)
+echo "  state_count before: ${STATE_BEFORE_CONV}"
+echo "  policy-drift cycle count before: ${PDRIFT_BEFORE_CONV}"
 
-# Modify the state fixture with added metadata.
-MUTATED_STATE=$(cat <<'MUTEOF'
+# Mutated NodeStateSnapshot envelope (contract shape). ports is an object
+# {from,to}; peers carry no psk/allowed_ips/endpoint. The 44-char base64
+# fingerprint is an arbitrary constant, deliberately different from the mock's
+# computed fixture fingerprint, so the differ reports PolicyChanged.
+CONVERGE_STATE=$(cat <<'CONVEOF'
 {
-    "peers": [
-        {
-            "id": "peer-001",
-            "public_key": "wg-pub-key-peer-001",
-            "mesh_ip": "10.99.0.2",
-            "endpoint": "203.0.113.1:51820",
-            "allowed_ips": ["10.99.0.2/32"],
-            "psk": "mock-psk-001"
-        },
-        {
-            "id": "peer-002",
-            "public_key": "wg-pub-key-peer-002",
-            "mesh_ip": "10.99.0.3",
-            "endpoint": "203.0.113.2:51820",
-            "allowed_ips": ["10.99.0.3/32"],
-            "psk": "mock-psk-002"
-        }
-    ],
-    "metadata": {
-        "test_key": "test_value_drift",
-        "environment": "e2e-mutated"
-    },
-    "policies": [
-        {
-            "id": "policy-001",
-            "rules": [
-                {
-                    "action": "allow",
-                    "protocol": "tcp",
-                    "ports": ["443", "8080"],
-                    "sources": ["10.99.0.0/24"]
-                }
-            ]
-        }
+  "peers": [
+    {"node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "mesh_ip": "10.99.0.2", "public_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=", "fallback_endpoint": "203.0.113.1:51820"},
+    {"node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "mesh_ip": "10.99.0.3", "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}
+  ],
+  "reachability": {"state": "healthy", "changed_at": "2026-01-01T00:00:00Z"},
+  "policy": {
+    "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2",
+    "fingerprint": "ZTJlLW11dGF0ZWQtZmluZ2VycHJpbnQtY29uc3RhbnQx",
+    "rules": [
+      {"action": "allow", "protocol": "tcp", "source_cidr": "10.99.0.0/24", "destination_cidr": "0.0.0.0/0", "ports": {"from": 443, "to": 8080}}
     ]
+  },
+  "bridge": null,
+  "state": {
+    "metadata": [{"key": "environment", "value": "e2e-mutated"}, {"key": "test_key", "value": "test_value_converge"}],
+    "data": [],
+    "reports": []
+  },
+  "reports": {
+    "metadata": [{"key": "environment", "value": "e2e-mutated"}, {"key": "test_key", "value": "test_value_converge"}],
+    "data": [],
+    "reports": []
+  }
 }
-MUTEOF
+CONVEOF
 )
-MUT_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+CONV_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
     -X POST -H "Content-Type: application/json" \
-    -d "${MUTATED_STATE}" \
+    -d "${CONVERGE_STATE}" \
     "http://localhost:18080/test/configure-state" 2>/dev/null || true)
-if [ "${MUT_STATUS}" != "204" ]; then
-    fail "configure-state returned status ${MUT_STATUS}, want 204"
+if [ "${CONV_STATUS}" != "204" ]; then
+    fail "configure-state returned status ${CONV_STATUS}, want 204"
 fi
-echo "  state fixture updated with mutated metadata"
+echo "  mutated NodeStateSnapshot posted to configure-state"
 
-# Trigger a reconcile via heartbeat to speed up detection.
+# Trigger a reconcile via the heartbeat response.
 curl -sf -X POST -H "Content-Type: application/json" \
     -d '{"reconcile":true,"rotate_keys":false}' \
     "http://localhost:18080/test/configure-heartbeat" >/dev/null 2>&1 || true
 
-# Wait for state_count and drift_count to increase.
-MUT_TIMEOUT=60
-MUT_ELAPSED=0
-MUT_STATE_PASSED=0
-MUT_DRIFT_PASSED=0
-while [ "${MUT_ELAPSED}" -lt "${MUT_TIMEOUT}" ]; do
+# Poll until state_count advances AND a cycle reported policy drift. Both are hard.
+CONV_TIMEOUT=60
+CONV_ELAPSED=0
+CONV_STATE_PASSED=0
+CONV_PDRIFT_PASSED=0
+PDRIFT_AFTER_CONV=${PDRIFT_BEFORE_CONV}
+while [ "${CONV_ELAPSED}" -lt "${CONV_TIMEOUT}" ]; do
     sleep 3
-    MUT_ELAPSED=$((MUT_ELAPSED + 3))
+    CONV_ELAPSED=$((CONV_ELAPSED + 3))
     RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
     if [ -n "${RESPONSE}" ]; then
-        STATE_AFTER_MUT=$(get_counter "${RESPONSE}" "state_count")
-        DRIFT_AFTER_MUT=$(get_counter "${RESPONSE}" "drift_count")
-        if [ "${STATE_AFTER_MUT}" -gt "${STATE_BEFORE_MUT}" ] && [ "${MUT_STATE_PASSED}" -eq 0 ]; then
-            echo "  PASS: state_count increased from ${STATE_BEFORE_MUT} to ${STATE_AFTER_MUT}"
-            MUT_STATE_PASSED=1
+        STATE_AFTER_CONV=$(get_counter "${RESPONSE}" "state_count")
+        if [ "${STATE_AFTER_CONV}" -gt "${STATE_BEFORE_CONV}" ] && [ "${CONV_STATE_PASSED}" -eq 0 ]; then
+            echo "  PASS: state_count increased from ${STATE_BEFORE_CONV} to ${STATE_AFTER_CONV}"
+            CONV_STATE_PASSED=1
         fi
-        if [ "${DRIFT_AFTER_MUT}" -gt "${DRIFT_BEFORE_MUT}" ] && [ "${MUT_DRIFT_PASSED}" -eq 0 ]; then
-            echo "  PASS: drift_count increased from ${DRIFT_BEFORE_MUT} to ${DRIFT_AFTER_MUT}"
-            MUT_DRIFT_PASSED=1
-        fi
-        if [ "${MUT_STATE_PASSED}" -eq 1 ] && [ "${MUT_DRIFT_PASSED}" -eq 1 ]; then
+    fi
+    PDRIFT_AFTER_CONV=$(policy_drift_count)
+    if [ "${PDRIFT_AFTER_CONV}" -gt "${PDRIFT_BEFORE_CONV}" ] && [ "${CONV_PDRIFT_PASSED}" -eq 0 ]; then
+        echo "  PASS: policy-drift cycle count increased from ${PDRIFT_BEFORE_CONV} to ${PDRIFT_AFTER_CONV}"
+        CONV_PDRIFT_PASSED=1
+    fi
+    if [ "${CONV_STATE_PASSED}" -eq 1 ] && [ "${CONV_PDRIFT_PASSED}" -eq 1 ]; then
+        break
+    fi
+done
+
+if [ "${CONV_STATE_PASSED}" -eq 0 ]; then
+    STATE_AFTER_CONV=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    fail "state_count did not increase after converge mutation (before=${STATE_BEFORE_CONV}, after=${STATE_AFTER_CONV})"
+fi
+if [ "${CONV_PDRIFT_PASSED}" -eq 0 ]; then
+    fail "policy-drift cycle count did not increase after fingerprint change (before=${PDRIFT_BEFORE_CONV}, after=${PDRIFT_AFTER_CONV}); the differ did not report PolicyChanged"
+fi
+
+echo "=== Phase 13 PASSED: converge cycle ==="
+
+# ===================================================================
+# Phase 13a: policy fingerprint no-op cycle
+# ===================================================================
+# Re-POST the same envelope with only revision_id bumped and a metadata value
+# changed; the policy fingerprint is unchanged. The differ must short-circuit
+# (PolicyChanged stays false), so no cycle reports policy drift even though the
+# state advances and the revision bumps.
+echo "=== Testing policy fingerprint no-op cycle ==="
+
+# Baseline the policy-drift count from the END of the converge phase.
+PDRIFT_BEFORE_NOOP=${PDRIFT_AFTER_CONV}
+echo "  policy-drift cycle count before: ${PDRIFT_BEFORE_NOOP}"
+
+# Same envelope, but revision_id bumped (...a0c3) and the test_key metadata value
+# changed in BOTH state and reports. The fingerprint stays EXACTLY the same.
+NOOP_STATE=$(cat <<'NOOPEOF'
+{
+  "peers": [
+    {"node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", "mesh_ip": "10.99.0.2", "public_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=", "fallback_endpoint": "203.0.113.1:51820"},
+    {"node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2", "mesh_ip": "10.99.0.3", "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}
+  ],
+  "reachability": {"state": "healthy", "changed_at": "2026-01-01T00:00:00Z"},
+  "policy": {
+    "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c3",
+    "fingerprint": "ZTJlLW11dGF0ZWQtZmluZ2VycHJpbnQtY29uc3RhbnQx",
+    "rules": [
+      {"action": "allow", "protocol": "tcp", "source_cidr": "10.99.0.0/24", "destination_cidr": "0.0.0.0/0", "ports": {"from": 443, "to": 8080}}
+    ]
+  },
+  "bridge": null,
+  "state": {
+    "metadata": [{"key": "environment", "value": "e2e-mutated"}, {"key": "test_key", "value": "test_value_noop"}],
+    "data": [],
+    "reports": []
+  },
+  "reports": {
+    "metadata": [{"key": "environment", "value": "e2e-mutated"}, {"key": "test_key", "value": "test_value_noop"}],
+    "data": [],
+    "reports": []
+  }
+}
+NOOPEOF
+)
+NOOP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${NOOP_STATE}" \
+    "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+if [ "${NOOP_STATUS}" != "204" ]; then
+    fail "configure-state returned status ${NOOP_STATUS}, want 204"
+fi
+echo "  revision-only mutated NodeStateSnapshot posted to configure-state"
+
+# Baseline state_count AFTER the POST: a reconcile landing between the read and
+# the POST would otherwise satisfy the gate below while having fetched the old
+# converge envelope. Both reads are guarded — get_counter emits nothing when the
+# assert endpoint is unreachable, and an empty operand would make the gate pass
+# vacuously.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+[ -n "${RESPONSE}" ] || fail "assert endpoint unreachable while baselining Phase 13a"
+STATE_BEFORE_NOOP=$(get_counter "${RESPONSE}" "state_count")
+[ -n "${STATE_BEFORE_NOOP}" ] || fail "state_count missing from assert response"
+echo "  state_count before: ${STATE_BEFORE_NOOP}"
+
+# Trigger a reconcile via the heartbeat response.
+curl -sf -X POST -H "Content-Type: application/json" \
+    -d '{"reconcile":true,"rotate_keys":false}' \
+    "http://localhost:18080/test/configure-heartbeat" >/dev/null 2>&1 || true
+
+# Poll until state_count advances by at least 1, proving the no-op envelope was
+# picked up by a reconcile.
+NOOP_TIMEOUT=60
+NOOP_ELAPSED=0
+NOOP_STATE_PASSED=0
+while [ "${NOOP_ELAPSED}" -lt "${NOOP_TIMEOUT}" ]; do
+    sleep 3
+    NOOP_ELAPSED=$((NOOP_ELAPSED + 3))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        STATE_AFTER_NOOP=$(get_counter "${RESPONSE}" "state_count")
+        if [ "${STATE_AFTER_NOOP}" -gt "${STATE_BEFORE_NOOP}" ]; then
+            echo "  PASS: state_count increased from ${STATE_BEFORE_NOOP} to ${STATE_AFTER_NOOP}"
+            NOOP_STATE_PASSED=1
             break
         fi
     fi
 done
 
-if [ "${MUT_STATE_PASSED}" -eq 0 ]; then
-    STATE_AFTER_MUT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
-    echo "  WARN: state_count did not increase after mutation (before=${STATE_BEFORE_MUT}, after=${STATE_AFTER_MUT})"
-fi
-if [ "${MUT_DRIFT_PASSED}" -eq 0 ]; then
-    DRIFT_AFTER_MUT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "drift_count")
-    echo "  WARN: drift_count did not increase after mutation (before=${DRIFT_BEFORE_MUT}, after=${DRIFT_AFTER_MUT})"
+if [ "${NOOP_STATE_PASSED}" -eq 0 ]; then
+    STATE_AFTER_NOOP=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    fail "state_count did not increase after revision-only mutation (before=${STATE_BEFORE_NOOP}, after=${STATE_AFTER_NOOP})"
 fi
 
-# Validate the drift report body contains updated corrections if drift was reported.
-if [ "${MUT_DRIFT_PASSED}" -eq 1 ]; then
-    DRIFT_MUT_BODY=$(curl -sf "http://localhost:18080/test/last-request/drift" 2>/dev/null || true)
-    if [ -n "${DRIFT_MUT_BODY}" ]; then
-        HAS_CORRECTIONS=$(echo "${DRIFT_MUT_BODY}" | jq 'has("corrections")')
-        if [ "${HAS_CORRECTIONS}" = "true" ]; then
-            CORR_LEN=$(echo "${DRIFT_MUT_BODY}" | jq '.corrections | length')
-            echo "  PASS: drift report has corrections array (length=${CORR_LEN})"
-        else
-            echo "  WARN: drift body missing 'corrections' after state mutation"
-        fi
-    fi
+# The cycle that consumed the no-op envelope has already run (state_count moved).
+# Give its "reconciliation cycle completed" line a moment to reach the log — this
+# is a flush allowance, NOT a reconcile interval, which is 60s here.
+sleep 3
+PDRIFT_AFTER_NOOP=$(policy_drift_count)
+if [ "${PDRIFT_AFTER_NOOP}" -eq "${PDRIFT_BEFORE_NOOP}" ]; then
+    echo "  PASS: policy-drift cycle count unchanged at ${PDRIFT_AFTER_NOOP} (fingerprint short-circuit held)"
+else
+    # A failing handler holds the snapshot back, so the previous cycle's diff --
+    # PolicyChanged included -- recurs verbatim. The drift lines carry
+    # handler_failed, which tells the two causes apart; print them rather than
+    # blaming the differ for a failure this assertion cannot attribute.
+    echo "  policy-drift cycles observed:"
+    dc logs plexd 2>&1 | grep -E "${POLICY_DRIFT_RE}" | tail -5
+    fail "policy-drift cycle count changed from ${PDRIFT_BEFORE_NOOP} to ${PDRIFT_AFTER_NOOP}; either the revision-only bump reported PolicyChanged or a failing handler replayed the converge diff (see handler_failed above)"
 fi
 
-echo "=== Phase 13 PASSED: state mutation drift detection ==="
+echo "=== Phase 13a PASSED: policy fingerprint no-op cycle ==="
 
 # ===================================================================
 # Phase 13b: stale_after-driven endpoint re-report cadence
