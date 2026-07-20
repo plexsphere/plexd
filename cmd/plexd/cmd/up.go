@@ -128,11 +128,14 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// 5a. Initialize WireGuard subsystem.
 	wgCtrl := newWGController(logger)
 	wgMgr := wireguard.NewManager(wgCtrl, cfg.WireGuard, logger)
+	wgReady := false
 	if wgCtrl != nil {
 		if err := wgMgr.Setup(ctx, identity); err != nil {
 			logger.Warn("wireguard setup failed, continuing without WireGuard",
 				"error", err,
 			)
+		} else {
+			wgReady = true
 		}
 	}
 
@@ -443,8 +446,14 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// Register nodeapi reconcile handler so cache updates on drift.
 	reconciler.RegisterHandler(nodeAPISrv.ReconcileHandler())
 
-	// Register WireGuard reconcile handler.
-	reconciler.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
+	// Register the WireGuard reconcile handler only when the interface came up.
+	// A handler that fails every cycle would hold back the reconciler snapshot,
+	// so the fingerprint short-circuit could never converge on such hosts.
+	if wgReady {
+		reconciler.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
+	} else {
+		logger.Warn("wireguard unavailable, skipping peer reconcile handler")
+	}
 
 	// Register policy reconcile handler.
 	reconciler.RegisterHandler(policy.ReconcileHandler(enforcer, cfg.WireGuard.InterfaceName))
