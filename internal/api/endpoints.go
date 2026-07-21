@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -197,25 +198,90 @@ func (c *ControlPlane) checkUploadScheme(uploadURL string) error {
 	return fmt.Errorf("api: output upload url scheme %q is weaker than the control plane's", parsed.Scheme)
 }
 
-// ReportMetrics sends a batch of metrics to the control plane.
+// ReportMetrics posts a batch of metric samples to the platform ingest
+// endpoint as a JSON array and returns the 202 ingest receipt.
 // POST /v1/nodes/{node_id}/metrics
-func (c *ControlPlane) ReportMetrics(ctx context.Context, nodeID string, batch MetricBatch) error {
+func (c *ControlPlane) ReportMetrics(ctx context.Context, nodeID string, samples []MetricSample) (*IngestReceipt, error) {
+	raw, err := json.Marshal(samples)
+	if err != nil {
+		return nil, fmt.Errorf("api: marshal metric samples: %w", err)
+	}
 	path := fmt.Sprintf("/v1/nodes/%s/metrics", url.PathEscape(nodeID))
-	return c.doRequest(ctx, http.MethodPost, path, batch, nil)
+	var resp IngestReceipt
+	if err := c.doIngest(ctx, path, "application/json", raw, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
-// ReportLogs sends a batch of logs to the control plane.
+// ReportLogs posts a batch of log lines to the platform ingest endpoint as
+// NDJSON (one JSON object per line) and returns the 202 ingest receipt.
 // POST /v1/nodes/{node_id}/logs
-func (c *ControlPlane) ReportLogs(ctx context.Context, nodeID string, batch LogBatch) error {
+func (c *ControlPlane) ReportLogs(ctx context.Context, nodeID string, lines []LogLine) (*IngestReceipt, error) {
+	raw, err := marshalNDJSON(lines)
+	if err != nil {
+		return nil, fmt.Errorf("api: marshal log lines: %w", err)
+	}
 	path := fmt.Sprintf("/v1/nodes/%s/logs", url.PathEscape(nodeID))
-	return c.doRequest(ctx, http.MethodPost, path, batch, nil)
+	var resp IngestReceipt
+	if err := c.doIngest(ctx, path, "application/x-ndjson", raw, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
-// ReportAudit sends a batch of audit events to the control plane.
+// ReportAudit posts a batch of audit events to the platform ingest endpoint as
+// NDJSON (one JSON object per line) and returns the 202 ingest receipt.
 // POST /v1/nodes/{node_id}/audit
-func (c *ControlPlane) ReportAudit(ctx context.Context, nodeID string, batch AuditBatch) error {
+func (c *ControlPlane) ReportAudit(ctx context.Context, nodeID string, events []AuditEvent) (*IngestReceipt, error) {
+	raw, err := marshalNDJSON(events)
+	if err != nil {
+		return nil, fmt.Errorf("api: marshal audit events: %w", err)
+	}
 	path := fmt.Sprintf("/v1/nodes/%s/audit", url.PathEscape(nodeID))
-	return c.doRequest(ctx, http.MethodPost, path, batch, nil)
+	var resp IngestReceipt
+	if err := c.doIngest(ctx, path, "application/x-ndjson", raw, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// marshalNDJSON serializes items as newline-delimited JSON: each element is
+// json.Marshal'ed and the encodings are joined with "\n" (no trailing newline).
+func marshalNDJSON[T any](items []T) ([]byte, error) {
+	var buf bytes.Buffer
+	for i, item := range items {
+		if i > 0 {
+			buf.WriteByte('\n')
+		}
+		line, err := json.Marshal(item)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(line)
+	}
+	return buf.Bytes(), nil
+}
+
+// PutStateReport publishes a single per-key node state report and returns the
+// server's acknowledgement.
+// PUT /v1/nodes/{node_id}/state/reports/{key}
+func (c *ControlPlane) PutStateReport(ctx context.Context, nodeID, key string, req NodeStateReportRequest) (*NodeStateReportResponse, error) {
+	var resp NodeStateReportResponse
+	path := fmt.Sprintf("/v1/nodes/%s/state/reports/%s", url.PathEscape(nodeID), url.PathEscape(key))
+	if err := c.doRequest(ctx, http.MethodPut, path, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// DeleteStateReport removes a single per-key node state report. A 204 No
+// Content returns nil; a 404 report_not_found (and any other non-2xx status)
+// surfaces as an *APIError through errorFromResponse.
+// DELETE /v1/nodes/{node_id}/state/reports/{key}
+func (c *ControlPlane) DeleteStateReport(ctx context.Context, nodeID, key string) error {
+	path := fmt.Sprintf("/v1/nodes/%s/state/reports/%s", url.PathEscape(nodeID), url.PathEscape(key))
+	return c.doRequest(ctx, http.MethodDelete, path, nil, nil)
 }
 
 // FetchArtifact downloads a plexd binary artifact.

@@ -1,9 +1,12 @@
 package api
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -492,7 +495,25 @@ func TestSyncReports_Success(t *testing.T) {
 	}
 }
 
+// gunzip decompresses gzip-encoded bytes, failing the test on error.
+func gunzip(t *testing.T, data []byte) []byte {
+	t.Helper()
+	gr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer gr.Close()
+	out, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("gunzip: %v", err)
+	}
+	return out
+}
+
 func TestReportMetrics_Success(t *testing.T) {
+	acceptedAt := time.Now().UTC().Truncate(time.Second)
+	var gotContentType, gotEncoding, gotSentAt string
+	var gotBody []byte
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method = %s, want POST", r.Method)
@@ -500,18 +521,136 @@ func TestReportMetrics_Success(t *testing.T) {
 		if r.URL.Path != "/v1/nodes/n1/metrics" {
 			t.Errorf("path = %s, want /v1/nodes/n1/metrics", r.URL.Path)
 		}
+		gotContentType = r.Header.Get("Content-Type")
+		gotEncoding = r.Header.Get("Content-Encoding")
+		gotSentAt = r.Header.Get("X-Plexsphere-Sent-At")
+		gotBody, _ = io.ReadAll(r.Body)
+
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(IngestReceipt{AcceptedAt: acceptedAt, Records: 1})
 	})
 
-	err := client.ReportMetrics(context.Background(), "n1", MetricBatch{
-		{Timestamp: time.Now(), Group: "cpu", Data: json.RawMessage(`{"usage":0.42}`)},
-	})
+	samples := []MetricSample{
+		{Group: MetricGroupNodeResources, Name: "cpu_percent", Value: 0.42, Timestamp: time.Now().UTC()},
+	}
+	receipt, err := client.ReportMetrics(context.Background(), "n1", samples)
 	if err != nil {
 		t.Fatalf("ReportMetrics: %v", err)
+	}
+	if receipt.Records != 1 {
+		t.Errorf("Records = %d, want 1", receipt.Records)
+	}
+	if !receipt.AcceptedAt.Equal(acceptedAt) {
+		t.Errorf("AcceptedAt = %v, want %v", receipt.AcceptedAt, acceptedAt)
+	}
+	if gotContentType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", gotContentType)
+	}
+	// A small body travels uncompressed.
+	if gotEncoding != "" {
+		t.Errorf("Content-Encoding = %q, want empty for a small body", gotEncoding)
+	}
+	if _, err := time.Parse(time.RFC3339, gotSentAt); err != nil {
+		t.Errorf("X-Plexsphere-Sent-At = %q, not RFC 3339: %v", gotSentAt, err)
+	}
+	// The body is the JSON array of samples.
+	want, _ := json.Marshal(samples)
+	if string(gotBody) != string(want) {
+		t.Errorf("body = %q, want %q", gotBody, want)
+	}
+}
+
+func TestReportMetrics_CompressesLargeBody(t *testing.T) {
+	var gotEncoding string
+	var gotBody []byte
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotEncoding = r.Header.Get("Content-Encoding")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(IngestReceipt{AcceptedAt: time.Now().UTC(), Records: 100})
+	})
+
+	ts := time.Now().UTC()
+	samples := make([]MetricSample, 100)
+	for i := range samples {
+		samples[i] = MetricSample{
+			Group:     MetricGroupNodeResources,
+			Name:      fmt.Sprintf("metric_number_%d_with_a_reasonably_long_name", i),
+			Value:     float64(i),
+			Labels:    map[string]string{"index": fmt.Sprintf("%d", i)},
+			Timestamp: ts,
+		}
+	}
+	want, _ := json.Marshal(samples)
+	if len(want) <= gzipThreshold {
+		t.Fatalf("payload is %d bytes, need > %d to exercise gzip", len(want), gzipThreshold)
+	}
+
+	if _, err := client.ReportMetrics(context.Background(), "n1", samples); err != nil {
+		t.Fatalf("ReportMetrics: %v", err)
+	}
+	if gotEncoding != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", gotEncoding)
+	}
+	if got := gunzip(t, gotBody); !bytes.Equal(got, want) {
+		t.Errorf("gunzipped body does not match the original marshaled samples")
+	}
+}
+
+// TestReportMetrics_UndecodableReceiptAccepted verifies that a 202 whose receipt
+// does not decode is still an acceptance. The status already says the batch was
+// enqueued durably, so returning an error would make the reporter re-send
+// records the platform holds — and ingest carries no idempotency key for the
+// control plane to deduplicate them with. The receipt is left zero-valued, which
+// the reporters surface as a record-count mismatch.
+func TestReportMetrics_UndecodableReceiptAccepted(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, "this is not a receipt")
+	})
+
+	receipt, err := client.ReportMetrics(context.Background(), "n1", []MetricSample{
+		{Group: MetricGroupAgentStats, Name: "x", Value: 1, Timestamp: time.Now().UTC()},
+	})
+	if err != nil {
+		t.Fatalf("ReportMetrics() with an undecodable 202 receipt = %v, want nil", err)
+	}
+	if receipt.Records != 0 {
+		t.Errorf("receipt.Records = %d, want the zero value", receipt.Records)
+	}
+}
+
+func TestReportMetrics_MalformedBatchProblem(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"type":"about:blank","title":"Bad Request","status":400,"detail":"metric group is not in the accepted set","code":"ingest_batch_malformed"}`)
+	})
+
+	_, err := client.ReportMetrics(context.Background(), "n1", []MetricSample{
+		{Group: "bogus", Name: "x", Value: 1, Timestamp: time.Now().UTC()},
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("errors.As failed to extract *APIError: %v", err)
+	}
+	if apiErr.StatusCode != 400 {
+		t.Errorf("StatusCode = %d, want 400", apiErr.StatusCode)
+	}
+	if apiErr.Code != "ingest_batch_malformed" {
+		t.Errorf("Code = %q, want %q", apiErr.Code, "ingest_batch_malformed")
 	}
 }
 
 func TestReportLogs_Success(t *testing.T) {
+	var gotContentType, gotSentAt string
+	var gotBody []byte
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method = %s, want POST", r.Method)
@@ -519,18 +658,40 @@ func TestReportLogs_Success(t *testing.T) {
 		if r.URL.Path != "/v1/nodes/n1/logs" {
 			t.Errorf("path = %s, want /v1/nodes/n1/logs", r.URL.Path)
 		}
+		gotContentType = r.Header.Get("Content-Type")
+		gotSentAt = r.Header.Get("X-Plexsphere-Sent-At")
+		gotBody, _ = io.ReadAll(r.Body)
+
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(IngestReceipt{AcceptedAt: time.Now().UTC(), Records: 2})
 	})
 
-	err := client.ReportLogs(context.Background(), "n1", LogBatch{
-		{Timestamp: time.Now(), Source: "systemd", Unit: "plexd.service", Message: "started", Severity: "info"},
-	})
+	ts := time.Now().UTC()
+	lines := []LogLine{
+		{Severity: "info", Unit: "plexd.service", Message: "started", Timestamp: ts},
+		{Severity: "err", Message: "boom", Timestamp: ts},
+	}
+	receipt, err := client.ReportLogs(context.Background(), "n1", lines)
 	if err != nil {
 		t.Fatalf("ReportLogs: %v", err)
 	}
+	if receipt.Records != 2 {
+		t.Errorf("Records = %d, want 2", receipt.Records)
+	}
+	if gotContentType != "application/x-ndjson" {
+		t.Errorf("Content-Type = %q, want application/x-ndjson", gotContentType)
+	}
+	if _, err := time.Parse(time.RFC3339, gotSentAt); err != nil {
+		t.Errorf("X-Plexsphere-Sent-At = %q, not RFC 3339: %v", gotSentAt, err)
+	}
+	// The body is one JSON object per line joined by "\n".
+	assertNDJSONMessages(t, gotBody, []string{"started", "boom"})
 }
 
 func TestReportAudit_Success(t *testing.T) {
+	var gotContentType, gotSentAt string
+	var gotBody []byte
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method = %s, want POST", r.Method)
@@ -538,14 +699,158 @@ func TestReportAudit_Success(t *testing.T) {
 		if r.URL.Path != "/v1/nodes/n1/audit" {
 			t.Errorf("path = %s, want /v1/nodes/n1/audit", r.URL.Path)
 		}
+		gotContentType = r.Header.Get("Content-Type")
+		gotSentAt = r.Header.Get("X-Plexsphere-Sent-At")
+		gotBody, _ = io.ReadAll(r.Body)
+
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(IngestReceipt{AcceptedAt: time.Now().UTC(), Records: 2})
 	})
 
-	err := client.ReportAudit(context.Background(), "n1", AuditBatch{
-		{Timestamp: time.Now(), Source: "plexd", EventType: "config_change", Action: "update", Result: "success"},
-	})
+	ts := time.Now().UTC()
+	events := []AuditEvent{
+		{Source: "auditd", Action: "update", Outcome: "success", Timestamp: ts},
+		{Source: "k8s", Action: "delete", Outcome: "failure", Timestamp: ts},
+	}
+	receipt, err := client.ReportAudit(context.Background(), "n1", events)
 	if err != nil {
 		t.Fatalf("ReportAudit: %v", err)
+	}
+	if receipt.Records != 2 {
+		t.Errorf("Records = %d, want 2", receipt.Records)
+	}
+	if gotContentType != "application/x-ndjson" {
+		t.Errorf("Content-Type = %q, want application/x-ndjson", gotContentType)
+	}
+	if _, err := time.Parse(time.RFC3339, gotSentAt); err != nil {
+		t.Errorf("X-Plexsphere-Sent-At = %q, not RFC 3339: %v", gotSentAt, err)
+	}
+	// The body is one JSON object per line joined by "\n".
+	lines := strings.Split(string(gotBody), "\n")
+	if len(lines) != len(events) {
+		t.Fatalf("got %d NDJSON lines, want %d: %q", len(lines), len(events), gotBody)
+	}
+	for i, raw := range lines {
+		var got AuditEvent
+		if err := json.Unmarshal([]byte(raw), &got); err != nil {
+			t.Fatalf("line %d is not a JSON object: %v (%q)", i, err, raw)
+		}
+		if got.Action != events[i].Action {
+			t.Errorf("line %d Action = %q, want %q", i, got.Action, events[i].Action)
+		}
+	}
+}
+
+// assertNDJSONMessages checks that body is newline-delimited JSON LogLine
+// objects whose Message fields equal wantMessages in order.
+func assertNDJSONMessages(t *testing.T, body []byte, wantMessages []string) {
+	t.Helper()
+	lines := strings.Split(string(body), "\n")
+	if len(lines) != len(wantMessages) {
+		t.Fatalf("got %d NDJSON lines, want %d: %q", len(lines), len(wantMessages), body)
+	}
+	for i, raw := range lines {
+		var got LogLine
+		if err := json.Unmarshal([]byte(raw), &got); err != nil {
+			t.Fatalf("line %d is not a JSON object: %v (%q)", i, err, raw)
+		}
+		if got.Message != wantMessages[i] {
+			t.Errorf("line %d Message = %q, want %q", i, got.Message, wantMessages[i])
+		}
+	}
+}
+
+func TestPutStateReport_Success(t *testing.T) {
+	acceptedAt := time.Now().UTC().Truncate(time.Second)
+	var gotMethod, gotPath, gotRawPath string
+	var gotReq NodeStateReportRequest
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotRawPath = r.URL.RawPath
+		if err := json.NewDecoder(r.Body).Decode(&gotReq); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(NodeStateReportResponse{AcceptedAt: acceptedAt, Key: "app/health"})
+	})
+
+	resp, err := client.PutStateReport(context.Background(), "node/1", "app/health", NodeStateReportRequest{
+		Value:       "ok",
+		WorkloadTag: "web",
+	})
+	if err != nil {
+		t.Fatalf("PutStateReport: %v", err)
+	}
+	if gotMethod != http.MethodPut {
+		t.Errorf("method = %s, want PUT", gotMethod)
+	}
+	// The decoded path is the report route for this node and key.
+	if gotPath != "/v1/nodes/node/1/state/reports/app/health" {
+		t.Errorf("decoded path = %s, want /v1/nodes/node/1/state/reports/app/health", gotPath)
+	}
+	// The raw path proves both segments were percent-escaped on the wire.
+	if strings.Contains(gotRawPath, "node/1") || strings.Contains(gotRawPath, "app/health") {
+		t.Errorf("raw path %q contains unescaped segments", gotRawPath)
+	}
+	if !strings.Contains(gotRawPath, "node%2F1") || !strings.Contains(gotRawPath, "app%2Fhealth") {
+		t.Errorf("raw path %q does not contain escaped segments", gotRawPath)
+	}
+	if gotReq.Value != "ok" || gotReq.WorkloadTag != "web" {
+		t.Errorf("req = %+v, want value=ok workload_tag=web", gotReq)
+	}
+	if resp.Key != "app/health" {
+		t.Errorf("Key = %q, want %q", resp.Key, "app/health")
+	}
+	if !resp.AcceptedAt.Equal(acceptedAt) {
+		t.Errorf("AcceptedAt = %v, want %v", resp.AcceptedAt, acceptedAt)
+	}
+}
+
+func TestDeleteStateReport_Success(t *testing.T) {
+	var gotMethod, gotRawPath string
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotRawPath = r.URL.RawPath
+		if gotRawPath == "" {
+			gotRawPath = r.URL.Path
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	if err := client.DeleteStateReport(context.Background(), "node/1", "app/health"); err != nil {
+		t.Fatalf("DeleteStateReport: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Errorf("method = %s, want DELETE", gotMethod)
+	}
+	if strings.Contains(gotRawPath, "node/1") || strings.Contains(gotRawPath, "app/health") {
+		t.Errorf("raw path %q contains unescaped segments", gotRawPath)
+	}
+}
+
+func TestDeleteStateReport_NotFound(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"type":"about:blank","title":"Not Found","status":404,"detail":"no report exists for that key","code":"report_not_found"}`)
+	})
+
+	err := client.DeleteStateReport(context.Background(), "n1", "missing")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("errors.As failed to extract *APIError: %v", err)
+	}
+	if apiErr.StatusCode != 404 {
+		t.Errorf("StatusCode = %d, want 404", apiErr.StatusCode)
+	}
+	if apiErr.Code != "report_not_found" {
+		t.Errorf("Code = %q, want %q", apiErr.Code, "report_not_found")
 	}
 }
 
