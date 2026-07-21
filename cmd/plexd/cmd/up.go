@@ -270,10 +270,28 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// 7. Create reconciler.
 	reconciler := reconcile.NewReconciler(client, cfg.Reconcile, logger)
 
-	// Register rotate_keys SSE handler (triggers reconcile, same as heartbeat-driven rotation).
+	// Key rotator: completes rotate_keys signals against POST /v1/keys/rotate.
+	// The typed device variable keeps the interface a true nil when WireGuard is
+	// unavailable, so rotation still commits and reconciles without a device.
+	var device agent.DeviceKeyUpdater
+	if wgReady {
+		device = wgMgr
+	}
+	rotator := agent.NewKeyRotator(client, identity, cfg.DataDir, device, reconciler, logger)
+
+	// Register rotate_keys SSE handler (starts a single-flight key rotation;
+	// the rotator triggers the reconcile itself after the swap). Unlike the
+	// heartbeat flag, which repeats every interval and is rate-limited by the
+	// rotator's cooldown, the SSE event arrives once per rotation decision, so
+	// it rotates immediately via RotateNow. ctx is the runUp context so the
+	// rotation outlives this event handler returning.
 	sseMgr.RegisterHandler(api.EventRotateKeys, func(_ context.Context, _ api.SignedEnvelope) error {
-		logger.Info("rotate_keys received via SSE, triggering reconcile")
-		reconciler.TriggerReconcile()
+		logger.Info("rotate_keys received via SSE, starting key rotation")
+		go func() {
+			if err := rotator.RotateNow(ctx); err != nil {
+				logger.Error("key rotation failed", "error", err)
+			}
+		}()
 		return nil
 	})
 
@@ -329,8 +347,12 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		logger.Info("re-registration successful", "node_id", newIdentity.NodeID)
 	})
 	heartbeat.SetOnRotateKeys(func() {
-		logger.Info("heartbeat signaled key rotation, triggering reconcile")
-		reconciler.TriggerReconcile()
+		logger.Info("heartbeat signaled key rotation, starting key rotation")
+		go func() {
+			if err := rotator.Rotate(ctx); err != nil {
+				logger.Error("key rotation failed", "error", err)
+			}
+		}()
 	})
 
 	heartbeat.SetBuildRequest(func() api.HeartbeatRequest {
@@ -555,6 +577,13 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		if err := reconciler.Run(ctx, identity.NodeID); err != nil {
 			logger.Error("reconciler stopped", "error", err)
 		}
+	}()
+
+	// Start key-rotation crash recovery.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		rotator.RecoverPending(ctx)
 	}()
 
 	// 19. Start node API server.
