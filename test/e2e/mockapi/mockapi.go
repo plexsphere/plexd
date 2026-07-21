@@ -107,6 +107,17 @@ type Server struct {
 	endpointTTL   time.Duration
 	endpointTTLMu sync.RWMutex
 
+	// Key-rotation state machine (issue #21), all guarded by keyRotationMu.
+	// The control plane arms a pending rotation, the node submits its fresh
+	// public key, and the mock answers a receipt (replaying the stored one on
+	// an idempotent retry). Completion disarms.
+	keyRotationMu       sync.Mutex
+	nodePublicKey       string
+	rotationArmed       bool
+	lastRotationReceipt *api.KeyRotateResponse
+	lastRotatedKey      string
+	rotationCount       int
+
 	lastRequests   map[string][]byte
 	lastRequestsMu sync.RWMutex
 
@@ -327,8 +338,7 @@ var (
 )
 
 // fixtureRegisterPeers is the initial peer snapshot returned by the register
-// handler. It is deliberately narrow (see api.RegisterPeer) and is distinct
-// from fixturePeers, which the state handler serves.
+// handler. It is deliberately narrow (see api.RegisterPeer).
 var fixtureRegisterPeers = []api.RegisterPeer{
 	{
 		NodeID:           "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
@@ -595,6 +605,12 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Record the node's public key so the keys/rotate handler can recognize an
+	// unchanged-key submission (issue #21).
+	s.keyRotationMu.Lock()
+	s.nodePublicKey = req.PublicKey
+	s.keyRotationMu.Unlock()
+
 	resp := api.RegisterResponse{
 		NodeID:           mockNodeID,
 		MeshIP:           "10.99.0.1",
@@ -662,6 +678,15 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	resp := s.heartbeatFixture
 	s.heartbeatFixtureMu.RUnlock()
 	resp.AcceptedAt = time.Now().UTC()
+
+	// Re-arm the rotation each time we serve rotate_keys=true, mirroring a
+	// control plane that keeps signaling while the rotation is pending.
+	if resp.RotateKeys {
+		s.keyRotationMu.Lock()
+		s.rotationArmed = true
+		s.keyRotationMu.Unlock()
+	}
+
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -775,36 +800,64 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// fixturePeers is the api.Peer set returned by handleKeyRotate. The key-rotation
-// response contract is deferred to issue #21, so it deliberately keeps the
-// mock-era api.Peer shape (with psk/allowed_ips/endpoint).
-var fixturePeers = []api.Peer{
-	{
-		ID:         "peer-001",
-		PublicKey:  "wg-pub-key-peer-001",
-		MeshIP:     "10.99.0.2",
-		Endpoint:   "203.0.113.1:51820",
-		AllowedIPs: []string{"10.99.0.2/32"},
-		PSK:        "mock-psk-001",
-	},
-	{
-		ID:         "peer-002",
-		PublicKey:  "wg-pub-key-peer-002",
-		MeshIP:     "10.99.0.3",
-		Endpoint:   "203.0.113.2:51820",
-		AllowedIPs: []string{"10.99.0.3/32"},
-		PSK:        "mock-psk-002",
-	},
-}
-
-// handleKeyRotate handles POST /v1/keys/rotate.
+// handleKeyRotate handles POST /v1/keys/rotate. It models the v1 rotation
+// receipt contract (issue #21): the control plane arms a pending rotation, the
+// node submits its fresh public key, and the mock answers a receipt (or replays
+// the stored receipt on an idempotent retry). The key_rotate counter advances
+// only on a completing rotation — the same precedent as handleEndpoint.
 func (s *Server) handleKeyRotate(w http.ResponseWriter, r *http.Request) {
-	var req api.KeyRotateRequest
-	if !s.decodeBody(w, r, "key_rotate", &req) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	data, err := s.captureBody("key_rotate", r)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, "keys_rotate_body_too_large", "keys/rotate body exceeds 4 KiB")
+			return
+		}
+		writeProblem(w, r, http.StatusBadRequest, "malformed_keys_rotate_request", "invalid request body")
 		return
 	}
-	s.keyRotateCount.Add(1)
-	writeJSON(w, http.StatusOK, api.KeyRotateResponse{UpdatedPeers: fixturePeers})
+
+	var req api.KeyRotateRequest
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_keys_rotate_request", "keys/rotate body is malformed")
+		return
+	}
+
+	// Shape: a 44-char standard-base64 X25519 key that is not the zero key.
+	raw, decErr := base64.StdEncoding.DecodeString(req.NewPublicKey)
+	if !pubKeyRe.MatchString(req.NewPublicKey) || decErr != nil || isAllZero(raw) {
+		writeProblem(w, r, http.StatusUnprocessableEntity, "keys_rotate_public_key_invalid", "new_public_key must be a non-zero 44-char standard base64 X25519 key")
+		return
+	}
+
+	s.keyRotationMu.Lock()
+	defer s.keyRotationMu.Unlock()
+
+	switch {
+	case req.NewPublicKey == s.nodePublicKey && req.NewPublicKey == s.lastRotatedKey && s.lastRotationReceipt != nil:
+		// Idempotent retry: replay the stored receipt without moving the counter.
+		writeJSON(w, http.StatusOK, *s.lastRotationReceipt)
+	case req.NewPublicKey == s.nodePublicKey:
+		writeProblem(w, r, http.StatusUnprocessableEntity, "keys_rotate_public_key_unchanged", "new_public_key matches the node's current public key")
+	case !s.rotationArmed:
+		writeProblem(w, r, http.StatusConflict, "keys_rotate_no_pending_rotation", "no pending rotation is armed for this node")
+	default:
+		s.rotationCount++
+		receipt := api.KeyRotateResponse{
+			RotationID:     fmt.Sprintf("e2e-rotation-%04d", s.rotationCount),
+			KID:            "did:web:plexsphere.com#psk-2026-04",
+			WrapKeyVersion: s.rotationCount,
+		}
+		s.nodePublicKey = req.NewPublicKey
+		s.lastRotatedKey = req.NewPublicKey
+		s.lastRotationReceipt = &receipt
+		s.rotationArmed = false
+		s.keyRotateCount.Add(1)
+		writeJSON(w, http.StatusOK, receipt)
+	}
 }
 
 // handleCapabilities handles PUT /v1/nodes/{id}/capabilities.
@@ -1045,6 +1098,11 @@ func (s *Server) handleConfigureHeartbeat(w http.ResponseWriter, r *http.Request
 		return
 	}
 	s.SetHeartbeatResponse(resp)
+	if resp.RotateKeys {
+		s.keyRotationMu.Lock()
+		s.rotationArmed = true
+		s.keyRotationMu.Unlock()
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1104,6 +1162,13 @@ func (s *Server) handleInjectEvent(w http.ResponseWriter, r *http.Request) {
 	// Override timestamp and sign the envelope so it passes verification.
 	envelope.IssuedAt = time.Now().UTC()
 	s.signEnvelope(&envelope)
+
+	// A rotate_keys event arms a pending rotation (issue #21).
+	if envelope.EventType == api.EventRotateKeys {
+		s.keyRotationMu.Lock()
+		s.rotationArmed = true
+		s.keyRotationMu.Unlock()
+	}
 
 	s.injectEventCount.Add(1)
 	s.BroadcastSSE(envelope)

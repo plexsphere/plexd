@@ -89,7 +89,8 @@ func validEndpointBody() string {
 
 // Test body constants for new endpoints.
 const (
-	keyRotateBody          = `{"node_id":"node-1","new_public_key":"new-pk-abc"}`
+	keyRotateKey           = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+	keyRotateBody          = `{"new_public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="}`
 	capabilitiesBody       = `{"builtin_actions":[],"hooks":[]}`
 	reportBody             = `{"entries":[],"deleted":[]}`
 	executionAckBody       = `{"execution_id":"exec-001","status":"accepted","reason":""}`
@@ -165,17 +166,26 @@ var localCounterFields = map[string]bool{
 	"LocalAuditCount":   true,
 }
 
+// statefulCounterFields contains counters whose value depends on server state
+// beyond a simple per-call increment, so they are exempt from the uniform
+// non-zero pass in assertAllCountersEqual. KeyRotateCount advances only on a
+// completing rotation, which n identical unarmed submissions cannot reach.
+var statefulCounterFields = map[string]bool{
+	"KeyRotateCount": true,
+}
+
 // assertAllCountersEqual checks that every field in the AssertionCounters struct
 // equals the expected value. Useful for InitialZero and ConcurrentCounters tests.
-// Fields in localCounterFields are excluded from this check when want != 0
-// because they are only incremented via the TLS handler.
+// Fields in localCounterFields and statefulCounterFields are excluded from this
+// check when want != 0 (the former are only incremented via the TLS handler; the
+// latter never reach a uniform count).
 func assertAllCountersEqual(t *testing.T, a mockapi.AssertionCounters, want int64) {
 	t.Helper()
 	v := reflect.ValueOf(a)
 	typ := v.Type()
 	for i := 0; i < v.NumField(); i++ {
 		name := typ.Field(i).Name
-		if want != 0 && localCounterFields[name] {
+		if want != 0 && (localCounterFields[name] || statefulCounterFields[name]) {
 			continue
 		}
 		got := v.Field(i).Int()
@@ -929,6 +939,10 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	// Call all new endpoints.
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/deregister", "")
 	resp.Body.Close()
+	// Arm a pending rotation so the keys/rotate call below completes (the
+	// registered key differs from keyRotateBody's fresh key).
+	resp = doRequest(t, http.MethodPost, ts.URL+"/test/configure-heartbeat", `{"reconcile":true,"rotate_keys":true}`)
+	resp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/keys/rotate", keyRotateBody)
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/n1/capabilities", capabilitiesBody)
@@ -1060,7 +1074,6 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodGet, "/v1/nodes/node-1/state", ""},
 		{http.MethodGet, "/v1/nodes/node-1/metadata", ""},
 		{http.MethodPost, "/v1/nodes/node-1/deregister", ""},
-		{http.MethodPost, "/v1/keys/rotate", keyRotateBody},
 		{http.MethodPut, "/v1/nodes/node-1/capabilities", capabilitiesBody},
 		{http.MethodPut, "/v1/nodes/node-1/endpoint", validEndpointBody()},
 		{http.MethodGet, "/v1/nodes/node-1/secrets/key1", ""},
@@ -1108,6 +1121,12 @@ func TestConcurrentCounters(t *testing.T) {
 
 	a := getAssertions(t, ts.URL)
 	assertAllCountersEqual(t, a, n)
+
+	// KeyRotateCount is stateful (see statefulCounterFields) and is exempt from
+	// the uniform pass above. No keys/rotate calls run here, so it stays zero.
+	if a.KeyRotateCount != 0 {
+		t.Errorf("key_rotate_count = %d, want 0", a.KeyRotateCount)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,26 +1165,248 @@ func TestDeregister_WrongMethod_Returns405(t *testing.T) {
 // Key rotate endpoint
 // ---------------------------------------------------------------------------
 
-func TestKeyRotate_ReturnsFixtureAndCounter(t *testing.T) {
+// registerNode performs a successful registration so the mock records the node's
+// public key (nodePublicKey), a precondition for the rotation state machine.
+func registerNode(t *testing.T, baseURL string) {
+	t.Helper()
+	resp := doRequest(t, http.MethodPost, baseURL+"/v1/register", registerBody)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+}
+
+// armRotation arms a pending rotation via the configure-heartbeat fixture.
+func armRotation(t *testing.T, baseURL string) {
+	t.Helper()
+	resp := doRequest(t, http.MethodPost, baseURL+"/test/configure-heartbeat", `{"reconcile":true,"rotate_keys":true}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-heartbeat status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+// rotateBodyForKey builds a keys/rotate request body carrying the given key.
+func rotateBodyForKey(key string) string {
+	return fmt.Sprintf(`{"new_public_key":%q}`, key)
+}
+
+// freshRotateKey returns a valid 44-char standard-base64 X25519 key derived from
+// seed. Seed 0 yields the register fixture key, so callers pass seed >= 2 for a
+// key distinct from both the registered key and keyRotateKey (seed 1).
+func freshRotateKey(seed byte) string {
+	raw := make([]byte, 32)
+	for i := range raw {
+		raw[i] = seed + byte(i)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+// problemCode decodes an application/problem+json body and returns its code
+// member, failing the test if the content type is wrong.
+func problemCode(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+	}
+	var problem map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	code, _ := problem["code"].(string)
+	return code
+}
+
+func TestKeyRotate_CompletionFlow(t *testing.T) {
 	_, ts := newTestServer(t)
 
+	registerNode(t, ts.URL)
+	armRotation(t, ts.URL)
+
+	// Submit a fresh key: the armed rotation completes with a receipt.
 	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/keys/rotate", keyRotateBody)
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
-
 	var kr api.KeyRotateResponse
 	if err := json.NewDecoder(resp.Body).Decode(&kr); err != nil {
+		resp.Body.Close()
 		t.Fatalf("decode: %v", err)
 	}
-	if len(kr.UpdatedPeers) != 2 {
-		t.Errorf("len(UpdatedPeers) = %d, want 2", len(kr.UpdatedPeers))
+	resp.Body.Close()
+	if kr.RotationID == "" {
+		t.Error("rotation_id is empty")
+	}
+	if kr.KID == "" {
+		t.Error("kid is empty")
+	}
+	if kr.WrapKeyVersion < 1 {
+		t.Errorf("wrap_key_version = %d, want >= 1", kr.WrapKeyVersion)
+	}
+
+	// Completion disarms: a second, different fresh key finds no pending rotation.
+	resp2 := doRequest(t, http.MethodPost, ts.URL+"/v1/keys/rotate", rotateBodyForKey(freshRotateKey(9)))
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("second rotate status = %d, want %d", resp2.StatusCode, http.StatusConflict)
+	}
+	if code := problemCode(t, resp2); code != "keys_rotate_no_pending_rotation" {
+		t.Errorf("code = %q, want %q", code, "keys_rotate_no_pending_rotation")
+	}
+
+	// The counter moved exactly once.
+	a := getAssertions(t, ts.URL)
+	if a.KeyRotateCount != 1 {
+		t.Errorf("key_rotate_count = %d, want 1", a.KeyRotateCount)
+	}
+}
+
+func TestKeyRotate_IdempotentRetry(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	registerNode(t, ts.URL)
+	armRotation(t, ts.URL)
+
+	first := doRequest(t, http.MethodPost, ts.URL+"/v1/keys/rotate", keyRotateBody)
+	var kr1 api.KeyRotateResponse
+	if err := json.NewDecoder(first.Body).Decode(&kr1); err != nil {
+		first.Body.Close()
+		t.Fatalf("decode first: %v", err)
+	}
+	first.Body.Close()
+
+	// Resubmitting the same key replays the stored receipt without moving the counter.
+	second := doRequest(t, http.MethodPost, ts.URL+"/v1/keys/rotate", keyRotateBody)
+	if second.StatusCode != http.StatusOK {
+		second.Body.Close()
+		t.Fatalf("retry status = %d, want %d", second.StatusCode, http.StatusOK)
+	}
+	var kr2 api.KeyRotateResponse
+	if err := json.NewDecoder(second.Body).Decode(&kr2); err != nil {
+		second.Body.Close()
+		t.Fatalf("decode second: %v", err)
+	}
+	second.Body.Close()
+
+	if kr2.RotationID != kr1.RotationID {
+		t.Errorf("retry rotation_id = %q, want identical %q", kr2.RotationID, kr1.RotationID)
+	}
+	if kr2.WrapKeyVersion != kr1.WrapKeyVersion {
+		t.Errorf("retry wrap_key_version = %d, want identical %d", kr2.WrapKeyVersion, kr1.WrapKeyVersion)
 	}
 
 	a := getAssertions(t, ts.URL)
 	if a.KeyRotateCount != 1 {
-		t.Errorf("key_rotate_count = %d, want 1", a.KeyRotateCount)
+		t.Errorf("key_rotate_count = %d, want 1 (retry must not move the counter)", a.KeyRotateCount)
+	}
+}
+
+func TestKeyRotate_ArmingSources(t *testing.T) {
+	tests := []struct {
+		name string
+		arm  func(t *testing.T, baseURL string)
+	}{
+		{
+			name: "configure_heartbeat_fixture",
+			arm:  armRotation,
+		},
+		{
+			name: "served_heartbeat_response",
+			arm: func(t *testing.T, baseURL string) {
+				// Configure the fixture, then serve one heartbeat carrying
+				// rotate_keys=true.
+				cfg := doRequest(t, http.MethodPost, baseURL+"/test/configure-heartbeat", `{"reconcile":true,"rotate_keys":true}`)
+				cfg.Body.Close()
+				hb := doRequest(t, http.MethodPost, baseURL+"/v1/nodes/node-1/heartbeat", validHeartbeatBody())
+				hb.Body.Close()
+			},
+		},
+		{
+			name: "injected_rotate_keys_event",
+			arm: func(t *testing.T, baseURL string) {
+				env := makeEnvelope(api.EventRotateKeys, "evt-rotate-001", json.RawMessage(`{}`))
+				body, _ := json.Marshal(env)
+				resp := doRequest(t, http.MethodPost, baseURL+"/test/inject-event", string(body))
+				resp.Body.Close()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			registerNode(t, ts.URL)
+			tt.arm(t, ts.URL)
+
+			// Armed: the fresh key completes.
+			resp := doRequest(t, http.MethodPost, ts.URL+"/v1/keys/rotate", keyRotateBody)
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				t.Fatalf("rotate status = %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+			resp.Body.Close()
+
+			// Completion disarms: a second, different fresh key finds no pending rotation.
+			resp2 := doRequest(t, http.MethodPost, ts.URL+"/v1/keys/rotate", rotateBodyForKey(freshRotateKey(7)))
+			defer resp2.Body.Close()
+			if resp2.StatusCode != http.StatusConflict {
+				t.Fatalf("second rotate status = %d, want %d", resp2.StatusCode, http.StatusConflict)
+			}
+			if code := problemCode(t, resp2); code != "keys_rotate_no_pending_rotation" {
+				t.Errorf("code = %q, want %q", code, "keys_rotate_no_pending_rotation")
+			}
+		})
+	}
+}
+
+func TestKeyRotate_DenialTaxonomy(t *testing.T) {
+	const path = "/v1/keys/rotate"
+
+	tests := []struct {
+		name       string
+		setup      func(t *testing.T, baseURL string)
+		body       string
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "invalid_json", body: "not-json", wantStatus: http.StatusBadRequest, wantCode: "malformed_keys_rotate_request"},
+		{name: "unknown_field", body: fmt.Sprintf(`{"new_public_key":%q,"node_id":"n1"}`, keyRotateKey), wantStatus: http.StatusBadRequest, wantCode: "malformed_keys_rotate_request"},
+		{name: "body_too_large", body: fmt.Sprintf(`{"new_public_key":%q}`, strings.Repeat("a", 5000)), wantStatus: http.StatusRequestEntityTooLarge, wantCode: "keys_rotate_body_too_large"},
+		{name: "not_44_char_key", body: `{"new_public_key":"short"}`, wantStatus: http.StatusUnprocessableEntity, wantCode: "keys_rotate_public_key_invalid"},
+		{name: "zero_key", body: `{"new_public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}`, wantStatus: http.StatusUnprocessableEntity, wantCode: "keys_rotate_public_key_invalid"},
+		{
+			name:       "unchanged_key_while_armed",
+			setup:      func(t *testing.T, baseURL string) { registerNode(t, baseURL); armRotation(t, baseURL) },
+			body:       rotateBodyForKey(testValidPubKey),
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "keys_rotate_public_key_unchanged",
+		},
+		{
+			name:       "unarmed_fresh_key",
+			setup:      registerNode,
+			body:       keyRotateBody,
+			wantStatus: http.StatusConflict,
+			wantCode:   "keys_rotate_no_pending_rotation",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			if tt.setup != nil {
+				tt.setup(t, ts.URL)
+			}
+
+			resp := doRequest(t, http.MethodPost, ts.URL+path, tt.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			if code := problemCode(t, resp); code != tt.wantCode {
+				t.Errorf("code = %q, want %q", code, tt.wantCode)
+			}
+		})
 	}
 }
 
@@ -1176,6 +1417,9 @@ func TestKeyRotate_InvalidBody_Returns400(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+	if code := problemCode(t, resp); code != "malformed_keys_rotate_request" {
+		t.Errorf("code = %q, want %q", code, "malformed_keys_rotate_request")
 	}
 }
 

@@ -250,6 +250,69 @@ func TestTypesEndpointResponse(t *testing.T) {
 	}
 }
 
+func TestTypesKeyRotateRequest(t *testing.T) {
+	orig := KeyRotateRequest{
+		NewPublicKey: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// The v1 contract serializes to exactly one member: the server identifies
+	// the node from the NSK bearer credential, so there is no node_id.
+	const want = `{"new_public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="}`
+	if string(data) != want {
+		t.Errorf("serialized = %s, want %s", data, want)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 1 {
+		t.Errorf("expected exactly 1 JSON key, got %d: %v", len(raw), raw)
+	}
+	if _, ok := raw["new_public_key"]; !ok {
+		t.Errorf("expected JSON key %q", "new_public_key")
+	}
+	if _, ok := raw["node_id"]; ok {
+		t.Error("node_id must not be present in the v1 keys/rotate request")
+	}
+}
+
+func TestTypesKeyRotateResponse(t *testing.T) {
+	const src = `{"rotation_id":"e2e-rotation-0001","kid":"did:web:plexsphere.com#psk-2026-04","wrap_key_version":3}`
+	var got KeyRotateResponse
+	if err := json.Unmarshal([]byte(src), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.RotationID != "e2e-rotation-0001" {
+		t.Errorf("RotationID = %q, want %q", got.RotationID, "e2e-rotation-0001")
+	}
+	if got.KID != "did:web:plexsphere.com#psk-2026-04" {
+		t.Errorf("KID = %q, want %q", got.KID, "did:web:plexsphere.com#psk-2026-04")
+	}
+	if got.WrapKeyVersion != 3 {
+		t.Errorf("WrapKeyVersion = %d, want 3", got.WrapKeyVersion)
+	}
+
+	data, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 3 {
+		t.Errorf("expected exactly 3 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"rotation_id", "kid", "wrap_key_version"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
 func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	orig := NodeStateSnapshot{

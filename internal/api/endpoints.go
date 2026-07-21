@@ -70,7 +70,7 @@ func (c *ControlPlane) Deregister(ctx context.Context, nodeID string) error {
 	return c.doRequest(ctx, http.MethodPost, path, nil, nil)
 }
 
-// RotateKeys requests key rotation for a node.
+// RotateKeys completes a pending mesh-key rotation; the server identifies the node from the NSK bearer credential.
 // POST /v1/keys/rotate
 func (c *ControlPlane) RotateKeys(ctx context.Context, req KeyRotateRequest) (*KeyRotateResponse, error) {
 	var resp KeyRotateResponse
