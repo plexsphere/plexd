@@ -40,8 +40,8 @@ type RegisterPeer struct {
 	FallbackEndpoint string `json:"fallback_endpoint,omitempty"`
 }
 
-// Peer is the WireGuard peer shape used only for SSE peer_* payloads and
-// KeyRotateResponse until issues #21/#25 migrate those contracts.
+// Peer is the WireGuard peer shape used only for SSE peer_* payloads
+// until issue #25 migrates that contract.
 type Peer struct {
 	ID         string   `json:"id"`
 	PublicKey  string   `json:"public_key"`
