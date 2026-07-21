@@ -338,12 +338,13 @@ type EndpointResponse struct {
 // ---------------------------------------------------------------------------
 
 type KeyRotateRequest struct {
-	NodeID       string `json:"node_id"`
 	NewPublicKey string `json:"new_public_key"`
 }
 
 type KeyRotateResponse struct {
-	UpdatedPeers []Peer `json:"updated_peers"`
+	RotationID     string `json:"rotation_id"`
+	KID            string `json:"kid"`
+	WrapKeyVersion int    `json:"wrap_key_version"`
 }
 
 // ---------------------------------------------------------------------------

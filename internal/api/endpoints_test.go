@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -286,33 +287,65 @@ func TestRotateKeys_Success(t *testing.T) {
 			t.Errorf("path = %s, want /v1/keys/rotate", r.URL.Path)
 		}
 
-		var req KeyRotateRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var raw map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-		if req.NodeID != "n1" {
-			t.Errorf("NodeID = %q, want %q", req.NodeID, "n1")
+		if _, ok := raw["new_public_key"]; !ok {
+			t.Error("request missing new_public_key")
+		}
+		if _, ok := raw["node_id"]; ok {
+			t.Error("request must not carry node_id; the server identifies the node from the NSK")
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(KeyRotateResponse{
-			UpdatedPeers: []Peer{{ID: "p1", MeshIP: "10.0.0.2"}},
+			RotationID:     "rot-001",
+			KID:            "did:web:plexsphere.com#psk-2026-04",
+			WrapKeyVersion: 2,
 		})
 	})
 
 	resp, err := client.RotateKeys(context.Background(), KeyRotateRequest{
-		NodeID:       "n1",
-		NewPublicKey: "new-pub-key",
+		NewPublicKey: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
 	})
 	if err != nil {
 		t.Fatalf("RotateKeys: %v", err)
 	}
-	if len(resp.UpdatedPeers) != 1 {
-		t.Fatalf("len(UpdatedPeers) = %d, want 1", len(resp.UpdatedPeers))
+	if resp.RotationID != "rot-001" {
+		t.Errorf("RotationID = %q, want %q", resp.RotationID, "rot-001")
 	}
-	if resp.UpdatedPeers[0].ID != "p1" {
-		t.Errorf("UpdatedPeers[0].ID = %q, want %q", resp.UpdatedPeers[0].ID, "p1")
+	if resp.KID != "did:web:plexsphere.com#psk-2026-04" {
+		t.Errorf("KID = %q, want %q", resp.KID, "did:web:plexsphere.com#psk-2026-04")
+	}
+	if resp.WrapKeyVersion != 2 {
+		t.Errorf("WrapKeyVersion = %d, want 2", resp.WrapKeyVersion)
+	}
+}
+
+func TestRotateKeys_UnchangedProblemCode(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = io.WriteString(w, `{"type":"about:blank","title":"Unprocessable Entity","status":422,"detail":"new_public_key matches the node's current public key","code":"keys_rotate_public_key_unchanged"}`)
+	})
+
+	_, err := client.RotateKeys(context.Background(), KeyRotateRequest{
+		NewPublicKey: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("errors.As failed to extract *APIError: %v", err)
+	}
+	if apiErr.StatusCode != 422 {
+		t.Errorf("StatusCode = %d, want 422", apiErr.StatusCode)
+	}
+	if apiErr.Code != "keys_rotate_public_key_unchanged" {
+		t.Errorf("Code = %q, want %q", apiErr.Code, "keys_rotate_public_key_unchanged")
 	}
 }
 
