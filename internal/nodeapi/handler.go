@@ -6,8 +6,8 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
-	"strings"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
@@ -311,6 +311,12 @@ func (h *Handler) handleGetReportKey(w http.ResponseWriter, r *http.Request) {
 // PUT requests (1 MiB). Prevents memory exhaustion from oversized payloads.
 const maxReportBodyBytes = 1 << 20
 
+// maxReportValueBytes caps the serialized report payload at 4 KiB, matching the
+// control plane's per-key value limit. The MaxBytesReader guarding the request
+// body is transport-level protection; this is the semantic cap the ingest API
+// enforces on the payload itself.
+const maxReportValueBytes = 4096
+
 func (h *Handler) handlePutReport(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if !validReportKey(key) {
@@ -332,6 +338,10 @@ func (h *Handler) handlePutReport(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Payload) == 0 || !json.Valid(req.Payload) {
 		writeError(w, http.StatusBadRequest, "payload must be valid JSON")
+		return
+	}
+	if len(req.Payload) > maxReportValueBytes {
+		writeError(w, http.StatusBadRequest, "payload exceeds the 4096-byte limit")
 		return
 	}
 
@@ -379,11 +389,18 @@ func (h *Handler) handleDeleteReport(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// validReportKey returns true if key is safe to use in file paths.
-// It rejects empty keys, path separators, '..' sequences, and the current
-// directory reference '.'.
+// reportKeyPattern is the control-plane wire grammar for report keys: a leading
+// lowercase letter followed by up to 127 more lowercase letters, digits, '.',
+// '_' or '-'. Holding local keys to this grammar keeps them in lockstep with
+// what the ingest API accepts and, as a side effect, bars path separators and
+// '.'/'..' traversal from the on-disk report store.
+var reportKeyPattern = regexp.MustCompile("^[a-z][a-z0-9._-]{0,127}$")
+
+// validReportKey reports whether key satisfies the wire report key grammar. The
+// local GET/PUT/DELETE report handlers share it so a key the node API accepts is
+// one the control plane will accept too.
 func validReportKey(key string) bool {
-	return key != "" && key != "." && key != ".." && !strings.ContainsAny(key, "/\\")
+	return reportKeyPattern.MatchString(key)
 }
 
 // actionsResponse is the response for GET /v1/actions.

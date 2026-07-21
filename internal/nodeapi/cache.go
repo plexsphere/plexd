@@ -40,6 +40,10 @@ type StateCache struct {
 	data        map[string]api.DataEntry
 	secretIndex []api.SecretRef
 	reports     map[string]ReportEntry
+	// orphanedReports holds the keys of persisted reports Load rejected because
+	// they predate the current key grammar. They are unreachable through every
+	// local route, so the syncer is the only thing that can still act on them.
+	orphanedReports []string
 }
 
 // NewStateCache creates a new StateCache with empty maps. dataDir is the base
@@ -121,6 +125,7 @@ func (sc *StateCache) Load() error {
 
 	// Load report/*.json.
 	sc.reports = make(map[string]ReportEntry)
+	sc.orphanedReports = nil
 	reportDir := filepath.Join(sd, "report")
 	reportEntries, err := os.ReadDir(reportDir)
 	if err != nil && !os.IsNotExist(err) {
@@ -137,6 +142,21 @@ func (sc *StateCache) Load() error {
 		var entry ReportEntry
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			return err
+		}
+		// A report persisted under an older, laxer key grammar (uppercase, a
+		// leading digit, over 128 bytes, ...) is unreachable through the GET/PUT/
+		// DELETE routes, which now reject it. Dropping it from the in-memory cache
+		// keeps the loaded state in lockstep with what the API can serve, so the
+		// listing never advertises a key the per-key routes reject. The file is
+		// left on disk for manual cleanup rather than deleted silently, and the
+		// key is recorded so the caller can have the syncer remove the copy a
+		// previous release published upstream — otherwise it would be pinned on
+		// the control plane with no local operation able to reach it.
+		if !validReportKey(entry.Key) {
+			sc.logger.Warn("dropping persisted report whose key is outside the current grammar; remove the file manually if no longer needed",
+				"key", entry.Key, "path", filepath.Join(reportDir, re.Name()))
+			sc.orphanedReports = append(sc.orphanedReports, entry.Key)
+			continue
 		}
 		sc.reports[entry.Key] = entry
 	}
@@ -240,6 +260,21 @@ func (sc *StateCache) GetReports() map[string]ReportEntry {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 	return maps.Clone(sc.reports)
+}
+
+// OrphanedReportKeys returns the keys of the persisted reports the last Load
+// rejected as outside the current key grammar. A previous release may have
+// synced them to the control plane, where nothing local can reach them any more,
+// so the caller queues a delete for each.
+func (sc *StateCache) OrphanedReportKeys() []string {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	if len(sc.orphanedReports) == 0 {
+		return nil
+	}
+	cp := make([]string, len(sc.orphanedReports))
+	copy(cp, sc.orphanedReports)
+	return cp
 }
 
 // GetReport returns a report entry by key and whether it exists.

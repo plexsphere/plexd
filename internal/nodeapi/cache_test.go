@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -526,5 +528,78 @@ func TestStateCache_LoadMissingDir(t *testing.T) {
 	}
 	if len(sc.GetReports()) != 0 {
 		t.Error("reports should be empty")
+	}
+}
+
+// TestStateCache_LoadDropsOutOfGrammarReportKeys verifies that a report
+// persisted under a key that the tightened grammar now rejects is dropped from
+// the in-memory cache on Load, so the listing stays in lockstep with what the
+// GET/PUT/DELETE routes serve. The on-disk file is left in place for manual
+// cleanup rather than deleted silently.
+func TestStateCache_LoadDropsOutOfGrammarReportKeys(t *testing.T) {
+	dir := t.TempDir()
+	reportDir := filepath.Join(dir, "state", "report")
+	if err := os.MkdirAll(reportDir, 0700); err != nil {
+		t.Fatalf("mkdir report: %v", err)
+	}
+
+	writeReport := func(file, key string) {
+		re := ReportEntry{Key: key, ContentType: "application/json", Payload: json.RawMessage(`{"ok":true}`), Version: 1, UpdatedAt: time.Now()}
+		reJSON, err := json.Marshal(re)
+		if err != nil {
+			t.Fatalf("marshal report %q: %v", key, err)
+		}
+		if err := os.WriteFile(filepath.Join(reportDir, file), reJSON, 0600); err != nil {
+			t.Fatalf("write report %q: %v", key, err)
+		}
+	}
+
+	writeReport("health.json", "health")  // valid under the grammar
+	writeReport("Health.json", "Health")  // uppercase -> out of grammar
+	writeReport("digit.json", "9-checks") // leading digit -> out of grammar
+
+	sc := NewStateCache(dir, discardLogger())
+	if err := sc.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	reports := sc.GetReports()
+	if len(reports) != 1 {
+		t.Fatalf("loaded reports = %v, want only the valid key", reports)
+	}
+	if _, ok := reports["health"]; !ok {
+		t.Error("valid key \"health\" should have been loaded")
+	}
+	for _, bad := range []string{"Health", "9-checks"} {
+		if _, ok := reports[bad]; ok {
+			t.Errorf("out-of-grammar key %q should have been dropped from the cache", bad)
+		}
+	}
+
+	// The dropped files remain on disk for manual cleanup.
+	for _, file := range []string{"Health.json", "digit.json"} {
+		if _, err := os.Stat(filepath.Join(reportDir, file)); err != nil {
+			t.Errorf("dropped report file %q should remain on disk, stat error: %v", file, err)
+		}
+	}
+
+	// The dropped keys are reported so the caller can have the syncer remove the
+	// copies a previous release published upstream; nothing local can reach them.
+	orphaned := sc.OrphanedReportKeys()
+	sort.Strings(orphaned)
+	if want := []string{"9-checks", "Health"}; !reflect.DeepEqual(orphaned, want) {
+		t.Errorf("OrphanedReportKeys() = %v, want %v", orphaned, want)
+	}
+	// A reload with the offending files gone reports no orphans.
+	for _, file := range []string{"Health.json", "digit.json"} {
+		if err := os.Remove(filepath.Join(reportDir, file)); err != nil {
+			t.Fatalf("remove %q: %v", file, err)
+		}
+	}
+	if err := sc.Load(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := sc.OrphanedReportKeys(); got != nil {
+		t.Errorf("OrphanedReportKeys() after reload = %v, want nil", got)
 	}
 }

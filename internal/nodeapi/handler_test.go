@@ -537,6 +537,8 @@ func TestValidReportKey(t *testing.T) {
 		{"health", true},
 		{"my-report", true},
 		{"report_v2", true},
+		{"cpu-load", true},
+		{"status.mesh", true},
 		{"", false},
 		{".", false},
 		{"..", false},
@@ -544,6 +546,10 @@ func TestValidReportKey(t *testing.T) {
 		{"foo/bar", false},
 		{"foo\\bar", false},
 		{"/absolute", false},
+		{"Bad_Key", false},
+		{"9lead", false},
+		{".dot", false},
+		{"a" + strings.Repeat("b", 128), false},
 	}
 	for _, tc := range tests {
 		got := validReportKey(tc.key)
@@ -610,6 +616,64 @@ func TestHandler_PutReport_OversizedBody(t *testing.T) {
 	}
 	// MaxBytesReader causes the decode to fail with a 400 (invalid JSON body)
 	// because the reader is truncated.
+	if resp.StatusCode != 400 {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestHandler_PutReport_KeyGrammar(t *testing.T) {
+	srv, _ := newTestHandler(t, &mockSecretFetcher{})
+	body := `{"content_type":"application/json","payload":{"x":1}}`
+
+	put := func(t *testing.T, key string) int {
+		t.Helper()
+		req, err := http.NewRequest("PUT", srv.URL+"/v1/state/report/"+key, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	for _, key := range []string{"cpu-load", "status.mesh"} {
+		if got := put(t, key); got != 200 {
+			t.Errorf("PUT key=%q: status = %d, want 200", key, got)
+		}
+	}
+
+	// A 129-character key exceeds the grammar's 128-character ceiling.
+	longKey := "a" + strings.Repeat("b", 128)
+	for _, key := range []string{"Bad_Key", "9lead", ".dot", longKey} {
+		if got := put(t, key); got != 400 {
+			t.Errorf("PUT key=%q: status = %d, want 400", key, got)
+		}
+	}
+}
+
+func TestHandler_PutReport_OversizedValue(t *testing.T) {
+	srv, _ := newTestHandler(t, &mockSecretFetcher{})
+
+	// A valid-JSON payload whose serialized form exceeds the 4096-byte value cap
+	// but stays well under the 1 MiB transport limit, so the semantic cap (not
+	// MaxBytesReader) is what rejects it.
+	oversized := `"` + strings.Repeat("x", maxReportValueBytes) + `"` // 4098 bytes
+	body := `{"content_type":"application/json","payload":` + oversized + `}`
+	req, err := http.NewRequest("PUT", srv.URL+"/v1/state/report/cpu-load", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if resp.StatusCode != 400 {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
