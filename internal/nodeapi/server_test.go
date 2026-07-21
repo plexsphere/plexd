@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,8 +21,9 @@ import (
 
 // configurableTestClient extends serverTestClient with configurable behavior.
 type configurableTestClient struct {
-	fetchSecret func(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
-	syncReports func(ctx context.Context, nodeID string, req api.ReportSyncRequest) error
+	fetchSecret       func(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
+	putStateReport    func(ctx context.Context, nodeID, key string, req api.NodeStateReportRequest) (*api.NodeStateReportResponse, error)
+	deleteStateReport func(ctx context.Context, nodeID, key string) error
 }
 
 func (c *configurableTestClient) FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error) {
@@ -31,9 +33,16 @@ func (c *configurableTestClient) FetchSecret(ctx context.Context, nodeID, key st
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (c *configurableTestClient) SyncReports(ctx context.Context, nodeID string, req api.ReportSyncRequest) error {
-	if c.syncReports != nil {
-		return c.syncReports(ctx, nodeID, req)
+func (c *configurableTestClient) PutStateReport(ctx context.Context, nodeID, key string, req api.NodeStateReportRequest) (*api.NodeStateReportResponse, error) {
+	if c.putStateReport != nil {
+		return c.putStateReport(ctx, nodeID, key, req)
+	}
+	return &api.NodeStateReportResponse{Key: key}, nil
+}
+
+func (c *configurableTestClient) DeleteStateReport(ctx context.Context, nodeID, key string) error {
+	if c.deleteStateReport != nil {
+		return c.deleteStateReport(ctx, nodeID, key)
 	}
 	return nil
 }
@@ -42,15 +51,23 @@ func (c *configurableTestClient) SyncReports(ctx context.Context, nodeID string,
 type serverTestClient struct {
 	secretResp *api.SecretResponse
 	secretErr  error
-	syncErr    error
+	putErr     error
+	deleteErr  error
 }
 
 func (c *serverTestClient) FetchSecret(_ context.Context, _, _ string) (*api.SecretResponse, error) {
 	return c.secretResp, c.secretErr
 }
 
-func (c *serverTestClient) SyncReports(_ context.Context, _ string, _ api.ReportSyncRequest) error {
-	return c.syncErr
+func (c *serverTestClient) PutStateReport(_ context.Context, _, key string, _ api.NodeStateReportRequest) (*api.NodeStateReportResponse, error) {
+	if c.putErr != nil {
+		return nil, c.putErr
+	}
+	return &api.NodeStateReportResponse{Key: key}, nil
+}
+
+func (c *serverTestClient) DeleteStateReport(_ context.Context, _, _ string) error {
+	return c.deleteErr
 }
 
 func newTestServer(t *testing.T, client *serverTestClient) (*Server, Config) {
@@ -493,10 +510,9 @@ func unixSocketClient(socketPath string) *http.Client {
 func TestServer_ReportSyncIntegration(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
-	syncCalls := make(chan api.ReportSyncRequest, 10)
-	client := &serverTestClient{}
-	// Override SyncReports with a channel-based tracker.
-	trackingClient := &trackingSyncClient{calls: syncCalls}
+	syncCalls := make(chan string, 10)
+	// Track per-key PutStateReport calls through a channel.
+	trackingClient := &trackingSyncClient{puts: syncCalls}
 
 	tmpDir := t.TempDir()
 	cfg := Config{
@@ -506,7 +522,6 @@ func TestServer_ReportSyncIntegration(t *testing.T) {
 		ShutdownTimeout: 2 * time.Second,
 	}
 	cfg.ApplyDefaults()
-	_ = client // not used; use trackingClient
 
 	nsk := make([]byte, 32)
 	srv := NewServer(cfg, trackingClient, nsk, nil)
@@ -539,9 +554,9 @@ func TestServer_ReportSyncIntegration(t *testing.T) {
 
 	// Wait for the sync call (debounce + processing).
 	select {
-	case syncReq := <-syncCalls:
-		if len(syncReq.Entries) == 0 {
-			t.Error("expected entries in sync request")
+	case key := <-syncCalls:
+		if key != "health" {
+			t.Errorf("synced key = %q, want %q", key, "health")
 		}
 	case <-time.After(2 * time.Second):
 		// Sync may not happen in time in CI; don't hard-fail.
@@ -552,16 +567,67 @@ func TestServer_ReportSyncIntegration(t *testing.T) {
 	<-errCh
 }
 
+// TestReportNotifyMiddleware_DerivesChangeFromCache pins the resolution of the
+// PUT/DELETE notify race: the notification must describe what the cache holds
+// after the handler returned, not the method that ran. The notify happens
+// outside the cache lock, so a PUT and a DELETE of the same key can notify in
+// the opposite order to the one they mutated the cache in; deriving the change
+// from the cache keeps the last notification truthful either way.
+func TestReportNotifyMiddleware_DerivesChangeFromCache(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		status     int
+		inCache    bool
+		wantDelete bool
+	}{
+		{"put with the key present notifies a put", http.MethodPut, http.StatusOK, true, false},
+		{"put whose key a racing delete removed notifies a delete", http.MethodPut, http.StatusOK, false, true},
+		{"delete with the key gone notifies a delete", http.MethodDelete, http.StatusNoContent, false, true},
+		{"delete whose key a racing put restored notifies a put", http.MethodDelete, http.StatusNoContent, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cache := NewStateCache(t.TempDir(), discardLogger())
+			if tt.inCache {
+				if _, err := cache.PutReport("health", "application/json", json.RawMessage(`{"ok":true}`), nil); err != nil {
+					t.Fatalf("seed cache: %v", err)
+				}
+			}
+			syncer := NewReportSyncer(&trackingSyncClient{puts: make(chan string, 1)}, time.Millisecond, discardLogger())
+
+			h := reportNotifyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+			}), cache, syncer)
+			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(tt.method, "/v1/state/report/health", nil))
+
+			syncer.mu.Lock()
+			entry, ok := syncer.dirty["health"]
+			syncer.mu.Unlock()
+			if !ok {
+				t.Fatalf("no change notified for key %q", "health")
+			}
+			if gotDelete := entry == nil; gotDelete != tt.wantDelete {
+				t.Errorf("notified delete = %v, want %v", gotDelete, tt.wantDelete)
+			}
+		})
+	}
+}
+
 type trackingSyncClient struct {
-	calls chan api.ReportSyncRequest
+	puts chan string
 }
 
 func (c *trackingSyncClient) FetchSecret(_ context.Context, _, _ string) (*api.SecretResponse, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (c *trackingSyncClient) SyncReports(_ context.Context, _ string, req api.ReportSyncRequest) error {
-	c.calls <- req
+func (c *trackingSyncClient) PutStateReport(_ context.Context, _, key string, _ api.NodeStateReportRequest) (*api.NodeStateReportResponse, error) {
+	c.puts <- key
+	return &api.NodeStateReportResponse{Key: key}, nil
+}
+
+func (c *trackingSyncClient) DeleteStateReport(_ context.Context, _, _ string) error {
 	return nil
 }
 
@@ -574,10 +640,14 @@ func (c *trackingSyncClient) SyncReports(_ context.Context, _ string, req api.Re
 func TestServer_EndToEndFlow(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
-	syncCalls := make(chan api.ReportSyncRequest, 10)
+	syncCalls := make(chan string, 10)
 	client := &configurableTestClient{
-		syncReports: func(_ context.Context, _ string, req api.ReportSyncRequest) error {
-			syncCalls <- req
+		putStateReport: func(_ context.Context, _, key string, _ api.NodeStateReportRequest) (*api.NodeStateReportResponse, error) {
+			syncCalls <- "put:" + key
+			return &api.NodeStateReportResponse{Key: key}, nil
+		},
+		deleteStateReport: func(_ context.Context, _, key string) error {
+			syncCalls <- "delete:" + key
 			return nil
 		},
 	}
@@ -737,6 +807,113 @@ syncLoop:
 	}
 	if syncReceived < 1 {
 		t.Log("WARN: expected at least 1 sync call, got 0 (timing-dependent)")
+	}
+
+	cancel()
+	if err := <-errCh; err != nil && err != context.Canceled {
+		t.Fatalf("Start returned: %v", err)
+	}
+}
+
+// TestServer_PublishReport exercises the internal publish seam: a valid report
+// is written through the cache (visible via the cache and the HTTP API) and
+// forwarded to the syncer, while grammar and value-cap violations are rejected
+// before any cache write.
+func TestServer_PublishReport(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	puts := make(chan api.NodeStateReportRequest, 4)
+	client := &configurableTestClient{
+		putStateReport: func(_ context.Context, _, _ string, req api.NodeStateReportRequest) (*api.NodeStateReportResponse, error) {
+			puts <- req
+			return &api.NodeStateReportResponse{}, nil
+		},
+	}
+
+	tmpDir := t.TempDir()
+	cfg := Config{
+		SocketPath:      filepath.Join(tmpDir, "api.sock"),
+		DataDir:         tmpDir,
+		DebouncePeriod:  50 * time.Millisecond,
+		ShutdownTimeout: 2 * time.Second,
+	}
+	cfg.ApplyDefaults()
+
+	nsk := make([]byte, 32)
+	srv := NewServer(cfg, client, nsk, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Start(ctx, "node-publish") }()
+
+	if !waitForSocket(t, cfg.SocketPath, 2*time.Second) {
+		cancel()
+		t.Fatal("socket did not appear")
+	}
+
+	// A valid publish writes through the cache and notifies the syncer.
+	if err := srv.PublishReport("status.mesh", "application/json", json.RawMessage(`{"peers":3}`)); err != nil {
+		cancel()
+		t.Fatalf("PublishReport: %v", err)
+	}
+
+	// The entry is visible in the cache with version 1.
+	entry, ok := srv.cache.GetReport("status.mesh")
+	if !ok {
+		cancel()
+		t.Fatal("published report not found in cache")
+	}
+	if entry.Version != 1 || string(entry.Payload) != `{"peers":3}` {
+		cancel()
+		t.Errorf("cache entry = %+v, want version 1 payload {\"peers\":3}", entry)
+	}
+
+	// And readable over the local HTTP API.
+	httpClient := unixSocketClient(cfg.SocketPath)
+	resp, err := httpClient.Get("http://unix/v1/state/report/status.mesh")
+	if err != nil {
+		cancel()
+		t.Fatalf("GET report: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		cancel()
+		t.Fatalf("GET report status = %d, want 200; body: %s", resp.StatusCode, body)
+	}
+	var got ReportEntry
+	_ = json.Unmarshal(body, &got)
+	if got.Key != "status.mesh" {
+		cancel()
+		t.Errorf("GET report key = %q, want %q", got.Key, "status.mesh")
+	}
+
+	// The syncer forwards the payload value with no workload tag.
+	select {
+	case req := <-puts:
+		if req.Value != `{"peers":3}` {
+			t.Errorf("synced value = %q, want %q", req.Value, `{"peers":3}`)
+		}
+		if req.WorkloadTag != "" {
+			t.Errorf("synced workload_tag = %q, want empty", req.WorkloadTag)
+		}
+	case <-time.After(2 * time.Second):
+		t.Log("WARN: publish sync not received within timeout (timing-dependent)")
+	}
+
+	// Grammar violations and oversized payloads are rejected with errors and
+	// never reach the cache.
+	if err := srv.PublishReport("Bad_Key", "application/json", json.RawMessage(`{}`)); err == nil {
+		t.Error("PublishReport(Bad_Key) = nil, want error")
+	}
+	oversized := json.RawMessage(`"` + strings.Repeat("x", maxReportValueBytes) + `"`)
+	if err := srv.PublishReport("cpu-load", "application/json", oversized); err == nil {
+		t.Error("PublishReport(oversized) = nil, want error")
+	}
+	if _, ok := srv.cache.GetReport("cpu-load"); ok {
+		t.Error("oversized publish wrote to cache, want rejected before write")
 	}
 
 	cancel()

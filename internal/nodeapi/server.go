@@ -2,6 +2,7 @@ package nodeapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -29,6 +30,7 @@ type Server struct {
 	nsk    []byte
 	logger *slog.Logger
 	cache  *StateCache
+	syncer *ReportSyncer
 
 	actionProvider ActionProvider
 	hookReloader   HookReloader
@@ -53,6 +55,9 @@ func NewServer(cfg Config, client NodeAPIClient, nsk []byte, logger *slog.Logger
 		nsk:    nsk,
 		logger: lg,
 		cache:  NewStateCache(cfg.DataDir, lg),
+		// The syncer is built here (before the node ID is known) so PublishReport
+		// works ahead of Start; Run receives the node ID when the server starts.
+		syncer: NewReportSyncer(client, cfg.DebouncePeriod, lg),
 	}
 }
 
@@ -93,6 +98,26 @@ func (s *Server) Cache() *StateCache {
 	return s.cache
 }
 
+// PublishReport writes a report entry through the cache and notifies the syncer
+// so it converges to the control plane. It is the seam through which internal
+// producers publish status blocks, and it holds key and payload to the same
+// grammar and 4096-byte value cap as the local HTTP API. content_type and the
+// resulting version stay local-only; the syncer ships only the payload value.
+func (s *Server) PublishReport(key, contentType string, payload json.RawMessage) error {
+	if !validReportKey(key) {
+		return fmt.Errorf("nodeapi: invalid report key %q", key)
+	}
+	if len(payload) > maxReportValueBytes {
+		return fmt.Errorf("nodeapi: report payload for key %q exceeds the %d-byte limit", key, maxReportValueBytes)
+	}
+	entry, err := s.cache.PutReport(key, contentType, payload, nil)
+	if err != nil {
+		return fmt.Errorf("nodeapi: publish report %q: %w", key, err)
+	}
+	s.syncer.NotifyChange([]ReportEntry{entry}, nil)
+	return nil
+}
+
 // Start initializes and runs the server. It blocks until ctx is cancelled.
 func (s *Server) Start(ctx context.Context, nodeID string) error {
 	if err := s.cfg.Validate(); err != nil {
@@ -104,8 +129,14 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 		return fmt.Errorf("nodeapi: load cache: %w", err)
 	}
 
-	// Start report syncer.
-	syncer := NewReportSyncer(s.client, nodeID, s.cfg.DebouncePeriod, s.logger)
+	// A report persisted under the older, laxer key grammar is unreachable
+	// through the local routes, so its upstream copy would stay pinned on the
+	// control plane forever. Queue a delete for each; DeleteStateReport is
+	// idempotent, so a key that was never synced simply answers 404
+	// report_not_found.
+	if orphaned := s.cache.OrphanedReportKeys(); len(orphaned) > 0 {
+		s.syncer.NotifyChange(nil, orphaned)
+	}
 
 	// Set up HTTP handler.
 	handler := NewHandler(s.cache, s.client, nodeID, s.nsk, s.logger)
@@ -118,7 +149,7 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 	mux := handler.Mux()
 
 	// Wrap mux with a report-sync notifier.
-	wrappedMux := reportNotifyMiddleware(mux, s.cache, syncer)
+	wrappedMux := reportNotifyMiddleware(mux, s.cache, s.syncer)
 
 	// Remove stale socket.
 	os.Remove(s.cfg.SocketPath)
@@ -191,7 +222,7 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = syncer.Run(syncCtx)
+		_ = s.syncer.Run(syncCtx, nodeID)
 	}()
 
 	// Unix socket serve goroutine.
@@ -283,7 +314,14 @@ func (s *Server) ReconcileHandler() reconcile.ReconcileHandler {
 	}
 }
 
-// reportNotifyMiddleware wraps a handler to notify the syncer after report mutations.
+// reportNotifyMiddleware wraps a handler to notify the syncer after report
+// mutations. The notification derives from what the cache holds after the
+// handler returned, not from the method that ran: the notify happens outside the
+// cache lock, so a PUT and a DELETE of the same key racing on the socket can
+// notify in the opposite order to the one they mutated the cache in. Deriving
+// the change from the cache makes whichever notification lands last carry the
+// cache's actual state, instead of a stale "put" overwriting a pending delete
+// and leaving the report on the control plane after it was removed locally.
 func reportNotifyMiddleware(next http.Handler, cache *StateCache, syncer *ReportSyncer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Capture report state before the request for mutation detection.
@@ -294,22 +332,16 @@ func reportNotifyMiddleware(next http.Handler, cache *StateCache, syncer *Report
 		rw := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(rw, r)
 
-		if isPutReport && rw.status == http.StatusOK {
-			key := extractReportKey(r.URL.Path)
-			if entry, ok := cache.GetReport(key); ok {
-				syncer.NotifyChange([]api.ReportEntry{
-					{
-						Key:         entry.Key,
-						ContentType: entry.ContentType,
-						Payload:     entry.Payload,
-						Version:     entry.Version,
-						UpdatedAt:   entry.UpdatedAt,
-					},
-				}, nil)
-			}
+		if !isPutReport && !isDeleteReport {
+			return
 		}
-		if isDeleteReport && rw.status == http.StatusNoContent {
-			key := extractReportKey(r.URL.Path)
+		if rw.status != http.StatusOK && rw.status != http.StatusNoContent {
+			return
+		}
+		key := extractReportKey(r.URL.Path)
+		if entry, ok := cache.GetReport(key); ok {
+			syncer.NotifyChange([]ReportEntry{entry}, nil)
+		} else {
 			syncer.NotifyChange(nil, []string{key})
 		}
 	})
