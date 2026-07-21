@@ -49,10 +49,10 @@ Control Plane
 1. Control plane sends `ssh_session_setup` SSE event with session parameters
 2. `HandleSSHSessionSetup` parses the payload and calls `SessionManager.CreateSession`
 3. `SessionManager` creates a `Session`, which opens a TCP listener on `meshIP:0`
-4. `TunnelReporter.ReportReady` notifies the control plane with the listen address
+4. `SessionActivityReporter.ReportSessionStarted` posts a `tcp` `session_started` row with the target host and port
 5. Client connects through the mesh to the listener; `Session` forwards to the target
 6. Session ends by expiry (`time.AfterFunc`), revocation (`session_revoked` SSE), or shutdown
-7. `TunnelReporter.ReportClosed` notifies the control plane with reason and duration
+7. The `SessionManager`'s on-closed callback fires `SessionActivityReporter.ReportSessionEnded`, posting a `tcp` `session_ended` row with byte counters and a `terminated_by` reason — for every close reason, `Shutdown` included
 
 ## Config
 
@@ -113,7 +113,7 @@ func NewSession(sessionID, targetHost string, targetPort int, meshIP string, exp
 | Method       | Signature                                  | Description                                              |
 |--------------|--------------------------------------------|----------------------------------------------------------|
 | `Start`      | `(ctx context.Context) (string, error)`    | Opens TCP listener on meshIP:0, starts accept loop       |
-| `Close`      | `() error`                                 | Idempotent shutdown: cancels context, closes listener and connection |
+| `Close`      | `() error`                                 | Idempotent shutdown: cancels context, closes listener and connection, then waits (bounded) for the forwarding goroutines so the byte counters are complete |
 | `ListenAddr` | `() string`                                | Returns listener address or empty string if not started  |
 
 ### Connection Lifecycle
@@ -149,7 +149,7 @@ func NewSessionManager(cfg Config, meshIP string, logger *slog.Logger) *SessionM
 |----------------|------------------------------------------------------------------|----------------------------------------------------------|
 | `CreateSession`| `(ctx context.Context, setup api.SSHSessionSetup) (string, error)` | Validates, creates, and starts a tunnel session          |
 | `CloseSession` | `(sessionID string, reason string) *ClosedSessionInfo`           | Closes and removes a session by ID; returns session info |
-| `Shutdown`     | `()`                                                             | Closes all active sessions                               |
+| `Shutdown`     | `()`                                                             | Closes all active sessions, reporting each through the on-closed callback |
 | `ActiveCount`  | `() int`                                                         | Returns number of active sessions                        |
 
 ### CreateSession Validation
@@ -195,8 +195,8 @@ Factory functions returning `api.EventHandler` for tunnel lifecycle events. Each
 
 | Factory                  | Event Type           | Payload Type                        | Action                                     |
 |--------------------------|----------------------|-------------------------------------|--------------------------------------------|
-| `HandleSSHSessionSetup`  | `ssh_session_setup`  | `api.SSHSessionSetup`               | `CreateSession` + `ReportReady`            |
-| `HandleSessionRevoked`   | `session_revoked`    | `{"session_id": "..."}`             | `CloseSession("revoked")` + `ReportClosed` |
+| `HandleSSHSessionSetup`  | `ssh_session_setup`  | `api.SSHSessionSetup`               | `CreateSession` + `ReportSessionStarted`   |
+| `HandleSessionRevoked`   | `session_revoked`    | `{"session_id": "..."}`             | `CloseSession("revoked")` (on-closed callback emits the `session_ended` row) |
 
 - Malformed payloads are logged at error level and return an error
 - `HandleSessionRevoked` is a no-op if the session ID is not found (logged at debug level)
@@ -208,21 +208,21 @@ mgr := tunnel.NewSessionManager(tunnel.Config{}, meshIP, logger)
 
 dispatcher := api.NewEventDispatcher(logger)
 dispatcher.Register("ssh_session_setup", tunnel.HandleSSHSessionSetup(mgr, reporter))
-dispatcher.Register("session_revoked", tunnel.HandleSessionRevoked(mgr, reporter))
+dispatcher.Register("session_revoked", tunnel.HandleSessionRevoked(mgr))
 ```
 
-## TunnelReporter
+## SessionActivityReporter
 
-Interface for reporting tunnel session lifecycle events to the control plane. Abstracted for testability.
+Interface for reporting `tcp`-phase session activity rows to the control plane. Abstracted for testability.
 
 ```go
-type TunnelReporter interface {
-    ReportReady(ctx context.Context, sessionID, listenAddr string)
-    ReportClosed(ctx context.Context, sessionID, reason string, duration time.Duration)
+type SessionActivityReporter interface {
+    ReportSessionStarted(ctx context.Context, sessionID, targetHost string, targetPort int)
+    ReportSessionEnded(ctx context.Context, sessionID, targetHost string, targetPort int, bytesIn, bytesOut int64, terminatedBy string)
 }
 ```
 
-A production implementation would use `api.ControlPlane.TunnelReady` and `api.ControlPlane.TunnelClosed`.
+A production implementation posts an `api.SessionActivityRequest` carrying a `tcp` `api.TCPActivity` to `api.ControlPlane.ReportSessionActivity` (`POST /v1/nodes/{node_id}/sessions/{session_id}`). `ReportSessionStarted` emits a `session_started` row; `ReportSessionEnded` emits a `session_ended` row with the byte counters and a `terminated_by` reason.
 
 ## API Types
 
@@ -242,32 +242,62 @@ type SSHSessionSetup struct {
 }
 ```
 
-### TunnelReadyRequest
+### SessionActivityRequest
 
-Sent by the node agent when a tunnel listener is ready.
+Posted by the node agent per session event. Exactly one of `SSH`, `K8s`, or `TCP`
+is set, selecting the session kind. The tunnel subsystem is an opaque TCP
+forwarder, so it always sets `TCP`; the `SSH` and `K8s` variants are carried by
+the type and accepted by the control plane but not emitted by any current session
+type.
 
 ```go
-type TunnelReadyRequest struct {
-    ListenAddr string    `json:"listen_addr"`
-    Timestamp  time.Time `json:"timestamp"`
+type SessionActivityRequest struct {
+    SSH *SSHActivity `json:"ssh,omitempty"`
+    K8s *K8sActivity `json:"k8s,omitempty"`
+    TCP *TCPActivity `json:"tcp,omitempty"`
 }
 ```
 
-**Endpoint**: `POST /v1/nodes/{node_id}/tunnels/{session_id}/ready`
+**Endpoint**: `POST /v1/nodes/{node_id}/sessions/{session_id}` (success: `204 No Content`)
 
-### TunnelClosedRequest
+### TCPActivity
 
-Sent by the node agent when a tunnel session closes.
+The `tcp` member: a session lifecycle row. `Phase` is `session_started` or
+`session_ended`. `BytesIn` (operator→target) and `BytesOut` (target→operator) are
+pointers so a `session_ended` row carries explicit zeros while a `session_started`
+row omits the byte counters. `TerminatedBy`, when set, is one of the
+`TerminatedBy*` values.
 
 ```go
-type TunnelClosedRequest struct {
-    Reason    string    `json:"reason"`
-    Duration  string    `json:"duration"`
-    Timestamp time.Time `json:"timestamp"`
+type TCPActivity struct {
+    Phase        string `json:"phase"`
+    TargetHost   string `json:"target_host,omitempty"`
+    TargetPort   int    `json:"target_port,omitempty"`
+    BytesIn      *int64 `json:"bytes_in,omitempty"`
+    BytesOut     *int64 `json:"bytes_out,omitempty"`
+    TerminatedBy string `json:"terminated_by,omitempty"`
 }
 ```
 
-**Endpoint**: `POST /v1/nodes/{node_id}/tunnels/{session_id}/closed`
+#### terminated_by mapping
+
+`TerminatedByFromReason` maps the internal session close reason to the wire
+`terminated_by` value reported on a `session_ended` row:
+
+| Close reason   | Wire value (`terminated_by`) |
+|----------------|------------------------------|
+| `expired`      | `ttl_expired`                |
+| `revoked`      | `operator_revoke`            |
+| any other      | `plexd_close`                |
+| _(reserved)_   | `idle_timeout`               |
+
+`idle_timeout` is reserved and never produced — the tunnel subsystem has no idle
+timer. The `session_ended` row is emitted by the `SessionManager`'s on-closed
+callback for **every** close reason: TTL expiry, operator revocation, and node
+shutdown alike. The row is the only carrier of a session's byte counters and
+`terminated_by`, so skipping it on shutdown would leave the control plane's
+audit record for every live session truncated — the node going offline says the
+session ended, but not how much traffic it carried.
 
 ## Integration Points
 
@@ -282,12 +312,11 @@ The tunnel package consumes two SSE event types via `api.EventDispatcher`:
 
 ### Control Plane API (`internal/api`)
 
-The node agent reports tunnel status via two endpoints on `api.ControlPlane`:
+The node agent reports session activity via a single endpoint on `api.ControlPlane`:
 
-| Method         | Endpoint                                          | When Called               |
-|----------------|---------------------------------------------------|---------------------------|
-| `TunnelReady`  | `POST /v1/nodes/{id}/tunnels/{sid}/ready`         | Listener is ready         |
-| `TunnelClosed` | `POST /v1/nodes/{id}/tunnels/{sid}/closed`        | Session closed            |
+| Method                  | Endpoint                             | When Called                                                            |
+|-------------------------|--------------------------------------|------------------------------------------------------------------------|
+| `ReportSessionActivity` | `POST /v1/nodes/{id}/sessions/{sid}` | Listener ready (`session_started`) and session close (`session_ended`) |
 
 ### WireGuard Mesh (`internal/wireguard`)
 

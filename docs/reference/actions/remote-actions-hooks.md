@@ -30,7 +30,7 @@ Control Plane (SSE)
      │ 2. Check duplicate execution_id            │
      │ 3. Check MaxConcurrent                     │
      │ 4. Look up action (builtins → hooks)       │
-     │ 5. Send ExecutionAck (accepted / rejected) │
+     │ 5. Post ack callback (accepted / rejected) │
      └──────────┬─────────────────────────────────┘
                 │ if accepted
                 ▼
@@ -54,9 +54,10 @@ Control Plane (SSE)
           └────────┬────────┘
                    │
                    ▼
-          ┌────────────────┐
-          │ ReportResult   │  POST /v1/nodes/{id}/executions/{eid}/result
-          └────────────────┘
+          ┌──────────────────────┐
+          │ ExecutionCallback    │  POST /v1/nodes/{id}/executions/{eid}
+          │ (started → terminal) │  (ack → started → succeeded|failed|cancelled)
+          └──────────────────────┘
 ```
 
 ## Config
@@ -130,17 +131,20 @@ Logger is tagged with `component=actions`.
 3. **Check concurrency**: if `len(active) >= MaxConcurrent`, reject with `reason=max_concurrent_reached`
 4. **Look up action**: search builtins map first, then hooks list
 5. **Unknown action**: reject with `reason=unknown_action`
-6. **Accept**: send `ExecutionAck{Status: "accepted"}` via `ActionReporter.AckExecution`
+6. **Accept**: post `ExecutionCallbackRequest{Status: "ack"}` via `ActionReporter.ExecutionCallback`
 7. **Execute**: launch goroutine calling `runAction` with timeout context
+
+A rejection (steps 1–3, 5) posts an `ack` callback followed by a `failed` terminal carrying `error=<reason>`. When the `ack` (or later `started`) callback is refused — a problem response whose `code` is `nsk_node_mismatch`, `invalid_state_transition`, or `execution_already_terminal` — plexd aborts without running or terminal-reporting the execution, because running it anyway would double-report. plexd keys that decision on the `code`, not on the bare `403`/`409` status: an intermediary's `403` is a transient failure, and treating it as a refusal would silently drop an action that then never runs and is never reported.
 
 ### runAction (goroutine)
 
-1. Parse timeout from `ActionRequest.Timeout` (capped by `Config.MaxActionTimeout`)
-2. Dispatch to `runBuiltin` or `runHook`
-3. Determine status: `success`, `failed` (non-zero exit), `timeout`, `cancelled`, `error`
-4. Build `api.ExecutionResult` with `ExecutionID`, `Status`, `ExitCode`, `Stdout`, `Stderr`, `Duration`, `FinishedAt`, `TriggeredBy`
-5. Report via `ActionReporter.ReportResult`
-6. Remove from active map
+1. Post `ExecutionCallbackRequest{Status: "started"}`; a coded refusal skips the run
+2. Parse timeout from `ActionRequest.Timeout` (capped by `Config.MaxActionTimeout`)
+3. Dispatch to `runBuiltin` or `runHook`
+4. Determine the terminal status via `terminalOutcome`: `succeeded` (exit 0), `failed` (non-zero exit, timeout, or run error), or `cancelled` (parent context cancelled)
+5. Build the terminal `ExecutionCallbackRequest` with `Status`, `ExitCode`, `Error`, and `Output` (base64 inline when ≤ 16 KiB, otherwise the declare → upload → object-key leg)
+6. Post the terminal callback via `ActionReporter.ExecutionCallback`, retrying a transient failure up to three times with exponential backoff (500 ms, 1 s) — the terminal callback is the only transition out of `started`, so giving up after one attempt would pin the invocation there forever. A coded refusal stops the retry immediately.
+7. Remove from active map
 
 ### runHook
 
@@ -149,7 +153,7 @@ Logger is tagged with `component=actions`.
 3. **Integrity verification**: call `HookVerifier.VerifyHook(ctx, nodeID, hookPath, checksum)`
 4. **Execute**: `exec.CommandContext` with `WaitDelay=500ms`
 5. **Environment**: minimal env (`PATH`, `HOME`, `PLEXD_NODE_ID`, `PLEXD_EXECUTION_ID`) plus `PLEXD_PARAM_*` vars
-6. **Output capture**: stdout and stderr captured in buffers, truncated to `MaxOutputBytes`
+6. **Output capture**: stdout and stderr each captured in a buffer truncated to `MaxOutputBytes`; the joined body is truncated back to `MaxOutputBytes` so a hook saturating both streams stays within the per-action cap
 
 ### Shutdown
 
@@ -171,7 +175,7 @@ Returns an `api.EventHandler` that:
 1. Parses `SignedEnvelope.Payload` into `api.ActionRequest`
 2. Returns error on malformed JSON (no ack sent; logged by dispatcher)
 3. Returns error on missing `execution_id`
-4. When `Config.Enabled` is `false`: sends rejected ack with `reason=actions_disabled`
+4. When `Config.Enabled` is `false`: routes through the executor's reject path, posting an `ack` callback followed by a `failed` terminal with `error=actions_disabled`
 5. Otherwise: delegates to `Executor.Execute`
 
 ## ActionReporter
@@ -180,12 +184,12 @@ Interface abstracting control plane communication for testability.
 
 ```go
 type ActionReporter interface {
-    AckExecution(ctx context.Context, nodeID, executionID string, ack api.ExecutionAck) error
-    ReportResult(ctx context.Context, nodeID, executionID string, result api.ExecutionResult) error
+    ExecutionCallback(ctx context.Context, nodeID, executionID string, req api.ExecutionCallbackRequest) (*api.ExecutionCallbackResponse, error)
+    UploadExecutionOutput(ctx context.Context, uploadURL string, output []byte) error
 }
 ```
 
-A production implementation wraps `api.ControlPlane.AckExecution` and `api.ControlPlane.ReportResult`.
+A production implementation wraps `api.ControlPlane.ExecutionCallback` and `api.ControlPlane.UploadExecutionOutput`.
 
 ## HookVerifier
 
@@ -571,13 +575,13 @@ Additional environment variables always set:
 
 ## Execution Status Values
 
-| Status      | Meaning                                              |
-|-------------|------------------------------------------------------|
-| `success`   | Action completed with exit code 0                    |
-| `failed`    | Action completed with non-zero exit code             |
-| `timeout`   | Action exceeded its timeout and was killed           |
-| `cancelled` | Action was cancelled (e.g., during shutdown)         |
-| `error`     | Internal error (integrity failure, file not found, etc.) |
+The terminal callback carries one of three statuses, chosen by `terminalOutcome`:
+
+| Status      | Meaning                                                                                       |
+|-------------|-----------------------------------------------------------------------------------------------|
+| `succeeded` | Action completed with exit code 0                                                              |
+| `failed`    | Non-zero exit, a timeout (`error="action timed out"`), or a run error (message in `error`)     |
+| `cancelled` | Parent context was cancelled (e.g., during shutdown)                                          |
 
 ## Ack Rejection Reasons
 
@@ -608,33 +612,62 @@ type ActionRequest struct {
 }
 ```
 
-### ExecutionAck
+### ExecutionCallbackRequest
 
-Sent to `POST /v1/nodes/{node_id}/executions/{execution_id}/ack`.
+The single callback posted to `POST /v1/nodes/{node_id}/executions/{execution_id}`,
+once per lifecycle transition. `Status` is one of the `ExecutionStatus*` values.
 
 ```go
-type ExecutionAck struct {
-    ExecutionID string `json:"execution_id"`
-    Status      string `json:"status"`   // "accepted" or "rejected"
-    Reason      string `json:"reason"`   // populated when rejected
+type ExecutionCallbackRequest struct {
+    Status              string           `json:"status"`
+    ExitCode            *int             `json:"exit_code,omitempty"`
+    Error               string           `json:"error,omitempty"`
+    DeclaredOutputBytes int64            `json:"declared_output_bytes,omitempty"`
+    Output              *ExecutionOutput `json:"output,omitempty"`
 }
 ```
 
-### ExecutionResult
+### ExecutionOutput
 
-Sent to `POST /v1/nodes/{node_id}/executions/{execution_id}/result`.
+Carries an execution's captured output on a terminal callback. `Inline` is the
+base64-encoded body, used only when it is at most 16 KiB; `ObjectKey` and `SHA256`
+describe an already-uploaded over-ceiling output.
 
 ```go
-type ExecutionResult struct {
-    ExecutionID string       `json:"execution_id"`
-    Status      string       `json:"status"`
-    ExitCode    int          `json:"exit_code"`
-    Stdout      string       `json:"stdout"`
-    Stderr      string       `json:"stderr"`
-    Duration    string       `json:"duration"`
-    FinishedAt  time.Time    `json:"finished_at"`
-    TriggeredBy *TriggeredBy `json:"triggered_by,omitempty"`
+type ExecutionOutput struct {
+    Inline    string `json:"inline,omitempty"`
+    ObjectKey string `json:"object_key,omitempty"`
+    SHA256    string `json:"sha256,omitempty"`
 }
+```
+
+### ExecutionCallbackResponse
+
+The `200` response to a callback. `OutputUploadURL` is a presigned PUT URL present
+only on the first callback that declares an over-ceiling output.
+
+```go
+type ExecutionCallbackResponse struct {
+    Status          string `json:"status"`
+    OutputUploadURL string `json:"output_upload_url,omitempty"`
+}
+```
+
+### ExecutionStatus constants
+
+```go
+const (
+    // ExecutionStatusAck acknowledges receipt of the action request.
+    ExecutionStatusAck = "ack"
+    // ExecutionStatusStarted reports that the action has begun running.
+    ExecutionStatusStarted = "started"
+    // ExecutionStatusSucceeded is the terminal callback for a successful run.
+    ExecutionStatusSucceeded = "succeeded"
+    // ExecutionStatusFailed is the terminal callback for a failed run.
+    ExecutionStatusFailed = "failed"
+    // ExecutionStatusCancelled is the terminal callback for a cancelled run.
+    ExecutionStatusCancelled = "cancelled"
+)
 ```
 
 ### CapabilitiesPayload
@@ -654,7 +687,7 @@ type CapabilitiesPayload struct {
 ### With internal/api
 
 - `EventActionRequest` constant defines the SSE event type
-- `api.ControlPlane.AckExecution` and `ReportResult` are the production implementations of `ActionReporter`
+- `api.ControlPlane.ExecutionCallback` and `UploadExecutionOutput` are the production implementations of `ActionReporter`
 - `api.ControlPlane.UpdateCapabilities` sends discovered capabilities
 
 ### With internal/integrity
@@ -713,15 +746,16 @@ exec.Shutdown(ctx)
 |------------------------------|-------------------------------------------------|
 | Malformed SSE payload        | Handler returns error (logged by dispatcher)    |
 | Missing execution_id         | Handler returns error                           |
-| Actions disabled             | Rejected ack with `reason=actions_disabled`     |
-| Unknown action               | Rejected ack with `reason=unknown_action`       |
-| Hook file missing            | Accepted ack, then error result                 |
-| Hook integrity failure       | Accepted ack, then error result                 |
-| Hook timeout                 | Process killed, result `status=timeout`         |
-| Hook non-zero exit           | Result `status=failed` with actual exit code    |
-| Result report fails          | Logged at warn level, agent continues           |
-| Ack report fails             | Logged at warn level                            |
-| Panic in action              | Recovered, error result reported                |
+| Actions disabled             | Ack callback, then `failed` terminal with `error=actions_disabled` |
+| Unknown action               | Ack callback, then `failed` terminal with `error=unknown_action`   |
+| Hook file missing            | `ack` + `started`, then `failed` terminal with `error` carrying the run error (e.g. `hook not found: <name>`) |
+| Hook integrity failure       | `failed` terminal with the integrity error message |
+| Hook timeout                 | Process killed; `failed` terminal with `error=action timed out` (there is no `timeout` wire status — the server sets timeout itself) |
+| Hook non-zero exit           | `failed` terminal with the actual `exit_code`   |
+| Terminal callback fails      | Retried up to 3 times with exponential backoff, then logged at warn level; agent continues |
+| Ack/started callback transport error | Logged at warn level, execution continues |
+| Callback refused (`nsk_node_mismatch`, `invalid_state_transition`, `execution_already_terminal`) | Execution aborted: no run, no terminal callback; a terminal refusal is not retried |
+| Panic in action              | Recovered; `failed` terminal with `error=panic: <value>` |
 
 ## Logging
 
@@ -732,8 +766,11 @@ All log entries use `component=actions`.
 | `Info`  | action_request received       | `execution_id`, `action`                    |
 | `Info`  | Action completed              | `execution_id`, `status`, `duration`        |
 | `Warn`  | Action rejected               | `execution_id`, `action`, `reason`          |
-| `Warn`  | Failed to send ack            | `execution_id`, `error`                     |
-| `Warn`  | Failed to report result       | `execution_id`, `error`                     |
+| `Warn`  | failed to send ack callback   | `execution_id`, `error`                     |
+| `Warn`  | failed to send started callback | `execution_id`, `error`                   |
+| `Warn`  | failed to send terminal callback | `execution_id`, `attempts`, `error`      |
+| `Error` | ack callback refused; aborting execution | `execution_id`, `error`          |
+| `Error` | started callback refused; skipping execution | `execution_id`, `error`      |
 | `Error` | Payload parse failed          | `event_id`, `error`                         |
 | `Error` | Missing execution_id          | `event_id`                                  |
 | `Warn`  | Actions disabled              | `execution_id`, `action`                    |
@@ -765,44 +802,100 @@ The control plane sends an `action_request` event over the existing SSE stream t
 | `type` | string | `builtin` or `hook` |
 | `parameters` | object | Key-value parameters passed to the action |
 | `timeout` | duration | Maximum execution time (default: 30s) |
-| `callback_url` | string | URL for ACK/NACK and result delivery |
+| `callback_url` | string | URL for execution status callbacks |
 
 The `issued_at`, `nonce`, and `signature` fields are part of the signed event envelope and apply to all SSE events uniformly.
 
-## ACK/NACK and Result Formats
+## Execution Callback Contract
 
-### ACK/NACK (immediate)
+Every lifecycle transition is a single `POST` to
+`/v1/nodes/{node_id}/executions/{execution_id}` carrying an
+`ExecutionCallbackRequest`. The server drives a closed state machine:
+`ack` → `started` → `succeeded` | `failed` | `cancelled`.
 
+The server refuses an illegal advance with `409 invalid_state_transition`, a
+callback on an already-settled invocation with `409 execution_already_terminal`, a
+foreign node's callback with `403 nsk_node_mismatch`, and inline output over 16
+KiB with `413 inline_output_too_large`. When the `ack` or `started` callback is
+refused with one of the three refusal codes above, plexd aborts the execution —
+it never runs or double-reports it. plexd matches on the problem `code`, not the
+`403`/`409` status, so an intermediary's `403` or an unrelated `409` stays a
+transient error: it is logged and tolerated like any other callback failure.
+
+### Ack
+
+```json
+{ "status": "ack" }
 ```
-POST {callback_url}/ack
 
+A rejected action (unknown action, duplicate, max-concurrent, shutting down, or
+actions disabled) follows the `ack` with a `failed` terminal whose `error` is the
+reason:
+
+```json
+{ "status": "failed", "error": "unknown_action" }
+```
+
+### Terminal with inline output
+
+Output at most 16 KiB travels base64-encoded in `output.inline` on the terminal
+callback:
+
+```json
 {
-  "execution_id": "exec_a1b2c3d4",
-  "status": "accepted",       // or "rejected"
-  "reason": ""                 // Reason if rejected (e.g. "unknown action", "integrity violation")
-}
-```
-
-### Result (asynchronous)
-
-```
-POST {callback_url}/result
-
-{
-  "execution_id": "exec_a1b2c3d4",
-  "status": "success",         // success, failure, timeout, cancelled
+  "status": "succeeded",
   "exit_code": 0,
-  "stdout": "...",             // Truncated to 64 KiB
-  "stderr": "...",             // Truncated to 64 KiB
-  "duration": "2.34s",
-  "finished_at": "2025-01-15T10:30:02Z"
+  "output": { "inline": "aGVsbG8gd29ybGQK" }
 }
 ```
 
-## Retry and Persistence
+### Terminal with uploaded output
 
-- If the callback POST fails, plexd retries with exponential backoff (1s, 2s, 4s, ... up to 5 minutes).
-- Pending results are persisted to `data_dir` and re-delivered when the SSE connection is re-established.
+Output larger than 16 KiB is not sent inline. plexd re-posts `started` declaring
+the byte count:
+
+```json
+{ "status": "started", "declared_output_bytes": 524288 }
+```
+
+The `200` response carries a one-time presigned PUT URL:
+
+```json
+{
+  "status": "started",
+  "output_upload_url": "https://blob.plexsphere.com/exec-output/exec_a1b2c3d4?token=b1c2d3e4"
+}
+```
+
+plexd derives the object key from the URL path, `PUT`s the raw bytes to that URL
+with `Content-Type: application/octet-stream` and no bearer token, then sends the
+terminal callback referencing the object by key and lowercase-hex SHA-256.
+Captured output routinely contains configuration and credentials, so the upload
+leg is pinned: the URL may not be less secure than the configured control-plane
+base URL (an `https` control plane can never downgrade an upload to `http`), and
+redirects are not followed — a `3xx` fails the upload rather than re-sending the
+body to the host it names. The URL itself is a bearer credential and is never
+written to a log, not even inside a wrapped transport error.
+
+```json
+{
+  "status": "succeeded",
+  "exit_code": 0,
+  "output": {
+    "object_key": "exec-output/exec_a1b2c3d4",
+    "sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+  }
+}
+```
+
+If any step of that upload leg fails, plexd falls back to truncated inline output
+on the terminal callback.
+
+## Retry
+
+- The terminal callback is retried up to three times with exponential backoff (500 ms, 1 s). A coded refusal stops the retry immediately, and so does a cancelled context.
+- `ack` and `started` callbacks are not retried: a transient failure there is logged and the execution continues, because the terminal callback still settles the invocation.
+- Callbacks are not persisted across a restart — a node that dies mid-execution leaves the invocation for the control plane to time out.
 
 ## Capability Announcement
 

@@ -268,30 +268,21 @@ shape the local node API serves for cached data entries.
 
 ## Executions
 
-### `POST /v1/nodes/{node_id}/executions/{execution_id}/ack`
+The `action_request` SSE payload and the single execution callback the node posts
+back to `POST /v1/nodes/{node_id}/executions/{execution_id}`.
 
-**ExecutionAck**
+### `action_request` SSE payload
 
-| Field        | Type   | JSON Tag         | Description            |
-|--------------|--------|------------------|------------------------|
-| `ExecutionID`| `string`| `"execution_id"`| Execution identifier   |
-| `Status`     | `string`| `"status"`      | Acknowledgement status |
-| `Reason`     | `string`| `"reason"`      | Status reason          |
+**ActionRequest**
 
-### `POST /v1/nodes/{node_id}/executions/{execution_id}/result`
-
-**ExecutionResult**
-
-| Field        | Type          | JSON Tag                   | Description            |
-|--------------|---------------|----------------------------|------------------------|
-| `ExecutionID`| `string`      | `"execution_id"`           | Execution identifier   |
-| `Status`     | `string`      | `"status"`                 | Final status           |
-| `ExitCode`   | `int`         | `"exit_code"`              | Process exit code      |
-| `Stdout`     | `string`      | `"stdout"`                 | Standard output        |
-| `Stderr`     | `string`      | `"stderr"`                 | Standard error         |
-| `Duration`   | `string`      | `"duration"`               | Execution duration     |
-| `FinishedAt` | `time.Time`   | `"finished_at"`            | Completion timestamp   |
-| `TriggeredBy`| `*TriggeredBy`| `"triggered_by,omitempty"` | Who triggered it       |
+| Field        | Type                | JSON Tag                  | Description                       |
+|--------------|---------------------|---------------------------|-----------------------------------|
+| `ExecutionID`| `string`            | `"execution_id"`          | Execution identifier              |
+| `Action`     | `string`            | `"action"`                | Action name (builtin or hook)     |
+| `Parameters` | `map[string]string` | `"parameters,omitempty"`  | Action parameters                 |
+| `Timeout`    | `string`            | `"timeout"`               | Requested execution timeout       |
+| `Checksum`   | `string`            | `"checksum,omitempty"`    | Expected hook checksum            |
+| `TriggeredBy`| `*TriggeredBy`      | `"triggered_by,omitempty"`| Who triggered the execution       |
 
 **TriggeredBy**
 
@@ -301,6 +292,46 @@ shape the local node API serves for cached data entries.
 | `SessionID`| `string`| `"session_id"`| Session ID        |
 | `UserID`   | `string`| `"user_id"`  | User ID            |
 | `Email`    | `string`| `"email"`    | User email         |
+
+### `POST /v1/nodes/{node_id}/executions/{execution_id}`
+
+A single callback advances an execution through its lifecycle, posted once per
+transition: `ack` → `started` → `succeeded` | `failed` | `cancelled`.
+
+**ExecutionCallbackRequest**
+
+| Field                | Type              | JSON Tag                          | Description                                             |
+|----------------------|-------------------|-----------------------------------|---------------------------------------------------------|
+| `Status`             | `string`          | `"status"`                        | One of the `ExecutionStatus*` values                    |
+| `ExitCode`           | `*int`            | `"exit_code,omitempty"`           | Process exit code on a terminal callback (explicit zero)|
+| `Error`              | `string`          | `"error,omitempty"`               | Failure reason on a `failed` terminal                   |
+| `DeclaredOutputBytes`| `int64`           | `"declared_output_bytes,omitempty"`| Captured output length; over 16 KiB drives the presign  |
+| `Output`             | `*ExecutionOutput`| `"output,omitempty"`              | Captured output on a terminal callback                  |
+
+**ExecutionOutput**
+
+| Field       | Type   | JSON Tag               | Description                                          |
+|-------------|--------|------------------------|------------------------------------------------------|
+| `Inline`    | `string`| `"inline,omitempty"`  | Base64 output body, used only when at most 16 KiB    |
+| `ObjectKey` | `string`| `"object_key,omitempty"`| Object-store key of an uploaded over-ceiling output|
+| `SHA256`    | `string`| `"sha256,omitempty"`  | Lowercase-hex SHA-256 of the uploaded bytes          |
+
+**ExecutionCallbackResponse**
+
+| Field            | Type   | JSON Tag                       | Description                                              |
+|------------------|--------|--------------------------------|----------------------------------------------------------|
+| `Status`         | `string`| `"status"`                    | The new invocation status                                |
+| `OutputUploadURL`| `string`| `"output_upload_url,omitempty"`| Presigned PUT URL, set only on the declaring callback    |
+
+**ExecutionStatus constants**
+
+| Constant                  | Value        | Description                                    |
+|---------------------------|--------------|------------------------------------------------|
+| `ExecutionStatusAck`      | `ack`        | Acknowledges receipt of the action request     |
+| `ExecutionStatusStarted`  | `started`    | Reports that the action has begun running       |
+| `ExecutionStatusSucceeded`| `succeeded`  | Terminal callback for a successful run          |
+| `ExecutionStatusFailed`   | `failed`     | Terminal callback for a failed run              |
+| `ExecutionStatusCancelled`| `cancelled`  | Terminal callback for a cancelled run           |
 
 ## Observability
 
@@ -442,6 +473,71 @@ propagated peer and PSK changes arrive via the next state pull.
 | `RotationID`     | `string` | `"rotation_id"`      | Identifier for this rotation               |
 | `KID`            | `string` | `"kid"`              | Key identifier for the rotated material    |
 | `WrapKeyVersion` | `int`    | `"wrap_key_version"` | Wrap-key version (monotonic, `>= 0`)       |
+
+## Sessions
+
+### `POST /v1/nodes/{node_id}/sessions/{session_id}`
+
+A one-of session activity record: exactly one of `ssh`, `k8s`, or `tcp` is set,
+selecting the session kind. plexd's tunnel subsystem is an opaque TCP forwarder,
+so it emits only `tcp` rows; the `ssh` and `k8s` variants are carried by the type
+and accepted by the server but not emitted by any current session type. Success
+is `204 No Content`.
+
+**SessionActivityRequest**
+
+| Field | Type           | JSON Tag          | Description                     |
+|-------|----------------|-------------------|---------------------------------|
+| `SSH` | `*SSHActivity` | `"ssh,omitempty"` | Per-command SSH session row      |
+| `K8s` | `*K8sActivity` | `"k8s,omitempty"` | Per-request Kubernetes API row   |
+| `TCP` | `*TCPActivity` | `"tcp,omitempty"` | TCP session lifecycle row        |
+
+**SSHActivity**
+
+| Field         | Type         | JSON Tag                  | Description                            |
+|---------------|--------------|---------------------------|----------------------------------------|
+| `Command`     | `string`     | `"command"`               | Executed command line (capped at 1 KiB)|
+| `ExitCode`    | `*int`       | `"exit_code,omitempty"`   | Command exit code                      |
+| `StartedAt`   | `*time.Time` | `"started_at,omitempty"`  | RFC 3339 start time                    |
+| `CompletedAt` | `*time.Time` | `"completed_at,omitempty"`| RFC 3339 completion time               |
+
+**K8sActivity**
+
+| Field          | Type    | JSON Tag                    | Description               |
+|----------------|---------|-----------------------------|---------------------------|
+| `Verb`         | `string`| `"verb"`                    | API verb                  |
+| `ResourceKind` | `string`| `"resource_kind,omitempty"` | Target resource kind      |
+| `Namespace`    | `string`| `"namespace,omitempty"`     | Target namespace          |
+| `Name`         | `string`| `"name,omitempty"`          | Target object name        |
+| `StatusCode`   | `int`   | `"status_code,omitempty"`   | Response status code      |
+| `DurationMS`   | `int64` | `"duration_ms,omitempty"`   | Request duration in ms    |
+
+**TCPActivity**
+
+| Field          | Type    | JSON Tag                   | Description                                             |
+|----------------|---------|----------------------------|---------------------------------------------------------|
+| `Phase`        | `string`| `"phase"`                  | One of the `TCPPhase*` values                           |
+| `TargetHost`   | `string`| `"target_host,omitempty"`  | Forward target host                                     |
+| `TargetPort`   | `int`   | `"target_port,omitempty"`  | Forward target port                                     |
+| `BytesIn`      | `*int64`| `"bytes_in,omitempty"`     | Operator→target bytes (explicit `0` on `session_ended`) |
+| `BytesOut`     | `*int64`| `"bytes_out,omitempty"`    | Target→operator bytes (explicit `0` on `session_ended`) |
+| `TerminatedBy` | `string`| `"terminated_by,omitempty"`| One of the `TerminatedBy*` values                       |
+
+**TCPPhase constants**
+
+| Constant                 | Value             | Description                  |
+|--------------------------|-------------------|------------------------------|
+| `TCPPhaseSessionStarted` | `session_started` | Opening of a TCP session     |
+| `TCPPhaseSessionEnded`   | `session_ended`   | Close of a TCP session       |
+
+**TerminatedBy constants**
+
+| Constant                     | Value            | Description                                   |
+|------------------------------|------------------|-----------------------------------------------|
+| `TerminatedByTTLExpired`     | `ttl_expired`    | Session reached its time-to-live              |
+| `TerminatedByIdleTimeout`    | `idle_timeout`   | Idle past its timeout (reserved; not emitted) |
+| `TerminatedByPlexdClose`     | `plexd_close`    | plexd closed the session locally              |
+| `TerminatedByOperatorRevoke` | `operator_revoke`| Operator's access was revoked                 |
 
 ## Artifacts
 
