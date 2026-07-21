@@ -1,0 +1,4 @@
+#!/bin/sh
+# E2E hook emitting a deterministic ~20 KiB body to drive the
+# over-ceiling execution output upload leg.
+head -c 20480 /dev/zero | tr '\0' 'A'
