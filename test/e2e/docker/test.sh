@@ -11,7 +11,7 @@
 #   - Agent restart for audit verification (ProcessSource fires per-process)
 #   - SSE event injection triggers reconciliation (state_count increases)
 #   - Action execution via SSE (action_request → ack + result)
-#   - Heartbeat-triggered reconcile via RotateKeys flag
+#   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Graceful shutdown (exit code 0, no crash indicators)
 set -euo pipefail
@@ -1053,17 +1053,20 @@ fi
 echo "=== Phase 8c PASSED: unknown action rejection ==="
 
 # ===================================================================
-# Phase 9: Heartbeat-triggered reconcile (RotateKeys flag)
+# Phase 9: Key rotation completes end to end (RotateKeys flag)
 # ===================================================================
-echo "=== Testing heartbeat-triggered reconcile via RotateKeys ==="
+echo "=== Testing key-rotation completion via RotateKeys ==="
 
-# Record current state_count before enabling RotateKeys.
+# Record current state_count and key_rotate_count before arming rotation.
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
 STATE_BEFORE_KR=$(get_counter "${RESPONSE}" "state_count")
+ROTATE_BEFORE_KR=$(get_counter "${RESPONSE}" "key_rotate_count")
 echo "  state_count before: ${STATE_BEFORE_KR}"
+echo "  key_rotate_count before: ${ROTATE_BEFORE_KR}"
 
 # Configure mock API to return RotateKeys: true in heartbeat responses.
-# This should trigger a reconcile cycle, which re-fetches state.
+# The agent should complete the rotation (POST /v1/keys/rotate) and then
+# reconcile, which re-fetches state.
 KR_CONFIG='{"reconcile":true,"rotate_keys":true}'
 KR_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
     -X POST -H "Content-Type: application/json" \
@@ -1074,7 +1077,49 @@ if [ "${KR_STATUS}" != "204" ]; then
 fi
 echo "  heartbeat response configured with rotate_keys=true"
 
-# Wait for state_count to increase (proving the RotateKeys flag triggered a reconcile).
+# Wait for key_rotate_count to strictly increase (rotation completed).
+# Assert monotonic increase, not == 1: while the fixture flag stays true
+# each served heartbeat re-arms and another rotation may complete before
+# the flag reset below.
+KR_ROTATE_TIMEOUT=60
+KR_ROTATE_ELAPSED=0
+while [ "${KR_ROTATE_ELAPSED}" -lt "${KR_ROTATE_TIMEOUT}" ]; do
+    sleep 3
+    KR_ROTATE_ELAPSED=$((KR_ROTATE_ELAPSED + 3))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        ROTATE_AFTER_KR=$(get_counter "${RESPONSE}" "key_rotate_count")
+        if [ "${ROTATE_AFTER_KR}" -gt "${ROTATE_BEFORE_KR}" ]; then
+            echo "  PASS: key_rotate_count increased from ${ROTATE_BEFORE_KR} to ${ROTATE_AFTER_KR} (rotation completed)"
+            break
+        fi
+    fi
+done
+
+if [ "${KR_ROTATE_ELAPSED}" -ge "${KR_ROTATE_TIMEOUT}" ]; then
+    ROTATE_AFTER_KR=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "key_rotate_count")
+    fail "key_rotate_count did not increase after RotateKeys=true (before=${ROTATE_BEFORE_KR}, after=${ROTATE_AFTER_KR})"
+fi
+
+# Validate the captured rotate request body: it must carry the new public
+# key and must NOT carry a node_id (the server identifies the node from
+# the NSK bearer credential).
+ROTATE_BODY=$(curl -sf "http://localhost:18080/test/last-request/key_rotate" 2>/dev/null || true)
+if [ -z "${ROTATE_BODY}" ]; then
+    fail "no captured key_rotate request body"
+fi
+if echo "${ROTATE_BODY}" | grep -q '"new_public_key"'; then
+    echo "  PASS: key_rotate body contains 'new_public_key'"
+else
+    fail "key_rotate body missing 'new_public_key' field (body: ${ROTATE_BODY})"
+fi
+if echo "${ROTATE_BODY}" | grep -q '"node_id"'; then
+    fail "key_rotate body unexpectedly contains 'node_id' (body: ${ROTATE_BODY})"
+fi
+echo "  PASS: key_rotate body does not contain 'node_id'"
+
+# Wait for state_count to increase too (peer view refreshes via pull after
+# the rotation-triggered reconcile).
 KR_TIMEOUT=60
 KR_ELAPSED=0
 while [ "${KR_ELAPSED}" -lt "${KR_TIMEOUT}" ]; do
@@ -1100,16 +1145,17 @@ curl -sf -X POST -H "Content-Type: application/json" \
     -d '{"reconcile":true,"rotate_keys":false}' \
     "http://localhost:18080/test/configure-heartbeat" >/dev/null 2>&1 || true
 
-echo "=== Phase 9 PASSED: heartbeat-triggered reconcile ==="
+echo "=== Phase 9 PASSED: key rotation completed end to end ==="
 
 # ===================================================================
-# Phase 9b: rotate_keys SSE event triggers reconcile (GAP-07)
+# Phase 9b: rotate_keys SSE event completes rotation (GAP-07)
 # ===================================================================
-echo "=== Testing rotate_keys SSE event ==="
+echo "=== Testing rotate_keys SSE event completion ==="
 
+# Record a fresh key_rotate_count baseline before injecting the event.
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
-STATE_BEFORE_RK=$(get_counter "${RESPONSE}" "state_count")
-echo "  state_count before: ${STATE_BEFORE_RK}"
+ROTATE_BEFORE_RK=$(get_counter "${RESPONSE}" "key_rotate_count")
+echo "  key_rotate_count before: ${ROTATE_BEFORE_RK}"
 
 # Inject a rotate_keys SSE event.
 RK_PAYLOAD=$(cat <<'RKEOF'
@@ -1132,28 +1178,29 @@ if [ "${RK_STATUS}" != "204" ]; then
 fi
 echo "  rotate_keys event injected"
 
-# Poll for state_count to increase (reconcile triggered).
-RK_TIMEOUT=15
+# Poll for a further key_rotate_count increase (event-driven rotation
+# completed on top of any heartbeat-driven rotations from Phase 9).
+RK_TIMEOUT=30
 RK_ELAPSED=0
 while [ "${RK_ELAPSED}" -lt "${RK_TIMEOUT}" ]; do
     sleep 2
     RK_ELAPSED=$((RK_ELAPSED + 2))
     RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
     if [ -n "${RESPONSE}" ]; then
-        STATE_AFTER_RK=$(get_counter "${RESPONSE}" "state_count")
-        if [ "${STATE_AFTER_RK}" -gt "${STATE_BEFORE_RK}" ]; then
-            echo "  PASS: state_count increased from ${STATE_BEFORE_RK} to ${STATE_AFTER_RK} after rotate_keys"
+        ROTATE_AFTER_RK=$(get_counter "${RESPONSE}" "key_rotate_count")
+        if [ "${ROTATE_AFTER_RK}" -gt "${ROTATE_BEFORE_RK}" ]; then
+            echo "  PASS: key_rotate_count increased from ${ROTATE_BEFORE_RK} to ${ROTATE_AFTER_RK} after rotate_keys"
             break
         fi
     fi
 done
 
 if [ "${RK_ELAPSED}" -ge "${RK_TIMEOUT}" ]; then
-    STATE_AFTER_RK=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
-    echo "  WARN: state_count did not increase after rotate_keys (before=${STATE_BEFORE_RK}, after=${STATE_AFTER_RK})"
+    ROTATE_AFTER_RK=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "key_rotate_count")
+    fail "key_rotate_count did not increase after rotate_keys event (before=${ROTATE_BEFORE_RK}, after=${ROTATE_AFTER_RK})"
 fi
 
-echo "=== Phase 9b PASSED: rotate_keys SSE event ==="
+echo "=== Phase 9b PASSED: rotate_keys SSE event completion ==="
 
 # ===================================================================
 # Phase 10: Deeper body validation
