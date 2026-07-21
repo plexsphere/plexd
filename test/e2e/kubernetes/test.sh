@@ -32,6 +32,15 @@ get_counter() {
     echo "${response}" | jq -r ".${key} // 0"
 }
 
+# --- Helper: base64-decode stdin portably across GNU and BSD/macOS ---
+# GNU coreutils spells decode as -d; older BSD/macOS base64 uses -D. Probe once
+# with a known value ("QQ==" -> "A") and bind b64_decode to whichever flag works.
+if printf 'QQ==' | base64 -d >/dev/null 2>&1; then
+    b64_decode() { base64 -d; }
+else
+    b64_decode() { base64 -D; }
+fi
+
 # Counter JSON keys (shared across extraction, checking, and reporting).
 COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count metrics_count logs_count audit_count)
 
@@ -517,12 +526,10 @@ echo "=== Phase 4 PASSED: pod restart resilience ==="
 # ===================================================================
 echo "=== Testing action execution via SSE ==="
 
-# Record current execution counters.
+# Record the execution callback counter (ack -> started -> terminal = +3).
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
-ACK_BEFORE=$(get_counter "${RESPONSE}" "execution_ack_count")
-RESULT_BEFORE=$(get_counter "${RESPONSE}" "execution_result_count")
-echo "  execution_ack_count before: ${ACK_BEFORE}"
-echo "  execution_result_count before: ${RESULT_BEFORE}"
+CB_BEFORE=$(get_counter "${RESPONSE}" "execution_callback_count")
+echo "  execution_callback_count before: ${CB_BEFORE}"
 
 # Inject an action_request SSE event for the builtin "system.info" action.
 ACTION_PAYLOAD=$(cat <<'ACTEOF'
@@ -551,65 +558,60 @@ if [ "${ACTION_STATUS}" != "204" ]; then
 fi
 echo "  action_request event injected successfully"
 
-# Poll for execution_ack_count and execution_result_count to increase.
+# Poll until execution_callback_count advances by at least 3.
 ACTION_TIMEOUT=30
 ACTION_ELAPSED=0
-ACK_PASSED=0
-RESULT_PASSED=0
+CB_PASSED=0
 while [ "${ACTION_ELAPSED}" -lt "${ACTION_TIMEOUT}" ]; do
     sleep 2
     ACTION_ELAPSED=$((ACTION_ELAPSED + 2))
     RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
     if [ -n "${RESPONSE}" ]; then
-        ACK_AFTER=$(get_counter "${RESPONSE}" "execution_ack_count")
-        RESULT_AFTER=$(get_counter "${RESPONSE}" "execution_result_count")
-        if [ "${ACK_AFTER}" -gt "${ACK_BEFORE}" ] && [ "${ACK_PASSED}" -eq 0 ]; then
-            echo "  PASS: execution_ack_count increased from ${ACK_BEFORE} to ${ACK_AFTER}"
-            ACK_PASSED=1
-        fi
-        if [ "${RESULT_AFTER}" -gt "${RESULT_BEFORE}" ] && [ "${RESULT_PASSED}" -eq 0 ]; then
-            echo "  PASS: execution_result_count increased from ${RESULT_BEFORE} to ${RESULT_AFTER}"
-            RESULT_PASSED=1
-        fi
-        if [ "${ACK_PASSED}" -eq 1 ] && [ "${RESULT_PASSED}" -eq 1 ]; then
+        CB_AFTER=$(get_counter "${RESPONSE}" "execution_callback_count")
+        if [ "${CB_AFTER}" -ge $((CB_BEFORE + 3)) ]; then
+            echo "  PASS: execution_callback_count advanced from ${CB_BEFORE} to ${CB_AFTER} (>= +3)"
+            CB_PASSED=1
             break
         fi
     fi
 done
 
-if [ "${ACK_PASSED}" -eq 0 ]; then
-    ACK_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_ack_count")
-    echo "FAIL: execution_ack_count did not increase (before=${ACK_BEFORE}, after=${ACK_AFTER})"
-    print_diagnostics
-    exit 1
-fi
-if [ "${RESULT_PASSED}" -eq 0 ]; then
-    RESULT_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_result_count")
-    echo "FAIL: execution_result_count did not increase (before=${RESULT_BEFORE}, after=${RESULT_AFTER})"
+if [ "${CB_PASSED}" -eq 0 ]; then
+    CB_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+    echo "FAIL: execution_callback_count did not reach $((CB_BEFORE + 3)) (before=${CB_BEFORE}, after=${CB_AFTER})"
     print_diagnostics
     exit 1
 fi
 
-# Validate execution_ack request body.
-ACK_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_ack" 2>/dev/null || true)
-if [ -n "${ACK_BODY}" ]; then
-    ACK_STATUS_VAL=$(echo "${ACK_BODY}" | jq -r '.status // empty')
-    if [ "${ACK_STATUS_VAL}" = "accepted" ]; then
-        echo "  PASS: execution_ack status = accepted"
-    else
-        echo "  WARN: execution_ack status = '${ACK_STATUS_VAL}', expected 'accepted'"
-    fi
+# Validate the terminal execution callback body.
+CB_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
+if [ -z "${CB_BODY}" ]; then
+    echo "FAIL: no execution_callback body captured"
+    print_diagnostics
+    exit 1
 fi
 
-# Validate execution_result request body.
-RESULT_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_result" 2>/dev/null || true)
-if [ -n "${RESULT_BODY}" ]; then
-    RES_STATUS_VAL=$(echo "${RESULT_BODY}" | jq -r '.status // empty')
-    if [ "${RES_STATUS_VAL}" = "success" ]; then
-        echo "  PASS: execution_result status = success"
-    else
-        echo "  WARN: execution_result status = '${RES_STATUS_VAL}', expected 'success'"
-    fi
+CB_STATUS=$(echo "${CB_BODY}" | jq -r '.status // empty')
+if [ "${CB_STATUS}" = "succeeded" ]; then
+    echo "  PASS: terminal callback status = succeeded"
+else
+    echo "FAIL: terminal callback status = '${CB_STATUS}', want 'succeeded'"
+    print_diagnostics
+    exit 1
+fi
+
+CB_INLINE=$(echo "${CB_BODY}" | jq -r '.output.inline // empty')
+if [ -z "${CB_INLINE}" ]; then
+    echo "FAIL: terminal callback missing non-empty output.inline"
+    print_diagnostics
+    exit 1
+fi
+if printf '%s' "${CB_INLINE}" | b64_decode >/dev/null 2>&1; then
+    echo "  PASS: terminal callback output.inline base64-decodes"
+else
+    echo "FAIL: terminal callback output.inline is not valid base64"
+    print_diagnostics
+    exit 1
 fi
 
 echo "=== Phase 5 PASSED: action execution ==="

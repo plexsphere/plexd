@@ -10,7 +10,7 @@
 #   - Log injection (docker cp into container, verify logs_count increases)
 #   - Agent restart for audit verification (ProcessSource fires per-process)
 #   - SSE event injection triggers reconciliation (state_count increases)
-#   - Action execution via SSE (action_request → ack + result)
+#   - Action execution via SSE (action_request → ack/started/terminal callbacks)
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Graceful shutdown (exit code 0, no crash indicators)
@@ -29,6 +29,24 @@ get_counter() {
     local response=$1 key=$2
     echo "${response}" | jq -r ".${key} // 0"
 }
+
+# --- Helper: base64-decode stdin portably across GNU and BSD/macOS ---
+# GNU coreutils spells decode as -d; older BSD/macOS base64 uses -D. Probe once
+# with a known value ("QQ==" -> "A") and bind b64_decode to whichever flag works.
+if printf 'QQ==' | base64 -d >/dev/null 2>&1; then
+    b64_decode() { base64 -d; }
+else
+    b64_decode() { base64 -D; }
+fi
+
+# --- Helper: lowercase-hex SHA-256 of stdin, taking field 1 ---
+# GNU coreutils ships sha256sum; BSD/macOS ships shasum. Both print
+# "<hex>  <name>", so field 1 is the digest.
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256_hex() { sha256sum | awk '{print $1}'; }
+else
+    sha256_hex() { shasum -a 256 | awk '{print $1}'; }
+fi
 
 # Counter JSON keys (shared across extraction, checking, and reporting).
 COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count metrics_count logs_count audit_count)
@@ -654,12 +672,11 @@ echo "=== Phase 7b PASSED: policy_updated SSE event ==="
 # ===================================================================
 echo "=== Testing action execution via SSE ==="
 
-# Record current execution counters.
+# Record the execution callback counter. A successful builtin run posts three
+# callbacks in sequence: ack -> started -> succeeded.
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
-ACK_BEFORE=$(get_counter "${RESPONSE}" "execution_ack_count")
-RESULT_BEFORE=$(get_counter "${RESPONSE}" "execution_result_count")
-echo "  execution_ack_count before: ${ACK_BEFORE}"
-echo "  execution_result_count before: ${RESULT_BEFORE}"
+CB_BEFORE=$(get_counter "${RESPONSE}" "execution_callback_count")
+echo "  execution_callback_count before: ${CB_BEFORE}"
 
 # Inject an action_request SSE event for the builtin "system.info" action.
 ACTION_PAYLOAD=$(cat <<'ACTEOF'
@@ -686,112 +703,88 @@ if [ "${ACTION_STATUS}" != "204" ]; then
 fi
 echo "  action_request event injected successfully"
 
-# Poll for execution_ack_count and execution_result_count to increase.
+# Poll until execution_callback_count advances by at least 3 (ack + started +
+# terminal).
 ACTION_TIMEOUT=30
 ACTION_ELAPSED=0
-ACK_PASSED=0
-RESULT_PASSED=0
+CB_PASSED=0
 while [ "${ACTION_ELAPSED}" -lt "${ACTION_TIMEOUT}" ]; do
     sleep 2
     ACTION_ELAPSED=$((ACTION_ELAPSED + 2))
     RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
     if [ -n "${RESPONSE}" ]; then
-        ACK_AFTER=$(get_counter "${RESPONSE}" "execution_ack_count")
-        RESULT_AFTER=$(get_counter "${RESPONSE}" "execution_result_count")
-        if [ "${ACK_AFTER}" -gt "${ACK_BEFORE}" ] && [ "${ACK_PASSED}" -eq 0 ]; then
-            echo "  PASS: execution_ack_count increased from ${ACK_BEFORE} to ${ACK_AFTER}"
-            ACK_PASSED=1
-        fi
-        if [ "${RESULT_AFTER}" -gt "${RESULT_BEFORE}" ] && [ "${RESULT_PASSED}" -eq 0 ]; then
-            echo "  PASS: execution_result_count increased from ${RESULT_BEFORE} to ${RESULT_AFTER}"
-            RESULT_PASSED=1
-        fi
-        if [ "${ACK_PASSED}" -eq 1 ] && [ "${RESULT_PASSED}" -eq 1 ]; then
+        CB_AFTER=$(get_counter "${RESPONSE}" "execution_callback_count")
+        if [ "${CB_AFTER}" -ge $((CB_BEFORE + 3)) ]; then
+            echo "  PASS: execution_callback_count advanced from ${CB_BEFORE} to ${CB_AFTER} (>= +3)"
+            CB_PASSED=1
             break
         fi
     fi
 done
 
-if [ "${ACK_PASSED}" -eq 0 ]; then
-    ACK_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_ack_count")
-    fail "execution_ack_count did not increase (before=${ACK_BEFORE}, after=${ACK_AFTER})"
-fi
-if [ "${RESULT_PASSED}" -eq 0 ]; then
-    RESULT_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_result_count")
-    fail "execution_result_count did not increase (before=${RESULT_BEFORE}, after=${RESULT_AFTER})"
+if [ "${CB_PASSED}" -eq 0 ]; then
+    CB_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+    fail "execution_callback_count did not reach $((CB_BEFORE + 3)) (before=${CB_BEFORE}, after=${CB_AFTER})"
 fi
 
-# Validate execution_ack request body.
-ACK_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_ack" 2>/dev/null || true)
-if [ -n "${ACK_BODY}" ]; then
-    ACK_EID=$(echo "${ACK_BODY}" | jq -r '.execution_id // empty')
-    ACK_STATUS_VAL=$(echo "${ACK_BODY}" | jq -r '.status // empty')
-    if [ "${ACK_EID}" = "exec-e2e-001" ]; then
-        echo "  PASS: execution_ack execution_id matches"
-    else
-        echo "  WARN: execution_ack execution_id = '${ACK_EID}', expected 'exec-e2e-001'"
-    fi
-    if [ "${ACK_STATUS_VAL}" = "accepted" ]; then
-        echo "  PASS: execution_ack status = accepted"
-    else
-        echo "  WARN: execution_ack status = '${ACK_STATUS_VAL}', expected 'accepted'"
-    fi
+# Validate the terminal execution callback body.
+CB_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
+if [ -z "${CB_BODY}" ]; then
+    fail "no execution_callback body captured"
 fi
 
-# Validate execution_result request body.
-RESULT_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_result" 2>/dev/null || true)
-if [ -n "${RESULT_BODY}" ]; then
-    RES_EID=$(echo "${RESULT_BODY}" | jq -r '.execution_id // empty')
-    RES_STATUS_VAL=$(echo "${RESULT_BODY}" | jq -r '.status // empty')
-    RES_STDOUT=$(echo "${RESULT_BODY}" | jq -r '.stdout // empty')
-    if [ "${RES_EID}" = "exec-e2e-001" ]; then
-        echo "  PASS: execution_result execution_id matches"
+CB_STATUS=$(echo "${CB_BODY}" | jq -r '.status // empty')
+if [ "${CB_STATUS}" = "succeeded" ]; then
+    echo "  PASS: terminal callback status = succeeded"
+else
+    fail "terminal callback status = '${CB_STATUS}', want 'succeeded'"
+fi
+
+CB_EXIT=$(echo "${CB_BODY}" | jq -r '.exit_code // empty')
+if [ "${CB_EXIT}" = "0" ]; then
+    echo "  PASS: terminal callback exit_code = 0"
+else
+    fail "terminal callback exit_code = '${CB_EXIT}', want 0"
+fi
+
+CB_INLINE=$(echo "${CB_BODY}" | jq -r '.output.inline // empty')
+if [ -z "${CB_INLINE}" ]; then
+    fail "terminal callback missing non-empty output.inline"
+fi
+echo "  PASS: terminal callback has output.inline"
+
+# GAP-03: Decode the inline output (base64) and validate system.info fields.
+RES_STDOUT=$(printf '%s' "${CB_INLINE}" | b64_decode)
+if echo "${RES_STDOUT}" | jq empty 2>/dev/null; then
+    INFO_HOSTNAME=$(echo "${RES_STDOUT}" | jq -r '.hostname // empty')
+    if [ -n "${INFO_HOSTNAME}" ]; then
+        echo "  PASS: system.info stdout has hostname='${INFO_HOSTNAME}'"
     else
-        echo "  WARN: execution_result execution_id = '${RES_EID}', expected 'exec-e2e-001'"
+        fail "system.info stdout missing 'hostname' field"
     fi
-    if [ "${RES_STATUS_VAL}" = "success" ]; then
-        echo "  PASS: execution_result status = success"
+
+    INFO_OS=$(echo "${RES_STDOUT}" | jq -r '.os // empty')
+    if [ "${INFO_OS}" = "linux" ]; then
+        echo "  PASS: system.info stdout os='linux'"
     else
-        echo "  WARN: execution_result status = '${RES_STATUS_VAL}', expected 'success'"
-    fi
-    if [ -n "${RES_STDOUT}" ]; then
-        echo "  PASS: execution_result has stdout output"
+        fail "system.info stdout os='${INFO_OS}', want 'linux'"
     fi
 
-    # GAP-03: Parse stdout as JSON and validate system.info fields.
-    if [ -n "${RES_STDOUT}" ]; then
-        if echo "${RES_STDOUT}" | jq empty 2>/dev/null; then
-            INFO_HOSTNAME=$(echo "${RES_STDOUT}" | jq -r '.hostname // empty')
-            if [ -n "${INFO_HOSTNAME}" ]; then
-                echo "  PASS: system.info stdout has hostname='${INFO_HOSTNAME}'"
-            else
-                fail "system.info stdout missing 'hostname' field"
-            fi
-
-            INFO_OS=$(echo "${RES_STDOUT}" | jq -r '.os // empty')
-            if [ "${INFO_OS}" = "linux" ]; then
-                echo "  PASS: system.info stdout os='linux'"
-            else
-                fail "system.info stdout os='${INFO_OS}', want 'linux'"
-            fi
-
-            INFO_NODE_ID=$(echo "${RES_STDOUT}" | jq -r '.node_id // empty')
-            if [ "${INFO_NODE_ID}" = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3" ]; then
-                echo "  PASS: system.info stdout node_id='0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3'"
-            else
-                fail "system.info stdout node_id='${INFO_NODE_ID}', want '0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3'"
-            fi
-
-            INFO_MESH_IP=$(echo "${RES_STDOUT}" | jq -r '.mesh_ip // empty')
-            if [ "${INFO_MESH_IP}" = "10.99.0.1" ]; then
-                echo "  PASS: system.info stdout mesh_ip='10.99.0.1'"
-            else
-                fail "system.info stdout mesh_ip='${INFO_MESH_IP}', want '10.99.0.1'"
-            fi
-        else
-            echo "  WARN: system.info stdout is not valid JSON"
-        fi
+    INFO_NODE_ID=$(echo "${RES_STDOUT}" | jq -r '.node_id // empty')
+    if [ "${INFO_NODE_ID}" = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3" ]; then
+        echo "  PASS: system.info stdout node_id='0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3'"
+    else
+        fail "system.info stdout node_id='${INFO_NODE_ID}', want '0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3'"
     fi
+
+    INFO_MESH_IP=$(echo "${RES_STDOUT}" | jq -r '.mesh_ip // empty')
+    if [ "${INFO_MESH_IP}" = "10.99.0.1" ]; then
+        echo "  PASS: system.info stdout mesh_ip='10.99.0.1'"
+    else
+        fail "system.info stdout mesh_ip='${INFO_MESH_IP}', want '10.99.0.1'"
+    fi
+else
+    fail "system.info decoded output is not valid JSON"
 fi
 
 echo "=== Phase 8 PASSED: action execution ==="
@@ -801,16 +794,16 @@ echo "=== Phase 8 PASSED: action execution ==="
 # ===================================================================
 echo "=== Testing additional builtin action types ==="
 
-# Helper function: inject an action, wait for result, validate.
+# Helper function: inject an action, wait for the terminal callback, validate.
 test_action() {
     local action_name=$1 exec_id=$2 nonce=$3
     shift 3
     # Remaining args are validation commands (passed as description only).
 
-    # Record current counters.
-    local resp ack_before result_before
+    # Record the execution callback counter (ack -> started -> terminal = +3).
+    local resp cb_before
     resp=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
-    result_before=$(get_counter "${resp}" "execution_result_count")
+    cb_before=$(get_counter "${resp}" "execution_callback_count")
 
     # Inject action_request SSE event.
     local payload
@@ -838,50 +831,47 @@ ACTEOF
         fail "${action_name} event injection returned status ${status}, want 204"
     fi
 
-    # Poll for execution_result_count to increase.
-    local timeout=30 elapsed=0
+    # Poll until execution_callback_count advances by at least 3.
+    local timeout=30 elapsed=0 cb_after
     while [ "${elapsed}" -lt "${timeout}" ]; do
         sleep 2
         elapsed=$((elapsed + 2))
         resp=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
         if [ -n "${resp}" ]; then
-            local result_after
-            result_after=$(get_counter "${resp}" "execution_result_count")
-            if [ "${result_after}" -gt "${result_before}" ]; then
+            cb_after=$(get_counter "${resp}" "execution_callback_count")
+            if [ "${cb_after}" -ge $((cb_before + 3)) ]; then
                 break
             fi
         fi
     done
 
     if [ "${elapsed}" -ge "${timeout}" ]; then
-        local result_after
-        result_after=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_result_count")
-        fail "${action_name}: execution_result_count did not increase (before=${result_before}, after=${result_after})"
+        cb_after=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+        fail "${action_name}: execution_callback_count did not reach $((cb_before + 3)) (before=${cb_before}, after=${cb_after})"
     fi
 
-    # Fetch and validate the result body.
-    local result_body
-    result_body=$(curl -sf "http://localhost:18080/test/last-request/execution_result" 2>/dev/null || true)
-    if [ -z "${result_body}" ]; then
-        fail "${action_name}: no execution_result body captured"
+    # Fetch and validate the terminal callback body.
+    local cb_body
+    cb_body=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
+    if [ -z "${cb_body}" ]; then
+        fail "${action_name}: no execution_callback body captured"
     fi
 
-    local res_status res_stdout
-    res_status=$(echo "${result_body}" | jq -r '.status // empty')
-    res_stdout=$(echo "${result_body}" | jq -r '.stdout // empty')
-    if [ "${res_status}" = "success" ]; then
-        echo "  PASS: ${action_name} result status = success"
+    local res_status res_inline
+    res_status=$(echo "${cb_body}" | jq -r '.status // empty')
+    res_inline=$(echo "${cb_body}" | jq -r '.output.inline // empty')
+    if [ "${res_status}" = "succeeded" ]; then
+        echo "  PASS: ${action_name} terminal callback status = succeeded"
     else
-        fail "${action_name} result status = '${res_status}', want 'success'"
+        fail "${action_name} terminal callback status = '${res_status}', want 'succeeded'"
     fi
-    if [ -n "${res_stdout}" ]; then
-        echo "  PASS: ${action_name} result has stdout"
-    else
-        fail "${action_name} result has empty stdout"
+    if [ -z "${res_inline}" ]; then
+        fail "${action_name} terminal callback has empty output.inline"
     fi
+    echo "  PASS: ${action_name} terminal callback has output.inline"
 
-    # Return stdout for caller-specific validation.
-    ACTION_STDOUT="${res_stdout}"
+    # Decode the inline output and return it for caller-specific validation.
+    ACTION_STDOUT=$(printf '%s' "${res_inline}" | b64_decode)
 }
 
 # 8b-1: diagnostics.collect -- should return JSON with hostname, os, cpu_count, load_avg.
@@ -968,12 +958,11 @@ echo "=== Phase 8b PASSED: additional action types ==="
 # ===================================================================
 echo "=== Testing unknown action rejection ==="
 
-# Record current counters.
+# Record the execution callback counter. A rejected action posts two callbacks:
+# ack -> failed (with error = reason).
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
-ACK_BEFORE_UNK=$(get_counter "${RESPONSE}" "execution_ack_count")
-RESULT_BEFORE_UNK=$(get_counter "${RESPONSE}" "execution_result_count")
-echo "  execution_ack_count before: ${ACK_BEFORE_UNK}"
-echo "  execution_result_count before: ${RESULT_BEFORE_UNK}"
+CB_BEFORE_UNK=$(get_counter "${RESPONSE}" "execution_callback_count")
+echo "  execution_callback_count before: ${CB_BEFORE_UNK}"
 
 # Inject action_request for a nonexistent action.
 UNK_PAYLOAD=$(cat <<'UNKEOF'
@@ -1000,57 +989,329 @@ if [ "${UNK_STATUS}" != "204" ]; then
 fi
 echo "  unknown action event injected"
 
-# Poll for execution_ack_count to increase.
+# Poll until execution_callback_count advances by at least 2 (ack + failed).
 UNK_TIMEOUT=15
 UNK_ELAPSED=0
-UNK_ACK_PASSED=0
+UNK_CB_PASSED=0
 while [ "${UNK_ELAPSED}" -lt "${UNK_TIMEOUT}" ]; do
     sleep 2
     UNK_ELAPSED=$((UNK_ELAPSED + 2))
     RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
     if [ -n "${RESPONSE}" ]; then
-        ACK_AFTER_UNK=$(get_counter "${RESPONSE}" "execution_ack_count")
-        if [ "${ACK_AFTER_UNK}" -gt "${ACK_BEFORE_UNK}" ]; then
-            echo "  PASS: execution_ack_count increased (rejected ack sent)"
-            UNK_ACK_PASSED=1
+        CB_AFTER_UNK=$(get_counter "${RESPONSE}" "execution_callback_count")
+        if [ "${CB_AFTER_UNK}" -ge $((CB_BEFORE_UNK + 2)) ]; then
+            echo "  PASS: execution_callback_count advanced from ${CB_BEFORE_UNK} to ${CB_AFTER_UNK} (>= +2)"
+            UNK_CB_PASSED=1
             break
         fi
     fi
 done
 
-if [ "${UNK_ACK_PASSED}" -eq 0 ]; then
-    ACK_AFTER_UNK=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_ack_count")
-    fail "execution_ack_count did not increase for unknown action (before=${ACK_BEFORE_UNK}, after=${ACK_AFTER_UNK})"
+if [ "${UNK_CB_PASSED}" -eq 0 ]; then
+    CB_AFTER_UNK=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+    fail "execution_callback_count did not reach $((CB_BEFORE_UNK + 2)) for unknown action (before=${CB_BEFORE_UNK}, after=${CB_AFTER_UNK})"
 fi
 
-# Validate the ack body shows rejected status.
-UNK_ACK_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_ack" 2>/dev/null || true)
-if [ -n "${UNK_ACK_BODY}" ]; then
-    UNK_ACK_STATUS=$(echo "${UNK_ACK_BODY}" | jq -r '.status // empty')
-    UNK_ACK_REASON=$(echo "${UNK_ACK_BODY}" | jq -r '.reason // empty')
-    if [ "${UNK_ACK_STATUS}" = "rejected" ]; then
-        echo "  PASS: unknown action ack status = 'rejected'"
-    else
-        fail "unknown action ack status = '${UNK_ACK_STATUS}', want 'rejected'"
-    fi
-    if [ "${UNK_ACK_REASON}" = "unknown_action" ]; then
-        echo "  PASS: unknown action ack reason = 'unknown_action'"
-    else
-        echo "  WARN: unknown action ack reason = '${UNK_ACK_REASON}', expected 'unknown_action'"
-    fi
+# Validate the terminal (failed) callback body: status failed, error = reason.
+UNK_CB_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
+if [ -z "${UNK_CB_BODY}" ]; then
+    fail "no execution_callback body captured for unknown action"
 fi
-
-# Verify execution_result_count did NOT increase (no result for rejected actions).
-sleep 3
-RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
-RESULT_AFTER_UNK=$(get_counter "${RESPONSE}" "execution_result_count")
-if [ "${RESULT_AFTER_UNK}" -eq "${RESULT_BEFORE_UNK}" ]; then
-    echo "  PASS: execution_result_count unchanged (no result sent for rejected action)"
+UNK_CB_STATUS=$(echo "${UNK_CB_BODY}" | jq -r '.status // empty')
+if [ "${UNK_CB_STATUS}" = "failed" ]; then
+    echo "  PASS: unknown action terminal callback status = 'failed'"
 else
-    echo "  WARN: execution_result_count changed from ${RESULT_BEFORE_UNK} to ${RESULT_AFTER_UNK} (unexpected)"
+    fail "unknown action terminal callback status = '${UNK_CB_STATUS}', want 'failed'"
+fi
+UNK_CB_ERROR=$(echo "${UNK_CB_BODY}" | jq -r '.error // empty')
+if [ "${UNK_CB_ERROR}" = "unknown_action" ]; then
+    echo "  PASS: unknown action terminal callback error = 'unknown_action'"
+else
+    fail "unknown action terminal callback error = '${UNK_CB_ERROR}', want 'unknown_action'"
 fi
 
 echo "=== Phase 8c PASSED: unknown action rejection ==="
+
+# ===================================================================
+# Phase 8d: Over-ceiling execution output upload
+# ===================================================================
+# The e2e-bigout hook prints ~20 KiB, past the 16 KiB inline ceiling, so the
+# node takes the presigned upload leg: ack -> started -> started (declaring
+# declared_output_bytes) -> terminal (succeeded, output.object_key+sha256) plus
+# one PUT. That is +4 execution callbacks and +1 execution upload.
+echo "=== Testing over-ceiling execution output upload ==="
+
+# plexd verifies hooks against a plain lowercase-hex sha256 of the file, so the
+# action_request must carry the hook's own checksum.
+HOOK_SHA=$(sha256_hex < "${SCRIPT_DIR}/hooks/e2e-bigout")
+echo "  e2e-bigout checksum: ${HOOK_SHA}"
+
+# The uploaded output is exactly 20480 'A' bytes; reproduce its sha256 locally so
+# the terminal callback's output.sha256 can be checked against a known value.
+EXPECTED_OUT_SHA=$(head -c 20480 /dev/zero | tr '\0' 'A' | sha256_hex)
+echo "  expected output sha256: ${EXPECTED_OUT_SHA}"
+
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+CB_BEFORE_BIG=$(get_counter "${RESPONSE}" "execution_callback_count")
+UP_BEFORE_BIG=$(get_counter "${RESPONSE}" "execution_upload_count")
+echo "  execution_callback_count before: ${CB_BEFORE_BIG}"
+echo "  execution_upload_count before: ${UP_BEFORE_BIG}"
+
+# Inject action_request for the e2e-bigout hook (interpolated heredoc: HOOK_SHA
+# must expand into the payload).
+BIG_PAYLOAD=$(cat <<BIGEOF
+{
+    "event_type": "action_request",
+    "event_id": "evt-e2e-big-001",
+    "issued_at": "2099-01-01T00:00:00Z",
+    "nonce": "e2e-big-nonce-001",
+    "payload": {
+        "execution_id": "exec-e2e-big-001",
+        "action": "e2e-bigout",
+        "timeout": "30s",
+        "checksum": "${HOOK_SHA}"
+    },
+    "signature": "mock-signature"
+}
+BIGEOF
+)
+BIG_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${BIG_PAYLOAD}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${BIG_STATUS}" != "204" ]; then
+    fail "e2e-bigout event injection returned status ${BIG_STATUS}, want 204"
+fi
+echo "  e2e-bigout action_request injected"
+
+# Poll until the upload landed (+1) AND all four callbacks arrived (+4).
+BIG_TIMEOUT=30
+BIG_ELAPSED=0
+BIG_PASSED=0
+while [ "${BIG_ELAPSED}" -lt "${BIG_TIMEOUT}" ]; do
+    sleep 2
+    BIG_ELAPSED=$((BIG_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        CB_AFTER_BIG=$(get_counter "${RESPONSE}" "execution_callback_count")
+        UP_AFTER_BIG=$(get_counter "${RESPONSE}" "execution_upload_count")
+        if [ "${UP_AFTER_BIG}" -ge $((UP_BEFORE_BIG + 1)) ] && [ "${CB_AFTER_BIG}" -ge $((CB_BEFORE_BIG + 4)) ]; then
+            echo "  PASS: execution_upload_count ${UP_BEFORE_BIG}->${UP_AFTER_BIG} (>= +1), execution_callback_count ${CB_BEFORE_BIG}->${CB_AFTER_BIG} (>= +4)"
+            BIG_PASSED=1
+            break
+        fi
+    fi
+done
+
+if [ "${BIG_PASSED}" -eq 0 ]; then
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    CB_AFTER_BIG=$(get_counter "${RESPONSE}" "execution_callback_count")
+    UP_AFTER_BIG=$(get_counter "${RESPONSE}" "execution_upload_count")
+    fail "over-ceiling run did not complete (upload ${UP_BEFORE_BIG}->${UP_AFTER_BIG} want >= +1, callback ${CB_BEFORE_BIG}->${CB_AFTER_BIG} want >= +4)"
+fi
+
+# Validate the terminal callback body: succeeded, object-referenced output.
+BIG_CB_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
+if [ -z "${BIG_CB_BODY}" ]; then
+    fail "no execution_callback body captured for over-ceiling run"
+fi
+
+BIG_CB_STATUS=$(echo "${BIG_CB_BODY}" | jq -r '.status // empty')
+if [ "${BIG_CB_STATUS}" = "succeeded" ]; then
+    echo "  PASS: over-ceiling terminal callback status = succeeded"
+else
+    fail "over-ceiling terminal callback status = '${BIG_CB_STATUS}', want 'succeeded'"
+fi
+
+BIG_OBJ_KEY=$(echo "${BIG_CB_BODY}" | jq -r '.output.object_key // empty')
+if [ "${BIG_OBJ_KEY}" = "exec-output/exec-e2e-big-001" ]; then
+    echo "  PASS: terminal callback output.object_key = 'exec-output/exec-e2e-big-001'"
+else
+    fail "terminal callback output.object_key = '${BIG_OBJ_KEY}', want 'exec-output/exec-e2e-big-001'"
+fi
+
+BIG_OUT_SHA=$(echo "${BIG_CB_BODY}" | jq -r '.output.sha256 // empty')
+if [ "${BIG_OUT_SHA}" = "${EXPECTED_OUT_SHA}" ]; then
+    echo "  PASS: terminal callback output.sha256 matches the uploaded bytes"
+else
+    fail "terminal callback output.sha256 = '${BIG_OUT_SHA}', want '${EXPECTED_OUT_SHA}'"
+fi
+
+BIG_INLINE=$(echo "${BIG_CB_BODY}" | jq -r '.output.inline // empty')
+if [ -z "${BIG_INLINE}" ]; then
+    echo "  PASS: terminal callback output.inline is absent (over-ceiling output)"
+else
+    fail "terminal callback unexpectedly carries output.inline for an over-ceiling run"
+fi
+
+echo "=== Phase 8d PASSED: over-ceiling execution output upload ==="
+
+# ===================================================================
+# Phase 8e: TCP session lifecycle (session_started + session_ended)
+# ===================================================================
+# An ssh_session_setup event brings up a tunnel listener, which reports a tcp
+# session_started row; a session_revoked event closes it, reporting a tcp
+# session_ended row with explicit zero byte counters and terminated_by
+# operator_revoke.
+echo "=== Testing TCP session lifecycle ==="
+
+# ExpiresAt 5 minutes ahead in RFC 3339 UTC (GNU date -d, BSD date -v fallback).
+EXPIRES_AT=$(date -u -d "+5 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+5M +%Y-%m-%dT%H:%M:%SZ)
+echo "  session expires_at: ${EXPIRES_AT}"
+
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+SESS_BEFORE=$(get_counter "${RESPONSE}" "session_activity_count")
+echo "  session_activity_count before: ${SESS_BEFORE}"
+
+# Inject ssh_session_setup (interpolated heredoc: EXPIRES_AT must expand).
+SSH_PAYLOAD=$(cat <<SSHEOF
+{
+    "event_type": "ssh_session_setup",
+    "event_id": "evt-e2e-sess-001",
+    "issued_at": "2099-01-01T00:00:00Z",
+    "nonce": "e2e-sess-nonce-001",
+    "payload": {
+        "session_id": "sess-e2e-001",
+        "target_host": "127.0.0.1",
+        "target_port": 8080,
+        "authorized_key": "",
+        "expires_at": "${EXPIRES_AT}"
+    },
+    "signature": "mock-signature"
+}
+SSHEOF
+)
+SSH_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${SSH_PAYLOAD}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${SSH_STATUS}" != "204" ]; then
+    fail "ssh_session_setup event injection returned status ${SSH_STATUS}, want 204"
+fi
+echo "  ssh_session_setup event injected"
+
+# Poll session_activity_count to +1 (session_started row).
+SESS_TIMEOUT=30
+SESS_ELAPSED=0
+SESS_START_PASSED=0
+while [ "${SESS_ELAPSED}" -lt "${SESS_TIMEOUT}" ]; do
+    sleep 2
+    SESS_ELAPSED=$((SESS_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        SESS_AFTER=$(get_counter "${RESPONSE}" "session_activity_count")
+        if [ "${SESS_AFTER}" -ge $((SESS_BEFORE + 1)) ]; then
+            echo "  PASS: session_activity_count advanced from ${SESS_BEFORE} to ${SESS_AFTER} (>= +1)"
+            SESS_START_PASSED=1
+            break
+        fi
+    fi
+done
+
+if [ "${SESS_START_PASSED}" -eq 0 ]; then
+    SESS_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_count")
+    fail "session_activity_count did not reach $((SESS_BEFORE + 1)) after ssh_session_setup (before=${SESS_BEFORE}, after=${SESS_AFTER})"
+fi
+
+# Validate the session_started row.
+START_BODY=$(curl -sf "http://localhost:18080/test/last-request/session_activity" 2>/dev/null || true)
+if [ -z "${START_BODY}" ]; then
+    fail "no session_activity body captured after ssh_session_setup"
+fi
+START_PHASE=$(echo "${START_BODY}" | jq -r '.tcp.phase // empty')
+if [ "${START_PHASE}" = "session_started" ]; then
+    echo "  PASS: session_activity tcp.phase = 'session_started'"
+else
+    fail "session_activity tcp.phase = '${START_PHASE}', want 'session_started'"
+fi
+START_HOST=$(echo "${START_BODY}" | jq -r '.tcp.target_host // empty')
+if [ "${START_HOST}" = "127.0.0.1" ]; then
+    echo "  PASS: session_activity tcp.target_host = '127.0.0.1'"
+else
+    fail "session_activity tcp.target_host = '${START_HOST}', want '127.0.0.1'"
+fi
+START_PORT=$(echo "${START_BODY}" | jq -r '.tcp.target_port // empty')
+if [ "${START_PORT}" = "8080" ]; then
+    echo "  PASS: session_activity tcp.target_port = 8080"
+else
+    fail "session_activity tcp.target_port = '${START_PORT}', want 8080"
+fi
+
+# Inject session_revoked to close the session.
+REV_PAYLOAD=$(cat <<'REVEOF'
+{
+    "event_type": "session_revoked",
+    "event_id": "evt-e2e-sess-revoke-001",
+    "issued_at": "2099-01-01T00:00:00Z",
+    "nonce": "e2e-sess-revoke-nonce-001",
+    "payload": {
+        "session_id": "sess-e2e-001"
+    },
+    "signature": "mock-signature"
+}
+REVEOF
+)
+REV_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${REV_PAYLOAD}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${REV_STATUS}" != "204" ]; then
+    fail "session_revoked event injection returned status ${REV_STATUS}, want 204"
+fi
+echo "  session_revoked event injected"
+
+# Poll session_activity_count to +2 (session_ended row).
+REV_ELAPSED=0
+SESS_END_PASSED=0
+while [ "${REV_ELAPSED}" -lt "${SESS_TIMEOUT}" ]; do
+    sleep 2
+    REV_ELAPSED=$((REV_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        SESS_AFTER=$(get_counter "${RESPONSE}" "session_activity_count")
+        if [ "${SESS_AFTER}" -ge $((SESS_BEFORE + 2)) ]; then
+            echo "  PASS: session_activity_count advanced to ${SESS_AFTER} (>= +2)"
+            SESS_END_PASSED=1
+            break
+        fi
+    fi
+done
+
+if [ "${SESS_END_PASSED}" -eq 0 ]; then
+    SESS_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_count")
+    fail "session_activity_count did not reach $((SESS_BEFORE + 2)) after session_revoked (before=${SESS_BEFORE}, after=${SESS_AFTER})"
+fi
+
+# Validate the session_ended row: phase, terminated_by, and numeric byte
+# counters (jq numbers so an absent field fails the check).
+REV_BODY=$(curl -sf "http://localhost:18080/test/last-request/session_activity" 2>/dev/null || true)
+if [ -z "${REV_BODY}" ]; then
+    fail "no session_activity body captured after session_revoked"
+fi
+REV_PHASE=$(echo "${REV_BODY}" | jq -r '.tcp.phase // empty')
+if [ "${REV_PHASE}" = "session_ended" ]; then
+    echo "  PASS: session_activity tcp.phase = 'session_ended'"
+else
+    fail "session_activity tcp.phase = '${REV_PHASE}', want 'session_ended'"
+fi
+REV_TERM=$(echo "${REV_BODY}" | jq -r '.tcp.terminated_by // empty')
+if [ "${REV_TERM}" = "operator_revoke" ]; then
+    echo "  PASS: session_activity tcp.terminated_by = 'operator_revoke'"
+else
+    fail "session_activity tcp.terminated_by = '${REV_TERM}', want 'operator_revoke'"
+fi
+if echo "${REV_BODY}" | jq -e '.tcp.bytes_in | numbers' >/dev/null 2>&1; then
+    echo "  PASS: session_activity tcp.bytes_in is present as a number"
+else
+    fail "session_activity tcp.bytes_in is not present as a number"
+fi
+if echo "${REV_BODY}" | jq -e '.tcp.bytes_out | numbers' >/dev/null 2>&1; then
+    echo "  PASS: session_activity tcp.bytes_out is present as a number"
+else
+    fail "session_activity tcp.bytes_out is not present as a number"
+fi
+
+echo "=== Phase 8e PASSED: TCP session lifecycle ==="
 
 # ===================================================================
 # Phase 9: Key rotation completes end to end (RotateKeys flag)

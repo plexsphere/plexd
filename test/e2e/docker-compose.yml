@@ -34,6 +34,7 @@ services:
     volumes:
       - ./docker/plexd-e2e.yaml:/etc/plexd/config.yaml:ro
       - ./docker/nodeapi-token:/etc/plexd/nodeapi-token:ro
+      - ./docker/hooks:/etc/plexd/hooks:ro
     tmpfs:
       - /var/lib/plexd
       - /var/run/plexd
