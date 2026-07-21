@@ -58,9 +58,9 @@ Capabilities are published after registration via `PUT /v1/nodes/{node_id}/capab
 
 **Peer**
 
-`Peer` is the WireGuard peer shape used **only** for the SSE `peer_*` payloads and
-`KeyRotateResponse`; it no longer appears on the state pull. It remains until
-issues #21/#25 migrate those contracts.
+`Peer` is the WireGuard peer shape used **only** for the SSE `peer_*` payloads;
+it no longer appears on the state pull. It remains until issue #25 migrates that
+contract.
 
 | Field        | Type       | JSON Tag       | Description                |
 |--------------|------------|----------------|----------------------------|
