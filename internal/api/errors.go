@@ -2,10 +2,12 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 )
@@ -103,6 +105,19 @@ func errorFromResponse(resp *http.Response) error {
 	}
 
 	return apiErr
+}
+
+// RedactURLError strips the request URL from a *url.Error, keeping only the
+// operation and the underlying cause. url.Error.Error() renders the full URL
+// including its query string, and a presigned upload URL carries its credential
+// there — logging such an error verbatim would publish a live write capability
+// against the object it points at. Errors of any other type pass through.
+func RedactURLError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Errorf("%s: %w", urlErr.Op, urlErr.Err)
+	}
+	return err
 }
 
 // isProblemJSON reports whether the given Content-Type header value denotes an

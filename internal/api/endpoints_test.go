@@ -810,3 +810,230 @@ func TestReportIntegrityViolation_Success(t *testing.T) {
 		t.Fatalf("ReportIntegrityViolation: %v", err)
 	}
 }
+
+func TestExecutionCallback_Success(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/nodes/n1/executions/exec1" {
+			t.Errorf("path = %s, want /v1/nodes/n1/executions/exec1", r.URL.Path)
+		}
+
+		var req ExecutionCallbackRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.Status != ExecutionStatusSucceeded {
+			t.Errorf("Status = %q, want %q", req.Status, ExecutionStatusSucceeded)
+		}
+		if req.ExitCode == nil || *req.ExitCode != 0 {
+			t.Errorf("ExitCode = %v, want pointer to 0", req.ExitCode)
+		}
+		if req.DeclaredOutputBytes != 32*1024 {
+			t.Errorf("DeclaredOutputBytes = %d, want %d", req.DeclaredOutputBytes, 32*1024)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(ExecutionCallbackResponse{
+			Status:          "awaiting_output",
+			OutputUploadURL: "https://store.example.com/outputs/exec1?sig=abc",
+		})
+	})
+
+	code := 0
+	resp, err := client.ExecutionCallback(context.Background(), "n1", "exec1", ExecutionCallbackRequest{
+		Status:              ExecutionStatusSucceeded,
+		ExitCode:            &code,
+		DeclaredOutputBytes: 32 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("ExecutionCallback: %v", err)
+	}
+	if resp.Status != "awaiting_output" {
+		t.Errorf("Status = %q, want %q", resp.Status, "awaiting_output")
+	}
+	if resp.OutputUploadURL != "https://store.example.com/outputs/exec1?sig=abc" {
+		t.Errorf("OutputUploadURL = %q, want the presigned URL", resp.OutputUploadURL)
+	}
+}
+
+func TestExecutionCallback_ProblemJSON409(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"type":"about:blank","title":"Conflict","status":409,"detail":"execution is already in a terminal state","code":"invalid_state_transition"}`)
+	})
+
+	_, err := client.ExecutionCallback(context.Background(), "n1", "exec1", ExecutionCallbackRequest{
+		Status: ExecutionStatusStarted,
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("errors.As failed to extract *APIError: %v", err)
+	}
+	if apiErr.StatusCode != 409 {
+		t.Errorf("StatusCode = %d, want 409", apiErr.StatusCode)
+	}
+	if apiErr.Code != "invalid_state_transition" {
+		t.Errorf("Code = %q, want %q", apiErr.Code, "invalid_state_transition")
+	}
+}
+
+func TestUploadExecutionOutput_NoBearerAndOctetStream(t *testing.T) {
+	payload := []byte("over-ceiling output bytes")
+	var gotMethod, gotContentType, gotAuth string
+	var gotBody []byte
+	reject := false
+	client, srv := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotContentType = r.Header.Get("Content-Type")
+		gotAuth = r.Header.Get("Authorization")
+		gotBody, _ = io.ReadAll(r.Body)
+		if reject {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	// newEndpointTestClient already set a bearer token; a presigned PUT must not
+	// carry it.
+
+	uploadURL := srv.URL + "/outputs/exec1?sig=abc"
+	if err := client.UploadExecutionOutput(context.Background(), uploadURL, payload); err != nil {
+		t.Fatalf("UploadExecutionOutput: %v", err)
+	}
+	if gotMethod != http.MethodPut {
+		t.Errorf("method = %s, want PUT", gotMethod)
+	}
+	if gotContentType != "application/octet-stream" {
+		t.Errorf("Content-Type = %q, want application/octet-stream", gotContentType)
+	}
+	if gotAuth != "" {
+		t.Errorf("Authorization = %q, want empty", gotAuth)
+	}
+	if string(gotBody) != string(payload) {
+		t.Errorf("body = %q, want %q", gotBody, payload)
+	}
+
+	// A non-2xx upload response surfaces an error.
+	reject = true
+	if err := client.UploadExecutionOutput(context.Background(), uploadURL, payload); err == nil {
+		t.Fatal("expected error on non-2xx upload response, got nil")
+	}
+}
+
+func TestUploadExecutionOutput_RejectsSchemeDowngrade(t *testing.T) {
+	// The upload URL comes from the control plane and the body is captured
+	// action output, so an https control plane must never be able to redirect
+	// the upload onto a plaintext leg.
+	cfg := Config{BaseURL: "https://control.example.com"}
+	client, err := NewControlPlane(cfg, "1.0.0-test", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const uploadURL = "http://collector.example/x?X-Amz-Signature=deadbeef"
+	err = client.UploadExecutionOutput(context.Background(), uploadURL, []byte("secret output"))
+	if err == nil {
+		t.Fatal("expected error for plaintext upload url, got nil")
+	}
+	if strings.Contains(err.Error(), "deadbeef") {
+		t.Errorf("error leaks the presigned url: %v", err)
+	}
+}
+
+func TestUploadExecutionOutput_DoesNotFollowRedirect(t *testing.T) {
+	redirected := make(chan []byte, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		redirected <- body
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(target.Close)
+
+	client, srv := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/stolen", http.StatusTemporaryRedirect)
+	})
+
+	err := client.UploadExecutionOutput(context.Background(), srv.URL+"/outputs/exec1", []byte("secret output"))
+	if err == nil {
+		t.Fatal("expected error on redirected upload, got nil")
+	}
+	select {
+	case body := <-redirected:
+		t.Errorf("body was re-sent to the redirect target: %q", body)
+	default:
+	}
+}
+
+func TestUploadExecutionOutput_TransportErrorRedactsURL(t *testing.T) {
+	// The presigned URL is a bearer credential; a transport failure must not
+	// write it into the node's log via the wrapped *url.Error.
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	closedURL := srv.URL
+	srv.Close()
+
+	cfg := Config{BaseURL: closedURL}
+	client, err := NewControlPlane(cfg, "1.0.0-test", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = client.UploadExecutionOutput(context.Background(), closedURL+"/outputs/exec1?X-Amz-Signature=deadbeef", []byte("out"))
+	if err == nil {
+		t.Fatal("expected transport error, got nil")
+	}
+	if strings.Contains(err.Error(), "deadbeef") || strings.Contains(err.Error(), "/outputs/exec1") {
+		t.Errorf("error leaks the presigned url: %v", err)
+	}
+}
+
+func TestReportSessionActivity_Success(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/nodes/n-001/sessions/sess-001" {
+			t.Errorf("path = %s, want /v1/nodes/n-001/sessions/sess-001", r.URL.Path)
+		}
+
+		var req SessionActivityRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.TCP == nil {
+			t.Fatal("TCP activity missing")
+		}
+		if req.TCP.Phase != TCPPhaseSessionEnded {
+			t.Errorf("Phase = %q, want %q", req.TCP.Phase, TCPPhaseSessionEnded)
+		}
+		if req.TCP.BytesIn == nil || *req.TCP.BytesIn != 1024 {
+			t.Errorf("BytesIn = %v, want pointer to 1024", req.TCP.BytesIn)
+		}
+		if req.TCP.TerminatedBy != TerminatedByPlexdClose {
+			t.Errorf("TerminatedBy = %q, want %q", req.TCP.TerminatedBy, TerminatedByPlexdClose)
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	var in, out int64 = 1024, 2048
+	err := client.ReportSessionActivity(context.Background(), "n-001", "sess-001", SessionActivityRequest{
+		TCP: &TCPActivity{
+			Phase:        TCPPhaseSessionEnded,
+			TargetHost:   "10.42.0.5",
+			TargetPort:   5432,
+			BytesIn:      &in,
+			BytesOut:     &out,
+			TerminatedBy: TerminatedByPlexdClose,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReportSessionActivity: %v", err)
+	}
+}

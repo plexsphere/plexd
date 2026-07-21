@@ -1316,3 +1316,257 @@ func TestBridgeInfo_SiteToSiteFields_JSONRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestExecutionCallbackRequest_AckOnly(t *testing.T) {
+	// The ack-only callback serializes to exactly one member.
+	data, err := json.Marshal(ExecutionCallbackRequest{Status: ExecutionStatusAck})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	const want = `{"status":"ack"}`
+	if string(data) != want {
+		t.Errorf("serialized = %s, want %s", data, want)
+	}
+}
+
+func TestExecutionCallbackRequest_TerminalInlineOutput(t *testing.T) {
+	code := 0
+	req := ExecutionCallbackRequest{
+		Status:   ExecutionStatusSucceeded,
+		ExitCode: &code,
+		Output:   &ExecutionOutput{Inline: "aGVsbG8="},
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	// The exit_code pointer keeps an explicit zero on the wire.
+	if string(raw["exit_code"]) != "0" {
+		t.Errorf("exit_code = %s, want 0", raw["exit_code"])
+	}
+	if string(raw["status"]) != `"succeeded"` {
+		t.Errorf("status = %s, want %q", raw["status"], "succeeded")
+	}
+	// error and declared_output_bytes stay absent when unset.
+	if _, ok := raw["error"]; ok {
+		t.Error("error should be omitted when empty")
+	}
+	if _, ok := raw["declared_output_bytes"]; ok {
+		t.Error("declared_output_bytes should be omitted when zero")
+	}
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal(raw["output"], &out); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	if string(out["inline"]) != `"aGVsbG8="` {
+		t.Errorf("output.inline = %s, want base64 body", out["inline"])
+	}
+	if _, ok := out["object_key"]; ok {
+		t.Error("object_key should be omitted for inline output")
+	}
+}
+
+func TestExecutionCallbackRequest_DeclaringForm(t *testing.T) {
+	// A large declared output length rides along without an output object.
+	data, err := json.Marshal(ExecutionCallbackRequest{
+		Status:              ExecutionStatusStarted,
+		DeclaredOutputBytes: 32 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if string(raw["declared_output_bytes"]) != "32768" {
+		t.Errorf("declared_output_bytes = %s, want 32768", raw["declared_output_bytes"])
+	}
+	if _, ok := raw["output"]; ok {
+		t.Error("output should be omitted when only the length is declared")
+	}
+}
+
+func TestExecutionCallbackRequest_ObjectKeyOutput(t *testing.T) {
+	req := ExecutionCallbackRequest{
+		Status: ExecutionStatusSucceeded,
+		Output: &ExecutionOutput{
+			ObjectKey: "outputs/exec-1.bin",
+			SHA256:    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		},
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal(raw["output"], &out); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	for _, key := range []string{"object_key", "sha256"} {
+		if _, ok := out[key]; !ok {
+			t.Errorf("output missing key %q", key)
+		}
+	}
+	if _, ok := out["inline"]; ok {
+		t.Error("inline should be omitted for an already-uploaded output")
+	}
+}
+
+func TestExecutionCallbackResponse_Decode(t *testing.T) {
+	const src = `{"status":"awaiting_output","output_upload_url":"https://store.example.com/outputs/exec-1?sig=abc"}`
+	var got ExecutionCallbackResponse
+	if err := json.Unmarshal([]byte(src), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Status != "awaiting_output" {
+		t.Errorf("Status = %q, want %q", got.Status, "awaiting_output")
+	}
+	if got.OutputUploadURL != "https://store.example.com/outputs/exec-1?sig=abc" {
+		t.Errorf("OutputUploadURL = %q, want the presigned URL", got.OutputUploadURL)
+	}
+
+	// output_upload_url is omitted when the callback declared no upload.
+	data, err := json.Marshal(ExecutionCallbackResponse{Status: "ack"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if s := string(data); strings.Contains(s, "output_upload_url") {
+		t.Errorf("output_upload_url should be omitted when empty, got: %s", s)
+	}
+}
+
+func TestSessionActivityRequest_TCPStarted(t *testing.T) {
+	req := SessionActivityRequest{
+		TCP: &TCPActivity{
+			Phase:      TCPPhaseSessionStarted,
+			TargetHost: "10.42.0.5",
+			TargetPort: 5432,
+		},
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// Exactly one one-of member appears.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		t.Fatal(err)
+	}
+	if len(top) != 1 {
+		t.Errorf("expected exactly 1 one-of member, got %d: %v", len(top), top)
+	}
+	var tcp map[string]json.RawMessage
+	if err := json.Unmarshal(top["tcp"], &tcp); err != nil {
+		t.Fatalf("decode tcp: %v", err)
+	}
+	for _, key := range []string{"phase", "target_host", "target_port"} {
+		if _, ok := tcp[key]; !ok {
+			t.Errorf("tcp missing key %q", key)
+		}
+	}
+	// A session_started row omits the byte counters and the terminated_by reason.
+	for _, key := range []string{"bytes_in", "bytes_out", "terminated_by"} {
+		if _, ok := tcp[key]; ok {
+			t.Errorf("session_started should omit %q", key)
+		}
+	}
+}
+
+func TestSessionActivityRequest_TCPEnded(t *testing.T) {
+	var in, out int64 = 0, 0
+	req := SessionActivityRequest{
+		TCP: &TCPActivity{
+			Phase:        TCPPhaseSessionEnded,
+			BytesIn:      &in,
+			BytesOut:     &out,
+			TerminatedBy: TerminatedByIdleTimeout,
+		},
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		t.Fatal(err)
+	}
+	var tcp map[string]json.RawMessage
+	if err := json.Unmarshal(top["tcp"], &tcp); err != nil {
+		t.Fatalf("decode tcp: %v", err)
+	}
+	// The byte-count pointers keep explicit zeros on a session_ended row.
+	if string(tcp["bytes_in"]) != "0" {
+		t.Errorf("bytes_in = %s, want 0", tcp["bytes_in"])
+	}
+	if string(tcp["bytes_out"]) != "0" {
+		t.Errorf("bytes_out = %s, want 0", tcp["bytes_out"])
+	}
+	if string(tcp["terminated_by"]) != `"idle_timeout"` {
+		t.Errorf("terminated_by = %s, want %q", tcp["terminated_by"], "idle_timeout")
+	}
+}
+
+func TestSessionActivityRequest_SSHRoundTrip(t *testing.T) {
+	started := time.Now().UTC().Truncate(time.Second)
+	completed := started.Add(90 * time.Second)
+	code := 0
+	orig := SessionActivityRequest{
+		SSH: &SSHActivity{
+			Command:     "systemctl restart plexd",
+			ExitCode:    &code,
+			StartedAt:   &started,
+			CompletedAt: &completed,
+		},
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := top["ssh"]; !ok {
+		t.Error("expected ssh member")
+	}
+	if _, ok := top["tcp"]; ok {
+		t.Error("tcp should be omitted when only ssh is set")
+	}
+}
+
+func TestSessionActivityRequest_K8sRoundTrip(t *testing.T) {
+	orig := SessionActivityRequest{
+		K8s: &K8sActivity{
+			Verb:         "get",
+			ResourceKind: "pods",
+			Namespace:    "default",
+			Name:         "web-0",
+			StatusCode:   200,
+			DurationMS:   42,
+		},
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		t.Fatal(err)
+	}
+	var k8s map[string]json.RawMessage
+	if err := json.Unmarshal(top["k8s"], &k8s); err != nil {
+		t.Fatalf("decode k8s: %v", err)
+	}
+	for _, key := range []string{"verb", "resource_kind", "namespace", "name", "status_code", "duration_ms"} {
+		if _, ok := k8s[key]; !ok {
+			t.Errorf("k8s missing key %q", key)
+		}
+	}
+}
