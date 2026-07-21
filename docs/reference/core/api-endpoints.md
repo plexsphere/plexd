@@ -176,33 +176,44 @@ Sent on shutdown or explicit `plexd deregister` command. No request body.
 
 ### POST /v1/keys/rotate
 
-Called after receiving a `rotate_keys` SSE event.
+Called after a `rotate_keys` signal — the heartbeat `rotate_keys` flag or a
+`rotate_keys` SSE event — to complete a pending mesh-key rotation. The request
+carries no node id; the server identifies the rotating node from its NSK bearer
+credential. The node stages a fresh keypair before submitting its public key.
 
 **Request body:**
 
 ```json
 {
-  "node_id": "n_abc123",
   "new_public_key": "base64-encoded-curve25519-public-key"
 }
 ```
 
-**Response** (`200 OK`):
+**Response** (`200 OK`) is a rotation receipt — never a peer list. The propagated
+peer and PSK changes arrive via the next state pull.
 
 ```json
 {
-  "updated_peers": [
-    {
-      "id": "n_peer456",
-      "public_key": "base64-encoded-curve25519-public-key",
-      "mesh_ip": "10.100.1.2",
-      "endpoint": "203.0.113.10:51820",
-      "allowed_ips": ["10.100.1.2/32"],
-      "psk": "base64-encoded-new-psk"
-    }
-  ]
+  "rotation_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1",
+  "kid": "did:web:plexsphere.com#psk-2026-04",
+  "wrap_key_version": 3
 }
 ```
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `200 OK` | — | Rotation completed; an idempotent retry of a completed rotation replays the prior receipt |
+| `400 Bad Request` | `malformed_keys_rotate_request` | Body is unreadable or fails strict decoding |
+| `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked |
+| `403 Forbidden` | — | ReBAC denial |
+| `404 Not Found` | `keys_rotate_peer_not_found` | Rotating node is not a known peer |
+| `409 Conflict` | `keys_rotate_no_pending_rotation` | No rotation is pending for this node |
+| `413 Payload Too Large` | `keys_rotate_body_too_large` | Body exceeds 4 KiB |
+| `422 Unprocessable Entity` | `keys_rotate_public_key_invalid` | `new_public_key` is not 32 bytes or is all-zero |
+| `422 Unprocessable Entity` | `keys_rotate_public_key_unchanged` | `new_public_key` is byte-identical to the node's current key |
+| `500 Internal Server Error` | — | Rotation transaction rolled back |
 
 ## Capabilities
 

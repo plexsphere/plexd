@@ -33,6 +33,7 @@ The directory is also referenced by `registration.data_dir` and `node_api.data_d
 | File | Key Type | Algorithm | Purpose | Received From |
 |------|----------|-----------|---------|---------------|
 | `private_key` | Curve25519 private key | X25519 (WireGuard) | Mesh traffic encryption and authentication | Generated locally during registration |
+| `rotation_pending_key` | Curve25519 private key (staged) | X25519 (WireGuard) | Staged private key for an in-flight rotation; same base64 encoding as `private_key`; removed on completion or discard | Generated locally when a rotation is signaled |
 | (in-memory, per peer) | Pre-Shared Key (PSK) | 256-bit symmetric | Post-quantum defense layer for each peer pair | Control plane, delivered with peer configuration |
 | `node_secret_key` | Node Secret Key (NSK) | AES-256-GCM | Decrypts secret values fetched from the control plane | Control plane, issued during registration |
 | `signing_public_key` | Ed25519 public key | Ed25519 | Verifies SSE event signatures and session JWT tokens | Control plane, issued during registration |
@@ -43,7 +44,7 @@ The directory is also referenced by `registration.data_dir` and `node_api.data_d
 
 The Curve25519 keypair is generated locally by the node during registration (`internal/registration`). The private key is base64-encoded and written to `data_dir/private_key`. The corresponding public key is sent to the control plane as part of the registration request; it is not stored separately on disk.
 
-WireGuard uses this keypair for all mesh traffic encryption. When keys are rotated, a new keypair is generated, the new public key is uploaded via `POST /v1/keys/rotate`, and the control plane returns an updated peer list.
+WireGuard uses this keypair for all mesh traffic encryption. When keys are rotated, a new keypair is generated and its public key is uploaded via `POST /v1/keys/rotate`; the control plane returns a rotation receipt (`rotation_id`, `kid`, `wrap_key_version`). The updated peer view arrives afterwards via the state pull, not as a response peer list.
 
 ### Pre-Shared Keys (PSK)
 
@@ -55,10 +56,10 @@ PSKs are not written to individual files on disk. They are part of the peer conf
 
 The NSK is an AES-256 symmetric key used with GCM mode to decrypt secret values fetched from the control plane (`GET /v1/nodes/{node_id}/secrets/{key}`). It is received during registration and stored as a raw string in `data_dir/node_secret_key`.
 
-The NSK can be rotated:
+The NSK is rotated independently of the mesh keypair:
 
-- **Together with mesh keys** -- when the control plane signals `rotate_keys` via heartbeat response or SSE event, the full key rotation flow (including NSK refresh) is triggered.
-- **Independently** -- the control plane can rotate the NSK without rotating the Curve25519 mesh keypair.
+- **Mesh keypair only** -- when the control plane signals `rotate_keys` via heartbeat response or SSE event, only the Curve25519 mesh keypair is rotated. The `POST /v1/keys/rotate` response carries no NSK.
+- **NSK rotation** -- the control plane rotates the NSK as an independent concern, without rotating the Curve25519 mesh keypair.
 
 After rotation, the control plane re-encrypts all secrets with the new NSK. The old NSK is overwritten atomically on disk.
 
@@ -105,8 +106,9 @@ All key files are written with mode `0600` (owner read/write only). The `data_di
 | Path | Mode | Contents |
 |------|------|----------|
 | `data_dir/` | `0700` | Key storage directory |
-| `data_dir/identity.json` | `0600` | `node_id`, `mesh_ip`, `signing_public_key` (JSON) |
+| `data_dir/identity.json` | `0600` | `node_id`, `mesh_ip`, `signing_public_key`, `last_rotation` (rotation receipt) (JSON) |
 | `data_dir/private_key` | `0600` | Base64-encoded Curve25519 private key |
+| `data_dir/rotation_pending_key` | `0600` | Base64-encoded staged rotation private key |
 | `data_dir/node_secret_key` | `0600` | Raw AES-256 Node Secret Key |
 | `data_dir/signing_public_key` | `0600` | Raw Ed25519 public key string |
 
@@ -132,11 +134,14 @@ Key rotation can be triggered in two ways:
 
 #### Mesh Key Rotation (`rotate_keys`)
 
-1. Control plane signals rotation via heartbeat or `rotate_keys` SSE event.
-2. Node generates a new Curve25519 keypair.
-3. Node calls `POST /v1/keys/rotate` with the new public key.
-4. Control plane responds with updated peers (new PSKs included).
-5. Node updates the WireGuard interface and overwrites `private_key` on disk.
+1. Control plane signals rotation via the heartbeat `rotate_keys` flag or the `rotate_keys` SSE event.
+2. Node loads the staged `rotation_pending_key`, or generates a fresh Curve25519 keypair and stages it crash-safe (base64, mode `0600`, atomic write) **before** any HTTP call.
+3. Node calls `POST /v1/keys/rotate` with `{new_public_key}`.
+4. On a `200` receipt carrying `rotation_id` and `kid` -- or a `422 keys_rotate_public_key_unchanged`, which means an earlier submission already landed -- the node commits: it swaps `private_key`, persists the receipt as `last_rotation` in `identity.json`, and removes the staging file. The commit re-reads `identity.json` first, so it only ever advances `private_key` and `last_rotation` and never writes back an identity that a re-registration has replaced.
+5. Node updates the WireGuard device private key, retrying a failed install with a backoff that spans about two minutes: the committed key is already published to every peer, so a device left on the old key would reject every handshake.
+6. Node triggers a reconcile -- the propagated peer and PSK changes arrive via the state pull, not as a rotate response.
+
+On `409 keys_rotate_no_pending_rotation` the signal is stale or cancelled, so the staged key is discarded. A permanent rejection -- `400`, `403`, `413`, `404 keys_rotate_peer_not_found`, or `422 keys_rotate_public_key_invalid` -- discards it too, because no resubmit changes the answer. A staged key that never received a terminal answer -- after a crash between a landed submit and the local commit, a `5xx`, or a `200` whose body carries no receipt because the control plane predates this contract -- is resubmitted by `RecoverPending` with a capped exponential backoff (5s doubling to 2min). That sweep runs for the lifetime of the process, not only at startup: a rotation the control plane completed is never signalled again, so a submit whose response was lost would otherwise leave the node on the old key until a restart.
 
 #### NSK Rotation
 
@@ -179,5 +184,7 @@ The NSK is rotated together with mesh keys or independently via the control plan
 | Signing key rotation handler | `cmd/plexd/cmd/up.go` |
 | WireGuard peer key rotation | `internal/wireguard/handler.go` |
 | Key rotate API endpoint | `internal/api/endpoints.go` |
+| Key rotation service | `internal/agent/keyrotation.go` |
+| Rotation staging and receipt | `internal/registration/rotation.go` |
 | Event types | `internal/api/envelope.go` |
 | Signing key types | `internal/api/types.go` |

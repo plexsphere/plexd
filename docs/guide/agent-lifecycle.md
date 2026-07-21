@@ -71,7 +71,7 @@ Heartbeat payload:
 |---|---|
 | `200 OK` | Heartbeat acknowledged, no action required |
 | `200 OK` + `{ "reconcile": true }` | Trigger immediate reconciliation (out-of-band hint) |
-| `200 OK` + `{ "rotate_keys": true }` | Trigger key rotation (redundant with SSE, serves as fallback) |
+| `200 OK` + `{ "rotate_keys": true }` | Trigger the mesh-key rotation flow: generate, stage, submit, swap (redundant with SSE, serves as fallback) |
 | `400 Bad Request` + `{ "code": "clock_skew" }` | `client_now` drifted more than 60s from the control plane; sync the system clock via NTP |
 | `401 Unauthorized` | Node identity invalid, re-register |
 

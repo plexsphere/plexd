@@ -158,6 +158,61 @@ configurable `HeartbeatResponse` fixture (defaults to `reconcile: true`,
 
 **Error:** Denials use `application/problem+json` with the codes above. Returns `405` if the HTTP method is not `POST`.
 
+### `POST /v1/keys/rotate`
+
+Models the v1 key-rotation receipt contract (issue #21). The control plane
+*arms* a pending rotation, the node submits its freshly staged public key, and
+the mock answers a receipt — replaying the stored receipt on an idempotent
+retry. `key_rotate_count` advances only on a completing rotation.
+
+**Arming.** A rotation is armed from three sources, mirroring a control plane
+that keeps signaling while a rotation is pending:
+
+- `POST /test/configure-heartbeat` with `rotate_keys: true`;
+- each served heartbeat response that carries `rotate_keys: true` re-arms;
+- an injected `rotate_keys` SSE event (`POST /test/inject-event`).
+
+A completing rotation disarms.
+
+**Request body:** the node identifies itself through its NSK bearer credential,
+so the body carries no node id.
+
+```json
+{ "new_public_key": "<44-char standard base64 X25519 public key>" }
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "rotation_id": "e2e-rotation-0001",
+  "kid": "did:web:plexsphere.com#psk-2026-04",
+  "wrap_key_version": 1
+}
+```
+
+`rotation_id` is `e2e-rotation-%04d`, `kid` is fixed, and `wrap_key_version`
+equals the completion count.
+
+**Served taxonomy.** The handler serves this subset:
+
+| Status | Problem `code` | Trigger |
+|--------|----------------|---------|
+| `400 Bad Request` | `malformed_keys_rotate_request` | Body is unreadable or fails strict decoding |
+| `413 Payload Too Large` | `keys_rotate_body_too_large` | Body exceeds 4 KiB |
+| `422 Unprocessable Entity` | `keys_rotate_public_key_invalid` | `new_public_key` is not a non-zero 44-char standard base64 X25519 key |
+| `422 Unprocessable Entity` | `keys_rotate_public_key_unchanged` | `new_public_key` matches the node's current key and no receipt is stored for it |
+| `409 Conflict` | `keys_rotate_no_pending_rotation` | No rotation is armed |
+| `200 OK` | — | Idempotent retry: replays the stored receipt without moving the counter |
+| `200 OK` | — | Completion: mints and stores a fresh receipt, disarms, and increments `key_rotate_count` |
+
+The mock deliberately does **not** model `404 keys_rotate_peer_not_found` or
+`403` (ReBAC denial) — server states plexd cannot reach in e2e.
+
+**Content-Type:** `application/json` (errors use `application/problem+json`).
+
+**Counter:** Increments `key_rotate_count` only on a completing rotation.
+
 ### `PUT /v1/nodes/{id}/endpoint`
 
 Enforces the v1 endpoint contract: a 4 KiB body cap, strict JSON decoding, a
@@ -595,7 +650,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `state_count` | `GET /v1/nodes/{id}/state` |
 | `metadata_count` | `GET /v1/nodes/{id}/metadata` |
 | `deregister_count` | `POST /v1/nodes/{id}/deregister` |
-| `key_rotate_count` | `POST /v1/keys/rotate` |
+| `key_rotate_count` | `POST /v1/keys/rotate` (completed rotations only) |
 | `capabilities_count` | `PUT /v1/nodes/{id}/capabilities` |
 | `endpoint_count` | `PUT /v1/nodes/{id}/endpoint` |
 | `secrets_count` | `GET /v1/nodes/{id}/secrets/{key}` |
