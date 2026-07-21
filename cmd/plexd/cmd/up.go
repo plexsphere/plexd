@@ -567,6 +567,27 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	nodeAPISrv.SetLogStatus(&logForwarderStatus{fwd: logForwarder})
 	nodeAPISrv.SetAuditStatus(&auditForwarderStatus{fwd: auditForwarder})
 
+	// Publish the mesh/bridge/user-access/ingress/site-to-site status blocks as
+	// per-key state reports through the node API cache and syncer. These blocks
+	// were removed from the heartbeat in issue #19 and re-homed here (issue #23),
+	// so they keep their old heartbeat cadence rather than a new config knob.
+	statusInterval := cfg.Heartbeat.Interval
+	if statusInterval == 0 {
+		statusInterval = agent.DefaultHeartbeatInterval
+	}
+	statusReports := &statusReportPublisher{
+		publisher:     nodeAPISrv,
+		peerCount:     wgMgr.PeerIndex().Count,
+		bridgeMgr:     bridgeMgr,
+		userAccessMgr: userAccessMgr,
+		ingressMgr:    ingressMgr,
+		s2sMgr:        s2sMgr,
+		ifaceName:     cfg.WireGuard.InterfaceName,
+		listenPort:    cfg.WireGuard.ListenPort,
+		interval:      statusInterval,
+		logger:        logger.With("component", "status-reports"),
+	}
+
 	// Wait group for all goroutines.
 	var wg sync.WaitGroup
 
@@ -609,6 +630,14 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		if err := nodeAPISrv.Start(ctx, identity.NodeID); err != nil {
 			logger.Error("node API server stopped", "error", err)
 		}
+	}()
+
+	// 19a. Start status report publisher. Started after the node API server so
+	// its cache and syncer are running before the first publish lands.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		statusReports.run(ctx)
 	}()
 
 	// 20. Start hook watcher.

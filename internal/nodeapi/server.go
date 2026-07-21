@@ -118,6 +118,18 @@ func (s *Server) PublishReport(key, contentType string, payload json.RawMessage)
 	return nil
 }
 
+// ReportPayload returns the payload currently stored under key, and whether the
+// key exists. Internal producers use it to compare what is actually published
+// against what they would publish, so a report another local caller overwrote or
+// deleted is re-asserted rather than assumed to still hold their last value.
+func (s *Server) ReportPayload(key string) (json.RawMessage, bool) {
+	entry, ok := s.cache.GetReport(key)
+	if !ok {
+		return nil, false
+	}
+	return entry.Payload, true
+}
+
 // Start initializes and runs the server. It blocks until ctx is cancelled.
 func (s *Server) Start(ctx context.Context, nodeID string) error {
 	if err := s.cfg.Validate(); err != nil {
