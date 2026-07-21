@@ -122,13 +122,6 @@ func (c *ControlPlane) FetchSecret(ctx context.Context, nodeID, key string) (*Se
 	return &resp, nil
 }
 
-// SyncReports sends report data to the control plane.
-// POST /v1/nodes/{node_id}/report
-func (c *ControlPlane) SyncReports(ctx context.Context, nodeID string, req ReportSyncRequest) error {
-	path := fmt.Sprintf("/v1/nodes/%s/report", url.PathEscape(nodeID))
-	return c.doRequest(ctx, http.MethodPost, path, req, nil)
-}
-
 // ExecutionCallback posts a single execution lifecycle callback and returns the
 // server's new invocation status, plus a presigned output upload URL when the
 // callback declares an over-ceiling output.

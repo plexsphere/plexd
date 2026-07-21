@@ -180,21 +180,8 @@ type SecretResponse struct {
 }
 
 // ---------------------------------------------------------------------------
-// Reports  POST /v1/nodes/{node_id}/report
+// Reports  PUT/DELETE /v1/nodes/{node_id}/state/reports/{key}
 // ---------------------------------------------------------------------------
-
-type ReportSyncRequest struct {
-	Entries []ReportEntry `json:"entries"`
-	Deleted []string      `json:"deleted"`
-}
-
-type ReportEntry struct {
-	Key         string          `json:"key"`
-	ContentType string          `json:"content_type"`
-	Payload     json.RawMessage `json:"payload"`
-	Version     int             `json:"version"`
-	UpdatedAt   time.Time       `json:"updated_at"`
-}
 
 // NodeStateReportRequest is the control-plane wire format for the body of
 // PUT /v1/nodes/{id}/state/reports/{key}. Value is the opaque report payload;

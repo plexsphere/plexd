@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,7 +49,8 @@ type AssertionCounters struct {
 	CapabilitiesCount       int64 `json:"capabilities_count"`
 	EndpointCount           int64 `json:"endpoint_count"`
 	SecretsCount            int64 `json:"secrets_count"`
-	ReportCount             int64 `json:"report_count"`
+	ReportPutCount          int64 `json:"report_put_count"`
+	ReportDeleteCount       int64 `json:"report_delete_count"`
 	ExecutionCallbackCount  int64 `json:"execution_callback_count"`
 	ExecutionUploadCount    int64 `json:"execution_upload_count"`
 	MetricsCount            int64 `json:"metrics_count"`
@@ -81,7 +83,8 @@ type Server struct {
 	capabilitiesCount       atomic.Int64
 	endpointCount           atomic.Int64
 	secretsCount            atomic.Int64
-	reportCount             atomic.Int64
+	reportPutCount          atomic.Int64
+	reportDeleteCount       atomic.Int64
 	executionCallbackCount  atomic.Int64
 	executionUploadCount    atomic.Int64
 	metricsCount            atomic.Int64
@@ -196,7 +199,8 @@ func (s *Server) Assertions() AssertionCounters {
 		CapabilitiesCount:       s.capabilitiesCount.Load(),
 		EndpointCount:           s.endpointCount.Load(),
 		SecretsCount:            s.secretsCount.Load(),
-		ReportCount:             s.reportCount.Load(),
+		ReportPutCount:          s.reportPutCount.Load(),
+		ReportDeleteCount:       s.reportDeleteCount.Load(),
 		ExecutionCallbackCount:  s.executionCallbackCount.Load(),
 		ExecutionUploadCount:    s.executionUploadCount.Load(),
 		MetricsCount:            s.metricsCount.Load(),
@@ -380,7 +384,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/capabilities", s.handleCapabilities)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/endpoint", s.handleEndpoint)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/secrets/{key}", s.handleSecrets)
-	s.mux.HandleFunc("POST /v1/nodes/{id}/report", s.handleReport)
+	s.mux.HandleFunc("PUT /v1/nodes/{id}/state/reports/{key}", s.handlePutStateReport)
+	s.mux.HandleFunc("DELETE /v1/nodes/{id}/state/reports/{key}", s.handleDeleteStateReport)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/executions/{eid}", s.handleExecutionCallback)
 	s.mux.HandleFunc("PUT /exec-output/{eid}", s.handleExecOutputUpload)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/metrics", s.handleMetrics)
@@ -407,7 +412,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/capabilities", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/endpoint", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/secrets/{key}", methodNotAllowed)
-	s.mux.HandleFunc("/v1/nodes/{id}/report", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/state/reports/{key}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/executions/{eid}", methodNotAllowed)
 	s.mux.HandleFunc("/exec-output/{eid}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/metrics", methodNotAllowed)
@@ -943,14 +948,132 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleReport handles POST /v1/nodes/{id}/report.
-func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
-	var req api.ReportSyncRequest
-	if !s.decodeBody(w, r, "report", &req) {
+// reportKeyRe is a mock-local copy of the control-plane per-key report grammar:
+// a lowercase-leading key of 1..128 chars over [a-z0-9._-]. A key outside it is
+// a 400 invalid_report.
+var reportKeyRe = regexp.MustCompile("^[a-z][a-z0-9._-]{0,127}$")
+
+// handlePutStateReport handles PUT /v1/nodes/{id}/state/reports/{key}. It
+// validates the key against reportKeyRe, strict-decodes the per-key wire body,
+// caps the value at 4 KiB, and upserts the entry into both mirrored reports
+// buckets. Success is a 200 acknowledgement.
+func (s *Server) handlePutStateReport(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if !reportKeyRe.MatchString(key) {
+		writeProblem(w, r, http.StatusBadRequest, "invalid_report", "report key is outside the accepted grammar")
 		return
 	}
-	s.reportCount.Add(1)
+
+	data, err := s.captureBody("report", r)
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "invalid_report", "invalid request body")
+		return
+	}
+	var req api.NodeStateReportRequest
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "invalid_report", "report body is malformed")
+		return
+	}
+	if len(req.Value) > 4096 {
+		writeProblem(w, r, http.StatusBadRequest, "invalid_report", "report value exceeds the 4096-byte ceiling")
+		return
+	}
+
+	s.upsertReport(api.StateEntry{Key: key, Value: req.Value, WorkloadTag: req.WorkloadTag})
+	s.reportPutCount.Add(1)
+	writeJSON(w, http.StatusOK, api.NodeStateReportResponse{AcceptedAt: time.Now().UTC(), Key: key})
+}
+
+// handleDeleteStateReport handles DELETE /v1/nodes/{id}/state/reports/{key}. It
+// validates the key, removes the entry from both mirrored reports buckets, and
+// responds 204; a key with no stored report is a 404 report_not_found.
+func (s *Server) handleDeleteStateReport(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if !reportKeyRe.MatchString(key) {
+		writeProblem(w, r, http.StatusBadRequest, "invalid_report", "report key is outside the accepted grammar")
+		return
+	}
+	if !s.deleteReport(key) {
+		writeProblem(w, r, http.StatusNotFound, "report_not_found", "no report exists for this key")
+		return
+	}
+	s.reportDeleteCount.Add(1)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// upsertReport inserts or replaces entry in both mirrored reports buckets
+// (State.Reports and Reports.Reports) of the stored fixture, keeping each bucket
+// sorted by key ascending. Report writes are copy-on-write — each mutated block
+// is rebuilt behind a fresh pointer — so a concurrent state read (which aliases
+// the previous block through GetState) never observes a half-written slice.
+func (s *Server) upsertReport(entry api.StateEntry) {
+	s.stateFixtureMu.Lock()
+	defer s.stateFixtureMu.Unlock()
+	s.stateFixture.State = upsertReportBlock(s.stateFixture.State, entry)
+	s.stateFixture.Reports = upsertReportBlock(s.stateFixture.Reports, entry)
+}
+
+// upsertReportBlock returns a copy of block with entry upserted into a freshly
+// allocated, key-ascending reports bucket. A nil block is initialized.
+func upsertReportBlock(block *api.NodeStateBlock, entry api.StateEntry) *api.NodeStateBlock {
+	nb := api.NodeStateBlock{Metadata: []api.StateEntry{}, Data: []api.StateEntry{}, Reports: []api.StateEntry{}}
+	if block != nil {
+		nb = *block
+	}
+	reports := make([]api.StateEntry, 0, len(nb.Reports)+1)
+	replaced := false
+	for _, e := range nb.Reports {
+		if e.Key == entry.Key {
+			reports = append(reports, entry)
+			replaced = true
+			continue
+		}
+		reports = append(reports, e)
+	}
+	if !replaced {
+		reports = append(reports, entry)
+	}
+	sort.Slice(reports, func(i, j int) bool { return reports[i].Key < reports[j].Key })
+	nb.Reports = reports
+	return &nb
+}
+
+// deleteReport removes the entry under key from both mirrored reports buckets of
+// the stored fixture, copy-on-write. It reports whether a matching entry existed.
+func (s *Server) deleteReport(key string) bool {
+	s.stateFixtureMu.Lock()
+	defer s.stateFixtureMu.Unlock()
+	newState, foundState := deleteReportBlock(s.stateFixture.State, key)
+	newReports, foundReports := deleteReportBlock(s.stateFixture.Reports, key)
+	if !foundState && !foundReports {
+		return false
+	}
+	s.stateFixture.State = newState
+	s.stateFixture.Reports = newReports
+	return true
+}
+
+// deleteReportBlock returns a copy of block with the entry under key removed from
+// a freshly allocated reports bucket, plus whether it existed. A nil block is
+// returned unchanged.
+func deleteReportBlock(block *api.NodeStateBlock, key string) (*api.NodeStateBlock, bool) {
+	if block == nil {
+		return block, false
+	}
+	nb := *block
+	reports := make([]api.StateEntry, 0, len(nb.Reports))
+	found := false
+	for _, e := range nb.Reports {
+		if e.Key == key {
+			found = true
+			continue
+		}
+		reports = append(reports, e)
+	}
+	nb.Reports = reports
+	return &nb, found
 }
 
 // execUpload records a one-time presigned output upload minted by a declaring

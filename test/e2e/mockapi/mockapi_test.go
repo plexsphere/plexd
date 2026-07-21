@@ -93,7 +93,7 @@ const (
 	keyRotateKey           = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
 	keyRotateBody          = `{"new_public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="}`
 	capabilitiesBody       = `{"builtin_actions":[],"hooks":[]}`
-	reportBody             = `{"entries":[],"deleted":[]}`
+	reportBody             = `{"value":"cpu ok","workload_tag":"web"}`
 	metricsBatchBody       = `[{"timestamp":"2025-01-01T00:00:00Z","group":"system","data":{}}]`
 	logsBatchBody          = `[{"timestamp":"2025-01-01T00:00:00Z","source":"plexd","unit":"main","message":"started","severity":"info","hostname":"node-1"}]`
 	auditBatchBody         = `[{"timestamp":"2025-01-01T00:00:00Z","source":"auditd","event_type":"execve","subject":{},"object":{},"action":"execve","result":"success","hostname":"node-1","raw":""}]`
@@ -954,7 +954,11 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 		t.Fatalf("GET secrets: %v", err)
 	}
 	resp.Body.Close()
-	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/report", reportBody)
+	// Exercise both per-key report legs: PUT stores the entry, DELETE removes it.
+	reportPath := ts.URL + "/v1/nodes/n1/state/reports/cpu.load"
+	resp = doRequest(t, http.MethodPut, reportPath, reportBody)
+	resp.Body.Close()
+	resp = doRequest(t, http.MethodDelete, reportPath, "")
 	resp.Body.Close()
 	// Drive one execution through the over-ceiling upload leg: the declaring
 	// callback (ack→started→declare) mints a presigned URL, and the PUT stores
@@ -1012,8 +1016,11 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	if a.SecretsCount != 1 {
 		t.Errorf("secrets_count = %d, want 1", a.SecretsCount)
 	}
-	if a.ReportCount != 1 {
-		t.Errorf("report_count = %d, want 1", a.ReportCount)
+	if a.ReportPutCount != 1 {
+		t.Errorf("report_put_count = %d, want 1", a.ReportPutCount)
+	}
+	if a.ReportDeleteCount != 1 {
+		t.Errorf("report_delete_count = %d, want 1", a.ReportDeleteCount)
 	}
 	if a.ExecutionCallbackCount != 3 {
 		t.Errorf("execution_callback_count = %d, want 3", a.ExecutionCallbackCount)
@@ -1074,7 +1081,6 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPut, "/v1/nodes/node-1/capabilities", capabilitiesBody},
 		{http.MethodPut, "/v1/nodes/node-1/endpoint", validEndpointBody()},
 		{http.MethodGet, "/v1/nodes/node-1/secrets/key1", ""},
-		{http.MethodPost, "/v1/nodes/node-1/report", reportBody},
 		{http.MethodPost, "/v1/nodes/node-1/metrics", metricsBatchBody},
 		{http.MethodPost, "/v1/nodes/node-1/logs", logsBatchBody},
 		{http.MethodPost, "/v1/nodes/node-1/audit", auditBatchBody},
@@ -1109,6 +1115,37 @@ func TestConcurrentCounters(t *testing.T) {
 				resp.Body.Close()
 			}(ep)
 		}
+	}
+
+	// Report writes need a distinct key per goroutine: each goroutine PUTs then
+	// DELETEs its own key so both the put and delete counters reach n without the
+	// two racing on a shared key (a delete of a missing key is a 404 that does not
+	// count).
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			path := ts.URL + "/v1/nodes/node-1/state/reports/" + fmt.Sprintf("report.conc.%d", i)
+			putReq, err := http.NewRequest(http.MethodPut, path, strings.NewReader(reportBody))
+			if err != nil {
+				return
+			}
+			putReq.Header.Set("Content-Type", "application/json")
+			putResp, err := http.DefaultClient.Do(putReq)
+			if err != nil {
+				return
+			}
+			putResp.Body.Close()
+			delReq, err := http.NewRequest(http.MethodDelete, path, nil)
+			if err != nil {
+				return
+			}
+			delResp, err := http.DefaultClient.Do(delReq)
+			if err != nil {
+				return
+			}
+			delResp.Body.Close()
+		}(i)
 	}
 
 	// Execution callbacks need a distinct execution id per request; concurrent
@@ -1750,38 +1787,186 @@ func TestSecrets_WrongMethod_Returns405(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Report endpoint
+// Per-key state report endpoint
 // ---------------------------------------------------------------------------
 
-func TestReport_Returns204AndCounter(t *testing.T) {
+// putReport issues PUT /v1/nodes/node-1/state/reports/{key} with the given JSON
+// body and returns the response.
+func putReport(t *testing.T, baseURL, key, body string) *http.Response {
+	t.Helper()
+	return doRequest(t, http.MethodPut, baseURL+"/v1/nodes/node-1/state/reports/"+key, body)
+}
+
+func TestReport_PutStoresSortedInBothBuckets(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/report", reportBody)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	// PUT two keys out of order; both mirrored buckets must end up key-ascending.
+	resp := putReport(t, ts.URL, "zeta", `{"value":"z","workload_tag":"web"}`)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("PUT zeta status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var ack api.NodeStateReportResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ack); err != nil {
+		resp.Body.Close()
+		t.Fatalf("decode ack: %v", err)
+	}
+	resp.Body.Close()
+	if ack.Key != "zeta" {
+		t.Errorf("ack.Key = %q, want %q", ack.Key, "zeta")
+	}
+	if ack.AcceptedAt.IsZero() {
+		t.Error("ack.AcceptedAt is zero, want a fresh timestamp")
+	}
+
+	resp = putReport(t, ts.URL, "alpha", `{"value":"a"}`)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("PUT alpha status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	resp.Body.Close()
+
+	state := getState(t, ts.URL)
+	for name, block := range map[string]*api.NodeStateBlock{"state": state.State, "reports": state.Reports} {
+		if block == nil {
+			t.Fatalf("%s block is nil", name)
+		}
+		if len(block.Reports) != 2 {
+			t.Fatalf("%s: len(Reports) = %d, want 2", name, len(block.Reports))
+		}
+		if block.Reports[0].Key != "alpha" || block.Reports[1].Key != "zeta" {
+			t.Errorf("%s: Reports not key-ascending: %q, %q", name, block.Reports[0].Key, block.Reports[1].Key)
+		}
+		if block.Reports[1].WorkloadTag != "web" {
+			t.Errorf("%s: zeta WorkloadTag = %q, want %q", name, block.Reports[1].WorkloadTag, "web")
+		}
 	}
 
 	a := getAssertions(t, ts.URL)
-	if a.ReportCount != 1 {
-		t.Errorf("report_count = %d, want 1", a.ReportCount)
+	if a.ReportPutCount != 2 {
+		t.Errorf("report_put_count = %d, want 2", a.ReportPutCount)
 	}
 }
 
-func TestReport_InvalidBody_Returns400(t *testing.T) {
+func TestReport_PutReplacesExistingKey(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/report", "not-json")
+	resp := putReport(t, ts.URL, "cpu", `{"value":"first"}`)
+	resp.Body.Close()
+	resp = putReport(t, ts.URL, "cpu", `{"value":"second"}`)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("second PUT status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	resp.Body.Close()
+
+	state := getState(t, ts.URL)
+	if len(state.State.Reports) != 1 {
+		t.Fatalf("len(State.Reports) = %d, want 1", len(state.State.Reports))
+	}
+	if got := state.State.Reports[0].Value; got != "second" {
+		t.Errorf("Value = %q, want %q", got, "second")
+	}
+}
+
+func TestReport_PutRejections(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		body string
+	}{
+		{"bad_key", "Bad_Key", `{"value":"x"}`},
+		{"oversized_value", "cpu", fmt.Sprintf(`{"value":%q}`, strings.Repeat("a", 4097))},
+		{"unknown_field", "cpu", `{"value":"x","surprise":true}`},
+		{"malformed_body", "cpu", "not-json"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := putReport(t, ts.URL, tt.key, tt.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			}
+			if code := problemCode(t, resp); code != "invalid_report" {
+				t.Errorf("code = %q, want %q", code, "invalid_report")
+			}
+
+			// A rejected PUT must not advance the counter or store an entry.
+			a := getAssertions(t, ts.URL)
+			if a.ReportPutCount != 0 {
+				t.Errorf("report_put_count = %d, want 0", a.ReportPutCount)
+			}
+			if state := getState(t, ts.URL); len(state.State.Reports) != 0 {
+				t.Errorf("State.Reports len = %d, want 0", len(state.State.Reports))
+			}
+		})
+	}
+}
+
+func TestReport_DeleteRemovesFromBothBuckets(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := putReport(t, ts.URL, "cpu", `{"value":"x"}`)
+	resp.Body.Close()
+
+	resp = doRequest(t, http.MethodDelete, ts.URL+"/v1/nodes/node-1/state/reports/cpu", "")
+	if resp.StatusCode != http.StatusNoContent {
+		resp.Body.Close()
+		t.Fatalf("DELETE status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+	resp.Body.Close()
+
+	state := getState(t, ts.URL)
+	if len(state.State.Reports) != 0 {
+		t.Errorf("State.Reports len = %d, want 0", len(state.State.Reports))
+	}
+	if len(state.Reports.Reports) != 0 {
+		t.Errorf("Reports.Reports len = %d, want 0", len(state.Reports.Reports))
+	}
+
+	a := getAssertions(t, ts.URL)
+	if a.ReportDeleteCount != 1 {
+		t.Errorf("report_delete_count = %d, want 1", a.ReportDeleteCount)
+	}
+}
+
+func TestReport_DeleteMissingKey_Returns404(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodDelete, ts.URL+"/v1/nodes/node-1/state/reports/ghost", "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+	if code := problemCode(t, resp); code != "report_not_found" {
+		t.Errorf("code = %q, want %q", code, "report_not_found")
+	}
+
+	a := getAssertions(t, ts.URL)
+	if a.ReportDeleteCount != 0 {
+		t.Errorf("report_delete_count = %d, want 0", a.ReportDeleteCount)
+	}
+}
+
+func TestReport_DeleteBadKey_Returns400(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodDelete, ts.URL+"/v1/nodes/node-1/state/reports/Bad_Key", "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+	if code := problemCode(t, resp); code != "invalid_report" {
+		t.Errorf("code = %q, want %q", code, "invalid_report")
 	}
 }
 
 func TestReport_WrongMethod_Returns405(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/report")
+	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/state/reports/cpu")
 	if err != nil {
 		t.Fatalf("GET report: %v", err)
 	}
