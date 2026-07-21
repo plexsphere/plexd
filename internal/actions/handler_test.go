@@ -7,32 +7,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
-
-type handlerMockReporter struct {
-	mu      sync.Mutex
-	acks    []api.ExecutionAck
-	results []api.ExecutionResult
-}
-
-func (m *handlerMockReporter) AckExecution(_ context.Context, _, _ string, ack api.ExecutionAck) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.acks = append(m.acks, ack)
-	return nil
-}
-
-func (m *handlerMockReporter) ReportResult(_ context.Context, _, _ string, result api.ExecutionResult) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.results = append(m.results, result)
-	return nil
-}
 
 type handlerMockVerifier struct {
 	ok  bool
@@ -73,7 +52,7 @@ func handlerWaitFor(t *testing.T, timeout time.Duration, fn func() bool) {
 }
 
 func TestHandleActionRequest_BuiltinAction(t *testing.T) {
-	reporter := &handlerMockReporter{}
+	reporter := &mockReporter{}
 	cfg := Config{Enabled: true, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 	exec.RegisterBuiltin("test_action", "test", nil, func(ctx context.Context, params map[string]string) (string, string, int, error) {
@@ -84,35 +63,24 @@ func TestHandleActionRequest_BuiltinAction(t *testing.T) {
 	req := api.ActionRequest{ExecutionID: "exec-001", Action: "test_action", Timeout: "5m"}
 	env := makeEnvelope(t, req)
 
-	err := handler(context.Background(), env)
-	if err != nil {
+	if err := handler(context.Background(), env); err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
 
 	// Wait for async execution to complete.
 	handlerWaitFor(t, 5*time.Second, func() bool {
-		reporter.mu.Lock()
-		defer reporter.mu.Unlock()
-		return len(reporter.results) > 0
+		return len(reporter.getCallbacks()) >= 3
 	})
 
-	reporter.mu.Lock()
-	defer reporter.mu.Unlock()
-	// Verify accepted ack.
-	if len(reporter.acks) == 0 {
-		t.Fatal("no acks received")
-	}
-	if reporter.acks[0].Status != "accepted" {
-		t.Errorf("ack status = %q, want accepted", reporter.acks[0].Status)
-	}
-	// Verify result.
-	if reporter.results[0].Status != "success" {
-		t.Errorf("result status = %q, want success", reporter.results[0].Status)
-	}
+	assertStatuses(t, reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusSucceeded,
+	})
 }
 
 func TestHandleActionRequest_UnknownAction(t *testing.T) {
-	reporter := &handlerMockReporter{}
+	reporter := &mockReporter{}
 	cfg := Config{Enabled: true, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 
@@ -120,30 +88,23 @@ func TestHandleActionRequest_UnknownAction(t *testing.T) {
 	req := api.ActionRequest{ExecutionID: "exec-002", Action: "nonexistent_action", Timeout: "5m"}
 	env := makeEnvelope(t, req)
 
-	err := handler(context.Background(), env)
-	if err != nil {
+	if err := handler(context.Background(), env); err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
 
-	// Wait for ack with rejected status.
 	handlerWaitFor(t, 5*time.Second, func() bool {
-		reporter.mu.Lock()
-		defer reporter.mu.Unlock()
-		return len(reporter.acks) > 0
+		return len(reporter.getCallbacks()) >= 2
 	})
 
-	reporter.mu.Lock()
-	defer reporter.mu.Unlock()
-	if reporter.acks[0].Status != "rejected" {
-		t.Errorf("ack status = %q, want rejected", reporter.acks[0].Status)
-	}
-	if reporter.acks[0].Reason != "unknown_action" {
-		t.Errorf("ack reason = %q, want unknown_action", reporter.acks[0].Reason)
+	cbs := reporter.getCallbacks()
+	assertStatuses(t, cbs, []string{api.ExecutionStatusAck, api.ExecutionStatusFailed})
+	if cbs[1].Error != "unknown_action" {
+		t.Errorf("failed error = %q, want unknown_action", cbs[1].Error)
 	}
 }
 
 func TestHandleActionRequest_MalformedPayload(t *testing.T) {
-	reporter := &handlerMockReporter{}
+	reporter := &mockReporter{}
 	cfg := Config{Enabled: true, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 
@@ -167,7 +128,7 @@ func TestHandleActionRequest_HookAction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reporter := &handlerMockReporter{}
+	reporter := &mockReporter{}
 	cfg := Config{Enabled: true, HooksDir: dir, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 	exec.SetHooks([]api.HookInfo{
@@ -178,29 +139,19 @@ func TestHandleActionRequest_HookAction(t *testing.T) {
 	req := api.ActionRequest{ExecutionID: "exec-003", Action: "my-hook", Timeout: "5m", Checksum: "abc123"}
 	env := makeEnvelope(t, req)
 
-	err := handler(context.Background(), env)
-	if err != nil {
+	if err := handler(context.Background(), env); err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
 
-	// Wait for result.
 	handlerWaitFor(t, 5*time.Second, func() bool {
-		reporter.mu.Lock()
-		defer reporter.mu.Unlock()
-		return len(reporter.results) > 0
+		return len(reporter.getCallbacks()) >= 3
 	})
 
-	reporter.mu.Lock()
-	defer reporter.mu.Unlock()
-	if len(reporter.acks) == 0 {
-		t.Fatal("no acks received")
-	}
-	if reporter.acks[0].Status != "accepted" {
-		t.Errorf("ack status = %q, want accepted", reporter.acks[0].Status)
-	}
-	if reporter.results[0].Status != "success" {
-		t.Errorf("result status = %q, want success", reporter.results[0].Status)
-	}
+	assertStatuses(t, reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusSucceeded,
+	})
 }
 
 func TestHandleActionRequest_HookIntegrityFailure(t *testing.T) {
@@ -210,7 +161,7 @@ func TestHandleActionRequest_HookIntegrityFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reporter := &handlerMockReporter{}
+	reporter := &mockReporter{}
 	cfg := Config{Enabled: true, HooksDir: dir, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: false}, discardLogger())
 	exec.SetHooks([]api.HookInfo{
@@ -221,37 +172,28 @@ func TestHandleActionRequest_HookIntegrityFailure(t *testing.T) {
 	req := api.ActionRequest{ExecutionID: "exec-004", Action: "my-hook", Timeout: "5m", Checksum: "abc123"}
 	env := makeEnvelope(t, req)
 
-	err := handler(context.Background(), env)
-	if err != nil {
+	if err := handler(context.Background(), env); err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
 
-	// The executor accepts the hook (it's in the hooks list), then integrity
-	// verification fails during runHook, producing an error result.
+	// The executor acks and starts the hook, then integrity verification fails
+	// during runHook, producing a failed terminal callback.
 	handlerWaitFor(t, 5*time.Second, func() bool {
-		reporter.mu.Lock()
-		defer reporter.mu.Unlock()
-		return len(reporter.results) > 0
+		return len(reporter.getCallbacks()) >= 3
 	})
 
-	reporter.mu.Lock()
-	defer reporter.mu.Unlock()
-	if len(reporter.acks) == 0 {
-		t.Fatal("no acks received")
-	}
-	if reporter.acks[0].Status != "accepted" {
-		t.Errorf("ack status = %q, want accepted", reporter.acks[0].Status)
-	}
-	if reporter.results[0].Status != "error" {
-		t.Errorf("result status = %q, want error", reporter.results[0].Status)
-	}
+	assertStatuses(t, reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusFailed,
+	})
 }
 
 func TestHandleActionRequest_HookNotFound(t *testing.T) {
 	dir := t.TempDir()
 	// Do NOT create the script on disk.
 
-	reporter := &handlerMockReporter{}
+	reporter := &mockReporter{}
 	cfg := Config{Enabled: true, HooksDir: dir, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 	exec.SetHooks([]api.HookInfo{
@@ -262,34 +204,25 @@ func TestHandleActionRequest_HookNotFound(t *testing.T) {
 	req := api.ActionRequest{ExecutionID: "exec-005", Action: "missing-hook", Timeout: "5m", Checksum: "abc123"}
 	env := makeEnvelope(t, req)
 
-	err := handler(context.Background(), env)
-	if err != nil {
+	if err := handler(context.Background(), env); err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
 
-	// The executor accepts the hook (it's in the hooks list), then runHook
-	// fails because the file doesn't exist on disk, producing an error result.
+	// The executor acks and starts the hook, then runHook fails because the file
+	// does not exist on disk, producing a failed terminal callback.
 	handlerWaitFor(t, 5*time.Second, func() bool {
-		reporter.mu.Lock()
-		defer reporter.mu.Unlock()
-		return len(reporter.results) > 0
+		return len(reporter.getCallbacks()) >= 3
 	})
 
-	reporter.mu.Lock()
-	defer reporter.mu.Unlock()
-	if len(reporter.acks) == 0 {
-		t.Fatal("no acks received")
-	}
-	if reporter.acks[0].Status != "accepted" {
-		t.Errorf("ack status = %q, want accepted", reporter.acks[0].Status)
-	}
-	if reporter.results[0].Status != "error" {
-		t.Errorf("result status = %q, want error", reporter.results[0].Status)
-	}
+	assertStatuses(t, reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusFailed,
+	})
 }
 
 func TestHandleActionRequest_Disabled(t *testing.T) {
-	reporter := &handlerMockReporter{}
+	reporter := &mockReporter{}
 	cfg := Config{Enabled: false, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 
@@ -297,21 +230,14 @@ func TestHandleActionRequest_Disabled(t *testing.T) {
 	req := api.ActionRequest{ExecutionID: "exec-006", Action: "test_action", Timeout: "5m"}
 	env := makeEnvelope(t, req)
 
-	err := handler(context.Background(), env)
-	if err != nil {
+	if err := handler(context.Background(), env); err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
 
-	// Ack should be immediate (synchronous in handler).
-	reporter.mu.Lock()
-	defer reporter.mu.Unlock()
-	if len(reporter.acks) == 0 {
-		t.Fatal("no acks received")
-	}
-	if reporter.acks[0].Status != "rejected" {
-		t.Errorf("ack status = %q, want rejected", reporter.acks[0].Status)
-	}
-	if reporter.acks[0].Reason != "actions_disabled" {
-		t.Errorf("ack reason = %q, want actions_disabled", reporter.acks[0].Reason)
+	// The disabled rejection is synchronous: ack + failed(actions_disabled).
+	cbs := reporter.getCallbacks()
+	assertStatuses(t, cbs, []string{api.ExecutionStatusAck, api.ExecutionStatusFailed})
+	if cbs[1].Error != "actions_disabled" {
+		t.Errorf("failed error = %q, want actions_disabled", cbs[1].Error)
 	}
 }

@@ -21,10 +21,10 @@ import (
 // noopActionReporter is a no-op for testing.
 type noopActionReporter struct{}
 
-func (noopActionReporter) AckExecution(_ context.Context, _, _ string, _ api.ExecutionAck) error {
-	return nil
+func (noopActionReporter) ExecutionCallback(_ context.Context, _, _ string, _ api.ExecutionCallbackRequest) (*api.ExecutionCallbackResponse, error) {
+	return &api.ExecutionCallbackResponse{}, nil
 }
-func (noopActionReporter) ReportResult(_ context.Context, _, _ string, _ api.ExecutionResult) error {
+func (noopActionReporter) UploadExecutionOutput(_ context.Context, _ string, _ []byte) error {
 	return nil
 }
 
