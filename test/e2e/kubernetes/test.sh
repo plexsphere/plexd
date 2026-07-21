@@ -783,26 +783,35 @@ echo "=== Phase 7 PASSED: key rotation completed end to end ==="
 # ===================================================================
 echo "=== Deeper body validation ==="
 
-# Metrics body: validate MetricPoint fields.
+# Metrics body: validate MetricSample fields (name, value, group).
 METRICS_BODY=$(curl -sf "http://localhost:18080/test/last-request/metrics" 2>/dev/null || true)
 if [ -n "${METRICS_BODY}" ]; then
     FIRST_METRIC=$(echo "${METRICS_BODY}" | jq '.[0]')
-    MET_TS=$(echo "${FIRST_METRIC}" | jq -r '.timestamp // empty')
+    MET_NAME=$(echo "${FIRST_METRIC}" | jq -r '.name // empty')
+    MET_VALUE_TYPE=$(echo "${FIRST_METRIC}" | jq -r '.value | type')
     MET_GROUP=$(echo "${FIRST_METRIC}" | jq -r '.group // empty')
-    if [ -n "${MET_TS}" ]; then
-        echo "  PASS: metric[0] has timestamp"
+    if [ -n "${MET_NAME}" ]; then
+        echo "  PASS: metric[0] has name='${MET_NAME}'"
     else
-        echo "FAIL: metric[0] missing 'timestamp' field"
+        echo "FAIL: metric[0] missing 'name' field"
         print_diagnostics
         exit 1
     fi
-    if [ -n "${MET_GROUP}" ]; then
-        echo "  PASS: metric[0] has group='${MET_GROUP}'"
+    if [ "${MET_VALUE_TYPE}" = "number" ]; then
+        echo "  PASS: metric[0] has a numeric value"
     else
-        echo "FAIL: metric[0] missing 'group' field"
+        echo "FAIL: metric[0] 'value' type='${MET_VALUE_TYPE}', want number"
         print_diagnostics
         exit 1
     fi
+    case "${MET_GROUP}" in
+        node_resources|tunnel_health|peer_latency|agent_stats)
+            echo "  PASS: metric[0] has group='${MET_GROUP}'" ;;
+        *)
+            echo "FAIL: metric[0] group='${MET_GROUP}' outside the wire enum"
+            print_diagnostics
+            exit 1 ;;
+    esac
 fi
 
 # Capabilities: validate specific builtin action names.

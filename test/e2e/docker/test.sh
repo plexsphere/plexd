@@ -317,16 +317,28 @@ if [ "${CAPS_COUNT}" -lt 1 ]; then
 fi
 echo "  PASS: capabilities body contains ${CAPS_COUNT} builtin_actions"
 
-# 3d. Metrics body must be a non-empty array.
+# 3d. Metrics body must be a non-empty JSON array of MetricSample records: every
+# element carries a group inside the wire enum, a non-empty name, a numeric
+# value, and a timestamp.
 METRICS_BODY=$(curl -sf "http://localhost:18080/test/last-request/metrics" 2>/dev/null || true)
 if [ -z "${METRICS_BODY}" ]; then
     fail "no captured metrics request body"
 fi
 METRICS_LEN=$(echo "${METRICS_BODY}" | jq 'length')
 if [ "${METRICS_LEN}" -lt 1 ]; then
-    fail "metrics body is empty (want >= 1 data point)"
+    fail "metrics body is empty (want >= 1 sample)"
 fi
-echo "  PASS: metrics body contains ${METRICS_LEN} data points"
+BAD_SAMPLES=$(echo "${METRICS_BODY}" | jq '
+    [.[] | select(
+        (.group as $g | (["node_resources","tunnel_health","peer_latency","agent_stats"] | index($g)) == null)
+        or ((.name | type) != "string") or (.name == "")
+        or ((.value | type) != "number")
+        or ((.timestamp | type) != "string") or (.timestamp == "")
+    )] | length')
+if [ "${BAD_SAMPLES}" -ne 0 ]; then
+    fail "metrics body has ${BAD_SAMPLES} sample(s) violating the MetricSample contract (body: ${METRICS_BODY})"
+fi
+echo "  PASS: all ${METRICS_LEN} metrics samples carry group/name/value/timestamp"
 
 echo "=== Phase 3 PASSED: request body validation ==="
 
@@ -1468,88 +1480,78 @@ echo "=== Phase 9b PASSED: rotate_keys SSE event completion ==="
 # ===================================================================
 echo "=== Deeper body validation ==="
 
-# 10a. Metrics body: validate MetricPoint fields (timestamp, group, data).
+# 10a. Metrics body: validate the MetricSample wire shape and a known sample.
 METRICS_BODY=$(curl -sf "http://localhost:18080/test/last-request/metrics" 2>/dev/null || true)
 if [ -n "${METRICS_BODY}" ]; then
-    FIRST_METRIC=$(echo "${METRICS_BODY}" | jq '.[0]')
-    MET_TS=$(echo "${FIRST_METRIC}" | jq -r '.timestamp // empty')
-    MET_GROUP=$(echo "${FIRST_METRIC}" | jq -r '.group // empty')
-    MET_DATA=$(echo "${FIRST_METRIC}" | jq -r '.data // empty')
-    if [ -n "${MET_TS}" ]; then
-        echo "  PASS: metric[0] has timestamp"
+    # A node_resources sample named cpu_usage_percent must be present.
+    HAS_CPU=$(echo "${METRICS_BODY}" | jq '[.[] | select(.group == "node_resources" and .name == "cpu_usage_percent")] | length')
+    if [ "${HAS_CPU}" -ge 1 ]; then
+        echo "  PASS: metrics contains node_resources sample 'cpu_usage_percent'"
     else
-        fail "metric[0] missing 'timestamp' field"
-    fi
-    if [ -n "${MET_GROUP}" ]; then
-        echo "  PASS: metric[0] has group='${MET_GROUP}'"
-    else
-        fail "metric[0] missing 'group' field"
-    fi
-    if [ -n "${MET_DATA}" ] && [ "${MET_DATA}" != "null" ]; then
-        echo "  PASS: metric[0] has data payload"
-    else
-        fail "metric[0] missing 'data' field"
+        fail "metrics missing node_resources sample 'cpu_usage_percent' (body: ${METRICS_BODY})"
     fi
 
-    # GAP-04: Validate expected metric groups and data keys.
-    HAS_SYSTEM_GROUP=$(echo "${METRICS_BODY}" | jq '[.[] | select(.group == "system")] | length')
-    if [ "${HAS_SYSTEM_GROUP}" -ge 1 ]; then
-        echo "  PASS: metrics contains 'system' group entry"
+    # That sample's value must be numeric.
+    CPU_VALUE_TYPE=$(echo "${METRICS_BODY}" | jq -r '[.[] | select(.group == "node_resources" and .name == "cpu_usage_percent")][0].value | type')
+    if [ "${CPU_VALUE_TYPE}" = "number" ]; then
+        echo "  PASS: cpu_usage_percent sample carries a numeric value"
     else
-        fail "metrics missing entry with group='system'"
+        fail "cpu_usage_percent value type='${CPU_VALUE_TYPE}', want 'number'"
     fi
-
-    # Validate system group data contains expected keys from SystemCollector.
-    SYSTEM_METRIC=$(echo "${METRICS_BODY}" | jq '[.[] | select(.group == "system")][0]')
-    SYSTEM_DATA=$(echo "${SYSTEM_METRIC}" | jq '.data')
-    for data_key in "cpu_usage_percent" "memory_total_bytes" "load_avg_1"; do
-        HAS_KEY=$(echo "${SYSTEM_DATA}" | jq --arg k "${data_key}" 'has($k)')
-        if [ "${HAS_KEY}" = "true" ]; then
-            echo "  PASS: system metric data has key '${data_key}'"
-        else
-            fail "system metric data missing key '${data_key}'"
-        fi
-    done
 else
     echo "  WARN: no metrics body captured"
 fi
 
-# 10b. Audit body: validate AuditEntry fields (timestamp, source, event_type, action, result).
+# 10b. Audit body is NDJSON: parse the first non-blank line and validate the
+# AuditEvent wire fields -- source inside the enum, non-empty action and outcome.
 AUDIT_BODY=$(curl -sf "http://localhost:18080/test/last-request/audit" 2>/dev/null || true)
 if [ -n "${AUDIT_BODY}" ]; then
-    FIRST_AUDIT=$(echo "${AUDIT_BODY}" | jq '.[0]')
-    AUD_TS=$(echo "${FIRST_AUDIT}" | jq -r '.timestamp // empty')
+    FIRST_AUDIT=$(echo "${AUDIT_BODY}" | awk 'NF{print; exit}')
+    if [ -z "${FIRST_AUDIT}" ]; then
+        fail "audit body has no non-blank NDJSON line"
+    fi
     AUD_SRC=$(echo "${FIRST_AUDIT}" | jq -r '.source // empty')
-    AUD_EVT=$(echo "${FIRST_AUDIT}" | jq -r '.event_type // empty')
     AUD_ACT=$(echo "${FIRST_AUDIT}" | jq -r '.action // empty')
-    AUD_RES=$(echo "${FIRST_AUDIT}" | jq -r '.result // empty')
-    if [ -n "${AUD_TS}" ]; then
-        echo "  PASS: audit[0] has timestamp"
-    else
-        fail "audit[0] missing 'timestamp' field"
-    fi
-    if [ -n "${AUD_SRC}" ]; then
-        echo "  PASS: audit[0] has source='${AUD_SRC}'"
-    else
-        fail "audit[0] missing 'source' field"
-    fi
-    if [ -n "${AUD_EVT}" ]; then
-        echo "  PASS: audit[0] has event_type='${AUD_EVT}'"
-    else
-        fail "audit[0] missing 'event_type' field"
-    fi
+    AUD_OUT=$(echo "${FIRST_AUDIT}" | jq -r '.outcome // empty')
+    case "${AUD_SRC}" in
+        auditd|k8s|plexd) echo "  PASS: audit[0] source='${AUD_SRC}'" ;;
+        *) fail "audit[0] source='${AUD_SRC}', want auditd|k8s|plexd" ;;
+    esac
     if [ -n "${AUD_ACT}" ]; then
-        echo "  PASS: audit[0] has action='${AUD_ACT}'"
+        echo "  PASS: audit[0] action='${AUD_ACT}'"
     else
-        echo "  WARN: audit[0] missing 'action' field (may be omitted for some sources)"
+        fail "audit[0] missing 'action' field"
     fi
-    if [ -n "${AUD_RES}" ]; then
-        echo "  PASS: audit[0] has result='${AUD_RES}'"
+    if [ -n "${AUD_OUT}" ]; then
+        echo "  PASS: audit[0] outcome='${AUD_OUT}'"
     else
-        echo "  WARN: audit[0] missing 'result' field (may be omitted for some sources)"
+        fail "audit[0] missing 'outcome' field"
     fi
 else
-    echo "  WARN: no audit body captured"
+    fail "no audit body captured"
+fi
+
+# 10b (logs). Logs body is NDJSON: parse the first non-blank line and validate
+# the LogLine wire fields -- severity inside the enum, non-empty message.
+LOGS_BODY=$(curl -sf "http://localhost:18080/test/last-request/logs" 2>/dev/null || true)
+if [ -n "${LOGS_BODY}" ]; then
+    FIRST_LOG=$(echo "${LOGS_BODY}" | awk 'NF{print; exit}')
+    if [ -z "${FIRST_LOG}" ]; then
+        fail "logs body has no non-blank NDJSON line"
+    fi
+    LOG_SEV=$(echo "${FIRST_LOG}" | jq -r '.severity // empty')
+    LOG_MSG=$(echo "${FIRST_LOG}" | jq -r '.message // empty')
+    case "${LOG_SEV}" in
+        emerg|alert|crit|err|warning|notice|info|debug) echo "  PASS: log[0] severity='${LOG_SEV}'" ;;
+        *) fail "log[0] severity='${LOG_SEV}', want emerg|alert|crit|err|warning|notice|info|debug" ;;
+    esac
+    if [ -n "${LOG_MSG}" ]; then
+        echo "  PASS: log[0] has a message"
+    else
+        fail "log[0] missing 'message' field"
+    fi
+else
+    fail "no logs body captured"
 fi
 
 # 10c. Capabilities: validate specific builtin action names and exact count.
@@ -1630,6 +1632,50 @@ if [ -n "${HB_BODY}" ]; then
 else
     fail "no captured heartbeat request body for richness validation"
 fi
+
+# 10e. Telemetry ingest rejection taxonomy. Drive POST /v1/nodes/{id}/metrics
+# directly and assert the mock's RFC 9457 ingest-gate contract. This runs AFTER
+# the 10a metrics body assertion because case (a) passes the header gates and so
+# overwrites the captured last-request/metrics body; the ~10s report cadence
+# refreshes it for any later reader.
+MOCK_METRICS_URL="http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/metrics"
+
+# assert_ingest_reject: POST body to the metrics ingest with any extra curl args
+# and assert the HTTP status, an application/problem+json body, and the problem
+# 'code' member. Args: name, want_status, want_code, body, extra curl args...
+assert_ingest_reject() {
+    local name=$1 want_status=$2 want_code=$3 body=$4
+    shift 4
+    local resp status ctype json code
+    resp=$(curl -s -w '\n%{http_code}\n%{content_type}' -X POST \
+        -H 'Content-Type: application/json' "$@" -d "${body}" \
+        "${MOCK_METRICS_URL}")
+    ctype=$(echo "${resp}" | tail -n1)
+    status=$(echo "${resp}" | tail -n2 | head -n1)
+    json=$(echo "${resp}" | sed '$d' | sed '$d')
+    if [ "${status}" != "${want_status}" ]; then
+        fail "${name}: status=${status}, want ${want_status} (body: ${json})"
+    fi
+    case "${ctype}" in
+        application/problem+json*) ;;
+        *) fail "${name}: content-type='${ctype}', want application/problem+json" ;;
+    esac
+    code=$(echo "${json}" | jq -r '.code // empty')
+    if [ "${code}" != "${want_code}" ]; then
+        fail "${name}: code='${code}', want '${want_code}'"
+    fi
+    echo "  PASS: ${name} -> ${status} (code='${code}')"
+}
+
+# (a) An out-of-enum group, but a valid RFC 3339 sent-at header: the header gates
+#     pass, so the batch reaches validation and is rejected as malformed.
+assert_ingest_reject "metrics_group_bogus" 400 ingest_batch_malformed \
+    '[{"group":"bogus","name":"cpu_usage_percent","value":1,"timestamp":"2026-07-21T00:00:00Z"}]' \
+    -H 'X-Plexsphere-Sent-At: 2026-07-21T00:00:00Z'
+
+# (b) A well-shaped batch with NO sent-at header is stopped by the header gate.
+assert_ingest_reject "metrics_missing_sent_at" 400 ingest_sent_at_invalid \
+    '[{"group":"node_resources","name":"cpu_usage_percent","value":1,"timestamp":"2026-07-21T00:00:00Z"}]'
 
 echo "=== Phase 10 PASSED: deeper body validation ==="
 
@@ -1742,6 +1788,153 @@ else
 fi
 
 echo "=== Phase 12 PASSED: Node API verification ==="
+
+# ===================================================================
+# Phase 12a: per-key state report roundtrip and status publisher
+# ===================================================================
+# Exercise the local node API report leg end to end over TCP: a PUT is accepted
+# locally, syncs upstream (report_put_count advances), and lands in BOTH mirrored
+# reports buckets of the mock's served state; a DELETE removes it
+# (report_delete_count advances, key gone). Then prove the agent's own status
+# publisher reached the mock by finding status.mesh in the served reports.
+# This MUST run before Phase 13's configure-state wipes the fixture.
+echo "=== Testing per-key state report roundtrip and status publisher ==="
+
+# The mock's GET /v1/nodes/{id}/state ignores the id; drive it with plexd's real
+# node id for realism, falling back to the fixture node id if unavailable.
+RT_NODE_ID=$(curl -sf "${NAPI_AUTH[@]}" "${NODE_API_URL}/v1/state" 2>/dev/null | jq -r '.node_id // empty')
+[ -n "${RT_NODE_ID}" ] || RT_NODE_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3"
+MOCK_STATE_URL="http://localhost:18080/v1/nodes/${RT_NODE_ID}/state"
+
+# reports_value: print the value stored under a key in a served-state bucket
+# ("state" or "reports"); empty when the key is absent.
+reports_value() {
+    local body=$1 bucket=$2 key=$3
+    echo "${body}" | jq -r --arg k "${key}" ".${bucket}.reports[]? | select(.key == \$k) | .value // empty"
+}
+
+# reports_has_key: succeed iff key exists in the given served-state bucket.
+reports_has_key() {
+    local body=$1 bucket=$2 key=$3
+    echo "${body}" | jq -e --arg k "${key}" "[.${bucket}.reports[]? | select(.key == \$k)] | length > 0" >/dev/null 2>&1
+}
+
+# Baseline the upstream PUT counter: the status publisher also drives report
+# PUTs, so an absolute ">= 1" alone would not prove OUR put was delivered.
+RT_PUT_BEFORE=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "report_put_count")
+
+# (a) PUT a per-key report through the local node API.
+RT_PUT_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "${NAPI_AUTH[@]}" \
+    -H "Content-Type: application/json" \
+    -d '{"content_type":"application/json","payload":{"probe":"e2e-roundtrip-marker"}}' \
+    "${NODE_API_URL}/v1/state/report/e2e-roundtrip" 2>/dev/null || true)
+if [ "${RT_PUT_STATUS}" = "200" ]; then
+    echo "  PASS: local PUT /v1/state/report/e2e-roundtrip -> 200"
+else
+    fail "local PUT report returned status ${RT_PUT_STATUS}, want 200"
+fi
+
+# (b) Poll the mock's served state until e2e-roundtrip lands in state.reports.
+#     The upsert precedes the counter bump, so its presence proves delivery.
+RT_TIMEOUT=60
+RT_ELAPSED=0
+RT_SEEN=0
+RT_STATE=""
+while [ "${RT_ELAPSED}" -lt "${RT_TIMEOUT}" ]; do
+    RT_STATE=$(curl -sf "${MOCK_STATE_URL}" 2>/dev/null || true)
+    if [ -n "${RT_STATE}" ] && reports_has_key "${RT_STATE}" "state" "e2e-roundtrip"; then
+        RT_SEEN=1
+        break
+    fi
+    sleep 3
+    RT_ELAPSED=$((RT_ELAPSED + 3))
+done
+if [ "${RT_SEEN}" -eq 0 ]; then
+    fail "e2e-roundtrip report did not reach the mock state within ${RT_TIMEOUT}s"
+fi
+
+# report_put_count must have advanced past the baseline (our PUT was counted).
+RT_PUT_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "report_put_count")
+if [ "${RT_PUT_AFTER}" -gt "${RT_PUT_BEFORE}" ] && [ "${RT_PUT_AFTER}" -ge 1 ]; then
+    echo "  PASS: report_put_count advanced ${RT_PUT_BEFORE} -> ${RT_PUT_AFTER}"
+else
+    fail "report_put_count did not advance past ${RT_PUT_BEFORE} (after=${RT_PUT_AFTER})"
+fi
+
+# (c) The key with its PUT value must appear in BOTH mirrored reports buckets.
+for bucket in state reports; do
+    RT_VAL=$(reports_value "${RT_STATE}" "${bucket}" "e2e-roundtrip")
+    case "${RT_VAL}" in
+        *e2e-roundtrip-marker*) echo "  PASS: ${bucket}.reports carries e2e-roundtrip value" ;;
+        *) fail "${bucket}.reports missing e2e-roundtrip value marker (value='${RT_VAL}')" ;;
+    esac
+done
+
+# (d) A key outside the wire grammar is rejected by the LOCAL node API itself.
+RT_BAD_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "${NAPI_AUTH[@]}" \
+    -H "Content-Type: application/json" \
+    -d '{"content_type":"application/json","payload":{"x":1}}' \
+    "${NODE_API_URL}/v1/state/report/Bad_Key" 2>/dev/null || true)
+if [ "${RT_BAD_STATUS}" = "400" ]; then
+    echo "  PASS: local PUT /v1/state/report/Bad_Key -> 400 (grammar enforced)"
+else
+    fail "local PUT Bad_Key returned status ${RT_BAD_STATUS}, want 400"
+fi
+
+# (e) DELETE removes the report: the delete counter advances and the key
+#     disappears from BOTH mirrored buckets of the mock's served state.
+RT_DEL_BEFORE=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "report_delete_count")
+RT_DEL_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "${NAPI_AUTH[@]}" \
+    "${NODE_API_URL}/v1/state/report/e2e-roundtrip" 2>/dev/null || true)
+if [ "${RT_DEL_STATUS}" = "204" ]; then
+    echo "  PASS: local DELETE /v1/state/report/e2e-roundtrip -> 204"
+else
+    fail "local DELETE report returned status ${RT_DEL_STATUS}, want 204"
+fi
+
+RT_DEL_TIMEOUT=60
+RT_DEL_ELAPSED=0
+RT_DEL_SEEN=0
+RT_DEL_AFTER=${RT_DEL_BEFORE}
+while [ "${RT_DEL_ELAPSED}" -lt "${RT_DEL_TIMEOUT}" ]; do
+    RT_STATE=$(curl -sf "${MOCK_STATE_URL}" 2>/dev/null || true)
+    RT_DEL_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "report_delete_count")
+    if [ "${RT_DEL_AFTER}" -gt "${RT_DEL_BEFORE}" ] && [ -n "${RT_STATE}" ] \
+        && ! reports_has_key "${RT_STATE}" "state" "e2e-roundtrip" \
+        && ! reports_has_key "${RT_STATE}" "reports" "e2e-roundtrip"; then
+        RT_DEL_SEEN=1
+        break
+    fi
+    sleep 3
+    RT_DEL_ELAPSED=$((RT_DEL_ELAPSED + 3))
+done
+if [ "${RT_DEL_SEEN}" -eq 0 ]; then
+    fail "e2e-roundtrip report was not removed from the mock within ${RT_DEL_TIMEOUT}s (report_delete_count before=${RT_DEL_BEFORE}, after=${RT_DEL_AFTER})"
+fi
+echo "  PASS: report_delete_count advanced to ${RT_DEL_AFTER} and e2e-roundtrip is gone"
+
+# (f) The agent's status publisher must have landed status.mesh in the served
+#     reports by now. Poll generously: the first publish is at startup, but the
+#     syncer debounce and PUT delivery add seconds on top.
+RT_STATUS_TIMEOUT=60
+RT_STATUS_ELAPSED=0
+RT_STATUS_SEEN=0
+while [ "${RT_STATUS_ELAPSED}" -lt "${RT_STATUS_TIMEOUT}" ]; do
+    RT_STATE=$(curl -sf "${MOCK_STATE_URL}" 2>/dev/null || true)
+    if [ -n "${RT_STATE}" ] && reports_has_key "${RT_STATE}" "reports" "status.mesh"; then
+        RT_STATUS_SEEN=1
+        break
+    fi
+    sleep 3
+    RT_STATUS_ELAPSED=$((RT_STATUS_ELAPSED + 3))
+done
+if [ "${RT_STATUS_SEEN}" -eq 1 ]; then
+    echo "  PASS: served reports include status.mesh (status publisher reached the mock)"
+else
+    fail "status.mesh did not appear in the mock's served reports within ${RT_STATUS_TIMEOUT}s"
+fi
+
+echo "=== Phase 12a PASSED: state report roundtrip and status publisher ==="
 
 # ===================================================================
 # Phase 13: Converge cycle (full envelope mutation)
