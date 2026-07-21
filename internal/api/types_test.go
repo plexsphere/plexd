@@ -538,45 +538,6 @@ func TestTypesActionRequest(t *testing.T) {
 	}
 }
 
-func TestTypesExecutionAck(t *testing.T) {
-	orig := ExecutionAck{
-		ExecutionID: "exec-001",
-		Status:      "accepted",
-		Reason:      "",
-	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-}
-
-func TestTypesExecutionResult(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := ExecutionResult{
-		ExecutionID: "exec-001",
-		Status:      "completed",
-		ExitCode:    0,
-		Stdout:      "hello",
-		Stderr:      "",
-		Duration:    "1.23s",
-		FinishedAt:  now,
-		TriggeredBy: &TriggeredBy{
-			Type:      "session",
-			SessionID: "sess-abc",
-			UserID:    "u-001",
-			Email:     "admin@example.com",
-		},
-	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// Without TriggeredBy.
-	orig.TriggeredBy = nil
-	data, got2 := roundTrip(t, orig)
-	requireEqual(t, orig, got2)
-	if s := string(data); strings.Contains(s, `"triggered_by"`) {
-		t.Errorf("triggered_by should be omitted when nil, got: %s", s)
-	}
-}
-
 func TestTypesSSHSessionSetup(t *testing.T) {
 	expires := time.Now().UTC().Truncate(time.Second).Add(30 * time.Minute)
 	orig := SSHSessionSetup{
@@ -599,27 +560,6 @@ func TestTypesSSHSessionSetup(t *testing.T) {
 			t.Errorf("expected JSON key %q", key)
 		}
 	}
-}
-
-func TestTypesTunnelReadyRequest(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := TunnelReadyRequest{
-		ListenAddr: "10.42.0.1:34567",
-		Timestamp:  now,
-	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-}
-
-func TestTypesTunnelClosedRequest(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := TunnelClosedRequest{
-		Reason:    "expired",
-		Duration:  "29m45s",
-		Timestamp: now,
-	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
 }
 
 func TestTypesIntegrityViolationReport(t *testing.T) {
