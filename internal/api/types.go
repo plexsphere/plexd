@@ -197,8 +197,7 @@ type ReportEntry struct {
 }
 
 // ---------------------------------------------------------------------------
-// Execution  POST /v1/nodes/{node_id}/executions/{execution_id}/ack
-//            POST /v1/nodes/{node_id}/executions/{execution_id}/result
+// Execution  POST /v1/nodes/{node_id}/executions/{execution_id}
 // ---------------------------------------------------------------------------
 
 // ActionRequest is the SSE payload for action_request events.
@@ -209,23 +208,6 @@ type ActionRequest struct {
 	Timeout     string            `json:"timeout"`
 	Checksum    string            `json:"checksum,omitempty"`
 	TriggeredBy *TriggeredBy      `json:"triggered_by,omitempty"`
-}
-
-type ExecutionAck struct {
-	ExecutionID string `json:"execution_id"`
-	Status      string `json:"status"`
-	Reason      string `json:"reason"`
-}
-
-type ExecutionResult struct {
-	ExecutionID string       `json:"execution_id"`
-	Status      string       `json:"status"`
-	ExitCode    int          `json:"exit_code"`
-	Stdout      string       `json:"stdout"`
-	Stderr      string       `json:"stderr"`
-	Duration    string       `json:"duration"`
-	FinishedAt  time.Time    `json:"finished_at"`
-	TriggeredBy *TriggeredBy `json:"triggered_by,omitempty"`
 }
 
 type TriggeredBy struct {
@@ -412,8 +394,7 @@ type KeyRotateResponse struct {
 }
 
 // ---------------------------------------------------------------------------
-// Tunnel  POST /v1/nodes/{node_id}/tunnels/{session_id}/ready
-//         POST /v1/nodes/{node_id}/tunnels/{session_id}/closed
+// Session  POST /v1/nodes/{node_id}/sessions/{session_id}
 // ---------------------------------------------------------------------------
 
 // SSHSessionSetup is the payload of an ssh_session_setup SSE event.
@@ -423,19 +404,6 @@ type SSHSessionSetup struct {
 	TargetPort    int       `json:"target_port"`
 	AuthorizedKey string    `json:"authorized_key"`
 	ExpiresAt     time.Time `json:"expires_at"`
-}
-
-// TunnelReadyRequest is sent when a tunnel listener is ready.
-type TunnelReadyRequest struct {
-	ListenAddr string    `json:"listen_addr"`
-	Timestamp  time.Time `json:"timestamp"`
-}
-
-// TunnelClosedRequest is sent when a tunnel session closes.
-type TunnelClosedRequest struct {
-	Reason    string    `json:"reason"`
-	Duration  string    `json:"duration"`
-	Timestamp time.Time `json:"timestamp"`
 }
 
 // SessionActivityRequest is the one-of activity record a node posts to

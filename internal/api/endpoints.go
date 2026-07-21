@@ -128,20 +128,6 @@ func (c *ControlPlane) SyncReports(ctx context.Context, nodeID string, req Repor
 	return c.doRequest(ctx, http.MethodPost, path, req, nil)
 }
 
-// AckExecution acknowledges receipt of an execution command.
-// POST /v1/nodes/{node_id}/executions/{execution_id}/ack
-func (c *ControlPlane) AckExecution(ctx context.Context, nodeID, executionID string, req ExecutionAck) error {
-	path := fmt.Sprintf("/v1/nodes/%s/executions/%s/ack", url.PathEscape(nodeID), url.PathEscape(executionID))
-	return c.doRequest(ctx, http.MethodPost, path, req, nil)
-}
-
-// ReportResult reports the result of an execution.
-// POST /v1/nodes/{node_id}/executions/{execution_id}/result
-func (c *ControlPlane) ReportResult(ctx context.Context, nodeID, executionID string, req ExecutionResult) error {
-	path := fmt.Sprintf("/v1/nodes/%s/executions/%s/result", url.PathEscape(nodeID), url.PathEscape(executionID))
-	return c.doRequest(ctx, http.MethodPost, path, req, nil)
-}
-
 // ExecutionCallback posts a single execution lifecycle callback and returns the
 // server's new invocation status, plus a presigned output upload URL when the
 // callback declares an over-ceiling output.
@@ -242,20 +228,6 @@ func (c *ControlPlane) FetchArtifact(ctx context.Context, version, goos, arch st
 		return nil, err
 	}
 	return resp.Body, nil
-}
-
-// TunnelReady reports that a tunnel listener is ready for connections.
-// POST /v1/nodes/{node_id}/tunnels/{session_id}/ready
-func (c *ControlPlane) TunnelReady(ctx context.Context, nodeID, sessionID string, req TunnelReadyRequest) error {
-	path := fmt.Sprintf("/v1/nodes/%s/tunnels/%s/ready", url.PathEscape(nodeID), url.PathEscape(sessionID))
-	return c.doRequest(ctx, http.MethodPost, path, req, nil)
-}
-
-// TunnelClosed reports that a tunnel session has closed.
-// POST /v1/nodes/{node_id}/tunnels/{session_id}/closed
-func (c *ControlPlane) TunnelClosed(ctx context.Context, nodeID, sessionID string, req TunnelClosedRequest) error {
-	path := fmt.Sprintf("/v1/nodes/%s/tunnels/%s/closed", url.PathEscape(nodeID), url.PathEscape(sessionID))
-	return c.doRequest(ctx, http.MethodPost, path, req, nil)
 }
 
 // ReportSessionActivity posts a one-of session activity record (ssh, k8s, or

@@ -492,67 +492,6 @@ func TestSyncReports_Success(t *testing.T) {
 	}
 }
 
-func TestAckExecution_Success(t *testing.T) {
-	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s, want POST", r.Method)
-		}
-		if r.URL.Path != "/v1/nodes/n1/executions/exec1/ack" {
-			t.Errorf("path = %s, want /v1/nodes/n1/executions/exec1/ack", r.URL.Path)
-		}
-
-		var req ExecutionAck
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-		if req.ExecutionID != "exec1" {
-			t.Errorf("ExecutionID = %q, want %q", req.ExecutionID, "exec1")
-		}
-
-		w.WriteHeader(http.StatusOK)
-	})
-
-	err := client.AckExecution(context.Background(), "n1", "exec1", ExecutionAck{
-		ExecutionID: "exec1",
-		Status:      "accepted",
-	})
-	if err != nil {
-		t.Fatalf("AckExecution: %v", err)
-	}
-}
-
-func TestReportResult_Success(t *testing.T) {
-	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s, want POST", r.Method)
-		}
-		if r.URL.Path != "/v1/nodes/n1/executions/exec1/result" {
-			t.Errorf("path = %s, want /v1/nodes/n1/executions/exec1/result", r.URL.Path)
-		}
-
-		var req ExecutionResult
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-		if req.ExitCode != 0 {
-			t.Errorf("ExitCode = %d, want 0", req.ExitCode)
-		}
-
-		w.WriteHeader(http.StatusOK)
-	})
-
-	err := client.ReportResult(context.Background(), "n1", "exec1", ExecutionResult{
-		ExecutionID: "exec1",
-		Status:      "success",
-		ExitCode:    0,
-		Stdout:      "hello",
-		FinishedAt:  time.Now(),
-	})
-	if err != nil {
-		t.Fatalf("ReportResult: %v", err)
-	}
-}
-
 func TestReportMetrics_Success(t *testing.T) {
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -681,67 +620,6 @@ func TestEndpoints_PathParametersEscaped(t *testing.T) {
 	// url.PathEscape encodes "/" as %2F.
 	if !strings.Contains(gotPath, "%2F") && !strings.Contains(gotPath, "%2f") {
 		t.Errorf("path does not contain escaped slashes: %s", gotPath)
-	}
-}
-
-func TestTunnelReady_Success(t *testing.T) {
-	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s, want POST", r.Method)
-		}
-		if r.URL.Path != "/v1/nodes/n-001/tunnels/sess-001/ready" {
-			t.Errorf("path = %s, want /v1/nodes/n-001/tunnels/sess-001/ready", r.URL.Path)
-		}
-
-		var req TunnelReadyRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-		if req.ListenAddr != "10.42.0.1:34567" {
-			t.Errorf("listen_addr = %q, want %q", req.ListenAddr, "10.42.0.1:34567")
-		}
-
-		w.WriteHeader(http.StatusNoContent)
-	})
-
-	now := time.Now().UTC().Truncate(time.Second)
-	err := client.TunnelReady(context.Background(), "n-001", "sess-001", TunnelReadyRequest{
-		ListenAddr: "10.42.0.1:34567",
-		Timestamp:  now,
-	})
-	if err != nil {
-		t.Fatalf("TunnelReady() = %v", err)
-	}
-}
-
-func TestTunnelClosed_Success(t *testing.T) {
-	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s, want POST", r.Method)
-		}
-		if r.URL.Path != "/v1/nodes/n-001/tunnels/sess-001/closed" {
-			t.Errorf("path = %s, want /v1/nodes/n-001/tunnels/sess-001/closed", r.URL.Path)
-		}
-
-		var req TunnelClosedRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-		if req.Reason != "expired" {
-			t.Errorf("reason = %q, want %q", req.Reason, "expired")
-		}
-
-		w.WriteHeader(http.StatusNoContent)
-	})
-
-	now := time.Now().UTC().Truncate(time.Second)
-	err := client.TunnelClosed(context.Background(), "n-001", "sess-001", TunnelClosedRequest{
-		Reason:    "expired",
-		Duration:  "29m45s",
-		Timestamp: now,
-	})
-	if err != nil {
-		t.Fatalf("TunnelClosed() = %v", err)
 	}
 }
 
