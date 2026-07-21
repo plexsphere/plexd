@@ -111,7 +111,11 @@ type AuditSource interface {
 
 ## AuditReporter
 
-Interface abstracting the control plane audit reporting API. Satisfied by `api.ControlPlane`.
+Interface abstracting the audit reporting API. It is satisfied by the package's
+`PlatformReporter` (the control-plane leg, which converts each batch to
+`[]api.AuditEvent` and posts it through the package's `IngestClient` seam — which
+`api.ControlPlane` satisfies), `LocalReporter` (the local leg), and
+`MultiReporter` (both).
 
 ```go
 type AuditReporter interface {
@@ -411,9 +415,94 @@ err := fwd.Run(ctx)
 
 ### POST /v1/nodes/{node_id}/audit
 
-Reports a batch of audit entries to the control plane.
+The control-plane leg of the pipeline (`PlatformReporter`) converts each buffered
+`AuditEntry` into a wire `api.AuditEvent` and POSTs the batch as **NDJSON** — one
+JSON object per line (`Content-Type: application/x-ndjson`). The request stamps
+an `X-Plexsphere-Sent-At` header (RFC 3339, nanosecond precision, UTC) and is
+gzip-compressed when the body exceeds 1 KiB. Success is `202 Accepted` with an
+`IngestReceipt`.
 
-**Request body** (`api.AuditBatch = []api.AuditEntry`):
+**Request body** (NDJSON of `api.AuditEvent`):
+
+```
+{"source":"auditd","action":"open","outcome":"failure","timestamp":"2026-02-12T10:30:00Z"}
+{"source":"k8s","action":"create","outcome":"success","timestamp":"2026-02-12T10:30:01Z"}
+```
+
+**AuditEvent fields:**
+
+| Field       | Type        | JSON Tag      | Description                                    |
+|-------------|-------------|---------------|-----------------------------------------------|
+| `Source`    | `string`    | `"source"`    | Wire source: `auditd`, `k8s`, or `plexd`      |
+| `Action`    | `string`    | `"action"`    | Action performed (non-empty)                  |
+| `Outcome`   | `string`    | `"outcome"`   | Outcome, taken from the entry's `Result` (non-empty) |
+| `Timestamp` | `time.Time` | `"timestamp"` | Event time (RFC 3339)                         |
+
+The internal `event_type`, `subject`, `object`, `hostname`, and `raw` fields have
+no wire counterpart and are dropped.
+
+> **The platform leg is a source/action/outcome stream, not a full audit trail.**
+> `AuditEvent` carries no actor and no target, so the control plane records
+> *that* an `open` failed on a node at a time — not which uid, pid, process, or
+> path. Two denied opens on different files collapse into indistinguishable
+> records upstream. Incident attribution and correlation therefore need the full
+> `AuditEntry`, which only reaches the [local endpoint](#localreporter);
+> configure `local_endpoint` on every node whose audit trail has to support it.
+
+#### Source mapping and skip rules
+
+`PlatformReporter` maps the internal source to the wire source and drops entries
+that fall outside the contract:
+
+| Internal `source` | Wire `source` |
+|-------------------|---------------|
+| `auditd`    | `auditd` |
+| `k8s-audit` | `k8s`    |
+| `process`   | `plexd` (plexd's own `process_start` event, kept attributable rather than conflated with kernel `auditd` records) |
+
+- An entry whose source is **not** in the table above is skipped with a Warn log.
+- An entry with an **empty action or result** is skipped with a Debug log (the
+  contract requires both non-empty and would reject the whole batch otherwise).
+- When no events survive, the client is not called (the ingest contract rejects an
+  empty array).
+
+#### Response — IngestReceipt (`202 Accepted`)
+
+```json
+{ "accepted_at": "2026-02-12T10:30:00.123456789Z", "records": 2 }
+```
+
+| Field        | Type        | JSON Tag        | Description                                  |
+|--------------|-------------|-----------------|----------------------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | When the control plane accepted the batch    |
+| `Records`    | `int`       | `"records"`     | Number of records accepted from the batch    |
+
+#### Ingest errors
+
+| Status | Problem `code` | Meaning | `PlatformReporter` reaction |
+|--------|----------------|---------|-----------------------------|
+| `400 Bad Request` | `ingest_batch_malformed` | Body has no non-blank lines, an undecodable line, or a record with an out-of-set `source`, empty `action`, empty `outcome`, or zero `timestamp` | Drops the batch — a verdict on the bytes, which no retry changes |
+| `400 Bad Request` | `ingest_sent_at_invalid` | `X-Plexsphere-Sent-At` is missing or not an RFC 3339 timestamp | Returned for retry — the header is re-stamped on every attempt, so it clears once the node's clock converges |
+| `413 Payload Too Large` | — | Batch exceeds the server-side size limit | Halves the batch and re-sends each half; a single event still refused is dropped |
+| `415 Unsupported Media Type` | `ingest_encoding_unsupported` | `Content-Encoding` is neither `gzip` nor `identity` | Returned for retry — a property of the deployment, not of the batch |
+| `501 Not Implemented` | `observability_ingest_not_provisioned` | Observability ingest is not provisioned | Drops the batch quietly (a one-time Info log on the transition, another on recovery) rather than re-buffering it |
+
+Any other error is returned to `Forwarder.flush`, which retains and retries the
+batch.
+
+Every record the reporter discards — an entry whose source is outside the
+contract, a dropped batch, an event over the size limit — is added to a running
+count that is summarized in a `dropping audit records` Warn at most once every
+five minutes. `Forwarder.flush` takes its success path for a dropped batch, so
+this log is the only signal that the audit trail is incomplete.
+
+### Internal / local-endpoint format: AuditEntry
+
+The in-memory buffer and the optional [local endpoint](#local-endpoint)
+(`LocalReporter`) keep the richer `AuditEntry` shape; only the control-plane leg
+converts to `AuditEvent`.
+
+**Example body** (`api.AuditBatch = []api.AuditEntry`):
 
 ```json
 [
@@ -442,7 +531,7 @@ Reports a batch of audit entries to the control plane.
 ]
 ```
 
-### AuditEntry Schema
+#### AuditEntry Schema
 
 ```go
 type AuditEntry struct {
@@ -500,25 +589,28 @@ All log entries use `component=auditfwd`.
 
 ### With api.ControlPlane
 
-`api.ControlPlane` satisfies the `AuditReporter` interface directly:
+`api.ControlPlane` is the control-plane ingest client; the `Forwarder` reaches it
+through a `PlatformReporter`, which converts each batch to `[]api.AuditEvent` and
+posts it via the client:
 
 ```go
 controlPlane, _ := api.NewControlPlane(apiCfg, "1.0.0", logger)
 
-// controlPlane.ReportAudit matches AuditReporter.ReportAudit
-fwd := auditfwd.NewForwarder(cfg, sources, controlPlane, nodeID, hostname, logger)
+// PlatformReporter is the control-plane leg; controlPlane satisfies its IngestClient seam.
+reporter := auditfwd.NewPlatformReporter(controlPlane, logger)
+fwd := auditfwd.NewForwarder(cfg, sources, reporter, nodeID, hostname, logger)
 fwd.Run(ctx)
 ```
 
 ### With LocalReporter and MultiReporter
 
-When `LocalEndpoint.URL` is configured, the `Forwarder` receives a `MultiReporter` instead of the control plane client directly:
+When `LocalEndpoint.URL` is configured, the `Forwarder` receives a `MultiReporter` that wraps both the `PlatformReporter` and a `LocalReporter`:
 
 ```go
-var auditReporter auditfwd.AuditReporter = controlPlane
+var auditReporter auditfwd.AuditReporter = auditfwd.NewPlatformReporter(controlPlane, logger)
 if cfg.AuditFwd.LocalEndpoint.URL != "" {
     localReporter := auditfwd.NewLocalReporter(cfg.AuditFwd.LocalEndpoint, controlPlane, nsk, identity.NodeID, logger)
-    auditReporter = auditfwd.NewMultiReporter(controlPlane, localReporter, logger)
+    auditReporter = auditfwd.NewMultiReporter(auditReporter, localReporter, logger)
     logger.Info("local endpoint enabled", "pipeline", "auditfwd", "url", cfg.AuditFwd.LocalEndpoint.URL)
 }
 fwd := auditfwd.NewForwarder(cfg.AuditFwd, sources, auditReporter, identity.NodeID, hostname, logger)

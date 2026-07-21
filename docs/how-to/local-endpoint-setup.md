@@ -28,8 +28,11 @@ Before starting, understand these design properties:
 - **Fire-and-forget.** Local endpoint delivery has no retry or backoff
   mechanism. If a POST fails, the batch is not retried — the next scheduled
   batch will be a fresh delivery.
-- **Identical payloads.** The local endpoint receives the same JSON body that
-  the control plane receives. No transformation or reformatting is applied.
+- **Local payload shape.** The local endpoint receives plexd's internal
+  `MetricPoint` / `LogEntry` / `AuditEntry` JSON unchanged, with no
+  transformation. The **control-plane** leg sends a different wire shape
+  (`MetricSample` / `LogLine` / `AuditEvent`), so the two legs are no longer
+  byte-identical.
 - **Shared configuration type.** The `local_endpoint` block uses the same
   `LocalEndpointConfig` type across all three pipelines (metrics, log
   forwarding, audit forwarding).
@@ -162,6 +165,14 @@ These warnings do **not** affect platform delivery.
 
 ## Common Use Cases
 
+::: info Local vs control-plane payloads
+The shapes below are what the **local endpoint** receives — plexd's internal
+`MetricPoint`, `LogEntry`, and `AuditEntry` JSON. The control-plane leg instead
+sends the flattened wire types (`MetricSample`, `LogLine`, `AuditEvent`)
+documented in the observability reference pages; only the local leg keeps these
+internal shapes.
+:::
+
 ### Forwarding Metrics to a Prometheus-Compatible Receiver
 
 plexd sends metrics as a JSON array of `MetricPoint` objects — this is **not**
@@ -218,11 +229,11 @@ payload schema your adapter must handle, see the
 [Audit Forwarding Reference — API Contract](../reference/observability/audit-forwarding.md#api-contract).
 
 ::: tip Payload Format
-All three pipelines send **identical JSON payloads** to the local endpoint and
-the control plane. The local endpoint receives plexd-specific JSON — not a
-standard format like Prometheus remote-write, OpenTelemetry, or Elasticsearch
-bulk. Plan for a receiving adapter if your monitoring stack requires a specific
-ingest format.
+The local endpoint receives plexd-specific JSON (`MetricPoint` / `LogEntry` /
+`AuditEntry`) — not a standard format like Prometheus remote-write,
+OpenTelemetry, or Elasticsearch bulk, and not the flattened wire shapes the
+control-plane leg sends. Plan for a receiving adapter if your monitoring stack
+requires a specific ingest format.
 :::
 
 ## Troubleshooting

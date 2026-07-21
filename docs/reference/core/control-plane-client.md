@@ -70,12 +70,13 @@ All methods accept a `context.Context` for cancellation and return typed respons
 | `UpdateCapabilities`  | `PUT`           | `/v1/nodes/{node_id}/capabilities`                | `CapabilitiesPayload`| —                     |
 | `ReportEndpoint`      | `PUT`           | `/v1/nodes/{node_id}/endpoint`                    | `EndpointRequest`    | `*EndpointResponse`   |
 | `FetchSecret`         | `GET`           | `/v1/nodes/{node_id}/secrets/{key}`               | —                    | `*SecretResponse`     |
-| `SyncReports`         | `POST`          | `/v1/nodes/{node_id}/report`                      | `ReportSyncRequest`  | —                     |
+| `PutStateReport`      | `PUT`           | `/v1/nodes/{node_id}/state/reports/{key}`          | `NodeStateReportRequest` | `*NodeStateReportResponse` |
+| `DeleteStateReport`   | `DELETE`        | `/v1/nodes/{node_id}/state/reports/{key}`          | —                    | — (`204 No Content`)  |
 | `ExecutionCallback`   | `POST`          | `/v1/nodes/{node_id}/executions/{execution_id}`    | `ExecutionCallbackRequest` | `*ExecutionCallbackResponse` |
 | `UploadExecutionOutput` | `PUT`         | presigned URL (no bearer token)                    | `[]byte`             | —                     |
-| `ReportMetrics`       | `POST`          | `/v1/nodes/{node_id}/metrics`                     | `MetricBatch`        | —                     |
-| `ReportLogs`          | `POST`          | `/v1/nodes/{node_id}/logs`                        | `LogBatch`           | —                     |
-| `ReportAudit`         | `POST`          | `/v1/nodes/{node_id}/audit`                       | `AuditBatch`         | —                     |
+| `ReportMetrics`       | `POST`          | `/v1/nodes/{node_id}/metrics`                     | `[]MetricSample` (JSON array) | `*IngestReceipt`   |
+| `ReportLogs`          | `POST`          | `/v1/nodes/{node_id}/logs`                        | `[]LogLine` (NDJSON)  | `*IngestReceipt`      |
+| `ReportAudit`         | `POST`          | `/v1/nodes/{node_id}/audit`                       | `[]AuditEvent` (NDJSON)| `*IngestReceipt`     |
 | `FetchArtifact`       | `GET`           | `/v1/artifacts/plexd/{version}/{os}/{arch}`        | —                    | `io.ReadCloser`       |
 | `ReportSessionActivity` | `POST`        | `/v1/nodes/{node_id}/sessions/{session_id}`        | `SessionActivityRequest` | — (`204 No Content`) |
 | `ReportIntegrityViolation` | `POST`     | `/v1/nodes/{node_id}/integrity/violations`         | `IntegrityViolationReport` | —              |
