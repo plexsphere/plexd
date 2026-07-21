@@ -18,7 +18,7 @@ services:
   plexd:
     build:
       context: ../..
-      dockerfile: deploy/docker/Dockerfile
+      dockerfile: test/e2e/docker/Dockerfile.plexd
     # Run as root with NET_ADMIN so WireGuard (netlink), nftables, and tunnel
     # subsystems can create interfaces and firewall rules inside the container.
     user: "0:0"
