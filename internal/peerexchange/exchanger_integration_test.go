@@ -64,6 +64,7 @@ func (c *trackingWGController) ConfigureAddress(string, string) error     { retu
 func (c *trackingWGController) SetInterfaceUp(string) error               { return nil }
 func (c *trackingWGController) SetMTU(string, int) error                  { return nil }
 func (c *trackingWGController) RemovePeer(string, []byte) error           { return nil }
+func (c *trackingWGController) SetPrivateKey(string, []byte) error        { return nil }
 
 func (c *trackingWGController) AddPeer(_ string, cfg wireguard.PeerConfig) error {
 	c.mu.Lock()
