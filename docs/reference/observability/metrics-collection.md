@@ -360,7 +360,11 @@ Returns a single `MetricPoint` with `Group="agent"`. Uses `runtime.NumGoroutine(
 
 ## MetricReporter
 
-Interface abstracting the control plane metrics reporting API. Satisfied by `api.ControlPlane`.
+Interface abstracting the metrics reporting API. It is satisfied by the package's
+`PlatformReporter` (the control-plane leg, which flattens each batch to
+`[]api.MetricSample` and posts it through the package's `IngestClient` seam —
+which `api.ControlPlane` satisfies), `LocalReporter` (the local leg), and
+`MultiReporter` (both).
 
 ```go
 type MetricReporter interface {
@@ -530,9 +534,103 @@ err := mgr.Run(ctx)
 
 ### POST /v1/nodes/{node_id}/metrics
 
-Reports a batch of metric points to the control plane.
+The control-plane leg of the pipeline (`PlatformReporter`) flattens each buffered
+`MetricPoint` into one or more `api.MetricSample` records and POSTs them as a
+**JSON array**. The request stamps an `X-Plexsphere-Sent-At` header (RFC 3339,
+nanosecond precision, UTC) and is gzip-compressed when the body exceeds 1 KiB.
+Success is `202 Accepted` with an `IngestReceipt`.
 
-**Request body** (`api.MetricBatch = []api.MetricPoint`):
+**Request body** (`[]api.MetricSample`):
+
+```json
+[
+  {
+    "group": "node_resources",
+    "name": "cpu_usage_percent",
+    "value": 42.5,
+    "timestamp": "2026-02-12T10:30:00Z"
+  },
+  {
+    "group": "tunnel_health",
+    "name": "rx_bytes",
+    "value": 104857600,
+    "labels": { "peer_id": "peer-abc-123" },
+    "timestamp": "2026-02-12T10:30:00Z"
+  },
+  {
+    "group": "peer_latency",
+    "name": "rtt_seconds",
+    "value": 0.015,
+    "labels": { "peer_id": "peer-abc-123" },
+    "timestamp": "2026-02-12T10:30:00Z"
+  }
+]
+```
+
+**MetricSample fields:**
+
+| Field       | Type                | JSON Tag             | Description                                              |
+|-------------|---------------------|----------------------|----------------------------------------------------------|
+| `Group`     | `string`            | `"group"`            | Wire group: `node_resources`, `tunnel_health`, `peer_latency`, or `agent_stats` |
+| `Name`      | `string`            | `"name"`             | Sample name (see the flattening table)                   |
+| `Value`     | `float64`           | `"value"`            | Sample value                                             |
+| `Labels`    | `map[string]string` | `"labels,omitempty"` | Dimensions such as `peer_id`; omitted when the sample has none |
+| `Timestamp` | `time.Time`         | `"timestamp"`        | The originating point's collection time (RFC 3339)       |
+
+#### Flattening
+
+`PlatformReporter` expands every numeric field of a `MetricPoint`'s data struct
+into its own sample, carrying the point's timestamp and the wire group for the
+point's internal group. A non-finite value (`NaN`/`Inf`) is skipped individually
+with a Debug log so one bad field does not fail the whole batch.
+
+| Internal group | Wire group       | Sample names | Labels |
+|----------------|------------------|--------------|--------|
+| `system`  | `node_resources` | `cpu_usage_percent`, `memory_used_bytes`, `memory_total_bytes`, `disk_used_bytes`, `disk_total_bytes`, `network_rx_bytes`, `network_tx_bytes`, `load_avg_1`, `load_avg_5`, `load_avg_15` | — |
+| `tunnel`  | `tunnel_health`  | `rx_bytes`, `tx_bytes`, `handshake_succeeded` (0/1), `handshake_stale` (0/1), `packet_loss_percent`, `last_handshake_timestamp_seconds` (Unix seconds, `0` for a zero time) | `peer_id` |
+| `latency` | `peer_latency`   | `rtt_seconds` (`rtt_nano / 1e9`; the `-1` ping-failure sentinel is carried through as `-1`) | `peer_id` |
+| `agent`   | `agent_stats`    | `goroutine_count`, `heap_alloc_bytes`, `heap_sys_bytes`, `gc_pause_total_ns`, `gc_num_gc`, `uptime_seconds`, `reconnect_count` | — |
+
+#### Response — IngestReceipt (`202 Accepted`)
+
+```json
+{ "accepted_at": "2026-02-12T10:30:00.123456789Z", "records": 17 }
+```
+
+| Field        | Type        | JSON Tag        | Description                                  |
+|--------------|-------------|-----------------|----------------------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | When the control plane accepted the batch    |
+| `Records`    | `int`       | `"records"`     | Number of records accepted from the batch    |
+
+A batch that flattens to zero samples is never sent (the ingest contract rejects
+an empty array).
+
+#### Ingest errors
+
+| Status | Problem `code` | Meaning | `PlatformReporter` reaction |
+|--------|----------------|---------|-----------------------------|
+| `400 Bad Request` | `ingest_batch_malformed` | Body is not a non-empty JSON array, or a record carries an out-of-set `group`, empty `name`, or zero `timestamp` | Drops the batch — a verdict on the bytes, which no retry changes |
+| `400 Bad Request` | `ingest_sent_at_invalid` | `X-Plexsphere-Sent-At` is missing or not an RFC 3339 timestamp | Returned for retry — the header is re-stamped on every attempt, so it clears once the node's clock converges |
+| `413 Payload Too Large` | — | Batch exceeds the server-side size limit | Halves the batch and re-sends each half; a single sample still refused is dropped |
+| `415 Unsupported Media Type` | `ingest_encoding_unsupported` | `Content-Encoding` is neither `gzip` nor `identity` | Returned for retry — a property of the deployment, not of the batch |
+| `501 Not Implemented` | `observability_ingest_not_provisioned` | Observability ingest is not provisioned | Drops the batch quietly (a one-time Info log on the transition, another on recovery) rather than re-buffering it |
+
+Any other error is returned to `Manager.flush`, which retains and retries the
+batch.
+
+Every sample the reporter discards — an unconvertible point, a dropped batch, a
+sample over the size limit — is added to a running count that is summarized in a
+`dropping metric samples` Warn at most once every five minutes. `Manager.flush`
+takes its success path for a dropped batch, so this log is the only signal that
+metrics are being lost.
+
+### Internal / local-endpoint format: MetricPoint
+
+The in-memory buffer and the optional [local endpoint](#local-endpoint)
+(`LocalReporter`) keep the richer `MetricPoint` shape; only the control-plane leg
+flattens to `MetricSample`.
+
+**Example body** (`api.MetricBatch = []api.MetricPoint`):
 
 ```json
 [
@@ -578,7 +676,7 @@ Reports a batch of metric points to the control plane.
 ]
 ```
 
-### MetricPoint Schema
+#### MetricPoint Schema
 
 ```go
 type MetricPoint struct {
@@ -626,27 +724,30 @@ All log entries use `component=metrics`.
 
 ### With api.ControlPlane
 
-`api.ControlPlane` satisfies the `MetricReporter` interface directly:
+`api.ControlPlane` is the control-plane ingest client; the pipeline reaches it
+through a `PlatformReporter`, which flattens each batch to `[]api.MetricSample`
+and posts it via the client:
 
 ```go
 controlPlane, _ := api.NewControlPlane(apiCfg, "1.0.0", logger)
 
-// controlPlane.ReportMetrics matches MetricReporter.ReportMetrics
-mgr := metrics.NewManager(cfg, collectors, controlPlane, nodeID, logger)
+// PlatformReporter is the control-plane leg; controlPlane satisfies its IngestClient seam.
+reporter := metrics.NewPlatformReporter(controlPlane, logger)
+mgr := metrics.NewManager(cfg, collectors, reporter, nodeID, logger)
 mgr.Run(ctx)
 ```
 
 ### With LocalReporter and MultiReporter
 
-When `LocalEndpoint.URL` is configured, the pipeline manager receives a `MultiReporter` that wraps both the control plane client and a `LocalReporter`. When not configured, the control plane client is passed directly—no extra goroutines, no `SecretFetcher` calls, no `MultiReporter` wrapping.
+When `LocalEndpoint.URL` is configured, the pipeline manager receives a `MultiReporter` that wraps both the `PlatformReporter` and a `LocalReporter`. When not configured, the `PlatformReporter` is used directly—no extra goroutines, no `SecretFetcher` calls, no `MultiReporter` wrapping.
 
 ```go
 nsk := []byte(identity.NodeSecretKey)
 
-var metricsReporter metrics.MetricsReporter = controlPlane
+var metricsReporter metrics.MetricsReporter = metrics.NewPlatformReporter(controlPlane, logger)
 if cfg.Metrics.LocalEndpoint.URL != "" {
     localReporter := metrics.NewLocalReporter(cfg.Metrics.LocalEndpoint, controlPlane, nsk, identity.NodeID, logger)
-    metricsReporter = metrics.NewMultiReporter(controlPlane, localReporter, logger)
+    metricsReporter = metrics.NewMultiReporter(metricsReporter, localReporter, logger)
     logger.Info("local endpoint enabled", "pipeline", "metrics", "url", cfg.Metrics.LocalEndpoint.URL)
 }
 mgr := metrics.NewManager(cfg.Metrics, collectors, metricsReporter, identity.NodeID, logger)

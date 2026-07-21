@@ -514,6 +514,110 @@ A valid record increments `session_activity_count` and returns `204 No Content`.
 | `400 Bad Request` | `malformed_session_activity` | Unreadable body, strict-decode failure, or a one-of / per-kind violation |
 | `403 Forbidden` | `nsk_node_mismatch` | `{id}` does not match the mock node identity |
 
+### `PUT /v1/nodes/{id}/state/reports/{key}`
+
+The per-key state report upsert. The mock validates `{key}` against the
+control-plane grammar `^[a-z][a-z0-9._-]{0,127}$`, strict-decodes the
+`api.NodeStateReportRequest` body, caps `value` at 4096 bytes, and upserts the
+entry into **both** mirrored reports buckets of the state fixture
+(`state.reports` and `reports.reports`), keeping each sorted by key ascending.
+Success is `200 OK`.
+
+**Request body:**
+
+```json
+{ "value": "{\"status\":\"healthy\"}", "workload_tag": "web" }
+```
+
+**Response:** `200 OK`
+
+```json
+{ "accepted_at": "2026-07-19T19:32:35Z", "key": "status.mesh" }
+```
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `200 OK` | — | Report upserted into both mirrored buckets |
+| `400 Bad Request` | `invalid_report` | Key is outside the grammar, the body fails strict decoding, or `value` exceeds 4096 bytes |
+
+**Counter:** Increments `report_put_count` on each accepted upsert.
+
+### `DELETE /v1/nodes/{id}/state/reports/{key}`
+
+Removes the report stored under `{key}` from both mirrored reports buckets.
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `204 No Content` | — | Report removed |
+| `400 Bad Request` | `invalid_report` | Key is outside the grammar |
+| `404 Not Found` | `report_not_found` | No report exists for this key |
+
+**Counter:** Increments `report_delete_count` on each successful delete.
+
+### `POST /v1/nodes/{id}/metrics`
+
+The v1 metrics ingest. The mock enforces the shared ingest header gates,
+strict-decodes a **non-empty JSON array** of `api.MetricSample`, and validates
+each record's `group` (closed set: `node_resources`, `tunnel_health`,
+`peer_latency`, `agent_stats`), non-empty `name`, and non-zero `timestamp`.
+Success is `202 Accepted` with an `IngestReceipt` whose `records` is the batch
+length.
+
+**Ingest header gates** (shared by metrics, logs, and audit, checked in order):
+
+1. **Encoding** → `415` `ingest_encoding_unsupported` if `Content-Encoding` is anything other than empty, `identity`, or `gzip`.
+2. **Sent-at** → `400` `ingest_sent_at_invalid` if `X-Plexsphere-Sent-At` is missing or not an RFC 3339 timestamp.
+
+**Response:** `202 Accepted`
+
+```json
+{ "accepted_at": "2026-07-19T19:32:35Z", "records": 2 }
+```
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `202 Accepted` | — | Batch accepted; body is an `IngestReceipt` |
+| `400 Bad Request` | `ingest_batch_malformed` | Body is not a non-empty JSON array, or a record has an out-of-set `group`, empty `name`, or zero `timestamp` |
+| `400 Bad Request` | `ingest_sent_at_invalid` | `X-Plexsphere-Sent-At` missing or not RFC 3339 |
+| `415 Unsupported Media Type` | `ingest_encoding_unsupported` | `Content-Encoding` other than `gzip` or `identity` |
+
+**Counter:** Increments `metrics_count` on each accepted batch.
+
+### `POST /v1/nodes/{id}/logs`
+
+The v1 logs ingest. After the shared header gates, the mock splits the NDJSON
+body on newlines (skipping blank lines), strict-decodes each line into
+`api.LogLine`, and validates the `severity` (closed set: `emerg`, `alert`,
+`crit`, `err`, `warning`, `notice`, `info`, `debug`), non-empty `message`, and
+non-zero `timestamp`. A batch with no non-blank lines is malformed. Success is
+`202 Accepted` with a receipt whose `records` is the line count.
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `202 Accepted` | — | Batch accepted; body is an `IngestReceipt` |
+| `400 Bad Request` | `ingest_batch_malformed` | No non-blank lines, an undecodable line, or a record with an out-of-set `severity`, empty `message`, or zero `timestamp` |
+| `400 Bad Request` | `ingest_sent_at_invalid` | `X-Plexsphere-Sent-At` missing or not RFC 3339 |
+| `415 Unsupported Media Type` | `ingest_encoding_unsupported` | `Content-Encoding` other than `gzip` or `identity` |
+
+**Counter:** Increments `logs_count` on each accepted batch.
+
+### `POST /v1/nodes/{id}/audit`
+
+The v1 audit ingest, mirroring the logs handler: shared header gates, NDJSON
+split skipping blank lines, strict decode into `api.AuditEvent`, and validation
+of the `source` (closed set: `auditd`, `k8s`), non-empty `action`, non-empty
+`outcome`, and non-zero `timestamp`. Success is `202 Accepted` with a receipt
+whose `records` is the line count.
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `202 Accepted` | — | Batch accepted; body is an `IngestReceipt` |
+| `400 Bad Request` | `ingest_batch_malformed` | No non-blank lines, an undecodable line, or a record with an out-of-set `source`, empty `action`, empty `outcome`, or zero `timestamp` |
+| `400 Bad Request` | `ingest_sent_at_invalid` | `X-Plexsphere-Sent-At` missing or not RFC 3339 |
+| `415 Unsupported Media Type` | `ingest_encoding_unsupported` | `Content-Encoding` other than `gzip` or `identity` |
+
+**Counter:** Increments `audit_count` on each accepted batch.
+
 ### `GET /test/assertions`
 
 Test-only endpoint returning a snapshot of all call counters. Not part of the `/v1/` API namespace.
@@ -531,7 +635,8 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "capabilities_count": 0,
   "endpoint_count": 0,
   "secrets_count": 0,
-  "report_count": 0,
+  "report_put_count": 0,
+  "report_delete_count": 0,
   "execution_callback_count": 0,
   "execution_upload_count": 0,
   "metrics_count": 0,
@@ -722,7 +827,8 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `capabilities_count` | `PUT /v1/nodes/{id}/capabilities` |
 | `endpoint_count` | `PUT /v1/nodes/{id}/endpoint` |
 | `secrets_count` | `GET /v1/nodes/{id}/secrets/{key}` |
-| `report_count` | `POST /v1/nodes/{id}/report` |
+| `report_put_count` | `PUT /v1/nodes/{id}/state/reports/{key}` (accepted upserts only) |
+| `report_delete_count` | `DELETE /v1/nodes/{id}/state/reports/{key}` (successful deletes only) |
 | `execution_callback_count` | `POST /v1/nodes/{id}/executions/{eid}` (accepted callbacks only) |
 | `execution_upload_count` | `PUT /exec-output/{eid}` (presigned output upload) |
 | `metrics_count` | `POST /v1/nodes/{id}/metrics` |

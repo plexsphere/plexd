@@ -247,24 +247,30 @@ shape the local node API serves for cached data entries.
 
 ## Reports
 
-### `POST /v1/nodes/{node_id}/report`
+### `PUT` / `DELETE /v1/nodes/{node_id}/state/reports/{key}`
 
-**ReportSyncRequest**
+Per-key node state reports. `PUT` upserts the report at `{key}`; `DELETE` removes
+it. `{key}` follows the report key grammar `^[a-z][a-z0-9._-]{0,127}$`, and
+`Value` is capped at 4096 bytes. See
+[Control Plane API Endpoints](api-endpoints.md#reports) for the wire examples and
+error taxonomy.
 
-| Field    | Type            | JSON Tag    | Description             |
-|----------|-----------------|-------------|-------------------------|
-| `Entries`| `[]ReportEntry` | `"entries"` | Report entries to sync  |
-| `Deleted`| `[]string`      | `"deleted"` | Deleted entry keys      |
+**NodeStateReportRequest** (`PUT` body)
 
-**ReportEntry**
+| Field         | Type     | JSON Tag                    | Description                                |
+|---------------|----------|-----------------------------|--------------------------------------------|
+| `Value`       | `string` | `"value"`                   | Opaque report payload (at most 4096 bytes) |
+| `WorkloadTag` | `string` | `"workload_tag,omitempty"`  | Owning workload; absent when unattributed  |
 
-| Field        | Type              | JSON Tag       | Description            |
-|--------------|-------------------|----------------|------------------------|
-| `Key`        | `string`          | `"key"`        | Entry key              |
-| `ContentType`| `string`          | `"content_type"`| MIME content type     |
-| `Payload`    | `json.RawMessage` | `"payload"`    | Arbitrary JSON payload |
-| `Version`    | `int`             | `"version"`    | Entry version          |
-| `UpdatedAt`  | `time.Time`       | `"updated_at"` | Last update timestamp  |
+**NodeStateReportResponse** (`200 OK` on `PUT`)
+
+`DELETE` returns `204 No Content` with no body (or `404` `report_not_found` when
+the key has no report).
+
+| Field        | Type        | JSON Tag        | Description                     |
+|--------------|-------------|-----------------|---------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | Server receive time             |
+| `Key`        | `string`    | `"key"`         | Echoes the addressed report key |
 
 ## Executions
 
@@ -335,11 +341,30 @@ transition: `ack` → `started` → `succeeded` | `failed` | `cancelled`.
 
 ## Observability
 
+The control-plane leg of the three ingest endpoints sends the flattened wire
+types below and receives an `IngestReceipt` on `202 Accepted`. The internal
+pipeline and the optional local endpoint keep the richer `MetricPoint` /
+`LogEntry` / `AuditEntry` shapes; see
+[Metrics Collection](../observability/metrics-collection.md),
+[Log Forwarding](../observability/log-forwarding.md), and
+[Audit Forwarding](../observability/audit-forwarding.md).
+
 ### `POST /v1/nodes/{node_id}/metrics`
 
-**MetricBatch** — type alias for `[]MetricPoint`
+Body is a JSON array of `MetricSample`.
 
-**MetricPoint**
+**MetricSample**
+
+| Field       | Type                | JSON Tag             | Description                                                    |
+|-------------|---------------------|----------------------|----------------------------------------------------------------|
+| `Group`     | `string`            | `"group"`            | Wire group: `node_resources`, `tunnel_health`, `peer_latency`, or `agent_stats` |
+| `Name`      | `string`            | `"name"`             | Sample name                                                    |
+| `Value`     | `float64`           | `"value"`            | Sample value                                                   |
+| `Labels`    | `map[string]string` | `"labels,omitempty"` | Dimensions (e.g. `peer_id`); absent when the sample has none   |
+| `Timestamp` | `time.Time`         | `"timestamp"`        | Sample time                                                    |
+
+**MetricPoint** — internal pipeline and local-endpoint format; `MetricBatch` is a
+type alias for `[]MetricPoint`
 
 | Field      | Type              | JSON Tag            | Description          |
 |------------|-------------------|---------------------|----------------------|
@@ -350,9 +375,20 @@ transition: `ack` → `started` → `succeeded` | `failed` | `cancelled`.
 
 ### `POST /v1/nodes/{node_id}/logs`
 
-**LogBatch** — type alias for `[]LogEntry`
+Body is NDJSON: one `LogLine` per line.
 
-**LogEntry**
+**LogLine**
+
+| Field       | Type        | JSON Tag              | Description                                                    |
+|-------------|-------------|-----------------------|----------------------------------------------------------------|
+| `Severity`  | `string`    | `"severity"`          | Syslog severity: `emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug` |
+| `Unit`      | `string`    | `"unit,omitempty"`    | Systemd unit; absent when unknown                              |
+| `Hostname`  | `string`    | `"hostname,omitempty"`| Origin hostname; absent when unknown                           |
+| `Message`   | `string`    | `"message"`           | Log message (non-empty)                                        |
+| `Timestamp` | `time.Time` | `"timestamp"`         | Log time                                                       |
+
+**LogEntry** — internal pipeline and local-endpoint format; `LogBatch` is a type
+alias for `[]LogEntry`
 
 | Field      | Type        | JSON Tag      | Description        |
 |------------|-------------|---------------|--------------------|
@@ -365,9 +401,19 @@ transition: `ack` → `started` → `succeeded` | `failed` | `cancelled`.
 
 ### `POST /v1/nodes/{node_id}/audit`
 
-**AuditBatch** — type alias for `[]AuditEntry`
+Body is NDJSON: one `AuditEvent` per line.
 
-**AuditEntry**
+**AuditEvent**
+
+| Field       | Type        | JSON Tag      | Description                     |
+|-------------|-------------|---------------|---------------------------------|
+| `Source`    | `string`    | `"source"`    | Wire source: `auditd`, `k8s`, or `plexd`  |
+| `Action`    | `string`    | `"action"`    | Action performed (non-empty)    |
+| `Outcome`   | `string`    | `"outcome"`   | Outcome (non-empty)             |
+| `Timestamp` | `time.Time` | `"timestamp"` | Event time                      |
+
+**AuditEntry** — internal pipeline and local-endpoint format; `AuditBatch` is a
+type alias for `[]AuditEntry`
 
 | Field      | Type              | JSON Tag       | Description         |
 |------------|-------------------|----------------|---------------------|
@@ -380,6 +426,15 @@ transition: `ack` → `started` → `succeeded` | `failed` | `cancelled`.
 | `Result`   | `string`          | `"result"`     | Action result       |
 | `Hostname` | `string`          | `"hostname"`   | Origin hostname     |
 | `Raw`      | `string`          | `"raw"`        | Raw audit record    |
+
+### Ingest receipt
+
+**IngestReceipt** (`202 Accepted` for all three ingest endpoints)
+
+| Field        | Type        | JSON Tag        | Description                                |
+|--------------|-------------|-----------------|--------------------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | When the control plane accepted the batch  |
+| `Records`    | `int`       | `"records"`     | Number of records accepted from the batch  |
 
 ## Capabilities
 

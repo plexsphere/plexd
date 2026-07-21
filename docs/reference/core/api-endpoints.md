@@ -19,13 +19,14 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 7 | `PUT` | `/v1/nodes/{node_id}/endpoint` | NAT endpoint reporting |
 | 8 | `GET` | `/v1/nodes/{node_id}/state` | State snapshot pull (reconciliation) |
 | 9 | `GET` | `/v1/nodes/{node_id}/secrets/{key}` | Secret fetch (NSK-encrypted) |
-| 10 | `POST` | `/v1/nodes/{node_id}/report` | Report entry sync |
-| 11 | `POST` | `/v1/nodes/{node_id}/executions/{execution_id}` | Action execution callback |
-| 12 | `POST` | `/v1/nodes/{node_id}/sessions/{session_id}` | Session activity record |
-| 13 | `POST` | `/v1/nodes/{node_id}/metrics` | Metrics batch |
-| 14 | `POST` | `/v1/nodes/{node_id}/logs` | Log batch |
-| 15 | `POST` | `/v1/nodes/{node_id}/audit` | Audit batch |
-| 16 | `GET` | `/v1/artifacts/plexd/{version}/{os}/{arch}` | Binary download |
+| 10 | `PUT` | `/v1/nodes/{node_id}/state/reports/{key}` | Per-key state report upsert |
+| 11 | `DELETE` | `/v1/nodes/{node_id}/state/reports/{key}` | Per-key state report delete |
+| 12 | `POST` | `/v1/nodes/{node_id}/executions/{execution_id}` | Action execution callback |
+| 13 | `POST` | `/v1/nodes/{node_id}/sessions/{session_id}` | Session activity record |
+| 14 | `POST` | `/v1/nodes/{node_id}/metrics` | Metrics batch |
+| 15 | `POST` | `/v1/nodes/{node_id}/logs` | Log batch |
+| 16 | `POST` | `/v1/nodes/{node_id}/audit` | Audit batch |
+| 17 | `GET` | `/v1/artifacts/plexd/{version}/{os}/{arch}` | Binary download |
 
 ## Registration & Identity
 
@@ -356,32 +357,53 @@ Called on-demand when a consumer requests a secret via the Local Node API. Retur
 
 ## Reports
 
-### POST /v1/nodes/{node_id}/report
+The node publishes local report entries to the control plane one key at a time.
+The Local Node API's per-key syncer flushes dirty keys in ascending order,
+debounced (default 5s) to coalesce bursts. `{key}` follows the grammar
+`^[a-z][a-z0-9._-]{0,127}$`, and the serialized `value` is capped at 4096 bytes.
 
-Batched report sync with debounce (default 5s).
+### PUT /v1/nodes/{node_id}/state/reports/{key}
+
+Upserts the report stored under `{key}`.
 
 **Request body:**
 
 ```json
 {
-  "entries": [
-    {
-      "key": "app-health",
-      "content_type": "application/json",
-      "payload": { "status": "healthy", "checked_at": "2025-01-15T10:30:00Z" },
-      "version": 12,
-      "updated_at": "2025-01-15T10:30:00Z"
-    }
-  ],
-  "deleted": ["old-report-key"]
+  "value": "{\"status\":\"healthy\",\"checked_at\":\"2025-01-15T10:30:00Z\"}",
+  "workload_tag": "web"
 }
 ```
 
-| Response | Meaning |
-|---|---|
-| `200 OK` | Report entries accepted |
-| `401 Unauthorized` | Invalid node identity |
-| `409 Conflict` | Version conflict on one or more entries |
+- `value` — the opaque report payload; at most 4096 bytes.
+- `workload_tag` — optional; attributes the report to a workload.
+
+**Response** (`200 OK`):
+
+```json
+{
+  "accepted_at": "2025-01-15T10:30:00Z",
+  "key": "app-health"
+}
+```
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `200 OK` | — | Report upserted |
+| `400 Bad Request` | `invalid_report` | Key is outside the grammar, the body is malformed, or `value` exceeds 4096 bytes |
+| `401 Unauthorized` | — | Invalid node identity |
+| `501 Not Implemented` | `reports_not_provisioned` | State reports are not provisioned; the node suppresses report sync for 5 minutes |
+
+### DELETE /v1/nodes/{node_id}/state/reports/{key}
+
+Removes the report stored under `{key}`.
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `204 No Content` | — | Report deleted |
+| `400 Bad Request` | `invalid_report` | Key is outside the grammar |
+| `404 Not Found` | `report_not_found` | No report exists for this key (the syncer treats this as success) |
+| `501 Not Implemented` | `reports_not_provisioned` | State reports are not provisioned; the node suppresses report sync for 5 minutes |
 
 ## Action Execution Callbacks
 
@@ -545,51 +567,69 @@ close.
 
 ## Observability
 
-All three observability endpoints use **gzip-compressed** request body with `Content-Encoding: gzip`.
+All three ingest endpoints stamp an `X-Plexsphere-Sent-At` header (RFC 3339,
+nanosecond precision, UTC) and gzip the request body when it exceeds 1 KiB
+(`Content-Encoding: gzip`). Success is `202 Accepted` with an `IngestReceipt`
+(`{ "accepted_at", "records" }`).
 
 ### POST /v1/nodes/{node_id}/metrics
 
-`Content-Type: application/json`, `Content-Encoding: gzip`
+`Content-Type: application/json` — a JSON array of `MetricSample`.
 
 ```json
 [
   {
-    "timestamp": "2025-01-15T10:30:00Z",
     "group": "node_resources",
-    "data": { "cpu_percent": 23.5, "memory_used": 4294967296, "memory_total": 8589934592 }
+    "name": "cpu_usage_percent",
+    "value": 23.5,
+    "timestamp": "2025-01-15T10:30:00Z"
   },
   {
-    "timestamp": "2025-01-15T10:30:00Z",
     "group": "tunnel_health",
-    "peer_id": "n_peer456",
-    "data": { "handshake_age_seconds": 15, "tx_bytes": 1048576, "rx_bytes": 524288, "packet_loss_percent": 0.1 }
+    "name": "rx_bytes",
+    "value": 524288,
+    "labels": { "peer_id": "n_peer456" },
+    "timestamp": "2025-01-15T10:30:00Z"
   }
 ]
 ```
 
 ### POST /v1/nodes/{node_id}/logs
 
-`Content-Type: application/x-ndjson`, `Content-Encoding: gzip`
+`Content-Type: application/x-ndjson` — one `LogLine` per line.
 
 ```
-{"timestamp":"2025-01-15T10:30:00.123Z","source":"journald","unit":"plexd","message":"reconciliation completed, 0 drifts corrected","severity":"info","hostname":"web-01"}
-{"timestamp":"2025-01-15T10:30:01.456Z","source":"journald","unit":"sshd","message":"Accepted publickey for admin","severity":"info","hostname":"web-01"}
+{"severity":"info","unit":"plexd","hostname":"web-01","message":"reconciliation completed, 0 drifts corrected","timestamp":"2025-01-15T10:30:00.123Z"}
+{"severity":"info","unit":"sshd","hostname":"web-01","message":"Accepted publickey for admin","timestamp":"2025-01-15T10:30:01.456Z"}
 ```
 
 ### POST /v1/nodes/{node_id}/audit
 
-`Content-Type: application/x-ndjson`, `Content-Encoding: gzip`
+`Content-Type: application/x-ndjson` — one `AuditEvent` per line.
 
 ```
-{"timestamp":"2025-01-15T10:30:00.456Z","source":"auditd","event_type":"SYSCALL","subject":{"uid":1000,"pid":4523,"comm":"sshd"},"object":{"path":"/etc/shadow"},"action":"open","result":"denied","hostname":"web-01","raw":"..."}
+{"source":"auditd","action":"open","outcome":"failure","timestamp":"2025-01-15T10:30:00.456Z"}
+{"source":"k8s","action":"create","outcome":"success","timestamp":"2025-01-15T10:30:01.789Z"}
 ```
 
-| Response | Meaning |
-|---|---|
-| `202 Accepted` | Batch received and queued for processing |
-| `401 Unauthorized` | Invalid node identity |
-| `413 Payload Too Large` | Batch exceeds server-side size limit |
-| `429 Too Many Requests` | Rate limit exceeded, retry with backoff |
+**Response** (`202 Accepted`):
+
+```json
+{ "accepted_at": "2025-01-15T10:30:00.123456789Z", "records": 2 }
+```
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `202 Accepted` | — | Batch accepted; body is an `IngestReceipt` |
+| `400 Bad Request` | `ingest_batch_malformed` | Body is not a well-formed batch, or a record fails the group/severity/source enum, required-field, or zero-timestamp checks |
+| `400 Bad Request` | `ingest_sent_at_invalid` | `X-Plexsphere-Sent-At` missing or not an RFC 3339 timestamp |
+| `401 Unauthorized` | — | Invalid node identity |
+| `413 Payload Too Large` | — | Batch exceeds server-side size limit |
+| `415 Unsupported Media Type` | `ingest_encoding_unsupported` | `Content-Encoding` other than `gzip` or `identity` |
+| `429 Too Many Requests` | — | Rate limit exceeded, retry with backoff |
+| `501 Not Implemented` | `observability_ingest_not_provisioned` | Observability ingest is not provisioned; the node drops the batch |
 
 ## Artifacts
 

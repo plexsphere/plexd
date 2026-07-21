@@ -56,7 +56,8 @@ type SecretFetcher interface {
 
 ```go
 type ReportSyncClient interface {
-    SyncReports(ctx context.Context, nodeID string, req api.ReportSyncRequest) error
+    PutStateReport(ctx context.Context, nodeID, key string, req api.NodeStateReportRequest) (*api.NodeStateReportResponse, error)
+    DeleteStateReport(ctx context.Context, nodeID, key string) error
 }
 ```
 
@@ -80,6 +81,8 @@ func NewServer(cfg Config, client NodeAPIClient, nsk []byte, logger *slog.Logger
 | `Start`                 | `(ctx context.Context, nodeID string) error`                     | Blocking; runs listeners and syncer until context cancelled         |
 | `RegisterEventHandlers` | `(dispatcher *api.EventDispatcher)`                              | Registers SSE handlers for cache updates (call before SSE start)    |
 | `ReconcileHandler`      | `() reconcile.ReconcileHandler`                                  | Returns a handler that feeds the cache from the snapshot `state` block |
+| `PublishReport`         | `(key, contentType string, payload json.RawMessage) error`       | Writes a report through the cache and notifies the syncer; holds `key`/`payload` to the same grammar and 4096-byte cap as the local HTTP API |
+| `ReportPayload`         | `(key string) (json.RawMessage, bool)`                           | Returns the payload currently stored under `key`; internal producers compare against it so a report another local caller overwrote or deleted is re-asserted |
 
 ### Lifecycle
 
@@ -221,28 +224,36 @@ var ErrNotFound        = errors.New("nodeapi: not found")
 
 ## ReportSyncer
 
-Buffers report mutations and syncs them to the control plane via `SyncReports`, debouncing rapid updates to reduce API calls.
+Reconciles per-key report changes to the control plane via `PutStateReport` /
+`DeleteStateReport`, debouncing rapid updates to reduce API calls. Changes are
+held in a dirty map keyed by report key (a `nil` value marks a pending delete);
+the last local write to a key wins.
 
 ### Constructor
 
 ```go
-func NewReportSyncer(client ReportSyncClient, nodeID string, debouncePeriod time.Duration, logger *slog.Logger) *ReportSyncer
+func NewReportSyncer(client ReportSyncClient, debouncePeriod time.Duration, logger *slog.Logger) *ReportSyncer
 ```
+
+The node ID is supplied later to `Run` because the syncer is constructed in
+`NewServer`, before the node has registered and its ID is known.
 
 ### Methods
 
 | Method         | Signature                                                 | Description                                    |
 |----------------|-----------------------------------------------------------|------------------------------------------------|
-| `NotifyChange` | `(entries []api.ReportEntry, deleted []string)`           | Buffers changes and signals the run loop       |
-| `Run`          | `(ctx context.Context) error`                             | Blocking loop; returns `ctx.Err()` on cancel   |
+| `NotifyChange` | `(entries []ReportEntry, deleted []string)`               | Merges changes into the dirty map and signals the run loop |
+| `Run`          | `(ctx context.Context, nodeID string) error`              | Blocking loop; returns `ctx.Err()` on cancel   |
 
-### Debounce and Retry Behavior
+### Debounce and Per-Key Sync Behavior
 
-1. **Notification** — `NotifyChange` appends entries/deletions to internal buffers and sends a non-blocking signal
-2. **Debounce** — after receiving a signal, waits `DebouncePeriod` (default 5s) to coalesce further changes
-3. **Flush** — drains buffers and calls `SyncReports` with all accumulated entries and deleted keys
-4. **Retry on failure** — if `SyncReports` fails, entries are re-buffered and a new signal is sent, triggering another debounce-then-flush cycle
-5. **Success** — logged at info level with entry and deletion counts
+1. **Notification** — `NotifyChange` merges entries (pending PUTs) and deleted keys (pending deletes) into the dirty map and sends a non-blocking signal.
+2. **Debounce** — after a signal, waits `DebouncePeriod` (default 5s) to coalesce a burst before flushing.
+3. **Flush** — snapshots the dirty map and reconciles each key **in ascending key order**, one at a time: a `nil` entry is a `DELETE`, otherwise a `PUT`. A key is cleared only if it still holds the snapshotted version, so a write that raced the flush stays dirty for the next round.
+4. **Retryable failure** — a key left dirty by a transient error is re-flushed on a **30-second** timer, without waiting for a new local mutation.
+5. **`DELETE` 404** — `report_not_found` is treated as success (the report is already absent upstream).
+6. **`PUT` 400** — `invalid_report` is a permanent refusal; the key is dropped with a Warn (unreachable once the local API enforces the same grammar and cap, kept as defense in depth).
+7. **Not provisioned (501)** — a `reports_not_provisioned` refusal aborts the flush and **suppresses every HTTP attempt for 5 minutes**, logging the transition once; the keys stay dirty until the window elapses.
 
 ### Report Notify Middleware
 
@@ -379,6 +390,17 @@ Returns a list of report entry summaries (key, version).
 [{"key": "health", "version": 3}]
 ```
 
+> plexd itself publishes a set of `status.*` reports — `status.mesh`,
+> `status.bridge`, `status.user-access`, `status.ingress`, and
+> `status.site-to-site` — through `Server.PublishReport` at heartbeat cadence, so
+> these keys appear here alongside workload-written reports. This is by design:
+> the same per-key syncer ships them to the control plane. They live in the same
+> flat, workload-writable keyspace, so every tick compares the sampled status
+> against the value actually stored under the key (`Server.ReportPayload`) rather
+> than against a private memory of the last publish: a `status.*` report another
+> local caller overwrote or deleted is re-asserted on the next tick instead of
+> standing until the sampled value happens to change.
+
 ### GET /v1/state/report/{key}
 
 Returns a full report entry.
@@ -392,7 +414,24 @@ Returns a full report entry.
 
 ### PUT /v1/state/report/{key}
 
-Creates or updates a report entry with optional optimistic locking.
+Creates or updates a report entry with optional optimistic locking. `{key}` must
+match the report key grammar `^[a-z][a-z0-9._-]{0,127}$` (shared by the `GET`,
+`PUT`, and `DELETE` report routes), and the serialized `payload` is capped at
+4096 bytes — both limits mirror what the control plane accepts.
+
+::: warning Breaking change
+This grammar is stricter than the earlier one (which accepted any non-empty key
+other than `.`/`..` without a path separator). Keys valid under the old rule but
+not the new one — uppercase (`Health`), a leading digit (`9-checks`), or over 128
+bytes — are rejected by all three report routes. On startup any such report
+persisted under `data_dir/state/report/<key>.json` is dropped from the cache with
+a `Warn` log naming the file, so the listing stays in lockstep with what the
+routes serve. The file itself is left in place; delete it by hand once the report
+is no longer needed. A previous release may have synced the report to the control
+plane, where no local route can reach it any more, so the server also queues a
+`DELETE /v1/nodes/{id}/state/reports/{key}` for each dropped key — the delete is
+idempotent, so a key that was never synced simply answers `404`.
+:::
 
 **Request**:
 
@@ -407,7 +446,7 @@ Creates or updates a report entry with optional optimistic locking.
 | Status | Condition                               |
 |--------|-----------------------------------------|
 | `200`  | Created or updated                      |
-| `400`  | Invalid JSON, missing `content_type`, invalid `payload`, or non-integer `If-Match` |
+| `400`  | Invalid report key, invalid JSON, missing `content_type`, invalid `payload`, `payload` over 4096 bytes, or non-integer `If-Match` |
 | `409`  | Version conflict (optimistic lock)      |
 | `500`  | Internal error                          |
 
@@ -505,12 +544,13 @@ issues #24/#25 land.
 
 ### ControlPlane Client
 
-The server uses two control plane methods via the `NodeAPIClient` interface:
+The server uses these control plane methods via the `NodeAPIClient` interface:
 
-| Method         | Used By                                       | Purpose                               |
-|----------------|-----------------------------------------------|---------------------------------------|
-| `FetchSecret`  | `GET /v1/state/secrets/{key}` handler         | Fetches encrypted secret on demand    |
-| `SyncReports`  | `ReportSyncer` (background)                   | Syncs report mutations to control plane|
+| Method              | Used By                                       | Purpose                             |
+|---------------------|-----------------------------------------------|-------------------------------------|
+| `FetchSecret`       | `GET /v1/state/secrets/{key}` handler         | Fetches encrypted secret on demand  |
+| `PutStateReport`    | `ReportSyncer` (background)                    | Upserts a report entry per key      |
+| `DeleteStateReport` | `ReportSyncer` (background)                    | Deletes a report entry per key      |
 
 ## Kubernetes: PlexdNodeState CRD
 
@@ -769,9 +809,9 @@ The `.spec` (including `nodeId`, `meshIp`, `metadata`, `data`, `secretRefs`) is 
 ### Upstream Sync (Node to Control Plane)
 
 1. When a workload writes a report entry (via Unix socket API or CRD status patch), plexd buffers the change locally.
-2. After a debounce period (default 5s), plexd syncs the report to the control plane via `POST /v1/nodes/{node_id}/report`.
-3. If the control plane is unreachable, report entries are buffered in `data_dir/state/report/` and drained when connectivity is restored.
-4. The sync payload includes all changed report entries since the last successful sync.
+2. After a debounce period (default 5s), plexd syncs each dirty report key to the control plane one at a time — `PUT /v1/nodes/{node_id}/state/reports/{key}` for an upsert, `DELETE` for a removal — flushing keys in ascending order.
+3. If the control plane is unreachable, report entries are buffered in `data_dir/state/report/` and drained when connectivity is restored; a key left dirty by a transient error is retried on a 30-second timer.
+4. plexd itself publishes `status.*` reports (the mesh and bridge status blocks) through `Server.PublishReport` on the same per-key syncer.
 
 ### Offline Behavior
 

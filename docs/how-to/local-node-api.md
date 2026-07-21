@@ -215,6 +215,13 @@ Report entries are local key-value records that the node publishes back to
 the control plane (e.g. health checks, inventory). They support optimistic
 locking via the `If-Match` header.
 
+Two limits mirror what the control plane accepts: the key must match
+`^[a-z][a-z0-9._-]{0,127}$` (a lowercase-leading name of at most 128 characters
+over `[a-z0-9._-]`), and the serialized `payload` must be at most 4096 bytes.
+The `health` key used in the examples below conforms. Each key is synced upstream
+independently — plexd flushes changed keys one at a time (`PUT`/`DELETE` per
+key), so a rejected or oversized key never blocks the others.
+
 ### Create a report entry
 
 ```bash
@@ -364,6 +371,8 @@ Requests without a token or with an invalid token receive `401 Unauthorized`:
 | 400         | `invalid JSON body`          | Request body is not valid JSON                                | Check your JSON syntax                                              |
 | 400         | `content_type is required`   | PUT report missing `content_type` field                       | Include `"content_type"` in the request body                        |
 | 400         | `payload must be valid JSON` | PUT report `payload` is empty or not valid JSON               | Ensure `"payload"` is a non-empty, valid JSON value                 |
+| 400         | `invalid report key`         | Report key doesn't match `^[a-z][a-z0-9._-]{0,127}$`          | Use a lowercase-leading key of at most 128 chars over `[a-z0-9._-]` |
+| 400         | `payload exceeds the 4096-byte limit` | Serialized report payload is larger than 4096 bytes | Shrink the payload below 4 KiB                                     |
 | 400         | `If-Match must be an integer`| `If-Match` header is not a valid integer                      | Pass a numeric version (e.g. `If-Match: 3`)                         |
 | 401         | `unauthorized`               | Missing or invalid bearer token on the TCP listener           | Pass `-H "Authorization: Bearer <token>"` with the correct token    |
 | 403         | (connection refused)         | User not in the `plexd` (or `plexd-secrets`) group            | Add the user to the appropriate group and re-login                  |

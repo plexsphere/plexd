@@ -111,7 +111,11 @@ type LogSource interface {
 
 ## LogReporter
 
-Interface abstracting the control plane log reporting API. Satisfied by `api.ControlPlane`.
+Interface abstracting the log reporting API. It is satisfied by the package's
+`PlatformReporter` (the control-plane leg, which converts each batch to
+`[]api.LogLine` and posts it through the package's `IngestClient` seam — which
+`api.ControlPlane` satisfies), `LocalReporter` (the local leg), and
+`MultiReporter` (both).
 
 ```go
 type LogReporter interface {
@@ -463,9 +467,83 @@ err := fwd.Run(ctx)
 
 ### POST /v1/nodes/{node_id}/logs
 
-Reports a batch of log entries to the control plane.
+The control-plane leg of the pipeline (`PlatformReporter`) converts each buffered
+`LogEntry` into a wire `api.LogLine` and POSTs the batch as **NDJSON** — one JSON
+object per line (`Content-Type: application/x-ndjson`). The request stamps an
+`X-Plexsphere-Sent-At` header (RFC 3339, nanosecond precision, UTC) and is
+gzip-compressed when the body exceeds 1 KiB. Success is `202 Accepted` with an
+`IngestReceipt`.
 
-**Request body** (`api.LogBatch = []api.LogEntry`):
+**Request body** (NDJSON of `api.LogLine`):
+
+```
+{"severity":"info","unit":"plexd.service","hostname":"node-01.example.com","message":"tunnel established with peer-abc-123","timestamp":"2026-02-12T10:30:00Z"}
+{"severity":"warning","unit":"sshd.service","hostname":"node-01.example.com","message":"Failed password for root from 192.168.1.100","timestamp":"2026-02-12T10:30:01Z"}
+```
+
+**LogLine fields:**
+
+| Field       | Type        | JSON Tag             | Description                                   |
+|-------------|-------------|----------------------|-----------------------------------------------|
+| `Severity`  | `string`    | `"severity"`         | Syslog severity (see the accepted set below)  |
+| `Unit`      | `string`    | `"unit,omitempty"`   | Systemd unit; omitted when unknown            |
+| `Hostname`  | `string`    | `"hostname,omitempty"`| Origin hostname; omitted when unknown        |
+| `Message`   | `string`    | `"message"`          | Log message (non-empty)                       |
+| `Timestamp` | `time.Time` | `"timestamp"`        | Entry time (RFC 3339)                         |
+
+The internal `LogEntry.Source` field has no wire counterpart and is dropped.
+
+**Accepted severities** (closed set): `emerg`, `alert`, `crit`, `err`, `warning`,
+`notice`, `info`, `debug`.
+
+#### Conversion and skip rules
+
+`PlatformReporter` applies these rules before sending:
+
+- An entry with an **empty message** is skipped with a Debug log (the contract
+  requires a non-empty message and would reject the whole batch otherwise).
+- A `severity` **outside the accepted set** is coerced to `info` (defensive; no
+  current producer emits one).
+- When no lines survive, the client is not called (the ingest contract rejects an
+  empty array).
+
+#### Response — IngestReceipt (`202 Accepted`)
+
+```json
+{ "accepted_at": "2026-02-12T10:30:00.123456789Z", "records": 2 }
+```
+
+| Field        | Type        | JSON Tag        | Description                                  |
+|--------------|-------------|-----------------|----------------------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | When the control plane accepted the batch    |
+| `Records`    | `int`       | `"records"`     | Number of records accepted from the batch    |
+
+#### Ingest errors
+
+| Status | Problem `code` | Meaning | `PlatformReporter` reaction |
+|--------|----------------|---------|-----------------------------|
+| `400 Bad Request` | `ingest_batch_malformed` | Body has no non-blank lines, an undecodable line, or a record with an out-of-set `severity`, empty `message`, or zero `timestamp` | Drops the batch — a verdict on the bytes, which no retry changes |
+| `400 Bad Request` | `ingest_sent_at_invalid` | `X-Plexsphere-Sent-At` is missing or not an RFC 3339 timestamp | Returned for retry — the header is re-stamped on every attempt, so it clears once the node's clock converges |
+| `413 Payload Too Large` | — | Batch exceeds the server-side size limit | Halves the batch and re-sends each half; a single line still refused is dropped |
+| `415 Unsupported Media Type` | `ingest_encoding_unsupported` | `Content-Encoding` is neither `gzip` nor `identity` | Returned for retry — a property of the deployment, not of the batch |
+| `501 Not Implemented` | `observability_ingest_not_provisioned` | Observability ingest is not provisioned | Drops the batch quietly (a one-time Info log on the transition, another on recovery) rather than re-buffering it |
+
+Any other error is returned to `Forwarder.flush`, which retains and retries the
+batch.
+
+Every line the reporter discards — a skipped entry, a dropped batch, a line over
+the size limit — is added to a running count that is summarized in a `dropping
+log lines` Warn at most once every five minutes. `Forwarder.flush` takes its
+success path for a dropped batch, so this log is the only signal that log lines
+are being lost.
+
+### Internal / local-endpoint format: LogEntry
+
+The in-memory buffer and the optional [local endpoint](#local-endpoint)
+(`LocalReporter`) keep the `LogEntry` shape; only the control-plane leg converts
+to `LogLine`.
+
+**Example body** (`api.LogBatch = []api.LogEntry`):
 
 ```json
 [
@@ -488,7 +566,7 @@ Reports a batch of log entries to the control plane.
 ]
 ```
 
-### LogEntry Schema
+#### LogEntry Schema
 
 ```go
 type LogEntry struct {
@@ -540,25 +618,28 @@ All log entries use `component=logfwd`.
 
 ### With api.ControlPlane
 
-`api.ControlPlane` satisfies the `LogReporter` interface directly:
+`api.ControlPlane` is the control-plane ingest client; the `Forwarder` reaches it
+through a `PlatformReporter`, which converts each batch to `[]api.LogLine` and
+posts it via the client:
 
 ```go
 controlPlane, _ := api.NewControlPlane(apiCfg, "1.0.0", logger)
 
-// controlPlane.ReportLogs matches LogReporter.ReportLogs
-fwd := logfwd.NewForwarder(cfg, sources, controlPlane, nodeID, hostname, logger)
+// PlatformReporter is the control-plane leg; controlPlane satisfies its IngestClient seam.
+reporter := logfwd.NewPlatformReporter(controlPlane, logger)
+fwd := logfwd.NewForwarder(cfg, sources, reporter, nodeID, hostname, logger)
 fwd.Run(ctx)
 ```
 
 ### With LocalReporter and MultiReporter
 
-When `LocalEndpoint.URL` is configured, the `Forwarder` receives a `MultiReporter` instead of the control plane client directly:
+When `LocalEndpoint.URL` is configured, the `Forwarder` receives a `MultiReporter` that wraps both the `PlatformReporter` and a `LocalReporter`:
 
 ```go
-var logReporter logfwd.LogReporter = controlPlane
+var logReporter logfwd.LogReporter = logfwd.NewPlatformReporter(controlPlane, logger)
 if cfg.LogFwd.LocalEndpoint.URL != "" {
     localReporter := logfwd.NewLocalReporter(cfg.LogFwd.LocalEndpoint, controlPlane, nsk, identity.NodeID, logger)
-    logReporter = logfwd.NewMultiReporter(controlPlane, localReporter, logger)
+    logReporter = logfwd.NewMultiReporter(logReporter, localReporter, logger)
     logger.Info("local endpoint enabled", "pipeline", "logfwd", "url", cfg.LogFwd.LocalEndpoint.URL)
 }
 fwd := logfwd.NewForwarder(cfg.LogFwd, sources, logReporter, identity.NodeID, hostname, logger)
