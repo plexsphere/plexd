@@ -45,7 +45,11 @@ func (testSecretFetcher) FetchSecret(_ context.Context, _, _ string) (*api.Secre
 // testReportSyncClient is a no-op ReportSyncClient for testing.
 type testReportSyncClient struct{}
 
-func (testReportSyncClient) SyncReports(_ context.Context, _ string, _ api.ReportSyncRequest) error {
+func (testReportSyncClient) PutStateReport(_ context.Context, _, key string, _ api.NodeStateReportRequest) (*api.NodeStateReportResponse, error) {
+	return &api.NodeStateReportResponse{Key: key}, nil
+}
+
+func (testReportSyncClient) DeleteStateReport(_ context.Context, _, _ string) error {
 	return nil
 }
 
