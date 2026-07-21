@@ -17,6 +17,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -48,14 +49,13 @@ type AssertionCounters struct {
 	EndpointCount           int64 `json:"endpoint_count"`
 	SecretsCount            int64 `json:"secrets_count"`
 	ReportCount             int64 `json:"report_count"`
-	ExecutionAckCount       int64 `json:"execution_ack_count"`
-	ExecutionResultCount    int64 `json:"execution_result_count"`
+	ExecutionCallbackCount  int64 `json:"execution_callback_count"`
+	ExecutionUploadCount    int64 `json:"execution_upload_count"`
 	MetricsCount            int64 `json:"metrics_count"`
 	LogsCount               int64 `json:"logs_count"`
 	AuditCount              int64 `json:"audit_count"`
 	ArtifactCount           int64 `json:"artifact_count"`
-	TunnelReadyCount        int64 `json:"tunnel_ready_count"`
-	TunnelClosedCount       int64 `json:"tunnel_closed_count"`
+	SessionActivityCount    int64 `json:"session_activity_count"`
 	IntegrityViolationCount int64 `json:"integrity_violation_count"`
 	InjectEventCount        int64 `json:"inject_event_count"`
 	LocalMetricsCount       int64 `json:"local_metrics_count"`
@@ -82,14 +82,13 @@ type Server struct {
 	endpointCount           atomic.Int64
 	secretsCount            atomic.Int64
 	reportCount             atomic.Int64
-	executionAckCount       atomic.Int64
-	executionResultCount    atomic.Int64
+	executionCallbackCount  atomic.Int64
+	executionUploadCount    atomic.Int64
 	metricsCount            atomic.Int64
 	logsCount               atomic.Int64
 	auditCount              atomic.Int64
 	artifactCount           atomic.Int64
-	tunnelReadyCount        atomic.Int64
-	tunnelClosedCount       atomic.Int64
+	sessionActivityCount    atomic.Int64
 	integrityViolationCount atomic.Int64
 	injectEventCount        atomic.Int64
 	localMetricsCount       atomic.Int64
@@ -132,6 +131,17 @@ type Server struct {
 	consumedNonces   map[string]struct{} // key: projectID+"|"+nonce, recorded only on 201
 	consumedNoncesMu sync.Mutex
 
+	// Execution callback state machine (issue #22), all guarded by execMu. The
+	// node advances an execution through ack/started/terminal callbacks;
+	// execStates maps an execution id to its current status (absent means
+	// dispatched). A started callback that declares an over-ceiling output mints
+	// a one-time presigned upload recorded in execUploads (token-keyed), and
+	// execTokenCounter mints distinct upload tokens.
+	execMu           sync.Mutex
+	execStates       map[string]string
+	execUploads      map[string]*execUpload
+	execTokenCounter int
+
 	mux *http.ServeMux
 }
 
@@ -156,6 +166,8 @@ func New() *Server {
 		nsk:                 mockNSK,
 		expectedBearerToken: "e2e-local-bearer-token",
 		consumedNonces:      make(map[string]struct{}),
+		execStates:          make(map[string]string),
+		execUploads:         make(map[string]*execUpload),
 		endpointTTL:         5 * time.Minute,
 		heartbeatFixture: api.HeartbeatResponse{
 			Reconcile:  true,
@@ -185,14 +197,13 @@ func (s *Server) Assertions() AssertionCounters {
 		EndpointCount:           s.endpointCount.Load(),
 		SecretsCount:            s.secretsCount.Load(),
 		ReportCount:             s.reportCount.Load(),
-		ExecutionAckCount:       s.executionAckCount.Load(),
-		ExecutionResultCount:    s.executionResultCount.Load(),
+		ExecutionCallbackCount:  s.executionCallbackCount.Load(),
+		ExecutionUploadCount:    s.executionUploadCount.Load(),
 		MetricsCount:            s.metricsCount.Load(),
 		LogsCount:               s.logsCount.Load(),
 		AuditCount:              s.auditCount.Load(),
 		ArtifactCount:           s.artifactCount.Load(),
-		TunnelReadyCount:        s.tunnelReadyCount.Load(),
-		TunnelClosedCount:       s.tunnelClosedCount.Load(),
+		SessionActivityCount:    s.sessionActivityCount.Load(),
 		IntegrityViolationCount: s.integrityViolationCount.Load(),
 		InjectEventCount:        s.injectEventCount.Load(),
 		LocalMetricsCount:       s.localMetricsCount.Load(),
@@ -370,14 +381,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/endpoint", s.handleEndpoint)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/secrets/{key}", s.handleSecrets)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/report", s.handleReport)
-	s.mux.HandleFunc("POST /v1/nodes/{id}/executions/{eid}/ack", s.handleExecutionAck)
-	s.mux.HandleFunc("POST /v1/nodes/{id}/executions/{eid}/result", s.handleExecutionResult)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/executions/{eid}", s.handleExecutionCallback)
+	s.mux.HandleFunc("PUT /exec-output/{eid}", s.handleExecOutputUpload)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/logs", s.handleLogs)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/audit", s.handleAudit)
 	s.mux.HandleFunc("GET /v1/artifacts/plexd/{version}/{os}/{arch}", s.handleArtifact)
-	s.mux.HandleFunc("POST /v1/nodes/{id}/tunnels/{sid}/ready", s.handleTunnelReady)
-	s.mux.HandleFunc("POST /v1/nodes/{id}/tunnels/{sid}/closed", s.handleTunnelClosed)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/sessions/{sid}", s.handleSessionActivity)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/integrity/violations", s.handleIntegrityViolation)
 
 	// Test control endpoints.
@@ -398,14 +408,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/endpoint", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/secrets/{key}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/report", methodNotAllowed)
-	s.mux.HandleFunc("/v1/nodes/{id}/executions/{eid}/ack", methodNotAllowed)
-	s.mux.HandleFunc("/v1/nodes/{id}/executions/{eid}/result", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/executions/{eid}", methodNotAllowed)
+	s.mux.HandleFunc("/exec-output/{eid}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/metrics", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/logs", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/audit", methodNotAllowed)
 	s.mux.HandleFunc("/v1/artifacts/plexd/{version}/{os}/{arch}", methodNotAllowed)
-	s.mux.HandleFunc("/v1/nodes/{id}/tunnels/{sid}/ready", methodNotAllowed)
-	s.mux.HandleFunc("/v1/nodes/{id}/tunnels/{sid}/closed", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/sessions/{sid}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/integrity/violations", methodNotAllowed)
 	s.mux.HandleFunc("/test/state", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-state", methodNotAllowed)
@@ -944,24 +953,211 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleExecutionAck handles POST /v1/nodes/{id}/executions/{eid}/ack.
-func (s *Server) handleExecutionAck(w http.ResponseWriter, r *http.Request) {
-	var req api.ExecutionAck
-	if !s.decodeBody(w, r, "execution_ack", &req) {
-		return
-	}
-	s.executionAckCount.Add(1)
-	w.WriteHeader(http.StatusNoContent)
+// execUpload records a one-time presigned output upload minted by a declaring
+// execution callback. key is the object key ("exec-output/{eid}"), declared is
+// the byte ceiling the PUT accepts, received flips once the bytes land, and
+// data holds the uploaded bytes for the terminal callback's sha256 check.
+type execUpload struct {
+	key      string
+	declared int64
+	received bool
+	data     []byte
 }
 
-// handleExecutionResult handles POST /v1/nodes/{id}/executions/{eid}/result.
-func (s *Server) handleExecutionResult(w http.ResponseWriter, r *http.Request) {
-	var req api.ExecutionResult
-	if !s.decodeBody(w, r, "execution_result", &req) {
+// nodeReportableStatus reports whether status is one of the five statuses a node
+// may report on an execution callback.
+func nodeReportableStatus(status string) bool {
+	switch status {
+	case api.ExecutionStatusAck, api.ExecutionStatusStarted,
+		api.ExecutionStatusSucceeded, api.ExecutionStatusFailed, api.ExecutionStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// terminalExecStatus reports whether status is a terminal execution status.
+func terminalExecStatus(status string) bool {
+	switch status {
+	case api.ExecutionStatusSucceeded, api.ExecutionStatusFailed, api.ExecutionStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// legalExecTransition reports whether advancing an execution from its current
+// state (cur, with exists=false when the id has never been seen) to next is a
+// legal non-terminal transition. Terminal current states are rejected by the
+// caller before this is reached. A started→started self-repeat is legal only
+// when the callback declares an output size, which the node knows only once the
+// run has finished.
+func legalExecTransition(cur string, exists bool, next string, declaredBytes int64) bool {
+	if !exists {
+		return next == api.ExecutionStatusAck
+	}
+	switch cur {
+	case api.ExecutionStatusAck:
+		switch next {
+		case api.ExecutionStatusStarted, api.ExecutionStatusFailed, api.ExecutionStatusCancelled:
+			return true
+		}
+	case api.ExecutionStatusStarted:
+		switch next {
+		case api.ExecutionStatusSucceeded, api.ExecutionStatusFailed, api.ExecutionStatusCancelled:
+			return true
+		case api.ExecutionStatusStarted:
+			return declaredBytes > 0
+		}
+	}
+	return false
+}
+
+// handleExecutionCallback handles POST /v1/nodes/{id}/executions/{eid}, the v1
+// execution status callback. It enforces the node-id guard, a 64 KiB body cap,
+// strict decoding to the five node-reportable statuses, the 16 KiB inline
+// output ceiling, and the execution state machine with its 409 taxonomy
+// (execution_already_terminal for a callback past a terminal state,
+// invalid_state_transition for any other illegal jump). A started callback that
+// declares an over-ceiling output mints a one-time presigned upload URL; a
+// terminal callback carrying an object_key is verified against the uploaded
+// bytes. Every 200 carries the new status so the client can decode the body.
+func (s *Server) handleExecutionCallback(w http.ResponseWriter, r *http.Request) {
+	if r.PathValue("id") != mockNodeID {
+		writeProblem(w, r, http.StatusForbidden, "nsk_node_mismatch", "node id does not match this node's identity")
 		return
 	}
-	s.executionResultCount.Add(1)
-	w.WriteHeader(http.StatusNoContent)
+	eid := r.PathValue("eid")
+
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	data, err := s.captureBody("execution_callback", r)
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_execution_callback", "invalid request body")
+		return
+	}
+
+	var req api.ExecutionCallbackRequest
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_execution_callback", "execution callback body is malformed")
+		return
+	}
+	if !nodeReportableStatus(req.Status) {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_execution_callback", "status is outside the node-reportable set")
+		return
+	}
+
+	// Inline output must base64-decode and stay within the 16 KiB ceiling. This
+	// precedes the state machine: an over-ceiling inline is a 413 regardless of
+	// whether the transition would otherwise be legal.
+	if req.Output != nil && req.Output.Inline != "" {
+		decoded, decErr := base64.StdEncoding.DecodeString(req.Output.Inline)
+		if decErr != nil {
+			writeProblem(w, r, http.StatusBadRequest, "malformed_execution_callback", "inline output is not valid base64")
+			return
+		}
+		if len(decoded) > 16384 {
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, "inline_output_too_large", "inline output exceeds the 16 KiB ceiling")
+			return
+		}
+	}
+
+	s.execMu.Lock()
+	defer s.execMu.Unlock()
+
+	cur, exists := s.execStates[eid]
+	if exists && terminalExecStatus(cur) {
+		writeProblem(w, r, http.StatusConflict, "execution_already_terminal", "execution has already reached a terminal state")
+		return
+	}
+	if !legalExecTransition(cur, exists, req.Status, req.DeclaredOutputBytes) {
+		writeProblem(w, r, http.StatusConflict, "invalid_state_transition", "illegal execution state transition")
+		return
+	}
+
+	resp := api.ExecutionCallbackResponse{Status: req.Status}
+	switch {
+	case req.Status == api.ExecutionStatusStarted && req.DeclaredOutputBytes > 0:
+		// Declaring callback: mint a one-time presigned upload. The URL path is
+		// the object key, which the node echoes back on the terminal callback.
+		s.execTokenCounter++
+		token := fmt.Sprintf("exec-upload-%04d", s.execTokenCounter)
+		s.execUploads[token] = &execUpload{key: "exec-output/" + eid, declared: req.DeclaredOutputBytes}
+		resp.OutputUploadURL = "http://" + r.Host + "/exec-output/" + eid + "?token=" + token
+	case req.Output != nil && req.Output.ObjectKey != "":
+		// Terminal callback referencing an uploaded output: the upload must exist,
+		// have been received, and hash to the declared sha256.
+		up := s.findExecUpload(req.Output.ObjectKey)
+		if up == nil || !up.received {
+			writeProblem(w, r, http.StatusBadRequest, "malformed_execution_callback", "output object_key does not match a received upload")
+			return
+		}
+		sum := sha256.Sum256(up.data)
+		if hex.EncodeToString(sum[:]) != req.Output.SHA256 {
+			writeProblem(w, r, http.StatusBadRequest, "malformed_execution_callback", "output sha256 does not match the uploaded bytes")
+			return
+		}
+	}
+
+	s.execStates[eid] = req.Status
+	s.executionCallbackCount.Add(1)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// findExecUpload returns the pending upload whose object key matches key, or nil.
+// Callers must hold execMu.
+func (s *Server) findExecUpload(key string) *execUpload {
+	for _, up := range s.execUploads {
+		if up.key == key {
+			return up
+		}
+	}
+	return nil
+}
+
+// handleExecOutputUpload handles PUT /exec-output/{eid}, the one-time presigned
+// output upload minted by a declaring execution callback. The token identifies
+// the upload; its recorded key must match the path, it must be unused, and the
+// body must fit within the declared size.
+func (s *Server) handleExecOutputUpload(w http.ResponseWriter, r *http.Request) {
+	eid := r.PathValue("eid")
+	token := r.URL.Query().Get("token")
+
+	s.execMu.Lock()
+	up, ok := s.execUploads[token]
+	if !ok || up.key != "exec-output/"+eid {
+		s.execMu.Unlock()
+		writeProblem(w, r, http.StatusNotFound, "", "no presigned upload for this token")
+		return
+	}
+	if up.received {
+		s.execMu.Unlock()
+		writeProblem(w, r, http.StatusConflict, "", "presigned upload URL has already been used")
+		return
+	}
+	declared := up.declared
+	s.execMu.Unlock()
+
+	r.Body = http.MaxBytesReader(w, r.Body, declared)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, "", "upload body exceeds the declared size")
+			return
+		}
+		writeProblem(w, r, http.StatusBadRequest, "", "invalid upload body")
+		return
+	}
+
+	s.execMu.Lock()
+	up.data = data
+	up.received = true
+	s.execMu.Unlock()
+
+	s.executionUploadCount.Add(1)
+	w.WriteHeader(http.StatusOK)
 }
 
 // handleMetrics handles POST /v1/nodes/{id}/metrics.
@@ -1004,23 +1200,80 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleTunnelReady handles POST /v1/nodes/{id}/tunnels/{sid}/ready.
-func (s *Server) handleTunnelReady(w http.ResponseWriter, r *http.Request) {
-	var req api.TunnelReadyRequest
-	if !s.decodeBody(w, r, "tunnel_ready", &req) {
-		return
+// validTerminatedBy reports whether v is a recognized TCP termination reason.
+func validTerminatedBy(v string) bool {
+	switch v {
+	case api.TerminatedByTTLExpired, api.TerminatedByIdleTimeout,
+		api.TerminatedByPlexdClose, api.TerminatedByOperatorRevoke:
+		return true
+	default:
+		return false
 	}
-	s.tunnelReadyCount.Add(1)
-	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleTunnelClosed handles POST /v1/nodes/{id}/tunnels/{sid}/closed.
-func (s *Server) handleTunnelClosed(w http.ResponseWriter, r *http.Request) {
-	var req api.TunnelClosedRequest
-	if !s.decodeBody(w, r, "tunnel_closed", &req) {
+// validSessionActivity reports whether req carries exactly one of ssh/k8s/tcp
+// and that member satisfies its per-kind rules.
+func validSessionActivity(req api.SessionActivityRequest) bool {
+	set := 0
+	if req.SSH != nil {
+		set++
+	}
+	if req.K8s != nil {
+		set++
+	}
+	if req.TCP != nil {
+		set++
+	}
+	if set != 1 {
+		return false
+	}
+
+	switch {
+	case req.SSH != nil:
+		return req.SSH.Command != "" && len(req.SSH.Command) <= 1024
+	case req.K8s != nil:
+		return req.K8s.Verb != ""
+	default:
+		if req.TCP.Phase != api.TCPPhaseSessionStarted && req.TCP.Phase != api.TCPPhaseSessionEnded {
+			return false
+		}
+		if req.TCP.TerminatedBy != "" && !validTerminatedBy(req.TCP.TerminatedBy) {
+			return false
+		}
+		return true
+	}
+}
+
+// handleSessionActivity handles POST /v1/nodes/{id}/sessions/{sid}, the v1
+// session activity record. It enforces the node-id guard, a 16 KiB body cap,
+// strict decoding, and the one-of ssh/k8s/tcp contract with per-kind
+// validation. Success is 204 No Content.
+func (s *Server) handleSessionActivity(w http.ResponseWriter, r *http.Request) {
+	if r.PathValue("id") != mockNodeID {
+		writeProblem(w, r, http.StatusForbidden, "nsk_node_mismatch", "node id does not match this node's identity")
 		return
 	}
-	s.tunnelClosedCount.Add(1)
+
+	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
+	data, err := s.captureBody("session_activity", r)
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_session_activity", "invalid request body")
+		return
+	}
+
+	var req api.SessionActivityRequest
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_session_activity", "session activity body is malformed")
+		return
+	}
+	if !validSessionActivity(req) {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_session_activity", "session activity violates the one-of contract")
+		return
+	}
+
+	s.sessionActivityCount.Add(1)
 	w.WriteHeader(http.StatusNoContent)
 }
 

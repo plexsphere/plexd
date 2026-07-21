@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
 	"sync"
@@ -93,13 +94,9 @@ const (
 	keyRotateBody          = `{"new_public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="}`
 	capabilitiesBody       = `{"builtin_actions":[],"hooks":[]}`
 	reportBody             = `{"entries":[],"deleted":[]}`
-	executionAckBody       = `{"execution_id":"exec-001","status":"accepted","reason":""}`
-	executionResultBody    = `{"execution_id":"exec-001","status":"success","exit_code":0,"stdout":"ok","stderr":"","duration":"1s","finished_at":"2025-01-01T00:00:01Z"}`
 	metricsBatchBody       = `[{"timestamp":"2025-01-01T00:00:00Z","group":"system","data":{}}]`
 	logsBatchBody          = `[{"timestamp":"2025-01-01T00:00:00Z","source":"plexd","unit":"main","message":"started","severity":"info","hostname":"node-1"}]`
 	auditBatchBody         = `[{"timestamp":"2025-01-01T00:00:00Z","source":"auditd","event_type":"execve","subject":{},"object":{},"action":"execve","result":"success","hostname":"node-1","raw":""}]`
-	tunnelReadyBody        = `{"listen_addr":"127.0.0.1:2222","timestamp":"2025-01-01T00:00:00Z"}`
-	tunnelClosedBody       = `{"reason":"client_disconnect","duration":"5m","timestamp":"2025-01-01T00:00:05Z"}`
 	integrityViolationBody = `{"type":"binary","path":"/usr/local/bin/plexd","expected_checksum":"abc","actual_checksum":"def","detail":"mismatch","timestamp":"2025-01-01T00:00:00Z"}`
 )
 
@@ -170,8 +167,11 @@ var localCounterFields = map[string]bool{
 // beyond a simple per-call increment, so they are exempt from the uniform
 // non-zero pass in assertAllCountersEqual. KeyRotateCount advances only on a
 // completing rotation, which n identical unarmed submissions cannot reach.
+// ExecutionUploadCount advances only through the presign-then-PUT leg, which the
+// flat fan-out does not drive uniformly.
 var statefulCounterFields = map[string]bool{
-	"KeyRotateCount": true,
+	"KeyRotateCount":       true,
+	"ExecutionUploadCount": true,
 }
 
 // assertAllCountersEqual checks that every field in the AssertionCounters struct
@@ -956,10 +956,12 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/report", reportBody)
 	resp.Body.Close()
-	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/executions/exec-001/ack", executionAckBody)
-	resp.Body.Close()
-	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/executions/exec-001/result", executionResultBody)
-	resp.Body.Close()
+	// Drive one execution through the over-ceiling upload leg: the declaring
+	// callback (ack→started→declare) mints a presigned URL, and the PUT stores
+	// the bytes. This exercises both the callback and upload routes/counters.
+	uploadURL := declareExecUpload(t, ts.URL, "exec-mixed", 4)
+	putResp := doRequest(t, http.MethodPut, uploadURL, "abcd")
+	putResp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/metrics", metricsBatchBody)
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/logs", logsBatchBody)
@@ -971,9 +973,7 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 		t.Fatalf("GET artifact: %v", err)
 	}
 	resp.Body.Close()
-	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/tunnels/sess-001/ready", tunnelReadyBody)
-	resp.Body.Close()
-	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/tunnels/sess-001/closed", tunnelClosedBody)
+	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/"+testMockNodeID+"/sessions/sess-001", `{"tcp":{"phase":"session_started"}}`)
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/integrity/violations", integrityViolationBody)
 	resp.Body.Close()
@@ -1015,11 +1015,11 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	if a.ReportCount != 1 {
 		t.Errorf("report_count = %d, want 1", a.ReportCount)
 	}
-	if a.ExecutionAckCount != 1 {
-		t.Errorf("execution_ack_count = %d, want 1", a.ExecutionAckCount)
+	if a.ExecutionCallbackCount != 3 {
+		t.Errorf("execution_callback_count = %d, want 3", a.ExecutionCallbackCount)
 	}
-	if a.ExecutionResultCount != 1 {
-		t.Errorf("execution_result_count = %d, want 1", a.ExecutionResultCount)
+	if a.ExecutionUploadCount != 1 {
+		t.Errorf("execution_upload_count = %d, want 1", a.ExecutionUploadCount)
 	}
 	if a.MetricsCount != 1 {
 		t.Errorf("metrics_count = %d, want 1", a.MetricsCount)
@@ -1033,11 +1033,8 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	if a.ArtifactCount != 1 {
 		t.Errorf("artifact_count = %d, want 1", a.ArtifactCount)
 	}
-	if a.TunnelReadyCount != 1 {
-		t.Errorf("tunnel_ready_count = %d, want 1", a.TunnelReadyCount)
-	}
-	if a.TunnelClosedCount != 1 {
-		t.Errorf("tunnel_closed_count = %d, want 1", a.TunnelClosedCount)
+	if a.SessionActivityCount != 1 {
+		t.Errorf("session_activity_count = %d, want 1", a.SessionActivityCount)
 	}
 	if a.IntegrityViolationCount != 1 {
 		t.Errorf("integrity_violation_count = %d, want 1", a.IntegrityViolationCount)
@@ -1078,14 +1075,11 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPut, "/v1/nodes/node-1/endpoint", validEndpointBody()},
 		{http.MethodGet, "/v1/nodes/node-1/secrets/key1", ""},
 		{http.MethodPost, "/v1/nodes/node-1/report", reportBody},
-		{http.MethodPost, "/v1/nodes/node-1/executions/exec-001/ack", executionAckBody},
-		{http.MethodPost, "/v1/nodes/node-1/executions/exec-001/result", executionResultBody},
 		{http.MethodPost, "/v1/nodes/node-1/metrics", metricsBatchBody},
 		{http.MethodPost, "/v1/nodes/node-1/logs", logsBatchBody},
 		{http.MethodPost, "/v1/nodes/node-1/audit", auditBatchBody},
 		{http.MethodGet, "/v1/artifacts/plexd/1.0.0/linux/amd64", ""},
-		{http.MethodPost, "/v1/nodes/node-1/tunnels/sess-001/ready", tunnelReadyBody},
-		{http.MethodPost, "/v1/nodes/node-1/tunnels/sess-001/closed", tunnelClosedBody},
+		{http.MethodPost, "/v1/nodes/" + testMockNodeID + "/sessions/sess-conc", `{"tcp":{"phase":"session_started"}}`},
 		{http.MethodPost, "/v1/nodes/node-1/integrity/violations", integrityViolationBody},
 		{http.MethodPost, "/test/inject-event", `{"event_type":"conc","event_id":"e1","nonce":"n","payload":{},"signature":"s"}`},
 	}
@@ -1117,15 +1111,40 @@ func TestConcurrentCounters(t *testing.T) {
 		}
 	}
 
+	// Execution callbacks need a distinct execution id per request; concurrent
+	// callbacks for one id would fight the state machine. Fire n absent→ack
+	// callbacks across n distinct ids so the callback counter reaches n.
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			eid := fmt.Sprintf("exec-conc-%d", i)
+			req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/nodes/"+testMockNodeID+"/executions/"+eid, strings.NewReader(`{"status":"ack"}`))
+			if err != nil {
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return
+			}
+			resp.Body.Close()
+		}(i)
+	}
+
 	wg.Wait()
 
 	a := getAssertions(t, ts.URL)
 	assertAllCountersEqual(t, a, n)
 
-	// KeyRotateCount is stateful (see statefulCounterFields) and is exempt from
-	// the uniform pass above. No keys/rotate calls run here, so it stays zero.
+	// KeyRotateCount and ExecutionUploadCount are stateful (see
+	// statefulCounterFields) and exempt from the uniform pass above. No
+	// keys/rotate calls and no presigned uploads run here, so both stay zero.
 	if a.KeyRotateCount != 0 {
 		t.Errorf("key_rotate_count = %d, want 0", a.KeyRotateCount)
+	}
+	if a.ExecutionUploadCount != 0 {
+		t.Errorf("execution_upload_count = %d, want 0", a.ExecutionUploadCount)
 	}
 }
 
@@ -1773,90 +1792,6 @@ func TestReport_WrongMethod_Returns405(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Execution ack endpoint
-// ---------------------------------------------------------------------------
-
-func TestExecutionAck_Returns204AndCounter(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/executions/exec-001/ack", executionAckBody)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
-	}
-
-	a := getAssertions(t, ts.URL)
-	if a.ExecutionAckCount != 1 {
-		t.Errorf("execution_ack_count = %d, want 1", a.ExecutionAckCount)
-	}
-}
-
-func TestExecutionAck_InvalidBody_Returns400(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/executions/exec-001/ack", "not-json")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
-	}
-}
-
-func TestExecutionAck_WrongMethod_Returns405(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/executions/exec-001/ack")
-	if err != nil {
-		t.Fatalf("GET execution ack: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Execution result endpoint
-// ---------------------------------------------------------------------------
-
-func TestExecutionResult_Returns204AndCounter(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/executions/exec-001/result", executionResultBody)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
-	}
-
-	a := getAssertions(t, ts.URL)
-	if a.ExecutionResultCount != 1 {
-		t.Errorf("execution_result_count = %d, want 1", a.ExecutionResultCount)
-	}
-}
-
-func TestExecutionResult_InvalidBody_Returns400(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/executions/exec-001/result", "not-json")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
-	}
-}
-
-func TestExecutionResult_WrongMethod_Returns405(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/executions/exec-001/result")
-	if err != nil {
-		t.Fatalf("GET execution result: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Metrics endpoint
 // ---------------------------------------------------------------------------
 
@@ -2025,90 +1960,6 @@ func TestArtifact_WrongMethod_Returns405(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Tunnel ready endpoint
-// ---------------------------------------------------------------------------
-
-func TestTunnelReady_Returns204AndCounter(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/tunnels/sess-001/ready", tunnelReadyBody)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
-	}
-
-	a := getAssertions(t, ts.URL)
-	if a.TunnelReadyCount != 1 {
-		t.Errorf("tunnel_ready_count = %d, want 1", a.TunnelReadyCount)
-	}
-}
-
-func TestTunnelReady_InvalidBody_Returns400(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/tunnels/sess-001/ready", "not-json")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
-	}
-}
-
-func TestTunnelReady_WrongMethod_Returns405(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/tunnels/sess-001/ready")
-	if err != nil {
-		t.Fatalf("GET tunnel ready: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Tunnel closed endpoint
-// ---------------------------------------------------------------------------
-
-func TestTunnelClosed_Returns204AndCounter(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/tunnels/sess-001/closed", tunnelClosedBody)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
-	}
-
-	a := getAssertions(t, ts.URL)
-	if a.TunnelClosedCount != 1 {
-		t.Errorf("tunnel_closed_count = %d, want 1", a.TunnelClosedCount)
-	}
-}
-
-func TestTunnelClosed_InvalidBody_Returns400(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/tunnels/sess-001/closed", "not-json")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
-	}
-}
-
-func TestTunnelClosed_WrongMethod_Returns405(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/tunnels/sess-001/closed")
-	if err != nil {
-		t.Fatalf("GET tunnel closed: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Integrity violation endpoint
 // ---------------------------------------------------------------------------
 
@@ -2143,6 +1994,398 @@ func TestIntegrityViolation_WrongMethod_Returns405(t *testing.T) {
 	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/integrity/violations")
 	if err != nil {
 		t.Fatalf("GET integrity violations: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Execution callback endpoint (issue #22)
+// ---------------------------------------------------------------------------
+
+// execCallbackURL builds POST /v1/nodes/{mockNode}/executions/{eid}.
+func execCallbackURL(baseURL, eid string) string {
+	return baseURL + "/v1/nodes/" + testMockNodeID + "/executions/" + eid
+}
+
+// postExecCallback posts one execution callback body and returns the response.
+func postExecCallback(t *testing.T, baseURL, eid, body string) *http.Response {
+	t.Helper()
+	return doRequest(t, http.MethodPost, execCallbackURL(baseURL, eid), body)
+}
+
+// declareExecUpload drives eid through ack→started→declare and returns the
+// one-time presigned upload URL minted by the declaring callback.
+func declareExecUpload(t *testing.T, baseURL, eid string, declaredBytes int) string {
+	t.Helper()
+	for _, body := range []string{`{"status":"ack"}`, `{"status":"started"}`} {
+		resp := postExecCallback(t, baseURL, eid, body)
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			t.Fatalf("declareExecUpload %s: setup status = %d, want %d", eid, resp.StatusCode, http.StatusOK)
+		}
+		resp.Body.Close()
+	}
+	resp := postExecCallback(t, baseURL, eid, fmt.Sprintf(`{"status":"started","declared_output_bytes":%d}`, declaredBytes))
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("declareExecUpload %s: declare status = %d, want %d", eid, resp.StatusCode, http.StatusOK)
+	}
+	var cr api.ExecutionCallbackResponse
+	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+		resp.Body.Close()
+		t.Fatalf("declareExecUpload %s: decode: %v", eid, err)
+	}
+	resp.Body.Close()
+	if cr.OutputUploadURL == "" {
+		t.Fatalf("declareExecUpload %s: output_upload_url is empty", eid)
+	}
+	return cr.OutputUploadURL
+}
+
+func TestExecutionCallback_AckStartedSucceededInline(t *testing.T) {
+	_, ts := newTestServer(t)
+	const eid = "exec-flow-001"
+
+	steps := []struct {
+		body   string
+		status string
+	}{
+		{`{"status":"ack"}`, "ack"},
+		{`{"status":"started"}`, "started"},
+		{fmt.Sprintf(`{"status":"succeeded","exit_code":0,"output":{"inline":%q}}`, base64.StdEncoding.EncodeToString([]byte("done"))), "succeeded"},
+	}
+	for _, step := range steps {
+		resp := postExecCallback(t, ts.URL, eid, step.body)
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			t.Fatalf("status %q: got %d, want %d", step.status, resp.StatusCode, http.StatusOK)
+		}
+		var cr api.ExecutionCallbackResponse
+		if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+			resp.Body.Close()
+			t.Fatalf("decode %q: %v", step.status, err)
+		}
+		resp.Body.Close()
+		if cr.Status != step.status {
+			t.Errorf("status = %q, want %q", cr.Status, step.status)
+		}
+	}
+
+	if a := getAssertions(t, ts.URL); a.ExecutionCallbackCount != 3 {
+		t.Errorf("execution_callback_count = %d, want 3", a.ExecutionCallbackCount)
+	}
+
+	// The last captured body is the succeeded callback.
+	captured := getCapturedBody(t, ts.URL, "execution_callback")
+	if !bytes.Contains(captured, []byte(`"succeeded"`)) {
+		t.Errorf("captured execution_callback = %s, want the succeeded callback", captured)
+	}
+}
+
+func TestExecutionCallback_IllegalTransitions(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup []string
+		jump  string
+	}{
+		{"absent_to_started", nil, `{"status":"started"}`},
+		{"absent_to_succeeded", nil, `{"status":"succeeded"}`},
+		{"ack_to_succeeded", []string{`{"status":"ack"}`}, `{"status":"succeeded"}`},
+		{"ack_to_ack", []string{`{"status":"ack"}`}, `{"status":"ack"}`},
+		{"started_to_ack", []string{`{"status":"ack"}`, `{"status":"started"}`}, `{"status":"ack"}`},
+		{"plain_started_to_started", []string{`{"status":"ack"}`, `{"status":"started"}`}, `{"status":"started"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			eid := "exec-" + tt.name
+			for i, body := range tt.setup {
+				resp := postExecCallback(t, ts.URL, eid, body)
+				if resp.StatusCode != http.StatusOK {
+					resp.Body.Close()
+					t.Fatalf("setup #%d: status = %d, want %d", i, resp.StatusCode, http.StatusOK)
+				}
+				resp.Body.Close()
+			}
+			resp := postExecCallback(t, ts.URL, eid, tt.jump)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
+			}
+			if code := problemCode(t, resp); code != "invalid_state_transition" {
+				t.Errorf("code = %q, want %q", code, "invalid_state_transition")
+			}
+		})
+	}
+}
+
+func TestExecutionCallback_TerminalIsFinal(t *testing.T) {
+	tests := []struct {
+		name string
+		next string
+	}{
+		{"then_started", `{"status":"started"}`},
+		{"then_succeeded", `{"status":"succeeded"}`},
+		{"then_failed", `{"status":"failed"}`},
+		{"then_ack", `{"status":"ack"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			eid := "exec-term-" + tt.name
+			// Drive to a terminal state: ack→started→succeeded.
+			for _, body := range []string{`{"status":"ack"}`, `{"status":"started"}`, `{"status":"succeeded"}`} {
+				resp := postExecCallback(t, ts.URL, eid, body)
+				resp.Body.Close()
+			}
+			resp := postExecCallback(t, ts.URL, eid, tt.next)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
+			}
+			if code := problemCode(t, resp); code != "execution_already_terminal" {
+				t.Errorf("code = %q, want %q", code, "execution_already_terminal")
+			}
+		})
+	}
+}
+
+func TestExecutionCallback_ForeignNodeID_Returns403(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/foreign-node/executions/exec-1", `{"status":"ack"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if code := problemCode(t, resp); code != "nsk_node_mismatch" {
+		t.Errorf("code = %q, want %q", code, "nsk_node_mismatch")
+	}
+}
+
+func TestExecutionCallback_WrongMethod_Returns405(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(execCallbackURL(ts.URL, "exec-1"))
+	if err != nil {
+		t.Fatalf("GET execution callback: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestExecutionCallback_OverCeilingUploadFlow(t *testing.T) {
+	_, ts := newTestServer(t)
+	const eid = "exec-upload-001"
+	output := []byte(strings.Repeat("x", 20000)) // over the 16 KiB inline ceiling
+	sum := sha256.Sum256(output)
+	sha := fmt.Sprintf("%x", sum[:])
+
+	// ack → started → declare mints the presigned URL.
+	uploadURL := declareExecUpload(t, ts.URL, eid, len(output))
+	u, err := url.Parse(uploadURL)
+	if err != nil {
+		t.Fatalf("parse upload url: %v", err)
+	}
+	if u.Path != "/exec-output/"+eid {
+		t.Errorf("upload url path = %q, want %q", u.Path, "/exec-output/"+eid)
+	}
+
+	// PUT the bytes → 200, execution_upload_count = 1.
+	put := doRequest(t, http.MethodPut, uploadURL, string(output))
+	if put.StatusCode != http.StatusOK {
+		put.Body.Close()
+		t.Fatalf("PUT upload status = %d, want %d", put.StatusCode, http.StatusOK)
+	}
+	put.Body.Close()
+	if a := getAssertions(t, ts.URL); a.ExecutionUploadCount != 1 {
+		t.Errorf("execution_upload_count = %d, want 1", a.ExecutionUploadCount)
+	}
+
+	// Terminal callback with the matching object_key + sha256 → 200.
+	term := postExecCallback(t, ts.URL, eid, fmt.Sprintf(`{"status":"succeeded","output":{"object_key":"exec-output/%s","sha256":%q}}`, eid, sha))
+	defer term.Body.Close()
+	if term.StatusCode != http.StatusOK {
+		t.Fatalf("terminal status = %d, want %d", term.StatusCode, http.StatusOK)
+	}
+}
+
+func TestExecOutputUpload_Errors(t *testing.T) {
+	_, ts := newTestServer(t)
+	const eid = "exec-upload-errs"
+	output := []byte(strings.Repeat("y", 18000))
+
+	uploadURL := declareExecUpload(t, ts.URL, eid, len(output))
+
+	// Unknown token → 404.
+	unknown := doRequest(t, http.MethodPut, ts.URL+"/exec-output/"+eid+"?token=nope", "data")
+	if unknown.StatusCode != http.StatusNotFound {
+		unknown.Body.Close()
+		t.Fatalf("unknown token status = %d, want %d", unknown.StatusCode, http.StatusNotFound)
+	}
+	unknown.Body.Close()
+
+	// A body larger than declared → 413 (the token stays unused).
+	over := doRequest(t, http.MethodPut, uploadURL, string(output)+"z")
+	if over.StatusCode != http.StatusRequestEntityTooLarge {
+		over.Body.Close()
+		t.Fatalf("over-declared status = %d, want %d", over.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+	over.Body.Close()
+
+	// The first well-sized PUT → 200.
+	first := doRequest(t, http.MethodPut, uploadURL, string(output))
+	if first.StatusCode != http.StatusOK {
+		first.Body.Close()
+		t.Fatalf("first PUT status = %d, want %d", first.StatusCode, http.StatusOK)
+	}
+	first.Body.Close()
+
+	// A second PUT with the same token → 409 (one-time URL).
+	second := doRequest(t, http.MethodPut, uploadURL, string(output))
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusConflict {
+		t.Fatalf("second PUT status = %d, want %d", second.StatusCode, http.StatusConflict)
+	}
+}
+
+func TestExecutionCallback_MalformedAndCeiling(t *testing.T) {
+	t.Run("sha256_mismatch", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		const eid = "exec-mismatch"
+		output := []byte(strings.Repeat("z", 20000))
+
+		uploadURL := declareExecUpload(t, ts.URL, eid, len(output))
+		put := doRequest(t, http.MethodPut, uploadURL, string(output))
+		put.Body.Close()
+
+		wrongSHA := strings.Repeat("00", 32)
+		term := postExecCallback(t, ts.URL, eid, fmt.Sprintf(`{"status":"succeeded","output":{"object_key":"exec-output/%s","sha256":%q}}`, eid, wrongSHA))
+		defer term.Body.Close()
+		if term.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", term.StatusCode, http.StatusBadRequest)
+		}
+		if code := problemCode(t, term); code != "malformed_execution_callback" {
+			t.Errorf("code = %q, want %q", code, "malformed_execution_callback")
+		}
+	})
+
+	simple := []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantCode   string
+	}{
+		{"unknown_field", `{"status":"ack","surprise":"x"}`, http.StatusBadRequest, "malformed_execution_callback"},
+		{"bad_status", `{"status":"bogus"}`, http.StatusBadRequest, "malformed_execution_callback"},
+		{"inline_over_ceiling", fmt.Sprintf(`{"status":"succeeded","output":{"inline":%q}}`, base64.StdEncoding.EncodeToString(make([]byte, 16385))), http.StatusRequestEntityTooLarge, "inline_output_too_large"},
+	}
+	for _, tt := range simple {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			resp := postExecCallback(t, ts.URL, "exec-"+tt.name, tt.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			if code := problemCode(t, resp); code != tt.wantCode {
+				t.Errorf("code = %q, want %q", code, tt.wantCode)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Session activity endpoint (issue #22)
+// ---------------------------------------------------------------------------
+
+// sessionURL builds POST /v1/nodes/{mockNode}/sessions/{sid}.
+func sessionURL(baseURL, sid string) string {
+	return baseURL + "/v1/nodes/" + testMockNodeID + "/sessions/" + sid
+}
+
+func TestSessionActivity_ValidRows(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"tcp_started", `{"tcp":{"phase":"session_started","target_host":"203.0.113.9","target_port":22}}`},
+		{"tcp_ended", `{"tcp":{"phase":"session_ended","bytes_in":0,"bytes_out":0,"terminated_by":"operator_revoke"}}`},
+		{"ssh", `{"ssh":{"command":"ls -la","exit_code":0}}`},
+		{"k8s", `{"k8s":{"verb":"get","resource_kind":"pods","namespace":"default"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			resp := doRequest(t, http.MethodPost, sessionURL(ts.URL, "sess-"+tt.name), tt.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+			}
+			if a := getAssertions(t, ts.URL); a.SessionActivityCount != 1 {
+				t.Errorf("session_activity_count = %d, want 1", a.SessionActivityCount)
+			}
+			if captured := getCapturedBody(t, ts.URL, "session_activity"); string(captured) != tt.body {
+				t.Errorf("captured session_activity = %q, want %q", captured, tt.body)
+			}
+		})
+	}
+}
+
+func TestSessionActivity_Denials(t *testing.T) {
+	longCommand := strings.Repeat("a", 1025)
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"zero_members", `{}`},
+		{"two_members", `{"ssh":{"command":"ls"},"k8s":{"verb":"get"}}`},
+		{"ssh_missing_command", `{"ssh":{"exit_code":0}}`},
+		{"ssh_command_too_long", fmt.Sprintf(`{"ssh":{"command":%q}}`, longCommand)},
+		{"k8s_missing_verb", `{"k8s":{"resource_kind":"pods"}}`},
+		{"bad_tcp_phase", `{"tcp":{"phase":"session_paused"}}`},
+		{"bad_terminated_by", `{"tcp":{"phase":"session_ended","terminated_by":"who_knows"}}`},
+		{"unknown_field", `{"tcp":{"phase":"session_started"},"surprise":true}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			resp := doRequest(t, http.MethodPost, sessionURL(ts.URL, "sess-"+tt.name), tt.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			}
+			if code := problemCode(t, resp); code != "malformed_session_activity" {
+				t.Errorf("code = %q, want %q", code, "malformed_session_activity")
+			}
+		})
+	}
+}
+
+func TestSessionActivity_ForeignNodeID_Returns403(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/foreign-node/sessions/sess-1", `{"tcp":{"phase":"session_started"}}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+	if code := problemCode(t, resp); code != "nsk_node_mismatch" {
+		t.Errorf("code = %q, want %q", code, "nsk_node_mismatch")
+	}
+}
+
+func TestSessionActivity_WrongMethod_Returns405(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(sessionURL(ts.URL, "sess-1"))
+	if err != nil {
+		t.Fatalf("GET session activity: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
