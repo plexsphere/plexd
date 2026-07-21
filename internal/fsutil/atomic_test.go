@@ -37,8 +37,22 @@ func TestWriteFileAtomic_Success(t *testing.T) {
 	}
 
 	// Temp file should be cleaned up.
-	if _, err := os.Stat(filepath.Join(dir, ".tmp-test.txt")); !os.IsNotExist(err) {
-		t.Errorf("temp file still exists")
+	assertNoTempFiles(t, dir)
+}
+
+// assertNoTempFiles fails when dir still holds a temp file from an interrupted
+// or completed write. The temp name carries a random suffix, so it is matched
+// by prefix.
+func assertNoTempFiles(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			t.Errorf("leftover temp file: %s", e.Name())
+		}
 	}
 }
 
@@ -157,9 +171,7 @@ func TestWriteFileAtomic_PermissionDenied(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(roDir, "file.txt")); !os.IsNotExist(statErr) {
 		t.Error("target file should not exist after permission denied")
 	}
-	if _, statErr := os.Stat(filepath.Join(roDir, ".tmp-file.txt")); !os.IsNotExist(statErr) {
-		t.Error("temp file should not exist after permission denied")
-	}
+	assertNoTempFiles(t, roDir)
 }
 
 func TestWriteFileAtomic_NonExistentDir(t *testing.T) {
@@ -217,8 +229,7 @@ func TestWriteFileAtomic_ConcurrentAccess(t *testing.T) {
 
 	errs := make(chan error, goroutines*iterations)
 
-	// Each goroutine writes to its own file to avoid temp file collisions
-	// (WriteFileAtomic uses a deterministic temp name per target file).
+	// Each goroutine writes to its own file.
 	for g := range goroutines {
 		go func(id int) {
 			defer wg.Done()
@@ -254,15 +265,83 @@ func TestWriteFileAtomic_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Verify no leftover .tmp- files remain after all writes complete.
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
+	assertNoTempFiles(t, dir)
+}
+
+func TestWriteFileAtomic_ConcurrentSameFile(t *testing.T) {
+	// Writers of the same target must not share a temp file: a shared temp
+	// inode lets one writer's buffer land in the file another already renamed
+	// into place, so a reader sees a mix of both payloads. The payloads differ
+	// in length here because that is what makes the mix observable.
+	dir := t.TempDir()
+	const name = "shared.json"
+	const goroutines = 8
+	const iterations = 40
+
+	payloads := make([][]byte, goroutines)
+	for g := range goroutines {
+		payloads[g] = bytes.Repeat([]byte{byte('a' + g)}, 16*(g+1))
 	}
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".tmp-") {
-			t.Errorf("leftover temp file: %s", e.Name())
+
+	// Seed the target so every read below has a file to open.
+	if err := WriteFileAtomic(dir, name, payloads[0], 0o600); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	var writers sync.WaitGroup
+	writers.Add(goroutines)
+	errs := make(chan error, goroutines*iterations+1)
+
+	for g := range goroutines {
+		go func(id int) {
+			defer writers.Done()
+			for range iterations {
+				if err := WriteFileAtomic(dir, name, payloads[id], 0o600); err != nil {
+					errs <- fmt.Errorf("goroutine %d: %w", id, err)
+				}
+			}
+		}(g)
+	}
+
+	// A concurrent reader: every observed content must be exactly one payload.
+	stop := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			got, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				errs <- fmt.Errorf("read: %w", err)
+				return
+			}
+			whole := false
+			for _, p := range payloads {
+				if bytes.Equal(got, p) {
+					whole = true
+					break
+				}
+			}
+			if !whole {
+				errs <- fmt.Errorf("torn content observed: %q", got)
+				return
+			}
 		}
+	}()
+
+	writers.Wait()
+	close(stop)
+	<-readerDone
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("%v", err)
 	}
+	assertNoTempFiles(t, dir)
 }
 
 func TestWriteFileAtomic_Permissions(t *testing.T) {
