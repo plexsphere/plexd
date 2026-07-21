@@ -11,33 +11,49 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// mockReporter records calls to ReportReady and ReportClosed.
+// mockReporter records calls to ReportSessionStarted and ReportSessionEnded.
 type mockReporter struct {
-	mu          sync.Mutex
-	readyCalls  []tunnelReadyCall
-	closedCalls []tunnelClosedCall
+	mu           sync.Mutex
+	startedCalls []sessionStartedCall
+	endedCalls   []sessionEndedCall
 }
 
-type tunnelReadyCall struct {
+type sessionStartedCall struct {
 	SessionID  string
-	ListenAddr string
+	TargetHost string
+	TargetPort int
 }
 
-type tunnelClosedCall struct {
-	SessionID string
-	Reason    string
+type sessionEndedCall struct {
+	SessionID    string
+	TargetHost   string
+	TargetPort   int
+	BytesIn      int64
+	BytesOut     int64
+	TerminatedBy string
 }
 
-func (r *mockReporter) ReportReady(ctx context.Context, sessionID, listenAddr string) {
+func (r *mockReporter) ReportSessionStarted(ctx context.Context, sessionID, targetHost string, targetPort int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.readyCalls = append(r.readyCalls, tunnelReadyCall{SessionID: sessionID, ListenAddr: listenAddr})
+	r.startedCalls = append(r.startedCalls, sessionStartedCall{
+		SessionID:  sessionID,
+		TargetHost: targetHost,
+		TargetPort: targetPort,
+	})
 }
 
-func (r *mockReporter) ReportClosed(ctx context.Context, sessionID, reason string, duration time.Duration) {
+func (r *mockReporter) ReportSessionEnded(ctx context.Context, sessionID, targetHost string, targetPort int, bytesIn, bytesOut int64, terminatedBy string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.closedCalls = append(r.closedCalls, tunnelClosedCall{SessionID: sessionID, Reason: reason})
+	r.endedCalls = append(r.endedCalls, sessionEndedCall{
+		SessionID:    sessionID,
+		TargetHost:   targetHost,
+		TargetPort:   targetPort,
+		BytesIn:      bytesIn,
+		BytesOut:     bytesOut,
+		TerminatedBy: terminatedBy,
+	})
 }
 
 func testEnvelope(eventType string, payload any) api.SignedEnvelope {
@@ -79,14 +95,18 @@ func TestSSEHandler_SSHSessionSetup(t *testing.T) {
 
 	reporter.mu.Lock()
 	defer reporter.mu.Unlock()
-	if len(reporter.readyCalls) != 1 {
-		t.Fatalf("expected 1 ReportReady call, got %d", len(reporter.readyCalls))
+	if len(reporter.startedCalls) != 1 {
+		t.Fatalf("expected 1 ReportSessionStarted call, got %d", len(reporter.startedCalls))
 	}
-	if reporter.readyCalls[0].SessionID != "sess-setup-1" {
-		t.Errorf("ReportReady session_id = %q, want %q", reporter.readyCalls[0].SessionID, "sess-setup-1")
+	got := reporter.startedCalls[0]
+	if got.SessionID != "sess-setup-1" {
+		t.Errorf("ReportSessionStarted session_id = %q, want %q", got.SessionID, "sess-setup-1")
 	}
-	if reporter.readyCalls[0].ListenAddr == "" {
-		t.Error("ReportReady listen_addr is empty")
+	if got.TargetHost != host {
+		t.Errorf("ReportSessionStarted target_host = %q, want %q", got.TargetHost, host)
+	}
+	if got.TargetPort != port {
+		t.Errorf("ReportSessionStarted target_port = %d, want %d", got.TargetPort, port)
 	}
 }
 
@@ -113,8 +133,8 @@ func TestSSEHandler_SSHSessionSetup_MalformedPayload(t *testing.T) {
 
 	reporter.mu.Lock()
 	defer reporter.mu.Unlock()
-	if len(reporter.readyCalls) != 0 {
-		t.Errorf("expected 0 ReportReady calls, got %d", len(reporter.readyCalls))
+	if len(reporter.startedCalls) != 0 {
+		t.Errorf("expected 0 ReportSessionStarted calls, got %d", len(reporter.startedCalls))
 	}
 }
 
@@ -124,7 +144,6 @@ func TestSSEHandler_SessionRevoked(t *testing.T) {
 	port := mustAtoi(t, portStr)
 
 	mgr := newTestManager(t, Config{})
-	reporter := &mockReporter{}
 
 	// Create a session first.
 	setup := api.SSHSessionSetup{
@@ -141,8 +160,10 @@ func TestSSEHandler_SessionRevoked(t *testing.T) {
 		t.Fatalf("expected ActiveCount()=1, got %d", mgr.ActiveCount())
 	}
 
-	// Revoke it via handler.
-	handler := HandleSessionRevoked(mgr, reporter)
+	// Revoke it via handler. HandleSessionRevoked only closes the session; the
+	// session_ended row is emitted by the manager's on-closed callback, so the
+	// handler takes no reporter.
+	handler := HandleSessionRevoked(mgr)
 
 	payload := struct {
 		SessionID string `json:"session_id"`
@@ -157,25 +178,12 @@ func TestSSEHandler_SessionRevoked(t *testing.T) {
 	if mgr.ActiveCount() != 0 {
 		t.Errorf("expected ActiveCount()=0 after revocation, got %d", mgr.ActiveCount())
 	}
-
-	reporter.mu.Lock()
-	defer reporter.mu.Unlock()
-	if len(reporter.closedCalls) != 1 {
-		t.Fatalf("expected 1 ReportClosed call, got %d", len(reporter.closedCalls))
-	}
-	if reporter.closedCalls[0].SessionID != "sess-revoke-1" {
-		t.Errorf("ReportClosed session_id = %q, want %q", reporter.closedCalls[0].SessionID, "sess-revoke-1")
-	}
-	if reporter.closedCalls[0].Reason != "revoked" {
-		t.Errorf("ReportClosed reason = %q, want %q", reporter.closedCalls[0].Reason, "revoked")
-	}
 }
 
 func TestSSEHandler_SessionRevoked_UnknownSession(t *testing.T) {
 	mgr := newTestManager(t, Config{})
-	reporter := &mockReporter{}
 
-	handler := HandleSessionRevoked(mgr, reporter)
+	handler := HandleSessionRevoked(mgr)
 
 	payload := struct {
 		SessionID string `json:"session_id"`
@@ -190,19 +198,12 @@ func TestSSEHandler_SessionRevoked_UnknownSession(t *testing.T) {
 	if mgr.ActiveCount() != 0 {
 		t.Errorf("expected ActiveCount()=0, got %d", mgr.ActiveCount())
 	}
-
-	reporter.mu.Lock()
-	defer reporter.mu.Unlock()
-	if len(reporter.closedCalls) != 0 {
-		t.Errorf("expected 0 ReportClosed calls for unknown session, got %d", len(reporter.closedCalls))
-	}
 }
 
 func TestSSEHandler_SessionRevoked_MalformedPayload(t *testing.T) {
 	mgr := newTestManager(t, Config{})
-	reporter := &mockReporter{}
 
-	handler := HandleSessionRevoked(mgr, reporter)
+	handler := HandleSessionRevoked(mgr)
 
 	envelope := api.SignedEnvelope{
 		EventType: api.EventSessionRevoked,
@@ -213,5 +214,26 @@ func TestSSEHandler_SessionRevoked_MalformedPayload(t *testing.T) {
 	err := handler(context.Background(), envelope)
 	if err == nil {
 		t.Fatal("expected error for malformed payload")
+	}
+}
+
+func TestTerminatedByFromReason(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{"expired maps to ttl_expired", "expired", api.TerminatedByTTLExpired},
+		{"revoked maps to operator_revoke", "revoked", api.TerminatedByOperatorRevoke},
+		{"other maps to plexd_close", "shutdown", api.TerminatedByPlexdClose},
+		{"empty maps to plexd_close", "", api.TerminatedByPlexdClose},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := TerminatedByFromReason(tt.reason); got != tt.want {
+				t.Errorf("TerminatedByFromReason(%q) = %q, want %q", tt.reason, got, tt.want)
+			}
+		})
 	}
 }

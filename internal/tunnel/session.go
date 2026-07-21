@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,9 +28,21 @@ type Session struct {
 	mu     sync.Mutex
 	conn   net.Conn // active connection (at most one)
 	closed bool
+	// copyDone is closed once the forwarding goroutines for the active
+	// connection have returned and added their byte counts. It is nil while no
+	// connection is being forwarded.
+	copyDone chan struct{}
+
+	bytesIn  atomic.Int64 // bytes forwarded client -> target (operator -> target)
+	bytesOut atomic.Int64 // bytes forwarded target -> client (target -> operator)
 
 	logger *slog.Logger
 }
+
+// drainTimeout bounds how long Close waits for the forwarding goroutines to
+// finish after the connections are torn down. They return as soon as the closed
+// sockets surface an error, so this only guards against a wedged conn.
+const drainTimeout = 2 * time.Second
 
 // NewSession creates a Session with the given parameters.
 func NewSession(sessionID, targetHost string, targetPort int, meshIP string, expiresAt time.Time, logger *slog.Logger) *Session {
@@ -111,8 +124,12 @@ func (s *Session) forward(ctx context.Context, clientConn net.Conn) {
 		return
 	}
 
+	// copyDone lets Close wait for the final counter updates before a caller
+	// reads Counters().
+	done := make(chan struct{})
 	s.mu.Lock()
 	s.conn = clientConn
+	s.copyDone = done
 	s.mu.Unlock()
 
 	var once sync.Once
@@ -129,24 +146,36 @@ func (s *Session) forward(ctx context.Context, clientConn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// io.Copy already returns the forwarded byte count, so the counters are
+	// settled from its result rather than from a wrapper around the destination.
+	// A wrapper would hide the *net.TCPConn destination from TCPConn.WriteTo and
+	// cost the connection its splice(2) fast path, adding a userspace copy and a
+	// syscall pair per 32 KiB chunk in both directions.
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(targetConn, clientConn)
+		n, _ := io.Copy(targetConn, clientConn)
+		s.bytesIn.Add(n)
 		cleanup()
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(clientConn, targetConn)
+		n, _ := io.Copy(clientConn, targetConn)
+		s.bytesOut.Add(n)
 		cleanup()
 	}()
 
 	wg.Wait()
+
+	s.mu.Lock()
+	s.copyDone = nil
+	s.mu.Unlock()
+	close(done)
 }
 
 // Close shuts down the session idempotently.
 func (s *Session) Close() error {
-	conn, alreadyClosed := s.markClosed()
+	conn, done, alreadyClosed := s.markClosed()
 	if alreadyClosed {
 		return nil
 	}
@@ -161,20 +190,37 @@ func (s *Session) Close() error {
 		conn.Close()
 	}
 
+	// Wait for the forwarding goroutines to add their final byte counts, so a
+	// Counters() read after Close reflects everything that was forwarded.
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(drainTimeout):
+			s.logger.Warn("timed out waiting for forwarding to drain; byte counters may be short")
+		}
+	}
+
 	s.logger.Info("session closed", "duration", time.Since(s.startTime).String())
 	return nil
 }
 
 // markClosed atomically marks the session as closed and returns the active
-// connection (if any) along with whether the session was already closed.
-func (s *Session) markClosed() (activeConn net.Conn, alreadyClosed bool) {
+// connection and its forwarding-done channel (both nil when nothing is being
+// forwarded) along with whether the session was already closed.
+func (s *Session) markClosed() (activeConn net.Conn, copyDone chan struct{}, alreadyClosed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil, true
+		return nil, nil, true
 	}
 	s.closed = true
-	return s.conn, false
+	return s.conn, s.copyDone, false
+}
+
+// Counters returns the bytes forwarded in each direction: in is client -> target
+// (operator to target), out is target -> client (target to operator).
+func (s *Session) Counters() (in, out int64) {
+	return s.bytesIn.Load(), s.bytesOut.Load()
 }
 
 // ListenAddr returns the listener address or empty string if not started.

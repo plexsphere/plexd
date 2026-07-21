@@ -55,6 +55,12 @@ func TestIntegration_FullTunnelLifecycle(t *testing.T) {
 	reporter := &mockReporter{}
 	handler := HandleSSHSessionSetup(mgr, reporter)
 
+	// The session_ended row arrives via the manager's on-closed callback, just
+	// as up.go wires it in production.
+	mgr.SetOnClosed(func(sessionID, reason string, info *ClosedSessionInfo) {
+		reporter.ReportSessionEnded(context.Background(), sessionID, info.TargetHost, info.TargetPort, info.BytesIn, info.BytesOut, TerminatedByFromReason(reason))
+	})
+
 	// 1. Dispatch ssh_session_setup SSE event.
 	setup := api.SSHSessionSetup{
 		SessionID:     "integ-lifecycle-1",
@@ -70,23 +76,27 @@ func TestIntegration_FullTunnelLifecycle(t *testing.T) {
 		t.Fatalf("HandleSSHSessionSetup() error: %v", err)
 	}
 
-	// 2. Verify session is active and reporter was called.
+	// 2. Verify session is active and the started row was reported.
 	if mgr.ActiveCount() != 1 {
 		t.Fatalf("expected ActiveCount()=1, got %d", mgr.ActiveCount())
 	}
 
 	reporter.mu.Lock()
-	if len(reporter.readyCalls) != 1 {
-		t.Fatalf("expected 1 ReportReady call, got %d", len(reporter.readyCalls))
+	if len(reporter.startedCalls) != 1 {
+		reporter.mu.Unlock()
+		t.Fatalf("expected 1 ReportSessionStarted call, got %d", len(reporter.startedCalls))
 	}
-	listenAddr := reporter.readyCalls[0].ListenAddr
+	started := reporter.startedCalls[0]
 	reporter.mu.Unlock()
 
-	if listenAddr == "" {
-		t.Fatal("listen address is empty")
+	if started.TargetHost != host || started.TargetPort != port {
+		t.Errorf("started row target = %s:%d, want %s:%d", started.TargetHost, started.TargetPort, host, port)
 	}
 
-	// 3. Connect and verify bidirectional data flow.
+	// 3. Connect and verify bidirectional data flow. The started row carries no
+	// listen address (production operators reach it via the mesh), so read it
+	// from the live session directly.
+	listenAddr := sessionListenAddr(t, mgr, "integ-lifecycle-1")
 	conn, err := net.DialTimeout("tcp", listenAddr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("Dial() error: %v", err)
@@ -107,16 +117,44 @@ func TestIntegration_FullTunnelLifecycle(t *testing.T) {
 		t.Errorf("echo mismatch: got %q, want %q", string(buf), msg)
 	}
 
-	// 4. Close the client connection so forwarding goroutines can exit.
+	// 4. Close the client connection so the forwarding goroutines can exit
+	// before the session expires. CloseSession drains them before reading the
+	// counters, so the ended row below carries the full byte counts.
 	conn.Close()
 
-	// 5. Wait for session to expire (DefaultTimeout caps at 3s).
+	// 5. Wait for the session to expire (DefaultTimeout caps at 3s) and the
+	// on-closed callback to emit the session_ended row. Waiting on the ended
+	// row (not ActiveCount) avoids racing the callback, which fires after the
+	// session is already removed from the map.
 	waitForCondition(t, 5*time.Second, func() bool {
-		return mgr.ActiveCount() == 0
+		reporter.mu.Lock()
+		defer reporter.mu.Unlock()
+		return len(reporter.endedCalls) == 1
 	})
 
 	if mgr.ActiveCount() != 0 {
 		t.Errorf("expected session to auto-expire, ActiveCount()=%d", mgr.ActiveCount())
+	}
+
+	// 6. The session_ended row must carry the counted bytes and the ttl_expired
+	// reason.
+	reporter.mu.Lock()
+	defer reporter.mu.Unlock()
+	if len(reporter.endedCalls) != 1 {
+		t.Fatalf("expected 1 ReportSessionEnded call, got %d", len(reporter.endedCalls))
+	}
+	ended := reporter.endedCalls[0]
+	if ended.SessionID != "integ-lifecycle-1" {
+		t.Errorf("ended row session_id = %q, want %q", ended.SessionID, "integ-lifecycle-1")
+	}
+	if ended.BytesIn != int64(len(msg)) {
+		t.Errorf("ended row bytes_in = %d, want %d", ended.BytesIn, len(msg))
+	}
+	if ended.BytesOut != int64(len(msg)) {
+		t.Errorf("ended row bytes_out = %d, want %d", ended.BytesOut, len(msg))
+	}
+	if ended.TerminatedBy != api.TerminatedByTTLExpired {
+		t.Errorf("ended row terminated_by = %q, want %q", ended.TerminatedBy, api.TerminatedByTTLExpired)
 	}
 }
 
@@ -131,6 +169,9 @@ func TestIntegration_SessionRevocationDuringActiveConnection(t *testing.T) {
 	t.Cleanup(func() { mgr.Shutdown() })
 
 	reporter := &mockReporter{}
+	mgr.SetOnClosed(func(sessionID, reason string, info *ClosedSessionInfo) {
+		reporter.ReportSessionEnded(context.Background(), sessionID, info.TargetHost, info.TargetPort, info.BytesIn, info.BytesOut, TerminatedByFromReason(reason))
+	})
 
 	// Create session via handler.
 	setupHandler := HandleSSHSessionSetup(mgr, reporter)
@@ -146,9 +187,7 @@ func TestIntegration_SessionRevocationDuringActiveConnection(t *testing.T) {
 		t.Fatalf("HandleSSHSessionSetup() error: %v", err)
 	}
 
-	reporter.mu.Lock()
-	listenAddr := reporter.readyCalls[0].ListenAddr
-	reporter.mu.Unlock()
+	listenAddr := sessionListenAddr(t, mgr, "integ-revoke-1")
 
 	// Connect a client.
 	conn, err := net.DialTimeout("tcp", listenAddr, 2*time.Second)
@@ -167,8 +206,8 @@ func TestIntegration_SessionRevocationDuringActiveConnection(t *testing.T) {
 		t.Fatalf("ReadFull() error: %v", err)
 	}
 
-	// Revoke via handler.
-	revokeHandler := HandleSessionRevoked(mgr, reporter)
+	// Revoke via handler (no reporter arg: the ended row comes via the callback).
+	revokeHandler := HandleSessionRevoked(mgr)
 	revokePayload := struct {
 		SessionID string `json:"session_id"`
 	}{SessionID: "integ-revoke-1"}
@@ -190,14 +229,19 @@ func TestIntegration_SessionRevocationDuringActiveConnection(t *testing.T) {
 		t.Error("expected read error on revoked connection, got nil")
 	}
 
-	// Reporter should have ReportClosed called.
+	// The on-closed callback must have emitted a session_ended row with the
+	// operator_revoke reason and the counted bytes.
 	reporter.mu.Lock()
 	defer reporter.mu.Unlock()
-	if len(reporter.closedCalls) != 1 {
-		t.Fatalf("expected 1 ReportClosed call, got %d", len(reporter.closedCalls))
+	if len(reporter.endedCalls) != 1 {
+		t.Fatalf("expected 1 ReportSessionEnded call, got %d", len(reporter.endedCalls))
 	}
-	if reporter.closedCalls[0].Reason != "revoked" {
-		t.Errorf("ReportClosed reason = %q, want %q", reporter.closedCalls[0].Reason, "revoked")
+	ended := reporter.endedCalls[0]
+	if ended.TerminatedBy != api.TerminatedByOperatorRevoke {
+		t.Errorf("ended row terminated_by = %q, want %q", ended.TerminatedBy, api.TerminatedByOperatorRevoke)
+	}
+	if ended.BytesIn != 1 || ended.BytesOut != 1 {
+		t.Errorf("ended row bytes = (%d, %d), want (1, 1)", ended.BytesIn, ended.BytesOut)
 	}
 }
 

@@ -4,21 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// TunnelReporter reports tunnel session lifecycle events to the control plane.
-type TunnelReporter interface {
-	ReportReady(ctx context.Context, sessionID, listenAddr string)
-	ReportClosed(ctx context.Context, sessionID, reason string, duration time.Duration)
+// SessionActivityReporter reports the tcp-phase session_started row to the
+// control plane once the listener is up. The matching session_ended row is
+// emitted from the SessionManager's on-closed callback, not through here.
+type SessionActivityReporter interface {
+	ReportSessionStarted(ctx context.Context, sessionID, targetHost string, targetPort int)
 }
 
 // HandleSSHSessionSetup returns an api.EventHandler for ssh_session_setup events.
 // It parses the SSE payload, creates a tunnel session via the SessionManager,
-// and reports readiness via the TunnelReporter.
-func HandleSSHSessionSetup(mgr *SessionManager, reporter TunnelReporter) api.EventHandler {
+// and reports the session_started row via the SessionActivityReporter.
+func HandleSSHSessionSetup(mgr *SessionManager, reporter SessionActivityReporter) api.EventHandler {
 	return func(ctx context.Context, envelope api.SignedEnvelope) error {
 		var setup api.SSHSessionSetup
 		if err := json.Unmarshal(envelope.Payload, &setup); err != nil {
@@ -29,20 +29,21 @@ func HandleSSHSessionSetup(mgr *SessionManager, reporter TunnelReporter) api.Eve
 			return fmt.Errorf("tunnel: ssh_session_setup: parse payload: %w", err)
 		}
 
-		addr, err := mgr.CreateSession(ctx, setup)
-		if err != nil {
+		if _, err := mgr.CreateSession(ctx, setup); err != nil {
 			return fmt.Errorf("tunnel: ssh_session_setup: %w", err)
 		}
 
-		reporter.ReportReady(ctx, setup.SessionID, addr)
+		reporter.ReportSessionStarted(ctx, setup.SessionID, setup.TargetHost, setup.TargetPort)
 		return nil
 	}
 }
 
 // HandleSessionRevoked returns an api.EventHandler for session_revoked events.
-// It looks up the session by ID and closes it with reason "revoked".
-// Revoking a non-existent session is a no-op.
-func HandleSessionRevoked(mgr *SessionManager, reporter TunnelReporter) api.EventHandler {
+// It looks up the session by ID and closes it with reason "revoked"; the
+// session_ended row is emitted by the manager's on-closed callback, keeping a
+// single reporting path for every close reason. Revoking a non-existent session
+// is a no-op.
+func HandleSessionRevoked(mgr *SessionManager) api.EventHandler {
 	return func(ctx context.Context, envelope api.SignedEnvelope) error {
 		var payload struct {
 			SessionID string `json:"session_id"`
@@ -55,15 +56,24 @@ func HandleSessionRevoked(mgr *SessionManager, reporter TunnelReporter) api.Even
 			return fmt.Errorf("tunnel: session_revoked: parse payload: %w", err)
 		}
 
-		info := mgr.CloseSession(payload.SessionID, "revoked")
-		if info == nil {
-			mgr.logger.Debug("session_revoked: session not found",
-				"session_id", payload.SessionID,
-			)
-			return nil
-		}
-
-		reporter.ReportClosed(ctx, payload.SessionID, "revoked", info.Duration)
+		mgr.CloseSession(payload.SessionID, "revoked")
 		return nil
+	}
+}
+
+// TerminatedByFromReason maps an internal session close reason to the wire
+// terminated_by enum reported on a session_ended row: "expired" becomes
+// ttl_expired, "revoked" becomes operator_revoke, and any other reason
+// (including a local plexd-initiated close) becomes plexd_close.
+// api.TerminatedByIdleTimeout is reserved and never produced here — the tunnel
+// subsystem has no idle timer.
+func TerminatedByFromReason(reason string) string {
+	switch reason {
+	case "expired":
+		return api.TerminatedByTTLExpired
+	case "revoked":
+		return api.TerminatedByOperatorRevoke
+	default:
+		return api.TerminatedByPlexdClose
 	}
 }

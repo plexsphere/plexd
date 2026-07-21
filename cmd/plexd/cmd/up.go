@@ -39,6 +39,11 @@ import (
 // drainTimeout is the maximum time for graceful shutdown.
 const drainTimeout = 30 * time.Second
 
+// sessionEndedReportTimeout bounds a single session_ended report. Sessions are
+// closed one after another on shutdown, so this also bounds how long tunnel
+// teardown can hold up the drain.
+const sessionEndedReportTimeout = 2 * time.Second
+
 var upCmd = &cobra.Command{
 	Use:   "up",
 	Short: "Start the plexd agent",
@@ -173,7 +178,18 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	}
 	jwtVerifier := tunnel.NewEd25519JWTVerifier(ed25519.PublicKey(sigKey))
 	meshServer := tunnel.NewMeshServer(cfg.Tunnel, hostKey, jwtVerifier, logger)
-	tunnelReporter := &controlPlaneTunnelReporter{cp: client, nodeID: identity.NodeID}
+	sessionReporter := &controlPlaneSessionReporter{cp: client, nodeID: identity.NodeID}
+
+	// Report a session_ended row for every close reason (revoke, TTL expiry,
+	// local close, node shutdown) via the manager's on-closed callback. The row
+	// is the only carrier of a session's byte counters, so the shutdown path
+	// must report it too — and by then ctx is already cancelled, hence the
+	// detached, bounded context.
+	meshServer.SessionManager().SetOnClosed(func(sessionID, reason string, info *tunnel.ClosedSessionInfo) {
+		reportCtx, cancelReport := context.WithTimeout(context.WithoutCancel(ctx), sessionEndedReportTimeout)
+		defer cancelReport()
+		sessionReporter.ReportSessionEnded(reportCtx, sessionID, info.TargetHost, info.TargetPort, info.BytesIn, info.BytesOut, tunnel.TerminatedByFromReason(reason))
+	})
 
 	// 5e. Initialize bridge subsystem (conditional on bridge mode).
 	var (
@@ -264,8 +280,8 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	exchanger.RegisterHandlers(sseMgr)
 
 	// Register tunnel SSE handlers.
-	sseMgr.RegisterHandler(api.EventSSHSessionSetup, tunnel.HandleSSHSessionSetup(meshServer.SessionManager(), tunnelReporter))
-	sseMgr.RegisterHandler(api.EventSessionRevoked, tunnel.HandleSessionRevoked(meshServer.SessionManager(), tunnelReporter))
+	sseMgr.RegisterHandler(api.EventSSHSessionSetup, tunnel.HandleSSHSessionSetup(meshServer.SessionManager(), sessionReporter))
+	sseMgr.RegisterHandler(api.EventSessionRevoked, tunnel.HandleSessionRevoked(meshServer.SessionManager()))
 
 	// 7. Create reconciler.
 	reconciler := reconcile.NewReconciler(client, cfg.Reconcile, logger)
@@ -908,28 +924,39 @@ func (s *auditForwarderStatus) ForwarderStatus() nodeapi.ForwarderStatus {
 	}
 }
 
-// controlPlaneTunnelReporter reports tunnel session lifecycle events to the control plane.
-type controlPlaneTunnelReporter struct {
+// controlPlaneSessionReporter reports tcp-phase session activity rows to the
+// control plane. plexd's tunnel subsystem is an opaque TCP forwarder, so it
+// emits tcp rows: a session_started row when the listener is up and a
+// session_ended row carrying byte counters and a terminated_by reason on close.
+type controlPlaneSessionReporter struct {
 	cp     *api.ControlPlane
 	nodeID string
 }
 
-func (r *controlPlaneTunnelReporter) ReportReady(ctx context.Context, sessionID, listenAddr string) {
-	if err := r.cp.TunnelReady(ctx, r.nodeID, sessionID, api.TunnelReadyRequest{
-		ListenAddr: listenAddr,
-		Timestamp:  time.Now(),
+func (r *controlPlaneSessionReporter) ReportSessionStarted(ctx context.Context, sessionID, targetHost string, targetPort int) {
+	if err := r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, api.SessionActivityRequest{
+		TCP: &api.TCPActivity{
+			Phase:      api.TCPPhaseSessionStarted,
+			TargetHost: targetHost,
+			TargetPort: targetPort,
+		},
 	}); err != nil {
-		slog.Error("tunnel ready report failed", "session_id", sessionID, "error", err)
+		slog.Error("tunnel session started report failed", "session_id", sessionID, "error", err)
 	}
 }
 
-func (r *controlPlaneTunnelReporter) ReportClosed(ctx context.Context, sessionID, reason string, duration time.Duration) {
-	if err := r.cp.TunnelClosed(ctx, r.nodeID, sessionID, api.TunnelClosedRequest{
-		Reason:    reason,
-		Duration:  duration.String(),
-		Timestamp: time.Now(),
+func (r *controlPlaneSessionReporter) ReportSessionEnded(ctx context.Context, sessionID, targetHost string, targetPort int, bytesIn, bytesOut int64, terminatedBy string) {
+	if err := r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, api.SessionActivityRequest{
+		TCP: &api.TCPActivity{
+			Phase:        api.TCPPhaseSessionEnded,
+			TargetHost:   targetHost,
+			TargetPort:   targetPort,
+			BytesIn:      &bytesIn,
+			BytesOut:     &bytesOut,
+			TerminatedBy: terminatedBy,
+		},
 	}); err != nil {
-		slog.Error("tunnel closed report failed", "session_id", sessionID, "error", err)
+		slog.Error("tunnel session ended report failed", "session_id", sessionID, "error", err)
 	}
 }
 

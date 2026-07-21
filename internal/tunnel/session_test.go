@@ -88,6 +88,103 @@ func TestSession_ForwardBidirectional(t *testing.T) {
 	}
 }
 
+func TestSession_CountsBytesBothDirections(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port := mustAtoi(t, portStr)
+
+	ctx := context.Background()
+	logger := slog.Default()
+
+	session := NewSession("test-counters", host, port, "127.0.0.1", time.Now().Add(5*time.Minute), logger)
+	t.Cleanup(func() { session.Close() })
+
+	addr, err := session.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Dial() error: %v", err)
+	}
+	defer conn.Close()
+
+	msg := "count these bytes"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatalf("Write() error: %v", err)
+	}
+
+	buf := make([]byte, len(msg))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("ReadFull() error: %v", err)
+	}
+
+	// The echo server writes back exactly what it received. Close drains the
+	// forwarding goroutines, so the counters are complete once it returns —
+	// this is exactly what CloseSession relies on before it reports the
+	// session_ended row.
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+
+	in, out := session.Counters()
+	if in != int64(len(msg)) {
+		t.Errorf("bytesIn = %d, want %d", in, len(msg))
+	}
+	if out != int64(len(msg)) {
+		t.Errorf("bytesOut = %d, want %d", out, len(msg))
+	}
+}
+
+func TestSession_CountersSettleBeforeCloseReturns(t *testing.T) {
+	// After a full round-trip both forwarding goroutines are parked in io.Copy,
+	// each having copied len(msg) bytes but not yet run the trailing counter
+	// add. Close must not return until those adds land, otherwise a Counters()
+	// read right after Close — exactly what CloseSession does before it reports
+	// the session_ended row — races the netpoller waking the goroutines and
+	// undercounts the session. Without the drain this loop observes a short
+	// count within a few iterations; with it, every iteration is exact.
+	echoAddr := startEchoServer(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port := mustAtoi(t, portStr)
+
+	msg := []byte("count these bytes")
+	for i := range 50 {
+		session := NewSession("test-drain", host, port, "127.0.0.1", time.Now().Add(5*time.Minute), slog.Default())
+
+		addr, err := session.Start(context.Background())
+		if err != nil {
+			t.Fatalf("Start() error: %v", err)
+		}
+
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			t.Fatalf("Dial() error: %v", err)
+		}
+
+		if _, err := conn.Write(msg); err != nil {
+			t.Fatalf("Write() error: %v", err)
+		}
+		buf := make([]byte, len(msg))
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			t.Fatalf("ReadFull() error: %v", err)
+		}
+
+		if err := session.Close(); err != nil {
+			t.Fatalf("Close() error: %v", err)
+		}
+		conn.Close()
+
+		if in, out := session.Counters(); in != int64(len(msg)) || out != int64(len(msg)) {
+			t.Fatalf("iteration %d: counters after Close() = (%d, %d), want (%d, %d)",
+				i, in, out, len(msg), len(msg))
+		}
+	}
+}
+
 func TestSession_DialFailureClosesClient(t *testing.T) {
 	// Use a port that nothing listens on.
 	ctx := context.Background()

@@ -18,6 +18,7 @@ type SessionManager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*Session
+	onClosed func(sessionID, reason string, info *ClosedSessionInfo)
 }
 
 // NewSessionManager creates a new SessionManager with default config applied.
@@ -96,7 +97,25 @@ func (m *SessionManager) CreateSession(ctx context.Context, setup api.SSHSession
 
 // ClosedSessionInfo contains metadata about a session that was closed.
 type ClosedSessionInfo struct {
-	Duration time.Duration
+	Duration   time.Duration
+	TargetHost string
+	TargetPort int
+	BytesIn    int64
+	BytesOut   int64
+}
+
+// SetOnClosed registers a callback invoked after a session is successfully
+// closed and removed, for every close reason including "shutdown". The callback
+// carries the close reason and the session's final metadata, and is the single
+// path by which a session_ended activity row — TTL expiry, operator revoke, and
+// node shutdown alike — reaches the control plane. Because it is the only
+// carrier of the session's byte counters, skipping it on shutdown would leave
+// the control plane's audit record for every live session without bytes_in,
+// bytes_out, or terminated_by.
+func (m *SessionManager) SetOnClosed(fn func(sessionID, reason string, info *ClosedSessionInfo)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onClosed = fn
 }
 
 // CloseSession closes and removes a session by ID.
@@ -110,18 +129,42 @@ func (m *SessionManager) CloseSession(sessionID, reason string) *ClosedSessionIn
 
 	session.Close()
 	duration := time.Since(session.startTime)
+	bytesIn, bytesOut := session.Counters()
+	info := &ClosedSessionInfo{
+		Duration:   duration,
+		TargetHost: session.TargetHost,
+		TargetPort: session.TargetPort,
+		BytesIn:    bytesIn,
+		BytesOut:   bytesOut,
+	}
 	m.logger.Info("session closed",
 		"session_id", sessionID,
 		"reason", reason,
 		"duration", duration.String(),
 	)
-	return &ClosedSessionInfo{Duration: duration}
+
+	// Report every successful close. Read the callback under the lock but invoke
+	// it outside so we never hold the lock across the callback. Double-close
+	// fires nothing here because removeSession returns nil on the second call.
+	m.mu.Lock()
+	onClosed := m.onClosed
+	m.mu.Unlock()
+	if onClosed != nil {
+		onClosed(sessionID, reason, info)
+	}
+
+	return info
 }
 
-// Shutdown closes all active sessions. This is a local cleanup operation
-// during node shutdown and does not report individual close events to the
-// control plane — the control plane infers session loss from the node going
-// offline (heartbeat timeout).
+// Shutdown closes all active sessions, reporting each one through the on-closed
+// callback with reason "shutdown" so its byte counters and a plexd_close
+// terminated_by reach the control plane before the node goes offline.
+//
+// The on-closed callback performs a blocking, bounded report, so the sessions
+// are closed concurrently: total shutdown latency is then the single slowest
+// report rather than their sum. Closing serially instead would let a slow or
+// unreachable control plane stretch teardown to MaxSessions times the per-report
+// bound, overrunning a typical orchestrator termination grace period.
 func (m *SessionManager) Shutdown() {
 	m.mu.Lock()
 	ids := make([]string, 0, len(m.sessions))
@@ -130,9 +173,15 @@ func (m *SessionManager) Shutdown() {
 	}
 	m.mu.Unlock()
 
+	var wg sync.WaitGroup
 	for _, id := range ids {
-		m.CloseSession(id, "shutdown")
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			m.CloseSession(id, "shutdown")
+		}(id)
 	}
+	wg.Wait()
 
 	m.logger.Info("all tunnel sessions closed")
 }
