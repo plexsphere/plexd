@@ -671,15 +671,19 @@ fi
 echo "=== Phase 6 PASSED: SSE event injection ==="
 
 # ===================================================================
-# Phase 7: Heartbeat-triggered reconcile (RotateKeys flag)
+# Phase 7: Key rotation completes end to end (RotateKeys flag)
 # ===================================================================
-echo "=== Testing heartbeat-triggered reconcile via RotateKeys ==="
+echo "=== Testing key-rotation completion via RotateKeys ==="
 
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
 STATE_BEFORE_KR=$(get_counter "${RESPONSE}" "state_count")
+ROTATE_BEFORE_KR=$(get_counter "${RESPONSE}" "key_rotate_count")
 echo "  state_count before: ${STATE_BEFORE_KR}"
+echo "  key_rotate_count before: ${ROTATE_BEFORE_KR}"
 
 # Configure mock API to return RotateKeys: true in heartbeat responses.
+# The agent should complete the rotation (POST /v1/keys/rotate) and then
+# reconcile, which re-fetches state.
 KR_CONFIG='{"reconcile":true,"rotate_keys":true}'
 KR_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
     -X POST -H "Content-Type: application/json" \
@@ -692,6 +696,57 @@ if [ "${KR_STATUS}" != "204" ]; then
 fi
 echo "  heartbeat response configured with rotate_keys=true"
 
+# Wait for key_rotate_count to strictly increase (rotation completed).
+# Assert monotonic increase, not == 1: while the fixture flag stays true
+# each served heartbeat re-arms and another rotation may complete before
+# the flag reset below.
+KR_ROTATE_TIMEOUT=60
+KR_ROTATE_ELAPSED=0
+while [ "${KR_ROTATE_ELAPSED}" -lt "${KR_ROTATE_TIMEOUT}" ]; do
+    sleep 3
+    KR_ROTATE_ELAPSED=$((KR_ROTATE_ELAPSED + 3))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        ROTATE_AFTER_KR=$(get_counter "${RESPONSE}" "key_rotate_count")
+        if [ "${ROTATE_AFTER_KR}" -gt "${ROTATE_BEFORE_KR}" ]; then
+            echo "  PASS: key_rotate_count increased from ${ROTATE_BEFORE_KR} to ${ROTATE_AFTER_KR} (rotation completed)"
+            break
+        fi
+    fi
+done
+
+if [ "${KR_ROTATE_ELAPSED}" -ge "${KR_ROTATE_TIMEOUT}" ]; then
+    ROTATE_AFTER_KR=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "key_rotate_count")
+    echo "FAIL: key_rotate_count did not increase after RotateKeys=true (before=${ROTATE_BEFORE_KR}, after=${ROTATE_AFTER_KR})"
+    print_diagnostics
+    exit 1
+fi
+
+# Validate the captured rotate request body: it must carry the new public
+# key and must NOT carry a node_id (the server identifies the node from
+# the NSK bearer credential).
+ROTATE_BODY=$(curl -sf "http://localhost:18080/test/last-request/key_rotate" 2>/dev/null || true)
+if [ -z "${ROTATE_BODY}" ]; then
+    echo "FAIL: no captured key_rotate request body"
+    print_diagnostics
+    exit 1
+fi
+if echo "${ROTATE_BODY}" | grep -q '"new_public_key"'; then
+    echo "  PASS: key_rotate body contains 'new_public_key'"
+else
+    echo "FAIL: key_rotate body missing 'new_public_key' field (body: ${ROTATE_BODY})"
+    print_diagnostics
+    exit 1
+fi
+if echo "${ROTATE_BODY}" | grep -q '"node_id"'; then
+    echo "FAIL: key_rotate body unexpectedly contains 'node_id' (body: ${ROTATE_BODY})"
+    print_diagnostics
+    exit 1
+fi
+echo "  PASS: key_rotate body does not contain 'node_id'"
+
+# Wait for state_count to increase too (peer view refreshes via pull after
+# the rotation-triggered reconcile).
 KR_TIMEOUT=60
 KR_ELAPSED=0
 while [ "${KR_ELAPSED}" -lt "${KR_TIMEOUT}" ]; do
@@ -719,7 +774,7 @@ curl -sf -X POST -H "Content-Type: application/json" \
     -d '{"reconcile":true,"rotate_keys":false}' \
     "http://localhost:18080/test/configure-heartbeat" >/dev/null 2>&1 || true
 
-echo "=== Phase 7 PASSED: heartbeat-triggered reconcile ==="
+echo "=== Phase 7 PASSED: key rotation completed end to end ==="
 
 # ===================================================================
 # Phase 8: Deeper body validation
