@@ -196,6 +196,23 @@ type ReportEntry struct {
 	UpdatedAt   time.Time       `json:"updated_at"`
 }
 
+// NodeStateReportRequest is the control-plane wire format for the body of
+// PUT /v1/nodes/{id}/state/reports/{key}. Value is the opaque report payload;
+// WorkloadTag attributes the report to a workload and is absent when the report
+// is unattributed.
+type NodeStateReportRequest struct {
+	Value       string `json:"value"`
+	WorkloadTag string `json:"workload_tag,omitempty"`
+}
+
+// NodeStateReportResponse is the control-plane wire format for the 200 body of
+// PUT /v1/nodes/{id}/state/reports/{key} (and DELETE /v1/nodes/{id}/state/
+// reports/{key}). Key echoes the report key the operation addressed.
+type NodeStateReportResponse struct {
+	AcceptedAt time.Time `json:"accepted_at"`
+	Key        string    `json:"key"`
+}
+
 // ---------------------------------------------------------------------------
 // Execution  POST /v1/nodes/{node_id}/executions/{execution_id}
 // ---------------------------------------------------------------------------
@@ -288,9 +305,59 @@ type ExecutionCallbackResponse struct {
 //   POST /v1/nodes/{node_id}/audit
 // ---------------------------------------------------------------------------
 
-// MetricBatch is the top-level payload for POST /v1/nodes/{node_id}/metrics.
+// MetricSample is the control-plane wire format for a single metric in the
+// body of POST /v1/nodes/{node_id}/metrics. Group is one of the MetricGroup*
+// values; Labels is absent when the sample carries no dimensions.
+type MetricSample struct {
+	Group     string            `json:"group"`
+	Name      string            `json:"name"`
+	Value     float64           `json:"value"`
+	Labels    map[string]string `json:"labels,omitempty"`
+	Timestamp time.Time         `json:"timestamp"`
+}
+
+// Wire metric groups (closed set; out-of-set → 400 ingest_batch_malformed).
+const (
+	MetricGroupNodeResources = "node_resources"
+	MetricGroupTunnelHealth  = "tunnel_health"
+	MetricGroupPeerLatency   = "peer_latency"
+	MetricGroupAgentStats    = "agent_stats"
+)
+
+// LogLine is the control-plane wire format for a single log record in the body
+// of POST /v1/nodes/{node_id}/logs. Unit and Hostname are absent when unknown.
+type LogLine struct {
+	Severity  string    `json:"severity"`
+	Unit      string    `json:"unit,omitempty"`
+	Hostname  string    `json:"hostname,omitempty"`
+	Message   string    `json:"message"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// AuditEvent is the control-plane wire format for a single audit record in the
+// body of POST /v1/nodes/{node_id}/audit.
+type AuditEvent struct {
+	Source    string    `json:"source"`
+	Action    string    `json:"action"`
+	Outcome   string    `json:"outcome"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// IngestReceipt is the 202 body of the three ingest operations
+// (POST /v1/nodes/{node_id}/metrics|logs|audit). Records is the number of
+// records the control plane accepted from the batch.
+type IngestReceipt struct {
+	AcceptedAt time.Time `json:"accepted_at"`
+	Records    int       `json:"records"`
+}
+
+// MetricBatch is the internal pipeline and local-endpoint payload for a batch
+// of metric points. The control-plane leg of POST /v1/nodes/{node_id}/metrics
+// sends MetricSample instead.
 type MetricBatch = []MetricPoint
 
+// MetricPoint is the internal pipeline and local-endpoint format for a single
+// metric. The control-plane leg sends MetricSample instead.
 type MetricPoint struct {
 	Timestamp time.Time       `json:"timestamp"`
 	Group     string          `json:"group"`
@@ -298,9 +365,13 @@ type MetricPoint struct {
 	Data      json.RawMessage `json:"data"`
 }
 
-// LogBatch is the top-level payload for POST /v1/nodes/{node_id}/logs.
+// LogBatch is the internal pipeline and local-endpoint payload for a batch of
+// log entries. The control-plane leg of POST /v1/nodes/{node_id}/logs sends
+// LogLine instead.
 type LogBatch = []LogEntry
 
+// LogEntry is the internal pipeline and local-endpoint format for a single log
+// record. The control-plane leg sends LogLine instead.
 type LogEntry struct {
 	Timestamp time.Time `json:"timestamp"`
 	Source    string    `json:"source"`
@@ -310,9 +381,13 @@ type LogEntry struct {
 	Hostname  string    `json:"hostname"`
 }
 
-// AuditBatch is the top-level payload for POST /v1/nodes/{node_id}/audit.
+// AuditBatch is the internal pipeline and local-endpoint payload for a batch of
+// audit entries. The control-plane leg of POST /v1/nodes/{node_id}/audit sends
+// AuditEvent instead.
 type AuditBatch = []AuditEntry
 
+// AuditEntry is the internal pipeline and local-endpoint format for a single
+// audit record. The control-plane leg sends AuditEvent instead.
 type AuditEntry struct {
 	Timestamp time.Time       `json:"timestamp"`
 	Source    string          `json:"source"`

@@ -60,6 +60,47 @@ var (
 	ErrServer          = &APIError{StatusCode: 500, Message: "server error"}
 )
 
+// IsIngestNotProvisioned reports whether err is the control plane's refusal to
+// accept observability ingest because it is not provisioned for the node: a 501
+// carrying the observability_ingest_not_provisioned problem code.
+func IsIngestNotProvisioned(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) &&
+		apiErr.StatusCode == http.StatusNotImplemented &&
+		apiErr.Code == "observability_ingest_not_provisioned"
+}
+
+// IsIngestPermanentlyRefused reports whether err is a refusal of an
+// observability ingest batch that no retry can fix: a 400 carrying the
+// ingest_batch_malformed problem code, which is a verdict on the batch bytes
+// themselves. Re-sending them would draw the identical status forever, so a
+// PlatformReporter drops such a batch rather than returning it for re-buffering.
+//
+// The sibling refusals are deliberately not permanent. A 400
+// ingest_sent_at_invalid faults the X-Plexsphere-Sent-At header, which is
+// re-stamped from the wall clock on every attempt, so it clears once the node's
+// clock converges. A 415 faults the Content-Encoding, a transport property of
+// the deployment rather than of the batch, so it clears once the gateway that
+// rejects gzip is fixed. Both are returned to the caller for re-buffering. A 413
+// is classified by IsIngestTooLarge and answered by splitting the batch, and a
+// 501 not-provisioned refusal by IsIngestNotProvisioned.
+func IsIngestPermanentlyRefused(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.StatusCode == http.StatusBadRequest && apiErr.Code == "ingest_batch_malformed"
+}
+
+// IsIngestTooLarge reports whether err is the control plane's refusal of an
+// observability ingest batch for exceeding its size limit: a 413. The batch
+// content is acceptable, only its size is not, so the caller answers by
+// splitting the batch and re-sending the halves rather than dropping it.
+func IsIngestTooLarge(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusRequestEntityTooLarge
+}
+
 // maxErrorBody is the maximum number of bytes read from an error response body.
 const maxErrorBody = 4096
 
