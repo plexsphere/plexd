@@ -120,7 +120,7 @@ This ensures that even if the TLS connection is compromised (e.g. through a rogu
 
 ### Phase 4: Key Rotation
 
-Key rotation is triggered by the control plane - either on a schedule, by admin action, or in response to a compromised node. The `rotate_keys` SSE event is signed like all other events and verified before processing.
+Key rotation is triggered by the control plane - either on a schedule, by admin action, or in response to a compromised node. The `rotate_keys` signal arrives as a heartbeat flag or as a signed SSE event; the SSE event is verified before processing. The node stages a fresh keypair before submitting its public key, and the control plane replies with a rotation receipt (`rotation_id`, `kid`, `wrap_key_version`) rather than a peer list. The node swaps its private key only after that receipt, then picks up the new peers and PSKs on the next state pull. A repeated signal within five minutes of the last committed rotation is skipped, so a `rotate_keys` flag the control plane keeps set until it observes the new key cannot rekey the node on every heartbeat; a rotation whose key is already staged is always resubmitted.
 
 ```mermaid
 sequenceDiagram
@@ -129,14 +129,15 @@ sequenceDiagram
 
     CP->>C: SSE: rotate_keys (signed)
     C->>C: Verify signature
-    C->>C: Generate new Curve25519 keypair
-    C->>CP: POST /v1/keys/rotate<br/>{node_id, new_public_key}
+    C->>C: Generate and stage new Curve25519 keypair
+    C->>CP: POST /v1/keys/rotate<br/>{new_public_key}
     CP->>CP: Store new public key
     CP->>CP: Generate new PSKs
     CP->>CP: Push new key to all peers
-    CP-->>C: {updated_peers}
-    C->>C: Replace private key on WireGuard interface
-    C->>C: Update all peer PSKs
+    CP-->>C: {rotation_id, kid, wrap_key_version}
+    C->>C: Swap private key on disk and WireGuard interface
+    C->>CP: GET /v1/nodes/{node_id}/state (reconcile)
+    CP-->>C: Updated peers (new PSKs)
 ```
 
 When a node is force-removed from the control plane, all peers that had a tunnel to the compromised node receive a `peer_removed` event followed by fresh PSKs for their remaining peer pairs.

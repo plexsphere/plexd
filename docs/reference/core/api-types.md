@@ -425,18 +425,23 @@ arrive via the `peer_endpoint_changed` SSE event.
 
 ### `POST /v1/keys/rotate`
 
+The server identifies the rotating node from its NSK bearer credential, so the
+request carries no node id. The response is a receipt, not a peer list — the
+propagated peer and PSK changes arrive via the next state pull.
+
 **KeyRotateRequest**
 
-| Field        | Type   | JSON Tag         | Description            |
-|--------------|--------|------------------|------------------------|
-| `NodeID`     | `string`| `"node_id"`     | Node identifier        |
-| `NewPublicKey`| `string`| `"new_public_key"`| New WireGuard key   |
+| Field          | Type     | JSON Tag           | Description                                          |
+|----------------|----------|--------------------|-----------------------------------------------------|
+| `NewPublicKey` | `string` | `"new_public_key"` | New Curve25519 public key (44-char standard base64) |
 
 **KeyRotateResponse**
 
-| Field         | Type     | JSON Tag         | Description              |
-|---------------|----------|------------------|--------------------------|
-| `UpdatedPeers`| `[]Peer` | `"updated_peers"`| Peers with updated keys  |
+| Field            | Type     | JSON Tag             | Description                                |
+|------------------|----------|----------------------|--------------------------------------------|
+| `RotationID`     | `string` | `"rotation_id"`      | Identifier for this rotation               |
+| `KID`            | `string` | `"kid"`              | Key identifier for the rotated material    |
+| `WrapKeyVersion` | `int`    | `"wrap_key_version"` | Wrap-key version (monotonic, `>= 0`)       |
 
 ## Artifacts
 
