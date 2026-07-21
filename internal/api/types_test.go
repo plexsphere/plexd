@@ -493,6 +493,185 @@ func TestTypesLogEntry(t *testing.T) {
 	requireEqual(t, orig, got)
 }
 
+func TestTypesMetricSample(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := MetricSample{
+		Group:     MetricGroupPeerLatency,
+		Name:      "rtt_ms",
+		Value:     12.5,
+		Labels:    map[string]string{"peer_id": "n-002"},
+		Timestamp: now,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Exactly the five contract keys, nothing more.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 5 {
+		t.Errorf("expected exactly 5 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"group", "name", "value", "labels", "timestamp"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+
+	// labels is omitted when empty.
+	orig.Labels = nil
+	data2, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data2); strings.Contains(s, `"labels"`) {
+		t.Errorf("labels should be omitted when empty, got: %s", s)
+	}
+}
+
+func TestTypesLogLine(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := LogLine{
+		Severity:  "info",
+		Unit:      "plexd.service",
+		Hostname:  "node-1",
+		Message:   "started",
+		Timestamp: now,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Exactly the five contract keys, nothing more.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 5 {
+		t.Errorf("expected exactly 5 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"severity", "unit", "hostname", "message", "timestamp"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+
+	// unit and hostname are omitted when empty.
+	orig.Unit = ""
+	orig.Hostname = ""
+	data2, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data2); strings.Contains(s, `"unit"`) {
+		t.Errorf("unit should be omitted when empty, got: %s", s)
+	}
+	if s := string(data2); strings.Contains(s, `"hostname"`) {
+		t.Errorf("hostname should be omitted when empty, got: %s", s)
+	}
+}
+
+func TestTypesAuditEvent(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := AuditEvent{
+		Source:    "systemd",
+		Action:    "unit_start",
+		Outcome:   "success",
+		Timestamp: now,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Exactly the four contract keys, nothing more.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 4 {
+		t.Errorf("expected exactly 4 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"source", "action", "outcome", "timestamp"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestTypesIngestReceipt(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := IngestReceipt{
+		AcceptedAt: now,
+		Records:    17,
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Exactly the two contract keys, nothing more.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 2 {
+		t.Errorf("expected exactly 2 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"accepted_at", "records"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestTypesNodeStateReportRequest(t *testing.T) {
+	orig := NodeStateReportRequest{
+		Value:       "healthy",
+		WorkloadTag: "app/web",
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Exactly the two contract keys, nothing more.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 2 {
+		t.Errorf("expected exactly 2 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"value", "workload_tag"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+
+	// workload_tag is omitted when empty.
+	orig.WorkloadTag = ""
+	data2, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data2); strings.Contains(s, `"workload_tag"`) {
+		t.Errorf("workload_tag should be omitted when empty, got: %s", s)
+	}
+}
+
+func TestTypesNodeStateReportResponse(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := NodeStateReportResponse{
+		AcceptedAt: now,
+		Key:        "app/web",
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Exactly the two contract keys, nothing more.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 2 {
+		t.Errorf("expected exactly 2 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"accepted_at", "key"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
 func TestTypesActionRequest(t *testing.T) {
 	orig := ActionRequest{
 		ExecutionID: "exec-001",

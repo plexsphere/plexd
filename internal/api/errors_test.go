@@ -299,3 +299,53 @@ func TestErrorFromResponse_ProblemJSON_429RetryAfter(t *testing.T) {
 		t.Errorf("expected Message from detail, got %q", apiErr.Message)
 	}
 }
+
+func TestIsIngestPermanentlyRefused(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"400 malformed", &APIError{StatusCode: 400, Code: "ingest_batch_malformed"}, true},
+		{"wrapped 400 malformed", fmt.Errorf("post logs: %w", &APIError{StatusCode: 400, Code: "ingest_batch_malformed"}), true},
+		{"400 invalid sent-at clears once the clock converges", &APIError{StatusCode: 400, Code: "ingest_sent_at_invalid"}, false},
+		{"400 without a code is not a batch verdict", &APIError{StatusCode: 400}, false},
+		{"413 too large is split, not dropped", &APIError{StatusCode: 413}, false},
+		{"415 unsupported encoding is a transport fault", &APIError{StatusCode: 415, Code: "ingest_encoding_unsupported"}, false},
+		{"429 rate limited is retryable", &APIError{StatusCode: 429}, false},
+		{"500 server error is retryable", &APIError{StatusCode: 500}, false},
+		{"501 not provisioned handled elsewhere", &APIError{StatusCode: 501, Code: "observability_ingest_not_provisioned"}, false},
+		{"503 unavailable is retryable", &APIError{StatusCode: 503}, false},
+		{"non-API error is retryable", errors.New("dial tcp: timeout"), false},
+		{"nil is not a refusal", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsIngestPermanentlyRefused(tt.err); got != tt.want {
+				t.Errorf("IsIngestPermanentlyRefused(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsIngestTooLarge(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"413", &APIError{StatusCode: 413}, true},
+		{"wrapped 413", fmt.Errorf("post metrics: %w", &APIError{StatusCode: 413}), true},
+		{"400 malformed", &APIError{StatusCode: 400, Code: "ingest_batch_malformed"}, false},
+		{"415 unsupported encoding", &APIError{StatusCode: 415}, false},
+		{"non-API error", errors.New("dial tcp: timeout"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsIngestTooLarge(tt.err); got != tt.want {
+				t.Errorf("IsIngestTooLarge(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
