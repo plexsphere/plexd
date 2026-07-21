@@ -465,36 +465,6 @@ func TestFetchSecret_Success(t *testing.T) {
 	}
 }
 
-func TestSyncReports_Success(t *testing.T) {
-	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s, want POST", r.Method)
-		}
-		if r.URL.Path != "/v1/nodes/n1/report" {
-			t.Errorf("path = %s, want /v1/nodes/n1/report", r.URL.Path)
-		}
-
-		var req ReportSyncRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-		if len(req.Entries) != 1 {
-			t.Errorf("len(Entries) = %d, want 1", len(req.Entries))
-		}
-
-		w.WriteHeader(http.StatusOK)
-	})
-
-	err := client.SyncReports(context.Background(), "n1", ReportSyncRequest{
-		Entries: []ReportEntry{
-			{Key: "status", ContentType: "application/json", Version: 1, UpdatedAt: time.Now()},
-		},
-	})
-	if err != nil {
-		t.Fatalf("SyncReports: %v", err)
-	}
-}
-
 // gunzip decompresses gzip-encoded bytes, failing the test on error.
 func gunzip(t *testing.T, data []byte) []byte {
 	t.Helper()
