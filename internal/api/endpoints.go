@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -141,6 +142,75 @@ func (c *ControlPlane) ReportResult(ctx context.Context, nodeID, executionID str
 	return c.doRequest(ctx, http.MethodPost, path, req, nil)
 }
 
+// ExecutionCallback posts a single execution lifecycle callback and returns the
+// server's new invocation status, plus a presigned output upload URL when the
+// callback declares an over-ceiling output.
+// POST /v1/nodes/{node_id}/executions/{execution_id}
+func (c *ControlPlane) ExecutionCallback(ctx context.Context, nodeID, executionID string, req ExecutionCallbackRequest) (*ExecutionCallbackResponse, error) {
+	var resp ExecutionCallbackResponse
+	path := fmt.Sprintf("/v1/nodes/%s/executions/%s", url.PathEscape(nodeID), url.PathEscape(executionID))
+	if err := c.doRequest(ctx, http.MethodPost, path, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// UploadExecutionOutput PUTs an over-ceiling execution output to a presigned
+// URL. Presigned URLs carry their own authentication, so this request sends
+// neither the bearer token nor gzip encoding; it uploads the raw bytes with a
+// Content-Type of application/octet-stream.
+//
+// The upload URL comes from the control plane, and captured action output
+// routinely contains configuration and credentials, so the transport is pinned
+// twice over: the URL may not be less secure than the configured control-plane
+// base URL (an https control plane can never downgrade an upload to http), and
+// redirects are not followed — a 3xx is surfaced as an error rather than
+// re-sending the body to whatever host the redirect names.
+func (c *ControlPlane) UploadExecutionOutput(ctx context.Context, uploadURL string, output []byte) error {
+	if err := c.checkUploadScheme(uploadURL); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(output))
+	if err != nil {
+		return fmt.Errorf("api: create output upload request: %w", RedactURLError(err))
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	noRedirect := *c.httpClient
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	resp, err := noRedirect.Do(req)
+	if err != nil {
+		return fmt.Errorf("api: upload execution output: %w", RedactURLError(err))
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		defer resp.Body.Close()
+		return errorFromResponse(resp)
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// checkUploadScheme rejects an output upload URL whose scheme is weaker than the
+// control plane's own. The error never echoes the URL: it is a bearer credential.
+func (c *ControlPlane) checkUploadScheme(uploadURL string) error {
+	parsed, err := url.Parse(uploadURL)
+	if err != nil {
+		return fmt.Errorf("api: parse output upload url: %w", RedactURLError(err))
+	}
+	if parsed.Scheme == "https" {
+		return nil
+	}
+	if base, err := url.Parse(c.baseURL); err == nil && base.Scheme == parsed.Scheme {
+		return nil
+	}
+	return fmt.Errorf("api: output upload url scheme %q is weaker than the control plane's", parsed.Scheme)
+}
+
 // ReportMetrics sends a batch of metrics to the control plane.
 // POST /v1/nodes/{node_id}/metrics
 func (c *ControlPlane) ReportMetrics(ctx context.Context, nodeID string, batch MetricBatch) error {
@@ -185,6 +255,14 @@ func (c *ControlPlane) TunnelReady(ctx context.Context, nodeID, sessionID string
 // POST /v1/nodes/{node_id}/tunnels/{session_id}/closed
 func (c *ControlPlane) TunnelClosed(ctx context.Context, nodeID, sessionID string, req TunnelClosedRequest) error {
 	path := fmt.Sprintf("/v1/nodes/%s/tunnels/%s/closed", url.PathEscape(nodeID), url.PathEscape(sessionID))
+	return c.doRequest(ctx, http.MethodPost, path, req, nil)
+}
+
+// ReportSessionActivity posts a one-of session activity record (ssh, k8s, or
+// tcp). Success is 204 No Content.
+// POST /v1/nodes/{node_id}/sessions/{session_id}
+func (c *ControlPlane) ReportSessionActivity(ctx context.Context, nodeID, sessionID string, req SessionActivityRequest) error {
+	path := fmt.Sprintf("/v1/nodes/%s/sessions/%s", url.PathEscape(nodeID), url.PathEscape(sessionID))
 	return c.doRequest(ctx, http.MethodPost, path, req, nil)
 }
 

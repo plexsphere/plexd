@@ -235,6 +235,70 @@ type TriggeredBy struct {
 	Email     string `json:"email"`
 }
 
+// Execution callback statuses a node reports on the v1 execution callback
+// (POST /v1/nodes/{node_id}/executions/{execution_id}).
+const (
+	// ExecutionStatusAck acknowledges receipt of the action request.
+	ExecutionStatusAck = "ack"
+	// ExecutionStatusStarted reports that the action has begun running.
+	ExecutionStatusStarted = "started"
+	// ExecutionStatusSucceeded is the terminal callback for a successful run.
+	ExecutionStatusSucceeded = "succeeded"
+	// ExecutionStatusFailed is the terminal callback for a failed run.
+	ExecutionStatusFailed = "failed"
+	// ExecutionStatusCancelled is the terminal callback for a cancelled run.
+	ExecutionStatusCancelled = "cancelled"
+)
+
+// RFC 9457 problem codes with which the control plane refuses an execution
+// callback. A refusal carrying one of these is deliberate and permanent: the
+// node must stop driving the execution instead of retrying or double-reporting.
+const (
+	// CodeNSKNodeMismatch (403) means the callback's node id does not match the
+	// node identified by the NSK bearer credential.
+	CodeNSKNodeMismatch = "nsk_node_mismatch"
+	// CodeInvalidStateTransition (409) means the callback would advance the
+	// invocation along an illegal edge of the execution state machine.
+	CodeInvalidStateTransition = "invalid_state_transition"
+	// CodeExecutionAlreadyTerminal (409) means the invocation has already
+	// settled and accepts no further callbacks.
+	CodeExecutionAlreadyTerminal = "execution_already_terminal"
+)
+
+// ExecutionCallbackRequest is the single callback a node posts to
+// POST /v1/nodes/{node_id}/executions/{execution_id} to advance an execution
+// through its lifecycle. Status is one of the ExecutionStatus* values. ExitCode
+// is a pointer so a terminal callback can report an explicit zero. Error is set
+// on failed terminals. DeclaredOutputBytes is the byte length of the captured
+// output; a declaration over the 16 KiB inline ceiling drives the presign mint.
+type ExecutionCallbackRequest struct {
+	Status              string           `json:"status"`
+	ExitCode            *int             `json:"exit_code,omitempty"`
+	Error               string           `json:"error,omitempty"`
+	DeclaredOutputBytes int64            `json:"declared_output_bytes,omitempty"`
+	Output              *ExecutionOutput `json:"output,omitempty"`
+}
+
+// ExecutionOutput carries an execution's captured output on a terminal
+// callback. Inline is the base64-encoded output body and is used only when it
+// is at most 16 KiB. ObjectKey and SHA256 describe an already-uploaded
+// over-ceiling output: ObjectKey is the object-store key and SHA256 is the
+// lowercase-hex SHA-256 of the uploaded bytes.
+type ExecutionOutput struct {
+	Inline    string `json:"inline,omitempty"`
+	ObjectKey string `json:"object_key,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+}
+
+// ExecutionCallbackResponse is the 200 response to an execution callback. Status
+// is the new invocation status. OutputUploadURL is a presigned PUT URL present
+// only on the first callback that declares an over-ceiling output; the node
+// derives the object key from the URL path and uploads the bytes there.
+type ExecutionCallbackResponse struct {
+	Status          string `json:"status"`
+	OutputUploadURL string `json:"output_upload_url,omitempty"`
+}
+
 // ---------------------------------------------------------------------------
 // Observability
 //   POST /v1/nodes/{node_id}/metrics
@@ -373,6 +437,71 @@ type TunnelClosedRequest struct {
 	Duration  string    `json:"duration"`
 	Timestamp time.Time `json:"timestamp"`
 }
+
+// SessionActivityRequest is the one-of activity record a node posts to
+// POST /v1/nodes/{node_id}/sessions/{session_id}. Exactly one member is set,
+// selecting the session kind: SSH, K8s, or TCP.
+type SessionActivityRequest struct {
+	SSH *SSHActivity `json:"ssh,omitempty"`
+	K8s *K8sActivity `json:"k8s,omitempty"`
+	TCP *TCPActivity `json:"tcp,omitempty"`
+}
+
+// SSHActivity records a completed SSH session command. Command is the executed
+// command line and is capped at 1 KiB. StartedAt and CompletedAt are RFC 3339
+// timestamps.
+type SSHActivity struct {
+	Command     string     `json:"command"`
+	ExitCode    *int       `json:"exit_code,omitempty"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+}
+
+// K8sActivity records a single Kubernetes API action proxied through the
+// session. Verb is the API verb; the remaining fields describe the target
+// object and the outcome.
+type K8sActivity struct {
+	Verb         string `json:"verb"`
+	ResourceKind string `json:"resource_kind,omitempty"`
+	Namespace    string `json:"namespace,omitempty"`
+	Name         string `json:"name,omitempty"`
+	StatusCode   int    `json:"status_code,omitempty"`
+	DurationMS   int64  `json:"duration_ms,omitempty"`
+}
+
+// TCPActivity records a TCP session lifecycle event. Phase is one of the
+// TCPPhase* values. BytesIn (operator to target) and BytesOut (target to
+// operator) are pointers so a session_ended row carries explicit zeros while a
+// session_started row omits the byte counters. TerminatedBy, when set, is one
+// of the TerminatedBy* values.
+type TCPActivity struct {
+	Phase        string `json:"phase"`
+	TargetHost   string `json:"target_host,omitempty"`
+	TargetPort   int    `json:"target_port,omitempty"`
+	BytesIn      *int64 `json:"bytes_in,omitempty"`
+	BytesOut     *int64 `json:"bytes_out,omitempty"`
+	TerminatedBy string `json:"terminated_by,omitempty"`
+}
+
+// TCP session lifecycle phases reported on a TCPActivity.
+const (
+	// TCPPhaseSessionStarted marks the opening of a TCP session.
+	TCPPhaseSessionStarted = "session_started"
+	// TCPPhaseSessionEnded marks the close of a TCP session.
+	TCPPhaseSessionEnded = "session_ended"
+)
+
+// Reasons a TCP session was terminated, reported on a session_ended TCPActivity.
+const (
+	// TerminatedByTTLExpired means the session reached its time-to-live.
+	TerminatedByTTLExpired = "ttl_expired"
+	// TerminatedByIdleTimeout means the session was idle past its timeout.
+	TerminatedByIdleTimeout = "idle_timeout"
+	// TerminatedByPlexdClose means plexd closed the session locally.
+	TerminatedByPlexdClose = "plexd_close"
+	// TerminatedByOperatorRevoke means the operator's access was revoked.
+	TerminatedByOperatorRevoke = "operator_revoke"
+)
 
 // ---------------------------------------------------------------------------
 // Integrity  POST /v1/nodes/{node_id}/integrity/violations
