@@ -94,9 +94,9 @@ const (
 	keyRotateBody          = `{"new_public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="}`
 	capabilitiesBody       = `{"builtin_actions":[],"hooks":[]}`
 	reportBody             = `{"value":"cpu ok","workload_tag":"web"}`
-	metricsBatchBody       = `[{"timestamp":"2025-01-01T00:00:00Z","group":"system","data":{}}]`
-	logsBatchBody          = `[{"timestamp":"2025-01-01T00:00:00Z","source":"plexd","unit":"main","message":"started","severity":"info","hostname":"node-1"}]`
-	auditBatchBody         = `[{"timestamp":"2025-01-01T00:00:00Z","source":"auditd","event_type":"execve","subject":{},"object":{},"action":"execve","result":"success","hostname":"node-1","raw":""}]`
+	metricsBatchBody       = `[{"group":"node_resources","name":"cpu.load","value":0.5,"timestamp":"2025-01-01T00:00:00Z"}]`
+	logsBatchBody          = `{"severity":"info","unit":"main","message":"started","timestamp":"2025-01-01T00:00:00Z"}`
+	auditBatchBody         = `{"source":"auditd","action":"execve","outcome":"success","timestamp":"2025-01-01T00:00:00Z"}`
 	integrityViolationBody = `{"type":"binary","path":"/usr/local/bin/plexd","expected_checksum":"abc","actual_checksum":"def","detail":"mismatch","timestamp":"2025-01-01T00:00:00Z"}`
 )
 
@@ -966,11 +966,11 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	uploadURL := declareExecUpload(t, ts.URL, "exec-mixed", 4)
 	putResp := doRequest(t, http.MethodPut, uploadURL, "abcd")
 	putResp.Body.Close()
-	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/metrics", metricsBatchBody)
+	resp = doIngest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/metrics", "application/json", metricsBatchBody, nil)
 	resp.Body.Close()
-	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/logs", logsBatchBody)
+	resp = doIngest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/logs", "application/x-ndjson", logsBatchBody, nil)
 	resp.Body.Close()
-	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/audit", auditBatchBody)
+	resp = doIngest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/audit", "application/x-ndjson", auditBatchBody, nil)
 	resp.Body.Close()
 	resp, err = http.Get(ts.URL + "/v1/artifacts/plexd/1.0.0/linux/amd64")
 	if err != nil {
@@ -1108,6 +1108,9 @@ func TestConcurrentCounters(t *testing.T) {
 				if e.body != "" {
 					req.Header.Set("Content-Type", "application/json")
 				}
+				// Harmless on non-ingest routes; the metrics/logs/audit ingest
+				// gate rejects a missing X-Plexsphere-Sent-At with 400.
+				req.Header.Set("X-Plexsphere-Sent-At", time.Now().UTC().Format(time.RFC3339))
 				resp, err := http.DefaultClient.Do(req)
 				if err != nil {
 					return
@@ -1977,31 +1980,179 @@ func TestReport_WrongMethod_Returns405(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Metrics endpoint
+// Telemetry ingest endpoints (metrics, logs, audit)
 // ---------------------------------------------------------------------------
 
-func TestMetrics_Returns204AndCounter(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/metrics", metricsBatchBody)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+// doIngest sends body to a platform ingest endpoint with the given content type
+// and a fresh RFC 3339 X-Plexsphere-Sent-At header (so the default gates pass).
+// A header override with an empty value deletes that header, letting a test drop
+// the sent-at or set an unsupported Content-Encoding.
+func doIngest(t *testing.T, method, url, contentType, body string, headers map[string]string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("create %s request: %v", method, err)
 	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-Plexsphere-Sent-At", time.Now().UTC().Format(time.RFC3339))
+	for k, v := range headers {
+		if v == "" {
+			req.Header.Del(k)
+		} else {
+			req.Header.Set(k, v)
+		}
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	return resp
+}
 
-	a := getAssertions(t, ts.URL)
-	if a.MetricsCount != 1 {
-		t.Errorf("metrics_count = %d, want 1", a.MetricsCount)
+// assertProblem asserts resp carries the given status and RFC 9457 problem code.
+func assertProblem(t *testing.T, resp *http.Response, wantStatus int, wantCode string) {
+	t.Helper()
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, wantStatus)
+	}
+	if code := problemCode(t, resp); code != wantCode {
+		t.Errorf("code = %q, want %q", code, wantCode)
 	}
 }
 
-func TestMetrics_InvalidBody_Returns400(t *testing.T) {
+// assertRecords asserts resp is a 202 ingest receipt whose records field equals
+// want and whose accepted_at is fresh.
+func assertRecords(t *testing.T, resp *http.Response, want int) {
+	t.Helper()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
+	}
+	var rcpt api.IngestReceipt
+	if err := json.NewDecoder(resp.Body).Decode(&rcpt); err != nil {
+		t.Fatalf("decode receipt: %v", err)
+	}
+	if rcpt.Records != want {
+		t.Errorf("records = %d, want %d", rcpt.Records, want)
+	}
+	if rcpt.AcceptedAt.IsZero() {
+		t.Error("accepted_at is zero, want a fresh timestamp")
+	}
+}
+
+// ingestSurface describes one of the three platform ingest endpoints for the
+// gate tests shared across metrics, logs, and audit.
+type ingestSurface struct {
+	name        string
+	path        string
+	contentType string
+	validBody   string
+	counter     func(mockapi.AssertionCounters) int64
+}
+
+func ingestSurfaces() []ingestSurface {
+	return []ingestSurface{
+		{"metrics", "/v1/nodes/node-1/metrics", "application/json", metricsBatchBody, func(a mockapi.AssertionCounters) int64 { return a.MetricsCount }},
+		{"logs", "/v1/nodes/node-1/logs", "application/x-ndjson", logsBatchBody, func(a mockapi.AssertionCounters) int64 { return a.LogsCount }},
+		{"audit", "/v1/nodes/node-1/audit", "application/x-ndjson", auditBatchBody, func(a mockapi.AssertionCounters) int64 { return a.AuditCount }},
+	}
+}
+
+func TestIngest_ValidBatch_Returns202(t *testing.T) {
+	for _, sf := range ingestSurfaces() {
+		t.Run(sf.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doIngest(t, http.MethodPost, ts.URL+sf.path, sf.contentType, sf.validBody, nil)
+			defer resp.Body.Close()
+			assertRecords(t, resp, 1)
+
+			if got := sf.counter(getAssertions(t, ts.URL)); got != 1 {
+				t.Errorf("%s counter = %d, want 1", sf.name, got)
+			}
+		})
+	}
+}
+
+// TestIngest_RecordsCountsElements proves records equals the array length for
+// metrics and the non-blank line count for logs and audit (blank lines skipped).
+func TestIngest_RecordsCountsElements(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/metrics", "not-json")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	metrics := `[{"group":"node_resources","name":"cpu.load","value":0.5,"timestamp":"2025-01-01T00:00:00Z"},` +
+		`{"group":"peer_latency","name":"rtt.ms","value":12,"timestamp":"2025-01-01T00:00:01Z"}]`
+	resp := doIngest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/metrics", "application/json", metrics, nil)
+	assertRecords(t, resp, 2)
+	resp.Body.Close()
+
+	logs := `{"severity":"info","message":"a","timestamp":"2025-01-01T00:00:00Z"}` + "\n\n" +
+		`{"severity":"err","message":"b","timestamp":"2025-01-01T00:00:01Z"}`
+	resp = doIngest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/logs", "application/x-ndjson", logs, nil)
+	assertRecords(t, resp, 2)
+	resp.Body.Close()
+
+	audit := `{"source":"auditd","action":"execve","outcome":"success","timestamp":"2025-01-01T00:00:00Z"}` + "\n" +
+		`{"source":"k8s","action":"create","outcome":"allow","timestamp":"2025-01-01T00:00:01Z"}` + "\n" +
+		`{"source":"plexd","action":"start","outcome":"success","timestamp":"2025-01-01T00:00:02Z"}`
+	resp = doIngest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/audit", "application/x-ndjson", audit, nil)
+	assertRecords(t, resp, 3)
+	resp.Body.Close()
+}
+
+// TestIngest_HeaderGates exercises the two header gates on all three surfaces:
+// an unsupported Content-Encoding is 415 ingest_encoding_unsupported, and a
+// missing or unparseable X-Plexsphere-Sent-At is 400 ingest_sent_at_invalid.
+func TestIngest_HeaderGates(t *testing.T) {
+	gates := []struct {
+		name       string
+		headers    map[string]string
+		wantStatus int
+		wantCode   string
+	}{
+		{"unsupported_encoding", map[string]string{"Content-Encoding": "br"}, http.StatusUnsupportedMediaType, "ingest_encoding_unsupported"},
+		{"missing_sent_at", map[string]string{"X-Plexsphere-Sent-At": ""}, http.StatusBadRequest, "ingest_sent_at_invalid"},
+		{"unparseable_sent_at", map[string]string{"X-Plexsphere-Sent-At": "not-a-timestamp"}, http.StatusBadRequest, "ingest_sent_at_invalid"},
+	}
+	for _, sf := range ingestSurfaces() {
+		for _, g := range gates {
+			t.Run(sf.name+"/"+g.name, func(t *testing.T) {
+				_, ts := newTestServer(t)
+
+				resp := doIngest(t, http.MethodPost, ts.URL+sf.path, sf.contentType, sf.validBody, g.headers)
+				defer resp.Body.Close()
+				assertProblem(t, resp, g.wantStatus, g.wantCode)
+
+				if got := sf.counter(getAssertions(t, ts.URL)); got != 0 {
+					t.Errorf("%s counter = %d, want 0", sf.name, got)
+				}
+			})
+		}
+	}
+}
+
+func TestMetricsIngest_BatchMalformed(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"empty_array", `[]`},
+		{"non_array", `{"group":"node_resources"}`},
+		{"unknown_field", `[{"group":"node_resources","name":"cpu","value":1,"timestamp":"2025-01-01T00:00:00Z","surprise":true}]`},
+		{"bad_group", `[{"group":"system","name":"cpu","value":1,"timestamp":"2025-01-01T00:00:00Z"}]`},
+		{"empty_name", `[{"group":"node_resources","name":"","value":1,"timestamp":"2025-01-01T00:00:00Z"}]`},
+		{"zero_timestamp", `[{"group":"node_resources","name":"cpu","value":1,"timestamp":"0001-01-01T00:00:00Z"}]`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doIngest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/metrics", "application/json", tt.body, nil)
+			defer resp.Body.Close()
+			assertProblem(t, resp, http.StatusBadRequest, "ingest_batch_malformed")
+
+			if a := getAssertions(t, ts.URL); a.MetricsCount != 0 {
+				t.Errorf("metrics_count = %d, want 0", a.MetricsCount)
+			}
+		})
 	}
 }
 
@@ -2022,28 +2173,31 @@ func TestMetrics_WrongMethod_Returns405(t *testing.T) {
 // Logs endpoint
 // ---------------------------------------------------------------------------
 
-func TestLogs_Returns204AndCounter(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/logs", logsBatchBody)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+func TestLogsIngest_BatchMalformed(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"empty", ``},
+		{"blank_only", "\n   \n"},
+		{"undecodable_line", `{not json}`},
+		{"unknown_field", `{"severity":"info","message":"x","timestamp":"2025-01-01T00:00:00Z","surprise":1}`},
+		{"bad_severity", `{"severity":"loud","message":"x","timestamp":"2025-01-01T00:00:00Z"}`},
+		{"empty_message", `{"severity":"info","message":"","timestamp":"2025-01-01T00:00:00Z"}`},
+		{"zero_timestamp", `{"severity":"info","message":"x","timestamp":"0001-01-01T00:00:00Z"}`},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
 
-	a := getAssertions(t, ts.URL)
-	if a.LogsCount != 1 {
-		t.Errorf("logs_count = %d, want 1", a.LogsCount)
-	}
-}
+			resp := doIngest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/logs", "application/x-ndjson", tt.body, nil)
+			defer resp.Body.Close()
+			assertProblem(t, resp, http.StatusBadRequest, "ingest_batch_malformed")
 
-func TestLogs_InvalidBody_Returns400(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/logs", "not-json")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			if a := getAssertions(t, ts.URL); a.LogsCount != 0 {
+				t.Errorf("logs_count = %d, want 0", a.LogsCount)
+			}
+		})
 	}
 }
 
@@ -2064,28 +2218,32 @@ func TestLogs_WrongMethod_Returns405(t *testing.T) {
 // Audit endpoint
 // ---------------------------------------------------------------------------
 
-func TestAudit_Returns204AndCounter(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/audit", auditBatchBody)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+func TestAuditIngest_BatchMalformed(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"empty", ``},
+		{"blank_only", "\n   \n"},
+		{"undecodable_line", `{not json}`},
+		{"unknown_field", `{"source":"auditd","action":"x","outcome":"ok","timestamp":"2025-01-01T00:00:00Z","surprise":1}`},
+		{"bad_source", `{"source":"syslog","action":"x","outcome":"ok","timestamp":"2025-01-01T00:00:00Z"}`},
+		{"empty_action", `{"source":"auditd","action":"","outcome":"ok","timestamp":"2025-01-01T00:00:00Z"}`},
+		{"empty_outcome", `{"source":"auditd","action":"x","outcome":"","timestamp":"2025-01-01T00:00:00Z"}`},
+		{"zero_timestamp", `{"source":"auditd","action":"x","outcome":"ok","timestamp":"0001-01-01T00:00:00Z"}`},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
 
-	a := getAssertions(t, ts.URL)
-	if a.AuditCount != 1 {
-		t.Errorf("audit_count = %d, want 1", a.AuditCount)
-	}
-}
+			resp := doIngest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/audit", "application/x-ndjson", tt.body, nil)
+			defer resp.Body.Close()
+			assertProblem(t, resp, http.StatusBadRequest, "ingest_batch_malformed")
 
-func TestAudit_InvalidBody_Returns400(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/audit", "not-json")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			if a := getAssertions(t, ts.URL); a.AuditCount != 0 {
+				t.Errorf("audit_count = %d, want 0", a.AuditCount)
+			}
+		})
 	}
 }
 

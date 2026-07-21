@@ -1283,34 +1283,183 @@ func (s *Server) handleExecOutputUpload(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleMetrics handles POST /v1/nodes/{id}/metrics.
+// ingestEncodingSupported reports whether enc is a Content-Encoding the platform
+// ingest endpoints accept: empty, identity, or gzip.
+func ingestEncodingSupported(enc string) bool {
+	switch strings.ToLower(strings.TrimSpace(enc)) {
+	case "", "identity", "gzip":
+		return true
+	default:
+		return false
+	}
+}
+
+// checkIngestGates enforces the two header gates shared by the metrics, logs,
+// and audit ingest endpoints, in order: a supported Content-Encoding (else 415
+// ingest_encoding_unsupported) and a present, RFC 3339 X-Plexsphere-Sent-At
+// (else 400 ingest_sent_at_invalid). It writes the problem response and returns
+// false on the first failing gate.
+func (s *Server) checkIngestGates(w http.ResponseWriter, r *http.Request) bool {
+	if !ingestEncodingSupported(r.Header.Get("Content-Encoding")) {
+		writeProblem(w, r, http.StatusUnsupportedMediaType, "ingest_encoding_unsupported", "Content-Encoding is not supported")
+		return false
+	}
+	sentAt := r.Header.Get("X-Plexsphere-Sent-At")
+	if sentAt == "" {
+		writeProblem(w, r, http.StatusBadRequest, "ingest_sent_at_invalid", "X-Plexsphere-Sent-At is required")
+		return false
+	}
+	if _, err := time.Parse(time.RFC3339, sentAt); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "ingest_sent_at_invalid", "X-Plexsphere-Sent-At is not an RFC 3339 timestamp")
+		return false
+	}
+	return true
+}
+
+// wireMetricGroup reports whether g is inside the closed metric-group enum.
+func wireMetricGroup(g string) bool {
+	switch g {
+	case api.MetricGroupNodeResources, api.MetricGroupTunnelHealth,
+		api.MetricGroupPeerLatency, api.MetricGroupAgentStats:
+		return true
+	default:
+		return false
+	}
+}
+
+// validLogSeverity reports whether sev is inside the closed log-severity enum.
+func validLogSeverity(sev string) bool {
+	switch sev {
+	case "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug":
+		return true
+	default:
+		return false
+	}
+}
+
+// validAuditSource reports whether src is inside the closed audit-source enum.
+func validAuditSource(src string) bool {
+	switch src {
+	case "auditd", "k8s", "plexd":
+		return true
+	default:
+		return false
+	}
+}
+
+// handleMetrics handles POST /v1/nodes/{id}/metrics, the v1 metrics ingest. It
+// enforces the shared ingest header gates, strict-decodes a non-empty JSON array
+// of api.MetricSample, and validates each record's group, name, and timestamp.
+// Success is a 202 ingest receipt whose records field is the batch length.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	var req api.MetricBatch
-	if !s.decodeBody(w, r, "metrics", &req) {
+	if !s.checkIngestGates(w, r) {
 		return
 	}
+	data, err := s.captureBody("metrics", r)
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "ingest_batch_malformed", "invalid request body")
+		return
+	}
+
+	var batch []api.MetricSample
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&batch); err != nil || len(batch) == 0 {
+		writeProblem(w, r, http.StatusBadRequest, "ingest_batch_malformed", "metrics batch is malformed or empty")
+		return
+	}
+	for _, m := range batch {
+		if !wireMetricGroup(m.Group) || m.Name == "" || m.Timestamp.IsZero() {
+			writeProblem(w, r, http.StatusBadRequest, "ingest_batch_malformed", "metrics batch has an invalid record")
+			return
+		}
+	}
+
 	s.metricsCount.Add(1)
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusAccepted, api.IngestReceipt{AcceptedAt: time.Now().UTC(), Records: len(batch)})
 }
 
-// handleLogs handles POST /v1/nodes/{id}/logs.
+// handleLogs handles POST /v1/nodes/{id}/logs, the v1 logs ingest. It enforces
+// the shared ingest header gates, splits the NDJSON body on newlines skipping
+// blank lines, strict-decodes each line into api.LogLine, and validates the
+// severity, message, and timestamp. A batch with no non-blank lines is
+// malformed. Success is a 202 receipt whose records field is the line count.
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
-	var req api.LogBatch
-	if !s.decodeBody(w, r, "logs", &req) {
+	if !s.checkIngestGates(w, r) {
 		return
 	}
+	data, err := s.captureBody("logs", r)
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "ingest_batch_malformed", "invalid request body")
+		return
+	}
+
+	count := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec api.LogLine
+		dec := json.NewDecoder(strings.NewReader(line))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&rec); err != nil {
+			writeProblem(w, r, http.StatusBadRequest, "ingest_batch_malformed", "logs batch has an undecodable line")
+			return
+		}
+		if !validLogSeverity(rec.Severity) || rec.Message == "" || rec.Timestamp.IsZero() {
+			writeProblem(w, r, http.StatusBadRequest, "ingest_batch_malformed", "logs batch has an invalid record")
+			return
+		}
+		count++
+	}
+	if count == 0 {
+		writeProblem(w, r, http.StatusBadRequest, "ingest_batch_malformed", "logs batch is empty")
+		return
+	}
+
 	s.logsCount.Add(1)
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusAccepted, api.IngestReceipt{AcceptedAt: time.Now().UTC(), Records: count})
 }
 
-// handleAudit handles POST /v1/nodes/{id}/audit.
+// handleAudit handles POST /v1/nodes/{id}/audit, the v1 audit ingest. It mirrors
+// handleLogs: shared header gates, NDJSON split skipping blank lines, strict
+// decode into api.AuditEvent, and validation of the source, action, outcome, and
+// timestamp. Success is a 202 receipt whose records field is the line count.
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
-	var req api.AuditBatch
-	if !s.decodeBody(w, r, "audit", &req) {
+	if !s.checkIngestGates(w, r) {
 		return
 	}
+	data, err := s.captureBody("audit", r)
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "ingest_batch_malformed", "invalid request body")
+		return
+	}
+
+	count := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec api.AuditEvent
+		dec := json.NewDecoder(strings.NewReader(line))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&rec); err != nil {
+			writeProblem(w, r, http.StatusBadRequest, "ingest_batch_malformed", "audit batch has an undecodable line")
+			return
+		}
+		if !validAuditSource(rec.Source) || rec.Action == "" || rec.Outcome == "" || rec.Timestamp.IsZero() {
+			writeProblem(w, r, http.StatusBadRequest, "ingest_batch_malformed", "audit batch has an invalid record")
+			return
+		}
+		count++
+	}
+	if count == 0 {
+		writeProblem(w, r, http.StatusBadRequest, "ingest_batch_malformed", "audit batch is empty")
+		return
+	}
+
 	s.auditCount.Add(1)
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusAccepted, api.IngestReceipt{AcceptedAt: time.Now().UTC(), Records: count})
 }
 
 // handleArtifact handles GET /v1/artifacts/plexd/{version}/{os}/{arch}.
