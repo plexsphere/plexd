@@ -20,8 +20,8 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 8 | `GET` | `/v1/nodes/{node_id}/state` | State snapshot pull (reconciliation) |
 | 9 | `GET` | `/v1/nodes/{node_id}/secrets/{key}` | Secret fetch (NSK-encrypted) |
 | 10 | `POST` | `/v1/nodes/{node_id}/report` | Report entry sync |
-| 11 | `POST` | `/v1/nodes/{node_id}/executions/{execution_id}/ack` | Action ACK/NACK |
-| 12 | `POST` | `/v1/nodes/{node_id}/executions/{execution_id}/result` | Action result |
+| 11 | `POST` | `/v1/nodes/{node_id}/executions/{execution_id}` | Action execution callback |
+| 12 | `POST` | `/v1/nodes/{node_id}/sessions/{session_id}` | Session activity record |
 | 13 | `POST` | `/v1/nodes/{node_id}/metrics` | Metrics batch |
 | 14 | `POST` | `/v1/nodes/{node_id}/logs` | Log batch |
 | 15 | `POST` | `/v1/nodes/{node_id}/audit` | Audit batch |
@@ -385,47 +385,163 @@ Batched report sync with debounce (default 5s).
 
 ## Action Execution Callbacks
 
-### POST /v1/nodes/{node_id}/executions/{execution_id}/ack
+### POST /v1/nodes/{node_id}/executions/{execution_id}
 
-Sent immediately after receiving an `action_request`.
+A single callback advances an execution through a closed state machine, posted
+once per transition:
 
-**Request body:**
+```text
+ack ──▶ started ──▶ succeeded
+    │           ├──▶ failed
+    │           └──▶ cancelled
+    ├──▶ failed
+    └──▶ cancelled
+```
+
+- `ack` — sent immediately after receiving the `action_request`; it is the first
+  callback and opens the invocation.
+- `started` — sent when the action begins running.
+- `succeeded` | `failed` | `cancelled` — the terminal callback.
+
+A rejected action (unknown action, duplicate, max-concurrent, shutting down, or
+actions disabled) posts `ack` and then `failed` with the reason in `error`,
+skipping `started`. When the ack or started callback is refused with `403` or
+`409`, plexd stops without running or terminal-reporting the execution; other
+callback errors are logged and tolerated.
+
+**Request body** (`ack`):
+
+```json
+{ "status": "ack" }
+```
+
+**Response** (`200 OK`) carries the new invocation status:
+
+```json
+{ "status": "ack" }
+```
+
+**Request body** (terminal `succeeded` with inline output). Output at most 16 KiB
+travels base64-encoded in `output.inline`; `exit_code` is an explicit number:
 
 ```json
 {
-  "execution_id": "exec_a1b2c3d4",
-  "status": "accepted",
-  "reason": ""
+  "status": "succeeded",
+  "exit_code": 0,
+  "output": { "inline": "aGVsbG8gd29ybGQK" }
 }
 ```
 
-`status` is `accepted` or `rejected`. When rejected, `reason` provides the cause.
+**Request body** (terminal `failed` for a rejected action):
 
-### POST /v1/nodes/{node_id}/executions/{execution_id}/result
+```json
+{ "status": "failed", "error": "unknown_action" }
+```
 
-Sent after action execution completes. Retried with exponential backoff on failure.
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
 
-**Request body:**
+| Status | Problem `code` | Meaning | plexd behavior |
+|---|---|---|---|
+| `200 OK` | — | Callback accepted; body carries the new status | — |
+| `400 Bad Request` | `malformed_execution_callback` | Unreadable/strict-decode failure, status outside the reportable set, non-base64 inline output, or an `object_key`/`sha256` that does not match a received upload | Logged, tolerated |
+| `403 Forbidden` | `nsk_node_mismatch` | Callback targets a node other than the caller's identity | Abort |
+| `409 Conflict` | `invalid_state_transition` | Illegal lifecycle advance | Abort |
+| `409 Conflict` | `execution_already_terminal` | Callback on an already-settled invocation | Abort |
+| `413 Payload Too Large` | `inline_output_too_large` | `output.inline` decodes to more than 16 KiB | Logged, tolerated |
+
+#### Over-ceiling output: declare, upload, reference
+
+Output larger than 16 KiB does not travel inline. Instead the node re-posts
+`started` declaring the byte count, uploads the raw bytes to a presigned URL, and
+references the object on the terminal callback.
+
+**Declaring callback** — re-post `started` with `declared_output_bytes`:
+
+```json
+{ "status": "started", "declared_output_bytes": 524288 }
+```
+
+**Response** (`200 OK`) carries a one-time presigned PUT URL. The node derives the
+object key from the URL path:
 
 ```json
 {
-  "execution_id": "exec_a1b2c3d4",
-  "status": "success",
+  "status": "started",
+  "output_upload_url": "https://blob.plexsphere.com/exec-output/exec_a1b2c3d4?token=b1c2d3e4"
+}
+```
+
+The node then `PUT`s the raw bytes to `output_upload_url` with
+`Content-Type: application/octet-stream` and **no** bearer token — the presigned
+URL carries its own authentication. That upload responds `404` for an unknown or
+expired token, `409` if the URL has already been used, and `413` if the body
+exceeds the declared size.
+
+The node rejects an `output_upload_url` whose scheme is weaker than the
+configured control-plane base URL, and does not follow redirects on the upload —
+the body is captured action output and must not be re-sent in the clear or to a
+host the control plane did not name directly.
+
+**Terminal callback** — reference the uploaded object by key and lowercase-hex
+SHA-256:
+
+```json
+{
+  "status": "succeeded",
   "exit_code": 0,
-  "stdout": "...",
-  "stderr": "...",
-  "duration": "2.34s",
-  "finished_at": "2025-01-15T10:30:02Z",
-  "triggered_by": {
-    "type": "control_plane",
-    "session_id": "",
-    "user_id": "",
-    "email": ""
+  "output": {
+    "object_key": "exec-output/exec_a1b2c3d4",
+    "sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
   }
 }
 ```
 
-`status` is `success`, `failure`, `timeout`, or `cancelled`. `stdout` and `stderr` are truncated to 64 KiB each.
+If any step of the upload leg fails, plexd falls back to truncated inline output
+on the terminal callback.
+
+## Session Activity
+
+### POST /v1/nodes/{node_id}/sessions/{session_id}
+
+A one-of activity record carrying exactly one of `ssh`, `k8s`, or `tcp`. plexd's
+tunnel subsystem is an opaque TCP forwarder, so it emits only `tcp` rows: a
+`session_started` row when the listener comes up and a `session_ended` row on
+close.
+
+**Request body** (`session_started`):
+
+```json
+{
+  "tcp": {
+    "phase": "session_started",
+    "target_host": "10.99.0.2",
+    "target_port": 22
+  }
+}
+```
+
+**Request body** (`session_ended`). `bytes_in` (operator→target) and `bytes_out`
+(target→operator) are explicit, present even when `0`; `terminated_by` is one of
+`ttl_expired`, `operator_revoke`, or `plexd_close`:
+
+```json
+{
+  "tcp": {
+    "phase": "session_ended",
+    "target_host": "10.99.0.2",
+    "target_port": 22,
+    "bytes_in": 4096,
+    "bytes_out": 8192,
+    "terminated_by": "operator_revoke"
+  }
+}
+```
+
+| Response | Meaning |
+|---|---|
+| `204 No Content` | Activity record accepted |
+| `400 Bad Request` (`malformed_session_activity`) | Body is unreadable, fails strict decoding, or violates the one-of contract |
+| `403 Forbidden` (`nsk_node_mismatch`) | Record targets a node other than the caller's identity |
 
 ## Observability
 

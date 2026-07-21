@@ -445,6 +445,75 @@ data: {"event_type":"node_state_updated","event_id":"evt-mock-001","issued_at":"
 
 **Disconnect:** The server detects client disconnect via context cancellation, removes the client from the broadcast list, and cleans up the goroutine.
 
+### `POST /v1/nodes/{id}/executions/{eid}`
+
+The v1 execution status callback. The mock enforces the node-id guard, a 64 KiB
+body cap, strict decoding to the five node-reportable statuses (`ack`, `started`,
+`succeeded`, `failed`, `cancelled`), the 16 KiB inline-output ceiling, and the
+execution state machine.
+
+**Legal transitions** — the mock tracks each execution's current status (absent
+means never dispatched) and admits only these advances:
+
+| Current state | Legal next status |
+|---------------|-------------------|
+| _(never seen)_ | `ack` |
+| `ack` | `started`, `failed`, `cancelled` |
+| `started` | `succeeded`, `failed`, `cancelled`, or `started` (only when `declared_output_bytes > 0`) |
+| terminal (`succeeded` / `failed` / `cancelled`) | none |
+
+The `ack` → `failed` / `cancelled` edges cover a pre-start rejection; the
+`started` → `started` self-repeat is the declaring callback that mints the output
+upload. A callback that declares an over-ceiling output (`started` with
+`declared_output_bytes > 0`) is answered with a one-time presigned PUT URL in
+`output_upload_url`; a terminal callback carrying an `object_key` is verified
+against the uploaded bytes (existence, receipt, and `sha256`).
+
+Every accepted callback increments `execution_callback_count` and returns `200`
+with the new status. Denials are RFC 9457 `application/problem+json` bodies:
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `200 OK` | — | Callback accepted; body carries the new status (and `output_upload_url` on a declaring callback) |
+| `400 Bad Request` | `malformed_execution_callback` | Unreadable/strict-decode failure, status outside the reportable set, non-base64 inline, or an `object_key`/`sha256` that does not match a received upload |
+| `403 Forbidden` | `nsk_node_mismatch` | `{id}` does not match the mock node identity |
+| `409 Conflict` | `execution_already_terminal` | Callback on an already-settled invocation |
+| `409 Conflict` | `invalid_state_transition` | Any other illegal advance |
+| `413 Payload Too Large` | `inline_output_too_large` | `output.inline` decodes to more than 16 KiB |
+
+### `PUT /exec-output/{eid}`
+
+The one-time presigned output upload minted by a declaring execution callback. The
+`token` query parameter identifies the upload; its recorded object key
+(`exec-output/{eid}`) must match the path, it must be unused, and the body must
+fit within the declared size. On success the mock records the bytes (for the
+terminal callback's `sha256` check), increments `execution_upload_count`, and
+returns `200`.
+
+| Status | Condition |
+|---|---|
+| `200 OK` | Bytes accepted |
+| `404 Not Found` | No upload for this token, or the token's key does not match the path |
+| `409 Conflict` | The upload URL has already been used |
+| `413 Payload Too Large` | Body exceeds the declared size |
+
+The `404` / `409` / `413` problem bodies carry no machine `code`.
+
+### `POST /v1/nodes/{id}/sessions/{sid}`
+
+The v1 session activity record. The mock enforces the node-id guard, a 16 KiB body
+cap, strict decoding, and the one-of `ssh` / `k8s` / `tcp` contract: exactly one
+member must be set, and that member must satisfy its per-kind rules —
+`ssh.command` non-empty and at most 1 KiB, `k8s.verb` non-empty, or `tcp.phase`
+one of `session_started` / `session_ended` with a valid `terminated_by` when set.
+A valid record increments `session_activity_count` and returns `204 No Content`.
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `204 No Content` | — | Activity record accepted |
+| `400 Bad Request` | `malformed_session_activity` | Unreadable body, strict-decode failure, or a one-of / per-kind violation |
+| `403 Forbidden` | `nsk_node_mismatch` | `{id}` does not match the mock node identity |
+
 ### `GET /test/assertions`
 
 Test-only endpoint returning a snapshot of all call counters. Not part of the `/v1/` API namespace.
@@ -463,14 +532,13 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "endpoint_count": 0,
   "secrets_count": 0,
   "report_count": 0,
-  "execution_ack_count": 0,
-  "execution_result_count": 0,
+  "execution_callback_count": 0,
+  "execution_upload_count": 0,
   "metrics_count": 0,
   "logs_count": 0,
   "audit_count": 0,
   "artifact_count": 0,
-  "tunnel_ready_count": 0,
-  "tunnel_closed_count": 0,
+  "session_activity_count": 0,
   "integrity_violation_count": 0,
   "inject_event_count": 0,
   "local_metrics_count": 0,
@@ -655,14 +723,13 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `endpoint_count` | `PUT /v1/nodes/{id}/endpoint` |
 | `secrets_count` | `GET /v1/nodes/{id}/secrets/{key}` |
 | `report_count` | `POST /v1/nodes/{id}/report` |
-| `execution_ack_count` | `POST /v1/nodes/{id}/executions/{eid}/ack` |
-| `execution_result_count` | `POST /v1/nodes/{id}/executions/{eid}/result` |
+| `execution_callback_count` | `POST /v1/nodes/{id}/executions/{eid}` (accepted callbacks only) |
+| `execution_upload_count` | `PUT /exec-output/{eid}` (presigned output upload) |
 | `metrics_count` | `POST /v1/nodes/{id}/metrics` |
 | `logs_count` | `POST /v1/nodes/{id}/logs` |
 | `audit_count` | `POST /v1/nodes/{id}/audit` |
 | `artifact_count` | `GET /v1/artifacts/plexd/{version}/{os}/{arch}` |
-| `tunnel_ready_count` | `POST /v1/nodes/{id}/tunnels/{sid}/ready` |
-| `tunnel_closed_count` | `POST /v1/nodes/{id}/tunnels/{sid}/closed` |
+| `session_activity_count` | `POST /v1/nodes/{id}/sessions/{sid}` |
 | `integrity_violation_count` | `POST /v1/nodes/{id}/integrity/violations` |
 | `inject_event_count` | `POST /test/inject-event` |
 | `local_metrics_count` | `POST /local/metrics` (TLS) |

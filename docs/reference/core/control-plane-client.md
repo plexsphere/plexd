@@ -71,14 +71,13 @@ All methods accept a `context.Context` for cancellation and return typed respons
 | `ReportEndpoint`      | `PUT`           | `/v1/nodes/{node_id}/endpoint`                    | `EndpointRequest`    | `*EndpointResponse`   |
 | `FetchSecret`         | `GET`           | `/v1/nodes/{node_id}/secrets/{key}`               | —                    | `*SecretResponse`     |
 | `SyncReports`         | `POST`          | `/v1/nodes/{node_id}/report`                      | `ReportSyncRequest`  | —                     |
-| `AckExecution`        | `POST`          | `/v1/nodes/{node_id}/executions/{id}/ack`         | `ExecutionAck`       | —                     |
-| `ReportResult`        | `POST`          | `/v1/nodes/{node_id}/executions/{id}/result`      | `ExecutionResult`    | —                     |
+| `ExecutionCallback`   | `POST`          | `/v1/nodes/{node_id}/executions/{execution_id}`    | `ExecutionCallbackRequest` | `*ExecutionCallbackResponse` |
+| `UploadExecutionOutput` | `PUT`         | presigned URL (no bearer token)                    | `[]byte`             | —                     |
 | `ReportMetrics`       | `POST`          | `/v1/nodes/{node_id}/metrics`                     | `MetricBatch`        | —                     |
 | `ReportLogs`          | `POST`          | `/v1/nodes/{node_id}/logs`                        | `LogBatch`           | —                     |
 | `ReportAudit`         | `POST`          | `/v1/nodes/{node_id}/audit`                       | `AuditBatch`         | —                     |
 | `FetchArtifact`       | `GET`           | `/v1/artifacts/plexd/{version}/{os}/{arch}`        | —                    | `io.ReadCloser`       |
-| `TunnelReady`         | `POST`          | `/v1/nodes/{node_id}/tunnels/{session_id}/ready`   | `TunnelReadyRequest` | —                     |
-| `TunnelClosed`        | `POST`          | `/v1/nodes/{node_id}/tunnels/{session_id}/closed`  | `TunnelClosedRequest`| —                     |
+| `ReportSessionActivity` | `POST`        | `/v1/nodes/{node_id}/sessions/{session_id}`        | `SessionActivityRequest` | — (`204 No Content`) |
 | `ReportIntegrityViolation` | `POST`     | `/v1/nodes/{node_id}/integrity/violations`         | `IntegrityViolationReport` | —              |
 
 ### Generic Helpers

@@ -195,10 +195,15 @@ event to the node. The event payload contains:
 
 The node will:
 
-1. **Ack**: send an `ExecutionAck` with `status=accepted`
+1. **Ack**: post an execution callback with `status=ack`
 2. **Verify**: compare the hook's SHA-256 against the provided `checksum`
-3. **Execute**: run the script with `PLEXD_PARAM_SERVICE=nginx`
-4. **Report**: send an `ExecutionResult` with stdout, stderr, exit code, and duration
+3. **Start**: post `status=started`, then run the script with `PLEXD_PARAM_SERVICE=nginx`
+4. **Report**: post a terminal callback (`succeeded`, `failed`, or `cancelled`) with the exit code and captured output
+
+Each step is one `POST /v1/nodes/{node_id}/executions/{execution_id}` callback.
+For the full state machine, the 16 KiB inline-output rule, and the presigned
+upload leg for larger output, see the
+[Remote Actions and Hooks Reference](../reference/actions/remote-actions-hooks.md).
 
 ## Execution Lifecycle
 
@@ -207,10 +212,10 @@ Control Plane                          Node (plexd)
      │                                      │
      │─── action_request (SSE) ────────────▶│
      │                                      │── parse ActionRequest
-     │◀── ExecutionAck (accepted) ──────────│── verify checksum (SHA-256)
-     │                                      │── execute script
+     │◀── callback: ack ────────────────────│── verify checksum (SHA-256)
+     │◀── callback: started ────────────────│── execute script
      │                                      │── capture stdout/stderr
-     │◀── ExecutionResult ─────────────────│── report result
+     │◀── callback: succeeded ──────────────│── report terminal status + output
      │                                      │
 ```
 
