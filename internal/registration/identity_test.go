@@ -270,6 +270,62 @@ func TestSaveAndLoad_RoundtripNewFields(t *testing.T) {
 	}
 }
 
+func TestSaveAndLoad_RoundtripLastRotation(t *testing.T) {
+	dir := t.TempDir()
+
+	original := &NodeIdentity{
+		NodeID:           "node-rotation",
+		MeshIP:           "100.64.0.1",
+		SigningPublicKey: "spk",
+		PrivateKey:       make([]byte, 32),
+		NodeSecretKey:    testNSK,
+		LastRotation: &RotationReceipt{
+			RotationID:     "rot-2026-07",
+			KID:            "kid-abc",
+			WrapKeyVersion: 3,
+		},
+	}
+
+	if err := SaveIdentity(dir, original); err != nil {
+		t.Fatalf("SaveIdentity: %v", err)
+	}
+
+	// identity.json must persist the receipt.
+	jsonData, err := os.ReadFile(filepath.Join(dir, "identity.json"))
+	if err != nil {
+		t.Fatalf("read identity.json: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(jsonData, &parsed); err != nil {
+		t.Fatalf("unmarshal identity.json: %v", err)
+	}
+	lr, ok := parsed["last_rotation"].(map[string]any)
+	if !ok {
+		t.Fatalf("last_rotation missing or wrong type in identity.json: %v", parsed["last_rotation"])
+	}
+	if lr["rotation_id"] != "rot-2026-07" {
+		t.Errorf("rotation_id = %v, want %q", lr["rotation_id"], "rot-2026-07")
+	}
+	if lr["kid"] != "kid-abc" {
+		t.Errorf("kid = %v, want %q", lr["kid"], "kid-abc")
+	}
+	if lr["wrap_key_version"] != float64(3) {
+		t.Errorf("wrap_key_version = %v, want 3", lr["wrap_key_version"])
+	}
+
+	// The loaded struct must round-trip the receipt.
+	loaded, err := LoadIdentity(dir)
+	if err != nil {
+		t.Fatalf("LoadIdentity: %v", err)
+	}
+	if loaded.LastRotation == nil {
+		t.Fatal("loaded LastRotation is nil")
+	}
+	if *loaded.LastRotation != *original.LastRotation {
+		t.Errorf("loaded LastRotation = %+v, want %+v", loaded.LastRotation, original.LastRotation)
+	}
+}
+
 func TestLoadIdentity_LegacyWithoutNewKeys(t *testing.T) {
 	dir := t.TempDir()
 
@@ -301,6 +357,9 @@ func TestLoadIdentity_LegacyWithoutNewKeys(t *testing.T) {
 	}
 	if loaded.DomainMeshCIDR != "" {
 		t.Errorf("DomainMeshCIDR = %q, want empty for legacy identity", loaded.DomainMeshCIDR)
+	}
+	if loaded.LastRotation != nil {
+		t.Errorf("LastRotation = %+v, want nil for legacy identity", loaded.LastRotation)
 	}
 }
 

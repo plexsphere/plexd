@@ -9,19 +9,30 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/plexsphere/plexd/internal/fsutil"
 )
 
+// RotationReceipt is the control plane's receipt for a completed mesh-key
+// rotation. It is persisted into identity.json so the node can prove which
+// rotation the currently committed private_key belongs to.
+type RotationReceipt struct {
+	RotationID     string `json:"rotation_id"`
+	KID            string `json:"kid"`
+	WrapKeyVersion int    `json:"wrap_key_version"`
+}
+
 // NodeIdentity holds the registration identity of a node.
 type NodeIdentity struct {
-	NodeID           string `json:"node_id"`
-	MeshIP           string `json:"mesh_ip"`
-	SigningPublicKey string `json:"signing_public_key"`
-	SigningKeyID     string `json:"signing_key_id"`
-	DomainMeshCIDR   string `json:"domain_mesh_cidr"`
-	PrivateKey       []byte `json:"-"` // never serialized to JSON
-	NodeSecretKey    string `json:"-"` // never serialized to JSON
+	NodeID           string           `json:"node_id"`
+	MeshIP           string           `json:"mesh_ip"`
+	SigningPublicKey string           `json:"signing_public_key"`
+	SigningKeyID     string           `json:"signing_key_id"`
+	DomainMeshCIDR   string           `json:"domain_mesh_cidr"`
+	LastRotation     *RotationReceipt `json:"last_rotation,omitempty"`
+	PrivateKey       []byte           `json:"-"` // never serialized to JSON
+	NodeSecretKey    string           `json:"-"` // never serialized to JSON
 }
 
 // ErrNotRegistered indicates that no valid identity files exist in data_dir.
@@ -59,8 +70,22 @@ func decodeNSK(nsk string) ([]byte, error) {
 	return raw, nil
 }
 
+// identityMu serialises every mutation of the identity file group in the data
+// dir. Re-registration (SaveIdentity, driven by the heartbeat goroutine) and
+// key rotation (CommitRotatedKey, driven by the rotator goroutine) both
+// read-modify-write that group. Without this lock a commit can read
+// identity.json inside SaveIdentity's remove-and-rewrite window — failing
+// outright — or rewrite it from a snapshot taken before the re-registration,
+// binding the rotated private key to the node the control plane just deleted.
+// Every writer of the group must hold it; LoadIdentity does not, so functions
+// holding it may read freely.
+var identityMu sync.Mutex
+
 // SaveIdentity persists the node identity atomically to dataDir.
 func SaveIdentity(dataDir string, id *NodeIdentity) error {
+	identityMu.Lock()
+	defer identityMu.Unlock()
+
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return fmt.Errorf("registration: save identity: %w", err)
 	}
