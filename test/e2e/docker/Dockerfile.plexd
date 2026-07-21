@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+
+# E2E-only plexd image: identical to the production runtime
+# (deploy/docker/Dockerfile) plus a static busybox shell so the suite's
+# hook actions — shell scripts — can execute inside the otherwise
+# shell-less distroless image. Keep the builder stage in sync with
+# deploy/docker/Dockerfile.
+FROM busybox:1.37.0-musl AS shell
+RUN mkdir -p /shellfs/bin \
+    && cp /bin/busybox /shellfs/bin/busybox \
+    && for applet in sh head tr; do ln -s busybox "/shellfs/bin/${applet}"; done
+
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 go build -o /build/plexd ./cmd/plexd
+
+RUN mkdir -p /runtime-dirs/var/lib/plexd \
+    /runtime-dirs/var/run/plexd \
+    /runtime-dirs/etc/plexd \
+    /runtime-dirs/var/log/plexd && \
+    echo "plexd container started" > /runtime-dirs/var/log/plexd/startup.log && \
+    chown -R 65534:65534 /runtime-dirs
+
+FROM gcr.io/distroless/static-debian12
+
+COPY --from=builder /runtime-dirs/ /
+COPY --from=shell /shellfs/bin/ /bin/
+COPY --from=builder --chown=65534:65534 /build/plexd /usr/local/bin/plexd
+
+USER 65534:65534
+
+EXPOSE 9100 51820/udp
+
+ENTRYPOINT ["/usr/local/bin/plexd"]
