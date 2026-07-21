@@ -67,6 +67,32 @@ func (c *NetlinkController) CreateInterface(name string, privateKey []byte, list
 	return nil
 }
 
+// SetPrivateKey replaces the named device's private key without touching its
+// listen port or peers.
+func (c *NetlinkController) SetPrivateKey(name string, privateKey []byte) error {
+	client, err := wgctrl.New()
+	if err != nil {
+		return fmt.Errorf("wireguard: set private key: open wgctrl: %w", err)
+	}
+	defer client.Close()
+
+	key, err := wgtypes.NewKey(privateKey)
+	if err != nil {
+		return fmt.Errorf("wireguard: set private key: parse private key: %w", err)
+	}
+
+	if err := client.ConfigureDevice(name, wgtypes.Config{PrivateKey: &key}); err != nil {
+		return fmt.Errorf("wireguard: set private key: configure device: %w", err)
+	}
+
+	c.logger.Info("wireguard private key rotated",
+		"component", "wireguard",
+		"interface", name,
+	)
+
+	return nil
+}
+
 // DeleteInterface deletes the named WireGuard interface.
 // It is idempotent: deleting a non-existent interface returns nil.
 func (c *NetlinkController) DeleteInterface(name string) error {

@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -238,6 +239,54 @@ func TestManager_Teardown_DeleteError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("error %q does not wrap original error", err.Error())
+	}
+}
+
+func TestManager_UpdatePrivateKey(t *testing.T) {
+	ctrl := &mockController{}
+	mgr := NewManager(ctrl, Config{}, discardLogger())
+
+	key := make([]byte, 32)
+	key[0] = 0x07 // Distinct byte to verify passthrough.
+
+	err := mgr.UpdatePrivateKey(key)
+	if err != nil {
+		t.Fatalf("UpdatePrivateKey() returned error: %v", err)
+	}
+
+	// Verify ctrl.SetPrivateKey was called once with the configured interface.
+	sp := ctrl.callsFor("SetPrivateKey")
+	if len(sp) != 1 {
+		t.Fatalf("expected 1 SetPrivateKey call, got %d", len(sp))
+	}
+	if sp[0].Args[0] != "plexd0" {
+		t.Errorf("SetPrivateKey iface = %v, want plexd0", sp[0].Args[0])
+	}
+	gotKey, ok := sp[0].Args[1].([]byte)
+	if !ok {
+		t.Fatalf("SetPrivateKey privateKey arg is not []byte")
+	}
+	if !bytes.Equal(gotKey, key) {
+		t.Errorf("SetPrivateKey privateKey = %v, want %v", gotKey, key)
+	}
+}
+
+func TestManager_UpdatePrivateKey_Error(t *testing.T) {
+	cause := errors.New("device busy")
+	ctrl := &mockController{
+		setPrivateKeyErr: cause,
+	}
+	mgr := NewManager(ctrl, Config{}, discardLogger())
+
+	err := mgr.UpdatePrivateKey(make([]byte, 32))
+	if err == nil {
+		t.Fatal("UpdatePrivateKey() expected error, got nil")
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("error %q does not wrap cause", err.Error())
+	}
+	if !strings.HasPrefix(err.Error(), "wireguard: update private key:") {
+		t.Errorf("error %q does not start with 'wireguard: update private key:'", err.Error())
 	}
 }
 

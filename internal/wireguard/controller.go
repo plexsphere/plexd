@@ -18,6 +18,9 @@ type WGController interface {
 	SetMTU(name string, mtu int) error
 	AddPeer(iface string, cfg PeerConfig) error
 	RemovePeer(iface string, publicKey []byte) error
+	// SetPrivateKey replaces the named device's private key without touching
+	// its listen port or peers.
+	SetPrivateKey(name string, privateKey []byte) error
 }
 
 // PeerConfig holds the WireGuard-native configuration for a single peer.
