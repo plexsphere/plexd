@@ -526,10 +526,10 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	}
 	metricsCollectors = append(metricsCollectors, metrics.NewAgentStatsCollector(startTime, nil, logger))
 
-	var metricsReporter metrics.MetricsReporter = client
+	var metricsReporter metrics.MetricsReporter = metrics.NewPlatformReporter(client, logger)
 	if cfg.Metrics.LocalEndpoint.URL != "" {
 		localMetrics := metrics.NewLocalReporter(cfg.Metrics.LocalEndpoint, client, nsk, identity.NodeID, logger)
-		metricsReporter = metrics.NewMultiReporter(client, localMetrics, logger)
+		metricsReporter = metrics.NewMultiReporter(metricsReporter, localMetrics, logger)
 		logger.Info("local endpoint enabled", "pipeline", "metrics", "url", cfg.Metrics.LocalEndpoint.URL)
 	}
 	metricsMgr := metrics.NewManager(cfg.Metrics, metricsCollectors, metricsReporter, identity.NodeID, logger)
@@ -543,10 +543,10 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	for _, pattern := range cfg.LogFwd.FilePatterns {
 		logSources = append(logSources, logfwd.NewFileSource(pattern, hostname, logger))
 	}
-	var logReporter logfwd.LogReporter = client
+	var logReporter logfwd.LogReporter = logfwd.NewPlatformReporter(client, logger)
 	if cfg.LogFwd.LocalEndpoint.URL != "" {
 		localLogs := logfwd.NewLocalReporter(cfg.LogFwd.LocalEndpoint, client, nsk, identity.NodeID, logger)
-		logReporter = logfwd.NewMultiReporter(client, localLogs, logger)
+		logReporter = logfwd.NewMultiReporter(logReporter, localLogs, logger)
 		logger.Info("local endpoint enabled", "pipeline", "logfwd", "url", cfg.LogFwd.LocalEndpoint.URL)
 	}
 	logForwarder := logfwd.NewForwarder(cfg.LogFwd, logSources, logReporter, identity.NodeID, hostname, logger)
@@ -555,10 +555,10 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// 15. Create audit forwarding sources and forwarder.
 	var auditSources []auditfwd.AuditSource
 	auditSources = append(auditSources, auditfwd.NewProcessSource(hostname))
-	var auditReporter auditfwd.AuditReporter = client
+	var auditReporter auditfwd.AuditReporter = auditfwd.NewPlatformReporter(client, logger)
 	if cfg.AuditFwd.LocalEndpoint.URL != "" {
 		localAudit := auditfwd.NewLocalReporter(cfg.AuditFwd.LocalEndpoint, client, nsk, identity.NodeID, logger)
-		auditReporter = auditfwd.NewMultiReporter(client, localAudit, logger)
+		auditReporter = auditfwd.NewMultiReporter(auditReporter, localAudit, logger)
 		logger.Info("local endpoint enabled", "pipeline", "auditfwd", "url", cfg.AuditFwd.LocalEndpoint.URL)
 	}
 	auditForwarder := auditfwd.NewForwarder(cfg.AuditFwd, auditSources, auditReporter, identity.NodeID, hostname, logger)

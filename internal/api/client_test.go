@@ -270,3 +270,75 @@ func TestClient_SetAuthToken_ThreadSafe(t *testing.T) {
 		t.Error("expected non-empty token after concurrent writes")
 	}
 }
+
+// TestClient_BodylessSuccessAccepted verifies that a success status carrying no
+// body is treated as success even when the caller passed a non-nil result. RFC
+// 9110 makes a response body a SHOULD, not a MUST: a 202 Accepted after a
+// durable enqueue and a 204 for an idempotent no-op upsert may both arrive
+// empty. Decoding into result must not turn that acknowledgement into an
+// "api: decode response: EOF" error that drives a retry of an already-accepted
+// request.
+func TestClient_BodylessSuccessAccepted(t *testing.T) {
+	t.Run("202 empty body via ingest", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusAccepted) // no body
+		}))
+		defer srv.Close()
+
+		c := newTestClient(t, srv.URL)
+		if _, err := c.ReportMetrics(context.Background(), "node-1", []MetricSample{{Group: "g", Name: "n"}}); err != nil {
+			t.Fatalf("ReportMetrics() with bodyless 202 = %v, want nil", err)
+		}
+	})
+
+	t.Run("204 no content via state report", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent) // no body
+		}))
+		defer srv.Close()
+
+		c := newTestClient(t, srv.URL)
+		if _, err := c.PutStateReport(context.Background(), "node-1", "health", NodeStateReportRequest{Value: "{}"}); err != nil {
+			t.Fatalf("PutStateReport() with bodyless 204 = %v, want nil", err)
+		}
+	})
+}
+
+// TestClient_TruncatedIngestReceiptAccepted verifies that the tolerance covers
+// every receipt a 202 can arrive with, not just an empty one. A body cut short by
+// a connection reset yields io.ErrUnexpectedEOF rather than io.EOF; treating that
+// as an error would re-send a batch the platform already accepted, and ingest
+// carries no idempotency key for the control plane to deduplicate it with.
+func TestClient_TruncatedIngestReceiptAccepted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted_at":"2026-07-2`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	if _, err := c.ReportMetrics(context.Background(), "node-1", []MetricSample{{Group: "g", Name: "n"}}); err != nil {
+		t.Fatalf("ReportMetrics() with a truncated 202 receipt = %v, want nil", err)
+	}
+}
+
+// TestClient_EmptyBodyOnStateIsError verifies that the ingest tolerance for a
+// bodyless 202 does not leak into the state-bearing endpoints. A gateway that
+// answers GET /v1/nodes/{id}/state with 200 and Content-Length: 0 must surface
+// a decode error: returning a zero-valued snapshot instead would read as
+// "no peers desired" and tear down every configured WireGuard peer.
+func TestClient_EmptyBodyOnStateIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK) // no body
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	snap, err := c.FetchState(context.Background(), "node-1")
+	if err == nil {
+		t.Fatalf("FetchState() with empty 200 body = %+v, nil; want a decode error", snap)
+	}
+	if !strings.Contains(err.Error(), "decode response") {
+		t.Errorf("FetchState() error = %v, want a decode response error", err)
+	}
+}
