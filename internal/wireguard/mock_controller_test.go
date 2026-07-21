@@ -27,6 +27,7 @@ type mockController struct {
 	setMTUErr           error
 	addPeerErr          error
 	removePeerErr       error
+	setPrivateKeyErr    error
 }
 
 func (m *mockController) CreateInterface(name string, privateKey []byte, listenPort int) error {
@@ -81,6 +82,14 @@ func (m *mockController) RemovePeer(iface string, publicKey []byte) error {
 	m.mu.Lock()
 	m.calls = append(m.calls, mockCall{Method: "RemovePeer", Args: []interface{}{iface, publicKey}})
 	err := m.removePeerErr
+	m.mu.Unlock()
+	return err
+}
+
+func (m *mockController) SetPrivateKey(name string, privateKey []byte) error {
+	m.mu.Lock()
+	m.calls = append(m.calls, mockCall{Method: "SetPrivateKey", Args: []interface{}{name, privateKey}})
+	err := m.setPrivateKeyErr
 	m.mu.Unlock()
 	return err
 }

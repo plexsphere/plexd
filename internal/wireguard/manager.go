@@ -104,6 +104,14 @@ func (m *Manager) Teardown() error {
 	return nil
 }
 
+// UpdatePrivateKey installs a rotated private key on the managed interface.
+func (m *Manager) UpdatePrivateKey(privateKey []byte) error {
+	if err := m.ctrl.SetPrivateKey(m.cfg.InterfaceName, privateKey); err != nil {
+		return fmt.Errorf("wireguard: update private key: %w", err)
+	}
+	return nil
+}
+
 // AddPeer adds a peer to the WireGuard interface and updates the peer index.
 func (m *Manager) AddPeer(peer api.Peer) error {
 	peerCfg, err := PeerConfigFromAPI(peer)
