@@ -134,6 +134,13 @@ func (m *mockWGController) RemovePeer(iface string, publicKey []byte) error {
 	return nil
 }
 
+func (m *mockWGController) SetPrivateKey(name string, privateKey []byte) error {
+	m.mu.Lock()
+	m.calls = append(m.calls, mockWGCall{Method: "SetPrivateKey", Args: []interface{}{name, privateKey}})
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *mockWGController) addPeerCalls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
