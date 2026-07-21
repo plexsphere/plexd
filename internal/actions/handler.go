@@ -31,20 +31,14 @@ func HandleActionRequest(executor *Executor, nodeID string, logger *slog.Logger)
 			return fmt.Errorf("actions: action_request: missing execution_id")
 		}
 
-		// When disabled, reject immediately.
+		// When disabled, reject immediately with the same ack + failed
+		// sequence as every other rejection.
 		if !executor.cfg.Enabled {
 			log.Warn("action_request: actions disabled",
 				"execution_id", req.ExecutionID,
 				"action", req.Action,
 			)
-			ack := api.ExecutionAck{
-				ExecutionID: req.ExecutionID,
-				Status:      "rejected",
-				Reason:      "actions_disabled",
-			}
-			if err := executor.reporter.AckExecution(ctx, nodeID, req.ExecutionID, ack); err != nil {
-				log.Warn("action_request: ack failed", "execution_id", req.ExecutionID, "error", err)
-			}
+			executor.reject(ctx, nodeID, req, "actions_disabled")
 			return nil
 		}
 

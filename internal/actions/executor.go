@@ -2,9 +2,13 @@ package actions
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,10 +29,30 @@ const waitDelayAfterKill = 500 * time.Millisecond
 // truncationSuffix is appended to output that was truncated due to exceeding MaxOutputBytes.
 const truncationSuffix = "\n...[truncated]"
 
+// inlineOutputCeiling is the control plane's inline output cap: outputs of at
+// most this many bytes travel base64-encoded inline on the terminal callback,
+// while larger outputs take the presigned upload leg.
+const inlineOutputCeiling = 16 * 1024
+
+// Bounded retry for the terminal callback, the only transition out of started.
+const (
+	terminalCallbackAttempts = 3
+	terminalCallbackBackoff  = 500 * time.Millisecond
+)
+
+// terminalReportTimeout bounds the whole terminal-report leg — the over-ceiling
+// upload plus the bounded retry loop. That leg runs on a context detached from
+// the action's own cancellation, because shutdown cancels the action context yet
+// the terminal transition out of started must still be delivered; a detached
+// context needs its own deadline so an unreachable control plane cannot pin
+// shutdown open. It exceeds the retry loop's backoff budget so the retries are
+// actually attempted.
+const terminalReportTimeout = 5 * time.Second
+
 // ActionReporter abstracts control plane communication for testability.
 type ActionReporter interface {
-	AckExecution(ctx context.Context, nodeID, executionID string, ack api.ExecutionAck) error
-	ReportResult(ctx context.Context, nodeID, executionID string, result api.ExecutionResult) error
+	ExecutionCallback(ctx context.Context, nodeID, executionID string, req api.ExecutionCallbackRequest) (*api.ExecutionCallbackResponse, error)
+	UploadExecutionOutput(ctx context.Context, uploadURL string, output []byte) error
 }
 
 // HookVerifier abstracts hook integrity verification for testability.
@@ -159,12 +183,22 @@ func (e *Executor) Execute(ctx context.Context, nodeID string, req api.ActionReq
 	e.active[req.ExecutionID] = cancel
 	e.mu.Unlock()
 
-	ack := api.ExecutionAck{
-		ExecutionID: req.ExecutionID,
-		Status:      "accepted",
-	}
-	if err := e.reporter.AckExecution(ctx, nodeID, req.ExecutionID, ack); err != nil {
-		e.logger.Warn("failed to send accepted ack",
+	ack := api.ExecutionCallbackRequest{Status: api.ExecutionStatusAck}
+	if _, err := e.reporter.ExecutionCallback(ctx, nodeID, req.ExecutionID, ack); err != nil {
+		if callbackRefused(err) {
+			// The server refused the execution (foreign node or illegal
+			// transition). Running it anyway would double-report, so abort.
+			e.logger.Error("ack callback refused; aborting execution",
+				"execution_id", req.ExecutionID,
+				"error", err,
+			)
+			cancel()
+			e.mu.Lock()
+			delete(e.active, req.ExecutionID)
+			e.mu.Unlock()
+			return
+		}
+		e.logger.Warn("failed to send ack callback",
 			"execution_id", req.ExecutionID,
 			"error", err,
 		)
@@ -202,38 +236,73 @@ func (e *Executor) reject(ctx context.Context, nodeID string, req api.ActionRequ
 		"reason", reason,
 	)
 
-	ack := api.ExecutionAck{
-		ExecutionID: req.ExecutionID,
-		Status:      "rejected",
-		Reason:      reason,
+	ack := api.ExecutionCallbackRequest{Status: api.ExecutionStatusAck}
+	if _, err := e.reporter.ExecutionCallback(ctx, nodeID, req.ExecutionID, ack); err != nil {
+		if callbackRefused(err) {
+			// The server refused the execution; skip the failed terminal.
+			e.logger.Error("ack callback refused for rejected execution",
+				"execution_id", req.ExecutionID,
+				"error", err,
+			)
+			return
+		}
+		e.logger.Warn("failed to send ack callback for rejected execution",
+			"execution_id", req.ExecutionID,
+			"error", err,
+		)
 	}
-	if err := e.reporter.AckExecution(ctx, nodeID, req.ExecutionID, ack); err != nil {
-		e.logger.Warn("failed to send rejected ack",
+
+	failed := api.ExecutionCallbackRequest{
+		Status: api.ExecutionStatusFailed,
+		Error:  reason,
+	}
+	if _, err := e.reporter.ExecutionCallback(ctx, nodeID, req.ExecutionID, failed); err != nil {
+		e.logger.Warn("failed to send failed callback for rejected execution",
 			"execution_id", req.ExecutionID,
 			"error", err,
 		)
 	}
 }
 
-// determineStatus maps the result of an action execution to a status string.
-func determineStatus(runErr error, exitCode int, timeoutCtx, parentCtx context.Context) string {
+// callbackRefused reports whether an execution-callback error carries one of the
+// RFC 9457 problem codes with which the control plane refuses a transition. Only
+// those codes mean the refusal is deliberate and permanent, so the node must stop
+// driving the execution rather than double-report it. Matching on the bare 403 or
+// 409 status instead would let an intermediary's 403 (WAF, proxy challenge) or a
+// 409 raised for an unrelated reason abort an action that never ran and is never
+// reported.
+func callbackRefused(err error) bool {
+	var apiErr *api.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.Code {
+	case api.CodeNSKNodeMismatch, api.CodeInvalidStateTransition, api.CodeExecutionAlreadyTerminal:
+		return true
+	}
+	return false
+}
+
+// terminalOutcome maps the result of an action execution to a terminal callback
+// status and, for failures without a meaningful exit code, an error message.
+func terminalOutcome(runErr error, exitCode int, timeoutCtx, parentCtx context.Context) (status, errMsg string) {
 	if runErr != nil {
 		if timeoutCtx.Err() == context.DeadlineExceeded {
-			return "timeout"
+			return api.ExecutionStatusFailed, "action timed out"
 		}
 		if parentCtx.Err() == context.Canceled {
-			return "cancelled"
+			return api.ExecutionStatusCancelled, ""
 		}
 		var exitErr *exec.ExitError
 		if errors.As(runErr, &exitErr) {
-			return "failed"
+			return api.ExecutionStatusFailed, ""
 		}
-		return "error"
+		return api.ExecutionStatusFailed, runErr.Error()
 	}
 	if exitCode != 0 {
-		return "failed"
+		return api.ExecutionStatusFailed, ""
 	}
-	return "success"
+	return api.ExecutionStatusSucceeded, ""
 }
 
 func (e *Executor) runAction(ctx context.Context, nodeID string, req api.ActionRequest, cancel context.CancelFunc) {
@@ -252,21 +321,36 @@ func (e *Executor) runAction(ctx context.Context, nodeID string, req api.ActionR
 				"panic", fmt.Sprintf("%v", r),
 				"stack", string(stack),
 			)
-			result := api.ExecutionResult{
-				ExecutionID: req.ExecutionID,
-				Status:      "error",
-				Stderr:      fmt.Sprintf("panic: %v\n%s", r, stack),
-				FinishedAt:  time.Now().UTC(),
-				TriggeredBy: req.TriggeredBy,
+			terminal := api.ExecutionCallbackRequest{
+				Status: api.ExecutionStatusFailed,
+				Error:  fmt.Sprintf("panic: %v", r),
 			}
-			if err := e.reporter.ReportResult(ctx, nodeID, req.ExecutionID, result); err != nil {
-				e.logger.Warn("failed to report panic result",
+			if _, err := e.reporter.ExecutionCallback(ctx, nodeID, req.ExecutionID, terminal); err != nil {
+				e.logger.Warn("failed to send panic terminal callback",
 					"execution_id", req.ExecutionID,
 					"error", err,
 				)
 			}
 		}
 	}()
+
+	// Report that the action has begun. A 403/409 refusal means the server has
+	// rejected the transition; stop without running or terminal-reporting. The
+	// deferred cleanup still removes the active entry.
+	started := api.ExecutionCallbackRequest{Status: api.ExecutionStatusStarted}
+	if _, err := e.reporter.ExecutionCallback(ctx, nodeID, req.ExecutionID, started); err != nil {
+		if callbackRefused(err) {
+			e.logger.Error("started callback refused; skipping execution",
+				"execution_id", req.ExecutionID,
+				"error", err,
+			)
+			return
+		}
+		e.logger.Warn("failed to send started callback",
+			"execution_id", req.ExecutionID,
+			"error", err,
+		)
+	}
 
 	// Parse timeout, clamped to the configured maximum.
 	timeout := e.cfg.MaxActionTimeout
@@ -296,31 +380,146 @@ func (e *Executor) runAction(ctx context.Context, nodeID string, req api.ActionR
 	}
 
 	duration := time.Since(start)
-	status := determineStatus(runErr, exitCode, timeoutCtx, ctx)
+	status, errMsg := terminalOutcome(runErr, exitCode, timeoutCtx, ctx)
 
-	result := api.ExecutionResult{
-		ExecutionID: req.ExecutionID,
-		Status:      status,
-		ExitCode:    exitCode,
-		Stdout:      stdout,
-		Stderr:      stderr,
-		Duration:    duration.String(),
-		FinishedAt:  time.Now().UTC(),
-		TriggeredBy: req.TriggeredBy,
+	// The terminal callback is the only transition out of started and must be
+	// delivered even when shutdown has already cancelled ctx (Shutdown cancels
+	// every actionCtx directly). Detach the report leg from that cancellation,
+	// keeping a bounded deadline of its own. terminalOutcome above still reads
+	// ctx to recognise the cancellation it reports.
+	reportCtx, cancelReport := context.WithTimeout(context.WithoutCancel(ctx), terminalReportTimeout)
+	defer cancelReport()
+
+	terminal := api.ExecutionCallbackRequest{
+		Status:   status,
+		ExitCode: &exitCode,
+		Error:    errMsg,
+		Output:   e.terminalOutput(reportCtx, nodeID, req.ExecutionID, combineOutput(stdout, stderr, e.cfg.MaxOutputBytes)),
 	}
 
-	if err := e.reporter.ReportResult(ctx, nodeID, req.ExecutionID, result); err != nil {
-		e.logger.Warn("failed to report result",
-			"execution_id", req.ExecutionID,
-			"error", err,
-		)
-	}
+	e.sendTerminal(reportCtx, nodeID, req.ExecutionID, terminal)
 
 	e.logger.Info("action completed",
 		"execution_id", req.ExecutionID,
 		"status", status,
 		"duration", duration,
 	)
+}
+
+// sendTerminal posts the terminal callback, retrying a transient failure with
+// exponential backoff. The terminal callback is the only transition out of
+// started, so giving up after one attempt leaves the invocation pinned at
+// started on the control plane forever — the node has already dropped its
+// active entry and keeps no pending terminal across a restart. A refusal is
+// deliberate and permanent, so it stops the retry immediately.
+func (e *Executor) sendTerminal(ctx context.Context, nodeID, executionID string, terminal api.ExecutionCallbackRequest) {
+	backoff := terminalCallbackBackoff
+	for attempt := 1; ; attempt++ {
+		_, err := e.reporter.ExecutionCallback(ctx, nodeID, executionID, terminal)
+		if err == nil {
+			return
+		}
+
+		retry := !callbackRefused(err) && attempt < terminalCallbackAttempts
+		if retry {
+			select {
+			case <-time.After(backoff):
+				backoff *= 2
+				continue
+			case <-ctx.Done():
+			}
+		}
+
+		e.logger.Warn("failed to send terminal callback",
+			"execution_id", executionID,
+			"attempts", attempt,
+			"error", err,
+		)
+		return
+	}
+}
+
+// combineOutput joins captured stdout and stderr into a single body: stdout
+// first, both separated by a newline when present, and whichever stream is
+// empty dropped entirely. Each stream is captured under its own MaxOutputBytes
+// limit, so the joined body is truncated back to limit — without that a hook
+// saturating both streams would produce twice the configured per-action cap,
+// which is then held three times over while it is uploaded and hashed. Config
+// validation keeps limit well above len(truncationSuffix).
+func combineOutput(stdout, stderr string, limit int64) string {
+	var combined string
+	switch {
+	case stdout != "" && stderr != "":
+		combined = stdout + "\n" + stderr
+	case stdout != "":
+		combined = stdout
+	default:
+		combined = stderr
+	}
+	if int64(len(combined)) <= limit {
+		return combined
+	}
+	return combined[:limit-int64(len(truncationSuffix))] + truncationSuffix
+}
+
+// terminalOutput builds the ExecutionOutput for a terminal callback. Empty
+// output is omitted; output within the inline ceiling travels base64 inline;
+// larger output takes the presigned upload leg, falling back to truncated
+// inline output if any step of that leg fails.
+func (e *Executor) terminalOutput(ctx context.Context, nodeID, executionID, combined string) *api.ExecutionOutput {
+	if combined == "" {
+		return nil
+	}
+	if len(combined) <= inlineOutputCeiling {
+		return &api.ExecutionOutput{Inline: base64.StdEncoding.EncodeToString([]byte(combined))}
+	}
+
+	output, err := e.uploadOutput(ctx, nodeID, executionID, combined)
+	if err != nil {
+		e.logger.Warn("over-ceiling output upload failed; falling back to truncated inline",
+			"execution_id", executionID,
+			"error", err,
+		)
+		truncated := combined[:inlineOutputCeiling-len(truncationSuffix)] + truncationSuffix
+		return &api.ExecutionOutput{Inline: base64.StdEncoding.EncodeToString([]byte(truncated))}
+	}
+	return output
+}
+
+// uploadOutput runs the over-ceiling upload leg: it declares the output byte
+// count to mint a one-time presigned PUT URL, derives the object key from that
+// URL's path, uploads the raw bytes, and returns the object reference (key plus
+// lowercase-hex SHA-256) for the terminal callback.
+func (e *Executor) uploadOutput(ctx context.Context, nodeID, executionID, combined string) (*api.ExecutionOutput, error) {
+	declare := api.ExecutionCallbackRequest{
+		Status:              api.ExecutionStatusStarted,
+		DeclaredOutputBytes: int64(len(combined)),
+	}
+	resp, err := e.reporter.ExecutionCallback(ctx, nodeID, executionID, declare)
+	if err != nil {
+		return nil, fmt.Errorf("declare output: %w", err)
+	}
+	if resp == nil || resp.OutputUploadURL == "" {
+		return nil, fmt.Errorf("declare output: empty upload url")
+	}
+
+	// The presigned URL is a bearer credential, and url.Error renders it in full.
+	// Every error on this leg is redacted before it reaches a log line.
+	parsed, err := url.Parse(resp.OutputUploadURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse upload url: %w", api.RedactURLError(err))
+	}
+	objectKey := strings.TrimPrefix(parsed.Path, "/")
+
+	if err := e.reporter.UploadExecutionOutput(ctx, resp.OutputUploadURL, []byte(combined)); err != nil {
+		return nil, fmt.Errorf("upload output: %w", err)
+	}
+
+	sum := sha256.Sum256([]byte(combined))
+	return &api.ExecutionOutput{
+		ObjectKey: objectKey,
+		SHA256:    hex.EncodeToString(sum[:]),
+	}, nil
 }
 
 // RunLocal executes a built-in action synchronously and returns the output.

@@ -22,53 +22,42 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-// integrationReporter is a thread-safe mock reporter for integration tests.
+// integrationReporter is a thread-safe mock reporter for integration tests. It
+// records the ordered execution callbacks the executor drives from goroutines.
 type integrationReporter struct {
-	mu      sync.Mutex
-	acks    []api.ExecutionAck
-	results []api.ExecutionResult
+	mu        sync.Mutex
+	callbacks []api.ExecutionCallbackRequest
 }
 
-func (r *integrationReporter) AckExecution(_ context.Context, _, _ string, ack api.ExecutionAck) error {
+func (r *integrationReporter) ExecutionCallback(_ context.Context, _, _ string, req api.ExecutionCallbackRequest) (*api.ExecutionCallbackResponse, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.acks = append(r.acks, ack)
+	r.callbacks = append(r.callbacks, req)
+	return &api.ExecutionCallbackResponse{Status: req.Status}, nil
+}
+
+func (r *integrationReporter) UploadExecutionOutput(_ context.Context, _ string, _ []byte) error {
 	return nil
 }
 
-func (r *integrationReporter) ReportResult(_ context.Context, _, _ string, result api.ExecutionResult) error {
+func (r *integrationReporter) getCallbacks() []api.ExecutionCallbackRequest {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.results = append(r.results, result)
-	return nil
-}
-
-func (r *integrationReporter) getAcks() []api.ExecutionAck {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	cp := make([]api.ExecutionAck, len(r.acks))
-	copy(cp, r.acks)
+	cp := make([]api.ExecutionCallbackRequest, len(r.callbacks))
+	copy(cp, r.callbacks)
 	return cp
 }
 
-func (r *integrationReporter) getResults() []api.ExecutionResult {
+func (r *integrationReporter) statusCount(status string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	cp := make([]api.ExecutionResult, len(r.results))
-	copy(cp, r.results)
-	return cp
-}
-
-func (r *integrationReporter) ackCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.acks)
-}
-
-func (r *integrationReporter) resultCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.results)
+	n := 0
+	for _, cb := range r.callbacks {
+		if cb.Status == status {
+			n++
+		}
+	}
+	return n
 }
 
 func integrationWaitFor(t *testing.T, timeout time.Duration, fn func() bool) {
@@ -123,7 +112,7 @@ func integrationEnvelope(t *testing.T, req api.ActionRequest) api.SignedEnvelope
 }
 
 // TestIntegration_FullActionLifecycle tests the full lifecycle:
-// action_request → ack → execute → result reported.
+// action_request → ack → started → terminal callback.
 // Tests both built-in and hook paths with real integrity verification.
 func TestIntegration_FullActionLifecycle(t *testing.T) {
 	hooksDir := t.TempDir()
@@ -171,33 +160,22 @@ func TestIntegration_FullActionLifecycle(t *testing.T) {
 		}
 
 		integrationWaitFor(t, 5*time.Second, func() bool {
-			return reporter.resultCount() > 0
+			return len(reporter.getCallbacks()) >= 3
 		})
 
-		acks := reporter.getAcks()
-		results := reporter.getResults()
+		cbs := reporter.getCallbacks()
+		assertStatuses(t, cbs, []string{
+			api.ExecutionStatusAck,
+			api.ExecutionStatusStarted,
+			api.ExecutionStatusSucceeded,
+		})
 
-		if len(acks) < 1 {
-			t.Fatal("no acks received for builtin")
+		terminal := cbs[len(cbs)-1]
+		if terminal.ExitCode == nil || *terminal.ExitCode != 0 {
+			t.Errorf("builtin exit_code = %v, want pointer to 0", terminal.ExitCode)
 		}
-		if acks[0].Status != "accepted" {
-			t.Errorf("builtin ack status = %q, want accepted", acks[0].Status)
-		}
-		if acks[0].ExecutionID != "integ-builtin-001" {
-			t.Errorf("builtin ack execution_id = %q, want integ-builtin-001", acks[0].ExecutionID)
-		}
-
-		if len(results) < 1 {
-			t.Fatal("no results received for builtin")
-		}
-		if results[0].Status != "success" {
-			t.Errorf("builtin result status = %q, want success", results[0].Status)
-		}
-		if results[0].ExitCode != 0 {
-			t.Errorf("builtin exit_code = %d, want 0", results[0].ExitCode)
-		}
-		if !strings.Contains(results[0].Stdout, "status") {
-			t.Errorf("builtin stdout = %q, expected to contain 'status'", results[0].Stdout)
+		if got := decodeInline(t, terminal.Output); !strings.Contains(got, "status") {
+			t.Errorf("builtin output = %q, expected to contain 'status'", got)
 		}
 	})
 
@@ -224,36 +202,22 @@ func TestIntegration_FullActionLifecycle(t *testing.T) {
 		}
 
 		integrationWaitFor(t, 5*time.Second, func() bool {
-			return reporter2.resultCount() > 0
+			return len(reporter2.getCallbacks()) >= 3
 		})
 
-		acks := reporter2.getAcks()
-		results := reporter2.getResults()
+		cbs := reporter2.getCallbacks()
+		assertStatuses(t, cbs, []string{
+			api.ExecutionStatusAck,
+			api.ExecutionStatusStarted,
+			api.ExecutionStatusSucceeded,
+		})
 
-		if len(acks) < 1 {
-			t.Fatal("no acks received for hook")
+		terminal := cbs[len(cbs)-1]
+		if terminal.ExitCode == nil || *terminal.ExitCode != 0 {
+			t.Errorf("hook exit_code = %v, want pointer to 0", terminal.ExitCode)
 		}
-		if acks[0].Status != "accepted" {
-			t.Errorf("hook ack status = %q, want accepted", acks[0].Status)
-		}
-
-		if len(results) < 1 {
-			t.Fatal("no results received for hook")
-		}
-		if results[0].Status != "success" {
-			t.Errorf("hook result status = %q, want success", results[0].Status)
-		}
-		if results[0].ExitCode != 0 {
-			t.Errorf("hook exit_code = %d, want 0", results[0].ExitCode)
-		}
-		if !strings.Contains(results[0].Stdout, "hook-lifecycle-output") {
-			t.Errorf("hook stdout = %q, want to contain 'hook-lifecycle-output'", results[0].Stdout)
-		}
-		if results[0].Duration == "" {
-			t.Error("hook result duration is empty")
-		}
-		if results[0].FinishedAt.IsZero() {
-			t.Error("hook result finished_at is zero")
+		if got := decodeInline(t, terminal.Output); !strings.Contains(got, "hook-lifecycle-output") {
+			t.Errorf("hook output = %q, want to contain 'hook-lifecycle-output'", got)
 		}
 	})
 }
@@ -310,53 +274,54 @@ func TestIntegration_ConcurrentExecutions(t *testing.T) {
 
 	wg.Wait()
 
-	// Wait for all acks and results to arrive.
+	// Every execution acks; accepted ones then start, rejected ones fail.
 	integrationWaitFor(t, 10*time.Second, func() bool {
-		return reporter.ackCount() >= totalRequests
+		return reporter.statusCount(api.ExecutionStatusAck) >= totalRequests
+	})
+	integrationWaitFor(t, 10*time.Second, func() bool {
+		terminal := reporter.statusCount(api.ExecutionStatusSucceeded) + reporter.statusCount(api.ExecutionStatusFailed)
+		return terminal >= totalRequests
 	})
 
-	// Wait for all results (accepted ones complete, rejected ones don't produce results).
-	acks := reporter.getAcks()
-	acceptedCount := 0
-	rejectedCount := 0
-	for _, ack := range acks {
-		switch ack.Status {
-		case "accepted":
-			acceptedCount++
-		case "rejected":
-			rejectedCount++
-			if ack.Reason != "max_concurrent_reached" {
-				t.Errorf("rejected reason = %q, want max_concurrent_reached", ack.Reason)
+	cbs := reporter.getCallbacks()
+	var acks, started, succeeded, rejected int
+	for _, cb := range cbs {
+		switch cb.Status {
+		case api.ExecutionStatusAck:
+			acks++
+		case api.ExecutionStatusStarted:
+			started++
+		case api.ExecutionStatusSucceeded:
+			succeeded++
+		case api.ExecutionStatusFailed:
+			rejected++
+			if cb.Error != "max_concurrent_reached" {
+				t.Errorf("failed error = %q, want max_concurrent_reached", cb.Error)
 			}
 		default:
-			t.Errorf("unexpected ack status = %q", ack.Status)
+			t.Errorf("unexpected callback status = %q", cb.Status)
 		}
 	}
 
-	if acceptedCount+rejectedCount != totalRequests {
-		t.Errorf("total acks = %d, want %d", acceptedCount+rejectedCount, totalRequests)
+	if acks != totalRequests {
+		t.Errorf("acks = %d, want %d", acks, totalRequests)
 	}
-	if acceptedCount > maxConcurrent+1 {
+	// Accepted executions start and succeed; rejected ones only fail.
+	if started != succeeded {
+		t.Errorf("started = %d, succeeded = %d, want equal", started, succeeded)
+	}
+	if started+rejected != totalRequests {
+		t.Errorf("started+rejected = %d, want %d", started+rejected, totalRequests)
+	}
+	if started > maxConcurrent+1 {
 		// Some concurrency overlap is possible since hooks complete quickly (0.1s).
 		// But we should never exceed the limit by a lot.
-		t.Errorf("accepted = %d, maxConcurrent = %d (should not wildly exceed)", acceptedCount, maxConcurrent)
-	}
-
-	// Wait for all accepted executions to produce results.
-	integrationWaitFor(t, 10*time.Second, func() bool {
-		return reporter.resultCount() >= acceptedCount
-	})
-
-	results := reporter.getResults()
-	for _, r := range results {
-		if r.Status != "success" {
-			t.Errorf("result %q status = %q, want success", r.ExecutionID, r.Status)
-		}
+		t.Errorf("started = %d, maxConcurrent = %d (should not wildly exceed)", started, maxConcurrent)
 	}
 }
 
 // TestIntegration_HookIntegrityAndExecution tests hook discovery, real integrity
-// verification, parameter passing as env vars, and result reporting.
+// verification, parameter passing as env vars, and terminal callback reporting.
 func TestIntegration_HookIntegrityAndExecution(t *testing.T) {
 	hooksDir := t.TempDir()
 
@@ -416,22 +381,16 @@ func TestIntegration_HookIntegrityAndExecution(t *testing.T) {
 		}
 
 		integrationWaitFor(t, 5*time.Second, func() bool {
-			return rep.resultCount() > 0
+			return len(rep.getCallbacks()) >= 3
 		})
 
-		acks := rep.getAcks()
-		results := rep.getResults()
-
-		if len(acks) < 1 || acks[0].Status != "accepted" {
-			t.Fatalf("expected accepted ack, got %v", acks)
-		}
-		if len(results) < 1 {
-			t.Fatal("no results")
-		}
-		if results[0].Status != "success" {
-			t.Errorf("result status = %q, want success", results[0].Status)
-		}
-		stdout := strings.TrimSpace(results[0].Stdout)
+		cbs := rep.getCallbacks()
+		assertStatuses(t, cbs, []string{
+			api.ExecutionStatusAck,
+			api.ExecutionStatusStarted,
+			api.ExecutionStatusSucceeded,
+		})
+		stdout := strings.TrimSpace(decodeInline(t, cbs[len(cbs)-1].Output))
 		if !strings.Contains(stdout, "target=10.0.0.1") {
 			t.Errorf("stdout %q missing target=10.0.0.1", stdout)
 		}
@@ -452,24 +411,23 @@ func TestIntegration_HookIntegrityAndExecution(t *testing.T) {
 			t.Fatalf("handler error: %v", err)
 		}
 
-		// The executor accepts (hook is in list), but runHook fails integrity check.
+		// The executor acks and starts, but runHook fails the integrity check.
 		integrationWaitFor(t, 5*time.Second, func() bool {
-			return reporter.resultCount() > 0
+			return len(reporter.getCallbacks()) >= 3
 		})
 
-		results := reporter.getResults()
-		if len(results) < 1 {
-			t.Fatal("no results")
-		}
-		if results[0].Status != "error" {
-			t.Errorf("result status = %q, want error", results[0].Status)
-		}
+		cbs := reporter.getCallbacks()
+		assertStatuses(t, cbs, []string{
+			api.ExecutionStatusAck,
+			api.ExecutionStatusStarted,
+			api.ExecutionStatusFailed,
+		})
 	})
 }
 
 // TestIntegration_ShutdownCancelsExecutions verifies that shutdown cancels
-// running executions, reports cancelled results, and leaves no goroutine leaks.
-// Goroutine leak detection is handled by goleak via TestMain.
+// running executions, reports cancelled terminal callbacks, and leaves no
+// goroutine leaks. Goroutine leak detection is handled by goleak via TestMain.
 func TestIntegration_ShutdownCancelsExecutions(t *testing.T) {
 	hooksDir := t.TempDir()
 	// Create a hook that blocks until cancelled.
@@ -538,17 +496,10 @@ func TestIntegration_ShutdownCancelsExecutions(t *testing.T) {
 		t.Fatalf("handler error: %v", err)
 	}
 
-	// Wait for both to be accepted.
+	// Wait for both to ack.
 	integrationWaitFor(t, 5*time.Second, func() bool {
-		return reporter.ackCount() >= 2
+		return reporter.statusCount(api.ExecutionStatusAck) >= 2
 	})
-
-	acks := reporter.getAcks()
-	for _, ack := range acks {
-		if ack.Status != "accepted" {
-			t.Errorf("ack %q status = %q, want accepted", ack.ExecutionID, ack.Status)
-		}
-	}
 
 	if exec.ActiveCount() < 1 {
 		t.Fatal("expected at least 1 active execution before shutdown")
@@ -557,21 +508,10 @@ func TestIntegration_ShutdownCancelsExecutions(t *testing.T) {
 	// Shutdown cancels all active executions.
 	exec.Shutdown(context.Background())
 
-	// Wait for results from both cancelled executions.
+	// Wait for at least one cancelled terminal callback.
 	integrationWaitFor(t, 10*time.Second, func() bool {
-		return reporter.resultCount() >= 2
+		return reporter.statusCount(api.ExecutionStatusCancelled) >= 1
 	})
-
-	results := reporter.getResults()
-	cancelledCount := 0
-	for _, r := range results {
-		if r.Status == "cancelled" {
-			cancelledCount++
-		}
-	}
-	if cancelledCount < 1 {
-		t.Errorf("expected at least 1 cancelled result, got %d out of %v", cancelledCount, results)
-	}
 
 	// After shutdown, new requests should be rejected.
 	req3 := api.ActionRequest{
@@ -584,32 +524,13 @@ func TestIntegration_ShutdownCancelsExecutions(t *testing.T) {
 	}
 
 	integrationWaitFor(t, 5*time.Second, func() bool {
-		acks := reporter.getAcks()
-		for _, a := range acks {
-			if a.ExecutionID == "integ-shutdown-003" && a.Status == "rejected" {
+		for _, cb := range reporter.getCallbacks() {
+			if cb.Status == api.ExecutionStatusFailed && cb.Error == "shutting_down" {
 				return true
 			}
 		}
 		return false
 	})
-
-	acks = reporter.getAcks()
-	var postShutdownAck *api.ExecutionAck
-	for i := range acks {
-		if acks[i].ExecutionID == "integ-shutdown-003" {
-			postShutdownAck = &acks[i]
-			break
-		}
-	}
-	if postShutdownAck == nil {
-		t.Fatal("no ack for post-shutdown request")
-	}
-	if postShutdownAck.Status != "rejected" {
-		t.Errorf("post-shutdown ack status = %q, want rejected", postShutdownAck.Status)
-	}
-	if postShutdownAck.Reason != "shutting_down" {
-		t.Errorf("post-shutdown ack reason = %q, want shutting_down", postShutdownAck.Reason)
-	}
 
 	// Verify no active executions remain.
 	if got := exec.ActiveCount(); got != 0 {
@@ -692,15 +613,16 @@ func TestIntegration_WatcherFeedsExecutor(t *testing.T) {
 	}
 
 	integrationWaitFor(t, 5*time.Second, func() bool {
-		return reporter.resultCount() > 0
+		return len(reporter.getCallbacks()) >= 3
 	})
 
-	results := reporter.getResults()
-	if results[0].Status != "success" {
-		t.Errorf("result status = %q, want success", results[0].Status)
+	cbs := reporter.getCallbacks()
+	terminal := cbs[len(cbs)-1]
+	if terminal.Status != api.ExecutionStatusSucceeded {
+		t.Errorf("terminal status = %q, want %q", terminal.Status, api.ExecutionStatusSucceeded)
 	}
-	if !strings.Contains(results[0].Stdout, "watcher-integration") {
-		t.Errorf("stdout = %q, want to contain 'watcher-integration'", results[0].Stdout)
+	if got := decodeInline(t, terminal.Output); !strings.Contains(got, "watcher-integration") {
+		t.Errorf("output = %q, want to contain 'watcher-integration'", got)
 	}
 
 	// --- Remove the hook file ---
@@ -727,4 +649,3 @@ func TestIntegration_WatcherFeedsExecutor(t *testing.T) {
 		t.Fatal("watcher did not exit")
 	}
 }
-
