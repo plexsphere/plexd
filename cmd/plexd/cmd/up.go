@@ -270,6 +270,14 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// 7. Create reconciler.
 	reconciler := reconcile.NewReconciler(client, cfg.Reconcile, logger)
 
+	// Wire the reconciler as the SSE reconcile trigger so the client covers
+	// replay gaps with one full pull per successful connect, and honor the
+	// configured SSE idle timeout and pull-only re-probe cadence. cfg.API is
+	// post-ApplyDefaults here, so both durations are non-zero.
+	sseMgr.SetReconcileTrigger(reconciler)
+	sseMgr.SetIdleTimeout(cfg.API.SSEIdleTimeout)
+	sseMgr.SetReprobeInterval(cfg.API.SSEReprobeInterval)
+
 	// Key rotator: completes rotate_keys signals against POST /v1/keys/rotate.
 	// The typed device variable keeps the interface a true nil when WireGuard is
 	// unavailable, so rotation still commits and reconciles without a device.

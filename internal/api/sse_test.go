@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -464,6 +465,124 @@ func TestSSEParser_MultipleEventsInSequence(t *testing.T) {
 	}
 	if evt2.Type != "b" || evt2.Data != "second" {
 		t.Errorf("event 2: Type=%q Data=%q, want Type=b Data=second", evt2.Type, evt2.Data)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SSE on-connected hook and 400 cursor-reset tests
+// ---------------------------------------------------------------------------
+
+// TestSSE_OnConnectedFiresOncePerConnect proves the on-connected hook fires
+// exactly once for every successful connect: two sequential Connect calls
+// against a healthy server yield exactly two invocations.
+func TestSSE_OnConnectedFiresOncePerConnect(t *testing.T) {
+	sseData := "data: {\"id\":\"e1\",\"type\":\"node_state_updated\",\"issued_at\":\"2025-01-01T00:00:00Z\",\"payload\":{},\"signature\":\"s\"}\nid: e1\n\n"
+	srv := httptest.NewServer(sseHandler(sseData))
+	defer srv.Close()
+
+	stream, _ := newTestSSEStream(t, srv)
+
+	var connects atomic.Int64
+	stream.SetOnConnected(func() { connects.Add(1) })
+
+	for i := 0; i < 2; i++ {
+		if err := stream.Connect(context.Background(), "n1"); err != nil {
+			t.Fatalf("Connect %d: %v", i, err)
+		}
+	}
+
+	if got := connects.Load(); got != 2 {
+		t.Errorf("onConnected fired %d times, want 2", got)
+	}
+}
+
+// TestSSE_BadRequestClearsCursor proves that a 400 while a cursor was sent
+// clears the stored cursor so the next connect tails from now: the error is
+// returned unchanged and the next request carries no Last-Event-ID header.
+func TestSSE_BadRequestClearsCursor(t *testing.T) {
+	var mu sync.Mutex
+	var requestCount int
+	var lastEventIDs []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requestCount++
+		n := requestCount
+		lastEventIDs = append(lastEventIDs, r.Header.Get("Last-Event-ID"))
+		mu.Unlock()
+
+		if n == 1 {
+			// Reject the cursor with a problem+json 400 so errors.Is matches.
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"title":"bad cursor","code":"invalid_cursor"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprint(w, "data: {\"id\":\"e1\",\"type\":\"node_state_updated\",\"issued_at\":\"2025-01-01T00:00:00Z\",\"payload\":{},\"signature\":\"s\"}\nid: e1\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer srv.Close()
+
+	stream, _ := newTestSSEStream(t, srv)
+
+	// Seed a cursor to simulate a prior stream position.
+	stream.mu.Lock()
+	stream.lastEventID = "evt-42"
+	stream.mu.Unlock()
+
+	err := stream.Connect(context.Background(), "n1")
+	if !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("Connect error = %v, want ErrBadRequest", err)
+	}
+	if got := stream.LastEventID(); got != "" {
+		t.Errorf("cursor after 400 = %q, want empty", got)
+	}
+
+	// The next connect must tail from now: no Last-Event-ID header.
+	if err := stream.Connect(context.Background(), "n1"); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(lastEventIDs) < 2 {
+		t.Fatalf("expected 2 requests, got %d", len(lastEventIDs))
+	}
+	if lastEventIDs[0] != "evt-42" {
+		t.Errorf("first request Last-Event-ID = %q, want %q", lastEventIDs[0], "evt-42")
+	}
+	if lastEventIDs[1] != "" {
+		t.Errorf("second request Last-Event-ID = %q, want empty", lastEventIDs[1])
+	}
+}
+
+// TestSSE_BadRequestNoCursorNoReset proves a 400 with no cursor sent gets no
+// special handling: the error propagates unchanged and the cursor stays empty.
+func TestSSE_BadRequestNoCursorNoReset(t *testing.T) {
+	var gotLastEventID string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLastEventID = r.Header.Get("Last-Event-ID")
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"title":"bad request","code":"malformed"}`)
+	}))
+	defer srv.Close()
+
+	stream, _ := newTestSSEStream(t, srv)
+
+	err := stream.Connect(context.Background(), "n1")
+	if !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("Connect error = %v, want ErrBadRequest", err)
+	}
+	if gotLastEventID != "" {
+		t.Errorf("Last-Event-ID = %q, want empty (no cursor was seeded)", gotLastEventID)
+	}
+	if got := stream.LastEventID(); got != "" {
+		t.Errorf("cursor = %q, want empty", got)
 	}
 }
 

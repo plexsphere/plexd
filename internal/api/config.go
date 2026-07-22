@@ -28,6 +28,11 @@ type Config struct {
 	// before considering the connection stale and reconnecting.
 	// Default: 90s
 	SSEIdleTimeout time.Duration `yaml:"sse_idle_timeout"`
+
+	// SSEReprobeInterval is how often pull-only delivery re-probes the SSE
+	// endpoint after the control plane descoped it.
+	// Default: 10m
+	SSEReprobeInterval time.Duration `yaml:"sse_reprobe_interval"`
 }
 
 // DefaultConnectTimeout is the default TCP connect timeout.
@@ -54,12 +59,21 @@ func (c *Config) ApplyDefaults() {
 	if c.SSEIdleTimeout == 0 {
 		c.SSEIdleTimeout = DefaultSSEIdleTimeout
 	}
+	if c.SSEReprobeInterval == 0 {
+		c.SSEReprobeInterval = DefaultSSEReprobeInterval
+	}
 }
 
 // Validate checks that required fields are set.
 func (c *Config) Validate() error {
 	if c.BaseURL == "" {
 		return errors.New("api: config: BaseURL is required")
+	}
+	if c.SSEReprobeInterval < 0 {
+		return errors.New("api: config: SSEReprobeInterval must not be negative")
+	}
+	if c.SSEReprobeInterval != 0 && c.SSEReprobeInterval < time.Second {
+		return errors.New("api: config: SSEReprobeInterval must be at least 1s")
 	}
 	return nil
 }

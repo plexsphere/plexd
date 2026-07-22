@@ -395,3 +395,225 @@ func TestManager_ModeDelegation(t *testing.T) {
 		t.Errorf("SetOnModeChange callback got %v, want pull_only", got.Load())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Reconcile trigger, idle timeout, and on-connected hook wiring
+// ---------------------------------------------------------------------------
+
+// fakeReconcileTrigger counts TriggerReconcile calls.
+type fakeReconcileTrigger struct {
+	count atomic.Int64
+}
+
+func (f *fakeReconcileTrigger) TriggerReconcile() { f.count.Add(1) }
+
+func newManagerTestClient(t *testing.T, baseURL string) *ControlPlane {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	client, err := NewControlPlane(Config{BaseURL: baseURL}, "1.0.0-test", logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetAuthToken("test-token")
+	return client
+}
+
+// TestManager_ReconcilePullTrigger proves exactly one reconcile pull fires per
+// successful connect: two connects yield exactly two TriggerReconcile calls.
+func TestManager_ReconcilePullTrigger(t *testing.T) {
+	var mu sync.Mutex
+	var requestCount int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requestCount++
+		n := requestCount
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprint(w, makeEnvelopeSSE("node_state_updated", "evt-1"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if n >= 2 {
+			// Hold the second connection open so no third connect starts.
+			<-r.Context().Done()
+		}
+	}))
+	defer srv.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mgr := NewSSEManager(newManagerTestClient(t, srv.URL), nil, logger)
+	mgr.SetReconnectIntervals(1*time.Millisecond, 10*time.Millisecond)
+
+	trigger := &fakeReconcileTrigger{}
+	mgr.SetReconcileTrigger(trigger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- mgr.Start(ctx, "node-1") }()
+
+	// Wait for exactly two successful connects (two trigger calls).
+	deadline := time.After(5 * time.Second)
+	for trigger.count.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for 2 reconcile triggers")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	<-done
+
+	if got := trigger.count.Load(); got != 2 {
+		t.Errorf("TriggerReconcile called %d times, want 2", got)
+	}
+}
+
+// TestManager_NilReconcileTrigger proves Start tolerates an unset trigger: the
+// on-connected hook fires without panicking.
+func TestManager_NilReconcileTrigger(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprint(w, makeEnvelopeSSE("node_state_updated", "evt-1"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mgr := NewSSEManager(newManagerTestClient(t, srv.URL), nil, logger)
+	mgr.SetReconnectIntervals(1*time.Millisecond, 10*time.Millisecond)
+	// No SetReconcileTrigger — the trigger stays nil.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- mgr.Start(ctx, "node-1") }()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil && err != context.Canceled {
+			t.Fatalf("Start returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return within 5s")
+	}
+}
+
+// TestManager_SetIdleTimeoutPropagates proves the configured idle timeout
+// reaches the stream (issue #27 item 1): a server that sends headers then falls
+// silent triggers a reconnect within a short deadline, which the hardcoded 90s
+// could never do.
+func TestManager_SetIdleTimeoutPropagates(t *testing.T) {
+	var mu sync.Mutex
+	var requestCount int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requestCount++
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Headers then silence — the client's idle timeout must fire.
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mgr := NewSSEManager(newManagerTestClient(t, srv.URL), nil, logger)
+	mgr.SetReconnectIntervals(1*time.Millisecond, 10*time.Millisecond)
+	mgr.SetIdleTimeout(50 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- mgr.Start(ctx, "node-1") }()
+
+	// A 50ms idle timeout must drive a second connect well under the old
+	// hardcoded 90s.
+	deadline := time.After(3 * time.Second)
+	for {
+		mu.Lock()
+		n := requestCount
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("no second connect within 3s — idle timeout not propagated")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	<-done
+}
+
+// TestManager_IdleTimeoutZeroFallsBackToDefault proves an unset idle timeout is
+// a zero that Start substitutes with DefaultSSEIdleTimeout.
+func TestManager_IdleTimeoutZeroFallsBackToDefault(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mgr := NewSSEManager(newManagerTestClient(t, "http://127.0.0.1:1"), nil, logger)
+
+	if mgr.idleTimeout != 0 {
+		t.Errorf("fresh manager idleTimeout = %v, want 0 (Start substitutes the default)", mgr.idleTimeout)
+	}
+	if DefaultSSEIdleTimeout != 90*time.Second {
+		t.Errorf("DefaultSSEIdleTimeout = %v, want 90s", DefaultSSEIdleTimeout)
+	}
+}
+
+// TestManager_ConnectHookFlipsModeToStreaming proves the wired on-connected hook
+// calls notifyConnected: an engine parked in pull-only flips back to streaming
+// on the first real HTTP 200.
+func TestManager_ConnectHookFlipsModeToStreaming(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprint(w, makeEnvelopeSSE("node_state_updated", "evt-1"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mgr := NewSSEManager(newManagerTestClient(t, srv.URL), nil, logger)
+	mgr.SetReconnectIntervals(1*time.Millisecond, 10*time.Millisecond)
+
+	// Park the engine in pull-only; the on-connected hook must flip it back.
+	mgr.reconnect.setMode(DeliveryModePullOnly)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- mgr.Start(ctx, "node-1") }()
+
+	deadline := time.After(3 * time.Second)
+	for mgr.Mode() != DeliveryModeStreaming {
+		select {
+		case <-deadline:
+			t.Fatal("Mode did not flip to streaming after a successful connect")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	<-done
+}
