@@ -91,13 +91,8 @@ func makeAuditEntries(n int) []api.AuditEntry {
 
 func newAuditTestFetcher(token string) *mockSecretFetcher {
 	nsk := testNSK()
-	ct, nc := encryptTestSecret(nsk, token)
 	return &mockSecretFetcher{
-		resp: &api.SecretResponse{
-			Key:        "audit-token",
-			Ciphertext: ct,
-			Nonce:      nc,
-		},
+		resp: &api.SecretEnvelope{Data: encryptTestSecret(nsk, token), Version: 1},
 	}
 }
 

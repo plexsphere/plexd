@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 )
 
 // Register sends a registration request to the control plane.
@@ -111,15 +113,69 @@ func (c *ControlPlane) FetchState(ctx context.Context, nodeID string) (*NodeStat
 	return &resp, nil
 }
 
-// FetchSecret retrieves a specific secret for the node.
-// GET /v1/nodes/{node_id}/secrets/{key}
-func (c *ControlPlane) FetchSecret(ctx context.Context, nodeID, key string) (*SecretResponse, error) {
-	var resp SecretResponse
-	path := fmt.Sprintf("/v1/nodes/%s/secrets/%s", url.PathEscape(nodeID), url.PathEscape(key))
-	if err := c.doRequest(ctx, http.MethodGet, path, nil, &resp); err != nil {
+// secretNamePattern is the control plane's secret-name grammar and the single
+// source of truth for it: secretNameRe compiles it and ErrSecretNameInvalid
+// quotes it, so the matcher and the error text can never describe different
+// grammars.
+const secretNamePattern = `^[a-z][a-z0-9_-]{0,62}$`
+
+var secretNameRe = regexp.MustCompile(secretNamePattern)
+
+// maxSecretEnvelopeSize is the contract's 1 MiB ciphertext cap plus the
+// 12-byte nonce and 16-byte GCM tag.
+const maxSecretEnvelopeSize = 1<<20 + 28
+
+// FetchSecret retrieves a specific secret for the node as the raw AES-256-GCM
+// envelope served by the control plane: the octet-stream body carries
+// <12-byte nonce> || <ciphertext + 16-byte GCM tag>, and the version and KID
+// ride in the X-Plexsphere-Secret-Version and X-Plexsphere-Secret-KID headers.
+// A version > 0 selects an older version via ?version=N; version == 0 is the
+// current version.
+// GET /v1/nodes/{node_id}/secrets/{name}
+func (c *ControlPlane) FetchSecret(ctx context.Context, nodeID, name string, version int) (*SecretEnvelope, error) {
+	if !secretNameRe.MatchString(name) {
+		return nil, fmt.Errorf("api: fetch secret %q: %w", name, ErrSecretNameInvalid)
+	}
+	if version < 0 {
+		return nil, fmt.Errorf("api: fetch secret %q: version must be >= 0, got %d", name, version)
+	}
+
+	// The name is deliberately not escaped: the grammar forbids every character
+	// url.PathEscape would touch.
+	path := fmt.Sprintf("/v1/nodes/%s/secrets/%s", url.PathEscape(nodeID), name)
+	if version > 0 {
+		path += fmt.Sprintf("?version=%d", version)
+	}
+
+	resp, err := c.doRequestRaw(ctx, http.MethodGet, path, nil)
+	if err != nil {
 		return nil, err
 	}
-	return &resp, nil
+	defer resp.Body.Close()
+
+	reader, err := decodedBody(resp, maxSecretEnvelopeSize+1)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := io.ReadAll(io.LimitReader(reader, maxSecretEnvelopeSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("api: read secret envelope: %w", err)
+	}
+	if len(data) > maxSecretEnvelopeSize {
+		return nil, fmt.Errorf("api: secret envelope exceeds the 1 MiB cap")
+	}
+
+	v, err := strconv.Atoi(resp.Header.Get("X-Plexsphere-Secret-Version"))
+	if err != nil || v <= 0 {
+		return nil, fmt.Errorf("api: secret response missing or invalid X-Plexsphere-Secret-Version header")
+	}
+
+	return &SecretEnvelope{
+		Data:    data,
+		Version: v,
+		KID:     resp.Header.Get("X-Plexsphere-Secret-KID"),
+	}, nil
 }
 
 // ExecutionCallback posts a single execution lifecycle callback and returns the

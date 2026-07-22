@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -432,7 +433,10 @@ func TestReportEndpoint_Success(t *testing.T) {
 }
 
 func TestFetchSecret_Success(t *testing.T) {
+	envelope := []byte("\x00\x01\x02nonce+ciphertext+tag-bytes")
+	var gotQuery string
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
 		if r.Method != http.MethodGet {
 			t.Errorf("method = %s, want GET", r.Method)
 		}
@@ -440,28 +444,294 @@ func TestFetchSecret_Success(t *testing.T) {
 			t.Errorf("path = %s, want /v1/nodes/n1/secrets/tls-cert", r.URL.Path)
 		}
 
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("X-Plexsphere-Secret-Version", "3")
+		w.Header().Set("X-Plexsphere-Secret-KID", "kid-abc")
+		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(SecretResponse{
-			Key:        "tls-cert",
-			Ciphertext: "encrypted-data",
-			Nonce:      "abc123",
-			Version:    3,
-		})
+		_, _ = w.Write(envelope)
 	})
 
-	resp, err := client.FetchSecret(context.Background(), "n1", "tls-cert")
+	resp, err := client.FetchSecret(context.Background(), "n1", "tls-cert", 0)
 	if err != nil {
 		t.Fatalf("FetchSecret: %v", err)
 	}
-	if resp.Key != "tls-cert" {
-		t.Errorf("Key = %q, want %q", resp.Key, "tls-cert")
+	if !bytes.Equal(resp.Data, envelope) {
+		t.Errorf("Data = %x, want %x", resp.Data, envelope)
 	}
 	if resp.Version != 3 {
 		t.Errorf("Version = %d, want 3", resp.Version)
 	}
-	if resp.Ciphertext != "encrypted-data" {
-		t.Errorf("Ciphertext = %q, want %q", resp.Ciphertext, "encrypted-data")
+	if resp.KID != "kid-abc" {
+		t.Errorf("KID = %q, want %q", resp.KID, "kid-abc")
+	}
+	if gotQuery != "" {
+		t.Errorf("RawQuery = %q, want empty for version 0", gotQuery)
+	}
+}
+
+func TestFetchSecret_VersionQuery(t *testing.T) {
+	tests := []struct {
+		name      string
+		version   int
+		wantQuery string
+	}{
+		{"explicit version", 3, "version=3"},
+		{"current version", 0, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotQuery string
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				gotQuery = r.URL.RawQuery
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("X-Plexsphere-Secret-Version", "1")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("envelope"))
+			})
+
+			if _, err := client.FetchSecret(context.Background(), "n1", "tls-cert", tc.version); err != nil {
+				t.Fatalf("FetchSecret: %v", err)
+			}
+			if gotQuery != tc.wantQuery {
+				t.Errorf("RawQuery = %q, want %q", gotQuery, tc.wantQuery)
+			}
+		})
+	}
+}
+
+func TestFetchSecret_NameInvalid(t *testing.T) {
+	var hits int
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	})
+
+	for _, name := range []string{"", "UPPER", "0leading", strings.Repeat("a", 64)} {
+		t.Run(name, func(t *testing.T) {
+			_, err := client.FetchSecret(context.Background(), "n1", name, 0)
+			if !errors.Is(err, ErrSecretNameInvalid) {
+				t.Errorf("err = %v, want ErrSecretNameInvalid", err)
+			}
+		})
+	}
+	if hits != 0 {
+		t.Errorf("HTTP handler hit %d times, want 0", hits)
+	}
+}
+
+func TestFetchSecret_NegativeVersion(t *testing.T) {
+	var hits int
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	})
+
+	_, err := client.FetchSecret(context.Background(), "n1", "tls-cert", -1)
+	if err == nil {
+		t.Fatal("FetchSecret: expected error for negative version")
+	}
+	if !strings.Contains(err.Error(), "version must be >= 0, got -1") {
+		t.Errorf("err = %q, want it to contain %q", err.Error(), "version must be >= 0, got -1")
+	}
+	if hits != 0 {
+		t.Errorf("HTTP handler hit %d times, want 0", hits)
+	}
+}
+
+func TestFetchSecret_VersionHeaderInvalid(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		set    bool
+	}{
+		{"missing", "", false},
+		{"zero", "0", true},
+		{"non-numeric", "abc", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				if tc.set {
+					w.Header().Set("X-Plexsphere-Secret-Version", tc.header)
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("envelope"))
+			})
+
+			_, err := client.FetchSecret(context.Background(), "n1", "tls-cert", 0)
+			if err == nil {
+				t.Fatal("FetchSecret: expected error for invalid version header")
+			}
+			if !strings.Contains(err.Error(), "missing or invalid X-Plexsphere-Secret-Version header") {
+				t.Errorf("err = %q, want version-header error", err.Error())
+			}
+		})
+	}
+}
+
+func TestFetchSecret_MissingKIDTolerated(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("X-Plexsphere-Secret-Version", "2")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("envelope"))
+	})
+
+	resp, err := client.FetchSecret(context.Background(), "n1", "tls-cert", 0)
+	if err != nil {
+		t.Fatalf("FetchSecret: %v", err)
+	}
+	if resp.KID != "" {
+		t.Errorf("KID = %q, want empty", resp.KID)
+	}
+}
+
+func TestFetchSecret_EnvelopeCap(t *testing.T) {
+	serve := func(t *testing.T, size int) (*SecretEnvelope, error) {
+		t.Helper()
+		body := bytes.Repeat([]byte("x"), size)
+		client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("X-Plexsphere-Secret-Version", "1")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+		})
+		return client.FetchSecret(context.Background(), "n1", "tls-cert", 0)
+	}
+
+	t.Run("over cap", func(t *testing.T) {
+		_, err := serve(t, maxSecretEnvelopeSize+1)
+		if err == nil || !strings.Contains(err.Error(), "secret envelope exceeds the 1 MiB cap") {
+			t.Errorf("err = %v, want envelope cap error", err)
+		}
+	})
+	t.Run("at cap", func(t *testing.T) {
+		resp, err := serve(t, maxSecretEnvelopeSize)
+		if err != nil {
+			t.Fatalf("FetchSecret at cap: %v", err)
+		}
+		if len(resp.Data) != maxSecretEnvelopeSize {
+			t.Errorf("len(Data) = %d, want %d", len(resp.Data), maxSecretEnvelopeSize)
+		}
+	})
+}
+
+func TestFetchSecret_EmptyBody(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("X-Plexsphere-Secret-Version", "1")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	resp, err := client.FetchSecret(context.Background(), "n1", "tls-cert", 0)
+	if err != nil {
+		t.Fatalf("FetchSecret: %v", err)
+	}
+	if len(resp.Data) != 0 {
+		t.Errorf("len(Data) = %d, want 0", len(resp.Data))
+	}
+}
+
+func TestFetchSecret_GzipBody(t *testing.T) {
+	envelope := []byte("\x00\x01\x02plaintext-envelope-bytes")
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write(envelope); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("X-Plexsphere-Secret-Version", "1")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(buf.Bytes())
+	})
+
+	resp, err := client.FetchSecret(context.Background(), "n1", "tls-cert", 0)
+	if err != nil {
+		t.Fatalf("FetchSecret: %v", err)
+	}
+	if !bytes.Equal(resp.Data, envelope) {
+		t.Errorf("Data = %x, want %x", resp.Data, envelope)
+	}
+}
+
+func TestFetchSecret_RateLimited(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"type":"about:blank","title":"Too Many Requests","status":429,"detail":"slow down","code":"per_node_rate_limited"}`))
+	})
+
+	_, err := client.FetchSecret(context.Background(), "n1", "tls-cert", 0)
+	if !errors.Is(err, ErrRateLimit) {
+		t.Fatalf("err = %v, want ErrRateLimit", err)
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want *APIError", err)
+	}
+	if apiErr.Code != "per_node_rate_limited" {
+		t.Errorf("Code = %q, want %q", apiErr.Code, "per_node_rate_limited")
+	}
+	if apiErr.RetryAfter != 7*time.Second {
+		t.Errorf("RetryAfter = %v, want 7s", apiErr.RetryAfter)
+	}
+}
+
+func TestFetchSecret_ForbiddenAndVersionNotFound(t *testing.T) {
+	t.Run("forbidden", func(t *testing.T) {
+		client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"status":403,"detail":"denied","code":"secret_forbidden"}`))
+		})
+		_, err := client.FetchSecret(context.Background(), "n1", "tls-cert", 0)
+		if !errors.Is(err, ErrForbidden) {
+			t.Errorf("err = %v, want ErrForbidden", err)
+		}
+	})
+	t.Run("version not found", func(t *testing.T) {
+		client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"status":404,"detail":"no such version","code":"secret_version_not_found"}`))
+		})
+		_, err := client.FetchSecret(context.Background(), "n1", "tls-cert", 5)
+		if !errors.Is(err, ErrNotFound) {
+			t.Errorf("err = %v, want ErrNotFound", err)
+		}
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("err = %v, want *APIError", err)
+		}
+		if apiErr.Code != "secret_version_not_found" {
+			t.Errorf("Code = %q, want %q", apiErr.Code, "secret_version_not_found")
+		}
+	})
+}
+
+func TestFetchSecret_TransportError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	cfg := Config{BaseURL: srv.URL}
+	client, err := NewControlPlane(cfg, "1.0.0-test", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetAuthToken("test-token")
+	srv.Close() // close so the request fails at the transport level
+
+	_, err = client.FetchSecret(context.Background(), "n1", "tls-cert", 0)
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("err = %v, want *url.Error", err)
 	}
 }
 
@@ -899,26 +1169,30 @@ func TestEndpoints_PathParametersEscaped(t *testing.T) {
 }
 
 func TestFetchSecret_PathParametersEscaped(t *testing.T) {
-	// Verify both nodeID and key parameters are escaped.
+	// Verify the nodeID is escaped; the in-grammar name needs no escaping.
 	var gotPath string
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.RawPath
 		if gotPath == "" {
 			gotPath = r.URL.Path
 		}
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("X-Plexsphere-Secret-Version", "1")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"key":"k","ciphertext":"c","nonce":"n","version":1}`))
+		_, _ = w.Write([]byte("envelope"))
 	})
 
-	_, err := client.FetchSecret(context.Background(), "node/id", "secret/key")
+	_, err := client.FetchSecret(context.Background(), "node/id", "secret-key", 0)
 	if err != nil {
 		t.Fatalf("FetchSecret: %v", err)
 	}
 
-	// Slashes in parameters should be escaped.
-	if strings.Contains(gotPath, "node/id") || strings.Contains(gotPath, "secret/key") {
-		t.Errorf("path contains unescaped slashes in parameters: %s", gotPath)
+	// A slash in the node ID must be escaped in the path.
+	if strings.Contains(gotPath, "node/id") {
+		t.Errorf("path contains unescaped node ID slash: %s", gotPath)
+	}
+	if !strings.Contains(gotPath, "%2F") && !strings.Contains(gotPath, "%2f") {
+		t.Errorf("path does not contain escaped node ID slash: %s", gotPath)
 	}
 }
 

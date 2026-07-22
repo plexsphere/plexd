@@ -172,11 +172,15 @@ type SecretRef struct {
 // Secrets  GET /v1/nodes/{node_id}/secrets/{key}
 // ---------------------------------------------------------------------------
 
-type SecretResponse struct {
-	Key        string `json:"key"`
-	Ciphertext string `json:"ciphertext"`
-	Nonce      string `json:"nonce"`
-	Version    int    `json:"version"`
+// SecretEnvelope is the raw AES-256-GCM envelope served by
+// GET /v1/nodes/{id}/secrets/{name}: Data is <12-byte nonce> ||
+// <ciphertext + 16-byte GCM tag>, Version and KID come from the
+// X-Plexsphere-Secret-Version and X-Plexsphere-Secret-KID headers.
+// It is parsed from headers and body, never from JSON.
+type SecretEnvelope struct {
+	Data    []byte
+	Version int
+	KID     string
 }
 
 // ---------------------------------------------------------------------------

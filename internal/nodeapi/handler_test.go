@@ -1,14 +1,17 @@
 package nodeapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,12 +19,31 @@ import (
 )
 
 type mockSecretFetcher struct {
-	resp *api.SecretResponse
-	err  error
+	mu          sync.Mutex
+	envelope    *api.SecretEnvelope
+	err         error
+	calls       int
+	lastVersion int
 }
 
-func (m *mockSecretFetcher) FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error) {
-	return m.resp, m.err
+func (m *mockSecretFetcher) FetchSecret(_ context.Context, _, _ string, version int) (*api.SecretEnvelope, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls++
+	m.lastVersion = version
+	return m.envelope, m.err
+}
+
+func (m *mockSecretFetcher) callCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls
+}
+
+func (m *mockSecretFetcher) version() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastVersion
 }
 
 // newTestHandler creates a Handler with a populated cache and returns the
@@ -252,29 +274,29 @@ func TestHandler_GetSecretsList(t *testing.T) {
 	}
 }
 
-func TestHandler_GetSecretValue(t *testing.T) {
-	nsk := testKey(t)
-	ct, nonce := testEncrypt(t, nsk, "supersecret")
-
-	fetcher := &mockSecretFetcher{
-		resp: &api.SecretResponse{
-			Key:        "db-pass",
-			Ciphertext: ct,
-			Nonce:      nonce,
-			Version:    1,
-		},
-	}
-
+// newSecretTestServer builds a Handler with the given fetcher, nsk and logger
+// and returns the httptest.Server wrapping its Mux.
+func newSecretTestServer(t *testing.T, fetcher SecretFetcher, nsk []byte, logger *slog.Logger) *httptest.Server {
+	t.Helper()
 	dir := t.TempDir()
 	cache := NewStateCache(dir, discardLogger())
 	if err := cache.Load(); err != nil {
 		t.Fatalf("cache.Load: %v", err)
 	}
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := NewHandler(cache, fetcher, "node-1", nsk, logger)
 	srv := httptest.NewServer(h.Mux())
 	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestHandler_GetSecretValue(t *testing.T) {
+	nsk := testKey(t)
+	envelope := testEncrypt(t, nsk, "supersecret")
+
+	fetcher := &mockSecretFetcher{
+		envelope: &api.SecretEnvelope{Data: envelope, Version: 1, KID: "kid-1"},
+	}
+	srv := newSecretTestServer(t, fetcher, nsk, discardLogger())
 
 	resp := mustGet(t, srv.URL+"/v1/state/secrets/db-pass")
 	if resp.StatusCode != 200 {
@@ -287,6 +309,7 @@ func TestHandler_GetSecretValue(t *testing.T) {
 		Version int    `json:"version"`
 	}
 	decodeJSON(t, resp, &result)
+	// Key is echoed from the request path; the envelope carries no key field.
 	if result.Key != "db-pass" {
 		t.Errorf("key = %q, want %q", result.Key, "db-pass")
 	}
@@ -298,50 +321,115 @@ func TestHandler_GetSecretValue(t *testing.T) {
 	}
 }
 
-func TestHandler_GetSecretValue_ControlPlaneDown(t *testing.T) {
+func TestHandler_GetSecretValue_VersionPassthrough(t *testing.T) {
+	nsk := testKey(t)
+	envelope := testEncrypt(t, nsk, "val")
 	fetcher := &mockSecretFetcher{
-		err: errors.New("connection refused"),
+		envelope: &api.SecretEnvelope{Data: envelope, Version: 2},
 	}
-	srv, _ := newTestHandler(t, fetcher)
+	srv := newSecretTestServer(t, fetcher, nsk, discardLogger())
 
-	resp := mustGet(t, srv.URL+"/v1/state/secrets/db-pass")
-	if resp.StatusCode != 503 {
-		t.Errorf("status = %d, want 503", resp.StatusCode)
+	// A valid ?version=2 is passed through to the fetcher.
+	resp := mustGet(t, srv.URL+"/v1/state/secrets/db-pass?version=2")
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 	resp.Body.Close()
+	if fetcher.version() != 2 {
+		t.Errorf("fetched version = %d, want 2", fetcher.version())
+	}
+
+	// Invalid versions are rejected with 400 without calling the fetcher again.
+	for _, q := range []string{"version=0", "version=-1", "version=abc"} {
+		before := fetcher.callCount()
+		resp := mustGet(t, srv.URL+"/v1/state/secrets/db-pass?"+q)
+		if resp.StatusCode != 400 {
+			t.Errorf("query %q: status = %d, want 400", q, resp.StatusCode)
+		}
+		resp.Body.Close()
+		if got := fetcher.callCount(); got != before {
+			t.Errorf("query %q: fetcher call count changed from %d to %d, want unchanged", q, before, got)
+		}
+	}
 }
 
-func TestHandler_GetSecretValue_NotFound(t *testing.T) {
-	fetcher := &mockSecretFetcher{
-		err: api.ErrNotFound,
+func TestHandler_GetSecretValue_ErrorMapping(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantRetry  string
+	}{
+		{"name invalid", fmt.Errorf("api: fetch secret: %w", api.ErrSecretNameInvalid), http.StatusBadRequest, ""},
+		{"not found", api.ErrNotFound, http.StatusNotFound, ""},
+		{"forbidden", api.ErrForbidden, http.StatusForbidden, ""},
+		{"rate limited", &api.APIError{StatusCode: 429, Code: "per_node_rate_limited", RetryAfter: 5 * time.Second}, http.StatusTooManyRequests, "5"},
+		{"transport", errors.New("connection refused"), http.StatusServiceUnavailable, ""},
 	}
-	srv, _ := newTestHandler(t, fetcher)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fetcher := &mockSecretFetcher{err: tc.err}
+			srv := newSecretTestServer(t, fetcher, testKey(t), discardLogger())
 
-	resp := mustGet(t, srv.URL+"/v1/state/secrets/nonexistent")
-	if resp.StatusCode != 404 {
-		t.Errorf("status = %d, want 404", resp.StatusCode)
+			resp := mustGet(t, srv.URL+"/v1/state/secrets/db-pass")
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+			if got := resp.Header.Get("Retry-After"); got != tc.wantRetry {
+				t.Errorf("Retry-After = %q, want %q", got, tc.wantRetry)
+			}
+		})
 	}
-	resp.Body.Close()
 }
 
 func TestHandler_GetSecretValue_DecryptionFailure(t *testing.T) {
-	// FetchSecret returns a valid response but with invalid ciphertext,
-	// triggering a DecryptSecret failure and a 500 response.
+	// A garbage envelope cannot be decrypted → 500, and the error log carries
+	// kid and version attributes alongside the key.
+	nsk := testKey(t)
 	fetcher := &mockSecretFetcher{
-		resp: &api.SecretResponse{
-			Key:        "db-pass",
-			Ciphertext: "dGhpcyBpcyBub3QgdmFsaWQgY2lwaGVydGV4dA==", // valid base64, invalid ciphertext
-			Nonce:      "AAAAAAAAAAAAAAAAAAAAAAAA",                    // valid base64, 12 bytes (16 b64 chars + padding)
-			Version:    1,
-		},
+		envelope: &api.SecretEnvelope{Data: []byte("this is not a valid envelope"), Version: 7, KID: "kid-xyz"},
 	}
-	srv, _ := newTestHandler(t, fetcher)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	srv := newSecretTestServer(t, fetcher, nsk, logger)
 
 	resp := mustGet(t, srv.URL+"/v1/state/secrets/db-pass")
 	if resp.StatusCode != 500 {
 		t.Errorf("status = %d, want 500", resp.StatusCode)
 	}
 	resp.Body.Close()
+
+	logOut := buf.String()
+	if !strings.Contains(logOut, "secret decryption failed") {
+		t.Errorf("log missing decryption-failure message: %s", logOut)
+	}
+	if !strings.Contains(logOut, "kid=kid-xyz") {
+		t.Errorf("log missing kid attribute: %s", logOut)
+	}
+	if !strings.Contains(logOut, "version=7") {
+		t.Errorf("log missing version attribute: %s", logOut)
+	}
+}
+
+func TestHandler_GetSecretValue_NoCaching(t *testing.T) {
+	nsk := testKey(t)
+	envelope := testEncrypt(t, nsk, "val")
+	fetcher := &mockSecretFetcher{
+		envelope: &api.SecretEnvelope{Data: envelope, Version: 1},
+	}
+	srv := newSecretTestServer(t, fetcher, nsk, discardLogger())
+
+	for i := 0; i < 2; i++ {
+		resp := mustGet(t, srv.URL+"/v1/state/secrets/db-pass")
+		if resp.StatusCode != 200 {
+			t.Fatalf("call %d: status = %d, want 200", i, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	if got := fetcher.callCount(); got != 2 {
+		t.Errorf("fetcher call count = %d, want 2 (no handler-side caching)", got)
+	}
 }
 
 func TestHandler_GetReportAll(t *testing.T) {

@@ -169,14 +169,9 @@ func handleResponseAllowEmpty(resp *http.Response, result any, allowEmpty bool) 
 
 	// A 204 carries no body by definition, so skip decoding it entirely.
 	if result != nil && resp.StatusCode != http.StatusNoContent {
-		var reader io.Reader = resp.Body
-		if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-			gr, err := gzip.NewReader(resp.Body)
-			if err != nil {
-				return fmt.Errorf("api: gzip decompress response: %w", err)
-			}
-			defer gr.Close()
-			reader = io.LimitReader(gr, maxResponseSize)
+		reader, err := decodedBody(resp, maxResponseSize)
+		if err != nil {
+			return err
 		}
 		if err := json.NewDecoder(reader).Decode(result); err != nil {
 			if allowEmpty {
@@ -187,6 +182,22 @@ func handleResponseAllowEmpty(resp *http.Response, result any, allowEmpty bool) 
 	}
 
 	return nil
+}
+
+// decodedBody returns a reader over resp.Body that transparently gunzips a
+// gzip-encoded response, capping the decompressed stream at limit bytes so a
+// hostile "gzip bomb" cannot expand without bound. An uncompressed body is
+// returned unwrapped and unbounded: it cannot expand past the bytes the peer
+// already sent, so each caller bounds it where it needs to.
+func decodedBody(resp *http.Response, limit int64) (io.Reader, error) {
+	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		gr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("api: gzip decompress response: %w", err)
+		}
+		return io.LimitReader(gr, limit), nil
+	}
+	return resp.Body, nil
 }
 
 // doRequestRaw sends an HTTP request and returns the raw response without

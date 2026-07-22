@@ -21,14 +21,14 @@ import (
 
 // configurableTestClient extends serverTestClient with configurable behavior.
 type configurableTestClient struct {
-	fetchSecret       func(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
+	fetchSecret       func(ctx context.Context, nodeID, name string, version int) (*api.SecretEnvelope, error)
 	putStateReport    func(ctx context.Context, nodeID, key string, req api.NodeStateReportRequest) (*api.NodeStateReportResponse, error)
 	deleteStateReport func(ctx context.Context, nodeID, key string) error
 }
 
-func (c *configurableTestClient) FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error) {
+func (c *configurableTestClient) FetchSecret(ctx context.Context, nodeID, name string, version int) (*api.SecretEnvelope, error) {
 	if c.fetchSecret != nil {
-		return c.fetchSecret(ctx, nodeID, key)
+		return c.fetchSecret(ctx, nodeID, name, version)
 	}
 	return nil, fmt.Errorf("not implemented")
 }
@@ -49,13 +49,13 @@ func (c *configurableTestClient) DeleteStateReport(ctx context.Context, nodeID, 
 
 // serverTestClient combines SecretFetcher and ReportSyncClient for tests.
 type serverTestClient struct {
-	secretResp *api.SecretResponse
+	secretResp *api.SecretEnvelope
 	secretErr  error
 	putErr     error
 	deleteErr  error
 }
 
-func (c *serverTestClient) FetchSecret(_ context.Context, _, _ string) (*api.SecretResponse, error) {
+func (c *serverTestClient) FetchSecret(_ context.Context, _, _ string, _ int) (*api.SecretEnvelope, error) {
 	return c.secretResp, c.secretErr
 }
 
@@ -618,7 +618,7 @@ type trackingSyncClient struct {
 	puts chan string
 }
 
-func (c *trackingSyncClient) FetchSecret(_ context.Context, _, _ string) (*api.SecretResponse, error) {
+func (c *trackingSyncClient) FetchSecret(_ context.Context, _, _ string, _ int) (*api.SecretEnvelope, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 
@@ -929,18 +929,13 @@ func TestServer_SecretProxy(t *testing.T) {
 
 	nsk := testKey(t)
 	secretPlaintext := "super-secret-password"
-	ct, nonce := testEncrypt(t, nsk, secretPlaintext)
+	envelope := testEncrypt(t, nsk, secretPlaintext)
 
 	client := &configurableTestClient{
-		fetchSecret: func(_ context.Context, nodeID, key string) (*api.SecretResponse, error) {
-			switch key {
+		fetchSecret: func(_ context.Context, nodeID, name string, version int) (*api.SecretEnvelope, error) {
+			switch name {
 			case "db-password":
-				return &api.SecretResponse{
-					Key:        "db-password",
-					Ciphertext: ct,
-					Nonce:      nonce,
-					Version:    3,
-				}, nil
+				return &api.SecretEnvelope{Data: envelope, Version: 3}, nil
 			case "missing-key":
 				return nil, api.ErrNotFound
 			default:

@@ -328,6 +328,18 @@ func TestIsIngestPermanentlyRefused(t *testing.T) {
 	}
 }
 
+func TestErrSecretNameInvalid(t *testing.T) {
+	const want = "secret name is outside the grammar ^[a-z][a-z0-9_-]{0,62}$"
+	if got := ErrSecretNameInvalid.Error(); got != want {
+		t.Errorf("ErrSecretNameInvalid.Error() = %q, want %q", got, want)
+	}
+
+	wrapped := fmt.Errorf("api: fetch secret %q: %w", "X", ErrSecretNameInvalid)
+	if !errors.Is(wrapped, ErrSecretNameInvalid) {
+		t.Errorf("errors.Is(wrapped, ErrSecretNameInvalid) = false, want true")
+	}
+}
+
 func TestIsIngestTooLarge(t *testing.T) {
 	tests := []struct {
 		name string

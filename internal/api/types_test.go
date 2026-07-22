@@ -443,17 +443,6 @@ func TestPolicyRule_PortsOmittedWhenNil(t *testing.T) {
 	}
 }
 
-func TestTypesSecretResponse(t *testing.T) {
-	orig := SecretResponse{
-		Key:        "db-password",
-		Ciphertext: "Y2lwaGVy",
-		Nonce:      "bm9uY2U=",
-		Version:    3,
-	}
-	_, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-}
-
 func TestTypesMetricPoint(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	orig := MetricPoint{

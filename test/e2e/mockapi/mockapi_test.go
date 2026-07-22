@@ -1745,7 +1745,7 @@ func TestDrift_RouteRemoved_Returns404(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSecrets_ReturnsFixtureWithPathKey(t *testing.T) {
-	_, ts := newTestServer(t)
+	srv, ts := newTestServer(t)
 
 	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/secrets/db-password")
 	if err != nil {
@@ -1756,21 +1756,29 @@ func TestSecrets_ReturnsFixtureWithPathKey(t *testing.T) {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 
-	var sr api.SecretResponse
-	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		t.Fatalf("decode: %v", err)
+	if got := resp.Header.Get("X-Plexsphere-Secret-Version"); got != "1" {
+		t.Errorf("X-Plexsphere-Secret-Version = %q, want %q", got, "1")
 	}
-	if sr.Key != "db-password" {
-		t.Errorf("Key = %q, want %q", sr.Key, "db-password")
+	if got := resp.Header.Get("X-Plexsphere-Secret-KID"); got != "e2e-nsk-kid-1" {
+		t.Errorf("X-Plexsphere-Secret-KID = %q, want %q", got, "e2e-nsk-kid-1")
 	}
-	if sr.Ciphertext == "" {
-		t.Error("Ciphertext is empty")
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want %q", got, "no-store")
 	}
-	if sr.Nonce == "" {
-		t.Error("Nonce is empty")
+	if got := resp.Header.Get("Content-Type"); got != "application/octet-stream" {
+		t.Errorf("Content-Type = %q, want %q", got, "application/octet-stream")
 	}
-	if sr.Version != 1 {
-		t.Errorf("Version = %d, want 1", sr.Version)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	plaintext, err := nodeapi.DecryptSecret(srv.NSK(), body)
+	if err != nil {
+		t.Fatalf("DecryptSecret: %v", err)
+	}
+	if plaintext != srv.ExpectedBearerToken() {
+		t.Errorf("decrypted = %q, want %q", plaintext, srv.ExpectedBearerToken())
 	}
 
 	a := getAssertions(t, ts.URL)
@@ -1786,6 +1794,90 @@ func TestSecrets_WrongMethod_Returns405(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestSecrets_FreshNoncePerFetch(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	get := func() []byte {
+		t.Helper()
+		resp, err := http.Get(ts.URL + "/v1/nodes/node-1/secrets/db-password")
+		if err != nil {
+			t.Fatalf("GET secrets: %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return body
+	}
+
+	if first, second := get(), get(); bytes.Equal(first, second) {
+		t.Error("two fetches produced identical envelopes, want a fresh nonce each time")
+	}
+}
+
+func TestSecrets_KeyOutsideGrammarReturns404(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/secrets/DB-password")
+	if err != nil {
+		t.Fatalf("GET secrets: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want application/problem+json", ct)
+	}
+	var problem struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem.Code != "secret_not_found" {
+		t.Errorf("code = %q, want %q", problem.Code, "secret_not_found")
+	}
+}
+
+func TestSecrets_VersionAboveCurrentReturns404(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/secrets/db-password?version=2")
+	if err != nil {
+		t.Fatalf("GET secrets: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+	var problem struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem.Code != "secret_version_not_found" {
+		t.Errorf("code = %q, want %q", problem.Code, "secret_version_not_found")
+	}
+}
+
+func TestSecrets_InvalidVersionReturns400(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	for _, q := range []string{"version=abc", "version=0"} {
+		resp, err := http.Get(ts.URL + "/v1/nodes/node-1/secrets/db-password?" + q)
+		if err != nil {
+			t.Fatalf("GET secrets ?%s: %v", q, err)
+		}
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("?%s: status = %d, want %d", q, resp.StatusCode, http.StatusBadRequest)
+		}
+		resp.Body.Close()
 	}
 }
 
@@ -3998,12 +4090,12 @@ func TestHandleSecrets_ReturnsDecryptableResponse(t *testing.T) {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 
-	var secret api.SecretResponse
-	if err := json.NewDecoder(resp.Body).Decode(&secret); err != nil {
-		t.Fatalf("decode: %v", err)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
 	}
 
-	plaintext, err := nodeapi.DecryptSecret(srv.NSK(), secret.Ciphertext, secret.Nonce)
+	plaintext, err := nodeapi.DecryptSecret(srv.NSK(), body)
 	if err != nil {
 		t.Fatalf("DecryptSecret: %v", err)
 	}
