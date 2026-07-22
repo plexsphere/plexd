@@ -2,7 +2,6 @@ package peerexchange
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -16,7 +15,6 @@ import (
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/nat"
-	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
 // ---------------------------------------------------------------------------
@@ -72,87 +70,6 @@ func (m *mockSTUNClient) Bind(ctx context.Context, serverAddr string, localPort 
 	return nat.MappedAddress{}, 0, defaultErr
 }
 
-// mockWGController is a test double for wireguard.WGController.
-type mockWGController struct {
-	mu    sync.Mutex
-	peers []wireguard.PeerConfig
-	calls []mockWGCall
-}
-
-type mockWGCall struct {
-	Method string
-	Args   []interface{}
-}
-
-func (m *mockWGController) CreateInterface(name string, privateKey []byte, listenPort int) error {
-	m.mu.Lock()
-	m.calls = append(m.calls, mockWGCall{Method: "CreateInterface", Args: []interface{}{name, privateKey, listenPort}})
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *mockWGController) DeleteInterface(name string) error {
-	m.mu.Lock()
-	m.calls = append(m.calls, mockWGCall{Method: "DeleteInterface", Args: []interface{}{name}})
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *mockWGController) ConfigureAddress(name string, address string) error {
-	m.mu.Lock()
-	m.calls = append(m.calls, mockWGCall{Method: "ConfigureAddress", Args: []interface{}{name, address}})
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *mockWGController) SetInterfaceUp(name string) error {
-	m.mu.Lock()
-	m.calls = append(m.calls, mockWGCall{Method: "SetInterfaceUp", Args: []interface{}{name}})
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *mockWGController) SetMTU(name string, mtu int) error {
-	m.mu.Lock()
-	m.calls = append(m.calls, mockWGCall{Method: "SetMTU", Args: []interface{}{name, mtu}})
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *mockWGController) AddPeer(iface string, cfg wireguard.PeerConfig) error {
-	m.mu.Lock()
-	m.peers = append(m.peers, cfg)
-	m.calls = append(m.calls, mockWGCall{Method: "AddPeer", Args: []interface{}{iface, cfg}})
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *mockWGController) RemovePeer(iface string, publicKey []byte) error {
-	m.mu.Lock()
-	m.calls = append(m.calls, mockWGCall{Method: "RemovePeer", Args: []interface{}{iface, publicKey}})
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *mockWGController) SetPrivateKey(name string, privateKey []byte) error {
-	m.mu.Lock()
-	m.calls = append(m.calls, mockWGCall{Method: "SetPrivateKey", Args: []interface{}{name, privateKey}})
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *mockWGController) addPeerCalls() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	n := 0
-	for _, c := range m.calls {
-		if c.Method == "AddPeer" {
-			n++
-		}
-	}
-	return n
-}
-
 // newTestControlPlane creates a ControlPlane pointing at the given test server.
 func newTestControlPlane(t *testing.T, ts *httptest.Server) *api.ControlPlane {
 	t.Helper()
@@ -164,9 +81,9 @@ func newTestControlPlane(t *testing.T, ts *httptest.Server) *api.ControlPlane {
 	return cp
 }
 
-// newTestExchanger constructs an Exchanger with the provided mock STUN client,
-// httptest server for the control plane, and a mock WG controller.
-func newTestExchanger(t *testing.T, stunClient nat.STUNClient, ts *httptest.Server, ctrl *mockWGController) *Exchanger {
+// newTestExchanger constructs an Exchanger with the provided mock STUN client
+// and httptest server for the control plane.
+func newTestExchanger(t *testing.T, stunClient nat.STUNClient, ts *httptest.Server) *Exchanger {
 	t.Helper()
 	logger := discardLogger()
 
@@ -177,7 +94,6 @@ func newTestExchanger(t *testing.T, stunClient nat.STUNClient, ts *httptest.Serv
 		Timeout:         5 * time.Second,
 	}
 	discoverer := nat.NewDiscoverer(stunClient, natCfg, 51820, logger)
-	wgManager := wireguard.NewManager(ctrl, wireguard.Config{}, logger)
 	cpClient := newTestControlPlane(t, ts)
 
 	cfg := Config{}
@@ -186,7 +102,7 @@ func newTestExchanger(t *testing.T, stunClient nat.STUNClient, ts *httptest.Serv
 	cfg.RefreshInterval = natCfg.RefreshInterval
 	cfg.Timeout = natCfg.Timeout
 
-	return NewExchanger(discoverer, wgManager, cpClient, cfg, logger)
+	return NewExchanger(discoverer, cpClient, cfg, logger)
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +112,6 @@ func newTestExchanger(t *testing.T, stunClient nat.STUNClient, ts *httptest.Serv
 func TestExchanger_Run_NATDisabled(t *testing.T) {
 	logger := discardLogger()
 	discoverer := nat.NewDiscoverer(nil, nat.Config{}, 51820, logger)
-	wgManager := wireguard.NewManager(&mockWGController{}, wireguard.Config{}, logger)
 
 	ts := httptest.NewServer(http.NotFoundHandler())
 	defer ts.Close()
@@ -207,7 +122,7 @@ func TestExchanger_Run_NATDisabled(t *testing.T) {
 	// Set a non-zero field so ApplyDefaults does not override Enabled to true.
 	cfg.RefreshInterval = 60 * time.Second
 
-	e := NewExchanger(discoverer, wgManager, cpClient, cfg, logger)
+	e := NewExchanger(discoverer, cpClient, cfg, logger)
 
 	err := e.Run(context.Background(), "node-1")
 	if err != nil {
@@ -251,8 +166,7 @@ func TestExchanger_Run_InitialDiscoveryAndReport(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	ctrl := &mockWGController{}
-	e := newTestExchanger(t, stunClient, ts, ctrl)
+	e := newTestExchanger(t, stunClient, ts)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -288,8 +202,7 @@ func TestExchanger_Run_ContextCancellation(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	ctrl := &mockWGController{}
-	e := newTestExchanger(t, stunClient, ts, ctrl)
+	e := newTestExchanger(t, stunClient, ts)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -306,69 +219,6 @@ func TestExchanger_Run_ContextCancellation(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after context cancellation")
-	}
-}
-
-func TestExchanger_RegisterHandlers(t *testing.T) {
-	tests := []struct {
-		name       string
-		natEnabled bool
-	}{
-		{"NATEnabled", true},
-		// RegisterHandlers must work even when NAT is disabled, because
-		// inbound peer endpoint updates still need to be processed via SSE.
-		{"NATDisabled", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			logger := discardLogger()
-
-			ts := httptest.NewServer(http.NotFoundHandler())
-			defer ts.Close()
-			cpClient := newTestControlPlane(t, ts)
-
-			ctrl := &mockWGController{}
-			wgManager := wireguard.NewManager(ctrl, wireguard.Config{}, logger)
-			discoverer := nat.NewDiscoverer(nil, nat.Config{}, 51820, logger)
-
-			cfg := Config{}
-			if !tt.natEnabled {
-				cfg.Enabled = false
-				cfg.RefreshInterval = 60 * time.Second
-			}
-			e := NewExchanger(discoverer, wgManager, cpClient, cfg, logger)
-
-			sseManager := api.NewSSEManager(cpClient, nil, logger)
-			e.RegisterHandlers(sseManager)
-
-			// Verify the handler works by creating a dispatcher and dispatching an event.
-			dispatcher := api.NewEventDispatcher(logger)
-			dispatcher.Register(api.EventPeerEndpointChanged, wireguard.HandlePeerEndpointChanged(wgManager))
-
-			peerPubKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
-			wgManager.PeerIndex().Add("peer-1", peerPubKey)
-
-			peer := api.Peer{
-				ID:         "peer-1",
-				PublicKey:  peerPubKey,
-				MeshIP:     "10.0.0.2",
-				Endpoint:   "9.8.7.6:51820",
-				AllowedIPs: []string{"10.0.0.2/32"},
-			}
-			payload, _ := json.Marshal(peer)
-			envelope := api.Envelope{
-				Type:    api.EventPeerEndpointChanged,
-				ID:      "evt-1",
-				Payload: payload,
-			}
-
-			dispatcher.Dispatch(context.Background(), envelope)
-
-			if n := ctrl.addPeerCalls(); n != 1 {
-				t.Errorf("expected 1 AddPeer call, got %d", n)
-			}
-		})
 	}
 }
 
@@ -394,11 +244,9 @@ func TestExchanger_LastResult(t *testing.T) {
 	defer ts.Close()
 	cpClient := newTestControlPlane(t, ts)
 
-	wgManager := wireguard.NewManager(&mockWGController{}, wireguard.Config{}, logger)
-
 	cfg := Config{}
 	cfg.Enabled = true
-	e := NewExchanger(discoverer, wgManager, cpClient, cfg, logger)
+	e := NewExchanger(discoverer, cpClient, cfg, logger)
 
 	// Before discovery, LastResult should be nil.
 	if e.LastResult() != nil {

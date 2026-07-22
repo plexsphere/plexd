@@ -12,30 +12,30 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	EventPeerAdded                = "peer_added"
-	EventPeerRemoved              = "peer_removed"
-	EventPeerKeyRotated           = "peer_key_rotated"
-	EventPeerEndpointChanged      = "peer_endpoint_changed"
-	EventPolicyUpdated            = "policy_updated"
-	EventActionRequest            = "action_request"
-	EventSessionRevoked           = "session_revoked"
-	EventSSHSessionSetup          = "ssh_session_setup"
-	EventRotateKeys               = "rotate_keys"
-	EventSigningKeyRotated        = "signing_key_rotated"
-	EventNodeStateUpdated         = "node_state_updated"
-	EventNodeSecretsUpdated       = "node_secrets_updated"
-	EventBridgeConfigUpdated      = "bridge_config_updated"
-	EventRelaySessionAssigned     = "relay_session_assigned"
-	EventRelaySessionRevoked      = "relay_session_revoked"
-	EventUserAccessConfigUpdated  = "user_access_config_updated"
-	EventUserAccessPeerAssigned   = "user_access_peer_assigned"
-	EventUserAccessPeerRevoked    = "user_access_peer_revoked"
-	EventIngressConfigUpdated     = "ingress_config_updated"
-	EventIngressRuleAssigned      = "ingress_rule_assigned"
-	EventIngressRuleRevoked       = "ingress_rule_revoked"
-	EventSiteToSiteConfigUpdated  = "site_to_site_config_updated"
-	EventSiteToSiteTunnelAssigned = "site_to_site_tunnel_assigned"
-	EventSiteToSiteTunnelRevoked  = "site_to_site_tunnel_revoked"
+	// Contract types are emitted by the control plane per the OpenAPI events
+	// document. Their payloads are treated as opaque: the reconciler pull is
+	// authoritative, so each of these events triggers a reconcile.
+	EventNodeStateUpdated    = "node_state_updated"
+	EventPolicyUpdated       = "policy_updated"
+	EventBridgeConfigUpdated = "bridge_config_updated"
+
+	// Documented-coming family: types that land with the platform's 14-type
+	// taxonomy. They are already named so the agent can subscribe to them once
+	// the control plane starts emitting them; every one triggers a reconcile.
+	EventPeerRegistered      = "peer_registered"
+	EventPeerPSKAssigned     = "peer_psk_assigned"
+	EventPeerDeregistered    = "peer_deregistered"
+	EventPeerEndpointChanged = "peer_endpoint_changed"
+	EventRotateKeys          = "rotate_keys"
+	EventPeerKeyRotated      = "peer_key_rotated"
+	EventSigningKeyRotated   = "signing_key_rotated"
+
+	// Test-only trio: retained only until the platform taxonomy ships real
+	// discriminators. They are injectable exclusively through the mock control
+	// plane in tests; the production control plane never emits them.
+	EventActionRequest   = "action_request"
+	EventSSHSessionSetup = "ssh_session_setup"
+	EventSessionRevoked  = "session_revoked"
 )
 
 // ---------------------------------------------------------------------------

@@ -302,21 +302,20 @@ func TestServer_ReconcileHandler(t *testing.T) {
 	// (secret refs no longer ride the snapshot).
 	srv.cache.UpdateSecretIndex([]api.SecretRef{{Key: "db-pass", Version: 2}})
 
-	// Pre-seed an SSE-delivered data entry so we can assert the pull path does
-	// not clobber it with a fabricated content_type/version.
+	// Pre-seed a data entry the next snapshot no longer carries, to prove the
+	// pull replaces the versioned data store rather than merging into it.
 	srv.cache.UpdateData([]api.DataEntry{
-		{Key: "cfg", ContentType: "application/json", Payload: json.RawMessage(`{"a":1}`), Version: 7},
+		{Key: "stale", ContentType: dataStateContentType, Payload: json.RawMessage(`"old"`), Version: 1},
 	})
 
-	// Get the reconcile handler.
 	handler := srv.ReconcileHandler()
 	if handler == nil {
 		cancel()
 		t.Fatal("ReconcileHandler returned nil")
 	}
 
-	// StateChanged feeds the metadata map. The snapshot's opaque data bucket is
-	// deliberately ignored — the versioned data store is SSE-owned.
+	// StateChanged feeds the metadata map and the opaque data bucket. Each data
+	// value is JSON-encoded into a versioned DataEntry under a fixed text type.
 	desired := &api.NodeStateSnapshot{
 		State: &api.NodeStateBlock{
 			Metadata: []api.StateEntry{{Key: "env", Value: "prod"}},
@@ -324,46 +323,68 @@ func TestServer_ReconcileHandler(t *testing.T) {
 			Reports:  []api.StateEntry{},
 		},
 	}
-	diff := reconcile.StateDiff{StateChanged: true}
-
-	if err := handler(ctx, desired, diff); err != nil {
+	if err := handler(ctx, desired, reconcile.StateDiff{StateChanged: true}); err != nil {
 		cancel()
 		t.Fatalf("reconcile handler: %v", err)
 	}
 
-	// Verify metadata bucket became the cache metadata map.
-	meta := srv.cache.GetMetadata()
-	if meta["env"] != "prod" {
+	// Metadata bucket became the cache metadata map.
+	if meta := srv.cache.GetMetadata(); meta["env"] != "prod" {
 		cancel()
 		t.Errorf("metadata[env] = %q, want %q", meta["env"], "prod")
 	}
 
-	// The SSE-delivered data entry must survive the pull untouched: its real
-	// content_type and version are not overwritten with fabricated values.
+	// The opaque data value is now served as a versioned DataEntry.
 	data := srv.cache.GetData()
 	entry, ok := data["cfg"]
 	if !ok {
 		cancel()
-		t.Fatal("SSE-delivered data entry 'cfg' was removed by reconcile")
+		t.Fatal("data entry 'cfg' was not fed from the snapshot")
 	}
-	if entry.ContentType != "application/json" {
+	if entry.ContentType != dataStateContentType {
 		cancel()
-		t.Errorf("data content_type = %q, want %q (clobbered by pull)", entry.ContentType, "application/json")
+		t.Errorf("data content_type = %q, want %q", entry.ContentType, dataStateContentType)
 	}
-	if entry.Version != 7 {
+	if string(entry.Payload) != `"hello"` {
 		cancel()
-		t.Errorf("data version = %d, want 7 (clobbered by pull)", entry.Version)
+		t.Errorf("data payload = %s, want %q", entry.Payload, `"hello"`)
+	}
+	if entry.Version != 1 {
+		cancel()
+		t.Errorf("data version = %d, want 1 (new key)", entry.Version)
+	}
+	// A key the snapshot no longer carries is dropped by the authoritative pull.
+	if _, ok := data["stale"]; ok {
+		cancel()
+		t.Error("stale data entry survived the authoritative pull")
+	}
+
+	// A changed value bumps the version; an unchanged one carries it forward.
+	desired.State.Data = []api.StateEntry{{Key: "cfg", Value: "world"}}
+	if err := handler(ctx, desired, reconcile.StateDiff{StateChanged: true}); err != nil {
+		cancel()
+		t.Fatalf("reconcile handler (changed value): %v", err)
+	}
+	if e := srv.cache.GetData()["cfg"]; e.Version != 2 || string(e.Payload) != `"world"` {
+		cancel()
+		t.Errorf("changed value: version=%d payload=%s, want version=2 payload=%q", e.Version, e.Payload, `"world"`)
+	}
+	if err := handler(ctx, desired, reconcile.StateDiff{StateChanged: true}); err != nil {
+		cancel()
+		t.Fatalf("reconcile handler (unchanged value): %v", err)
+	}
+	if e := srv.cache.GetData()["cfg"]; e.Version != 2 {
+		cancel()
+		t.Errorf("unchanged value: version=%d, want 2 (carried forward)", e.Version)
 	}
 
 	// Reconcile must NOT touch the secret index.
-	secrets := srv.cache.GetSecretIndex()
-	if len(secrets) != 1 || secrets[0].Key != "db-pass" || secrets[0].Version != 2 {
+	if secrets := srv.cache.GetSecretIndex(); len(secrets) != 1 || secrets[0].Key != "db-pass" || secrets[0].Version != 2 {
 		cancel()
 		t.Errorf("secret index changed by reconcile: %v", secrets)
 	}
 
-	// A nil State block authoritatively clears the pull-owned metadata map but
-	// leaves the SSE-owned data store intact.
+	// A nil State block authoritatively clears both pull-owned buckets.
 	if err := handler(ctx, &api.NodeStateSnapshot{State: nil}, reconcile.StateDiff{StateChanged: true}); err != nil {
 		cancel()
 		t.Fatalf("reconcile handler (nil state): %v", err)
@@ -372,57 +393,14 @@ func TestServer_ReconcileHandler(t *testing.T) {
 		cancel()
 		t.Errorf("metadata not cleared on nil state: %v", srv.cache.GetMetadata())
 	}
-	if _, ok := srv.cache.GetData()["cfg"]; !ok {
+	if len(srv.cache.GetData()) != 0 {
 		cancel()
-		t.Errorf("SSE-owned data cleared by nil state block")
+		t.Errorf("data not cleared on nil state: %v", srv.cache.GetData())
 	}
 	// The secret index remains untouched by the clear.
 	if len(srv.cache.GetSecretIndex()) != 1 {
 		cancel()
 		t.Errorf("secret index touched by state clear: %v", srv.cache.GetSecretIndex())
-	}
-
-	cancel()
-	<-errCh
-}
-
-func TestServer_RegisterEventHandlers(t *testing.T) {
-	defer goleak.VerifyNone(t)
-
-	client := &serverTestClient{}
-	srv, cfg := newTestServer(t, client)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Start(ctx, "node-1") }()
-
-	if !waitForSocket(t, cfg.SocketPath, 2*time.Second) {
-		cancel()
-		t.Fatal("socket did not appear")
-	}
-
-	// Create a dispatcher and register handlers.
-	dispatcher := api.NewEventDispatcher(srv.logger)
-	srv.RegisterEventHandlers(dispatcher)
-
-	// Dispatch a node_state_updated event.
-	payload := NodeStateUpdatePayload{
-		Metadata: map[string]string{"zone": "us-east-1"},
-	}
-	payloadJSON, _ := json.Marshal(payload)
-	env := api.Envelope{
-		Type:    api.EventNodeStateUpdated,
-		ID:      "evt-1",
-		Payload: payloadJSON,
-	}
-	dispatcher.Dispatch(ctx, env)
-
-	// Verify cache updated.
-	meta := srv.cache.GetMetadata()
-	if meta["zone"] != "us-east-1" {
-		t.Errorf("metadata[zone] = %q, want %q", meta["zone"], "us-east-1")
 	}
 
 	cancel()
@@ -1021,18 +999,15 @@ func TestServer_SecretProxy(t *testing.T) {
 	}
 }
 
-// TestServer_CacheUpdateFromEvents verifies that SSE events dispatched via the
-// EventDispatcher correctly update the server cache and that subsequent GET
-// requests reflect the new data.
-func TestServer_CacheUpdateFromEvents(t *testing.T) {
+// TestServer_CacheReflectedInHTTP verifies that cache state (metadata, the
+// versioned data store, and the secret index) is reflected by the HTTP GET
+// endpoints. The cache is populated directly through its update methods, which
+// outlive the retired SSE writers.
+func TestServer_CacheReflectedInHTTP(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
 	client := &serverTestClient{}
 	srv, cfg := newTestServer(t, client)
-
-	// Register event handlers with a dispatcher.
-	dispatcher := api.NewEventDispatcher(srv.logger)
-	srv.RegisterEventHandlers(dispatcher)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1047,33 +1022,17 @@ func TestServer_CacheUpdateFromEvents(t *testing.T) {
 
 	httpClient := unixSocketClient(cfg.SocketPath)
 
-	// 1. Simulate node_state_updated event with metadata and data.
-	statePayload := NodeStateUpdatePayload{
-		Metadata: map[string]string{"env": "production", "cluster": "alpha"},
-		Data: []api.DataEntry{
-			{Key: "wireguard.conf", ContentType: "text/plain", Payload: json.RawMessage(`"[Interface]\nAddress=10.0.0.1"`), Version: 5},
-			{Key: "dns-config", ContentType: "application/json", Payload: json.RawMessage(`{"servers":["8.8.8.8"]}`), Version: 1},
-		},
-	}
-	statePayloadJSON, _ := json.Marshal(statePayload)
-	dispatcher.Dispatch(ctx, api.Envelope{
-		Type:    api.EventNodeStateUpdated,
-		ID:      "evt-state-1",
-		Payload: statePayloadJSON,
+	// 1. Populate metadata and the versioned data store.
+	srv.cache.UpdateMetadata(map[string]string{"env": "production", "cluster": "alpha"})
+	srv.cache.UpdateData([]api.DataEntry{
+		{Key: "wireguard.conf", ContentType: "text/plain", Payload: json.RawMessage(`"[Interface]\nAddress=10.0.0.1"`), Version: 5},
+		{Key: "dns-config", ContentType: "application/json", Payload: json.RawMessage(`{"servers":["8.8.8.8"]}`), Version: 1},
 	})
 
-	// 2. Simulate node_secrets_updated event.
-	secretsPayload := NodeSecretsUpdatePayload{
-		SecretRefs: []api.SecretRef{
-			{Key: "tls-cert", Version: 2},
-			{Key: "api-key", Version: 1},
-		},
-	}
-	secretsPayloadJSON, _ := json.Marshal(secretsPayload)
-	dispatcher.Dispatch(ctx, api.Envelope{
-		Type:    api.EventNodeSecretsUpdated,
-		ID:      "evt-secrets-1",
-		Payload: secretsPayloadJSON,
+	// 2. Populate the secret index.
+	srv.cache.UpdateSecretIndex([]api.SecretRef{
+		{Key: "tls-cert", Version: 2},
+		{Key: "api-key", Version: 1},
 	})
 
 	// 3. Verify via HTTP endpoints that cache reflects the updates.

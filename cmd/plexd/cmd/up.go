@@ -147,7 +147,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// 5b. Initialize NAT traversal and peer exchange.
 	stunClient := &nat.UDPSTUNClient{Timeout: cfg.NAT.Timeout}
 	natDiscoverer := nat.NewDiscoverer(stunClient, cfg.NAT, cfg.WireGuard.ListenPort, logger)
-	exchanger := peerexchange.NewExchanger(natDiscoverer, wgMgr, client, cfg.PeerExchange, logger)
+	exchanger := peerexchange.NewExchanger(natDiscoverer, client, cfg.PeerExchange, logger)
 
 	// 5c. Initialize network policy engine.
 	policyEngine := policy.NewPolicyEngine(logger)
@@ -261,15 +261,9 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// Register signing_key_rotated SSE handler to update verifier keys.
 	sseMgr.RegisterHandler(api.EventSigningKeyRotated, signingKeyRotatedHandler(verifier, logger))
 
-	// Register WireGuard SSE handlers.
-	sseMgr.RegisterHandler(api.EventPeerAdded, wireguard.HandlePeerAdded(wgMgr))
-	sseMgr.RegisterHandler(api.EventPeerRemoved, wireguard.HandlePeerRemoved(wgMgr))
-	sseMgr.RegisterHandler(api.EventPeerKeyRotated, wireguard.HandlePeerKeyRotated(wgMgr))
-
-	// Register peer exchange SSE handler (peer_endpoint_changed).
-	exchanger.RegisterHandlers(sseMgr)
-
-	// Register tunnel SSE handlers.
+	// Register tunnel SSE handlers. ssh_session_setup and session_revoked are
+	// test-only until the platform taxonomy ships real discriminators; the
+	// production control plane never emits them (see internal/api/envelope.go).
 	sseMgr.RegisterHandler(api.EventSSHSessionSetup, tunnel.HandleSSHSessionSetup(meshServer.SessionManager(), sessionReporter))
 	sseMgr.RegisterHandler(api.EventSessionRevoked, tunnel.HandleSessionRevoked(meshServer.SessionManager()))
 
@@ -304,29 +298,29 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// Register policy SSE handler (needs reconciler as trigger).
 	sseMgr.RegisterHandler(api.EventPolicyUpdated, policy.HandlePolicyUpdated(reconciler))
 
-	// Register bridge SSE handlers (needs reconciler and bridge managers).
-	if bridgeMgr != nil {
-		sseMgr.RegisterHandler(api.EventBridgeConfigUpdated, bridge.HandleBridgeConfigUpdated(reconciler))
+	// The control plane's pull (the reconciler snapshot) is authoritative, so
+	// bridge_config_updated carries an opaque payload and only triggers a
+	// reconcile. Registered unconditionally: the bridge reconcile handlers apply
+	// whatever bridge subtree the snapshot carries, regardless of local config.
+	sseMgr.RegisterHandler(api.EventBridgeConfigUpdated, bridge.HandleBridgeConfigUpdated(reconciler))
 
-		if relay := bridgeMgr.Relay(); relay != nil {
-			sseMgr.RegisterHandler(api.EventRelaySessionAssigned, bridge.HandleRelaySessionAssigned(relay, logger))
-			sseMgr.RegisterHandler(api.EventRelaySessionRevoked, bridge.HandleRelaySessionRevoked(relay, logger))
-		}
-		if ingressMgr != nil {
-			sseMgr.RegisterHandler(api.EventIngressRuleAssigned, bridge.HandleIngressRuleAssigned(ingressMgr, logger))
-			sseMgr.RegisterHandler(api.EventIngressRuleRevoked, bridge.HandleIngressRuleRevoked(ingressMgr, logger))
-			sseMgr.RegisterHandler(api.EventIngressConfigUpdated, bridge.HandleIngressConfigUpdated(reconciler))
-		}
-		if userAccessMgr != nil {
-			sseMgr.RegisterHandler(api.EventUserAccessPeerAssigned, bridge.HandleUserAccessPeerAssigned(userAccessMgr, logger))
-			sseMgr.RegisterHandler(api.EventUserAccessPeerRevoked, bridge.HandleUserAccessPeerRevoked(userAccessMgr, logger))
-			sseMgr.RegisterHandler(api.EventUserAccessConfigUpdated, bridge.HandleUserAccessConfigUpdated(reconciler))
-		}
-		if s2sMgr != nil {
-			sseMgr.RegisterHandler(api.EventSiteToSiteTunnelAssigned, bridge.HandleSiteToSiteTunnelAssigned(s2sMgr, logger))
-			sseMgr.RegisterHandler(api.EventSiteToSiteTunnelRevoked, bridge.HandleSiteToSiteTunnelRevoked(s2sMgr, logger))
-			sseMgr.RegisterHandler(api.EventSiteToSiteConfigUpdated, bridge.HandleSiteToSiteConfigUpdated(reconciler))
-		}
+	// Every remaining pull-authoritative event simply requests a reconcile: the
+	// snapshot is the source of truth, so the payloads are opaque. One shared
+	// closure covers the node_state_updated contract type and the peer-family
+	// types from the documented-coming taxonomy.
+	triggerReconcile := func(_ context.Context, _ api.Envelope) error {
+		reconciler.TriggerReconcile()
+		return nil
+	}
+	for _, eventType := range []string{
+		api.EventNodeStateUpdated,
+		api.EventPeerRegistered,
+		api.EventPeerPSKAssigned,
+		api.EventPeerDeregistered,
+		api.EventPeerEndpointChanged,
+		api.EventPeerKeyRotated,
+	} {
+		sseMgr.RegisterHandler(eventType, triggerReconcile)
 	}
 
 	selfChecksum, err := integrity.SelfChecksum()
@@ -428,7 +422,9 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		logger.Warn("capabilities report failed", "error", err)
 	}
 
-	// Register action_request SSE handler.
+	// Register action_request SSE handler. action_request is test-only until the
+	// platform taxonomy ships real discriminators; the production control plane
+	// never emits it (see internal/api/envelope.go).
 	sseMgr.RegisterHandler(api.EventActionRequest, actions.HandleActionRequest(executor, identity.NodeID, logger))
 
 	// 11. Create hook watcher.
@@ -462,16 +458,9 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	nodeAPISrv.SetPeerProvider(peerSnap)
 	nodeAPISrv.SetPolicyProvider(policySnap)
 
-	// Register node_state_updated and node_secrets_updated SSE handlers for
-	// real-time cache updates (in addition to reconcile-loop fallback).
-	sseMgr.RegisterHandler(api.EventNodeStateUpdated, func(ctx context.Context, env api.Envelope) error {
-		return nodeapi.HandleNodeStateUpdated(nodeAPISrv.Cache(), logger, env)
-	})
-	sseMgr.RegisterHandler(api.EventNodeSecretsUpdated, func(ctx context.Context, env api.Envelope) error {
-		return nodeapi.HandleNodeSecretsUpdated(nodeAPISrv.Cache(), logger, env)
-	})
-
-	// Register nodeapi reconcile handler so cache updates on drift.
+	// Register nodeapi reconcile handler so cache updates on drift. The pull is
+	// authoritative: node_state_updated triggers a reconcile (see above), and
+	// this handler refreshes the node API cache from the resulting snapshot.
 	reconciler.RegisterHandler(nodeAPISrv.ReconcileHandler())
 
 	// Register the WireGuard reconcile handler only when the interface came up.

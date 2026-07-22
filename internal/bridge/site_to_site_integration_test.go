@@ -2,10 +2,6 @@ package bridge
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,13 +9,26 @@ import (
 	"github.com/plexsphere/plexd/internal/reconcile"
 )
 
+// testTunnel builds a site-to-site tunnel fixture with the given ID.
+func testTunnel(id string) api.SiteToSiteTunnel {
+	return api.SiteToSiteTunnel{
+		TunnelID:        id,
+		RemoteEndpoint:  "203.0.113.1:51820",
+		RemotePublicKey: "remote-pub-key-" + id,
+		LocalSubnets:    []string{"10.0.0.0/24"},
+		RemoteSubnets:   []string{"192.168.1.0/24"},
+		InterfaceName:   "wg-s2s-" + id,
+		ListenPort:      51823,
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests — Site-to-Site
 // ---------------------------------------------------------------------------
 
 // TestSiteToSiteIntegration_FullLifecycle wires a SiteToSiteManager with mock
-// controllers and SSE handlers, verifies Setup → add tunnels via SSE handler →
-// reconcile drift → remove tunnels via SSE handler → Teardown.
+// controllers, verifies Setup → add tunnels via the manager → reconcile drift →
+// remove a tunnel via the manager → Teardown.
 func TestSiteToSiteIntegration_FullLifecycle(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
@@ -39,15 +48,10 @@ func TestSiteToSiteIntegration_FullLifecycle(t *testing.T) {
 		t.Fatal("should be active after Setup")
 	}
 
-	// Wire up SSE handlers.
-	assignHandler := HandleSiteToSiteTunnelAssigned(mgr, discardLogger())
-	revokeHandler := HandleSiteToSiteTunnelRevoked(mgr, discardLogger())
-
-	// --- Step 1: Add a tunnel via SSE handler and verify tracking ---
+	// --- Step 1: Add a tunnel via the manager and verify tracking ---
 	tunnel1 := testTunnel("tun-lifecycle-1")
-	envelope1 := tunnelAssignmentEnvelope(t, tunnel1)
-	if err := assignHandler(context.Background(), envelope1); err != nil {
-		t.Fatalf("assign handler: %v", err)
+	if err := mgr.AddTunnel(tunnel1); err != nil {
+		t.Fatalf("add tunnel: %v", err)
 	}
 
 	ids := mgr.TunnelIDs()
@@ -82,11 +86,10 @@ func TestSiteToSiteIntegration_FullLifecycle(t *testing.T) {
 		t.Fatalf("expected 1 AddRoute call, got %d", len(addRouteCalls))
 	}
 
-	// --- Step 2: Add a second tunnel via SSE handler ---
+	// --- Step 2: Add a second tunnel via the manager ---
 	tunnel2 := testTunnel("tun-lifecycle-2")
-	envelope2 := tunnelAssignmentEnvelope(t, tunnel2)
-	if err := assignHandler(context.Background(), envelope2); err != nil {
-		t.Fatalf("assign handler second: %v", err)
+	if err := mgr.AddTunnel(tunnel2); err != nil {
+		t.Fatalf("add second tunnel: %v", err)
 	}
 	if len(mgr.TunnelIDs()) != 2 {
 		t.Errorf("TunnelIDs count = %d, want 2", len(mgr.TunnelIDs()))
@@ -116,11 +119,8 @@ func TestSiteToSiteIntegration_FullLifecycle(t *testing.T) {
 		t.Error("RemoveTunnelInterface should not be called for unchanged tunnels")
 	}
 
-	// --- Step 4: Remove first tunnel via SSE handler ---
-	revokeEnv := tunnelRevocationEnvelope(t, "tun-lifecycle-1")
-	if err := revokeHandler(context.Background(), revokeEnv); err != nil {
-		t.Fatalf("revoke handler: %v", err)
-	}
+	// --- Step 4: Remove the first tunnel via the manager ---
+	mgr.RemoveTunnel("tun-lifecycle-1")
 
 	ids = mgr.TunnelIDs()
 	if len(ids) != 1 {
@@ -234,140 +234,4 @@ func TestSiteToSiteIntegration_ReconcileDrift(t *testing.T) {
 
 	// Clean up.
 	_ = mgr.Teardown()
-}
-
-// TestSiteToSiteIntegration_ConcurrentAccess exercises concurrent SSE events
-// (config updates, tunnel assignments, and tunnel revocations) alongside the
-// reconcile loop to verify no data races. Also verifies max tunnels enforcement
-// under concurrent load. Run with -race.
-func TestSiteToSiteIntegration_ConcurrentAccess(t *testing.T) {
-	vpnCtrl := &mockVPNController{}
-	routeCtrl := &mockRouteController{}
-	cfg := Config{
-		Enabled:              true,
-		SiteToSiteEnabled:    true,
-		MaxSiteToSiteTunnels: 5, // Low limit to exercise max tunnels under concurrent load.
-	}
-	cfg.ApplyDefaults()
-
-	mgr := NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, discardLogger(), nil)
-	if err := mgr.Setup("wg0"); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	var cycle atomic.Int32
-	states := []*api.NodeStateSnapshot{
-		{
-			Bridge: &api.BridgeSnapshot{
-				SiteToSite: &api.SiteToSiteConfig{
-					Enabled: true,
-					Tunnels: []api.SiteToSiteTunnel{
-						testTunnel("tun-conc-1"),
-					},
-				},
-			},
-		},
-		{
-			Bridge: &api.BridgeSnapshot{
-				SiteToSite: &api.SiteToSiteConfig{
-					Enabled: true,
-					Tunnels: []api.SiteToSiteTunnel{
-						testTunnel("tun-conc-1"),
-						testTunnel("tun-conc-2"),
-					},
-				},
-			},
-		},
-	}
-
-	fetcher := &alternatingBridgeFetcher{
-		states: states,
-		cycle:  &cycle,
-	}
-
-	rec := reconcile.NewReconciler(fetcher, reconcile.Config{Interval: 30 * time.Millisecond}, discardLogger())
-	rec.RegisterHandler(SiteToSiteReconcileHandler(mgr, discardLogger()))
-
-	dispatcher := api.NewEventDispatcher(discardLogger())
-	dispatcher.Register(api.EventSiteToSiteConfigUpdated, HandleSiteToSiteConfigUpdated(rec))
-	dispatcher.Register(api.EventSiteToSiteTunnelAssigned, HandleSiteToSiteTunnelAssigned(mgr, discardLogger()))
-	dispatcher.Register(api.EventSiteToSiteTunnelRevoked, HandleSiteToSiteTunnelRevoked(mgr, discardLogger()))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() { done <- rec.Run(ctx, "node-s2s") }()
-
-	// Concurrently dispatch SSE events while the reconcile loop runs.
-	var wg sync.WaitGroup
-
-	// Config update dispatchers.
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			envelope := api.Envelope{
-				Type: api.EventSiteToSiteConfigUpdated,
-				ID:   "concurrent-config-evt",
-			}
-			dispatcher.Dispatch(ctx, envelope)
-		}()
-	}
-
-	// Tunnel assignment dispatchers — use unique tunnel IDs per goroutine.
-	// With MaxSiteToSiteTunnels=5, some of these will hit the limit and fail
-	// (which is expected — errors are handled gracefully by the dispatcher).
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			tunnel := testTunnel(fmt.Sprintf("tun-sse-%d", idx))
-			payload, _ := json.Marshal(tunnel)
-			envelope := api.Envelope{
-				Type:    api.EventSiteToSiteTunnelAssigned,
-				ID:      fmt.Sprintf("assign-evt-%d", idx),
-				Payload: payload,
-			}
-			dispatcher.Dispatch(ctx, envelope)
-		}(i)
-	}
-
-	// Tunnel revocation dispatchers — revoke the same tunnel IDs we're adding above.
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			payload, _ := json.Marshal(struct {
-				TunnelID string `json:"tunnel_id"`
-			}{TunnelID: fmt.Sprintf("tun-sse-%d", idx)})
-			envelope := api.Envelope{
-				Type:    api.EventSiteToSiteTunnelRevoked,
-				ID:      fmt.Sprintf("revoke-evt-%d", idx),
-				Payload: payload,
-			}
-			dispatcher.Dispatch(ctx, envelope)
-		}(i)
-	}
-
-	// Let the reconcile loop run several cycles.
-	time.Sleep(300 * time.Millisecond)
-
-	wg.Wait()
-	cancel()
-	<-done
-
-	// Verify max tunnels enforcement: active count must never exceed the limit.
-	tunnelCount := len(mgr.TunnelIDs())
-	if tunnelCount > cfg.MaxSiteToSiteTunnels {
-		t.Errorf("active tunnels = %d, exceeds max = %d", tunnelCount, cfg.MaxSiteToSiteTunnels)
-	}
-
-	// Clean up.
-	_ = mgr.Teardown()
-
-	// Test passes if no race detected. Verify some activity occurred.
-	if n := fetcher.getFetchCount(); n < 2 {
-		t.Errorf("FetchState calls = %d, want >= 2", n)
-	}
 }

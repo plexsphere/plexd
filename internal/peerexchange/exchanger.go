@@ -6,38 +6,26 @@ import (
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/nat"
-	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
-// Exchanger orchestrates peer endpoint exchange: STUN discovery,
-// control plane reporting, and WireGuard peer endpoint updates.
+// Exchanger orchestrates peer endpoint exchange: STUN discovery and
+// control plane reporting.
 type Exchanger struct {
 	discoverer *nat.Discoverer
-	wgManager  *wireguard.Manager
 	cpClient   *api.ControlPlane
 	cfg        Config
 	logger     *slog.Logger
 }
 
 // NewExchanger creates a new Exchanger.
-func NewExchanger(discoverer *nat.Discoverer, wgManager *wireguard.Manager, cpClient *api.ControlPlane, cfg Config, logger *slog.Logger) *Exchanger {
+func NewExchanger(discoverer *nat.Discoverer, cpClient *api.ControlPlane, cfg Config, logger *slog.Logger) *Exchanger {
 	cfg.ApplyDefaults()
 	return &Exchanger{
 		discoverer: discoverer,
-		wgManager:  wgManager,
 		cpClient:   cpClient,
 		cfg:        cfg,
 		logger:     logger,
 	}
-}
-
-// RegisterHandlers registers SSE event handlers for peer endpoint changes.
-// Must be called before the SSEManager is started.
-// Handlers are registered regardless of whether NAT is enabled, because
-// inbound peer endpoint updates must still be processed.
-func (e *Exchanger) RegisterHandlers(sseManager *api.SSEManager) {
-	sseManager.RegisterHandler(api.EventPeerEndpointChanged, wireguard.HandlePeerEndpointChanged(e.wgManager))
-	e.logger.Debug("peer_endpoint_changed handler registered", "component", "exchange")
 }
 
 // Run starts the endpoint exchange loop. If NAT is disabled, it returns nil
