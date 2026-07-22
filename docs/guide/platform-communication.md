@@ -28,8 +28,8 @@ sequenceDiagram
     rect rgb(240, 240, 240)
     Note over N,CP: 2. SSE Event Stream (persistent)
     N->>CP: GET /v1/nodes/{id}/events (SSE, Last-Event-ID)
-    CP-->>N: Ed25519-signed events (21 types)
-    Note right of CP: peer_added, peer_removed,<br/>policy_updated, action_request,<br/>signing_key_rotated, ...
+    CP-->>N: Ed25519-signed event envelopes
+    Note right of CP: node_state_updated, policy_updated,<br/>bridge_config_updated, rotate_keys,<br/>signing_key_rotated, ...
     end
 
     rect rgb(240, 240, 240)

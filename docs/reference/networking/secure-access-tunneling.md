@@ -191,7 +191,7 @@ mgr.Shutdown()
 
 ## SSE Event Handlers
 
-Factory functions returning `api.EventHandler` for tunnel lifecycle events. Each parses the `SignedEnvelope.Payload` and calls the appropriate `SessionManager` method.
+Factory functions returning `api.EventHandler` for tunnel lifecycle events. Each parses the `Envelope.Payload` and calls the appropriate `SessionManager` method.
 
 | Factory                  | Event Type           | Payload Type                        | Action                                     |
 |--------------------------|----------------------|-------------------------------------|--------------------------------------------|

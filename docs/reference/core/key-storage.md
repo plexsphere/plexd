@@ -67,7 +67,7 @@ After rotation, the control plane re-encrypts all secrets with the new NSK. The 
 
 The control plane's Ed25519 signing public key is used by the node for two purposes:
 
-1. **SSE event signature verification** -- every `SignedEnvelope` received on the SSE stream is verified against this key before dispatch (see [Event Verification](event-verification.md)).
+1. **SSE event signature verification** -- every `Envelope` received on the SSE stream is verified against this key before dispatch (see [Event Verification](event-verification.md)).
 2. **Session JWT validation** -- session tokens presented during secure access tunneling are validated using the same key.
 
 The key is stored as a raw string in `data_dir/signing_public_key` and also recorded in `identity.json`. On load, the file value takes precedence if it differs from the JSON field (a warning is logged).

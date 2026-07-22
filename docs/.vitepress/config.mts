@@ -40,6 +40,7 @@ export default withMermaid(defineConfig({
           { text: 'VM Deployment', link: '/how-to/vm-deployment' },
           { text: 'Kubernetes Deployment', link: '/how-to/kubernetes-deployment' },
           { text: 'Local Node API', link: '/how-to/local-node-api' },
+          { text: 'Delivery Modes', link: '/how-to/delivery-modes' },
           { text: 'Custom Hook Scripts', link: '/how-to/custom-hook-scripts' },
           { text: 'Local Endpoint Setup', link: '/how-to/local-endpoint-setup' },
           { text: 'Cutting a Release', link: '/how-to/cutting-a-release' },

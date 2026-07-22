@@ -164,31 +164,30 @@ flowchart TD
 
 ## SSE Event Types
 
-The SSE manager processes these event types:
+The SSE manager processes events in three tiers. Payloads of the reconcile-driving
+types are opaque — the reconciler's state pull is authoritative, so those events
+only request a reconcile.
 
-| Event | Handler | Description |
-|-------|---------|-------------|
-| `signing_key_rotated` | Updates Ed25519 verifier keys | Fired when the control plane rotates its signing key pair |
-| `action_request` | Dispatches to action executor | Requests execution of a built-in action or hook |
-| `peer_added` | `wireguard.HandlePeerAdded` | Adds a new WireGuard peer |
-| `peer_removed` | `wireguard.HandlePeerRemoved` | Removes a WireGuard peer |
-| `peer_key_rotated` | `wireguard.HandlePeerKeyRotated` | Rotates a peer's public key |
-| `peer_endpoint_changed` | `wireguard.HandlePeerEndpointChanged` | Updates a peer's endpoint (via peer exchange) |
-| `policy_updated` | `policy.HandlePolicyUpdated` | Triggers policy reconciliation |
-| `ssh_session_setup` | `tunnel.HandleSSHSessionSetup` | Creates a new tunnel session |
-| `session_revoked` | `tunnel.HandleSessionRevoked` | Closes a revoked tunnel session |
-| `bridge_config_updated` | `bridge.HandleBridgeConfigUpdated` | Triggers bridge reconciliation (bridge mode) |
-| `relay_session_assigned` | `bridge.HandleRelaySessionAssigned` | Assigns a relay session (bridge mode) |
-| `relay_session_revoked` | `bridge.HandleRelaySessionRevoked` | Revokes a relay session (bridge mode) |
-| `ingress_rule_assigned` | `bridge.HandleIngressRuleAssigned` | Assigns an ingress rule (bridge mode) |
-| `ingress_rule_revoked` | `bridge.HandleIngressRuleRevoked` | Revokes an ingress rule (bridge mode) |
-| `ingress_config_updated` | `bridge.HandleIngressConfigUpdated` | Triggers ingress reconciliation (bridge mode) |
-| `user_access_peer_assigned` | `bridge.HandleUserAccessPeerAssigned` | Assigns a user access peer (bridge mode) |
-| `user_access_peer_revoked` | `bridge.HandleUserAccessPeerRevoked` | Revokes a user access peer (bridge mode) |
-| `user_access_config_updated` | `bridge.HandleUserAccessConfigUpdated` | Triggers user access reconciliation (bridge mode) |
-| `site_to_site_tunnel_assigned` | `bridge.HandleSiteToSiteTunnelAssigned` | Assigns a site-to-site tunnel (bridge mode) |
-| `site_to_site_tunnel_revoked` | `bridge.HandleSiteToSiteTunnelRevoked` | Revokes a site-to-site tunnel (bridge mode) |
-| `site_to_site_config_updated` | `bridge.HandleSiteToSiteConfigUpdated` | Triggers site-to-site reconciliation (bridge mode) |
+| Event | Tier | Handler |
+|-------|------|---------|
+| `node_state_updated` | contract | Triggers a reconcile |
+| `policy_updated` | contract | `policy.HandlePolicyUpdated` — triggers a reconcile |
+| `bridge_config_updated` | contract | `bridge.HandleBridgeConfigUpdated` — triggers a reconcile (bridge mode) |
+| `peer_registered` | documented-coming | Triggers a reconcile |
+| `peer_psk_assigned` | documented-coming | Triggers a reconcile |
+| `peer_deregistered` | documented-coming | Triggers a reconcile |
+| `peer_endpoint_changed` | documented-coming | Triggers a reconcile |
+| `peer_key_rotated` | documented-coming | Triggers a reconcile |
+| `rotate_keys` | documented-coming | Starts a key rotation (`rotator.RotateNow`) |
+| `signing_key_rotated` | documented-coming | Updates the Ed25519 verifier key (`verifier.Rotate`) |
+| `action_request` | test-only | `actions.HandleActionRequest` — dispatches to the action executor |
+| `ssh_session_setup` | test-only | `tunnel.HandleSSHSessionSetup` — creates a tunnel session |
+| `session_revoked` | test-only | `tunnel.HandleSessionRevoked` — closes a revoked tunnel session |
+
+**Contract** types are emitted by the control plane today. **Documented-coming**
+types are named so the agent can subscribe once the platform's 14-type taxonomy
+starts emitting them. **Test-only** types are injectable exclusively through the
+e2e mock control plane; the production control plane never emits them.
 
 ## See Also
 

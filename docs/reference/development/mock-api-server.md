@@ -421,29 +421,44 @@ Returns a fixture metadata map with four key-value pairs.
 
 ### `GET /v1/nodes/{id}/events`
 
-Server-Sent Events (SSE) endpoint. Sends an initial `SignedEnvelope` event, then registers the client on the server's broadcast list for injected events, and holds the connection open with periodic keep-alive comments until the client disconnects.
+Server-Sent Events (SSE) endpoint for the signed event stream. There is **no** unsolicited initial event: the stream tails from now unless a `Last-Event-ID` cursor asks to replay buffered envelopes. The connection is held open with periodic keep-alive comments until the client disconnects or the stream is descoped.
 
-**Headers:**
+**Cursor (`Last-Event-ID`):**
+
+| Header value | Behavior |
+|--------------|----------|
+| absent or empty | Tail from now — no replay |
+| non-negative integer `N` | Replay every buffered envelope with sequence `> N`, in order, then tail live |
+| anything else (non-integer or negative) | `400 Bad Request`, `application/problem+json` with `code: invalid_cursor`, no stream opened |
+
+**Descope:** When the events endpoint is descoped (see `POST /test/configure-events`), it answers `501 Not Implemented`, `application/problem+json` with `code: signed_event_bus_not_provisioned`, without opening a stream. The mode is re-checked under lock so a descope that races the request never leaves a stream open.
+
+**Headers on the `200` stream:**
 
 | Header | Value |
 |--------|-------|
 | `Content-Type` | `text/event-stream` |
 | `Cache-Control` | `no-cache` |
 | `Connection` | `keep-alive` |
+| `X-Plexsphere-API-Version` | `v1` |
 
-**Initial event:**
+**Frame format:** each broadcast envelope is delivered as an SSE frame carrying its monotonic stream sequence in the `id:` line:
 
 ```
+id: 1
 event: node_state_updated
-id: evt-mock-001
-data: {"event_type":"node_state_updated","event_id":"evt-mock-001","issued_at":"2025-01-01T00:00:00Z","nonce":"mock-nonce-001","payload":{"node_id":"node-mock-001"},"signature":"mock-signature-placeholder"}
+data: {"id":"evt-inject-001","type":"node_state_updated","scope":"","key_id":"did:web:plexsphere.com#key-e2e","issued_at":"2026-01-01T00:00:00Z","payload":{"revision":42},"signature":"<base64-ed25519>"}
 ```
 
-**Keep-alive:** Sends `: keep-alive` comment every 15 seconds.
+**Sequencing and ring buffer:** every broadcast is assigned the next stream sequence (the first is `1`) and recorded in a bounded replay ring (capacity 64; the oldest entry is dropped past that). Recording happens regardless of connected clients and regardless of descoped mode, so a later reconnect can replay from a cursor.
 
-**Fan-out:** After the initial event, the client is registered on the server's broadcast list. Events injected via `POST /test/inject-event` are delivered to all registered clients. Each client has a buffered channel (capacity 16); slow clients that fall behind have events dropped silently to prevent blocking the injector.
+**Keep-alive:** Sends `: keep-alive` comment every 15 seconds (`KeepAliveInterval`).
 
-**Disconnect:** The server detects client disconnect via context cancellation, removes the client from the broadcast list, and cleans up the goroutine.
+**Fan-out:** Live clients are registered on the broadcast list. Events injected via `POST /test/inject-event` are delivered to all registered clients. Each client has a buffered channel (capacity 64); a client whose buffer is full has the event dropped silently to avoid blocking the broadcaster.
+
+**Disconnect:** The server detects client disconnect via context cancellation (or a descope closing the stream's `done` channel), removes the client from the broadcast list, and cleans up the goroutine.
+
+**Counter:** Increments `events_request_count` on every request, including descoped `501` and `400` cursor answers.
 
 ### `POST /v1/nodes/{id}/executions/{eid}`
 
@@ -647,6 +662,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "session_activity_count": 0,
   "integrity_violation_count": 0,
   "inject_event_count": 0,
+  "events_request_count": 0,
   "local_metrics_count": 0,
   "local_logs_count": 0,
   "local_audit_count": 0
@@ -657,32 +673,33 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
 
 ### `POST /test/inject-event`
 
-Broadcasts a `SignedEnvelope` to all connected SSE clients. The request body is a full `SignedEnvelope` JSON object. The server delivers it in SSE wire format (`id:`, `event:`, `data:` fields) to every registered client.
+Broadcasts a signed `Envelope` to all connected SSE clients and records it in the replay ring. The caller supplies only the identifying fields; the mock stamps the rest and signs the envelope so the agent's verifier accepts it.
 
-**Request body:**
+**Request body:** `id`, `type`, `scope`, and `payload`. Both `id` and `type` are required.
 
 ```json
 {
-  "event_type": "action_request",
-  "event_id": "evt-inject-001",
-  "issued_at": "2025-01-01T00:00:00Z",
-  "nonce": "test-nonce",
-  "payload": {"action_id": "a1"},
-  "signature": "mock-signature"
+  "id": "evt-inject-001",
+  "type": "action_request",
+  "scope": "node:n_abc123",
+  "payload": {"action_id": "a1"}
 }
 ```
+
+**Fields the mock stamps:** `issued_at` (current time), `key_id` (`did:web:plexsphere.com#key-e2e`), the stream sequence (the `id:` frame line), and `signature` (a valid Ed25519 signature over the shared canonical form, `api.CanonicalBytes`).
 
 **Response:** `204 No Content`
 
 **Behavior:**
 
-- The envelope is broadcast to all connected SSE clients in SSE wire format
-- If no SSE clients are connected, the call succeeds silently (no-op broadcast)
-- Non-blocking send: slow clients with full channel buffers have the event dropped
+- The signed envelope is recorded in the replay ring and broadcast to all connected SSE clients in SSE wire format
+- If no SSE clients are connected, the call still records the envelope in the ring (a later reconnect can replay it) and succeeds
+- Non-blocking send: a client whose channel buffer is full has the event dropped
+- A `rotate_keys` event additionally arms a pending key rotation for `POST /v1/keys/rotate`
 - Increments `inject_event_count` on each call
 - Request body is captured and retrievable via `GET /test/last-request/inject_event`
 
-**Error:** Returns `400` if the request body is not valid JSON. Returns `405` if the HTTP method is not `POST`.
+**Error:** Returns `400` if the request body is not valid JSON or is missing `id` or `type`. Returns `405` if the HTTP method is not `POST`.
 
 ### `POST /test/configure-state`
 
@@ -770,6 +787,31 @@ untouched.
 - Request body is captured and retrievable via `GET /test/last-request/configure_secrets`.
 
 **Error:** Returns `400` if the body is not valid JSON or contains an unknown field. Returns `405` if the HTTP method is not `POST`.
+
+### `POST /test/configure-events`
+
+Flips the event stream between `streaming` (the default) and `descoped`. Descoping
+makes `GET /v1/nodes/{id}/events` answer the spec's `501`
+`signed_event_bus_not_provisioned` and closes every open stream through its `done`
+channel; `streaming` restores normal service. Lets a test exercise the agent's
+pull-only delivery mode without a live control plane.
+
+**Request body:** strict-decoded — an unknown field is a `400`. `mode` is a closed
+enum: `streaming` or `descoped`.
+
+```json
+{ "mode": "descoped" }
+```
+
+**Response:** `204 No Content`.
+
+**Behavior:**
+
+- `descoped` — the events endpoint answers `501` `signed_event_bus_not_provisioned`, and every currently open stream is closed. The replay ring keeps recording injected envelopes while descoped.
+- `streaming` — normal service is restored; new connections open streams again.
+- Request body is captured and retrievable via `GET /test/last-request/configure_events`.
+
+**Error:** Returns `400` if the body is not valid JSON, contains an unknown field, or carries a `mode` other than `streaming` or `descoped`. Returns `405` if the HTTP method is not `POST`.
 
 ### `GET /test/last-request/{endpoint}`
 
@@ -867,6 +909,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `session_activity_count` | `POST /v1/nodes/{id}/sessions/{sid}` |
 | `integrity_violation_count` | `POST /v1/nodes/{id}/integrity/violations` |
 | `inject_event_count` | `POST /test/inject-event` |
+| `events_request_count` | `GET /v1/nodes/{id}/events` (every request, including descoped `501` and `400`) |
 | `local_metrics_count` | `POST /local/metrics` (TLS) |
 | `local_logs_count` | `POST /local/logs` (TLS) |
 | `local_audit_count` | `POST /local/audit` (TLS) |
@@ -885,7 +928,7 @@ All responses use the same JSON field names as the types in `internal/api`:
 - `PolicySnapshot` / `PolicyRule` / `PortRange` — `internal/api.PolicySnapshot` / `internal/api.PolicyRule` / `internal/api.PortRange`
 - `BridgeSnapshot` — `internal/api.BridgeSnapshot`
 - `NodeStateBlock` / `StateEntry` — `internal/api.NodeStateBlock` / `internal/api.StateEntry`
-- `SignedEnvelope` — `internal/api.SignedEnvelope`
+- `Envelope` — `internal/api.Envelope`
 - `Peer` — `internal/api.Peer`
 - `RelayConfig` / `RelaySessionAssignment` — `internal/api.RelayConfig` / `internal/api.RelaySessionAssignment`
 - `UserAccessConfig` / `UserAccessPeer` — `internal/api.UserAccessConfig` / `internal/api.UserAccessPeer`

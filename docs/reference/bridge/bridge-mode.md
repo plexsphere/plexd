@@ -269,7 +269,7 @@ r.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
 | `api.BridgeInfo`               | `internal/api` | Bridge status reported in heartbeats                      |
 | `api.NodeStateSnapshot`        | `internal/api` | Desired-state envelope (contains `Bridge`)                |
 | `api.HeartbeatRequest`         | `internal/api` | Heartbeat payload (contains `BridgeInfo`)                 |
-| `api.SignedEnvelope`           | `internal/api` | SSE event wrapper                                         |
+| `api.Envelope`                 | `internal/api` | SSE event wrapper                                         |
 | `api.EventBridgeConfigUpdated` | `internal/api` | Event type constant `"bridge_config_updated"`             |
 
 ### Heartbeat Reporting

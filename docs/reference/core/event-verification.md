@@ -6,7 +6,7 @@ feature: PXD-0025
 
 # Event Verification
 
-The `internal/api` package provides Ed25519 signature verification for SSE events received from the control plane. Every event envelope is verified before being dispatched to handlers, ensuring authenticity and preventing replay attacks.
+The `internal/api` package provides Ed25519 signature verification for SSE events received from the control plane. Every event envelope is verified before being dispatched to handlers, ensuring the event was issued by the control plane and has not been tampered with in transit.
 
 ## Architecture
 
@@ -18,102 +18,139 @@ The `EventVerifier` interface decouples verification from the SSE transport:
 
 ```go
 type EventVerifier interface {
-    Verify(ctx context.Context, envelope SignedEnvelope) error
+    Verify(ctx context.Context, envelope Envelope) error
 }
 ```
 
-## Canonical JSON Format
+`NoOpVerifier` is the default implementation and accepts every envelope without checking a signature. Production wiring constructs an `Ed25519Verifier` from the registration-persisted signing key instead.
 
-Signature verification uses a deterministic JSON representation of the envelope fields. The canonical form includes exactly these fields in struct-defined order:
+## Envelope
+
+`Envelope` is the wire format for signed events. It matches the control plane's OpenAPI v1 events contract:
+
+| Field       | Type              | JSON Tag       | Description                                              |
+|-------------|-------------------|----------------|---------------------------------------------------------|
+| `ID`        | `string`          | `"id"`         | Unique event identifier (required)                      |
+| `Type`      | `string`          | `"type"`       | Event type discriminator (required)                     |
+| `Scope`     | `string`          | `"scope"`      | Scope the event applies to                              |
+| `KeyID`     | `string`          | `"key_id"`     | Key id that selects the verifying signing key           |
+| `IssuedAt`  | `time.Time`       | `"issued_at"`  | Event timestamp                                         |
+| `Payload`   | `json.RawMessage` | `"payload"`    | Event-specific JSON payload (opaque to verification)    |
+| `Signature` | `string`          | `"signature"`  | Base64-encoded Ed25519 signature over the canonical form |
+
+A realistic envelope on the wire:
 
 ```json
 {
-  "event_type": "node_state_updated",
-  "event_id": "evt-abc-123",
-  "issued_at": "2025-01-15T10:30:00Z",
-  "nonce": "random-nonce-value",
-  "payload": { ... }
+  "id": "evt-9f2a1c",
+  "type": "node_state_updated",
+  "scope": "node:n_abc123",
+  "key_id": "did:web:plexsphere.com#key-2026-01",
+  "issued_at": "2026-01-15T10:30:00Z",
+  "payload": { "revision": 42 },
+  "signature": "base64-encoded-ed25519-signature"
 }
 ```
 
-The Go struct tag ordering ensures deterministic serialization via `encoding/json`:
+### Parsing
+
+`ParseEnvelope(data []byte) (Envelope, error)` unmarshals the frame's `data:` bytes and validates the two required fields:
+
+- A JSON decode failure returns `api: envelope: <cause>`.
+- A missing `id` returns `api: envelope: missing required field "id"`.
+- A missing `type` returns `api: envelope: missing required field "type"`.
+
+The SSE stream logs a parse failure and skips the frame; it never disconnects the stream for a single malformed envelope. Dispatch keys on the verified envelope's `type`, never on the SSE frame's `event:` field.
+
+## Canonical Form
+
+Signature verification is computed over a deterministic JSON representation of the envelope. `CanonicalBytes(env Envelope) ([]byte, error)` serializes exactly these fields, in this order, and **never** the signature:
+
+```json
+{"id":"evt-9f2a1c","type":"node_state_updated","scope":"node:n_abc123","key_id":"did:web:plexsphere.com#key-2026-01","issued_at":"2026-01-15T10:30:00Z","payload":{"revision":42}}
+```
+
+The Go struct tag ordering fixes the serialization:
 
 ```go
 type canonicalEnvelope struct {
-    EventType string          `json:"event_type"`
-    EventID   string          `json:"event_id"`
-    IssuedAt  time.Time       `json:"issued_at"`
-    Nonce     string          `json:"nonce"`
-    Payload   json.RawMessage `json:"payload"`
+    ID       string          `json:"id"`
+    Type     string          `json:"type"`
+    Scope    string          `json:"scope"`
+    KeyID    string          `json:"key_id"`
+    IssuedAt time.Time       `json:"issued_at"`
+    Payload  json.RawMessage `json:"payload"`
 }
 ```
 
-The signature is computed as `ed25519.Sign(privateKey, canonicalJSON)` and transmitted as base64-encoded bytes in the `signature` field of the envelope.
+A nil `Payload` serializes as `"payload":null`. The signature is `ed25519.Sign(privateKey, canonicalBytes)` transmitted as base64 in the envelope's `signature` field.
+
+::: info Author-approved assumption
+`CanonicalBytes` is the single canonical-form seam shared between the agent and the e2e mock control plane. The real control plane's own canonical-bytes helper is not published, so this field set and ordering is an author-approved assumption. A future mismatch with the real control plane is corrected in this one function, and both the agent verifier and the mock signer follow it.
+:::
 
 ## Verification Steps
 
-The `Ed25519Verifier.Verify()` method performs these checks in order:
+`Ed25519Verifier.Verify()` performs these checks in order, returning a descriptive error on the first failure:
 
-1. **Signature present** — envelope must have a non-empty `signature` field
-2. **Nonce present** — envelope must have a non-empty `nonce` field
-3. **Timestamp present** — `issued_at` must be non-zero
-4. **Staleness check** — `time.Since(issued_at)` must be within 5 minutes (`DefaultStalenessWindow`)
-5. **Future timestamp check** — `issued_at` must not be more than `DefaultStalenessWindow` in the future
-6. **Ed25519 signature** — `ed25519.Verify(publicKey, canonicalJSON, signatureBytes)` must return true
-7. **Nonce uniqueness** — nonce must not have been seen before (replay protection; recorded only after signature verification to prevent nonce exhaustion via forged envelopes)
+1. **Signature present** — a non-empty `signature`, else `api: verifier: missing signature`.
+2. **Timestamp present** — a non-zero `issued_at`, else `api: verifier: missing issued_at`.
+3. **Staleness** — `time.Since(issued_at)` must be within `DefaultStalenessWindow` (5 minutes), else `api: verifier: event is stale`.
+4. **Future timestamp** — `issued_at` must not be more than `DefaultStalenessWindow` in the future, else `api: verifier: event timestamp is in the future`.
+5. **Key selection** — a signing key is selected by the envelope's `key_id` (see below); if none matches, `api: verifier: unknown signing key id`.
+6. **Ed25519 signature** — the base64 signature is decoded and checked against `CanonicalBytes(env)` with the selected key. A decode failure, a canonicalization failure, or a signature that does not verify all return `api: verifier: signature verification failed`.
 
-If any check fails, the event is rejected with a descriptive error.
+There is no nonce and no replay-tracking step: the events contract carries no nonce, so replay protection is delegated to the transport and to the idempotence of what each event triggers. TLS keeps captured envelopes off the wire; every production event drives an authoritative state pull (a reconcile), which is idempotent under duplicated or reordered delivery; and a replayed `rotate_keys` only re-requests a rotation the control plane rejects with `409 keys_rotate_no_pending_rotation` when none is pending. This is a deliberate trade-off of the contract's no-nonce design, not an oversight.
 
-## Nonce Replay Protection
+When verification fails, the SSE stream logs `event verification failed` (with the envelope `type` and `id`) and skips the envelope. A failed envelope is never dispatched to a handler.
 
-The `NonceStore` prevents replay attacks by tracking recently seen nonces:
+## Key Selection and Rotation
 
-| Parameter        | Value   | Description                                |
-|------------------|---------|--------------------------------------------|
-| Nonce TTL        | 5 min   | Duration nonces are remembered             |
-| Cleanup interval | 60 sec  | How often expired nonces are garbage-collected |
-
-The store uses a `sync.Mutex`-protected `map[string]time.Time`. Cleanup runs lazily on the next `Add()` call after the cleanup interval elapses.
-
-## Signing Key Rotation
-
-The verifier supports zero-downtime key rotation by holding two keys simultaneously:
-
-| Field               | Type                | Description                              |
-|---------------------|---------------------|------------------------------------------|
-| `currentKey`        | `ed25519.PublicKey` | Primary verification key                 |
-| `previousKey`       | `ed25519.PublicKey` | Previous key accepted during transition  |
-| `transitionExpires` | `time.Time`         | Deadline after which previous key is rejected |
-
-### Rotation Flow
-
-1. Control plane generates a new signing key pair
-2. Control plane sends `signing_key_rotated` SSE event with both keys and a transition deadline
-3. Agent updates verifier via `SetKeys(current, previous, transitionExpires)`
-4. During the transition period, signatures from either key are accepted
-5. After `transitionExpires`, only the current key is accepted
-
-### Update Sources
-
-Keys are updated from two sources:
-
-- **Registration** — the initial verifier key comes from the registration response's `signing_public_key`
-- **SSE event** — the `signing_key_rotated` event handler decodes the rotated keys and calls `verifier.SetKeys()` immediately
-
-Signing keys no longer ride the state snapshot: the reconcile loop has no signing-keys handler. The `signing_key_rotated` SSE payload decodes base64-encoded keys from `api.SigningKeys`:
+`Ed25519Verifier` is keyed by signing key id. It is constructed from the registration response's `signing_key_id` and `signing_public_key`:
 
 ```go
-type SigningKeys struct {
-    Current           string     `json:"current"`
-    Previous          string     `json:"previous,omitempty"`
-    TransitionExpires *time.Time `json:"transition_expires,omitempty"`
+verifier := api.NewEd25519Verifier(identity.SigningKeyID, ed25519.PublicKey(sigKey))
+```
+
+At verification time the verifier selects the key that matches the envelope's `key_id`:
+
+- The **current** key id is always accepted.
+- The **previous** key id is accepted **only** while `time.Now()` is before `transitionExpires` (the rotation grace window).
+
+Any other `key_id` — including an empty one — is rejected as an unknown signing key id.
+
+### Rotation
+
+The `signing_key_rotated` SSE event carries an `api.SigningKeyRotation` payload, which the event handler applies via `Rotate`:
+
+```go
+type SigningKeyRotation struct {
+    KeyID             string    `json:"key_id"`
+    PublicKey         string    `json:"public_key"`
+    PreviousKeyID     string    `json:"previous_key_id"`
+    TransitionExpires time.Time `json:"transition_expires"`
 }
 ```
+
+`Rotate(rot SigningKeyRotation) error` installs `key_id`/`public_key` as the new current key. It retains a previous key as a grace entry **only** when all of these hold:
+
+- `previous_key_id` is non-empty, and
+- `transition_expires` is non-zero, and
+- `previous_key_id` matches a key id the verifier currently holds (its current or its previous key id).
+
+When any of those conditions is unmet — an empty `previous_key_id`, a zero `transition_expires`, or an unknown previous key id — no grace entry is kept and only the new current key is accepted after the rotation.
+
+`Rotate` returns an error and leaves the installed keys **unchanged** when:
+
+- `key_id` is empty — `api: verifier: rotation missing key_id`.
+- `public_key` is not valid base64 — `api: verifier: rotation public key: <cause>`.
+- the decoded key is not 32 bytes — `api: verifier: rotation public key: invalid length: got N, want 32`.
+
+The rotation event is itself signed with the current (pre-rotation) key, so each key vouches for its successor. Signing keys never ride the state snapshot; the reconcile loop has no signing-key handler.
 
 ## Thread Safety
 
 All verifier operations are safe for concurrent use:
 
-- `Verify()` acquires a read lock on the key pair
-- `SetKeys()` acquires a write lock to replace keys
-- `NonceStore.Add()` is mutex-protected
+- `Verify()` acquires a read lock while selecting the key.
+- `Rotate()` acquires a write lock to install the new key material.
