@@ -49,6 +49,7 @@ type AssertionCounters struct {
 	CapabilitiesCount       int64 `json:"capabilities_count"`
 	EndpointCount           int64 `json:"endpoint_count"`
 	SecretsCount            int64 `json:"secrets_count"`
+	SecretsRateLimitedCount int64 `json:"secrets_rate_limited_count"`
 	ReportPutCount          int64 `json:"report_put_count"`
 	ReportDeleteCount       int64 `json:"report_delete_count"`
 	ExecutionCallbackCount  int64 `json:"execution_callback_count"`
@@ -84,6 +85,9 @@ type Server struct {
 	endpointCount           atomic.Int64
 	secretsCount            atomic.Int64
 	secretCurrentVersion    atomic.Int64
+	secretRateLimitNext     atomic.Int64
+	secretRetryAfterSeconds atomic.Int64
+	secretsRateLimitedCount atomic.Int64
 	reportPutCount          atomic.Int64
 	reportDeleteCount       atomic.Int64
 	executionCallbackCount  atomic.Int64
@@ -180,6 +184,7 @@ func New() *Server {
 		stateFixture: newStateFixture(),
 	}
 	s.secretCurrentVersion.Store(1)
+	s.secretRetryAfterSeconds.Store(1)
 	s.registerRoutes()
 	return s
 }
@@ -201,6 +206,7 @@ func (s *Server) Assertions() AssertionCounters {
 		CapabilitiesCount:       s.capabilitiesCount.Load(),
 		EndpointCount:           s.endpointCount.Load(),
 		SecretsCount:            s.secretsCount.Load(),
+		SecretsRateLimitedCount: s.secretsRateLimitedCount.Load(),
 		ReportPutCount:          s.reportPutCount.Load(),
 		ReportDeleteCount:       s.reportDeleteCount.Load(),
 		ExecutionCallbackCount:  s.executionCallbackCount.Load(),
@@ -402,6 +408,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /test/configure-state", s.handleSetState)
 	s.mux.HandleFunc("POST /test/configure-heartbeat", s.handleConfigureHeartbeat)
 	s.mux.HandleFunc("POST /test/configure-endpoint", s.handleConfigureEndpoint)
+	s.mux.HandleFunc("POST /test/configure-secrets", s.handleConfigureSecrets)
 	s.mux.HandleFunc("POST /test/inject-event", s.handleInjectEvent)
 	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
 
@@ -427,6 +434,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/test/configure-state", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-heartbeat", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-endpoint", methodNotAllowed)
+	s.mux.HandleFunc("/test/configure-secrets", methodNotAllowed)
 	s.mux.HandleFunc("/test/inject-event", methodNotAllowed)
 }
 
@@ -947,18 +955,42 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse an optional ?version selector. Its grammar is validated before the
+	// rate-limit gate, so a malformed selector is always a 400 rather than a 429.
 	version := s.secretCurrentVersion.Load()
+	var requested int64
 	if raw := r.URL.Query().Get("version"); raw != "" {
 		v, err := strconv.Atoi(raw)
 		if err != nil || v < 1 {
 			writeProblem(w, r, http.StatusBadRequest, "invalid_version", "version must be a positive integer")
 			return
 		}
-		if int64(v) > s.secretCurrentVersion.Load() {
+		requested = int64(v)
+	}
+
+	// Armed rate limiting: exactly the next secretRateLimitNext fetches answer a
+	// 429. The CompareAndSwap decrement keeps the "exactly N" guarantee under
+	// concurrent fetches — two racing goroutines can never both claim the same
+	// remaining unit. Retry-After is set before writeProblem writes the status.
+	for {
+		n := s.secretRateLimitNext.Load()
+		if n <= 0 {
+			break
+		}
+		if s.secretRateLimitNext.CompareAndSwap(n, n-1) {
+			s.secretsRateLimitedCount.Add(1)
+			w.Header().Set("Retry-After", strconv.FormatInt(s.secretRetryAfterSeconds.Load(), 10))
+			writeProblem(w, r, http.StatusTooManyRequests, "per_node_rate_limited", "per-node secret fetch rate limit exceeded")
+			return
+		}
+	}
+
+	if requested > 0 {
+		if requested > s.secretCurrentVersion.Load() {
 			writeProblem(w, r, http.StatusNotFound, "secret_version_not_found", "no such secret version")
 			return
 		}
-		version = int64(v)
+		version = requested
 	}
 
 	envelope := encryptSecret(s.nsk, s.expectedBearerToken)
@@ -1692,6 +1724,39 @@ func (s *Server) handleConfigureEndpoint(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	s.SetEndpointTTL(time.Duration(body.TTLSeconds) * time.Second)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleConfigureSecrets handles POST /test/configure-secrets. It arms the
+// secret handler's served version and rate-limit dials from an optional JSON
+// body; each field is applied only when > 0, so a partial body leaves the
+// other dials untouched. Decoding is strict: an unknown field is a 400.
+func (s *Server) handleConfigureSecrets(w http.ResponseWriter, r *http.Request) {
+	data, err := s.captureBody("configure_secrets", r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	var body struct {
+		CurrentVersion    int64 `json:"current_version"`
+		RateLimitNext     int64 `json:"rate_limit_next"`
+		RetryAfterSeconds int64 `json:"retry_after_seconds"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if body.CurrentVersion > 0 {
+		s.secretCurrentVersion.Store(body.CurrentVersion)
+	}
+	if body.RateLimitNext > 0 {
+		s.secretRateLimitNext.Store(body.RateLimitNext)
+	}
+	if body.RetryAfterSeconds > 0 {
+		s.secretRetryAfterSeconds.Store(body.RetryAfterSeconds)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

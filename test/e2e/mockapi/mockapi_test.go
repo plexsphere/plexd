@@ -168,10 +168,12 @@ var localCounterFields = map[string]bool{
 // non-zero pass in assertAllCountersEqual. KeyRotateCount advances only on a
 // completing rotation, which n identical unarmed submissions cannot reach.
 // ExecutionUploadCount advances only through the presign-then-PUT leg, which the
-// flat fan-out does not drive uniformly.
+// flat fan-out does not drive uniformly. SecretsRateLimitedCount advances only
+// while the secret rate limit is armed, which the flat fan-out never arms.
 var statefulCounterFields = map[string]bool{
-	"KeyRotateCount":       true,
-	"ExecutionUploadCount": true,
+	"KeyRotateCount":          true,
+	"ExecutionUploadCount":    true,
+	"SecretsRateLimitedCount": true,
 }
 
 // assertAllCountersEqual checks that every field in the AssertionCounters struct
@@ -1878,6 +1880,127 @@ func TestSecrets_InvalidVersionReturns400(t *testing.T) {
 			t.Errorf("?%s: status = %d, want %d", q, resp.StatusCode, http.StatusBadRequest)
 		}
 		resp.Body.Close()
+	}
+}
+
+func TestSecrets_ConfigureCurrentVersion(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	cfg := doRequest(t, http.MethodPost, ts.URL+"/test/configure-secrets", `{"current_version":3}`)
+	if cfg.StatusCode != http.StatusNoContent {
+		cfg.Body.Close()
+		t.Fatalf("configure-secrets status = %d, want %d", cfg.StatusCode, http.StatusNoContent)
+	}
+	cfg.Body.Close()
+
+	// An unversioned fetch now serves the raised current version.
+	unversioned, err := http.Get(ts.URL + "/v1/nodes/node-1/secrets/db-password")
+	if err != nil {
+		t.Fatalf("GET secrets: %v", err)
+	}
+	defer unversioned.Body.Close()
+	if unversioned.StatusCode != http.StatusOK {
+		t.Fatalf("unversioned status = %d, want %d", unversioned.StatusCode, http.StatusOK)
+	}
+	if got := unversioned.Header.Get("X-Plexsphere-Secret-Version"); got != "3" {
+		t.Errorf("unversioned X-Plexsphere-Secret-Version = %q, want %q", got, "3")
+	}
+
+	// A ?version below the current one is served with its own version header.
+	pinned, err := http.Get(ts.URL + "/v1/nodes/node-1/secrets/db-password?version=2")
+	if err != nil {
+		t.Fatalf("GET secrets ?version=2: %v", err)
+	}
+	defer pinned.Body.Close()
+	if pinned.StatusCode != http.StatusOK {
+		t.Fatalf("?version=2 status = %d, want %d", pinned.StatusCode, http.StatusOK)
+	}
+	if got := pinned.Header.Get("X-Plexsphere-Secret-Version"); got != "2" {
+		t.Errorf("?version=2 X-Plexsphere-Secret-Version = %q, want %q", got, "2")
+	}
+
+	// A ?version above the current one is a 404 secret_version_not_found.
+	above, err := http.Get(ts.URL + "/v1/nodes/node-1/secrets/db-password?version=4")
+	if err != nil {
+		t.Fatalf("GET secrets ?version=4: %v", err)
+	}
+	defer above.Body.Close()
+	if above.StatusCode != http.StatusNotFound {
+		t.Fatalf("?version=4 status = %d, want %d", above.StatusCode, http.StatusNotFound)
+	}
+	if code := problemCode(t, above); code != "secret_version_not_found" {
+		t.Errorf("?version=4 code = %q, want %q", code, "secret_version_not_found")
+	}
+}
+
+func TestSecrets_RateLimit(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	cfg := doRequest(t, http.MethodPost, ts.URL+"/test/configure-secrets", `{"rate_limit_next":2,"retry_after_seconds":7}`)
+	if cfg.StatusCode != http.StatusNoContent {
+		cfg.Body.Close()
+		t.Fatalf("configure-secrets status = %d, want %d", cfg.StatusCode, http.StatusNoContent)
+	}
+	cfg.Body.Close()
+
+	// The next two fetches are throttled with a 429 carrying Retry-After: 7.
+	for i := 1; i <= 2; i++ {
+		resp, err := http.Get(ts.URL + "/v1/nodes/node-1/secrets/db-password")
+		if err != nil {
+			t.Fatalf("throttled GET %d: %v", i, err)
+		}
+		if resp.StatusCode != http.StatusTooManyRequests {
+			resp.Body.Close()
+			t.Fatalf("fetch %d status = %d, want %d", i, resp.StatusCode, http.StatusTooManyRequests)
+		}
+		if got := resp.Header.Get("Retry-After"); got != "7" {
+			t.Errorf("fetch %d Retry-After = %q, want %q", i, got, "7")
+		}
+		if code := problemCode(t, resp); code != "per_node_rate_limited" {
+			t.Errorf("fetch %d code = %q, want %q", i, code, "per_node_rate_limited")
+		}
+		resp.Body.Close()
+	}
+
+	// Exactly two fetches were throttled; none of them served an envelope.
+	a := getAssertions(t, ts.URL)
+	if a.SecretsRateLimitedCount != 2 {
+		t.Errorf("secrets_rate_limited_count = %d, want 2", a.SecretsRateLimitedCount)
+	}
+	if a.SecretsCount != 0 {
+		t.Errorf("secrets_count = %d, want 0 while throttled", a.SecretsCount)
+	}
+
+	// The budget is spent: the third fetch serves a 200 envelope.
+	served, err := http.Get(ts.URL + "/v1/nodes/node-1/secrets/db-password")
+	if err != nil {
+		t.Fatalf("post-throttle GET: %v", err)
+	}
+	defer served.Body.Close()
+	if served.StatusCode != http.StatusOK {
+		t.Fatalf("third fetch status = %d, want %d", served.StatusCode, http.StatusOK)
+	}
+
+	// secrets_count counts only the served 200, not the two throttled fetches.
+	a = getAssertions(t, ts.URL)
+	if a.SecretsCount != 1 {
+		t.Errorf("secrets_count = %d, want 1 (served envelopes only)", a.SecretsCount)
+	}
+	if a.SecretsRateLimitedCount != 2 {
+		t.Errorf("secrets_rate_limited_count = %d, want 2", a.SecretsRateLimitedCount)
+	}
+}
+
+func TestSecrets_ConfigureWrongMethod_Returns405(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/test/configure-secrets")
+	if err != nil {
+		t.Fatalf("GET configure-secrets: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
 	}
 }
 
