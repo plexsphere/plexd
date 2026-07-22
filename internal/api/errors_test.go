@@ -340,6 +340,31 @@ func TestErrSecretNameInvalid(t *testing.T) {
 	}
 }
 
+func TestIsEventBusNotProvisioned(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"501 with the descope code", &APIError{StatusCode: 501, Code: "signed_event_bus_not_provisioned"}, true},
+		{"wrapped 501 with the descope code", fmt.Errorf("connect SSE: %w", &APIError{StatusCode: 501, Code: "signed_event_bus_not_provisioned"}), true},
+		{"501 with another code is a plain not-implemented", &APIError{StatusCode: 501, Code: "observability_ingest_not_provisioned"}, false},
+		{"501 without a code", &APIError{StatusCode: 501}, false},
+		{"503 with the descope code is transient", &APIError{StatusCode: 503, Code: "signed_event_bus_not_provisioned"}, false},
+		{"500 with the descope code is transient", &APIError{StatusCode: 500, Code: "signed_event_bus_not_provisioned"}, false},
+		{"400 with the descope code", &APIError{StatusCode: 400, Code: "signed_event_bus_not_provisioned"}, false},
+		{"non-API error", errors.New("dial tcp: timeout"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsEventBusNotProvisioned(tt.err); got != tt.want {
+				t.Errorf("IsEventBusNotProvisioned(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsIngestTooLarge(t *testing.T) {
 	tests := []struct {
 		name string

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -431,5 +432,422 @@ func TestClassifyError_5xx(t *testing.T) {
 	action := ClassifyError(err)
 	if action != RetryTransient {
 		t.Errorf("expected RetryTransient, got %v", action)
+	}
+}
+
+// A 501 signed_event_bus_not_provisioned is the control plane's long-term
+// events descope: it must classify as RetryDescoped even though it also matches
+// the any-5xx ErrServer sentinel, so pull-only delivery engages instead of
+// burning backoff against a channel that is not there.
+func TestClassifyError_501EventBusDescoped(t *testing.T) {
+	err := &APIError{StatusCode: 501, Code: "signed_event_bus_not_provisioned"}
+	if action := ClassifyError(err); action != RetryDescoped {
+		t.Errorf("expected RetryDescoped, got %v", action)
+	}
+}
+
+// A 501 carrying any other code is a plain not-implemented and stays transient.
+func TestClassifyError_501OtherCode(t *testing.T) {
+	err := &APIError{StatusCode: 501, Code: "observability_ingest_not_provisioned"}
+	if action := ClassifyError(err); action != RetryTransient {
+		t.Errorf("expected RetryTransient, got %v", action)
+	}
+}
+
+// A 503 event_stream_unavailable is a transient outage, not a descope.
+func TestClassifyError_503EventStreamUnavailable(t *testing.T) {
+	err := &APIError{StatusCode: 503, Code: "event_stream_unavailable"}
+	if action := ClassifyError(err); action != RetryTransient {
+		t.Errorf("expected RetryTransient, got %v", action)
+	}
+}
+
+// discardLogger returns a logger that drops all output, keeping test logs quiet.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// recordingClock is a fake Clock that resolves After immediately and records
+// every delay it was handed, so a test can assert the reconnect engine's wait
+// cadence without real sleeps. Now advances by each waited delay, which lets the
+// polling-fallback window elapse deterministically.
+type recordingClock struct {
+	mu    sync.Mutex
+	now   time.Time
+	after []time.Duration
+}
+
+func newRecordingClock() *recordingClock {
+	return &recordingClock{now: time.Now()}
+}
+
+func (c *recordingClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *recordingClock) After(d time.Duration) <-chan time.Time {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.after = append(c.after, d)
+	now := c.now
+	c.mu.Unlock()
+	ch := make(chan time.Time, 1)
+	ch <- now
+	return ch
+}
+
+func (c *recordingClock) delays() []time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]time.Duration, len(c.after))
+	copy(out, c.after)
+	return out
+}
+
+// descopedErr is the control plane's long-term events descope.
+func descopedErr() error {
+	return &APIError{StatusCode: 501, Code: "signed_event_bus_not_provisioned"}
+}
+
+// modeRecorder collects the delivery-mode transitions the engine fires.
+type modeRecorder struct {
+	mu    sync.Mutex
+	modes []DeliveryMode
+}
+
+func (m *modeRecorder) record(mode DeliveryMode) {
+	m.mu.Lock()
+	m.modes = append(m.modes, mode)
+	m.mu.Unlock()
+}
+
+func (m *modeRecorder) seq() []DeliveryMode {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]DeliveryMode, len(m.modes))
+	copy(out, m.modes)
+	return out
+}
+
+// TestReconnect_PullOnlyEntryImmediate proves the descope enters pull-only with
+// no exponential-backoff wait and no 5-minute polling window preceding it: the
+// first wait the engine performs equals the reprobe interval, and every wait in
+// the run is the reprobe interval.
+func TestReconnect_PullOnlyEntryImmediate(t *testing.T) {
+	e := fastEngine(discardLogger())
+	clk := newRecordingClock()
+	e.SetClock(clk)
+	const reprobe = 30 * time.Millisecond
+	e.SetReprobeInterval(reprobe)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls atomic.Int32
+	connectFn := func(context.Context) error {
+		if calls.Add(1) >= 3 {
+			cancel()
+		}
+		return descopedErr()
+	}
+	pollFn := func(context.Context) error { return nil }
+
+	_ = e.Run(ctx, connectFn, pollFn)
+
+	delays := clk.delays()
+	if len(delays) == 0 {
+		t.Fatal("expected at least one wait, got none")
+	}
+	if delays[0] != reprobe {
+		t.Errorf("first wait after descope = %v, want reprobe interval %v", delays[0], reprobe)
+	}
+	for i, d := range delays {
+		if d != reprobe {
+			t.Errorf("wait[%d] = %v, want reprobe interval %v (no backoff/polling wait may precede pull-only)", i, d, reprobe)
+		}
+	}
+}
+
+// TestReconnect_PullOnlyNeverPolls proves the pull path never calls pollFn while
+// descoped, and re-probes SSE exactly once per elapsed reprobe interval.
+func TestReconnect_PullOnlyNeverPolls(t *testing.T) {
+	e := fastEngine(discardLogger())
+	clk := newRecordingClock()
+	e.SetClock(clk)
+	const reprobe = 20 * time.Millisecond
+	e.SetReprobeInterval(reprobe)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var connectCalls, pollCalls atomic.Int32
+	connectFn := func(context.Context) error {
+		if connectCalls.Add(1) >= 5 {
+			cancel()
+		}
+		return descopedErr()
+	}
+	pollFn := func(context.Context) error {
+		pollCalls.Add(1)
+		return nil
+	}
+
+	_ = e.Run(ctx, connectFn, pollFn)
+
+	if got := pollCalls.Load(); got != 0 {
+		t.Errorf("pollFn called %d times in pull-only, want 0", got)
+	}
+	// Each reprobe wait is followed by exactly one connectFn attempt; the extra
+	// attempt is the initial descope in Run's main loop.
+	delays := clk.delays()
+	if got := int(connectCalls.Load()); got != len(delays)+1 {
+		t.Errorf("connectFn attempts = %d, want reprobe waits + 1 = %d", got, len(delays)+1)
+	}
+	for i, d := range delays {
+		if d != reprobe {
+			t.Errorf("wait[%d] = %v, want reprobe interval %v", i, d, reprobe)
+		}
+	}
+}
+
+// TestReconnect_PullOnlyStaysDescoped proves that re-probes still answering the
+// descope keep the engine in pull-only with a single mode transition fired.
+func TestReconnect_PullOnlyStaysDescoped(t *testing.T) {
+	e := fastEngine(discardLogger())
+	clk := newRecordingClock()
+	e.SetClock(clk)
+	e.SetReprobeInterval(15 * time.Millisecond)
+
+	var rec modeRecorder
+	e.SetOnModeChange(rec.record)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls atomic.Int32
+	connectFn := func(context.Context) error {
+		if calls.Add(1) >= 4 {
+			cancel()
+		}
+		return descopedErr()
+	}
+
+	_ = e.Run(ctx, connectFn, func(context.Context) error { return nil })
+
+	if got := e.Mode(); got != DeliveryModePullOnly {
+		t.Errorf("mode = %q, want pull_only", got)
+	}
+	if seq := rec.seq(); len(seq) != 1 || seq[0] != DeliveryModePullOnly {
+		t.Errorf("mode transitions = %v, want exactly [pull_only]", seq)
+	}
+}
+
+// TestReconnect_PullOnlyExitOnReconnect proves each reconnect path leaves
+// pull-only for streaming with backoff reset and exactly two mode transitions
+// (streaming->pull_only->streaming).
+func TestReconnect_PullOnlyExitOnReconnect(t *testing.T) {
+	cases := []struct {
+		name string
+		// probe is the connectFn behaviour on the pull-only re-probe (call 2).
+		probe func(e *ReconnectEngine) error
+	}{
+		{
+			name: "nil after notifyConnected",
+			probe: func(e *ReconnectEngine) error {
+				e.notifyConnected()
+				return nil
+			},
+		},
+		{
+			name: "error after notifyConnected",
+			probe: func(e *ReconnectEngine) error {
+				e.notifyConnected()
+				return errors.New("stream dropped after 200")
+			},
+		},
+		{
+			name: "nil without notifyConnected (hook not wired)",
+			probe: func(*ReconnectEngine) error {
+				return nil
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fastEngine(discardLogger())
+			clk := newRecordingClock()
+			e.SetClock(clk)
+			e.SetReprobeInterval(15 * time.Millisecond)
+
+			var rec modeRecorder
+			e.SetOnModeChange(rec.record)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var calls atomic.Int32
+			connectFn := func(context.Context) error {
+				switch calls.Add(1) {
+				case 1:
+					return descopedErr()
+				case 2:
+					return tc.probe(e)
+				default:
+					cancel()
+					return nil
+				}
+			}
+
+			_ = e.Run(ctx, connectFn, func(context.Context) error { return nil })
+
+			if got := e.Mode(); got != DeliveryModeStreaming {
+				t.Errorf("mode = %q, want streaming", got)
+			}
+			if seq := rec.seq(); len(seq) != 2 || seq[0] != DeliveryModePullOnly || seq[1] != DeliveryModeStreaming {
+				t.Errorf("mode transitions = %v, want [pull_only streaming]", seq)
+			}
+			e.mu.Lock()
+			interval, failing := e.currentInterval, e.failingSince
+			e.mu.Unlock()
+			if interval != e.baseInterval {
+				t.Errorf("currentInterval = %v, want base %v (backoff not reset)", interval, e.baseInterval)
+			}
+			if !failing.IsZero() {
+				t.Errorf("failingSince = %v, want zero (backoff not reset)", failing)
+			}
+		})
+	}
+}
+
+// TestReconnect_PullOnlyReprobePropagates proves an auth or permanent failure
+// surfaced by a re-probe stops the engine and propagates the error.
+func TestReconnect_PullOnlyReprobePropagates(t *testing.T) {
+	t.Run("401 invokes auth callback and returns", func(t *testing.T) {
+		e := fastEngine(discardLogger())
+		e.SetClock(newRecordingClock())
+		e.SetReprobeInterval(15 * time.Millisecond)
+
+		var authCalled atomic.Bool
+		e.SetOnAuthFailure(func() { authCalled.Store(true) })
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var calls atomic.Int32
+		connectFn := func(context.Context) error {
+			if calls.Add(1) == 1 {
+				return descopedErr()
+			}
+			return &APIError{StatusCode: 401, Message: "unauthorized"}
+		}
+
+		err := e.Run(ctx, connectFn, func(context.Context) error { return nil })
+		if !authCalled.Load() {
+			t.Error("expected onAuthFailure callback to be invoked")
+		}
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != 401 {
+			t.Errorf("Run error = %v, want 401 APIError", err)
+		}
+	})
+
+	t.Run("403 stops and returns", func(t *testing.T) {
+		e := fastEngine(discardLogger())
+		e.SetClock(newRecordingClock())
+		e.SetReprobeInterval(15 * time.Millisecond)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var calls atomic.Int32
+		connectFn := func(context.Context) error {
+			if calls.Add(1) == 1 {
+				return descopedErr()
+			}
+			return &APIError{StatusCode: 403, Message: "forbidden"}
+		}
+
+		err := e.Run(ctx, connectFn, func(context.Context) error { return nil })
+		if !errors.Is(err, ErrForbidden) {
+			t.Errorf("Run error = %v, want ErrForbidden", err)
+		}
+	})
+}
+
+// TestReconnect_DegradedPollingMode proves the legacy transient path is intact:
+// a persistent transient error backs off, enters the polling fallback reporting
+// degraded_polling, and returns to streaming once SSE reattaches from fallback.
+func TestReconnect_DegradedPollingMode(t *testing.T) {
+	e := NewReconnectEngine(discardLogger())
+	clk := newRecordingClock()
+	e.SetClock(clk)
+	e.jitterFraction = 0 // deterministic backoff so the window elapses predictably
+	e.SetIntervals(1*time.Second, 4*time.Second)
+	e.SetPollingFallbackConfig(10*time.Second, 2*time.Second)
+
+	var rec modeRecorder
+	e.SetOnModeChange(rec.record)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var connectCalls, pollCalls atomic.Int32
+	// Fail transiently until the polling window elapses, reconnect once from the
+	// fallback, then cancel so Run returns.
+	connectFn := func(context.Context) error {
+		n := connectCalls.Add(1)
+		if n <= 5 {
+			return errors.New("connection refused")
+		}
+		if n == 6 {
+			return nil // SSE reattaches from polling fallback
+		}
+		cancel()
+		return nil
+	}
+	pollFn := func(context.Context) error {
+		pollCalls.Add(1)
+		return nil
+	}
+
+	_ = e.Run(ctx, connectFn, pollFn)
+
+	if got := pollCalls.Load(); got < 1 {
+		t.Errorf("pollFn called %d times, want >= 1 in degraded polling", got)
+	}
+	if got := e.Mode(); got != DeliveryModeStreaming {
+		t.Errorf("mode = %q, want streaming after SSE reattaches", got)
+	}
+	if seq := rec.seq(); len(seq) != 2 || seq[0] != DeliveryModeDegradedPolling || seq[1] != DeliveryModeStreaming {
+		t.Errorf("mode transitions = %v, want [degraded_polling streaming]", seq)
+	}
+}
+
+// TestReconnect_NilModeChangeCallback proves the engine tolerates a nil
+// on-mode-change callback: a descope drives a transition without panicking.
+func TestReconnect_NilModeChangeCallback(t *testing.T) {
+	e := fastEngine(discardLogger())
+	e.SetClock(newRecordingClock())
+	e.SetReprobeInterval(15 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls atomic.Int32
+	connectFn := func(context.Context) error {
+		if calls.Add(1) >= 2 {
+			cancel()
+		}
+		return descopedErr()
+	}
+
+	// No SetOnModeChange: the callback stays nil.
+	_ = e.Run(ctx, connectFn, func(context.Context) error { return nil })
+
+	if got := e.Mode(); got != DeliveryModePullOnly {
+		t.Errorf("mode = %q, want pull_only", got)
 	}
 }

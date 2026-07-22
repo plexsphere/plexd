@@ -13,6 +13,7 @@ import (
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/nat"
+	"github.com/plexsphere/plexd/internal/nodeapi"
 )
 
 // TestRedactSensitiveLine_SecretKey verifies that the existing redaction logic
@@ -170,4 +171,37 @@ func TestSigningKeyRotatedHandler(t *testing.T) {
 			t.Errorf("envelope under old kid failed to verify after malformed rotation: %v", err)
 		}
 	})
+}
+
+// TestDeliveryModePublisher verifies the publisher surfaces the delivery mode as
+// the delivery_mode metadata key, that a later transition overwrites it, and
+// that it is held apart from the snapshot-owned metadata map so a reconcile that
+// rewrites that map cannot drop it.
+func TestDeliveryModePublisher(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cache := nodeapi.NewStateCache(t.TempDir(), logger)
+
+	// Seed an unrelated metadata key the publisher must preserve.
+	cache.UpdateMetadata(map[string]string{"region": "eu-central"})
+
+	publish := deliveryModePublisher(cache, logger)
+
+	publish(api.DeliveryModePullOnly)
+	if got, _ := cache.GetMetadataKey("delivery_mode"); got != "pull_only" {
+		t.Errorf("delivery_mode = %q, want pull_only", got)
+	}
+	if got := cache.GetMetadata()["region"]; got != "eu-central" {
+		t.Errorf("pre-existing region key = %q, want eu-central (must survive)", got)
+	}
+
+	// A reconcile that rewrites the snapshot metadata must not drop delivery_mode.
+	cache.UpdateMetadata(map[string]string{"env": "prod"})
+	if got, _ := cache.GetMetadataKey("delivery_mode"); got != "pull_only" {
+		t.Errorf("delivery_mode after metadata rewrite = %q, want pull_only", got)
+	}
+
+	publish(api.DeliveryModeStreaming)
+	if got, _ := cache.GetMetadataKey("delivery_mode"); got != "streaming" {
+		t.Errorf("delivery_mode after update = %q, want streaming", got)
+	}
 }

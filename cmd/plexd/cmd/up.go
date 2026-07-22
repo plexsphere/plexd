@@ -458,6 +458,13 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	nodeAPISrv.SetPeerProvider(peerSnap)
 	nodeAPISrv.SetPolicyProvider(policySnap)
 
+	// Publish the SSE delivery mode as node-API cache metadata so `plexd status`
+	// surfaces it. Seed it once so the field reads streaming from startup, then
+	// update it on every transition (e.g. into pull-only on a 501 descope).
+	publishDeliveryMode := deliveryModePublisher(nodeAPISrv.Cache(), logger)
+	sseMgr.SetOnModeChange(publishDeliveryMode)
+	publishDeliveryMode(sseMgr.Mode())
+
 	// Register nodeapi reconcile handler so cache updates on drift. The pull is
 	// authoritative: node_state_updated triggers a reconcile (see above), and
 	// this handler refreshes the node API cache from the resulting snapshot.
@@ -1011,6 +1018,18 @@ type controlPlaneReporter struct{ cp *api.ControlPlane }
 
 func (r *controlPlaneReporter) ReportViolation(ctx context.Context, nodeID string, report api.IntegrityViolationReport) error {
 	return r.cp.ReportIntegrityViolation(ctx, nodeID, report)
+}
+
+// deliveryModePublisher returns a callback that records the SSE delivery mode in
+// a dedicated node-API cache field, so `plexd status` shows which channel is
+// currently delivering control-plane state. The mode is held apart from the
+// snapshot-owned metadata map, which the authoritative pull reconcile rebuilds
+// from scratch on every cycle and would otherwise clobber.
+func deliveryModePublisher(cache *nodeapi.StateCache, logger *slog.Logger) func(api.DeliveryMode) {
+	return func(mode api.DeliveryMode) {
+		cache.SetDeliveryMode(string(mode))
+		logger.Info("event delivery mode changed", "mode", mode)
+	}
 }
 
 // applyEnvOverrides applies PLEXD_* environment variable overrides to the config.
