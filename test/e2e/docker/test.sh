@@ -1937,6 +1937,102 @@ fi
 echo "=== Phase 12a PASSED: state report roundtrip and status publisher ==="
 
 # ===================================================================
+# Phase 12b: versioned and rate-limited secret fetches
+# ===================================================================
+# Drive the Local Node API secret route against the mock's envelope
+# contract: prove ?version=N threads through (the current version and an
+# older one both echo their number in the 200 body), that a version above
+# the current one is an honest 404, and that an armed per-node 429 passes
+# through with its Retry-After header before the service recovers to 200.
+# A background reporter refetch may consume the armed 429 before our curl
+# does, so the mock's secrets_rate_limited_count is an equally valid proof.
+echo "=== Testing versioned and rate-limited secret fetches ==="
+
+SEC_URL="${NODE_API_URL}/v1/state/secrets/local-bearer-token"
+
+# Pin the mock's current secret version to 2.
+SEC_CFG_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"current_version": 2}' \
+    "http://localhost:18080/test/configure-secrets" 2>/dev/null || true)
+if [ "${SEC_CFG_STATUS}" != "204" ]; then
+    fail "configure-secrets (current_version) returned status ${SEC_CFG_STATUS}, want 204"
+fi
+
+# (a) Default fetch echoes the plaintext value and the current version.
+SEC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${NAPI_AUTH[@]}" "${SEC_URL}" 2>/dev/null || true)
+SEC_BODY=$(curl -sf "${NAPI_AUTH[@]}" "${SEC_URL}" 2>/dev/null || true)
+if [ "${SEC_STATUS}" = "200" ] \
+    && [ "$(echo "${SEC_BODY}" | jq -r '.value // empty')" = "e2e-local-bearer-token" ] \
+    && [ "$(echo "${SEC_BODY}" | jq -r '.version // empty')" = "2" ]; then
+    echo "  PASS: GET secrets/local-bearer-token -> 200 value ok version=2"
+else
+    fail "secret fetch returned status ${SEC_STATUS} body '${SEC_BODY}', want 200 value=e2e-local-bearer-token version=2"
+fi
+
+# (b) ?version=1 threads an older version through to the 200 body.
+SEC_V1_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${NAPI_AUTH[@]}" "${SEC_URL}?version=1" 2>/dev/null || true)
+SEC_V1_BODY=$(curl -sf "${NAPI_AUTH[@]}" "${SEC_URL}?version=1" 2>/dev/null || true)
+if [ "${SEC_V1_STATUS}" = "200" ] \
+    && [ "$(echo "${SEC_V1_BODY}" | jq -r '.version // empty')" = "1" ]; then
+    echo "  PASS: GET secrets ?version=1 -> 200 version=1"
+else
+    fail "secret ?version=1 returned status ${SEC_V1_STATUS} body '${SEC_V1_BODY}', want 200 version=1"
+fi
+
+# (c) A version above the current one is an honest 404.
+SEC_V3_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${NAPI_AUTH[@]}" "${SEC_URL}?version=3" 2>/dev/null || true)
+if [ "${SEC_V3_STATUS}" = "404" ]; then
+    echo "  PASS: GET secrets ?version=3 -> 404 (above current)"
+else
+    fail "secret ?version=3 returned status ${SEC_V3_STATUS}, want 404"
+fi
+
+# Arm a single per-node 429 carrying Retry-After: 5.
+SEC_RL_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"rate_limit_next": 1, "retry_after_seconds": 5}' \
+    "http://localhost:18080/test/configure-secrets" 2>/dev/null || true)
+if [ "${SEC_RL_STATUS}" != "204" ]; then
+    fail "configure-secrets (rate_limit_next) returned status ${SEC_RL_STATUS}, want 204"
+fi
+
+# (d) The armed 429 must pass through: either our own fetch sees the 429
+#     with a Retry-After header, or a background reporter refetch consumed
+#     it first and the mock's rate-limit counter advanced -- both prove
+#     the passthrough. Poll up to 5 times.
+SEC_RL_SEEN=0
+for _ in 1 2 3 4 5; do
+    SEC_HDRS=$(curl -s -D - -o /dev/null "${NAPI_AUTH[@]}" "${SEC_URL}" 2>/dev/null || true)
+    SEC_RL_CODE=$(echo "${SEC_HDRS}" | awk 'NR==1{print $2}')
+    if [ "${SEC_RL_CODE}" = "429" ] && echo "${SEC_HDRS}" | grep -qi '^Retry-After:'; then
+        echo "  PASS: secret fetch -> 429 with Retry-After (passthrough)"
+        SEC_RL_SEEN=1
+        break
+    fi
+    SEC_RL_COUNT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "secrets_rate_limited_count")
+    if [ "${SEC_RL_COUNT}" -ge 1 ]; then
+        echo "  PASS: secrets_rate_limited_count=${SEC_RL_COUNT} (reporter consumed the armed 429)"
+        SEC_RL_SEEN=1
+        break
+    fi
+    sleep 2
+done
+if [ "${SEC_RL_SEEN}" -eq 0 ]; then
+    fail "armed per-node 429 was neither observed nor counted after 5 attempts"
+fi
+
+# (e) The armed limit is exhausted, so the next fetch recovers to 200.
+SEC_OK_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${NAPI_AUTH[@]}" "${SEC_URL}" 2>/dev/null || true)
+if [ "${SEC_OK_STATUS}" = "200" ]; then
+    echo "  PASS: secret fetch recovered to 200"
+else
+    fail "secret fetch did not recover to 200 (status ${SEC_OK_STATUS})"
+fi
+
+echo "=== Phase 12b PASSED: versioned and rate-limited secret fetches ==="
+
+# ===================================================================
 # Phase 13: Converge cycle (full envelope mutation)
 # ===================================================================
 # POST a mutated NodeStateSnapshot whose policy fingerprint differs from the
