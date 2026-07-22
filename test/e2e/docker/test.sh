@@ -13,6 +13,8 @@
 #   - Action execution via SSE (action_request → ack/started/terminal callbacks)
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
+#   - Pull-only delivery under a descoped event bus (quiet SSE re-probing)
+#   - Last-Event-ID resume replays buffered envelopes after a descope window
 #   - Graceful shutdown (exit code 0, no crash indicators)
 set -euo pipefail
 
@@ -583,12 +585,10 @@ echo "  state_count before injection: ${STATE_BEFORE}"
 # Inject a node_state_updated SSE event.
 INJECT_PAYLOAD=$(cat <<'INJEOF'
 {
-    "event_type": "node_state_updated",
-    "event_id": "evt-e2e-inject-001",
-    "issued_at": "2099-01-01T00:00:00Z",
-    "nonce": "e2e-inject-nonce-001",
-    "payload": "{\"node_id\":\"e2e-node-1\"}",
-    "signature": "mock-signature"
+    "id": "evt-e2e-inject-001",
+    "type": "node_state_updated",
+    "scope": "node",
+    "payload": "{\"node_id\":\"e2e-node-1\"}"
 }
 INJEOF
 )
@@ -638,12 +638,10 @@ echo "  state_count before: ${STATE_BEFORE_POL}"
 # Inject a policy_updated SSE event.
 POL_PAYLOAD=$(cat <<'POLEOF'
 {
-    "event_type": "policy_updated",
-    "event_id": "evt-e2e-policy-001",
-    "issued_at": "2099-01-01T00:00:00Z",
-    "nonce": "e2e-policy-nonce-001",
-    "payload": "{\"policy_id\":\"pol-e2e-001\"}",
-    "signature": "mock-signature"
+    "id": "evt-e2e-policy-001",
+    "type": "policy_updated",
+    "scope": "node",
+    "payload": "{\"policy_id\":\"pol-e2e-001\"}"
 }
 POLEOF
 )
@@ -693,16 +691,14 @@ echo "  execution_callback_count before: ${CB_BEFORE}"
 # Inject an action_request SSE event for the builtin "system.info" action.
 ACTION_PAYLOAD=$(cat <<'ACTEOF'
 {
-    "event_type": "action_request",
-    "event_id": "evt-e2e-action-001",
-    "issued_at": "2099-01-01T00:00:00Z",
-    "nonce": "e2e-action-nonce-001",
+    "id": "evt-e2e-action-001",
+    "type": "action_request",
+    "scope": "node",
     "payload": {
         "execution_id": "exec-e2e-001",
         "action": "system.info",
         "timeout": "30s"
-    },
-    "signature": "mock-signature"
+    }
 }
 ACTEOF
 )
@@ -808,7 +804,7 @@ echo "=== Testing additional builtin action types ==="
 
 # Helper function: inject an action, wait for the terminal callback, validate.
 test_action() {
-    local action_name=$1 exec_id=$2 nonce=$3
+    local action_name=$1 exec_id=$2
     shift 3
     # Remaining args are validation commands (passed as description only).
 
@@ -821,16 +817,14 @@ test_action() {
     local payload
     payload=$(cat <<ACTEOF
 {
-    "event_type": "action_request",
-    "event_id": "evt-e2e-${exec_id}",
-    "issued_at": "2099-01-01T00:00:00Z",
-    "nonce": "${nonce}",
+    "id": "evt-e2e-${exec_id}",
+    "type": "action_request",
+    "scope": "node",
     "payload": {
         "execution_id": "${exec_id}",
         "action": "${action_name}",
         "timeout": "30s"
-    },
-    "signature": "mock-signature"
+    }
 }
 ACTEOF
     )
@@ -979,16 +973,14 @@ echo "  execution_callback_count before: ${CB_BEFORE_UNK}"
 # Inject action_request for a nonexistent action.
 UNK_PAYLOAD=$(cat <<'UNKEOF'
 {
-    "event_type": "action_request",
-    "event_id": "evt-e2e-unknown-001",
-    "issued_at": "2099-01-01T00:00:00Z",
-    "nonce": "e2e-unknown-nonce-001",
+    "id": "evt-e2e-unknown-001",
+    "type": "action_request",
+    "scope": "node",
     "payload": {
         "execution_id": "exec-e2e-unknown-001",
         "action": "nonexistent.fake",
         "timeout": "10s"
-    },
-    "signature": "mock-signature"
+    }
 }
 UNKEOF
 )
@@ -1073,17 +1065,15 @@ echo "  execution_upload_count before: ${UP_BEFORE_BIG}"
 # must expand into the payload).
 BIG_PAYLOAD=$(cat <<BIGEOF
 {
-    "event_type": "action_request",
-    "event_id": "evt-e2e-big-001",
-    "issued_at": "2099-01-01T00:00:00Z",
-    "nonce": "e2e-big-nonce-001",
+    "id": "evt-e2e-big-001",
+    "type": "action_request",
+    "scope": "node",
     "payload": {
         "execution_id": "exec-e2e-big-001",
         "action": "e2e-bigout",
         "timeout": "30s",
         "checksum": "${HOOK_SHA}"
-    },
-    "signature": "mock-signature"
+    }
 }
 BIGEOF
 )
@@ -1178,18 +1168,16 @@ echo "  session_activity_count before: ${SESS_BEFORE}"
 # Inject ssh_session_setup (interpolated heredoc: EXPIRES_AT must expand).
 SSH_PAYLOAD=$(cat <<SSHEOF
 {
-    "event_type": "ssh_session_setup",
-    "event_id": "evt-e2e-sess-001",
-    "issued_at": "2099-01-01T00:00:00Z",
-    "nonce": "e2e-sess-nonce-001",
+    "id": "evt-e2e-sess-001",
+    "type": "ssh_session_setup",
+    "scope": "node",
     "payload": {
         "session_id": "sess-e2e-001",
         "target_host": "127.0.0.1",
         "target_port": 8080,
         "authorized_key": "",
         "expires_at": "${EXPIRES_AT}"
-    },
-    "signature": "mock-signature"
+    }
 }
 SSHEOF
 )
@@ -1252,14 +1240,12 @@ fi
 # Inject session_revoked to close the session.
 REV_PAYLOAD=$(cat <<'REVEOF'
 {
-    "event_type": "session_revoked",
-    "event_id": "evt-e2e-sess-revoke-001",
-    "issued_at": "2099-01-01T00:00:00Z",
-    "nonce": "e2e-sess-revoke-nonce-001",
+    "id": "evt-e2e-sess-revoke-001",
+    "type": "session_revoked",
+    "scope": "node",
     "payload": {
         "session_id": "sess-e2e-001"
-    },
-    "signature": "mock-signature"
+    }
 }
 REVEOF
 )
@@ -1433,12 +1419,10 @@ echo "  key_rotate_count before: ${ROTATE_BEFORE_RK}"
 # Inject a rotate_keys SSE event.
 RK_PAYLOAD=$(cat <<'RKEOF'
 {
-    "event_type": "rotate_keys",
-    "event_id": "evt-e2e-rotatekeys-001",
-    "issued_at": "2099-01-01T00:00:00Z",
-    "nonce": "e2e-rotatekeys-nonce-001",
-    "payload": "{\"reason\":\"e2e-test\"}",
-    "signature": "mock-signature"
+    "id": "evt-e2e-rotatekeys-001",
+    "type": "rotate_keys",
+    "scope": "node",
+    "payload": "{\"reason\":\"e2e-test\"}"
 }
 RKEOF
 )
@@ -2436,6 +2420,237 @@ if [ "${DUAL_PASS}" -eq 0 ]; then
 fi
 
 echo "=== Phase 16 PASSED: dual delivery verification ==="
+
+# ===================================================================
+# Phase 17: Pull-only delivery mode under a descoped event bus
+# ===================================================================
+# Descoping the mock's event bus makes GET /v1/nodes/{id}/events answer the
+# spec's 501, so the open SSE stream closes and plexd reclassifies delivery as
+# pull_only within seconds. While descoped it keeps reconciling on its own 60s
+# loop (state_count rises) and only re-probes SSE once per sse_reprobe_interval
+# (5s here) rather than hot-looping. Restoring streaming returns delivery to SSE
+# and fresh injects flow again. The mode is read from `plexd status`, which
+# renders the node-API cache metadata (delivery_mode key) generically.
+echo "=== Testing pull-only delivery mode under a descoped event bus ==="
+
+# poll_delivery_mode: poll `plexd status` inside the plexd container until its
+# rendered metadata shows the wanted delivery_mode within the timeout. Returns 0
+# on match, 1 on timeout. Whitespace-tolerant so it survives the "  key: value"
+# indent the status command prints.
+poll_delivery_mode() {
+    local want=$1 timeout=$2 elapsed=0 out
+    while [ "${elapsed}" -lt "${timeout}" ]; do
+        out=$(dc exec -T plexd /usr/local/bin/plexd status 2>/dev/null || true)
+        if echo "${out}" | grep -qE "delivery_mode:[[:space:]]*${want}"; then
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    return 1
+}
+
+# (a) Flip the event bus to descoped.
+DM_DESCOPE_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"mode":"descoped"}' \
+    "http://localhost:18080/test/configure-events" 2>/dev/null || true)
+if [ "${DM_DESCOPE_STATUS}" != "204" ]; then
+    fail "configure-events (descoped) returned status ${DM_DESCOPE_STATUS}, want 204"
+fi
+echo "  event bus flipped to descoped"
+
+# (b) plexd must reclassify to pull_only within seconds of the stream closing.
+if poll_delivery_mode pull_only 30; then
+    echo "  PASS: delivery_mode reclassified to pull_only after descope"
+else
+    fail "delivery_mode did not reach pull_only within 30s after descope"
+fi
+
+# (c) Pulls continue while pull-only: the reconciler's own 60s loop advances
+#     state_count even with no SSE stream. Poll generously past one interval.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+DM_STATE_BEFORE=$(get_counter "${RESPONSE}" "state_count")
+echo "  state_count before pull-only wait: ${DM_STATE_BEFORE}"
+DM_PULL_TIMEOUT=90
+DM_PULL_ELAPSED=0
+DM_PULL_PASSED=0
+while [ "${DM_PULL_ELAPSED}" -lt "${DM_PULL_TIMEOUT}" ]; do
+    sleep 2
+    DM_PULL_ELAPSED=$((DM_PULL_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        DM_STATE_AFTER=$(get_counter "${RESPONSE}" "state_count")
+        if [ "${DM_STATE_AFTER}" -gt "${DM_STATE_BEFORE}" ]; then
+            echo "  PASS: state_count advanced ${DM_STATE_BEFORE} -> ${DM_STATE_AFTER} while pull-only (reconcile loop)"
+            DM_PULL_PASSED=1
+            break
+        fi
+    fi
+done
+if [ "${DM_PULL_PASSED}" -eq 0 ]; then
+    DM_STATE_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    fail "state_count did not advance while pull-only within ${DM_PULL_TIMEOUT}s (before=${DM_STATE_BEFORE}, after=${DM_STATE_AFTER})"
+fi
+
+# (d) Re-probe cadence, not hot retry: over a quiet 15s window the events
+#     endpoint is hit only a handful of times (~one per 5s sse_reprobe_interval),
+#     never a tight retry loop.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+[ -n "${RESPONSE}" ] || fail "assert endpoint unreachable while baselining re-probe cadence"
+DM_EVREQ_BEFORE=$(get_counter "${RESPONSE}" "events_request_count")
+echo "  events_request_count before quiet window: ${DM_EVREQ_BEFORE}"
+sleep 15
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+[ -n "${RESPONSE}" ] || fail "assert endpoint unreachable while measuring re-probe cadence"
+DM_EVREQ_AFTER=$(get_counter "${RESPONSE}" "events_request_count")
+DM_EVREQ_DELTA=$((DM_EVREQ_AFTER - DM_EVREQ_BEFORE))
+if [ "${DM_EVREQ_DELTA}" -le 3 ]; then
+    echo "  PASS: events_request_count rose by ${DM_EVREQ_DELTA} in 15s (<= 3, quiet re-probing)"
+else
+    fail "events_request_count rose by ${DM_EVREQ_DELTA} in 15s (> 3); pull-only is hot-retrying the event stream"
+fi
+
+# (e) Restore streaming; delivery must return to SSE promptly on a good re-probe.
+DM_STREAM_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"mode":"streaming"}' \
+    "http://localhost:18080/test/configure-events" 2>/dev/null || true)
+if [ "${DM_STREAM_STATUS}" != "204" ]; then
+    fail "configure-events (streaming) returned status ${DM_STREAM_STATUS}, want 204"
+fi
+echo "  event bus flipped to streaming"
+if poll_delivery_mode streaming 15; then
+    echo "  PASS: delivery_mode returned to streaming"
+else
+    fail "delivery_mode did not return to streaming within 15s"
+fi
+
+# (f) A fresh live inject flows again over the restored stream.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+DM_LIVE_BEFORE=$(get_counter "${RESPONSE}" "state_count")
+DM_INJECT_PAYLOAD=$(cat <<'DMEOF'
+{
+    "id": "evt-e2e-dm-001",
+    "type": "node_state_updated",
+    "scope": "node",
+    "payload": "{\"node_id\":\"e2e-node-1\"}"
+}
+DMEOF
+)
+DM_INJECT_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${DM_INJECT_PAYLOAD}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${DM_INJECT_STATUS}" != "204" ]; then
+    fail "post-resume node_state_updated injection returned status ${DM_INJECT_STATUS}, want 204"
+fi
+DM_LIVE_TIMEOUT=15
+DM_LIVE_ELAPSED=0
+DM_LIVE_PASSED=0
+while [ "${DM_LIVE_ELAPSED}" -lt "${DM_LIVE_TIMEOUT}" ]; do
+    sleep 2
+    DM_LIVE_ELAPSED=$((DM_LIVE_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        DM_LIVE_AFTER=$(get_counter "${RESPONSE}" "state_count")
+        if [ "${DM_LIVE_AFTER}" -gt "${DM_LIVE_BEFORE}" ]; then
+            echo "  PASS: state_count increased ${DM_LIVE_BEFORE} -> ${DM_LIVE_AFTER} after live inject over streaming"
+            DM_LIVE_PASSED=1
+            break
+        fi
+    fi
+done
+if [ "${DM_LIVE_PASSED}" -eq 0 ]; then
+    DM_LIVE_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    fail "state_count did not increase after the live inject (before=${DM_LIVE_BEFORE}, after=${DM_LIVE_AFTER})"
+fi
+
+echo "=== Phase 17 PASSED: pull-only delivery mode under a descoped event bus ==="
+
+# ===================================================================
+# Phase 18: Last-Event-ID resume after a descope window
+# ===================================================================
+# Descope again, buffer two envelopes while the stream is down (the mock records
+# them into the replay ring and advances the stream sequence even with no client
+# attached), then restore streaming. On reconnect plexd sends its Last-Event-ID
+# cursor, the mock replays the buffered envelopes above it, and each verified
+# node_state_updated dispatches a reconcile; that plus the reconnect pull drives
+# state_count up. Triggers may coalesce, so assert an increase, not a fixed delta.
+echo "=== Testing Last-Event-ID resume after a descope window ==="
+
+# (a) Descope and confirm pull-only for the buffering window.
+RES_DESCOPE_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"mode":"descoped"}' \
+    "http://localhost:18080/test/configure-events" 2>/dev/null || true)
+if [ "${RES_DESCOPE_STATUS}" != "204" ]; then
+    fail "configure-events (descoped) returned status ${RES_DESCOPE_STATUS}, want 204"
+fi
+if poll_delivery_mode pull_only 30; then
+    echo "  PASS: delivery_mode reclassified to pull_only for the resume window"
+else
+    fail "delivery_mode did not reach pull_only within 30s for the resume window"
+fi
+
+# (b) Buffer two envelopes while descoped; each inject is still accepted (204).
+for res_id in evt-e2e-resume-001 evt-e2e-resume-002; do
+    RES_PAYLOAD=$(cat <<RESEOF
+{
+    "id": "${res_id}",
+    "type": "node_state_updated",
+    "scope": "node",
+    "payload": "{\"node_id\":\"e2e-node-1\"}"
+}
+RESEOF
+    )
+    RES_INJECT_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${RES_PAYLOAD}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${RES_INJECT_STATUS}" != "204" ]; then
+        fail "descoped inject ${res_id} returned status ${RES_INJECT_STATUS}, want 204"
+    fi
+done
+echo "  two envelopes buffered while descoped"
+
+# (c) Baseline state_count, then restore streaming so the agent reconnects with
+#     its Last-Event-ID cursor and the mock replays the buffered envelopes.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+RES_STATE_BEFORE=$(get_counter "${RESPONSE}" "state_count")
+echo "  state_count before resume: ${RES_STATE_BEFORE}"
+RES_STREAM_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"mode":"streaming"}' \
+    "http://localhost:18080/test/configure-events" 2>/dev/null || true)
+if [ "${RES_STREAM_STATUS}" != "204" ]; then
+    fail "configure-events (streaming) returned status ${RES_STREAM_STATUS}, want 204"
+fi
+echo "  event bus flipped to streaming"
+
+# (d) The replayed envelopes plus the reconnect pull must advance state_count.
+RES_TIMEOUT=30
+RES_ELAPSED=0
+RES_PASSED=0
+while [ "${RES_ELAPSED}" -lt "${RES_TIMEOUT}" ]; do
+    sleep 2
+    RES_ELAPSED=$((RES_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        RES_STATE_AFTER=$(get_counter "${RESPONSE}" "state_count")
+        if [ "${RES_STATE_AFTER}" -gt "${RES_STATE_BEFORE}" ]; then
+            echo "  PASS: state_count increased ${RES_STATE_BEFORE} -> ${RES_STATE_AFTER} after resume"
+            RES_PASSED=1
+            break
+        fi
+    fi
+done
+if [ "${RES_PASSED}" -eq 0 ]; then
+    RES_STATE_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    fail "state_count did not increase after resume within ${RES_TIMEOUT}s (before=${RES_STATE_BEFORE}, after=${RES_STATE_AFTER})"
+fi
+
+echo "=== Phase 18 PASSED: Last-Event-ID resume after a descope window ==="
 
 # ===================================================================
 # Phase 11: Graceful shutdown verification

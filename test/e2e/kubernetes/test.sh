@@ -534,16 +534,14 @@ echo "  execution_callback_count before: ${CB_BEFORE}"
 # Inject an action_request SSE event for the builtin "system.info" action.
 ACTION_PAYLOAD=$(cat <<'ACTEOF'
 {
-    "event_type": "action_request",
-    "event_id": "evt-e2e-action-k8s-001",
-    "issued_at": "2099-01-01T00:00:00Z",
-    "nonce": "e2e-action-nonce-k8s-001",
+    "id": "evt-e2e-action-k8s-001",
+    "type": "action_request",
+    "scope": "node",
     "payload": {
         "execution_id": "exec-e2e-k8s-001",
         "action": "system.info",
         "timeout": "30s"
-    },
-    "signature": "mock-signature"
+    }
 }
 ACTEOF
 )
@@ -629,12 +627,10 @@ echo "  state_count before injection: ${STATE_BEFORE}"
 # Inject a node_state_updated SSE event.
 INJECT_PAYLOAD=$(cat <<'INJEOF'
 {
-    "event_type": "node_state_updated",
-    "event_id": "evt-e2e-inject-k8s-001",
-    "issued_at": "2099-01-01T00:00:00Z",
-    "nonce": "e2e-inject-nonce-k8s-001",
-    "payload": {"node_id": "e2e-k8s-node"},
-    "signature": "mock-signature"
+    "id": "evt-e2e-inject-k8s-001",
+    "type": "node_state_updated",
+    "scope": "node",
+    "payload": {"node_id": "e2e-k8s-node"}
 }
 INJEOF
 )

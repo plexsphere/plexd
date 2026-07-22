@@ -3,6 +3,7 @@
 # PLEXD_BOOTSTRAP_TOKEN env var provides the token via registration.token_env.
 api:
   base_url: http://mock-api:8080
+  sse_reprobe_interval: 5s
 
 registration:
   data_dir: /var/lib/plexd
