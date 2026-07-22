@@ -23,22 +23,22 @@ type NodeSecretsUpdatePayload struct {
 // RegisterEventHandlers registers SSE event handlers for node_state_updated
 // and node_secrets_updated with the given dispatcher.
 func RegisterEventHandlers(dispatcher *api.EventDispatcher, cache *StateCache, logger *slog.Logger) {
-	dispatcher.Register(api.EventNodeStateUpdated, func(ctx context.Context, env api.SignedEnvelope) error {
+	dispatcher.Register(api.EventNodeStateUpdated, func(ctx context.Context, env api.Envelope) error {
 		return HandleNodeStateUpdated(cache, logger, env)
 	})
-	dispatcher.Register(api.EventNodeSecretsUpdated, func(ctx context.Context, env api.SignedEnvelope) error {
+	dispatcher.Register(api.EventNodeSecretsUpdated, func(ctx context.Context, env api.Envelope) error {
 		return HandleNodeSecretsUpdated(cache, logger, env)
 	})
 }
 
 // HandleNodeStateUpdated parses the event payload and updates metadata and
 // data entries in the cache.
-func HandleNodeStateUpdated(cache *StateCache, logger *slog.Logger, env api.SignedEnvelope) error {
+func HandleNodeStateUpdated(cache *StateCache, logger *slog.Logger, env api.Envelope) error {
 	var payload NodeStateUpdatePayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		logger.Error("failed to parse node_state_updated payload",
 			"component", "nodeapi",
-			"event_id", env.EventID,
+			"event_id", env.ID,
 			"error", err,
 		)
 		return fmt.Errorf("nodeapi: parse node_state_updated: %w", err)
@@ -49,7 +49,7 @@ func HandleNodeStateUpdated(cache *StateCache, logger *slog.Logger, env api.Sign
 
 	logger.Info("cache updated from node_state_updated",
 		"component", "nodeapi",
-		"event_id", env.EventID,
+		"event_id", env.ID,
 		"metadata_keys", len(payload.Metadata),
 		"data_entries", len(payload.Data),
 	)
@@ -58,12 +58,12 @@ func HandleNodeStateUpdated(cache *StateCache, logger *slog.Logger, env api.Sign
 
 // HandleNodeSecretsUpdated parses the event payload and updates the secret
 // index in the cache.
-func HandleNodeSecretsUpdated(cache *StateCache, logger *slog.Logger, env api.SignedEnvelope) error {
+func HandleNodeSecretsUpdated(cache *StateCache, logger *slog.Logger, env api.Envelope) error {
 	var payload NodeSecretsUpdatePayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		logger.Error("failed to parse node_secrets_updated payload",
 			"component", "nodeapi",
-			"event_id", env.EventID,
+			"event_id", env.ID,
 			"error", err,
 		)
 		return fmt.Errorf("nodeapi: parse node_secrets_updated: %w", err)
@@ -73,7 +73,7 @@ func HandleNodeSecretsUpdated(cache *StateCache, logger *slog.Logger, env api.Si
 
 	logger.Info("secret index updated from node_secrets_updated",
 		"component", "nodeapi",
-		"event_id", env.EventID,
+		"event_id", env.ID,
 		"secret_refs", len(payload.SecretRefs),
 	)
 	return nil

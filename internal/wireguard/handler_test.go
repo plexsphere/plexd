@@ -21,12 +21,12 @@ func handlerTestPeer(id string) api.Peer {
 	}
 }
 
-func testEnvelope(eventType string, payload interface{}) api.SignedEnvelope {
+func testEnvelope(eventType string, payload interface{}) api.Envelope {
 	data, _ := json.Marshal(payload)
-	return api.SignedEnvelope{
-		EventType: eventType,
-		EventID:   "evt-1",
-		Payload:   data,
+	return api.Envelope{
+		Type:    eventType,
+		ID:      "evt-1",
+		Payload: data,
 	}
 }
 
@@ -298,10 +298,10 @@ func TestSSEHandler_MalformedPayload(t *testing.T) {
 	ctrl := &mockController{}
 	mgr := newTestManager(ctrl)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventPeerAdded,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not json"),
+	envelope := api.Envelope{
+		Type:    api.EventPeerAdded,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not json"),
 	}
 
 	handler := HandlePeerAdded(mgr)

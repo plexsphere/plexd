@@ -56,12 +56,12 @@ func (r *mockReporter) ReportSessionEnded(ctx context.Context, sessionID, target
 	})
 }
 
-func testEnvelope(eventType string, payload any) api.SignedEnvelope {
+func testEnvelope(eventType string, payload any) api.Envelope {
 	data, _ := json.Marshal(payload)
-	return api.SignedEnvelope{
-		EventType: eventType,
-		EventID:   "evt-1",
-		Payload:   data,
+	return api.Envelope{
+		Type:    eventType,
+		ID:      "evt-1",
+		Payload: data,
 	}
 }
 
@@ -116,10 +116,10 @@ func TestSSEHandler_SSHSessionSetup_MalformedPayload(t *testing.T) {
 
 	handler := HandleSSHSessionSetup(mgr, reporter)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventSSHSessionSetup,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not json"),
+	envelope := api.Envelope{
+		Type:    api.EventSSHSessionSetup,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not json"),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -205,10 +205,10 @@ func TestSSEHandler_SessionRevoked_MalformedPayload(t *testing.T) {
 
 	handler := HandleSessionRevoked(mgr)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventSessionRevoked,
-		EventID:   "evt-bad-revoke",
-		Payload:   json.RawMessage("not json"),
+	envelope := api.Envelope{
+		Type:    api.EventSessionRevoked,
+		ID:      "evt-bad-revoke",
+		Payload: json.RawMessage("not json"),
 	}
 
 	err := handler(context.Background(), envelope)

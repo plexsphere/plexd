@@ -284,8 +284,8 @@ func (s *SSEStream) Connect(ctx context.Context, nodeID string) error {
 		// Verify envelope
 		if err := s.verifier.Verify(ctx, envelope); err != nil {
 			s.logger.Error("event verification failed",
-				"event_type", envelope.EventType,
-				"event_id", envelope.EventID,
+				"event_type", envelope.Type,
+				"event_id", envelope.ID,
 				"error", err,
 			)
 			continue

@@ -357,10 +357,10 @@ func TestExchanger_RegisterHandlers(t *testing.T) {
 				AllowedIPs: []string{"10.0.0.2/32"},
 			}
 			payload, _ := json.Marshal(peer)
-			envelope := api.SignedEnvelope{
-				EventType: api.EventPeerEndpointChanged,
-				EventID:   "evt-1",
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventPeerEndpointChanged,
+				ID:      "evt-1",
+				Payload: payload,
 			}
 
 			dispatcher.Dispatch(context.Background(), envelope)

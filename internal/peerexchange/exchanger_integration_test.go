@@ -237,10 +237,10 @@ func TestIntegration_SSEPeerEndpointChangedTriggersWGUpdate(t *testing.T) {
 		AllowedIPs: []string{"10.0.0.5/32"},
 	}
 	payload, _ := json.Marshal(peer)
-	envelope := api.SignedEnvelope{
-		EventType: api.EventPeerEndpointChanged,
-		EventID:   "evt-100",
-		Payload:   payload,
+	envelope := api.Envelope{
+		Type:    api.EventPeerEndpointChanged,
+		ID:      "evt-100",
+		Payload: payload,
 	}
 
 	dispatcher.Dispatch(context.Background(), envelope)
@@ -402,10 +402,10 @@ func TestIntegration_ConcurrentSSEAndRefreshNoRace(t *testing.T) {
 				AllowedIPs: []string{"10.0.0.1/32"},
 			}
 			payload, _ := json.Marshal(peer)
-			envelope := api.SignedEnvelope{
-				EventType: api.EventPeerEndpointChanged,
-				EventID:   "concurrent-evt",
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventPeerEndpointChanged,
+				ID:      "concurrent-evt",
+				Payload: payload,
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}()

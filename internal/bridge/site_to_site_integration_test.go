@@ -244,8 +244,8 @@ func TestSiteToSiteIntegration_ConcurrentAccess(t *testing.T) {
 	vpnCtrl := &mockVPNController{}
 	routeCtrl := &mockRouteController{}
 	cfg := Config{
-		Enabled:            true,
-		SiteToSiteEnabled:  true,
+		Enabled:              true,
+		SiteToSiteEnabled:    true,
 		MaxSiteToSiteTunnels: 5, // Low limit to exercise max tunnels under concurrent load.
 	}
 	cfg.ApplyDefaults()
@@ -307,9 +307,9 @@ func TestSiteToSiteIntegration_ConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			envelope := api.SignedEnvelope{
-				EventType: api.EventSiteToSiteConfigUpdated,
-				EventID:   "concurrent-config-evt",
+			envelope := api.Envelope{
+				Type: api.EventSiteToSiteConfigUpdated,
+				ID:   "concurrent-config-evt",
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}()
@@ -324,10 +324,10 @@ func TestSiteToSiteIntegration_ConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			tunnel := testTunnel(fmt.Sprintf("tun-sse-%d", idx))
 			payload, _ := json.Marshal(tunnel)
-			envelope := api.SignedEnvelope{
-				EventType: api.EventSiteToSiteTunnelAssigned,
-				EventID:   fmt.Sprintf("assign-evt-%d", idx),
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventSiteToSiteTunnelAssigned,
+				ID:      fmt.Sprintf("assign-evt-%d", idx),
+				Payload: payload,
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}(i)
@@ -341,10 +341,10 @@ func TestSiteToSiteIntegration_ConcurrentAccess(t *testing.T) {
 			payload, _ := json.Marshal(struct {
 				TunnelID string `json:"tunnel_id"`
 			}{TunnelID: fmt.Sprintf("tun-sse-%d", idx)})
-			envelope := api.SignedEnvelope{
-				EventType: api.EventSiteToSiteTunnelRevoked,
-				EventID:   fmt.Sprintf("revoke-evt-%d", idx),
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventSiteToSiteTunnelRevoked,
+				ID:      fmt.Sprintf("revoke-evt-%d", idx),
+				Payload: payload,
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}(i)

@@ -103,7 +103,7 @@ type Server struct {
 	localLogsCount          atomic.Int64
 	localAuditCount         atomic.Int64
 
-	sseClients sync.Map // map[uint64]chan api.SignedEnvelope
+	sseClients sync.Map // map[uint64]chan api.Envelope
 
 	stateFixture   api.NodeStateSnapshot
 	stateFixtureMu sync.RWMutex
@@ -341,6 +341,9 @@ func policyFingerprint(rules []api.PolicyRule) string {
 const (
 	mockProjectID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0"
 	mockNodeID    = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3"
+	// mockSigningKeyID is the key id the mock stamps on every signed envelope and
+	// returns from register; the agent's verifier selects the signing key by it.
+	mockSigningKeyID = "did:web:plexsphere.com#key-e2e"
 )
 
 var (
@@ -639,7 +642,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		NodeID:           mockNodeID,
 		MeshIP:           "10.99.0.1",
 		SigningPublicKey: s.signingPublicKeyB64,
-		SigningKeyID:     "did:web:plexsphere.com#key-e2e",
+		SigningKeyID:     mockSigningKeyID,
 		// NSK is standard-padded base64 per the register contract; plexd
 		// decodes it back into the 32-byte AES-256-GCM key.
 		NSK:            base64.StdEncoding.EncodeToString(s.nsk),
@@ -748,13 +751,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nodeID := r.PathValue("id")
-	nonce := fmt.Sprintf("mock-nonce-%d", time.Now().UnixNano())
-	envelope := api.SignedEnvelope{
-		EventType: api.EventNodeStateUpdated,
-		EventID:   "evt-mock-001",
-		IssuedAt:  time.Now().UTC(),
-		Nonce:     nonce,
-		Payload:   json.RawMessage(fmt.Sprintf(`{"node_id":%q}`, nodeID)),
+	envelope := api.Envelope{
+		Type:     api.EventNodeStateUpdated,
+		ID:       "evt-mock-001",
+		IssuedAt: time.Now().UTC(),
+		Payload:  json.RawMessage(fmt.Sprintf(`{"node_id":%q}`, nodeID)),
 	}
 	s.signEnvelope(&envelope)
 
@@ -763,8 +764,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Fprintf(w, "id: %s\n", envelope.EventID)
-	fmt.Fprintf(w, "event: %s\n", envelope.EventType)
+	fmt.Fprintf(w, "id: %s\n", envelope.ID)
+	fmt.Fprintf(w, "event: %s\n", envelope.Type)
 	// Split data across SSE data lines if it contains newlines (it won't for JSON, but be safe).
 	for _, line := range strings.Split(string(data), "\n") {
 		fmt.Fprintf(w, "data: %s\n", line)
@@ -774,7 +775,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	// Register this client for broadcast events.
 	clientID := s.sseClientID.Add(1)
-	clientCh := make(chan api.SignedEnvelope, 16)
+	clientCh := make(chan api.Envelope, 16)
 	s.sseClients.Store(clientID, clientCh)
 	defer s.sseClients.Delete(clientID)
 
@@ -796,8 +797,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return
 			}
-			fmt.Fprintf(w, "id: %s\n", env.EventID)
-			fmt.Fprintf(w, "event: %s\n", env.EventType)
+			fmt.Fprintf(w, "id: %s\n", env.ID)
+			fmt.Fprintf(w, "event: %s\n", env.Type)
 			for _, line := range strings.Split(string(evtData), "\n") {
 				fmt.Fprintf(w, "data: %s\n", line)
 			}
@@ -1761,9 +1762,9 @@ func (s *Server) handleConfigureSecrets(w http.ResponseWriter, r *http.Request) 
 }
 
 // BroadcastSSE sends an SSE event to all connected SSE clients.
-func (s *Server) BroadcastSSE(envelope api.SignedEnvelope) {
+func (s *Server) BroadcastSSE(envelope api.Envelope) {
 	s.sseClients.Range(func(key, value any) bool {
-		ch := value.(chan api.SignedEnvelope)
+		ch := value.(chan api.Envelope)
 		select {
 		case ch <- envelope:
 		default:
@@ -1777,8 +1778,12 @@ func (s *Server) BroadcastSSE(envelope api.SignedEnvelope) {
 // It sets issued_at to the current time and computes a valid ed25519 signature
 // so the agent's verifier accepts the event.
 func (s *Server) handleInjectEvent(w http.ResponseWriter, r *http.Request) {
-	var envelope api.SignedEnvelope
+	var envelope api.Envelope
 	if !s.decodeBody(w, r, "inject_event", &envelope) {
+		return
+	}
+	if envelope.ID == "" || envelope.Type == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing id or type"})
 		return
 	}
 
@@ -1787,7 +1792,7 @@ func (s *Server) handleInjectEvent(w http.ResponseWriter, r *http.Request) {
 	s.signEnvelope(&envelope)
 
 	// A rotate_keys event arms a pending rotation (issue #21).
-	if envelope.EventType == api.EventRotateKeys {
+	if envelope.Type == api.EventRotateKeys {
 		s.keyRotationMu.Lock()
 		s.rotationArmed = true
 		s.keyRotationMu.Unlock()
@@ -1798,23 +1803,12 @@ func (s *Server) handleInjectEvent(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// signEnvelope computes a valid ed25519 signature for the envelope using the
-// mock API's signing key. The canonical form matches internal/api/verifier.go.
-func (s *Server) signEnvelope(envelope *api.SignedEnvelope) {
-	type canonicalEnvelope struct {
-		EventType string          `json:"event_type"`
-		EventID   string          `json:"event_id"`
-		IssuedAt  time.Time       `json:"issued_at"`
-		Nonce     string          `json:"nonce"`
-		Payload   json.RawMessage `json:"payload"`
-	}
-	canonical, err := json.Marshal(canonicalEnvelope{
-		EventType: envelope.EventType,
-		EventID:   envelope.EventID,
-		IssuedAt:  envelope.IssuedAt,
-		Nonce:     envelope.Nonce,
-		Payload:   envelope.Payload,
-	})
+// signEnvelope stamps the mock's signing key id on the envelope and computes a
+// valid ed25519 signature over the shared canonical form (api.CanonicalBytes)
+// using the mock API's signing key.
+func (s *Server) signEnvelope(envelope *api.Envelope) {
+	envelope.KeyID = mockSigningKeyID
+	canonical, err := api.CanonicalBytes(*envelope)
 	if err != nil {
 		panic("mockapi: marshal canonical envelope: " + err.Error())
 	}

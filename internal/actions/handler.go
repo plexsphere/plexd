@@ -14,11 +14,11 @@ import (
 // When the executor's config is disabled, all requests are rejected with reason=actions_disabled.
 func HandleActionRequest(executor *Executor, nodeID string, logger *slog.Logger) api.EventHandler {
 	log := logger.With("component", "actions")
-	return func(ctx context.Context, envelope api.SignedEnvelope) error {
+	return func(ctx context.Context, envelope api.Envelope) error {
 		var req api.ActionRequest
 		if err := json.Unmarshal(envelope.Payload, &req); err != nil {
 			log.Error("action_request: parse payload failed",
-				"event_id", envelope.EventID,
+				"event_id", envelope.ID,
 				"error", err,
 			)
 			return fmt.Errorf("actions: action_request: parse payload: %w", err)
@@ -26,7 +26,7 @@ func HandleActionRequest(executor *Executor, nodeID string, logger *slog.Logger)
 
 		if req.ExecutionID == "" {
 			log.Error("action_request: missing execution_id",
-				"event_id", envelope.EventID,
+				"event_id", envelope.ID,
 			)
 			return fmt.Errorf("actions: action_request: missing execution_id")
 		}

@@ -309,9 +309,9 @@ func TestIngressIntegration_ConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			envelope := api.SignedEnvelope{
-				EventType: api.EventIngressConfigUpdated,
-				EventID:   "concurrent-config-evt",
+			envelope := api.Envelope{
+				Type: api.EventIngressConfigUpdated,
+				ID:   "concurrent-config-evt",
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}()
@@ -329,10 +329,10 @@ func TestIngressIntegration_ConcurrentAccess(t *testing.T) {
 				Mode:       "tcp",
 			}
 			payload, _ := json.Marshal(rule)
-			envelope := api.SignedEnvelope{
-				EventType: api.EventIngressRuleAssigned,
-				EventID:   fmt.Sprintf("assign-evt-%d", idx),
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventIngressRuleAssigned,
+				ID:      fmt.Sprintf("assign-evt-%d", idx),
+				Payload: payload,
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}(i)
@@ -346,10 +346,10 @@ func TestIngressIntegration_ConcurrentAccess(t *testing.T) {
 			payload, _ := json.Marshal(struct {
 				RuleID string `json:"rule_id"`
 			}{RuleID: fmt.Sprintf("rule-sse-%d", idx)})
-			envelope := api.SignedEnvelope{
-				EventType: api.EventIngressRuleRevoked,
-				EventID:   fmt.Sprintf("revoke-evt-%d", idx),
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventIngressRuleRevoked,
+				ID:      fmt.Sprintf("revoke-evt-%d", idx),
+				Payload: payload,
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}(i)

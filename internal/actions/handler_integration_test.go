@@ -98,16 +98,16 @@ func (noopViolationReporter) ReportViolation(_ context.Context, _ string, _ api.
 	return nil
 }
 
-func integrationEnvelope(t *testing.T, req api.ActionRequest) api.SignedEnvelope {
+func integrationEnvelope(t *testing.T, req api.ActionRequest) api.Envelope {
 	t.Helper()
 	data, err := json.Marshal(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return api.SignedEnvelope{
-		EventType: api.EventActionRequest,
-		EventID:   "evt-" + req.ExecutionID,
-		Payload:   data,
+	return api.Envelope{
+		Type:    api.EventActionRequest,
+		ID:      "evt-" + req.ExecutionID,
+		Payload: data,
 	}
 }
 

@@ -216,10 +216,10 @@ func TestIntegration_SSEPolicyUpdatedTriggersReconcile(t *testing.T) {
 	initialFetch := fetcher.getFetchCount()
 
 	payload, _ := json.Marshal(map[string]string{"policy_id": "pol-1"})
-	envelope := api.SignedEnvelope{
-		EventType: api.EventPolicyUpdated,
-		EventID:   "evt-sse-1",
-		Payload:   payload,
+	envelope := api.Envelope{
+		Type:    api.EventPolicyUpdated,
+		ID:      "evt-sse-1",
+		Payload: payload,
 	}
 	dispatcher.Dispatch(ctx, envelope)
 
@@ -266,10 +266,10 @@ func TestIntegration_ConcurrentPolicyChangesNoRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			payload, _ := json.Marshal(map[string]string{"policy_id": "pol-x"})
-			envelope := api.SignedEnvelope{
-				EventType: api.EventPolicyUpdated,
-				EventID:   "concurrent-evt",
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventPolicyUpdated,
+				ID:      "concurrent-evt",
+				Payload: payload,
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}()

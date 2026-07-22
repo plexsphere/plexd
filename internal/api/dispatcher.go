@@ -7,7 +7,7 @@ import (
 )
 
 // EventHandler is a function that handles a verified SSE event.
-type EventHandler func(ctx context.Context, envelope SignedEnvelope) error
+type EventHandler func(ctx context.Context, envelope Envelope) error
 
 // EventDispatcher routes verified events to registered handlers by event type.
 type EventDispatcher struct {
@@ -35,15 +35,15 @@ func (d *EventDispatcher) Register(eventType string, handler EventHandler) {
 // Dispatch invokes all handlers registered for the event's type.
 // Handler errors are logged but do not stop processing of subsequent handlers.
 // Events with no registered handler are logged at debug level and discarded.
-func (d *EventDispatcher) Dispatch(ctx context.Context, envelope SignedEnvelope) {
+func (d *EventDispatcher) Dispatch(ctx context.Context, envelope Envelope) {
 	d.mu.RLock()
-	handlers, ok := d.handlers[envelope.EventType]
+	handlers, ok := d.handlers[envelope.Type]
 	d.mu.RUnlock()
 
 	if !ok || len(handlers) == 0 {
 		d.logger.Debug("no handler registered for event type",
-			"event_type", envelope.EventType,
-			"event_id", envelope.EventID,
+			"event_type", envelope.Type,
+			"event_id", envelope.ID,
 		)
 		return
 	}
@@ -51,8 +51,8 @@ func (d *EventDispatcher) Dispatch(ctx context.Context, envelope SignedEnvelope)
 	for i, handler := range handlers {
 		if err := handler(ctx, envelope); err != nil {
 			d.logger.Error("event handler failed",
-				"event_type", envelope.EventType,
-				"event_id", envelope.EventID,
+				"event_type", envelope.Type,
+				"event_id", envelope.ID,
 				"handler_index", i,
 				"error", err,
 			)

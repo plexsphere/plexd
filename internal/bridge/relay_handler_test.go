@@ -10,22 +10,22 @@ import (
 	"github.com/plexsphere/plexd/internal/reconcile"
 )
 
-// relayAssignmentEnvelope builds a SignedEnvelope for a relay session assignment.
-func relayAssignmentEnvelope(t *testing.T, assignment api.RelaySessionAssignment) api.SignedEnvelope {
+// relayAssignmentEnvelope builds an Envelope for a relay session assignment.
+func relayAssignmentEnvelope(t *testing.T, assignment api.RelaySessionAssignment) api.Envelope {
 	t.Helper()
 	payload, err := json.Marshal(assignment)
 	if err != nil {
 		t.Fatalf("marshal assignment: %v", err)
 	}
-	return api.SignedEnvelope{
-		EventType: api.EventRelaySessionAssigned,
-		EventID:   "evt-" + assignment.SessionID,
-		Payload:   payload,
+	return api.Envelope{
+		Type:    api.EventRelaySessionAssigned,
+		ID:      "evt-" + assignment.SessionID,
+		Payload: payload,
 	}
 }
 
-// relayRevocationEnvelope builds a SignedEnvelope for a relay session revocation.
-func relayRevocationEnvelope(t *testing.T, sessionID string) api.SignedEnvelope {
+// relayRevocationEnvelope builds an Envelope for a relay session revocation.
+func relayRevocationEnvelope(t *testing.T, sessionID string) api.Envelope {
 	t.Helper()
 	payload, err := json.Marshal(struct {
 		SessionID string `json:"session_id"`
@@ -33,10 +33,10 @@ func relayRevocationEnvelope(t *testing.T, sessionID string) api.SignedEnvelope 
 	if err != nil {
 		t.Fatalf("marshal revocation: %v", err)
 	}
-	return api.SignedEnvelope{
-		EventType: api.EventRelaySessionRevoked,
-		EventID:   "evt-revoke-" + sessionID,
-		Payload:   payload,
+	return api.Envelope{
+		Type:    api.EventRelaySessionRevoked,
+		ID:      "evt-revoke-" + sessionID,
+		Payload: payload,
 	}
 }
 
@@ -74,10 +74,10 @@ func TestHandleRelaySessionAssigned_MalformedPayload(t *testing.T) {
 
 	handler := HandleRelaySessionAssigned(relay, discardLogger())
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventRelaySessionAssigned,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventRelaySessionAssigned,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -156,10 +156,10 @@ func TestHandleRelaySessionRevoked_MalformedPayload(t *testing.T) {
 
 	handler := HandleRelaySessionRevoked(relay, discardLogger())
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventRelaySessionRevoked,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventRelaySessionRevoked,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)

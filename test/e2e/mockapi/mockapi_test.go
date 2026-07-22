@@ -197,13 +197,12 @@ func assertAllCountersEqual(t *testing.T, a mockapi.AssertionCounters, want int6
 	}
 }
 
-// makeEnvelope creates a SignedEnvelope with the given event type and ID.
-func makeEnvelope(eventType, eventID string, payload json.RawMessage) api.SignedEnvelope {
-	return api.SignedEnvelope{
-		EventType: eventType,
-		EventID:   eventID,
+// makeEnvelope creates an Envelope with the given event type and ID.
+func makeEnvelope(eventType, eventID string, payload json.RawMessage) api.Envelope {
+	return api.Envelope{
+		Type:      eventType,
+		ID:        eventID,
 		IssuedAt:  time.Now().UTC(),
-		Nonce:     "nonce-" + eventID,
 		Payload:   payload,
 		Signature: "sig-" + eventID,
 	}
@@ -1089,7 +1088,7 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodGet, "/v1/artifacts/plexd/1.0.0/linux/amd64", ""},
 		{http.MethodPost, "/v1/nodes/" + testMockNodeID + "/sessions/sess-conc", `{"tcp":{"phase":"session_started"}}`},
 		{http.MethodPost, "/v1/nodes/node-1/integrity/violations", integrityViolationBody},
-		{http.MethodPost, "/test/inject-event", `{"event_type":"conc","event_id":"e1","nonce":"n","payload":{},"signature":"s"}`},
+		{http.MethodPost, "/test/inject-event", `{"id":"e1","type":"conc","payload":{},"signature":"s"}`},
 	}
 
 	var wg sync.WaitGroup
@@ -3898,10 +3897,9 @@ func TestConcurrent_InjectEventAndConfigureState(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			defer wg.Done()
-			env := api.SignedEnvelope{
-				EventType: "concurrent_test",
-				EventID:   fmt.Sprintf("evt-conc-%d", i),
-				Nonce:     fmt.Sprintf("nonce-conc-%d", i),
+			env := api.Envelope{
+				Type:      "concurrent_test",
+				ID:        fmt.Sprintf("evt-conc-%d", i),
 				Payload:   json.RawMessage(`{"i":` + fmt.Sprint(i) + `}`),
 				Signature: "sig",
 			}

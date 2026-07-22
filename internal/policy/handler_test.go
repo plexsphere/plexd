@@ -171,10 +171,10 @@ func TestSSEHandler_PolicyUpdated(t *testing.T) {
 
 	handler := HandlePolicyUpdated(mock)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventPolicyUpdated,
-		EventID:   "evt-1",
-		Payload:   json.RawMessage(`{"policy_id": "pol-1"}`),
+	envelope := api.Envelope{
+		Type:    api.EventPolicyUpdated,
+		ID:      "evt-1",
+		Payload: json.RawMessage(`{"policy_id": "pol-1"}`),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -191,10 +191,10 @@ func TestSSEHandler_PolicyUpdated_MalformedPayload(t *testing.T) {
 
 	handler := HandlePolicyUpdated(mock)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventPolicyUpdated,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventPolicyUpdated,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)

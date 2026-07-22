@@ -13,22 +13,22 @@ import (
 // Test helpers
 // ---------------------------------------------------------------------------
 
-// tunnelAssignmentEnvelope builds a SignedEnvelope for a site-to-site tunnel assignment.
-func tunnelAssignmentEnvelope(t *testing.T, tunnel api.SiteToSiteTunnel) api.SignedEnvelope {
+// tunnelAssignmentEnvelope builds an Envelope for a site-to-site tunnel assignment.
+func tunnelAssignmentEnvelope(t *testing.T, tunnel api.SiteToSiteTunnel) api.Envelope {
 	t.Helper()
 	payload, err := json.Marshal(tunnel)
 	if err != nil {
 		t.Fatalf("marshal tunnel: %v", err)
 	}
-	return api.SignedEnvelope{
-		EventType: api.EventSiteToSiteTunnelAssigned,
-		EventID:   "evt-assign-" + tunnel.TunnelID,
-		Payload:   payload,
+	return api.Envelope{
+		Type:    api.EventSiteToSiteTunnelAssigned,
+		ID:      "evt-assign-" + tunnel.TunnelID,
+		Payload: payload,
 	}
 }
 
-// tunnelRevocationEnvelope builds a SignedEnvelope for a site-to-site tunnel revocation.
-func tunnelRevocationEnvelope(t *testing.T, tunnelID string) api.SignedEnvelope {
+// tunnelRevocationEnvelope builds an Envelope for a site-to-site tunnel revocation.
+func tunnelRevocationEnvelope(t *testing.T, tunnelID string) api.Envelope {
 	t.Helper()
 	payload, err := json.Marshal(struct {
 		TunnelID string `json:"tunnel_id"`
@@ -36,10 +36,10 @@ func tunnelRevocationEnvelope(t *testing.T, tunnelID string) api.SignedEnvelope 
 	if err != nil {
 		t.Fatalf("marshal revocation: %v", err)
 	}
-	return api.SignedEnvelope{
-		EventType: api.EventSiteToSiteTunnelRevoked,
-		EventID:   "evt-revoke-" + tunnelID,
-		Payload:   payload,
+	return api.Envelope{
+		Type:    api.EventSiteToSiteTunnelRevoked,
+		ID:      "evt-revoke-" + tunnelID,
+		Payload: payload,
 	}
 }
 
@@ -47,9 +47,9 @@ func tunnelRevocationEnvelope(t *testing.T, tunnelID string) api.SignedEnvelope 
 func newTestSiteToSiteManager(t *testing.T, vpnCtrl *mockVPNController, routeCtrl *mockRouteController) *SiteToSiteManager {
 	t.Helper()
 	cfg := Config{
-		Enabled:          true,
-		AccessInterface:  "eth1",
-		AccessSubnets:    []string{"10.0.0.0/24"},
+		Enabled:           true,
+		AccessInterface:   "eth1",
+		AccessSubnets:     []string{"10.0.0.0/24"},
 		SiteToSiteEnabled: true,
 	}
 	cfg.ApplyDefaults()
@@ -85,10 +85,10 @@ func TestHandleSiteToSiteConfigUpdated(t *testing.T) {
 
 	handler := HandleSiteToSiteConfigUpdated(mock)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventSiteToSiteConfigUpdated,
-		EventID:   "evt-1",
-		Payload:   json.RawMessage(`{"enabled":true}`),
+	envelope := api.Envelope{
+		Type:    api.EventSiteToSiteConfigUpdated,
+		ID:      "evt-1",
+		Payload: json.RawMessage(`{"enabled":true}`),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -105,10 +105,10 @@ func TestHandleSiteToSiteConfigUpdated_MalformedPayload(t *testing.T) {
 
 	handler := HandleSiteToSiteConfigUpdated(mock)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventSiteToSiteConfigUpdated,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventSiteToSiteConfigUpdated,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -167,10 +167,10 @@ func TestHandleSiteToSiteTunnelAssigned_MalformedPayload(t *testing.T) {
 
 	handler := HandleSiteToSiteTunnelAssigned(mgr, discardLogger())
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventSiteToSiteTunnelAssigned,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventSiteToSiteTunnelAssigned,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -235,10 +235,10 @@ func TestHandleSiteToSiteTunnelRevoked_MalformedPayload(t *testing.T) {
 
 	handler := HandleSiteToSiteTunnelRevoked(mgr, discardLogger())
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventSiteToSiteTunnelRevoked,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventSiteToSiteTunnelRevoked,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)

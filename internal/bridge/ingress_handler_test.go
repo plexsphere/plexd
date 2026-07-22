@@ -15,22 +15,22 @@ import (
 // Test helpers
 // ---------------------------------------------------------------------------
 
-// ruleAssignmentEnvelope builds a SignedEnvelope for an ingress rule assignment.
-func ruleAssignmentEnvelope(t *testing.T, rule api.IngressRule) api.SignedEnvelope {
+// ruleAssignmentEnvelope builds an Envelope for an ingress rule assignment.
+func ruleAssignmentEnvelope(t *testing.T, rule api.IngressRule) api.Envelope {
 	t.Helper()
 	payload, err := json.Marshal(rule)
 	if err != nil {
 		t.Fatalf("marshal rule: %v", err)
 	}
-	return api.SignedEnvelope{
-		EventType: api.EventIngressRuleAssigned,
-		EventID:   "evt-assign-" + rule.RuleID,
-		Payload:   payload,
+	return api.Envelope{
+		Type:    api.EventIngressRuleAssigned,
+		ID:      "evt-assign-" + rule.RuleID,
+		Payload: payload,
 	}
 }
 
-// ruleRevocationEnvelope builds a SignedEnvelope for an ingress rule revocation.
-func ruleRevocationEnvelope(t *testing.T, ruleID string) api.SignedEnvelope {
+// ruleRevocationEnvelope builds an Envelope for an ingress rule revocation.
+func ruleRevocationEnvelope(t *testing.T, ruleID string) api.Envelope {
 	t.Helper()
 	payload, err := json.Marshal(struct {
 		RuleID string `json:"rule_id"`
@@ -38,10 +38,10 @@ func ruleRevocationEnvelope(t *testing.T, ruleID string) api.SignedEnvelope {
 	if err != nil {
 		t.Fatalf("marshal revocation: %v", err)
 	}
-	return api.SignedEnvelope{
-		EventType: api.EventIngressRuleRevoked,
-		EventID:   "evt-revoke-" + ruleID,
-		Payload:   payload,
+	return api.Envelope{
+		Type:    api.EventIngressRuleRevoked,
+		ID:      "evt-revoke-" + ruleID,
+		Payload: payload,
 	}
 }
 
@@ -77,10 +77,10 @@ func TestHandleIngressConfigUpdated(t *testing.T) {
 
 	handler := HandleIngressConfigUpdated(mock)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventIngressConfigUpdated,
-		EventID:   "evt-1",
-		Payload:   json.RawMessage(`{"enabled":true}`),
+	envelope := api.Envelope{
+		Type:    api.EventIngressConfigUpdated,
+		ID:      "evt-1",
+		Payload: json.RawMessage(`{"enabled":true}`),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -97,10 +97,10 @@ func TestHandleIngressConfigUpdated_MalformedPayload(t *testing.T) {
 
 	handler := HandleIngressConfigUpdated(mock)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventIngressConfigUpdated,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventIngressConfigUpdated,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -162,10 +162,10 @@ func TestHandleIngressRuleAssigned_MalformedPayload(t *testing.T) {
 
 	handler := HandleIngressRuleAssigned(mgr, discardLogger())
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventIngressRuleAssigned,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventIngressRuleAssigned,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -217,10 +217,10 @@ func TestHandleIngressRuleRevoked_MalformedPayload(t *testing.T) {
 
 	handler := HandleIngressRuleRevoked(mgr, discardLogger())
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventIngressRuleRevoked,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventIngressRuleRevoked,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)

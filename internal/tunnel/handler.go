@@ -19,11 +19,11 @@ type SessionActivityReporter interface {
 // It parses the SSE payload, creates a tunnel session via the SessionManager,
 // and reports the session_started row via the SessionActivityReporter.
 func HandleSSHSessionSetup(mgr *SessionManager, reporter SessionActivityReporter) api.EventHandler {
-	return func(ctx context.Context, envelope api.SignedEnvelope) error {
+	return func(ctx context.Context, envelope api.Envelope) error {
 		var setup api.SSHSessionSetup
 		if err := json.Unmarshal(envelope.Payload, &setup); err != nil {
 			mgr.logger.Error("ssh_session_setup: parse payload failed",
-				"event_id", envelope.EventID,
+				"event_id", envelope.ID,
 				"error", err,
 			)
 			return fmt.Errorf("tunnel: ssh_session_setup: parse payload: %w", err)
@@ -44,13 +44,13 @@ func HandleSSHSessionSetup(mgr *SessionManager, reporter SessionActivityReporter
 // single reporting path for every close reason. Revoking a non-existent session
 // is a no-op.
 func HandleSessionRevoked(mgr *SessionManager) api.EventHandler {
-	return func(ctx context.Context, envelope api.SignedEnvelope) error {
+	return func(ctx context.Context, envelope api.Envelope) error {
 		var payload struct {
 			SessionID string `json:"session_id"`
 		}
 		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
 			mgr.logger.Error("session_revoked: parse payload failed",
-				"event_id", envelope.EventID,
+				"event_id", envelope.ID,
 				"error", err,
 			)
 			return fmt.Errorf("tunnel: session_revoked: parse payload: %w", err)

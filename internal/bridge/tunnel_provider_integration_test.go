@@ -585,9 +585,9 @@ func TestTunnelProviderIntegration_ConcurrentAccessWithProviders(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			envelope := api.SignedEnvelope{
-				EventType: api.EventSiteToSiteConfigUpdated,
-				EventID:   "concurrent-config-evt",
+			envelope := api.Envelope{
+				Type: api.EventSiteToSiteConfigUpdated,
+				ID:   "concurrent-config-evt",
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}()
@@ -600,10 +600,10 @@ func TestTunnelProviderIntegration_ConcurrentAccessWithProviders(t *testing.T) {
 			defer wg.Done()
 			tunnel := testTunnel(fmt.Sprintf("tun-sse-wg-%d", idx))
 			payload, _ := json.Marshal(tunnel)
-			envelope := api.SignedEnvelope{
-				EventType: api.EventSiteToSiteTunnelAssigned,
-				EventID:   fmt.Sprintf("assign-wg-evt-%d", idx),
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventSiteToSiteTunnelAssigned,
+				ID:      fmt.Sprintf("assign-wg-evt-%d", idx),
+				Payload: payload,
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}(i)
@@ -621,10 +621,10 @@ func TestTunnelProviderIntegration_ConcurrentAccessWithProviders(t *testing.T) {
 				ProviderType:   "ipsec",
 			}
 			payload, _ := json.Marshal(tunnel)
-			envelope := api.SignedEnvelope{
-				EventType: api.EventSiteToSiteTunnelAssigned,
-				EventID:   fmt.Sprintf("assign-ipsec-evt-%d", idx),
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventSiteToSiteTunnelAssigned,
+				ID:      fmt.Sprintf("assign-ipsec-evt-%d", idx),
+				Payload: payload,
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}(i)
@@ -638,10 +638,10 @@ func TestTunnelProviderIntegration_ConcurrentAccessWithProviders(t *testing.T) {
 			payload, _ := json.Marshal(struct {
 				TunnelID string `json:"tunnel_id"`
 			}{TunnelID: fmt.Sprintf("tun-sse-wg-%d", idx)})
-			envelope := api.SignedEnvelope{
-				EventType: api.EventSiteToSiteTunnelRevoked,
-				EventID:   fmt.Sprintf("revoke-wg-evt-%d", idx),
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventSiteToSiteTunnelRevoked,
+				ID:      fmt.Sprintf("revoke-wg-evt-%d", idx),
+				Payload: payload,
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}(i)
@@ -653,10 +653,10 @@ func TestTunnelProviderIntegration_ConcurrentAccessWithProviders(t *testing.T) {
 			payload, _ := json.Marshal(struct {
 				TunnelID string `json:"tunnel_id"`
 			}{TunnelID: fmt.Sprintf("t-ipsec-sse-%d", idx)})
-			envelope := api.SignedEnvelope{
-				EventType: api.EventSiteToSiteTunnelRevoked,
-				EventID:   fmt.Sprintf("revoke-ipsec-evt-%d", idx),
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventSiteToSiteTunnelRevoked,
+				ID:      fmt.Sprintf("revoke-ipsec-evt-%d", idx),
+				Payload: payload,
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}(i)

@@ -128,7 +128,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	if len(sigKey) != ed25519.PublicKeySize {
 		return fmt.Errorf("plexd up: invalid signing key length: got %d, want %d", len(sigKey), ed25519.PublicKeySize)
 	}
-	verifier := api.NewEd25519Verifier(ed25519.PublicKey(sigKey))
+	verifier := api.NewEd25519Verifier(identity.SigningKeyID, ed25519.PublicKey(sigKey))
 
 	// 5a. Initialize WireGuard subsystem.
 	wgCtrl := newWGController(logger)
@@ -259,17 +259,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	sseMgr := api.NewSSEManager(client, verifier, logger)
 
 	// Register signing_key_rotated SSE handler to update verifier keys.
-	sseMgr.RegisterHandler(api.EventSigningKeyRotated, func(_ context.Context, env api.SignedEnvelope) error {
-		var keys api.SigningKeys
-		if err := json.Unmarshal(env.Payload, &keys); err != nil {
-			logger.Error("failed to parse signing_key_rotated payload", "error", err)
-			return fmt.Errorf("plexd up: parse signing_key_rotated: %w", err)
-		}
-		current, prev, expires := decodeSigningKeys(keys, logger)
-		verifier.SetKeys(current, prev, expires)
-		logger.Info("signing keys rotated via SSE")
-		return nil
-	})
+	sseMgr.RegisterHandler(api.EventSigningKeyRotated, signingKeyRotatedHandler(verifier, logger))
 
 	// Register WireGuard SSE handlers.
 	sseMgr.RegisterHandler(api.EventPeerAdded, wireguard.HandlePeerAdded(wgMgr))
@@ -301,7 +291,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// rotator's cooldown, the SSE event arrives once per rotation decision, so
 	// it rotates immediately via RotateNow. ctx is the runUp context so the
 	// rotation outlives this event handler returning.
-	sseMgr.RegisterHandler(api.EventRotateKeys, func(_ context.Context, _ api.SignedEnvelope) error {
+	sseMgr.RegisterHandler(api.EventRotateKeys, func(_ context.Context, _ api.Envelope) error {
 		logger.Info("rotate_keys received via SSE, starting key rotation")
 		go func() {
 			if err := rotator.RotateNow(ctx); err != nil {
@@ -474,10 +464,10 @@ func runUp(cmd *cobra.Command, _ []string) error {
 
 	// Register node_state_updated and node_secrets_updated SSE handlers for
 	// real-time cache updates (in addition to reconcile-loop fallback).
-	sseMgr.RegisterHandler(api.EventNodeStateUpdated, func(ctx context.Context, env api.SignedEnvelope) error {
+	sseMgr.RegisterHandler(api.EventNodeStateUpdated, func(ctx context.Context, env api.Envelope) error {
 		return nodeapi.HandleNodeStateUpdated(nodeAPISrv.Cache(), logger, env)
 	})
-	sseMgr.RegisterHandler(api.EventNodeSecretsUpdated, func(ctx context.Context, env api.SignedEnvelope) error {
+	sseMgr.RegisterHandler(api.EventNodeSecretsUpdated, func(ctx context.Context, env api.Envelope) error {
 		return nodeapi.HandleNodeSecretsUpdated(nodeAPISrv.Cache(), logger, env)
 	})
 
@@ -1007,29 +997,24 @@ func buildHeartbeatRequest(checksum, version string, natInfo *nat.DiscoveryResul
 	}
 }
 
-// decodeSigningKeys decodes base64-encoded signing keys from an api.SigningKeys
-// struct into ed25519 public keys for use with the Ed25519Verifier.
-func decodeSigningKeys(keys api.SigningKeys, logger *slog.Logger) (current, previous ed25519.PublicKey, transitionExpires time.Time) {
-	if keys.Current != "" {
-		decoded, err := base64.StdEncoding.DecodeString(keys.Current)
-		if err != nil {
-			logger.Error("failed to decode current signing key", "error", err)
-		} else {
-			current = ed25519.PublicKey(decoded)
+// signingKeyRotatedHandler returns the SSE handler for signing_key_rotated
+// events. It unmarshals the payload into an api.SigningKeyRotation and applies
+// it to the verifier. A malformed payload or a rejected rotation is logged and
+// returned as an error, leaving the installed keys unchanged.
+func signingKeyRotatedHandler(verifier *api.Ed25519Verifier, logger *slog.Logger) api.EventHandler {
+	return func(_ context.Context, env api.Envelope) error {
+		var rot api.SigningKeyRotation
+		if err := json.Unmarshal(env.Payload, &rot); err != nil {
+			logger.Error("failed to parse signing_key_rotated payload", "error", err)
+			return fmt.Errorf("plexd up: parse signing_key_rotated: %w", err)
 		}
-	}
-	if keys.Previous != "" {
-		decoded, err := base64.StdEncoding.DecodeString(keys.Previous)
-		if err != nil {
-			logger.Error("failed to decode previous signing key", "error", err)
-		} else {
-			previous = ed25519.PublicKey(decoded)
+		if err := verifier.Rotate(rot); err != nil {
+			logger.Error("failed to rotate signing keys", "error", err)
+			return fmt.Errorf("plexd up: rotate signing keys: %w", err)
 		}
+		logger.Info("signing keys rotated via SSE", "key_id", rot.KeyID)
+		return nil
 	}
-	if keys.TransitionExpires != nil {
-		transitionExpires = *keys.TransitionExpires
-	}
-	return current, previous, transitionExpires
 }
 
 // controlPlaneReporter adapts api.ControlPlane to the integrity.ViolationReporter interface.

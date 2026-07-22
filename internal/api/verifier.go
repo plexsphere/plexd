@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -13,150 +12,126 @@ import (
 // DefaultStalenessWindow is the maximum age of an event before it is considered stale.
 const DefaultStalenessWindow = 5 * time.Minute
 
-// nonceTTL is the duration for which a nonce is remembered.
-const nonceTTL = 5 * time.Minute
-
-// nonceCleanupInterval is how often the nonce store runs cleanup.
-const nonceCleanupInterval = 60 * time.Second
-
-// ---------------------------------------------------------------------------
-// NonceStore
-// ---------------------------------------------------------------------------
-
-// NonceStore tracks recently seen nonces to prevent replay attacks.
-type NonceStore struct {
-	mu          sync.Mutex
-	seen        map[string]time.Time
-	lastCleanup time.Time
-}
-
-// NewNonceStore returns an initialised NonceStore.
-func NewNonceStore() *NonceStore {
-	return &NonceStore{
-		seen:        make(map[string]time.Time),
-		lastCleanup: time.Now(),
-	}
-}
-
-// Add records a nonce. It returns an error if the nonce has already been seen.
-func (s *NonceStore) Add(nonce string, issuedAt time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if time.Since(s.lastCleanup) >= nonceCleanupInterval {
-		s.cleanup()
-	}
-
-	if _, ok := s.seen[nonce]; ok {
-		return fmt.Errorf("api: verifier: duplicate nonce")
-	}
-	s.seen[nonce] = issuedAt
-	return nil
-}
-
-// cleanup removes expired nonces. Must be called with mu held.
-func (s *NonceStore) cleanup() {
-	cutoff := time.Now().Add(-nonceTTL)
-	for k, v := range s.seen {
-		if v.Before(cutoff) {
-			delete(s.seen, k)
-		}
-	}
-	s.lastCleanup = time.Now()
-}
-
 // ---------------------------------------------------------------------------
 // Ed25519Verifier
 // ---------------------------------------------------------------------------
 
-// Ed25519Verifier verifies SignedEnvelope signatures using Ed25519 keys.
-// It supports key rotation by holding both a current and an optional previous key.
+// Ed25519Verifier verifies Envelope signatures using Ed25519 keys selected by
+// key id. It supports rotation by holding a current key and an optional
+// previous key that stays accepted until a transition deadline.
 type Ed25519Verifier struct {
 	mu                sync.RWMutex
+	currentKID        string
 	currentKey        ed25519.PublicKey
+	previousKID       string
 	previousKey       ed25519.PublicKey
 	transitionExpires time.Time
-
-	nonces *NonceStore
 }
 
-// NewEd25519Verifier returns a new verifier using the given public key.
-func NewEd25519Verifier(currentKey ed25519.PublicKey) *Ed25519Verifier {
+// NewEd25519Verifier returns a new verifier that accepts envelopes signed with
+// the given key and carrying the given key id.
+func NewEd25519Verifier(keyID string, key ed25519.PublicKey) *Ed25519Verifier {
 	return &Ed25519Verifier{
-		currentKey: currentKey,
-		nonces:     NewNonceStore(),
+		currentKID: keyID,
+		currentKey: key,
 	}
 }
 
-// SetKeys updates the verifier with a new current key, an optional previous key,
-// and a deadline after which the previous key is no longer accepted.
-func (v *Ed25519Verifier) SetKeys(current, previous ed25519.PublicKey, transitionExpires time.Time) {
+// Rotate installs a new current signing key from a signing_key_rotated event.
+// The previous key is retained as a grace entry only when the rotation names a
+// previous key id the verifier currently holds and a non-zero transition
+// deadline; otherwise no grace entry is kept. On any error the installed keys
+// are left unchanged.
+func (v *Ed25519Verifier) Rotate(rot SigningKeyRotation) error {
+	if rot.KeyID == "" {
+		return fmt.Errorf("api: verifier: rotation missing key_id")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(rot.PublicKey)
+	if err != nil {
+		return fmt.Errorf("api: verifier: rotation public key: %w", err)
+	}
+	if len(decoded) != ed25519.PublicKeySize {
+		return fmt.Errorf("api: verifier: rotation public key: invalid length: got %d, want %d", len(decoded), ed25519.PublicKeySize)
+	}
+
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.currentKey = current
-	v.previousKey = previous
-	v.transitionExpires = transitionExpires
+
+	var graceKID string
+	var graceKey ed25519.PublicKey
+	if rot.PreviousKeyID != "" && !rot.TransitionExpires.IsZero() {
+		switch rot.PreviousKeyID {
+		case v.currentKID:
+			graceKID, graceKey = v.currentKID, v.currentKey
+		case v.previousKID:
+			graceKID, graceKey = v.previousKID, v.previousKey
+		}
+	}
+
+	v.currentKID = rot.KeyID
+	v.currentKey = ed25519.PublicKey(decoded)
+	if len(graceKey) > 0 {
+		v.previousKID = graceKID
+		v.previousKey = graceKey
+		v.transitionExpires = rot.TransitionExpires
+	} else {
+		v.previousKID = ""
+		v.previousKey = nil
+		v.transitionExpires = time.Time{}
+	}
+	return nil
 }
 
-// canonicalEnvelope is the deterministic representation used for signature verification.
-type canonicalEnvelope struct {
-	EventType string          `json:"event_type"`
-	EventID   string          `json:"event_id"`
-	IssuedAt  time.Time       `json:"issued_at"`
-	Nonce     string          `json:"nonce"`
-	Payload   json.RawMessage `json:"payload"`
-}
-
-// Verify checks the signature and freshness of a SignedEnvelope.
-// The nonce is recorded only after signature verification succeeds to prevent
-// nonce exhaustion attacks via forged envelopes.
-func (v *Ed25519Verifier) Verify(_ context.Context, envelope SignedEnvelope) error {
-	if envelope.Signature == "" {
+// Verify checks the freshness and Ed25519 signature of an envelope. It selects
+// the verifying key by the envelope's key id, honouring the rotation grace
+// window for the previous key.
+func (v *Ed25519Verifier) Verify(_ context.Context, env Envelope) error {
+	if env.Signature == "" {
 		return fmt.Errorf("api: verifier: missing signature")
 	}
-	if envelope.Nonce == "" {
-		return fmt.Errorf("api: verifier: missing nonce")
-	}
-	if envelope.IssuedAt.IsZero() {
+	if env.IssuedAt.IsZero() {
 		return fmt.Errorf("api: verifier: missing issued_at")
 	}
-	if time.Since(envelope.IssuedAt) > DefaultStalenessWindow {
+	if time.Since(env.IssuedAt) > DefaultStalenessWindow {
 		return fmt.Errorf("api: verifier: event is stale")
 	}
-	if envelope.IssuedAt.After(time.Now().Add(DefaultStalenessWindow)) {
+	if env.IssuedAt.After(time.Now().Add(DefaultStalenessWindow)) {
 		return fmt.Errorf("api: verifier: event timestamp is in the future")
 	}
 
-	sigBytes, err := base64.StdEncoding.DecodeString(envelope.Signature)
-	if err != nil {
-		return fmt.Errorf("api: verifier: signature verification failed")
-	}
-
-	canonical, err := json.Marshal(canonicalEnvelope{
-		EventType: envelope.EventType,
-		EventID:   envelope.EventID,
-		IssuedAt:  envelope.IssuedAt,
-		Nonce:     envelope.Nonce,
-		Payload:   envelope.Payload,
-	})
-	if err != nil {
-		return fmt.Errorf("api: verifier: signature verification failed")
-	}
-
 	v.mu.RLock()
-	currentKey := v.currentKey
-	previousKey := v.previousKey
-	transitionExpires := v.transitionExpires
+	var key ed25519.PublicKey
+	switch {
+	case env.KeyID != "" && env.KeyID == v.currentKID:
+		key = v.currentKey
+	case env.KeyID != "" && env.KeyID == v.previousKID && time.Now().Before(v.transitionExpires):
+		key = v.previousKey
+	}
 	v.mu.RUnlock()
 
-	verified := ed25519.Verify(currentKey, canonical, sigBytes)
-	if !verified && len(previousKey) > 0 && time.Now().Before(transitionExpires) {
-		verified = ed25519.Verify(previousKey, canonical, sigBytes)
+	if len(key) == 0 {
+		return fmt.Errorf("api: verifier: unknown signing key id")
 	}
-	if !verified {
+
+	sigBytes, err := base64.StdEncoding.DecodeString(env.Signature)
+	if err != nil {
+		return fmt.Errorf("api: verifier: signature verification failed")
+	}
+	canonical, err := CanonicalBytes(env)
+	if err != nil {
+		return fmt.Errorf("api: verifier: signature verification failed")
+	}
+	if !ed25519.Verify(key, canonical, sigBytes) {
 		return fmt.Errorf("api: verifier: signature verification failed")
 	}
 
-	// Record nonce only after successful signature verification.
-	return v.nonces.Add(envelope.Nonce, envelope.IssuedAt)
+	// No replay-tracking step, by design: the events contract carries no nonce,
+	// so there is nothing unique to record here. Replay protection is delegated
+	// to (a) the TLS transport, which keeps captured envelopes off the wire, and
+	// (b) the idempotence of what a verified event triggers — every production
+	// event drives an authoritative reconcile pull, and a replayed rotate_keys
+	// only re-requests a rotation the control plane rejects (409) when none is
+	// pending. This is a deliberate trade-off of the no-nonce contract, not an
+	// oversight; see docs/reference/core/event-verification.md.
+	return nil
 }
