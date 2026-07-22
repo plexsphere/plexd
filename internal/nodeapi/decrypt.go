@@ -3,26 +3,16 @@ package nodeapi
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"encoding/base64"
 	"errors"
 )
 
-// DecryptSecret decrypts an AES-256-GCM encrypted secret.
-// The ciphertext and nonce are base64-encoded (standard encoding).
+// DecryptSecret opens the raw AES-256-GCM envelope
+// <12-byte nonce> || <ciphertext + 16-byte GCM tag> under the NSK.
 // The NSK (node secret key) must be exactly 32 bytes.
-// Returns a generic error on failure to avoid leaking cryptographic details.
-func DecryptSecret(nsk []byte, ciphertext string, nonce string) (string, error) {
+// Returns a generic error on every failure to avoid leaking cryptographic
+// details.
+func DecryptSecret(nsk []byte, envelope []byte) (string, error) {
 	if len(nsk) != 32 {
-		return "", errors.New("nodeapi: decryption failed")
-	}
-
-	ciphertextBytes, err := base64.StdEncoding.DecodeString(ciphertext)
-	if err != nil {
-		return "", errors.New("nodeapi: decryption failed")
-	}
-
-	nonceBytes, err := base64.StdEncoding.DecodeString(nonce)
-	if err != nil {
 		return "", errors.New("nodeapi: decryption failed")
 	}
 
@@ -36,11 +26,11 @@ func DecryptSecret(nsk []byte, ciphertext string, nonce string) (string, error) 
 		return "", errors.New("nodeapi: decryption failed")
 	}
 
-	if len(nonceBytes) != gcm.NonceSize() {
+	if len(envelope) < gcm.NonceSize()+gcm.Overhead() {
 		return "", errors.New("nodeapi: decryption failed")
 	}
 
-	plaintext, err := gcm.Open(nil, nonceBytes, ciphertextBytes, nil)
+	plaintext, err := gcm.Open(nil, envelope[:gcm.NonceSize()], envelope[gcm.NonceSize():], nil)
 	if err != nil {
 		return "", errors.New("nodeapi: decryption failed")
 	}

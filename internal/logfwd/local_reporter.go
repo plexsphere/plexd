@@ -27,7 +27,7 @@ const (
 
 // SecretFetcher abstracts fetching encrypted secrets from the control plane.
 type SecretFetcher interface {
-	FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
+	FetchSecret(ctx context.Context, nodeID, name string, version int) (*api.SecretEnvelope, error)
 }
 
 // LocalReporter sends log batches to a local data-plane endpoint.
@@ -116,7 +116,7 @@ func (r *LocalReporter) resolveToken(ctx context.Context) (string, error) {
 		return r.cachedToken, nil
 	}
 
-	resp, err := r.fetcher.FetchSecret(ctx, r.nodeID, r.secretKey)
+	resp, err := r.fetcher.FetchSecret(ctx, r.nodeID, r.secretKey, 0)
 	if err != nil {
 		if r.cachedToken != "" {
 			r.logger.Warn("using cached credential", "component", "logfwd", "error", err)
@@ -125,10 +125,10 @@ func (r *LocalReporter) resolveToken(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("logfwd: fetch secret: %w", err)
 	}
 
-	plaintext, err := nodeapi.DecryptSecret(r.nsk, resp.Ciphertext, resp.Nonce)
+	plaintext, err := nodeapi.DecryptSecret(r.nsk, resp.Data)
 	if err != nil {
 		if r.cachedToken != "" {
-			r.logger.Warn("using cached credential", "component", "logfwd", "error", err)
+			r.logger.Warn("using cached credential", "component", "logfwd", "kid", resp.KID, "version", resp.Version, "error", err)
 			return r.cachedToken, nil
 		}
 		return "", fmt.Errorf("logfwd: decrypt secret: %w", err)

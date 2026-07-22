@@ -27,7 +27,7 @@ const (
 
 // SecretFetcher abstracts the control plane client for secret retrieval.
 type SecretFetcher interface {
-	FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
+	FetchSecret(ctx context.Context, nodeID, name string, version int) (*api.SecretEnvelope, error)
 }
 
 // LocalReporter implements MetricsReporter by posting metric batches to a
@@ -128,7 +128,7 @@ func (r *LocalReporter) resolveToken(ctx context.Context) (string, error) {
 		return r.cachedToken, nil
 	}
 
-	resp, err := r.fetcher.FetchSecret(ctx, r.nodeID, r.secretKey)
+	resp, err := r.fetcher.FetchSecret(ctx, r.nodeID, r.secretKey, 0)
 	if err != nil {
 		if r.cachedToken != "" {
 			r.logger.Warn("using cached credential", "component", "metrics", "error", err)
@@ -137,10 +137,10 @@ func (r *LocalReporter) resolveToken(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("metrics: fetch secret: %w", err)
 	}
 
-	token, err := nodeapi.DecryptSecret(r.nsk, resp.Ciphertext, resp.Nonce)
+	token, err := nodeapi.DecryptSecret(r.nsk, resp.Data)
 	if err != nil {
 		if r.cachedToken != "" {
-			r.logger.Warn("using cached credential", "component", "metrics", "error", err)
+			r.logger.Warn("using cached credential", "component", "metrics", "kid", resp.KID, "version", resp.Version, "error", err)
 			return r.cachedToken, nil
 		}
 		return "", fmt.Errorf("metrics: decrypt secret: %w", err)

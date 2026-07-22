@@ -27,7 +27,7 @@ const (
 
 // SecretFetcher abstracts retrieval of encrypted secrets from the control plane.
 type SecretFetcher interface {
-	FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
+	FetchSecret(ctx context.Context, nodeID, name string, version int) (*api.SecretEnvelope, error)
 }
 
 // LocalReporter sends audit batches to a local data-plane endpoint.
@@ -115,7 +115,7 @@ func (r *LocalReporter) resolveToken(ctx context.Context) (string, error) {
 		return r.cachedToken, nil
 	}
 
-	secret, err := r.fetcher.FetchSecret(ctx, r.nodeID, r.secretKey)
+	secret, err := r.fetcher.FetchSecret(ctx, r.nodeID, r.secretKey, 0)
 	if err != nil {
 		if r.cachedToken != "" {
 			r.logger.Warn("using cached credential", "component", "auditfwd", "error", err)
@@ -124,10 +124,10 @@ func (r *LocalReporter) resolveToken(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("auditfwd: fetch secret: %w", err)
 	}
 
-	plaintext, err := nodeapi.DecryptSecret(r.nsk, secret.Ciphertext, secret.Nonce)
+	plaintext, err := nodeapi.DecryptSecret(r.nsk, secret.Data)
 	if err != nil {
 		if r.cachedToken != "" {
-			r.logger.Warn("using cached credential", "component", "auditfwd", "error", err)
+			r.logger.Warn("using cached credential", "component", "auditfwd", "kid", secret.KID, "version", secret.Version, "error", err)
 			return r.cachedToken, nil
 		}
 		return "", fmt.Errorf("auditfwd: decrypt secret: %w", err)

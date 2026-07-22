@@ -83,6 +83,7 @@ type Server struct {
 	capabilitiesCount       atomic.Int64
 	endpointCount           atomic.Int64
 	secretsCount            atomic.Int64
+	secretCurrentVersion    atomic.Int64
 	reportPutCount          atomic.Int64
 	reportDeleteCount       atomic.Int64
 	executionCallbackCount  atomic.Int64
@@ -178,6 +179,7 @@ func New() *Server {
 		},
 		stateFixture: newStateFixture(),
 	}
+	s.secretCurrentVersion.Store(1)
 	s.registerRoutes()
 	return s
 }
@@ -934,19 +936,50 @@ func (s *Server) handleEndpoint(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleSecrets handles GET /v1/nodes/{id}/secrets/{key}.
+// handleSecrets handles GET /v1/nodes/{id}/secrets/{key}. It validates the key
+// against secretKeyRe, honours an optional ?version=N selector bounded by the
+// current version, and serves the raw AES-256-GCM envelope as an octet-stream
+// body with the version and KID in response headers.
 func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
-	s.secretsCount.Add(1)
 	key := r.PathValue("key")
-	ct, nc := encryptSecret(s.nsk, s.expectedBearerToken)
-	resp := api.SecretResponse{
-		Key:        key,
-		Ciphertext: ct,
-		Nonce:      nc,
-		Version:    1,
+	if !secretKeyRe.MatchString(key) {
+		writeProblem(w, r, http.StatusNotFound, "secret_not_found", "no secret exists for this key")
+		return
 	}
-	writeJSON(w, http.StatusOK, resp)
+
+	version := s.secretCurrentVersion.Load()
+	if raw := r.URL.Query().Get("version"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 1 {
+			writeProblem(w, r, http.StatusBadRequest, "invalid_version", "version must be a positive integer")
+			return
+		}
+		if int64(v) > s.secretCurrentVersion.Load() {
+			writeProblem(w, r, http.StatusNotFound, "secret_version_not_found", "no such secret version")
+			return
+		}
+		version = int64(v)
+	}
+
+	envelope := encryptSecret(s.nsk, s.expectedBearerToken)
+	s.secretsCount.Add(1)
+	w.Header().Set("X-Plexsphere-Secret-Version", strconv.FormatInt(version, 10))
+	w.Header().Set("X-Plexsphere-Secret-KID", mockSecretKID)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(envelope); err != nil {
+		slog.Error("handleSecrets: write failed", "error", err)
+	}
 }
+
+// mockSecretKID is the fixture key id served in the X-Plexsphere-Secret-KID
+// header of every secret envelope.
+const mockSecretKID = "e2e-nsk-kid-1"
+
+// secretKeyRe is a mock-local copy of the control-plane secret name grammar.
+// A name outside it is a 404 secret_not_found.
+var secretKeyRe = regexp.MustCompile("^[a-z][a-z0-9_-]{0,62}$")
 
 // reportKeyRe is a mock-local copy of the control-plane per-key report grammar:
 // a lowercase-leading key of 1..128 chars over [a-z0-9._-]. A key outside it is
@@ -1745,9 +1778,10 @@ func (s *Server) handleLastRequest(w http.ResponseWriter, r *http.Request) {
 // Local Endpoint Handlers (HTTPS :8443)
 // ---------------------------------------------------------------------------
 
-// encryptSecret encrypts plaintext using AES-256-GCM with the given NSK,
-// returning base64-encoded ciphertext and nonce.
-func encryptSecret(nsk []byte, plaintext string) (ciphertext, nonce string) {
+// encryptSecret seals plaintext with AES-256-GCM under the given NSK using a
+// fresh random 12-byte nonce, returning the raw envelope
+// nonce || ciphertext+tag exactly as the control-plane octet-stream body.
+func encryptSecret(nsk []byte, plaintext string) []byte {
 	block, err := aes.NewCipher(nsk)
 	if err != nil {
 		panic("mockapi: aes.NewCipher: " + err.Error())
@@ -1757,8 +1791,10 @@ func encryptSecret(nsk []byte, plaintext string) (ciphertext, nonce string) {
 		panic("mockapi: cipher.NewGCM: " + err.Error())
 	}
 	nonceBytes := make([]byte, gcm.NonceSize())
-	ct := gcm.Seal(nil, nonceBytes, []byte(plaintext), nil)
-	return base64.StdEncoding.EncodeToString(ct), base64.StdEncoding.EncodeToString(nonceBytes)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		panic("mockapi: rand.Read nonce: " + err.Error())
+	}
+	return gcm.Seal(nonceBytes, nonceBytes, []byte(plaintext), nil)
 }
 
 // validateLocalAuth checks the Authorization header for the expected bearer token.

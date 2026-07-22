@@ -38,8 +38,8 @@ func (noopHookVerifier) VerifyHook(_ context.Context, _, _, _ string) (bool, err
 // testSecretFetcher is a no-op SecretFetcher for testing.
 type testSecretFetcher struct{}
 
-func (testSecretFetcher) FetchSecret(_ context.Context, _, _ string) (*api.SecretResponse, error) {
-	return &api.SecretResponse{}, nil
+func (testSecretFetcher) FetchSecret(_ context.Context, _, _ string, _ int) (*api.SecretEnvelope, error) {
+	return &api.SecretEnvelope{}, nil
 }
 
 // testReportSyncClient is a no-op ReportSyncClient for testing.

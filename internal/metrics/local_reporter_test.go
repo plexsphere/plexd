@@ -1,10 +1,10 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,14 +26,13 @@ import (
 // Helpers
 // ---------------------------------------------------------------------------
 
-// encryptTestSecret encrypts plaintext using AES-256-GCM with the given NSK,
-// returning base64-encoded ciphertext and nonce suitable for DecryptSecret.
-func encryptTestSecret(nsk []byte, plaintext string) (ciphertext, nonce string) {
+// encryptTestSecret seals plaintext with AES-256-GCM under the given NSK,
+// returning the raw envelope nonce || ciphertext+tag suitable for DecryptSecret.
+func encryptTestSecret(nsk []byte, plaintext string) []byte {
 	block, _ := aes.NewCipher(nsk)
 	gcm, _ := cipher.NewGCM(block)
-	nonceBytes := make([]byte, gcm.NonceSize())
-	ct := gcm.Seal(nil, nonceBytes, []byte(plaintext), nil)
-	return base64.StdEncoding.EncodeToString(ct), base64.StdEncoding.EncodeToString(nonceBytes)
+	nonce := make([]byte, gcm.NonceSize())
+	return gcm.Seal(nonce, nonce, []byte(plaintext), nil)
 }
 
 // testNSK returns a deterministic 32-byte key for testing.
@@ -45,22 +44,24 @@ func testNSK() []byte {
 	return nsk
 }
 
-// mockSecretFetcher records calls and returns a pre-configured SecretResponse.
+// mockSecretFetcher records calls and returns a pre-configured SecretEnvelope.
 type mockSecretFetcher struct {
-	mu         sync.Mutex
-	calls      int
-	resp       *api.SecretResponse
-	err        error
-	failAfter  int // if >0, succeed for the first failAfter calls, then fail
-	failErr    error
-	calledWith []string // keys passed to FetchSecret
+	mu             sync.Mutex
+	calls          int
+	resp           *api.SecretEnvelope
+	err            error
+	failAfter      int // if >0, succeed for the first failAfter calls, then fail
+	failErr        error
+	calledWith     []string // names passed to FetchSecret
+	calledVersions []int    // versions passed to FetchSecret
 }
 
-func (m *mockSecretFetcher) FetchSecret(_ context.Context, nodeID, key string) (*api.SecretResponse, error) {
+func (m *mockSecretFetcher) FetchSecret(_ context.Context, nodeID, name string, version int) (*api.SecretEnvelope, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls++
-	m.calledWith = append(m.calledWith, key)
+	m.calledWith = append(m.calledWith, name)
+	m.calledVersions = append(m.calledVersions, version)
 	if m.failAfter > 0 && m.calls > m.failAfter {
 		return nil, m.failErr
 	}
@@ -98,13 +99,10 @@ func newTestReporter(t *testing.T, handler http.Handler, fetcher SecretFetcher) 
 // token.
 func newTestFetcher(token string) *mockSecretFetcher {
 	nsk := testNSK()
-	ct, nc := encryptTestSecret(nsk, token)
 	return &mockSecretFetcher{
-		resp: &api.SecretResponse{
-			Key:        "metrics-token",
-			Ciphertext: ct,
-			Nonce:      nc,
-			Version:    1,
+		resp: &api.SecretEnvelope{
+			Data:    encryptTestSecret(nsk, token),
+			Version: 1,
 		},
 	}
 }
@@ -229,9 +227,109 @@ func TestLocalReporter_ResolvesCredentialViaFetchAndDecrypt(t *testing.T) {
 	}
 	fetcher.mu.Lock()
 	if fetcher.calledWith[0] != "metrics-token" {
-		t.Errorf("FetchSecret key = %q, want %q", fetcher.calledWith[0], "metrics-token")
+		t.Errorf("FetchSecret name = %q, want %q", fetcher.calledWith[0], "metrics-token")
+	}
+	if fetcher.calledVersions[0] != 0 {
+		t.Errorf("FetchSecret version = %d, want 0", fetcher.calledVersions[0])
 	}
 	fetcher.mu.Unlock()
+}
+
+func TestLocalReporter_RateLimitedFetchError(t *testing.T) {
+	rateLimitErr := &api.APIError{StatusCode: 429, Code: "per_node_rate_limited", RetryAfter: 7 * time.Second}
+
+	t.Run("populated cache falls back with warning", func(t *testing.T) {
+		var gotAuth string
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotAuth = r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusOK)
+		})
+
+		fetcher := newTestFetcher("rl-cached-tok")
+		fetcher.failAfter = 1
+		fetcher.failErr = rateLimitErr
+
+		ch := &capturingHandler{}
+		srv, reporter := newTestReporter(t, handler, fetcher)
+		defer srv.Close()
+		reporter.logger = slog.New(ch)
+		reporter.cacheTTL = 1 * time.Millisecond
+
+		batch := api.MetricBatch{{Timestamp: time.Now(), Group: GroupSystem, Data: json.RawMessage(`{}`)}}
+		if err := reporter.ReportMetrics(context.Background(), "node-1", batch); err != nil {
+			t.Fatalf("first call: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+		if err := reporter.ReportMetrics(context.Background(), "node-1", batch); err != nil {
+			t.Fatalf("rate-limited fallback: %v", err)
+		}
+
+		if gotAuth != "Bearer rl-cached-tok" {
+			t.Errorf("Authorization = %q, want cached token", gotAuth)
+		}
+		found := false
+		for _, r := range ch.getRecords() {
+			if strings.Contains(r.Message, "using cached credential") {
+				found = true
+			}
+		}
+		if !found {
+			t.Error("expected warning about using cached credential")
+		}
+	})
+
+	t.Run("empty cache returns wrapped error", func(t *testing.T) {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		fetcher := &mockSecretFetcher{err: rateLimitErr}
+		srv, reporter := newTestReporter(t, handler, fetcher)
+		defer srv.Close()
+
+		batch := api.MetricBatch{{Timestamp: time.Now(), Group: GroupSystem, Data: json.RawMessage(`{}`)}}
+		err := reporter.ReportMetrics(context.Background(), "node-1", batch)
+		if err == nil {
+			t.Fatal("expected error with empty cache")
+		}
+		if !strings.Contains(err.Error(), "metrics: fetch secret:") {
+			t.Errorf("error = %q, want metrics: fetch secret prefix", err.Error())
+		}
+	})
+}
+
+func TestLocalReporter_DecryptFailureWarnCarriesKIDAndVersion(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// A fetch that succeeds but returns an undecryptable envelope must fall back
+	// to the cached token and log the KID and version.
+	fetcher := &mockSecretFetcher{
+		resp: &api.SecretEnvelope{Data: make([]byte, 28), Version: 9, KID: "kid-9"},
+	}
+
+	var buf bytes.Buffer
+	srv, reporter := newTestReporter(t, handler, fetcher)
+	defer srv.Close()
+	reporter.logger = slog.New(slog.NewTextHandler(&buf, nil))
+
+	reporter.mu.Lock()
+	reporter.cachedToken = "stale-tok"
+	reporter.fetchedAt = time.Now().Add(-time.Hour)
+	reporter.mu.Unlock()
+
+	batch := api.MetricBatch{{Timestamp: time.Now(), Group: GroupSystem, Data: json.RawMessage(`{}`)}}
+	if err := reporter.ReportMetrics(context.Background(), "node-1", batch); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	logOut := buf.String()
+	if !strings.Contains(logOut, "kid=kid-9") {
+		t.Errorf("log missing kid attribute: %s", logOut)
+	}
+	if !strings.Contains(logOut, "version=9") {
+		t.Errorf("log missing version attribute: %s", logOut)
+	}
 }
 
 func TestLocalReporter_CachesTokenWithinTTL(t *testing.T) {

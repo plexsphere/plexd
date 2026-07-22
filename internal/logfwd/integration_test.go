@@ -91,13 +91,8 @@ func makeLogEntries(n int) []api.LogEntry {
 
 func newLogTestFetcher(token string) *mockSecretFetcher {
 	nsk := testNSK()
-	ct, nc := encryptTestSecret(nsk, token)
 	return &mockSecretFetcher{
-		response: &api.SecretResponse{
-			Key:        "logs-token",
-			Ciphertext: ct,
-			Nonce:      nc,
-		},
+		response: &api.SecretEnvelope{Data: encryptTestSecret(nsk, token), Version: 1},
 	}
 }
 

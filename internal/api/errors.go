@@ -60,6 +60,10 @@ var (
 	ErrServer          = &APIError{StatusCode: 500, Message: "server error"}
 )
 
+// ErrSecretNameInvalid is returned by FetchSecret before any HTTP request
+// when the requested secret name is outside the contract's name grammar.
+var ErrSecretNameInvalid = fmt.Errorf("secret name is outside the grammar %s", secretNamePattern)
+
 // IsIngestNotProvisioned reports whether err is the control plane's refusal to
 // accept observability ingest because it is not provisioned for the node: a 501
 // carrying the observability_ingest_not_provisioned problem code.

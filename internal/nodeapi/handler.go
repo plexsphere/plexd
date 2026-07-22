@@ -14,7 +14,7 @@ import (
 
 // SecretFetcher abstracts the control plane client for secret retrieval.
 type SecretFetcher interface {
-	FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
+	FetchSecret(ctx context.Context, nodeID, name string, version int) (*api.SecretEnvelope, error)
 }
 
 // ActionProvider supplies action and hook information to the local API.
@@ -256,26 +256,47 @@ func (h *Handler) handleGetSecretsList(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleGetSecretValue(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
-	resp, err := h.secretFetcher.FetchSecret(r.Context(), h.nodeID, key)
-	if err != nil {
-		if errors.Is(err, api.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "not found")
+	version := 0
+	if r.URL.Query().Has("version") {
+		v, err := strconv.Atoi(r.URL.Query().Get("version"))
+		if err != nil || v < 1 {
+			writeError(w, http.StatusBadRequest, "invalid version")
 			return
 		}
-		h.logger.Error("secret fetch failed", "key", key, "error", err)
-		writeError(w, http.StatusServiceUnavailable, "control plane unavailable")
+		version = v
+	}
+
+	resp, err := h.secretFetcher.FetchSecret(r.Context(), h.nodeID, key, version)
+	if err != nil {
+		switch {
+		case errors.Is(err, api.ErrSecretNameInvalid):
+			writeError(w, http.StatusBadRequest, "invalid secret key")
+		case errors.Is(err, api.ErrNotFound):
+			writeError(w, http.StatusNotFound, "not found")
+		case errors.Is(err, api.ErrForbidden):
+			writeError(w, http.StatusForbidden, "forbidden")
+		case errors.Is(err, api.ErrRateLimit):
+			var apiErr *api.APIError
+			if errors.As(err, &apiErr) && apiErr.RetryAfter > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(int(apiErr.RetryAfter.Seconds())))
+			}
+			writeError(w, http.StatusTooManyRequests, "rate limited")
+		default:
+			h.logger.Error("secret fetch failed", "key", key, "error", err)
+			writeError(w, http.StatusServiceUnavailable, "control plane unavailable")
+		}
 		return
 	}
 
-	plaintext, err := DecryptSecret(h.nsk, resp.Ciphertext, resp.Nonce)
+	plaintext, err := DecryptSecret(h.nsk, resp.Data)
 	if err != nil {
-		h.logger.Error("secret decryption failed", "key", key, "error", err)
+		h.logger.Error("secret decryption failed", "key", key, "kid", resp.KID, "version", resp.Version, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"key":     resp.Key,
+		"key":     key,
 		"value":   plaintext,
 		"version": resp.Version,
 	})
