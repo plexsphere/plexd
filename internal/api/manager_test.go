@@ -32,7 +32,7 @@ func makeEnvelopeSSE(eventType, eventID string) string {
 // ---------------------------------------------------------------------------
 
 func TestManager_StartAndDispatch(t *testing.T) {
-	sseData := makeEnvelopeSSE("peer_added", "evt-1") + makeEnvelopeSSE("peer_removed", "evt-2")
+	sseData := makeEnvelopeSSE("node_state_updated", "evt-1") + makeEnvelopeSSE("peer_removed", "evt-2")
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -57,7 +57,7 @@ func TestManager_StartAndDispatch(t *testing.T) {
 	var added atomic.Int64
 	var removed atomic.Int64
 
-	mgr.RegisterHandler("peer_added", func(_ context.Context, env Envelope) error {
+	mgr.RegisterHandler("node_state_updated", func(_ context.Context, env Envelope) error {
 		added.Add(1)
 		return nil
 	})
@@ -89,7 +89,7 @@ func TestManager_StartAndDispatch(t *testing.T) {
 	}
 
 	if added.Load() < 1 {
-		t.Errorf("peer_added handler called %d times, want >= 1", added.Load())
+		t.Errorf("node_state_updated handler called %d times, want >= 1", added.Load())
 	}
 	if removed.Load() < 1 {
 		t.Errorf("peer_removed handler called %d times, want >= 1", removed.Load())
@@ -117,10 +117,10 @@ func TestManager_ReconnectWithLastEventID(t *testing.T) {
 
 		if n == 1 {
 			// First connection: send event then close
-			fmt.Fprint(w, makeEnvelopeSSE("peer_added", "evt-100"))
+			fmt.Fprint(w, makeEnvelopeSSE("node_state_updated", "evt-100"))
 		} else if n == 2 {
 			// Second connection: send one more event then close
-			fmt.Fprint(w, makeEnvelopeSSE("peer_added", "evt-101"))
+			fmt.Fprint(w, makeEnvelopeSSE("node_state_updated", "evt-101"))
 		}
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
@@ -142,7 +142,7 @@ func TestManager_ReconnectWithLastEventID(t *testing.T) {
 	mgr.SetReconnectIntervals(1*time.Millisecond, 10*time.Millisecond)
 
 	var dispatched atomic.Int64
-	mgr.RegisterHandler("peer_added", func(_ context.Context, env Envelope) error {
+	mgr.RegisterHandler("node_state_updated", func(_ context.Context, env Envelope) error {
 		dispatched.Add(1)
 		return nil
 	})

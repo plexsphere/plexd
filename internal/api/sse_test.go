@@ -19,15 +19,15 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestSSEParser_SingleLineEvent(t *testing.T) {
-	input := "event: peer_added\ndata: {\"foo\":\"bar\"}\nid: evt_001\n\n"
+	input := "event: node_state_updated\ndata: {\"foo\":\"bar\"}\nid: evt_001\n\n"
 	parser := NewSSEParser(strings.NewReader(input))
 
 	evt, ok := parser.Next()
 	if !ok {
 		t.Fatal("expected an event, got none")
 	}
-	if evt.Type != "peer_added" {
-		t.Errorf("Type = %q, want %q", evt.Type, "peer_added")
+	if evt.Type != "node_state_updated" {
+		t.Errorf("Type = %q, want %q", evt.Type, "node_state_updated")
 	}
 	if evt.Data != `{"foo":"bar"}` {
 		t.Errorf("Data = %q, want %q", evt.Data, `{"foo":"bar"}`)
@@ -169,7 +169,7 @@ func TestSSE_LastEventIDSentOnReconnect(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
 		// Send a minimal event so the stream ends cleanly.
-		fmt.Fprint(w, "data: {\"id\":\"e1\",\"type\":\"peer_added\",\"issued_at\":\"2025-01-01T00:00:00Z\",\"payload\":{},\"signature\":\"s\"}\nid: e1\n\n")
+		fmt.Fprint(w, "data: {\"id\":\"e1\",\"type\":\"node_state_updated\",\"issued_at\":\"2025-01-01T00:00:00Z\",\"payload\":{},\"signature\":\"s\"}\nid: e1\n\n")
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
@@ -199,7 +199,7 @@ func TestSSE_NoLastEventIDOnFirstConnect(t *testing.T) {
 		gotLastEventID = r.Header.Get("Last-Event-ID")
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
-		fmt.Fprint(w, "data: {\"id\":\"e1\",\"type\":\"peer_added\",\"issued_at\":\"2025-01-01T00:00:00Z\",\"payload\":{},\"signature\":\"s\"}\nid: e1\n\n")
+		fmt.Fprint(w, "data: {\"id\":\"e1\",\"type\":\"node_state_updated\",\"issued_at\":\"2025-01-01T00:00:00Z\",\"payload\":{},\"signature\":\"s\"}\nid: e1\n\n")
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
@@ -219,8 +219,8 @@ func TestSSE_NoLastEventIDOnFirstConnect(t *testing.T) {
 }
 
 func TestSSE_MalformedDataSkipped(t *testing.T) {
-	envelopeJSON := `{"id":"evt_002","type":"peer_added","issued_at":"2025-01-01T00:00:00Z","payload":{},"signature":"sig"}`
-	sseData := fmt.Sprintf("data: NOT-VALID-JSON\nid: bad\n\nevent: peer_added\ndata: %s\nid: evt_002\n\n", envelopeJSON)
+	envelopeJSON := `{"id":"evt_002","type":"node_state_updated","issued_at":"2025-01-01T00:00:00Z","payload":{},"signature":"sig"}`
+	sseData := fmt.Sprintf("data: NOT-VALID-JSON\nid: bad\n\nevent: node_state_updated\ndata: %s\nid: evt_002\n\n", envelopeJSON)
 
 	var dispatched atomic.Int64
 	srv := httptest.NewServer(sseHandler(sseData))
@@ -228,7 +228,7 @@ func TestSSE_MalformedDataSkipped(t *testing.T) {
 
 	stream, dispatcher := newTestSSEStream(t, srv)
 
-	dispatcher.Register("peer_added", func(_ context.Context, env Envelope) error {
+	dispatcher.Register("node_state_updated", func(_ context.Context, env Envelope) error {
 		dispatched.Add(1)
 		if env.ID != "evt_002" {
 			t.Errorf("EventID = %q, want %q", env.ID, "evt_002")
@@ -284,8 +284,8 @@ func TestSSE_GracefulShutdownOnContextCancel(t *testing.T) {
 }
 
 func TestSSE_DispatchesVerifiedEvents(t *testing.T) {
-	envelopeJSON := `{"id":"evt_001","type":"peer_added","issued_at":"2025-01-01T00:00:00Z","payload":{},"signature":"sig"}`
-	sseData := fmt.Sprintf("event: peer_added\ndata: %s\nid: evt_001\n\n", envelopeJSON)
+	envelopeJSON := `{"id":"evt_001","type":"node_state_updated","issued_at":"2025-01-01T00:00:00Z","payload":{},"signature":"sig"}`
+	sseData := fmt.Sprintf("event: node_state_updated\ndata: %s\nid: evt_001\n\n", envelopeJSON)
 
 	srv := httptest.NewServer(sseHandler(sseData))
 	defer srv.Close()
@@ -295,7 +295,7 @@ func TestSSE_DispatchesVerifiedEvents(t *testing.T) {
 	var called atomic.Int64
 	var receivedEnvelope Envelope
 
-	dispatcher.Register("peer_added", func(_ context.Context, env Envelope) error {
+	dispatcher.Register("node_state_updated", func(_ context.Context, env Envelope) error {
 		called.Add(1)
 		receivedEnvelope = env
 		return nil
@@ -309,8 +309,8 @@ func TestSSE_DispatchesVerifiedEvents(t *testing.T) {
 	if called.Load() != 1 {
 		t.Fatalf("handler called %d times, want 1", called.Load())
 	}
-	if receivedEnvelope.Type != "peer_added" {
-		t.Errorf("EventType = %q, want %q", receivedEnvelope.Type, "peer_added")
+	if receivedEnvelope.Type != "node_state_updated" {
+		t.Errorf("EventType = %q, want %q", receivedEnvelope.Type, "node_state_updated")
 	}
 	if receivedEnvelope.ID != "evt_001" {
 		t.Errorf("EventID = %q, want %q", receivedEnvelope.ID, "evt_001")
@@ -326,7 +326,7 @@ func TestSSE_DispatchesVerifiedEvents(t *testing.T) {
 // envelope's type, never the SSE frame's event: field. Here the frame advertises
 // a different event name than the envelope carries.
 func TestSSE_DispatchesByEnvelopeTypeNotFrame(t *testing.T) {
-	envelopeJSON := `{"id":"evt_777","type":"peer_added","issued_at":"2025-01-01T00:00:00Z","payload":{},"signature":"sig"}`
+	envelopeJSON := `{"id":"evt_777","type":"node_state_updated","issued_at":"2025-01-01T00:00:00Z","payload":{},"signature":"sig"}`
 	// The SSE event: field deliberately disagrees with the envelope type.
 	sseData := fmt.Sprintf("event: policy_updated\ndata: %s\nid: evt_777\n\n", envelopeJSON)
 
@@ -336,7 +336,7 @@ func TestSSE_DispatchesByEnvelopeTypeNotFrame(t *testing.T) {
 	stream, dispatcher := newTestSSEStream(t, srv)
 
 	var peerAdded, policyUpdated atomic.Int64
-	dispatcher.Register("peer_added", func(_ context.Context, _ Envelope) error {
+	dispatcher.Register("node_state_updated", func(_ context.Context, _ Envelope) error {
 		peerAdded.Add(1)
 		return nil
 	})
@@ -350,7 +350,7 @@ func TestSSE_DispatchesByEnvelopeTypeNotFrame(t *testing.T) {
 	}
 
 	if peerAdded.Load() != 1 {
-		t.Errorf("peer_added handler called %d times, want 1 (dispatch must key on envelope type)", peerAdded.Load())
+		t.Errorf("node_state_updated handler called %d times, want 1 (dispatch must key on envelope type)", peerAdded.Load())
 	}
 	if policyUpdated.Load() != 0 {
 		t.Errorf("policy_updated handler called %d times, want 0 (SSE frame event: must be ignored)", policyUpdated.Load())

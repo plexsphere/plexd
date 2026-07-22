@@ -2,7 +2,6 @@ package wireguard
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -105,97 +104,4 @@ func peerFromSnapshot(p api.SnapshotPeer) (api.Peer, error) {
 		AllowedIPs: []string{netip.PrefixFrom(addr, 32).String()},
 		PSK:        "",
 	}, nil
-}
-
-// HandlePeerAdded returns an EventHandler for peer_added events.
-// It parses the Peer from the envelope payload and adds it via the Manager.
-func HandlePeerAdded(mgr *Manager) api.EventHandler {
-	return func(ctx context.Context, envelope api.Envelope) error {
-		var peer api.Peer
-		if err := json.Unmarshal(envelope.Payload, &peer); err != nil {
-			mgr.logger.Error("peer_added: parse payload failed",
-				"component", "wireguard",
-				"event_id", envelope.ID,
-				"error", err,
-			)
-			return fmt.Errorf("wireguard: peer_added: parse payload: %w", err)
-		}
-		if err := mgr.AddPeer(peer); err != nil {
-			return fmt.Errorf("wireguard: peer_added: %w", err)
-		}
-		return nil
-	}
-}
-
-// HandlePeerRemoved returns an EventHandler for peer_removed events.
-// The payload is expected to be a JSON object with a "peer_id" field.
-func HandlePeerRemoved(mgr *Manager) api.EventHandler {
-	return func(ctx context.Context, envelope api.Envelope) error {
-		var payload struct {
-			PeerID string `json:"peer_id"`
-		}
-		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
-			mgr.logger.Error("peer_removed: parse payload failed",
-				"component", "wireguard",
-				"event_id", envelope.ID,
-				"error", err,
-			)
-			return fmt.Errorf("wireguard: peer_removed: parse payload: %w", err)
-		}
-		if err := mgr.RemovePeerByID(payload.PeerID); err != nil {
-			return fmt.Errorf("wireguard: peer_removed: %w", err)
-		}
-		return nil
-	}
-}
-
-// HandlePeerKeyRotated returns an EventHandler for peer_key_rotated events.
-// The payload is a Peer with the new public key. The old peer is removed
-// (resolved via index) and the new one added.
-func HandlePeerKeyRotated(mgr *Manager) api.EventHandler {
-	return func(ctx context.Context, envelope api.Envelope) error {
-		var peer api.Peer
-		if err := json.Unmarshal(envelope.Payload, &peer); err != nil {
-			mgr.logger.Error("peer_key_rotated: parse payload failed",
-				"component", "wireguard",
-				"event_id", envelope.ID,
-				"error", err,
-			)
-			return fmt.Errorf("wireguard: peer_key_rotated: parse payload: %w", err)
-		}
-		// Remove old peer by ID (uses old public key from index)
-		if err := mgr.RemovePeerByID(peer.ID); err != nil {
-			mgr.logger.Warn("peer_key_rotated: remove old peer failed",
-				"component", "wireguard",
-				"peer_id", peer.ID,
-				"error", err,
-			)
-			// Continue — still try to add the new key
-		}
-		// Add with new key
-		if err := mgr.AddPeer(peer); err != nil {
-			return fmt.Errorf("wireguard: peer_key_rotated: add new peer: %w", err)
-		}
-		return nil
-	}
-}
-
-// HandlePeerEndpointChanged returns an EventHandler for peer_endpoint_changed events.
-// The payload is a Peer with the updated endpoint.
-func HandlePeerEndpointChanged(mgr *Manager) api.EventHandler {
-	return func(ctx context.Context, envelope api.Envelope) error {
-		var peer api.Peer
-		if err := json.Unmarshal(envelope.Payload, &peer); err != nil {
-			mgr.logger.Error("peer_endpoint_changed: parse payload failed",
-				"component", "wireguard",
-				"event_id", envelope.ID,
-				"error", err,
-			)
-			return fmt.Errorf("wireguard: peer_endpoint_changed: parse payload: %w", err)
-		}
-		if err := mgr.UpdatePeer(peer); err != nil {
-			return fmt.Errorf("wireguard: peer_endpoint_changed: %w", err)
-		}
-		return nil
-	}
 }

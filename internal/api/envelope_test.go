@@ -162,7 +162,7 @@ func TestNoOpVerifier_AcceptsAll(t *testing.T) {
 
 	env := Envelope{
 		ID:        "evt-999",
-		Type:      "peer_added",
+		Type:      "node_state_updated",
 		Signature: "sig",
 	}
 
@@ -176,24 +176,33 @@ func TestNoOpVerifier_AcceptsAll(t *testing.T) {
 	}
 }
 
+// TestEventTypeConstants locks the wire string of every event-type constant so
+// a rename breaks a test. The three tiers mirror the taxonomy in envelope.go:
+// contract types, the documented-coming family, and the test-only trio.
 func TestEventTypeConstants(t *testing.T) {
 	tests := []struct {
 		name     string
 		constant string
 		want     string
 	}{
-		{"EventPeerAdded", EventPeerAdded, "peer_added"},
-		{"EventPeerRemoved", EventPeerRemoved, "peer_removed"},
-		{"EventPeerKeyRotated", EventPeerKeyRotated, "peer_key_rotated"},
-		{"EventPeerEndpointChanged", EventPeerEndpointChanged, "peer_endpoint_changed"},
-		{"EventPolicyUpdated", EventPolicyUpdated, "policy_updated"},
-		{"EventActionRequest", EventActionRequest, "action_request"},
-		{"EventSessionRevoked", EventSessionRevoked, "session_revoked"},
-		{"EventSSHSessionSetup", EventSSHSessionSetup, "ssh_session_setup"},
-		{"EventRotateKeys", EventRotateKeys, "rotate_keys"},
-		{"EventSigningKeyRotated", EventSigningKeyRotated, "signing_key_rotated"},
+		// Contract types.
 		{"EventNodeStateUpdated", EventNodeStateUpdated, "node_state_updated"},
-		{"EventNodeSecretsUpdated", EventNodeSecretsUpdated, "node_secrets_updated"},
+		{"EventPolicyUpdated", EventPolicyUpdated, "policy_updated"},
+		{"EventBridgeConfigUpdated", EventBridgeConfigUpdated, "bridge_config_updated"},
+
+		// Documented-coming family.
+		{"EventPeerRegistered", EventPeerRegistered, "peer_registered"},
+		{"EventPeerPSKAssigned", EventPeerPSKAssigned, "peer_psk_assigned"},
+		{"EventPeerDeregistered", EventPeerDeregistered, "peer_deregistered"},
+		{"EventPeerEndpointChanged", EventPeerEndpointChanged, "peer_endpoint_changed"},
+		{"EventRotateKeys", EventRotateKeys, "rotate_keys"},
+		{"EventPeerKeyRotated", EventPeerKeyRotated, "peer_key_rotated"},
+		{"EventSigningKeyRotated", EventSigningKeyRotated, "signing_key_rotated"},
+
+		// Test-only trio.
+		{"EventActionRequest", EventActionRequest, "action_request"},
+		{"EventSSHSessionSetup", EventSSHSessionSetup, "ssh_session_setup"},
+		{"EventSessionRevoked", EventSessionRevoked, "session_revoked"},
 	}
 
 	for _, tt := range tests {

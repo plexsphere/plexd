@@ -1,6 +1,7 @@
 package nodeapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/reconcile"
@@ -41,8 +43,8 @@ type Server struct {
 }
 
 // NewServer creates a new Server. Config defaults are applied automatically.
-// The cache is initialized eagerly so that RegisterEventHandlers and
-// ReconcileHandler can be called before Start.
+// The cache is initialized eagerly so that ReconcileHandler can be called
+// before Start.
 func NewServer(cfg Config, client NodeAPIClient, nsk []byte, logger *slog.Logger) *Server {
 	cfg.ApplyDefaults()
 	if logger == nil {
@@ -285,25 +287,16 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 	return ctx.Err()
 }
 
-// RegisterEventHandlers registers SSE event handlers with the given dispatcher.
-func (s *Server) RegisterEventHandlers(dispatcher *api.EventDispatcher) {
-	RegisterEventHandlers(dispatcher, s.cache, s.logger)
-}
-
-// ReconcileHandler returns a reconcile.ReconcileHandler that updates the cache
-// when the desired state block changes. The block's metadata bucket becomes the
-// cache metadata map (both representations are a faithful map[string]string, so
-// the pull round-trips it). A nil state block authoritatively clears the
-// metadata map.
+// ReconcileHandler returns a reconcile.ReconcileHandler that refreshes the cache
+// from the desired state block whenever it changes. The block's metadata bucket
+// becomes the cache metadata map, and its opaque data bucket feeds the versioned
+// data store (GET /v1/state/data): each api.StateEntry value is JSON-encoded into
+// an api.DataEntry payload under dataStateContentType. A nil state block
+// authoritatively clears both buckets.
 //
-// The versioned data store (GET /v1/state/data, api.DataEntry with a real
-// content_type and version) is owned by the node_state_updated SSE feed, not by
-// this pull path. The snapshot's data bucket carries only opaque key/value
-// strings (api.StateEntry) — it has no source for content_type or version, so
-// converting it here would have to fabricate both, pinning every entry to
-// version 1 and clobbering the SSE-delivered content_type/version that consumers
-// poll for change detection. The pull therefore leaves the data store to its SSE
-// owner, mirroring how secret refs already ride the node_secrets_updated feed.
+// The secret index is not fed here: secret references no longer ride the
+// snapshot and secret values are always fetched live, so the pull leaves it
+// untouched.
 func (s *Server) ReconcileHandler() reconcile.ReconcileHandler {
 	return func(ctx context.Context, desired *api.NodeStateSnapshot, diff reconcile.StateDiff) error {
 		if !diff.StateChanged {
@@ -311,9 +304,9 @@ func (s *Server) ReconcileHandler() reconcile.ReconcileHandler {
 		}
 
 		if desired.State == nil {
-			// Authoritative clear of the metadata map the pull owns; the
-			// SSE-owned data store is left intact.
+			// Authoritative clear of both buckets the pull owns.
 			s.cache.UpdateMetadata(map[string]string{})
+			s.cache.UpdateData(nil)
 			return nil
 		}
 
@@ -322,8 +315,56 @@ func (s *Server) ReconcileHandler() reconcile.ReconcileHandler {
 			metadata[e.Key] = e.Value
 		}
 		s.cache.UpdateMetadata(metadata)
+
+		entries, err := s.dataEntriesFromSnapshot(desired.State.Data)
+		if err != nil {
+			return err
+		}
+		s.cache.UpdateData(entries)
 		return nil
 	}
+}
+
+// dataStateContentType is stamped on every data entry the pull derives from the
+// snapshot. The opaque data bucket carries no content type of its own, so each
+// value is wrapped as a JSON string payload under this fixed text type.
+const dataStateContentType = "text/plain; charset=utf-8"
+
+// dataEntriesFromSnapshot converts the snapshot's opaque data bucket
+// (api.StateEntry key/value pairs) into the versioned api.DataEntry values the
+// GET /v1/state/data routes serve. The snapshot has no content_type or version,
+// so each value is JSON-encoded into a payload under dataStateContentType and
+// its version is carried forward from the current cache entry, bumped only when
+// a key's payload actually changes — a consumer polling the version therefore
+// sees a monotonic change signal instead of every entry pinned to 1.
+func (s *Server) dataEntriesFromSnapshot(bucket []api.StateEntry) ([]api.DataEntry, error) {
+	prev := s.cache.GetData()
+	now := time.Now()
+	entries := make([]api.DataEntry, 0, len(bucket))
+	for _, e := range bucket {
+		payload, err := json.Marshal(e.Value)
+		if err != nil {
+			return nil, fmt.Errorf("nodeapi: encode data value for key %q: %w", e.Key, err)
+		}
+		entry := api.DataEntry{
+			Key:         e.Key,
+			ContentType: dataStateContentType,
+			Payload:     payload,
+			Version:     1,
+			UpdatedAt:   now,
+		}
+		if p, ok := prev[e.Key]; ok {
+			if p.ContentType == entry.ContentType && bytes.Equal(p.Payload, payload) {
+				// Unchanged: carry the version and timestamp forward.
+				entry.Version = p.Version
+				entry.UpdatedAt = p.UpdatedAt
+			} else {
+				entry.Version = p.Version + 1
+			}
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
 }
 
 // reportNotifyMiddleware wraps a handler to notify the syncer after report

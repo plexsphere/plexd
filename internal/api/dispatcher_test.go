@@ -17,14 +17,14 @@ func TestDispatcher_RoutesToHandler(t *testing.T) {
 	var called bool
 	var received Envelope
 
-	d.Register("peer_added", func(_ context.Context, env Envelope) error {
+	d.Register("node_state_updated", func(_ context.Context, env Envelope) error {
 		called = true
 		received = env
 		return nil
 	})
 
 	envelope := Envelope{
-		Type: "peer_added",
+		Type: "node_state_updated",
 		ID:   "evt_001",
 	}
 
@@ -33,8 +33,8 @@ func TestDispatcher_RoutesToHandler(t *testing.T) {
 	if !called {
 		t.Fatal("handler was not called")
 	}
-	if received.Type != "peer_added" {
-		t.Fatalf("expected event_type %q, got %q", "peer_added", received.Type)
+	if received.Type != "node_state_updated" {
+		t.Fatalf("expected event_type %q, got %q", "node_state_updated", received.Type)
 	}
 	if received.ID != "evt_001" {
 		t.Fatalf("expected event_id %q, got %q", "evt_001", received.ID)
