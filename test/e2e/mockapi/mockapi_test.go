@@ -1,8 +1,10 @@
 package mockapi_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -13,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -170,10 +173,13 @@ var localCounterFields = map[string]bool{
 // ExecutionUploadCount advances only through the presign-then-PUT leg, which the
 // flat fan-out does not drive uniformly. SecretsRateLimitedCount advances only
 // while the secret rate limit is armed, which the flat fan-out never arms.
+// EventsRequestCount advances only on GET .../events, which the flat fan-out
+// never opens.
 var statefulCounterFields = map[string]bool{
 	"KeyRotateCount":          true,
 	"ExecutionUploadCount":    true,
 	"SecretsRateLimitedCount": true,
+	"EventsRequestCount":      true,
 }
 
 // assertAllCountersEqual checks that every field in the AssertionCounters struct
@@ -213,6 +219,15 @@ func makeEnvelope(eventType, eventID string, payload json.RawMessage) api.Envelo
 // the connection lifetime.
 func connectSSE(t *testing.T, baseURL, nodeID string, timeout time.Duration) *http.Response {
 	t.Helper()
+	return connectSSECursor(t, baseURL, nodeID, "", timeout)
+}
+
+// connectSSECursor opens an SSE connection, optionally seeding a Last-Event-ID
+// cursor (sent only when non-empty). The caller must close resp.Body. The mock
+// flushes the 200 headers only after registering the client, so once this
+// returns a subsequent broadcast is guaranteed to reach the live stream.
+func connectSSECursor(t *testing.T, baseURL, nodeID, lastEventID string, timeout time.Duration) *http.Response {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	t.Cleanup(cancel)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/nodes/"+nodeID+"/events", nil)
@@ -220,11 +235,90 @@ func connectSSE(t *testing.T, baseURL, nodeID string, timeout time.Duration) *ht
 		t.Fatalf("create SSE request: %v", err)
 	}
 	req.Header.Set("Accept", "text/event-stream")
+	if lastEventID != "" {
+		req.Header.Set("Last-Event-ID", lastEventID)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET events: %v", err)
 	}
 	return resp
+}
+
+// sseFrames reads complete SSE event frames from a stream body in a single
+// background goroutine, forwarding each frame (the text up to and including its
+// terminating blank line) on a channel. One reader per body keeps reads
+// race-free; the channel closes when the body errors or is closed.
+type sseFrames struct {
+	ch chan string
+}
+
+// startSSEFrames begins reading SSE frames from body. Keep-alive comment lines
+// (":"-prefixed) are folded into the next frame, which is harmless when tests
+// use a long keep-alive interval.
+func startSSEFrames(body io.Reader) *sseFrames {
+	f := &sseFrames{ch: make(chan string, 128)}
+	go func() {
+		defer close(f.ch)
+		r := bufio.NewReader(body)
+		var b strings.Builder
+		for {
+			line, err := r.ReadString('\n')
+			b.WriteString(line)
+			if line == "\n" || line == "\r\n" {
+				f.ch <- b.String()
+				b.Reset()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return f
+}
+
+// next returns the next SSE frame, or "" and false if the timeout elapses or the
+// stream ended before a frame arrived.
+func (f *sseFrames) next(timeout time.Duration) (string, bool) {
+	select {
+	case frame, ok := <-f.ch:
+		return frame, ok
+	case <-time.After(timeout):
+		return "", false
+	}
+}
+
+// sseFrameID extracts the integer id from an SSE frame's "id:" line.
+func sseFrameID(t *testing.T, frame string) uint64 {
+	t.Helper()
+	for _, line := range strings.Split(frame, "\n") {
+		if after, ok := strings.CutPrefix(line, "id:"); ok {
+			n, err := strconv.ParseUint(strings.TrimSpace(after), 10, 64)
+			if err != nil {
+				t.Fatalf("parse frame id from %q: %v", line, err)
+			}
+			return n
+		}
+	}
+	t.Fatalf("frame has no id line: %q", frame)
+	return 0
+}
+
+// sseFrameEnvelope decodes the api.Envelope carried on an SSE frame's "data:"
+// lines.
+func sseFrameEnvelope(t *testing.T, frame string) api.Envelope {
+	t.Helper()
+	var data strings.Builder
+	for _, line := range strings.Split(frame, "\n") {
+		if after, ok := strings.CutPrefix(line, "data:"); ok {
+			data.WriteString(strings.TrimPrefix(after, " "))
+		}
+	}
+	var env api.Envelope
+	if err := json.Unmarshal([]byte(data.String()), &env); err != nil {
+		t.Fatalf("decode envelope from frame %q: %v", frame, err)
+	}
+	return env
 }
 
 // ---------------------------------------------------------------------------
@@ -838,24 +932,30 @@ func TestEvents_SSEStream(t *testing.T) {
 	if cc := resp.Header.Get("Cache-Control"); cc != "no-cache" {
 		t.Errorf("Cache-Control = %q, want %q", cc, "no-cache")
 	}
+	if v := resp.Header.Get("X-Plexsphere-API-Version"); v == "" {
+		t.Error("X-Plexsphere-API-Version header is empty, want the served API version")
+	}
 
-	// Read at least one SSE event.
-	buf := make([]byte, 4096)
-	n, err := resp.Body.Read(buf)
-	if err != nil && err != io.EOF {
-		t.Fatalf("read SSE: %v", err)
+	// Tail-from-now: no unsolicited initial event arrives on connect.
+	frames := startSSEFrames(resp.Body)
+	if frame, ok := frames.next(300 * time.Millisecond); ok {
+		t.Errorf("unexpected unsolicited event on connect: %q", frame)
 	}
-	data := string(buf[:n])
 
-	// Verify SSE format: should contain event type, id, and data fields.
-	if !strings.Contains(data, "event:") {
-		t.Errorf("expected SSE event field, got: %q", data)
+	// An injected event is the first frame the client sees, well-formed: the
+	// first broadcast on a fresh server carries stream sequence 1.
+	envJSON, _ := json.Marshal(makeEnvelope("stream_test", "evt-stream-001", json.RawMessage(`{"k":"v"}`)))
+	injectResp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", string(envJSON))
+	injectResp.Body.Close()
+
+	frame, ok := frames.next(3 * time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for injected event")
 	}
-	if !strings.Contains(data, "data:") {
-		t.Errorf("expected SSE data field, got: %q", data)
-	}
-	if !strings.Contains(data, "id:") {
-		t.Errorf("expected SSE id field, got: %q", data)
+	for _, want := range []string{"id: 1", "event: stream_test", "data:"} {
+		if !strings.Contains(frame, want) {
+			t.Errorf("frame missing %q, got: %q", want, frame)
+		}
 	}
 }
 
@@ -898,6 +998,376 @@ func TestEvents_ClientDisconnect(t *testing.T) {
 	resp.Body.Close()
 
 	// If we got here without panicking, disconnect was handled gracefully.
+}
+
+// ---------------------------------------------------------------------------
+// Contract event stream: sequences, replay, descope (issue #25)
+// ---------------------------------------------------------------------------
+
+// mockVerifier registers against the mock and builds a real agent-side verifier
+// from the mock's advertised signing key id and public key.
+func mockVerifier(t *testing.T, baseURL string) *api.Ed25519Verifier {
+	t.Helper()
+	resp := doRequest(t, http.MethodPost, baseURL+"/v1/register", registerBody)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	var reg api.RegisterResponse
+	if err := json.NewDecoder(resp.Body).Decode(&reg); err != nil {
+		t.Fatalf("decode register: %v", err)
+	}
+	pub, err := base64.StdEncoding.DecodeString(reg.SigningPublicKey)
+	if err != nil {
+		t.Fatalf("decode signing public key: %v", err)
+	}
+	return api.NewEd25519Verifier(reg.SigningKeyID, ed25519.PublicKey(pub))
+}
+
+// configureEvents flips the mock's event stream mode via POST
+// /test/configure-events, failing the test on a non-204 answer.
+func configureEvents(t *testing.T, baseURL, mode string) {
+	t.Helper()
+	resp := doRequest(t, http.MethodPost, baseURL+"/test/configure-events", fmt.Sprintf(`{"mode":%q}`, mode))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-events %s status = %d, want %d", mode, resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+// TestEvents_InjectRoundTripVerifies proves the mock signs injected envelopes
+// with a key a real agent verifier accepts: the client supplies only
+// id/type/scope/payload and the mock stamps issued_at, key_id, and signature.
+func TestEvents_InjectRoundTripVerifies(t *testing.T) {
+	_, ts := newTestServer(t)
+	verifier := mockVerifier(t, ts.URL)
+
+	resp := connectSSE(t, ts.URL, "node-1", 5*time.Second)
+	defer resp.Body.Close()
+	frames := startSSEFrames(resp.Body)
+
+	body := `{"id":"evt-rt-001","type":"node_state_updated","scope":"node/n1","payload":{"ok":true}}`
+	injectResp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", body)
+	injectResp.Body.Close()
+	if injectResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("inject status = %d, want %d", injectResp.StatusCode, http.StatusNoContent)
+	}
+
+	frame, ok := frames.next(3 * time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for injected event")
+	}
+	env := sseFrameEnvelope(t, frame)
+	if env.KeyID == "" || env.Signature == "" {
+		t.Fatalf("mock did not stamp key_id/signature: %+v", env)
+	}
+	if err := verifier.Verify(context.Background(), env); err != nil {
+		t.Errorf("agent verifier rejected mock-signed envelope: %v", err)
+	}
+}
+
+// TestEvents_MonotonicSequences asserts consecutive broadcasts carry frame ids
+// 1, 2, 3.
+func TestEvents_MonotonicSequences(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := connectSSE(t, ts.URL, "node-1", 5*time.Second)
+	defer resp.Body.Close()
+	frames := startSSEFrames(resp.Body)
+
+	for i := 1; i <= 3; i++ {
+		r := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event",
+			fmt.Sprintf(`{"id":"evt-seq-%d","type":"seq_test","payload":{}}`, i))
+		r.Body.Close()
+	}
+	for want := uint64(1); want <= 3; want++ {
+		frame, ok := frames.next(3 * time.Second)
+		if !ok {
+			t.Fatalf("timed out waiting for frame %d", want)
+		}
+		if got := sseFrameID(t, frame); got != want {
+			t.Errorf("frame id = %d, want %d", got, want)
+		}
+	}
+}
+
+// TestEvents_RingCapDropsOldest broadcasts 70 envelopes with no clients and
+// asserts the replay ring holds exactly the last 64 (seq 7..70).
+func TestEvents_RingCapDropsOldest(t *testing.T) {
+	srv := mockapi.New()
+	srv.KeepAliveInterval = 10 * time.Second
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	for i := 1; i <= 70; i++ {
+		srv.BroadcastSSE(makeEnvelope("ring_test", fmt.Sprintf("evt-ring-%d", i), json.RawMessage(`{}`)))
+	}
+
+	resp := connectSSECursor(t, ts.URL, "node-1", "0", 5*time.Second)
+	defer resp.Body.Close()
+	frames := startSSEFrames(resp.Body)
+
+	for i := 0; i < eventRingReplayCount; i++ {
+		frame, ok := frames.next(3 * time.Second)
+		if !ok {
+			t.Fatalf("timed out after %d replayed frames", i)
+		}
+		if got, want := sseFrameID(t, frame), uint64(7+i); got != want {
+			t.Errorf("replayed frame %d seq = %d, want %d", i, got, want)
+		}
+	}
+	// The ring holds exactly 64 entries: no 65th replay frame arrives.
+	if frame, ok := frames.next(300 * time.Millisecond); ok {
+		t.Errorf("unexpected 65th replay frame: %q", frame)
+	}
+}
+
+// eventRingReplayCount mirrors the mock's ring capacity for the ring-cap test.
+const eventRingReplayCount = 64
+
+// TestEvents_RecordsWhileDescoped asserts a broadcast made while descoped is
+// still recorded and replays once the stream is restored.
+func TestEvents_RecordsWhileDescoped(t *testing.T) {
+	srv := mockapi.New()
+	srv.KeepAliveInterval = 10 * time.Second
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	configureEvents(t, ts.URL, "descoped")
+	srv.BroadcastSSE(makeEnvelope("descoped_record", "evt-descoped-001", json.RawMessage(`{}`)))
+	configureEvents(t, ts.URL, "streaming")
+
+	resp := connectSSECursor(t, ts.URL, "node-1", "0", 5*time.Second)
+	defer resp.Body.Close()
+	frames := startSSEFrames(resp.Body)
+
+	frame, ok := frames.next(3 * time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for the event recorded while descoped")
+	}
+	if !strings.Contains(frame, "descoped_record") {
+		t.Errorf("expected the descoped-broadcast event, got: %q", frame)
+	}
+	if got := sseFrameID(t, frame); got != 1 {
+		t.Errorf("replayed seq = %d, want 1", got)
+	}
+}
+
+// TestEvents_ReplayFromCursor asserts a Last-Event-ID cursor replays exactly the
+// buffered envelopes above it, in order, then continues live.
+func TestEvents_ReplayFromCursor(t *testing.T) {
+	srv := mockapi.New()
+	srv.KeepAliveInterval = 10 * time.Second
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	for i := 1; i <= 5; i++ {
+		srv.BroadcastSSE(makeEnvelope("replay_test", fmt.Sprintf("evt-replay-%d", i), json.RawMessage(`{}`)))
+	}
+
+	resp := connectSSECursor(t, ts.URL, "node-1", "2", 5*time.Second)
+	defer resp.Body.Close()
+	frames := startSSEFrames(resp.Body)
+
+	for want := uint64(3); want <= 5; want++ {
+		frame, ok := frames.next(3 * time.Second)
+		if !ok {
+			t.Fatalf("timed out waiting for replay frame %d", want)
+		}
+		if got := sseFrameID(t, frame); got != want {
+			t.Errorf("replay frame id = %d, want %d", got, want)
+		}
+	}
+
+	// Live delivery continues after replay: a fresh broadcast is seq 6.
+	srv.BroadcastSSE(makeEnvelope("replay_test", "evt-replay-live", json.RawMessage(`{}`)))
+	frame, ok := frames.next(3 * time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for the live event after replay")
+	}
+	if got := sseFrameID(t, frame); got != 6 {
+		t.Errorf("live frame id = %d, want 6", got)
+	}
+}
+
+// TestEvents_TailFromNow asserts that both an absent and an empty Last-Event-ID
+// header replay nothing.
+func TestEvents_TailFromNow(t *testing.T) {
+	tests := []struct {
+		name   string
+		header func(r *http.Request)
+	}{
+		{"absent_header", func(r *http.Request) {}},
+		{"empty_header", func(r *http.Request) { r.Header.Set("Last-Event-ID", "") }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := mockapi.New()
+			srv.KeepAliveInterval = 10 * time.Second
+			ts := httptest.NewServer(srv.Handler())
+			t.Cleanup(ts.Close)
+
+			// Buffer events the tail-from-now stream must NOT replay.
+			for i := 1; i <= 3; i++ {
+				srv.BroadcastSSE(makeEnvelope("tail_test", fmt.Sprintf("evt-tail-%d", i), json.RawMessage(`{}`)))
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/nodes/node-1/events", nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Accept", "text/event-stream")
+			tt.header(req)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("GET events: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+
+			frames := startSSEFrames(resp.Body)
+			if frame, ok := frames.next(300 * time.Millisecond); ok {
+				t.Errorf("tail-from-now replayed a buffered event: %q", frame)
+			}
+		})
+	}
+}
+
+// TestEvents_BadCursor asserts an unparseable or negative Last-Event-ID is a 400
+// problem+json without opening the stream.
+func TestEvents_BadCursor(t *testing.T) {
+	for _, cursor := range []string{"abc", "-1"} {
+		t.Run(cursor, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := connectSSECursor(t, ts.URL, "node-1", cursor, 3*time.Second)
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+				t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+			}
+			var problem map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			if problem["code"] != "invalid_cursor" {
+				t.Errorf("code = %v, want %q", problem["code"], "invalid_cursor")
+			}
+		})
+	}
+}
+
+// TestEvents_DescopedMode asserts descoping answers the spec's 501, tears down an
+// open stream, and that streaming restores 200.
+func TestEvents_DescopedMode(t *testing.T) {
+	srv := mockapi.New()
+	srv.KeepAliveInterval = 10 * time.Second
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	// An open stream in streaming mode is torn down when the mode flips.
+	openResp := connectSSE(t, ts.URL, "node-1", 10*time.Second)
+	defer openResp.Body.Close()
+
+	configureEvents(t, ts.URL, "descoped")
+
+	closed := make(chan struct{})
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			if _, err := openResp.Body.Read(buf); err != nil {
+				close(closed)
+				return
+			}
+		}
+	}()
+	select {
+	case <-closed:
+		// Stream closed as expected.
+	case <-time.After(3 * time.Second):
+		t.Error("open stream did not close after the descope flip")
+	}
+
+	// A new events request while descoped is the spec's 501.
+	descResp := connectSSE(t, ts.URL, "node-1", 3*time.Second)
+	defer descResp.Body.Close()
+	if descResp.StatusCode != http.StatusNotImplemented {
+		t.Errorf("descoped status = %d, want %d", descResp.StatusCode, http.StatusNotImplemented)
+	}
+	if ct := descResp.Header.Get("Content-Type"); ct != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+	}
+	var problem map[string]any
+	if err := json.NewDecoder(descResp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem["code"] != "signed_event_bus_not_provisioned" {
+		t.Errorf("code = %v, want %q", problem["code"], "signed_event_bus_not_provisioned")
+	}
+
+	// Flipping back to streaming restores a 200 stream.
+	configureEvents(t, ts.URL, "streaming")
+	okResp := connectSSE(t, ts.URL, "node-1", 3*time.Second)
+	defer okResp.Body.Close()
+	if okResp.StatusCode != http.StatusOK {
+		t.Errorf("restored status = %d, want %d", okResp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestConfigureEvents_Validation asserts strict validation of
+// POST /test/configure-events and its method-not-allowed fallback.
+func TestConfigureEvents_Validation(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		body       string
+		wantStatus int
+	}{
+		{"unknown_mode", http.MethodPost, `{"mode":"bogus"}`, http.StatusBadRequest},
+		{"malformed_body", http.MethodPost, "not-json", http.StatusBadRequest},
+		{"unknown_field", http.MethodPost, `{"mode":"streaming","extra":1}`, http.StatusBadRequest},
+		{"wrong_method", http.MethodGet, "", http.StatusMethodNotAllowed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, tt.method, ts.URL+"/test/configure-events", tt.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+		})
+	}
+}
+
+// TestEvents_RequestCountIncrements asserts every events request is counted,
+// including the bad-cursor 400 and descoped 501 answers.
+func TestEvents_RequestCountIncrements(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	// A bad cursor (400) counts.
+	badResp := connectSSECursor(t, ts.URL, "node-1", "abc", 3*time.Second)
+	badResp.Body.Close()
+
+	// Descoped answers (501) count.
+	configureEvents(t, ts.URL, "descoped")
+	for i := 0; i < 2; i++ {
+		resp := connectSSE(t, ts.URL, "node-1", 3*time.Second)
+		resp.Body.Close()
+	}
+
+	a := getAssertions(t, ts.URL)
+	if a.EventsRequestCount != 3 {
+		t.Errorf("events_request_count = %d, want 3 (1 bad-cursor 400 + 2 descoped 501)", a.EventsRequestCount)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3083,54 +3553,17 @@ func TestHandler_NotNil(t *testing.T) {
 // SSE broadcast / inject-event (Task 1.1)
 // ---------------------------------------------------------------------------
 
-// readSSEEvent reads the next SSE event from an SSE response body.
-// It returns the raw text of the event block (up to and including the blank line).
-func readSSEEvent(t *testing.T, body io.Reader, timeout time.Duration) string {
-	t.Helper()
-	ch := make(chan string, 1)
-	go func() {
-		buf := make([]byte, 8192)
-		var accumulated string
-		for {
-			n, err := body.Read(buf)
-			if n > 0 {
-				accumulated += string(buf[:n])
-			}
-			// An SSE event ends with a double newline.
-			if idx := strings.Index(accumulated, "\n\n"); idx >= 0 {
-				ch <- accumulated[:idx+2]
-				return
-			}
-			if err != nil {
-				ch <- accumulated
-				return
-			}
-		}
-	}()
-	select {
-	case data := <-ch:
-		return data
-	case <-time.After(timeout):
-		t.Fatal("timed out waiting for SSE event")
-		return ""
-	}
-}
-
 func TestInjectEvent_DeliversToConnectedClient(t *testing.T) {
 	srv := mockapi.New()
 	srv.KeepAliveInterval = 10 * time.Second // long interval so keep-alives don't interfere
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
-	// Connect an SSE client.
+	// Connect an SSE client. The stream tails from now, so nothing arrives until
+	// an event is injected.
 	resp := connectSSE(t, ts.URL, "node-1", 5*time.Second)
 	defer resp.Body.Close()
-
-	// Read the initial event (node_state_updated sent on connect).
-	initialEvt := readSSEEvent(t, resp.Body, 3*time.Second)
-	if !strings.Contains(initialEvt, "node_state_updated") {
-		t.Fatalf("expected initial node_state_updated event, got: %q", initialEvt)
-	}
+	frames := startSSEFrames(resp.Body)
 
 	// Inject an event via POST /test/inject-event.
 	envJSON, _ := json.Marshal(makeEnvelope("test_injected", "evt-inject-001", json.RawMessage(`{"action":"test"}`)))
@@ -3141,7 +3574,10 @@ func TestInjectEvent_DeliversToConnectedClient(t *testing.T) {
 	}
 
 	// Read the injected event from the SSE stream.
-	injectedEvt := readSSEEvent(t, resp.Body, 3*time.Second)
+	injectedEvt, ok := frames.next(3 * time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for injected event")
+	}
 	if !strings.Contains(injectedEvt, "test_injected") {
 		t.Errorf("expected injected event type, got: %q", injectedEvt)
 	}
@@ -3179,15 +3615,12 @@ func TestInjectEvent_MultipleClients(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
-	// Connect two SSE clients.
-	clients := make([]*http.Response, 2)
-	for i := range clients {
+	// Connect two SSE clients, each tailing from now.
+	readers := make([]*sseFrames, 2)
+	for i := range readers {
 		resp := connectSSE(t, ts.URL, "node-1", 5*time.Second)
 		defer resp.Body.Close()
-		clients[i] = resp
-
-		// Consume the initial event.
-		readSSEEvent(t, resp.Body, 3*time.Second)
+		readers[i] = startSSEFrames(resp.Body)
 	}
 
 	// Inject one event.
@@ -3196,8 +3629,11 @@ func TestInjectEvent_MultipleClients(t *testing.T) {
 	injectResp.Body.Close()
 
 	// Both clients should receive the event.
-	for i, c := range clients {
-		evt := readSSEEvent(t, c.Body, 3*time.Second)
+	for i, f := range readers {
+		evt, ok := f.next(3 * time.Second)
+		if !ok {
+			t.Fatalf("client %d: timed out waiting for event", i)
+		}
 		if !strings.Contains(evt, "multi_test") {
 			t.Errorf("client %d: expected multi_test event, got: %q", i, evt)
 		}
@@ -3449,18 +3885,19 @@ func TestBroadcastSSE_Programmatic(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
-	// Connect an SSE client.
+	// Connect an SSE client, tailing from now.
 	resp := connectSSE(t, ts.URL, "node-1", 5*time.Second)
 	defer resp.Body.Close()
-
-	// Consume initial event.
-	readSSEEvent(t, resp.Body, 3*time.Second)
+	frames := startSSEFrames(resp.Body)
 
 	// Use the Go API directly instead of the HTTP endpoint.
 	srv.BroadcastSSE(makeEnvelope("programmatic_test", "evt-prog-001", json.RawMessage(`{"via":"go_api"}`)))
 
 	// Read the broadcast event.
-	evt := readSSEEvent(t, resp.Body, 3*time.Second)
+	evt, ok := frames.next(3 * time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for broadcast event")
+	}
 	if !strings.Contains(evt, "programmatic_test") {
 		t.Errorf("expected programmatic_test event, got: %q", evt)
 	}
@@ -3882,12 +4319,11 @@ func TestConcurrent_InjectEventAndConfigureState(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
-	// Connect an SSE client so BroadcastSSE has a target.
+	// Connect an SSE client so BroadcastSSE has a target, draining frames in the
+	// background so the stream keeps flowing.
 	sseResp := connectSSE(t, ts.URL, "node-1", 10*time.Second)
 	defer sseResp.Body.Close()
-
-	// Drain the initial event.
-	readSSEEvent(t, sseResp.Body, 3*time.Second)
+	startSSEFrames(sseResp.Body)
 
 	const n = 50
 	var wg sync.WaitGroup

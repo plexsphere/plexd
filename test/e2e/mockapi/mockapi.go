@@ -61,6 +61,7 @@ type AssertionCounters struct {
 	SessionActivityCount    int64 `json:"session_activity_count"`
 	IntegrityViolationCount int64 `json:"integrity_violation_count"`
 	InjectEventCount        int64 `json:"inject_event_count"`
+	EventsRequestCount      int64 `json:"events_request_count"`
 	LocalMetricsCount       int64 `json:"local_metrics_count"`
 	LocalLogsCount          int64 `json:"local_logs_count"`
 	LocalAuditCount         int64 `json:"local_audit_count"`
@@ -99,11 +100,24 @@ type Server struct {
 	sessionActivityCount    atomic.Int64
 	integrityViolationCount atomic.Int64
 	injectEventCount        atomic.Int64
+	eventsRequestCount      atomic.Int64
 	localMetricsCount       atomic.Int64
 	localLogsCount          atomic.Int64
 	localAuditCount         atomic.Int64
 
-	sseClients sync.Map // map[uint64]chan api.Envelope
+	// Signed event stream state (issue #25), all guarded by eventsMu. Every
+	// broadcast envelope is assigned a monotonic stream sequence (the first is
+	// 1), appended to a bounded ring so a reconnecting client can replay from a
+	// Last-Event-ID cursor, and fanned out to the registered live clients. The
+	// ring records regardless of connected clients and regardless of descoped
+	// mode. eventsMode is "streaming" (default) or "descoped"; flipping to
+	// descoped closes every open stream through its done channel.
+	eventsMu      sync.Mutex
+	eventSeq      uint64
+	eventRing     []storedEvent
+	eventClients  map[uint64]*sseClient
+	eventClientID uint64
+	eventsMode    string
 
 	stateFixture   api.NodeStateSnapshot
 	stateFixtureMu sync.RWMutex
@@ -127,8 +141,6 @@ type Server struct {
 
 	lastRequests   map[string][]byte
 	lastRequestsMu sync.RWMutex
-
-	sseClientID atomic.Uint64
 
 	signingPrivateKey   ed25519.PrivateKey
 	signingPublicKeyB64 string
@@ -176,6 +188,8 @@ func New() *Server {
 		consumedNonces:      make(map[string]struct{}),
 		execStates:          make(map[string]string),
 		execUploads:         make(map[string]*execUpload),
+		eventClients:        make(map[uint64]*sseClient),
+		eventsMode:          eventsModeStreaming,
 		endpointTTL:         5 * time.Minute,
 		heartbeatFixture: api.HeartbeatResponse{
 			Reconcile:  true,
@@ -218,6 +232,7 @@ func (s *Server) Assertions() AssertionCounters {
 		SessionActivityCount:    s.sessionActivityCount.Load(),
 		IntegrityViolationCount: s.integrityViolationCount.Load(),
 		InjectEventCount:        s.injectEventCount.Load(),
+		EventsRequestCount:      s.eventsRequestCount.Load(),
 		LocalMetricsCount:       s.localMetricsCount.Load(),
 		LocalLogsCount:          s.localLogsCount.Load(),
 		LocalAuditCount:         s.localAuditCount.Load(),
@@ -344,6 +359,17 @@ const (
 	// mockSigningKeyID is the key id the mock stamps on every signed envelope and
 	// returns from register; the agent's verifier selects the signing key by it.
 	mockSigningKeyID = "did:web:plexsphere.com#key-e2e"
+	// mockAPIVersion is the value stamped in the X-Plexsphere-API-Version header
+	// on the events stream, matching the /v1 route prefix the mock serves.
+	mockAPIVersion = "v1"
+
+	// eventsModeStreaming serves the event stream normally; eventsModeDescoped
+	// makes the events endpoint answer the spec's 501 descope.
+	eventsModeStreaming = "streaming"
+	eventsModeDescoped  = "descoped"
+
+	// eventRingCap bounds the replay ring: beyond it the oldest entry is dropped.
+	eventRingCap = 64
 )
 
 var (
@@ -379,6 +405,21 @@ var fixtureRegisterPeers = []api.RegisterPeer{
 	},
 }
 
+// storedEvent is a broadcast envelope paired with its stream sequence, as held
+// in the replay ring and delivered to live clients.
+type storedEvent struct {
+	seq uint64
+	env api.Envelope
+}
+
+// sseClient is a registered live event stream. ch carries sequenced envelopes to
+// the handler's write loop; done is closed when a descope flip tears the stream
+// down.
+type sseClient struct {
+	ch   chan storedEvent
+	done chan struct{}
+}
+
 func (s *Server) registerRoutes() {
 	// Existing endpoints.
 	s.mux.HandleFunc("GET /v1/ping", s.handlePing)
@@ -412,6 +453,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /test/configure-heartbeat", s.handleConfigureHeartbeat)
 	s.mux.HandleFunc("POST /test/configure-endpoint", s.handleConfigureEndpoint)
 	s.mux.HandleFunc("POST /test/configure-secrets", s.handleConfigureSecrets)
+	s.mux.HandleFunc("POST /test/configure-events", s.handleConfigureEvents)
 	s.mux.HandleFunc("POST /test/inject-event", s.handleInjectEvent)
 	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
 
@@ -438,6 +480,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/test/configure-heartbeat", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-endpoint", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-secrets", methodNotAllowed)
+	s.mux.HandleFunc("/test/configure-events", methodNotAllowed)
 	s.mux.HandleFunc("/test/inject-event", methodNotAllowed)
 }
 
@@ -736,76 +779,122 @@ func (s *Server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, meta)
 }
 
-// handleEvents handles GET /v1/nodes/{id}/events (REQ-006).
-// Sends a single SSE event then sends keep-alive comments at KeepAliveInterval
-// until the client disconnects.
+// handleEvents handles GET /v1/nodes/{id}/events (REQ-006), the pull-only signed
+// event stream. It tails from now unless a Last-Event-ID cursor asks to replay
+// the buffered envelopes with a higher sequence, keeps the stream live until the
+// client disconnects, and honours the descope contract: when descoped it answers
+// the spec's 501 without opening a stream. Every request is counted, including
+// descoped and 400 answers.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
+	s.eventsRequestCount.Add(1)
+
+	// A descoped control plane answers the spec's 501 without opening a stream,
+	// ahead of any cursor parsing.
+	if s.descoped() {
+		writeProblem(w, r, http.StatusNotImplemented, "signed_event_bus_not_provisioned", "signed event bus not provisioned")
+		return
+	}
+
+	// Parse the Last-Event-ID cursor. An empty or absent header tails from now; a
+	// parseable non-negative integer replays the buffered envelopes above it;
+	// anything else is a 400 with no stream.
+	var cursor uint64
+	hasCursor := false
+	if raw := r.Header.Get("Last-Event-ID"); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 0 {
+			writeProblem(w, r, http.StatusBadRequest, "invalid_cursor", "Last-Event-ID must be a non-negative integer")
+			return
+		}
+		cursor = uint64(n)
+		hasCursor = true
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return
 	}
 
-	nodeID := r.PathValue("id")
-	envelope := api.Envelope{
-		Type:     api.EventNodeStateUpdated,
-		ID:       "evt-mock-001",
-		IssuedAt: time.Now().UTC(),
-		Payload:  json.RawMessage(fmt.Sprintf(`{"node_id":%q}`, nodeID)),
-	}
-	s.signEnvelope(&envelope)
-
-	data, err := json.Marshal(envelope)
-	if err != nil {
+	// Snapshot the replay set and register this client under one lock acquisition
+	// so no broadcast can slip between replay and live delivery. Re-check the mode
+	// here so a descope that races the request never leaves a stream open.
+	s.eventsMu.Lock()
+	if s.eventsMode == eventsModeDescoped {
+		s.eventsMu.Unlock()
+		writeProblem(w, r, http.StatusNotImplemented, "signed_event_bus_not_provisioned", "signed event bus not provisioned")
 		return
 	}
-
-	fmt.Fprintf(w, "id: %s\n", envelope.ID)
-	fmt.Fprintf(w, "event: %s\n", envelope.Type)
-	// Split data across SSE data lines if it contains newlines (it won't for JSON, but be safe).
-	for _, line := range strings.Split(string(data), "\n") {
-		fmt.Fprintf(w, "data: %s\n", line)
+	var replay []storedEvent
+	if hasCursor {
+		for _, ev := range s.eventRing {
+			if ev.seq > cursor {
+				replay = append(replay, ev)
+			}
+		}
 	}
-	fmt.Fprint(w, "\n")
+	s.eventClientID++
+	clientID := s.eventClientID
+	client := &sseClient{ch: make(chan storedEvent, eventRingCap), done: make(chan struct{})}
+	s.eventClients[clientID] = client
+	s.eventsMu.Unlock()
+
+	defer func() {
+		s.eventsMu.Lock()
+		delete(s.eventClients, clientID)
+		s.eventsMu.Unlock()
+	}()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Plexsphere-API-Version", mockAPIVersion)
+	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	// Register this client for broadcast events.
-	clientID := s.sseClientID.Add(1)
-	clientCh := make(chan api.Envelope, 16)
-	s.sseClients.Store(clientID, clientCh)
-	defer s.sseClients.Delete(clientID)
+	for _, ev := range replay {
+		writeSSEEvent(w, ev)
+	}
+	flusher.Flush()
 
-	// Send keep-alive comments at KeepAliveInterval until client disconnects.
-	// Also listen for injected events on the client channel.
+	// Keep-alive comments at KeepAliveInterval; live envelopes on the client
+	// channel; the stream ends on client disconnect or a descope flip.
 	ticker := time.NewTicker(s.KeepAliveInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-client.done:
+			return
 		case <-ticker.C:
 			if _, err := fmt.Fprint(w, ": keep-alive\n"); err != nil {
 				return
 			}
 			flusher.Flush()
-		case env := <-clientCh:
-			evtData, err := json.Marshal(env)
-			if err != nil {
-				return
-			}
-			fmt.Fprintf(w, "id: %s\n", env.ID)
-			fmt.Fprintf(w, "event: %s\n", env.Type)
-			for _, line := range strings.Split(string(evtData), "\n") {
-				fmt.Fprintf(w, "data: %s\n", line)
-			}
-			fmt.Fprint(w, "\n")
+		case ev := <-client.ch:
+			writeSSEEvent(w, ev)
 			flusher.Flush()
 		}
 	}
+}
+
+// writeSSEEvent writes one storedEvent as an SSE frame: an id line carrying the
+// stream sequence, the event type, the marshaled envelope across data lines, and
+// a terminating blank line. A marshal failure is logged and the frame skipped.
+func writeSSEEvent(w io.Writer, ev storedEvent) {
+	data, err := json.Marshal(ev.env)
+	if err != nil {
+		slog.Error("writeSSEEvent: marshal failed", "error", err)
+		return
+	}
+	fmt.Fprintf(w, "id: %d\n", ev.seq)
+	fmt.Fprintf(w, "event: %s\n", ev.env.Type)
+	// Split data across SSE data lines if it contains newlines (it won't for
+	// compact JSON, but be safe).
+	for _, line := range strings.Split(string(data), "\n") {
+		fmt.Fprintf(w, "data: %s\n", line)
+	}
+	fmt.Fprint(w, "\n")
 }
 
 // handleAssertions handles GET /test/assertions (REQ-007).
@@ -1761,17 +1850,76 @@ func (s *Server) handleConfigureSecrets(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// BroadcastSSE sends an SSE event to all connected SSE clients.
+// handleConfigureEvents handles POST /test/configure-events. It flips the event
+// stream between "streaming" (default) and "descoped" from a strict {"mode":...}
+// body. Descoping closes every open stream through its done channel and makes the
+// events endpoint answer the spec's 501; streaming restores normal service.
+// Decoding is strict and the mode is a closed enum: an unknown mode or malformed
+// body is a 400.
+func (s *Server) handleConfigureEvents(w http.ResponseWriter, r *http.Request) {
+	data, err := s.captureBody("configure_events", r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if body.Mode != eventsModeStreaming && body.Mode != eventsModeDescoped {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mode must be streaming or descoped"})
+		return
+	}
+
+	s.eventsMu.Lock()
+	s.eventsMode = body.Mode
+	if body.Mode == eventsModeDescoped {
+		for id, c := range s.eventClients {
+			close(c.done)
+			delete(s.eventClients, id)
+		}
+	}
+	s.eventsMu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// descoped reports whether the event stream is currently in descoped mode.
+func (s *Server) descoped() bool {
+	s.eventsMu.Lock()
+	defer s.eventsMu.Unlock()
+	return s.eventsMode == eventsModeDescoped
+}
+
+// BroadcastSSE assigns the next stream sequence to the envelope, records it in
+// the replay ring (dropping the oldest beyond eventRingCap), and fans it out to
+// every connected client non-blocking. Recording happens even with zero clients
+// and while descoped, so a later reconnect can replay from a cursor. A client
+// whose channel is full is skipped to avoid blocking the broadcaster.
 func (s *Server) BroadcastSSE(envelope api.Envelope) {
-	s.sseClients.Range(func(key, value any) bool {
-		ch := value.(chan api.Envelope)
+	s.eventsMu.Lock()
+	defer s.eventsMu.Unlock()
+
+	s.eventSeq++
+	ev := storedEvent{seq: s.eventSeq, env: envelope}
+	if len(s.eventRing) < eventRingCap {
+		s.eventRing = append(s.eventRing, ev)
+	} else {
+		copy(s.eventRing, s.eventRing[1:])
+		s.eventRing[eventRingCap-1] = ev
+	}
+
+	for _, c := range s.eventClients {
 		select {
-		case ch <- envelope:
+		case c.ch <- ev:
 		default:
 			// Client channel full, skip to avoid blocking.
 		}
-		return true
-	})
+	}
 }
 
 // handleInjectEvent handles POST /test/inject-event.
