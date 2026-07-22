@@ -15,11 +15,11 @@ import (
 // HandleSiteToSiteTunnelAssigned returns an api.EventHandler that adds a
 // site-to-site tunnel when a site_to_site_tunnel_assigned SSE event is received.
 func HandleSiteToSiteTunnelAssigned(mgr *SiteToSiteManager, logger *slog.Logger) api.EventHandler {
-	return func(_ context.Context, envelope api.SignedEnvelope) error {
+	return func(_ context.Context, envelope api.Envelope) error {
 		var tunnel api.SiteToSiteTunnel
 		if err := json.Unmarshal(envelope.Payload, &tunnel); err != nil {
 			logger.Error("site_to_site_tunnel_assigned: parse payload failed",
-				"event_id", envelope.EventID,
+				"event_id", envelope.ID,
 				"error", err,
 			)
 			return fmt.Errorf("bridge: site_to_site_tunnel_assigned: parse payload: %w", err)
@@ -35,13 +35,13 @@ func HandleSiteToSiteTunnelAssigned(mgr *SiteToSiteManager, logger *slog.Logger)
 // HandleSiteToSiteTunnelRevoked returns an api.EventHandler that removes a
 // site-to-site tunnel when a site_to_site_tunnel_revoked SSE event is received.
 func HandleSiteToSiteTunnelRevoked(mgr *SiteToSiteManager, logger *slog.Logger) api.EventHandler {
-	return func(_ context.Context, envelope api.SignedEnvelope) error {
+	return func(_ context.Context, envelope api.Envelope) error {
 		var payload struct {
 			TunnelID string `json:"tunnel_id"`
 		}
 		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
 			logger.Error("site_to_site_tunnel_revoked: parse payload failed",
-				"event_id", envelope.EventID,
+				"event_id", envelope.ID,
 				"error", err,
 			)
 			return fmt.Errorf("bridge: site_to_site_tunnel_revoked: parse payload: %w", err)
@@ -57,7 +57,7 @@ func HandleSiteToSiteTunnelRevoked(mgr *SiteToSiteManager, logger *slog.Logger) 
 // Follows the HandleBridgeConfigUpdated pattern: payload is ignored, reconcile
 // cycle will fetch the full desired state.
 func HandleSiteToSiteConfigUpdated(trigger ReconcileTrigger) api.EventHandler {
-	return func(_ context.Context, _ api.SignedEnvelope) error {
+	return func(_ context.Context, _ api.Envelope) error {
 		trigger.TriggerReconcile()
 		return nil
 	}

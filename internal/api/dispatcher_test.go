@@ -15,17 +15,17 @@ func TestDispatcher_RoutesToHandler(t *testing.T) {
 	d := NewEventDispatcher(logger)
 
 	var called bool
-	var received SignedEnvelope
+	var received Envelope
 
-	d.Register("peer_added", func(_ context.Context, env SignedEnvelope) error {
+	d.Register("peer_added", func(_ context.Context, env Envelope) error {
 		called = true
 		received = env
 		return nil
 	})
 
-	envelope := SignedEnvelope{
-		EventType: "peer_added",
-		EventID:   "evt_001",
+	envelope := Envelope{
+		Type: "peer_added",
+		ID:   "evt_001",
 	}
 
 	d.Dispatch(context.Background(), envelope)
@@ -33,11 +33,11 @@ func TestDispatcher_RoutesToHandler(t *testing.T) {
 	if !called {
 		t.Fatal("handler was not called")
 	}
-	if received.EventType != "peer_added" {
-		t.Fatalf("expected event_type %q, got %q", "peer_added", received.EventType)
+	if received.Type != "peer_added" {
+		t.Fatalf("expected event_type %q, got %q", "peer_added", received.Type)
 	}
-	if received.EventID != "evt_001" {
-		t.Fatalf("expected event_id %q, got %q", "evt_001", received.EventID)
+	if received.ID != "evt_001" {
+		t.Fatalf("expected event_id %q, got %q", "evt_001", received.ID)
 	}
 }
 
@@ -47,18 +47,18 @@ func TestDispatcher_MultipleHandlers(t *testing.T) {
 
 	var order []int
 
-	d.Register("policy_updated", func(_ context.Context, _ SignedEnvelope) error {
+	d.Register("policy_updated", func(_ context.Context, _ Envelope) error {
 		order = append(order, 1)
 		return errors.New("handler 1 failed")
 	})
-	d.Register("policy_updated", func(_ context.Context, _ SignedEnvelope) error {
+	d.Register("policy_updated", func(_ context.Context, _ Envelope) error {
 		order = append(order, 2)
 		return nil
 	})
 
-	envelope := SignedEnvelope{
-		EventType: "policy_updated",
-		EventID:   "evt_002",
+	envelope := Envelope{
+		Type: "policy_updated",
+		ID:   "evt_002",
 	}
 
 	d.Dispatch(context.Background(), envelope)
@@ -76,9 +76,9 @@ func TestDispatcher_UnhandledEventLogged(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	d := NewEventDispatcher(logger)
 
-	envelope := SignedEnvelope{
-		EventType: "unknown_event",
-		EventID:   "evt_003",
+	envelope := Envelope{
+		Type: "unknown_event",
+		ID:   "evt_003",
 	}
 
 	d.Dispatch(context.Background(), envelope)
@@ -102,18 +102,18 @@ func TestDispatcher_ErrorIsolation(t *testing.T) {
 
 	var firstCalled, secondCalled bool
 
-	d.Register("peer_removed", func(_ context.Context, _ SignedEnvelope) error {
+	d.Register("peer_removed", func(_ context.Context, _ Envelope) error {
 		firstCalled = true
 		return errors.New("first handler error")
 	})
-	d.Register("peer_removed", func(_ context.Context, _ SignedEnvelope) error {
+	d.Register("peer_removed", func(_ context.Context, _ Envelope) error {
 		secondCalled = true
 		return nil
 	})
 
-	envelope := SignedEnvelope{
-		EventType: "peer_removed",
-		EventID:   "evt_004",
+	envelope := Envelope{
+		Type: "peer_removed",
+		ID:   "evt_004",
 	}
 
 	d.Dispatch(context.Background(), envelope)
@@ -139,14 +139,14 @@ func TestDispatcher_ConcurrentRegisterAndDispatch(t *testing.T) {
 	var callCount atomic.Int64
 
 	// Pre-register a handler so dispatches have something to call.
-	d.Register("concurrent_event", func(_ context.Context, _ SignedEnvelope) error {
+	d.Register("concurrent_event", func(_ context.Context, _ Envelope) error {
 		callCount.Add(1)
 		return nil
 	})
 
-	envelope := SignedEnvelope{
-		EventType: "concurrent_event",
-		EventID:   "evt_005",
+	envelope := Envelope{
+		Type: "concurrent_event",
+		ID:   "evt_005",
 	}
 
 	// Concurrently register new handlers and dispatch events.
@@ -154,7 +154,7 @@ func TestDispatcher_ConcurrentRegisterAndDispatch(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			d.Register("concurrent_event", func(_ context.Context, _ SignedEnvelope) error {
+			d.Register("concurrent_event", func(_ context.Context, _ Envelope) error {
 				callCount.Add(1)
 				return nil
 			})

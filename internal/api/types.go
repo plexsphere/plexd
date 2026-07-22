@@ -40,8 +40,7 @@ type RegisterPeer struct {
 	FallbackEndpoint string `json:"fallback_endpoint,omitempty"`
 }
 
-// Peer is the WireGuard peer shape used only for SSE peer_* payloads
-// until issue #25 migrates that contract.
+// Peer is the internal WireGuard programming shape built by peerFromSnapshot.
 type Peer struct {
 	ID         string   `json:"id"`
 	PublicKey  string   `json:"public_key"`
@@ -149,10 +148,15 @@ type StateEntry struct {
 	WorkloadTag string `json:"workload_tag,omitempty"`
 }
 
-type SigningKeys struct {
-	Current           string     `json:"current"`
-	Previous          string     `json:"previous,omitempty"`
-	TransitionExpires *time.Time `json:"transition_expires,omitempty"`
+// SigningKeyRotation is the payload of the signing_key_rotated event: the new
+// current signing key and, optionally, the previous key id kept valid until a
+// transition deadline. Its shape is an author-approved assumption until the
+// platform taxonomy documents it.
+type SigningKeyRotation struct {
+	KeyID             string    `json:"key_id"`
+	PublicKey         string    `json:"public_key"`
+	PreviousKeyID     string    `json:"previous_key_id"`
+	TransitionExpires time.Time `json:"transition_expires"`
 }
 
 type DataEntry struct {

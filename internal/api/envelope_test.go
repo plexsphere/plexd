@@ -3,17 +3,19 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestSignedEnvelope_ParseValid(t *testing.T) {
+func TestParseEnvelope_Valid(t *testing.T) {
 	raw := `{
-		"event_type": "peer_added",
-		"event_id": "evt-001",
+		"id": "evt-001",
+		"type": "policy_updated",
+		"scope": "node:node-42",
+		"key_id": "kid-1",
 		"issued_at": "2025-01-15T10:30:00Z",
-		"nonce": "abc123",
-		"payload": {"peer_id": "node-42"},
+		"payload": {"revision_id": "rev-7"},
 		"signature": "sig-xyz"
 	}`
 
@@ -22,14 +24,17 @@ func TestSignedEnvelope_ParseValid(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if env.EventType != "peer_added" {
-		t.Errorf("EventType = %q, want %q", env.EventType, "peer_added")
+	if env.ID != "evt-001" {
+		t.Errorf("ID = %q, want %q", env.ID, "evt-001")
 	}
-	if env.EventID != "evt-001" {
-		t.Errorf("EventID = %q, want %q", env.EventID, "evt-001")
+	if env.Type != "policy_updated" {
+		t.Errorf("Type = %q, want %q", env.Type, "policy_updated")
 	}
-	if env.Nonce != "abc123" {
-		t.Errorf("Nonce = %q, want %q", env.Nonce, "abc123")
+	if env.Scope != "node:node-42" {
+		t.Errorf("Scope = %q, want %q", env.Scope, "node:node-42")
+	}
+	if env.KeyID != "kid-1" {
+		t.Errorf("KeyID = %q, want %q", env.KeyID, "kid-1")
 	}
 	if env.Signature != "sig-xyz" {
 		t.Errorf("Signature = %q, want %q", env.Signature, "sig-xyz")
@@ -39,54 +44,125 @@ func TestSignedEnvelope_ParseValid(t *testing.T) {
 		t.Errorf("IssuedAt = %v, want %v", env.IssuedAt, wantTime)
 	}
 
-	// Payload should be a json.RawMessage containing the object.
 	var payload map[string]string
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		t.Fatalf("failed to unmarshal payload: %v", err)
 	}
-	if payload["peer_id"] != "node-42" {
-		t.Errorf("payload[peer_id] = %q, want %q", payload["peer_id"], "node-42")
+	if payload["revision_id"] != "rev-7" {
+		t.Errorf("payload[revision_id] = %q, want %q", payload["revision_id"], "rev-7")
 	}
 }
 
-func TestSignedEnvelope_MissingEventType(t *testing.T) {
-	raw := `{"event_id": "evt-001"}`
-
-	_, err := ParseEnvelope([]byte(raw))
-	if err == nil {
-		t.Fatal("expected error for missing event_type, got nil")
+func TestParseEnvelope_Errors(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr string // exact when set
+		prefix  string // prefix when set
+	}{
+		{
+			name:    "missing id",
+			raw:     `{"type": "policy_updated"}`,
+			wantErr: `api: envelope: missing required field "id"`,
+		},
+		{
+			name:    "missing type",
+			raw:     `{"id": "evt-001"}`,
+			wantErr: `api: envelope: missing required field "type"`,
+		},
+		{
+			name:   "malformed json",
+			raw:    `{not json`,
+			prefix: "api: envelope: ",
+		},
+		{
+			name:   "empty input",
+			raw:    ``,
+			prefix: "api: envelope: ",
+		},
 	}
-	if got := err.Error(); !strContains(got, "event_type") {
-		t.Errorf("error = %q, want it to contain %q", got, "event_type")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseEnvelope([]byte(tt.raw))
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if tt.wantErr != "" && err.Error() != tt.wantErr {
+				t.Errorf("error = %q, want %q", err.Error(), tt.wantErr)
+			}
+			if tt.prefix != "" && !strings.HasPrefix(err.Error(), tt.prefix) {
+				t.Errorf("error = %q, want prefix %q", err.Error(), tt.prefix)
+			}
+		})
 	}
 }
 
-func TestSignedEnvelope_MissingEventID(t *testing.T) {
-	raw := `{"event_type": "peer_added"}`
-
-	_, err := ParseEnvelope([]byte(raw))
-	if err == nil {
-		t.Fatal("expected error for missing event_id, got nil")
+func TestCanonicalBytes_GoldenOrder(t *testing.T) {
+	env := Envelope{
+		ID:        "evt-001",
+		Type:      "policy_updated",
+		Scope:     "node:node-42",
+		KeyID:     "kid-1",
+		IssuedAt:  time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC),
+		Payload:   json.RawMessage(`{"revision_id":"rev-7"}`),
+		Signature: "sig-xyz", // must NOT appear in the canonical bytes
 	}
-	if got := err.Error(); !strContains(got, "event_id") {
-		t.Errorf("error = %q, want it to contain %q", got, "event_id")
+
+	got, err := CanonicalBytes(env)
+	if err != nil {
+		t.Fatalf("CanonicalBytes: %v", err)
+	}
+
+	want := `{"id":"evt-001","type":"policy_updated","scope":"node:node-42","key_id":"kid-1","issued_at":"2025-01-15T10:30:00Z","payload":{"revision_id":"rev-7"}}`
+	if string(got) != want {
+		t.Errorf("CanonicalBytes =\n  %s\nwant\n  %s", got, want)
+	}
+	if strings.Contains(string(got), "signature") || strings.Contains(string(got), "sig-xyz") {
+		t.Errorf("canonical bytes must not contain the signature: %s", got)
 	}
 }
 
-func TestSignedEnvelope_InvalidJSON(t *testing.T) {
-	_, err := ParseEnvelope([]byte(`{not json`))
-	if err == nil {
-		t.Fatal("expected error for invalid JSON, got nil")
+func TestCanonicalBytes_NilPayload(t *testing.T) {
+	env := Envelope{
+		ID:       "evt-nil",
+		Type:     "policy_updated",
+		IssuedAt: time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC),
+		Payload:  nil,
+	}
+
+	got, err := CanonicalBytes(env)
+	if err != nil {
+		t.Fatalf("CanonicalBytes: %v", err)
+	}
+	want := `{"id":"evt-nil","type":"policy_updated","scope":"","key_id":"","issued_at":"2025-01-15T10:30:00Z","payload":null}`
+	if string(got) != want {
+		t.Errorf("CanonicalBytes =\n  %s\nwant\n  %s", got, want)
+	}
+
+	// The full envelope round-trips: a nil Payload marshals as null and parses back.
+	wire, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	if !strings.Contains(string(wire), `"payload":null`) {
+		t.Errorf("marshaled envelope should contain payload:null, got %s", wire)
+	}
+	back, err := ParseEnvelope(wire)
+	if err != nil {
+		t.Fatalf("round-trip ParseEnvelope: %v", err)
+	}
+	if back.ID != env.ID || back.Type != env.Type {
+		t.Errorf("round-trip lost fields: got id=%q type=%q", back.ID, back.Type)
 	}
 }
 
 func TestNoOpVerifier_AcceptsAll(t *testing.T) {
 	v := NoOpVerifier{}
 
-	env := SignedEnvelope{
-		EventType: "peer_added",
-		EventID:   "evt-999",
-		Nonce:     "nonce",
+	env := Envelope{
+		ID:        "evt-999",
+		Type:      "peer_added",
 		Signature: "sig",
 	}
 
@@ -95,7 +171,7 @@ func TestNoOpVerifier_AcceptsAll(t *testing.T) {
 	}
 
 	// Also verify with a zero-value envelope.
-	if err := v.Verify(context.Background(), SignedEnvelope{}); err != nil {
+	if err := v.Verify(context.Background(), Envelope{}); err != nil {
 		t.Fatalf("NoOpVerifier.Verify() returned error for zero-value: %v", err)
 	}
 }
@@ -132,8 +208,8 @@ func TestEventTypeConstants(t *testing.T) {
 func TestParseEnvelope_PreservesPayload(t *testing.T) {
 	// The payload contains nested JSON that should be preserved as-is.
 	raw := `{
-		"event_type": "action_request",
-		"event_id": "evt-002",
+		"id": "evt-002",
+		"type": "action_request",
 		"payload": {"action": "restart", "params": {"timeout": 30}}
 	}`
 
@@ -142,13 +218,11 @@ func TestParseEnvelope_PreservesPayload(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Re-parse the preserved RawMessage.
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		t.Fatalf("failed to unmarshal payload: %v", err)
 	}
 
-	// Check nested value is preserved.
 	var action string
 	if err := json.Unmarshal(payload["action"], &action); err != nil {
 		t.Fatalf("failed to unmarshal action: %v", err)
@@ -157,7 +231,6 @@ func TestParseEnvelope_PreservesPayload(t *testing.T) {
 		t.Errorf("payload action = %q, want %q", action, "restart")
 	}
 
-	// Check nested object is preserved.
 	var params map[string]int
 	if err := json.Unmarshal(payload["params"], &params); err != nil {
 		t.Fatalf("failed to unmarshal params: %v", err)
@@ -169,10 +242,5 @@ func TestParseEnvelope_PreservesPayload(t *testing.T) {
 
 // strContains reports whether s contains substr.
 func strContains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(s, substr)
 }

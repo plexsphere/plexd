@@ -419,9 +419,9 @@ func TestProviderIntegration_ConcurrentAccessWithProvider(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			envelope := api.SignedEnvelope{
-				EventType: api.EventUserAccessConfigUpdated,
-				EventID:   "concurrent-config-evt",
+			envelope := api.Envelope{
+				Type: api.EventUserAccessConfigUpdated,
+				ID:   "concurrent-config-evt",
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}()
@@ -438,10 +438,10 @@ func TestProviderIntegration_ConcurrentAccessWithProvider(t *testing.T) {
 				Label:      fmt.Sprintf("sse-peer-%d", idx),
 			}
 			payload, _ := json.Marshal(peer)
-			envelope := api.SignedEnvelope{
-				EventType: api.EventUserAccessPeerAssigned,
-				EventID:   fmt.Sprintf("assign-evt-%d", idx),
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventUserAccessPeerAssigned,
+				ID:      fmt.Sprintf("assign-evt-%d", idx),
+				Payload: payload,
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}(i)
@@ -455,10 +455,10 @@ func TestProviderIntegration_ConcurrentAccessWithProvider(t *testing.T) {
 			payload, _ := json.Marshal(struct {
 				PublicKey string `json:"public_key"`
 			}{PublicKey: fmt.Sprintf("pk-sse-%d", idx)})
-			envelope := api.SignedEnvelope{
-				EventType: api.EventUserAccessPeerRevoked,
-				EventID:   fmt.Sprintf("revoke-evt-%d", idx),
-				Payload:   payload,
+			envelope := api.Envelope{
+				Type:    api.EventUserAccessPeerRevoked,
+				ID:      fmt.Sprintf("revoke-evt-%d", idx),
+				Payload: payload,
 			}
 			dispatcher.Dispatch(ctx, envelope)
 		}(i)

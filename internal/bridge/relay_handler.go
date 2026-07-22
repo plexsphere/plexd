@@ -14,11 +14,11 @@ import (
 // HandleRelaySessionAssigned returns an api.EventHandler that adds a relay
 // session when a relay_session_assigned SSE event is received.
 func HandleRelaySessionAssigned(relay *Relay, logger *slog.Logger) api.EventHandler {
-	return func(_ context.Context, envelope api.SignedEnvelope) error {
+	return func(_ context.Context, envelope api.Envelope) error {
 		var assignment api.RelaySessionAssignment
 		if err := json.Unmarshal(envelope.Payload, &assignment); err != nil {
 			logger.Error("relay_session_assigned: parse payload failed",
-				"event_id", envelope.EventID,
+				"event_id", envelope.ID,
 				"error", err,
 			)
 			return fmt.Errorf("bridge: relay_session_assigned: parse payload: %w", err)
@@ -34,13 +34,13 @@ func HandleRelaySessionAssigned(relay *Relay, logger *slog.Logger) api.EventHand
 // HandleRelaySessionRevoked returns an api.EventHandler that removes a relay
 // session when a relay_session_revoked SSE event is received.
 func HandleRelaySessionRevoked(relay *Relay, logger *slog.Logger) api.EventHandler {
-	return func(_ context.Context, envelope api.SignedEnvelope) error {
+	return func(_ context.Context, envelope api.Envelope) error {
 		var payload struct {
 			SessionID string `json:"session_id"`
 		}
 		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
 			logger.Error("relay_session_revoked: parse payload failed",
-				"event_id", envelope.EventID,
+				"event_id", envelope.ID,
 				"error", err,
 			)
 			return fmt.Errorf("bridge: relay_session_revoked: parse payload: %w", err)

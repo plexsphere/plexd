@@ -22,16 +22,16 @@ func (m *handlerMockVerifier) VerifyHook(_ context.Context, _, _, _ string) (boo
 	return m.ok, m.err
 }
 
-func makeEnvelope(t *testing.T, req api.ActionRequest) api.SignedEnvelope {
+func makeEnvelope(t *testing.T, req api.ActionRequest) api.Envelope {
 	t.Helper()
 	data, err := json.Marshal(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return api.SignedEnvelope{
-		EventType: api.EventActionRequest,
-		EventID:   "evt-" + req.ExecutionID,
-		Payload:   data,
+	return api.Envelope{
+		Type:    api.EventActionRequest,
+		ID:      "evt-" + req.ExecutionID,
+		Payload: data,
 	}
 }
 
@@ -109,10 +109,10 @@ func TestHandleActionRequest_MalformedPayload(t *testing.T) {
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 
 	handler := HandleActionRequest(exec, "node-1", discardLogger())
-	env := api.SignedEnvelope{
-		EventType: api.EventActionRequest,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage(`{invalid json`),
+	env := api.Envelope{
+		Type:    api.EventActionRequest,
+		ID:      "evt-bad",
+		Payload: json.RawMessage(`{invalid json`),
 	}
 
 	err := handler(context.Background(), env)

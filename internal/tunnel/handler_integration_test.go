@@ -283,10 +283,10 @@ func TestIntegration_MaxSessionsWithConcurrentSetups(t *testing.T) {
 				ExpiresAt:  time.Now().Add(30 * time.Second),
 			}
 			data, _ := json.Marshal(setup)
-			envelope := api.SignedEnvelope{
-				EventType: api.EventSSHSessionSetup,
-				EventID:   fmt.Sprintf("evt-concurrent-%d", idx),
-				Payload:   data,
+			envelope := api.Envelope{
+				Type:    api.EventSSHSessionSetup,
+				ID:      fmt.Sprintf("evt-concurrent-%d", idx),
+				Payload: data,
 			}
 
 			err := handler(context.Background(), envelope)

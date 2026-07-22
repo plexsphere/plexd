@@ -16,11 +16,10 @@ import (
 
 // makeEnvelopeSSE builds an SSE text block from the given event type and ID.
 func makeEnvelopeSSE(eventType, eventID string) string {
-	env := SignedEnvelope{
-		EventType: eventType,
-		EventID:   eventID,
+	env := Envelope{
+		Type:      eventType,
+		ID:        eventID,
 		IssuedAt:  time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
-		Nonce:     "n",
 		Payload:   json.RawMessage(`{}`),
 		Signature: "sig",
 	}
@@ -58,11 +57,11 @@ func TestManager_StartAndDispatch(t *testing.T) {
 	var added atomic.Int64
 	var removed atomic.Int64
 
-	mgr.RegisterHandler("peer_added", func(_ context.Context, env SignedEnvelope) error {
+	mgr.RegisterHandler("peer_added", func(_ context.Context, env Envelope) error {
 		added.Add(1)
 		return nil
 	})
-	mgr.RegisterHandler("peer_removed", func(_ context.Context, env SignedEnvelope) error {
+	mgr.RegisterHandler("peer_removed", func(_ context.Context, env Envelope) error {
 		removed.Add(1)
 		return nil
 	})
@@ -143,7 +142,7 @@ func TestManager_ReconnectWithLastEventID(t *testing.T) {
 	mgr.SetReconnectIntervals(1*time.Millisecond, 10*time.Millisecond)
 
 	var dispatched atomic.Int64
-	mgr.RegisterHandler("peer_added", func(_ context.Context, env SignedEnvelope) error {
+	mgr.RegisterHandler("peer_added", func(_ context.Context, env Envelope) error {
 		dispatched.Add(1)
 		return nil
 	})
@@ -331,9 +330,9 @@ func TestManager_RegisterHandlerBeforeStart(t *testing.T) {
 
 	var called atomic.Int64
 	// Register BEFORE Start
-	mgr.RegisterHandler("policy_updated", func(_ context.Context, env SignedEnvelope) error {
-		if env.EventID != "evt-50" {
-			t.Errorf("EventID = %q, want %q", env.EventID, "evt-50")
+	mgr.RegisterHandler("policy_updated", func(_ context.Context, env Envelope) error {
+		if env.ID != "evt-50" {
+			t.Errorf("EventID = %q, want %q", env.ID, "evt-50")
 		}
 		called.Add(1)
 		return nil

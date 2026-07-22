@@ -14,11 +14,11 @@ import (
 // HandleUserAccessPeerAssigned returns an api.EventHandler that adds a user
 // access peer when a user_access_peer_assigned SSE event is received.
 func HandleUserAccessPeerAssigned(mgr *UserAccessManager, logger *slog.Logger) api.EventHandler {
-	return func(_ context.Context, envelope api.SignedEnvelope) error {
+	return func(_ context.Context, envelope api.Envelope) error {
 		var peer api.UserAccessPeer
 		if err := json.Unmarshal(envelope.Payload, &peer); err != nil {
 			logger.Error("user_access_peer_assigned: parse payload failed",
-				"event_id", envelope.EventID,
+				"event_id", envelope.ID,
 				"error", err,
 			)
 			return fmt.Errorf("bridge: user_access_peer_assigned: parse payload: %w", err)
@@ -34,13 +34,13 @@ func HandleUserAccessPeerAssigned(mgr *UserAccessManager, logger *slog.Logger) a
 // HandleUserAccessPeerRevoked returns an api.EventHandler that removes a user
 // access peer when a user_access_peer_revoked SSE event is received.
 func HandleUserAccessPeerRevoked(mgr *UserAccessManager, logger *slog.Logger) api.EventHandler {
-	return func(_ context.Context, envelope api.SignedEnvelope) error {
+	return func(_ context.Context, envelope api.Envelope) error {
 		var payload struct {
 			PublicKey string `json:"public_key"`
 		}
 		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
 			logger.Error("user_access_peer_revoked: parse payload failed",
-				"event_id", envelope.EventID,
+				"event_id", envelope.ID,
 				"error", err,
 			)
 			return fmt.Errorf("bridge: user_access_peer_revoked: parse payload: %w", err)
@@ -56,7 +56,7 @@ func HandleUserAccessPeerRevoked(mgr *UserAccessManager, logger *slog.Logger) ap
 // Follows the HandleBridgeConfigUpdated pattern: payload is ignored, reconcile
 // cycle will fetch the full desired state.
 func HandleUserAccessConfigUpdated(trigger ReconcileTrigger) api.EventHandler {
-	return func(_ context.Context, _ api.SignedEnvelope) error {
+	return func(_ context.Context, _ api.Envelope) error {
 		trigger.TriggerReconcile()
 		return nil
 	}

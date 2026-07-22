@@ -14,11 +14,11 @@ import (
 // HandleIngressRuleAssigned returns an api.EventHandler that adds an ingress
 // rule when an ingress_rule_assigned SSE event is received.
 func HandleIngressRuleAssigned(mgr *IngressManager, logger *slog.Logger) api.EventHandler {
-	return func(_ context.Context, envelope api.SignedEnvelope) error {
+	return func(_ context.Context, envelope api.Envelope) error {
 		var rule api.IngressRule
 		if err := json.Unmarshal(envelope.Payload, &rule); err != nil {
 			logger.Error("ingress_rule_assigned: parse payload failed",
-				"event_id", envelope.EventID,
+				"event_id", envelope.ID,
 				"error", err,
 			)
 			return fmt.Errorf("bridge: ingress_rule_assigned: parse payload: %w", err)
@@ -34,13 +34,13 @@ func HandleIngressRuleAssigned(mgr *IngressManager, logger *slog.Logger) api.Eve
 // HandleIngressRuleRevoked returns an api.EventHandler that removes an ingress
 // rule when an ingress_rule_revoked SSE event is received.
 func HandleIngressRuleRevoked(mgr *IngressManager, logger *slog.Logger) api.EventHandler {
-	return func(_ context.Context, envelope api.SignedEnvelope) error {
+	return func(_ context.Context, envelope api.Envelope) error {
 		var payload struct {
 			RuleID string `json:"rule_id"`
 		}
 		if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
 			logger.Error("ingress_rule_revoked: parse payload failed",
-				"event_id", envelope.EventID,
+				"event_id", envelope.ID,
 				"error", err,
 			)
 			return fmt.Errorf("bridge: ingress_rule_revoked: parse payload: %w", err)
@@ -56,7 +56,7 @@ func HandleIngressRuleRevoked(mgr *IngressManager, logger *slog.Logger) api.Even
 // Follows the HandleBridgeConfigUpdated pattern: payload is ignored, reconcile
 // cycle will fetch the full desired state.
 func HandleIngressConfigUpdated(trigger ReconcileTrigger) api.EventHandler {
-	return func(_ context.Context, _ api.SignedEnvelope) error {
+	return func(_ context.Context, _ api.Envelope) error {
 		trigger.TriggerReconcile()
 		return nil
 	}

@@ -16,7 +16,7 @@ type ReconcileTrigger interface {
 // Follows the HandlePolicyUpdated pattern: payload is ignored, reconcile
 // cycle will fetch the full desired state.
 func HandleBridgeConfigUpdated(trigger ReconcileTrigger) api.EventHandler {
-	return func(_ context.Context, _ api.SignedEnvelope) error {
+	return func(_ context.Context, _ api.Envelope) error {
 		trigger.TriggerReconcile()
 		return nil
 	}

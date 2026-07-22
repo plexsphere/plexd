@@ -412,10 +412,10 @@ func TestServer_RegisterEventHandlers(t *testing.T) {
 		Metadata: map[string]string{"zone": "us-east-1"},
 	}
 	payloadJSON, _ := json.Marshal(payload)
-	env := api.SignedEnvelope{
-		EventType: api.EventNodeStateUpdated,
-		EventID:   "evt-1",
-		Payload:   payloadJSON,
+	env := api.Envelope{
+		Type:    api.EventNodeStateUpdated,
+		ID:      "evt-1",
+		Payload: payloadJSON,
 	}
 	dispatcher.Dispatch(ctx, env)
 
@@ -1056,10 +1056,10 @@ func TestServer_CacheUpdateFromEvents(t *testing.T) {
 		},
 	}
 	statePayloadJSON, _ := json.Marshal(statePayload)
-	dispatcher.Dispatch(ctx, api.SignedEnvelope{
-		EventType: api.EventNodeStateUpdated,
-		EventID:   "evt-state-1",
-		Payload:   statePayloadJSON,
+	dispatcher.Dispatch(ctx, api.Envelope{
+		Type:    api.EventNodeStateUpdated,
+		ID:      "evt-state-1",
+		Payload: statePayloadJSON,
 	})
 
 	// 2. Simulate node_secrets_updated event.
@@ -1070,10 +1070,10 @@ func TestServer_CacheUpdateFromEvents(t *testing.T) {
 		},
 	}
 	secretsPayloadJSON, _ := json.Marshal(secretsPayload)
-	dispatcher.Dispatch(ctx, api.SignedEnvelope{
-		EventType: api.EventNodeSecretsUpdated,
-		EventID:   "evt-secrets-1",
-		Payload:   secretsPayloadJSON,
+	dispatcher.Dispatch(ctx, api.Envelope{
+		Type:    api.EventNodeSecretsUpdated,
+		ID:      "evt-secrets-1",
+		Payload: secretsPayloadJSON,
 	})
 
 	// 3. Verify via HTTP endpoints that cache reflects the updates.

@@ -10,17 +10,17 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-func makeEnvelope(t *testing.T, eventType string, payload any) api.SignedEnvelope {
+func makeEnvelope(t *testing.T, eventType string, payload any) api.Envelope {
 	t.Helper()
 	data, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return api.SignedEnvelope{
-		EventType: eventType,
-		EventID:   "test-event-1",
-		IssuedAt:  time.Now(),
-		Payload:   data,
+	return api.Envelope{
+		Type:     eventType,
+		ID:       "test-event-1",
+		IssuedAt: time.Now(),
+		Payload:  data,
 	}
 }
 
@@ -104,11 +104,11 @@ func TestEventHandler_MalformedPayload(t *testing.T) {
 	}
 	logger := slog.Default()
 
-	env := api.SignedEnvelope{
-		EventType: api.EventNodeStateUpdated,
-		EventID:   "test-bad-1",
-		IssuedAt:  time.Now(),
-		Payload:   json.RawMessage(`{not valid json`),
+	env := api.Envelope{
+		Type:     api.EventNodeStateUpdated,
+		ID:       "test-bad-1",
+		IssuedAt: time.Now(),
+		Payload:  json.RawMessage(`{not valid json`),
 	}
 
 	err := HandleNodeStateUpdated(cache, logger, env)
@@ -131,11 +131,11 @@ func TestEventHandler_NodeSecretsUpdated_MalformedPayload(t *testing.T) {
 	}
 	logger := slog.Default()
 
-	env := api.SignedEnvelope{
-		EventType: api.EventNodeSecretsUpdated,
-		EventID:   "test-bad-2",
-		IssuedAt:  time.Now(),
-		Payload:   json.RawMessage(`<<<broken`),
+	env := api.Envelope{
+		Type:     api.EventNodeSecretsUpdated,
+		ID:       "test-bad-2",
+		IssuedAt: time.Now(),
+		Payload:  json.RawMessage(`<<<broken`),
 	}
 
 	err := HandleNodeSecretsUpdated(cache, logger, env)

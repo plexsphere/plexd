@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
@@ -110,89 +112,62 @@ func TestBuildHeartbeatRequest(t *testing.T) {
 	})
 }
 
-func TestDecodeSigningKeys_CurrentOnly(t *testing.T) {
-	pub, _, err := ed25519.GenerateKey(nil)
+// signRotationEnvelope builds an envelope signed over its canonical bytes with
+// the given key and key id, used to prove which key the verifier accepts.
+func signRotationEnvelope(t *testing.T, priv ed25519.PrivateKey, keyID string) api.Envelope {
+	t.Helper()
+	env := api.Envelope{
+		ID:       "evt-rot-1",
+		Type:     api.EventPolicyUpdated,
+		KeyID:    keyID,
+		IssuedAt: time.Now().UTC(),
+		Payload:  json.RawMessage(`{}`),
+	}
+	canonical, err := api.CanonicalBytes(env)
+	if err != nil {
+		t.Fatalf("canonical bytes: %v", err)
+	}
+	env.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, canonical))
+	return env
+}
+
+func TestSigningKeyRotatedHandler(t *testing.T) {
+	oldPub, oldPriv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded := base64.StdEncoding.EncodeToString(pub)
-	logger := slog.Default()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	keys := api.SigningKeys{Current: encoded}
-	current, previous, expires := decodeSigningKeys(keys, logger)
+	t.Run("valid rotation installs new key id", func(t *testing.T) {
+		verifier := api.NewEd25519Verifier("kid-old", oldPub)
+		newPub, newPriv, err := ed25519.GenerateKey(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rot := api.SigningKeyRotation{
+			KeyID:     "kid-new",
+			PublicKey: base64.StdEncoding.EncodeToString(newPub),
+		}
+		payload, err := json.Marshal(rot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := signingKeyRotatedHandler(verifier, logger)(context.Background(), api.Envelope{Payload: payload}); err != nil {
+			t.Fatalf("handler returned error: %v", err)
+		}
+		if err := verifier.Verify(context.Background(), signRotationEnvelope(t, newPriv, "kid-new")); err != nil {
+			t.Errorf("envelope under new kid failed to verify: %v", err)
+		}
+	})
 
-	if len(current) != ed25519.PublicKeySize {
-		t.Errorf("current key length = %d, want %d", len(current), ed25519.PublicKeySize)
-	}
-	if len(previous) != 0 {
-		t.Errorf("previous key should be nil, got len %d", len(previous))
-	}
-	if !expires.IsZero() {
-		t.Errorf("expires should be zero, got %v", expires)
-	}
-}
-
-func TestDecodeSigningKeys_WithPreviousAndExpiry(t *testing.T) {
-	pub1, _, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pub2, _, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	now := time.Now().Add(time.Hour)
-	keys := api.SigningKeys{
-		Current:           base64.StdEncoding.EncodeToString(pub1),
-		Previous:          base64.StdEncoding.EncodeToString(pub2),
-		TransitionExpires: &now,
-	}
-	logger := slog.Default()
-
-	current, previous, expires := decodeSigningKeys(keys, logger)
-
-	if len(current) != ed25519.PublicKeySize {
-		t.Errorf("current key length = %d, want %d", len(current), ed25519.PublicKeySize)
-	}
-	if len(previous) != ed25519.PublicKeySize {
-		t.Errorf("previous key length = %d, want %d", len(previous), ed25519.PublicKeySize)
-	}
-	if !expires.Equal(now) {
-		t.Errorf("expires = %v, want %v", expires, now)
-	}
-}
-
-func TestDecodeSigningKeys_InvalidBase64(t *testing.T) {
-	keys := api.SigningKeys{
-		Current:  "not-valid-base64!",
-		Previous: "also-invalid!!",
-	}
-	logger := slog.Default()
-
-	current, previous, _ := decodeSigningKeys(keys, logger)
-
-	if len(current) != 0 {
-		t.Errorf("current should be nil for invalid base64, got len %d", len(current))
-	}
-	if len(previous) != 0 {
-		t.Errorf("previous should be nil for invalid base64, got len %d", len(previous))
-	}
-}
-
-func TestDecodeSigningKeys_Empty(t *testing.T) {
-	keys := api.SigningKeys{}
-	logger := slog.Default()
-
-	current, previous, expires := decodeSigningKeys(keys, logger)
-
-	if len(current) != 0 {
-		t.Errorf("current should be nil for empty keys, got len %d", len(current))
-	}
-	if len(previous) != 0 {
-		t.Errorf("previous should be nil for empty keys, got len %d", len(previous))
-	}
-	if !expires.IsZero() {
-		t.Errorf("expires should be zero for empty keys, got %v", expires)
-	}
+	t.Run("malformed payload leaves keys unchanged", func(t *testing.T) {
+		verifier := api.NewEd25519Verifier("kid-old", oldPub)
+		err := signingKeyRotatedHandler(verifier, logger)(context.Background(), api.Envelope{Payload: json.RawMessage(`not-json`)})
+		if err == nil {
+			t.Fatal("expected wrapped error for malformed payload, got nil")
+		}
+		if err := verifier.Verify(context.Background(), signRotationEnvelope(t, oldPriv, "kid-old")); err != nil {
+			t.Errorf("envelope under old kid failed to verify after malformed rotation: %v", err)
+		}
+	})
 }

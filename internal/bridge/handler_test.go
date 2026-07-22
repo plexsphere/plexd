@@ -26,10 +26,10 @@ func TestHandleBridgeConfigUpdated(t *testing.T) {
 
 	handler := HandleBridgeConfigUpdated(mock)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventBridgeConfigUpdated,
-		EventID:   "evt-1",
-		Payload:   json.RawMessage(`{"access_subnets":["10.0.0.0/24"]}`),
+	envelope := api.Envelope{
+		Type:    api.EventBridgeConfigUpdated,
+		ID:      "evt-1",
+		Payload: json.RawMessage(`{"access_subnets":["10.0.0.0/24"]}`),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -46,10 +46,10 @@ func TestHandleBridgeConfigUpdated_MalformedPayload(t *testing.T) {
 
 	handler := HandleBridgeConfigUpdated(mock)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventBridgeConfigUpdated,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventBridgeConfigUpdated,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)

@@ -13,22 +13,22 @@ import (
 // Test helpers
 // ---------------------------------------------------------------------------
 
-// peerAssignmentEnvelope builds a SignedEnvelope for a user access peer assignment.
-func peerAssignmentEnvelope(t *testing.T, peer api.UserAccessPeer) api.SignedEnvelope {
+// peerAssignmentEnvelope builds an Envelope for a user access peer assignment.
+func peerAssignmentEnvelope(t *testing.T, peer api.UserAccessPeer) api.Envelope {
 	t.Helper()
 	payload, err := json.Marshal(peer)
 	if err != nil {
 		t.Fatalf("marshal peer: %v", err)
 	}
-	return api.SignedEnvelope{
-		EventType: api.EventUserAccessPeerAssigned,
-		EventID:   "evt-assign-" + peer.PublicKey,
-		Payload:   payload,
+	return api.Envelope{
+		Type:    api.EventUserAccessPeerAssigned,
+		ID:      "evt-assign-" + peer.PublicKey,
+		Payload: payload,
 	}
 }
 
-// peerRevocationEnvelope builds a SignedEnvelope for a user access peer revocation.
-func peerRevocationEnvelope(t *testing.T, publicKey string) api.SignedEnvelope {
+// peerRevocationEnvelope builds an Envelope for a user access peer revocation.
+func peerRevocationEnvelope(t *testing.T, publicKey string) api.Envelope {
 	t.Helper()
 	payload, err := json.Marshal(struct {
 		PublicKey string `json:"public_key"`
@@ -36,10 +36,10 @@ func peerRevocationEnvelope(t *testing.T, publicKey string) api.SignedEnvelope {
 	if err != nil {
 		t.Fatalf("marshal revocation: %v", err)
 	}
-	return api.SignedEnvelope{
-		EventType: api.EventUserAccessPeerRevoked,
-		EventID:   "evt-revoke-" + publicKey,
-		Payload:   payload,
+	return api.Envelope{
+		Type:    api.EventUserAccessPeerRevoked,
+		ID:      "evt-revoke-" + publicKey,
+		Payload: payload,
 	}
 }
 
@@ -79,8 +79,8 @@ func TestHandleUserAccessPeerAssigned_Success(t *testing.T) {
 	peer := api.UserAccessPeer{
 		PublicKey:  "pk-1",
 		AllowedIPs: []string{"10.99.0.1/32"},
-		PSK:       "psk-1",
-		Label:     "alice",
+		PSK:        "psk-1",
+		Label:      "alice",
 	}
 	envelope := peerAssignmentEnvelope(t, peer)
 
@@ -110,10 +110,10 @@ func TestHandleUserAccessPeerAssigned_MalformedPayload(t *testing.T) {
 
 	handler := HandleUserAccessPeerAssigned(mgr, discardLogger())
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventUserAccessPeerAssigned,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventUserAccessPeerAssigned,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -132,7 +132,7 @@ func TestHandleUserAccessPeerAssigned_DuplicatePeer(t *testing.T) {
 	peer := api.UserAccessPeer{
 		PublicKey:  "pk-dup",
 		AllowedIPs: []string{"10.99.0.1/32"},
-		Label:     "alice",
+		Label:      "alice",
 	}
 	envelope := peerAssignmentEnvelope(t, peer)
 
@@ -164,7 +164,7 @@ func TestHandleUserAccessPeerRevoked_Success(t *testing.T) {
 	peer := api.UserAccessPeer{
 		PublicKey:  "pk-revoke",
 		AllowedIPs: []string{"10.99.0.1/32"},
-		Label:     "alice",
+		Label:      "alice",
 	}
 	if err := assignHandler(context.Background(), peerAssignmentEnvelope(t, peer)); err != nil {
 		t.Fatalf("assign: %v", err)
@@ -192,10 +192,10 @@ func TestHandleUserAccessPeerRevoked_MalformedPayload(t *testing.T) {
 
 	handler := HandleUserAccessPeerRevoked(mgr, discardLogger())
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventUserAccessPeerRevoked,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventUserAccessPeerRevoked,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -228,10 +228,10 @@ func TestHandleUserAccessConfigUpdated(t *testing.T) {
 
 	handler := HandleUserAccessConfigUpdated(mock)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventUserAccessConfigUpdated,
-		EventID:   "evt-1",
-		Payload:   json.RawMessage(`{"enabled":true}`),
+	envelope := api.Envelope{
+		Type:    api.EventUserAccessConfigUpdated,
+		ID:      "evt-1",
+		Payload: json.RawMessage(`{"enabled":true}`),
 	}
 
 	err := handler(context.Background(), envelope)
@@ -248,10 +248,10 @@ func TestHandleUserAccessConfigUpdated_MalformedPayload(t *testing.T) {
 
 	handler := HandleUserAccessConfigUpdated(mock)
 
-	envelope := api.SignedEnvelope{
-		EventType: api.EventUserAccessConfigUpdated,
-		EventID:   "evt-bad",
-		Payload:   json.RawMessage("not valid json"),
+	envelope := api.Envelope{
+		Type:    api.EventUserAccessConfigUpdated,
+		ID:      "evt-bad",
+		Payload: json.RawMessage("not valid json"),
 	}
 
 	err := handler(context.Background(), envelope)

@@ -85,7 +85,7 @@ func ReconcileHandler(enforcer *Enforcer, iface string) reconcile.ReconcileHandl
 // HandlePolicyUpdated returns an api.EventHandler that triggers reconciliation
 // when a policy_updated SSE event is received.
 func HandlePolicyUpdated(trigger ReconcileTrigger) api.EventHandler {
-	return func(_ context.Context, _ api.SignedEnvelope) error {
+	return func(_ context.Context, _ api.Envelope) error {
 		trigger.TriggerReconcile()
 		return nil
 	}

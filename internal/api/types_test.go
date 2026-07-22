@@ -1337,6 +1337,46 @@ func TestTypesSiteToSiteInfo(t *testing.T) {
 	requireEqual(t, orig, got)
 }
 
+// TestSigningKeyRotation_JSONDecode proves the signing_key_rotated payload
+// decodes from the contract's snake_case keys into every field.
+func TestSigningKeyRotation_JSONDecode(t *testing.T) {
+	raw := `{
+		"key_id": "kid-new",
+		"public_key": "cHVia2V5LWJhc2U2NA==",
+		"previous_key_id": "kid-old",
+		"transition_expires": "2025-01-15T10:30:00Z"
+	}`
+
+	var rot SigningKeyRotation
+	if err := json.Unmarshal([]byte(raw), &rot); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if rot.KeyID != "kid-new" {
+		t.Errorf("KeyID = %q, want %q", rot.KeyID, "kid-new")
+	}
+	if rot.PublicKey != "cHVia2V5LWJhc2U2NA==" {
+		t.Errorf("PublicKey = %q, want %q", rot.PublicKey, "cHVia2V5LWJhc2U2NA==")
+	}
+	if rot.PreviousKeyID != "kid-old" {
+		t.Errorf("PreviousKeyID = %q, want %q", rot.PreviousKeyID, "kid-old")
+	}
+	wantTime := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
+	if !rot.TransitionExpires.Equal(wantTime) {
+		t.Errorf("TransitionExpires = %v, want %v", rot.TransitionExpires, wantTime)
+	}
+
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &keys); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"key_id", "public_key", "previous_key_id", "transition_expires"} {
+		if _, ok := keys[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
 func TestLocalEndpointConfig_Validate(t *testing.T) {
 	tests := []struct {
 		name       string

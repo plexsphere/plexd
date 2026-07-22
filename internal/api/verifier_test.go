@@ -10,28 +10,23 @@ import (
 	"time"
 )
 
-// signEnvelope creates a valid SignedEnvelope signed with the given private key.
-func signEnvelope(t *testing.T, priv ed25519.PrivateKey, eventType, eventID, nonce string, issuedAt time.Time, payload json.RawMessage) SignedEnvelope {
+// signEnvelope returns an envelope signed over its canonical bytes with priv,
+// carrying the given key id, issued_at and payload.
+func signEnvelope(t *testing.T, priv ed25519.PrivateKey, keyID string, issuedAt time.Time, payload json.RawMessage) Envelope {
 	t.Helper()
-	canonical, err := json.Marshal(canonicalEnvelope{
-		EventType: eventType,
-		EventID:   eventID,
-		IssuedAt:  issuedAt,
-		Nonce:     nonce,
-		Payload:   payload,
-	})
+	env := Envelope{
+		ID:       "evt-001",
+		Type:     "policy_updated",
+		KeyID:    keyID,
+		IssuedAt: issuedAt,
+		Payload:  payload,
+	}
+	canonical, err := CanonicalBytes(env)
 	if err != nil {
-		t.Fatalf("marshal canonical: %v", err)
+		t.Fatalf("canonical bytes: %v", err)
 	}
-	sig := ed25519.Sign(priv, canonical)
-	return SignedEnvelope{
-		EventType: eventType,
-		EventID:   eventID,
-		IssuedAt:  issuedAt,
-		Nonce:     nonce,
-		Payload:   payload,
-		Signature: base64.StdEncoding.EncodeToString(sig),
-	}
+	env.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, canonical))
+	return env
 }
 
 func generateKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
@@ -45,273 +40,245 @@ func generateKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 
 func TestEd25519Verifier_ValidSignature(t *testing.T) {
 	pub, priv := generateKey(t)
-	v := NewEd25519Verifier(pub)
+	v := NewEd25519Verifier("kid-1", pub)
 
-	env := signEnvelope(t, priv, "peer_added", "evt-001", "nonce-1", time.Now(), json.RawMessage(`{"peer_id":"node-1"}`))
+	env := signEnvelope(t, priv, "kid-1", time.Now(), json.RawMessage(`{"peer_id":"node-1"}`))
 	if err := v.Verify(context.Background(), env); err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
 }
 
-func TestEd25519Verifier_InvalidSignature(t *testing.T) {
+func TestEd25519Verifier_TamperedPayload(t *testing.T) {
 	pub, priv := generateKey(t)
-	v := NewEd25519Verifier(pub)
+	v := NewEd25519Verifier("kid-1", pub)
 
-	env := signEnvelope(t, priv, "peer_added", "evt-001", "nonce-1", time.Now(), json.RawMessage(`{"peer_id":"node-1"}`))
-	// Tamper with the payload after signing.
+	env := signEnvelope(t, priv, "kid-1", time.Now(), json.RawMessage(`{"peer_id":"node-1"}`))
 	env.Payload = json.RawMessage(`{"peer_id":"node-2"}`)
 
 	err := v.Verify(context.Background(), env)
 	if err == nil {
 		t.Fatal("expected error for tampered envelope, got nil")
 	}
-	if !strContains(err.Error(), "signature verification failed") {
-		t.Errorf("error = %q, want it to contain %q", err.Error(), "signature verification failed")
+	if err.Error() != "api: verifier: signature verification failed" {
+		t.Errorf("error = %q, want %q", err.Error(), "api: verifier: signature verification failed")
 	}
 }
 
-func TestEd25519Verifier_MissingSignature(t *testing.T) {
-	pub, _ := generateKey(t)
-	v := NewEd25519Verifier(pub)
-
-	env := SignedEnvelope{
-		EventType: "peer_added",
-		EventID:   "evt-001",
-		IssuedAt:  time.Now(),
-		Nonce:     "nonce-1",
-		Payload:   json.RawMessage(`{}`),
-		Signature: "",
-	}
-
-	err := v.Verify(context.Background(), env)
-	if err == nil {
-		t.Fatal("expected error for missing signature, got nil")
-	}
-	if !strContains(err.Error(), "missing signature") {
-		t.Errorf("error = %q, want it to contain %q", err.Error(), "missing signature")
-	}
-}
-
-func TestEd25519Verifier_CanonicalJSON(t *testing.T) {
+func TestEd25519Verifier_UnknownAndEmptyKeyID(t *testing.T) {
 	pub, priv := generateKey(t)
-	v := NewEd25519Verifier(pub)
+	v := NewEd25519Verifier("kid-1", pub)
 
-	now := time.Now()
-	payload := json.RawMessage(`{"b":2,"a":1}`)
-
-	env := signEnvelope(t, priv, "peer_added", "evt-001", "nonce-canonical", now, payload)
-	if err := v.Verify(context.Background(), env); err != nil {
-		t.Fatalf("expected nil error, got: %v", err)
+	tests := []struct {
+		name  string
+		keyID string
+	}{
+		{"unknown key id", "kid-unknown"},
+		{"empty key id", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := signEnvelope(t, priv, tt.keyID, time.Now(), json.RawMessage(`{}`))
+			err := v.Verify(context.Background(), env)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if err.Error() != "api: verifier: unknown signing key id" {
+				t.Errorf("error = %q, want %q", err.Error(), "api: verifier: unknown signing key id")
+			}
+		})
 	}
 }
 
-func TestEd25519Verifier_StaleEvent(t *testing.T) {
-	pub, priv := generateKey(t)
-	v := NewEd25519Verifier(pub)
-
-	staleTime := time.Now().Add(-6 * time.Minute)
-	env := signEnvelope(t, priv, "peer_added", "evt-001", "nonce-stale", staleTime, json.RawMessage(`{}`))
-
-	err := v.Verify(context.Background(), env)
-	if err == nil {
-		t.Fatal("expected error for stale event, got nil")
-	}
-	if !strContains(err.Error(), "stale") {
-		t.Errorf("error = %q, want it to contain %q", err.Error(), "stale")
-	}
-}
-
-func TestEd25519Verifier_DuplicateNonce(t *testing.T) {
-	pub, priv := generateKey(t)
-	v := NewEd25519Verifier(pub)
-
-	now := time.Now()
-	env1 := signEnvelope(t, priv, "peer_added", "evt-001", "nonce-dup", now, json.RawMessage(`{}`))
-	env2 := signEnvelope(t, priv, "peer_added", "evt-002", "nonce-dup", now, json.RawMessage(`{}`))
-
-	if err := v.Verify(context.Background(), env1); err != nil {
-		t.Fatalf("first verify failed: %v", err)
-	}
-
-	err := v.Verify(context.Background(), env2)
-	if err == nil {
-		t.Fatal("expected error for duplicate nonce, got nil")
-	}
-	if !strContains(err.Error(), "nonce") {
-		t.Errorf("error = %q, want it to contain %q", err.Error(), "nonce")
-	}
-}
-
-func TestEd25519Verifier_EmptyNonce(t *testing.T) {
-	pub, _ := generateKey(t)
-	v := NewEd25519Verifier(pub)
-
-	env := SignedEnvelope{
-		EventType: "peer_added",
-		EventID:   "evt-001",
-		IssuedAt:  time.Now(),
-		Nonce:     "",
-		Payload:   json.RawMessage(`{}`),
-		Signature: "c29tZXNpZw==",
-	}
-
-	err := v.Verify(context.Background(), env)
-	if err == nil {
-		t.Fatal("expected error for empty nonce, got nil")
-	}
-	if !strContains(err.Error(), "missing nonce") {
-		t.Errorf("error = %q, want it to contain %q", err.Error(), "missing nonce")
-	}
-}
-
-func TestEd25519Verifier_ZeroIssuedAt(t *testing.T) {
-	pub, _ := generateKey(t)
-	v := NewEd25519Verifier(pub)
-
-	env := SignedEnvelope{
-		EventType: "peer_added",
-		EventID:   "evt-001",
-		IssuedAt:  time.Time{},
-		Nonce:     "nonce-zero",
-		Payload:   json.RawMessage(`{}`),
-		Signature: "c29tZXNpZw==",
-	}
-
-	err := v.Verify(context.Background(), env)
-	if err == nil {
-		t.Fatal("expected error for zero issued_at, got nil")
-	}
-	if !strContains(err.Error(), "missing issued_at") {
-		t.Errorf("error = %q, want it to contain %q", err.Error(), "missing issued_at")
-	}
-}
-
-func TestNonceStore_TTLExpiry(t *testing.T) {
-	s := NewNonceStore()
-
-	// Add a nonce with an old issuedAt so it appears expired.
-	old := time.Now().Add(-10 * time.Minute)
-	if err := s.Add("old-nonce", old); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Force cleanup by setting lastCleanup far in the past.
-	s.mu.Lock()
-	s.lastCleanup = time.Now().Add(-2 * nonceCleanupInterval)
-	s.mu.Unlock()
-
-	// Adding a new nonce should trigger cleanup and remove the old one.
-	if err := s.Add("new-nonce", time.Now()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// The old nonce should have been cleaned up; adding it again should succeed.
-	if err := s.Add("old-nonce", time.Now()); err != nil {
-		t.Fatalf("expected old nonce to be cleaned up, got: %v", err)
-	}
-}
-
-func TestEd25519Verifier_KeyRotation_CurrentKey(t *testing.T) {
-	oldPub, _ := generateKey(t)
+func TestEd25519Verifier_Rotation(t *testing.T) {
+	oldPub, oldPriv := generateKey(t)
 	newPub, newPriv := generateKey(t)
+	newPubB64 := base64.StdEncoding.EncodeToString(newPub)
 
-	v := NewEd25519Verifier(oldPub)
-	v.SetKeys(newPub, oldPub, time.Now().Add(1*time.Hour))
+	t.Run("previous kid accepted during transition", func(t *testing.T) {
+		v := NewEd25519Verifier("kid-old", oldPub)
+		if err := v.Rotate(SigningKeyRotation{
+			KeyID:             "kid-new",
+			PublicKey:         newPubB64,
+			PreviousKeyID:     "kid-old",
+			TransitionExpires: time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("rotate: %v", err)
+		}
+		// New key + new kid verifies.
+		if err := v.Verify(context.Background(), signEnvelope(t, newPriv, "kid-new", time.Now(), json.RawMessage(`{}`))); err != nil {
+			t.Errorf("new kid failed to verify: %v", err)
+		}
+		// Old key + old kid still verifies within the grace window.
+		if err := v.Verify(context.Background(), signEnvelope(t, oldPriv, "kid-old", time.Now(), json.RawMessage(`{}`))); err != nil {
+			t.Errorf("previous kid failed to verify during transition: %v", err)
+		}
+	})
 
-	env := signEnvelope(t, newPriv, "peer_added", "evt-001", "nonce-rot-curr", time.Now(), json.RawMessage(`{}`))
-	if err := v.Verify(context.Background(), env); err != nil {
-		t.Fatalf("expected nil error with current key after rotation, got: %v", err)
-	}
+	t.Run("previous kid rejected after transition", func(t *testing.T) {
+		v := NewEd25519Verifier("kid-old", oldPub)
+		// Inject an already-expired transition deadline.
+		if err := v.Rotate(SigningKeyRotation{
+			KeyID:             "kid-new",
+			PublicKey:         newPubB64,
+			PreviousKeyID:     "kid-old",
+			TransitionExpires: time.Now().Add(-time.Hour),
+		}); err != nil {
+			t.Fatalf("rotate: %v", err)
+		}
+		err := v.Verify(context.Background(), signEnvelope(t, oldPriv, "kid-old", time.Now(), json.RawMessage(`{}`)))
+		if err == nil {
+			t.Fatal("expected error for expired previous kid, got nil")
+		}
+		if err.Error() != "api: verifier: unknown signing key id" {
+			t.Errorf("error = %q, want %q", err.Error(), "api: verifier: unknown signing key id")
+		}
+	})
+
+	t.Run("empty previous key id installs no grace", func(t *testing.T) {
+		v := NewEd25519Verifier("kid-old", oldPub)
+		if err := v.Rotate(SigningKeyRotation{
+			KeyID:             "kid-new",
+			PublicKey:         newPubB64,
+			TransitionExpires: time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("rotate: %v", err)
+		}
+		err := v.Verify(context.Background(), signEnvelope(t, oldPriv, "kid-old", time.Now(), json.RawMessage(`{}`)))
+		if err == nil || err.Error() != "api: verifier: unknown signing key id" {
+			t.Errorf("error = %v, want %q", err, "api: verifier: unknown signing key id")
+		}
+	})
+
+	t.Run("zero transition expires installs no grace", func(t *testing.T) {
+		v := NewEd25519Verifier("kid-old", oldPub)
+		if err := v.Rotate(SigningKeyRotation{
+			KeyID:         "kid-new",
+			PublicKey:     newPubB64,
+			PreviousKeyID: "kid-old",
+		}); err != nil {
+			t.Fatalf("rotate: %v", err)
+		}
+		err := v.Verify(context.Background(), signEnvelope(t, oldPriv, "kid-old", time.Now(), json.RawMessage(`{}`)))
+		if err == nil || err.Error() != "api: verifier: unknown signing key id" {
+			t.Errorf("error = %v, want %q", err, "api: verifier: unknown signing key id")
+		}
+	})
 }
 
-func TestEd25519Verifier_KeyRotation_PreviousKeyDuringTransition(t *testing.T) {
+func TestEd25519Verifier_RotateErrors(t *testing.T) {
 	oldPub, oldPriv := generateKey(t)
 	newPub, _ := generateKey(t)
 
-	v := NewEd25519Verifier(oldPub)
-	v.SetKeys(newPub, oldPub, time.Now().Add(1*time.Hour))
+	tests := []struct {
+		name    string
+		rot     SigningKeyRotation
+		wantErr string // exact when set
+		prefix  string // prefix when set
+	}{
+		{
+			name:    "empty key id",
+			rot:     SigningKeyRotation{PublicKey: base64.StdEncoding.EncodeToString(newPub)},
+			wantErr: "api: verifier: rotation missing key_id",
+		},
+		{
+			name:   "non-base64 public key",
+			rot:    SigningKeyRotation{KeyID: "kid-new", PublicKey: "not-base64!!!"},
+			prefix: "api: verifier: rotation public key: ",
+		},
+		{
+			name:   "wrong length public key",
+			rot:    SigningKeyRotation{KeyID: "kid-new", PublicKey: base64.StdEncoding.EncodeToString([]byte("short"))},
+			prefix: "api: verifier: rotation public key: ",
+		},
+	}
 
-	// Sign with the OLD key — should still pass during transition.
-	env := signEnvelope(t, oldPriv, "peer_added", "evt-001", "nonce-rot-prev", time.Now(), json.RawMessage(`{}`))
-	if err := v.Verify(context.Background(), env); err != nil {
-		t.Fatalf("expected nil error with previous key during transition, got: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := NewEd25519Verifier("kid-old", oldPub)
+			err := v.Rotate(tt.rot)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if tt.wantErr != "" && err.Error() != tt.wantErr {
+				t.Errorf("error = %q, want %q", err.Error(), tt.wantErr)
+			}
+			if tt.prefix != "" && !strContains(err.Error(), tt.prefix) {
+				t.Errorf("error = %q, want prefix %q", err.Error(), tt.prefix)
+			}
+			// Keys unchanged: an envelope under the old kid still verifies.
+			if err := v.Verify(context.Background(), signEnvelope(t, oldPriv, "kid-old", time.Now(), json.RawMessage(`{}`))); err != nil {
+				t.Errorf("old kid failed to verify after rejected rotation: %v", err)
+			}
+		})
 	}
 }
 
-func TestEd25519Verifier_KeyRotation_PreviousKeyAfterTransition(t *testing.T) {
-	oldPub, oldPriv := generateKey(t)
-	newPub, _ := generateKey(t)
-
-	v := NewEd25519Verifier(oldPub)
-	// Transition already expired.
-	v.SetKeys(newPub, oldPub, time.Now().Add(-1*time.Hour))
-
-	env := signEnvelope(t, oldPriv, "peer_added", "evt-001", "nonce-rot-exp", time.Now(), json.RawMessage(`{}`))
-	err := v.Verify(context.Background(), env)
-	if err == nil {
-		t.Fatal("expected error with previous key after transition, got nil")
-	}
-	if !strContains(err.Error(), "signature verification failed") {
-		t.Errorf("error = %q, want it to contain %q", err.Error(), "signature verification failed")
-	}
-}
-
-func TestEd25519Verifier_InvalidBase64Signature(t *testing.T) {
-	pub, _ := generateKey(t)
-	v := NewEd25519Verifier(pub)
-
-	env := SignedEnvelope{
-		EventType: "peer_added",
-		EventID:   "evt-001",
-		IssuedAt:  time.Now(),
-		Nonce:     "nonce-bad-b64",
-		Payload:   json.RawMessage(`{}`),
-		Signature: "not-valid-base64!!!",
-	}
-
-	err := v.Verify(context.Background(), env)
-	if err == nil {
-		t.Fatal("expected error for invalid base64 signature, got nil")
-	}
-	if !strContains(err.Error(), "signature verification failed") {
-		t.Errorf("error = %q, want it to contain %q", err.Error(), "signature verification failed")
-	}
-}
-
-func TestEd25519Verifier_FutureTimestamp(t *testing.T) {
+func TestEd25519Verifier_FreshnessAndSignatureErrors(t *testing.T) {
 	pub, priv := generateKey(t)
-	v := NewEd25519Verifier(pub)
 
-	futureTime := time.Now().Add(10 * time.Minute)
-	env := signEnvelope(t, priv, "peer_added", "evt-001", "nonce-future", futureTime, json.RawMessage(`{}`))
-
-	err := v.Verify(context.Background(), env)
-	if err == nil {
-		t.Fatal("expected error for future timestamp, got nil")
+	tests := []struct {
+		name    string
+		env     Envelope
+		wantErr string
+	}{
+		{
+			name: "missing signature",
+			env: Envelope{
+				ID: "evt-1", Type: "policy_updated", KeyID: "kid-1",
+				IssuedAt: time.Now(), Payload: json.RawMessage(`{}`), Signature: "",
+			},
+			wantErr: "api: verifier: missing signature",
+		},
+		{
+			name: "zero issued_at",
+			env: Envelope{
+				ID: "evt-1", Type: "policy_updated", KeyID: "kid-1",
+				IssuedAt: time.Time{}, Payload: json.RawMessage(`{}`), Signature: "c29tZXNpZw==",
+			},
+			wantErr: "api: verifier: missing issued_at",
+		},
+		{
+			name: "stale issued_at",
+			env: Envelope{
+				ID: "evt-1", Type: "policy_updated", KeyID: "kid-1",
+				IssuedAt: time.Now().Add(-6 * time.Minute), Payload: json.RawMessage(`{}`), Signature: "c29tZXNpZw==",
+			},
+			wantErr: "api: verifier: event is stale",
+		},
+		{
+			name: "future issued_at",
+			env: Envelope{
+				ID: "evt-1", Type: "policy_updated", KeyID: "kid-1",
+				IssuedAt: time.Now().Add(10 * time.Minute), Payload: json.RawMessage(`{}`), Signature: "c29tZXNpZw==",
+			},
+			wantErr: "api: verifier: event timestamp is in the future",
+		},
+		{
+			name: "undecodable base64 signature",
+			env: Envelope{
+				ID: "evt-1", Type: "policy_updated", KeyID: "kid-1",
+				IssuedAt: time.Now(), Payload: json.RawMessage(`{}`), Signature: "not-valid-base64!!!",
+			},
+			wantErr: "api: verifier: signature verification failed",
+		},
 	}
-	if !strContains(err.Error(), "future") {
-		t.Errorf("error = %q, want it to contain %q", err.Error(), "future")
-	}
-}
 
-func TestEd25519Verifier_NonceNotConsumedOnInvalidSignature(t *testing.T) {
-	pub, _ := generateKey(t)
-	_, otherPriv := generateKey(t)
-	v := NewEd25519Verifier(pub)
-
-	// Sign with wrong key — signature verification should fail.
-	env := signEnvelope(t, otherPriv, "peer_added", "evt-001", "nonce-exhaust", time.Now(), json.RawMessage(`{}`))
-
-	err := v.Verify(context.Background(), env)
-	if err == nil {
-		t.Fatal("expected error for wrong key, got nil")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := NewEd25519Verifier("kid-1", pub)
+			err := v.Verify(context.Background(), tt.env)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if err.Error() != tt.wantErr {
+				t.Errorf("error = %q, want %q", err.Error(), tt.wantErr)
+			}
+		})
 	}
 
-	// The same nonce should still be usable since it was never recorded.
-	v2pub, v2priv := generateKey(t)
-	v2 := NewEd25519Verifier(v2pub)
-	env2 := signEnvelope(t, v2priv, "peer_added", "evt-002", "nonce-exhaust", time.Now(), json.RawMessage(`{}`))
-	if err := v2.Verify(context.Background(), env2); err != nil {
-		t.Fatalf("nonce should not have been consumed by failed verification: %v", err)
+	// Sanity: a genuinely signed envelope under the same kid verifies, proving the
+	// cases above fail on their specific defect rather than a mis-seeded key.
+	if err := NewEd25519Verifier("kid-1", pub).Verify(context.Background(), signEnvelope(t, priv, "kid-1", time.Now(), json.RawMessage(`{}`))); err != nil {
+		t.Fatalf("valid envelope should verify: %v", err)
 	}
 }
