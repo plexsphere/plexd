@@ -236,14 +236,18 @@ shape the local node API serves for cached data entries.
 
 ### `GET /v1/nodes/{node_id}/secrets/{key}`
 
-**SecretResponse**
+**SecretEnvelope**
 
-| Field       | Type   | JSON Tag      | Description            |
-|-------------|--------|---------------|------------------------|
-| `Key`       | `string`| `"key"`      | Secret key name        |
-| `Ciphertext`| `string`| `"ciphertext"`| Encrypted secret value|
-| `Nonce`     | `string`| `"nonce"`    | Encryption nonce       |
-| `Version`   | `int`  | `"version"`   | Secret version         |
+The raw AES-256-GCM envelope served by the endpoint. Unlike every other type on
+this page it carries **no JSON tags**: `Data` is read from the octet-stream body,
+`Version` and `KID` from response headers — the type is never JSON-marshaled or
+unmarshaled.
+
+| Field     | Type     | Source                                      | Description                                          |
+|-----------|----------|---------------------------------------------|------------------------------------------------------|
+| `Data`    | `[]byte` | Response body (`application/octet-stream`)  | `<12-byte nonce> \|\| <ciphertext + 16-byte GCM tag>` |
+| `Version` | `int`    | `X-Plexsphere-Secret-Version` header        | Version of the returned secret                       |
+| `KID`     | `string` | `X-Plexsphere-Secret-KID` header            | Key id of the NSK the envelope was sealed under      |
 
 ## Reports
 

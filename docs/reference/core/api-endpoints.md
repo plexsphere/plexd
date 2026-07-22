@@ -18,7 +18,7 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 6 | `PUT` | `/v1/nodes/{node_id}/capabilities` | Capability update |
 | 7 | `PUT` | `/v1/nodes/{node_id}/endpoint` | NAT endpoint reporting |
 | 8 | `GET` | `/v1/nodes/{node_id}/state` | State snapshot pull (reconciliation) |
-| 9 | `GET` | `/v1/nodes/{node_id}/secrets/{key}` | Secret fetch (NSK-encrypted) |
+| 9 | `GET` | `/v1/nodes/{node_id}/secrets/{key}` | Secret envelope fetch (NSK-encrypted octet-stream) |
 | 10 | `PUT` | `/v1/nodes/{node_id}/state/reports/{key}` | Per-key state report upsert |
 | 11 | `DELETE` | `/v1/nodes/{node_id}/state/reports/{key}` | Per-key state report delete |
 | 12 | `POST` | `/v1/nodes/{node_id}/executions/{execution_id}` | Action execution callback |
@@ -335,25 +335,39 @@ absence.
 
 ### GET /v1/nodes/{node_id}/secrets/{key}
 
-Called on-demand when a consumer requests a secret via the Local Node API. Returns the value encrypted with the node's AES-256-GCM Node Secret Key (NSK).
+Called on-demand when a consumer requests a secret via the Local Node API. The
+`{key}` is validated client-side against the name grammar
+`^[a-z][a-z0-9_-]{0,62}$` **before any request is sent** — a name outside the
+grammar fails locally without touching the control plane. An optional
+`?version=N` query (`N` a positive integer) selects an older version; omitting it
+returns the current version.
 
-**Response** (`200 OK`):
+**Response** (`200 OK`) is `Content-Type: application/octet-stream`, not JSON:
+the body is the raw AES-256-GCM envelope `<12-byte nonce> || <ciphertext +
+16-byte GCM tag>`, opened with AES-256-GCM under the node's NSK. The ciphertext
+is capped at 1 MiB (28 bytes of nonce + GCM-tag overhead on top). The metadata
+rides in response headers rather than the body:
 
-```json
-{
-  "key": "tls-cert",
-  "ciphertext": "base64-encoded-aes-256-gcm-ciphertext",
-  "nonce": "base64-encoded-gcm-nonce",
-  "version": 2
-}
-```
-
-| Response | Meaning |
+| Header | Meaning |
 |---|---|
-| `200 OK` | Encrypted secret value |
-| `401 Unauthorized` | Invalid node identity |
-| `403 Forbidden` | Node not authorized to access this secret |
-| `404 Not Found` | Secret key does not exist |
+| `X-Plexsphere-Secret-Version` | Version of the returned secret (a positive integer) |
+| `X-Plexsphere-Secret-KID` | Key id of the NSK the envelope was sealed under |
+| `Cache-Control` | Always `no-store` — the plaintext is never cached |
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `200 OK` | — | Encrypted secret envelope (octet-stream) |
+| `401 Unauthorized` | — | Invalid node identity |
+| `403 Forbidden` | `permission_denied` | Node not authorized to access this secret |
+| `404 Not Found` | `secret_not_found` | Secret name does not exist |
+| `404 Not Found` | `secret_version_not_found` | The requested `?version` does not exist |
+| `429 Too Many Requests` | `per_node_rate_limited` | Per-node fetch rate limit; honor `Retry-After` |
+| `429 Too Many Requests` | `per_domain_rate_limited` | Per-domain fetch rate limit; honor `Retry-After` |
+| `500 Internal Server Error` | — | Server error |
+| `501 Not Implemented` | `secrets_not_provisioned` | Secret storage is not provisioned for this node |
+| `503 Service Unavailable` | `openbao_unavailable` | Secret backend temporarily unavailable |
 
 ## Reports
 

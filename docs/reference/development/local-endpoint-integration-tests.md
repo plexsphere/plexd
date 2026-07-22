@@ -63,7 +63,7 @@ fetcher := newLogTestFetcher("my-bearer-token")  // logfwd
 fetcher := newAuditTestFetcher("my-bearer-token")  // auditfwd
 ```
 
-These construct a `mockSecretFetcher` with a pre-encrypted `api.SecretResponse` that decrypts to the given plaintext token.
+These construct a `mockSecretFetcher` with a pre-sealed `api.SecretEnvelope` that decrypts to the given plaintext token.
 
 ### Polling Helper
 

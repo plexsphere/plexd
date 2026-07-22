@@ -394,7 +394,7 @@ func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []
 
 ```go
 type SecretFetcher interface {
-    FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
+    FetchSecret(ctx context.Context, nodeID, name string, version int) (*api.SecretEnvelope, error)
 }
 ```
 
@@ -416,8 +416,8 @@ On each `ReportMetrics` call, `LocalReporter` resolves a bearer token via the fo
 
 1. **Check cache** (read lock): if `cachedToken` is non-empty and `fetchedAt` is within the 5-minute TTL, return the cached token immediately.
 2. **Acquire write lock** and double-check the cache (another goroutine may have refreshed it).
-3. **Fetch secret**: call `SecretFetcher.FetchSecret(ctx, nodeID, secretKey)` to retrieve the encrypted credential.
-4. **Decrypt**: call `nodeapi.DecryptSecret(nsk, resp.Ciphertext, resp.Nonce)` to obtain the plaintext token.
+3. **Fetch secret**: call `SecretFetcher.FetchSecret(ctx, nodeID, secretKey, 0)` to retrieve the current version's encrypted envelope.
+4. **Decrypt**: call `nodeapi.DecryptSecret(nsk, resp.Data)` to obtain the plaintext token.
 5. **Update cache**: store the plaintext token and current timestamp.
 
 **Failure modes:**
