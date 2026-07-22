@@ -39,6 +39,10 @@ const DefaultRequestTimeout = 30 * time.Second
 // DefaultSSEIdleTimeout is the default SSE idle timeout.
 const DefaultSSEIdleTimeout = 90 * time.Second
 
+// DefaultSSEReprobeInterval is how often pull-only delivery mode re-probes the
+// descoped SSE endpoint to detect that it has come back.
+const DefaultSSEReprobeInterval = 10 * time.Minute
+
 // ApplyDefaults sets default values for zero-valued fields.
 func (c *Config) ApplyDefaults() {
 	if c.ConnectTimeout == 0 {

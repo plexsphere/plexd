@@ -74,6 +74,19 @@ func IsIngestNotProvisioned(err error) bool {
 		apiErr.Code == "observability_ingest_not_provisioned"
 }
 
+// IsEventBusNotProvisioned reports whether err is the control plane's long-term
+// descope of the signed event stream for the node: a 501 carrying the
+// signed_event_bus_not_provisioned problem code. Unlike a transient 5xx, this is
+// a durable verdict — the endpoint stays unavailable until the node is
+// re-provisioned — so it is answered by switching to pull-only delivery rather
+// than by retrying against a channel that is not there.
+func IsEventBusNotProvisioned(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) &&
+		apiErr.StatusCode == http.StatusNotImplemented &&
+		apiErr.Code == "signed_event_bus_not_provisioned"
+}
+
 // IsIngestPermanentlyRefused reports whether err is a refusal of an
 // observability ingest batch that no retry can fix: a 400 carrying the
 // ingest_batch_malformed problem code, which is a verdict on the batch bytes

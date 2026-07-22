@@ -52,6 +52,17 @@ func (m *SSEManager) SetPollingFallback(fallbackAfter, pollInterval time.Duratio
 	m.reconnect.SetPollingFallbackConfig(fallbackAfter, pollInterval)
 }
 
+// Mode returns the delivery mode currently reported by the reconnect engine.
+func (m *SSEManager) Mode() DeliveryMode {
+	return m.reconnect.Mode()
+}
+
+// SetOnModeChange registers a callback invoked on every delivery-mode
+// transition. The callback may be nil.
+func (m *SSEManager) SetOnModeChange(fn func(DeliveryMode)) {
+	m.reconnect.SetOnModeChange(fn)
+}
+
 // SetPollFunc sets the function called during polling fallback to fetch full state.
 func (m *SSEManager) SetPollFunc(fn PollFunc) {
 	m.mu.Lock()

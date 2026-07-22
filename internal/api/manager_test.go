@@ -362,3 +362,36 @@ func TestManager_RegisterHandlerBeforeStart(t *testing.T) {
 		t.Errorf("handler called %d times, want >= 1", called.Load())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TestManager_ModeDelegation — Mode and SetOnModeChange delegate to the engine
+// ---------------------------------------------------------------------------
+
+func TestManager_ModeDelegation(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := Config{BaseURL: "http://127.0.0.1:1"}
+	client, err := NewControlPlane(cfg, "1.0.0-test", logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := NewSSEManager(client, nil, logger)
+
+	if got := mgr.Mode(); got != DeliveryModeStreaming {
+		t.Errorf("fresh manager Mode() = %q, want streaming", got)
+	}
+
+	var got atomic.Value // DeliveryMode
+	mgr.SetOnModeChange(func(m DeliveryMode) { got.Store(m) })
+
+	// Drive a transition through the underlying engine to prove the callback the
+	// manager registered is the one the engine fires.
+	mgr.reconnect.setMode(DeliveryModePullOnly)
+
+	if now := mgr.Mode(); now != DeliveryModePullOnly {
+		t.Errorf("Mode() after transition = %q, want pull_only", now)
+	}
+	if v, ok := got.Load().(DeliveryMode); !ok || v != DeliveryModePullOnly {
+		t.Errorf("SetOnModeChange callback got %v, want pull_only", got.Load())
+	}
+}

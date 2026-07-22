@@ -33,13 +33,18 @@ type ReportEntry struct {
 
 // StateCache holds node state in memory with file persistence.
 type StateCache struct {
-	mu          sync.RWMutex
-	dataDir     string // base dir; state lives under dataDir/state/
-	logger      *slog.Logger
-	metadata    map[string]string
-	data        map[string]api.DataEntry
-	secretIndex []api.SecretRef
-	reports     map[string]ReportEntry
+	mu       sync.RWMutex
+	dataDir  string // base dir; state lives under dataDir/state/
+	logger   *slog.Logger
+	metadata map[string]string
+	// deliveryMode is the SSE delivery channel diagnostic (streaming,
+	// pull_only, degraded_polling). It is held apart from the snapshot-owned
+	// metadata map so the authoritative pull reconcile, which rebuilds that map
+	// from scratch on every cycle, cannot clobber it.
+	deliveryMode string
+	data         map[string]api.DataEntry
+	secretIndex  []api.SecretRef
+	reports      map[string]ReportEntry
 	// orphanedReports holds the keys of persisted reports Load rejected because
 	// they predate the current key grammar. They are unreachable through every
 	// local route, so the syncer is the only thing that can still act on them.
@@ -213,17 +218,44 @@ func (sc *StateCache) UpdateSecretIndex(refs []api.SecretRef) {
 	sc.persistJSON(filepath.Join(sc.stateDir(), "secrets.json"), sc.secretIndex)
 }
 
-// GetMetadata returns a copy of the metadata map.
+// deliveryModeMetadataKey is the synthetic metadata key under which the SSE
+// delivery channel diagnostic is surfaced. It is a computed key overlaid on the
+// metadata view rather than a stored snapshot key, so the authoritative pull
+// reconcile cannot clobber it.
+const deliveryModeMetadataKey = "delivery_mode"
+
+// SetDeliveryMode records the SSE delivery channel diagnostic. It is stored
+// separately from the snapshot-owned metadata map and is intentionally not
+// persisted: the value is re-seeded from the live SSE manager on every startup.
+func (sc *StateCache) SetDeliveryMode(mode string) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.deliveryMode = mode
+}
+
+// GetMetadata returns a copy of the metadata map, with the delivery-mode
+// diagnostic overlaid as the delivery_mode key when a mode is set.
 func (sc *StateCache) GetMetadata() map[string]string {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
-	return maps.Clone(sc.metadata)
+	m := maps.Clone(sc.metadata)
+	if sc.deliveryMode != "" {
+		if m == nil {
+			m = make(map[string]string, 1)
+		}
+		m[deliveryModeMetadataKey] = sc.deliveryMode
+	}
+	return m
 }
 
 // GetMetadataKey returns the value for a metadata key and whether it exists.
+// The delivery_mode key resolves to the delivery-mode diagnostic.
 func (sc *StateCache) GetMetadataKey(key string) (string, bool) {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
+	if key == deliveryModeMetadataKey && sc.deliveryMode != "" {
+		return sc.deliveryMode, true
+	}
 	v, ok := sc.metadata[key]
 	return v, ok
 }

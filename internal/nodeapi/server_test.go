@@ -407,6 +407,38 @@ func TestServer_ReconcileHandler(t *testing.T) {
 	<-errCh
 }
 
+// TestServer_ReconcileHandlerPreservesDeliveryMode proves the authoritative pull
+// reconcile leaves the delivery_mode diagnostic visible in the metadata view.
+// The reconcile rebuilds the snapshot-owned metadata map from scratch on a
+// state-changed cycle and clears it outright on a nil state block; before the
+// diagnostic was split out of that map, a single reconcile wiped the key.
+func TestServer_ReconcileHandlerPreservesDeliveryMode(t *testing.T) {
+	srv, _ := newTestServer(t, &serverTestClient{})
+	srv.cache.SetDeliveryMode(string(api.DeliveryModePullOnly))
+
+	handler := srv.ReconcileHandler()
+	ctx := context.Background()
+
+	// A state-changed cycle rebuilds the metadata map but must not drop the key.
+	desired := &api.NodeStateSnapshot{
+		State: &api.NodeStateBlock{Metadata: []api.StateEntry{{Key: "env", Value: "prod"}}},
+	}
+	if err := handler(ctx, desired, reconcile.StateDiff{StateChanged: true}); err != nil {
+		t.Fatalf("reconcile handler: %v", err)
+	}
+	if got, _ := srv.cache.GetMetadataKey("delivery_mode"); got != string(api.DeliveryModePullOnly) {
+		t.Errorf("delivery_mode after state-changed reconcile = %q, want pull_only", got)
+	}
+
+	// A nil state block clears the metadata map but must not drop the key either.
+	if err := handler(ctx, &api.NodeStateSnapshot{State: nil}, reconcile.StateDiff{StateChanged: true}); err != nil {
+		t.Fatalf("reconcile handler (nil state): %v", err)
+	}
+	if got, _ := srv.cache.GetMetadataKey("delivery_mode"); got != string(api.DeliveryModePullOnly) {
+		t.Errorf("delivery_mode after nil-state reconcile = %q, want pull_only", got)
+	}
+}
+
 func TestServer_StaleSocketRemoved(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
