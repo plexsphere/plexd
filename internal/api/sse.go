@@ -201,6 +201,7 @@ type SSEStream struct {
 	dispatcher  *EventDispatcher
 	logger      *slog.Logger
 	idleTimeout time.Duration
+	onConnected func()
 
 	mu          sync.Mutex
 	lastEventID string
@@ -227,6 +228,12 @@ func (s *SSEStream) LastEventID() string {
 	return s.lastEventID
 }
 
+// SetOnConnected registers a hook invoked once after every ConnectSSE that
+// returns HTTP 200, before the parse loop begins.
+func (s *SSEStream) SetOnConnected(fn func()) {
+	s.onConnected = fn
+}
+
 // Connect establishes the SSE connection and processes events until
 // the connection drops or context is cancelled.
 // Returns nil when the connection closes cleanly, or an error.
@@ -237,9 +244,27 @@ func (s *SSEStream) Connect(ctx context.Context, nodeID string) error {
 
 	resp, err := s.client.ConnectSSE(ctx, nodeID, lastID)
 	if err != nil {
+		// A 400 while a cursor was sent means the control plane rejected the
+		// cursor. Clear it so the next connect tails from now; the events
+		// contract has no below-window error, so a gap is covered by the
+		// reconcile pull the manager fires on every successful connect. The
+		// error is still returned unchanged, staying on the transient path.
+		if lastID != "" && errors.Is(err, ErrBadRequest) {
+			s.mu.Lock()
+			s.lastEventID = ""
+			s.mu.Unlock()
+			s.logger.Warn("control plane rejected the SSE cursor, clearing it — next connect tails from now",
+				"rejected_cursor", lastID,
+			)
+		}
 		return err
 	}
 	defer resp.Body.Close()
+
+	// Notify the connected hook once per successful connect, before parsing.
+	if s.onConnected != nil {
+		s.onConnected()
+	}
 
 	// Wrap body with idle timeout enforcement (REQ-011).
 	// If no data arrives within idleTimeout, the reader returns an error
