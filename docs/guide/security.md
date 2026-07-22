@@ -72,51 +72,41 @@ The control plane pushes peer and key updates via SSE. Every SSE event is signed
 
 **Signed Event Envelope:**
 
-Every SSE event is wrapped in a signed envelope. The `signature` covers the canonical JSON serialization of all fields except `signature` itself (i.e. `event_type`, `event_id`, `issued_at`, `nonce`, and `payload`):
+Every SSE event is wrapped in a signed envelope. The `signature` covers the canonical JSON serialization of all fields except `signature` itself (i.e. `id`, `type`, `scope`, `key_id`, `issued_at`, and `payload`):
 
 ```json
 {
-  "event_type": "peer_added",
-  "event_id": "evt_d4e5f6",
-  "issued_at": "2025-01-15T10:30:00Z",
-  "nonce": "unique-random-nonce-value",
-  "payload": {
-    "peer_id": "n_peer456",
-    "public_key": "...",
-    "mesh_ip": "10.100.1.5",
-    "endpoint": "203.0.113.10:51820",
-    "allowed_ips": ["10.100.1.5/32"],
-    "psk": "..."
-  },
+  "id": "evt_d4e5f6",
+  "type": "node_state_updated",
+  "scope": "node:n_abc123",
+  "key_id": "did:web:plexsphere.com#key-2026-01",
+  "issued_at": "2026-01-15T10:30:00Z",
+  "payload": { "revision": 42 },
   "signature": "base64-encoded-ed25519-signature"
 }
 ```
 
 **Verification on every event:**
 
-1. Verify Ed25519 signature over the canonical JSON of all fields except `signature`, using the control plane's signing public key (received during registration).
-2. Check `issued_at` staleness (max 5 minutes).
-3. Check `nonce` uniqueness (bounded in-memory set with automatic expiry).
-4. If any check fails, reject the event and log a security warning.
+1. Select the signing key by the envelope's `key_id` — the current signing key, or the previous key during a rotation grace window — and verify the Ed25519 signature over the canonical JSON of all fields except `signature`, using the control plane's signing public key (received during registration).
+2. Check `issued_at` staleness (max 5 minutes) and reject timestamps too far in the future.
+3. If any check fails, reject the event and log it; the event is skipped and never dispatched.
 
-This ensures that even if the TLS connection is compromised (e.g. through a rogue proxy or certificate authority), events cannot be forged or replayed.
+This ensures that even if the TLS connection is compromised (e.g. through a rogue proxy or certificate authority), events cannot be forged. Duplicate or reordered deliveries are harmless because the reconciler's authoritative state pull, not the event payload, is the source of truth.
 
 **SSE Events:**
 
 | SSE Event | Client Action |
 |---|---|
-| `peer_added` | Add peer with public key, endpoint, and PSK |
-| `peer_removed` | Remove peer from WireGuard interface |
-| `peer_key_rotated` | Replace peer's public key and PSK |
-| `peer_endpoint_changed` | Update peer's WireGuard endpoint |
-| `policy_updated` | Update local firewall rules |
+| `node_state_updated` | Trigger a state reconcile: refresh the local node state cache (metadata, data entries) and notify Node API consumers |
+| `policy_updated` | Trigger a reconcile and update local firewall rules |
+| `bridge_config_updated` | Trigger a bridge reconcile (bridge mode) |
+| `peer_endpoint_changed` / `peer_key_rotated` | Trigger a state reconcile — peer topology is applied from the authoritative state pull, not the event payload |
 | `action_request` | Validate, ACK, and execute the requested action (see [Actions & Hooks](../reference/core/cli.md)) |
 | `session_revoked` | Add session to local revocation set, reject future actions with that session's token |
 | `ssh_session_setup` | Set up SSH session: start listener, inject session token |
 | `rotate_keys` | Generate new Curve25519 keypair and initiate key rotation (see [Phase 4: Key Rotation](#phase-4-key-rotation)) |
-| `signing_key_rotated` | Update the control plane's signing public key (see [Signing Key Rotation](#signing-key-rotation)) |
-| `node_state_updated` | Update local node state cache (metadata, data entries) and notify Node API consumers |
-| `node_secrets_updated` | Fetch updated secret values from control plane via HTTPS and update local secret store (names and versions only in SSE, never plaintext) |
+| `signing_key_rotated` | Update the control plane's signing public key, selected by `key_id` (see [Signing Key Rotation](#signing-key-rotation)) |
 
 ### Phase 4: Key Rotation
 

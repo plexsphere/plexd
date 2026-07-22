@@ -278,7 +278,7 @@ r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
 | `api.PolicyRule` | `internal/api` | Five-tuple: `action`, `protocol`, `source_cidr`, `destination_cidr`, `ports?` |
 | `api.PortRange`  | `internal/api` | Inclusive destination port range `{from, to}`             |
 | `api.NodeStateSnapshot` | `internal/api` | Desired-state envelope from the control plane        |
-| `api.SignedEnvelope` | `internal/api` | SSE event wrapper                                     |
+| `api.Envelope` | `internal/api` | SSE event wrapper                                     |
 | `api.EventPolicyUpdated` | `internal/api` | Event type constant `"policy_updated"`            |
 
 ### Graceful Shutdown

@@ -41,6 +41,7 @@ Control plane HTTP client configuration.
 | `connect_timeout` | duration | `10s` | Maximum time to wait for a TCP connection |
 | `request_timeout` | duration | `30s` | Maximum time for a complete HTTP request/response cycle |
 | `sse_idle_timeout` | duration | `90s` | Maximum idle time on the SSE stream before reconnecting |
+| `sse_reprobe_interval` | duration | `10m` | How often pull-only delivery re-probes the SSE endpoint after the control plane descoped it. Must be at least `1s` when set. |
 
 Source: `internal/api/config.go`
 
@@ -332,6 +333,7 @@ api:
   connect_timeout: 10s
   request_timeout: 30s
   sse_idle_timeout: 90s
+  sse_reprobe_interval: 10m
 
 registration:
   # project_id: ""            # platform project UUID (required for registration)

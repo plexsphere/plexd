@@ -172,7 +172,7 @@ func HandleActionRequest(executor *Executor, nodeID string, logger *slog.Logger)
 
 Returns an `api.EventHandler` that:
 
-1. Parses `SignedEnvelope.Payload` into `api.ActionRequest`
+1. Parses `Envelope.Payload` into `api.ActionRequest`
 2. Returns error on malformed JSON (no ack sent; logged by dispatcher)
 3. Returns error on missing `execution_id`
 4. When `Config.Enabled` is `false`: routes through the executor's reject path, posting an `ack` callback followed by a `failed` terminal with `error=actions_disabled`

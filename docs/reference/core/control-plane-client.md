@@ -18,7 +18,8 @@ The `internal/api` package provides the Go client for communicating with the Ple
 | `TLSInsecureSkipVerify` | `bool`          | `false` | Disable TLS certificate verification           |
 | `ConnectTimeout`        | `time.Duration` | `10s`   | TCP connection timeout                         |
 | `RequestTimeout`        | `time.Duration` | `30s`   | Full HTTP request/response timeout             |
-| `SSEIdleTimeout`        | `time.Duration` | `90s`   | Max idle time before SSE reconnect             |
+| `SSEIdleTimeout`        | `time.Duration` | `90s`   | Max idle time before SSE reconnect (now honored) |
+| `SSEReprobeInterval`    | `time.Duration` | `10m`   | How often pull-only delivery re-probes a descoped SSE endpoint |
 
 ```go
 cfg := api.Config{
@@ -126,11 +127,11 @@ logger := slog.Default()
 mgr := api.NewSSEManager(client, nil, logger) // nil verifier = NoOpVerifier
 
 // Register handlers before Start
-mgr.RegisterHandler("peer_added", func(ctx context.Context, env api.SignedEnvelope) error {
-    // handle peer addition
+mgr.RegisterHandler("node_state_updated", func(ctx context.Context, env api.Envelope) error {
+    // request a reconcile — the state pull is authoritative
     return nil
 })
-mgr.RegisterHandler("policy_updated", func(ctx context.Context, env api.SignedEnvelope) error {
+mgr.RegisterHandler("policy_updated", func(ctx context.Context, env api.Envelope) error {
     // handle policy change
     return nil
 })
@@ -158,20 +159,27 @@ mgr.Shutdown()
 | `SetPollFunc(fn)`      | Overrides the default polling function (`FetchState`)          |
 | `SetReconnectIntervals`| Configures backoff base and max intervals                      |
 | `SetPollingFallback`   | Configures polling fallback threshold and interval             |
+| `SetIdleTimeout(d)`    | Sets the SSE idle timeout used for connections opened by `Start` |
+| `SetReprobeInterval(d)`| Sets how often pull-only mode re-probes the SSE endpoint (non-positive ignored) |
+| `SetReconcileTrigger(t)`| Sets the trigger fired once after every successful SSE connect to cover replay gaps |
+| `Mode()`               | Returns the current `DeliveryMode` (`streaming`, `pull_only`, `degraded_polling`) |
+| `SetOnModeChange(fn)`  | Registers a callback invoked on every delivery-mode transition |
 
 ## EventVerifier
 
-Pluggable interface for verifying signed event envelopes. The default `NoOpVerifier` accepts all events. A concrete Ed25519 implementation will be provided by feature S010.
+Pluggable interface for verifying signed event envelopes. The default `NoOpVerifier` accepts all events; the production `Ed25519Verifier` checks the signature.
 
 ```go
 type EventVerifier interface {
-    Verify(ctx context.Context, envelope SignedEnvelope) error
+    Verify(ctx context.Context, envelope Envelope) error
 }
 ```
 
+`Ed25519Verifier` is keyed by signing key id: it is built from the registration-persisted `signing_key_id`/`signing_public_key` and selects the verifying key by the envelope's `key_id`. The current key id is always accepted; a previous key id is accepted only during the rotation grace window (until `transition_expires`). The `signing_key_rotated` event installs a new current key via `Rotate`. See [Event Verification](event-verification.md) for the full envelope shape, canonical form, staleness window, and rotation rules.
+
 ## EventDispatcher
 
-Routes verified events to registered handlers by `event_type`.
+Routes verified events to registered handlers by the envelope's `type`.
 
 - Multiple handlers per event type (invoked sequentially in registration order)
 - Handler errors are logged but do not block subsequent handlers
@@ -180,34 +188,37 @@ Routes verified events to registered handlers by `event_type`.
 
 ## Event Type Constants
 
-All 21 SSE event types from the control plane:
+The SSE event set is organized in three tiers. Payloads of the reconcile-driving
+types are opaque: the reconciler's state pull is authoritative, so those events
+only request a reconcile.
 
-| Constant                         | Value                          |
-|----------------------------------|--------------------------------|
-| `EventPeerAdded`                 | `peer_added`                   |
-| `EventPeerRemoved`               | `peer_removed`                 |
-| `EventPeerKeyRotated`            | `peer_key_rotated`             |
-| `EventPeerEndpointChanged`       | `peer_endpoint_changed`        |
-| `EventPolicyUpdated`             | `policy_updated`               |
-| `EventActionRequest`             | `action_request`               |
-| `EventSessionRevoked`            | `session_revoked`              |
-| `EventSSHSessionSetup`           | `ssh_session_setup`            |
-| `EventRotateKeys`                | `rotate_keys`                  |
-| `EventSigningKeyRotated`         | `signing_key_rotated`          |
-| `EventNodeStateUpdated`          | `node_state_updated`           |
-| `EventNodeSecretsUpdated`        | `node_secrets_updated`         |
-| `EventBridgeConfigUpdated`       | `bridge_config_updated`        |
-| `EventRelaySessionAssigned`      | `relay_session_assigned`       |
-| `EventRelaySessionRevoked`       | `relay_session_revoked`        |
-| `EventUserAccessConfigUpdated`   | `user_access_config_updated`   |
-| `EventUserAccessPeerAssigned`    | `user_access_peer_assigned`    |
-| `EventUserAccessPeerRevoked`     | `user_access_peer_revoked`     |
-| `EventIngressConfigUpdated`      | `ingress_config_updated`       |
-| `EventIngressRuleAssigned`       | `ingress_rule_assigned`        |
-| `EventIngressRuleRevoked`        | `ingress_rule_revoked`         |
-| `EventSiteToSiteConfigUpdated`   | `site_to_site_config_updated`  |
-| `EventSiteToSiteTunnelAssigned`  | `site_to_site_tunnel_assigned` |
-| `EventSiteToSiteTunnelRevoked`   | `site_to_site_tunnel_revoked`  |
+**Contract** — currently emitted by the control plane per the OpenAPI events document:
+
+| Constant                   | Value                   | Dispatch target                             |
+|----------------------------|-------------------------|---------------------------------------------|
+| `EventNodeStateUpdated`    | `node_state_updated`    | `TriggerReconcile()`                        |
+| `EventPolicyUpdated`       | `policy_updated`        | `policy.HandlePolicyUpdated` → reconcile    |
+| `EventBridgeConfigUpdated` | `bridge_config_updated` | `bridge.HandleBridgeConfigUpdated` → reconcile |
+
+**Documented-coming** — named now so the agent can subscribe once the platform's 14-type taxonomy starts emitting them:
+
+| Constant                   | Value                   | Dispatch target             |
+|----------------------------|-------------------------|-----------------------------|
+| `EventPeerRegistered`      | `peer_registered`       | `TriggerReconcile()`        |
+| `EventPeerPSKAssigned`     | `peer_psk_assigned`     | `TriggerReconcile()`        |
+| `EventPeerDeregistered`    | `peer_deregistered`     | `TriggerReconcile()`        |
+| `EventPeerEndpointChanged` | `peer_endpoint_changed` | `TriggerReconcile()`        |
+| `EventPeerKeyRotated`      | `peer_key_rotated`      | `TriggerReconcile()`        |
+| `EventRotateKeys`          | `rotate_keys`           | key rotator's `RotateNow`   |
+| `EventSigningKeyRotated`   | `signing_key_rotated`   | `Ed25519Verifier.Rotate`    |
+
+**Test-only** — retained until the platform taxonomy ships real discriminators. These are injectable exclusively through the e2e mock control plane; the production control plane never emits them:
+
+| Constant               | Value               | Dispatch target                   |
+|------------------------|---------------------|-----------------------------------|
+| `EventActionRequest`   | `action_request`    | `actions.HandleActionRequest`     |
+| `EventSSHSessionSetup` | `ssh_session_setup` | `tunnel.HandleSSHSessionSetup`    |
+| `EventSessionRevoked`  | `session_revoked`   | `tunnel.HandleSessionRevoked`     |
 
 ## ReconnectEngine
 
@@ -226,12 +237,31 @@ Manages SSE reconnection with exponential backoff and polling fallback.
 
 ### Failure Classification
 
-| Error Type         | Action                                          |
-|--------------------|-------------------------------------------------|
-| Network / 5xx      | `RetryTransient` — exponential backoff          |
-| 401 Unauthorized   | `RetryAuth` — invoke callback, stop             |
-| 429 Rate Limited   | `RespectServer` — use Retry-After header        |
-| 403 / 404          | `PermanentFailure` — stop reconnection          |
+| Error Type                                | Action                                          |
+|-------------------------------------------|-------------------------------------------------|
+| Network / 5xx                             | `RetryTransient` — exponential backoff          |
+| 401 Unauthorized                          | `RetryAuth` — invoke callback, stop             |
+| 429 Rate Limited                          | `RespectServer` — use Retry-After header        |
+| 403 / 404                                 | `PermanentFailure` — stop reconnection          |
+| 501 `signed_event_bus_not_provisioned`    | `RetryDescoped` — switch to pull-only delivery  |
+
+A 501 carrying `signed_event_bus_not_provisioned` is classified ahead of the generic 5xx match: it is a durable descope of the event stream, not a transient error, so it is answered by pull-only delivery rather than backoff. A 501 with any other code, a 503 `event_stream_unavailable`, and network errors stay on the transient path.
+
+### Delivery Modes
+
+`SSEManager.Mode()` reports which channel currently delivers control-plane state, and `SetOnModeChange` fires on every transition:
+
+| Mode               | Meaning                                                                                     |
+|--------------------|---------------------------------------------------------------------------------------------|
+| `streaming`        | The SSE event stream is attached and live.                                                  |
+| `pull_only`        | The event stream is descoped (`RetryDescoped`). The engine stops polling entirely; the reconciler's own loop is the delivery channel, and SSE is re-probed once per `SSEReprobeInterval` (default 10m). |
+| `degraded_polling` | The legacy transient fallback: after 5 minutes of failing SSE, the engine polls state every 60s while re-probing SSE. |
+
+On a descope the engine enters `pull_only` immediately, with no backoff and no 5-minute polling-fallback window. A successful re-probe returns to `streaming` and resets backoff. During pull-only re-probes, auth failures and 403/404 still propagate as permanent; any other error keeps the engine in pull-only at the re-probe cadence.
+
+### Reconnect-Triggered Pull and Cursor Reset
+
+The server replays only sequences strictly greater than the client's `Last-Event-ID` cursor and never backfills an absent cursor. The client covers gaps itself: `SetReconcileTrigger` fires exactly one `TriggerReconcile()` after every successful SSE connect (HTTP 200). On a 400 while a cursor was set, the stream clears the cursor so the next connect tails from now — the reconcile pull covers the gap. The cursor is in-memory only, so a restart tails from now and the reconciler's first cycle covers the gap.
 
 ### State Machine
 
@@ -241,10 +271,12 @@ stateDiagram-v2
     Disconnected --> Connecting
     Connecting --> Connected
     Connecting --> Backoff : transient error
+    Connecting --> PullOnly : 501 descope
     Connected --> Connecting : connection dropped
     Backoff --> Connecting : delay elapsed
     Backoff --> Polling : threshold exceeded (5 min)
     Polling --> Connecting : periodic SSE retry
+    PullOnly --> Connecting : re-probe (every SSEReprobeInterval)
 ```
 
 ## SSE Parser
@@ -263,6 +295,7 @@ W3C-compliant `text/event-stream` line protocol parser.
 
 - Connects via `ControlPlane.ConnectSSE` with `Accept: text/event-stream`
 - Sends `Last-Event-ID` header on reconnection
-- Parses each `data:` payload as a `SignedEnvelope`
+- Parses each `data:` payload as an `Envelope`
 - Passes envelope through `EventVerifier` before dispatching
+- Dispatches on the verified envelope's `type`, not the frame's `event:` field
 - Malformed events are logged and skipped without disconnecting
