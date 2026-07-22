@@ -635,6 +635,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "capabilities_count": 0,
   "endpoint_count": 0,
   "secrets_count": 0,
+  "secrets_rate_limited_count": 0,
   "report_put_count": 0,
   "report_delete_count": 0,
   "execution_callback_count": 0,
@@ -743,6 +744,33 @@ re-report path.
 
 **Go API:** The `Server` also exposes `SetEndpointTTL(time.Duration)` for direct use in Go test code.
 
+### `POST /test/configure-secrets`
+
+Arms the dials the secret handler reads: the served `current_version`, the count
+of upcoming fetches that answer a `429` (`rate_limit_next`), and the
+`Retry-After` seconds those `429`s carry (`retry_after_seconds`). Lets a test
+exercise version selection and the armed rate-limit path without a live secret
+backend.
+
+**Request body:** strict-decoded — an unknown field is a `400`. Each field is
+applied only when greater than 0, so a partial body leaves the other dials
+untouched.
+
+```json
+{ "current_version": 3, "rate_limit_next": 2, "retry_after_seconds": 5 }
+```
+
+**Response:** `204 No Content`.
+
+**Behavior:**
+
+- `current_version` — the version served in `X-Plexsphere-Secret-Version` and the ceiling a `?version=N` selector is checked against (a higher `?version` yields `404` `secret_version_not_found`).
+- `rate_limit_next` — arms the **next N** fetches to answer `429` `per_node_rate_limited` with a `Retry-After` header, decremented exactly once per fetch so that exactly N fetches are limited; each armed response increments `secrets_rate_limited_count`.
+- `retry_after_seconds` — the value written into the `Retry-After` header of those armed `429`s.
+- Request body is captured and retrievable via `GET /test/last-request/configure_secrets`.
+
+**Error:** Returns `400` if the body is not valid JSON or contains an unknown field. Returns `405` if the HTTP method is not `POST`.
+
 ### `GET /test/last-request/{endpoint}`
 
 Returns the raw request body captured from the last call to the specified endpoint. Useful for asserting that the client sent the correct payload.
@@ -808,8 +836,8 @@ Accepts an audit payload on the local endpoint. Requires Bearer token authentica
 The expected bearer token (`e2e-local-bearer-token`) is provisioned through the same credential chain that plexd uses in production:
 
 1. **Registration** — `POST /v1/register` returns `nsk` as 44-char standard-padded base64; plexd decodes it into the 32-byte AES-256-GCM key
-2. **Secret fetch** — `GET /v1/nodes/{id}/secrets/{key}` returns `ciphertext` and `nonce` (AES-256-GCM encrypted with the NSK)
-3. **Decryption** — plexd decrypts the ciphertext using `nodeapi.DecryptSecret(nsk, ciphertext, nonce)` to recover the bearer token
+2. **Secret fetch** — `GET /v1/nodes/{id}/secrets/{key}` returns the raw AES-256-GCM envelope (`<12-byte nonce> || <ciphertext + 16-byte GCM tag>`) as an `application/octet-stream` body, with the version and KID (`e2e-nsk-kid-1`) in the `X-Plexsphere-Secret-Version` / `X-Plexsphere-Secret-KID` headers and `Cache-Control: no-store`
+3. **Decryption** — plexd opens the envelope with `nodeapi.DecryptSecret(nsk, envelope)` to recover the bearer token
 4. **Authentication** — plexd sends `Authorization: Bearer e2e-local-bearer-token` on each request to the local endpoint
 
 ## Call Counters
@@ -826,7 +854,8 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `key_rotate_count` | `POST /v1/keys/rotate` (completed rotations only) |
 | `capabilities_count` | `PUT /v1/nodes/{id}/capabilities` |
 | `endpoint_count` | `PUT /v1/nodes/{id}/endpoint` |
-| `secrets_count` | `GET /v1/nodes/{id}/secrets/{key}` |
+| `secrets_count` | `GET /v1/nodes/{id}/secrets/{key}` (served `200` envelopes only) |
+| `secrets_rate_limited_count` | `GET /v1/nodes/{id}/secrets/{key}` (armed `429` responses only) |
 | `report_put_count` | `PUT /v1/nodes/{id}/state/reports/{key}` (accepted upserts only) |
 | `report_delete_count` | `DELETE /v1/nodes/{id}/state/reports/{key}` (successful deletes only) |
 | `execution_callback_count` | `POST /v1/nodes/{id}/executions/{eid}` (accepted callbacks only) |

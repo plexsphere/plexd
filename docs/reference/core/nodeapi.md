@@ -48,7 +48,7 @@ type NodeAPIClient interface {
 
 ```go
 type SecretFetcher interface {
-    FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
+    FetchSecret(ctx context.Context, nodeID, name string, version int) (*api.SecretEnvelope, error)
 }
 ```
 
@@ -265,14 +265,13 @@ The server wraps the HTTP mux with middleware that automatically notifies the sy
 ## DecryptSecret
 
 ```go
-func DecryptSecret(nsk []byte, ciphertext string, nonce string) (string, error)
+func DecryptSecret(nsk []byte, envelope []byte) (string, error)
 ```
 
-Decrypts an AES-256-GCM encrypted secret value.
+Opens the raw AES-256-GCM secret envelope under the NSK.
 
 - `nsk` — 32-byte node secret key (raw bytes)
-- `ciphertext` — base64-encoded (standard encoding) ciphertext
-- `nonce` — base64-encoded (standard encoding) GCM nonce
+- `envelope` — the raw envelope bytes `<12-byte nonce> || <ciphertext + 16-byte GCM tag>` (the `Data` field of an `api.SecretEnvelope`)
 - Returns plaintext string on success
 - Returns a generic `"nodeapi: decryption failed"` error on any failure to avoid leaking cryptographic details
 
@@ -365,7 +364,10 @@ Returns the secret reference index (keys and versions, not values).
 
 ### GET /v1/state/secrets/{key}
 
-Fetches, decrypts, and returns a secret value. The secret is fetched from the control plane on each request, decrypted with the node secret key, and returned as plaintext.
+Fetches, decrypts, and returns a secret value. The secret is fetched from the
+control plane on each request, decrypted with the node secret key, and returned
+as plaintext. An optional `?version=N` query (a positive integer) selects an
+older version; omitting it returns the current version.
 
 **Response** `200 OK`:
 
@@ -376,7 +378,10 @@ Fetches, decrypts, and returns a secret value. The secret is fetched from the co
 | Status | Condition                          |
 |--------|------------------------------------|
 | `200`  | Secret fetched and decrypted       |
-| `404`  | Secret not found on control plane  |
+| `400`  | `?version` is not a positive integer, or the key is outside the grammar `^[a-z][a-z0-9_-]{0,62}$` |
+| `403`  | Node not authorized to access this secret |
+| `404`  | Secret — or the requested version — not found on the control plane |
+| `429`  | Upstream rate limit; a `Retry-After` header copies the upstream wait in seconds |
 | `500`  | Decryption failed                  |
 | `503`  | Control plane unavailable          |
 

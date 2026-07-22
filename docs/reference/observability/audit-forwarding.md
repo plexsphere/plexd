@@ -145,7 +145,7 @@ func NewLocalReporter(cfg api.LocalEndpointConfig, fetcher SecretFetcher, nsk []
 
 ```go
 type SecretFetcher interface {
-    FetchSecret(ctx context.Context, nodeID, key string) (*api.SecretResponse, error)
+    FetchSecret(ctx context.Context, nodeID, name string, version int) (*api.SecretEnvelope, error)
 }
 ```
 

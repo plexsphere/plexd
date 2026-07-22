@@ -172,6 +172,11 @@ Secret access requires membership in the `plexd-secrets` group. Secrets are
 fetched from the control plane on demand and decrypted locally using the
 node's secret key. They are never cached to disk.
 
+Secret key names follow the grammar `^[a-z][a-z0-9_-]{0,62}$` — a
+lowercase-leading name of at most 63 characters over `[a-z0-9_-]`. A forward
+slash is outside the grammar, so secret keys never contain one and never need
+URL-encoding.
+
 ### List available secret keys
 
 ```bash
@@ -181,8 +186,8 @@ curl -s --unix-socket /var/run/plexd/api.sock \
 
 ```json
 [
-  { "key": "tls/server.key", "version": 1 },
-  { "key": "db/password", "version": 2 }
+  { "key": "tls_server_key", "version": 1 },
+  { "key": "db_password", "version": 2 }
 ]
 ```
 
@@ -190,20 +195,38 @@ curl -s --unix-socket /var/run/plexd/api.sock \
 
 ```bash
 curl -s --unix-socket /var/run/plexd/api.sock \
-  http://localhost/v1/state/secrets/db%2Fpassword | jq .
+  http://localhost/v1/state/secrets/db_password | jq .
 ```
-
-> URL-encode forward slashes in key names (`/` becomes `%2F`).
 
 ```json
 {
-  "key": "db/password",
+  "key": "db_password",
   "value": "s3cret-p@ssw0rd",
   "version": 2
 }
 ```
 
-If the control plane is unreachable the API returns `503`:
+By default the current version is returned. Pass `?version=N` (a positive
+integer) to read a specific older version:
+
+```bash
+curl -s --unix-socket /var/run/plexd/api.sock \
+  "http://localhost/v1/state/secrets/db_password?version=1" | jq .
+```
+
+The endpoint maps upstream failures to these statuses (the body is always
+`{"error": "<message>"}`):
+
+| Status | Error message               | Cause                                                         |
+|--------|-----------------------------|--------------------------------------------------------------|
+| `400`  | `invalid version`           | `?version` is not a positive integer                         |
+| `400`  | `invalid secret key`        | Key is outside `^[a-z][a-z0-9_-]{0,62}$`                      |
+| `403`  | `forbidden`                 | Node is not authorized to access this secret                 |
+| `404`  | `not found`                 | The secret key — or the requested `?version` — does not exist |
+| `429`  | `rate limited`              | Upstream fetch rate limit; a `Retry-After` header carries the wait in seconds |
+| `503`  | `control plane unavailable` | Control plane unreachable                                    |
+
+For example, an unreachable control plane returns `503`:
 
 ```json
 { "error": "control plane unavailable" }
