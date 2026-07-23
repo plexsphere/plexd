@@ -203,17 +203,18 @@ unattributed.
 ### Supporting types
 
 These types are still part of the API but no longer ride the state snapshot.
-`SigningKeys` arrives via the `signing_key_rotated` SSE event; `SecretRef` feeds
-the secret index via the `node_secrets_updated` SSE event; `DataEntry` is the
+`SigningKeyRotation` is the payload of the `signing_key_rotated` SSE event;
+`SecretRef` is the shape of the local node API's secret index; `DataEntry` is the
 shape the local node API serves for cached data entries.
 
-**SigningKeys**
+**SigningKeyRotation**
 
-| Field               | Type         | JSON Tag                         | Description                   |
-|---------------------|--------------|----------------------------------|-------------------------------|
-| `Current`           | `string`     | `"current"`                      | Current signing public key    |
-| `Previous`          | `string`     | `"previous,omitempty"`           | Previous key (during rotation)|
-| `TransitionExpires` | `*time.Time` | `"transition_expires,omitempty"` | When previous key expires     |
+| Field               | Type        | JSON Tag                | Description                                       |
+|---------------------|-------------|-------------------------|--------------------------------------------------|
+| `KeyID`             | `string`    | `"key_id"`              | Key id of the new current signing key            |
+| `PublicKey`         | `string`    | `"public_key"`          | Base64 Ed25519 public key of the new current key |
+| `PreviousKeyID`     | `string`    | `"previous_key_id"`     | Prior key id kept valid during the grace window  |
+| `TransitionExpires` | `time.Time` | `"transition_expires"`  | When the previous key id stops being accepted    |
 
 **DataEntry**
 
@@ -610,42 +611,40 @@ Returns `io.ReadCloser` with the binary stream. No request/response struct — p
 
 Returns `text/event-stream` with signed event envelopes.
 
-**SignedEnvelope**
+**Envelope**
 
-| Field      | Type              | JSON Tag      | Description                    |
-|------------|-------------------|---------------|--------------------------------|
-| `EventType`| `string`          | `"event_type"`| Event type constant            |
-| `EventID`  | `string`          | `"event_id"`  | Unique event identifier        |
-| `IssuedAt` | `time.Time`       | `"issued_at"` | Event timestamp                |
-| `Nonce`    | `string`          | `"nonce"`     | Replay protection nonce        |
-| `Payload`  | `json.RawMessage` | `"payload"`   | Event-specific JSON payload    |
-| `Signature`| `string`          | `"signature"` | Ed25519 signature              |
+| Field       | Type              | JSON Tag       | Description                                   |
+|-------------|-------------------|----------------|-----------------------------------------------|
+| `ID`        | `string`          | `"id"`         | Unique event identifier (required)            |
+| `Type`      | `string`          | `"type"`       | Event type discriminator (required)           |
+| `Scope`     | `string`          | `"scope"`      | Scope the event applies to                    |
+| `KeyID`     | `string`          | `"key_id"`     | Key id that selects the verifying signing key |
+| `IssuedAt`  | `time.Time`       | `"issued_at"`  | Event timestamp                               |
+| `Payload`   | `json.RawMessage` | `"payload"`    | Event-specific JSON payload                   |
+| `Signature` | `string`          | `"signature"`  | Base64 Ed25519 signature over the canonical form |
+
+`ParseEnvelope` requires `id` and `type`. See [Event Verification](event-verification.md)
+for the canonical form and signature rules.
 
 ### Event Types
 
-| Constant                    | Value                     | Description                    |
-|-----------------------------|---------------------------|--------------------------------|
-| `EventPeerAdded`            | `peer_added`              | New peer joined mesh           |
-| `EventPeerRemoved`          | `peer_removed`            | Peer left mesh                 |
-| `EventPeerKeyRotated`       | `peer_key_rotated`        | Peer rotated WireGuard key     |
-| `EventPeerEndpointChanged`  | `peer_endpoint_changed`   | Peer endpoint updated          |
-| `EventPolicyUpdated`        | `policy_updated`          | Network policy changed         |
-| `EventActionRequest`        | `action_request`          | Remote action requested        |
-| `EventSessionRevoked`       | `session_revoked`         | Session revoked                |
-| `EventSSHSessionSetup`      | `ssh_session_setup`       | SSH session initiated          |
-| `EventRotateKeys`           | `rotate_keys`             | Key rotation requested         |
-| `EventSigningKeyRotated`    | `signing_key_rotated`     | Signing key rotated            |
-| `EventNodeStateUpdated`     | `node_state_updated`      | Node state changed             |
-| `EventNodeSecretsUpdated`   | `node_secrets_updated`    | Node secrets changed           |
-| `EventBridgeConfigUpdated`  | `bridge_config_updated`   | Bridge configuration changed   |
-| `EventRelaySessionAssigned` | `relay_session_assigned`  | Relay session assigned         |
-| `EventRelaySessionRevoked`  | `relay_session_revoked`   | Relay session revoked          |
-| `EventUserAccessConfigUpdated` | `user_access_config_updated` | User access config changed |
-| `EventUserAccessPeerAssigned`  | `user_access_peer_assigned`  | User access peer assigned  |
-| `EventUserAccessPeerRevoked`   | `user_access_peer_revoked`   | User access peer revoked   |
-| `EventIngressConfigUpdated`    | `ingress_config_updated`     | Ingress config changed     |
-| `EventIngressRuleAssigned`     | `ingress_rule_assigned`      | Ingress rule assigned      |
-| `EventIngressRuleRevoked`      | `ingress_rule_revoked`       | Ingress rule revoked       |
-| `EventSiteToSiteConfigUpdated`   | `site_to_site_config_updated`   | Site-to-site config changed   |
-| `EventSiteToSiteTunnelAssigned`  | `site_to_site_tunnel_assigned`  | Site-to-site tunnel assigned  |
-| `EventSiteToSiteTunnelRevoked`   | `site_to_site_tunnel_revoked`   | Site-to-site tunnel revoked   |
+The event set is organized in three tiers. Contract types are emitted today;
+documented-coming types are named for the platform's 14-type taxonomy; test-only
+types are injectable exclusively through the e2e mock. Reconcile-driving payloads
+are opaque — the state pull is authoritative.
+
+| Constant                   | Value                   | Tier              |
+|----------------------------|-------------------------|-------------------|
+| `EventNodeStateUpdated`    | `node_state_updated`    | contract          |
+| `EventPolicyUpdated`       | `policy_updated`        | contract          |
+| `EventBridgeConfigUpdated` | `bridge_config_updated` | contract          |
+| `EventPeerRegistered`      | `peer_registered`       | documented-coming |
+| `EventPeerPSKAssigned`     | `peer_psk_assigned`     | documented-coming |
+| `EventPeerDeregistered`    | `peer_deregistered`     | documented-coming |
+| `EventPeerEndpointChanged` | `peer_endpoint_changed` | documented-coming |
+| `EventPeerKeyRotated`      | `peer_key_rotated`      | documented-coming |
+| `EventRotateKeys`          | `rotate_keys`           | documented-coming |
+| `EventSigningKeyRotated`   | `signing_key_rotated`   | documented-coming |
+| `EventActionRequest`       | `action_request`        | test-only         |
+| `EventSSHSessionSetup`     | `ssh_session_setup`     | test-only         |
+| `EventSessionRevoked`      | `session_revoked`       | test-only         |

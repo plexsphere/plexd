@@ -37,9 +37,7 @@ External Network
 |  | (OS routing ops)   |                                          |
 |  +--------------------+                                          |
 |                                                                 |
-|  Control Plane --SSE--> HandleSiteToSiteTunnelAssigned           |
-|                --SSE--> HandleSiteToSiteTunnelRevoked             |
-|                --SSE--> HandleSiteToSiteConfigUpdated             |
+|  Control Plane --SSE--> bridge_config_updated --> reconcile      |
 |                --Rec--> SiteToSiteReconcileHandler                |
 +-----------------------------------------------------------------+
 ```
@@ -113,7 +111,7 @@ type VPNController interface {
 
 ## SiteToSiteManager
 
-Central coordinator for site-to-site VPN lifecycle. Concurrent-safe via `sync.Mutex` — SSE event handlers and the reconcile loop may invoke methods concurrently.
+Central coordinator for site-to-site VPN lifecycle. Concurrent-safe via `sync.Mutex` — the reconcile handler and status readers may invoke methods concurrently.
 
 ### Constructor
 
@@ -144,7 +142,7 @@ if err := mgr.Setup(); err != nil {
     log.Fatal(err)
 }
 
-// Add a tunnel (driven by SSE handler or reconciliation)
+// Add a tunnel (driven by the reconcile handler)
 err := mgr.AddTunnel(api.SiteToSiteTunnel{
     TunnelID:        "site-hq",
     RemoteEndpoint:  "203.0.113.1:51820",
@@ -209,48 +207,17 @@ On failure at any step, AddTunnel performs full rollback of all completed operat
 
 Errors during removal are logged but do not prevent cleanup of remaining resources.
 
-## SSE Event Handlers
+## SSE Event Handling
 
-### HandleSiteToSiteTunnelAssigned
-
-```go
-func HandleSiteToSiteTunnelAssigned(mgr *SiteToSiteManager, logger *slog.Logger) api.EventHandler
-```
-
-Handles `site_to_site_tunnel_assigned` events. Parses `api.SiteToSiteTunnel` from the envelope payload and calls `mgr.AddTunnel(tunnel)`.
-
-- On parse error: logs and returns wrapped error
-- On `AddTunnel` error: returns wrapped error
-
-### HandleSiteToSiteTunnelRevoked
-
-```go
-func HandleSiteToSiteTunnelRevoked(mgr *SiteToSiteManager, logger *slog.Logger) api.EventHandler
-```
-
-Handles `site_to_site_tunnel_revoked` events. Parses `tunnel_id` from the envelope payload and calls `mgr.RemoveTunnel(tunnelID)`.
-
-- On parse error: logs and returns wrapped error
-- `RemoveTunnel` is a no-op if the tunnel does not exist
-
-### HandleSiteToSiteConfigUpdated
-
-```go
-func HandleSiteToSiteConfigUpdated(trigger ReconcileTrigger) api.EventHandler
-```
-
-Handles `site_to_site_config_updated` events. Calls `trigger.TriggerReconcile()` to request an immediate reconciliation cycle. The event payload is not parsed — any config update triggers a full reconcile.
-
-### Registration
+There are no site-to-site-specific SSE handlers. The control plane emits a single
+`bridge_config_updated` event with an opaque payload; `bridge.HandleBridgeConfigUpdated`
+dispatches it to `TriggerReconcile()`, and the `SiteToSiteReconcileHandler` below
+applies the desired site-to-site subtree from the authoritative state snapshot.
 
 ```go
 dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventSiteToSiteTunnelAssigned,
-    bridge.HandleSiteToSiteTunnelAssigned(s2sMgr, logger))
-dispatcher.Register(api.EventSiteToSiteTunnelRevoked,
-    bridge.HandleSiteToSiteTunnelRevoked(s2sMgr, logger))
-dispatcher.Register(api.EventSiteToSiteConfigUpdated,
-    bridge.HandleSiteToSiteConfigUpdated(reconciler))
+dispatcher.Register(api.EventBridgeConfigUpdated,
+    bridge.HandleBridgeConfigUpdated(reconciler))
 ```
 
 ## SiteToSiteReconcileHandler
@@ -332,11 +299,12 @@ type SiteToSiteInfo struct {
 
 ### SSE Event Constants
 
-| Constant                                | Value                              |
-|-----------------------------------------|------------------------------------|
-| `api.EventSiteToSiteConfigUpdated`      | `"site_to_site_config_updated"`    |
-| `api.EventSiteToSiteTunnelAssigned`     | `"site_to_site_tunnel_assigned"`   |
-| `api.EventSiteToSiteTunnelRevoked`      | `"site_to_site_tunnel_revoked"`    |
+Site-to-site changes are delivered through the single bridge event constant; the
+fine-grained `site_to_site_*` constants have been removed.
+
+| Constant                        | Value                     |
+|---------------------------------|---------------------------|
+| `api.EventBridgeConfigUpdated`  | `"bridge_config_updated"` |
 
 ## Error Prefixes
 
@@ -350,8 +318,6 @@ type SiteToSiteInfo struct {
 | `SiteToSiteManager.AddTunnel` (add route)        | `bridge: site-to-site: add route <subnet> for tunnel <id>: `    |
 | `SiteToSiteManager.Teardown` (remove route)      | `bridge: site-to-site: remove route <subnet> for tunnel <id>: ` |
 | `SiteToSiteManager.Teardown` (remove iface)      | `bridge: site-to-site: remove interface for tunnel <id>: `       |
-| `HandleSiteToSiteTunnelAssigned`                  | `bridge: site_to_site_tunnel_assigned: `                         |
-| `HandleSiteToSiteTunnelRevoked`                   | `bridge: site_to_site_tunnel_revoked: `                          |
 
 ## Logging
 
@@ -366,7 +332,6 @@ All site-to-site log entries use `component=bridge`.
 | `Error` | Remove route failed             | `tunnel_id`, `subnet`, `error`                       |
 | `Error` | Remove peer failed              | `tunnel_id`, `error`                                 |
 | `Error` | Remove interface failed         | `tunnel_id`, `error`                                 |
-| `Error` | SSE parse payload failed        | `event_id`, `error`                                  |
 | `Error` | Reconcile: add tunnel failed    | `tunnel_id`, `error`                                 |
 
 ## Integration Points
@@ -387,7 +352,9 @@ r.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
 
 ### SSE Real-Time Updates
 
-Tunnel-level events (`tunnel_assigned`/`tunnel_revoked`) enable immediate response to individual tunnel changes. The `config_updated` event triggers a full reconcile for bulk changes.
+The `bridge_config_updated` event triggers a full reconcile; the
+`SiteToSiteReconcileHandler` then applies the desired tunnel set from the state
+snapshot. There are no per-tunnel events.
 
 ### Control Plane Types
 
@@ -398,10 +365,8 @@ Tunnel-level events (`tunnel_assigned`/`tunnel_revoked`) enable immediate respon
 | `api.SiteToSiteInfo`                      | `internal/api` | Site-to-site status in heartbeats               |
 | `api.BridgeSnapshot`                      | `internal/api` | Snapshot `bridge` subtree (contains `SiteToSite`) |
 | `api.HeartbeatRequest`                    | `internal/api` | Heartbeat payload (contains `SiteToSiteInfo`)   |
-| `api.SignedEnvelope`                      | `internal/api` | SSE event wrapper                               |
-| `api.EventSiteToSiteConfigUpdated`        | `internal/api` | Event type `"site_to_site_config_updated"`      |
-| `api.EventSiteToSiteTunnelAssigned`       | `internal/api` | Event type `"site_to_site_tunnel_assigned"`     |
-| `api.EventSiteToSiteTunnelRevoked`        | `internal/api` | Event type `"site_to_site_tunnel_revoked"`      |
+| `api.Envelope`                            | `internal/api` | SSE event wrapper                               |
+| `api.EventBridgeConfigUpdated`            | `internal/api` | Event type `"bridge_config_updated"`            |
 
 ### Heartbeat Reporting
 
@@ -444,14 +409,10 @@ s2sMgr := bridge.NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg, logger)
 // Setup site-to-site manager
 s2sMgr.Setup()
 
-// Register SSE handlers
+// Register the bridge SSE handler
 dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventSiteToSiteTunnelAssigned,
-    bridge.HandleSiteToSiteTunnelAssigned(s2sMgr, logger))
-dispatcher.Register(api.EventSiteToSiteTunnelRevoked,
-    bridge.HandleSiteToSiteTunnelRevoked(s2sMgr, logger))
-dispatcher.Register(api.EventSiteToSiteConfigUpdated,
-    bridge.HandleSiteToSiteConfigUpdated(reconciler))
+dispatcher.Register(api.EventBridgeConfigUpdated,
+    bridge.HandleBridgeConfigUpdated(reconciler))
 
 // Register reconcile handler
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)

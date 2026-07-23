@@ -93,7 +93,7 @@ When plexd receives a shutdown signal (`SIGTERM`, `SIGINT`) or the `plexd deregi
 
 1. **Stop accepting new work** - Stop accepting new action requests and SSE events.
 2. **Drain in-flight executions** - Wait for all running action/hook executions to complete (up to 30s grace period). After the grace period, running executions are cancelled and reported as `cancelled` to the control plane.
-3. **Notify control plane** - Send `POST /v1/nodes/{node_id}/deregister` to inform the control plane. The control plane removes the node from peer lists and pushes `peer_removed` events to all peers.
+3. **Notify control plane** - Send `POST /v1/nodes/{node_id}/deregister` to inform the control plane. The control plane removes the node from peer lists and pushes `peer_deregistered` events to all peers.
 4. **Tear down tunnels** - Remove all WireGuard peers from the `plexd0` interface and delete the interface.
 5. **Stop subsystems** - Stop log forwarding, audit collection, observability reporting, access proxy, and heartbeat.
 6. **Clean up local state** - Optionally (when `--purge` is passed) remove all data from `data_dir`, including private keys and cached state. Without `--purge`, state is preserved for potential re-registration.

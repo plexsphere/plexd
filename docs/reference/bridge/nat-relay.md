@@ -28,8 +28,7 @@ Peer A                                                      Peer B
 │         │         (pre-allocated 64KB buf)        ▼               │
 │         └────────────────────────────────────────┘               │
 │                                                                  │
-│  Control Plane ──SSE──▶ HandleRelaySessionAssigned               │
-│                ──SSE──▶ HandleRelaySessionRevoked                │
+│  Control Plane ──SSE──▶ bridge_config_updated ─▶ reconcile       │
 │                ──Rec──▶ RelayReconcileHandler                    │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -182,38 +181,17 @@ type RelaySession struct {
 
 `Close()` is idempotent — calling it multiple times returns `nil`.
 
-## SSE Event Handlers
+## SSE Event Handling
 
-### HandleRelaySessionAssigned
-
-```go
-func HandleRelaySessionAssigned(relay *Relay, logger *slog.Logger) api.EventHandler
-```
-
-Handles `relay_session_assigned` events. Parses `api.RelaySessionAssignment` from the envelope payload and calls `relay.AddSession(assignment)`.
-
-- On parse error: logs and returns wrapped error
-- On `AddSession` error: returns wrapped error
-
-### HandleRelaySessionRevoked
-
-```go
-func HandleRelaySessionRevoked(relay *Relay, logger *slog.Logger) api.EventHandler
-```
-
-Handles `relay_session_revoked` events. Parses `session_id` from the envelope payload and calls `relay.RemoveSession(sessionID)`.
-
-- On parse error: logs and returns wrapped error
-- `RemoveSession` is a no-op if the session does not exist
-
-### Registration
+There are no relay-specific SSE handlers. The control plane emits a single
+`bridge_config_updated` event with an opaque payload; `bridge.HandleBridgeConfigUpdated`
+dispatches it to `TriggerReconcile()`, and the `RelayReconcileHandler` below
+applies the desired relay subtree from the authoritative state snapshot.
 
 ```go
 dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventRelaySessionAssigned,
-    bridge.HandleRelaySessionAssigned(mgr.Relay(), logger))
-dispatcher.Register(api.EventRelaySessionRevoked,
-    bridge.HandleRelaySessionRevoked(mgr.Relay(), logger))
+dispatcher.Register(api.EventBridgeConfigUpdated,
+    bridge.HandleBridgeConfigUpdated(reconciler))
 ```
 
 ## RelayReconcileHandler
@@ -292,10 +270,6 @@ r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(bridge.RelayReconcileHandler(mgr.Relay(), logger))
 
 dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventRelaySessionAssigned,
-    bridge.HandleRelaySessionAssigned(mgr.Relay(), logger))
-dispatcher.Register(api.EventRelaySessionRevoked,
-    bridge.HandleRelaySessionRevoked(mgr.Relay(), logger))
 dispatcher.Register(api.EventBridgeConfigUpdated,
     bridge.HandleBridgeConfigUpdated(r))
 
@@ -354,10 +328,12 @@ Reported in heartbeats via `api.BridgeInfo`:
 
 ### SSE Event Constants
 
-| Constant                       | Value                       |
-|--------------------------------|-----------------------------|
-| `api.EventRelaySessionAssigned`| `"relay_session_assigned"`  |
-| `api.EventRelaySessionRevoked` | `"relay_session_revoked"`   |
+Relay changes are delivered through the single bridge event constant; the
+fine-grained `relay_*` constants have been removed.
+
+| Constant                        | Value                     |
+|---------------------------------|---------------------------|
+| `api.EventBridgeConfigUpdated`  | `"bridge_config_updated"` |
 
 ## Error Prefixes
 
@@ -367,8 +343,6 @@ Reported in heartbeats via `api.BridgeInfo`:
 | `Relay.AddSession` (resolve) | `bridge: relay: resolve peer A/B endpoint`  |
 | `Relay.AddSession` (dup)     | `bridge: relay: duplicate session ID: `     |
 | `Relay.AddSession` (max)     | `bridge: relay: max sessions reached`       |
-| `HandleRelaySessionAssigned` | `bridge: relay_session_assigned: `          |
-| `HandleRelaySessionRevoked`  | `bridge: relay_session_revoked: `           |
 
 ## Logging
 
@@ -384,4 +358,3 @@ All relay log entries use `component=bridge`.
 | `Debug` | Dropping packet (unknown src)  | `session_id`, `source`                         |
 | `Error` | Forward failed                 | `session_id`, `dst`, `error`                   |
 | `Error` | Relay reconcile: add failed    | `session_id`, `error`                          |
-| `Error` | SSE parse payload failed       | `event_id`, `error`                            |

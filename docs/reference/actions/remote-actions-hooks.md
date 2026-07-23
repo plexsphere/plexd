@@ -804,7 +804,7 @@ The control plane sends an `action_request` event over the existing SSE stream t
 | `timeout` | duration | Maximum execution time (default: 30s) |
 | `callback_url` | string | URL for execution status callbacks |
 
-The `issued_at`, `nonce`, and `signature` fields are part of the signed event envelope and apply to all SSE events uniformly.
+The `issued_at`, `key_id`, and `signature` fields are part of the signed event envelope and apply to all SSE events uniformly.
 
 ## Execution Callback Contract
 
@@ -1046,8 +1046,8 @@ Stdout and stderr are captured from the pod logs via the Kubernetes API.
 
 ## Security Considerations
 
-- **Signed delivery** -- All SSE events (including `action_request`, `peer_added`, `peer_removed`, `rotate_keys`, etc.) are signed with the control plane's Ed25519 key. plexd verifies every signature before processing. Local action requests via Unix socket require a valid session JWT.
-- **Replay protection** -- Every SSE event includes `issued_at` (max staleness: 5 minutes) and `nonce` (tracked in bounded set). Signature verification, staleness, and nonce checks are applied uniformly to all event types.
+- **Signed delivery** -- All SSE events (including `action_request`, `node_state_updated`, `rotate_keys`, etc.) are signed with the control plane's Ed25519 key. plexd verifies every signature before processing. Local action requests via Unix socket require a valid session JWT.
+- **Signature verification** -- Every SSE event carries `issued_at` (max staleness: 5 minutes) and is verified with a kid-indexed Ed25519 signature selected by the envelope's `key_id`. Signature and staleness checks are applied uniformly to all event types; there is no nonce.
 - **Hook file permissions** -- plexd verifies that hook files are owned by root and not group- or other-writable before execution.
 - **Symlink protection** -- Hook paths are resolved and validated to prevent symlink escape outside the configured hooks directory.
 - **Checksum enforcement** -- Hook checksums are verified before every execution. Binary checksums are reported continuously. On Kubernetes, image digests serve as checksums -- hooks without pinned digest (`@sha256:...`) are rejected.

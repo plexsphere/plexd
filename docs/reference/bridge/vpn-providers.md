@@ -422,14 +422,10 @@ status := accessMgr.UserAccessStatus()
 //     ListenPort: 51822, ProviderName: "tailscale", ProviderStatus: "running",
 // }
 
-// Register SSE handlers
+// Register the bridge SSE handler
 dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventUserAccessPeerAssigned,
-    bridge.HandleUserAccessPeerAssigned(accessMgr, logger))
-dispatcher.Register(api.EventUserAccessPeerRevoked,
-    bridge.HandleUserAccessPeerRevoked(accessMgr, logger))
-dispatcher.Register(api.EventUserAccessConfigUpdated,
-    bridge.HandleUserAccessConfigUpdated(reconciler))
+dispatcher.Register(api.EventBridgeConfigUpdated,
+    bridge.HandleBridgeConfigUpdated(reconciler))
 
 // Register reconcile handler
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)

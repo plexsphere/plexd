@@ -212,31 +212,19 @@ r.RegisterHandler(wireguard.ReconcileHandler(mgr))
 
 The agent registers this handler **only when WireGuard `Setup` succeeded**. On hosts without a programmable WireGuard stack the interface fails to come up, the agent continues without WireGuard, and the peer reconcile handler is skipped — a handler that failed every cycle would hold the reconciler snapshot back and prevent convergence (for example, the policy fingerprint short-circuit could never hold).
 
-## SSE Event Handlers
+## Peer Programming
 
-Factory functions returning `api.EventHandler` for real-time peer topology updates. Each parses the `SignedEnvelope.Payload` and calls the appropriate `Manager` method.
+There are no WireGuard-specific SSE handlers. Peers are programmed from the
+authoritative state snapshot, not from fine-grained events. The peer topology
+events (`peer_registered`, `peer_psk_assigned`, `peer_deregistered`,
+`peer_endpoint_changed`, `peer_key_rotated`) carry opaque payloads and dispatch to
+`TriggerReconcile()`; the reconcile loop then pulls the snapshot and
+`ReconcileHandler` (see above) converges the interface.
 
-| Factory                    | Event Type              | Payload Type               | Action                              |
-|----------------------------|-------------------------|----------------------------|-------------------------------------|
-| `HandlePeerAdded`          | `peer_added`            | `api.Peer`                 | `AddPeer`                           |
-| `HandlePeerRemoved`        | `peer_removed`          | `{"peer_id": "..."}`       | `RemovePeerByID`                    |
-| `HandlePeerKeyRotated`     | `peer_key_rotated`      | `api.Peer` (new key)       | `RemovePeerByID` + `AddPeer`        |
-| `HandlePeerEndpointChanged`| `peer_endpoint_changed` | `api.Peer` (new endpoint)  | `UpdatePeer`                        |
-
-- Malformed payloads are logged at error level and return an error (the dispatcher logs but does not halt)
-- `HandlePeerKeyRotated` removes the old peer first (via index lookup), then adds with the new key. If removal fails (e.g., peer already removed), it continues with the add.
-
-### Registration
-
-```go
-mgr := wireguard.NewManager(ctrl, wireguard.Config{}, logger)
-
-dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventPeerAdded, wireguard.HandlePeerAdded(mgr))
-dispatcher.Register(api.EventPeerRemoved, wireguard.HandlePeerRemoved(mgr))
-dispatcher.Register(api.EventPeerKeyRotated, wireguard.HandlePeerKeyRotated(mgr))
-dispatcher.Register(api.EventPeerEndpointChanged, wireguard.HandlePeerEndpointChanged(mgr))
-```
+`peerFromSnapshot(api.SnapshotPeer) (api.Peer, error)` builds each programmed
+peer from a snapshot entry, deriving `AllowedIPs` locally as `mesh_ip/32`. The
+manager then adds, updates, or removes peers so the interface matches the desired
+set.
 
 ## Integration Points
 
@@ -256,7 +244,9 @@ The reconcile handler ensures WireGuard state converges to desired state even af
 
 ### SSE Real-Time Updates
 
-SSE handlers provide immediate mesh topology updates. The reconcile loop catches any missed changes on its next cycle — SSE handlers do not trigger reconciliation.
+Peer topology events trigger a reconcile for a prompt convergence; the reconcile
+loop also catches any missed changes on its next cycle. The snapshot pull, not the
+event payload, is authoritative.
 
 ### Graceful Shutdown
 
