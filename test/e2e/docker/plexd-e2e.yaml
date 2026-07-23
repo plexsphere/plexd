@@ -63,3 +63,14 @@ audit_fwd:
     url: https://mock-api:8443/local/audit
     secret_key: local-bearer-token
     tls_insecure_skip_verify: true
+
+# The service.upgrade builtin downloads release assets from this fixture
+# channel, checks their SHA-256, and verifies the co-located Sigstore bundle
+# offline before swapping the binary. These values pin the checked-in
+# fixture's signing identity and MUST change together with the fixture files
+# (see the Makefile upgrade-fixture target). trusted_root_path is left unset
+# so verification uses the embedded trusted root and stays fully offline.
+upgrade:
+  release_base_url: "http://mock-api:8080/releases"
+  signing_identity_regexp: '^https://github\.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/\.github/workflows/extremely-dangerous-oidc-beacon\.yml@refs/heads/main$'
+  signing_issuer: "https://token.actions.githubusercontent.com"

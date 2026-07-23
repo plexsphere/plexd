@@ -15,6 +15,7 @@
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Pull-only delivery under a descoped event bus (quiet SSE re-probing)
 #   - Last-Event-ID resume replays buffered envelopes after a descope window
+#   - release-verdict upgrade flow (checksum + offline Sigstore verification)
 #   - Graceful shutdown (exit code 0, no crash indicators)
 set -euo pipefail
 
@@ -2651,6 +2652,143 @@ if [ "${RES_PASSED}" -eq 0 ]; then
 fi
 
 echo "=== Phase 18 PASSED: Last-Event-ID resume after a descope window ==="
+
+# ===================================================================
+# Phase 19: release-verdict upgrade flow
+# ===================================================================
+# The service.upgrade builtin downloads a release asset from the mock's
+# /releases fixture channel, compares its SHA-256 to the dispatched checksum,
+# then verifies the co-located Sigstore bundle offline against the embedded
+# trusted root and the configured signing identity/issuer. This phase drives
+# three dispatches: a valid release (upgraded_restart_pending), a mismatched
+# checksum (checksum_mismatch), and a garbage bundle (bundle_verification_failed).
+#
+# It runs last among the functional phases because the first dispatch replaces
+# the on-disk plexd binary with the 109-byte fixture blob. The running process
+# is untouched (systemctl is absent in the container), and only the shutdown
+# block below follows -- it signals the running process and does not re-exec
+# the on-disk binary.
+echo "=== Testing release-verdict upgrade flow ==="
+
+# Compute the fixture blob's digest at runtime (reusing the sha256_hex probe
+# from the top of the file) so this phase survives fixture regeneration via the
+# Makefile upgrade-fixture target. SCRIPT_DIR is test/e2e/docker, so the blob
+# lives one directory up under mockapi/testdata.
+FIXTURE_DIGEST=$(sha256_hex < "${SCRIPT_DIR}/../mockapi/testdata/fixture.bin")
+if [ -z "${FIXTURE_DIGEST}" ]; then
+    fail "could not compute SHA-256 of fixture.bin"
+fi
+echo "  fixture.bin SHA-256: ${FIXTURE_DIGEST}"
+
+# SHA-256 of empty input; used to force a checksum_mismatch verdict.
+EMPTY_DIGEST="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+# dispatch_upgrade injects a service.upgrade action_request and asserts its
+# terminal execution callback. Args: event-id execution-id version checksum
+# expected-callback-status expected-output-status. Like Phase 8, a run posts
+# three callbacks (ack -> started -> terminal) and the last-request endpoint
+# captures only the most recent, so polling +3 then reading it yields the
+# terminal callback.
+dispatch_upgrade() {
+    local evt_id=$1 exec_id=$2 version=$3 checksum=$4 want_cb=$5 want_out=$6
+
+    local cb_before
+    cb_before=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+    echo "  [${exec_id}] execution_callback_count before: ${cb_before}"
+
+    local payload
+    payload=$(cat <<UPGEOF
+{
+    "id": "${evt_id}",
+    "type": "action_request",
+    "scope": "node",
+    "payload": {
+        "execution_id": "${exec_id}",
+        "action": "service.upgrade",
+        "timeout": "60s",
+        "parameters": {
+            "version": "${version}",
+            "checksum": "${checksum}"
+        }
+    }
+}
+UPGEOF
+    )
+    local inject_status
+    inject_status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${payload}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${inject_status}" != "204" ]; then
+        fail "[${exec_id}] service.upgrade inject returned status ${inject_status}, want 204"
+    fi
+
+    # Poll until the callback counter advances by >= 3 (ack + started +
+    # terminal). The first dispatch performs a real Sigstore verification, so
+    # allow a generous window.
+    local timeout=60 elapsed=0 passed=0 cb_after=0
+    while [ "${elapsed}" -lt "${timeout}" ]; do
+        sleep 2
+        elapsed=$((elapsed + 2))
+        cb_after=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+        if [ "${cb_after}" -ge $((cb_before + 3)) ]; then
+            passed=1
+            break
+        fi
+    done
+    if [ "${passed}" -eq 0 ]; then
+        fail "[${exec_id}] execution_callback_count did not reach $((cb_before + 3)) (before=${cb_before}, after=${cb_after})"
+    fi
+    echo "  [${exec_id}] PASS: execution_callback_count advanced ${cb_before} -> ${cb_after} (>= +3)"
+
+    local cb_body cb_status cb_inline out_status
+    cb_body=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
+    if [ -z "${cb_body}" ]; then
+        fail "[${exec_id}] no execution_callback body captured"
+    fi
+
+    cb_status=$(echo "${cb_body}" | jq -r '.status // empty')
+    if [ "${cb_status}" != "${want_cb}" ]; then
+        fail "[${exec_id}] terminal callback status = '${cb_status}', want '${want_cb}'"
+    fi
+    echo "  [${exec_id}] PASS: terminal callback status = ${cb_status}"
+
+    cb_inline=$(echo "${cb_body}" | jq -r '.output.inline // empty')
+    if [ -z "${cb_inline}" ]; then
+        fail "[${exec_id}] terminal callback missing non-empty output.inline"
+    fi
+
+    out_status=$(printf '%s' "${cb_inline}" | b64_decode | jq -r '.status // empty')
+    if [ "${out_status}" != "${want_out}" ]; then
+        fail "[${exec_id}] output status = '${out_status}', want '${want_out}'"
+    fi
+    echo "  [${exec_id}] PASS: output status = ${out_status}"
+}
+
+# Dispatch 1: valid release asset + matching checksum. systemctl is absent in
+# the container, so the terminal status is upgraded_restart_pending, exit 0.
+dispatch_upgrade "evt-e2e-upgrade-001" "exec-e2e-upgrade-001" \
+    "v9.9.9" "${FIXTURE_DIGEST}" "succeeded" "upgraded_restart_pending"
+UPG_CB=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
+UPG_EXIT=$(echo "${UPG_CB}" | jq -r '.exit_code // empty')
+if [ "${UPG_EXIT}" != "0" ]; then
+    fail "[exec-e2e-upgrade-001] terminal callback exit_code = '${UPG_EXIT}', want 0"
+fi
+echo "  PASS: v9.9.9 upgrade succeeded with exit_code 0 (restart pending)"
+
+# Dispatch 2: valid release asset but a checksum that cannot match (empty-input
+# digest) -> checksum_mismatch, callback failed, before the bundle is fetched.
+dispatch_upgrade "evt-e2e-upgrade-002" "exec-e2e-upgrade-002" \
+    "v9.9.9" "${EMPTY_DIGEST}" "failed" "checksum_mismatch"
+echo "  PASS: mismatched checksum rejected as checksum_mismatch"
+
+# Dispatch 3: matching checksum but the v9.9.8 tag serves a garbage (non-JSON)
+# Sigstore bundle -> bundle_verification_failed, callback failed.
+dispatch_upgrade "evt-e2e-upgrade-003" "exec-e2e-upgrade-003" \
+    "v9.9.8" "${FIXTURE_DIGEST}" "failed" "bundle_verification_failed"
+echo "  PASS: garbage Sigstore bundle rejected as bundle_verification_failed"
+
+echo "=== Phase 19 PASSED: release-verdict upgrade flow ==="
 
 # ===================================================================
 # Phase 11: Graceful shutdown verification
