@@ -51,7 +51,7 @@ func fixtureIdentity(t *testing.T, bundleJSON []byte) (issuer, san string) {
 	if err != nil {
 		t.Fatalf("summarize fixture certificate: %v", err)
 	}
-	return summary.Extensions.Issuer, summary.SubjectAlternativeName
+	return summary.Issuer, summary.SubjectAlternativeName
 }
 
 // acceptConfig builds a Config whose identity policy matches the fixture leaf.
