@@ -38,8 +38,8 @@ func TestClient_AuthHeaderInjected(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 	c.SetAuthToken("tok123")
 
-	if err := c.Ping(context.Background()); err != nil {
-		t.Fatalf("Ping: %v", err)
+	if err := c.GetJSON(context.Background(), "/v1/health", nil); err != nil {
+		t.Fatalf("GetJSON: %v", err)
 	}
 	if gotAuth != "Bearer tok123" {
 		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer tok123")
@@ -56,8 +56,8 @@ func TestClient_UserAgentSet(t *testing.T) {
 
 	c := newTestClient(t, srv.URL)
 
-	if err := c.Ping(context.Background()); err != nil {
-		t.Fatalf("Ping: %v", err)
+	if err := c.GetJSON(context.Background(), "/v1/health", nil); err != nil {
+		t.Fatalf("GetJSON: %v", err)
 	}
 	if gotUA != "plexd/1.2.3" {
 		t.Errorf("User-Agent = %q, want %q", gotUA, "plexd/1.2.3")
@@ -180,7 +180,7 @@ func TestClient_ErrorPropagation(t *testing.T) {
 
 	c := newTestClient(t, srv.URL)
 
-	err := c.Ping(context.Background())
+	err := c.GetJSON(context.Background(), "/v1/health", nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -227,8 +227,8 @@ func TestClient_NewControlPlane_AppliesDefaults(t *testing.T) {
 	}
 
 	// Verify the client works (defaults were applied so timeouts are non-zero).
-	if err := c.Ping(context.Background()); err != nil {
-		t.Fatalf("Ping with defaults: %v", err)
+	if err := c.GetJSON(context.Background(), "/v1/health", nil); err != nil {
+		t.Fatalf("GetJSON with defaults: %v", err)
 	}
 
 	// Verify the httpClient timeout matches the default.

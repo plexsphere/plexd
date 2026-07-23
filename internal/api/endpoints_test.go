@@ -121,7 +121,9 @@ func TestRegister_OmitsAuthHeaderAndPreservesToken(t *testing.T) {
 			return
 		}
 		followupAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
 	})
 	// newEndpointTestClient already set a bearer token on the client.
 
@@ -133,8 +135,8 @@ func TestRegister_OmitsAuthHeaderAndPreservesToken(t *testing.T) {
 	}
 
 	// The shared token is untouched, so later calls still authenticate.
-	if err := client.Ping(context.Background()); err != nil {
-		t.Fatalf("Ping: %v", err)
+	if _, err := client.Heartbeat(context.Background(), "n1", HeartbeatRequest{}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
 	}
 	if followupAuth != "Bearer test-token" {
 		t.Errorf("follow-up Authorization = %q, want %q", followupAuth, "Bearer test-token")
