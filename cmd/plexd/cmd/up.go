@@ -1070,11 +1070,6 @@ func applyEnvOverrides(cfg *agent.AgentConfig) {
 			slog.Warn("invalid PLEXD_ACTIONS_MAX_CONCURRENT", "value", v)
 		}
 	}
-	if v := os.Getenv("PLEXD_NODE_API_ENABLED"); v != "" {
-		// Node API doesn't have an Enabled field; it's always active.
-		// This env var is documented but effectively a no-op in current code.
-		_ = v
-	}
 	if v := os.Getenv("PLEXD_NODE_API_SOCKET"); v != "" {
 		cfg.NodeAPI.SocketPath = v
 	}
