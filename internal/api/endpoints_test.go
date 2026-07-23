@@ -232,26 +232,6 @@ func TestFetchState_ReturnsSnapshot(t *testing.T) {
 	}
 }
 
-func TestDeregister_Success(t *testing.T) {
-	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s, want POST", r.Method)
-		}
-		if r.URL.Path != "/v1/nodes/n1/deregister" {
-			t.Errorf("path = %s, want /v1/nodes/n1/deregister", r.URL.Path)
-		}
-		if r.ContentLength > 0 {
-			t.Errorf("expected no body, got ContentLength = %d", r.ContentLength)
-		}
-		w.WriteHeader(http.StatusOK)
-	})
-
-	err := client.Deregister(context.Background(), "n1")
-	if err != nil {
-		t.Fatalf("Deregister: %v", err)
-	}
-}
-
 func TestRotateKeys_Success(t *testing.T) {
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

@@ -67,13 +67,6 @@ func (c *ControlPlane) Heartbeat(ctx context.Context, nodeID string, req Heartbe
 	return &resp, nil
 }
 
-// Deregister removes a node from the control plane.
-// POST /v1/nodes/{node_id}/deregister
-func (c *ControlPlane) Deregister(ctx context.Context, nodeID string) error {
-	path := fmt.Sprintf("/v1/nodes/%s/deregister", url.PathEscape(nodeID))
-	return c.doRequest(ctx, http.MethodPost, path, nil, nil)
-}
-
 // RotateKeys completes a pending mesh-key rotation; the server identifies the node from the NSK bearer credential.
 // POST /v1/keys/rotate
 func (c *ControlPlane) RotateKeys(ctx context.Context, req KeyRotateRequest) (*KeyRotateResponse, error) {
