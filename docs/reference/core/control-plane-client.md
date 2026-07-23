@@ -64,7 +64,6 @@ All methods accept a `context.Context` for cancellation and return typed respons
 |-----------------------|-----------------|---------------------------------------------------|----------------------|-----------------------|
 | `Register`            | `POST`          | `/v1/register`                                    | `RegisterRequest`    | `*RegisterResponse`   |
 | `Heartbeat`           | `POST`          | `/v1/nodes/{node_id}/heartbeat`                   | `HeartbeatRequest`   | `*HeartbeatResponse`  |
-| `Deregister`          | `POST`          | `/v1/nodes/{node_id}/deregister`                  | —                    | —                     |
 | `FetchState`          | `GET`           | `/v1/nodes/{node_id}/state`                       | —                    | `*NodeStateSnapshot`  |
 | `ConnectSSE`          | `GET`           | `/v1/nodes/{node_id}/events`                      | —                    | `*http.Response`      |
 | `RotateKeys`          | `POST`          | `/v1/keys/rotate`                                 | `KeyRotateRequest`   | `*KeyRotateResponse`  |
@@ -78,14 +77,12 @@ All methods accept a `context.Context` for cancellation and return typed respons
 | `ReportMetrics`       | `POST`          | `/v1/nodes/{node_id}/metrics`                     | `[]MetricSample` (JSON array) | `*IngestReceipt`   |
 | `ReportLogs`          | `POST`          | `/v1/nodes/{node_id}/logs`                        | `[]LogLine` (NDJSON)  | `*IngestReceipt`      |
 | `ReportAudit`         | `POST`          | `/v1/nodes/{node_id}/audit`                       | `[]AuditEvent` (NDJSON)| `*IngestReceipt`     |
-| `FetchArtifact`       | `GET`           | `/v1/artifacts/plexd/{version}/{os}/{arch}`        | —                    | `io.ReadCloser`       |
 | `ReportSessionActivity` | `POST`        | `/v1/nodes/{node_id}/sessions/{session_id}`        | `SessionActivityRequest` | — (`204 No Content`) |
 | `ReportIntegrityViolation` | `POST`     | `/v1/nodes/{node_id}/integrity/violations`         | `IntegrityViolationReport` | —              |
 
 ### Generic Helpers
 
 ```go
-func (c *ControlPlane) Ping(ctx context.Context) error
 func (c *ControlPlane) PostJSON(ctx context.Context, path string, body any, result any) error
 func (c *ControlPlane) GetJSON(ctx context.Context, path string, result any) error
 ```

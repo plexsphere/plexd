@@ -19,17 +19,24 @@ The binary prints `MOCKAPI_ADDR=<address>` to stdout on startup, which allows te
 
 ## Endpoints
 
-### `GET /v1/ping`
+### `GET /v1/health`
 
-Health check probe. Returns immediately with no blocking operations.
+Unauthenticated readiness probe (a readiness probe carries no credentials). Answers the control-plane `HealthStatus` shape — an overall status plus a list of named component checks — so the harness has a stable, contract-faithful liveness endpoint. The e2e suites poll this endpoint to gate on mock-api readiness.
 
 **Response:** `200 OK`
 
 ```json
-{}
+{
+  "status": "ok",
+  "checks": [
+    { "name": "mock", "status": "ok", "detail": "" }
+  ]
+}
 ```
 
 **Content-Type:** `application/json`
+
+**Error:** Returns `405` if the HTTP method is not `GET`.
 
 ### `POST /v1/register`
 
@@ -400,25 +407,6 @@ comparison key and never re-derives it from the rules.
 
 **Concurrency:** The active fixture is protected by `sync.RWMutex`. Reads never block other reads. A write via `POST /test/configure-state` blocks reads briefly during replacement. Readers always see a complete fixture (never a partial update).
 
-### `GET /v1/nodes/{id}/metadata`
-
-Returns a fixture metadata map with four key-value pairs.
-
-**Response:** `200 OK`
-
-```json
-{
-  "environment": "e2e-test",
-  "region": "mock-region-1",
-  "role": "worker",
-  "version": "1.0.0-mock"
-}
-```
-
-**Content-Type:** `application/json`
-
-**Counter:** Increments `metadata_count` on each call.
-
 ### `GET /v1/nodes/{id}/events`
 
 Server-Sent Events (SSE) endpoint for the signed event stream. There is **no** unsolicited initial event: the stream tails from now unless a `Last-Event-ID` cursor asks to replay buffered envelopes. The connection is held open with periodic keep-alive comments until the client disconnects or the stream is descoped.
@@ -633,6 +621,22 @@ whose `records` is the line count.
 
 **Counter:** Increments `audit_count` on each accepted batch.
 
+### `GET /releases/{tag}/{asset}`
+
+Plays the GitHub release channel the `service.upgrade` fetcher pulls from. It lives **outside** the `/v1` namespace, mirroring the real release host rather than the control-plane API. The served assets are byte-identical copies of the `internal/upgrade` verification fixtures, embedded into the binary, so the e2e upgrade path fetches and verifies exactly what the unit tests do.
+
+Asset matching is arch-agnostic (CI runs amd64, Docker Desktop arm64): `{asset}` must be `plexd-linux-<arch>` (the binary) or `plexd-linux-<arch>.sigstore.json` (the Sigstore bundle); anything else is a `404`. The `{tag}` selects which fixture is served:
+
+| Tag | Binary | Bundle |
+|-----|--------|--------|
+| `v9.9.9` | fixture blob | valid Sigstore bundle → verification succeeds |
+| `v9.9.8` | fixture blob | garbage non-JSON bundle → bundle parse fails downstream |
+| anything else | `404 Not Found` | `404 Not Found` |
+
+**Content-Type:** `application/octet-stream` for the binary, `application/json` for the bundle.
+
+**Fixtures:** `test/e2e/mockapi/testdata/fixture.bin` and `fixture.sigstore.json`, byte-identical copies of `internal/upgrade/testdata/`. Regenerate both sets together via `make upgrade-fixture` (keyless `cosign sign-blob`); the pinned signing identity in `test/e2e/docker/plexd-e2e.yaml` changes with the fixtures.
+
 ### `GET /test/assertions`
 
 Test-only endpoint returning a snapshot of all call counters. Not part of the `/v1/` API namespace.
@@ -644,8 +648,6 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "registration_count": 0,
   "heartbeat_count": 0,
   "state_count": 0,
-  "metadata_count": 0,
-  "deregister_count": 0,
   "key_rotate_count": 0,
   "capabilities_count": 0,
   "endpoint_count": 0,
@@ -658,7 +660,6 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "metrics_count": 0,
   "logs_count": 0,
   "audit_count": 0,
-  "artifact_count": 0,
   "session_activity_count": 0,
   "integrity_violation_count": 0,
   "inject_event_count": 0,
@@ -891,8 +892,6 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `registration_count` | `POST /v1/register` |
 | `heartbeat_count` | `POST /v1/nodes/{id}/heartbeat` |
 | `state_count` | `GET /v1/nodes/{id}/state` |
-| `metadata_count` | `GET /v1/nodes/{id}/metadata` |
-| `deregister_count` | `POST /v1/nodes/{id}/deregister` |
 | `key_rotate_count` | `POST /v1/keys/rotate` (completed rotations only) |
 | `capabilities_count` | `PUT /v1/nodes/{id}/capabilities` |
 | `endpoint_count` | `PUT /v1/nodes/{id}/endpoint` |
@@ -905,7 +904,6 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `metrics_count` | `POST /v1/nodes/{id}/metrics` |
 | `logs_count` | `POST /v1/nodes/{id}/logs` |
 | `audit_count` | `POST /v1/nodes/{id}/audit` |
-| `artifact_count` | `GET /v1/artifacts/plexd/{version}/{os}/{arch}` |
 | `session_activity_count` | `POST /v1/nodes/{id}/sessions/{sid}` |
 | `integrity_violation_count` | `POST /v1/nodes/{id}/integrity/violations` |
 | `inject_event_count` | `POST /test/inject-event` |

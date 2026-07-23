@@ -292,12 +292,30 @@ No parameters required.
 
 ### service.upgrade
 
-Upgrades plexd to a specified version. Downloads the new binary from the control plane's artifact store (`GET /v1/artifacts/plexd/{version}/{os}/{arch}`), verifies the SHA-256 checksum, atomically replaces the current binary, and triggers a systemd restart.
+Upgrades plexd to a specified version from the release channel. The action downloads the release binary, verifies its SHA-256 against the dispatched `checksum`, downloads and verifies the release's Sigstore bundle **offline**, and only then atomically replaces the current binary and triggers a systemd restart. It refuses to run on a non-Linux node and never fetches the binary from the control plane.
 
 | Parameter  | Type   | Required | Description                                      |
 |------------|--------|----------|--------------------------------------------------|
 | `version`  | string | yes      | Target version (e.g. `1.5.0`)                    |
 | `checksum` | string | yes      | Expected SHA-256 checksum (hex, optional `sha256:` prefix) |
+
+**Order of operations:**
+
+1. Download `plexd-linux-{GOARCH}` from `{upgrade.release_base_url}/{tag}/…` (`{tag}` is the `v`-prefixed version) into a temporary file, streaming its SHA-256.
+2. Compare the SHA-256 to the dispatched `checksum`. On a mismatch the action ends with `checksum_mismatch` (exit 1); the running binary is untouched.
+3. Download the release's Sigstore bundle (`plexd-linux-{GOARCH}.sigstore.json`). A release with no bundle asset fails this download and is refused (the action fails with a download error rather than a terminal status object).
+4. Verify the bundle offline against the embedded Sigstore public-good trusted root: the certificate identity must satisfy `upgrade.signing_issuer` / `upgrade.signing_identity_regexp`, and the signed artifact digest must match the downloaded binary. On failure the action ends with `bundle_verification_failed` (exit 1), the temporary file is removed, and the running binary is untouched.
+5. `chmod 0755`, atomically rename over the current binary, then `systemctl restart plexd.service`.
+
+**Terminal statuses:**
+
+| Status | Exit | Meaning |
+|--------|------|---------|
+| `upgraded` | 0 | Binary replaced and `systemctl restart` succeeded |
+| `upgraded_restart_pending` | 0 | Binary replaced but `systemctl` is unavailable; restart is manual |
+| `upgraded_restart_failed` | 1 | Binary replaced but the restart command failed |
+| `checksum_mismatch` | 1 | Download SHA-256 differs from the dispatched `checksum`; binary untouched |
+| `bundle_verification_failed` | 1 | Sigstore bundle verification failed; binary untouched |
 
 On checksum mismatch, the upgrade is aborted and the original binary is preserved:
 
@@ -315,7 +333,7 @@ On success:
 {
   "status": "upgraded",
   "version": "1.5.0",
-  "message": "binary replaced, restarting service"
+  "message": "binary replaced and service restarted"
 }
 ```
 
@@ -715,7 +733,7 @@ exec.RegisterBuiltin("diagnostics.ping_peer", "Ping a mesh peer", peerIDParam, a
 exec.RegisterBuiltin("diagnostics.traceroute_peer", "Traceroute to peer", peerIDParam, actions.DiagnosticsTraceroutePeer(nodeInfo))
 exec.RegisterBuiltin("service.restart", "Restart service", nil, actions.ServiceRestart())
 exec.RegisterBuiltin("service.reload_config", "Reload config", nil, actions.ServiceReloadConfig())
-exec.RegisterBuiltin("service.upgrade", "Upgrade plexd binary", upgradeParams, actions.ServiceUpgrade(apiClient))
+exec.RegisterBuiltin("service.upgrade", "Upgrade plexd binary", upgradeParams, actions.ServiceUpgrade(upgradeFetcher, upgradeVerifier))
 exec.RegisterBuiltin("system.info", "Report system and runtime info", nil, actions.SystemInfo(nodeInfo))
 exec.RegisterBuiltin("health.check", "Check health", healthParams, actions.HealthCheck(healthProvider))
 exec.RegisterBuiltin("mesh.reconnect", "Reconnect mesh", nil, actions.MeshReconnect(reconnector))

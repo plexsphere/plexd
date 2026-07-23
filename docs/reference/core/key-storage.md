@@ -161,7 +161,7 @@ The NSK is rotated together with mesh keys or independently via the control plan
 ### Deletion
 
 - **Bootstrap token**: deleted immediately after successful registration.
-- **All identity files**: removed during explicit deregistration (`plexd deregister`), which also deletes the token file if present.
+- **Local identity**: `plexd deregister` is a local-only cleanup (no control-plane call) that removes just `identity.json` from `data_dir`. `plexd deregister --purge` additionally removes the rest of `data_dir` — the remaining identity and key files and cached state — and the registration token file.
 
 ## Security Considerations
 

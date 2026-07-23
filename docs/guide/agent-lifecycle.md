@@ -19,11 +19,11 @@ title: Agent Lifecycle
 │                                                                               │
 │   ┌────────────┐                 ┌─────────────────────────────────────┐      │
 │   │            │  On shutdown    │            Connected                │      │
-│   │ Deregister │◀── or command ──┤                                     │      │
+│   │  Shutdown  │◀── or command ──┤                                     │      │
 │   │            │                 │  ┌─────────────┐ ┌───────────────┐  │      │
 │   └────────────┘                 │  │ Heartbeat   │ │ Reconcile     │  │      │
 │                                  │  │ NAT Refresh │ │ SSE Stream    │  │      │
-│   • Notify control plane         │  └─────────────┘ └───────────────┘  │      │
+│   • Stop accepting new work      │  └─────────────┘ └───────────────┘  │      │
 │   • Tear down tunnels            │  ┌─────────────┐ ┌───────────────┐  │      │
 │   • Wait for in-flight           │  │ Policy      │ │ Observe       │  │      │
 │     action executions            │  │ Enforce     │ │ Logs, Audit   │  │      │
@@ -46,7 +46,7 @@ title: Agent Lifecycle
 3. **Configure Tunnels** - Set up mesh interfaces and establish tunnels to all authorized peers.
 4. **NAT Discovery** - Determine public endpoint via STUN and report it to the control plane, which returns a freshness deadline (`stale_after`) that schedules the next report. Peer endpoints arrive separately via SSE.
 5. **Connected** - Enter steady state: send heartbeats, stream peer/policy/action/state updates via SSE, report observability data, forward logs, collect audit data, serve access requests, dispatch actions, watch hook files for changes, serve node API, refresh STUN endpoints, reconcile periodically.
-6. **Deregister** - On shutdown or explicit command: graceful shutdown with cleanup (see details below).
+6. **Shutdown** - On a shutdown signal or explicit command: graceful local shutdown with cleanup (see details below).
 
 ## Steady State
 
@@ -87,18 +87,34 @@ The SSE stream is the primary channel for real-time updates. When the connection
 4. After a successful reconnect, plexd triggers an **immediate reconciliation** to catch any updates that may have been missed during the disconnect window.
 5. If the SSE stream cannot be re-established after 5 minutes, plexd falls back to polling the full state at `reconcile.interval` until the SSE stream recovers.
 
-## Deregistration
+## Shutdown and Deregistration
 
-When plexd receives a shutdown signal (`SIGTERM`, `SIGINT`) or the `plexd deregister` command is run:
+### Graceful shutdown
+
+When the running agent (`plexd up`) receives a shutdown signal (`SIGTERM`,
+`SIGINT`) it performs a graceful **local** shutdown. It sends **no** deregister
+call to the control plane — removing a node from the platform is operator-driven.
 
 1. **Stop accepting new work** - Stop accepting new action requests and SSE events.
-2. **Drain in-flight executions** - Wait for all running action/hook executions to complete (up to 30s grace period). After the grace period, running executions are cancelled and reported as `cancelled` to the control plane.
-3. **Notify control plane** - Send `POST /v1/nodes/{node_id}/deregister` to inform the control plane. The control plane removes the node from peer lists and pushes `peer_deregistered` events to all peers.
-4. **Tear down tunnels** - Remove all WireGuard peers from the `plexd0` interface and delete the interface.
-5. **Stop subsystems** - Stop log forwarding, audit collection, observability reporting, access proxy, and heartbeat.
-6. **Clean up local state** - Optionally (when `--purge` is passed) remove all data from `data_dir`, including private keys and cached state. Without `--purge`, state is preserved for potential re-registration.
+2. **Drain in-flight executions** - Wait for all running action/hook executions to complete (up to the 30s drain timeout). After the grace period, running executions are cancelled and reported as `cancelled` to the control plane.
+3. **Tear down tunnels** - Remove all WireGuard peers from the `plexd0` interface and delete the interface.
+4. **Stop subsystems** - Stop log forwarding, audit collection, observability reporting, access proxy, and heartbeat.
 
-On `plexd deregister --purge`, the bootstrap token file is also removed if it still exists, and the systemd unit is disabled.
+The local identity is left in place, so the agent re-attaches on its next start.
+Once the node stops sending heartbeats the control plane marks it `unreachable`,
+then `offline`, and its peers drop it from their tunnel configuration (see
+[Heartbeat Protocol](#heartbeat-protocol)).
+
+### `plexd deregister`
+
+`plexd deregister` is a separate, **local-only** cleanup command; it makes no
+request to the control plane. It removes the node's `identity.json` from
+`data_dir` and prints that platform-side removal is operator-driven. With
+`--purge` it additionally removes the whole `data_dir` (all identity and key
+files, cached state) and the registration token file. `--purge` does **not**
+disable the systemd unit — use `plexd uninstall` to remove the service. See the
+[CLI Reference](/reference/core/cli#plexd-deregister) for the exact output and
+exit codes.
 
 ## Operational Behavior
 
@@ -116,15 +132,18 @@ plexd is designed to remain functional when the control plane is temporarily unr
 
 ### Upgrade Process
 
-plexd supports in-place upgrades triggered by the control plane via the `service.upgrade` built-in action:
+plexd supports in-place upgrades triggered by the control plane via the `service.upgrade` built-in action. The binary comes from the release channel, and every upgrade is gated on both a dispatched checksum and an offline Sigstore signature check — a release the platform did not sign is refused.
 
 1. Control plane sends `action_request` with `action: service.upgrade`, including the target `version` and expected binary `checksum`.
-2. plexd downloads the new binary from the control plane's artifact store, verifies the SHA-256 checksum, and places it alongside the current binary.
-3. plexd signals the systemd service to restart (or re-execs in non-systemd environments).
-4. On startup, the new binary computes its own checksum and reports it in the registration/heartbeat. The control plane verifies the upgrade succeeded.
-5. If the new binary fails to start (crash loop), systemd's `RestartSec` and `StartLimitBurst` prevent excessive restarts. Manual intervention or rollback via the control plane is required.
+2. plexd downloads the release binary from the configured release channel (`{upgrade.release_base_url}/{tag}/plexd-linux-{arch}`, with `{tag}` the `v`-prefixed version) into a temporary file, computing its SHA-256 as it streams. Upgrades are Linux-only; a non-Linux node refuses. plexd never fetches the binary from the control plane.
+3. plexd compares the download's SHA-256 to the dispatched `checksum`. A mismatch ends the action with the terminal status `checksum_mismatch` (exit 1) and the running binary is untouched.
+4. plexd downloads the release's Sigstore bundle (`plexd-linux-{arch}.sigstore.json`) and verifies it **offline** against the embedded Sigstore public-good trusted root: the signing certificate's issuer and SAN must match `upgrade.signing_issuer` / `upgrade.signing_identity_regexp`, and the signed artifact digest must match the downloaded binary. A release with no bundle asset fails the bundle download and is refused; a bundle that fails verification ends the action with the terminal status `bundle_verification_failed` (exit 1) and the temporary file is removed. In both cases the running binary is untouched.
+5. Once both checks pass, plexd makes the new binary executable (`chmod 0755`), atomically renames it over the current binary, and triggers `systemctl restart plexd.service`. The terminal status is `upgraded` on a successful restart, `upgraded_restart_pending` when `systemctl` is unavailable, or `upgraded_restart_failed` when the restart command errors.
+6. If the new binary fails to start (crash loop), systemd's `RestartSec` and `StartLimitBurst` prevent excessive restarts. Manual intervention or a follow-up upgrade is required.
 
-Rollback is a new `service.upgrade` action pointing to the previous version.
+Rollback is a new `service.upgrade` action pointing to a previous version (a version published without a Sigstore bundle is refused by the signature check).
+
+**Sigstore root rotation.** Verification chains to the Sigstore public-good trusted root vendored into the binary, so it needs no network access — but that embedded copy can go stale. If Sigstore rotates its public-good root, releases signed under the new keys no longer chain for an already-deployed node, and every upgrade to such a release is refused with `bundle_verification_failed` while the running binary is left untouched. Because the refreshed root normally ships inside a plexd release, the upgrade path itself is blocked and must be repaired out of band: point `upgrade.trusted_root_path` at a current `trusted_root.json` (or reinstall the package), then re-issue the upgrade.
 
 ### Mesh IP Allocation
 
@@ -133,7 +152,7 @@ Each node receives a unique mesh IP from the `10.100.0.0/16` range during regist
 - **Format:** `10.100.x.y/32` (single host address per node)
 - **Uniqueness:** Guaranteed by the control plane within a tenant
 - **Persistence:** The mesh IP is stored in `data_dir` and reused across restarts
-- **Deregistration:** When a node deregisters, its mesh IP is returned to the pool after a cooldown period (to avoid conflicts with cached peer configurations on other nodes)
+- **Decommission:** When a node is removed from the platform (operator-driven), its mesh IP is returned to the pool after a cooldown period (to avoid conflicts with cached peer configurations on other nodes)
 - **Bridge nodes:** Typically assigned from a reserved range (e.g. `10.100.255.x`) by convention, but this is a control plane policy, not enforced by plexd
 
 ### Reconciliation

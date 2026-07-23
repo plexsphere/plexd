@@ -30,7 +30,7 @@ The test runs twelve phases:
 │   mock-api   │◄──────│    plexd     │
 │  :8080 (HTTP)│       │  (agent)     │
 │  :8443 (TLS) │       │  depends_on  │
-│  /v1/ping    │       │  mock-api    │
+│  /v1/health  │       │  mock-api    │
 └──────────────┘       └──────────────┘
         │                      │
         └──────── e2e-net ─────┘
@@ -43,7 +43,7 @@ The test runs twelve phases:
 
 ### Startup Ordering
 
-1. `mock-api` starts and exposes a healthcheck on `GET /v1/ping`.
+1. `mock-api` starts and exposes a healthcheck on `GET /v1/health`.
 2. docker compose waits for `mock-api` to become healthy (2s interval, 10 retries).
 3. `plexd` starts with `depends_on: mock-api (service_healthy)`.
 
