@@ -23,18 +23,19 @@ func repoRoot(t *testing.T) string {
 
 // workflow is a minimal representation of a GitHub Actions workflow file.
 type workflow struct {
-	Name        string                    `yaml:"name"`
-	On          map[string]any            `yaml:"on"`
-	Permissions map[string]string         `yaml:"permissions"`
-	Jobs        map[string]workflowJob    `yaml:"jobs"`
+	Name        string                 `yaml:"name"`
+	On          map[string]any         `yaml:"on"`
+	Permissions map[string]string      `yaml:"permissions"`
+	Jobs        map[string]workflowJob `yaml:"jobs"`
 }
 
 type workflowJob struct {
-	RunsOn        string            `yaml:"runs-on"`
-	TimeoutMin    int               `yaml:"timeout-minutes"`
-	Needs         any               `yaml:"needs"`
-	Strategy      *jobStrategy      `yaml:"strategy"`
-	Steps         []workflowStep    `yaml:"steps"`
+	RunsOn      string            `yaml:"runs-on"`
+	TimeoutMin  int               `yaml:"timeout-minutes"`
+	Needs       any               `yaml:"needs"`
+	Permissions map[string]string `yaml:"permissions"`
+	Strategy    *jobStrategy      `yaml:"strategy"`
+	Steps       []workflowStep    `yaml:"steps"`
 }
 
 type jobStrategy struct {
@@ -42,11 +43,11 @@ type jobStrategy struct {
 }
 
 type workflowStep struct {
-	Name string `yaml:"name"`
-	Uses string `yaml:"uses"`
-	With map[string]any `yaml:"with"`
+	Name string            `yaml:"name"`
+	Uses string            `yaml:"uses"`
+	With map[string]any    `yaml:"with"`
 	Env  map[string]string `yaml:"env"`
-	Run  string `yaml:"run"`
+	Run  string            `yaml:"run"`
 }
 
 func loadReleaseWorkflow(t *testing.T) workflow {
@@ -266,6 +267,22 @@ func TestReleaseWorkflow_ReleaseJob(t *testing.T) {
 	}
 }
 
+func TestReleaseWorkflow_ReleasePermissions(t *testing.T) {
+	wf := loadReleaseWorkflow(t)
+	release, ok := wf.Jobs["release"]
+	if !ok {
+		t.Fatal("missing release job")
+	}
+	// Keyless cosign signing needs an OIDC token, so the release job that
+	// signs must request id-token: write in addition to contents: write.
+	if release.Permissions["contents"] != "write" {
+		t.Errorf("release permissions.contents = %q, want %q", release.Permissions["contents"], "write")
+	}
+	if release.Permissions["id-token"] != "write" {
+		t.Errorf("release permissions.id-token = %q, want %q", release.Permissions["id-token"], "write")
+	}
+}
+
 func TestReleaseWorkflow_ReleaseSteps(t *testing.T) {
 	wf := loadReleaseWorkflow(t)
 	release := wf.Jobs["release"]
@@ -290,6 +307,26 @@ func TestReleaseWorkflow_ReleaseSteps(t *testing.T) {
 		}
 	})
 
+	t.Run("cosign-installer", func(t *testing.T) {
+		if _, ok := findStep(release.Steps, func(s workflowStep) bool {
+			return strings.Contains(s.Uses, "sigstore/cosign-installer@")
+		}); !ok {
+			t.Fatal("missing cosign-installer step")
+		}
+	})
+
+	t.Run("sign release binaries", func(t *testing.T) {
+		step, ok := findStep(release.Steps, func(s workflowStep) bool {
+			return strings.Contains(s.Run, "cosign sign-blob")
+		})
+		if !ok {
+			t.Fatal("missing cosign sign-blob step")
+		}
+		if !strings.Contains(step.Run, "--bundle") {
+			t.Error("cosign sign-blob step missing --bundle flag")
+		}
+	})
+
 	t.Run("gh-release", func(t *testing.T) {
 		step, ok := findStep(release.Steps, func(s workflowStep) bool {
 			return strings.Contains(s.Uses, "softprops/action-gh-release@")
@@ -305,6 +342,10 @@ func TestReleaseWorkflow_ReleaseSteps(t *testing.T) {
 			}
 			if strings.Contains(files, binary+".sha256") {
 				t.Errorf("release files should not include per-binary %s.sha256", binary)
+			}
+			bundle := binary + ".sigstore.json"
+			if !strings.Contains(files, bundle) {
+				t.Errorf("release files missing signature bundle %s", bundle)
 			}
 		}
 		if !strings.Contains(files, "checksums.sha256") {
