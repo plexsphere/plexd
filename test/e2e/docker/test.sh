@@ -111,7 +111,7 @@ echo "=== Waiting for mock-api healthcheck ==="
 HEALTH_TIMEOUT=30
 HEALTH_ELAPSED=0
 while [ "${HEALTH_ELAPSED}" -lt "${HEALTH_TIMEOUT}" ]; do
-    if curl -sf http://localhost:18080/v1/ping >/dev/null 2>&1; then
+    if curl -sf http://localhost:18080/v1/health >/dev/null 2>&1; then
         echo "mock-api is healthy"
         break
     fi
