@@ -130,7 +130,7 @@ sequenceDiagram
     CP-->>C: Updated peers (new PSKs)
 ```
 
-When a node is force-removed from the control plane, all peers that had a tunnel to the compromised node receive a `peer_removed` event followed by fresh PSKs for their remaining peer pairs.
+When a node is force-removed from the control plane, all peers that had a tunnel to the compromised node receive a `peer_deregistered` event followed by fresh PSKs for their remaining peer pairs.
 
 ### Signing Key Rotation
 

@@ -32,9 +32,7 @@ External VPN Clients
 │  │ (WG operations) │            │  10.42.0.0/16    │           │
 │  └─────────────────┘            └──────────────────┘           │
 │                                                                 │
-│  Control Plane ──SSE──▶ HandleUserAccessPeerAssigned            │
-│                ──SSE──▶ HandleUserAccessPeerRevoked              │
-│                ──SSE──▶ HandleUserAccessConfigUpdated            │
+│  Control Plane ──SSE──▶ bridge_config_updated ─▶ reconcile      │
 │                ──Rec──▶ UserAccessReconcileHandler               │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -110,7 +108,7 @@ All methods must be idempotent: repeating an already-applied operation returns `
 
 ## UserAccessManager
 
-Central coordinator for user access lifecycle. Concurrent-safe via `sync.Mutex` — SSE event handlers and the reconcile loop may invoke methods concurrently.
+Central coordinator for user access lifecycle. Concurrent-safe via `sync.Mutex` — the reconcile handler and status readers may invoke methods concurrently.
 
 ### Constructor
 
@@ -140,7 +138,7 @@ if err := mgr.Setup(); err != nil {
     log.Fatal(err)
 }
 
-// Add a peer (driven by SSE handler or reconciliation)
+// Add a peer (driven by the reconcile handler)
 err := mgr.AddPeer(api.UserAccessPeer{
     PublicKey:  "pk-abc123",
     AllowedIPs: []string{"10.99.0.1/32"},
@@ -198,48 +196,17 @@ Errors are aggregated via `errors.Join` — cleanup continues even when individu
 2. Calls `AccessController.RemovePeer` to remove the WireGuard peer
 3. On success, removes the key from internal tracking
 
-## SSE Event Handlers
+## SSE Event Handling
 
-### HandleUserAccessPeerAssigned
-
-```go
-func HandleUserAccessPeerAssigned(mgr *UserAccessManager, logger *slog.Logger) api.EventHandler
-```
-
-Handles `user_access_peer_assigned` events. Parses `api.UserAccessPeer` from the envelope payload and calls `mgr.AddPeer(peer)`.
-
-- On parse error: logs and returns wrapped error
-- On `AddPeer` error: returns wrapped error
-
-### HandleUserAccessPeerRevoked
-
-```go
-func HandleUserAccessPeerRevoked(mgr *UserAccessManager, logger *slog.Logger) api.EventHandler
-```
-
-Handles `user_access_peer_revoked` events. Parses `public_key` from the envelope payload and calls `mgr.RemovePeer(publicKey)`.
-
-- On parse error: logs and returns wrapped error
-- `RemovePeer` is a no-op if the peer does not exist
-
-### HandleUserAccessConfigUpdated
-
-```go
-func HandleUserAccessConfigUpdated(trigger ReconcileTrigger) api.EventHandler
-```
-
-Handles `user_access_config_updated` events. Calls `trigger.TriggerReconcile()` to request an immediate reconciliation cycle. The event payload is not parsed — any config update triggers a full reconcile.
-
-### Registration
+There are no user-access-specific SSE handlers. The control plane emits a single
+`bridge_config_updated` event with an opaque payload; `bridge.HandleBridgeConfigUpdated`
+dispatches it to `TriggerReconcile()`, and the `UserAccessReconcileHandler` below
+applies the desired user-access subtree from the authoritative state snapshot.
 
 ```go
 dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventUserAccessPeerAssigned,
-    bridge.HandleUserAccessPeerAssigned(accessMgr, logger))
-dispatcher.Register(api.EventUserAccessPeerRevoked,
-    bridge.HandleUserAccessPeerRevoked(accessMgr, logger))
-dispatcher.Register(api.EventUserAccessConfigUpdated,
-    bridge.HandleUserAccessConfigUpdated(reconciler))
+dispatcher.Register(api.EventBridgeConfigUpdated,
+    bridge.HandleBridgeConfigUpdated(reconciler))
 ```
 
 ## UserAccessReconcileHandler
@@ -313,11 +280,12 @@ type UserAccessInfo struct {
 
 ### SSE Event Constants
 
-| Constant                             | Value                            |
-|--------------------------------------|----------------------------------|
-| `api.EventUserAccessConfigUpdated`   | `"user_access_config_updated"`   |
-| `api.EventUserAccessPeerAssigned`    | `"user_access_peer_assigned"`    |
-| `api.EventUserAccessPeerRevoked`     | `"user_access_peer_revoked"`     |
+User-access changes are delivered through the single bridge event constant; the
+fine-grained `user_access_*` constants have been removed.
+
+| Constant                        | Value                     |
+|---------------------------------|---------------------------|
+| `api.EventBridgeConfigUpdated`  | `"bridge_config_updated"` |
 
 ## Plan Deviations
 
@@ -336,8 +304,6 @@ The implementation deviates from the original plan in two areas:
 | `UserAccessManager.AddPeer` (dup)   | `bridge: user access: peer already exists: `        |
 | `UserAccessManager.AddPeer` (max)   | `bridge: user access: max peers reached (`          |
 | `UserAccessManager.AddPeer` (ctrl)  | `bridge: user access: configure peer: `             |
-| `HandleUserAccessPeerAssigned`      | `bridge: user_access_peer_assigned: `               |
-| `HandleUserAccessPeerRevoked`       | `bridge: user_access_peer_revoked: `                |
 
 ## Logging
 
@@ -349,7 +315,6 @@ All user access log entries use `component=bridge`.
 | `Info`  | User access interface removed    | `interface`                                 |
 | `Error` | Remove peer failed               | `public_key`, `error`                       |
 | `Error` | Reconcile: add peer failed       | `public_key`, `error`                       |
-| `Error` | SSE parse payload failed         | `event_id`, `error`                         |
 
 ## Integration Points
 
@@ -367,7 +332,9 @@ r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 
 ### SSE Real-Time Updates
 
-Peer-level events (`peer_assigned`/`peer_revoked`) enable immediate response to individual peer changes. The `config_updated` event triggers a full reconcile for bulk changes.
+The `bridge_config_updated` event triggers a full reconcile; the
+`UserAccessReconcileHandler` then applies the desired peer set from the state
+snapshot. There are no per-peer events.
 
 ### Control Plane Types
 
@@ -378,10 +345,8 @@ Peer-level events (`peer_assigned`/`peer_revoked`) enable immediate response to 
 | `api.UserAccessInfo`                   | `internal/api` | User access status in heartbeats                |
 | `api.BridgeSnapshot`                   | `internal/api` | Snapshot `bridge` subtree (contains `UserAccess`) |
 | `api.HeartbeatRequest`                 | `internal/api` | Heartbeat payload (contains `UserAccessInfo`)   |
-| `api.SignedEnvelope`                   | `internal/api` | SSE event wrapper                               |
-| `api.EventUserAccessConfigUpdated`     | `internal/api` | Event type `"user_access_config_updated"`       |
-| `api.EventUserAccessPeerAssigned`      | `internal/api` | Event type `"user_access_peer_assigned"`        |
-| `api.EventUserAccessPeerRevoked`       | `internal/api` | Event type `"user_access_peer_revoked"`         |
+| `api.Envelope`                         | `internal/api` | SSE event wrapper                               |
+| `api.EventBridgeConfigUpdated`         | `internal/api` | Event type `"bridge_config_updated"`            |
 
 ### Heartbeat Reporting
 
@@ -424,14 +389,10 @@ accessMgr := bridge.NewUserAccessManager(accessCtrl, routeCtrl, cfg, logger)
 // Setup user access interface and forwarding
 accessMgr.Setup()
 
-// Register SSE handlers
+// Register the bridge SSE handler
 dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventUserAccessPeerAssigned,
-    bridge.HandleUserAccessPeerAssigned(accessMgr, logger))
-dispatcher.Register(api.EventUserAccessPeerRevoked,
-    bridge.HandleUserAccessPeerRevoked(accessMgr, logger))
-dispatcher.Register(api.EventUserAccessConfigUpdated,
-    bridge.HandleUserAccessConfigUpdated(reconciler))
+dispatcher.Register(api.EventBridgeConfigUpdated,
+    bridge.HandleBridgeConfigUpdated(reconciler))
 
 // Register reconcile handler
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)

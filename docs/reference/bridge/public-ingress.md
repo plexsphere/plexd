@@ -37,9 +37,7 @@ Public Internet Clients
 |    TLS passthrough:                                              |
 |    raw TCP forward                                               |
 |                                                                 |
-|  Control Plane --SSE--> HandleIngressRuleAssigned                |
-|                --SSE--> HandleIngressRuleRevoked                  |
-|                --SSE--> HandleIngressConfigUpdated                |
+|  Control Plane --SSE--> bridge_config_updated --> reconcile      |
 |                --Rec--> IngressReconcileHandler                   |
 +-----------------------------------------------------------------+
 ```
@@ -106,7 +104,7 @@ type IngressController interface {
 
 ## IngressManager
 
-Central coordinator for public ingress lifecycle. Concurrent-safe via `sync.Mutex` — SSE event handlers and the reconcile loop may invoke methods concurrently. Active proxy connections are tracked via `atomic.Int64` for lock-free counting.
+Central coordinator for public ingress lifecycle. Concurrent-safe via `sync.Mutex` — the reconcile handler and status readers may invoke methods concurrently. Active proxy connections are tracked via `atomic.Int64` for lock-free counting.
 
 ### Constructor
 
@@ -136,7 +134,7 @@ if err := mgr.Setup(); err != nil {
     log.Fatal(err)
 }
 
-// Add a rule (driven by SSE handler or reconciliation)
+// Add a rule (driven by the reconcile handler)
 err := mgr.AddRule(api.IngressRule{
     RuleID:     "web-https",
     ListenPort: 443,
@@ -213,48 +211,17 @@ Each accepted connection spawns a `proxyConnection` goroutine:
 
 TLS terminate mode enforces minimum TLS 1.2 via `tls.Config.MinVersion`.
 
-## SSE Event Handlers
+## SSE Event Handling
 
-### HandleIngressRuleAssigned
-
-```go
-func HandleIngressRuleAssigned(mgr *IngressManager, logger *slog.Logger) api.EventHandler
-```
-
-Handles `ingress_rule_assigned` events. Parses `api.IngressRule` from the envelope payload and calls `mgr.AddRule(rule)`.
-
-- On parse error: logs and returns wrapped error
-- On `AddRule` error: returns wrapped error
-
-### HandleIngressRuleRevoked
-
-```go
-func HandleIngressRuleRevoked(mgr *IngressManager, logger *slog.Logger) api.EventHandler
-```
-
-Handles `ingress_rule_revoked` events. Parses `rule_id` from the envelope payload and calls `mgr.RemoveRule(ruleID)`.
-
-- On parse error: logs and returns wrapped error
-- `RemoveRule` is a no-op if the rule does not exist
-
-### HandleIngressConfigUpdated
-
-```go
-func HandleIngressConfigUpdated(trigger ReconcileTrigger) api.EventHandler
-```
-
-Handles `ingress_config_updated` events. Calls `trigger.TriggerReconcile()` to request an immediate reconciliation cycle. The event payload is not parsed — any config update triggers a full reconcile.
-
-### Registration
+There are no ingress-specific SSE handlers. The control plane emits a single
+`bridge_config_updated` event with an opaque payload; `bridge.HandleBridgeConfigUpdated`
+dispatches it to `TriggerReconcile()`, and the `IngressReconcileHandler` below
+applies the desired ingress subtree from the authoritative state snapshot.
 
 ```go
 dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventIngressRuleAssigned,
-    bridge.HandleIngressRuleAssigned(ingressMgr, logger))
-dispatcher.Register(api.EventIngressRuleRevoked,
-    bridge.HandleIngressRuleRevoked(ingressMgr, logger))
-dispatcher.Register(api.EventIngressConfigUpdated,
-    bridge.HandleIngressConfigUpdated(reconciler))
+dispatcher.Register(api.EventBridgeConfigUpdated,
+    bridge.HandleBridgeConfigUpdated(reconciler))
 ```
 
 ## IngressReconcileHandler
@@ -334,11 +301,12 @@ type IngressInfo struct {
 
 ### SSE Event Constants
 
-| Constant                           | Value                          |
-|------------------------------------|--------------------------------|
-| `api.EventIngressConfigUpdated`    | `"ingress_config_updated"`     |
-| `api.EventIngressRuleAssigned`     | `"ingress_rule_assigned"`      |
-| `api.EventIngressRuleRevoked`      | `"ingress_rule_revoked"`       |
+Ingress changes are delivered through the single bridge event constant; the
+fine-grained `ingress_*` constants have been removed.
+
+| Constant                        | Value                     |
+|---------------------------------|---------------------------|
+| `api.EventBridgeConfigUpdated`  | `"bridge_config_updated"` |
 
 ## Error Prefixes
 
@@ -349,8 +317,6 @@ type IngressInfo struct {
 | `IngressManager.AddRule` (TLS)     | `bridge: ingress: rule <id>: load TLS certificate: ` |
 | `IngressManager.AddRule` (listen)  | `bridge: ingress: rule <id>: listen on <addr>: `     |
 | `IngressManager.Teardown` (close)  | `bridge: ingress: close rule <id>: `                 |
-| `HandleIngressRuleAssigned`        | `bridge: ingress_rule_assigned: `                    |
-| `HandleIngressRuleRevoked`         | `bridge: ingress_rule_revoked: `                     |
 
 ## Logging
 
@@ -364,7 +330,6 @@ All ingress log entries use `component=bridge`.
 | `Info`  | Ingress rule removed           | `rule_id`                                   |
 | `Error` | Dial target failed             | `rule_id`, `target`, `error`                |
 | `Error` | Close rule failed              | `rule_id`, `error`                          |
-| `Error` | SSE parse payload failed       | `event_id`, `error`                         |
 | `Error` | Reconcile: add rule failed     | `rule_id`, `error`                          |
 
 ## Integration Points
@@ -384,7 +349,9 @@ r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 
 ### SSE Real-Time Updates
 
-Rule-level events (`rule_assigned`/`rule_revoked`) enable immediate response to individual rule changes. The `config_updated` event triggers a full reconcile for bulk changes.
+The `bridge_config_updated` event triggers a full reconcile; the
+`IngressReconcileHandler` then applies the desired rule set from the state
+snapshot. There are no per-rule events.
 
 ### Control Plane Types
 
@@ -395,10 +362,8 @@ Rule-level events (`rule_assigned`/`rule_revoked`) enable immediate response to 
 | `api.IngressInfo`                    | `internal/api` | Ingress status in heartbeats                  |
 | `api.BridgeSnapshot`                 | `internal/api` | Snapshot `bridge` subtree (contains `Ingress`)|
 | `api.HeartbeatRequest`               | `internal/api` | Heartbeat payload (contains `IngressInfo`)    |
-| `api.SignedEnvelope`                 | `internal/api` | SSE event wrapper                             |
-| `api.EventIngressConfigUpdated`      | `internal/api` | Event type `"ingress_config_updated"`         |
-| `api.EventIngressRuleAssigned`       | `internal/api` | Event type `"ingress_rule_assigned"`          |
-| `api.EventIngressRuleRevoked`        | `internal/api` | Event type `"ingress_rule_revoked"`           |
+| `api.Envelope`                       | `internal/api` | SSE event wrapper                             |
+| `api.EventBridgeConfigUpdated`       | `internal/api` | Event type `"bridge_config_updated"`          |
 
 ### Heartbeat Reporting
 
@@ -441,14 +406,10 @@ ingressMgr := bridge.NewIngressManager(ingressCtrl, cfg, logger)
 // Setup ingress manager
 ingressMgr.Setup()
 
-// Register SSE handlers
+// Register the bridge SSE handler
 dispatcher := api.NewEventDispatcher(logger)
-dispatcher.Register(api.EventIngressRuleAssigned,
-    bridge.HandleIngressRuleAssigned(ingressMgr, logger))
-dispatcher.Register(api.EventIngressRuleRevoked,
-    bridge.HandleIngressRuleRevoked(ingressMgr, logger))
-dispatcher.Register(api.EventIngressConfigUpdated,
-    bridge.HandleIngressConfigUpdated(reconciler))
+dispatcher.Register(api.EventBridgeConfigUpdated,
+    bridge.HandleBridgeConfigUpdated(reconciler))
 
 // Register reconcile handler
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
