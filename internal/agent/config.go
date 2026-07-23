@@ -20,6 +20,7 @@ import (
 	"github.com/plexsphere/plexd/internal/reconcile"
 	"github.com/plexsphere/plexd/internal/registration"
 	"github.com/plexsphere/plexd/internal/tunnel"
+	"github.com/plexsphere/plexd/internal/upgrade"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
@@ -61,6 +62,7 @@ type AgentConfig struct {
 	LogFwd       logfwd.Config       `yaml:"log_fwd"`
 	AuditFwd     auditfwd.Config     `yaml:"audit_fwd"`
 	Integrity    integrity.Config    `yaml:"integrity"`
+	Upgrade      upgrade.Config      `yaml:"upgrade"`
 	Tunnel       tunnel.Config       `yaml:"tunnel"`
 	NAT          nat.Config          `yaml:"nat"`
 	PeerExchange peerexchange.Config `yaml:"peer_exchange"`
@@ -90,6 +92,7 @@ func (c *AgentConfig) ApplyDefaults() {
 	c.LogFwd.ApplyDefaults()
 	c.AuditFwd.ApplyDefaults()
 	c.Integrity.ApplyDefaults()
+	c.Upgrade.ApplyDefaults()
 	c.Tunnel.ApplyDefaults()
 	c.NAT.ApplyDefaults()
 	c.PeerExchange.ApplyDefaults()
@@ -133,6 +136,9 @@ func (c *AgentConfig) Validate() error {
 		return err
 	}
 	if err := c.Integrity.Validate(); err != nil {
+		return err
+	}
+	if err := c.Upgrade.Validate(); err != nil {
 		return err
 	}
 	if err := c.Tunnel.Validate(); err != nil {

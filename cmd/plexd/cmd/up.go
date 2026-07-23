@@ -33,6 +33,7 @@ import (
 	"github.com/plexsphere/plexd/internal/reconcile"
 	"github.com/plexsphere/plexd/internal/registration"
 	"github.com/plexsphere/plexd/internal/tunnel"
+	"github.com/plexsphere/plexd/internal/upgrade"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
@@ -377,6 +378,13 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// Record start time for uptime calculations.
 	startTime := time.Now()
 
+	// Build the release fetcher and Sigstore verifier for service.upgrade.
+	upgradeFetcher := upgrade.NewFetcher(cfg.Upgrade)
+	upgradeVerifier, err := upgrade.NewVerifier(cfg.Upgrade)
+	if err != nil {
+		return fmt.Errorf("plexd up: upgrade verifier: %w", err)
+	}
+
 	// 10. Create action executor and register built-in actions.
 	executor := actions.NewExecutor(cfg.Actions, client, integrityVerifier, logger)
 
@@ -402,7 +410,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		[]api.ActionParam{
 			{Name: "version", Type: "string", Required: true, Description: "Target version"},
 			{Name: "checksum", Type: "string", Required: true, Description: "Expected SHA-256 checksum"},
-		}, actions.ServiceUpgrade(client))
+		}, actions.ServiceUpgrade(upgradeFetcher, upgradeVerifier))
 	executor.RegisterBuiltin("system.info", "Report OS, kernel, hardware, and runtime info", nil, actions.GatherInfo(nodeInfo))
 	executor.RegisterBuiltin("health.check", "Run all health checks and report status",
 		[]api.ActionParam{

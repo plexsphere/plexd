@@ -232,36 +232,6 @@ func TestFetchState_ReturnsSnapshot(t *testing.T) {
 	}
 }
 
-func TestFetchArtifact_ReturnsBinaryStream(t *testing.T) {
-	binaryContent := []byte("fake-binary-content-plexd-v1.0.0")
-	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("method = %s, want GET", r.Method)
-		}
-		if r.URL.Path != "/v1/artifacts/plexd/1.0.0/linux/amd64" {
-			t.Errorf("path = %s, want /v1/artifacts/plexd/1.0.0/linux/amd64", r.URL.Path)
-		}
-
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(binaryContent)
-	})
-
-	rc, err := client.FetchArtifact(context.Background(), "1.0.0", "linux", "amd64")
-	if err != nil {
-		t.Fatalf("FetchArtifact: %v", err)
-	}
-	defer rc.Close()
-
-	got, err := io.ReadAll(rc)
-	if err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-	if string(got) != string(binaryContent) {
-		t.Errorf("body = %q, want %q", string(got), string(binaryContent))
-	}
-}
-
 func TestDeregister_Success(t *testing.T) {
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
