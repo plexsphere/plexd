@@ -165,11 +165,13 @@ func TestRegistrar_SuccessfulRegistration(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(newSuccessResponse())
 			return
 		}
-		// Subsequent calls (Ping) observe the post-register auth token.
+		// Subsequent calls (heartbeat) observe the post-register auth token.
 		mu.Lock()
 		postAuth = r.Header.Get("Authorization")
 		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
 	})
 
 	dataDir := t.TempDir()
@@ -256,8 +258,8 @@ func TestRegistrar_SuccessfulRegistration(t *testing.T) {
 	}
 
 	// After success the client authenticates subsequent calls with the NSK.
-	if err := client.Ping(context.Background()); err != nil {
-		t.Fatalf("Ping: %v", err)
+	if _, err := client.Heartbeat(context.Background(), "node-123", api.HeartbeatRequest{}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
 	}
 	mu.Lock()
 	gotPost := postAuth
@@ -1071,7 +1073,9 @@ func TestRegistrar_LeavesPreviousAuthTokenOnFailedRegistration(t *testing.T) {
 		mu.Lock()
 		followupAuth = r.Header.Get("Authorization")
 		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
 	})
 
 	client.SetAuthToken("previous-nsk")
@@ -1096,8 +1100,8 @@ func TestRegistrar_LeavesPreviousAuthTokenOnFailedRegistration(t *testing.T) {
 	}
 
 	// The previous credential must still authenticate later requests.
-	if err := client.Ping(context.Background()); err != nil {
-		t.Fatalf("Ping: %v", err)
+	if _, err := client.Heartbeat(context.Background(), "node-123", api.HeartbeatRequest{}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
 	}
 	mu.Lock()
 	gotFollowup := followupAuth

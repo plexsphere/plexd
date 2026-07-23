@@ -283,11 +283,6 @@ func (c *ControlPlane) newRequest(ctx context.Context, method, path, contentType
 	return req, nil
 }
 
-// Ping sends a GET request to /v1/ping for health checking.
-func (c *ControlPlane) Ping(ctx context.Context) error {
-	return c.doRequest(ctx, http.MethodGet, "/v1/ping", nil, nil)
-}
-
 // PostJSON sends a POST request with a JSON body and decodes the JSON response.
 func (c *ControlPlane) PostJSON(ctx context.Context, path string, body any, result any) error {
 	return c.doRequest(ctx, http.MethodPost, path, body, result)
