@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -322,15 +323,20 @@ func sseFrameEnvelope(t *testing.T, frame string) api.Envelope {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-001: GET /v1/ping (Task 2.1)
+// GET /v1/health (unauthenticated liveness)
 // ---------------------------------------------------------------------------
 
-func TestPing_ReturnsOK(t *testing.T) {
+func TestHealth_ReturnsStatusShape(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp, err := http.Get(ts.URL + "/v1/ping")
+	// No Authorization header: the health endpoint is unauthenticated.
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/health", nil)
 	if err != nil {
-		t.Fatalf("GET /v1/ping: %v", err)
+		t.Fatalf("build request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/health: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -340,14 +346,33 @@ func TestPing_ReturnsOK(t *testing.T) {
 	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
 	}
+
+	var body struct {
+		Status string              `json:"status"`
+		Checks []map[string]string `json:"checks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Status != "ok" {
+		t.Errorf("status = %q, want %q", body.Status, "ok")
+	}
+	if len(body.Checks) == 0 {
+		t.Fatal("checks is empty, want at least one entry")
+	}
+	for _, key := range []string{"name", "status", "detail"} {
+		if _, ok := body.Checks[0][key]; !ok {
+			t.Errorf("checks[0] missing key %q", key)
+		}
+	}
 }
 
-func TestPing_WrongMethod_Returns405(t *testing.T) {
+func TestHealth_WrongMethod_Returns405(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp, err := http.Post(ts.URL+"/v1/ping", "application/json", nil)
+	resp, err := http.Post(ts.URL+"/v1/health", "application/json", nil)
 	if err != nil {
-		t.Fatalf("POST /v1/ping: %v", err)
+		t.Fatalf("POST /v1/health: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -875,45 +900,6 @@ func TestState_ReturnsPeersAndPolicy(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-005: GET /v1/nodes/{id}/metadata (Task 2.5)
-// ---------------------------------------------------------------------------
-
-func TestMetadata_ReturnsFixtureAndCounterIncrements(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/metadata")
-	if err != nil {
-		t.Fatalf("GET metadata: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
-		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
-	}
-
-	var meta map[string]string
-	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-
-	// Verify expected metadata keys.
-	for _, key := range []string{"environment", "region", "role"} {
-		if _, ok := meta[key]; !ok {
-			t.Errorf("metadata missing key %q", key)
-		}
-	}
-
-	// Verify metadata_count increments.
-	a := getAssertions(t, ts.URL)
-	if a.MetadataCount != 1 {
-		t.Errorf("metadata_count = %d, want 1", a.MetadataCount)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // REQ-006: GET /v1/nodes/{id}/events (Task 2.6)
 // ---------------------------------------------------------------------------
 
@@ -1400,16 +1386,7 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Call metadata once.
-	resp, err = http.Get(ts.URL + "/v1/nodes/n1/metadata")
-	if err != nil {
-		t.Fatalf("GET metadata: %v", err)
-	}
-	resp.Body.Close()
-
 	// Call all new endpoints.
-	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/deregister", "")
-	resp.Body.Close()
 	// Arm a pending rotation so the keys/rotate call below completes (the
 	// registered key differs from keyRotateBody's fresh key).
 	resp = doRequest(t, http.MethodPost, ts.URL+"/test/configure-heartbeat", `{"reconcile":true,"rotate_keys":true}`)
@@ -1443,11 +1420,6 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp.Body.Close()
 	resp = doIngest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/audit", "application/x-ndjson", auditBatchBody, nil)
 	resp.Body.Close()
-	resp, err = http.Get(ts.URL + "/v1/artifacts/plexd/1.0.0/linux/amd64")
-	if err != nil {
-		t.Fatalf("GET artifact: %v", err)
-	}
-	resp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/"+testMockNodeID+"/sessions/sess-001", `{"tcp":{"phase":"session_started"}}`)
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/integrity/violations", integrityViolationBody)
@@ -1468,12 +1440,6 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	}
 	if a.StateCount != 1 {
 		t.Errorf("state_count = %d, want 1", a.StateCount)
-	}
-	if a.MetadataCount != 1 {
-		t.Errorf("metadata_count = %d, want 1", a.MetadataCount)
-	}
-	if a.DeregisterCount != 1 {
-		t.Errorf("deregister_count = %d, want 1", a.DeregisterCount)
 	}
 	if a.KeyRotateCount != 1 {
 		t.Errorf("key_rotate_count = %d, want 1", a.KeyRotateCount)
@@ -1507,9 +1473,6 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	}
 	if a.AuditCount != 1 {
 		t.Errorf("audit_count = %d, want 1", a.AuditCount)
-	}
-	if a.ArtifactCount != 1 {
-		t.Errorf("artifact_count = %d, want 1", a.ArtifactCount)
 	}
 	if a.SessionActivityCount != 1 {
 		t.Errorf("session_activity_count = %d, want 1", a.SessionActivityCount)
@@ -1547,15 +1510,12 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPost, "/v1/register", registerBody},
 		{http.MethodPost, "/v1/nodes/node-1/heartbeat", validHeartbeatBody()},
 		{http.MethodGet, "/v1/nodes/node-1/state", ""},
-		{http.MethodGet, "/v1/nodes/node-1/metadata", ""},
-		{http.MethodPost, "/v1/nodes/node-1/deregister", ""},
 		{http.MethodPut, "/v1/nodes/node-1/capabilities", capabilitiesBody},
 		{http.MethodPut, "/v1/nodes/node-1/endpoint", validEndpointBody()},
 		{http.MethodGet, "/v1/nodes/node-1/secrets/key1", ""},
 		{http.MethodPost, "/v1/nodes/node-1/metrics", metricsBatchBody},
 		{http.MethodPost, "/v1/nodes/node-1/logs", logsBatchBody},
 		{http.MethodPost, "/v1/nodes/node-1/audit", auditBatchBody},
-		{http.MethodGet, "/v1/artifacts/plexd/1.0.0/linux/amd64", ""},
 		{http.MethodPost, "/v1/nodes/" + testMockNodeID + "/sessions/sess-conc", `{"tcp":{"phase":"session_started"}}`},
 		{http.MethodPost, "/v1/nodes/node-1/integrity/violations", integrityViolationBody},
 		{http.MethodPost, "/test/inject-event", `{"id":"e1","type":"conc","payload":{},"signature":"s"}`},
@@ -1656,38 +1616,6 @@ func TestConcurrentCounters(t *testing.T) {
 	}
 	if a.ExecutionUploadCount != 0 {
 		t.Errorf("execution_upload_count = %d, want 0", a.ExecutionUploadCount)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Deregister endpoint
-// ---------------------------------------------------------------------------
-
-func TestDeregister_Returns204AndCounterIncrements(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/deregister", "")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
-	}
-
-	a := getAssertions(t, ts.URL)
-	if a.DeregisterCount != 1 {
-		t.Errorf("deregister_count = %d, want 1", a.DeregisterCount)
-	}
-}
-
-func TestDeregister_WrongMethod_Returns405(t *testing.T) {
-	_, ts := newTestServer(t)
-
-	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/deregister")
-	if err != nil {
-		t.Fatalf("GET deregister: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
 	}
 }
 
@@ -2945,44 +2873,148 @@ func TestAudit_WrongMethod_Returns405(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Artifact endpoint
+// Release channel fixture (GET /releases/{tag}/{asset})
 // ---------------------------------------------------------------------------
 
-func TestArtifact_ReturnsBinaryAndCounter(t *testing.T) {
+func TestReleases_ServesFixtureAndValidBundle(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp, err := http.Get(ts.URL + "/v1/artifacts/plexd/1.0.0/linux/amd64")
+	want, err := os.ReadFile("testdata/fixture.bin")
 	if err != nil {
-		t.Fatalf("GET artifact: %v", err)
+		t.Fatalf("read fixture.bin: %v", err)
+	}
+
+	resp, err := http.Get(ts.URL + "/releases/v9.9.9/plexd-linux-amd64")
+	if err != nil {
+		t.Fatalf("GET binary asset: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+		t.Fatalf("binary status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "application/octet-stream" {
-		t.Errorf("Content-Type = %q, want %q", ct, "application/octet-stream")
+		t.Errorf("binary Content-Type = %q, want %q", ct, "application/octet-stream")
 	}
-	body, err := io.ReadAll(resp.Body)
+	got, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("read body: %v", err)
+		t.Fatalf("read binary body: %v", err)
 	}
-	if len(body) == 0 {
-		t.Error("artifact body is empty")
+	if !bytes.Equal(got, want) {
+		t.Errorf("binary body does not match fixture.bin (%d vs %d bytes)", len(got), len(want))
 	}
 
-	a := getAssertions(t, ts.URL)
-	if a.ArtifactCount != 1 {
-		t.Errorf("artifact_count = %d, want 1", a.ArtifactCount)
+	bundleResp, err := http.Get(ts.URL + "/releases/v9.9.9/plexd-linux-amd64.sigstore.json")
+	if err != nil {
+		t.Fatalf("GET bundle asset: %v", err)
+	}
+	defer bundleResp.Body.Close()
+	if bundleResp.StatusCode != http.StatusOK {
+		t.Fatalf("bundle status = %d, want %d", bundleResp.StatusCode, http.StatusOK)
+	}
+	bundle, err := io.ReadAll(bundleResp.Body)
+	if err != nil {
+		t.Fatalf("read bundle body: %v", err)
+	}
+	if !json.Valid(bundle) {
+		t.Error("bundle body is not valid JSON")
 	}
 }
 
-func TestArtifact_WrongMethod_Returns405(t *testing.T) {
+func TestReleases_GarbageBundleForV998(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/artifacts/plexd/1.0.0/linux/amd64", "")
-	defer resp.Body.Close()
+	bundleResp, err := http.Get(ts.URL + "/releases/v9.9.8/plexd-linux-arm64.sigstore.json")
+	if err != nil {
+		t.Fatalf("GET bundle asset: %v", err)
+	}
+	defer bundleResp.Body.Close()
+	if bundleResp.StatusCode != http.StatusOK {
+		t.Fatalf("bundle status = %d, want %d", bundleResp.StatusCode, http.StatusOK)
+	}
+	bundle, err := io.ReadAll(bundleResp.Body)
+	if err != nil {
+		t.Fatalf("read bundle body: %v", err)
+	}
+	if json.Valid(bundle) {
+		t.Error("v9.9.8 bundle should be garbage non-JSON, but it parsed as valid JSON")
+	}
+
+	want, err := os.ReadFile("testdata/fixture.bin")
+	if err != nil {
+		t.Fatalf("read fixture.bin: %v", err)
+	}
+	binResp, err := http.Get(ts.URL + "/releases/v9.9.8/plexd-linux-arm64")
+	if err != nil {
+		t.Fatalf("GET binary asset: %v", err)
+	}
+	defer binResp.Body.Close()
+	if binResp.StatusCode != http.StatusOK {
+		t.Fatalf("binary status = %d, want %d", binResp.StatusCode, http.StatusOK)
+	}
+	got, err := io.ReadAll(binResp.Body)
+	if err != nil {
+		t.Fatalf("read binary body: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("binary body does not match fixture.bin (%d vs %d bytes)", len(got), len(want))
+	}
+}
+
+func TestReleases_UnknownTagOrAsset_Returns404(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	// Unknown tag.
+	resp, err := http.Get(ts.URL + "/releases/v1.0.0/plexd-linux-amd64")
+	if err != nil {
+		t.Fatalf("GET unknown tag: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown tag status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+
+	// Unknown asset under a known tag.
+	resp, err = http.Get(ts.URL + "/releases/v9.9.9/evil.bin")
+	if err != nil {
+		t.Fatalf("GET unknown asset: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown asset status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+
+	// Wrong method on a valid releases path.
+	resp = doRequest(t, http.MethodPost, ts.URL+"/releases/v9.9.9/plexd-linux-amd64", "")
+	resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+		t.Errorf("wrong method status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Retired mock-era routes now return 404
+// ---------------------------------------------------------------------------
+
+func TestRetiredRoutes_Return404(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	// With their handlers and method-not-allowed fallbacks removed, no mux
+	// pattern matches these paths, so Go's ServeMux answers 404.
+	cases := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/v1/ping"},
+		{http.MethodGet, "/v1/nodes/n1/metadata"},
+		{http.MethodPost, "/v1/nodes/n1/deregister"},
+		{http.MethodGet, "/v1/artifacts/plexd/1.0.0/linux/amd64"},
+	}
+	for _, c := range cases {
+		resp := doRequest(t, c.method, ts.URL+c.path, "")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s %s status = %d, want %d", c.method, c.path, resp.StatusCode, http.StatusNotFound)
+		}
 	}
 }
 

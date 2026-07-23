@@ -34,13 +34,13 @@ spec:
               protocol: TCP
           readinessProbe:
             httpGet:
-              path: /v1/ping
+              path: /v1/health
               port: http
             initialDelaySeconds: 1
             periodSeconds: 2
           livenessProbe:
             httpGet:
-              path: /v1/ping
+              path: /v1/health
               port: http
             initialDelaySeconds: 3
             periodSeconds: 10

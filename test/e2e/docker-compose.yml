@@ -7,7 +7,7 @@ services:
       - "18080:8080"
       - "18443:8443"
     healthcheck:
-      test: ["CMD", "/usr/local/bin/mockapi", "-check", "http://localhost:8080/v1/ping"]
+      test: ["CMD", "/usr/local/bin/mockapi", "-check", "http://localhost:8080/v1/health"]
       interval: 2s
       timeout: 2s
       retries: 10

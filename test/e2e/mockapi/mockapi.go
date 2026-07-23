@@ -16,6 +16,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -43,8 +44,6 @@ type AssertionCounters struct {
 	RegisterCount           int64 `json:"registration_count"`
 	HeartbeatCount          int64 `json:"heartbeat_count"`
 	StateCount              int64 `json:"state_count"`
-	MetadataCount           int64 `json:"metadata_count"`
-	DeregisterCount         int64 `json:"deregister_count"`
 	KeyRotateCount          int64 `json:"key_rotate_count"`
 	CapabilitiesCount       int64 `json:"capabilities_count"`
 	EndpointCount           int64 `json:"endpoint_count"`
@@ -57,7 +56,6 @@ type AssertionCounters struct {
 	MetricsCount            int64 `json:"metrics_count"`
 	LogsCount               int64 `json:"logs_count"`
 	AuditCount              int64 `json:"audit_count"`
-	ArtifactCount           int64 `json:"artifact_count"`
 	SessionActivityCount    int64 `json:"session_activity_count"`
 	IntegrityViolationCount int64 `json:"integrity_violation_count"`
 	InjectEventCount        int64 `json:"inject_event_count"`
@@ -79,8 +77,6 @@ type Server struct {
 	registerCount           atomic.Int64
 	heartbeatCount          atomic.Int64
 	stateCount              atomic.Int64
-	metadataCount           atomic.Int64
-	deregisterCount         atomic.Int64
 	keyRotateCount          atomic.Int64
 	capabilitiesCount       atomic.Int64
 	endpointCount           atomic.Int64
@@ -96,7 +92,6 @@ type Server struct {
 	metricsCount            atomic.Int64
 	logsCount               atomic.Int64
 	auditCount              atomic.Int64
-	artifactCount           atomic.Int64
 	sessionActivityCount    atomic.Int64
 	integrityViolationCount atomic.Int64
 	injectEventCount        atomic.Int64
@@ -214,8 +209,6 @@ func (s *Server) Assertions() AssertionCounters {
 		RegisterCount:           s.registerCount.Load(),
 		HeartbeatCount:          s.heartbeatCount.Load(),
 		StateCount:              s.stateCount.Load(),
-		MetadataCount:           s.metadataCount.Load(),
-		DeregisterCount:         s.deregisterCount.Load(),
 		KeyRotateCount:          s.keyRotateCount.Load(),
 		CapabilitiesCount:       s.capabilitiesCount.Load(),
 		EndpointCount:           s.endpointCount.Load(),
@@ -228,7 +221,6 @@ func (s *Server) Assertions() AssertionCounters {
 		MetricsCount:            s.metricsCount.Load(),
 		LogsCount:               s.logsCount.Load(),
 		AuditCount:              s.auditCount.Load(),
-		ArtifactCount:           s.artifactCount.Load(),
 		SessionActivityCount:    s.sessionActivityCount.Load(),
 		IntegrityViolationCount: s.integrityViolationCount.Load(),
 		InjectEventCount:        s.injectEventCount.Load(),
@@ -389,6 +381,14 @@ var (
 	uuidRe = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 )
 
+// releaseFixtures holds the plexd release binary and its Sigstore bundle served
+// by GET /releases/{tag}/{asset}. They are byte-identical copies of the upgrade
+// package's verification fixtures, so the e2e upgrade path fetches and verifies
+// the same artifacts the unit tests do.
+//
+//go:embed testdata/fixture.bin testdata/fixture.sigstore.json
+var releaseFixtures embed.FS
+
 // fixtureRegisterPeers is the initial peer snapshot returned by the register
 // handler. It is deliberately narrow (see api.RegisterPeer).
 var fixtureRegisterPeers = []api.RegisterPeer{
@@ -422,16 +422,14 @@ type sseClient struct {
 
 func (s *Server) registerRoutes() {
 	// Existing endpoints.
-	s.mux.HandleFunc("GET /v1/ping", s.handlePing)
+	s.mux.HandleFunc("GET /v1/health", s.handleHealth)
 	s.mux.HandleFunc("POST /v1/register", s.handleRegister)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/heartbeat", s.handleHeartbeat)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/state", s.handleState)
-	s.mux.HandleFunc("GET /v1/nodes/{id}/metadata", s.handleMetadata)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/events", s.handleEvents)
 	s.mux.HandleFunc("GET /test/assertions", s.handleAssertions)
 
 	// New endpoints.
-	s.mux.HandleFunc("POST /v1/nodes/{id}/deregister", s.handleDeregister)
 	s.mux.HandleFunc("POST /v1/keys/rotate", s.handleKeyRotate)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/capabilities", s.handleCapabilities)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/endpoint", s.handleEndpoint)
@@ -443,9 +441,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/nodes/{id}/metrics", s.handleMetrics)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/logs", s.handleLogs)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/audit", s.handleAudit)
-	s.mux.HandleFunc("GET /v1/artifacts/plexd/{version}/{os}/{arch}", s.handleArtifact)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/sessions/{sid}", s.handleSessionActivity)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/integrity/violations", s.handleIntegrityViolation)
+
+	// Release channel fixture (outside /v1: this plays the GitHub release host,
+	// not the control plane).
+	s.mux.HandleFunc("GET /releases/{tag}/{asset}", s.handleReleases)
 
 	// Test control endpoints.
 	s.mux.HandleFunc("PUT /test/state", s.handleSetState)
@@ -458,10 +459,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
 
 	// Method-not-allowed fallbacks.
-	s.mux.HandleFunc("/v1/ping", methodNotAllowed)
+	s.mux.HandleFunc("/v1/health", methodNotAllowed)
 	s.mux.HandleFunc("/v1/register", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/heartbeat", methodNotAllowed)
-	s.mux.HandleFunc("/v1/nodes/{id}/deregister", methodNotAllowed)
 	s.mux.HandleFunc("/v1/keys/rotate", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/capabilities", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/endpoint", methodNotAllowed)
@@ -472,9 +472,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/metrics", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/logs", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/audit", methodNotAllowed)
-	s.mux.HandleFunc("/v1/artifacts/plexd/{version}/{os}/{arch}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/sessions/{sid}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/integrity/violations", methodNotAllowed)
+	s.mux.HandleFunc("/releases/{tag}/{asset}", methodNotAllowed)
 	s.mux.HandleFunc("/test/state", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-state", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-heartbeat", methodNotAllowed)
@@ -539,9 +539,28 @@ func (s *Server) LastRequestBody(endpoint string) ([]byte, bool) {
 // Handlers
 // ---------------------------------------------------------------------------
 
-// handlePing handles GET /v1/ping (REQ-001).
-func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, struct{}{})
+// healthStatus mirrors the control-plane GET /v1/health response shape: an
+// overall status plus a list of named component checks.
+type healthStatus struct {
+	Status string        `json:"status"`
+	Checks []healthCheck `json:"checks"`
+}
+
+// healthCheck is one component entry in a healthStatus.
+type healthCheck struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Detail string `json:"detail"`
+}
+
+// handleHealth handles GET /v1/health. It is unauthenticated (a readiness probe
+// has no credentials) and answers the control-plane HealthStatus shape so the
+// harness has a stable, contract-faithful liveness endpoint.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, healthStatus{
+		Status: "ok",
+		Checks: []healthCheck{{Name: "mock", Status: "ok", Detail: ""}},
+	})
 }
 
 // handleRegister handles POST /v1/register (REQ-002). It enforces the full
@@ -766,19 +785,6 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.GetState())
 }
 
-// handleMetadata handles GET /v1/nodes/{id}/metadata (REQ-005).
-func (s *Server) handleMetadata(w http.ResponseWriter, r *http.Request) {
-	s.metadataCount.Add(1)
-
-	meta := map[string]string{
-		"environment": "e2e-test",
-		"region":      "mock-region-1",
-		"role":        "worker",
-		"version":     "1.0.0-mock",
-	}
-	writeJSON(w, http.StatusOK, meta)
-}
-
 // handleEvents handles GET /v1/nodes/{id}/events (REQ-006), the pull-only signed
 // event stream. It tails from now unless a Last-Event-ID cursor asks to replay
 // the buffered envelopes with a higher sequence, keeps the stream live until the
@@ -900,18 +906,6 @@ func writeSSEEvent(w io.Writer, ev storedEvent) {
 // handleAssertions handles GET /test/assertions (REQ-007).
 func (s *Server) handleAssertions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.Assertions())
-}
-
-// handleDeregister handles POST /v1/nodes/{id}/deregister.
-// The client sends a nil body (see endpoints.go), so we only capture for
-// test observability — there is no payload to decode.
-func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.captureBody("deregister", r); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
-		return
-	}
-	s.deregisterCount.Add(1)
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleKeyRotate handles POST /v1/keys/rotate. It models the v1 rotation
@@ -1617,13 +1611,58 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, api.IngestReceipt{AcceptedAt: time.Now().UTC(), Records: count})
 }
 
-// handleArtifact handles GET /v1/artifacts/plexd/{version}/{os}/{arch}.
-func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
-	s.artifactCount.Add(1)
-	w.Header().Set("Content-Type", "application/octet-stream")
+// handleReleases handles GET /releases/{tag}/{asset}, playing the GitHub release
+// channel the upgrade fetcher pulls from. Asset matching is arch-agnostic (CI
+// runs amd64, Docker Desktop arm64): the asset must be plexd-linux-<arch> (the
+// binary) or plexd-linux-<arch>.sigstore.json (the Sigstore bundle); anything
+// else is a 404. Tag v9.9.9 serves the valid fixture bundle so verification
+// succeeds; v9.9.8 serves a garbage non-JSON bundle so bundle parsing fails
+// downstream; any other tag is a 404.
+func (s *Server) handleReleases(w http.ResponseWriter, r *http.Request) {
+	asset := r.PathValue("asset")
+	if !strings.HasPrefix(asset, "plexd-linux-") {
+		http.NotFound(w, r)
+		return
+	}
+	isBundle := strings.HasSuffix(asset, ".sigstore.json")
+
+	switch r.PathValue("tag") {
+	case "v9.9.9":
+		if isBundle {
+			writeReleaseFixture(w, "testdata/fixture.sigstore.json", "application/json")
+			return
+		}
+		writeReleaseFixture(w, "testdata/fixture.bin", "application/octet-stream")
+	case "v9.9.8":
+		if isBundle {
+			// A garbage non-JSON bundle so the downstream Sigstore parse fails.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if _, err := w.Write([]byte("garbage not a bundle")); err != nil {
+				slog.Error("handleReleases: write failed", "error", err)
+			}
+			return
+		}
+		writeReleaseFixture(w, "testdata/fixture.bin", "application/octet-stream")
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// writeReleaseFixture serves an embedded release fixture with the given
+// Content-Type. A read failure can only mean the embed directive drifted from
+// the testdata files, so it is a 500.
+func writeReleaseFixture(w http.ResponseWriter, name, contentType string) {
+	data, err := releaseFixtures.ReadFile(name)
+	if err != nil {
+		slog.Error("handleReleases: read fixture failed", "name", name, "error", err)
+		http.Error(w, "fixture unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write([]byte("mock-plexd-binary-v0.0.0")); err != nil {
-		slog.Error("handleArtifact: write failed", "error", err)
+	if _, err := w.Write(data); err != nil {
+		slog.Error("handleReleases: write failed", "error", err)
 	}
 }
 
