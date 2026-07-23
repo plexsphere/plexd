@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -49,9 +50,15 @@ type ConfigProvider interface {
 	DumpConfig() string
 }
 
-// ArtifactFetcher downloads a plexd binary artifact.
-type ArtifactFetcher interface {
-	FetchArtifact(ctx context.Context, version, goos, arch string) (io.ReadCloser, error)
+// ReleaseFetcher downloads plexd release assets for a version.
+type ReleaseFetcher interface {
+	FetchBinary(ctx context.Context, version string) (io.ReadCloser, error)
+	FetchBundle(ctx context.Context, version string) ([]byte, error)
+}
+
+// BundleVerifier verifies a Sigstore bundle against an artifact digest.
+type BundleVerifier interface {
+	Verify(bundleJSON []byte, sha256Hex string) error
 }
 
 // LogProvider supplies recent log lines.
@@ -329,15 +336,36 @@ type serviceUpgradeResult struct {
 	Version string `json:"version,omitempty"`
 }
 
-// ServiceUpgrade returns a BuiltinFunc that performs an in-place binary upgrade.
-// It downloads the new binary from the control plane, verifies its SHA-256
-// checksum, atomically replaces the current binary, and triggers a systemd restart.
+// resolveExecutable resolves the path of the running binary. It is a package
+// var so tests can point the upgrade flow at a temporary file.
+var resolveExecutable = os.Executable
+
+// upgradeMu serializes ServiceUpgrade so that at most one in-place upgrade runs
+// at a time. The orphan sweep below deletes every .plexd-upgrade-* file in the
+// binary's directory; without this guard a second concurrent upgrade (a distinct
+// execution ID passes the executor's duplicate check) would remove the temp file
+// the first is still streaming into, and two upgrades could each rename over the
+// binary, leaving a non-deterministic installed version.
+var upgradeMu sync.Mutex
+
+// ServiceUpgrade returns a BuiltinFunc that performs an in-place binary upgrade
+// from the GitHub release channel.
+//
+// It downloads the target release binary, verifies its SHA-256 checksum against
+// the dispatched value, then downloads and verifies the release's Sigstore
+// bundle against the fetched binary's digest. Only after both checks pass is the
+// current binary made executable, atomically replaced, and a systemd restart
+// triggered. A release without a bundle asset (the fetch fails) or one whose
+// bundle fails verification is refused, and the on-disk binary is left untouched.
 //
 // Required parameters:
 //   - version: target version string (e.g. "1.5.0")
 //   - checksum: expected SHA-256 checksum of the new binary (hex-encoded, with or without "sha256:" prefix)
-func ServiceUpgrade(fetcher ArtifactFetcher) BuiltinFunc {
+func ServiceUpgrade(fetcher ReleaseFetcher, verifier BundleVerifier) BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
+		upgradeMu.Lock()
+		defer upgradeMu.Unlock()
+
 		version := params["version"]
 		if version == "" {
 			return "", "", 1, fmt.Errorf("missing required parameter: version")
@@ -350,7 +378,7 @@ func ServiceUpgrade(fetcher ArtifactFetcher) BuiltinFunc {
 		checksum = strings.TrimPrefix(checksum, "sha256:")
 
 		// Determine current binary path.
-		binaryPath, err := os.Executable()
+		binaryPath, err := resolveExecutable()
 		if err != nil {
 			return "", "", 1, fmt.Errorf("resolve executable path: %w", err)
 		}
@@ -359,15 +387,23 @@ func ServiceUpgrade(fetcher ArtifactFetcher) BuiltinFunc {
 			return "", "", 1, fmt.Errorf("resolve symlinks: %w", err)
 		}
 
-		// Download the new binary.
-		rc, err := fetcher.FetchArtifact(ctx, version, runtime.GOOS, runtime.GOARCH)
+		// Download the new binary from the release channel.
+		rc, err := fetcher.FetchBinary(ctx, version)
 		if err != nil {
-			return "", "", 1, fmt.Errorf("download artifact: %w", err)
+			return "", "", 1, fmt.Errorf("download binary: %w", err)
 		}
 		defer rc.Close()
 
-		// Write to a temporary file next to the current binary.
+		// Write to a temporary file next to the current binary. First sweep any
+		// temp files orphaned by a previous upgrade that was killed (SIGKILL,
+		// OOM, power loss) between CreateTemp and Rename, before its deferred
+		// cleanup could run — otherwise partially-streamed downloads accumulate
+		// here (up to maxBinaryBytes each) until the binary's partition fills.
 		dir := filepath.Dir(binaryPath)
+		orphans, _ := filepath.Glob(filepath.Join(dir, ".plexd-upgrade-*"))
+		for _, orphan := range orphans {
+			os.Remove(orphan)
+		}
 		tmpFile, err := os.CreateTemp(dir, ".plexd-upgrade-*")
 		if err != nil {
 			return "", "", 1, fmt.Errorf("create temp file: %w", err)
@@ -383,17 +419,13 @@ func ServiceUpgrade(fetcher ArtifactFetcher) BuiltinFunc {
 		writer := io.MultiWriter(tmpFile, hasher)
 		if _, err := io.Copy(writer, rc); err != nil {
 			tmpFile.Close()
-			return "", "", 1, fmt.Errorf("download binary: %w", err)
-		}
-		if err := tmpFile.Chmod(0755); err != nil {
-			tmpFile.Close()
-			return "", "", 1, fmt.Errorf("chmod binary: %w", err)
+			return "", "", 1, fmt.Errorf("stream binary: %w", err)
 		}
 		if err := tmpFile.Close(); err != nil {
 			return "", "", 1, fmt.Errorf("close temp file: %w", err)
 		}
 
-		// Verify checksum.
+		// Verify the download's checksum against the dispatched value.
 		actualChecksum := hex.EncodeToString(hasher.Sum(nil))
 		if actualChecksum != checksum {
 			result := serviceUpgradeResult{
@@ -405,7 +437,28 @@ func ServiceUpgrade(fetcher ArtifactFetcher) BuiltinFunc {
 			return string(data), "", 1, nil
 		}
 
-		// Atomic replace: rename temp file over the current binary.
+		// Download and verify the release's Sigstore bundle against the fetched
+		// binary's digest. A missing bundle asset fails the fetch, which is how
+		// unsigned releases are refused.
+		bundle, err := fetcher.FetchBundle(ctx, version)
+		if err != nil {
+			return "", "", 1, fmt.Errorf("download bundle: %w", err)
+		}
+		if err := verifier.Verify(bundle, actualChecksum); err != nil {
+			result := serviceUpgradeResult{
+				Status:  "bundle_verification_failed",
+				Message: err.Error(),
+				Version: version,
+			}
+			data, _ := json.MarshalIndent(result, "", "  ")
+			return string(data), "", 1, nil
+		}
+
+		// Make the verified binary executable, then atomically replace the
+		// current binary with it.
+		if err := os.Chmod(tmpPath, 0755); err != nil {
+			return "", "", 1, fmt.Errorf("chmod binary: %w", err)
+		}
 		if err := os.Rename(tmpPath, binaryPath); err != nil {
 			return "", "", 1, fmt.Errorf("replace binary: %w", err)
 		}

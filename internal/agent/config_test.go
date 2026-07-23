@@ -3,7 +3,10 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/plexsphere/plexd/internal/upgrade"
 )
 
 func TestAgentConfig_ApplyDefaults(t *testing.T) {
@@ -18,6 +21,18 @@ func TestAgentConfig_ApplyDefaults(t *testing.T) {
 	}
 	if cfg.DataDir != DefaultDataDir {
 		t.Errorf("DataDir = %q, want %q", cfg.DataDir, DefaultDataDir)
+	}
+	if cfg.Upgrade.ReleaseBaseURL != "https://github.com/plexsphere/plexd/releases/download" {
+		t.Errorf("Upgrade.ReleaseBaseURL = %q, want %q", cfg.Upgrade.ReleaseBaseURL, "https://github.com/plexsphere/plexd/releases/download")
+	}
+	if cfg.Upgrade.SigningIdentityRegexp != upgrade.DefaultSigningIdentityRegexp {
+		t.Errorf("Upgrade.SigningIdentityRegexp = %q, want %q", cfg.Upgrade.SigningIdentityRegexp, upgrade.DefaultSigningIdentityRegexp)
+	}
+	if cfg.Upgrade.SigningIssuer != "https://token.actions.githubusercontent.com" {
+		t.Errorf("Upgrade.SigningIssuer = %q, want %q", cfg.Upgrade.SigningIssuer, "https://token.actions.githubusercontent.com")
+	}
+	if cfg.Upgrade.TrustedRootPath != "" {
+		t.Errorf("Upgrade.TrustedRootPath = %q, want empty", cfg.Upgrade.TrustedRootPath)
 	}
 }
 
@@ -71,6 +86,60 @@ heartbeat:
 	}
 	if cfg.Registration.RequestedResourceID != "substrate-id-1" {
 		t.Errorf("Registration.RequestedResourceID = %q, want %q", cfg.Registration.RequestedResourceID, "substrate-id-1")
+	}
+}
+
+func TestParseConfig_UpgradeSection(t *testing.T) {
+	yaml := `
+api:
+  base_url: "https://example.com"
+registration:
+  data_dir: /tmp/plexd
+node_api:
+  data_dir: /tmp/plexd
+heartbeat:
+  node_id: "node-1"
+upgrade:
+  release_base_url: "https://mirror.example.com/releases"
+  signing_issuer: "https://issuer.example.com"
+`
+	path := writeTemp(t, yaml)
+	cfg, err := ParseConfig(path)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if cfg.Upgrade.ReleaseBaseURL != "https://mirror.example.com/releases" {
+		t.Errorf("Upgrade.ReleaseBaseURL = %q, want %q", cfg.Upgrade.ReleaseBaseURL, "https://mirror.example.com/releases")
+	}
+	if cfg.Upgrade.SigningIssuer != "https://issuer.example.com" {
+		t.Errorf("Upgrade.SigningIssuer = %q, want %q", cfg.Upgrade.SigningIssuer, "https://issuer.example.com")
+	}
+	// Unset fields still receive their defaults.
+	if cfg.Upgrade.SigningIdentityRegexp != upgrade.DefaultSigningIdentityRegexp {
+		t.Errorf("Upgrade.SigningIdentityRegexp = %q, want default", cfg.Upgrade.SigningIdentityRegexp)
+	}
+}
+
+func TestParseConfig_UpgradeInvalidRegexp(t *testing.T) {
+	yaml := `
+api:
+  base_url: "https://example.com"
+registration:
+  data_dir: /tmp/plexd
+node_api:
+  data_dir: /tmp/plexd
+heartbeat:
+  node_id: "node-1"
+upgrade:
+  signing_identity_regexp: "("
+`
+	path := writeTemp(t, yaml)
+	_, err := ParseConfig(path)
+	if err == nil {
+		t.Fatal("expected error for invalid signing_identity_regexp")
+	}
+	if !strings.Contains(err.Error(), "upgrade: config: compile signing_identity_regexp:") {
+		t.Errorf("err = %q, want it to contain %q", err.Error(), "upgrade: config: compile signing_identity_regexp:")
 	}
 }
 

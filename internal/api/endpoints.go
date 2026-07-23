@@ -333,18 +333,6 @@ func (c *ControlPlane) DeleteStateReport(ctx context.Context, nodeID, key string
 	return c.doRequest(ctx, http.MethodDelete, path, nil, nil)
 }
 
-// FetchArtifact downloads a plexd binary artifact.
-// The caller is responsible for closing the returned ReadCloser.
-// GET /v1/artifacts/plexd/{version}/{os}/{arch}
-func (c *ControlPlane) FetchArtifact(ctx context.Context, version, goos, arch string) (io.ReadCloser, error) {
-	path := fmt.Sprintf("/v1/artifacts/plexd/%s/%s/%s", url.PathEscape(version), url.PathEscape(goos), url.PathEscape(arch))
-	resp, err := c.doRequestRaw(ctx, http.MethodGet, path, nil)
-	if err != nil {
-		return nil, err
-	}
-	return resp.Body, nil
-}
-
 // ReportSessionActivity posts a one-of session activity record (ssh, k8s, or
 // tcp). Success is 204 No Content.
 // POST /v1/nodes/{node_id}/sessions/{session_id}
