@@ -15,7 +15,7 @@ Validates that plexd runs correctly as a systemd service by deploying it inside 
 │   mock-api   │◄──────│   systemd container     │
 │  :8080 (HTTP)│       │  (Ubuntu 24.04)         │
 │  :8443 (TLS) │       │  systemd PID 1          │
-│  /v1/ping    │       │  plexd.service managed   │
+│  /v1/health  │       │  plexd.service managed   │
 └──────────────┘       └─────────────────────────┘
         │                          │
         └──── plexd-systemd-e2e ───┘
@@ -220,7 +220,7 @@ docker exec plexd-e2e-systemd journalctl -u plexd --no-pager -n 100
 
 Common causes:
 - Network connectivity — both containers must be on the `plexd-systemd-e2e` bridge network.
-- mock-api not ready — the script polls `/v1/ping` for readiness but the health timeout may be too short.
+- mock-api not ready — the script polls `/v1/health` for readiness but the health timeout may be too short.
 
 **Leftover containers from previous run:**
 

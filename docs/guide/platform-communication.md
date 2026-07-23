@@ -99,9 +99,8 @@ flowchart TD
     subgraph Shutdown
         S1 & S2 & S3 -->|SIGTERM / SIGINT| D1[Stop accepting new work]
         D1 --> D2[Drain in-flight actions up to 30s]
-        D2 --> D3[POST /v1/nodes/id/deregister]
-        D3 --> D4[Tear down WireGuard interface]
-        D4 --> D5[Clean up local state]
+        D2 --> D4[Tear down WireGuard interface]
+        D4 --> D5[Stop subsystems]
     end
 ```
 

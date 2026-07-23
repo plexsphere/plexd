@@ -599,12 +599,6 @@ is `204 No Content`.
 | `TerminatedByPlexdClose`     | `plexd_close`    | plexd closed the session locally              |
 | `TerminatedByOperatorRevoke` | `operator_revoke`| Operator's access was revoked                 |
 
-## Artifacts
-
-### `GET /v1/artifacts/plexd/{version}/{os}/{arch}`
-
-Returns `io.ReadCloser` with the binary stream. No request/response struct — path parameters only.
-
 ## SSE Events
 
 ### `GET /v1/nodes/{node_id}/events`

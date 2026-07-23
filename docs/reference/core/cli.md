@@ -118,15 +118,34 @@ plexd uninstall [--purge]
 
 ### `plexd deregister`
 
-Deregister this node from the control plane.
+Remove this node's local identity. This is a **local-only** cleanup: it makes no
+request to the control plane. Removing the node from the control plane is
+operator-driven and is done on the platform.
 
 ```
 plexd deregister [--purge]
 ```
 
-| Flag      | Default | Description                                             |
-|-----------|---------|---------------------------------------------------------|
-| `--purge` | `false` | Remove data_dir, token file, and disable systemd unit   |
+| Flag      | Default | Description                                                      |
+|-----------|---------|------------------------------------------------------------------|
+| `--purge` | `false` | Also remove `data_dir` and the registration token file          |
+
+Plain `plexd deregister` removes `identity.json` from `data_dir` and prints:
+
+```
+local identity removed (/var/lib/plexd/identity.json)
+node removal from the control plane is operator-driven on the platform
+```
+
+The command is idempotent: when no `identity.json` exists it prints
+`no local identity found (nothing to do)` and exits `0`. If the identity file
+exists but cannot be removed, it fails with
+`plexd deregister: remove identity: <error>` and a non-zero exit.
+
+With `--purge`, the command additionally removes the entire `data_dir` (all
+identity and key files, cached state) and the registration token file, then
+prints `local data purged`. `--purge` does **not** disable any systemd unit; use
+[`plexd uninstall`](#plexd-uninstall) to remove the service.
 
 **Exit codes:** 0 on success, 1 on error.
 
@@ -247,7 +266,7 @@ plexd actions run restart-service --param name=nginx --param force=true
 | `diagnostics.traceroute_peer` | Traceroute to a mesh peer | `peer_id` (required), `max_hops` |
 | `service.restart` | Restart plexd via systemctl | — |
 | `service.reload_config` | Send SIGHUP to reload config | — |
-| `service.upgrade` | Upgrade plexd to a specified version | `version` (required), `checksum` (required) |
+| `service.upgrade` | Download a release binary, verify its checksum and Sigstore bundle, then swap and restart | `version` (required), `checksum` (required) |
 | `system.info` | Report OS, kernel, hardware, and runtime info | — |
 | `health.check` | Run all health checks and report status | `include_peers` |
 | `mesh.reconnect` | Tear down and re-establish all mesh tunnels | — |

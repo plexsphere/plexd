@@ -131,6 +131,21 @@ Source: `internal/actions/config.go`
 
 ---
 
+## upgrade
+
+Release download and Sigstore bundle verification for the `service.upgrade` action.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `release_base_url` | string | `https://github.com/plexsphere/plexd/releases/download` | Base URL of the release download channel. Assets are fetched from `{release_base_url}/{tag}/{asset}`. Air-gapped setups point this at a mirror. |
+| `signing_identity_regexp` | string | `^https://github\.com/plexsphere/plexd/\.github/workflows/release\.yml@refs/tags/v.+$` | Regexp the signing certificate's SAN must match. Compiled at validation; a malformed pattern fails with `upgrade: config: compile signing_identity_regexp: ...`. |
+| `signing_issuer` | string | `https://token.actions.githubusercontent.com` | Exact OIDC issuer the signing certificate must carry. |
+| `trusted_root_path` | string | — (empty) | Path to a Sigstore trusted root JSON file. Empty uses the embedded Sigstore public-good trusted root. |
+
+Source: `internal/upgrade/config.go`
+
+---
+
 ## integrity
 
 Binary and hook integrity verification.
@@ -367,6 +382,12 @@ actions:
   max_concurrent: 5          # min: 1
   max_action_timeout: 10m    # min: 10s
   max_output_bytes: 1048576  # min: 1024 (1 MiB)
+
+upgrade:
+  release_base_url: https://github.com/plexsphere/plexd/releases/download
+  signing_identity_regexp: '^https://github\.com/plexsphere/plexd/\.github/workflows/release\.yml@refs/tags/v.+$'
+  signing_issuer: https://token.actions.githubusercontent.com
+  # trusted_root_path: ""    # empty = embedded Sigstore public-good root
 
 integrity:
   enabled: true

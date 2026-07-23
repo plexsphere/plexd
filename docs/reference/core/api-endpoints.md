@@ -13,20 +13,18 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 1 | `POST` | `/v1/register` | Node registration |
 | 2 | `GET` | `/v1/nodes/{node_id}/events` | SSE event stream |
 | 3 | `POST` | `/v1/nodes/{node_id}/heartbeat` | Heartbeat |
-| 4 | `POST` | `/v1/nodes/{node_id}/deregister` | Graceful deregistration |
-| 5 | `POST` | `/v1/keys/rotate` | Key rotation |
-| 6 | `PUT` | `/v1/nodes/{node_id}/capabilities` | Capability update |
-| 7 | `PUT` | `/v1/nodes/{node_id}/endpoint` | NAT endpoint reporting |
-| 8 | `GET` | `/v1/nodes/{node_id}/state` | State snapshot pull (reconciliation) |
-| 9 | `GET` | `/v1/nodes/{node_id}/secrets/{key}` | Secret envelope fetch (NSK-encrypted octet-stream) |
-| 10 | `PUT` | `/v1/nodes/{node_id}/state/reports/{key}` | Per-key state report upsert |
-| 11 | `DELETE` | `/v1/nodes/{node_id}/state/reports/{key}` | Per-key state report delete |
-| 12 | `POST` | `/v1/nodes/{node_id}/executions/{execution_id}` | Action execution callback |
-| 13 | `POST` | `/v1/nodes/{node_id}/sessions/{session_id}` | Session activity record |
-| 14 | `POST` | `/v1/nodes/{node_id}/metrics` | Metrics batch |
-| 15 | `POST` | `/v1/nodes/{node_id}/logs` | Log batch |
-| 16 | `POST` | `/v1/nodes/{node_id}/audit` | Audit batch |
-| 17 | `GET` | `/v1/artifacts/plexd/{version}/{os}/{arch}` | Binary download |
+| 4 | `POST` | `/v1/keys/rotate` | Key rotation |
+| 5 | `PUT` | `/v1/nodes/{node_id}/capabilities` | Capability update |
+| 6 | `PUT` | `/v1/nodes/{node_id}/endpoint` | NAT endpoint reporting |
+| 7 | `GET` | `/v1/nodes/{node_id}/state` | State snapshot pull (reconciliation) |
+| 8 | `GET` | `/v1/nodes/{node_id}/secrets/{key}` | Secret envelope fetch (NSK-encrypted octet-stream) |
+| 9 | `PUT` | `/v1/nodes/{node_id}/state/reports/{key}` | Per-key state report upsert |
+| 10 | `DELETE` | `/v1/nodes/{node_id}/state/reports/{key}` | Per-key state report delete |
+| 11 | `POST` | `/v1/nodes/{node_id}/executions/{execution_id}` | Action execution callback |
+| 12 | `POST` | `/v1/nodes/{node_id}/sessions/{session_id}` | Session activity record |
+| 13 | `POST` | `/v1/nodes/{node_id}/metrics` | Metrics batch |
+| 14 | `POST` | `/v1/nodes/{node_id}/logs` | Log batch |
+| 15 | `POST` | `/v1/nodes/{node_id}/audit` | Audit batch |
 
 ## Registration & Identity
 
@@ -161,17 +159,6 @@ Sent at `heartbeat.interval` (default 30s).
 | `400 Bad Request` | `binary_checksum_empty` | `binary_checksum` missing or not a valid SHA-256 encoding |
 | `400 Bad Request` | `binary_version_empty` | `binary_version` missing |
 | `401 Unauthorized` | — | Node identity invalid, re-register |
-
-## Deregistration
-
-### POST /v1/nodes/{node_id}/deregister
-
-Sent on shutdown or explicit `plexd deregister` command. No request body.
-
-| Response | Meaning |
-|---|---|
-| `200 OK` | Deregistration acknowledged |
-| `401 Unauthorized` | Invalid node identity |
 
 ## Key Management
 
@@ -644,17 +631,3 @@ nanosecond precision, UTC) and gzip the request body when it exceeds 1 KiB
 | `415 Unsupported Media Type` | `ingest_encoding_unsupported` | `Content-Encoding` other than `gzip` or `identity` |
 | `429 Too Many Requests` | — | Rate limit exceeded, retry with backoff |
 | `501 Not Implemented` | `observability_ingest_not_provisioned` | Observability ingest is not provisioned; the node drops the batch |
-
-## Artifacts
-
-### GET /v1/artifacts/plexd/{version}/{os}/{arch}
-
-Called during `service.upgrade` action execution. Returns the binary as an octet stream.
-
-| Parameter | Example | Description |
-|---|---|---|
-| `version` | `1.5.0` | Target version |
-| `os` | `linux` | Operating system |
-| `arch` | `amd64` | CPU architecture |
-
-Response: `200 OK` with `Content-Type: application/octet-stream`. The SHA-256 checksum is provided in the `action_request` parameters and verified by plexd after download.
