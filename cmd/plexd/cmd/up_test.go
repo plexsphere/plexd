@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
@@ -204,4 +205,88 @@ func TestDeliveryModePublisher(t *testing.T) {
 	if got, _ := cache.GetMetadataKey("delivery_mode"); got != "streaming" {
 		t.Errorf("delivery_mode after update = %q, want streaming", got)
 	}
+}
+
+// TestApplyEnvOverrides_NodeAPI locks down the node-API branches of
+// applyEnvOverrides: the three working overrides (socket, http_enabled,
+// http_listen) and a regression guard proving the removed
+// PLEXD_NODE_API_ENABLED variable is no longer read. Every subtest pins all
+// four variables via t.Setenv so ambient CI values cannot leak in; t.Setenv
+// restores the environment on cleanup and forbids t.Parallel, so none is used.
+func TestApplyEnvOverrides_NodeAPI(t *testing.T) {
+	t.Run("happy path", func(t *testing.T) {
+		t.Setenv("PLEXD_NODE_API_ENABLED", "")
+		t.Setenv("PLEXD_NODE_API_SOCKET", "/tmp/x.sock")
+		t.Setenv("PLEXD_NODE_API_HTTP_ENABLED", "1")
+		t.Setenv("PLEXD_NODE_API_HTTP_LISTEN", "127.0.0.1:9999")
+
+		cfg := agent.AgentConfig{}
+		applyEnvOverrides(&cfg)
+
+		if cfg.NodeAPI.SocketPath != "/tmp/x.sock" {
+			t.Errorf("SocketPath = %q, want %q", cfg.NodeAPI.SocketPath, "/tmp/x.sock")
+		}
+		if cfg.NodeAPI.HTTPEnabled != true {
+			t.Errorf("HTTPEnabled = %v, want true", cfg.NodeAPI.HTTPEnabled)
+		}
+		if cfg.NodeAPI.HTTPListen != "127.0.0.1:9999" {
+			t.Errorf("HTTPListen = %q, want %q", cfg.NodeAPI.HTTPListen, "127.0.0.1:9999")
+		}
+	})
+
+	t.Run("http_enabled coercion", func(t *testing.T) {
+		tests := []struct {
+			value string
+			want  bool
+		}{
+			{"true", true},
+			{"1", true},
+			{"false", false},
+			{"0", false},
+			{"yes", false},
+		}
+		for _, tt := range tests {
+			t.Run(tt.value, func(t *testing.T) {
+				t.Setenv("PLEXD_NODE_API_ENABLED", "")
+				t.Setenv("PLEXD_NODE_API_SOCKET", "")
+				t.Setenv("PLEXD_NODE_API_HTTP_ENABLED", tt.value)
+				t.Setenv("PLEXD_NODE_API_HTTP_LISTEN", "")
+
+				cfg := agent.AgentConfig{}
+				applyEnvOverrides(&cfg)
+
+				if cfg.NodeAPI.HTTPEnabled != tt.want {
+					t.Errorf("HTTPEnabled for %q = %v, want %v", tt.value, cfg.NodeAPI.HTTPEnabled, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("empty values leave zero config", func(t *testing.T) {
+		t.Setenv("PLEXD_NODE_API_ENABLED", "")
+		t.Setenv("PLEXD_NODE_API_SOCKET", "")
+		t.Setenv("PLEXD_NODE_API_HTTP_ENABLED", "")
+		t.Setenv("PLEXD_NODE_API_HTTP_LISTEN", "")
+
+		cfg := agent.AgentConfig{}
+		applyEnvOverrides(&cfg)
+
+		if cfg.NodeAPI != (nodeapi.Config{}) {
+			t.Errorf("NodeAPI = %+v, want zero value", cfg.NodeAPI)
+		}
+	})
+
+	t.Run("removed PLEXD_NODE_API_ENABLED is inert", func(t *testing.T) {
+		t.Setenv("PLEXD_NODE_API_ENABLED", "false")
+		t.Setenv("PLEXD_NODE_API_SOCKET", "")
+		t.Setenv("PLEXD_NODE_API_HTTP_ENABLED", "")
+		t.Setenv("PLEXD_NODE_API_HTTP_LISTEN", "")
+
+		cfg := agent.AgentConfig{}
+		applyEnvOverrides(&cfg)
+
+		if cfg.NodeAPI != (nodeapi.Config{}) {
+			t.Errorf("NodeAPI = %+v, want zero value (PLEXD_NODE_API_ENABLED must be ignored)", cfg.NodeAPI)
+		}
+	})
 }
