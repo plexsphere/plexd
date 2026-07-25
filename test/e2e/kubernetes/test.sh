@@ -11,6 +11,8 @@
 #   - Action execution via SSE (action_request → ack + result)
 #   - Heartbeat-triggered reconcile via RotateKeys flag
 #   - Deeper body validation (metrics, capabilities fields)
+#   - Shipped liveness/readiness probes stay active; a final phase asserts no
+#     probe-induced restarts and no liveness-probe failures
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -166,6 +168,10 @@ registration:
 node_api:
   data_dir: /var/lib/plexd
 
+health:
+  enabled: true
+  listen: "127.0.0.1:9101"
+
 heartbeat:
   node_id: e2e-k8s-node
 
@@ -216,10 +222,6 @@ sed "s/namespace: plexd-system/namespace: ${NAMESPACE}/" "${DAEMONSET_DIR}/daemo
     | sed "s|image: ghcr.io/plexsphere/plexd:latest|image: plexd:e2e|" \
     | sed 's/imagePullPolicy: Always/imagePullPolicy: Never/' \
     | kubectl apply -f -
-
-# Remove liveness/readiness probes (health endpoints not yet implemented).
-kubectl -n "${NAMESPACE}" patch daemonset plexd --type=json \
-    -p='[{"op":"remove","path":"/spec/template/spec/containers/0/livenessProbe"},{"op":"remove","path":"/spec/template/spec/containers/0/readinessProbe"}]'
 
 # --- Wait for readiness (REQ-005) ---
 echo "=== Waiting for mock-api to be ready ==="
@@ -862,6 +864,48 @@ if [ "${LOCAL_ELAPSED}" -ge "${LOCAL_TIMEOUT}" ]; then
 fi
 
 echo "=== Phase 9 PASSED: local endpoint delivery ==="
+
+# ===================================================================
+# Phase 10: Probe health
+# ===================================================================
+echo "=== Checking probe health ==="
+
+# Phase 4 deleted the original pod, so the DaemonSet replaced it with a NEW
+# pod. A restartCount > 0 on the current pod therefore means the kubelet
+# restarted the container in place — i.e. a liveness probe failed.
+PLEXD_POD=$(kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=plexd -o jsonpath='{.items[0].metadata.name}')
+RESTART_COUNT=$(kubectl -n "${NAMESPACE}" get pod "${PLEXD_POD}" -o jsonpath='{.status.containerStatuses[0].restartCount}')
+# jsonpath yields an empty string when the pod carries no containerStatuses yet
+# (Pending, ContainerCreating, mid-termination). Without this check the numeric
+# comparison below would error out, and because set -e does not apply inside an
+# if condition, the guard would fall through to its own PASS line — reporting
+# success for the very pod state most likely to be thrashing.
+if ! [[ "${RESTART_COUNT}" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: could not read restartCount for pod ${PLEXD_POD} (got '${RESTART_COUNT}')"
+    print_diagnostics
+    exit 1
+fi
+if [ "${RESTART_COUNT}" -ne 0 ]; then
+    echo "FAIL: plexd pod ${PLEXD_POD} has restartCount=${RESTART_COUNT}, want 0"
+    print_diagnostics
+    exit 1
+fi
+echo "  PASS: plexd pod ${PLEXD_POD} has restartCount=0"
+
+# Only liveness failures are asserted: a 503 from /readyz before registration
+# completes is by design, so Unhealthy readiness events are expected.
+LIVENESS_FAILURES=$(kubectl -n "${NAMESPACE}" get events \
+    --field-selector reason=Unhealthy -o json \
+    | jq -r '[.items[] | select(.involvedObject.name | startswith("plexd")) | select(.message | contains("Liveness"))] | length')
+if [ "${LIVENESS_FAILURES}" -ne 0 ]; then
+    echo "FAIL: ${LIVENESS_FAILURES} liveness-probe failure event(s) for plexd pods, want 0"
+    kubectl -n "${NAMESPACE}" get events --field-selector reason=Unhealthy 2>/dev/null || true
+    print_diagnostics
+    exit 1
+fi
+echo "  PASS: no liveness-probe failure events for plexd pods"
+
+echo "=== Phase 10 PASSED: probe health ==="
 
 TEST_FAILED=0
 echo "=== ALL TESTS PASSED ==="
