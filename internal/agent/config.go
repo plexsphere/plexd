@@ -10,6 +10,7 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/auditfwd"
 	"github.com/plexsphere/plexd/internal/bridge"
+	"github.com/plexsphere/plexd/internal/health"
 	"github.com/plexsphere/plexd/internal/integrity"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
@@ -55,6 +56,7 @@ type AgentConfig struct {
 	Registration registration.Config `yaml:"registration"`
 	Reconcile    reconcile.Config    `yaml:"reconcile"`
 	NodeAPI      nodeapi.Config      `yaml:"node_api"`
+	Health       health.Config       `yaml:"health"`
 	Actions      actions.Config      `yaml:"actions"`
 	Policy       policy.Config       `yaml:"policy"`
 	WireGuard    wireguard.Config    `yaml:"wireguard"`
@@ -85,6 +87,7 @@ func (c *AgentConfig) ApplyDefaults() {
 	c.Registration.ApplyDefaults()
 	c.Reconcile.ApplyDefaults()
 	c.NodeAPI.ApplyDefaults()
+	c.Health.ApplyDefaults()
 	c.Actions.ApplyDefaults()
 	c.Policy.ApplyDefaults()
 	c.WireGuard.ApplyDefaults()
@@ -115,6 +118,9 @@ func (c *AgentConfig) Validate() error {
 		return err
 	}
 	if err := c.NodeAPI.Validate(); err != nil {
+		return err
+	}
+	if err := c.Health.Validate(); err != nil {
 		return err
 	}
 	if err := c.Actions.Validate(); err != nil {

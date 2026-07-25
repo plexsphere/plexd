@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/plexsphere/plexd/internal/health"
 	"github.com/plexsphere/plexd/internal/upgrade"
 )
 
@@ -34,6 +35,15 @@ func TestAgentConfig_ApplyDefaults(t *testing.T) {
 	if cfg.Upgrade.TrustedRootPath != "" {
 		t.Errorf("Upgrade.TrustedRootPath = %q, want empty", cfg.Upgrade.TrustedRootPath)
 	}
+	if cfg.Health.Listen != health.DefaultListen {
+		t.Errorf("Health.Listen = %q, want %q", cfg.Health.Listen, health.DefaultListen)
+	}
+	// A config file without a health block must still bring the listener up:
+	// the shipped DaemonSet probes /healthz and /readyz unconditionally, so an
+	// unbound probe target means a liveness failure and a restart loop.
+	if !cfg.Health.IsEnabled() {
+		t.Error("Health.IsEnabled() = false, want true for an omitted health block")
+	}
 }
 
 func TestAgentConfig_Validate_InvalidMode(t *testing.T) {
@@ -58,6 +68,9 @@ registration:
   requested_resource_id: substrate-id-1
 node_api:
   data_dir: /tmp/plexd
+health:
+  enabled: false
+  listen: "127.0.0.1:19101"
 heartbeat:
   node_id: "node-1"
 `
@@ -86,6 +99,14 @@ heartbeat:
 	}
 	if cfg.Registration.RequestedResourceID != "substrate-id-1" {
 		t.Errorf("Registration.RequestedResourceID = %q, want %q", cfg.Registration.RequestedResourceID, "substrate-id-1")
+	}
+	// An explicit false must survive parsing: that opt-out is the only way to
+	// turn the listener off now that an omitted block enables it.
+	if cfg.Health.IsEnabled() {
+		t.Error("Health.IsEnabled() = true, want false for an explicit enabled: false")
+	}
+	if cfg.Health.Listen != "127.0.0.1:19101" {
+		t.Errorf("Health.Listen = %q, want %q", cfg.Health.Listen, "127.0.0.1:19101")
 	}
 }
 
