@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/auditfwd"
 	"github.com/plexsphere/plexd/internal/bridge"
+	"github.com/plexsphere/plexd/internal/health"
 	"github.com/plexsphere/plexd/internal/integrity"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
@@ -108,6 +110,41 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	// Wait group for all goroutines.
+	var wg sync.WaitGroup
+
+	// 4a. Start the health listener before registration begins, so a probe
+	// issued during a slow first registration sees 200 on /healthz and 503 on
+	// /readyz rather than a connection refused (which the kubelet treats as a
+	// liveness failure and restarts the container mid-registration).
+	var healthSrv *health.Server
+	if cfg.Health.IsEnabled() {
+		healthSrv = health.NewServer(cfg.Health, logger)
+		healthLn, err := healthSrv.Listen()
+		if err != nil {
+			// Under hostNetwork: true the address lives in the node's global
+			// port space, shared with every other host-networked workload, so
+			// a collision is the likely cause and worth naming: the container
+			// exits and the failure otherwise reads as a plexd bug.
+			return fmt.Errorf("plexd up: health listener cannot bind %s (port already in use on the host network?): %w", cfg.Health.Listen, err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := healthSrv.Serve(ctx, healthLn); err != nil && ctx.Err() == nil {
+				// Every other terminal subsystem failure is routed to readiness
+				// so the kubelet does not restart the node and tear its data
+				// plane down. This one cannot be: without a listener there is no
+				// probe target at all, the kubelet fails liveness three times and
+				// restarts the container anyway. Cancelling the root context
+				// makes that shutdown deliberate and logged, instead of a
+				// connection-refused 90 seconds later with no trace of the cause.
+				logger.Error("health listener stopped, terminating", "error", err)
+				stop()
+			}
+		}()
+	}
+
 	identity, err := registrar.Register(ctx)
 	if err != nil {
 		return fmt.Errorf("plexd up: registration: %w", err)
@@ -117,6 +154,13 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		"node_id", identity.NodeID,
 		"mesh_ip", identity.MeshIP,
 	)
+
+	// The health listener reports ready only once the node holds a registered
+	// identity. Register returns a persisted identity without a network
+	// round-trip on restart, so this also covers the restart case.
+	if healthSrv != nil {
+		healthSrv.SetRegistered()
+	}
 
 	// Set auth token (Register already does this, but be explicit).
 	client.SetAuthToken(identity.NodeSecretKey)
@@ -170,6 +214,37 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// exactly the unfiltered state this call exists to prevent.
 	if _, err := enforcer.ApplyFirewallRules(nil, cfg.WireGuard.InterfaceName); err != nil {
 		return fmt.Errorf("plexd up: install deny-by-default firewall baseline: %w", err)
+	}
+
+	// The mesh data plane is complete only here: the interface is up and the
+	// baseline chain is installed. Readiness is announced at this point rather
+	// than next to SetRegistered above, because WireGuard setup failure is
+	// non-fatal by design — without this gate a node whose interface never came
+	// up would report ready for the rest of its life, and a rolling update
+	// would march across the fleet leaving no node with a tunnel.
+	//
+	// The announcement is a latch, so readiness also gets a check that a
+	// background poller re-runs: the interface is kernel state that outlives this
+	// function and other actors delete it (a node admin, a kernel upgrade that
+	// drops the wireguard module). Without the check a node that lost its tunnel
+	// hours after startup keeps reporting ready and the next rolling update
+	// sweeps the fleet anyway. The poller is what keeps the cost fixed —
+	// net.InterfaceByName dumps the node's whole interface table (one entry per
+	// pod veth, bridge and tunnel) and scans it for the name, so running it per
+	// probe would let anyone reaching the unauthenticated port drive that dump.
+	if healthSrv != nil && wgReady {
+		iface := cfg.WireGuard.InterfaceName
+		healthSrv.SetDataPlaneCheck(ctx, func() error {
+			link, err := net.InterfaceByName(iface)
+			if err != nil {
+				return fmt.Errorf("wireguard interface %s: %w", iface, err)
+			}
+			if link.Flags&net.FlagUp == 0 {
+				return fmt.Errorf("wireguard interface %s is down", iface)
+			}
+			return nil
+		})
+		healthSrv.SetDataPlaneReady()
 	}
 
 	// 5d. Initialize tunnel subsystem.
@@ -475,11 +550,22 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	nodeAPISrv.SetPolicyProvider(policySnap)
 
 	// Publish the SSE delivery mode as node-API cache metadata so `plexd status`
-	// surfaces it. Seed it once so the field reads streaming from startup, then
-	// update it on every transition (e.g. into pull-only on a 501 descope).
+	// surfaces it, and feed it to the health listener's readiness state. Seed it
+	// once so both read streaming from startup, then update them on every
+	// transition (e.g. into pull-only on a 501 descope).
 	publishDeliveryMode := deliveryModePublisher(nodeAPISrv.Cache(), logger)
-	sseMgr.SetOnModeChange(publishDeliveryMode)
-	publishDeliveryMode(sseMgr.Mode())
+	onModeChange := publishDeliveryMode
+	if healthSrv != nil {
+		// SetOnModeChange holds a single callback slot: fan the transition out
+		// to both the node-API cache metadata and the health listener's
+		// readiness state.
+		onModeChange = func(m api.DeliveryMode) {
+			publishDeliveryMode(m)
+			healthSrv.SetDeliveryMode(m)
+		}
+	}
+	sseMgr.SetOnModeChange(onModeChange)
+	onModeChange(sseMgr.Mode())
 
 	// Register nodeapi reconcile handler so cache updates on drift. The pull is
 	// authoritative: node_state_updated triggers a reconcile (see above), and
@@ -590,15 +676,20 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		logger:        logger.With("component", "status-reports"),
 	}
 
-	// Wait group for all goroutines.
-	var wg sync.WaitGroup
-
 	// 16. Start SSE manager.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		if err := sseMgr.Start(ctx, identity.NodeID); err != nil {
 			logger.Error("SSE manager stopped", "error", err)
+		}
+		// Start returning means event delivery is over for this process: the
+		// reconnect engine gives up on a permanent failure or a rejected node
+		// secret without ever transitioning the delivery mode, so readiness
+		// would otherwise keep reporting the last mode while nothing arrives.
+		// The ctx guard keeps an ordinary shutdown from flapping readiness.
+		if healthSrv != nil && ctx.Err() == nil {
+			healthSrv.SetDeliveryStopped()
 		}
 	}()
 
@@ -616,6 +707,13 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		if err := reconciler.Run(ctx, identity.NodeID); err != nil {
 			logger.Error("reconciler stopped", "error", err)
 		}
+		// Nothing restarts this goroutine, so an exit before shutdown leaves the
+		// process alive while it no longer converges on the desired state.
+		// Readiness has to say so — liveness is a constant by design, so the
+		// kubelet would otherwise keep a half-dead node in rotation.
+		if healthSrv != nil && ctx.Err() == nil {
+			healthSrv.SetSubsystemStopped("reconciler")
+		}
 	}()
 
 	// Start key-rotation crash recovery.
@@ -631,6 +729,13 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		defer wg.Done()
 		if err := nodeAPISrv.Start(ctx, identity.NodeID); err != nil {
 			logger.Error("node API server stopped", "error", err)
+		}
+		// Start returns before it serves anything when the on-disk cache fails
+		// to load — a truncated file after an unclean reboot, a full disk, a
+		// changed permission. The socket and the state-report syncer are then
+		// gone for the life of the process, so readiness must stop reporting 200.
+		if healthSrv != nil && ctx.Err() == nil {
+			healthSrv.SetSubsystemStopped("node-api")
 		}
 	}()
 
