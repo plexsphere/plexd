@@ -31,8 +31,9 @@ type Config struct {
 	// Default: 5s
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 
-	// DataDir is the path to the data directory (required).
-	DataDir string `yaml:"data_dir"`
+	// DataDir is the path to the data directory (required). It is propagated
+	// from the top-level data_dir by AgentConfig.ApplyDefaults, not from YAML.
+	DataDir string `yaml:"-"`
 
 	// SecretAuthEnabled enables SO_PEERCRED-based authentication for
 	// /v1/state/secrets/* routes on the Unix socket. When enabled, only

@@ -53,7 +53,7 @@ func handlerWaitFor(t *testing.T, timeout time.Duration, fn func() bool) {
 
 func TestHandleActionRequest_BuiltinAction(t *testing.T) {
 	reporter := &mockReporter{}
-	cfg := Config{Enabled: true, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
+	cfg := Config{Enabled: boolPtr(true), MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 	exec.RegisterBuiltin("test_action", "test", nil, func(ctx context.Context, params map[string]string) (string, string, int, error) {
 		return "ok", "", 0, nil
@@ -81,7 +81,7 @@ func TestHandleActionRequest_BuiltinAction(t *testing.T) {
 
 func TestHandleActionRequest_UnknownAction(t *testing.T) {
 	reporter := &mockReporter{}
-	cfg := Config{Enabled: true, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
+	cfg := Config{Enabled: boolPtr(true), MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 
 	handler := HandleActionRequest(exec, "node-1", discardLogger())
@@ -105,7 +105,7 @@ func TestHandleActionRequest_UnknownAction(t *testing.T) {
 
 func TestHandleActionRequest_MalformedPayload(t *testing.T) {
 	reporter := &mockReporter{}
-	cfg := Config{Enabled: true, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
+	cfg := Config{Enabled: boolPtr(true), MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 
 	handler := HandleActionRequest(exec, "node-1", discardLogger())
@@ -129,7 +129,7 @@ func TestHandleActionRequest_HookAction(t *testing.T) {
 	}
 
 	reporter := &mockReporter{}
-	cfg := Config{Enabled: true, HooksDir: dir, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
+	cfg := Config{Enabled: boolPtr(true), HooksDir: dir, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 	exec.SetHooks([]api.HookInfo{
 		{Name: "my-hook", Source: "local", Checksum: "abc123"},
@@ -162,7 +162,7 @@ func TestHandleActionRequest_HookIntegrityFailure(t *testing.T) {
 	}
 
 	reporter := &mockReporter{}
-	cfg := Config{Enabled: true, HooksDir: dir, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
+	cfg := Config{Enabled: boolPtr(true), HooksDir: dir, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: false}, discardLogger())
 	exec.SetHooks([]api.HookInfo{
 		{Name: "my-hook", Source: "local", Checksum: "abc123"},
@@ -194,7 +194,7 @@ func TestHandleActionRequest_HookNotFound(t *testing.T) {
 	// Do NOT create the script on disk.
 
 	reporter := &mockReporter{}
-	cfg := Config{Enabled: true, HooksDir: dir, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
+	cfg := Config{Enabled: boolPtr(true), HooksDir: dir, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 	exec.SetHooks([]api.HookInfo{
 		{Name: "missing-hook", Source: "local", Checksum: "abc123"},
@@ -223,7 +223,7 @@ func TestHandleActionRequest_HookNotFound(t *testing.T) {
 
 func TestHandleActionRequest_Disabled(t *testing.T) {
 	reporter := &mockReporter{}
-	cfg := Config{Enabled: false, MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
+	cfg := Config{Enabled: boolPtr(false), MaxConcurrent: 5, MaxActionTimeout: 10 * time.Minute, MaxOutputBytes: 1 << 20}
 	exec := NewExecutor(cfg, reporter, &handlerMockVerifier{ok: true}, discardLogger())
 
 	handler := HandleActionRequest(exec, "node-1", discardLogger())

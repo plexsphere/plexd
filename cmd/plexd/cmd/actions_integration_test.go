@@ -18,6 +18,8 @@ import (
 	"github.com/plexsphere/plexd/internal/nodeapi"
 )
 
+func boolPtr(v bool) *bool { return &v }
+
 // noopActionReporter is a no-op for testing.
 type noopActionReporter struct{}
 
@@ -115,7 +117,7 @@ func TestIntegration_ActionsList(t *testing.T) {
 	defer cancel()
 
 	// Create an executor with built-in actions.
-	cfg := actions.Config{Enabled: true}
+	cfg := actions.Config{Enabled: boolPtr(true)}
 	cfg.ApplyDefaults()
 	executor := actions.NewExecutor(cfg, noopActionReporter{}, noopHookVerifier{}, discardLogger())
 	executor.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics", nil, actions.DiagnosticsCollect())
@@ -168,7 +170,7 @@ func TestIntegration_ActionsRunSuccess(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	cfg := actions.Config{Enabled: true}
+	cfg := actions.Config{Enabled: boolPtr(true)}
 	cfg.ApplyDefaults()
 	executor := actions.NewExecutor(cfg, noopActionReporter{}, noopHookVerifier{}, discardLogger())
 	executor.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics", nil, actions.DiagnosticsCollect())
@@ -221,7 +223,7 @@ func TestIntegration_ActionsRunUnknown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	cfg := actions.Config{Enabled: true}
+	cfg := actions.Config{Enabled: boolPtr(true)}
 	cfg.ApplyDefaults()
 	executor := actions.NewExecutor(cfg, noopActionReporter{}, noopHookVerifier{}, discardLogger())
 
@@ -282,7 +284,7 @@ func TestIntegration_HooksList(t *testing.T) {
 		t.Fatalf("write sidecar: %v", err)
 	}
 
-	cfg := actions.Config{Enabled: true, HooksDir: hooksDir}
+	cfg := actions.Config{Enabled: boolPtr(true), HooksDir: hooksDir}
 	cfg.ApplyDefaults()
 	executor := actions.NewExecutor(cfg, noopActionReporter{}, noopHookVerifier{}, discardLogger())
 
@@ -333,7 +335,7 @@ func TestIntegration_HooksReload(t *testing.T) {
 
 	hooksDir := t.TempDir()
 
-	cfg := actions.Config{Enabled: true, HooksDir: hooksDir}
+	cfg := actions.Config{Enabled: boolPtr(true), HooksDir: hooksDir}
 	cfg.ApplyDefaults()
 	executor := actions.NewExecutor(cfg, noopActionReporter{}, noopHookVerifier{}, discardLogger())
 

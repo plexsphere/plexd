@@ -6,35 +6,43 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/plexsphere/plexd/internal/agent"
 )
 
+// useConfigFile points cfgFile at path and sets cobra's "changed" bookkeeping
+// for the persistent --config flag, restoring both afterwards. deregister reads
+// that flag to tell an explicit --config from the default one, and the flag is
+// shared across every command execution in this package — a test that left it
+// changed would make a later file-less test look as if the operator had passed
+// the flag.
+func useConfigFile(t *testing.T, path string, changed bool) {
+	t.Helper()
+
+	f := rootCmd.PersistentFlags().Lookup("config")
+	oldPath, oldChanged := cfgFile, f.Changed
+	cfgFile, f.Changed = path, changed
+	t.Cleanup(func() { cfgFile, f.Changed = oldPath, oldChanged })
+}
+
 // writeDeregisterConfig writes a minimal agent config to a temp file and points
-// cfgFile at it for the duration of the test. The config never needs a
-// reachable control plane: deregister makes no HTTP request, so base_url is a
-// dead address that is only present to satisfy config validation.
+// cfgFile at it for the duration of the test. deregister is local-only, so the
+// data dir and the registration token file are the only values it reads.
 func writeDeregisterConfig(t *testing.T, dataDir, tokenFile string) {
 	t.Helper()
 
-	tokenLine := ""
+	registrationSection := ""
 	if tokenFile != "" {
-		tokenLine = fmt.Sprintf("  token_file: %s\n", tokenFile)
+		registrationSection = fmt.Sprintf("registration:\n  token_file: %s\n", tokenFile)
 	}
-	body := fmt.Sprintf(
-		"data_dir: %[1]s\n"+
-			"api:\n  base_url: http://127.0.0.1:0\n"+
-			"registration:\n  data_dir: %[1]s\n%[2]s"+
-			"node_api:\n  data_dir: %[1]s\n"+
-			"heartbeat:\n  node_id: deregister-test-node\n",
-		dataDir, tokenLine)
+	body := fmt.Sprintf("data_dir: %s\n%s", dataDir, registrationSection)
 
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(cfgPath, []byte(body), 0600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 
-	old := cfgFile
-	cfgFile = cfgPath
-	t.Cleanup(func() { cfgFile = old })
+	useConfigFile(t, cfgPath, true)
 }
 
 func TestDeregisterCommand_Help(t *testing.T) {
@@ -60,20 +68,102 @@ func TestDeregisterCommand_PurgeFlag(t *testing.T) {
 	}
 }
 
-func TestDeregisterCommand_ConfigError(t *testing.T) {
-	oldCfgFile := cfgFile
-	t.Cleanup(func() { cfgFile = oldCfgFile })
-
-	_, err := executeCmd(t, "deregister", "--config", "/nonexistent/path/config.yaml")
-
-	rootCmd.SetOut(nil)
-	rootCmd.SetErr(nil)
-
-	if err == nil {
-		t.Fatal("expected error for nonexistent config")
+// TestDeregisterCommand_ExplicitConfigMissing pins the guard against a mistyped
+// --config. Passing the flag asserts the file is there; when it is not,
+// data_dir silently falls back to the built-in default, and both outcomes at
+// that path report success — removing an unrelated identity, or vouching for a
+// decommission while the node's real identity, and a node secret the control
+// plane still accepts, stays on disk. The identity written here stands in for
+// that real one: it lives under a data_dir only the unread config names, so it
+// must survive untouched. The explicit empty --api keeps the test hermetic
+// against an ambient PLEXD_API, which feeds the flag default at package init.
+func TestDeregisterCommand_ExplicitConfigMissing(t *testing.T) {
+	// The guard runs before the removal, so nothing under the default data dir
+	// is touched — but a regression would unlink identity.json there. The
+	// hazard is a writable directory, not uid 0, so skip whenever the path
+	// exists at all.
+	if _, err := os.Stat(agent.DefaultDataDir); err == nil {
+		t.Skipf("%s exists on this host; a regression would touch real state there", agent.DefaultDataDir)
 	}
-	if !strings.Contains(err.Error(), "plexd deregister") {
-		t.Errorf("error should mention 'plexd deregister', got: %v", err)
+
+	realDataDir := t.TempDir()
+	realIdentity := filepath.Join(realDataDir, "identity.json")
+	if err := os.WriteFile(realIdentity, []byte(`{"node_id":"n1"}`), 0600); err != nil {
+		t.Fatalf("write identity: %v", err)
+	}
+
+	oldAPIURL := apiURL
+	t.Cleanup(func() { apiURL = oldAPIURL })
+	useConfigFile(t, "/nonexistent/path/config.yaml", true)
+
+	output, err := executeCmd(t, "deregister", "--config", "/nonexistent/path/config.yaml", "--api=")
+	if err == nil {
+		t.Fatal("expected an error for an explicit --config that names no file")
+	}
+	for _, want := range []string{"plexd deregister: no config file at", agent.DefaultDataDir, "/nonexistent/path/config.yaml"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should contain %q, got: %v", want, err)
+		}
+	}
+	for _, unwanted := range []string{"no local identity found", "local identity removed"} {
+		if strings.Contains(output, unwanted) {
+			t.Errorf("output must not contain %q, got: %s", unwanted, output)
+		}
+	}
+	if _, statErr := os.Stat(realIdentity); statErr != nil {
+		t.Errorf("the configured data_dir's identity must be untouched, stat err = %v", statErr)
+	}
+}
+
+// TestDeregisterCommand_FilelessDefaultIsIdempotent pins the documented
+// contract for the file-less deployment this branch blesses: there is no config
+// file by construction, so a deregister that finds no identity is "nothing to
+// do", not a failure. A retried Helm pre-delete hook or a re-run Ansible task
+// must not record an error — and under `set -e` a failure here would abort
+// every remaining cleanup step.
+func TestDeregisterCommand_FilelessDefaultIsIdempotent(t *testing.T) {
+	if _, err := os.Stat(agent.DefaultDataDir); err == nil {
+		t.Skipf("%s exists on this host; the file-less default data_dir would touch real state", agent.DefaultDataDir)
+	}
+
+	// changed=false is the point: the operator never passed --config, so the
+	// absent file is the deployment, not a typo.
+	useConfigFile(t, "/nonexistent/path/config.yaml", false)
+
+	output, err := executeCmd(t, "deregister")
+	if err != nil {
+		t.Fatalf("deregister without a config file should succeed, got: %v", err)
+	}
+	if !strings.Contains(output, "no local identity found") {
+		t.Errorf("output should report nothing to do, got: %s", output)
+	}
+}
+
+// TestDeregisterCommand_AbsentConfigRefusesPurge pins that the destructive path
+// fails closed: without a config file, data_dir is the built-in default rather
+// than the configured one, so purging it would wipe unrelated state and leave
+// the node's real identity — and a node secret the control plane still accepts
+// — untouched while reporting success.
+func TestDeregisterCommand_AbsentConfigRefusesPurge(t *testing.T) {
+	oldAPIURL := apiURL
+	oldPurge := deregisterPurge
+	t.Cleanup(func() {
+		apiURL = oldAPIURL
+		deregisterPurge = oldPurge
+	})
+	useConfigFile(t, "/nonexistent/path/config.yaml", true)
+
+	output, err := executeCmd(t, "deregister", "--purge", "--config", "/nonexistent/path/config.yaml", "--api=")
+	if err == nil {
+		t.Fatal("expected error for --purge without a config file")
+	}
+	for _, want := range []string{"plexd deregister: --purge needs a config file", "/nonexistent/path/config.yaml", agent.DefaultDataDir} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should contain %q, got: %v", want, err)
+		}
+	}
+	if strings.Contains(output, "purged") {
+		t.Errorf("output must not claim a purge happened, got: %s", output)
 	}
 }
 

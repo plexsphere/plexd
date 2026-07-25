@@ -685,7 +685,7 @@ func TestWatcher_FullLifecycle(t *testing.T) {
 func TestWatcher_CapabilitiesReReport(t *testing.T) {
 	dir := t.TempDir()
 
-	cfg := Config{Enabled: true, HooksDir: dir}
+	cfg := Config{Enabled: boolPtr(true), HooksDir: dir}
 	cfg.ApplyDefaults()
 
 	executor := NewExecutor(cfg, &mockReporter{}, noopHookVerifier{}, testLogger())

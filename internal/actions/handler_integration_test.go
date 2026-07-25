@@ -131,7 +131,7 @@ func TestIntegration_FullActionLifecycle(t *testing.T) {
 	verifier := newRealVerifier(t)
 
 	cfg := Config{
-		Enabled:          true,
+		Enabled:          boolPtr(true),
 		HooksDir:         hooksDir,
 		MaxConcurrent:    5,
 		MaxActionTimeout: 10 * time.Minute,
@@ -242,7 +242,7 @@ func TestIntegration_ConcurrentExecutions(t *testing.T) {
 
 	maxConcurrent := 3
 	cfg := Config{
-		Enabled:          true,
+		Enabled:          boolPtr(true),
 		HooksDir:         hooksDir,
 		MaxConcurrent:    maxConcurrent,
 		MaxActionTimeout: 10 * time.Minute,
@@ -348,7 +348,7 @@ func TestIntegration_HookIntegrityAndExecution(t *testing.T) {
 	verifier := newRealVerifier(t)
 
 	cfg := Config{
-		Enabled:          true,
+		Enabled:          boolPtr(true),
 		HooksDir:         hooksDir,
 		MaxConcurrent:    5,
 		MaxActionTimeout: 10 * time.Minute,
@@ -446,7 +446,7 @@ func TestIntegration_ShutdownCancelsExecutions(t *testing.T) {
 	verifier := newRealVerifier(t)
 
 	cfg := Config{
-		Enabled:          true,
+		Enabled:          boolPtr(true),
 		HooksDir:         hooksDir,
 		MaxConcurrent:    5,
 		MaxActionTimeout: 10 * time.Minute,
@@ -547,7 +547,7 @@ func TestIntegration_WatcherFeedsExecutor(t *testing.T) {
 	verifier := newRealVerifier(t)
 
 	cfg := Config{
-		Enabled:          true,
+		Enabled:          boolPtr(true),
 		HooksDir:         hooksDir,
 		MaxConcurrent:    5,
 		MaxActionTimeout: 10 * time.Minute,
