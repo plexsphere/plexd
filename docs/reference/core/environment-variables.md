@@ -6,7 +6,7 @@ feature: PXD-0025
 
 # Environment Variables Reference
 
-plexd supports environment variable overrides for configuration. Variables are applied at different stages during startup and follow a strict precedence order.
+plexd supports environment variable overrides for configuration. Variables are applied at different stages during startup and follow a strict precedence order. A config file is not required — flags and environment variables alone can run plexd, with defaults filling every field neither supplies (see [Running without a config file](configuration.md#running-without-a-config-file)).
 
 ## Global Variables (all commands)
 
@@ -29,7 +29,7 @@ These variables are read by `applyEnvOverrides()` in `cmd/plexd/cmd/up.go` and o
 | Variable | Config field | Description |
 |----------|-------------|-------------|
 | `PLEXD_BOOTSTRAP_TOKEN_FILE` | `registration.token_file` | Path to the bootstrap token file |
-| `PLEXD_ACTIONS_ENABLED` | `actions.enabled` | Enable/disable action execution. Values: `true`, `1` to enable; anything else to disable. |
+| `PLEXD_ACTIONS_ENABLED` | `actions.enabled` | Enable/disable action execution. Parsed with Go's `strconv.ParseBool`: `1`, `t`, `T`, `true`, `TRUE`, `True` enable; `0`, `f`, `F`, `false`, `FALSE`, `False` disable. Any other value is ignored with a warning and leaves `actions.enabled` as the file or the default set it. Required to enable it on the file-less path, where `actions.enabled` defaults to `false`. |
 | `PLEXD_HOOKS_ENABLED` | `integrity.watch_enabled` | Enable/disable inotify hook watching. Values: `true`, `1` to enable. |
 | `PLEXD_HOOKS_DIR` | `actions.hooks_dir`, `integrity.hooks_dir` | Directory for hook scripts. Sets both `actions.hooks_dir` and `integrity.hooks_dir`. |
 | `PLEXD_ACTIONS_MAX_CONCURRENT` | `actions.max_concurrent` | Maximum number of concurrent actions (integer) |

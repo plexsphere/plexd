@@ -137,15 +137,30 @@ local identity removed (/var/lib/plexd/identity.json)
 node removal from the control plane is operator-driven on the platform
 ```
 
-The command is idempotent: when no `identity.json` exists it prints
-`no local identity found (nothing to do)` and exits `0`. If the identity file
-exists but cannot be removed, it fails with
+The command is idempotent: when no `identity.json` exists in the configured
+`data_dir` it prints `no local identity found (nothing to do)` and exits `0`.
+If the identity file exists but cannot be removed, it fails with
 `plexd deregister: remove identity: <error>` and a non-zero exit.
 
 With `--purge`, the command additionally removes the entire `data_dir` (all
 identity and key files, cached state) and the registration token file, then
 prints `local data purged`. `--purge` does **not** disable any systemd unit; use
 [`plexd uninstall`](#plexd-uninstall) to remove the service.
+
+`--purge` requires a config file: when none exists at the `--config` path it
+fails with `plexd deregister: --purge needs a config file: ...` and removes
+nothing. Without a file `data_dir` would be the built-in `/var/lib/plexd`, so a
+mistyped `--config` would wipe an unrelated directory while leaving the node's
+real key material — still valid against the control plane — in place.
+
+Passing `--config` explicitly asserts that the file is there. When it is not,
+the command fails with `plexd deregister: no config file at ...` and touches
+nothing, because `data_dir` would silently fall back to `/var/lib/plexd`: a
+mistyped path would otherwise remove an unrelated `identity.json` and report a
+decommission, or report `nothing to do` for a node whose real identity is
+elsewhere on disk. Without the flag the default path is the file-less
+deployment, which stays idempotent and names the `data_dir` it used in the
+warning it logs.
 
 **Exit codes:** 0 on success, 1 on error.
 
