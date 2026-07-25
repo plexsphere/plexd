@@ -21,8 +21,14 @@ const DefaultHooksDir = "/etc/plexd/hooks"
 // Config holds the configuration for remote action execution.
 type Config struct {
 	// Enabled controls whether action execution is active.
-	// Default: true (set by ApplyDefaults).
-	Enabled bool `yaml:"enabled"`
+	// nil means use default (true); explicit false disables execution.
+	//
+	// The tri-state is what makes the switch usable: with a plain bool an
+	// operator's `enabled: false` is indistinguishable from an omitted key,
+	// and defaulting turns it back on. Enabled is the only switch that stops
+	// the control plane from running actions and hooks on the node, so it has
+	// to survive ApplyDefaults exactly as written.
+	Enabled *bool `yaml:"enabled"`
 
 	// HooksDir is the directory containing hook scripts.
 	// Default: /etc/plexd/hooks
@@ -41,16 +47,34 @@ type Config struct {
 	MaxOutputBytes int64 `yaml:"max_output_bytes"`
 }
 
-// ApplyDefaults sets default values for zero-valued fields.
-// On a zero-valued Config, Enabled defaults to true.
-// To disable action execution, set Enabled=false before or after calling ApplyDefaults.
-func (c *Config) ApplyDefaults() {
-	// Enabled defaults to true for zero-valued Config. Since bool zero is false,
-	// we use a heuristic: if all fields are zero, the caller wants defaults (including Enabled=true).
-	// If any field is non-zero, the caller constructed the config explicitly and we respect Enabled as-is.
-	if c.MaxConcurrent == 0 && c.MaxActionTimeout == 0 && c.MaxOutputBytes == 0 {
-		c.Enabled = true
+// IsEnabled returns the effective Enabled setting: true unless explicitly set
+// to false.
+func (c *Config) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true
 	}
+	return *c.Enabled
+}
+
+// MarshalYAML renders the effective Enabled value so a dump of the live config
+// never reports the switch that gates remote execution as `enabled: null`.
+// config.dump is what an operator reads to audit which nodes accept
+// control-plane-driven execution, and a null there reads as "unset" — which for
+// this field reads as off, while it means on.
+func (c Config) MarshalYAML() (any, error) {
+	// plain drops the method set, so encoding it does not recurse.
+	type plain Config
+	out := plain(c)
+	if out.Enabled == nil {
+		effective := true
+		out.Enabled = &effective
+	}
+	return out, nil
+}
+
+// ApplyDefaults sets default values for zero-valued fields.
+func (c *Config) ApplyDefaults() {
+	// Enabled is handled via IsEnabled(); nil means default true.
 	if c.HooksDir == "" {
 		c.HooksDir = DefaultHooksDir
 	}
@@ -67,7 +91,7 @@ func (c *Config) ApplyDefaults() {
 
 // Validate checks that configuration values are within acceptable ranges.
 func (c *Config) Validate() error {
-	if !c.Enabled {
+	if !c.IsEnabled() {
 		return nil
 	}
 	if c.MaxConcurrent < 1 {

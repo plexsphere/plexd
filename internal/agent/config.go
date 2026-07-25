@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 
@@ -101,6 +103,11 @@ func (c *AgentConfig) ApplyDefaults() {
 	c.PeerExchange.ApplyDefaults()
 	c.Bridge.ApplyDefaults()
 	c.Heartbeat.ApplyDefaults()
+	// Propagate the top-level data dir into the subsystem configs. Both fields
+	// are excluded from the YAML surface (yaml:"-"), so this is their only
+	// source.
+	c.Registration.DataDir = c.DataDir
+	c.NodeAPI.DataDir = c.DataDir
 }
 
 // Validate checks that required fields are set and values are acceptable.
@@ -159,26 +166,49 @@ func (c *AgentConfig) Validate() error {
 	if err := c.Bridge.Validate(); err != nil {
 		return err
 	}
-	if err := c.Heartbeat.Validate(); err != nil {
-		return err
-	}
+	// Heartbeat is deliberately not validated here: its NodeID only exists
+	// after registration, so plexd up validates the constructed config instead.
 	return nil
 }
 
-// ParseConfig reads a YAML configuration file and returns an AgentConfig.
-// It applies defaults and validates the configuration.
-func ParseConfig(path string) (*AgentConfig, error) {
+// ParseConfig reads a YAML configuration file and returns an AgentConfig with
+// defaults applied. An absent file is not an error: it is treated as an empty
+// config, and the returned bool reports whether the file was found. A file
+// that exists but cannot be read, that is empty, or that does not parse, is an
+// error.
+// Validating the result is the caller's responsibility, once the CLI flag and
+// environment overrides have been merged in.
+func ParseConfig(path string) (*AgentConfig, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("agent: config: read %s: %w", path, err)
+		if errors.Is(err, os.ErrNotExist) {
+			var cfg AgentConfig
+			cfg.ApplyDefaults()
+			// An unset Actions.Enabled means on, and it is the only kill
+			// switch on control-plane-driven execution. An absent file carries
+			// no operator-expressed policy, so it must not enable it: a
+			// deleted or unmounted config would otherwise silently undo
+			// actions.enabled: false. PLEXD_ACTIONS_ENABLED turns it back on
+			// for a deliberately file-less deployment.
+			disabled := false
+			cfg.Actions.Enabled = &disabled
+			return &cfg, false, nil
+		}
+		return nil, false, fmt.Errorf("agent: config: read %s: %w", path, err)
+	}
+	// A file with no content is not a configuration. yaml.Unmarshal accepts it
+	// silently, so it would come back as "found" with every field defaulted —
+	// including the actions kill switch, which the absent-file path above
+	// deliberately turns off. A truncated write, a Helm template that rendered
+	// an empty ConfigMap key, and a bootstrap that created the file before
+	// writing it all land here, and none of them carry operator intent.
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, false, fmt.Errorf("agent: config: %s is empty: remove the file to run without one, or supply a configuration", path)
 	}
 	var cfg AgentConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("agent: config: parse %s: %w", path, err)
+		return nil, false, fmt.Errorf("agent: config: parse %s: %w", path, err)
 	}
 	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
+	return &cfg, true, nil
 }

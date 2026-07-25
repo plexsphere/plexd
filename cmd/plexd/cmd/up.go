@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -60,41 +61,32 @@ func init() {
 }
 
 func runUp(cmd *cobra.Command, _ []string) error {
-	// 1. Parse config.
-	cfg, err := agent.ParseConfig(cfgFile)
+	// 1. Parse config and merge the flag and environment overrides on top.
+	cfg, cfgFound, err := loadMergedConfig(cfgFile)
 	if err != nil {
 		return fmt.Errorf("plexd up: %w", err)
 	}
 
-	// Apply CLI flag overrides.
-	if apiURL != "" {
-		cfg.API.BaseURL = apiURL
-	}
-	if mode != "" {
-		cfg.Mode = mode
-	}
-	if logLevel != "" {
-		cfg.LogLevel = logLevel
-	}
-	if projectID != "" {
-		cfg.Registration.ProjectID = projectID
-	}
-	if resourceHandle != "" {
-		cfg.Registration.ResourceHandle = resourceHandle
-	}
-	if requestedResourceID != "" {
-		cfg.Registration.RequestedResourceID = requestedResourceID
-	}
-
-	// Apply environment variable overrides.
-	applyEnvOverrides(cfg)
-
 	// 2. Set up structured logger.
 	logger := setupLogger(cfg.LogLevel)
 
+	// Validate the merged result, not the file: a required value may come from
+	// any layer. The warning goes out first so a missing file is named even
+	// when validation then fails on a value that file would have supplied.
+	warnIfConfigAbsent(cfgFound, cfgFile, cfg.DataDir)
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("plexd up: %w", err)
+	}
+
+	// actions_enabled is reported because nothing else announces it. It is the
+	// only switch that stops the control plane from running commands and hooks
+	// on this node, it defaults to on, and it is reached from three layers
+	// (file, absent-file fallback, PLEXD_ACTIONS_ENABLED) — so the effective
+	// value belongs in the startup record rather than in an operator's head.
 	logger.Info("starting plexd",
 		"version", buildVersion,
 		"mode", cfg.Mode,
+		"actions_enabled", cfg.Actions.IsEnabled(),
 	)
 
 	// 3. Create control plane client.
@@ -104,7 +96,6 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	}
 
 	// 4. Register (or load existing identity).
-	cfg.Registration.DataDir = cfg.DataDir
 	registrar := newRegistrar(client, cfg.Registration, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -418,6 +409,9 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		NodeID:   identity.NodeID,
 	}
 	hbCfg.ApplyDefaults()
+	if err := hbCfg.Validate(); err != nil {
+		return fmt.Errorf("plexd up: %w", err)
+	}
 	heartbeat := agent.NewHeartbeatService(hbCfg, client, logger)
 	heartbeat.SetReconcileTrigger(reconciler)
 	heartbeat.SetOnAuthFailure(func() {
@@ -533,7 +527,6 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	)
 
 	// 12. Create node API server.
-	cfg.NodeAPI.DataDir = cfg.DataDir
 	cfg.NodeAPI.SecretAuthEnabled = true
 	nsk, err := identity.SecretKey()
 	if err != nil {
@@ -1153,6 +1146,37 @@ func deliveryModePublisher(cache *nodeapi.StateCache, logger *slog.Logger) func(
 	}
 }
 
+// loadMergedConfig parses the config file at path — an absent one is not fatal
+// — and merges the CLI flag values and then the PLEXD_* environment overrides
+// on top. The returned bool reports whether the file was found. The merged
+// result is what the caller validates.
+func loadMergedConfig(path string) (*agent.AgentConfig, bool, error) {
+	cfg, found, err := agent.ParseConfig(path)
+	if err != nil {
+		return nil, false, err
+	}
+	if apiURL != "" {
+		cfg.API.BaseURL = apiURL
+	}
+	if mode != "" {
+		cfg.Mode = mode
+	}
+	if logLevel != "" {
+		cfg.LogLevel = logLevel
+	}
+	if projectID != "" {
+		cfg.Registration.ProjectID = projectID
+	}
+	if resourceHandle != "" {
+		cfg.Registration.ResourceHandle = resourceHandle
+	}
+	if requestedResourceID != "" {
+		cfg.Registration.RequestedResourceID = requestedResourceID
+	}
+	applyEnvOverrides(cfg)
+	return cfg, found, nil
+}
+
 // applyEnvOverrides applies PLEXD_* environment variable overrides to the config.
 // Environment variables take precedence over the config file but not CLI flags
 // (CLI flags are applied separately and may have already overridden values).
@@ -1161,7 +1185,17 @@ func applyEnvOverrides(cfg *agent.AgentConfig) {
 		cfg.Registration.TokenFile = v
 	}
 	if v := os.Getenv("PLEXD_ACTIONS_ENABLED"); v != "" {
-		cfg.Actions.Enabled = v == "true" || v == "1"
+		// Parsed rather than compared against "true"/"1": on the file-less path
+		// this variable is the only way to turn action execution back on, so a
+		// "True" or a "yes" rendered from a values file must not be read as a
+		// deliberate disable. An unparseable value leaves the setting alone and
+		// says so, like PLEXD_ACTIONS_MAX_CONCURRENT below.
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			slog.Warn("invalid PLEXD_ACTIONS_ENABLED, leaving actions.enabled unchanged", "value", v)
+		} else {
+			cfg.Actions.Enabled = &enabled
+		}
 	}
 	if v := os.Getenv("PLEXD_HOOKS_ENABLED"); v != "" {
 		cfg.Integrity.WatchEnabled = v == "true" || v == "1"

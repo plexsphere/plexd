@@ -1013,7 +1013,7 @@ func TestExecutor_CombinedOutputCappedAtMaxOutputBytes(t *testing.T) {
 	reporter := &mockReporter{}
 	verifier := &mockVerifier{ok: true}
 	exec := newTestExecutor(Config{
-		Enabled:          true,
+		Enabled:          boolPtr(true),
 		MaxConcurrent:    1,
 		MaxActionTimeout: time.Minute,
 		MaxOutputBytes:   maxOutput,

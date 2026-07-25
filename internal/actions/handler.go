@@ -33,7 +33,7 @@ func HandleActionRequest(executor *Executor, nodeID string, logger *slog.Logger)
 
 		// When disabled, reject immediately with the same ack + failed
 		// sequence as every other rejection.
-		if !executor.cfg.Enabled {
+		if !executor.cfg.IsEnabled() {
 			log.Warn("action_request: actions disabled",
 				"execution_id", req.ExecutionID,
 				"action", req.Action,

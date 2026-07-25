@@ -27,7 +27,7 @@ func init() {
 }
 
 func runJoin(cmd *cobra.Command, _ []string) error {
-	cfg, err := agent.ParseConfig(cfgFile)
+	cfg, cfgFound, err := agent.ParseConfig(cfgFile)
 	if err != nil {
 		return fmt.Errorf("plexd join: %w", err)
 	}
@@ -37,13 +37,17 @@ func runJoin(cmd *cobra.Command, _ []string) error {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
+	warnIfConfigAbsent(cfgFound, cfgFile, cfg.DataDir)
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("plexd join: %w", err)
+	}
+
 	client, err := api.NewControlPlane(cfg.API, buildVersion, logger)
 	if err != nil {
 		return fmt.Errorf("plexd join: create client: %w", err)
 	}
 
 	regCfg := cfg.Registration
-	regCfg.DataDir = cfg.DataDir
 	if joinTokenFile != "" {
 		regCfg.TokenFile = joinTokenFile
 	}

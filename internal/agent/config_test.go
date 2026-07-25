@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,6 +45,39 @@ func TestAgentConfig_ApplyDefaults(t *testing.T) {
 	if !cfg.Health.IsEnabled() {
 		t.Error("Health.IsEnabled() = false, want true for an omitted health block")
 	}
+	// Both are propagated from the top-level data_dir at runtime and never
+	// appear in YAML, so defaulting them here is what lets an empty config
+	// validate.
+	if cfg.Registration.DataDir != DefaultDataDir {
+		t.Errorf("Registration.DataDir = %q, want %q", cfg.Registration.DataDir, DefaultDataDir)
+	}
+	if cfg.NodeAPI.DataDir != DefaultDataDir {
+		t.Errorf("NodeAPI.DataDir = %q, want %q", cfg.NodeAPI.DataDir, DefaultDataDir)
+	}
+	// A config that reaches ApplyDefaults through a file is an
+	// operator-expressed configuration, so action execution stays on unless it
+	// says otherwise. Only ParseConfig's absent-file path turns it off.
+	if !cfg.Actions.IsEnabled() {
+		t.Error("Actions.IsEnabled() = false, want true for an omitted actions block")
+	}
+}
+
+// TestAgentConfig_ApplyDefaults_TopLevelDataDirWins pins the propagation
+// contract with values that differ on both sides: the subsystem fields are
+// overwritten from the top level, never merged or preserved.
+func TestAgentConfig_ApplyDefaults_TopLevelDataDirWins(t *testing.T) {
+	var cfg AgentConfig
+	cfg.DataDir = "/tmp/plexd-top"
+	cfg.Registration.DataDir = "/tmp/plexd-registration"
+	cfg.NodeAPI.DataDir = "/tmp/plexd-nodeapi"
+	cfg.ApplyDefaults()
+
+	if cfg.Registration.DataDir != "/tmp/plexd-top" {
+		t.Errorf("Registration.DataDir = %q, want %q", cfg.Registration.DataDir, "/tmp/plexd-top")
+	}
+	if cfg.NodeAPI.DataDir != "/tmp/plexd-top" {
+		t.Errorf("NodeAPI.DataDir = %q, want %q", cfg.NodeAPI.DataDir, "/tmp/plexd-top")
+	}
 }
 
 func TestAgentConfig_Validate_InvalidMode(t *testing.T) {
@@ -75,9 +109,12 @@ heartbeat:
   node_id: "node-1"
 `
 	path := writeTemp(t, yaml)
-	cfg, err := ParseConfig(path)
+	cfg, found, err := ParseConfig(path)
 	if err != nil {
 		t.Fatalf("ParseConfig: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true for an existing file")
 	}
 	if cfg.Mode != "bridge" {
 		t.Errorf("Mode = %q, want %q", cfg.Mode, "bridge")
@@ -125,9 +162,12 @@ upgrade:
   signing_issuer: "https://issuer.example.com"
 `
 	path := writeTemp(t, yaml)
-	cfg, err := ParseConfig(path)
+	cfg, found, err := ParseConfig(path)
 	if err != nil {
 		t.Fatalf("ParseConfig: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true for an existing file")
 	}
 	if cfg.Upgrade.ReleaseBaseURL != "https://mirror.example.com/releases" {
 		t.Errorf("Upgrade.ReleaseBaseURL = %q, want %q", cfg.Upgrade.ReleaseBaseURL, "https://mirror.example.com/releases")
@@ -155,7 +195,16 @@ upgrade:
   signing_identity_regexp: "("
 `
 	path := writeTemp(t, yaml)
-	_, err := ParseConfig(path)
+	cfg, found, err := ParseConfig(path)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true for an existing file")
+	}
+	// Parsing no longer validates; the bad pattern surfaces once the caller
+	// validates the merged config.
+	err = cfg.Validate()
 	if err == nil {
 		t.Fatal("expected error for invalid signing_identity_regexp")
 	}
@@ -165,7 +214,8 @@ upgrade:
 }
 
 func TestParseConfig_MissingRequiredField(t *testing.T) {
-	// api.BaseURL is required; omitting it should fail validation.
+	// api.BaseURL is required, but only once the caller validates: the file may
+	// legitimately omit it and have --api or PLEXD_API supply it.
 	yaml := `
 mode: node
 registration:
@@ -176,9 +226,19 @@ heartbeat:
   node_id: "node-1"
 `
 	path := writeTemp(t, yaml)
-	_, err := ParseConfig(path)
+	cfg, found, err := ParseConfig(path)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true for an existing file")
+	}
+	err = cfg.Validate()
 	if err == nil {
 		t.Fatal("expected error for missing api.base_url")
+	}
+	if err.Error() != "api: config: BaseURL is required" {
+		t.Errorf("Validate() error = %q, want %q", err.Error(), "api: config: BaseURL is required")
 	}
 }
 
@@ -195,9 +255,12 @@ heartbeat:
   node_id: "node-1"
 `
 	path := writeTemp(t, yaml)
-	cfg, err := ParseConfig(path)
+	cfg, found, err := ParseConfig(path)
 	if err != nil {
 		t.Fatalf("ParseConfig: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true for an existing file")
 	}
 	if cfg.Mode != DefaultMode {
 		t.Errorf("Mode = %q, want %q", cfg.Mode, DefaultMode)
@@ -210,28 +273,135 @@ heartbeat:
 	}
 }
 
-func TestParseConfig_FileNotFound(t *testing.T) {
-	_, err := ParseConfig("/nonexistent/path/config.yaml")
+// TestParseConfig_ActionsDisabledByFile pins the kill switch against
+// defaulting. The override is deliberately minimal — the shape an operator
+// writes when the rest of the actions block is fine as-is — because that is
+// the case where an omitted key and an explicit false are easiest to confuse:
+// getting it wrong hands the control plane command execution on the node.
+func TestParseConfig_ActionsDisabledByFile(t *testing.T) {
+	path := writeTemp(t, "actions:\n  enabled: false\n")
+	cfg, found, err := ParseConfig(path)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true for an existing file")
+	}
+	if cfg.Actions.IsEnabled() {
+		t.Error("Actions.IsEnabled() = true, want false for an explicit enabled: false")
+	}
+}
+
+func TestParseConfig_AbsentFile(t *testing.T) {
+	// The DaemonSet mounts the config as optional, so a missing file must yield
+	// a defaulted config that flags and environment overrides can complete.
+	cfg, found, err := ParseConfig("/nonexistent/path/config.yaml")
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if found {
+		t.Error("found = true, want false for a non-existent file")
+	}
+	if cfg.Mode != DefaultMode {
+		t.Errorf("Mode = %q, want %q", cfg.Mode, DefaultMode)
+	}
+	if cfg.DataDir != DefaultDataDir {
+		t.Errorf("DataDir = %q, want %q", cfg.DataDir, DefaultDataDir)
+	}
+	if !cfg.Health.IsEnabled() {
+		t.Error("Health.IsEnabled() = false, want true without a config file")
+	}
+	if cfg.Registration.DataDir != DefaultDataDir {
+		t.Errorf("Registration.DataDir = %q, want %q", cfg.Registration.DataDir, DefaultDataDir)
+	}
+	if cfg.NodeAPI.DataDir != DefaultDataDir {
+		t.Errorf("NodeAPI.DataDir = %q, want %q", cfg.NodeAPI.DataDir, DefaultDataDir)
+	}
+	// Actions.Enabled is the only kill switch on control-plane-driven
+	// execution, and it defaults to on. Without a file there is no operator
+	// policy to honour, so it must come up off: a deleted or unmounted config
+	// must not silently undo actions.enabled: false.
+	if cfg.Actions.IsEnabled() {
+		t.Error("Actions.IsEnabled() = true, want false without a config file")
+	}
+
+	// An API base URL from --api or PLEXD_API is all the merged config needs.
+	cfg.API.BaseURL = "https://example.com"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil", err)
+	}
+}
+
+// TestParseConfig_EmptyFile guards the actions kill switch against the gap the
+// absent-file path leaves open. yaml.Unmarshal accepts empty input without an
+// error, so a zero-byte file would otherwise parse as an operator-supplied
+// config and hand back Actions.Enabled unset — that is, action execution on —
+// for a truncated write, a ConfigMap key that rendered to nothing, or a
+// bootstrap that has not written the file yet.
+func TestParseConfig_EmptyFile(t *testing.T) {
+	for _, body := range []string{"", "\n", "  \n  \n"} {
+		t.Run(fmt.Sprintf("%q", body), func(t *testing.T) {
+			path := writeTemp(t, body)
+			cfg, found, err := ParseConfig(path)
+			if err == nil {
+				t.Fatalf("expected an error for an empty file, got cfg with Actions.IsEnabled() = %v", cfg.Actions.IsEnabled())
+			}
+			if found {
+				t.Error("found = true, want false alongside the error")
+			}
+			if !strings.Contains(err.Error(), "is empty") {
+				t.Errorf("err = %q, want it to contain %q", err.Error(), "is empty")
+			}
+			if !strings.Contains(err.Error(), path) {
+				t.Errorf("err = %q, want it to contain the path %q", err.Error(), path)
+			}
+		})
+	}
+}
+
+func TestParseConfig_UnreadableFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permissions, so the read cannot fail")
+	}
+	path := writeTemp(t, "mode: node\n")
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+
+	// A file that exists but cannot be read stays fatal: silently falling back
+	// to defaults would hide a misconfigured mount.
+	_, _, err := ParseConfig(path)
 	if err == nil {
-		t.Fatal("expected error for non-existent file")
+		t.Fatal("expected error for an unreadable file")
+	}
+	if !strings.Contains(err.Error(), "agent: config: read") {
+		t.Errorf("err = %q, want it to contain %q", err.Error(), "agent: config: read")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("err = %q, want it to contain the path %q", err.Error(), path)
 	}
 }
 
 func TestParseConfig_InvalidYAML(t *testing.T) {
 	path := writeTemp(t, "{{invalid yaml")
-	_, err := ParseConfig(path)
+	_, _, err := ParseConfig(path)
 	if err == nil {
 		t.Fatal("expected error for invalid YAML")
+	}
+	if !strings.Contains(err.Error(), "agent: config: parse") {
+		t.Errorf("err = %q, want it to contain %q", err.Error(), "agent: config: parse")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("err = %q, want it to contain the path %q", err.Error(), path)
 	}
 }
 
 // validConfig returns an AgentConfig that passes Validate after ApplyDefaults.
+// The API base URL is the only field defaults cannot supply.
 func validConfig() AgentConfig {
 	var cfg AgentConfig
 	cfg.API.BaseURL = "https://example.com"
-	cfg.Registration.DataDir = "/tmp/plexd"
-	cfg.NodeAPI.DataDir = "/tmp/plexd"
-	cfg.Heartbeat.NodeID = "node-1"
 	cfg.ApplyDefaults()
 	return cfg
 }

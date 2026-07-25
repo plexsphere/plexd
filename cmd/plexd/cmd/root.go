@@ -3,10 +3,31 @@ package cmd
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/spf13/cobra"
 )
+
+// warnIfConfigAbsent reports a missing config file once, at warn level, so a
+// mistyped --config stays visible on the file-less path. The data dir is named
+// alongside the path because it decides which identity the command reads and
+// writes, and without a file it is the built-in default rather than a
+// configured one.
+//
+// It writes through its own stderr handler instead of the command's logger:
+// plexd up's logger is level-filtered, so --log-level error would drop this
+// line — and that is the deployment where it matters most, since a pod that
+// lost its ConfigMap emits no other signal before it registers as a new node.
+// A missing config file is a startup fact, not routine chatter.
+func warnIfConfigAbsent(found bool, path, dataDir string) {
+	if found {
+		return
+	}
+	slog.New(slog.NewTextHandler(os.Stderr, nil)).Warn(
+		"config file not found, continuing with defaults and overrides",
+		"path", path, "data_dir", dataDir)
+}
 
 // envOrDefault returns the value of the environment variable named by key,
 // or defaultVal if the variable is not set or empty.

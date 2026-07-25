@@ -8,8 +8,9 @@ import (
 // Config holds the configuration for the agent registration process.
 // Config is passed as a constructor argument — no file I/O in this package.
 type Config struct {
-	// DataDir is the path to the data directory (required).
-	DataDir string `yaml:"data_dir"`
+	// DataDir is the path to the data directory (required). It is propagated
+	// from the top-level data_dir by AgentConfig.ApplyDefaults, not from YAML.
+	DataDir string `yaml:"-"`
 
 	// ProjectID is the platform project UUID the node registers into
 	// (required for fresh registration).

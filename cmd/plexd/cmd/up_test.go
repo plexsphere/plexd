@@ -290,3 +290,62 @@ func TestApplyEnvOverrides_NodeAPI(t *testing.T) {
 		}
 	})
 }
+
+// TestApplyEnvOverrides_ActionsEnabled covers the one override that can turn
+// action execution back on where nothing else can: on the file-less path
+// ParseConfig comes up with an explicit false, so a value this handler
+// misreads leaves the whole fleet without remote diagnostics or upgrades. A
+// spelling ParseBool accepts must not be read as a disable, and a value it does
+// not accept must leave the setting alone rather than silently disable it.
+func TestApplyEnvOverrides_ActionsEnabled(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		// want is the effective setting after the override is applied on top of
+		// an explicit enabled: false, as the file-less path produces it.
+		want bool
+	}{
+		{"true", "true", true},
+		{"True", "True", true},
+		{"TRUE", "TRUE", true},
+		{"1", "1", true},
+		{"t", "t", true},
+		{"false", "false", false},
+		{"False", "False", false},
+		{"0", "0", false},
+		// Not a bool: the config file's value stands, and the operator gets a
+		// warning rather than a silent disable.
+		{"yes", "yes", false},
+		{"on", "on", false},
+		{"empty value is inert", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PLEXD_ACTIONS_ENABLED", tt.value)
+
+			disabled := false
+			cfg := agent.AgentConfig{}
+			cfg.Actions.Enabled = &disabled
+			applyEnvOverrides(&cfg)
+
+			if got := cfg.Actions.IsEnabled(); got != tt.want {
+				t.Errorf("Actions.IsEnabled() for %q = %v, want %v", tt.value, got, tt.want)
+			}
+		})
+	}
+
+	// The mirror case: an unparseable value must not undo a config file that
+	// enabled execution either.
+	t.Run("unparseable leaves an enabled config alone", func(t *testing.T) {
+		t.Setenv("PLEXD_ACTIONS_ENABLED", "yes")
+
+		enabled := true
+		cfg := agent.AgentConfig{}
+		cfg.Actions.Enabled = &enabled
+		applyEnvOverrides(&cfg)
+
+		if !cfg.Actions.IsEnabled() {
+			t.Error("Actions.IsEnabled() = false, want true: an unparseable value must not disable execution")
+		}
+	})
+}
