@@ -23,6 +23,8 @@ The `internal/nodeapi` package exposes node state to local consumers (sidecar ag
 | `SecretAuthEnabled`| `bool`         | `false`                    | SO_PEERCRED-based auth for secret routes     |
 | `DataDir`         | `string`        | —                          | Data directory for cache persistence (required) |
 
+> The TCP listener serves the authenticated `/v1` routes only. The Kubernetes probe endpoints `/healthz` and `/readyz` come from a separate, unauthenticated health listener configured by the top-level `health` block (default `:9101`). That listener is enabled and bound independently of `HTTPEnabled`. See the [Configuration Reference](configuration.md#health).
+
 ```go
 cfg := nodeapi.Config{
     DataDir: "/var/lib/plexd",

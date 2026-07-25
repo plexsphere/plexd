@@ -51,6 +51,16 @@ plexd status | grep delivery_mode
 | `pull_only`        | The platform's signed event bus is not provisioned for this node. The node still reconciles on its interval and re-probes SSE periodically. |
 | `degraded_polling` | The SSE stream has been failing transiently. The node polls state every 60s and keeps retrying SSE. |
 
+The mode also drives the health listener's `/readyz` endpoint: a node that is
+otherwise ready reports ready in `streaming` or `pull_only`, while
+`degraded_polling` answers `503` with `not ready: event delivery degraded`. On
+Kubernetes the pod goes NotReady until SSE reconnects.
+
+A stream that stops for good — a permanent failure, or a node secret the control
+plane rotated or revoked — never reaches `degraded_polling`: the reconnect engine
+returns instead, leaving the mode at its last value. `/readyz` covers that case
+separately and answers `503` with `not ready: event delivery stopped`.
+
 ### `pull_only`
 
 The control plane answered the events endpoint with `501` and the problem code

@@ -83,10 +83,11 @@ docker buildx build -f deploy/docker/Dockerfile \
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 9100 | TCP | HTTP health checks (`/healthz`, `/readyz`) and local node API |
+| 9100 | TCP | Local node API (optional, token-gated, disabled by default) |
+| 9101 | TCP | Health endpoints (`/healthz`, `/readyz`) |
 | 51820 | UDP | WireGuard mesh traffic |
 
-These match the liveness/readiness probes in `deploy/kubernetes/daemonset.yaml` and the default `wireguard.listen_port` in the configuration.
+The liveness and readiness probes in `deploy/kubernetes/daemonset.yaml` target 9101, and 51820 is the default `wireguard.listen_port` in the configuration.
 
 ## Runtime User
 

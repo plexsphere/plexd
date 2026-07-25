@@ -115,6 +115,41 @@ Source: `internal/nodeapi/config.go`
 
 ---
 
+## health
+
+Dedicated listener for the unauthenticated Kubernetes probe endpoints `/healthz` and `/readyz`. It is independent of `node_api`, so a probe never needs a credential.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Run the health listener. `plexd up` starts it before registration begins, so a probe during a slow first registration gets an answer instead of a refused connection. On by default because the shipped DaemonSet probes both endpoints unconditionally: an omitted `health` block would leave the probe target unbound, and the resulting liveness failures restart the container in a loop that tears down the WireGuard interface and the firewall chain every time. Set it to `false` only when nothing probes the node. |
+| `listen` | string | `"127.0.0.1:9101"` | Listen address. The default binds loopback deliberately: the endpoints are unauthenticated, and under `hostNetwork: true` a wildcard bind answers on every node NIC and — once the mesh is up — to every WireGuard peer. The kubelet probes from the host network namespace, which is the namespace plexd listens in, so a probe with `host: 127.0.0.1` reaches a loopback-bound listener. Widening this to `":9101"` is an explicit opt-in; adjust the probes' `host` to match. |
+
+`/healthz` answers `200` for as long as the process serves requests — it reports liveness, not control-plane reachability. `/readyz` answers `200` once all readiness conditions hold; otherwise it answers `503` naming the first unmet one, in the order the agent establishes them:
+
+| Condition | `503` body when unmet |
+|-----------|-----------------------|
+| The node holds a registered identity | `not ready: registration pending` |
+| The WireGuard interface is up and the deny-by-default firewall baseline is installed | `not ready: data plane not configured` |
+| The WireGuard interface is still present and up | `not ready: data plane lost` |
+| Event delivery to the control plane is working | `not ready: event delivery stopped` or `not ready: event delivery degraded` |
+| Every long-running subsystem is still running | `not ready: subsystem stopped` |
+
+WireGuard setup failure is non-fatal — the agent logs a warning and keeps running — so the data-plane condition is what keeps such a node out of rotation instead of letting it report ready without a tunnel. On Kubernetes this also stops a DaemonSet rolling update from marching across the fleet when a kernel or capability regression breaks WireGuard everywhere.
+
+The data plane is re-checked rather than latched at startup, so an interface deleted or brought down hours later takes the node out of rotation — and puts it back once the interface returns, without a restart. A background poller runs the check every 5 seconds and probes read its last verdict; the endpoints are unauthenticated, so running the check per request would let any caller that reaches the port drive one interface-table dump per `GET`. The check covers the interface only: a firewall baseline flushed by another actor on the node stays undetected.
+
+`not ready: subsystem stopped` means a goroutine that should run for the life of the process exited before shutdown — the reconciler or the node API server. Nothing restarts them and `/healthz` stays `200` by design, so readiness is the only signal; the log line names which subsystem, the response body never does.
+
+For the delivery condition, `streaming` and `pull_only` both count as a working path and `degraded_polling` does not. `not ready: event delivery stopped` is separate: it means the SSE goroutine exited for good — a permanent failure or a rejected node secret — which the delivery mode alone cannot express, because the reconnect engine returns without ever transitioning it.
+
+Two consequences are worth knowing before you alert on readiness: the mode only turns to `degraded_polling` after the SSE polling-fallback window (default `5m`), so a node whose stream just broke still reports ready until the window elapses; and a node reports `200` in the short window between its data plane coming up and its first SSE connect. A restart that loads a persisted identity is ready without a fresh registration round-trip.
+
+> For the delivery modes themselves, see [Reading a Node's Event Delivery Mode](../../how-to/delivery-modes.md).
+
+Source: `internal/health/config.go`
+
+---
+
 ## actions
 
 Remote action execution and hook management.
@@ -375,6 +410,10 @@ node_api:
   # http_token_file: ""
   debounce_period: 5s
   shutdown_timeout: 5s
+
+health:
+  enabled: true              # dedicated /healthz + /readyz listener (default: true)
+  listen: "127.0.0.1:9101"   # loopback: the endpoints are unauthenticated
 
 actions:
   enabled: true
