@@ -13,6 +13,7 @@
 #   - Deeper body validation (metrics, capabilities fields)
 #   - Shipped liveness/readiness probes stay active; a final phase asserts no
 #     probe-induced restarts and no liveness-probe failures
+#   - Optional ConfigMap: delete plexd-config, run file-less from env only
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -88,6 +89,47 @@ print_diagnostics() {
     kubectl -n "${NAMESPACE}" logs -l app.kubernetes.io/name=plexd --tail=50 2>/dev/null || true
     echo "==> mock-api logs:"
     kubectl -n "${NAMESPACE}" logs -l app.kubernetes.io/name=mock-api --tail=50 2>/dev/null || true
+}
+
+# --- Helper: assert the current plexd pod shows no probe-induced restarts ---
+# A restartCount > 0 on the current pod means the kubelet restarted the
+# container in place — i.e. a liveness probe failed. The event query is
+# namespace-wide, so it also covers pods that have since been replaced.
+assert_probe_health() {
+    local pod restart_count liveness_failures
+    pod=$(kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=plexd -o jsonpath='{.items[0].metadata.name}')
+    restart_count=$(kubectl -n "${NAMESPACE}" get pod "${pod}" -o jsonpath='{.status.containerStatuses[0].restartCount}')
+    # jsonpath yields an empty string when the pod carries no containerStatuses
+    # yet (Pending, ContainerCreating, mid-termination). Without this check the
+    # numeric comparison below would error out, and because set -e does not
+    # apply inside an if condition, the guard would fall through to its own PASS
+    # line — reporting success for the very pod state most likely to be
+    # thrashing.
+    if ! [[ "${restart_count}" =~ ^[0-9]+$ ]]; then
+        echo "FAIL: could not read restartCount for pod ${pod} (got '${restart_count}')"
+        print_diagnostics
+        exit 1
+    fi
+    if [ "${restart_count}" -ne 0 ]; then
+        echo "FAIL: plexd pod ${pod} has restartCount=${restart_count}, want 0"
+        print_diagnostics
+        exit 1
+    fi
+    echo "  PASS: plexd pod ${pod} has restartCount=0"
+
+    # Only liveness failures are asserted: a 503 from /readyz before
+    # registration completes is by design, so Unhealthy readiness events are
+    # expected.
+    liveness_failures=$(kubectl -n "${NAMESPACE}" get events \
+        --field-selector reason=Unhealthy -o json \
+        | jq -r '[.items[] | select(.involvedObject.name | startswith("plexd")) | select(.message | contains("Liveness"))] | length')
+    if [ "${liveness_failures}" -ne 0 ]; then
+        echo "FAIL: ${liveness_failures} liveness-probe failure event(s) for plexd pods, want 0"
+        kubectl -n "${NAMESPACE}" get events --field-selector reason=Unhealthy 2>/dev/null || true
+        print_diagnostics
+        exit 1
+    fi
+    echo "  PASS: no liveness-probe failure events for plexd pods"
 }
 
 cleanup() {
@@ -873,39 +915,96 @@ echo "=== Checking probe health ==="
 # Phase 4 deleted the original pod, so the DaemonSet replaced it with a NEW
 # pod. A restartCount > 0 on the current pod therefore means the kubelet
 # restarted the container in place — i.e. a liveness probe failed.
-PLEXD_POD=$(kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=plexd -o jsonpath='{.items[0].metadata.name}')
-RESTART_COUNT=$(kubectl -n "${NAMESPACE}" get pod "${PLEXD_POD}" -o jsonpath='{.status.containerStatuses[0].restartCount}')
-# jsonpath yields an empty string when the pod carries no containerStatuses yet
-# (Pending, ContainerCreating, mid-termination). Without this check the numeric
-# comparison below would error out, and because set -e does not apply inside an
-# if condition, the guard would fall through to its own PASS line — reporting
-# success for the very pod state most likely to be thrashing.
-if ! [[ "${RESTART_COUNT}" =~ ^[0-9]+$ ]]; then
-    echo "FAIL: could not read restartCount for pod ${PLEXD_POD} (got '${RESTART_COUNT}')"
-    print_diagnostics
-    exit 1
-fi
-if [ "${RESTART_COUNT}" -ne 0 ]; then
-    echo "FAIL: plexd pod ${PLEXD_POD} has restartCount=${RESTART_COUNT}, want 0"
-    print_diagnostics
-    exit 1
-fi
-echo "  PASS: plexd pod ${PLEXD_POD} has restartCount=0"
-
-# Only liveness failures are asserted: a 503 from /readyz before registration
-# completes is by design, so Unhealthy readiness events are expected.
-LIVENESS_FAILURES=$(kubectl -n "${NAMESPACE}" get events \
-    --field-selector reason=Unhealthy -o json \
-    | jq -r '[.items[] | select(.involvedObject.name | startswith("plexd")) | select(.message | contains("Liveness"))] | length')
-if [ "${LIVENESS_FAILURES}" -ne 0 ]; then
-    echo "FAIL: ${LIVENESS_FAILURES} liveness-probe failure event(s) for plexd pods, want 0"
-    kubectl -n "${NAMESPACE}" get events --field-selector reason=Unhealthy 2>/dev/null || true
-    print_diagnostics
-    exit 1
-fi
-echo "  PASS: no liveness-probe failure events for plexd pods"
+assert_probe_health
 
 echo "=== Phase 10 PASSED: probe health ==="
+
+# ===================================================================
+# Phase 11: Optional ConfigMap
+# ===================================================================
+echo "=== Testing file-less operation without the plexd-config ConfigMap ==="
+
+# Drop the config source entirely. The shipped DaemonSet mounts the ConfigMap
+# with optional: true, so the replacement pod still starts — it just mounts an
+# empty /etc/plexd with no config.yaml in it.
+kubectl -n "${NAMESPACE}" delete configmap plexd-config
+
+# Supply the inputs the config file used to carry through the environment
+# instead. PLEXD_BOOTSTRAP_TOKEN already arrives from the plexd-bootstrap
+# secret, and everything else falls back to its built-in default.
+kubectl -n "${NAMESPACE}" set env daemonset/plexd \
+    PLEXD_API=http://mock-api.plexd-e2e:8080 \
+    PLEXD_PROJECT_ID=0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0 \
+    PLEXD_RESOURCE_HANDLE=e2e-k8s-node
+kubectl -n "${NAMESPACE}" rollout status daemonset/plexd --timeout="${TIMEOUT}"
+
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+REG_BEFORE=$(get_counter "${RESPONSE}" "registration_count")
+HB_BEFORE=$(get_counter "${RESPONSE}" "heartbeat_count")
+echo "  registration_count before: ${REG_BEFORE}"
+echo "  heartbeat_count before: ${HB_BEFORE}"
+
+# The rolled-out pod finds the identity the earlier phases persisted on the
+# node and resumes from it without ever registering. Wipe that identity and
+# replace the pod so its successor has to register from the environment alone.
+docker exec "${CLUSTER_NAME}-control-plane" rm -f /var/lib/plexd/identity.json
+kubectl -n "${NAMESPACE}" delete pod -l app.kubernetes.io/name=plexd --grace-period=10
+
+# Registration proves the file-less pod reached the control plane with the
+# env-supplied API URL and identity; a heartbeat counted after that proves it
+# went on to reach steady state rather than dying right after the registration
+# call. The outgoing pod keeps heartbeating through its grace period, so the
+# heartbeat baseline is re-read at the moment registration lands — from then on
+# only the new pod can bump the counter.
+OPTCM_TIMEOUT=90
+OPTCM_ELAPSED=0
+OPTCM_REGISTERED=0
+while [ "${OPTCM_ELAPSED}" -lt "${OPTCM_TIMEOUT}" ]; do
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        REG_AFTER=$(get_counter "${RESPONSE}" "registration_count")
+        HB_AFTER=$(get_counter "${RESPONSE}" "heartbeat_count")
+        if [ "${OPTCM_REGISTERED}" -eq 0 ]; then
+            if [ "${REG_AFTER}" -gt "${REG_BEFORE}" ]; then
+                OPTCM_REGISTERED=1
+                HB_BEFORE="${HB_AFTER}"
+                echo "  PASS: registration_count increased from ${REG_BEFORE} to ${REG_AFTER} without a config file"
+                echo "  heartbeat_count re-baselined at registration: ${HB_BEFORE}"
+            fi
+        elif [ "${HB_AFTER}" -gt "${HB_BEFORE}" ]; then
+            echo "  PASS: heartbeat_count increased from ${HB_BEFORE} to ${HB_AFTER} after the file-less registration"
+            break
+        fi
+    fi
+    sleep 5
+    OPTCM_ELAPSED=$((OPTCM_ELAPSED + 5))
+done
+
+if [ "${OPTCM_ELAPSED}" -ge "${OPTCM_TIMEOUT}" ]; then
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    REG_AFTER=$(get_counter "${RESPONSE}" "registration_count")
+    HB_AFTER=$(get_counter "${RESPONSE}" "heartbeat_count")
+    echo "  registration_count=${REG_AFTER} (before ${REG_BEFORE}), heartbeat_count=${HB_AFTER} (before ${HB_BEFORE})"
+    echo "FAIL: file-less plexd did not register and heartbeat within ${OPTCM_TIMEOUT}s"
+    print_diagnostics
+    exit 1
+fi
+
+# The agent must say why it started without a file, not silently pick defaults.
+if kubectl -n "${NAMESPACE}" logs -l app.kubernetes.io/name=plexd --tail=200 | grep -q "config file not found"; then
+    echo "  PASS: fall-back warning names the missing config file"
+else
+    echo "FAIL: expected 'config file not found' warning in plexd logs"
+    print_diagnostics
+    exit 1
+fi
+
+# Phase 10 only covered the ConfigMap-backed pod. Without a file, health.enabled
+# and health.listen come purely from ApplyDefaults, so repeat the probe checks
+# against the file-less pod: an unbound probe target restarts it in a loop.
+assert_probe_health
+
+echo "=== Phase 11 PASSED: optional ConfigMap ==="
 
 TEST_FAILED=0
 echo "=== ALL TESTS PASSED ==="
