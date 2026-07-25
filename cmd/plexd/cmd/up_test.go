@@ -62,6 +62,41 @@ func TestRedactSensitiveLine_SecretKey(t *testing.T) {
 	}
 }
 
+// TestLoadMergedConfig_AbsentFile exercises the loader runUp calls: an absent
+// config file is not fatal, the CLI flags are merged on top of the defaults,
+// and the result is what validation then runs against. Without the flag the
+// merged config has no base URL; with it, the file-less run validates.
+func TestLoadMergedConfig_AbsentFile(t *testing.T) {
+	oldAPIURL := apiURL
+	t.Cleanup(func() { apiURL = oldAPIURL })
+
+	apiURL = ""
+	cfg, found, err := loadMergedConfig("/nonexistent/path/config.yaml")
+	if err != nil {
+		t.Fatalf("loadMergedConfig for an absent file should not fail, got: %v", err)
+	}
+	if found {
+		t.Error("found = true, want false for an absent config file")
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want an error for a missing base URL")
+	} else if err.Error() != "api: config: BaseURL is required" {
+		t.Errorf("Validate() error = %q, want %q", err.Error(), "api: config: BaseURL is required")
+	}
+
+	apiURL = "https://api.example.com"
+	cfg, _, err = loadMergedConfig("/nonexistent/path/config.yaml")
+	if err != nil {
+		t.Fatalf("loadMergedConfig: %v", err)
+	}
+	if cfg.API.BaseURL != apiURL {
+		t.Errorf("API.BaseURL = %q, want the --api value %q", cfg.API.BaseURL, apiURL)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil for a config-less run with --api", err)
+	}
+}
+
 func TestBuildHeartbeatRequest(t *testing.T) {
 	t.Run("nil NAT info yields empty non-nil summary", func(t *testing.T) {
 		req := buildHeartbeatRequest("checksum-abc", "1.2.3", nil)
