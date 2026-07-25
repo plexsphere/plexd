@@ -80,16 +80,24 @@ spec:
             limits:
               cpu: 200m
               memory: 128Mi
+          # The probes dial loopback explicitly. The health endpoints are
+          # unauthenticated, so plexd binds them to 127.0.0.1; under
+          # hostNetwork: true the kubelet probes from the host network
+          # namespace, which is the namespace plexd listens in, so loopback
+          # reaches it. Without host, the kubelet would dial the node address
+          # and the endpoint would have to answer on every NIC.
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 9100
+              port: 9101
+              host: 127.0.0.1
             initialDelaySeconds: 10
             periodSeconds: 30
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 9100
+              port: 9101
+              host: 127.0.0.1
             initialDelaySeconds: 5
             periodSeconds: 10
       volumes:

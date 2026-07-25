@@ -45,7 +45,7 @@ COPY --from=builder --chown=65534:65534 /build/plexd /usr/local/bin/plexd
 # Run as non-root (nobody)
 USER 65534:65534
 
-# Health checks / node API (TCP) and WireGuard mesh (UDP)
-EXPOSE 9100 51820/udp
+# Node API (TCP, optional) and health checks (TCP), WireGuard mesh (UDP)
+EXPOSE 9100 9101 51820/udp
 
 ENTRYPOINT ["/usr/local/bin/plexd"]

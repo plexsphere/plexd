@@ -24,3 +24,12 @@ data:
     policy:
       enabled: true
       chain_name: plexd-mesh
+
+    # The health listener serves the DaemonSet's liveness/readiness probes.
+    # The address must match the probe host and port in daemonset.yaml. It is
+    # loopback because the endpoints are unauthenticated: under
+    # hostNetwork: true a wildcard bind would answer on every node NIC and, once
+    # the mesh is up, to every WireGuard peer.
+    health:
+      enabled: true
+      listen: "127.0.0.1:9101"
