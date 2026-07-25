@@ -6,11 +6,16 @@ feature: PXD-0001
 
 # Configuration Reference
 
-plexd reads its configuration from a YAML file (default: `/etc/plexd/config.yaml`). The file is parsed by `ParseConfig()` in `internal/agent/config.go`, which performs three steps:
+plexd reads its configuration from a YAML file (default: `/etc/plexd/config.yaml`, overridable with `--config`). The file is optional: when no file exists at that path, plexd continues with an empty configuration — defaults apply, and CLI flags and environment variables supply the rest — and logs a single warn-level message naming the path it did not find, so a mistyped `--config` stays visible. A file that exists but cannot be read, a file that is empty, and a file that is not valid YAML, are startup errors that name the path. An empty file is rejected rather than treated as an absent one: a truncated write or a ConfigMap key that rendered to nothing is a broken configuration, not a decision to run without one.
 
-1. **Unmarshal** the YAML into an `AgentConfig` struct
+The configuration a command runs on is assembled in four steps:
+
+1. **Unmarshal** the YAML into an `AgentConfig` struct — or start from an empty struct when the file is absent (`ParseConfig()` in `internal/agent/config.go`)
 2. **ApplyDefaults** for every zero-valued field
-3. **Validate** all sections (returns the first error encountered)
+3. **Merge overrides** — CLI flag values, then the `PLEXD_*` environment overrides
+4. **Validate** the merged configuration (returns the first error encountered)
+
+Because validation runs on the merged result, a required value may come from any layer: `plexd up --api https://api.example.com` starts with no config file at all, and with a file that omits `api.base_url`.
 
 **Precedence order** (highest to lowest):
 
@@ -19,6 +24,18 @@ plexd reads its configuration from a YAML file (default: `/etc/plexd/config.yaml
 3. Global env vars via `envOrDefault()` (`PLEXD_CONFIG`, `PLEXD_LOG_LEVEL`, `PLEXD_API`, `PLEXD_MODE`)
 4. Values in the YAML config file
 5. `ApplyDefaults()` for zero-valued fields
+
+## Running without a config file
+
+plexd can run entirely from flags and environment variables. For a fresh registration the file-less minimum is `PLEXD_API`, `PLEXD_PROJECT_ID`, `PLEXD_RESOURCE_HANDLE`, and `PLEXD_BOOTSTRAP_TOKEN` — or the equivalent `--api`, `--project-id`, and `--resource-handle` flags plus the token. Every other field falls back to its default.
+
+Fields that have no flag or environment override remain reachable only through the file, which stays the primary configuration surface for host installs.
+
+One default is inverted on this path: `actions.enabled` comes up `false` without a config file, where a file that omits the `actions` block leaves it `true`. `actions.enabled` is the only switch that stops the control plane from executing actions and hooks on the node, so a file that has gone missing — a deleted ConfigMap, a mistyped `--config`, a broken mount — must not silently enable it. A deliberately file-less deployment that wants action execution sets `PLEXD_ACTIONS_ENABLED=true`.
+
+> For the full list of overrides, see [Environment Variables](environment-variables.md).
+
+---
 
 ## Top-Level Fields
 
@@ -36,7 +53,7 @@ Control plane HTTP client configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `base_url` | string | — (required) | Control plane API base URL, e.g. `https://api.plexsphere.com` |
+| `base_url` | string | — (required) | Control plane API base URL, e.g. `https://api.plexsphere.com`. Required in the merged configuration — the value may come from the file, `--api`, or `PLEXD_API`. |
 | `tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification. **WARNING:** Only for development/testing. |
 | `connect_timeout` | duration | `10s` | Maximum time to wait for a TCP connection |
 | `request_timeout` | duration | `30s` | Maximum time for a complete HTTP request/response cycle |
@@ -109,7 +126,7 @@ Local node API server (Unix socket and optional HTTP).
 | `debounce_period` | duration | `5s` | Debounce period for coalescing events |
 | `shutdown_timeout` | duration | `5s` | Maximum time to wait for graceful shutdown |
 
-> `data_dir` and `secret_auth_enabled` are set at runtime by `plexd up`. They do not appear in the YAML.
+> `data_dir` is propagated from the top-level `data_dir` by `ApplyDefaults()`; `secret_auth_enabled` is set at runtime by `plexd up`. Neither appears in the YAML.
 
 Source: `internal/nodeapi/config.go`
 
@@ -156,11 +173,17 @@ Remote action execution and hook management.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Enable action execution. Defaults to `true` via zero-value heuristic: if all numeric fields are zero, `Enabled` is set to `true` by `ApplyDefaults()`. |
+| `enabled` | bool | `true` | Enable action execution. An omitted key leaves it `true`; an explicit `false` disables execution and survives defaulting. Without a config file it defaults to `false` — see [Running without a config file](#running-without-a-config-file). |
 | `hooks_dir` | string | `/etc/plexd/hooks` | Directory containing hook scripts |
 | `max_concurrent` | int | `5` | Maximum number of concurrent actions. Minimum: `1`. |
 | `max_action_timeout` | duration | `10m` | Maximum duration for a single action. Minimum: `10s`. |
 | `max_output_bytes` | int64 | `1048576` (1 MiB) | Maximum output size per action in bytes. Minimum: `1024`. |
+
+::: warning Upgrading from a release that used the zero-value heuristic
+Earlier releases derived `enabled` from the other fields: `ApplyDefaults()` set it to `true` only when `max_concurrent`, `max_action_timeout`, and `max_output_bytes` were all zero. A config file that set any one of them without an `enabled` key therefore ran with action execution **off**.
+
+That heuristic is gone. `enabled` now means what it says, so a file of that shape comes up with action execution **on** after the upgrade, with no config change. If those nodes are meant to stay off, add an explicit `actions.enabled: false` before rolling the binary forward. `plexd up` reports the effective value as `actions_enabled` in its startup log line, and `config.dump` reports it under `actions.enabled`.
+:::
 
 Source: `internal/actions/config.go`
 

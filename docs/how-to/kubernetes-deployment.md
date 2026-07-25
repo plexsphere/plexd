@@ -107,7 +107,7 @@ kubectl apply -f deploy/kubernetes/secret.yaml
 kubectl apply -f deploy/kubernetes/plexd-config-configmap.yaml
 ```
 
-plexd requires a config file at `/etc/plexd/config.yaml` — the path the DaemonSet passes to `--config`. The `health` block in this ConfigMap spells out the listener that answers the DaemonSet's probes; it matches the defaults, so it documents the probe target rather than switching it on.
+This step is optional. The DaemonSet mounts the ConfigMap with `optional: true` and passes `/etc/plexd/config.yaml` to `--config`; without the ConfigMap plexd starts on its built-in defaults plus the environment and logs a warning that it found no config file at that path. Skip it and supply the registration inputs through the DaemonSet's `env` instead (see [Providing a config file](#providing-a-config-file) below). The `health` block in this ConfigMap spells out the listener that answers the DaemonSet's probes; it matches the defaults, so it documents the probe target rather than switching it on.
 
 ### 5. Deploy the DaemonSet
 
@@ -135,7 +135,7 @@ kubectl create configmap plexd-config \
   --from-file=config.yaml=/path/to/your/config.yaml
 ```
 
-The DaemonSet mounts this ConfigMap at `/etc/plexd`. The ConfigMap is required — plexd reads `/etc/plexd/config.yaml` on startup and exits when no file exists at that path, so a pod without the ConfigMap crash-loops. A custom ConfigMap needs no `health` block: the listener is on by default, precisely so that a config written without it still answers the DaemonSet's probes. Setting `health.enabled: false` leaves the probe target unbound and the pods restart in a loop, so remove the probes from the DaemonSet as well if you turn the listener off.
+The DaemonSet mounts this ConfigMap at `/etc/plexd` with `optional: true`, so the ConfigMap itself is optional — a pod that starts without it runs on plexd's built-in defaults plus the environment and logs a warning naming the config file it did not find. A file-less deployment supplies the registration inputs through the DaemonSet's `env` instead: add `PLEXD_API`, `PLEXD_PROJECT_ID`, and `PLEXD_RESOURCE_HANDLE`, since `PLEXD_BOOTSTRAP_TOKEN` is already injected from the `plexd-bootstrap` secret. Action execution is off on that path — without a file there is no `actions` block to honour, so plexd will not run control-plane actions or hooks unless the DaemonSet also sets `PLEXD_ACTIONS_ENABLED=true`. A custom ConfigMap needs no `health` block: the listener is on by default, precisely so that a config written without it still answers the DaemonSet's probes. Setting `health.enabled: false` leaves the probe target unbound and the pods restart in a loop, so remove the probes from the DaemonSet as well if you turn the listener off.
 
 ### Environment variables
 
