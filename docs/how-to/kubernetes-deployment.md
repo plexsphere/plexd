@@ -22,6 +22,7 @@ kubectl apply -f deploy/kubernetes/namespace.yaml
 kubectl apply -f deploy/kubernetes/crds/plexdnodestate-crd.yaml
 kubectl apply -f deploy/kubernetes/serviceaccount.yaml
 kubectl apply -f deploy/kubernetes/rbac.yaml
+kubectl apply -f deploy/kubernetes/plexd-config-configmap.yaml
 kubectl apply -f deploy/kubernetes/daemonset.yaml
 ```
 
@@ -100,7 +101,15 @@ echo -n "your-token-here" | base64
 kubectl apply -f deploy/kubernetes/secret.yaml
 ```
 
-### 4. Deploy the DaemonSet
+### 4. Apply the configuration
+
+```sh
+kubectl apply -f deploy/kubernetes/plexd-config-configmap.yaml
+```
+
+plexd requires a config file at `/etc/plexd/config.yaml` — the path the DaemonSet passes to `--config`. The `health` block in this ConfigMap spells out the listener that answers the DaemonSet's probes; it matches the defaults, so it documents the probe target rather than switching it on.
+
+### 5. Deploy the DaemonSet
 
 ```sh
 kubectl apply -f deploy/kubernetes/daemonset.yaml
@@ -126,7 +135,7 @@ kubectl create configmap plexd-config \
   --from-file=config.yaml=/path/to/your/config.yaml
 ```
 
-The DaemonSet mounts this ConfigMap at `/etc/plexd`. The ConfigMap is optional — if absent, plexd uses defaults.
+The DaemonSet mounts this ConfigMap at `/etc/plexd`. The ConfigMap is required — plexd reads `/etc/plexd/config.yaml` on startup and exits when no file exists at that path, so a pod without the ConfigMap crash-loops. A custom ConfigMap needs no `health` block: the listener is on by default, precisely so that a config written without it still answers the DaemonSet's probes. Setting `health.enabled: false` leaves the probe target unbound and the pods restart in a loop, so remove the probes from the DaemonSet as well if you turn the listener off.
 
 ### Environment variables
 
@@ -186,10 +195,18 @@ kubectl logs -n plexd-system daemonset/plexd -c plexd --tail=100
 
 The DaemonSet configures liveness and readiness probes:
 
-| Probe      | Path       | Port | Interval |
-|------------|------------|------|----------|
-| Liveness   | `/healthz` | 9100 | 30s      |
-| Readiness  | `/readyz`  | 9100 | 10s      |
+| Probe      | Path       | Host        | Port | Interval |
+|------------|------------|-------------|------|----------|
+| Liveness   | `/healthz` | `127.0.0.1` | 9101 | 30s      |
+| Readiness  | `/readyz`  | `127.0.0.1` | 9101 | 10s      |
+
+Both endpoints are served by the health listener and need no credentials — which is why the listener binds loopback and the probes set `host: 127.0.0.1`. Under `hostNetwork: true` the kubelet probes from the host network namespace, the same namespace plexd listens in, so loopback reaches it while nothing on the node's NICs or on the mesh can.
+
+`/healthz` returns `200` for as long as the process serves requests — it reports liveness, not control-plane reachability. `/readyz` returns `200` once the node holds a registered identity, its WireGuard interface and firewall baseline are up, its event delivery path to the control plane is working, and its long-running subsystems are still running; otherwise it returns `503` with a one-line reason (`not ready: registration pending`, `not ready: data plane not configured`, `not ready: data plane lost`, `not ready: event delivery stopped`, `not ready: event delivery degraded`, or `not ready: subsystem stopped`). A node in `pull_only` delivery counts as ready — it still reconciles on its interval — while `degraded_polling` does not. A restarted pod that finds its persisted identity reports ready without registering again.
+
+Readiness keeps watching after startup: the WireGuard interface is re-checked every 5 seconds in the background, so a pod whose interface is deleted or brought down goes NotReady and recovers on its own once the interface returns, and a subsystem that exits before shutdown turns the pod NotReady for good — the pod log names which one. `/healthz` deliberately stays `200` in both cases, because a restart runs the drain path and deletes the interface and the firewall chain.
+
+Because readiness covers the data plane, a node whose WireGuard interface fails to come up stays NotReady rather than reporting healthy without a tunnel. With `maxUnavailable: 1` that halts a rolling update on the first affected node instead of letting it sweep the fleet.
 
 Check probe status:
 
@@ -297,10 +314,10 @@ kubectl logs -n plexd-system <pod-name> | grep "crd"
 
 ### Host networking issues
 
-Since plexd uses `hostNetwork: true`, port conflicts can occur. Verify port 9100 (HTTP API) is not in use on the host:
+Since plexd uses `hostNetwork: true`, port conflicts can occur — a bind failure on the health listener aborts startup and the pod crash-loops. Verify that port 9101 (health endpoints) is free on the host, and port 9100 (local node API) as well if you set `node_api.http_enabled`:
 
 ```sh
-kubectl exec -n plexd-system <pod-name> -- ss -tlnp | grep 9100
+kubectl exec -n plexd-system <pod-name> -- ss -tlnp | grep -E '9100|9101'
 ```
 
 ## See also
