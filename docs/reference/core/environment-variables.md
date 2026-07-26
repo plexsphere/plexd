@@ -36,6 +36,9 @@ These variables are read by `applyEnvOverrides()` in `cmd/plexd/cmd/up.go` and o
 | `PLEXD_NODE_API_SOCKET` | `node_api.socket_path` | Path to the Unix domain socket |
 | `PLEXD_NODE_API_HTTP_ENABLED` | `node_api.http_enabled` | Enable/disable the HTTP listener. Values: `true`, `1` to enable. |
 | `PLEXD_NODE_API_HTTP_LISTEN` | `node_api.http_listen` | HTTP listen address, e.g. `127.0.0.1:9100` |
+| `PLEXD_POLICY_ENABLED` | `policy.enabled` | Enable/disable network policy enforcement. Parsed with `strconv.ParseBool`, like `PLEXD_ACTIONS_ENABLED`; any other value is ignored with a warning and leaves `policy.enabled` as the file or the default set it. Setting it to `false` is how a container without `CAP_NET_ADMIN` gets past the firewall pre-flight without mounting a config file. |
+| `PLEXD_HEALTH_ENABLED` | `health.enabled` | Enable/disable the health listener. Parsed with `strconv.ParseBool`; an unparseable value is ignored with a warning. Turning the listener off leaves the probe target unbound — remove the probes as well, or the kubelet restarts the container in a loop. |
+| `PLEXD_HEALTH_LISTEN` | `health.listen` | Health listen address, e.g. `0.0.0.0:9101`. Applied verbatim: an address that cannot be bound fails at startup with the bind error, not a config-validation error. Needed by a Pod-network deployment, where the kubelet dials the Pod IP and the `127.0.0.1:9101` default answers nothing. The endpoints are unauthenticated, so widening the bind is a deliberate choice — see [health](configuration.md#health). |
 
 ## Bootstrap Token Variable
 
@@ -74,6 +77,18 @@ PLEXD_ACTIONS_ENABLED=false plexd up
 ```bash
 PLEXD_NODE_API_HTTP_ENABLED=true PLEXD_NODE_API_HTTP_LISTEN=0.0.0.0:9200 plexd up
 ```
+
+**Run without a config file on a restricted Pod-network deployment:**
+
+```bash
+PLEXD_API=https://api.example.com \
+PLEXD_PROJECT_ID=... PLEXD_RESOURCE_HANDLE=... \
+PLEXD_POLICY_ENABLED=false \
+PLEXD_HEALTH_LISTEN=0.0.0.0:9101 \
+plexd up
+```
+
+Without `PLEXD_POLICY_ENABLED=false` this pod aborts on the firewall pre-flight, because it holds no `CAP_NET_ADMIN`; without `PLEXD_HEALTH_LISTEN` its liveness probe never reaches the loopback-bound listener. Neither default changes — this run opts out of both explicitly.
 
 **Set log level and API URL globally:**
 

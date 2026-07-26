@@ -156,6 +156,15 @@ kubectl create configmap plexd-config \
 
 The DaemonSet mounts this ConfigMap at `/etc/plexd` with `optional: true`, so the ConfigMap itself is optional — a pod that starts without it runs on plexd's built-in defaults plus the environment and logs a warning naming the config file it did not find. A file-less deployment supplies the registration inputs through the DaemonSet's `env` instead: add `PLEXD_API`, `PLEXD_PROJECT_ID`, and `PLEXD_RESOURCE_HANDLE`, since `PLEXD_BOOTSTRAP_TOKEN` is already injected from the `plexd-bootstrap` secret. Action execution is off on that path — without a file there is no `actions` block to honour, so plexd will not run control-plane actions or hooks unless the DaemonSet also sets `PLEXD_ACTIONS_ENABLED=true`. A custom ConfigMap needs no `health` block: the listener is on by default, precisely so that a config written without it still answers the DaemonSet's probes. Setting `health.enabled: false` leaves the probe target unbound and the pods restart in a loop, so remove the probes from the DaemonSet as well if you turn the listener off.
 
+Two more defaults are shaped for the DaemonSet this repository ships, and a workload that differs overrides them from the environment too:
+
+| Variable | When a deployment needs it |
+|----------|----------------------------|
+| `PLEXD_POLICY_ENABLED=false` | The container has no `NET_ADMIN`. Enforcement is on by default, so such a pod aborts on the firewall pre-flight before it registers; this is the file-less form of the `policy.enabled: false` opt-out, and the same deliberate downgrade — see [Missing NET_ADMIN](#missing-net-admin). It buys startup, not a working tunnel: WireGuard needs `NET_ADMIN` too, so a pod that dropped it registers and heartbeats but stays `503 not ready: data plane not configured`. |
+| `PLEXD_HEALTH_LISTEN=0.0.0.0:9101` | The pod is on the Pod network rather than `hostNetwork: true`. The kubelet then dials the Pod IP, which the `127.0.0.1:9101` default never answers; drop `host: 127.0.0.1` from the probes to match. |
+
+The health endpoints are unauthenticated — that is why the default is loopback — so widening the bind exposes them to whatever can reach the Pod. It is a deliberate choice, not a step in a checklist.
+
 ### Environment variables
 
 The DaemonSet sets these environment variables automatically:
@@ -344,6 +353,8 @@ If `NET_ADMIN` is absent from `add`, something between the manifest and the kube
 policy:
   enabled: false
 ```
+
+Where there is no ConfigMap to edit, the same opt-out is `PLEXD_POLICY_ENABLED=false` in the DaemonSet's `env`.
 
 That is a deliberate downgrade: the node joins the mesh with no plexd firewall chain. plexd will not make that choice on its own — a node told to enforce that cannot enforce fails closed.
 
