@@ -18,7 +18,7 @@ import (
 // ---------------------------------------------------------------------------
 
 func newEnabledEnforcer(fw FirewallController) *Enforcer {
-	return NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{Enabled: true, ChainName: "TEST"}, testLogger())
+	return NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{Enabled: boolPtr(true), ChainName: "TEST"}, testLogger())
 }
 
 func policySnapshot(fingerprint string, rules ...api.PolicyRule) *api.PolicySnapshot {
@@ -145,7 +145,7 @@ func TestReconcileHandler_DisabledEnforcementDoesNotClaimApplied(t *testing.T) {
 	enforcer := NewEnforcer(
 		NewPolicyEngine(testLogger()),
 		&mockFirewallController{},
-		Config{Enabled: false, ChainName: "TEST"},
+		Config{Enabled: boolPtr(false), ChainName: "TEST"},
 		slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	)
 	handler := ReconcileHandler(enforcer, "wg0")

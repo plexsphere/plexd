@@ -48,7 +48,7 @@ func NewEnforcer(engine *PolicyEngine, firewall FirewallController, cfg Config, 
 // callers can tell a permanently broken revision from a transient netlink
 // failure.
 func (e *Enforcer) ApplyFirewallRules(policy *api.PolicySnapshot, iface string) (bool, error) {
-	if !e.cfg.Enabled {
+	if !e.cfg.IsEnabled() {
 		return false, nil
 	}
 	if e.firewall == nil {
@@ -74,6 +74,30 @@ func (e *Enforcer) ApplyFirewallRules(policy *api.PolicySnapshot, iface string) 
 
 	e.logger.Info("applied firewall rules", "count", len(fwRules), "chain", e.cfg.ChainName)
 	return true, nil
+}
+
+// Preflight reports whether this node can enforce policy at all, without
+// changing any kernel state. It answers the question the first
+// ApplyFirewallRules would otherwise answer — but that call happens after
+// registration has spent a one-shot bootstrap token, so a node that can never
+// install a chain has to learn it here instead.
+//
+// The two no-op paths of ApplyFirewallRules are no-ops here as well: with
+// enforcement disabled or no firewall backend compiled in, there is no
+// enforcement to be unable to perform. A backend that fails the probe is an
+// error — that node was told to enforce and cannot.
+func (e *Enforcer) Preflight() error {
+	if !e.cfg.IsEnabled() {
+		return nil
+	}
+	if e.firewall == nil {
+		return nil
+	}
+	if err := e.firewall.Probe(); err != nil {
+		return fmt.Errorf("policy: preflight: %w", err)
+	}
+	e.logger.Debug("firewall backend available", "chain", e.cfg.ChainName)
+	return nil
 }
 
 // Teardown removes the firewall chain and its rules. It is safe to call when
