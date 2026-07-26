@@ -27,6 +27,7 @@ nat:
   timeout: 5s
 
 policy:
+  enabled: true
   chain_name: plexd-policy
 
 tunnel:
