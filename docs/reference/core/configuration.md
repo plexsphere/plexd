@@ -138,8 +138,8 @@ Dedicated listener for the unauthenticated Kubernetes probe endpoints `/healthz`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Run the health listener. `plexd up` starts it before registration begins, so a probe during a slow first registration gets an answer instead of a refused connection. On by default because the shipped DaemonSet probes both endpoints unconditionally: an omitted `health` block would leave the probe target unbound, and the resulting liveness failures restart the container in a loop that tears down the WireGuard interface and the firewall chain every time. Set it to `false` only when nothing probes the node. |
-| `listen` | string | `"127.0.0.1:9101"` | Listen address. The default binds loopback deliberately: the endpoints are unauthenticated, and under `hostNetwork: true` a wildcard bind answers on every node NIC and — once the mesh is up — to every WireGuard peer. The kubelet probes from the host network namespace, which is the namespace plexd listens in, so a probe with `host: 127.0.0.1` reaches a loopback-bound listener. Widening this to `":9101"` is an explicit opt-in; adjust the probes' `host` to match. |
+| `enabled` | bool | `true` | Run the health listener. `plexd up` starts it before registration begins, so a probe during a slow first registration gets an answer instead of a refused connection. On by default because the shipped DaemonSet probes both endpoints unconditionally: an omitted `health` block would leave the probe target unbound, and the resulting liveness failures restart the container in a loop that tears down the WireGuard interface and the firewall chain every time. Set it to `false` only when nothing probes the node. Also settable as [`PLEXD_HEALTH_ENABLED`](environment-variables.md#plexd-up-variables). |
+| `listen` | string | `"127.0.0.1:9101"` | Listen address. The default binds loopback deliberately: the endpoints are unauthenticated, and under `hostNetwork: true` a wildcard bind answers on every node NIC and — once the mesh is up — to every WireGuard peer. The kubelet probes from the host network namespace, which is the namespace plexd listens in, so a probe with `host: 127.0.0.1` reaches a loopback-bound listener. Widening this to `":9101"` is an explicit opt-in; adjust the probes' `host` to match. Also settable as [`PLEXD_HEALTH_LISTEN`](environment-variables.md#plexd-up-variables), which is what a Pod-network deployment running without a config file uses — there the kubelet dials the Pod IP and a loopback-bound listener answers nothing. |
 
 `/healthz` answers `200` for as long as the process serves requests — it reports liveness, not control-plane reachability. `/readyz` answers `200` once all readiness conditions hold; otherwise it answers `503` naming the first unmet one, in the order the agent establishes them:
 
@@ -330,7 +330,7 @@ Network policy enforcement and firewall rules. See [Network Policy Enforcement](
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Enable policy enforcement. An omitted key means enabled; an explicit `false` is preserved. |
+| `enabled` | bool | `true` | Enable policy enforcement. An omitted key means enabled; an explicit `false` is preserved. Also settable as [`PLEXD_POLICY_ENABLED`](environment-variables.md#plexd-up-variables), which is how a deployment without a config file reaches the opt-out below. |
 | `chain_name` | string | `plexd-mesh` | Name of the nftables chain for policy rules |
 
 Policy enforcement needs `CAP_NET_ADMIN`. With enforcement on, `plexd up` probes the nftables backend **before it registers** and exits if the probe fails — a node that cannot install the deny-by-default baseline must not spend its one-shot bootstrap token first. The failure names the capability and this opt-out:
@@ -342,7 +342,7 @@ enforcement: policy: preflight: policy: nftables: probe: netlink receive:
 operation not permitted
 ```
 
-Grant the capability (see [Kubernetes Deployment](../../how-to/kubernetes-deployment.md)) or set `enabled: false`. There is no middle setting: a node told to enforce that cannot enforce fails closed rather than joining the mesh unfiltered.
+Grant the capability (see [Kubernetes Deployment](../../how-to/kubernetes-deployment.md)) or set `enabled: false` — or, without a file to set it in, `PLEXD_POLICY_ENABLED=false`. There is no middle setting: a node told to enforce that cannot enforce fails closed rather than joining the mesh unfiltered.
 
 > **Migration:** `enabled` was previously resolved by a zero-value heuristic that guessed intent from `chain_name`. A `policy` block naming a chain without an `enabled` key was read as *disabled* — such a node ran unenforced and now comes up enforcing, which on a host without `CAP_NET_ADMIN` means it fails the pre-flight instead of starting. A block setting only `enabled: false` was forced back on and now takes effect as written. Spell `enabled` out to be certain of either.
 
