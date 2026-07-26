@@ -44,10 +44,17 @@ Logger entries use `component=policy`.
 
 | Method        | nftables Operation                                                    |
 |---------------|-----------------------------------------------------------------------|
+| `Probe`       | `ListTablesOfFamily(IPv4)` — read-only                               |
 | `EnsureChain` | `AddTable` (idempotent) + `AddChain` + `Flush`                       |
 | `ApplyRules`  | `AddTable` + `AddChain` + `FlushChain` + `AddRule` per rule + `Flush`|
 | `FlushChain`  | `AddTable` + `FlushChain` + `Flush`                                  |
 | `DeleteChain` | `ListChainsOfTableFamily` → `DelChain` + `Flush` if found            |
+
+### Probe
+
+Dumps the IPv4 table list and discards the result. nfnetlink gates every message on `CAP_NET_ADMIN`, dumps included, so a dropped capability or a kernel that does not offer the `nf_tables` subsystem fails here exactly as it would on the first `EnsureChain` — but without adding a table to a batch first.
+
+`Enforcer.Preflight` calls this before `plexd up` registers, so a node that cannot enforce policy exits before it spends a bootstrap token. The read-only shape is deliberate: a node that goes on to fail startup for another reason must not leave a table behind.
 
 ### EnsureChain
 

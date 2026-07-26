@@ -330,8 +330,21 @@ Network policy enforcement and firewall rules. See [Network Policy Enforcement](
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Enable policy enforcement. Defaults to `true` when `chain_name` is empty (zero-value heuristic). |
+| `enabled` | bool | `true` | Enable policy enforcement. An omitted key means enabled; an explicit `false` is preserved. |
 | `chain_name` | string | `plexd-mesh` | Name of the nftables chain for policy rules |
+
+Policy enforcement needs `CAP_NET_ADMIN`. With enforcement on, `plexd up` probes the nftables backend **before it registers** and exits if the probe fails — a node that cannot install the deny-by-default baseline must not spend its one-shot bootstrap token first. The failure names the capability and this opt-out:
+
+```
+plexd up: firewall baseline pre-flight: policy enforcement needs CAP_NET_ADMIN,
+grant it to the container or set policy.enabled: false to run this node without
+enforcement: policy: preflight: policy: nftables: probe: netlink receive:
+operation not permitted
+```
+
+Grant the capability (see [Kubernetes Deployment](../../how-to/kubernetes-deployment.md)) or set `enabled: false`. There is no middle setting: a node told to enforce that cannot enforce fails closed rather than joining the mesh unfiltered.
+
+> **Migration:** `enabled` was previously resolved by a zero-value heuristic that guessed intent from `chain_name`. A `policy` block naming a chain without an `enabled` key was read as *disabled* — such a node ran unenforced and now comes up enforcing, which on a host without `CAP_NET_ADMIN` means it fails the pre-flight instead of starting. A block setting only `enabled: false` was forced back on and now takes effect as written. Spell `enabled` out to be certain of either.
 
 Source: `internal/policy/config.go`
 
@@ -514,6 +527,7 @@ peer_exchange:
   timeout: 5s
 
 policy:
+  enabled: true              # needs CAP_NET_ADMIN; false to run unenforced
   chain_name: plexd-mesh
 
 tunnel:

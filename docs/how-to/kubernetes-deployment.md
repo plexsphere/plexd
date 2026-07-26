@@ -12,6 +12,7 @@ Step-by-step guide for deploying plexd as a DaemonSet on Kubernetes clusters.
 - **Cluster admin** permissions (for CRD and ClusterRole creation)
 - **Network connectivity** from cluster nodes to the Plexsphere control plane API
 - **Bootstrap token** from the control plane for node enrollment
+- **`NET_ADMIN` and `NET_RAW` capabilities** for the plexd container — the shipped DaemonSet adds them; a cluster policy that strips them makes plexd exit at startup (see [Missing NET_ADMIN](#missing-net-admin))
 
 ## Quick start
 
@@ -116,6 +117,8 @@ kubectl apply -f deploy/kubernetes/daemonset.yaml
 ```
 
 The DaemonSet runs one plexd pod on every node, including control plane nodes.
+
+Its `securityContext` drops all capabilities and adds back `NET_ADMIN` and `NET_RAW`. Both are required: `NET_ADMIN` for the WireGuard interface and for the nftables chain that carries the deny-by-default policy baseline, `NET_RAW` for the ICMP probes behind `diagnostics.ping_peer`. A PodSecurityPolicy, admission webhook, or Pod Security Standard that removes `NET_ADMIN` makes plexd exit at startup rather than join the mesh unfiltered — see [Missing NET_ADMIN](#missing-net-admin).
 
 Verify rollout:
 
@@ -313,6 +316,36 @@ Common causes:
 - **Missing bootstrap token**: The `plexd-bootstrap` secret does not exist or the `token` key is missing
 - **Control plane unreachable**: The node cannot reach the Plexsphere API. Check network policies and firewall rules
 - **Invalid token**: The bootstrap token is expired or malformed
+- **Missing `NET_ADMIN`**: See below
+
+### Missing NET_ADMIN
+
+A pod whose container lost `NET_ADMIN` exits before it registers, with:
+
+```
+plexd up: firewall baseline pre-flight: policy enforcement needs CAP_NET_ADMIN,
+grant it to the container or set policy.enabled: false to run this node without
+enforcement: policy: preflight: policy: nftables: probe: netlink receive:
+operation not permitted
+```
+
+The check runs before registration on purpose: it consumes a one-shot bootstrap token and allocates a node upstream, so a pod that can never install the firewall baseline must not claim an identity it will never use. Nothing was spent — fix the capability and the same token still works.
+
+Confirm what the container actually got:
+
+```sh
+kubectl get pod -n plexd-system <pod-name> \
+  -o jsonpath='{.spec.containers[0].securityContext.capabilities}'
+```
+
+If `NET_ADMIN` is absent from `add`, something between the manifest and the kubelet removed it — a mutating admission webhook, a Pod Security Standard, or an edited manifest. Restore it in the DaemonSet's `securityContext`, or, for a node that is not meant to enforce policy at all, disable enforcement explicitly in the ConfigMap:
+
+```yaml
+policy:
+  enabled: false
+```
+
+That is a deliberate downgrade: the node joins the mesh with no plexd firewall chain. plexd will not make that choice on its own — a node told to enforce that cannot enforce fails closed.
 
 ### CRD not updating
 

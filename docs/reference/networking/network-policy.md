@@ -41,28 +41,31 @@ The merged policy flows from the control plane via `NodeStateSnapshot.Policy`. T
 
 | Field       | Type     | Default          | Description                              |
 |-------------|----------|------------------|------------------------------------------|
-| `Enabled`   | `bool`   | `true`           | Whether policy enforcement is active     |
+| `Enabled`   | `*bool`  | `true` (nil)     | Whether policy enforcement is active     |
 | `ChainName` | `string` | `plexd-mesh`   | iptables chain name for firewall rules   |
 
 ```go
 cfg := policy.Config{}
-cfg.ApplyDefaults() // Enabled=true, ChainName="plexd-mesh"
+cfg.ApplyDefaults()  // ChainName="plexd-mesh"; Enabled stays nil
+cfg.IsEnabled()      // true
 if err := cfg.Validate(); err != nil {
     log.Fatal(err)
 }
 ```
 
-### Default Heuristic
+### Enabled Is a Pointer
 
-`ApplyDefaults` uses zero-value detection: on a fully zero-valued `Config`, `Enabled` is set to `true`. If `ChainName` is already set (indicating explicit construction), `Enabled` is left as-is. This allows `Config{Enabled: false}` to disable enforcement after `ApplyDefaults`.
+`Enabled` is a `*bool` and `ApplyDefaults` never writes to it: `nil` means unset, which `IsEnabled()` reads as enabled. Read the effective setting through `IsEnabled()`, never through the field.
+
+The pointer is what keeps an operator's `enabled: false` distinguishable from an omitted key. Enforcement is the deny-by-default posture and a node that cannot install it aborts startup, so `enabled: false` is the only way to run a node without it — and defaulting a `false` back to `true` would swallow exactly that instruction.
 
 ### Validation Rules
 
-| Field       | Rule                              | Error Message                                              |
-|-------------|-----------------------------------|------------------------------------------------------------|
-| `ChainName` | Must not be empty when `Enabled`  | `policy: config: ChainName must not be empty when enabled` |
+| Field       | Rule                                | Error Message                                              |
+|-------------|-------------------------------------|------------------------------------------------------------|
+| `ChainName` | Must not be empty when `IsEnabled()`| `policy: config: ChainName must not be empty when enabled` |
 
-Validation is skipped entirely when `Enabled` is `false`.
+Validation is skipped entirely when enforcement is disabled.
 
 ## FirewallRule
 
@@ -159,25 +162,35 @@ func NewEnforcer(
 
 | Method              | Signature                                                     | Description                                                        |
 |---------------------|---------------------------------------------------------------|-------------------------------------------------------------------|
+| `Preflight`         | `() error`                                                    | Probes the firewall backend without changing kernel state; no-op when disabled or nil firewall |
 | `ApplyFirewallRules` | `(policy *api.PolicySnapshot, iface string) (bool, error)`   | Builds and applies rules; no-op when disabled or nil firewall. A `nil` policy yields the default-deny-only ruleset. The `bool` reports whether the ruleset actually reached the kernel |
 | `Teardown`          | `() error`                                                    | Flushes and deletes firewall chain; safe with nil firewall        |
 
 The `bool` exists so callers cannot log an enforcement that never happened: both no-op paths return `(false, nil)`, which is indistinguishable from a successful apply on the error value alone.
 
+### Preflight
+
+`plexd up` calls `Preflight` before it registers, and aborts startup on an error.
+
+The check exists because the baseline install is fatal but happens *after* registration, which spends a one-shot bootstrap token and persists the identity the control plane hands back. Without it, a node that can never install a chain claims an identity it will never use and then crash-loops on the same step; where `data_dir` is ephemeral, the restart has neither an identity to reload nor an unspent token to register with.
+
+`Preflight` mirrors the no-op paths of `ApplyFirewallRules` exactly — with enforcement disabled or no backend compiled in there is no enforcement to be unable to perform — and it never mutates kernel state, so a node that goes on to fail startup for another reason leaves nothing behind.
+
 ### Behavior by State
 
-| `Enabled` | `firewall` | `ApplyFirewallRules` | `Teardown`          |
-|-----------|------------|----------------------|---------------------|
-| `true`    | non-nil    | Rules applied, `(true, nil)`  | Chain removed       |
-| `true`    | `nil`      | No-op, `(false, nil)`         | No-op               |
-| `false`   | any        | No-op, `(false, nil)`         | No-op/chain removed |
+| `IsEnabled()` | `firewall` | `Preflight`                  | `ApplyFirewallRules`          | `Teardown`          |
+|---------------|------------|------------------------------|-------------------------------|---------------------|
+| `true`        | non-nil    | Backend probed               | Rules applied, `(true, nil)`  | Chain removed       |
+| `true`        | `nil`      | No-op, `nil`                 | No-op, `(false, nil)`         | No-op               |
+| `false`       | any        | No-op, `nil`                 | No-op, `(false, nil)`         | No-op/chain removed |
 
 ### Error Prefixes
 
-| Method              | Prefix              |
-|---------------------|---------------------|
-| `ApplyFirewallRules`| `policy: enforce: ` |
-| `Teardown`          | `policy: teardown: `|
+| Method              | Prefix               |
+|---------------------|----------------------|
+| `Preflight`         | `policy: preflight: `|
+| `ApplyFirewallRules`| `policy: enforce: `  |
+| `Teardown`          | `policy: teardown: ` |
 
 A ruleset the engine refuses to translate is additionally wrapped in the sentinel `ErrInvalidRuleset`, so callers can distinguish a permanently broken revision (`errors.Is(err, policy.ErrInvalidRuleset)`) from a transient netlink failure. The backend is never touched in that case — the previously installed chain stays in place.
 
