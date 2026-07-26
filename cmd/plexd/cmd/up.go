@@ -1251,6 +1251,40 @@ func applyEnvOverrides(cfg *agent.AgentConfig) {
 	if v := os.Getenv("PLEXD_NODE_API_HTTP_LISTEN"); v != "" {
 		cfg.NodeAPI.HTTPListen = v
 	}
+	if v := os.Getenv("PLEXD_POLICY_ENABLED"); v != "" {
+		// Parsed like PLEXD_ACTIONS_ENABLED rather than compared against
+		// "true"/"1": on the file-less path this is the only way to reach the
+		// opt-out that keeps a container without CAP_NET_ADMIN from aborting on
+		// the pre-flight, so a "True" rendered from a values file must not read
+		// as an enable that changes nothing. An unparseable value leaves the
+		// deny-by-default posture standing and says so — the safe direction, and
+		// the opposite of what a bare == "false" comparison would do to a typo.
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			slog.Warn("invalid PLEXD_POLICY_ENABLED, leaving policy.enabled unchanged", "value", v)
+		} else {
+			cfg.Policy.Enabled = &enabled
+		}
+	}
+	if v := os.Getenv("PLEXD_HEALTH_ENABLED"); v != "" {
+		// Same tri-state parsing, and the same reason to prefer leaving the
+		// setting alone: an unparseable value that disabled the listener would
+		// unbind the probe target, and the kubelet answers that with a restart
+		// loop that tears down the data plane on every pass.
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			slog.Warn("invalid PLEXD_HEALTH_ENABLED, leaving health.enabled unchanged", "value", v)
+		} else {
+			cfg.Health.Enabled = &enabled
+		}
+	}
+	if v := os.Getenv("PLEXD_HEALTH_LISTEN"); v != "" {
+		// Verbatim, like PLEXD_NODE_API_HTTP_LISTEN: an address the kernel
+		// refuses surfaces through the bind error in runUp, which names the
+		// address and the likely cause, rather than through a second syntax
+		// check here that would only restate it earlier.
+		cfg.Health.Listen = v
+	}
 }
 
 func setupLogger(level string) *slog.Logger {

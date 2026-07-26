@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/health"
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
 	"github.com/plexsphere/plexd/internal/policy"
@@ -393,6 +395,172 @@ func TestApplyEnvOverrides_ActionsEnabled(t *testing.T) {
 	})
 }
 
+// TestApplyEnvOverrides_PolicyEnabled covers the override that lets a container
+// which cannot program nftables start at all: with enforcement on, `plexd up`
+// aborts on the firewall pre-flight, and without a config file this variable is
+// the only way to reach the opt-out. The stakes run both ways — a value misread
+// as a disable drops the deny-by-default posture on a node that could enforce,
+// and a value misread as an enable strands a node that cannot.
+func TestApplyEnvOverrides_PolicyEnabled(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		// want is the effective setting after the override is applied on top of
+		// a zero-valued policy block, where nil already reads as enabled.
+		want bool
+	}{
+		{"true", "true", true},
+		{"True", "True", true},
+		{"TRUE", "TRUE", true},
+		{"1", "1", true},
+		{"t", "t", true},
+		{"false", "false", false},
+		{"False", "False", false},
+		{"FALSE", "FALSE", false},
+		{"0", "0", false},
+		{"f", "f", false},
+		// Not a bool: the default stands, and the operator gets a warning
+		// rather than a silently unenforced node.
+		{"yes", "yes", true},
+		{"off", "off", true},
+		{"empty value is inert", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PLEXD_POLICY_ENABLED", tt.value)
+
+			cfg := agent.AgentConfig{}
+			applyEnvOverrides(&cfg)
+
+			if got := cfg.Policy.IsEnabled(); got != tt.want {
+				t.Errorf("Policy.IsEnabled() for %q = %v, want %v", tt.value, got, tt.want)
+			}
+		})
+	}
+
+	// The mirror case, and the one that costs a node its startup: an
+	// unparseable value must not re-enable enforcement on a config that turned
+	// it off, because that node fails the pre-flight and never comes up.
+	t.Run("unparseable leaves a disabled config alone", func(t *testing.T) {
+		t.Setenv("PLEXD_POLICY_ENABLED", "yes")
+
+		disabled := false
+		cfg := agent.AgentConfig{}
+		cfg.Policy.Enabled = &disabled
+		applyEnvOverrides(&cfg)
+
+		if cfg.Policy.IsEnabled() {
+			t.Error("Policy.IsEnabled() = true, want false: an unparseable value must not re-enable enforcement")
+		}
+	})
+
+	t.Run("unset leaves the config untouched", func(t *testing.T) {
+		t.Setenv("PLEXD_POLICY_ENABLED", "")
+
+		cfg := agent.AgentConfig{}
+		applyEnvOverrides(&cfg)
+
+		if cfg.Policy != (policy.Config{}) {
+			t.Errorf("Policy = %+v, want zero value", cfg.Policy)
+		}
+	})
+}
+
+// TestApplyEnvOverrides_Health covers the two health overrides. health.listen
+// is the one a Pod-network deployment needs: the kubelet dials the Pod IP, and
+// the loopback default answers nothing there, so without this variable a
+// file-less Deployment cannot be probed at all.
+func TestApplyEnvOverrides_Health(t *testing.T) {
+	t.Run("listen is applied verbatim", func(t *testing.T) {
+		t.Setenv("PLEXD_HEALTH_ENABLED", "")
+		t.Setenv("PLEXD_HEALTH_LISTEN", "0.0.0.0:9101")
+
+		cfg := agent.AgentConfig{}
+		applyEnvOverrides(&cfg)
+
+		if cfg.Health.Listen != "0.0.0.0:9101" {
+			t.Errorf("Health.Listen = %q, want %q", cfg.Health.Listen, "0.0.0.0:9101")
+		}
+	})
+
+	// No syntax check runs here on purpose: an address the kernel refuses has
+	// to reach the bind error in runUp, which names the address and the port
+	// collision that is the likely cause on a host-networked node.
+	t.Run("an unbindable listen value is passed through", func(t *testing.T) {
+		t.Setenv("PLEXD_HEALTH_ENABLED", "")
+		t.Setenv("PLEXD_HEALTH_LISTEN", "not-an-address")
+
+		cfg := agent.AgentConfig{}
+		applyEnvOverrides(&cfg)
+
+		if cfg.Health.Listen != "not-an-address" {
+			t.Errorf("Health.Listen = %q, want the value passed through unvalidated", cfg.Health.Listen)
+		}
+		if err := cfg.Health.Validate(); err != nil {
+			t.Errorf("Health.Validate() = %v, want nil: the address is checked at bind time, not here", err)
+		}
+	})
+
+	t.Run("enabled coercion", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			value string
+			want  bool
+		}{
+			{"true", "true", true},
+			{"1", "1", true},
+			{"false", "false", false},
+			{"False", "False", false},
+			{"0", "0", false},
+			// Not a bool: the listener stays on. Disabling it on a typo would
+			// unbind the probe target, and the kubelet answers an unbound
+			// probe target with a restart loop that tears down the data plane
+			// on every pass.
+			{"yes", "yes", true},
+			{"empty value is inert", "", true},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Setenv("PLEXD_HEALTH_ENABLED", tt.value)
+				t.Setenv("PLEXD_HEALTH_LISTEN", "")
+
+				cfg := agent.AgentConfig{}
+				applyEnvOverrides(&cfg)
+
+				if got := cfg.Health.IsEnabled(); got != tt.want {
+					t.Errorf("Health.IsEnabled() for %q = %v, want %v", tt.value, got, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("unparseable leaves a disabled config alone", func(t *testing.T) {
+		t.Setenv("PLEXD_HEALTH_ENABLED", "yes")
+		t.Setenv("PLEXD_HEALTH_LISTEN", "")
+
+		disabled := false
+		cfg := agent.AgentConfig{}
+		cfg.Health.Enabled = &disabled
+		applyEnvOverrides(&cfg)
+
+		if cfg.Health.IsEnabled() {
+			t.Error("Health.IsEnabled() = true, want false: an unparseable value must not re-enable the listener")
+		}
+	})
+
+	t.Run("unset leaves the config untouched", func(t *testing.T) {
+		t.Setenv("PLEXD_HEALTH_ENABLED", "")
+		t.Setenv("PLEXD_HEALTH_LISTEN", "")
+
+		cfg := agent.AgentConfig{}
+		applyEnvOverrides(&cfg)
+
+		if cfg.Health != (health.Config{}) {
+			t.Errorf("Health = %+v, want zero value", cfg.Health)
+		}
+	})
+}
+
 // failingFirewallController fails its pre-flight probe. Every other method
 // panics: a failed pre-flight must abort startup before anything reaches the
 // firewall, and a node running with enforcement disabled must not touch it
@@ -436,6 +604,15 @@ func countingControlPlane(t *testing.T) (baseURL string, requests *atomic.Int32)
 // listener is off so the test does not bind the node's health port.
 func writeUpConfig(t *testing.T, apiBase, policyBlock string) {
 	t.Helper()
+
+	// The two blocks this helper pins in the file are also reachable from the
+	// environment, so an ambient PLEXD_POLICY_ENABLED or PLEXD_HEALTH_* would
+	// override what the config says and quietly change what the test exercises.
+	// A caller that wants one of them sets it after this call: t.Setenv cleanup
+	// is LIFO, so the later value wins and both are still restored.
+	t.Setenv("PLEXD_POLICY_ENABLED", "")
+	t.Setenv("PLEXD_HEALTH_ENABLED", "")
+	t.Setenv("PLEXD_HEALTH_LISTEN", "")
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
@@ -524,5 +701,193 @@ func TestRunUp_PolicyDisabledSkipsPreflight(t *testing.T) {
 	}
 	if requests.Load() == 0 {
 		t.Error("control plane received no requests, want the registration attempt")
+	}
+}
+
+// The same opt-out, reached from the environment instead of the file. This is
+// the path a restricted container takes: the ConfigMap is mounted optional and
+// absent, so the policy block defaults to enabled and the pre-flight is fatal
+// — PLEXD_POLICY_ENABLED=false is the only thing standing between that node and
+// a crash loop. Proven through runUp rather than applyEnvOverrides alone,
+// because the override has to survive the merge and land in the config the
+// enforcer is built from.
+func TestRunUp_PolicyDisabledFromEnvSkipsPreflight(t *testing.T) {
+	apiBase, requests := countingControlPlane(t)
+	useFirewallController(t, &failingFirewallController{err: errors.New("operation not permitted")})
+	// No policy block: the file leaves enforcement at its default of on, so the
+	// environment is what turns it off.
+	writeUpConfig(t, apiBase, "")
+	t.Setenv("PLEXD_POLICY_ENABLED", "false")
+
+	err := runUp(upCmd, nil)
+	if err == nil {
+		t.Fatal("runUp() = nil, want the registration failure")
+	}
+	if strings.Contains(err.Error(), "pre-flight") {
+		t.Fatalf("runUp() error = %v, want PLEXD_POLICY_ENABLED=false to make the pre-flight a no-op", err)
+	}
+	if !strings.Contains(err.Error(), "registration") {
+		t.Fatalf("runUp() error = %v, want the registration failure", err)
+	}
+	if requests.Load() == 0 {
+		t.Error("control plane received no requests, want the registration attempt")
+	}
+}
+
+// The control case for the test above: without the variable, the identical
+// file-and-backend combination aborts on the pre-flight. Without this, a bug
+// that disabled enforcement unconditionally would leave both tests green.
+func TestRunUp_PolicyEnvUnsetKeepsPreflightFatal(t *testing.T) {
+	apiBase, requests := countingControlPlane(t)
+	probeErr := errors.New("operation not permitted")
+	useFirewallController(t, &failingFirewallController{err: probeErr})
+	writeUpConfig(t, apiBase, "")
+
+	err := runUp(upCmd, nil)
+	if err == nil {
+		t.Fatal("runUp() = nil, want the pre-flight failure")
+	}
+	if !errors.Is(err, probeErr) {
+		t.Errorf("error does not wrap the probe failure: %v", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Errorf("control plane received %d requests, want 0 (the pre-flight must abort first)", got)
+	}
+}
+
+// A file that says one thing and an environment that says the other: the
+// environment wins, in both directions. The precedence is what the shipped
+// DaemonSet depends on staying predictable — its ConfigMap keeps working
+// because nothing sets these variables, not because the file outranks them.
+func TestRunUp_PolicyEnvOverridesFile(t *testing.T) {
+	t.Run("env false beats file true", func(t *testing.T) {
+		apiBase, requests := countingControlPlane(t)
+		useFirewallController(t, &failingFirewallController{err: errors.New("operation not permitted")})
+		writeUpConfig(t, apiBase, "policy:\n  enabled: true\n")
+		t.Setenv("PLEXD_POLICY_ENABLED", "false")
+
+		err := runUp(upCmd, nil)
+		if err == nil || strings.Contains(err.Error(), "pre-flight") {
+			t.Fatalf("runUp() error = %v, want the environment's false to win over the file's true", err)
+		}
+		if requests.Load() == 0 {
+			t.Error("control plane received no requests, want the registration attempt")
+		}
+	})
+
+	t.Run("env true beats file false", func(t *testing.T) {
+		apiBase, _ := countingControlPlane(t)
+		probeErr := errors.New("operation not permitted")
+		useFirewallController(t, &failingFirewallController{err: probeErr})
+		writeUpConfig(t, apiBase, "policy:\n  enabled: false\n")
+		t.Setenv("PLEXD_POLICY_ENABLED", "true")
+
+		err := runUp(upCmd, nil)
+		if err == nil || !errors.Is(err, probeErr) {
+			t.Fatalf("runUp() error = %v, want the environment's true to win and the pre-flight to run", err)
+		}
+	})
+}
+
+// freePort returns a port nothing is listening on, by taking one from the
+// kernel and handing it straight back. A test that needs to reach the health
+// listener has to know its address in advance, and health.Listen offers no way
+// to report the port it settled on.
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatalf("release the reserved port: %v", err)
+	}
+	return port
+}
+
+// PLEXD_HEALTH_LISTEN has to reach the socket that actually binds, not just the
+// config struct — the point of the variable is that a probe can reach the
+// listener, and only a served response proves that. The file here says the
+// listener is off, so a 200 also proves PLEXD_HEALTH_ENABLED turned it back on:
+// the two variables together are the whole file-less arrangement.
+//
+// The address is a loopback port rather than the 0.0.0.0 a Pod-network
+// Deployment would use — a wildcard bind in a test claims a port on every
+// interface of whatever machine runs it. What that costs is coverage of the
+// wildcard itself, which is a kernel behaviour, not a plexd one; what is under
+// test is that the address plexd binds is the one the environment named.
+func TestRunUp_HealthListenFromEnvIsServed(t *testing.T) {
+	// A control plane that holds its first request open, so registration is
+	// still in flight while the probe runs. The health listener starts before
+	// registration precisely so a probe during a slow one gets an answer, and
+	// that is the window this test occupies.
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	useFirewallController(t, &failingFirewallController{err: errors.New("operation not permitted")})
+	writeUpConfig(t, srv.URL, "policy:\n  enabled: false\n")
+	addr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	t.Setenv("PLEXD_HEALTH_ENABLED", "true")
+	t.Setenv("PLEXD_HEALTH_LISTEN", addr)
+
+	upErr := make(chan error, 1)
+	go func() { upErr <- runUp(upCmd, nil) }()
+	// Whatever the probe finds, registration has to be let go or runUp never
+	// returns and the goroutine outlives the test.
+	defer func() {
+		close(release)
+		if err := <-upErr; err == nil {
+			t.Error("runUp() = nil, want the registration failure")
+		} else if strings.Contains(err.Error(), "health listener cannot bind") {
+			t.Errorf("runUp() error = %v, want %s to bind", err, addr)
+		}
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		resp, err := http.Get("http://" + addr + "/healthz")
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("GET %s/healthz = %d, want 200", addr, resp.StatusCode)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("GET %s/healthz never succeeded: %v", addr, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The failure mode the variable is verbatim for: an address the kernel refuses
+// surfaces through the bind error, which names the address, rather than
+// through a validation path that would have to guess at the cause.
+func TestRunUp_HealthListenFromEnvSurfacesBindError(t *testing.T) {
+	apiBase, requests := countingControlPlane(t)
+	useFirewallController(t, &failingFirewallController{err: errors.New("operation not permitted")})
+	writeUpConfig(t, apiBase, "policy:\n  enabled: false\n")
+	t.Setenv("PLEXD_HEALTH_ENABLED", "true")
+	t.Setenv("PLEXD_HEALTH_LISTEN", "not-an-address")
+
+	err := runUp(upCmd, nil)
+	if err == nil {
+		t.Fatal("runUp() = nil, want the bind failure")
+	}
+	if !strings.Contains(err.Error(), "health listener cannot bind") {
+		t.Fatalf("runUp() error = %v, want the bind error", err)
+	}
+	if !strings.Contains(err.Error(), "not-an-address") {
+		t.Errorf("error %q does not name the rejected address", err.Error())
+	}
+	// The listener starts before registration, so a bad address must not have
+	// spent the bootstrap token on the way to failing.
+	if got := requests.Load(); got != 0 {
+		t.Errorf("control plane received %d requests, want 0", got)
 	}
 }
