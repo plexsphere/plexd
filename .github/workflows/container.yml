@@ -35,6 +35,7 @@ jobs:
           images: ghcr.io/plexsphere/plexd
           tags: |
             type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=dev,enable={{is_default_branch}}
