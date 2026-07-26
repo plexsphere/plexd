@@ -18,6 +18,21 @@ curl -fsSL https://get.plexsphere.com/plexd | sh
 docker pull ghcr.io/plexsphere/plexd:latest
 ```
 
+Every release publishes the same multi-arch image under several tags, so you can pin at whatever
+granularity you want:
+
+| Tag              | Example  | Moves                                          |
+|------------------|----------|------------------------------------------------|
+| `v<version>`     | `v0.2.0` | Never — the release version, spelled as the git tag and the GitHub release name |
+| `<version>`      | `0.2.0`  | Never — the same image, without the `v` prefix |
+| `<major>.<minor>`| `0.2`    | With each patch release in that minor series   |
+| `<major>`        | `0`      | With each release in that major series         |
+| `latest`         |          | With each release                              |
+| `dev`            |          | With each push to `main` — unreleased, not for production |
+
+`v<version>` and `<version>` point at the same manifest digest; pick the spelling that matches how
+you record versions elsewhere.
+
 ### OpenWRT
 
 No opkg package yet - download the release binary for your package

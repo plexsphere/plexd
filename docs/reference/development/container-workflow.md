@@ -73,12 +73,15 @@ The metadata step (id: `meta`) configures image name and tag rules:
 | Trigger            | Tag Rule                                  | Example Input | Example Tags                  |
 |--------------------|-------------------------------------------|---------------|-------------------------------|
 | Tag push `v1.2.3`  | `type=semver,pattern={{version}}`          | `v1.2.3`      | `1.2.3`                       |
+| Tag push `v1.2.3`  | `type=semver,pattern=v{{version}}`         | `v1.2.3`      | `v1.2.3`                      |
 | Tag push `v1.2.3`  | `type=semver,pattern={{major}}.{{minor}}`  | `v1.2.3`      | `1.2`                         |
 | Tag push `v1.2.3`  | `type=semver,pattern={{major}}`            | `v1.2.3`      | `1`                           |
 | Tag push `v1.2.3`  | (automatic)                               | `v1.2.3`      | `latest`                      |
 | Main push          | `type=raw,value=dev,enable={{is_default_branch}}` | (any)  | `dev`                         |
 
 For non-prerelease semver tags, `metadata-action` automatically adds a `latest` tag (default behavior). Main-branch pushes produce only the `dev` tag — no semver tags and no `latest`.
+
+The `{{version}}` placeholder emits the *parsed* semantic version, which drops the leading `v` by definition, so `v{{version}}` is spelled out separately to publish the release version verbatim. Both patterns resolve to the same manifest — the git tag, the GitHub release name, and `ghcr.io/plexsphere/plexd:v1.2.3` are one spelling, and a consumer that records the release version and builds an image reference from it gets a pullable one. The bare-semver forms are unaffected; this is an alias, not a replacement.
 :::
 
 ## Build Arguments
