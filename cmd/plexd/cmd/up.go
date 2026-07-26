@@ -48,6 +48,18 @@ const drainTimeout = 30 * time.Second
 // teardown can hold up the drain.
 const sessionEndedReportTimeout = 2 * time.Second
 
+// policyCapabilityHint is carried by both firewall-baseline failures. The kernel
+// reports a dropped capability as a bare EPERM on a netlink call, which names
+// neither what the process is missing nor the setting that turns the whole path
+// off — so the operator's two next steps go in the message rather than in the
+// source.
+const policyCapabilityHint = "policy enforcement needs CAP_NET_ADMIN, " +
+	"grant it to the container or set policy.enabled: false to run this node without enforcement"
+
+// firewallController indirects the platform-specific constructor so tests can
+// drive the pre-flight path without depending on the host's netfilter state.
+var firewallController = newFirewallController
+
 var upCmd = &cobra.Command{
 	Use:   "up",
 	Short: "Start the plexd agent",
@@ -88,6 +100,27 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		"mode", cfg.Mode,
 		"actions_enabled", cfg.Actions.IsEnabled(),
 	)
+
+	// 2a. Build the policy enforcer and pre-flight its firewall backend before
+	// anything reaches the control plane. Installing the deny-by-default
+	// baseline is fatal (step 5c) but happens after registration, which spends a
+	// one-shot bootstrap token and persists the identity the control plane hands
+	// back — so without this check a node that can never install a chain claims
+	// an identity it will never use, and then crash-loops on the same step
+	// forever. Where data_dir is ephemeral (a Pod without a persistent volume, a
+	// fresh VM image) the restart has no identity to reload and no unspent token
+	// to register with either, which strands the deployment until an operator
+	// issues a new one.
+	//
+	// The probe changes no kernel state and is a no-op whenever the baseline
+	// install would be one, so this is an early exit for the fatal case only —
+	// the enforcement itself stays where it was.
+	policyEngine := policy.NewPolicyEngine(logger)
+	fwCtrl := firewallController(logger)
+	enforcer := policy.NewEnforcer(policyEngine, fwCtrl, cfg.Policy, logger)
+	if err := enforcer.Preflight(); err != nil {
+		return fmt.Errorf("plexd up: firewall baseline pre-flight: %s: %w", policyCapabilityHint, err)
+	}
 
 	// 3. Create control plane client.
 	client, err := api.NewControlPlane(cfg.API, buildVersion, logger)
@@ -185,12 +218,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	natDiscoverer := nat.NewDiscoverer(stunClient, cfg.NAT, cfg.WireGuard.ListenPort, logger)
 	exchanger := peerexchange.NewExchanger(natDiscoverer, client, cfg.PeerExchange, logger)
 
-	// 5c. Initialize network policy engine.
-	policyEngine := policy.NewPolicyEngine(logger)
-	fwCtrl := newFirewallController(logger)
-	enforcer := policy.NewEnforcer(policyEngine, fwCtrl, cfg.Policy, logger)
-
-	// Install the deny-by-default baseline immediately, independent of the
+	// 5c. Install the deny-by-default baseline immediately, independent of the
 	// reconcile diff. A nil policy yields a default-deny-only ruleset, so the
 	// node is never left unfiltered while waiting for the control plane to
 	// publish its first policy revision (the differ short-circuits when both
@@ -203,8 +231,13 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// and no-backend cases are no-ops that return nil — so continuing here
 	// would bring up WireGuard and join the mesh with no chain installed,
 	// exactly the unfiltered state this call exists to prevent.
+	//
+	// The pre-flight probe in step 2a already cleared the backend, so reaching
+	// this failure means the capability was lost between the two calls or the
+	// chain itself was refused. It carries the same hint regardless: the operator
+	// reading this line has the same two options either way.
 	if _, err := enforcer.ApplyFirewallRules(nil, cfg.WireGuard.InterfaceName); err != nil {
-		return fmt.Errorf("plexd up: install deny-by-default firewall baseline: %w", err)
+		return fmt.Errorf("plexd up: install deny-by-default firewall baseline: %s: %w", policyCapabilityHint, err)
 	}
 
 	// The mesh data plane is complete only here: the interface is up and the

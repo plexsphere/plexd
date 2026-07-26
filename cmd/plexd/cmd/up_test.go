@@ -5,9 +5,16 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +22,7 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
+	"github.com/plexsphere/plexd/internal/policy"
 )
 
 // TestRedactSensitiveLine_SecretKey verifies that the existing redaction logic
@@ -383,4 +391,138 @@ func TestApplyEnvOverrides_ActionsEnabled(t *testing.T) {
 			t.Error("Actions.IsEnabled() = false, want true: an unparseable value must not disable execution")
 		}
 	})
+}
+
+// failingFirewallController fails its pre-flight probe. Every other method
+// panics: a failed pre-flight must abort startup before anything reaches the
+// firewall, and a node running with enforcement disabled must not touch it
+// either.
+type failingFirewallController struct{ err error }
+
+func (f *failingFirewallController) Probe() error { return f.err }
+
+func (f *failingFirewallController) EnsureChain(string) error {
+	panic("EnsureChain called without a passing pre-flight probe")
+}
+
+func (f *failingFirewallController) ApplyRules(string, []policy.FirewallRule) error {
+	panic("ApplyRules called without a passing pre-flight probe")
+}
+
+func (f *failingFirewallController) FlushChain(string) error {
+	panic("FlushChain called without a passing pre-flight probe")
+}
+
+func (f *failingFirewallController) DeleteChain(string) error {
+	panic("DeleteChain called without a passing pre-flight probe")
+}
+
+// countingControlPlane starts a control plane that records every request it
+// receives and rejects each one permanently, so a registration attempt fails on
+// its first try instead of retrying into the test's deadline.
+func countingControlPlane(t *testing.T) (baseURL string, requests *atomic.Int32) {
+	t.Helper()
+	requests = &atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, requests
+}
+
+// writeUpConfig writes a config file that validates and points at apiBase,
+// with policyBlock appended verbatim, and makes runUp read it. The health
+// listener is off so the test does not bind the node's health port.
+func writeUpConfig(t *testing.T, apiBase, policyBlock string) {
+	t.Helper()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := fmt.Sprintf(`mode: node
+data_dir: %s
+log_level: error
+api:
+  base_url: %s
+registration:
+  project_id: 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0
+  resource_handle: preflight-test
+  token_value: psb_test_preflight_token
+  max_retry_duration: 1s
+health:
+  enabled: false
+%s`, dir, apiBase, policyBlock)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	oldCfgFile, oldAPIURL, oldMode, oldLogLevel := cfgFile, apiURL, mode, logLevel
+	oldProject, oldHandle, oldResourceID := projectID, resourceHandle, requestedResourceID
+	t.Cleanup(func() {
+		cfgFile, apiURL, mode, logLevel = oldCfgFile, oldAPIURL, oldMode, oldLogLevel
+		projectID, resourceHandle, requestedResourceID = oldProject, oldHandle, oldResourceID
+	})
+	cfgFile, apiURL, mode, logLevel = path, "", "", ""
+	projectID, resourceHandle, requestedResourceID = "", "", ""
+}
+
+// useFirewallController points runUp's platform seam at ctrl for one test.
+func useFirewallController(t *testing.T, ctrl policy.FirewallController) {
+	t.Helper()
+	old := firewallController
+	t.Cleanup(func() { firewallController = old })
+	firewallController = func(*slog.Logger) policy.FirewallController { return ctrl }
+}
+
+// A node that cannot install the deny-by-default baseline has to fail before it
+// registers: registration spends a one-shot bootstrap token and creates an
+// upstream identity, and where data_dir is ephemeral neither survives the
+// restart — leaving a node the control plane knows about, a token nobody can
+// reuse, and a container crash-looping on the same fatal step.
+func TestRunUp_PolicyPreflightAbortsBeforeRegistration(t *testing.T) {
+	apiBase, requests := countingControlPlane(t)
+	probeErr := errors.New("operation not permitted")
+	useFirewallController(t, &failingFirewallController{err: probeErr})
+	writeUpConfig(t, apiBase, "policy:\n  chain_name: plexd-mesh\n")
+
+	err := runUp(upCmd, nil)
+	if err == nil {
+		t.Fatal("runUp() = nil, want the pre-flight failure")
+	}
+	if got := requests.Load(); got != 0 {
+		t.Errorf("control plane received %d requests, want 0 (nothing may be spent before the check)", got)
+	}
+	if !errors.Is(err, probeErr) {
+		t.Errorf("error does not wrap the probe failure: %v", err)
+	}
+	// The kernel names neither the capability nor the way out, so the message
+	// has to. Both halves are what the operator reading this line acts on.
+	for _, want := range []string{"CAP_NET_ADMIN", "policy.enabled: false", "operation not permitted"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+// policy.enabled: false is the opt-out the pre-flight failure points at, so it
+// has to survive the config merge and leave the check a no-op — including on a
+// host whose backend would fail the probe.
+func TestRunUp_PolicyDisabledSkipsPreflight(t *testing.T) {
+	apiBase, requests := countingControlPlane(t)
+	useFirewallController(t, &failingFirewallController{err: errors.New("operation not permitted")})
+	writeUpConfig(t, apiBase, "policy:\n  enabled: false\n")
+
+	err := runUp(upCmd, nil)
+	if err == nil {
+		t.Fatal("runUp() = nil, want the registration failure")
+	}
+	if strings.Contains(err.Error(), "pre-flight") {
+		t.Fatalf("runUp() error = %v, want startup to proceed past the pre-flight", err)
+	}
+	if !strings.Contains(err.Error(), "registration") {
+		t.Fatalf("runUp() error = %v, want the registration failure", err)
+	}
+	if requests.Load() == 0 {
+		t.Error("control plane received no requests, want the registration attempt")
+	}
 }
