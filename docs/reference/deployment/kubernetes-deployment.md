@@ -310,7 +310,7 @@ Consumer RBAC roles:
 | `priorityClassName`   | `system-node-critical`         | Ensures scheduling on resource pressure |
 | `tolerations`         | `operator: Exists`             | Run on all nodes including control plane |
 | `readOnlyRootFilesystem` | `true`                      | Security hardening                    |
-| Capabilities          | `NET_ADMIN`, `NET_RAW`         | WireGuard interface management        |
+| Capabilities          | `NET_ADMIN`, `NET_RAW`         | WireGuard interface management and the nftables policy chain. Without `NET_ADMIN`, `plexd up` fails its firewall pre-flight and exits before registering |
 
 ### Environment variables
 
