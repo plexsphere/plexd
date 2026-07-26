@@ -25,6 +25,8 @@ type countingFirewall struct {
 	lastRules   []FirewallRule
 }
 
+func (c *countingFirewall) Probe() error { return nil }
+
 func (c *countingFirewall) EnsureChain(string) error {
 	c.mu.Lock()
 	c.ensureCalls++
@@ -82,7 +84,7 @@ func snapshotWithPolicy(fingerprint string, rules ...api.PolicyRule) *api.NodeSt
 }
 
 func enabledEnforcer(fw FirewallController) *Enforcer {
-	return NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{Enabled: true, ChainName: "TEST"}, testLogger())
+	return NewEnforcer(NewPolicyEngine(testLogger()), fw, Config{Enabled: boolPtr(true), ChainName: "TEST"}, testLogger())
 }
 
 // waitForCondition polls until cond returns true or timeout expires.

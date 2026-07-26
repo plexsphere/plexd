@@ -505,3 +505,38 @@ func TestApplyAndFlushRoundTrip(t *testing.T) {
 		t.Fatalf("FlushChain failed: %v", err)
 	}
 }
+
+func TestProbeErrorPrefix(t *testing.T) {
+	ctrl := NewNftablesController(discardLoggerNft())
+
+	err := ctrl.Probe()
+	if err == nil {
+		// Backend usable — running with CAP_NET_ADMIN on a kernel offering
+		// nf_tables. Nothing to clean up: the probe only reads.
+		return
+	}
+
+	expected := "policy: nftables: probe"
+	if !strings.HasPrefix(err.Error(), expected) {
+		t.Errorf("expected error prefix %q, got %q", expected, err.Error())
+	}
+}
+
+// The pre-flight check is only worth running if its verdict matches the one the
+// baseline install would reach, so assert the two agree on whatever host this
+// runs on — privileged or not.
+func TestProbeAgreesWithEnsureChain(t *testing.T) {
+	ctrl := NewNftablesController(discardLoggerNft())
+	chain := "plexd-test-probe-agree"
+
+	probeErr := ctrl.Probe()
+	ensureErr := ctrl.EnsureChain(chain)
+	if ensureErr == nil {
+		_ = ctrl.FlushChain(chain)
+		_ = ctrl.DeleteChain(chain)
+	}
+
+	if (probeErr == nil) != (ensureErr == nil) {
+		t.Errorf("Probe and EnsureChain disagree: probe = %v, EnsureChain = %v", probeErr, ensureErr)
+	}
+}

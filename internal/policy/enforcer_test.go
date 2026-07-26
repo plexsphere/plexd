@@ -9,6 +9,7 @@ import (
 
 // mockFirewallController records method calls and returns configurable errors.
 type mockFirewallController struct {
+	probeCalls       int
 	ensureChainCalls []string
 	applyRulesCalls  []struct {
 		Chain string
@@ -17,10 +18,16 @@ type mockFirewallController struct {
 	flushChainCalls  []string
 	deleteChainCalls []string
 
+	probeErr       error
 	ensureChainErr error
 	applyRulesErr  error
 	flushChainErr  error
 	deleteChainErr error
+}
+
+func (m *mockFirewallController) Probe() error {
+	m.probeCalls++
+	return m.probeErr
 }
 
 func (m *mockFirewallController) EnsureChain(chain string) error {
@@ -49,7 +56,7 @@ func (m *mockFirewallController) DeleteChain(chain string) error {
 func TestEnforcer_ApplyFirewallRulesDisabled(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
 	mock := &mockFirewallController{}
-	cfg := Config{Enabled: false, ChainName: "TEST"}
+	cfg := Config{Enabled: boolPtr(false), ChainName: "TEST"}
 	enf := NewEnforcer(eng, mock, cfg, testLogger())
 
 	applied, err := enf.ApplyFirewallRules(nil, "wg0")
@@ -66,7 +73,7 @@ func TestEnforcer_ApplyFirewallRulesDisabled(t *testing.T) {
 
 func TestEnforcer_ApplyFirewallRulesNilFirewall(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
-	cfg := Config{Enabled: true, ChainName: "TEST"}
+	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST"}
 	enf := NewEnforcer(eng, nil, cfg, testLogger())
 
 	applied, err := enf.ApplyFirewallRules(nil, "wg0")
@@ -81,7 +88,7 @@ func TestEnforcer_ApplyFirewallRulesNilFirewall(t *testing.T) {
 func TestEnforcer_ApplyFirewallRulesNilPolicyDefaultDeny(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
 	mock := &mockFirewallController{}
-	cfg := Config{Enabled: true, ChainName: "TEST-CHAIN"}
+	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST-CHAIN"}
 	enf := NewEnforcer(eng, mock, cfg, testLogger())
 
 	// A nil policy yields the default-deny-only ruleset.
@@ -104,7 +111,7 @@ func TestEnforcer_ApplyFirewallRulesNilPolicyDefaultDeny(t *testing.T) {
 func TestEnforcer_ApplyFirewallRulesSuccess(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
 	mock := &mockFirewallController{}
-	cfg := Config{Enabled: true, ChainName: "TEST-CHAIN"}
+	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST-CHAIN"}
 	enf := NewEnforcer(eng, mock, cfg, testLogger())
 
 	policy := &api.PolicySnapshot{
@@ -147,7 +154,7 @@ func TestEnforcer_ApplyFirewallRulesEnsureChainError(t *testing.T) {
 	mock := &mockFirewallController{
 		ensureChainErr: errors.New("chain creation failed"),
 	}
-	cfg := Config{Enabled: true, ChainName: "TEST"}
+	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST"}
 	enf := NewEnforcer(eng, mock, cfg, testLogger())
 
 	_, err := enf.ApplyFirewallRules(nil, "wg0")
@@ -168,7 +175,7 @@ func TestEnforcer_ApplyFirewallRulesApplyRulesError(t *testing.T) {
 	mock := &mockFirewallController{
 		applyRulesErr: errors.New("apply failed"),
 	}
-	cfg := Config{Enabled: true, ChainName: "TEST"}
+	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST"}
 	enf := NewEnforcer(eng, mock, cfg, testLogger())
 
 	_, err := enf.ApplyFirewallRules(nil, "wg0")
@@ -187,7 +194,7 @@ func TestEnforcer_ApplyFirewallRulesApplyRulesError(t *testing.T) {
 func TestEnforcer_ApplyFirewallRulesInvalidRuleset(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
 	mock := &mockFirewallController{}
-	cfg := Config{Enabled: true, ChainName: "TEST"}
+	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST"}
 	enf := NewEnforcer(eng, mock, cfg, testLogger())
 
 	policy := &api.PolicySnapshot{
@@ -217,7 +224,7 @@ func TestEnforcer_ApplyFirewallRulesInvalidRuleset(t *testing.T) {
 
 func TestEnforcer_TeardownNilFirewall(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
-	cfg := Config{Enabled: true, ChainName: "TEST"}
+	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST"}
 	enf := NewEnforcer(eng, nil, cfg, testLogger())
 
 	err := enf.Teardown()
@@ -229,7 +236,7 @@ func TestEnforcer_TeardownNilFirewall(t *testing.T) {
 func TestEnforcer_TeardownSuccess(t *testing.T) {
 	eng := NewPolicyEngine(testLogger())
 	mock := &mockFirewallController{}
-	cfg := Config{Enabled: true, ChainName: "TEST-CHAIN"}
+	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST-CHAIN"}
 	enf := NewEnforcer(eng, mock, cfg, testLogger())
 
 	err := enf.Teardown()
@@ -257,7 +264,7 @@ func TestEnforcer_TeardownFlushError(t *testing.T) {
 	mock := &mockFirewallController{
 		flushChainErr: errors.New("flush failed"),
 	}
-	cfg := Config{Enabled: true, ChainName: "TEST"}
+	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST"}
 	enf := NewEnforcer(eng, mock, cfg, testLogger())
 
 	err := enf.Teardown()
@@ -274,5 +281,71 @@ func TestEnforcer_TeardownFlushError(t *testing.T) {
 	// DeleteChain should NOT be called if FlushChain fails.
 	if len(mock.deleteChainCalls) != 0 {
 		t.Errorf("DeleteChain called %d times, want 0 (should not be called after flush error)", len(mock.deleteChainCalls))
+	}
+}
+
+func TestEnforcer_PreflightDisabled(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+	mock := &mockFirewallController{probeErr: errors.New("operation not permitted")}
+	cfg := Config{Enabled: boolPtr(false), ChainName: "TEST"}
+	enf := NewEnforcer(eng, mock, cfg, testLogger())
+
+	if err := enf.Preflight(); err != nil {
+		t.Fatalf("Preflight() error = %v, want nil (enforcement disabled)", err)
+	}
+	// A node that was told not to enforce must start on a host that could not
+	// enforce anyway, so the backend is never asked.
+	if mock.probeCalls != 0 {
+		t.Errorf("Probe called %d times, want 0 (disabled)", mock.probeCalls)
+	}
+}
+
+func TestEnforcer_PreflightNilFirewall(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST"}
+	enf := NewEnforcer(eng, nil, cfg, testLogger())
+
+	if err := enf.Preflight(); err != nil {
+		t.Fatalf("Preflight() error = %v, want nil (no firewall backend)", err)
+	}
+}
+
+func TestEnforcer_PreflightProbeSucceeds(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+	mock := &mockFirewallController{}
+	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST"}
+	enf := NewEnforcer(eng, mock, cfg, testLogger())
+
+	if err := enf.Preflight(); err != nil {
+		t.Fatalf("Preflight() error = %v, want nil", err)
+	}
+	if mock.probeCalls != 1 {
+		t.Errorf("Probe called %d times, want 1", mock.probeCalls)
+	}
+	// The probe must not change kernel state: no chain, no rules.
+	if len(mock.ensureChainCalls) != 0 || len(mock.applyRulesCalls) != 0 {
+		t.Errorf("Preflight mutated the firewall: %d EnsureChain, %d ApplyRules calls",
+			len(mock.ensureChainCalls), len(mock.applyRulesCalls))
+	}
+}
+
+func TestEnforcer_PreflightProbeError(t *testing.T) {
+	eng := NewPolicyEngine(testLogger())
+	mock := &mockFirewallController{
+		probeErr: errors.New("policy: nftables: probe: operation not permitted"),
+	}
+	cfg := Config{Enabled: boolPtr(true), ChainName: "TEST"}
+	enf := NewEnforcer(eng, mock, cfg, testLogger())
+
+	err := enf.Preflight()
+	if err == nil {
+		t.Fatal("Preflight() error = nil, want error")
+	}
+	if !errors.Is(err, mock.probeErr) {
+		t.Errorf("error does not wrap the backend error: %v", err)
+	}
+	want := "policy: preflight: policy: nftables: probe: operation not permitted"
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
 	}
 }

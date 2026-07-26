@@ -27,6 +27,29 @@ func NewNftablesController(logger *slog.Logger) *NftablesController {
 	return &NftablesController{logger: logger}
 }
 
+// Probe reports whether the nftables backend is usable, without changing any
+// kernel state. It dumps the IPv4 table list: nfnetlink gates every message on
+// CAP_NET_ADMIN, dumps included, so a dropped capability or an nf_tables
+// subsystem the kernel does not offer is reported here rather than on the first
+// EnsureChain — which by then has already added a table to its batch.
+//
+// A read is deliberate: the caller runs this before registration, so it must not
+// leave a table behind on a node that goes on to fail startup for another
+// reason.
+func (c *NftablesController) Probe() error {
+	conn, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("policy: nftables: probe: %w", err)
+	}
+
+	if _, err := conn.ListTablesOfFamily(nftables.TableFamilyIPv4); err != nil {
+		return fmt.Errorf("policy: nftables: probe: %w", err)
+	}
+
+	c.logger.Debug("nftables backend probed", "component", "policy")
+	return nil
+}
+
 // EnsureChain creates the named nftables chain if it does not already exist.
 // The chain is created as a base chain with a forward hook in the plexd filter
 // table so that the kernel evaluates its rules for forwarded traffic.

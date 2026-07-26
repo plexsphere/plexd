@@ -41,6 +41,11 @@ func (r *FirewallRule) Validate() error {
 
 // FirewallController abstracts OS-level iptables operations for testability.
 type FirewallController interface {
+	// Probe reports whether the backend is usable, without changing any kernel
+	// state. It must exercise the same privileged path the mutating calls take,
+	// so a missing capability or an unavailable subsystem surfaces here rather
+	// than on the first EnsureChain.
+	Probe() error
 	// EnsureChain creates the named iptables chain if it does not already exist.
 	EnsureChain(chain string) error
 	// ApplyRules replaces all rules in the named chain atomically.
