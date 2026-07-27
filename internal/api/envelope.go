@@ -19,6 +19,12 @@ const (
 	EventPolicyUpdated       = "policy_updated"
 	EventBridgeConfigUpdated = "bridge_config_updated"
 
+	// EventActionRequest exists as a push-latency optimisation: action
+	// dispatches are delivered in the executions block of the state pull, so the
+	// event's payload is opaque and it triggers a reconcile like the rest of the
+	// tier — the resulting pull carries the dispatch.
+	EventActionRequest = "action_request"
+
 	// Documented-coming family: types that land with the platform's 14-type
 	// taxonomy. They are already named so the agent can subscribe to them once
 	// the control plane starts emitting them; every one triggers a reconcile.
@@ -30,10 +36,9 @@ const (
 	EventPeerKeyRotated      = "peer_key_rotated"
 	EventSigningKeyRotated   = "signing_key_rotated"
 
-	// Test-only trio: retained only until the platform taxonomy ships real
+	// Test-only duo: retained only until the platform taxonomy ships real
 	// discriminators. They are injectable exclusively through the mock control
 	// plane in tests; the production control plane never emits them.
-	EventActionRequest   = "action_request"
 	EventSSHSessionSetup = "ssh_session_setup"
 	EventSessionRevoked  = "session_revoked"
 )

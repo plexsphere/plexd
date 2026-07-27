@@ -178,7 +178,7 @@ func TestNoOpVerifier_AcceptsAll(t *testing.T) {
 
 // TestEventTypeConstants locks the wire string of every event-type constant so
 // a rename breaks a test. The three tiers mirror the taxonomy in envelope.go:
-// contract types, the documented-coming family, and the test-only trio.
+// contract types, the documented-coming family, and the test-only duo.
 func TestEventTypeConstants(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -189,6 +189,7 @@ func TestEventTypeConstants(t *testing.T) {
 		{"EventNodeStateUpdated", EventNodeStateUpdated, "node_state_updated"},
 		{"EventPolicyUpdated", EventPolicyUpdated, "policy_updated"},
 		{"EventBridgeConfigUpdated", EventBridgeConfigUpdated, "bridge_config_updated"},
+		{"EventActionRequest", EventActionRequest, "action_request"},
 
 		// Documented-coming family.
 		{"EventPeerRegistered", EventPeerRegistered, "peer_registered"},
@@ -199,8 +200,7 @@ func TestEventTypeConstants(t *testing.T) {
 		{"EventPeerKeyRotated", EventPeerKeyRotated, "peer_key_rotated"},
 		{"EventSigningKeyRotated", EventSigningKeyRotated, "signing_key_rotated"},
 
-		// Test-only trio.
-		{"EventActionRequest", EventActionRequest, "action_request"},
+		// Test-only duo.
 		{"EventSSHSessionSetup", EventSSHSessionSetup, "ssh_session_setup"},
 		{"EventSessionRevoked", EventSessionRevoked, "session_revoked"},
 	}

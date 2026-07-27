@@ -257,23 +257,6 @@ const (
 	ExecutionStatusPending = "pending"
 )
 
-// ActionRequest is the SSE payload for action_request events.
-type ActionRequest struct {
-	ExecutionID string            `json:"execution_id"`
-	Action      string            `json:"action"`
-	Parameters  map[string]string `json:"parameters,omitempty"`
-	Timeout     string            `json:"timeout"`
-	Checksum    string            `json:"checksum,omitempty"`
-	TriggeredBy *TriggeredBy      `json:"triggered_by,omitempty"`
-}
-
-type TriggeredBy struct {
-	Type      string `json:"type"`
-	SessionID string `json:"session_id"`
-	UserID    string `json:"user_id"`
-	Email     string `json:"email"`
-}
-
 // Execution callback statuses a node reports on the v1 execution callback
 // (POST /v1/nodes/{node_id}/executions/{execution_id}).
 const (
