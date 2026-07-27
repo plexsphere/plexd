@@ -10,7 +10,7 @@
 #   - Request body validation (registration token, heartbeat, capabilities)
 #   - Periodic loop verification (heartbeat/metrics/logs counters >= 2)
 #   - Audit forwarding via service restart (ProcessSource fires per-process)
-#   - Action execution via SSE (action_request → ack + result)
+#   - Action execution via the state pull's executions block (ack/started/terminal callbacks)
 #   - SSE event injection triggers reconciliation
 #   - Heartbeat-triggered reconcile via RotateKeys flag
 #   - Deeper body validation (metrics, capabilities fields)
@@ -467,38 +467,78 @@ fi
 
 echo "=== Audit forwarding via restart PASSED ==="
 
-# --- Action execution via SSE injection ---
-echo "=== Testing action execution via SSE ==="
+# --- Action execution from the pull's executions block ---
+echo "=== Testing action execution via the executions block ==="
 
-# Record the execution callback counter (ack -> started -> terminal = +3).
+# Record the execution callback counter BEFORE the dispatch is configured: the
+# nudge below makes the agent pull right away, so a baseline taken afterwards
+# could already have missed the ack. A successful builtin run posts three
+# callbacks in sequence: ack -> started -> succeeded.
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
 CB_BEFORE=$(get_counter "${RESPONSE}" "execution_callback_count")
 echo "  execution_callback_count before: ${CB_BEFORE}"
 
-# Inject an action_request SSE event for the builtin "system.info" action.
-ACTION_PAYLOAD=$(cat <<'ACTEOF'
-{
-    "id": "evt-e2e-action-systemd-001",
-    "type": "action_request",
-    "scope": "node",
-    "payload": {
-        "execution_id": "exec-e2e-systemd-001",
-        "action": "system.info",
-        "timeout": "30s"
-    }
-}
+# Configure a pending builtin dispatch for "system.info". Dispatches ride in the
+# executions block of GET /v1/nodes/{id}/state, and the wire carries NO timeout
+# and NO checksum: the run deadline is the node's own. expires_at is far enough
+# out that the entry is never served as lapsed.
+ACTION_ENTRIES=$(cat <<'ACTEOF'
+[
+  {
+    "execution_id": "exec-e2e-systemd-001",
+    "action": "system.info",
+    "type": "builtin",
+    "parameters": null,
+    "status": "pending",
+    "requested_at": "2026-01-01T00:00:00Z",
+    "expires_at": "2099-01-01T00:00:00Z"
+  }
+]
 ACTEOF
 )
+
+# configure-state REPLACES the whole snapshot fixture, so the block is spliced
+# into the live snapshot and every other block travels back verbatim. Reading
+# the snapshot is a real GET on the state endpoint and therefore increments
+# state_count; the later phases take their state_count baselines after this.
+STATE_SNAPSHOT=$(curl -sf "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null || true)
+if [ -z "${STATE_SNAPSHOT}" ]; then
+    fail "could not read the live node state snapshot"
+fi
+# printf, not echo: the fixture carries backslash escapes (an embedded newline
+# in the certs/ca data entry) that must travel back byte for byte.
+SPLICED_STATE=$(printf '%s' "${STATE_SNAPSHOT}" | jq --argjson e "${ACTION_ENTRIES}" '.executions = $e')
 ACTION_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
     -X POST -H "Content-Type: application/json" \
-    -d "${ACTION_PAYLOAD}" \
-    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    -d "${SPLICED_STATE}" \
+    "http://localhost:18080/test/configure-state" 2>/dev/null || true)
 if [ "${ACTION_STATUS}" != "204" ]; then
-    fail "action_request event injection returned status ${ACTION_STATUS}, want 204"
+    fail "configure-state returned status ${ACTION_STATUS}, want 204"
 fi
-echo "  action_request event injected successfully"
+echo "  system.info dispatch configured in the executions block"
 
-# Poll until execution_callback_count advances by at least 3.
+# Nudge the agent into an immediate pull instead of waiting out the heartbeat
+# reconcile cadence.
+NUDGE_PAYLOAD=$(cat <<'NUDGEEOF'
+{
+    "id": "evt-e2e-nudge-exec-e2e-systemd-001",
+    "type": "node_state_updated",
+    "scope": "node",
+    "payload": {"node_id": "e2e-systemd-node"}
+}
+NUDGEEOF
+)
+NUDGE_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${NUDGE_PAYLOAD}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${NUDGE_STATUS}" != "204" ]; then
+    fail "executions nudge injection returned status ${NUDGE_STATUS}, want 204"
+fi
+echo "  executions nudge injected successfully"
+
+# Poll until execution_callback_count advances by at least 3 (ack + started +
+# terminal).
 ACTION_TIMEOUT=30
 ACTION_ELAPSED=0
 CB_PASSED=0
@@ -544,7 +584,7 @@ else
     fail "terminal callback output.inline is not valid base64"
 fi
 
-echo "=== Action execution via SSE PASSED ==="
+echo "=== Action execution via the executions block PASSED ==="
 
 # --- SSE event injection triggers reconciliation ---
 echo "=== Testing SSE event injection ==="
