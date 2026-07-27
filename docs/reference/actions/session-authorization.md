@@ -4,7 +4,7 @@ title: Session-Based Action Authorization
 
 # Session-Based Action Authorization
 
-Actions triggered via the control plane SSE stream are implicitly authorized. Actions triggered locally via `plexd actions run` in an SSH session require explicit authorization through a session-scoped JWT.
+Actions dispatched by the control plane are implicitly authorized: they arrive in the `executions` block of the node's authenticated state pull, so the control plane has already decided the node may run them. Actions triggered locally via `plexd actions run` in an SSH session require explicit authorization through a session-scoped JWT.
 
 ## Authorization Flow
 
@@ -66,12 +66,16 @@ The JWT is signed with the control plane's Ed25519 key. plexd receives the corre
 
 ## Authorization Tiers
 
-| Trigger | Authentication | Authorization | Audit |
-|---|---|---|---|
-| SSE (control plane) | Authenticated SSE stream | Pre-authorized by control plane | `triggered_by.type: "control_plane"` |
-| SSH via access proxy | `PLEXD_SESSION_TOKEN` (JWT) | Local JWT validation + action scope check | `triggered_by.type: "session"` with user identity |
-| Direct SSH (no token) | No token present | Denied (or control-plane roundtrip if online) | `triggered_by.type: "direct_access"` |
-| Local root access | `--local` flag, root or plexd user only | No scope limit, emergency use | `triggered_by.type: "local_emergency"` |
+| Trigger | Authentication | Authorization |
+|---|---|---|
+| Pull (control plane) | NSK-authenticated state pull | Pre-authorized by the control plane: an entry in the `executions` block *is* the authorization, and the dispatch decision is the control plane's alone |
+| SSH via access proxy | `PLEXD_SESSION_TOKEN` (JWT) | Local JWT validation + action scope check |
+| Direct SSH (no token) | No token present | Denied (or control-plane roundtrip if online) |
+| Local root access | `--local` flag, root or plexd user only | No scope limit, emergency use |
+
+Trigger attribution — who asked for a control-plane execution — lives in the
+control plane's audit trail, not on the node: the pull entry carries no
+requester identity.
 
 ## Token Revocation
 
@@ -86,31 +90,9 @@ When an SSH session ends (disconnect, admin termination, timeout), the control p
 
 plexd adds the `session_id` to a local revocation set (bounded, TTL = maximum token lifetime). Subsequent action requests using a revoked session token are rejected immediately.
 
-## Result Callback with Session Context
-
-Actions triggered from an SSH session include the session context in the result callback:
-
-```json
-{
-  "execution_id": "exec_a1b2c3d4",
-  "status": "success",
-  "exit_code": 0,
-  "stdout": "...",
-  "stderr": "...",
-  "duration": "2.34s",
-  "finished_at": "2025-01-15T10:30:02Z",
-  "triggered_by": {
-    "type": "session",
-    "session_id": "sess_a1b2c3",
-    "user_id": "user_abc123",
-    "email": "admin@example.com"
-  }
-}
-```
-
 ## Local Transport via Unix Socket
 
-The `plexd actions run` CLI does not execute actions directly. It connects to the plexd daemon via a Unix socket (`/var/run/plexd.sock`), ensuring locally triggered actions go through the same path as SSE-triggered ones: token validation, integrity checks, sandbox, resource limits, and audit.
+The `plexd actions run` CLI does not execute actions directly. It connects to the plexd daemon via a Unix socket (`/var/run/plexd.sock`), ensuring locally triggered actions go through the same path as control-plane-dispatched ones: token validation, integrity checks, sandbox, resource limits, and audit.
 
 ```
 plexd actions run diagnostics.collect --param include_network=true

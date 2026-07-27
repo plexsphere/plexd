@@ -87,7 +87,7 @@ flowchart TD
 7. **Create reconciler** — `reconcile.NewReconciler()` with handlers for WireGuard, policy, and bridge reconciliation
 8. **Create heartbeat service** — `agent.NewHeartbeatService()` with subsystem status enrichment, auth-failure callback, and key-rotation callback
 9. **Create integrity store + verifier** — `integrity.NewStore()` and `integrity.NewVerifier()` for hook checksums
-10. **Create action executor** — `actions.NewExecutor()`, register 11 built-in actions, register `action_request` SSE handler, report capabilities to control plane
+10. **Create action executor** — `actions.NewExecutor()`, register 11 built-in actions, register `actions.NewDispatcher()` on the reconciler as a dispatch handler, report capabilities to control plane
 11. **Create hook watcher** — `actions.NewHookWatcher()` for filesystem hook scanning
 12. **Create node API server** — `nodeapi.NewServer()`, wire action provider, hook reloader, and reconcile handler
 13. **Create metrics collectors + manager** — system collector, agent stats collector, `metrics.NewManager()`
@@ -173,6 +173,7 @@ only request a reconcile.
 | `node_state_updated` | contract | Triggers a reconcile |
 | `policy_updated` | contract | `policy.HandlePolicyUpdated` — triggers a reconcile |
 | `bridge_config_updated` | contract | `bridge.HandleBridgeConfigUpdated` — triggers a reconcile (bridge mode) |
+| `action_request` | contract | Triggers a reconcile — the dispatch rides the `executions` block of the resulting pull |
 | `peer_registered` | documented-coming | Triggers a reconcile |
 | `peer_psk_assigned` | documented-coming | Triggers a reconcile |
 | `peer_deregistered` | documented-coming | Triggers a reconcile |
@@ -180,7 +181,6 @@ only request a reconcile.
 | `peer_key_rotated` | documented-coming | Triggers a reconcile |
 | `rotate_keys` | documented-coming | Starts a key rotation (`rotator.RotateNow`) |
 | `signing_key_rotated` | documented-coming | Updates the Ed25519 verifier key (`verifier.Rotate`) |
-| `action_request` | test-only | `actions.HandleActionRequest` — dispatches to the action executor |
 | `ssh_session_setup` | test-only | `tunnel.HandleSSHSessionSetup` — creates a tunnel session |
 | `session_revoked` | test-only | `tunnel.HandleSessionRevoked` — closes a revoked tunnel session |
 

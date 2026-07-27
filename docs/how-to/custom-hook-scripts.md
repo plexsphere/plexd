@@ -140,7 +140,10 @@ ls -la /etc/plexd/hooks/
 ## Step 4: Hook Discovery
 
 plexd automatically discovers new and changed hooks using the `HookWatcher`,
-which monitors the hooks directory with `fsnotify`. No restart is required.
+which monitors the hooks directory with `fsnotify`. Adding a hook needs no
+restart. **Changing** one does: the digest a hook is executed against is pinned
+at first discovery and the watcher cannot move it, so an edited hook is refused
+until the agent restarts (see [Verify the Checksum](#verify-the-checksum)).
 
 When a hook file is added, modified, or removed, plexd:
 
@@ -172,51 +175,72 @@ locally:
 sha256sum /etc/plexd/hooks/restart-service
 ```
 
-This checksum must match the value the control plane sends in the
-`action_request` event's `checksum` field. If the checksums don't match at
-execution time, the hook will fail integrity verification and will not run.
+This is the digest plexd pins the first time it discovers the hook and
+re-verifies before every execution. If the file on disk changes afterwards, the
+hook fails integrity verification and will not run — and it keeps failing until
+the agent restarts, because the watcher deliberately cannot move the pin. That is
+what makes the check meaningful: a digest refreshed on every write would only
+compare the file with a hash of itself.
+
+To roll out a changed hook, deploy the new file and restart the agent, which
+re-discovers it and re-reports the new checksum to the control plane.
+
+The dispatch itself carries **no** checksum. Whether this node may run this hook
+at all is decided upstream by the control plane's server-side dispatch gating; the
+node's own check answers a narrower question: are these still the bytes it
+discovered and reported?
 
 ## Step 6: Trigger from the Control Plane
 
-The control plane triggers hook execution by sending an `action_request` SSE
-event to the node. The event payload contains:
+The control plane triggers hook execution by queueing an entry in the `executions`
+block of the node's state snapshot. plexd consumes that block on every successful
+reconciliation pull:
 
 ```json
 {
   "execution_id": "exec-abc-123",
   "action": "restart-service",
+  "type": "hook",
   "parameters": {
     "service": "nginx"
   },
-  "timeout": "30s",
-  "checksum": "a1b2c3d4e5f6..."
+  "status": "pending",
+  "requested_at": "2026-07-27T10:30:00Z",
+  "expires_at": "2026-07-27T10:35:00Z"
 }
 ```
 
 The node will:
 
-1. **Ack**: post an execution callback with `status=ack`
-2. **Verify**: compare the hook's SHA-256 against the provided `checksum`
-3. **Start**: post `status=started`, then run the script with `PLEXD_PARAM_SERVICE=nginx`
+1. **Claim**: post an execution callback with `status=ack`, then one with `status=started` — both before anything runs, so an execution the control plane still holds at `ack` is known not to have executed
+2. **Verify**: compare the hook's SHA-256 against the digest pinned at first discovery
+3. **Run**: execute the script with `PLEXD_PARAM_SERVICE=nginx`
 4. **Report**: post a terminal callback (`succeeded`, `failed`, or `cancelled`) with the exit code and captured output
 
 Each step is one `POST /v1/nodes/{node_id}/executions/{execution_id}` callback.
+The entry keeps reappearing on every pull until the terminal callback settles it.
+
+An `action_request` SSE event may arrive alongside the dispatch, but it carries no
+payload the node acts on — it only pulls the next reconcile forward, so the
+execution starts in milliseconds instead of at the reconciliation cadence. A node
+with no event stream still runs every dispatch.
+
 For the full state machine, the 16 KiB inline-output rule, and the presigned
 upload leg for larger output, see the
 [Remote Actions and Hooks Reference](../reference/actions/remote-actions-hooks.md).
 
 ## Execution Lifecycle
 
-```
+```text
 Control Plane                          Node (plexd)
      │                                      │
-     │─── action_request (SSE) ────────────▶│
-     │                                      │── parse ActionRequest
-     │◀── callback: ack ────────────────────│── verify checksum (SHA-256)
+     │◀── GET /v1/nodes/{id}/state ─────────│── reconciliation pull
+     │─── executions: [ entry ] ───────────▶│── dispatch stage
+     │◀── callback: ack ────────────────────│── verify vs discovery digest
      │◀── callback: started ────────────────│── execute script
      │                                      │── capture stdout/stderr
      │◀── callback: succeeded ──────────────│── report terminal status + output
-     │                                      │
+     │                                      │  (entry drains from the block)
 ```
 
 ## Troubleshooting
@@ -234,9 +258,9 @@ Control Plane                          Node (plexd)
 
 | Symptom                        | Cause                             | Fix                                                |
 |--------------------------------|-----------------------------------|----------------------------------------------------|
-| Status `error`, integrity fail | Checksum mismatch                 | Re-deploy hook and wait for capability refresh     |
+| Status `error`, integrity fail | The file changed after the agent pinned its digest | Restart the agent so it re-discovers and re-attests the hook |
 | Status `error`, file not found | Hook in capabilities but missing  | Verify file exists at `hooks_dir/<action-name>`     |
-| Status `timeout`               | Script exceeds timeout            | Optimize script or increase timeout in request     |
+| Status `failed`, `error="action timed out"` | Script outran the run deadline, which is whatever is left of the entry's `expires_at`, capped by `max_action_timeout` | Optimize the script, or raise `max_action_timeout` and have the control plane dispatch a later `expires_at` |
 | Status `failed`, exit code > 0 | Script returned non-zero exit     | Check stderr in result for error details           |
 | Empty stdout                   | Script writes to file, not stdout | Write output to stdout (`echo`) for capture        |
 
@@ -245,7 +269,7 @@ Control Plane                          Node (plexd)
 | Symptom                    | Cause                                    | Fix                                                |
 |----------------------------|------------------------------------------|----------------------------------------------------|
 | Empty parameter value      | Parameter name case mismatch             | Parameters are uppercased: `target` → `PLEXD_PARAM_TARGET` |
-| Missing parameter          | Parameter not in action request          | Ensure control plane sends the parameter           |
+| Missing parameter          | Parameter not in the entry's `parameters`| Ensure control plane sends the parameter           |
 | Garbled parameter name     | Special characters in name               | Non-alphanumeric chars become underscores          |
 
 ## Reference

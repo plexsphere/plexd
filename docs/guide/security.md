@@ -11,7 +11,7 @@ title: Security & Trust Model
 - **Control plane communication** is TLS-encrypted (HTTPS). The agent validates the server certificate. Every SSE event is additionally signed with the control plane's Ed25519 key and verified by the agent before processing.
 - **Mesh traffic** is encrypted end-to-end via WireGuard.
 - **Compromised nodes** can be force-removed from the control plane, triggering key rotation across all affected peers.
-- **Hook integrity** is enforced via SHA-256 checksums computed at startup, monitored via inotify, and re-verified before every execution. Mismatches block execution and trigger alerts.
+- **Hook integrity** is enforced via SHA-256 checksums computed at discovery, monitored via inotify, and re-verified before every execution against the digest pinned at first discovery — there is no checksum on the wire, and the inotify watcher deliberately cannot move that pin. Mismatches block execution and trigger alerts.
 - **Binary verification** - plexd reports its own SHA-256 checksum at registration and with every heartbeat. The control plane compares against known-good checksums per version.
 
 ## Key Exchange and Trust Model
@@ -94,6 +94,8 @@ Every SSE event is wrapped in a signed envelope. The `signature` covers the cano
 
 This ensures that even if the TLS connection is compromised (e.g. through a rogue proxy or certificate authority), events cannot be forged. Duplicate or reordered deliveries are harmless because the reconciler's authoritative state pull, not the event payload, is the source of truth.
 
+Action dispatch is the one case where that distinction cuts both ways. A dispatch is read only from the `executions` block of the NSK-authenticated state pull, so no event payload — forged, replayed, or reordered — can make a node run an action. But the state response itself carries **no** application-layer signature: unlike an SSE envelope, it is protected by TLS alone. An attacker able to present a certificate the node's system trust store accepts — a misissued certificate, a rogue CA, or a deployment that set `tls_insecure_skip_verify` — can therefore inject an `executions` entry naming any registered action. Signing the executions block is a control-plane contract change and is not yet available; until it is, treat the TLS trust path (and never enabling `tls_insecure_skip_verify` outside a lab) as the boundary that protects remote execution.
+
 **SSE Events:**
 
 | SSE Event | Client Action |
@@ -102,7 +104,7 @@ This ensures that even if the TLS connection is compromised (e.g. through a rogu
 | `policy_updated` | Trigger a reconcile and update local firewall rules |
 | `bridge_config_updated` | Trigger a bridge reconcile (bridge mode) |
 | `peer_endpoint_changed` / `peer_key_rotated` | Trigger a state reconcile — peer topology is applied from the authoritative state pull, not the event payload |
-| `action_request` | Validate, ACK, and execute the requested action (see [Actions & Hooks](../reference/core/cli.md)) |
+| `action_request` | Trigger a state reconcile — the payload is opaque; action dispatches are delivered in the `executions` block of the authoritative state pull, never by the event (see [Remote Actions and Hooks](../reference/actions/remote-actions-hooks.md)) |
 | `session_revoked` | Add session to local revocation set, reject future actions with that session's token |
 | `ssh_session_setup` | Set up SSH session: start listener, inject session token |
 | `rotate_keys` | Generate new Curve25519 keypair and initiate key rotation (see [Phase 4: Key Rotation](#phase-4-key-rotation)) |

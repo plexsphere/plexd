@@ -12,7 +12,7 @@ The Plexsphere node agent (`plexd`) is a lightweight daemon that runs on every m
 - **Network Policy** — enforces peer visibility rules and firewall policies via nftables
 - **Secure Tunneling** — provides SSH-based secure access tunnels through the mesh
 - **State Reconciliation** — periodically fetches desired state and applies drift corrections
-- **Remote Actions** — executes built-in and hook-based actions requested via SSE events
+- **Remote Actions** — executes built-in and hook-based actions dispatched in the state pull
 - **Observability** — collects and forwards metrics, logs, and audit events to the control plane
 - **Local Node API** — exposes node state (metadata, data, secrets) to local workloads via Unix socket API or PlexdNodeState CRD
 - **Integrity** — verifies checksums of the plexd binary and hook scripts

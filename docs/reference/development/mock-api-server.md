@@ -266,9 +266,9 @@ closed `nat_type` enum, clock-skew tolerance, and a routable `ip:port`.
 
 Returns the active `NodeStateSnapshot` fixture built by `newStateFixture`. By
 default it is an enriched envelope containing two peers, a merged policy with two
-rules, the `reachability` projection, all four bridge subtrees, and the `state`
-and `reports` blocks (which mirror one another). The active fixture can be
-replaced at runtime via `POST /test/configure-state`.
+rules, the `reachability` projection, all four bridge subtrees, the `state`
+and `reports` blocks (which mirror one another), and an empty `executions` block.
+The active fixture can be replaced at runtime via `POST /test/configure-state`.
 
 **Default fixture blocks:**
 
@@ -282,6 +282,7 @@ replaced at runtime via `POST /test/configure-state`.
 | `bridge.ingress` | `enabled: true`, 1 rule (`ingress-001`, port 443) |
 | `bridge.site_to_site` | `enabled: true`, 1 tunnel (`s2s-001`) |
 | `state` / `reports` | `metadata` (2 entries), `data` (2 entries), `reports` (`[]`) |
+| `executions` | `[]` — no dispatch queued; phases configure entries explicitly |
 
 The `fingerprint` is produced by the mock-internal `policyFingerprint` helper — a
 44-char base64 SHA-256 over the compact-JSON encoding of the rules slice. This
@@ -397,13 +398,29 @@ comparison key and never re-derives it from the rules.
       {"key": "certs/ca", "value": "-----BEGIN CERTIFICATE-----\nmock-ca-cert\n-----END CERTIFICATE-----"}
     ],
     "reports": []
-  }
+  },
+  "executions": []
 }
 ```
 
 **Content-Type:** `application/json`
 
 **Counter:** Increments `state_count` on each call.
+
+**Executions projection:** the `executions` block is not served verbatim from the
+fixture. Each request projects the configured entries through the live callback
+state machine:
+
+| Configured entry | Served as |
+|------------------|-----------|
+| `expires_at` not in the future (including a missing `expires_at`) | filtered out |
+| execution has reached a terminal status | drained — filtered out from the moment it settles |
+| execution is tracked non-terminally | served with the **live** status, not the configured one |
+| execution is untracked | served verbatim |
+
+The result is a freshly allocated slice, so the configured entries are never
+rewritten in place, and it is never `nil` — the block always serializes as `[]`
+rather than `null`.
 
 **Concurrency:** The active fixture is protected by `sync.RWMutex`. Reads never block other reads. A write via `POST /test/configure-state` blocks reads briefly during replacement. Readers always see a complete fixture (never a partial update).
 
@@ -461,13 +478,17 @@ means never dispatched) and admits only these advances:
 | Current state | Legal next status |
 |---------------|-------------------|
 | _(never seen)_ | `ack` |
-| `ack` | `started`, `failed`, `cancelled` |
+| `ack` | `started` |
 | `started` | `succeeded`, `failed`, `cancelled`, or `started` (only when `declared_output_bytes > 0`) |
 | terminal (`succeeded` / `failed` / `cancelled`) | none |
 
-The `ack` → `failed` / `cancelled` edges cover a pre-start rejection; the
-`started` → `started` self-repeat is the declaring callback that mints the output
-upload. A callback that declares an over-ceiling output (`started` with
+The roster is closed and mirrors the control plane: a terminal status is reachable
+**only from `started`**, so `ack` → `failed` and `ack` → `cancelled` are refused
+with `409 invalid_state_transition`. A node that will not run an action must
+therefore walk to `started` before failing it. The `started` → `started`
+self-repeat is the declaring callback that mints the output upload, which the node
+can only send once the run has finished. A callback that declares an over-ceiling
+output (`started` with
 `declared_output_bytes > 0`) is answered with a one-time presigned PUT URL in
 `output_upload_url`; a terminal callback carrying an `object_key` is verified
 against the uploaded bytes (existence, receipt, and `sha256`).
@@ -681,11 +702,16 @@ Broadcasts a signed `Envelope` to all connected SSE clients and records it in th
 ```json
 {
   "id": "evt-inject-001",
-  "type": "action_request",
+  "type": "node_state_updated",
   "scope": "node:n_abc123",
-  "payload": {"action_id": "a1"}
+  "payload": {"node_id": "e2e-node-1"}
 }
 ```
+
+Injecting `action_request` is possible too, but it delivers no dispatch: like
+`node_state_updated` its payload is opaque and it only nudges the agent into an
+immediate reconcile. The dispatch itself must be configured into the `executions`
+block via `POST /test/configure-state`.
 
 **Fields the mock stamps:** `issued_at` (current time), `key_id` (`did:web:plexsphere.com#key-e2e`), the stream sequence (the `id:` frame line), and `signature` (a valid Ed25519 signature over the shared canonical form, `api.CanonicalBytes`).
 
@@ -715,9 +741,24 @@ Replaces the active `NodeStateSnapshot` fixture at runtime. Subsequent calls to 
   "policy": null,
   "bridge": null,
   "state": {"metadata": [{"key": "custom", "value": "value"}], "data": [], "reports": []},
-  "reports": null
+  "reports": null,
+  "executions": [
+    {
+      "execution_id": "exec-e2e-001",
+      "action": "system.info",
+      "type": "builtin",
+      "parameters": null,
+      "status": "pending",
+      "requested_at": "2026-01-01T00:00:00Z",
+      "expires_at": "2099-01-01T00:00:00Z"
+    }
+  ]
 }
 ```
+
+Because the call replaces the **whole** fixture, a test that only wants to queue a
+dispatch reads the live snapshot, splices its `executions` array in, and posts the
+result back — that is what the e2e helper `configure_executions` does.
 
 **Response:** `204 No Content`
 
@@ -726,7 +767,22 @@ Replaces the active `NodeStateSnapshot` fixture at runtime. Subsequent calls to 
 - The replacement is atomic — concurrent readers never see a partial update
 - The state fixture is protected by `sync.RWMutex`
 - Any valid `NodeStateSnapshot` JSON is accepted, including minimal objects with `null` blocks
+- Decoding is **strict**: a misspelled or renamed key anywhere in the envelope is a `400`, not a `204` that silently stores a zero-valued block
+- Each configured execution seeds the callback state machine (see below)
 - Request body is captured and retrievable via `GET /test/last-request/configure_state`
+
+**Execution seeding:** the configured `status` of each entry tells the mock what the
+control plane already holds for that execution, so a phase can stage a mid-flight
+execution rather than only a fresh one:
+
+| Configured `status` | Seeds |
+|---------------------|-------|
+| `pending` | nothing — the execution stays untracked until the node's `ack` |
+| `ack` / `started` | that status, so the node's next callback is validated against it |
+
+Seeding is **seed-if-absent**: an execution the mock is already tracking is left
+alone, so re-posting the same fixture can never regress an execution the node has
+already advanced.
 
 **Error:** Returns `400` if the request body is not valid JSON. Returns `405` if the HTTP method is not `POST`.
 

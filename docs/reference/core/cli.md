@@ -55,7 +55,7 @@ plexd up [--config /path/to/config.yaml] [--log-level debug]
 7. Create reconciler with handlers for WireGuard, policy, and bridge reconciliation
 8. Create heartbeat service with subsystem status enrichment, auth-failure, and key-rotation callbacks
 9. Create integrity store + verifier
-10. Create action executor, register 11 built-in actions, register `action_request` SSE handler, report capabilities
+10. Create action executor, register 11 built-in actions, register the action dispatcher on the reconciler, report capabilities
 11. Create hook watcher
 12. Create node API server, wire reconcile handler
 13. Create metrics collectors + manager

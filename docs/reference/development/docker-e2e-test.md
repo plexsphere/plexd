@@ -116,6 +116,8 @@ Posts a full mutated `NodeStateSnapshot` envelope to `POST /test/configure-state
 
 The assertion deliberately gates on the reconciler drift summary rather than on `"policy ruleset applied"`. The test container's kernel exposes no nftables backend, so policy enforcement stays disabled there and no rule can reach the kernel; the applied-log is emitted only on a real apply and would never fire. Proving rule installation requires an environment with a working nftables backend.
 
+`POST /test/configure-state` replaces the **whole** snapshot fixture, which is also how the action phases drive execution: they queue a dispatch by reading the live snapshot, splicing an entry into its `executions` array, and posting the result back, then inject a `node_state_updated` envelope so the agent pulls immediately instead of waiting out the reconcile cadence. Because the fetch leg is a real `GET` on the state endpoint, it increments `state_count` — a phase gating on that counter must take its baseline **after** configuring the block. Action dispatches never ride an SSE payload, so `action_request` can only be used the same way: as a nudge that pulls the next reconcile forward.
+
 ### Phase 8: Policy Fingerprint No-Op
 
 Re-posts the envelope with only `revision_id` bumped and a metadata value changed — the policy `fingerprint` stays identical. The test asserts `state_count` advances (the no-op envelope was fetched) but the policy-drift cycle count is **unchanged**, exercising the differ's fingerprint short-circuit: a revision-only bump must not report `PolicyChanged`.

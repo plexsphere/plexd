@@ -108,17 +108,21 @@ never serialized on its own.
 
 The desired-state envelope. Every block key is **always present on the wire**: a
 `null` value means "block not populated", never "field absent", so the differ
-distinguishes a nil pointer from a populated block. None of the six fields carry
+distinguishes a nil pointer from a populated block. None of the seven fields carry
 `omitempty`.
 
-| Field          | Type              | JSON Tag         | Description                                              |
-|----------------|-------------------|------------------|---------------------------------------------------------|
-| `Peers`        | `[]SnapshotPeer`  | `"peers"`        | Desired peers; `[]` when empty, node_id ascending, self excluded |
-| `Reachability` | `json.RawMessage` | `"reachability"` | The node's own health projection, carried opaquely (unconsumed) |
-| `Policy`       | `*PolicySnapshot` | `"policy"`       | Merged network policy block                             |
-| `Bridge`       | `*BridgeSnapshot` | `"bridge"`       | Bridge subtrees                                         |
-| `State`        | `*NodeStateBlock` | `"state"`        | Node state buckets                                     |
-| `Reports`      | `*NodeStateBlock` | `"reports"`      | Mirrors `state` today (forward-compat split)           |
+| Field          | Type                   | JSON Tag         | Description                                              |
+|----------------|------------------------|------------------|---------------------------------------------------------|
+| `Peers`        | `[]SnapshotPeer`       | `"peers"`        | Desired peers; `[]` when empty, node_id ascending, self excluded |
+| `Reachability` | `json.RawMessage`      | `"reachability"` | The node's own health projection, carried opaquely (unconsumed) |
+| `Policy`       | `*PolicySnapshot`      | `"policy"`       | Merged network policy block                             |
+| `Bridge`       | `*BridgeSnapshot`      | `"bridge"`       | Bridge subtrees                                         |
+| `State`        | `*NodeStateBlock`      | `"state"`        | Node state buckets                                     |
+| `Reports`      | `*NodeStateBlock`      | `"reports"`      | Mirrors `state` today (forward-compat split)           |
+| `Executions`   | `[]NodeStateExecution` | `"executions"`   | Pending action dispatches; `[]` when empty, never `null` |
+
+`executions` is the only member that is not desired state: it is a delivery
+queue, documented under [Executions](#executions) below.
 
 **SnapshotPeer**
 
@@ -279,30 +283,45 @@ the key has no report).
 
 ## Executions
 
-The `action_request` SSE payload and the single execution callback the node posts
-back to `POST /v1/nodes/{node_id}/executions/{execution_id}`.
+The `executions` block of the state snapshot and the single execution callback the
+node posts back to `POST /v1/nodes/{node_id}/executions/{execution_id}`.
 
-### `action_request` SSE payload
+### `executions` block of `GET /v1/nodes/{node_id}/state`
 
-**ActionRequest**
+**NodeStateExecution**
 
-| Field        | Type                | JSON Tag                  | Description                       |
-|--------------|---------------------|---------------------------|-----------------------------------|
-| `ExecutionID`| `string`            | `"execution_id"`          | Execution identifier              |
-| `Action`     | `string`            | `"action"`                | Action name (builtin or hook)     |
-| `Parameters` | `map[string]string` | `"parameters,omitempty"`  | Action parameters                 |
-| `Timeout`    | `string`            | `"timeout"`               | Requested execution timeout       |
-| `Checksum`   | `string`            | `"checksum,omitempty"`    | Expected hook checksum            |
-| `TriggeredBy`| `*TriggeredBy`      | `"triggered_by,omitempty"`| Who triggered the execution       |
+One pending action dispatch. The block is the delivery channel for action
+dispatches: it is always present (`[]` when empty, never `null`) and ordered by
+`RequestedAt`, then `ExecutionID`. An entry keeps reappearing on every pull until
+its execution reaches a terminal status through the execution callback, so a
+consumer must tolerate re-observing the same `ExecutionID`. The entry carries **no**
+callback URL and **no** hook checksum.
 
-**TriggeredBy**
+| Field         | Type             | JSON Tag         | Description                                            |
+|---------------|------------------|------------------|--------------------------------------------------------|
+| `ExecutionID` | `string`         | `"execution_id"` | Execution identifier                                   |
+| `Action`      | `string`         | `"action"`       | Action name (builtin or hook)                          |
+| `Type`        | `string`         | `"type"`         | One of the `ActionKind*` values                        |
+| `Parameters`  | `map[string]json.RawMessage` | `"parameters"` | Action parameters, each held as raw JSON so a large integer keeps every digit; nullable, a JSON `null` decodes to a nil map |
+| `Status`      | `string`         | `"status"`       | `pending`, `ack`, or `started`                         |
+| `RequestedAt` | `time.Time`      | `"requested_at"` | When the control plane dispatched the execution        |
+| `ExpiresAt`   | `time.Time`      | `"expires_at"`   | Absolute UTC deadline, **not** a relative timeout      |
 
-| Field      | Type   | JSON Tag      | Description        |
-|------------|--------|---------------|--------------------|
-| `Type`     | `string`| `"type"`     | Trigger type       |
-| `SessionID`| `string`| `"session_id"`| Session ID        |
-| `UserID`   | `string`| `"user_id"`  | User ID            |
-| `Email`    | `string`| `"email"`    | User email         |
+**ActionKind constants**
+
+| Constant            | Value     | Description                            |
+|---------------------|-----------|----------------------------------------|
+| `ActionKindBuiltin` | `builtin` | Dispatches an action built into plexd  |
+| `ActionKindHook`    | `hook`    | Dispatches a hook registered by the node |
+
+**Pull-only execution status**
+
+| Constant                 | Value     | Description                                                        |
+|--------------------------|-----------|--------------------------------------------------------------------|
+| `ExecutionStatusPending` | `pending` | Dispatched and not yet acknowledged; observed only on the pull block and **never** reported by a node on the callback |
+
+The other two statuses an entry can carry, `ack` and `started`, are the
+node-reportable constants listed below.
 
 ### `POST /v1/nodes/{node_id}/executions/{execution_id}`
 
@@ -632,6 +651,7 @@ are opaque — the state pull is authoritative.
 | `EventNodeStateUpdated`    | `node_state_updated`    | contract          |
 | `EventPolicyUpdated`       | `policy_updated`        | contract          |
 | `EventBridgeConfigUpdated` | `bridge_config_updated` | contract          |
+| `EventActionRequest`       | `action_request`        | contract          |
 | `EventPeerRegistered`      | `peer_registered`       | documented-coming |
 | `EventPeerPSKAssigned`     | `peer_psk_assigned`     | documented-coming |
 | `EventPeerDeregistered`    | `peer_deregistered`     | documented-coming |
@@ -639,6 +659,9 @@ are opaque — the state pull is authoritative.
 | `EventPeerKeyRotated`      | `peer_key_rotated`      | documented-coming |
 | `EventRotateKeys`          | `rotate_keys`           | documented-coming |
 | `EventSigningKeyRotated`   | `signing_key_rotated`   | documented-coming |
-| `EventActionRequest`       | `action_request`        | test-only         |
 | `EventSSHSessionSetup`     | `ssh_session_setup`     | test-only         |
 | `EventSessionRevoked`      | `session_revoked`       | test-only         |
+
+`action_request` is a contract type with an opaque payload: action dispatches are
+delivered in the `executions` block of the state pull, so the event only triggers
+a reconcile and the resulting pull carries the dispatch.
