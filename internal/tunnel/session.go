@@ -39,6 +39,9 @@ type Session struct {
 	// idleTimeout is the idle window for this session, set by the manager before
 	// Start. Zero means the session has no idle window.
 	idleTimeout time.Duration
+	// onIdle is invoked once by the idle monitor when the window elapses without
+	// byte flow, set by the manager before Start alongside idleTimeout.
+	onIdle func()
 	// lastActive holds the last observed activity as a duration since
 	// processStart: the listener bind, then every forwarded chunk while an idle
 	// window is armed.
@@ -88,13 +91,17 @@ func NewSession(sessionID, targetHost string, targetPort int, meshIP string, exp
 	}
 }
 
-// Start opens a TCP listener bound to the mesh IP and begins accepting connections.
+// Start opens a TCP listener bound to the mesh IP and begins accepting
+// connections. Everything the session runs — the accept loop and, when an idle
+// window is armed, the idle monitor — hangs off the child context Start derives
+// here, which Close cancels; nothing outlives the session.
 func (s *Session) Start(ctx context.Context) (string, error) {
 	ctx, s.cancel = context.WithCancel(ctx)
 
 	addr := net.JoinHostPort(s.MeshIP, "0")
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
+		s.cancel()
 		return "", fmt.Errorf("tunnel: listen on %s: %w", addr, err)
 	}
 	s.listener = ln
@@ -109,7 +116,38 @@ func (s *Session) Start(ctx context.Context) (string, error) {
 
 	go s.acceptLoop(ctx)
 
+	// The monitor runs on Start's own child context, the one Close cancels, so
+	// it cannot outlive the session it watches.
+	if s.idleTimeout > 0 {
+		go s.idleMonitor(ctx)
+	}
+
 	return ln.Addr().String(), nil
+}
+
+// idleMonitor calls onIdle once the idle window has passed without byte flow.
+// Byte flow re-arms the window: every forwarded chunk stamps the session's last
+// activity, so each firing re-reads the stamp and either gives up the session or
+// waits out the remaining window. The listener bind counts as the first
+// activity, so a listener no connection ever reaches idles out one window after
+// Start.
+func (s *Session) idleMonitor(ctx context.Context) {
+	timer := time.NewTimer(s.idleTimeout - s.IdleFor())
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			remaining := s.idleTimeout - s.IdleFor()
+			if remaining <= 0 {
+				s.onIdle()
+				return
+			}
+			timer.Reset(remaining)
+		}
+	}
 }
 
 func (s *Session) acceptLoop(ctx context.Context) {

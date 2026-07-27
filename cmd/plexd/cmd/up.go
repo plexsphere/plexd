@@ -277,7 +277,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("plexd up: tunnel host key: %w", err)
 	}
 	jwtVerifier := tunnel.NewEd25519JWTVerifier(ed25519.PublicKey(sigKey))
-	meshServer := tunnel.NewMeshServer(cfg.Tunnel, hostKey, jwtVerifier, logger)
+	meshServer := tunnel.NewMeshServer(cfg.Tunnel, identity.MeshIP, hostKey, jwtVerifier, logger)
 	sessionReporter := &controlPlaneSessionReporter{cp: client, nodeID: identity.NodeID}
 
 	// Report a session_ended row for every close reason (revoke, TTL expiry,
@@ -361,12 +361,6 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// Register signing_key_rotated SSE handler to update verifier keys.
 	sseMgr.RegisterHandler(api.EventSigningKeyRotated, signingKeyRotatedHandler(verifier, logger))
 
-	// Register tunnel SSE handlers. ssh_session_setup and session_revoked are
-	// test-only until the platform taxonomy ships real discriminators; the
-	// production control plane never emits them (see internal/api/envelope.go).
-	sseMgr.RegisterHandler(api.EventSSHSessionSetup, tunnel.HandleSSHSessionSetup(meshServer.SessionManager(), sessionReporter))
-	sseMgr.RegisterHandler(api.EventSessionRevoked, tunnel.HandleSessionRevoked(meshServer.SessionManager()))
-
 	// 7. Create reconciler.
 	reconciler := reconcile.NewReconciler(client, cfg.Reconcile, logger)
 
@@ -415,9 +409,12 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// Every remaining pull-authoritative event simply requests a reconcile: the
 	// snapshot is the source of truth, so the payloads are opaque. One shared
 	// closure covers the node_state_updated contract type and the peer-family
-	// types from the documented-coming taxonomy. action_request joins them as a
-	// push-latency optimisation: the dispatch itself is delivered in the pull's
-	// executions block, the event only pulls it forward.
+	// types from the documented-coming taxonomy. action_request and
+	// session_setup join them as push-latency optimisations: the dispatch and
+	// the session themselves are delivered in the pull's executions and sessions
+	// blocks, the events only pull them forward. session_revoked is the same
+	// shape from the other end — a session leaving the sessions block is what
+	// tears it down, so the event only pulls the observing reconcile forward.
 	triggerReconcile := func(_ context.Context, _ api.Envelope) error {
 		reconciler.TriggerReconcile()
 		return nil
@@ -425,6 +422,8 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	for _, eventType := range []string{
 		api.EventNodeStateUpdated,
 		api.EventActionRequest,
+		api.EventSessionSetup,
+		api.EventSessionRevoked,
 		api.EventPeerRegistered,
 		api.EventPeerPSKAssigned,
 		api.EventPeerDeregistered,
@@ -601,6 +600,13 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// redelivers each entry until its execution settles through the callback.
 	dispatcher := actions.NewDispatcher(executor, identity.NodeID, logger)
 	reconciler.RegisterDispatchHandler(dispatcher.Handle)
+
+	// Mediated-access sessions are consumed from the pull's sessions block on
+	// every successful cycle too, but that block is desired state: a listener is
+	// provisioned when its entry appears and torn down when the entry drains,
+	// which is the only teardown signal there is.
+	sessionDispatcher := tunnel.NewDispatcher(meshServer.SessionManager(), sessionReporter, logger)
+	reconciler.RegisterDispatchHandler(sessionDispatcher.Handle)
 
 	// Register the WireGuard reconcile handler only when the interface came up.
 	// A handler that fails every cycle would hold back the reconciler snapshot,
@@ -1099,16 +1105,18 @@ type controlPlaneSessionReporter struct {
 	nodeID string
 }
 
-func (r *controlPlaneSessionReporter) ReportSessionStarted(ctx context.Context, sessionID, targetHost string, targetPort int) {
-	if err := r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, api.SessionActivityRequest{
+// ReportSessionStarted returns the post's error rather than logging it away: the
+// row carries the listener endpoint the operator connects to, so the dispatcher
+// has to know whether it arrived.
+func (r *controlPlaneSessionReporter) ReportSessionStarted(ctx context.Context, sessionID, targetHost string, targetPort int, listenerEndpoint string) error {
+	return r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, api.SessionActivityRequest{
 		TCP: &api.TCPActivity{
-			Phase:      api.TCPPhaseSessionStarted,
-			TargetHost: targetHost,
-			TargetPort: targetPort,
+			Phase:            api.TCPPhaseSessionStarted,
+			TargetHost:       targetHost,
+			TargetPort:       targetPort,
+			ListenerEndpoint: listenerEndpoint,
 		},
-	}); err != nil {
-		slog.Error("tunnel session started report failed", "session_id", sessionID, "error", err)
-	}
+	})
 }
 
 func (r *controlPlaneSessionReporter) ReportSessionEnded(ctx context.Context, sessionID, targetHost string, targetPort int, bytesIn, bytesOut int64, terminatedBy string) {

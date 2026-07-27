@@ -19,7 +19,7 @@ func TestMeshServer_NewWithSSH(t *testing.T) {
 	cfg := Config{
 		SSHListenAddr: "127.0.0.1:0",
 	}
-	m := NewMeshServer(cfg, hostKey, &mockJWTVerifier{}, slog.Default())
+	m := NewMeshServer(cfg, "127.0.0.1", hostKey, &mockJWTVerifier{}, slog.Default())
 
 	if m.SSHServer() == nil {
 		t.Fatal("SSHServer() = nil, want non-nil when SSHListenAddr is set")
@@ -31,7 +31,7 @@ func TestMeshServer_NewWithSSH(t *testing.T) {
 
 func TestMeshServer_NewWithoutSSH(t *testing.T) {
 	cfg := Config{}
-	m := NewMeshServer(cfg, nil, &mockJWTVerifier{}, slog.Default())
+	m := NewMeshServer(cfg, "127.0.0.1", nil, &mockJWTVerifier{}, slog.Default())
 
 	if m.SSHServer() != nil {
 		t.Fatal("SSHServer() = non-nil, want nil when SSHListenAddr is empty")
@@ -50,7 +50,7 @@ func TestMeshServer_StartAndShutdown(t *testing.T) {
 	cfg := Config{
 		SSHListenAddr: "127.0.0.1:0",
 	}
-	m := NewMeshServer(cfg, hostKey, &mockJWTVerifier{}, slog.Default())
+	m := NewMeshServer(cfg, "127.0.0.1", hostKey, &mockJWTVerifier{}, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -91,7 +91,7 @@ func TestMeshServer_ShutdownOrder(t *testing.T) {
 	cfg := Config{
 		SSHListenAddr: "127.0.0.1:0",
 	}
-	m := NewMeshServer(cfg, hostKey, &mockJWTVerifier{}, slog.Default())
+	m := NewMeshServer(cfg, "127.0.0.1", hostKey, &mockJWTVerifier{}, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

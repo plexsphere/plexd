@@ -568,15 +568,6 @@ type KeyRotateResponse struct {
 // Session  POST /v1/nodes/{node_id}/sessions/{session_id}
 // ---------------------------------------------------------------------------
 
-// SSHSessionSetup is the payload of an ssh_session_setup SSE event.
-type SSHSessionSetup struct {
-	SessionID     string    `json:"session_id"`
-	TargetHost    string    `json:"target_host"`
-	TargetPort    int       `json:"target_port"`
-	AuthorizedKey string    `json:"authorized_key"`
-	ExpiresAt     time.Time `json:"expires_at"`
-}
-
 // SessionActivityRequest is the one-of activity record a node posts to
 // POST /v1/nodes/{node_id}/sessions/{session_id}. Exactly one member is set,
 // selecting the session kind: SSH, K8s, or TCP.
