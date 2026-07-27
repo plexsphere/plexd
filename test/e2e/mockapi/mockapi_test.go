@@ -3153,6 +3153,8 @@ func TestExecutionCallback_IllegalTransitions(t *testing.T) {
 		{"absent_to_started", nil, `{"status":"started"}`},
 		{"absent_to_succeeded", nil, `{"status":"succeeded"}`},
 		{"ack_to_succeeded", []string{`{"status":"ack"}`}, `{"status":"succeeded"}`},
+		{"ack_to_failed", []string{`{"status":"ack"}`}, `{"status":"failed"}`},
+		{"ack_to_cancelled", []string{`{"status":"ack"}`}, `{"status":"cancelled"}`},
 		{"ack_to_ack", []string{`{"status":"ack"}`}, `{"status":"ack"}`},
 		{"started_to_ack", []string{`{"status":"ack"}`, `{"status":"started"}`}, `{"status":"ack"}`},
 		{"plain_started_to_started", []string{`{"status":"ack"}`, `{"status":"started"}`}, `{"status":"started"}`},
@@ -3357,6 +3359,238 @@ func TestExecutionCallback_MalformedAndCeiling(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Executions block delivery (issue #51)
+// ---------------------------------------------------------------------------
+
+// stateExecution builds one configured executions entry with a future deadline,
+// the only shape the state handler serves.
+func stateExecution(eid, status string) api.NodeStateExecution {
+	now := time.Now().UTC()
+	return api.NodeStateExecution{
+		ExecutionID: eid,
+		Action:      "service.restart",
+		Type:        api.ActionKindBuiltin,
+		Parameters:  map[string]json.RawMessage{"unit": json.RawMessage(`"plexd"`)},
+		Status:      status,
+		RequestedAt: now,
+		ExpiresAt:   now.Add(time.Hour),
+	}
+}
+
+// configureExecutions posts a snapshot carrying only the given executions block.
+func configureExecutions(t *testing.T, baseURL string, execs ...api.NodeStateExecution) {
+	t.Helper()
+	body, err := json.Marshal(api.NodeStateSnapshot{Executions: execs})
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	resp := doRequest(t, http.MethodPost, baseURL+"/test/configure-state", string(body))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+// servedExecutions returns the served executions block keyed by execution id.
+func servedExecutions(t *testing.T, baseURL string) map[string]api.NodeStateExecution {
+	t.Helper()
+	served := make(map[string]api.NodeStateExecution)
+	for _, exec := range getState(t, baseURL).Executions {
+		served[exec.ExecutionID] = exec
+	}
+	return served
+}
+
+// callbackStatus posts one bare status callback and returns its HTTP status.
+func callbackStatus(t *testing.T, baseURL, eid, status string) int {
+	t.Helper()
+	resp := postExecCallback(t, baseURL, eid, fmt.Sprintf(`{"status":%q}`, status))
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
+// stateEnvelope returns the served state as raw JSON members, so a test can tell
+// [] from null.
+func stateEnvelope(t *testing.T, baseURL string) map[string]json.RawMessage {
+	t.Helper()
+	resp, err := http.Get(baseURL + "/v1/nodes/node-1/state")
+	if err != nil {
+		t.Fatalf("GET state: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("unmarshal %s: %v", raw, err)
+	}
+	return envelope
+}
+
+func TestConfigureState_SeedsExecutionStates(t *testing.T) {
+	_, ts := newTestServer(t)
+	const (
+		pendingID = "exec-seed-pending"
+		ackID     = "exec-seed-ack"
+		startedID = "exec-seed-started"
+	)
+	configureExecutions(t, ts.URL,
+		stateExecution(pendingID, api.ExecutionStatusPending),
+		stateExecution(ackID, api.ExecutionStatusAck),
+		stateExecution(startedID, api.ExecutionStatusStarted),
+	)
+
+	// A pending entry seeds nothing, so the id is still unseen: started is
+	// refused and ack is the only legal first callback.
+	if got := callbackStatus(t, ts.URL, pendingID, api.ExecutionStatusStarted); got != http.StatusConflict {
+		t.Errorf("pending id → started status = %d, want %d", got, http.StatusConflict)
+	}
+	if got := callbackStatus(t, ts.URL, pendingID, api.ExecutionStatusAck); got != http.StatusOK {
+		t.Errorf("pending id → ack status = %d, want %d", got, http.StatusOK)
+	}
+
+	// An ack entry resumes mid-roster: the acknowledgement is not repeatable and
+	// started is the next legal step.
+	if got := callbackStatus(t, ts.URL, ackID, api.ExecutionStatusAck); got != http.StatusConflict {
+		t.Errorf("ack id → ack status = %d, want %d", got, http.StatusConflict)
+	}
+	if got := callbackStatus(t, ts.URL, ackID, api.ExecutionStatusStarted); got != http.StatusOK {
+		t.Errorf("ack id → started status = %d, want %d", got, http.StatusOK)
+	}
+
+	// A started entry is the orphan path: the node reports the terminal status of
+	// a run it inherited without ever having sent ack or started itself.
+	if got := callbackStatus(t, ts.URL, startedID, api.ExecutionStatusFailed); got != http.StatusOK {
+		t.Errorf("started id → failed status = %d, want %d", got, http.StatusOK)
+	}
+}
+
+func TestConfigureState_ExecutionSeedDoesNotRegressLiveState(t *testing.T) {
+	_, ts := newTestServer(t)
+	const eid = "exec-seed-live"
+	configureExecutions(t, ts.URL, stateExecution(eid, api.ExecutionStatusPending))
+
+	for _, status := range []string{api.ExecutionStatusAck, api.ExecutionStatusStarted} {
+		if got := callbackStatus(t, ts.URL, eid, status); got != http.StatusOK {
+			t.Fatalf("callback %q status = %d, want %d", status, got, http.StatusOK)
+		}
+	}
+
+	// Re-posting the snapshot at its stale configured status must not pull the
+	// live execution back to ack.
+	configureExecutions(t, ts.URL, stateExecution(eid, api.ExecutionStatusAck))
+
+	served := servedExecutions(t, ts.URL)
+	entry, ok := served[eid]
+	if !ok {
+		t.Fatalf("served executions = %v, want an entry for %q", served, eid)
+	}
+	if entry.Status != api.ExecutionStatusStarted {
+		t.Errorf("served status = %q, want %q", entry.Status, api.ExecutionStatusStarted)
+	}
+}
+
+func TestState_ExecutionsCarryLiveStatus(t *testing.T) {
+	_, ts := newTestServer(t)
+	const eid = "exec-project-live"
+	configureExecutions(t, ts.URL, stateExecution(eid, api.ExecutionStatusPending))
+
+	// Untouched, the entry is served with its configured status.
+	if got := servedExecutions(t, ts.URL)[eid].Status; got != api.ExecutionStatusPending {
+		t.Errorf("served status before the callback = %q, want %q", got, api.ExecutionStatusPending)
+	}
+
+	if got := callbackStatus(t, ts.URL, eid, api.ExecutionStatusAck); got != http.StatusOK {
+		t.Fatalf("ack status = %d, want %d", got, http.StatusOK)
+	}
+
+	// The acknowledged entry keeps reappearing, now at its live status.
+	entry := servedExecutions(t, ts.URL)[eid]
+	if entry.Status != api.ExecutionStatusAck {
+		t.Errorf("served status after the callback = %q, want %q", entry.Status, api.ExecutionStatusAck)
+	}
+	if entry.Action != "service.restart" || entry.Type != api.ActionKindBuiltin {
+		t.Errorf("served entry = %+v, want the configured action and type", entry)
+	}
+}
+
+func TestState_TerminalExecutionDrains(t *testing.T) {
+	_, ts := newTestServer(t)
+	const (
+		liveID = "exec-drain-live"
+		doneID = "exec-drain-done"
+	)
+	configureExecutions(t, ts.URL,
+		stateExecution(liveID, api.ExecutionStatusPending),
+		stateExecution(doneID, api.ExecutionStatusPending),
+	)
+
+	for _, status := range []string{api.ExecutionStatusAck, api.ExecutionStatusStarted, api.ExecutionStatusSucceeded} {
+		if got := callbackStatus(t, ts.URL, doneID, status); got != http.StatusOK {
+			t.Fatalf("callback %q status = %d, want %d", status, got, http.StatusOK)
+		}
+	}
+
+	served := servedExecutions(t, ts.URL)
+	if _, ok := served[doneID]; ok {
+		t.Errorf("served executions still carry %q after its terminal callback", doneID)
+	}
+	if _, ok := served[liveID]; !ok {
+		t.Errorf("served executions = %v, want the undelivered entry %q", served, liveID)
+	}
+}
+
+func TestState_ExpiredExecutionsAreNotServed(t *testing.T) {
+	_, ts := newTestServer(t)
+	const freshID = "exec-expiry-fresh"
+
+	expired := stateExecution("exec-expiry-past", api.ExecutionStatusPending)
+	expired.ExpiresAt = time.Now().UTC().Add(-time.Minute)
+	noDeadline := stateExecution("exec-expiry-none", api.ExecutionStatusPending)
+	noDeadline.ExpiresAt = time.Time{}
+	configureExecutions(t, ts.URL, expired, noDeadline, stateExecution(freshID, api.ExecutionStatusPending))
+
+	served := servedExecutions(t, ts.URL)
+	if len(served) != 1 {
+		t.Fatalf("served executions = %v, want only %q", served, freshID)
+	}
+	if _, ok := served[freshID]; !ok {
+		t.Errorf("served executions = %v, want the unexpired entry %q", served, freshID)
+	}
+}
+
+func TestState_EmptyExecutionsSerializeAsArray(t *testing.T) {
+	t.Run("none_configured", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configureExecutions(t, ts.URL)
+
+		envelope := stateEnvelope(t, ts.URL)
+		if got, ok := envelope["executions"]; !ok || string(got) != "[]" {
+			t.Errorf("executions = %s, want [] (never null)", got)
+		}
+	})
+
+	t.Run("all_drained", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		const eid = "exec-empty-drained"
+		configureExecutions(t, ts.URL, stateExecution(eid, api.ExecutionStatusPending))
+
+		for _, status := range []string{api.ExecutionStatusAck, api.ExecutionStatusStarted, api.ExecutionStatusFailed} {
+			if got := callbackStatus(t, ts.URL, eid, status); got != http.StatusOK {
+				t.Fatalf("callback %q status = %d, want %d", status, got, http.StatusOK)
+			}
+		}
+
+		envelope := stateEnvelope(t, ts.URL)
+		if got := envelope["executions"]; string(got) != "[]" {
+			t.Errorf("executions = %s, want [] (never null)", got)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -4069,6 +4303,21 @@ func TestGetState_NormalizesEmptyPeers(t *testing.T) {
 	}
 	if len(got.Peers) != 0 {
 		t.Errorf("GetState().Peers = %v, want empty", got.Peers)
+	}
+}
+
+func TestGetState_NormalizesEmptyExecutions(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	// The seventh block is normalized like peers: a fixture with no executions
+	// still returns a non-nil (empty) slice so it serializes as [], not null.
+	srv.SetState(api.NodeStateSnapshot{})
+	got := srv.GetState()
+	if got.Executions == nil {
+		t.Error("GetState().Executions is nil, want a non-nil empty slice")
+	}
+	if len(got.Executions) != 0 {
+		t.Errorf("GetState().Executions = %v, want empty", got.Executions)
 	}
 }
 

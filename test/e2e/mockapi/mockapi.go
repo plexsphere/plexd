@@ -779,10 +779,43 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleState handles GET /v1/nodes/{id}/state (REQ-004).
+// handleState handles GET /v1/nodes/{id}/state (REQ-004). The executions block
+// is served through projectExecutions, so every pull reports the live callback
+// status of each entry still awaiting delivery.
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.stateCount.Add(1)
-	writeJSON(w, http.StatusOK, s.GetState())
+	state := s.GetState()
+	state.Executions = s.projectExecutions(state.Executions)
+	writeJSON(w, http.StatusOK, state)
+}
+
+// projectExecutions returns the executions block as served: a freshly allocated
+// slice — the fixture is handed out as a shallow copy, so the configured entries
+// are never rewritten in place — carrying the live callback status of every entry
+// still due for delivery. An entry keeps reappearing on every pull until the node
+// drives it to a terminal status through the callback, at which point it drains
+// out of the block; an entry whose expires_at is not in the future is no longer
+// served, and an entry carrying no expires_at at all is therefore never served.
+// The result is never nil, so the block serializes as [] rather than null.
+func (s *Server) projectExecutions(configured []api.NodeStateExecution) []api.NodeStateExecution {
+	s.execMu.Lock()
+	defer s.execMu.Unlock()
+
+	now := time.Now()
+	served := make([]api.NodeStateExecution, 0, len(configured))
+	for _, exec := range configured {
+		if !exec.ExpiresAt.After(now) {
+			continue
+		}
+		if live, tracked := s.execStates[exec.ExecutionID]; tracked {
+			if terminalExecStatus(live) {
+				continue
+			}
+			exec.Status = live
+		}
+		served = append(served, exec)
+	}
+	return served
 }
 
 // handleEvents handles GET /v1/nodes/{id}/events (REQ-006), the pull-only signed
@@ -1261,19 +1294,18 @@ func terminalExecStatus(status string) bool {
 // legalExecTransition reports whether advancing an execution from its current
 // state (cur, with exists=false when the id has never been seen) to next is a
 // legal non-terminal transition. Terminal current states are rejected by the
-// caller before this is reached. A started→started self-repeat is legal only
-// when the callback declares an output size, which the node knows only once the
-// run has finished.
+// caller before this is reached. The roster is closed and mirrors the control
+// plane: an unseen id accepts only ack, ack advances only to started, and a
+// terminal status is reachable only from started — ack→failed and ack→cancelled
+// are refused. A started→started self-repeat is legal only when the callback
+// declares an output size, which the node knows only once the run has finished.
 func legalExecTransition(cur string, exists bool, next string, declaredBytes int64) bool {
 	if !exists {
 		return next == api.ExecutionStatusAck
 	}
 	switch cur {
 	case api.ExecutionStatusAck:
-		switch next {
-		case api.ExecutionStatusStarted, api.ExecutionStatusFailed, api.ExecutionStatusCancelled:
-			return true
-		}
+		return next == api.ExecutionStatusStarted
 	case api.ExecutionStatusStarted:
 		switch next {
 		case api.ExecutionStatusSucceeded, api.ExecutionStatusFailed, api.ExecutionStatusCancelled:
@@ -1288,9 +1320,10 @@ func legalExecTransition(cur string, exists bool, next string, declaredBytes int
 // handleExecutionCallback handles POST /v1/nodes/{id}/executions/{eid}, the v1
 // execution status callback. It enforces the node-id guard, a 64 KiB body cap,
 // strict decoding to the five node-reportable statuses, the 16 KiB inline
-// output ceiling, and the execution state machine with its 409 taxonomy
-// (execution_already_terminal for a callback past a terminal state,
-// invalid_state_transition for any other illegal jump). A started callback that
+// output ceiling, and the execution state machine — ack, then started, then one
+// terminal status — with its 409 taxonomy (execution_already_terminal for a
+// callback past a terminal state, invalid_state_transition for any other
+// illegal jump, including a terminal that skips started). A started callback that
 // declares an over-ceiling output mints a one-time presigned upload URL; a
 // terminal callback carrying an object_key is verified against the uploaded
 // bytes. Every 200 carries the new status so the client can decode the body.
@@ -1753,30 +1786,52 @@ func (s *Server) handleIntegrityViolation(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// SetState updates the mutable state fixture returned by GET /v1/nodes/{id}/state.
+// SetState updates the mutable state fixture returned by GET /v1/nodes/{id}/state
+// and seeds the execution state machine from the configured executions block, so
+// an entry configured mid-flight resumes on the callback roster: a configured
+// ack or started status seeds that state, while pending seeds nothing and the
+// first legal callback for it stays ack. Seeding is skip-if-present — a re-posted
+// snapshot must never regress an execution the node has already advanced. The
+// two locks are never held at once: execMu is taken only after stateFixtureMu is
+// released.
 func (s *Server) SetState(state api.NodeStateSnapshot) {
 	s.stateFixtureMu.Lock()
 	s.stateFixture = state
 	s.stateFixtureMu.Unlock()
+
+	s.execMu.Lock()
+	defer s.execMu.Unlock()
+	for _, exec := range state.Executions {
+		if _, tracked := s.execStates[exec.ExecutionID]; tracked {
+			continue
+		}
+		switch exec.Status {
+		case api.ExecutionStatusAck, api.ExecutionStatusStarted:
+			s.execStates[exec.ExecutionID] = exec.Status
+		}
+	}
 }
 
-// GetState returns the current state fixture with the peers slice normalized to
-// non-nil so it always serializes as [] rather than null. The six envelope
-// blocks carry no omitempty, so all keys are emitted (null for unpopulated
-// blocks).
+// GetState returns the current state fixture with the peers and executions
+// slices normalized to non-nil so they always serialize as [] rather than null.
+// The seven envelope blocks carry no omitempty, so all keys are emitted (null
+// for unpopulated blocks).
 //
 // The result is a SHALLOW copy: the policy, bridge, state, and reports pointers
-// and the peers backing array alias the live fixture. Reading is safe — SetState
-// replaces the whole struct under the mutex, so no caller observes a half-written
-// fixture — but callers must NOT mutate through the returned pointers or slice,
-// which would race the state handler serving a concurrent request. Change the
-// fixture with SetState instead.
+// and the peers and executions backing arrays alias the live fixture. Reading is
+// safe — SetState replaces the whole struct under the mutex, so no caller
+// observes a half-written fixture — but callers must NOT mutate through the
+// returned pointers or slices, which would race the state handler serving a
+// concurrent request. Change the fixture with SetState instead.
 func (s *Server) GetState() api.NodeStateSnapshot {
 	s.stateFixtureMu.RLock()
 	state := s.stateFixture
 	s.stateFixtureMu.RUnlock()
 	if state.Peers == nil {
 		state.Peers = []api.SnapshotPeer{}
+	}
+	if state.Executions == nil {
+		state.Executions = []api.NodeStateExecution{}
 	}
 	return state
 }
