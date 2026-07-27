@@ -10,7 +10,10 @@
 #   - Log injection (docker cp into container, verify logs_count increases)
 #   - Agent restart for audit verification (ProcessSource fires per-process)
 #   - SSE event injection triggers reconciliation (state_count increases)
-#   - Action execution via SSE (action_request → ack/started/terminal callbacks)
+#   - Action execution via the state pull's executions block
+#     (ack/started/terminal callbacks)
+#   - Executions resumed from a seeded status (no re-ack, no re-run)
+#   - action_request is a pull trigger, not a delivery channel
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Pull-only delivery under a descoped event bus (quiet SSE re-probing)
@@ -90,6 +93,89 @@ fail() {
     echo "FAIL: $1"
     dc logs
     exit 1
+}
+
+# --- Helper: render a one-entry executions block ---
+# Args: <execution-id> <action> <type> <status> <parameters-json>. type is
+# "builtin" or "hook", status is the one the control plane holds ("pending" for
+# a fresh dispatch), and parameters is a JSON object or null. requested_at is a
+# fixed constant and expires_at is far enough out that the entry is never served
+# as lapsed. The wire carries NO timeout and NO checksum: the run deadline is
+# the node's own, and a hook is verified against the digest plexd recorded when
+# it discovered the hook on disk.
+exec_entry() {
+    local exec_id=$1 action=$2 kind=$3 status=$4 params=$5
+    cat <<ENTRYEOF
+[
+  {
+    "execution_id": "${exec_id}",
+    "action": "${action}",
+    "type": "${kind}",
+    "parameters": ${params},
+    "status": "${status}",
+    "requested_at": "2026-01-01T00:00:00Z",
+    "expires_at": "2099-01-01T00:00:00Z"
+  }
+]
+ENTRYEOF
+}
+
+# --- Helper: replace the snapshot's executions block ---
+# Args: <tag> <executions-json-array>. Action dispatches are delivered in the
+# executions block of GET /v1/nodes/{id}/state, so a phase drives an action by
+# configuring that block. configure-state REPLACES the whole snapshot fixture,
+# so the block is spliced into the live snapshot and every other block travels
+# back verbatim.
+#
+# NOTE: reading the live snapshot is a real GET on the state endpoint and
+# therefore INCREMENTS state_count. A phase gating on state_count must take its
+# baseline AFTER calling this helper.
+configure_executions_no_nudge() {
+    local tag=$1 entries=$2
+
+    local snapshot spliced status
+    snapshot=$(curl -sf "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    # printf, not echo: the fixture carries backslash escapes (an embedded
+    # newline in the certs/ca data entry) that must travel back byte for byte.
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson e "${entries}" '.executions = $e')
+
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+}
+
+# --- Helper: configure the executions block and nudge the agent ---
+# Same as configure_executions_no_nudge plus a node_state_updated envelope, so
+# the agent pulls the new block right away instead of waiting out the ~30s
+# heartbeat reconcile cadence. The tag keeps the envelope id unique per call.
+configure_executions() {
+    local tag=$1 entries=$2
+    configure_executions_no_nudge "${tag}" "${entries}"
+
+    local payload status
+    payload=$(cat <<NUDGEEOF
+{
+    "id": "evt-e2e-nudge-${tag}",
+    "type": "node_state_updated",
+    "scope": "node",
+    "payload": "{\"node_id\":\"e2e-node-1\"}"
+}
+NUDGEEOF
+    )
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${payload}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] executions nudge injection returned status ${status}, want 204"
+    fi
 }
 
 cleanup() {
@@ -679,38 +765,23 @@ fi
 echo "=== Phase 7b PASSED: policy_updated SSE event ==="
 
 # ===================================================================
-# Phase 8: Action execution via SSE injection
+# Phase 8: Action execution from the pull's executions block
 # ===================================================================
-echo "=== Testing action execution via SSE ==="
+echo "=== Testing action execution from the executions block ==="
 
-# Record the execution callback counter. A successful builtin run posts three
-# callbacks in sequence: ack -> started -> succeeded.
+# Record the execution callback counter BEFORE the dispatch is configured: the
+# helper nudges an immediate pull, so a baseline taken afterwards could already
+# have missed the ack. A successful builtin run posts three callbacks in
+# sequence: ack -> started -> succeeded.
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
 CB_BEFORE=$(get_counter "${RESPONSE}" "execution_callback_count")
 echo "  execution_callback_count before: ${CB_BEFORE}"
 
-# Inject an action_request SSE event for the builtin "system.info" action.
-ACTION_PAYLOAD=$(cat <<'ACTEOF'
-{
-    "id": "evt-e2e-action-001",
-    "type": "action_request",
-    "scope": "node",
-    "payload": {
-        "execution_id": "exec-e2e-001",
-        "action": "system.info",
-        "timeout": "30s"
-    }
-}
-ACTEOF
-)
-ACTION_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
-    -X POST -H "Content-Type: application/json" \
-    -d "${ACTION_PAYLOAD}" \
-    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
-if [ "${ACTION_STATUS}" != "204" ]; then
-    fail "action_request event injection returned status ${ACTION_STATUS}, want 204"
-fi
-echo "  action_request event injected successfully"
+# Configure a pending builtin dispatch for "system.info" in the executions
+# block of the state snapshot.
+configure_executions "exec-e2e-001" \
+    "$(exec_entry "exec-e2e-001" "system.info" "builtin" "pending" "null")"
+echo "  system.info dispatch configured in the executions block"
 
 # Poll until execution_callback_count advances by at least 3 (ack + started +
 # terminal).
@@ -803,40 +874,23 @@ echo "=== Phase 8 PASSED: action execution ==="
 # ===================================================================
 echo "=== Testing additional builtin action types ==="
 
-# Helper function: inject an action, wait for the terminal callback, validate.
+# Helper function: dispatch an action through the executions block, wait for the
+# terminal callback, validate.
 test_action() {
     local action_name=$1 exec_id=$2
     shift 3
     # Remaining args are validation commands (passed as description only).
 
-    # Record the execution callback counter (ack -> started -> terminal = +3).
+    # Record the execution callback counter (ack -> started -> terminal = +3)
+    # before configuring the dispatch: the pull the helper nudges could
+    # otherwise land ahead of the baseline read.
     local resp cb_before
     resp=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
     cb_before=$(get_counter "${resp}" "execution_callback_count")
 
-    # Inject action_request SSE event.
-    local payload
-    payload=$(cat <<ACTEOF
-{
-    "id": "evt-e2e-${exec_id}",
-    "type": "action_request",
-    "scope": "node",
-    "payload": {
-        "execution_id": "${exec_id}",
-        "action": "${action_name}",
-        "timeout": "30s"
-    }
-}
-ACTEOF
-    )
-    local status
-    status=$(curl -sf -o /dev/null -w "%{http_code}" \
-        -X POST -H "Content-Type: application/json" \
-        -d "${payload}" \
-        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
-    if [ "${status}" != "204" ]; then
-        fail "${action_name} event injection returned status ${status}, want 204"
-    fi
+    # Configure a pending builtin dispatch in the pull's executions block.
+    configure_executions "${exec_id}" \
+        "$(exec_entry "${exec_id}" "${action_name}" "builtin" "pending" "null")"
 
     # Poll until execution_callback_count advances by at least 3.
     local timeout=30 elapsed=0 cb_after
@@ -965,36 +1019,20 @@ echo "=== Phase 8b PASSED: additional action types ==="
 # ===================================================================
 echo "=== Testing unknown action rejection ==="
 
-# Record the execution callback counter. A rejected action posts two callbacks:
-# ack -> failed (with error = reason).
+# Record the execution callback counter. A terminal status is reachable only
+# from started, so a rejected pending entry walks every legal edge down to it:
+# ack -> started -> failed (with error = reason), three callbacks in all.
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
 CB_BEFORE_UNK=$(get_counter "${RESPONSE}" "execution_callback_count")
 echo "  execution_callback_count before: ${CB_BEFORE_UNK}"
 
-# Inject action_request for a nonexistent action.
-UNK_PAYLOAD=$(cat <<'UNKEOF'
-{
-    "id": "evt-e2e-unknown-001",
-    "type": "action_request",
-    "scope": "node",
-    "payload": {
-        "execution_id": "exec-e2e-unknown-001",
-        "action": "nonexistent.fake",
-        "timeout": "10s"
-    }
-}
-UNKEOF
-)
-UNK_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
-    -X POST -H "Content-Type: application/json" \
-    -d "${UNK_PAYLOAD}" \
-    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
-if [ "${UNK_STATUS}" != "204" ]; then
-    fail "unknown action event injection returned status ${UNK_STATUS}, want 204"
-fi
-echo "  unknown action event injected"
+# Configure a pending builtin dispatch for a nonexistent action.
+configure_executions "exec-e2e-unknown-001" \
+    "$(exec_entry "exec-e2e-unknown-001" "nonexistent.fake" "builtin" "pending" "null")"
+echo "  unknown action dispatch configured in the executions block"
 
-# Poll until execution_callback_count advances by at least 2 (ack + failed).
+# Poll until execution_callback_count advances by at least 3 (ack + started +
+# failed).
 UNK_TIMEOUT=15
 UNK_ELAPSED=0
 UNK_CB_PASSED=0
@@ -1004,8 +1042,8 @@ while [ "${UNK_ELAPSED}" -lt "${UNK_TIMEOUT}" ]; do
     RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
     if [ -n "${RESPONSE}" ]; then
         CB_AFTER_UNK=$(get_counter "${RESPONSE}" "execution_callback_count")
-        if [ "${CB_AFTER_UNK}" -ge $((CB_BEFORE_UNK + 2)) ]; then
-            echo "  PASS: execution_callback_count advanced from ${CB_BEFORE_UNK} to ${CB_AFTER_UNK} (>= +2)"
+        if [ "${CB_AFTER_UNK}" -ge $((CB_BEFORE_UNK + 3)) ]; then
+            echo "  PASS: execution_callback_count advanced from ${CB_BEFORE_UNK} to ${CB_AFTER_UNK} (>= +3)"
             UNK_CB_PASSED=1
             break
         fi
@@ -1014,7 +1052,7 @@ done
 
 if [ "${UNK_CB_PASSED}" -eq 0 ]; then
     CB_AFTER_UNK=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
-    fail "execution_callback_count did not reach $((CB_BEFORE_UNK + 2)) for unknown action (before=${CB_BEFORE_UNK}, after=${CB_AFTER_UNK})"
+    fail "execution_callback_count did not reach $((CB_BEFORE_UNK + 3)) for unknown action (before=${CB_BEFORE_UNK}, after=${CB_AFTER_UNK})"
 fi
 
 # Validate the terminal (failed) callback body: status failed, error = reason.
@@ -1046,11 +1084,9 @@ echo "=== Phase 8c PASSED: unknown action rejection ==="
 # one PUT. That is +4 execution callbacks and +1 execution upload.
 echo "=== Testing over-ceiling execution output upload ==="
 
-# plexd verifies hooks against a plain lowercase-hex sha256 of the file, so the
-# action_request must carry the hook's own checksum.
-HOOK_SHA=$(sha256_hex < "${SCRIPT_DIR}/hooks/e2e-bigout")
-echo "  e2e-bigout checksum: ${HOOK_SHA}"
-
+# The pull entry carries no checksum: plexd verifies a hook against the digest
+# it recorded when it discovered the hook on disk.
+#
 # The uploaded output is exactly 20480 'A' bytes; reproduce its sha256 locally so
 # the terminal callback's output.sha256 can be checked against a known value.
 EXPECTED_OUT_SHA=$(head -c 20480 /dev/zero | tr '\0' 'A' | sha256_hex)
@@ -1062,30 +1098,10 @@ UP_BEFORE_BIG=$(get_counter "${RESPONSE}" "execution_upload_count")
 echo "  execution_callback_count before: ${CB_BEFORE_BIG}"
 echo "  execution_upload_count before: ${UP_BEFORE_BIG}"
 
-# Inject action_request for the e2e-bigout hook (interpolated heredoc: HOOK_SHA
-# must expand into the payload).
-BIG_PAYLOAD=$(cat <<BIGEOF
-{
-    "id": "evt-e2e-big-001",
-    "type": "action_request",
-    "scope": "node",
-    "payload": {
-        "execution_id": "exec-e2e-big-001",
-        "action": "e2e-bigout",
-        "timeout": "30s",
-        "checksum": "${HOOK_SHA}"
-    }
-}
-BIGEOF
-)
-BIG_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
-    -X POST -H "Content-Type: application/json" \
-    -d "${BIG_PAYLOAD}" \
-    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
-if [ "${BIG_STATUS}" != "204" ]; then
-    fail "e2e-bigout event injection returned status ${BIG_STATUS}, want 204"
-fi
-echo "  e2e-bigout action_request injected"
+# Configure a pending hook dispatch for e2e-bigout in the executions block.
+configure_executions "exec-e2e-big-001" \
+    "$(exec_entry "exec-e2e-big-001" "e2e-bigout" "hook" "pending" "null")"
+echo "  e2e-bigout dispatch configured in the executions block"
 
 # Poll until the upload landed (+1) AND all four callbacks arrived (+4).
 BIG_TIMEOUT=30
@@ -1148,6 +1164,232 @@ else
 fi
 
 echo "=== Phase 8d PASSED: over-ceiling execution output upload ==="
+
+# ===================================================================
+# Phase 8f: execution resume from a seeded status
+# ===================================================================
+# The executions block reports the LIVE status of every entry still awaiting
+# delivery, so an agent that picks up an execution mid-flight sees the
+# transition the control plane already recorded. Two resumes are proven:
+#   - an entry held at ack is completed without a second ack (started ->
+#     succeeded, +2 callbacks); a repeated ack would be refused as an illegal
+#     transition and the run would abort short of the gate.
+#   - an entry held at started under an execution id this agent never ran is
+#     reported lost with a single terminal callback (+1). Actions are not
+#     idempotent, so the run is never repeated.
+# The two sub-steps run sequentially: the last-request endpoint keeps only the
+# most recent callback body, so overlapping runs would make it ambiguous.
+echo "=== Testing execution resume from a seeded status ==="
+
+# --- 8f-1: an entry seeded at ack resumes without re-acking (+2 callbacks).
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+CB_BEFORE_RACK=$(get_counter "${RESPONSE}" "execution_callback_count")
+echo "  [ack resume] execution_callback_count before: ${CB_BEFORE_RACK}"
+
+configure_executions "exec-e2e-resume-ack-001" \
+    "$(exec_entry "exec-e2e-resume-ack-001" "system.info" "builtin" "ack" "null")"
+echo "  [ack resume] ack-seeded dispatch configured in the executions block"
+
+RACK_TIMEOUT=30
+RACK_ELAPSED=0
+RACK_PASSED=0
+while [ "${RACK_ELAPSED}" -lt "${RACK_TIMEOUT}" ]; do
+    sleep 2
+    RACK_ELAPSED=$((RACK_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        CB_AFTER_RACK=$(get_counter "${RESPONSE}" "execution_callback_count")
+        if [ "${CB_AFTER_RACK}" -ge $((CB_BEFORE_RACK + 2)) ]; then
+            echo "  PASS: [ack resume] execution_callback_count advanced from ${CB_BEFORE_RACK} to ${CB_AFTER_RACK} (>= +2, started + succeeded)"
+            RACK_PASSED=1
+            break
+        fi
+    fi
+done
+
+if [ "${RACK_PASSED}" -eq 0 ]; then
+    CB_AFTER_RACK=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+    fail "[ack resume] execution_callback_count did not reach $((CB_BEFORE_RACK + 2)) (before=${CB_BEFORE_RACK}, after=${CB_AFTER_RACK}); a re-ack would have been refused"
+fi
+
+RACK_CB_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
+if [ -z "${RACK_CB_BODY}" ]; then
+    fail "[ack resume] no execution_callback body captured"
+fi
+RACK_CB_STATUS=$(echo "${RACK_CB_BODY}" | jq -r '.status // empty')
+if [ "${RACK_CB_STATUS}" = "succeeded" ]; then
+    echo "  PASS: [ack resume] terminal callback status = succeeded"
+else
+    fail "[ack resume] terminal callback status = '${RACK_CB_STATUS}', want 'succeeded'"
+fi
+
+# --- 8f-2: an entry seeded at started under an unknown id is reported lost.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+CB_BEFORE_ORPH=$(get_counter "${RESPONSE}" "execution_callback_count")
+echo "  [orphan resume] execution_callback_count before: ${CB_BEFORE_ORPH}"
+
+configure_executions "exec-e2e-resume-orphan-001" \
+    "$(exec_entry "exec-e2e-resume-orphan-001" "system.info" "builtin" "started" "null")"
+echo "  [orphan resume] started-seeded dispatch configured in the executions block"
+
+ORPH_TIMEOUT=30
+ORPH_ELAPSED=0
+ORPH_PASSED=0
+while [ "${ORPH_ELAPSED}" -lt "${ORPH_TIMEOUT}" ]; do
+    sleep 2
+    ORPH_ELAPSED=$((ORPH_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        CB_AFTER_ORPH=$(get_counter "${RESPONSE}" "execution_callback_count")
+        if [ "${CB_AFTER_ORPH}" -ge $((CB_BEFORE_ORPH + 1)) ]; then
+            echo "  PASS: [orphan resume] execution_callback_count advanced from ${CB_BEFORE_ORPH} to ${CB_AFTER_ORPH} (>= +1)"
+            ORPH_PASSED=1
+            break
+        fi
+    fi
+done
+
+if [ "${ORPH_PASSED}" -eq 0 ]; then
+    CB_AFTER_ORPH=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+    fail "[orphan resume] execution_callback_count did not reach $((CB_BEFORE_ORPH + 1)) (before=${CB_BEFORE_ORPH}, after=${CB_AFTER_ORPH})"
+fi
+
+ORPH_CB_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
+if [ -z "${ORPH_CB_BODY}" ]; then
+    fail "[orphan resume] no execution_callback body captured"
+fi
+ORPH_CB_STATUS=$(echo "${ORPH_CB_BODY}" | jq -r '.status // empty')
+if [ "${ORPH_CB_STATUS}" = "failed" ]; then
+    echo "  PASS: [orphan resume] terminal callback status = failed"
+else
+    fail "[orphan resume] terminal callback status = '${ORPH_CB_STATUS}', want 'failed'"
+fi
+ORPH_CB_ERROR=$(echo "${ORPH_CB_BODY}" | jq -r '.error // empty')
+if [ "${ORPH_CB_ERROR}" = "execution lost to an agent restart" ]; then
+    echo "  PASS: [orphan resume] terminal callback error = 'execution lost to an agent restart'"
+else
+    fail "[orphan resume] terminal callback error = '${ORPH_CB_ERROR}', want 'execution lost to an agent restart'"
+fi
+
+# The single terminal callback must be the ONLY one: had the entry been run
+# again, an ack/started pair would trail it. Settle briefly, then re-read.
+sleep 5
+CB_SETTLED_ORPH=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+if [ "${CB_SETTLED_ORPH}" -eq $((CB_BEFORE_ORPH + 1)) ]; then
+    echo "  PASS: [orphan resume] execution_callback_count settled at exactly +1 (no re-execution)"
+else
+    fail "[orphan resume] execution_callback_count settled at ${CB_SETTLED_ORPH}, want exactly $((CB_BEFORE_ORPH + 1)); the lost run was re-executed"
+fi
+
+echo "=== Phase 8f PASSED: execution resume from a seeded status ==="
+
+# ===================================================================
+# Phase 8g: action_request is a pull trigger, not a delivery channel
+# ===================================================================
+# The dispatch is configured WITHOUT the usual nudge, then an action_request
+# envelope carrying an opaque payload is injected. Nothing in that payload can
+# identify the execution: the event only requests a reconcile, and the pull it
+# triggers is what carries the dispatch.
+echo "=== Testing action_request as a pull trigger ==="
+
+# Baseline the callback counter BEFORE the block is configured, so a pull that
+# lands early cannot hide the ack from the +3 gate.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+CB_BEFORE_PUSH=$(get_counter "${RESPONSE}" "execution_callback_count")
+echo "  execution_callback_count before: ${CB_BEFORE_PUSH}"
+
+configure_executions_no_nudge "exec-e2e-push-001" \
+    "$(exec_entry "exec-e2e-push-001" "system.info" "builtin" "pending" "null")"
+echo "  push dispatch configured in the executions block (no nudge)"
+
+# Baseline state_count AFTER the configure post: the helper reads the live
+# snapshot over the real state endpoint, which bumps the counter itself.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+[ -n "${RESPONSE}" ] || fail "assert endpoint unreachable while baselining Phase 8g"
+STATE_BEFORE_PUSH=$(get_counter "${RESPONSE}" "state_count")
+echo "  state_count before: ${STATE_BEFORE_PUSH}"
+
+# Inject an action_request whose payload is junk: its content is irrelevant to
+# the node, which learns the dispatch only from the pull.
+PUSH_PAYLOAD=$(cat <<'PUSHEOF'
+{
+    "id": "evt-e2e-push-001",
+    "type": "action_request",
+    "scope": "node",
+    "payload": "{}"
+}
+PUSHEOF
+)
+PUSH_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${PUSH_PAYLOAD}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${PUSH_STATUS}" != "204" ]; then
+    fail "action_request event injection returned status ${PUSH_STATUS}, want 204"
+fi
+echo "  action_request injected with an opaque payload"
+
+# The event must pull the state promptly. The heartbeat fixture answers
+# reconcile: true on its own ~30s cadence, so this window is deliberately
+# shorter than that fallback -- what is proven here is that the pull happens now.
+PUSH_TIMEOUT=15
+PUSH_ELAPSED=0
+PUSH_STATE_PASSED=0
+while [ "${PUSH_ELAPSED}" -lt "${PUSH_TIMEOUT}" ]; do
+    sleep 2
+    PUSH_ELAPSED=$((PUSH_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        STATE_AFTER_PUSH=$(get_counter "${RESPONSE}" "state_count")
+        if [ "${STATE_AFTER_PUSH}" -gt "${STATE_BEFORE_PUSH}" ]; then
+            echo "  PASS: state_count increased from ${STATE_BEFORE_PUSH} to ${STATE_AFTER_PUSH} after action_request"
+            PUSH_STATE_PASSED=1
+            break
+        fi
+    fi
+done
+
+if [ "${PUSH_STATE_PASSED}" -eq 0 ]; then
+    STATE_AFTER_PUSH=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    fail "state_count did not increase after action_request (before=${STATE_BEFORE_PUSH}, after=${STATE_AFTER_PUSH})"
+fi
+
+# The pull the event triggered carried the dispatch, so the run completes with
+# the usual three callbacks.
+PUSH_CB_TIMEOUT=30
+PUSH_CB_ELAPSED=0
+PUSH_CB_PASSED=0
+while [ "${PUSH_CB_ELAPSED}" -lt "${PUSH_CB_TIMEOUT}" ]; do
+    sleep 2
+    PUSH_CB_ELAPSED=$((PUSH_CB_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        CB_AFTER_PUSH=$(get_counter "${RESPONSE}" "execution_callback_count")
+        if [ "${CB_AFTER_PUSH}" -ge $((CB_BEFORE_PUSH + 3)) ]; then
+            echo "  PASS: execution_callback_count advanced from ${CB_BEFORE_PUSH} to ${CB_AFTER_PUSH} (>= +3)"
+            PUSH_CB_PASSED=1
+            break
+        fi
+    fi
+done
+
+if [ "${PUSH_CB_PASSED}" -eq 0 ]; then
+    CB_AFTER_PUSH=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+    fail "execution_callback_count did not reach $((CB_BEFORE_PUSH + 3)) after action_request (before=${CB_BEFORE_PUSH}, after=${CB_AFTER_PUSH})"
+fi
+
+PUSH_CB_BODY=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
+if [ -z "${PUSH_CB_BODY}" ]; then
+    fail "no execution_callback body captured for the push-triggered run"
+fi
+PUSH_CB_STATUS=$(echo "${PUSH_CB_BODY}" | jq -r '.status // empty')
+if [ "${PUSH_CB_STATUS}" = "succeeded" ]; then
+    echo "  PASS: push-triggered terminal callback status = succeeded"
+else
+    fail "push-triggered terminal callback status = '${PUSH_CB_STATUS}', want 'succeeded'"
+fi
+
+echo "=== Phase 8g PASSED: action_request is a pull trigger ==="
 
 # ===================================================================
 # Phase 8e: TCP session lifecycle (session_started + session_ended)
@@ -2683,45 +2925,25 @@ echo "  fixture.bin SHA-256: ${FIXTURE_DIGEST}"
 # SHA-256 of empty input; used to force a checksum_mismatch verdict.
 EMPTY_DIGEST="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-# dispatch_upgrade injects a service.upgrade action_request and asserts its
-# terminal execution callback. Args: event-id execution-id version checksum
-# expected-callback-status expected-output-status. Like Phase 8, a run posts
-# three callbacks (ack -> started -> terminal) and the last-request endpoint
-# captures only the most recent, so polling +3 then reading it yields the
-# terminal callback.
+# dispatch_upgrade configures a service.upgrade dispatch in the pull's
+# executions block and asserts its terminal execution callback. Args:
+# execution-id version checksum expected-callback-status expected-output-status.
+# Like Phase 8, a run posts three callbacks (ack -> started -> terminal) and the
+# last-request endpoint captures only the most recent, so polling +3 then
+# reading it yields the terminal callback. The version and checksum travel as
+# JSON strings in the entry's parameters object and reach the builtin verbatim.
 dispatch_upgrade() {
-    local evt_id=$1 exec_id=$2 version=$3 checksum=$4 want_cb=$5 want_out=$6
+    local exec_id=$1 version=$2 checksum=$3 want_cb=$4 want_out=$5
 
+    # Baseline before configuring: the dispatch helper nudges an immediate pull.
     local cb_before
     cb_before=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
     echo "  [${exec_id}] execution_callback_count before: ${cb_before}"
 
-    local payload
-    payload=$(cat <<UPGEOF
-{
-    "id": "${evt_id}",
-    "type": "action_request",
-    "scope": "node",
-    "payload": {
-        "execution_id": "${exec_id}",
-        "action": "service.upgrade",
-        "timeout": "60s",
-        "parameters": {
-            "version": "${version}",
-            "checksum": "${checksum}"
-        }
-    }
-}
-UPGEOF
-    )
-    local inject_status
-    inject_status=$(curl -sf -o /dev/null -w "%{http_code}" \
-        -X POST -H "Content-Type: application/json" \
-        -d "${payload}" \
-        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
-    if [ "${inject_status}" != "204" ]; then
-        fail "[${exec_id}] service.upgrade inject returned status ${inject_status}, want 204"
-    fi
+    local params
+    params=$(printf '{"version": "%s", "checksum": "%s"}' "${version}" "${checksum}")
+    configure_executions "${exec_id}" \
+        "$(exec_entry "${exec_id}" "service.upgrade" "builtin" "pending" "${params}")"
 
     # Poll until the callback counter advances by >= 3 (ack + started +
     # terminal). The first dispatch performs a real Sigstore verification, so
@@ -2767,7 +2989,7 @@ UPGEOF
 
 # Dispatch 1: valid release asset + matching checksum. systemctl is absent in
 # the container, so the terminal status is upgraded_restart_pending, exit 0.
-dispatch_upgrade "evt-e2e-upgrade-001" "exec-e2e-upgrade-001" \
+dispatch_upgrade "exec-e2e-upgrade-001" \
     "v9.9.9" "${FIXTURE_DIGEST}" "succeeded" "upgraded_restart_pending"
 UPG_CB=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
 UPG_EXIT=$(echo "${UPG_CB}" | jq -r '.exit_code // empty')
@@ -2778,13 +3000,13 @@ echo "  PASS: v9.9.9 upgrade succeeded with exit_code 0 (restart pending)"
 
 # Dispatch 2: valid release asset but a checksum that cannot match (empty-input
 # digest) -> checksum_mismatch, callback failed, before the bundle is fetched.
-dispatch_upgrade "evt-e2e-upgrade-002" "exec-e2e-upgrade-002" \
+dispatch_upgrade "exec-e2e-upgrade-002" \
     "v9.9.9" "${EMPTY_DIGEST}" "failed" "checksum_mismatch"
 echo "  PASS: mismatched checksum rejected as checksum_mismatch"
 
 # Dispatch 3: matching checksum but the v9.9.8 tag serves a garbage (non-JSON)
 # Sigstore bundle -> bundle_verification_failed, callback failed.
-dispatch_upgrade "evt-e2e-upgrade-003" "exec-e2e-upgrade-003" \
+dispatch_upgrade "exec-e2e-upgrade-003" \
     "v9.9.8" "${FIXTURE_DIGEST}" "failed" "bundle_verification_failed"
 echo "  PASS: garbage Sigstore bundle rejected as bundle_verification_failed"
 
