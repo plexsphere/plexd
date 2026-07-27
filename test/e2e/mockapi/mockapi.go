@@ -781,11 +781,15 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 // handleState handles GET /v1/nodes/{id}/state (REQ-004). The executions block
 // is served through projectExecutions, so every pull reports the live callback
-// status of each entry still awaiting delivery.
+// status of each entry still awaiting delivery. The sessions block is served
+// through projectSessions, so every pull redelivers the sessions that are still
+// live.
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.stateCount.Add(1)
 	state := s.GetState()
 	state.Executions = s.projectExecutions(state.Executions)
+	served := s.projectSessions(*state.Sessions)
+	state.Sessions = &served
 	writeJSON(w, http.StatusOK, state)
 }
 
@@ -814,6 +818,28 @@ func (s *Server) projectExecutions(configured []api.NodeStateExecution) []api.No
 			exec.Status = live
 		}
 		served = append(served, exec)
+	}
+	return served
+}
+
+// projectSessions returns the sessions block as served: a freshly allocated
+// slice — the fixture is handed out as a shallow copy, so the configured entries
+// are never rewritten in place — carrying every entry whose expires_at is still
+// in the future. The block is desired state, so a live entry is redelivered on
+// every pull; hard expiry drains it out, and an entry carrying no expires_at at
+// all is therefore never served. Revocation is a re-posted fixture without the
+// entry. Unlike executions there is no status projection — sessions have no
+// callback state machine — so no lock is taken: the fixture copy is already read
+// under the fixture lock in GetState and this only filters its argument. The
+// result is never nil, so the block serializes as [] rather than null.
+func (s *Server) projectSessions(configured []api.NodeStateSession) []api.NodeStateSession {
+	now := time.Now()
+	served := make([]api.NodeStateSession, 0, len(configured))
+	for _, session := range configured {
+		if !session.ExpiresAt.After(now) {
+			continue
+		}
+		served = append(served, session)
 	}
 	return served
 }
@@ -1812,16 +1838,16 @@ func (s *Server) SetState(state api.NodeStateSnapshot) {
 	}
 }
 
-// GetState returns the current state fixture with the peers and executions
-// slices normalized to non-nil so they always serialize as [] rather than null.
-// The seven envelope blocks carry no omitempty, so all keys are emitted (null
-// for unpopulated blocks).
+// GetState returns the current state fixture with the peers, executions, and
+// sessions slices normalized to non-nil so they always serialize as [] rather
+// than null. The eight envelope blocks carry no omitempty, so all keys are
+// emitted (null for unpopulated blocks).
 //
 // The result is a SHALLOW copy: the policy, bridge, state, and reports pointers
-// and the peers and executions backing arrays alias the live fixture. Reading is
-// safe — SetState replaces the whole struct under the mutex, so no caller
-// observes a half-written fixture — but callers must NOT mutate through the
-// returned pointers or slices, which would race the state handler serving a
+// and the peers, executions, and sessions backing arrays alias the live fixture.
+// Reading is safe — SetState replaces the whole struct under the mutex, so no
+// caller observes a half-written fixture — but callers must NOT mutate through
+// the returned pointers or slices, which would race the state handler serving a
 // concurrent request. Change the fixture with SetState instead.
 func (s *Server) GetState() api.NodeStateSnapshot {
 	s.stateFixtureMu.RLock()
@@ -1832,6 +1858,9 @@ func (s *Server) GetState() api.NodeStateSnapshot {
 	}
 	if state.Executions == nil {
 		state.Executions = []api.NodeStateExecution{}
+	}
+	if state.Sessions == nil {
+		state.Sessions = &[]api.NodeStateSession{}
 	}
 	return state
 }
