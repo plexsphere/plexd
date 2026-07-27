@@ -76,20 +76,20 @@ func integrationLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 }
 
-// newRealVerifier creates a real integrity.Verifier backed by a temp store.
-func newRealVerifier(t *testing.T) *integrity.Verifier {
+// newRealVerifier creates a real integrity.Verifier backed by a temp store and
+// the given violation reporter.
+func newRealVerifier(t *testing.T, violations integrity.ViolationReporter) *integrity.Verifier {
 	t.Helper()
 	dataDir := t.TempDir()
 	store, err := integrity.NewStore(dataDir)
 	if err != nil {
 		t.Fatalf("new integrity store: %v", err)
 	}
-	// Use a no-op violation reporter since we only care about the bool return.
 	return integrity.NewVerifier(integrity.Config{
 		Enabled:        true,
 		BinaryPath:     "/dev/null",
 		VerifyInterval: time.Hour,
-	}, store, &noopViolationReporter{}, integrationLogger())
+	}, store, violations, integrationLogger())
 }
 
 type noopViolationReporter struct{}
@@ -98,22 +98,43 @@ func (noopViolationReporter) ReportViolation(_ context.Context, _ string, _ api.
 	return nil
 }
 
-func integrationEnvelope(t *testing.T, req api.ActionRequest) api.Envelope {
-	t.Helper()
-	data, err := json.Marshal(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return api.Envelope{
-		Type:    api.EventActionRequest,
-		ID:      "evt-" + req.ExecutionID,
-		Payload: data,
+// recordingViolationReporter captures the integrity violations a refused hook
+// files with the control plane.
+type recordingViolationReporter struct {
+	mu      sync.Mutex
+	reports []api.IntegrityViolationReport
+}
+
+func (r *recordingViolationReporter) ReportViolation(_ context.Context, _ string, report api.IntegrityViolationReport) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reports = append(r.reports, report)
+	return nil
+}
+
+func (r *recordingViolationReporter) getReports() []api.IntegrityViolationReport {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cp := make([]api.IntegrityViolationReport, len(r.reports))
+	copy(cp, r.reports)
+	return cp
+}
+
+// integrationConfig is the enabled, generously bounded config the integration
+// scenarios share.
+func integrationConfig(hooksDir string) Config {
+	return Config{
+		Enabled:          boolPtr(true),
+		HooksDir:         hooksDir,
+		MaxConcurrent:    5,
+		MaxActionTimeout: 10 * time.Minute,
+		MaxOutputBytes:   1 << 20,
 	}
 }
 
-// TestIntegration_FullActionLifecycle tests the full lifecycle:
-// action_request → ack → started → terminal callback.
-// Tests both built-in and hook paths with real integrity verification.
+// TestIntegration_FullActionLifecycle drives the full lifecycle through the
+// dispatcher — pull entry → ack → started → terminal — for both the builtin and
+// the hook path, with real integrity verification.
 func TestIntegration_FullActionLifecycle(t *testing.T) {
 	hooksDir := t.TempDir()
 	hookContent := "#!/bin/sh\necho \"hook-lifecycle-output\"\n"
@@ -127,37 +148,26 @@ func TestIntegration_FullActionLifecycle(t *testing.T) {
 		t.Fatalf("hash hook: %v", err)
 	}
 
-	reporter := &integrationReporter{}
-	verifier := newRealVerifier(t)
+	cfg := integrationConfig(hooksDir)
+	verifier := newRealVerifier(t, noopViolationReporter{})
 
-	cfg := Config{
-		Enabled:          boolPtr(true),
-		HooksDir:         hooksDir,
-		MaxConcurrent:    5,
-		MaxActionTimeout: 10 * time.Minute,
-		MaxOutputBytes:   1 << 20,
+	newExecutor := func(reporter ActionReporter) *Executor {
+		exec := NewExecutor(cfg, reporter, verifier, integrationLogger())
+		exec.RegisterBuiltin("gather_info", "Gather info", nil, func(_ context.Context, _ map[string]string) (string, string, int, error) {
+			return `{"status":"ok"}`, "", 0, nil
+		})
+		exec.SetHooks([]api.HookInfo{
+			{Name: "lifecycle-hook", Source: "local", Checksum: hookChecksum},
+		})
+		return exec
 	}
-	exec := NewExecutor(cfg, reporter, verifier, integrationLogger())
 
-	exec.RegisterBuiltin("gather_info", "Gather info", nil, func(_ context.Context, _ map[string]string) (string, string, int, error) {
-		return `{"status":"ok"}`, "", 0, nil
-	})
-	exec.SetHooks([]api.HookInfo{
-		{Name: "lifecycle-hook", Source: "local", Checksum: hookChecksum},
-	})
-
-	handler := HandleActionRequest(exec, "node-integ", integrationLogger())
-
-	// --- Builtin path ---
 	t.Run("builtin", func(t *testing.T) {
-		req := api.ActionRequest{
-			ExecutionID: "integ-builtin-001",
-			Action:      "gather_info",
-			Timeout:     "30s",
-		}
-		if err := handler(context.Background(), integrationEnvelope(t, req)); err != nil {
-			t.Fatalf("handler error: %v", err)
-		}
+		reporter := &integrationReporter{}
+		exec := newExecutor(reporter)
+		dispatcher := NewDispatcher(exec, "node-integ", integrationLogger())
+
+		dispatcher.Handle(context.Background(), snapshot(pendingExec("integ-builtin-001", "gather_info")))
 
 		integrationWaitFor(t, 5*time.Second, func() bool {
 			return len(reporter.getCallbacks()) >= 3
@@ -179,33 +189,18 @@ func TestIntegration_FullActionLifecycle(t *testing.T) {
 		}
 	})
 
-	// --- Hook path ---
 	t.Run("hook", func(t *testing.T) {
-		reporter2 := &integrationReporter{}
-		exec2 := NewExecutor(cfg, reporter2, verifier, integrationLogger())
-		exec2.RegisterBuiltin("gather_info", "Gather info", nil, func(_ context.Context, _ map[string]string) (string, string, int, error) {
-			return `{"status":"ok"}`, "", 0, nil
-		})
-		exec2.SetHooks([]api.HookInfo{
-			{Name: "lifecycle-hook", Source: "local", Checksum: hookChecksum},
-		})
-		handler2 := HandleActionRequest(exec2, "node-integ", integrationLogger())
+		reporter := &integrationReporter{}
+		exec := newExecutor(reporter)
+		dispatcher := NewDispatcher(exec, "node-integ", integrationLogger())
 
-		req := api.ActionRequest{
-			ExecutionID: "integ-hook-001",
-			Action:      "lifecycle-hook",
-			Timeout:     "30s",
-			Checksum:    hookChecksum,
-		}
-		if err := handler2(context.Background(), integrationEnvelope(t, req)); err != nil {
-			t.Fatalf("handler error: %v", err)
-		}
+		dispatcher.Handle(context.Background(), snapshot(pendingHookExec("integ-hook-001", "lifecycle-hook")))
 
 		integrationWaitFor(t, 5*time.Second, func() bool {
-			return len(reporter2.getCallbacks()) >= 3
+			return len(reporter.getCallbacks()) >= 3
 		})
 
-		cbs := reporter2.getCallbacks()
+		cbs := reporter.getCallbacks()
 		assertStatuses(t, cbs, []string{
 			api.ExecutionStatusAck,
 			api.ExecutionStatusStarted,
@@ -222,9 +217,10 @@ func TestIntegration_FullActionLifecycle(t *testing.T) {
 	})
 }
 
-// TestIntegration_ConcurrentExecutions fires multiple action requests concurrently,
-// verifies concurrency limit enforcement, and passes under -race.
-func TestIntegration_ConcurrentExecutions(t *testing.T) {
+// TestIntegration_ConcurrencyBackpressure fires a full block at a saturated
+// executor: the entries beyond the limit are deferred without a callback, and a
+// later cycle delivers every one of them.
+func TestIntegration_ConcurrencyBackpressure(t *testing.T) {
 	hooksDir := t.TempDir()
 	hookContent := "#!/bin/sh\nsleep 0.1\necho done\n"
 	hookPath := filepath.Join(hooksDir, "concurrent-hook")
@@ -238,90 +234,51 @@ func TestIntegration_ConcurrentExecutions(t *testing.T) {
 	}
 
 	reporter := &integrationReporter{}
-	verifier := newRealVerifier(t)
+	verifier := newRealVerifier(t, noopViolationReporter{})
 
-	maxConcurrent := 3
-	cfg := Config{
-		Enabled:          boolPtr(true),
-		HooksDir:         hooksDir,
-		MaxConcurrent:    maxConcurrent,
-		MaxActionTimeout: 10 * time.Minute,
-		MaxOutputBytes:   1 << 20,
-	}
+	const maxConcurrent = 3
+	cfg := integrationConfig(hooksDir)
+	cfg.MaxConcurrent = maxConcurrent
 	exec := NewExecutor(cfg, reporter, verifier, integrationLogger())
 	exec.SetHooks([]api.HookInfo{
 		{Name: "concurrent-hook", Source: "local", Checksum: hookChecksum},
 	})
+	dispatcher := NewDispatcher(exec, "node-concurrent", integrationLogger())
 
-	handler := HandleActionRequest(exec, "node-concurrent", integrationLogger())
-
-	totalRequests := 6
-	var wg sync.WaitGroup
-	wg.Add(totalRequests)
-
-	for i := 0; i < totalRequests; i++ {
-		go func(idx int) {
-			defer wg.Done()
-			req := api.ActionRequest{
-				ExecutionID: fmt.Sprintf("integ-concurrent-%03d", idx),
-				Action:      "concurrent-hook",
-				Timeout:     "30s",
-				Checksum:    hookChecksum,
-			}
-			_ = handler(context.Background(), integrationEnvelope(t, req))
-		}(i)
+	const totalEntries = 6
+	block := make([]api.NodeStateExecution, 0, totalEntries)
+	for i := range totalEntries {
+		block = append(block, pendingHookExec(fmt.Sprintf("integ-concurrent-%03d", i), "concurrent-hook"))
 	}
 
-	wg.Wait()
+	dispatcher.Handle(context.Background(), snapshot(block...))
 
-	// Every execution acks; accepted ones then start, rejected ones fail.
-	integrationWaitFor(t, 10*time.Second, func() bool {
-		return reporter.statusCount(api.ExecutionStatusAck) >= totalRequests
-	})
-	integrationWaitFor(t, 10*time.Second, func() bool {
-		terminal := reporter.statusCount(api.ExecutionStatusSucceeded) + reporter.statusCount(api.ExecutionStatusFailed)
-		return terminal >= totalRequests
+	// A saturated executor defers: no entry beyond the limit is failed, so the
+	// first cycle can never produce more than maxConcurrent acks.
+	if got := reporter.statusCount(api.ExecutionStatusAck); got > maxConcurrent {
+		t.Errorf("acks after the first cycle = %d, want at most %d", got, maxConcurrent)
+	}
+	if got := reporter.statusCount(api.ExecutionStatusFailed); got != 0 {
+		t.Errorf("failed callbacks = %d, want 0 for deferred entries", got)
+	}
+
+	// Later cycles redeliver the block until every entry has run.
+	integrationWaitFor(t, 30*time.Second, func() bool {
+		dispatcher.Handle(context.Background(), snapshot(block...))
+		return reporter.statusCount(api.ExecutionStatusSucceeded) >= totalEntries
 	})
 
-	cbs := reporter.getCallbacks()
-	var acks, started, succeeded, rejected int
-	for _, cb := range cbs {
-		switch cb.Status {
-		case api.ExecutionStatusAck:
-			acks++
-		case api.ExecutionStatusStarted:
-			started++
-		case api.ExecutionStatusSucceeded:
-			succeeded++
-		case api.ExecutionStatusFailed:
-			rejected++
-			if cb.Error != "max_concurrent_reached" {
-				t.Errorf("failed error = %q, want max_concurrent_reached", cb.Error)
-			}
-		default:
-			t.Errorf("unexpected callback status = %q", cb.Status)
-		}
+	if got := reporter.statusCount(api.ExecutionStatusAck); got != totalEntries {
+		t.Errorf("acks = %d, want %d", got, totalEntries)
 	}
-
-	if acks != totalRequests {
-		t.Errorf("acks = %d, want %d", acks, totalRequests)
-	}
-	// Accepted executions start and succeed; rejected ones only fail.
-	if started != succeeded {
-		t.Errorf("started = %d, succeeded = %d, want equal", started, succeeded)
-	}
-	if started+rejected != totalRequests {
-		t.Errorf("started+rejected = %d, want %d", started+rejected, totalRequests)
-	}
-	if started > maxConcurrent+1 {
-		// Some concurrency overlap is possible since hooks complete quickly (0.1s).
-		// But we should never exceed the limit by a lot.
-		t.Errorf("started = %d, maxConcurrent = %d (should not wildly exceed)", started, maxConcurrent)
+	if got := reporter.statusCount(api.ExecutionStatusFailed); got != 0 {
+		t.Errorf("failed callbacks = %d, want 0", got)
 	}
 }
 
-// TestIntegration_HookIntegrityAndExecution tests hook discovery, real integrity
-// verification, parameter passing as env vars, and terminal callback reporting.
+// TestIntegration_HookIntegrityAndExecution covers hook discovery, real
+// integrity verification against the discovery digest, parameter passing as env
+// vars, and the violation filed when the hook's bytes drift after discovery.
 func TestIntegration_HookIntegrityAndExecution(t *testing.T) {
 	hooksDir := t.TempDir()
 
@@ -344,47 +301,26 @@ func TestIntegration_HookIntegrityAndExecution(t *testing.T) {
 		t.Fatalf("hook name = %q, want deploy", hooks[0].Name)
 	}
 
-	reporter := &integrationReporter{}
-	verifier := newRealVerifier(t)
+	cfg := integrationConfig(hooksDir)
 
-	cfg := Config{
-		Enabled:          boolPtr(true),
-		HooksDir:         hooksDir,
-		MaxConcurrent:    5,
-		MaxActionTimeout: 10 * time.Minute,
-		MaxOutputBytes:   1 << 20,
-	}
-	exec := NewExecutor(cfg, reporter, verifier, integrationLogger())
-	exec.SetHooks(hooks)
-
-	handler := HandleActionRequest(exec, "node-integrity", integrationLogger())
-
-	// --- Valid integrity: checksum matches ---
 	t.Run("valid_integrity", func(t *testing.T) {
-		rep := &integrationReporter{}
-		e := NewExecutor(cfg, rep, verifier, integrationLogger())
-		e.SetHooks(hooks)
-		h := HandleActionRequest(e, "node-integrity", integrationLogger())
+		reporter := &integrationReporter{}
+		exec := NewExecutor(cfg, reporter, newRealVerifier(t, noopViolationReporter{}), integrationLogger())
+		exec.SetHooks(hooks)
+		dispatcher := NewDispatcher(exec, "node-integrity", integrationLogger())
 
-		req := api.ActionRequest{
-			ExecutionID: "integ-integrity-001",
-			Action:      "deploy",
-			Timeout:     "30s",
-			Checksum:    hooks[0].Checksum,
-			Parameters: map[string]string{
-				"target": "10.0.0.1",
-				"region": "us-east-1",
-			},
+		entry := pendingHookExec("integ-integrity-001", "deploy")
+		entry.Parameters = map[string]json.RawMessage{
+			"target": json.RawMessage(`"10.0.0.1"`),
+			"region": json.RawMessage(`"us-east-1"`),
 		}
-		if err := h(context.Background(), integrationEnvelope(t, req)); err != nil {
-			t.Fatalf("handler error: %v", err)
-		}
+		dispatcher.Handle(context.Background(), snapshot(entry))
 
 		integrationWaitFor(t, 5*time.Second, func() bool {
-			return len(rep.getCallbacks()) >= 3
+			return len(reporter.getCallbacks()) >= 3
 		})
 
-		cbs := rep.getCallbacks()
+		cbs := reporter.getCallbacks()
 		assertStatuses(t, cbs, []string{
 			api.ExecutionStatusAck,
 			api.ExecutionStatusStarted,
@@ -399,35 +335,52 @@ func TestIntegration_HookIntegrityAndExecution(t *testing.T) {
 		}
 	})
 
-	// --- Invalid integrity: wrong checksum ---
-	t.Run("invalid_integrity", func(t *testing.T) {
-		req := api.ActionRequest{
-			ExecutionID: "integ-integrity-002",
-			Action:      "deploy",
-			Timeout:     "30s",
-			Checksum:    "0000000000000000000000000000000000000000000000000000000000000000",
+	// The pull entry carries no checksum, so a hook rewritten after discovery is
+	// caught only because verification re-anchors on the discovery digest.
+	t.Run("drift_after_discovery", func(t *testing.T) {
+		driftDir := t.TempDir()
+		driftPath := filepath.Join(driftDir, "deploy")
+		if err := os.WriteFile(driftPath, []byte(hookContent), 0o755); err != nil {
+			t.Fatal(err)
 		}
-		if err := handler(context.Background(), integrationEnvelope(t, req)); err != nil {
-			t.Fatalf("handler error: %v", err)
+		discovered, err := DiscoverHooks(driftDir, integrationLogger())
+		if err != nil {
+			t.Fatalf("discover hooks: %v", err)
 		}
 
-		// The executor acks and starts, but runHook fails the integrity check.
+		violations := &recordingViolationReporter{}
+		reporter := &integrationReporter{}
+		exec := NewExecutor(integrationConfig(driftDir), reporter, newRealVerifier(t, violations), integrationLogger())
+		exec.SetHooks(discovered)
+		dispatcher := NewDispatcher(exec, "node-integrity", integrationLogger())
+
+		// Rewrite the hook's bytes behind the recorded digest.
+		if err := os.WriteFile(driftPath, []byte("#!/bin/sh\necho tampered\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		dispatcher.Handle(context.Background(), snapshot(pendingHookExec("integ-integrity-002", "deploy")))
+
 		integrationWaitFor(t, 5*time.Second, func() bool {
 			return len(reporter.getCallbacks()) >= 3
 		})
 
-		cbs := reporter.getCallbacks()
-		assertStatuses(t, cbs, []string{
+		assertStatuses(t, reporter.getCallbacks(), []string{
 			api.ExecutionStatusAck,
 			api.ExecutionStatusStarted,
 			api.ExecutionStatusFailed,
 		})
+
+		reports := violations.getReports()
+		if len(reports) == 0 {
+			t.Fatal("drifted hook filed no integrity violation")
+		}
 	})
 }
 
 // TestIntegration_ShutdownCancelsExecutions verifies that shutdown cancels
-// running executions, reports cancelled terminal callbacks, and leaves no
-// goroutine leaks. Goroutine leak detection is handled by goleak via TestMain.
+// running executions, reports cancelled terminal callbacks, and defers every
+// later dispatch. Goroutine leak detection is handled by goleak via TestMain.
 func TestIntegration_ShutdownCancelsExecutions(t *testing.T) {
 	hooksDir := t.TempDir()
 	// Create a hook that blocks until cancelled.
@@ -443,16 +396,9 @@ func TestIntegration_ShutdownCancelsExecutions(t *testing.T) {
 	}
 
 	reporter := &integrationReporter{}
-	verifier := newRealVerifier(t)
+	verifier := newRealVerifier(t, noopViolationReporter{})
 
-	cfg := Config{
-		Enabled:          boolPtr(true),
-		HooksDir:         hooksDir,
-		MaxConcurrent:    5,
-		MaxActionTimeout: 10 * time.Minute,
-		MaxOutputBytes:   1 << 20,
-	}
-	exec := NewExecutor(cfg, reporter, verifier, integrationLogger())
+	exec := NewExecutor(integrationConfig(hooksDir), reporter, verifier, integrationLogger())
 
 	// Register a blocking builtin.
 	builtinStarted := make(chan struct{})
@@ -466,37 +412,20 @@ func TestIntegration_ShutdownCancelsExecutions(t *testing.T) {
 		{Name: "blocking-hook", Source: "local", Checksum: hookChecksum},
 	})
 
-	handler := HandleActionRequest(exec, "node-shutdown", integrationLogger())
+	dispatcher := NewDispatcher(exec, "node-shutdown", integrationLogger())
 
-	// Start a blocking builtin execution.
-	req1 := api.ActionRequest{
-		ExecutionID: "integ-shutdown-001",
-		Action:      "block",
-		Timeout:     "5m",
-	}
-	if err := handler(context.Background(), integrationEnvelope(t, req1)); err != nil {
-		t.Fatalf("handler error: %v", err)
-	}
+	dispatcher.Handle(context.Background(), snapshot(
+		pendingExec("integ-shutdown-001", "block"),
+		pendingHookExec("integ-shutdown-002", "blocking-hook"),
+	))
 
-	// Wait for builtin to start.
+	// Wait for the builtin to start.
 	select {
 	case <-builtinStarted:
 	case <-time.After(5 * time.Second):
 		t.Fatal("builtin did not start")
 	}
 
-	// Start a blocking hook execution.
-	req2 := api.ActionRequest{
-		ExecutionID: "integ-shutdown-002",
-		Action:      "blocking-hook",
-		Timeout:     "5m",
-		Checksum:    hookChecksum,
-	}
-	if err := handler(context.Background(), integrationEnvelope(t, req2)); err != nil {
-		t.Fatalf("handler error: %v", err)
-	}
-
-	// Wait for both to ack.
 	integrationWaitFor(t, 5*time.Second, func() bool {
 		return reporter.statusCount(api.ExecutionStatusAck) >= 2
 	})
@@ -508,29 +437,22 @@ func TestIntegration_ShutdownCancelsExecutions(t *testing.T) {
 	// Shutdown cancels all active executions.
 	exec.Shutdown(context.Background())
 
-	// Wait for at least one cancelled terminal callback.
 	integrationWaitFor(t, 10*time.Second, func() bool {
 		return reporter.statusCount(api.ExecutionStatusCancelled) >= 1
 	})
 
-	// After shutdown, new requests should be rejected.
-	req3 := api.ActionRequest{
-		ExecutionID: "integ-shutdown-003",
-		Action:      "block",
-		Timeout:     "30s",
-	}
-	if err := handler(context.Background(), integrationEnvelope(t, req3)); err != nil {
-		t.Fatalf("handler error: %v", err)
-	}
+	// After shutdown a dispatch is deferred, not failed: the entry stays in the
+	// block for the next agent process.
+	before := len(reporter.getCallbacks())
+	shutdownDispatcher := NewDispatcher(exec, "node-shutdown", integrationLogger())
+	shutdownDispatcher.Handle(context.Background(), snapshot(pendingExec("integ-shutdown-003", "block")))
 
-	integrationWaitFor(t, 5*time.Second, func() bool {
-		for _, cb := range reporter.getCallbacks() {
-			if cb.Status == api.ExecutionStatusFailed && cb.Error == "shutting_down" {
-				return true
-			}
-		}
-		return false
-	})
+	if got := len(reporter.getCallbacks()); got != before {
+		t.Errorf("callbacks after a post-shutdown dispatch = %d, want %d", got, before)
+	}
+	if _, settled := shutdownDispatcher.handled["integ-shutdown-003"]; settled {
+		t.Error("deferred entry was marked handled")
+	}
 
 	// Verify no active executions remain.
 	if got := exec.ActiveCount(); got != 0 {
@@ -539,21 +461,15 @@ func TestIntegration_ShutdownCancelsExecutions(t *testing.T) {
 }
 
 // TestIntegration_WatcherFeedsExecutor verifies that HookWatcher dynamically
-// updates the Executor's hooks list via the onChange → SetHooks integration.
+// updates the Executor's hooks list via the onChange → SetHooks integration, and
+// that a hook it discovers is dispatchable from the pull block.
 func TestIntegration_WatcherFeedsExecutor(t *testing.T) {
 	hooksDir := t.TempDir()
 
 	reporter := &integrationReporter{}
-	verifier := newRealVerifier(t)
+	verifier := newRealVerifier(t, noopViolationReporter{})
 
-	cfg := Config{
-		Enabled:          boolPtr(true),
-		HooksDir:         hooksDir,
-		MaxConcurrent:    5,
-		MaxActionTimeout: 10 * time.Minute,
-		MaxOutputBytes:   1 << 20,
-	}
-	exec := NewExecutor(cfg, reporter, verifier, integrationLogger())
+	exec := NewExecutor(integrationConfig(hooksDir), reporter, verifier, integrationLogger())
 
 	// Wire HookWatcher onChange to executor.SetHooks — this is the integration point.
 	watcher := NewHookWatcher(hooksDir, exec.SetHooks, nil, integrationLogger())
@@ -600,17 +516,9 @@ func TestIntegration_WatcherFeedsExecutor(t *testing.T) {
 		t.Errorf("hook checksum = %q, want %q", hooks[0].Checksum, hookChecksum)
 	}
 
-	// --- Execute the hook through the handler ---
-	handler := HandleActionRequest(exec, "node-watcher", integrationLogger())
-	req := api.ActionRequest{
-		ExecutionID: "integ-watcher-001",
-		Action:      "watcher-hook",
-		Timeout:     "30s",
-		Checksum:    hookChecksum,
-	}
-	if err := handler(context.Background(), integrationEnvelope(t, req)); err != nil {
-		t.Fatalf("handler error: %v", err)
-	}
+	// --- Dispatch the hook from the pull block ---
+	dispatcher := NewDispatcher(exec, "node-watcher", integrationLogger())
+	dispatcher.Handle(context.Background(), snapshot(pendingHookExec("integ-watcher-001", "watcher-hook")))
 
 	integrationWaitFor(t, 5*time.Second, func() bool {
 		return len(reporter.getCallbacks()) >= 3

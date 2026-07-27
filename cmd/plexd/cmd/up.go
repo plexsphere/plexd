@@ -415,13 +415,16 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// Every remaining pull-authoritative event simply requests a reconcile: the
 	// snapshot is the source of truth, so the payloads are opaque. One shared
 	// closure covers the node_state_updated contract type and the peer-family
-	// types from the documented-coming taxonomy.
+	// types from the documented-coming taxonomy. action_request joins them as a
+	// push-latency optimisation: the dispatch itself is delivered in the pull's
+	// executions block, the event only pulls it forward.
 	triggerReconcile := func(_ context.Context, _ api.Envelope) error {
 		reconciler.TriggerReconcile()
 		return nil
 	}
 	for _, eventType := range []string{
 		api.EventNodeStateUpdated,
+		api.EventActionRequest,
 		api.EventPeerRegistered,
 		api.EventPeerPSKAssigned,
 		api.EventPeerDeregistered,
@@ -540,11 +543,6 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		logger.Warn("capabilities report failed", "error", err)
 	}
 
-	// Register action_request SSE handler. action_request is test-only until the
-	// platform taxonomy ships real discriminators; the production control plane
-	// never emits it (see internal/api/envelope.go).
-	sseMgr.RegisterHandler(api.EventActionRequest, actions.HandleActionRequest(executor, identity.NodeID, logger))
-
 	// 11. Create hook watcher.
 	hookWatcher := actions.NewHookWatcher(
 		cfg.Actions.HooksDir,
@@ -597,6 +595,12 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// authoritative: node_state_updated triggers a reconcile (see above), and
 	// this handler refreshes the node API cache from the resulting snapshot.
 	reconciler.RegisterHandler(nodeAPISrv.ReconcileHandler())
+
+	// Action dispatches are consumed from the pull's executions block on every
+	// successful cycle, drift or not: the block is a delivery queue that
+	// redelivers each entry until its execution settles through the callback.
+	dispatcher := actions.NewDispatcher(executor, identity.NodeID, logger)
+	reconciler.RegisterDispatchHandler(dispatcher.Handle)
 
 	// Register the WireGuard reconcile handler only when the interface came up.
 	// A handler that fails every cycle would hold back the reconciler snapshot,
