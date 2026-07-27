@@ -19,15 +19,23 @@ type StateFetcher interface {
 // ReconcileHandler is a function invoked when drift is detected.
 type ReconcileHandler func(ctx context.Context, desired *api.NodeStateSnapshot, diff StateDiff) error
 
+// DispatchHandler is a function invoked on every successful pull. Dispatch
+// handlers consume the delivery-queue blocks of the snapshot (e.g. executions),
+// which are not desired state to converge on. They return nothing: a dispatch
+// problem is logged where it happens and must neither block the snapshot update
+// nor count as a handler failure.
+type DispatchHandler func(ctx context.Context, desired *api.NodeStateSnapshot)
+
 // Reconciler periodically compares desired state against a local snapshot
 // and invokes registered handlers to correct drift.
 type Reconciler struct {
-	client    StateFetcher
-	cfg       Config
-	logger    *slog.Logger
-	snapshot  *stateSnapshot
-	handlers  []ReconcileHandler
-	triggerCh chan struct{}
+	client           StateFetcher
+	cfg              Config
+	logger           *slog.Logger
+	snapshot         *stateSnapshot
+	handlers         []ReconcileHandler
+	dispatchHandlers []DispatchHandler
+	triggerCh        chan struct{}
 }
 
 // NewReconciler creates a new Reconciler with the given configuration.
@@ -48,6 +56,15 @@ func NewReconciler(client StateFetcher, cfg Config, logger *slog.Logger) *Reconc
 // RegisterHandler must be called before Run; it is not safe for concurrent use.
 func (r *Reconciler) RegisterHandler(handler ReconcileHandler) {
 	r.handlers = append(r.handlers, handler)
+}
+
+// RegisterDispatchHandler adds a dispatch handler invoked on every successful
+// pull, regardless of drift.
+// Handlers are called in registration order.
+// RegisterDispatchHandler must be called before Run; it is not safe for
+// concurrent use.
+func (r *Reconciler) RegisterDispatchHandler(handler DispatchHandler) {
+	r.dispatchHandlers = append(r.dispatchHandlers, handler)
 }
 
 // TriggerReconcile requests an immediate reconciliation cycle.
@@ -120,6 +137,13 @@ func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 		return
 	}
 
+	// Delivery-queue blocks are consumed on every successful pull: an unchanged
+	// snapshot must still redeliver entries, so dispatch runs before the
+	// empty-diff short-circuit can skip the rest of the cycle.
+	for i, handler := range r.dispatchHandlers {
+		r.safeDispatch(ctx, handler, desired, i)
+	}
+
 	current := r.snapshot.Get()
 	diff := ComputeDiff(desired, &current)
 
@@ -174,4 +198,20 @@ func (r *Reconciler) safeInvoke(ctx context.Context, handler ReconcileHandler, d
 		}
 	}()
 	return handler(ctx, desired, diff)
+}
+
+// safeDispatch calls a dispatch handler with panic recovery. A panicking
+// dispatch handler is logged and otherwise ignored: it never counts as a
+// handler failure and never prevents the snapshot update.
+func (r *Reconciler) safeDispatch(ctx context.Context, handler DispatchHandler, desired *api.NodeStateSnapshot, index int) {
+	defer func() {
+		if v := recover(); v != nil {
+			r.logger.Error("dispatch handler panicked",
+				"component", "reconcile",
+				"handler_index", index,
+				"error", fmt.Errorf("%v\n%s", v, debug.Stack()),
+			)
+		}
+	}()
+	handler(ctx, desired)
 }

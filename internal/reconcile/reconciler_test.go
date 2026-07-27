@@ -483,6 +483,113 @@ func TestReconciler_FetchStateErrorSkipsTick(t *testing.T) {
 	}
 }
 
+func TestReconciler_DispatchHandlerRunsOnEmptyDiff(t *testing.T) {
+	desired := &api.NodeStateSnapshot{
+		Peers: []api.SnapshotPeer{{NodeID: "p1", MeshIP: "10.0.0.1"}},
+		Executions: []api.NodeStateExecution{
+			{ExecutionID: "e1", Action: "gather_info"},
+		},
+	}
+	fetcher := &mockFetcher{
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+			return desired, nil
+		},
+	}
+
+	r := NewReconciler(fetcher, Config{Interval: time.Hour}, discardLogger())
+
+	var dispatched []*api.NodeStateSnapshot
+	r.RegisterDispatchHandler(func(_ context.Context, d *api.NodeStateSnapshot) {
+		dispatched = append(dispatched, d)
+	})
+
+	handlerCalls := 0
+	r.RegisterHandler(func(_ context.Context, _ *api.NodeStateSnapshot, _ StateDiff) error {
+		handlerCalls++
+		return nil
+	})
+
+	// The second cycle sees the snapshot the first one stored → empty diff.
+	r.runCycle(context.Background(), "node-1")
+	r.runCycle(context.Background(), "node-1")
+
+	if len(dispatched) != 2 {
+		t.Fatalf("dispatch handler called %d times, want 2 (once per successful pull)", len(dispatched))
+	}
+	for i, d := range dispatched {
+		if d != desired {
+			t.Errorf("dispatch call %d received %+v, want the fetched snapshot", i, d)
+		}
+	}
+
+	if handlerCalls != 1 {
+		t.Errorf("reconcile handler called %d times, want 1 (second cycle has an empty diff)", handlerCalls)
+	}
+}
+
+func TestReconciler_DispatchHandlerPanicRecovered(t *testing.T) {
+	desired := &api.NodeStateSnapshot{
+		Peers: []api.SnapshotPeer{{NodeID: "p1", MeshIP: "10.0.0.1"}},
+	}
+	fetcher := &mockFetcher{
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+			return desired, nil
+		},
+	}
+
+	r := NewReconciler(fetcher, Config{Interval: time.Hour}, discardLogger())
+
+	dispatchCalls := 0
+	r.RegisterDispatchHandler(func(_ context.Context, _ *api.NodeStateSnapshot) {
+		dispatchCalls++
+		panic("test dispatch panic")
+	})
+
+	handlerCalls := 0
+	r.RegisterHandler(func(_ context.Context, _ *api.NodeStateSnapshot, _ StateDiff) error {
+		handlerCalls++
+		return nil
+	})
+
+	r.runCycle(context.Background(), "node-1")
+	r.runCycle(context.Background(), "node-1")
+
+	if dispatchCalls != 2 {
+		t.Errorf("dispatch handler called %d times, want 2 (a panic must not stop later cycles)", dispatchCalls)
+	}
+	// The reconcile handler running exactly once proves the snapshot was
+	// updated despite the panicking dispatch handler: the second cycle sees
+	// no drift.
+	if handlerCalls != 1 {
+		t.Errorf("reconcile handler called %d times, want 1 (dispatch panic must not block the snapshot update)", handlerCalls)
+	}
+}
+
+func TestReconciler_NoDispatchOnFetchError(t *testing.T) {
+	fetcher := &mockFetcher{
+		fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+			return nil, errors.New("fetch error")
+		},
+	}
+
+	r := NewReconciler(fetcher, Config{Interval: time.Hour}, discardLogger())
+
+	dispatchCalls := 0
+	r.RegisterDispatchHandler(func(_ context.Context, _ *api.NodeStateSnapshot) {
+		dispatchCalls++
+	})
+
+	r.runCycle(context.Background(), "node-1")
+	r.runCycle(context.Background(), "node-1")
+
+	if dispatchCalls != 0 {
+		t.Errorf("dispatch handler called %d times, want 0 (nothing was delivered)", dispatchCalls)
+	}
+	if fetcher.getFetchCount() != 2 {
+		t.Errorf("FetchState called %d times, want 2", fetcher.getFetchCount())
+	}
+}
+
 func TestReconciler_NoGoroutineLeaks(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
