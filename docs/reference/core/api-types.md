@@ -108,7 +108,7 @@ never serialized on its own.
 
 The desired-state envelope. Every block key is **always present on the wire**: a
 `null` value means "block not populated", never "field absent", so the differ
-distinguishes a nil pointer from a populated block. None of the seven fields carry
+distinguishes a nil pointer from a populated block. None of the eight fields carry
 `omitempty`.
 
 | Field          | Type                   | JSON Tag         | Description                                              |
@@ -120,9 +120,13 @@ distinguishes a nil pointer from a populated block. None of the seven fields car
 | `State`        | `*NodeStateBlock`      | `"state"`        | Node state buckets                                     |
 | `Reports`      | `*NodeStateBlock`      | `"reports"`      | Mirrors `state` today (forward-compat split)           |
 | `Executions`   | `[]NodeStateExecution` | `"executions"`   | Pending action dispatches; `[]` when empty, never `null` |
+| `Sessions`     | `*[]NodeStateSession`  | `"sessions"`     | Live mediated-access sessions; `[]` when empty, never `null` on the wire. A pointer, like the block fields above: a `nil` value is a block the control plane did **not** populate, which is not a teardown signal |
 
-`executions` is the only member that is not desired state: it is a delivery
-queue, documented under [Executions](#executions) below.
+Two members are consumed on the dispatch seam rather than by the differ.
+`executions` is not desired state at all — it is a delivery queue, documented
+under [Executions](#executions) below. `sessions` *is* desired state, but state
+the tunnel dispatcher converges on itself, documented under
+[Sessions](#sessions) below.
 
 **SnapshotPeer**
 
@@ -555,6 +559,75 @@ propagated peer and PSK changes arrive via the next state pull.
 
 ## Sessions
 
+The `sessions` block of the state snapshot and the activity records the node posts
+back to `POST /v1/nodes/{node_id}/sessions/{session_id}`.
+
+### `sessions` block of `GET /v1/nodes/{node_id}/state`
+
+**NodeStateSession**
+
+One live mediated-access session. The block is **desired state, not a queue**: it
+is always present on the wire (`[]` when empty, never `null`). A response that
+violates that contract by omitting or nulling the key decodes to a `nil`
+`Sessions` pointer, which the tunnel dispatcher leaves alone rather than reading
+as an empty block — emptiness tears every live session down, so the two cases
+must stay distinguishable. An entry appears when the control plane issues the
+session and disappears on revocation or hard expiry — that disappearance *is* the
+teardown signal, so there is no separate teardown event, no revocation callback to
+answer, and no terminal status to report. A live entry is redelivered on every
+pull, so a consumer must tolerate re-observing the same `SessionID`.
+
+| Field                | Type            | JSON Tag                            | Description                                                          |
+|----------------------|-----------------|-------------------------------------|----------------------------------------------------------------------|
+| `SessionID`          | `string`        | `"session_id"`                      | Session identifier                                                   |
+| `JTI`                | `string`        | `"jti"`                             | Equals the session id; carried opaquely and **never** evaluated      |
+| `Kind`               | `string`        | `"kind"`                            | One of the `SessionKind*` values; selects the member of `Target`     |
+| `Target`             | `SessionTarget` | `"target"`                          | Exactly one member set, matching `Kind`                              |
+| `ExpiresAt`          | `time.Time`     | `"expires_at"`                      | Absolute UTC deadline, **not** a relative timeout                    |
+| `IdleTimeoutSeconds` | `int`           | `"idle_timeout_seconds,omitempty"`  | Idle window in seconds; `0` or absent means no idle window           |
+
+**SessionTarget**
+
+| Field | Type                | JSON Tag          | Description                        |
+|-------|---------------------|-------------------|------------------------------------|
+| `SSH` | `*SessionTargetSSH` | `"ssh,omitempty"` | Target of an `ssh` session         |
+| `K8s` | `*SessionTargetK8s` | `"k8s,omitempty"` | Target of a `k8s` session          |
+| `TCP` | `*SessionTargetTCP` | `"tcp,omitempty"` | Target of a `tcp` session          |
+
+**SessionTargetSSH**
+
+| Field             | Type       | JSON Tag                       | Description                                            |
+|-------------------|------------|--------------------------------|--------------------------------------------------------|
+| `User`            | `string`   | `"user"`                       | Local account the session logs in as                   |
+| `AllowedCommands` | `[]string` | `"allowed_commands,omitempty"` | Closed set of command lines the session may run        |
+
+**SessionTargetK8s**
+
+| Field               | Type       | JSON Tag                         | Description                            |
+|---------------------|------------|----------------------------------|----------------------------------------|
+| `User`              | `string`   | `"user"`                         | Impersonated Kubernetes user           |
+| `ImpersonateGroups` | `[]string` | `"impersonate_groups,omitempty"` | Groups impersonated alongside the user |
+
+**SessionTargetTCP**
+
+| Field  | Type     | JSON Tag | Description                                       |
+|--------|----------|----------|---------------------------------------------------|
+| `Host` | `string` | `"host"` | Host the node forwards the session's connections to |
+| `Port` | `int`    | `"port"` | Port on that host                                 |
+
+**SessionKind constants**
+
+| Constant          | Value | Description                                        |
+|-------------------|-------|----------------------------------------------------|
+| `SessionKindSSH`  | `ssh` | Mediates an SSH session; `Target.SSH` is set       |
+| `SessionKindK8s`  | `k8s` | Mediates a Kubernetes API session; `Target.K8s` is set |
+| `SessionKindTCP`  | `tcp` | Mediates a plain TCP forward; `Target.TCP` is set  |
+
+Only `tcp` entries are provisionable by this agent; `ssh` and `k8s` entries are
+decoded and settled as unsupported. See
+[Secure Access Tunneling](../networking/secure-access-tunneling.md) for how plexd
+consumes the block.
+
 ### `POST /v1/nodes/{node_id}/sessions/{session_id}`
 
 A one-of session activity record: exactly one of `ssh`, `k8s`, or `tcp` is set,
@@ -598,6 +671,7 @@ is `204 No Content`.
 | `Phase`        | `string`| `"phase"`                  | One of the `TCPPhase*` values                           |
 | `TargetHost`   | `string`| `"target_host,omitempty"`  | Forward target host                                     |
 | `TargetPort`   | `int`   | `"target_port,omitempty"`  | Forward target port                                     |
+| `ListenerEndpoint` | `string`| `"listener_endpoint,omitempty"` | Address the node's listener bound; set on `session_started` rows only |
 | `BytesIn`      | `*int64`| `"bytes_in,omitempty"`     | Operator→target bytes (explicit `0` on `session_ended`) |
 | `BytesOut`     | `*int64`| `"bytes_out,omitempty"`    | Target→operator bytes (explicit `0` on `session_ended`) |
 | `TerminatedBy` | `string`| `"terminated_by,omitempty"`| One of the `TerminatedBy*` values                       |
@@ -614,9 +688,9 @@ is `204 No Content`.
 | Constant                     | Value            | Description                                   |
 |------------------------------|------------------|-----------------------------------------------|
 | `TerminatedByTTLExpired`     | `ttl_expired`    | Session reached its time-to-live              |
-| `TerminatedByIdleTimeout`    | `idle_timeout`   | Idle past its timeout (reserved; not emitted) |
+| `TerminatedByIdleTimeout`    | `idle_timeout`   | Idle window elapsed with no byte flow          |
 | `TerminatedByPlexdClose`     | `plexd_close`    | plexd closed the session locally              |
-| `TerminatedByOperatorRevoke` | `operator_revoke`| Operator's access was revoked                 |
+| `TerminatedByOperatorRevoke` | `operator_revoke`| Operator's access was revoked. Part of the wire enum; **never produced by plexd**, which cannot tell a revocation from a block the control plane failed to serve |
 
 ## SSE Events
 
@@ -641,10 +715,9 @@ for the canonical form and signature rules.
 
 ### Event Types
 
-The event set is organized in three tiers. Contract types are emitted today;
-documented-coming types are named for the platform's 14-type taxonomy; test-only
-types are injectable exclusively through the e2e mock. Reconcile-driving payloads
-are opaque — the state pull is authoritative.
+The event set is organized in two tiers. Contract types are emitted today;
+documented-coming types are named for the platform's 14-type taxonomy.
+Reconcile-driving payloads are opaque — the state pull is authoritative.
 
 | Constant                   | Value                   | Tier              |
 |----------------------------|-------------------------|-------------------|
@@ -652,6 +725,7 @@ are opaque — the state pull is authoritative.
 | `EventPolicyUpdated`       | `policy_updated`        | contract          |
 | `EventBridgeConfigUpdated` | `bridge_config_updated` | contract          |
 | `EventActionRequest`       | `action_request`        | contract          |
+| `EventSessionSetup`        | `session_setup`         | contract          |
 | `EventPeerRegistered`      | `peer_registered`       | documented-coming |
 | `EventPeerPSKAssigned`     | `peer_psk_assigned`     | documented-coming |
 | `EventPeerDeregistered`    | `peer_deregistered`     | documented-coming |
@@ -659,9 +733,12 @@ are opaque — the state pull is authoritative.
 | `EventPeerKeyRotated`      | `peer_key_rotated`      | documented-coming |
 | `EventRotateKeys`          | `rotate_keys`           | documented-coming |
 | `EventSigningKeyRotated`   | `signing_key_rotated`   | documented-coming |
-| `EventSSHSessionSetup`     | `ssh_session_setup`     | test-only         |
-| `EventSessionRevoked`      | `session_revoked`       | test-only         |
+| `EventSessionRevoked`      | `session_revoked`       | documented-coming |
 
 `action_request` is a contract type with an opaque payload: action dispatches are
 delivered in the `executions` block of the state pull, so the event only triggers
-a reconcile and the resulting pull carries the dispatch.
+a reconcile and the resulting pull carries the dispatch. `session_setup` is the
+same shape for mediated access — the session is delivered in the `sessions` block
+of that pull. `session_revoked` is the same shape from the other end: a session
+leaving the `sessions` block is what tears it down, so the event only pulls the
+observing reconcile forward.

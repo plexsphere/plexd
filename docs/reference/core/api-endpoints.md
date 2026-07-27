@@ -102,8 +102,8 @@ Long-lived SSE connection. Supports `Last-Event-ID` header for replay after reco
 | `peer_endpoint_changed` | Peer ID, new endpoint |
 | `policy_updated` | Full policy ruleset (L3/L4 rules scoped to mesh IPs) |
 | `action_request` | Opaque; triggers a reconcile — the dispatch itself rides the `executions` block of the state pull |
-| `session_revoked` | Session ID, revocation timestamp |
-| `ssh_session_setup` | Session token, target configuration |
+| `session_setup` | Opaque; triggers a reconcile — the session itself rides the `sessions` block of the state pull |
+| `session_revoked` | Opaque; triggers a reconcile — the session leaving the `sessions` block is what tears it down |
 | `rotate_keys` | Key rotation trigger |
 | `signing_key_rotated` | New signing public key, valid_from, transition period |
 | `node_state_updated` | Updated metadata and data entries |
@@ -325,12 +325,22 @@ absence.
       "requested_at": "2026-01-01T00:00:00Z",
       "expires_at": "2026-01-01T00:05:00Z"
     }
+  ],
+  "sessions": [
+    {
+      "session_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+      "jti": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1",
+      "kind": "tcp",
+      "target": { "tcp": { "host": "10.99.0.2", "port": 22 } },
+      "expires_at": "2026-01-01T01:00:00Z",
+      "idle_timeout_seconds": 900
+    }
   ]
 }
 ```
 
 `executions` is the delivery channel for action dispatches, and the only block
-that is not desired state. It is always an array — `[]` when empty, never `null` —
+that is a delivery queue rather than desired state. It is always an array — `[]` when empty, never `null` —
 ordered by `requested_at`, then `execution_id`. An entry keeps reappearing on
 every pull until its execution reaches a terminal status through the
 [execution callback](#action-execution-callbacks), so a consumer
@@ -338,6 +348,17 @@ must tolerate re-observing the same `execution_id`. `expires_at` is an absolute
 UTC deadline, not a relative timeout; the entry carries no callback URL and no
 hook checksum. See [Remote Actions and Hooks](/reference/actions/remote-actions-hooks)
 for how plexd consumes it.
+
+`sessions` carries the node's live mediated-access sessions. It is desired state
+rather than a queue: an entry stands for as long as its session is valid, and its
+disappearance — on revocation or hard expiry — is the teardown signal, so there is
+no revocation event to answer and no terminal status to report. It is always an
+array (`[]` when empty, never `null`). `kind` is one of `ssh`, `k8s`, or `tcp` and
+selects the single member of `target`; `jti` equals `session_id` and is carried
+opaquely; `expires_at` is an absolute UTC timestamp; `idle_timeout_seconds` absent
+or `0` means the session has no idle window. See
+[Secure Access Tunneling](/reference/networking/secure-access-tunneling) for how
+plexd consumes it.
 
 ## Secrets
 
@@ -562,21 +583,27 @@ tunnel subsystem is an opaque TCP forwarder, so it emits only `tcp` rows: a
 `session_started` row when the listener comes up and a `session_ended` row on
 close.
 
-**Request body** (`session_started`):
+**Request body** (`session_started`). `listener_endpoint` is the address the node
+actually bound, so the control plane has somewhere to send the operator; it is
+set on started rows only:
 
 ```json
 {
   "tcp": {
     "phase": "session_started",
     "target_host": "10.99.0.2",
-    "target_port": 22
+    "target_port": 22,
+    "listener_endpoint": "10.99.0.1:34567"
   }
 }
 ```
 
 **Request body** (`session_ended`). `bytes_in` (operator→target) and `bytes_out`
 (target→operator) are explicit, present even when `0`; `terminated_by` is one of
-`ttl_expired`, `operator_revoke`, or `plexd_close`:
+`ttl_expired`, `idle_timeout`, `operator_revoke`, or `plexd_close`. plexd itself
+never sends `operator_revoke`: a revoked session reaches the node as the absence
+of its entry, which is indistinguishable from a control plane that failed to
+serve the block, so a drained entry is reported as `plexd_close`:
 
 ```json
 {
@@ -586,7 +613,7 @@ close.
     "target_port": 22,
     "bytes_in": 4096,
     "bytes_out": 8192,
-    "terminated_by": "operator_revoke"
+    "terminated_by": "plexd_close"
   }
 }
 ```

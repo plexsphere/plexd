@@ -164,7 +164,7 @@ flowchart TD
 
 ## SSE Event Types
 
-The SSE manager processes events in three tiers. Payloads of the reconcile-driving
+The SSE manager processes events in two tiers. Payloads of the reconcile-driving
 types are opaque — the reconciler's state pull is authoritative, so those events
 only request a reconcile.
 
@@ -174,6 +174,7 @@ only request a reconcile.
 | `policy_updated` | contract | `policy.HandlePolicyUpdated` — triggers a reconcile |
 | `bridge_config_updated` | contract | `bridge.HandleBridgeConfigUpdated` — triggers a reconcile (bridge mode) |
 | `action_request` | contract | Triggers a reconcile — the dispatch rides the `executions` block of the resulting pull |
+| `session_setup` | contract | Triggers a reconcile — the session rides the `sessions` block of the resulting pull |
 | `peer_registered` | documented-coming | Triggers a reconcile |
 | `peer_psk_assigned` | documented-coming | Triggers a reconcile |
 | `peer_deregistered` | documented-coming | Triggers a reconcile |
@@ -181,13 +182,11 @@ only request a reconcile.
 | `peer_key_rotated` | documented-coming | Triggers a reconcile |
 | `rotate_keys` | documented-coming | Starts a key rotation (`rotator.RotateNow`) |
 | `signing_key_rotated` | documented-coming | Updates the Ed25519 verifier key (`verifier.Rotate`) |
-| `ssh_session_setup` | test-only | `tunnel.HandleSSHSessionSetup` — creates a tunnel session |
-| `session_revoked` | test-only | `tunnel.HandleSessionRevoked` — closes a revoked tunnel session |
+| `session_revoked` | documented-coming | Triggers a reconcile — the block drain does the teardown |
 
 **Contract** types are emitted by the control plane today. **Documented-coming**
 types are named so the agent can subscribe once the platform's 14-type taxonomy
-starts emitting them. **Test-only** types are injectable exclusively through the
-e2e mock control plane; the production control plane never emits them.
+starts emitting them.
 
 ## See Also
 

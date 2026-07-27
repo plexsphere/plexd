@@ -8,7 +8,7 @@ feature: PXD-0038
 
 Validates that a containerised plexd agent successfully registers, sends heartbeats, retrieves state, reports capabilities, converges to desired state, and forwards metrics, logs, and audit events to the Central API. The test uses docker compose to orchestrate two services — `mock-api` (a fixture-based mock of the Central API) and `plexd` (the agent under test) — on an isolated bridge network.
 
-The test runs twelve phases:
+The test runs fourteen phases:
 
 1. **Initial assertions** — all 7 counters >= 1 (agent started and contacted all endpoints)
 2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, and metrics data
@@ -16,12 +16,14 @@ The test runs twelve phases:
 4. **Log injection** — injects a log file via `docker cp`, verifies logs_count increases (FileSource pipeline works)
 5. **Agent restart for audit** — restarts plexd container, verifies audit_count increases (ProcessSource fires per-process)
 6. **SSE event injection** — injects a `node_state_updated` event and verifies state_count increases (proves SSE stream is connected)
-7. **Convergence cycle** — posts a mutated `NodeStateSnapshot` envelope via `/test/configure-state`, verifies `state_count` advances AND a reconcile cycle reports `policy` drift
-8. **Policy fingerprint no-op** — re-posts the envelope with only `revision_id` bumped (same fingerprint), verifies `state_count` advances but no cycle reports `policy` drift (the differ's fingerprint short-circuit holds)
-9. **Local endpoint delivery** — all 3 local endpoint counters >= 1 (dual delivery to HTTPS local endpoint works)
-10. **Local endpoint body validation** — verifies non-empty JSON arrays received at each local endpoint
-11. **Dual delivery verification** — both platform and local counters >= 1 simultaneously (proves parallel delivery)
-12. **Graceful shutdown** — stops plexd container, verifies exit code 0 and no crash indicators in logs
+7. **Session lifecycle from the state pull** — splices a `tcp` entry into the snapshot's `sessions` block and verifies a `session_started` activity row carrying `listener_endpoint`, then re-posts the snapshot **without** the entry and verifies the drain produces a `session_ended` row with `plexd_close` and numeric byte counters; a second entry carrying `idle_timeout_seconds` verifies the idle window closes a session on its own with `idle_timeout`
+8. **Session events as pull triggers** — injects `session_setup` and `session_revoked` envelopes with opaque payloads, verifies each advances `state_count` while leaving `session_activity_count` unchanged
+9. **Convergence cycle** — posts a mutated `NodeStateSnapshot` envelope via `/test/configure-state`, verifies `state_count` advances AND a reconcile cycle reports `policy` drift
+10. **Policy fingerprint no-op** — re-posts the envelope with only `revision_id` bumped (same fingerprint), verifies `state_count` advances but no cycle reports `policy` drift (the differ's fingerprint short-circuit holds)
+11. **Local endpoint delivery** — all 3 local endpoint counters >= 1 (dual delivery to HTTPS local endpoint works)
+12. **Local endpoint body validation** — verifies non-empty JSON arrays received at each local endpoint
+13. **Dual delivery verification** — both platform and local counters >= 1 simultaneously (proves parallel delivery)
+14. **Graceful shutdown** — stops plexd container, verifies exit code 0 and no crash indicators in logs
 
 ## Service Topology
 
@@ -110,7 +112,17 @@ The `ProcessSource` uses `sync.Once` to emit a single `process_start` audit entr
 
 Injects a `node_state_updated` event via `POST /test/inject-event` and verifies that `state_count` increases, proving the SSE stream is connected and event-driven reconciliation works.
 
-### Phase 7: Convergence Cycle
+### Phase 7: Session Lifecycle from the State Pull
+
+Drives the whole mediated-access lifecycle through the `sessions` block (script phase `8e`). Splicing a `tcp` entry with a future `expires_at` into that block provisions a listener: the test polls `session_activity_count` to +1 and asserts the captured row carries `tcp.phase = session_started`, the configured `target_host` / `target_port`, and a non-empty `host:port` `listener_endpoint` — the address the listener actually bound. Re-posting the snapshot with an empty `sessions` array is the teardown signal: `session_activity_count` reaches +2 and the captured row is `session_ended` with `terminated_by = plexd_close` and `bytes_in` / `bytes_out` present as numbers — the node cannot tell a revocation from a control plane that failed to serve the block, so it never claims `operator_revoke`. There is no revocation endpoint and no teardown event; the drain is the whole mechanism.
+
+Script phase `8i` covers the other way a session ends on the node's own initiative: an entry carrying `idle_timeout_seconds: 1` provisions a listener nothing ever connects to, so the window runs out from the bind. `session_activity_count` reaches +2 with no drain at all, and the captured row is `session_ended` with `terminated_by = idle_timeout` — the entry is still standing in the block when its session ends, and it is not provisioned again.
+
+### Phase 8: Session Events as Pull Triggers
+
+Proves that `session_setup` and `session_revoked` are reconcile triggers rather than delivery channels (script phase `8h`). Each is injected with an opaque `"{}"` payload. The test asserts `state_count` advances within a window deliberately shorter than the ~30s heartbeat reconcile cadence — what is proven is that the pull happens *now* — and that `session_activity_count` is unchanged afterwards: the resulting pull found no session in the block, so nothing was provisioned or torn down.
+
+### Phase 9: Convergence Cycle
 
 Posts a full mutated `NodeStateSnapshot` envelope to `POST /test/configure-state` (a new policy fingerprint and new state values), then polls until **both** hard conditions hold: `state_count` advances (the agent re-fetched the snapshot) and the count of `"reconciliation cycle completed"` lines whose `drift` summary contains `policy` increases (the differ reported `PolicyChanged`, so the policy handler ran). Both fixture peers are surfaced and asserted through the node API `GET /v1/peers`.
 
@@ -118,23 +130,25 @@ The assertion deliberately gates on the reconciler drift summary rather than on 
 
 `POST /test/configure-state` replaces the **whole** snapshot fixture, which is also how the action phases drive execution: they queue a dispatch by reading the live snapshot, splicing an entry into its `executions` array, and posting the result back, then inject a `node_state_updated` envelope so the agent pulls immediately instead of waiting out the reconcile cadence. Because the fetch leg is a real `GET` on the state endpoint, it increments `state_count` — a phase gating on that counter must take its baseline **after** configuring the block. Action dispatches never ride an SSE payload, so `action_request` can only be used the same way: as a nudge that pulls the next reconcile forward.
 
-### Phase 8: Policy Fingerprint No-Op
+The session phases drive the `sessions` array through the same splice, via the `session_entry` and `configure_sessions` helpers. The one difference is what a re-post means: `executions` is a delivery queue that drains when the node settles an entry, while `sessions` is desired state, so dropping an entry from the array *is* the revocation — the node tears the listener down on the pull that no longer carries it. `session_setup` and `session_revoked` are nudges exactly like `action_request`, carrying neither a session nor a teardown of their own.
+
+### Phase 10: Policy Fingerprint No-Op
 
 Re-posts the envelope with only `revision_id` bumped and a metadata value changed — the policy `fingerprint` stays identical. The test asserts `state_count` advances (the no-op envelope was fetched) but the policy-drift cycle count is **unchanged**, exercising the differ's fingerprint short-circuit: a revision-only bump must not report `PolicyChanged`.
 
-### Phase 9: Local Endpoint Delivery
+### Phase 11: Local Endpoint Delivery
 
 Polls `GET /test/assertions` until `local_metrics_count`, `local_logs_count`, and `local_audit_count` are all >= 1 (timeout: 60s). This validates the full local endpoint credential chain: registration (32-byte NSK) → secret fetch → AES-256-GCM decryption → Bearer token → HTTPS POST to mock-api's TLS listener on `:8443`.
 
-### Phase 10: Local Endpoint Body Validation
+### Phase 12: Local Endpoint Body Validation
 
 Uses `GET /test/last-request/local_{metrics,logs,audit}` to verify each local endpoint received a non-empty JSON array payload.
 
-### Phase 11: Dual Delivery Verification
+### Phase 13: Dual Delivery Verification
 
 Asserts that both platform counters (`metrics_count`, `logs_count`, `audit_count`) and local counters (`local_metrics_count`, `local_logs_count`, `local_audit_count`) are all >= 1, proving parallel delivery to both the central API and the local endpoint.
 
-### Phase 12: Graceful Shutdown
+### Phase 14: Graceful Shutdown
 
 Stops the plexd container via `docker compose stop` (sends SIGTERM) and verifies:
 - Exit code is 0
