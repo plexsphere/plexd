@@ -75,7 +75,7 @@ type HeartbeatResponse struct {
 // GET /v1/nodes/{node_id}/state. Every block key is always present on the wire:
 // a null value means "block not populated", never "field absent". The differ
 // therefore distinguishes a nil pointer from a populated block, so none of the
-// seven fields carry omitempty.
+// eight fields carry omitempty.
 type NodeStateSnapshot struct {
 	Peers        []SnapshotPeer       `json:"peers"`
 	Reachability json.RawMessage      `json:"reachability"`
@@ -84,6 +84,13 @@ type NodeStateSnapshot struct {
 	State        *NodeStateBlock      `json:"state"`
 	Reports      *NodeStateBlock      `json:"reports"`
 	Executions   []NodeStateExecution `json:"executions"`
+	// Sessions is a pointer for the same reason the block fields above are: the
+	// sessions block is desired state whose emptiness is destructive — an empty
+	// block tears every live session down — so "the control plane says you have
+	// no sessions" ([]) has to stay distinguishable from "the control plane did
+	// not populate the block" (null, or a key a build predating the block never
+	// wrote). A nil pointer is the second case and is not a teardown signal.
+	Sessions *[]NodeStateSession `json:"sessions"`
 }
 
 // SnapshotPeer is a reconciliation peer entry in NodeStateSnapshot. It is a
@@ -322,6 +329,72 @@ type ExecutionCallbackResponse struct {
 }
 
 // ---------------------------------------------------------------------------
+// Sessions  GET /v1/nodes/{node_id}/state
+// ---------------------------------------------------------------------------
+
+// NodeStateSession is one live mediated-access session in the sessions block of
+// GET /v1/nodes/{node_id}/state. That block is desired state, not a queue: it
+// is always present on the wire ([] when empty, never null). An entry appears
+// when the control plane issues the session and disappears on revocation or
+// hard expiry — the disappearance is the teardown signal, there is no separate
+// teardown event. A response that violates the contract by omitting or nulling
+// the block decodes to a nil NodeStateSnapshot.Sessions and is not read as an
+// empty block.
+//
+// Kind is one of the SessionKind* values and selects which member of Target is
+// set. JTI equals the session id: it is carried as an opaque value and never
+// evaluated. ExpiresAt is an absolute UTC timestamp, not a relative timeout.
+// IdleTimeoutSeconds 0 or absent means the session has no idle window.
+type NodeStateSession struct {
+	SessionID          string        `json:"session_id"`
+	JTI                string        `json:"jti"`
+	Kind               string        `json:"kind"`
+	Target             SessionTarget `json:"target"`
+	ExpiresAt          time.Time     `json:"expires_at"`
+	IdleTimeoutSeconds int           `json:"idle_timeout_seconds,omitempty"`
+}
+
+// SessionTarget is the target of a NodeStateSession. Exactly one member is set,
+// selecting the session kind: SSH, K8s, or TCP.
+type SessionTarget struct {
+	SSH *SessionTargetSSH `json:"ssh,omitempty"`
+	K8s *SessionTargetK8s `json:"k8s,omitempty"`
+	TCP *SessionTargetTCP `json:"tcp,omitempty"`
+}
+
+// SessionTargetSSH is the target of an ssh session. User is the local account
+// the session logs in as; AllowedCommands, when set, is the closed set of
+// command lines the session may run.
+type SessionTargetSSH struct {
+	User            string   `json:"user"`
+	AllowedCommands []string `json:"allowed_commands,omitempty"`
+}
+
+// SessionTargetK8s is the target of a k8s session. User is the impersonated
+// Kubernetes user; ImpersonateGroups are the groups impersonated alongside it.
+type SessionTargetK8s struct {
+	User              string   `json:"user"`
+	ImpersonateGroups []string `json:"impersonate_groups,omitempty"`
+}
+
+// SessionTargetTCP is the target of a tcp session: the host and port the node
+// forwards the session's connections to.
+type SessionTargetTCP struct {
+	Host string `json:"host"`
+	Port int    `json:"port"`
+}
+
+// The three legal values of a NodeStateSession.Kind.
+const (
+	// SessionKindSSH mediates an SSH session; Target.SSH is set.
+	SessionKindSSH = "ssh"
+	// SessionKindK8s mediates a Kubernetes API session; Target.K8s is set.
+	SessionKindK8s = "k8s"
+	// SessionKindTCP mediates a plain TCP forward; Target.TCP is set.
+	SessionKindTCP = "tcp"
+)
+
+// ---------------------------------------------------------------------------
 // Observability
 //   POST /v1/nodes/{node_id}/metrics
 //   POST /v1/nodes/{node_id}/logs
@@ -536,17 +609,19 @@ type K8sActivity struct {
 }
 
 // TCPActivity records a TCP session lifecycle event. Phase is one of the
-// TCPPhase* values. BytesIn (operator to target) and BytesOut (target to
-// operator) are pointers so a session_ended row carries explicit zeros while a
-// session_started row omits the byte counters. TerminatedBy, when set, is one
-// of the TerminatedBy* values.
+// TCPPhase* values. ListenerEndpoint is the node's bound listener address and
+// is set only on session_started rows. BytesIn (operator to target) and
+// BytesOut (target to operator) are pointers so a session_ended row carries
+// explicit zeros while a session_started row omits the byte counters.
+// TerminatedBy, when set, is one of the TerminatedBy* values.
 type TCPActivity struct {
-	Phase        string `json:"phase"`
-	TargetHost   string `json:"target_host,omitempty"`
-	TargetPort   int    `json:"target_port,omitempty"`
-	BytesIn      *int64 `json:"bytes_in,omitempty"`
-	BytesOut     *int64 `json:"bytes_out,omitempty"`
-	TerminatedBy string `json:"terminated_by,omitempty"`
+	Phase            string `json:"phase"`
+	TargetHost       string `json:"target_host,omitempty"`
+	TargetPort       int    `json:"target_port,omitempty"`
+	ListenerEndpoint string `json:"listener_endpoint,omitempty"`
+	BytesIn          *int64 `json:"bytes_in,omitempty"`
+	BytesOut         *int64 `json:"bytes_out,omitempty"`
+	TerminatedBy     string `json:"terminated_by,omitempty"`
 }
 
 // TCP session lifecycle phases reported on a TCPActivity.

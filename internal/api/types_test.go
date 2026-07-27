@@ -350,19 +350,29 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 				ExpiresAt:   now.Add(5 * time.Minute),
 			},
 		},
+		Sessions: &[]NodeStateSession{
+			{
+				SessionID:          "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b0",
+				JTI:                "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b0",
+				Kind:               SessionKindTCP,
+				Target:             SessionTarget{TCP: &SessionTargetTCP{Host: "10.42.0.5", Port: 5432}},
+				ExpiresAt:          now.Add(30 * time.Minute),
+				IdleTimeoutSeconds: 300,
+			},
+		},
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Exactly the seven contract keys must appear.
+	// Exactly the eight contract keys must appear.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 7 {
-		t.Errorf("expected exactly 7 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 8 {
+		t.Errorf("expected exactly 8 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
@@ -371,7 +381,7 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 
 func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	// Decoding explicit nulls yields nil pointers.
-	const nullBlocks = `{"peers":[],"reachability":null,"policy":null,"bridge":null,"state":null,"reports":null,"executions":[]}`
+	const nullBlocks = `{"peers":[],"reachability":null,"policy":null,"bridge":null,"state":null,"reports":null,"executions":[],"sessions":[]}`
 	var snap NodeStateSnapshot
 	if err := json.Unmarshal([]byte(nullBlocks), &snap); err != nil {
 		t.Fatalf("unmarshal null blocks: %v", err)
@@ -385,10 +395,13 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if snap.Executions == nil || len(snap.Executions) != 0 {
 		t.Errorf("executions = %v, want empty non-nil slice", snap.Executions)
 	}
+	if snap.Sessions == nil || len(*snap.Sessions) != 0 {
+		t.Errorf("sessions = %v, want a non-nil pointer to an empty slice", snap.Sessions)
+	}
 
 	// A populated zero-value block decodes to a NON-nil pointer — distinct from
 	// a null block.
-	const populatedPolicy = `{"peers":[],"reachability":null,"policy":{},"bridge":null,"state":null,"reports":null,"executions":[]}`
+	const populatedPolicy = `{"peers":[],"reachability":null,"policy":{},"bridge":null,"state":null,"reports":null,"executions":[],"sessions":[]}`
 	var snap2 NodeStateSnapshot
 	if err := json.Unmarshal([]byte(populatedPolicy), &snap2); err != nil {
 		t.Fatalf("unmarshal populated policy: %v", err)
@@ -397,7 +410,7 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		t.Error("policy:{} should decode to a non-nil pointer, distinct from null")
 	}
 
-	// Marshalling nil blocks emits literal null with all seven keys PRESENT.
+	// Marshalling nil blocks emits literal null with all eight keys PRESENT.
 	out, err := json.Marshal(NodeStateSnapshot{})
 	if err != nil {
 		t.Fatalf("marshal zero value: %v", err)
@@ -406,7 +419,7 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if err := json.Unmarshal(out, &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions"} {
 		v, ok := raw[key]
 		if !ok {
 			t.Errorf("key %q absent, want present with null value", key)
@@ -418,6 +431,41 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		if string(v) != "null" {
 			t.Errorf("key %q = %s, want null", key, v)
 		}
+	}
+}
+
+// TestNodeStateSnapshot_SessionsBlock pins the three shapes the sessions block
+// can arrive in. [] is the contract form of "no live sessions" and decodes to a
+// non-nil pointer; null and an absent key both decode to a nil pointer, which is
+// what keeps a control plane that failed to populate the block from reading as a
+// teardown of every live session. None of the three is a decode error.
+func TestNodeStateSnapshot_SessionsBlock(t *testing.T) {
+	const others = `"peers":[],"reachability":null,"policy":null,"bridge":null,"state":null,"reports":null,"executions":[]`
+	tests := []struct {
+		name    string
+		src     string
+		wantNil bool
+	}{
+		{name: "empty array", src: `{` + others + `,"sessions":[]}`},
+		{name: "null", src: `{` + others + `,"sessions":null}`, wantNil: true},
+		{name: "key absent", src: `{` + others + `}`, wantNil: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var snap NodeStateSnapshot
+			if err := json.Unmarshal([]byte(tt.src), &snap); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if tt.wantNil {
+				if snap.Sessions != nil {
+					t.Errorf("sessions = %#v, want a nil pointer", snap.Sessions)
+				}
+				return
+			}
+			if snap.Sessions == nil || len(*snap.Sessions) != 0 {
+				t.Errorf("sessions = %#v, want a non-nil pointer to an empty slice", snap.Sessions)
+			}
+		})
 	}
 }
 
@@ -743,6 +791,126 @@ func TestTypesNodeStateExecution(t *testing.T) {
 	}
 	if nulled.Status != ExecutionStatusAck {
 		t.Errorf("Status = %q, want %q", nulled.Status, ExecutionStatusAck)
+	}
+}
+
+func TestTypesNodeStateSession(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	tests := []struct {
+		name       string
+		session    NodeStateSession
+		targetKey  string
+		targetKeys []string
+	}{
+		{
+			name: "ssh",
+			session: NodeStateSession{
+				SessionID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b0",
+				JTI:       "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b0",
+				Kind:      SessionKindSSH,
+				Target: SessionTarget{SSH: &SessionTargetSSH{
+					User:            "operator",
+					AllowedCommands: []string{"systemctl restart plexd", "journalctl -u plexd"},
+				}},
+				ExpiresAt:          now.Add(30 * time.Minute),
+				IdleTimeoutSeconds: 300,
+			},
+			targetKey:  "ssh",
+			targetKeys: []string{"user", "allowed_commands"},
+		},
+		{
+			name: "k8s",
+			session: NodeStateSession{
+				SessionID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+				JTI:       "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+				Kind:      SessionKindK8s,
+				Target: SessionTarget{K8s: &SessionTargetK8s{
+					User:              "alice@example.com",
+					ImpersonateGroups: []string{"sre", "oncall"},
+				}},
+				ExpiresAt:          now.Add(15 * time.Minute),
+				IdleTimeoutSeconds: 120,
+			},
+			targetKey:  "k8s",
+			targetKeys: []string{"user", "impersonate_groups"},
+		},
+		{
+			name: "tcp",
+			session: NodeStateSession{
+				SessionID:          "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+				JTI:                "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
+				Kind:               SessionKindTCP,
+				Target:             SessionTarget{TCP: &SessionTargetTCP{Host: "10.42.0.5", Port: 5432}},
+				ExpiresAt:          now.Add(1 * time.Hour),
+				IdleTimeoutSeconds: 60,
+			},
+			targetKey:  "tcp",
+			targetKeys: []string{"host", "port"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, got := roundTrip(t, tt.session)
+			requireEqual(t, tt.session, got)
+
+			// Verify snake_case keys: exactly the six contract keys, nothing more.
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(data, &raw); err != nil {
+				t.Fatal(err)
+			}
+			if len(raw) != 6 {
+				t.Errorf("expected exactly 6 JSON keys, got %d: %v", len(raw), raw)
+			}
+			for _, key := range []string{"session_id", "jti", "kind", "target", "expires_at", "idle_timeout_seconds"} {
+				if _, ok := raw[key]; !ok {
+					t.Errorf("expected JSON key %q", key)
+				}
+			}
+
+			// The target carries exactly the one-of member the kind selects.
+			var target map[string]json.RawMessage
+			if err := json.Unmarshal(raw["target"], &target); err != nil {
+				t.Fatalf("decode target: %v", err)
+			}
+			if len(target) != 1 {
+				t.Errorf("expected exactly 1 one-of member, got %d: %v", len(target), target)
+			}
+			member, ok := target[tt.targetKey]
+			if !ok {
+				t.Fatalf("target missing member %q: %v", tt.targetKey, target)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(member, &fields); err != nil {
+				t.Fatalf("decode target.%s: %v", tt.targetKey, err)
+			}
+			for _, key := range tt.targetKeys {
+				if _, ok := fields[key]; !ok {
+					t.Errorf("target.%s missing key %q", tt.targetKey, key)
+				}
+			}
+		})
+	}
+
+	// An entry without idle_timeout_seconds means "no idle window": it decodes
+	// to a zero, not to a default.
+	const noIdle = `{"session_id":"sess-1","jti":"sess-1","kind":"tcp",` +
+		`"target":{"tcp":{"host":"10.42.0.5","port":5432}},"expires_at":"2026-01-01T00:30:00Z"}`
+	var got NodeStateSession
+	if err := json.Unmarshal([]byte(noIdle), &got); err != nil {
+		t.Fatalf("unmarshal without idle_timeout_seconds: %v", err)
+	}
+	if got.IdleTimeoutSeconds != 0 {
+		t.Errorf("IdleTimeoutSeconds = %d, want 0", got.IdleTimeoutSeconds)
+	}
+	if got.Kind != SessionKindTCP {
+		t.Errorf("Kind = %q, want %q", got.Kind, SessionKindTCP)
+	}
+	if got.Target.TCP == nil || got.Target.TCP.Port != 5432 {
+		t.Errorf("Target.TCP = %+v, want host 10.42.0.5 port 5432", got.Target.TCP)
+	}
+	if got.Target.SSH != nil || got.Target.K8s != nil {
+		t.Errorf("unset one-of members should stay nil, got %+v", got.Target)
 	}
 }
 
@@ -1635,9 +1803,10 @@ func TestExecutionCallbackResponse_Decode(t *testing.T) {
 func TestSessionActivityRequest_TCPStarted(t *testing.T) {
 	req := SessionActivityRequest{
 		TCP: &TCPActivity{
-			Phase:      TCPPhaseSessionStarted,
-			TargetHost: "10.42.0.5",
-			TargetPort: 5432,
+			Phase:            TCPPhaseSessionStarted,
+			TargetHost:       "10.42.0.5",
+			TargetPort:       5432,
+			ListenerEndpoint: "127.0.0.1:34517",
 		},
 	}
 	data, err := json.Marshal(req)
@@ -1656,7 +1825,7 @@ func TestSessionActivityRequest_TCPStarted(t *testing.T) {
 	if err := json.Unmarshal(top["tcp"], &tcp); err != nil {
 		t.Fatalf("decode tcp: %v", err)
 	}
-	for _, key := range []string{"phase", "target_host", "target_port"} {
+	for _, key := range []string{"phase", "target_host", "target_port", "listener_endpoint"} {
 		if _, ok := tcp[key]; !ok {
 			t.Errorf("tcp missing key %q", key)
 		}
@@ -1700,6 +1869,10 @@ func TestSessionActivityRequest_TCPEnded(t *testing.T) {
 	}
 	if string(tcp["terminated_by"]) != `"idle_timeout"` {
 		t.Errorf("terminated_by = %s, want %q", tcp["terminated_by"], "idle_timeout")
+	}
+	// The listener address rides only on the session_started row.
+	if _, ok := tcp["listener_endpoint"]; ok {
+		t.Error("session_ended should omit listener_endpoint")
 	}
 }
 
