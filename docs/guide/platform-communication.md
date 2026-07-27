@@ -60,10 +60,10 @@ sequenceDiagram
 | Registration | Node → CP | HTTPS POST | Once | Bootstrap identity, receive keys and peers |
 | SSE Stream | Node ← CP | HTTPS SSE | Persistent | Real-time peer, policy, action, and key events |
 | Heartbeat | Node → CP | HTTPS POST | Every 30s | Liveness, status reporting, reconcile/rotate hints |
-| Reconciliation | Node → CP | HTTPS GET | Every 60s | State consistency fallback; pulls the desired-state snapshot |
+| Reconciliation | Node → CP | HTTPS GET | Every 60s | State consistency fallback; pulls the desired-state snapshot and the queued action dispatches |
 | Observability | Node → CP | HTTPS POST | Periodic | Metrics, logs, and audit event uploads |
 
-The SSE stream is the primary real-time channel. Reconciliation acts as a consistency fallback — if an SSE event is missed, the next reconciliation cycle detects and corrects the drift. See [Heartbeat Service](/reference/core/heartbeat-service) and [Reconciliation](/reference/core/reconciliation) for protocol details.
+The SSE stream is the primary real-time channel. Reconciliation acts as a consistency fallback — if an SSE event is missed, the next reconciliation cycle detects and corrects the drift. Action dispatches are the one payload that never rides the event stream at all: they are delivered in the `executions` block of the reconciliation pull, and the matching `action_request` event merely pulls the next cycle forward. See [Heartbeat Service](/reference/core/heartbeat-service) and [Reconciliation](/reference/core/reconciliation) for protocol details.
 
 ## Node Lifecycle
 
@@ -92,7 +92,7 @@ flowchart TD
         S2 -->|reconcile flag| S3
         S2 -->|rotate_keys flag| S4[Key rotation]
         T4 --> S5[Observability uploads]
-        T4 --> S6[Action dispatcher]
+        S3 --> S6[Action dispatcher]
         T4 --> S7[Node API server]
     end
 
@@ -171,7 +171,7 @@ flowchart LR
     MESH --> C2["NAT Traversal<br/>STUN + endpoint reporting"]
     MESH --> C3["Network Policy<br/>Peer visibility rules via nftables"]
     MESH --> C4["Secure Tunnels<br/>SSH-based access through mesh"]
-    MESH --> C5["Remote Actions<br/>SSE-triggered execution"]
+    MESH --> C5["Remote Actions<br/>Pull-dispatched execution"]
     MESH --> C6["Observability<br/>Metrics, logs, audit forwarding"]
 
     BR["Bridge Node<br/>(bridge mode only)"]
@@ -196,7 +196,7 @@ flowchart LR
 | NAT Traversal | STUN-based public endpoint discovery and exchange | [NAT Traversal](/reference/networking/nat-traversal) |
 | Network Policy | Peer visibility rules enforced via nftables | [Network Policy](/reference/networking/network-policy) |
 | Secure Tunnels | SSH-based access to services through the mesh | [Secure Access Tunneling](/reference/networking/secure-access-tunneling) |
-| Remote Actions | Execute built-in and hook-based actions via SSE | [Remote Actions & Hooks](/reference/actions/remote-actions-hooks) |
+| Remote Actions | Execute built-in and hook-based actions dispatched in the state pull | [Remote Actions & Hooks](/reference/actions/remote-actions-hooks) |
 | Observability | Metrics, logs, and audit event forwarding | [Metrics](/reference/observability/metrics-collection), [Logs](/reference/observability/log-forwarding), [Audit](/reference/observability/audit-forwarding) |
 
 ### Bridge-Only Capabilities

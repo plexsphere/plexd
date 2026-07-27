@@ -8,30 +8,55 @@ feature: PXD-0019
 
 The `internal/actions` package enables platform-triggered remote action execution on plexd mesh nodes. It supports built-in operations (diagnostics, connectivity checks) and custom hook scripts with SHA-256 integrity verification. Action results are reported back to the control plane.
 
+## Delivery Model
+
+Action dispatches are **pulled**, not pushed. The control plane queues an execution into the `executions` block of `GET /v1/nodes/{node_id}/state`; plexd consumes that block on every successful reconciliation pull. The block is a delivery queue, not desired state: an entry keeps reappearing on every pull until its execution reaches a terminal status through the execution callback, so the node is responsible for suppressing the re-observations.
+
+The `action_request` SSE event is a push-latency optimisation only. Its payload is opaque and it merely triggers a reconcile — the resulting pull carries the dispatch. A node with no event stream (descoped or disconnected) still executes every dispatch, just at the reconciliation cadence instead of within milliseconds.
+
 ## Data Flow
 
-```
-Control Plane (SSE)
-       │
+```text
+Control Plane
+       │  executions block of GET /v1/nodes/{id}/state
        ▼
 ┌──────────────────────┐
-│ HandleActionRequest  │  api.EventHandler for EventActionRequest
-│  (handler.go)        │
+│ Reconciler dispatch  │  reconcile.DispatchHandler, invoked after every
+│  stage               │  successful FetchState and BEFORE the diff
 └──────────┬───────────┘
-           │ parse ActionRequest
+           │ *api.NodeStateSnapshot
            ▼
+┌──────────────────────┐
+│ Dispatcher.Handle    │  per entry, in block order
+│  (dispatch.go)       │
+└──────────┬───────────┘
+           │
+     ┌─────┴──────────────────────────────────────┐
+     │ 1. no execution_id?    → drop, no callback │
+     │ 2. already handled?    → skip              │
+     │ 3. run still active?   → skip              │
+     │ 4. budget short of one? → stop, next pull  │
+     │ 5. expires_at absent/lapsed? → skip        │
+     │ 6. status pending/ack  → Executor.Execute  │
+     │    (actions disabled   → reject)           │
+     │ 7. status started      → FailOrphan        │
+     └──────────┬─────────────────────────────────┘
+                │ status pending | ack
+                ▼
 ┌──────────────────────┐
 │ Executor.Execute     │
 │  (executor.go)       │
 └──────────┬───────────┘
            │
-     ┌─────┴──────────────────────────────────────┐
-     │ 1. Check shuttingDown                      │
-     │ 2. Check duplicate execution_id            │
-     │ 3. Check MaxConcurrent                     │
-     │ 4. Look up action (builtins → hooks)       │
-     │ 5. Post ack callback (accepted / rejected) │
-     └──────────┬─────────────────────────────────┘
+     ┌─────┴──────────────────────────────────────────┐
+     │ 1. shuttingDown / active id / MaxConcurrent    │
+     │    → ErrDispatchDeferred (no callback, retry)  │
+     │ 2. Look up action in the registry the entry's  │
+     │    type names → unknown_action rejects, an     │
+     │    unknown type → unsupported_action_type      │
+     │ 3. Claim: post ack (only when status is        │
+     │    pending), then started — both before the run│
+     └──────────┬─────────────────────────────────────┘
                 │ if accepted
                 ▼
         ┌───────────────┐
@@ -44,11 +69,12 @@ Control Plane (SSE)
      ┌─────────┐ ┌─────────────────────────────┐
      │runBuiltin│ │runHook                      │
      │ call fn  │ │ 1. Path traversal check     │
-     └────┬────┘ │ 2. File existence check      │
-          │      │ 3. integrity.VerifyHook       │
-          │      │ 4. exec.CommandContext         │
-          │      │ 5. Capture stdout/stderr       │
-          │      │ 6. Truncate to MaxOutputBytes  │
+     └────┬────┘ │ 2. Discovery-snapshot lookup │
+          │      │ 3. File existence check      │
+          │      │ 4. Verify vs pinned digest   │
+          │      │ 5. exec.CommandContext        │
+          │      │ 6. Capture stdout/stderr      │
+          │      │ 7. Truncate to MaxOutputBytes │
           │      └──────────┬──────────────────────┘
           │                 │
           └────────┬────────┘
@@ -56,7 +82,7 @@ Control Plane (SSE)
                    ▼
           ┌──────────────────────┐
           │ ExecutionCallback    │  POST /v1/nodes/{id}/executions/{eid}
-          │ (started → terminal) │  (ack → started → succeeded|failed|cancelled)
+          │ (terminal)           │  (ack → started → succeeded|failed|cancelled)
           └──────────────────────┘
 ```
 
@@ -94,6 +120,76 @@ if err := cfg.Validate(); err != nil {
 
 Validation is skipped entirely when `Enabled` is `false`.
 
+## Dispatcher
+
+Consumes the `executions` block of the reconciliation pull and turns each entry into an execution on the `Executor`. It is registered on the reconciler in `cmd/plexd/cmd/up.go`:
+
+```go
+dispatcher := actions.NewDispatcher(executor, identity.NodeID, logger)
+reconciler.RegisterDispatchHandler(dispatcher.Handle)
+```
+
+### Constructor
+
+```go
+func NewDispatcher(executor *Executor, nodeID string, logger *slog.Logger) *Dispatcher
+```
+
+### Handle
+
+```go
+func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
+```
+
+The signature matches `reconcile.DispatchHandler`. A `Dispatcher` is **not** safe for concurrent use: `Handle` is invoked only from the reconcile goroutine, one cycle at a time.
+
+### Decision Table
+
+Each entry of the block is evaluated in block order:
+
+| Condition                                    | Outcome                                                                  | Callbacks |
+|----------------------------------------------|--------------------------------------------------------------------------|-----------|
+| `execution_id` is empty                      | Dropped, never run: there is no callback route and no identity to deduplicate, cancel, or audit on | none |
+| Execution id already settled by this dispatcher | Skipped                                                                | none      |
+| The executor is still running that execution | Marked settled again; the executor, not the settled set, is authoritative on in-flight runs | none |
+| Less than one settlement (15s) of the pass budget (20s) is left | The remaining entries are left for the next pull, logged at warn | none |
+| `expires_at` is absent (the zero time)       | Refused and marked settled, logged at warn — never folded into the lapsed case below, which would silently discard every dispatch | none |
+| `expires_at` is not after now                | Skipped; expiry is the control plane's move                              | none      |
+| `status` is `pending` or `ack`, `Config.Enabled` is `false` | Fail-fast rejection with `error=actions_disabled`           | `ack` → `started` → `failed` |
+| `status` is `pending` or `ack`               | `Executor.Execute`                                                       | see [Execute Flow](#execute-flow) |
+| `status` is `started`                        | `Executor.FailOrphan`: the run was lost to an agent restart; an undelivered report is retried on the next pull, at most 5 times | `failed`  |
+| any other `status`                            | Logged at warn and marked settled                                        | none      |
+
+There is no `timeout` wire status: a lapsed entry is dropped without a callback because the control plane sets the timeout itself.
+
+The `Config.Enabled` gate sits **inside** the `pending`/`ack` case, not ahead of the status switch: a status this build cannot place must not be driven through a rejection walk, which would guess a transition path from a state the node does not understand.
+
+The pass budget bounds the whole of `Handle`, which runs on the reconcile goroutine ahead of peer, policy, and bridge convergence. Block size is the control plane's to choose and nothing caps it, so without a budget a degraded control plane pins the reconciliation cycle open for the length of the block. Entries the pass never reaches are redelivered by the next pull, so an exhausted budget only defers work — and the entry it stopped on is named in the log line.
+
+The budget gates which entries the pass *starts*, never how long a settlement already under way may take: a callback sequence handed what is left of the budget as its deadline would fail on that deadline rather than on the control plane, and the next pass would repeat the failure. Every sequence therefore keeps its own per-leg deadline, and an entry is started only while a whole settlement — the three-leg rejection walk, 15s — of the budget is left. That leaves a 5s window in which entries start and bounds the pass at the 20s budget instead of at the budget plus one entire settlement.
+
+### Handled Set
+
+The dispatcher keeps a set of settled execution ids — dispatched, rejected, expired, or reported lost — so a re-observed entry is a no-op. An id is forgotten the moment its entry drains from the block: the control plane only drains a settled execution, so the id can never be re-observed. That bounds the set by the size of the block.
+
+The set is a hint, not the run state. `Executor.IsActive` is authoritative on whether a run is still in flight, and the dispatcher consults it before doing anything else with an entry: a block that transiently omits an entry prunes its id, and without that check the next pull would report a live run lost or dispatch it a second time.
+
+An entry whose `Execute` or rejection walk returned `ErrDispatchDeferred` is deliberately **not** marked settled, so the next pull retries it. That covers both local backpressure and a transient control-plane failure that cut a callback sequence short: in either case the execution is still unresolved, and suppressing the entry would strand it until the control plane's own expiry fires.
+
+An undelivered **orphan report** is retried the same way, but only 5 times. An unsettled entry is retried at the head of the block on every pull and each attempt spends part of the pass budget, so a report the control plane keeps refusing would starve every entry queued behind it for the execution's whole expiry window — up to `max_action_timeout` (10 minutes by default), or ten consecutive cycles at the default 60s interval. Once the cap is reached the entry is settled locally at error level and the execution is left to the server-side expiry an undeliverable report ends at anyway. The counter is per execution id and is forgotten alongside the settled id when the entry drains from the block.
+
+### Resume After a Restart
+
+plexd keeps no execution state across a restart, so the entry's `status` is what resumes it:
+
+| Status on the pull | Meaning                                                | Node's move                                                        |
+|--------------------|--------------------------------------------------------|--------------------------------------------------------------------|
+| `pending`          | Dispatched, never acknowledged                         | Run it; `ack` is the first callback                                 |
+| `ack`              | Acknowledged before the restart, never started         | Run it **without** re-acking; `started` is the first callback       |
+| `started`          | The run was in flight and did not survive the restart  | Report `failed` with `error=execution lost to an agent restart`; **never** re-execute |
+
+Actions are not idempotent, which is why a `started` entry is reported lost rather than repeated. `started` → `failed` is a legal edge, so the single terminal callback settles the execution.
+
 ## Executor
 
 Central orchestrator for action execution, concurrency control, and result reporting.
@@ -120,63 +216,94 @@ Logger is tagged with `component=actions`.
 | `RegisterBuiltin` | `(name, description string, params []api.ActionParam, fn BuiltinFunc)`         | Register a built-in action                           |
 | `SetHooks`        | `(hooks []api.HookInfo)`                                                        | Set the discovered hooks snapshot                    |
 | `Capabilities`    | `() ([]api.ActionInfo, []api.HookInfo)`                                         | Return registered builtins and hooks for reporting   |
-| `Execute`         | `(ctx context.Context, nodeID string, req api.ActionRequest)`                   | Main entry point for action execution                |
+| `Execute`         | `(ctx context.Context, nodeID string, entry api.NodeStateExecution) error`      | Main entry point for action execution                |
+| `FailOrphan`      | `(ctx context.Context, nodeID, executionID string)`                             | Report a run lost to an agent restart as `failed`    |
 | `Shutdown`        | `(ctx context.Context)`                                                         | Cancel all running executions, reject new ones       |
 | `ActiveCount`     | `() int`                                                                         | Number of currently running actions                  |
+| `IsActive`        | `(executionID string) bool`                                                      | Whether that execution is running right now          |
 
 ### Execute Flow
 
-1. **Check shutting down**: if `shuttingDown`, reject with `reason=shutting_down`
-2. **Check duplicate**: if `executionID` already active, reject with `reason=duplicate_execution_id`
-3. **Check concurrency**: if `len(active) >= MaxConcurrent`, reject with `reason=max_concurrent_reached`
-4. **Look up action**: search builtins map first, then hooks list
-5. **Unknown action**: reject with `reason=unknown_action`
-6. **Accept**: post `ExecutionCallbackRequest{Status: "ack"}` via `ActionReporter.ExecutionCallback`
+`Execute` takes the pull entry itself. It returns `ErrDispatchDeferred` when local backpressure prevents the run from starting, and `nil` once the execution has been accepted or settled with a callback.
+
+1. **Check shutting down**: if `shuttingDown`, defer with `reason=shutting_down`
+2. **Check duplicate**: if the execution id is already active, defer with `reason=already_active`
+3. **Check concurrency**: if `len(active) >= MaxConcurrent`, defer with `reason=max_concurrent_reached`
+4. **Look up action**: the entry's `type` picks the registry — `builtin` resolves **only** against the builtins map, `hook` **only** against the discovered hooks snapshot. A mistyped entry is unresolvable rather than silently routed to the other kind
+5. **Unknown action**: reject with `reason=unknown_action`; a `type` outside `builtin`/`hook` rejects with `reason=unsupported_action_type`, because the action itself may well be registered and naming the wrong cause sends the operator auditing the action registry instead of the `type` field
+6. **Claim**: post `ExecutionCallbackRequest{Status: "ack"}` — but only when the entry's `status` is `pending`, since an entry the pull already reports at `ack` has that transition recorded and repeating it would be a non-terminal self-edge answered `409` — then post `{Status: "started"}`. Both legs run **synchronously, before the run**, under a 5s deadline for the whole handshake
 7. **Execute**: launch goroutine calling `runAction` with timeout context
 
-A rejection (steps 1–3, 5) posts an `ack` callback followed by a `failed` terminal carrying `error=<reason>`. When the `ack` (or later `started`) callback is refused — a problem response whose `code` is `nsk_node_mismatch`, `invalid_state_transition`, or `execution_already_terminal` — plexd aborts without running or terminal-reporting the execution, because running it anyway would double-report. plexd keys that decision on the `code`, not on the bare `403`/`409` status: an intermediary's `403` is a transient failure, and treating it as a refusal would silently drop an action that then never runs and is never reported.
+`started` is a hard precondition for running, which is what keeps the pull's `ack` status unambiguous: an entry the block still reports at `ack` has not executed, so redelivering it after a restart cannot repeat a non-idempotent action. A transient failure on either leg therefore aborts the dispatch with `ErrDispatchDeferred` — nothing runs, the execution stays where the control plane had it, and the next pull redelivers it.
+
+#### Deferral vs. fail-fast
+
+The two failure shapes are deliberately different, because the pull redelivers:
+
+|                    | Deferral (steps 1–3 and 6)                           | Fail-fast rejection (step 5, plus `actions_disabled`)   |
+|--------------------|------------------------------------------------------|----------------------------------------------------------|
+| Cause              | Local backpressure, or a transient failure of the claim handshake — either way the execution is unresolved | The node will never run this action — permanent |
+| Callbacks          | **None** for backpressure; a cut-short claim may have delivered `ack` | The full legal sequence to `failed`             |
+| Return value       | `ErrDispatchDeferred`                                | `nil`                                                    |
+| Dispatcher's move  | Leaves the entry unsettled; the next pull retries it | Marks the entry settled                                  |
+
+Reporting a deferral would fail an execution the control plane is about to redeliver, so a deferral is logged at warn and nothing else.
+
+A rejection walk returns `ErrDispatchDeferred` too when a transient failure cuts it short: the leg that failed was never recorded, so continuing the walk would only earn a `409` on the next one. The entry stays unsettled and the next pull retries the walk from whatever status the control plane now reports.
+
+A fail-fast rejection walks **every legal edge** from the status the pull entry declared, because the control plane reaches a terminal status only from `started`:
+
+| Entry status | Callback sequence                    |
+|--------------|--------------------------------------|
+| `pending`    | `ack` → `started` → `failed(reason)` |
+| `ack`        | `started` → `failed(reason)`         |
+| `started`    | `failed(reason)`                     |
+
+A two-step `ack` → `failed` is **not** legal: the control plane answers it `409 invalid_state_transition`.
+
+When a callback is refused — a problem response whose `code` is `nsk_node_mismatch`, `invalid_state_transition`, or `execution_already_terminal` — plexd aborts without running or terminal-reporting the execution, because running it anyway would double-report. plexd keys that decision on the `code`, not on the bare `403`/`409` status: an intermediary's `403` is a transient failure, and treating it as a refusal would silently drop an action that then never runs and is never reported. A refusal settles the execution; a transient failure leaves it unsettled for the next pull.
 
 ### runAction (goroutine)
 
-1. Post `ExecutionCallbackRequest{Status: "started"}`; a coded refusal skips the run
-2. Parse timeout from `ActionRequest.Timeout` (capped by `Config.MaxActionTimeout`)
-3. Dispatch to `runBuiltin` or `runHook`
-4. Determine the terminal status via `terminalOutcome`: `succeeded` (exit 0), `failed` (non-zero exit, timeout, or run error), or `cancelled` (parent context cancelled)
-5. Build the terminal `ExecutionCallbackRequest` with `Status`, `ExitCode`, `Error`, and `Output` (base64 inline when ≤ 16 KiB, otherwise the declare → upload → object-key leg)
-6. Post the terminal callback via `ActionReporter.ExecutionCallback`, retrying a transient failure up to three times with exponential backoff (500 ms, 1 s) — the terminal callback is the only transition out of `started`, so giving up after one attempt would pin the invocation there forever. A coded refusal stops the retry immediately.
-7. Remove from active map
+1. Derive the run deadline as `min(time.Until(entry.ExpiresAt), Config.MaxActionTimeout)` — the entry carries an absolute deadline, not a relative timeout, so the run gets whatever is left of it, clamped to the configured maximum. A deadline that lapses mid-run reports `failed` with `error="action timed out"`. A deadline with **nothing left of it** — the claim handshake ahead of the run is synchronous, so a slow control plane can consume the whole remainder — reports `failed` with `error="execution deadline lapsed before the run started"` without running anything: an already-lapsed context would kill a hook at `Start` while a builtin that does not watch its context would run to completion and report `succeeded` past its own deadline
+2. Dispatch to `runBuiltin` or `runHook`
+3. Determine the terminal status via `terminalOutcome`: `succeeded` (exit 0), `failed` (non-zero exit, timeout, or run error), or `cancelled` (parent context cancelled)
+4. Build the terminal `ExecutionCallbackRequest` with `Status`, `ExitCode`, `Error`, and `Output` (base64 inline when ≤ 16 KiB, otherwise the declare → upload → object-key leg)
+5. Post the terminal callback via `ActionReporter.ExecutionCallback`, retrying a transient failure up to three times with exponential backoff (500 ms, 1 s) — the terminal callback is the only transition out of `started`, so giving up after one attempt would pin the invocation there forever. A coded refusal stops the retry immediately.
+6. Remove from active map
 
 ### runHook
 
 1. **Path traversal prevention**: reject names containing `/`, `\`, or `..`
-2. **File existence**: `os.Stat` the resolved path
-3. **Integrity verification**: call `HookVerifier.VerifyHook(ctx, nodeID, hookPath, checksum)`
-4. **Execute**: `exec.CommandContext` with `WaitDelay=500ms`
-5. **Environment**: minimal env (`PATH`, `HOME`, `PLEXD_NODE_ID`, `PLEXD_EXECUTION_ID`) plus `PLEXD_PARAM_*` vars
-6. **Output capture**: stdout and stderr each captured in a buffer truncated to `MaxOutputBytes`; the joined body is truncated back to `MaxOutputBytes` so a hook saturating both streams stays within the per-action cap
+2. **Discovery-snapshot lookup**: find the hook in the discovered hooks snapshot. A hook absent from it fails the run — `Execute` already gated this, so it is the backstop for a snapshot that changed in between
+3. **File existence**: `os.Stat` the resolved path
+4. **Integrity verification**: call `HookVerifier.VerifyHook(ctx, nodeID, hookPath, pinnedChecksum)`, where `pinnedChecksum` is the digest this process recorded the **first** time it discovered the hook — **not** a wire field, and **not** the digest `HookWatcher` last recomputed (see [Hook Integrity Pinning](#hook-integrity-pinning))
+5. **Execute**: `exec.CommandContext` with `WaitDelay=500ms`
+6. **Environment**: minimal env (`PATH`, `HOME`, `PLEXD_NODE_ID`, `PLEXD_EXECUTION_ID`) plus `PLEXD_PARAM_*` vars
+7. **Output capture**: stdout and stderr each captured in a buffer truncated to `MaxOutputBytes`; the joined body is truncated back to `MaxOutputBytes` so a hook saturating both streams stays within the per-action cap
+
+#### Hook Integrity Pinning
+
+The pull entry carries **no** checksum, so hook trust anchors on a digest the node pins itself: the one recorded the **first** time this process discovered the hook — the same digest it reports to the control plane in its capabilities.
+
+The pin is what makes the check meaningful. `HookWatcher` re-hashes a hook on every write and pushes the new digest through `SetHooks`, so verifying against the live snapshot would compare a file with a hash of itself and pass for whatever bytes are on disk — including an attacker's, since the integrity callback only logs. A pin is therefore never updated and never dropped for the life of the process: a hook whose bytes change after discovery fails verification, files an integrity violation, and stays unrunnable until the agent restarts and re-attests it. That is also why a legitimately edited hook needs an agent restart before it can be dispatched again.
+
+Upstream integrity — whether this node should run this hook at all — is the control plane's server-side dispatch gating, not a field the node re-checks.
 
 ### Shutdown
 
 1. Sets `shuttingDown = true` under mutex
 2. Collects all active cancel functions
 3. Calls each cancel function to cancel running contexts
-4. Subsequent `Execute` calls are rejected with `reason=shutting_down`
+4. Subsequent `Execute` calls return `ErrDispatchDeferred` with `reason=shutting_down`, so the pull redelivers them to the next agent process
 
-## HandleActionRequest
-
-SSE event handler for `action_request` events. Follows the same closure pattern as `tunnel.HandleSSHSessionSetup`.
+## ErrDispatchDeferred
 
 ```go
-func HandleActionRequest(executor *Executor, nodeID string, logger *slog.Logger) api.EventHandler
+var ErrDispatchDeferred = errors.New("actions: dispatch deferred")
 ```
 
-Returns an `api.EventHandler` that:
-
-1. Parses `Envelope.Payload` into `api.ActionRequest`
-2. Returns error on malformed JSON (no ack sent; logged by dispatcher)
-3. Returns error on missing `execution_id`
-4. When `Config.Enabled` is `false`: routes through the executor's reject path, posting an `ack` callback followed by a `failed` terminal with `error=actions_disabled`
-5. Otherwise: delegates to `Executor.Execute`
+Reports that a dispatch has **not** been settled: local backpressure prevented it — shutdown, a run already in flight under the same id, or a saturated concurrency slot — or a transient control-plane failure cut a callback sequence short before it resolved the execution. It is **not** a failure of the execution: the pull's `executions` block redelivers the entry, so the caller must retry it on a later cycle instead of suppressing it.
 
 ## ActionReporter
 
@@ -201,7 +328,7 @@ type HookVerifier interface {
 }
 ```
 
-The production implementation is `integrity.Verifier`, which computes SHA-256 of the hook file and compares against the expected checksum from the control plane.
+The production implementation is `integrity.Verifier`, which computes SHA-256 of the hook file and compares it against the digest plexd recorded when it discovered the hook on disk.
 
 ## BuiltinFunc
 
@@ -447,7 +574,7 @@ In `cmd/plexd/cmd/up.go`, the watcher is wired to the executor:
 hookWatcher := actions.NewHookWatcher(cfg.Actions.HooksDir, executor.SetHooks, onIntegrityAlert, logger)
 ```
 
-When hooks change, `executor.SetHooks` is called, updating `Capabilities()` output. The `Hooks()` method satisfies the `nodeapi.HookReloader` interface.
+When hooks change, `executor.SetHooks` is called, updating `Capabilities()` output. It does **not** move the integrity anchor of a hook the executor has already seen — see [Hook Integrity Pinning](#hook-integrity-pinning). The `Hooks()` method satisfies the `nodeapi.HookReloader` interface.
 
 ## Local API Endpoints
 
@@ -572,7 +699,20 @@ A hook named `deploy` can have a sidecar file `deploy.json`:
 
 ## Parameter Passing
 
-Parameters from `ActionRequest.Parameters` are passed to hook scripts as environment variables with the `PLEXD_PARAM_` prefix.
+The entry's `parameters` is an arbitrary JSON object (or `null`, which flattens to an empty map). Each value is kept as raw JSON rather than decoded into an `any`, because the state response is decoded with a plain decoder: a number in an `any` becomes a `float64`, which silently rewrites every integer past 2^53 (an epoch in nanoseconds, a snowflake id) before it ever reaches the action.
+
+The object is flattened to the flat string map builtins and hooks consume: a JSON **string** is unquoted so an ordinary parameter keeps its exact text, and every other value — number, bool, `null`, array, object — travels as the JSON text the control plane sent.
+
+| JSON value        | Flattened string |
+|-------------------|------------------|
+| `"s3://bucket"`   | `s3://bucket`    |
+| `30`              | `30`             |
+| `true`            | `true`           |
+| `null`            | `null`           |
+| `["a","b"]`       | `["a","b"]`      |
+| `{"k":"v"}`       | `{"k":"v"}`      |
+
+The flattened parameters are passed to hook scripts as environment variables with the `PLEXD_PARAM_` prefix.
 
 | Original Name     | Environment Variable        |
 |--------------------|-----------------------------|
@@ -589,7 +729,7 @@ Additional environment variables always set:
 | `PATH`                 | Inherited from agent process   |
 | `HOME`                 | Inherited from agent process   |
 | `PLEXD_NODE_ID`        | Node ID of the executing node  |
-| `PLEXD_EXECUTION_ID`   | Execution ID from the request  |
+| `PLEXD_EXECUTION_ID`   | Execution ID from the pull entry |
 
 ## Execution Status Values
 
@@ -601,33 +741,67 @@ The terminal callback carries one of three statuses, chosen by `terminalOutcome`
 | `failed`    | Non-zero exit, a timeout (`error="action timed out"`), or a run error (message in `error`)     |
 | `cancelled` | Parent context was cancelled (e.g., during shutdown)                                          |
 
-## Ack Rejection Reasons
+## Rejection Reasons
 
-| Reason                     | Trigger                                           |
-|----------------------------|---------------------------------------------------|
-| `unknown_action`           | Action name not in builtins or hooks list          |
-| `max_concurrent_reached`   | Active executions >= `Config.MaxConcurrent`        |
-| `duplicate_execution_id`   | Execution ID already in progress                   |
-| `shutting_down`            | Agent is shutting down                             |
-| `actions_disabled`         | `Config.Enabled` is `false`                        |
+Three reasons reach the control plane, each as the `error` of the `failed` terminal that closes the fail-fast sequence:
+
+| Reason                    | Trigger                                                                     |
+|---------------------------|------------------------------------------------------------------------------|
+| `unknown_action`          | Action name not in the registry the entry's `type` names                      |
+| `unsupported_action_type` | `type` outside `builtin`/`hook` — the action itself may well be registered    |
+| `actions_disabled`        | `Config.Enabled` is `false`                                                   |
+
+Three more are **deferral** reasons: they are logged locally at warn and produce **no callback at all**, because the pull redelivers the entry.
+
+| Reason                   | Trigger                                     |
+|--------------------------|---------------------------------------------|
+| `shutting_down`          | Agent is shutting down                      |
+| `already_active`         | Execution id already in progress            |
+| `max_concurrent_reached` | Active executions >= `Config.MaxConcurrent` |
 
 ## API Types
 
 Types defined in `internal/api/types.go`.
 
-### ActionRequest
+### NodeStateExecution
 
-SSE payload for `action_request` events.
+One entry of the `executions` block of `GET /v1/nodes/{node_id}/state`.
 
 ```go
-type ActionRequest struct {
-    ExecutionID string            `json:"execution_id"`
-    Action      string            `json:"action"`
-    Parameters  map[string]string `json:"parameters,omitempty"`
-    Timeout     string            `json:"timeout"`
-    Checksum    string            `json:"checksum,omitempty"`
-    TriggeredBy *TriggeredBy      `json:"triggered_by,omitempty"`
+type NodeStateExecution struct {
+    ExecutionID string                     `json:"execution_id"`
+    Action      string                     `json:"action"`
+    Type        string                     `json:"type"`
+    Parameters  map[string]json.RawMessage `json:"parameters"`
+    Status      string                     `json:"status"`
+    RequestedAt time.Time                  `json:"requested_at"`
+    ExpiresAt   time.Time                  `json:"expires_at"`
 }
+```
+
+`ExpiresAt` is an absolute UTC deadline, not a relative timeout; a missing or `null` value decodes to the zero time, which the dispatcher refuses rather than treats as lapsed. `Parameters` is nullable: a JSON `null` decodes to a nil map, and each value is held as raw JSON so a large integer reaches the action with every digit intact. The entry carries no callback URL and no hook checksum.
+
+### ActionKind constants
+
+```go
+const (
+    // ActionKindBuiltin dispatches an action built into plexd.
+    ActionKindBuiltin = "builtin"
+    // ActionKindHook dispatches a hook registered by the node.
+    ActionKindHook = "hook"
+)
+```
+
+### ExecutionStatusPending
+
+```go
+const (
+    // ExecutionStatusPending marks an execution the control plane has dispatched
+    // and the node has not yet acknowledged. It appears in the executions block
+    // of the node state snapshot and is never reported by a node on the
+    // execution callback.
+    ExecutionStatusPending = "pending"
+)
 ```
 
 ### ExecutionCallbackRequest
@@ -704,7 +878,7 @@ type CapabilitiesPayload struct {
 
 ### With internal/api
 
-- `EventActionRequest` constant defines the SSE event type
+- `api.NodeStateExecution` is the pull entry the dispatcher consumes
 - `api.ControlPlane.ExecutionCallback` and `UploadExecutionOutput` are the production implementations of `ActionReporter`
 - `api.ControlPlane.UpdateCapabilities` sends discovered capabilities
 
@@ -713,9 +887,9 @@ type CapabilitiesPayload struct {
 - `integrity.Verifier` implements `HookVerifier` for SHA-256 hook verification
 - `integrity.HashFile` is used by `DiscoverHooks` for computing hook checksums
 
-### With internal/api (EventDispatcher)
+### With internal/reconcile
 
-`HandleActionRequest` returns an `api.EventHandler` registered with the `EventDispatcher` for `EventActionRequest` events, following the same pattern as `tunnel.HandleSSHSessionSetup`.
+`Dispatcher.Handle` satisfies `reconcile.DispatchHandler` and is registered with `RegisterDispatchHandler`, so it runs after every successful state pull and before the diff. The `action_request` SSE event is registered on the shared `triggerReconcile` closure instead, alongside `node_state_updated` and the peer family.
 
 ## Lifecycle
 
@@ -740,9 +914,10 @@ exec.RegisterBuiltin("mesh.reconnect", "Reconnect mesh", nil, actions.MeshReconn
 exec.RegisterBuiltin("config.dump", "Dump config", nil, actions.ConfigDump(configProvider))
 exec.RegisterBuiltin("logs.snapshot", "Snapshot logs", snapshotParams, actions.LogsSnapshot(logProvider))
 
-// 4. Register SSE handler
-sseMgr.RegisterHandler(api.EventActionRequest,
-    actions.HandleActionRequest(exec, nodeID, logger))
+// 4. Register the dispatcher on the reconciler; it consumes the pull's
+//    executions block on every successful cycle
+dispatcher := actions.NewDispatcher(exec, nodeID, logger)
+reconciler.RegisterDispatchHandler(dispatcher.Handle)
 
 // 5. Create hook watcher (replaces one-time DiscoverHooks)
 watcher := actions.NewHookWatcher(cfg.HooksDir, exec.SetHooks, onIntegrityAlert, logger)
@@ -762,16 +937,25 @@ exec.Shutdown(ctx)
 
 | Scenario                     | Behavior                                        |
 |------------------------------|-------------------------------------------------|
-| Malformed SSE payload        | Handler returns error (logged by dispatcher)    |
-| Missing execution_id         | Handler returns error                           |
-| Actions disabled             | Ack callback, then `failed` terminal with `error=actions_disabled` |
-| Unknown action               | Ack callback, then `failed` terminal with `error=unknown_action`   |
+| Entry without an `execution_id` | Dropped at error level; never run — there is no callback route |
+| Entry without an `expires_at` | Refused at warn level, marked settled; no callback |
+| Entry past its `expires_at`  | Skipped; no callback — the control plane owns the timeout |
+| Entry with an unexpected `status` | Logged at warn, marked settled; no callback |
+| Dispatch pass budget spent   | The remaining entries are logged at warn and left for the next pull |
+| Backpressure (shutting down, id already active, `MaxConcurrent` saturated) | No callback; the next pull redelivers the entry |
+| Actions disabled             | Fail-fast: the legal sequence to a `failed` terminal with `error=actions_disabled` |
+| Unknown action               | Fail-fast: the legal sequence to a `failed` terminal with `error=unknown_action`   |
+| `type` outside `builtin`/`hook` | Fail-fast: the legal sequence to a `failed` terminal with `error=unsupported_action_type` |
+| Deadline lapsed during the claim handshake | `failed` terminal with `error=execution deadline lapsed before the run started`; nothing runs |
+| Run lost to an agent restart | One `failed` terminal with `error=execution lost to an agent restart`; never re-executed |
+| Orphan report undelivered    | Retried on the next pull, at most 5 passes; then logged at error level and left to server-side expiry |
 | Hook file missing            | `ack` + `started`, then `failed` terminal with `error` carrying the run error (e.g. `hook not found: <name>`) |
 | Hook integrity failure       | `failed` terminal with the integrity error message |
 | Hook timeout                 | Process killed; `failed` terminal with `error=action timed out` (there is no `timeout` wire status — the server sets timeout itself) |
 | Hook non-zero exit           | `failed` terminal with the actual `exit_code`   |
 | Terminal callback fails      | Retried up to 3 times with exponential backoff, then logged at warn level; agent continues |
-| Ack/started callback transport error | Logged at warn level, execution continues |
+| Ack/started callback transport error | Logged at warn level; the dispatch is deferred — nothing runs and the next pull redelivers the entry |
+| Rejection-walk callback transport error | Logged at warn level; the walk stops and the entry stays unsettled for the next pull |
 | Callback refused (`nsk_node_mismatch`, `invalid_state_transition`, `execution_already_terminal`) | Execution aborted: no run, no terminal callback; a terminal refusal is not retried |
 | Panic in action              | Recovered; `failed` terminal with `error=panic: <value>` |
 
@@ -781,23 +965,31 @@ All log entries use `component=actions`.
 
 | Level   | Event                         | Keys                                        |
 |---------|-------------------------------|---------------------------------------------|
-| `Info`  | action_request received       | `execution_id`, `action`                    |
+| `Info`  | execution expired; leaving the timeout to the control plane | `execution_id`, `action`, `expires_at` |
 | `Info`  | Action completed              | `execution_id`, `status`, `duration`        |
+| `Warn`  | dispatch deferred             | `execution_id`, `action`, `reason`          |
 | `Warn`  | Action rejected               | `execution_id`, `action`, `reason`          |
-| `Warn`  | failed to send ack callback   | `execution_id`, `error`                     |
-| `Warn`  | failed to send started callback | `execution_id`, `error`                   |
+| `Warn`  | execution lost to an agent restart; reporting failed | `execution_id`       |
+| `Warn`  | unexpected execution status in the pull block | `execution_id`, `action`, `status` |
+| `Warn`  | execution carries no expires_at; refusing to dispatch | `execution_id`, `action`     |
+| `Warn`  | dispatch budget exhausted; the remaining entries wait for the next pull | `execution_id`, `budget` |
+| `Warn`  | claim callback failed; deferring the dispatch | `execution_id`, `status`, `error` |
+| `Warn`  | execution deadline lapsed before the run started | `execution_id`, `expires_at` |
 | `Warn`  | failed to send terminal callback | `execution_id`, `attempts`, `error`      |
-| `Error` | ack callback refused; aborting execution | `execution_id`, `error`          |
-| `Error` | started callback refused; skipping execution | `execution_id`, `error`      |
-| `Error` | Payload parse failed          | `event_id`, `error`                         |
-| `Error` | Missing execution_id          | `event_id`                                  |
-| `Warn`  | Actions disabled              | `execution_id`, `action`                    |
+| `Warn`  | failed to send callback for rejected execution | `execution_id`, `status`, `error` |
+| `Error` | execution entry carries no execution_id; dropping | `action`                |
+| `Error` | orphan report undelivered across repeated pulls; leaving the execution to server-side expiry | `execution_id`, `passes` |
+| `Error` | claim callback refused; aborting execution | `execution_id`, `status`, `error` |
+| `Error` | callback refused for rejected execution | `execution_id`, `status`, `error` |
+| `Error` | panic in action execution     | `execution_id`, `panic`, `stack`            |
 
-## SSE Event: `action_request`
+## Dispatch Delivery: the `executions` block
 
-The control plane sends an `action_request` event over the existing SSE stream to trigger an action on a node. Like all SSE events, it is wrapped in a signed envelope and verified before processing.
+The control plane queues a dispatch into the `executions` block of
+`GET /v1/nodes/{node_id}/state`. The block is always present (`[]` when empty,
+never `null`) and ordered by `requested_at`, then `execution_id`.
 
-### Payload
+### Entry
 
 ```json
 {
@@ -808,21 +1000,33 @@ The control plane sends an `action_request` event over the existing SSE stream t
     "include_network": true,
     "include_processes": true
   },
-  "timeout": "30s",
-  "callback_url": "https://api.plexsphere.com/v1/nodes/n_abc123/executions/exec_a1b2c3d4"
+  "status": "pending",
+  "requested_at": "2026-07-27T10:30:00Z",
+  "expires_at": "2026-07-27T10:35:00Z"
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `execution_id` | string | Unique identifier for this execution |
-| `action` | string | Action name (e.g. `diagnostics.collect`, `hooks/backup`) |
-| `type` | string | `builtin` or `hook` |
-| `parameters` | object | Key-value parameters passed to the action |
-| `timeout` | duration | Maximum execution time (default: 30s) |
-| `callback_url` | string | URL for execution status callbacks |
+| `action` | string | Action name (e.g. `diagnostics.collect`, `backup`) |
+| `type` | string | `builtin` or `hook`; selects the registry the name is resolved against |
+| `parameters` | object | Parameters passed to the action; nullable |
+| `status` | string | `pending`, `ack`, or `started` — the status the control plane currently holds |
+| `requested_at` | timestamp | When the control plane dispatched the execution |
+| `expires_at` | timestamp | Absolute UTC deadline, **not** a relative timeout |
 
-The `issued_at`, `key_id`, and `signature` fields are part of the signed event envelope and apply to all SSE events uniformly.
+There is no `callback_url` (the callback path is derived from the node and
+execution ids) and no `checksum` (hook integrity anchors on the digest the node
+pinned at first discovery).
+
+### SSE Event: `action_request`
+
+`action_request` is a contract-tier event whose payload plexd treats as **opaque**.
+It carries no dispatch: like `node_state_updated`, it only triggers a reconcile,
+and the resulting pull delivers the `executions` block. It exists purely to cut
+the latency between dispatch and execution. Like all SSE events it is wrapped in a
+signed envelope and verified before processing.
 
 ## Execution Callback Contract
 
@@ -830,6 +1034,19 @@ Every lifecycle transition is a single `POST` to
 `/v1/nodes/{node_id}/executions/{execution_id}` carrying an
 `ExecutionCallbackRequest`. The server drives a closed state machine:
 `ack` → `started` → `succeeded` | `failed` | `cancelled`.
+
+The roster is closed, and a terminal status is reachable **only from `started`**:
+
+| From        | Legal next                                  |
+|-------------|---------------------------------------------|
+| `pending`   | `ack`                                        |
+| `ack`       | `started`                                    |
+| `started`   | `succeeded`, `failed`, `cancelled` — plus `started` again, but only to declare an over-ceiling output size |
+| terminal    | nothing                                      |
+
+`ack` → `failed` and `ack` → `cancelled` are **not** legal edges; the control plane
+answers them `409 invalid_state_transition`. That is why a node that refuses to run
+an action walks the whole way to `started` before failing it.
 
 The server refuses an illegal advance with `409 invalid_state_transition`, a
 callback on an already-settled invocation with `409 execution_already_terminal`, a
@@ -846,12 +1063,30 @@ transient error: it is logged and tolerated like any other callback failure.
 { "status": "ack" }
 ```
 
-A rejected action (unknown action, duplicate, max-concurrent, shutting down, or
-actions disabled) follows the `ack` with a `failed` terminal whose `error` is the
-reason:
+Sent only when the pull entry's `status` is `pending`. An entry already at `ack`
+has that transition recorded upstream, so its first callback is `started`.
+
+A rejected action (unknown action or actions disabled) walks the remaining legal
+edges to a `failed` terminal whose `error` is the reason — for a `pending` entry
+that is three callbacks:
 
 ```json
+{ "status": "ack" }
+{ "status": "started" }
 { "status": "failed", "error": "unknown_action" }
+```
+
+Backpressure is **not** a rejection: shutdown, a duplicate in-flight id, and a
+saturated concurrency slot produce no callback at all, because the pull redelivers
+the entry.
+
+### Orphaned run
+
+An entry the pull reports at `started` belonged to a run that did not survive an
+agent restart. plexd posts one terminal callback and never re-executes it:
+
+```json
+{ "status": "failed", "error": "execution lost to an agent restart" }
 ```
 
 ### Terminal with inline output
@@ -993,11 +1228,11 @@ Used when capabilities change after initial registration (e.g. hook files added/
 
 ## Kubernetes CRD Hooks
 
-When plexd runs as a DaemonSet in Kubernetes, hooks are defined as `PlexdHook` custom resources instead of script files. On `action_request`, plexd creates a Kubernetes Job on the target node.
+When plexd runs as a DaemonSet in Kubernetes, hooks are defined as `PlexdHook` custom resources instead of script files. On dispatching a hook execution, plexd creates a Kubernetes Job on the target node.
 
 ### Generated Job YAML
 
-When `action_request` arrives with `action: hooks/db-backup`, plexd creates:
+When an executions entry with `action: hooks/db-backup` is dispatched, plexd creates:
 
 ```yaml
 apiVersion: batch/v1
@@ -1056,19 +1291,20 @@ plexd watches the Job and maps its status to the action callback:
 
 | Job Condition | Callback Status | Notes |
 |---|---|---|
-| Succeeded | `success` | Exit code 0 |
-| Failed | `failure` | Exit code from container termination state |
-| `activeDeadlineSeconds` exceeded | `timeout` | Job killed by Kubernetes |
+| Succeeded | `succeeded` | Exit code 0 |
+| Failed | `failed` | Exit code from container termination state |
+| `activeDeadlineSeconds` exceeded | `failed` with `error="action timed out"` | Job killed by Kubernetes; there is no node-reported `timeout` status |
 
 Stdout and stderr are captured from the pod logs via the Kubernetes API.
 
 ## Security Considerations
 
-- **Signed delivery** -- All SSE events (including `action_request`, `node_state_updated`, `rotate_keys`, etc.) are signed with the control plane's Ed25519 key. plexd verifies every signature before processing. Local action requests via Unix socket require a valid session JWT.
+- **Authenticated delivery** -- Action dispatches arrive in the `executions` block of the NSK-authenticated state pull, so a dispatch is only ever as trustworthy as the control-plane connection itself; no SSE payload can inject one. Local action requests via Unix socket require a valid session JWT.
+- **Signed delivery** -- All SSE events (including `action_request`, `node_state_updated`, `rotate_keys`, etc.) are signed with the control plane's Ed25519 key. plexd verifies every signature before processing.
 - **Signature verification** -- Every SSE event carries `issued_at` (max staleness: 5 minutes) and is verified with a kid-indexed Ed25519 signature selected by the envelope's `key_id`. Signature and staleness checks are applied uniformly to all event types; there is no nonce.
 - **Hook file permissions** -- plexd verifies that hook files are owned by root and not group- or other-writable before execution.
 - **Symlink protection** -- Hook paths are resolved and validated to prevent symlink escape outside the configured hooks directory.
-- **Checksum enforcement** -- Hook checksums are verified before every execution. Binary checksums are reported continuously. On Kubernetes, image digests serve as checksums -- hooks without pinned digest (`@sha256:...`) are rejected.
+- **Checksum enforcement** -- Hook checksums are verified before every execution, against the digest plexd recorded when it discovered the hook (there is no checksum on the wire). Binary checksums are reported continuously. On Kubernetes, image digests serve as checksums -- hooks without pinned digest (`@sha256:...`) are rejected.
 - **Resource isolation** -- Hooks run with cgroup limits at minimum; higher sandbox levels add namespace or container isolation. On Kubernetes, hooks always run as separate Pods with native resource limits.
 - **CRD privilege control** -- Kubernetes hooks requiring host-level access (`hostPID`, `hostNetwork`, `privileged`) must declare `privileged: true` in the `PlexdHook` spec. The platform can enforce approval policies.
 - **Session token scoping** -- JWTs are bound to a specific node (`node_id` claim) and a specific set of actions (`actions` claim). Tokens cannot be used on other nodes or for unauthorized actions.

@@ -64,9 +64,31 @@ Startup
 ### Hook Verification
 
 1. `Verifier.VerifyHook` calls `VerifyFile` with `requireChecksum=true`
-2. Empty expected checksum returns error (hooks must have a control-plane-provided checksum)
+2. Empty expected checksum returns error (hooks must have a digest pinned at discovery)
 3. Match: returns `true` (safe to execute)
 4. Mismatch: reports violation, returns `false` (must not execute)
+
+The expected checksum is the digest the executor **pinned** the first time this
+process discovered the hook, not the one `HookWatcher` last recomputed. It does
+**not** come from the control plane — an action dispatch carries no checksum on
+the wire — so this check answers "are these still the bytes the node discovered
+and reported to the control plane?", catching a swap between discovery and
+execution.
+
+The pin matters because `HookWatcher` re-hashes a hook on every write and pushes
+the new digest into the executor. Verifying against that live digest would
+compare the file with a hash of itself and pass for any bytes on disk, so the
+executor records a hook's digest once and never updates it: a hook whose bytes
+change after discovery is refused, files a violation, and stays unrunnable until
+the agent restarts and re-attests it. Changing a hook in place therefore requires
+an agent restart before it can be dispatched again.
+
+The pin is process-local, so re-attestation on restart is both the recovery path
+for a legitimate hook change and the limit of the control: a restart re-anchors
+the pin to whatever bytes are on disk at that moment. Write access to `HooksDir`
+must therefore be treated as equivalent to code execution with the agent's
+privileges — the pin narrows the window between discovery and execution, it does
+not make an untrusted hooks directory safe.
 
 ## Config
 
@@ -199,7 +221,7 @@ Logger is tagged with `component=integrity`.
 | Method           | Signature                                                              | Description                                            |
 |------------------|------------------------------------------------------------------------|--------------------------------------------------------|
 | `VerifyBinary`   | `(ctx context.Context, nodeID string) error`                           | Verify binary against stored baseline                  |
-| `VerifyHook`     | `(ctx context.Context, nodeID, hookPath, expectedChecksum string) (bool, error)` | Verify hook against control-plane checksum   |
+| `VerifyHook`     | `(ctx context.Context, nodeID, hookPath, expectedChecksum string) (bool, error)` | Verify hook against its pinned digest        |
 | `BinaryChecksum` | `() string`                                                            | Thread-safe getter for last computed binary checksum   |
 | `Run`            | `(ctx context.Context, nodeID string) error`                           | Periodic re-verification loop (blocks until cancelled) |
 
@@ -217,7 +239,7 @@ Violations are non-fatal: the agent continues running after reporting.
 ### VerifyHook
 
 1. Calls `VerifyFile(hookPath, expectedChecksum, true)`
-2. Empty expected checksum: returns error (hooks require a checksum from the control plane)
+2. Empty expected checksum: returns error (hooks require the digest pinned at discovery)
 3. Match: returns `true` (hook is safe to execute)
 4. Mismatch: reports violation, returns `false` (hook must not be executed)
 

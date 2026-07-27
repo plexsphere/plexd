@@ -10,7 +10,9 @@ The `internal/reconcile` package implements the core convergence loop that keeps
 
 The pull is one-way: plexd does not report drift corrections back to the control plane. `POST /v1/nodes/{node_id}/drift` no longer exists. Applied-correction visibility will return as node-authored state reports (issue #23).
 
-The envelope carries six always-present blocks — `peers`, `reachability`, `policy`, `bridge`, `state`, and `reports`. A `null` block means "not populated" rather than "field absent", so the differ compares by presence: a `null` block and a populated block are distinct states, and switching between them drives convergence.
+The envelope carries seven always-present blocks — `peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, and `executions`. A `null` block means "not populated" rather than "field absent", so the differ compares by presence: a `null` block and a populated block are distinct states, and switching between them drives convergence.
+
+`executions` is the exception: it is a delivery queue, not desired state. It is consumed by the dispatch stage on every successful pull and is never stored in the local snapshot nor diffed.
 
 ## Config
 
@@ -50,6 +52,18 @@ type ReconcileHandler func(ctx context.Context, desired *api.NodeStateSnapshot, 
 
 Handlers are invoked sequentially in registration order. Errors and panics in one handler do not prevent subsequent handlers from running.
 
+## DispatchHandler
+
+Function type invoked on every successful pull, before the diff. Dispatch handlers consume the snapshot's delivery-queue blocks, which are not desired state to converge on.
+
+```go
+type DispatchHandler func(ctx context.Context, desired *api.NodeStateSnapshot)
+```
+
+They return nothing: a dispatch problem is the handler's own to report and never blocks the snapshot update. Panics are recovered and logged, and never count as a handler failure.
+
+Today the only delivery-queue block is `executions`, consumed by `actions.Dispatcher.Handle`. Issue #52 registers the sessions consumer on this same seam.
+
 ## Reconciler
 
 ### Constructor
@@ -67,6 +81,7 @@ func NewReconciler(client StateFetcher, cfg Config, logger *slog.Logger) *Reconc
 | Method             | Signature                                                   | Description                                        |
 |--------------------|-------------------------------------------------------------|----------------------------------------------------|
 | `RegisterHandler`  | `(handler ReconcileHandler)`                                | Adds a handler invoked on drift (call before `Run`) |
+| `RegisterDispatchHandler` | `(handler DispatchHandler)`                          | Adds a handler invoked on every successful pull (call before `Run`) |
 | `TriggerReconcile` | `()`                                                        | Requests immediate cycle; rapid calls are coalesced |
 | `Run`              | `(ctx context.Context, nodeID string) error`                | Blocking loop; returns `ctx.Err()` on cancellation |
 
@@ -113,7 +128,8 @@ Each cycle follows this sequence:
 flowchart TD
     START([Tick / Trigger]) --> FETCH[FetchState]
     FETCH -->|error| SKIP_ERR[Log warn, skip cycle]
-    FETCH -->|ok| DIFF[ComputeDiff]
+    FETCH -->|ok| DISPATCH[Invoke dispatch handlers]
+    DISPATCH --> DIFF[ComputeDiff]
     DIFF --> EMPTY{Diff empty?}
     EMPTY -->|yes| DONE([Wait for next tick])
     EMPTY -->|no| HANDLERS[Invoke handlers sequentially]
@@ -127,10 +143,11 @@ flowchart TD
 ```
 
 1. **FetchState** — `GET /v1/nodes/{node_id}/state` via `StateFetcher`, returning the `NodeStateSnapshot` envelope
-2. **ComputeDiff** — compare the desired snapshot against the local snapshot
-3. **Skip if empty** — no handlers invoked
-4. **Invoke handlers** — each handler called with panic recovery, in registration order
-5. **Update snapshot** — only if every handler succeeded; a single handler failure holds the snapshot back so the same diff re-fires next cycle until it converges
+2. **Invoke dispatch handlers** — each called with panic recovery, in registration order. This runs on **every** successful pull, before the diff, so an unchanged snapshot still redelivers the queued entries; the empty-diff short-circuit below can never skip it
+3. **ComputeDiff** — compare the desired snapshot against the local snapshot
+4. **Skip if empty** — no reconcile handlers invoked
+5. **Invoke handlers** — each handler called with panic recovery, in registration order
+6. **Update snapshot** — only if every handler succeeded; a single handler failure holds the snapshot back so the same diff re-fires next cycle until it converges
 
 ### Error Handling
 
@@ -139,6 +156,7 @@ flowchart TD
 | `FetchState` error | Logged at warn, tick skipped, loop continues          |
 | Handler error      | Logged at error, other handlers still run, snapshot held back |
 | Handler panic      | Recovered with stack trace, treated as error          |
+| Dispatch handler panic | Recovered with stack trace, logged at error; never counts as a handler failure and never holds the snapshot back |
 | Context cancelled  | `Run` returns `ctx.Err()` immediately                |
 
 ### Logging
@@ -188,7 +206,7 @@ Comparison logic by block:
 | State   | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
 | Reports | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
 
-The policy `Fingerprint` is a 44-char base64 SHA-256 that the server computes over its canonical rule stream. plexd treats it as an opaque comparison key and **never re-derives it from the rules**: a revision-only bump (same fingerprint, new `revision_id`) or any rule-array difference that keeps the fingerprint equal is **not** a change, so the ruleset rebuild short-circuits. `reachability` is the node's own health projection, not desired state, so it is never diffed or stored.
+The policy `Fingerprint` is a 44-char base64 SHA-256 that the server computes over its canonical rule stream. plexd treats it as an opaque comparison key and **never re-derives it from the rules**: a revision-only bump (same fingerprint, new `revision_id`) or any rule-array difference that keeps the fingerprint equal is **not** a change, so the ruleset rebuild short-circuits. `reachability` is the node's own health projection, not desired state, so it is never diffed or stored. `executions` is a delivery queue whose entries are consumed once by the dispatch stage and settled through the execution callback, not converged on, so it too is never diffed or stored — there is no `ExecutionsChanged` flag, and a pull carrying only new executions still reports an empty diff.
 
 ### Summary
 
@@ -216,7 +234,7 @@ In-memory cache of the last known desired state, protected by `sync.RWMutex`.
 | `Get() api.NodeStateSnapshot`                  | Returns a deep copy of the current snapshot     |
 | `Update(desired *api.NodeStateSnapshot)`       | Atomically replaces all blocks (deep copy)      |
 
-All methods deep-copy data to prevent aliasing between snapshot and caller. `reachability` is not desired state, so `Get` always returns it as `nil` and `Update` never stores it.
+All methods deep-copy data to prevent aliasing between snapshot and caller. `reachability` is not desired state, so `Get` always returns it as `nil` and `Update` never stores it. The same holds for `executions`: the dispatch stage has already consumed the block by the time `Update` runs, and storing it would make a redelivered entry look like drift.
 
 > Drift reporting has been removed. There is no `BuildDriftReport`, `DriftReport`, or `DriftCorrection`, and `POST /v1/nodes/{node_id}/drift` does not exist upstream. Node-authored state reports (issue #23) will carry applied-correction visibility instead.
 
@@ -254,3 +272,11 @@ The agent registers these handlers (in `cmd/plexd/cmd/up.go`):
 | bridge sub-handlers              | Reconcile relay, user-access, ingress, and site-to-site subtrees      |
 
 Signing-key rotation is no longer a reconcile handler: key material comes from registration and the `signing_key_rotated` SSE event.
+
+### Registered Dispatch Handlers
+
+| Handler                    | Responsibility                                                     |
+|----------------------------|--------------------------------------------------------------------|
+| `actions.Dispatcher.Handle`| Turn each entry of the `executions` block into an action execution |
+
+See [Remote Actions and Hooks](/reference/actions/remote-actions-hooks) for the dispatcher's decision table.

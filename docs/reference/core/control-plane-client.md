@@ -196,6 +196,11 @@ only request a reconcile.
 | `EventNodeStateUpdated`    | `node_state_updated`    | `TriggerReconcile()`                        |
 | `EventPolicyUpdated`       | `policy_updated`        | `policy.HandlePolicyUpdated` → reconcile    |
 | `EventBridgeConfigUpdated` | `bridge_config_updated` | `bridge.HandleBridgeConfigUpdated` → reconcile |
+| `EventActionRequest`       | `action_request`        | `TriggerReconcile()`                        |
+
+`action_request` carries no dispatch of its own: action executions are delivered
+in the `executions` block of the state pull, so the event only pulls the next
+reconcile forward and the resulting pull carries the dispatch.
 
 **Documented-coming** — named now so the agent can subscribe once the platform's 14-type taxonomy starts emitting them:
 
@@ -213,7 +218,6 @@ only request a reconcile.
 
 | Constant               | Value               | Dispatch target                   |
 |------------------------|---------------------|-----------------------------------|
-| `EventActionRequest`   | `action_request`    | `actions.HandleActionRequest`     |
 | `EventSSHSessionSetup` | `ssh_session_setup` | `tunnel.HandleSSHSessionSetup`    |
 | `EventSessionRevoked`  | `session_revoked`   | `tunnel.HandleSessionRevoked`     |
 

@@ -79,7 +79,7 @@ This diagram expands the [high-level overview](/) to show the control plane's in
                                                    └─────────┘ └──────────┘ └───────────┘
 ```
 
-**Control plane** — The four components at the top handle distinct responsibilities: the **Registration API** bootstraps new nodes, the **Key & Peer Manager** distributes WireGuard public keys and pre-shared keys, the **Policy Engine** evaluates visibility and firewall rules, and the **Event Bus (SSE)** pushes real-time updates (peer changes, policy updates, action requests, key rotations) to connected nodes.
+**Control plane** — The four components at the top handle distinct responsibilities: the **Registration API** bootstraps new nodes, the **Key & Peer Manager** distributes WireGuard public keys and pre-shared keys, the **Policy Engine** evaluates visibility and firewall rules, and the **Event Bus (SSE)** pushes real-time update notifications (peer changes, policy updates, action requests, key rotations) to connected nodes. Those notifications are hints: the node applies the change — and picks up queued action dispatches — from its authoritative state pull.
 
 **Node mesh** — Each node receives a unique mesh IP from the `10.100.0.0/16` range at registration (e.g. `10.100.1.1/32`). All nodes form a **full-mesh WireGuard topology** with direct peer-to-peer tunnels. Nodes behind NAT discover their public endpoints via STUN and exchange them through the control plane. When direct connectivity is not possible, traffic is relayed through bridge nodes.
 

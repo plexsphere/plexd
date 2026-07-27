@@ -101,7 +101,7 @@ Long-lived SSE connection. Supports `Last-Event-ID` header for replay after reco
 | `peer_key_rotated` | Peer ID, new public key, new PSK |
 | `peer_endpoint_changed` | Peer ID, new endpoint |
 | `policy_updated` | Full policy ruleset (L3/L4 rules scoped to mesh IPs) |
-| `action_request` | Execution ID, action name, type, parameters, timeout, callback URL |
+| `action_request` | Opaque; triggers a reconcile — the dispatch itself rides the `executions` block of the state pull |
 | `session_revoked` | Session ID, revocation timestamp |
 | `ssh_session_setup` | Session token, target configuration |
 | `rotate_keys` | Key rotation trigger |
@@ -314,9 +314,30 @@ absence.
     "metadata": [],
     "data": [],
     "reports": []
-  }
+  },
+  "executions": [
+    {
+      "execution_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1",
+      "action": "diagnostics.collect",
+      "type": "builtin",
+      "parameters": { "include_network": true },
+      "status": "pending",
+      "requested_at": "2026-01-01T00:00:00Z",
+      "expires_at": "2026-01-01T00:05:00Z"
+    }
+  ]
 }
 ```
+
+`executions` is the delivery channel for action dispatches, and the only block
+that is not desired state. It is always an array — `[]` when empty, never `null` —
+ordered by `requested_at`, then `execution_id`. An entry keeps reappearing on
+every pull until its execution reaches a terminal status through the
+[execution callback](#action-execution-callbacks), so a consumer
+must tolerate re-observing the same `execution_id`. `expires_at` is an absolute
+UTC deadline, not a relative timeout; the entry carries no callback URL and no
+hook checksum. See [Remote Actions and Hooks](/reference/actions/remote-actions-hooks)
+for how plexd consumes it.
 
 ## Secrets
 
@@ -411,26 +432,36 @@ Removes the report stored under `{key}`.
 ### POST /v1/nodes/{node_id}/executions/{execution_id}
 
 A single callback advances an execution through a closed state machine, posted
-once per transition:
+once per transition. The edge roster is closed and a terminal status is reachable
+**only from `started`**:
 
 ```text
-ack ──▶ started ──▶ succeeded
-    │           ├──▶ failed
-    │           └──▶ cancelled
-    ├──▶ failed
-    └──▶ cancelled
+pending ──▶ ack ──▶ started ──▶ succeeded
+                        │  ├──▶ failed
+                        │  └──▶ cancelled
+                        └──▶ started   (self-edge, only to declare an
+                                        over-ceiling output size)
 ```
 
-- `ack` — sent immediately after receiving the `action_request`; it is the first
-  callback and opens the invocation.
+- `pending` — the status a freshly dispatched entry carries in the `executions`
+  block. It is never reported by a node.
+- `ack` — sent when the node picks up an entry the pull reports as `pending`; it
+  opens the invocation. An entry the pull already reports at `ack` is **not**
+  re-acked — repeating a recorded transition is answered `409`.
 - `started` — sent when the action begins running.
 - `succeeded` | `failed` | `cancelled` — the terminal callback.
 
-A rejected action (unknown action, duplicate, max-concurrent, shutting down, or
-actions disabled) posts `ack` and then `failed` with the reason in `error`,
-skipping `started`. When the ack or started callback is refused with `403` or
-`409`, plexd stops without running or terminal-reporting the execution; other
-callback errors are logged and tolerated.
+`ack → failed` and `ack → cancelled` are **not** legal edges. A node that refuses
+to run an action (unknown action, actions disabled) therefore walks every
+remaining legal edge before failing it — three callbacks for a `pending` entry
+(`ack` → `started` → `failed`), two for an `ack` entry, one for a `started` entry.
+
+Local backpressure — shutting down, an id already in flight, a saturated
+concurrency slot — produces **no callback at all**: the entry stays in the
+`executions` block and the next pull redelivers it.
+
+When a callback is refused with `403` or `409`, plexd stops without running or
+terminal-reporting the execution; other callback errors are logged and tolerated.
 
 **Request body** (`ack`):
 

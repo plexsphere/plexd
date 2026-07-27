@@ -127,14 +127,14 @@ plexd is designed to remain functional when the control plane is temporarily unr
 - **Buffered telemetry:** Log, audit, and observability data are buffered in local ringbuffers and drained when connectivity is restored.
 - **No new peers:** New peers cannot be added while offline, as peer key exchange requires the control plane. Existing peers continue to work.
 - **Heartbeat failure:** After 3 missed heartbeats, the control plane marks the node as `unreachable`. This does not affect the node's local operation.
-- **Actions are unavailable:** SSE-triggered actions cannot be received while offline. Local actions via `plexd actions run --local` remain available.
+- **Actions are unavailable while the control plane is unreachable:** Action dispatches arrive in the `executions` block of the state pull, so they need the control plane, not the event stream. A node whose SSE stream is descoped or disconnected but whose pull still succeeds keeps executing dispatches — just at the reconciliation cadence instead of within milliseconds, because `action_request` only pulls the next reconcile forward. Local actions via `plexd actions run --local` remain available regardless.
 - **Secrets are unavailable:** Secret values are fetched in real-time from the control plane and never cached in plaintext. When the control plane is unreachable, secret read requests return `503 Service Unavailable`. Metadata and data entries remain available from the local cache.
 
 ### Upgrade Process
 
 plexd supports in-place upgrades triggered by the control plane via the `service.upgrade` built-in action. The binary comes from the release channel, and every upgrade is gated on both a dispatched checksum and an offline Sigstore signature check — a release the platform did not sign is refused.
 
-1. Control plane sends `action_request` with `action: service.upgrade`, including the target `version` and expected binary `checksum`.
+1. The control plane queues an execution for `action: service.upgrade` in the `executions` block of the state pull, with the target `version` and expected binary `checksum` among its `parameters`.
 2. plexd downloads the release binary from the configured release channel (`{upgrade.release_base_url}/{tag}/plexd-linux-{arch}`, with `{tag}` the `v`-prefixed version) into a temporary file, computing its SHA-256 as it streams. Upgrades are Linux-only; a non-Linux node refuses. plexd never fetches the binary from the control plane.
 3. plexd compares the download's SHA-256 to the dispatched `checksum`. A mismatch ends the action with the terminal status `checksum_mismatch` (exit 1) and the running binary is untouched.
 4. plexd downloads the release's Sigstore bundle (`plexd-linux-{arch}.sigstore.json`) and verifies it **offline** against the embedded Sigstore public-good trusted root: the signing certificate's issuer and SAN must match `upgrade.signing_issuer` / `upgrade.signing_identity_regexp`, and the signed artifact digest must match the downloaded binary. A release with no bundle asset fails the bundle download and is refused; a bundle that fails verification ends the action with the terminal status `bundle_verification_failed` (exit 1) and the temporary file is removed. In both cases the running binary is untouched.
@@ -161,9 +161,10 @@ The reconciliation loop (`reconcile.interval`, default 60s) ensures that the loc
 
 Each reconciliation cycle:
 
-1. **Pull the state snapshot** from `GET /v1/nodes/{node_id}/state` — the `NodeStateSnapshot` envelope with its always-present blocks (`peers`, `reachability`, `policy`, `bridge`, `state`, `reports`). A `null` block means "not populated".
-2. **Diff** the snapshot against the local snapshot by presence: peer add/remove/update, and per-block change flags for policy, bridge, and the state/reports buckets.
-3. **Apply corrections** for any detected drift:
+1. **Pull the state snapshot** from `GET /v1/nodes/{node_id}/state` — the `NodeStateSnapshot` envelope with its always-present blocks (`peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`). A `null` block means "not populated".
+2. **Dispatch** the delivery-queue blocks. Today that is `executions`, the channel through which the control plane delivers action dispatches. This step runs on **every** successful pull, before the diff, so a queued action executes even when nothing has drifted.
+3. **Diff** the snapshot against the local snapshot by presence: peer add/remove/update, and per-block change flags for policy, bridge, and the state/reports buckets. `executions` is a queue rather than desired state, so it is neither stored nor diffed.
+4. **Apply corrections** for any detected drift:
    - Add/remove WireGuard peers (membership comes from the `peers` block; AllowedIPs derived as `mesh_ip/32`, no PSK)
    - Rebuild nftables rules from the merged `policy` block, but only when its fingerprint changed
    - Reconcile the bridge subtrees (relay, user access, ingress, site-to-site)
