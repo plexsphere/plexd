@@ -178,6 +178,88 @@ NUDGEEOF
     fi
 }
 
+# --- Helper: render a one-entry sessions block ---
+# Args: <session-id> <host> <port> <expires-at> [idle-timeout-seconds]. Sessions
+# are delivered in the sessions block of GET /v1/nodes/{id}/state. That block is
+# desired state, not a queue: an entry appearing provisions the listener, and the
+# same entry disappearing is the teardown signal. jti equals the session id and
+# is carried as an opaque value, never evaluated. idle_timeout_seconds is omitted
+# unless given, which means the session has no idle window.
+session_entry() {
+    local session_id=$1 host=$2 port=$3 expires_at=$4 idle=${5:-}
+    local idle_field=""
+    if [ -n "${idle}" ]; then
+        idle_field=",
+    \"idle_timeout_seconds\": ${idle}"
+    fi
+    cat <<SESSENTRYEOF
+[
+  {
+    "session_id": "${session_id}",
+    "jti": "${session_id}",
+    "kind": "tcp",
+    "target": {
+      "tcp": {
+        "host": "${host}",
+        "port": ${port}
+      }
+    },
+    "expires_at": "${expires_at}"${idle_field}
+  }
+]
+SESSENTRYEOF
+}
+
+# --- Helper: configure the sessions block and nudge the agent ---
+# Args: <tag> <sessions-json-array>. A phase drives a session by configuring
+# that block. configure-state REPLACES the whole snapshot fixture, so the block
+# is spliced into the live snapshot and every other block travels back verbatim.
+# A node_state_updated envelope follows, so the agent pulls the new block right
+# away instead of waiting out the ~30s heartbeat reconcile cadence. The tag keeps
+# the envelope id unique per call.
+#
+# NOTE: reading the live snapshot is a real GET on the state endpoint and
+# therefore INCREMENTS state_count. A phase gating on state_count must take its
+# baseline AFTER calling this helper.
+configure_sessions() {
+    local tag=$1 entries=$2
+
+    local snapshot spliced status
+    snapshot=$(curl -sf "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    # printf, not echo: the fixture carries backslash escapes (an embedded
+    # newline in the certs/ca data entry) that must travel back byte for byte.
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson e "${entries}" '.sessions = $e')
+
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+
+    local payload
+    payload=$(cat <<SESSNUDGEEOF
+{
+    "id": "evt-e2e-sess-nudge-${tag}",
+    "type": "node_state_updated",
+    "scope": "node",
+    "payload": "{\"node_id\":\"e2e-node-1\"}"
+}
+SESSNUDGEEOF
+    )
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${payload}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] sessions nudge injection returned status ${status}, want 204"
+    fi
+}
+
 cleanup() {
     echo "--- Cleaning up docker compose resources ---"
     if [ "${TEST_FAILED}" -ne 0 ]; then
@@ -1392,13 +1474,16 @@ fi
 echo "=== Phase 8g PASSED: action_request is a pull trigger ==="
 
 # ===================================================================
-# Phase 8e: TCP session lifecycle (session_started + session_ended)
+# Phase 8e: TCP session lifecycle driven by the sessions block
 # ===================================================================
-# An ssh_session_setup event brings up a tunnel listener, which reports a tcp
-# session_started row; a session_revoked event closes it, reporting a tcp
-# session_ended row with explicit zero byte counters and terminated_by
-# operator_revoke.
-echo "=== Testing TCP session lifecycle ==="
+# The sessions block of the pull drives the whole lifecycle. A tcp entry
+# appearing provisions a listener, which reports a tcp session_started row
+# carrying the address the listener actually bound (listener_endpoint); the same
+# entry draining out of the block is the teardown signal, closing the listener
+# and reporting a tcp session_ended row with explicit byte counters and
+# terminated_by plexd_close — the node cannot tell a revocation from a control
+# plane that failed to serve the block, so it never claims operator_revoke.
+echo "=== Testing pull-driven TCP session lifecycle ==="
 
 # ExpiresAt 5 minutes ahead in RFC 3339 UTC (GNU date -d, BSD date -v fallback).
 EXPIRES_AT=$(date -u -d "+5 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+5M +%Y-%m-%dT%H:%M:%SZ)
@@ -1408,30 +1493,11 @@ RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
 SESS_BEFORE=$(get_counter "${RESPONSE}" "session_activity_count")
 echo "  session_activity_count before: ${SESS_BEFORE}"
 
-# Inject ssh_session_setup (interpolated heredoc: EXPIRES_AT must expand).
-SSH_PAYLOAD=$(cat <<SSHEOF
-{
-    "id": "evt-e2e-sess-001",
-    "type": "ssh_session_setup",
-    "scope": "node",
-    "payload": {
-        "session_id": "sess-e2e-001",
-        "target_host": "127.0.0.1",
-        "target_port": 8080,
-        "authorized_key": "",
-        "expires_at": "${EXPIRES_AT}"
-    }
-}
-SSHEOF
-)
-SSH_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
-    -X POST -H "Content-Type: application/json" \
-    -d "${SSH_PAYLOAD}" \
-    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
-if [ "${SSH_STATUS}" != "204" ]; then
-    fail "ssh_session_setup event injection returned status ${SSH_STATUS}, want 204"
-fi
-echo "  ssh_session_setup event injected"
+# Configure the tcp entry into the sessions block: its appearance is what
+# provisions the listener.
+configure_sessions "8e-issue" \
+    "$(session_entry "sess-e2e-001" "127.0.0.1" 8080 "${EXPIRES_AT}")"
+echo "  tcp session configured in the sessions block"
 
 # Poll session_activity_count to +1 (session_started row).
 SESS_TIMEOUT=30
@@ -1453,13 +1519,13 @@ done
 
 if [ "${SESS_START_PASSED}" -eq 0 ]; then
     SESS_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_count")
-    fail "session_activity_count did not reach $((SESS_BEFORE + 1)) after ssh_session_setup (before=${SESS_BEFORE}, after=${SESS_AFTER})"
+    fail "session_activity_count did not reach $((SESS_BEFORE + 1)) after the sessions block was configured (before=${SESS_BEFORE}, after=${SESS_AFTER})"
 fi
 
 # Validate the session_started row.
 START_BODY=$(curl -sf "http://localhost:18080/test/last-request/session_activity" 2>/dev/null || true)
 if [ -z "${START_BODY}" ]; then
-    fail "no session_activity body captured after ssh_session_setup"
+    fail "no session_activity body captured after the sessions block was configured"
 fi
 START_PHASE=$(echo "${START_BODY}" | jq -r '.tcp.phase // empty')
 if [ "${START_PHASE}" = "session_started" ]; then
@@ -1479,27 +1545,19 @@ if [ "${START_PORT}" = "8080" ]; then
 else
     fail "session_activity tcp.target_port = '${START_PORT}', want 8080"
 fi
-
-# Inject session_revoked to close the session.
-REV_PAYLOAD=$(cat <<'REVEOF'
-{
-    "id": "evt-e2e-sess-revoke-001",
-    "type": "session_revoked",
-    "scope": "node",
-    "payload": {
-        "session_id": "sess-e2e-001"
-    }
-}
-REVEOF
-)
-REV_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
-    -X POST -H "Content-Type: application/json" \
-    -d "${REV_PAYLOAD}" \
-    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
-if [ "${REV_STATUS}" != "204" ]; then
-    fail "session_revoked event injection returned status ${REV_STATUS}, want 204"
+# The started row reports the address the listener actually bound, so the
+# control plane can hand clients somewhere to connect.
+START_ENDPOINT=$(echo "${START_BODY}" | jq -r '.tcp.listener_endpoint // empty')
+if echo "${START_ENDPOINT}" | grep -Eq '^.+:[0-9]+$'; then
+    echo "  PASS: session_activity tcp.listener_endpoint = '${START_ENDPOINT}'"
+else
+    fail "session_activity tcp.listener_endpoint = '${START_ENDPOINT}', want a non-empty host:port"
 fi
-echo "  session_revoked event injected"
+
+# Drain the entry out of the sessions block: its disappearance is the teardown
+# signal, there is no separate revocation event.
+configure_sessions "8e-drain" "[]"
+echo "  tcp session drained from the sessions block"
 
 # Poll session_activity_count to +2 (session_ended row).
 REV_ELAPSED=0
@@ -1520,14 +1578,14 @@ done
 
 if [ "${SESS_END_PASSED}" -eq 0 ]; then
     SESS_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_count")
-    fail "session_activity_count did not reach $((SESS_BEFORE + 2)) after session_revoked (before=${SESS_BEFORE}, after=${SESS_AFTER})"
+    fail "session_activity_count did not reach $((SESS_BEFORE + 2)) after the drain (before=${SESS_BEFORE}, after=${SESS_AFTER})"
 fi
 
 # Validate the session_ended row: phase, terminated_by, and numeric byte
 # counters (jq numbers so an absent field fails the check).
 REV_BODY=$(curl -sf "http://localhost:18080/test/last-request/session_activity" 2>/dev/null || true)
 if [ -z "${REV_BODY}" ]; then
-    fail "no session_activity body captured after session_revoked"
+    fail "no session_activity body captured after the drain"
 fi
 REV_PHASE=$(echo "${REV_BODY}" | jq -r '.tcp.phase // empty')
 if [ "${REV_PHASE}" = "session_ended" ]; then
@@ -1535,11 +1593,14 @@ if [ "${REV_PHASE}" = "session_ended" ]; then
 else
     fail "session_activity tcp.phase = '${REV_PHASE}', want 'session_ended'"
 fi
+# The entry drained before its expiry lapsed. That may be a revocation or a
+# control plane that failed to serve the block, and the node cannot tell them
+# apart, so it reports a local close rather than asserting an operator action.
 REV_TERM=$(echo "${REV_BODY}" | jq -r '.tcp.terminated_by // empty')
-if [ "${REV_TERM}" = "operator_revoke" ]; then
-    echo "  PASS: session_activity tcp.terminated_by = 'operator_revoke'"
+if [ "${REV_TERM}" = "plexd_close" ]; then
+    echo "  PASS: session_activity tcp.terminated_by = 'plexd_close'"
 else
-    fail "session_activity tcp.terminated_by = '${REV_TERM}', want 'operator_revoke'"
+    fail "session_activity tcp.terminated_by = '${REV_TERM}', want 'plexd_close'"
 fi
 if echo "${REV_BODY}" | jq -e '.tcp.bytes_in | numbers' >/dev/null 2>&1; then
     echo "  PASS: session_activity tcp.bytes_in is present as a number"
@@ -1552,7 +1613,202 @@ else
     fail "session_activity tcp.bytes_out is not present as a number"
 fi
 
-echo "=== Phase 8e PASSED: TCP session lifecycle ==="
+echo "=== Phase 8e PASSED: pull-driven TCP session lifecycle ==="
+
+# ===================================================================
+# Phase 8i: the idle window travels the wire and closes the session
+# ===================================================================
+# idle_timeout_seconds on the entry is the access-control boundary that caps how
+# long an unattended forward stays open. Nothing ever connects to this listener,
+# so the window runs out from the bind and the session closes on its own — while
+# its entry still stands in the block — and reports terminated_by idle_timeout.
+echo "=== Testing the idle window driven from the sessions block ==="
+
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+[ -n "${RESPONSE}" ] || fail "assert endpoint unreachable while baselining Phase 8i"
+IDLE_BEFORE=$(get_counter "${RESPONSE}" "session_activity_count")
+echo "  session_activity_count before: ${IDLE_BEFORE}"
+
+# A one-second window: the started row and the idle-driven ended row both land
+# well inside the poll below.
+configure_sessions "8i-issue" \
+    "$(session_entry "sess-e2e-idle" "127.0.0.1" 8080 "${EXPIRES_AT}" 1)"
+echo "  tcp session with a 1s idle window configured in the sessions block"
+
+# Poll session_activity_count to +2: session_started, then session_ended from the
+# idle monitor. No drain is needed to get there.
+IDLE_TIMEOUT=30
+IDLE_ELAPSED=0
+IDLE_PASSED=0
+while [ "${IDLE_ELAPSED}" -lt "${IDLE_TIMEOUT}" ]; do
+    sleep 2
+    IDLE_ELAPSED=$((IDLE_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        IDLE_AFTER=$(get_counter "${RESPONSE}" "session_activity_count")
+        if [ "${IDLE_AFTER}" -ge $((IDLE_BEFORE + 2)) ]; then
+            echo "  PASS: session_activity_count advanced from ${IDLE_BEFORE} to ${IDLE_AFTER} (>= +2)"
+            IDLE_PASSED=1
+            break
+        fi
+    fi
+done
+
+if [ "${IDLE_PASSED}" -eq 0 ]; then
+    IDLE_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_count")
+    fail "session_activity_count did not reach $((IDLE_BEFORE + 2)) after the idle window elapsed (before=${IDLE_BEFORE}, after=${IDLE_AFTER})"
+fi
+
+IDLE_BODY=$(curl -sf "http://localhost:18080/test/last-request/session_activity" 2>/dev/null || true)
+if [ -z "${IDLE_BODY}" ]; then
+    fail "no session_activity body captured after the idle window elapsed"
+fi
+IDLE_PHASE=$(echo "${IDLE_BODY}" | jq -r '.tcp.phase // empty')
+if [ "${IDLE_PHASE}" = "session_ended" ]; then
+    echo "  PASS: session_activity tcp.phase = 'session_ended'"
+else
+    fail "session_activity tcp.phase = '${IDLE_PHASE}', want 'session_ended'"
+fi
+IDLE_TERM=$(echo "${IDLE_BODY}" | jq -r '.tcp.terminated_by // empty')
+if [ "${IDLE_TERM}" = "idle_timeout" ]; then
+    echo "  PASS: session_activity tcp.terminated_by = 'idle_timeout'"
+else
+    fail "session_activity tcp.terminated_by = '${IDLE_TERM}', want 'idle_timeout'"
+fi
+
+# The entry outlived its session, so drain it before the next phase. The session
+# is already closed, so this reports nothing further.
+configure_sessions "8i-drain" "[]"
+
+echo "=== Phase 8i PASSED: idle window closes the session ==="
+
+# ===================================================================
+# Phase 8h: session events are pull triggers, not delivery channels
+# ===================================================================
+# The session lifecycle is delivered in the sessions block of the pull.
+# session_setup and session_revoked only pull the observing reconcile forward:
+# nothing in their payloads is parsed, so an opaque payload must still move
+# state_count while leaving the session activity untouched.
+echo "=== Testing session events as pull triggers ==="
+
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+[ -n "${RESPONSE}" ] || fail "assert endpoint unreachable while baselining Phase 8h"
+STATE_BEFORE_SETUP=$(get_counter "${RESPONSE}" "state_count")
+SESS_BEFORE_SETUP=$(get_counter "${RESPONSE}" "session_activity_count")
+echo "  state_count before session_setup: ${STATE_BEFORE_SETUP}"
+echo "  session_activity_count before session_setup: ${SESS_BEFORE_SETUP}"
+
+# Inject a session_setup whose payload is junk: its content is irrelevant to the
+# node, which learns the session only from the pull.
+SETUP_PAYLOAD=$(cat <<'SETUPEOF'
+{
+    "id": "evt-e2e-sess-push-001",
+    "type": "session_setup",
+    "scope": "node",
+    "payload": "{}"
+}
+SETUPEOF
+)
+SETUP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${SETUP_PAYLOAD}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${SETUP_STATUS}" != "204" ]; then
+    fail "session_setup event injection returned status ${SETUP_STATUS}, want 204"
+fi
+echo "  session_setup injected with an opaque payload"
+
+# The event must pull the state promptly. The heartbeat fixture answers
+# reconcile: true on its own ~30s cadence, so this window is deliberately
+# shorter than that fallback -- what is proven here is that the pull happens now.
+SETUP_TIMEOUT=15
+SETUP_ELAPSED=0
+SETUP_STATE_PASSED=0
+while [ "${SETUP_ELAPSED}" -lt "${SETUP_TIMEOUT}" ]; do
+    sleep 2
+    SETUP_ELAPSED=$((SETUP_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        STATE_AFTER_SETUP=$(get_counter "${RESPONSE}" "state_count")
+        if [ "${STATE_AFTER_SETUP}" -gt "${STATE_BEFORE_SETUP}" ]; then
+            echo "  PASS: state_count increased from ${STATE_BEFORE_SETUP} to ${STATE_AFTER_SETUP} after session_setup"
+            SETUP_STATE_PASSED=1
+            break
+        fi
+    fi
+done
+
+if [ "${SETUP_STATE_PASSED}" -eq 0 ]; then
+    STATE_AFTER_SETUP=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    fail "state_count did not increase after session_setup (before=${STATE_BEFORE_SETUP}, after=${STATE_AFTER_SETUP})"
+fi
+
+# The pull found no session in the block, so no activity row was reported: the
+# event carried no session of its own.
+SESS_AFTER_SETUP=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_count")
+if [ "${SESS_AFTER_SETUP}" -eq "${SESS_BEFORE_SETUP}" ]; then
+    echo "  PASS: session_activity_count unchanged at ${SESS_AFTER_SETUP} after session_setup"
+else
+    fail "session_activity_count moved from ${SESS_BEFORE_SETUP} to ${SESS_AFTER_SETUP} after session_setup; the payload was acted on"
+fi
+
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+[ -n "${RESPONSE}" ] || fail "assert endpoint unreachable while baselining session_revoked"
+STATE_BEFORE_REVOKE=$(get_counter "${RESPONSE}" "state_count")
+SESS_BEFORE_REVOKE=$(get_counter "${RESPONSE}" "session_activity_count")
+echo "  state_count before session_revoked: ${STATE_BEFORE_REVOKE}"
+echo "  session_activity_count before session_revoked: ${SESS_BEFORE_REVOKE}"
+
+# session_revoked is the same shape of trigger: the drain in the sessions block
+# is the teardown signal, the event only asks for a reconcile.
+REVOKE_PAYLOAD=$(cat <<'REVOKEEOF'
+{
+    "id": "evt-e2e-sess-push-002",
+    "type": "session_revoked",
+    "scope": "node",
+    "payload": "{}"
+}
+REVOKEEOF
+)
+REVOKE_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${REVOKE_PAYLOAD}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${REVOKE_STATUS}" != "204" ]; then
+    fail "session_revoked event injection returned status ${REVOKE_STATUS}, want 204"
+fi
+echo "  session_revoked injected with an opaque payload"
+
+REVOKE_TIMEOUT=15
+REVOKE_ELAPSED=0
+REVOKE_STATE_PASSED=0
+while [ "${REVOKE_ELAPSED}" -lt "${REVOKE_TIMEOUT}" ]; do
+    sleep 2
+    REVOKE_ELAPSED=$((REVOKE_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        STATE_AFTER_REVOKE=$(get_counter "${RESPONSE}" "state_count")
+        if [ "${STATE_AFTER_REVOKE}" -gt "${STATE_BEFORE_REVOKE}" ]; then
+            echo "  PASS: state_count increased from ${STATE_BEFORE_REVOKE} to ${STATE_AFTER_REVOKE} after session_revoked"
+            REVOKE_STATE_PASSED=1
+            break
+        fi
+    fi
+done
+
+if [ "${REVOKE_STATE_PASSED}" -eq 0 ]; then
+    STATE_AFTER_REVOKE=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    fail "state_count did not increase after session_revoked (before=${STATE_BEFORE_REVOKE}, after=${STATE_AFTER_REVOKE})"
+fi
+
+SESS_AFTER_REVOKE=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_count")
+if [ "${SESS_AFTER_REVOKE}" -eq "${SESS_BEFORE_REVOKE}" ]; then
+    echo "  PASS: session_activity_count unchanged at ${SESS_AFTER_REVOKE} after session_revoked"
+else
+    fail "session_activity_count moved from ${SESS_BEFORE_REVOKE} to ${SESS_AFTER_REVOKE} after session_revoked; the payload was acted on"
+fi
+
+echo "=== Phase 8h PASSED: session events are pull triggers ==="
 
 # ===================================================================
 # Phase 9: Key rotation completes end to end (RotateKeys flag)
