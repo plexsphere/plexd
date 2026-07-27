@@ -350,6 +350,152 @@ func TestSession_CloseIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestSession_StartStampsActivity(t *testing.T) {
+	logger := slog.Default()
+
+	session := NewSession("test-activity-bind", "127.0.0.1", 9999, "127.0.0.1", time.Now().Add(5*time.Minute), logger)
+	t.Cleanup(func() { session.Close() })
+
+	if got := session.lastActive.Load(); got != 0 {
+		t.Errorf("activity stamp before Start() = %d, want 0", got)
+	}
+
+	before := time.Now()
+	if _, err := session.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+
+	// A listener no connection ever reaches must still age against the bind
+	// rather than against the start of the process.
+	if got := session.IdleFor(); got < 0 || got > time.Since(before)+time.Second {
+		t.Errorf("IdleFor() after Start() = %v, want no more than the time since the bind", got)
+	}
+}
+
+func TestSession_IdleWindowStampsActivityBothDirections(t *testing.T) {
+	// The target is driven by hand rather than by startEchoServer so that each
+	// direction of the forwarded byte flow can be exercised on its own.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- conn
+	}()
+
+	host, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port := mustAtoi(t, portStr)
+
+	session := NewSession("test-activity-flow", host, port, "127.0.0.1", time.Now().Add(5*time.Minute), slog.Default())
+	// Arm the idle window; the monitor that acts on it lands separately.
+	session.idleTimeout = time.Minute
+	t.Cleanup(func() { session.Close() })
+
+	addr, err := session.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+
+	client, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Dial() error: %v", err)
+	}
+	defer client.Close()
+
+	var target net.Conn
+	select {
+	case target = <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("target never saw the forwarded connection")
+	}
+	defer target.Close()
+
+	msg := []byte("byte flow")
+	buf := make([]byte, len(msg))
+
+	// client -> target
+	bind := time.Duration(session.lastActive.Load())
+	if _, err := client.Write(msg); err != nil {
+		t.Fatalf("client Write() error: %v", err)
+	}
+	_ = target.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(target, buf); err != nil {
+		t.Fatalf("target ReadFull() error: %v", err)
+	}
+	inbound := waitForActivityAfter(t, session, bind)
+
+	// target -> client
+	if _, err := target.Write(msg); err != nil {
+		t.Fatalf("target Write() error: %v", err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(client, buf); err != nil {
+		t.Fatalf("client ReadFull() error: %v", err)
+	}
+	waitForActivityAfter(t, session, inbound)
+}
+
+func TestSession_WithoutIdleWindowActivityStaysAtBind(t *testing.T) {
+	// Without an idle window the sources stay unwrapped so io.Copy keeps its
+	// splice(2) fast path, which means byte flow does not stamp activity: the
+	// bind timestamp is all a session without a window ever reports.
+	echoAddr := startEchoServer(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port := mustAtoi(t, portStr)
+
+	session := NewSession("test-activity-unarmed", host, port, "127.0.0.1", time.Now().Add(5*time.Minute), slog.Default())
+	t.Cleanup(func() { session.Close() })
+
+	addr, err := session.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+
+	bind := time.Duration(session.lastActive.Load())
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Dial() error: %v", err)
+	}
+	defer conn.Close()
+
+	msg := []byte("no stamping here")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("Write() error: %v", err)
+	}
+	buf := make([]byte, len(msg))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("ReadFull() error: %v", err)
+	}
+
+	if got := time.Duration(session.lastActive.Load()); got != bind {
+		t.Errorf("activity stamp after forwarding = %v, want the bind stamp %v", got, bind)
+	}
+}
+
+// waitForActivityAfter polls the session's activity stamp until it moves past
+// base, so the assertion does not race the forwarding goroutine storing it. The
+// stamp is a monotonic offset from processStart, not a wall-clock time.
+func waitForActivityAfter(t *testing.T, s *Session, base time.Duration) time.Duration {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := time.Duration(s.lastActive.Load()); got > base {
+			return got
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("activity stamp %v did not advance past %v within 2s", time.Duration(s.lastActive.Load()), base)
+	return 0
+}
+
 func mustAtoi(t *testing.T, s string) int {
 	t.Helper()
 	n, err := strconv.Atoi(s)
