@@ -36,7 +36,38 @@ type Session struct {
 	bytesIn  atomic.Int64 // bytes forwarded client -> target (operator -> target)
 	bytesOut atomic.Int64 // bytes forwarded target -> client (target -> operator)
 
+	// idleTimeout is the idle window for this session, set by the manager before
+	// Start. Zero means the session has no idle window.
+	idleTimeout time.Duration
+	// lastActive holds the last observed activity as a duration since
+	// processStart: the listener bind, then every forwarded chunk while an idle
+	// window is armed.
+	lastActive atomic.Int64
+
 	logger *slog.Logger
+}
+
+// processStart is the epoch every activity stamp is measured against. It carries
+// a monotonic reading, so time.Since against it is immune to wall-clock steps —
+// an NTP correction or a VM snapshot resume must not stretch or collapse an idle
+// window, which is the access-control boundary that caps how long an unattended
+// forward to an internal host stays open.
+var processStart = time.Now()
+
+// activityReader wraps a forwarding source so that every chunk it yields stamps
+// the session's last-activity timestamp. Only used while an idle window is
+// armed; see the fast-path note in forward.
+type activityReader struct {
+	src     io.Reader
+	session *Session
+}
+
+func (r *activityReader) Read(p []byte) (int, error) {
+	n, err := r.src.Read(p)
+	if n > 0 {
+		r.session.lastActive.Store(int64(time.Since(processStart)))
+	}
+	return n, err
 }
 
 // drainTimeout bounds how long Close waits for the forwarding goroutines to
@@ -67,6 +98,9 @@ func (s *Session) Start(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("tunnel: listen on %s: %w", addr, err)
 	}
 	s.listener = ln
+	// The bind is the session's first activity, so a listener no connection ever
+	// reaches still has a well-defined activity epoch to age against.
+	s.lastActive.Store(int64(time.Since(processStart)))
 
 	s.logger.Info("session started",
 		"listen_addr", ln.Addr().String(),
@@ -150,17 +184,26 @@ func (s *Session) forward(ctx context.Context, clientConn net.Conn) {
 	// settled from its result rather than from a wrapper around the destination.
 	// A wrapper would hide the *net.TCPConn destination from TCPConn.WriteTo and
 	// cost the connection its splice(2) fast path, adding a userspace copy and a
-	// syscall pair per 32 KiB chunk in both directions.
+	// syscall pair per 32 KiB chunk in both directions. Sessions with an idle
+	// window are the exception: there the sources are wrapped so every chunk
+	// stamps activity, deliberately trading the fast path for the byte-flow
+	// observation the idle window needs.
+	clientSrc, targetSrc := io.Reader(clientConn), io.Reader(targetConn)
+	if s.idleTimeout > 0 {
+		clientSrc = &activityReader{src: clientConn, session: s}
+		targetSrc = &activityReader{src: targetConn, session: s}
+	}
+
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(targetConn, clientConn)
+		n, _ := io.Copy(targetConn, clientSrc)
 		s.bytesIn.Add(n)
 		cleanup()
 	}()
 
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(clientConn, targetConn)
+		n, _ := io.Copy(clientConn, targetSrc)
 		s.bytesOut.Add(n)
 		cleanup()
 	}()
@@ -221,6 +264,13 @@ func (s *Session) markClosed() (activeConn net.Conn, copyDone chan struct{}, alr
 // (operator to target), out is target -> client (target to operator).
 func (s *Session) Counters() (in, out int64) {
 	return s.bytesIn.Load(), s.bytesOut.Load()
+}
+
+// IdleFor returns how long the session has gone without observed byte flow. The
+// listener bind counts as the first activity, so a started session never reports
+// the whole time since the process began.
+func (s *Session) IdleFor() time.Duration {
+	return time.Since(processStart) - time.Duration(s.lastActive.Load())
 }
 
 // ListenAddr returns the listener address or empty string if not started.
