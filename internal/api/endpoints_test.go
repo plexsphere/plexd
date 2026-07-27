@@ -203,7 +203,10 @@ func TestFetchState_ReturnsSnapshot(t *testing.T) {
 			`"reachability":{"state":"healthy","changed_at":"2026-01-01T00:00:00Z"},` +
 			`"policy":{"revision_id":"rev-1","fingerprint":"fp","rules":[` +
 			`{"action":"allow","protocol":"tcp","source_cidr":"10.0.0.1/32","destination_cidr":"10.0.0.2/32","ports":{"from":443,"to":443}}]},` +
-			`"bridge":null,"state":null,"reports":null}`))
+			`"bridge":null,"state":null,"reports":null,` +
+			`"executions":[{"execution_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","action":"gather_info","type":"builtin",` +
+			`"parameters":{"target":"10.0.0.2"},"status":"pending",` +
+			`"requested_at":"2026-01-01T00:00:00Z","expires_at":"2026-01-01T00:05:00Z"}]}`))
 	})
 
 	resp, err := client.FetchState(context.Background(), "n1")
@@ -231,6 +234,47 @@ func TestFetchState_ReturnsSnapshot(t *testing.T) {
 	// Null blocks decode to nil pointers.
 	if resp.Bridge != nil || resp.State != nil || resp.Reports != nil {
 		t.Errorf("null blocks should decode to nil, got bridge=%v state=%v reports=%v", resp.Bridge, resp.State, resp.Reports)
+	}
+	// The executions block carries the node's pending action dispatches.
+	if len(resp.Executions) != 1 {
+		t.Fatalf("len(Executions) = %d, want 1", len(resp.Executions))
+	}
+	exec := resp.Executions[0]
+	if exec.ExecutionID != "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0" {
+		t.Errorf("Executions[0].ExecutionID = %q, want %q", exec.ExecutionID, "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0")
+	}
+	if exec.Action != "gather_info" {
+		t.Errorf("Executions[0].Action = %q, want %q", exec.Action, "gather_info")
+	}
+	if exec.Type != ActionKindBuiltin {
+		t.Errorf("Executions[0].Type = %q, want %q", exec.Type, ActionKindBuiltin)
+	}
+	if exec.Status != ExecutionStatusPending {
+		t.Errorf("Executions[0].Status = %q, want %q", exec.Status, ExecutionStatusPending)
+	}
+	if got := string(exec.Parameters["target"]); got != `"10.0.0.2"` {
+		t.Errorf(`Executions[0].Parameters["target"] = %s, want "10.0.0.2"`, got)
+	}
+	if want := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC); !exec.RequestedAt.Equal(want) {
+		t.Errorf("Executions[0].RequestedAt = %v, want %v", exec.RequestedAt, want)
+	}
+	if want := time.Date(2026, 1, 1, 0, 5, 0, 0, time.UTC); !exec.ExpiresAt.Equal(want) {
+		t.Errorf("Executions[0].ExpiresAt = %v, want %v", exec.ExpiresAt, want)
+	}
+
+	// An empty executions block decodes to a zero-length slice.
+	emptyClient, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"peers":[],"reachability":null,"policy":null,` +
+			`"bridge":null,"state":null,"reports":null,"executions":[]}`))
+	})
+	empty, err := emptyClient.FetchState(context.Background(), "n1")
+	if err != nil {
+		t.Fatalf("FetchState (empty executions): %v", err)
+	}
+	if len(empty.Executions) != 0 {
+		t.Errorf("len(Executions) = %d, want 0", len(empty.Executions))
 	}
 }
 
