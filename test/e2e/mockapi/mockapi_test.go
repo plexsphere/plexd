@@ -3594,6 +3594,151 @@ func TestState_EmptyExecutionsSerializeAsArray(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Sessions block delivery (issue #52)
+// ---------------------------------------------------------------------------
+
+// stateSession builds one configured tcp sessions entry with a future deadline,
+// the only shape the state handler serves.
+func stateSession(sid string, port int) api.NodeStateSession {
+	return api.NodeStateSession{
+		SessionID:          sid,
+		JTI:                sid,
+		Kind:               api.SessionKindTCP,
+		Target:             api.SessionTarget{TCP: &api.SessionTargetTCP{Host: "10.10.0.5", Port: port}},
+		ExpiresAt:          time.Now().UTC().Add(time.Hour),
+		IdleTimeoutSeconds: 300,
+	}
+}
+
+// configureSessions posts a snapshot carrying only the given sessions block.
+func configureSessions(t *testing.T, baseURL string, sessions ...api.NodeStateSession) {
+	t.Helper()
+	body, err := json.Marshal(api.NodeStateSnapshot{Sessions: &sessions})
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	resp := doRequest(t, http.MethodPost, baseURL+"/test/configure-state", string(body))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+// servedSessions returns the served sessions block keyed by session id.
+func servedSessions(t *testing.T, baseURL string) map[string]api.NodeStateSession {
+	t.Helper()
+	served := make(map[string]api.NodeStateSession)
+	for _, session := range *getState(t, baseURL).Sessions {
+		served[session.SessionID] = session
+	}
+	return served
+}
+
+func TestState_SessionsServed(t *testing.T) {
+	_, ts := newTestServer(t)
+	const (
+		firstID  = "sess-served-first"
+		secondID = "sess-served-second"
+	)
+	configureSessions(t, ts.URL, stateSession(firstID, 22), stateSession(secondID, 5432))
+
+	// The block is desired state, not a queue: every pull redelivers both entries.
+	for pull := 1; pull <= 2; pull++ {
+		served := servedSessions(t, ts.URL)
+		if len(served) != 2 {
+			t.Fatalf("pull %d served sessions = %v, want both entries", pull, served)
+		}
+		entry, ok := served[firstID]
+		if !ok {
+			t.Fatalf("pull %d served sessions = %v, want %q", pull, served, firstID)
+		}
+		if entry.Kind != api.SessionKindTCP || entry.JTI != firstID {
+			t.Errorf("pull %d served entry = %+v, want kind %q and jti %q", pull, entry, api.SessionKindTCP, firstID)
+		}
+		if entry.Target.TCP == nil {
+			t.Fatalf("pull %d served entry %q carries no tcp target", pull, firstID)
+		}
+		if entry.Target.TCP.Host != "10.10.0.5" || entry.Target.TCP.Port != 22 {
+			t.Errorf("pull %d tcp target = %+v, want 10.10.0.5:22", pull, *entry.Target.TCP)
+		}
+		if entry.IdleTimeoutSeconds != 300 {
+			t.Errorf("pull %d idle_timeout_seconds = %d, want 300", pull, entry.IdleTimeoutSeconds)
+		}
+		if got := served[secondID].Target.TCP; got == nil || got.Port != 5432 {
+			t.Errorf("pull %d second entry tcp target = %+v, want port 5432", pull, got)
+		}
+	}
+}
+
+func TestState_ExpiredSessionsAreNotServed(t *testing.T) {
+	_, ts := newTestServer(t)
+	const freshID = "sess-expiry-fresh"
+
+	expired := stateSession("sess-expiry-past", 22)
+	expired.ExpiresAt = time.Now().UTC().Add(-time.Minute)
+	noDeadline := stateSession("sess-expiry-none", 22)
+	noDeadline.ExpiresAt = time.Time{}
+	configureSessions(t, ts.URL, expired, noDeadline, stateSession(freshID, 22))
+
+	served := servedSessions(t, ts.URL)
+	if len(served) != 1 {
+		t.Fatalf("served sessions = %v, want only %q", served, freshID)
+	}
+	if _, ok := served[freshID]; !ok {
+		t.Errorf("served sessions = %v, want the unexpired entry %q", served, freshID)
+	}
+}
+
+func TestState_EmptySessionsSerializeAsArray(t *testing.T) {
+	t.Run("none_configured", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configureSessions(t, ts.URL)
+
+		envelope := stateEnvelope(t, ts.URL)
+		if got, ok := envelope["sessions"]; !ok || string(got) != "[]" {
+			t.Errorf("sessions = %s, want [] (never null)", got)
+		}
+	})
+
+	t.Run("all_expired", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		expired := stateSession("sess-empty-expired", 22)
+		expired.ExpiresAt = time.Now().UTC().Add(-time.Minute)
+		configureSessions(t, ts.URL, expired)
+
+		envelope := stateEnvelope(t, ts.URL)
+		if got := envelope["sessions"]; string(got) != "[]" {
+			t.Errorf("sessions = %s, want [] (never null)", got)
+		}
+	})
+}
+
+func TestConfigureState_RepostDrainsSessions(t *testing.T) {
+	_, ts := newTestServer(t)
+	const (
+		keptID    = "sess-repost-kept"
+		revokedID = "sess-repost-revoked"
+	)
+	kept := stateSession(keptID, 22)
+	configureSessions(t, ts.URL, kept, stateSession(revokedID, 5432))
+
+	if served := servedSessions(t, ts.URL); len(served) != 2 {
+		t.Fatalf("served sessions = %v, want both entries", served)
+	}
+
+	// Revocation is a re-posted fixture without the entry: no teardown endpoint.
+	configureSessions(t, ts.URL, kept)
+
+	served := servedSessions(t, ts.URL)
+	if _, ok := served[revokedID]; ok {
+		t.Errorf("served sessions = %v, want %q dropped by the re-post", served, revokedID)
+	}
+	if _, ok := served[keptID]; !ok {
+		t.Errorf("served sessions = %v, want the still-configured entry %q", served, keptID)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Session activity endpoint (issue #22)
 // ---------------------------------------------------------------------------
 
@@ -3627,6 +3772,25 @@ func TestSessionActivity_ValidRows(t *testing.T) {
 				t.Errorf("captured session_activity = %q, want %q", captured, tt.body)
 			}
 		})
+	}
+}
+
+func TestSessionActivity_AcceptsListenerEndpoint(t *testing.T) {
+	_, ts := newTestServer(t)
+	// The listener endpoint the node opened for the mediated session travels on
+	// the tcp row and must survive the strict decode.
+	const body = `{"tcp":{"phase":"session_started","target_host":"203.0.113.9","target_port":22,"listener_endpoint":"10.42.0.1:45123"}}`
+
+	resp := doRequest(t, http.MethodPost, sessionURL(ts.URL, "sess-listener-endpoint"), body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+	if a := getAssertions(t, ts.URL); a.SessionActivityCount != 1 {
+		t.Errorf("session_activity_count = %d, want 1", a.SessionActivityCount)
+	}
+	if captured := getCapturedBody(t, ts.URL, "session_activity"); string(captured) != body {
+		t.Errorf("captured session_activity = %q, want %q", captured, body)
 	}
 }
 
