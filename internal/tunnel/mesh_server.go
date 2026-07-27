@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -18,19 +17,15 @@ type MeshServer struct {
 	logger   *slog.Logger
 }
 
-// NewMeshServer creates a MeshServer that manages the SSH server and session manager.
+// NewMeshServer creates a MeshServer that manages the SSH server and session
+// manager. meshIP is the node's registered mesh address, which every session
+// listener binds — it is the reachability boundary of an otherwise
+// unauthenticated forward, so it comes from the node identity rather than being
+// guessed from the SSH listen address, which is empty in both documented
+// configurations and would bind every interface on the host.
 // If cfg.SSHListenAddr is empty, the SSH server is not created.
-func NewMeshServer(cfg Config, hostKey ssh.Signer, verifier JWTVerifier, logger *slog.Logger) *MeshServer {
+func NewMeshServer(cfg Config, meshIP string, hostKey ssh.Signer, verifier JWTVerifier, logger *slog.Logger) *MeshServer {
 	cfg.ApplyDefaults()
-
-	// Extract mesh IP from SSHListenAddr if set, otherwise use empty string.
-	meshIP := ""
-	if cfg.SSHListenAddr != "" {
-		host, _, err := net.SplitHostPort(cfg.SSHListenAddr)
-		if err == nil {
-			meshIP = host
-		}
-	}
 
 	m := &MeshServer{
 		cfg:      cfg,

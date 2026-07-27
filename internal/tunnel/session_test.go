@@ -393,8 +393,11 @@ func TestSession_IdleWindowStampsActivityBothDirections(t *testing.T) {
 	port := mustAtoi(t, portStr)
 
 	session := NewSession("test-activity-flow", host, port, "127.0.0.1", time.Now().Add(5*time.Minute), slog.Default())
-	// Arm the idle window; the monitor that acts on it lands separately.
+	// Arm the idle window, the pair the manager always sets together. A minute is
+	// far longer than this test runs, so what is asserted here is the stamping,
+	// not the monitor acting on it.
 	session.idleTimeout = time.Minute
+	session.onIdle = func() { t.Error("idle monitor fired while bytes were flowing") }
 	t.Cleanup(func() { session.Close() })
 
 	addr, err := session.Start(context.Background())

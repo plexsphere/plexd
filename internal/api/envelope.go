@@ -25,6 +25,12 @@ const (
 	// tier — the resulting pull carries the dispatch.
 	EventActionRequest = "action_request"
 
+	// EventSessionSetup is the same push-latency optimisation for mediated
+	// access: sessions are delivered in the sessions block of the state pull, so
+	// the event's payload is opaque and it triggers a reconcile like the rest of
+	// the tier — the resulting pull carries the session.
+	EventSessionSetup = "session_setup"
+
 	// Documented-coming family: types that land with the platform's 14-type
 	// taxonomy. They are already named so the agent can subscribe to them once
 	// the control plane starts emitting them; every one triggers a reconcile.
@@ -36,11 +42,10 @@ const (
 	EventPeerKeyRotated      = "peer_key_rotated"
 	EventSigningKeyRotated   = "signing_key_rotated"
 
-	// Test-only duo: retained only until the platform taxonomy ships real
-	// discriminators. They are injectable exclusively through the mock control
-	// plane in tests; the production control plane never emits them.
-	EventSSHSessionSetup = "ssh_session_setup"
-	EventSessionRevoked  = "session_revoked"
+	// EventSessionRevoked carries no teardown of its own: a session leaving the
+	// pull's sessions block is what closes it, so this event only pulls the
+	// observing reconcile forward.
+	EventSessionRevoked = "session_revoked"
 )
 
 // ---------------------------------------------------------------------------
