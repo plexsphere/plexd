@@ -19,8 +19,8 @@ User                Platform / CP              plexd (Target Node)
  |                       |   { sub, node_id,          |
  |                       |     actions, exp }         |
  |                       |                            |
- |                       |-- SSH setup via SSE ------>|
- |                       |   (includes session token) |-- Start SSH session
+ |                       |-- Session in the state --->|
+ |                       |   pull's sessions block    |-- Start SSH session
  |<======== SSH session (tunneled through mesh) =====>|-- Inject PLEXD_SESSION_TOKEN
  |                       |                            |
  |-- plexd actions run -------------------------------->|
@@ -79,16 +79,11 @@ requester identity.
 
 ## Token Revocation
 
-When an SSH session ends (disconnect, admin termination, timeout), the control plane pushes a `session_revoked` SSE event:
+Revocation is not pushed to the node as a command. When a session ends (disconnect, admin termination, timeout), the control plane drops its entry from the `sessions` block of the node's state pull, and the next reconcile observes the absence: that absence *is* the teardown signal. plexd closes the session and, for a session whose listener it provisioned, reports a `session_ended` activity row with `terminated_by: plexd_close` — the node cannot tell a revocation from a control plane that failed to serve the block, so it does not claim an operator action. There is no revocation callback to answer and no terminal status to report — see [Secure Access Tunneling](../networking/secure-access-tunneling.md) for the dispatcher that performs the teardown.
 
-```json
-{
-  "session_id": "sess_a1b2c3",
-  "revoked_at": "2025-01-15T12:00:00Z"
-}
-```
+The `session_revoked` SSE event only shortens the window. Its payload is never parsed; it triggers a reconcile so the drain is observed now rather than on the next scheduled cycle, and a node that misses the event converges on its own cadence.
 
-plexd adds the `session_id` to a local revocation set (bounded, TTL = maximum token lifetime). Subsequent action requests using a revoked session token are rejected immediately.
+The session JWT itself is not revoked on the node. plexd keeps no local revocation set: local validation covers the signature and `exp`, so a token already handed out stays usable for its remaining lifetime. Keeping session tokens short-lived is what bounds that window.
 
 ## Local Transport via Unix Socket
 

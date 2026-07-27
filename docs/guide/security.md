@@ -105,8 +105,8 @@ Action dispatch is the one case where that distinction cuts both ways. A dispatc
 | `bridge_config_updated` | Trigger a bridge reconcile (bridge mode) |
 | `peer_endpoint_changed` / `peer_key_rotated` | Trigger a state reconcile — peer topology is applied from the authoritative state pull, not the event payload |
 | `action_request` | Trigger a state reconcile — the payload is opaque; action dispatches are delivered in the `executions` block of the authoritative state pull, never by the event (see [Remote Actions and Hooks](../reference/actions/remote-actions-hooks.md)) |
-| `session_revoked` | Add session to local revocation set, reject future actions with that session's token |
-| `ssh_session_setup` | Set up SSH session: start listener, inject session token |
+| `session_setup` | Trigger a state reconcile — the payload is opaque; the session is provisioned from the `sessions` block of the authoritative state pull, never from the event (see [Secure Access Tunneling](../reference/networking/secure-access-tunneling.md)) |
+| `session_revoked` | Trigger a state reconcile — the payload is opaque; the session leaving the `sessions` block is what tears the listener down, so the reconcile's drain does the revocation |
 | `rotate_keys` | Generate new Curve25519 keypair and initiate key rotation (see [Phase 4: Key Rotation](#phase-4-key-rotation)) |
 | `signing_key_rotated` | Update the control plane's signing public key, selected by `key_id` (see [Signing Key Rotation](#signing-key-rotation)) |
 

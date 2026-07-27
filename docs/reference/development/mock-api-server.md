@@ -267,7 +267,8 @@ closed `nat_type` enum, clock-skew tolerance, and a routable `ip:port`.
 Returns the active `NodeStateSnapshot` fixture built by `newStateFixture`. By
 default it is an enriched envelope containing two peers, a merged policy with two
 rules, the `reachability` projection, all four bridge subtrees, the `state`
-and `reports` blocks (which mirror one another), and an empty `executions` block.
+and `reports` blocks (which mirror one another), and empty `executions` and
+`sessions` blocks.
 The active fixture can be replaced at runtime via `POST /test/configure-state`.
 
 **Default fixture blocks:**
@@ -283,6 +284,7 @@ The active fixture can be replaced at runtime via `POST /test/configure-state`.
 | `bridge.site_to_site` | `enabled: true`, 1 tunnel (`s2s-001`) |
 | `state` / `reports` | `metadata` (2 entries), `data` (2 entries), `reports` (`[]`) |
 | `executions` | `[]` — no dispatch queued; phases configure entries explicitly |
+| `sessions` | `[]` — no session issued; phases configure entries explicitly |
 
 The `fingerprint` is produced by the mock-internal `policyFingerprint` helper — a
 44-char base64 SHA-256 over the compact-JSON encoding of the rules slice. This
@@ -399,7 +401,8 @@ comparison key and never re-derives it from the rules.
     ],
     "reports": []
   },
-  "executions": []
+  "executions": [],
+  "sessions": []
 }
 ```
 
@@ -421,6 +424,20 @@ state machine:
 The result is a freshly allocated slice, so the configured entries are never
 rewritten in place, and it is never `nil` — the block always serializes as `[]`
 rather than `null`.
+
+**Sessions projection:** the `sessions` block is filtered the same way, but there
+is no status projection — sessions have no callback state machine, so an entry is
+either served or not:
+
+| Configured entry | Served as |
+|------------------|-----------|
+| `expires_at` in the future | served verbatim, on **every** pull for as long as it stands |
+| `expires_at` not in the future (including a missing `expires_at`) | filtered out |
+
+The block is desired state, so redelivery is the point rather than a retry: an
+entry stands until it is drained. Revocation is expressed by re-posting the
+fixture *without* the entry — see `POST /test/configure-state` below. Like
+`executions`, the result is a freshly allocated slice and never `nil`.
 
 **Concurrency:** The active fixture is protected by `sync.RWMutex`. Reads never block other reads. A write via `POST /test/configure-state` blocks reads briefly during replacement. Readers always see a complete fixture (never a partial update).
 
@@ -531,6 +548,11 @@ member must be set, and that member must satisfy its per-kind rules —
 `ssh.command` non-empty and at most 1 KiB, `k8s.verb` non-empty, or `tcp.phase`
 one of `session_started` / `session_ended` with a valid `terminated_by` when set.
 A valid record increments `session_activity_count` and returns `204 No Content`.
+
+Strict decoding means the accepted `tcp` fields are exactly those of
+`api.TCPActivity`, `listener_endpoint` among them — a node that reports the
+address its listener bound on a `session_started` row is accepted, not `400`ed as
+an unknown field. The value itself is not validated.
 
 | Status | Problem `code` | Meaning |
 |---|---|---|
@@ -711,7 +733,9 @@ Broadcasts a signed `Envelope` to all connected SSE clients and records it in th
 Injecting `action_request` is possible too, but it delivers no dispatch: like
 `node_state_updated` its payload is opaque and it only nudges the agent into an
 immediate reconcile. The dispatch itself must be configured into the `executions`
-block via `POST /test/configure-state`.
+block via `POST /test/configure-state`. `session_setup` and `session_revoked`
+behave the same way — neither carries a session nor a teardown, so the session
+must be configured into (or dropped from) the `sessions` block the same way.
 
 **Fields the mock stamps:** `issued_at` (current time), `key_id` (`did:web:plexsphere.com#key-e2e`), the stream sequence (the `id:` frame line), and `signature` (a valid Ed25519 signature over the shared canonical form, `api.CanonicalBytes`).
 
@@ -752,13 +776,23 @@ Replaces the active `NodeStateSnapshot` fixture at runtime. Subsequent calls to 
       "requested_at": "2026-01-01T00:00:00Z",
       "expires_at": "2099-01-01T00:00:00Z"
     }
+  ],
+  "sessions": [
+    {
+      "session_id": "sess-e2e-001",
+      "jti": "sess-e2e-001",
+      "kind": "tcp",
+      "target": {"tcp": {"host": "127.0.0.1", "port": 8080}},
+      "expires_at": "2099-01-01T00:00:00Z"
+    }
   ]
 }
 ```
 
 Because the call replaces the **whole** fixture, a test that only wants to queue a
 dispatch reads the live snapshot, splices its `executions` array in, and posts the
-result back — that is what the e2e helper `configure_executions` does.
+result back — that is what the e2e helper `configure_executions` does. The
+`sessions` key works the same way, spliced by `configure_sessions`.
 
 **Response:** `204 No Content`
 
@@ -783,6 +817,14 @@ execution rather than only a fresh one:
 Seeding is **seed-if-absent**: an execution the mock is already tracking is left
 alone, so re-posting the same fixture can never regress an execution the node has
 already advanced.
+
+**Session issuance and revocation:** sessions seed nothing — there is no callback
+state machine to stage. A configured entry is issued by the mere fact of being
+served, and only while its `expires_at` is in the future: an entry with a zero or
+past `expires_at` is never served at all, so it cannot be used to stage an expired
+session. **Revocation is a re-post without the entry**: because the sessions block
+is desired state, dropping an entry from the fixture drains it out of the next
+pull, which is the node's teardown signal. There is no revocation endpoint.
 
 **Error:** Returns `400` if the request body is not valid JSON. Returns `405` if the HTTP method is not `POST`.
 

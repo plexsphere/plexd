@@ -10,9 +10,9 @@ The `internal/reconcile` package implements the core convergence loop that keeps
 
 The pull is one-way: plexd does not report drift corrections back to the control plane. `POST /v1/nodes/{node_id}/drift` no longer exists. Applied-correction visibility will return as node-authored state reports (issue #23).
 
-The envelope carries seven always-present blocks — `peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, and `executions`. A `null` block means "not populated" rather than "field absent", so the differ compares by presence: a `null` block and a populated block are distinct states, and switching between them drives convergence.
+The envelope carries eight always-present blocks — `peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`, and `sessions`. A `null` block means "not populated" rather than "field absent", so the differ compares by presence: a `null` block and a populated block are distinct states, and switching between them drives convergence.
 
-`executions` is the exception: it is a delivery queue, not desired state. It is consumed by the dispatch stage on every successful pull and is never stored in the local snapshot nor diffed.
+`executions` and `sessions` are the exceptions: both are consumed by the dispatch stage on every successful pull and neither is stored in the local snapshot nor diffed. `executions` is a delivery queue rather than desired state; `sessions` is desired state, but state the tunnel dispatcher converges on itself rather than through the differ.
 
 ## Config
 
@@ -54,7 +54,7 @@ Handlers are invoked sequentially in registration order. Errors and panics in on
 
 ## DispatchHandler
 
-Function type invoked on every successful pull, before the diff. Dispatch handlers consume the snapshot's delivery-queue blocks, which are not desired state to converge on.
+Function type invoked on every successful pull, before the diff. Dispatch handlers consume the snapshot blocks the differ never sees, so an unchanged snapshot still delivers them.
 
 ```go
 type DispatchHandler func(ctx context.Context, desired *api.NodeStateSnapshot)
@@ -62,7 +62,7 @@ type DispatchHandler func(ctx context.Context, desired *api.NodeStateSnapshot)
 
 They return nothing: a dispatch problem is the handler's own to report and never blocks the snapshot update. Panics are recovered and logged, and never count as a handler failure.
 
-Today the only delivery-queue block is `executions`, consumed by `actions.Dispatcher.Handle`. Issue #52 registers the sessions consumer on this same seam.
+Two blocks are consumed on this seam. `executions` is a delivery queue: `actions.Dispatcher.Handle` redelivers each entry until its execution settles through the callback. `sessions` is desired state rather than a queue — an entry stands for as long as its session is valid, and its disappearance is the teardown signal — but `tunnel.Dispatcher.Handle` converges it here rather than behind the diff, because an entry a transient failure left unprovisioned has to be retried on the next pull whether or not the snapshot moved.
 
 ## Reconciler
 

@@ -185,7 +185,7 @@ Routes verified events to registered handlers by the envelope's `type`.
 
 ## Event Type Constants
 
-The SSE event set is organized in three tiers. Payloads of the reconcile-driving
+The SSE event set is organized in two tiers. Payloads of the reconcile-driving
 types are opaque: the reconciler's state pull is authoritative, so those events
 only request a reconcile.
 
@@ -197,10 +197,13 @@ only request a reconcile.
 | `EventPolicyUpdated`       | `policy_updated`        | `policy.HandlePolicyUpdated` → reconcile    |
 | `EventBridgeConfigUpdated` | `bridge_config_updated` | `bridge.HandleBridgeConfigUpdated` → reconcile |
 | `EventActionRequest`       | `action_request`        | `TriggerReconcile()`                        |
+| `EventSessionSetup`        | `session_setup`         | `TriggerReconcile()`                        |
 
 `action_request` carries no dispatch of its own: action executions are delivered
 in the `executions` block of the state pull, so the event only pulls the next
-reconcile forward and the resulting pull carries the dispatch.
+reconcile forward and the resulting pull carries the dispatch. `session_setup` is
+the same optimisation for mediated access: the session is delivered in the
+`sessions` block of that pull, and the event only pulls it forward.
 
 **Documented-coming** — named now so the agent can subscribe once the platform's 14-type taxonomy starts emitting them:
 
@@ -213,13 +216,11 @@ reconcile forward and the resulting pull carries the dispatch.
 | `EventPeerKeyRotated`      | `peer_key_rotated`      | `TriggerReconcile()`        |
 | `EventRotateKeys`          | `rotate_keys`           | key rotator's `RotateNow`   |
 | `EventSigningKeyRotated`   | `signing_key_rotated`   | `Ed25519Verifier.Rotate`    |
+| `EventSessionRevoked`      | `session_revoked`       | `TriggerReconcile()`        |
 
-**Test-only** — retained until the platform taxonomy ships real discriminators. These are injectable exclusively through the e2e mock control plane; the production control plane never emits them:
-
-| Constant               | Value               | Dispatch target                   |
-|------------------------|---------------------|-----------------------------------|
-| `EventSSHSessionSetup` | `ssh_session_setup` | `tunnel.HandleSSHSessionSetup`    |
-| `EventSessionRevoked`  | `session_revoked`   | `tunnel.HandleSessionRevoked`     |
+`session_revoked` carries no teardown of its own: a session leaving the `sessions`
+block of the state pull is what closes it, so the event only pulls the observing
+reconcile forward.
 
 ## ReconnectEngine
 
