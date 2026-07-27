@@ -75,14 +75,15 @@ type HeartbeatResponse struct {
 // GET /v1/nodes/{node_id}/state. Every block key is always present on the wire:
 // a null value means "block not populated", never "field absent". The differ
 // therefore distinguishes a nil pointer from a populated block, so none of the
-// six fields carry omitempty.
+// seven fields carry omitempty.
 type NodeStateSnapshot struct {
-	Peers        []SnapshotPeer  `json:"peers"`
-	Reachability json.RawMessage `json:"reachability"`
-	Policy       *PolicySnapshot `json:"policy"`
-	Bridge       *BridgeSnapshot `json:"bridge"`
-	State        *NodeStateBlock `json:"state"`
-	Reports      *NodeStateBlock `json:"reports"`
+	Peers        []SnapshotPeer       `json:"peers"`
+	Reachability json.RawMessage      `json:"reachability"`
+	Policy       *PolicySnapshot      `json:"policy"`
+	Bridge       *BridgeSnapshot      `json:"bridge"`
+	State        *NodeStateBlock      `json:"state"`
+	Reports      *NodeStateBlock      `json:"reports"`
+	Executions   []NodeStateExecution `json:"executions"`
 }
 
 // SnapshotPeer is a reconciliation peer entry in NodeStateSnapshot. It is a
@@ -211,6 +212,50 @@ type NodeStateReportResponse struct {
 // ---------------------------------------------------------------------------
 // Execution  POST /v1/nodes/{node_id}/executions/{execution_id}
 // ---------------------------------------------------------------------------
+
+// NodeStateExecution is one pending action dispatch in the executions block of
+// GET /v1/nodes/{node_id}/state. That block is the delivery channel for action
+// dispatches: it is always present ([] when empty, never null) and ordered by
+// RequestedAt, then ExecutionID. An entry keeps reappearing on every pull until
+// its execution reaches a terminal status through the execution callback, so a
+// consumer must tolerate re-observing the same ExecutionID.
+//
+// Type is one of the ActionKind* values; Status is ExecutionStatusPending,
+// ExecutionStatusAck, or ExecutionStatusStarted. ExpiresAt is an absolute UTC
+// deadline, not a relative timeout. Parameters is nullable: a JSON null decodes
+// to a nil map. The entry carries no callback URL and no hook checksum.
+//
+// A parameter value is held as raw JSON, not decoded into any: the state
+// response is decoded with a plain decoder, so a JSON number would land in an
+// any as a float64 and every integer beyond 2^53 would reach the action
+// rewritten. The raw form hands the value to the action exactly as the control
+// plane sent it.
+type NodeStateExecution struct {
+	ExecutionID string                     `json:"execution_id"`
+	Action      string                     `json:"action"`
+	Type        string                     `json:"type"`
+	Parameters  map[string]json.RawMessage `json:"parameters"`
+	Status      string                     `json:"status"`
+	RequestedAt time.Time                  `json:"requested_at"`
+	ExpiresAt   time.Time                  `json:"expires_at"`
+}
+
+// The two legal values of a NodeStateExecution.Type.
+const (
+	// ActionKindBuiltin dispatches an action built into plexd.
+	ActionKindBuiltin = "builtin"
+	// ActionKindHook dispatches a hook registered by the node.
+	ActionKindHook = "hook"
+)
+
+// Execution status observed only on the pull block.
+const (
+	// ExecutionStatusPending marks an execution the control plane has dispatched
+	// and the node has not yet acknowledged. It appears in the executions block
+	// of the node state snapshot and is never reported by a node on the
+	// execution callback.
+	ExecutionStatusPending = "pending"
+)
 
 // ActionRequest is the SSE payload for action_request events.
 type ActionRequest struct {

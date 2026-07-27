@@ -340,19 +340,29 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 			Data:     []StateEntry{},
 			Reports:  []StateEntry{},
 		},
+		Executions: []NodeStateExecution{
+			{
+				ExecutionID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0",
+				Action:      "gather_info",
+				Type:        ActionKindBuiltin,
+				Status:      ExecutionStatusPending,
+				RequestedAt: now,
+				ExpiresAt:   now.Add(5 * time.Minute),
+			},
+		},
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Exactly the six contract keys must appear.
+	// Exactly the seven contract keys must appear.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 6 {
-		t.Errorf("expected exactly 6 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 7 {
+		t.Errorf("expected exactly 7 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
@@ -361,7 +371,7 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 
 func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	// Decoding explicit nulls yields nil pointers.
-	const nullBlocks = `{"peers":[],"reachability":null,"policy":null,"bridge":null,"state":null,"reports":null}`
+	const nullBlocks = `{"peers":[],"reachability":null,"policy":null,"bridge":null,"state":null,"reports":null,"executions":[]}`
 	var snap NodeStateSnapshot
 	if err := json.Unmarshal([]byte(nullBlocks), &snap); err != nil {
 		t.Fatalf("unmarshal null blocks: %v", err)
@@ -372,10 +382,13 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if snap.Peers == nil || len(snap.Peers) != 0 {
 		t.Errorf("peers = %v, want empty non-nil slice", snap.Peers)
 	}
+	if snap.Executions == nil || len(snap.Executions) != 0 {
+		t.Errorf("executions = %v, want empty non-nil slice", snap.Executions)
+	}
 
 	// A populated zero-value block decodes to a NON-nil pointer — distinct from
 	// a null block.
-	const populatedPolicy = `{"peers":[],"reachability":null,"policy":{},"bridge":null,"state":null,"reports":null}`
+	const populatedPolicy = `{"peers":[],"reachability":null,"policy":{},"bridge":null,"state":null,"reports":null,"executions":[]}`
 	var snap2 NodeStateSnapshot
 	if err := json.Unmarshal([]byte(populatedPolicy), &snap2); err != nil {
 		t.Fatalf("unmarshal populated policy: %v", err)
@@ -384,7 +397,7 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		t.Error("policy:{} should decode to a non-nil pointer, distinct from null")
 	}
 
-	// Marshalling nil blocks emits literal null with all six keys PRESENT.
+	// Marshalling nil blocks emits literal null with all seven keys PRESENT.
 	out, err := json.Marshal(NodeStateSnapshot{})
 	if err != nil {
 		t.Fatalf("marshal zero value: %v", err)
@@ -393,13 +406,13 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if err := json.Unmarshal(out, &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions"} {
 		v, ok := raw[key]
 		if !ok {
 			t.Errorf("key %q absent, want present with null value", key)
 			continue
 		}
-		if key == "peers" {
+		if key == "peers" || key == "executions" {
 			continue // nil slice marshals as null; presence is what matters
 		}
 		if string(v) != "null" {
@@ -658,6 +671,78 @@ func TestTypesNodeStateReportResponse(t *testing.T) {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
+	}
+}
+
+func TestTypesNodeStateExecution(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := NodeStateExecution{
+		ExecutionID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0",
+		Action:      "gather_info",
+		Type:        ActionKindBuiltin,
+		Parameters: map[string]json.RawMessage{
+			"target":   json.RawMessage(`"10.42.0.5"`),
+			"retries":  json.RawMessage(`3`),
+			"since_ns": json.RawMessage(`1769500800123456789`),
+			"verbose":  json.RawMessage(`true`),
+			"label":    json.RawMessage(`null`),
+			"tags":     json.RawMessage(`["a","b"]`),
+			"nested":   json.RawMessage(`{"k":"v"}`),
+		},
+		Status:      ExecutionStatusPending,
+		RequestedAt: now,
+		ExpiresAt:   now.Add(5 * time.Minute),
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	// Verify snake_case keys: exactly the seven contract keys, nothing more.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 7 {
+		t.Errorf("expected exactly 7 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"execution_id", "action", "type", "parameters", "status", "requested_at", "expires_at"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+
+	// A parameter value keeps the JSON text it arrived as. since_ns is the
+	// regression: decoded into an any it would come back as 1769500800123456800,
+	// because float64 cannot hold an integer that large.
+	wantParams := map[string]string{
+		"target":   `"10.42.0.5"`,
+		"retries":  `3`,
+		"since_ns": `1769500800123456789`,
+		"verbose":  `true`,
+		"label":    `null`,
+		"tags":     `["a","b"]`,
+		"nested":   `{"k":"v"}`,
+	}
+	for name, want := range wantParams {
+		if got := string(got.Parameters[name]); got != want {
+			t.Errorf("Parameters[%q] = %s, want %s", name, got, want)
+		}
+	}
+
+	// A null parameters block decodes to a nil map, not an empty one.
+	const nullParams = `{"execution_id":"exec-1","action":"restart","type":"hook","parameters":null,` +
+		`"status":"ack","requested_at":"2026-01-01T00:00:00Z","expires_at":"2026-01-01T00:05:00Z"}`
+	var nulled NodeStateExecution
+	if err := json.Unmarshal([]byte(nullParams), &nulled); err != nil {
+		t.Fatalf("unmarshal null parameters: %v", err)
+	}
+	if nulled.Parameters != nil {
+		t.Errorf("parameters:null should decode to a nil map, got %#v", nulled.Parameters)
+	}
+	if nulled.Type != ActionKindHook {
+		t.Errorf("Type = %q, want %q", nulled.Type, ActionKindHook)
+	}
+	if nulled.Status != ExecutionStatusAck {
+		t.Errorf("Status = %q, want %q", nulled.Status, ExecutionStatusAck)
 	}
 }
 
