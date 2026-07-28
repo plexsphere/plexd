@@ -51,10 +51,12 @@ func NewControlPlane(cfg Config, version string, logger *slog.Logger) (*ControlP
 ### Authentication
 
 ```go
-client.SetAuthToken("node-identity-token")
+bearer, err := identity.BearerToken()
+// ...
+client.SetAuthToken(bearer)
 ```
 
-Thread-safe via `sync.RWMutex`. The token is injected as `Authorization: Bearer {token}` on every request. Call `SetAuthToken` after registration to switch from bootstrap token to node identity token.
+Thread-safe via `sync.RWMutex`. The token is injected as `Authorization: Bearer {token}` on every request. After registration the registrar arms the client with the NSK bearer envelope (`nsk_<env>_<base64url(node_id || nsk)>`, see the [registration reference](registration.md#bearertoken)) — never the raw NSK, which the control plane refuses with `401`.
 
 ### API Methods
 

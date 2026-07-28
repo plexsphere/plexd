@@ -49,12 +49,20 @@ func (r *Registrar) SetClock(c api.Clock) { r.clock = c }
 // Register orchestrates the full registration flow. If a valid identity already
 // exists on disk, it is returned without contacting the control plane.
 func (r *Registrar) Register(ctx context.Context) (*NodeIdentity, error) {
-	// 1. Check existing identity.
+	// 1. Check existing identity. An identity that loads but cannot form the
+	// bearer envelope (a node_id that is not a canonical UUID) is treated
+	// exactly like corrupt identity files: it predates the real control-plane
+	// contract and can only ever be refused, so a fresh registration is the
+	// one recovery that can work.
 	identity, err := LoadIdentity(r.cfg.DataDir)
 	if err == nil {
-		r.client.SetAuthToken(identity.NodeSecretKey)
-		r.logger.Info("existing identity loaded", "node_id", identity.NodeID, "mesh_ip", identity.MeshIP)
-		return identity, nil
+		var bearer string
+		bearer, err = identity.BearerToken()
+		if err == nil {
+			r.client.SetAuthToken(bearer)
+			r.logger.Info("existing identity loaded", "node_id", identity.NodeID, "mesh_ip", identity.MeshIP)
+			return identity, nil
+		}
 	}
 	if !errors.Is(err, ErrNotRegistered) {
 		r.logger.Warn("corrupt identity files, proceeding with fresh registration", "error", err)
@@ -122,12 +130,13 @@ func (r *Registrar) Register(ctx context.Context) (*NodeIdentity, error) {
 		return nil, fmt.Errorf("registration: register: %w", err)
 	}
 
-	// 7. Build identity from response. nsk is standard-padded base64 per the
-	// register contract; reject anything that does not decode to an
-	// AES-256-GCM key before it is persisted and used to open secrets.
-	if _, err := decodeNSK(resp.NSK); err != nil {
-		return nil, err
-	}
+	// 7. Build identity from response and assemble the bearer envelope every
+	// post-registration call presents (see BearerToken). Doing both before
+	// the identity is persisted rejects a response whose nsk does not decode
+	// to an AES-256-GCM key — per the register contract nsk is
+	// standard-padded base64 — or whose node_id cannot form the credential,
+	// instead of persisting a node that can never authenticate or open
+	// secrets.
 	identity = &NodeIdentity{
 		NodeID:           resp.NodeID,
 		MeshIP:           resp.MeshIP,
@@ -136,6 +145,10 @@ func (r *Registrar) Register(ctx context.Context) (*NodeIdentity, error) {
 		DomainMeshCIDR:   resp.DomainMeshCIDR,
 		NodeSecretKey:    resp.NSK,
 		PrivateKey:       keypair.PrivateKey,
+	}
+	bearer, err := identity.BearerToken()
+	if err != nil {
+		return nil, err
 	}
 
 	// 8. Persist identity. The control plane has already allocated the node and
@@ -156,9 +169,9 @@ func (r *Registrar) Register(ctx context.Context) (*NodeIdentity, error) {
 		}
 	}
 
-	// 10. Set nsk as auth token so subsequent calls on the shared client
-	// authenticate as the newly registered node.
-	r.client.SetAuthToken(resp.NSK)
+	// 10. Present the bearer envelope so subsequent calls on the shared
+	// client authenticate as the newly registered node.
+	r.client.SetAuthToken(bearer)
 
 	r.logger.Info("registration successful", "node_id", identity.NodeID, "mesh_ip", identity.MeshIP)
 	return identity, nil

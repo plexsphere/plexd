@@ -151,13 +151,35 @@ keys existed still load — the missing fields decode as empty strings.
 {data_dir}/
 ├── identity.json        (0600) — NodeID, MeshIP, SigningPublicKey, SigningKeyID, DomainMeshCIDR
 ├── private_key          (0600) — base64-encoded Curve25519 private key
-├── node_secret_key      (0600) — bearer token for post-registration API calls
+├── node_secret_key      (0600) — NSK (standard base64); source of the bearer envelope
 └── signing_public_key   (0600) — control plane signing public key
 ```
 
 - Directory created with `0700` permissions if missing
 - All files written atomically (temp file + fsync + rename)
 - `PrivateKey` and `NodeSecretKey` use `json:"-"` tags to prevent accidental JSON serialization
+
+### BearerToken
+
+Assembles the `Authorization` bearer credential the control plane admits on
+every post-registration call:
+
+```
+nsk_<env>_<base64url(node_id_bytes(16) || nsk_plaintext_bytes(32))>
+```
+
+The payload is exactly 48 bytes — the node's UUID followed by the decoded
+NSK — encoded with unpadded base64url; plexd stamps `plexd` as the `<env>`
+segment, which the control plane treats as informational. The raw base64 NSK
+string is never presented as a bearer; the control plane refuses it with
+`401`. Both registrar paths (fresh registration and resuming a persisted
+identity) arm the shared API client with this envelope, and an identity whose
+`node_id` is not a canonical UUID cannot form it — the registrar treats such
+an identity like corrupt identity files and re-registers.
+
+```go
+bearer, err := identity.BearerToken()
+```
 
 ### SaveIdentity / LoadIdentity
 

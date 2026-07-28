@@ -2,6 +2,7 @@ package registration
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -66,6 +67,59 @@ func decodeNSK(nsk string) ([]byte, error) {
 	}
 	if len(raw) != nskSize {
 		return nil, fmt.Errorf("registration: nsk must decode to %d bytes, got %d", nskSize, len(raw))
+	}
+	return raw, nil
+}
+
+// bearerEnvSegment is the informational `<env>` segment stamped into the
+// bearer envelope. The control plane tolerates any non-empty segment without
+// an underscore — the cryptographic gate is the payload, not the tag — so the
+// value attributes the credential to the producing software: agent-assembled
+// envelopes read `nsk_plexd_…`, which separates them from hand-assembled
+// operator recipes in traffic captures. No configuration knob: nothing
+// consumes the segment today, and the server-side tolerance means one can be
+// added later without breaking a deployed fleet.
+const bearerEnvSegment = "plexd"
+
+// BearerToken assembles the Authorization bearer credential the control plane
+// admits on every post-registration call:
+//
+//	nsk_<env>_<base64url(node_id_bytes(16) || nsk_plaintext_bytes(32))>
+//
+// The payload is exactly 48 bytes — the node's UUID followed by the decoded
+// NSK — encoded with unpadded base64url. Presenting the raw base64 nsk string
+// instead is refused by the control plane with 401. The embedded node id is a
+// lookup hint for the control plane's resolver, not an authorizer: the server
+// independently matches it against the URL path and verifies the key bytes
+// against its own records.
+func (id *NodeIdentity) BearerToken() (string, error) {
+	nodeID, err := parseNodeUUID(id.NodeID)
+	if err != nil {
+		return "", err
+	}
+	key, err := decodeNSK(id.NodeSecretKey)
+	if err != nil {
+		return "", err
+	}
+	payload := make([]byte, 0, len(nodeID)+len(key))
+	payload = append(payload, nodeID...)
+	payload = append(payload, key...)
+	return "nsk_" + bearerEnvSegment + "_" + base64.RawURLEncoding.EncodeToString(payload), nil
+}
+
+// parseNodeUUID decodes the canonical textual UUID the control plane issues
+// as node_id (8-4-4-4-12 hex groups) into its 16 raw bytes. Anything else —
+// including the free-form ids a mock-era control plane handed out — cannot
+// form a bearer envelope and is rejected here rather than sent as a
+// credential the server is guaranteed to refuse.
+func parseNodeUUID(s string) ([]byte, error) {
+	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
+		return nil, fmt.Errorf("registration: node_id %q is not a canonical UUID", s)
+	}
+	compact := s[:8] + s[9:13] + s[14:18] + s[19:23] + s[24:]
+	raw, err := hex.DecodeString(compact)
+	if err != nil {
+		return nil, fmt.Errorf("registration: node_id %q is not a canonical UUID: %w", s, err)
 	}
 	return raw, nil
 }
