@@ -25,6 +25,11 @@ import (
 const (
 	testProjectID      = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0"
 	testResourceHandle = "edge-router-01"
+	// testNodeID and testNodeIDAlt are the canonical UUIDs the fixture control
+	// plane issues as node_id. The bearer envelope embeds their 16 raw bytes,
+	// so unlike the mock-era free-form ids they must parse as UUIDs.
+	testNodeID    = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3"
+	testNodeIDAlt = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b7"
 )
 
 // nonceRe matches a canonical lowercase UUIDv4 (the nonce format plexd sends).
@@ -38,6 +43,20 @@ var (
 	// response the persisted identity was built from.
 	testNSKAlt = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5b}, 32))
 )
+
+// wantBearer assembles the bearer envelope expected on the Authorization
+// header after registration. The exact wire form is pinned by the BearerToken
+// tests in identity_test.go; the registrar tests only assert that the client
+// presents what BearerToken assembles.
+func wantBearer(t *testing.T, nodeID, nsk string) string {
+	t.Helper()
+	id := &NodeIdentity{NodeID: nodeID, NodeSecretKey: nsk}
+	bearer, err := id.BearerToken()
+	if err != nil {
+		t.Fatalf("BearerToken(%q): %v", nodeID, err)
+	}
+	return bearer
+}
 
 // testServer creates an httptest.Server and a ControlPlane client connected to it.
 func testServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *api.ControlPlane) {
@@ -56,7 +75,7 @@ func testServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *api.
 // newSuccessResponse returns a fully-populated new-contract register response.
 func newSuccessResponse() api.RegisterResponse {
 	return api.RegisterResponse{
-		NodeID:           "node-123",
+		NodeID:           testNodeID,
 		MeshIP:           "100.64.0.1",
 		SigningPublicKey: "signing-key-base64",
 		SigningKeyID:     "did:web:plexsphere.com#key-2026-04",
@@ -193,8 +212,8 @@ func TestRegistrar_SuccessfulRegistration(t *testing.T) {
 	}
 
 	// Verify identity fields, including the new signing_key_id and domain_mesh_cidr.
-	if identity.NodeID != "node-123" {
-		t.Errorf("NodeID = %q, want %q", identity.NodeID, "node-123")
+	if identity.NodeID != testNodeID {
+		t.Errorf("NodeID = %q, want %q", identity.NodeID, testNodeID)
 	}
 	if identity.MeshIP != "100.64.0.1" {
 		t.Errorf("MeshIP = %q, want %q", identity.MeshIP, "100.64.0.1")
@@ -247,8 +266,8 @@ func TestRegistrar_SuccessfulRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadIdentity after registration: %v", err)
 	}
-	if loaded.NodeID != "node-123" {
-		t.Errorf("persisted NodeID = %q, want %q", loaded.NodeID, "node-123")
+	if loaded.NodeID != testNodeID {
+		t.Errorf("persisted NodeID = %q, want %q", loaded.NodeID, testNodeID)
 	}
 	if loaded.SigningKeyID != "did:web:plexsphere.com#key-2026-04" {
 		t.Errorf("persisted SigningKeyID = %q, want %q", loaded.SigningKeyID, "did:web:plexsphere.com#key-2026-04")
@@ -257,15 +276,16 @@ func TestRegistrar_SuccessfulRegistration(t *testing.T) {
 		t.Errorf("persisted DomainMeshCIDR = %q, want %q", loaded.DomainMeshCIDR, "100.64.0.0/10")
 	}
 
-	// After success the client authenticates subsequent calls with the NSK.
-	if _, err := client.Heartbeat(context.Background(), "node-123", api.HeartbeatRequest{}); err != nil {
+	// After success the client authenticates subsequent calls with the
+	// bearer envelope assembled from node_id and nsk — never the raw nsk.
+	if _, err := client.Heartbeat(context.Background(), testNodeID, api.HeartbeatRequest{}); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 	mu.Lock()
 	gotPost := postAuth
 	mu.Unlock()
-	if gotPost != "Bearer "+testNSK {
-		t.Errorf("post-register Authorization = %q, want %q", gotPost, "Bearer "+testNSK)
+	if want := "Bearer " + wantBearer(t, testNodeID, testNSK); gotPost != want {
+		t.Errorf("post-register Authorization = %q, want %q", gotPost, want)
 	}
 
 	if reqCount.Load() != 1 {
@@ -509,7 +529,7 @@ func TestRegistrar_SkipsRegistrationIfIdentityExists(t *testing.T) {
 
 	// Pre-save identity.
 	existing := &NodeIdentity{
-		NodeID:           "existing-node",
+		NodeID:           testNodeID,
 		MeshIP:           "100.64.0.99",
 		SigningPublicKey: "existing-spk",
 		PrivateKey:       make([]byte, 32),
@@ -529,13 +549,103 @@ func TestRegistrar_SkipsRegistrationIfIdentityExists(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	if identity.NodeID != "existing-node" {
-		t.Errorf("NodeID = %q, want %q", identity.NodeID, "existing-node")
+	if identity.NodeID != testNodeID {
+		t.Errorf("NodeID = %q, want %q", identity.NodeID, testNodeID)
 	}
 
 	// Verify no HTTP requests were made.
 	if reqCount.Load() != 0 {
 		t.Errorf("request count = %d, want 0", reqCount.Load())
+	}
+}
+
+// Resuming a persisted identity must arm the shared client with the bearer
+// envelope, exactly like a fresh registration does — the resume path is what
+// every restart takes, so a raw-nsk regression here silently 401s the whole
+// fleet after its next rollout.
+func TestRegistrar_ResumedIdentityPresentsEnvelope(t *testing.T) {
+	var mu sync.Mutex
+	var gotAuth string
+	_, client := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotAuth = r.Header.Get("Authorization")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	})
+
+	dataDir := t.TempDir()
+	existing := &NodeIdentity{
+		NodeID:           testNodeID,
+		MeshIP:           "100.64.0.99",
+		SigningPublicKey: "existing-spk",
+		PrivateKey:       make([]byte, 32),
+		NodeSecretKey:    testNSK,
+	}
+	if err := SaveIdentity(dataDir, existing); err != nil {
+		t.Fatalf("SaveIdentity: %v", err)
+	}
+
+	reg := NewRegistrar(client, Config{
+		DataDir:    dataDir,
+		TokenValue: "unused-token",
+	}, discardLogger())
+
+	if _, err := reg.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := client.Heartbeat(context.Background(), testNodeID, api.HeartbeatRequest{}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := "Bearer " + wantBearer(t, testNodeID, testNSK); gotAuth != want {
+		t.Errorf("post-resume Authorization = %q, want %q", gotAuth, want)
+	}
+}
+
+// An identity whose node_id is not a canonical UUID (a mock-era leftover)
+// cannot form the bearer envelope; the registrar must treat it like corrupt
+// identity files and fall through to a fresh registration.
+func TestRegistrar_ReRegistersOnNonUUIDIdentity(t *testing.T) {
+	var reqCount atomic.Int32
+	_, client := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		reqCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(newSuccessResponse())
+	})
+
+	dataDir := t.TempDir()
+	existing := &NodeIdentity{
+		NodeID:           "node-mock-era",
+		MeshIP:           "100.64.0.99",
+		SigningPublicKey: "existing-spk",
+		PrivateKey:       make([]byte, 32),
+		NodeSecretKey:    testNSK,
+	}
+	if err := SaveIdentity(dataDir, existing); err != nil {
+		t.Fatalf("SaveIdentity: %v", err)
+	}
+
+	reg := NewRegistrar(client, Config{
+		DataDir:        dataDir,
+		TokenValue:     "boot-token",
+		ProjectID:      testProjectID,
+		ResourceHandle: testResourceHandle,
+	}, discardLogger())
+
+	identity, err := reg.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if identity.NodeID != testNodeID {
+		t.Errorf("NodeID = %q, want the freshly registered %q", identity.NodeID, testNodeID)
+	}
+	if reqCount.Load() != 1 {
+		t.Errorf("request count = %d, want 1 (fresh registration)", reqCount.Load())
 	}
 }
 
@@ -546,7 +656,7 @@ func TestRegistrar_ReRegistersOnCorruptIdentity(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		resp := newSuccessResponse()
-		resp.NodeID = "new-node"
+		resp.NodeID = testNodeIDAlt
 		resp.MeshIP = "100.64.0.2"
 		resp.NSK = testNSKAlt
 		_ = json.NewEncoder(w).Encode(resp)
@@ -570,8 +680,8 @@ func TestRegistrar_ReRegistersOnCorruptIdentity(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	if identity.NodeID != "new-node" {
-		t.Errorf("NodeID = %q, want %q", identity.NodeID, "new-node")
+	if identity.NodeID != testNodeIDAlt {
+		t.Errorf("NodeID = %q, want %q", identity.NodeID, testNodeIDAlt)
 	}
 
 	// Verify a registration request was made.
@@ -584,8 +694,8 @@ func TestRegistrar_ReRegistersOnCorruptIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadIdentity: %v", err)
 	}
-	if loaded.NodeID != "new-node" {
-		t.Errorf("persisted NodeID = %q, want %q", loaded.NodeID, "new-node")
+	if loaded.NodeID != testNodeIDAlt {
+		t.Errorf("persisted NodeID = %q, want %q", loaded.NodeID, testNodeIDAlt)
 	}
 }
 
@@ -651,7 +761,7 @@ func TestRegistrar_RetriesOnTransientError(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		resp := newSuccessResponse()
-		resp.NodeID = "node-retry"
+		resp.NodeID = testNodeIDAlt
 		resp.MeshIP = "100.64.0.3"
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -671,8 +781,8 @@ func TestRegistrar_RetriesOnTransientError(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	if identity.NodeID != "node-retry" {
-		t.Errorf("NodeID = %q, want %q", identity.NodeID, "node-retry")
+	if identity.NodeID != testNodeIDAlt {
+		t.Errorf("NodeID = %q, want %q", identity.NodeID, testNodeIDAlt)
 	}
 
 	if reqCount.Load() != 3 {
@@ -693,7 +803,7 @@ func TestRegistrar_Retry429RespectsRetryAfter(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		resp := newSuccessResponse()
-		resp.NodeID = "node-429"
+		resp.NodeID = testNodeIDAlt
 		resp.MeshIP = "100.64.0.4"
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -713,8 +823,8 @@ func TestRegistrar_Retry429RespectsRetryAfter(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	if identity.NodeID != "node-429" {
-		t.Errorf("NodeID = %q, want %q", identity.NodeID, "node-429")
+	if identity.NodeID != testNodeIDAlt {
+		t.Errorf("NodeID = %q, want %q", identity.NodeID, testNodeIDAlt)
 	}
 	if reqCount.Load() != 2 {
 		t.Errorf("request count = %d, want 2", reqCount.Load())
@@ -852,8 +962,8 @@ func TestRegistrar_TokenDeletionFailureDoesNotFailRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if identity.NodeID != "node-123" {
-		t.Errorf("NodeID = %q, want %q", identity.NodeID, "node-123")
+	if identity.NodeID != testNodeID {
+		t.Errorf("NodeID = %q, want %q", identity.NodeID, testNodeID)
 	}
 }
 
@@ -903,7 +1013,7 @@ func TestRegistrar_FullFlow(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		resp := newSuccessResponse()
-		resp.NodeID = "node-full"
+		resp.NodeID = testNodeIDAlt
 		resp.MeshIP = "100.64.0.10"
 		resp.NSK = testNSKAlt
 		resp.PeerSnapshot = []api.RegisterPeer{
@@ -934,8 +1044,8 @@ func TestRegistrar_FullFlow(t *testing.T) {
 	}
 
 	// Step 2: Verify identity.
-	if identity.NodeID != "node-full" {
-		t.Errorf("NodeID = %q, want %q", identity.NodeID, "node-full")
+	if identity.NodeID != testNodeIDAlt {
+		t.Errorf("NodeID = %q, want %q", identity.NodeID, testNodeIDAlt)
 	}
 	if identity.MeshIP != "100.64.0.10" {
 		t.Errorf("MeshIP = %q, want %q", identity.MeshIP, "100.64.0.10")
@@ -976,8 +1086,8 @@ func TestRegistrar_FullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadIdentity: %v", err)
 	}
-	if loaded.NodeID != "node-full" {
-		t.Errorf("loaded NodeID = %q, want %q", loaded.NodeID, "node-full")
+	if loaded.NodeID != testNodeIDAlt {
+		t.Errorf("loaded NodeID = %q, want %q", loaded.NodeID, testNodeIDAlt)
 	}
 
 	// Step 5: Verify token file deleted.
@@ -990,8 +1100,8 @@ func TestRegistrar_FullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Register: %v", err)
 	}
-	if identity2.NodeID != "node-full" {
-		t.Errorf("second call NodeID = %q, want %q", identity2.NodeID, "node-full")
+	if identity2.NodeID != testNodeIDAlt {
+		t.Errorf("second call NodeID = %q, want %q", identity2.NodeID, testNodeIDAlt)
 	}
 }
 
@@ -1040,8 +1150,9 @@ func TestRegistrar_RejectsMalformedNSK(t *testing.T) {
 	}
 }
 
-// A valid nsk decodes to the raw AES-256-GCM key, while the identity keeps the
-// encoded form for the Authorization header.
+// A valid nsk decodes to the raw AES-256-GCM key; the Authorization header
+// carries the envelope BearerToken assembles from it, never this decoded key
+// nor the stored encoded form.
 func TestNodeIdentity_SecretKeyDecodesNSK(t *testing.T) {
 	id := &NodeIdentity{NodeSecretKey: testNSK}
 	key, err := id.SecretKey()
@@ -1100,7 +1211,7 @@ func TestRegistrar_LeavesPreviousAuthTokenOnFailedRegistration(t *testing.T) {
 	}
 
 	// The previous credential must still authenticate later requests.
-	if _, err := client.Heartbeat(context.Background(), "node-123", api.HeartbeatRequest{}); err != nil {
+	if _, err := client.Heartbeat(context.Background(), testNodeID, api.HeartbeatRequest{}); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 	mu.Lock()
@@ -1187,9 +1298,11 @@ func TestRegistrar_KeepsLegacyRawNSKIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	// writeIdentityFiles writes identity.json with node_id "node-legacy".
-	if identity.NodeID != "node-legacy" {
-		t.Errorf("NodeID = %q, want %q", identity.NodeID, "node-legacy")
+	// writeIdentityFiles writes identity.json with node_id testNodeID: legacy
+	// here means the pre-base64 nsk form, not a mock-era node id — real
+	// enrolments always carried the control plane's UUID.
+	if identity.NodeID != testNodeID {
+		t.Errorf("NodeID = %q, want %q", identity.NodeID, testNodeID)
 	}
 	// The raw secret doubles as the AES-256-GCM key and remains usable.
 	key, err := identity.SecretKey()
@@ -1272,7 +1385,7 @@ func TestRegistrar_LogsOrphanWhenSaveIdentityFails(t *testing.T) {
 	if !strings.Contains(out, "node allocated but not persisted") {
 		t.Errorf("logs = %q, want the orphan marker", out)
 	}
-	if !strings.Contains(out, "node-123") {
+	if !strings.Contains(out, testNodeID) {
 		t.Errorf("logs = %q, want the allocated node_id", out)
 	}
 	// The nsk must never reach the log.

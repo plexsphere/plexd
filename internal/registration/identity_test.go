@@ -1,6 +1,7 @@
 package registration
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -392,6 +393,70 @@ func TestLoadIdentity_AcceptsLegacyRawNSK(t *testing.T) {
 	}
 }
 
+// TestNodeIdentity_BearerToken_WireForm pins the exact bearer envelope the
+// control plane admits: `nsk_<env>_<base64url(node_id_bytes || nsk_bytes)>`
+// with unpadded base64url and a 48-byte payload. The literals are fixed so a
+// drift in the prefix, the env segment, the byte order, or the encoding
+// (padded, or non-URL alphabet) fails against a known-good string instead of
+// against a re-derivation sharing the same bug.
+func TestNodeIdentity_BearerToken_WireForm(t *testing.T) {
+	id := &NodeIdentity{
+		// 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3 || 32 x 0x2a
+		NodeID:        "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3",
+		NodeSecretKey: "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=",
+	}
+	got, err := id.BearerToken()
+	if err != nil {
+		t.Fatalf("BearerToken: %v", err)
+	}
+	const want = "nsk_plexd_AZCouKDAegqKCqCgoKCgoyoqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioq"
+	if got != want {
+		t.Errorf("BearerToken = %q, want %q", got, want)
+	}
+}
+
+// A legacy identity holds the raw 32-byte secret instead of its base64 form;
+// the envelope embeds those bytes directly, so an upgraded node authenticates
+// without rewriting its identity files.
+func TestNodeIdentity_BearerToken_LegacyRawNSK(t *testing.T) {
+	id := &NodeIdentity{
+		NodeID:        "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3",
+		NodeSecretKey: "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+	}
+	got, err := id.BearerToken()
+	if err != nil {
+		t.Fatalf("BearerToken: %v", err)
+	}
+	const want = "nsk_plexd_AZCouKDAegqKCqCgoKCgo0FCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaMDEyMzQ1"
+	if got != want {
+		t.Errorf("BearerToken = %q, want %q", got, want)
+	}
+}
+
+func TestNodeIdentity_BearerToken_Rejects(t *testing.T) {
+	validNSK := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x2a}, 32))
+	tests := []struct {
+		name   string
+		nodeID string
+		nsk    string
+	}{
+		{"mock-era node id", "node-123", validNSK},
+		{"empty node id", "", validNSK},
+		{"node id with non-hex groups", "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0zz", validNSK},
+		{"node id without dashes", "0190a8b8a0c07a0a8a0aa0a0a0a0a0a3", validNSK},
+		{"nsk not base64", "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3", "nsk-secret-value"},
+		{"nsk wrong length", "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x2a}, 31))},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			id := &NodeIdentity{NodeID: tc.nodeID, NodeSecretKey: tc.nsk}
+			if got, err := id.BearerToken(); err == nil {
+				t.Errorf("BearerToken = %q, want error", got)
+			}
+		})
+	}
+}
+
 func TestSaveIdentity_PartialWriteLeavesNoIdentityJSON(t *testing.T) {
 	dir := t.TempDir()
 
@@ -475,7 +540,7 @@ func TestSaveIdentity_PartialReRegistrationLeavesNoStaleIdentity(t *testing.T) {
 func writeIdentityFiles(t *testing.T, dir, nsk string) {
 	t.Helper()
 	files := map[string]string{
-		"identity.json":      `{"node_id":"node-legacy","mesh_ip":"100.64.0.7","signing_public_key":"spk"}`,
+		"identity.json":      `{"node_id":"` + testNodeID + `","mesh_ip":"100.64.0.7","signing_public_key":"spk"}`,
 		"private_key":        base64.StdEncoding.EncodeToString(make([]byte, 32)),
 		"node_secret_key":    nsk,
 		"signing_public_key": "spk",
