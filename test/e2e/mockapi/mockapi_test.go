@@ -116,12 +116,17 @@ const (
 	// capabilitiesBody is a contract-valid capability manifest: the flat
 	// binary_version / binary_checksum pair the handler requires, with the
 	// digest in the wire form (32 bytes, standard-padded base64).
-	capabilitiesBody       = `{"binary_version":"v1.2.3","binary_checksum":"f39/f39/f39/f39/f39/f39/f39/f39/f39/f39/f38="}`
-	reportBody             = `{"value":"cpu ok","workload_tag":"web"}`
-	metricsBatchBody       = `[{"group":"node_resources","name":"cpu.load","value":0.5,"timestamp":"2025-01-01T00:00:00Z"}]`
-	logsBatchBody          = `{"severity":"info","unit":"main","message":"started","timestamp":"2025-01-01T00:00:00Z"}`
-	auditBatchBody         = `{"source":"auditd","action":"execve","outcome":"success","timestamp":"2025-01-01T00:00:00Z"}`
-	integrityViolationBody = `{"type":"binary","path":"/usr/local/bin/plexd","expected_checksum":"abc","actual_checksum":"def","detail":"mismatch","timestamp":"2025-01-01T00:00:00Z"}`
+	capabilitiesBody = `{"binary_version":"v1.2.3","binary_checksum":"f39/f39/f39/f39/f39/f39/f39/f39/f39/f39/f38="}`
+	reportBody       = `{"value":"cpu ok","workload_tag":"web"}`
+	metricsBatchBody = `[{"group":"node_resources","name":"cpu.load","value":0.5,"timestamp":"2025-01-01T00:00:00Z"}]`
+	logsBatchBody    = `{"severity":"info","unit":"main","message":"started","timestamp":"2025-01-01T00:00:00Z"}`
+	auditBatchBody   = `{"source":"auditd","action":"execve","outcome":"success","timestamp":"2025-01-01T00:00:00Z"}`
+	// wireDigest is a 32-byte SHA-256 digest in the wire form the contract's
+	// checksum fields carry.
+	wireDigest             = `f39/f39/f39/f39/f39/f39/f39/f39/f39/f39/f38=`
+	integrityViolationBody = `{"violations":[{"kind":"binary_checksum","detected_by":"startup_scan",` +
+		`"artifact_id":"/usr/local/bin/plexd","observed_checksum":"` + wireDigest + `",` +
+		`"expected_checksum":"` + wireDigest + `"}]}`
 )
 
 // doRequest creates and sends an HTTP request with the given method, url, and body.
@@ -1445,7 +1450,7 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/"+testMockNodeID+"/sessions/sess-001", `{"tcp":{"phase":"session_started"}}`)
 	resp.Body.Close()
-	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/integrity/violations", integrityViolationBody)
+	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/integrity-violations", integrityViolationBody)
 	resp.Body.Close()
 
 	// Inject one SSE event.
@@ -1540,7 +1545,7 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPost, "/v1/nodes/node-1/logs", logsBatchBody},
 		{http.MethodPost, "/v1/nodes/node-1/audit", auditBatchBody},
 		{http.MethodPost, "/v1/nodes/" + testMockNodeID + "/sessions/sess-conc", `{"tcp":{"phase":"session_started"}}`},
-		{http.MethodPost, "/v1/nodes/node-1/integrity/violations", integrityViolationBody},
+		{http.MethodPost, "/v1/nodes/node-1/integrity-violations", integrityViolationBody},
 		{http.MethodPost, "/test/inject-event", `{"id":"e1","type":"conc","payload":{},"signature":"s"}`},
 	}
 
@@ -3049,13 +3054,26 @@ func TestRetiredRoutes_Return404(t *testing.T) {
 // Integrity violation endpoint
 // ---------------------------------------------------------------------------
 
-func TestIntegrityViolation_Returns204AndCounter(t *testing.T) {
+func TestIntegrityViolations_Returns200AndCounter(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/integrity/violations", integrityViolationBody)
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/integrity-violations", integrityViolationBody)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	// The contract's receipt, not an empty 204: the rows and the alert are
+	// committed before the response is written.
+	var receipt api.IntegrityViolationsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&receipt); err != nil {
+		t.Fatalf("decode receipt: %v", err)
+	}
+	if receipt.ViolationCount != 1 {
+		t.Errorf("violation_count = %d, want 1", receipt.ViolationCount)
+	}
+	if receipt.AcceptedAt.IsZero() {
+		t.Error("accepted_at is unset")
 	}
 
 	a := getAssertions(t, ts.URL)
@@ -3064,20 +3082,182 @@ func TestIntegrityViolation_Returns204AndCounter(t *testing.T) {
 	}
 }
 
-func TestIntegrityViolation_InvalidBody_Returns400(t *testing.T) {
-	_, ts := newTestServer(t)
+// TestIntegrityViolations_RefusesNonContractBody walks every way an agent can
+// diverge from the contract's envelope. The fixture used to accept whatever the
+// agent sent, so the report was dead on every node and the suite stayed green;
+// each case here is a divergence that must now fail the suite instead.
+func TestIntegrityViolations_RefusesNonContractBody(t *testing.T) {
+	entry := func(fields string) string {
+		return `{"violations":[{` + fields + `}]}`
+	}
+	valid := `"kind":"binary_checksum","detected_by":"startup_scan",` +
+		`"artifact_id":"/usr/local/bin/plexd","observed_checksum":"` + wireDigest + `"`
 
-	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/integrity/violations", "not-json")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	tests := []struct {
+		name     string
+		body     string
+		wantCode string
+	}{
+		{"not json", "not-json", "malformed_integrity_violations_request"},
+		{
+			// The shape the agent sent before this endpoint was corrected.
+			"bare entry, no envelope",
+			`{"type":"binary","path":"/usr/local/bin/plexd","expected_checksum":"abc",` +
+				`"actual_checksum":"def","detail":"mismatch","timestamp":"2025-01-01T00:00:00Z"}`,
+			"malformed_integrity_violations_request",
+		},
+		{"unknown field", entry(valid + `,"detail":"mismatch"`), "malformed_integrity_violations_request"},
+		{"empty batch", `{"violations":[]}`, "integrity_violations_empty"},
+		{"missing violations key", `{}`, "integrity_violations_empty"},
+		{
+			"kind outside the enum",
+			entry(`"kind":"binary","detected_by":"startup_scan","artifact_id":"p","observed_checksum":"` + wireDigest + `"`),
+			"integrity_violation_kind_invalid",
+		},
+		{
+			"detected_by missing",
+			entry(`"kind":"binary_checksum","artifact_id":"p","observed_checksum":"` + wireDigest + `"`),
+			"integrity_violation_detected_by_invalid",
+		},
+		{
+			"detected_by outside the enum",
+			entry(`"kind":"hook_checksum","detected_by":"periodic","artifact_id":"p","observed_checksum":"` + wireDigest + `"`),
+			"integrity_violation_detected_by_invalid",
+		},
+		{
+			"artifact_id whitespace only",
+			entry(`"kind":"binary_checksum","detected_by":"startup_scan","artifact_id":"  ","observed_checksum":"` + wireDigest + `"`),
+			"integrity_violation_artifact_id_empty",
+		},
+		{
+			// A hex digest decodes as base64 to 48 bytes, which is the mistake
+			// this check exists for.
+			"hex digest",
+			entry(`"kind":"binary_checksum","detected_by":"startup_scan","artifact_id":"p",` +
+				`"observed_checksum":"5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"`),
+			"integrity_violation_checksum_invalid",
+		},
+		{
+			"observed_checksum missing on a checksum kind",
+			entry(`"kind":"hook_checksum","detected_by":"pre_dispatch","artifact_id":"p"`),
+			"integrity_violation_checksum_invalid",
+		},
+		{
+			"fingerprint on a checksum kind",
+			entry(valid + `,"observed_fingerprint":"SHA256:abc"`),
+			"integrity_violation_kind_mismatch",
+		},
+		{
+			"checksum on the host-key kind",
+			entry(`"kind":"ssh_host_key","detected_by":"startup_scan","artifact_id":"k",` +
+				`"observed_checksum":"` + wireDigest + `","observed_fingerprint":"SHA256:abc"`),
+			"integrity_violation_kind_mismatch",
+		},
+		{
+			"host-key fingerprint outside the canonical form",
+			entry(`"kind":"ssh_host_key","detected_by":"startup_scan","artifact_id":"k",` +
+				`"observed_fingerprint":"MD5:aa:bb"`),
+			"integrity_violation_host_key_fingerprint_invalid",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			path := "/v1/nodes/node-1/integrity-violations"
+
+			resp := doRequest(t, http.MethodPost, ts.URL+path, tt.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			}
+
+			var problem map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			if problem["code"] != tt.wantCode {
+				t.Errorf("code = %v, want %q", problem["code"], tt.wantCode)
+			}
+
+			// A refused batch must not be counted as delivered.
+			if a := getAssertions(t, ts.URL); a.IntegrityViolationCount != 0 {
+				t.Errorf("integrity_violation_count = %d, want 0", a.IntegrityViolationCount)
+			}
+		})
 	}
 }
 
-func TestIntegrityViolation_WrongMethod_Returns405(t *testing.T) {
+func TestIntegrityViolations_OversizedBatch_Returns400(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/integrity/violations")
+	entry := `{"kind":"hook_checksum","detected_by":"inotify","artifact_id":"h",` +
+		`"observed_checksum":"` + wireDigest + `"}`
+	entries := make([]string, api.MaxIntegrityViolationsPerBatch+1)
+	for i := range entries {
+		entries[i] = entry
+	}
+	body := `{"violations":[` + strings.Join(entries, ",") + `]}`
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/integrity-violations", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	var problem map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem["code"] != "integrity_violations_too_many" {
+		t.Errorf("code = %v, want %q", problem["code"], "integrity_violations_too_many")
+	}
+}
+
+func TestIntegrityViolations_OversizedBody_Returns413(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	// One entry whose artifact_id alone pushes the envelope past the 32 KiB cap.
+	body := `{"violations":[{"kind":"binary_checksum","detected_by":"startup_scan","artifact_id":"` +
+		strings.Repeat("a", 40*1024) + `","observed_checksum":"` + wireDigest + `"}]}`
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/integrity-violations", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+
+	var problem map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem["code"] != "integrity_violations_body_too_large" {
+		t.Errorf("code = %v, want %q", problem["code"], "integrity_violations_body_too_large")
+	}
+}
+
+// TestIntegrityViolations_AcceptsHostKeyEntry pins the third kind: the agent's
+// host-key detector is the only producer of a fingerprint pair, and the fixture
+// must accept it as readily as it accepts a checksum entry.
+func TestIntegrityViolations_AcceptsHostKeyEntry(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	body := `{"violations":[{"kind":"ssh_host_key","detected_by":"startup_scan",` +
+		`"artifact_id":"/var/lib/plexd/ssh_host_ed25519_key",` +
+		`"observed_fingerprint":"SHA256:6QGz1Q4iE2zG5p2N3oRZb8ZsT4nKqJgY3oZmP8eFvWk",` +
+		`"expected_fingerprint":"SHA256:7QGz1Q4iE2zG5p2N3oRZb8ZsT4nKqJgY3oZmP8eFvWk"}]}`
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/integrity-violations", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+func TestIntegrityViolations_WrongMethod_Returns405(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/v1/nodes/node-1/integrity-violations")
 	if err != nil {
 		t.Fatalf("GET integrity violations: %v", err)
 	}
