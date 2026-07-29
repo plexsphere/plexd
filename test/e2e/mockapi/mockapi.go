@@ -454,7 +454,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/nodes/{id}/logs", s.handleLogs)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/audit", s.handleAudit)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/sessions/{sid}", s.handleSessionActivity)
-	s.mux.HandleFunc("POST /v1/nodes/{id}/integrity/violations", s.handleIntegrityViolation)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/integrity-violations", s.handleIntegrityViolations)
 
 	// Release channel fixture (outside /v1: this plays the GitHub release host,
 	// not the control plane).
@@ -486,7 +486,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/logs", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/audit", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/sessions/{sid}", methodNotAllowed)
-	s.mux.HandleFunc("/v1/nodes/{id}/integrity/violations", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/integrity-violations", methodNotAllowed)
 	s.mux.HandleFunc("/releases/{tag}/{asset}", methodNotAllowed)
 	s.mux.HandleFunc("/test/state", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-state", methodNotAllowed)
@@ -1885,14 +1885,118 @@ func (s *Server) handleSessionActivity(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleIntegrityViolation handles POST /v1/nodes/{id}/integrity/violations.
-func (s *Server) handleIntegrityViolation(w http.ResponseWriter, r *http.Request) {
-	var req api.IntegrityViolationReport
-	if !s.decodeBody(w, r, "integrity_violation", &req) {
+// handleIntegrityViolations handles POST /v1/nodes/{id}/integrity-violations. It
+// strict-decodes the contract's batch envelope and enforces the invariants the
+// real handler runs every entry through: a 1-to-128 entry batch, closed kind and
+// detected_by enums, a non-empty artifact_id, 32-byte base64 digests for the two
+// checksum kinds, canonical fingerprints for the host-key kind, and the per-kind
+// guard that refuses a checksum entry carrying a fingerprint or the reverse.
+//
+// Strictness is the point, as it is for the capability manifest. The fixture
+// used to register the agent's own route and decode the agent's own shape, so
+// the agent's reports agreed with the fixture and with nothing else: the real
+// endpoint had never seen one. A violation never fires during an e2e run, so
+// this handler is the only place the divergence can be caught.
+func (s *Server) handleIntegrityViolations(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxIntegrityViolationsBody)
+	data, err := s.captureBody("integrity_violations", r)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, "integrity_violations_body_too_large",
+				"request body exceeds the 32768-byte integrity-violations envelope cap")
+			return
+		}
+		writeProblem(w, r, http.StatusBadRequest, "malformed_integrity_violations_request", "invalid request body")
 		return
 	}
+
+	var req api.IntegrityViolationsRequest
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_integrity_violations_request",
+			"request body is not a valid IntegrityViolationsRequest envelope: "+err.Error())
+		return
+	}
+
+	if len(req.Violations) == 0 {
+		writeProblem(w, r, http.StatusBadRequest, "integrity_violations_empty",
+			"the violations array is empty")
+		return
+	}
+	if len(req.Violations) > api.MaxIntegrityViolationsPerBatch {
+		writeProblem(w, r, http.StatusBadRequest, "integrity_violations_too_many",
+			fmt.Sprintf("the violations array carries %d entries, at most %d are accepted",
+				len(req.Violations), api.MaxIntegrityViolationsPerBatch))
+		return
+	}
+	for _, entry := range req.Violations {
+		if code, detail := checkIntegrityViolation(entry); code != "" {
+			writeProblem(w, r, http.StatusBadRequest, code, detail)
+			return
+		}
+	}
+
 	s.integrityViolationCount.Add(1)
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, api.IntegrityViolationsResponse{
+		AcceptedAt:     time.Now().UTC(),
+		ViolationCount: len(req.Violations),
+	})
+}
+
+// maxIntegrityViolationsBody is the contract's 32 KiB cap on the batch envelope.
+const maxIntegrityViolationsBody = 32 * 1024
+
+// checkIntegrityViolation validates one batch entry against the contract's
+// per-violation invariants, returning the problem code and detail of the first
+// one it breaks, or an empty code when the entry is valid.
+func checkIntegrityViolation(v api.IntegrityViolationReport) (code, detail string) {
+	switch v.Kind {
+	case api.IntegrityKindBinaryChecksum, api.IntegrityKindHookChecksum, api.IntegrityKindSSHHostKey:
+	default:
+		return "integrity_violation_kind_invalid",
+			fmt.Sprintf("kind %q is outside {binary_checksum, hook_checksum, ssh_host_key}", v.Kind)
+	}
+
+	switch v.DetectedBy {
+	case api.IntegrityDetectorStartupScan, api.IntegrityDetectorInotify, api.IntegrityDetectorPreDispatch:
+	default:
+		return "integrity_violation_detected_by_invalid",
+			fmt.Sprintf("detected_by %q is outside {startup_scan, inotify, pre_dispatch}", v.DetectedBy)
+	}
+
+	if strings.TrimSpace(v.ArtifactID) == "" {
+		return "integrity_violation_artifact_id_empty", "artifact_id is empty or whitespace-only"
+	}
+
+	if v.Kind == api.IntegrityKindSSHHostKey {
+		if v.ObservedChecksum != "" || v.ExpectedChecksum != "" {
+			return "integrity_violation_kind_mismatch", "an ssh_host_key entry must not carry a checksum"
+		}
+		if !sshFingerprintRe.MatchString(v.ObservedFingerprint) {
+			return "integrity_violation_host_key_fingerprint_invalid",
+				"observed_fingerprint must match SHA256:<base64>"
+		}
+		if v.ExpectedFingerprint != "" && !sshFingerprintRe.MatchString(v.ExpectedFingerprint) {
+			return "integrity_violation_host_key_fingerprint_invalid",
+				"expected_fingerprint must match SHA256:<base64>"
+		}
+		return "", ""
+	}
+
+	if v.ObservedFingerprint != "" || v.ExpectedFingerprint != "" {
+		return "integrity_violation_kind_mismatch", "a checksum entry must not carry a fingerprint"
+	}
+	if !isBase64Digest(v.ObservedChecksum) {
+		return "integrity_violation_checksum_invalid",
+			"observed_checksum must be 32 bytes, standard-padded base64"
+	}
+	if v.ExpectedChecksum != "" && !isBase64Digest(v.ExpectedChecksum) {
+		return "integrity_violation_checksum_invalid",
+			"expected_checksum must be 32 bytes, standard-padded base64"
+	}
+	return "", ""
 }
 
 // SetState updates the mutable state fixture returned by GET /v1/nodes/{id}/state
