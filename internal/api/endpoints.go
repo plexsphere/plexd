@@ -334,9 +334,24 @@ func (c *ControlPlane) ReportSessionActivity(ctx context.Context, nodeID, sessio
 	return c.doRequest(ctx, http.MethodPost, path, req, nil)
 }
 
-// ReportIntegrityViolation reports a file integrity violation to the control plane.
-// POST /v1/nodes/{node_id}/integrity/violations
-func (c *ControlPlane) ReportIntegrityViolation(ctx context.Context, nodeID string, req IntegrityViolationReport) error {
-	path := fmt.Sprintf("/v1/nodes/%s/integrity/violations", url.PathEscape(nodeID))
+// ReportIntegrityViolations reports a batch of integrity violations to the
+// control plane. The 200 response carries a commit timestamp and an echo of the
+// batch size; the agent keeps no replay queue to reconcile them against, so the
+// body is not decoded and a non-2xx surfaces as an *APIError.
+//
+// The batch bounds are checked here rather than left to the server: the two
+// codes it answers with (integrity_violations_empty,
+// integrity_violations_too_many) describe a caller mistake, and a refused
+// request would take every violation in it down.
+// POST /v1/nodes/{node_id}/integrity-violations
+func (c *ControlPlane) ReportIntegrityViolations(ctx context.Context, nodeID string, req IntegrityViolationsRequest) error {
+	if len(req.Violations) == 0 {
+		return fmt.Errorf("api: report integrity violations: %w", ErrIntegrityViolationsEmpty)
+	}
+	if len(req.Violations) > MaxIntegrityViolationsPerBatch {
+		return fmt.Errorf("api: report integrity violations: %d entries: %w",
+			len(req.Violations), ErrIntegrityViolationsTooMany)
+	}
+	path := fmt.Sprintf("/v1/nodes/%s/integrity-violations", url.PathEscape(nodeID))
 	return c.doRequest(ctx, http.MethodPost, path, req, nil)
 }

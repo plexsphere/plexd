@@ -1244,45 +1244,122 @@ func TestFetchSecret_PathParametersEscaped(t *testing.T) {
 	}
 }
 
-func TestReportIntegrityViolation_Success(t *testing.T) {
+// testWireDigest is a 32-byte SHA-256 digest in the base64 form the contract's
+// checksum fields carry.
+const testWireDigest = "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg="
+
+func TestReportIntegrityViolations_Success(t *testing.T) {
+	var body []byte
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("method = %s, want POST", r.Method)
 		}
-		if r.URL.Path != "/v1/nodes/n1/integrity/violations" {
-			t.Errorf("path = %s, want /v1/nodes/n1/integrity/violations", r.URL.Path)
+		if r.URL.Path != "/v1/nodes/n1/integrity-violations" {
+			t.Errorf("path = %s, want /v1/nodes/n1/integrity-violations", r.URL.Path)
 		}
 
-		var req IntegrityViolationReport
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-		if req.Type != "binary" {
-			t.Errorf("Type = %q, want %q", req.Type, "binary")
-		}
-		if req.Path != "/usr/local/bin/plexd" {
-			t.Errorf("Path = %q, want %q", req.Path, "/usr/local/bin/plexd")
-		}
-		if req.ExpectedChecksum != "abc123" {
-			t.Errorf("ExpectedChecksum = %q, want %q", req.ExpectedChecksum, "abc123")
-		}
-		if req.ActualChecksum != "def456" {
-			t.Errorf("ActualChecksum = %q, want %q", req.ActualChecksum, "def456")
+		var err error
+		if body, err = io.ReadAll(r.Body); err != nil {
+			t.Fatalf("read request: %v", err)
 		}
 
-		w.WriteHeader(http.StatusNoContent)
+		// The contract answers 200 with a receipt, not 204.
+		_ = json.NewEncoder(w).Encode(IntegrityViolationsResponse{
+			AcceptedAt:     time.Now().UTC(),
+			ViolationCount: 1,
+		})
 	})
 
-	err := client.ReportIntegrityViolation(context.Background(), "n1", IntegrityViolationReport{
-		Type:             "binary",
-		Path:             "/usr/local/bin/plexd",
-		ExpectedChecksum: "abc123",
-		ActualChecksum:   "def456",
-		Detail:           "binary checksum mismatch",
-		Timestamp:        time.Now(),
+	err := client.ReportIntegrityViolations(context.Background(), "n1", IntegrityViolationsRequest{
+		Violations: []IntegrityViolationReport{{
+			Kind:             IntegrityKindBinaryChecksum,
+			DetectedBy:       IntegrityDetectorStartupScan,
+			ArtifactID:       "/usr/local/bin/plexd",
+			ObservedChecksum: testWireDigest,
+			ExpectedChecksum: testWireDigest,
+		}},
 	})
 	if err != nil {
-		t.Fatalf("ReportIntegrityViolation: %v", err)
+		t.Fatalf("ReportIntegrityViolations: %v", err)
+	}
+
+	// The batch envelope, not a bare entry: a body the handler strict-decodes,
+	// so an extra or a renamed key refuses the whole request.
+	want := `{"violations":[{"kind":"binary_checksum","detected_by":"startup_scan",` +
+		`"artifact_id":"/usr/local/bin/plexd","observed_checksum":"` + testWireDigest + `",` +
+		`"expected_checksum":"` + testWireDigest + `"}]}`
+	if got := strings.TrimSpace(string(body)); got != want {
+		t.Errorf("request body =\n  %s\nwant\n  %s", got, want)
+	}
+}
+
+func TestReportIntegrityViolations_HostKeyEntryOmitsChecksums(t *testing.T) {
+	var body []byte
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		if body, err = io.ReadAll(r.Body); err != nil {
+			t.Fatalf("read request: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(IntegrityViolationsResponse{ViolationCount: 1})
+	})
+
+	err := client.ReportIntegrityViolations(context.Background(), "n1", IntegrityViolationsRequest{
+		Violations: []IntegrityViolationReport{{
+			Kind:                IntegrityKindSSHHostKey,
+			DetectedBy:          IntegrityDetectorStartupScan,
+			ArtifactID:          "/var/lib/plexd/ssh_host_ed25519_key",
+			ObservedFingerprint: "SHA256:6QGz1Q4iE2zG5p2N3oRZb8ZsT4nKqJgY3oZmP8eFvWk",
+			ExpectedFingerprint: "SHA256:7QGz1Q4iE2zG5p2N3oRZb8ZsT4nKqJgY3oZmP8eFvWk",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("ReportIntegrityViolations: %v", err)
+	}
+
+	// An unset checksum must be absent, not present and empty: the contract
+	// refuses a host-key entry carrying a checksum key with 400
+	// integrity_violation_kind_mismatch.
+	for _, key := range []string{"observed_checksum", "expected_checksum"} {
+		if strings.Contains(string(body), key) {
+			t.Errorf("host key entry carries %q: %s", key, body)
+		}
+	}
+}
+
+func TestReportIntegrityViolations_RefusesOutOfRangeBatch(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("an out-of-range batch reached the control plane: %s", r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	entry := IntegrityViolationReport{
+		Kind:             IntegrityKindHookChecksum,
+		DetectedBy:       IntegrityDetectorInotify,
+		ArtifactID:       "/etc/plexd/hooks/deploy",
+		ObservedChecksum: testWireDigest,
+	}
+	oversized := make([]IntegrityViolationReport, MaxIntegrityViolationsPerBatch+1)
+	for i := range oversized {
+		oversized[i] = entry
+	}
+
+	tests := []struct {
+		name       string
+		violations []IntegrityViolationReport
+		want       error
+	}{
+		{"nil", nil, ErrIntegrityViolationsEmpty},
+		{"empty", []IntegrityViolationReport{}, ErrIntegrityViolationsEmpty},
+		{"over the ceiling", oversized, ErrIntegrityViolationsTooMany},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := client.ReportIntegrityViolations(context.Background(), "n1",
+				IntegrityViolationsRequest{Violations: tt.violations})
+			if !errors.Is(err, tt.want) {
+				t.Errorf("error = %v, want %v", err, tt.want)
+			}
+		})
 	}
 }
 
