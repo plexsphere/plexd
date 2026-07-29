@@ -6,16 +6,18 @@ feature: PXD-0023
 
 # CI Workflow
 
-The `.github/workflows/ci.yml` workflow runs lint checks, unit tests, and integration tests on every push to `main` and every pull request. All three jobs run in parallel on `ubuntu-latest` with no inter-job dependencies.
+The `.github/workflows/ci.yml` workflow runs lint checks, unit tests, and integration tests on every pull request. All three jobs run in parallel on `ubuntu-latest` with no inter-job dependencies.
 
 ## Trigger Events
 
-| Event          | Filter             | Description                                     |
-|----------------|--------------------|-------------------------------------------------|
-| `push`         | `branches: [main]` | Runs on every push to the `main` branch         |
-| `pull_request` | (all)              | Runs on opened, synchronized, and reopened PRs  |
+| Event               | Filter | Description                                    |
+|---------------------|--------|------------------------------------------------|
+| `pull_request`      | (all)  | Runs on opened, synchronized, and reopened PRs |
+| `workflow_dispatch` | —      | Manual run against any branch                  |
 
-Pushes to non-main branches without an open PR do not trigger the workflow.
+The workflow does not run on pushes to `main`. A `pull_request` run checks out the merge result rather than the branch head, so the commit that lands on `main` is the commit CI already tested; repeating the run after the merge tests it a second time. Use `workflow_dispatch` to verify `main` on demand — after a merge whose base had moved since the PR run, for example.
+
+A branch without an open PR does not trigger the workflow on push.
 
 ## Jobs
 
