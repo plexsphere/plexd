@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -914,27 +916,70 @@ func TestTypesNodeStateSession(t *testing.T) {
 	}
 }
 
-func TestTypesIntegrityViolationReport(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := IntegrityViolationReport{
-		Type:             "binary",
-		Path:             "/usr/local/bin/plexd",
-		ExpectedChecksum: "abc123",
-		ActualChecksum:   "def456",
-		Detail:           "binary checksum mismatch on startup",
-		Timestamp:        now,
+func TestTypesIntegrityViolationsRequest(t *testing.T) {
+	digest := base64.StdEncoding.EncodeToString(make([]byte, sha256.Size))
+	orig := IntegrityViolationsRequest{
+		Violations: []IntegrityViolationReport{{
+			Kind:             IntegrityKindBinaryChecksum,
+			DetectedBy:       IntegrityDetectorStartupScan,
+			ArtifactID:       "/usr/local/bin/plexd",
+			ExpectedChecksum: digest,
+			ObservedChecksum: digest,
+		}},
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Verify snake_case keys.
+	var raw struct {
+		Violations []map[string]json.RawMessage `json:"violations"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.Violations) != 1 {
+		t.Fatalf("violations = %d entries, want 1", len(raw.Violations))
+	}
+
+	entry := raw.Violations[0]
+	for _, key := range []string{"kind", "detected_by", "artifact_id", "expected_checksum", "observed_checksum"} {
+		if _, ok := entry[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+	// The handler decodes with DisallowUnknownFields, so the two fields the
+	// agent used to send must be gone rather than merely unread, and the
+	// fingerprint pair must stay absent on a checksum kind.
+	for _, key := range []string{"type", "path", "actual_checksum", "detail", "timestamp",
+		"observed_fingerprint", "expected_fingerprint"} {
+		if _, ok := entry[key]; ok {
+			t.Errorf("unexpected JSON key %q on a binary_checksum entry", key)
+		}
+	}
+}
+
+func TestTypesIntegrityViolationReport_HostKeyOmitsChecksums(t *testing.T) {
+	orig := IntegrityViolationReport{
+		Kind:                IntegrityKindSSHHostKey,
+		DetectedBy:          IntegrityDetectorStartupScan,
+		ArtifactID:          "/var/lib/plexd/ssh_host_ed25519_key",
+		ObservedFingerprint: "SHA256:6QGz1Q4iE2zG5p2N3oRZb8ZsT4nKqJgY3oZmP8eFvWk",
+		ExpectedFingerprint: "SHA256:7QGz1Q4iE2zG5p2N3oRZb8ZsT4nKqJgY3oZmP8eFvWk",
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"type", "path", "expected_checksum", "actual_checksum", "detail", "timestamp"} {
+	for _, key := range []string{"observed_fingerprint", "expected_fingerprint"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
+		}
+	}
+	for _, key := range []string{"observed_checksum", "expected_checksum"} {
+		if _, ok := raw[key]; ok {
+			t.Errorf("ssh_host_key entry carries %q, which the contract refuses", key)
 		}
 	}
 }

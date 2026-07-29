@@ -64,6 +64,14 @@ var (
 // when the requested secret name is outside the contract's name grammar.
 var ErrSecretNameInvalid = fmt.Errorf("secret name is outside the grammar %s", secretNamePattern)
 
+// ErrIntegrityViolationsEmpty and ErrIntegrityViolationsTooMany are returned by
+// ReportIntegrityViolations before any HTTP request when the batch is outside
+// the contract's 1..MaxIntegrityViolationsPerBatch bounds.
+var (
+	ErrIntegrityViolationsEmpty   = errors.New("integrity violation batch is empty")
+	ErrIntegrityViolationsTooMany = fmt.Errorf("integrity violation batch exceeds %d entries", MaxIntegrityViolationsPerBatch)
+)
+
 // IsIngestNotProvisioned reports whether err is the control plane's refusal to
 // accept observability ingest because it is not provisioned for the node: a 501
 // carrying the observability_ingest_not_provisioned problem code.

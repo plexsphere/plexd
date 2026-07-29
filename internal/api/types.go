@@ -667,17 +667,103 @@ const (
 )
 
 // ---------------------------------------------------------------------------
-// Integrity  POST /v1/nodes/{node_id}/integrity/violations
+// Integrity  POST /v1/nodes/{node_id}/integrity-violations
 // ---------------------------------------------------------------------------
 
-// IntegrityViolationReport is sent when a file integrity check fails.
+// IntegrityViolationKind is the artifact class a violation applies to. The
+// control plane canonicalises every entry through a value-object constructor
+// that refuses anything outside this set with 400
+// integrity_violation_kind_invalid, so the type exists to keep an unchecked
+// string from reaching the wire in the first place.
+type IntegrityViolationKind string
+
+const (
+	// IntegrityKindBinaryChecksum reports the agent's own binary.
+	IntegrityKindBinaryChecksum IntegrityViolationKind = "binary_checksum"
+	// IntegrityKindHookChecksum reports a hook script.
+	IntegrityKindHookChecksum IntegrityViolationKind = "hook_checksum"
+	// IntegrityKindSSHHostKey reports the mesh SSH host key.
+	IntegrityKindSSHHostKey IntegrityViolationKind = "ssh_host_key"
+)
+
+// IntegrityDetector is the on-node detector that surfaced a violation. Like
+// IntegrityViolationKind the set is closed; a value outside it is refused with
+// 400 integrity_violation_detected_by_invalid.
+type IntegrityDetector string
+
+const (
+	// IntegrityDetectorStartupScan is the agent's own sweep of the artifacts it
+	// holds baselines for. The contract has no value for a periodic re-scan, so
+	// the interval-driven sweep reports this one too.
+	IntegrityDetectorStartupScan IntegrityDetector = "startup_scan"
+	// IntegrityDetectorInotify is the hooks-directory watcher reacting to a
+	// filesystem event.
+	IntegrityDetectorInotify IntegrityDetector = "inotify"
+	// IntegrityDetectorPreDispatch is the check that runs immediately before a
+	// hook executes.
+	IntegrityDetectorPreDispatch IntegrityDetector = "pre_dispatch"
+)
+
+// MaxIntegrityViolationsPerBatch is the contract's per-request ceiling on the
+// violations array. A larger batch is refused whole with 400
+// integrity_violations_too_many, and an empty one with
+// integrity_violations_empty.
+const MaxIntegrityViolationsPerBatch = 128
+
+// IntegrityViolationsRequest is the body of
+// POST /v1/nodes/{node_id}/integrity-violations: a batch of the tamper-evidence
+// divergences the agent detected locally. The endpoint takes a batch even when
+// the agent has a single violation to report, so a lone finding travels as a
+// one-entry array rather than as a bare object.
+type IntegrityViolationsRequest struct {
+	// Violations carries between 1 and MaxIntegrityViolationsPerBatch entries.
+	Violations []IntegrityViolationReport `json:"violations"`
+}
+
+// IntegrityViolationReport is one entry of an IntegrityViolationsRequest.
+//
+// The handler decodes the envelope with DisallowUnknownFields, so this struct
+// carries the contract's fields and nothing else — in particular there is no
+// timestamp (the control plane stamps its own) and no free-text detail field.
+//
+// Kind decides which digest pair is legal. A binary_checksum or hook_checksum
+// entry carries the checksums and no fingerprint; an ssh_host_key entry carries
+// the fingerprints and no checksum. Crossing them is refused with 400
+// integrity_violation_kind_mismatch, which is why the four digest fields are
+// omitempty: an unset one must be absent from the JSON, not present and empty.
 type IntegrityViolationReport struct {
-	Type             string    `json:"type"`
-	Path             string    `json:"path"`
-	ExpectedChecksum string    `json:"expected_checksum"`
-	ActualChecksum   string    `json:"actual_checksum"`
-	Detail           string    `json:"detail"`
-	Timestamp        time.Time `json:"timestamp"`
+	Kind       IntegrityViolationKind `json:"kind"`
+	DetectedBy IntegrityDetector      `json:"detected_by"`
+	// ArtifactID identifies the affected artifact — a hook path, the binary
+	// path, or the host-key file. Non-empty after trimming, at most 4096 bytes.
+	ArtifactID string `json:"artifact_id"`
+	// ObservedChecksum is the SHA-256 the agent computed, as 32 raw bytes in
+	// standard-padded base64 (see integrity.WireChecksum). Required for the
+	// checksum kinds; anything that does not decode to exactly 32 bytes is
+	// refused with 400 integrity_violation_checksum_invalid.
+	ObservedChecksum string `json:"observed_checksum,omitempty"`
+	// ExpectedChecksum is the baseline digest, same encoding as
+	// ObservedChecksum.
+	ExpectedChecksum string `json:"expected_checksum,omitempty"`
+	// ObservedFingerprint is the OpenSSH host-key fingerprint the agent
+	// observed, in the canonical `SHA256:<base64>` form. Required for the
+	// ssh_host_key kind.
+	ObservedFingerprint string `json:"observed_fingerprint,omitempty"`
+	// ExpectedFingerprint is the baseline fingerprint, same form as
+	// ObservedFingerprint.
+	ExpectedFingerprint string `json:"expected_fingerprint,omitempty"`
+}
+
+// IntegrityViolationsResponse is the 200 body of
+// POST /v1/nodes/{node_id}/integrity-violations. The work is synchronous — every
+// row and the integrity_alert outbox event are committed before the response is
+// written — so the status is 200 rather than 202.
+type IntegrityViolationsResponse struct {
+	// AcceptedAt is the server-side commit timestamp.
+	AcceptedAt time.Time `json:"accepted_at"`
+	// ViolationCount echoes the number of rows persisted, matching the length
+	// of the violations array on input.
+	ViolationCount int `json:"violation_count"`
 }
 
 // ---------------------------------------------------------------------------
