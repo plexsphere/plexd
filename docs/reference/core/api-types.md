@@ -714,6 +714,81 @@ is `204 No Content`.
 | `TerminatedByPlexdClose`     | `plexd_close`    | plexd closed the session locally              |
 | `TerminatedByOperatorRevoke` | `operator_revoke`| Operator's access was revoked. Part of the wire enum; **never produced by plexd**, which cannot tell a revocation from a block the control plane failed to serve |
 
+## Integrity
+
+### `POST /v1/nodes/{node_id}/integrity-violations`
+
+A batch of the tamper-evidence divergences the agent detected on the node: a
+mismatched binary checksum, a tampered hook checksum, or a rotated SSH host key.
+The endpoint takes a batch even for a single finding, so a lone violation travels
+as a one-entry array rather than as a bare object. Success is `200 OK` with a
+receipt, not `202`: the violation rows and the `integrity_alert` outbox event are
+committed before the response is written.
+
+The handler decodes with `DisallowUnknownFields` and caps the body at 32 KiB, so
+an unknown or renamed field refuses the whole request.
+
+**IntegrityViolationsRequest**
+
+| Field        | Type                         | JSON Tag       | Description                                    |
+|--------------|------------------------------|----------------|------------------------------------------------|
+| `Violations` | `[]IntegrityViolationReport` | `"violations"` | 1 to `MaxIntegrityViolationsPerBatch` (128) entries |
+
+An empty array is refused with `400 integrity_violations_empty` and an oversized
+one with `integrity_violations_too_many`. `ReportIntegrityViolations` checks both
+bounds locally and returns `ErrIntegrityViolationsEmpty` or
+`ErrIntegrityViolationsTooMany` without sending, since a refused request would
+take every violation in it down.
+
+**IntegrityViolationReport**
+
+| Field                 | Type                     | JSON Tag                          | Description                                     |
+|-----------------------|--------------------------|-----------------------------------|-------------------------------------------------|
+| `Kind`                | `IntegrityViolationKind` | `"kind"`                          | Artifact class the divergence applies to        |
+| `DetectedBy`          | `IntegrityDetector`      | `"detected_by"`                   | On-node detector that surfaced it               |
+| `ArtifactID`          | `string`                 | `"artifact_id"`                   | Affected artifact; non-empty after trimming, at most 4096 bytes |
+| `ObservedChecksum`    | `string`                 | `"observed_checksum,omitempty"`   | Computed SHA-256, 32 raw bytes in standard-padded base64 |
+| `ExpectedChecksum`    | `string`                 | `"expected_checksum,omitempty"`   | Baseline digest, same encoding                  |
+| `ObservedFingerprint` | `string`                 | `"observed_fingerprint,omitempty"`| Observed host-key fingerprint, `SHA256:<base64>`|
+| `ExpectedFingerprint` | `string`                 | `"expected_fingerprint,omitempty"`| Baseline fingerprint, same form                 |
+
+`Kind` decides which digest pair is legal: a checksum kind carries the checksums
+and no fingerprint, the host-key kind carries the fingerprints and no checksum.
+Crossing them is refused with `400 integrity_violation_kind_mismatch`, which is
+why the four digest fields are `omitempty` — an unset one must be absent from the
+JSON rather than present and empty.
+
+The checksum fields are declared `format: byte`, so the hex form the integrity
+package works in decodes to 48 bytes and is refused with
+`integrity_violation_checksum_invalid`. `integrity.WireChecksum` converts hex into
+the wire form.
+
+**IntegrityViolationKind constants**
+
+| Constant                      | Value             | Description                       |
+|-------------------------------|-------------------|-----------------------------------|
+| `IntegrityKindBinaryChecksum` | `binary_checksum` | The agent's own binary            |
+| `IntegrityKindHookChecksum`   | `hook_checksum`   | A hook script                     |
+| `IntegrityKindSSHHostKey`     | `ssh_host_key`    | The mesh SSH host key             |
+
+**IntegrityDetector constants**
+
+| Constant                       | Value          | Description                                             |
+|--------------------------------|----------------|---------------------------------------------------------|
+| `IntegrityDetectorStartupScan` | `startup_scan` | The agent's sweep of the artifacts it holds baselines for. The enum has no value for a periodic re-scan, so the interval-driven sweeps report this one too |
+| `IntegrityDetectorInotify`     | `inotify`      | The hooks-directory watcher reacting to a filesystem event |
+| `IntegrityDetectorPreDispatch` | `pre_dispatch` | The check that runs immediately before a hook executes  |
+
+A value outside either set is refused with `400
+integrity_violation_kind_invalid` or `integrity_violation_detected_by_invalid`.
+
+**IntegrityViolationsResponse**
+
+| Field            | Type        | JSON Tag            | Description                            |
+|------------------|-------------|---------------------|----------------------------------------|
+| `AcceptedAt`     | `time.Time` | `"accepted_at"`     | Server-side commit timestamp           |
+| `ViolationCount` | `int`       | `"violation_count"` | Rows persisted; matches the input length |
+
 ## SSE Events
 
 ### `GET /v1/nodes/{node_id}/events`

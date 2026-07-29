@@ -82,7 +82,7 @@ All methods accept a `context.Context` for cancellation and return typed respons
 | `ReportLogs`          | `POST`          | `/v1/nodes/{node_id}/logs`                        | `[]LogLine` (NDJSON)  | `*IngestReceipt`      |
 | `ReportAudit`         | `POST`          | `/v1/nodes/{node_id}/audit`                       | `[]AuditEvent` (NDJSON)| `*IngestReceipt`     |
 | `ReportSessionActivity` | `POST`        | `/v1/nodes/{node_id}/sessions/{session_id}`        | `SessionActivityRequest` | — (`204 No Content`) |
-| `ReportIntegrityViolation` | `POST`     | `/v1/nodes/{node_id}/integrity/violations`         | `IntegrityViolationReport` | —              |
+| `ReportIntegrityViolations` | `POST`    | `/v1/nodes/{node_id}/integrity-violations`         | `IntegrityViolationsRequest` | —            |
 
 ### Generic Helpers
 

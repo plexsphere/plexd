@@ -6,7 +6,7 @@ feature: PXD-0010
 
 # Integrity Verification
 
-The `internal/integrity` package verifies the integrity of the plexd binary and hook scripts using SHA-256 checksums. It computes checksums on startup, re-verifies periodically, verifies hook scripts before execution, and reports integrity violations to the control plane.
+The `internal/integrity` package verifies the integrity of the plexd binary, hook scripts, and the SSH host key. It computes checksums on startup, re-verifies periodically, verifies hook scripts before execution, and reports integrity violations to the control plane.
 
 ## Data Flow
 
@@ -32,19 +32,20 @@ Startup
               │          │
       match   │          │ mismatch
               ▼          ▼
-        ┌─────────┐  ┌──────────────────┐
-        │ Log OK  │  │ ViolationReporter│
-        └─────────┘  │  .ReportViolation│
-                     └──────────────────┘
+        ┌─────────┐  ┌───────────────────┐
+        │ Log OK  │  │ ViolationReporter │
+        └─────────┘  │  .ReportViolations│
+                     └───────────────────┘
                               │
                               ▼
                      POST /v1/nodes/{id}/
-                       integrity/violations
+                      integrity-violations
 
    ─── periodic ticker at VerifyInterval ───
               │
               ▼
-        Re-run VerifyBinary
+   Re-run VerifyBinary, VerifyHooksDir,
+             VerifyHostKey
 ```
 
 ### Startup Sequence
@@ -58,8 +59,19 @@ Startup
 ### Periodic Re-verification
 
 1. `Verifier.Run` starts a `time.Ticker` at `Config.VerifyInterval`
-2. Each tick calls `VerifyBinary` to detect runtime tampering
+2. Each tick calls `VerifyBinary`, `VerifyHooksDir`, and `VerifyHostKey` to detect runtime tampering
 3. Loop exits cleanly on context cancellation
+
+### Host Key Verification
+
+1. `Verifier.VerifyHostKey` parses the key at `Config.HostKeyPath` and renders its `SHA256:<base64>` fingerprint
+2. No baseline (first run): stores the fingerprint via `Store.Set`
+3. Match: logs info
+4. Mismatch: logs error and reports an `ssh_host_key` violation
+
+The check compares fingerprints rather than file digests, because the fingerprint identifies the key: the same key re-serialised produces different bytes and the same identity, and the identity is what a peer pins. An unset `HostKeyPath` or an absent file is a no-op, so a node that never started the tunnel reports nothing.
+
+The SSH server keeps serving the key it loaded at startup, so a key that changes on disk under a running agent is the tamper signal this detects.
 
 ### Hook Verification
 
@@ -99,6 +111,7 @@ not make an untrusted hooks directory safe.
 | `Enabled`        | `bool`          | `true`  | Whether integrity verification is active |
 | `BinaryPath`     | `string`        | —       | Path to the plexd binary to verify       |
 | `HooksDir`       | `string`        | —       | Directory containing hook scripts        |
+| `HostKeyPath`    | `string`        | —       | SSH host key to verify. Not a YAML key: `AgentConfig.ApplyDefaults` derives it from the data dir via `tunnel.HostKeyPath` |
 | `VerifyInterval` | `time.Duration` | `5m`    | Interval between periodic re-checks      |
 | `WatchEnabled`   | `bool`          | `true`  | Enable inotify file watching on HooksDir |
 
@@ -183,7 +196,7 @@ Loads existing `checksums.json` or creates an empty store. Missing file on first
 
 - Writes use `fsutil.WriteFileAtomic` for crash-safe persistence
 - Concurrent access protected by `sync.RWMutex`
-- File format: `{"<path>": "<hex-sha256>", ...}`
+- File format: `{"<path>": "<hex-sha256>", ...}`, with the host key entry holding its `SHA256:<base64>` fingerprint instead of a digest
 
 ## ViolationReporter
 
@@ -191,11 +204,13 @@ Interface abstracting control plane violation reporting for testability.
 
 ```go
 type ViolationReporter interface {
-    ReportViolation(ctx context.Context, nodeID string, report api.IntegrityViolationReport) error
+    ReportViolations(ctx context.Context, nodeID string, reports []api.IntegrityViolationReport) error
 }
 ```
 
-A production implementation wraps `api.ControlPlane.ReportIntegrityViolation`.
+A production implementation wraps `api.ControlPlane.ReportIntegrityViolations`.
+
+The interface takes a batch because the endpoint does: a directory sweep that finds three tampered hooks delivers them as one request, and the control plane records them in one transaction so an operator sees one alert per tampering event. `Verifier` splits anything over `api.MaxIntegrityViolationsPerBatch` and sends nothing at all for an empty slice.
 
 ## Verifier
 
@@ -222,6 +237,8 @@ Logger is tagged with `component=integrity`.
 |------------------|------------------------------------------------------------------------|--------------------------------------------------------|
 | `VerifyBinary`   | `(ctx context.Context, nodeID string) error`                           | Verify binary against stored baseline                  |
 | `VerifyHook`     | `(ctx context.Context, nodeID, hookPath, expectedChecksum string) (bool, error)` | Verify hook against its pinned digest        |
+| `VerifyHooksDir` | `(ctx context.Context, nodeID string)`                                 | Sweep the hooks directory against stored baselines     |
+| `VerifyHostKey`  | `(ctx context.Context, nodeID string) error`                           | Verify the SSH host key's fingerprint                  |
 | `BinaryChecksum` | `() string`                                                            | Thread-safe getter for last computed binary checksum   |
 | `Run`            | `(ctx context.Context, nodeID string) error`                           | Periodic re-verification loop (blocks until cancelled) |
 
@@ -255,7 +272,21 @@ heartbeat := api.HeartbeatRequest{
 
 ### Run
 
-When `Config.Enabled` is `false`, returns immediately. Otherwise starts a `time.Ticker` at `Config.VerifyInterval` and calls `VerifyBinary` on each tick. Blocks until the context is cancelled.
+When `Config.Enabled` is `false`, returns immediately. Otherwise starts a `time.Ticker` at `Config.VerifyInterval` and calls `VerifyBinary`, `VerifyHooksDir`, and `VerifyHostKey` on each tick. Blocks until the context is cancelled.
+
+### Detectors
+
+Every violation names the detector that surfaced it, from the contract's closed set:
+
+| Report site                       | `detected_by`  |
+|-----------------------------------|----------------|
+| `VerifyBinary`                    | `startup_scan` |
+| `VerifyHostKey`                   | `startup_scan` |
+| `VerifyHooksDir`                  | `startup_scan` |
+| the hooks-directory fsnotify watcher | `inotify`   |
+| `VerifyHook`, before a hook runs  | `pre_dispatch` |
+
+The watcher and the sweep share one code path, so the detector travels as an argument rather than being derived from the report site. The enum has no value for a periodic re-scan, so the interval-driven sweeps report `startup_scan`.
 
 ### Lifecycle
 
@@ -288,20 +319,31 @@ if !ok {
 
 Types defined in `internal/api` for integrity violation reporting.
 
-### IntegrityViolationReport
+### IntegrityViolationsRequest
 
 ```go
+type IntegrityViolationsRequest struct {
+    Violations []IntegrityViolationReport `json:"violations"` // 1..128 entries
+}
+
 type IntegrityViolationReport struct {
-    Type             string    `json:"type"`              // "binary" or "hook"
-    Path             string    `json:"path"`              // file path
-    ExpectedChecksum string    `json:"expected_checksum"` // expected hex SHA-256
-    ActualChecksum   string    `json:"actual_checksum"`   // computed hex SHA-256
-    Detail           string    `json:"detail"`            // human-readable description
-    Timestamp        time.Time `json:"timestamp"`         // UTC detection time
+    Kind                IntegrityViolationKind `json:"kind"`
+    DetectedBy          IntegrityDetector      `json:"detected_by"`
+    ArtifactID          string                 `json:"artifact_id"`
+    ObservedChecksum    string                 `json:"observed_checksum,omitempty"`
+    ExpectedChecksum    string                 `json:"expected_checksum,omitempty"`
+    ObservedFingerprint string                 `json:"observed_fingerprint,omitempty"`
+    ExpectedFingerprint string                 `json:"expected_fingerprint,omitempty"`
 }
 ```
 
-**Endpoint**: `POST /v1/nodes/{node_id}/integrity/violations`
+**Endpoint**: `POST /v1/nodes/{node_id}/integrity-violations`
+
+`Kind` is one of `binary_checksum`, `hook_checksum`, `ssh_host_key`; `DetectedBy` is one of `startup_scan`, `inotify`, `pre_dispatch`. Both are named string types rather than plain strings, so a call site cannot reach the wire with a value the control plane refuses.
+
+`Kind` also decides which digest pair is legal. A checksum kind carries the two checksums as 32 raw bytes in standard-padded base64 (`integrity.WireChecksum` converts the hex the package works in); the host-key kind carries the two `SHA256:<base64>` fingerprints. An entry that crosses them is refused with 400 `integrity_violation_kind_mismatch`, which is why the four digest fields are `omitempty`: an unset one is absent from the JSON rather than present and empty.
+
+A digest that will not convert drops its own entry rather than the batch it travels in, the rule the capability manifest's `declared_hooks` already uses. The control plane validates every entry and refuses the whole request on any bad one, so a single unconvertible digest would otherwise cost every violation sent with it.
 
 ### HeartbeatRequest.BinaryChecksum
 
@@ -311,15 +353,15 @@ The `BinaryChecksum` field in `api.HeartbeatRequest` (line 47 of `types.go`) is 
 
 ### With api.ControlPlane
 
-`api.ControlPlane.ReportIntegrityViolation` satisfies the `ViolationReporter` interface when wrapped in an adapter:
+`api.ControlPlane.ReportIntegrityViolations` satisfies the `ViolationReporter` interface when wrapped in an adapter:
 
 ```go
 type controlPlaneReporter struct {
     client *api.ControlPlane
 }
 
-func (r *controlPlaneReporter) ReportViolation(ctx context.Context, nodeID string, report api.IntegrityViolationReport) error {
-    return r.client.ReportIntegrityViolation(ctx, nodeID, report)
+func (r *controlPlaneReporter) ReportViolations(ctx context.Context, nodeID string, reports []api.IntegrityViolationReport) error {
+    return r.client.ReportIntegrityViolations(ctx, nodeID, api.IntegrityViolationsRequest{Violations: reports})
 }
 ```
 
