@@ -34,8 +34,8 @@ The gate exists because its absence hid a shipped defect: the mock used to admit
 ### Request validation the fixture enforces
 
 The mock refuses what the real handlers refuse, because a fixture that accepts
-more than the contract hides exactly the defects the suite exists to catch. Two
-gates were added after a release shipped past both of them:
+more than the contract hides exactly the defects the suite exists to catch. Three
+gates were added after a release shipped past them:
 
 - **`PUT /v1/nodes/{id}/capabilities`** strict-decodes a `CapabilityManifestRequest`
   (`DisallowUnknownFields`) and enforces its invariants: a non-empty
@@ -48,6 +48,21 @@ gates were added after a release shipped past both of them:
 - **`POST /v1/nodes/{id}/audit`** admits only the contract's closed source enum,
   `auditd` and `k8s`. The fixture used to also admit `plexd`, so a batch the real
   ingest gate refuses whole with `400 ingest_batch_malformed` was accepted here.
+- **`POST /v1/nodes/{id}/integrity-violations`** caps the body at 32 KiB
+  (`413 integrity_violations_body_too_large`), strict-decodes an
+  `IntegrityViolationsRequest`, and enforces the batch bounds
+  (`integrity_violations_empty`, `integrity_violations_too_many`) plus every
+  per-entry invariant: the closed `kind` and `detected_by` enums, a non-empty
+  `artifact_id`, 32-byte base64 digests for the checksum kinds, canonical
+  `SHA256:<base64>` fingerprints for the host-key kind, and the per-kind guard
+  that refuses a checksum entry carrying a fingerprint or the reverse. Success
+  answers `200` with an `IntegrityViolationsResponse`, not `204`.
+
+  This one was worse than the other two: the fixture registered the agent's own
+  route (`/v1/nodes/{id}/integrity/violations`, which the contract does not
+  serve) and decoded the agent's own shape, so the agent's reports agreed with
+  the fixture and with nothing else. A violation never fires during an e2e run,
+  so this handler is the only place the divergence can be caught.
 
 ### `GET /test/bearer`
 
@@ -1048,7 +1063,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `logs_count` | `POST /v1/nodes/{id}/logs` |
 | `audit_count` | `POST /v1/nodes/{id}/audit` |
 | `session_activity_count` | `POST /v1/nodes/{id}/sessions/{sid}` |
-| `integrity_violation_count` | `POST /v1/nodes/{id}/integrity/violations` |
+| `integrity_violation_count` | `POST /v1/nodes/{id}/integrity-violations` (accepted batches only, one per request regardless of batch size) |
 | `inject_event_count` | `POST /test/inject-event` |
 | `events_request_count` | `GET /v1/nodes/{id}/events` (every request, including descoped `501` and `400`) |
 | `local_metrics_count` | `POST /local/metrics` (TLS) |
