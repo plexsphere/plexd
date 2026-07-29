@@ -6,11 +6,13 @@ feature: PXD-0041
 
 # E2E Workflow
 
-The `.github/workflows/e2e.yml` workflow runs all three E2E test suites — Docker, Kubernetes, and systemd — as parallel GitHub Actions jobs. It triggers on pushes to `main` and on pull requests when relevant source paths change.
+The `.github/workflows/e2e.yml` workflow runs all three E2E test suites — Docker, Kubernetes, and systemd — as parallel GitHub Actions jobs. It triggers on pull requests when relevant source paths change, and on manual dispatch.
 
 ## Trigger Configuration
 
-The workflow uses path-filtered triggers on both `push` (branches: `main`) and `pull_request`:
+The workflow uses a path-filtered `pull_request` trigger. It does not run on pushes to `main`: a `pull_request` run tests the merge result, so the suites have already run against the commit the merge produces. `workflow_dispatch` runs them against any branch on demand, unfiltered by path.
+
+The filtered paths:
 
 | Path | Rationale |
 |------|-----------|
