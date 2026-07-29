@@ -1,4 +1,5 @@
-// Package integrity provides SHA-256 checksum verification for plexd binaries and hook scripts.
+// Package integrity verifies the plexd binary and hook scripts by SHA-256
+// checksum, and the SSH host key by its OpenSSH fingerprint.
 package integrity
 
 import (
@@ -20,6 +21,11 @@ type Config struct {
 
 	// HooksDir is the directory containing hook scripts to verify.
 	HooksDir string `yaml:"hooks_dir"`
+
+	// HostKeyPath is the SSH host key whose fingerprint is verified. It is
+	// derived from the agent's data dir rather than configured, so it is kept
+	// off the YAML surface.
+	HostKeyPath string `yaml:"-"`
 
 	// VerifyInterval is the interval between integrity verification runs.
 	// Must be at least 30s when enabled.

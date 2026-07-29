@@ -103,11 +103,13 @@ func (c *AgentConfig) ApplyDefaults() {
 	c.PeerExchange.ApplyDefaults()
 	c.Bridge.ApplyDefaults()
 	c.Heartbeat.ApplyDefaults()
-	// Propagate the top-level data dir into the subsystem configs. Both fields
-	// are excluded from the YAML surface (yaml:"-"), so this is their only
-	// source.
+	// Propagate the top-level data dir into the subsystem configs. All three
+	// fields are excluded from the YAML surface (yaml:"-"), so this is their
+	// only source. The integrity verifier watches the same host key file the
+	// tunnel loads, so it takes the path from tunnel rather than respelling it.
 	c.Registration.DataDir = c.DataDir
 	c.NodeAPI.DataDir = c.DataDir
+	c.Integrity.HostKeyPath = tunnel.HostKeyPath(c.DataDir)
 }
 
 // Validate checks that required fields are set and values are acceptable.

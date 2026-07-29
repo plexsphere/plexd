@@ -2,26 +2,38 @@ package integrity
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/json"
+	"encoding/pem"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// mockReporter records violations reported by the Verifier.
+// mockReporter records the violations and the batches the Verifier reports.
 type mockReporter struct {
 	mu         sync.Mutex
 	violations []api.IntegrityViolationReport
+	batches    [][]api.IntegrityViolationReport
 }
 
-func (m *mockReporter) ReportViolation(_ context.Context, _ string, report api.IntegrityViolationReport) error {
+func (m *mockReporter) ReportViolations(_ context.Context, _ string, reports []api.IntegrityViolationReport) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.violations = append(m.violations, report)
+	if len(reports) == 0 {
+		return api.ErrIntegrityViolationsEmpty
+	}
+	m.violations = append(m.violations, reports...)
+	m.batches = append(m.batches, slices.Clone(reports))
 	return nil
 }
 
@@ -30,6 +42,16 @@ func (m *mockReporter) get() []api.IntegrityViolationReport {
 	defer m.mu.Unlock()
 	out := make([]api.IntegrityViolationReport, len(m.violations))
 	copy(out, m.violations)
+	return out
+}
+
+// getBatches returns one entry per request the reporter received, so a test can
+// tell one batch of three violations from three batches of one.
+func (m *mockReporter) getBatches() [][]api.IntegrityViolationReport {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([][]api.IntegrityViolationReport, len(m.batches))
+	copy(out, m.batches)
 	return out
 }
 
@@ -44,6 +66,18 @@ func writeTempFile(t *testing.T, dir, name, content string) string {
 }
 
 // sha256Hex is defined in checker_test.go.
+
+// wireDigest converts a hex digest into the base64 form the contract's checksum
+// fields carry, so an assertion can be written against the hex the test already
+// computed.
+func wireDigest(t *testing.T, hexDigest string) string {
+	t.Helper()
+	wire, err := WireChecksum(hexDigest)
+	if err != nil {
+		t.Fatalf("WireChecksum(%q): %v", hexDigest, err)
+	}
+	return wire
+}
 
 func TestVerifier_StartupVerification_NoBaseline(t *testing.T) {
 	dir := t.TempDir()
@@ -145,15 +179,14 @@ func TestVerifier_StartupVerification_MismatchedBaseline(t *testing.T) {
 	if len(viol) != 1 {
 		t.Fatalf("got %d violations, want 1", len(viol))
 	}
-	if viol[0].Type != "binary" {
-		t.Errorf("violation type = %q, want %q", viol[0].Type, "binary")
+	if viol[0].Kind != api.IntegrityKindBinaryChecksum {
+		t.Errorf("violation kind = %q, want %q", viol[0].Kind, api.IntegrityKindBinaryChecksum)
 	}
-	if viol[0].ExpectedChecksum != oldChecksum {
-		t.Errorf("expected checksum = %q, want %q", viol[0].ExpectedChecksum, oldChecksum)
+	if want := wireDigest(t, oldChecksum); viol[0].ExpectedChecksum != want {
+		t.Errorf("expected checksum = %q, want %q", viol[0].ExpectedChecksum, want)
 	}
-	actualChecksum := sha256Hex(binaryContent)
-	if viol[0].ActualChecksum != actualChecksum {
-		t.Errorf("actual checksum = %q, want %q", viol[0].ActualChecksum, actualChecksum)
+	if want := wireDigest(t, sha256Hex(binaryContent)); viol[0].ObservedChecksum != want {
+		t.Errorf("observed checksum = %q, want %q", viol[0].ObservedChecksum, want)
 	}
 }
 
@@ -215,8 +248,11 @@ func TestVerifier_VerifyHook_Mismatched(t *testing.T) {
 	if len(viol) != 1 {
 		t.Fatalf("got %d violations, want 1", len(viol))
 	}
-	if viol[0].Type != "hook" {
-		t.Errorf("violation type = %q, want %q", viol[0].Type, "hook")
+	if viol[0].Kind != api.IntegrityKindHookChecksum {
+		t.Errorf("violation kind = %q, want %q", viol[0].Kind, api.IntegrityKindHookChecksum)
+	}
+	if viol[0].DetectedBy != api.IntegrityDetectorPreDispatch {
+		t.Errorf("detected_by = %q, want %q", viol[0].DetectedBy, api.IntegrityDetectorPreDispatch)
 	}
 }
 
@@ -359,8 +395,8 @@ func TestVerifier_PeriodicRun_DetectsTampering(t *testing.T) {
 		default:
 		}
 		if viol := reporter.get(); len(viol) > 0 {
-			if viol[0].Type != "binary" {
-				t.Errorf("violation type = %q, want %q", viol[0].Type, "binary")
+			if viol[0].Kind != api.IntegrityKindBinaryChecksum {
+				t.Errorf("violation kind = %q, want %q", viol[0].Kind, api.IntegrityKindBinaryChecksum)
 			}
 			cancel()
 			<-done
@@ -431,14 +467,15 @@ func TestVerifier_WatchHooksDir_DetectsChange(t *testing.T) {
 		default:
 		}
 		if viol := reporter.get(); len(viol) > 0 {
-			found := false
 			for _, v := range viol {
-				if v.Type == "hook" && v.Path == hookPath {
-					found = true
-					break
+				if v.Kind != api.IntegrityKindHookChecksum || v.ArtifactID != hookPath {
+					continue
 				}
-			}
-			if found {
+				// The ticker is an hour out, so only the watcher can have
+				// produced this — and the watcher's detector is inotify.
+				if v.DetectedBy != api.IntegrityDetectorInotify {
+					t.Errorf("detected_by = %q, want %q", v.DetectedBy, api.IntegrityDetectorInotify)
+				}
 				cancel()
 				<-done
 				return
@@ -520,11 +557,16 @@ func TestVerifier_VerifyHooksDir_DetectsViolation(t *testing.T) {
 	if len(viol) != 1 {
 		t.Fatalf("got %d violations, want 1", len(viol))
 	}
-	if viol[0].Type != "hook" {
-		t.Errorf("violation type = %q, want %q", viol[0].Type, "hook")
+	if viol[0].Kind != api.IntegrityKindHookChecksum {
+		t.Errorf("violation kind = %q, want %q", viol[0].Kind, api.IntegrityKindHookChecksum)
 	}
-	if viol[0].Path != hookPath {
-		t.Errorf("violation path = %q, want %q", viol[0].Path, hookPath)
+	if viol[0].ArtifactID != hookPath {
+		t.Errorf("violation artifact_id = %q, want %q", viol[0].ArtifactID, hookPath)
+	}
+	// The exported sweep is the scanning detector; the watcher enters the same
+	// sweep as inotify.
+	if viol[0].DetectedBy != api.IntegrityDetectorStartupScan {
+		t.Errorf("detected_by = %q, want %q", viol[0].DetectedBy, api.IntegrityDetectorStartupScan)
 	}
 }
 
@@ -567,5 +609,258 @@ func TestVerifier_PeriodicRun_ContextCancellation(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not exit after context cancellation")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Wire form
+// ---------------------------------------------------------------------------
+
+// TestVerifier_VerifyHooksDir_PinsWireBody drives two real tampered hooks
+// through the reporter and compares the marshalled batch against the body the
+// contract accepts, byte for byte. Every earlier test asserts a field; this one
+// asserts the document, so a renamed key, a hex digest, or a resurrected
+// timestamp fails here rather than at a control plane nobody is watching.
+func TestVerifier_VerifyHooksDir_PinsWireBody(t *testing.T) {
+	dir := t.TempDir()
+	hooksDir := filepath.Join(dir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Two hooks, both tampered, so the sweep has a batch to build.
+	for _, name := range []string{"alpha.sh", "beta.sh"} {
+		writeTempFile(t, hooksDir, name, "#!/bin/sh\necho tampered")
+	}
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	for _, name := range []string{"alpha.sh", "beta.sh"} {
+		if err := store.Set(filepath.Join(hooksDir, name), sha256Hex("#!/bin/sh\necho original")); err != nil {
+			t.Fatalf("store set: %v", err)
+		}
+	}
+
+	reporter := &mockReporter{}
+	v := NewVerifier(Config{
+		Enabled:        true,
+		BinaryPath:     writeTempFile(t, dir, "plexd", "binary-content"),
+		HooksDir:       hooksDir,
+		VerifyInterval: DefaultVerifyInterval,
+	}, store, reporter, slog.Default())
+
+	v.VerifyHooksDir(context.Background(), "node-1")
+
+	batches := reporter.getBatches()
+	if len(batches) != 1 {
+		t.Fatalf("got %d batches, want 1: the sweep must deliver its findings together", len(batches))
+	}
+
+	body, err := json.Marshal(api.IntegrityViolationsRequest{Violations: batches[0]})
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+
+	observed := wireDigest(t, sha256Hex("#!/bin/sh\necho tampered"))
+	expected := wireDigest(t, sha256Hex("#!/bin/sh\necho original"))
+	want := `{"violations":[` +
+		`{"kind":"hook_checksum","detected_by":"startup_scan","artifact_id":"` +
+		filepath.Join(hooksDir, "alpha.sh") + `","observed_checksum":"` + observed +
+		`","expected_checksum":"` + expected + `"},` +
+		`{"kind":"hook_checksum","detected_by":"startup_scan","artifact_id":"` +
+		filepath.Join(hooksDir, "beta.sh") + `","observed_checksum":"` + observed +
+		`","expected_checksum":"` + expected + `"}]}`
+	if string(body) != want {
+		t.Errorf("wire body =\n  %s\nwant\n  %s", body, want)
+	}
+}
+
+// TestVerifier_VerifyHooksDir_DropsEntryWithUnconvertibleDigest pins the rule
+// declaredHooks already uses for the capability manifest: a digest that will not
+// re-encode costs its own entry, not the batch it travels in.
+func TestVerifier_VerifyHooksDir_DropsEntryWithUnconvertibleDigest(t *testing.T) {
+	dir := t.TempDir()
+	hooksDir := filepath.Join(dir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeTempFile(t, hooksDir, "good.sh", "#!/bin/sh\necho tampered")
+	writeTempFile(t, hooksDir, "bad.sh", "#!/bin/sh\necho tampered")
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	goodPath := filepath.Join(hooksDir, "good.sh")
+	if err := store.Set(goodPath, sha256Hex("#!/bin/sh\necho original")); err != nil {
+		t.Fatalf("store set: %v", err)
+	}
+	// A baseline that is not a SHA-256 hex digest, as a store written by an
+	// older agent or a hand-edited checksums.json could hold.
+	if err := store.Set(filepath.Join(hooksDir, "bad.sh"), "not-a-digest"); err != nil {
+		t.Fatalf("store set: %v", err)
+	}
+
+	reporter := &mockReporter{}
+	v := NewVerifier(Config{
+		Enabled:        true,
+		BinaryPath:     writeTempFile(t, dir, "plexd", "binary-content"),
+		HooksDir:       hooksDir,
+		VerifyInterval: DefaultVerifyInterval,
+	}, store, reporter, slog.Default())
+
+	v.VerifyHooksDir(context.Background(), "node-1")
+
+	viol := reporter.get()
+	if len(viol) != 1 {
+		t.Fatalf("got %d violations, want 1: the unconvertible entry drops, the batch survives", len(viol))
+	}
+	if viol[0].ArtifactID != goodPath {
+		t.Errorf("surviving violation = %q, want %q", viol[0].ArtifactID, goodPath)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SSH host key
+// ---------------------------------------------------------------------------
+
+// writeHostKey generates an Ed25519 host key, writes it to dir in the OpenSSH
+// PEM form LoadOrGenerateHostKey persists, and returns its path and canonical
+// fingerprint.
+func writeHostKey(t *testing.T, dir, name string) (path, fingerprint string) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate host key: %v", err)
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "")
+	if err != nil {
+		t.Fatalf("marshal host key: %v", err)
+	}
+	path = filepath.Join(dir, name)
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatalf("write host key: %v", err)
+	}
+	sshPub, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatalf("public key: %v", err)
+	}
+	return path, ssh.FingerprintSHA256(sshPub)
+}
+
+func TestVerifier_VerifyHostKey_EstablishesBaseline(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, fingerprint := writeHostKey(t, dir, "ssh_host_ed25519_key")
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	reporter := &mockReporter{}
+	v := NewVerifier(Config{
+		Enabled:        true,
+		BinaryPath:     writeTempFile(t, dir, "plexd", "binary-content"),
+		HostKeyPath:    keyPath,
+		VerifyInterval: DefaultVerifyInterval,
+	}, store, reporter, slog.Default())
+
+	if err := v.VerifyHostKey(context.Background(), "node-1"); err != nil {
+		t.Fatalf("verify host key: %v", err)
+	}
+	if got := store.Get(keyPath); got != fingerprint {
+		t.Errorf("baseline = %q, want %q", got, fingerprint)
+	}
+	if viol := reporter.get(); len(viol) != 0 {
+		t.Errorf("unexpected violations on first run: %v", viol)
+	}
+
+	// A second pass over the unchanged key verifies and reports nothing.
+	if err := v.VerifyHostKey(context.Background(), "node-1"); err != nil {
+		t.Fatalf("re-verify host key: %v", err)
+	}
+	if viol := reporter.get(); len(viol) != 0 {
+		t.Errorf("unexpected violations for an unchanged key: %v", viol)
+	}
+}
+
+func TestVerifier_VerifyHostKey_DetectsRotation(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, oldFingerprint := writeHostKey(t, dir, "ssh_host_ed25519_key")
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.Set(keyPath, oldFingerprint); err != nil {
+		t.Fatalf("store set: %v", err)
+	}
+
+	// Replace the key under the running agent.
+	_, newFingerprint := writeHostKey(t, dir, "ssh_host_ed25519_key")
+	if newFingerprint == oldFingerprint {
+		t.Fatal("regenerated host key kept its fingerprint")
+	}
+
+	reporter := &mockReporter{}
+	v := NewVerifier(Config{
+		Enabled:        true,
+		BinaryPath:     writeTempFile(t, dir, "plexd", "binary-content"),
+		HostKeyPath:    keyPath,
+		VerifyInterval: DefaultVerifyInterval,
+	}, store, reporter, slog.Default())
+
+	if err := v.VerifyHostKey(context.Background(), "node-1"); err != nil {
+		t.Fatalf("verify host key: %v", err)
+	}
+
+	viol := reporter.get()
+	if len(viol) != 1 {
+		t.Fatalf("got %d violations, want 1", len(viol))
+	}
+	want := api.IntegrityViolationReport{
+		Kind:                api.IntegrityKindSSHHostKey,
+		DetectedBy:          api.IntegrityDetectorStartupScan,
+		ArtifactID:          keyPath,
+		ObservedFingerprint: newFingerprint,
+		ExpectedFingerprint: oldFingerprint,
+	}
+	if viol[0] != want {
+		t.Errorf("violation = %+v, want %+v", viol[0], want)
+	}
+}
+
+func TestVerifier_VerifyHostKey_NoKeyIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	reporter := &mockReporter{}
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{"unconfigured", ""},
+		{"absent file", filepath.Join(dir, "ssh_host_ed25519_key")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := NewVerifier(Config{
+				Enabled:        true,
+				BinaryPath:     filepath.Join(dir, "plexd"),
+				HostKeyPath:    tt.path,
+				VerifyInterval: DefaultVerifyInterval,
+			}, store, reporter, slog.Default())
+
+			if err := v.VerifyHostKey(context.Background(), "node-1"); err != nil {
+				t.Fatalf("verify host key: %v", err)
+			}
+			if viol := reporter.get(); len(viol) != 0 {
+				t.Errorf("unexpected violations: %v", viol)
+			}
+		})
 	}
 }

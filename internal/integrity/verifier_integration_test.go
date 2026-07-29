@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"go.uber.org/goleak"
+
+	"github.com/plexsphere/plexd/internal/api"
 )
 
 func TestMain(m *testing.M) {
@@ -72,11 +74,11 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	deadline := time.After(3 * time.Second)
 	for {
 		if viol := reporter.get(); len(viol) > 0 {
-			if viol[0].Type != "binary" {
-				t.Errorf("violation[0].Type = %q, want %q", viol[0].Type, "binary")
+			if viol[0].Kind != api.IntegrityKindBinaryChecksum {
+				t.Errorf("violation[0].Kind = %q, want %q", viol[0].Kind, api.IntegrityKindBinaryChecksum)
 			}
-			if viol[0].ExpectedChecksum != binaryChecksum {
-				t.Errorf("violation[0].Expected = %q, want %q", viol[0].ExpectedChecksum, binaryChecksum)
+			if want := wireDigest(t, binaryChecksum); viol[0].ExpectedChecksum != want {
+				t.Errorf("violation[0].ExpectedChecksum = %q, want %q", viol[0].ExpectedChecksum, want)
 			}
 			break
 		}
@@ -116,10 +118,10 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	binaryViolations := 0
 	hookViolations := 0
 	for _, v := range viol {
-		switch v.Type {
-		case "binary":
+		switch v.Kind {
+		case api.IntegrityKindBinaryChecksum:
 			binaryViolations++
-		case "hook":
+		case api.IntegrityKindHookChecksum:
 			hookViolations++
 		}
 	}

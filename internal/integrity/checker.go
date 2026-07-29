@@ -1,4 +1,5 @@
-// Package integrity provides SHA-256 checksum verification for plexd binaries and hook scripts.
+// Package integrity verifies the plexd binary and hook scripts by SHA-256
+// checksum, and the SSH host key by its OpenSSH fingerprint.
 package integrity
 
 import (
@@ -9,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // CheckResult holds the outcome of a file integrity check.
@@ -66,6 +69,26 @@ func WireChecksum(hexDigest string) (string, error) {
 		return "", fmt.Errorf("integrity: wire checksum: digest is %d bytes, want %d", len(raw), sha256.Size)
 	}
 	return base64.StdEncoding.EncodeToString(raw), nil
+}
+
+// HostKeyFingerprint parses the OpenSSH private key at path and renders its
+// public half as the canonical `SHA256:<base64>` fingerprint — the form
+// `ssh-keygen -l` prints, the one the capability manifest already carries, and
+// the one the integrity contract's fingerprint fields accept.
+//
+// The fingerprint, not a file digest, is what identifies a host key: the same
+// key re-serialised is a different PEM but the same identity, and it is the
+// identity a peer pins.
+func HostKeyFingerprint(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("integrity: read host key %s: %w", path, err)
+	}
+	signer, err := ssh.ParsePrivateKey(data)
+	if err != nil {
+		return "", fmt.Errorf("integrity: parse host key %s: %w", path, err)
+	}
+	return ssh.FingerprintSHA256(signer.PublicKey()), nil
 }
 
 // VerifyFile computes the SHA-256 checksum of the file at path and compares it

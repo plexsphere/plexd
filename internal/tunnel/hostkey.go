@@ -16,6 +16,13 @@ import (
 
 const hostKeyFileName = "ssh_host_ed25519_key"
 
+// HostKeyPath returns the path LoadOrGenerateHostKey reads and writes the
+// node's SSH host key at. The integrity verifier watches the same file, so the
+// name has one owner rather than two spellings that can drift apart.
+func HostKeyPath(dataDir string) string {
+	return filepath.Join(dataDir, hostKeyFileName)
+}
+
 // GenerateHostKey generates a new Ed25519 keypair and returns it as an ssh.Signer.
 func GenerateHostKey() (ssh.Signer, error) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -32,7 +39,7 @@ func GenerateHostKey() (ssh.Signer, error) {
 // LoadOrGenerateHostKey loads an existing Ed25519 host key from dataDir,
 // or generates and persists a new one if none exists.
 func LoadOrGenerateHostKey(dataDir string, logger *slog.Logger) (ssh.Signer, error) {
-	keyPath := filepath.Join(dataDir, hostKeyFileName)
+	keyPath := HostKeyPath(dataDir)
 
 	data, err := os.ReadFile(keyPath)
 	if err == nil {
