@@ -1243,8 +1243,8 @@ func reRegisterOnAuthFailure(ctx context.Context, registrar *registration.Regist
 // controlPlaneReporter adapts api.ControlPlane to the integrity.ViolationReporter interface.
 type controlPlaneReporter struct{ cp *api.ControlPlane }
 
-func (r *controlPlaneReporter) ReportViolation(ctx context.Context, nodeID string, report api.IntegrityViolationReport) error {
-	return r.cp.ReportIntegrityViolation(ctx, nodeID, report)
+func (r *controlPlaneReporter) ReportViolations(ctx context.Context, nodeID string, reports []api.IntegrityViolationReport) error {
+	return r.cp.ReportIntegrityViolations(ctx, nodeID, api.IntegrityViolationsRequest{Violations: reports})
 }
 
 // deliveryModePublisher returns a callback that records the SSE delivery mode in

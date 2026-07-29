@@ -94,7 +94,7 @@ func newRealVerifier(t *testing.T, violations integrity.ViolationReporter) *inte
 
 type noopViolationReporter struct{}
 
-func (noopViolationReporter) ReportViolation(_ context.Context, _ string, _ api.IntegrityViolationReport) error {
+func (noopViolationReporter) ReportViolations(_ context.Context, _ string, _ []api.IntegrityViolationReport) error {
 	return nil
 }
 
@@ -105,10 +105,10 @@ type recordingViolationReporter struct {
 	reports []api.IntegrityViolationReport
 }
 
-func (r *recordingViolationReporter) ReportViolation(_ context.Context, _ string, report api.IntegrityViolationReport) error {
+func (r *recordingViolationReporter) ReportViolations(_ context.Context, _ string, reports []api.IntegrityViolationReport) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.reports = append(r.reports, report)
+	r.reports = append(r.reports, reports...)
 	return nil
 }
 
