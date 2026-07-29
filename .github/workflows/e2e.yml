@@ -1,16 +1,6 @@
 name: E2E
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'cmd/**'
-      - 'internal/**'
-      - 'deploy/**'
-      - 'test/e2e/**'
-      - 'Dockerfile'
-      - '.github/workflows/e2e.yml'
   pull_request:
     paths:
       - 'cmd/**'
@@ -19,6 +9,7 @@ on:
       - 'test/e2e/**'
       - 'Dockerfile'
       - '.github/workflows/e2e.yml'
+  workflow_dispatch:
 
 jobs:
   docker-e2e:
