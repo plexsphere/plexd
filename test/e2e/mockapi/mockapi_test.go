@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,10 +29,26 @@ import (
 	"github.com/plexsphere/plexd/test/e2e/mockapi"
 )
 
+// withBearerEnvelope serves the mock behind a shim that stamps the node's
+// bearer envelope on any request that arrives without one. The mock refuses
+// authenticated routes that do not present it, and these tests are about the
+// handlers behind that gate, not about the credential — a test that means to
+// exercise the gate itself serves srv.Handler() directly and sets (or omits)
+// the header it wants.
+func withBearerEnvelope(srv *mockapi.Server) http.Handler {
+	gated := srv.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			r.Header.Set("Authorization", "Bearer "+srv.BearerEnvelope())
+		}
+		gated.ServeHTTP(w, r)
+	})
+}
+
 func newTestServer(t *testing.T) (*mockapi.Server, *httptest.Server) {
 	t.Helper()
 	srv := mockapi.New()
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(withBearerEnvelope(srv))
 	t.Cleanup(ts.Close)
 	return srv, ts
 }
@@ -94,9 +111,12 @@ func validEndpointBody() string {
 
 // Test body constants for new endpoints.
 const (
-	keyRotateKey           = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
-	keyRotateBody          = `{"new_public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="}`
-	capabilitiesBody       = `{"builtin_actions":[],"hooks":[]}`
+	keyRotateKey  = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+	keyRotateBody = `{"new_public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="}`
+	// capabilitiesBody is a contract-valid capability manifest: the flat
+	// binary_version / binary_checksum pair the handler requires, with the
+	// digest in the wire form (32 bytes, standard-padded base64).
+	capabilitiesBody       = `{"binary_version":"v1.2.3","binary_checksum":"f39/f39/f39/f39/f39/f39/f39/f39/f39/f39/f38="}`
 	reportBody             = `{"value":"cpu ok","workload_tag":"web"}`
 	metricsBatchBody       = `[{"group":"node_resources","name":"cpu.load","value":0.5,"timestamp":"2025-01-01T00:00:00Z"}]`
 	logsBatchBody          = `{"severity":"info","unit":"main","message":"started","timestamp":"2025-01-01T00:00:00Z"}`
@@ -175,12 +195,15 @@ var localCounterFields = map[string]bool{
 // flat fan-out does not drive uniformly. SecretsRateLimitedCount advances only
 // while the secret rate limit is armed, which the flat fan-out never arms.
 // EventsRequestCount advances only on GET .../events, which the flat fan-out
-// never opens.
+// never opens. UnauthorizedCount advances only when the bearer gate refuses a
+// request, and a run in which it moves at all is a failing run — the tests that
+// drive it assert on it directly.
 var statefulCounterFields = map[string]bool{
 	"KeyRotateCount":          true,
 	"ExecutionUploadCount":    true,
 	"SecretsRateLimitedCount": true,
 	"EventsRequestCount":      true,
+	"UnauthorizedCount":       true,
 }
 
 // assertAllCountersEqual checks that every field in the AssertionCounters struct
@@ -948,7 +971,7 @@ func TestEvents_SSEStream(t *testing.T) {
 func TestEvents_SSEKeepAlive(t *testing.T) {
 	srv := mockapi.New()
 	srv.KeepAliveInterval = 50 * time.Millisecond // fast interval for testing
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(withBearerEnvelope(srv))
 	t.Cleanup(ts.Close)
 
 	resp := connectSSE(t, ts.URL, "node-1", 2*time.Second)
@@ -1082,7 +1105,7 @@ func TestEvents_MonotonicSequences(t *testing.T) {
 func TestEvents_RingCapDropsOldest(t *testing.T) {
 	srv := mockapi.New()
 	srv.KeepAliveInterval = 10 * time.Second
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(withBearerEnvelope(srv))
 	t.Cleanup(ts.Close)
 
 	for i := 1; i <= 70; i++ {
@@ -1116,7 +1139,7 @@ const eventRingReplayCount = 64
 func TestEvents_RecordsWhileDescoped(t *testing.T) {
 	srv := mockapi.New()
 	srv.KeepAliveInterval = 10 * time.Second
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(withBearerEnvelope(srv))
 	t.Cleanup(ts.Close)
 
 	configureEvents(t, ts.URL, "descoped")
@@ -1144,7 +1167,7 @@ func TestEvents_RecordsWhileDescoped(t *testing.T) {
 func TestEvents_ReplayFromCursor(t *testing.T) {
 	srv := mockapi.New()
 	srv.KeepAliveInterval = 10 * time.Second
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(withBearerEnvelope(srv))
 	t.Cleanup(ts.Close)
 
 	for i := 1; i <= 5; i++ {
@@ -1190,7 +1213,7 @@ func TestEvents_TailFromNow(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := mockapi.New()
 			srv.KeepAliveInterval = 10 * time.Second
-			ts := httptest.NewServer(srv.Handler())
+			ts := httptest.NewServer(withBearerEnvelope(srv))
 			t.Cleanup(ts.Close)
 
 			// Buffer events the tail-from-now stream must NOT replay.
@@ -1255,7 +1278,7 @@ func TestEvents_BadCursor(t *testing.T) {
 func TestEvents_DescopedMode(t *testing.T) {
 	srv := mockapi.New()
 	srv.KeepAliveInterval = 10 * time.Second
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(withBearerEnvelope(srv))
 	t.Cleanup(ts.Close)
 
 	// An open stream in streaming mode is torn down when the mode flips.
@@ -1616,6 +1639,11 @@ func TestConcurrentCounters(t *testing.T) {
 	}
 	if a.ExecutionUploadCount != 0 {
 		t.Errorf("execution_upload_count = %d, want 0", a.ExecutionUploadCount)
+	}
+	// Every request above presented the node's envelope, so nothing may have
+	// been turned away.
+	if a.UnauthorizedCount != 0 {
+		t.Errorf("unauthorized_count = %d, want 0", a.UnauthorizedCount)
 	}
 }
 
@@ -2703,10 +2731,9 @@ func TestIngest_RecordsCountsElements(t *testing.T) {
 	resp.Body.Close()
 
 	audit := `{"source":"auditd","action":"execve","outcome":"success","timestamp":"2025-01-01T00:00:00Z"}` + "\n" +
-		`{"source":"k8s","action":"create","outcome":"allow","timestamp":"2025-01-01T00:00:01Z"}` + "\n" +
-		`{"source":"plexd","action":"start","outcome":"success","timestamp":"2025-01-01T00:00:02Z"}`
+		`{"source":"k8s","action":"create","outcome":"allow","timestamp":"2025-01-01T00:00:01Z"}`
 	resp = doIngest(t, http.MethodPost, ts.URL+"/v1/nodes/node-1/audit", "application/x-ndjson", audit, nil)
-	assertRecords(t, resp, 3)
+	assertRecords(t, resp, 2)
 	resp.Body.Close()
 }
 
@@ -3986,7 +4013,7 @@ func TestHandler_NotNil(t *testing.T) {
 func TestInjectEvent_DeliversToConnectedClient(t *testing.T) {
 	srv := mockapi.New()
 	srv.KeepAliveInterval = 10 * time.Second // long interval so keep-alives don't interfere
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(withBearerEnvelope(srv))
 	t.Cleanup(ts.Close)
 
 	// Connect an SSE client. The stream tails from now, so nothing arrives until
@@ -4042,7 +4069,7 @@ func TestInjectEvent_CounterIncrements(t *testing.T) {
 func TestInjectEvent_MultipleClients(t *testing.T) {
 	srv := mockapi.New()
 	srv.KeepAliveInterval = 10 * time.Second
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(withBearerEnvelope(srv))
 	t.Cleanup(ts.Close)
 
 	// Connect two SSE clients, each tailing from now.
@@ -4312,7 +4339,7 @@ func TestInjectEvent_NoClients_Succeeds(t *testing.T) {
 func TestBroadcastSSE_Programmatic(t *testing.T) {
 	srv := mockapi.New()
 	srv.KeepAliveInterval = 10 * time.Second
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(withBearerEnvelope(srv))
 	t.Cleanup(ts.Close)
 
 	// Connect an SSE client, tailing from now.
@@ -4761,7 +4788,7 @@ func TestSetState_PutCapturesRequestBody(t *testing.T) {
 func TestConcurrent_InjectEventAndConfigureState(t *testing.T) {
 	srv := mockapi.New()
 	srv.KeepAliveInterval = 10 * time.Second
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(withBearerEnvelope(srv))
 	t.Cleanup(ts.Close)
 
 	// Connect an SSE client so BroadcastSSE has a target, draining frames in the
@@ -5134,5 +5161,132 @@ func TestRegister_ReturnsBase64EncodedNSK(t *testing.T) {
 	}
 	if !bytes.Equal(raw, s.NSK()) {
 		t.Errorf("decoded nsk = %x, want %x", raw, s.NSK())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bearer envelope gate (issue #60)
+// ---------------------------------------------------------------------------
+
+// agentEnvelope assembles the credential exactly as the agent does — the
+// `plexd` environment tag, the node's UUID bytes followed by the decoded nsk,
+// unpadded base64url — from the fixture's own material.
+func agentEnvelope(t *testing.T, srv *mockapi.Server) string {
+	t.Helper()
+	id, err := hex.DecodeString(strings.ReplaceAll(testMockNodeID, "-", ""))
+	if err != nil {
+		t.Fatalf("decode node id: %v", err)
+	}
+	return "nsk_plexd_" + base64.RawURLEncoding.EncodeToString(append(id, srv.NSK()...))
+}
+
+// The gate is what makes the agent's credential observable to the e2e suite. It
+// has to refuse precisely what the control plane refuses — above all the raw
+// base64 nsk, which two releases presented and which the mock used to admit,
+// leaving the whole suite green while every deployed node answered 401.
+func TestBearerEnvelopeGate(t *testing.T) {
+	srv := mockapi.New()
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	stateURL := ts.URL + "/v1/nodes/" + testMockNodeID + "/state"
+	rawNSK := base64.StdEncoding.EncodeToString(srv.NSK())
+
+	// A payload whose base64url spells an underscore is not an exotic case: the
+	// fixture's own credential contains one, and a parser that splits on every
+	// separator refuses every real envelope.
+	envelope := agentEnvelope(t, srv)
+	if !strings.Contains(strings.TrimPrefix(envelope, "nsk_plexd_"), "_") {
+		t.Fatal("fixture payload has no underscore, so this suite no longer covers the separator case")
+	}
+
+	tests := []struct {
+		name   string
+		header string
+		want   int
+	}{
+		{"agent envelope is admitted", "Bearer " + envelope, http.StatusOK},
+		{"fixture envelope is admitted", "Bearer " + srv.BearerEnvelope(), http.StatusOK},
+		{"raw base64 nsk is refused", "Bearer " + rawNSK, http.StatusUnauthorized},
+		{"no header is refused", "", http.StatusUnauthorized},
+		{"wrong scheme is refused", "Basic " + envelope, http.StatusUnauthorized},
+		{"envelope without an env segment is refused", "Bearer nsk__" + strings.TrimPrefix(envelope, "nsk_plexd_"), http.StatusUnauthorized},
+		{"padded base64 payload is refused", "Bearer nsk_plexd_" + base64.URLEncoding.EncodeToString(append([]byte("0123456789abcdef"), srv.NSK()...)), http.StatusUnauthorized},
+		{"truncated payload is refused", "Bearer nsk_plexd_" + base64.RawURLEncoding.EncodeToString(srv.NSK()), http.StatusUnauthorized},
+		{"another node's id is refused", "Bearer nsk_plexd_" + base64.RawURLEncoding.EncodeToString(append([]byte("0123456789abcdef"), srv.NSK()...)), http.StatusUnauthorized},
+		{"another node's key is refused", "Bearer nsk_plexd_" + base64.RawURLEncoding.EncodeToString(append(mustNodeIDBytes(t), bytes.Repeat([]byte{0x11}, 32)...)), http.StatusUnauthorized},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, stateURL, nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("GET state: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tt.want {
+				body, _ := io.ReadAll(resp.Body)
+				t.Errorf("status = %d, want %d (body: %s)", resp.StatusCode, tt.want, body)
+			}
+			if tt.want != http.StatusUnauthorized {
+				return
+			}
+			if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/problem+json") {
+				t.Errorf("content-type = %q, want application/problem+json", ct)
+			}
+		})
+	}
+
+	// Every refusal is counted, so a suite can assert the agent was never
+	// turned away without reading the log.
+	if got := srv.Assertions().UnauthorizedCount; got == 0 {
+		t.Error("unauthorized_count = 0 after the refused cases, want the refusals counted")
+	}
+}
+
+// mustNodeIDBytes returns the fixture node id as its 16 raw UUID bytes.
+func mustNodeIDBytes(t *testing.T) []byte {
+	t.Helper()
+	id, err := hex.DecodeString(strings.ReplaceAll(testMockNodeID, "-", ""))
+	if err != nil {
+		t.Fatalf("decode node id: %v", err)
+	}
+	return id
+}
+
+// The routes that carry no bearer must stay reachable without one: registration
+// is `security: []` in the spec, and the health probe is what the container
+// healthcheck dials before the node holds any credential at all.
+func TestBearerEnvelopeGate_ExemptRoutes(t *testing.T) {
+	srv := mockapi.New()
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/v1/health")
+	if err != nil {
+		t.Fatalf("GET health: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Error("GET /v1/health = 401, want the probe to answer without a credential")
+	}
+
+	resp, err = http.Post(ts.URL+"/v1/register", "application/json", strings.NewReader(registerBody))
+	if err != nil {
+		t.Fatalf("POST register: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Error("POST /v1/register = 401, want registration to run without a credential")
+	}
+	if got := srv.Assertions().UnauthorizedCount; got != 0 {
+		t.Errorf("unauthorized_count = %d after exempt routes, want 0", got)
 	}
 }

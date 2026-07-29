@@ -468,15 +468,37 @@ type alias for `[]AuditEntry`
 
 ### `PUT /v1/nodes/{node_id}/capabilities`
 
-**CapabilitiesPayload**
+**CapabilityManifestRequest**
 
-| Field           | Type           | JSON Tag                | Description              |
-|-----------------|----------------|-------------------------|--------------------------|
-| `Binary`        | `*BinaryInfo`  | `"binary,omitempty"`    | Binary version info      |
-| `BuiltinActions`| `[]ActionInfo` | `"builtin_actions"`     | Built-in actions         |
-| `Hooks`         | `[]HookInfo`   | `"hooks"`               | Registered hooks         |
+| Field                   | Type             | JSON Tag                                | Description                                             |
+|-------------------------|------------------|-----------------------------------------|---------------------------------------------------------|
+| `BinaryVersion`         | `string`         | `"binary_version"`                      | Agent version, non-empty after trimming                 |
+| `BinaryChecksum`        | `string`         | `"binary_checksum"`                     | Running binary's SHA-256: 32 bytes, standard-padded base64 |
+| `SSHHostKeyFingerprint` | `string`         | `"ssh_host_key_fingerprint,omitempty"`  | Optional `SHA256:<base64>` host-key fingerprint         |
+| `DeclaredHooks`         | `[]DeclaredHook` | `"declared_hooks,omitempty"`            | Optional hook declarations, at most 128, unique names   |
 
-**BinaryInfo**
+**DeclaredHook**
+
+| Field      | Type     | JSON Tag     | Description                                        |
+|------------|----------|--------------|----------------------------------------------------|
+| `Name`     | `string` | `"name"`     | Hook identifier, non-empty                         |
+| `Checksum` | `string` | `"checksum"` | Hook payload SHA-256: 32 bytes, standard-padded base64 |
+
+The handler decodes this body with `DisallowUnknownFields`, so the manifest
+carries these fields and nothing else. Two consequences are worth stating
+outright:
+
+- **The digest is base64, never hex.** Both checksum fields are declared
+  `format: byte`, so a hex digest decodes to 48 bytes and is refused with
+  `binary_checksum_invalid`. `integrity.WireChecksum` converts the hex form the
+  integrity package works in into the wire form.
+- **There is no field for the agent's builtin action list.** An earlier payload
+  sent one under `builtin_actions`, inside a `binary` object the contract also
+  does not define; the whole manifest was rejected. The action inventory is
+  served locally by the node API's `GET /v1/actions`.
+
+**BinaryInfo** — the node API's local view of the running binary. The control
+plane receives the same two values as the manifest's flat fields.
 
 | Field    | Type   | JSON Tag    | Description        |
 |----------|--------|-------------|--------------------|

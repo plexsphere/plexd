@@ -86,3 +86,14 @@ func LoadOrGenerateHostKey(dataDir string, logger *slog.Logger) (ssh.Signer, err
 	logger.Info("generated new host key", "path", keyPath, "component", "tunnel")
 	return signer, nil
 }
+
+// HostKeyFingerprint renders the host key's public half as the canonical
+// OpenSSH SHA-256 fingerprint, `SHA256:<base64>` with the padding omitted —
+// the form `ssh-keygen -l` prints and the form the capability manifest's
+// optional ssh_host_key_fingerprint field carries.
+func HostKeyFingerprint(signer ssh.Signer) string {
+	if signer == nil {
+		return ""
+	}
+	return ssh.FingerprintSHA256(signer.PublicKey())
+}

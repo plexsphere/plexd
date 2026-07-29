@@ -500,12 +500,43 @@ type AuditEntry struct {
 // Capabilities  PUT /v1/nodes/{node_id}/capabilities
 // ---------------------------------------------------------------------------
 
-type CapabilitiesPayload struct {
-	Binary         *BinaryInfo  `json:"binary,omitempty"`
-	BuiltinActions []ActionInfo `json:"builtin_actions"`
-	Hooks          []HookInfo   `json:"hooks"`
+// CapabilityManifestRequest is the body of PUT /v1/nodes/{node_id}/capabilities:
+// the agent's binary version and digest, plus the hooks it advertises.
+//
+// The handler decodes it with DisallowUnknownFields, so this struct carries the
+// contract's fields and nothing else. In particular there is no field for the
+// agent's builtin action list — the control plane has no column for it, and an
+// earlier payload that sent one under `builtin_actions` (inside a nested
+// `binary` object that the contract also does not have) was refused whole. The
+// action list stays available locally through the node API's /v1/actions.
+type CapabilityManifestRequest struct {
+	// BinaryVersion is the agent version string, non-empty after trimming.
+	BinaryVersion string `json:"binary_version"`
+	// BinaryChecksum is the running binary's SHA-256 as 32 raw bytes in
+	// standard-padded base64 (see integrity.WireChecksum). Anything that does
+	// not decode to exactly 32 bytes is refused with 400
+	// binary_checksum_invalid.
+	BinaryChecksum string `json:"binary_checksum"`
+	// SSHHostKeyFingerprint is the optional OpenSSH host-key fingerprint in the
+	// canonical `SHA256:<base64>` form. Omitted when the agent has none.
+	SSHHostKeyFingerprint string `json:"ssh_host_key_fingerprint,omitempty"`
+	// DeclaredHooks are the hooks the agent advertises, at most 128, with
+	// unique names. Omitted when empty rather than sent as null.
+	DeclaredHooks []DeclaredHook `json:"declared_hooks,omitempty"`
 }
 
+// DeclaredHook pairs a hook name with the digest of its payload, so the
+// integrity correlator can see a hook change without re-fetching it.
+type DeclaredHook struct {
+	Name string `json:"name"`
+	// Checksum is the hook payload's SHA-256 as 32 raw bytes in
+	// standard-padded base64, same encoding as BinaryChecksum.
+	Checksum string `json:"checksum"`
+}
+
+// BinaryInfo describes the running agent binary. It is reported through the
+// node API's local surface; the control plane receives the same two values as
+// the flat binary_version / binary_checksum fields of a capability manifest.
 type BinaryInfo struct {
 	Version  string `json:"version"`
 	Checksum string `json:"checksum"`

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // newTestClient creates a ControlPlane client pointed at the given test server.
@@ -64,13 +66,55 @@ func TestClient_UserAgentSet(t *testing.T) {
 	}
 }
 
-func TestClient_GzipCompression(t *testing.T) {
+// Only the three observability ingest operations document a request encoding
+// other than identity. Every other handler decodes the body as it arrives, so a
+// compressed one is read as JSON and refused — which is how a capability
+// manifest that crossed the threshold drew a 400 naming the gzip magic byte.
+func TestClient_DoesNotGzipOrdinaryRequests(t *testing.T) {
 	var gotEncoding string
 	var gotBody []byte
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotEncoding = r.Header.Get("Content-Encoding")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
 
+	c := newTestClient(t, srv.URL)
+
+	// Comfortably past gzipThreshold: the old client compressed this.
+	largePayload := map[string]string{"data": strings.Repeat("x", 2048)}
+
+	var result map[string]bool
+	if err := c.PostJSON(context.Background(), "/v1/test", largePayload, &result); err != nil {
+		t.Fatalf("PostJSON: %v", err)
+	}
+
+	if gotEncoding != "" {
+		t.Errorf("Content-Encoding = %q, want none on an ordinary operation", gotEncoding)
+	}
+	// The body has to arrive as plain JSON, not as bytes that merely decompress
+	// to it: the receiving handler does no inflating.
+	var decoded map[string]string
+	if err := json.Unmarshal(gotBody, &decoded); err != nil {
+		t.Fatalf("body is not plain JSON: %v", err)
+	}
+	if len(decoded["data"]) != 2048 {
+		t.Errorf("data length = %d, want 2048", len(decoded["data"]))
+	}
+}
+
+// The ingest operations are the ones whose contract accepts gzip, and a
+// telemetry batch is exactly where compression is worth having.
+func TestClient_GzipsIngestRequests(t *testing.T) {
+	var gotEncoding string
+	var gotBody []byte
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEncoding = r.Header.Get("Content-Encoding")
 		if gotEncoding == "gzip" {
 			gr, err := gzip.NewReader(r.Body)
 			if err != nil {
@@ -81,36 +125,30 @@ func TestClient_GzipCompression(t *testing.T) {
 		} else {
 			gotBody, _ = io.ReadAll(r.Body)
 		}
-
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted_at":"2026-01-01T00:00:00Z","records":1}`))
 	}))
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL)
 
-	// Create a body larger than gzipThreshold (1024 bytes).
-	largePayload := map[string]string{
-		"data": strings.Repeat("x", 2048),
-	}
-
-	var result map[string]bool
-	if err := c.PostJSON(context.Background(), "/v1/test", largePayload, &result); err != nil {
-		t.Fatalf("PostJSON: %v", err)
+	samples := []MetricSample{{
+		Group:     "system",
+		Name:      "cpu",
+		Value:     1,
+		Timestamp: time.Now().UTC(),
+		Labels:    map[string]string{"pad": strings.Repeat("x", 2048)},
+	}}
+	if _, err := c.ReportMetrics(context.Background(), "n1", samples); err != nil {
+		t.Fatalf("ReportMetrics: %v", err)
 	}
 
 	if gotEncoding != "gzip" {
-		t.Errorf("Content-Encoding = %q, want %q", gotEncoding, "gzip")
+		t.Errorf("Content-Encoding = %q, want gzip on an ingest operation", gotEncoding)
 	}
-
-	// Verify the decompressed body is valid JSON with our payload.
-	var decoded map[string]string
-	if err := json.Unmarshal(gotBody, &decoded); err != nil {
-		t.Fatalf("Unmarshal decompressed body: %v", err)
-	}
-	if len(decoded["data"]) != 2048 {
-		t.Errorf("data length = %d, want 2048", len(decoded["data"]))
+	if !bytes.Contains(gotBody, []byte(`"cpu"`)) {
+		t.Errorf("inflated body does not carry the sample: %s", gotBody)
 	}
 }
 

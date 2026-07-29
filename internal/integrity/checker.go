@@ -3,6 +3,7 @@ package integrity
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -44,6 +45,27 @@ func SelfChecksum() (string, error) {
 		return "", fmt.Errorf("integrity: self checksum: %w", err)
 	}
 	return HashFile(exe)
+}
+
+// WireChecksum re-encodes a hex digest from HashFile into the form the control
+// plane's checksum fields carry: the 32 raw bytes in standard-padded base64.
+//
+// Hex is this package's own currency — it is what the baseline store holds and
+// what hook comparisons run on — but on the wire those fields are declared
+// `format: byte`, so a hex string is decoded as base64 and yields 48 bytes
+// instead of 32. The capability manifest refuses that outright, and while the
+// heartbeat contract also documents a hex form, the deployed control plane
+// answers it with 400 `binary_checksum_empty`. Base64 is the one encoding both
+// operations accept, so it is the one this agent sends.
+func WireChecksum(hexDigest string) (string, error) {
+	raw, err := hex.DecodeString(hexDigest)
+	if err != nil {
+		return "", fmt.Errorf("integrity: wire checksum: %w", err)
+	}
+	if len(raw) != sha256.Size {
+		return "", fmt.Errorf("integrity: wire checksum: digest is %d bytes, want %d", len(raw), sha256.Size)
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
 // VerifyFile computes the SHA-256 checksum of the file at path and compares it

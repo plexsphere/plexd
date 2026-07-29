@@ -17,6 +17,50 @@ A fixture-based mock of the Central API for end-to-end testing. Returns static r
 
 The binary prints `MOCKAPI_ADDR=<address>` to stdout on startup, which allows test scripts to discover the dynamically assigned port when using `:0`.
 
+## Authentication
+
+Every route under `/v1/` is served behind a bearer-envelope gate, with two exemptions: `POST /v1/register` (`security: []` in the spec — a node has no credential before it registers) and `GET /v1/health` (the readiness probe the compose healthcheck dials). The `/test/`, `/releases/` and `/exec-output/` surfaces are fixture scaffolding and a presigned upload; none of them carries a bearer.
+
+An authenticated route admits exactly one credential, the NSK bearer envelope the agent assembles after registration:
+
+```
+Authorization: Bearer nsk_<env>_<base64url(node_id_bytes(16) || nsk_bytes(32))>
+```
+
+The payload is unpadded base64url, whose alphabet includes `-` and `_` — the separator parse therefore splits on the first two underscores only. The `<env>` segment must be non-empty but is not otherwise checked: the gate's authority is the payload, which must name this node (`mockNodeID`) and carry its secret key (`mockNSK`). Anything else — no header, a non-Bearer scheme, the raw standard-base64 nsk, a padded or short payload, another node's id or key — is refused with `401` and an `application/problem+json` body, and increments `unauthorized_count`.
+
+The gate exists because its absence hid a shipped defect: the mock used to admit any credential and check only the node id in the URL, so the whole suite stayed green through two releases in which the agent presented the raw nsk and every deployed node was refused by the real control plane (issues #56, #60). A fixture that accepts anything cannot fail on the one thing every deployed node depends on.
+
+### Request validation the fixture enforces
+
+The mock refuses what the real handlers refuse, because a fixture that accepts
+more than the contract hides exactly the defects the suite exists to catch. Two
+gates were added after a release shipped past both of them:
+
+- **`PUT /v1/nodes/{id}/capabilities`** strict-decodes a `CapabilityManifestRequest`
+  (`DisallowUnknownFields`) and enforces its invariants: a non-empty
+  `binary_version`, a `binary_checksum` that decodes to exactly 32 bytes of
+  standard-padded base64, a canonical `SHA256:<base64>` fingerprint when present,
+  and `declared_hooks` that are unique, named, and carry a 32-byte digest. A hex
+  digest decodes to 48 bytes and is refused with `binary_checksum_invalid`; a
+  gzip-compressed body fails the decode, as it does upstream. The fixture used to
+  decode into whatever shape the agent sent and count it.
+- **`POST /v1/nodes/{id}/audit`** admits only the contract's closed source enum,
+  `auditd` and `k8s`. The fixture used to also admit `plexd`, so a batch the real
+  ingest gate refuses whole with `400 ingest_batch_malformed` was accepted here.
+
+### `GET /test/bearer`
+
+Returns the envelope an authenticated route admits, so a test script that drives one itself does not hardcode a base64 blob and the node id and secret keep a single definition.
+
+**Response:** `200 OK`
+
+```json
+{ "bearer": "nsk_e2e_AZCouKDAegqKCqCgoKCgowABAgMEBQYHCAkKCwwNDg-AkaKzxNXm9_jp2su8rZ6P" }
+```
+
+Go callers reach the same value through `(*Server).BearerEnvelope()`. In-process tests that mean to exercise handlers rather than the gate serve the mock behind a shim that stamps this header when a request arrives without one.
+
 ## Endpoints
 
 ### `GET /v1/health`
@@ -709,7 +753,8 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "events_request_count": 0,
   "local_metrics_count": 0,
   "local_logs_count": 0,
-  "local_audit_count": 0
+  "local_audit_count": 0,
+  "unauthorized_count": 0
 }
 ```
 
@@ -991,7 +1036,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `heartbeat_count` | `POST /v1/nodes/{id}/heartbeat` |
 | `state_count` | `GET /v1/nodes/{id}/state` |
 | `key_rotate_count` | `POST /v1/keys/rotate` (completed rotations only) |
-| `capabilities_count` | `PUT /v1/nodes/{id}/capabilities` |
+| `capabilities_count` | `PUT /v1/nodes/{id}/capabilities` (accepted manifests only) |
 | `endpoint_count` | `PUT /v1/nodes/{id}/endpoint` |
 | `secrets_count` | `GET /v1/nodes/{id}/secrets/{key}` (served `200` envelopes only) |
 | `secrets_rate_limited_count` | `GET /v1/nodes/{id}/secrets/{key}` (armed `429` responses only) |
@@ -1009,6 +1054,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `local_metrics_count` | `POST /local/metrics` (TLS) |
 | `local_logs_count` | `POST /local/logs` (TLS) |
 | `local_audit_count` | `POST /local/audit` (TLS) |
+| `unauthorized_count` | any authenticated route refused by the bearer-envelope gate |
 
 Query current values via `GET /test/assertions`.
 

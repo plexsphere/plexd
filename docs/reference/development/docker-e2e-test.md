@@ -14,7 +14,7 @@ The test runs fourteen phases:
 2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, and metrics data
 3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously)
 4. **Log injection** — injects a log file via `docker cp`, verifies logs_count increases (FileSource pipeline works)
-5. **Agent restart for audit** — restarts plexd container, verifies audit_count increases (ProcessSource fires per-process)
+5. **Agent restart for audit** — restarts the plexd container and verifies `local_audit_count` increases (ProcessSource fires per-process). The platform leg carries nothing: plexd's own `process` source is outside the ingest contract's closed enum (`auditd`, `k8s`), so `audit_count` must stay at 0.
 6. **SSE event injection** — injects a `node_state_updated` event and verifies state_count increases (proves SSE stream is connected)
 7. **Session lifecycle from the state pull** — splices a `tcp` entry into the snapshot's `sessions` block and verifies a `session_started` activity row carrying `listener_endpoint`, then re-posts the snapshot **without** the entry and verifies the drain produces a `session_ended` row with `plexd_close` and numeric byte counters; a second entry carrying `idle_timeout_seconds` verifies the idle window closes a session on its own with `idle_timeout`
 8. **Session events as pull triggers** — injects `session_setup` and `session_revoked` envelopes with opaque payloads, verifies each advances `state_count` while leaving `session_activity_count` unchanged
@@ -63,7 +63,7 @@ The test script polls `GET http://localhost:18080/test/assertions` every 2 secon
   "capabilities_count": 1,
   "metrics_count": 1,
   "logs_count": 1,
-  "audit_count": 1,
+  "audit_count": 0,
   "local_metrics_count": 1,
   "local_logs_count": 1,
   "local_audit_count": 1
@@ -80,7 +80,7 @@ Phase 1 passes when all seven platform counters are >= 1. Local endpoint counter
 | `capabilities_count` | plexd called `PUT /v1/nodes/{id}/capabilities` |
 | `metrics_count` | plexd called `POST /v1/nodes/{id}/metrics` |
 | `logs_count` | plexd called `POST /v1/nodes/{id}/logs` |
-| `audit_count` | plexd called `POST /v1/nodes/{id}/audit` |
+| `audit_count` | plexd called `POST /v1/nodes/{id}/audit` — 0 while no contract-legal audit source is wired |
 | `local_metrics_count` | plexd sent metrics to `POST /local/metrics` (TLS) |
 | `local_logs_count` | plexd sent logs to `POST /local/logs` (TLS) |
 | `local_audit_count` | plexd sent audit to `POST /local/audit` (TLS) |
@@ -93,7 +93,7 @@ Uses `GET /test/last-request/{endpoint}` to verify the content of request payloa
 |----------|-----------------|
 | `register` | `token` (non-empty), `hostname` (non-empty), `public_key` (non-empty) |
 | `heartbeat` | Valid JSON with `timestamp` field (node_id is in URL path, not body) |
-| `capabilities` | `builtin_actions` (array with >= 1 entry) |
+| `capabilities` | `binary_version` (non-empty), `binary_checksum` (32-byte base64 digest), and no field the handler rejects as unknown |
 | `metrics` | Array with >= 1 data point |
 
 ### Phase 3: Periodic Loop Verification
@@ -106,7 +106,9 @@ Injects a log file into the plexd container via `docker cp` (the container is di
 
 ### Phase 5: Agent Restart for Audit
 
-The `ProcessSource` uses `sync.Once` to emit a single `process_start` audit entry per process lifetime. Restarting the plexd container creates a new process with a fresh `ProcessSource`, verifying `audit_count` increases.
+The `ProcessSource` uses `sync.Once` to emit a single `process_start` audit entry per process lifetime. Restarting the plexd container creates a new process with a fresh `ProcessSource`, verifying `local_audit_count` increases.
+
+That entry travels to the local endpoint only. Its source is plexd's own `process`, which is not in the audit ingest contract's closed enum (`auditd`, `k8s`), and a record naming a value outside that set refuses the whole batch with `400 ingest_batch_malformed`. The reporter therefore skips it, and the phase also asserts `audit_count == 0`: with no contract-legal audit source wired, the platform leg carries nothing. If the agent grows an auditd or Kubernetes audit reader, that assertion is the thing to update.
 
 ### Phase 6: SSE Event Injection
 
@@ -147,6 +149,10 @@ Uses `GET /test/last-request/local_{metrics,logs,audit}` to verify each local en
 ### Phase 13: Dual Delivery Verification
 
 Asserts that both platform counters (`metrics_count`, `logs_count`, `audit_count`) and local counters (`local_metrics_count`, `local_logs_count`, `local_audit_count`) are all >= 1, proving parallel delivery to both the central API and the local endpoint.
+
+### Phase 20: Bearer Envelope on Every Authenticated Call
+
+Every phase above runs through the mock's bearer-envelope gate, so this one states the outcome: `unauthorized_count` is 0 across the whole run, and the agent log carries no `heartbeat auth failure`. Both halves matter — an agent that registers successfully and is then refused on every later call looks healthy while delivering nothing, which is how the defect in issue #60 reached two releases. A phase that drives an authenticated route itself presents the same envelope, fetched once from `GET /test/bearer`.
 
 ### Phase 14: Graceful Shutdown
 

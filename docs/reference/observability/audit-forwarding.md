@@ -433,7 +433,7 @@ gzip-compressed when the body exceeds 1 KiB. Success is `202 Accepted` with an
 
 | Field       | Type        | JSON Tag      | Description                                    |
 |-------------|-------------|---------------|-----------------------------------------------|
-| `Source`    | `string`    | `"source"`    | Wire source: `auditd`, `k8s`, or `plexd`      |
+| `Source`    | `string`    | `"source"`    | Wire source, closed set: `auditd` or `k8s`    |
 | `Action`    | `string`    | `"action"`    | Action performed (non-empty)                  |
 | `Outcome`   | `string`    | `"outcome"`   | Outcome, taken from the entry's `Result` (non-empty) |
 | `Timestamp` | `time.Time` | `"timestamp"` | Event time (RFC 3339)                         |
@@ -458,7 +458,26 @@ that fall outside the contract:
 |-------------------|---------------|
 | `auditd`    | `auditd` |
 | `k8s-audit` | `k8s`    |
-| `process`   | `plexd` (plexd's own `process_start` event, kept attributable rather than conflated with kernel `auditd` records) |
+| `process`   | *(none — skipped)* |
+
+The wire enum is closed at `auditd` and `k8s`. A record naming anything else
+does not fail on its own line: it refuses the **whole batch** with
+`400 ingest_batch_malformed`, taking every valid record with it.
+
+plexd's own `process_start` entry therefore has no platform representation. It
+used to travel under a `plexd` source the contract has never defined, which
+refused every batch it appeared in — and since `ProcessSource` is the only audit
+source `plexd up` wires, that was every batch. The entry still reaches a
+configured `local_endpoint`, which carries plexd's own richer entry shape rather
+than the platform's four wire fields.
+
+::: warning No platform audit traffic by default
+With only `ProcessSource` wired, the platform leg of audit forwarding carries
+nothing at all. Restoring it needs either a contract-legal source on the agent
+(an `auditd` or Kubernetes audit reader — both source types exist in this
+package but nothing constructs them in `plexd up`) or a `plexd` value added to
+the platform's audit source enum.
+:::
 
 - An entry whose source is **not** in the table above is skipped with a Warn log.
 - An entry with an **empty action or result** is skipped with a Debug log (the

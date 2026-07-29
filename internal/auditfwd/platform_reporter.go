@@ -25,14 +25,19 @@ type IngestClient interface {
 }
 
 // wireSources maps an internal audit source to the source value the audit
-// ingest contract accepts. plexd's own process_start event is reported under
-// the distinct "plexd" source so it stays attributable upstream instead of
-// being conflated with real kernel auditd records. A source absent from this
-// map is not part of the contract and its entries are skipped.
+// ingest contract accepts. The contract's set is closed at `auditd` and `k8s`;
+// a record naming anything else is not refused on its own line but takes the
+// whole batch down with 400 ingest_batch_malformed. A source absent from this
+// map is therefore skipped rather than sent.
+//
+// plexd's own process_start event has no representation here. It was reported
+// under a "plexd" source that the contract does not define, which refused every
+// batch it appeared in — and since it is the only source `plexd up` wires, that
+// was every batch. The event still reaches a configured local endpoint, which
+// carries plexd's own entry shape rather than the platform's closed enum.
 var wireSources = map[string]string{
 	"auditd":    "auditd",
 	"k8s-audit": "k8s",
-	"process":   "plexd",
 }
 
 // PlatformReporter implements AuditReporter by converting each audit entry into
