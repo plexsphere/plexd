@@ -87,9 +87,12 @@ func TestPlatformReporter_SourceMapping(t *testing.T) {
 		t.Fatalf("ReportAudit() error = %v", err)
 	}
 	got := client.calls[0]
-	// plexd's own process_start event carries the distinct "plexd" wire source,
-	// not "auditd" -- it must stay attributable, not conflated with kernel records.
-	wantSource := []string{"auditd", "k8s", "plexd"}
+	// The ingest contract's source enum is closed at auditd and k8s. plexd's own
+	// process entry has no value in that set, and a record naming one outside it
+	// does not fail on its own line — it refuses the whole batch with 400
+	// ingest_batch_malformed, taking the real audit records down with it. So it
+	// is skipped here rather than sent under an invented source.
+	wantSource := []string{"auditd", "k8s"}
 	if len(got) != len(wantSource) {
 		t.Fatalf("sent %d events, want %d", len(got), len(wantSource))
 	}

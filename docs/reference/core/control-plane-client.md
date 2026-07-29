@@ -34,7 +34,7 @@ if err := cfg.Validate(); err != nil {
 
 ## ControlPlane
 
-`ControlPlane` is the core HTTP client. It manages authentication, JSON serialization, gzip compression, and error mapping.
+`ControlPlane` is the core HTTP client. It manages authentication, JSON serialization, request/response compression, and error mapping.
 
 ### Constructor
 
@@ -45,7 +45,7 @@ func NewControlPlane(cfg Config, version string, logger *slog.Logger) (*ControlP
 - Applies config defaults and validates
 - Configures TLS, connect timeout, request timeout
 - Sets `User-Agent: plexd/{version}` on all requests
-- Gzip-compresses request bodies larger than 1 KiB
+- Gzip-compresses request bodies larger than 1 KiB **on the three observability ingest operations only** — they are the ones whose contract accepts `Content-Encoding: gzip`. Every other handler decodes the body as it arrives, so a compressed one is read as JSON and refused with `400`, naming the gzip magic byte as `invalid character '\x1f'`.
 - Transparently decompresses gzip responses
 
 ### Authentication
@@ -58,6 +58,8 @@ client.SetAuthToken(bearer)
 
 Thread-safe via `sync.RWMutex`. The token is injected as `Authorization: Bearer {token}` on every request. After registration the registrar arms the client with the NSK bearer envelope (`nsk_<env>_<base64url(node_id || nsk)>`, see the [registration reference](registration.md#bearertoken)) — never the raw NSK, which the control plane refuses with `401`.
 
+The registrar is the sole owner of this credential: it arms the client on both of its paths (resumed identity and fresh registration), and no other production code calls `SetAuthToken`. One client is shared by every post-registration consumer — heartbeat, SSE, reconciler, key rotator, peer exchange, actions, node API, and the platform reporters — so a later assignment does not degrade one caller, it mutes all of them at once. Callers that need a credential re-armed re-register; they do not set the token themselves.
+
 ### API Methods
 
 All methods accept a `context.Context` for cancellation and return typed responses.
@@ -69,7 +71,7 @@ All methods accept a `context.Context` for cancellation and return typed respons
 | `FetchState`          | `GET`           | `/v1/nodes/{node_id}/state`                       | —                    | `*NodeStateSnapshot`  |
 | `ConnectSSE`          | `GET`           | `/v1/nodes/{node_id}/events`                      | —                    | `*http.Response`      |
 | `RotateKeys`          | `POST`          | `/v1/keys/rotate`                                 | `KeyRotateRequest`   | `*KeyRotateResponse`  |
-| `UpdateCapabilities`  | `PUT`           | `/v1/nodes/{node_id}/capabilities`                | `CapabilitiesPayload`| —                     |
+| `UpdateCapabilities`  | `PUT`           | `/v1/nodes/{node_id}/capabilities`                | `CapabilityManifestRequest`| —               |
 | `ReportEndpoint`      | `PUT`           | `/v1/nodes/{node_id}/endpoint`                    | `EndpointRequest`    | `*EndpointResponse`   |
 | `FetchSecret`         | `GET`           | `/v1/nodes/{node_id}/secrets/{name}` (optional `?version=N`) | —          | `*SecretEnvelope`     |
 | `PutStateReport`      | `PUT`           | `/v1/nodes/{node_id}/state/reports/{key}`          | `NodeStateReportRequest` | `*NodeStateReportResponse` |

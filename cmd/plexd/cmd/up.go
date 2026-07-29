@@ -131,7 +131,15 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// 4. Register (or load existing identity).
 	registrar := newRegistrar(client, cfg.Registration, logger)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	// The command's context is the parent, so a caller that owns one can shut the
+	// daemon down without a signal. Under Execute that context is always
+	// non-nil; a direct call (a test) may leave it unset, which NotifyContext
+	// would panic on.
+	parent := cmd.Context()
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, stop := signal.NotifyContext(parent, syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
 	// Wait group for all goroutines.
@@ -186,8 +194,12 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		healthSrv.SetRegistered()
 	}
 
-	// Set auth token (Register already does this, but be explicit).
-	client.SetAuthToken(identity.NodeSecretKey)
+	// The bearer credential is deliberately not set here. Register arms the
+	// shared client with the bearer envelope on both of its paths — resumed
+	// identity and fresh registration — and that envelope is the only credential
+	// the control plane admits (see NodeIdentity.BearerToken). Re-arming it from
+	// identity.NodeSecretKey, the raw base64 nsk, is answered with 401 on every
+	// subsequent call, which is what this line used to do.
 
 	// 5. Create Ed25519 verifier from the control plane's signing public key.
 	sigKey, err := base64.StdEncoding.DecodeString(identity.SigningPublicKey)
@@ -437,6 +449,14 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("plexd up: binary checksum: %w", err)
 	}
+	// Both operations that carry this digest declare it `format: byte`, so the
+	// wire form is the raw 32 bytes in base64 — the hex form this package works
+	// in is refused (heartbeat: 400 binary_checksum_empty, capabilities: 400
+	// binary_checksum_invalid).
+	wireChecksum, err := integrity.WireChecksum(selfChecksum)
+	if err != nil {
+		return fmt.Errorf("plexd up: binary checksum: %w", err)
+	}
 
 	// 8. Create heartbeat service.
 	hbCfg := agent.HeartbeatConfig{
@@ -449,16 +469,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	}
 	heartbeat := agent.NewHeartbeatService(hbCfg, client, logger)
 	heartbeat.SetReconcileTrigger(reconciler)
-	heartbeat.SetOnAuthFailure(func() {
-		logger.Warn("heartbeat auth failure, attempting re-registration")
-		newIdentity, err := registrar.Register(ctx)
-		if err != nil {
-			logger.Error("re-registration failed", "error", err)
-			return
-		}
-		client.SetAuthToken(newIdentity.NodeSecretKey)
-		logger.Info("re-registration successful", "node_id", newIdentity.NodeID)
-	})
+	heartbeat.SetOnAuthFailure(reRegisterOnAuthFailure(ctx, registrar, logger))
 	heartbeat.SetOnRotateKeys(func() {
 		logger.Info("heartbeat signaled key rotation, starting key rotation")
 		go func() {
@@ -469,7 +480,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	})
 
 	heartbeat.SetBuildRequest(func() api.HeartbeatRequest {
-		return buildHeartbeatRequest(selfChecksum, buildVersion, exchanger.LastResult())
+		return buildHeartbeatRequest(wireChecksum, buildVersion, exchanger.LastResult())
 	})
 
 	// 9. Create integrity verifier for hook execution.
@@ -531,13 +542,19 @@ func runUp(cmd *cobra.Command, _ []string) error {
 			{Name: "since", Type: "string", Required: false, Description: "Duration filter (e.g. 5m, 1h)"},
 		}, actions.LogsSnapshot(&agentLogProvider{ringBuffer: logRingBuffer}))
 
-	// Report capabilities to the control plane.
-	caps := api.CapabilitiesPayload{
-		Binary: &api.BinaryInfo{Version: buildVersion},
+	// Report the capability manifest to the control plane. The manifest carries
+	// the binary version and digest, the SSH host-key fingerprint the integrity
+	// correlator watches for rotation, and the declared hooks. The builtin
+	// action list is deliberately not sent: the contract has no field for it and
+	// the handler rejects unknown ones, so an action list on the wire refuses
+	// the whole manifest. `plexd actions` reads it from the node API instead.
+	_, capsHooks := executor.Capabilities()
+	caps := api.CapabilityManifestRequest{
+		BinaryVersion:         buildVersion,
+		BinaryChecksum:        wireChecksum,
+		SSHHostKeyFingerprint: tunnel.HostKeyFingerprint(hostKey),
+		DeclaredHooks:         declaredHooks(capsHooks, logger),
 	}
-	capsActions, capsHooks := executor.Capabilities()
-	caps.BuiltinActions = capsActions
-	caps.Hooks = capsHooks
 	if err := client.UpdateCapabilities(ctx, identity.NodeID, caps); err != nil {
 		logger.Warn("capabilities report failed", "error", err)
 	}
@@ -1169,6 +1186,57 @@ func signingKeyRotatedHandler(verifier *api.Ed25519Verifier, logger *slog.Logger
 		}
 		logger.Info("signing keys rotated via SSE", "key_id", rot.KeyID)
 		return nil
+	}
+}
+
+// declaredHooks converts the executor's hook inventory into the manifest's
+// declared_hooks entries, re-encoding each checksum from the hex the integrity
+// package works in into the base64 the contract carries.
+//
+// A hook whose checksum is missing or not a SHA-256 digest is dropped with a
+// warning rather than sent: the manifest is validated as a whole, so one
+// unusable entry would cost the binary version and digest of the entire report.
+func declaredHooks(hooks []api.HookInfo, logger *slog.Logger) []api.DeclaredHook {
+	if len(hooks) == 0 {
+		return nil
+	}
+	out := make([]api.DeclaredHook, 0, len(hooks))
+	for _, h := range hooks {
+		checksum, err := integrity.WireChecksum(h.Checksum)
+		if err != nil {
+			logger.Warn("hook omitted from the capability manifest",
+				"hook", h.Name, "error", err)
+			continue
+		}
+		out = append(out, api.DeclaredHook{Name: h.Name, Checksum: checksum})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// reRegisterOnAuthFailure returns the heartbeat's auth-failure callback: a
+// heartbeat the control plane refuses means the node's credential is no longer
+// accepted, and re-registering is the only recovery the agent can perform on
+// its own.
+//
+// The callback deliberately leaves the credential alone. Register arms the
+// shared client with the bearer envelope itself, on both of its paths, so the
+// recovery is complete when it returns. Setting the token here from the
+// returned identity — as this callback once did, with the raw base64
+// NodeSecretKey — replaces the envelope with a credential the control plane
+// answers 401 to, so the next heartbeat fails the same way and the fallback
+// that exists to recover the node is what keeps it broken.
+func reRegisterOnAuthFailure(ctx context.Context, registrar *registration.Registrar, logger *slog.Logger) func() {
+	return func() {
+		logger.Warn("heartbeat auth failure, attempting re-registration")
+		newIdentity, err := registrar.Register(ctx)
+		if err != nil {
+			logger.Error("re-registration failed", "error", err)
+			return
+		}
+		logger.Info("re-registration successful", "node_id", newIdentity.NodeID)
 	}
 }
 

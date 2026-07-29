@@ -43,7 +43,10 @@ else
 fi
 
 # Counter JSON keys (shared across extraction, checking, and reporting).
-COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count metrics_count logs_count audit_count)
+# audit_count is absent: the ingest contract's source enum is closed at auditd
+# and k8s, and the only audit source the agent wires emits plexd's own process
+# entry, which has no value in that set — so no platform audit batch is sent.
+COUNTER_KEYS=(registration_count heartbeat_count state_count capabilities_count metrics_count logs_count)
 
 # Extract all counter values from a JSON response into COUNTER_VALUES.
 extract_counters() {
@@ -176,6 +179,16 @@ done
 if [ "${HEALTH_ELAPSED}" -ge "${HEALTH_TIMEOUT}" ]; then
     fail "mock-api did not become ready within ${HEALTH_TIMEOUT}s"
 fi
+
+# The mock refuses every authenticated /v1 route whose Authorization header is
+# not the NSK bearer envelope, as the control plane does. A phase that drives
+# such a route itself presents the same envelope, fetched from the fixture so
+# the node id and secret keep a single definition.
+MOCK_BEARER=$(curl -sf "http://localhost:18080/test/bearer" | jq -r '.bearer // empty')
+if [ -z "${MOCK_BEARER}" ]; then
+    fail "could not read the mock's bearer envelope from /test/bearer"
+fi
+MOCK_AUTH=(-H "Authorization: Bearer ${MOCK_BEARER}")
 
 # --- Start systemd container and install plexd (REQ-002, REQ-003, REQ-007) ---
 echo "=== Starting systemd container ==="
@@ -355,11 +368,14 @@ if ! echo "${HB_CLIENT_NOW}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+.*(
 fi
 echo "  PASS: heartbeat body client_now='${HB_CLIENT_NOW}' matches RFC 3339"
 
+# binary_checksum is 32 raw bytes in standard-padded base64 (the field is
+# `format: byte`; hex decodes to 48 bytes and the capability manifest refuses it).
 HB_CHECKSUM=$(echo "${HB_BODY}" | jq -r '.binary_checksum // empty')
-if ! echo "${HB_CHECKSUM}" | grep -Eq '^[0-9a-f]{64}$'; then
-    fail "heartbeat binary_checksum='${HB_CHECKSUM}' is not 64-char lowercase hex"
+HB_DIGEST_LEN=$(printf '%s' "${HB_CHECKSUM}" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+if [ "${HB_DIGEST_LEN}" != "32" ]; then
+    fail "heartbeat binary_checksum='${HB_CHECKSUM}' decodes to ${HB_DIGEST_LEN} bytes, want 32"
 fi
-echo "  PASS: heartbeat body binary_checksum is 64-char lowercase hex"
+echo "  PASS: heartbeat body binary_checksum is a 32-byte base64 digest"
 
 HB_VERSION=$(echo "${HB_BODY}" | jq -r '.binary_version // empty')
 if [ -z "${HB_VERSION}" ]; then
@@ -373,16 +389,27 @@ if [ "${HB_NAT_SUMMARY_TYPE}" != "object" ]; then
 fi
 echo "  PASS: heartbeat body nat_summary is a JSON object"
 
-# Capabilities body must contain builtin_actions array.
+# Capability manifest: the contract's flat envelope, with a binary_checksum that
+# decodes to 32 bytes (hex decodes to 48 and is refused) and no field the
+# handler would reject as unknown. The agent's action list is not part of this
+# body — the contract has no field for it; the node API serves it instead.
 CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
 if [ -z "${CAPS_BODY}" ]; then
     fail "no captured capabilities request body"
 fi
-CAPS_COUNT=$(echo "${CAPS_BODY}" | jq '.builtin_actions | length')
-if [ "${CAPS_COUNT}" -lt 1 ]; then
-    fail "capabilities body has empty builtin_actions (want >= 1)"
+CAPS_VERSION=$(echo "${CAPS_BODY}" | jq -r '.binary_version // empty')
+CAPS_CHECKSUM=$(echo "${CAPS_BODY}" | jq -r '.binary_checksum // empty')
+if [ -z "${CAPS_VERSION}" ] || [ -z "${CAPS_CHECKSUM}" ]; then
+    fail "capability manifest missing binary_version or binary_checksum (body: ${CAPS_BODY})"
 fi
-echo "  PASS: capabilities body contains ${CAPS_COUNT} builtin_actions"
+CAPS_DIGEST_LEN=$(printf '%s' "${CAPS_CHECKSUM}" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+if [ "${CAPS_DIGEST_LEN}" != "32" ]; then
+    fail "binary_checksum decodes to ${CAPS_DIGEST_LEN} bytes, want 32"
+fi
+if echo "${CAPS_BODY}" | jq -e 'has("builtin_actions") or has("binary")' >/dev/null 2>&1; then
+    fail "capability manifest carries a field the handler rejects as unknown (body: ${CAPS_BODY})"
+fi
+echo "  PASS: capability manifest is contract-shaped (version=${CAPS_VERSION}, 32-byte digest)"
 
 echo "=== Request body validation PASSED ==="
 
@@ -438,32 +465,44 @@ fi
 echo "=== Testing audit forwarding via service restart ==="
 # ProcessSource fires exactly once per process lifetime (sync.Once).
 # Restarting the service creates a new process with a fresh ProcessSource.
+#
+# That entry reaches the local endpoint, not the platform: its source is plexd's
+# own "process", which has no value in the ingest contract's closed enum
+# (auditd, k8s). Sending it anyway refused the whole batch with 400
+# ingest_batch_malformed, so the reporter skips it and the platform counter must
+# stay at zero.
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
-AUDIT_BEFORE=$(get_counter "${RESPONSE}" "audit_count")
-echo "  audit_count before restart: ${AUDIT_BEFORE}"
+LOCAL_AUDIT_BEFORE=$(get_counter "${RESPONSE}" "local_audit_count")
+echo "  local_audit_count before restart: ${LOCAL_AUDIT_BEFORE}"
 
 docker exec "${SYSTEMD_CONTAINER}" systemctl restart plexd
 
-# Wait for the restarted agent to report a new audit entry.
-AUDIT_TIMEOUT=30
+# Wait for the restarted agent to deliver a new audit entry locally.
+AUDIT_TIMEOUT=60
 AUDIT_ELAPSED=0
 while [ "${AUDIT_ELAPSED}" -lt "${AUDIT_TIMEOUT}" ]; do
     sleep 3
     AUDIT_ELAPSED=$((AUDIT_ELAPSED + 3))
     RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
     if [ -n "${RESPONSE}" ]; then
-        AUDIT_AFTER=$(get_counter "${RESPONSE}" "audit_count")
-        if [ "${AUDIT_AFTER}" -gt "${AUDIT_BEFORE}" ]; then
-            echo "  PASS: audit_count increased from ${AUDIT_BEFORE} to ${AUDIT_AFTER} after restart"
+        LOCAL_AUDIT_AFTER=$(get_counter "${RESPONSE}" "local_audit_count")
+        if [ "${LOCAL_AUDIT_AFTER}" -gt "${LOCAL_AUDIT_BEFORE}" ]; then
+            echo "  PASS: local_audit_count increased from ${LOCAL_AUDIT_BEFORE} to ${LOCAL_AUDIT_AFTER} after restart"
             break
         fi
     fi
 done
 
 if [ "${AUDIT_ELAPSED}" -ge "${AUDIT_TIMEOUT}" ]; then
-    AUDIT_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "audit_count")
-    fail "audit_count did not increase after restart (before=${AUDIT_BEFORE}, after=${AUDIT_AFTER})"
+    LOCAL_AUDIT_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "local_audit_count")
+    fail "local_audit_count did not increase after restart (before=${LOCAL_AUDIT_BEFORE}, after=${LOCAL_AUDIT_AFTER})"
 fi
+
+AUDIT_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "audit_count")
+if [ "${AUDIT_AFTER}" != "0" ]; then
+    fail "platform audit_count = ${AUDIT_AFTER}, want 0: no wired audit source has a value in the contract's closed enum"
+fi
+echo "  PASS: platform audit_count = 0 (no contract-legal source is wired)"
 
 echo "=== Audit forwarding via restart PASSED ==="
 
@@ -501,7 +540,7 @@ ACTEOF
 # into the live snapshot and every other block travels back verbatim. Reading
 # the snapshot is a real GET on the state endpoint and therefore increments
 # state_count; the later phases take their state_count baselines after this.
-STATE_SNAPSHOT=$(curl -sf "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null || true)
+STATE_SNAPSHOT=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null || true)
 if [ -z "${STATE_SNAPSHOT}" ]; then
     fail "could not read the live node state snapshot"
 fi
@@ -705,18 +744,16 @@ if [ -n "${METRICS_BODY}" ]; then
     esac
 fi
 
-# Capabilities: validate specific builtin action names.
+# The capability manifest carries no action list — the contract has no field for
+# one — so the optional fields it does define are what there is to check here.
 CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
 if [ -n "${CAPS_BODY}" ]; then
-    for expected_action in "diagnostics.collect" "system.info" "service.restart"; do
-        HAS_ACTION=$(echo "${CAPS_BODY}" | jq --arg name "${expected_action}" \
-            '[.builtin_actions[] | select(.name == $name)] | length')
-        if [ "${HAS_ACTION}" -ge 1 ]; then
-            echo "  PASS: capabilities includes builtin '${expected_action}'"
-        else
-            echo "  WARN: capabilities missing builtin '${expected_action}'"
-        fi
-    done
+    CAPS_FP=$(echo "${CAPS_BODY}" | jq -r '.ssh_host_key_fingerprint // empty')
+    case "${CAPS_FP}" in
+        SHA256:*) echo "  PASS: ssh_host_key_fingerprint is the canonical SHA256:<base64> form" ;;
+        "") echo "  WARN: capability manifest carries no ssh_host_key_fingerprint" ;;
+        *) fail "ssh_host_key_fingerprint='${CAPS_FP}', want the SHA256:<base64> form" ;;
+    esac
 fi
 
 echo "=== Deeper body validation PASSED ==="

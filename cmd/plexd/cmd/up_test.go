@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,6 +29,7 @@ import (
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
 	"github.com/plexsphere/plexd/internal/policy"
+	"github.com/plexsphere/plexd/internal/registration"
 )
 
 // TestRedactSensitiveLine_SecretKey verifies that the existing redaction logic
@@ -600,9 +605,11 @@ func countingControlPlane(t *testing.T) (baseURL string, requests *atomic.Int32)
 }
 
 // writeUpConfig writes a config file that validates and points at apiBase,
-// with policyBlock appended verbatim, and makes runUp read it. The health
-// listener is off so the test does not bind the node's health port.
-func writeUpConfig(t *testing.T, apiBase, policyBlock string) {
+// with extraYAML appended verbatim as further top-level blocks, and makes runUp
+// read it. The health listener is off so the test does not bind the node's
+// health port. It returns the data_dir the config names, which is where a test
+// that needs runUp to resume an identity seeds one.
+func writeUpConfig(t *testing.T, apiBase, extraYAML string) string {
 	t.Helper()
 
 	// The two blocks this helper pins in the file are also reachable from the
@@ -628,7 +635,7 @@ registration:
   max_retry_duration: 1s
 health:
   enabled: false
-%s`, dir, apiBase, policyBlock)
+%s`, dir, apiBase, extraYAML)
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -641,6 +648,7 @@ health:
 	})
 	cfgFile, apiURL, mode, logLevel = path, "", "", ""
 	projectID, resourceHandle, requestedResourceID = "", "", ""
+	return dir
 }
 
 // useFirewallController points runUp's platform seam at ctrl for one test.
@@ -889,5 +897,526 @@ func TestRunUp_HealthListenFromEnvSurfacesBindError(t *testing.T) {
 	// spent the bootstrap token on the way to failing.
 	if got := requests.Load(); got != 0 {
 		t.Errorf("control plane received %d requests, want 0", got)
+	}
+}
+
+// The node id and secret the fixture control plane hands back, and the values a
+// seeded on-disk identity carries. The two differ so a test can tell which of
+// the two registrar paths produced the credential the daemon then presents.
+const (
+	upTestNodeID     = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3"
+	upResumedNodeID  = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b7"
+	upTestSigningKID = "did:web:plexsphere.com#key-2026-04"
+)
+
+var (
+	// The nsk travels and is stored as standard-padded base64 of 32 bytes; the
+	// bearer envelope carries those bytes decoded.
+	upTestNSKBytes    = bytes.Repeat([]byte{0x2a}, 32)
+	upTestNSK         = base64.StdEncoding.EncodeToString(upTestNSKBytes)
+	upResumedNSKBytes = bytes.Repeat([]byte{0x5b}, 32)
+	upResumedNSK      = base64.StdEncoding.EncodeToString(upResumedNSKBytes)
+	upTestSigningKey  = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, ed25519.PublicKeySize))
+)
+
+// wantBearerEnvelope spells out the credential the control plane admits —
+// nsk_plexd_<base64url(node_id_bytes || nsk_bytes)>, unpadded — from the raw
+// material rather than by calling NodeIdentity.BearerToken, so the assertion
+// pins the wire format itself instead of agreeing with whatever the producer
+// currently emits.
+func wantBearerEnvelope(t *testing.T, nodeID string, nsk []byte) string {
+	t.Helper()
+	idBytes, err := hex.DecodeString(strings.ReplaceAll(nodeID, "-", ""))
+	if err != nil {
+		t.Fatalf("decode node id %q: %v", nodeID, err)
+	}
+	payload := make([]byte, 0, len(idBytes)+len(nsk))
+	payload = append(payload, idBytes...)
+	payload = append(payload, nsk...)
+	return "Bearer nsk_plexd_" + base64.RawURLEncoding.EncodeToString(payload)
+}
+
+// authRecordingControlPlane admits registrations and records the Authorization
+// header of every request that follows one. Every non-register route answers
+// 200 with an empty JSON object: what the daemon makes of those responses is
+// not under test, only the credential it presents while asking.
+type authRecordingControlPlane struct {
+	mu            sync.Mutex
+	registrations int
+	paths         []string
+	auth          map[string]string
+}
+
+func newAuthRecordingControlPlane(t *testing.T) (*authRecordingControlPlane, string) {
+	t.Helper()
+	cp := &authRecordingControlPlane{auth: make(map[string]string)}
+	srv := httptest.NewServer(http.HandlerFunc(cp.serve))
+	t.Cleanup(srv.Close)
+	return cp, srv.URL
+}
+
+func (cp *authRecordingControlPlane) serve(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == http.MethodPost && r.URL.Path == "/v1/register" {
+		cp.mu.Lock()
+		cp.registrations++
+		cp.mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(api.RegisterResponse{
+			NodeID:           upTestNodeID,
+			MeshIP:           "100.64.0.1",
+			SigningPublicKey: upTestSigningKey,
+			SigningKeyID:     upTestSigningKID,
+			NSK:              upTestNSK,
+			DomainMeshCIDR:   "100.64.0.0/10",
+			PeerSnapshot:     []api.RegisterPeer{},
+		})
+		return
+	}
+
+	cp.mu.Lock()
+	if _, seen := cp.auth[r.URL.Path]; !seen {
+		cp.paths = append(cp.paths, r.URL.Path)
+	}
+	cp.auth[r.URL.Path] = r.Header.Get("Authorization")
+	cp.mu.Unlock()
+	_, _ = w.Write([]byte("{}"))
+}
+
+func (cp *authRecordingControlPlane) registerCount() int {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.registrations
+}
+
+// authFor returns the Authorization header last seen on path, and whether the
+// path was requested at all.
+func (cp *authRecordingControlPlane) authFor(path string) (string, bool) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	auth, ok := cp.auth[path]
+	return auth, ok
+}
+
+// allAuth returns the Authorization header last seen on each path.
+func (cp *authRecordingControlPlane) allAuth() map[string]string {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	out := make(map[string]string, len(cp.auth))
+	for path, auth := range cp.auth {
+		out[path] = auth
+	}
+	return out
+}
+
+// waitForAuthenticatedCall blocks until the daemon issues a request that is not
+// the registration itself. Which route arrives first is not fixed —
+// capabilities, heartbeat, the reconcile pull and the event stream all start
+// within moments of each other — so the test waits for any of them rather than
+// for a named one.
+func (cp *authRecordingControlPlane) waitForAuthenticatedCall(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		cp.mu.Lock()
+		seen := len(cp.paths)
+		cp.mu.Unlock()
+		if seen > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no authenticated request reached the control plane after registration")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// assertEveryCallPresentsEnvelope checks the credential on every
+// post-registration request recorded so far. POST /v1/register is the only
+// route that sends no bearer, so everything else the daemon asks for must carry
+// the envelope — they all go through the one client, and which routes have run
+// by now is a matter of scheduling.
+func assertEveryCallPresentsEnvelope(t *testing.T, cp *authRecordingControlPlane, want, rawNSK string) {
+	t.Helper()
+	for path, got := range cp.allAuth() {
+		switch got {
+		case want:
+		case "Bearer " + rawNSK:
+			t.Errorf("Authorization on %s is the raw nsk, which the control plane refuses with 401: %q", path, got)
+		default:
+			t.Errorf("Authorization on %s = %q, want the bearer envelope %q", path, got, want)
+		}
+	}
+}
+
+// upDaemonYAML is the extra config a test needs to run the whole daemon rather
+// than stop at registration: no firewall enforcement, no tunnel listener, and a
+// node-API socket inside the test's own directory.
+func upDaemonYAML(t *testing.T) string {
+	t.Helper()
+	return fmt.Sprintf(`policy:
+  enabled: false
+tunnel:
+  enabled: false
+node_api:
+  socket_path: %s
+`, filepath.Join(t.TempDir(), "api.sock"))
+}
+
+// startRunUp runs the daemon against a context the test owns and returns the
+// shutdown func, which cancels that context and waits for runUp to return.
+func startRunUp(t *testing.T) func() {
+	t.Helper()
+	// The firewall seam is nil rather than a controller: with enforcement off
+	// nothing should reach a backend, and a nil one turns a call that does into
+	// a skipped no-op instead of a panic in a daemon goroutine.
+	useFirewallController(t, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	previous := upCmd.Context()
+	upCmd.SetContext(ctx)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- runUp(upCmd, nil) }()
+
+	return func() {
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Errorf("runUp() = %v, want a clean shutdown", err)
+			}
+		case <-time.After(drainTimeout + 30*time.Second):
+			t.Error("runUp did not return after its context was cancelled")
+		}
+		upCmd.SetContext(previous)
+	}
+}
+
+// seedIdentity writes the identity files LoadIdentity reads, so the next runUp
+// resumes this node instead of registering a new one.
+func seedIdentity(t *testing.T, dataDir, nodeID, nsk string) {
+	t.Helper()
+	err := registration.SaveIdentity(dataDir, &registration.NodeIdentity{
+		NodeID:           nodeID,
+		MeshIP:           "100.64.0.7",
+		SigningPublicKey: upTestSigningKey,
+		SigningKeyID:     upTestSigningKID,
+		DomainMeshCIDR:   "100.64.0.0/10",
+		PrivateKey:       bytes.Repeat([]byte{0x33}, 32),
+		NodeSecretKey:    nsk,
+	})
+	if err != nil {
+		t.Fatalf("seed identity in %s: %v", dataDir, err)
+	}
+}
+
+// The credential runUp leaves on the shared control-plane client is the one
+// every later call presents: heartbeat, reconcile pull, state reports,
+// capability updates, metrics and audit ingest all go through that single
+// client. Only the bearer envelope the registrar assembles is admitted, so a
+// raw nsk left here answers 401 on all of them at once while the node still
+// logs a successful registration and holds a mesh address — the failure this
+// pins is a node that looks healthy and reports nothing.
+//
+// Both registrar paths are covered, because both arm the client and either one
+// can be undone by a later assignment.
+func TestRunUp_PresentsBearerEnvelopeAfterRegistration(t *testing.T) {
+	t.Run("fresh registration", func(t *testing.T) {
+		cp, apiBase := newAuthRecordingControlPlane(t)
+		writeUpConfig(t, apiBase, upDaemonYAML(t))
+
+		shutdown := startRunUp(t)
+		defer shutdown()
+
+		cp.waitForAuthenticatedCall(t)
+		assertEveryCallPresentsEnvelope(t, cp, wantBearerEnvelope(t, upTestNodeID, upTestNSKBytes), upTestNSK)
+		if n := cp.registerCount(); n != 1 {
+			t.Errorf("control plane saw %d registrations, want 1", n)
+		}
+	})
+
+	t.Run("resumed identity", func(t *testing.T) {
+		cp, apiBase := newAuthRecordingControlPlane(t)
+		dataDir := writeUpConfig(t, apiBase, upDaemonYAML(t))
+		seedIdentity(t, dataDir, upResumedNodeID, upResumedNSK)
+
+		shutdown := startRunUp(t)
+		defer shutdown()
+
+		cp.waitForAuthenticatedCall(t)
+		assertEveryCallPresentsEnvelope(t, cp, wantBearerEnvelope(t, upResumedNodeID, upResumedNSKBytes), upResumedNSK)
+		// A resumed identity contacts no one to load itself, so a registration
+		// here would mean the daemon spent a bootstrap token it did not need.
+		if n := cp.registerCount(); n != 0 {
+			t.Errorf("control plane saw %d registrations, want 0 for a resumed identity", n)
+		}
+	})
+}
+
+// The heartbeat's auth-failure fallback is the only recovery the agent can
+// perform on its own from a refused credential, and re-arming the client after
+// it is what turned that recovery into the thing that guaranteed the failure:
+// Register leaves the envelope on the client, an assignment after it replaced
+// the envelope with a credential the control plane answers 401 to, and the next
+// heartbeat one interval later failed the same way, indefinitely.
+func TestReRegisterOnAuthFailure_LeavesTheRegistrarsEnvelopeArmed(t *testing.T) {
+	cp, apiBase := newAuthRecordingControlPlane(t)
+	client, err := api.NewControlPlane(api.Config{BaseURL: apiBase}, "test", discardLogger())
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	// What a 401 heartbeat means: the credential on the client is one the
+	// control plane no longer accepts.
+	client.SetAuthToken("stale-credential")
+
+	registrar := newRegistrar(client, registration.Config{
+		DataDir:          t.TempDir(),
+		TokenValue:       "psb_test_token",
+		ProjectID:        "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0",
+		ResourceHandle:   "auth-failure-test",
+		MaxRetryDuration: time.Second,
+	}, discardLogger())
+
+	reRegisterOnAuthFailure(context.Background(), registrar, discardLogger())()
+
+	if n := cp.registerCount(); n != 1 {
+		t.Fatalf("control plane saw %d registrations, want 1 from the fallback", n)
+	}
+
+	// The credential is only observable in what the client sends, which is also
+	// the only form in which it matters.
+	if _, err := client.Heartbeat(context.Background(), upTestNodeID, api.HeartbeatRequest{}); err != nil {
+		t.Fatalf("Heartbeat after re-registration: %v", err)
+	}
+	path := "/v1/nodes/" + upTestNodeID + "/heartbeat"
+	got, ok := cp.authFor(path)
+	if !ok {
+		t.Fatalf("control plane saw no request on %s", path)
+	}
+	if want := wantBearerEnvelope(t, upTestNodeID, upTestNSKBytes); got != want {
+		t.Errorf("Authorization after the fallback = %q, want the new identity's envelope %q", got, want)
+	}
+	if got == "Bearer "+upTestNSK {
+		t.Error("the fallback left the raw nsk on the client, so the next heartbeat 401s the same way")
+	}
+	if got == "Bearer stale-credential" {
+		t.Error("the fallback left the refused credential on the client")
+	}
+}
+
+// The one rule that keeps the two layers from drifting apart again: the
+// registrar owns the client's bearer, and nothing else assigns it. The
+// production code is the subject — a test may still arm a client to set a
+// scenario up, as the fallback test above does.
+func TestNoProductionCodeOutsideRegistrationSetsTheBearer(t *testing.T) {
+	root := filepath.Join("..", "..", "..")
+	// Where the credential is legitimately owned or defined.
+	allowed := map[string]bool{
+		filepath.Join("internal", "registration", "registrar.go"): true,
+		filepath.Join("internal", "api", "client.go"):             true,
+	}
+
+	var offenders []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" || d.Name() == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".go") || strings.HasSuffix(d.Name(), "_test.go") {
+			return nil
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(string(src), "SetAuthToken(") {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if !allowed[rel] {
+			offenders = append(offenders, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk the tree: %v", err)
+	}
+	for _, file := range offenders {
+		t.Errorf("%s sets the control-plane bearer: Register arms the client with the envelope on every path, so an assignment here can only replace it with something the control plane refuses", file)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Capability manifest and the digest that travels with it
+// ---------------------------------------------------------------------------
+
+// declaredHooks re-encodes each hook's digest into the manifest's wire form and
+// drops what it cannot convert. Dropping matters more than converting: the
+// manifest is validated as a whole, so one unusable entry would cost the binary
+// version and digest of the entire report.
+func TestDeclaredHooks(t *testing.T) {
+	sum := sha256.Sum256([]byte("hook payload"))
+	hexDigest := hex.EncodeToString(sum[:])
+	wantChecksum := base64.StdEncoding.EncodeToString(sum[:])
+
+	got := declaredHooks([]api.HookInfo{
+		{Name: "post-install", Checksum: hexDigest},
+		{Name: "no-checksum"},
+		{Name: "not-a-digest", Checksum: "zzzz"},
+		{Name: "nightly", Checksum: hexDigest},
+	}, discardLogger())
+
+	want := []api.DeclaredHook{
+		{Name: "post-install", Checksum: wantChecksum},
+		{Name: "nightly", Checksum: wantChecksum},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("declaredHooks returned %d entries (%+v), want %d", len(got), got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	// Nil rather than an empty slice: the field is omitempty, and `null` where
+	// the contract expects an array is a decode failure upstream.
+	if got := declaredHooks(nil, discardLogger()); got != nil {
+		t.Errorf("declaredHooks(nil) = %+v, want nil", got)
+	}
+	if got := declaredHooks([]api.HookInfo{{Name: "bad", Checksum: "zzzz"}}, discardLogger()); got != nil {
+		t.Errorf("declaredHooks with no convertible entry = %+v, want nil", got)
+	}
+}
+
+// What the daemon actually puts on the wire for the two operations that carry
+// the binary digest. Both were refused by the control plane before: the
+// heartbeat sent hex where the field is `format: byte`, and the manifest sent a
+// nested `binary` object plus a `builtin_actions` list the handler rejects as
+// unknown fields — gzip-compressed on top, which the handler read as JSON.
+func TestRunUp_CapabilityManifestAndHeartbeatAreContractShaped(t *testing.T) {
+	type capture struct {
+		body     []byte
+		encoding string
+	}
+	var (
+		mu    sync.Mutex
+		calls = map[string]capture{}
+	)
+	record := func(name string, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls[name] = capture{body: raw, encoding: r.Header.Get("Content-Encoding")}
+		mu.Unlock()
+	}
+	get := func(name string) (capture, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		c, ok := calls[name]
+		return c, ok
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/register":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(api.RegisterResponse{
+				NodeID:           upTestNodeID,
+				MeshIP:           "100.64.0.1",
+				SigningPublicKey: upTestSigningKey,
+				SigningKeyID:     upTestSigningKID,
+				NSK:              upTestNSK,
+				DomainMeshCIDR:   "100.64.0.0/10",
+				PeerSnapshot:     []api.RegisterPeer{},
+			})
+			return
+		case strings.HasSuffix(r.URL.Path, "/capabilities"):
+			record("capabilities", r)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			record("heartbeat", r)
+		}
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(srv.Close)
+
+	writeUpConfig(t, srv.URL, upDaemonYAML(t))
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, ok := get("capabilities"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the daemon never reported its capability manifest")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	caps, _ := get("capabilities")
+	// Not compressed: only the three ingest operations accept an encoding.
+	if caps.encoding != "" {
+		t.Errorf("capabilities Content-Encoding = %q, want none", caps.encoding)
+	}
+	// Strict decoding, as the handler does — an unknown field fails here.
+	var manifest api.CapabilityManifestRequest
+	dec := json.NewDecoder(bytes.NewReader(caps.body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&manifest); err != nil {
+		t.Fatalf("manifest is not contract-shaped: %v (body: %s)", err, caps.body)
+	}
+	if strings.TrimSpace(manifest.BinaryVersion) == "" {
+		t.Error("binary_version is empty, which the handler refuses")
+	}
+	assertWireDigest(t, "binary_checksum", manifest.BinaryChecksum)
+	if fp := manifest.SSHHostKeyFingerprint; fp != "" && !strings.HasPrefix(fp, "SHA256:") {
+		t.Errorf("ssh_host_key_fingerprint = %q, want the SHA256:<base64> form", fp)
+	}
+
+	// The heartbeat carries the same digest and must carry it the same way.
+	for {
+		if _, ok := get("heartbeat"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the daemon never sent a heartbeat")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	hb, _ := get("heartbeat")
+	var beat api.HeartbeatRequest
+	if err := json.Unmarshal(hb.body, &beat); err != nil {
+		t.Fatalf("decode heartbeat: %v (body: %s)", err, hb.body)
+	}
+	assertWireDigest(t, "heartbeat binary_checksum", beat.BinaryChecksum)
+}
+
+// assertWireDigest checks a checksum field is the form the contract's
+// `format: byte` declares: 32 bytes, standard-padded base64. Hex is the shape
+// that was refused, and it decodes as base64 to 48 bytes — so the length check
+// is what separates the two.
+func assertWireDigest(t *testing.T, field, value string) {
+	t.Helper()
+	raw, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		t.Errorf("%s = %q, which is not standard base64: %v", field, value, err)
+		return
+	}
+	if len(raw) != sha256.Size {
+		t.Errorf("%s = %q decodes to %d bytes, want %d (a hex digest decodes to 48)", field, value, len(raw), sha256.Size)
 	}
 }

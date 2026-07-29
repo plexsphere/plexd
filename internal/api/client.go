@@ -120,12 +120,14 @@ func (c *ControlPlane) doRequest(ctx context.Context, method, path string, body 
 // doIngest posts a caller-supplied raw body with the given content type to an
 // observability ingest endpoint and decodes the response exactly as doRequest
 // does. It lets the ingest endpoints send a pre-serialized JSON array or NDJSON
-// payload without going through json.Marshal, while keeping identical gzip and
-// error semantics. X-Plexsphere-Sent-At carries the node's wall clock at send
-// time; ingest gate 4 refuses a missing or unparseable value with 400
-// ingest_sent_at_invalid, so it is always stamped in RFC 3339 (nanosecond).
+// payload without going through json.Marshal, while keeping identical error
+// semantics. These are the three operations whose contract accepts a
+// gzip-encoded request body, so they are also the only ones that compress.
+// X-Plexsphere-Sent-At carries the node's wall clock at send time; ingest gate 4
+// refuses a missing or unparseable value with 400 ingest_sent_at_invalid, so it
+// is always stamped in RFC 3339 (nanosecond).
 func (c *ControlPlane) doIngest(ctx context.Context, path, contentType string, raw []byte, result any) error {
-	req, err := c.newRequest(ctx, http.MethodPost, path, contentType, raw)
+	req, err := c.newRequest(ctx, http.MethodPost, path, contentType, raw, true)
 	if err != nil {
 		return err
 	}
@@ -217,8 +219,11 @@ func (c *ControlPlane) doRequestRaw(ctx context.Context, method, path string, bo
 	return resp, nil
 }
 
-// sendRequest builds and executes an HTTP request with standard headers,
-// optional JSON body marshaling, and gzip compression for large payloads.
+// sendRequest builds and executes an HTTP request with standard headers and
+// optional JSON body marshaling. The body is never compressed: only the three
+// observability ingest operations document a `Content-Encoding` other than
+// identity, and a handler that does not expect one reads the gzip header bytes
+// as JSON and answers 400 (see newRequest).
 func (c *ControlPlane) sendRequest(ctx context.Context, method, path string, body any) (*http.Response, error) {
 	var raw []byte
 	contentType := ""
@@ -230,23 +235,32 @@ func (c *ControlPlane) sendRequest(ctx context.Context, method, path string, bod
 		raw = data
 		contentType = "application/json"
 	}
-	req, err := c.newRequest(ctx, method, path, contentType, raw)
+	req, err := c.newRequest(ctx, method, path, contentType, raw, false)
 	if err != nil {
 		return nil, err
 	}
 	return c.httpClient.Do(req)
 }
 
-// newRequest builds an HTTP request from a pre-serialized body. It gzips the
-// body when it exceeds gzipThreshold, sets Content-Type from the parameter when
-// there is a body, and applies the standard Accept, Accept-Encoding,
-// Authorization, and User-Agent headers.
-func (c *ControlPlane) newRequest(ctx context.Context, method, path, contentType string, raw []byte) (*http.Request, error) {
+// newRequest builds an HTTP request from a pre-serialized body, sets
+// Content-Type from the parameter when there is a body, and applies the
+// standard Accept, Accept-Encoding, Authorization, and User-Agent headers.
+//
+// It gzips the body only when allowGzip is set and the body exceeds
+// gzipThreshold. Compression is per-route rather than global because the
+// contract is: the metrics, logs, and audit ingest operations accept `gzip` or
+// `identity` and refuse anything else with 415, while every other operation
+// documents no request encoding at all and decodes the body as it arrives. A
+// gzipped capabilities manifest is therefore answered with 400 — the handler
+// reports the gzip magic byte as `invalid character '\x1f'` — which is what
+// silently muted the capability report on every node whose manifest crossed the
+// threshold.
+func (c *ControlPlane) newRequest(ctx context.Context, method, path, contentType string, raw []byte, allowGzip bool) (*http.Request, error) {
 	var bodyReader io.Reader
 	var compressed bool
 
 	if len(raw) > 0 {
-		if len(raw) > gzipThreshold {
+		if allowGzip && len(raw) > gzipThreshold {
 			var buf bytes.Buffer
 			gw := gzip.NewWriter(&buf)
 			if _, err := gw.Write(raw); err != nil {

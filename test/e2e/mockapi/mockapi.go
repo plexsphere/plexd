@@ -63,6 +63,10 @@ type AssertionCounters struct {
 	LocalMetricsCount       int64 `json:"local_metrics_count"`
 	LocalLogsCount          int64 `json:"local_logs_count"`
 	LocalAuditCount         int64 `json:"local_audit_count"`
+	// UnauthorizedCount counts requests refused by the bearer-envelope gate. A
+	// node that presents the wrong credential drives this above zero, which is
+	// exactly the defect the suite failed to catch before the gate existed.
+	UnauthorizedCount int64 `json:"unauthorized_count"`
 }
 
 // DefaultKeepAliveInterval is the default interval between SSE keep-alive comments.
@@ -134,6 +138,8 @@ type Server struct {
 	lastRotatedKey      string
 	rotationCount       int
 
+	unauthorizedCount atomic.Int64
+
 	lastRequests   map[string][]byte
 	lastRequestsMu sync.RWMutex
 
@@ -199,8 +205,10 @@ func New() *Server {
 }
 
 // Handler returns the http.Handler for use with httptest or a real listener.
+// Every authenticated route is served behind the bearer-envelope gate, so the
+// suite exercises the credential contract rather than assuming it.
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return s.requireBearerEnvelope(s.mux)
 }
 
 // Assertions returns a snapshot of the current call counters.
@@ -228,6 +236,7 @@ func (s *Server) Assertions() AssertionCounters {
 		LocalMetricsCount:       s.localMetricsCount.Load(),
 		LocalLogsCount:          s.localLogsCount.Load(),
 		LocalAuditCount:         s.localAuditCount.Load(),
+		UnauthorizedCount:       s.unauthorizedCount.Load(),
 	}
 }
 
@@ -379,6 +388,9 @@ var (
 	tokenRe = regexp.MustCompile("^psb_[a-z]+_[a-z2-7]+_(node|bridge)_[a-z2-7]{20,}$")
 	// uuidRe matches a canonical 8-4-4-4-12 hex UUID (any version).
 	uuidRe = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+	// sshFingerprintRe matches the capability manifest's optional host-key
+	// fingerprint: the literal SHA256: prefix and a base64 body, padded or not.
+	sshFingerprintRe = regexp.MustCompile(`^SHA256:[A-Za-z0-9+/]+={0,2}$`)
 )
 
 // releaseFixtures holds the plexd release binary and its Sigstore bundle served
@@ -457,6 +469,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /test/configure-events", s.handleConfigureEvents)
 	s.mux.HandleFunc("POST /test/inject-event", s.handleInjectEvent)
 	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
+	s.mux.HandleFunc("GET /test/bearer", s.handleBearer)
 
 	// Method-not-allowed fallbacks.
 	s.mux.HandleFunc("/v1/health", methodNotAllowed)
@@ -1027,14 +1040,80 @@ func (s *Server) handleKeyRotate(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleCapabilities handles PUT /v1/nodes/{id}/capabilities.
+// handleCapabilities handles PUT /v1/nodes/{id}/capabilities, the capability
+// manifest. It strict-decodes the contract's envelope and enforces its
+// invariants: a non-empty binary_version, a binary_checksum that decodes to
+// exactly 32 bytes, a canonical ssh_host_key_fingerprint when present, and
+// declared_hooks that are unique, named, and carry a 32-byte digest.
+//
+// Strictness is the point. The fixture used to decode into whatever shape the
+// agent happened to send and count it, so a manifest the real handler refuses
+// — the wrong envelope, a hex checksum, or a gzip-encoded body — passed here
+// and the capability report was silently dead on every deployed node.
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
-	var req api.CapabilitiesPayload
-	if !s.decodeBody(w, r, "capabilities", &req) {
+	data, err := s.captureBody("capabilities", r)
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_capabilities_request", "invalid request body")
 		return
 	}
+
+	var req api.CapabilityManifestRequest
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_capabilities_request",
+			"request body is not a valid CapabilityManifestRequest envelope: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(req.BinaryVersion) == "" {
+		writeProblem(w, r, http.StatusBadRequest, "binary_version_empty", "binary_version is required")
+		return
+	}
+	if !isBase64Digest(req.BinaryChecksum) {
+		writeProblem(w, r, http.StatusBadRequest, "binary_checksum_invalid",
+			"binary_checksum must be 32 bytes, standard-padded base64")
+		return
+	}
+	if req.SSHHostKeyFingerprint != "" && !sshFingerprintRe.MatchString(req.SSHHostKeyFingerprint) {
+		writeProblem(w, r, http.StatusBadRequest, "ssh_host_key_fingerprint_invalid",
+			"ssh_host_key_fingerprint must match SHA256:<base64>")
+		return
+	}
+	if len(req.DeclaredHooks) > maxDeclaredHooks {
+		writeProblem(w, r, http.StatusBadRequest, "declared_hooks_too_many",
+			fmt.Sprintf("declared_hooks carries %d entries, at most %d are accepted", len(req.DeclaredHooks), maxDeclaredHooks))
+		return
+	}
+	seen := make(map[string]struct{}, len(req.DeclaredHooks))
+	for _, h := range req.DeclaredHooks {
+		if strings.TrimSpace(h.Name) == "" || !isBase64Digest(h.Checksum) {
+			writeProblem(w, r, http.StatusBadRequest, "declared_hook_invalid",
+				"each declared hook needs a name and a 32-byte base64 checksum")
+			return
+		}
+		if _, dup := seen[h.Name]; dup {
+			writeProblem(w, r, http.StatusBadRequest, "declared_hook_duplicate",
+				"declared_hooks names must be unique: "+h.Name)
+			return
+		}
+		seen[h.Name] = struct{}{}
+	}
+
 	s.capabilitiesCount.Add(1)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// maxDeclaredHooks is the manifest's per-request declared_hooks ceiling.
+const maxDeclaredHooks = 128
+
+// isBase64Digest reports whether v is a SHA-256 digest in the wire form the
+// manifest carries: exactly 32 bytes, standard-padded base64. Hex is refused —
+// it decodes as base64 to 48 bytes, which is the shape that made this check
+// worth having.
+func isBase64Digest(v string) bool {
+	raw, err := base64.StdEncoding.DecodeString(v)
+	return err == nil && len(raw) == sha256.Size
 }
 
 // handleEndpoint handles PUT /v1/nodes/{id}/endpoint. It enforces the v1
@@ -1546,9 +1625,13 @@ func validLogSeverity(sev string) bool {
 }
 
 // validAuditSource reports whether src is inside the closed audit-source enum.
+// validAuditSource reports whether src is in the audit ingest contract's closed
+// set. The set is exactly `auditd` and `k8s`; the fixture used to also admit
+// `plexd`, which the contract has never defined, so a batch the real control
+// plane refuses whole with 400 ingest_batch_malformed was accepted here.
 func validAuditSource(src string) bool {
 	switch src {
-	case "auditd", "k8s", "plexd":
+	case "auditd", "k8s":
 		return true
 	default:
 		return false
@@ -2125,6 +2208,109 @@ func encryptSecret(nsk []byte, plaintext string) []byte {
 		panic("mockapi: rand.Read nonce: " + err.Error())
 	}
 	return gcm.Seal(nonceBytes, nonceBytes, []byte(plaintext), nil)
+}
+
+// BearerEnvelope returns the credential every authenticated route admits, in
+// the exact form a client must present it. The e2e scripts fetch it from
+// GET /test/bearer so the fixture keeps one source of truth for the node id and
+// the nsk, and the `<env>` segment is deliberately not the agent's `plexd`: the
+// gate gets its authority from the payload, not from the tag.
+func (s *Server) BearerEnvelope() string {
+	return "nsk_e2e_" + base64.RawURLEncoding.EncodeToString(bearerPayload(s.nsk))
+}
+
+// bearerPayload is the 48 bytes an envelope carries: the node's UUID followed
+// by the decoded node secret key.
+func bearerPayload(nsk []byte) []byte {
+	id, err := hex.DecodeString(strings.ReplaceAll(mockNodeID, "-", ""))
+	if err != nil {
+		panic("mockapi: decode mock node id: " + err.Error())
+	}
+	return append(id, nsk...)
+}
+
+// requiresBearer reports whether path is an authenticated control-plane route.
+// POST /v1/register is `security: []` in the spec and GET /v1/health is the
+// probe the compose healthcheck dials, so both are exempt; everything else
+// under /v1 is a node route. The /test, /releases and /exec-output surfaces are
+// fixture scaffolding and a presigned upload, none of which carry a bearer.
+func requiresBearer(path string) bool {
+	if !strings.HasPrefix(path, "/v1/") {
+		return false
+	}
+	return path != "/v1/register" && path != "/v1/health"
+}
+
+// requireBearerEnvelope refuses any authenticated route whose Authorization
+// header is not the NSK bearer envelope
+// (`nsk_<env>_<base64url(node_id(16) || nsk(32))>`, unpadded) for this node.
+//
+// The mock used to admit every credential and check only the node id in the
+// path, which is why the whole suite stayed green through two releases in which
+// the agent presented the raw nsk and every deployed node answered 401 from the
+// control plane (issues #56, #60). A fixture that accepts anything cannot fail
+// on the one thing every deployed node depends on.
+func (s *Server) requireBearerEnvelope(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !requiresBearer(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if detail := s.checkBearerEnvelope(r.Header.Get("Authorization")); detail != "" {
+			s.unauthorizedCount.Add(1)
+			writeProblem(w, r, http.StatusUnauthorized, "unauthorized", detail)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// checkBearerEnvelope returns "" when auth carries this node's envelope, and
+// otherwise the reason it was refused. The shape check mirrors the control
+// plane's: three underscore-separated segments, `nsk` then a non-empty
+// environment tag then an unpadded base64url payload of exactly 48 bytes, whose
+// halves are the node id and the node secret key.
+func (s *Server) checkBearerEnvelope(auth string) string {
+	const prefix = "Bearer "
+	if auth == "" {
+		return "Authorization header is required"
+	}
+	if !strings.HasPrefix(auth, prefix) {
+		return "Authorization must use the Bearer scheme"
+	}
+	token := strings.TrimPrefix(auth, prefix)
+
+	// SplitN with a limit of 3, not Split: the payload is base64url, whose
+	// alphabet includes the underscore, so splitting on every separator tears a
+	// valid credential apart. Only the first two underscores delimit segments.
+	segments := strings.SplitN(token, "_", 3)
+	if len(segments) != 3 || segments[0] != "nsk" || segments[1] == "" {
+		return "Authorization Bearer credential must be an NSK envelope"
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(segments[2])
+	if err != nil {
+		return "Authorization Bearer credential must be an NSK envelope: payload is not unpadded base64url"
+	}
+	want := bearerPayload(s.nsk)
+	if len(payload) != len(want) {
+		return fmt.Sprintf("Authorization Bearer credential must be an NSK envelope: payload is %d bytes, want %d", len(payload), len(want))
+	}
+	if !bytes.Equal(payload[:16], want[:16]) {
+		return "Authorization Bearer credential names an unknown node"
+	}
+	if !bytes.Equal(payload[16:], want[16:]) {
+		return "Authorization Bearer credential does not match this node's secret key"
+	}
+	return ""
+}
+
+// handleBearer serves GET /test/bearer, the credential the scripts present when
+// they drive an authenticated route themselves.
+func (s *Server) handleBearer(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]string{"bearer": s.BearerEnvelope()}); err != nil {
+		slog.Error("handleBearer: encode failed", "error", err)
+	}
 }
 
 // validateLocalAuth checks the Authorization header for the expected bearer token.

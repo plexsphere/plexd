@@ -77,9 +77,9 @@ func (c *ControlPlane) RotateKeys(ctx context.Context, req KeyRotateRequest) (*K
 	return &resp, nil
 }
 
-// UpdateCapabilities publishes the node's capabilities.
+// UpdateCapabilities publishes the node's capability manifest.
 // PUT /v1/nodes/{node_id}/capabilities
-func (c *ControlPlane) UpdateCapabilities(ctx context.Context, nodeID string, caps CapabilitiesPayload) error {
+func (c *ControlPlane) UpdateCapabilities(ctx context.Context, nodeID string, caps CapabilityManifestRequest) error {
 	path := fmt.Sprintf("/v1/nodes/%s/capabilities", url.PathEscape(nodeID))
 	return c.doRequest(ctx, http.MethodPut, path, caps, nil)
 }

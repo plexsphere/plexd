@@ -2,6 +2,7 @@ package integrity
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"math/rand/v2"
@@ -213,5 +214,59 @@ func TestHashFile_LargeFile(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("HashFile(1MiB) = %s, want %s", got, want)
+	}
+}
+
+// The control plane declares every checksum field `format: byte`, so the wire
+// form is the raw digest in base64 — a hex string decodes as base64 to 48
+// bytes and is refused (400 binary_checksum_empty on the heartbeat,
+// binary_checksum_invalid on the capability manifest).
+func TestWireChecksum(t *testing.T) {
+	sum := sha256.Sum256([]byte("plexd"))
+	hexDigest := hex.EncodeToString(sum[:])
+
+	got, err := WireChecksum(hexDigest)
+	if err != nil {
+		t.Fatalf("WireChecksum(%q): %v", hexDigest, err)
+	}
+	if want := base64.StdEncoding.EncodeToString(sum[:]); got != want {
+		t.Errorf("WireChecksum = %q, want %q", got, want)
+	}
+	// Standard padding, and a payload that decodes to exactly the digest.
+	raw, err := base64.StdEncoding.DecodeString(got)
+	if err != nil {
+		t.Fatalf("result is not standard base64: %v", err)
+	}
+	if len(raw) != sha256.Size {
+		t.Errorf("decoded %d bytes, want %d", len(raw), sha256.Size)
+	}
+
+	for name, in := range map[string]string{
+		"empty":          "",
+		"not hex":        "zzzz",
+		"short digest":   hex.EncodeToString(sum[:16]),
+		"already base64": base64.StdEncoding.EncodeToString(sum[:]),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := WireChecksum(in); err == nil {
+				t.Errorf("WireChecksum(%q) = nil error, want a rejection", in)
+			}
+		})
+	}
+}
+
+// The digest that actually travels comes from HashFile, so the two have to
+// compose: whatever HashFile returns must be convertible.
+func TestWireChecksum_AcceptsHashFileOutput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "binary")
+	if err := os.WriteFile(path, []byte("contents"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	hexDigest, err := HashFile(path)
+	if err != nil {
+		t.Fatalf("HashFile: %v", err)
+	}
+	if _, err := WireChecksum(hexDigest); err != nil {
+		t.Errorf("WireChecksum(HashFile(...)) = %v, want it to convert", err)
 	}
 }

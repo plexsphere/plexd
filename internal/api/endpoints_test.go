@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -358,22 +360,72 @@ func TestUpdateCapabilities_Success(t *testing.T) {
 			t.Errorf("path = %s, want /v1/nodes/n1/capabilities", r.URL.Path)
 		}
 
-		var caps CapabilitiesPayload
-		if err := json.NewDecoder(r.Body).Decode(&caps); err != nil {
-			t.Fatalf("decode request: %v", err)
+		// The handler decodes with DisallowUnknownFields, so the body must
+		// carry the contract's flat fields and nothing else — a nested
+		// `binary` object or a `builtin_actions` list refuses the manifest.
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request: %v", err)
 		}
-		if len(caps.BuiltinActions) != 1 {
-			t.Errorf("len(BuiltinActions) = %d, want 1", len(caps.BuiltinActions))
+		var caps CapabilityManifestRequest
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&caps); err != nil {
+			t.Fatalf("strict decode of the manifest: %v (body: %s)", err, raw)
+		}
+		if caps.BinaryVersion != "v1.2.3" {
+			t.Errorf("binary_version = %q, want %q", caps.BinaryVersion, "v1.2.3")
+		}
+		if caps.BinaryChecksum != testDigestB64 {
+			t.Errorf("binary_checksum = %q, want %q", caps.BinaryChecksum, testDigestB64)
+		}
+		if len(caps.DeclaredHooks) != 1 || caps.DeclaredHooks[0].Name != "post-install" {
+			t.Errorf("declared_hooks = %+v, want one entry named post-install", caps.DeclaredHooks)
 		}
 
 		w.WriteHeader(http.StatusOK)
 	})
 
-	err := client.UpdateCapabilities(context.Background(), "n1", CapabilitiesPayload{
-		BuiltinActions: []ActionInfo{{Name: "restart", Description: "restart service"}},
+	err := client.UpdateCapabilities(context.Background(), "n1", CapabilityManifestRequest{
+		BinaryVersion:         "v1.2.3",
+		BinaryChecksum:        testDigestB64,
+		SSHHostKeyFingerprint: "SHA256:6QGz1Q4iE2zG5p2N3oRZb8ZsT4nKqJgY3oZmP8eFvWk",
+		DeclaredHooks:         []DeclaredHook{{Name: "post-install", Checksum: testDigestB64}},
 	})
 	if err != nil {
 		t.Fatalf("UpdateCapabilities: %v", err)
+	}
+}
+
+// testDigestB64 is a SHA-256 digest in the wire form the manifest carries:
+// 32 bytes, standard-padded base64.
+var testDigestB64 = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x7f}, sha256.Size))
+
+// An omitted host-key fingerprint and an empty hook list must not travel as
+// explicit nulls: the manifest's optional fields are absent when unset, and a
+// `null` where the contract expects an array is a decode failure upstream.
+func TestUpdateCapabilities_OmitsEmptyOptionalFields(t *testing.T) {
+	var body []byte
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request: %v", err)
+		}
+		body = raw
+		w.WriteHeader(http.StatusOK)
+	})
+
+	err := client.UpdateCapabilities(context.Background(), "n1", CapabilityManifestRequest{
+		BinaryVersion:  "v1.2.3",
+		BinaryChecksum: testDigestB64,
+	})
+	if err != nil {
+		t.Fatalf("UpdateCapabilities: %v", err)
+	}
+	for _, absent := range []string{"ssh_host_key_fingerprint", "declared_hooks", "null"} {
+		if strings.Contains(string(body), absent) {
+			t.Errorf("manifest body carries %q, want it omitted: %s", absent, body)
+		}
 	}
 }
 
