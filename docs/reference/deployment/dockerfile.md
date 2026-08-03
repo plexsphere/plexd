@@ -37,8 +37,10 @@ The Makefile target produces the image tagged as `ghcr.io/plexsphere/plexd:dev`.
 | `VERSION` | `dev` | Version string injected via `-X main.version` ldflags |
 | `COMMIT` | `none` | Git commit hash injected via `-X main.commit` ldflags |
 | `DATE` | `unknown` | Build date injected via `-X main.date` ldflags |
-| `TARGETOS` | `linux` | Target operating system for cross-compilation (`GOOS`) |
-| `TARGETARCH` | `amd64` | Target architecture for cross-compilation (`GOARCH`) |
+| `TARGETOS` | none (set by BuildKit) | Target operating system for cross-compilation (`GOOS`) |
+| `TARGETARCH` | none (set by BuildKit) | Target architecture for cross-compilation (`GOARCH`) |
+
+`TARGETOS` and `TARGETARCH` are declared without defaults on purpose: BuildKit sets them per platform, and a declared default would override the per-platform values — a multi-arch build would then stamp every variant with the default architecture ([#70](https://github.com/plexsphere/plexd/issues/70)).
 
 Example with explicit version metadata:
 
@@ -63,6 +65,8 @@ var (
 ## Multi-Platform Builds
 
 The Dockerfile supports building for `linux/amd64` and `linux/arm64` using Docker BuildKit's automatic `TARGETOS` and `TARGETARCH` arguments.
+
+After compiling, the builder stage verifies with `go version -m` that the binary's `GOOS` and `GOARCH` match the requested `TARGETPLATFORM` and fails the build on a mismatch, so a platform/binary drift cannot reach a published image again.
 
 Build for a single platform:
 
