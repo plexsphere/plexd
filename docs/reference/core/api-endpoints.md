@@ -69,9 +69,14 @@ Each `peer_snapshot` entry is a narrow `RegisterPeer` (`node_id`, `mesh_ip`,
 `endpoint`.
 
 **Errors** are RFC 9457 `application/problem+json` bodies (`type`, `title`,
-`status`, `detail`, `instance`, and an optional machine-readable `code`). plexd
-classifies each failure on the HTTP status and `code`; unknown codes are
-tolerated. The bootstrap token is **never consumed on an error branch**.
+`status`, `detail`, `instance`, an optional `correlation_id`, and an optional
+machine-readable `code`). Every error response also carries the id on the
+`X-Correlation-Id` response header; plexd reads the body member first and falls
+back to the header, and reads neither from a response that is not
+`application/problem+json`. plexd classifies each failure on the HTTP status and
+`code`; unknown codes are tolerated. plexd carries the id it read into the error
+string of the failed call, so an operator can quote it against the control-plane
+log. The bootstrap token is **never consumed on an error branch**.
 
 | Status | Problem `code`(s) | Meaning | plexd behavior |
 |---|---|---|---|

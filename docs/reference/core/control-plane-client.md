@@ -117,6 +117,8 @@ if errors.Is(err, api.ErrUnauthorized) {
 }
 ```
 
+`APIError.CorrelationID` carries the `correlation_id` member of the control plane's problem document; when the document has no id, the client falls back to the `X-Correlation-Id` header of that same response. Both sources are read only from an `application/problem+json` response, so an id minted by a proxy or gateway that answered in place of the control plane is not presented as a control-plane id. The header itself is not authenticated, so that gate is the whole guarantee: a tracing proxy that passes the control plane's problem document through untouched and stamps its own `X-Correlation-Id` on it is indistinguishable, and a fallback id may be that proxy's request id rather than one the control-plane log keys. The field also stays empty for an id longer than 256 bytes, which is dropped rather than truncated because a truncated id keys nothing, and any unprintable rune is stripped — from the message the error string renders alongside the id as well — so a hostile intermediary cannot forge a log line or emit a terminal escape through the error string. `APIError.Code`, the third response-derived field the error string renders, is guarded by rejection rather than stripping: a code longer than 128 bytes or carrying any unprintable rune is dropped whole, because stripping a rune out of it could collapse a forged code onto a live one the classifiers branch on. A set id is appended to the error string as a trailing ` (correlation_id=...)` segment, so every logged failure line carries it. The id keys the control-plane log, so an operator can quote it there.
+
 ## SSEManager
 
 `SSEManager` is the top-level orchestrator that wires together SSE streaming, reconnection, verification, and event dispatching.
