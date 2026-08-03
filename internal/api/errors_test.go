@@ -2,12 +2,15 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
+	"unicode"
 )
 
 // newResponse creates a minimal *http.Response for testing errorFromResponse.
@@ -177,6 +180,275 @@ func TestErrorFromResponse_ProblemJSON_TaxonomyCodes(t *testing.T) {
 	}
 }
 
+func TestErrorFromResponse_ProblemJSON_CorrelationID(t *testing.T) {
+	body := `{"type":"about:blank","title":"error","status":403,"detail":"enrollment token has expired","instance":"/v1/register","code":"token_expired","correlation_id":"3f2a"}`
+	resp := newResponse(403, body, map[string]string{"Content-Type": "application/problem+json"})
+	err := errorFromResponse(resp)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected errors.As to extract *APIError")
+	}
+	if apiErr.CorrelationID != "3f2a" {
+		t.Errorf("expected CorrelationID=3f2a, got %q", apiErr.CorrelationID)
+	}
+	if apiErr.Code != "token_expired" {
+		t.Errorf("expected Code=token_expired, got %q", apiErr.Code)
+	}
+}
+
+// TestErrorFromResponse_ProblemJSON_NonStringCorrelationID guards the code
+// member — which the IsXxx classifiers branch on — against an id of an
+// unexpected JSON type. Numeric trace ids are common; decoding one into a
+// string field yields an *json.UnmarshalTypeError that must not discard the
+// rest of the problem document.
+func TestErrorFromResponse_ProblemJSON_NonStringCorrelationID(t *testing.T) {
+	body := `{"type":"about:blank","title":"error","status":501,"detail":"event bus not provisioned","code":"signed_event_bus_not_provisioned","correlation_id":8749203847}`
+	resp := newResponse(501, body, map[string]string{"Content-Type": "application/problem+json"})
+	err := errorFromResponse(resp)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected errors.As to extract *APIError")
+	}
+	if apiErr.Code != "signed_event_bus_not_provisioned" {
+		t.Errorf("expected Code=signed_event_bus_not_provisioned, got %q", apiErr.Code)
+	}
+	if apiErr.Message != "event bus not provisioned" {
+		t.Errorf("expected Message from detail, got %q", apiErr.Message)
+	}
+	if apiErr.CorrelationID != "" {
+		t.Errorf("expected empty CorrelationID for a non-string member, got %q", apiErr.CorrelationID)
+	}
+	if !IsEventBusNotProvisioned(err) {
+		t.Error("expected IsEventBusNotProvisioned to classify the response")
+	}
+}
+
+func TestErrorFromResponse_CorrelationID_HeaderFallback(t *testing.T) {
+	body := problemJSON(403, "enrollment token has expired", "token_expired")
+	resp := newResponse(403, body, map[string]string{
+		"Content-Type":     "application/problem+json",
+		"X-Correlation-Id": "3f2a",
+	})
+	err := errorFromResponse(resp)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected errors.As to extract *APIError")
+	}
+	if apiErr.CorrelationID != "3f2a" {
+		t.Errorf("expected CorrelationID=3f2a from the header, got %q", apiErr.CorrelationID)
+	}
+}
+
+func TestErrorFromResponse_CorrelationID_EmptyMemberFallsBackToHeader(t *testing.T) {
+	body := `{"type":"about:blank","title":"error","status":403,"detail":"denied","code":"token_expired","correlation_id":""}`
+	resp := newResponse(403, body, map[string]string{
+		"Content-Type":     "application/problem+json",
+		"X-Correlation-Id": "3f2a",
+	})
+	err := errorFromResponse(resp)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected errors.As to extract *APIError")
+	}
+	if apiErr.CorrelationID != "3f2a" {
+		t.Errorf("expected CorrelationID=3f2a from the header, got %q", apiErr.CorrelationID)
+	}
+}
+
+func TestErrorFromResponse_CorrelationID_AbsentLeavesFieldEmpty(t *testing.T) {
+	body := problemJSON(403, "enrollment token has expired", "token_expired")
+	resp := newResponse(403, body, map[string]string{"Content-Type": "application/problem+json"})
+	err := errorFromResponse(resp)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected errors.As to extract *APIError")
+	}
+	if apiErr.CorrelationID != "" {
+		t.Errorf("expected empty CorrelationID, got %q", apiErr.CorrelationID)
+	}
+}
+
+// errReader is a response body that fails on the first read.
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("connection reset") }
+
+func TestErrorFromResponse_UnreadableBody_HeaderCorrelationID(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: 500,
+		Header:     http.Header{},
+		Body:       io.NopCloser(errReader{}),
+	}
+	resp.Header.Set("Content-Type", "application/problem+json")
+	resp.Header.Set("X-Correlation-Id", "3f2a")
+	err := errorFromResponse(resp)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected errors.As to extract *APIError")
+	}
+	if apiErr.CorrelationID != "3f2a" {
+		t.Errorf("expected CorrelationID=3f2a from the header, got %q", apiErr.CorrelationID)
+	}
+}
+
+func TestErrorFromResponse_CorrelationID_Sanitized(t *testing.T) {
+	oversized := strings.Repeat("a", 300)
+	tests := []struct {
+		name    string
+		header  string
+		want    string
+		wantLen int
+	}{
+		{"oversized id is dropped, not truncated", oversized, "", 0},
+		{"id at the size bound is kept", oversized[:256], oversized[:256], 256},
+		{"invalid UTF-8 is dropped", "abc\xff\xfedef", "abcdef", 6},
+		{"surrounding whitespace is trimmed", "  3f2a  ", "3f2a", 4},
+		{"newline is dropped", "3f2a\nlevel=info msg=\"registration succeeded\"", `3f2alevel=info msg="registration succeeded"`, 43},
+		{"ANSI escape is dropped", "3f2a\x1b[2J\x1b[1;1H", "3f2a[2J[1;1H", 12},
+		{"NUL and carriage return are dropped", "3f\x002a\r", "3f2a", 4},
+		{"bidi override is dropped", "3f2a\u202e", "3f2a", 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := problemJSON(400, "public key is malformed", "public_key_invalid")
+			resp := newResponse(400, body, map[string]string{
+				"Content-Type":     "application/problem+json",
+				"X-Correlation-Id": tt.header,
+			})
+			err := errorFromResponse(resp)
+
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("expected errors.As to extract *APIError")
+			}
+			if apiErr.CorrelationID != tt.want {
+				t.Errorf("expected CorrelationID=%q, got %q", tt.want, apiErr.CorrelationID)
+			}
+			if len(apiErr.CorrelationID) != tt.wantLen {
+				t.Errorf("expected CorrelationID of %d bytes, got %d", tt.wantLen, len(apiErr.CorrelationID))
+			}
+		})
+	}
+}
+
+// TestErrorFromResponse_Message_Sanitized guards the message the way
+// TestErrorFromResponse_CorrelationID_Sanitized guards the id: APIError.Error
+// splices both into the one string cobra prints to stderr unescaped, so a
+// detail, a title or a raw body carrying terminal escapes must not reach the
+// operator's screen through the message either.
+func TestErrorFromResponse_Message_Sanitized(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		want        string
+	}{
+		{
+			name:        "escape sequence and newline in detail",
+			contentType: "application/problem+json",
+			body:        `{"type":"about:blank","title":"error","status":500,"detail":"\u001b[2J\u001b[1;1Hplexd: registration succeeded\n","code":"internal"}`,
+			want:        " [2J [1;1Hplexd: registration succeeded ",
+		},
+		{
+			name:        "bell in the title the message falls back to",
+			contentType: "application/problem+json",
+			body:        `{"type":"about:blank","title":"denied\u0007","status":422,"detail":""}`,
+			want:        "denied ",
+		},
+		{
+			name:        "raw non-problem body is taken verbatim but sanitized",
+			contentType: "text/plain",
+			body:        "boom\x1b[2J\r\nlevel=info msg=\"registration succeeded\"",
+			want:        "boom [2J  level=info msg=\"registration succeeded\"",
+		},
+		{
+			name:        "invalid UTF-8 in a raw body is dropped",
+			contentType: "text/plain",
+			body:        "boom\xff\xfe",
+			want:        "boom",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := newResponse(500, tt.body, map[string]string{"Content-Type": tt.contentType})
+			err := errorFromResponse(resp)
+
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("expected errors.As to extract *APIError")
+			}
+			if apiErr.Message != tt.want {
+				t.Errorf("expected Message=%q, got %q", tt.want, apiErr.Message)
+			}
+			if strings.ContainsFunc(apiErr.Error(), func(r rune) bool { return !unicode.IsPrint(r) }) {
+				t.Errorf("expected a printable error string, got %q", apiErr.Error())
+			}
+		})
+	}
+}
+
+// TestErrorFromResponse_Code_Sanitized guards the code member the way
+// TestErrorFromResponse_Message_Sanitized guards the message: APIError.Error
+// splices the code into that same string cobra prints to stderr unescaped. The
+// code is rejected whole rather than scrubbed because the IsXxx classifiers and
+// internal/actions/executor.go compare it for equality — stripping the NUL out
+// of a forged "clock\x00_skew" would hand it the live "clock_skew" branch.
+func TestErrorFromResponse_Code_Sanitized(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		want string
+	}{
+		{"a taxonomy code passes through", "token_expired", "token_expired"},
+		{"ANSI escape is rejected whole", "x\x1b[2Jplexd: ok", ""},
+		{"NUL that would collapse onto a live code is rejected whole", "clock\x00_skew", ""},
+		{"newline is rejected whole", "token_expired\nlevel=info msg=\"registration succeeded\"", ""},
+		{"bidi override is rejected whole", "token_expired\u202e", ""},
+		{"oversized code is rejected whole", strings.Repeat("a", 129), ""},
+		{"code at the size bound is kept", strings.Repeat("a", 128), strings.Repeat("a", 128)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The code is marshalled rather than interpolated so that a
+			// control character reaches the decoder as the \u00xx escape
+			// JSON requires, not as a raw byte that would fail the parse
+			// and send Message down the raw-body branch instead.
+			encoded, marshalErr := json.Marshal(tt.code)
+			if marshalErr != nil {
+				t.Fatalf("marshalling the code: %v", marshalErr)
+			}
+			body := fmt.Sprintf(
+				`{"type":"about:blank","title":"error","status":500,"detail":"failed","code":%s}`,
+				encoded,
+			)
+			resp := newResponse(500, body, map[string]string{"Content-Type": "application/problem+json"})
+			err := errorFromResponse(resp)
+
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("expected errors.As to extract *APIError")
+			}
+			if apiErr.Code != tt.want {
+				t.Errorf("expected Code=%q, got %q", tt.want, apiErr.Code)
+			}
+			// The rest of the document must survive a rejected code —
+			// dropping the code must not cost the operator the detail.
+			if apiErr.Message != "failed" {
+				t.Errorf("expected Message=%q, got %q", "failed", apiErr.Message)
+			}
+			if strings.ContainsFunc(apiErr.Error(), func(r rune) bool { return !unicode.IsPrint(r) }) {
+				t.Errorf("expected a printable error string, got %q", apiErr.Error())
+			}
+		})
+	}
+}
+
 func TestErrorFromResponse_ProblemJSON_CharsetParameter(t *testing.T) {
 	body := problemJSON(400, "public key is malformed", "public_key_invalid")
 	resp := newResponse(400, body, map[string]string{"Content-Type": "application/problem+json; charset=utf-8"})
@@ -244,7 +516,10 @@ func TestErrorFromResponse_ProblemJSON_EmptyDetailAndTitleFallsBackToRawBody(t *
 
 func TestErrorFromResponse_MalformedProblemJSON_FallsBackToRawBody(t *testing.T) {
 	body := `{"detail": "oops"` // truncated, invalid JSON
-	resp := newResponse(400, body, map[string]string{"Content-Type": "application/problem+json"})
+	resp := newResponse(400, body, map[string]string{
+		"Content-Type":     "application/problem+json",
+		"X-Correlation-Id": "3f2a",
+	})
 	err := errorFromResponse(resp)
 
 	var apiErr *APIError
@@ -257,11 +532,17 @@ func TestErrorFromResponse_MalformedProblemJSON_FallsBackToRawBody(t *testing.T)
 	if apiErr.Message != body {
 		t.Errorf("expected raw body Message, got %q", apiErr.Message)
 	}
+	if apiErr.CorrelationID != "3f2a" {
+		t.Errorf("expected CorrelationID=3f2a from the header, got %q", apiErr.CorrelationID)
+	}
 }
 
 func TestErrorFromResponse_NonProblemContentType_RawBody(t *testing.T) {
 	body := `{"detail":"not parsed","code":"nope"}`
-	resp := newResponse(400, body, map[string]string{"Content-Type": "text/plain"})
+	resp := newResponse(400, body, map[string]string{
+		"Content-Type":     "text/plain",
+		"X-Correlation-Id": "3f2a",
+	})
 	err := errorFromResponse(resp)
 
 	var apiErr *APIError
@@ -273,6 +554,13 @@ func TestErrorFromResponse_NonProblemContentType_RawBody(t *testing.T) {
 	}
 	if apiErr.Message != body {
 		t.Errorf("expected raw body Message, got %q", apiErr.Message)
+	}
+	// The response does not present itself as a control-plane problem
+	// document, so its X-Correlation-Id is an intermediary's id. Rendering
+	// it would send the operator to the control-plane log with a key that
+	// was never issued there.
+	if apiErr.CorrelationID != "" {
+		t.Errorf("expected empty CorrelationID for non-problem content type, got %q", apiErr.CorrelationID)
 	}
 }
 
