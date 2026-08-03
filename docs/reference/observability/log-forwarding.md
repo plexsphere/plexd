@@ -29,6 +29,7 @@ Each log line is serialized as:
 
 - **Filtering:** Severity-level filters (`min_severity`), unit inclusion lists (`include_units`), and unit exclusion lists (`exclude_units`) are applied before batching.
 - **File patterns:** Glob patterns in `file_patterns` specify additional log files to monitor beyond journald.
+- **Source availability:** The journald source is only registered on Linux hosts that actually have `journalctl`. On a host without it — a container image without systemd, typically — `plexd up` logs `journald not available, journald log source disabled` once at startup and forwards from the configured `file_patterns` only.
 - **Offline buffering:** When the control plane is unreachable, log entries are buffered internally. Buffered entries are drained on reconnection.
 
 ## Config
@@ -271,6 +272,14 @@ func NewJournalctlReader() *JournalctlReader
 ```
 
 Build-tagged `//go:build linux`.
+
+### Availability Probe
+
+```go
+func JournalctlAvailable() bool
+```
+
+Reports whether `journalctl` is present in `$PATH`. A missing binary is a property of the host rather than a transient failure, so `plexd up` probes once at startup and omits the journald source entirely instead of letting every collect cycle fail with `journalctl not found`.
 
 ### Cursor Tracking
 
