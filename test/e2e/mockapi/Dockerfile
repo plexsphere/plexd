@@ -12,9 +12,10 @@ RUN go mod download
 COPY . .
 
 # Multi-platform support — Docker sets TARGETOS/TARGETARCH automatically
-# during buildx multi-platform builds
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+# during buildx multi-platform builds. Declared without defaults: a default
+# would override the per-platform values, stamping every variant amd64 (#70).
+ARG TARGETOS
+ARG TARGETARCH
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags "-s -w" \
