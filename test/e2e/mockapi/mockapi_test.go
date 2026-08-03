@@ -567,10 +567,13 @@ func TestRegister_DenialTaxonomy(t *testing.T) {
 				t.Fatalf("decode problem: %v", err)
 			}
 			// RFC 9457 required members.
-			for _, member := range []string{"type", "title", "status", "detail", "instance"} {
+			for _, member := range []string{"type", "title", "status", "detail", "instance", "correlation_id"} {
 				if _, ok := problem[member]; !ok {
 					t.Errorf("problem missing required member %q", member)
 				}
+			}
+			if got := resp.Header.Get("X-Correlation-Id"); got == "" || problem["correlation_id"] != got {
+				t.Errorf("X-Correlation-Id header = %q, want the correlation_id member %v", got, problem["correlation_id"])
 			}
 			if tt.wantCode == "" {
 				if _, ok := problem["code"]; ok {
