@@ -2553,20 +2553,29 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // writeProblem writes an RFC 9457 application/problem+json error response. The
 // type member is a well-known problem URI when code is non-empty, else
 // about:blank; the code member is omitted when code is empty. The instance
-// member identifies the specific occurrence via the request path.
+// member identifies the specific occurrence via the request path. Every problem
+// response carries a freshly minted correlation_id member, echoed on the
+// X-Correlation-Id header.
 func writeProblem(w http.ResponseWriter, r *http.Request, status int, code, detail string) {
+	id := make([]byte, 16)
+	if _, err := rand.Read(id); err != nil {
+		panic("mockapi: rand.Read correlation id: " + err.Error())
+	}
+	correlationID := hex.EncodeToString(id)
 	problem := map[string]any{
-		"type":     "about:blank",
-		"title":    http.StatusText(status),
-		"status":   status,
-		"detail":   detail,
-		"instance": r.URL.Path,
+		"type":           "about:blank",
+		"title":          http.StatusText(status),
+		"status":         status,
+		"detail":         detail,
+		"instance":       r.URL.Path,
+		"correlation_id": correlationID,
 	}
 	if code != "" {
 		problem["type"] = "https://api.plexsphere.com/problems/" + code
 		problem["code"] = code
 	}
 	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("X-Correlation-Id", correlationID)
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(problem); err != nil {
 		slog.Error("writeProblem: encode failed", "error", err)
