@@ -17,14 +17,25 @@ ARG COMMIT=none
 ARG DATE=unknown
 
 # Multi-platform support — Docker sets TARGETOS/TARGETARCH automatically
-# during buildx multi-platform builds
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+# during buildx multi-platform builds. Declared without defaults: a default
+# would override the per-platform values, stamping every variant amd64 (#70).
+ARG TARGETOS
+ARG TARGETARCH
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \
     -o /build/plexd \
     ./cmd/plexd
+
+# Fail the build when the binary does not match the requested platform.
+# Compared against TARGETPLATFORM, not TARGETOS/TARGETARCH: a reintroduced
+# ARG default corrupts those for the build and the check alike, while
+# TARGETPLATFORM stays the platform BuildKit was asked for. The $ anchors
+# keep e.g. arm from matching arm64.
+ARG TARGETPLATFORM
+RUN os="${TARGETPLATFORM%%/*}"; arch="${TARGETPLATFORM#*/}"; arch="${arch%%/*}"; \
+    go version -m /build/plexd | grep -q "GOOS=${os}$" && \
+    go version -m /build/plexd | grep -q "GOARCH=${arch}$"
 
 # Create empty directories for the runtime stage (distroless has no shell/mkdir)
 RUN mkdir -p /runtime-dirs/var/lib/plexd \
