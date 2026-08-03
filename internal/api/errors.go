@@ -36,12 +36,17 @@ type APIError struct {
 	RetryAfter    time.Duration // only set for 429
 }
 
-// Error returns the formatted error string.
+// Error returns the formatted error string. A non-empty CorrelationID is
+// appended as a trailing " (correlation_id=...)" segment.
 func (e *APIError) Error() string {
+	var code, correlation string
 	if e.Code != "" {
-		return fmt.Sprintf("api: HTTP %d (%s): %s", e.StatusCode, e.Code, e.Message)
+		code = " (" + e.Code + ")"
 	}
-	return fmt.Sprintf("api: HTTP %d: %s", e.StatusCode, e.Message)
+	if e.CorrelationID != "" {
+		correlation = " (correlation_id=" + e.CorrelationID + ")"
+	}
+	return fmt.Sprintf("api: HTTP %d%s: %s%s", e.StatusCode, code, e.Message, correlation)
 }
 
 // Is supports errors.Is matching by status code.

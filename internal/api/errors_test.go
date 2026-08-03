@@ -130,6 +130,22 @@ func TestAPIError_ErrorMessage_WithCode(t *testing.T) {
 	}
 }
 
+func TestAPIError_ErrorMessage_WithCorrelationID(t *testing.T) {
+	err := &APIError{StatusCode: 500, Message: "server error", CorrelationID: "3f2a"}
+	expected := "api: HTTP 500: server error (correlation_id=3f2a)"
+	if err.Error() != expected {
+		t.Fatalf("expected %q, got %q", expected, err.Error())
+	}
+}
+
+func TestAPIError_ErrorMessage_WithCodeAndCorrelationID(t *testing.T) {
+	err := &APIError{StatusCode: 503, Message: "address pool exhausted", Code: "pool_exhausted", CorrelationID: "3f2a"}
+	expected := "api: HTTP 503 (pool_exhausted): address pool exhausted (correlation_id=3f2a)"
+	if err.Error() != expected {
+		t.Fatalf("expected %q, got %q", expected, err.Error())
+	}
+}
+
 // problemJSON builds an RFC 9457 problem+json body for tests.
 func problemJSON(status int, detail, code string) string {
 	return fmt.Sprintf(
