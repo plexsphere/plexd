@@ -4,9 +4,32 @@ package logfwd
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 )
+
+func TestJournalctlAvailable_TrueWhenBinaryOnPath(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "journalctl")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write journalctl stub: %v", err)
+	}
+	t.Setenv("PATH", dir)
+
+	if !JournalctlAvailable() {
+		t.Error("JournalctlAvailable() = false, want true with journalctl on PATH")
+	}
+}
+
+func TestJournalctlAvailable_FalseWhenBinaryMissing(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+
+	if JournalctlAvailable() {
+		t.Error("JournalctlAvailable() = true, want false with an empty PATH")
+	}
+}
 
 func TestJournalctlReader_NewReaderHasNoCursor(t *testing.T) {
 	r := NewJournalctlReader()

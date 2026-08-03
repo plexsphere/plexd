@@ -18,7 +18,7 @@ func newSystemReader() metrics.SystemReader {
 }
 
 // newJournalReader returns nil on non-Linux platforms.
-func newJournalReader() logfwd.JournalReader {
+func newJournalReader(_ *slog.Logger) logfwd.JournalReader {
 	return nil
 }
 

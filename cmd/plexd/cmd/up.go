@@ -678,7 +678,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// 14. Create log forwarding sources and forwarder.
 	hostname, _ := os.Hostname()
 	var logSources []logfwd.LogSource
-	if journalReader := newJournalReader(); journalReader != nil {
+	if journalReader := newJournalReader(logger); journalReader != nil {
 		logSources = append(logSources, logfwd.NewJournaldSource(journalReader, hostname, logger))
 	}
 	for _, pattern := range cfg.LogFwd.FilePatterns {

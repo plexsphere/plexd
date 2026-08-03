@@ -17,8 +17,14 @@ func newSystemReader() metrics.SystemReader {
 	return metrics.NewLinuxSystemReader("", "")
 }
 
-// newJournalReader creates a JournalctlReader on Linux.
-func newJournalReader() logfwd.JournalReader {
+// newJournalReader creates a JournalctlReader on Linux. It returns nil when
+// journalctl is missing so the caller skips the journald log source entirely
+// rather than warning about an unusable facility on every collect cycle.
+func newJournalReader(logger *slog.Logger) logfwd.JournalReader {
+	if !logfwd.JournalctlAvailable() {
+		logger.Info("journald not available, journald log source disabled")
+		return nil
+	}
 	return logfwd.NewJournalctlReader()
 }
 

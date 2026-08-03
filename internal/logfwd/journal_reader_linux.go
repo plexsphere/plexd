@@ -25,6 +25,15 @@ func NewJournalctlReader() *JournalctlReader {
 	return &JournalctlReader{}
 }
 
+// JournalctlAvailable reports whether the journalctl binary is present in $PATH.
+// Its absence is a property of the host (a container image without systemd, for
+// example), not a transient collection failure, so callers probe once at startup
+// and skip registering the journald source instead of failing every cycle.
+func JournalctlAvailable() bool {
+	_, err := exec.LookPath("journalctl")
+	return err == nil
+}
+
 // ReadEntries runs journalctl and parses JSON output.
 // On the first call, it reads entries from the last 60 seconds.
 // Subsequent calls read entries after the stored cursor.
