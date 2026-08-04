@@ -321,7 +321,7 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 		Peers: []SnapshotPeer{
 			{NodeID: "n-002", MeshIP: "10.42.0.2", PublicKey: "pk", FallbackEndpoint: "1.2.3.4:51820"},
 		},
-		Reachability: json.RawMessage(`{"state":"healthy","changed_at":"2026-01-01T00:00:00Z"}`),
+		Reachability: json.RawMessage(`{"state":"healthy","last_heartbeat_at":"2026-01-01T00:00:00Z","changed_at":"2026-01-01T00:00:00Z"}`),
 		Policy: &PolicySnapshot{
 			RevisionID:  "rev-1",
 			Fingerprint: "0123456789012345678901234567890123456789012=",

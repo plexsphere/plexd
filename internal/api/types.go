@@ -105,6 +105,36 @@ type SnapshotPeer struct {
 	FallbackEndpoint string `json:"fallback_endpoint,omitempty"`
 }
 
+// ReachabilitySnapshot is the interior of the snapshot's reachability block: the
+// control plane's own verdict about this node, derived from the heartbeats it has
+// admitted. It is a diagnostic projection, never desired state.
+//
+// State is a plain string and is never validated against the constants below.
+// The verdict vocabulary belongs to the control plane and grows there —
+// never_reported was added after plexd shipped — so a value this build does not
+// know must keep flowing to the log rather than be rejected. LastHeartbeatAt is
+// absent until the first heartbeat is accepted; ChangedAt is always present.
+type ReachabilitySnapshot struct {
+	State           string     `json:"state"`
+	LastHeartbeatAt *time.Time `json:"last_heartbeat_at,omitempty"`
+	ChangedAt       time.Time  `json:"changed_at"`
+}
+
+// Reachability verdicts the platform contract documents today. The set is open:
+// these are the values plexd expects to see, not the values it accepts.
+const (
+	// ReachabilityHealthy marks a node whose heartbeats arrive on schedule.
+	ReachabilityHealthy = "healthy"
+	// ReachabilityStale marks a node whose last admitted heartbeat is older than
+	// the control plane's freshness window.
+	ReachabilityStale = "stale"
+	// ReachabilityUnreachable marks a node the control plane has given up on.
+	ReachabilityUnreachable = "unreachable"
+	// ReachabilityNeverReported marks a node whose first heartbeat was never
+	// admitted. It is the verdict a freshly enrolled node is born with.
+	ReachabilityNeverReported = "never_reported"
+)
+
 // PolicySnapshot is the single merged policy block. Fingerprint is a 44-char
 // base64 SHA-256 over the server's canonical rule byte stream; plexd treats it
 // as an opaque comparison key and never re-derives it from Rules.
