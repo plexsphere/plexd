@@ -278,7 +278,10 @@ func newStateFixture() api.NodeStateSnapshot {
 				PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
 			},
 		},
-		Reachability: json.RawMessage(`{"state":"healthy","changed_at":"2026-01-01T00:00:00Z"}`),
+		// The mock accepts heartbeats but never evaluates them into a projection,
+		// so never_reported is the honest verdict — and the one a real control
+		// plane serves for a freshly enrolled node.
+		Reachability: json.RawMessage(`{"state":"never_reported","changed_at":"2026-01-01T00:00:00Z"}`),
 		Policy: &api.PolicySnapshot{
 			RevisionID:  "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
 			Fingerprint: policyFingerprint(rules),

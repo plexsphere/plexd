@@ -114,7 +114,7 @@ distinguishes a nil pointer from a populated block. None of the eight fields car
 | Field          | Type                   | JSON Tag         | Description                                              |
 |----------------|------------------------|------------------|---------------------------------------------------------|
 | `Peers`        | `[]SnapshotPeer`       | `"peers"`        | Desired peers; `[]` when empty, node_id ascending, self excluded |
-| `Reachability` | `json.RawMessage`      | `"reachability"` | The node's own health projection, carried opaquely (unconsumed) |
+| `Reachability` | `json.RawMessage`      | `"reachability"` | The control plane's verdict about this node, carried opaquely and decoded leniently by the reachability observer |
 | `Policy`       | `*PolicySnapshot`      | `"policy"`       | Merged network policy block                             |
 | `Bridge`       | `*BridgeSnapshot`      | `"bridge"`       | Bridge subtrees                                         |
 | `State`        | `*NodeStateBlock`      | `"state"`        | Node state buckets                                     |
@@ -122,11 +122,13 @@ distinguishes a nil pointer from a populated block. None of the eight fields car
 | `Executions`   | `[]NodeStateExecution` | `"executions"`   | Pending action dispatches; `[]` when empty, never `null` |
 | `Sessions`     | `*[]NodeStateSession`  | `"sessions"`     | Live mediated-access sessions; `[]` when empty, never `null` on the wire. A pointer, like the block fields above: a `nil` value is a block the control plane did **not** populate, which is not a teardown signal |
 
-Two members are consumed on the dispatch seam rather than by the differ.
+Three members are consumed on the dispatch seam rather than by the differ.
 `executions` is not desired state at all — it is a delivery queue, documented
 under [Executions](#executions) below. `sessions` *is* desired state, but state
 the tunnel dispatcher converges on itself, documented under
-[Sessions](#sessions) below.
+[Sessions](#sessions) below. `reachability` is not state to converge on either:
+the reachability observer decodes it leniently and logs the verdict when it
+changes.
 
 **SnapshotPeer**
 
@@ -140,6 +142,24 @@ locally as `mesh_ip/32`, programs `fallback_endpoint` as the WireGuard endpoint
 | `MeshIP`           | `string` | `"mesh_ip"`                     | Peer mesh IP address          |
 | `PublicKey`        | `string` | `"public_key"`                  | Peer WireGuard public key     |
 | `FallbackEndpoint` | `string` | `"fallback_endpoint,omitempty"` | Optional relay/fallback endpoint |
+
+**ReachabilitySnapshot**
+
+The interior of the `reachability` block. `NodeStateSnapshot.Reachability` stays
+a `json.RawMessage`: decoding it inside `FetchState` would let a malformed
+diagnostic block abort the whole state pull, so the decode happens in the
+reachability observer instead.
+
+`State` is a plain string and is **never validated** against the constants below.
+The verdict vocabulary belongs to the control plane and grows there —
+`never_reported` was added after plexd shipped — so a value this build does not
+know is logged verbatim rather than rejected.
+
+| Field             | Type         | JSON Tag                          | Description                                              |
+|-------------------|--------------|-----------------------------------|----------------------------------------------------------|
+| `State`           | `string`     | `"state"`                         | `ReachabilityHealthy` (`healthy`), `ReachabilityStale` (`stale`), `ReachabilityUnreachable` (`unreachable`), or `ReachabilityNeverReported` (`never_reported`); any other value is carried through |
+| `LastHeartbeatAt` | `*time.Time` | `"last_heartbeat_at,omitempty"`   | Absent until the control plane accepts the first heartbeat |
+| `ChangedAt`       | `time.Time`  | `"changed_at"`                    | When the verdict last changed; always present            |
 
 **PolicySnapshot**
 
