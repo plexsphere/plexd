@@ -202,7 +202,7 @@ func TestFetchState_ReturnsSnapshot(t *testing.T) {
 		_, _ = w.Write([]byte(`{` +
 			`"peers":[{"node_id":"p1","mesh_ip":"10.0.0.2","public_key":"pk1"},` +
 			`{"node_id":"p2","mesh_ip":"10.0.0.3","public_key":"pk2","fallback_endpoint":"203.0.113.1:51820"}],` +
-			`"reachability":{"state":"healthy","changed_at":"2026-01-01T00:00:00Z"},` +
+			`"reachability":{"state":"never_reported","changed_at":"2026-01-01T00:00:00Z"},` +
 			`"policy":{"revision_id":"rev-1","fingerprint":"fp","rules":[` +
 			`{"action":"allow","protocol":"tcp","source_cidr":"10.0.0.1/32","destination_cidr":"10.0.0.2/32","ports":{"from":443,"to":443}}]},` +
 			`"bridge":null,"state":null,"reports":null,` +
@@ -236,6 +236,13 @@ func TestFetchState_ReturnsSnapshot(t *testing.T) {
 	// Null blocks decode to nil pointers.
 	if resp.Bridge != nil || resp.State != nil || resp.Reports != nil {
 		t.Errorf("null blocks should decode to nil, got bridge=%v state=%v reports=%v", resp.Bridge, resp.State, resp.Reports)
+	}
+	// The reachability block is carried through the live decode byte for byte,
+	// including a verdict this build's constants do not name. The verdict
+	// vocabulary is the control plane's, and an unknown value must reach the
+	// observer rather than fail the pull.
+	if want := `{"state":"never_reported","changed_at":"2026-01-01T00:00:00Z"}`; string(resp.Reachability) != want {
+		t.Errorf("Reachability = %s, want %s", resp.Reachability, want)
 	}
 	// The executions block carries the node's pending action dispatches.
 	if len(resp.Executions) != 1 {
