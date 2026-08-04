@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"encoding/json"
 	"sync"
 	"testing"
 
@@ -12,6 +13,9 @@ func sampleSnapshot() *api.NodeStateSnapshot {
 		Peers: []api.SnapshotPeer{
 			{NodeID: "node-1", PublicKey: "pk-1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820"},
 		},
+		// Populated so the never-stored assertions below bite instead of holding
+		// vacuously against a fixture that never carried the block.
+		Reachability: json.RawMessage(`{"state":"never_reported","changed_at":"2026-01-01T00:00:00Z"}`),
 		Policy: &api.PolicySnapshot{
 			RevisionID:  "rev-1",
 			Fingerprint: "fp-1",

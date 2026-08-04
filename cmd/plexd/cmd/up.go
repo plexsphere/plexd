@@ -625,6 +625,12 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	sessionDispatcher := tunnel.NewDispatcher(meshServer.SessionManager(), sessionReporter, logger)
 	reconciler.RegisterDispatchHandler(sessionDispatcher.Handle)
 
+	// The reachability block is the control plane's own verdict about this node,
+	// not desired state: it is observed and logged on every successful pull, and
+	// never stored or converged on. A node whose heartbeats stop being admitted
+	// while its state pulls keep succeeding has no other way to learn that.
+	reconciler.RegisterDispatchHandler(reconcile.NewReachabilityObserver(logger).Handle)
+
 	// Register the WireGuard reconcile handler only when the interface came up.
 	// A handler that fails every cycle would hold back the reconciler snapshot,
 	// so the fingerprint short-circuit could never converge on such hosts.

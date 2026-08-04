@@ -290,7 +290,11 @@ absence.
       "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
     }
   ],
-  "reachability": { "state": "healthy", "changed_at": "2026-01-01T00:00:00Z" },
+  "reachability": {
+    "state": "healthy",
+    "last_heartbeat_at": "2026-01-01T00:00:00Z",
+    "changed_at": "2026-01-01T00:00:00Z"
+  },
   "policy": {
     "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
     "fingerprint": "j7Hn2mF0oQ9rXcV8yZ1aB4cD6eF8gH0iJ2kL4mN6oM=",
@@ -343,6 +347,18 @@ absence.
   ]
 }
 ```
+
+`reachability` is the control plane's own verdict about this node, derived from
+the heartbeats it has admitted. `state` is one of `healthy`, `stale`,
+`unreachable`, or `never_reported`; the set is the control plane's to grow, so
+plexd carries an unknown value through rather than rejecting it.
+`never_reported` is the verdict a node is born with — its first heartbeat has
+never been admitted — and `last_heartbeat_at` is absent for exactly as long as
+that holds. `changed_at` is always present. The block is a diagnostic
+projection, never desired state: plexd logs the verdict whenever it changes and
+neither stores nor converges on it. The same projection is served at
+`GET /v1/nodes/{node_id}/reachability`, which plexd does not call because the
+pull already carries it.
 
 `executions` is the delivery channel for action dispatches, and the only block
 that is a delivery queue rather than desired state. It is always an array — `[]` when empty, never `null` —

@@ -335,7 +335,7 @@ The active fixture can be replaced at runtime via `POST /test/configure-state`.
 | Block | Default Value |
 |-------|---------------|
 | `peers` | 2 mesh peers (node_id ascending), no `psk`/`allowed_ips`/`endpoint` |
-| `reachability` | opaque `{"state":"healthy", ...}` projection |
+| `reachability` | `{"state":"never_reported", ...}` — the mock accepts heartbeats but never evaluates them into a projection |
 | `policy` | merged block: 2 rules, `fingerprint` from `policyFingerprint` |
 | `bridge.relay` | 1 relay session assignment (`relay-sess-001`) |
 | `bridge.user_access` | `enabled: true`, interface `wg-access0`, 1 peer |
@@ -367,7 +367,7 @@ comparison key and never re-derives it from the rules.
       "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
     }
   ],
-  "reachability": {"state": "healthy", "changed_at": "2026-01-01T00:00:00Z"},
+  "reachability": {"state": "never_reported", "changed_at": "2026-01-01T00:00:00Z"},
   "policy": {
     "revision_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
     "fingerprint": "<44-char base64 SHA-256>",
