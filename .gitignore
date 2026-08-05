@@ -1,5 +1,6 @@
 # Compiled binaries
 /mockapi
+/plexd
 
 # Node / VitePress
 node_modules/
