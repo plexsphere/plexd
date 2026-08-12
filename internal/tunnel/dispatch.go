@@ -35,8 +35,7 @@ const sessionStartedReportTimeout = 15 * time.Second
 // unsupported: one warning, no listener, no activity row.
 //
 // A Dispatcher is not safe for concurrent use. Handle is invoked only from the
-// reconcile goroutine, one cycle at a time, so known and unreported need no
-// mutex.
+// reconcile goroutine, one cycle at a time, so its maps need no mutex.
 //
 // The pass carries no dispatch budget, unlike the executions block's: it is
 // bounded by the live sessions the manager caps at MaxSessions plus the length
@@ -61,29 +60,43 @@ type Dispatcher struct {
 	// than the listener being rebuilt: the ephemeral port is the operator's only
 	// route in, so giving it up would publish a different listener_endpoint per
 	// attempt and pair each one with a spurious session_ended row. It drains on
-	// the first delivered row, and otherwise with the entry itself.
+	// the first delivered row or a revoked-or-expired answer, and otherwise with
+	// the entry itself.
 	unreported map[string]string
+
+	// goneStanding holds the ids the control plane answered as revoked or
+	// expired while their entry still stood in the block. That answer settles
+	// the row and performs no teardown, so the listener keeps forwarding to the
+	// target until the block drains the entry — the one state in which the node
+	// knowingly serves access the platform has already withdrawn. Every later
+	// pull that still carries such an entry re-states it as a warning, so the
+	// condition stays alertable instead of ending with the single Info line that
+	// settled the row.
+	goneStanding map[string]struct{}
 }
 
 // NewDispatcher creates a Dispatcher that provisions the pull's sessions block
 // through manager and reports each started listener through reporter.
 func NewDispatcher(manager *SessionManager, reporter SessionActivityReporter, logger *slog.Logger) *Dispatcher {
 	return &Dispatcher{
-		manager:    manager,
-		reporter:   reporter,
-		logger:     logger.With("component", "tunnel"),
-		known:      make(map[string]struct{}),
-		unreported: make(map[string]string),
+		manager:      manager,
+		reporter:     reporter,
+		logger:       logger.With("component", "tunnel"),
+		known:        make(map[string]struct{}),
+		unreported:   make(map[string]string),
+		goneStanding: make(map[string]struct{}),
 	}
 }
 
 // startedSession is one listener this pass provisioned, held until the report
-// pass that follows the provisioning loop. reported is written by the goroutine
-// posting that session's started row and read once every report has returned.
+// pass that follows the provisioning loop. reported and gone are written by the
+// goroutine posting that session's started row and read once every report has
+// returned.
 type startedSession struct {
 	entry    api.NodeStateSession
 	addr     string
 	reported bool
+	gone     bool
 }
 
 // Handle reconciles the snapshot's sessions block: it first tears down every
@@ -163,6 +176,19 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 		}
 
 		if _, settled := d.known[entry.SessionID]; settled {
+			// A settled entry is a no-op — except where what settled it was the
+			// control plane's verdict that the session is revoked or expired.
+			// The verdict tears nothing down, so a listener whose entry the
+			// block never drains keeps forwarding to the target for the rest of
+			// its capped life, and the operator who revoked the session is the
+			// one who needs to hear about it.
+			_, gone := d.goneStanding[entry.SessionID]
+			_, stillLive := live[entry.SessionID]
+			if gone && stillLive {
+				d.logger.Warn("revoked or expired session still stands in the block; its listener keeps forwarding until the drain",
+					"session_id", entry.SessionID,
+				)
+			}
 			continue
 		}
 
@@ -295,6 +321,22 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 			// the whole TTL of the entry. The capped expiry timer is what
 			// reclaims a listener whose row never lands.
 			if err := d.reporter.ReportSessionStarted(reportCtx, s.entry.SessionID, s.entry.Target.TCP.Host, s.entry.Target.TCP.Port, s.addr); err != nil {
+				// A revoked-or-expired verdict settles the row but never tears
+				// the listener down: the entry draining from the block on a
+				// later pull is what closes it, so the block stays the single
+				// driver of desired state. It is the only answer that settles —
+				// a 404 is the block and the session store disagreeing rather
+				// than a terminal state, and the entry standing in the block is
+				// the control plane still asking for the session, so it stays on
+				// the re-post path below.
+				if api.IsSessionRevokedOrExpired(err) {
+					s.gone = true
+					d.logger.Info("session no longer live server-side; awaiting the drain",
+						"session_id", s.entry.SessionID,
+						"error", err,
+					)
+					return
+				}
 				d.logger.Warn("session started report failed; keeping the listener for the next pull to re-post it",
 					"session_id", s.entry.SessionID,
 					"listener_endpoint", s.addr,
@@ -308,11 +350,14 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 	reportWg.Wait()
 
 	// Settling happens back on this goroutine, once every report has returned,
-	// so known and unreported keep needing no mutex.
+	// so the dispatcher's maps keep needing no mutex.
 	for _, s := range started {
-		if s.reported {
+		if s.reported || s.gone {
 			delete(d.unreported, s.entry.SessionID)
 			d.known[s.entry.SessionID] = struct{}{}
+			if s.gone {
+				d.goneStanding[s.entry.SessionID] = struct{}{}
+			}
 			continue
 		}
 		d.unreported[s.entry.SessionID] = s.addr
@@ -329,6 +374,11 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 	for id := range d.unreported {
 		if _, ok := present[id]; !ok {
 			delete(d.unreported, id)
+		}
+	}
+	for id := range d.goneStanding {
+		if _, ok := present[id]; !ok {
+			delete(d.goneStanding, id)
 		}
 	}
 }

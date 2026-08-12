@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"strconv"
@@ -16,14 +17,16 @@ import (
 
 // countingHandler counts emitted log records by message so a test can pin log
 // cadence — that a settled entry warns exactly once across repeated pulls, for
-// instance, rather than once per pull.
+// instance, rather than once per pull. It also keeps the level each message was
+// emitted at, so a test can pin that a routine outcome is not warned about.
 type countingHandler struct {
 	mu     sync.Mutex
 	counts map[string]int
+	levels map[string]slog.Level
 }
 
 func newCountingHandler() *countingHandler {
-	return &countingHandler{counts: make(map[string]int)}
+	return &countingHandler{counts: make(map[string]int), levels: make(map[string]slog.Level)}
 }
 
 func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
@@ -32,6 +35,7 @@ func (h *countingHandler) Handle(_ context.Context, rec slog.Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.counts[rec.Message]++
+	h.levels[rec.Message] = rec.Level
 	return nil
 }
 
@@ -43,6 +47,14 @@ func (h *countingHandler) count(msg string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.counts[msg]
+}
+
+// level returns the level msg was last emitted at. It is meaningful only for a
+// message the caller has already pinned a count on.
+func (h *countingHandler) level(msg string) slog.Level {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.levels[msg]
 }
 
 // newTestDispatcher wires a Dispatcher onto a real SessionManager. The manager
@@ -739,6 +751,157 @@ func TestDispatcher_UndeliveredStartedRowKeepsListener(t *testing.T) {
 		if call.ListenerEndpoint != listenAddr {
 			t.Errorf("started row %d listener_endpoint = %q, want %q", i, call.ListenerEndpoint, listenAddr)
 		}
+	}
+}
+
+// The two messages the started-row classification decides between, plus the one
+// that keeps a settled-but-standing revoked entry visible.
+const (
+	goneMsg     = "session no longer live server-side; awaiting the drain"
+	standingMsg = "revoked or expired session still stands in the block; its listener keeps forwarding until the drain"
+)
+
+// TestDispatcher_SessionGoneSettlesStartedRow covers the control plane answering
+// the started row with its verdict that the session is no longer live. That
+// verdict is durable — re-posting the row draws the identical status for as long
+// as the entry stands — so the entry is settled instead of retried. It is not a
+// teardown signal: the listener stays bound until the entry drains from the
+// block, which keeps the block the single driver of desired state.
+func TestDispatcher_SessionGoneSettlesStartedRow(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	d, mgr, reporter, logs := newTestDispatcher(t, Config{})
+	mu, records := recordCloses(mgr)
+
+	reporter.mu.Lock()
+	reporter.startedErr = fmt.Errorf("report session started: %w", &api.APIError{StatusCode: 409, Code: "session_already_revoked"})
+	reporter.mu.Unlock()
+
+	snapshot := sessionsSnapshot(echoSession(t, "sess-gone", echoAddr))
+	d.Handle(context.Background(), snapshot)
+
+	if mgr.ActiveCount() != 1 {
+		t.Fatalf("expected the listener to survive the session-gone answer, ActiveCount()=%d", mgr.ActiveCount())
+	}
+	if n := logs.count(goneMsg); n != 1 {
+		t.Errorf("session-gone logged %d times, want 1", n)
+	}
+	// The node is doing what the control plane told it, so the outcome is noted
+	// rather than warned about.
+	if got := logs.level(goneMsg); got != slog.LevelInfo {
+		t.Errorf("session-gone logged at %v, want %v", got, slog.LevelInfo)
+	}
+	if n := logs.count("session started report failed; keeping the listener for the next pull to re-post it"); n != 0 {
+		t.Errorf("a session-gone answer must not be reported as a delivery failure, got %d warnings", n)
+	}
+	mu.Lock()
+	if len(*records) != 0 {
+		t.Errorf("expected no close from the session-gone answer, got %d", len(*records))
+	}
+	mu.Unlock()
+
+	// The row is settled, so the entry still standing in the block is a
+	// re-observation and nothing is posted a second time.
+	d.Handle(context.Background(), snapshot)
+
+	reporter.mu.Lock()
+	startedCalls := len(reporter.startedCalls)
+	reporter.mu.Unlock()
+	if startedCalls != 1 {
+		t.Fatalf("started rows = %d across two pulls, want 1", startedCalls)
+	}
+	if mgr.ActiveCount() != 1 {
+		t.Fatalf("expected ActiveCount()=1 before the drain, got %d", mgr.ActiveCount())
+	}
+	// Settling ends the re-posting, not the reporting: while the block keeps
+	// carrying an entry the control plane has already revoked, the listener goes
+	// on forwarding to the target, and that stays warned about once per pull
+	// instead of ending with the Info line that settled the row.
+	if n := logs.count(standingMsg); n != 1 {
+		t.Errorf("the standing revoked entry warned %d times on the second pull, want 1", n)
+	}
+	if got := logs.level(standingMsg); got != slog.LevelWarn {
+		t.Errorf("the standing revoked entry logged at %v, want %v", got, slog.LevelWarn)
+	}
+
+	// The drain closes the session exactly as it would one whose started row
+	// landed: the node never asserts the operator action behind the verdict.
+	d.Handle(context.Background(), sessionsSnapshot())
+
+	if mgr.ActiveCount() != 0 {
+		t.Errorf("expected ActiveCount()=0 after the drain, got %d", mgr.ActiveCount())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*records) != 1 {
+		t.Fatalf("expected 1 close, got %d", len(*records))
+	}
+	if (*records)[0].reason != reasonDrained {
+		t.Errorf("close reason = %q, want %q", (*records)[0].reason, reasonDrained)
+	}
+	if got := TerminatedByFromReason((*records)[0].reason); got != api.TerminatedByPlexdClose {
+		t.Errorf("terminated_by = %q, want %q", got, api.TerminatedByPlexdClose)
+	}
+
+	// The entry drained, so the warning stops with it rather than outliving the
+	// block that carried it.
+	if n := logs.count(standingMsg); n != 1 {
+		t.Errorf("the standing warning fired %d times in total, want 1 (the drain ends it)", n)
+	}
+}
+
+// TestDispatcher_NonTerminalStartedRowRetries pins the other side of that
+// classification: an answer that is not a terminal state of the session keeps
+// the row on the re-post path, so the listener the control plane has no endpoint
+// for is not stranded for the standing life of its entry.
+func TestDispatcher_NonTerminalStartedRowRetries(t *testing.T) {
+	tests := []struct {
+		name string
+		// why the answer is not a verdict this node may settle on.
+		reason string
+		err    error
+	}{
+		{
+			name:   "501 callback not provisioned",
+			reason: "it faults the callback endpoint rather than the session, and the endpoint can be provisioned while the session runs",
+			err:    &api.APIError{StatusCode: 501, Code: "access_session_not_provisioned"},
+		},
+		{
+			name:   "404 session not found",
+			reason: "the block and the session store are two reads that can disagree, and the entry standing in the block is the control plane still asking for the session",
+			err:    fmt.Errorf("report session started: %w", &api.APIError{StatusCode: 404, Code: "session_not_found"}),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			echoAddr := startEchoServer(t)
+			d, mgr, reporter, logs := newTestDispatcher(t, Config{})
+
+			reporter.mu.Lock()
+			reporter.startedErr = tt.err
+			reporter.mu.Unlock()
+
+			snapshot := sessionsSnapshot(echoSession(t, "sess-retryable", echoAddr))
+			d.Handle(context.Background(), snapshot)
+
+			if mgr.ActiveCount() != 1 {
+				t.Fatalf("expected ActiveCount()=1, got %d", mgr.ActiveCount())
+			}
+			if n := logs.count(goneMsg); n != 0 {
+				t.Errorf("%s, so it must not settle the row, got %d records", tt.reason, n)
+			}
+
+			// The entry was left unsettled, so the next pull re-posts the same row.
+			d.Handle(context.Background(), snapshot)
+
+			if mgr.ActiveCount() != 1 {
+				t.Errorf("expected ActiveCount()=1 after the retry, got %d", mgr.ActiveCount())
+			}
+			reporter.mu.Lock()
+			defer reporter.mu.Unlock()
+			if len(reporter.startedCalls) != 2 {
+				t.Errorf("started rows = %d across two pulls, want 2 (the refusal is retried)", len(reporter.startedCalls))
+			}
+		})
 	}
 }
 
