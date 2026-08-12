@@ -112,6 +112,36 @@ func IsEventBusNotProvisioned(err error) bool {
 		apiErr.Code == "signed_event_bus_not_provisioned"
 }
 
+// IsSessionRevokedOrExpired reports whether err is the control plane's verdict
+// that the session a session activity callback names has reached a terminal
+// state: a 409 carrying session_already_revoked or session_expired. Like the
+// not-provisioned refusals this is a durable verdict — neither state goes back
+// to live, so re-sending the callback draws the identical status forever — and
+// the node answers it by settling rather than by retrying.
+//
+// What it settles on is a drain signal, not a teardown. The answer itself never
+// closes a session: the entry leaves the sessions block on a following pull, and
+// the block drain performs the teardown.
+//
+// A 404 session_not_found is deliberately not classified here. It is not a
+// terminal state but the sessions block and the session store disagreeing — a
+// lagging read replica, a session record written after the block was rendered, a
+// failover window — and the two are separate reads. The entry standing in the
+// block is the control plane still asking for the session, so the callback stays
+// retryable: settling on the 404 instead would strand a bound listener whose
+// endpoint the control plane never learns, for the whole standing life of its
+// entry.
+//
+// A 501 access_session_not_provisioned is not classified here either. It faults
+// the callback endpoint rather than the session, and the endpoint may be
+// provisioned mid-session, so it stays retryable too.
+func IsSessionRevokedOrExpired(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) &&
+		apiErr.StatusCode == http.StatusConflict &&
+		(apiErr.Code == "session_already_revoked" || apiErr.Code == "session_expired")
+}
+
 // IsIngestPermanentlyRefused reports whether err is a refusal of an
 // observability ingest batch that no retry can fix: a 400 carrying the
 // ingest_batch_malformed problem code, which is a verdict on the batch bytes

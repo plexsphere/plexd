@@ -669,6 +669,37 @@ func TestIsEventBusNotProvisioned(t *testing.T) {
 	}
 }
 
+func TestIsSessionRevokedOrExpired(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"409 already revoked", &APIError{StatusCode: 409, Code: "session_already_revoked"}, true},
+		{"409 expired", &APIError{StatusCode: 409, Code: "session_expired"}, true},
+		{"wrapped 409 already revoked", fmt.Errorf("report session activity: %w", &APIError{StatusCode: 409, Code: "session_already_revoked"}), true},
+		{"409 without a code is not a session verdict", &APIError{StatusCode: 409}, false},
+		{"409 with another code", &APIError{StatusCode: 409, Code: "node_state_conflict"}, false},
+		// A 404 is the sessions block and the session store disagreeing, not a
+		// terminal state: the session can resolve on a later attempt, so it must
+		// stay retryable rather than settle a standing entry.
+		{"404 not found is not terminal", &APIError{StatusCode: 404, Code: "session_not_found"}, false},
+		{"404 with another code faults the node, not the session", &APIError{StatusCode: 404, Code: "node_not_found"}, false},
+		{"400 malformed report is a verdict on the body", &APIError{StatusCode: 400, Code: "malformed_session_activity"}, false},
+		{"501 callback not provisioned stays retryable", &APIError{StatusCode: 501, Code: "access_session_not_provisioned"}, false},
+		{"500 server error is retryable", &APIError{StatusCode: 500}, false},
+		{"non-API error", errors.New("dial tcp: timeout"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsSessionRevokedOrExpired(tt.err); got != tt.want {
+				t.Errorf("IsSessionRevokedOrExpired(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsIngestTooLarge(t *testing.T) {
 	tests := []struct {
 		name string
