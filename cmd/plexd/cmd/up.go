@@ -1283,6 +1283,25 @@ func (r *controlPlaneSessionReporter) ReportSessionEnded(ctx context.Context, se
 			TerminatedBy: terminatedBy,
 		},
 	}); err != nil {
+		// A drain-driven close posts its row into a session the control plane
+		// already holds as revoked or expired, so the refusal is the expected
+		// answer of every revocation and hard expiry rather than a fault of this
+		// node. It is still audit data going missing, and for exactly the
+		// sessions an investigation asks about: the row is fire-once, nothing
+		// re-posts it, and it is the sole carrier of the transfer volumes and
+		// the terminating reason. So the answer is warned about rather than
+		// noted, and the row's payload is carried into the line, which is the
+		// only place those numbers survive.
+		if api.IsSessionRevokedOrExpired(err) {
+			slog.Warn("tunnel session ended row refused; its counters are recorded only here",
+				"session_id", sessionID,
+				"bytes_in", bytesIn,
+				"bytes_out", bytesOut,
+				"terminated_by", terminatedBy,
+				"error", err,
+			)
+			return
+		}
 		slog.Error("tunnel session ended report failed", "session_id", sessionID, "error", err)
 	}
 }
