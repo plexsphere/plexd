@@ -1420,3 +1420,164 @@ func assertWireDigest(t *testing.T, field, value string) {
 		t.Errorf("%s = %q decodes to %d bytes, want %d (a hex digest decodes to 48)", field, value, len(raw), sha256.Size)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Session activity rows
+// ---------------------------------------------------------------------------
+
+// loggedRecord is the part of a log record these tests pin: what was said, how
+// loudly, and what it carried.
+type loggedRecord struct {
+	level slog.Level
+	msg   string
+	attrs map[string]string
+}
+
+// recordingHandler keeps every record emitted through it, so a test can pin
+// both the message and the level it carried.
+type recordingHandler struct {
+	mu      sync.Mutex
+	records []loggedRecord
+}
+
+func newRecordingHandler() *recordingHandler { return &recordingHandler{} }
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, rec slog.Record) error {
+	attrs := make(map[string]string, rec.NumAttrs())
+	rec.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.String()
+		return true
+	})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, loggedRecord{level: rec.Level, msg: rec.Message, attrs: attrs})
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *recordingHandler) WithGroup(string) slog.Handler { return h }
+
+// count returns how many records carry exactly this level and message.
+func (h *recordingHandler) count(level slog.Level, msg string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, rec := range h.records {
+		if rec.level == level && rec.msg == msg {
+			n++
+		}
+	}
+	return n
+}
+
+// attrsOf returns the attributes of the first record carrying exactly this level
+// and message, or nil when no record does.
+func (h *recordingHandler) attrsOf(level slog.Level, msg string) map[string]string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, rec := range h.records {
+		if rec.level == level && rec.msg == msg {
+			return rec.attrs
+		}
+	}
+	return nil
+}
+
+// countAt returns how many records were emitted at the given level, whatever
+// they said.
+func (h *recordingHandler) countAt(level slog.Level) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, rec := range h.records {
+		if rec.level == level {
+			n++
+		}
+	}
+	return n
+}
+
+const (
+	endedRefusedMsg = "tunnel session ended row refused; its counters are recorded only here"
+	endedFailedMsg  = "tunnel session ended report failed"
+)
+
+// The ended row of a drain-driven teardown reaches a control plane that already
+// holds the session as revoked or expired, because the node only closes the
+// listener after it has observed the drain. Its refusal is therefore the answer
+// every revocation and every hard expiry produces, so it is not reported as a
+// failure of this node — but the row is fire-once and is the sole carrier of the
+// transfer volumes and the terminating reason, so the refusal loses audit data
+// for exactly the sessions an operator cut. The line is therefore a warning and
+// carries the row's payload, which makes it the only surviving record of it. Any
+// other error keeps the Error level.
+//
+// The test swaps the process-global default logger, so it must not run in
+// parallel.
+func TestControlPlaneSessionReporter_RefusedEndedRowKeepsCounters(t *testing.T) {
+	// reportEnded posts one ended row against a control plane answering the
+	// session-activity POST with the given status and problem body, and returns
+	// what the reporter logged while doing it.
+	reportEnded := func(t *testing.T, status int, body string) *recordingHandler {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, body)
+		}))
+		t.Cleanup(srv.Close)
+
+		client, err := api.NewControlPlane(api.Config{BaseURL: srv.URL}, "1.0.0-test", discardLogger())
+		if err != nil {
+			t.Fatalf("create client: %v", err)
+		}
+		client.SetAuthToken("test-token")
+
+		logs := newRecordingHandler()
+		prev := slog.Default()
+		slog.SetDefault(slog.New(logs))
+		defer slog.SetDefault(prev)
+
+		reporter := &controlPlaneSessionReporter{cp: client, nodeID: upTestNodeID}
+		reporter.ReportSessionEnded(context.Background(), "sess-drained", "10.0.0.5", 22, 4096, 8192, api.TerminatedByPlexdClose)
+		return logs
+	}
+
+	t.Run("session revoked", func(t *testing.T) {
+		logs := reportEnded(t, http.StatusConflict, `{"code":"session_already_revoked"}`)
+
+		if n := logs.count(slog.LevelWarn, endedRefusedMsg); n != 1 {
+			t.Errorf("the refused row was warned about %d times, want 1", n)
+		}
+		if n := logs.countAt(slog.LevelError); n != 0 {
+			t.Errorf("the expected answer of a revocation produced %d error records, want 0", n)
+		}
+		// Nothing re-posts the row, so a line without the counters would drop
+		// them for good.
+		attrs := logs.attrsOf(slog.LevelWarn, endedRefusedMsg)
+		for _, want := range []struct{ key, value string }{
+			{"session_id", "sess-drained"},
+			{"bytes_in", "4096"},
+			{"bytes_out", "8192"},
+			{"terminated_by", api.TerminatedByPlexdClose},
+		} {
+			if got := attrs[want.key]; got != want.value {
+				t.Errorf("%s = %q, want %q", want.key, got, want.value)
+			}
+		}
+	})
+
+	t.Run("other error", func(t *testing.T) {
+		logs := reportEnded(t, http.StatusInternalServerError, `{"title":"boom"}`)
+
+		if n := logs.count(slog.LevelError, endedFailedMsg); n != 1 {
+			t.Errorf("the 500 was reported as a failure %d times, want 1", n)
+		}
+		if n := logs.countAt(slog.LevelWarn); n != 0 {
+			t.Errorf("a 500 is no verdict on the session, but %d warn records were emitted", n)
+		}
+	})
+}
