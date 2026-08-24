@@ -50,29 +50,115 @@ type workflowStep struct {
 	Run  string            `yaml:"run"`
 }
 
-func loadReleaseWorkflow(t *testing.T) workflow {
+// loadWorkflow parses a workflow file from .github/workflows by name.
+func loadWorkflow(t *testing.T, name string) workflow {
 	t.Helper()
-	path := filepath.Join(repoRoot(t), ".github", "workflows", "release.yml")
+	path := filepath.Join(repoRoot(t), ".github", "workflows", name)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read release.yml: %v", err)
+		t.Fatalf("read %s: %v", name, err)
 	}
 	var wf workflow
 	if err := yaml.Unmarshal(data, &wf); err != nil {
-		t.Fatalf("parse release.yml: %v", err)
+		t.Fatalf("parse %s: %v", name, err)
 	}
 	return wf
 }
 
+// releaseTarget is one entry of the build matrix that build.yml and release.yml
+// share. ext is the binary's file extension, empty everywhere but Windows.
+type releaseTarget struct{ goos, goarch, gomips, ext string }
+
+// binary returns the file name the build step writes for this target, which is
+// also the published release asset name.
+func (rt releaseTarget) binary() string { return "plexd-" + rt.goos + "-" + rt.goarch + rt.ext }
+
+// releaseTargets is the set of platforms every release ships. The Linux names
+// are consumed by deploy/install.sh and internal/upgrade/fetcher.go, so they
+// must not change.
+var releaseTargets = []releaseTarget{
+	{"linux", "amd64", "", ""},
+	{"linux", "arm64", "", ""},
+	{"linux", "mipsle", "softfloat", ""},
+	{"windows", "amd64", "", ".exe"},
+	{"windows", "arm64", "", ".exe"},
+	{"darwin", "amd64", "", ""},
+	{"darwin", "arm64", "", ""},
+}
+
+// matrixInclude returns a job's matrix.include entries keyed by "goos/goarch".
+func matrixInclude(t *testing.T, job workflowJob) map[string]map[string]any {
+	t.Helper()
+	if job.Strategy == nil {
+		t.Fatal("build job has no strategy")
+	}
+	includeRaw, ok := job.Strategy.Matrix["include"]
+	if !ok {
+		t.Fatal("build matrix missing include")
+	}
+	includeList, ok := includeRaw.([]any)
+	if !ok {
+		t.Fatalf("matrix.include is %T, want []any", includeRaw)
+	}
+	entries := make(map[string]map[string]any, len(includeList))
+	for i, v := range includeList {
+		entry, ok := v.(map[string]any)
+		if !ok {
+			t.Fatalf("matrix.include[%d] is %T, want map", i, v)
+		}
+		goos, _ := entry["goos"].(string)
+		goarch, _ := entry["goarch"].(string)
+		if goos == "" || goarch == "" {
+			t.Fatalf("matrix.include[%d] missing goos or goarch", i)
+		}
+		entries[goos+"/"+goarch] = entry
+	}
+	return entries
+}
+
+// assertBuildBinaryStep checks the cross-compilation step that build.yml and
+// release.yml both carry. They differ only in the version ldflag.
+func assertBuildBinaryStep(t *testing.T, steps []workflowStep, wantVersion string) {
+	t.Helper()
+	step, ok := findStep(steps, func(s workflowStep) bool {
+		return s.Name == "Build binary"
+	})
+	if !ok {
+		t.Fatal("missing Build binary step")
+	}
+	if step.Env["CGO_ENABLED"] != "0" {
+		t.Error("CGO_ENABLED not set to 0")
+	}
+	for _, env := range []struct{ key, want string }{
+		{"GOOS", "${{ matrix.goos }}"},
+		{"GOARCH", "${{ matrix.goarch }}"},
+		{"GOMIPS", "${{ matrix.gomips }}"},
+	} {
+		if got := step.Env[env.key]; got != env.want {
+			t.Errorf("%s = %q, want %q (it must come from the matrix)", env.key, got, env.want)
+		}
+	}
+	const wantOutput = "-o plexd-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+	if !strings.Contains(step.Run, wantOutput) {
+		t.Errorf("build step missing %q", wantOutput)
+	}
+	if !strings.Contains(step.Run, "-ldflags") {
+		t.Error("missing -ldflags")
+	}
+	if !strings.Contains(step.Run, wantVersion) {
+		t.Errorf("build step missing %q ldflag", wantVersion)
+	}
+}
+
 func TestReleaseWorkflow_Name(t *testing.T) {
-	wf := loadReleaseWorkflow(t)
+	wf := loadWorkflow(t, "release.yml")
 	if wf.Name != "Release" {
 		t.Errorf("workflow name = %q, want %q", wf.Name, "Release")
 	}
 }
 
 func TestReleaseWorkflow_Trigger(t *testing.T) {
-	wf := loadReleaseWorkflow(t)
+	wf := loadWorkflow(t, "release.yml")
 	push, ok := wf.On["push"]
 	if !ok {
 		t.Fatal("missing on.push trigger")
@@ -99,14 +185,14 @@ func TestReleaseWorkflow_Trigger(t *testing.T) {
 }
 
 func TestReleaseWorkflow_Permissions(t *testing.T) {
-	wf := loadReleaseWorkflow(t)
+	wf := loadWorkflow(t, "release.yml")
 	if wf.Permissions["contents"] != "write" {
 		t.Errorf("permissions.contents = %q, want %q", wf.Permissions["contents"], "write")
 	}
 }
 
 func TestReleaseWorkflow_BuildJob(t *testing.T) {
-	wf := loadReleaseWorkflow(t)
+	wf := loadWorkflow(t, "release.yml")
 	build, ok := wf.Jobs["build"]
 	if !ok {
 		t.Fatal("missing build job")
@@ -120,39 +206,26 @@ func TestReleaseWorkflow_BuildJob(t *testing.T) {
 }
 
 func TestReleaseWorkflow_BuildMatrix(t *testing.T) {
-	wf := loadReleaseWorkflow(t)
-	build := wf.Jobs["build"]
-	if build.Strategy == nil {
-		t.Fatal("build job has no strategy")
+	wf := loadWorkflow(t, "release.yml")
+	entries := matrixInclude(t, wf.Jobs["build"])
+
+	if len(entries) != len(releaseTargets) {
+		t.Errorf("matrix.include has %d entries, want %d", len(entries), len(releaseTargets))
 	}
-	includeRaw, ok := build.Strategy.Matrix["include"]
-	if !ok {
-		t.Fatal("build matrix missing include")
-	}
-	includeList, ok := includeRaw.([]any)
-	if !ok {
-		t.Fatalf("matrix.include is %T, want []any", includeRaw)
-	}
-	arches := make(map[string]map[string]any)
-	for i, v := range includeList {
-		entry, ok := v.(map[string]any)
+	for _, rt := range releaseTargets {
+		key := rt.goos + "/" + rt.goarch
+		entry, ok := entries[key]
 		if !ok {
-			t.Fatalf("matrix.include[%d] is %T, want map", i, v)
+			t.Errorf("matrix.include missing target %q", key)
+			continue
 		}
-		goarch, _ := entry["goarch"].(string)
-		if goarch == "" {
-			t.Fatalf("matrix.include[%d] missing goarch", i)
+		if gomips, _ := entry["gomips"].(string); gomips != rt.gomips {
+			t.Errorf("%s gomips = %q, want %q", key, gomips, rt.gomips)
 		}
-		arches[goarch] = entry
-	}
-	for _, want := range []string{"amd64", "arm64", "mipsle"} {
-		if _, ok := arches[want]; !ok {
-			t.Errorf("matrix.include missing goarch %q", want)
-		}
-	}
-	if mipsle, ok := arches["mipsle"]; ok {
-		if gomips, _ := mipsle["gomips"].(string); gomips != "softfloat" {
-			t.Errorf("mipsle gomips = %q, want %q", gomips, "softfloat")
+		// ext carries the .exe suffix into the binary name, so a Windows entry
+		// that loses it publishes an extensionless asset.
+		if ext, _ := entry["ext"].(string); ext != rt.ext {
+			t.Errorf("%s ext = %q, want %q", key, ext, rt.ext)
 		}
 	}
 }
@@ -167,7 +240,7 @@ func findStep(steps []workflowStep, match func(workflowStep) bool) (workflowStep
 }
 
 func TestReleaseWorkflow_BuildSteps(t *testing.T) {
-	wf := loadReleaseWorkflow(t)
+	wf := loadWorkflow(t, "release.yml")
 	build := wf.Jobs["build"]
 
 	t.Run("checkout pinned", func(t *testing.T) {
@@ -192,24 +265,7 @@ func TestReleaseWorkflow_BuildSteps(t *testing.T) {
 	})
 
 	t.Run("build binary", func(t *testing.T) {
-		step, ok := findStep(build.Steps, func(s workflowStep) bool {
-			return s.Name == "Build binary"
-		})
-		if !ok {
-			t.Fatal("missing Build binary step")
-		}
-		if step.Env["CGO_ENABLED"] != "0" {
-			t.Error("CGO_ENABLED not set to 0")
-		}
-		if step.Env["GOOS"] != "linux" {
-			t.Error("GOOS not set to linux")
-		}
-		if !strings.Contains(step.Run, "-ldflags") {
-			t.Error("missing -ldflags")
-		}
-		if !strings.Contains(step.Run, "main.version") {
-			t.Error("missing main.version ldflags")
-		}
+		assertBuildBinaryStep(t, build.Steps, "main.version=${GITHUB_REF_NAME}")
 	})
 
 	t.Run("checksum", func(t *testing.T) {
@@ -219,8 +275,11 @@ func TestReleaseWorkflow_BuildSteps(t *testing.T) {
 		if !ok {
 			t.Fatal("missing Generate checksum step")
 		}
-		if !strings.Contains(step.Run, "sha256sum") {
-			t.Error("missing sha256sum command")
+		// The checksum line must name the binary exactly as it is published,
+		// .exe included, so checksums.sha256 can be checked against the assets.
+		const wantSum = "sha256sum plexd-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+		if !strings.Contains(step.Run, wantSum) {
+			t.Errorf("checksum step missing %q", wantSum)
 		}
 	})
 
@@ -234,7 +293,7 @@ func TestReleaseWorkflow_BuildSteps(t *testing.T) {
 }
 
 func TestReleaseWorkflow_ReleaseJob(t *testing.T) {
-	wf := loadReleaseWorkflow(t)
+	wf := loadWorkflow(t, "release.yml")
 	release, ok := wf.Jobs["release"]
 	if !ok {
 		t.Fatal("missing release job")
@@ -268,7 +327,7 @@ func TestReleaseWorkflow_ReleaseJob(t *testing.T) {
 }
 
 func TestReleaseWorkflow_ReleasePermissions(t *testing.T) {
-	wf := loadReleaseWorkflow(t)
+	wf := loadWorkflow(t, "release.yml")
 	release, ok := wf.Jobs["release"]
 	if !ok {
 		t.Fatal("missing release job")
@@ -284,7 +343,7 @@ func TestReleaseWorkflow_ReleasePermissions(t *testing.T) {
 }
 
 func TestReleaseWorkflow_ReleaseSteps(t *testing.T) {
-	wf := loadReleaseWorkflow(t)
+	wf := loadWorkflow(t, "release.yml")
 	release := wf.Jobs["release"]
 
 	t.Run("download-artifact", func(t *testing.T) {
@@ -302,8 +361,10 @@ func TestReleaseWorkflow_ReleaseSteps(t *testing.T) {
 		if !ok {
 			t.Fatal("missing Generate combined checksums step")
 		}
-		if !strings.Contains(step.Run, "checksums.sha256") {
-			t.Error("missing checksums.sha256 output")
+		// The glob must cover every target, not just the Linux ones.
+		const wantCat = "cat plexd-*.sha256 > checksums.sha256"
+		if !strings.Contains(step.Run, wantCat) {
+			t.Errorf("combined checksums step missing %q", wantCat)
 		}
 	})
 
@@ -325,6 +386,11 @@ func TestReleaseWorkflow_ReleaseSteps(t *testing.T) {
 		if !strings.Contains(step.Run, "--bundle") {
 			t.Error("cosign sign-blob step missing --bundle flag")
 		}
+		for _, rt := range releaseTargets {
+			if !strings.Contains(step.Run, rt.binary()) {
+				t.Errorf("cosign step does not sign %s", rt.binary())
+			}
+		}
 	})
 
 	t.Run("gh-release", func(t *testing.T) {
@@ -335,27 +401,40 @@ func TestReleaseWorkflow_ReleaseSteps(t *testing.T) {
 			t.Fatal("missing gh-release step")
 		}
 		files, _ := step.With["files"].(string)
-		for _, arch := range []string{"amd64", "arm64", "mipsle"} {
-			binary := "plexd-linux-" + arch
-			if !strings.Contains(files, binary) {
-				t.Errorf("release files missing %s", binary)
-			}
-			if strings.Contains(files, binary+".sha256") {
-				t.Errorf("release files should not include per-binary %s.sha256", binary)
-			}
-			bundle := binary + ".sigstore.json"
-			if !strings.Contains(files, bundle) {
-				t.Errorf("release files missing signature bundle %s", bundle)
+		// Compare whole lines. "plexd-linux-amd64" is a substring of
+		// "plexd-linux-amd64.sigstore.json", so a substring check would keep
+		// passing after the binary itself was dropped from the list.
+		listed := make(map[string]bool)
+		for _, line := range strings.Split(files, "\n") {
+			if line = strings.TrimSpace(line); line != "" {
+				listed[line] = true
 			}
 		}
-		if !strings.Contains(files, "checksums.sha256") {
+		for _, rt := range releaseTargets {
+			if !listed[rt.binary()] {
+				t.Errorf("release files missing %s", rt.binary())
+			}
+			if bundle := rt.binary() + ".sigstore.json"; !listed[bundle] {
+				t.Errorf("release files missing signature bundle %s", bundle)
+			}
+			if listed[rt.binary()+".sha256"] {
+				t.Errorf("release files should not include per-binary %s.sha256", rt.binary())
+			}
+		}
+		if !listed["checksums.sha256"] {
 			t.Error("release files missing combined checksums.sha256")
 		}
 	})
 }
 
 func TestReleaseWorkflow_AllActionsPinned(t *testing.T) {
-	wf := loadReleaseWorkflow(t)
+	assertAllActionsPinned(t, loadWorkflow(t, "release.yml"))
+}
+
+// assertAllActionsPinned rejects any `uses:` that is not pinned to a full
+// commit SHA, the supply-chain rule this repository holds for every workflow.
+func assertAllActionsPinned(t *testing.T, wf workflow) {
+	t.Helper()
 	for jobName, job := range wf.Jobs {
 		for i, step := range job.Steps {
 			if step.Uses == "" {

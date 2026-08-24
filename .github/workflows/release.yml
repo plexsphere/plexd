@@ -15,10 +15,23 @@ jobs:
     strategy:
       matrix:
         include:
-          - goarch: amd64
-          - goarch: arm64
-          - goarch: mipsle
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: mipsle
             gomips: softfloat
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -29,24 +42,24 @@ jobs:
       - name: Build binary
         env:
           CGO_ENABLED: '0'
-          GOOS: linux
+          GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOMIPS: ${{ matrix.gomips }}
         run: |
           go build \
             -ldflags "-s -w -X main.version=${GITHUB_REF_NAME} -X main.commit=${GITHUB_SHA::8} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            -o plexd-linux-${{ matrix.goarch }} \
+            -o plexd-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} \
             ./cmd/plexd
 
       - name: Generate checksum
-        run: sha256sum plexd-linux-${{ matrix.goarch }} > plexd-linux-${{ matrix.goarch }}.sha256
+        run: sha256sum plexd-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} > plexd-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.sha256
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: plexd-linux-${{ matrix.goarch }}
+          name: plexd-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
-            plexd-linux-${{ matrix.goarch }}
-            plexd-linux-${{ matrix.goarch }}.sha256
+            plexd-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+            plexd-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.sha256
           retention-days: 1
 
   release:
@@ -62,14 +75,16 @@ jobs:
           merge-multiple: true
 
       - name: Generate combined checksums
-        run: cat plexd-linux-*.sha256 > checksums.sha256
+        run: cat plexd-*.sha256 > checksums.sha256
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign release binaries
         run: |
-          for arch in amd64 arm64 mipsle; do
-            cosign sign-blob --yes --bundle "plexd-linux-${arch}.sigstore.json" "plexd-linux-${arch}"
+          for bin in plexd-linux-amd64 plexd-linux-arm64 plexd-linux-mipsle \
+                     plexd-windows-amd64.exe plexd-windows-arm64.exe \
+                     plexd-darwin-amd64 plexd-darwin-arm64; do
+            cosign sign-blob --yes --bundle "${bin}.sigstore.json" "${bin}"
           done
 
       - name: Create GitHub Release
@@ -80,7 +95,15 @@ jobs:
             plexd-linux-amd64
             plexd-linux-arm64
             plexd-linux-mipsle
+            plexd-windows-amd64.exe
+            plexd-windows-arm64.exe
+            plexd-darwin-amd64
+            plexd-darwin-arm64
             plexd-linux-amd64.sigstore.json
             plexd-linux-arm64.sigstore.json
             plexd-linux-mipsle.sigstore.json
+            plexd-windows-amd64.exe.sigstore.json
+            plexd-windows-arm64.exe.sigstore.json
+            plexd-darwin-amd64.sigstore.json
+            plexd-darwin-arm64.sigstore.json
             checksums.sha256
