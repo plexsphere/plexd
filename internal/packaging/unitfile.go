@@ -2,7 +2,7 @@ package packaging
 
 import (
 	"fmt"
-	"path/filepath"
+	"path"
 )
 
 // GenerateUnitFile produces a complete systemd unit file for the plexd service.
@@ -10,8 +10,10 @@ import (
 func GenerateUnitFile(cfg InstallConfig) string {
 	cfg.ApplyDefaults()
 
-	configPath := filepath.Join(cfg.ConfigDir, "config.yaml")
-	envPath := filepath.Join(cfg.ConfigDir, "environment")
+	// path, not filepath: a systemd unit is a Linux artifact, so its paths are
+	// slash-separated whatever host generates the file.
+	configPath := path.Join(cfg.ConfigDir, "config.yaml")
+	envPath := path.Join(cfg.ConfigDir, "environment")
 
 	return fmt.Sprintf(`[Unit]
 Description=plexd node agent
