@@ -75,7 +75,19 @@ func (s *FileSource) Collect(ctx context.Context) ([]api.LogEntry, error) {
 
 // readFile reads new lines from a single file, tracking offset and detecting rotation.
 func (s *FileSource) readFile(path string) ([]api.LogEntry, error) {
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	// Stat through the open handle rather than the path. A FileInfo from
+	// os.Stat carries its identity lazily on Windows: os.SameFile resolves it
+	// by reopening the path the FileInfo was made from, and after a rotation
+	// that path holds the new file, so both sides of the comparison resolve to
+	// the same file and the rotation goes unnoticed. A handle pins the file it
+	// was opened on, on every platform.
+	info, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -95,12 +107,6 @@ func (s *FileSource) readFile(path string) ([]api.LogEntry, error) {
 		s.states[path] = state
 		return nil, nil
 	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
 
 	if state.offset > 0 {
 		if _, err := f.Seek(state.offset, 0); err != nil {
