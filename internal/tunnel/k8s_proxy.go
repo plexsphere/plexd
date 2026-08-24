@@ -29,15 +29,15 @@ func NewK8sProxy(targetURL string, tlsConfig *tls.Config, logger *slog.Logger) (
 	}
 
 	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			req.Host = target.Host
-			clientIP := req.RemoteAddr
-			if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.Out.URL.Scheme = target.Scheme
+			pr.Out.URL.Host = target.Host
+			pr.Out.Host = target.Host
+			clientIP := pr.In.RemoteAddr
+			if host, _, err := net.SplitHostPort(pr.In.RemoteAddr); err == nil {
 				clientIP = host
 			}
-			req.Header.Set("X-Forwarded-For", clientIP)
+			pr.Out.Header.Set("X-Forwarded-For", clientIP)
 		},
 	}
 

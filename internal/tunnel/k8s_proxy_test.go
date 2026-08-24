@@ -110,6 +110,53 @@ func TestK8sProxy_SetsXForwardedFor(t *testing.T) {
 	}
 }
 
+func TestK8sProxy_XForwardedForIsNotDuplicated(t *testing.T) {
+	var gotXFF string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotXFF = r.Header.Get("X-Forwarded-For")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	proxy, err := NewK8sProxy(backend.URL, nil, slog.Default())
+	if err != nil {
+		t.Fatalf("NewK8sProxy() error: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/pods", nil)
+	req.RemoteAddr = "10.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if gotXFF != "10.0.0.1" {
+		t.Errorf("X-Forwarded-For = %q, want exactly %q", gotXFF, "10.0.0.1")
+	}
+}
+
+func TestK8sProxy_DropsClientSuppliedXForwardedFor(t *testing.T) {
+	var gotXFF string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotXFF = r.Header.Get("X-Forwarded-For")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	proxy, err := NewK8sProxy(backend.URL, nil, slog.Default())
+	if err != nil {
+		t.Fatalf("NewK8sProxy() error: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/pods", nil)
+	req.RemoteAddr = "10.0.0.1:12345"
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if gotXFF != "10.0.0.1" {
+		t.Errorf("X-Forwarded-For = %q, want exactly %q", gotXFF, "10.0.0.1")
+	}
+}
+
 func TestK8sProxy_SetsHostHeader(t *testing.T) {
 	var gotHost string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
