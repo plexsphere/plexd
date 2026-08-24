@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestWriteFileAtomic_Success(t *testing.T) {
@@ -268,6 +269,23 @@ func TestWriteFileAtomic_ConcurrentAccess(t *testing.T) {
 	assertNoTempFiles(t, dir)
 }
 
+// readSettled reads path, retrying briefly on any error. On Windows a replace
+// in flight makes the open fail with a sharing violation until MoveFileEx
+// finishes, which is the platform's file-sharing behaviour rather than a torn
+// write — and a torn write is what the caller asserts against. On Unix the
+// retry never triggers, and a genuinely unreadable file still surfaces its
+// error once the budget is spent.
+func readSettled(path string) ([]byte, error) {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got, err := os.ReadFile(path)
+		if err == nil || !time.Now().Before(deadline) {
+			return got, err
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestWriteFileAtomic_ConcurrentSameFile(t *testing.T) {
 	// Writers of the same target must not share a temp file: a shared temp
 	// inode lets one writer's buffer land in the file another already renamed
@@ -314,7 +332,7 @@ func TestWriteFileAtomic_ConcurrentSameFile(t *testing.T) {
 				return
 			default:
 			}
-			got, err := os.ReadFile(filepath.Join(dir, name))
+			got, err := readSettled(filepath.Join(dir, name))
 			if err != nil {
 				errs <- fmt.Errorf("read: %w", err)
 				return

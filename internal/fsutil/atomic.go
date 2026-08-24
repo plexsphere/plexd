@@ -41,20 +41,9 @@ func WriteFileAtomic(dir, name string, data []byte, perm os.FileMode) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpPath, targetPath); err != nil {
+	if err := replaceFile(tmpPath, targetPath); err != nil {
 		return err
 	}
 
-	// Syncing the file only makes its contents durable; on ext4/XFS the new
-	// directory entry can still be lost after a power cut until the parent
-	// directory itself is synced.
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		d.Close()
-		return err
-	}
-	return d.Close()
+	return syncDir(dir)
 }
