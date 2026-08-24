@@ -4,6 +4,8 @@ package actions
 import (
 	"errors"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/paths"
 )
 
 // DefaultMaxConcurrent is the default maximum number of concurrent actions.
@@ -15,8 +17,9 @@ const DefaultMaxActionTimeout = 10 * time.Minute
 // DefaultMaxOutputBytes is the default maximum output size per action (1 MiB).
 const DefaultMaxOutputBytes = 1 << 20
 
-// DefaultHooksDir is the default directory for hook scripts.
-const DefaultHooksDir = "/etc/plexd/hooks"
+// DefaultHooksDir is the default directory for hook scripts. It is resolved
+// per platform, which is why it is a var rather than a const.
+var DefaultHooksDir = paths.HooksDir()
 
 // Config holds the configuration for remote action execution.
 type Config struct {
@@ -31,7 +34,7 @@ type Config struct {
 	Enabled *bool `yaml:"enabled"`
 
 	// HooksDir is the directory containing hook scripts.
-	// Default: /etc/plexd/hooks
+	// Default: paths.HooksDir()
 	HooksDir string `yaml:"hooks_dir"`
 
 	// MaxConcurrent is the maximum number of actions that can run concurrently.

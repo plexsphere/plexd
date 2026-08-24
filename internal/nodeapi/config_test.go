@@ -9,8 +9,10 @@ func TestConfig_Defaults(t *testing.T) {
 	cfg := Config{DataDir: "/var/lib/plexd"}
 	cfg.ApplyDefaults()
 
-	if cfg.SocketPath != "/var/run/plexd/api.sock" {
-		t.Errorf("SocketPath = %q, want %q", cfg.SocketPath, "/var/run/plexd/api.sock")
+	// The socket path differs per platform (internal/paths pins each), so what
+	// is asserted here is that ApplyDefaults fills an empty field with it.
+	if cfg.SocketPath != DefaultSocketPath {
+		t.Errorf("SocketPath = %q, want %q", cfg.SocketPath, DefaultSocketPath)
 	}
 	if cfg.HTTPEnabled {
 		t.Error("HTTPEnabled = true, want false")

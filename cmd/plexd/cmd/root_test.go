@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/plexsphere/plexd/internal/paths"
 )
 
 // TestWarnIfConfigAbsent_SurvivesLogLevelError pins the missing-config line
@@ -76,6 +79,40 @@ func TestRootCommand_RegistrationFlags(t *testing.T) {
 			t.Errorf("help output should contain %q, got: %s", flag, output)
 		}
 	}
+}
+
+// TestRootCommand_ConfigFlagDefault pins the --config default to the platform
+// configuration file, and keeps PLEXD_CONFIG ahead of it. The path is the
+// first thing every command touches, so a default that resolved against the
+// current drive on Windows would send the daemon to C:\etc\plexd.
+func TestRootCommand_ConfigFlagDefault(t *testing.T) {
+	// The flag is registered in init(), so its default froze against the
+	// environment as it stood then. This assertion therefore has to run before
+	// any t.Setenv below touches PLEXD_CONFIG.
+	flag := rootCmd.PersistentFlags().Lookup("config")
+	if flag == nil {
+		t.Fatal("rootCmd has no --config flag")
+	}
+	if want := envOrDefault("PLEXD_CONFIG", paths.ConfigFile()); flag.DefValue != want {
+		t.Errorf("--config default = %q, want %q", flag.DefValue, want)
+	}
+
+	t.Run("empty PLEXD_CONFIG falls back to the platform path", func(t *testing.T) {
+		t.Setenv("PLEXD_CONFIG", "")
+
+		if got, want := envOrDefault("PLEXD_CONFIG", paths.ConfigFile()), paths.ConfigFile(); got != want {
+			t.Errorf("envOrDefault = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("PLEXD_CONFIG overrides the platform path", func(t *testing.T) {
+		custom := filepath.Join(t.TempDir(), "config.yaml")
+		t.Setenv("PLEXD_CONFIG", custom)
+
+		if got := envOrDefault("PLEXD_CONFIG", paths.ConfigFile()); got != custom {
+			t.Errorf("envOrDefault = %q, want %q", got, custom)
+		}
+	})
 }
 
 func TestRootCommand_Version(t *testing.T) {

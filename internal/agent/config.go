@@ -18,6 +18,7 @@ import (
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
+	"github.com/plexsphere/plexd/internal/paths"
 	"github.com/plexsphere/plexd/internal/peerexchange"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/reconcile"
@@ -33,10 +34,11 @@ const (
 
 	// DefaultLogLevel is the default log level.
 	DefaultLogLevel = "info"
-
-	// DefaultDataDir is the default data directory.
-	DefaultDataDir = "/var/lib/plexd"
 )
+
+// DefaultDataDir is the default data directory. It is resolved per platform,
+// which is why it is a var rather than a const.
+var DefaultDataDir = paths.DataDir()
 
 // AgentConfig is the top-level configuration for the plexd agent.
 // It aggregates all subsystem configurations and is populated from
@@ -51,7 +53,7 @@ type AgentConfig struct {
 	LogLevel string `yaml:"log_level"`
 
 	// DataDir is the directory for persistent agent data.
-	// Default: /var/lib/plexd
+	// Default: paths.DataDir()
 	DataDir string `yaml:"data_dir"`
 
 	API          api.Config          `yaml:"api"`

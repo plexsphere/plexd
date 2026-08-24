@@ -3,6 +3,8 @@ package registration
 import (
 	"errors"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/paths"
 )
 
 // Config holds the configuration for the agent registration process.
@@ -25,7 +27,7 @@ type Config struct {
 	RequestedResourceID string `yaml:"requested_resource_id"`
 
 	// TokenFile is the path to the bootstrap token file.
-	// Default: /etc/plexd/bootstrap-token
+	// Default: paths.TokenFile()
 	TokenFile string `yaml:"token_file"`
 
 	// TokenEnv is the environment variable name for the bootstrap token.
@@ -54,8 +56,9 @@ type Config struct {
 	MaxRetryDuration time.Duration `yaml:"max_retry_duration"`
 }
 
-// DefaultTokenFile is the default path to the bootstrap token file.
-const DefaultTokenFile = "/etc/plexd/bootstrap-token"
+// DefaultTokenFile is the default path to the bootstrap token file. It is
+// resolved per platform, which is why it is a var rather than a const.
+var DefaultTokenFile = paths.TokenFile()
 
 // DefaultTokenEnv is the default environment variable name for the bootstrap token.
 const DefaultTokenEnv = "PLEXD_BOOTSTRAP_TOKEN"

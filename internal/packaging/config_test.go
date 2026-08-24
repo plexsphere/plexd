@@ -2,6 +2,8 @@ package packaging
 
 import (
 	"testing"
+
+	"github.com/plexsphere/plexd/internal/paths"
 )
 
 func TestInstallConfig_ApplyDefaults(t *testing.T) {
@@ -11,14 +13,18 @@ func TestInstallConfig_ApplyDefaults(t *testing.T) {
 	if cfg.BinaryPath != "/usr/local/bin/plexd" {
 		t.Errorf("BinaryPath = %q, want %q", cfg.BinaryPath, "/usr/local/bin/plexd")
 	}
-	if cfg.ConfigDir != "/etc/plexd" {
-		t.Errorf("ConfigDir = %q, want %q", cfg.ConfigDir, "/etc/plexd")
+	// The three directories differ per platform, so what is asserted here is
+	// that ApplyDefaults fills an empty field from internal/paths. The exact
+	// string each platform resolves to is pinned by the tagged tests in that
+	// package, on the runner that actually has it.
+	if cfg.ConfigDir != paths.ConfigDir() {
+		t.Errorf("ConfigDir = %q, want %q", cfg.ConfigDir, paths.ConfigDir())
 	}
-	if cfg.DataDir != "/var/lib/plexd" {
-		t.Errorf("DataDir = %q, want %q", cfg.DataDir, "/var/lib/plexd")
+	if cfg.DataDir != paths.DataDir() {
+		t.Errorf("DataDir = %q, want %q", cfg.DataDir, paths.DataDir())
 	}
-	if cfg.RunDir != "/var/run/plexd" {
-		t.Errorf("RunDir = %q, want %q", cfg.RunDir, "/var/run/plexd")
+	if cfg.RunDir != paths.RunDir() {
+		t.Errorf("RunDir = %q, want %q", cfg.RunDir, paths.RunDir())
 	}
 	if cfg.ServiceName != "plexd" {
 		t.Errorf("ServiceName = %q, want %q", cfg.ServiceName, "plexd")

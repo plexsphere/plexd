@@ -1,9 +1,18 @@
 package packaging
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/plexsphere/plexd/internal/paths"
+)
 
 // GenerateDefaultConfig produces a minimal default config.yaml for plexd.
 // If apiBaseURL is empty, a placeholder comment is written instead.
+//
+// data_dir and registration.token_file are written as the platform defaults,
+// so the file names the same directories the daemon would fall back to without
+// it. Both are plain YAML scalars, where a backslash is a literal character
+// and needs no escaping.
 func GenerateDefaultConfig(apiBaseURL string) string {
 	apiSection := "# api:\n#   base_url: https://your-control-plane.example.com"
 	if apiBaseURL != "" {
@@ -15,12 +24,12 @@ func GenerateDefaultConfig(apiBaseURL string) string {
 
 %s
 
-data_dir: /var/lib/plexd
+data_dir: %s
 log_level: info
 
 registration:
-  token_file: /etc/plexd/bootstrap-token
+  token_file: %s
   # project_id: <project uuid>
   # resource_handle: <platform resource handle>
-`, apiSection)
+`, apiSection, DefaultDataDir, paths.TokenFile())
 }
