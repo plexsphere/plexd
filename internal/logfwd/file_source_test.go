@@ -168,6 +168,43 @@ func TestFileSource_FileRotationDetection(t *testing.T) {
 	}
 }
 
+func TestFileSource_FileRotationDetection_SameSize(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rotated.log")
+
+	if err := os.WriteFile(path, []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	src := NewFileSource(path, "host", discardLogger())
+
+	entries, err := src.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("first Collect() error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].Message != "original" {
+		t.Fatalf("first Collect: unexpected entries: %v", entries)
+	}
+
+	// Rotate by rename, so the old file keeps its inode and the replacement
+	// cannot reuse it. "replaced\n" is the same 9 bytes as "original\n", so only
+	// the identity check can reveal the rotation.
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replaced\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err = src.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("second Collect() error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].Message != "replaced" {
+		t.Fatalf("second Collect: expected 'replaced', got %v", entries)
+	}
+}
+
 func TestFileSource_EmptyGlobReturnsEmpty(t *testing.T) {
 	dir := t.TempDir()
 	src := NewFileSource(filepath.Join(dir, "*.nonexistent"), "host", discardLogger())

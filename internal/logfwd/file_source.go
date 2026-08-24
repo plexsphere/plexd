@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -18,10 +17,10 @@ const MaxLineBytes = 16384
 
 const truncatedSuffix = "[truncated]"
 
-// fileState tracks read position and inode for a single file.
+// fileState tracks read position and file identity for a single file.
 type fileState struct {
 	offset int64
-	inode  uint64
+	info   os.FileInfo
 }
 
 // FileSource implements LogSource by reading from log files matching a glob pattern.
@@ -81,19 +80,15 @@ func (s *FileSource) readFile(path string) ([]api.LogEntry, error) {
 		return nil, err
 	}
 
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return nil, fmt.Errorf("unsupported file stat type for %s", path)
-	}
-
 	state, exists := s.states[path]
 
-	// Detect file rotation: inode changed or file is smaller than our offset.
-	if exists && (stat.Ino != state.inode || info.Size() < state.offset) {
-		state = fileState{offset: 0, inode: stat.Ino}
-	} else if !exists {
-		state = fileState{offset: 0, inode: stat.Ino}
+	// Detect file rotation: a different file now carries this path, or the file
+	// is smaller than our offset. The !exists test comes first so os.SameFile
+	// never sees a nil state.info.
+	if !exists || !os.SameFile(state.info, info) || info.Size() < state.offset {
+		state = fileState{offset: 0}
 	}
+	state.info = info
 
 	// No new data.
 	if info.Size() == state.offset {
