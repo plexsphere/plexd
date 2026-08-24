@@ -1552,6 +1552,38 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPost, "/test/inject-event", `{"id":"e1","type":"conc","payload":{},"signature":"s"}`},
 	}
 
+	// http.DefaultClient keeps two idle connections per host, and a response
+	// whose body is closed without being read cannot be reused at all, so this
+	// fan-out of well over a thousand requests used to need a socket each.
+	// Windows runs out of ephemeral ports long before the last one lands, and
+	// the failures were dropped on the floor, surfacing as counters that were
+	// merely short — which reads like a lost update in the server rather than a
+	// request that never arrived. Pool the connections, bound the burst, drain
+	// every body, and report what fails.
+	transport := &http.Transport{
+		MaxIdleConns:        128,
+		MaxIdleConnsPerHost: 128,
+		IdleConnTimeout:     30 * time.Second,
+	}
+	t.Cleanup(transport.CloseIdleConnections)
+	client := &http.Client{Transport: transport}
+	inFlight := make(chan struct{}, 64)
+	errs := make(chan error, 8*n*len(endpoints))
+
+	send := func(req *http.Request) {
+		inFlight <- struct{}{}
+		defer func() { <-inFlight }()
+		resp, err := client.Do(req)
+		if err != nil {
+			errs <- err
+			return
+		}
+		defer resp.Body.Close()
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			errs <- err
+		}
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(n * len(endpoints))
 
@@ -1565,6 +1597,7 @@ func TestConcurrentCounters(t *testing.T) {
 				}
 				req, err := http.NewRequest(e.method, ts.URL+e.path, bodyReader)
 				if err != nil {
+					errs <- err
 					return
 				}
 				if e.body != "" {
@@ -1573,11 +1606,7 @@ func TestConcurrentCounters(t *testing.T) {
 				// Harmless on non-ingest routes; the metrics/logs/audit ingest
 				// gate rejects a missing X-Plexsphere-Sent-At with 400.
 				req.Header.Set("X-Plexsphere-Sent-At", time.Now().UTC().Format(time.RFC3339))
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
-					return
-				}
-				resp.Body.Close()
+				send(req)
 			}(ep)
 		}
 	}
@@ -1593,23 +1622,17 @@ func TestConcurrentCounters(t *testing.T) {
 			path := ts.URL + "/v1/nodes/node-1/state/reports/" + fmt.Sprintf("report.conc.%d", i)
 			putReq, err := http.NewRequest(http.MethodPut, path, strings.NewReader(reportBody))
 			if err != nil {
+				errs <- err
 				return
 			}
 			putReq.Header.Set("Content-Type", "application/json")
-			putResp, err := http.DefaultClient.Do(putReq)
-			if err != nil {
-				return
-			}
-			putResp.Body.Close()
+			send(putReq)
 			delReq, err := http.NewRequest(http.MethodDelete, path, nil)
 			if err != nil {
+				errs <- err
 				return
 			}
-			delResp, err := http.DefaultClient.Do(delReq)
-			if err != nil {
-				return
-			}
-			delResp.Body.Close()
+			send(delReq)
 		}(i)
 	}
 
@@ -1623,18 +1646,19 @@ func TestConcurrentCounters(t *testing.T) {
 			eid := fmt.Sprintf("exec-conc-%d", i)
 			req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/nodes/"+testMockNodeID+"/executions/"+eid, strings.NewReader(`{"status":"ack"}`))
 			if err != nil {
+				errs <- err
 				return
 			}
 			req.Header.Set("Content-Type", "application/json")
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				return
-			}
-			resp.Body.Close()
+			send(req)
 		}(i)
 	}
 
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("request failed: %v", err)
+	}
 
 	a := getAssertions(t, ts.URL)
 	assertAllCountersEqual(t, a, n)

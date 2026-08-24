@@ -665,12 +665,22 @@ func TestVerifier_VerifyHooksDir_PinsWireBody(t *testing.T) {
 
 	observed := wireDigest(t, sha256Hex("#!/bin/sh\necho tampered"))
 	expected := wireDigest(t, sha256Hex("#!/bin/sh\necho original"))
+	// The artifact id is a filesystem path. On Windows it contains backslashes,
+	// which JSON escapes, so the expectation has to encode it the way the wire
+	// body does instead of pasting it into the literal.
+	artifactID := func(name string) string {
+		encoded, err := json.Marshal(filepath.Join(hooksDir, name))
+		if err != nil {
+			t.Fatalf("marshal artifact id for %q: %v", name, err)
+		}
+		return string(encoded)
+	}
 	want := `{"violations":[` +
-		`{"kind":"hook_checksum","detected_by":"startup_scan","artifact_id":"` +
-		filepath.Join(hooksDir, "alpha.sh") + `","observed_checksum":"` + observed +
+		`{"kind":"hook_checksum","detected_by":"startup_scan","artifact_id":` +
+		artifactID("alpha.sh") + `,"observed_checksum":"` + observed +
 		`","expected_checksum":"` + expected + `"},` +
-		`{"kind":"hook_checksum","detected_by":"startup_scan","artifact_id":"` +
-		filepath.Join(hooksDir, "beta.sh") + `","observed_checksum":"` + observed +
+		`{"kind":"hook_checksum","detected_by":"startup_scan","artifact_id":` +
+		artifactID("beta.sh") + `,"observed_checksum":"` + observed +
 		`","expected_checksum":"` + expected + `"}]}`
 	if string(body) != want {
 		t.Errorf("wire body =\n  %s\nwant\n  %s", body, want)

@@ -1052,7 +1052,7 @@ func assertEveryCallPresentsEnvelope(t *testing.T, cp *authRecordingControlPlane
 
 // upDaemonYAML is the extra config a test needs to run the whole daemon rather
 // than stop at registration: no firewall enforcement, no tunnel listener, and a
-// node-API socket inside the test's own directory.
+// node-API socket short enough to bind on every platform.
 func upDaemonYAML(t *testing.T) string {
 	t.Helper()
 	return fmt.Sprintf(`policy:
@@ -1061,7 +1061,7 @@ tunnel:
   enabled: false
 node_api:
   socket_path: %s
-`, filepath.Join(t.TempDir(), "api.sock"))
+`, shortSocketPath(t))
 }
 
 // startRunUp runs the daemon against a context the test owns and returns the

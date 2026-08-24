@@ -15,13 +15,26 @@ import (
 	"github.com/plexsphere/plexd/internal/nodeapi"
 )
 
+// shortSocketPath returns a Unix socket path that fits every platform's
+// sun_path limit: 104 bytes on macOS, 108 on Linux and Windows. t.TempDir()
+// embeds the test's own name in the path, which pushes a long-named test past
+// the limit and fails bind with EINVAL.
+func shortSocketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "plexd-sock-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "api.sock")
+}
+
 // startTestSocketServer starts an HTTP server on a temporary Unix socket.
 // It returns the socket path and cleans up on test completion.
 func startTestSocketServer(t *testing.T, handler http.Handler) string {
 	t.Helper()
 
-	tmpDir := t.TempDir()
-	socketPath := filepath.Join(tmpDir, "test.sock")
+	socketPath := shortSocketPath(t)
 
 	ln, err := net.Listen("unix", socketPath)
 	if err != nil {

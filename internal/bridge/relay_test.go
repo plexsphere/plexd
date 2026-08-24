@@ -33,6 +33,18 @@ func startTestRelay(t *testing.T, maxSessions int, sessionTTL time.Duration) *Re
 	return relay
 }
 
+// relayLoopbackAddr returns the relay's port on 127.0.0.1. The relay binds
+// 0.0.0.0, and while Linux routes a datagram sent to 0.0.0.0 back to loopback,
+// macOS and Windows reject it with "no route to host".
+func relayLoopbackAddr(t *testing.T, relay *Relay) *net.UDPAddr {
+	t.Helper()
+	addr, ok := relay.ListenAddr().(*net.UDPAddr)
+	if !ok || addr == nil {
+		t.Fatalf("relay listen addr = %v, want *net.UDPAddr", relay.ListenAddr())
+	}
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: addr.Port}
+}
+
 func TestRelaySession_ForwardAtoB(t *testing.T) {
 	relay := startTestRelay(t, 100, 5*time.Minute)
 
@@ -49,10 +61,7 @@ func TestRelaySession_ForwardAtoB(t *testing.T) {
 		t.Fatalf("AddSession: %v", err)
 	}
 
-	relayAddr, err := net.ResolveUDPAddr("udp", relay.ListenAddr().String())
-	if err != nil {
-		t.Fatalf("resolve relay addr: %v", err)
-	}
+	relayAddr := relayLoopbackAddr(t, relay)
 	msg := []byte("hello from A")
 	if _, err := peerA.WriteToUDP(msg, relayAddr); err != nil {
 		t.Fatalf("write: %v", err)
@@ -85,10 +94,7 @@ func TestRelaySession_ForwardBtoA(t *testing.T) {
 		t.Fatalf("AddSession: %v", err)
 	}
 
-	relayAddr, err := net.ResolveUDPAddr("udp", relay.ListenAddr().String())
-	if err != nil {
-		t.Fatalf("resolve relay addr: %v", err)
-	}
+	relayAddr := relayLoopbackAddr(t, relay)
 	msg := []byte("hello from B")
 	if _, err := peerB.WriteToUDP(msg, relayAddr); err != nil {
 		t.Fatalf("write: %v", err)
@@ -122,10 +128,7 @@ func TestRelaySession_DropUnknownSource(t *testing.T) {
 		t.Fatalf("AddSession: %v", err)
 	}
 
-	relayAddr, err := net.ResolveUDPAddr("udp", relay.ListenAddr().String())
-	if err != nil {
-		t.Fatalf("resolve relay addr: %v", err)
-	}
+	relayAddr := relayLoopbackAddr(t, relay)
 
 	if _, err := unknown.WriteToUDP([]byte("unknown"), relayAddr); err != nil {
 		t.Fatalf("write: %v", err)
@@ -133,7 +136,7 @@ func TestRelaySession_DropUnknownSource(t *testing.T) {
 
 	_ = peerA.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	buf := make([]byte, 1024)
-	_, _, err = peerA.ReadFromUDP(buf)
+	_, _, err := peerA.ReadFromUDP(buf)
 	if err == nil {
 		t.Error("peer A should not receive packet from unknown source")
 	}

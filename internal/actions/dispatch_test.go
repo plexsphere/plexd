@@ -27,6 +27,16 @@ func snapshot(entries ...api.NodeStateExecution) *api.NodeStateSnapshot {
 	return &api.NodeStateSnapshot{Executions: entries}
 }
 
+// activeExecutions reports how many executions the executor still holds in
+// flight. An id is released after its terminal callback has been delivered, so
+// this is the only way to tell that a re-dispatch under the same id will be
+// taken rather than refused as already_active.
+func activeExecutions(e *Executor) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.active)
+}
+
 func TestDispatcher_EmptyBlock(t *testing.T) {
 	d, _, reporter := newTestDispatcher(t, Config{})
 
@@ -70,13 +80,17 @@ func TestDispatcher_PendingEntryDispatchedOnce(t *testing.T) {
 // TestDispatcher_DrainPrunesHandled checks that the settled-id set is garbage
 // collected when an entry leaves the block, keeping it bounded by the block.
 func TestDispatcher_DrainPrunesHandled(t *testing.T) {
-	d, _, reporter := newTestDispatcher(t, Config{})
+	d, exec, reporter := newTestDispatcher(t, Config{})
 	entry := pendingExec("exec-drained", "test.echo")
 
 	d.Handle(context.Background(), snapshot(entry))
 	waitFor(t, 5*time.Second, func() bool {
 		return len(reporter.getCallbacks()) >= 3
 	})
+	// The terminal callback is delivered before the executor releases the id,
+	// so the re-dispatch below can race that release and be refused as
+	// already_active. Wait for the release itself, not just for its callback.
+	waitFor(t, 5*time.Second, func() bool { return activeExecutions(exec) == 0 })
 
 	// The entry drains: the control plane has settled it.
 	d.Handle(context.Background(), snapshot())
