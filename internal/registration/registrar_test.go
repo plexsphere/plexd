@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -935,6 +936,9 @@ func TestRegistrar_DeletesTokenFileAfterRegistration(t *testing.T) {
 }
 
 func TestRegistrar_TokenDeletionFailureDoesNotFailRegistration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on windows")
+	}
 	_, client := testServer(t, successHandler(t))
 
 	// Create token file in a directory, then make it read-only so deletion fails.

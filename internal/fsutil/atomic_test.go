@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -33,8 +34,11 @@ func TestWriteFileAtomic_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	if got := info.Mode().Perm(); got != perm {
-		t.Errorf("perm = %o, want %o", got, perm)
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != perm {
+			t.Errorf("perm = %o, want %o", got, perm)
+		}
 	}
 
 	// Temp file should be cleaned up.
@@ -84,8 +88,11 @@ func TestWriteFileAtomic_Overwrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
-	if got := info.Mode().Perm(); got != perm2 {
-		t.Errorf("perm = %o, want %o", got, perm2)
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != perm2 {
+			t.Errorf("perm = %o, want %o", got, perm2)
+		}
 	}
 }
 
@@ -105,8 +112,11 @@ func TestWriteFileAtomic_EmptyData(t *testing.T) {
 	if info.Size() != 0 {
 		t.Errorf("size = %d, want 0", info.Size())
 	}
-	if got := info.Mode().Perm(); got != perm {
-		t.Errorf("perm = %o, want %o", got, perm)
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != perm {
+			t.Errorf("perm = %o, want %o", got, perm)
+		}
 	}
 }
 
@@ -126,8 +136,11 @@ func TestWriteFileAtomic_NilData(t *testing.T) {
 	if info.Size() != 0 {
 		t.Errorf("size = %d, want 0", info.Size())
 	}
-	if got := info.Mode().Perm(); got != perm {
-		t.Errorf("perm = %o, want %o", got, perm)
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != perm {
+			t.Errorf("perm = %o, want %o", got, perm)
+		}
 	}
 }
 
@@ -154,6 +167,9 @@ func TestWriteFileAtomic_LargePayload(t *testing.T) {
 }
 
 func TestWriteFileAtomic_PermissionDenied(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on windows")
+	}
 	dir := t.TempDir()
 	roDir := filepath.Join(dir, "readonly")
 	if err := os.Mkdir(roDir, 0o500); err != nil {
@@ -185,6 +201,9 @@ func TestWriteFileAtomic_NonExistentDir(t *testing.T) {
 }
 
 func TestWriteFileAtomic_PreservesOriginalOnFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on windows")
+	}
 	dir := t.TempDir()
 	name := "original.txt"
 	originalData := []byte("original content")
@@ -363,6 +382,9 @@ func TestWriteFileAtomic_ConcurrentSameFile(t *testing.T) {
 }
 
 func TestWriteFileAtomic_Permissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on windows")
+	}
 	dir := t.TempDir()
 
 	tests := []struct {

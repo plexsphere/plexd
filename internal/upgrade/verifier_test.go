@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -134,6 +135,9 @@ func TestVerify_Refusals(t *testing.T) {
 }
 
 func TestNewVerifier_UnreadableTrustedRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on windows")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: file mode 0000 is still readable")
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -191,6 +192,9 @@ func TestTokenResolver_FileNotFoundFallsThrough(t *testing.T) {
 }
 
 func TestTokenResolver_FileReadError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on windows")
+	}
 	dir := t.TempDir()
 	tokenFile := filepath.Join(dir, "token")
 	if err := os.WriteFile(tokenFile, []byte("secret"), 0o600); err != nil {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -32,8 +33,11 @@ func TestSaveIdentity_CreatesDataDir(t *testing.T) {
 	if !info.IsDir() {
 		t.Fatalf("%q is not a directory", dir)
 	}
-	if perm := info.Mode().Perm(); perm != 0700 {
-		t.Errorf("data dir permissions = %o, want 0700", perm)
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0700 {
+			t.Errorf("data dir permissions = %o, want 0700", perm)
+		}
 	}
 }
 
@@ -112,8 +116,11 @@ func TestSaveIdentity_AtomicWrite(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Stat(%q): %v", name, err)
 		}
-		if perm := info.Mode().Perm(); perm != 0600 {
-			t.Errorf("%s permissions = %o, want 0600", name, perm)
+		// Windows reports 0666/0777, never POSIX bits.
+		if runtime.GOOS != "windows" {
+			if perm := info.Mode().Perm(); perm != 0600 {
+				t.Errorf("%s permissions = %o, want 0600", name, perm)
+			}
 		}
 	}
 }
@@ -553,6 +560,9 @@ func writeIdentityFiles(t *testing.T, dir, nsk string) {
 }
 
 func TestSaveIdentity_Permissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on windows")
+	}
 	dir := t.TempDir()
 
 	id := &NodeIdentity{

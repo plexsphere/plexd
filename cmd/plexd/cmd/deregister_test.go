@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -225,6 +226,9 @@ func TestDeregisterCommand_MissingIdentityIsIdempotent(t *testing.T) {
 }
 
 func TestDeregisterCommand_RemoveFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on windows")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses directory write permissions, so os.Remove cannot fail here")
 	}
