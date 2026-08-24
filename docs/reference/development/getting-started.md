@@ -61,6 +61,31 @@ plexd/
 └── README.md
 ```
 
+## Platform-specific files
+
+Code that only builds on some operating systems lives in its own file, tagged by the platform it serves. Two conventions are in use:
+
+| Tag | File suffix | Used for | Examples |
+|---|---|---|---|
+| `//go:build linux` / `//go:build !linux` | `_linux.go` / `_other.go` | Controllers that exist only on Linux, paired with a stub elsewhere | `cmd/plexd/cmd/up_linux.go`, `cmd/plexd/cmd/up_other.go`, `internal/nodeapi/socket_perms_other.go` |
+| `//go:build unix` / `//go:build windows` | `_unix.go` / `_windows.go` | Syscall helpers that Linux and macOS share | `internal/actions/builtins_unix.go`, `internal/actions/builtins_windows.go` |
+
+Pick `unix` / `windows` when Linux and macOS want the same implementation; `!linux` would wrongly catch Windows. Every such file carries an explicit `//go:build` line, even when its name already implies the constraint: only `_windows.go`, `_linux.go` and `_darwin.go` are implicit to the Go tool, and `_unix.go` and `_other.go` are not.
+
+Before pushing, check that the tree still builds for every supported target:
+
+```bash
+for t in linux/amd64 linux/arm64 linux/mipsle darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+  GOOS=${t%/*} GOARCH=${t#*/} CGO_ENABLED=0 go build ./... || exit 1
+done
+
+for t in linux/amd64 linux/arm64 linux/mipsle darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+  GOOS=${t%/*} GOARCH=${t#*/} CGO_ENABLED=0 go vet ./... || exit 1
+done
+```
+
+`go vet` compiles the test files too, so it catches a platform-tagged test that no longer builds.
+
 ## Client-Side Implementation
 
 | Module | Responsibility |

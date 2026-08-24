@@ -280,7 +280,7 @@ plexd actions run restart-service --param name=nginx --param force=true
 | `diagnostics.ping_peer` | Ping a mesh peer and report latency | `peer_id` (required), `count` |
 | `diagnostics.traceroute_peer` | Traceroute to a mesh peer | `peer_id` (required), `max_hops` |
 | `service.restart` | Restart plexd via systemctl | — |
-| `service.reload_config` | Send SIGHUP to reload config | — |
+| `service.reload_config` | Send SIGHUP to reload config (Unix only; fails on Windows) | — |
 | `service.upgrade` | Download a release binary, verify its checksum and Sigstore bundle, then swap and restart | `version` (required), `checksum` (required) |
 | `system.info` | Report OS, kernel, hardware, and runtime info | — |
 | `health.check` | Run all health checks and report status | `include_peers` |

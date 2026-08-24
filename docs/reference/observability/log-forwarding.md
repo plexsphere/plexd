@@ -322,8 +322,8 @@ func NewFileSource(pattern, hostname string, logger *slog.Logger) *FileSource
 ### Collect Behavior
 
 1. Expand glob pattern to matching files
-2. For each file, check inode and size against tracked state
-3. **Rotation detection**: if inode changed or file is smaller than stored offset, reset offset to 0
+2. For each file, check file identity and size against tracked state
+3. **Rotation detection**: if the path now carries a different file or the file is smaller than the stored offset, reset offset to 0. Identity comes from `os.SameFile`: device and inode on Unix, volume serial number and file index on Windows
 4. Read new lines from the stored offset using `bufio.Scanner`
 5. Lines exceeding 16 KiB are truncated with `[truncated]` suffix
 6. Empty lines are skipped
