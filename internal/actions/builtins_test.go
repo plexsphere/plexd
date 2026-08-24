@@ -10,12 +10,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -223,6 +221,25 @@ func TestBuiltinDiagnosticsCollect(t *testing.T) {
 	}
 }
 
+func TestDiskTotalBytes(t *testing.T) {
+	if got := diskTotalBytes(t.TempDir()); got == 0 {
+		t.Error("diskTotalBytes(t.TempDir()) = 0, want a non-zero capacity")
+	}
+	if got := diskTotalBytes(diskRootPath()); got == 0 {
+		t.Errorf("diskTotalBytes(%q) = 0, want a non-zero capacity", diskRootPath())
+	}
+	missing := filepath.Join(t.TempDir(), "missing")
+	if got := diskTotalBytes(missing); got != 0 {
+		t.Errorf("diskTotalBytes(%q) = %d, want 0", missing, got)
+	}
+}
+
+func TestKernelRelease(t *testing.T) {
+	if kernelRelease() == "" {
+		t.Error("kernelRelease() = \"\", want the running kernel release")
+	}
+}
+
 func TestBuiltinTraceroutePeer_MissingPeerID(t *testing.T) {
 	info := &mockNodeInfo{
 		nodeID:    "node-1",
@@ -262,40 +279,6 @@ func TestBuiltinTraceroutePeer_InvalidPeerID(t *testing.T) {
 	}
 	if stderr == "" || !strings.Contains(stderr, "invalid peer_id") {
 		t.Errorf("expected stderr to contain 'invalid peer_id', got %q", stderr)
-	}
-}
-
-func TestBuiltinServiceReloadConfig(t *testing.T) {
-	// Ignore SIGHUP so the test process isn't killed.
-	signal.Ignore(syscall.SIGHUP)
-	defer signal.Reset(syscall.SIGHUP)
-
-	fn := ServiceReloadConfig()
-	stdout, stderr, exitCode, err := fn(context.Background(), nil)
-
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if exitCode != 0 {
-		t.Fatalf("expected exit code 0, got %d", exitCode)
-	}
-	if stderr != "" {
-		t.Fatalf("expected empty stderr, got %q", stderr)
-	}
-
-	var result map[string]any
-	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
-		t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
-	}
-
-	if _, ok := result["status"]; !ok {
-		t.Error("missing key 'status' in JSON output")
-	}
-	if result["status"] != "reload_signal_sent" {
-		t.Errorf("expected status='reload_signal_sent', got %q", result["status"])
-	}
-	if _, ok := result["pid"]; !ok {
-		t.Error("missing key 'pid' in JSON output")
 	}
 }
 

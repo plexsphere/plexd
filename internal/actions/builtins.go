@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -179,22 +178,15 @@ func DiagnosticsCollect() BuiltinFunc {
 			}
 		}
 
-		var diskTotal uint64
-		var stat syscall.Statfs_t
-		if err := syscall.Statfs("/", &stat); err == nil {
-			diskTotal = stat.Blocks * uint64(stat.Bsize)
-		}
+		diskTotal := diskTotalBytes(diskRootPath())
 
 		var loadAvg string
 		if data, err := os.ReadFile("/proc/loadavg"); err == nil {
 			loadAvg = strings.TrimSpace(string(data))
 		}
 
-		var kernelVersion string
-		var uname syscall.Utsname
-		if err := syscall.Uname(&uname); err == nil {
-			kernelVersion = int8ArrayToString(uname.Release[:])
-		} else {
+		kernelVersion := kernelRelease()
+		if kernelVersion == "" {
 			kernelVersion = runtime.GOOS + "/" + runtime.GOARCH
 		}
 
@@ -227,18 +219,6 @@ func DiagnosticsCollect() BuiltinFunc {
 
 		return string(data), "", 0, nil
 	}
-}
-
-// int8ArrayToString converts a null-terminated int8 array (from syscall.Utsname) to a Go string.
-func int8ArrayToString(arr []int8) string {
-	buf := make([]byte, 0, len(arr))
-	for _, b := range arr {
-		if b == 0 {
-			break
-		}
-		buf = append(buf, byte(b))
-	}
-	return string(buf)
 }
 
 // DiagnosticsTraceroutePeer returns a BuiltinFunc that runs traceroute to a mesh peer.
@@ -310,8 +290,8 @@ type serviceReloadConfigResult struct {
 // to trigger a configuration reload.
 func ServiceReloadConfig() BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
-		pid := syscall.Getpid()
-		if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
+		pid := os.Getpid()
+		if err := sendReloadSignal(pid); err != nil {
 			return "", "", 1, fmt.Errorf("actions: reload config: %w", err)
 		}
 
