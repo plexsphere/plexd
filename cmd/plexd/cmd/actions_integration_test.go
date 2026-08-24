@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -265,6 +266,9 @@ func TestIntegration_ActionsRunUnknown(t *testing.T) {
 func TestIntegration_HooksList(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need the executable bit and /bin/sh, which windows lacks")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

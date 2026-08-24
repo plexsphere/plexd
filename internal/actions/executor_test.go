@@ -261,6 +261,7 @@ func TestExecutor_RunBuiltin_Success(t *testing.T) {
 }
 
 func TestExecutor_RunHook_Success(t *testing.T) {
+	requireHookScripts(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "greet")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho hello from hook\n"), 0o755); err != nil {
@@ -304,6 +305,7 @@ func TestExecutor_RunHook_Success(t *testing.T) {
 }
 
 func TestExecutor_RunHook_Timeout(t *testing.T) {
+	requireHookScripts(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "slow")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 999\n"), 0o755); err != nil {
@@ -338,6 +340,7 @@ func TestExecutor_RunHook_Timeout(t *testing.T) {
 }
 
 func TestExecutor_RunHook_NonZeroExit(t *testing.T) {
+	requireHookScripts(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fail")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 42\n"), 0o755); err != nil {
@@ -368,6 +371,7 @@ func TestExecutor_RunHook_NonZeroExit(t *testing.T) {
 }
 
 func TestExecutor_RunHook_OutputTruncation(t *testing.T) {
+	requireHookScripts(t)
 	dir := t.TempDir()
 	// Script outputs 200 bytes
 	script := filepath.Join(dir, "big-output")
@@ -510,6 +514,7 @@ func TestExecutor_DuplicateExecutionID(t *testing.T) {
 // outside the two-value set. All of them fail fast along the legal edges from
 // the status the entry declared.
 func TestExecutor_UnknownAction(t *testing.T) {
+	requireHookScripts(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "greet")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
@@ -1197,6 +1202,7 @@ func TestExecutor_UnsupportedActionType(t *testing.T) {
 // against the refreshed digest would compare the file with a hash of itself and
 // admit whatever an attacker with write access to the hooks directory put there.
 func TestExecutor_HookIntegrityAnchorIsPinned(t *testing.T) {
+	requireHookScripts(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "deploy")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho deployed\n"), 0o755); err != nil {
@@ -1335,6 +1341,7 @@ func TestExecutor_PanicRecovery(t *testing.T) {
 }
 
 func TestExecutor_ParameterEnvVars(t *testing.T) {
+	requireHookScripts(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "env-check")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho \"target=$PLEXD_PARAM_TARGET mode=$PLEXD_PARAM_MODE\"\n"), 0o755); err != nil {
@@ -1373,6 +1380,7 @@ func TestExecutor_ParameterEnvVars(t *testing.T) {
 // TestExecutor_NonStringParameterEnvVars checks that the flattening of a
 // structured parameter object survives all the way into the hook environment.
 func TestExecutor_NonStringParameterEnvVars(t *testing.T) {
+	requireHookScripts(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "json-check")
 	content := "#!/bin/sh\necho \"count=$PLEXD_PARAM_COUNT flag=$PLEXD_PARAM_FLAG tags=$PLEXD_PARAM_TAGS since_ns=$PLEXD_PARAM_SINCE_NS\"\n"
@@ -1413,6 +1421,7 @@ func TestExecutor_NonStringParameterEnvVars(t *testing.T) {
 }
 
 func TestExecutor_ParameterSanitization(t *testing.T) {
+	requireHookScripts(t)
 	dir := t.TempDir()
 	// Script that prints the env var with sanitized name
 	script := filepath.Join(dir, "sanitize-check")
@@ -1521,6 +1530,7 @@ func TestExecutor_ExpiresAtBoundsRun(t *testing.T) {
 // to resolve: absent from the discovery snapshot when the entry is dispatched,
 // and dropped from it between dispatch and run.
 func TestExecutor_RunHook_MissingFromSnapshot(t *testing.T) {
+	requireHookScripts(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "greet")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {

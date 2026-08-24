@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -28,8 +29,11 @@ func TestSavePendingKey_LoadPendingKey_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat(rotation_pending_key): %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0600 {
-		t.Errorf("rotation_pending_key permissions = %o, want 0600", perm)
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0600 {
+			t.Errorf("rotation_pending_key permissions = %o, want 0600", perm)
+		}
 	}
 
 	loaded, err := LoadPendingKey(dir)
@@ -220,6 +224,9 @@ func TestCommitRotatedKey_NilReceiptKeepsLastRotation(t *testing.T) {
 }
 
 func TestCommitRotatedKey_UnwritableDirKeepsPending(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on windows")
+	}
 	dir := t.TempDir()
 
 	id := &NodeIdentity{

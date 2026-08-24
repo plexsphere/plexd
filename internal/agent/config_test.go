@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -360,6 +361,9 @@ func TestParseConfig_EmptyFile(t *testing.T) {
 }
 
 func TestParseConfig_UnreadableFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on windows")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses file permissions, so the read cannot fail")
 	}

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -159,9 +160,12 @@ func TestInstall_CreatesDirectories(t *testing.T) {
 			if !info.IsDir() {
 				t.Errorf("%q is not a directory", tt.path)
 			}
-			got := info.Mode().Perm()
-			if got != tt.perm {
-				t.Errorf("%q perm = %04o, want %04o", tt.path, got, tt.perm)
+			// Windows reports 0666/0777, never POSIX bits.
+			if runtime.GOOS != "windows" {
+				got := info.Mode().Perm()
+				if got != tt.perm {
+					t.Errorf("%q perm = %04o, want %04o", tt.path, got, tt.perm)
+				}
 			}
 		})
 	}
@@ -185,9 +189,12 @@ func TestInstall_CopiesBinary(t *testing.T) {
 		t.Error("binary file is empty")
 	}
 
-	perm := info.Mode().Perm()
-	if perm != 0o755 {
-		t.Errorf("binary perm = %04o, want 0755", perm)
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		perm := info.Mode().Perm()
+		if perm != 0o755 {
+			t.Errorf("binary perm = %04o, want 0755", perm)
+		}
 	}
 }
 
@@ -310,9 +317,12 @@ func TestInstall_WritesTokenFromValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat(%q) = %v", tokenPath, err)
 	}
-	perm := info.Mode().Perm()
-	if perm != 0o600 {
-		t.Errorf("token perm = %04o, want 0600", perm)
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		perm := info.Mode().Perm()
+		if perm != 0o600 {
+			t.Errorf("token perm = %04o, want 0600", perm)
+		}
 	}
 }
 

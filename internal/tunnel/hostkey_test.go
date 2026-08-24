@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -37,8 +38,11 @@ func TestLoadOrGenerateHostKey_GeneratesNew(t *testing.T) {
 	if err != nil {
 		t.Fatalf("key file not created: %v", err)
 	}
-	if info.Mode().Perm() != 0600 {
-		t.Errorf("key file permissions = %04o, want 0600", info.Mode().Perm())
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		if info.Mode().Perm() != 0600 {
+			t.Errorf("key file permissions = %04o, want 0600", info.Mode().Perm())
+		}
 	}
 }
 

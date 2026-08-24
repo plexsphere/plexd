@@ -1,3 +1,5 @@
+//go:build unix
+
 package actions
 
 import (
@@ -12,15 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"go.uber.org/goleak"
-
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/integrity"
 )
-
-func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
-}
 
 // integrationReporter is a thread-safe mock reporter for integration tests. It
 // records the ordered execution callbacks the executor drives from goroutines.

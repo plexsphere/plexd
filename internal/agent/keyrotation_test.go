@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -370,6 +371,9 @@ func TestKeyRotator_Rotate_CooldownStillResubmitsStagedKey(t *testing.T) {
 }
 
 func TestKeyRotator_Rotate_StageWriteError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on windows")
+	}
 	client := &fakeRotateClient{resp: &api.KeyRotateResponse{}}
 	r, dir, _, rt := newTestRotator(t, client, &fakeDeviceUpdater{})
 

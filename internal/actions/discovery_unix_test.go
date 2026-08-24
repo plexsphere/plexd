@@ -1,9 +1,9 @@
+//go:build unix
+
 package actions
 
 import (
 	"encoding/json"
-	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,10 +11,6 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/integrity"
 )
-
-func testLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
 
 func writeExecutable(t *testing.T, dir, name, content string) string {
 	t.Helper()

@@ -160,6 +160,12 @@ func TestBuiltinPingPeer_InvalidPeerID(t *testing.T) {
 }
 
 func TestBuiltinPingPeer_ValidTarget(t *testing.T) {
+	// PingPeer passes iputils flags. BSD ping on macOS reads -W in
+	// milliseconds and times out; Windows ping has -n/-w instead of -c/-W and
+	// its binary exists, so the LookPath guard below does not fire there.
+	if runtime.GOOS != "linux" {
+		t.Skip("PingPeer passes iputils flags: BSD ping reads -W in milliseconds and Windows ping uses -n/-w")
+	}
 	if _, err := exec.LookPath("ping"); err != nil {
 		t.Skip("ping not available")
 	}
@@ -424,8 +430,11 @@ func TestBuiltinServiceUpgrade_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat replaced binary: %v", err)
 	}
-	if fi.Mode().Perm() != 0o755 {
-		t.Errorf("binary mode = %o, want 0755", fi.Mode().Perm())
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		if fi.Mode().Perm() != 0o755 {
+			t.Errorf("binary mode = %o, want 0755", fi.Mode().Perm())
+		}
 	}
 	if verifier.calls != 1 {
 		t.Errorf("verifier called %d times, want 1", verifier.calls)
