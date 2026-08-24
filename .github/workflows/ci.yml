@@ -33,8 +33,17 @@ jobs:
           version: v2.12.2
 
   unit-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: ${{ matrix.os }}
+    # No measured Windows duration exists yet; the Linux job takes about a
+    # minute and a half, and a race-instrumented run on the Windows runner is
+    # expected to take several times that.
+    timeout-minutes: 30
+    strategy:
+      # A Windows failure must not cancel the Linux and macOS jobs: their logs
+      # are what tell you whether the failure is platform-specific.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
