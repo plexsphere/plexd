@@ -911,8 +911,12 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		logger.Error("policy enforcer teardown error", "error", err)
 	}
 	// WireGuard last — other subsystems depend on the interface being up.
-	if err := wgMgr.Teardown(); err != nil {
-		logger.Error("wireguard teardown error", "error", err)
+	// Without a controller there is no interface to delete, and Teardown would
+	// dereference the nil newWGController returns off Linux (see up_other.go).
+	if wgCtrl != nil {
+		if err := wgMgr.Teardown(); err != nil {
+			logger.Error("wireguard teardown error", "error", err)
+		}
 	}
 
 	done := make(chan struct{})
