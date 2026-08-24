@@ -11,10 +11,23 @@ jobs:
     strategy:
       matrix:
         include:
-          - goarch: amd64
-          - goarch: arm64
-          - goarch: mipsle
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: mipsle
             gomips: softfloat
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -25,11 +38,11 @@ jobs:
       - name: Build binary
         env:
           CGO_ENABLED: '0'
-          GOOS: linux
+          GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOMIPS: ${{ matrix.gomips }}
         run: |
           go build \
             -ldflags "-s -w -X main.version=dev -X main.commit=${GITHUB_SHA::8} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            -o plexd-linux-${{ matrix.goarch }} \
+            -o plexd-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} \
             ./cmd/plexd
