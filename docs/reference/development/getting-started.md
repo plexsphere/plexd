@@ -86,6 +86,28 @@ done
 
 `go vet` compiles the test files too, so it catches a platform-tagged test that no longer builds.
 
+CI covers the same ground: the [Build workflow](./release-workflow.md) compiles all seven targets on every pull request, and the [CI workflow](./ci-workflow.md) runs `go test -race ./...` on Linux, Windows and macOS. The loop above is a faster local check, not the only one.
+
+## Tests that cannot run everywhere
+
+Most tests run on all three platforms. A test that cannot is constrained, never deleted or excluded from `./...`, and the constraint says what the platform lacks:
+
+| Situation | What to write |
+|---|---|
+| Every test in the file needs hook scripts | Tag the file `//go:build unix` and name it `_unix_test.go` (`internal/actions/watcher_unix_test.go`) |
+| One test needs a hook script | `requireHookScripts(t)`, which skips on Windows |
+| One test asserts POSIX permission bits, or forces a failure with `os.Chmod` | Skip on `runtime.GOOS == "windows"` |
+| A test checks a mode alongside other things | Wrap only the mode assertion in `if runtime.GOOS != "windows"`, so the rest still runs |
+| A test binds a Unix socket | Use the package's `shortSocketPath(t)` helper |
+
+Hooks are discovered by their executable bit and executed directly, so they are `#!/bin/sh` scripts; Windows has neither the mode bit nor the interpreter. Windows reports `0666` or `0777` from `Mode().Perm()`, `os.Chmod` there only toggles the read-only attribute, and a read-only directory still accepts writes, so a test that injects a failure that way cannot work.
+
+`shortSocketPath` exists because `t.TempDir()` embeds the test's own name in the path, which overruns the 104-byte `sun_path` limit on macOS for a long-named test.
+
+A shared helper that untagged tests call must itself live in an untagged file, or the package stops compiling on Windows. `internal/actions/helpers_test.go` holds those for that package, `TestMain` among them, so goroutine-leak checking still runs where the tagged files do not build.
+
+The repository's `.gitattributes` sets `* -text`, which stops git from rewriting line endings on a Windows checkout. Without it, `internal/upgrade/testdata/fixture.bin` would be converted to CRLF and no longer match the digest its checked-in Sigstore bundle pins.
+
 ## Client-Side Implementation
 
 | Module | Responsibility |

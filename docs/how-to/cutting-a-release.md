@@ -44,12 +44,12 @@ Releases use lightweight tags, the same convention documented in the [Release Wo
 
 ## What the Automation Publishes
 
-- A GitHub release with `plexd-linux-{amd64,arm64,mipsle}` binaries, a combined `checksums.sha256`, and auto-generated release notes.
+- A GitHub release with seven binaries (`plexd-{linux,darwin}-{amd64,arm64}`, `plexd-linux-mipsle` and `plexd-windows-{amd64,arm64}.exe`), a `.sigstore.json` bundle for each, a combined `checksums.sha256`, and auto-generated release notes.
 - Multi-arch (linux/amd64, linux/arm64) container images `ghcr.io/plexsphere/plexd:{vX.Y.Z, X.Y.Z, X.Y, X, latest}` — for `v0.1.0` that is `v0.1.0`, `0.1.0`, `0.1`, `0`, and `latest`. The `v`-prefixed and bare forms of the full version are aliases for the same manifest, published so the release version resolves as an image reference without a consumer having to strip the prefix.
 
 ## Verify the Release
 
-- The release page carries the three binaries plus `checksums.sha256`. Spot-check a binary against the checksums file to catch a truncated or corrupted upload:
+- The release page carries the seven binaries, their `.sigstore.json` bundles and `checksums.sha256`. Spot-check a binary against the checksums file to catch a truncated or corrupted upload:
 
   ```bash
   sha256sum --ignore-missing --check checksums.sha256

@@ -27,15 +27,16 @@ func WriteFileAtomic(dir, name string, data []byte, perm os.FileMode) error
 
 ### Return Value
 
-Returns `nil` on success. On failure, returns the underlying `os` error from whichever step failed (file creation, write, fsync, or rename). The original file, if any, is left untouched on error.
+Returns `nil` on success. On failure, returns the underlying `os` error from whichever step failed (file creation, write, fsync, rename, or directory sync). The original file, if any, is left untouched on error.
 
 ### Atomicity Guarantee
 
 1. Creates a temporary file at `dir/.tmp-name` with the requested permissions
 2. Writes `data` to the temporary file
 3. Calls `f.Sync()` (`fsync`) to flush data to stable storage before renaming
-4. Calls `os.Rename` to atomically replace the target file
-5. On any error, the temporary file is removed via `defer os.Remove`
+4. Calls `os.Rename` to atomically replace the target file. On Windows the replace is retried for up to two seconds (`rename_windows.go`): Go opens files without `FILE_SHARE_DELETE`, so any reader holding the target makes `MoveFileEx` fail with a sharing violation until it closes its handle. Unix has no such condition and does not retry.
+5. Syncs the parent directory so the new entry survives a power cut, not just the file's contents (`sync_unix.go`). On Windows this step does nothing (`sync_windows.go`): Go opens a directory with `GENERIC_READ` alone and `FlushFileBuffers` requires `GENERIC_WRITE`, so the call could only fail there. NTFS journals directory metadata itself, and step 3 is unchanged, so the contents are as durable as on Unix.
+6. On any error, the temporary file is removed via `defer os.Remove`
 
 Because `os.Rename` is atomic on POSIX filesystems, concurrent readers will see either the old content or the new content — never a partial write.
 
@@ -89,6 +90,8 @@ if err := fsutil.WriteFileAtomic(dir, name, data, 0600); err != nil {
 | Non-existent dir      | `dir` does not exist                           | `os.OpenFile` fails; error returned                             |
 | Disk full             | No space for temp file or write                | Write or sync fails; error returned, temp file cleaned up       |
 | Rename failure        | Cross-device rename or permission issue        | `os.Rename` fails; error returned, temp file cleaned up         |
+| Target held open      | A reader holds the target (Windows only)       | The replace is retried for two seconds, then the sharing-violation error is returned |
+| Directory sync failure | Parent directory cannot be opened or flushed (Unix only) | `syncDir` fails after the rename; error returned, the renamed file stays in place |
 
 ### Temp File Cleanup
 
