@@ -6,7 +6,7 @@ feature: PXD-0001
 
 # Configuration Reference
 
-plexd reads its configuration from a YAML file (default: `/etc/plexd/config.yaml`, overridable with `--config`). The file is optional: when no file exists at that path, plexd continues with an empty configuration — defaults apply, and CLI flags and environment variables supply the rest — and logs a single warn-level message naming the path it did not find, so a mistyped `--config` stays visible. A file that exists but cannot be read, a file that is empty, and a file that is not valid YAML, are startup errors that name the path. An empty file is rejected rather than treated as an absent one: a truncated write or a ConfigMap key that rendered to nothing is a broken configuration, not a decision to run without one.
+plexd reads its configuration from a YAML file (default on Linux: `/etc/plexd/config.yaml`, overridable with `--config`; see [Platform defaults](#platform-defaults) for macOS and Windows). The file is optional: when no file exists at that path, plexd continues with an empty configuration — defaults apply, and CLI flags and environment variables supply the rest — and logs a single warn-level message naming the path it did not find, so a mistyped `--config` stays visible. A file that exists but cannot be read, a file that is empty, and a file that is not valid YAML, are startup errors that name the path. An empty file is rejected rather than treated as an absent one: a truncated write or a ConfigMap key that rendered to nothing is a broken configuration, not a decision to run without one.
 
 The configuration a command runs on is assembled in four steps:
 
@@ -37,13 +37,34 @@ One default is inverted on this path: `actions.enabled` comes up `false` without
 
 ---
 
+## Platform defaults
+
+plexd resolves its configuration, data and runtime directories from the host it runs on. Every value below is a default: `--config`, `PLEXD_CONFIG`, the YAML keys and the `PLEXD_*` overrides replace it, and they take precedence on every platform.
+
+| Path | Linux | macOS | Windows |
+|------|-------|-------|---------|
+| Configuration file (`--config`, `PLEXD_CONFIG`) | `/etc/plexd/config.yaml` | `/Library/Application Support/plexd/config.yaml` | `%ProgramData%\plexd\config.yaml` |
+| `data_dir` | `/var/lib/plexd` | `/Library/Application Support/plexd/data` | `%ProgramData%\plexd\data` |
+| `registration.token_file` | `/etc/plexd/bootstrap-token` | `/Library/Application Support/plexd/bootstrap-token` | `%ProgramData%\plexd\bootstrap-token` |
+| `actions.hooks_dir` | `/etc/plexd/hooks` | `/Library/Application Support/plexd/hooks` | `%ProgramData%\plexd\hooks` |
+| `node_api.socket_path` | `/var/run/plexd/api.sock` | `/var/run/plexd/api.sock` | `%ProgramData%\plexd\run\api.sock` |
+| Runtime directory (`plexd install`) | `/var/run/plexd` | `/var/run/plexd` | `%ProgramData%\plexd\run` |
+
+`%ProgramData%` is the `ProgramData` environment variable, which Windows sets for every process including services. plexd falls back to `C:\ProgramData` when it is unset or empty.
+
+macOS resolves the system locations only, with no per-user fallback under `~/Library`. The CLI reaches the node API socket without knowing who started the daemon, so a per-user runtime directory would send `plexd status` looking for a socket a root daemon never created. An unprivileged macOS run sets `--config` and `data_dir` itself.
+
+The sections below show the Linux value in their Default column.
+
+---
+
 ## Top-Level Fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `mode` | string | `node` | Operating mode: `node` or `bridge`. Bridge mode enables bridge-specific subsystems when `bridge.enabled: true`. |
 | `log_level` | string | `info` | Log level: `debug`, `info`, `warn`, `error` |
-| `data_dir` | string | `/var/lib/plexd` | Directory for persistent agent data. Propagated to `registration.data_dir` and `node_api.data_dir` at runtime. |
+| `data_dir` | string | `/var/lib/plexd` (Linux) | Directory for persistent agent data. Propagated to `registration.data_dir` and `node_api.data_dir` at runtime. Per platform; see [Platform defaults](#platform-defaults). |
 
 ---
 
@@ -73,7 +94,7 @@ Node registration and bootstrap authentication.
 | `project_id` | string | — | Platform project UUID to register into. Required for fresh registration (validated at registration time, not config parse). |
 | `resource_handle` | string | — | Platform Resource handle to bind to. Required for fresh registration. |
 | `requested_resource_id` | string | — | Optional resource ID override used when substrate naming differs from the platform handle. |
-| `token_file` | string | `/etc/plexd/bootstrap-token` | Path to the bootstrap token file |
+| `token_file` | string | `/etc/plexd/bootstrap-token` (Linux) | Path to the bootstrap token file. Per platform; see [Platform defaults](#platform-defaults). |
 | `token_env` | string | `PLEXD_BOOTSTRAP_TOKEN` | Environment variable name for the bootstrap token |
 | `token_value` | string | — | Direct token value override |
 | `use_metadata` | bool | `false` | Enable the cloud metadata service (IMDS) as a fallback source for registration inputs |
@@ -119,7 +140,7 @@ Local node API server (Unix socket and optional HTTP).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `socket_path` | string | `/var/run/plexd/api.sock` | Path to the Unix domain socket |
+| `socket_path` | string | `/var/run/plexd/api.sock` (Linux) | Path to the Unix domain socket. Per platform; see [Platform defaults](#platform-defaults). |
 | `http_enabled` | bool | `false` | Enable the optional HTTP listener |
 | `http_listen` | string | `127.0.0.1:9100` | HTTP listen address |
 | `http_token_file` | string | — | Path to the HTTP bearer token file |
@@ -174,7 +195,7 @@ Remote action execution and hook management.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable action execution. An omitted key leaves it `true`; an explicit `false` disables execution and survives defaulting. Without a config file it defaults to `false` — see [Running without a config file](#running-without-a-config-file). |
-| `hooks_dir` | string | `/etc/plexd/hooks` | Directory containing hook scripts |
+| `hooks_dir` | string | `/etc/plexd/hooks` (Linux) | Directory containing hook scripts. Per platform; see [Platform defaults](#platform-defaults). |
 | `max_concurrent` | int | `5` | Maximum number of concurrent actions. Minimum: `1`. |
 | `max_action_timeout` | duration | `10m` | Maximum duration for a single action. Minimum: `10s`. |
 | `max_output_bytes` | int64 | `1048576` (1 MiB) | Maximum output size per action in bytes. Minimum: `1024`. |

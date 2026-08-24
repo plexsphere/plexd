@@ -12,7 +12,7 @@ The `plexd` binary is a single static executable providing node agent lifecycle 
 
 | Flag          | Default                     | Description                                |
 |---------------|-----------------------------|--------------------------------------------|
-| `--config`    | `/etc/plexd/config.yaml`    | Path to the configuration file             |
+| `--config`    | `/etc/plexd/config.yaml` (Linux) | Path to the configuration file ([per platform](configuration.md#platform-defaults)) |
 | `--log-level` | `info`                      | Log level: `debug`, `info`, `warn`, `error`|
 | `--api`       | —                           | Control plane API URL (overrides config)   |
 | `--mode`      | —                           | Operating mode: `node` or `bridge`         |
@@ -166,7 +166,7 @@ warning it logs.
 
 ### `plexd status`
 
-Show node agent status by querying the local agent via Unix socket (`/var/run/plexd/api.sock`).
+Show node agent status by querying the local agent via Unix socket (`/var/run/plexd/api.sock` on Linux and macOS; see [Platform defaults](configuration.md#platform-defaults)).
 
 ```
 plexd status
@@ -306,8 +306,8 @@ Trigger a re-scan of action hooks.
 
 ## Unix Socket Communication
 
-Commands that query local agent state (`status`, `peers`, `policies`, `state`, `log-status`, `audit`, `actions`, `hooks`) connect to the agent via HTTP-over-Unix-socket at `/var/run/plexd/api.sock`. If the agent is not running, these commands return an error indicating the socket is unavailable.
+Commands that query local agent state (`status`, `peers`, `policies`, `state`, `log-status`, `audit`, `actions`, `hooks`) connect to the agent via HTTP-over-Unix-socket at `/var/run/plexd/api.sock` on Linux and macOS, and under `%ProgramData%\plexd\run` on Windows (see [Platform defaults](configuration.md#platform-defaults)). If the agent is not running, these commands return an error indicating the socket is unavailable.
 
 ## Configuration File
 
-The default configuration file is `/etc/plexd/config.yaml`. For the full YAML schema, see [Configuration Reference](configuration.md). For environment variable overrides, see [Environment Variables](environment-variables.md).
+The default configuration file is `/etc/plexd/config.yaml` on Linux; macOS and Windows resolve their own, listed under [Platform defaults](configuration.md#platform-defaults). For the full YAML schema, see [Configuration Reference](configuration.md). For environment variable overrides, see [Environment Variables](environment-variables.md).

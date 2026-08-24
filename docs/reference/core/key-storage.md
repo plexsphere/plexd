@@ -20,11 +20,11 @@ During registration, the control plane provisions the node with several cryptogr
 
 ## Storage Location
 
-All key material is stored under `data_dir`, which defaults to `/var/lib/plexd/`. The directory is created with mode `0700` if it does not already exist.
+All key material is stored under `data_dir`, which defaults to `/var/lib/plexd/` on Linux and to a platform location on macOS and Windows (see [Platform defaults](configuration.md#platform-defaults)). The directory is created with mode `0700` if it does not already exist.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `data_dir` | `/var/lib/plexd` | Root directory for identity and key files |
+| `data_dir` | `/var/lib/plexd` (Linux) | Root directory for identity and key files ([per platform](configuration.md#platform-defaults)) |
 
 The directory is also referenced by `registration.data_dir` and `node_api.data_dir`, which are propagated from the top-level `data_dir` at runtime. See the [Configuration Reference](configuration.md) for details.
 
@@ -86,7 +86,7 @@ Both the current and previous keys are held in memory for the transition period 
 
 ### Bootstrap Token
 
-The bootstrap token is a one-time credential used to authenticate the initial registration request. It can be sourced from a file (`/etc/plexd/bootstrap-token`), an environment variable (`PLEXD_BOOTSTRAP_TOKEN`), a direct value, or a cloud metadata service.
+The bootstrap token is a one-time credential used to authenticate the initial registration request. It can be sourced from a file (`/etc/plexd/bootstrap-token` on Linux; see [Platform defaults](configuration.md#platform-defaults)), an environment variable (`PLEXD_BOOTSTRAP_TOKEN`), a direct value, or a cloud metadata service.
 
 The token is **deleted from disk immediately after successful registration** to prevent reuse:
 

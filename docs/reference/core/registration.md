@@ -18,7 +18,7 @@ The `internal/registration` package handles node self-registration and bootstrap
 | `ProjectID`                       | `string`        | —                              | Platform project UUID to register into (required for fresh registration)|
 | `ResourceHandle`                  | `string`        | —                              | Platform Resource handle to bind to (required for fresh registration)|
 | `RequestedResourceID`             | `string`        | —                              | Optional resource ID override when substrate naming differs from the handle|
-| `TokenFile`                       | `string`        | `/etc/plexd/bootstrap-token`   | Path to bootstrap token file               |
+| `TokenFile`                       | `string`        | `/etc/plexd/bootstrap-token` (Linux) | Path to bootstrap token file ([per platform](configuration.md#platform-defaults)) |
 | `TokenEnv`                        | `string`        | `PLEXD_BOOTSTRAP_TOKEN`        | Environment variable for bootstrap token   |
 | `TokenValue`                      | `string`        | —                              | Direct token value override                |
 | `UseMetadata`                     | `bool`          | `false`                        | Enable cloud metadata source for registration inputs|

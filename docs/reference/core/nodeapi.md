@@ -14,7 +14,7 @@ The `internal/nodeapi` package exposes node state to local consumers (sidecar ag
 
 | Field             | Type            | Default                    | Description                                  |
 |-------------------|-----------------|----------------------------|----------------------------------------------|
-| `SocketPath`      | `string`        | `/var/run/plexd/api.sock`  | Path to the Unix domain socket               |
+| `SocketPath`      | `string`        | `/var/run/plexd/api.sock` (Linux, macOS) | Path to the Unix domain socket ([per platform](configuration.md#platform-defaults)) |
 | `HTTPEnabled`     | `bool`          | `false`                    | Enable the optional TCP listener             |
 | `HTTPListen`      | `string`        | `127.0.0.1:9100`           | TCP listen address                           |
 | `HTTPTokenFile`   | `string`        | —                          | Path to file containing HTTP bearer token    |

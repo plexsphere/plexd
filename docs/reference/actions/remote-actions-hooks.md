@@ -93,7 +93,7 @@ Control Plane
 | Field              | Type            | Default | Description                              |
 |--------------------|-----------------|---------|------------------------------------------|
 | `Enabled`          | `bool`          | `true`  | Whether action execution is active       |
-| `HooksDir`         | `string`        | `/etc/plexd/hooks` | Directory containing hook scripts        |
+| `HooksDir`         | `string`        | `/etc/plexd/hooks` (Linux) | Directory containing hook scripts ([per platform](../core/configuration.md#platform-defaults)) |
 | `MaxConcurrent`    | `int`           | `5`     | Max simultaneous action executions       |
 | `MaxActionTimeout` | `time.Duration` | `10m`   | Max duration for a single action         |
 | `MaxOutputBytes`   | `int64`         | `1 MiB` | Max output capture size per action       |
@@ -102,7 +102,7 @@ Control Plane
 cfg := actions.Config{
     HooksDir: "/etc/plexd/hooks",
 }
-cfg.ApplyDefaults() // Enabled=true, HooksDir=/etc/plexd/hooks, MaxConcurrent=5, MaxActionTimeout=10m, MaxOutputBytes=1MiB
+cfg.ApplyDefaults() // Enabled=true, HooksDir=/etc/plexd/hooks (Linux), MaxConcurrent=5, MaxActionTimeout=10m, MaxOutputBytes=1MiB
 if err := cfg.Validate(); err != nil {
     log.Fatal(err)
 }

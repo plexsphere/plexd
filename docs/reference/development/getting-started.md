@@ -42,6 +42,7 @@ plexd/
 │   ├── nat/                # STUN-based NAT traversal and endpoint discovery
 │   ├── nodeapi/            # Local Node API server, state cache, report sync
 │   ├── packaging/          # Bare-metal installer, systemd unit generation
+│   ├── paths/              # Per-platform default config, data and runtime dirs
 │   ├── peerexchange/       # Peer endpoint exchange protocol
 │   ├── policy/             # Network policy evaluation, nftables firewall rules
 │   ├── reconcile/          # Configuration reconciliation loop
@@ -69,8 +70,9 @@ Code that only builds on some operating systems lives in its own file, tagged by
 |---|---|---|---|
 | `//go:build linux` / `//go:build !linux` | `_linux.go` / `_other.go` | Controllers that exist only on Linux, paired with a stub elsewhere | `cmd/plexd/cmd/up_linux.go`, `cmd/plexd/cmd/up_other.go`, `internal/nodeapi/socket_perms_other.go` |
 | `//go:build unix` / `//go:build windows` | `_unix.go` / `_windows.go` | Syscall helpers that Linux and macOS share | `internal/actions/builtins_unix.go`, `internal/actions/builtins_windows.go` |
+| `//go:build unix && !darwin` / `//go:build darwin` / `//go:build windows` | `_unix.go` / `_darwin.go` / `_windows.go` | Values every Unix but macOS shares, with macOS and Windows each answering for itself | `internal/paths/paths_unix.go`, `internal/paths/paths_darwin.go`, `internal/paths/paths_windows.go` |
 
-Pick `unix` / `windows` when Linux and macOS want the same implementation; `!linux` would wrongly catch Windows. Every such file carries an explicit `//go:build` line, even when its name already implies the constraint: only `_windows.go`, `_linux.go` and `_darwin.go` are implicit to the Go tool, and `_unix.go` and `_other.go` are not.
+Pick `unix` / `windows` when Linux and macOS want the same implementation; `!linux` would wrongly catch Windows. When macOS needs its own answer, narrow the Unix file to `unix && !darwin` and put a `_darwin.go` beside it rather than renaming it to `_linux.go`: that name carries an implicit `linux` constraint and would leave every other Unix, freebsd included, with no definition at all. Every such file carries an explicit `//go:build` line, even when its name already implies the constraint: only `_windows.go`, `_linux.go` and `_darwin.go` are implicit to the Go tool, and `_unix.go` and `_other.go` are not.
 
 Before pushing, check that the tree still builds for every supported target:
 

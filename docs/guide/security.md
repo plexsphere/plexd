@@ -7,7 +7,7 @@ title: Security & Trust Model
 ## Security Overview
 
 - **Bootstrap tokens** are one-time-use with a short TTL. They are deleted from disk after successful registration.
-- **Private keys** are generated during registration and stored in `/var/lib/plexd/`. They never leave the node.
+- **Private keys** are generated during registration and stored in `/var/lib/plexd/` on Linux, and under the platform data directory on macOS and Windows (see [Platform defaults](../reference/core/configuration.md#platform-defaults)). They never leave the node.
 - **Control plane communication** is TLS-encrypted (HTTPS). The agent validates the server certificate. Every SSE event is additionally signed with the control plane's Ed25519 key and verified by the agent before processing.
 - **Mesh traffic** is encrypted end-to-end via WireGuard.
 - **Compromised nodes** can be force-removed from the control plane, triggering key rotation across all affected peers.

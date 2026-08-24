@@ -13,9 +13,9 @@ Configuration struct for packaging and installing plexd.
 | Field          | Type   | Default                                  | Description                                  |
 |----------------|--------|------------------------------------------|----------------------------------------------|
 | `BinaryPath`   | string | `/usr/local/bin/plexd`                   | Path to install the plexd binary             |
-| `ConfigDir`    | string | `/etc/plexd`                             | Configuration directory                      |
-| `DataDir`      | string | `/var/lib/plexd`                         | Data directory                               |
-| `RunDir`       | string | `/var/run/plexd`                         | Runtime directory                            |
+| `ConfigDir`    | string | `/etc/plexd` (Linux)                     | Configuration directory ([per platform](../core/configuration.md#platform-defaults)) |
+| `DataDir`      | string | `/var/lib/plexd` (Linux)                 | Data directory ([per platform](../core/configuration.md#platform-defaults)) |
+| `RunDir`       | string | `/var/run/plexd` (Linux)                 | Runtime directory ([per platform](../core/configuration.md#platform-defaults)) |
 | `UnitFilePath` | string | `/etc/systemd/system/plexd.service`      | Path for the systemd unit file               |
 | `ServiceName`  | string | `plexd`                                  | Systemd service name                         |
 | `APIBaseURL`   | string | *(empty)*                                | Control plane API URL (optional)             |
@@ -63,16 +63,16 @@ Produces a complete systemd unit file. Calls `cfg.ApplyDefaults()` before genera
 func GenerateDefaultConfig(apiBaseURL string) string
 ```
 
-Produces a minimal default `config.yaml`. When `apiBaseURL` is empty, writes a commented-out placeholder.
+Produces a minimal default `config.yaml`. When `apiBaseURL` is empty, writes a commented-out placeholder. The two paths it writes are the platform defaults ([per platform](../core/configuration.md#platform-defaults)); the values below are the Linux ones, which is what `plexd install` writes, since it requires systemd.
 
 ### Output fields
 
 | Field                      | Value                                  | Description               |
 |----------------------------|----------------------------------------|---------------------------|
 | `api.base_url`             | Provided URL or `# api: base_url: …`  | Control plane API URL     |
-| `data_dir`                 | `/var/lib/plexd`                       | Data directory            |
+| `data_dir`                 | `/var/lib/plexd` (Linux)               | Data directory            |
 | `log_level`                | `info`                                 | Log verbosity             |
-| `registration.token_file`  | `/etc/plexd/bootstrap-token`           | Bootstrap token file path |
+| `registration.token_file`  | `/etc/plexd/bootstrap-token` (Linux)   | Bootstrap token file path |
 
 ## Installer
 

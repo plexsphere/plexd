@@ -14,7 +14,7 @@ These variables are read via `envOrDefault()` in `cmd/plexd/cmd/root.go` and app
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PLEXD_CONFIG` | `/etc/plexd/config.yaml` | Path to the configuration file. Equivalent to `--config`. |
+| `PLEXD_CONFIG` | `/etc/plexd/config.yaml` (Linux) | Path to the configuration file. Equivalent to `--config`. Per platform; see [Platform defaults](configuration.md#platform-defaults). |
 | `PLEXD_LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error`. Equivalent to `--log-level`. |
 | `PLEXD_API` | — | Control plane API URL. Equivalent to `--api`. |
 | `PLEXD_MODE` | — | Operating mode: `node` or `bridge`. Equivalent to `--mode`. |
@@ -55,7 +55,7 @@ From highest to lowest priority:
 1. **CLI flags** — `--api`, `--mode`, `--log-level` (applied in `runUp` before `applyEnvOverrides`)
 2. **`applyEnvOverrides()`** — `PLEXD_BOOTSTRAP_TOKEN_FILE`, `PLEXD_ACTIONS_ENABLED`, etc.
 3. **Global env vars** — `PLEXD_CONFIG`, `PLEXD_LOG_LEVEL`, `PLEXD_API`, `PLEXD_MODE` (via `envOrDefault` in flag defaults)
-4. **YAML config file** — values from `/etc/plexd/config.yaml` (or `--config` path)
+4. **YAML config file** — values from `/etc/plexd/config.yaml` on Linux (or the `--config` path; see [Platform defaults](configuration.md#platform-defaults))
 5. **`ApplyDefaults()`** — built-in defaults for zero-valued fields
 
 ## Examples
