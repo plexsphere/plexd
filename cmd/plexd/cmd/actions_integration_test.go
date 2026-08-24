@@ -72,7 +72,7 @@ func startTestNodeAPI(t *testing.T, ctx context.Context, provider nodeapi.Action
 	t.Helper()
 
 	dir := t.TempDir()
-	socketPath := filepath.Join(dir, "plexd.sock")
+	socketPath := shortSocketPath(t)
 
 	cfg := nodeapi.Config{
 		SocketPath: socketPath,

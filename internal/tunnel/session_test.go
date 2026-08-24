@@ -424,6 +424,7 @@ func TestSession_IdleWindowStampsActivityBothDirections(t *testing.T) {
 
 	// client -> target
 	bind := time.Duration(session.lastActive.Load())
+	settleClockPast(t, bind)
 	if _, err := client.Write(msg); err != nil {
 		t.Fatalf("client Write() error: %v", err)
 	}
@@ -434,6 +435,7 @@ func TestSession_IdleWindowStampsActivityBothDirections(t *testing.T) {
 	inbound := waitForActivityAfter(t, session, bind)
 
 	// target -> client
+	settleClockPast(t, inbound)
 	if _, err := target.Write(msg); err != nil {
 		t.Fatalf("target Write() error: %v", err)
 	}
@@ -480,6 +482,26 @@ func TestSession_WithoutIdleWindowActivityStaysAtBind(t *testing.T) {
 
 	if got := time.Duration(session.lastActive.Load()); got != bind {
 		t.Errorf("activity stamp after forwarding = %v, want the bind stamp %v", got, bind)
+	}
+}
+
+// settleClockPast waits until the monotonic reading a stamp is taken from has
+// moved past base, so the next chunk forwarded is certain to stamp a strictly
+// greater value.
+//
+// Windows advances that clock in timer ticks of roughly 15ms rather than
+// continuously, so two chunks forwarded inside one tick carry the same reading
+// and a strict comparison against the earlier one can never succeed however
+// long it is polled for. The granularity is irrelevant to the idle window
+// itself, which is armed in minutes.
+func settleClockPast(t *testing.T, base time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Since(processStart) <= base {
+		if time.Now().After(deadline) {
+			t.Fatalf("monotonic clock did not advance past %v within 2s", base)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

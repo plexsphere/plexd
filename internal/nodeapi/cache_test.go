@@ -554,8 +554,11 @@ func TestStateCache_LoadDropsOutOfGrammarReportKeys(t *testing.T) {
 		}
 	}
 
-	writeReport("health.json", "health")  // valid under the grammar
-	writeReport("Health.json", "Health")  // uppercase -> out of grammar
+	writeReport("health.json", "health") // valid under the grammar
+	// The file name is deliberately not a case variant of health.json: APFS and
+	// NTFS fold case, so "Health.json" would overwrite it instead of adding a
+	// second report. The key under test comes from the JSON, not the name.
+	writeReport("upper.json", "Health")   // uppercase -> out of grammar
 	writeReport("digit.json", "9-checks") // leading digit -> out of grammar
 
 	sc := NewStateCache(dir, discardLogger())
@@ -577,7 +580,7 @@ func TestStateCache_LoadDropsOutOfGrammarReportKeys(t *testing.T) {
 	}
 
 	// The dropped files remain on disk for manual cleanup.
-	for _, file := range []string{"Health.json", "digit.json"} {
+	for _, file := range []string{"upper.json", "digit.json"} {
 		if _, err := os.Stat(filepath.Join(reportDir, file)); err != nil {
 			t.Errorf("dropped report file %q should remain on disk, stat error: %v", file, err)
 		}
@@ -591,7 +594,7 @@ func TestStateCache_LoadDropsOutOfGrammarReportKeys(t *testing.T) {
 		t.Errorf("OrphanedReportKeys() = %v, want %v", orphaned, want)
 	}
 	// A reload with the offending files gone reports no orphans.
-	for _, file := range []string{"Health.json", "digit.json"} {
+	for _, file := range []string{"upper.json", "digit.json"} {
 		if err := os.Remove(filepath.Join(reportDir, file)); err != nil {
 			t.Fatalf("remove %q: %v", file, err)
 		}

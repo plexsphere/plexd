@@ -70,11 +70,25 @@ func (c *serverTestClient) DeleteStateReport(_ context.Context, _, _ string) err
 	return c.deleteErr
 }
 
+// shortSocketPath returns a Unix socket path that fits every platform's
+// sun_path limit: 104 bytes on macOS, 108 on Linux and Windows. t.TempDir()
+// embeds the test's own name in the path, which pushes a long-named test past
+// the limit and fails bind with EINVAL.
+func shortSocketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "plexd-sock-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "api.sock")
+}
+
 func newTestServer(t *testing.T, client *serverTestClient) (*Server, Config) {
 	t.Helper()
 	tmpDir := t.TempDir()
 	cfg := Config{
-		SocketPath:      filepath.Join(tmpDir, "api.sock"),
+		SocketPath:      shortSocketPath(t),
 		DataDir:         tmpDir,
 		DebouncePeriod:  50 * time.Millisecond,
 		ShutdownTimeout: 2 * time.Second,
@@ -526,7 +540,7 @@ func TestServer_ReportSyncIntegration(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	cfg := Config{
-		SocketPath:      filepath.Join(tmpDir, "api.sock"),
+		SocketPath:      shortSocketPath(t),
 		DataDir:         tmpDir,
 		DebouncePeriod:  50 * time.Millisecond,
 		ShutdownTimeout: 2 * time.Second,
@@ -664,7 +678,7 @@ func TestServer_EndToEndFlow(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	cfg := Config{
-		SocketPath:      filepath.Join(tmpDir, "api.sock"),
+		SocketPath:      shortSocketPath(t),
 		DataDir:         tmpDir,
 		DebouncePeriod:  50 * time.Millisecond,
 		ShutdownTimeout: 2 * time.Second,
@@ -842,7 +856,7 @@ func TestServer_PublishReport(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	cfg := Config{
-		SocketPath:      filepath.Join(tmpDir, "api.sock"),
+		SocketPath:      shortSocketPath(t),
 		DataDir:         tmpDir,
 		DebouncePeriod:  50 * time.Millisecond,
 		ShutdownTimeout: 2 * time.Second,
@@ -956,7 +970,7 @@ func TestServer_SecretProxy(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	cfg := Config{
-		SocketPath:      filepath.Join(tmpDir, "api.sock"),
+		SocketPath:      shortSocketPath(t),
 		DataDir:         tmpDir,
 		DebouncePeriod:  50 * time.Millisecond,
 		ShutdownTimeout: 2 * time.Second,

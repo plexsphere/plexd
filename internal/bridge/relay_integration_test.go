@@ -34,10 +34,7 @@ func TestRelayIntegration_FullFlow(t *testing.T) {
 		t.Fatalf("AddSession: %v", err)
 	}
 
-	relayAddr, err := net.ResolveUDPAddr("udp", relay.ListenAddr().String())
-	if err != nil {
-		t.Fatalf("resolve relay addr: %v", err)
-	}
+	relayAddr := relayLoopbackAddr(t, relay)
 
 	// A -> relay -> B
 	msgAB := []byte("hello from A to B")
@@ -191,10 +188,7 @@ func TestRelayIntegration_ReconcileSessionSync(t *testing.T) {
 func TestRelayIntegration_ConcurrentNoRace(t *testing.T) {
 	relay := startTestRelay(t, 200, 5*time.Minute)
 
-	relayAddr, err := net.ResolveUDPAddr("udp", relay.ListenAddr().String())
-	if err != nil {
-		t.Fatalf("resolve relay addr: %v", err)
-	}
+	relayAddr := relayLoopbackAddr(t, relay)
 
 	// Pre-create peer sockets for sessions.
 	const numSessions = 20
