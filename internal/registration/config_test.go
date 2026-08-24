@@ -12,8 +12,10 @@ func TestConfig_Defaults(t *testing.T) {
 	if cfg.MaxRetryDuration != 5*time.Minute {
 		t.Errorf("MaxRetryDuration = %v, want %v", cfg.MaxRetryDuration, 5*time.Minute)
 	}
-	if cfg.TokenFile != "/etc/plexd/bootstrap-token" {
-		t.Errorf("TokenFile = %q, want %q", cfg.TokenFile, "/etc/plexd/bootstrap-token")
+	// The token file differs per platform (internal/paths pins each), so what
+	// is asserted here is that ApplyDefaults fills an empty field with it.
+	if cfg.TokenFile != DefaultTokenFile {
+		t.Errorf("TokenFile = %q, want %q", cfg.TokenFile, DefaultTokenFile)
 	}
 	if cfg.TokenEnv != "PLEXD_BOOTSTRAP_TOKEN" {
 		t.Errorf("TokenEnv = %q, want %q", cfg.TokenEnv, "PLEXD_BOOTSTRAP_TOKEN")

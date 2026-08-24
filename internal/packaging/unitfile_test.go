@@ -57,7 +57,10 @@ func TestGenerateUnitFile_SecurityHardening(t *testing.T) {
 }
 
 func TestGenerateUnitFile_EnvironmentFile(t *testing.T) {
-	cfg := InstallConfig{}
+	// ConfigDir is set explicitly rather than defaulted: a systemd unit is a
+	// Linux artifact whatever host generates it, so the rendering under test
+	// is the Linux one on every runner.
+	cfg := InstallConfig{ConfigDir: "/etc/plexd"}
 	output := GenerateUnitFile(cfg)
 
 	if !strings.Contains(output, "EnvironmentFile=-/etc/plexd/environment") {

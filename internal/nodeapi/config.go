@@ -3,13 +3,15 @@ package nodeapi
 import (
 	"errors"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/paths"
 )
 
 // Config holds the configuration for the local node API server.
 // Config is passed as a constructor argument — no file I/O in this package.
 type Config struct {
 	// SocketPath is the path to the Unix domain socket.
-	// Default: /var/run/plexd/api.sock
+	// Default: paths.SocketPath()
 	SocketPath string `yaml:"socket_path"`
 
 	// HTTPEnabled enables the optional HTTP listener.
@@ -42,8 +44,9 @@ type Config struct {
 	SecretAuthEnabled bool `yaml:"secret_auth_enabled"`
 }
 
-// DefaultSocketPath is the default Unix domain socket path.
-const DefaultSocketPath = "/var/run/plexd/api.sock"
+// DefaultSocketPath is the default Unix domain socket path. It is resolved per
+// platform, which is why it is a var rather than a const.
+var DefaultSocketPath = paths.SocketPath()
 
 // DefaultHTTPListen is the default HTTP listen address.
 const DefaultHTTPListen = "127.0.0.1:9100"

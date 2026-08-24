@@ -3,6 +3,8 @@ package packaging
 
 import (
 	"errors"
+
+	"github.com/plexsphere/plexd/internal/paths"
 )
 
 // InstallConfig holds the configuration for packaging and installing plexd as a systemd service.
@@ -13,15 +15,15 @@ type InstallConfig struct {
 	BinaryPath string
 
 	// ConfigDir is the configuration directory.
-	// Default: /etc/plexd
+	// Default: paths.ConfigDir()
 	ConfigDir string
 
 	// DataDir is the data directory.
-	// Default: /var/lib/plexd
+	// Default: paths.DataDir()
 	DataDir string
 
 	// RunDir is the runtime directory.
-	// Default: /var/run/plexd
+	// Default: paths.RunDir()
 	RunDir string
 
 	// UnitFilePath is the path for the systemd unit file.
@@ -45,14 +47,18 @@ type InstallConfig struct {
 // DefaultBinaryPath is the default path to install the plexd binary.
 const DefaultBinaryPath = "/usr/local/bin/plexd"
 
+// The three directories the installer creates are resolved per platform, which
+// is why they are vars rather than consts. The binary path, service name and
+// unit file path stay Linux: they belong to the systemd installer.
+
 // DefaultConfigDir is the default configuration directory.
-const DefaultConfigDir = "/etc/plexd"
+var DefaultConfigDir = paths.ConfigDir()
 
 // DefaultDataDir is the default data directory.
-const DefaultDataDir = "/var/lib/plexd"
+var DefaultDataDir = paths.DataDir()
 
 // DefaultRunDir is the default runtime directory.
-const DefaultRunDir = "/var/run/plexd"
+var DefaultRunDir = paths.RunDir()
 
 // DefaultServiceName is the default systemd service name.
 const DefaultServiceName = "plexd"

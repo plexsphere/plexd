@@ -7,6 +7,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/plexsphere/plexd/internal/paths"
 )
 
 // warnIfConfigAbsent reports a missing config file once, at warn level, so a
@@ -75,7 +77,7 @@ var rootCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", envOrDefault("PLEXD_CONFIG", "/etc/plexd/config.yaml"), "config file path")
+	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", envOrDefault("PLEXD_CONFIG", paths.ConfigFile()), "config file path")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", envOrDefault("PLEXD_LOG_LEVEL", "info"), "log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().StringVar(&apiURL, "api", os.Getenv("PLEXD_API"), "control plane API URL (overrides config)")
 	rootCmd.PersistentFlags().StringVar(&mode, "mode", envOrDefault("PLEXD_MODE", ""), "operating mode: node or bridge (overrides config)")
