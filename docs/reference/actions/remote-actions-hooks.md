@@ -378,6 +378,15 @@ Collects system diagnostics (hostname, OS, architecture, CPU count, memory, disk
 }
 ```
 
+Two fields are read per platform:
+
+| Field | Unix | Windows |
+|---|---|---|
+| `disk_total` | `statfs` of `/` | `GetDiskFreeSpaceEx` of `%SystemDrive%\` |
+| `kernel_version` | the `uname` release (e.g. `6.1.0-amd64`) | `major.minor.build` from `RtlGetVersion` (e.g. `10.0.19045`) |
+
+When the `uname` call fails, `kernel_version` falls back to `<GOOS>/<GOARCH>`.
+
 ### diagnostics.ping_peer
 
 Pings a mesh peer and reports latency. Uses the system `ping` command with `-c <count> -W 3`.
@@ -416,6 +425,8 @@ Sends `SIGHUP` to the current process to trigger a configuration reload.
 ```
 
 No parameters required.
+
+Windows has no signal that maps to a reload, so on Windows the action fails with exit code 1 and the error `actions: reload config: reload signal not supported on windows; restart the service instead`. Restart the service instead.
 
 ### service.upgrade
 
