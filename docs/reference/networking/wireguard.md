@@ -39,7 +39,7 @@ if err := cfg.Validate(); err != nil {
 
 ## WGController
 
-Interface abstracting OS-level WireGuard operations. The production implementation (netlink/userspace) is provided externally; this package defines and consumes the interface.
+Interface abstracting OS-level WireGuard operations. The Linux implementation is `NetlinkController` (`controller_linux.go`); macOS and Windows build theirs on the userspace backend below.
 
 ```go
 type WGController interface {
@@ -50,8 +50,37 @@ type WGController interface {
     SetMTU(name string, mtu int) error
     AddPeer(iface string, cfg PeerConfig) error
     RemovePeer(iface string, publicKey []byte) error
+    SetPrivateKey(name string, privateKey []byte) error
 }
 ```
+
+## Userspace backend
+
+`UserspaceBackend` (`internal/wireguard/userspace.go`) runs wireguard-go devices inside the plexd process. It is the base of the macOS (utun) and Windows (Wintun) `WGController` implementations and of the bridge access and site-to-site controllers. On Linux plexd stays on the kernel path through `NetlinkController`; the backend compiles and is tested there but is not wired in.
+
+The caller creates the tun device and hands it to `CreateDevice`; the backend owns the wireguard-go device lifecycle, the private key, the listen port and the peers. Addressing, MTU and the interface flag stay with the per-OS controller. Devices are keyed by the configured interface name, so `wg show <name>` works even where the kernel gives the tun another name (`utunN` on macOS).
+
+```go
+func NewUserspaceBackend(logger *slog.Logger) *UserspaceBackend
+
+func (b *UserspaceBackend) CreateDevice(name string, tdev tun.Device, privateKey []byte, listenPort int) error
+func (b *UserspaceBackend) DeleteDevice(name string) error
+func (b *UserspaceBackend) SetPrivateKey(name string, privateKey []byte) error
+func (b *UserspaceBackend) AddPeer(name string, cfg PeerConfig) error
+func (b *UserspaceBackend) RemovePeer(name string, publicKey []byte) error
+```
+
+- **`CreateDevice`** takes ownership of `tdev`: it closes the tun on any error, and the caller never closes a tun it handed in. It sets the key and port, brings the device up, and serves the UAPI endpoint. Because the device is brought up here, a listen port already in use surfaces as an error from this call. A `listenPort` of `0` binds an ephemeral port.
+- **`DeleteDevice`** closes the UAPI listener and the device, which closes the tun. It is idempotent: deleting an unknown device returns `nil`.
+- **`SetPrivateKey`**, **`AddPeer`** and **`RemovePeer`** return an error wrapping `os.ErrNotExist` for an unknown device. `AddPeer` upserts by public key and validates its input in the same order and with the same error text as `NetlinkController`; `RemovePeer` is silent for a public key with no matching peer.
+
+### UAPI endpoint
+
+The backend serves the WireGuard UAPI for each device so `wg show` and any `wgctrl` reader can query it: a Unix socket at `/var/run/wireguard/<name>.sock` on macOS (`uapi_unix.go`) and the named pipe `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<name>` on Windows (`uapi_windows.go`).
+
+Configuration is applied in process through the device's UAPI text protocol (`device.Device.IpcSet`), not through `wgctrl`. `wgctrl`'s userspace transport reaches a device only through a root-owned socket directory on Unix and a LocalSystem-owned named pipe on Windows, so it cannot configure the device from an unprivileged test; the in-process path is the same in production and under test on all three platforms. The served endpoint still lets `wgctrl` and `wg(8)` read the device.
+
+wireguard-go's own log lines are adapted to plexd's `slog.Logger`, appearing at `debug` and `error` with `component=wireguard`. Private keys and preshared keys are never logged.
 
 ## PeerConfig
 
