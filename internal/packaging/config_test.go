@@ -10,13 +10,13 @@ func TestInstallConfig_ApplyDefaults(t *testing.T) {
 	cfg := InstallConfig{}
 	cfg.ApplyDefaults()
 
-	if cfg.BinaryPath != "/usr/local/bin/plexd" {
-		t.Errorf("BinaryPath = %q, want %q", cfg.BinaryPath, "/usr/local/bin/plexd")
+	// The install paths differ per platform, so what is asserted here is that
+	// ApplyDefaults fills an empty field from the package default. The exact
+	// string each platform resolves to is pinned by the tagged tests beside
+	// this file, on the runner that actually has it.
+	if cfg.BinaryPath != DefaultBinaryPath {
+		t.Errorf("BinaryPath = %q, want %q", cfg.BinaryPath, DefaultBinaryPath)
 	}
-	// The three directories differ per platform, so what is asserted here is
-	// that ApplyDefaults fills an empty field from internal/paths. The exact
-	// string each platform resolves to is pinned by the tagged tests in that
-	// package, on the runner that actually has it.
 	if cfg.ConfigDir != paths.ConfigDir() {
 		t.Errorf("ConfigDir = %q, want %q", cfg.ConfigDir, paths.ConfigDir())
 	}
@@ -29,8 +29,11 @@ func TestInstallConfig_ApplyDefaults(t *testing.T) {
 	if cfg.ServiceName != "plexd" {
 		t.Errorf("ServiceName = %q, want %q", cfg.ServiceName, "plexd")
 	}
-	if cfg.UnitFilePath != "/etc/systemd/system/plexd.service" {
-		t.Errorf("UnitFilePath = %q, want %q", cfg.UnitFilePath, "/etc/systemd/system/plexd.service")
+	if cfg.UnitFilePath != DefaultUnitFilePath {
+		t.Errorf("UnitFilePath = %q, want %q", cfg.UnitFilePath, DefaultUnitFilePath)
+	}
+	if cfg.LogDir != DefaultLogDir {
+		t.Errorf("LogDir = %q, want %q", cfg.LogDir, DefaultLogDir)
 	}
 	if cfg.APIBaseURL != "" {
 		t.Errorf("APIBaseURL = %q, want empty", cfg.APIBaseURL)
@@ -49,6 +52,7 @@ func TestInstallConfig_CustomValues(t *testing.T) {
 		ConfigDir:    "/opt/plexd/etc",
 		DataDir:      "/opt/plexd/data",
 		RunDir:       "/opt/plexd/run",
+		LogDir:       "/opt/plexd/log",
 		UnitFilePath: "/usr/lib/systemd/system/plexd.service",
 		ServiceName:  "plexd-custom",
 		APIBaseURL:   "https://api.example.com",
@@ -69,6 +73,9 @@ func TestInstallConfig_CustomValues(t *testing.T) {
 	if cfg.RunDir != "/opt/plexd/run" {
 		t.Errorf("RunDir = %q, want %q", cfg.RunDir, "/opt/plexd/run")
 	}
+	if cfg.LogDir != "/opt/plexd/log" {
+		t.Errorf("LogDir = %q, want %q", cfg.LogDir, "/opt/plexd/log")
+	}
 	if cfg.UnitFilePath != "/usr/lib/systemd/system/plexd.service" {
 		t.Errorf("UnitFilePath = %q, want %q", cfg.UnitFilePath, "/usr/lib/systemd/system/plexd.service")
 	}
@@ -86,6 +93,9 @@ func TestInstallConfig_CustomValues(t *testing.T) {
 	}
 }
 
+// TestInstallConfig_Validate is, on the Windows runner, the proof that Validate
+// accepts a config whose UnitFilePath is empty: the Service Control Manager
+// keeps no definition file, so ApplyDefaults leaves that field blank there.
 func TestInstallConfig_Validate(t *testing.T) {
 	cfg := InstallConfig{}
 	cfg.ApplyDefaults()
@@ -149,17 +159,6 @@ func TestInstallConfig_Validate_EmptyFields(t *testing.T) {
 				RunDir:     "/var/run/plexd",
 			},
 			wantErr: "packaging: config: ServiceName is required",
-		},
-		{
-			name: "empty UnitFilePath",
-			cfg: InstallConfig{
-				BinaryPath:  "/usr/local/bin/plexd",
-				ConfigDir:   "/etc/plexd",
-				DataDir:     "/var/lib/plexd",
-				RunDir:      "/var/run/plexd",
-				ServiceName: "plexd",
-			},
-			wantErr: "packaging: config: UnitFilePath is required",
 		},
 	}
 

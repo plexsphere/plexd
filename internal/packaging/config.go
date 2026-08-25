@@ -1,4 +1,5 @@
-// Package packaging implements systemd service packaging for bare-metal Linux servers.
+// Package packaging installs plexd as a host service: a systemd unit on Linux,
+// a launchd daemon on macOS, a Windows service on Windows.
 package packaging
 
 import (
@@ -7,11 +8,11 @@ import (
 	"github.com/plexsphere/plexd/internal/paths"
 )
 
-// InstallConfig holds the configuration for packaging and installing plexd as a systemd service.
+// InstallConfig holds the configuration for packaging and installing plexd as a host service.
 // InstallConfig is passed as a constructor argument — no file I/O in this package.
 type InstallConfig struct {
 	// BinaryPath is the path to install the plexd binary.
-	// Default: /usr/local/bin/plexd
+	// Default: DefaultBinaryPath
 	BinaryPath string
 
 	// ConfigDir is the configuration directory.
@@ -26,11 +27,18 @@ type InstallConfig struct {
 	// Default: paths.RunDir()
 	RunDir string
 
-	// UnitFilePath is the path for the systemd unit file.
-	// Default: /etc/systemd/system/plexd.service
+	// LogDir is the directory the service manager writes plexd's output to.
+	// Empty where the manager keeps the logs itself (journald on Linux, the
+	// Event Log on Windows).
+	// Default: DefaultLogDir
+	LogDir string
+
+	// UnitFilePath is the path of the service definition file. Empty where the
+	// manager keeps no file (the Service Control Manager on Windows).
+	// Default: DefaultUnitFilePath
 	UnitFilePath string
 
-	// ServiceName is the systemd service name.
+	// ServiceName is the name the host's service manager knows plexd by.
 	// Default: plexd
 	ServiceName string
 
@@ -44,12 +52,12 @@ type InstallConfig struct {
 	TokenFile string
 }
 
-// DefaultBinaryPath is the default path to install the plexd binary.
-const DefaultBinaryPath = "/usr/local/bin/plexd"
+// The install paths are resolved per platform, which is why they are vars
+// rather than consts. Only the service name is the same everywhere.
 
-// The three directories the installer creates are resolved per platform, which
-// is why they are vars rather than consts. The binary path, service name and
-// unit file path stay Linux: they belong to the systemd installer.
+// DefaultBinaryPath is the default path to install the plexd binary,
+// resolved per platform by defaultBinaryPath.
+var DefaultBinaryPath = defaultBinaryPath()
 
 // DefaultConfigDir is the default configuration directory.
 var DefaultConfigDir = paths.ConfigDir()
@@ -60,11 +68,18 @@ var DefaultDataDir = paths.DataDir()
 // DefaultRunDir is the default runtime directory.
 var DefaultRunDir = paths.RunDir()
 
-// DefaultServiceName is the default systemd service name.
+// DefaultLogDir is the default directory the service manager writes plexd's
+// output to, resolved per platform by defaultLogDir. It is empty where the
+// manager keeps the logs itself.
+var DefaultLogDir = defaultLogDir()
+
+// DefaultServiceName is the default service name.
 const DefaultServiceName = "plexd"
 
-// DefaultUnitFilePath is the default path for the systemd unit file.
-const DefaultUnitFilePath = "/etc/systemd/system/plexd.service"
+// DefaultUnitFilePath is the default path of the service definition file,
+// resolved per platform by defaultUnitFilePath. It is empty where the manager
+// keeps no file.
+var DefaultUnitFilePath = defaultUnitFilePath()
 
 // ApplyDefaults sets default values for zero-valued fields.
 func (c *InstallConfig) ApplyDefaults() {
@@ -80,6 +95,9 @@ func (c *InstallConfig) ApplyDefaults() {
 	if c.RunDir == "" {
 		c.RunDir = DefaultRunDir
 	}
+	if c.LogDir == "" {
+		c.LogDir = DefaultLogDir
+	}
 	if c.ServiceName == "" {
 		c.ServiceName = DefaultServiceName
 	}
@@ -89,6 +107,10 @@ func (c *InstallConfig) ApplyDefaults() {
 }
 
 // Validate checks that required fields are set.
+//
+// UnitFilePath and LogDir are not required: the Service Control Manager keeps
+// neither a definition file nor a log directory, and the two managers that do
+// need one check it themselves.
 func (c *InstallConfig) Validate() error {
 	if c.BinaryPath == "" {
 		return errors.New("packaging: config: BinaryPath is required")
@@ -104,9 +126,6 @@ func (c *InstallConfig) Validate() error {
 	}
 	if c.ServiceName == "" {
 		return errors.New("packaging: config: ServiceName is required")
-	}
-	if c.UnitFilePath == "" {
-		return errors.New("packaging: config: UnitFilePath is required")
 	}
 	return nil
 }
