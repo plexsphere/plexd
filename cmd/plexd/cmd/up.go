@@ -286,8 +286,12 @@ func runAgent(ctx context.Context) error {
 	// net.InterfaceByName dumps the node's whole interface table (one entry per
 	// pod veth, bridge and tunnel) and scans it for the name, so running it per
 	// probe would let anyone reaching the unauthenticated port drive that dump.
+	//
+	// The name resolved here is the operating system's, not the configured one:
+	// on macOS the controller creates a utun the kernel calls utunN, and that
+	// is what net.InterfaceByName finds.
 	if healthSrv != nil && wgReady {
-		iface := cfg.WireGuard.InterfaceName
+		iface := wgMgr.OSInterfaceName()
 		healthSrv.SetDataPlaneCheck(ctx, func() error {
 			link, err := net.InterfaceByName(iface)
 			if err != nil {
