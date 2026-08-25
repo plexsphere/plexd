@@ -136,13 +136,10 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// newTestInstaller creates an Installer with mock dependencies and paths under t.TempDir().
-// It creates a fake source binary at a temp location and sets BinaryPath under tmpDir.
-func newTestInstaller(t *testing.T, cfg InstallConfig, systemd *mockSystemdController, root *mockRootChecker) (*Installer, string) {
-	t.Helper()
-	tmpDir := t.TempDir()
-
-	// Remap paths to temp directory
+// remapUnderTemp points every path in cfg at tmpDir, so an installer test
+// writes nothing outside it. LogDir is remapped unconditionally: the macOS
+// default is /Library/Logs/plexd, which an unprivileged test cannot create.
+func remapUnderTemp(cfg InstallConfig, tmpDir string) InstallConfig {
 	if cfg.BinaryPath == "" {
 		cfg.BinaryPath = filepath.Join(tmpDir, "usr", "local", "bin", "plexd")
 	}
@@ -155,14 +152,37 @@ func newTestInstaller(t *testing.T, cfg InstallConfig, systemd *mockSystemdContr
 	if cfg.RunDir == "" {
 		cfg.RunDir = filepath.Join(tmpDir, "var", "run", "plexd")
 	}
+	if cfg.LogDir == "" {
+		cfg.LogDir = filepath.Join(tmpDir, "var", "log", "plexd")
+	}
 	if cfg.UnitFilePath == "" {
 		cfg.UnitFilePath = filepath.Join(tmpDir, "etc", "systemd", "system", "plexd.service")
 	}
 	if cfg.ServiceName == "" {
 		cfg.ServiceName = "plexd"
 	}
+	return cfg
+}
 
-	return NewInstaller(cfg, systemd, root, testLogger()), tmpDir
+// newTestInstaller creates an Installer over the systemd manager with mock
+// dependencies and paths under t.TempDir(). Driving the real systemd manager
+// rather than a mock one is deliberate: these tests are what proves the unit
+// file flow still behaves as it did before it moved out of Installer.
+func newTestInstaller(t *testing.T, cfg InstallConfig, systemd *mockSystemdController, root *mockRootChecker) (*Installer, string) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	cfg = remapUnderTemp(cfg, tmpDir)
+	return NewInstaller(cfg, NewSystemdManager(systemd, testLogger()), root, testLogger()), tmpDir
+}
+
+// newTestInstallerWithManager creates an Installer over mgr, for the cases that
+// assert on what Installer does with the manager's answers rather than on what
+// a particular manager does.
+func newTestInstallerWithManager(t *testing.T, cfg InstallConfig, mgr ServiceManager, root *mockRootChecker) (*Installer, string) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	cfg = remapUnderTemp(cfg, tmpDir)
+	return NewInstaller(cfg, mgr, root, testLogger()), tmpDir
 }
 
 // --- Install tests ---
@@ -176,8 +196,8 @@ func TestInstall_RejectsNonRoot(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install() = nil, want error for non-root")
 	}
-	if !strings.Contains(err.Error(), "root privileges") {
-		t.Errorf("Install() error = %q, want message about root privileges", err)
+	if want := privilegeName + " privileges"; !strings.Contains(err.Error(), want) {
+		t.Errorf("Install() error = %q, want message about %s", err, want)
 	}
 
 	// Verify no files were created
@@ -631,8 +651,8 @@ func TestUninstall_RejectsNonRoot(t *testing.T) {
 	if err == nil {
 		t.Fatal("Uninstall() = nil, want error for non-root")
 	}
-	if !strings.Contains(err.Error(), "root privileges") {
-		t.Errorf("Uninstall() error = %q, want message about root privileges", err)
+	if want := privilegeName + " privileges"; !strings.Contains(err.Error(), want) {
+		t.Errorf("Uninstall() error = %q, want message about %s", err, want)
 	}
 }
 
@@ -718,5 +738,147 @@ func TestInstall_WithAPIBaseURL(t *testing.T) {
 	content := string(data)
 	if !strings.Contains(content, "https://api.example.com") {
 		t.Errorf("default config missing API URL, got:\n%s", content)
+	}
+}
+
+// --- Installer against the ServiceManager seam ---
+
+func TestInstall_CreatesLogDir(t *testing.T) {
+	root := &mockRootChecker{isRoot: true}
+	mgr := &mockServiceManager{available: true}
+	ins, tmpDir := newTestInstallerWithManager(t, InstallConfig{}, mgr, root)
+
+	if err := ins.Install(); err != nil {
+		t.Fatalf("Install() = %v", err)
+	}
+
+	logDir := filepath.Join(tmpDir, "var", "log", "plexd")
+	info, err := os.Stat(logDir)
+	if err != nil {
+		t.Fatalf("Stat(%q) = %v", logDir, err)
+	}
+	if !info.IsDir() {
+		t.Errorf("%q is not a directory", logDir)
+	}
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != 0o755 {
+			t.Errorf("%q perm = %04o, want 0755", logDir, got)
+		}
+	}
+}
+
+// Where the service manager keeps the logs itself — journald on Linux, the
+// Event Log on Windows — LogDir is empty and the installer creates nothing.
+func TestInstall_SkipsLogDirWhenEmpty(t *testing.T) {
+	// ApplyDefaults fills an empty LogDir from DefaultLogDir, which is set on
+	// macOS. Override it so the empty case is the same on every runner.
+	prev := DefaultLogDir
+	DefaultLogDir = ""
+	t.Cleanup(func() { DefaultLogDir = prev })
+
+	root := &mockRootChecker{isRoot: true}
+	mgr := &mockServiceManager{available: true}
+	tmpDir := t.TempDir()
+	cfg := remapUnderTemp(InstallConfig{}, tmpDir)
+	cfg.LogDir = ""
+	ins := NewInstaller(cfg, mgr, root, testLogger())
+
+	if err := ins.Install(); err != nil {
+		t.Fatalf("Install() = %v", err)
+	}
+
+	logDir := filepath.Join(tmpDir, "var", "log", "plexd")
+	if _, err := os.Stat(logDir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Stat(%q) = %v, want os.ErrNotExist", logDir, err)
+	}
+	if len(mgr.registerCalls) != 1 {
+		t.Errorf("Register called %d times, want 1", len(mgr.registerCalls))
+	}
+}
+
+func TestInstall_RegisterFailure(t *testing.T) {
+	registerErr := errors.New("packaging: write plist: permission denied")
+	root := &mockRootChecker{isRoot: true}
+	mgr := &mockServiceManager{available: true, registerErr: registerErr}
+	ins, _ := newTestInstallerWithManager(t, InstallConfig{}, mgr, root)
+
+	err := ins.Install()
+	if !errors.Is(err, registerErr) {
+		t.Fatalf("Install() = %v, want the manager's Register error", err)
+	}
+	// Every manager already prefixes its errors, so the installer adds nothing.
+	if err.Error() != registerErr.Error() {
+		t.Errorf("Install() error = %q, want it returned verbatim as %q", err, registerErr)
+	}
+}
+
+func TestInstall_UnavailableManager(t *testing.T) {
+	root := &mockRootChecker{isRoot: true}
+	mgr := &mockServiceManager{name: "launchd", available: false}
+	ins, tmpDir := newTestInstallerWithManager(t, InstallConfig{}, mgr, root)
+
+	err := ins.Install()
+	if err == nil {
+		t.Fatal("Install() = nil, want error for an unavailable manager")
+	}
+	if want := "packaging: launchd is not available"; err.Error() != want {
+		t.Errorf("Install() error = %q, want %q", err, want)
+	}
+
+	entries, readErr := os.ReadDir(tmpDir)
+	if readErr != nil {
+		t.Fatalf("ReadDir(%q) failed: %v", tmpDir, readErr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected no directory created, found %d entries in %s", len(entries), tmpDir)
+	}
+}
+
+// --- Uninstall against the ServiceManager seam ---
+
+func TestUninstall_RegisteredQueryFailure(t *testing.T) {
+	queryErr := errors.New("access denied")
+	root := &mockRootChecker{isRoot: true}
+	mgr := &mockServiceManager{available: true, registeredErr: queryErr}
+	ins, _ := newTestInstallerWithManager(t, InstallConfig{}, mgr, root)
+
+	err := ins.Uninstall(false)
+	if err == nil {
+		t.Fatal("Uninstall() = nil, want the query failure")
+	}
+	if want := "packaging: query service: access denied"; err.Error() != want {
+		t.Errorf("Uninstall() error = %q, want %q", err, want)
+	}
+	if len(mgr.unregisterCalls) != 0 {
+		t.Error("Uninstall() went on to Unregister after the query failed")
+	}
+}
+
+// A failed Unregister stops the uninstall before the binary goes: removing it
+// would leave a registered service pointing at a path that no longer exists.
+func TestUninstall_UnregisterFailure(t *testing.T) {
+	unregisterErr := errors.New("packaging: delete service: access denied")
+	root := &mockRootChecker{isRoot: true}
+	mgr := &mockServiceManager{available: true, registered: true, unregisterErr: unregisterErr}
+	ins, tmpDir := newTestInstallerWithManager(t, InstallConfig{}, mgr, root)
+
+	binPath := filepath.Join(tmpDir, "usr", "local", "bin", "plexd")
+	if err := os.MkdirAll(filepath.Dir(binPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) = %v", filepath.Dir(binPath), err)
+	}
+	if err := os.WriteFile(binPath, []byte("binary"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%q) = %v", binPath, err)
+	}
+
+	err := ins.Uninstall(false)
+	if !errors.Is(err, unregisterErr) {
+		t.Fatalf("Uninstall() = %v, want the manager's Unregister error", err)
+	}
+	if err.Error() != unregisterErr.Error() {
+		t.Errorf("Uninstall() error = %q, want it returned verbatim as %q", err, unregisterErr)
+	}
+	if _, statErr := os.Stat(binPath); statErr != nil {
+		t.Errorf("Stat(binary) = %v, want the binary kept after a failed Unregister", statErr)
 	}
 }

@@ -38,7 +38,7 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 		TokenFile:  installTokenFile,
 	}
 
-	installer := packaging.NewInstaller(cfg, packaging.NewSystemdController(), packaging.NewRootChecker(), logger)
+	installer := packaging.NewInstaller(cfg, packaging.NewServiceManager(logger), packaging.NewRootChecker(), logger)
 
 	if err := installer.Install(); err != nil {
 		return fmt.Errorf("plexd install: %w", err)

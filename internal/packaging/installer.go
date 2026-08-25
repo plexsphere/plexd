@@ -12,45 +12,54 @@ import (
 
 const maxTokenLength = 512
 
-// Installer handles installing and uninstalling plexd as a systemd service.
+// dirSpec is a directory Install creates, with the mode it creates it under.
+type dirSpec struct {
+	path string
+	perm os.FileMode
+}
+
+// Installer handles installing and uninstalling plexd as a host service. It
+// owns the files that are the same everywhere — the binary, the config, the
+// token — and leaves the service definition to the host's ServiceManager.
 type Installer struct {
-	cfg     InstallConfig
-	systemd SystemdController
-	root    RootChecker
-	logger  *slog.Logger
+	cfg    InstallConfig
+	mgr    ServiceManager
+	root   RootChecker
+	logger *slog.Logger
 }
 
 // NewInstaller creates a new Installer with defaults applied.
-func NewInstaller(cfg InstallConfig, systemd SystemdController, root RootChecker, logger *slog.Logger) *Installer {
+func NewInstaller(cfg InstallConfig, mgr ServiceManager, root RootChecker, logger *slog.Logger) *Installer {
 	cfg.ApplyDefaults()
 	return &Installer{
-		cfg:     cfg,
-		systemd: systemd,
-		root:    root,
-		logger:  logger.With("component", "packaging"),
+		cfg:    cfg,
+		mgr:    mgr,
+		root:   root,
+		logger: logger.With("component", "packaging"),
 	}
 }
 
-// Install installs plexd as a systemd service.
+// Install installs plexd as a host service.
 func (ins *Installer) Install() error {
-	// 1. Check root
+	// 1. Check privileges
 	if !ins.root.IsRoot() {
-		return errors.New("packaging: install requires root privileges")
+		return fmt.Errorf("packaging: install requires %s privileges", privilegeName)
 	}
 
-	// 2. Check systemd
-	if !ins.systemd.IsAvailable() {
-		return errors.New("packaging: systemd is not available")
+	// 2. Check the host's service manager
+	if !ins.mgr.Available() {
+		return fmt.Errorf("packaging: %s is not available", ins.mgr.Name())
 	}
 
-	// 3. Create directories
-	dirs := []struct {
-		path string
-		perm os.FileMode
-	}{
+	// 3. Create directories. LogDir is empty wherever the service manager
+	// keeps the logs itself, and then there is nothing to create.
+	dirs := []dirSpec{
 		{ins.cfg.ConfigDir, 0o755},
 		{ins.cfg.DataDir, 0o700},
 		{ins.cfg.RunDir, 0o755},
+	}
+	if ins.cfg.LogDir != "" {
+		dirs = append(dirs, dirSpec{ins.cfg.LogDir, 0o755})
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d.path, d.perm); err != nil {
@@ -83,68 +92,40 @@ func (ins *Installer) Install() error {
 		return err
 	}
 
-	// 7. Write unit file
-	unitContent := GenerateUnitFile(ins.cfg)
-	// Create parent directory for unit file if needed
-	unitDir := filepath.Dir(ins.cfg.UnitFilePath)
-	if err := os.MkdirAll(unitDir, 0o755); err != nil {
-		return fmt.Errorf("packaging: create unit file directory: %w", err)
-	}
-	if err := os.WriteFile(ins.cfg.UnitFilePath, []byte(unitContent), 0o644); err != nil {
-		return fmt.Errorf("packaging: write unit file: %w", err)
-	}
-	ins.logger.Info("unit file written", "path", ins.cfg.UnitFilePath)
-
-	// 8. Daemon reload
-	if err := ins.systemd.DaemonReload(); err != nil {
-		return fmt.Errorf("packaging: daemon-reload: %w", err)
-	}
-	ins.logger.Info("systemd daemon reloaded")
-
-	return nil
+	// 7. Register the service. The manager never starts it: --api-url is
+	// optional, so an install can legitimately precede a usable configuration.
+	// Every manager already prefixes its errors with "packaging:".
+	return ins.mgr.Register(ins.cfg)
 }
 
-// Uninstall removes the plexd systemd service. If purge is true, data and config dirs are also removed.
+// Uninstall removes the plexd host service. If purge is true, data and config dirs are also removed.
 func (ins *Installer) Uninstall(purge bool) error {
-	// 1. Check root
+	// 1. Check privileges
 	if !ins.root.IsRoot() {
-		return errors.New("packaging: uninstall requires root privileges")
+		return fmt.Errorf("packaging: uninstall requires %s privileges", privilegeName)
 	}
 
-	// 2. Check if installed (unit file exists)
-	if _, err := os.Stat(ins.cfg.UnitFilePath); errors.Is(err, os.ErrNotExist) {
+	// 2. Check if installed
+	registered, err := ins.mgr.Registered(ins.cfg)
+	if err != nil {
+		return fmt.Errorf("packaging: query service: %w", err)
+	}
+	if !registered {
 		ins.logger.Info("plexd is not installed, nothing to do")
 		return nil
 	}
 
-	// 3. Stop service (ignore errors — service may not be running)
-	if err := ins.systemd.Stop(ins.cfg.ServiceName); err != nil {
-		ins.logger.Info("stop service", "error", err)
+	// 3. Stop the service and remove its definition.
+	if err := ins.mgr.Unregister(ins.cfg); err != nil {
+		return err
 	}
 
-	// 4. Disable service
-	if err := ins.systemd.Disable(ins.cfg.ServiceName); err != nil {
-		ins.logger.Info("disable service", "error", err)
+	// 4. Remove binary
+	if err := ins.removeBinary(); err != nil {
+		return err
 	}
 
-	// 5. Remove unit file
-	if err := os.Remove(ins.cfg.UnitFilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("packaging: remove unit file: %w", err)
-	}
-	ins.logger.Info("unit file removed", "path", ins.cfg.UnitFilePath)
-
-	// 6. Daemon reload
-	if err := ins.systemd.DaemonReload(); err != nil {
-		return fmt.Errorf("packaging: daemon-reload: %w", err)
-	}
-
-	// 7. Remove binary
-	if err := os.Remove(ins.cfg.BinaryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("packaging: remove binary: %w", err)
-	}
-	ins.logger.Info("binary removed", "path", ins.cfg.BinaryPath)
-
-	// 8. Purge directories if requested
+	// 5. Purge directories if requested
 	if purge {
 		for _, dir := range []string{ins.cfg.DataDir, ins.cfg.ConfigDir} {
 			if err := os.RemoveAll(dir); err != nil {
