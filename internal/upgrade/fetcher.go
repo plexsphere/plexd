@@ -25,8 +25,8 @@ var maxBinaryBytes int64 = 512 << 20
 // release path once interpolated into the download URL.
 var versionPattern = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`)
 
-// goos is a test seam for runtime.GOOS. Releases ship Linux assets only, so the
-// fetcher refuses to download on other platforms.
+// goos is a test seam for runtime.GOOS. It selects the release asset for the
+// host the fetcher runs on.
 var goos = runtime.GOOS
 
 // Fetcher downloads plexd release assets from the GitHub release channel.
@@ -51,9 +51,14 @@ func releaseTag(version string) string {
 	return "v" + version
 }
 
-// assetName returns the release asset file name for the current architecture.
+// assetName returns the release asset file name for the host platform, the
+// name .github/workflows/release.yml publishes and signs.
 func assetName() string {
-	return "plexd-linux-" + runtime.GOARCH
+	name := "plexd-" + goos + "-" + runtime.GOARCH
+	if goos == "windows" {
+		name += ".exe"
+	}
+	return name
 }
 
 // FetchBinary downloads the plexd binary for the given version and returns its
@@ -87,14 +92,9 @@ func (f *Fetcher) FetchBundle(ctx context.Context, version string) ([]byte, erro
 	return data, nil
 }
 
-// get performs the GET for a release asset. It refuses non-Linux platforms
-// before any network I/O and returns a non-nil response only on HTTP 200; the
-// caller owns the returned body.
+// get performs the GET for a release asset. It returns a non-nil response only
+// on HTTP 200; the caller owns the returned body.
 func (f *Fetcher) get(ctx context.Context, version, asset string) (*http.Response, error) {
-	if goos != "linux" {
-		return nil, fmt.Errorf("download release asset %s: releases ship linux assets only, running on %s", asset, goos)
-	}
-
 	if !versionPattern.MatchString(version) {
 		return nil, fmt.Errorf("download release asset %s: invalid version %q", asset, version)
 	}
