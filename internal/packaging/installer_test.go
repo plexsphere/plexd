@@ -67,6 +67,61 @@ func (m *mockSystemdController) Restart(ctx context.Context, service string) err
 	return m.restartErr
 }
 
+// --- Mock ServiceManager ---
+
+type mockServiceManager struct {
+	name          string
+	available     bool
+	registered    bool
+	registeredErr error
+	registerErr   error
+	unregisterErr error
+	restartErr    error
+
+	registerCalls   []InstallConfig
+	unregisterCalls []InstallConfig
+	restartCalls    []InstallConfig
+}
+
+func (m *mockServiceManager) Name() string {
+	if m.name == "" {
+		return "mock"
+	}
+	return m.name
+}
+
+func (m *mockServiceManager) Available() bool { return m.available }
+
+func (m *mockServiceManager) Registered(_ InstallConfig) (bool, error) {
+	return m.registered, m.registeredErr
+}
+
+func (m *mockServiceManager) Register(cfg InstallConfig) error {
+	m.registerCalls = append(m.registerCalls, cfg)
+	return m.registerErr
+}
+
+func (m *mockServiceManager) Unregister(cfg InstallConfig) error {
+	m.unregisterCalls = append(m.unregisterCalls, cfg)
+	return m.unregisterErr
+}
+
+func (m *mockServiceManager) Start(_ InstallConfig) error { return nil }
+
+func (m *mockServiceManager) Stop(_ InstallConfig) error { return nil }
+
+func (m *mockServiceManager) Restart(_ context.Context, cfg InstallConfig) error {
+	m.restartCalls = append(m.restartCalls, cfg)
+	return m.restartErr
+}
+
+func (m *mockServiceManager) Status(_ InstallConfig) (ServiceStatus, error) {
+	if !m.registered {
+		return "", ErrNotRegistered
+	}
+	return StatusStopped, nil
+}
+
 // --- Mock RootChecker ---
 
 type mockRootChecker struct {
