@@ -3,6 +3,8 @@ package cmd
 import (
 	"strings"
 	"testing"
+
+	"github.com/plexsphere/plexd/internal/packaging"
 )
 
 func TestInstallCommand_Help(t *testing.T) {
@@ -10,8 +12,8 @@ func TestInstallCommand_Help(t *testing.T) {
 	if !strings.Contains(output, "install") {
 		t.Errorf("help should contain 'install', got: %s", output)
 	}
-	if !strings.Contains(output, "systemd") {
-		t.Errorf("help should mention 'systemd', got: %s", output)
+	if !strings.Contains(output, "system service") {
+		t.Errorf("help should mention 'system service', got: %s", output)
 	}
 }
 
@@ -36,6 +38,13 @@ func TestInstallCommand_Flags(t *testing.T) {
 	}
 }
 
-func TestInstallCommand_RequiresRoot(t *testing.T) {
+// TestInstallCommand_RequiresPrivileges runs the real command, so it can only
+// assert the refusal on a host that would actually be refused. The GitHub
+// windows-latest runner is elevated, and without this skip the test would
+// register a plexd service on the runner itself.
+func TestInstallCommand_RequiresPrivileges(t *testing.T) {
+	if packaging.NewRootChecker().IsRoot() {
+		t.Skip("running privileged; install would register a real service on this host")
+	}
 	assertCmdError(t, "plexd install", "install")
 }

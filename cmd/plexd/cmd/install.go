@@ -18,8 +18,16 @@ var (
 
 var installCmd = &cobra.Command{
 	Use:   "install",
-	Short: "Install plexd as a systemd service",
-	RunE:  runInstall,
+	Short: "Install plexd as a system service (systemd, launchd or Windows service)",
+	Long: "Registers plexd as a system service with the host's service manager: a\n" +
+		"systemd unit on Linux, a launchd daemon on macOS, a Windows service on\n" +
+		"Windows. The service is registered but not started.\n" +
+		"\n" +
+		"Start it with one of:\n" +
+		"  systemctl enable --now plexd\n" +
+		"  sudo launchctl bootstrap system /Library/LaunchDaemons/com.plexsphere.plexd.plist\n" +
+		"  sc start plexd",
+	RunE: runInstall,
 }
 
 func init() {
