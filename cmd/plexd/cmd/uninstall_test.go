@@ -3,6 +3,8 @@ package cmd
 import (
 	"strings"
 	"testing"
+
+	"github.com/plexsphere/plexd/internal/packaging"
 )
 
 func TestUninstallCommand_Help(t *testing.T) {
@@ -10,8 +12,8 @@ func TestUninstallCommand_Help(t *testing.T) {
 	if !strings.Contains(output, "uninstall") {
 		t.Errorf("help should contain 'uninstall', got: %s", output)
 	}
-	if !strings.Contains(output, "systemd") {
-		t.Errorf("help should mention 'systemd', got: %s", output)
+	if !strings.Contains(output, "system service") {
+		t.Errorf("help should mention 'system service', got: %s", output)
 	}
 }
 
@@ -28,6 +30,11 @@ func TestUninstallCommand_PurgeFlag(t *testing.T) {
 	}
 }
 
-func TestUninstallCommand_RequiresRoot(t *testing.T) {
+// TestUninstallCommand_RequiresPrivileges skips on a privileged host for the
+// reason TestInstallCommand_RequiresPrivileges gives.
+func TestUninstallCommand_RequiresPrivileges(t *testing.T) {
+	if packaging.NewRootChecker().IsRoot() {
+		t.Skip("running privileged; uninstall would touch a real service on this host")
+	}
 	assertCmdError(t, "plexd uninstall", "uninstall")
 }

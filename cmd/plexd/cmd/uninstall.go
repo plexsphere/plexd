@@ -14,7 +14,7 @@ var purge bool
 
 var uninstallCmd = &cobra.Command{
 	Use:   "uninstall",
-	Short: "Remove plexd systemd service",
+	Short: "Remove the plexd system service",
 	RunE:  runUninstall,
 }
 
