@@ -1,6 +1,7 @@
 package packaging
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -19,15 +20,20 @@ type mockSystemdController struct {
 	daemonReloadErr error
 	enableErr       error
 	disableErr      error
+	startErr        error
 	stopErr         error
+	restartErr      error
 
 	daemonReloadCalls int
 	enableCalls       []string
 	disableCalls      []string
+	startCalls        []string
 	stopCalls         []string
+	restartCalls      []string
+	restartCtx        context.Context
 }
 
-func (m *mockSystemdController) IsAvailable() bool { return m.available }
+func (m *mockSystemdController) IsAvailable() bool      { return m.available }
 func (m *mockSystemdController) IsActive(_ string) bool { return m.active }
 
 func (m *mockSystemdController) DaemonReload() error {
@@ -45,9 +51,20 @@ func (m *mockSystemdController) Disable(service string) error {
 	return m.disableErr
 }
 
+func (m *mockSystemdController) Start(service string) error {
+	m.startCalls = append(m.startCalls, service)
+	return m.startErr
+}
+
 func (m *mockSystemdController) Stop(service string) error {
 	m.stopCalls = append(m.stopCalls, service)
 	return m.stopErr
+}
+
+func (m *mockSystemdController) Restart(ctx context.Context, service string) error {
+	m.restartCalls = append(m.restartCalls, service)
+	m.restartCtx = ctx
+	return m.restartErr
 }
 
 // --- Mock RootChecker ---
