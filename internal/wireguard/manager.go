@@ -104,6 +104,23 @@ func (m *Manager) Teardown() error {
 	return nil
 }
 
+// OSInterfaceName returns the name the operating system knows the managed
+// interface by, which is what net.InterfaceByName and the host's own tooling
+// resolve. It is Config.InterfaceName everywhere except macOS, where the
+// controller creates a utun the kernel names utunN.
+//
+// Callers that address the interface through plexd keep using
+// Config.InterfaceName: the policy enforcer, the bridge managers and the
+// status report.
+func (m *Manager) OSInterfaceName() string {
+	if namer, ok := m.ctrl.(OSInterfaceNamer); ok {
+		if osName, found := namer.OSInterfaceName(m.cfg.InterfaceName); found {
+			return osName
+		}
+	}
+	return m.cfg.InterfaceName
+}
+
 // UpdatePrivateKey installs a rotated private key on the managed interface.
 func (m *Manager) UpdatePrivateKey(privateKey []byte) error {
 	if err := m.ctrl.SetPrivateKey(m.cfg.InterfaceName, privateKey); err != nil {

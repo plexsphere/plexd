@@ -23,6 +23,20 @@ type WGController interface {
 	SetPrivateKey(name string, privateKey []byte) error
 }
 
+// OSInterfaceNamer is implemented by controllers on platforms where the kernel,
+// not the configuration, names the interface. macOS is the case: WireGuard
+// there runs on a utun device the kernel calls utunN, while plexd keys the
+// device, its UAPI endpoint and its log lines by the configured name.
+//
+// Only code that hands the name back to the operating system needs this: the
+// readiness check, which resolves the interface with net.InterfaceByName.
+// Everything addressing the device through plexd keeps the configured name.
+type OSInterfaceNamer interface {
+	// OSInterfaceName returns the kernel's name for the interface created
+	// under the configured name, and false when no such interface exists.
+	OSInterfaceName(name string) (string, bool)
+}
+
 // PeerConfig holds the WireGuard-native configuration for a single peer.
 type PeerConfig struct {
 	PublicKey           []byte
