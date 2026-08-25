@@ -17,6 +17,7 @@ import (
 	"github.com/plexsphere/plexd/internal/actions"
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/nodeapi"
+	"github.com/plexsphere/plexd/internal/packaging"
 )
 
 func boolPtr(v bool) *bool { return &v }
@@ -122,7 +123,8 @@ func TestIntegration_ActionsList(t *testing.T) {
 	cfg.ApplyDefaults()
 	executor := actions.NewExecutor(cfg, noopActionReporter{}, noopHookVerifier{}, discardLogger())
 	executor.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics", nil, actions.DiagnosticsCollect())
-	executor.RegisterBuiltin("service.restart", "Restart plexd service", nil, actions.ServiceRestart())
+	executor.RegisterBuiltin("service.restart", "Restart plexd service", nil,
+		actions.ServiceRestart(packaging.NewService(packaging.NewServiceManager(discardLogger()), packaging.InstallConfig{})))
 
 	socketPath := startTestNodeAPI(t, ctx, executor, nil)
 

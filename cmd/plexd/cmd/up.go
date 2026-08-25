@@ -31,6 +31,7 @@ import (
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
+	"github.com/plexsphere/plexd/internal/packaging"
 	"github.com/plexsphere/plexd/internal/peerexchange"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/reconcile"
@@ -510,12 +511,17 @@ func runAgent(ctx context.Context) error {
 	// Record start time for uptime calculations.
 	startTime := time.Now()
 
-	// Build the release fetcher and Sigstore verifier for service.upgrade.
+	// Build the release fetcher and Sigstore verifier for service.upgrade, and
+	// the controller both service actions restart the daemon through: systemd
+	// here, launchd on macOS, the Service Control Manager on Windows. The
+	// empty InstallConfig is the default installation, which is the one this
+	// process is running from.
 	upgradeFetcher := upgrade.NewFetcher(cfg.Upgrade)
 	upgradeVerifier, err := upgrade.NewVerifier(cfg.Upgrade)
 	if err != nil {
 		return fmt.Errorf("plexd up: upgrade verifier: %w", err)
 	}
+	svcCtl := packaging.NewService(packaging.NewServiceManager(logger), packaging.InstallConfig{})
 
 	// 10. Create action executor and register built-in actions.
 	executor := actions.NewExecutor(cfg.Actions, client, integrityVerifier, logger)
@@ -536,13 +542,13 @@ func runAgent(ctx context.Context) error {
 			{Name: "peer_id", Type: "string", Required: true, Description: "Peer mesh IP address"},
 			{Name: "max_hops", Type: "string", Required: false, Default: "15", Description: "Maximum number of hops"},
 		}, actions.DiagnosticsTraceroutePeer(nodeInfo))
-	executor.RegisterBuiltin("service.restart", "Restart the plexd service", nil, actions.ServiceRestart())
+	executor.RegisterBuiltin("service.restart", "Restart plexd through the host's service manager", nil, actions.ServiceRestart(svcCtl))
 	executor.RegisterBuiltin("service.reload_config", "Reload configuration without restart", nil, actions.ServiceReloadConfig())
 	executor.RegisterBuiltin("service.upgrade", "Upgrade plexd to a specified version",
 		[]api.ActionParam{
 			{Name: "version", Type: "string", Required: true, Description: "Target version"},
 			{Name: "checksum", Type: "string", Required: true, Description: "Expected SHA-256 checksum"},
-		}, actions.ServiceUpgrade(upgradeFetcher, upgradeVerifier))
+		}, actions.ServiceUpgrade(upgradeFetcher, upgradeVerifier, svcCtl))
 	executor.RegisterBuiltin("system.info", "Report OS, kernel, hardware, and runtime info", nil, actions.GatherInfo(nodeInfo))
 	executor.RegisterBuiltin("health.check", "Run all health checks and report status",
 		[]api.ActionParam{

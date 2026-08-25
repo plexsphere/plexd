@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -289,7 +290,7 @@ func TestBuiltinTraceroutePeer_InvalidPeerID(t *testing.T) {
 }
 
 func TestBuiltinServiceUpgrade_MissingVersion(t *testing.T) {
-	fn := ServiceUpgrade(nil, nil)
+	fn := ServiceUpgrade(nil, nil, nil)
 	_, _, exitCode, err := fn(context.Background(), nil)
 
 	if err == nil {
@@ -301,7 +302,7 @@ func TestBuiltinServiceUpgrade_MissingVersion(t *testing.T) {
 }
 
 func TestBuiltinServiceUpgrade_MissingChecksum(t *testing.T) {
-	fn := ServiceUpgrade(nil, nil)
+	fn := ServiceUpgrade(nil, nil, nil)
 	params := map[string]string{"version": "1.5.0"}
 	_, _, exitCode, err := fn(context.Background(), params)
 
@@ -385,11 +386,10 @@ func assertNoUpgradeTempFiles(t *testing.T, dir string) {
 	}
 }
 
+// TestBuiltinServiceUpgrade_HappyPath covers the swap itself, with a service
+// manager that cannot be driven. It used to skip wherever systemctl existed;
+// the controller is injected now, so the case runs everywhere.
 func TestBuiltinServiceUpgrade_HappyPath(t *testing.T) {
-	if _, err := exec.LookPath("systemctl"); err == nil {
-		t.Skip("systemctl present; upgraded_restart_pending status requires its absence")
-	}
-
 	newBinary := []byte("brand-new-plexd-binary-bytes")
 	sum := sha256.Sum256(newBinary)
 	checksum := hex.EncodeToString(sum[:])
@@ -398,7 +398,7 @@ func TestBuiltinServiceUpgrade_HappyPath(t *testing.T) {
 	fetcher := &fakeReleaseFetcher{binary: newBinary, bundle: []byte(`{"bundle":true}`)}
 	verifier := &fakeBundleVerifier{}
 
-	fn := ServiceUpgrade(fetcher, verifier)
+	fn := ServiceUpgrade(fetcher, verifier, &fakeServiceController{available: false})
 	stdout, _, exitCode, err := fn(context.Background(), map[string]string{
 		"version":  "1.5.0",
 		"checksum": "sha256:" + checksum,
@@ -462,7 +462,7 @@ func TestBuiltinServiceUpgrade_SweepsOrphanedTempFiles(t *testing.T) {
 	fetcher := &fakeReleaseFetcher{binary: newBinary, bundle: []byte(`{"bundle":true}`)}
 	verifier := &fakeBundleVerifier{}
 
-	fn := ServiceUpgrade(fetcher, verifier)
+	fn := ServiceUpgrade(fetcher, verifier, &fakeServiceController{available: true})
 	if _, _, _, err := fn(context.Background(), map[string]string{
 		"version":  "1.5.0",
 		"checksum": checksum,
@@ -517,11 +517,11 @@ func TestBuiltinServiceUpgrade_SerializesConcurrentUpgrades(t *testing.T) {
 	first := ServiceUpgrade(&fakeReleaseFetcher{
 		binaryReader: &blockingReader{data: newBinary, parked: parked, release: release},
 		bundle:       []byte(`{"bundle":true}`),
-	}, &fakeBundleVerifier{})
+	}, &fakeBundleVerifier{}, &fakeServiceController{available: true})
 	second := ServiceUpgrade(&fakeReleaseFetcher{
 		binary: newBinary,
 		bundle: []byte(`{"bundle":true}`),
-	}, &fakeBundleVerifier{})
+	}, &fakeBundleVerifier{}, &fakeServiceController{available: true})
 
 	var wg sync.WaitGroup
 	var errFirst, errSecond error
@@ -571,7 +571,7 @@ func TestBuiltinServiceUpgrade_ChecksumMismatch(t *testing.T) {
 	fetcher := &fakeReleaseFetcher{binary: []byte{}}
 	verifier := &fakeBundleVerifier{}
 
-	fn := ServiceUpgrade(fetcher, verifier)
+	fn := ServiceUpgrade(fetcher, verifier, &fakeServiceController{available: true})
 	stdout, _, exitCode, err := fn(context.Background(), map[string]string{
 		"version":  "1.5.0",
 		"checksum": strings.Repeat("ab", 32),
@@ -619,7 +619,7 @@ func TestBuiltinServiceUpgrade_BundleVerificationFailed(t *testing.T) {
 	fetcher := &fakeReleaseFetcher{binary: newBinary, bundle: []byte(`{"bundle":true}`)}
 	verifier := &fakeBundleVerifier{err: fmt.Errorf("upgrade: verify bundle: untrusted signer")}
 
-	fn := ServiceUpgrade(fetcher, verifier)
+	fn := ServiceUpgrade(fetcher, verifier, &fakeServiceController{available: true})
 	stdout, _, exitCode, err := fn(context.Background(), map[string]string{
 		"version":  "1.5.0",
 		"checksum": checksum,
@@ -667,7 +667,7 @@ func TestBuiltinServiceUpgrade_BundleFetchError(t *testing.T) {
 	fetcher := &fakeReleaseFetcher{binary: newBinary, bundleErr: fmt.Errorf("unexpected status 404")}
 	verifier := &fakeBundleVerifier{}
 
-	fn := ServiceUpgrade(fetcher, verifier)
+	fn := ServiceUpgrade(fetcher, verifier, &fakeServiceController{available: true})
 	_, _, exitCode, err := fn(context.Background(), map[string]string{
 		"version":  "1.5.0",
 		"checksum": checksum,
@@ -953,3 +953,176 @@ func (c *capturingLogProvider) RecentLines(n int) []string {
 	return nil
 }
 
+// --- service.restart and the upgrade's restart leg ---
+
+// fakeServiceController stands in for packaging.Service, so the two actions are
+// testable without a service manager on the host.
+type fakeServiceController struct {
+	available bool
+	err       error
+	calls     int
+}
+
+func (f *fakeServiceController) Available() bool { return f.available }
+
+func (f *fakeServiceController) Restart(_ context.Context) error {
+	f.calls++
+	return f.err
+}
+
+func TestBuiltinServiceRestart_Unavailable(t *testing.T) {
+	ctl := &fakeServiceController{available: false}
+	fn := ServiceRestart(ctl)
+
+	stdout, stderr, exitCode, err := fn(context.Background(), nil)
+
+	if err == nil {
+		t.Fatal("expected an error when the service manager is unavailable")
+	}
+	if want := "service manager not available"; err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+	if exitCode != 1 {
+		t.Errorf("exit code = %d, want 1", exitCode)
+	}
+	if stdout != "" || stderr != "" {
+		t.Errorf("stdout = %q, stderr = %q, want both empty", stdout, stderr)
+	}
+	if ctl.calls != 0 {
+		t.Errorf("Restart called %d times, want 0", ctl.calls)
+	}
+}
+
+func TestBuiltinServiceRestart_Success(t *testing.T) {
+	ctl := &fakeServiceController{available: true}
+	fn := ServiceRestart(ctl)
+
+	stdout, stderr, exitCode, err := fn(context.Background(), nil)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("exit code = %d, want 0", exitCode)
+	}
+	// A quiet systemctl restart printed nothing either.
+	if stdout != "" || stderr != "" {
+		t.Errorf("stdout = %q, stderr = %q, want both empty", stdout, stderr)
+	}
+	if ctl.calls != 1 {
+		t.Errorf("Restart called %d times, want 1", ctl.calls)
+	}
+}
+
+// A restart the manager refuses is the action's own failure, not the executor's:
+// it reports the reason on stderr with exit 1 and returns no error, so the
+// execution ends as failed rather than as a transport problem.
+func TestBuiltinServiceRestart_Error(t *testing.T) {
+	ctl := &fakeServiceController{available: true, err: errors.New("packaging: systemctl restart: Unit plexd.service not found: exit status 5")}
+	fn := ServiceRestart(ctl)
+
+	stdout, stderr, exitCode, err := fn(context.Background(), nil)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exitCode != 1 {
+		t.Errorf("exit code = %d, want 1", exitCode)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want empty", stdout)
+	}
+	if stderr != ctl.err.Error() {
+		t.Errorf("stderr = %q, want %q", stderr, ctl.err.Error())
+	}
+	if ctl.calls != 1 {
+		t.Errorf("Restart called %d times, want 1", ctl.calls)
+	}
+}
+
+func TestBuiltinServiceUpgrade_Restarts(t *testing.T) {
+	newBinary := []byte("brand-new-plexd-binary-bytes")
+	sum := sha256.Sum256(newBinary)
+	checksum := hex.EncodeToString(sum[:])
+
+	path := upgradeSeamFile(t, []byte("old binary"))
+	ctl := &fakeServiceController{available: true}
+	fn := ServiceUpgrade(
+		&fakeReleaseFetcher{binary: newBinary, bundle: []byte(`{"bundle":true}`)},
+		&fakeBundleVerifier{},
+		ctl,
+	)
+
+	stdout, _, exitCode, err := fn(context.Background(), map[string]string{
+		"version":  "1.5.0",
+		"checksum": checksum,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0", exitCode)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
+	}
+	if result["status"] != "upgraded" {
+		t.Errorf("status = %q, want %q", result["status"], "upgraded")
+	}
+	if ctl.calls != 1 {
+		t.Errorf("Restart called %d times, want 1", ctl.calls)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read replaced binary: %v", err)
+	}
+	if !bytes.Equal(got, newBinary) {
+		t.Errorf("binary content = %q, want %q", got, newBinary)
+	}
+}
+
+// A failed restart still leaves the new binary in place: the node is upgraded,
+// and an operator restarting it by hand gets the new version.
+func TestBuiltinServiceUpgrade_RestartFails(t *testing.T) {
+	newBinary := []byte("brand-new-plexd-binary-bytes")
+	sum := sha256.Sum256(newBinary)
+	checksum := hex.EncodeToString(sum[:])
+
+	path := upgradeSeamFile(t, []byte("old binary"))
+	ctl := &fakeServiceController{available: true, err: errors.New("packaging: launchctl kickstart: Could not find service: exit status 113")}
+	fn := ServiceUpgrade(
+		&fakeReleaseFetcher{binary: newBinary, bundle: []byte(`{"bundle":true}`)},
+		&fakeBundleVerifier{},
+		ctl,
+	)
+
+	stdout, _, exitCode, err := fn(context.Background(), map[string]string{
+		"version":  "1.5.0",
+		"checksum": checksum,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exitCode != 1 {
+		t.Fatalf("exit code = %d, want 1", exitCode)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
+	}
+	if result["status"] != "upgraded_restart_failed" {
+		t.Errorf("status = %q, want %q", result["status"], "upgraded_restart_failed")
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read replaced binary: %v", err)
+	}
+	if !bytes.Equal(got, newBinary) {
+		t.Errorf("binary content = %q, want the new bytes despite the failed restart", got)
+	}
+}

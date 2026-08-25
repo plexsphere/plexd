@@ -55,6 +55,13 @@ type ReleaseFetcher interface {
 	FetchBundle(ctx context.Context, version string) ([]byte, error)
 }
 
+// ServiceController drives the plexd service through the host's service
+// manager. packaging.Service implements it.
+type ServiceController interface {
+	Available() bool
+	Restart(ctx context.Context) error
+}
+
 // BundleVerifier verifies a Sigstore bundle against an artifact digest.
 type BundleVerifier interface {
 	Verify(bundleJSON []byte, sha256Hex string) error
@@ -259,24 +266,18 @@ func DiagnosticsTraceroutePeer(info NodeInfoProvider) BuiltinFunc {
 	}
 }
 
-// ServiceRestart returns a BuiltinFunc that restarts the plexd service via systemctl.
-func ServiceRestart() BuiltinFunc {
+// ServiceRestart returns a BuiltinFunc that restarts plexd through the host's
+// service manager: systemd on Linux, launchd on macOS, the Service Control
+// Manager on Windows.
+func ServiceRestart(ctl ServiceController) BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
-		path, err := exec.LookPath("systemctl")
-		if err != nil {
-			return "", "", 1, fmt.Errorf("systemctl not available")
+		if !ctl.Available() {
+			return "", "", 1, fmt.Errorf("service manager not available")
 		}
-
-		cmd := exec.CommandContext(ctx, path, "restart", "plexd.service")
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			if cmd.ProcessState != nil {
-				return "", string(out), cmd.ProcessState.ExitCode(), nil
-			}
+		if err := ctl.Restart(ctx); err != nil {
 			return "", err.Error(), 1, nil
 		}
-
-		return string(out), "", 0, nil
+		return "", "", 0, nil
 	}
 }
 
@@ -334,14 +335,15 @@ var upgradeMu sync.Mutex
 // It downloads the target release binary, verifies its SHA-256 checksum against
 // the dispatched value, then downloads and verifies the release's Sigstore
 // bundle against the fetched binary's digest. Only after both checks pass is the
-// current binary made executable, atomically replaced, and a systemd restart
-// triggered. A release without a bundle asset (the fetch fails) or one whose
-// bundle fails verification is refused, and the on-disk binary is left untouched.
+// current binary made executable, replaced, and a restart triggered through the
+// host's service manager. A release without a bundle asset (the fetch fails) or
+// one whose bundle fails verification is refused, and the on-disk binary is
+// left untouched.
 //
 // Required parameters:
 //   - version: target version string (e.g. "1.5.0")
 //   - checksum: expected SHA-256 checksum of the new binary (hex-encoded, with or without "sha256:" prefix)
-func ServiceUpgrade(fetcher ReleaseFetcher, verifier BundleVerifier) BuiltinFunc {
+func ServiceUpgrade(fetcher ReleaseFetcher, verifier BundleVerifier, ctl ServiceController) BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
 		upgradeMu.Lock()
 		defer upgradeMu.Unlock()
@@ -439,29 +441,27 @@ func ServiceUpgrade(fetcher ReleaseFetcher, verifier BundleVerifier) BuiltinFunc
 		if err := os.Chmod(tmpPath, 0755); err != nil {
 			return "", "", 1, fmt.Errorf("chmod binary: %w", err)
 		}
-		if err := os.Rename(tmpPath, binaryPath); err != nil {
+		if err := replaceExecutable(tmpPath, binaryPath); err != nil {
 			return "", "", 1, fmt.Errorf("replace binary: %w", err)
 		}
 		// Prevent deferred removal of the (now-replaced) file.
 		tmpPath = ""
 
-		// Trigger systemd restart.
-		systemctl, lookErr := exec.LookPath("systemctl")
-		if lookErr != nil {
+		// Restart through the host's service manager.
+		if !ctl.Available() {
 			result := serviceUpgradeResult{
 				Status:  "upgraded_restart_pending",
-				Message: "binary replaced, but systemctl not available; manual restart required",
+				Message: "binary replaced, but the service manager is not available; manual restart required",
 				Version: version,
 			}
 			data, _ := json.MarshalIndent(result, "", "  ")
 			return string(data), "", 0, nil
 		}
 
-		cmd := exec.CommandContext(ctx, systemctl, "restart", "plexd.service")
-		if out, err := cmd.CombinedOutput(); err != nil {
+		if err := ctl.Restart(ctx); err != nil {
 			result := serviceUpgradeResult{
 				Status:  "upgraded_restart_failed",
-				Message: fmt.Sprintf("binary replaced, restart failed: %s", strings.TrimSpace(string(out))),
+				Message: fmt.Sprintf("binary replaced, restart failed: %s", err),
 				Version: version,
 			}
 			data, _ := json.MarshalIndent(result, "", "  ")
