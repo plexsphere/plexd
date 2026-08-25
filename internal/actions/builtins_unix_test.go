@@ -5,7 +5,10 @@ package actions
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"testing"
 )
@@ -48,5 +51,35 @@ func TestDiskTotalBytes_EmptyPath(t *testing.T) {
 	// unix.Statfs("") fails with ENOENT, which diskTotalBytes reports as 0.
 	if got := diskTotalBytes(""); got != 0 {
 		t.Errorf("diskTotalBytes(%q) = %d, want 0", "", got)
+	}
+}
+
+// TestReplaceExecutable pins the Unix swap: a single rename over the running
+// executable, which Unix allows, leaving no copy behind.
+func TestReplaceExecutable(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "plexd")
+	tmp := filepath.Join(dir, ".plexd-upgrade-1")
+
+	if err := os.WriteFile(target, []byte("old binary"), 0o755); err != nil {
+		t.Fatalf("WriteFile(target) = %v", err)
+	}
+	if err := os.WriteFile(tmp, []byte("new binary"), 0o755); err != nil {
+		t.Fatalf("WriteFile(tmp) = %v", err)
+	}
+
+	if err := replaceExecutable(tmp, target); err != nil {
+		t.Fatalf("replaceExecutable() = %v", err)
+	}
+
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile(target) = %v", err)
+	}
+	if string(got) != "new binary" {
+		t.Errorf("target = %q, want %q", got, "new binary")
+	}
+	if _, err := os.Stat(target + ".old"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Stat(%q.old) = %v, want os.ErrNotExist: Unix keeps no copy", target, err)
 	}
 }

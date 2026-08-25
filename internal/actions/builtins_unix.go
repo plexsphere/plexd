@@ -2,7 +2,11 @@
 
 package actions
 
-import "golang.org/x/sys/unix"
+import (
+	"os"
+
+	"golang.org/x/sys/unix"
+)
 
 // diskRootPath returns the filesystem path whose capacity diagnostics.collect
 // reports as disk_total.
@@ -33,4 +37,10 @@ func kernelRelease() string {
 // sendReloadSignal asks the process to reload its configuration.
 func sendReloadSignal(pid int) error {
 	return unix.Kill(pid, unix.SIGHUP)
+}
+
+// replaceExecutable installs the verified binary at binaryPath. Unix allows
+// renaming over a running executable, so this is a single atomic rename.
+func replaceExecutable(tmpPath, binaryPath string) error {
+	return os.Rename(tmpPath, binaryPath)
 }
