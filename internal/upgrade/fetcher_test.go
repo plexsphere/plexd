@@ -41,7 +41,15 @@ func recordingServer(t *testing.T, status int) (*httptest.Server, *[]string) {
 	return srv, &paths
 }
 
-func wantAsset() string { return "plexd-linux-" + runtime.GOARCH }
+// wantAsset mirrors assetName through the same goos seam the tests set, so a
+// case that has not called setGOOS still names the host's own asset.
+func wantAsset() string {
+	name := "plexd-" + goos + "-" + runtime.GOARCH
+	if goos == "windows" {
+		name += ".exe"
+	}
+	return name
+}
 
 func TestFetchBinary_RequestPath(t *testing.T) {
 	setGOOS(t, "linux")
@@ -153,25 +161,50 @@ func TestFetchBundle_RequestPath(t *testing.T) {
 	}
 }
 
-func TestFetch_RefusesNonLinux(t *testing.T) {
-	setGOOS(t, "darwin")
-	srv, paths := recordingServer(t, http.StatusOK)
-	f := NewFetcher(Config{ReleaseBaseURL: srv.URL})
-
-	if _, err := f.FetchBinary(context.Background(), "0.2.0"); err == nil {
-		t.Error("FetchBinary() = nil, want refusal on darwin")
-	} else if !strings.Contains(err.Error(), "darwin") {
-		t.Errorf("FetchBinary() error = %q, want to contain %q", err.Error(), "darwin")
+// TestFetch_AssetNamePerPlatform pins the asset the fetcher asks for on each
+// host. The release workflow has published macOS and Windows assets since #78,
+// so the fetcher downloads the one for the platform it runs on rather than
+// refusing anything but Linux. Windows assets carry the .exe suffix, in the
+// binary's name and in its bundle's.
+func TestFetch_AssetNamePerPlatform(t *testing.T) {
+	tests := []struct {
+		goos      string
+		wantAsset string
+	}{
+		{goos: "linux", wantAsset: "plexd-linux-" + runtime.GOARCH},
+		{goos: "darwin", wantAsset: "plexd-darwin-" + runtime.GOARCH},
+		{goos: "windows", wantAsset: "plexd-windows-" + runtime.GOARCH + ".exe"},
 	}
 
-	if _, err := f.FetchBundle(context.Background(), "0.2.0"); err == nil {
-		t.Error("FetchBundle() = nil, want refusal on darwin")
-	} else if !strings.Contains(err.Error(), "darwin") {
-		t.Errorf("FetchBundle() error = %q, want to contain %q", err.Error(), "darwin")
-	}
+	for _, tt := range tests {
+		t.Run(tt.goos, func(t *testing.T) {
+			setGOOS(t, tt.goos)
+			srv, paths := recordingServer(t, http.StatusOK)
+			f := NewFetcher(Config{ReleaseBaseURL: srv.URL})
 
-	if len(*paths) != 0 {
-		t.Errorf("server received %d requests, want 0", len(*paths))
+			rc, err := f.FetchBinary(context.Background(), "0.2.0")
+			if err != nil {
+				t.Fatalf("FetchBinary() = %v, want nil on %s", err, tt.goos)
+			}
+			if _, err := io.ReadAll(rc); err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			_ = rc.Close()
+
+			if _, err := f.FetchBundle(context.Background(), "0.2.0"); err != nil {
+				t.Fatalf("FetchBundle() = %v, want nil on %s", err, tt.goos)
+			}
+
+			want := []string{"/v0.2.0/" + tt.wantAsset, "/v0.2.0/" + tt.wantAsset + ".sigstore.json"}
+			if len(*paths) != len(want) {
+				t.Fatalf("server received %d requests (%v), want %d", len(*paths), *paths, len(want))
+			}
+			for i, w := range want {
+				if (*paths)[i] != w {
+					t.Errorf("request %d path = %q, want %q", i, (*paths)[i], w)
+				}
+			}
+		})
 	}
 }
 
