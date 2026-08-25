@@ -27,7 +27,7 @@ func runUninstall(cmd *cobra.Command, _ []string) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	cfg := packaging.InstallConfig{}
-	installer := packaging.NewInstaller(cfg, packaging.NewSystemdController(), packaging.NewRootChecker(), logger)
+	installer := packaging.NewInstaller(cfg, packaging.NewServiceManager(logger), packaging.NewRootChecker(), logger)
 
 	if err := installer.Uninstall(purge); err != nil {
 		return fmt.Errorf("plexd uninstall: %w", err)
