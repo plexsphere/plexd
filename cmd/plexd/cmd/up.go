@@ -72,7 +72,30 @@ func init() {
 	rootCmd.AddCommand(upCmd)
 }
 
+// runUp resolves the context the agent runs under and hands it to runAgent,
+// unless the process was started by the host's service manager as a service. On
+// Windows that means the Service Control Manager, which needs the status
+// protocol runAsService implements; everywhere else runAsService declines and
+// the agent runs in the foreground, which is what a systemd or launchd daemon
+// is.
 func runUp(cmd *cobra.Command, _ []string) error {
+	// The command's context is the parent, so a caller that owns one can shut
+	// the daemon down without a signal. Under Execute that context is always
+	// non-nil; a direct call (a test) may leave it unset.
+	parent := cmd.Context()
+	if parent == nil {
+		parent = context.Background()
+	}
+
+	if handled, err := runAsService(runAgent); handled {
+		return err
+	}
+	return runAgent(parent)
+}
+
+// runAgent is the agent itself, from the configuration load to the last log
+// line. It ends when ctx is cancelled.
+func runAgent(ctx context.Context) error {
 	// 1. Parse config and merge the flag and environment overrides on top.
 	cfg, cfgFound, err := loadMergedConfig(cfgFile)
 	if err != nil {
@@ -131,15 +154,9 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	// 4. Register (or load existing identity).
 	registrar := newRegistrar(client, cfg.Registration, logger)
 
-	// The command's context is the parent, so a caller that owns one can shut the
-	// daemon down without a signal. Under Execute that context is always
-	// non-nil; a direct call (a test) may leave it unset, which NotifyContext
-	// would panic on.
-	parent := cmd.Context()
-	if parent == nil {
-		parent = context.Background()
-	}
-	ctx, stop := signal.NotifyContext(parent, syscall.SIGTERM, syscall.SIGINT)
+	// Under a service manager no signal arrives and this call is harmless; in
+	// the foreground it is how Ctrl-C and systemd's SIGTERM reach the drain.
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
 	// Wait group for all goroutines.
@@ -1389,7 +1406,14 @@ func setupLogger(level string) *slog.Logger {
 	default:
 		lvl = slog.LevelInfo
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+	return slog.New(newLogHandler(lvl))
+}
+
+// newLogHandler builds the handler setupLogger writes through. It is a var so
+// the Windows service entry can redirect the daemon's output to the Event Log,
+// which is the only sink a process without a console has.
+var newLogHandler = func(lvl slog.Level) slog.Handler {
+	return slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
 }
 
 // imdsBaseURL is the link-local address of the cloud instance metadata service.
