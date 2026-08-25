@@ -68,7 +68,7 @@ Code that only builds on some operating systems lives in its own file, tagged by
 
 | Tag | File suffix | Used for | Examples |
 |---|---|---|---|
-| `//go:build linux` / `//go:build !linux` | `_linux.go` / `_other.go` | Controllers that exist only on Linux, paired with a stub elsewhere | `cmd/plexd/cmd/up_linux.go`, `cmd/plexd/cmd/up_other.go`, `internal/nodeapi/socket_perms_other.go` |
+| `//go:build linux` / `//go:build darwin` / `//go:build !linux && !darwin` | `_linux.go` / `_darwin.go` / `_other.go` | Controllers with a per-OS implementation, paired with a stub on the platforms that have none yet | `cmd/plexd/cmd/up_linux.go`, `cmd/plexd/cmd/up_darwin.go`, `cmd/plexd/cmd/up_other.go`, `internal/wireguard/controller_linux.go`, `internal/wireguard/controller_darwin.go`, `internal/nodeapi/socket_perms_other.go` |
 | `//go:build unix` / `//go:build windows` | `_unix.go` / `_windows.go` | Syscall helpers that Linux and macOS share | `internal/actions/builtins_unix.go`, `internal/actions/builtins_windows.go`, `internal/packaging/root_unix.go`, `internal/packaging/root_windows.go`, `cmd/plexd/cmd/service_unix.go`, `cmd/plexd/cmd/service_windows.go`, `internal/wireguard/uapi_unix.go`, `internal/wireguard/uapi_windows.go` |
 | `//go:build unix && !darwin` / `//go:build darwin` / `//go:build windows` | `_unix.go` / `_darwin.go` / `_windows.go` | Values every Unix but macOS shares, with macOS and Windows each answering for itself | `internal/paths/paths_unix.go`, `internal/paths/paths_darwin.go`, `internal/paths/paths_windows.go`, `internal/packaging/defaults_unix.go`, `internal/packaging/defaults_darwin.go`, `internal/packaging/defaults_windows.go` |
 
@@ -102,6 +102,7 @@ Most tests run on all three platforms. A test that cannot is constrained, never 
 | A test checks a mode alongside other things | Wrap only the mode assertion in `if runtime.GOOS != "windows"`, so the rest still runs |
 | A test binds a Unix socket | Use the package's `shortSocketPath(t)` helper |
 | The test would install or register a real service on a privileged runner | Skip when `packaging.NewRootChecker().IsRoot()` is true (`cmd/plexd/cmd/install_test.go`) |
+| The test creates a real utun, which needs root | Skip unless `os.Geteuid() == 0` (`internal/wireguard/controller_darwin_test.go`, `TestDarwinController_RealUTUN`). CI runs it in its own privileged step on the macOS runner; locally, `sudo go test -run TestDarwinController_RealUTUN ./internal/wireguard/` |
 
 Hooks are discovered by their executable bit and executed directly, so they are `#!/bin/sh` scripts; Windows has neither the mode bit nor the interpreter. Windows reports `0666` or `0777` from `Mode().Perm()`, `os.Chmod` there only toggles the read-only attribute, and a read-only directory still accepts writes, so a test that injects a failure that way cannot work.
 
