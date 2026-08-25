@@ -54,6 +54,19 @@ jobs:
       - name: Run unit tests
         run: go test -race -count=1 ./...
 
+      # Creating a utun device needs root, so the macOS WireGuard controller's
+      # one test against the real kernel skips in the unprivileged run above.
+      # The absolute go path is resolved before sudo resets PATH, and the two
+      # cache variables let root reuse what the step above downloaded and built
+      # instead of filling a second cache under /var/root. -v is what makes a
+      # skip visible in the log rather than passing as a bare ok.
+      - name: Run privileged macOS tests
+        if: runner.os == 'macOS'
+        run: |
+          sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" \
+            "$(command -v go)" test -race -count=1 -v \
+            -run '^TestDarwinController_RealUTUN$' ./internal/wireguard/
+
   integration-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
