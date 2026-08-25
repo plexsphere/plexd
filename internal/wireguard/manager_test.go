@@ -479,3 +479,55 @@ func TestManager_ConfigurePeers_ContextCancellation(t *testing.T) {
 		t.Errorf("error %q does not contain 'context canceled'", err.Error())
 	}
 }
+
+// namingController is a mockController that also reports a kernel interface
+// name, the shape DarwinController has on macOS.
+type namingController struct {
+	mockController
+	osName string
+	found  bool
+}
+
+func (c *namingController) OSInterfaceName(string) (string, bool) {
+	return c.osName, c.found
+}
+
+func TestManager_OSInterfaceName_Default(t *testing.T) {
+	mgr := NewManager(&mockController{}, Config{}, discardLogger())
+
+	// mockController does not implement OSInterfaceNamer, so the configured
+	// name stands. This is the Linux case.
+	if got := mgr.OSInterfaceName(); got != "plexd0" {
+		t.Errorf("OSInterfaceName() = %q, want %q", got, "plexd0")
+	}
+}
+
+func TestManager_OSInterfaceName_Mapped(t *testing.T) {
+	ctrl := &namingController{osName: "utun3", found: true}
+	mgr := NewManager(ctrl, Config{}, discardLogger())
+
+	if got := mgr.OSInterfaceName(); got != "utun3" {
+		t.Errorf("OSInterfaceName() = %q, want %q", got, "utun3")
+	}
+}
+
+func TestManager_OSInterfaceName_Unmapped(t *testing.T) {
+	// The controller implements the interface but has no mapping yet: the
+	// interface was never created, or was already deleted.
+	ctrl := &namingController{found: false}
+	mgr := NewManager(ctrl, Config{}, discardLogger())
+
+	if got := mgr.OSInterfaceName(); got != "plexd0" {
+		t.Errorf("OSInterfaceName() = %q, want %q", got, "plexd0")
+	}
+}
+
+func TestManager_OSInterfaceName_NilController(t *testing.T) {
+	// plexd up builds a Manager even where newWGController returns nil, so the
+	// type assertion has to survive a nil controller rather than panic.
+	mgr := NewManager(nil, Config{}, discardLogger())
+
+	if got := mgr.OSInterfaceName(); got != "plexd0" {
+		t.Errorf("OSInterfaceName() = %q, want %q", got, "plexd0")
+	}
+}
