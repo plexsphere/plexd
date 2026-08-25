@@ -88,7 +88,7 @@ plexd join [--token-file /path/to/token]
 
 ### `plexd install`
 
-Install plexd as a systemd service. Requires root privileges.
+Register plexd with the host's service manager. Requires root privileges on Unix and an elevated shell on Windows.
 
 ```
 plexd install [--api-url https://api.example.com] [--token TOKEN] [--token-file /path]
@@ -100,11 +100,27 @@ plexd install [--api-url https://api.example.com] [--token TOKEN] [--token-file 
 | `--token`      | —       | Bootstrap token value            |
 | `--token-file` | —       | Path to bootstrap token file     |
 
+What is registered, and what "registered" means, differs per platform:
+
+| Platform | What is registered                                                | State afterwards                          |
+|----------|-------------------------------------------------------------------|-------------------------------------------|
+| Linux    | a systemd unit at `/etc/systemd/system/plexd.service`             | written, not enabled                      |
+| macOS    | a LaunchDaemon plist at `/Library/LaunchDaemons/com.plexsphere.plexd.plist`, plus a newsyslog rotation rule | loaded by launchd at the next boot        |
+| Windows  | a Windows service `plexd` with automatic start, plus the Event Log source `plexd` | started at the next boot                  |
+
+The service is never started by the install itself: `--api-url` is optional, so an install can legitimately precede a usable configuration. Start it now with one of:
+
+```sh
+systemctl enable --now plexd                                                    # Linux
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.plexsphere.plexd.plist  # macOS
+sc start plexd                                                                  # Windows
+```
+
 **Exit codes:** 0 on success, 1 on error.
 
 ### `plexd uninstall`
 
-Remove the plexd systemd service. Requires root privileges.
+Stop and unregister the plexd system service on every platform, then remove the binary. Requires root privileges on Unix and an elevated shell on Windows.
 
 ```
 plexd uninstall [--purge]
@@ -113,6 +129,8 @@ plexd uninstall [--purge]
 | Flag      | Default | Description                               |
 |-----------|---------|-------------------------------------------|
 | `--purge` | `false` | Also remove data and config directories   |
+
+On Windows the binary is a running image whenever `plexd uninstall` runs from the installed path, and Windows refuses to delete one. It is renamed to `plexd.exe.old` and removed at the next reboot.
 
 **Exit codes:** 0 on success, 1 on error.
 
@@ -279,7 +297,7 @@ plexd actions run restart-service --param name=nginx --param force=true
 | `diagnostics.collect` | Collect system diagnostics (CPU, memory, disk, network) | `include_network`, `include_processes` |
 | `diagnostics.ping_peer` | Ping a mesh peer and report latency | `peer_id` (required), `count` |
 | `diagnostics.traceroute_peer` | Traceroute to a mesh peer | `peer_id` (required), `max_hops` |
-| `service.restart` | Restart plexd via systemctl | — |
+| `service.restart` | Ask the host's service manager to restart plexd | — |
 | `service.reload_config` | Send SIGHUP to reload config (Unix only; fails on Windows) | — |
 | `service.upgrade` | Download a release binary, verify its checksum and Sigstore bundle, then swap and restart | `version` (required), `checksum` (required) |
 | `system.info` | Report OS, kernel, hardware, and runtime info | — |

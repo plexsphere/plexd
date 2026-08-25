@@ -49,8 +49,11 @@ plexd resolves its configuration, data and runtime directories from the host it 
 | `actions.hooks_dir` | `/etc/plexd/hooks` | `/Library/Application Support/plexd/hooks` | `%ProgramData%\plexd\hooks` |
 | `node_api.socket_path` | `/var/run/plexd/api.sock` | `/var/run/plexd/api.sock` | `%ProgramData%\plexd\run\api.sock` |
 | Runtime directory (`plexd install`) | `/var/run/plexd` | `/var/run/plexd` | `%ProgramData%\plexd\run` |
+| Binary (`plexd install`) | `/usr/local/bin/plexd` | `/usr/local/bin/plexd` | `%ProgramFiles%\plexd\plexd.exe` |
+| Service definition | `/etc/systemd/system/plexd.service` | `/Library/LaunchDaemons/com.plexsphere.plexd.plist` | SCM service `plexd` (no file) |
+| Service log | journald | `/Library/Logs/plexd/plexd.log` | Application Event Log, source `plexd` |
 
-`%ProgramData%` is the `ProgramData` environment variable, which Windows sets for every process including services. plexd falls back to `C:\ProgramData` when it is unset or empty.
+`%ProgramData%` is the `ProgramData` environment variable, which Windows sets for every process including services. plexd falls back to `C:\ProgramData` when it is unset or empty. `%ProgramFiles%` is read the same way, with `C:\Program Files` as its fallback.
 
 macOS resolves the system locations only, with no per-user fallback under `~/Library`. The CLI reaches the node API socket without knowing who started the daemon, so a per-user runtime directory would send `plexd status` looking for a socket a root daemon never created. An unprivileged macOS run sets `--config` and `data_dir` itself.
 
