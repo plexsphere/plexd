@@ -39,7 +39,7 @@ if err := cfg.Validate(); err != nil {
 
 ## WGController
 
-Interface abstracting OS-level WireGuard operations. The Linux implementation is `NetlinkController` (`controller_linux.go`); macOS and Windows build theirs on the userspace backend below.
+Interface abstracting OS-level WireGuard operations. The Linux implementation is `NetlinkController` (`controller_linux.go`); the macOS implementation is `DarwinController` (`controller_darwin.go`), built on the userspace backend below; Windows builds its own on the same backend.
 
 ```go
 type WGController interface {
@@ -81,6 +81,44 @@ The backend serves the WireGuard UAPI for each device so `wg show` and any `wgct
 Configuration is applied in process through the device's UAPI text protocol (`device.Device.IpcSet`), not through `wgctrl`. `wgctrl`'s userspace transport reaches a device only through a root-owned socket directory on Unix and a LocalSystem-owned named pipe on Windows, so it cannot configure the device from an unprivileged test; the in-process path is the same in production and under test on all three platforms. The served endpoint still lets `wgctrl` and `wg(8)` read the device.
 
 wireguard-go's own log lines are adapted to plexd's `slog.Logger`, appearing at `debug` and `error` with `component=wireguard`. Private keys and preshared keys are never logged.
+
+## macOS controller
+
+`DarwinController` (`internal/wireguard/controller_darwin.go`) is the `WGController` on macOS. It creates the tun device, hands it to the userspace backend, and programs the address, the on-link route, the MTU and the interface flag with `/sbin/ifconfig` and `/sbin/route`. Absolute paths, because launchd starts the daemon with a minimal environment.
+
+`plexd up` must run as root on macOS: creating a utun device is privileged. Without it `CreateInterface` fails with `wireguard: create interface: create utun: operation not permitted (creating a utun device requires root)`, `plexd up` logs `wireguard setup failed, continuing without WireGuard`, and the agent runs on without a tunnel. The launchd daemon `plexd install` registers already runs as root.
+
+### The utunN name
+
+macOS names a WireGuard device `utunN` and accepts no other name. `tun.CreateTUN` is asked for `utun`, which lets the kernel pick the next free unit; an `interface_name` that already names a unit (`utun7`) is passed through, so an operator can pin one.
+
+Everything addressed through plexd keeps the configured name: the backend's device key, the UAPI socket (`wg show plexd0`), the policy chain, the bridge managers and the `status.mesh` report. The kernel name is used for the `ifconfig` and `route` calls, and for the readiness check, which resolves it through `Manager.OSInterfaceName()` because `net.InterfaceByName` knows only `utunN`.
+
+The pairing is logged once per interface, at `info`:
+
+```
+utun device created  component=wireguard interface=plexd0 utun=utun4
+```
+
+`address configured`, `mtu configured`, `interface brought up`, `route already exists` and `utun device released` carry the same `interface` and `utun` keys at `debug`.
+
+### Commands
+
+| Method | Command |
+|---|---|
+| `ConfigureAddress` (IPv4) | `ifconfig utunN inet 10.0.0.5/16 10.0.0.5 alias`, then `route -n add -inet 10.0.0.0/16 -interface utunN` |
+| `ConfigureAddress` (IPv6) | `ifconfig utunN inet6 fd00::5/64 alias`, then `route -n add -inet6 fd00::/64 -interface utunN` |
+| `SetMTU` | `ifconfig utunN mtu 1380` |
+| `SetInterfaceUp` | `ifconfig utunN up` |
+| `DeleteInterface` | none |
+
+A utun is point-to-point, so the `inet` form takes the destination address after the local one, and the alias installs a host route only. Linux gets the route for the whole prefix implicitly when the address is added, so `ConfigureAddress` adds it here explicitly; otherwise every packet for a mesh peer would leave through the default route. A `/32` or `/128` needs no route, since the alias already installed it. Routes for peer `AllowedIPs` beyond the address prefix belong to the bridge route controller, as they do on Linux.
+
+`route(8)` reports an existing route as `File exists`, which the controller treats as success, matching the idempotency `NetlinkRouteController` grants `EEXIST`.
+
+`DeleteInterface` runs no command: closing the device closes the tun, and the kernel then destroys the `utunN` with its addresses and routes.
+
+A `Config.MTU` of `0` leaves the device at wireguard-go's `device.DefaultMTU` of 1420, the same value the Linux kernel gives a WireGuard link, so "system default" means the same on both platforms.
 
 ## PeerConfig
 
@@ -144,6 +182,7 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 |-----------------|------------------------------------------------------------------------------|----------------------------------------------------------------|
 | `Setup`         | `(ctx context.Context, identity *registration.NodeIdentity) error`           | Creates interface, assigns the mesh IP with the `domain_mesh_cidr` prefix (fallback `/32`), sets MTU if > 0, brings up |
 | `Teardown`      | `() error`                                                                   | Deletes the WireGuard interface                                |
+| `OSInterfaceName` | `() string`                                                                | The name the OS knows the interface by (`utunN` on macOS), else `Config.InterfaceName` |
 | `AddPeer`       | `(peer api.Peer) error`                                                      | Translates and adds peer; updates index                        |
 | `RemovePeer`    | `(publicKey []byte) error`                                                   | Removes peer by raw public key                                 |
 | `RemovePeerByID`| `(peerID string) error`                                                      | Resolves ID via index, removes peer, cleans index              |
@@ -184,7 +223,7 @@ if err := mgr.Teardown(); err != nil {
 ### Setup Sequence
 
 1. `CreateInterface(name, privateKey, listenPort)` — create WireGuard interface with node's private key
-2. `ConfigureAddress(name, meshIP+"/<prefix>")` — assign the mesh IP. The prefix length comes from the registration `domain_mesh_cidr`, so the kernel installs an on-link route for the whole mesh (which the snapshot peers, advertised as `mesh_ip/32`, rely on). Identities without the field, or with an unparseable value, fall back to a host `/32` (the unparseable case is logged as a warning)
+2. `ConfigureAddress(name, meshIP+"/<prefix>")` — assign the mesh IP. The prefix length comes from the registration `domain_mesh_cidr`, so the kernel installs an on-link route for the whole mesh (which the snapshot peers, advertised as `mesh_ip/32`, rely on). Identities without the field, or with an unparseable value, fall back to a host `/32` (the unparseable case is logged as a warning). On macOS the on-link route is not implicit and `DarwinController` installs it explicitly (see [macOS controller](#macos-controller))
 3. `SetMTU(name, mtu)` — only if `Config.MTU > 0`
 4. `SetInterfaceUp(name)` — bring the interface up
 
