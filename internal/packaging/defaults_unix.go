@@ -2,6 +2,8 @@
 
 package packaging
 
+import "log/slog"
+
 // The install paths on every Unix but macOS, unchanged from what plexd shipped
 // before it resolved them per platform.
 //
@@ -15,3 +17,8 @@ func defaultUnitFilePath() string { return "/etc/systemd/system/plexd.service" }
 
 // defaultLogDir is empty because journald keeps the daemon's output.
 func defaultLogDir() string { return "" }
+
+// NewServiceManager returns the host's own service manager.
+func NewServiceManager(logger *slog.Logger) ServiceManager {
+	return NewSystemdManager(NewSystemdController(), logger)
+}

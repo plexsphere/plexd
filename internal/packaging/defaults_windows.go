@@ -3,6 +3,7 @@
 package packaging
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -30,3 +31,8 @@ func defaultUnitFilePath() string { return "" }
 // defaultLogDir is empty because the service writes to the Application Event
 // Log under source plexd.
 func defaultLogDir() string { return "" }
+
+// NewServiceManager returns the host's own service manager.
+func NewServiceManager(logger *slog.Logger) ServiceManager {
+	return NewSCMManager(logger)
+}
