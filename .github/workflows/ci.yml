@@ -67,6 +67,19 @@ jobs:
             "$(command -v go)" test -race -count=1 -v \
             -run '^TestDarwinController_RealUTUN$' ./internal/wireguard/
 
+      # Creating a Wintun adapter needs the driver DLL and Administrator. The
+      # Windows runner is already elevated, so the gate is this variable rather
+      # than the privilege check: without one the test would also run inside the
+      # ordinary step above and create a real adapter there. The test writes the
+      # embedded wintun.dll beside its own binary, so nothing has to be fetched.
+      - name: Run real Wintun tests
+        if: runner.os == 'Windows'
+        env:
+          PLEXD_TEST_REAL_WINTUN: '1'
+        run: >-
+          go test -race -count=1 -v
+          -run '^TestWindowsController_RealWintun$' ./internal/wireguard/
+
   integration-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
