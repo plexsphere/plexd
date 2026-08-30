@@ -314,7 +314,7 @@ WireGuard interface and peer management. See [WireGuard Tunnel Management](../ne
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `interface_name` | string | `plexd0` | Name of the WireGuard interface. On macOS the kernel names the device `utunN`; this value still keys the device, its UAPI socket (`wg show plexd0`) and the log lines, and a value of the form `utunN` requests that unit. See [macOS controller](../networking/wireguard.md#macos-controller) |
+| `interface_name` | string | `plexd0` | Name of the WireGuard interface. On macOS the kernel names the device `utunN`; this value still keys the device, its UAPI socket (`wg show plexd0`) and the log lines, and a value of the form `utunN` requests that unit. See [macOS controller](../networking/wireguard.md#macos-controller). On Windows the value names the Wintun adapter itself, and its GUID is derived from it: see [Windows controller](../networking/wireguard.md#windows-controller) |
 | `listen_port` | int | `51820` | UDP listen port for WireGuard |
 | `mtu` | int | `0` | MTU for the WireGuard interface. `0` means use system default. |
 
