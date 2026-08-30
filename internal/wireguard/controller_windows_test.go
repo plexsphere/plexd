@@ -687,7 +687,7 @@ func TestWindowsController_RealWintun(t *testing.T) {
 		t.Fatalf("SetInterfaceUp: %v", err)
 	}
 
-	pipe := `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\` + name
+	pipe := uapiPipePrefix + name
 	dump := uapiGet(t, pipe)
 	if !strings.Contains(dump, "listen_port=") {
 		t.Errorf("uapi dump = %q, want a listen_port= line", dump)
