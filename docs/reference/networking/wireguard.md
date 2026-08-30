@@ -39,7 +39,7 @@ if err := cfg.Validate(); err != nil {
 
 ## WGController
 
-Interface abstracting OS-level WireGuard operations. The Linux implementation is `NetlinkController` (`controller_linux.go`); the macOS implementation is `DarwinController` (`controller_darwin.go`), built on the userspace backend below; Windows builds its own on the same backend.
+Interface abstracting OS-level WireGuard operations. The Linux implementation is `NetlinkController` (`controller_linux.go`); the macOS implementation is `DarwinController` (`controller_darwin.go`) and the Windows one is `WindowsController` (`controller_windows.go`), both built on the userspace backend below.
 
 ```go
 type WGController interface {
@@ -119,6 +119,39 @@ A utun is point-to-point, so the `inet` form takes the destination address after
 `DeleteInterface` runs no command: closing the device closes the tun, and the kernel then destroys the `utunN` with its addresses and routes.
 
 A `Config.MTU` of `0` leaves the device at wireguard-go's `device.DefaultMTU` of 1420, the same value the Linux kernel gives a WireGuard link, so "system default" means the same on both platforms.
+
+## Windows controller
+
+`WindowsController` (`internal/wireguard/controller_windows.go`) is the `WGController` on Windows. It creates a Wintun adapter, hands it to the userspace backend, and programs the address and the MTU through the IP Helper API (`CreateUnicastIpAddressEntry` and `SetIpInterfaceEntry`, via `golang.zx2c4.com/wireguard/windows`'s `winipcfg`). Interfaces are addressed by the adapter's LUID, not by name, so nothing depends on the host's display language.
+
+plexd must run as Administrator on Windows: creating a Wintun adapter is privileged. Without it `CreateInterface` fails with `wireguard: create interface: create plexd0: Access is denied. (creating a Wintun adapter requires Administrator)`, `plexd up` logs `wireguard setup failed, continuing without WireGuard`, and the agent runs on without a tunnel. The service `plexd install` registers already runs as LocalSystem.
+
+The adapter carries the configured `interface_name`, so `net.InterfaceByName` and the readiness check resolve it directly and there is no kernel-name indirection of the kind macOS needs. Its GUID is derived from that name, which keeps Windows from registering a new network profile, and applying that profile's firewall category, on every restart. Adapters are registered under the tunnel type `plexd`.
+
+### The driver
+
+Wintun is not part of Windows, and its loader searches only the executable's own directory and System32. `internal/wintundll` carries the signed `wintun.dll` (0.14.1) inside the plexd binary, one architecture per build, and writes it beside `plexd.exe` before the first adapter is created; a file that already matches is left alone. That keeps the release a single `.exe`, so `service.upgrade` still replaces one file and carries a newer driver with it. The driver's licence is committed at `internal/wintundll/LICENSE`.
+
+A missing driver surfaces as `wireguard: create interface: create plexd0: The specified module could not be found. (wintun.dll is missing beside plexd.exe)`.
+
+### Addresses, MTU and the interface flag
+
+| Method | What it does |
+|---|---|
+| `ConfigureAddress` | `CreateUnicastIpAddressEntry` with the prefix length; no route call |
+| `SetMTU` | `SetIpInterfaceEntry` for IPv4 and IPv6, then `ForceMTU` on the running device |
+| `SetInterfaceUp` | nothing |
+| `DeleteInterface` | nothing beyond closing the device |
+
+The address carries its own prefix length, and Windows installs the on-link route for that prefix itself, the way Linux does when an address is added. macOS is the exception that needs the route added by hand. Routes for peer `AllowedIPs` beyond the address prefix belong to the bridge route controller, as they do everywhere else. An address already on the adapter is reported as `ERROR_OBJECT_ALREADY_EXISTS`, which the controller treats as success.
+
+The MTU is programmed twice over an interface's life: once at creation, to 1420, and again whenever the configuration asks for another value. Creating the adapter records the MTU in wireguard-go's own field without telling the interface, and no OS event ever reports an MTU change back on Windows, so the controller both programs the interface and pushes the value to the running device. A `Config.MTU` of `0` therefore still means 1420, as it does on Linux and macOS.
+
+`SetInterfaceUp` runs nothing: a Wintun adapter's media state is connected from the moment its session starts inside `CreateTUN`. `DeleteInterface` runs nothing either, because closing the device closes the tun, which ends the session and closes the adapter; Windows then removes it with its addresses and routes. The adapter is scoped to the handles that own it, so it also disappears if the process dies without a clean shutdown.
+
+The UAPI named pipe is `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<name>`, so `wg show plexd0` works against the running service.
+
+Until the Windows firewall controller lands, Windows Defender Firewall may drop unsolicited inbound handshakes on the listen port. Handshakes plexd initiates are unaffected, so a node behind it still reaches peers that are reachable.
 
 ## PeerConfig
 

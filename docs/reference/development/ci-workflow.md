@@ -49,10 +49,13 @@ Runs all tests with race detection and cache disabled, once per platform.
 | Setup Go       | `actions/setup-go@v5` (`go-version: '1.26'`)| Install Go with module caching          |
 | Run unit tests | `go test -race -count=1 ./...`              | Execute all tests, detect data races     |
 | Run privileged macOS tests | `sudo env GOMODCACHE=… GOCACHE=… "$(command -v go)" test -race -count=1 -v -run '^TestDarwinController_RealUTUN$' ./internal/wireguard/` (macOS only) | Create a real utun as root and verify its address, route, UAPI socket and cleanup |
+| Run real Wintun tests | `go test -race -count=1 -v -run '^TestWindowsController_RealWintun$' ./internal/wireguard/` (Windows only, with `PLEXD_TEST_REAL_WINTUN=1`) | Create a real Wintun adapter and verify its address, MTU, UAPI pipe and cleanup |
 
 The `-count=1` flag disables test caching to ensure every CI run exercises all tests. The `-race` flag enables the Go race detector.
 
 The privileged step is gated on `if: runner.os == 'macOS'` and runs only there. Creating a utun device needs root, so the macOS WireGuard controller's one test against the real kernel skips in the unprivileged run and would otherwise never execute. `sudo` resets the environment, so the step passes the module and build caches through `sudo env` and resolves the toolchain with `$(command -v go)` before `sudo` replaces `PATH`; root then reuses what the previous step downloaded and built. `-v` is what makes a skip visible in the log rather than passing as a bare `ok`.
+
+The Wintun step is the Windows counterpart, gated on `if: runner.os == 'Windows'`. It needs no `sudo`: that runner is already elevated, which is why the test's own gate is `PLEXD_TEST_REAL_WINTUN` rather than a privilege check. Without a separate variable the test would also run inside `Run unit tests` and create a real adapter there. The test writes the embedded `wintun.dll` beside its own binary, so the step fetches nothing, and `-v` makes a skip visible here too.
 
 ::: v-pre
 **Matrix strategy:** the job sets `runs-on: ${{ matrix.os }}` over three labels, producing the jobs `unit-test (ubuntu-latest)`, `unit-test (windows-latest)` and `unit-test (macos-latest)`.
