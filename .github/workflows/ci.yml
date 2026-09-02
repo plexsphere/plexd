@@ -54,18 +54,20 @@ jobs:
       - name: Run unit tests
         run: go test -race -count=1 ./...
 
-      # Creating a utun device needs root, so the macOS WireGuard controller's
-      # one test against the real kernel skips in the unprivileged run above.
-      # The absolute go path is resolved before sudo resets PATH, and the two
-      # cache variables let root reuse what the step above downloaded and built
-      # instead of filling a second cache under /var/root. -v is what makes a
-      # skip visible in the log rather than passing as a bare ok.
+      # Creating a utun device needs root, and so do altering the routing table
+      # and the forwarding sysctl, so the two macOS tests against the real
+      # kernel skip in the unprivileged run above. The absolute go path is
+      # resolved before sudo resets PATH, and the two cache variables let root
+      # reuse what the step above downloaded and built instead of filling a
+      # second cache under /var/root. -v is what makes a skip visible in the
+      # log rather than passing as a bare ok.
       - name: Run privileged macOS tests
         if: runner.os == 'macOS'
         run: |
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" \
             "$(command -v go)" test -race -count=1 -v \
-            -run '^TestDarwinController_RealUTUN$' ./internal/wireguard/
+            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real)$' \
+            ./internal/wireguard/ ./internal/bridge/
 
       # Creating a Wintun adapter needs the driver DLL and Administrator. The
       # Windows runner is already elevated, so the gate is this variable rather
@@ -79,6 +81,18 @@ jobs:
         run: >-
           go test -race -count=1 -v
           -run '^TestWindowsController_RealWintun$' ./internal/wireguard/
+
+      # Adding a route and toggling an adapter's forwarding flag need
+      # Administrator. The runner has it, so the gate is this variable for the
+      # same reason as above: without one the test would alter the runner's
+      # routing table from inside the ordinary step.
+      - name: Run real route tests
+        if: runner.os == 'Windows'
+        env:
+          PLEXD_TEST_REAL_ROUTES: '1'
+        run: >-
+          go test -race -count=1 -v
+          -run '^TestWindowsRouteController_Real$' ./internal/bridge/
 
   integration-test:
     runs-on: ubuntu-latest
