@@ -5,6 +5,7 @@ package cmd
 import (
 	"testing"
 
+	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
@@ -26,6 +27,18 @@ func TestNewWGController_Windows(t *testing.T) {
 	}
 }
 
+func TestNewRouteController_Windows(t *testing.T) {
+	logger := discardLogger()
+
+	ctrl := newRouteController(logger)
+	if ctrl == nil {
+		t.Fatal("newRouteController() = nil, want the IP Helper controller on Windows")
+	}
+	if _, ok := ctrl.(*bridge.WindowsRouteController); !ok {
+		t.Errorf("newRouteController() = %T, want *bridge.WindowsRouteController", ctrl)
+	}
+}
+
 // TestNewControllers_WindowsStubs pins the subsystems Windows does not have
 // yet, so the sibling that implements one has to flip its stub deliberately.
 func TestNewControllers_WindowsStubs(t *testing.T) {
@@ -39,9 +52,6 @@ func TestNewControllers_WindowsStubs(t *testing.T) {
 	}
 	if c := newFirewallController(logger); c != nil {
 		t.Errorf("newFirewallController() = %v, want nil until #11", c)
-	}
-	if c := newRouteController(logger); c != nil {
-		t.Errorf("newRouteController() = %v, want nil until #10", c)
 	}
 	if c := newAccessController(logger); c != nil {
 		t.Errorf("newAccessController() = %v, want nil until #12", c)
