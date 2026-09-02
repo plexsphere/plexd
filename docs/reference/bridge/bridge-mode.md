@@ -68,7 +68,7 @@ Validation is skipped entirely when `Enabled` is `false`.
 
 ## RouteController
 
-Interface abstracting OS-level routing and forwarding operations. The production implementation (netlink/sysctl/iptables) is provided externally; this package defines and consumes the interface.
+Interface abstracting OS-level routing and forwarding operations. The package has three production implementations: [`NetlinkRouteController`](./netlink-route-controller.md) on Linux (`route_linux.go`), and `DarwinRouteController` and `WindowsRouteController` on macOS and Windows (`route_darwin.go`, `route_windows.go`, described in [macOS & Windows Route Controllers](./route-controllers-macos-windows.md)).
 
 ```go
 type RouteController interface {
@@ -76,10 +76,17 @@ type RouteController interface {
     DisableForwarding(meshIface, accessIface string) error
     AddRoute(subnet, iface string) error
     RemoveRoute(subnet, iface string) error
+
+    NATController
+}
+
+type NATController interface {
     AddNATMasquerade(iface string) error
     RemoveNATMasquerade(iface string) error
 }
 ```
+
+The NAT methods are a separate interface because the macOS and Windows controllers do not implement them: pf and the Windows Filtering Platform own those rules, so both delegate to a backend passed to their constructor.
 
 | Method               | Description                                                |
 |----------------------|------------------------------------------------------------|
@@ -91,6 +98,8 @@ type RouteController interface {
 | `RemoveNATMasquerade`| Removes NAT masquerading from the given interface          |
 
 All methods must be idempotent: repeating an already-applied operation returns `nil`.
+
+`AddNATMasquerade` returns an error wrapping `ErrNATUnavailable` on a platform whose controller was built without a NAT backend, which is macOS and Windows today. Set `enable_nat: false` there.
 
 ## Manager
 
