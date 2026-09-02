@@ -397,9 +397,9 @@ Gateway bridge mode operation. Active when `mode: bridge` and `bridge.enabled: t
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable bridge mode |
-| `access_interface` | string | `eth1` | Access-side network interface |
+| `access_interface` | string | `eth1` | Access-side network interface. The kernel name on Linux and macOS (`eth1`, `en1`); on Windows the adapter's friendly name, as `Get-NetAdapter` lists it (`Ethernet`) |
 | `access_subnets` | []string | — | Subnets routable via the access interface |
-| `enable_nat` | bool | `false` | Enable NAT masquerading on the access interface |
+| `enable_nat` | bool | `true` | Enable NAT masquerading on the access interface. On macOS and Windows NAT needs the firewall controller, which does not exist yet: set `false` there, or bridge setup fails with `NAT masquerade is not available on this platform`. See [macOS & Windows Route Controllers](../bridge/route-controllers-macos-windows.md#nat) |
 | `relay_enabled` | bool | `false` | Enable UDP relay for NAT traversal |
 | `relay_listen_port` | int | `51821` | Relay UDP listen port |
 | `max_relay_sessions` | int | `100` | Maximum concurrent relay sessions |

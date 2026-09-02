@@ -8,6 +8,8 @@ feature: PXD-0027
 
 `NetlinkRouteController` is the Linux production implementation of the `RouteController` interface defined in `internal/bridge`. It manages IP routes via netlink, IP forwarding via sysctl, and NAT masquerading via nftables. It requires `CAP_NET_ADMIN` and the `//go:build linux` constraint.
 
+The macOS and Windows implementations are described in [macOS & Windows Route Controllers](./route-controllers-macos-windows.md).
+
 ## Architecture
 
 ```

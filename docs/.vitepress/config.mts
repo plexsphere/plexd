@@ -118,6 +118,7 @@ export default withMermaid(defineConfig({
               { text: 'Site-to-Site VPN', link: '/reference/bridge/site-to-site-vpn' },
               { text: 'Tunnel Providers', link: '/reference/bridge/tunnel-providers' },
               { text: 'Netlink Route Controller', link: '/reference/bridge/netlink-route-controller' },
+              { text: 'macOS & Windows Route Controllers', link: '/reference/bridge/route-controllers-macos-windows' },
             ],
           },
           {
