@@ -5,6 +5,7 @@ package cmd
 import (
 	"testing"
 
+	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
@@ -25,6 +26,18 @@ func TestNewWGController_Darwin(t *testing.T) {
 	}
 }
 
+func TestNewRouteController_Darwin(t *testing.T) {
+	logger := discardLogger()
+
+	ctrl := newRouteController(logger)
+	if ctrl == nil {
+		t.Fatal("newRouteController() = nil, want the route(8) controller on macOS")
+	}
+	if _, ok := ctrl.(*bridge.DarwinRouteController); !ok {
+		t.Errorf("newRouteController() = %T, want *bridge.DarwinRouteController", ctrl)
+	}
+}
+
 // TestNewControllers_DarwinStubs pins the subsystems macOS does not have yet,
 // so the sibling that implements one has to flip its stub deliberately.
 func TestNewControllers_DarwinStubs(t *testing.T) {
@@ -38,9 +51,6 @@ func TestNewControllers_DarwinStubs(t *testing.T) {
 	}
 	if c := newFirewallController(logger); c != nil {
 		t.Errorf("newFirewallController() = %v, want nil until #11", c)
-	}
-	if c := newRouteController(logger); c != nil {
-		t.Errorf("newRouteController() = %v, want nil until #10", c)
 	}
 	if c := newAccessController(logger); c != nil {
 		t.Errorf("newAccessController() = %v, want nil until #12", c)

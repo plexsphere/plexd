@@ -35,10 +35,15 @@ func newFirewallController(_ *slog.Logger) policy.FirewallController {
 	return nil
 }
 
-// newRouteController returns nil until the Windows route controller lands
-// (#10). Bridge mode is unavailable on Windows until then.
-func newRouteController(_ *slog.Logger) bridge.RouteController {
-	return nil
+// newRouteController creates the IP Helper backed controller for bridge
+// routing on Windows. It needs Administrator, which the LocalSystem service
+// satisfies.
+//
+// NAT masquerade has no backend yet — those rules belong to the WFP controller
+// (#11) — so a bridge on Windows needs bridge.enable_nat: false until it
+// lands, and says so when it does not have it.
+func newRouteController(logger *slog.Logger) bridge.RouteController {
+	return bridge.NewWindowsRouteController(logger, nil)
 }
 
 // newAccessController returns nil until the bridge user-access controller
