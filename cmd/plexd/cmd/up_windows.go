@@ -30,20 +30,33 @@ func newWGController(logger *slog.Logger) wireguard.WGController {
 	return wireguard.NewWindowsController(logger)
 }
 
-// newFirewallController returns nil until the WFP controller lands (#11).
-func newFirewallController(_ *slog.Logger) policy.FirewallController {
-	return nil
+// policyCapabilityHint is carried by both firewall-baseline failures. The
+// filter engine answers an unprivileged caller with ERROR_ACCESS_DENIED, whose
+// message is a bare "Access is denied" that names neither the privilege the
+// call wanted nor the setting that turns the whole path off, so the operator's
+// two next steps go in the message rather than in the source.
+const policyCapabilityHint = "policy enforcement needs Administrator, " +
+	"run plexd elevated or as the LocalSystem service, " +
+	"or set policy.enabled: false to run this node without enforcement"
+
+// newFirewallController creates the WFP-backed controller for policy
+// enforcement on Windows. It needs Administrator, which the LocalSystem
+// service satisfies. meshIface is the adapter the mesh prefix sits on, which
+// the filters and the same instance's bridge NAT rule bind to.
+func newFirewallController(logger *slog.Logger, meshIface string) policy.FirewallController {
+	return policy.NewWFPController(logger, meshIface)
 }
 
 // newRouteController creates the IP Helper backed controller for bridge
 // routing on Windows. It needs Administrator, which the LocalSystem service
 // satisfies.
 //
-// NAT masquerade has no backend yet — those rules belong to the WFP controller
-// (#11) — so a bridge on Windows needs bridge.enable_nat: false until it
-// lands, and says so when it does not have it.
-func newRouteController(logger *slog.Logger) bridge.RouteController {
-	return bridge.NewWindowsRouteController(logger, nil)
+// The WFP controller supplies NAT masquerade through WinNAT, so fw doubles as
+// the route controller's NAT backend. A nil fw (tests) yields a nil backend
+// and leaves AddNATMasquerade failing with bridge.ErrNATUnavailable.
+func newRouteController(logger *slog.Logger, fw policy.FirewallController) bridge.RouteController {
+	nat, _ := fw.(bridge.NATController)
+	return bridge.NewWindowsRouteController(logger, nat)
 }
 
 // newAccessController returns nil until the bridge user-access controller

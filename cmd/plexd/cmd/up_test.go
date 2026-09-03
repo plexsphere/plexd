@@ -30,6 +30,7 @@ import (
 	"github.com/plexsphere/plexd/internal/nodeapi"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/registration"
+	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
 // TestRedactSensitiveLine_SecretKey verifies that the existing redaction logic
@@ -651,12 +652,20 @@ health:
 	return dir
 }
 
-// useFirewallController points runUp's platform seam at ctrl for one test.
-func useFirewallController(t *testing.T, ctrl policy.FirewallController) {
+// useFirewallController points runUp's platform seam at ctrl for one test and
+// returns the mesh interface name the constructor was handed. That string is
+// what WFPController reads the WinNAT source prefix from, and nothing else
+// observes it: on macOS and Linux the constructor discards it.
+func useFirewallController(t *testing.T, ctrl policy.FirewallController) *string {
 	t.Helper()
 	old := firewallController
 	t.Cleanup(func() { firewallController = old })
-	firewallController = func(*slog.Logger) policy.FirewallController { return ctrl }
+	var got string
+	firewallController = func(_ *slog.Logger, meshIface string) policy.FirewallController {
+		got = meshIface
+		return ctrl
+	}
+	return &got
 }
 
 // A node that cannot install the deny-by-default baseline has to fail before it
@@ -667,12 +676,18 @@ func useFirewallController(t *testing.T, ctrl policy.FirewallController) {
 func TestRunUp_PolicyPreflightAbortsBeforeRegistration(t *testing.T) {
 	apiBase, requests := countingControlPlane(t)
 	probeErr := errors.New("operation not permitted")
-	useFirewallController(t, &failingFirewallController{err: probeErr})
+	meshIface := useFirewallController(t, &failingFirewallController{err: probeErr})
 	writeUpConfig(t, apiBase, "policy:\n  chain_name: plexd-mesh\n")
 
 	err := runUp(upCmd, nil)
 	if err == nil {
 		t.Fatal("runUp() = nil, want the pre-flight failure")
+	}
+	// The constructor takes the configured WireGuard interface, not the
+	// bridge's and not the kernel name resolved later: on Windows an empty or
+	// wrong name leaves every bridge node failing to resolve its NAT prefix.
+	if want := wireguard.DefaultInterfaceName; *meshIface != want {
+		t.Errorf("firewall controller built for interface %q, want %q", *meshIface, want)
 	}
 	if got := requests.Load(); got != 0 {
 		t.Errorf("control plane received %d requests, want 0 (nothing may be spent before the check)", got)
@@ -680,9 +695,10 @@ func TestRunUp_PolicyPreflightAbortsBeforeRegistration(t *testing.T) {
 	if !errors.Is(err, probeErr) {
 		t.Errorf("error does not wrap the probe failure: %v", err)
 	}
-	// The kernel names neither the capability nor the way out, so the message
-	// has to. Both halves are what the operator reading this line acts on.
-	for _, want := range []string{"CAP_NET_ADMIN", "policy.enabled: false", "operation not permitted"} {
+	// The backend names neither what the node is missing nor the way out, so
+	// the message has to. Both halves are what the operator reading this line
+	// acts on.
+	for _, want := range []string{policyCapabilityHint, "policy.enabled: false", "operation not permitted"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err.Error(), want)
 		}
@@ -795,6 +811,235 @@ func TestRunUp_PolicyEnvOverridesFile(t *testing.T) {
 			t.Fatalf("runUp() error = %v, want the environment's true to win and the pre-flight to run", err)
 		}
 	})
+}
+
+// baselineRefusingFirewallController clears the pre-flight probe and refuses
+// the chain, which is the state the baseline abort exists for: the capability
+// was lost between the two calls, or the backend refused the chain itself.
+type baselineRefusingFirewallController struct {
+	err     error
+	applies atomic.Int32
+}
+
+func (f *baselineRefusingFirewallController) Probe() error             { return nil }
+func (f *baselineRefusingFirewallController) EnsureChain(string) error { return nil }
+
+func (f *baselineRefusingFirewallController) ApplyRules(string, []policy.FirewallRule) error {
+	f.applies.Add(1)
+	return f.err
+}
+
+func (f *baselineRefusingFirewallController) FlushChain(string) error  { return nil }
+func (f *baselineRefusingFirewallController) DeleteChain(string) error { return nil }
+
+// setupRefusingWGController is a WGController whose CreateInterface fails, the
+// way the Linux controller's does when the device is already there. The
+// baseline tests need Setup to fail without creating anything: whether the
+// real controller fails depends on privilege, and the Windows runner is
+// elevated, so there Wintun would create a second adapter under the
+// loopback's name — one that carries the seeded mesh address and outlives a
+// runUp that returns early, which is what TestMeshInterfaceOwned then finds.
+type setupRefusingWGController struct{}
+
+func (setupRefusingWGController) CreateInterface(name string, _ []byte, _ int) error {
+	return fmt.Errorf("device %q already exists", name)
+}
+
+func (setupRefusingWGController) DeleteInterface(string) error               { return nil }
+func (setupRefusingWGController) ConfigureAddress(string, string) error      { return nil }
+func (setupRefusingWGController) SetInterfaceUp(string) error                { return nil }
+func (setupRefusingWGController) SetMTU(string, int) error                   { return nil }
+func (setupRefusingWGController) AddPeer(string, wireguard.PeerConfig) error { return nil }
+func (setupRefusingWGController) RemovePeer(string, []byte) error            { return nil }
+func (setupRefusingWGController) SetPrivateKey(string, []byte) error         { return nil }
+
+func useWGController(t *testing.T, ctrl wireguard.WGController) {
+	t.Helper()
+	old := wgController
+	t.Cleanup(func() { wgController = old })
+	wgController = func(*slog.Logger) wireguard.WGController { return ctrl }
+}
+
+// loopbackInterface returns the loopback's name and one IPv4 address it
+// carries. The baseline gate resolves the mesh name in the host's interface
+// table and then asks whether that device answers to the node's mesh address,
+// so a test needs both halves — and the loopback is the one interface every
+// platform running these tests has, with an address this process can point an
+// identity at without creating a device.
+func loopbackInterface(t *testing.T) (string, string) {
+	t.Helper()
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("list interfaces: %v", err)
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			t.Fatalf("read the addresses of %s: %v", iface.Name, err)
+		}
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil {
+				return iface.Name, ipNet.IP.String()
+			}
+		}
+	}
+	t.Skip("host carries no loopback interface with an IPv4 address for the mesh name to resolve to")
+	return "", ""
+}
+
+// runUpUntilError runs the daemon against a context the test owns and returns
+// the error it stops with. A daemon that keeps running is itself the failure
+// this reports: the caller expects a startup step to abort.
+func runUpUntilError(t *testing.T) error {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	previous := upCmd.Context()
+	upCmd.SetContext(ctx)
+	t.Cleanup(func() {
+		cancel()
+		upCmd.SetContext(previous)
+	})
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- runUp(upCmd, nil) }()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-time.After(30 * time.Second):
+		t.Fatal("runUp did not return, want the baseline failure to abort startup")
+		return nil
+	}
+}
+
+// A failed WireGuard setup does not mean the device is gone: Manager.Setup
+// creates the interface before any of the steps that can fail and rolls none of
+// them back, and on Linux it usually fails because the device is already there.
+// That node peers and forwards, so its baseline has to be installed and its
+// refusal has to abort startup — gating the baseline on a successful setup
+// instead leaves a node that registers, reports healthy and carries mesh
+// traffic on a live interface with no chain at all, which nothing installs
+// later because the reconcile handler short-circuits on an unchanged revision.
+//
+// Setup is refused by the controller double, and the mesh name is the
+// loopback's while the seeded identity holds the address that loopback carries
+// — a device this process did not create that answers to the node's mesh
+// address, which is exactly the shape a leftover device from a previous run
+// has.
+func TestRunUp_BaselineRunsOnAnInterfaceWireGuardDidNotCreate(t *testing.T) {
+	iface, meshIP := loopbackInterface(t)
+	_, apiBase := newAuthRecordingControlPlane(t)
+	applyErr := errors.New("chain refused")
+	fw := &baselineRefusingFirewallController{err: applyErr}
+	useFirewallController(t, fw)
+	useWGController(t, setupRefusingWGController{})
+	dataDir := writeUpConfig(t, apiBase, fmt.Sprintf(`policy:
+  chain_name: plexd-mesh
+tunnel:
+  enabled: false
+node_api:
+  socket_path: %s
+wireguard:
+  interface_name: %q
+`, shortSocketPath(t), iface))
+	seedIdentityWithMeshIP(t, dataDir, upResumedNodeID, upResumedNSK, meshIP)
+
+	err := runUpUntilError(t)
+	if err == nil {
+		t.Fatal("runUp() = nil, want the baseline failure")
+	}
+	if !errors.Is(err, applyErr) {
+		t.Errorf("runUp() error = %v, want it to wrap the refused chain", err)
+	}
+	if !strings.Contains(err.Error(), "deny-by-default firewall baseline") {
+		t.Errorf("runUp() error = %v, want it to name the baseline", err)
+	}
+	if got := fw.applies.Load(); got != 1 {
+		t.Errorf("ApplyRules ran %d times, want 1: the baseline was skipped although %q carries the mesh address", got, iface)
+	}
+}
+
+// The name alone does not make the device plexd's: wireguard.Config never asks
+// whether the configured interface name is free, so a copy-pasted eth0 or a
+// name a VPN already holds resolves in the interface table exactly as a
+// leftover plexd0 does. Installing this baseline there points deny-by-default
+// at the node's own uplink — on a Kubernetes node that drops every forwarded
+// packet, all pod ingress and all routed transit — while the daemon keeps
+// running and reports registered, and recovery needs an operator to find and
+// delete the chain by hand. The mesh address is what tells the two apart, so a
+// device that does not answer to it is skipped and startup continues.
+func TestRunUp_BaselineSkipsADeviceThatIsNotTheMeshInterface(t *testing.T) {
+	iface, _ := loopbackInterface(t)
+	cp, apiBase := newAuthRecordingControlPlane(t)
+	fw := &baselineRefusingFirewallController{err: errors.New("chain refused")}
+	useFirewallController(t, fw)
+	useWGController(t, setupRefusingWGController{})
+	// The seeded mesh address is the one the control plane assigned this node,
+	// which no loopback carries.
+	dataDir := writeUpConfig(t, apiBase, fmt.Sprintf(`policy:
+  chain_name: plexd-mesh
+tunnel:
+  enabled: false
+node_api:
+  socket_path: %s
+wireguard:
+  interface_name: %q
+`, shortSocketPath(t), iface))
+	seedIdentity(t, dataDir, upResumedNodeID, upResumedNSK)
+
+	shutdown := startRunUpDaemon(t)
+	// A resumed identity contacts no one to load itself, so the first
+	// authenticated call comes from the steady-state loops — which start after
+	// the baseline, making it the signal that startup ran past it.
+	cp.waitForAuthenticatedCall(t)
+	shutdown()
+
+	if got := fw.applies.Load(); got != 0 {
+		t.Errorf("ApplyRules ran %d times, want 0: the baseline was installed on %q, which does not carry this node's mesh address", got, iface)
+	}
+}
+
+// meshInterfaceOwned answers three questions the baseline gate has to keep
+// apart: the device is this node's, the name is carried by something else or by
+// nothing, and the interface table could not be read at all. net.InterfaceByName
+// reports the last two identically, and reading a failed table read as an
+// absent interface is what leaves a node forwarding with no chain installed.
+func TestMeshInterfaceOwned(t *testing.T) {
+	iface, meshIP := loopbackInterface(t)
+
+	tests := []struct {
+		name    string
+		iface   string
+		meshIP  string
+		want    bool
+		wantErr bool
+	}{
+		{name: "device carries the mesh address", iface: iface, meshIP: meshIP, want: true},
+		{name: "device carries another address", iface: iface, meshIP: "100.64.0.7"},
+		{name: "no interface carries the name", iface: "plexd-absent0", meshIP: meshIP},
+		{name: "mesh address is not an address", iface: iface, meshIP: "", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := meshInterfaceOwned(tc.iface, tc.meshIP)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("meshInterfaceOwned(%q, %q) = %v, nil, want an error", tc.iface, tc.meshIP, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("meshInterfaceOwned(%q, %q) error = %v, want none: only an unreadable table is a failure", tc.iface, tc.meshIP, err)
+			}
+			if got != tc.want {
+				t.Errorf("meshInterfaceOwned(%q, %q) = %v, want %v", tc.iface, tc.meshIP, got, tc.want)
+			}
+		})
+	}
 }
 
 // freePort returns a port nothing is listening on, by taking one from the
@@ -1072,6 +1317,13 @@ func startRunUp(t *testing.T) func() {
 	// nothing should reach a backend, and a nil one turns a call that does into
 	// a skipped no-op instead of a panic in a daemon goroutine.
 	useFirewallController(t, nil)
+	return startRunUpDaemon(t)
+}
+
+// startRunUpDaemon is startRunUp for a test that points the firewall seam
+// somewhere itself, which startRunUp otherwise decides.
+func startRunUpDaemon(t *testing.T) func() {
+	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	previous := upCmd.Context()
@@ -1098,9 +1350,16 @@ func startRunUp(t *testing.T) func() {
 // resumes this node instead of registering a new one.
 func seedIdentity(t *testing.T, dataDir, nodeID, nsk string) {
 	t.Helper()
+	seedIdentityWithMeshIP(t, dataDir, nodeID, nsk, "100.64.0.7")
+}
+
+// seedIdentityWithMeshIP is seedIdentity for a test that cares which address
+// the node holds — the firewall baseline resolves its interface by it.
+func seedIdentityWithMeshIP(t *testing.T, dataDir, nodeID, nsk, meshIP string) {
+	t.Helper()
 	err := registration.SaveIdentity(dataDir, &registration.NodeIdentity{
 		NodeID:           nodeID,
-		MeshIP:           "100.64.0.7",
+		MeshIP:           meshIP,
 		SigningPublicKey: upTestSigningKey,
 		SigningKeyID:     upTestSigningKID,
 		DomainMeshCIDR:   "100.64.0.0/10",

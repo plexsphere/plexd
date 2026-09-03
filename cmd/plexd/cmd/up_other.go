@@ -27,13 +27,21 @@ func newWGController(_ *slog.Logger) wireguard.WGController {
 	return nil
 }
 
+// policyCapabilityHint exists because up.go references it on every platform.
+// Without a backend Preflight and ApplyFirewallRules are both no-ops, so
+// neither failure path can reach this text: the node comes up unenforced with
+// a warning instead. It names only the setting that makes that state
+// deliberate, since there is no privilege to grant either.
+const policyCapabilityHint = "policy enforcement has no backend on this platform, " +
+	"set policy.enabled: false to run this node without enforcement"
+
 // newFirewallController returns nil on platforms without an implementation.
-func newFirewallController(_ *slog.Logger) policy.FirewallController {
+func newFirewallController(_ *slog.Logger, _ string) policy.FirewallController {
 	return nil
 }
 
 // newRouteController returns nil on platforms without an implementation.
-func newRouteController(_ *slog.Logger) bridge.RouteController {
+func newRouteController(_ *slog.Logger, _ policy.FirewallController) bridge.RouteController {
 	return nil
 }
 

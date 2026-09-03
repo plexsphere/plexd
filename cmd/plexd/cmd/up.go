@@ -49,17 +49,15 @@ const drainTimeout = 30 * time.Second
 // teardown can hold up the drain.
 const sessionEndedReportTimeout = 2 * time.Second
 
-// policyCapabilityHint is carried by both firewall-baseline failures. The kernel
-// reports a dropped capability as a bare EPERM on a netlink call, which names
-// neither what the process is missing nor the setting that turns the whole path
-// off — so the operator's two next steps go in the message rather than in the
-// source.
-const policyCapabilityHint = "policy enforcement needs CAP_NET_ADMIN, " +
-	"grant it to the container or set policy.enabled: false to run this node without enforcement"
-
 // firewallController indirects the platform-specific constructor so tests can
 // drive the pre-flight path without depending on the host's netfilter state.
 var firewallController = newFirewallController
+
+// wgController indirects the platform-specific constructor so tests can pin a
+// failed WireGuard setup without depending on the host's privilege: the
+// Windows runner is elevated, and Wintun creates an adapter under any name a
+// test configures, the loopback's included.
+var wgController = newWGController
 
 var upCmd = &cobra.Command{
 	Use:   "up",
@@ -140,7 +138,11 @@ func runAgent(ctx context.Context) error {
 	// install would be one, so this is an early exit for the fatal case only —
 	// the enforcement itself stays where it was.
 	policyEngine := policy.NewPolicyEngine(logger)
-	fwCtrl := firewallController(logger)
+	// The argument is the Windows adapter name the WinNAT source prefix is read
+	// from, and there the configured name is the kernel's. macOS and Linux
+	// discard it: their rules take policyIface further down, which wgMgr cannot
+	// supply yet — it does not exist this early.
+	fwCtrl := firewallController(logger, cfg.WireGuard.InterfaceName)
 	enforcer := policy.NewEnforcer(policyEngine, fwCtrl, cfg.Policy, logger)
 	if err := enforcer.Preflight(); err != nil {
 		return fmt.Errorf("plexd up: firewall baseline pre-flight: %s: %w", policyCapabilityHint, err)
@@ -230,7 +232,7 @@ func runAgent(ctx context.Context) error {
 	verifier := api.NewEd25519Verifier(identity.SigningKeyID, ed25519.PublicKey(sigKey))
 
 	// 5a. Initialize WireGuard subsystem.
-	wgCtrl := newWGController(logger)
+	wgCtrl := wgController(logger)
 	wgMgr := wireguard.NewManager(wgCtrl, cfg.WireGuard, logger)
 	wgReady := false
 	if wgCtrl != nil {
@@ -247,6 +249,13 @@ func runAgent(ctx context.Context) error {
 	stunClient := &nat.UDPSTUNClient{Timeout: cfg.NAT.Timeout}
 	natDiscoverer := nat.NewDiscoverer(stunClient, cfg.NAT, cfg.WireGuard.ListenPort, logger)
 	exchanger := peerexchange.NewExchanger(natDiscoverer, client, cfg.PeerExchange, logger)
+
+	// The policy enforcer addresses the interface by the name the kernel knows
+	// it by: pf on macOS matches its rules against the utunN the controller
+	// created, not against the configured plexd0. OSInterfaceName returns the
+	// configured name on every other platform, so the baseline below and the
+	// reconcile handler further down take one name everywhere.
+	policyIface := wgMgr.OSInterfaceName()
 
 	// 5c. Install the deny-by-default baseline immediately, independent of the
 	// reconcile diff. A nil policy yields a default-deny-only ruleset, so the
@@ -266,8 +275,50 @@ func runAgent(ctx context.Context) error {
 	// this failure means the capability was lost between the two calls or the
 	// chain itself was refused. It carries the same hint regardless: the operator
 	// reading this line has the same two options either way.
-	if _, err := enforcer.ApplyFirewallRules(nil, cfg.WireGuard.InterfaceName); err != nil {
-		return fmt.Errorf("plexd up: install deny-by-default firewall baseline: %s: %w", policyCapabilityHint, err)
+	//
+	// Gated on the device being this node's mesh interface, not on wgReady:
+	// Manager.Setup creates the interface before any of the steps that can fail
+	// and rolls none of them back, so a failed setup regularly leaves the
+	// device behind — on Linux it usually fails because the device is already
+	// there, EEXIST from a run whose teardown never got to it. That node peers,
+	// carries mesh traffic and would run unfiltered for the rest of its life:
+	// the reconcile handler short-circuits while the policy revision is
+	// unchanged, so nothing installs the chain afterwards.
+	//
+	// The mesh address is what proves the device is ours, and a name alone
+	// proves nothing: wireguard.Config never asks whether the configured name
+	// is free, so a copy-pasted eth0 or a name a VPN already holds resolves
+	// here exactly as a leftover plexd0 does — and this baseline is
+	// deny-by-default, so installing it on the node's uplink drops every
+	// packet that host forwards.
+	//
+	// A name this node's mesh address does not answer to is skipped, which is
+	// also the Windows case this gate exists for: the backend resolves the
+	// adapter through the OS and refuses a chain naming one that was never
+	// created, turning a warning macOS and Linux both survive into a fatal
+	// abort reported under a hint about Administrator that names the wrong
+	// cause. Failing to read the interface table is not that case and aborts:
+	// the read is a netlink dump on Linux and answers ENOBUFS on a node with a
+	// large, churning link table, so treating it as an absent interface would
+	// leave exactly the unfiltered node this call exists to prevent.
+	installBaseline := true
+	if cfg.Policy.IsEnabled() && !wgReady {
+		owned, err := meshInterfaceOwned(policyIface, identity.MeshIP)
+		if err != nil {
+			return fmt.Errorf("plexd up: resolve the mesh interface for the firewall baseline: %s: %w", policyCapabilityHint, err)
+		}
+		if !owned {
+			logger.Warn("no interface carries the mesh address under the mesh name, skipping the firewall baseline",
+				"interface", policyIface,
+				"mesh_ip", identity.MeshIP,
+			)
+			installBaseline = false
+		}
+	}
+	if installBaseline {
+		if _, err := enforcer.ApplyFirewallRules(nil, policyIface); err != nil {
+			return fmt.Errorf("plexd up: install deny-by-default firewall baseline: %s: %w", policyCapabilityHint, err)
+		}
 	}
 
 	// The mesh data plane is complete only here: the interface is up and the
@@ -334,7 +385,7 @@ func runAgent(ctx context.Context) error {
 		acmeMgr       *bridge.ACMEManager
 	)
 	if cfg.Mode == "bridge" && cfg.Bridge.Enabled {
-		routeCtrl := newRouteController(logger)
+		routeCtrl := newRouteController(logger, fwCtrl)
 		bridgeMgr = bridge.NewManager(routeCtrl, cfg.Bridge, logger)
 		if err := bridgeMgr.Setup(cfg.WireGuard.InterfaceName); err != nil {
 			return fmt.Errorf("plexd up: bridge setup: %w", err)
@@ -668,7 +719,7 @@ func runAgent(ctx context.Context) error {
 	}
 
 	// Register policy reconcile handler.
-	reconciler.RegisterHandler(policy.ReconcileHandler(enforcer, cfg.WireGuard.InterfaceName))
+	reconciler.RegisterHandler(policy.ReconcileHandler(enforcer, policyIface))
 
 	// Register peer/policy snapshot reconcile handler for node API queries.
 	reconciler.RegisterHandler(func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
@@ -961,6 +1012,45 @@ func runAgent(ctx context.Context) error {
 
 	logger.Info("plexd stopped")
 	return nil
+}
+
+// meshInterfaceOwned reports whether the interface named name carries meshIP,
+// the address the control plane assigned this node. Only the mesh interface
+// answers to it, so it tells the device plexd manages — the one this run
+// created or the one a previous run left behind — apart from a foreign device
+// that happens to carry the configured name.
+//
+// A name no interface carries is (false, nil): that is the ordinary case the
+// caller skips. An error means the interface table itself could not be read,
+// which net.InterfaceByName reports the same way as an absent name and callers
+// must not: on Linux the table is a netlink dump that answers ENOBUFS on a node
+// with a large, churning link table and EMFILE when the process is out of
+// descriptors, and neither says the interface is gone.
+func meshInterfaceOwned(name, meshIP string) (bool, error) {
+	want := net.ParseIP(meshIP)
+	if want == nil {
+		return false, fmt.Errorf("mesh ip %q is not an address", meshIP)
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false, fmt.Errorf("list interfaces: %w", err)
+	}
+	for _, iface := range ifaces {
+		if iface.Name != name {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return false, fmt.Errorf("read the addresses of %s: %w", name, err)
+		}
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.Equal(want) {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	return false, nil
 }
 
 // agentNodeInfo adapts agent identity to actions.NodeInfoProvider.

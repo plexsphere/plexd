@@ -7,16 +7,21 @@ import "errors"
 // NAT when bridge.enable_nat is false.
 var ErrNATUnavailable = errors.New("NAT masquerade is not available on this platform")
 
-// NATController programs NAT masquerade for bridge egress on an interface.
+// NATController programs NAT masquerade for bridge egress.
 // NetlinkRouteController implements it itself through nftables. The macOS and
 // Windows route controllers delegate to one handed to their constructor,
-// because on those platforms the firewall backend owns the NAT rules; until it
-// exists they are built with nil and AddNATMasquerade fails with
+// because on those platforms the firewall backend owns the NAT rules:
+// PFController on macOS and WFPController on Windows. A controller built
+// without one — which is what the tests do — fails AddNATMasquerade with
 // ErrNATUnavailable.
 // All methods must be idempotent: repeating an operation that is already
 // applied returns nil.
 type NATController interface {
-	// AddNATMasquerade configures NAT masquerading on the given interface.
+	// AddNATMasquerade configures NAT masquerading for bridge egress.
+	// Linux and macOS scope the translation to iface. Windows scopes it by
+	// mesh source prefix through WinNAT, which cannot bind to an interface,
+	// and ignores iface: mesh-sourced traffic is translated on its way out of
+	// whichever adapter carries the route.
 	AddNATMasquerade(iface string) error
 
 	// RemoveNATMasquerade removes NAT masquerading from the given interface.

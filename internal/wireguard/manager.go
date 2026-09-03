@@ -110,8 +110,9 @@ func (m *Manager) Teardown() error {
 // controller creates a utun the kernel names utunN.
 //
 // Callers that address the interface through plexd keep using
-// Config.InterfaceName: the policy enforcer, the bridge managers and the
-// status report.
+// Config.InterfaceName: the bridge managers and the status report. The policy
+// enforcer takes the name this method returns, because pf on macOS matches the
+// kernel's name.
 func (m *Manager) OSInterfaceName() string {
 	if namer, ok := m.ctrl.(OSInterfaceNamer); ok {
 		if osName, found := namer.OSInterfaceName(m.cfg.InterfaceName); found {
