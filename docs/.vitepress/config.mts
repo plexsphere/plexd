@@ -102,6 +102,7 @@ export default withMermaid(defineConfig({
               { text: 'Peer Endpoint Exchange', link: '/reference/networking/peer-endpoint-exchange' },
               { text: 'Network Policy', link: '/reference/networking/network-policy' },
               { text: 'nftables Firewall', link: '/reference/networking/nftables-firewall' },
+              { text: 'pf & WFP Firewall Controllers', link: '/reference/networking/pf-wfp-firewall' },
               { text: 'Secure Access Tunneling', link: '/reference/networking/secure-access-tunneling' },
             ],
           },

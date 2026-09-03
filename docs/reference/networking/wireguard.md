@@ -92,7 +92,7 @@ wireguard-go's own log lines are adapted to plexd's `slog.Logger`, appearing at 
 
 macOS names a WireGuard device `utunN` and accepts no other name. `tun.CreateTUN` is asked for `utun`, which lets the kernel pick the next free unit; an `interface_name` that already names a unit (`utun7`) is passed through, so an operator can pin one.
 
-Everything addressed through plexd keeps the configured name: the backend's device key, the UAPI socket (`wg show plexd0`), the policy chain, the bridge managers and the `status.mesh` report. The kernel name is used for the `ifconfig` and `route` calls, and for the readiness check, which resolves it through `Manager.OSInterfaceName()` because `net.InterfaceByName` knows only `utunN`.
+Everything addressed through plexd keeps the configured name: the backend's device key, the UAPI socket (`wg show plexd0`), the bridge managers and the `status.mesh` report. The kernel name is used for the `ifconfig` and `route` calls, for the [pf policy rules](./pf-wfp-firewall.md#interface-names) and for the readiness check, all of which resolve it through `Manager.OSInterfaceName()` because `net.InterfaceByName` knows only `utunN`.
 
 The pairing is logged once per interface, at `info`:
 

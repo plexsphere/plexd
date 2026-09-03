@@ -6,7 +6,7 @@ feature: PXD-0027
 
 # nftables Firewall Controller
 
-`NftablesController` is the Linux production implementation of the `FirewallController` interface defined in `internal/policy`. It translates `FirewallRule` entries into nftables expressions and manages them via the `github.com/google/nftables` netlink library.
+`NftablesController` is the Linux production implementation of the `FirewallController` interface defined in `internal/policy`. It translates `FirewallRule` entries into nftables expressions and manages them via the `github.com/google/nftables` netlink library. The macOS and Windows implementations are described in [pf & WFP Firewall Controllers](./pf-wfp-firewall.md).
 
 The controller operates on a single IPv4 table (`plexd`) and creates base chains with a forward hook (`ChainTypeFilter`, `ChainHookForward`, `ChainPriorityFilter`) so that rules are evaluated by the kernel for forwarded traffic. It requires `CAP_NET_ADMIN` and the `//go:build linux` constraint.
 

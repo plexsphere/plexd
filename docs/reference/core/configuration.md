@@ -355,9 +355,9 @@ Network policy enforcement and firewall rules. See [Network Policy Enforcement](
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable policy enforcement. An omitted key means enabled; an explicit `false` is preserved. Also settable as [`PLEXD_POLICY_ENABLED`](environment-variables.md#plexd-up-variables), which is how a deployment without a config file reaches the opt-out below. |
-| `chain_name` | string | `plexd-mesh` | Name of the nftables chain for policy rules |
+| `chain_name` | string | `plexd-mesh` | Name of the nftables chain on Linux; on macOS the chain's comment line in the pf anchor, on Windows the prefix of the WFP filter names |
 
-Policy enforcement needs `CAP_NET_ADMIN`. With enforcement on, `plexd up` probes the nftables backend **before it registers** and exits if the probe fails — a node that cannot install the deny-by-default baseline must not spend its one-shot bootstrap token first. The failure names the capability and this opt-out:
+Policy enforcement needs `CAP_NET_ADMIN`. On macOS it needs root and a pf main ruleset that references `anchor "com.apple/*"`, which Apple's `/etc/pf.conf` does; on Windows it needs Administrator. With enforcement on, `plexd up` probes the backend **before it registers** and exits if the probe fails — a node that cannot install the deny-by-default baseline must not spend its one-shot bootstrap token first. The failure names the capability and this opt-out:
 
 ```
 plexd up: firewall baseline pre-flight: policy enforcement needs CAP_NET_ADMIN,
@@ -366,7 +366,17 @@ enforcement: policy: preflight: policy: nftables: probe: netlink receive:
 operation not permitted
 ```
 
+On macOS and Windows that failure names the platform's own requirement instead, with the hints `policy enforcement needs root and a pf main ruleset that references anchor "com.apple/*"` and `policy enforcement needs Administrator`; see [pf & WFP Firewall Controllers](../networking/pf-wfp-firewall.md#error-prefixes).
+
 Grant the capability (see [Kubernetes Deployment](../../how-to/kubernetes-deployment.md)) or set `enabled: false` — or, without a file to set it in, `PLEXD_POLICY_ENABLED=false`. There is no middle setting: a node told to enforce that cannot enforce fails closed rather than joining the mesh unfiltered.
+
+> **Migration:** macOS and Windows had no firewall backend before this release, so
+> `policy.enabled: true` — the default — was a silent no-op there. Both platforms now
+> enforce: a node without root (macOS) or Administrator (Windows) fails the pre-flight
+> instead of starting, and a privileged node also filters traffic addressed to itself,
+> which the Linux forward hook never did. Set `policy.enabled: false` before rolling the
+> binary forward to keep the previous behaviour, or add rules for the mesh services the
+> node hosts.
 
 > **Migration:** `enabled` was previously resolved by a zero-value heuristic that guessed intent from `chain_name`. A `policy` block naming a chain without an `enabled` key was read as *disabled* — such a node ran unenforced and now comes up enforcing, which on a host without `CAP_NET_ADMIN` means it fails the pre-flight instead of starting. A block setting only `enabled: false` was forced back on and now takes effect as written. Spell `enabled` out to be certain of either.
 
@@ -399,7 +409,7 @@ Gateway bridge mode operation. Active when `mode: bridge` and `bridge.enabled: t
 | `enabled` | bool | `false` | Enable bridge mode |
 | `access_interface` | string | `eth1` | Access-side network interface. The kernel name on Linux and macOS (`eth1`, `en1`); on Windows the adapter's friendly name, as `Get-NetAdapter` lists it (`Ethernet`) |
 | `access_subnets` | []string | — | Subnets routable via the access interface |
-| `enable_nat` | bool | `true` | Enable NAT masquerading on the access interface. On macOS and Windows NAT needs the firewall controller, which does not exist yet: set `false` there, or bridge setup fails with `NAT masquerade is not available on this platform`. See [macOS & Windows Route Controllers](../bridge/route-controllers-macos-windows.md#nat) |
+| `enable_nat` | bool | `true` | Enable NAT masquerading on the access interface. On macOS the masquerade is a `nat` rule in plexd's pf anchor; on Windows a WinNAT object scoped to the mesh prefix, which translates mesh-sourced traffic only. See [pf & WFP Firewall Controllers](../networking/pf-wfp-firewall.md#nat) |
 | `relay_enabled` | bool | `false` | Enable UDP relay for NAT traversal |
 | `relay_listen_port` | int | `51821` | Relay UDP listen port |
 | `max_relay_sessions` | int | `100` | Maximum concurrent relay sessions |
@@ -551,7 +561,7 @@ peer_exchange:
   timeout: 5s
 
 policy:
-  enabled: true              # needs CAP_NET_ADMIN; false to run unenforced
+  enabled: true              # needs CAP_NET_ADMIN (Linux), root (macOS) or Administrator (Windows); false to run unenforced
   chain_name: plexd-mesh
 
 tunnel:
