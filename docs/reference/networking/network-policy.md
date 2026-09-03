@@ -6,7 +6,7 @@ feature: PXD-0008
 
 # Network Policy Enforcement
 
-The `internal/policy` package enforces network policies on mesh nodes. It translates the control plane's merged policy — a single `{revision_id, fingerprint, rules[]}` block on the `NodeStateSnapshot` envelope — into concrete nftables firewall rules for packet-level enforcement.
+The `internal/policy` package enforces network policies on mesh nodes. It translates the control plane's merged policy — a single `{revision_id, fingerprint, rules[]}` block on the `NodeStateSnapshot` envelope — into concrete firewall rules (nftables on Linux, pf on macOS, the Windows Filtering Platform on Windows) for packet-level enforcement.
 
 The package integrates with `internal/reconcile` for periodic convergence and with `internal/api` for real-time SSE-driven policy updates.
 
@@ -97,10 +97,11 @@ type FirewallRule struct {
 
 ## FirewallController
 
-Interface abstracting OS-level iptables operations. The production implementation is provided externally; this package defines and consumes the interface.
+Interface abstracting OS-level packet filter operations. The package has three implementations, one per platform: [`NftablesController`](./nftables-firewall.md) on Linux, and [`PFController` and `WFPController`](./pf-wfp-firewall.md) on macOS and Windows.
 
 ```go
 type FirewallController interface {
+    Probe() error
     EnsureChain(chain string) error
     ApplyRules(chain string, rules []FirewallRule) error
     FlushChain(chain string) error
@@ -110,6 +111,7 @@ type FirewallController interface {
 
 | Method        | Description                                              |
 |---------------|----------------------------------------------------------|
+| `Probe`       | Reports whether the backend is usable, without changing kernel state |
 | `EnsureChain` | Creates the named chain if it does not already exist     |
 | `ApplyRules`  | Replaces all rules in the named chain atomically         |
 | `FlushChain`  | Removes all rules from the named chain                   |
@@ -262,7 +264,8 @@ dispatcher.Register(api.EventPolicyUpdated, policy.HandlePolicyUpdated(reconcile
 > **Note:** The policy enforcement model is under active development. The behavior described here reflects the current design and may change in future versions.
 
 - Policy changes are signalled by the control plane via the `policy_updated` SSE event, which triggers a reconcile; the merged policy itself is pulled in the `NodeStateSnapshot` envelope.
-- Filtering operates at **L3/L4** (CIDR, port, protocol) on the `plexd0` mesh interface using **nftables** rules.
+- Filtering operates at **L3/L4** (CIDR, port, protocol) on the mesh interface: nftables forward rules on `plexd0` on Linux, pf rules on the kernel's `utunN` on macOS, WFP filters on the Wintun adapter on Windows.
+- The Linux chain hooks the forward path alone, while the macOS and Windows rules also govern what the node itself receives, so a Mac or a Windows node rejects unsolicited mesh traffic to its own addresses until a rule allows it; see [What the rules govern](./pf-wfp-firewall.md#what-the-rules-govern).
 - The default stance is **deny-all**: the ruleset always ends with a default-deny rule, and a `null` policy applies the default-deny-only ruleset.
 - Peer membership is **not** governed by policy — it comes from the snapshot `peers` block via `wireguard.ReconcileHandler`. Policy rules are CIDR-scoped five-tuples, not node-ID references.
 - On a genuine policy change (fingerprint mismatch), plexd rebuilds the nftables ruleset from the merged policy. Revision-only bumps short-circuit and leave the ruleset untouched.

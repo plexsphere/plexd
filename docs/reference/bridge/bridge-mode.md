@@ -94,12 +94,12 @@ The NAT methods are a separate interface because the macOS and Windows controlle
 | `DisableForwarding`  | Reverses the forwarding setup                              |
 | `AddRoute`           | Adds a route for a CIDR subnet via the given interface     |
 | `RemoveRoute`        | Removes the route for a CIDR subnet                        |
-| `AddNATMasquerade`   | Configures NAT masquerading on the given interface         |
+| `AddNATMasquerade`   | Configures NAT masquerading for bridge egress               |
 | `RemoveNATMasquerade`| Removes NAT masquerading from the given interface          |
 
 All methods must be idempotent: repeating an already-applied operation returns `nil`.
 
-`AddNATMasquerade` returns an error wrapping `ErrNATUnavailable` on a platform whose controller was built without a NAT backend, which is macOS and Windows today. Set `enable_nat: false` there.
+`AddNATMasquerade` returns an error wrapping `ErrNATUnavailable` on a controller built without a NAT backend. `cmd/plexd/cmd/up_darwin.go` and `up_windows.go` supply one — the pf and WFP firewall controllers — so NAT works on all three platforms; see [pf & WFP Firewall Controllers](../networking/pf-wfp-firewall.md#nat). Linux and macOS scope the translation to the given interface; Windows scopes it by the mesh source prefix and ignores the name.
 
 ## Manager
 

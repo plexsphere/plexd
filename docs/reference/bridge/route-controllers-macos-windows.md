@@ -13,16 +13,15 @@ The Linux implementation is [`NetlinkRouteController`](./netlink-route-controlle
 
 ```
 Bridge Manager / UserAccessManager / SiteToSiteManager
-                        │
-        ┌───────────────┴───────────────┐
-        ▼                               ▼
-┌───────────────────────┐   ┌────────────────────────┐
-│ DarwinRouteController │   │ WindowsRouteController │
-└──┬─────────┬──────────┘   └──┬──────────┬──────────┘
-   │         │                 │          │
-   ▼         ▼                 ▼          ▼
-route(8)  sysctl(8)        winipcfg   NATController
-                                       (#11, nil today)
+                                  │
+                 ┌────────────────┴─────────────────┐
+                 ▼                                  ▼
+┌──────────────────────────────────┐   ┌──────────────────────────┐
+│      DarwinRouteController       │   │  WindowsRouteController  │
+└──┬──────────┬────────────┬───────┘   └────┬────────────┬────────┘
+   │          │            │                │            │
+   ▼          ▼            ▼                ▼            ▼
+route(8)  sysctl(8)  PFController       winipcfg   WFPController
 ```
 
 ## Constructors
@@ -45,14 +44,16 @@ type NATController interface {
 }
 ```
 
-`NetlinkRouteController` implements it itself through nftables. On macOS and Windows the masquerade rules belong to pf and to the Windows Filtering Platform, which the firewall controller owns, so both constructors take a backend to delegate to. Until that controller exists, `cmd/plexd/cmd/up_darwin.go` and `up_windows.go` pass `nil`, and `AddNATMasquerade` fails:
+`NetlinkRouteController` implements it itself through nftables. On macOS and Windows the masquerade belongs to pf and to WinNAT, which the firewall controller owns, so both constructors take a backend to delegate to. `cmd/plexd/cmd/up_darwin.go` and `up_windows.go` build one `PFController` or `WFPController` and hand the same instance to the policy enforcer and to the route controller; see [pf & WFP Firewall Controllers](../networking/pf-wfp-firewall.md#nat).
+
+A controller built without a backend, which is what the tests do, still fails on `AddNATMasquerade`:
 
 ```
 bridge: add NAT masquerade on "en1": NAT masquerade is not available on this
 platform; set bridge.enable_nat: false to run the bridge without NAT
 ```
 
-The error wraps `bridge.ErrNATUnavailable`. `bridge.enable_nat` defaults to true, so a bridge on either platform must set it to `false` until the firewall controller lands. Failing is deliberate: a gateway that came up logging `nat=true` without a masquerade would forward mesh traffic with mesh source addresses, and the return path would disappear silently.
+The error wraps `bridge.ErrNATUnavailable`. Failing is deliberate: a gateway that came up logging `nat=true` without a masquerade would forward mesh traffic with mesh source addresses, and the return path would disappear silently.
 
 `RemoveNATMasquerade` returns `nil` with no backend. Nothing could have been added, and the interface documents removal as idempotent.
 
@@ -168,14 +169,14 @@ Each adds a `/30`, checks the routing table for it, repeats the add to prove ide
 ```go
 logger := slog.Default()
 
-// nil until the pf or WFP controller supplies a NAT backend.
-ctrl := bridge.NewDarwinRouteController(logger, nil)
+// The pf controller supplies the NAT backend.
+ctrl := bridge.NewDarwinRouteController(logger, policy.NewPFController(logger))
 
 mgr := bridge.NewManager(ctrl, bridge.Config{
     Enabled:         true,
     AccessInterface: "en1",
     AccessSubnets:   []string{"10.0.0.0/24"},
-    EnableNAT:       bridge.BoolPtr(false), // required until #11 lands
+    EnableNAT:       bridge.BoolPtr(true),
 }, logger)
 
 if err := mgr.Setup("plexd0"); err != nil {
