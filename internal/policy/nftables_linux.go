@@ -312,11 +312,11 @@ func buildIPMatchExprs(addr string, offset uint32) ([]expr.Any, error) {
 		// Try as a plain IP without CIDR notation — normalize to /32.
 		parsed := net.ParseIP(addr)
 		if parsed == nil {
-			return nil, fmt.Errorf("invalid IP address %q", addr)
+			return nil, fmt.Errorf(errInvalidAddress, addr)
 		}
 		ip = parsed.To4()
 		if ip == nil {
-			return nil, fmt.Errorf("non-IPv4 address %q", addr)
+			return nil, fmt.Errorf(errNonIPv4Address, addr)
 		}
 		ipNet = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
 	} else {
