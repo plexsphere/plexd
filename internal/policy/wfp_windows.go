@@ -57,9 +57,9 @@ var plexdSublayerID = wf.SublayerID(windows.GUID{
 })
 
 // WFPController implements FirewallController on Windows through the Windows
-// Filtering Platform. Filters live in a dynamic session, so they vanish with
-// the process; the Wintun adapter vanishes with it too, so nothing arrives
-// that they could have filtered.
+// Filtering Platform and bridge.NATController through WinNAT. Filters live in
+// a dynamic session, so they vanish with the process; the Wintun adapter
+// vanishes with it too, so nothing arrives that they could have filtered.
 type WFPController struct {
 	logger    *slog.Logger
 	meshIface string // configured WireGuard interface name, the NAT source prefix comes from its address
