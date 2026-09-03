@@ -33,13 +33,21 @@ func newWGController(logger *slog.Logger) wireguard.WGController {
 	return wireguard.NewNetlinkController(logger)
 }
 
+// policyCapabilityHint is carried by both firewall-baseline failures. The
+// kernel reports a dropped capability as a bare EPERM on a netlink call, which
+// names neither what the process is missing nor the setting that turns the
+// whole path off, so the operator's two next steps go in the message rather
+// than in the source.
+const policyCapabilityHint = "policy enforcement needs CAP_NET_ADMIN, " +
+	"grant it to the container or set policy.enabled: false to run this node without enforcement"
+
 // newFirewallController creates an NftablesController for policy enforcement on Linux.
-func newFirewallController(logger *slog.Logger) policy.FirewallController {
+func newFirewallController(logger *slog.Logger, _ string) policy.FirewallController {
 	return policy.NewNftablesController(logger)
 }
 
 // newRouteController creates a NetlinkRouteController for bridge routing on Linux.
-func newRouteController(logger *slog.Logger) bridge.RouteController {
+func newRouteController(logger *slog.Logger, _ policy.FirewallController) bridge.RouteController {
 	return bridge.NewNetlinkRouteController(logger)
 }
 
