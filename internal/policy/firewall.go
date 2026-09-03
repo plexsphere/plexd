@@ -2,6 +2,16 @@ package policy
 
 import "fmt"
 
+// errNonIPv4Address and errInvalidAddress are the formats every backend
+// rejects an address field with, so a rejected rule reads the same on Linux,
+// macOS and Windows. The three renderers sit in build-tagged files that no
+// single test compiles together, which is why the text is shared here rather
+// than repeated in each of them.
+const (
+	errNonIPv4Address = "non-IPv4 address %q"
+	errInvalidAddress = "invalid IP address %q"
+)
+
 // FirewallRule describes a single iptables-style packet filter rule.
 type FirewallRule struct {
 	Interface string // network interface name
