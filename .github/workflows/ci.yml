@@ -55,19 +55,23 @@ jobs:
         run: go test -race -count=1 ./...
 
       # Creating a utun device needs root, and so do altering the routing table
-      # and the forwarding sysctl, so the two macOS tests against the real
-      # kernel skip in the unprivileged run above. The absolute go path is
-      # resolved before sudo resets PATH, and the two cache variables let root
-      # reuse what the step above downloaded and built instead of filling a
-      # second cache under /var/root. -v is what makes a skip visible in the
-      # log rather than passing as a bare ok.
+      # and the forwarding sysctl, so the three macOS tests against the real
+      # kernel skip in the unprivileged run above. Loading a pf anchor and
+      # taking a pf enable reference need root as well; that test also asks for
+      # PLEXD_TEST_REAL_PF, so sudo go test ./... on a developer's Mac leaves
+      # the host's pf alone. The absolute go path is resolved before sudo resets
+      # PATH, and the two cache variables let root reuse what the step above
+      # downloaded and built instead of filling a second cache under /var/root.
+      # -v is what makes a skip visible in the log rather than passing as a bare
+      # ok.
       - name: Run privileged macOS tests
         if: runner.os == 'macOS'
         run: |
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" \
+            PLEXD_TEST_REAL_PF=1 \
             "$(command -v go)" test -race -count=1 -v \
-            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real)$' \
-            ./internal/wireguard/ ./internal/bridge/
+            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real|TestPFController_Real)$' \
+            ./internal/wireguard/ ./internal/bridge/ ./internal/policy/
 
       # Creating a Wintun adapter needs the driver DLL and Administrator. The
       # Windows runner is already elevated, so the gate is this variable rather
@@ -93,6 +97,18 @@ jobs:
         run: >-
           go test -race -count=1 -v
           -run '^TestWindowsRouteController_Real$' ./internal/bridge/
+
+      # Programming the filter engine and creating a NetNat object need
+      # Administrator. The runner has it, so the gate is this variable for the
+      # same reason as above: without one the tests would install real filters
+      # inside the ordinary step. The NAT test uses a prefix no adapter carries.
+      - name: Run real WFP tests
+        if: runner.os == 'Windows'
+        env:
+          PLEXD_TEST_REAL_WFP: '1'
+        run: >-
+          go test -race -count=1 -v
+          -run '^TestWFPController_Real(NAT)?$' ./internal/policy/
 
   integration-test:
     runs-on: ubuntu-latest
