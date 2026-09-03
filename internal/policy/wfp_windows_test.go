@@ -22,6 +22,16 @@ import (
 // WFPController is the Windows FirewallController the enforcer is handed.
 var _ FirewallController = (*WFPController)(nil)
 
+// natController mirrors bridge.NATController. The contract is checked against
+// a local copy because internal/policy must not import internal/bridge: the
+// bridge package already depends on this one.
+type natController interface {
+	AddNATMasquerade(string) error
+	RemoveNATMasquerade(string) error
+}
+
+var _ natController = (*WFPController)(nil)
+
 // fakeEngine records what the controller would install in the filter engine.
 // opens counts the sessions the controller opened through it, so a test sees
 // that one session serves every chain.
