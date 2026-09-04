@@ -37,7 +37,7 @@ plexd/
 │   ├── fsutil/             # Atomic file operations
 │   ├── integrity/          # Binary and file integrity verification
 │   ├── kubernetes/         # K8s detection, CRD controller, PlexdHook types
-│   ├── logfwd/             # Log collection and forwarding (journald, file sources)
+│   ├── logfwd/             # Log collection and forwarding (journald, launchd log file, Event Log, file sources)
 │   ├── metrics/            # Metrics collection, system stats, tunnel stats
 │   ├── nat/                # STUN-based NAT traversal and endpoint discovery
 │   ├── nodeapi/            # Local Node API server, state cache, report sync
@@ -108,6 +108,8 @@ Most tests run on all three platforms. A test that cannot is constrained, never 
 | The test alters the routing table and an adapter's forwarding flag, which needs Administrator | Skip unless `PLEXD_TEST_REAL_ROUTES=1` and the process token is elevated (`internal/bridge/route_windows_test.go`, `TestWindowsRouteController_Real`). CI runs it in its own step; locally it is `$env:PLEXD_TEST_REAL_ROUTES='1'; go test -run TestWindowsRouteController_Real ./internal/bridge/` from an elevated shell |
 | The test loads a pf anchor and takes a pf enable reference, which needs root | Skip unless `os.Geteuid() == 0` (`internal/policy/pf_darwin_test.go`, `TestPFController_Real`); CI runs it in the privileged macOS step; locally `sudo go test -run TestPFController_Real ./internal/policy/` |
 | The test programs the filter engine and creates a NetNat object, which needs Administrator | Skip unless `PLEXD_TEST_REAL_WFP=1` and the token is elevated (`internal/policy/wfp_windows_test.go`, `TestWFPController_Real`; `netnat_windows_test.go`, `TestWFPController_RealNAT`); CI runs them in their own step; locally `$env:PLEXD_TEST_REAL_WFP='1'; go test -run 'TestWFPController_Real' ./internal/policy/` from an elevated shell |
+| The test writes to and reads the real Windows Event Log | Tag the file `//go:build windows` (`internal/logfwd/eventlog_reader_windows_test.go`); it runs in the ordinary step on the Windows runner, under a throwaway source name that leaves no registry entry behind |
+| The test renames or removes a file that another handle in the same process holds open | Skip on `runtime.GOOS == "windows"` (`cmd/plexd/cmd/daemonlog_test.go`): `os.OpenFile` there opens without `FILE_SHARE_DELETE`, so Windows refuses both |
 
 Hooks are discovered by their executable bit and executed directly, so they are `#!/bin/sh` scripts; Windows has neither the mode bit nor the interpreter. Windows reports `0666` or `0777` from `Mode().Perm()`, `os.Chmod` there only toggles the read-only attribute, and a read-only directory still accepts writes, so a test that injects a failure that way cannot work.
 

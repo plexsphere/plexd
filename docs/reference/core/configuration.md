@@ -274,10 +274,10 @@ Log collection and forwarding.
 | `collect_interval` | duration | `10s` | Interval between collection cycles. Minimum: `5s`. |
 | `report_interval` | duration | `30s` | Interval between reporting to the control plane. Must be >= `collect_interval`. |
 | `batch_size` | int | `200` | Maximum number of log entries per report batch. Minimum: `1`. |
-| `file_patterns` | []string | — | Glob patterns for file-based log collection, e.g. `["/var/log/app/*.log"]` |
+| `file_patterns` | []string | — | Glob patterns for file-based log collection, e.g. `["/var/log/app/*.log"]`. The daemon's own log is collected by the platform log source, so listing it here forwards every one of its lines twice. |
 | `filter.min_severity` | string | — | Drop log entries below this severity level (syslog severities: `emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug`) |
-| `filter.include_units` | []string | — | Only pass entries matching one of these unit names |
-| `filter.exclude_units` | []string | — | Drop entries matching any of these unit names. Takes precedence over `include_units`. |
+| `filter.include_units` | []string | — | Only pass entries matching one of these unit names. The unit name is the systemd unit on Linux (`plexd.service` for the daemon) and `plexd` on macOS and Windows. |
+| `filter.exclude_units` | []string | — | Drop entries matching any of these unit names. Takes precedence over `include_units`. The unit name is the systemd unit on Linux (`plexd.service` for the daemon) and `plexd` on macOS and Windows. |
 | `local_endpoint.url` | string | — | HTTPS URL for a local log forwarding endpoint. Must use `https://` scheme. Empty means not configured. |
 | `local_endpoint.secret_key` | string | — | Authentication credential for the local endpoint. Required when `url` is set. Redacted in config dumps. |
 | `local_endpoint.tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification for the local endpoint. |
@@ -526,6 +526,7 @@ log_fwd:
   #   min_severity: warning
   #   include_units:
   #     - sshd.service
+  #     - plexd              # the daemon itself on macOS and Windows
   #   exclude_units:
   #     - cron.service
   # local_endpoint:
