@@ -17,15 +17,15 @@ func newSystemReader(_ *slog.Logger) metrics.SystemReader {
 	return metrics.NewLinuxSystemReader("", "")
 }
 
-// newJournalReader creates a JournalctlReader on Linux. It returns nil when
+// newSystemLogSource builds the journald source on Linux. It returns nil when
 // journalctl is missing so the caller skips the journald log source entirely
 // rather than warning about an unusable facility on every collect cycle.
-func newJournalReader(logger *slog.Logger) logfwd.JournalReader {
+func newSystemLogSource(hostname string, logger *slog.Logger) logfwd.LogSource {
 	if !logfwd.JournalctlAvailable() {
 		logger.Info("journald not available, journald log source disabled")
 		return nil
 	}
-	return logfwd.NewJournalctlReader()
+	return logfwd.NewJournaldSource(logfwd.NewJournalctlReader(), hostname, logger)
 }
 
 // newWGController creates a NetlinkController for WireGuard on Linux.

@@ -8,6 +8,7 @@ import (
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
+	"github.com/plexsphere/plexd/internal/packaging"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
@@ -19,10 +20,11 @@ func newSystemReader(logger *slog.Logger) metrics.SystemReader {
 	return metrics.NewWindowsSystemReader(logger, "", "")
 }
 
-// newJournalReader returns nil until Windows log forwarding lands (#14). The
-// service writes to the Application Event Log, which no source reads yet.
-func newJournalReader(_ *slog.Logger) logfwd.JournalReader {
-	return nil
+// newSystemLogSource reads the events the service writes under provider plexd
+// to the Application log. A console run logs to stderr instead of to the Event
+// Log, so the source then forwards only what the service wrote.
+func newSystemLogSource(hostname string, logger *slog.Logger) logfwd.LogSource {
+	return logfwd.NewEventLogSource(logfwd.NewWevtapiReader(packaging.DefaultServiceName, logger), hostname)
 }
 
 // newWGController creates the Wintun-backed controller for WireGuard on

@@ -17,8 +17,8 @@ func newSystemReader(_ *slog.Logger) metrics.SystemReader {
 	return nil
 }
 
-// newJournalReader returns nil on platforms without an implementation.
-func newJournalReader(_ *slog.Logger) logfwd.JournalReader {
+// newSystemLogSource returns nil on platforms without an implementation.
+func newSystemLogSource(_ string, _ *slog.Logger) logfwd.LogSource {
 	return nil
 }
 

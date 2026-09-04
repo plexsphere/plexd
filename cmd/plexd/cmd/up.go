@@ -771,8 +771,8 @@ func runAgent(ctx context.Context) error {
 	// 14. Create log forwarding sources and forwarder.
 	hostname, _ := os.Hostname()
 	var logSources []logfwd.LogSource
-	if journalReader := newJournalReader(logger); journalReader != nil {
-		logSources = append(logSources, logfwd.NewJournaldSource(journalReader, hostname, logger))
+	if src := newSystemLogSource(hostname, logger); src != nil {
+		logSources = append(logSources, src)
 	}
 	for _, pattern := range cfg.LogFwd.FilePatterns {
 		logSources = append(logSources, logfwd.NewFileSource(pattern, hostname, logger))
