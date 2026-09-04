@@ -86,6 +86,14 @@ func runUp(cmd *cobra.Command, _ []string) error {
 		parent = context.Background()
 	}
 
+	// This has to precede setupLogger, which runAgent calls, because it decides
+	// what that logger writes through. It changes nothing unless stderr is the
+	// service manager's own log file. The writer is closed on the way out; a
+	// line logged after that reopens the path, so nothing is lost.
+	if w := useDaemonLogFile(); w != nil {
+		defer func() { _ = w.Close() }()
+	}
+
 	if handled, err := runAsService(runAgent); handled {
 		return err
 	}
