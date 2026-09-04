@@ -578,6 +578,10 @@ func runAgent(ctx context.Context) error {
 	}
 	svcCtl := packaging.NewService(packaging.NewServiceManager(logger), packaging.InstallConfig{})
 
+	// The platform system reader serves both diagnostics.collect and the
+	// metrics collector, so it is built once. It is nil where no reader exists.
+	sysReader := newSystemReader(logger)
+
 	// 10. Create action executor and register built-in actions.
 	executor := actions.NewExecutor(cfg.Actions, client, integrityVerifier, logger)
 
@@ -745,10 +749,7 @@ func runAgent(ctx context.Context) error {
 	}
 
 	// 13. Create metrics collectors and manager.
-	var metricsCollectors []metrics.Collector
-	if sysReader := newSystemReader(); sysReader != nil {
-		metricsCollectors = append(metricsCollectors, metrics.NewSystemCollector(sysReader, logger))
-	}
+	metricsCollectors := systemCollectors(sysReader, logger)
 	metricsCollectors = append(metricsCollectors, metrics.NewAgentStatsCollector(startTime, nil, logger))
 
 	var metricsReporter metrics.MetricsReporter = metrics.NewPlatformReporter(client, logger)
@@ -1384,6 +1385,17 @@ func deliveryModePublisher(cache *nodeapi.StateCache, logger *slog.Logger) func(
 		cache.SetDeliveryMode(string(mode))
 		logger.Info("event delivery mode changed", "mode", mode)
 	}
+}
+
+// systemCollectors returns the node_resources collector for a platform that
+// has a system reader, and nothing for a platform without one. sysReader is
+// nil on the latter (see up_other.go), where a collector would dereference it
+// on every cycle, so such a node reports agent stats alone.
+func systemCollectors(sysReader metrics.SystemReader, logger *slog.Logger) []metrics.Collector {
+	if sysReader == nil {
+		return nil
+	}
+	return []metrics.Collector{metrics.NewSystemCollector(sysReader, logger)}
 }
 
 // loadMergedConfig parses the config file at path — an absent one is not fatal

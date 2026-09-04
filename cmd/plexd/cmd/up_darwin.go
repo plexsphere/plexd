@@ -12,9 +12,11 @@ import (
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
-// newSystemReader returns nil until the macOS metrics reader lands (#13).
-func newSystemReader() metrics.SystemReader {
-	return nil
+// newSystemReader creates the sysctl, Mach and routing-socket backed reader
+// for system metrics on macOS. It needs no privilege: every source is readable
+// by an unprivileged process.
+func newSystemReader(logger *slog.Logger) metrics.SystemReader {
+	return metrics.NewDarwinSystemReader(logger, "", "")
 }
 
 // newJournalReader returns nil until macOS log forwarding lands (#14). The

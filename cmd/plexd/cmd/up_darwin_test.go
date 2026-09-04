@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/bridge"
+	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
@@ -70,14 +71,21 @@ func TestNewRouteController_Darwin_NilFirewall(t *testing.T) {
 	}
 }
 
+func TestNewSystemReader_Darwin(t *testing.T) {
+	reader := newSystemReader(discardLogger())
+	if reader == nil {
+		t.Fatal("newSystemReader() = nil, want the sysctl and Mach reader on macOS")
+	}
+	if _, ok := reader.(*metrics.DarwinSystemReader); !ok {
+		t.Errorf("newSystemReader() = %T, want *metrics.DarwinSystemReader", reader)
+	}
+}
+
 // TestNewControllers_DarwinStubs pins the subsystems macOS does not have yet,
 // so the sibling that implements one has to flip its stub deliberately.
 func TestNewControllers_DarwinStubs(t *testing.T) {
 	logger := discardLogger()
 
-	if r := newSystemReader(); r != nil {
-		t.Errorf("newSystemReader() = %v, want nil until #13", r)
-	}
 	if r := newJournalReader(logger); r != nil {
 		t.Errorf("newJournalReader() = %v, want nil until #14", r)
 	}

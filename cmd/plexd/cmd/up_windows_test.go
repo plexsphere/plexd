@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/bridge"
+	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
@@ -71,14 +72,21 @@ func TestNewRouteController_Windows_NilFirewall(t *testing.T) {
 	}
 }
 
+func TestNewSystemReader_Windows(t *testing.T) {
+	reader := newSystemReader(discardLogger())
+	if reader == nil {
+		t.Fatal("newSystemReader() = nil, want the kernel32 and IP Helper reader on Windows")
+	}
+	if _, ok := reader.(*metrics.WindowsSystemReader); !ok {
+		t.Errorf("newSystemReader() = %T, want *metrics.WindowsSystemReader", reader)
+	}
+}
+
 // TestNewControllers_WindowsStubs pins the subsystems Windows does not have
 // yet, so the sibling that implements one has to flip its stub deliberately.
 func TestNewControllers_WindowsStubs(t *testing.T) {
 	logger := discardLogger()
 
-	if r := newSystemReader(); r != nil {
-		t.Errorf("newSystemReader() = %v, want nil until #13", r)
-	}
 	if r := newJournalReader(logger); r != nil {
 		t.Errorf("newJournalReader() = %v, want nil until #14", r)
 	}
