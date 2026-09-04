@@ -26,6 +26,7 @@ import (
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/health"
+	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
 	"github.com/plexsphere/plexd/internal/policy"
@@ -255,6 +256,34 @@ func TestDeliveryModePublisher(t *testing.T) {
 	publish(api.DeliveryModeStreaming)
 	if got, _ := cache.GetMetadataKey("delivery_mode"); got != "streaming" {
 		t.Errorf("delivery_mode after update = %q, want streaming", got)
+	}
+}
+
+// stubSystemReader stands in for a platform reader so systemCollectors can be
+// exercised on every operating system.
+type stubSystemReader struct{}
+
+func (stubSystemReader) ReadStats(context.Context) (*metrics.SystemStats, error) {
+	return &metrics.SystemStats{}, nil
+}
+
+// TestSystemCollectors covers both platform shapes. A node with a reader gets
+// the node_resources collector; a node without one (up_other.go) gets no
+// collector at all, because a collector built around a nil reader would
+// dereference it on every cycle.
+func TestSystemCollectors(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	if got := systemCollectors(nil, logger); got != nil {
+		t.Errorf("systemCollectors(nil) = %v, want no collector", got)
+	}
+
+	got := systemCollectors(stubSystemReader{}, logger)
+	if len(got) != 1 {
+		t.Fatalf("systemCollectors(reader) returned %d collectors, want 1", len(got))
+	}
+	if _, ok := got[0].(*metrics.SystemCollector); !ok {
+		t.Errorf("systemCollectors(reader)[0] = %T, want *metrics.SystemCollector", got[0])
 	}
 }
 

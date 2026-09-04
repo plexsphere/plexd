@@ -13,7 +13,7 @@ import (
 )
 
 // newSystemReader creates a LinuxSystemReader on Linux.
-func newSystemReader() metrics.SystemReader {
+func newSystemReader(_ *slog.Logger) metrics.SystemReader {
 	return metrics.NewLinuxSystemReader("", "")
 }
 

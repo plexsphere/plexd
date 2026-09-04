@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/plexsphere/plexd/internal/metrics"
 )
 
 // writeJournalctlStub creates an executable journalctl stub in a temporary
@@ -55,5 +57,15 @@ func TestNewJournalReader_ReturnsNilWhenJournalctlMissing(t *testing.T) {
 	}
 	if !strings.Contains(out, "level=INFO") {
 		t.Errorf("log output = %q, want the notice at INFO level", out)
+	}
+}
+
+func TestNewSystemReader_Linux(t *testing.T) {
+	reader := newSystemReader(discardLogger())
+	if reader == nil {
+		t.Fatal("newSystemReader() = nil, want the procfs reader on Linux")
+	}
+	if _, ok := reader.(*metrics.LinuxSystemReader); !ok {
+		t.Errorf("newSystemReader() = %T, want *metrics.LinuxSystemReader", reader)
 	}
 }

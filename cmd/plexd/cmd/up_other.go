@@ -13,7 +13,7 @@ import (
 )
 
 // newSystemReader returns nil on platforms without an implementation.
-func newSystemReader() metrics.SystemReader {
+func newSystemReader(_ *slog.Logger) metrics.SystemReader {
 	return nil
 }
 

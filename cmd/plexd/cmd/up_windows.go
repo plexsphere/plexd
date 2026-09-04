@@ -12,9 +12,11 @@ import (
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
-// newSystemReader returns nil until the Windows metrics reader lands (#13).
-func newSystemReader() metrics.SystemReader {
-	return nil
+// newSystemReader creates the kernel32 and IP Helper backed reader for system
+// metrics on Windows. It needs no privilege: every source is readable by an
+// unprivileged process.
+func newSystemReader(logger *slog.Logger) metrics.SystemReader {
+	return metrics.NewWindowsSystemReader(logger, "", "")
 }
 
 // newJournalReader returns nil until Windows log forwarding lands (#14). The
