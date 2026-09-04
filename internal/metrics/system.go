@@ -29,6 +29,9 @@ type SystemReader interface {
 	ReadStats(ctx context.Context) (*SystemStats, error)
 }
 
+// cpuSampleInterval is the delay between two CPU samples for usage calculation.
+const cpuSampleInterval = 100 * time.Millisecond
+
 // SystemCollector implements Collector for system resource metrics.
 type SystemCollector struct {
 	reader SystemReader
