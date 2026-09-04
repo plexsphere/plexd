@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
 )
 
@@ -27,28 +28,32 @@ func writeJournalctlStub(t *testing.T) {
 	t.Setenv("PATH", dir)
 }
 
-func TestNewJournalReader_ReturnsReaderWhenJournalctlPresent(t *testing.T) {
+func TestNewSystemLogSource_ReturnsJournaldSourceWhenJournalctlPresent(t *testing.T) {
 	writeJournalctlStub(t)
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
-	if reader := newJournalReader(logger); reader == nil {
-		t.Fatal("newJournalReader() = nil, want a reader when journalctl is on PATH")
+	src := newSystemLogSource("host", logger)
+	if src == nil {
+		t.Fatal("newSystemLogSource() = nil, want a source when journalctl is on PATH")
+	}
+	if _, ok := src.(*logfwd.JournaldSource); !ok {
+		t.Errorf("newSystemLogSource() = %T, want *logfwd.JournaldSource", src)
 	}
 	if buf.Len() != 0 {
 		t.Errorf("log output = %q, want none when journalctl is available", buf.String())
 	}
 }
 
-func TestNewJournalReader_ReturnsNilWhenJournalctlMissing(t *testing.T) {
+func TestNewSystemLogSource_ReturnsNilWhenJournalctlMissing(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
-	if reader := newJournalReader(logger); reader != nil {
-		t.Errorf("newJournalReader() = %v, want nil when journalctl is missing", reader)
+	if src := newSystemLogSource("host", logger); src != nil {
+		t.Errorf("newSystemLogSource() = %v, want nil when journalctl is missing", src)
 	}
 
 	out := buf.String()

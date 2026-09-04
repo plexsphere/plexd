@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/bridge"
+	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/wireguard"
@@ -82,14 +83,22 @@ func TestNewSystemReader_Windows(t *testing.T) {
 	}
 }
 
-// TestNewControllers_WindowsStubs pins the subsystems Windows does not have
-// yet, so the sibling that implements one has to flip its stub deliberately.
+func TestNewSystemLogSource_Windows(t *testing.T) {
+	src := newSystemLogSource("host", discardLogger())
+	if src == nil {
+		t.Fatal("newSystemLogSource() = nil, want the Event Log source on Windows")
+	}
+	if _, ok := src.(*logfwd.EventLogSource); !ok {
+		t.Errorf("newSystemLogSource() = %T, want *logfwd.EventLogSource", src)
+	}
+}
+
+// TestNewControllers_WindowsStubs pins the bridge subsystems Windows does not
+// have yet (#12), so the sibling that implements one has to flip its stub
+// deliberately.
 func TestNewControllers_WindowsStubs(t *testing.T) {
 	logger := discardLogger()
 
-	if r := newJournalReader(logger); r != nil {
-		t.Errorf("newJournalReader() = %v, want nil until #14", r)
-	}
 	if c := newAccessController(logger); c != nil {
 		t.Errorf("newAccessController() = %v, want nil until #12", c)
 	}

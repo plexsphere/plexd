@@ -4,10 +4,12 @@ package cmd
 
 import (
 	"log/slog"
+	"path/filepath"
 
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
+	"github.com/plexsphere/plexd/internal/packaging"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
@@ -19,10 +21,13 @@ func newSystemReader(logger *slog.Logger) metrics.SystemReader {
 	return metrics.NewDarwinSystemReader(logger, "", "")
 }
 
-// newJournalReader returns nil until macOS log forwarding lands (#14). The
-// launchd daemon writes to a file, which the existing file source reads.
-func newJournalReader(_ *slog.Logger) logfwd.JournalReader {
-	return nil
+// newSystemLogSource tails the file launchd writes the daemon's output to
+// (the plist's StandardErrorPath) and reads the time and level off each line.
+// A console run writes to the terminal instead of to that file, so the source
+// then forwards nothing new. It is registered regardless, because the file
+// source tolerates an absent file and the daemon is what this serves.
+func newSystemLogSource(hostname string, logger *slog.Logger) logfwd.LogSource {
+	return logfwd.NewDaemonLogSource(filepath.Join(packaging.DefaultLogDir, packaging.DaemonLogFile), packaging.DefaultServiceName, hostname, logger)
 }
 
 // newWGController creates the utun-backed controller for WireGuard on macOS.

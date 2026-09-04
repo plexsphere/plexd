@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/bridge"
+	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/wireguard"
@@ -81,14 +82,22 @@ func TestNewSystemReader_Darwin(t *testing.T) {
 	}
 }
 
-// TestNewControllers_DarwinStubs pins the subsystems macOS does not have yet,
-// so the sibling that implements one has to flip its stub deliberately.
+func TestNewSystemLogSource_Darwin(t *testing.T) {
+	src := newSystemLogSource("host", discardLogger())
+	if src == nil {
+		t.Fatal("newSystemLogSource() = nil, want the daemon log source on macOS")
+	}
+	if _, ok := src.(*logfwd.DaemonLogSource); !ok {
+		t.Errorf("newSystemLogSource() = %T, want *logfwd.DaemonLogSource", src)
+	}
+}
+
+// TestNewControllers_DarwinStubs pins the bridge subsystems macOS does not
+// have yet (#12), so the sibling that implements one has to flip its stub
+// deliberately.
 func TestNewControllers_DarwinStubs(t *testing.T) {
 	logger := discardLogger()
 
-	if r := newJournalReader(logger); r != nil {
-		t.Errorf("newJournalReader() = %v, want nil until #14", r)
-	}
 	if c := newAccessController(logger); c != nil {
 		t.Errorf("newAccessController() = %v, want nil until #12", c)
 	}
