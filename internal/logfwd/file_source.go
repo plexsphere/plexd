@@ -30,6 +30,14 @@ type FileSource struct {
 	hostname string
 	logger   *slog.Logger
 	states   map[string]fileState
+
+	// openFlags are added to every open this source performs, so a caller
+	// that reads a file somebody else may substitute can constrain what the
+	// open accepts. Zero for a plain glob source; DaemonLogSource sets
+	// daemonLogReadFlags. The flags belong here rather than in a check in
+	// front of the read, because only the open itself sees the file the read
+	// will return.
+	openFlags int
 }
 
 // NewFileSource creates a new FileSource.
@@ -76,7 +84,7 @@ func (s *FileSource) Collect(ctx context.Context) ([]api.LogEntry, error) {
 
 // readFile reads new lines from a single file, tracking offset and detecting rotation.
 func (s *FileSource) readFile(path string) ([]api.LogEntry, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|s.openFlags, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +166,7 @@ func (s *FileSource) readFile(path string) ([]api.LogEntry, error) {
 // fall inside a line, so the first line the next Collect scans may be a
 // fragment, which the caller drops.
 func (s *FileSource) seekTail(path string, window int64) error {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|s.openFlags, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
