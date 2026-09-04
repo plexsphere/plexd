@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/metrics"
 )
 
 // BuiltinFunc is the signature for built-in action implementations.
@@ -131,13 +133,21 @@ func PingPeer(info NodeInfoProvider) BuiltinFunc {
 			}
 		}
 
-		cmd := exec.CommandContext(ctx, "ping", "-c", count, "-W", "3", target)
+		name, args := pingCommand(count, target)
+		cmd := exec.CommandContext(ctx, name, args...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			if cmd.ProcessState != nil {
 				return "", string(out), cmd.ProcessState.ExitCode(), nil
 			}
 			return "", err.Error(), 1, nil
+		}
+		// The exit status is not the whole answer everywhere: Windows ping.exe
+		// exits 0 for any ICMP response, a router's "Destination host
+		// unreachable" included, so an unreachable peer would be reported as
+		// reachable.
+		if !pingSucceeded(out) {
+			return "", string(out), 1, nil
 		}
 
 		return string(out), "", 0, nil
@@ -160,7 +170,10 @@ type diagnosticsCollectResult struct {
 
 // DiagnosticsCollect returns a BuiltinFunc that collects system diagnostics and returns them as JSON.
 // Optional parameters: "include_network" (default "true"), "include_processes" (default "true").
-func DiagnosticsCollect() BuiltinFunc {
+// The reader fills "memory_total" and "load_avg" where the /proc files yield
+// nothing, which is the case on macOS and Windows. A nil reader keeps the
+// /proc-only behaviour.
+func DiagnosticsCollect(reader metrics.SystemReader) BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
 		includeNetwork := params["include_network"] != "false"
 		includeProcesses := params["include_processes"] != "false"
@@ -192,6 +205,29 @@ func DiagnosticsCollect() BuiltinFunc {
 			loadAvg = strings.TrimSpace(string(data))
 		}
 
+		// The platform reader answers where /proc does not. On Linux the
+		// /proc reads already filled both values, so the output there is
+		// unchanged. A reader error leaves both values as the /proc reads
+		// left them, matching their soft-fail.
+		//
+		// The macOS and Windows readers are best-effort and report a source
+		// they could not read as a zero field under a nil error, so only a
+		// non-zero load counts as a reading: a failed vm.loadavg would
+		// otherwise surface as "0.00 0.00 0.00", a well-formed measurement
+		// claiming the machine is idle. Windows has no load average at all
+		// and is excluded outright.
+		if reader != nil && (memTotal == 0 || loadAvg == "") {
+			if stats, err := reader.ReadStats(ctx); err == nil {
+				if memTotal == 0 {
+					memTotal = stats.MemoryTotalBytes
+				}
+				if loadAvg == "" && runtime.GOOS != "windows" &&
+					(stats.LoadAvg1 != 0 || stats.LoadAvg5 != 0 || stats.LoadAvg15 != 0) {
+					loadAvg = fmt.Sprintf("%.2f %.2f %.2f", stats.LoadAvg1, stats.LoadAvg5, stats.LoadAvg15)
+				}
+			}
+		}
+
 		kernelVersion := kernelRelease()
 		if kernelVersion == "" {
 			kernelVersion = runtime.GOOS + "/" + runtime.GOARCH
@@ -209,12 +245,14 @@ func DiagnosticsCollect() BuiltinFunc {
 		}
 
 		if includeNetwork {
-			if out, err := exec.CommandContext(ctx, "ip", "addr", "show").CombinedOutput(); err == nil {
+			name, args := networkListCommand()
+			if out, err := exec.CommandContext(ctx, name, args...).CombinedOutput(); err == nil {
 				result.NetworkInterfaces = string(out)
 			}
 		}
 		if includeProcesses {
-			if out, err := exec.CommandContext(ctx, "ps", "aux", "--no-headers").CombinedOutput(); err == nil {
+			name, args := processListCommand()
+			if out, err := exec.CommandContext(ctx, name, args...).CombinedOutput(); err == nil {
 				result.Processes = string(out)
 			}
 		}
@@ -248,12 +286,12 @@ func DiagnosticsTraceroutePeer(info NodeInfoProvider) BuiltinFunc {
 			}
 		}
 
-		path, err := exec.LookPath("traceroute")
+		name, args, err := tracerouteCommand(maxHops, target)
 		if err != nil {
 			return "", "", 1, fmt.Errorf("traceroute not available")
 		}
 
-		cmd := exec.CommandContext(ctx, path, "-n", "-m", maxHops, "-w", "3", target)
+		cmd := exec.CommandContext(ctx, name, args...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			if cmd.ProcessState != nil {

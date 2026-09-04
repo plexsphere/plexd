@@ -3,12 +3,70 @@
 package actions
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"golang.org/x/sys/windows"
 )
+
+// systemDirBin returns the absolute path of the helper binary name in the
+// Windows system directory. The service runs as LocalSystem, so a bare name
+// would be resolved through %PATH%, and exec.LookPath returns the first match
+// in PATH order rather than the System32 one: a machine-PATH entry ahead of
+// System32 that an unprivileged user can write to would then run with SYSTEM
+// rights. GetSystemDirectory is the authoritative answer; %SystemRoot% is set
+// by the kernel for every session and only serves as a fallback.
+func systemDirBin(name string) string {
+	dir, err := windows.GetSystemDirectory()
+	if err != nil || dir == "" {
+		root := os.Getenv("SystemRoot")
+		if root == "" {
+			root = `C:\Windows`
+		}
+		dir = filepath.Join(root, "System32")
+	}
+	return filepath.Join(dir, name)
+}
+
+// networkListCommand returns the command that lists the host's network
+// interfaces.
+func networkListCommand() (string, []string) {
+	return systemDirBin("ipconfig.exe"), []string{"/all"}
+}
+
+// processListCommand returns the command that lists the host's processes.
+func processListCommand() (string, []string) {
+	return systemDirBin("tasklist.exe"), nil
+}
+
+// pingCommand returns the command that sends count echo requests to target.
+// Windows ping takes the count as -n and the per-reply wait as -w in
+// milliseconds, not the iputils -c and -W.
+func pingCommand(count, target string) (string, []string) {
+	return systemDirBin("ping.exe"), []string{"-n", count, "-w", "3000", target}
+}
+
+// pingSucceeded reports whether out holds a real echo reply. ping.exe exits 0
+// for any ICMP response, a router's "Destination host unreachable" and a "TTL
+// expired in transit" included, so the exit status alone would report a peer
+// behind a broken tunnel as reachable. The TTL= token is the one part of a
+// reply line Windows does not localize.
+func pingSucceeded(out []byte) bool {
+	return bytes.Contains(out, []byte("TTL="))
+}
+
+// tracerouteCommand returns the command that traces the route to target.
+// Windows ships tracert.exe and has no traceroute.exe, so a PATH lookup for
+// the Unix name could only ever resolve a planted file — and PATHEXT would let
+// a traceroute.bat count as one. -d suppresses name resolution like -n does on
+// Unix, and -w is the per-hop wait in milliseconds. The error return exists for
+// the Unix build, where the binary is optional; here it is always nil.
+func tracerouteCommand(maxHops, target string) (string, []string, error) {
+	return systemDirBin("tracert.exe"), []string{"-d", "-h", maxHops, "-w", "3000", target}, nil
+}
 
 // errReloadSignalUnsupported is returned by sendReloadSignal because Windows
 // has no signal that maps to a configuration reload.

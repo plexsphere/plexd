@@ -122,7 +122,7 @@ func TestIntegration_ActionsList(t *testing.T) {
 	cfg := actions.Config{Enabled: boolPtr(true)}
 	cfg.ApplyDefaults()
 	executor := actions.NewExecutor(cfg, noopActionReporter{}, noopHookVerifier{}, discardLogger())
-	executor.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics", nil, actions.DiagnosticsCollect())
+	executor.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics", nil, actions.DiagnosticsCollect(nil))
 	executor.RegisterBuiltin("service.restart", "Restart plexd service", nil,
 		actions.ServiceRestart(packaging.NewService(packaging.NewServiceManager(discardLogger()), packaging.InstallConfig{})))
 
@@ -176,7 +176,7 @@ func TestIntegration_ActionsRunSuccess(t *testing.T) {
 	cfg := actions.Config{Enabled: boolPtr(true)}
 	cfg.ApplyDefaults()
 	executor := actions.NewExecutor(cfg, noopActionReporter{}, noopHookVerifier{}, discardLogger())
-	executor.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics", nil, actions.DiagnosticsCollect())
+	executor.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics", nil, actions.DiagnosticsCollect(nil))
 
 	socketPath := startTestNodeAPI(t, ctx, executor, nil)
 
