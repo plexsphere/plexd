@@ -590,7 +590,7 @@ func runAgent(ctx context.Context) error {
 		[]api.ActionParam{
 			{Name: "include_network", Type: "bool", Required: false, Default: "true", Description: "Include network interface info"},
 			{Name: "include_processes", Type: "bool", Required: false, Default: "true", Description: "Include process listing"},
-		}, actions.DiagnosticsCollect())
+		}, actions.DiagnosticsCollect(sysReader))
 	executor.RegisterBuiltin("diagnostics.ping_peer", "Ping a mesh peer and report latency",
 		[]api.ActionParam{
 			{Name: "peer_id", Type: "string", Required: true, Description: "Peer mesh IP address"},

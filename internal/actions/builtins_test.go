@@ -17,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/metrics"
 )
 
 type mockNodeInfo struct {
@@ -161,11 +163,13 @@ func TestBuiltinPingPeer_InvalidPeerID(t *testing.T) {
 }
 
 func TestBuiltinPingPeer_ValidTarget(t *testing.T) {
-	// PingPeer passes iputils flags. BSD ping on macOS reads -W in
-	// milliseconds and times out; Windows ping has -n/-w instead of -c/-W and
-	// its binary exists, so the LookPath guard below does not fire there.
+	// Only Linux answers an ICMP echo to the loopback address unconditionally:
+	// the macOS firewall drops echo requests in stealth mode, so a red run
+	// there would say nothing about PingPeer. The binary and the flags
+	// pingCommand picks per platform are pinned by TestPlatformCommandsOnDarwin
+	// and TestPlatformCommandsOnWindows instead.
 	if runtime.GOOS != "linux" {
-		t.Skip("PingPeer passes iputils flags: BSD ping reads -W in milliseconds and Windows ping uses -n/-w")
+		t.Skip("a loopback echo reply is only guaranteed on Linux")
 	}
 	if _, err := exec.LookPath("ping"); err != nil {
 		t.Skip("ping not available")
@@ -192,7 +196,7 @@ func TestBuiltinPingPeer_ValidTarget(t *testing.T) {
 }
 
 func TestBuiltinDiagnosticsCollect(t *testing.T) {
-	fn := DiagnosticsCollect()
+	fn := DiagnosticsCollect(nil)
 	stdout, stderr, exitCode, err := fn(context.Background(), nil)
 
 	if err != nil {
@@ -225,6 +229,195 @@ func TestBuiltinDiagnosticsCollect(t *testing.T) {
 	}
 	if int(result["cpu_count"].(float64)) != runtime.NumCPU() {
 		t.Errorf("expected cpu_count=%d, got %v", runtime.NumCPU(), result["cpu_count"])
+	}
+}
+
+// stubSystemReader is a metrics.SystemReader with a canned answer.
+type stubSystemReader struct {
+	stats *metrics.SystemStats
+	err   error
+}
+
+func (s *stubSystemReader) ReadStats(context.Context) (*metrics.SystemStats, error) {
+	return s.stats, s.err
+}
+
+func TestBuiltinDiagnosticsCollect_ReaderFillsGaps(t *testing.T) {
+	reader := &stubSystemReader{stats: &metrics.SystemStats{
+		MemoryTotalBytes: 4096,
+		LoadAvg1:         1.5,
+		LoadAvg5:         2,
+		LoadAvg15:        2.5,
+	}}
+
+	fn := DiagnosticsCollect(reader)
+	stdout, _, exitCode, err := fn(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("DiagnosticsCollect() err = %v, want nil", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("DiagnosticsCollect() exit code = %d, want 0", exitCode)
+	}
+
+	var result struct {
+		MemoryTotal uint64 `json:"memory_total"`
+		LoadAvg     string `json:"load_avg"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
+	}
+
+	switch runtime.GOOS {
+	case "linux":
+		if result.MemoryTotal == 4096 {
+			t.Errorf("memory_total = %d, want the /proc/meminfo value", result.MemoryTotal)
+		}
+		if got := len(strings.Fields(result.LoadAvg)); got != 5 {
+			t.Errorf("load_avg = %q has %d fields, want the 5 fields of /proc/loadavg", result.LoadAvg, got)
+		}
+	case "darwin":
+		if result.MemoryTotal != 4096 {
+			t.Errorf("memory_total = %d, want 4096", result.MemoryTotal)
+		}
+		if result.LoadAvg != "1.50 2.00 2.50" {
+			t.Errorf("load_avg = %q, want %q", result.LoadAvg, "1.50 2.00 2.50")
+		}
+	case "windows":
+		if result.MemoryTotal != 4096 {
+			t.Errorf("memory_total = %d, want 4096", result.MemoryTotal)
+		}
+		if result.LoadAvg != "" {
+			t.Errorf("load_avg = %q, want the empty string because Windows has no load average", result.LoadAvg)
+		}
+	default:
+		t.Skipf("no expectation for GOOS %q", runtime.GOOS)
+	}
+}
+
+// TestBuiltinDiagnosticsCollect_ReaderDegradedLoad pins the macOS reader's
+// soft-fail shape: a source it could not read leaves its fields at zero and
+// still returns a nil error, so a load of zero is a missing reading and must
+// not be formatted into a "0.00 0.00 0.00" that claims the machine is idle.
+func TestBuiltinDiagnosticsCollect_ReaderDegradedLoad(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("/proc/loadavg fills load_avg before the reader is consulted")
+	}
+
+	reader := &stubSystemReader{stats: &metrics.SystemStats{MemoryTotalBytes: 4096}}
+
+	fn := DiagnosticsCollect(reader)
+	stdout, _, exitCode, err := fn(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("DiagnosticsCollect() err = %v, want nil", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("DiagnosticsCollect() exit code = %d, want 0", exitCode)
+	}
+
+	var result struct {
+		MemoryTotal uint64 `json:"memory_total"`
+		LoadAvg     string `json:"load_avg"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
+	}
+	if result.MemoryTotal != 4096 {
+		t.Errorf("memory_total = %d, want 4096 from the source that did read", result.MemoryTotal)
+	}
+	if result.LoadAvg != "" {
+		t.Errorf("load_avg = %q, want the empty string for a load the reader could not read", result.LoadAvg)
+	}
+}
+
+func TestBuiltinDiagnosticsCollect_ReaderError(t *testing.T) {
+	reader := &stubSystemReader{err: errors.New("no stats")}
+
+	fn := DiagnosticsCollect(reader)
+	stdout, _, exitCode, err := fn(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("DiagnosticsCollect() err = %v, want nil", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("DiagnosticsCollect() exit code = %d, want 0", exitCode)
+	}
+
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		return
+	}
+
+	var result struct {
+		MemoryTotal uint64 `json:"memory_total"`
+		LoadAvg     string `json:"load_avg"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
+	}
+	if result.MemoryTotal != 0 {
+		t.Errorf("memory_total = %d, want 0 after a reader error", result.MemoryTotal)
+	}
+	if result.LoadAvg != "" {
+		t.Errorf("load_avg = %q, want the empty string after a reader error", result.LoadAvg)
+	}
+}
+
+func TestBuiltinDiagnosticsCollect_Listings(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("ip and ps are not guaranteed in the Linux test container")
+	}
+
+	fn := DiagnosticsCollect(nil)
+	stdout, _, exitCode, err := fn(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("DiagnosticsCollect() err = %v, want nil", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("DiagnosticsCollect() exit code = %d, want 0", exitCode)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
+	}
+
+	for _, key := range []string{"network_interfaces", "processes"} {
+		value, ok := result[key]
+		if !ok {
+			t.Errorf("key %q is missing, want the command output", key)
+			continue
+		}
+		text, ok := value.(string)
+		if !ok {
+			t.Errorf("key %q is %T, want string", key, value)
+			continue
+		}
+		if text == "" {
+			t.Errorf("key %q is empty, want the command output", key)
+		}
+	}
+}
+
+func TestBuiltinDiagnosticsCollect_ListingsDisabled(t *testing.T) {
+	fn := DiagnosticsCollect(nil)
+	stdout, _, exitCode, err := fn(context.Background(), map[string]string{
+		"include_network":   "false",
+		"include_processes": "false",
+	})
+	if err != nil {
+		t.Fatalf("DiagnosticsCollect() err = %v, want nil", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("DiagnosticsCollect() exit code = %d, want 0", exitCode)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
+	}
+
+	for _, key := range []string{"network_interfaces", "processes"} {
+		if _, ok := result[key]; ok {
+			t.Errorf("key %q is present, want it omitted", key)
+		}
 	}
 }
 
