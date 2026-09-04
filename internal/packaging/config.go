@@ -76,6 +76,11 @@ var DefaultLogDir = defaultLogDir()
 // DefaultServiceName is the default service name.
 const DefaultServiceName = "plexd"
 
+// DaemonLogFile is the name of the file the service manager writes the
+// daemon's output to, under LogDir, where a manager keeps such a file
+// (launchd's StandardOutPath and StandardErrorPath on macOS).
+const DaemonLogFile = "plexd.log"
+
 // DefaultUnitFilePath is the default path of the service definition file,
 // resolved per platform by defaultUnitFilePath. It is empty where the manager
 // keeps no file.
