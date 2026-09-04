@@ -3,6 +3,7 @@ module github.com/plexsphere/plexd
 go 1.26.0
 
 require (
+	github.com/ebitengine/purego v0.11.0
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/google/nftables v0.3.0
 	github.com/sigstore/sigstore-go v1.2.2
