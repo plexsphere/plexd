@@ -2,9 +2,14 @@ package logfwd
 
 import (
 	"context"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
+
+// systemLogWindow is how far back the first collection of a platform log
+// source reaches, matching journalctl's --since=60 seconds ago.
+const systemLogWindow = 60 * time.Second
 
 // LogSource collects log entries from a specific source.
 type LogSource interface {
