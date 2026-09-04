@@ -92,13 +92,15 @@ Produces the LaunchDaemon property list macOS loads from `/Library/LaunchDaemons
 
 launchd has no `StartLimitBurst` counterpart, so a daemon that exits on a configuration error restarts every five seconds until an operator boots it out. It has no `EnvironmentFile` counterpart either: `PLEXD_*` overrides on macOS go into `config.yaml`, or into an `EnvironmentVariables` dict an operator adds by hand.
 
+When the daemon finds its own stderr to be the log file above, it writes its log records through a writer that reopens the path whenever the file sitting there changes, so the newsyslog rotation below does not strand its output in the renamed file. Every reopen uses `O_NOFOLLOW`, because `/Library/Logs` is writable by the admin group and the daemon runs as root. A symlink already at the path is therefore left alone entirely: the writer is not installed and the records keep going to the descriptor launchd opened, rather than to a writer whose every write the reopen would refuse. Output the log handler does not produce (a Go panic trace, and the missing-configuration warning that runs before the logger exists) still goes to that descriptor in either case.
+
 ## GenerateNewsyslogConf
 
 ```go
 func GenerateNewsyslogConf(cfg InstallConfig) string
 ```
 
-Produces the rotation rule `plexd install` writes to `/etc/newsyslog.d/com.plexsphere.plexd.conf`. launchd appends to `StandardOutPath` forever, so without it the log grows without bound.
+Produces the rotation rule `plexd install` writes to `/etc/newsyslog.d/com.plexsphere.plexd.conf`. launchd appends to `StandardOutPath` forever, so without it the log grows without bound. The rule carries no `path_to_pid_file` for the reason above. That field names the process newsyslog signals after a rotation; without it the signal goes to syslogd rather than to the daemon, and the daemon needs no signal to find the new file.
 
 ```
 # plexd log rotation, written by plexd install

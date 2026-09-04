@@ -91,7 +91,7 @@ flowchart TD
 11. **Create hook watcher** — `actions.NewHookWatcher()` for filesystem hook scanning
 12. **Create node API server** — `nodeapi.NewServer()`, wire action provider, hook reloader, and reconcile handler
 13. **Create metrics collectors + manager** — system collector, agent stats collector, `metrics.NewManager()`
-14. **Create log sources + forwarder** — journald source, file sources from `file_patterns`, `logfwd.NewForwarder()`
+14. **Create log sources + forwarder** — platform log source (journald on Linux, the launchd log file on macOS, the Event Log on Windows), file sources from `file_patterns`, `logfwd.NewForwarder()`
 15. **Create audit sources + forwarder** — process source, `auditfwd.NewForwarder()`
 
 **Goroutines (10 in node mode, 11 in bridge mode):**
