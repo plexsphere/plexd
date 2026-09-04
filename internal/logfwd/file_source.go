@@ -3,6 +3,7 @@ package logfwd
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -148,4 +149,32 @@ func (s *FileSource) readFile(path string) ([]api.LogEntry, error) {
 	s.states[path] = state
 
 	return entries, nil
+}
+
+// seekTail records path at an offset window bytes before its end, so the
+// first Collect reads only that tail of a file that predates the source. A
+// file shorter than window is read from its start. A missing file is not an
+// error: Collect finds it later and reads it from the start. The offset can
+// fall inside a line, so the first line the next Collect scans may be a
+// fragment, which the caller drops.
+func (s *FileSource) seekTail(path string, window int64) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+
+	// Stat through the open handle for the same reason readFile does: the
+	// FileInfo goes into the state that os.SameFile later compares.
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
+	s.states[path] = fileState{offset: max(0, info.Size()-window), info: info}
+
+	return nil
 }

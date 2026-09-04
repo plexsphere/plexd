@@ -2,9 +2,13 @@ package logfwd
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -292,5 +296,150 @@ func TestFileSource_UnreadableFileSkipped(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected entry from good.log")
+	}
+}
+
+func TestFileSource_SeekTail(t *testing.T) {
+	t.Run("long file reads the tail", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "app.log")
+
+		// Ten lines of seven bytes each ("lineNN\n"), so the file is 70 bytes
+		// and "line08\n" occupies bytes 49 to 55.
+		var content strings.Builder
+		for i := 1; i <= 10; i++ {
+			fmt.Fprintf(&content, "line%02d\n", i)
+		}
+		if err := os.WriteFile(path, []byte(content.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		// A 19 byte window puts the offset at byte 51, inside line08, so the
+		// first line Collect scans is the fragment "ne08".
+		const window = 19
+
+		src := NewFileSource(path, "host", discardLogger())
+		if err := src.seekTail(path, window); err != nil {
+			t.Fatalf("seekTail() error = %v", err)
+		}
+
+		entries, err := src.Collect(context.Background())
+		if err != nil {
+			t.Fatalf("Collect() error = %v", err)
+		}
+		if len(entries) != 3 {
+			t.Fatalf("len(entries) = %d, want 3", len(entries))
+		}
+
+		fragment := entries[0].Message
+		if fragment == "line08" {
+			t.Errorf("entries[0].Message = %q, want a fragment of it", fragment)
+		}
+		if fragment == "" || !strings.HasSuffix("line08", fragment) {
+			t.Errorf("entries[0].Message = %q, want a non-empty suffix of %q", fragment, "line08")
+		}
+		if entries[1].Message != "line09" {
+			t.Errorf("entries[1].Message = %q, want %q", entries[1].Message, "line09")
+		}
+		if entries[2].Message != "line10" {
+			t.Errorf("entries[2].Message = %q, want %q", entries[2].Message, "line10")
+		}
+
+		// The offset advanced past the tail, so nothing is re-read.
+		entries, err = src.Collect(context.Background())
+		if err != nil {
+			t.Fatalf("second Collect() error = %v", err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("second Collect: len(entries) = %d, want 0", len(entries))
+		}
+	})
+
+	t.Run("short file reads from the start", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "app.log")
+		if err := os.WriteFile(path, []byte("one\ntwo\nthree\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		src := NewFileSource(path, "host", discardLogger())
+		if err := src.seekTail(path, 1024); err != nil {
+			t.Fatalf("seekTail() error = %v", err)
+		}
+
+		entries, err := src.Collect(context.Background())
+		if err != nil {
+			t.Fatalf("Collect() error = %v", err)
+		}
+		if len(entries) != 3 {
+			t.Fatalf("len(entries) = %d, want 3", len(entries))
+		}
+		for i, want := range []string{"one", "two", "three"} {
+			if entries[i].Message != want {
+				t.Errorf("entries[%d].Message = %q, want %q", i, entries[i].Message, want)
+			}
+		}
+	})
+
+	t.Run("missing file records nothing", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "absent.log")
+
+		src := NewFileSource(path, "host", discardLogger())
+		if err := src.seekTail(path, 1024); err != nil {
+			t.Fatalf("seekTail() error = %v, want nil for a missing file", err)
+		}
+		if len(src.states) != 0 {
+			t.Errorf("len(states) = %d, want 0", len(src.states))
+		}
+
+		entries, err := src.Collect(context.Background())
+		if err != nil {
+			t.Fatalf("Collect() error = %v", err)
+		}
+		if entries != nil {
+			t.Errorf("entries = %v, want nil", entries)
+		}
+	})
+}
+
+func TestFileSource_SeekTail_Unreadable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits do not deny reads on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses mode bits")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	if err := os.WriteFile(path, []byte("secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Restore the mode so t.TempDir can clean the directory up.
+	t.Cleanup(func() {
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Error(err)
+		}
+	})
+
+	src := NewFileSource(path, "host", discardLogger())
+	err := src.seekTail(path, 1024)
+	if err == nil {
+		t.Fatal("seekTail() error = nil, want a permission error")
+	}
+
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) {
+		t.Errorf("seekTail() error = %v (%T), want a *os.PathError", err, err)
+	}
+	if !errors.Is(err, syscall.EACCES) {
+		t.Errorf("seekTail() error = %v, want it to wrap syscall.EACCES", err)
+	}
+	if len(src.states) != 0 {
+		t.Errorf("len(states) = %d, want 0", len(src.states))
 	}
 }
