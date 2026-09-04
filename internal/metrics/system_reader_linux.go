@@ -13,9 +13,6 @@ import (
 	"time"
 )
 
-// cpuSampleInterval is the delay between two /proc/stat reads for CPU usage calculation.
-const cpuSampleInterval = 100 * time.Millisecond
-
 // LinuxSystemReader reads system metrics from /proc and syscall on Linux.
 type LinuxSystemReader struct {
 	mountPoint string
