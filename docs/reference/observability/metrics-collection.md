@@ -195,6 +195,84 @@ func NewLinuxSystemReader(mountPoint, netIface string) *LinuxSystemReader
 
 Build-tagged `//go:build linux`.
 
+### DarwinSystemReader
+
+Concrete `SystemReader` implementation for macOS, reading from sysctl, `statfs`, the routing socket and the Mach host port.
+
+```go
+func NewDarwinSystemReader(logger *slog.Logger, mountPoint, netIface string) *DarwinSystemReader
+```
+
+| Parameter    | Default  | Description                                              |
+|--------------|----------|----------------------------------------------------------|
+| `logger`     | _(none)_ | Target of the degrade log (see [Degraded readings](#degraded-readings)) |
+| `mountPoint` | `"/"`    | Filesystem path for disk stats via `statfs`              |
+| `netIface`   | `""`     | Network interface for rx/tx bytes; empty sums all (excl. loopback) |
+
+**Data Sources:**
+
+| Field              | Source                                | Method                                              |
+|--------------------|---------------------------------------|-----------------------------------------------------|
+| `CPUUsagePercent`  | `host_statistics(HOST_CPU_LOAD_INFO)` | Two samples 100ms apart, delta busy/total           |
+| `MemoryUsedBytes`  | `host_statistics64(HOST_VM_INFO64)`   | `(internal - purgeable + wired + compressor) pages × hw.pagesize` |
+| `MemoryTotalBytes` | `sysctl hw.memsize`                   | Physical memory of the machine                      |
+| `DiskUsedBytes`    | `statfs`                              | `(Blocks - Bfree) × Bsize`                         |
+| `DiskTotalBytes`   | `statfs`                              | `Blocks × Bsize`                                   |
+| `NetworkRxBytes`   | `NET_RT_IFLIST2` (routing socket)     | Sum of `ifi_ibytes` per interface (excl. loopback)  |
+| `NetworkTxBytes`   | `NET_RT_IFLIST2` (routing socket)     | Sum of `ifi_obytes` per interface (excl. loopback)  |
+| `LoadAvg1/5/15`    | `sysctl vm.loadavg`                   | Three fixed-point values divided by `fscale`        |
+
+`MemoryUsedBytes` is the number Activity Monitor shows as "Memory Used" and the counterpart of the Linux reader's `MemTotal - MemAvailable`; the file cache does not count as used. `top` counts it and reports a higher number.
+
+The two Mach calls go through `github.com/ebitengine/purego` v0.11.0, the Apache-2.0 licensed package that resolves symbols out of `/usr/lib/libSystem.B.dylib` without cgo. It is imported from `//go:build darwin` files only, so no other target pulls it into a build.
+
+Every source the reader touches is readable by an unprivileged process.
+
+Build-tagged `//go:build darwin`.
+
+### WindowsSystemReader
+
+Concrete `SystemReader` implementation for Windows, reading from kernel32 and the IP Helper API.
+
+```go
+func NewWindowsSystemReader(logger *slog.Logger, mountPoint, netIface string) *WindowsSystemReader
+```
+
+| Parameter    | Default           | Description                                              |
+|--------------|-------------------|----------------------------------------------------------|
+| `logger`     | _(none)_          | Target of the degrade log (see [Degraded readings](#degraded-readings)) |
+| `mountPoint` | `%SystemDrive%\`  | Filesystem path for disk stats via `GetDiskFreeSpaceEx`  |
+| `netIface`   | `""`              | Adapter friendly name (e.g. `Ethernet`) for rx/tx bytes; empty sums all (excl. loopback) |
+
+**Data Sources:**
+
+| Field              | Source                      | Method                                                    |
+|--------------------|-----------------------------|-----------------------------------------------------------|
+| `CPUUsagePercent`  | `GetSystemTimes`            | Two samples 100ms apart, `(kernel + user - idle) / (kernel + user)` |
+| `MemoryUsedBytes`  | `GlobalMemoryStatusEx`      | `TotalPhys - AvailPhys`                                   |
+| `MemoryTotalBytes` | `GlobalMemoryStatusEx`      | `TotalPhys`                                               |
+| `DiskUsedBytes`    | `GetDiskFreeSpaceEx`        | `total - totalFree`                                       |
+| `DiskTotalBytes`   | `GetDiskFreeSpaceEx`        | `total`                                                   |
+| `NetworkRxBytes`   | `GetIfTable2Ex` (IP Helper) | Sum of `InOctets` per adapter (excl. `IF_TYPE_SOFTWARE_LOOPBACK`) |
+| `NetworkTxBytes`   | `GetIfTable2Ex` (IP Helper) | Sum of `OutOctets` per adapter (excl. `IF_TYPE_SOFTWARE_LOOPBACK`) |
+| `LoadAvg1/5/15`    | none                        | Always 0, Windows has no load average                     |
+
+The kernel time `GetSystemTimes` reports contains the idle time, so the busy time is kernel plus user minus idle. `GetSystemTimes` and `GlobalMemoryStatusEx` are resolved from `kernel32.dll` at first use, and `GetIfTable2Ex` is called through `winipcfg`, the IP Helper binding the Wintun adapter already uses.
+
+Every source the reader touches is readable by an unprivileged process.
+
+Build-tagged `//go:build windows`.
+
+### Degraded readings
+
+The macOS and Windows readers are best-effort. Their sources fail independently, so one that cannot be read leaves its fields at 0 while `ReadStats` returns the remaining fields with a nil error. Each failure is logged as `system metric unavailable` with `component=metrics`, the failing `metric` (`cpu`, `memory`, `load`, `disk` or `network`) and the error. The first report for a metric logs at warn level and every later one at debug level, so a host that is missing a source costs one warning instead of one per collect cycle.
+
+```text
+level=WARN msg="system metric unavailable" component=metrics metric=network error="sysctl NET_RT_IFLIST2: invalid argument"
+```
+
+The Linux reader keeps its behaviour: a failing source fails the whole reading, and the manager logs `collector failed` and drops the system reading for that cycle.
+
 ## TunnelCollector
 
 Collects per-peer tunnel health metrics via an injectable `TunnelStatsReader`.

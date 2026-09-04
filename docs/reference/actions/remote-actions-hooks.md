@@ -378,18 +378,34 @@ Collects system diagnostics (hostname, OS, architecture, CPU count, memory, disk
 }
 ```
 
-Two fields are read per platform:
+Six fields are read per platform:
 
-| Field | Unix | Windows |
-|---|---|---|
-| `disk_total` | `statfs` of `/` | `GetDiskFreeSpaceEx` of `%SystemDrive%\` |
-| `kernel_version` | the `uname` release (e.g. `6.1.0-amd64`) | `major.minor.build` from `RtlGetVersion` (e.g. `10.0.19045`) |
+| Field | Linux | macOS | Windows |
+|---|---|---|---|
+| `memory_total` | `MemTotal` from `/proc/meminfo` | `hw.memsize` | `GlobalMemoryStatusEx` |
+| `load_avg` | the `/proc/loadavg` line | `vm.loadavg`, formatted as `1.50 2.00 2.50` | empty, Windows has no load average |
+| `disk_total` | `statfs` of `/` | `statfs` of `/` | `GetDiskFreeSpaceEx` of `%SystemDrive%\` |
+| `kernel_version` | the `uname` release (e.g. `6.1.0-amd64`) | the `uname` release (e.g. `24.6.0`) | `major.minor.build` from `RtlGetVersion` (e.g. `10.0.19045`) |
+| `network_interfaces` | `ip addr show` | `/sbin/ifconfig -a` | `%SystemRoot%\System32\ipconfig.exe /all` |
+| `processes` | `ps aux --no-headers` | `/bin/ps aux` | `%SystemRoot%\System32\tasklist.exe` |
 
 When the `uname` call fails, `kernel_version` falls back to `<GOOS>/<GOARCH>`.
 
+`memory_total` and `load_avg` come from the platform system reader (see [degraded readings](../observability/metrics-collection.md#degraded-readings)) where the `/proc` files do not exist. A reader error leaves both at the values the `/proc` reads produced, which is 0 and empty on those platforms. The same holds for a single source the reader could not read: it reports a zero field, and `load_avg` stays empty rather than reporting `0.00 0.00 0.00`.
+
+The macOS and Windows commands are addressed by absolute path, as are the ping and traceroute binaries of the two peer diagnostics below. launchd starts the daemon with a minimal `PATH`, and the Windows service runs as `LocalSystem`, where a bare name would be resolved through the machine `PATH` and any entry ahead of `System32` would run with `SYSTEM` rights.
+
+Linux resolves the same binaries from the system directories (`/usr/sbin`, `/sbin`, `/usr/bin`, `/bin`) first and only falls back to a `PATH` lookup for distributions that place them elsewhere. The daemon runs as root under systemd, so it must not take the first `PATH` match either: an entry ahead of those directories that an unprivileged account can write to — a unit drop-in extending `PATH`, an operator shell carrying `~/bin` — would otherwise run with root rights.
+
 ### diagnostics.ping_peer
 
-Pings a mesh peer and reports latency. Uses the system `ping` command with `-c <count> -W 3`.
+Pings a mesh peer and reports latency. The binary and its flags are picked per platform, because the flag letters and the unit of the wait differ:
+
+| Platform | Command |
+|---|---|
+| Linux | `ping -c <count> -W 3` |
+| macOS | `/sbin/ping -c <count> -W 3000` — BSD `ping` reads `-W` in milliseconds |
+| Windows | `%SystemRoot%\System32\ping.exe -n <count> -w 3000` |
 
 | Parameter | Type   | Required | Default | Description              |
 |-----------|--------|----------|---------|--------------------------|
@@ -398,16 +414,24 @@ Pings a mesh peer and reports latency. Uses the system `ping` command with `-c <
 
 Returns ping output in stdout. Exit code 0 on success, 1 on failure (unreachable or invalid IP).
 
+On Windows the exit status is not the whole answer: `ping.exe` exits 0 for any ICMP response, a router's `Destination host unreachable` and a `TTL expired in transit` included. The reply is therefore checked for the `TTL=` token of a real echo reply, the one part of the line Windows does not localize, and an answer without it is reported as exit code 1 with the output on stderr. `iputils` and BSD `ping` report the same case through the exit status, so their output is not read.
+
 ### diagnostics.traceroute_peer
 
-Traceroute to a mesh peer. Uses the system `traceroute` command with `-n -m <max_hops> -w 3` flags.
+Traceroute to a mesh peer. The binary and its flags are picked per platform:
+
+| Platform | Command |
+|---|---|
+| Linux | `traceroute -n -m <max_hops> -w 3`, resolved from the system directories, then `PATH` |
+| macOS | `/usr/sbin/traceroute -n -m <max_hops> -w 3` |
+| Windows | `%SystemRoot%\System32\tracert.exe -d -h <max_hops> -w 3000` — Windows has no `traceroute.exe`, and `-d` is its `-n` |
 
 | Parameter  | Type   | Required | Default | Description              |
 |------------|--------|----------|---------|--------------------------|
 | `peer_id`  | string | yes      | —       | Peer mesh IP address     |
 | `max_hops` | string | no       | `15`    | Maximum number of hops   |
 
-Returns traceroute output in stdout. Exit code 1 if `traceroute` is not installed.
+Returns traceroute output in stdout. Exit code 1 with the error `traceroute not available` when neither the Linux system directories nor the `PATH` lookup hold the binary; macOS and Windows ship it at a fixed path.
 
 ### service.restart
 
@@ -916,8 +940,9 @@ exec := actions.NewExecutor(cfg, reporter, verifier, logger)
 
 // 3. Register built-in actions. svcCtl is a *packaging.Service over the host's
 //    service manager: packaging.NewService(packaging.NewServiceManager(logger),
-//    packaging.InstallConfig{})
-exec.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics", collectParams, actions.DiagnosticsCollect())
+//    packaging.InstallConfig{}). sysReader is the platform metrics.SystemReader
+//    from newSystemReader(logger), nil on a platform without a reader
+exec.RegisterBuiltin("diagnostics.collect", "Collect system diagnostics", collectParams, actions.DiagnosticsCollect(sysReader))
 exec.RegisterBuiltin("diagnostics.ping_peer", "Ping a mesh peer", peerIDParam, actions.PingPeer(nodeInfo))
 exec.RegisterBuiltin("diagnostics.traceroute_peer", "Traceroute to peer", peerIDParam, actions.DiagnosticsTraceroutePeer(nodeInfo))
 exec.RegisterBuiltin("service.restart", "Restart service", nil, actions.ServiceRestart(svcCtl))
