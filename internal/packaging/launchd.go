@@ -58,7 +58,7 @@ func GenerateLaunchdPlist(cfg InstallConfig) string {
 	// path, not filepath: a launchd plist is a macOS artifact, so its paths are
 	// slash-separated whatever host generates the file.
 	configPath := path.Join(cfg.ConfigDir, "config.yaml")
-	logPath := path.Join(cfg.LogDir, "plexd.log")
+	logPath := path.Join(cfg.LogDir, DaemonLogFile)
 
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -110,7 +110,7 @@ func GenerateLaunchdPlist(cfg InstallConfig) string {
 // without bound.
 func GenerateNewsyslogConf(cfg InstallConfig) string {
 	cfg.ApplyDefaults()
-	logPath := path.Join(cfg.LogDir, "plexd.log")
+	logPath := path.Join(cfg.LogDir, DaemonLogFile)
 	return fmt.Sprintf("# plexd log rotation, written by plexd install\n%s\t644\t5\t10240\t*\tJ\n", logPath)
 }
 
