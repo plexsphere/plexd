@@ -86,7 +86,11 @@ User access validation is skipped when `UserAccessEnabled` is `false`. When enab
 
 ## AccessController
 
-Interface abstracting WireGuard interface operations for user access. The production implementation is provided externally; this package defines and consumes the interface.
+Interface abstracting WireGuard interface operations for user access. Two implementations exist. `NetlinkAccessController` (`access_controller_linux.go`) drives the Linux kernel through netlink and `wgctrl`. `WGAccessController` (`access_controller_wg.go`) covers macOS and Windows by wrapping the platform `WGController`: `DarwinController` on a utun device, `WindowsController` on a Wintun adapter, both running on the [userspace backend](../networking/wireguard.md#userspace-backend).
+
+Every platform generates a fresh private key per interface and assigns no address. User access forwards between the access and the mesh interface, and no route is installed over the device. macOS requires root and Windows Administrator, which the LocalSystem service satisfies. The interface answers the WireGuard UAPI, so `wg show wg-access` works through `/var/run/wireguard/wg-access.sock` on macOS and through the named pipe `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\wg-access` on Windows. The macOS kernel calls the device `utunN`; the `utun device created` log line pairs that name with `wg-access`, while the Wintun adapter carries `wg-access` itself.
+
+A second `CreateInterface` for a name that already exists fails with an error wrapping `os.ErrExist` on macOS and Windows, which is what `EEXIST` is on Linux. Forwarding on those two platforms behaves as [macOS & Windows Route Controllers](./route-controllers-macos-windows.md) describes. WinNAT is scoped to the mesh prefix, so a user-access source is not translated on Windows; see [pf & WFP Firewall Controllers](../networking/pf-wfp-firewall.md#nat).
 
 ```go
 type AccessController interface {
@@ -104,7 +108,7 @@ type AccessController interface {
 | `ConfigurePeer`   | Adds or updates a peer on the WireGuard interface              |
 | `RemovePeer`      | Removes a peer from the WireGuard interface by public key      |
 
-All methods must be idempotent: repeating an already-applied operation returns `nil`.
+Every method except `CreateInterface` must be idempotent: repeating an already-applied operation returns `nil`. The create is not, on any platform: a name that already exists fails with an error wrapping `os.ErrExist`.
 
 ## UserAccessManager
 
@@ -305,6 +309,25 @@ The implementation deviates from the original plan in two areas:
 | `UserAccessManager.AddPeer` (max)   | `bridge: user access: max peers reached (`          |
 | `UserAccessManager.AddPeer` (ctrl)  | `bridge: user access: configure peer: `             |
 
+The controller behind those calls carries prefixes of its own:
+
+| Step                       | Prefix                                     |
+|----------------------------|--------------------------------------------|
+| Private key generation     | `bridge: access: generate key:`            |
+| Interface creation         | `bridge: access: create interface <name>:` |
+| Address assignment         | `bridge: access: configure address <cidr>:`|
+| Bringing the interface up  | `bridge: access: set interface up:`        |
+| Interface removal          | `bridge: access: remove interface:`        |
+| Peer public key decode     | `bridge: access: decode public key:`       |
+| Peer public key parse      | `bridge: access: parse public key:`        |
+| Allowed IP parse           | `bridge: access: parse allowed IP "<cidr>":` |
+| PSK decode                 | `bridge: access: decode psk:`              |
+| PSK parse                  | `bridge: access: parse psk:`               |
+| Peer programming           | `bridge: access: configure peer:`          |
+| Peer removal               | `bridge: access: remove peer:`             |
+
+Both implementations use these prefixes, so a rejected peer reads the same on every platform. `NetlinkAccessController` adds `bridge: access: open wgctrl:` and `bridge: access: configure device:` for the two steps only it has. On macOS and Windows the text after the prefix is the `wireguard:` controller's own message.
+
 ## Logging
 
 All user access log entries use `component=bridge`.
@@ -313,8 +336,15 @@ All user access log entries use `component=bridge`.
 |---------|----------------------------------|---------------------------------------------|
 | `Info`  | User access interface created    | `interface`, `listen_port`                  |
 | `Info`  | User access interface removed    | `interface`                                 |
+| `Info`  | Access interface created         | `interface`, `listen_port`                  |
+| `Info`  | Access interface removed         | `interface`                                 |
+| `Debug` | Access interface addressed       | `interface`, `address`                      |
+| `Debug` | Access peer configured           | `interface`                                 |
+| `Debug` | Access peer removed              | `interface`                                 |
 | `Error` | Remove peer failed               | `public_key`, `error`                       |
 | `Error` | Reconcile: add peer failed       | `public_key`, `error`                       |
+
+The four controller lines `access interface created`, `access interface removed`, `access peer configured` and `access peer removed` are the same on Linux, macOS and Windows. `access interface addressed` comes from the WireGuard-backed controller and appears only when it is built with an address; the access interface is unnumbered on every platform.
 
 ## Integration Points
 

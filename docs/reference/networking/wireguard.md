@@ -56,7 +56,7 @@ type WGController interface {
 
 ## Userspace backend
 
-`UserspaceBackend` (`internal/wireguard/userspace.go`) runs wireguard-go devices inside the plexd process. It is the base of the macOS (utun) and Windows (Wintun) `WGController` implementations and of the bridge access and site-to-site controllers. On Linux plexd stays on the kernel path through `NetlinkController`; the backend compiles and is tested there but is not wired in.
+`UserspaceBackend` (`internal/wireguard/userspace.go`) runs wireguard-go devices inside the plexd process. It is the base of the macOS (utun) and Windows (Wintun) `WGController` implementations and, through those two controllers, of the bridge access and site-to-site controllers (`WGAccessController` and `WGVPNController` in `internal/bridge`), which wrap the platform's `WGController`. On Linux plexd stays on the kernel path through `NetlinkController`; the backend compiles and is tested there but is not wired in.
 
 The caller creates the tun device and hands it to `CreateDevice`; the backend owns the wireguard-go device lifecycle, the private key, the listen port and the peers. Addressing, MTU and the interface flag stay with the per-OS controller. Devices are keyed by the configured interface name, so `wg show <name>` works even where the kernel gives the tun another name (`utunN` on macOS).
 
@@ -92,7 +92,7 @@ wireguard-go's own log lines are adapted to plexd's `slog.Logger`, appearing at 
 
 macOS names a WireGuard device `utunN` and accepts no other name. `tun.CreateTUN` is asked for `utun`, which lets the kernel pick the next free unit; an `interface_name` that already names a unit (`utun7`) is passed through, so an operator can pin one.
 
-Everything addressed through plexd keeps the configured name: the backend's device key, the UAPI socket (`wg show plexd0`), the bridge managers and the `status.mesh` report. The kernel name is used for the `ifconfig` and `route` calls, for the [pf policy rules](./pf-wfp-firewall.md#interface-names) and for the readiness check, all of which resolve it through `Manager.OSInterfaceName()` because `net.InterfaceByName` knows only `utunN`.
+Everything addressed through plexd keeps the configured name: the backend's device key, the UAPI socket (`wg show plexd0`), the bridge managers and the `status.mesh` report. The kernel name is used for the `ifconfig` and `route` calls, for the [pf policy rules](./pf-wfp-firewall.md#interface-names), for the readiness check and for the route calls the [site-to-site manager](../bridge/site-to-site-vpn.md#sitetositemanager) makes for a tunnel, because `net.InterfaceByName` knows only `utunN`. The first three resolve it through `Manager.OSInterfaceName()`, the last through the bridge controller's `OSInterfaceName`.
 
 The pairing is logged once per interface, at `info`:
 
@@ -114,7 +114,7 @@ utun device created  component=wireguard interface=plexd0 utun=utun4
 
 A utun is point-to-point, so the `inet` form takes the destination address after the local one, and the alias installs a host route only. Linux gets the route for the whole prefix implicitly when the address is added, so `ConfigureAddress` adds it here explicitly; otherwise every packet for a mesh peer would leave through the default route. A `/32` or `/128` needs no route, since the alias already installed it. Routes for peer `AllowedIPs` beyond the address prefix belong to the bridge route controller, as they do on Linux.
 
-`route(8)` reports an existing route as `File exists`, which the controller treats as success, matching the idempotency `NetlinkRouteController` grants `EEXIST`.
+`route(8)` reports every routing-socket failure in its output and still exits 0, so the controller reads that output whatever the exit status is. `File exists` is success, matching the idempotency `NetlinkRouteController` grants `EEXIST`; any other line carrying `writing to routing socket:` fails with the command line and the message `route(8)` printed. Trusting the exit status would leave the mesh prefix on the default route with nothing recording why.
 
 `DeleteInterface` runs no command: closing the device closes the tun, and the kernel then destroys the `utunN` with its addresses and routes.
 
@@ -133,6 +133,16 @@ The adapter carries the configured `interface_name`, so `net.InterfaceByName` an
 Wintun is not part of Windows, and its loader searches only the executable's own directory and System32. `internal/wintundll` carries the signed `wintun.dll` (0.14.1) inside the plexd binary, one architecture per build, and writes it beside `plexd.exe` before the first adapter is created; a file that already matches is left alone. That keeps the release a single `.exe`, so `service.upgrade` still replaces one file and carries a newer driver with it. The driver's licence is committed at `internal/wintundll/LICENSE`.
 
 A missing driver surfaces as `wireguard: create interface: create plexd0: The specified module could not be found. (wintun.dll is missing beside plexd.exe)`.
+
+### Adapter visibility
+
+`CreateInterface` returns only once `net.InterfaceByName` resolves the adapter. Windows settles the IP stack a moment after the adapter appears, while the callers that run next resolve it by name in one attempt and never retry: the route controller's `LookupLUID` and the WFP enforcer's `lookupWinIface`. The lookup is repeated every 200 ms for at most 10 seconds; on the deadline the device is deleted and the call fails with `wireguard: create interface: adapter <name> not visible to the IP stack within 10s:` followed by the lookup error. An adapter that needed more than one attempt is logged at `debug`:
+
+```
+wintun adapter visible after wait  component=wireguard interface=plexd0 waited=412ms
+```
+
+The adapter is recorded before the wait starts, so the wait runs outside the controller's lock. Holding it for up to ten seconds would block every other method on the same controller — the `ConfigureAddress` and `SetMTU` of an unrelated interface, and the `DeleteInterface` a teardown makes — on a call that only polls.
 
 ### Addresses, MTU and the interface flag
 

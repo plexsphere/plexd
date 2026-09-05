@@ -91,7 +91,11 @@ Site-to-site validation is skipped when `SiteToSiteEnabled` is `false`. When ena
 
 ## VPNController
 
-Interface abstracting OS-level WireGuard tunnel operations for testability. The production implementation is provided externally; this package defines and consumes the interface. All methods must be idempotent.
+Interface abstracting OS-level WireGuard tunnel operations for testability. Two implementations exist. `NetlinkVPNController` (`vpn_controller_linux.go`) drives the Linux kernel through netlink and `wgctrl`. `WGVPNController` (`vpn_controller_wg.go`) covers macOS and Windows by wrapping the platform `WGController`: `DarwinController` on a utun device, `WindowsController` on a Wintun adapter, both running on the [userspace backend](../networking/wireguard.md#userspace-backend). Every method except `CreateTunnelInterface` must be idempotent; no implementation makes the create idempotent, and the interface says so.
+
+Every platform generates a fresh private key per tunnel interface. On macOS `plexd up` builds the controller with the node's mesh IP as a `/32`, because `route(8)` refuses a route over a utun that carries no IPv4 address and answers `Network is unreachable`. Each tunnel utun therefore holds the mesh IP as an alias (`ifconfig utunN inet <meshIP>/32 <meshIP> alias`; a host prefix needs no on-link route, so none is added). That is the unnumbered-interface idiom: traffic the node originates towards the remote site leaves with the mesh IP as its source, which the remote site routes back through the tunnel. An identity without a mesh IP leaves the utun unnumbered. On Windows and Linux the tunnel interface stays unnumbered, since the route to a remote subnet is installed by adapter LUID there and through netlink on Linux, neither of which needs an address on the device.
+
+macOS requires root and Windows Administrator, which the LocalSystem service satisfies. Each tunnel interface answers the WireGuard UAPI, so `wg show wg-s2s-0` works through `/var/run/wireguard/wg-s2s-0.sock` on macOS and through the named pipe `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\wg-s2s-0` on Windows. A second `CreateTunnelInterface` for a name that already exists fails with an error wrapping `os.ErrExist` on macOS and Windows, which is what `EEXIST` is on Linux. WinNAT is scoped to the mesh prefix, so a site-to-site source is not translated on Windows; see [pf & WFP Firewall Controllers](../networking/pf-wfp-firewall.md#nat).
 
 ```go
 type VPNController interface {
@@ -104,7 +108,7 @@ type VPNController interface {
 
 | Method                   | Description                                                                 |
 |--------------------------|-----------------------------------------------------------------------------|
-| `CreateTunnelInterface`  | Creates a WireGuard interface with the given name and UDP listen port       |
+| `CreateTunnelInterface`  | Creates a WireGuard interface with the given name and UDP listen port; not idempotent, a name in use fails with `os.ErrExist` |
 | `RemoveTunnelInterface`  | Removes the WireGuard interface; idempotent for non-existent interfaces    |
 | `ConfigureTunnelPeer`    | Configures the remote peer (public key, allowed IPs, endpoint, optional PSK) |
 | `RemoveTunnelPeer`       | Removes the remote peer from the interface; idempotent                     |
@@ -112,6 +116,12 @@ type VPNController interface {
 ## SiteToSiteManager
 
 Central coordinator for site-to-site VPN lifecycle. Concurrent-safe via `sync.Mutex` — the reconcile handler and status readers may invoke methods concurrently.
+
+Once `CreateTunnelInterface` succeeds, the manager asks the controller for `wireguard.OSInterfaceNamer`. A controller that implements it and reports a mapping supplies the name the operating system knows the interface by, which the manager stores as the tunnel's `osIface` and passes to every `RouteController` call: `EnableForwarding(osIface, meshIface)`, `AddRoute(subnet, osIface)`, `RemoveRoute(subnet, osIface)` and `DisableForwarding(osIface, meshIface)`, in `AddTunnel`, in its rollback, in `RemoveTunnel` and in `Teardown`. The `VPNController` calls keep the configured name. A controller that is no namer, or one that reports no mapping, leaves the configured name in both places, which is what Linux needs. `WGVPNController` is a namer on every platform: it answers the configured name where the wrapped controller keeps it, as `WindowsController` does, because that name is the one the operating system knows the adapter by. Reporting no mapping there would tell a caller reading the `wireguard.OSInterfaceNamer` contract that a live adapter does not exist. `WGVPNController` over `DarwinController` maps `wg-s2s-0` to `utunN`, and the manager logs the pairing at `Debug` when the two names differ:
+
+```
+tunnel interface resolved  component=bridge tunnel_id=t-1 interface=wg-s2s-0 os_interface=utun9
+```
 
 ### Constructor
 
@@ -319,6 +329,26 @@ fine-grained `site_to_site_*` constants have been removed.
 | `SiteToSiteManager.Teardown` (remove route)      | `bridge: site-to-site: remove route <subnet> for tunnel <id>: ` |
 | `SiteToSiteManager.Teardown` (remove iface)      | `bridge: site-to-site: remove interface for tunnel <id>: `       |
 
+The controller behind those calls carries prefixes of its own:
+
+| Step                       | Prefix                                    |
+|----------------------------|-------------------------------------------|
+| Private key generation     | `bridge: vpn: generate key:`              |
+| Interface creation         | `bridge: vpn: create interface <name>:`   |
+| Address assignment         | `bridge: vpn: configure address <cidr>:`  |
+| Bringing the interface up  | `bridge: vpn: set interface up:`          |
+| Interface removal          | `bridge: vpn: remove interface:`          |
+| Peer public key decode     | `bridge: vpn: decode public key:`         |
+| Peer public key parse      | `bridge: vpn: parse public key:`          |
+| Endpoint resolution        | `bridge: vpn: resolve endpoint:`          |
+| Allowed IP parse           | `bridge: vpn: parse allowed IP "<cidr>":` |
+| PSK decode                 | `bridge: vpn: decode psk:`                |
+| PSK parse                  | `bridge: vpn: parse psk:`                 |
+| Peer programming           | `bridge: vpn: configure peer:`            |
+| Peer removal               | `bridge: vpn: remove peer:`               |
+
+Both implementations use these prefixes, so a rejected peer reads the same on every platform. `NetlinkVPNController` adds `bridge: vpn: open wgctrl:` and `bridge: vpn: configure device:` for the two steps only it has. On macOS and Windows the text after the prefix is the `wireguard:` controller's own message.
+
 ## Logging
 
 All site-to-site log entries use `component=bridge`.
@@ -329,10 +359,18 @@ All site-to-site log entries use `component=bridge`.
 | `Info`  | Site-to-site manager stopped    | (none)                                               |
 | `Info`  | Site-to-site tunnel added       | `tunnel_id`, `interface`, `remote_endpoint`, `remote_subnets` |
 | `Info`  | Site-to-site tunnel removed     | `tunnel_id`                                          |
+| `Debug` | Tunnel interface resolved       | `tunnel_id`, `interface`, `os_interface`             |
+| `Info`  | Tunnel interface created        | `interface`, `listen_port`                           |
+| `Info`  | Tunnel interface removed        | `interface`                                          |
+| `Debug` | Tunnel interface addressed      | `interface`, `address`                               |
+| `Debug` | Tunnel peer configured          | `interface`                                          |
+| `Debug` | Tunnel peer removed             | `interface`                                          |
 | `Error` | Remove route failed             | `tunnel_id`, `subnet`, `error`                       |
 | `Error` | Remove peer failed              | `tunnel_id`, `error`                                 |
 | `Error` | Remove interface failed         | `tunnel_id`, `error`                                 |
 | `Error` | Reconcile: add tunnel failed    | `tunnel_id`, `error`                                 |
+
+The four controller lines `tunnel interface created`, `tunnel interface removed`, `tunnel peer configured` and `tunnel peer removed` are the same on Linux, macOS and Windows. `tunnel interface addressed` comes from the WireGuard-backed controller and appears only when it is built with an address, which `plexd up` does on macOS.
 
 ## Integration Points
 
