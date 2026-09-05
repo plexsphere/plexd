@@ -1160,3 +1160,105 @@ func TestServer_CacheReflectedInHTTP(t *testing.T) {
 		t.Fatalf("Start returned: %v", err)
 	}
 }
+
+func TestServerSecretAuthEnabled(t *testing.T) {
+	defer verifyNoLeaks(t)
+
+	cfg := Config{
+		SocketPath:        shortSocketPath(t),
+		DataDir:           t.TempDir(),
+		DebouncePeriod:    5 * time.Second,
+		ShutdownTimeout:   2 * time.Second,
+		SecretAuthEnabled: true,
+	}
+	srv := NewServer(cfg, &serverTestClient{}, []byte("test-nsk"), discardLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Start(ctx, "node-auth-test") }()
+
+	if !waitForSocket(t, cfg.SocketPath, 2*time.Second) {
+		cancel()
+		t.Fatal("socket did not appear")
+	}
+
+	httpClient := localClient(cfg.SocketPath)
+
+	// The state endpoint carries no secret values and stays open.
+	resp, err := httpClient.Get("http://localhost/v1/state")
+	if err != nil {
+		cancel()
+		t.Fatalf("GET /v1/state: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		cancel()
+		t.Errorf("GET /v1/state: status = %d, want 200", resp.StatusCode)
+	}
+
+	// The secret routes admit only a privileged peer.
+	resp, err = httpClient.Get("http://localhost/v1/state/secrets")
+	if err != nil {
+		cancel()
+		t.Fatalf("GET /v1/state/secrets: %v", err)
+	}
+	resp.Body.Close()
+
+	want := http.StatusForbidden
+	if currentPeerIsPrivileged() {
+		want = http.StatusOK
+	}
+	if resp.StatusCode != want {
+		cancel()
+		t.Errorf("GET /v1/state/secrets: status = %d, want %d", resp.StatusCode, want)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil && err != context.Canceled {
+		t.Fatalf("Start returned: %v", err)
+	}
+}
+
+func TestServerSecretAuthDisabled(t *testing.T) {
+	defer verifyNoLeaks(t)
+
+	cfg := Config{
+		SocketPath:        shortSocketPath(t),
+		DataDir:           t.TempDir(),
+		DebouncePeriod:    5 * time.Second,
+		ShutdownTimeout:   2 * time.Second,
+		SecretAuthEnabled: false,
+	}
+	srv := NewServer(cfg, &serverTestClient{}, []byte("test-nsk"), discardLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Start(ctx, "node-noauth-test") }()
+
+	if !waitForSocket(t, cfg.SocketPath, 2*time.Second) {
+		cancel()
+		t.Fatal("socket did not appear")
+	}
+
+	httpClient := localClient(cfg.SocketPath)
+
+	resp, err := httpClient.Get("http://localhost/v1/state/secrets")
+	if err != nil {
+		cancel()
+		t.Fatalf("GET /v1/state/secrets: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		cancel()
+		t.Errorf("GET /v1/state/secrets without auth: status = %d, want 200", resp.StatusCode)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil && err != context.Canceled {
+		t.Fatalf("Start returned: %v", err)
+	}
+}
