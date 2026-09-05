@@ -12,6 +12,11 @@ import (
 	"syscall"
 )
 
+// setSocketPermissions is a variable so the tests can drive the failure path.
+// No unprivileged process can provoke it through the OS: the socket belongs to
+// the caller, so its own chmod always succeeds.
+var setSocketPermissions = SetSocketPermissions
+
 // ListenLocal opens the local node API listener: a Unix domain socket at path.
 // It drops a socket file an earlier run left behind, creates the socket
 // directory, and applies the platform's socket ownership and mode.
@@ -37,8 +42,18 @@ func ListenLocal(path string, logger *slog.Logger) (net.Listener, error) {
 		return nil, fmt.Errorf("nodeapi: listen unix %s: %w", path, err)
 	}
 
-	// Set socket ownership and permissions (Linux: root:plexd 0660).
-	applySocketPermissions(path, logger)
+	// Set socket ownership and mode: root:plexd 0660 when the plexd group
+	// exists and the daemon may hand the socket to it, else 0600. A failure
+	// aborts the listener rather than warning: the socket's mode was never
+	// established then, and opening the socket is the whole authorization for
+	// every route but the secret ones, so serving it anyway would hand the
+	// action, hook and report routes to whoever can reach it. Close unlinks
+	// the socket it created, and no second unlink follows it: that one would
+	// race a listener that has meanwhile bound the same path.
+	if err := setSocketPermissions(path, logger); err != nil {
+		ln.Close()
+		return nil, fmt.Errorf("nodeapi: set socket permissions: %w", err)
+	}
 
 	return ln, nil
 }

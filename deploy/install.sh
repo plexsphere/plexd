@@ -100,6 +100,31 @@ verify_checksum() {
     info "checksum verified: ${actual}"
 }
 
+# --- Group creation ---
+
+# The daemon chowns its API socket to root:plexd with mode 0660 and narrows it
+# to 0600 when the group is missing, so without these groups only root reaches
+# the local node API. Failure is not fatal: plexd itself still runs. The plexd
+# group takes effect only for a daemon that carries CAP_CHOWN -- the systemd
+# unit does not, so there the socket stays at 0600 and plexd-secrets is what
+# these two groups buy. See docs/reference/core/nodeapi.md.
+ensure_groups() {
+    if ! command -v groupadd >/dev/null 2>&1; then
+        warn "groupadd not found; create the plexd and plexd-secrets groups by hand, or only root reaches the node API"
+        return 0
+    fi
+    for group in plexd plexd-secrets; do
+        if getent group "${group}" >/dev/null 2>&1; then
+            continue
+        fi
+        if groupadd --system "${group}"; then
+            info "created system group ${group}"
+        else
+            warn "could not create the ${group} group; only root reaches the node API"
+        fi
+    done
+}
+
 # --- Argument parsing ---
 
 parse_args() {
@@ -166,6 +191,9 @@ main() {
 
     # Make executable
     chmod +x "${TMPDIR_PATH}/${BINARY_NAME}"
+
+    # Create the groups the node API socket is chowned to
+    ensure_groups
 
     # Run plexd install
     info "running plexd install"

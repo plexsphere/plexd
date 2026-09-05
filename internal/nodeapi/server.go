@@ -171,16 +171,23 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 		return err
 	}
 
-	// Wrap secret routes with peer credential auth (Linux: SO_PEERCRED).
-	// Only enabled when SecretAuthEnabled is set (requires root to set socket perms).
+	// Wrap the secret routes with peer-credential auth: SO_PEERCRED on Linux,
+	// LOCAL_PEERCRED on macOS, the pipe client's token on Windows. Only when
+	// SecretAuthEnabled is set. That middleware is the only reader of what
+	// ConnContext stores, so the credentials are resolved only alongside it:
+	// otherwise every accepted connection pays for a result nothing consumes,
+	// a process handle and a token query on Windows, and a lookup that cannot
+	// succeed on the Unix platforms without an implementation.
 	var localHandler http.Handler = wrappedMux
+	var localConnContext func(context.Context, net.Conn) context.Context
 	if s.cfg.SecretAuthEnabled {
-		localHandler = wrapSecretAuth(wrappedMux, s.logger)
+		localHandler = wrapSecretAuth(wrappedMux, newSecretPolicy(), s.logger)
+		localConnContext = connContextWithPeerCred(s.logger)
 	}
 
 	localServer := &http.Server{
 		Handler:     localHandler,
-		ConnContext: connContextWithPeerCred(s.logger),
+		ConnContext: localConnContext,
 	}
 
 	var tcpServer *http.Server
