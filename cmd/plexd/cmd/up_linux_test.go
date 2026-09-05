@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
 )
@@ -72,5 +73,17 @@ func TestNewSystemReader_Linux(t *testing.T) {
 	}
 	if _, ok := reader.(*metrics.LinuxSystemReader); !ok {
 		t.Errorf("newSystemReader() = %T, want *metrics.LinuxSystemReader", reader)
+	}
+}
+
+// TestNewVPNController_Linux pins the mesh IP as behaviour-neutral on Linux:
+// the tunnel link stays unnumbered whatever identity the node came up with.
+func TestNewVPNController_Linux(t *testing.T) {
+	ctrl := newVPNController(discardLogger(), "10.42.0.5")
+	if ctrl == nil {
+		t.Fatal("newVPNController() = nil, want the netlink tunnel controller on Linux")
+	}
+	if _, ok := ctrl.(*bridge.NetlinkVPNController); !ok {
+		t.Errorf("newVPNController() = %T, want *bridge.NetlinkVPNController", ctrl)
 	}
 }

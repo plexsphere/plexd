@@ -92,16 +92,61 @@ func TestNewSystemLogSource_Darwin(t *testing.T) {
 	}
 }
 
-// TestNewControllers_DarwinStubs pins the bridge subsystems macOS does not
-// have yet (#12), so the sibling that implements one has to flip its stub
-// deliberately.
-func TestNewControllers_DarwinStubs(t *testing.T) {
+func TestNewAccessController_Darwin(t *testing.T) {
+	ctrl := newAccessController(discardLogger())
+	if ctrl == nil {
+		t.Fatal("newAccessController() = nil, want the utun-backed access controller on macOS")
+	}
+	if _, ok := ctrl.(*bridge.WGAccessController); !ok {
+		t.Errorf("newAccessController() = %T, want *bridge.WGAccessController", ctrl)
+	}
+}
+
+func TestNewVPNController_Darwin(t *testing.T) {
 	logger := discardLogger()
 
-	if c := newAccessController(logger); c != nil {
-		t.Errorf("newAccessController() = %v, want nil until #12", c)
+	ctrl := newVPNController(logger, "10.42.0.5")
+	if ctrl == nil {
+		t.Fatal("newVPNController() = nil, want the utun-backed tunnel controller on macOS")
 	}
-	if c := newVPNController(logger); c != nil {
-		t.Errorf("newVPNController() = %v, want nil until #12", c)
+	if _, ok := ctrl.(*bridge.WGVPNController); !ok {
+		t.Errorf("newVPNController() = %T, want *bridge.WGVPNController", ctrl)
+	}
+
+	// The site-to-site manager resolves utunN through this interface, so the
+	// route to the remote subnet names the device the kernel created.
+	if _, ok := ctrl.(wireguard.OSInterfaceNamer); !ok {
+		t.Errorf("%T does not implement wireguard.OSInterfaceNamer", ctrl)
+	}
+
+	// An identity without a mesh IP leaves the utun unnumbered instead of
+	// leaving the node without a tunnel controller.
+	if c := newVPNController(logger, ""); c == nil {
+		t.Fatal(`newVPNController(logger, "") = nil, want a controller that leaves the utun unnumbered`)
+	}
+}
+
+// The address the controller is built with is what route(8) needs to accept a
+// route over the tunnel utun, and it is unreachable from here once the
+// controller exists, so the derivation is asserted on its own. A mesh IP that
+// lost its /32 fails every AddRoute with "Network is unreachable"; an empty
+// one turned into "/32" fails ConfigureAddress and deletes the interface the
+// create just made.
+func TestTunnelAddress_Darwin(t *testing.T) {
+	tests := []struct {
+		name   string
+		meshIP string
+		want   string
+	}{
+		{name: "mesh ip becomes a host prefix", meshIP: "10.42.0.5", want: "10.42.0.5/32"},
+		{name: "no mesh ip leaves the utun unnumbered", meshIP: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tunnelAddress(tt.meshIP); got != tt.want {
+				t.Errorf("tunnelAddress(%q) = %q, want %q", tt.meshIP, got, tt.want)
+			}
+		})
 	}
 }

@@ -63,14 +63,26 @@ func newRouteController(logger *slog.Logger, fw policy.FirewallController) bridg
 	return bridge.NewWindowsRouteController(logger, nat)
 }
 
-// newAccessController returns nil until the bridge user-access controller
-// lands (#12).
-func newAccessController(_ *slog.Logger) bridge.AccessController {
-	return nil
+// newAccessController creates the Wintun-backed controller for bridge user
+// access on Windows. It needs Administrator: creating an adapter is
+// privileged, which the LocalSystem service satisfies. The WindowsController
+// is its own, so the mesh, the access and the tunnel adapters live in three
+// backends, each keyed by the names it created.
+//
+// The adapter stays unnumbered, as on Linux. Nothing routes over the access
+// adapter, and the IP Helper route controller addresses an interface by its
+// LUID rather than by an address on it.
+func newAccessController(logger *slog.Logger) bridge.AccessController {
+	return bridge.NewWGAccessController(wireguard.NewWindowsController(logger), logger)
 }
 
-// newVPNController returns nil until the bridge site-to-site controller lands
-// (#12).
-func newVPNController(_ *slog.Logger) bridge.VPNController {
-	return nil
+// newVPNController creates the Wintun-backed controller for bridge
+// site-to-site tunnels on Windows. It needs Administrator for the same
+// reason, and it holds its own WindowsController.
+//
+// The tunnel adapter stays unnumbered, as on Linux: the route to the remote
+// subnet is installed by adapter LUID, so it does not depend on the adapter
+// carrying an address. The mesh IP is therefore unused here.
+func newVPNController(logger *slog.Logger, _ string) bridge.VPNController {
+	return bridge.NewWGVPNController(wireguard.NewWindowsController(logger), "", logger)
 }

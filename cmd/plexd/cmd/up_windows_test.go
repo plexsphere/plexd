@@ -93,16 +93,37 @@ func TestNewSystemLogSource_Windows(t *testing.T) {
 	}
 }
 
-// TestNewControllers_WindowsStubs pins the bridge subsystems Windows does not
-// have yet (#12), so the sibling that implements one has to flip its stub
-// deliberately.
-func TestNewControllers_WindowsStubs(t *testing.T) {
+func TestNewAccessController_Windows(t *testing.T) {
+	ctrl := newAccessController(discardLogger())
+	if ctrl == nil {
+		t.Fatal("newAccessController() = nil, want the Wintun-backed access controller on Windows")
+	}
+	if _, ok := ctrl.(*bridge.WGAccessController); !ok {
+		t.Errorf("newAccessController() = %T, want *bridge.WGAccessController", ctrl)
+	}
+}
+
+func TestNewVPNController_Windows(t *testing.T) {
 	logger := discardLogger()
 
-	if c := newAccessController(logger); c != nil {
-		t.Errorf("newAccessController() = %v, want nil until #12", c)
+	ctrl := newVPNController(logger, "10.42.0.5")
+	if ctrl == nil {
+		t.Fatal("newVPNController() = nil, want the Wintun-backed tunnel controller on Windows")
 	}
-	if c := newVPNController(logger); c != nil {
-		t.Errorf("newVPNController() = %v, want nil until #12", c)
+	if _, ok := ctrl.(*bridge.WGVPNController); !ok {
+		t.Errorf("newVPNController() = %T, want *bridge.WGVPNController", ctrl)
+	}
+
+	// The site-to-site manager asks for a kernel name through this interface.
+	// A Wintun adapter keeps the configured name, so the controller reports no
+	// mapping and the manager routes over the configured name.
+	if _, ok := ctrl.(wireguard.OSInterfaceNamer); !ok {
+		t.Errorf("%T does not implement wireguard.OSInterfaceNamer", ctrl)
+	}
+
+	// The mesh IP is unused on Windows: an identity without one yields the
+	// same unnumbered adapter.
+	if c := newVPNController(logger, ""); c == nil {
+		t.Fatal(`newVPNController(logger, "") = nil, want the unnumbered tunnel controller`)
 	}
 }

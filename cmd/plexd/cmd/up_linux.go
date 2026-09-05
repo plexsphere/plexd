@@ -56,7 +56,9 @@ func newAccessController(logger *slog.Logger) bridge.AccessController {
 	return bridge.NewNetlinkAccessController(logger)
 }
 
-// newVPNController creates a NetlinkVPNController for site-to-site tunnels on Linux.
-func newVPNController(logger *slog.Logger) bridge.VPNController {
+// newVPNController creates a NetlinkVPNController for site-to-site tunnels on
+// Linux. The mesh IP is unused: the tunnel link stays unnumbered, because a
+// netlink route names the link itself.
+func newVPNController(logger *slog.Logger, _ string) bridge.VPNController {
 	return bridge.NewNetlinkVPNController(logger)
 }
