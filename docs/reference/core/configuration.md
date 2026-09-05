@@ -47,7 +47,7 @@ plexd resolves its configuration, data and runtime directories from the host it 
 | `data_dir` | `/var/lib/plexd` | `/Library/Application Support/plexd/data` | `%ProgramData%\plexd\data` |
 | `registration.token_file` | `/etc/plexd/bootstrap-token` | `/Library/Application Support/plexd/bootstrap-token` | `%ProgramData%\plexd\bootstrap-token` |
 | `actions.hooks_dir` | `/etc/plexd/hooks` | `/Library/Application Support/plexd/hooks` | `%ProgramData%\plexd\hooks` |
-| `node_api.socket_path` | `/var/run/plexd/api.sock` | `/var/run/plexd/api.sock` | `%ProgramData%\plexd\run\api.sock` |
+| `node_api.socket_path` | `/var/run/plexd/api.sock` | `/var/run/plexd/api.sock` | `\\.\pipe\plexd` |
 | Runtime directory (`plexd install`) | `/var/run/plexd` | `/var/run/plexd` | `%ProgramData%\plexd\run` |
 | Binary (`plexd install`) | `/usr/local/bin/plexd` | `/usr/local/bin/plexd` | `%ProgramFiles%\plexd\plexd.exe` |
 | Service definition | `/etc/systemd/system/plexd.service` | `/Library/LaunchDaemons/com.plexsphere.plexd.plist` | SCM service `plexd` (no file) |
@@ -143,7 +143,7 @@ Local node API server (Unix socket and optional HTTP).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `socket_path` | string | `/var/run/plexd/api.sock` (Linux) | Path to the Unix domain socket. Per platform; see [Platform defaults](#platform-defaults). |
+| `socket_path` | string | `/var/run/plexd/api.sock` (Linux, macOS) | Unix socket path; on Windows the named pipe name. Per platform; see [Platform defaults](#platform-defaults). |
 | `http_enabled` | bool | `false` | Enable the optional HTTP listener |
 | `http_listen` | string | `127.0.0.1:9100` | HTTP listen address |
 | `http_token_file` | string | — | Path to the HTTP bearer token file |

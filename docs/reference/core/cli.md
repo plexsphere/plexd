@@ -184,7 +184,7 @@ warning it logs.
 
 ### `plexd status`
 
-Show node agent status by querying the local agent via Unix socket (`/var/run/plexd/api.sock` on Linux and macOS; see [Platform defaults](configuration.md#platform-defaults)).
+Show node agent status by querying the local agent via the local endpoint (`/var/run/plexd/api.sock` on Linux and macOS, the named pipe `\\.\pipe\plexd` on Windows; see [Platform defaults](configuration.md#platform-defaults)).
 
 ```
 plexd status
@@ -322,9 +322,9 @@ Run integrity verification on all registered hooks.
 
 Trigger a re-scan of action hooks.
 
-## Unix Socket Communication
+## Local Endpoint Communication
 
-Commands that query local agent state (`status`, `peers`, `policies`, `state`, `log-status`, `audit`, `actions`, `hooks`) connect to the agent via HTTP-over-Unix-socket at `/var/run/plexd/api.sock` on Linux and macOS, and under `%ProgramData%\plexd\run` on Windows (see [Platform defaults](configuration.md#platform-defaults)). If the agent is not running, these commands return an error indicating the socket is unavailable.
+Commands that query local agent state (`status`, `peers`, `policies`, `state`, `log-status`, `audit`, `actions`, `hooks`) connect to the agent over HTTP at `/var/run/plexd/api.sock` (a Unix socket) on Linux and macOS, and at the named pipe `\\.\pipe\plexd` on Windows (see [Platform defaults](configuration.md#platform-defaults)). If the agent is not running, these commands return an error indicating the socket or pipe is unavailable.
 
 ## Configuration File
 
