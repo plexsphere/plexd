@@ -182,6 +182,10 @@ func newTestWindowsController(t *testing.T) (*WindowsController, *tunFactory, *f
 	c.backend.uapiListen = func(string) (net.Listener, error) {
 		return net.Listen("tcp", "127.0.0.1:0")
 	}
+	// The adapter resolves on the first attempt, so no test sleeps unless it
+	// stubs lookup itself.
+	c.lookup = func(name string) (*net.Interface, error) { return &net.Interface{Name: name}, nil }
+	c.visibleTimeout = time.Second
 
 	t.Cleanup(func() {
 		c.mu.Lock()
@@ -383,6 +387,116 @@ func TestWindowsController_CreateInterface_NilKey(t *testing.T) {
 		t.Error("the tun device was left open after a rejected key")
 	}
 	assertNoAdapter(t, c)
+}
+
+func TestWindowsController_CreateInterface_WaitsForAdapter(t *testing.T) {
+	c, _, _ := newTestWindowsController(t)
+
+	var buf strings.Builder
+	c.logger = slogTextLogger(&buf)
+
+	// The lookup fails the way Windows does while it is still wiring the adapter
+	// into the IP stack, then resolves.
+	calls := 0
+	c.lookup = func(name string) (*net.Interface, error) {
+		calls++
+		if calls < 3 {
+			return nil, errors.New("no such network interface")
+		}
+		return &net.Interface{Name: name}, nil
+	}
+
+	createTestInterface(t, c, "plexd0")
+
+	c.mu.Lock()
+	_, ok := c.adapters["plexd0"]
+	c.mu.Unlock()
+	if !ok {
+		t.Error("no adapter recorded after the lookup resolved")
+	}
+	if calls != 3 {
+		t.Errorf("lookup called %d times, want 3", calls)
+	}
+
+	out := buf.String()
+	for _, want := range []string{"wintun adapter visible after wait", "interface=plexd0", "waited="} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log output %q missing %q", out, want)
+		}
+	}
+}
+
+func TestWindowsController_CreateInterface_AdapterNeverVisible(t *testing.T) {
+	c, tuns, _ := newTestWindowsController(t)
+
+	lookupErr := errors.New("no such network interface")
+	c.lookup = func(string) (*net.Interface, error) { return nil, lookupErr }
+	c.visibleTimeout = 50 * time.Millisecond
+	key := mustKey(t)
+
+	err := c.CreateInterface("plexd0", key[:], 0)
+	const want = "wireguard: create interface: adapter plexd0 not visible to the IP stack within 50ms"
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("CreateInterface = %v, want an error containing %q", err, want)
+	}
+	if !errors.Is(err, lookupErr) {
+		t.Errorf("error = %v, want it to wrap the lookup error", err)
+	}
+	if !tuns.only(t).closed.Load() {
+		t.Error("the tun device was left open after the adapter stayed invisible")
+	}
+	assertNoAdapter(t, c)
+
+	// Nothing was recorded, so releasing the name afterwards is still a no-op.
+	if err := c.DeleteInterface("plexd0"); err != nil {
+		t.Errorf("DeleteInterface = %v, want nil after a create that never recorded the adapter", err)
+	}
+}
+
+// The wait for the IP stack runs after the adapter is recorded and outside the
+// controller's lock, so every other method stays callable while it polls.
+// Holding the lock for up to visibleTimeout would stall the ConfigureAddress
+// and SetMTU of unrelated interfaces, and the DeleteInterface a teardown makes.
+func TestWindowsController_CreateInterface_WaitRunsWithoutTheLock(t *testing.T) {
+	c, _, _ := newTestWindowsController(t)
+	createTestInterface(t, c, "plexd0")
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	c.lookup = func(name string) (*net.Interface, error) {
+		if name == "plexd1" {
+			close(entered)
+			<-release
+		}
+		return &net.Interface{Name: name}, nil
+	}
+
+	key := mustKey(t)
+	created := make(chan error, 1)
+	go func() { created <- c.CreateInterface("plexd1", key[:], 0) }()
+	<-entered
+
+	mtu := make(chan error, 1)
+	go func() { mtu <- c.SetMTU("plexd0", 1380) }()
+
+	blocked := false
+	select {
+	case err := <-mtu:
+		if err != nil {
+			t.Errorf("SetMTU during the visibility wait = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		blocked = true
+	}
+
+	close(release)
+	if err := <-created; err != nil {
+		t.Fatalf("CreateInterface: %v", err)
+	}
+	if blocked {
+		<-mtu
+		t.Error("SetMTU blocked until CreateInterface finished waiting for the IP stack")
+	}
 }
 
 func TestWindowsController_ConfigureAddress(t *testing.T) {
