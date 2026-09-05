@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/device"
@@ -27,6 +29,17 @@ import (
 func init() {
 	tun.WintunTunnelType = "plexd"
 }
+
+// adapterVisibleTimeout bounds how long CreateInterface waits for a fresh
+// adapter to resolve by name, adapterVisiblePoll is the interval between
+// attempts. The wait exists because Windows settles the IP stack a moment after
+// the adapter appears, while the callers that run next resolve it by name and
+// never retry: the route controller's LookupLUID and the WFP enforcer's
+// lookupWinIface.
+const (
+	adapterVisibleTimeout = 10 * time.Second
+	adapterVisiblePoll    = 200 * time.Millisecond
+)
 
 // wintunDevice is what a Wintun tun device offers beyond tun.Device: the
 // adapter's LUID, which is how the IP Helper API addresses an interface, and a
@@ -62,9 +75,13 @@ type WindowsController struct {
 
 	// createTUN, ensureDLL and ipcfg are seams: production wires them to
 	// wireguard-go, the embedded driver and the IP Helper API, tests to fakes.
-	createTUN func(name string, mtu int) (tun.Device, error)
-	ensureDLL func() (string, bool, error)
-	ipcfg     ipConfigurator
+	// lookup is the seam for the visibility wait, production net.InterfaceByName,
+	// and visibleTimeout bounds that wait.
+	createTUN      func(name string, mtu int) (tun.Device, error)
+	ensureDLL      func() (string, bool, error)
+	ipcfg          ipConfigurator
+	lookup         func(name string) (*net.Interface, error)
+	visibleTimeout time.Duration
 }
 
 // wintunAdapter is one live adapter: the LUID the IP Helper API addresses it
@@ -84,8 +101,10 @@ func NewWindowsController(logger *slog.Logger) *WindowsController {
 		createTUN: func(name string, mtu int) (tun.Device, error) {
 			return tun.CreateTUNWithRequestedGUID(name, adapterGUID(name), mtu)
 		},
-		ensureDLL: ensureDLLBesideExecutable,
-		ipcfg:     winipcfgConfigurator{},
+		ensureDLL:      ensureDLLBesideExecutable,
+		ipcfg:          winipcfgConfigurator{},
+		lookup:         net.InterfaceByName,
+		visibleTimeout: adapterVisibleTimeout,
 	}
 }
 
@@ -151,10 +170,34 @@ func (winipcfgConfigurator) SetMTU(luid uint64, mtu int) error {
 // CreateInterface provisions the driver, creates a Wintun adapter, and starts a
 // wireguard-go device on it with the given private key and listen port.
 //
-// Creating an adapter requires Administrator. The lock is held for the whole
-// call so two concurrent creations of one name cannot both pass the duplicate
-// check.
+// Creating an adapter requires Administrator. It returns once the IP stack
+// resolves the adapter by name, because what Manager.Setup and
+// SiteToSiteManager.AddTunnel call next resolves it in one attempt and never
+// retries: the route controller's LookupLUID and the WFP enforcer's
+// lookupWinIface. A device whose adapter never becomes visible goes away
+// again, because it would fail those calls with an error that does not name
+// the cause.
 func (c *WindowsController) CreateInterface(name string, privateKey []byte, listenPort int) error {
+	if err := c.createAdapter(name, privateKey, listenPort); err != nil {
+		return err
+	}
+
+	// The adapter is recorded by now, so the wait runs without the lock.
+	// Holding it for up to visibleTimeout would block every other method on
+	// this controller — the ConfigureAddress and SetMTU of another interface,
+	// and the DeleteInterface a teardown makes — on a call that only polls.
+	if err := c.waitAdapterVisible(name); err != nil {
+		_ = c.DeleteInterface(name)
+		return err
+	}
+
+	return nil
+}
+
+// createAdapter is the part of CreateInterface that touches the controller's
+// state. The lock is held for all of it, so two concurrent creations of one
+// name cannot both pass the duplicate check.
+func (c *WindowsController) createAdapter(name string, privateKey []byte, listenPort int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -219,6 +262,38 @@ func (c *WindowsController) CreateInterface(name string, privateKey []byte, list
 		"interface", name,
 		"luid", luid,
 	)
+
+	return nil
+}
+
+// waitAdapterVisible polls for the adapter's name until the IP stack resolves
+// it, bounded by visibleTimeout. The device runs before Windows has finished
+// wiring the adapter in, so this turns that race into a bounded delay; it
+// costs nothing when the adapter is visible at once, which is the ordinary
+// case.
+func (c *WindowsController) waitAdapterVisible(name string) error {
+	start := time.Now()
+	deadline := start.Add(c.visibleTimeout)
+	for {
+		_, err := c.lookup(name)
+		if err == nil {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("wireguard: create interface: adapter %s not visible to the IP stack within %s: %w", name, c.visibleTimeout, err)
+		}
+		time.Sleep(adapterVisiblePoll)
+	}
+
+	// One poll of elapsed time is what separates an adapter that resolved at
+	// once from one that took a wait worth logging.
+	if waited := time.Since(start); waited >= adapterVisiblePoll {
+		c.logger.Debug("wintun adapter visible after wait",
+			"component", "wireguard",
+			"interface", name,
+			"waited", waited,
+		)
+	}
 
 	return nil
 }
