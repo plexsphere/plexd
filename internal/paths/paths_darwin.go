@@ -2,6 +2,8 @@
 
 package paths
 
+import "path/filepath"
+
 // macOS keeps per-machine application support data under /Library, not under
 // /etc and /var/lib. Runtime state stays in /var/run, which is where a launchd
 // daemon puts its socket.
@@ -17,3 +19,5 @@ func configDir() string { return "/Library/Application Support/plexd" }
 func dataDir() string { return "/Library/Application Support/plexd/data" }
 
 func runDir() string { return "/var/run/plexd" }
+
+func socketPath() string { return filepath.Join(runDir(), "api.sock") }

@@ -5,9 +5,10 @@ import (
 	"testing"
 )
 
-// TestPaths_Derived pins the four derived paths to their base directory, on
+// TestPaths_Derived pins the three derived paths to their base directory, on
 // whatever platform the test runs. The exact strings per platform are asserted
-// by the tagged tests beside this file.
+// by the tagged tests beside this file, which also pin the socket address: it
+// is not derived from a directory on every platform.
 func TestPaths_Derived(t *testing.T) {
 	tests := []struct {
 		name string
@@ -17,7 +18,6 @@ func TestPaths_Derived(t *testing.T) {
 		{"ConfigFile", ConfigFile(), filepath.Join(ConfigDir(), "config.yaml")},
 		{"HooksDir", HooksDir(), filepath.Join(ConfigDir(), "hooks")},
 		{"TokenFile", TokenFile(), filepath.Join(ConfigDir(), "bootstrap-token")},
-		{"SocketPath", SocketPath(), filepath.Join(RunDir(), "api.sock")},
 	}
 
 	for _, tt := range tests {
