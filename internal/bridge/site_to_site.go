@@ -10,12 +10,16 @@ import (
 	"sync"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
 // activeTunnel holds the state of a running site-to-site tunnel.
 type activeTunnel struct {
-	tunnel       api.SiteToSiteTunnel
-	iface        string
+	tunnel api.SiteToSiteTunnel
+	iface  string
+	// osIface is the name the operating system knows the interface by, utunN
+	// on macOS. It equals iface where the platform keeps the configured name.
+	osIface      string
 	providerName string // non-empty if managed by a TunnelProvider rather than WireGuard
 }
 
@@ -101,12 +105,12 @@ func (m *SiteToSiteManager) Teardown() error {
 		}
 		// WireGuard-managed tunnel: remove routes, forwarding, and interface.
 		for _, subnet := range at.tunnel.RemoteSubnets {
-			if err := m.routes.RemoveRoute(subnet, at.iface); err != nil {
+			if err := m.routes.RemoveRoute(subnet, at.osIface); err != nil {
 				errs = append(errs, fmt.Errorf("bridge: site-to-site: remove route %s for tunnel %s: %w", subnet, id, err))
 			}
 		}
 		// Disable forwarding between tunnel and mesh interfaces.
-		if err := m.routes.DisableForwarding(at.iface, m.meshIface); err != nil {
+		if err := m.routes.DisableForwarding(at.osIface, m.meshIface); err != nil {
 			errs = append(errs, fmt.Errorf("bridge: site-to-site: disable forwarding for tunnel %s: %w", id, err))
 		}
 		// Remove the tunnel interface.
@@ -192,6 +196,19 @@ func (m *SiteToSiteManager) AddTunnel(tunnel api.SiteToSiteTunnel) error {
 		return fmt.Errorf("bridge: site-to-site: create interface for tunnel %s: %w", tunnel.TunnelID, err)
 	}
 
+	// macOS names the interface utunN, and the route controller hands the name
+	// to route(8) verbatim, so every route call below uses the kernel name.
+	// The WireGuard controller keeps addressing the device by the configured
+	// name.
+	osIface := m.osInterfaceName(iface)
+	if osIface != iface {
+		m.logger.Debug("tunnel interface resolved",
+			"tunnel_id", tunnel.TunnelID,
+			"interface", iface,
+			"os_interface", osIface,
+		)
+	}
+
 	// Configure the remote peer.
 	if err := m.ctrl.ConfigureTunnelPeer(iface, tunnel.RemotePublicKey, tunnel.RemoteSubnets, tunnel.RemoteEndpoint, tunnel.PSK); err != nil {
 		// Rollback: remove the interface.
@@ -200,7 +217,7 @@ func (m *SiteToSiteManager) AddTunnel(tunnel api.SiteToSiteTunnel) error {
 	}
 
 	// Enable forwarding between tunnel and mesh interfaces.
-	if err := m.routes.EnableForwarding(iface, m.meshIface); err != nil {
+	if err := m.routes.EnableForwarding(osIface, m.meshIface); err != nil {
 		// Rollback: remove peer and interface.
 		_ = m.ctrl.RemoveTunnelPeer(iface, tunnel.RemotePublicKey)
 		_ = m.ctrl.RemoveTunnelInterface(iface)
@@ -210,13 +227,13 @@ func (m *SiteToSiteManager) AddTunnel(tunnel api.SiteToSiteTunnel) error {
 	// Add routes for remote subnets.
 	var addedRoutes []string
 	for _, subnet := range tunnel.RemoteSubnets {
-		if err := m.routes.AddRoute(subnet, iface); err != nil {
+		if err := m.routes.AddRoute(subnet, osIface); err != nil {
 			// Rollback added routes.
 			for _, added := range addedRoutes {
-				_ = m.routes.RemoveRoute(added, iface)
+				_ = m.routes.RemoveRoute(added, osIface)
 			}
 			// Rollback forwarding, peer, and interface.
-			_ = m.routes.DisableForwarding(iface, m.meshIface)
+			_ = m.routes.DisableForwarding(osIface, m.meshIface)
 			_ = m.ctrl.RemoveTunnelPeer(iface, tunnel.RemotePublicKey)
 			_ = m.ctrl.RemoveTunnelInterface(iface)
 			return fmt.Errorf("bridge: site-to-site: add route %s for tunnel %s: %w", subnet, tunnel.TunnelID, err)
@@ -225,8 +242,9 @@ func (m *SiteToSiteManager) AddTunnel(tunnel api.SiteToSiteTunnel) error {
 	}
 
 	m.activeTunnels[tunnel.TunnelID] = &activeTunnel{
-		tunnel: tunnel,
-		iface:  iface,
+		tunnel:  tunnel,
+		iface:   iface,
+		osIface: osIface,
 	}
 
 	m.logger.Info("site-to-site tunnel added",
@@ -237,6 +255,19 @@ func (m *SiteToSiteManager) AddTunnel(tunnel api.SiteToSiteTunnel) error {
 	)
 
 	return nil
+}
+
+// osInterfaceName returns the name the operating system knows iface by.
+// A controller that is no wireguard.OSInterfaceNamer, or one that finds no
+// such interface, leaves the configured name in place, which is what Linux
+// and Windows need.
+func (m *SiteToSiteManager) osInterfaceName(iface string) string {
+	if namer, ok := m.ctrl.(wireguard.OSInterfaceNamer); ok {
+		if osName, found := namer.OSInterfaceName(iface); found {
+			return osName
+		}
+	}
+	return iface
 }
 
 // RemoveTunnel removes a site-to-site tunnel: removes routes, disables forwarding,
@@ -276,7 +307,7 @@ func (m *SiteToSiteManager) RemoveTunnel(tunnelID string) {
 	// WireGuard-managed tunnel removal.
 	// Remove routes for remote subnets.
 	for _, subnet := range at.tunnel.RemoteSubnets {
-		if err := m.routes.RemoveRoute(subnet, at.iface); err != nil {
+		if err := m.routes.RemoveRoute(subnet, at.osIface); err != nil {
 			m.logger.Error("bridge: site-to-site: remove route failed",
 				"tunnel_id", tunnelID,
 				"subnet", subnet,
@@ -286,7 +317,7 @@ func (m *SiteToSiteManager) RemoveTunnel(tunnelID string) {
 	}
 
 	// Disable forwarding between tunnel and mesh interfaces.
-	if err := m.routes.DisableForwarding(at.iface, m.meshIface); err != nil {
+	if err := m.routes.DisableForwarding(at.osIface, m.meshIface); err != nil {
 		m.logger.Error("bridge: site-to-site: disable forwarding failed",
 			"tunnel_id", tunnelID,
 			"error", err,
