@@ -1,12 +1,15 @@
 package bridge
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
 // ---------------------------------------------------------------------------
@@ -1545,4 +1548,262 @@ func searchSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// SiteToSiteManager kernel interface name tests
+// ---------------------------------------------------------------------------
+
+// namerVPNController is a mockVPNController that also reports kernel interface
+// names, the way the macOS bridge controller does.
+type namerVPNController struct {
+	*mockVPNController
+	names map[string]string
+}
+
+func (c *namerVPNController) OSInterfaceName(name string) (string, bool) {
+	osName, ok := c.names[name]
+	return osName, ok
+}
+
+var _ wireguard.OSInterfaceNamer = (*namerVPNController)(nil)
+
+// newUtunNamer returns a VPN controller that resolves wg-s2s-0 to utun9.
+func newUtunNamer() *namerVPNController {
+	return &namerVPNController{
+		mockVPNController: &mockVPNController{},
+		names:             map[string]string{"wg-s2s-0": "utun9"},
+	}
+}
+
+// newActiveS2SManager returns a manager set up on mesh interface wg0 over vpn,
+// its route controller, and the buffer its debug logger writes to.
+func newActiveS2SManager(t *testing.T, vpn VPNController) (*SiteToSiteManager, *mockRouteController, *bytes.Buffer) {
+	t.Helper()
+
+	routes := &mockRouteController{}
+	cfg := Config{
+		Enabled:           true,
+		AccessInterface:   "eth1",
+		AccessSubnets:     []string{"10.0.0.0/24"},
+		SiteToSiteEnabled: true,
+	}
+	cfg.ApplyDefaults()
+
+	logger, buf := debugLogger()
+	mgr := NewSiteToSiteManager(vpn, routes, cfg, logger, nil)
+	if err := mgr.Setup("wg0"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	return mgr, routes, buf
+}
+
+// kernelNameTunnel returns the tunnel the kernel name tests add, carrying the
+// given remote subnets.
+func kernelNameTunnel(subnets ...string) api.SiteToSiteTunnel {
+	return api.SiteToSiteTunnel{
+		TunnelID:        "t-1",
+		RemoteEndpoint:  "1.2.3.4:51823",
+		RemotePublicKey: "rpk-1",
+		LocalSubnets:    []string{"10.0.0.0/24"},
+		RemoteSubnets:   subnets,
+		InterfaceName:   "wg-s2s-0",
+		ListenPort:      51823,
+	}
+}
+
+// onlyRouteCall returns the single recorded call to method on routes.
+func onlyRouteCall(t *testing.T, routes *mockRouteController, method string) mockCall {
+	t.Helper()
+	calls := routes.callsFor(method)
+	if len(calls) != 1 {
+		t.Fatalf("%s calls = %d, want 1", method, len(calls))
+	}
+	return calls[0]
+}
+
+// onlyVPNCall returns the single recorded call to method on vpn.
+func onlyVPNCall(t *testing.T, vpn *mockVPNController, method string) mockVPNCall {
+	t.Helper()
+	calls := vpn.vpnCallsFor(method)
+	if len(calls) != 1 {
+		t.Fatalf("%s calls = %d, want 1", method, len(calls))
+	}
+	return calls[0]
+}
+
+func TestSiteToSiteManager_AddTunnel_ResolvesKernelName(t *testing.T) {
+	vpn := newUtunNamer()
+	mgr, routes, buf := newActiveS2SManager(t, vpn)
+
+	if err := mgr.AddTunnel(kernelNameTunnel("10.1.0.0/24")); err != nil {
+		t.Fatalf("AddTunnel: %v", err)
+	}
+
+	// The route controller sees the name the kernel gave the interface.
+	fwd := onlyRouteCall(t, routes, "EnableForwarding")
+	if fwd.Args[0] != "utun9" || fwd.Args[1] != "wg0" {
+		t.Errorf("EnableForwarding args = %v, want [utun9 wg0]", fwd.Args)
+	}
+	add := onlyRouteCall(t, routes, "AddRoute")
+	if add.Args[0] != "10.1.0.0/24" || add.Args[1] != "utun9" {
+		t.Errorf("AddRoute args = %v, want [10.1.0.0/24 utun9]", add.Args)
+	}
+
+	// The VPN controller keeps the configured name.
+	create := onlyVPNCall(t, vpn.mockVPNController, "CreateTunnelInterface")
+	if create.Args[0] != "wg-s2s-0" {
+		t.Errorf("CreateTunnelInterface iface = %v, want wg-s2s-0", create.Args[0])
+	}
+	configure := onlyVPNCall(t, vpn.mockVPNController, "ConfigureTunnelPeer")
+	if configure.Args[0] != "wg-s2s-0" {
+		t.Errorf("ConfigureTunnelPeer iface = %v, want wg-s2s-0", configure.Args[0])
+	}
+
+	logged := buf.String()
+	for _, want := range []string{
+		"level=DEBUG",
+		`msg="tunnel interface resolved"`,
+		"tunnel_id=t-1",
+		"interface=wg-s2s-0",
+		"os_interface=utun9",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("log = %q, want it to contain %q", logged, want)
+		}
+	}
+}
+
+func TestSiteToSiteManager_AddTunnel_AddRouteError_KernelName(t *testing.T) {
+	vpn := newUtunNamer()
+	mgr, routes, _ := newActiveS2SManager(t, vpn)
+	// Fail on the second subnet so the first one has to be rolled back.
+	routes.addRouteErrFor = map[string]error{
+		"10.2.0.0/24": fmt.Errorf("add route error"),
+	}
+
+	if err := mgr.AddTunnel(kernelNameTunnel("10.1.0.0/24", "10.2.0.0/24")); err == nil {
+		t.Fatal("AddTunnel should return an error when AddRoute fails")
+	}
+
+	remove := onlyRouteCall(t, routes, "RemoveRoute")
+	if remove.Args[0] != "10.1.0.0/24" || remove.Args[1] != "utun9" {
+		t.Errorf("RemoveRoute args = %v, want [10.1.0.0/24 utun9]", remove.Args)
+	}
+	disable := onlyRouteCall(t, routes, "DisableForwarding")
+	if disable.Args[0] != "utun9" || disable.Args[1] != "wg0" {
+		t.Errorf("DisableForwarding args = %v, want [utun9 wg0]", disable.Args)
+	}
+
+	removePeer := onlyVPNCall(t, vpn.mockVPNController, "RemoveTunnelPeer")
+	if removePeer.Args[0] != "wg-s2s-0" {
+		t.Errorf("RemoveTunnelPeer iface = %v, want wg-s2s-0", removePeer.Args[0])
+	}
+	removeIface := onlyVPNCall(t, vpn.mockVPNController, "RemoveTunnelInterface")
+	if removeIface.Args[0] != "wg-s2s-0" {
+		t.Errorf("RemoveTunnelInterface iface = %v, want wg-s2s-0", removeIface.Args[0])
+	}
+}
+
+func TestSiteToSiteManager_RemoveTunnel_KernelName(t *testing.T) {
+	vpn := newUtunNamer()
+	mgr, routes, _ := newActiveS2SManager(t, vpn)
+
+	if err := mgr.AddTunnel(kernelNameTunnel("10.1.0.0/24")); err != nil {
+		t.Fatalf("AddTunnel: %v", err)
+	}
+	vpn.resetVPN()
+	routes.reset()
+
+	mgr.RemoveTunnel("t-1")
+
+	remove := onlyRouteCall(t, routes, "RemoveRoute")
+	if remove.Args[0] != "10.1.0.0/24" || remove.Args[1] != "utun9" {
+		t.Errorf("RemoveRoute args = %v, want [10.1.0.0/24 utun9]", remove.Args)
+	}
+	disable := onlyRouteCall(t, routes, "DisableForwarding")
+	if disable.Args[0] != "utun9" || disable.Args[1] != "wg0" {
+		t.Errorf("DisableForwarding args = %v, want [utun9 wg0]", disable.Args)
+	}
+
+	removePeer := onlyVPNCall(t, vpn.mockVPNController, "RemoveTunnelPeer")
+	if removePeer.Args[0] != "wg-s2s-0" {
+		t.Errorf("RemoveTunnelPeer iface = %v, want wg-s2s-0", removePeer.Args[0])
+	}
+	removeIface := onlyVPNCall(t, vpn.mockVPNController, "RemoveTunnelInterface")
+	if removeIface.Args[0] != "wg-s2s-0" {
+		t.Errorf("RemoveTunnelInterface iface = %v, want wg-s2s-0", removeIface.Args[0])
+	}
+}
+
+func TestSiteToSiteManager_Teardown_KernelName(t *testing.T) {
+	vpn := newUtunNamer()
+	mgr, routes, _ := newActiveS2SManager(t, vpn)
+
+	if err := mgr.AddTunnel(kernelNameTunnel("10.1.0.0/24")); err != nil {
+		t.Fatalf("AddTunnel: %v", err)
+	}
+	vpn.resetVPN()
+	routes.reset()
+
+	if err := mgr.Teardown(); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+
+	remove := onlyRouteCall(t, routes, "RemoveRoute")
+	if remove.Args[0] != "10.1.0.0/24" || remove.Args[1] != "utun9" {
+		t.Errorf("RemoveRoute args = %v, want [10.1.0.0/24 utun9]", remove.Args)
+	}
+	disable := onlyRouteCall(t, routes, "DisableForwarding")
+	if disable.Args[0] != "utun9" || disable.Args[1] != "wg0" {
+		t.Errorf("DisableForwarding args = %v, want [utun9 wg0]", disable.Args)
+	}
+
+	// Teardown drops the whole interface and never touches the peer.
+	removeIface := onlyVPNCall(t, vpn.mockVPNController, "RemoveTunnelInterface")
+	if removeIface.Args[0] != "wg-s2s-0" {
+		t.Errorf("RemoveTunnelInterface iface = %v, want wg-s2s-0", removeIface.Args[0])
+	}
+}
+
+func TestSiteToSiteManager_AddTunnel_NamerUnresolved(t *testing.T) {
+	tests := []struct {
+		name string
+		vpn  VPNController
+	}{
+		{
+			name: "namer without a match",
+			vpn: &namerVPNController{
+				mockVPNController: &mockVPNController{},
+				names:             map[string]string{},
+			},
+		},
+		{
+			name: "controller is no namer",
+			vpn:  &mockVPNController{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr, routes, buf := newActiveS2SManager(t, tt.vpn)
+
+			if err := mgr.AddTunnel(kernelNameTunnel("10.1.0.0/24")); err != nil {
+				t.Fatalf("AddTunnel: %v", err)
+			}
+
+			fwd := onlyRouteCall(t, routes, "EnableForwarding")
+			if fwd.Args[0] != "wg-s2s-0" || fwd.Args[1] != "wg0" {
+				t.Errorf("EnableForwarding args = %v, want [wg-s2s-0 wg0]", fwd.Args)
+			}
+			add := onlyRouteCall(t, routes, "AddRoute")
+			if add.Args[0] != "10.1.0.0/24" || add.Args[1] != "wg-s2s-0" {
+				t.Errorf("AddRoute args = %v, want [10.1.0.0/24 wg-s2s-0]", add.Args)
+			}
+
+			if logged := buf.String(); strings.Contains(logged, "tunnel interface resolved") {
+				t.Errorf("log = %q, want no resolved line for the configured name", logged)
+			}
+		})
+	}
 }
