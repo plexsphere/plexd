@@ -6,7 +6,7 @@ feature: PXD-0004
 
 # Local Node API
 
-The `internal/nodeapi` package exposes node state to local consumers (sidecar agents, CLI tools, monitoring) via a Unix domain socket and an optional TCP listener. It provides read access to metadata, data entries, and secrets, plus read-write access to local report entries that are synced to the control plane. The cache is kept current via SSE events and the reconciliation loop.
+The `internal/nodeapi` package exposes node state to local consumers (sidecar agents, CLI tools, monitoring) via a local endpoint (a Unix domain socket on Linux and macOS, the named pipe `\\.\pipe\plexd` on Windows) and an optional TCP listener. It provides read access to metadata, data entries, and secrets, plus read-write access to local report entries that are synced to the control plane. The cache is kept current via SSE events and the reconciliation loop.
 
 ## Config
 
@@ -14,13 +14,13 @@ The `internal/nodeapi` package exposes node state to local consumers (sidecar ag
 
 | Field             | Type            | Default                    | Description                                  |
 |-------------------|-----------------|----------------------------|----------------------------------------------|
-| `SocketPath`      | `string`        | `/var/run/plexd/api.sock` (Linux, macOS) | Path to the Unix domain socket ([per platform](configuration.md#platform-defaults)) |
+| `SocketPath`      | `string`        | `/var/run/plexd/api.sock` (Linux, macOS), `\\.\pipe\plexd` (Windows) | Address of the local listener: a Unix socket path, or on Windows a named pipe name ([per platform](configuration.md#platform-defaults)) |
 | `HTTPEnabled`     | `bool`          | `false`                    | Enable the optional TCP listener             |
 | `HTTPListen`      | `string`        | `127.0.0.1:9100`           | TCP listen address                           |
 | `HTTPTokenFile`   | `string`        | —                          | Path to file containing HTTP bearer token    |
 | `DebouncePeriod`  | `time.Duration` | `5s`                       | Debounce period for report sync coalescing   |
 | `ShutdownTimeout` | `time.Duration` | `5s`                       | Maximum time to wait for graceful shutdown   |
-| `SecretAuthEnabled`| `bool`         | `false`                    | SO_PEERCRED-based auth for secret routes     |
+| `SecretAuthEnabled`| `bool`         | `false`                    | Peer-credential auth for the secret routes: SO_PEERCRED on Linux, LOCAL_PEERCRED on macOS, the pipe client's process token on Windows (see [Local peer authorization](#local-peer-authorization)) |
 | `DataDir`         | `string`        | —                          | Data directory for cache persistence (required) |
 
 > The TCP listener serves the authenticated `/v1` routes only. The Kubernetes probe endpoints `/healthz` and `/readyz` come from a separate, unauthenticated health listener configured by the top-level `health` block (default `:9101`). That listener is enabled and bound independently of `HTTPEnabled`. See the [Configuration Reference](configuration.md#health).
@@ -120,10 +120,10 @@ cancel()
 2. **Load cache** — reads persisted state from `{DataDir}/state/` (creates directories if absent)
 3. **Start ReportSyncer** — background goroutine for debounced report sync
 4. **Build HTTP handler** — registers all 11 routes, wraps with report-notify middleware
-5. **Open Unix socket** — removes stale socket, creates directory, listens
+5. **Open the local listener** — removes a stale socket file and creates its directory on Unix, then listens on the socket or pipe
 6. **Open TCP listener** — only if `HTTPEnabled`; reads token from `HTTPTokenFile`, wraps with `BearerAuthMiddleware`
 7. **Serve** — blocks until context cancelled
-8. **Graceful shutdown** — shuts down HTTP servers with `ShutdownTimeout`, stops syncer, removes socket
+8. **Graceful shutdown** — shuts down HTTP servers with `ShutdownTimeout`, stops syncer, removes the socket (or, for a pipe, nothing)
 
 ### Error Handling
 
@@ -131,9 +131,9 @@ cancel()
 |---------------------------|-----------------------------------------------|
 | Config validation failure | `Start` returns error immediately             |
 | Cache load failure        | `Start` returns error immediately             |
-| Token file read failure   | `Start` returns error, closes Unix listener   |
-| TCP listen failure        | `Start` returns error, closes Unix listener   |
-| Unix listen failure       | `Start` returns error                         |
+| Token file read failure   | `Start` returns error, closes local listener  |
+| TCP listen failure        | `Start` returns error, closes local listener  |
+| Socket or pipe listen failure | `Start` returns error                     |
 | Context cancelled         | Graceful shutdown, returns `ctx.Err()`        |
 
 ### Logging
@@ -143,7 +143,7 @@ All log entries use structured keys with `component=nodeapi`:
 | Key              | Description                          |
 |------------------|--------------------------------------|
 | `component`      | Always `"nodeapi"`                   |
-| `socket`         | Unix socket path                     |
+| `socket`         | Unix socket path, or the pipe name on Windows |
 | `http_enabled`   | Whether TCP listener is active       |
 | `http_listen`    | TCP listen address                   |
 | `node_id`        | Node identifier                      |
@@ -284,6 +284,41 @@ Returns HTTP middleware that validates `Authorization: Bearer {token}` headers. 
 - Expects header format `Bearer <token>` (case-insensitive scheme)
 - Uses `crypto/subtle.ConstantTimeCompare` to prevent timing attacks
 - Returns `401 Unauthorized` with `{"error": "unauthorized"}` on failure
+
+## Local peer authorization
+
+When `SecretAuthEnabled` is set, `GET /v1/state/secrets` and `GET /v1/state/secrets/{key}` are restricted to the peers the platform admits; every other route stays open to any local peer that can open the endpoint.
+
+| Platform | Identity source | Who may read secrets |
+|----------|-----------------|----------------------|
+| Linux | `SO_PEERCRED`: uid, gid, pid | root, or a member of `plexd-secrets` |
+| macOS | `LOCAL_PEERCRED` and `LOCAL_PEERPID`: the same uid, gid, pid | root, or a member of `plexd-secrets` |
+| Windows | `GetNamedPipeClientProcessId` and the client's process token: pid, elevation, LocalSystem | an elevated Administrator, or LocalSystem |
+
+The endpoint itself is protected by the platform's own mechanism, and every platform restricts it to a privileged set, because opening it is the whole authorization for the routes outside `/v1/state/secrets` — `POST /v1/actions/run`, `POST /v1/hooks/reload` and the report writes all run in the daemon's own privilege. On Linux and macOS the socket is `root:plexd` with mode `0660` when a `plexd` group exists and the daemon may hand the socket to it, and mode `0600` with a warning when either does not hold. `deploy/install.sh` creates the `plexd` and `plexd-secrets` groups on Linux; nothing creates them on macOS, and no other install path does either, so the owner-only fallback is the default state wherever they were not created by hand. It is also the state under the systemd unit `plexd install` writes: `chown(2)` lets a caller without `CAP_CHOWN` set a file's group only to a group it belongs to itself, the unit bounds the daemon's capabilities to `CAP_NET_ADMIN` and `CAP_NET_RAW`, and `groupadd --system plexd` creates the group empty — so the `plexd` group governs a daemon started with full root capabilities, such as `sudo plexd up`, and not `systemctl start plexd`. The chmod that follows is not best-effort: when it fails, `ListenLocal` closes the socket and returns the error rather than serving a socket whose mode was never established. The bind itself runs under a umask that leaves the socket at `0600`, so the socket is never connectable at a wider mode than the one it ends up with. On Windows the pipe carries the security descriptor `D:P(A;;GA;;;SY)(A;;GA;;;BA)`, a protected DACL that grants full access to LocalSystem (`SY`) and Administrators (`BA`) and to nobody else — the same descriptor the WireGuard UAPI pipe uses. A non-elevated shell is refused by it, because `BA` resolves to the deny-only Administrators SID of a filtered token. It carries no owner clause, because an `O:SY` clause fails with `ERROR_INVALID_OWNER` when an elevated Administrator starts plexd by hand; the creator becomes the owner, which is LocalSystem for the service.
+
+The gate fails closed. A peer whose credentials cannot be read is answered `403` and logged as `failed to get peer credentials` at Error. That covers a connection that is neither a pipe nor a socket, a client process token that cannot be opened, and every Unix other than Linux and macOS, where the package has no implementation.
+
+The platform builds the policy that decides who passes:
+
+```go
+// SecretPolicy decides whether an identified local peer may read secret values.
+type SecretPolicy interface {
+    AllowSecrets(cred *PeerCredentials) bool
+}
+```
+
+```go
+func SecretAuthMiddleware(policy SecretPolicy, getter PeerCredGetter, logger *slog.Logger) func(http.Handler) http.Handler
+```
+
+The middleware applies that policy to the secret routes. The getter reads the credentials the server's `ConnContext` stored on the context of the connection when it was accepted, so a request is judged by the peer that opened its connection.
+
+A denied peer produces `secret access denied` at Warn with `pid`, `uid` and `gid` on Linux and macOS, `pid`, `elevated` and `local_system` on Windows, and `path` on every platform. The response body is:
+
+```json
+{"error": "forbidden: insufficient privileges for secret access"}
+```
 
 ## HTTP API Endpoints
 
@@ -821,11 +856,11 @@ data_dir/state/
 
 ## Security Considerations
 
-- **Envelope encryption (NSK)** - All secret values are encrypted with a per-node AES-256-GCM key (Node Secret Key) before leaving the control plane. The NSK is generated during registration and delivered to the node over authenticated TLS. Even if TLS is compromised or an attacker gains access to the Unix socket, CRD, or Kubernetes Secret objects, they only see ciphertext without the NSK.
+- **Envelope encryption (NSK)** - All secret values are encrypted with a per-node AES-256-GCM key (Node Secret Key) before leaving the control plane. The NSK is generated during registration and delivered to the node over authenticated TLS. Even if TLS is compromised or an attacker gains access to the local endpoint, CRD, or Kubernetes Secret objects, they only see ciphertext without the NSK.
 - **No plaintext at rest** - Secret values are never written to disk or etcd in plaintext. The file cache stores only the secret index (names + versions). On Kubernetes, Secret objects contain NSK-encrypted ciphertext. Plaintext exists only transiently in plexd's process memory during decryption and response delivery.
 - **Real-time fetch** - Secret values are fetched from the control plane on every access, not cached. This ensures the control plane remains the authoritative source and can enforce access policies, audit access, and revoke secrets in real-time. The trade-off is that secrets are unavailable when the control plane is unreachable (503).
-- **Two-layer access control** - Access to decrypted secrets requires both: (1) authorization at the plexd API level (Unix socket group membership or bearer token), and (2) live connectivity to the control plane. Neither layer alone is sufficient. On Kubernetes, even RBAC access to the K8s Secret objects only yields encrypted ciphertext.
-- **Transport security** - All control plane communication (state fetch, secret fetch, report sync) uses TLS-encrypted HTTPS. The NSK encryption layer provides defense-in-depth: secrets remain protected even if TLS is compromised. The Unix socket is local-only and protected by filesystem permissions.
+- **Two-layer access control** - Access to decrypted secrets requires both: (1) authorization at the plexd API level (socket group membership or Windows token elevation on the local endpoint, or bearer token on TCP), and (2) live connectivity to the control plane. Neither layer alone is sufficient. On Kubernetes, even RBAC access to the K8s Secret objects only yields encrypted ciphertext.
+- **Transport security** - All control plane communication (state fetch, secret fetch, report sync) uses TLS-encrypted HTTPS. The NSK encryption layer provides defense-in-depth: secrets remain protected even if TLS is compromised. The local endpoint is local-only: the socket is protected by its file mode, the pipe by its security descriptor.
 - **Least privilege** - The CRD splits `.spec` (plexd-managed) from `.status` (workload-writable) using the Kubernetes status subresource. Workloads that need to write reports do not need write access to the node's metadata, data, or secret references.
 - **Secret rotation** - Secret values are fetched in real-time, so the next access automatically returns the new value after a rotation on the control plane. No local cache invalidation is needed.
 - **NSK rotation** - The NSK is rotated together with mesh keys via the `rotate_keys` flow, or independently via a dedicated `rotate_nsk` control plane API. During rotation, the control plane re-encrypts all secrets for the node with the new NSK.

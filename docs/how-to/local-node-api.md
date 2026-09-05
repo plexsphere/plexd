@@ -8,47 +8,102 @@ feature: PXD-0004
 
 The Local Node API lets programs running on a plexd-managed node read node
 state (metadata, data entries, secrets) and write report entries back to the
-control plane. The API is served over a Unix domain socket by default and,
-optionally, over TCP with bearer-token authentication.
+control plane. The API is served over a Unix domain socket on Linux and macOS
+and over the named pipe `\\.\pipe\plexd` on Windows, and, optionally, over TCP
+with bearer-token authentication.
 
 This guide walks through common tasks. For a full reference of types and
 internals, see [Local Node API Reference](../reference/core/nodeapi.md).
 
 ## Prerequisites
 
-1. **plexd is running** on the node. The daemon creates the Unix socket on
-   startup.
+1. **plexd is running** on the node. The daemon creates the socket, or the
+   named pipe on Windows, on startup.
 
-2. **Group membership** -- access to the socket is controlled by filesystem
-   permissions:
+2. **Access to the endpoint** -- who may read what depends on the platform:
+
+   On Linux, access to the socket is controlled by filesystem permissions:
 
    | Group            | Grants access to                      |
    |------------------|---------------------------------------|
    | `plexd`          | All endpoints except secret values    |
    | `plexd-secrets`  | Secret-value endpoints (`/v1/state/secrets/{key}`) |
 
-   Add your user (or service account) to the appropriate group:
+   `deploy/install.sh` creates both groups. If you installed plexd another
+   way, create them first, then add your user (or service account) to the
+   appropriate one:
 
    ```bash
+   sudo groupadd --system plexd
+   sudo groupadd --system plexd-secrets
    sudo usermod -aG plexd myuser
    sudo usermod -aG plexd-secrets myuser   # only if secret access is needed
    ```
 
-3. **curl** (or any HTTP client that supports `--unix-socket`).
+   On macOS the same two groups apply, nothing creates them, and macOS keeps
+   them in Open Directory. Create a group and add a user to it with:
+
+   ```bash
+   sudo dscl . -create /Groups/plexd-secrets
+   sudo dseditgroup -o edit -a <user> -t user plexd-secrets
+   ```
+
+   Run the same pair for `plexd`. On both platforms, without the `plexd` group
+   the daemon narrows the socket to mode `0600` and only root reaches the API:
+   opening the socket is the whole authorization for every route but the
+   secret ones, so a missing group fails closed rather than opening the action
+   and report routes to every local account. Restarting the daemon after
+   creating the group is what applies the new mode.
+
+   The daemon narrows to `0600` for the same reason when it may not hand
+   the socket to the group. That is the case under the systemd unit
+   `plexd install` writes, whose capability set excludes `CAP_CHOWN`: the
+   `plexd` group grants access to a daemon started with full root
+   capabilities, such as `sudo plexd up`, and not to one started with
+   `systemctl start plexd`. When a member of `plexd` is refused, look for
+   `cannot hand the socket to the plexd group` in the daemon log.
+
+   On Windows the endpoint is the named pipe `\\.\pipe\plexd`, and no group
+   governs it. Its security descriptor admits LocalSystem and Administrators
+   only, so reaching the API needs an elevated shell or a caller running as
+   LocalSystem, such as the plexd service. That is the same posture as the
+   `plexd` group on Linux and macOS, for the same reason: the pipe carries the
+   action, hook and report routes, which the service runs as LocalSystem.
+
+3. **An HTTP client that reaches the endpoint.** On Linux and macOS that is
+   curl, or any HTTP client that supports `--unix-socket`. curl cannot open a
+   Windows named pipe, so use the plexd CLI (`plexd status`, `plexd state`)
+   from an elevated shell there, or a pipe-capable client:
+
+   ```powershell
+   $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'plexd', [System.IO.Pipes.PipeDirection]::InOut)
+   $pipe.Connect(2000)
+   $writer = New-Object System.IO.StreamWriter($pipe)
+   $writer.NewLine = "`r`n"; $writer.AutoFlush = $true
+   $writer.WriteLine('GET /v1/state HTTP/1.0'); $writer.WriteLine('Host: localhost'); $writer.WriteLine('')
+   $reader = New-Object System.IO.StreamReader($pipe)
+   $reader.ReadToEnd()
+   ```
+
+   The request asks for HTTP/1.0, so the server closes the connection after
+   the response and `ReadToEnd` returns.
 
 ## Connecting to the API
 
-### Via Unix socket (default)
+### Via the local endpoint (default)
 
-The socket path defaults to `/var/run/plexd/api.sock`. All examples in this
-guide use this path.
+The socket path defaults to `/var/run/plexd/api.sock` on Linux and macOS, and
+the pipe is `\\.\pipe\plexd` on Windows. All examples in this guide use the
+socket path.
 
 ```bash
 curl -s --unix-socket /var/run/plexd/api.sock http://localhost/v1/state
 ```
 
-No authentication header is required -- access is governed by socket file
-permissions.
+No authentication header is required -- access is governed by the socket's file
+mode, or by the pipe's security descriptor on Windows. On Windows, reach the
+pipe with the plexd CLI or with the PowerShell client from the
+[prerequisites](#prerequisites).
 
 ### Via TCP (when enabled)
 
@@ -168,9 +223,10 @@ curl -s --unix-socket /var/run/plexd/api.sock \
 
 ## Reading Secrets
 
-Secret access requires membership in the `plexd-secrets` group. Secrets are
-fetched from the control plane on demand and decrypted locally using the
-node's secret key. They are never cached to disk.
+Secret access requires root or membership in the `plexd-secrets` group on
+Linux and macOS, and an elevated Administrator or LocalSystem token on
+Windows. Secrets are fetched from the control plane on demand and decrypted
+locally using the node's secret key. They are never cached to disk.
 
 Secret key names follow the grammar `^[a-z][a-z0-9_-]{0,62}$` — a
 lowercase-leading name of at most 63 characters over `[a-z0-9_-]`. A forward
@@ -398,7 +454,7 @@ Requests without a token or with an invalid token receive `401 Unauthorized`:
 | 400         | `payload exceeds the 4096-byte limit` | Serialized report payload is larger than 4096 bytes | Shrink the payload below 4 KiB                                     |
 | 400         | `If-Match must be an integer`| `If-Match` header is not a valid integer                      | Pass a numeric version (e.g. `If-Match: 3`)                         |
 | 401         | `unauthorized`               | Missing or invalid bearer token on the TCP listener           | Pass `-H "Authorization: Bearer <token>"` with the correct token    |
-| 403         | (connection refused)         | User not in the `plexd` (or `plexd-secrets`) group            | Add the user to the appropriate group and re-login                  |
+| 403         | `forbidden: insufficient privileges for secret access` | Peer is not root or a `plexd-secrets` member (Linux, macOS), or not elevated / LocalSystem (Windows) | Add the user to `plexd-secrets` and re-login, or run from an elevated shell on Windows |
 | 404         | `not found`                  | Key does not exist in metadata, data, secrets, or report      | Verify the key name; list available keys first                      |
 | 409         | `version conflict`           | `If-Match` version does not match current version             | Re-read the entry, use the latest version in `If-Match`             |
 | 503         | `control plane unavailable`  | Control plane unreachable when fetching a secret value         | Verify network connectivity; check plexd logs for details           |
@@ -407,7 +463,9 @@ If the socket file does not exist (`curl: (7) Couldn't connect to server`),
 verify that plexd is running:
 
 ```bash
-systemctl status plexd
+systemctl status plexd                              # Linux
+launchctl print system/com.plexsphere.plexd         # macOS
+sc query plexd                                      # Windows
 ```
 
 ## Reference

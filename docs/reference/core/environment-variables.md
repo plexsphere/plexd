@@ -33,7 +33,7 @@ These variables are read by `applyEnvOverrides()` in `cmd/plexd/cmd/up.go` and o
 | `PLEXD_HOOKS_ENABLED` | `integrity.watch_enabled` | Enable/disable inotify hook watching. Values: `true`, `1` to enable. |
 | `PLEXD_HOOKS_DIR` | `actions.hooks_dir`, `integrity.hooks_dir` | Directory for hook scripts. Sets both `actions.hooks_dir` and `integrity.hooks_dir`. |
 | `PLEXD_ACTIONS_MAX_CONCURRENT` | `actions.max_concurrent` | Maximum number of concurrent actions (integer) |
-| `PLEXD_NODE_API_SOCKET` | `node_api.socket_path` | Path to the Unix domain socket |
+| `PLEXD_NODE_API_SOCKET` | `node_api.socket_path` | Unix socket path, or the named pipe name on Windows |
 | `PLEXD_NODE_API_HTTP_ENABLED` | `node_api.http_enabled` | Enable/disable the HTTP listener. Values: `true`, `1` to enable. |
 | `PLEXD_NODE_API_HTTP_LISTEN` | `node_api.http_listen` | HTTP listen address, e.g. `127.0.0.1:9100` |
 | `PLEXD_POLICY_ENABLED` | `policy.enabled` | Enable/disable network policy enforcement. Parsed with `strconv.ParseBool`, like `PLEXD_ACTIONS_ENABLED`; any other value is ignored with a warning and leaves `policy.enabled` as the file or the default set it. Setting it to `false` is how a container without `CAP_NET_ADMIN` gets past the firewall pre-flight without mounting a config file. |

@@ -173,7 +173,7 @@ PSKs are rotated together with the main key pairs and whenever a peer is removed
 | Signing key compromised | Attacker can forge SSE events until key is rotated | Signing key rotation via `signing_key_rotated` event (signed with current key); transition period for graceful rollover |
 | Session token stolen | Attacker could execute scoped actions on target node | Short TTL, node-bound, scoped action list, revocation on session end |
 | Unauthorized local action execution | SSH user runs actions without permission | Requires valid session JWT; `--local` restricted to root and logged as emergency |
-| Unauthorized secret access (local) | Attacker on node reads secrets via socket or K8s Secret | Socket requires `plexd-secrets` group; K8s Secrets contain only NSK-encrypted ciphertext; decryption requires plexd API with valid bearer token + live control plane |
+| Unauthorized secret access (local) | Attacker on node reads secrets via socket or K8s Secret | Linux/macOS: socket requires root or `plexd-secrets`; Windows: pipe requires an elevated Administrator or LocalSystem token; K8s Secrets contain only NSK-encrypted ciphertext; decryption requires plexd API with valid bearer token + live control plane |
 | NSK compromised | Attacker could decrypt secret ciphertext from K8s Secrets or intercepted responses | NSK rotation invalidates old key; secrets are fetched in real-time so no historical ciphertext accumulates on-node; control plane re-encrypts with new NSK |
 
 ## Network Requirements
