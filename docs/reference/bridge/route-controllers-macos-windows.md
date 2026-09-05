@@ -95,10 +95,14 @@ An unspecified next hop (`0.0.0.0` or `::`) with metric 0 is how Windows express
 
 | Operation | Duplicate condition | macOS | Windows |
 |-----------|---------------------|-------|---------|
-| `AddRoute`    | Route already exists | `File exists` in the output | `ERROR_OBJECT_ALREADY_EXISTS` |
+| `AddRoute`    | This interface already carries the route | `File exists` in the output, and `route -n get` names the same interface | `ERROR_OBJECT_ALREADY_EXISTS` |
 | `RemoveRoute` | Route not found      | `not in table` in the output | `ERROR_NOT_FOUND` |
 
 Both are reported as success, which is the idempotency `NetlinkRouteController` grants through `EEXIST` and `ESRCH`.
+
+On macOS the duplicate is only idempotent when this interface holds the prefix. `File exists` names neither the prefix's owner nor a next hop, and `RemoveRoute` names the destination alone, so accepting a prefix another interface routes would let one tunnel delete another tunnel's route while both are still reported as carried. The controller therefore runs `route -n get <family> <prefix>` and compares the `interface:` line with the interface the add named; anything else fails with `the prefix is already routed via "<other>"`.
+
+macOS `route(8)` exits 0 on a routing-socket error and reports the failure only in its output, so the controller reads that output whatever the exit status is. `File exists` on an add and `not in table` on a delete are success; any other line carrying `writing to routing socket:` is a failure, reported with the command line and the message `route(8)` printed. A utun that carries no IPv4 address answers `Network is unreachable`, which is why a site-to-site tunnel utun carries the node's mesh IP as a `/32`; see [Site-to-Site VPN](./site-to-site-vpn.md#vpncontroller).
 
 ## Interface Names
 
@@ -112,7 +116,7 @@ Neither controller maps names. Each passes what it is given straight to the plat
 
 On Windows, `net.InterfaceByName` resolves the friendly name and `ConvertInterfaceIndexToLuid` turns it into the LUID the IP Helper API addresses. A Wintun adapter is created under the configured interface name, so `plexd0` resolves without a mapping; see [Windows controller](../networking/wireguard.md#windows-controller).
 
-macOS is the platform where this matters most. The kernel names a tunnel device `utunN`, not `plexd0`, so a caller routing over a WireGuard interface has to resolve the kernel name first and hand that in. The bridge manager routes over `access_interface`, which is already a kernel name; the user-access and site-to-site controllers own that resolution for the interfaces they create.
+macOS is the platform where this matters most. The kernel names a tunnel device `utunN`, not `plexd0`, so a caller routing over a WireGuard interface has to resolve the kernel name first and hand that in. The bridge manager routes over `access_interface`, which is already a kernel name. `SiteToSiteManager` resolves the name of a tunnel interface through `wireguard.OSInterfaceNamer`, which `WGVPNController` implements over `DarwinController`, and hands the resulting `utunN` to `AddRoute`, `RemoveRoute` and the two forwarding calls; see [Site-to-Site VPN](./site-to-site-vpn.md#sitetositemanager). User access installs no route, so its forwarding calls carry the configured name, which macOS only logs, and `WGAccessController` exposes no mapping of its own.
 
 The mesh interface name reaches only `EnableForwarding`. macOS logs it and programs the global sysctl; Windows resolves it and programs its flag.
 
@@ -134,6 +138,14 @@ A privilege failure carries a hint, because the tool's own message does not say 
 bridge: add route "10.1.0.0/24" via "en99": /sbin/route -n add -inet 10.1.0.0/24 -interface en99: exit status 68: route: bad address: en99
 ```
 
+A refusal `route(8)` wrote to its output while exiting 0 takes the same form without the exit status, the message being what followed `writing to routing socket:`:
+
+```
+bridge: add route "10.1.0.0/24" via "utun9": /sbin/route -n add -inet 10.1.0.0/24 -interface utun9: Network is unreachable
+```
+
+The delete names the destination alone, so its form is `bridge: remove route "<subnet>" via "<iface>": /sbin/route -n delete -inet <subnet>: <message>`.
+
 Every `route` and `sysctl` invocation runs under a 10 second timeout, so a wedged host cannot stall bridge setup.
 
 ## Logging
@@ -153,16 +165,20 @@ All entries are at `Debug` with `component=bridge`.
 
 ## Tests
 
-Both controllers reach the operating system through a seam, so every argument list and every idempotent case is exercised on an ordinary unprivileged runner: macOS through the package's `CommandExecutor` and its recording mock, Windows through the `ipRouter` interface and a fake.
+Both controllers reach the operating system through a seam, so every argument list and every idempotent case is exercised on an ordinary unprivileged runner: macOS through the package's `CommandExecutor` and its recording mock, Windows through the `ipRouter` interface and a fake. The macOS cases cover the outputs that arrive with exit status 0 (`Network is unreachable`, `File exists`, `not in table`, `Permission denied`), the `route get` answers the ownership check reads (the same interface, another interface, no `interface:` line, a failed `get`), and the two helpers that parse them, `routeSocketError` and `routeInterface`. `site_to_site_test.go` covers the kernel-name resolution with a `VPNController` that maps `wg-s2s-0` to `utun9` and one that reports no mapping.
 
-Two tests drive the real kernel and are gated:
+Four tests drive the real kernel and are gated:
 
 | Test | Gate | Locally |
 |------|------|---------|
 | `TestDarwinRouteController_Real` | `os.Geteuid() == 0` | `sudo go test -run TestDarwinRouteController_Real ./internal/bridge/` |
 | `TestWindowsRouteController_Real` | `PLEXD_TEST_REAL_ROUTES=1` and an elevated token | `$env:PLEXD_TEST_REAL_ROUTES='1'; go test -run TestWindowsRouteController_Real ./internal/bridge/` from an elevated shell |
+| `TestWGControllers_RealUTUN` | `os.Geteuid() == 0` | `sudo go test -run TestWGControllers_RealUTUN ./internal/bridge/` |
+| `TestWGControllers_RealWintun` | `PLEXD_TEST_REAL_WINTUN=1` and an elevated token | `$env:PLEXD_TEST_REAL_WINTUN='1'; go test -run TestWGControllers_RealWintun ./internal/bridge/` from an elevated shell |
 
-Each adds a `/30`, checks the routing table for it, repeats the add to prove idempotency, removes it twice, then toggles forwarding and asserts the prior value comes back. CI runs both; see [CI Workflow](../development/ci-workflow.md).
+The two route-controller tests each add a `/30`, check the routing table for it, repeat the add to prove idempotency, remove it twice, then toggle forwarding and assert the prior value comes back.
+
+The other two drive the bridge access and site-to-site controllers over a real device. `TestWGControllers_RealUTUN` proves that `AddRoute` over an unnumbered tunnel utun fails with `Network is unreachable` and that the same route installs over a utun addressed `10.255.251.1/32`, where `netstat -rn -f inet` then lists it. It programs a peer through the UAPI socket, removes the interface and repeats the removal, and puts the access controller through the same create, peer and repeated remove. `TestWGControllers_RealWintun` proves that the adapter resolves on the first `net.InterfaceByName` call after creation, that `OSInterfaceName` reports the configured name there, and that the on-link route installs by LUID on an adapter carrying no address. CI runs all four; see [CI Workflow](../development/ci-workflow.md).
 
 ## Usage
 
