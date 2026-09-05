@@ -10,7 +10,8 @@ import (
 // Config holds the configuration for the local node API server.
 // Config is passed as a constructor argument — no file I/O in this package.
 type Config struct {
-	// SocketPath is the path to the Unix domain socket.
+	// SocketPath is the address of the local API listener: a Unix socket
+	// path, or on Windows a named pipe name (`\\.\pipe\plexd` by default).
 	// Default: paths.SocketPath()
 	SocketPath string `yaml:"socket_path"`
 
@@ -37,15 +38,19 @@ type Config struct {
 	// from the top-level data_dir by AgentConfig.ApplyDefaults, not from YAML.
 	DataDir string `yaml:"-"`
 
-	// SecretAuthEnabled enables SO_PEERCRED-based authentication for
-	// /v1/state/secrets/* routes on the Unix socket. When enabled, only
-	// root (UID 0) or plexd-secrets group members may access secrets.
+	// SecretAuthEnabled enables peer-credential authentication for
+	// /v1/state/secrets/* on the local listener: SO_PEERCRED on Linux,
+	// LOCAL_PEERCRED on macOS, the pipe client's process token on Windows.
+	// When enabled, only a privileged local peer (root or a plexd-secrets
+	// member on Linux and macOS; an elevated Administrator or LocalSystem on
+	// Windows) may read secrets.
 	// Default: false (enabled by cmd/plexd/cmd/up.go in production).
 	SecretAuthEnabled bool `yaml:"secret_auth_enabled"`
 }
 
-// DefaultSocketPath is the default Unix domain socket path. It is resolved per
-// platform, which is why it is a var rather than a const.
+// DefaultSocketPath is the default address of the local API listener. It is
+// resolved per platform (a Unix socket path, or the named pipe
+// `\\.\pipe\plexd` on Windows), which is why it is a var rather than a const.
 var DefaultSocketPath = paths.SocketPath()
 
 // DefaultHTTPListen is the default HTTP listen address.
@@ -77,6 +82,9 @@ func (c *Config) ApplyDefaults() {
 func (c *Config) Validate() error {
 	if c.DataDir == "" {
 		return errors.New("nodeapi: config: DataDir is required")
+	}
+	if err := validateSocketPath(c.SocketPath); err != nil {
+		return err
 	}
 	if c.DebouncePeriod <= 0 {
 		return errors.New("nodeapi: config: DebouncePeriod must be positive")

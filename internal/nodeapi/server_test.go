@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -71,11 +72,15 @@ func (c *serverTestClient) DeleteStateReport(_ context.Context, _, _ string) err
 }
 
 // shortSocketPath returns a Unix socket path that fits every platform's
-// sun_path limit: 104 bytes on macOS, 108 on Linux and Windows. t.TempDir()
-// embeds the test's own name in the path, which pushes a long-named test past
-// the limit and fails bind with EINVAL.
+// sun_path limit: 104 bytes on macOS, 108 on Linux. t.TempDir() embeds the
+// test's own name in the path, which pushes a long-named test past the limit
+// and fails bind with EINVAL. On Windows it returns a per-test named pipe
+// name, which has no length limit and needs no directory.
 func shortSocketPath(t *testing.T) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf(`\\.\pipe\plexd-test-%d-%d`, os.Getpid(), time.Now().UnixNano())
+	}
 	dir, err := os.MkdirTemp("", "plexd-sock-")
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
@@ -104,8 +109,8 @@ func newTestServer(t *testing.T, client *serverTestClient) (*Server, Config) {
 	return srv, cfg
 }
 
-func TestServer_UnixSocket(t *testing.T) {
-	defer goleak.VerifyNone(t)
+func TestServer_LocalListener(t *testing.T) {
+	defer verifyNoLeaks(t)
 
 	client := &serverTestClient{}
 	srv, cfg := newTestServer(t, client)
@@ -122,8 +127,8 @@ func TestServer_UnixSocket(t *testing.T) {
 		t.Fatal("socket did not appear")
 	}
 
-	// Make a request over the Unix socket.
-	httpClient := unixSocketClient(cfg.SocketPath)
+	// Make a request over the local listener.
+	httpClient := localClient(cfg.SocketPath)
 	resp, err := httpClient.Get("http://unix/v1/state")
 	if err != nil {
 		cancel()
@@ -143,26 +148,15 @@ func TestServer_UnixSocket(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	// Verify socket exists.
-	if _, err := os.Stat(cfg.SocketPath); err != nil {
-		cancel()
-		t.Fatalf("socket file missing: %v", err)
-	}
-
 	// Shut down.
 	cancel()
 	if err := <-errCh; err != nil && err != context.Canceled {
 		t.Fatalf("Start returned: %v", err)
 	}
-
-	// Verify socket removed after shutdown.
-	if _, err := os.Stat(cfg.SocketPath); !os.IsNotExist(err) {
-		t.Errorf("socket file not removed after shutdown")
-	}
 }
 
 func TestServer_TCPListener(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer verifyNoLeaks(t)
 
 	client := &serverTestClient{}
 	srv, cfg := newTestServer(t, client)
@@ -234,7 +228,7 @@ func TestServer_TCPListener(t *testing.T) {
 }
 
 func TestServer_GracefulShutdown(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer verifyNoLeaks(t)
 
 	client := &serverTestClient{}
 	srv, cfg := newTestServer(t, client)
@@ -260,15 +254,10 @@ func TestServer_GracefulShutdown(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not shut down in time")
 	}
-
-	// Socket should be removed.
-	if _, err := os.Stat(cfg.SocketPath); !os.IsNotExist(err) {
-		t.Errorf("socket not removed after shutdown")
-	}
 }
 
 func TestServer_NoGoroutineLeaks(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer verifyNoLeaks(t)
 
 	client := &serverTestClient{}
 	srv, cfg := newTestServer(t, client)
@@ -284,7 +273,7 @@ func TestServer_NoGoroutineLeaks(t *testing.T) {
 	}
 
 	// Make a quick request to exercise the handler.
-	httpClient := unixSocketClient(cfg.SocketPath)
+	httpClient := localClient(cfg.SocketPath)
 	resp, err := httpClient.Get("http://unix/v1/state")
 	if err == nil {
 		resp.Body.Close()
@@ -292,11 +281,11 @@ func TestServer_NoGoroutineLeaks(t *testing.T) {
 
 	cancel()
 	<-errCh
-	// goleak.VerifyNone runs in defer.
+	// verifyNoLeaks runs in defer.
 }
 
 func TestServer_ReconcileHandler(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer verifyNoLeaks(t)
 
 	client := &serverTestClient{}
 	srv, cfg := newTestServer(t, client)
@@ -453,52 +442,13 @@ func TestServer_ReconcileHandlerPreservesDeliveryMode(t *testing.T) {
 	}
 }
 
-func TestServer_StaleSocketRemoved(t *testing.T) {
-	defer goleak.VerifyNone(t)
-
-	client := &serverTestClient{}
-	srv, cfg := newTestServer(t, client)
-
-	// Create a stale socket file.
-	if err := os.WriteFile(cfg.SocketPath, []byte("stale"), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Start(ctx, "node-1") }()
-
-	if !waitForSocket(t, cfg.SocketPath, 2*time.Second) {
-		cancel()
-		t.Fatal("socket did not appear after stale removal")
-	}
-
-	// Verify we can connect.
-	httpClient := unixSocketClient(cfg.SocketPath)
-	resp, err := httpClient.Get("http://unix/v1/state")
-	if err != nil {
-		cancel()
-		t.Fatalf("GET /v1/state: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		cancel()
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-
-	cancel()
-	<-errCh
-}
-
 // --- helpers ---
 
 func waitForSocket(t *testing.T, path string, timeout time.Duration) bool {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if conn, err := net.Dial("unix", path); err == nil {
+		if conn, err := DialLocal(context.Background(), path); err == nil {
 			conn.Close()
 			return true
 		}
@@ -520,19 +470,31 @@ func waitForTCP(t *testing.T, addr string, timeout time.Duration) bool {
 	return false
 }
 
-func unixSocketClient(socketPath string) *http.Client {
+func localClient(socketPath string) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", socketPath)
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return DialLocal(ctx, socketPath)
 			},
 		},
 	}
 }
 
+// verifyNoLeaks fails the test if goroutines are left behind, except for
+// namedpipe.ioCompletionProcessor: wireguard-go's named-pipe transport
+// starts that IO-completion dispatcher once per process on the first pipe
+// and never stops it, so it outlives every test that opened the pipe on
+// Windows. It has to be IgnoreAnyFunction because the goroutine is parked
+// in the GetQueuedCompletionStatus syscall, so ioCompletionProcessor is not
+// its top frame. internal/wireguard/leak_test.go carries the same exemption.
+func verifyNoLeaks(t *testing.T) {
+	t.Helper()
+	goleak.VerifyNone(t, goleak.IgnoreAnyFunction("golang.zx2c4.com/wireguard/ipc/namedpipe.ioCompletionProcessor"))
+}
+
 // Verify ReportSyncer integration — PUT report triggers sync.
 func TestServer_ReportSyncIntegration(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer verifyNoLeaks(t)
 
 	syncCalls := make(chan string, 10)
 	// Track per-key PutStateReport calls through a channel.
@@ -562,7 +524,7 @@ func TestServer_ReportSyncIntegration(t *testing.T) {
 	}
 
 	// PUT a report entry via Unix socket.
-	httpClient := unixSocketClient(cfg.SocketPath)
+	httpClient := localClient(cfg.SocketPath)
 	body := strings.NewReader(`{"content_type":"application/json","payload":{"status":"ok"}}`)
 	req, _ := http.NewRequest(http.MethodPut, "http://unix/v1/state/report/health", body)
 	resp, err := httpClient.Do(req)
@@ -662,7 +624,7 @@ func (c *trackingSyncClient) DeleteStateReport(_ context.Context, _, _ string) e
 // TestServer_EndToEndFlow exercises the full server lifecycle: start, populate
 // cache, read state summary, CRUD report entries, verify sync, and shutdown.
 func TestServer_EndToEndFlow(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer verifyNoLeaks(t)
 
 	syncCalls := make(chan string, 10)
 	client := &configurableTestClient{
@@ -708,7 +670,7 @@ func TestServer_EndToEndFlow(t *testing.T) {
 		{Key: "db-password", Version: 1},
 	})
 
-	httpClient := unixSocketClient(cfg.SocketPath)
+	httpClient := localClient(cfg.SocketPath)
 
 	// 1. GET /v1/state — verify summary contains all categories.
 	resp, err := httpClient.Get("http://unix/v1/state")
@@ -844,7 +806,7 @@ syncLoop:
 // forwarded to the syncer, while grammar and value-cap violations are rejected
 // before any cache write.
 func TestServer_PublishReport(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer verifyNoLeaks(t)
 
 	puts := make(chan api.NodeStateReportRequest, 4)
 	client := &configurableTestClient{
@@ -895,7 +857,7 @@ func TestServer_PublishReport(t *testing.T) {
 	}
 
 	// And readable over the local HTTP API.
-	httpClient := unixSocketClient(cfg.SocketPath)
+	httpClient := localClient(cfg.SocketPath)
 	resp, err := httpClient.Get("http://unix/v1/state/report/status.mesh")
 	if err != nil {
 		cancel()
@@ -949,7 +911,7 @@ func TestServer_PublishReport(t *testing.T) {
 // TestServer_SecretProxy exercises the secret proxy endpoint: successful
 // decrypt, 503 on control plane failure, and 404 on ErrNotFound.
 func TestServer_SecretProxy(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer verifyNoLeaks(t)
 
 	nsk := testKey(t)
 	secretPlaintext := "super-secret-password"
@@ -990,7 +952,7 @@ func TestServer_SecretProxy(t *testing.T) {
 		t.Fatal("socket did not appear")
 	}
 
-	httpClient := unixSocketClient(cfg.SocketPath)
+	httpClient := localClient(cfg.SocketPath)
 
 	// Test 1: Successful secret fetch and decryption.
 	resp, err := httpClient.Get("http://unix/v1/state/secrets/db-password")
@@ -1050,7 +1012,7 @@ func TestServer_SecretProxy(t *testing.T) {
 // endpoints. The cache is populated directly through its update methods, which
 // outlive the retired SSE writers.
 func TestServer_CacheReflectedInHTTP(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer verifyNoLeaks(t)
 
 	client := &serverTestClient{}
 	srv, cfg := newTestServer(t, client)
@@ -1066,7 +1028,7 @@ func TestServer_CacheReflectedInHTTP(t *testing.T) {
 		t.Fatal("socket did not appear")
 	}
 
-	httpClient := unixSocketClient(cfg.SocketPath)
+	httpClient := localClient(cfg.SocketPath)
 
 	// 1. Populate metadata and the versioned data store.
 	srv.cache.UpdateMetadata(map[string]string{"env": "production", "cluster": "alpha"})

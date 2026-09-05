@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"net"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -16,11 +17,15 @@ import (
 )
 
 // shortSocketPath returns a Unix socket path that fits every platform's
-// sun_path limit: 104 bytes on macOS, 108 on Linux and Windows. t.TempDir()
-// embeds the test's own name in the path, which pushes a long-named test past
-// the limit and fails bind with EINVAL.
+// sun_path limit: 104 bytes on macOS, 108 on Linux. t.TempDir() embeds the
+// test's own name in the path, which pushes a long-named test past the limit
+// and fails bind with EINVAL. On Windows it returns a per-test named pipe
+// name, which has no length limit and needs no directory.
 func shortSocketPath(t *testing.T) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf(`\\.\pipe\plexd-test-%d-%d`, os.Getpid(), time.Now().UnixNano())
+	}
 	dir, err := os.MkdirTemp("", "plexd-sock-")
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
@@ -29,16 +34,17 @@ func shortSocketPath(t *testing.T) string {
 	return filepath.Join(dir, "api.sock")
 }
 
-// startTestSocketServer starts an HTTP server on a temporary Unix socket.
-// It returns the socket path and cleans up on test completion.
+// startTestSocketServer starts an HTTP server on a temporary local endpoint:
+// a Unix socket, or a named pipe on Windows. It returns the endpoint address
+// and cleans up on test completion.
 func startTestSocketServer(t *testing.T, handler http.Handler) string {
 	t.Helper()
 
 	socketPath := shortSocketPath(t)
 
-	ln, err := net.Listen("unix", socketPath)
+	ln, err := nodeapi.ListenLocal(socketPath, discardLogger())
 	if err != nil {
-		t.Fatalf("listen unix: %v", err)
+		t.Fatalf("listen local: %v", err)
 	}
 
 	srv := &http.Server{Handler: handler}
@@ -48,12 +54,11 @@ func startTestSocketServer(t *testing.T, handler http.Handler) string {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
-		os.Remove(socketPath)
 	})
 
-	// Wait for socket to be ready.
+	// Wait for the endpoint to be ready.
 	for i := 0; i < 50; i++ {
-		conn, err := net.Dial("unix", socketPath)
+		conn, err := nodeapi.DialLocal(context.Background(), socketPath)
 		if err == nil {
 			conn.Close()
 			break
@@ -64,8 +69,9 @@ func startTestSocketServer(t *testing.T, handler http.Handler) string {
 	return socketPath
 }
 
-// startFakeAgent starts a minimal HTTP server on a Unix socket that serves
-// the given StateSummary at /v1/state. It returns the socket path.
+// startFakeAgent starts a minimal HTTP server on a temporary local endpoint
+// (a Unix socket, or a named pipe on Windows) that serves the given
+// StateSummary at /v1/state. It returns the endpoint address.
 func startFakeAgent(t *testing.T, summary nodeapi.StateSummary) string {
 	t.Helper()
 

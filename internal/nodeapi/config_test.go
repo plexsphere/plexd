@@ -99,7 +99,7 @@ func TestConfig_CustomValuesOverrideDefaults(t *testing.T) {
 func TestConfig_ValidateAcceptsValid(t *testing.T) {
 	cfg := Config{
 		DataDir:         "/var/lib/plexd",
-		SocketPath:      "/tmp/custom.sock",
+		SocketPath:      shortSocketPath(t),
 		DebouncePeriod:  10 * time.Second,
 		ShutdownTimeout: 30 * time.Second,
 	}

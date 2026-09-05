@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -24,8 +23,9 @@ type NodeAPIClient interface {
 	ReportSyncClient
 }
 
-// Server is the local node API server. It serves HTTP over a Unix socket and
-// optionally over TCP with bearer token authentication.
+// Server is the local node API server. It serves HTTP over the local listener
+// (a Unix socket, or a named pipe on Windows) and optionally over TCP with
+// bearer token authentication.
 type Server struct {
 	cfg    Config
 	client NodeAPIClient
@@ -165,34 +165,21 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 	// Wrap mux with a report-sync notifier.
 	wrappedMux := reportNotifyMiddleware(mux, s.cache, s.syncer)
 
-	// Remove stale socket.
-	os.Remove(s.cfg.SocketPath)
-
-	// Ensure socket directory exists.
-	if dir := filepath.Dir(s.cfg.SocketPath); dir != "" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("nodeapi: create socket dir: %w", err)
-		}
-	}
-
-	// Open Unix socket listener.
-	unixLn, err := net.Listen("unix", s.cfg.SocketPath)
+	// Open the local listener (Unix socket, or a named pipe on Windows).
+	localLn, err := ListenLocal(s.cfg.SocketPath, s.logger)
 	if err != nil {
-		return fmt.Errorf("nodeapi: listen unix %s: %w", s.cfg.SocketPath, err)
+		return err
 	}
-
-	// Set socket ownership and permissions (Linux: root:plexd 0660).
-	applySocketPermissions(s.cfg.SocketPath, s.logger)
 
 	// Wrap secret routes with peer credential auth (Linux: SO_PEERCRED).
 	// Only enabled when SecretAuthEnabled is set (requires root to set socket perms).
-	var unixHandler http.Handler = wrappedMux
+	var localHandler http.Handler = wrappedMux
 	if s.cfg.SecretAuthEnabled {
-		unixHandler = wrapSecretAuth(wrappedMux, s.logger)
+		localHandler = wrapSecretAuth(wrappedMux, s.logger)
 	}
 
-	unixServer := &http.Server{
-		Handler:     unixHandler,
+	localServer := &http.Server{
+		Handler:     localHandler,
 		ConnContext: connContextWithPeerCred(s.logger),
 	}
 
@@ -203,8 +190,8 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 		// Read token from file.
 		token, err := readTokenFile(s.cfg.HTTPTokenFile)
 		if err != nil {
-			unixLn.Close()
-			os.Remove(s.cfg.SocketPath)
+			localLn.Close()
+			removeLocal(s.cfg.SocketPath)
 			return fmt.Errorf("nodeapi: read token file: %w", err)
 		}
 
@@ -214,8 +201,8 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 
 		tcpLn, err = net.Listen("tcp", s.cfg.HTTPListen)
 		if err != nil {
-			unixLn.Close()
-			os.Remove(s.cfg.SocketPath)
+			localLn.Close()
+			removeLocal(s.cfg.SocketPath)
 			return fmt.Errorf("nodeapi: listen tcp %s: %w", s.cfg.HTTPListen, err)
 		}
 		tcpServer = &http.Server{Handler: tcpHandler}
@@ -239,12 +226,12 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 		_ = s.syncer.Run(syncCtx, nodeID)
 	}()
 
-	// Unix socket serve goroutine.
+	// Local listener serve goroutine.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := unixServer.Serve(unixLn); err != http.ErrServerClosed {
-			s.logger.Error("unix server error", "error", err)
+		if err := localServer.Serve(localLn); err != http.ErrServerClosed {
+			s.logger.Error("local server error", "error", err)
 		}
 	}()
 
@@ -268,7 +255,7 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
 	defer shutdownCancel()
 
-	_ = unixServer.Shutdown(shutdownCtx)
+	_ = localServer.Shutdown(shutdownCtx)
 	if tcpServer != nil {
 		_ = tcpServer.Shutdown(shutdownCtx)
 	}
@@ -276,8 +263,8 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 	// Stop syncer.
 	syncCancel()
 
-	// Remove socket file.
-	os.Remove(s.cfg.SocketPath)
+	// Remove the socket file (a no-op where the listener is a pipe).
+	removeLocal(s.cfg.SocketPath)
 
 	// Wait for all goroutines.
 	wg.Wait()
