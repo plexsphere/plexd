@@ -30,5 +30,6 @@ func HooksDir() string { return filepath.Join(ConfigDir(), "hooks") }
 // TokenFile returns the default bootstrap token file.
 func TokenFile() string { return filepath.Join(ConfigDir(), "bootstrap-token") }
 
-// SocketPath returns the default Unix socket of the local node API.
-func SocketPath() string { return filepath.Join(RunDir(), "api.sock") }
+// SocketPath returns the default address of the local node API: a Unix socket
+// path, or the named pipe `\\.\pipe\plexd` on Windows.
+func SocketPath() string { return socketPath() }

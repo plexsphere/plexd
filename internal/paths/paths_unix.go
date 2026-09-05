@@ -2,6 +2,8 @@
 
 package paths
 
+import "path/filepath"
+
 // The Filesystem Hierarchy Standard layout, unchanged from what plexd shipped
 // before it resolved paths per platform.
 //
@@ -15,3 +17,5 @@ func configDir() string { return "/etc/plexd" }
 func dataDir() string { return "/var/lib/plexd" }
 
 func runDir() string { return "/var/run/plexd" }
+
+func socketPath() string { return filepath.Join(runDir(), "api.sock") }

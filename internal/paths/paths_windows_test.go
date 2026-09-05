@@ -7,7 +7,8 @@ import "testing"
 // TestPaths_Windows pins the layout under %ProgramData%. The variable is set
 // here rather than read from the runner, so the assertion is the same on every
 // host: what is under test is how plexd composes the path, not what the CI
-// image happens to set ProgramData to.
+// image happens to set ProgramData to. The socket address is the named pipe,
+// which ProgramData does not reach: it is the same string on every host.
 func TestPaths_Windows(t *testing.T) {
 	t.Setenv("ProgramData", `D:\PD`)
 
@@ -22,7 +23,7 @@ func TestPaths_Windows(t *testing.T) {
 		{"ConfigFile", ConfigFile(), `D:\PD\plexd\config.yaml`},
 		{"HooksDir", HooksDir(), `D:\PD\plexd\hooks`},
 		{"TokenFile", TokenFile(), `D:\PD\plexd\bootstrap-token`},
-		{"SocketPath", SocketPath(), `D:\PD\plexd\run\api.sock`},
+		{"SocketPath", SocketPath(), `\\.\pipe\plexd`},
 	}
 
 	for _, tt := range tests {

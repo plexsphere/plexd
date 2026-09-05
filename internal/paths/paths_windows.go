@@ -29,3 +29,9 @@ func configDir() string { return filepath.Join(programData(), "plexd") }
 func dataDir() string { return filepath.Join(programData(), "plexd", "data") }
 
 func runDir() string { return filepath.Join(programData(), "plexd", "run") }
+
+// socketPath is a named pipe: the local node API is served over the pipe
+// namespace on Windows. That namespace is not a directory, so nothing here is
+// derived from runDir. The run directory stays as it is, created by
+// plexd install (internal/packaging/installer.go).
+func socketPath() string { return `\\.\pipe\plexd` }
