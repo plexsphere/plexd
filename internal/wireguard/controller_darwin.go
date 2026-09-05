@@ -225,23 +225,88 @@ func (c *DarwinController) addOnLinkRoute(osName string, prefix netip.Prefix) er
 	}
 	network := prefix.Masked().String()
 
-	out, err := c.runTool("configure address", routePath, "-n", "add", family, network, "-interface", osName)
-	if err == nil {
-		return nil
-	}
+	argv := []string{routePath, "-n", "add", family, network, "-interface", osName}
+	out, err := c.runTool("configure address", argv...)
 
-	// route(8) reports an existing route as "File exists". Re-adding one is a
-	// success, the idempotency NetlinkRouteController grants EEXIST on Linux.
+	// route(8) reports an existing route as "File exists". Re-adding the route
+	// this utun already carries is a success, the idempotency
+	// NetlinkRouteController grants EEXIST on Linux. Who holds the prefix
+	// decides, because the message names neither. It arrives with either exit
+	// status, so it is read first.
 	if bytes.Contains(out, []byte("File exists")) {
-		c.logger.Debug("route already exists",
-			"component", "wireguard",
-			"utun", osName,
-			"prefix", network,
-		)
-		return nil
+		return c.confirmRouteOwner(osName, family, network)
+	}
+	if err != nil {
+		return err
 	}
 
-	return err
+	// route(8) exits 0 after a refusal it only wrote to its output. A utun
+	// whose alias has not settled answers "Network is unreachable" that way,
+	// and trusting the exit status would leave every mesh packet on the
+	// default route with nothing recording why.
+	if msg, ok := routeSocketError(out); ok {
+		return fmt.Errorf("wireguard: configure address: %s: %s", strings.Join(argv, " "), msg)
+	}
+
+	return nil
+}
+
+// confirmRouteOwner reports whether the prefix route(8) refused to add as
+// "File exists" is already routed via this utun. route(8) refuses only an
+// exact (destination, mask) duplicate, so this catches a second interface
+// holding the identical mesh prefix; a mesh CIDR that is merely a subnet of a
+// prefix another interface holds — a corporate LAN, another VPN's utun —
+// is added without a refusal and is not covered here.
+func (c *DarwinController) confirmRouteOwner(osName, family, network string) error {
+	argv := []string{routePath, "-n", "get", family, network}
+	out, err := c.runTool("configure address", argv...)
+	if err != nil {
+		return err
+	}
+	// The "get" is refused the same way an "add" is: with a message in the
+	// output and a zero exit status.
+	if msg, ok := routeSocketError(out); ok {
+		return fmt.Errorf("wireguard: configure address: %s: %s", strings.Join(argv, " "), msg)
+	}
+
+	owner, ok := routeInterface(out)
+	if !ok || owner != osName {
+		return fmt.Errorf("wireguard: configure address: %s is already routed via %q, not via %s", network, owner, osName)
+	}
+
+	c.logger.Debug("route already exists",
+		"component", "wireguard",
+		"utun", osName,
+		"prefix", network,
+	)
+	return nil
+}
+
+// routeInterface returns the interface name route(8) printed on the
+// "interface:" line of a "get" answer, and whether the answer carried one.
+func routeInterface(out []byte) (string, bool) {
+	for _, line := range strings.Split(string(out), "\n") {
+		if _, name, ok := strings.Cut(line, "interface:"); ok {
+			return strings.TrimSpace(name), true
+		}
+	}
+	return "", false
+}
+
+// routeSocketError returns the message route(8) printed after the marker
+// "writing to routing socket: ", and whether any line carried it. route(8)
+// reports a routing-socket failure that way and still exits 0, so its output
+// is the only place a refused change shows up. The bridge route controller
+// reads route(8) the same way, in its own package.
+func routeSocketError(out []byte) (string, bool) {
+	const marker = "writing to routing socket: "
+
+	for _, line := range strings.Split(string(out), "\n") {
+		if _, msg, ok := strings.Cut(line, marker); ok {
+			return strings.TrimSpace(msg), true
+		}
+	}
+	return "", false
 }
 
 // SetInterfaceUp raises the interface flag on the utun. The kernel's route

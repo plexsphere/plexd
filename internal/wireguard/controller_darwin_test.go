@@ -404,9 +404,86 @@ func TestDarwinController_ConfigureAddress_RouteExists(t *testing.T) {
 		"route: writing to routing socket: File exists\nadd net 10.0.0.0: gateway utun9: File exists",
 		errors.New("exit status 1"),
 	)
+	runner.stub("/sbin/route -n get -inet 10.0.0.0/16", routeGetOutput("utun9"), nil)
 
 	if err := c.ConfigureAddress("plexd0", "10.0.0.5/16"); err != nil {
 		t.Fatalf("ConfigureAddress: %v, want an existing route to be success", err)
+	}
+
+	assertArgv(t, runner,
+		"/sbin/ifconfig utun9 inet 10.0.0.5/16 10.0.0.5 alias",
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"/sbin/route -n get -inet 10.0.0.0/16",
+	)
+}
+
+// routeGetOutput is what route(8) prints for a "get" that found a route.
+func routeGetOutput(iface string) string {
+	return "   route to: 10.0.0.0\ndestination: 10.0.0.0\n       mask: 255.255.0.0\n" +
+		"  interface: " + iface + "\n      flags: <UP,DONE,STATIC>\n"
+}
+
+// "File exists" names neither the prefix's owner nor a next hop. A mesh CIDR
+// that overlaps a prefix another interface holds must not be accepted as the
+// idempotent case: every mesh packet would leave through that interface in the
+// clear.
+func TestDarwinController_ConfigureAddress_RouteExistsOtherInterface(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+	runner.stub(
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"route: writing to routing socket: File exists\nadd net 10.0.0.0: gateway utun9: File exists",
+		errors.New("exit status 1"),
+	)
+	runner.stub("/sbin/route -n get -inet 10.0.0.0/16", routeGetOutput("en0"), nil)
+
+	err := c.ConfigureAddress("plexd0", "10.0.0.5/16")
+	want := `wireguard: configure address: 10.0.0.0/16 is already routed via "en0", not via utun9`
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+// route(8) answers a "get" for a prefix with no route of its own with the
+// default route, which carries no interface the add can be matched against.
+func TestDarwinController_ConfigureAddress_RouteExistsOwnerUnknown(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+	runner.stub(
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"route: writing to routing socket: File exists",
+		nil,
+	)
+	runner.stub("/sbin/route -n get -inet 10.0.0.0/16", "   route to: 10.0.0.0\n", nil)
+
+	err := c.ConfigureAddress("plexd0", "10.0.0.5/16")
+	want := `wireguard: configure address: 10.0.0.0/16 is already routed via "", not via utun9`
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+// The "get" is refused the way every route(8) call is: with a message in the
+// output and a zero exit status. Nothing proved the route belongs to this
+// utun, so the add is not success.
+func TestDarwinController_ConfigureAddress_RouteExistsGetFails(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+	runner.stub(
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"route: writing to routing socket: File exists",
+		nil,
+	)
+	runner.stub(
+		"/sbin/route -n get -inet 10.0.0.0/16",
+		"route: writing to routing socket: not in table",
+		nil,
+	)
+
+	err := c.ConfigureAddress("plexd0", "10.0.0.5/16")
+	want := "wireguard: configure address: /sbin/route -n get -inet 10.0.0.0/16: not in table"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
 	}
 }
 
@@ -421,6 +498,79 @@ func TestDarwinController_ConfigureAddress_RouteFails(t *testing.T) {
 
 	err := c.ConfigureAddress("plexd0", "10.0.0.5/16")
 	assertPrefix(t, err, "wireguard: configure address: /sbin/route -n add -inet 10.0.0.0/16 -interface utun9: exit status 1:")
+}
+
+// route(8) reports every routing-socket failure in its output and still exits
+// 0, so a zero exit alone must not be read as "the route went in": the mesh
+// prefix would then be left on the default route with nothing recording it.
+func TestDarwinController_ConfigureAddress_RouteFailsWithExitZero(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+	runner.stub(
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"route: writing to routing socket: Network is unreachable\nadd net 10.0.0.0: gateway utun9: Network is unreachable",
+		nil,
+	)
+
+	err := c.ConfigureAddress("plexd0", "10.0.0.5/16")
+	want := "wireguard: configure address: /sbin/route -n add -inet 10.0.0.0/16 -interface utun9: Network is unreachable"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+// The same zero exit carries "File exists", which stays idempotent success.
+func TestDarwinController_ConfigureAddress_RouteExistsWithExitZero(t *testing.T) {
+	c, runner, _ := newTestDarwinController(t)
+	createTestInterface(t, c, "plexd0")
+	runner.stub(
+		"/sbin/route -n add -inet 10.0.0.0/16 -interface utun9",
+		"route: writing to routing socket: File exists\nadd net 10.0.0.0: gateway utun9: File exists",
+		nil,
+	)
+	runner.stub("/sbin/route -n get -inet 10.0.0.0/16", routeGetOutput("utun9"), nil)
+
+	if err := c.ConfigureAddress("plexd0", "10.0.0.5/16"); err != nil {
+		t.Fatalf("ConfigureAddress: %v, want an existing route to be success", err)
+	}
+}
+
+func TestRouteSocketError(t *testing.T) {
+	tests := []struct {
+		name    string
+		out     string
+		wantMsg string
+		wantOK  bool
+	}{
+		{
+			name:    "two lines",
+			out:     "route: writing to routing socket: Network is unreachable\nadd net 10.0.0.0: gateway utun9: Network is unreachable",
+			wantMsg: "Network is unreachable",
+			wantOK:  true,
+		},
+		{
+			name:    "single line",
+			out:     "route: writing to routing socket: File exists",
+			wantMsg: "File exists",
+			wantOK:  true,
+		},
+		{
+			name: "success output",
+			out:  "add net 10.0.0.0: gateway utun9",
+		},
+		{
+			name: "empty output",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg, ok := routeSocketError([]byte(tt.out))
+			if msg != tt.wantMsg || ok != tt.wantOK {
+				t.Errorf("routeSocketError(%q) = (%q, %v), want (%q, %v)", tt.out, msg, ok, tt.wantMsg, tt.wantOK)
+			}
+		})
+	}
 }
 
 func TestDarwinController_SetMTU(t *testing.T) {
