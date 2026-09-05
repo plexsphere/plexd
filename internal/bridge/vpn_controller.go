@@ -1,11 +1,15 @@
 package bridge
 
 // VPNController abstracts OS-level WireGuard tunnel operations for site-to-site testability.
-// All methods must be idempotent: repeating an operation that is already applied returns nil.
+// Every method except CreateTunnelInterface must be idempotent: repeating an
+// operation that is already applied returns nil.
 type VPNController interface {
 	// CreateTunnelInterface creates a WireGuard interface for a site-to-site tunnel.
 	// name is the interface name, listenPort is the UDP port.
-	// Idempotent: creating an already-existing interface with the same config returns nil.
+	// Not idempotent: a name that already exists fails with an error wrapping
+	// os.ErrExist, which is what EEXIST is on Linux. The caller owns the
+	// interface names it hands in, so a collision is a bug, not a state to
+	// converge on.
 	CreateTunnelInterface(name string, listenPort int) error
 
 	// RemoveTunnelInterface removes the WireGuard interface with the given name.
