@@ -67,14 +67,42 @@ func newRouteController(logger *slog.Logger, fw policy.FirewallController) bridg
 	return bridge.NewDarwinRouteController(logger, nat)
 }
 
-// newAccessController returns nil until the bridge user-access controller
-// lands (#12).
-func newAccessController(_ *slog.Logger) bridge.AccessController {
-	return nil
+// newAccessController creates the utun-backed controller for bridge user
+// access on macOS. It needs root: creating a utun device is a privileged
+// operation. The DarwinController is its own, so the mesh, the access and the
+// tunnel devices live in three backends, each keyed by the names it created.
+//
+// The access utun stays unnumbered. User access needs forwarding between the
+// access and the mesh interface, and no route is installed over the device.
+func newAccessController(logger *slog.Logger) bridge.AccessController {
+	return bridge.NewWGAccessController(wireguard.NewDarwinController(logger), logger)
 }
 
-// newVPNController returns nil until the bridge site-to-site controller lands
-// (#12).
-func newVPNController(_ *slog.Logger) bridge.VPNController {
-	return nil
+// newVPNController creates the utun-backed controller for bridge
+// site-to-site tunnels on macOS. It needs root for the same reason, and it
+// holds its own DarwinController.
+//
+// The tunnel utun carries the node's mesh IP as a /32, because route(8)
+// refuses a route to the remote subnet over a utun without an IPv4 address
+// and reports "Network is unreachable". DarwinController.addOnLinkRoute skips
+// the on-link route for a host prefix, so only the alias is programmed
+// (ifconfig utunN inet <meshIP>/32 <meshIP> alias), which the kernel accepts
+// although the mesh utun already carries that address. That is the
+// unnumbered-interface idiom: traffic the node originates towards the remote
+// site leaves with the mesh IP as its source, which the remote site routes
+// back through the tunnel. An identity without a mesh IP leaves the utun
+// unnumbered instead of failing ConfigureAddress on the string "/32".
+func newVPNController(logger *slog.Logger, meshIP string) bridge.VPNController {
+	return bridge.NewWGVPNController(wireguard.NewDarwinController(logger), tunnelAddress(meshIP), logger)
+}
+
+// tunnelAddress returns the CIDR a site-to-site tunnel utun carries: the
+// node's mesh IP as a host prefix, and nothing for an identity that has no
+// mesh IP, which leaves the utun unnumbered rather than failing
+// ConfigureAddress on the string "/32".
+func tunnelAddress(meshIP string) string {
+	if meshIP == "" {
+		return ""
+	}
+	return meshIP + "/32"
 }

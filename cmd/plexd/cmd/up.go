@@ -433,7 +433,7 @@ func runAgent(ctx context.Context) error {
 
 		// Site-to-site VPN manager.
 		if cfg.Bridge.SiteToSiteEnabled {
-			vpnCtrl := newVPNController(logger)
+			vpnCtrl := newVPNController(logger, identity.MeshIP)
 			s2sMgr = bridge.NewSiteToSiteManager(vpnCtrl, routeCtrl, cfg.Bridge, logger, nil)
 			if err := s2sMgr.Setup(cfg.WireGuard.InterfaceName); err != nil {
 				return fmt.Errorf("plexd up: site-to-site setup: %w", err)

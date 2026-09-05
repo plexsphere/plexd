@@ -51,6 +51,6 @@ func newAccessController(_ *slog.Logger) bridge.AccessController {
 }
 
 // newVPNController returns nil on platforms without an implementation.
-func newVPNController(_ *slog.Logger) bridge.VPNController {
+func newVPNController(_ *slog.Logger, _ string) bridge.VPNController {
 	return nil
 }
