@@ -177,10 +177,28 @@ func TestDarwinRouteController_AddRoute_Exists(t *testing.T) {
 	key := commandKey(routePath, "-n", "add", "-inet", "10.1.0.0/24", "-interface", "en1")
 	runner.runOutputs[key] = []byte("route: writing to routing socket: File exists\nadd net 10.1.0.0: gateway en1: File exists")
 	runner.runErrors[key] = errors.New("exit status 1")
+	runner.runOutputs[getKey("10.1.0.0/24")] = routeGetOutput("10.1.0.0", "en1")
 
 	if err := ctrl.AddRoute("10.1.0.0/24", "en1"); err != nil {
 		t.Fatalf("AddRoute over an existing route = %v, want nil", err)
 	}
+
+	wantCalls(t, runner, [][]string{
+		{routePath, "-n", "add", "-inet", "10.1.0.0/24", "-interface", "en1"},
+		{routePath, "-n", "get", "-inet", "10.1.0.0/24"},
+	})
+}
+
+// getKey names the "route get" command line the ownership check runs after
+// route(8) refused an add with "File exists".
+func getKey(subnet string) string {
+	return commandKey(routePath, "-n", "get", "-inet", subnet)
+}
+
+// routeGetOutput is what route(8) prints for a "get" that found a route.
+func routeGetOutput(destination, iface string) []byte {
+	return []byte("   route to: " + destination + "\ndestination: " + destination +
+		"\n       mask: 255.255.255.0\n  interface: " + iface + "\n      flags: <UP,DONE,STATIC>\n")
 }
 
 func TestDarwinRouteController_AddRoute_Fails(t *testing.T) {
@@ -230,6 +248,161 @@ func TestDarwinRouteController_AddRoute_FailsWithoutOutput(t *testing.T) {
 	want := `bridge: add route "10.1.0.0/24" via "en1": /sbin/route -n add -inet 10.1.0.0/24 -interface en1: exit status 1`
 	if err.Error() != want {
 		t.Errorf("error = %q, want %q", err, want)
+	}
+}
+
+// A routing socket that refuses the add is the case route(8) reports with a
+// zero exit, so only its output distinguishes it from a route that was added.
+func TestDarwinRouteController_AddRoute_ExitZeroUnreachable(t *testing.T) {
+	ctrl, runner := newTestDarwinRouteController(t)
+
+	key := commandKey(routePath, "-n", "add", "-inet", "10.1.0.0/24", "-interface", "utun9")
+	runner.runOutputs[key] = []byte("route: writing to routing socket: Network is unreachable\nadd net 10.1.0.0: gateway utun9: Network is unreachable")
+
+	err := ctrl.AddRoute("10.1.0.0/24", "utun9")
+	if err == nil {
+		t.Fatal("AddRoute onto an unreachable interface = nil, want an error")
+	}
+	want := `bridge: add route "10.1.0.0/24" via "utun9": /sbin/route -n add -inet 10.1.0.0/24 -interface utun9: Network is unreachable`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err, want)
+	}
+	// The command exited 0, so the root hint the failure path adds would be
+	// wrong here.
+	if strings.Contains(err.Error(), "requires root") {
+		t.Errorf("error = %q, want no root hint", err)
+	}
+}
+
+func TestDarwinRouteController_AddRoute_ExitZeroExists(t *testing.T) {
+	logger, buf := debugLogger()
+	runner := newMockCommandExecutor()
+	ctrl := NewDarwinRouteController(logger, nil)
+	ctrl.exec = runner
+
+	key := commandKey(routePath, "-n", "add", "-inet", "10.1.0.0/24", "-interface", "utun9")
+	runner.runOutputs[key] = []byte("route: writing to routing socket: File exists\nadd net 10.1.0.0: gateway utun9: File exists")
+	runner.runOutputs[getKey("10.1.0.0/24")] = routeGetOutput("10.1.0.0", "utun9")
+
+	if err := ctrl.AddRoute("10.1.0.0/24", "utun9"); err != nil {
+		t.Fatalf("AddRoute over an existing route = %v, want nil", err)
+	}
+	if !strings.Contains(buf.String(), "route already exists, idempotent success") {
+		t.Errorf("log = %q, want the idempotent success line", buf)
+	}
+}
+
+// A second tunnel declaring a prefix the first one already routes gets "File
+// exists" too. Accepting it would report that tunnel as carrying traffic the
+// first one encrypts, and its RemoveTunnel would then delete the first one's
+// route, because the delete names the destination only.
+func TestDarwinRouteController_AddRoute_ExistsOnAnotherInterface(t *testing.T) {
+	ctrl, runner := newTestDarwinRouteController(t)
+
+	key := commandKey(routePath, "-n", "add", "-inet", "192.168.50.0/24", "-interface", "utun6")
+	runner.runOutputs[key] = []byte("route: writing to routing socket: File exists\nadd net 192.168.50.0: gateway utun6: File exists")
+	runner.runOutputs[getKey("192.168.50.0/24")] = routeGetOutput("192.168.50.0", "utun5")
+
+	err := ctrl.AddRoute("192.168.50.0/24", "utun6")
+	if err == nil {
+		t.Fatal("AddRoute over a prefix another interface holds = nil, want an error")
+	}
+	want := `bridge: add route "192.168.50.0/24" via "utun6": the prefix is already routed via "utun5"`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err, want)
+	}
+}
+
+// route(8) answers a "get" for a prefix with no route of its own with the
+// default route, whose interface is not the one the add named.
+func TestDarwinRouteController_AddRoute_ExistsOwnerUnknown(t *testing.T) {
+	ctrl, runner := newTestDarwinRouteController(t)
+
+	key := commandKey(routePath, "-n", "add", "-inet", "10.1.0.0/24", "-interface", "utun9")
+	runner.runOutputs[key] = []byte("route: writing to routing socket: File exists")
+	runner.runOutputs[getKey("10.1.0.0/24")] = []byte("   route to: 10.1.0.0\n")
+
+	err := ctrl.AddRoute("10.1.0.0/24", "utun9")
+	if err == nil {
+		t.Fatal("AddRoute = nil, want an error when route(8) named no interface")
+	}
+	want := `bridge: add route "10.1.0.0/24" via "utun9": the prefix is already routed via ""`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err, want)
+	}
+}
+
+// A "get" that fails carries its own message: the add is not success, because
+// nothing proved the existing route belongs to this interface.
+func TestDarwinRouteController_AddRoute_ExistsGetFails(t *testing.T) {
+	ctrl, runner := newTestDarwinRouteController(t)
+
+	key := commandKey(routePath, "-n", "add", "-inet", "10.1.0.0/24", "-interface", "utun9")
+	runner.runOutputs[key] = []byte("route: writing to routing socket: File exists")
+	runner.runOutputs[getKey("10.1.0.0/24")] = []byte("route: writing to routing socket: not in table")
+
+	err := ctrl.AddRoute("10.1.0.0/24", "utun9")
+	if err == nil {
+		t.Fatal("AddRoute = nil, want the get error")
+	}
+	want := `bridge: get route "10.1.0.0/24": /sbin/route -n get -inet 10.1.0.0/24: not in table`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err, want)
+	}
+}
+
+func TestRouteInterface(t *testing.T) {
+	tests := []struct {
+		name     string
+		out      string
+		wantName string
+		wantOK   bool
+	}{
+		{
+			name:     "get answer",
+			out:      string(routeGetOutput("10.1.0.0", "utun9")),
+			wantName: "utun9",
+			wantOK:   true,
+		},
+		{
+			name:     "single line",
+			out:      "  interface: en0",
+			wantName: "en0",
+			wantOK:   true,
+		},
+		{
+			name: "no interface line",
+			out:  "   route to: 10.1.0.0\ndestination: 10.1.0.0",
+		},
+		{
+			name: "empty output",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			name, ok := routeInterface([]byte(tt.out))
+			if name != tt.wantName || ok != tt.wantOK {
+				t.Errorf("routeInterface(%q) = (%q, %v), want (%q, %v)", tt.out, name, ok, tt.wantName, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestDarwinRouteController_AddRoute_ExitZeroAdded(t *testing.T) {
+	logger, buf := debugLogger()
+	runner := newMockCommandExecutor()
+	ctrl := NewDarwinRouteController(logger, nil)
+	ctrl.exec = runner
+
+	key := commandKey(routePath, "-n", "add", "-inet", "10.1.0.0/24", "-interface", "utun9")
+	runner.runOutputs[key] = []byte("add net 10.1.0.0: gateway utun9")
+
+	if err := ctrl.AddRoute("10.1.0.0/24", "utun9"); err != nil {
+		t.Fatalf("AddRoute: %v", err)
+	}
+	if !strings.Contains(buf.String(), "route added") {
+		t.Errorf("log = %q, want the route added line", buf)
 	}
 }
 
@@ -299,6 +472,77 @@ func TestDarwinRouteController_RemoveRoute_Fails(t *testing.T) {
 	want := `bridge: remove route "10.1.0.0/24" via "en1": /sbin/route -n delete -inet 10.1.0.0/24: exit status 1:`
 	if !strings.HasPrefix(err.Error(), want) {
 		t.Errorf("error = %q, want prefix %q", err, want)
+	}
+}
+
+func TestDarwinRouteController_RemoveRoute_ExitZeroNotInTable(t *testing.T) {
+	logger, buf := debugLogger()
+	runner := newMockCommandExecutor()
+	ctrl := NewDarwinRouteController(logger, nil)
+	ctrl.exec = runner
+
+	key := commandKey(routePath, "-n", "delete", "-inet", "10.1.0.0/24")
+	runner.runOutputs[key] = []byte("route: writing to routing socket: not in table\ndelete net 10.1.0.0: not in table")
+
+	if err := ctrl.RemoveRoute("10.1.0.0/24", "utun9"); err != nil {
+		t.Fatalf("RemoveRoute of a missing route = %v, want nil", err)
+	}
+	if !strings.Contains(buf.String(), "route not found, idempotent success") {
+		t.Errorf("log = %q, want the idempotent success line", buf)
+	}
+}
+
+func TestDarwinRouteController_RemoveRoute_ExitZeroDenied(t *testing.T) {
+	ctrl, runner := newTestDarwinRouteController(t)
+
+	key := commandKey(routePath, "-n", "delete", "-inet", "10.1.0.0/24")
+	runner.runOutputs[key] = []byte("route: writing to routing socket: Permission denied")
+
+	err := ctrl.RemoveRoute("10.1.0.0/24", "utun9")
+	if err == nil {
+		t.Fatal("RemoveRoute denied by the kernel = nil, want an error")
+	}
+	want := `bridge: remove route "10.1.0.0/24" via "utun9": /sbin/route -n delete -inet 10.1.0.0/24: Permission denied`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err, want)
+	}
+}
+
+func TestRouteSocketError(t *testing.T) {
+	tests := []struct {
+		name    string
+		out     string
+		wantMsg string
+		wantOK  bool
+	}{
+		{
+			name:    "two lines",
+			out:     "route: writing to routing socket: Network is unreachable\nadd net 10.1.0.0: gateway utun9: Network is unreachable",
+			wantMsg: "Network is unreachable",
+			wantOK:  true,
+		},
+		{
+			name:    "single line",
+			out:     "route: writing to routing socket: Permission denied",
+			wantMsg: "Permission denied",
+			wantOK:  true,
+		},
+		{
+			name: "success output",
+			out:  "add net 10.1.0.0: gateway utun9",
+		},
+		{
+			name: "empty output",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg, ok := routeSocketError([]byte(tt.out))
+			if msg != tt.wantMsg || ok != tt.wantOK {
+				t.Errorf("routeSocketError(%q) = (%q, %v), want (%q, %v)", tt.out, msg, ok, tt.wantMsg, tt.wantOK)
+			}
+		})
 	}
 }
 

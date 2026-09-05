@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"bytes"
 	"log/slog"
 	"sync"
 )
@@ -114,4 +115,11 @@ func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(nopWriter{}, nil))
+}
+
+// debugLogger returns a debug-level text logger and the buffer it writes to,
+// for asserting the levels and attributes a controller emits.
+func debugLogger() (*slog.Logger, *bytes.Buffer) {
+	var buf bytes.Buffer
+	return slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})), &buf
 }

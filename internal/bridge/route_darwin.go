@@ -76,6 +76,11 @@ func (c *DarwinRouteController) run(op string, argv ...string) ([]byte, error) {
 
 	out, err := c.exec.Run(ctx, argv[0], argv[1:]...)
 	if err == nil {
+		// route(8) reports a routing-socket failure in its output and still
+		// exits 0, so a zero exit alone does not mean the change went through.
+		if msg, ok := routeSocketError(out); ok {
+			return out, fmt.Errorf("bridge: %s: %s: %s", op, strings.Join(argv, " "), msg)
+		}
 		return out, nil
 	}
 
@@ -95,8 +100,25 @@ func (c *DarwinRouteController) run(op string, argv ...string) ([]byte, error) {
 	return out, fmt.Errorf("bridge: %s: %s: %w%s", op, strings.Join(argv, " "), err, hint)
 }
 
+// routeSocketError returns the message route(8) printed after the marker
+// "writing to routing socket: ", and whether any line carried it. route(8)
+// reports a routing-socket failure that way and still exits 0, so its output is
+// the only place a refused change shows up.
+func routeSocketError(out []byte) (string, bool) {
+	const marker = "writing to routing socket: "
+
+	for _, line := range strings.Split(string(out), "\n") {
+		if i := strings.Index(line, marker); i >= 0 {
+			return strings.TrimSpace(line[i+len(marker):]), true
+		}
+	}
+	return "", false
+}
+
 // AddRoute adds a route for the given CIDR subnet via the given interface.
-// Idempotent: adding an existing route returns nil.
+// Idempotent: adding a route this interface already carries returns nil. The
+// output is inspected whatever the exit status is, because route(8) exits 0
+// after a refusal it only wrote to its output.
 func (c *DarwinRouteController) AddRoute(subnet, iface string) error {
 	prefix, err := netip.ParsePrefix(subnet)
 	if err != nil {
@@ -110,17 +132,14 @@ func (c *DarwinRouteController) AddRoute(subnet, iface string) error {
 
 	out, err := c.run(fmt.Sprintf("add route %q via %q", subnet, iface),
 		routePath, "-n", "add", routeFamily(prefix), prefix.Masked().String(), "-interface", iface)
+	// route(8) reports an existing route as "File exists"; re-adding the route
+	// this interface already carries is success, the idempotency
+	// NetlinkRouteController grants EEXIST. Who holds the prefix decides,
+	// because the message names neither. It arrives with either exit status.
+	if bytes.Contains(out, []byte("File exists")) {
+		return c.confirmRouteOwner(subnet, prefix, iface)
+	}
 	if err != nil {
-		// route(8) reports an existing route as "File exists"; re-adding one
-		// is success, the idempotency NetlinkRouteController grants EEXIST.
-		if bytes.Contains(out, []byte("File exists")) {
-			c.logger.Debug("route already exists, idempotent success",
-				"component", "bridge",
-				"subnet", subnet,
-				"interface", iface,
-			)
-			return nil
-		}
 		return err
 	}
 
@@ -132,8 +151,45 @@ func (c *DarwinRouteController) AddRoute(subnet, iface string) error {
 	return nil
 }
 
+// confirmRouteOwner reports whether the route route(8) refused to add as "File
+// exists" is the one AddRoute asked for. RemoveRoute names the destination
+// only, so granting idempotency to a prefix another interface holds would let
+// one tunnel delete another tunnel's route while both are still reported as
+// carried.
+func (c *DarwinRouteController) confirmRouteOwner(subnet string, prefix netip.Prefix, iface string) error {
+	out, err := c.run(fmt.Sprintf("get route %q", subnet),
+		routePath, "-n", "get", routeFamily(prefix), prefix.Masked().String())
+	if err != nil {
+		return err
+	}
+
+	owner, ok := routeInterface(out)
+	if !ok || owner != iface {
+		return fmt.Errorf("bridge: add route %q via %q: the prefix is already routed via %q", subnet, iface, owner)
+	}
+
+	c.logger.Debug("route already exists, idempotent success",
+		"component", "bridge",
+		"subnet", subnet,
+		"interface", iface,
+	)
+	return nil
+}
+
+// routeInterface returns the interface name route(8) printed on the
+// "interface:" line of a "get" answer, and whether the answer carried one.
+func routeInterface(out []byte) (string, bool) {
+	for _, line := range strings.Split(string(out), "\n") {
+		if _, name, ok := strings.Cut(line, "interface:"); ok {
+			return strings.TrimSpace(name), true
+		}
+	}
+	return "", false
+}
+
 // RemoveRoute removes the route for the given CIDR subnet via the given
-// interface. Idempotent: removing a non-existent route returns nil.
+// interface. Idempotent: removing a non-existent route returns nil. As in
+// AddRoute, the output decides, because route(8) exits 0 on a refused delete.
 func (c *DarwinRouteController) RemoveRoute(subnet, iface string) error {
 	prefix, err := netip.ParsePrefix(subnet)
 	if err != nil {
@@ -149,17 +205,18 @@ func (c *DarwinRouteController) RemoveRoute(subnet, iface string) error {
 	// way on this platform.
 	out, err := c.run(fmt.Sprintf("remove route %q via %q", subnet, iface),
 		routePath, "-n", "delete", routeFamily(prefix), prefix.Masked().String())
+	// route(8) reports a missing route as "not in table", the idempotency
+	// NetlinkRouteController grants ESRCH. The message arrives with either
+	// exit status.
+	if bytes.Contains(out, []byte("not in table")) {
+		c.logger.Debug("route not found, idempotent success",
+			"component", "bridge",
+			"subnet", subnet,
+			"interface", iface,
+		)
+		return nil
+	}
 	if err != nil {
-		// route(8) reports a missing route as "not in table", the idempotency
-		// NetlinkRouteController grants ESRCH.
-		if bytes.Contains(out, []byte("not in table")) {
-			c.logger.Debug("route not found, idempotent success",
-				"component", "bridge",
-				"subnet", subnet,
-				"interface", iface,
-			)
-			return nil
-		}
 		return err
 	}
 
