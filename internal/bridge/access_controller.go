@@ -1,10 +1,12 @@
 package bridge
 
 // AccessController abstracts WireGuard interface operations for user access testability.
-// All methods must be idempotent: repeating an operation that is already applied returns nil.
+// Every method except CreateInterface must be idempotent: repeating an
+// operation that is already applied returns nil.
 type AccessController interface {
 	// CreateInterface creates a WireGuard interface with the given name and listen port.
-	// Idempotent: creating an already-existing interface with the same config returns nil.
+	// Not idempotent: a name that already exists fails with an error wrapping
+	// os.ErrExist, which is what EEXIST is on Linux.
 	CreateInterface(name string, listenPort int) error
 
 	// RemoveInterface removes the WireGuard interface with the given name.
