@@ -10,12 +10,13 @@ import (
 	"github.com/plexsphere/plexd/internal/nodeapi"
 )
 
-// newSocketClient creates an HTTP client that connects via Unix socket.
+// newSocketClient creates an HTTP client that connects to the local node API
+// endpoint: a Unix socket, or a named pipe on Windows.
 func newSocketClient(socketPath string) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", socketPath)
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return nodeapi.DialLocal(ctx, socketPath)
 			},
 		},
 	}

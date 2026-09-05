@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
-	"go.uber.org/goleak"
 )
 
 // putCall records a single PutStateReport invocation.
@@ -285,7 +284,7 @@ func TestReportSyncer_NotProvisionedSuppressesAndLogsOnce(t *testing.T) {
 }
 
 func TestReportSyncer_TransportErrorRetriesOnTimer(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer verifyNoLeaks(t)
 
 	var attempts int32
 	client := &fakeReportClient{
@@ -356,7 +355,7 @@ func TestReportSyncer_CancellationPreservesDirty(t *testing.T) {
 }
 
 func TestReportSyncer_NoGoroutineLeaks(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer verifyNoLeaks(t)
 
 	client := &fakeReportClient{}
 	s, _ := newTestSyncer(client, 10*time.Millisecond)

@@ -210,7 +210,7 @@ func TestServerSecretAuthEnabled(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	httpClient := unixSocketClient(cfg.SocketPath)
+	httpClient := localClient(cfg.SocketPath)
 
 	// State endpoint should work (no auth required).
 	resp, err := httpClient.Get("http://localhost/v1/state")
@@ -277,7 +277,7 @@ func TestServerSecretAuthDisabled(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	httpClient := unixSocketClient(cfg.SocketPath)
+	httpClient := localClient(cfg.SocketPath)
 
 	// Secret endpoint should work without auth when disabled.
 	resp, err := httpClient.Get("http://localhost/v1/state/secrets")

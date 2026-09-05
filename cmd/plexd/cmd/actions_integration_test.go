@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -67,8 +66,8 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// startTestNodeAPI starts a nodeapi server on a temporary unix socket with
-// the given ActionProvider and HookReloader. It returns the socket path.
+// startTestNodeAPI starts a nodeapi server on a temporary local endpoint with
+// the given ActionProvider and HookReloader. It returns the endpoint address.
 // The server shuts down when the context is cancelled.
 func startTestNodeAPI(t *testing.T, ctx context.Context, provider nodeapi.ActionProvider, reloader nodeapi.HookReloader) string {
 	t.Helper()
@@ -98,7 +97,7 @@ func startTestNodeAPI(t *testing.T, ctx context.Context, provider nodeapi.Action
 	// Wait for socket to become available.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, err := net.Dial("unix", socketPath)
+		conn, err := nodeapi.DialLocal(context.Background(), socketPath)
 		if err == nil {
 			conn.Close()
 			return socketPath
