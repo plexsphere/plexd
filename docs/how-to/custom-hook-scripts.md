@@ -15,10 +15,14 @@ For the full reference of types and internals, see
 
 ## Prerequisites
 
-1. **plexd is running** on the node with actions enabled (default).
+1. **plexd is running** on a Linux or macOS node with actions enabled
+   (default). Windows reports no executable bit on a regular file, so hooks
+   are never discovered there; see
+   [Platform Support](../guide/platform-support.md).
 
-2. **Hooks directory** is configured. The default is `/etc/plexd/hooks`.
-   Set `hooks_dir` in the actions configuration to override.
+2. **Hooks directory** is configured. The default is `/etc/plexd/hooks` on
+   Linux and `/Library/Application Support/plexd/hooks` on macOS. Set
+   `hooks_dir` in the actions configuration to override.
 
 3. **Shell access** to the node for deploying the script (or a deployment
    pipeline that places files in the hooks directory).
@@ -160,8 +164,12 @@ The initial scan at startup also follows this process for all existing hooks.
 Check the agent logs to confirm the hook was discovered:
 
 ```bash
-journalctl -u plexd --since "1 minute ago" | grep -i hook
+plexd logs | grep -i hook
 ```
+
+`plexd logs` reads whatever log the host's service manager keeps, so the same
+command works on Linux and macOS. Its Linux equivalent is
+`journalctl -u plexd --since "1 minute ago"`.
 
 You should see discovery-related log entries. The hook will appear in the
 capabilities reported to the control plane with its computed checksum.

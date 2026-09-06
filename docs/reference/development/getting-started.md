@@ -9,9 +9,10 @@ feature: PXD-0026
 ## Prerequisites
 
 - Go 1.26+
-- WireGuard tools (`wg`, `wg-quick`)
-- nftables
+- WireGuard tools (`wg`, `wg-quick`) and nftables, for the Linux data plane and the e2e suites
 - Docker (for integration tests)
+
+The tree builds and its tests run on Linux, macOS and Windows; only the Linux data plane needs the two host packages above.
 
 ## Make Targets
 
@@ -70,7 +71,7 @@ Code that only builds on some operating systems lives in its own file, tagged by
 |---|---|---|---|
 | `//go:build linux` / `//go:build darwin` / `//go:build windows` / `//go:build !linux && !darwin && !windows` | `_linux.go` / `_darwin.go` / `_windows.go` / `_other.go` | Controllers with a per-OS implementation, paired with a stub on the platforms that have none yet | `cmd/plexd/cmd/up_linux.go`, `cmd/plexd/cmd/up_darwin.go`, `cmd/plexd/cmd/up_windows.go`, `cmd/plexd/cmd/up_other.go`, `internal/wireguard/controller_linux.go`, `internal/wireguard/controller_darwin.go`, `internal/wireguard/controller_windows.go`, `internal/bridge/route_linux.go`, `internal/bridge/route_darwin.go`, `internal/bridge/route_windows.go`, `internal/policy/nftables_linux.go`, `internal/policy/pf_darwin.go`, `internal/policy/wfp_windows.go`, `internal/nodeapi/peercred_linux.go`, `internal/nodeapi/peercred_darwin.go`, `internal/nodeapi/peercred_windows.go`, `internal/nodeapi/peercred_other.go` |
 | `//go:build unix` / `//go:build windows` | `_unix.go` / `_windows.go` | Syscall helpers that Linux and macOS share | `internal/actions/builtins_unix.go`, `internal/actions/builtins_windows.go`, `internal/packaging/root_unix.go`, `internal/packaging/root_windows.go`, `cmd/plexd/cmd/service_unix.go`, `cmd/plexd/cmd/service_windows.go`, `internal/wireguard/uapi_unix.go`, `internal/wireguard/uapi_windows.go`, `internal/nodeapi/listen_unix.go`, `internal/nodeapi/listen_windows.go`, `internal/nodeapi/peercred_unix.go` |
-| `//go:build unix && !darwin` / `//go:build darwin` / `//go:build windows` | `_unix.go` / `_darwin.go` / `_windows.go` | Values every Unix but macOS shares, with macOS and Windows each answering for itself | `internal/paths/paths_unix.go`, `internal/paths/paths_darwin.go`, `internal/paths/paths_windows.go`, `internal/packaging/defaults_unix.go`, `internal/packaging/defaults_darwin.go`, `internal/packaging/defaults_windows.go` |
+| `//go:build unix && !darwin` / `//go:build darwin` / `//go:build windows` | `_unix.go` / `_darwin.go` / `_windows.go` | Values every Unix but macOS shares, with macOS and Windows each answering for itself | `internal/paths/paths_unix.go`, `internal/paths/paths_darwin.go`, `internal/paths/paths_windows.go`, `internal/packaging/defaults_unix.go`, `internal/packaging/defaults_darwin.go`, `internal/packaging/defaults_windows.go`, `cmd/plexd/cmd/logs_unix.go`, `cmd/plexd/cmd/logs_darwin.go`, `cmd/plexd/cmd/logs_windows.go` |
 
 Pick `unix` / `windows` when Linux and macOS want the same implementation; `!linux` would wrongly catch Windows. When macOS needs its own answer, narrow the Unix file to `unix && !darwin` and put a `_darwin.go` beside it rather than renaming it to `_linux.go`: that name carries an implicit `linux` constraint and would leave every other Unix, freebsd included, with no definition at all. Every such file carries an explicit `//go:build` line, even when its name already implies the constraint: only `_windows.go`, `_linux.go` and `_darwin.go` are implicit to the Go tool, and `_unix.go` and `_other.go` are not.
 
@@ -88,7 +89,7 @@ done
 
 `go vet` compiles the test files too, so it catches a platform-tagged test that no longer builds.
 
-CI covers the same ground: the [Build workflow](./release-workflow.md) compiles all seven targets on every pull request, and the [CI workflow](./ci-workflow.md) runs `go test -race ./...` on Linux, Windows and macOS. The loop above is a faster local check, not the only one.
+CI covers the same ground: the [Build workflow](./release-workflow.md) compiles all seven targets on every pull request, and the [CI workflow](./ci-workflow.md) runs `go test -race ./...` on Linux, Windows and macOS. The loop above is a faster local check, not the only one. A change under `docs/` is built by the [Docs workflow](./docs-workflow.md) on every pull request, which is also the dead-link check.
 
 ## Tests that cannot run everywhere
 

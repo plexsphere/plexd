@@ -714,6 +714,8 @@ func DiscoverHooks(hooksDir string, logger *slog.Logger) ([]api.HookInfo, error)
 5. Results sorted by name
 6. Individual file errors logged at warn level; valid hooks still returned
 
+Windows reports no executable bit on a regular file, so nothing is ever discovered there and no hook can be dispatched. Hook scripts are a Linux and macOS feature; see [Platform Support](../../guide/platform-support.md).
+
 ### Sidecar Metadata Format
 
 A hook named `deploy` can have a sidecar file `deploy.json`:

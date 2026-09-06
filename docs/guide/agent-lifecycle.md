@@ -112,7 +112,8 @@ request to the control plane. It removes the node's `identity.json` from
 `data_dir` and prints that platform-side removal is operator-driven. With
 `--purge` it additionally removes the whole `data_dir` (all identity and key
 files, cached state) and the registration token file. `--purge` does **not**
-disable the systemd unit — use `plexd uninstall` to remove the service. See the
+remove the host service (the systemd unit, the launchd daemon or the Windows
+service) — use `plexd uninstall` for that. See the
 [CLI Reference](/reference/core/cli#plexd-deregister) for the exact output and
 exit codes.
 
@@ -135,11 +136,11 @@ plexd is designed to remain functional when the control plane is temporarily unr
 plexd supports in-place upgrades triggered by the control plane via the `service.upgrade` built-in action. The binary comes from the release channel, and every upgrade is gated on both a dispatched checksum and an offline Sigstore signature check — a release the platform did not sign is refused.
 
 1. The control plane queues an execution for `action: service.upgrade` in the `executions` block of the state pull, with the target `version` and expected binary `checksum` among its `parameters`.
-2. plexd downloads the release binary from the configured release channel (`{upgrade.release_base_url}/{tag}/plexd-linux-{arch}`, with `{tag}` the `v`-prefixed version) into a temporary file, computing its SHA-256 as it streams. Upgrades are Linux-only; a non-Linux node refuses. plexd never fetches the binary from the control plane.
+2. plexd downloads the release binary for the platform it runs on from the configured release channel (`{upgrade.release_base_url}/{tag}/plexd-{os}-{arch}`, with a `.exe` suffix on Windows and `{tag}` the `v`-prefixed version) into a temporary file, computing its SHA-256 as it streams. plexd never fetches the binary from the control plane.
 3. plexd compares the download's SHA-256 to the dispatched `checksum`. A mismatch ends the action with the terminal status `checksum_mismatch` (exit 1) and the running binary is untouched.
-4. plexd downloads the release's Sigstore bundle (`plexd-linux-{arch}.sigstore.json`) and verifies it **offline** against the embedded Sigstore public-good trusted root: the signing certificate's issuer and SAN must match `upgrade.signing_issuer` / `upgrade.signing_identity_regexp`, and the signed artifact digest must match the downloaded binary. A release with no bundle asset fails the bundle download and is refused; a bundle that fails verification ends the action with the terminal status `bundle_verification_failed` (exit 1) and the temporary file is removed. In both cases the running binary is untouched.
-5. Once both checks pass, plexd makes the new binary executable (`chmod 0755`), atomically renames it over the current binary, and triggers `systemctl restart plexd.service`. The terminal status is `upgraded` on a successful restart, `upgraded_restart_pending` when `systemctl` is unavailable, or `upgraded_restart_failed` when the restart command errors.
-6. If the new binary fails to start (crash loop), systemd's `RestartSec` and `StartLimitBurst` prevent excessive restarts. Manual intervention or a follow-up upgrade is required.
+4. plexd downloads the release's Sigstore bundle (`plexd-{os}-{arch}.sigstore.json`, carrying the `.exe` on Windows) and verifies it **offline** against the embedded Sigstore public-good trusted root: the signing certificate's issuer and SAN must match `upgrade.signing_issuer` / `upgrade.signing_identity_regexp`, and the signed artifact digest must match the downloaded binary. A release with no bundle asset fails the bundle download and is refused; a bundle that fails verification ends the action with the terminal status `bundle_verification_failed` (exit 1) and the temporary file is removed. In both cases the running binary is untouched.
+5. Once both checks pass, plexd makes the new binary executable (`chmod 0755`), replaces the current binary with it, and restarts through the host's service manager: `systemctl restart plexd` on Linux, `launchctl kickstart -k system/com.plexsphere.plexd` on macOS, a detached `Restart-Service plexd` on Windows. On Linux and macOS the replacement is a single rename over the running executable; Windows refuses to rename over a running image, so the running binary is renamed to `plexd.exe.old` first and a failed swap puts it back. The terminal status is `upgraded` on a successful restart, `upgraded_restart_pending` when the service manager is unavailable, or `upgraded_restart_failed` when the restart command errors.
+6. If the new binary fails to start (crash loop), systemd stops after five restarts in 60 seconds. launchd and the Windows SCM have no such limit and keep restarting every five seconds, so on those two an operator has to intervene. Manual intervention or a follow-up upgrade is required in every case.
 
 Rollback is a new `service.upgrade` action pointing to a previous version (a version published without a Sigstore bundle is refused by the signature check).
 

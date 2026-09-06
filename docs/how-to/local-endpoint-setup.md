@@ -144,8 +144,11 @@ sudo systemctl restart plexd
 Check the plexd logs for confirmation that local endpoints are enabled:
 
 ```bash
-journalctl -u plexd --no-pager | grep 'local endpoint enabled'
+plexd logs | grep 'local endpoint enabled'
 ```
+
+`plexd logs` reads whatever log the host's service manager keeps. Its Linux
+equivalent is `journalctl -u plexd --no-pager`.
 
 You should see one log line per configured pipeline:
 

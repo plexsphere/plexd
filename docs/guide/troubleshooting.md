@@ -6,11 +6,30 @@ title: Troubleshooting
 
 This guide covers the most common issues encountered when running plexd and how to diagnose them.
 
+## Reading the daemon log
+
+Every section below asks you to read the agent's own log. `plexd logs` finds it on any platform:
+
+```bash
+plexd logs        # recent entries
+plexd logs -f     # follow (not supported on Windows)
+```
+
+Where it reads from, and the native command if you would rather use it directly:
+
+| Platform | Log | Native command |
+|----------|-----|----------------|
+| Linux    | journald | `journalctl -u plexd` |
+| macOS    | `/Library/Logs/plexd/plexd.log` | `tail -f /Library/Logs/plexd/plexd.log` |
+| Windows  | Application Event Log, source `plexd` | `Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='plexd'}` |
+
+A `plexd up` started by hand writes to its own terminal rather than to any of these, so a host that never ran `plexd install` has nothing for the command to read. It says so instead of failing.
+
 ## Agent fails to register
 
 ```bash
-plexd status          # Check current state
-journalctl -u plexd   # View service logs
+plexd status   # Check current state
+plexd logs     # View service logs
 ```
 
 Verify that the bootstrap token has not expired and that the node can reach the control plane API (`PLEXD_API`).
@@ -61,8 +80,8 @@ If you are behind a corporate proxy or firewall, ensure that idle timeout settin
 ## Node marked as unreachable but is running
 
 ```bash
-plexd status          # Verify heartbeat is being sent
-journalctl -u plexd --since "5 minutes ago" | grep heartbeat
+plexd status   # Verify heartbeat is being sent
+plexd logs | grep heartbeat
 ```
 
 If plexd is running but the control plane shows the node as `unreachable`, the heartbeat POST may be failing. Common causes: DNS resolution failure for the control plane API, expired TLS certificate on an intermediate proxy, or network partition. Check that `PLEXD_API` is reachable with `curl -s -o /dev/null -w "%{http_code}" $PLEXD_API/health`.

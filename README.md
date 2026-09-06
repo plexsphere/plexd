@@ -23,16 +23,19 @@ local state against the desired state.
 - **Bridge Mode** for user access, public ingress, site-to-site VPN, and NAT relay
 - **Observability** with metrics collection, log forwarding, and audit data forwarding
 - **Remote Actions & Hooks** with SHA-256 integrity verification
-- **Local Node API** exposing node state via Unix socket (bare-metal/VM) or CRD (Kubernetes)
+- **Local Node API** exposing node state via a local endpoint (Unix socket, named pipe on Windows) or CRD (Kubernetes)
 - **Secure Access** for platform-mediated SSH and Kubernetes API tunneling through the mesh
 
 Runs on bare-metal servers, VMs, Kubernetes clusters, OpenWRT routers, and as
-bridge/gateway. Linux (amd64, arm64, mipsle).
+bridge/gateway. Linux (amd64, arm64, mipsle), macOS (amd64, arm64) and Windows
+(amd64, arm64).
+[Platform Support](https://plexsphere.github.io/plexd/guide/platform-support.html)
+says what each one supports.
 
 ## Quick Start
 
 ```bash
-# Install
+# Install (Linux; use `| sudo sh` on macOS)
 curl -fsSL https://get.plexsphere.com/plexd | sh
 
 # Enroll the node (interactive token prompt)
@@ -40,8 +43,14 @@ plexd join
 
 # Run as a service
 sudo plexd install
-sudo systemctl enable --now plexd
+sudo systemctl enable --now plexd                                   # Linux
+sudo launchctl bootstrap system \
+  /Library/LaunchDaemons/com.plexsphere.plexd.plist                 # macOS
 ```
+
+On Windows, download `plexd-windows-amd64.exe` and run `.\plexd.exe install`
+then `sc.exe start plexd` from an elevated PowerShell; see the
+[Windows guide](https://plexsphere.github.io/plexd/how-to/windows-installation.html).
 
 See [Installation & Quick Start](https://plexsphere.github.io/plexd/guide/installation.html)
 for container, Kubernetes, OpenWRT, and bridge-mode deployments.
@@ -50,9 +59,9 @@ for container, Kubernetes, OpenWRT, and bridge-mode deployments.
 
 The full documentation lives at **<https://plexsphere.github.io/plexd/>**:
 
-- [Installation & Quick Start](https://plexsphere.github.io/plexd/guide/installation.html)
+- [Installation & Quick Start](https://plexsphere.github.io/plexd/guide/installation.html) and [Platform Support](https://plexsphere.github.io/plexd/guide/platform-support.html)
 - [Architecture](https://plexsphere.github.io/plexd/guide/architecture.html), [Agent Lifecycle](https://plexsphere.github.io/plexd/guide/agent-lifecycle.html), and [Security & Trust Model](https://plexsphere.github.io/plexd/guide/security.html)
-- How-to guides for [bare-metal](https://plexsphere.github.io/plexd/how-to/bare-metal-installation.html), [VM](https://plexsphere.github.io/plexd/how-to/vm-deployment.html), and [Kubernetes](https://plexsphere.github.io/plexd/how-to/kubernetes-deployment.html) deployments
+- How-to guides for [bare-metal](https://plexsphere.github.io/plexd/how-to/bare-metal-installation.html), [macOS](https://plexsphere.github.io/plexd/how-to/macos-installation.html), [Windows](https://plexsphere.github.io/plexd/how-to/windows-installation.html), [VM](https://plexsphere.github.io/plexd/how-to/vm-deployment.html), and [Kubernetes](https://plexsphere.github.io/plexd/how-to/kubernetes-deployment.html) deployments
 - Reference for the [CLI](https://plexsphere.github.io/plexd/reference/core/cli.html), [configuration](https://plexsphere.github.io/plexd/reference/core/configuration.html), [environment variables](https://plexsphere.github.io/plexd/reference/core/environment-variables.html), and [control plane API](https://plexsphere.github.io/plexd/reference/core/api-endpoints.html)
 - [Troubleshooting](https://plexsphere.github.io/plexd/guide/troubleshooting.html)
 
@@ -61,7 +70,8 @@ The documentation source is in [docs/](docs/); preview locally with
 
 ## Development
 
-Requires Go 1.26+, WireGuard tools, and nftables.
+Requires Go 1.26+. The Linux data plane and the e2e suites also need WireGuard
+tools and nftables.
 
 ```bash
 make build   # Build the plexd binary
