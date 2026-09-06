@@ -21,6 +21,7 @@ export default withMermaid(defineConfig({
         items: [
           { text: 'Overview', link: '/' },
           { text: 'Installation & Quick Start', link: '/guide/installation' },
+          { text: 'Platform Support', link: '/guide/platform-support' },
         ],
       },
       {
@@ -37,6 +38,8 @@ export default withMermaid(defineConfig({
         text: 'How-To Guides',
         items: [
           { text: 'Bare-Metal Installation', link: '/how-to/bare-metal-installation' },
+          { text: 'macOS Installation', link: '/how-to/macos-installation' },
+          { text: 'Windows Installation', link: '/how-to/windows-installation' },
           { text: 'VM Deployment', link: '/how-to/vm-deployment' },
           { text: 'Kubernetes Deployment', link: '/how-to/kubernetes-deployment' },
           { text: 'Local Node API', link: '/how-to/local-node-api' },
@@ -140,6 +143,7 @@ export default withMermaid(defineConfig({
               { text: 'CI Workflow', link: '/reference/development/ci-workflow' },
               { text: 'Container Workflow', link: '/reference/development/container-workflow' },
               { text: 'Release Workflow', link: '/reference/development/release-workflow' },
+              { text: 'Docs Workflow', link: '/reference/development/docs-workflow' },
               { text: 'E2E Workflow', link: '/reference/development/e2e-workflow' },
               { text: 'Docker E2E Test', link: '/reference/development/docker-e2e-test' },
               { text: 'Kubernetes E2E Test', link: '/reference/development/kubernetes-e2e-test' },
