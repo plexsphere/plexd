@@ -101,7 +101,7 @@ After initialization, goroutines are started via a `sync.WaitGroup`:
 1. **SSE Manager** — `sseMgr.Start()` — event stream connection
 2. **Heartbeat** — `heartbeat.Run()` — periodic heartbeats
 3. **Reconciler** — `reconciler.Run()` — periodic state reconciliation
-4. **Node API** — `nodeAPISrv.Start()` — Unix socket + optional HTTP server
+4. **Node API** — `nodeAPISrv.Start()` — local endpoint (a Unix socket, or a named pipe on Windows) + optional HTTP server
 5. **Hook Watcher** — `hookWatcher.Watch()` — filesystem watching for hook changes
 6. **Metrics Manager** — `metricsMgr.Run()` — collect and report metrics
 7. **Log Forwarder** — `logForwarder.Run()` — collect and forward logs

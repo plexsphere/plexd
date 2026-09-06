@@ -161,7 +161,7 @@ The MTU is programmed twice over an interface's life: once at creation, to 1420,
 
 The UAPI named pipe is `\\.\pipe\ProtectedPrefix\Administrators\WireGuard\<name>`, so `wg show plexd0` works against the running service. Its security descriptor grants LocalSystem and Administrators full access under a high mandatory label, but names no owner, so the creating process becomes the owner. wireguard-go's own descriptor assigns the pipe to LocalSystem, which only a LocalSystem process may do: an elevated Administrator running `plexd up` by hand would fail to open the pipe at all, and with it the interface. The cost of leaving the owner out is that `wgctrl`, which requires a LocalSystem-owned pipe, does not find a device belonging to a plexd started from a console; against the service, which is how plexd runs, `wg show` is unaffected.
 
-Until the Windows firewall controller lands, Windows Defender Firewall may drop unsolicited inbound handshakes on the listen port. Handshakes plexd initiates are unaffected, so a node behind it still reaches peers that are reachable.
+Windows Defender Firewall may drop unsolicited inbound handshakes on the listen port: plexd's own WFP permits are soft and cannot open a port the host firewall closes (see [Soft permits](./pf-wfp-firewall.md#soft-permits)). The [Windows installation guide](../../how-to/windows-installation.md) adds the inbound rule. Handshakes plexd initiates are unaffected, so a node behind it still reaches peers that are reachable.
 
 ## PeerConfig
 

@@ -9,8 +9,14 @@ title: Installation & Quick Start
 ### Binary
 
 ```bash
+# Linux
 curl -fsSL https://get.plexsphere.com/plexd | sh
+
+# macOS — plexd runs as root, so the installer needs it too
+curl -fsSL https://get.plexsphere.com/plexd | sudo sh
 ```
+
+Windows has no install script: a POSIX shell script cannot serve it. Follow the [Windows Installation Guide](../how-to/windows-installation.md), which downloads the binary and registers the service by hand from an elevated PowerShell.
 
 ### Container
 
@@ -42,7 +48,7 @@ the README there for requirements and step-by-step instructions.
 
 ### From Source
 
-Requires Go 1.26+, WireGuard tools, and nftables.
+Requires Go 1.26+. Building needs nothing else. Running the Linux data plane additionally needs WireGuard tools and nftables on the host; macOS and Windows need nothing beyond the binary, because both carry their own userspace WireGuard.
 
 ```bash
 git clone https://github.com/plexsphere/plexd.git
@@ -77,10 +83,27 @@ PLEXD_BOOTSTRAP_TOKEN=plx_enroll_a8f3c7... plexd join
 
 ### Running as a Service
 
+`plexd install` registers plexd with whatever service manager the host has, and never starts it. Start it with the matching command:
+
 ```bash
-sudo plexd install   # Creates systemd unit
+# Linux — systemd
+sudo plexd install
 sudo systemctl enable --now plexd
 ```
+
+```bash
+# macOS — launchd
+sudo plexd install
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.plexsphere.plexd.plist
+```
+
+```powershell
+# Windows — Service Control Manager, from an elevated PowerShell
+.\plexd.exe install
+sc.exe start plexd
+```
+
+The [macOS](../how-to/macos-installation.md) and [Windows](../how-to/windows-installation.md) guides carry the full walkthrough, including verification and uninstall.
 
 ### Kubernetes (DaemonSet)
 
@@ -168,6 +191,9 @@ secrets:
 
 ## See Also
 
+- [Platform Support](platform-support.md) — what Linux, macOS and Windows each support
+- [macOS Installation Guide](../how-to/macos-installation.md)
+- [Windows Installation Guide](../how-to/windows-installation.md)
 - [Configuration Reference](../reference/core/configuration.md)
 - [Environment Variables](../reference/core/environment-variables.md)
 - [CLI Reference](../reference/core/cli.md)

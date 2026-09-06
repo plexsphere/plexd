@@ -169,7 +169,7 @@ flowchart LR
 
     MESH --> C1["P2P Communication<br/>Direct encrypted tunnels"]
     MESH --> C2["NAT Traversal<br/>STUN + endpoint reporting"]
-    MESH --> C3["Network Policy<br/>Peer visibility rules via nftables"]
+    MESH --> C3["Network Policy<br/>Peer visibility rules via the host firewall"]
     MESH --> C4["Secure Tunnels<br/>SSH-based access through mesh"]
     MESH --> C5["Remote Actions<br/>Pull-dispatched execution"]
     MESH --> C6["Observability<br/>Metrics, logs, audit forwarding"]
@@ -194,7 +194,7 @@ flowchart LR
 |------------|-------------|-----------|
 | P2P Communication | Direct encrypted WireGuard tunnels between all peers | [WireGuard Tunnels](/reference/networking/wireguard) |
 | NAT Traversal | STUN-based public endpoint discovery and exchange | [NAT Traversal](/reference/networking/nat-traversal) |
-| Network Policy | Peer visibility rules enforced via nftables | [Network Policy](/reference/networking/network-policy) |
+| Network Policy | Peer visibility rules enforced via the host firewall (nftables, pf or WFP) | [Network Policy](/reference/networking/network-policy) |
 | Secure Tunnels | SSH-based access to services through the mesh | [Secure Access Tunneling](/reference/networking/secure-access-tunneling) |
 | Remote Actions | Execute built-in and hook-based actions dispatched in the state pull | [Remote Actions & Hooks](/reference/actions/remote-actions-hooks) |
 | Observability | Metrics, logs, and audit event forwarding | [Metrics](/reference/observability/metrics-collection), [Logs](/reference/observability/log-forwarding), [Audit](/reference/observability/audit-forwarding) |

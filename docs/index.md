@@ -9,14 +9,16 @@ The Plexsphere node agent (`plexd`) is a lightweight daemon that runs on every m
 - **Registration** — self-registers with the control plane using a bootstrap token
 - **WireGuard Mesh** — creates and manages WireGuard interfaces and encrypted peer tunnels
 - **NAT Traversal** — discovers public endpoints via STUN and exchanges them with peers
-- **Network Policy** — enforces peer visibility rules and firewall policies via nftables
+- **Network Policy** — enforces peer visibility rules and firewall policies via nftables on Linux, pf on macOS and the Windows Filtering Platform on Windows
 - **Secure Tunneling** — provides SSH-based secure access tunnels through the mesh
 - **State Reconciliation** — periodically fetches desired state and applies drift corrections
 - **Remote Actions** — executes built-in and hook-based actions dispatched in the state pull
 - **Observability** — collects and forwards metrics, logs, and audit events to the control plane
-- **Local Node API** — exposes node state (metadata, data, secrets) to local workloads via Unix socket API or PlexdNodeState CRD
+- **Local Node API** — exposes node state (metadata, data, secrets) to local workloads via a local endpoint (a Unix socket, or a named pipe on Windows) or PlexdNodeState CRD
 - **Integrity** — verifies checksums of the plexd binary and hook scripts
 - **Bridge Mode** — optional gateway mode with NAT relay, public ingress, user access, and site-to-site VPN
+
+plexd runs on Linux, macOS and Windows, in node mode and in bridge mode. What each operating system supports, feature by feature, is in [Platform Support](guide/platform-support.md).
 
 ## Operating Modes
 
