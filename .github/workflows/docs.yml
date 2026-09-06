@@ -6,6 +6,13 @@ on:
     paths:
       - 'docs/**'
       - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -14,9 +21,14 @@ permissions:
   pages: write
   id-token: write
 
+# A pull request builds the site to prove it still builds; only a push
+# publishes it. Keying the group by event keeps a pull-request build from
+# queueing behind a deploy, and cancel-in-progress applies to pull requests
+# alone: superseding a build is right, cancelling a half-finished publish is
+# not.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('docs-pr-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -35,17 +47,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # VitePress fails the build on a link to a page that does not exist, so
+      # this step is the dead-link check as well as the build.
       - name: Build docs
         run: npm run docs:build
 
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+        if: github.event_name != 'pull_request'
 
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        if: github.event_name != 'pull_request'
         with:
           path: docs/.vitepress/dist
 
   deploy:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment:
