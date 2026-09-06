@@ -76,6 +76,89 @@ test_detect_arch_current() {
     fi
 }
 
+# fake_uname shadows the uname binary with a shell function, so both platform
+# branches are exercised whatever host runs these tests. A function takes
+# precedence over a PATH lookup, and unfake_uname removes it again.
+fake_uname() {
+    _fake_os="$1"
+    _fake_machine="$2"
+    # Invoked indirectly, by the detect_* functions under test.
+    # shellcheck disable=SC2329
+    uname() {
+        case "$1" in
+            -s) echo "${_fake_os}" ;;
+            -m) echo "${_fake_machine}" ;;
+        esac
+    }
+}
+
+unfake_uname() {
+    unset -f uname
+}
+
+test_detect_os_darwin() {
+    fake_uname Darwin arm64
+    detect_os 2>/dev/null
+    unfake_uname
+    if [ "${OS_NAME}" = "darwin" ]; then
+        pass "detect_os maps Darwin to darwin"
+    else
+        fail "detect_os set OS_NAME=${OS_NAME}, expected darwin"
+    fi
+}
+
+test_detect_os_unsupported() {
+    fake_uname FreeBSD amd64
+    # fatal exits, so the call runs in a subshell; an if condition also
+    # suppresses errexit, leaving the failure for this test to report.
+    if ( detect_os ) 2>/dev/null; then
+        unfake_uname
+        fail "detect_os accepted an unsupported operating system"
+    else
+        unfake_uname
+        pass "detect_os rejects an unsupported operating system"
+    fi
+}
+
+test_detect_arch_arm64_darwin() {
+    fake_uname Darwin arm64
+    detect_arch 2>/dev/null
+    unfake_uname
+    if [ "${ARCH}" = "arm64" ]; then
+        pass "detect_arch maps arm64 to arm64"
+    else
+        fail "detect_arch mapped arm64 to ${ARCH}, expected arm64"
+    fi
+}
+
+test_resolve_binary_name_darwin() {
+    fake_uname Darwin arm64
+    detect_os 2>/dev/null
+    detect_arch 2>/dev/null
+    unfake_uname
+    resolve_binary_name
+    if [ "${BINARY_NAME}" = "plexd-darwin-arm64" ]; then
+        pass "resolve_binary_name builds plexd-darwin-arm64"
+    else
+        fail "resolve_binary_name built ${BINARY_NAME}, expected plexd-darwin-arm64"
+    fi
+}
+
+test_service_start_command() {
+    OS_NAME="linux"
+    linux_cmd="$(service_start_command)"
+    OS_NAME="darwin"
+    darwin_cmd="$(service_start_command)"
+    OS_NAME=""
+
+    if [ "${linux_cmd}" = "systemctl enable --now plexd" ] &&
+       [ "${darwin_cmd}" = "launchctl bootstrap system ${LAUNCHD_PLIST}" ]; then
+        pass "service_start_command prints the service manager command per platform"
+    else
+        fail "service_start_command printed '${linux_cmd}' and '${darwin_cmd}'"
+    fi
+}
+
 test_parse_args_token() {
     TOKEN=""
     parse_args --token "test-token-123"
@@ -164,9 +247,14 @@ test_find_download_cmd() {
 
 printf "Running install.sh tests...\n"
 test_detect_os_linux
+test_detect_os_darwin
+test_detect_os_unsupported
 test_detect_arch_amd64
 test_detect_arch_arm64
+test_detect_arch_arm64_darwin
 test_detect_arch_current
+test_resolve_binary_name_darwin
+test_service_start_command
 test_parse_args_token
 test_parse_args_api_url
 test_parse_args_version
