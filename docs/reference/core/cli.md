@@ -242,7 +242,7 @@ plexd state report health --data '{"status":"ok"}'
 
 ### `plexd logs`
 
-Stream agent logs from journald.
+Stream the agent's own log from wherever the host's service manager keeps it.
 
 ```
 plexd logs [--follow]
@@ -250,9 +250,32 @@ plexd logs [--follow]
 
 | Flag       | Default | Description           |
 |------------|---------|-----------------------|
-| `-f`/`--follow` | `false` | Follow log output |
+| `-f`/`--follow` | `false` | Follow log output (refused on Windows) |
 
-Falls back to a helpful message if journalctl is not available.
+What the command runs, per platform:
+
+| Platform | Log | Command |
+|----------|-----|---------|
+| Linux    | journald | `journalctl -u plexd --no-pager`, plus `-f` with `--follow` |
+| macOS    | `/Library/Logs/plexd/plexd.log`, the launchd plist's `StandardErrorPath` | `tail -n 100`, plus `-f` with `--follow` |
+| Windows  | Application Event Log, provider `plexd` | `Get-WinEvent` through `powershell.exe`, the 100 most recent records, oldest first |
+
+The macOS tail is 100 lines because newsyslog lets that file reach 10 MiB before it rotates; journalctl keeps the whole journal for the unit. Windows renders `TimeCreated`, `LevelDisplayName` and `Message`; a channel holding no `plexd` record prints nothing and exits 0.
+
+A host with no reader for its log is not a failure. The command names where the log lives and exits `0`:
+
+```
+journalctl not found; logs may be available on stdout of the plexd process
+no daemon log at /Library/Logs/plexd/plexd.log; a console plexd up writes to its terminal
+tail not found; read /Library/Logs/plexd/plexd.log directly
+powershell.exe not found; read the Application Event Log with Event Viewer
+```
+
+The macOS message about a missing file is the ordinary answer on a host where nobody ran `plexd install`: a console `plexd up` writes to its terminal rather than to that file. Anything else that stops the file being read — a directory that denies the lookup — fails with `plexd logs: stat …` and exit `1`.
+
+`--follow` on Windows fails with `plexd logs: --follow is not supported on windows; use Event Viewer or Get-WinEvent` and exit `1`. The Event Log's live feed is a subscription with no command-line form, so printing a snapshot to somebody who asked to keep watching would be the wrong answer.
+
+**Exit codes:** 0 on success and on every message above, 1 when the reader fails.
 
 ### `plexd log-status`
 
