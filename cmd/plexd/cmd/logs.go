@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,8 +16,13 @@ var logsFollow bool
 var logsCmd = &cobra.Command{
 	Use:   "logs",
 	Short: "Stream agent logs",
-	Long:  "Stream plexd agent logs from journald. Falls back to a helpful message if journald is unavailable.",
-	RunE:  runLogs,
+	Long: "Stream the plexd agent's own log from wherever the host's service manager keeps it:\n" +
+		"journald on Linux, /Library/Logs/plexd/plexd.log on macOS, and the Application\n" +
+		"Event Log under source plexd on Windows.\n" +
+		"\n" +
+		"Prints where the log lives instead when this host has no reader for it.\n" +
+		"--follow is refused on Windows, where the Event Log has no follow mode.",
+	RunE: runLogs,
 }
 
 var logStatusCmd = &cobra.Command{
@@ -32,19 +38,34 @@ func init() {
 	rootCmd.AddCommand(logStatusCmd)
 }
 
+// logsUnavailableError reports that this host holds nothing for plexd logs to
+// read: the reader the platform needs is not installed, or the file the
+// service manager writes is not there yet. It carries the sentence the
+// operator gets instead of output.
+//
+// It is a type rather than a sentinel error because the reason differs per
+// platform and names a path, and because runLogs answers it differently from
+// every other error: the command prints the reason and exits 0, which is what
+// plexd logs has always done for a missing journalctl.
+type logsUnavailableError struct{ reason string }
+
+func (e logsUnavailableError) Error() string { return e.reason }
+
+// runLogs runs the reader logsCommand picks for this platform, with the
+// daemon's log going straight to the terminal rather than through cobra's
+// buffer, because --follow streams until the operator stops it.
 func runLogs(cmd *cobra.Command, _ []string) error {
-	journalctl, err := exec.LookPath("journalctl")
+	name, args, err := logsCommand(logsFollow)
 	if err != nil {
-		fmt.Fprintln(cmd.OutOrStdout(), "journalctl not found; logs may be available on stdout of the plexd process")
-		return nil
+		var unavailable logsUnavailableError
+		if errors.As(err, &unavailable) {
+			fmt.Fprintln(cmd.OutOrStdout(), unavailable.reason)
+			return nil
+		}
+		return fmt.Errorf("plexd logs: %w", err)
 	}
 
-	args := []string{"-u", "plexd", "--no-pager"}
-	if logsFollow {
-		args = append(args, "-f")
-	}
-
-	c := exec.Command(journalctl, args...)
+	c := exec.Command(name, args...)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 
