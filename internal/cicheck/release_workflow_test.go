@@ -33,6 +33,7 @@ type workflowJob struct {
 	RunsOn      string            `yaml:"runs-on"`
 	TimeoutMin  int               `yaml:"timeout-minutes"`
 	Needs       any               `yaml:"needs"`
+	If          string            `yaml:"if"`
 	Permissions map[string]string `yaml:"permissions"`
 	Strategy    *jobStrategy      `yaml:"strategy"`
 	Steps       []workflowStep    `yaml:"steps"`
@@ -45,6 +46,7 @@ type jobStrategy struct {
 type workflowStep struct {
 	Name string            `yaml:"name"`
 	Uses string            `yaml:"uses"`
+	If   string            `yaml:"if"`
 	With map[string]any    `yaml:"with"`
 	Env  map[string]string `yaml:"env"`
 	Run  string            `yaml:"run"`
