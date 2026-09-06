@@ -77,6 +77,7 @@ For a detailed view of the control plane components, mesh topology, and bridge i
 ## Guide
 
 - [Installation & Quick Start](guide/installation.md) — Install plexd and get running
+- [Platform Support](guide/platform-support.md) — What Linux, macOS and Windows each support, feature by feature
 - [Architecture](guide/architecture.md) — Platform support, architecture diagrams, mesh topology
 - [Agent Lifecycle](guide/agent-lifecycle.md) — Startup phases, heartbeat, SSE, deregistration, operational behavior
 - [Platform Communication & Mesh](guide/platform-communication.md) — Communication channels, node lifecycle, mesh topology, and capabilities
@@ -88,6 +89,8 @@ For a detailed view of the control plane components, mesh topology, and bridge i
 Step-by-step guides for common operational tasks.
 
 - [Bare-Metal Installation](how-to/bare-metal-installation.md) — Install plexd on a bare-metal Linux server
+- [macOS Installation](how-to/macos-installation.md) — Install plexd as a launchd daemon on a Mac
+- [Windows Installation](how-to/windows-installation.md) — Install plexd as a Windows service from an elevated PowerShell
 - [VM Deployment](how-to/vm-deployment.md) — Deploy plexd on cloud VMs using Cloud-Init
 - [Kubernetes Deployment](how-to/kubernetes-deployment.md) — Deploy plexd as a DaemonSet on Kubernetes
 - [Using the Local Node API](how-to/local-node-api.md) — Read node state and write reports via the local API
@@ -141,6 +144,7 @@ Developer and contributor reference for plexd subsystem internals.
 - [Peer Endpoint Exchange](reference/networking/peer-endpoint-exchange.md) — Peer endpoint discovery and exchange
 - [Network Policy Enforcement](reference/networking/network-policy.md) — Network policy rules and enforcement
 - [nftables Firewall Controller](reference/networking/nftables-firewall.md) — nftables-based firewall management
+- [pf & WFP Firewall Controllers](reference/networking/pf-wfp-firewall.md) — Firewall enforcement on macOS and Windows
 - [Secure Access Tunneling](reference/networking/secure-access-tunneling.md) — Secure tunnel access for services
 
 ### Bridge
@@ -154,6 +158,7 @@ Developer and contributor reference for plexd subsystem internals.
 - [Site-to-Site VPN](reference/bridge/site-to-site-vpn.md) — Site-to-site VPN connectivity
 - [Tunnel Providers](reference/bridge/tunnel-providers.md) — Tunnel provider integrations
 - [Netlink Route Controller](reference/bridge/netlink-route-controller.md) — Netlink-based route management
+- [macOS & Windows Route Controllers](reference/bridge/route-controllers-macos-windows.md) — Route and forwarding management off Linux
 
 ### Observability
 
@@ -171,6 +176,7 @@ Developer and contributor reference for plexd subsystem internals.
 - [CI Workflow](reference/development/ci-workflow.md) — Continuous integration workflow
 - [Container Workflow](reference/development/container-workflow.md) — Container image build workflow
 - [Release Workflow](reference/development/release-workflow.md) — Release and versioning workflow
+- [Docs Workflow](reference/development/docs-workflow.md) — Documentation build and GitHub Pages deployment
 - [E2E Workflow](reference/development/e2e-workflow.md) — End-to-end test orchestration workflow
 - [Docker E2E Test](reference/development/docker-e2e-test.md) — Docker Compose-based E2E test
 - [Kubernetes E2E Test](reference/development/kubernetes-e2e-test.md) — kind-based Kubernetes E2E test

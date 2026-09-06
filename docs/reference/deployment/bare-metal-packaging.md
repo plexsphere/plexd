@@ -300,7 +300,7 @@ Bootstrap tokens are validated with the same rules as `internal/registration/tok
 
 ## Install script
 
-The install script (`deploy/install.sh`) is a POSIX-compatible shell script.
+The install script (`deploy/install.sh`) is a POSIX-compatible shell script. It installs plexd on Linux and macOS. Windows has no install script, because a POSIX script cannot serve it; that install is the manual walkthrough in the [Windows installation guide](../../how-to/windows-installation.md).
 
 ### Usage
 
@@ -319,13 +319,16 @@ curl -fsSL https://get.plexsphere.com/install.sh | sh -s -- [OPTIONS]
 
 ### Behavior
 
-1. Detects OS (Linux required)
-2. Detects architecture (`x86_64` → `amd64`, `aarch64` → `arm64`)
-3. Downloads binary from artifact URL
+1. Detects the OS: Linux or macOS (`Darwin`); anything else is fatal
+2. Detects architecture (`x86_64` → `amd64`, `aarch64` and `arm64` → `arm64`; Linux reports `aarch64` where macOS reports `arm64` for the same silicon)
+3. Downloads `plexd-{os}-{arch}` from the artifact URL
 4. Downloads and verifies SHA-256 checksum
-5. Runs `plexd install` with passthrough flags
-6. Enables and starts the service (unless `--no-start`)
-7. Cleans up temporary files on exit
+5. Creates the `plexd` and `plexd-secrets` groups where `groupadd` exists
+6. Runs `plexd install` with passthrough flags
+7. Starts the service unless `--no-start`: `systemctl enable --now plexd` on Linux, `launchctl bootstrap system /Library/LaunchDaemons/com.plexsphere.plexd.plist` on macOS
+8. Cleans up temporary files on exit
+
+Step 5 is a no-op on macOS, which has no `groupadd`: the script warns and carries on, and the node API socket stays owner-only. Create the two groups with `dscl` to widen it, as the [local node API guide](../../how-to/local-node-api.md#prerequisites) shows.
 
 ### Environment variables
 
