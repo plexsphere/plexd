@@ -606,7 +606,28 @@ cap, strict decoding, and the one-of `ssh` / `k8s` / `tcp` contract: exactly one
 member must be set, and that member must satisfy its per-kind rules —
 `ssh.command` non-empty and at most 1 KiB, `k8s.verb` non-empty, or `tcp.phase`
 one of `session_started` / `session_ended` with a valid `terminated_by` when set.
-A valid record increments `session_activity_count` and returns `204 No Content`.
+A record that clears those structural gates goes on to liveness resolution.
+
+Liveness resolves `{sid}` against the configured `sessions` block and against a
+`session_id` registry that `POST /test/configure-state` (and `PUT /test/state`)
+fills from every configured entry carrying a non-empty `session_id` and never
+prunes, so an id drained out of the block stays distinguishable from one that
+was never configured. A configured entry whose `expires_at` is in the future is
+live, and the row's populated member has to be the one its `kind` calls for (an
+`ssh` member for an `ssh` entry, `k8s` for `k8s`, `tcp` for `tcp`): a match
+increments `session_activity_count` and returns `204 No Content`, a mismatch is
+a `400 malformed_session_activity` with the detail
+`activity variant does not match the session's kind`, which counts on neither
+counter (the spec folds the kind mismatch into the structural code). A
+configured entry whose `expires_at` has lapsed is a `409 session_expired`, an id
+in the registry but no longer in the block is a `409 session_already_revoked`,
+and an id in neither is a `404 session_not_found`; each of those three
+increments `session_activity_rejected_count`. Configuring the id again makes it
+live again. The body is captured before validation, so
+`GET /test/last-request/session_activity` holds the last posted row whether or
+not it was accepted. The mock accepts configured sessions of any kind, so `ssh`
+and `k8s` rows are testable against it even though plexd produces only `tcp`
+rows.
 
 Strict decoding means the accepted `tcp` fields are exactly those of
 `api.TCPActivity`, `listener_endpoint` among them — a node that reports the
@@ -616,8 +637,11 @@ an unknown field. The value itself is not validated.
 | Status | Problem `code` | Meaning |
 |---|---|---|
 | `204 No Content` | — | Activity record accepted |
-| `400 Bad Request` | `malformed_session_activity` | Unreadable body, strict-decode failure, or a one-of / per-kind violation |
+| `400 Bad Request` | `malformed_session_activity` | Unreadable body, strict-decode failure, a one-of / per-kind violation, or a row whose member does not match the session's `kind` |
 | `403 Forbidden` | `nsk_node_mismatch` | `{id}` does not match the mock node identity |
+| `404 Not Found` | `session_not_found` | No session resolves for this node and session id |
+| `409 Conflict` | `session_already_revoked` | The id was configured earlier and has drained out of the block since |
+| `409 Conflict` | `session_expired` | The configured entry's `expires_at` has lapsed |
 
 ### `PUT /v1/nodes/{id}/state/reports/{key}`
 
@@ -763,6 +787,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "logs_count": 0,
   "audit_count": 0,
   "session_activity_count": 0,
+  "session_activity_rejected_count": 0,
   "integrity_violation_count": 0,
   "inject_event_count": 0,
   "events_request_count": 0,
@@ -1062,7 +1087,8 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `metrics_count` | `POST /v1/nodes/{id}/metrics` |
 | `logs_count` | `POST /v1/nodes/{id}/logs` |
 | `audit_count` | `POST /v1/nodes/{id}/audit` |
-| `session_activity_count` | `POST /v1/nodes/{id}/sessions/{sid}` |
+| `session_activity_count` | `POST /v1/nodes/{id}/sessions/{sid}` (accepted rows only) |
+| `session_activity_rejected_count` | `POST /v1/nodes/{id}/sessions/{sid}` (liveness refusals only: `404` / `409`) |
 | `integrity_violation_count` | `POST /v1/nodes/{id}/integrity-violations` (accepted batches only, one per request regardless of batch size) |
 | `inject_event_count` | `POST /test/inject-event` |
 | `events_request_count` | `GET /v1/nodes/{id}/events` (every request, including descoped `501` and `400`) |

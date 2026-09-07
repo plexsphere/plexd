@@ -644,6 +644,28 @@ serve the block, so a drained entry is reported as `plexd_close`:
 | `204 No Content` | Activity record accepted |
 | `400 Bad Request` (`malformed_session_activity`) | Body is unreadable, fails strict decoding, or violates the one-of contract |
 | `403 Forbidden` (`nsk_node_mismatch`) | Record targets a node other than the caller's identity |
+| `404 Not Found` (`session_not_found`) | No session resolves for this node and session id |
+| `409 Conflict` (`session_already_revoked`) | The session has been revoked |
+| `409 Conflict` (`session_expired`) | The session's `expires_at` has lapsed |
+
+The two `409` answers are terminal states of the session: neither goes back to
+live. plexd classifies them with `api.IsSessionRevokedOrExpired` and reads them
+as the drain signal rather than as a retryable error — a `session_started` row
+answered this way is settled instead of re-posted, and a `session_ended` row
+answered this way is logged at Warn carrying the counters it failed to deliver.
+It is the expected answer for every drain-driven close, since the control plane
+already holds the session as revoked or expired by the time the node has observed
+the drain. The teardown itself stays with the `sessions` block drain: the answer
+never closes a session, and while the block keeps carrying an entry answered this
+way, every pull warns that its listener is still forwarding.
+
+The `404` is not classified with them. It is the `sessions` block and the session
+store disagreeing — two separate reads, so a lagging replica, a session record
+written after the block was rendered, or a failover window all produce it — and
+the entry standing in the block is the control plane still asking for the
+session. It therefore keeps the ordinary handling, as every other answer does: a
+started row is re-posted on the next pull and an ended row is logged at Error and
+dropped.
 
 ## Observability
 
