@@ -202,13 +202,16 @@ var localCounterFields = map[string]bool{
 // EventsRequestCount advances only on GET .../events, which the flat fan-out
 // never opens. UnauthorizedCount advances only when the bearer gate refuses a
 // request, and a run in which it moves at all is a failing run — the tests that
-// drive it assert on it directly.
+// drive it assert on it directly. SessionActivityRejectedCount advances only on
+// a liveness refusal, which a fan-out posting to a seeded live session never
+// draws.
 var statefulCounterFields = map[string]bool{
-	"KeyRotateCount":          true,
-	"ExecutionUploadCount":    true,
-	"SecretsRateLimitedCount": true,
-	"EventsRequestCount":      true,
-	"UnauthorizedCount":       true,
+	"KeyRotateCount":               true,
+	"ExecutionUploadCount":         true,
+	"SecretsRateLimitedCount":      true,
+	"EventsRequestCount":           true,
+	"UnauthorizedCount":            true,
+	"SessionActivityRejectedCount": true,
 }
 
 // assertAllCountersEqual checks that every field in the AssertionCounters struct
@@ -1451,6 +1454,8 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp.Body.Close()
 	resp = doIngest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/audit", "application/x-ndjson", auditBatchBody, nil)
 	resp.Body.Close()
+	// The activity endpoint answers only for a live session of the row's kind.
+	configureSessions(t, ts.URL, stateSession("sess-001", 22))
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/"+testMockNodeID+"/sessions/sess-001", `{"tcp":{"phase":"session_started"}}`)
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/integrity-violations", integrityViolationBody)
@@ -1508,6 +1513,9 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	if a.SessionActivityCount != 1 {
 		t.Errorf("session_activity_count = %d, want 1", a.SessionActivityCount)
 	}
+	if a.SessionActivityRejectedCount != 0 {
+		t.Errorf("session_activity_rejected_count = %d, want 0", a.SessionActivityRejectedCount)
+	}
 	if a.IntegrityViolationCount != 1 {
 		t.Errorf("integrity_violation_count = %d, want 1", a.IntegrityViolationCount)
 	}
@@ -1529,6 +1537,10 @@ func TestAssertions_InitialZero(t *testing.T) {
 
 func TestConcurrentCounters(t *testing.T) {
 	_, ts := newTestServer(t)
+
+	// The session activity fan-out posts tcp rows, so its id has to resolve to a
+	// live tcp session for all n of them to count as accepted.
+	configureSessions(t, ts.URL, stateSession("sess-conc", 22))
 
 	const n = 100
 
@@ -1647,6 +1659,11 @@ func TestConcurrentCounters(t *testing.T) {
 	}
 	if a.ExecutionUploadCount != 0 {
 		t.Errorf("execution_upload_count = %d, want 0", a.ExecutionUploadCount)
+	}
+	// Every session activity row above named the seeded live session, so no
+	// liveness refusal was drawn.
+	if a.SessionActivityRejectedCount != 0 {
+		t.Errorf("session_activity_rejected_count = %d, want 0", a.SessionActivityRejectedCount)
 	}
 	// Every request above presented the node's envelope, so nothing may have
 	// been turned away.
@@ -3820,6 +3837,22 @@ func stateSession(sid string, port int) api.NodeStateSession {
 	}
 }
 
+// sessionOfKind builds one configured sessions entry of the given kind with a
+// future deadline. The mock accepts a session of any kind, so ssh and k8s rows
+// are testable against it even though plexd produces neither.
+func sessionOfKind(sid, kind string) api.NodeStateSession {
+	session := stateSession(sid, 22)
+	switch kind {
+	case api.SessionKindSSH:
+		session.Kind = api.SessionKindSSH
+		session.Target = api.SessionTarget{SSH: &api.SessionTargetSSH{User: "ops"}}
+	case api.SessionKindK8s:
+		session.Kind = api.SessionKindK8s
+		session.Target = api.SessionTarget{K8s: &api.SessionTargetK8s{User: "ops"}}
+	}
+	return session
+}
+
 // configureSessions posts a snapshot carrying only the given sessions block.
 func configureSessions(t *testing.T, baseURL string, sessions ...api.NodeStateSession) {
 	t.Helper()
@@ -3960,16 +3993,19 @@ func sessionURL(baseURL, sid string) string {
 func TestSessionActivity_ValidRows(t *testing.T) {
 	tests := []struct {
 		name string
+		kind string
 		body string
 	}{
-		{"tcp_started", `{"tcp":{"phase":"session_started","target_host":"203.0.113.9","target_port":22}}`},
-		{"tcp_ended", `{"tcp":{"phase":"session_ended","bytes_in":0,"bytes_out":0,"terminated_by":"operator_revoke"}}`},
-		{"ssh", `{"ssh":{"command":"ls -la","exit_code":0}}`},
-		{"k8s", `{"k8s":{"verb":"get","resource_kind":"pods","namespace":"default"}}`},
+		{"tcp_started", api.SessionKindTCP, `{"tcp":{"phase":"session_started","target_host":"203.0.113.9","target_port":22}}`},
+		{"tcp_ended", api.SessionKindTCP, `{"tcp":{"phase":"session_ended","bytes_in":0,"bytes_out":0,"terminated_by":"operator_revoke"}}`},
+		{"ssh", api.SessionKindSSH, `{"ssh":{"command":"ls -la","exit_code":0}}`},
+		{"k8s", api.SessionKindK8s, `{"k8s":{"verb":"get","resource_kind":"pods","namespace":"default"}}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, ts := newTestServer(t)
+			// Only a live session of the row's own kind draws the 204.
+			configureSessions(t, ts.URL, sessionOfKind("sess-"+tt.name, tt.kind))
 			resp := doRequest(t, http.MethodPost, sessionURL(ts.URL, "sess-"+tt.name), tt.body)
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusNoContent {
@@ -3990,6 +4026,7 @@ func TestSessionActivity_AcceptsListenerEndpoint(t *testing.T) {
 	// The listener endpoint the node opened for the mediated session travels on
 	// the tcp row and must survive the strict decode.
 	const body = `{"tcp":{"phase":"session_started","target_host":"203.0.113.9","target_port":22,"listener_endpoint":"10.42.0.1:45123"}}`
+	configureSessions(t, ts.URL, stateSession("sess-listener-endpoint", 22))
 
 	resp := doRequest(t, http.MethodPost, sessionURL(ts.URL, "sess-listener-endpoint"), body)
 	defer resp.Body.Close()
@@ -4008,20 +4045,25 @@ func TestSessionActivity_Denials(t *testing.T) {
 	longCommand := strings.Repeat("a", 1025)
 	tests := []struct {
 		name string
+		kind string
 		body string
 	}{
-		{"zero_members", `{}`},
-		{"two_members", `{"ssh":{"command":"ls"},"k8s":{"verb":"get"}}`},
-		{"ssh_missing_command", `{"ssh":{"exit_code":0}}`},
-		{"ssh_command_too_long", fmt.Sprintf(`{"ssh":{"command":%q}}`, longCommand)},
-		{"k8s_missing_verb", `{"k8s":{"resource_kind":"pods"}}`},
-		{"bad_tcp_phase", `{"tcp":{"phase":"session_paused"}}`},
-		{"bad_terminated_by", `{"tcp":{"phase":"session_ended","terminated_by":"who_knows"}}`},
-		{"unknown_field", `{"tcp":{"phase":"session_started"},"surprise":true}`},
+		{"zero_members", api.SessionKindTCP, `{}`},
+		{"two_members", api.SessionKindTCP, `{"ssh":{"command":"ls"},"k8s":{"verb":"get"}}`},
+		{"ssh_missing_command", api.SessionKindSSH, `{"ssh":{"exit_code":0}}`},
+		{"ssh_command_too_long", api.SessionKindSSH, fmt.Sprintf(`{"ssh":{"command":%q}}`, longCommand)},
+		{"k8s_missing_verb", api.SessionKindK8s, `{"k8s":{"resource_kind":"pods"}}`},
+		{"bad_tcp_phase", api.SessionKindTCP, `{"tcp":{"phase":"session_paused"}}`},
+		{"bad_terminated_by", api.SessionKindTCP, `{"tcp":{"phase":"session_ended","terminated_by":"who_knows"}}`},
+		{"unknown_field", api.SessionKindTCP, `{"tcp":{"phase":"session_started"},"surprise":true}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, ts := newTestServer(t)
+			// The structural gate runs ahead of the liveness resolution, so
+			// seeding a live session of the row's kind proves the 400 is a verdict
+			// on the row itself and not the refusal an unknown id would draw.
+			configureSessions(t, ts.URL, sessionOfKind("sess-"+tt.name, tt.kind))
 			resp := doRequest(t, http.MethodPost, sessionURL(ts.URL, "sess-"+tt.name), tt.body)
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusBadRequest {
@@ -4032,6 +4074,131 @@ func TestSessionActivity_Denials(t *testing.T) {
 			}
 		})
 	}
+}
+
+// assertActivityCounters checks the accepted and the refused session activity
+// counter together, since a verdict is only proven by what both of them read.
+func assertActivityCounters(t *testing.T, baseURL string, wantAccepted, wantRejected int64) {
+	t.Helper()
+	a := getAssertions(t, baseURL)
+	if a.SessionActivityCount != wantAccepted {
+		t.Errorf("session_activity_count = %d, want %d", a.SessionActivityCount, wantAccepted)
+	}
+	if a.SessionActivityRejectedCount != wantRejected {
+		t.Errorf("session_activity_rejected_count = %d, want %d", a.SessionActivityRejectedCount, wantRejected)
+	}
+}
+
+func TestSessionActivity_KindMismatch_Returns400(t *testing.T) {
+	_, ts := newTestServer(t)
+	configureSessions(t, ts.URL, sessionOfKind("sess-kind", api.SessionKindSSH))
+
+	// A shape-valid tcp row against an ssh session: the platform cross-checks the
+	// variant against the persisted session, and the spec folds the mismatch into
+	// the structural code rather than giving it one of its own.
+	resp := doRequest(t, http.MethodPost, sessionURL(ts.URL, "sess-kind"), `{"tcp":{"phase":"session_started"}}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+	}
+	var problem map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if code, _ := problem["code"].(string); code != "malformed_session_activity" {
+		t.Errorf("code = %q, want %q", code, "malformed_session_activity")
+	}
+	const wantDetail = "activity variant does not match the session's kind"
+	if detail, _ := problem["detail"].(string); detail != wantDetail {
+		t.Errorf("detail = %q, want %q", detail, wantDetail)
+	}
+	// A 400 is a verdict on the row, so it counts on neither counter.
+	assertActivityCounters(t, ts.URL, 0, 0)
+}
+
+func TestSessionActivity_UnknownSession_Returns404(t *testing.T) {
+	tests := []struct {
+		name string
+		// seedOther configures an unrelated session. Without it the fixture's
+		// sessions block was never set at all, and the resolution has to read the
+		// nil pointer as "no sessions" rather than panic on it.
+		seedOther bool
+	}{
+		{"never_configured", true},
+		{"nil_block", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			if tt.seedOther {
+				configureSessions(t, ts.URL, stateSession("sess-other", 22))
+			}
+
+			resp := doRequest(t, http.MethodPost, sessionURL(ts.URL, "sess-unknown"), `{"tcp":{"phase":"session_started"}}`)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+			}
+			if code := problemCode(t, resp); code != "session_not_found" {
+				t.Errorf("code = %q, want %q", code, "session_not_found")
+			}
+			assertActivityCounters(t, ts.URL, 0, 1)
+		})
+	}
+}
+
+func TestSessionActivity_RevokedSession_Returns409(t *testing.T) {
+	_, ts := newTestServer(t)
+	configureSessions(t, ts.URL, stateSession("sess-rev", 22))
+	// Revocation is a re-posted fixture without the entry. The registry keeps the
+	// id, which is what separates this answer from the 404 of an unknown id.
+	configureSessions(t, ts.URL)
+
+	resp := doRequest(t, http.MethodPost, sessionURL(ts.URL, "sess-rev"), `{"tcp":{"phase":"session_started"}}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
+	}
+	if code := problemCode(t, resp); code != "session_already_revoked" {
+		t.Errorf("code = %q, want %q", code, "session_already_revoked")
+	}
+	assertActivityCounters(t, ts.URL, 0, 1)
+}
+
+func TestSessionActivity_ExpiredSession_Returns409(t *testing.T) {
+	_, ts := newTestServer(t)
+	expired := stateSession("sess-exp", 22)
+	expired.ExpiresAt = time.Now().UTC().Add(-time.Minute)
+	configureSessions(t, ts.URL, expired)
+
+	resp := doRequest(t, http.MethodPost, sessionURL(ts.URL, "sess-exp"), `{"tcp":{"phase":"session_started"}}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
+	}
+	if code := problemCode(t, resp); code != "session_expired" {
+		t.Errorf("code = %q, want %q", code, "session_expired")
+	}
+	assertActivityCounters(t, ts.URL, 0, 1)
+}
+
+func TestSessionActivity_ReconfiguredSessionIsLiveAgain(t *testing.T) {
+	_, ts := newTestServer(t)
+	configureSessions(t, ts.URL, stateSession("sess-again", 22))
+	configureSessions(t, ts.URL)
+	// The registry is never pruned, so a re-posted entry has to take the fixture
+	// back to live rather than stay refused for having once been drained.
+	configureSessions(t, ts.URL, stateSession("sess-again", 22))
+
+	resp := doRequest(t, http.MethodPost, sessionURL(ts.URL, "sess-again"), `{"tcp":{"phase":"session_started"}}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+	assertActivityCounters(t, ts.URL, 1, 0)
 }
 
 func TestSessionActivity_ForeignNodeID_Returns403(t *testing.T) {
