@@ -57,12 +57,15 @@ type AssertionCounters struct {
 	LogsCount               int64 `json:"logs_count"`
 	AuditCount              int64 `json:"audit_count"`
 	SessionActivityCount    int64 `json:"session_activity_count"`
-	IntegrityViolationCount int64 `json:"integrity_violation_count"`
-	InjectEventCount        int64 `json:"inject_event_count"`
-	EventsRequestCount      int64 `json:"events_request_count"`
-	LocalMetricsCount       int64 `json:"local_metrics_count"`
-	LocalLogsCount          int64 `json:"local_logs_count"`
-	LocalAuditCount         int64 `json:"local_audit_count"`
+	// SessionActivityRejectedCount counts the liveness refusals (404/409) of the
+	// session activity endpoint. A structural 400 counts nowhere.
+	SessionActivityRejectedCount int64 `json:"session_activity_rejected_count"`
+	IntegrityViolationCount      int64 `json:"integrity_violation_count"`
+	InjectEventCount             int64 `json:"inject_event_count"`
+	EventsRequestCount           int64 `json:"events_request_count"`
+	LocalMetricsCount            int64 `json:"local_metrics_count"`
+	LocalLogsCount               int64 `json:"local_logs_count"`
+	LocalAuditCount              int64 `json:"local_audit_count"`
 	// UnauthorizedCount counts requests refused by the bearer-envelope gate. A
 	// node that presents the wrong credential drives this above zero, which is
 	// exactly the defect the suite failed to catch before the gate existed.
@@ -78,31 +81,32 @@ type Server struct {
 	// Defaults to DefaultKeepAliveInterval (15s). Set before calling Handler().
 	KeepAliveInterval time.Duration
 
-	registerCount           atomic.Int64
-	heartbeatCount          atomic.Int64
-	stateCount              atomic.Int64
-	keyRotateCount          atomic.Int64
-	capabilitiesCount       atomic.Int64
-	endpointCount           atomic.Int64
-	secretsCount            atomic.Int64
-	secretCurrentVersion    atomic.Int64
-	secretRateLimitNext     atomic.Int64
-	secretRetryAfterSeconds atomic.Int64
-	secretsRateLimitedCount atomic.Int64
-	reportPutCount          atomic.Int64
-	reportDeleteCount       atomic.Int64
-	executionCallbackCount  atomic.Int64
-	executionUploadCount    atomic.Int64
-	metricsCount            atomic.Int64
-	logsCount               atomic.Int64
-	auditCount              atomic.Int64
-	sessionActivityCount    atomic.Int64
-	integrityViolationCount atomic.Int64
-	injectEventCount        atomic.Int64
-	eventsRequestCount      atomic.Int64
-	localMetricsCount       atomic.Int64
-	localLogsCount          atomic.Int64
-	localAuditCount         atomic.Int64
+	registerCount                atomic.Int64
+	heartbeatCount               atomic.Int64
+	stateCount                   atomic.Int64
+	keyRotateCount               atomic.Int64
+	capabilitiesCount            atomic.Int64
+	endpointCount                atomic.Int64
+	secretsCount                 atomic.Int64
+	secretCurrentVersion         atomic.Int64
+	secretRateLimitNext          atomic.Int64
+	secretRetryAfterSeconds      atomic.Int64
+	secretsRateLimitedCount      atomic.Int64
+	reportPutCount               atomic.Int64
+	reportDeleteCount            atomic.Int64
+	executionCallbackCount       atomic.Int64
+	executionUploadCount         atomic.Int64
+	metricsCount                 atomic.Int64
+	logsCount                    atomic.Int64
+	auditCount                   atomic.Int64
+	sessionActivityCount         atomic.Int64
+	sessionActivityRejectedCount atomic.Int64
+	integrityViolationCount      atomic.Int64
+	injectEventCount             atomic.Int64
+	eventsRequestCount           atomic.Int64
+	localMetricsCount            atomic.Int64
+	localLogsCount               atomic.Int64
+	localAuditCount              atomic.Int64
 
 	// Signed event stream state (issue #25), all guarded by eventsMu. Every
 	// broadcast envelope is assigned a monotonic stream sequence (the first is
@@ -120,6 +124,12 @@ type Server struct {
 
 	stateFixture   api.NodeStateSnapshot
 	stateFixtureMu sync.RWMutex
+
+	// sessionRegistry holds the session_id of every session ever configured
+	// through SetState, guarded by stateFixtureMu. It is never pruned, so an id
+	// that has been drained out of the fixture stays distinguishable from one
+	// that was never configured at all.
+	sessionRegistry map[string]struct{}
 
 	heartbeatFixture   api.HeartbeatResponse
 	heartbeatFixtureMu sync.RWMutex
@@ -188,6 +198,7 @@ func New() *Server {
 		expectedBearerToken: "e2e-local-bearer-token",
 		consumedNonces:      make(map[string]struct{}),
 		execStates:          make(map[string]string),
+		sessionRegistry:     make(map[string]struct{}),
 		execUploads:         make(map[string]*execUpload),
 		eventClients:        make(map[uint64]*sseClient),
 		eventsMode:          eventsModeStreaming,
@@ -214,29 +225,30 @@ func (s *Server) Handler() http.Handler {
 // Assertions returns a snapshot of the current call counters.
 func (s *Server) Assertions() AssertionCounters {
 	return AssertionCounters{
-		RegisterCount:           s.registerCount.Load(),
-		HeartbeatCount:          s.heartbeatCount.Load(),
-		StateCount:              s.stateCount.Load(),
-		KeyRotateCount:          s.keyRotateCount.Load(),
-		CapabilitiesCount:       s.capabilitiesCount.Load(),
-		EndpointCount:           s.endpointCount.Load(),
-		SecretsCount:            s.secretsCount.Load(),
-		SecretsRateLimitedCount: s.secretsRateLimitedCount.Load(),
-		ReportPutCount:          s.reportPutCount.Load(),
-		ReportDeleteCount:       s.reportDeleteCount.Load(),
-		ExecutionCallbackCount:  s.executionCallbackCount.Load(),
-		ExecutionUploadCount:    s.executionUploadCount.Load(),
-		MetricsCount:            s.metricsCount.Load(),
-		LogsCount:               s.logsCount.Load(),
-		AuditCount:              s.auditCount.Load(),
-		SessionActivityCount:    s.sessionActivityCount.Load(),
-		IntegrityViolationCount: s.integrityViolationCount.Load(),
-		InjectEventCount:        s.injectEventCount.Load(),
-		EventsRequestCount:      s.eventsRequestCount.Load(),
-		LocalMetricsCount:       s.localMetricsCount.Load(),
-		LocalLogsCount:          s.localLogsCount.Load(),
-		LocalAuditCount:         s.localAuditCount.Load(),
-		UnauthorizedCount:       s.unauthorizedCount.Load(),
+		RegisterCount:                s.registerCount.Load(),
+		HeartbeatCount:               s.heartbeatCount.Load(),
+		StateCount:                   s.stateCount.Load(),
+		KeyRotateCount:               s.keyRotateCount.Load(),
+		CapabilitiesCount:            s.capabilitiesCount.Load(),
+		EndpointCount:                s.endpointCount.Load(),
+		SecretsCount:                 s.secretsCount.Load(),
+		SecretsRateLimitedCount:      s.secretsRateLimitedCount.Load(),
+		ReportPutCount:               s.reportPutCount.Load(),
+		ReportDeleteCount:            s.reportDeleteCount.Load(),
+		ExecutionCallbackCount:       s.executionCallbackCount.Load(),
+		ExecutionUploadCount:         s.executionUploadCount.Load(),
+		MetricsCount:                 s.metricsCount.Load(),
+		LogsCount:                    s.logsCount.Load(),
+		AuditCount:                   s.auditCount.Load(),
+		SessionActivityCount:         s.sessionActivityCount.Load(),
+		SessionActivityRejectedCount: s.sessionActivityRejectedCount.Load(),
+		IntegrityViolationCount:      s.integrityViolationCount.Load(),
+		InjectEventCount:             s.injectEventCount.Load(),
+		EventsRequestCount:           s.eventsRequestCount.Load(),
+		LocalMetricsCount:            s.localMetricsCount.Load(),
+		LocalLogsCount:               s.localLogsCount.Load(),
+		LocalAuditCount:              s.localAuditCount.Load(),
+		UnauthorizedCount:            s.unauthorizedCount.Load(),
 	}
 }
 
@@ -1855,10 +1867,58 @@ func validSessionActivity(req api.SessionActivityRequest) bool {
 	}
 }
 
+// activityMatchesKind reports whether the row's populated member is the one the
+// session's kind calls for. validSessionActivity has already established the
+// one-of contract, so neither ssh nor k8s set means tcp.
+func activityMatchesKind(req api.SessionActivityRequest, kind string) bool {
+	switch {
+	case req.SSH != nil:
+		return kind == api.SessionKindSSH
+	case req.K8s != nil:
+		return kind == api.SessionKindK8s
+	default:
+		return kind == api.SessionKindTCP
+	}
+}
+
+// resolveSession looks sessionID up in the state fixture and in the session
+// registry under a single lock acquisition, so the two answers describe the same
+// snapshot: read one after the other, a SetState landing between them could show
+// an id as absent from the fixture and present in the registry, reading a
+// session that is just being configured as a revoked one. configured reports
+// whether the current fixture carries the entry, returned in entry with its
+// expires_at for the caller to judge; registered reports whether the id was ever
+// configured.
+func (s *Server) resolveSession(sessionID string) (entry api.NodeStateSession, configured, registered bool) {
+	s.stateFixtureMu.RLock()
+	defer s.stateFixtureMu.RUnlock()
+	if s.stateFixture.Sessions != nil {
+		for _, session := range *s.stateFixture.Sessions {
+			if session.SessionID == sessionID {
+				entry, configured = session, true
+				break
+			}
+		}
+	}
+	_, registered = s.sessionRegistry[sessionID]
+	return entry, configured, registered
+}
+
 // handleSessionActivity handles POST /v1/nodes/{id}/sessions/{sid}, the v1
 // session activity record. It enforces the node-id guard, a 16 KiB body cap,
 // strict decoding, and the one-of ssh/k8s/tcp contract with per-kind
 // validation. Success is 204 No Content.
+//
+// The structural gates run first, so a malformed row is a 400 whatever session
+// it names. Liveness resolves next, against the configured fixture and the
+// session registry: a configured entry whose expires_at has lapsed is a 409
+// session_expired, an id configured earlier and drained since is a 409
+// session_already_revoked, and an id never configured is a 404
+// session_not_found, each of them whatever member the row populates. Only a live
+// session reaches the kind cross-check, where a row whose member disagrees with
+// the entry's kind is a 400 (the spec folds that mismatch into the structural
+// code). The liveness refusals count on sessionActivityRejectedCount, the
+// accepted rows on sessionActivityCount, and a 400 on neither.
 func (s *Server) handleSessionActivity(w http.ResponseWriter, r *http.Request) {
 	if r.PathValue("id") != mockNodeID {
 		writeProblem(w, r, http.StatusForbidden, "nsk_node_mismatch", "node id does not match this node's identity")
@@ -1881,6 +1941,28 @@ func (s *Server) handleSessionActivity(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validSessionActivity(req) {
 		writeProblem(w, r, http.StatusBadRequest, "malformed_session_activity", "session activity violates the one-of contract")
+		return
+	}
+
+	entry, configured, registered := s.resolveSession(r.PathValue("sid"))
+	switch {
+	case configured && entry.ExpiresAt.After(time.Now()):
+		if !activityMatchesKind(req, entry.Kind) {
+			writeProblem(w, r, http.StatusBadRequest, "malformed_session_activity",
+				"activity variant does not match the session's kind")
+			return
+		}
+	case configured:
+		s.sessionActivityRejectedCount.Add(1)
+		writeProblem(w, r, http.StatusConflict, "session_expired", "session has expired")
+		return
+	case registered:
+		s.sessionActivityRejectedCount.Add(1)
+		writeProblem(w, r, http.StatusConflict, "session_already_revoked", "session has been revoked")
+		return
+	default:
+		s.sessionActivityRejectedCount.Add(1)
+		writeProblem(w, r, http.StatusNotFound, "session_not_found", "no session resolves for this node and session id")
 		return
 	}
 
@@ -2010,9 +2092,20 @@ func checkIntegrityViolation(v api.IntegrityViolationReport) (code, detail strin
 // snapshot must never regress an execution the node has already advanced. The
 // two locks are never held at once: execMu is taken only after stateFixtureMu is
 // released.
+//
+// Every configured session carrying a session_id is also recorded in the
+// session registry, which is never pruned, so an id drained by a later snapshot
+// stays distinguishable from one that was never configured.
 func (s *Server) SetState(state api.NodeStateSnapshot) {
 	s.stateFixtureMu.Lock()
 	s.stateFixture = state
+	if state.Sessions != nil {
+		for _, session := range *state.Sessions {
+			if session.SessionID != "" {
+				s.sessionRegistry[session.SessionID] = struct{}{}
+			}
+		}
+	}
 	s.stateFixtureMu.Unlock()
 
 	s.execMu.Lock()
