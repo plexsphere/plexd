@@ -369,7 +369,7 @@ func TestUpdateCapabilities_Success(t *testing.T) {
 
 		// The handler decodes with DisallowUnknownFields, so the body must
 		// carry the contract's flat fields and nothing else — a nested
-		// `binary` object or a `builtin_actions` list refuses the manifest.
+		// `binary` object refuses the manifest.
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("read request: %v", err)

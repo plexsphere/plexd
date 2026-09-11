@@ -531,14 +531,16 @@ type AuditEntry struct {
 // ---------------------------------------------------------------------------
 
 // CapabilityManifestRequest is the body of PUT /v1/nodes/{node_id}/capabilities:
-// the agent's binary version and digest, plus the hooks it advertises.
+// the agent's binary version and digest, the hooks it advertises, and two
+// inventories of what it can run: the builtin actions it implements and the
+// PlexdHook resources it discovered in its cluster.
 //
 // The handler decodes it with DisallowUnknownFields, so this struct carries the
-// contract's fields and nothing else. In particular there is no field for the
-// agent's builtin action list — the control plane has no column for it, and an
-// earlier payload that sent one under `builtin_actions` (inside a nested
-// `binary` object that the contract also does not have) was refused whole. The
-// action list stays available locally through the node API's /v1/actions.
+// contract's fields and nothing else. A manifest is refused whole, so one
+// inventory entry that breaks an invariant (422) costs the binary version and
+// checksum with it. The agent therefore sends only entries the contract
+// accepts: at most 128 per inventory, unique names, at most 64 parameters per
+// action, and a canonical image digest on every PlexdHook.
 type CapabilityManifestRequest struct {
 	// BinaryVersion is the agent version string, non-empty after trimming.
 	BinaryVersion string `json:"binary_version"`
@@ -553,6 +555,15 @@ type CapabilityManifestRequest struct {
 	// DeclaredHooks are the hooks the agent advertises, at most 128, with
 	// unique names. Omitted when empty rather than sent as null.
 	DeclaredHooks []DeclaredHook `json:"declared_hooks,omitempty"`
+	// PlexdHooks are the PlexdHook resources the agent discovered in its
+	// ServiceAccount's namespace at boot, at most 128, with unique names.
+	// Omitted when the agent runs outside a cluster or found nothing it can
+	// report, rather than sent as null.
+	PlexdHooks []DiscoveredPlexdHook `json:"plexd_hooks,omitempty"`
+	// BuiltinActions is the inventory of builtin actions the agent implements,
+	// sorted by name, each with its parameters in registration order. Omitted
+	// when empty rather than sent as null.
+	BuiltinActions []ActionInfo `json:"builtin_actions,omitempty"`
 }
 
 // DeclaredHook pairs a hook name with the digest of its payload, so the
@@ -562,6 +573,27 @@ type DeclaredHook struct {
 	// Checksum is the hook payload's SHA-256 as 32 raw bytes in
 	// standard-padded base64, same encoding as BinaryChecksum.
 	Checksum string `json:"checksum"`
+}
+
+// DiscoveredPlexdHook is one PlexdHook resource as the manifest reports it (the
+// contract's PlexdHook schema). It identifies the hook by its image digest
+// rather than a payload checksum, so only a digest-pinned image can be
+// reported.
+type DiscoveredPlexdHook struct {
+	// Name is the resource name, unique within the namespace it was listed in.
+	Name string `json:"name"`
+	// ImageDigest is the hook image's digest in canonical
+	// `sha256:<64 lowercase hex>` form.
+	ImageDigest string `json:"image_digest"`
+	// Parameters is the spec's name/value list folded into a map.
+	Parameters map[string]string `json:"parameters,omitempty"`
+	// TimeoutSeconds is the execution timeout. The CRD has no timeout field,
+	// so the agent never sets it and the key stays off the wire.
+	TimeoutSeconds int64 `json:"timeout_seconds,omitempty"`
+	// Sandbox reports that the hook runs sandboxed: a read-only root
+	// filesystem with every capability dropped, which is how the controller
+	// runs any hook that is not privileged.
+	Sandbox bool `json:"sandbox,omitempty"`
 }
 
 // BinaryInfo describes the running agent binary. It is reported through the
@@ -575,7 +607,7 @@ type BinaryInfo struct {
 type ActionInfo struct {
 	Name        string        `json:"name"`
 	Description string        `json:"description"`
-	Parameters  []ActionParam `json:"parameters"`
+	Parameters  []ActionParam `json:"parameters,omitempty"`
 }
 
 type ActionParam struct {
