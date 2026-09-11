@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/health"
+	"github.com/plexsphere/plexd/internal/kubernetes"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/nat"
 	"github.com/plexsphere/plexd/internal/nodeapi"
@@ -1587,12 +1589,227 @@ func TestDeclaredHooks(t *testing.T) {
 	}
 }
 
+const (
+	plexdHookOmittedMsg       = "plexd hook omitted from the capability manifest"
+	plexdHookParamRepeatedMsg = "plexd hook parameter repeated; the later value is reported"
+	plexdHooksCappedMsg       = "plexd hooks beyond the capability manifest cap omitted"
+)
+
+// discoveredPlexdHooks turns listed PlexdHook resources into plexd_hooks
+// entries. It follows declaredHooks: an entry the control plane would refuse
+// costs the whole manifest, so what cannot be reported is dropped with a
+// warning instead of sent.
+func TestDiscoveredPlexdHooks(t *testing.T) {
+	const digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	upperDigest := "sha256:" + strings.ToUpper(strings.TrimPrefix(digest, "sha256:"))
+	template := func(image string) *kubernetes.PlexdHookJobTemplate {
+		return &kubernetes.PlexdHookJobTemplate{Image: image}
+	}
+
+	rec := newRecordingHandler()
+	got := discoveredPlexdHooks([]kubernetes.PlexdHook{
+		{Name: "nightly-backup", Spec: kubernetes.PlexdHookSpec{
+			JobTemplate: template("registry.example/backup:1.4@" + digest),
+			Parameters: []kubernetes.PlexdHookParam{
+				{Name: "retention", Value: "7d"},
+				{Name: "target", Value: "/var/backups"},
+				{Name: "retention", Value: "30d"},
+			},
+		}},
+		{Name: "tag-pinned", Spec: kubernetes.PlexdHookSpec{JobTemplate: template("alpine:3.19")}},
+		{Name: "no-template"},
+		{Name: "uppercase-digest", Spec: kubernetes.PlexdHookSpec{JobTemplate: template("busybox@" + upperDigest)}},
+		{Name: "disk-check", Spec: kubernetes.PlexdHookSpec{JobTemplate: template("busybox@" + digest), Privileged: true}},
+	}, slog.New(rec))
+
+	// Sorted by name. The privileged hook is not sandboxed and, having no
+	// parameters, carries no map.
+	want := []api.DiscoveredPlexdHook{
+		{Name: "disk-check", ImageDigest: digest},
+		{
+			Name:        "nightly-backup",
+			ImageDigest: digest,
+			Parameters:  map[string]string{"retention": "30d", "target": "/var/backups"},
+			Sandbox:     true,
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("discoveredPlexdHooks = %+v\nwant %+v", got, want)
+	}
+
+	// Each dropped entry is named with the image it would have run, including
+	// the busybox:latest default a hook without a job template gets.
+	omitted := map[string]string{}
+	rec.mu.Lock()
+	for _, r := range rec.records {
+		if r.level == slog.LevelWarn && r.msg == plexdHookOmittedMsg {
+			omitted[r.attrs["hook"]] = r.attrs["image"]
+		}
+	}
+	rec.mu.Unlock()
+	wantOmitted := map[string]string{
+		"tag-pinned":       "alpine:3.19",
+		"no-template":      "busybox:latest",
+		"uppercase-digest": "busybox@" + upperDigest,
+	}
+	if !reflect.DeepEqual(omitted, wantOmitted) {
+		t.Errorf("omitted hooks = %v, want %v", omitted, wantOmitted)
+	}
+	if n := rec.count(slog.LevelWarn, plexdHookParamRepeatedMsg); n != 1 {
+		t.Errorf("repeated-parameter warnings = %d, want 1", n)
+	}
+	if attrs := rec.attrsOf(slog.LevelWarn, plexdHookParamRepeatedMsg); attrs["hook"] != "nightly-backup" || attrs["parameter"] != "retention" {
+		t.Errorf("repeated-parameter warning attrs = %v, want hook=nightly-backup parameter=retention", attrs)
+	}
+
+	// No timeout on the wire: the CRD has nothing to fill it from.
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(`"timeout_seconds"`)) {
+		t.Errorf("entries carry timeout_seconds: %s", raw)
+	}
+
+	// Nil rather than empty, so the omitempty field leaves the key off.
+	if got := discoveredPlexdHooks(nil, discardLogger()); got != nil {
+		t.Errorf("discoveredPlexdHooks(nil) = %+v, want nil", got)
+	}
+	if got := discoveredPlexdHooks([]kubernetes.PlexdHook{}, discardLogger()); got != nil {
+		t.Errorf("discoveredPlexdHooks(empty) = %+v, want nil", got)
+	}
+	tagOnly := []kubernetes.PlexdHook{{Name: "tag-pinned", Spec: kubernetes.PlexdHookSpec{JobTemplate: template("alpine:3.19")}}}
+	if got := discoveredPlexdHooks(tagOnly, discardLogger()); got != nil {
+		t.Errorf("discoveredPlexdHooks with nothing reportable = %+v, want nil", got)
+	}
+}
+
+// Past the contract's cap the manifest would be refused whole, so the first
+// entries by name go out and the rest are counted in a warning.
+func TestDiscoveredPlexdHooks_CapsAtContractLimit(t *testing.T) {
+	const digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	hooks := make([]kubernetes.PlexdHook, 0, maxPlexdHooks+1)
+	for i := maxPlexdHooks; i >= 0; i-- { // reversed, so the sort decides which stay
+		hooks = append(hooks, kubernetes.PlexdHook{
+			Name: fmt.Sprintf("hook-%03d", i),
+			Spec: kubernetes.PlexdHookSpec{JobTemplate: &kubernetes.PlexdHookJobTemplate{Image: "busybox@" + digest}},
+		})
+	}
+
+	rec := newRecordingHandler()
+	got := discoveredPlexdHooks(hooks, slog.New(rec))
+	if len(got) != maxPlexdHooks {
+		t.Fatalf("discoveredPlexdHooks returned %d entries, want %d", len(got), maxPlexdHooks)
+	}
+	if first, last := got[0].Name, got[len(got)-1].Name; first != "hook-000" || last != "hook-127" {
+		t.Errorf("kept %s..%s, want hook-000..hook-127", first, last)
+	}
+	if attrs := rec.attrsOf(slog.LevelWarn, plexdHooksCappedMsg); attrs["dropped"] != "1" {
+		t.Errorf("cap warning attrs = %v, want dropped=1", attrs)
+	}
+}
+
+// fakeHookLister answers ListPlexdHooks from fixed values and records what it
+// was asked.
+type fakeHookLister struct {
+	hooks []kubernetes.PlexdHook
+	err   error
+
+	namespace   string
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (f *fakeHookLister) ListPlexdHooks(ctx context.Context, namespace string) ([]kubernetes.PlexdHook, error) {
+	f.namespace = namespace
+	f.deadline, f.hasDeadline = ctx.Deadline()
+	return f.hooks, f.err
+}
+
+// Discovery never blocks or fails boot. Outside a cluster it says nothing;
+// inside one, every way it can fail is one warning and no plexd_hooks.
+func TestDiscoverPlexdHooks(t *testing.T) {
+	inCluster := &kubernetes.KubernetesEnvironment{InCluster: true, Namespace: "plexd-system\n", ServiceAccountToken: "/token"}
+	listed := []kubernetes.PlexdHook{{Name: "nightly-backup"}}
+	transportErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+
+	for _, tc := range []struct {
+		name            string
+		env             *kubernetes.KubernetesEnvironment
+		constructErr    error
+		listErr         error
+		want            []kubernetes.PlexdHook
+		wantWarnings    int
+		wantConstructed bool
+		wantListed      bool
+	}{
+		{name: "no environment"},
+		{name: "not in cluster", env: &kubernetes.KubernetesEnvironment{}},
+		{name: "blank namespace", env: &kubernetes.KubernetesEnvironment{InCluster: true, Namespace: " \n"}, wantWarnings: 1},
+		{name: "lister construction fails", env: inCluster, constructErr: errors.New("no cluster CA"), wantWarnings: 1, wantConstructed: true},
+		{name: "missing RBAC", env: inCluster, listErr: fmt.Errorf("list: %w", kubernetes.ErrUnauthorized), wantWarnings: 1, wantConstructed: true, wantListed: true},
+		{name: "CRD not installed", env: inCluster, listErr: fmt.Errorf("list: %w", kubernetes.ErrNotFound), wantWarnings: 1, wantConstructed: true, wantListed: true},
+		{name: "list times out", env: inCluster, listErr: fmt.Errorf("list: %w", context.DeadlineExceeded), wantWarnings: 1, wantConstructed: true, wantListed: true},
+		{name: "transport error", env: inCluster, listErr: fmt.Errorf("list: %w", transportErr), wantWarnings: 1, wantConstructed: true, wantListed: true},
+		{name: "listed", env: inCluster, want: listed, wantConstructed: true, wantListed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The fake returns hooks even alongside an error, so a caller that
+			// used them anyway would show here.
+			lister := &fakeHookLister{hooks: listed, err: tc.listErr}
+			constructed := false
+			newLister := func(*kubernetes.KubernetesEnvironment) (plexdHookLister, error) {
+				constructed = true
+				if tc.constructErr != nil {
+					return nil, tc.constructErr
+				}
+				return lister, nil
+			}
+
+			rec := newRecordingHandler()
+			start := time.Now()
+			got := discoverPlexdHooks(context.Background(), tc.env, newLister, slog.New(rec))
+			end := time.Now()
+
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("discoverPlexdHooks = %+v, want %+v", got, tc.want)
+			}
+			if n := rec.countAt(slog.LevelWarn); n != tc.wantWarnings {
+				t.Errorf("warnings = %d, want %d", n, tc.wantWarnings)
+			}
+			if constructed != tc.wantConstructed {
+				t.Errorf("lister constructed = %v, want %v", constructed, tc.wantConstructed)
+			}
+			if listedNow := lister.namespace != ""; listedNow != tc.wantListed {
+				t.Fatalf("list called = %v, want %v", listedNow, tc.wantListed)
+			}
+			if !tc.wantListed {
+				return
+			}
+			if lister.namespace != "plexd-system" {
+				t.Errorf("listed namespace %q, want the trimmed %q", lister.namespace, "plexd-system")
+			}
+			// The list runs under its own 10-second budget.
+			if !lister.hasDeadline ||
+				lister.deadline.Before(start.Add(plexdHookDiscoveryTimeout)) ||
+				lister.deadline.After(end.Add(plexdHookDiscoveryTimeout)) {
+				t.Errorf("list deadline = %v (set %v), want %v after the call", lister.deadline, lister.hasDeadline, plexdHookDiscoveryTimeout)
+			}
+		})
+	}
+}
+
 // What the daemon actually puts on the wire for the two operations that carry
 // the binary digest. Both were refused by the control plane before: the
-// heartbeat sent hex where the field is `format: byte`, and the manifest sent a
-// nested `binary` object plus a `builtin_actions` list the handler rejects as
-// unknown fields — gzip-compressed on top, which the handler read as JSON.
+// heartbeat sent hex where the field is `format: byte`, and the manifest nested
+// a `builtin_actions` list inside a `binary` object the handler rejects as an
+// unknown field — gzip-compressed on top, which the handler read as JSON. The
+// action inventory now travels where the contract puts it, at the top level.
 func TestRunUp_CapabilityManifestAndHeartbeatAreContractShaped(t *testing.T) {
+	// Outside a cluster no PlexdHook list runs; an ambient
+	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
 	type capture struct {
 		body     []byte
 		encoding string
@@ -1673,6 +1890,37 @@ func TestRunUp_CapabilityManifestAndHeartbeatAreContractShaped(t *testing.T) {
 	assertWireDigest(t, "binary_checksum", manifest.BinaryChecksum)
 	if fp := manifest.SSHHostKeyFingerprint; fp != "" && !strings.HasPrefix(fp, "SHA256:") {
 		t.Errorf("ssh_host_key_fingerprint = %q, want the SHA256:<base64> form", fp)
+	}
+
+	// The action inventory: every builtin runUp registers, sorted by name and
+	// described, with its parameters in registration order.
+	wantActions := []string{
+		"config.dump", "diagnostics.collect", "diagnostics.ping_peer", "diagnostics.traceroute_peer",
+		"health.check", "logs.snapshot", "mesh.reconnect", "service.reload_config",
+		"service.restart", "service.upgrade", "system.info",
+	}
+	gotActions := make([]string, len(manifest.BuiltinActions))
+	for i, a := range manifest.BuiltinActions {
+		gotActions[i] = a.Name
+		if a.Description == "" {
+			t.Errorf("builtin %q has no description", a.Name)
+		}
+		if a.Name == "service.upgrade" {
+			var params []string
+			for _, p := range a.Parameters {
+				params = append(params, fmt.Sprintf("%s:%t", p.Name, p.Required))
+			}
+			if want := []string{"version:true", "checksum:true"}; !reflect.DeepEqual(params, want) {
+				t.Errorf("service.upgrade parameters = %v, want %v", params, want)
+			}
+		}
+	}
+	if !reflect.DeepEqual(gotActions, wantActions) {
+		t.Errorf("builtin_actions = %v, want %v", gotActions, wantActions)
+	}
+	// Not in a cluster, so no PlexdHook list ran and the key stays off.
+	if bytes.Contains(caps.body, []byte(`"plexd_hooks"`)) {
+		t.Errorf("manifest carries plexd_hooks outside a cluster: %s", caps.body)
 	}
 
 	// The heartbeat carries the same digest and must carry it the same way.
