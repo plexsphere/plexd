@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -168,6 +169,9 @@ func (e *Executor) SetHooks(hooks []api.HookInfo) {
 }
 
 // Capabilities returns builtin action metadata and hooks for capability reporting.
+// The actions are sorted by name, so the inventory reads the same on every call
+// whatever order the builtins map ranges in; each action's parameters keep the
+// order they were registered in.
 func (e *Executor) Capabilities() ([]api.ActionInfo, []api.HookInfo) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -180,6 +184,9 @@ func (e *Executor) Capabilities() ([]api.ActionInfo, []api.HookInfo) {
 			Parameters:  entry.params,
 		})
 	}
+	sort.Slice(actions, func(i, j int) bool {
+		return actions[i].Name < actions[j].Name
+	})
 
 	hooks := make([]api.HookInfo, len(e.hooks))
 	copy(hooks, e.hooks)
