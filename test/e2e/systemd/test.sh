@@ -390,9 +390,10 @@ fi
 echo "  PASS: heartbeat body nat_summary is a JSON object"
 
 # Capability manifest: the contract's flat envelope, with a binary_checksum that
-# decodes to 32 bytes (hex decodes to 48 and is refused) and no field the
-# handler would reject as unknown. The agent's action list is not part of this
-# body — the contract has no field for it; the node API serves it instead.
+# decodes to 32 bytes (hex decodes to 48 and is refused) and no nested `binary`
+# object, which the handler rejects as unknown. builtin_actions carries the
+# agent's eleven builtins; plexd_hooks stays off, because the host is not in a
+# cluster.
 CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
 if [ -z "${CAPS_BODY}" ]; then
     fail "no captured capabilities request body"
@@ -406,10 +407,14 @@ CAPS_DIGEST_LEN=$(printf '%s' "${CAPS_CHECKSUM}" | base64 -d 2>/dev/null | wc -c
 if [ "${CAPS_DIGEST_LEN}" != "32" ]; then
     fail "binary_checksum decodes to ${CAPS_DIGEST_LEN} bytes, want 32"
 fi
-if echo "${CAPS_BODY}" | jq -e 'has("builtin_actions") or has("binary")' >/dev/null 2>&1; then
-    fail "capability manifest carries a field the handler rejects as unknown (body: ${CAPS_BODY})"
+if echo "${CAPS_BODY}" | jq -e 'has("binary") or has("plexd_hooks")' >/dev/null 2>&1; then
+    fail "capability manifest carries 'binary' or 'plexd_hooks', neither of which belongs here (body: ${CAPS_BODY})"
 fi
-echo "  PASS: capability manifest is contract-shaped (version=${CAPS_VERSION}, 32-byte digest)"
+CAPS_ACTION_COUNT=$(echo "${CAPS_BODY}" | jq '.builtin_actions | length')
+if [ "${CAPS_ACTION_COUNT}" != "11" ]; then
+    fail "capability manifest carries ${CAPS_ACTION_COUNT} builtin_actions, want 11 (body: ${CAPS_BODY})"
+fi
+echo "  PASS: capability manifest is contract-shaped (version=${CAPS_VERSION}, 32-byte digest, 11 builtins)"
 
 echo "=== Request body validation PASSED ==="
 
@@ -744,8 +749,8 @@ if [ -n "${METRICS_BODY}" ]; then
     esac
 fi
 
-# The capability manifest carries no action list — the contract has no field for
-# one — so the optional fields it does define are what there is to check here.
+# The request body checks covered the manifest's inventories, so the optional
+# host-key fingerprint is what is left to check here.
 CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
 if [ -n "${CAPS_BODY}" ]; then
     CAPS_FP=$(echo "${CAPS_BODY}" | jq -r '.ssh_host_key_fingerprint // empty')
