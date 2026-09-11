@@ -130,18 +130,26 @@ func sanitizeHookParamName(name string) string {
 	return strings.ToUpper(hookParamSanitizer.ReplaceAllString(name, "_"))
 }
 
+// Image returns the container image the controller runs for a hook with this
+// spec: the job template's image, or defaultHookImage when the template or its
+// image is absent. The capability manifest derives a hook's image digest from
+// the same value, so the two cannot disagree about which image a hook runs.
+func (s PlexdHookSpec) Image() string {
+	if s.JobTemplate != nil && s.JobTemplate.Image != "" {
+		return s.JobTemplate.Image
+	}
+	return defaultHookImage
+}
+
 // buildJob creates a PlexdJob from a PlexdHook resource.
 func (c *PlexdHookController) buildJob(hook *PlexdHook) *PlexdJob {
 	jobName := fmt.Sprintf("plexdhook-%s", hook.Name)
 
 	// Default image and command.
-	image := defaultHookImage
+	image := hook.Spec.Image()
 	var command []string
 	var args []string
 	if hook.Spec.JobTemplate != nil {
-		if hook.Spec.JobTemplate.Image != "" {
-			image = hook.Spec.JobTemplate.Image
-		}
 		command = hook.Spec.JobTemplate.Command
 		args = hook.Spec.JobTemplate.Args
 	}
