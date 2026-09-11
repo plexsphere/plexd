@@ -2010,6 +2010,179 @@ func TestCapabilities_WrongMethod_Returns405(t *testing.T) {
 	}
 }
 
+// testImageDigest is a canonical image digest for plexd_hooks fixtures.
+const testImageDigest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// manifestWith returns capabilitiesBody with the given members added, so a case
+// differs from a manifest the mock accepts only in what it sets.
+func manifestWith(t *testing.T, extra map[string]any) string {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(capabilitiesBody), &m); err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range extra {
+		m[k] = v
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// Inventory fixtures: a plexd_hooks entry, a builtin action, a parameter, and
+// n distinct copies of each.
+func plexdHookEntry(name, digest string) map[string]any {
+	return map[string]any{"name": name, "image_digest": digest}
+}
+
+func builtinActionEntry(name string, params ...map[string]any) map[string]any {
+	return map[string]any{"name": name, "description": "the " + name + " builtin", "parameters": params}
+}
+
+func actionParamEntry(name string) map[string]any {
+	return map[string]any{"name": name, "type": "string", "required": false, "description": "the " + name + " parameter"}
+}
+
+func plexdHookEntries(n int) []map[string]any {
+	out := make([]map[string]any, n)
+	for i := range out {
+		out[i] = plexdHookEntry(fmt.Sprintf("hook-%03d", i), testImageDigest)
+	}
+	return out
+}
+
+func builtinActionEntries(n int) []map[string]any {
+	out := make([]map[string]any, n)
+	for i := range out {
+		out[i] = builtinActionEntry(fmt.Sprintf("action.%03d", i))
+	}
+	return out
+}
+
+func actionParamEntries(n int) []map[string]any {
+	out := make([]map[string]any, n)
+	for i := range out {
+		out[i] = actionParamEntry(fmt.Sprintf("param_%02d", i))
+	}
+	return out
+}
+
+// Both inventories in the shape the contract defines are accepted and counted,
+// up to and including their caps.
+func TestCapabilities_ValidInventories_Accepted(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra map[string]any
+	}{
+		{name: "both inventories", extra: map[string]any{
+			"plexd_hooks": []map[string]any{
+				{"name": "nightly-backup", "image_digest": testImageDigest, "parameters": map[string]string{"retention": "7d"}, "timeout_seconds": 300, "sandbox": true},
+				plexdHookEntry("disk-check", testImageDigest),
+			},
+			"builtin_actions": []map[string]any{
+				builtinActionEntry("service.upgrade", actionParamEntry("version"), actionParamEntry("checksum")),
+				builtinActionEntry("system.info"),
+			},
+		}},
+		{name: "128 hooks", extra: map[string]any{"plexd_hooks": plexdHookEntries(128)}},
+		{name: "128 actions", extra: map[string]any{"builtin_actions": builtinActionEntries(128)}},
+		{name: "64 parameters on one action", extra: map[string]any{
+			"builtin_actions": []map[string]any{builtinActionEntry("wide", actionParamEntries(64)...)},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", manifestWith(t, tc.extra))
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusNoContent {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusNoContent, body)
+			}
+			if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+				t.Errorf("capabilities_count = %d, want 1", a.CapabilitiesCount)
+			}
+		})
+	}
+}
+
+// An action registered without parameters may reach the handler as
+// `"parameters": null`. That is zero parameters, not a violation.
+func TestCapabilities_NullActionParameters_Accepted(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	body := manifestWith(t, map[string]any{
+		"builtin_actions": []map[string]any{{"name": "service.restart", "description": "Restart plexd", "parameters": nil}},
+	})
+	if !strings.Contains(body, `"parameters":null`) {
+		t.Fatalf("fixture lost its null parameters: %s", body)
+	}
+
+	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+// Every inventory invariant the contract states answers 422 with its own code,
+// and a refused manifest is not counted.
+func TestCapabilities_InventoryViolations_Return422(t *testing.T) {
+	upperDigest := "sha256:" + strings.ToUpper(strings.TrimPrefix(testImageDigest, "sha256:"))
+
+	for _, tc := range []struct {
+		name  string
+		extra map[string]any
+		code  string
+	}{
+		{name: "hook without a name", code: "plexd_hook_invalid",
+			extra: map[string]any{"plexd_hooks": []map[string]any{plexdHookEntry("  ", testImageDigest)}}},
+		{name: "hook image digest missing", code: "plexd_hook_invalid",
+			extra: map[string]any{"plexd_hooks": []map[string]any{{"name": "nightly"}}}},
+		{name: "hook image digest is a tag", code: "plexd_hook_invalid",
+			extra: map[string]any{"plexd_hooks": []map[string]any{plexdHookEntry("nightly", "latest")}}},
+		{name: "hook image digest in uppercase hex", code: "plexd_hook_invalid",
+			extra: map[string]any{"plexd_hooks": []map[string]any{plexdHookEntry("nightly", upperDigest)}}},
+		{name: "negative hook timeout", code: "plexd_hook_invalid",
+			extra: map[string]any{"plexd_hooks": []map[string]any{{"name": "nightly", "image_digest": testImageDigest, "timeout_seconds": -1}}}},
+		{name: "duplicate hook", code: "plexd_hook_duplicate",
+			extra: map[string]any{"plexd_hooks": []map[string]any{plexdHookEntry("nightly", testImageDigest), plexdHookEntry("nightly", testImageDigest)}}},
+		{name: "129 hooks", code: "plexd_hooks_too_many",
+			extra: map[string]any{"plexd_hooks": plexdHookEntries(129)}},
+		{name: "action without a name", code: "builtin_action_invalid",
+			extra: map[string]any{"builtin_actions": []map[string]any{builtinActionEntry(" ")}}},
+		{name: "parameter without a name", code: "builtin_action_invalid",
+			extra: map[string]any{"builtin_actions": []map[string]any{builtinActionEntry("service.upgrade", actionParamEntry(""))}}},
+		{name: "parameter declared twice", code: "builtin_action_invalid",
+			extra: map[string]any{"builtin_actions": []map[string]any{builtinActionEntry("service.upgrade", actionParamEntry("version"), actionParamEntry("version"))}}},
+		{name: "duplicate action", code: "builtin_action_duplicate",
+			extra: map[string]any{"builtin_actions": []map[string]any{builtinActionEntry("system.info"), builtinActionEntry("system.info")}}},
+		{name: "129 actions", code: "builtin_actions_too_many",
+			extra: map[string]any{"builtin_actions": builtinActionEntries(129)}},
+		{name: "65 parameters on one action", code: "builtin_actions_too_many",
+			extra: map[string]any{"builtin_actions": []map[string]any{builtinActionEntry("wide", actionParamEntries(65)...)}}},
+		// plexd_hooks is checked before builtin_actions, the contract's order.
+		{name: "both inventories invalid", code: "plexd_hook_invalid",
+			extra: map[string]any{
+				"plexd_hooks":     []map[string]any{plexdHookEntry("", testImageDigest)},
+				"builtin_actions": []map[string]any{builtinActionEntry("")},
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", manifestWith(t, tc.extra))
+			defer resp.Body.Close()
+			assertProblem(t, resp, http.StatusUnprocessableEntity, tc.code)
+			if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 0 {
+				t.Errorf("capabilities_count = %d, want 0 for a refused manifest", a.CapabilitiesCount)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Endpoint (NAT) endpoint
 // ---------------------------------------------------------------------------

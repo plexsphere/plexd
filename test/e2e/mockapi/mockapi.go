@@ -406,6 +406,11 @@ var (
 	// sshFingerprintRe matches the capability manifest's optional host-key
 	// fingerprint: the literal SHA256: prefix and a base64 body, padded or not.
 	sshFingerprintRe = regexp.MustCompile(`^SHA256:[A-Za-z0-9+/]+={0,2}$`)
+	// imageDigestRe matches a plexd_hooks entry's image_digest: the canonical
+	// sha256:<64 lowercase hex> form and nothing looser. The mock keeps its own
+	// copy rather than share the agent's, so it checks the contract, not the
+	// agent's reading of it.
+	imageDigestRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
 
 // releaseFixtures holds the plexd release binary and its Sigstore bundle served
@@ -1059,7 +1064,10 @@ func (s *Server) handleKeyRotate(w http.ResponseWriter, r *http.Request) {
 // manifest. It strict-decodes the contract's envelope and enforces its
 // invariants: a non-empty binary_version, a binary_checksum that decodes to
 // exactly 32 bytes, a canonical ssh_host_key_fingerprint when present, and
-// declared_hooks that are unique, named, and carry a 32-byte digest.
+// declared_hooks that are unique, named, and carry a 32-byte digest, each
+// refused with 400. The two advertised inventories, plexd_hooks and
+// builtin_actions, are refused with 422 when an entry breaks one of theirs
+// (see checkPlexdHooks and checkBuiltinActions).
 //
 // Strictness is the point. The fixture used to decode into whatever shape the
 // agent happened to send and count it, so a manifest the real handler refuses
@@ -1115,12 +1123,88 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		seen[h.Name] = struct{}{}
 	}
 
+	// The two inventories fail as 422, not 400: the envelope decoded, but a
+	// value in it breaks an invariant. plexd_hooks is checked first, then
+	// builtin_actions, in the order the contract lists them.
+	if code, detail := checkPlexdHooks(req.PlexdHooks); code != "" {
+		writeProblem(w, r, http.StatusUnprocessableEntity, code, detail)
+		return
+	}
+	if code, detail := checkBuiltinActions(req.BuiltinActions); code != "" {
+		writeProblem(w, r, http.StatusUnprocessableEntity, code, detail)
+		return
+	}
+
 	s.capabilitiesCount.Add(1)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // maxDeclaredHooks is the manifest's per-request declared_hooks ceiling.
 const maxDeclaredHooks = 128
+
+// The manifest's inventory ceilings: entries per inventory, and parameters per
+// builtin action.
+const (
+	maxPlexdHooks              = 128
+	maxBuiltinActions          = 128
+	maxBuiltinActionParameters = 64
+)
+
+// checkPlexdHooks enforces the plexd_hooks invariants and returns the 422
+// problem code and detail of the first violation, or an empty code.
+func checkPlexdHooks(hooks []api.DiscoveredPlexdHook) (code, detail string) {
+	if len(hooks) > maxPlexdHooks {
+		return "plexd_hooks_too_many",
+			fmt.Sprintf("plexd_hooks carries %d entries, at most %d are accepted", len(hooks), maxPlexdHooks)
+	}
+	seen := make(map[string]struct{}, len(hooks))
+	for _, h := range hooks {
+		if strings.TrimSpace(h.Name) == "" || !imageDigestRe.MatchString(h.ImageDigest) || h.TimeoutSeconds < 0 {
+			return "plexd_hook_invalid",
+				"each plexd hook needs a name, a sha256:<64 lowercase hex> image_digest, and a non-negative timeout_seconds"
+		}
+		if _, dup := seen[h.Name]; dup {
+			return "plexd_hook_duplicate", "plexd_hooks names must be unique: " + h.Name
+		}
+		seen[h.Name] = struct{}{}
+	}
+	return "", ""
+}
+
+// checkBuiltinActions enforces the builtin_actions invariants and returns the
+// 422 problem code and detail of the first violation, or an empty code. An
+// action whose parameters are `null` decodes to none and passes.
+func checkBuiltinActions(actions []api.ActionInfo) (code, detail string) {
+	if len(actions) > maxBuiltinActions {
+		return "builtin_actions_too_many",
+			fmt.Sprintf("builtin_actions carries %d entries, at most %d are accepted", len(actions), maxBuiltinActions)
+	}
+	seen := make(map[string]struct{}, len(actions))
+	for _, a := range actions {
+		if strings.TrimSpace(a.Name) == "" {
+			return "builtin_action_invalid", "each builtin action needs a name"
+		}
+		if len(a.Parameters) > maxBuiltinActionParameters {
+			return "builtin_actions_too_many",
+				fmt.Sprintf("builtin action %s declares %d parameters, at most %d are accepted", a.Name, len(a.Parameters), maxBuiltinActionParameters)
+		}
+		params := make(map[string]struct{}, len(a.Parameters))
+		for _, p := range a.Parameters {
+			if strings.TrimSpace(p.Name) == "" {
+				return "builtin_action_invalid", "builtin action " + a.Name + " declares a parameter without a name"
+			}
+			if _, dup := params[p.Name]; dup {
+				return "builtin_action_invalid", "builtin action " + a.Name + " declares parameter " + p.Name + " twice"
+			}
+			params[p.Name] = struct{}{}
+		}
+		if _, dup := seen[a.Name]; dup {
+			return "builtin_action_duplicate", "builtin_actions names must be unique: " + a.Name
+		}
+		seen[a.Name] = struct{}{}
+	}
+	return "", ""
+}
 
 // isBase64Digest reports whether v is a SHA-256 digest in the wire form the
 // manifest carries: exactly 32 bytes, standard-padded base64. Hex is refused —
