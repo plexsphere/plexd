@@ -1227,6 +1227,44 @@ func TestExecutor_HookIntegrityAnchorIsPinned(t *testing.T) {
 	}
 }
 
+// The inventory goes into the capability manifest and out of GET /v1/actions,
+// so its order must not change from one call to the next — and the builtins map
+// ranges in a different order every time. Parameters keep the order they were
+// registered in, which is the order an operator surface presents them in.
+func TestExecutor_CapabilitiesSortedByName(t *testing.T) {
+	exec := newTestExecutor(Config{}, &mockReporter{}, &mockVerifier{ok: true})
+	noop := func(context.Context, map[string]string) (string, string, int, error) {
+		return "", "", 0, nil
+	}
+	for _, name := range []string{"system.info", "config.dump", "service.upgrade", "mesh.reconnect", "diagnostics.collect", "health.check"} {
+		var params []api.ActionParam
+		if name == "service.upgrade" {
+			params = []api.ActionParam{
+				{Name: "version", Type: "string", Required: true},
+				{Name: "checksum", Type: "string", Required: true},
+			}
+		}
+		exec.RegisterBuiltin(name, "the "+name+" builtin", params, noop)
+	}
+	want := []string{"config.dump", "diagnostics.collect", "health.check", "mesh.reconnect", "service.upgrade", "system.info"}
+
+	// One sorted result could be luck of the map order; twenty in a row is not.
+	for range 20 {
+		actions, _ := exec.Capabilities()
+		got := make([]string, len(actions))
+		for i, a := range actions {
+			got[i] = a.Name
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("Capabilities() names = %v, want %v", got, want)
+		}
+		upgrade := actions[4]
+		if len(upgrade.Parameters) != 2 || upgrade.Parameters[0].Name != "version" || upgrade.Parameters[1].Name != "checksum" {
+			t.Fatalf("service.upgrade parameters = %+v, want version then checksum", upgrade.Parameters)
+		}
+	}
+}
+
 func TestExecutor_AckUncodedStatusErrorIsNotRefusal(t *testing.T) {
 	// A 403 from a proxy or WAF and a 409 raised for an unrelated reason carry
 	// no refusal code. Treating them as deliberate refusals would settle the
