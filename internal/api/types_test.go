@@ -1952,3 +1952,107 @@ func TestSessionActivityRequest_K8sRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// Both inventories are optional, and `null` where the contract expects an
+// array fails the decode upstream. An executor with no builtins hands over an
+// empty slice, not nil, so both forms must leave the key off entirely.
+func TestCapabilityManifestRequest_OmitsEmptyInventories(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		req  CapabilityManifestRequest
+	}{
+		{name: "nil", req: CapabilityManifestRequest{BinaryVersion: "v1.2.3"}},
+		{name: "empty", req: CapabilityManifestRequest{
+			BinaryVersion:  "v1.2.3",
+			BuiltinActions: []ActionInfo{},
+			PlexdHooks:     []DiscoveredPlexdHook{},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(tc.req)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var top map[string]json.RawMessage
+			if err := json.Unmarshal(data, &top); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{"builtin_actions", "plexd_hooks"} {
+				if raw, ok := top[key]; ok {
+					t.Errorf("%s = %s, want the key absent", key, raw)
+				}
+			}
+		})
+	}
+
+	digest := "sha256:" + strings.Repeat("ab", 32)
+	data, err := json.Marshal(CapabilityManifestRequest{
+		BinaryVersion:  "v1.2.3",
+		BuiltinActions: []ActionInfo{{Name: "system.info", Description: "Report OS info"}},
+		PlexdHooks:     []DiscoveredPlexdHook{{Name: "nightly", ImageDigest: digest}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(data)
+	if want := `"builtin_actions":[{"name":"system.info","description":"Report OS info"}]`; !strings.Contains(s, want) {
+		t.Errorf("manifest = %s, want it to contain %s", s, want)
+	}
+	if want := `"plexd_hooks":[{"name":"nightly","image_digest":"` + digest + `"}]`; !strings.Contains(s, want) {
+		t.Errorf("manifest = %s, want it to contain %s", s, want)
+	}
+}
+
+// A builtin registered without parameters carries no parameters key rather than
+// `"parameters": null`. The node API's GET /v1/actions shares the struct.
+func TestActionInfo_OmitsNilParameters(t *testing.T) {
+	orig := ActionInfo{Name: "service.restart", Description: "Restart plexd"}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+	if s := string(data); strings.Contains(s, `"parameters"`) {
+		t.Errorf("parameters should be omitted when nil, got: %s", s)
+	}
+
+	orig.Parameters = []ActionParam{{Name: "version", Type: "string", Required: true, Description: "Target version"}}
+	data2, got2 := roundTrip(t, orig)
+	requireEqual(t, orig, got2)
+	if s := string(data2); !strings.Contains(s, `"parameters":[{"name":"version"`) {
+		t.Errorf("parameters should be present when set, got: %s", s)
+	}
+}
+
+// Only name and image_digest are required. The optional members stay off the
+// wire when unset; timeout_seconds in particular never goes out, because the
+// PlexdHook CRD has no field to fill it from.
+func TestDiscoveredPlexdHook_WireShape(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("0f", 32)
+
+	minimal := DiscoveredPlexdHook{Name: "nightly", ImageDigest: digest}
+	data, got := roundTrip(t, minimal)
+	requireEqual(t, minimal, got)
+	if want := `{"name":"nightly","image_digest":"` + digest + `"}`; string(data) != want {
+		t.Errorf("minimal entry = %s, want %s", data, want)
+	}
+
+	full := DiscoveredPlexdHook{
+		Name:           "nightly",
+		ImageDigest:    digest,
+		Parameters:     map[string]string{"retention": "7d"},
+		TimeoutSeconds: 300,
+		Sandbox:        true,
+	}
+	data, got = roundTrip(t, full)
+	requireEqual(t, full, got)
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"name", "image_digest", "parameters", "timeout_seconds", "sandbox"} {
+		if _, ok := top[key]; !ok {
+			t.Errorf("full entry missing key %q: %s", key, data)
+		}
+	}
+	if got := string(top["parameters"]); got != `{"retention":"7d"}` {
+		t.Errorf("parameters = %s, want a string map", got)
+	}
+}
