@@ -212,14 +212,95 @@ peer and PSK changes arrive via the next state pull.
 
 ### PUT /v1/nodes/{node_id}/capabilities
 
-Sent when capabilities change after registration (hooks added/removed, binary updated).
+plexd sends its capability manifest once at boot, after registration. It is not
+re-sent while the agent runs: a hook added, changed, or removed later is reported
+at the next restart.
 
-Request body: Same `capabilities` structure as in `POST /v1/register`.
+**Request body** (`CapabilityManifestRequest`):
 
-| Response | Meaning |
-|---|---|
-| `200 OK` | Capabilities updated |
-| `401 Unauthorized` | Invalid node identity |
+```json
+{
+  "binary_version": "v1.4.2",
+  "binary_checksum": "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg=",
+  "ssh_host_key_fingerprint": "SHA256:6QGz1Q4iE2zG5p2N3oRZb8ZsT4nKqJgY3oZmP8eFvWk=",
+  "declared_hooks": [
+    { "name": "post-install", "checksum": "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg=" }
+  ],
+  "plexd_hooks": [
+    {
+      "name": "nightly-backup",
+      "image_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "parameters": { "retention": "7d" },
+      "sandbox": true
+    }
+  ],
+  "builtin_actions": [
+    {
+      "name": "service.upgrade",
+      "description": "Upgrade plexd to a specified version",
+      "parameters": [
+        { "name": "version", "type": "string", "required": true, "description": "Target version" },
+        { "name": "checksum", "type": "string", "required": true, "description": "Expected SHA-256 checksum" }
+      ]
+    }
+  ]
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `binary_version` | Yes | Agent version, non-empty after trimming |
+| `binary_checksum` | Yes | SHA-256 of the running binary: 32 bytes, standard-padded base64 |
+| `ssh_host_key_fingerprint` | No | `SHA256:<base64>` host-key fingerprint |
+| `declared_hooks` | No | Script hooks from the hooks directory, each a name and a 32-byte base64 payload digest; at most 128, unique names |
+| `plexd_hooks` | No | `PlexdHook` resources discovered at boot in the ServiceAccount's namespace; at most 128, unique names. Absent outside Kubernetes |
+| `builtin_actions` | No | The builtin actions the agent implements, sorted by name; at most 128 actions, at most 64 parameters each |
+
+A `plexd_hooks` entry carries `name`, `image_digest` in canonical
+`sha256:<64 lowercase hex>` form, and optionally `parameters` (a string map),
+`timeout_seconds` (non-negative) and `sandbox`. plexd never sets
+`timeout_seconds`, because the PlexdHook CRD has no timeout field. A
+`builtin_actions` entry carries `name`, `description` and `parameters`; each
+parameter carries `name`, `type`, `required`, `default` and `description`, in
+the order the action registered them. An empty inventory is omitted, never sent
+as `null` or `[]`.
+
+The control plane refuses a manifest whole, binary version and checksum
+included, so plexd sends only entries it knows are valid. A PlexdHook whose image
+is not pinned by a digest is left out with a warning; see
+[PlexdHook CRD](../actions/plexdhook-crd.md#capability-manifest-reporting).
+
+**Responses.** The contract answers `200 OK` with a `CapabilityManifestResponse`
+(`accepted_at`, `fields_changed`, `host_key_changed`); plexd does not read the
+body. Errors are RFC 9457 `application/problem+json` bodies with a
+machine-readable `code`. A structural failure is a `400`; an advertised inventory
+entry that breaks an invariant is a `422`:
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `400 Bad Request` | `malformed_capabilities_request` | Body is not valid JSON or carries an unknown field |
+| `400 Bad Request` | `binary_version_empty` | `binary_version` is missing or blank |
+| `400 Bad Request` | `binary_checksum_invalid` | `binary_checksum` does not decode to 32 bytes |
+| `400 Bad Request` | `ssh_host_key_fingerprint_invalid` | The fingerprint is set but not `SHA256:<base64>` |
+| `400 Bad Request` | `declared_hook_invalid` | A declared hook has an empty name or a checksum that is not 32 bytes |
+| `400 Bad Request` | `declared_hook_duplicate` | Two declared hooks share a name |
+| `400 Bad Request` | `declared_hooks_too_many` | More than 128 declared hooks |
+| `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked |
+| `403 Forbidden` | `node_id_mismatch` | The NSK belongs to a different node than the path |
+| `404 Not Found` | `capabilities_node_not_found` | No node row for the path |
+| `413 Payload Too Large` | `capabilities_body_too_large` | Body exceeds 32 KiB |
+| `422 Unprocessable Entity` | `plexd_hook_invalid` | A `plexd_hooks` entry has an empty name, a non-canonical `image_digest`, or a negative `timeout_seconds` |
+| `422 Unprocessable Entity` | `plexd_hook_duplicate` | Two `plexd_hooks` entries share a name |
+| `422 Unprocessable Entity` | `plexd_hooks_too_many` | More than 128 `plexd_hooks` entries |
+| `422 Unprocessable Entity` | `builtin_action_invalid` | An action has an empty name, or a parameter with an empty or repeated name |
+| `422 Unprocessable Entity` | `builtin_action_duplicate` | Two actions share a name |
+| `422 Unprocessable Entity` | `builtin_actions_too_many` | More than 128 actions, or one action with more than 64 parameters |
+| `500 Internal Server Error` | `internal` | Server error |
+| `501 Not Implemented` | `capabilities_not_provisioned` | The control plane has not wired its capability store yet |
+
+plexd logs a failed report as a warning and carries on. It does not retry the
+report without the inventories: a control plane that refuses them has to be
+upgraded.
 
 ## NAT Endpoint Discovery
 

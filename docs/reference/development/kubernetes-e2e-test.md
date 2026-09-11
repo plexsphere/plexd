@@ -55,13 +55,14 @@ Manifests are applied in dependency order:
 |-------|----------|--------|-------|
 | 1 | Namespace `plexd-e2e` | `kubectl create namespace` | Test-specific namespace |
 | 2 | PlexdNodeState CRD | `deploy/kubernetes/crds/plexdnodestate-crd.yaml` | Cluster-scoped |
-| 3 | PlexdHook CRD | `deploy/kubernetes/crds/plexdhook-crd.yaml` | Cluster-scoped |
-| 4 | ServiceAccount | `deploy/kubernetes/serviceaccount.yaml` | Namespace patched via sed |
-| 5 | RBAC | `deploy/kubernetes/rbac.yaml` | ClusterRoleBinding patched to test namespace |
-| 6 | Bootstrap Secret | `kubectl create secret generic` | Token: `e2e-test-token` |
-| 7 | ConfigMap | `kubectl create configmap` | Inline config pointing to mock-api |
-| 8 | mock-api Deployment + Service | `test/e2e/kubernetes/mock-api-manifests.yaml` | ClusterIP on ports 8080 (HTTP) and 8443 (TLS) |
-| 9 | plexd DaemonSet | `deploy/kubernetes/daemonset.yaml` | Image and namespace patched via sed |
+| 3 | PlexdHook CRD | `deploy/kubernetes/crds/plexdhook-crd.yaml` | Cluster-scoped; the script waits for `Established` |
+| 4 | PlexdHook fixtures | Inline heredoc | `e2e-pinned` (digest-pinned image, two parameters) and `e2e-tagged` (tag-pinned image) for the boot-time discovery; nothing runs them |
+| 5 | ServiceAccount | `deploy/kubernetes/serviceaccount.yaml` | Namespace patched via sed |
+| 6 | RBAC | `deploy/kubernetes/rbac.yaml` | ClusterRoleBinding patched to test namespace |
+| 7 | Bootstrap Secret | `kubectl create secret generic` | Token: `e2e-test-token` |
+| 8 | ConfigMap | `kubectl create configmap` | Inline config pointing to mock-api |
+| 9 | mock-api Deployment + Service | `test/e2e/kubernetes/mock-api-manifests.yaml` | ClusterIP on ports 8080 (HTTP) and 8443 (TLS) |
+| 10 | plexd DaemonSet | `deploy/kubernetes/daemonset.yaml` | Image and namespace patched via sed |
 
 The DaemonSet manifest is patched at apply time using `--dry-run=client -o yaml | sed` to substitute the namespace, image tag, and pull policy.
 
@@ -82,7 +83,7 @@ Uses `GET /test/last-request/{endpoint}` to verify the content of request payloa
 |----------|-----------------|
 | `register` | `token` (non-empty), `hostname` (non-empty) |
 | `heartbeat` | Valid JSON with `timestamp` field |
-| `capabilities` | `builtin_actions` (array with >= 1 entry) |
+| `capabilities` | `binary_version` and a 32-byte `binary_checksum`, no `binary` key, eleven `builtin_actions`, and exactly one `plexd_hooks` entry: `e2e-pinned` with its digest, `sandbox: true`, its two parameters, and no `timeout_seconds` |
 
 ### 8. Periodic loop verification
 

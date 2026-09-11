@@ -264,6 +264,33 @@ func NewHTTPTokenReviewClient(apiServer, saTokenPath string) *HTTPTokenReviewCli
 - Loads cluster CA from `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`
 - TLS minimum version: 1.2
 
+## HookLister
+
+Lists `PlexdHook` resources through the API server for the capability manifest. It is one authenticated GET per call: no watch, no write.
+
+```go
+func NewInClusterHookLister(env *KubernetesEnvironment) (*HookLister, error)
+func (l *HookLister) ListPlexdHooks(ctx context.Context, namespace string) ([]PlexdHook, error)
+```
+
+- Connects to `https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT`; construction fails when either variable is unset
+- Trusts the cluster CA at `DefaultCACertPath`; construction fails when the bundle cannot be read or holds no certificate
+- GETs `/apis/plexd.plexsphere.com/v1alpha1/namespaces/{namespace}/plexdhooks`
+- Reads the service account token from `env.ServiceAccountToken` on every call, because the kubelet rotates it
+- Has no timeout of its own; the caller's context bounds each call
+- TLS minimum version: 1.2
+
+| Response     | Result                                           |
+|--------------|--------------------------------------------------|
+| `200 OK`     | The resources, or an empty slice                 |
+| `401`, `403` | Error wrapping `ErrUnauthorized`                 |
+| `404`        | Error wrapping `ErrNotFound` (CRD not installed) |
+| Other status | Error naming the status                          |
+
+### Boot-time PlexdHook discovery
+
+`plexd up` runs `DefaultDetector.Detect()` before it sends the capability manifest. In a pod it lists the `PlexdHook` resources in the ServiceAccount's namespace once, with a 10-second budget, and reports the digest-pinned ones as `plexd_hooks` (see [PlexdHook CRD](../actions/plexdhook-crd.md#capability-manifest-reporting)). The existing `plexdhooks` `get, list, watch` grant in the `plexd` ClusterRole authorizes the list, so no RBAC change is needed. Outside a cluster the step costs one environment variable check. Inside one, a missing grant, a missing CRD, a timeout, or an unreachable API server logs one warning, and the manifest goes out without `plexd_hooks`. The node boots either way.
+
 ## Kubernetes manifests
 
 All manifests are in `deploy/kubernetes/`.

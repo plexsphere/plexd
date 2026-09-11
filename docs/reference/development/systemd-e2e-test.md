@@ -61,7 +61,7 @@ Uses `GET /test/last-request/{endpoint}` to verify the content of request payloa
 |----------|-----------------|
 | `register` | `token` (non-empty), `hostname` (non-empty) |
 | `heartbeat` | Valid JSON with `timestamp` field |
-| `capabilities` | `binary_version` (non-empty), `binary_checksum` (32-byte base64 digest), and no field the handler rejects as unknown |
+| `capabilities` | `binary_version` (non-empty), `binary_checksum` (32-byte base64 digest), eleven `builtin_actions`; `binary` and `plexd_hooks` absent |
 
 ### 8. Periodic loop verification
 

@@ -44,7 +44,15 @@ gates were added after a release shipped past them:
   and `declared_hooks` that are unique, named, and carry a 32-byte digest. A hex
   digest decodes to 48 bytes and is refused with `binary_checksum_invalid`; a
   gzip-compressed body fails the decode, as it does upstream. The fixture used to
-  decode into whatever shape the agent sent and count it.
+  decode into whatever shape the agent sent and count it. The two advertised
+  inventories are checked after that, `plexd_hooks` first, and a violation is
+  answered `422` with the contract's code: `plexd_hook_invalid` (empty name,
+  non-canonical `image_digest`, negative `timeout_seconds`),
+  `plexd_hook_duplicate`, `plexd_hooks_too_many` (over 128),
+  `builtin_action_invalid` (empty action or parameter name, or a parameter
+  declared twice), `builtin_action_duplicate`, and `builtin_actions_too_many`
+  (over 128 actions, or over 64 parameters on one). An action whose `parameters`
+  is `null` counts as having none.
 - **`POST /v1/nodes/{id}/audit`** admits only the contract's closed source enum,
   `auditd` and `k8s`. The fixture used to also admit `plexd`, so a batch the real
   ingest gate refuses whole with `400 ingest_batch_malformed` was accepted here.

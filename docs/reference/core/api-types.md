@@ -490,12 +490,14 @@ type alias for `[]AuditEntry`
 
 **CapabilityManifestRequest**
 
-| Field                   | Type             | JSON Tag                                | Description                                             |
-|-------------------------|------------------|-----------------------------------------|---------------------------------------------------------|
-| `BinaryVersion`         | `string`         | `"binary_version"`                      | Agent version, non-empty after trimming                 |
-| `BinaryChecksum`        | `string`         | `"binary_checksum"`                     | Running binary's SHA-256: 32 bytes, standard-padded base64 |
-| `SSHHostKeyFingerprint` | `string`         | `"ssh_host_key_fingerprint,omitempty"`  | Optional `SHA256:<base64>` host-key fingerprint         |
-| `DeclaredHooks`         | `[]DeclaredHook` | `"declared_hooks,omitempty"`            | Optional hook declarations, at most 128, unique names   |
+| Field                   | Type                    | JSON Tag                                | Description                                             |
+|-------------------------|-------------------------|-----------------------------------------|---------------------------------------------------------|
+| `BinaryVersion`         | `string`                | `"binary_version"`                      | Agent version, non-empty after trimming                 |
+| `BinaryChecksum`        | `string`                | `"binary_checksum"`                     | Running binary's SHA-256: 32 bytes, standard-padded base64 |
+| `SSHHostKeyFingerprint` | `string`                | `"ssh_host_key_fingerprint,omitempty"`  | Optional `SHA256:<base64>` host-key fingerprint         |
+| `DeclaredHooks`         | `[]DeclaredHook`        | `"declared_hooks,omitempty"`            | Optional hook declarations, at most 128, unique names   |
+| `PlexdHooks`            | `[]DiscoveredPlexdHook` | `"plexd_hooks,omitempty"`               | Optional PlexdHook resources discovered at boot, at most 128, unique names |
+| `BuiltinActions`        | `[]ActionInfo`          | `"builtin_actions,omitempty"`           | Optional builtin action inventory sorted by name, at most 128 actions of at most 64 parameters |
 
 **DeclaredHook**
 
@@ -504,18 +506,33 @@ type alias for `[]AuditEntry`
 | `Name`     | `string` | `"name"`     | Hook identifier, non-empty                         |
 | `Checksum` | `string` | `"checksum"` | Hook payload SHA-256: 32 bytes, standard-padded base64 |
 
+**DiscoveredPlexdHook** — one `PlexdHook` resource as the manifest reports it
+(the contract's `PlexdHook` schema).
+
+| Field            | Type                | JSON Tag                      | Description                                        |
+|------------------|---------------------|-------------------------------|----------------------------------------------------|
+| `Name`           | `string`            | `"name"`                      | Resource name, unique within its namespace         |
+| `ImageDigest`    | `string`            | `"image_digest"`              | Hook image digest, canonical `sha256:<64 lowercase hex>` |
+| `Parameters`     | `map[string]string` | `"parameters,omitempty"`      | The spec's name/value list folded into a map       |
+| `TimeoutSeconds` | `int64`             | `"timeout_seconds,omitempty"` | Execution timeout; never set, because the CRD has no timeout field |
+| `Sandbox`        | `bool`              | `"sandbox,omitempty"`         | `true` unless the hook is privileged               |
+
 The handler decodes this body with `DisallowUnknownFields`, so the manifest
-carries these fields and nothing else. Two consequences are worth stating
+carries these fields and nothing else. Three consequences are worth stating
 outright:
 
 - **The digest is base64, never hex.** Both checksum fields are declared
   `format: byte`, so a hex digest decodes to 48 bytes and is refused with
   `binary_checksum_invalid`. `integrity.WireChecksum` converts the hex form the
   integrity package works in into the wire form.
-- **There is no field for the agent's builtin action list.** An earlier payload
-  sent one under `builtin_actions`, inside a `binary` object the contract also
-  does not define; the whole manifest was rejected. The action inventory is
-  served locally by the node API's `GET /v1/actions`.
+- **One refused entry costs the whole manifest.** An inventory entry that breaks
+  an invariant is answered `422`, and the binary version and checksum are lost
+  with it. plexd therefore sends only entries it knows are valid: at most 128 per
+  inventory, at most 64 parameters per action, unique names, and a canonical
+  image digest on every PlexdHook.
+- **Empty inventories are omitted.** Both inventory fields and
+  `ActionInfo.Parameters` are `omitempty`, so an empty list leaves its key off
+  instead of sending `null` where the contract expects an array.
 
 **BinaryInfo** — the node API's local view of the running binary. The control
 plane receives the same two values as the manifest's flat fields.

@@ -213,6 +213,31 @@ spec:
 
 This creates a non-privileged Job on the target node that runs `df -h /dev/sda1` with environment variables `PLEXD_PARAM_DISK_PATH=/dev/sda1` and `PLEXD_PARAM_THRESHOLD=90`.
 
+## Capability manifest reporting
+
+At boot, plexd lists the `PlexdHook` resources in the namespace its ServiceAccount runs in and reports them to the control plane in the `plexd_hooks` field of its capability manifest. The list runs once, with a 10-second budget. It is not a watch, so a resource created, changed, or deleted later is reported at the next agent restart. The `plexdhooks` `list` grant in the `plexd` ClusterRole authorizes it. Discovery never blocks boot: when the CRD is not installed, the grant is missing, or the API server does not answer, plexd logs one warning and sends the manifest without `plexd_hooks`.
+
+Each reported entry is built from one resource:
+
+| Manifest field    | Source                                                                  |
+|-------------------|-------------------------------------------------------------------------|
+| `name`            | `metadata.name`                                                         |
+| `image_digest`    | The `sha256:<64 lowercase hex>` digest after the last `@` of the image the Job runs |
+| `parameters`      | `spec.parameters` as a name-to-value map; a repeated name keeps the later value |
+| `sandbox`         | `true` unless `spec.privileged` is set, matching the [security context](#security-context) the Job gets |
+| `timeout_seconds` | Never sent: the CRD has no timeout field                                |
+
+**Only digest-pinned images are reported.** The control plane accepts an image digest and nothing else, and plexd has no registry access to resolve a tag. A hook whose image is a tag, such as `alpine:3.19`, or that omits `jobTemplate` and so runs the `busybox:latest` default, stays out of the catalog, and plexd logs a warning naming the hook and its image. Pin the image by digest to have the hook reported:
+
+```yaml
+spec:
+  hookName: disk-check
+  jobTemplate:
+    image: alpine@sha256:<64 lowercase hex>
+```
+
+Entries are sorted by name and capped at 128, the contract's limit; the warning for a larger set names how many were left out. Resources in other namespaces are not listed.
+
 ## See also
 
 - [Kubernetes Deployment Reference](../deployment/kubernetes-deployment.md) — Manifests, RBAC, and DaemonSet configuration
