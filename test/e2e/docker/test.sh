@@ -497,12 +497,29 @@ if [ -z "${EP_REPORTED_AT}" ]; then
 fi
 echo "  PASS: endpoint body reported_at='${EP_REPORTED_AT}'"
 
+# The eleven builtins runUp registers. Phase 3c asserts them in the capability
+# manifest and phase 12b on the node API, so both read this one list.
+ALL_BUILTINS=(
+    "diagnostics.collect"
+    "diagnostics.ping_peer"
+    "diagnostics.traceroute_peer"
+    "service.restart"
+    "service.reload_config"
+    "service.upgrade"
+    "system.info"
+    "health.check"
+    "mesh.reconnect"
+    "config.dump"
+    "logs.snapshot"
+)
+
 # 3c. Capability manifest: the contract's flat envelope. binary_version and
 # binary_checksum are required, the digest is 32 bytes in standard-padded base64
-# (hex decodes to 48 and is refused), and the shape carries nothing else — the
-# handler decodes with DisallowUnknownFields, so a nested `binary` object or a
-# `builtin_actions` list refuses the whole manifest. The agent's action list is
-# asserted where it is actually served, on the node API in phase 12b.
+# (hex decodes to 48 and is refused), and the handler decodes with
+# DisallowUnknownFields, so a nested `binary` object refuses the whole manifest.
+# builtin_actions carries the agent's action inventory: the eleven builtins,
+# sorted by name, each described, with parameters in registration order.
+# plexd_hooks stays off, because this container is not in a cluster.
 CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
 if [ -z "${CAPS_BODY}" ]; then
     fail "no captured capabilities request body"
@@ -519,12 +536,29 @@ CAPS_DIGEST_LEN=$(printf '%s' "${CAPS_CHECKSUM}" | b64_decode | wc -c | tr -d ' 
 if [ "${CAPS_DIGEST_LEN}" != "32" ]; then
     fail "binary_checksum decodes to ${CAPS_DIGEST_LEN} bytes, want 32 (a hex digest decodes to 48)"
 fi
-for absent in builtin_actions binary hooks; do
+for absent in binary hooks; do
     if echo "${CAPS_BODY}" | jq -e --arg k "${absent}" 'has($k)' >/dev/null 2>&1; then
         fail "capability manifest carries '${absent}', which the handler rejects as an unknown field"
     fi
 done
-echo "  PASS: capability manifest is contract-shaped (version=${CAPS_VERSION}, 32-byte digest)"
+if echo "${CAPS_BODY}" | jq -e 'has("plexd_hooks")' >/dev/null 2>&1; then
+    fail "capability manifest carries plexd_hooks, but this container is not in a cluster (body: ${CAPS_BODY})"
+fi
+CAPS_ACTIONS=$(echo "${CAPS_BODY}" | jq -r '[.builtin_actions[]?.name] | join(",")')
+WANT_ACTIONS=$(jq -rn '$ARGS.positional | sort | join(",")' --args "${ALL_BUILTINS[@]}")
+if [ "${CAPS_ACTIONS}" != "${WANT_ACTIONS}" ]; then
+    fail "capability manifest builtin_actions = [${CAPS_ACTIONS}], want the eleven builtins sorted by name [${WANT_ACTIONS}]"
+fi
+CAPS_UNDESCRIBED=$(echo "${CAPS_BODY}" | jq '[.builtin_actions[] | select((.description // "") == "")] | length')
+if [ "${CAPS_UNDESCRIBED}" -ne 0 ]; then
+    fail "capability manifest carries ${CAPS_UNDESCRIBED} builtins without a description"
+fi
+# Parameter order is registration order, which service.upgrade makes visible.
+CAPS_UPGRADE_PARAMS=$(echo "${CAPS_BODY}" | jq -r '[.builtin_actions[] | select(.name == "service.upgrade") | .parameters[]? | "\(.name):\(.required)"] | join(",")')
+if [ "${CAPS_UPGRADE_PARAMS}" != "version:true,checksum:true" ]; then
+    fail "service.upgrade declares parameters [${CAPS_UPGRADE_PARAMS}], want [version:true,checksum:true] in that order"
+fi
+echo "  PASS: capability manifest is contract-shaped (version=${CAPS_VERSION}, 32-byte digest, 11 builtins by name)"
 
 # 3d. Metrics body must be a non-empty JSON array of MetricSample records: every
 # element carries a group inside the wire enum, a non-empty name, a numeric
@@ -2072,10 +2106,8 @@ fi
 echo "  PASS: no platform audit batch was sent"
 
 # 10c. Capability manifest, second look: the same envelope late in the run, plus
-# the optional fields the contract defines. The agent's builtin action list is
-# not part of this body — the contract has no field for it — so the eleven
-# builtins are asserted against the node API in phase 12b, which is what serves
-# them.
+# the optional fields the contract defines. Phase 3c already checked the action
+# inventory; phase 12b checks the same eleven builtins on the node API.
 CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
 if [ -n "${CAPS_BODY}" ]; then
     CAPS_FP=$(echo "${CAPS_BODY}" | jq -r '.ssh_host_key_fingerprint // empty')
@@ -2221,10 +2253,9 @@ else
         fail "GET /v1/state returned invalid response"
     fi
 
-    # 12b. GET /v1/actions -- the agent's builtin action inventory. This is the
-    # only surface that carries it: the capability manifest has no field for an
-    # action list, so what the control plane never learns is asserted here
-    # instead, in full.
+    # 12b. GET /v1/actions -- the agent's builtin action inventory as the node
+    # API serves it locally: the same eleven builtins phase 3c found in the
+    # capability manifest, checked against the shared ALL_BUILTINS list.
     ACTIONS_RESP=$(curl -sf "${NAPI_AUTH[@]}" "${NODE_API_URL}/v1/actions" 2>/dev/null || true)
     if [ -n "${ACTIONS_RESP}" ] && echo "${ACTIONS_RESP}" | jq empty 2>/dev/null; then
         NAPI_ACTION_COUNT=$(echo "${ACTIONS_RESP}" | jq '.builtin_actions | length // 0')
@@ -2234,19 +2265,6 @@ else
             fail "GET /v1/actions returns ${NAPI_ACTION_COUNT} builtins, want exactly 11"
         fi
 
-        ALL_BUILTINS=(
-            "diagnostics.collect"
-            "diagnostics.ping_peer"
-            "diagnostics.traceroute_peer"
-            "service.restart"
-            "service.reload_config"
-            "service.upgrade"
-            "system.info"
-            "health.check"
-            "mesh.reconnect"
-            "config.dump"
-            "logs.snapshot"
-        )
         for expected_action in "${ALL_BUILTINS[@]}"; do
             HAS_ACTION=$(echo "${ACTIONS_RESP}" | jq --arg name "${expected_action}" \
                 '[.builtin_actions[] | select(.name == $name)] | length')

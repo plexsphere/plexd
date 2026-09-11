@@ -185,6 +185,38 @@ kubectl apply -f "${DAEMONSET_DIR}/crds/plexdhook-crd.yaml"
 echo "=== Verifying CRDs ==="
 kubectl get crd plexdnodestates.plexd.plexsphere.com
 kubectl get crd plexdhooks.plexd.plexsphere.com
+kubectl wait --for=condition=Established crd/plexdhooks.plexd.plexsphere.com --timeout=60s
+
+# Two PlexdHooks for the boot-time discovery, created before the DaemonSet so
+# the first manifest already sees them. Only the digest-pinned one can be
+# reported; the tag-pinned one must stay out of plexd_hooks. Nothing runs
+# them: plexd up starts no PlexdHook controller.
+PINNED_HOOK_DIGEST="sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+echo "=== Creating PlexdHook fixtures ==="
+kubectl -n "${NAMESPACE}" apply -f - <<HOOKEOF
+apiVersion: plexd.plexsphere.com/v1alpha1
+kind: PlexdHook
+metadata:
+  name: e2e-pinned
+spec:
+  hookName: e2e-pinned
+  jobTemplate:
+    image: busybox@${PINNED_HOOK_DIGEST}
+  parameters:
+    - name: retention
+      value: 7d
+    - name: target
+      value: /var/backups
+---
+apiVersion: plexd.plexsphere.com/v1alpha1
+kind: PlexdHook
+metadata:
+  name: e2e-tagged
+spec:
+  hookName: e2e-tagged
+  jobTemplate:
+    image: alpine:3.19
+HOOKEOF
 
 echo "=== Applying ServiceAccount ==="
 sed "s/namespace: plexd-system/namespace: ${NAMESPACE}/" "${DAEMONSET_DIR}/serviceaccount.yaml" \
@@ -427,9 +459,12 @@ fi
 echo "  PASS: heartbeat body nat_summary is a JSON object"
 
 # Capability manifest: the contract's flat envelope, with a binary_checksum that
-# decodes to 32 bytes (hex decodes to 48 and is refused) and no field the
-# handler would reject as unknown. The agent's action list is not part of this
-# body — the contract has no field for it; the node API serves it instead.
+# decodes to 32 bytes (hex decodes to 48 and is refused) and no nested `binary`
+# object, which the handler rejects as unknown. It carries both inventories: the
+# eleven builtin actions, and in plexd_hooks the PlexdHooks plexd listed in its
+# namespace at boot. Only the digest-pinned fixture is reportable; the
+# tag-pinned one is dropped, and no timeout_seconds goes out because the CRD has
+# no field for it.
 CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
 if [ -z "${CAPS_BODY}" ]; then
     echo "FAIL: no captured capabilities request body"
@@ -449,12 +484,29 @@ if [ "${CAPS_DIGEST_LEN}" != "32" ]; then
     print_diagnostics
     exit 1
 fi
-if echo "${CAPS_BODY}" | jq -e 'has("builtin_actions") or has("binary")' >/dev/null 2>&1; then
-    echo "FAIL: capability manifest carries a field the handler rejects as unknown (body: ${CAPS_BODY})"
+if echo "${CAPS_BODY}" | jq -e 'has("binary")' >/dev/null 2>&1; then
+    echo "FAIL: capability manifest carries a nested binary object, which the handler rejects as unknown (body: ${CAPS_BODY})"
     print_diagnostics
     exit 1
 fi
-echo "  PASS: capability manifest is contract-shaped (version=${CAPS_VERSION}, 32-byte digest)"
+CAPS_ACTION_COUNT=$(echo "${CAPS_BODY}" | jq '.builtin_actions | length')
+if [ "${CAPS_ACTION_COUNT}" != "11" ]; then
+    echo "FAIL: capability manifest carries ${CAPS_ACTION_COUNT} builtin_actions, want 11 (body: ${CAPS_BODY})"
+    print_diagnostics
+    exit 1
+fi
+if ! echo "${CAPS_BODY}" | jq -e --arg digest "${PINNED_HOOK_DIGEST}" '
+    (.plexd_hooks | length) == 1
+    and .plexd_hooks[0].name == "e2e-pinned"
+    and .plexd_hooks[0].image_digest == $digest
+    and .plexd_hooks[0].sandbox == true
+    and .plexd_hooks[0].parameters == {"retention": "7d", "target": "/var/backups"}
+    and (.plexd_hooks[0] | has("timeout_seconds") | not)' >/dev/null 2>&1; then
+    echo "FAIL: capability manifest plexd_hooks = $(echo "${CAPS_BODY}" | jq -c '.plexd_hooks'), want only e2e-pinned with its digest, sandbox true, its two parameters and no timeout_seconds"
+    print_diagnostics
+    exit 1
+fi
+echo "  PASS: capability manifest is contract-shaped (version=${CAPS_VERSION}, 32-byte digest, 11 builtins, 1 PlexdHook)"
 
 echo "=== Phase 2 PASSED: request body validation ==="
 
@@ -944,8 +996,8 @@ if [ -n "${METRICS_BODY}" ]; then
     esac
 fi
 
-# The capability manifest carries no action list — the contract has no field for
-# one — so the optional fields it does define are what there is to check here.
+# Phase 2 checked the manifest's two inventories, so the optional host-key
+# fingerprint is what is left to check here.
 CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
 if [ -n "${CAPS_BODY}" ]; then
     CAPS_FP=$(echo "${CAPS_BODY}" | jq -r '.ssh_host_key_fingerprint // empty')
