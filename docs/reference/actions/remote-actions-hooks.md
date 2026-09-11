@@ -215,7 +215,7 @@ Logger is tagged with `component=actions`.
 |-------------------|---------------------------------------------------------------------------------|------------------------------------------------------|
 | `RegisterBuiltin` | `(name, description string, params []api.ActionParam, fn BuiltinFunc)`         | Register a built-in action                           |
 | `SetHooks`        | `(hooks []api.HookInfo)`                                                        | Set the discovered hooks snapshot                    |
-| `Capabilities`    | `() ([]api.ActionInfo, []api.HookInfo)`                                         | Return registered builtins and hooks for reporting   |
+| `Capabilities`    | `() ([]api.ActionInfo, []api.HookInfo)`                                         | Return registered builtins, sorted by name, and hooks for reporting |
 | `Execute`         | `(ctx context.Context, nodeID string, entry api.NodeStateExecution) error`      | Main entry point for action execution                |
 | `FailOrphan`      | `(ctx context.Context, nodeID, executionID string)`                             | Report a run lost to an agent restart as `failed`    |
 | `Shutdown`        | `(ctx context.Context)`                                                         | Cancel all running executions, reject new ones       |
@@ -901,15 +901,18 @@ const (
 )
 ```
 
-### CapabilitiesPayload
+### CapabilityManifestRequest
 
-Sent to `PUT /v1/nodes/{node_id}/capabilities`.
+Sent to `PUT /v1/nodes/{node_id}/capabilities` once at boot; see [Capability Announcement](#capability-announcement). Defined in `internal/api/types.go`.
 
 ```go
-type CapabilitiesPayload struct {
-    Binary         *BinaryInfo  `json:"binary,omitempty"`
-    BuiltinActions []ActionInfo `json:"builtin_actions"`
-    Hooks          []HookInfo   `json:"hooks"`
+type CapabilityManifestRequest struct {
+    BinaryVersion         string                `json:"binary_version"`
+    BinaryChecksum        string                `json:"binary_checksum"`
+    SSHHostKeyFingerprint string                `json:"ssh_host_key_fingerprint,omitempty"`
+    DeclaredHooks         []DeclaredHook        `json:"declared_hooks,omitempty"`
+    PlexdHooks            []DiscoveredPlexdHook `json:"plexd_hooks,omitempty"`
+    BuiltinActions        []ActionInfo          `json:"builtin_actions,omitempty"`
 }
 ```
 
@@ -1194,79 +1197,54 @@ on the terminal callback.
 
 ## Capability Announcement
 
-When plexd registers or when its capabilities change (e.g. hooks added/removed, binary updated), it announces its full capability set to the control plane.
-
-### Registration Flow
-
-During `POST /v1/register`, the `capabilities` field is included in the registration payload:
+plexd announces what it can run in the capability manifest it sends to
+`PUT /v1/nodes/{node_id}/capabilities` once at boot, after registration.
+Registration itself carries no capabilities. The manifest is not re-sent while
+the agent runs: a hook added, changed, or removed later is reported at the next
+restart.
 
 ```json
 {
-  "token": "plx_enroll_a8f3c7...",
-  "public_key": "...",
-  "hostname": "web-01",
-  "metadata": { },
-  "capabilities": {
-    "binary": {
-      "version": "1.4.2",
-      "checksum": "sha256:a1b2c3d4e5f6..."
-    },
-    "builtin_actions": [
-      {
-        "name": "diagnostics.collect",
-        "description": "Collect system diagnostics",
-        "parameters": [
-          { "name": "include_network", "type": "bool", "required": false, "default": "true" },
-          { "name": "include_processes", "type": "bool", "required": false, "default": "true" }
-        ]
-      }
-    ],
-    "hooks": [
-      {
-        "name": "backup",
-        "description": "Run incremental backup of application data",
-        "source": "script",
-        "checksum": "sha256:f7e8d9c0b1a2...",
-        "parameters": [
-          { "name": "target", "type": "string", "required": true },
-          { "name": "compress", "type": "bool", "required": false, "default": "true" }
-        ],
-        "timeout": "300s",
-        "sandbox": "namespaced"
-      },
-      {
-        "name": "db-backup",
-        "description": "PostgreSQL backup to S3",
-        "source": "crd",
-        "checksum": "sha256:abc123...",
-        "parameters": [
-          { "name": "bucket", "type": "string", "required": true },
-          { "name": "compress", "type": "bool", "required": false, "default": "true" }
-        ],
-        "timeout": "600s",
-        "privileged": false
-      }
-    ]
-  }
+  "binary_version": "v1.4.2",
+  "binary_checksum": "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg=",
+  "ssh_host_key_fingerprint": "SHA256:6QGz1Q4iE2zG5p2N3oRZb8ZsT4nKqJgY3oZmP8eFvWk=",
+  "declared_hooks": [
+    { "name": "backup", "checksum": "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg=" }
+  ],
+  "plexd_hooks": [
+    {
+      "name": "db-backup",
+      "image_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "parameters": { "bucket": "backups" },
+      "sandbox": true
+    }
+  ],
+  "builtin_actions": [
+    {
+      "name": "diagnostics.collect",
+      "description": "Collect system diagnostics (CPU, memory, disk, network)",
+      "parameters": [
+        { "name": "include_network", "type": "bool", "required": false, "default": "true", "description": "Include network interface info" },
+        { "name": "include_processes", "type": "bool", "required": false, "default": "true", "description": "Include process listing" }
+      ]
+    }
+  ]
 }
 ```
 
-### Runtime Capability Update
-
-```
-PUT /v1/nodes/{node_id}/capabilities
-```
-
-Used when capabilities change after initial registration (e.g. hook files added/removed/modified, `PlexdHook` CRs created/updated/deleted, plexd binary updated). Same `capabilities` payload structure as in the registration request.
-
 ### Data Model
 
-| Type | Fields |
-|---|---|
-| `BinaryInfo` | `version`, `checksum` |
-| `ActionCapability` | `name`, `description`, `parameters[]` |
-| `HookCapability` | `name`, `description`, `source` (`script` or `crd`), `checksum`, `parameters[]`, `timeout`, `sandbox` (script) / `privileged` (crd) |
-| `ParameterDef` | `name`, `type`, `required`, `default`, `description` |
+| Field | Source | Content |
+|---|---|---|
+| `builtin_actions` | `Executor.Capabilities()` | Every registered builtin, sorted by name: `name`, `description`, and `parameters[]` in registration order (`name`, `type`, `required`, `default`, `description`). A builtin without parameters carries no `parameters` key |
+| `declared_hooks` | Hook scripts in `hooks_dir` | `name` and the payload's SHA-256 as 32 bytes of standard-padded base64 |
+| `plexd_hooks` | `PlexdHook` resources in the ServiceAccount's namespace, listed at boot (Kubernetes only) | `name`, `image_digest`, `parameters` map, `sandbox`; see [PlexdHook CRD](plexdhook-crd.md#capability-manifest-reporting) |
+
+The control plane refuses a manifest whole when one entry breaks an invariant,
+so plexd drops an entry it cannot report (a script hook without a usable digest,
+a PlexdHook whose image is not pinned by a digest) with a warning instead of
+sending it. The status codes are listed under
+[API Endpoints](../core/api-endpoints.md#put-v1-nodes-node-id-capabilities).
 
 ## Kubernetes CRD Hooks
 

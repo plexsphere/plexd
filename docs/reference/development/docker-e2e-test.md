@@ -93,7 +93,7 @@ Uses `GET /test/last-request/{endpoint}` to verify the content of request payloa
 |----------|-----------------|
 | `register` | `token` (non-empty), `hostname` (non-empty), `public_key` (non-empty) |
 | `heartbeat` | Valid JSON with `timestamp` field (node_id is in URL path, not body) |
-| `capabilities` | `binary_version` (non-empty), `binary_checksum` (32-byte base64 digest), and no field the handler rejects as unknown |
+| `capabilities` | `binary_version` (non-empty), `binary_checksum` (32-byte base64 digest), `builtin_actions` equal to the eleven builtins sorted by name, each with a description, `service.upgrade` declaring `version` then `checksum` as required; `plexd_hooks`, `binary`, and `hooks` absent |
 | `metrics` | Array with >= 1 data point |
 
 ### Phase 3: Periodic Loop Verification
