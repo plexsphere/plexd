@@ -10,6 +10,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +29,7 @@ import (
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/health"
 	"github.com/plexsphere/plexd/internal/integrity"
+	"github.com/plexsphere/plexd/internal/kubernetes"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/nat"
@@ -634,16 +637,23 @@ func runAgent(ctx context.Context) error {
 
 	// Report the capability manifest to the control plane. The manifest carries
 	// the binary version and digest, the SSH host-key fingerprint the integrity
-	// correlator watches for rotation, and the declared hooks. The builtin
-	// action list is deliberately not sent: the contract has no field for it and
-	// the handler rejects unknown ones, so an action list on the wire refuses
-	// the whole manifest. `plexd actions` reads it from the node API instead.
-	_, capsHooks := executor.Capabilities()
+	// correlator watches for rotation, the declared hooks, and two inventories.
+	// builtin_actions is the executor's name-sorted action list, sent whole: the
+	// builtins registered above sit far below the contract's 128-action and
+	// 64-parameter caps. plexd_hooks carries the PlexdHook resources a pod finds
+	// in its ServiceAccount's namespace, listed once here and never watched.
+	// Outside a cluster that costs one environment lookup, and a failed list only
+	// leaves the key off.
+	kubeEnv := (&kubernetes.DefaultDetector{Logger: logger}).Detect()
+	plexdHooks := discoverPlexdHooks(ctx, kubeEnv, newInClusterHookLister, logger)
+	capsActions, capsHooks := executor.Capabilities()
 	caps := api.CapabilityManifestRequest{
 		BinaryVersion:         buildVersion,
 		BinaryChecksum:        wireChecksum,
 		SSHHostKeyFingerprint: tunnel.HostKeyFingerprint(hostKey),
 		DeclaredHooks:         declaredHooks(capsHooks, logger),
+		PlexdHooks:            discoveredPlexdHooks(plexdHooks, logger),
+		BuiltinActions:        capsActions,
 	}
 	if err := client.UpdateCapabilities(ctx, identity.NodeID, caps); err != nil {
 		logger.Warn("capabilities report failed", "error", err)
@@ -1367,6 +1377,133 @@ func declaredHooks(hooks []api.HookInfo, logger *slog.Logger) []api.DeclaredHook
 	}
 	if len(out) == 0 {
 		return nil
+	}
+	return out
+}
+
+// plexdHookDiscoveryTimeout bounds the boot-time PlexdHook list, so an API
+// server that does not answer holds the capability manifest back by at most
+// this long.
+const plexdHookDiscoveryTimeout = 10 * time.Second
+
+// maxPlexdHooks is the manifest's plexd_hooks ceiling. A manifest carrying more
+// is refused whole with 422 plexd_hooks_too_many.
+const maxPlexdHooks = 128
+
+// imageDigestRe matches the one image digest form the contract accepts in a
+// plexd_hooks entry.
+var imageDigestRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// plexdHookLister lists the PlexdHook resources in one namespace;
+// kubernetes.HookLister is the production implementation.
+type plexdHookLister interface {
+	ListPlexdHooks(ctx context.Context, namespace string) ([]kubernetes.PlexdHook, error)
+}
+
+// newInClusterHookLister adapts kubernetes.NewInClusterHookLister to the
+// constructor discoverPlexdHooks takes.
+func newInClusterHookLister(env *kubernetes.KubernetesEnvironment) (plexdHookLister, error) {
+	lister, err := kubernetes.NewInClusterHookLister(env)
+	if err != nil {
+		return nil, err
+	}
+	return lister, nil
+}
+
+// discoverPlexdHooks lists the PlexdHook resources in the namespace the pod's
+// ServiceAccount runs in: one list at boot, never a watch, so a hook created
+// later appears at the next restart. Outside a cluster it returns nil without a
+// word. Inside one, every failure (no namespace, no lister, a list refused for
+// want of RBAC or a CRD, or one that outlives its budget) logs one warning and
+// returns nil: the manifest goes out without plexd_hooks and boot carries on.
+func discoverPlexdHooks(ctx context.Context, env *kubernetes.KubernetesEnvironment, newLister func(*kubernetes.KubernetesEnvironment) (plexdHookLister, error), logger *slog.Logger) []kubernetes.PlexdHook {
+	if env == nil || !env.InCluster {
+		return nil
+	}
+	namespace := strings.TrimSpace(env.Namespace)
+	if namespace == "" {
+		logger.Warn("plexd hook discovery skipped: the ServiceAccount namespace is empty")
+		return nil
+	}
+	lister, err := newLister(env)
+	if err != nil {
+		logger.Warn("plexd hook discovery skipped", "error", err)
+		return nil
+	}
+
+	listCtx, cancel := context.WithTimeout(ctx, plexdHookDiscoveryTimeout)
+	defer cancel()
+	hooks, err := lister.ListPlexdHooks(listCtx, namespace)
+	if err != nil {
+		logger.Warn("plexd hook discovery failed", "namespace", namespace, "error", err)
+		return nil
+	}
+	return hooks
+}
+
+// discoveredPlexdHooks converts listed PlexdHook resources into the manifest's
+// plexd_hooks entries. Like declaredHooks it drops what it cannot report, with a
+// warning, because one entry the control plane refuses costs the whole
+// manifest.
+//
+//   - image_digest is the digest after the last `@` of the image the controller
+//     runs for the hook. plexd has no registry access to resolve a tag, so a hook
+//     whose image is not pinned by a canonical sha256 digest (the busybox:latest
+//     default included) is dropped.
+//   - parameters folds the spec's name/value list into a map; a repeated name
+//     keeps the later value.
+//   - sandbox mirrors the controller, which runs every hook that is not
+//     privileged with a read-only root filesystem and all capabilities dropped.
+//   - timeout_seconds stays unset: the CRD has no field to fill it from.
+//
+// Resource names are unique within the one namespace listed, so entries cannot
+// collide. They are sorted by name and capped at maxPlexdHooks. Nothing to
+// report returns nil, so the key stays off the wire.
+func discoveredPlexdHooks(hooks []kubernetes.PlexdHook, logger *slog.Logger) []api.DiscoveredPlexdHook {
+	if len(hooks) == 0 {
+		return nil
+	}
+	out := make([]api.DiscoveredPlexdHook, 0, len(hooks))
+	for _, h := range hooks {
+		image := h.Spec.Image()
+		digest := ""
+		if at := strings.LastIndex(image, "@"); at >= 0 {
+			digest = image[at+1:]
+		}
+		if !imageDigestRe.MatchString(digest) {
+			logger.Warn("plexd hook omitted from the capability manifest",
+				"hook", h.Name, "image", image, "reason", "image is not pinned by a sha256 digest")
+			continue
+		}
+
+		var params map[string]string
+		for _, p := range h.Spec.Parameters {
+			if params == nil {
+				params = make(map[string]string, len(h.Spec.Parameters))
+			}
+			if _, repeated := params[p.Name]; repeated {
+				logger.Warn("plexd hook parameter repeated; the later value is reported",
+					"hook", h.Name, "parameter", p.Name)
+			}
+			params[p.Name] = p.Value
+		}
+
+		out = append(out, api.DiscoveredPlexdHook{
+			Name:        h.Name,
+			ImageDigest: digest,
+			Parameters:  params,
+			Sandbox:     !h.Spec.Privileged,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	if len(out) > maxPlexdHooks {
+		logger.Warn("plexd hooks beyond the capability manifest cap omitted",
+			"cap", maxPlexdHooks, "dropped", len(out)-maxPlexdHooks)
+		out = out[:maxPlexdHooks]
 	}
 	return out
 }
