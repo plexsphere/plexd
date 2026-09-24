@@ -682,35 +682,51 @@ pull, so a consumer must tolerate re-observing the same `SessionID`.
 | `SessionKindK8s`  | `k8s` | Mediates a Kubernetes API session; `Target.K8s` is set |
 | `SessionKindTCP`  | `tcp` | Mediates a plain TCP forward; `Target.TCP` is set  |
 
-Only `tcp` entries are provisionable by this agent; `ssh` and `k8s` entries are
-decoded and settled as unsupported. See
+This agent provisions `tcp` entries, and `ssh` entries on Linux; `k8s` entries,
+and `ssh` entries on macOS and Windows, are decoded and settled as unsupported.
+See
 [Secure Access Tunneling](../networking/secure-access-tunneling.md) for how plexd
 consumes the block.
 
 ### `POST /v1/nodes/{node_id}/sessions/{session_id}`
 
 A one-of session activity record: exactly one of `ssh`, `k8s`, or `tcp` is set,
-selecting the session kind. plexd's tunnel subsystem is an opaque TCP forwarder,
-so it emits only `tcp` rows; the `ssh` and `k8s` variants are carried by the type
-and accepted by the server but not emitted by any current session type. Success
-is `204 No Content`.
+selecting the session kind. plexd emits `tcp` rows for tcp sessions and `ssh` rows
+for ssh sessions; the `k8s` variant is carried by the type and accepted by the
+server but not emitted. Success is `204 No Content`.
 
 **SessionActivityRequest**
 
 | Field | Type           | JSON Tag          | Description                     |
 |-------|----------------|-------------------|---------------------------------|
-| `SSH` | `*SSHActivity` | `"ssh,omitempty"` | Per-command SSH session row      |
+| `SSH` | `*SSHActivity` | `"ssh,omitempty"` | SSH session lifecycle or command row |
 | `K8s` | `*K8sActivity` | `"k8s,omitempty"` | Per-request Kubernetes API row   |
 | `TCP` | `*TCPActivity` | `"tcp,omitempty"` | TCP session lifecycle row        |
 
 **SSHActivity**
 
-| Field         | Type         | JSON Tag                  | Description                            |
-|---------------|--------------|---------------------------|----------------------------------------|
-| `Command`     | `string`     | `"command"`               | Executed command line (capped at 1 KiB)|
-| `ExitCode`    | `*int`       | `"exit_code,omitempty"`   | Command exit code                      |
-| `StartedAt`   | `*time.Time` | `"started_at,omitempty"`  | RFC 3339 start time                    |
-| `CompletedAt` | `*time.Time` | `"completed_at,omitempty"`| RFC 3339 completion time               |
+A row takes one of two shapes. A command row carries `command`, optionally with
+`exit_code`, `started_at` and `completed_at`. A lifecycle row carries `phase`
+plus `listener_endpoint` on `session_started` or `terminated_by` on
+`session_ended`, and no command fields. plexd never posts an empty `command`: the
+server refuses a row that mixes the shapes.
+
+| Field              | Type         | JSON Tag                         | Description                            |
+|--------------------|--------------|----------------------------------|----------------------------------------|
+| `Command`          | `string`     | `"command,omitempty"`            | Command line of an `exec` (1 to 1024 bytes); command rows only |
+| `ExitCode`         | `*int`       | `"exit_code,omitempty"`          | Command exit code, on the row posted after the command exited |
+| `StartedAt`        | `*time.Time` | `"started_at,omitempty"`         | RFC 3339 start time (UTC)              |
+| `CompletedAt`      | `*time.Time` | `"completed_at,omitempty"`       | RFC 3339 completion time (UTC)         |
+| `Phase`            | `string`     | `"phase,omitempty"`              | One of the `SSHPhase*` values; lifecycle rows only |
+| `ListenerEndpoint` | `string`     | `"listener_endpoint,omitempty"`  | Address the ssh listener bound; `session_started` rows only |
+| `TerminatedBy`     | `string`     | `"terminated_by,omitempty"`      | One of the `TerminatedBy*` values; `session_ended` rows only |
+
+**SSHPhase constants**
+
+| Constant                 | Value             | Description                           |
+|--------------------------|-------------------|---------------------------------------|
+| `SSHPhaseSessionStarted` | `session_started` | The listener of an SSH session is up  |
+| `SSHPhaseSessionEnded`   | `session_ended`   | Close of an SSH session               |
 
 **K8sActivity**
 
@@ -743,6 +759,8 @@ is `204 No Content`.
 | `TCPPhaseSessionEnded`   | `session_ended`   | Close of a TCP session       |
 
 **TerminatedBy constants**
+
+Shared by the `session_ended` rows of both kinds.
 
 | Constant                     | Value            | Description                                   |
 |------------------------------|------------------|-----------------------------------------------|

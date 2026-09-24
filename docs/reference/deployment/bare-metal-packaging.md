@@ -53,6 +53,8 @@ Produces a complete systemd unit file. Calls `cfg.ApplyDefaults()` before genera
 | `[Unit]`    | `Description`            | `plexd node agent`                       | Service description                          |
 |             | `After`                  | `network-online.target`                  | Start after network is available             |
 |             | `Wants`                  | `network-online.target`                  | Declare network dependency                   |
+|             | `Wants`                  | `plexd-session-helper.socket`            | Start the session helper socket with plexd   |
+|             | `After`                  | `plexd-session-helper.socket`            | Listen on the helper socket before plexd dials it |
 |             | `StartLimitBurst`        | `5`                                      | Max restart attempts in interval             |
 |             | `StartLimitIntervalSec`  | `60`                                     | Crash loop protection window (seconds)       |
 | `[Service]` | `Type`                   | `simple`                                 | Process type                                 |
@@ -67,6 +69,91 @@ Produces a complete systemd unit file. Calls `cfg.ApplyDefaults()` before genera
 |             | `ProtectHome`            | `true`                                   | Make /home, /root, /run/user inaccessible    |
 |             | `ReadWritePaths`         | `{DataDir} {RunDir}`                     | Allow writes to data and runtime dirs        |
 | `[Install]` | `WantedBy`               | `multi-user.target`                      | Enable at boot in multi-user mode            |
+|             | `Also`                   | `plexd-session-helper.socket`            | Enabling or disabling plexd does the same to the socket |
+
+`systemctl enable --now plexd` therefore enables the helper socket and starts it
+with plexd. The sandbox directives stay: the session helper is what runs outside
+them.
+
+## Session helper units
+
+```go
+func GenerateSessionHelperSocketUnit() string
+func GenerateSessionHelperServiceUnit(cfg InstallConfig) string
+```
+
+The session helper starts the processes of mediated ssh sessions outside plexd's
+sandbox (see [SSH Sessions](../networking/secure-access-tunneling.md#session-helper)).
+The socket unit, `plexd-session-helper.socket`, is root-only, and `Accept=yes`
+starts one helper instance per connection:
+
+```ini
+[Unit]
+Description=plexd session helper socket
+
+[Socket]
+ListenStream=/run/plexd-session-helper.sock
+SocketMode=0600
+SocketUser=root
+SocketGroup=root
+Accept=yes
+MaxConnections=512
+TriggerLimitIntervalSec=0
+
+[Install]
+WantedBy=sockets.target
+```
+
+systemd's defaults for `Accept=yes` sockets would let one session holder break
+ssh sessions for the whole node. `MaxConnections=64` is below the 400 processes
+plexd's defaults allow (10 sessions of 4 connections of 10 channels), and more
+than 200 connections in 2 s would put the socket in a failed state until an
+operator restarts it. The unit raises `MaxConnections` above plexd's own bound,
+which is what limits the helpers, and turns the trigger limit off.
+
+The template each connection instantiates, `plexd-session-helper@.service`, calls
+`cfg.ApplyDefaults()` for `{BinaryPath}` and `{ConfigDir}`:
+
+```ini
+[Unit]
+Description=plexd session helper (one mediated ssh process)
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+ExecStart={BinaryPath} session-helper --config {ConfigDir}/config.yaml
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+KillMode=control-group
+```
+
+It carries no sandbox directives on purpose: it exists to run outside plexd's
+sandbox, where a shell can become the login user, and its guard is the helper's
+own check of the session token against a key plexd cannot write.
+`KillMode=control-group` takes down whatever a session left behind.
+`deploy/systemd/` ships all three units byte-identical to the generators' output
+for the Linux defaults, which a unit test keeps true.
+
+### plexd session-helper
+
+A hidden command that serves one request of the helper protocol on fd 3 and
+exits 0, or 1 on an error. It is not run by hand, and runs in one of two modes:
+
+| Mode | When | Signing key |
+|------|------|-------------|
+| Socket | `LISTEN_PID` is its pid and `LISTEN_FDS` is `1` (systemd `Accept=yes`), without `--child` | `tunnel.session_signing_public_key` from `--config`, else the key pinned at `session-signing-key` beside the config file, written from `identity.json` on the first run |
+| Child | `--child`, when plexd starts it because the socket does not exist | Every `--trusted-key` (standard base64); no config is read and nothing is pinned |
+
+`--trusted-key` in socket mode, `--child` without `--trusted-key`, and a run that
+is neither socket-activated nor `--child` (or both) are refused. The socket mode
+unsets `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES` before it starts anything.
+Resolving the key fails on a malformed pin
+(`session helper: pinned key <path> is malformed`), on an unregistered node when
+no pin exists yet (`session helper: node is not registered; no signing key to
+pin`), and on any other error reading the pin
+(`session helper: read pinned key <path>`); the helper then answers nothing and
+the client's login gets a launch error.
 
 ## GenerateLaunchdPlist
 
@@ -203,8 +290,8 @@ type ServiceManager interface {
 | `Name`       | `systemd`                                   | `launchd`                                                 | `service control manager`                            |
 | `Available`  | `systemctl` on `PATH`                       | `launchctl` on `PATH`                                     | the SCM accepts a connection                         |
 | `Registered` | the unit file exists                        | the plist exists                                          | `OpenService` finds the service                      |
-| `Register`   | write the unit file, `systemctl daemon-reload` | write the plist and the newsyslog rule                 | `CreateService` or `UpdateConfig`, recovery actions, Event Log source |
-| `Unregister` | `systemctl stop`, `disable`, remove the unit file, `daemon-reload` | `launchctl bootout`, remove the plist and the newsyslog rule | stop, `Delete`, remove the Event Log source |
+| `Register`   | write `plexd.service` and the two session helper units beside it, `systemctl daemon-reload` | write the plist and the newsyslog rule | `CreateService` or `UpdateConfig`, recovery actions, Event Log source |
+| `Unregister` | `systemctl stop` and `disable` for plexd and `plexd-session-helper.socket`, remove the three unit files, `daemon-reload` | `launchctl bootout`, remove the plist and the newsyslog rule | stop, `Delete`, remove the Event Log source |
 | `Start`      | `systemctl start`                           | `launchctl bootstrap system <plist>`                      | `Service.Start`                                      |
 | `Stop`       | `systemctl stop`                            | `launchctl bootout` when loaded                           | `Service.Control(svc.Stop)`, then poll for `Stopped` |
 | `Restart`    | `systemctl restart`                         | `launchctl kickstart -k`                                  | a detached `Restart-Service`                         |
@@ -257,6 +344,10 @@ Linux:
 | `/var/lib/plexd/`                         | 0700       | Install    | Data directory           |
 | `/var/run/plexd/`                         | 0755       | Install    | Runtime directory        |
 | `/etc/systemd/system/plexd.service`       | 0644       | Install    | Systemd unit file        |
+| `/etc/systemd/system/plexd-session-helper.socket` | 0644 | Install | Session helper socket unit |
+| `/etc/systemd/system/plexd-session-helper@.service` | 0644 | Install | Session helper service template |
+| `/run/plexd-session-helper.sock`          | 0600       | systemd    | Session helper socket, root only |
+| `/etc/plexd/session-signing-key`          | 0644       | Session helper | The pinned signing key ssh session tokens verify against; written on the helper's first run when `tunnel.session_signing_public_key` is unset |
 
 The daemon's own output goes to journald.
 

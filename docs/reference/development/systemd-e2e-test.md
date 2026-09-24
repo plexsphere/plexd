@@ -47,7 +47,7 @@ Creates a Docker bridge network and starts both containers on it. The systemd co
 
 ### 5. Service installation
 
-Copies the plexd binary and the production `deploy/systemd/plexd.service` unit file into the systemd container. Writes `config.yaml` pointing at the mock-api container and an environment file with the bootstrap token. Runs `systemctl daemon-reload` and `systemctl enable --now plexd`.
+Copies the plexd binary, the production `deploy/systemd/plexd.service` unit file and the two session helper units (`plexd-session-helper.socket`, `plexd-session-helper@.service`) into the systemd container. Writes `config.yaml` pointing at the mock-api container and an environment file with the bootstrap token. Runs `systemctl daemon-reload` and `systemctl enable --now plexd`, then checks that `systemctl is-active plexd-session-helper.socket` prints `active`: `plexd.service` wants the socket and names it in `Also=`.
 
 ### 6. Assertion polling
 
@@ -75,11 +75,22 @@ The `ProcessSource` uses `sync.Once` to emit a single `process_start` audit entr
 
 Polls `GET /test/assertions` until `local_metrics_count`, `local_logs_count`, and `local_audit_count` are all >= 1 (timeout: 60s). Validates that the local endpoint credential chain works with systemd: NSK from registration → secret fetch → AES-256-GCM decryption → Bearer token → HTTPS POST to `plexd-e2e-mockapi:8443`.
 
-### 11. Shutdown verification
+### 11. Mediated ssh session
+
+Drives a mediated ssh session through the sessions block, the socket-activated session helper and a real OpenSSH client. The listener binds the mesh address the mock assigns, `10.99.0.1`, so the client runs inside the container (`docker exec … sshpass -e ssh`), and the phase relies on WireGuard coming up in the privileged container. The image carries `openssh-client`, `sshpass` and an unprivileged user `e2e`. Each login uses `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1`; the last option makes a refused token end ssh with `255` instead of sshpass giving up on a second prompt. Tokens come from `POST /test/session-token`.
+
+1. Configures an `ssh` entry for `root` and waits up to 60 s for a `session_started` row whose `listener_endpoint` starts with `10.99.0.1:`; without one it prints `journalctl -u plexd` and fails.
+2. Runs `id -un` as `root` and expects `root`, then a last session activity body with `ssh.command == "id -un"` and `ssh.exit_code == 0`.
+3. Checks that `/etc/plexd/session-signing-key` has mode `644` and holds `signing_public_key` from `identity.json`, the key the helper pinned on its first run.
+4. Adds an entry for `e2e`, waits for its own `session_started` row, and expects `id -un` to print `e2e`, which proves the helper switched uid.
+5. Expects `exit 3` to exit `3`, and a token minted for another session id to end with `255` and `Permission denied`.
+6. Drains the block and waits for `session_activity_rejected_count` to rise by 2: both `session_ended` rows post for sessions the mock already holds as revoked, as the tcp drain does in the docker suite. The last body is an ssh `session_ended` row with `terminated_by` `plexd_close`.
+
+### 12. Shutdown verification
 
 Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged.
 
-### 12. Cleanup
+### 13. Cleanup
 
 The `cleanup` function runs on `EXIT` trap (both success and failure). It prints diagnostics on failure, then removes both containers and the Docker network.
 
@@ -241,6 +252,7 @@ On any failure, the `print_diagnostics` function outputs:
 | `docker logs plexd-e2e-mockapi` | Mock API server logs |
 | `systemctl status plexd` | Service state and recent log lines |
 | `journalctl -u plexd -n 100` | Recent plexd service logs |
+| `journalctl -u 'plexd-session-helper@*' -n 100` | Recent session helper logs |
 | `journalctl -n 50` | Recent system-wide journal entries |
 | `ps aux` | Process list inside systemd container |
 | `ls -la /etc/plexd/` | Configuration files |
@@ -256,6 +268,7 @@ On any failure, the `print_diagnostics` function outputs:
 | `test/e2e/mockapi/Dockerfile` | Mock API image |
 | `test/e2e/mockapi/mockapi.go` | Mock API server with `/test/assertions` endpoint |
 | `deploy/systemd/plexd.service` | Production unit file (copied verbatim into container) |
+| `deploy/systemd/plexd-session-helper.socket`, `deploy/systemd/plexd-session-helper@.service` | Session helper units (copied verbatim into container) |
 | `Makefile` | `test-e2e-systemd` target |
 
 ## See also

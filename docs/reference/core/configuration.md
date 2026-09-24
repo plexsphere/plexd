@@ -395,6 +395,8 @@ Secure tunnel access for services. See [Secure Access Tunneling](../networking/s
 | `default_timeout` | duration | `30m` | Default session timeout |
 | `ssh_listen_addr` | string | — | SSH server listen address. If empty, the SSH server is not started. |
 | `host_key_dir` | string | — | Directory for the host key (defaults to `data_dir`) |
+| `ssh_sessions_enabled` | bool | `true` | Serve mediated `ssh` sessions (Linux only). `false` settles `ssh` entries with a warning while `tcp` sessions keep working. See [SSH Sessions](../networking/secure-access-tunneling.md#ssh-sessions) |
+| `session_signing_public_key` | string | — | Standard-base64 Ed25519 key the session helper verifies ssh session tokens against. It wins over the key the helper pins from `identity.json` into `/etc/plexd/session-signing-key` on its first run; set it after a Domain signing-key rotation. A malformed value fails validation even with `enabled: false`. See [Trust anchor](../networking/secure-access-tunneling.md#trust-anchor) |
 
 Source: `internal/tunnel/config.go`
 
@@ -571,6 +573,8 @@ tunnel:
   default_timeout: 30m
   # ssh_listen_addr: ""       # empty = SSH server not started
   # host_key_dir: ""         # defaults to data_dir
+  # ssh_sessions_enabled: true         # false refuses mediated ssh sessions (Linux)
+  # session_signing_public_key: ""     # empty = the session helper pins identity.json's key
 
 # bridge:                    # uncomment for bridge mode
 #   enabled: true
