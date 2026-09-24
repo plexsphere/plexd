@@ -1924,6 +1924,43 @@ func TestSessionActivityRequest_SSHRoundTrip(t *testing.T) {
 	}
 }
 
+// An ssh lifecycle row carries its phase and exactly one of listener_endpoint
+// and terminated_by. The command fields are omitted rather than sent empty: the
+// control plane refuses a row that carries both shapes as mixed.
+func TestSSHActivity_LifecycleRowMarshal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  SSHActivity
+		want string
+	}{
+		{
+			name: "session_started",
+			row:  SSHActivity{Phase: SSHPhaseSessionStarted, ListenerEndpoint: "10.99.0.1:40000"},
+			want: `{"phase":"session_started","listener_endpoint":"10.99.0.1:40000"}`,
+		},
+		{
+			name: "session_ended",
+			row:  SSHActivity{Phase: SSHPhaseSessionEnded, TerminatedBy: TerminatedByIdleTimeout},
+			want: `{"phase":"session_ended","terminated_by":"idle_timeout"}`,
+		},
+		{
+			name: "command row omits the lifecycle fields",
+			row:  SSHActivity{Command: "uptime"},
+			want: `{"command":"uptime"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(tc.row)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(data) != tc.want {
+				t.Errorf("marshal = %s, want %s", data, tc.want)
+			}
+		})
+	}
+}
+
 func TestSessionActivityRequest_K8sRoundTrip(t *testing.T) {
 	orig := SessionActivityRequest{
 		K8s: &K8sActivity{

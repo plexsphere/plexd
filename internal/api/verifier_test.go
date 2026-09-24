@@ -165,6 +165,46 @@ func TestEd25519Verifier_Rotation(t *testing.T) {
 	})
 }
 
+func TestEd25519Verifier_TrustedKeys(t *testing.T) {
+	oldPub, _ := generateKey(t)
+	newPub, _ := generateKey(t)
+
+	v := NewEd25519Verifier("kid-old", oldPub)
+	now := time.Now()
+
+	if got := v.TrustedKeys(now); len(got) != 1 || !got[0].Equal(oldPub) {
+		t.Fatalf("TrustedKeys before rotation = %d keys, want only the current key", len(got))
+	}
+
+	transition := now.Add(time.Hour)
+	if err := v.Rotate(SigningKeyRotation{
+		KeyID:             "kid-new",
+		PublicKey:         base64.StdEncoding.EncodeToString(newPub),
+		PreviousKeyID:     "kid-old",
+		TransitionExpires: transition,
+	}); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+
+	inside := v.TrustedKeys(now)
+	if len(inside) != 2 || !inside[0].Equal(newPub) || !inside[1].Equal(oldPub) {
+		t.Fatalf("TrustedKeys inside the window = %d keys, want the current and the previous key", len(inside))
+	}
+
+	// The slice is the caller's: overwriting it must not reach the verifier.
+	inside[0] = oldPub
+	if got := v.TrustedKeys(now); !got[0].Equal(newPub) {
+		t.Error("mutating the returned slice changed the verifier's current key")
+	}
+
+	for _, at := range []time.Time{transition, transition.Add(time.Second)} {
+		after := v.TrustedKeys(at)
+		if len(after) != 1 || !after[0].Equal(newPub) {
+			t.Errorf("TrustedKeys at %v = %d keys, want only the current key", at.Sub(now), len(after))
+		}
+	}
+}
+
 func TestEd25519Verifier_RotateErrors(t *testing.T) {
 	oldPub, oldPriv := generateKey(t)
 	newPub, _ := generateKey(t)
