@@ -2,6 +2,8 @@
 Description=plexd node agent
 After=network-online.target
 Wants=network-online.target
+Wants=plexd-session-helper.socket
+After=plexd-session-helper.socket
 StartLimitBurst=5
 StartLimitIntervalSec=60
 
@@ -20,3 +22,4 @@ ReadWritePaths=/var/lib/plexd /var/run/plexd
 
 [Install]
 WantedBy=multi-user.target
+Also=plexd-session-helper.socket

@@ -115,6 +115,18 @@ func (m *systemdManager) Register(cfg InstallConfig) error {
 	}
 	m.logger.Info("unit file written", "path", cfg.UnitFilePath)
 
+	unitDir := filepath.Dir(cfg.UnitFilePath)
+	for _, unit := range []struct{ name, content string }{
+		{SessionHelperSocketUnitName, GenerateSessionHelperSocketUnit()},
+		{SessionHelperServiceUnitName, GenerateSessionHelperServiceUnit(cfg)},
+	} {
+		unitPath := filepath.Join(unitDir, unit.name)
+		if err := os.WriteFile(unitPath, []byte(unit.content), 0o644); err != nil {
+			return fmt.Errorf("packaging: write unit file: %w", err)
+		}
+		m.logger.Info("unit file written", "path", unitPath)
+	}
+
 	if err := m.ctl.DaemonReload(); err != nil {
 		return fmt.Errorf("packaging: daemon-reload: %w", err)
 	}
@@ -131,11 +143,24 @@ func (m *systemdManager) Unregister(cfg InstallConfig) error {
 	if err := m.ctl.Disable(cfg.ServiceName); err != nil {
 		m.logger.Info("disable service", "error", err)
 	}
-
-	if err := os.Remove(cfg.UnitFilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("packaging: remove unit file: %w", err)
+	if err := m.ctl.Stop(SessionHelperSocketUnitName); err != nil {
+		m.logger.Info("stop session helper socket", "error", err)
 	}
-	m.logger.Info("unit file removed", "path", cfg.UnitFilePath)
+	if err := m.ctl.Disable(SessionHelperSocketUnitName); err != nil {
+		m.logger.Info("disable session helper socket", "error", err)
+	}
+
+	unitDir := filepath.Dir(cfg.UnitFilePath)
+	for _, unitPath := range []string{
+		cfg.UnitFilePath,
+		filepath.Join(unitDir, SessionHelperSocketUnitName),
+		filepath.Join(unitDir, SessionHelperServiceUnitName),
+	} {
+		if err := os.Remove(unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("packaging: remove unit file: %w", err)
+		}
+		m.logger.Info("unit file removed", "path", unitPath)
+	}
 
 	if err := m.ctl.DaemonReload(); err != nil {
 		return fmt.Errorf("packaging: daemon-reload: %w", err)

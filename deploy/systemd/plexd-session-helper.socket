@@ -1,0 +1,14 @@
+[Unit]
+Description=plexd session helper socket
+
+[Socket]
+ListenStream=/run/plexd-session-helper.sock
+SocketMode=0600
+SocketUser=root
+SocketGroup=root
+Accept=yes
+MaxConnections=512
+TriggerLimitIntervalSec=0
+
+[Install]
+WantedBy=sockets.target
