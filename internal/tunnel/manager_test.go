@@ -307,7 +307,7 @@ func TestSessionManager_ZeroIdleTimeoutArmsNoMonitor(t *testing.T) {
 	}
 
 	mgr.mu.Lock()
-	idle := mgr.sessions["idle-off"].idleTimeout
+	idle := mgr.sessions["idle-off"].(*Session).idleTimeout
 	mgr.mu.Unlock()
 	if idle != 0 {
 		t.Errorf("session idleTimeout = %v, want 0", idle)
@@ -436,7 +436,7 @@ func sessionListenAddr(t *testing.T, mgr *SessionManager, sessionID string) stri
 	if !ok {
 		t.Fatalf("session %q not found", sessionID)
 	}
-	return sess.ListenAddr()
+	return sess.(*Session).ListenAddr()
 }
 
 func TestSessionManager_OnClosedFiresForRevoke(t *testing.T) {
@@ -724,7 +724,7 @@ func TestSessionManager_StaleIdleCloseSparesSuccessor(t *testing.T) {
 
 	// The first session's idle closer, captured while it is still the live one.
 	mgr.mu.Lock()
-	staleOnIdle := mgr.sessions["sess-reissued"].onIdle
+	staleOnIdle := mgr.sessions["sess-reissued"].(*Session).onIdle
 	mgr.mu.Unlock()
 
 	mgr.CloseSession("sess-reissued", reasonDrained)

@@ -195,7 +195,7 @@ func TestDispatcher_DrainAtExpiryClosesAsExpired(t *testing.T) {
 	// and leave the teardown pass nothing to discriminate. The write is under the
 	// manager's lock, the same lock ActiveSessions reads the value under.
 	mgr.mu.Lock()
-	mgr.sessions["sess-expire"].expiresAt = time.Now().Add(-time.Second)
+	mgr.sessions["sess-expire"].(*Session).expiresAt = time.Now().Add(-time.Second)
 	mgr.mu.Unlock()
 
 	d.Handle(context.Background(), sessionsSnapshot())
