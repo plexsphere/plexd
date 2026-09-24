@@ -54,6 +54,7 @@ type SessionManager struct {
 	mu       sync.Mutex
 	sessions map[string]managedSession
 	onClosed func(sessionID, reason string, info *ClosedSessionInfo)
+	sshDeps  SSHSessionDeps
 }
 
 // NewSessionManager creates a new SessionManager with default config applied.
@@ -67,21 +68,61 @@ func NewSessionManager(cfg Config, meshIP string, logger *slog.Logger) *SessionM
 	}
 }
 
+// SetSSHSessionDeps wires what ssh sessions need. Until it is called, or while
+// any member is nil, CreateSession refuses ssh entries.
+func (m *SessionManager) SetSSHSessionDeps(deps SSHSessionDeps) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sshDeps = deps
+}
+
 // CreateSession creates and starts a tunnel session for one entry of the pull's
-// sessions block and returns the bound listener address. Only tcp-kind entries
-// are provisionable: the session dispatcher filters the block before calling in,
-// and the kind guard here keeps the manager safe to call on its own.
+// sessions block and returns the bound listener address. tcp entries become a
+// TCP forward to their target. ssh entries become an SSH listener, on Linux and
+// once SetSSHSessionDeps wired it; they are refused with
+// ErrSSHSessionsUnsupported elsewhere and with ErrSSHSessionsDisabled when the
+// node refuses ssh sessions. Any other kind is not provisionable: the session
+// dispatcher filters the block before calling in, and the kind guard here keeps
+// the manager safe to call on its own. Sessions of both kinds count against
+// MaxSessions together.
 func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSession) (string, error) {
 	if !m.cfg.Enabled {
 		return "", ErrTunnelingDisabled
 	}
 
-	if sess.Kind != api.SessionKindTCP || sess.Target.TCP == nil {
+	var sshDeps SSHSessionDeps
+	switch sess.Kind {
+	case api.SessionKindTCP:
+		if sess.Target.TCP == nil {
+			return "", fmt.Errorf("tunnel: session kind is not provisionable")
+		}
+		if sess.SessionID == "" || sess.Target.TCP.Host == "" || sess.Target.TCP.Port <= 0 || sess.Target.TCP.Port > 65535 {
+			return "", fmt.Errorf("tunnel: invalid session setup: session_id, target_host, and valid target_port (1-65535) are required")
+		}
+	case api.SessionKindSSH:
+		if sess.Target.SSH == nil {
+			return "", fmt.Errorf("tunnel: session kind is not provisionable")
+		}
+		if !sshSessionsSupported {
+			return "", ErrSSHSessionsUnsupported
+		}
+		if !m.cfg.SSHSessionsAllowed() {
+			return "", ErrSSHSessionsDisabled
+		}
+		if sess.Target.SSH.User == "" {
+			return "", fmt.Errorf("tunnel: invalid session setup: ssh target user is required")
+		}
+		m.mu.Lock()
+		sshDeps = m.sshDeps
+		m.mu.Unlock()
+		if !sshDeps.complete() {
+			return "", fmt.Errorf("tunnel: ssh sessions are not wired: host key, signing keys, command reporter and session launcher are required")
+		}
+		if sess.SessionID == "" {
+			return "", fmt.Errorf("tunnel: invalid session setup: session_id is required")
+		}
+	default:
 		return "", fmt.Errorf("tunnel: session kind is not provisionable")
-	}
-
-	if sess.SessionID == "" || sess.Target.TCP.Host == "" || sess.Target.TCP.Port <= 0 || sess.Target.TCP.Port > 65535 {
-		return "", fmt.Errorf("tunnel: invalid session setup: session_id, target_host, and valid target_port (1-65535) are required")
 	}
 
 	// A negative idle window, or one large enough to overflow the multiplication
@@ -146,7 +187,22 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 		return "", fmt.Errorf("tunnel: max sessions reached (%d)", m.cfg.MaxSessions)
 	}
 
-	var session managedSession = NewSession(sess.SessionID, sess.Target.TCP.Host, sess.Target.TCP.Port, m.meshIP, expiresAt, m.logger)
+	var session managedSession
+	if sess.Kind == api.SessionKindSSH {
+		session, err = newSSHSession(sshSessionParams{
+			entry:     sess,
+			meshIP:    m.meshIP,
+			expiresAt: expiresAt,
+			deps:      sshDeps,
+			logger:    m.logger,
+		})
+		if err != nil {
+			m.mu.Unlock()
+			return "", err
+		}
+	} else {
+		session = NewSession(sess.SessionID, sess.Target.TCP.Host, sess.Target.TCP.Port, m.meshIP, expiresAt, m.logger)
+	}
 
 	// The idle window is set before start because start arms the idle monitor,
 	// and because a session decides per connection whether to stamp activity —
@@ -182,6 +238,7 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 
 	m.logger.Info("session created",
 		"session_id", sess.SessionID,
+		"kind", sess.Kind,
 		"listen_addr", addr,
 		"expires_at", expiresAt.String(),
 	)
