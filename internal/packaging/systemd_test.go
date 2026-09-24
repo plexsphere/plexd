@@ -3,6 +3,7 @@ package packaging
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,6 +57,20 @@ func TestSystemdManager_RegisterWritesUnitAndReloads(t *testing.T) {
 	if !strings.Contains(string(data), "ExecStart=") {
 		t.Errorf("unit file missing ExecStart directive, got:\n%s", data)
 	}
+	for name, want := range map[string]string{
+		"plexd-session-helper.socket":   GenerateSessionHelperSocketUnit(),
+		"plexd-session-helper@.service": GenerateSessionHelperServiceUnit(cfg),
+	} {
+		unitPath := filepath.Join(filepath.Dir(cfg.UnitFilePath), name)
+		got, err := os.ReadFile(unitPath)
+		if err != nil {
+			t.Errorf("ReadFile(%q) = %v", unitPath, err)
+			continue
+		}
+		if string(got) != want {
+			t.Errorf("%s =\n%s\nwant\n%s", name, got, want)
+		}
+	}
 	if ctl.daemonReloadCalls != 1 {
 		t.Errorf("DaemonReload() called %d times, want 1", ctl.daemonReloadCalls)
 	}
@@ -101,14 +116,22 @@ func TestSystemdManager_UnregisterStopsDisablesRemovesReloads(t *testing.T) {
 		t.Fatalf("Unregister() = %v", err)
 	}
 
-	if len(ctl.stopCalls) != 1 || ctl.stopCalls[0] != "plexd" {
-		t.Errorf("Stop calls = %v, want [plexd]", ctl.stopCalls)
+	want := "[plexd plexd-session-helper.socket]"
+	if got := fmt.Sprint(ctl.stopCalls); got != want {
+		t.Errorf("Stop calls = %v, want %s", got, want)
 	}
-	if len(ctl.disableCalls) != 1 || ctl.disableCalls[0] != "plexd" {
-		t.Errorf("Disable calls = %v, want [plexd]", ctl.disableCalls)
+	if got := fmt.Sprint(ctl.disableCalls); got != want {
+		t.Errorf("Disable calls = %v, want %s", got, want)
 	}
-	if _, err := os.Stat(cfg.UnitFilePath); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("Stat(unit file) = %v, want os.ErrNotExist", err)
+	unitDir := filepath.Dir(cfg.UnitFilePath)
+	for _, unitPath := range []string{
+		cfg.UnitFilePath,
+		filepath.Join(unitDir, "plexd-session-helper.socket"),
+		filepath.Join(unitDir, "plexd-session-helper@.service"),
+	} {
+		if _, err := os.Stat(unitPath); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("Stat(%s) = %v, want os.ErrNotExist", unitPath, err)
+		}
 	}
 	if ctl.daemonReloadCalls != 1 {
 		t.Errorf("DaemonReload() called %d times, want 1", ctl.daemonReloadCalls)

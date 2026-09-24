@@ -1,0 +1,11 @@
+[Unit]
+Description=plexd session helper (one mediated ssh process)
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/plexd session-helper --config /etc/plexd/config.yaml
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+KillMode=control-group

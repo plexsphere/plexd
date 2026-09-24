@@ -3,6 +3,7 @@ package packaging
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -306,6 +307,11 @@ func TestInstall_WritesUnitFile(t *testing.T) {
 	}
 
 	content := string(data)
+	for _, helper := range []string{"plexd-session-helper.socket", "plexd-session-helper@.service"} {
+		if _, err := os.Stat(filepath.Join(filepath.Dir(unitPath), helper)); err != nil {
+			t.Errorf("session helper unit %s not written: %v", helper, err)
+		}
+	}
 	if !strings.Contains(content, "[Unit]") {
 		t.Error("unit file missing [Unit] section")
 	}
@@ -544,11 +550,13 @@ func TestUninstall_StopsAndDisablesService(t *testing.T) {
 		t.Fatalf("Uninstall(false) = %v", err)
 	}
 
-	if len(systemd.stopCalls) != 1 || systemd.stopCalls[0] != "plexd" {
-		t.Errorf("Stop calls = %v, want [plexd]", systemd.stopCalls)
+	// The helper socket goes with plexd.
+	want := "[plexd plexd-session-helper.socket]"
+	if got := fmt.Sprint(systemd.stopCalls); got != want {
+		t.Errorf("Stop calls = %v, want %s", got, want)
 	}
-	if len(systemd.disableCalls) != 1 || systemd.disableCalls[0] != "plexd" {
-		t.Errorf("Disable calls = %v, want [plexd]", systemd.disableCalls)
+	if got := fmt.Sprint(systemd.disableCalls); got != want {
+		t.Errorf("Disable calls = %v, want %s", got, want)
 	}
 }
 

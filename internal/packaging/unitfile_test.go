@@ -1,8 +1,12 @@
 package packaging
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/plexsphere/plexd/internal/tunnel"
 )
 
 func TestGenerateUnitFile_DefaultConfig(t *testing.T) {
@@ -117,5 +121,109 @@ func TestGenerateUnitFile_CustomPaths(t *testing.T) {
 	}
 	if !strings.Contains(output, "ReadWritePaths=/opt/plexd/data /opt/plexd/run") {
 		t.Errorf("output missing custom ReadWritePaths, got:\n%s", output)
+	}
+}
+
+func TestGenerateUnitFile_SessionHelperSocketDependency(t *testing.T) {
+	output := GenerateUnitFile(InstallConfig{})
+
+	for _, line := range []string{
+		"Wants=plexd-session-helper.socket",
+		"After=plexd-session-helper.socket",
+		"Also=plexd-session-helper.socket",
+		// The sandbox stays: the helper is what runs outside it.
+		"ProtectSystem=full",
+		"ProtectHome=true",
+		"CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW",
+	} {
+		if !strings.Contains(output, "\n"+line+"\n") {
+			t.Errorf("unit file missing %q, got:\n%s", line, output)
+		}
+	}
+	unit, install, _ := strings.Cut(output, "[Install]")
+	if !strings.Contains(install, "Also=plexd-session-helper.socket") || strings.Contains(unit, "Also=") {
+		t.Errorf("Also= must sit in [Install], got:\n%s", output)
+	}
+}
+
+func TestGenerateSessionHelperSocketUnit(t *testing.T) {
+	want := `[Unit]
+Description=plexd session helper socket
+
+[Socket]
+ListenStream=/run/plexd-session-helper.sock
+SocketMode=0600
+SocketUser=root
+SocketGroup=root
+Accept=yes
+MaxConnections=512
+TriggerLimitIntervalSec=0
+
+[Install]
+WantedBy=sockets.target
+`
+	if got := GenerateSessionHelperSocketUnit(); got != want {
+		t.Errorf("socket unit =\n%s\nwant\n%s", got, want)
+	}
+	// plexd dials the path the socket listens on.
+	if sessionHelperSocketPath != tunnel.DefaultSessionHelperSocket {
+		t.Errorf("socket path %q differs from the path plexd dials, %q", sessionHelperSocketPath, tunnel.DefaultSessionHelperSocket)
+	}
+}
+
+func TestGenerateSessionHelperServiceUnit(t *testing.T) {
+	want := `[Unit]
+Description=plexd session helper (one mediated ssh process)
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+ExecStart=/opt/plexd/bin/plexd session-helper --config /srv/plexd/config.yaml
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+KillMode=control-group
+`
+	got := GenerateSessionHelperServiceUnit(InstallConfig{BinaryPath: "/opt/plexd/bin/plexd", ConfigDir: "/srv/plexd"})
+	if got != want {
+		t.Errorf("service unit =\n%s\nwant\n%s", got, want)
+	}
+	// The unit runs outside the sandbox on purpose.
+	for _, directive := range []string{"Protect", "CapabilityBoundingSet", "ReadWritePaths", "NoNewPrivileges"} {
+		if strings.Contains(got, directive) {
+			t.Errorf("service unit carries the sandbox directive %s", directive)
+		}
+	}
+}
+
+// TestDeployUnitsMatchGenerators keeps the unit files the repository ships,
+// which the systemd e2e suite installs, byte-identical to what plexd install
+// writes. The config is spelled out rather than defaulted, so the Linux
+// rendering is compared on every runner; defaults_linux_test.go pins these
+// paths as the Linux defaults.
+func TestDeployUnitsMatchGenerators(t *testing.T) {
+	cfg := InstallConfig{
+		BinaryPath: "/usr/local/bin/plexd",
+		ConfigDir:  "/etc/plexd",
+		DataDir:    "/var/lib/plexd",
+		RunDir:     "/var/run/plexd",
+	}
+	for _, tc := range []struct {
+		file string
+		want string
+	}{
+		{"plexd.service", GenerateUnitFile(cfg)},
+		{"plexd-session-helper.socket", GenerateSessionHelperSocketUnit()},
+		{"plexd-session-helper@.service", GenerateSessionHelperServiceUnit(cfg)},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("..", "..", "deploy", "systemd", tc.file))
+			if err != nil {
+				t.Fatalf("read the shipped unit: %v", err)
+			}
+			if string(data) != tc.want {
+				t.Errorf("deploy/systemd/%s differs from the generator:\n%s\nwant\n%s", tc.file, data, tc.want)
+			}
+		})
 	}
 }
