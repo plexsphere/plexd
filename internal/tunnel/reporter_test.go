@@ -18,8 +18,12 @@ type mockReporter struct {
 	startedErr   error
 }
 
+// sessionStartedCall is one started row. User is set for an ssh entry, the
+// target for a tcp one.
 type sessionStartedCall struct {
 	SessionID        string
+	Kind             string
+	User             string
 	TargetHost       string
 	TargetPort       int
 	ListenerEndpoint string
@@ -27,6 +31,7 @@ type sessionStartedCall struct {
 
 type sessionEndedCall struct {
 	SessionID    string
+	Kind         string
 	TargetHost   string
 	TargetPort   int
 	BytesIn      int64
@@ -34,27 +39,34 @@ type sessionEndedCall struct {
 	TerminatedBy string
 }
 
-func (r *mockReporter) ReportSessionStarted(ctx context.Context, sessionID, targetHost string, targetPort int, listenerEndpoint string) error {
+func (r *mockReporter) ReportSessionStarted(ctx context.Context, entry api.NodeStateSession, listenerEndpoint string) error {
+	call := sessionStartedCall{
+		SessionID:        entry.SessionID,
+		Kind:             entry.Kind,
+		ListenerEndpoint: listenerEndpoint,
+	}
+	if entry.Target.TCP != nil {
+		call.TargetHost, call.TargetPort = entry.Target.TCP.Host, entry.Target.TCP.Port
+	}
+	if entry.Target.SSH != nil {
+		call.User = entry.Target.SSH.User
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.startedCalls = append(r.startedCalls, sessionStartedCall{
-		SessionID:        sessionID,
-		TargetHost:       targetHost,
-		TargetPort:       targetPort,
-		ListenerEndpoint: listenerEndpoint,
-	})
+	r.startedCalls = append(r.startedCalls, call)
 	return r.startedErr
 }
 
-func (r *mockReporter) ReportSessionEnded(ctx context.Context, sessionID, targetHost string, targetPort int, bytesIn, bytesOut int64, terminatedBy string) {
+func (r *mockReporter) ReportSessionEnded(ctx context.Context, sessionID string, info *ClosedSessionInfo, terminatedBy string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.endedCalls = append(r.endedCalls, sessionEndedCall{
 		SessionID:    sessionID,
-		TargetHost:   targetHost,
-		TargetPort:   targetPort,
-		BytesIn:      bytesIn,
-		BytesOut:     bytesOut,
+		Kind:         info.Kind,
+		TargetHost:   info.TargetHost,
+		TargetPort:   info.TargetPort,
+		BytesIn:      info.BytesIn,
+		BytesOut:     info.BytesOut,
 		TerminatedBy: terminatedBy,
 	})
 }

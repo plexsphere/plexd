@@ -6,15 +6,16 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// SessionActivityReporter reports the tcp-phase session_started row to the
-// control plane. The session dispatcher posts it once the listener is up, so the
-// row carries the bound listener address alongside the target. That address is
+// SessionActivityReporter reports a session's session_started row to the
+// control plane: the tcp row, which carries the target, for a tcp entry, and the
+// ssh lifecycle row for an ssh entry. The session dispatcher posts it once the
+// listener is up, so the row carries the bound listener address. That address is
 // the operator's only route to the listener, so the error is returned rather
 // than swallowed: a dropped row leaves a listener nobody can reach. The matching
 // session_ended row is emitted from the SessionManager's on-closed callback, not
 // through here.
 type SessionActivityReporter interface {
-	ReportSessionStarted(ctx context.Context, sessionID, targetHost string, targetPort int, listenerEndpoint string) error
+	ReportSessionStarted(ctx context.Context, entry api.NodeStateSession, listenerEndpoint string) error
 }
 
 // The close reasons handed to CloseSession. They are the sole input to
