@@ -1,8 +1,13 @@
 package tunnel
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
+	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestConfig_Defaults(t *testing.T) {
@@ -115,5 +120,59 @@ func TestConfig_ValidateAcceptsCustomValues(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() = %v, want nil", err)
+	}
+}
+
+func TestConfig_SSHSessionsAllowed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{"key absent", "enabled: true\n", true},
+		{"explicit true", "ssh_sessions_enabled: true\n", true},
+		{"explicit false", "ssh_sessions_enabled: false\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg Config
+			if err := yaml.Unmarshal([]byte(tc.yaml), &cfg); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got := cfg.SSHSessionsAllowed(); got != tc.want {
+				t.Errorf("SSHSessionsAllowed() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestConfig_ValidateSessionSigningPublicKey(t *testing.T) {
+	valid := base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize))
+	const prefix = "tunnel: config: session_signing_public_key: "
+
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		key     string
+		wantErr bool
+	}{
+		{"empty", true, "", false},
+		{"valid", true, valid, false},
+		{"invalid", true, "not base64!", true},
+		{"invalid under enabled: false", false, "not base64!", true},
+		{"short key", true, base64.StdEncoding.EncodeToString(make([]byte, 31)), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Enabled: tc.enabled, MaxSessions: 1, DefaultTimeout: time.Minute, SessionSigningPublicKey: tc.key}
+			err := cfg.Validate()
+			if !tc.wantErr {
+				if err != nil {
+					t.Errorf("Validate() error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.HasPrefix(err.Error(), prefix) {
+				t.Errorf("Validate() error = %v, want prefix %q", err, prefix)
+			}
+		})
 	}
 }
