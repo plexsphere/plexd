@@ -9,7 +9,8 @@ FROM ubuntu:24.04
 # Prevent interactive prompts during package installation.
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install systemd and curl (needed for the install script and health checks).
+# Install systemd and curl (needed for the install script and health checks),
+# and the ssh client plus sshpass the mediated ssh session phase logs in with.
 # Clean up apt caches to keep the image small.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -17,9 +18,15 @@ RUN apt-get update && \
         systemd-sysv \
         curl \
         ca-certificates \
-        jq && \
+        jq \
+        openssh-client \
+        sshpass && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# An unprivileged login user: a session as it proves the session helper
+# switched uid.
+RUN useradd --create-home --shell /bin/bash e2e
 
 # Mask units that cannot run inside a container.
 RUN systemctl mask \
