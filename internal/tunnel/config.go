@@ -3,6 +3,7 @@ package tunnel
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -33,6 +34,22 @@ type Config struct {
 	// HostKeyDir is the directory for storing the SSH host key.
 	// If empty, a transient key is generated (not persisted).
 	HostKeyDir string `yaml:"host_key_dir"`
+
+	// SSHSessionsEnabled lets the node refuse mediated ssh sessions while it
+	// keeps serving tcp ones. nil means allowed; read it through
+	// SSHSessionsAllowed.
+	SSHSessionsEnabled *bool `yaml:"ssh_sessions_enabled"`
+
+	// SessionSigningPublicKey is the standard-base64 Ed25519 key the session
+	// helper verifies ssh session tokens against. When set it wins over the
+	// key the helper pins from identity.json on its first run.
+	SessionSigningPublicKey string `yaml:"session_signing_public_key"`
+}
+
+// SSHSessionsAllowed reports whether the node serves mediated ssh sessions:
+// true unless ssh_sessions_enabled is explicitly false.
+func (c *Config) SSHSessionsAllowed() bool {
+	return c.SSHSessionsEnabled == nil || *c.SSHSessionsEnabled
 }
 
 // ApplyDefaults sets default values for zero-valued fields.
@@ -54,6 +71,13 @@ func (c *Config) ApplyDefaults() {
 
 // Validate checks that configuration values are within acceptable ranges.
 func (c *Config) Validate() error {
+	// The key is read by the session helper, which runs whether or not plexd
+	// serves sessions, so a broken value is refused under enabled: false too.
+	if c.SessionSigningPublicKey != "" {
+		if _, err := ParseSessionSigningPublicKey(c.SessionSigningPublicKey); err != nil {
+			return fmt.Errorf("tunnel: config: session_signing_public_key: %w", err)
+		}
+	}
 	if !c.Enabled {
 		return nil
 	}
