@@ -384,7 +384,7 @@ func runAgent(ctx context.Context) error {
 	meshServer.SessionManager().SetOnClosed(func(sessionID, reason string, info *tunnel.ClosedSessionInfo) {
 		reportCtx, cancelReport := context.WithTimeout(context.WithoutCancel(ctx), sessionEndedReportTimeout)
 		defer cancelReport()
-		sessionReporter.ReportSessionEnded(reportCtx, sessionID, info.TargetHost, info.TargetPort, info.BytesIn, info.BytesOut, tunnel.TerminatedByFromReason(reason))
+		sessionReporter.ReportSessionEnded(reportCtx, sessionID, info, tunnel.TerminatedByFromReason(reason))
 	})
 
 	// 5e. Initialize bridge subsystem (conditional on bridge mode).
@@ -1271,23 +1271,24 @@ type controlPlaneSessionReporter struct {
 // ReportSessionStarted returns the post's error rather than logging it away: the
 // row carries the listener endpoint the operator connects to, so the dispatcher
 // has to know whether it arrived.
-func (r *controlPlaneSessionReporter) ReportSessionStarted(ctx context.Context, sessionID, targetHost string, targetPort int, listenerEndpoint string) error {
-	return r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, api.SessionActivityRequest{
+func (r *controlPlaneSessionReporter) ReportSessionStarted(ctx context.Context, entry api.NodeStateSession, listenerEndpoint string) error {
+	return r.cp.ReportSessionActivity(ctx, r.nodeID, entry.SessionID, api.SessionActivityRequest{
 		TCP: &api.TCPActivity{
 			Phase:            api.TCPPhaseSessionStarted,
-			TargetHost:       targetHost,
-			TargetPort:       targetPort,
+			TargetHost:       entry.Target.TCP.Host,
+			TargetPort:       entry.Target.TCP.Port,
 			ListenerEndpoint: listenerEndpoint,
 		},
 	})
 }
 
-func (r *controlPlaneSessionReporter) ReportSessionEnded(ctx context.Context, sessionID, targetHost string, targetPort int, bytesIn, bytesOut int64, terminatedBy string) {
+func (r *controlPlaneSessionReporter) ReportSessionEnded(ctx context.Context, sessionID string, info *tunnel.ClosedSessionInfo, terminatedBy string) {
+	bytesIn, bytesOut := info.BytesIn, info.BytesOut
 	if err := r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, api.SessionActivityRequest{
 		TCP: &api.TCPActivity{
 			Phase:        api.TCPPhaseSessionEnded,
-			TargetHost:   targetHost,
-			TargetPort:   targetPort,
+			TargetHost:   info.TargetHost,
+			TargetPort:   info.TargetPort,
 			BytesIn:      &bytesIn,
 			BytesOut:     &bytesOut,
 			TerminatedBy: terminatedBy,

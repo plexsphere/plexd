@@ -320,7 +320,7 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 			// session_ended row and a fresh listener_endpoint on every pull for
 			// the whole TTL of the entry. The capped expiry timer is what
 			// reclaims a listener whose row never lands.
-			if err := d.reporter.ReportSessionStarted(reportCtx, s.entry.SessionID, s.entry.Target.TCP.Host, s.entry.Target.TCP.Port, s.addr); err != nil {
+			if err := d.reporter.ReportSessionStarted(reportCtx, s.entry, s.addr); err != nil {
 				// A revoked-or-expired verdict settles the row but never tears
 				// the listener down: the entry draining from the block on a
 				// later pull is what closes it, so the block stays the single

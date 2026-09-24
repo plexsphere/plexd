@@ -33,6 +33,7 @@ import (
 	"github.com/plexsphere/plexd/internal/nodeapi"
 	"github.com/plexsphere/plexd/internal/policy"
 	"github.com/plexsphere/plexd/internal/registration"
+	"github.com/plexsphere/plexd/internal/tunnel"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
@@ -2078,7 +2079,13 @@ func TestControlPlaneSessionReporter_RefusedEndedRowKeepsCounters(t *testing.T) 
 		defer slog.SetDefault(prev)
 
 		reporter := &controlPlaneSessionReporter{cp: client, nodeID: upTestNodeID}
-		reporter.ReportSessionEnded(context.Background(), "sess-drained", "10.0.0.5", 22, 4096, 8192, api.TerminatedByPlexdClose)
+		reporter.ReportSessionEnded(context.Background(), "sess-drained", &tunnel.ClosedSessionInfo{
+			Kind:       api.SessionKindTCP,
+			TargetHost: "10.0.0.5",
+			TargetPort: 22,
+			BytesIn:    4096,
+			BytesOut:   8192,
+		}, api.TerminatedByPlexdClose)
 		return logs
 	}
 

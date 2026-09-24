@@ -70,7 +70,7 @@ func newIntegrationDispatcher(t *testing.T, cfg Config) (*Dispatcher, *SessionMa
 
 	reporter := &mockReporter{}
 	mgr.SetOnClosed(func(sessionID, reason string, info *ClosedSessionInfo) {
-		reporter.ReportSessionEnded(context.Background(), sessionID, info.TargetHost, info.TargetPort, info.BytesIn, info.BytesOut, TerminatedByFromReason(reason))
+		reporter.ReportSessionEnded(context.Background(), sessionID, info, TerminatedByFromReason(reason))
 	})
 
 	return NewDispatcher(mgr, reporter, slog.Default()), mgr, reporter

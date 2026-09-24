@@ -912,7 +912,7 @@ type barrierReporter struct {
 	inFlight atomic.Int32
 }
 
-func (r *barrierReporter) ReportSessionStarted(context.Context, string, string, int, string) error {
+func (r *barrierReporter) ReportSessionStarted(context.Context, api.NodeStateSession, string) error {
 	r.inFlight.Add(1)
 	defer r.inFlight.Add(-1)
 	<-r.release
@@ -964,7 +964,7 @@ type deadlineReporter struct {
 	remaining []time.Duration
 }
 
-func (r *deadlineReporter) ReportSessionStarted(ctx context.Context, _, _ string, _ int, _ string) error {
+func (r *deadlineReporter) ReportSessionStarted(ctx context.Context, _ api.NodeStateSession, _ string) error {
 	remaining := time.Duration(-1)
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining = time.Until(deadline)
