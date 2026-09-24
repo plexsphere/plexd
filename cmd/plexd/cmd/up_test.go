@@ -2038,8 +2038,9 @@ func (h *recordingHandler) countAt(level slog.Level) int {
 }
 
 const (
-	endedRefusedMsg = "tunnel session ended row refused; its counters are recorded only here"
-	endedFailedMsg  = "tunnel session ended report failed"
+	endedRefusedMsg    = "tunnel session ended row refused; its counters are recorded only here"
+	sshEndedRefusedMsg = "ssh session ended row refused; its terminating reason is recorded only here"
+	endedFailedMsg     = "tunnel session ended report failed"
 )
 
 // The ended row of a drain-driven teardown reaches a control plane that already
@@ -2058,7 +2059,14 @@ func TestControlPlaneSessionReporter_RefusedEndedRowKeepsCounters(t *testing.T) 
 	// reportEnded posts one ended row against a control plane answering the
 	// session-activity POST with the given status and problem body, and returns
 	// what the reporter logged while doing it.
-	reportEnded := func(t *testing.T, status int, body string) *recordingHandler {
+	tcpInfo := &tunnel.ClosedSessionInfo{
+		Kind:       api.SessionKindTCP,
+		TargetHost: "10.0.0.5",
+		TargetPort: 22,
+		BytesIn:    4096,
+		BytesOut:   8192,
+	}
+	reportEnded := func(t *testing.T, status int, body string, info *tunnel.ClosedSessionInfo) *recordingHandler {
 		t.Helper()
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/problem+json")
@@ -2079,18 +2087,12 @@ func TestControlPlaneSessionReporter_RefusedEndedRowKeepsCounters(t *testing.T) 
 		defer slog.SetDefault(prev)
 
 		reporter := &controlPlaneSessionReporter{cp: client, nodeID: upTestNodeID}
-		reporter.ReportSessionEnded(context.Background(), "sess-drained", &tunnel.ClosedSessionInfo{
-			Kind:       api.SessionKindTCP,
-			TargetHost: "10.0.0.5",
-			TargetPort: 22,
-			BytesIn:    4096,
-			BytesOut:   8192,
-		}, api.TerminatedByPlexdClose)
+		reporter.ReportSessionEnded(context.Background(), "sess-drained", info, api.TerminatedByPlexdClose)
 		return logs
 	}
 
 	t.Run("session revoked", func(t *testing.T) {
-		logs := reportEnded(t, http.StatusConflict, `{"code":"session_already_revoked"}`)
+		logs := reportEnded(t, http.StatusConflict, `{"code":"session_already_revoked"}`, tcpInfo)
 
 		if n := logs.count(slog.LevelWarn, endedRefusedMsg); n != 1 {
 			t.Errorf("the refused row was warned about %d times, want 1", n)
@@ -2113,8 +2115,27 @@ func TestControlPlaneSessionReporter_RefusedEndedRowKeepsCounters(t *testing.T) 
 		}
 	})
 
+	// An ssh session counts no bytes, so its line must not suggest it moved
+	// none.
+	t.Run("ssh session revoked", func(t *testing.T) {
+		logs := reportEnded(t, http.StatusConflict, `{"code":"session_already_revoked"}`, &tunnel.ClosedSessionInfo{Kind: api.SessionKindSSH})
+
+		if n := logs.count(slog.LevelWarn, sshEndedRefusedMsg); n != 1 {
+			t.Errorf("the refused row was warned about %d times, want 1", n)
+		}
+		attrs := logs.attrsOf(slog.LevelWarn, sshEndedRefusedMsg)
+		if attrs["kind"] != api.SessionKindSSH || attrs["terminated_by"] != api.TerminatedByPlexdClose {
+			t.Errorf("attrs = %v, want kind ssh and terminated_by %s", attrs, api.TerminatedByPlexdClose)
+		}
+		for _, key := range []string{"bytes_in", "bytes_out"} {
+			if _, ok := attrs[key]; ok {
+				t.Errorf("the ssh line carries %s", key)
+			}
+		}
+	})
+
 	t.Run("other error", func(t *testing.T) {
-		logs := reportEnded(t, http.StatusInternalServerError, `{"title":"boom"}`)
+		logs := reportEnded(t, http.StatusInternalServerError, `{"title":"boom"}`, tcpInfo)
 
 		if n := logs.count(slog.LevelError, endedFailedMsg); n != 1 {
 			t.Errorf("the 500 was reported as a failure %d times, want 1", n)
@@ -2123,4 +2144,108 @@ func TestControlPlaneSessionReporter_RefusedEndedRowKeepsCounters(t *testing.T) 
 			t.Errorf("a 500 is no verdict on the session, but %d warn records were emitted", n)
 		}
 	})
+}
+
+// captureSessionRows serves the session-activity callback and records each
+// body it receives, answering with status.
+func captureSessionRows(t *testing.T, status int, body string) (*controlPlaneSessionReporter, func() []string) {
+	t.Helper()
+	var (
+		mu   sync.Mutex
+		rows []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		rows = append(rows, strings.TrimSpace(string(data)))
+		mu.Unlock()
+		if status == http.StatusNoContent {
+			w.WriteHeader(status)
+			return
+		}
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := api.NewControlPlane(api.Config{BaseURL: srv.URL}, "1.0.0-test", discardLogger())
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.SetAuthToken("test-token")
+	return &controlPlaneSessionReporter{cp: client, nodeID: upTestNodeID}, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), rows...)
+	}
+}
+
+func TestControlPlaneSessionReporter_PostsActivityRows(t *testing.T) {
+	reporter, rows := captureSessionRows(t, http.StatusNoContent, "")
+	ctx := context.Background()
+	// A non-UTC instant: the rows carry UTC.
+	started := time.Date(2026, 9, 24, 10, 0, 0, 0, time.FixedZone("CEST", 2*60*60))
+	completed := started.Add(3 * time.Second)
+
+	sshEntry := api.NodeStateSession{
+		SessionID: "sess-ssh",
+		Kind:      api.SessionKindSSH,
+		Target:    api.SessionTarget{SSH: &api.SessionTargetSSH{User: "ubuntu"}},
+	}
+	tcpEntry := api.NodeStateSession{
+		SessionID: "sess-tcp",
+		Kind:      api.SessionKindTCP,
+		Target:    api.SessionTarget{TCP: &api.SessionTargetTCP{Host: "10.0.0.5", Port: 22}},
+	}
+
+	if err := reporter.ReportSessionStarted(ctx, sshEntry, "10.99.0.1:40000"); err != nil {
+		t.Fatalf("ReportSessionStarted(ssh) error: %v", err)
+	}
+	reporter.ReportSessionEnded(ctx, "sess-ssh", &tunnel.ClosedSessionInfo{Kind: api.SessionKindSSH}, api.TerminatedByIdleTimeout)
+	if err := reporter.ReportSSHCommandStarted(ctx, "sess-ssh", "uptime", started); err != nil {
+		t.Fatalf("ReportSSHCommandStarted() error: %v", err)
+	}
+	if err := reporter.ReportSSHCommandExited(ctx, "sess-ssh", "uptime", 0, started, completed); err != nil {
+		t.Fatalf("ReportSSHCommandExited() error: %v", err)
+	}
+	if err := reporter.ReportSessionStarted(ctx, tcpEntry, "10.99.0.1:40001"); err != nil {
+		t.Fatalf("ReportSessionStarted(tcp) error: %v", err)
+	}
+	reporter.ReportSessionEnded(ctx, "sess-tcp", &tunnel.ClosedSessionInfo{
+		Kind: api.SessionKindTCP, TargetHost: "10.0.0.5", TargetPort: 22, BytesIn: 4096, BytesOut: 8192,
+	}, api.TerminatedByPlexdClose)
+
+	want := []string{
+		`{"ssh":{"phase":"session_started","listener_endpoint":"10.99.0.1:40000"}}`,
+		`{"ssh":{"phase":"session_ended","terminated_by":"idle_timeout"}}`,
+		`{"ssh":{"command":"uptime","started_at":"2026-09-24T08:00:00Z"}}`,
+		`{"ssh":{"command":"uptime","exit_code":0,"started_at":"2026-09-24T08:00:00Z","completed_at":"2026-09-24T08:00:03Z"}}`,
+		`{"tcp":{"phase":"session_started","target_host":"10.0.0.5","target_port":22,"listener_endpoint":"10.99.0.1:40001"}}`,
+		`{"tcp":{"phase":"session_ended","target_host":"10.0.0.5","target_port":22,"bytes_in":4096,"bytes_out":8192,"terminated_by":"plexd_close"}}`,
+	}
+	got := rows()
+	if len(got) != len(want) {
+		t.Fatalf("posted %d rows, want %d: %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("row %d = %s, want %s", i, got[i], want[i])
+		}
+	}
+}
+
+// The listener runs a command only once its started row was accepted, so the
+// refusal has to reach it intact for the revoked-session check.
+func TestControlPlaneSessionReporter_SSHCommandStartedReturnsConflict(t *testing.T) {
+	reporter, _ := captureSessionRows(t, http.StatusConflict, `{"code":"session_already_revoked"}`)
+
+	err := reporter.ReportSSHCommandStarted(context.Background(), "sess-ssh", "uptime", time.Now())
+	var apiErr *api.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict {
+		t.Fatalf("error = %v, want the 409 APIError", err)
+	}
+	if !api.IsSessionRevokedOrExpired(err) {
+		t.Errorf("error = %v, want it classified as revoked", err)
+	}
 }

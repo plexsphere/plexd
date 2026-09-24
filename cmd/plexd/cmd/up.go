@@ -387,6 +387,22 @@ func runAgent(ctx context.Context) error {
 		sessionReporter.ReportSessionEnded(reportCtx, sessionID, info, tunnel.TerminatedByFromReason(reason))
 	})
 
+	// Mediated ssh sessions start their processes through the session helper,
+	// which only Linux has. Elsewhere ssh entries stay settled as unsupported.
+	// A node that serves no ssh sessions skips the wiring, and with it the
+	// warning about a missing helper socket; the manager settles its ssh
+	// entries as disabled.
+	if cfg.Tunnel.Enabled && cfg.Tunnel.SSHSessionsAllowed() {
+		if launcher := newSessionLauncher(verifier, logger); launcher != nil {
+			meshServer.SessionManager().SetSSHSessionDeps(tunnel.SSHSessionDeps{
+				HostKey:  hostKey,
+				Keys:     verifier,
+				Commands: sessionReporter,
+				Launcher: launcher,
+			})
+		}
+	}
+
 	// 5e. Initialize bridge subsystem (conditional on bridge mode).
 	var (
 		bridgeMgr     *bridge.Manager
@@ -1259,10 +1275,12 @@ func (s *auditForwarderStatus) ForwarderStatus() nodeapi.ForwarderStatus {
 	}
 }
 
-// controlPlaneSessionReporter reports tcp-phase session activity rows to the
-// control plane. plexd's tunnel subsystem is an opaque TCP forwarder, so it
-// emits tcp rows: a session_started row when the listener is up and a
-// session_ended row carrying byte counters and a terminated_by reason on close.
+// controlPlaneSessionReporter reports session activity rows to the control
+// plane. A tcp session is an opaque TCP forward, so it gets tcp rows: a
+// session_started row when the listener is up and a session_ended row carrying
+// byte counters and a terminated_by reason on close. An ssh session gets the
+// ssh lifecycle rows, which carry the listener endpoint and the terminated_by
+// reason, and one command row before and one after every command it runs.
 type controlPlaneSessionReporter struct {
 	cp     *api.ControlPlane
 	nodeID string
@@ -1272,49 +1290,77 @@ type controlPlaneSessionReporter struct {
 // row carries the listener endpoint the operator connects to, so the dispatcher
 // has to know whether it arrived.
 func (r *controlPlaneSessionReporter) ReportSessionStarted(ctx context.Context, entry api.NodeStateSession, listenerEndpoint string) error {
-	return r.cp.ReportSessionActivity(ctx, r.nodeID, entry.SessionID, api.SessionActivityRequest{
-		TCP: &api.TCPActivity{
+	var req api.SessionActivityRequest
+	if entry.Kind == api.SessionKindSSH {
+		req.SSH = &api.SSHActivity{Phase: api.SSHPhaseSessionStarted, ListenerEndpoint: listenerEndpoint}
+	} else {
+		req.TCP = &api.TCPActivity{
 			Phase:            api.TCPPhaseSessionStarted,
 			TargetHost:       entry.Target.TCP.Host,
 			TargetPort:       entry.Target.TCP.Port,
 			ListenerEndpoint: listenerEndpoint,
-		},
-	})
+		}
+	}
+	return r.cp.ReportSessionActivity(ctx, r.nodeID, entry.SessionID, req)
 }
 
 func (r *controlPlaneSessionReporter) ReportSessionEnded(ctx context.Context, sessionID string, info *tunnel.ClosedSessionInfo, terminatedBy string) {
 	bytesIn, bytesOut := info.BytesIn, info.BytesOut
-	if err := r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, api.SessionActivityRequest{
-		TCP: &api.TCPActivity{
+	var req api.SessionActivityRequest
+	if info.Kind == api.SessionKindSSH {
+		req.SSH = &api.SSHActivity{Phase: api.SSHPhaseSessionEnded, TerminatedBy: terminatedBy}
+	} else {
+		req.TCP = &api.TCPActivity{
 			Phase:        api.TCPPhaseSessionEnded,
 			TargetHost:   info.TargetHost,
 			TargetPort:   info.TargetPort,
 			BytesIn:      &bytesIn,
 			BytesOut:     &bytesOut,
 			TerminatedBy: terminatedBy,
-		},
-	}); err != nil {
+		}
+	}
+	if err := r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, req); err != nil {
 		// A drain-driven close posts its row into a session the control plane
 		// already holds as revoked or expired, so the refusal is the expected
 		// answer of every revocation and hard expiry rather than a fault of this
 		// node. It is still audit data going missing, and for exactly the
 		// sessions an investigation asks about: the row is fire-once, nothing
-		// re-posts it, and it is the sole carrier of the transfer volumes and
-		// the terminating reason. So the answer is warned about rather than
-		// noted, and the row's payload is carried into the line, which is the
-		// only place those numbers survive.
+		// re-posts it, and it is the sole carrier of the terminating reason and,
+		// for a tcp session, of the transfer volumes. So the answer is warned
+		// about rather than noted, and the row's payload is carried into the
+		// line, which is the only place it survives. An ssh session counts no
+		// bytes, so its line carries none.
 		if api.IsSessionRevokedOrExpired(err) {
-			slog.Warn("tunnel session ended row refused; its counters are recorded only here",
-				"session_id", sessionID,
-				"bytes_in", bytesIn,
-				"bytes_out", bytesOut,
-				"terminated_by", terminatedBy,
-				"error", err,
-			)
+			msg := "ssh session ended row refused; its terminating reason is recorded only here"
+			attrs := []any{"session_id", sessionID, "kind", info.Kind}
+			if req.TCP != nil {
+				msg = "tunnel session ended row refused; its counters are recorded only here"
+				attrs = append(attrs, "bytes_in", bytesIn, "bytes_out", bytesOut)
+			}
+			slog.Warn(msg, append(attrs, "terminated_by", terminatedBy, "error", err)...)
 			return
 		}
 		slog.Error("tunnel session ended report failed", "session_id", sessionID, "error", err)
 	}
+}
+
+// ReportSSHCommandStarted posts the command row of an exec request before it
+// runs. The error is returned: the listener runs the command only once the row
+// was accepted.
+func (r *controlPlaneSessionReporter) ReportSSHCommandStarted(ctx context.Context, sessionID, command string, startedAt time.Time) error {
+	started := startedAt.UTC()
+	return r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, api.SessionActivityRequest{
+		SSH: &api.SSHActivity{Command: command, StartedAt: &started},
+	})
+}
+
+// ReportSSHCommandExited posts the command row of an exec request that exited,
+// with its exit code.
+func (r *controlPlaneSessionReporter) ReportSSHCommandExited(ctx context.Context, sessionID, command string, exitCode int, startedAt, completedAt time.Time) error {
+	started, completed := startedAt.UTC(), completedAt.UTC()
+	return r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, api.SessionActivityRequest{
+		SSH: &api.SSHActivity{Command: command, ExitCode: &exitCode, StartedAt: &started, CompletedAt: &completed},
+	})
 }
 
 // buildHeartbeatRequest assembles the v1 heartbeat request. NATSummary is
