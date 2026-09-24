@@ -26,6 +26,7 @@ import (
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/nodeapi"
+	"github.com/plexsphere/plexd/internal/tunnel"
 	"github.com/plexsphere/plexd/test/e2e/mockapi"
 )
 
@@ -4035,8 +4036,8 @@ func stateSession(sid string, port int) api.NodeStateSession {
 }
 
 // sessionOfKind builds one configured sessions entry of the given kind with a
-// future deadline. The mock accepts a session of any kind, so ssh and k8s rows
-// are testable against it even though plexd produces neither.
+// future deadline. The mock accepts a session of any kind, so k8s rows are
+// testable against it even though plexd produces none.
 func sessionOfKind(sid, kind string) api.NodeStateSession {
 	session := stateSession(sid, 22)
 	switch kind {
@@ -4218,6 +4219,25 @@ func TestSessionActivity_ValidRows(t *testing.T) {
 	}
 }
 
+// plexd posts two lifecycle rows per ssh session and a command row per command.
+func TestSessionActivity_SSHLifecycleRows(t *testing.T) {
+	for _, body := range []string{
+		`{"ssh":{"phase":"session_started","listener_endpoint":"10.99.0.1:40000"}}`,
+		`{"ssh":{"phase":"session_ended","terminated_by":"plexd_close"}}`,
+		`{"ssh":{"command":"ls"}}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			configureSessions(t, ts.URL, sessionOfKind("sess-ssh-row", api.SessionKindSSH))
+			resp := doRequest(t, http.MethodPost, sessionURL(ts.URL, "sess-ssh-row"), body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+			}
+		})
+	}
+}
+
 func TestSessionActivity_AcceptsListenerEndpoint(t *testing.T) {
 	_, ts := newTestServer(t)
 	// The listener endpoint the node opened for the mediated session travels on
@@ -4248,6 +4268,13 @@ func TestSessionActivity_Denials(t *testing.T) {
 		{"zero_members", api.SessionKindTCP, `{}`},
 		{"two_members", api.SessionKindTCP, `{"ssh":{"command":"ls"},"k8s":{"verb":"get"}}`},
 		{"ssh_missing_command", api.SessionKindSSH, `{"ssh":{"exit_code":0}}`},
+		{"ssh_empty", api.SessionKindSSH, `{"ssh":{}}`},
+		{"ssh_command_and_phase", api.SessionKindSSH, `{"ssh":{"command":"ls","phase":"session_started"}}`},
+		{"ssh_bad_phase", api.SessionKindSSH, `{"ssh":{"phase":"session_paused"}}`},
+		{"ssh_ended_with_listener_endpoint", api.SessionKindSSH, `{"ssh":{"phase":"session_ended","listener_endpoint":"10.99.0.1:1"}}`},
+		{"ssh_started_with_terminated_by", api.SessionKindSSH, `{"ssh":{"phase":"session_started","terminated_by":"plexd_close"}}`},
+		{"ssh_ended_bad_terminated_by", api.SessionKindSSH, `{"ssh":{"phase":"session_ended","terminated_by":"who_knows"}}`},
+		{"ssh_command_with_terminated_by", api.SessionKindSSH, `{"ssh":{"command":"ls","terminated_by":"plexd_close"}}`},
 		{"ssh_command_too_long", api.SessionKindSSH, fmt.Sprintf(`{"ssh":{"command":%q}}`, longCommand)},
 		{"k8s_missing_verb", api.SessionKindK8s, `{"k8s":{"resource_kind":"pods"}}`},
 		{"bad_tcp_phase", api.SessionKindTCP, `{"tcp":{"phase":"session_paused"}}`},
@@ -5835,5 +5862,87 @@ func TestBearerEnvelopeGate_ExemptRoutes(t *testing.T) {
 	}
 	if got := srv.Assertions().UnauthorizedCount; got != 0 {
 		t.Errorf("unauthorized_count = %d after exempt routes, want 0", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Session tokens (issue #93)
+// ---------------------------------------------------------------------------
+
+// mintMockSessionToken asks the mock for a session token and returns the
+// response.
+func mintMockSessionToken(t *testing.T, baseURL, body string) *http.Response {
+	t.Helper()
+	return doRequest(t, http.MethodPost, baseURL+"/test/session-token", body)
+}
+
+func TestSessionToken_VerifiesAgainstMockKey(t *testing.T) {
+	_, ts := newTestServer(t)
+	verifier := mockVerifier(t, ts.URL)
+
+	resp := mintMockSessionToken(t, ts.URL, `{"session_id":"sess-token","user":"root","allowed_commands":["uptime"],"ttl_seconds":600}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var answer struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	now := time.Now()
+	claims, err := tunnel.VerifySessionToken(answer.Token, verifier.TrustedKeys(now), "sess-token", "root", now)
+	if err != nil {
+		t.Fatalf("VerifySessionToken() error: %v", err)
+	}
+	if strings.Join(claims.AllowedCommands, ",") != "uptime" {
+		t.Errorf("allowed commands = %q, want [uptime]", claims.AllowedCommands)
+	}
+	if left := time.Until(claims.Expiry); left < 590*time.Second || left > 601*time.Second {
+		t.Errorf("token expires in %v, want about ttl_seconds", left)
+	}
+
+	header, _, _ := strings.Cut(answer.Token, ".")
+	raw, err := base64.RawURLEncoding.DecodeString(header)
+	if err != nil {
+		t.Fatalf("decode header: %v", err)
+	}
+	if want := `{"alg":"EdDSA","kid":"did:web:plexsphere.com#key-e2e","typ":"at+jwt"}`; string(raw) != want {
+		t.Errorf("header = %s, want %s", raw, want)
+	}
+}
+
+func TestSessionToken_Refusals(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{"empty session_id", `{"session_id":"","user":"root","ttl_seconds":60}`},
+		{"empty user", `{"session_id":"sess","user":"","ttl_seconds":60}`},
+		{"zero ttl", `{"session_id":"sess","user":"root","ttl_seconds":0}`},
+		{"ttl above an hour", `{"session_id":"sess","user":"root","ttl_seconds":3601}`},
+		{"not json", `not json`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			resp := mintMockSessionToken(t, ts.URL, tc.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			}
+		})
+	}
+}
+
+func TestSessionToken_WrongMethod_Returns405(t *testing.T) {
+	_, ts := newTestServer(t)
+	resp, err := http.Get(ts.URL + "/test/session-token")
+	if err != nil {
+		t.Fatalf("GET session token: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
 	}
 }
