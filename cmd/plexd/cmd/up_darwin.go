@@ -6,11 +6,13 @@ import (
 	"log/slog"
 	"path/filepath"
 
+	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/packaging"
 	"github.com/plexsphere/plexd/internal/policy"
+	"github.com/plexsphere/plexd/internal/tunnel"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
@@ -105,4 +107,10 @@ func tunnelAddress(meshIP string) string {
 		return ""
 	}
 	return meshIP + "/32"
+}
+
+// newSessionLauncher returns nil: mediated ssh sessions are served on Linux
+// only, so ssh entries stay settled as unsupported on macOS.
+func newSessionLauncher(_ *api.Ed25519Verifier, _ *slog.Logger) tunnel.SessionLauncher {
+	return nil
 }

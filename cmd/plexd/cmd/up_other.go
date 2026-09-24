@@ -5,10 +5,12 @@ package cmd
 import (
 	"log/slog"
 
+	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/policy"
+	"github.com/plexsphere/plexd/internal/tunnel"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
@@ -52,5 +54,10 @@ func newAccessController(_ *slog.Logger) bridge.AccessController {
 
 // newVPNController returns nil on platforms without an implementation.
 func newVPNController(_ *slog.Logger, _ string) bridge.VPNController {
+	return nil
+}
+
+// newSessionLauncher returns nil on platforms without an implementation.
+func newSessionLauncher(_ *api.Ed25519Verifier, _ *slog.Logger) tunnel.SessionLauncher {
 	return nil
 }

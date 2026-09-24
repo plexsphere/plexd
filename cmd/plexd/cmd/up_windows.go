@@ -5,11 +5,13 @@ package cmd
 import (
 	"log/slog"
 
+	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/packaging"
 	"github.com/plexsphere/plexd/internal/policy"
+	"github.com/plexsphere/plexd/internal/tunnel"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
@@ -85,4 +87,10 @@ func newAccessController(logger *slog.Logger) bridge.AccessController {
 // carrying an address. The mesh IP is therefore unused here.
 func newVPNController(logger *slog.Logger, _ string) bridge.VPNController {
 	return bridge.NewWGVPNController(wireguard.NewWindowsController(logger), "", logger)
+}
+
+// newSessionLauncher returns nil: mediated ssh sessions are served on Linux
+// only, so ssh entries stay settled as unsupported on Windows.
+func newSessionLauncher(_ *api.Ed25519Verifier, _ *slog.Logger) tunnel.SessionLauncher {
+	return nil
 }

@@ -3,12 +3,18 @@
 package cmd
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"log/slog"
+	"os"
+	"os/exec"
 
+	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/policy"
+	"github.com/plexsphere/plexd/internal/tunnel"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
@@ -61,4 +67,39 @@ func newAccessController(logger *slog.Logger) bridge.AccessController {
 // netlink route names the link itself.
 func newVPNController(logger *slog.Logger, _ string) bridge.VPNController {
 	return bridge.NewNetlinkVPNController(logger)
+}
+
+// newSessionLauncher returns the launcher ssh sessions start their processes
+// through: plexd-session-helper.socket when it listens, else this binary run
+// as `plexd session-helper --child`, trusting the verifier's keys.
+//
+// Under systemd plexd runs sandboxed, and a child helper inherits the sandbox:
+// its shells cannot switch users. A missing socket there is a unit that was
+// not installed, so it is warned about once.
+func newSessionLauncher(verifier *api.Ed25519Verifier, logger *slog.Logger) tunnel.SessionLauncher {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "/proc/self/exe"
+	}
+	child := func(keys []ed25519.PublicKey) *exec.Cmd {
+		return exec.Command(exe, sessionHelperChildArgs(keys)...)
+	}
+	if os.Getenv("INVOCATION_ID") != "" {
+		if info, err := os.Stat(tunnel.DefaultSessionHelperSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
+			logger.Warn("plexd-session-helper.socket is not listening; ssh sessions run inside plexd's own sandbox and cannot switch users",
+				"socket", tunnel.DefaultSessionHelperSocket,
+			)
+		}
+	}
+	return tunnel.NewSessionHelperClient(tunnel.DefaultSessionHelperSocket, child, verifier, logger)
+}
+
+// sessionHelperChildArgs is the command line of the child helper, trusting
+// keys.
+func sessionHelperChildArgs(keys []ed25519.PublicKey) []string {
+	args := []string{"session-helper", "--child"}
+	for _, key := range keys {
+		args = append(args, "--trusted-key", base64.StdEncoding.EncodeToString(key))
+	}
+	return args
 }
