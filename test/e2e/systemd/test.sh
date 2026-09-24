@@ -14,6 +14,7 @@
 #   - SSE event injection triggers reconciliation
 #   - Heartbeat-triggered reconcile via RotateKeys flag
 #   - Deeper body validation (metrics, capabilities fields)
+#   - Mediated ssh session through the socket-activated session helper
 #   - Shutdown log message verification
 set -euo pipefail
 
@@ -90,6 +91,8 @@ print_diagnostics() {
     docker exec "${SYSTEMD_CONTAINER}" systemctl status plexd --no-pager 2>/dev/null || true
     echo "==> Systemd container journalctl plexd:"
     docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager -n 100 2>/dev/null || true
+    echo "==> Systemd container journalctl plexd-session-helper@*:"
+    docker exec "${SYSTEMD_CONTAINER}" journalctl --no-pager -u 'plexd-session-helper@*' -n 100 2>/dev/null || true
     echo "==> Systemd container journalctl (full):"
     docker exec "${SYSTEMD_CONTAINER}" journalctl --no-pager -n 50 2>/dev/null || true
     echo "==> Systemd container process list:"
@@ -200,6 +203,8 @@ docker run -d \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
     -v "${REPO_ROOT}/plexd-linux-amd64:/opt/plexd-binary:ro" \
     -v "${REPO_ROOT}/deploy/systemd/plexd.service:/opt/plexd.service:ro" \
+    -v "${REPO_ROOT}/deploy/systemd/plexd-session-helper.socket:/opt/plexd-session-helper.socket:ro" \
+    -v "${REPO_ROOT}/deploy/systemd/plexd-session-helper@.service:/opt/plexd-session-helper@.service:ro" \
     "${SYSTEMD_IMAGE}"
 
 # Wait for systemd to finish booting inside the container.
@@ -222,7 +227,7 @@ fi
 # Install plexd binary and service unit (REQ-003, REQ-007).
 echo "=== Installing plexd into systemd container ==="
 docker exec "${SYSTEMD_CONTAINER}" bash -c \
-    'cp /opt/plexd-binary /usr/local/bin/plexd && chmod +x /usr/local/bin/plexd && cp /opt/plexd.service /etc/systemd/system/plexd.service'
+    'cp /opt/plexd-binary /usr/local/bin/plexd && chmod +x /usr/local/bin/plexd && cp /opt/plexd.service /opt/plexd-session-helper.socket /opt/plexd-session-helper@.service /etc/systemd/system/'
 
 # Write plexd config pointing at mock-api (REQ-004).
 docker exec "${SYSTEMD_CONTAINER}" bash -c "cat > /etc/plexd/config.yaml <<EOF
@@ -287,6 +292,15 @@ sleep 3
 echo "=== Verifying plexd service is active ==="
 if ! docker exec "${SYSTEMD_CONTAINER}" systemctl is-active plexd; then
     fail "plexd service is not active"
+fi
+
+# plexd.service wants the helper socket and names it in Also=, so enabling and
+# starting plexd brings it up too.
+HELPER_SOCKET_STATE=$(docker exec "${SYSTEMD_CONTAINER}" systemctl is-active plexd-session-helper.socket 2>/dev/null || true)
+if [ "${HELPER_SOCKET_STATE}" = "active" ]; then
+    echo "  PASS: plexd-session-helper.socket is active"
+else
+    fail "plexd-session-helper.socket is '${HELPER_SOCKET_STATE}', want 'active'"
 fi
 
 # Poll mock-api assertion endpoint (REQ-004).
@@ -795,6 +809,219 @@ if [ "${LOCAL_ELAPSED}" -ge "${LOCAL_TIMEOUT}" ]; then
 fi
 
 echo "=== Local endpoint delivery PASSED ==="
+
+# --- Mediated ssh session ---
+# An ssh entry in the sessions block makes plexd bind an SSH listener on its
+# mesh address and report it on a session_started row. A client logs in as the
+# entry's user with the session token as password, and plexd starts the
+# command through plexd-session-helper.socket, whose root helper verifies the
+# token again against the key it pinned from identity.json. The listener binds
+# the mesh address the mock assigns, so the client dials from inside the
+# container.
+echo "=== Testing mediated ssh session ==="
+
+NODE_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3"
+MESH_IP="10.99.0.1"
+# One password prompt: a refused token then ends ssh with 255 and "Permission
+# denied" instead of sshpass giving up on the repeated prompt with its own 5.
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+    -o PreferredAuthentications=password -o PubkeyAuthentication=no
+    -o NumberOfPasswordPrompts=1)
+SSH_ERR=$(mktemp)
+
+# Render one ssh entry of the sessions block.
+ssh_session_entry() {
+    local session_id=$1 user=$2 expires_at=$3
+    cat <<SSHENTRYEOF
+{
+  "session_id": "${session_id}",
+  "jti": "${session_id}",
+  "kind": "ssh",
+  "target": {"ssh": {"user": "${user}"}},
+  "expires_at": "${expires_at}"
+}
+SSHENTRYEOF
+}
+
+# Splice a sessions block into the live snapshot and nudge plexd into a pull,
+# the way the executions phase configures its block.
+configure_sessions() {
+    local tag=$1 entries=$2 snapshot spliced status
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/${NODE_ID}/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson e "${entries}" '.sessions = $e')
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "{\"id\": \"evt-e2e-ssh-nudge-${tag}\", \"type\": \"node_state_updated\", \"scope\": \"node\", \"payload\": {\"node_id\": \"e2e-systemd-node\"}}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] sessions nudge injection returned status ${status}, want 204"
+    fi
+}
+
+# Mint a session token from the mock, signed with the key registration handed
+# out.
+mint_session_token() {
+    local session_id=$1 user=$2 token
+    token=$(curl -sf -X POST -H "Content-Type: application/json" \
+        -d "{\"session_id\": \"${session_id}\", \"user\": \"${user}\", \"ttl_seconds\": 600}" \
+        "http://localhost:18080/test/session-token" | jq -r '.token // empty')
+    if [ -z "${token}" ]; then
+        fail "could not mint a session token for ${session_id}"
+    fi
+    echo "${token}"
+}
+
+# Run one command over ssh from inside the container; stderr lands in SSH_ERR.
+ssh_in_node() {
+    local token=$1 port=$2 user=$3 command=$4
+    docker exec -e SSHPASS="${token}" "${SYSTEMD_CONTAINER}" \
+        sshpass -e ssh "${SSH_OPTS[@]}" -p "${port}" "${user}@${MESH_IP}" "${command}" 2>"${SSH_ERR}"
+}
+
+last_session_activity() {
+    curl -sf "http://localhost:18080/test/last-request/session_activity" 2>/dev/null || true
+}
+
+# ExpiresAt 10 minutes ahead in RFC 3339 UTC (GNU date -d, BSD date -v fallback).
+SSH_EXPIRES_AT=$(date -u -d "+10 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+10M +%Y-%m-%dT%H:%M:%SZ)
+ROOT_ENTRY=$(ssh_session_entry "sess-e2e-ssh-root" "root" "${SSH_EXPIRES_AT}")
+USER_ENTRY=$(ssh_session_entry "sess-e2e-ssh-user" "e2e" "${SSH_EXPIRES_AT}")
+
+# Step 1: an entry for root brings up a listener on the mesh address.
+configure_sessions "ssh-root" "[${ROOT_ENTRY}]"
+ROOT_ENDPOINT=""
+SSH_ELAPSED=0
+while [ "${SSH_ELAPSED}" -lt 60 ]; do
+    BODY=$(last_session_activity)
+    if [ "$(echo "${BODY}" | jq -r '.ssh.phase // empty' 2>/dev/null)" = "session_started" ]; then
+        ROOT_ENDPOINT=$(echo "${BODY}" | jq -r '.ssh.listener_endpoint // empty')
+        break
+    fi
+    sleep 2
+    SSH_ELAPSED=$((SSH_ELAPSED + 2))
+done
+if [ -z "${ROOT_ENDPOINT}" ]; then
+    docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>/dev/null || true
+    fail "no ssh session_started row within 60s of configuring the root entry"
+fi
+case "${ROOT_ENDPOINT}" in
+    "${MESH_IP}":*) echo "  PASS: ssh session_started row carries listener_endpoint ${ROOT_ENDPOINT}" ;;
+    *) fail "ssh listener_endpoint = '${ROOT_ENDPOINT}', want ${MESH_IP}:<port>" ;;
+esac
+ROOT_PORT=${ROOT_ENDPOINT##*:}
+
+# Step 2: log in as root with the session token and run one command.
+ROOT_TOKEN=$(mint_session_token "sess-e2e-ssh-root" "root")
+SSH_RC=0
+SSH_OUT=$(ssh_in_node "${ROOT_TOKEN}" "${ROOT_PORT}" root 'id -un') || SSH_RC=$?
+if [ "${SSH_RC}" -ne 0 ] || [ "${SSH_OUT}" != "root" ]; then
+    cat "${SSH_ERR}"
+    fail "ssh 'id -un' as root exited ${SSH_RC} and printed '${SSH_OUT}', want 0 and 'root'"
+fi
+echo "  PASS: ssh 'id -un' printed root"
+BODY=$(last_session_activity)
+if [ "$(echo "${BODY}" | jq -r '.ssh.command // empty')" = "id -un" ] && [ "$(echo "${BODY}" | jq -r '.ssh.exit_code // empty')" = "0" ]; then
+    echo "  PASS: the command_exited row carries 'id -un' and exit_code 0"
+else
+    fail "last session activity = ${BODY}, want the command_exited row of 'id -un' with exit_code 0"
+fi
+
+# Step 3: the helper's first run pinned the identity's signing key where plexd
+# cannot write.
+PIN_MODE=$(docker exec "${SYSTEMD_CONTAINER}" stat -c %a /etc/plexd/session-signing-key 2>/dev/null || true)
+PIN_KEY=$(docker exec "${SYSTEMD_CONTAINER}" cat /etc/plexd/session-signing-key 2>/dev/null || true)
+IDENTITY_KEY=$(docker exec "${SYSTEMD_CONTAINER}" jq -r '.signing_public_key' /var/lib/plexd/identity.json 2>/dev/null || true)
+if [ "${PIN_MODE}" = "644" ] && [ -n "${IDENTITY_KEY}" ] && [ "${PIN_KEY}" = "${IDENTITY_KEY}" ]; then
+    echo "  PASS: /etc/plexd/session-signing-key is mode 644 and holds the signing key"
+else
+    fail "session-signing-key mode '${PIN_MODE}' holds '${PIN_KEY}', want 644 and '${IDENTITY_KEY}'"
+fi
+
+# Step 4: a second entry for an unprivileged user gets its own listener, and the
+# helper switches to that user.
+configure_sessions "ssh-user" "[${ROOT_ENTRY}, ${USER_ENTRY}]"
+USER_ENDPOINT=""
+SSH_ELAPSED=0
+while [ "${SSH_ELAPSED}" -lt 60 ]; do
+    BODY=$(last_session_activity)
+    ENDPOINT=$(echo "${BODY}" | jq -r 'select(.ssh.phase == "session_started") | .ssh.listener_endpoint // empty' 2>/dev/null || true)
+    if [ -n "${ENDPOINT}" ] && [ "${ENDPOINT}" != "${ROOT_ENDPOINT}" ]; then
+        USER_ENDPOINT=${ENDPOINT}
+        break
+    fi
+    sleep 2
+    SSH_ELAPSED=$((SSH_ELAPSED + 2))
+done
+if [ -z "${USER_ENDPOINT}" ]; then
+    fail "no second ssh session_started row within 60s of configuring the e2e entry"
+fi
+USER_TOKEN=$(mint_session_token "sess-e2e-ssh-user" "e2e")
+SSH_RC=0
+SSH_OUT=$(ssh_in_node "${USER_TOKEN}" "${USER_ENDPOINT##*:}" e2e 'id -un') || SSH_RC=$?
+if [ "${SSH_RC}" -ne 0 ] || [ "${SSH_OUT}" != "e2e" ]; then
+    cat "${SSH_ERR}"
+    fail "ssh 'id -un' as e2e exited ${SSH_RC} and printed '${SSH_OUT}', want 0 and 'e2e'"
+fi
+echo "  PASS: ssh 'id -un' printed e2e (the helper switched uid)"
+
+# Step 5: the exit status travels back, and a token for another session is
+# refused.
+SSH_RC=0
+ssh_in_node "${ROOT_TOKEN}" "${ROOT_PORT}" root 'exit 3' >/dev/null || SSH_RC=$?
+if [ "${SSH_RC}" -eq 3 ]; then
+    echo "  PASS: ssh 'exit 3' exited 3"
+else
+    cat "${SSH_ERR}"
+    fail "ssh 'exit 3' exited ${SSH_RC}, want 3"
+fi
+OTHER_TOKEN=$(mint_session_token "sess-e2e-other" "root")
+SSH_RC=0
+ssh_in_node "${OTHER_TOKEN}" "${ROOT_PORT}" root 'id -un' >/dev/null || SSH_RC=$?
+if [ "${SSH_RC}" -eq 255 ] && grep -q "Permission denied" "${SSH_ERR}"; then
+    echo "  PASS: a token for another session was refused (exit 255, Permission denied)"
+else
+    cat "${SSH_ERR}"
+    fail "a token for another session exited ${SSH_RC}, want 255 with 'Permission denied'"
+fi
+
+# Step 6: draining the block closes both listeners. Each session_ended row
+# posts for a session the mock already holds as revoked, so both are refused
+# and counted as rejected, as the tcp drain is in the docker suite.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+SSH_REJ_BEFORE=$(get_counter "${RESPONSE}" "session_activity_rejected_count")
+configure_sessions "ssh-drain" "[]"
+SSH_ELAPSED=0
+SSH_REJ_AFTER=${SSH_REJ_BEFORE}
+while [ "${SSH_ELAPSED}" -lt 60 ]; do
+    SSH_REJ_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_rejected_count")
+    if [ "${SSH_REJ_AFTER}" -ge $((SSH_REJ_BEFORE + 2)) ]; then
+        break
+    fi
+    sleep 2
+    SSH_ELAPSED=$((SSH_ELAPSED + 2))
+done
+if [ "${SSH_REJ_AFTER}" -lt $((SSH_REJ_BEFORE + 2)) ]; then
+    fail "session_activity_rejected_count went from ${SSH_REJ_BEFORE} to ${SSH_REJ_AFTER} after the drain, want +2"
+fi
+BODY=$(last_session_activity)
+if [ "$(echo "${BODY}" | jq -r '.ssh.phase // empty')" = "session_ended" ] && [ "$(echo "${BODY}" | jq -r '.ssh.terminated_by // empty')" = "plexd_close" ]; then
+    echo "  PASS: the drain posted ssh session_ended rows with terminated_by plexd_close"
+else
+    fail "last session activity = ${BODY}, want an ssh session_ended row with terminated_by plexd_close"
+fi
+rm -f "${SSH_ERR}"
+
+echo "=== Mediated ssh session PASSED ==="
 
 # --- Clean shutdown verification (REQ-005) ---
 echo "=== Stopping plexd service ==="
