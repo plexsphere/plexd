@@ -680,12 +680,13 @@ on the terminal callback.
 
 ### POST /v1/nodes/{node_id}/sessions/{session_id}
 
-A one-of activity record carrying exactly one of `ssh`, `k8s`, or `tcp`. plexd's
-tunnel subsystem is an opaque TCP forwarder, so it emits only `tcp` rows: a
-`session_started` row when the listener comes up and a `session_ended` row on
-close.
+A one-of activity record carrying exactly one of `ssh`, `k8s`, or `tcp`. plexd
+emits `tcp` rows for a tcp session: a `session_started` row when the listener
+comes up and a `session_ended` row on close. It emits `ssh` rows for an ssh
+session, served on Linux: the same two lifecycle rows, plus two command rows
+around every `exec`. It emits no `k8s` rows.
 
-**Request body** (`session_started`). `listener_endpoint` is the address the node
+**Request body** (tcp `session_started`). `listener_endpoint` is the address the node
 actually bound, so the control plane has somewhere to send the operator; it is
 set on started rows only:
 
@@ -700,7 +701,7 @@ set on started rows only:
 }
 ```
 
-**Request body** (`session_ended`). `bytes_in` (operator→target) and `bytes_out`
+**Request body** (tcp `session_ended`). `bytes_in` (operator→target) and `bytes_out`
 (target→operator) are explicit, present even when `0`; `terminated_by` is one of
 `ttl_expired`, `idle_timeout`, `operator_revoke`, or `plexd_close`. plexd itself
 never sends `operator_revoke`: a revoked session reaches the node as the absence
@@ -720,10 +721,40 @@ serve the block, so a drained entry is reported as `plexd_close`:
 }
 ```
 
+**Request body** (ssh `session_started` and `session_ended`). A lifecycle row
+carries no command fields and no byte counters:
+
+```json
+{"ssh": {"phase": "session_started", "listener_endpoint": "10.99.0.1:40000"}}
+```
+
+```json
+{"ssh": {"phase": "session_ended", "terminated_by": "idle_timeout"}}
+```
+
+**Request body** (ssh command rows). An `exec` fails closed: plexd posts the
+first row before the command runs and runs it only once the row is accepted, and
+the second once the command exited. Times are UTC:
+
+```json
+{"ssh": {"command": "uptime", "started_at": "2026-09-24T08:00:00Z"}}
+```
+
+```json
+{
+  "ssh": {
+    "command": "uptime",
+    "exit_code": 0,
+    "started_at": "2026-09-24T08:00:00Z",
+    "completed_at": "2026-09-24T08:00:03Z"
+  }
+}
+```
+
 | Response | Meaning |
 |---|---|
 | `204 No Content` | Activity record accepted |
-| `400 Bad Request` (`malformed_session_activity`) | Body is unreadable, fails strict decoding, or violates the one-of contract |
+| `400 Bad Request` (`malformed_session_activity`) | Body is unreadable, fails strict decoding, violates the one-of contract, mixes the ssh lifecycle and command shapes, or populates a member other than the session's kind |
 | `403 Forbidden` (`nsk_node_mismatch`) | Record targets a node other than the caller's identity |
 | `404 Not Found` (`session_not_found`) | No session resolves for this node and session id |
 | `409 Conflict` (`session_already_revoked`) | The session has been revoked |
@@ -738,7 +769,9 @@ It is the expected answer for every drain-driven close, since the control plane
 already holds the session as revoked or expired by the time the node has observed
 the drain. The teardown itself stays with the `sessions` block drain: the answer
 never closes a session, and while the block keeps carrying an entry answered this
-way, every pull warns that its listener is still forwarding.
+way, every pull warns that its listener is still forwarding. On an ssh command
+row that precedes an `exec` the answer means the command does not run, and it
+closes the client's connection.
 
 The `404` is not classified with them. It is the `sessions` block and the session
 store disagreeing — two separate reads, so a lagging replica, a session record

@@ -175,6 +175,8 @@ PSKs are rotated together with the main key pairs and whenever a peer is removed
 | Unauthorized local action execution | SSH user runs actions without permission | Requires valid session JWT; `--local` restricted to root and logged as emergency |
 | Unauthorized secret access (local) | Attacker on node reads secrets via socket or K8s Secret | Linux/macOS: socket requires root or `plexd-secrets`; Windows: pipe requires an elevated Administrator or LocalSystem token; K8s Secrets contain only NSK-encrypted ciphertext; decryption requires plexd API with valid bearer token + live control plane |
 | NSK compromised | Attacker could decrypt secret ciphertext from K8s Secrets or intercepted responses | NSK rotation invalidates old key; secrets are fetched in real-time so no historical ciphertext accumulates on-node; control plane re-encrypts with new NSK |
+| plexd compromised (Linux) | Attacker controls the process that serves mediated ssh sessions | plexd starts no shell itself: the root session helper verifies every session token again against a signing key in `/etc/plexd`, which plexd's unit keeps read-only, so without a token the control plane signed the attacker cannot open a shell. Hosts without `plexd-session-helper.socket` run the helper as plexd's own child, which is no boundary |
+| Session token replayed after revocation | A compromised plexd reuses a token a client presented to open further shells | The listener closes when the entry drains from the sessions block, but the helper cannot see revocations: the token stays usable until its `exp`. Tokens are short-lived and bound to one session id and user |
 
 ## Network Requirements
 

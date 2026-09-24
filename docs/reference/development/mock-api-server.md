@@ -612,9 +612,18 @@ The `404` / `409` / `413` problem bodies carry no machine `code`.
 The v1 session activity record. The mock enforces the node-id guard, a 16 KiB body
 cap, strict decoding, and the one-of `ssh` / `k8s` / `tcp` contract: exactly one
 member must be set, and that member must satisfy its per-kind rules —
-`ssh.command` non-empty and at most 1 KiB, `k8s.verb` non-empty, or `tcp.phase`
-one of `session_started` / `session_ended` with a valid `terminated_by` when set.
-A record that clears those structural gates goes on to liveness resolution.
+`k8s.verb` non-empty, `tcp.phase` one of `session_started` / `session_ended` with
+a valid `terminated_by` when set, or one of the two `ssh` shapes the control plane
+admits:
+
+- a lifecycle row (`phase` set) carries no `command`, `exit_code`, `started_at` or `completed_at`; its phase is `session_started` without `terminated_by`, or `session_ended` without `listener_endpoint` and with a valid `terminated_by` when set;
+- a command row carries a `command` of 1 to 1024 bytes and neither `terminated_by` nor `listener_endpoint`.
+
+So `{"ssh":{}}`, `{"ssh":{"command":"ls","phase":"session_started"}}`,
+`{"ssh":{"phase":"session_paused"}}` and
+`{"ssh":{"phase":"session_ended","listener_endpoint":"10.99.0.1:1"}}` are all
+`400 malformed_session_activity`. A record that clears those structural gates goes
+on to liveness resolution.
 
 Liveness resolves `{sid}` against the configured `sessions` block and against a
 `session_id` registry that `POST /test/configure-state` (and `PUT /test/state`)
@@ -633,9 +642,8 @@ and an id in neither is a `404 session_not_found`; each of those three
 increments `session_activity_rejected_count`. Configuring the id again makes it
 live again. The body is captured before validation, so
 `GET /test/last-request/session_activity` holds the last posted row whether or
-not it was accepted. The mock accepts configured sessions of any kind, so `ssh`
-and `k8s` rows are testable against it even though plexd produces only `tcp`
-rows.
+not it was accepted. The mock accepts configured sessions of any kind, so `k8s`
+rows are testable against it even though plexd produces none.
 
 Strict decoding means the accepted `tcp` fields are exactly those of
 `api.TCPActivity`, `listener_endpoint` among them — a node that reports the
@@ -1004,6 +1012,32 @@ enum: `streaming` or `descoped`.
 - Request body is captured and retrievable via `GET /test/last-request/configure_events`.
 
 **Error:** Returns `400` if the body is not valid JSON, contains an unknown field, or carries a `mode` other than `streaming` or `descoped`. Returns `405` if the HTTP method is not `POST`.
+
+### `POST /test/session-token`
+
+Mints the token a mediated ssh session logs in with: a compact JWS signed with
+the mock's signing key, the key `POST /v1/register` hands out as
+`signing_public_key`, so plexd and its session helper accept it the way they
+accept a token the control plane signed with the Domain key.
+
+**Request body:**
+
+```json
+{"session_id": "sess-e2e-ssh-root", "user": "root", "allowed_commands": ["uptime"], "ttl_seconds": 600}
+```
+
+`allowed_commands` is optional.
+
+**Response:** `200 OK` with `{"token": "<header>.<claims>.<signature>"}`. The
+header is `{"alg":"EdDSA","kid":"did:web:plexsphere.com#key-e2e","typ":"at+jwt"}`.
+The claims are `iss` `plexsphere://domain/e2e`, `aud` `resource://e2e`, `sub`
+`identity://e2e`, `jti` equal to `session_id`, `kind` `ssh`, `target`
+`{"kind":"ssh","user":…,"allowed_commands":…}`, and `iat`, `nbf` and `exp` in Unix
+seconds, with `iat` and `nbf` now and `exp` now plus `ttl_seconds`.
+
+**Error:** Returns `400` if the body is not valid JSON, `session_id` or `user` is
+empty, or `ttl_seconds` is outside 1 to 3600. Returns `405` if the HTTP method is
+not `POST`.
 
 ### `GET /test/last-request/{endpoint}`
 

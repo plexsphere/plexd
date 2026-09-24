@@ -6,7 +6,7 @@ feature: PXD-0009
 
 # Secure Access Tunneling
 
-The `internal/tunnel` package provides platform-mediated access to mesh nodes through WireGuard tunnels without exposing services to the public internet. The control plane declares a node's live sessions in the `sessions` block of the reconciliation state pull; the node agent holds its listeners level with that block, opening a local TCP listener bound to the mesh IP for each entry it can provision, forwarding connections to the target host, and reporting activity back to the control plane.
+The `internal/tunnel` package provides platform-mediated access to mesh nodes through WireGuard tunnels without exposing services to the public internet. The control plane declares a node's live sessions in the `sessions` block of the reconciliation state pull; the node agent holds its listeners level with that block, opening a listener bound to the mesh IP for each entry it can provision, and reporting activity back to the control plane. A `tcp` entry gets a TCP listener that forwards connections to the target host. On Linux, an `ssh` entry gets an SSH listener that starts a shell or one command for the session's user (see [SSH Sessions](#ssh-sessions)).
 
 The block is **desired state, not a delivery queue**: an entry stands for as long as its session is valid, and its disappearance is the teardown signal. Revocation and hard expiry both reach the node as that same absence — there is no revocation event to answer and no terminal status to report.
 
@@ -51,11 +51,11 @@ Control Plane
 1. The reconciler pulls `GET /v1/nodes/{node_id}/state` on its cadence, or immediately when an SSE event — `session_setup` among them — triggers a cycle
 2. `Dispatcher.Handle` runs on every successful pull, **before** the empty-diff short-circuit, so an unchanged snapshot still reconciles sessions
 3. Teardown pass: every live session whose entry is no longer in the block is closed, with the reason derived from its capped local expiry
-4. Provision pass, in block order: each entry not yet settled is validated and, if it is a `tcp` entry, handed to `SessionManager.CreateSession`, which opens a TCP listener on `meshIP:0`
-5. Report pass: once the block is provisioned, `SessionActivityReporter.ReportSessionStarted` posts a `tcp` `session_started` row per listener whose row is still outstanding — with the target host and port and the `listener_endpoint` the listener actually bound. A row that does not land is re-posted on the next pull from the same listener, so `listener_endpoint` stays stable across attempts. The posts run concurrently and each is bounded, so a stalled control plane cannot hold the reconciler's single goroutine for the length of the block. A row answered with a terminal-state verdict (a `409` `session_already_revoked` or `session_expired`, classified by `api.IsSessionRevokedOrExpired`) is settled rather than re-posted and is logged at Info (`session no longer live server-side; awaiting the drain`); the listener stays up and the block drain performs the teardown, and every pull that still carries the settled entry warns that the listener is forwarding for a session the platform has withdrawn. A `404` `session_not_found` is not a terminal state — the block and the session store are separate reads that can disagree — so it stays on the re-post path
+4. Provision pass, in block order: each entry not yet settled is validated and, if it is a `tcp` entry or, on Linux, an `ssh` entry, handed to `SessionManager.CreateSession`, which opens a listener on `meshIP:0`
+5. Report pass: once the block is provisioned, `SessionActivityReporter.ReportSessionStarted` posts a `session_started` row per listener whose row is still outstanding — the `tcp` row with the target host and port, or the `ssh` lifecycle row, each with the `listener_endpoint` the listener actually bound. A row that does not land is re-posted on the next pull from the same listener, so `listener_endpoint` stays stable across attempts. The posts run concurrently and each is bounded, so a stalled control plane cannot hold the reconciler's single goroutine for the length of the block. A row answered with a terminal-state verdict (a `409` `session_already_revoked` or `session_expired`, classified by `api.IsSessionRevokedOrExpired`) is settled rather than re-posted and is logged at Info (`session no longer live server-side; awaiting the drain`); the listener stays up and the block drain performs the teardown, and every pull that still carries the settled entry warns that the listener is forwarding for a session the platform has withdrawn. A `404` `session_not_found` is not a terminal state — the block and the session store are separate reads that can disagree — so it stays on the re-post path
 6. A client connects through the mesh to that listener; `Session` forwards to the target
 7. A session ends when its entry drains from the block, when its capped expiry fires, when its idle window elapses, or on `Shutdown`
-8. The `SessionManager`'s on-closed callback fires the production reporter's `ReportSessionEnded`, posting a `tcp` `session_ended` row with byte counters and a `terminated_by` reason for every close reason, `Shutdown` included. For a drain-driven close the platform already holds the session as revoked or expired and answers `409`; the row is fire-once and nothing re-posts it, so plexd warns (`tunnel session ended row refused; its counters are recorded only here`) and carries the byte counters and `terminated_by` into that line, which is where they survive
+8. The `SessionManager`'s on-closed callback fires the production reporter's `ReportSessionEnded`, posting a `session_ended` row with a `terminated_by` reason for every close reason, `Shutdown` included: the `tcp` row carries the byte counters, the `ssh` row picks its shape from `ClosedSessionInfo.Kind`. For a drain-driven close the platform already holds the session as revoked or expired and answers `409`; the row is fire-once and nothing re-posts it, so plexd warns (`tunnel session ended row refused; its counters are recorded only here`) and carries the byte counters and `terminated_by` into that line, which is where they survive
 
 ## Config
 
@@ -68,6 +68,8 @@ Control Plane
 | `DefaultTimeout` | `time.Duration` | `30m`   | Default/maximum session timeout                |
 | `SSHListenAddr`  | `string`        | —       | SSH mesh server listen address (empty = no SSH server) |
 | `HostKeyDir`     | `string`        | —       | Directory for SSH host key (empty = transient key)     |
+| `SSHSessionsEnabled` | `*bool`     | `true`  | `ssh_sessions_enabled`: whether the node serves mediated ssh sessions; read through `SSHSessionsAllowed()`, where nil means true |
+| `SessionSigningPublicKey` | `string` | —     | `session_signing_public_key`: standard-base64 Ed25519 key the session helper verifies tokens against; empty means the helper pins the identity's key (see [Trust anchor](#trust-anchor)) |
 
 ```go
 cfg := tunnel.Config{
@@ -89,8 +91,9 @@ if err := cfg.Validate(); err != nil {
 |------------------|---------------------------|---------------------------------------------------------------|
 | `MaxSessions`    | Must be > 0 when enabled  | `tunnel: config: MaxSessions must be positive when enabled`   |
 | `DefaultTimeout` | Must be >= 1m when enabled| `tunnel: config: DefaultTimeout must be at least 1m when enabled` |
+| `SessionSigningPublicKey` | Empty, or standard base64 decoding to 32 bytes | `tunnel: config: session_signing_public_key: ...` |
 
-Validation is skipped entirely when `Enabled` is `false`.
+The key is checked whatever `Enabled` says, because the session helper reads it either way. The other rules are skipped when `Enabled` is `false`.
 
 ## Session
 
@@ -153,6 +156,7 @@ func NewSessionManager(cfg Config, meshIP string, logger *slog.Logger) *SessionM
 | Method           | Signature                                                          | Description                                              |
 |------------------|--------------------------------------------------------------------|----------------------------------------------------------|
 | `CreateSession`  | `(ctx context.Context, sess api.NodeStateSession) (string, error)` | Validates one entry of the `sessions` block, creates and starts its session, and returns the bound listener address |
+| `SetSSHSessionDeps` | `(deps SSHSessionDeps)`                                         | Wires the host key, signing keys, command reporter and session launcher ssh sessions need; `plexd up` calls it on Linux |
 | `CloseSession`   | `(sessionID string, reason string) *ClosedSessionInfo`             | Closes and removes a session by ID; returns session info |
 | `Shutdown`       | `()`                                                               | Closes all active sessions, reporting each through the on-closed callback |
 | `ActiveSessions` | `() map[string]time.Time`                                          | Snapshot of live session IDs and their **capped** local expiry; the dispatcher's teardown input |
@@ -160,23 +164,31 @@ func NewSessionManager(cfg Config, meshIP string, logger *slog.Logger) *SessionM
 
 ### CreateSession Validation
 
-Only `tcp` entries are provisionable. The dispatcher filters the block before
-calling in; the kind guard repeats the check so the manager is safe to call on its
-own.
+`tcp` entries are provisionable everywhere, `ssh` entries on Linux once
+`SetSSHSessionDeps` wired them. The dispatcher filters the block before calling in;
+the kind guard repeats the check so the manager is safe to call on its own. Both
+kinds share one session map, so `MaxSessions` and the `DefaultTimeout` cap count
+them together.
 
 | Check                  | Condition                                   | Error                                              |
 |------------------------|---------------------------------------------|-----------------------------------------------------|
 | Tunneling disabled     | `cfg.Enabled == false`                      | `ErrTunnelingDisabled` (`tunnel: tunneling is disabled`) |
-| Not provisionable      | `Kind != "tcp"`, or `Target.TCP == nil`     | `tunnel: session kind is not provisionable`         |
-| Missing fields         | Empty ID, empty host, or port outside 1-65535 | `tunnel: invalid session setup: ...`              |
+| Not provisionable      | `Kind` is neither `tcp` nor `ssh`, or the entry lacks the target of its kind | `tunnel: session kind is not provisionable` |
+| Missing fields (`tcp`) | Empty ID, empty host, or port outside 1-65535 | `tunnel: invalid session setup: ...`              |
+| Unsupported (`ssh`)    | Not Linux                                   | `ErrSSHSessionsUnsupported` (`tunnel: ssh sessions are not supported on this platform`) |
+| Refused (`ssh`)        | `ssh_sessions_enabled: false`               | `ErrSSHSessionsDisabled` (`tunnel: ssh sessions are disabled on this node`) |
+| Missing user (`ssh`)   | Empty `target.ssh.user`                     | `tunnel: invalid session setup: ssh target user is required` |
+| Not wired (`ssh`)      | Any `SSHSessionDeps` member is nil          | `tunnel: ssh sessions are not wired: host key, signing keys, command reporter and session launcher are required` |
+| Missing ID (`ssh`)     | Empty `session_id`                          | `tunnel: invalid session setup: session_id is required` |
 | Already expired        | `ExpiresAt` in the past                     | `tunnel: session already expired`                   |
 | Duplicate ID           | Session ID already exists                   | `tunnel: duplicate session ID: {id}`                |
 | Capacity               | `len(sessions) >= MaxSessions`              | `tunnel: max sessions reached ({n})`                |
 | Invalid idle window    | `IdleTimeoutSeconds` negative or above 86400 | `tunnel: invalid idle_timeout_seconds: {n}`        |
 | Unbindable mesh IP     | `meshIP` empty, not an IP address, multicast, or unspecified once the zone is stripped and the IPv4-mapped form unwrapped (`0.0.0.0`, `::`, `::ffff:0.0.0.0`, `::%eth0`) | `tunnel: mesh IP {ip} is not a bindable unicast address; refusing to bind a session listener` |
 
-`ErrTunnelingDisabled` is a sentinel: the dispatcher matches it with `errors.Is`
-to settle an entry permanently instead of retrying it on every pull.
+`ErrTunnelingDisabled` and `ErrSSHSessionsDisabled` are sentinels: the dispatcher
+matches them with `errors.Is` to settle an entry permanently instead of retrying it
+on every pull.
 
 ### Expiry
 
@@ -190,7 +202,7 @@ An entry with `idle_timeout_seconds > 0` arms an idle monitor; `0` or an absent
 value means the session has no idle window.
 
 - `idle_timeout_seconds` is validated on the way in: a negative value, or one large enough to overflow the seconds-to-`Duration` multiplication, is rejected rather than silently read as "no idle window"
-- Byte flow re-arms the window: every forwarded chunk stamps the session's last activity, so the monitor either closes the session or waits out the remaining window
+- Byte flow re-arms the window: every forwarded chunk of a tcp session, and every byte read from or written to any connection of an ssh session, stamps the session's last activity, so the monitor either closes the session or waits out the remaining window
 - Activity is stamped as a monotonic offset, not a wall-clock time: an NTP step or a VM snapshot resume cannot stretch or collapse the window
 - The listener bind counts as the first activity, so a listener no connection ever reaches idles out one window after `Start`
 - The close runs through `CloseSession(id, "idle")` like any other, so the `session_ended` row still carries the byte counters and, via the reason, a `terminated_by` of `idle_timeout`
@@ -281,18 +293,21 @@ live, or permanently settled — so a settled entry is a no-op on every later pu
 | Live session not yet in `known`                    | Recorded as known; the listener is already bound, so no second setup     | yes     |
 | `expires_at` is the zero time                      | Warning (`session carries no expires_at; refusing to provision`)          | yes     |
 | `expires_at` is not in the future                  | Info (`session expired; waiting for the control plane to drain the entry`) | yes     |
-| `kind` is `ssh` or `k8s`                           | One warning (`unsupported session kind; no listener provisioned`); no listener, no activity row | yes |
+| `kind` is `k8s`, or `ssh` off Linux                | One warning (`unsupported session kind; no listener provisioned`); no listener, no activity row | yes |
 | `kind` is none of the three the contract names     | Warning (`unrecognised session kind; no listener provisioned`) — the target is fine, the kind is not one this build knows | yes |
-| `tcp` entry without a `tcp` target, or with more than one target member set | Warning (`session target does not match kind`)  | yes     |
-| Valid `tcp` entry, `CreateSession` succeeds        | Listener bound; `ReportSessionStarted` posts the `session_started` row with `listener_endpoint` | yes |
+| `tcp` or `ssh` entry without the target of its kind, or with more than one target member set | Warning (`session target does not match kind`)  | yes     |
+| Valid `tcp` or `ssh` entry, `CreateSession` succeeds | Listener bound; `ReportSessionStarted` posts the `session_started` row with `listener_endpoint` | yes |
 | The `session_started` row does not reach the control plane | Warning; the listener stays bound and the entry is left unsettled so the next pull re-posts the row from the same `listener_endpoint` | **no** |
 | The `session_started` row is answered `409 session_already_revoked` / `session_expired` | Info (`session no longer live server-side; awaiting the drain`); the listener stays bound, the entry is settled, the teardown waits for the block drain, and each later pull still carrying the entry warns | yes |
 | `CreateSession` returns `ErrTunnelingDisabled`     | Warning (`tunneling is disabled; no listener provisioned`) — configuration, not weather | yes |
+| `CreateSession` returns `ErrSSHSessionsDisabled`   | Warning (`ssh sessions are disabled on this node; no listener provisioned`) | yes |
 | `CreateSession` fails otherwise                    | Warning (`session listener setup failed`); left unsettled so the next pull retries | **no** |
 
-`ssh` and `k8s` entries are part of the contract but not of this agent's
-mediation. They are settled rather than retried, so the warning is emitted once
-per entry rather than once per pull.
+`k8s` entries are part of the contract but not of this agent's mediation, and
+`ssh` entries are served on Linux only. Both are settled rather than retried, so
+the warning is emitted once per entry rather than once per pull. An `ssh` entry
+with an empty user, or one reaching a manager nobody wired, is a setup failure and
+is retried.
 
 An entry draining from the block also prunes its ID from `known` and from the
 outstanding-row set, which bounds both by the size of the block. The pass carries
@@ -311,15 +326,20 @@ reconciler.RegisterDispatchHandler(sessionDispatcher.Handle)
 
 ## SessionActivityReporter
 
-Interface for reporting `tcp`-phase session activity rows to the control plane. Abstracted for testability.
+Interface for reporting a session's `session_started` row to the control plane. Abstracted for testability.
 
 ```go
 type SessionActivityReporter interface {
-    ReportSessionStarted(ctx context.Context, sessionID, targetHost string, targetPort int, listenerEndpoint string) error
+    ReportSessionStarted(ctx context.Context, entry api.NodeStateSession, listenerEndpoint string) error
+}
+
+type SSHCommandReporter interface {
+    ReportSSHCommandStarted(ctx context.Context, sessionID, command string, startedAt time.Time) error
+    ReportSSHCommandExited(ctx context.Context, sessionID, command string, exitCode int, startedAt, completedAt time.Time) error
 }
 ```
 
-A production implementation posts an `api.SessionActivityRequest` carrying a `tcp` `api.TCPActivity` to `api.ControlPlane.ReportSessionActivity` (`POST /v1/nodes/{node_id}/sessions/{session_id}`). `ReportSessionStarted` emits a `session_started` row carrying `listenerEndpoint` — the address the listener actually bound, so the control plane has somewhere to send the operator; `ReportSessionEnded` emits a `session_ended` row with the byte counters and a `terminated_by` reason. `ReportSessionEnded` is not on the interface: it is a method of the production `controlPlaneSessionReporter` in `cmd/plexd/cmd/up.go`, fired from the `SessionManager`'s on-closed callback that `plexd up` wires with `SetOnClosed`.
+The production implementation, `controlPlaneSessionReporter` in `cmd/plexd/cmd/up.go`, posts an `api.SessionActivityRequest` to `api.ControlPlane.ReportSessionActivity` (`POST /v1/nodes/{node_id}/sessions/{session_id}`). For a `tcp` entry `ReportSessionStarted` emits a `tcp` `session_started` row with the target and `listenerEndpoint`, the address the listener actually bound, so the control plane has somewhere to send the operator; for an `ssh` entry it emits the `ssh` lifecycle row with `listener_endpoint`. `ReportSessionEnded(ctx, sessionID, info *ClosedSessionInfo, terminatedBy)` emits a `session_ended` row: the `tcp` row with the byte counters, or, when `info.Kind` is `ssh`, the `ssh` row with `terminated_by` only. `ReportSessionEnded` is not on the interface: it is fired from the `SessionManager`'s on-closed callback that `plexd up` wires with `SetOnClosed`. The same type implements `SSHCommandReporter`, whose two rows the ssh listener posts around every `exec` (see [Commands and activity rows](#commands-and-activity-rows)); both return the post's error.
 
 `ReportSessionStarted` returns the post's error because the row is not merely an audit record: `listener_endpoint` is the operator's only route to the listener, so the dispatcher has to know whether the row landed. A terminal-state answer (`api.IsSessionRevokedOrExpired`: a `409` `session_already_revoked` or `session_expired`) settles the entry and is logged at Info; the listener stays bound until the block drain closes it. Every other error (a transport failure, a `400`, a `404` `session_not_found`, a `501` `access_session_not_provisioned`, a `5xx`) keeps the listener bound, leaves the entry unsettled, and re-posts the row on the next pull from the same `listener_endpoint`, logged at Warn. `ReportSessionEnded` returns nothing and is fire-once from the on-closed callback: a `409` is logged at Warn carrying the byte counters and `terminated_by` (the drain-driven ended row is answered `409` by design, and nothing re-posts it, so the line is where that payload survives), any other failure at Error, and nothing is retried.
 
@@ -349,8 +369,10 @@ type NodeStateSession struct {
 ### SessionTarget
 
 Exactly one member is set, matching `Kind` — `SessionKindSSH` (`ssh`),
-`SessionKindK8s` (`k8s`), or `SessionKindTCP` (`tcp`). Only `tcp` is provisionable
-by this agent; `ssh` and `k8s` entries are decoded and settled as unsupported.
+`SessionKindK8s` (`k8s`), or `SessionKindTCP` (`tcp`). This agent provisions `tcp`
+entries, and `ssh` entries on Linux; `k8s` entries, and `ssh` entries elsewhere,
+are decoded and settled as unsupported. The ssh listener takes the allowed-command
+list from the session token, not from `SessionTargetSSH.AllowedCommands`.
 
 ```go
 type SessionTarget struct {
@@ -378,10 +400,9 @@ type SessionTargetTCP struct {
 ### SessionActivityRequest
 
 Posted by the node agent per session event. Exactly one of `SSH`, `K8s`, or `TCP`
-is set, selecting the session kind. The tunnel subsystem is an opaque TCP
-forwarder, so it always sets `TCP`; the `SSH` and `K8s` variants are carried by
-the type and accepted by the control plane but not emitted by any current session
-type.
+is set, selecting the session kind. A tcp session sets `TCP` and an ssh session
+sets `SSH`; the `K8s` variant is carried by the type and accepted by the control
+plane but not emitted.
 
 ```go
 type SessionActivityRequest struct {
@@ -411,6 +432,28 @@ type TCPActivity struct {
     BytesIn          *int64 `json:"bytes_in,omitempty"`
     BytesOut         *int64 `json:"bytes_out,omitempty"`
     TerminatedBy     string `json:"terminated_by,omitempty"`
+}
+```
+
+### SSHActivity
+
+The `ssh` member takes one of two shapes. A **lifecycle row** carries `Phase`
+(`SSHPhaseSessionStarted` or `SSHPhaseSessionEnded`) plus `ListenerEndpoint` on
+`session_started` or `TerminatedBy` on `session_ended`, and no command fields. A
+**command row** carries `Command` (1 to 1024 bytes), with `StartedAt` on the row
+posted before the command runs and `ExitCode`, `StartedAt` and `CompletedAt` on
+the row posted after it exited. plexd never posts an empty `Command`: the control
+plane refuses a row that mixes the shapes.
+
+```go
+type SSHActivity struct {
+    Command          string     `json:"command,omitempty"`
+    ExitCode         *int       `json:"exit_code,omitempty"`
+    StartedAt        *time.Time `json:"started_at,omitempty"`
+    CompletedAt      *time.Time `json:"completed_at,omitempty"`
+    Phase            string     `json:"phase,omitempty"`
+    ListenerEndpoint string     `json:"listener_endpoint,omitempty"`
+    TerminatedBy     string     `json:"terminated_by,omitempty"`
 }
 ```
 
@@ -465,7 +508,7 @@ The node agent reports session activity via a single endpoint on `api.ControlPla
 
 | Method                  | Endpoint                             | When Called                                                            |
 |-------------------------|--------------------------------------|------------------------------------------------------------------------|
-| `ReportSessionActivity` | `POST /v1/nodes/{id}/sessions/{sid}` | Listener ready (`session_started`) and session close (`session_ended`) |
+| `ReportSessionActivity` | `POST /v1/nodes/{id}/sessions/{sid}` | Listener ready (`session_started`), session close (`session_ended`), and around every ssh `exec` (the two command rows) |
 
 ### WireGuard Mesh (`internal/wireguard`)
 
@@ -507,13 +550,144 @@ mgr.Shutdown()
 4. Connections arriving on that listener are forwarded through the encrypted mesh to the target host and port.
 5. The session ends when the control plane drops the entry from the block (`plexd_close`), when its capped expiry fires (`ttl_expired`), when its idle window elapses (`idle_timeout`), or on node shutdown (`plexd_close`). The `session_ended` row carries the byte counters and the reason.
 
-### SSH and Kubernetes Sessions
+### Kubernetes Sessions
 
-`ssh` and `k8s` entries are part of the `sessions` contract and plexd decodes them,
-but **this agent provisions no listener for them**: each is settled with a single
+`k8s` entries are part of the `sessions` contract and plexd decodes them, but
+**this agent provisions no listener for them**: each is settled with a single
 `unsupported session kind; no listener provisioned` warning and produces no
-activity row, so there is nothing to tear down when the entry later drains.
-Mediating those kinds from the block is follow-up work.
+activity row, so there is nothing to tear down when the entry later drains. No
+kube-apiserver proxy contract exists yet. `ssh` entries get the same treatment on
+macOS and Windows.
+
+## SSH Sessions
+
+On Linux, an `ssh` entry of the `sessions` block becomes an SSH-2 listener that a
+client logs in to with the session's token, as the `## SSH session listener`
+section of plexsphere's agent contract specifies. macOS and Windows settle `ssh`
+entries as unsupported. A node owner refuses ssh sessions, and keeps serving tcp
+ones, with `tunnel.ssh_sessions_enabled: false`.
+
+### Listener
+
+- One listener per session, on an ephemeral port of the mesh address, like a tcp session. The `session_started` row carries it as `listener_endpoint`.
+- It presents the node's SSH host key (`ssh_host_ed25519_key` in the data dir), whose fingerprint the capability manifest carries. Clients do not pin it (contract §d): the token authenticates the pair.
+- It identifies as `SSH-2.0-plexd`.
+- A session holds at most 4 concurrent connections (a fifth is closed before its handshake) and each connection at most 10 open session channels (an eleventh is rejected with `resource shortage`). A handshake has 30 s, and a connection 3 authentication attempts.
+- The mesh `SSHServer` (`tunnel.ssh_listen_addr`) is a separate server that keeps serving `direct-tcpip`.
+
+### Authentication
+
+The client logs in as the entry's `target.ssh.user`, with the session token as
+password; password is the only method offered. `VerifySessionToken` checks the
+token against the keys the envelope verifier trusts at that moment (the current
+signing key, plus the previous one during a rotation's grace window), in this
+order:
+
+1. at most 8192 bytes of three raw-base64url segments whose header and claims are JSON objects
+2. `alg` is `EdDSA`; `kid` is not consulted, since the contract binds the key and not its id
+3. the Ed25519 signature
+4. `kind` and `target.kind` are both `ssh`
+5. `jti` is the session id
+6. `nbf <= now < exp`, where a missing `exp` counts as expired; there is no clock-skew leeway
+7. `target.user` is the login user
+
+A refusal fails the handshake and is logged at Warn (`ssh login refused`). No log
+line and no error carries the token. `iss` and `aud` are not checked.
+
+### Requests
+
+| Request | Answer |
+|---------|--------|
+| `session` channel | Accepted; one process per channel |
+| Any other channel type (`direct-tcpip`, `x11`, `auth-agent@openssh.com`) | Rejected with `administratively prohibited` |
+| Global requests (`tcpip-forward` among them) | Refused |
+| `pty-req` | Allocates a pty sized from the request; terminal modes are ignored. Refused once a process started or a pty exists. A failed allocation answers false, and a later `shell` or `exec` runs without a pty |
+| `window-change` | Resizes the pty |
+| `shell` | Starts the user's login shell. Refused when the token lists allowed commands |
+| `exec` | Runs the command through the user's shell. Refused when it is empty, over 1024 bytes, or, under a non-empty allowed-command list, not byte-equal to one of its entries |
+| `env`, `subsystem` (`sftp` included), `x11-req`, `auth-agent-req@openssh.com`, `signal`, anything else | Refused |
+
+The allowed-command list comes from the verified token's `target` claim, not from
+the pull entry, so the list plexd checks is the list the session helper enforces.
+
+### Commands and activity rows
+
+The session posts two lifecycle rows, `{"ssh":{"phase":"session_started","listener_endpoint":"…"}}`
+when the listener is up and `{"ssh":{"phase":"session_ended","terminated_by":"…"}}`
+on close, and two command rows per `exec`. A shell posts no command rows.
+
+An `exec` fails closed. plexd first posts the command row
+`{"ssh":{"command":"…","started_at":"…"}}` and runs the command only once the
+control plane accepted it. When the post fails, the client's stderr reads
+`plexd: the control plane did not record this command; it was not run: <error>`
+and the exit status is 1; a `409` `session_already_revoked` or `session_expired`
+also closes the connection. After the command exits plexd sends its `exit-status`
+and posts the command row again with `exit_code`, `started_at` and
+`completed_at`. A lost exit row is logged at Warn and leaves the client's exit
+status as it was. A launcher error reaches the client as a `plexd: <error>`
+stderr line with exit status 1.
+
+### Session helper
+
+plexd's unit bounds it to `CAP_NET_ADMIN CAP_NET_RAW` and hides `/home`, so a shell
+plexd forked could not become the login user. Every process therefore starts in
+the session helper, `plexd session-helper`:
+
+- When `/run/plexd-session-helper.sock` exists, plexd connects to it. The `plexd-session-helper.socket` unit (`Accept=yes`) then starts one root instance of `plexd-session-helper@.service` per connection, outside plexd's sandbox. A connection the socket refuses is an error: plexd never falls back to a child helper there, because that would run the shell inside the sandbox.
+- Without the socket, plexd starts its own binary as `plexd session-helper --child --trusted-key <key>…` over a socketpair, trusting the keys plexd trusts. The child has plexd's own privileges, which is no boundary, so it pins nothing; hosts without a sandbox (OpenWrt, containers) need no extra unit. Under systemd plexd warns once that the socket is not listening, since shells then cannot switch users.
+
+The protocol is one request per connection. plexd sends one JSON line of at most
+16 KiB, with the process's file descriptors as `SCM_RIGHTS`: the pty slave, or
+stdin, stdout and stderr. The helper answers with one JSON line,
+`{"exit_status":N}` or `{"error":"<reason>"}`, and closes. plexd closing its end
+means "stop the process".
+
+Whatever plexd checked, the helper:
+
+1. verifies the token again, against its own trust anchor;
+2. enforces the allowed-command list and the mode rules;
+3. resolves the user from `/etc/passwd`, with supplementary groups from `/etc/group`; NSS sources such as LDAP are not consulted, and an empty shell field means `/bin/sh`;
+4. starts a login shell, or `<shell> -c <command>`, as that user in a new session and process group, in the home directory, with exactly `HOME`, `USER`, `LOGNAME`, `SHELL` and `PATH` in the environment, plus `TERM` with a pty, which it first hands to that user, as sshd does;
+5. sends `SIGHUP` to the process group when plexd hangs up, and `SIGKILL` 2 s later;
+6. once the process exits, kills what is left of its group and answers with the exit code, or 128 plus the signal for a death by signal.
+
+No PAM session, no utmp, wtmp or lastlog record and no resource limit apply: plexd
+links no libpam.
+
+### Trust anchor
+
+The socket-activated helper verifies tokens against one key:
+
+1. `tunnel.session_signing_public_key` in `/etc/plexd/config.yaml`, when set; the pin file is then neither read nor written;
+2. otherwise the key pinned at `/etc/plexd/session-signing-key`. On its first run the helper copies `signing_public_key` from `identity.json` there (mode 0644) and logs `pinned the session signing key` with the key's SHA-256; later runs trust only that file.
+
+Both units make `/etc` read-only for plexd, so a compromised plexd cannot replace
+the anchor, and without a token the control plane signed it cannot start a shell.
+A malformed pin fails every login until it is fixed. The helper does not follow
+signing-key rotations: once the Domain key rotates, it refuses every token until
+an operator sets `tunnel.session_signing_public_key` to the new key. Deleting the
+pin does not help, because the next run pins `identity.json`'s key again, and
+plexd writes that file only at registration. The same holds once the node
+re-registers with another Domain: `plexd deregister` leaves the pin in place, so
+set the new Domain's key there as well.
+
+### Lifetime
+
+An ssh session ends like a tcp one: when its entry drains (`plexd_close`), when its
+capped expiry fires (`ttl_expired`), when its idle window elapses
+(`idle_timeout`), or on shutdown (`plexd_close`). Any byte on any of its
+connections is activity. The close ends every connection within the drain bound
+and stops each running process through its helper; under socket activation
+systemd also kills the instance's cgroup.
+
+The helper cannot see the sessions block, so it cannot honour a revocation: a
+compromised plexd can reuse a token a client presented until that token's `exp`.
+The listener itself closes on the drain.
+
+### Deployment notes
+
+- A host installed before the helper units keeps its old `plexd.service` until `plexd install` runs again; `service.upgrade` does not rewrite units. Until then plexd uses the child helper and warns, and every login as a user other than root fails. `plexd install` writes the units and reloads systemd but neither enables nor starts the socket, so run `plexd install && systemctl restart plexd`: plexd pulls the socket in through `Wants=` when it starts.
+- Nodes without a usable shell, such as the distroless Kubernetes DaemonSet and container images, should set `tunnel.ssh_sessions_enabled: false`: their listeners would come up, and every launch would fail.
 
 ## Logging
 
@@ -522,8 +696,25 @@ All log entries use `component=tunnel`. Session-scoped entries add `session_id`.
 | Level   | Event                          | Keys                                        |
 |---------|--------------------------------|---------------------------------------------|
 | `Info`  | Session started                | `listen_addr`, `target`                     |
-| `Info`  | Session created                | `session_id`, `listen_addr`, `expires_at`   |
-| `Info`  | Session closed                 | `session_id`, `reason`, `duration`          |
+| `Info`  | Session created                | `session_id`, `kind`, `listen_addr`, `expires_at` |
+| `Info`  | Session closed                 | `session_id`, `kind`, `reason`, `duration`  |
+| `Info`  | ssh session started            | `listen_addr`, `user`                       |
+| `Info`  | ssh login accepted             | `remote_addr`, `user`                       |
+| `Info`  | ssh request refused            | `request`, `reason`                         |
+| `Info`  | ssh process exited             | `mode`, `exit_status` (a number, never a signal name) |
+| `Info`  | ssh session revoked or expired server-side; closing the connection | — |
+| `Info`  | ssh session closed             | `duration`                                  |
+| `Warn`  | ssh login refused              | `remote_addr`, `user`, `error`              |
+| `Warn`  | ssh pty allocation failed      | `error`                                     |
+| `Warn`  | ssh command not recorded by the control plane; refusing to run it | `command`, `error` |
+| `Warn`  | ssh command exit not recorded  | `command`, `exit_code`, `error`             |
+| `Warn`  | ssh session launch failed      | `mode`, `error`                             |
+| `Warn`  | ssh sessions are disabled on this node; no listener provisioned | `session_id` |
+| `Warn`  | plexd-session-helper.socket is not listening; ssh sessions run inside plexd's own sandbox and cannot switch users | `socket` |
+| `Warn`  | Timed out waiting for ssh handlers to drain | —                              |
+| `Debug` | ssh connection refused: session connection limit reached | `remote_addr`   |
+| `Debug` | ssh handshake failed           | `remote_addr`, `error`                      |
+| `Debug` | ssh request not served         | `request`                                   |
 | `Info`  | All tunnel sessions closed     | —                                           |
 | `Info`  | Session expired; waiting for the control plane to drain the entry | `session_id`, `kind`, `expires_at` |
 | `Warn`  | Session carries no expires_at; refusing to provision | `session_id`, `kind`   |
@@ -535,3 +726,10 @@ All log entries use `component=tunnel`. Session-scoped entries add `session_id`.
 | `Debug` | Session not found for close    | `session_id`                                |
 | `Error` | Session entry carries no session_id; dropping | `kind`                       |
 | `Error` | Failed to dial target          | `target`, `error`                           |
+
+The session helper logs to its own unit's journal (`journalctl -u 'plexd-session-helper@*'`),
+or to plexd's stderr in child mode, as text: `session helper started process`
+(`session_id`, `user`, `mode`, `command`, `pid`), `session helper process exited`
+(`session_id`, `exit_status`) and `pinned the session signing key` (`path`,
+`sha256`) at Info, and `session helper refused a request` (`session_id`,
+`reason`) at Warn.
