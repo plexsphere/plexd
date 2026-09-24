@@ -490,6 +490,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /test/inject-event", s.handleInjectEvent)
 	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
 	s.mux.HandleFunc("GET /test/bearer", s.handleBearer)
+	s.mux.HandleFunc("POST /test/session-token", s.handleSessionToken)
 
 	// Method-not-allowed fallbacks.
 	s.mux.HandleFunc("/v1/health", methodNotAllowed)
@@ -515,6 +516,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/test/configure-secrets", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-events", methodNotAllowed)
 	s.mux.HandleFunc("/test/inject-event", methodNotAllowed)
+	s.mux.HandleFunc("/test/session-token", methodNotAllowed)
 }
 
 // maxCapturedBody bounds how many bytes captureBody keeps per request. The
@@ -1907,7 +1909,8 @@ func writeReleaseFixture(w http.ResponseWriter, name, contentType string) {
 	}
 }
 
-// validTerminatedBy reports whether v is a recognized TCP termination reason.
+// validTerminatedBy reports whether v is a recognized TCP or SSH termination
+// reason.
 func validTerminatedBy(v string) bool {
 	switch v {
 	case api.TerminatedByTTLExpired, api.TerminatedByIdleTimeout,
@@ -1937,7 +1940,7 @@ func validSessionActivity(req api.SessionActivityRequest) bool {
 
 	switch {
 	case req.SSH != nil:
-		return req.SSH.Command != "" && len(req.SSH.Command) <= 1024
+		return validSSHActivity(req.SSH)
 	case req.K8s != nil:
 		return req.K8s.Verb != ""
 	default:
@@ -1949,6 +1952,28 @@ func validSessionActivity(req api.SessionActivityRequest) bool {
 		}
 		return true
 	}
+}
+
+// validSSHActivity mirrors the control plane's admission of an ssh row, which
+// takes one of two shapes. A lifecycle row (phase set) carries no command
+// fields: session_started without terminated_by, or session_ended without
+// listener_endpoint and with a known terminated_by when it has one. A command
+// row carries a command of 1 to 1024 bytes and neither lifecycle field.
+func validSSHActivity(a *api.SSHActivity) bool {
+	if a.Phase != "" {
+		if a.Command != "" || a.ExitCode != nil || a.StartedAt != nil || a.CompletedAt != nil {
+			return false
+		}
+		switch a.Phase {
+		case api.SSHPhaseSessionStarted:
+			return a.TerminatedBy == ""
+		case api.SSHPhaseSessionEnded:
+			return a.ListenerEndpoint == "" && (a.TerminatedBy == "" || validTerminatedBy(a.TerminatedBy))
+		default:
+			return false
+		}
+	}
+	return a.Command != "" && len(a.Command) <= 1024 && a.TerminatedBy == "" && a.ListenerEndpoint == ""
 }
 
 // activityMatchesKind reports whether the row's populated member is the one the
@@ -2274,6 +2299,55 @@ func (s *Server) handleConfigureHeartbeat(w http.ResponseWriter, r *http.Request
 		s.keyRotationMu.Unlock()
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleSessionToken handles POST /test/session-token. It mints the token a
+// mediated ssh session logs in with: a compact JWS signed with the mock's
+// signing key, the way the control plane signs one with the Domain key, so plexd
+// and its session helper accept it against the key registration handed out. The
+// body is {"session_id","user","allowed_commands"?,"ttl_seconds"}; the answer is
+// 200 {"token":"..."}. An empty session_id or user, or a ttl_seconds outside 1
+// to 3600, is a 400.
+func (s *Server) handleSessionToken(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID       string   `json:"session_id"`
+		User            string   `json:"user"`
+		AllowedCommands []string `json:"allowed_commands"`
+		TTLSeconds      int      `json:"ttl_seconds"`
+	}
+	if !s.decodeBody(w, r, "session_token", &body) {
+		return
+	}
+	if body.SessionID == "" || body.User == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session_id and user are required"})
+		return
+	}
+	if body.TTLSeconds < 1 || body.TTLSeconds > 3600 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ttl_seconds must be between 1 and 3600"})
+		return
+	}
+
+	target := map[string]any{"kind": api.SessionKindSSH, "user": body.User}
+	if len(body.AllowedCommands) > 0 {
+		target["allowed_commands"] = body.AllowedCommands
+	}
+	now := time.Now().Unix()
+	// Maps of strings, string slices and integers always marshal.
+	header, _ := json.Marshal(map[string]string{"alg": "EdDSA", "typ": "at+jwt", "kid": mockSigningKeyID})
+	claims, _ := json.Marshal(map[string]any{
+		"iss":    "plexsphere://domain/e2e",
+		"aud":    "resource://e2e",
+		"sub":    "identity://e2e",
+		"jti":    body.SessionID,
+		"kind":   api.SessionKindSSH,
+		"target": target,
+		"iat":    now,
+		"nbf":    now,
+		"exp":    now + int64(body.TTLSeconds),
+	})
+	signingInput := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(claims)
+	sig := ed25519.Sign(s.signingPrivateKey, []byte(signingInput))
+	writeJSON(w, http.StatusOK, map[string]string{"token": signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)})
 }
 
 // SetEndpointTTL updates the stale_after TTL applied by the endpoint handler.
