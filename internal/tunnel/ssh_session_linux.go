@@ -554,9 +554,7 @@ func (s *sshSession) launch(ctx context.Context, conn *ssh.ServerConn, ch ssh.Ch
 	}, files)
 	// The launcher closes files; closing them again is harmless and keeps a
 	// launcher that failed before taking them from leaving the copies waiting.
-	for _, f := range files {
-		f.Close()
-	}
+	closeFiles(files)
 
 	drained := make(chan struct{})
 	go func() {
@@ -568,9 +566,7 @@ func (s *sshSession) launch(ctx context.Context, conn *ssh.ServerConn, ch ssh.Ch
 	case <-time.After(drainTimeout):
 		// Something outside the process still holds a write end. Closing plexd's
 		// read ends ends the copies.
-		for _, f := range outputs {
-			f.Close()
-		}
+		closeFiles(outputs)
 		<-drained
 	}
 	return status, err
@@ -594,9 +590,7 @@ func newStdioPipes() (*stdioPipes, error) {
 	} {
 		r, w, err := os.Pipe()
 		if err != nil {
-			for _, f := range made {
-				f.Close()
-			}
+			closeFiles(made)
 			return nil, fmt.Errorf("tunnel: ssh: create pipe: %w", err)
 		}
 		*pair.r, *pair.w = r, w
