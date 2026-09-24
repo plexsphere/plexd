@@ -670,14 +670,27 @@ type SessionActivityRequest struct {
 	TCP *TCPActivity `json:"tcp,omitempty"`
 }
 
-// SSHActivity records a completed SSH session command. Command is the executed
-// command line and is capped at 1 KiB. StartedAt and CompletedAt are RFC 3339
-// timestamps.
+// SSHActivity records one row of an SSH session. It takes one of two shapes.
+//
+// A command row carries Command, the command line of an exec request, capped
+// at 1 KiB, optionally with ExitCode, StartedAt and CompletedAt (RFC 3339
+// timestamps). plexd posts it twice per command: once with StartedAt before
+// the command runs, and once with ExitCode and CompletedAt after it exited.
+//
+// A lifecycle row carries Phase, one of the SSHPhase* values, plus
+// ListenerEndpoint on session_started or TerminatedBy (one of the
+// TerminatedBy* values) on session_ended, and no command fields.
+//
+// plexd never posts an empty Command; the control plane refuses a row that
+// mixes the two shapes.
 type SSHActivity struct {
-	Command     string     `json:"command"`
-	ExitCode    *int       `json:"exit_code,omitempty"`
-	StartedAt   *time.Time `json:"started_at,omitempty"`
-	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	Command          string     `json:"command,omitempty"`
+	ExitCode         *int       `json:"exit_code,omitempty"`
+	StartedAt        *time.Time `json:"started_at,omitempty"`
+	CompletedAt      *time.Time `json:"completed_at,omitempty"`
+	Phase            string     `json:"phase,omitempty"`
+	ListenerEndpoint string     `json:"listener_endpoint,omitempty"`
+	TerminatedBy     string     `json:"terminated_by,omitempty"`
 }
 
 // K8sActivity records a single Kubernetes API action proxied through the
@@ -716,7 +729,16 @@ const (
 	TCPPhaseSessionEnded = "session_ended"
 )
 
-// Reasons a TCP session was terminated, reported on a session_ended TCPActivity.
+// SSH session lifecycle phases reported on an SSHActivity.
+const (
+	// SSHPhaseSessionStarted marks the listener of an SSH session coming up.
+	SSHPhaseSessionStarted = "session_started"
+	// SSHPhaseSessionEnded marks the close of an SSH session.
+	SSHPhaseSessionEnded = "session_ended"
+)
+
+// Reasons a TCP or SSH session was terminated, reported on a session_ended
+// TCPActivity or SSHActivity.
 const (
 	// TerminatedByTTLExpired means the session reached its time-to-live.
 	TerminatedByTTLExpired = "ttl_expired"

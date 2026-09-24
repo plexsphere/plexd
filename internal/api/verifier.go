@@ -82,6 +82,20 @@ func (v *Ed25519Verifier) Rotate(rot SigningKeyRotation) error {
 	return nil
 }
 
+// TrustedKeys returns the signing keys a session token may be signed with at
+// now: the current key, plus the previous key while its rotation grace window
+// is open. The slice is fresh on every call, so a caller may keep it. It is
+// what tunnel.SigningKeySource asks for.
+func (v *Ed25519Verifier) TrustedKeys(now time.Time) []ed25519.PublicKey {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	keys := []ed25519.PublicKey{v.currentKey}
+	if len(v.previousKey) > 0 && now.Before(v.transitionExpires) {
+		keys = append(keys, v.previousKey)
+	}
+	return keys
+}
+
 // Verify checks the freshness and Ed25519 signature of an envelope. It selects
 // the verifying key by the envelope's key id, honouring the rotation grace
 // window for the previous key.
