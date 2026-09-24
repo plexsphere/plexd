@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/api"
 )
 
 // Session represents an active tunnel session with a local TCP listener
@@ -42,10 +44,9 @@ type Session struct {
 	// onIdle is invoked once by the idle monitor when the window elapses without
 	// byte flow, set by the manager before Start alongside idleTimeout.
 	onIdle func()
-	// lastActive holds the last observed activity as a duration since
-	// processStart: the listener bind, then every forwarded chunk while an idle
-	// window is armed.
-	lastActive atomic.Int64
+	// activityClock holds the last observed activity: the listener bind, then
+	// every forwarded chunk while an idle window is armed.
+	activityClock
 
 	logger *slog.Logger
 }
@@ -56,6 +57,22 @@ type Session struct {
 // window, which is the access-control boundary that caps how long an unattended
 // forward to an internal host stays open.
 var processStart = time.Now()
+
+// activityClock is a session's last activity, stamped as a duration since
+// processStart so that its idle window follows the monotonic clock.
+type activityClock struct {
+	lastActive atomic.Int64
+}
+
+// stamp records activity now.
+func (c *activityClock) stamp() {
+	c.lastActive.Store(int64(time.Since(processStart)))
+}
+
+// idleFor returns how long ago the last stamp was.
+func (c *activityClock) idleFor() time.Duration {
+	return time.Since(processStart) - time.Duration(c.lastActive.Load())
+}
 
 // activityReader wraps a forwarding source so that every chunk it yields stamps
 // the session's last-activity timestamp. Only used while an idle window is
@@ -68,7 +85,7 @@ type activityReader struct {
 func (r *activityReader) Read(p []byte) (int, error) {
 	n, err := r.src.Read(p)
 	if n > 0 {
-		r.session.lastActive.Store(int64(time.Since(processStart)))
+		r.session.stamp()
 	}
 	return n, err
 }
@@ -107,7 +124,7 @@ func (s *Session) Start(ctx context.Context) (string, error) {
 	s.listener = ln
 	// The bind is the session's first activity, so a listener no connection ever
 	// reaches still has a well-defined activity epoch to age against.
-	s.lastActive.Store(int64(time.Since(processStart)))
+	s.stamp()
 
 	s.logger.Info("session started",
 		"listen_addr", ln.Addr().String(),
@@ -127,12 +144,19 @@ func (s *Session) Start(ctx context.Context) (string, error) {
 
 // idleMonitor calls onIdle once the idle window has passed without byte flow.
 // Byte flow re-arms the window: every forwarded chunk stamps the session's last
-// activity, so each firing re-reads the stamp and either gives up the session or
-// waits out the remaining window. The listener bind counts as the first
-// activity, so a listener no connection ever reaches idles out one window after
-// Start.
+// activity. The listener bind counts as the first activity, so a listener no
+// connection ever reaches idles out one window after Start.
 func (s *Session) idleMonitor(ctx context.Context) {
-	timer := time.NewTimer(s.idleTimeout - s.IdleFor())
+	runIdleMonitor(ctx, s.idleTimeout, s.IdleFor, s.onIdle)
+}
+
+// runIdleMonitor calls onIdle once timeout has passed without activity, as
+// idleFor measures it, and returns; it also returns when ctx is done. Each
+// firing re-reads idleFor and either gives up the session or waits out the
+// remaining window, so activity re-arms the window without the monitor being
+// told about it.
+func runIdleMonitor(ctx context.Context, timeout time.Duration, idleFor func() time.Duration, onIdle func()) {
+	timer := time.NewTimer(timeout - idleFor())
 	defer timer.Stop()
 
 	for {
@@ -140,9 +164,9 @@ func (s *Session) idleMonitor(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			remaining := s.idleTimeout - s.IdleFor()
+			remaining := timeout - idleFor()
 			if remaining <= 0 {
-				s.onIdle()
+				onIdle()
 				return
 			}
 			timer.Reset(remaining)
@@ -308,7 +332,7 @@ func (s *Session) Counters() (in, out int64) {
 // listener bind counts as the first activity, so a started session never reports
 // the whole time since the process began.
 func (s *Session) IdleFor() time.Duration {
-	return time.Since(processStart) - time.Duration(s.lastActive.Load())
+	return s.idleFor()
 }
 
 // ListenAddr returns the listener address or empty string if not started.
@@ -317,4 +341,26 @@ func (s *Session) ListenAddr() string {
 		return ""
 	}
 	return s.listener.Addr().String()
+}
+
+var _ managedSession = (*Session)(nil)
+
+func (s *Session) setIdle(timeout time.Duration, onIdle func()) {
+	s.idleTimeout = timeout
+	s.onIdle = onIdle
+}
+
+func (s *Session) expiry() time.Time { return s.expiresAt }
+
+func (s *Session) started() time.Time { return s.startTime }
+
+func (s *Session) closedInfo() ClosedSessionInfo {
+	bytesIn, bytesOut := s.Counters()
+	return ClosedSessionInfo{
+		Kind:       api.SessionKindTCP,
+		TargetHost: s.TargetHost,
+		TargetPort: s.TargetPort,
+		BytesIn:    bytesIn,
+		BytesOut:   bytesOut,
+	}
 }

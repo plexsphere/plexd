@@ -23,6 +23,28 @@ var ErrTunnelingDisabled = errors.New("tunnel: tunneling is disabled")
 // multiplication from overflowing into a negative value.
 const maxIdleTimeoutSeconds = 24 * 60 * 60
 
+// managedSession is what the SessionManager needs from a session of any kind:
+// a listener to start, a close, an idle window, and the facts its expiry timer,
+// the dispatcher's teardown pass and the session_ended row are built from.
+// Sessions of every kind share one map, so MaxSessions and the DefaultTimeout
+// cap count them together.
+type managedSession interface {
+	// Start binds the session's listener and returns its address. Everything
+	// the session runs hangs off a child of ctx that Close cancels.
+	Start(ctx context.Context) (string, error)
+	Close() error
+	// setIdle arms the idle window before start; zero means none. onIdle is
+	// invoked once when the window elapses without activity.
+	setIdle(timeout time.Duration, onIdle func())
+	// expiry is the session's capped local expiry.
+	expiry() time.Time
+	// started is when the session was created, the base of its duration.
+	started() time.Time
+	// closedInfo returns the kind-specific part of the session_ended row. It is
+	// read after Close, so counters are final.
+	closedInfo() ClosedSessionInfo
+}
+
 // SessionManager manages the lifecycle of tunnel sessions.
 type SessionManager struct {
 	cfg    Config
@@ -30,7 +52,7 @@ type SessionManager struct {
 	logger *slog.Logger
 
 	mu       sync.Mutex
-	sessions map[string]*Session
+	sessions map[string]managedSession
 	onClosed func(sessionID, reason string, info *ClosedSessionInfo)
 }
 
@@ -41,7 +63,7 @@ func NewSessionManager(cfg Config, meshIP string, logger *slog.Logger) *SessionM
 		cfg:      cfg,
 		meshIP:   meshIP,
 		logger:   logger.With("component", "tunnel"),
-		sessions: make(map[string]*Session),
+		sessions: make(map[string]managedSession),
 	}
 }
 
@@ -124,17 +146,18 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 		return "", fmt.Errorf("tunnel: max sessions reached (%d)", m.cfg.MaxSessions)
 	}
 
-	session := NewSession(sess.SessionID, sess.Target.TCP.Host, sess.Target.TCP.Port, m.meshIP, expiresAt, m.logger)
+	var session managedSession = NewSession(sess.SessionID, sess.Target.TCP.Host, sess.Target.TCP.Port, m.meshIP, expiresAt, m.logger)
 
-	// Both are set before Start because it arms the idle monitor, and because
-	// forward decides per connection whether to stamp activity — the first
-	// connection can arrive as soon as the listener is up.
-	session.idleTimeout = time.Duration(sess.IdleTimeoutSeconds) * time.Second
-	// Closed for this session, not just for its id, for the same reason as the
+	// The idle window is set before start because start arms the idle monitor,
+	// and because a session decides per connection whether to stamp activity —
+	// the first connection can arrive as soon as the listener is up. The closer
+	// is bound to this session, not just to its id, for the same reason as the
 	// expiry timer below: the monitor commits to the close once its window has
-	// fired, so a cancellation racing that decision must not let it take down the
-	// successor of the session it was watching.
-	session.onIdle = func() { m.closeSession(sess.SessionID, reasonIdle, session) }
+	// fired, so a cancellation racing that decision must not let it take down
+	// the successor of the session it was watching.
+	session.setIdle(time.Duration(sess.IdleTimeoutSeconds)*time.Second, func() {
+		m.closeSession(sess.SessionID, reasonIdle, session)
+	})
 
 	addr, err := session.Start(ctx)
 	if err != nil {
@@ -166,8 +189,11 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 	return addr, nil
 }
 
-// ClosedSessionInfo contains metadata about a session that was closed.
+// ClosedSessionInfo contains metadata about a session that was closed. Kind is
+// the session's api.SessionKind* value; the target and the byte counters are
+// set for tcp sessions only.
 type ClosedSessionInfo struct {
+	Kind       string
 	Duration   time.Duration
 	TargetHost string
 	TargetPort int
@@ -198,7 +224,7 @@ func (m *SessionManager) CloseSession(sessionID, reason string) *ClosedSessionIn
 // closeSession closes and removes a session by ID. A non-nil want closes the id
 // only while it still holds exactly that session, so a caller holding a stale
 // reference cannot close the successor of the session it meant to close.
-func (m *SessionManager) closeSession(sessionID, reason string, want *Session) *ClosedSessionInfo {
+func (m *SessionManager) closeSession(sessionID, reason string, want managedSession) *ClosedSessionInfo {
 	session := m.removeSession(sessionID, want)
 	if session == nil {
 		m.logger.Debug("session not found for close", "session_id", sessionID)
@@ -206,19 +232,13 @@ func (m *SessionManager) closeSession(sessionID, reason string, want *Session) *
 	}
 
 	session.Close()
-	duration := time.Since(session.startTime)
-	bytesIn, bytesOut := session.Counters()
-	info := &ClosedSessionInfo{
-		Duration:   duration,
-		TargetHost: session.TargetHost,
-		TargetPort: session.TargetPort,
-		BytesIn:    bytesIn,
-		BytesOut:   bytesOut,
-	}
+	info := session.closedInfo()
+	info.Duration = time.Since(session.started())
 	m.logger.Info("session closed",
 		"session_id", sessionID,
+		"kind", info.Kind,
 		"reason", reason,
-		"duration", duration.String(),
+		"duration", info.Duration.String(),
 	)
 
 	// Report every successful close. Read the callback under the lock but invoke
@@ -228,10 +248,10 @@ func (m *SessionManager) closeSession(sessionID, reason string, want *Session) *
 	onClosed := m.onClosed
 	m.mu.Unlock()
 	if onClosed != nil {
-		onClosed(sessionID, reason, info)
+		onClosed(sessionID, reason, &info)
 	}
 
-	return info
+	return &info
 }
 
 // Shutdown closes all active sessions, reporting each one through the on-closed
@@ -266,7 +286,7 @@ func (m *SessionManager) Shutdown() {
 
 // removeSession removes and returns the session for the given ID, or nil if not
 // found. A non-nil want also requires the live session to be exactly that one.
-func (m *SessionManager) removeSession(sessionID string, want *Session) *Session {
+func (m *SessionManager) removeSession(sessionID string, want managedSession) managedSession {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	session, ok := m.sessions[sessionID]
@@ -287,7 +307,7 @@ func (m *SessionManager) ActiveSessions() map[string]time.Time {
 	defer m.mu.Unlock()
 	active := make(map[string]time.Time, len(m.sessions))
 	for id, session := range m.sessions {
-		active[id] = session.expiresAt
+		active[id] = session.expiry()
 	}
 	return active
 }
