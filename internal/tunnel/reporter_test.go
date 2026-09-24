@@ -2,20 +2,37 @@ package tunnel
 
 import (
 	"context"
+	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// mockReporter records calls to ReportSessionStarted and ReportSessionEnded.
-// startedErr, when set, is returned from every ReportSessionStarted so a test
-// can drive the undelivered-row path.
+// mockReporter records calls to ReportSessionStarted and ReportSessionEnded,
+// and the ssh command rows. startedErr, when set, is returned from every
+// ReportSessionStarted so a test can drive the undelivered-row path;
+// commandStartedErr and commandExitedErr do the same for the command rows.
 type mockReporter struct {
-	mu           sync.Mutex
-	startedCalls []sessionStartedCall
-	endedCalls   []sessionEndedCall
-	startedErr   error
+	mu                sync.Mutex
+	startedCalls      []sessionStartedCall
+	endedCalls        []sessionEndedCall
+	commandCalls      []commandCall
+	startedErr        error
+	commandStartedErr error
+	commandExitedErr  error
+}
+
+// commandCall is one ssh command row: a started row, or an exited row with its
+// exit code and completion time.
+type commandCall struct {
+	SessionID   string
+	Command     string
+	Exited      bool
+	ExitCode    int
+	StartedAt   time.Time
+	CompletedAt time.Time
 }
 
 // sessionStartedCall is one started row. User is set for an ssh entry, the
@@ -69,6 +86,61 @@ func (r *mockReporter) ReportSessionEnded(ctx context.Context, sessionID string,
 		BytesOut:     info.BytesOut,
 		TerminatedBy: terminatedBy,
 	})
+}
+
+func (r *mockReporter) ReportSSHCommandStarted(_ context.Context, sessionID, command string, startedAt time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.commandCalls = append(r.commandCalls, commandCall{SessionID: sessionID, Command: command, StartedAt: startedAt})
+	return r.commandStartedErr
+}
+
+func (r *mockReporter) ReportSSHCommandExited(ctx context.Context, sessionID, command string, exitCode int, startedAt, completedAt time.Time) error {
+	// Like a real post, one on a cancelled context delivers nothing.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.commandCalls = append(r.commandCalls, commandCall{
+		SessionID:   sessionID,
+		Command:     command,
+		Exited:      true,
+		ExitCode:    exitCode,
+		StartedAt:   startedAt,
+		CompletedAt: completedAt,
+	})
+	return r.commandExitedErr
+}
+
+// fakeLauncher is a SessionLauncher that records every request and runs an
+// optional hook instead of a process. Like the real one it closes the files it
+// was handed before it returns.
+type fakeLauncher struct {
+	mu    sync.Mutex
+	calls []launchCall
+	run   func(ctx context.Context, req LaunchRequest, files []*os.File) (int, error)
+}
+
+type launchCall struct {
+	req   LaunchRequest
+	files int
+}
+
+func (l *fakeLauncher) Launch(ctx context.Context, req LaunchRequest, files []*os.File) (int, error) {
+	defer func() {
+		for _, f := range files {
+			f.Close()
+		}
+	}()
+	l.mu.Lock()
+	l.calls = append(l.calls, launchCall{req: req, files: len(files)})
+	run := l.run
+	l.mu.Unlock()
+	if run == nil {
+		return 0, nil
+	}
+	return run(ctx, req, files)
 }
 
 func TestTerminatedByFromReason(t *testing.T) {

@@ -63,17 +63,6 @@ func validSSHClaims(sessionID, user string, now time.Time) map[string]any {
 	}
 }
 
-// sessionToken mints a valid token for sessionID and user, with the given
-// allowed-command list when it is non-nil.
-func sessionToken(t testing.TB, priv ed25519.PrivateKey, sessionID, user string, allowed []string) string {
-	t.Helper()
-	claims := validSSHClaims(sessionID, user, time.Now())
-	if allowed != nil {
-		claims["target"] = map[string]any{"kind": "ssh", "user": user, "allowed_commands": allowed}
-	}
-	return mintSessionToken(t, priv, sessionTokenHeaderFields(), claims)
-}
-
 func TestVerifySessionToken_Valid(t *testing.T) {
 	pub, priv := newSigningKey(t)
 	now := time.Now()

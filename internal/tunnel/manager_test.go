@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"io"
 	"log/slog"
@@ -140,10 +141,17 @@ func TestSessionManager_ExpiredSessionRejected(t *testing.T) {
 func TestSessionManager_NonProvisionableKindRejected(t *testing.T) {
 	mgr := newTestManager(t, Config{})
 
-	sshSession := api.NodeStateSession{
-		SessionID: "ssh-kind",
+	sshWithoutTarget := api.NodeStateSession{
+		SessionID: "ssh-no-target",
 		Kind:      api.SessionKindSSH,
-		Target:    api.SessionTarget{SSH: &api.SessionTargetSSH{User: "ops"}},
+		Target:    api.SessionTarget{TCP: &api.SessionTargetTCP{Host: "127.0.0.1", Port: 22}},
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+
+	k8sSession := api.NodeStateSession{
+		SessionID: "k8s-kind",
+		Kind:      api.SessionKindK8s,
+		Target:    api.SessionTarget{K8s: &api.SessionTargetK8s{User: "ops"}},
 		ExpiresAt: time.Now().Add(5 * time.Minute),
 	}
 
@@ -157,7 +165,8 @@ func TestSessionManager_NonProvisionableKindRejected(t *testing.T) {
 		name string
 		sess api.NodeStateSession
 	}{
-		{"ssh kind", sshSession},
+		{"ssh kind without ssh target", sshWithoutTarget},
+		{"k8s kind", k8sSession},
 		{"tcp kind without tcp target", tcpWithoutTarget},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -825,5 +834,195 @@ func TestSessionManager_DisabledRejectsAll(t *testing.T) {
 	}
 	if !errors.Is(err, ErrTunnelingDisabled) {
 		t.Errorf("CreateSession() error = %v, want ErrTunnelingDisabled", err)
+	}
+}
+
+// requireSSHSessions skips a test of the ssh listener on a platform without
+// one.
+func requireSSHSessions(t *testing.T) {
+	t.Helper()
+	if !sshSessionsSupported {
+		t.Skip("ssh sessions are served on Linux only")
+	}
+}
+
+// sshEntry builds an ssh-kind entry of the pull's sessions block.
+func sshEntry(sessionID, user string, expiresAt time.Time) api.NodeStateSession {
+	return api.NodeStateSession{
+		SessionID: sessionID,
+		JTI:       sessionID,
+		Kind:      api.SessionKindSSH,
+		Target:    api.SessionTarget{SSH: &api.SessionTargetSSH{User: user}},
+		ExpiresAt: expiresAt,
+	}
+}
+
+// newSSHTestDeps wires ssh sessions onto a fresh host key and signing key. The
+// private half of the signing key mints the tokens the tests log in with.
+func newSSHTestDeps(t *testing.T, commands SSHCommandReporter, launcher SessionLauncher) (SSHSessionDeps, ed25519.PrivateKey) {
+	t.Helper()
+	hostKey, err := GenerateHostKey()
+	if err != nil {
+		t.Fatalf("GenerateHostKey() error: %v", err)
+	}
+	pub, priv := newSigningKey(t)
+	return SSHSessionDeps{
+		HostKey:  hostKey,
+		Keys:     staticKeys{pub},
+		Commands: commands,
+		Launcher: launcher,
+	}, priv
+}
+
+func TestSessionManager_SSHNotWired(t *testing.T) {
+	requireSSHSessions(t)
+	mgr := newTestManager(t, Config{})
+
+	entry := sshEntry("ssh-unwired", "ops", time.Now().Add(5*time.Minute))
+	_, err := mgr.CreateSession(context.Background(), entry)
+	const want = "tunnel: ssh sessions are not wired: host key, signing keys, command reporter and session launcher are required"
+	if err == nil || err.Error() != want {
+		t.Fatalf("CreateSession() error = %v, want %q", err, want)
+	}
+
+	// A partial wiring is no wiring.
+	deps, _ := newSSHTestDeps(t, &mockReporter{}, &fakeLauncher{})
+	deps.Launcher = nil
+	mgr.SetSSHSessionDeps(deps)
+	if _, err := mgr.CreateSession(context.Background(), entry); err == nil || err.Error() != want {
+		t.Fatalf("CreateSession() without a launcher error = %v, want %q", err, want)
+	}
+	if mgr.ActiveCount() != 0 {
+		t.Errorf("expected ActiveCount()=0, got %d", mgr.ActiveCount())
+	}
+}
+
+func TestSessionManager_SSHEmptyUserRejected(t *testing.T) {
+	requireSSHSessions(t)
+	mgr := newTestManager(t, Config{})
+	deps, _ := newSSHTestDeps(t, &mockReporter{}, &fakeLauncher{})
+	mgr.SetSSHSessionDeps(deps)
+
+	_, err := mgr.CreateSession(context.Background(), sshEntry("ssh-no-user", "", time.Now().Add(5*time.Minute)))
+	const want = "tunnel: invalid session setup: ssh target user is required"
+	if err == nil || err.Error() != want {
+		t.Fatalf("CreateSession() error = %v, want %q", err, want)
+	}
+}
+
+func TestSessionManager_SSHDisabled(t *testing.T) {
+	requireSSHSessions(t)
+	off := false
+	mgr := newTestManager(t, Config{
+		Enabled:            true,
+		MaxSessions:        10,
+		DefaultTimeout:     5 * time.Minute,
+		SSHSessionsEnabled: &off,
+	})
+	deps, _ := newSSHTestDeps(t, &mockReporter{}, &fakeLauncher{})
+	mgr.SetSSHSessionDeps(deps)
+
+	_, err := mgr.CreateSession(context.Background(), sshEntry("ssh-off", "ops", time.Now().Add(5*time.Minute)))
+	if !errors.Is(err, ErrSSHSessionsDisabled) {
+		t.Fatalf("CreateSession() error = %v, want ErrSSHSessionsDisabled", err)
+	}
+	if mgr.ActiveCount() != 0 {
+		t.Errorf("expected ActiveCount()=0, got %d", mgr.ActiveCount())
+	}
+}
+
+// Both kinds share the session map, so MaxSessions caps them together.
+func TestSessionManager_MaxSessionsCountsBothKinds(t *testing.T) {
+	requireSSHSessions(t)
+	echoAddr := startEchoServer(t)
+	mgr := newTestManager(t, Config{
+		Enabled:        true,
+		MaxSessions:    2,
+		DefaultTimeout: 5 * time.Minute,
+	})
+	deps, _ := newSSHTestDeps(t, &mockReporter{}, &fakeLauncher{})
+	mgr.SetSSHSessionDeps(deps)
+
+	if _, err := mgr.CreateSession(context.Background(), echoSession(t, "both-tcp", echoAddr)); err != nil {
+		t.Fatalf("CreateSession(tcp) error: %v", err)
+	}
+	addr, err := mgr.CreateSession(context.Background(), sshEntry("both-ssh", "ops", time.Now().Add(5*time.Minute)))
+	if err != nil {
+		t.Fatalf("CreateSession(ssh) error: %v", err)
+	}
+	if host, _, _ := net.SplitHostPort(addr); host != "127.0.0.1" {
+		t.Errorf("ssh listener bound %q, want the mesh address", addr)
+	}
+
+	for _, entry := range []api.NodeStateSession{
+		echoSession(t, "third-tcp", echoAddr),
+		sshEntry("third-ssh", "ops", time.Now().Add(5*time.Minute)),
+	} {
+		_, err := mgr.CreateSession(context.Background(), entry)
+		if err == nil || err.Error() != "tunnel: max sessions reached (2)" {
+			t.Errorf("CreateSession(%s) error = %v, want %q", entry.Kind, err, "tunnel: max sessions reached (2)")
+		}
+	}
+}
+
+func TestSessionManager_SSHClosesWithKind(t *testing.T) {
+	requireSSHSessions(t)
+
+	for _, tc := range []struct {
+		name  string
+		setup func(e *api.NodeStateSession)
+		close func(mgr *SessionManager)
+		want  string
+	}{
+		{
+			name:  "drain",
+			setup: func(*api.NodeStateSession) {},
+			close: func(mgr *SessionManager) { mgr.CloseSession("ssh-close", reasonDrained) },
+			want:  api.TerminatedByPlexdClose,
+		},
+		{
+			name:  "expiry",
+			setup: func(e *api.NodeStateSession) { e.ExpiresAt = time.Now().Add(100 * time.Millisecond) },
+			close: func(*SessionManager) {},
+			want:  api.TerminatedByTTLExpired,
+		},
+		{
+			name:  "idle",
+			setup: func(e *api.NodeStateSession) { e.IdleTimeoutSeconds = 1 },
+			close: func(*SessionManager) {},
+			want:  api.TerminatedByIdleTimeout,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := newTestManager(t, Config{})
+			deps, _ := newSSHTestDeps(t, &mockReporter{}, &fakeLauncher{})
+			mgr.SetSSHSessionDeps(deps)
+			mu, records := recordCloses(mgr)
+
+			entry := sshEntry("ssh-close", "ops", time.Now().Add(5*time.Minute))
+			tc.setup(&entry)
+			if _, err := mgr.CreateSession(context.Background(), entry); err != nil {
+				t.Fatalf("CreateSession() error: %v", err)
+			}
+			tc.close(mgr)
+
+			waitForCondition(t, 4*time.Second, func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return len(*records) == 1
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			rec := (*records)[0]
+			if rec.info.Kind != api.SessionKindSSH {
+				t.Errorf("info.Kind = %q, want %q", rec.info.Kind, api.SessionKindSSH)
+			}
+			if got := TerminatedByFromReason(rec.reason); got != tc.want {
+				t.Errorf("terminated_by = %q, want %q", got, tc.want)
+			}
+			if rec.info.Duration <= 0 {
+				t.Errorf("info.Duration = %v, want positive", rec.info.Duration)
+			}
+		})
 	}
 }
