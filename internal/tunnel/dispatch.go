@@ -31,8 +31,9 @@ const sessionStartedReportTimeout = 15 * time.Second
 // Revocation and hard expiry both reach the node as that same absence — there is
 // no revocation callback to answer and no terminal status to report.
 //
-// Provisioning is tcp-kind only. An ssh or k8s entry is decoded and settled as
-// unsupported: one warning, no listener, no activity row.
+// tcp sessions are provisioned everywhere, and ssh sessions on Linux. A k8s
+// entry, and an ssh entry off Linux, is decoded and settled as unsupported: one
+// warning, no listener, no activity row.
 //
 // A Dispatcher is not safe for concurrent use. Handle is invoked only from the
 // reconcile goroutine, one cycle at a time, so its maps need no mutex.
@@ -235,10 +236,11 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 			continue
 		}
 
-		// ssh and k8s sessions are part of the contract but not of this agent's
-		// mediation. They are settled rather than retried, so the warning is
-		// emitted once per entry rather than once per pull.
-		if entry.Kind == api.SessionKindSSH || entry.Kind == api.SessionKindK8s {
+		// k8s sessions are part of the contract but not of this agent's
+		// mediation, and ssh sessions are served on Linux only. Both are settled
+		// rather than retried, so the warning is emitted once per entry rather
+		// than once per pull.
+		if entry.Kind == api.SessionKindK8s || (entry.Kind == api.SessionKindSSH && !sshSessionsSupported) {
 			d.logger.Warn("unsupported session kind; no listener provisioned",
 				"session_id", entry.SessionID,
 				"kind", entry.Kind,
@@ -250,7 +252,7 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 		// A kind outside the three the contract names is one a later control
 		// plane started emitting: nothing is wrong with the entry's target, so
 		// the operator is told about the kind rather than sent to inspect it.
-		if entry.Kind != api.SessionKindTCP {
+		if entry.Kind != api.SessionKindTCP && entry.Kind != api.SessionKindSSH {
 			d.logger.Warn("unrecognised session kind; no listener provisioned",
 				"session_id", entry.SessionID,
 				"kind", entry.Kind,
@@ -259,10 +261,10 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 			continue
 		}
 
-		// What is left must be a tcp session carrying exactly its own target: a
-		// tcp entry without a tcp target, or one with a second member set,
-		// describes a session this build cannot place.
-		if entry.Target.TCP == nil || entry.Target.SSH != nil || entry.Target.K8s != nil {
+		// What is left must be a tcp or ssh session carrying exactly its own
+		// target: an entry without the target of its kind, or one with a second
+		// member set, describes a session this build cannot place.
+		if !targetMatchesKind(entry) {
 			d.logger.Warn("session target does not match kind",
 				"session_id", entry.SessionID,
 				"kind", entry.Kind,
@@ -283,6 +285,13 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 			// Configuration, not weather. Retrying it would warn once per pull
 			// for the life of the process and never succeed.
 			d.logger.Warn("tunneling is disabled; no listener provisioned",
+				"session_id", entry.SessionID,
+			)
+			d.known[entry.SessionID] = struct{}{}
+
+		case errors.Is(err, ErrSSHSessionsDisabled):
+			// The node owner's choice, settled for the same reason.
+			d.logger.Warn("ssh sessions are disabled on this node; no listener provisioned",
 				"session_id", entry.SessionID,
 			)
 			d.known[entry.SessionID] = struct{}{}
@@ -380,5 +389,19 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 		if _, ok := present[id]; !ok {
 			delete(d.goneStanding, id)
 		}
+	}
+}
+
+// targetMatchesKind reports whether a tcp or ssh entry carries the target of its
+// kind and no other member.
+func targetMatchesKind(entry api.NodeStateSession) bool {
+	t := entry.Target
+	switch entry.Kind {
+	case api.SessionKindTCP:
+		return t.TCP != nil && t.SSH == nil && t.K8s == nil
+	case api.SessionKindSSH:
+		return t.SSH != nil && t.TCP == nil && t.K8s == nil
+	default:
+		return false
 	}
 }

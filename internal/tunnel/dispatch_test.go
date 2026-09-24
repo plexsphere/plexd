@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"strconv"
@@ -342,12 +343,6 @@ func TestDispatcher_UnsupportedKindsSettled(t *testing.T) {
 	expires := time.Now().Add(5 * time.Minute)
 	snapshot := sessionsSnapshot(
 		api.NodeStateSession{
-			SessionID: "sess-ssh",
-			Kind:      api.SessionKindSSH,
-			Target:    api.SessionTarget{SSH: &api.SessionTargetSSH{User: "ops"}},
-			ExpiresAt: expires,
-		},
-		api.NodeStateSession{
 			SessionID: "sess-k8s",
 			Kind:      api.SessionKindK8s,
 			Target:    api.SessionTarget{K8s: &api.SessionTargetK8s{User: "ops"}},
@@ -362,8 +357,8 @@ func TestDispatcher_UnsupportedKindsSettled(t *testing.T) {
 		t.Errorf("expected ActiveCount()=0, got %d", mgr.ActiveCount())
 	}
 	// One warning per entry, not one per entry per pull.
-	if n := logs.count("unsupported session kind; no listener provisioned"); n != 2 {
-		t.Errorf("unsupported-kind warned %d times, want 2 (once per entry)", n)
+	if n := logs.count("unsupported session kind; no listener provisioned"); n != 1 {
+		t.Errorf("unsupported-kind warned %d times, want 1 (once per entry)", n)
 	}
 	reporter.mu.Lock()
 	defer reporter.mu.Unlock()
@@ -1004,5 +999,179 @@ func TestDispatcher_StartedReportIsBounded(t *testing.T) {
 	}
 	if got := reporter.remaining[0]; got <= 0 || got > sessionStartedReportTimeout {
 		t.Errorf("started report deadline left %v, want a bound in (0, %v]", got, sessionStartedReportTimeout)
+	}
+}
+
+// newSSHTestDispatcher is newTestDispatcher with ssh sessions wired, their
+// command rows going to the same recording reporter.
+func newSSHTestDispatcher(t *testing.T, cfg Config) (*Dispatcher, *SessionManager, *mockReporter, *countingHandler) {
+	t.Helper()
+	d, mgr, reporter, logs := newTestDispatcher(t, cfg)
+	deps, _ := newSSHTestDeps(t, reporter, &fakeLauncher{})
+	mgr.SetSSHSessionDeps(deps)
+	return d, mgr, reporter, logs
+}
+
+func TestDispatcher_ProvisionsSSHEntry(t *testing.T) {
+	requireSSHSessions(t)
+	d, mgr, reporter, _ := newSSHTestDispatcher(t, Config{})
+
+	d.Handle(context.Background(), sessionsSnapshot(sshEntry("sess-ssh", "ops", time.Now().Add(5*time.Minute))))
+
+	if mgr.ActiveCount() != 1 {
+		t.Fatalf("expected ActiveCount()=1, got %d", mgr.ActiveCount())
+	}
+	reporter.mu.Lock()
+	calls := append([]sessionStartedCall(nil), reporter.startedCalls...)
+	reporter.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 started row, got %d", len(calls))
+	}
+	got := calls[0]
+	if got.SessionID != "sess-ssh" || got.Kind != api.SessionKindSSH || got.User != "ops" {
+		t.Errorf("started row = %+v, want the ssh entry for ops", got)
+	}
+	host, _, err := net.SplitHostPort(got.ListenerEndpoint)
+	if err != nil || host != "127.0.0.1" {
+		t.Fatalf("listener_endpoint = %q, want 127.0.0.1:<port>", got.ListenerEndpoint)
+	}
+
+	// The reported endpoint is the listener itself: it answers with the SSH
+	// identification line.
+	conn, err := net.DialTimeout("tcp", got.ListenerEndpoint, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial the reported endpoint: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	banner := make([]byte, len("SSH-2.0-plexd"))
+	if _, err := io.ReadFull(conn, banner); err != nil || string(banner) != "SSH-2.0-plexd" {
+		t.Errorf("endpoint banner = %q (%v), want SSH-2.0-plexd", banner, err)
+	}
+}
+
+func TestDispatcher_SSHDisabledSettled(t *testing.T) {
+	requireSSHSessions(t)
+	off := false
+	d, mgr, reporter, logs := newSSHTestDispatcher(t, Config{
+		Enabled:            true,
+		MaxSessions:        10,
+		DefaultTimeout:     5 * time.Minute,
+		SSHSessionsEnabled: &off,
+	})
+
+	snapshot := sessionsSnapshot(sshEntry("sess-ssh-off", "ops", time.Now().Add(5*time.Minute)))
+	d.Handle(context.Background(), snapshot)
+	d.Handle(context.Background(), snapshot)
+
+	if mgr.ActiveCount() != 0 {
+		t.Errorf("expected ActiveCount()=0, got %d", mgr.ActiveCount())
+	}
+	if n := logs.count("ssh sessions are disabled on this node; no listener provisioned"); n != 1 {
+		t.Errorf("disabled warned %d times across two pulls, want 1", n)
+	}
+	if n := logs.count("session listener setup failed"); n != 0 {
+		t.Errorf("disabled must not be reported as a setup failure, got %d warnings", n)
+	}
+	reporter.mu.Lock()
+	defer reporter.mu.Unlock()
+	if len(reporter.startedCalls) != 0 {
+		t.Errorf("expected no started row, got %d", len(reporter.startedCalls))
+	}
+}
+
+func TestDispatcher_SSHTargetMismatchSettled(t *testing.T) {
+	requireSSHSessions(t)
+	expires := time.Now().Add(5 * time.Minute)
+
+	noTarget := sshEntry("sess-ssh-no-target", "ops", expires)
+	noTarget.Target = api.SessionTarget{}
+
+	twoTargets := sshEntry("sess-ssh-two-targets", "ops", expires)
+	twoTargets.Target.TCP = &api.SessionTargetTCP{Host: "127.0.0.1", Port: 22}
+
+	for _, tt := range []struct {
+		name  string
+		entry api.NodeStateSession
+	}{
+		{"ssh kind without ssh target", noTarget},
+		{"ssh kind with a tcp target beside it", twoTargets},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d, mgr, reporter, logs := newSSHTestDispatcher(t, Config{})
+			snapshot := sessionsSnapshot(tt.entry)
+
+			d.Handle(context.Background(), snapshot)
+			d.Handle(context.Background(), snapshot)
+
+			if mgr.ActiveCount() != 0 {
+				t.Errorf("expected ActiveCount()=0, got %d", mgr.ActiveCount())
+			}
+			if n := logs.count("session target does not match kind"); n != 1 {
+				t.Errorf("mismatch warned %d times across two pulls, want 1", n)
+			}
+			reporter.mu.Lock()
+			defer reporter.mu.Unlock()
+			if len(reporter.startedCalls) != 0 {
+				t.Errorf("expected no started row, got %d", len(reporter.startedCalls))
+			}
+		})
+	}
+}
+
+// An empty user and a manager nobody wired are setup failures, not verdicts on
+// the entry, so the entry stays unsettled and every pull retries it.
+func TestDispatcher_SSHSetupErrorsAreRetried(t *testing.T) {
+	requireSSHSessions(t)
+	expires := time.Now().Add(5 * time.Minute)
+
+	for _, tt := range []struct {
+		name  string
+		wired bool
+		entry api.NodeStateSession
+	}{
+		{"empty user", true, sshEntry("sess-ssh-no-user", "", expires)},
+		{"not wired", false, sshEntry("sess-ssh-unwired", "ops", expires)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d, mgr, reporter, logs := newTestDispatcher(t, Config{})
+			if tt.wired {
+				deps, _ := newSSHTestDeps(t, reporter, &fakeLauncher{})
+				mgr.SetSSHSessionDeps(deps)
+			}
+			snapshot := sessionsSnapshot(tt.entry)
+
+			d.Handle(context.Background(), snapshot)
+			d.Handle(context.Background(), snapshot)
+
+			if n := logs.count("session listener setup failed"); n != 2 {
+				t.Errorf("setup failure logged %d times across two pulls, want 2", n)
+			}
+			if mgr.ActiveCount() != 0 {
+				t.Errorf("expected ActiveCount()=0, got %d", mgr.ActiveCount())
+			}
+		})
+	}
+}
+
+func TestDispatcher_SSHDrainClosesWithKind(t *testing.T) {
+	requireSSHSessions(t)
+	d, mgr, _, _ := newSSHTestDispatcher(t, Config{})
+	mu, records := recordCloses(mgr)
+
+	d.Handle(context.Background(), sessionsSnapshot(sshEntry("sess-ssh-drain", "ops", time.Now().Add(5*time.Minute))))
+	d.Handle(context.Background(), sessionsSnapshot())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*records) != 1 {
+		t.Fatalf("expected 1 close, got %d", len(*records))
+	}
+	rec := (*records)[0]
+	if rec.info.Kind != api.SessionKindSSH {
+		t.Errorf("info.Kind = %q, want %q", rec.info.Kind, api.SessionKindSSH)
+	}
+	if got := TerminatedByFromReason(rec.reason); got != api.TerminatedByPlexdClose {
+		t.Errorf("terminated_by = %q, want %q", got, api.TerminatedByPlexdClose)
 	}
 }
