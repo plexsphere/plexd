@@ -65,7 +65,7 @@ Resolves the bootstrap token by checking sources in priority order. The first no
 | `Value`    | `string` | The resolved token value                       |
 | `FilePath` | `string` | Non-empty if token was read from a file        |
 
-`FilePath` is used by the `Registrar` to delete the token file after successful registration.
+`FilePath` is used by the `Registrar` to remove the token file after successful registration, or to empty it when it cannot be removed, as under plexd's systemd unit, which keeps `/etc` read-only and grants write access to the token file alone. The resolver skips an empty file, so an emptied token is never read again.
 
 ```go
 resolver := registration.NewTokenResolver(&cfg, nil) // nil = no metadata provider
@@ -262,7 +262,7 @@ sequenceDiagram
         CP-->>R: node_id, mesh_ip, signing_public_key, signing_key_id, nsk, peer_snapshot, domain_mesh_cidr
         R->>R: Build NodeIdentity
         R->>D: SaveIdentity() (atomic write)
-        R->>D: Delete token file (if file-based)
+        R->>D: Remove or empty token file (if file-based)
         R->>CP: SetAuthToken(NSK)
     end
 ```
@@ -277,7 +277,7 @@ sequenceDiagram
 8. **POST /v1/register with retry** — one UUIDv4 nonce per logical registration, reused across attempts; exponential backoff on transient errors. The nonce is replay protection, not an idempotency key: a nonce the control plane has already recorded is answered with `403 nonce_collision`, so retrying a request that may already have been committed is denied rather than granted a second node. The nonce is never persisted — after a restart it could only produce that denial, so a fresh registration starts with a fresh nonce
 9. **Build NodeIdentity** from response + private key — `nsk` must decode from standard-padded base64 to a 32-byte AES-256-GCM key, or registration fails before anything is persisted
 10. **Persist identity** atomically to data directory
-11. **Delete token file** if token was file-based (failure logged, not fatal)
+11. **Remove token file** if token was file-based. When the unlink fails, the file is truncated to zero bytes and `token file emptied, it could not be removed` is logged at Info; only when that fails too is `failed to delete token file` logged at Warn, with `truncate_error`. A file that is already gone logs nothing, and no outcome is fatal
 12. **Set node_secret_key (nsk) as auth** — `client.SetAuthToken(nsk)`
 
 ### Retry Logic

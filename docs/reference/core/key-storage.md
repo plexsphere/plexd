@@ -16,7 +16,7 @@ During registration, the control plane provisions the node with several cryptogr
 - **Pre-Shared Keys (PSK)** -- per-peer-pair post-quantum defense layer
 - **Node Secret Key (NSK)** -- AES-256-GCM secret decryption
 - **Ed25519 signing public key** -- SSE event and JWT verification
-- **Bootstrap token** -- one-time registration credential (deleted after use)
+- **Bootstrap token** -- one-time registration credential (its file is removed after use, or emptied where it cannot be removed)
 
 ## Storage Location
 
@@ -88,13 +88,17 @@ Both the current and previous keys are held in memory for the transition period 
 
 The bootstrap token is a one-time credential used to authenticate the initial registration request. It can be sourced from a file (`/etc/plexd/bootstrap-token` on Linux; see [Platform defaults](configuration.md#platform-defaults)), an environment variable (`PLEXD_BOOTSTRAP_TOKEN`), a direct value, or a cloud metadata service.
 
-The token is **deleted from disk immediately after successful registration** to prevent reuse:
+The token is **removed from disk immediately after successful registration** to prevent reuse. Under plexd's systemd unit `/etc` is read-only and only the token file itself is writable, so the unlink fails and the file is emptied instead; the resolver skips an empty file:
 
 ```go
-// 10. Delete token file if applicable.
+// 9. Delete token file if applicable.
 if tokenResult.FilePath != "" {
-    if err := os.Remove(tokenResult.FilePath); err != nil {
-        r.logger.Warn("failed to delete token file", ...)
+    if err := os.Remove(tokenResult.FilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+        if terr := os.Truncate(tokenResult.FilePath, 0); terr != nil {
+            r.logger.Warn("failed to delete token file", ..., "truncate_error", terr)
+        } else {
+            r.logger.Info("token file emptied, it could not be removed", ...)
+        }
     }
 }
 ```
@@ -123,7 +127,7 @@ The plexd process should run as a dedicated `plexd` user. No other user or group
 3. Node calls `POST /v1/nodes/register` with the bootstrap token and public key.
 4. Control plane responds with `node_id`, `mesh_ip`, `node_secret_key`, `signing_public_key`, and peer list (including PSKs).
 5. `SaveIdentity` writes `identity.json`, `private_key`, `node_secret_key`, and `signing_public_key` atomically with `0600` permissions.
-6. Bootstrap token file is deleted from disk.
+6. Bootstrap token file is removed from disk, or emptied when it cannot be removed (as under plexd's systemd unit).
 
 ### Rotation
 

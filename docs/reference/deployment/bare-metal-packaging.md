@@ -65,15 +65,31 @@ Produces a complete systemd unit file. Calls `cfg.ApplyDefaults()` before genera
 |             | `EnvironmentFile`        | `-{ConfigDir}/environment`               | Optional environment file (dash = optional)  |
 |             | `AmbientCapabilities`    | `CAP_NET_ADMIN CAP_NET_RAW`              | Network capabilities for WireGuard and ICMP  |
 |             | `CapabilityBoundingSet`  | `CAP_NET_ADMIN CAP_NET_RAW`              | Limit capabilities to required set           |
-|             | `ProtectSystem`          | `full`                                   | Make /usr, /boot, /efi read-only             |
+|             | `ProtectSystem`          | `full`                                   | Make /usr, /boot, /efi and /etc read-only    |
 |             | `ProtectHome`            | `true`                                   | Make /home, /root, /run/user inaccessible    |
-|             | `ReadWritePaths`         | `{DataDir} {RunDir}`                     | Allow writes to data and runtime dirs        |
+|             | `ReadWritePaths`         | `-{DataDir} -{RunDir} -{ConfigDir}/bootstrap-token` | Allow writes to the data and runtime dirs and the bootstrap token file |
 | `[Install]` | `WantedBy`               | `multi-user.target`                      | Enable at boot in multi-user mode            |
 |             | `Also`                   | `plexd-session-helper.socket`            | Enabling or disabling plexd does the same to the socket |
 
 `systemctl enable --now plexd` therefore enables the helper socket and starts it
 with plexd. The sandbox directives stay: the session helper is what runs outside
 them.
+
+`/etc` stays read-only for plexd on purpose. The session helper trusts
+`config.yaml` and the signing key it pins at `{ConfigDir}/session-signing-key`
+only because plexd cannot write them. The bootstrap token file is the one path
+under `ConfigDir` the unit lets plexd write: plexd cannot unlink the spent token,
+because its directory stays read-only, so it empties the file instead (see
+[Registration](../core/registration.md)). The hooks directory is created by
+`plexd install`, not by plexd.
+
+Every `ReadWritePaths` entry carries the `-` prefix, which tells systemd to skip
+a path that does not exist instead of failing the unit with `226/NAMESPACE`.
+`RunDir` lives on tmpfs and is gone after every reboot until plexd recreates it
+for the node API socket, and `plexd deregister --purge` removes `DataDir` until
+plexd saves a new identity. `/run` and `/var` stay writable under
+`ProtectSystem=full`, so plexd can create both. A token file that does not exist
+at start leaves nothing to empty.
 
 ## Session helper units
 
@@ -245,7 +261,7 @@ Installs plexd as a host service. Steps:
 
 1. Verify privileges (`RootChecker.IsRoot()`): root on Unix, an elevated token on Windows
 2. Verify the host's service manager is available (`ServiceManager.Available()`)
-3. Create directories: `ConfigDir` (0755), `DataDir` (0700), `RunDir` (0755), and `LogDir` (0755) where it is set
+3. Create directories: `ConfigDir` (0755), `ConfigDir/hooks` (0755), `DataDir` (0700), `RunDir` (0755), and `LogDir` (0755) where it is set. An existing directory and its contents are left as they are
 4. Copy the running binary to `BinaryPath` (0755)
 5. Write default `config.yaml` if absent (preserves existing)
 6. Write bootstrap token if `TokenValue` or `TokenFile` is set (0600)
@@ -338,8 +354,9 @@ Linux:
 |-------------------------------------------|------------|------------|--------------------------|
 | `/usr/local/bin/plexd`                    | 0755       | Install    | plexd binary             |
 | `/etc/plexd/`                             | 0755       | Install    | Configuration directory  |
+| `/etc/plexd/hooks/`                       | 0755       | Install    | Hook scripts; read-only to plexd under its unit |
 | `/etc/plexd/config.yaml`                  | 0644       | Install    | Service configuration    |
-| `/etc/plexd/bootstrap-token`              | 0600       | Install    | Bootstrap token          |
+| `/etc/plexd/bootstrap-token`              | 0600       | Install    | Bootstrap token; emptied rather than removed after registration under the unit |
 | `/etc/plexd/environment`                  | *(user)*   | Operator   | Optional env vars        |
 | `/var/lib/plexd/`                         | 0700       | Install    | Data directory           |
 | `/var/run/plexd/`                         | 0755       | Install    | Runtime directory        |
@@ -357,6 +374,7 @@ macOS:
 |-----------------------------------------------------|------------|------------|--------------------------------|
 | `/usr/local/bin/plexd`                              | 0755       | Install    | plexd binary                   |
 | `/Library/Application Support/plexd/`               | 0755       | Install    | Configuration directory        |
+| `/Library/Application Support/plexd/hooks/`         | 0755       | Install    | Hook scripts                   |
 | `/Library/Application Support/plexd/data/`          | 0700       | Install    | Data directory                 |
 | `/var/run/plexd/`                                   | 0755       | Install    | Runtime directory              |
 | `/Library/LaunchDaemons/com.plexsphere.plexd.plist` | 0644       | Install    | LaunchDaemon definition, `root:wheel` |
@@ -373,6 +391,7 @@ Windows:
 | `%ProgramFiles%\plexd\plexd.exe`         | Install    | plexd binary                                       |
 | `%ProgramFiles%\plexd\plexd.exe.old`     | Upgrade    | The previous binary, removed by the next upgrade or at the next reboot after `plexd uninstall` |
 | `%ProgramData%\plexd\`                   | Install    | Configuration directory                            |
+| `%ProgramData%\plexd\hooks\`             | Install    | Hook scripts                                       |
 | `%ProgramData%\plexd\data\`              | Install    | Data directory                                     |
 | `%ProgramData%\plexd\run\`               | Install    | Runtime directory                                  |
 | SCM service `plexd`                     | Install    | Service definition, in the SCM's own database      |
