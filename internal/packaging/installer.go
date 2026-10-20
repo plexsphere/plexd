@@ -52,9 +52,13 @@ func (ins *Installer) Install() error {
 	}
 
 	// 3. Create directories. LogDir is empty wherever the service manager
-	// keeps the logs itself, and then there is nothing to create.
+	// keeps the logs itself, and then there is nothing to create. The hooks
+	// directory is created here because plexd cannot create it under its
+	// systemd unit, which keeps /etc read-only; the hook watcher only needs
+	// it to exist.
 	dirs := []dirSpec{
 		{ins.cfg.ConfigDir, 0o755},
+		{filepath.Join(ins.cfg.ConfigDir, "hooks"), 0o755},
 		{ins.cfg.DataDir, 0o700},
 		{ins.cfg.RunDir, 0o755},
 	}

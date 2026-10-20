@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -240,6 +241,7 @@ func TestInstall_CreatesDirectories(t *testing.T) {
 		perm os.FileMode
 	}{
 		{"ConfigDir", filepath.Join(tmpDir, "etc", "plexd"), 0o755},
+		{"HooksDir", filepath.Join(tmpDir, "etc", "plexd", "hooks"), 0o755},
 		{"DataDir", filepath.Join(tmpDir, "var", "lib", "plexd"), 0o700},
 		{"RunDir", filepath.Join(tmpDir, "var", "run", "plexd"), 0o755},
 	}
@@ -261,6 +263,78 @@ func TestInstall_CreatesDirectories(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Re-running plexd install on a host with hooks must leave them alone.
+func TestInstall_PreservesExistingHooks(t *testing.T) {
+	systemd := &mockSystemdController{available: true}
+	root := &mockRootChecker{isRoot: true}
+	ins, tmpDir := newTestInstaller(t, InstallConfig{}, systemd, root)
+
+	hookPath := filepath.Join(tmpDir, "etc", "plexd", "hooks", "restart-service")
+	hook := []byte("#!/bin/sh\nsystemctl restart example\n")
+	if err := os.MkdirAll(filepath.Dir(hookPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() = %v", err)
+	}
+	if err := os.WriteFile(hookPath, hook, 0o755); err != nil {
+		t.Fatalf("WriteFile() = %v", err)
+	}
+
+	if err := ins.Install(); err != nil {
+		t.Fatalf("Install() = %v", err)
+	}
+
+	info, err := os.Stat(hookPath)
+	if err != nil {
+		t.Fatalf("Stat(%q) = %v", hookPath, err)
+	}
+	data, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) = %v", hookPath, err)
+	}
+	if string(data) != string(hook) {
+		t.Errorf("hook = %q, want %q", data, hook)
+	}
+	// Windows reports 0666/0777, never POSIX bits.
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != 0o755 {
+			t.Errorf("hook perm = %04o, want 0755", got)
+		}
+	}
+}
+
+func TestInstall_HooksPathIsAFile(t *testing.T) {
+	systemd := &mockSystemdController{available: true}
+	root := &mockRootChecker{isRoot: true}
+	ins, tmpDir := newTestInstaller(t, InstallConfig{}, systemd, root)
+
+	hooksPath := filepath.Join(tmpDir, "etc", "plexd", "hooks")
+	if err := os.MkdirAll(filepath.Dir(hooksPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() = %v", err)
+	}
+	if err := os.WriteFile(hooksPath, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("WriteFile() = %v", err)
+	}
+
+	err := ins.Install()
+	if err == nil {
+		t.Fatal("Install() = nil, want error for a hooks path that is a file")
+	}
+	if !strings.HasPrefix(err.Error(), "packaging: create directory ") || !strings.Contains(err.Error(), hooksPath) {
+		t.Errorf("Install() error = %q, want packaging: create directory %s", err, hooksPath)
+	}
+	if !errors.Is(err, syscall.ENOTDIR) {
+		t.Errorf("Install() error = %v, want syscall.ENOTDIR", err)
+	}
+
+	// Install stops at the directories: no unit is written or loaded.
+	unitPath := filepath.Join(tmpDir, "etc", "systemd", "system", "plexd.service")
+	if _, err := os.Stat(unitPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Stat(%q) = %v, want the unit file absent", unitPath, err)
+	}
+	if systemd.daemonReloadCalls != 0 {
+		t.Errorf("daemonReloadCalls = %d, want 0", systemd.daemonReloadCalls)
 	}
 }
 
