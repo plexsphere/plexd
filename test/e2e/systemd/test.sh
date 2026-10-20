@@ -8,6 +8,7 @@
 #
 # Extended tests:
 #   - Request body validation (registration token, heartbeat, capabilities)
+#   - Spent token emptied in place under the unit's read-only /etc, hook watcher running
 #   - Periodic loop verification (heartbeat/metrics/logs counters >= 2)
 #   - Audit forwarding via service restart (ProcessSource fires per-process)
 #   - Action execution via the state pull's executions block (ack/started/terminal callbacks)
@@ -15,6 +16,7 @@
 #   - Heartbeat-triggered reconcile via RotateKeys flag
 #   - Deeper body validation (metrics, capabilities fields)
 #   - Mediated ssh session through the socket-activated session helper
+#   - Start after a reboot cleared /run/plexd
 #   - Shutdown log message verification
 set -euo pipefail
 
@@ -275,10 +277,12 @@ audit_fwd:
     tls_insecure_skip_verify: true
 EOF"
 
-# Write environment file with bootstrap token.
-docker exec "${SYSTEMD_CONTAINER}" bash -c 'echo "PLEXD_BOOTSTRAP_TOKEN=psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22" > /etc/plexd/environment && chmod 600 /etc/plexd/environment'
+# Write the bootstrap token file before the service starts: the unit can only
+# grant write access to a path that exists when systemd sets up its namespace.
+docker exec "${SYSTEMD_CONTAINER}" bash -c 'printf %s "psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22" > /etc/plexd/bootstrap-token && chmod 600 /etc/plexd/bootstrap-token'
 
-# Pre-create hooks directory (ProtectSystem=full makes /etc read-only for the service).
+# Create the hooks directory, as plexd install does; this suite copies the
+# units instead of running it, and the unit keeps /etc read-only for plexd.
 docker exec "${SYSTEMD_CONTAINER}" mkdir -p /etc/plexd/hooks
 
 # --- Start service and poll assertions (REQ-003, REQ-004) ---
@@ -431,6 +435,31 @@ fi
 echo "  PASS: capability manifest is contract-shaped (version=${CAPS_VERSION}, 32-byte digest, 11 builtins)"
 
 echo "=== Request body validation PASSED ==="
+
+# --- Spent token cleanup under the sandbox ---
+# The unit keeps /etc read-only and grants write access to the token file
+# alone, so plexd cannot unlink the token it spent and empties it instead.
+# Here-strings rather than pipes: grep -q exits on the first match, and under
+# pipefail the writer's SIGPIPE would fail the check.
+echo "=== Verifying the spent bootstrap token was emptied ==="
+TOKEN_SIZE=$(docker exec "${SYSTEMD_CONTAINER}" stat -c %s /etc/plexd/bootstrap-token 2>/dev/null || true)
+if [ "${TOKEN_SIZE}" = "0" ]; then
+    echo "  PASS: /etc/plexd/bootstrap-token is empty"
+else
+    fail "/etc/plexd/bootstrap-token size='${TOKEN_SIZE}', want 0"
+fi
+PLEXD_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>/dev/null || true)
+if grep -q "token file emptied, it could not be removed" <<< "${PLEXD_JOURNAL}"; then
+    echo "  PASS: plexd logged that it emptied the token file"
+else
+    fail "journal has no 'token file emptied, it could not be removed' line"
+fi
+for line in "failed to delete token file" "hook watcher stopped"; do
+    if grep -q "${line}" <<< "${PLEXD_JOURNAL}"; then
+        fail "journal has '${line}'"
+    fi
+done
+echo "  PASS: no token deletion warning and no stopped hook watcher"
 
 # --- Periodic loop verification (counters >= 2) ---
 echo "=== Waiting for periodic counters to increment (>= 2) ==="
@@ -1022,6 +1051,34 @@ fi
 rm -f "${SSH_ERR}"
 
 echo "=== Mediated ssh session PASSED ==="
+
+# --- Start after a reboot ---
+# /run is tmpfs, so a reboot takes /run/plexd with it. Every ReadWritePaths
+# entry is optional, so the unit still sets up its namespace instead of
+# failing with 226/NAMESPACE, and plexd recreates the directory for the node
+# API socket.
+echo "=== Starting plexd after a simulated reboot (no /run/plexd) ==="
+docker exec "${SYSTEMD_CONTAINER}" systemctl stop plexd
+docker exec "${SYSTEMD_CONTAINER}" rm -rf /run/plexd
+if ! docker exec "${SYSTEMD_CONTAINER}" systemctl start plexd; then
+    fail "plexd did not start without /run/plexd"
+fi
+SOCKET_TIMEOUT=30
+SOCKET_ELAPSED=0
+until docker exec "${SYSTEMD_CONTAINER}" test -S /var/run/plexd/api.sock; do
+    if [ "${SOCKET_ELAPSED}" -ge "${SOCKET_TIMEOUT}" ]; then
+        fail "/var/run/plexd/api.sock did not appear within ${SOCKET_TIMEOUT}s of the start"
+    fi
+    sleep 2
+    SOCKET_ELAPSED=$((SOCKET_ELAPSED + 2))
+done
+echo "  PASS: /var/run/plexd/api.sock is back"
+REBOOT_STATE=$(docker exec "${SYSTEMD_CONTAINER}" systemctl is-active plexd 2>/dev/null || true)
+if [ "${REBOOT_STATE}" = "active" ]; then
+    echo "  PASS: plexd is active after the simulated reboot"
+else
+    fail "plexd state after the simulated reboot is '${REBOOT_STATE}', want 'active'"
+fi
 
 # --- Clean shutdown verification (REQ-005) ---
 echo "=== Stopping plexd service ==="
