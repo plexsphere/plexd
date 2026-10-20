@@ -2,6 +2,7 @@ package packaging
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -119,8 +120,54 @@ func TestGenerateUnitFile_CustomPaths(t *testing.T) {
 	if !strings.Contains(output, "EnvironmentFile=-/opt/plexd/etc/environment") {
 		t.Errorf("output missing custom EnvironmentFile, got:\n%s", output)
 	}
-	if !strings.Contains(output, "ReadWritePaths=/opt/plexd/data /opt/plexd/run") {
+	if !strings.Contains(output, "ReadWritePaths=-/opt/plexd/data -/opt/plexd/run -/opt/plexd/etc/bootstrap-token") {
 		t.Errorf("output missing custom ReadWritePaths, got:\n%s", output)
+	}
+}
+
+// TestGenerateUnitFile_ReadWritePaths pins what the sandboxed agent may write.
+// ProtectSystem=full keeps /etc read-only, which the session helper relies on
+// for config.yaml and its pinned signing key, so the token file is the one
+// writable path under ConfigDir. Every entry carries "-": a missing path, such
+// as RunDir after a reboot, must not fail the unit with 226/NAMESPACE.
+func TestGenerateUnitFile_ReadWritePaths(t *testing.T) {
+	output := GenerateUnitFile(InstallConfig{
+		BinaryPath: "/usr/local/bin/plexd",
+		ConfigDir:  "/etc/plexd",
+		DataDir:    "/var/lib/plexd",
+		RunDir:     "/var/run/plexd",
+	})
+
+	for _, line := range []string{
+		"ProtectSystem=full",
+		"ReadWritePaths=-/var/lib/plexd -/var/run/plexd -/etc/plexd/bootstrap-token",
+	} {
+		if !strings.Contains(output, "\n"+line+"\n") {
+			t.Errorf("unit file missing %q, got:\n%s", line, output)
+		}
+	}
+
+	for _, line := range strings.Split(output, "\n") {
+		entries, ok := strings.CutPrefix(line, "ReadWritePaths=")
+		if !ok {
+			continue
+		}
+		for _, entry := range strings.Fields(entries) {
+			p := strings.TrimPrefix(entry, "-")
+			if p == "/etc/plexd/bootstrap-token" {
+				continue
+			}
+			if p == "/etc/plexd" || strings.HasPrefix(p, "/etc/plexd/") {
+				t.Errorf("ReadWritePaths grants %s; only /etc/plexd/bootstrap-token may be writable under /etc/plexd", p)
+			}
+		}
+	}
+
+	// The defaults render the same shape on every runner. The line is compared
+	// whole because the macOS ConfigDir has a space in it.
+	want := "ReadWritePaths=-" + DefaultDataDir + " -" + DefaultRunDir + " -" + path.Join(DefaultConfigDir, "bootstrap-token")
+	if got := GenerateUnitFile(InstallConfig{}); !strings.Contains(got, "\n"+want+"\n") {
+		t.Errorf("default unit file missing %q, got:\n%s", want, got)
 	}
 }
 
