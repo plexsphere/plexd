@@ -162,10 +162,18 @@ func (r *Registrar) Register(ctx context.Context) (*NodeIdentity, error) {
 		return nil, fmt.Errorf("registration: save identity: %w", err)
 	}
 
-	// 9. Delete token file if applicable.
+	// 9. Delete token file if applicable. Under plexd's systemd unit /etc is
+	// read-only and only the token file itself is writable, so the unlink
+	// fails with EROFS; emptying the file keeps the spent token off the disk,
+	// and the resolver skips an empty file. A file that is already gone is
+	// what this step wants.
 	if tokenResult.FilePath != "" {
-		if err := os.Remove(tokenResult.FilePath); err != nil {
-			r.logger.Warn("failed to delete token file", "path", tokenResult.FilePath, "error", err)
+		if err := os.Remove(tokenResult.FilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if terr := os.Truncate(tokenResult.FilePath, 0); terr != nil {
+				r.logger.Warn("failed to delete token file", "path", tokenResult.FilePath, "error", err, "truncate_error", terr)
+			} else {
+				r.logger.Info("token file emptied, it could not be removed", "path", tokenResult.FilePath, "error", err)
+			}
 		}
 	}
 
