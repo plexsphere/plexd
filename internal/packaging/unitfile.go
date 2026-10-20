@@ -23,6 +23,16 @@ const sessionHelperSocketPath = "/run/plexd-session-helper.sock"
 // The unit wants the session helper socket and is ordered after it, and
 // enabling plexd enables the socket too (Also=), so `systemctl enable --now
 // plexd` brings both up.
+//
+// ProtectSystem=full keeps /etc read-only, and the session helper relies on
+// that: plexd must not write config.yaml or the signing key the helper pins
+// beside it. The bootstrap token file is therefore the only writable path
+// under ConfigDir, so the registrar can empty the spent token it cannot
+// unlink. Every ReadWritePaths entry is optional ("-"), because a missing one
+// fails the unit with 226/NAMESPACE: RunDir is on tmpfs and gone after a
+// reboot until plexd recreates it for the node API socket, DataDir is gone
+// after deregister --purge until plexd saves a new identity, and an absent
+// token file leaves nothing to empty.
 func GenerateUnitFile(cfg InstallConfig) string {
 	cfg.ApplyDefaults()
 
@@ -30,6 +40,7 @@ func GenerateUnitFile(cfg InstallConfig) string {
 	// slash-separated whatever host generates the file.
 	configPath := path.Join(cfg.ConfigDir, "config.yaml")
 	envPath := path.Join(cfg.ConfigDir, "environment")
+	tokenPath := path.Join(cfg.ConfigDir, "bootstrap-token")
 
 	return fmt.Sprintf(`[Unit]
 Description=plexd node agent
@@ -51,12 +62,12 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=%s %s
+ReadWritePaths=-%s -%s -%s
 
 [Install]
 WantedBy=multi-user.target
 Also=plexd-session-helper.socket
-`, cfg.BinaryPath, configPath, envPath, cfg.DataDir, cfg.RunDir)
+`, cfg.BinaryPath, configPath, envPath, cfg.DataDir, cfg.RunDir, tokenPath)
 }
 
 // GenerateSessionHelperSocketUnit produces plexd-session-helper.socket. It is
