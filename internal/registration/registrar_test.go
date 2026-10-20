@@ -971,6 +971,178 @@ func TestRegistrar_TokenDeletionFailureDoesNotFailRegistration(t *testing.T) {
 	}
 }
 
+// tokenInReadOnlyDir writes a token file with the given mode into a directory
+// it then makes read-only, the way plexd's systemd unit leaves /etc/plexd: the
+// unlink fails, and the file's own mode decides whether it can be emptied.
+// Root ignores both modes, so the caller is skipped there.
+func tokenInReadOnlyDir(t *testing.T, mode os.FileMode) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory and file modes")
+	}
+	tokenDir := t.TempDir()
+	tokenFile := filepath.Join(tokenDir, "bootstrap-token")
+	if err := os.WriteFile(tokenFile, []byte("spent-token"), mode); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	if err := os.Chmod(tokenDir, 0500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(tokenDir, 0700)
+	})
+	return tokenFile
+}
+
+func TestRegistrar_EmptiesTokenFileWhenRemoveFails(t *testing.T) {
+	tokenFile := tokenInReadOnlyDir(t, 0600)
+	_, client := testServer(t, successHandler(t))
+
+	var logs bytes.Buffer
+	reg := NewRegistrar(client, Config{
+		DataDir:        t.TempDir(),
+		TokenFile:      tokenFile,
+		ProjectID:      testProjectID,
+		ResourceHandle: testResourceHandle,
+	}, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	if _, err := reg.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	info, err := os.Stat(tokenFile)
+	if err != nil {
+		t.Fatalf("stat token file: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("token file size = %d, want 0", info.Size())
+	}
+	out := logs.String()
+	if !strings.Contains(out, `level=INFO msg="token file emptied, it could not be removed"`) {
+		t.Errorf("logs = %q, want the emptied record at INFO", out)
+	}
+	if !strings.Contains(out, " path="+tokenFile+" ") {
+		t.Errorf("logs = %q, want path=%s", out, tokenFile)
+	}
+	if strings.Contains(out, "failed to delete token file") {
+		t.Errorf("logs = %q, want no deletion warning", out)
+	}
+	if strings.Contains(out, "spent-token") {
+		t.Error("logs leak the bootstrap token")
+	}
+}
+
+func TestRegistrar_WarnsWhenTokenFileCannotBeEmptied(t *testing.T) {
+	tokenFile := tokenInReadOnlyDir(t, 0400)
+	_, client := testServer(t, successHandler(t))
+
+	var logs bytes.Buffer
+	reg := NewRegistrar(client, Config{
+		DataDir:        t.TempDir(),
+		TokenFile:      tokenFile,
+		ProjectID:      testProjectID,
+		ResourceHandle: testResourceHandle,
+	}, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	if _, err := reg.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	data, err := os.ReadFile(tokenFile)
+	if err != nil {
+		t.Fatalf("read token file: %v", err)
+	}
+	if string(data) != "spent-token" {
+		t.Errorf("token file = %q, want it unchanged", data)
+	}
+	out := logs.String()
+	if !strings.Contains(out, `level=WARN msg="failed to delete token file"`) {
+		t.Errorf("logs = %q, want the deletion warning at WARN", out)
+	}
+	// The leading space keeps truncate_error= from satisfying the error= check.
+	for _, attr := range []string{
+		` error="remove ` + tokenFile + `: permission denied"`,
+		` truncate_error="truncate ` + tokenFile + `: permission denied"`,
+	} {
+		if !strings.Contains(out, attr) {
+			t.Errorf("logs = %q, want %s", out, attr)
+		}
+	}
+	if strings.Contains(out, "token file emptied") {
+		t.Errorf("logs = %q, want no emptied record", out)
+	}
+}
+
+func TestRegistrar_TokenFileGoneBeforeCleanup(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "bootstrap-token")
+	if err := os.WriteFile(tokenFile, []byte("vanishing-token"), 0600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	register := successHandler(t)
+	_, client := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// The file disappears while the registration is in flight.
+		if err := os.Remove(tokenFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("remove token file: %v", err)
+		}
+		register(w, r)
+	})
+
+	var logs bytes.Buffer
+	reg := NewRegistrar(client, Config{
+		DataDir:        t.TempDir(),
+		TokenFile:      tokenFile,
+		ProjectID:      testProjectID,
+		ResourceHandle: testResourceHandle,
+	}, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	if _, err := reg.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	out := logs.String()
+	for _, msg := range []string{"failed to delete token file", "token file emptied"} {
+		if strings.Contains(out, msg) {
+			t.Errorf("logs = %q, want no %q record for a file that is already gone", out, msg)
+		}
+	}
+	if _, err := os.Stat(tokenFile); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stat token file = %v, want it still absent", err)
+	}
+}
+
+func TestRegistrar_LeavesTokenFileWhenTokenNotFromFile(t *testing.T) {
+	_, client := testServer(t, successHandler(t))
+
+	tokenFile := filepath.Join(t.TempDir(), "bootstrap-token")
+	if err := os.WriteFile(tokenFile, []byte("file-token"), 0600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	reg := NewRegistrar(client, Config{
+		DataDir:        t.TempDir(),
+		TokenValue:     "direct-token",
+		TokenFile:      tokenFile,
+		ProjectID:      testProjectID,
+		ResourceHandle: testResourceHandle,
+	}, discardLogger())
+
+	if _, err := reg.Register(context.Background()); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// The direct value won, so the file was never read and is not spent.
+	data, err := os.ReadFile(tokenFile)
+	if err != nil {
+		t.Fatalf("read token file: %v", err)
+	}
+	if string(data) != "file-token" {
+		t.Errorf("token file = %q, want it unchanged", data)
+	}
+}
+
 func TestRegistrar_IsRegistered(t *testing.T) {
 	dataDir := t.TempDir()
 

@@ -191,6 +191,34 @@ func TestTokenResolver_FileNotFoundFallsThrough(t *testing.T) {
 	}
 }
 
+// A token file the registrar emptied after a registration it could not
+// unlink is skipped, so it is never read or cleaned up again.
+func TestTokenResolver_EmptyFileFallsThrough(t *testing.T) {
+	envName := "PLEXD_TEST_TOKEN_EMPTY_FILE"
+	t.Setenv(envName, "env-after-empty-file")
+
+	tokenFile := filepath.Join(t.TempDir(), "bootstrap-token")
+	if err := os.WriteFile(tokenFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{
+		TokenFile: tokenFile,
+		TokenEnv:  envName,
+	}
+	r := NewTokenResolver(cfg, nil)
+	result, err := r.Resolve(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Value != "env-after-empty-file" {
+		t.Fatalf("got value %q, want %q", result.Value, "env-after-empty-file")
+	}
+	if result.FilePath != "" {
+		t.Fatalf("got FilePath %q, want empty", result.FilePath)
+	}
+}
+
 func TestTokenResolver_FileReadError(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX permission bits are not enforced on windows")
