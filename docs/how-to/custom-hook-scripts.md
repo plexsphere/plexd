@@ -21,8 +21,10 @@ For the full reference of types and internals, see
    [Platform Support](../guide/platform-support.md).
 
 2. **Hooks directory** is configured. The default is `/etc/plexd/hooks` on
-   Linux and `/Library/Application Support/plexd/hooks` on macOS. Set
-   `hooks_dir` in the actions configuration to override.
+   Linux and `/Library/Application Support/plexd/hooks` on macOS, and
+   `plexd install` creates it. Set `hooks_dir` in the actions configuration to
+   override. plexd's systemd unit keeps `/etc` read-only, so plexd cannot create
+   a custom `hooks_dir` under `/etc` itself: create it before plexd starts.
 
 3. **Shell access** to the node for deploying the script (or a deployment
    pipeline that places files in the hooks directory).

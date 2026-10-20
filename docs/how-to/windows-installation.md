@@ -63,6 +63,7 @@ This creates:
 | `%ProgramData%\plexd\`              | Configuration directory                            |
 | `%ProgramData%\plexd\config.yaml`   | Service configuration                              |
 | `%ProgramData%\plexd\bootstrap-token` | Bootstrap token                                  |
+| `%ProgramData%\plexd\hooks\`          | Hook scripts directory                             |
 | `%ProgramData%\plexd\data\`         | Data directory                                     |
 | `%ProgramData%\plexd\run\`          | Runtime directory                                  |
 | SCM service `plexd`                | Service definition, automatic start, LocalSystem   |

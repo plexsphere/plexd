@@ -47,7 +47,7 @@ Creates a Docker bridge network and starts both containers on it. The systemd co
 
 ### 5. Service installation
 
-Copies the plexd binary, the production `deploy/systemd/plexd.service` unit file and the two session helper units (`plexd-session-helper.socket`, `plexd-session-helper@.service`) into the systemd container. Writes `config.yaml` pointing at the mock-api container and an environment file with the bootstrap token. Runs `systemctl daemon-reload` and `systemctl enable --now plexd`, then checks that `systemctl is-active plexd-session-helper.socket` prints `active`: `plexd.service` wants the socket and names it in `Also=`.
+Copies the plexd binary, the production `deploy/systemd/plexd.service` unit file and the two session helper units (`plexd-session-helper.socket`, `plexd-session-helper@.service`) into the systemd container. Writes `config.yaml` pointing at the mock-api container and the bootstrap token to `/etc/plexd/bootstrap-token` (mode 0600), before the service starts so the unit can grant write access to it, and creates `/etc/plexd/hooks` as `plexd install` would. Runs `systemctl daemon-reload` and `systemctl enable --now plexd`, then checks that `systemctl is-active plexd-session-helper.socket` prints `active`: `plexd.service` wants the socket and names it in `Also=`.
 
 ### 6. Assertion polling
 
@@ -63,19 +63,23 @@ Uses `GET /test/last-request/{endpoint}` to verify the content of request payloa
 | `heartbeat` | Valid JSON with `timestamp` field |
 | `capabilities` | `binary_version` (non-empty), `binary_checksum` (32-byte base64 digest), eleven `builtin_actions`; `binary` and `plexd_hooks` absent |
 
-### 8. Periodic loop verification
+### 8. Spent token cleanup
+
+The unit keeps `/etc` read-only and grants write access to `/etc/plexd/bootstrap-token` alone, so plexd cannot unlink the token it spent and empties the file instead. The phase fails unless `stat -c %s /etc/plexd/bootstrap-token` prints `0`, `journalctl -u plexd` contains `token file emptied, it could not be removed`, and the journal contains neither `failed to delete token file` nor `hook watcher stopped`.
+
+### 9. Periodic loop verification
 
 Waits up to 60 seconds for `heartbeat_count`, `metrics_count`, and `logs_count` to reach >= 2, proving that periodic loops run continuously. Logs work via journald in the systemd container. Audit is tested separately via restart.
 
-### 9. Audit forwarding via service restart
+### 10. Audit forwarding via service restart
 
 The `ProcessSource` uses `sync.Once` to emit a single `process_start` audit entry per process lifetime. The test restarts the plexd service via `systemctl restart plexd`, creating a new process with a fresh `ProcessSource`, and verifies `audit_count` increases.
 
-### 10. Local endpoint delivery
+### 11. Local endpoint delivery
 
 Polls `GET /test/assertions` until `local_metrics_count`, `local_logs_count`, and `local_audit_count` are all >= 1 (timeout: 60s). Validates that the local endpoint credential chain works with systemd: NSK from registration → secret fetch → AES-256-GCM decryption → Bearer token → HTTPS POST to `plexd-e2e-mockapi:8443`.
 
-### 11. Mediated ssh session
+### 12. Mediated ssh session
 
 Drives a mediated ssh session through the sessions block, the socket-activated session helper and a real OpenSSH client. The listener binds the mesh address the mock assigns, `10.99.0.1`, so the client runs inside the container (`docker exec … sshpass -e ssh`), and the phase relies on WireGuard coming up in the privileged container. The image carries `openssh-client`, `sshpass` and an unprivileged user `e2e`. Each login uses `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1`; the last option makes a refused token end ssh with `255` instead of sshpass giving up on a second prompt. Tokens come from `POST /test/session-token`.
 
@@ -86,11 +90,15 @@ Drives a mediated ssh session through the sessions block, the socket-activated s
 5. Expects `exit 3` to exit `3`, and a token minted for another session id to end with `255` and `Permission denied`.
 6. Drains the block and waits for `session_activity_rejected_count` to rise by 2: both `session_ended` rows post for sessions the mock already holds as revoked, as the tcp drain does in the docker suite. The last body is an ssh `session_ended` row with `terminated_by` `plexd_close`.
 
-### 12. Shutdown verification
+### 13. Start after a reboot
+
+A reboot empties `/run`, which takes `/run/plexd` with it. The phase stops plexd, removes `/run/plexd` and starts plexd again, then waits up to 30 s for `/var/run/plexd/api.sock` and expects `systemctl is-active plexd` to print `active`. Every `ReadWritePaths` entry of the unit is optional, so systemd skips the missing directory instead of failing with `226/NAMESPACE`, and plexd recreates it for the node API socket.
+
+### 14. Shutdown verification
 
 Stops the service with `systemctl stop plexd`, verifies `inactive` state and exit code 0, checks `journalctl -u plexd` for absence of crash indicators (`core dumped`, `segfault`, `SIGABRT`, `SIGKILL`), and verifies the shutdown message was logged.
 
-### 13. Cleanup
+### 15. Cleanup
 
 The `cleanup` function runs on `EXIT` trap (both success and failure). It prints diagnostics on failure, then removes both containers and the Docker network.
 
@@ -113,7 +121,7 @@ The test polls `GET http://localhost:18080/test/assertions` which returns JSON c
 }
 ```
 
-The test passes when all seven platform counters are >= 1 (initial assertions), and separately verifies that all three local endpoint counters are >= 1 (Phase 10):
+The test passes when all seven platform counters are >= 1 (initial assertions), and separately verifies that all three local endpoint counters are >= 1 (Phase 11):
 
 | Counter | Meaning |
 |---------|---------|
@@ -169,7 +177,7 @@ audit_fwd:
     tls_insecure_skip_verify: true
 ```
 
-The bootstrap token is set via the environment file at `/etc/plexd/environment` (`PLEXD_BOOTSTRAP_TOKEN=e2e-test-token`).
+The bootstrap token is written to `/etc/plexd/bootstrap-token` (mode 0600) before the service starts; no environment file is written.
 
 ## Configuration Variables
 
@@ -220,7 +228,7 @@ docker exec plexd-e2e-systemd systemctl status plexd
 Common causes:
 - Binary not executable — check that `chmod +x` was applied to `/usr/local/bin/plexd`.
 - Config YAML parse error — field names must use snake_case YAML tags (e.g. `base_url`, not `baseurl`).
-- Missing bootstrap token — the environment file must set `PLEXD_BOOTSTRAP_TOKEN`.
+- Missing bootstrap token — `/etc/plexd/bootstrap-token` must hold the token before the service starts.
 
 **Assertions not met (counters stay at 0):**
 

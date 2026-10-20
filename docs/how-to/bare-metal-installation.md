@@ -61,6 +61,7 @@ This creates:
 | `/usr/local/bin/plexd`               | plexd binary             |
 | `/etc/plexd/config.yaml`            | Service configuration    |
 | `/etc/plexd/bootstrap-token`        | Bootstrap token (0600)   |
+| `/etc/plexd/hooks/`                  | Hook scripts directory   |
 | `/var/lib/plexd/`                    | Data directory           |
 | `/var/run/plexd/`                    | Runtime directory        |
 | `/etc/systemd/system/plexd.service` | Systemd unit file        |
@@ -170,6 +171,21 @@ Common issues:
 - **Missing token**: Provide a bootstrap token via `plexd join` or the `--token` flag.
 - **Network unreachable**: Verify connectivity to the control plane API URL.
 - **Permission denied**: Ensure plexd was installed as root.
+
+### `failed to delete token file` or `hook watcher stopped` in the journal
+
+A host installed before plexd's unit granted write access to the token file, and before `plexd install` created the hooks directory, logs these on its first start. Its unit also fails with `status=226/NAMESPACE` after a reboot. Re-run the installer, which rewrites the unit and creates `/etc/plexd/hooks/` while keeping `config.yaml`, then restart the service:
+
+```sh
+sudo plexd install
+sudo systemctl restart plexd
+```
+
+A node that logged `failed to delete token file` has already registered, and plexd runs token cleanup only while it registers, so the spent token is still on disk. Remove it once, from outside the unit's sandbox:
+
+```sh
+sudo rm -f /etc/plexd/bootstrap-token
+```
 
 ### Verify the unit file
 

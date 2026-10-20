@@ -90,6 +90,7 @@ This creates:
 | `/Library/Application Support/plexd/`               | Configuration directory               |
 | `/Library/Application Support/plexd/config.yaml`    | Service configuration                 |
 | `/Library/Application Support/plexd/bootstrap-token`| Bootstrap token (0600)                |
+| `/Library/Application Support/plexd/hooks/`         | Hook scripts directory                |
 | `/Library/Application Support/plexd/data/`          | Data directory (0700)                 |
 | `/var/run/plexd/`                                   | Runtime directory                     |
 | `/Library/LaunchDaemons/com.plexsphere.plexd.plist` | LaunchDaemon definition, `root:wheel` |
