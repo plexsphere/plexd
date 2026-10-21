@@ -6,7 +6,7 @@ feature: PXD-0001
 
 # API Types
 
-All request/response types for the 17 control plane API endpoints, organized by endpoint group. All types use JSON struct tags matching the API specification.
+All request/response types for the control plane API endpoints, organized by endpoint group. All types use JSON struct tags matching the API specification.
 
 ## Registration
 
@@ -58,18 +58,19 @@ Capabilities are published after registration via `PUT /v1/nodes/{node_id}/capab
 
 **Peer**
 
-`Peer` is the WireGuard peer shape used **only** for the SSE `peer_*` payloads;
-it no longer appears on the state pull. It remains until issue #25 migrates that
-contract.
+`Peer` is the internal WireGuard programming shape. The wireguard package builds
+it from a `SnapshotPeer` (see [State](#state)) and never reads it off the wire:
+the state pull carries `SnapshotPeer`, and plexd never decodes the payloads of the
+SSE `peer_*` events.
 
 | Field        | Type       | JSON Tag       | Description                |
 |--------------|------------|----------------|----------------------------|
 | `ID`         | `string`   | `"id"`         | Peer node ID               |
 | `PublicKey`  | `string`   | `"public_key"` | WireGuard public key       |
 | `MeshIP`     | `string`   | `"mesh_ip"`    | Mesh IP address            |
-| `Endpoint`   | `string`   | `"endpoint"`   | WireGuard endpoint         |
-| `AllowedIPs` | `[]string` | `"allowed_ips"`| Allowed IP ranges          |
-| `PSK`        | `string`   | `"psk"`        | Pre-shared key             |
+| `Endpoint`   | `string`   | `"endpoint"`   | Endpoint plexd programs: the peer's direct `endpoint` when it is usable, its `fallback_endpoint` otherwise |
+| `AllowedIPs` | `[]string` | `"allowed_ips"`| `mesh_ip/32`, derived locally |
+| `PSK`        | `string`   | `"psk"`        | Edge PSK fetched for the peer's current public key, standard base64; empty when plexd holds none |
 
 ## Heartbeat
 
@@ -128,19 +129,32 @@ under [Executions](#executions) below. `sessions` *is* desired state, but state
 the tunnel dispatcher converges on itself, documented under
 [Sessions](#sessions) below. `reachability` is not state to converge on either:
 the reachability observer decodes it leniently and logs the verdict when it
-changes.
+changes. `peers` goes to both: the differ drives the WireGuard reconcile handler
+from it, and the edge PSK store reads it on the dispatch seam.
 
 **SnapshotPeer**
 
-Carries **no** `psk`, `allowed_ips`, or `endpoint`. plexd derives `AllowedIPs`
-locally as `mesh_ip/32`, programs `fallback_endpoint` as the WireGuard endpoint
-(relay target), and configures peers without a preshared key.
+Carries the peer's direct `endpoint` but **no** `psk` or `allowed_ips`. plexd
+derives `AllowedIPs` locally as `mesh_ip/32`. plexd programs `endpoint` as the
+WireGuard endpoint when it is usable and `fallback_endpoint` (the relay target)
+otherwise (see [Endpoint selection](../networking/wireguard.md#endpoint-selection)).
+Unless `wireguard.edge_psk` is `false`, plexd fetches the pairwise edge PSK per
+edge from `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk` (see
+[Edge PSK](#edge-psk)).
+
+A direct endpoint is usable when it parses as an IP address and port with a
+non-zero port and no zone, its address (an IPv4-mapped address is unmapped first)
+is not unspecified, loopback, multicast or link-local, and it lies outside the
+Domain mesh prefix. plexd logs a refused endpoint at Warn and programs the
+fallback. `fallback_endpoint` is not validated, because the contract allows a
+hostname there.
 
 | Field              | Type     | JSON Tag                        | Description                   |
 |--------------------|----------|---------------------------------|-------------------------------|
 | `NodeID`           | `string` | `"node_id"`                     | Peer node ID                  |
 | `MeshIP`           | `string` | `"mesh_ip"`                     | Peer mesh IP address          |
 | `PublicKey`        | `string` | `"public_key"`                  | Peer WireGuard public key     |
+| `Endpoint`         | `string` | `"endpoint,omitempty"`          | Peer's direct WireGuard endpoint as `host:port` (an IPv6 host in brackets), the address it last reported through `PUT /v1/nodes/{node_id}/endpoint`; absent while the peer has no fresh observation |
 | `FallbackEndpoint` | `string` | `"fallback_endpoint,omitempty"` | Optional relay/fallback endpoint |
 
 **ReachabilitySnapshot**
@@ -277,6 +291,39 @@ unmarshaled.
 | `Data`    | `[]byte` | Response body (`application/octet-stream`)  | `<12-byte nonce> \|\| <ciphertext + 16-byte GCM tag>` |
 | `Version` | `int`    | `X-Plexsphere-Secret-Version` header        | Version of the returned secret                       |
 | `KID`     | `string` | `X-Plexsphere-Secret-KID` header            | Key id of the NSK the envelope was sealed under      |
+
+## Edge PSK
+
+### `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`
+
+**EdgePSKEnvelope**
+
+The pairwise WireGuard PSK for one edge, sealed under the calling node's NSK with
+AES-256-GCM. Like `SecretEnvelope` it carries **no JSON tags**: `Data` is read
+from the octet-stream body, `KID` and `Epoch` from response headers, and the type
+is never JSON-marshaled or unmarshaled. `FetchEdgePSK` refuses a body of any other
+length than `EdgePSKEnvelopeSize` and a response that lacks either header. `Data`
+is key material and is never logged.
+
+| Field   | Type     | Source                                      | Description                                          |
+|---------|----------|---------------------------------------------|------------------------------------------------------|
+| `Data`  | `[]byte` | Response body (`application/octet-stream`)  | `<12-byte nonce> \|\| <32-byte PSK + 16-byte GCM tag>`, exactly `EdgePSKEnvelopeSize` bytes |
+| `KID`   | `string` | `X-Plexsphere-PSK-KID` header               | Key id of the NSK the envelope was sealed under; required, but plexd holds one NSK and selects nothing by it |
+| `Epoch` | `string` | `X-Plexsphere-PSK-Epoch` header             | PSK epoch; required, part of the additional authenticated data and used verbatim |
+
+The wireguard package opens `Data` under the 32-byte NSK with the additional
+authenticated data `plexsphere/mesh/edge-psk/v1|<self node id>|<peer node id>|<epoch>`,
+both node IDs trimmed and lowercased. It refuses an envelope whose epoch sorts
+below the highest epoch it already accepted for the edge. That floor survives a
+change of the peer's public key and lives in memory only. See
+[Edge PSKs](../networking/wireguard.md#edge-psks) for the fetch rule and how plexd
+handles each answer.
+
+**Constants**
+
+| Constant              | Value | Description                                                       |
+|-----------------------|-------|-------------------------------------------------------------------|
+| `EdgePSKEnvelopeSize` | `60`  | Exact envelope length: 12-byte nonce, 32-byte PSK, 16-byte GCM tag |
 
 ## Reports
 
@@ -591,8 +638,10 @@ plane receives the same two values as the manifest's flat fields.
 | `AcceptedAt` | `time.Time` | `"accepted_at"` | Server receive time                    |
 | `StaleAfter` | `time.Time` | `"stale_after"` | Deadline after which the endpoint is stale; drives the re-report cadence |
 
-The response no longer carries peer endpoints. Inbound peer endpoint updates
-arrive via the `peer_endpoint_changed` SSE event.
+The response does not carry peer endpoints. Each peer's direct endpoint rides the
+state pull as `SnapshotPeer.Endpoint` (see [State](#state)). A
+`peer_endpoint_changed` SSE event only triggers a reconcile, and plexd never
+decodes its payload.
 
 ## Handshakes
 
@@ -643,8 +692,10 @@ return an error matching `ErrHandshakeReportTooMany` without sending a request.
 ### `POST /v1/keys/rotate`
 
 The server identifies the rotating node from its NSK bearer credential, so the
-request carries no node id. The response is a receipt, not a peer list — the
-propagated peer and PSK changes arrive via the next state pull.
+request carries no node id. The response is a receipt, not a peer list. The
+propagated peer changes arrive via the next state pull. With edge PSKs on, plexd
+fetches every edge PSK again on that pull from
+`GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk` (see [Edge PSK](#edge-psk)).
 
 **KeyRotateRequest**
 
@@ -922,10 +973,10 @@ Reconcile-driving payloads are opaque — the state pull is authoritative.
 | `EventBridgeConfigUpdated` | `bridge_config_updated` | contract          |
 | `EventActionRequest`       | `action_request`        | contract          |
 | `EventSessionSetup`        | `session_setup`         | contract          |
+| `EventPeerEndpointChanged` | `peer_endpoint_changed` | contract          |
 | `EventPeerRegistered`      | `peer_registered`       | documented-coming |
 | `EventPeerPSKAssigned`     | `peer_psk_assigned`     | documented-coming |
 | `EventPeerDeregistered`    | `peer_deregistered`     | documented-coming |
-| `EventPeerEndpointChanged` | `peer_endpoint_changed` | documented-coming |
 | `EventPeerKeyRotated`      | `peer_key_rotated`      | documented-coming |
 | `EventRotateKeys`          | `rotate_keys`           | documented-coming |
 | `EventSigningKeyRotated`   | `signing_key_rotated`   | documented-coming |
@@ -938,3 +989,13 @@ same shape for mediated access — the session is delivered in the `sessions` bl
 of that pull. `session_revoked` is the same shape from the other end: a session
 leaving the `sessions` block is what tears it down, so the event only pulls the
 observing reconcile forward.
+
+`peer_endpoint_changed` is a contract type the control plane emits now, and plexd
+treats it as a reconcile trigger. Its payload is never decoded: each peer's direct
+endpoint rides the `peers` block of the state pull as `SnapshotPeer.Endpoint`, and
+the event only brings the next pull forward. `peer_psk_assigned` is a reconcile
+trigger too, and it never forces a fetch on its own: plexd fetches an edge PSK
+from `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk` (see [Edge PSK](#edge-psk))
+when a peer first appears, when its public key changes and after this node's own
+key rotation, and a fetch still pending retries on the pull the event brings
+forward.

@@ -26,6 +26,7 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 14 | `POST` | `/v1/nodes/{node_id}/logs` | Log batch |
 | 15 | `POST` | `/v1/nodes/{node_id}/audit` | Audit batch |
 | 16 | `POST` | `/v1/nodes/{node_id}/handshakes` | Per-peer WireGuard handshake report |
+| 17 | `GET` | `/v1/nodes/{node_id}/peers/{peer_node_id}/psk` | Pairwise edge PSK (NSK-encrypted octet-stream) |
 
 ## Registration & Identity
 
@@ -102,10 +103,11 @@ Long-lived SSE connection. Supports `Last-Event-ID` header for replay after reco
 
 | Event Type | Payload Summary |
 |---|---|
-| `peer_added` | Peer identity, public key, mesh IP, endpoint, allowed IPs, PSK |
-| `peer_removed` | Peer ID |
-| `peer_key_rotated` | Peer ID, new public key, new PSK |
-| `peer_endpoint_changed` | Peer ID, new endpoint |
+| `peer_registered` | Opaque; triggers a reconcile. The new peer rides the state pull's `peers` block |
+| `peer_deregistered` | Opaque; triggers a reconcile. The peer leaving the `peers` block is what removes it |
+| `peer_psk_assigned` | Opaque; triggers a reconcile. The edge PSK itself comes from [`GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`](#edge-psk) |
+| `peer_key_rotated` | Opaque; triggers a reconcile. The new key rides the `public_key` member of the `peers` block, and the change makes plexd fetch the edge PSK again |
+| `peer_endpoint_changed` | Opaque; triggers a reconcile. The endpoint itself rides the `endpoint` member of the state pull's `peers` block |
 | `policy_updated` | Full policy ruleset (L3/L4 rules scoped to mesh IPs) |
 | `action_request` | Opaque; triggers a reconcile — the dispatch itself rides the `executions` block of the state pull |
 | `session_setup` | Opaque; triggers a reconcile — the session itself rides the `sessions` block of the state pull |
@@ -184,7 +186,9 @@ credential. The node stages a fresh keypair before submitting its public key.
 ```
 
 **Response** (`200 OK`) is a rotation receipt — never a peer list. The propagated
-peer and PSK changes arrive via the next state pull.
+peer changes arrive via the next state pull. Once the rotation completes, plexd
+fetches every edge PSK again from
+[`GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`](#edge-psk).
 
 ```json
 {
@@ -307,7 +311,7 @@ upgraded.
 
 ### PUT /v1/nodes/{node_id}/endpoint
 
-Called after STUN discovery, then on a deadline derived from the response (see below). The response no longer carries peer endpoints — those arrive via the `peer_endpoint_changed` SSE event.
+Called after STUN discovery, then on a deadline derived from the response (see below). The response carries no peer endpoints. Each peer's endpoint arrives as `endpoint` in the `peers` block of the [state pull](#get-v1-nodes-node-id-state), and a `peer_endpoint_changed` SSE event only brings that pull forward. The endpoint a node reports here is the one its peers receive for it.
 
 **Request body:**
 
@@ -444,6 +448,103 @@ has no internal retry, and Go's HTTP transport does not replay a `POST`.
 `api.IsHandshakeReportNotServed` classifies the two not-served answers. A `501`
 with any other code is an ordinary failure and logged at Warn.
 
+## Edge PSK
+
+### GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk
+
+Returns the pairwise WireGuard preshared key (PSK) of the edge between the node
+and the peer `{peer_node_id}`, sealed under the node's NSK. The state pull never
+carries a PSK, so plexd fetches one per edge from this operation and programs it
+on the peer. The request has no body.
+
+**Response** (`200 OK`) is `Content-Type: application/octet-stream`, not JSON:
+the body is exactly 60 bytes (`api.EdgePSKEnvelopeSize`), the AES-256-GCM
+envelope `<12-byte nonce> || <32-byte PSK ciphertext> || <16-byte GCM tag>`.
+plexd refuses a body of any other length. The metadata rides in response
+headers, and plexd refuses a response that lacks either `X-Plexsphere-PSK-*`
+header:
+
+| Header | Meaning |
+|---|---|
+| `X-Plexsphere-PSK-KID` | Key id of the NSK the envelope was sealed under. plexd holds one NSK, so the value selects nothing |
+| `X-Plexsphere-PSK-Epoch` | The epoch of the PSK, bound into the additional authenticated data and used verbatim |
+| `Cache-Control` | Always `no-store` |
+
+plexd opens the envelope with AES-256-GCM under its 32-byte NSK, the same key
+and layout as a [secret envelope](#secrets), but with this additional
+authenticated data (AAD):
+
+```text
+plexsphere/mesh/edge-psk/v1|<node_id>|<peer_node_id>|<epoch>
+```
+
+`<node_id>` is this node's ID and `<peer_node_id>` the peer's, each trimmed and
+lowercased; `<epoch>` is the `X-Plexsphere-PSK-Epoch` value exactly as served.
+Binding the two IDs keeps a secret envelope (sealed with no AAD) or another
+edge's envelope from opening as this edge's PSK. Binding the epoch makes the
+header a trustworthy statement of the envelope's age. An envelope that does not
+open is logged at Warn and installs nothing.
+
+**Epoch rule.** plexd keeps the highest epoch it has accepted for each edge and
+refuses an envelope whose epoch sorts below it, with a Warn line. The
+comparison is a plain string comparison, which the fixed-width UTC epoch format
+makes chronological, and an equal epoch is accepted. A mesh key rotation does
+not rotate the NSK, so an older envelope would still open and reinstall a
+retired key. The floor survives a change of the peer's public key and is
+dropped when the peer leaves the `peers` block. It lives in memory only: a
+restarted node fetches every PSK again with no floor.
+
+**Fetch rule.** plexd fetches a peer's PSK when the peer first appears in the
+`peers` block of the [state pull](#get-v1-nodes-node-id-state), when its
+`public_key` changes, and after this node completes its own key rotation. A
+fetch that failed stays due, and once every peer's PSK is in hand, a pull with
+an unchanged peer set sends no request. The fetches run on every successful
+pull, in node ID order, before the reconcile handlers, so a new peer's PSK is
+in hand when the WireGuard handler adds the peer in the same cycle. After its
+own rotation, plexd keeps each old PSK on the device until the replacement
+arrives. A `peer_psk_assigned` event only triggers a reconcile, and a fetch
+that is still due runs on the pull it triggers.
+
+When plexd has already programmed the peer under the public key the PSK was
+fetched for, it installs the PSK by rewriting the peer's device entry with its
+allowed IPs and the PSK, which leaves the device's endpoint for the peer as it
+is. A failed install is logged at Warn and retried on the next pull without
+another fetch. The WireGuard reconcile handler programs the PSK held for a
+peer's current public key on every peer it adds or updates, so a PSK fetched
+before its peer is programmed reaches the device that way. Keys, envelopes and
+the NSK never reach a log line or an error.
+
+plexd fetches edge PSKs only when its WireGuard interface came up and
+[`wireguard.edge_psk`](configuration.md#wireguard) is true, the default. With
+`edge_psk: false` it logs `edge psk disabled by wireguard.edge_psk` at Info and
+programs no PSK. WireGuard needs the same PSK on both ends of a tunnel, and the
+relay forwards UDP end to end, so an edge between a node that installs edge PSKs and one that
+installs none fails, direct and relayed, until both ends match. During a
+rolling upgrade, set `edge_psk: false` on the upgraded nodes and turn it back
+on once every node of the Domain runs a plexd that installs edge PSKs.
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning | plexd behavior |
+|---|---|---|---|
+| `200 OK` | — | Edge PSK envelope (octet-stream) with the headers above | Checked against the epoch floor, opened and installed; logged at Info as `wireguard: edge psk fetched` with `peer_id` and `epoch`. After a not-served phase, one Info line that the control plane serves edge PSKs |
+| `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked | Logged at Warn; the pass goes on to the next peer, and the next pull fetches again |
+| `403 Forbidden` | `node_id_mismatch`, `node_deregistered` | The NSK belongs to a different node than the path, or this node was deregistered | Terminal for any code: logged at Error, and plexd sends no edge PSK request again until it restarts |
+| `404 Not Found` | `peer_not_found` | The peer does not resolve to a live peer of the node's Domain yet, for example right after it registered | Logged at Debug; the pass goes on to the next peer, and the next pull retries |
+| `404 Not Found` | any other, or none | An older control plane that does not serve the operation | Logged once at Info as not served; the pass stops, so such a control plane sees one request per pull |
+| `409 Conflict` | `psk_not_ready` | The PSK of the edge has not been provisioned yet | Logged at Debug; the pass goes on to the next peer, and the next pull retries |
+| `429 Too Many Requests` | `per_node_rate_limited` | Per-node fetch rate limit | Logged at Warn; the pass stops, and no pull fetches until `Retry-After` has passed (at least 1s) |
+| `500 Internal Server Error` | — | Server error | Logged at Warn; the pass goes on to the next peer, and the next pull fetches again |
+| `501 Not Implemented` | `psk_delivery_not_provisioned` | The control plane has not wired its PSK delivery | Logged once at Info as not served; the pass stops, so such a control plane sees one request per pull |
+
+`api.IsEdgePSKNotServed` classifies the two not-served answers. A `501` with any
+other code, a body that is not 60 bytes, or a missing header is an ordinary
+failure: plexd logs it at Warn and goes on to the next peer. A transport error,
+such as a refused connection or a request timeout, is logged at Warn and stops
+the pass: it would meet every remaining peer the same way, and the fetches run
+before the reconcile handlers, so a control plane that hangs costs one request
+timeout per pull rather than one per peer.
+
 ## Reconciliation & State
 
 ### GET /v1/nodes/{node_id}/state
@@ -467,7 +568,8 @@ absence.
     {
       "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
       "mesh_ip": "10.99.0.3",
-      "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+      "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "endpoint": "198.51.100.20:51820"
     }
   ],
   "reachability": {
@@ -527,6 +629,22 @@ absence.
   ]
 }
 ```
+
+A peer's `endpoint` is its direct WireGuard endpoint as `host:port` (an IPv6
+host in brackets), the address the peer last reported through
+[`PUT /v1/nodes/{node_id}/endpoint`](#put-v1-nodes-node-id-endpoint). It is
+absent while the peer has no fresh NAT observation. plexd programs `endpoint`
+when it is usable and `fallback_endpoint`, the relay target, otherwise. The
+pull carries no PSK: plexd fetches the pairwise PSK of each edge from
+[`GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`](#edge-psk). A direct
+endpoint is usable when it parses as an IP address and a non-zero port, carries
+no IPv6 zone, names an address that is not unspecified, loopback, multicast or
+link-local (an IPv4-mapped IPv6 address is unmapped first), and lies outside
+the Domain mesh prefix (the node's own mesh IP as a host /32 when registration
+returned no usable `domain_mesh_cidr`). plexd logs a refused one at Warn and
+programs the fallback instead. `fallback_endpoint` is not validated, since the
+contract allows a hostname there. A change of `endpoint` alone is enough for
+the differ to update the peer.
 
 `reachability` is the control plane's own verdict about this node, derived from
 the heartbeats it has admitted. `state` is one of `healthy`, `stale`,

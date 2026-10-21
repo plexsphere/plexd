@@ -317,6 +317,9 @@ WireGuard interface and peer management. See [WireGuard Tunnel Management](../ne
 | `interface_name` | string | `plexd0` | Name of the WireGuard interface. On macOS the kernel names the device `utunN`; this value still keys the device, its UAPI socket (`wg show plexd0`) and the log lines, and a value of the form `utunN` requests that unit. See [macOS controller](../networking/wireguard.md#macos-controller). On Windows the value names the Wintun adapter itself, and its GUID is derived from it: see [Windows controller](../networking/wireguard.md#windows-controller) |
 | `listen_port` | int | `51820` | UDP listen port for WireGuard |
 | `mtu` | int | `0` | MTU for the WireGuard interface. `0` means use system default. |
+| `edge_psk` | bool | `true` | Fetch each edge's PSK from the control plane and program it on the peer. An omitted key means enabled; an explicit `false` is preserved. Takes effect only when the WireGuard interface came up. See [Edge PSKs](../networking/wireguard.md#edge-psks). |
+
+WireGuard needs the same PSK on both ends of a tunnel, and the NAT relay forwards the WireGuard packets end to end, so an edge between a plexd that installs edge PSKs and an older plexd fails, direct and relayed, until both ends match. During a rolling upgrade, set `edge_psk: false` on the upgraded nodes, and set it back to `true` (or remove the key) once every node of the Domain runs a plexd that installs edge PSKs. A node with the setting off and its WireGuard interface up logs `edge psk disabled by wireguard.edge_psk` when `plexd up` starts. See [Turning edge PSKs off](../networking/wireguard.md#turning-edge-psks-off).
 
 Source: `internal/wireguard/config.go`
 
@@ -550,6 +553,7 @@ wireguard:
   interface_name: plexd0
   listen_port: 51820
   # mtu: 0                  # 0 = system default
+  # edge_psk: true          # false during a rolling upgrade, until every node installs edge PSKs
 
 nat:
   enabled: true

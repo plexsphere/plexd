@@ -64,6 +64,8 @@ They return nothing: a dispatch problem is the handler's own to report and never
 
 Two blocks are consumed on this seam. `executions` is a delivery queue: `actions.Dispatcher.Handle` redelivers each entry until its execution settles through the callback. `sessions` is desired state rather than a queue — an entry stands for as long as its session is valid, and its disappearance is the teardown signal — but `tunnel.Dispatcher.Handle` converges it here rather than behind the diff, because an entry a transient failure left unprovisioned has to be retried on the next pull whether or not the snapshot moved.
 
+The [edge PSK store](../networking/wireguard.md#edge-psks) also runs on this seam, through `wireguard.EdgePSKDispatchHandler`, when the WireGuard interface came up, `wireguard.edge_psk` is not `false` and the node secret key decodes. It reads the `peers` block, which the differ sees as well, and fetches the edge PSK of a peer that first appears, of a peer whose `public_key` changed, and of every peer after this node's own key rotation. It runs here rather than behind the diff so that a failed fetch retries on every pull, drift or not, without failing the WireGuard reconcile handler and holding the snapshot back: the store logs the failure and retries on the next pull. Because dispatch handlers run before the reconcile handlers, a new peer's PSK is fetched before the WireGuard handler adds the peer in the same cycle.
+
 ## Reconciler
 
 ### Constructor
@@ -200,7 +202,7 @@ Comparison logic by block:
 
 | Block   | Match Key         | Detection                                                                 |
 |---------|-------------------|---------------------------------------------------------------------------|
-| Peers   | `SnapshotPeer.NodeID` | Add/remove by node ID; update when `MeshIP`, `PublicKey`, or `FallbackEndpoint` differs |
+| Peers   | `SnapshotPeer.NodeID` | Add/remove by node ID; update when `MeshIP`, `PublicKey`, `Endpoint`, or `FallbackEndpoint` differs |
 | Policy  | —                 | Presence-aware; when both blocks are populated it compares **only** the `Fingerprint` byte-for-byte |
 | Bridge  | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
 | State   | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
@@ -267,7 +269,7 @@ The agent registers these handlers (in `cmd/plexd/cmd/up.go`):
 | Handler                          | Responsibility                                                        |
 |----------------------------------|----------------------------------------------------------------------|
 | `nodeapi` cache handler          | Feed the local state cache from the snapshot `state` block           |
-| `wireguard.ReconcileHandler`     | Apply peer add/remove/update from the `peers` block (registered only when the WireGuard interface came up) |
+| `wireguard.ReconcileHandler`     | Apply peer add/remove/update from the `peers` block, with each peer's usable direct `endpoint` or else its `fallback_endpoint`, and the edge PSK held for its current public key (registered only when the WireGuard interface came up) |
 | `policy.ReconcileHandler`        | Rebuild the nftables ruleset from the merged `policy` block on a fingerprint change |
 | bridge sub-handlers              | Reconcile relay, user-access, ingress, and site-to-site subtrees      |
 
@@ -278,5 +280,6 @@ Signing-key rotation is no longer a reconcile handler: key material comes from r
 | Handler                    | Responsibility                                                     |
 |----------------------------|--------------------------------------------------------------------|
 | `actions.Dispatcher.Handle`| Turn each entry of the `executions` block into an action execution |
+| `wireguard.EdgePSKDispatchHandler` | Fetch, open and install the edge PSKs the `peers` block makes due (registered only when the WireGuard interface came up, `wireguard.edge_psk` is not `false` and the node secret key decodes) |
 
 See [Remote Actions and Hooks](/reference/actions/remote-actions-hooks) for the dispatcher's decision table.

@@ -215,7 +215,7 @@ type EndpointResponse struct {
 }
 ```
 
-The response no longer carries peer endpoints. Inbound peer endpoint updates arrive via the `peer_endpoint_changed` SSE event (and, once issue #20 lands, the reconciliation state pull).
+The response no longer carries peer endpoints. Inbound peer endpoints arrive on the reconciliation state pull, as the `endpoint` member of each peer, and a `peer_endpoint_changed` SSE event only brings that pull forward.
 
 ## report
 
@@ -293,7 +293,7 @@ disc.Run(ctx, controlPlane, nodeID)
 
 ### With SSE Events
 
-The existing `wireguard.HandlePeerEndpointChanged` SSE handler (from B001) processes `peer_endpoint_changed` events for real-time endpoint updates. The NAT discovery module does not register its own SSE handler — it relies on the wireguard handler for inbound endpoint updates.
+The NAT discovery module registers no SSE handler. `plexd up` registers `peer_endpoint_changed` as a reconcile trigger and never decodes its payload: inbound peer endpoints arrive on the reconciliation state pull the event brings forward, and the WireGuard reconcile handler programs them (see [Peer Endpoint Exchange](peer-endpoint-exchange.md#data-flow)).
 
 ## Error Handling
 
