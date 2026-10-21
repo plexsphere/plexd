@@ -93,6 +93,11 @@ var (
 // request when the report carries more than MaxHandshakeReportPeers peers.
 var ErrHandshakeReportTooMany = fmt.Errorf("handshake report exceeds %d peers", MaxHandshakeReportPeers)
 
+// ErrEndpointCandidatesTooMany is returned by ReportEndpointCandidates before
+// any HTTP request when the report carries more than MaxEndpointCandidates
+// candidates.
+var ErrEndpointCandidatesTooMany = fmt.Errorf("endpoint candidate report exceeds %d candidates", MaxEndpointCandidates)
+
 // IsIngestNotProvisioned reports whether err is the control plane's refusal to
 // accept observability ingest because it is not provisioned for the node: a 501
 // carrying the observability_ingest_not_provisioned problem code.
@@ -169,6 +174,32 @@ func IsEdgePSKNotServed(err error) bool {
 		return apiErr.Code != "peer_not_found"
 	case http.StatusNotImplemented:
 		return apiErr.Code == "psk_delivery_not_provisioned"
+	default:
+		return false
+	}
+}
+
+// IsEndpointCandidatesNotServed reports whether err says the control plane does
+// not serve PUT /v1/nodes/{node_id}/endpoint-candidates: a 404 with any code but
+// endpoint_peer_not_found, or a 501 carrying the
+// endpoint_candidates_not_provisioned problem code.
+//
+// A control plane older than the operation has no route for it, and its router
+// answers 404 with whatever its not-found handler writes, so no code can be
+// required of it. The operation's own 404 is endpoint_peer_not_found, the
+// first-report race plexsphere/plexsphere#868 documents: the node reports
+// before the control plane has registered it as a peer, and a later cycle
+// heals it, so it is not a missing surface.
+func IsEndpointCandidatesNotServed(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.StatusCode {
+	case http.StatusNotFound:
+		return apiErr.Code != "endpoint_peer_not_found"
+	case http.StatusNotImplemented:
+		return apiErr.Code == "endpoint_candidates_not_provisioned"
 	default:
 		return false
 	}

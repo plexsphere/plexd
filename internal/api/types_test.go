@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -232,6 +233,44 @@ func TestTypesEndpointRequest(t *testing.T) {
 func TestTypesEndpointResponse(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	orig := EndpointResponse{
+		AcceptedAt: now,
+		StaleAfter: now.Add(5 * time.Minute),
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 2 {
+		t.Errorf("expected exactly 2 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"accepted_at", "stale_after"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
+func TestTypesEndpointCandidatesRequest(t *testing.T) {
+	// The contract's request example.
+	orig := EndpointCandidatesRequest{
+		Candidates: []string{"10.0.0.5:51820", "[fd00:10::5]:51820"},
+		ReportedAt: time.Date(2026, 10, 21, 10, 15, 30, 0, time.UTC),
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	const want = `{"candidates":["10.0.0.5:51820","[fd00:10::5]:51820"],"reported_at":"2026-10-21T10:15:30Z"}`
+	if string(data) != want {
+		t.Errorf("serialized = %s, want %s", data, want)
+	}
+}
+
+func TestTypesEndpointCandidatesResponse(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	orig := EndpointCandidatesResponse{
 		AcceptedAt: now,
 		StaleAfter: now.Add(5 * time.Minute),
 	}
@@ -612,6 +651,49 @@ func TestSnapshotPeer_Endpoint(t *testing.T) {
 	}
 	if s := string(data); strings.Contains(s, `"endpoint"`) {
 		t.Errorf("endpoint should be omitted when empty, got: %s", s)
+	}
+}
+
+func TestSnapshotPeer_EndpointCandidates(t *testing.T) {
+	const withCandidates = `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","mesh_ip":"10.99.0.2","public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=","endpoint_candidates":["10.0.0.5:51820","[fd00:10::5]:51820"]}`
+	var got SnapshotPeer
+	if err := json.Unmarshal([]byte(withCandidates), &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if want := []string{"10.0.0.5:51820", "[fd00:10::5]:51820"}; !slices.Equal(got.EndpointCandidates, want) {
+		t.Errorf("EndpointCandidates = %v, want %v", got.EndpointCandidates, want)
+	}
+
+	const withoutCandidates = `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","mesh_ip":"10.99.0.2","public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="}`
+	var absent SnapshotPeer
+	if err := json.Unmarshal([]byte(withoutCandidates), &absent); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if absent.EndpointCandidates != nil {
+		t.Errorf("EndpointCandidates = %#v for a peer without the key, want nil", absent.EndpointCandidates)
+	}
+
+	data, err := json.Marshal(absent)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if s := string(data); strings.Contains(s, `"endpoint_candidates"`) {
+		t.Errorf("endpoint_candidates should be omitted when nil, got: %s", s)
+	}
+}
+
+func TestPeer_EndpointsTag(t *testing.T) {
+	orig := Peer{ID: "n-002", Endpoint: "10.0.0.5:51820", Endpoints: []string{"10.0.0.5:51820", "203.0.113.1:51820"}}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+	if s := string(data); !strings.Contains(s, `"endpoints":["10.0.0.5:51820","203.0.113.1:51820"]`) {
+		t.Errorf("endpoints should serialize under the endpoints key, got: %s", s)
+	}
+
+	orig.Endpoints = nil
+	data, _ = roundTrip(t, orig)
+	if s := string(data); strings.Contains(s, `"endpoints"`) {
+		t.Errorf("endpoints should be omitted when nil, got: %s", s)
 	}
 }
 
