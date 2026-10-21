@@ -8,6 +8,7 @@
 #   - Periodic loop verification (counters >= 2 after additional wait)
 #   - Handshake report and tunnel_health samples (skipped when WireGuard
 #     did not come up in the container)
+#   - Edge PSK fetches for both fixture peers (same skip condition)
 #   - Request body validation (registration token, heartbeat, capabilities)
 #   - Log injection (docker cp into container, verify logs_count increases)
 #   - Agent restart for audit verification (ProcessSource fires per-process)
@@ -829,6 +830,66 @@ else
     echo "  PASS: metrics carry tunnel_health samples labelled with fixture peer(s) ${TH_PEERS}"
 
     echo "=== Phase 4b PASSED: handshake report and tunnel_health ==="
+fi
+
+# ===================================================================
+# Phase 4c: edge PSKs
+#
+# plexd fetches each peer's edge PSK only when its interface came up, so the
+# phase shares phase 4b's skip condition. The store syncs on every pull, before
+# the WireGuard handler adds the peers, so both fixture peers' PSKs are fetched
+# on the first pull after start. Each fetch logs one Info line naming the peer
+# and its epoch; the key itself never reaches the log.
+# ===================================================================
+echo "=== Testing edge PSK fetches ==="
+
+if [ "${WG_CONFIGURED}" -eq 0 ]; then
+    echo "SKIP: edge psk (WireGuard did not come up in this container)"
+else
+    PSK_TIMEOUT=60
+    PSK_ELAPSED=0
+    PSK_COUNT=0
+    while [ "${PSK_ELAPSED}" -lt "${PSK_TIMEOUT}" ]; do
+        RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+        if [ -n "${RESPONSE}" ]; then
+            PSK_COUNT=$(get_counter "${RESPONSE}" "edge_psk_count")
+            if [ "${PSK_COUNT}" -ge 2 ]; then
+                break
+            fi
+        fi
+        sleep 3
+        PSK_ELAPSED=$((PSK_ELAPSED + 3))
+    done
+    if [ "${PSK_COUNT}" -lt 2 ]; then
+        fail "edge_psk_count=${PSK_COUNT} after ${PSK_TIMEOUT}s, want >= 2 (one fetch per fixture peer on the first pull)"
+    fi
+    echo "  PASS: edge_psk_count=${PSK_COUNT} >= 2"
+
+    # Read line by line and match with case, as above: no grep -q in a pipeline.
+    for PSK_PEER in "${FIXTURE_PEER_B1}" "${FIXTURE_PEER_B2}"; do
+        PSK_LOG_TIMEOUT=30
+        PSK_LOG_ELAPSED=0
+        PSK_FOUND=0
+        while [ "${PSK_LOG_ELAPSED}" -lt "${PSK_LOG_TIMEOUT}" ]; do
+            PLEXD_LOGS=$(dc logs plexd 2>/dev/null || true)
+            while IFS= read -r PSK_LINE; do
+                case "${PSK_LINE}" in
+                    *"edge psk fetched"*"${PSK_PEER}"*) PSK_FOUND=1; break ;;
+                esac
+            done <<< "${PLEXD_LOGS}"
+            if [ "${PSK_FOUND}" -eq 1 ]; then
+                break
+            fi
+            sleep 3
+            PSK_LOG_ELAPSED=$((PSK_LOG_ELAPSED + 3))
+        done
+        if [ "${PSK_FOUND}" -eq 0 ]; then
+            fail "no 'edge psk fetched' log line for peer ${PSK_PEER} within ${PSK_LOG_TIMEOUT}s"
+        fi
+        echo "  PASS: plexd logged 'edge psk fetched' for peer ${PSK_PEER}"
+    done
+
+    echo "=== Phase 4c PASSED: edge PSKs ==="
 fi
 
 # ===================================================================

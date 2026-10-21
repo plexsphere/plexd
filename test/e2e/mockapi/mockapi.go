@@ -64,6 +64,7 @@ type AssertionCounters struct {
 	SessionActivityRejectedCount int64 `json:"session_activity_rejected_count"`
 	IntegrityViolationCount      int64 `json:"integrity_violation_count"`
 	HandshakeReportCount         int64 `json:"handshake_report_count"`
+	EdgePSKCount                 int64 `json:"edge_psk_count"`
 	InjectEventCount             int64 `json:"inject_event_count"`
 	EventsRequestCount           int64 `json:"events_request_count"`
 	LocalMetricsCount            int64 `json:"local_metrics_count"`
@@ -106,6 +107,7 @@ type Server struct {
 	sessionActivityRejectedCount atomic.Int64
 	integrityViolationCount      atomic.Int64
 	handshakeReportCount         atomic.Int64
+	edgePSKCount                 atomic.Int64
 	injectEventCount             atomic.Int64
 	eventsRequestCount           atomic.Int64
 	localMetricsCount            atomic.Int64
@@ -248,6 +250,7 @@ func (s *Server) Assertions() AssertionCounters {
 		SessionActivityRejectedCount: s.sessionActivityRejectedCount.Load(),
 		IntegrityViolationCount:      s.integrityViolationCount.Load(),
 		HandshakeReportCount:         s.handshakeReportCount.Load(),
+		EdgePSKCount:                 s.edgePSKCount.Load(),
 		InjectEventCount:             s.injectEventCount.Load(),
 		EventsRequestCount:           s.eventsRequestCount.Load(),
 		LocalMetricsCount:            s.localMetricsCount.Load(),
@@ -259,7 +262,9 @@ func (s *Server) Assertions() AssertionCounters {
 
 // newStateFixture builds the desired-state NodeStateSnapshot envelope served by
 // GET /v1/nodes/{id}/state. The two peers mirror fixtureRegisterPeers (node_id
-// ascending, self excluded) and carry no psk/allowed_ips/endpoint; the merged
+// ascending, self excluded) and carry no psk/allowed_ips. Peer ...a0b1 has only
+// its relay fallback and peer ...a0b2 only a direct endpoint, so the agent's
+// endpoint selection meets both branches; the merged
 // policy fingerprint is derived with policyFingerprint; the bridge subtree
 // carries the four child configs; and both state and reports mirror one another
 // (the contract splits them for forward compatibility).
@@ -293,6 +298,7 @@ func newStateFixture() api.NodeStateSnapshot {
 				NodeID:    "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
 				MeshIP:    "10.99.0.3",
 				PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+				Endpoint:  "198.51.100.20:51820",
 			},
 		},
 		// The mock accepts heartbeats but never evaluates them into a projection,
@@ -481,6 +487,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/nodes/{id}/sessions/{sid}", s.handleSessionActivity)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/integrity-violations", s.handleIntegrityViolations)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/handshakes", s.handleHandshakes)
+	s.mux.HandleFunc("GET /v1/nodes/{id}/peers/{peer_node_id}/psk", s.handleEdgePSK)
 
 	// Release channel fixture (outside /v1: this plays the GitHub release host,
 	// not the control plane).
@@ -515,6 +522,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/sessions/{sid}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/integrity-violations", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/handshakes", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/peers/{peer_node_id}/psk", methodNotAllowed)
 	s.mux.HandleFunc("/releases/{tag}/{asset}", methodNotAllowed)
 	s.mux.HandleFunc("/test/state", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-state", methodNotAllowed)
@@ -1333,6 +1341,62 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 	if _, err := w.Write(envelope); err != nil {
 		slog.Error("handleSecrets: write failed", "error", err)
 	}
+}
+
+// handleEdgePSK handles GET /v1/nodes/{id}/peers/{peer_node_id}/psk. It serves
+// the fixture peers' edge PSKs the way the control plane does: sealed under the
+// node's NSK with the contract's additional authenticated data, as a 60-byte
+// octet-stream body with the KID and epoch headers. A path id other than the
+// registered node is 403 node_id_mismatch, and a peer that is not a fixture
+// peer, or the node itself, is 404 peer_not_found. The counter increments only
+// on a 200.
+func (s *Server) handleEdgePSK(w http.ResponseWriter, r *http.Request) {
+	nodeID, peerID := r.PathValue("id"), r.PathValue("peer_node_id")
+	if nodeID != mockNodeID {
+		writeProblem(w, r, http.StatusForbidden, "node_id_mismatch", "resolved NSK Node id does not match URL path id.")
+		return
+	}
+	if peerID == nodeID || !isFixturePeer(peerID) {
+		writeProblem(w, r, http.StatusNotFound, "peer_not_found", "peer node id does not resolve to a live peer of the calling Node's Domain.")
+		return
+	}
+
+	envelope := sealEdgePSK(s.nsk, mockEdgePSK(peerID), []byte(edgePSKAADPrefix+nodeID+"|"+peerID+"|"+mockEdgePSKEpoch))
+	s.edgePSKCount.Add(1)
+	w.Header().Set("X-Plexsphere-PSK-KID", mockEdgePSKKID)
+	w.Header().Set("X-Plexsphere-PSK-Epoch", mockEdgePSKEpoch)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(envelope); err != nil {
+		slog.Error("handleEdgePSK: write failed", "error", err)
+	}
+}
+
+// The edge-PSK fixture: the contract's AAD tag, the key id and the epoch
+// served with every envelope. The epoch is fixed, so a re-fetch is never
+// older than the envelope already in force.
+const (
+	edgePSKAADPrefix = "plexsphere/mesh/edge-psk/v1|"
+	mockEdgePSKKID   = "mock-nsk-1"
+	mockEdgePSKEpoch = "2026-01-01T00:00:00.000000000Z|2026-01-01T00:00:01.000000000Z"
+)
+
+// mockEdgePSK is the fixture edge PSK for peerID: SHA-256 of
+// "mock-edge-psk|<peer_node_id>".
+func mockEdgePSK(peerID string) []byte {
+	sum := sha256.Sum256([]byte("mock-edge-psk|" + peerID))
+	return sum[:]
+}
+
+// isFixturePeer reports whether peerID names one of the state fixture's peers.
+func isFixturePeer(peerID string) bool {
+	for _, p := range newStateFixture().Peers {
+		if p.NodeID == peerID {
+			return true
+		}
+	}
+	return false
 }
 
 // mockSecretKID is the fixture key id served in the X-Plexsphere-Secret-KID
@@ -2739,6 +2803,24 @@ func (s *Server) handleLastRequest(w http.ResponseWriter, r *http.Request) {
 // encryptSecret seals plaintext with AES-256-GCM under the given NSK using a
 // fresh random 12-byte nonce, returning the raw envelope
 // nonce || ciphertext+tag exactly as the control-plane octet-stream body.
+// sealEdgePSK seals an edge PSK the way encryptSecret seals a secret, but with
+// the edge's additional authenticated data bound into the tag.
+func sealEdgePSK(nsk, key, aad []byte) []byte {
+	block, err := aes.NewCipher(nsk)
+	if err != nil {
+		panic("mockapi: aes.NewCipher: " + err.Error())
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		panic("mockapi: cipher.NewGCM: " + err.Error())
+	}
+	nonceBytes := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonceBytes); err != nil {
+		panic("mockapi: rand.Read nonce: " + err.Error())
+	}
+	return gcm.Seal(nonceBytes, nonceBytes, key, aad)
+}
+
 func encryptSecret(nsk []byte, plaintext string) []byte {
 	block, err := aes.NewCipher(nsk)
 	if err != nil {
