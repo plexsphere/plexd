@@ -89,6 +89,10 @@ var (
 	ErrIntegrityViolationsTooMany = fmt.Errorf("integrity violation batch exceeds %d entries", MaxIntegrityViolationsPerBatch)
 )
 
+// ErrHandshakeReportTooMany is returned by ReportHandshakes before any HTTP
+// request when the report carries more than MaxHandshakeReportPeers peers.
+var ErrHandshakeReportTooMany = fmt.Errorf("handshake report exceeds %d peers", MaxHandshakeReportPeers)
+
 // IsIngestNotProvisioned reports whether err is the control plane's refusal to
 // accept observability ingest because it is not provisioned for the node: a 501
 // carrying the observability_ingest_not_provisioned problem code.
@@ -110,6 +114,39 @@ func IsEventBusNotProvisioned(err error) bool {
 	return errors.As(err, &apiErr) &&
 		apiErr.StatusCode == http.StatusNotImplemented &&
 		apiErr.Code == "signed_event_bus_not_provisioned"
+}
+
+// IsHandshakeReportNotServed reports whether err says the control plane does
+// not serve POST /v1/nodes/{node_id}/handshakes: a 404 with any code or none, or
+// a 501 carrying the handshakes_not_provisioned problem code.
+//
+// The two statuses are one condition met on two control-plane generations. A
+// control plane older than the operation has no route for it, and its router
+// answers 404 with whatever body its not-found handler writes, so no code can
+// be required of it. A control plane that has the route but not the recording
+// service wired answers 501 handshakes_not_provisioned. Either way nothing
+// stores the report until the control plane is upgraded or provisioned, so the
+// reporter says so once and keeps sending on its interval instead of warning
+// on every tick.
+//
+// Taking every 404 is safe because the operation has none of its own: the
+// contract answers it with 200, 400, 401, 403, 413, 500 or 501, and an entry
+// naming an unknown or deregistered peer is counted as ignored rather than
+// refused. A 501 with another code is a different surface's refusal and stays a
+// failure.
+func IsHandshakeReportNotServed(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.StatusCode {
+	case http.StatusNotFound:
+		return true
+	case http.StatusNotImplemented:
+		return apiErr.Code == "handshakes_not_provisioned"
+	default:
+		return false
+	}
 }
 
 // IsSessionRevokedOrExpired reports whether err is the control plane's verdict

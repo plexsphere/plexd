@@ -252,6 +252,106 @@ func TestTypesEndpointResponse(t *testing.T) {
 	}
 }
 
+func TestTypesHandshakeReportRequest(t *testing.T) {
+	// The contract's request example.
+	orig := HandshakeReportRequest{
+		ObservedAt: time.Date(2026, 10, 21, 10, 15, 30, 0, time.UTC),
+		Peers: []HandshakeReportPeer{
+			{PeerNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2", LastHandshakeAgeSeconds: 42, Endpoint: "198.51.100.7:51820"},
+			{PeerNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3", LastHandshakeAgeSeconds: 117, Endpoint: "[2001:db8::7]:51820"},
+		},
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	const want = `{"observed_at":"2026-10-21T10:15:30Z","peers":[` +
+		`{"peer_node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2","last_handshake_age_seconds":42,"endpoint":"198.51.100.7:51820"},` +
+		`{"peer_node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3","last_handshake_age_seconds":117,"endpoint":"[2001:db8::7]:51820"}]}`
+	if string(data) != want {
+		t.Errorf("serialized =\n  %s\nwant\n  %s", data, want)
+	}
+
+	// The handler decodes with DisallowUnknownFields, so the envelope and each
+	// entry must carry exactly the contract's keys.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 2 {
+		t.Errorf("expected exactly 2 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"observed_at", "peers"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+	var entries []map[string]json.RawMessage
+	if err := json.Unmarshal(raw["peers"], &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("peers = %d entries, want 2", len(entries))
+	}
+	for i, entry := range entries {
+		if len(entry) != 3 {
+			t.Errorf("peers[%d]: expected exactly 3 JSON keys, got %d: %v", i, len(entry), entry)
+		}
+		for _, key := range []string{"peer_node_id", "last_handshake_age_seconds", "endpoint"} {
+			if _, ok := entry[key]; !ok {
+				t.Errorf("peers[%d]: expected JSON key %q", i, key)
+			}
+		}
+	}
+}
+
+// A zero-valued entry still carries all three keys: the contract refuses an
+// entry missing its age, and an age of 0 is a handshake within the last second.
+func TestTypesHandshakeReportPeer_ZeroValuesOnWire(t *testing.T) {
+	data, got := roundTrip(t, HandshakeReportPeer{})
+	requireEqual(t, HandshakeReportPeer{}, got)
+
+	const want = `{"peer_node_id":"","last_handshake_age_seconds":0,"endpoint":""}`
+	if string(data) != want {
+		t.Errorf("serialized = %s, want %s", data, want)
+	}
+}
+
+func TestTypesHandshakeReportResponse(t *testing.T) {
+	// The contract's 200 example.
+	const src = `{"accepted_at":"2026-10-21T10:15:30.123Z","recorded":2,"ignored":0}`
+	var got HandshakeReportResponse
+	if err := json.Unmarshal([]byte(src), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	wantAcceptedAt := time.Date(2026, 10, 21, 10, 15, 30, 123_000_000, time.UTC)
+	if !got.AcceptedAt.Equal(wantAcceptedAt) {
+		t.Errorf("AcceptedAt = %v, want %v", got.AcceptedAt, wantAcceptedAt)
+	}
+	if got.Recorded != 2 {
+		t.Errorf("Recorded = %d, want 2", got.Recorded)
+	}
+	if got.Ignored != 0 {
+		t.Errorf("Ignored = %d, want 0", got.Ignored)
+	}
+
+	data, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 3 {
+		t.Errorf("expected exactly 3 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"accepted_at", "recorded", "ignored"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("expected JSON key %q", key)
+		}
+	}
+}
+
 func TestTypesKeyRotateRequest(t *testing.T) {
 	orig := KeyRotateRequest{
 		NewPublicKey: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",

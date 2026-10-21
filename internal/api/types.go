@@ -644,6 +644,70 @@ type EndpointResponse struct {
 }
 
 // ---------------------------------------------------------------------------
+// Handshakes  POST /v1/nodes/{node_id}/handshakes
+// ---------------------------------------------------------------------------
+
+// MaxHandshakeReportPeers is the contract's ceiling on the peers array of one
+// handshake report. A longer array is refused whole with 400
+// malformed_handshake_report, taking every edge in it down, so ReportHandshakes
+// refuses one before sending it.
+const MaxHandshakeReportPeers = 4096
+
+// HandshakeReportRequest is the body of POST /v1/nodes/{node_id}/handshakes:
+// for each mesh peer the node has completed a WireGuard handshake with, the age
+// of the latest handshake and the endpoint WireGuard used for it.
+//
+// The control plane anchors every age on its own receive time, so a body is
+// only true for the attempt it was assembled for. The agent builds a fresh one,
+// with a fresh ObservedAt and fresh ages, for every attempt and never replays
+// one: a replayed age would make the handshake look newer than it was. The
+// handler decodes with DisallowUnknownFields, so the struct carries the
+// contract's fields and nothing else.
+type HandshakeReportRequest struct {
+	// ObservedAt is the agent's wall clock when it assembled the report. It
+	// gates the request only: a value more than 60 seconds from server time is
+	// refused with 400 handshake_clock_skew.
+	ObservedAt time.Time `json:"observed_at"`
+	// Peers carries at most MaxHandshakeReportPeers entries and omits a peer
+	// with no handshake yet. An empty array is a valid report that records
+	// nothing; a null one is refused, so ReportHandshakes sends nil as [].
+	Peers []HandshakeReportPeer `json:"peers"` // never null on the wire
+}
+
+// HandshakeReportPeer is one entry of a HandshakeReportRequest.
+//
+// No field is omitempty: all three are required, and an age of 0 (a handshake
+// within the last second) is as legitimate as any other, so it must reach the
+// wire rather than be dropped as a zero value and refused as missing.
+type HandshakeReportPeer struct {
+	// PeerNodeID is the peer's node_id, a non-zero UUID that no other entry of
+	// the report repeats. An id the control plane does not know as a live peer
+	// of the node's Domain is counted as ignored rather than refused.
+	PeerNodeID string `json:"peer_node_id"`
+	// LastHandshakeAgeSeconds is the whole seconds between the latest completed
+	// handshake and ObservedAt, in 0..2147483647 (the contract's int32).
+	LastHandshakeAgeSeconds int32 `json:"last_handshake_age_seconds"`
+	// Endpoint is the address WireGuard uses for the peer as host:port, with an
+	// IPv6 host in brackets ([2001:db8::7]:51820). A port of 0, an unspecified
+	// address or an IPv6 zone is refused with 400
+	// handshake_endpoint_unparseable, for the whole report.
+	Endpoint string `json:"endpoint"`
+}
+
+// HandshakeReportResponse is the 200 body of
+// POST /v1/nodes/{node_id}/handshakes.
+type HandshakeReportResponse struct {
+	// AcceptedAt is the server receive time every age was anchored on.
+	AcceptedAt time.Time `json:"accepted_at"`
+	// Recorded counts the entries stored as the latest observation of their
+	// directed edge.
+	Recorded int `json:"recorded"`
+	// Ignored counts the entries naming the node itself, an unknown node, a
+	// node of another Domain or a deregistered peer.
+	Ignored int `json:"ignored"`
+}
+
+// ---------------------------------------------------------------------------
 // Key Rotation  POST /v1/keys/rotate
 // ---------------------------------------------------------------------------
 

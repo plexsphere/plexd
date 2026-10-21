@@ -669,6 +669,50 @@ func TestIsEventBusNotProvisioned(t *testing.T) {
 	}
 }
 
+func TestIsHandshakeReportNotServed(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// An older control plane has no route, so its router's 404 carries
+		// whatever code its not-found handler writes, or none.
+		{"404 without a code", &APIError{StatusCode: 404}, true},
+		{"404 with a code", &APIError{StatusCode: 404, Code: "not_found"}, true},
+		{"wrapped 404", fmt.Errorf("report handshakes: %w", &APIError{StatusCode: 404}), true},
+		{"501 with the provisioning code", &APIError{StatusCode: 501, Code: "handshakes_not_provisioned"}, true},
+		{"wrapped 501 with the provisioning code", fmt.Errorf("report handshakes: %w", &APIError{StatusCode: 501, Code: "handshakes_not_provisioned"}), true},
+		{"501 with another surface's code", &APIError{StatusCode: 501, Code: "observability_ingest_not_provisioned"}, false},
+		{"501 without a code", &APIError{StatusCode: 501}, false},
+		{"500 is a failed write, not a missing surface", &APIError{StatusCode: 500, Code: "internal"}, false},
+		{"503 with the provisioning code is transient", &APIError{StatusCode: 503, Code: "handshakes_not_provisioned"}, false},
+		{"400 clock skew is a verdict on the report", &APIError{StatusCode: 400, Code: "handshake_clock_skew"}, false},
+		{"400 malformed report", &APIError{StatusCode: 400, Code: "malformed_handshake_report"}, false},
+		{"403 node mismatch", &APIError{StatusCode: 403, Code: "node_id_mismatch"}, false},
+		{"non-API error", errors.New("dial tcp: timeout"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsHandshakeReportNotServed(tt.err); got != tt.want {
+				t.Errorf("IsHandshakeReportNotServed(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestErrHandshakeReportTooMany(t *testing.T) {
+	const want = "handshake report exceeds 4096 peers"
+	if got := ErrHandshakeReportTooMany.Error(); got != want {
+		t.Errorf("ErrHandshakeReportTooMany.Error() = %q, want %q", got, want)
+	}
+
+	wrapped := fmt.Errorf("api: report handshakes: %d peers: %w", 4097, ErrHandshakeReportTooMany)
+	if !errors.Is(wrapped, ErrHandshakeReportTooMany) {
+		t.Errorf("errors.Is(wrapped, ErrHandshakeReportTooMany) = false, want true")
+	}
+}
+
 func TestIsSessionRevokedOrExpired(t *testing.T) {
 	tests := []struct {
 		name string
