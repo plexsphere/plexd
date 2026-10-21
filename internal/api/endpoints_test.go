@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -484,6 +485,288 @@ func TestReportEndpoint_Success(t *testing.T) {
 	}
 	if !resp.StaleAfter.Equal(staleAfter) {
 		t.Errorf("StaleAfter = %v, want %v", resp.StaleAfter, staleAfter)
+	}
+}
+
+// testHandshakeObservedAt is the observed_at of the contract's request example.
+var testHandshakeObservedAt = time.Date(2026, 10, 21, 10, 15, 30, 0, time.UTC)
+
+// testHandshakePeers builds n handshake entries with distinct, well-formed
+// peer IDs, the shape a report the control plane accepts carries.
+func testHandshakePeers(n int) []HandshakeReportPeer {
+	peers := make([]HandshakeReportPeer, n)
+	for i := range peers {
+		peers[i] = HandshakeReportPeer{
+			PeerNodeID:              fmt.Sprintf("0190a8b8-a0c0-7a0a-8a0a-%012x", i+1),
+			LastHandshakeAgeSeconds: int32(i),
+			Endpoint:                "198.51.100.7:51820",
+		}
+	}
+	return peers
+}
+
+// strictDecodeHandshakeReport decodes body the way the control plane's handler
+// does, refusing an unknown field, and fails the test when it does not decode.
+func strictDecodeHandshakeReport(t *testing.T, body []byte) HandshakeReportRequest {
+	t.Helper()
+	var req HandshakeReportRequest
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		t.Fatalf("strict decode of the handshake report: %v (body: %s)", err, body)
+	}
+	return req
+}
+
+func TestReportHandshakes_Success(t *testing.T) {
+	acceptedAt := testHandshakeObservedAt.Add(123 * time.Millisecond)
+
+	var gotMethod, gotPath, gotContentType, gotContentEncoding, gotAuth string
+	var gotBody []byte
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotContentType = r.Header.Get("Content-Type")
+		gotContentEncoding = r.Header.Get("Content-Encoding")
+		gotAuth = r.Header.Get("Authorization")
+		var err error
+		if gotBody, err = io.ReadAll(r.Body); err != nil {
+			t.Errorf("read request: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(HandshakeReportResponse{
+			AcceptedAt: acceptedAt,
+			Recorded:   1,
+			Ignored:    1,
+		})
+	})
+
+	peers := []HandshakeReportPeer{
+		{PeerNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2", LastHandshakeAgeSeconds: 42, Endpoint: "198.51.100.7:51820"},
+		{PeerNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3", LastHandshakeAgeSeconds: 117, Endpoint: "[2001:db8::7]:51820"},
+	}
+	resp, err := client.ReportHandshakes(context.Background(), "n1", HandshakeReportRequest{
+		ObservedAt: testHandshakeObservedAt,
+		Peers:      peers,
+	})
+	if err != nil {
+		t.Fatalf("ReportHandshakes: %v", err)
+	}
+
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	if gotPath != "/v1/nodes/n1/handshakes" {
+		t.Errorf("path = %s, want /v1/nodes/n1/handshakes", gotPath)
+	}
+	if gotContentType != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", gotContentType, "application/json")
+	}
+	// The operation documents no request encoding, so its handler would read a
+	// gzip header as JSON and refuse the report.
+	if gotContentEncoding != "" {
+		t.Errorf("Content-Encoding = %q, want none", gotContentEncoding)
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer test-token")
+	}
+
+	got := strictDecodeHandshakeReport(t, gotBody)
+	if !got.ObservedAt.Equal(testHandshakeObservedAt) {
+		t.Errorf("observed_at = %v, want %v", got.ObservedAt, testHandshakeObservedAt)
+	}
+	if !slices.Equal(got.Peers, peers) {
+		t.Errorf("peers = %+v, want %+v", got.Peers, peers)
+	}
+
+	if !resp.AcceptedAt.Equal(acceptedAt) {
+		t.Errorf("AcceptedAt = %v, want %v", resp.AcceptedAt, acceptedAt)
+	}
+	if resp.Recorded != 1 {
+		t.Errorf("Recorded = %d, want 1", resp.Recorded)
+	}
+	if resp.Ignored != 1 {
+		t.Errorf("Ignored = %d, want 1", resp.Ignored)
+	}
+}
+
+// A report with no handshake yet is valid and records nothing, but the contract
+// answers a null peers with 400 malformed_handshake_report. A nil slice, which
+// is what an unfilled report naturally holds, must therefore reach the wire as
+// an empty array.
+func TestReportHandshakes_PeersNeverNull(t *testing.T) {
+	tests := []struct {
+		name  string
+		peers []HandshakeReportPeer
+	}{
+		{"nil", nil},
+		{"empty", []HandshakeReportPeer{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body []byte
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				var err error
+				if body, err = io.ReadAll(r.Body); err != nil {
+					t.Errorf("read request: %v", err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"accepted_at":"2026-10-21T10:15:30Z","recorded":0,"ignored":0}`)
+			})
+
+			if _, err := client.ReportHandshakes(context.Background(), "n1", HandshakeReportRequest{
+				ObservedAt: testHandshakeObservedAt,
+				Peers:      tt.peers,
+			}); err != nil {
+				t.Fatalf("ReportHandshakes: %v", err)
+			}
+
+			const want = `{"observed_at":"2026-10-21T10:15:30Z","peers":[]}`
+			if got := strings.TrimSpace(string(body)); got != want {
+				t.Errorf("request body =\n  %s\nwant\n  %s", got, want)
+			}
+		})
+	}
+}
+
+func TestReportHandshakes_PeerCeiling(t *testing.T) {
+	t.Run("over the ceiling is refused unsent", func(t *testing.T) {
+		client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Errorf("an oversized handshake report reached the control plane: %s", r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		})
+
+		resp, err := client.ReportHandshakes(context.Background(), "n1", HandshakeReportRequest{
+			ObservedAt: testHandshakeObservedAt,
+			Peers:      testHandshakePeers(MaxHandshakeReportPeers + 1),
+		})
+		if !errors.Is(err, ErrHandshakeReportTooMany) {
+			t.Fatalf("error = %v, want %v", err, ErrHandshakeReportTooMany)
+		}
+		const wantMsg = "api: report handshakes: 4097 peers: handshake report exceeds 4096 peers"
+		if err.Error() != wantMsg {
+			t.Errorf("error = %q, want %q", err.Error(), wantMsg)
+		}
+		if resp != nil {
+			t.Errorf("response = %+v, want nil", resp)
+		}
+	})
+
+	t.Run("at the ceiling is sent", func(t *testing.T) {
+		var gotContentEncoding string
+		var gotBody []byte
+		client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			gotContentEncoding = r.Header.Get("Content-Encoding")
+			var err error
+			if gotBody, err = io.ReadAll(r.Body); err != nil {
+				t.Errorf("read request: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"accepted_at":"2026-10-21T10:15:30Z","recorded":0,"ignored":4096}`)
+		})
+
+		peers := testHandshakePeers(MaxHandshakeReportPeers)
+		if _, err := client.ReportHandshakes(context.Background(), "n1", HandshakeReportRequest{
+			ObservedAt: testHandshakeObservedAt,
+			Peers:      peers,
+		}); err != nil {
+			t.Fatalf("ReportHandshakes: %v", err)
+		}
+
+		// A full report is far above the gzip threshold, which is where a body
+		// routed through the ingest path would start to be compressed.
+		if gotContentEncoding != "" {
+			t.Errorf("Content-Encoding = %q, want none", gotContentEncoding)
+		}
+		got := strictDecodeHandshakeReport(t, gotBody)
+		if len(got.Peers) != MaxHandshakeReportPeers {
+			t.Fatalf("request carried %d peers, want %d", len(got.Peers), MaxHandshakeReportPeers)
+		}
+		if !slices.Equal(got.Peers, peers) {
+			t.Error("request peers differ from the ones passed")
+		}
+	})
+}
+
+func TestReportHandshakes_ClockSkewProblem(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"type":"https://plexsphere.com/errors/handshake-clock-skew","title":"Bad Request","status":400,"detail":"observed_at drifts more than 60 seconds from server time.","code":"handshake_clock_skew"}`)
+	})
+
+	resp, err := client.ReportHandshakes(context.Background(), "n1", HandshakeReportRequest{
+		ObservedAt: testHandshakeObservedAt,
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if resp != nil {
+		t.Errorf("response = %+v, want nil", resp)
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("errors.As failed to extract *APIError: %v", err)
+	}
+	if apiErr.StatusCode != http.StatusBadRequest {
+		t.Errorf("StatusCode = %d, want 400", apiErr.StatusCode)
+	}
+	if apiErr.Code != "handshake_clock_skew" {
+		t.Errorf("Code = %q, want %q", apiErr.Code, "handshake_clock_skew")
+	}
+}
+
+// Both forms of "this control plane does not take handshake reports" must
+// survive the client's error mapping in the shape the classifier reads: the
+// plain-text 404 an older router writes, and the provisioning problem document.
+func TestReportHandshakes_NotServed(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+	}{
+		{"404 from a control plane without the route", http.StatusNotFound,
+			"text/plain; charset=utf-8", "404 page not found\n"},
+		{"501 handshakes_not_provisioned", http.StatusNotImplemented,
+			"application/problem+json", `{"title":"Not Implemented","status":501,"detail":"not provisioned in this build.","code":"handshakes_not_provisioned"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tt.contentType)
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			})
+
+			_, err := client.ReportHandshakes(context.Background(), "n1", HandshakeReportRequest{
+				ObservedAt: testHandshakeObservedAt,
+			})
+			if !IsHandshakeReportNotServed(err) {
+				t.Errorf("IsHandshakeReportNotServed(%v) = false, want true", err)
+			}
+		})
+	}
+}
+
+// A gateway that answers 200 with no body has not handed back a receipt, and
+// the caller must not read the zero value as "recorded nothing".
+func TestReportHandshakes_EmptyBody(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	resp, err := client.ReportHandshakes(context.Background(), "n1", HandshakeReportRequest{
+		ObservedAt: testHandshakeObservedAt,
+	})
+	if err == nil || !strings.HasPrefix(err.Error(), "api: decode response:") {
+		t.Fatalf("error = %v, want one starting %q", err, "api: decode response:")
+	}
+	if resp != nil {
+		t.Errorf("response = %+v, want nil", resp)
 	}
 }
 
@@ -1248,6 +1531,34 @@ func TestFetchSecret_PathParametersEscaped(t *testing.T) {
 	}
 	if !strings.Contains(gotPath, "%2F") && !strings.Contains(gotPath, "%2f") {
 		t.Errorf("path does not contain escaped node ID slash: %s", gotPath)
+	}
+}
+
+func TestReportHandshakes_PathParametersEscaped(t *testing.T) {
+	// Verify the nodeID is escaped, so it cannot climb out of its segment.
+	var gotPath string
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RawPath
+		if gotPath == "" {
+			gotPath = r.URL.Path
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"accepted_at":"2026-10-21T10:15:30Z","recorded":0,"ignored":0}`))
+	})
+
+	_, err := client.ReportHandshakes(context.Background(), "../../../etc/passwd", HandshakeReportRequest{
+		ObservedAt: testHandshakeObservedAt,
+	})
+	if err != nil {
+		t.Fatalf("ReportHandshakes: %v", err)
+	}
+
+	// url.PathEscape encodes "/" as %2F, keeping the traversal inside the one
+	// segment the node ID owns.
+	const want = "/v1/nodes/..%2F..%2F..%2Fetc%2Fpasswd/handshakes"
+	if gotPath != want {
+		t.Errorf("path = %s, want %s", gotPath, want)
 	}
 }
 

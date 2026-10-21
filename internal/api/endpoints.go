@@ -95,6 +95,35 @@ func (c *ControlPlane) ReportEndpoint(ctx context.Context, nodeID string, req En
 	return &resp, nil
 }
 
+// ReportHandshakes reports the age of the latest WireGuard handshake with each
+// mesh peer and the endpoint WireGuard used for it, and returns the control
+// plane's receipt.
+//
+// A nil Peers is sent as an empty array: the contract answers a null peers with
+// 400 malformed_handshake_report, while an empty array is a valid report that
+// records nothing. The substitution is made on a copy, so the caller's request
+// is left as passed.
+//
+// The peer ceiling is checked here rather than left to the server, as
+// ReportIntegrityViolations does for its bounds: an oversized report is refused
+// whole, so sending it would cost every edge it carries.
+// POST /v1/nodes/{node_id}/handshakes
+func (c *ControlPlane) ReportHandshakes(ctx context.Context, nodeID string, req HandshakeReportRequest) (*HandshakeReportResponse, error) {
+	if len(req.Peers) > MaxHandshakeReportPeers {
+		return nil, fmt.Errorf("api: report handshakes: %d peers: %w", len(req.Peers), ErrHandshakeReportTooMany)
+	}
+	body := req
+	if body.Peers == nil {
+		body.Peers = []HandshakeReportPeer{}
+	}
+	var resp HandshakeReportResponse
+	path := fmt.Sprintf("/v1/nodes/%s/handshakes", url.PathEscape(nodeID))
+	if err := c.doRequest(ctx, http.MethodPost, path, body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // FetchState retrieves the desired-state snapshot for a node.
 // GET /v1/nodes/{node_id}/state
 func (c *ControlPlane) FetchState(ctx context.Context, nodeID string) (*NodeStateSnapshot, error) {
