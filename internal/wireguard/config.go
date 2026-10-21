@@ -15,6 +15,21 @@ type Config struct {
 
 	// MTU is the interface MTU. 0 means system default.
 	MTU int `yaml:"mtu"`
+
+	// EdgePSK controls whether plexd fetches each edge's PSK from the control
+	// plane and programs it on the peer. A pointer, so an unset key stays
+	// distinguishable from an explicit false: WireGuard needs the same PSK on
+	// both ends of a tunnel, so during a rolling upgrade an operator sets
+	// `edge_psk: false` on upgraded nodes until every node of the Domain runs a
+	// plexd that installs edge PSKs, and that false must survive ApplyDefaults.
+	// Default: true (nil reads as enabled).
+	EdgePSK *bool `yaml:"edge_psk"`
+}
+
+// EdgePSKEnabled returns the effective EdgePSK setting: true unless explicitly
+// set to false.
+func (c *Config) EdgePSKEnabled() bool {
+	return c.EdgePSK == nil || *c.EdgePSK
 }
 
 // DefaultInterfaceName is the default WireGuard interface name.

@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -22,6 +23,15 @@ type Manager struct {
 	logger *slog.Logger
 	peers  *PeerIndex
 
+	// mu serializes the device writes that record a peer in programmed with
+	// SetPeerPSK, which rewrites a recorded peer: the reconcile handler and the
+	// edge-PSK store write the same peers from different call paths.
+	mu sync.Mutex
+	// programmed is the last peer written per node ID, which SetPeerPSK needs:
+	// every device write replaces the peer's allowed IPs, so a PSK alone cannot
+	// be written without them.
+	programmed map[string]api.Peer
+
 	// meshPrefix is the prefix the interface address carries, masked: the
 	// Domain mesh CIDR, or the mesh IP's host /32 when the identity has no
 	// usable CIDR. It is zero until Setup succeeds.
@@ -32,10 +42,11 @@ type Manager struct {
 func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager {
 	cfg.ApplyDefaults()
 	return &Manager{
-		ctrl:   ctrl,
-		cfg:    cfg,
-		logger: logger,
-		peers:  NewPeerIndex(),
+		ctrl:       ctrl,
+		cfg:        cfg,
+		logger:     logger,
+		peers:      NewPeerIndex(),
+		programmed: make(map[string]api.Peer),
 	}
 }
 
@@ -222,10 +233,13 @@ func (m *Manager) AddPeer(peer api.Peer) error {
 		return fmt.Errorf("wireguard: add peer: %w", err)
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err := m.ctrl.AddPeer(m.cfg.InterfaceName, peerCfg); err != nil {
 		return fmt.Errorf("wireguard: add peer: %w", err)
 	}
 
+	m.programmed[peer.ID] = peer
 	m.peers.Add(peer.ID, peer.PublicKey)
 
 	m.logger.Debug("peer added",
@@ -256,10 +270,13 @@ func (m *Manager) RemovePeerByID(peerID string) error {
 		return fmt.Errorf("wireguard: decode public key: %w", err)
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err := m.ctrl.RemovePeer(m.cfg.InterfaceName, pubKeyBytes); err != nil {
 		return fmt.Errorf("wireguard: remove peer: %w", err)
 	}
 
+	delete(m.programmed, peerID)
 	m.peers.Remove(peerID)
 
 	m.logger.Debug("peer removed",
@@ -277,10 +294,13 @@ func (m *Manager) UpdatePeer(peer api.Peer) error {
 		return fmt.Errorf("wireguard: update peer: %w", err)
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err := m.ctrl.AddPeer(m.cfg.InterfaceName, peerCfg); err != nil {
 		return fmt.Errorf("wireguard: update peer: %w", err)
 	}
 
+	m.programmed[peer.ID] = peer
 	m.peers.Update(peer.ID, peer.PublicKey)
 
 	m.logger.Debug("peer updated",
@@ -293,7 +313,10 @@ func (m *Manager) UpdatePeer(peer api.Peer) error {
 
 // ConfigurePeers bulk-configures all peers. Individual errors are logged but not returned.
 func (m *Manager) ConfigurePeers(ctx context.Context, peers []api.Peer) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.peers.LoadFromPeers(peers)
+	m.programmed = make(map[string]api.Peer, len(peers))
 
 	for _, peer := range peers {
 		if err := ctx.Err(); err != nil {
@@ -318,6 +341,7 @@ func (m *Manager) ConfigurePeers(ctx context.Context, peers []api.Peer) error {
 			)
 			continue
 		}
+		m.programmed[peer.ID] = peer
 	}
 
 	m.logger.Info("peers configured",
@@ -325,6 +349,40 @@ func (m *Manager) ConfigurePeers(ctx context.Context, peers []api.Peer) error {
 		"count", len(peers),
 	)
 
+	return nil
+}
+
+// SetPeerPSK programs psk on the device peer of peerNodeID, when that peer was
+// last written with publicKey. A peer not written yet, or written with another
+// key, gets nothing: the PSK belongs to a different device peer, and the next
+// AddPeer or UpdatePeer for the key takes it from the edge-PSK store.
+//
+// The write carries the recorded peer's allowed IPs, which every device write
+// replaces, and an empty endpoint, which leaves the device's endpoint as it is.
+func (m *Manager) SetPeerPSK(peerNodeID, publicKey string, psk []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	peer, ok := m.programmed[peerNodeID]
+	if !ok || peer.PublicKey != publicKey {
+		return nil
+	}
+
+	peer.PSK = base64.StdEncoding.EncodeToString(psk)
+	write := peer
+	write.Endpoint = ""
+	peerCfg, err := PeerConfigFromAPI(write)
+	if err != nil {
+		return fmt.Errorf("wireguard: set peer psk: %w", err)
+	}
+	if err := m.ctrl.AddPeer(m.cfg.InterfaceName, peerCfg); err != nil {
+		return fmt.Errorf("wireguard: set peer psk: %w", err)
+	}
+	m.programmed[peerNodeID] = peer
+
+	m.logger.Debug("peer psk set",
+		"component", "wireguard",
+		"peer_id", peerNodeID,
+	)
 	return nil
 }
 
