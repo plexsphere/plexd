@@ -54,6 +54,28 @@ type WGController interface {
 }
 ```
 
+### PeerStatsReader
+
+Reading a peer's runtime state is a separate, optional interface. Callers type-assert it on the controller, as they do `OSInterfaceNamer`. Adding the method to `WGController` would force it onto every test double of that interface, none of which needs it.
+
+```go
+// PeerStat is one peer's runtime state as the device reports it.
+type PeerStat struct {
+    PublicKey     [32]byte
+    Endpoint      netip.AddrPort // invalid when the device knows no endpoint
+    LastHandshake time.Time      // zero when no handshake has completed
+    RxBytes       uint64
+    TxBytes       uint64
+}
+
+// PeerStatsReader is implemented by controllers that can read peer runtime state.
+type PeerStatsReader interface {
+    PeerStats(name string) ([]PeerStat, error)
+}
+```
+
+`NetlinkController`, `UserspaceBackend`, `DarwinController` and `WindowsController` implement it. `NetlinkController.PeerStats` opens a wgctrl client per call, as `AddPeer` does, reads the device with `client.Device(name)` and maps each `wgtypes.Peer`: the key bytes, `Endpoint.AddrPort()` when the peer has an endpoint, `LastHandshakeTime` (wgctrl already yields a zero time when no handshake has completed), and the receive and transmit byte counters. Its errors are `wireguard: peer stats: open wgctrl: <cause>` and `wireguard: peer stats: read device: <cause>`; a missing interface wraps `os.ErrNotExist`. `DarwinController` and `WindowsController` delegate to the [userspace backend](#userspace-backend).
+
 ## Userspace backend
 
 `UserspaceBackend` (`internal/wireguard/userspace.go`) runs wireguard-go devices inside the plexd process. It is the base of the macOS (utun) and Windows (Wintun) `WGController` implementations and, through those two controllers, of the bridge access and site-to-site controllers (`WGAccessController` and `WGVPNController` in `internal/bridge`), which wrap the platform's `WGController`. On Linux plexd stays on the kernel path through `NetlinkController`; the backend compiles and is tested there but is not wired in.
@@ -68,11 +90,23 @@ func (b *UserspaceBackend) DeleteDevice(name string) error
 func (b *UserspaceBackend) SetPrivateKey(name string, privateKey []byte) error
 func (b *UserspaceBackend) AddPeer(name string, cfg PeerConfig) error
 func (b *UserspaceBackend) RemovePeer(name string, publicKey []byte) error
+func (b *UserspaceBackend) PeerStats(name string) ([]PeerStat, error)
 ```
 
 - **`CreateDevice`** takes ownership of `tdev`: it closes the tun on any error, and the caller never closes a tun it handed in. It sets the key and port, brings the device up, and serves the UAPI endpoint. Because the device is brought up here, a listen port already in use surfaces as an error from this call. A `listenPort` of `0` binds an ephemeral port.
 - **`DeleteDevice`** closes the UAPI listener and the device, which closes the tun. It is idempotent: deleting an unknown device returns `nil`.
 - **`SetPrivateKey`**, **`AddPeer`** and **`RemovePeer`** return an error wrapping `os.ErrNotExist` for an unknown device. `AddPeer` upserts by public key and validates its input in the same order and with the same error text as `NetlinkController`; `RemovePeer` is silent for a public key with no matching peer.
+- **`PeerStats`** implements [`PeerStatsReader`](#peerstatsreader). For an unknown device it returns `wireguard: peer stats: <cause>` wrapping `os.ErrNotExist`. It reads the device's UAPI dump with `device.Device.IpcGet` (a failure returns `wireguard: peer stats: read device: <cause>`) and parses it with `parseUAPIPeerStats`.
+
+`parseUAPIPeerStats` splits the dump into `key=value` lines. `public_key` (64 hex characters) starts a new peer; `endpoint` parses with `netip.ParseAddrPort`; `rx_bytes` and `tx_bytes` parse as `uint64`; `last_handshake_time_sec` and `last_handshake_time_nsec` give `time.Unix(sec, nsec)`. Both at 0 give the zero time. The parser does not copy wgctrl's `sec > 0 && nsec > 0` check, which drops a handshake that lands on a whole second. Empty lines and every other key (`private_key`, `listen_port`, `fwmark`, `preshared_key`, `protocol_version`, `persistent_keepalive_interval`, `allowed_ip`, `errno`) are skipped. A dump with device keys only yields an empty slice.
+
+| Input | Error |
+|---|---|
+| A line without `=` | `wireguard: peer stats: line <n> has no '='` |
+| A peer key before any `public_key` | `wireguard: peer stats: <key> before public_key` |
+| An unparseable value of one of the six peer keys | `wireguard: peer stats: parse <key>: <cause>` |
+
+No error text quotes a line or the value of a skipped key, because the dump carries `private_key` and `preshared_key`.
 
 ### UAPI endpoint
 
@@ -205,6 +239,7 @@ func NewPeerIndex() *PeerIndex
 | `Lookup(peerID string) (string, bool)` | Returns public key and whether found          |
 | `Update(peerID, newPublicKey string)` | Updates mapping (semantically distinct from Add) |
 | `LoadFromPeers(peers []api.Peer)`   | Bulk-populates; clears existing entries first    |
+| `NodeIDsByPublicKey() map[[32]byte]string` | Reverse map from decoded public key to node ID. Skips a key that does not decode with `base64.StdEncoding` to 32 bytes, and leaves out a key two node IDs share, because no single node owns it |
 
 ## Manager
 
@@ -232,6 +267,28 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 | `UpdatePeer`    | `(peer api.Peer) error`                                                      | Upserts peer config (AddPeer is idempotent); updates index     |
 | `ConfigurePeers`| `(ctx context.Context, peers []api.Peer) error`                              | Bulk-adds peers with context cancellation; individual errors logged |
 | `PeerIndex`     | `() *PeerIndex`                                                              | Returns the peer index                                         |
+| `MeshPeerStats` | `() ([]MeshPeerStat, error)`                                                 | Reads the mesh interface's peers and maps them to node IDs; see [Mesh peer stats](#mesh-peer-stats) |
+
+### Mesh peer stats
+
+`MeshPeerStats` is the read path behind the [handshake report](../core/heartbeat-service.md#handshake-reporter) and the [tunnel metrics](../observability/metrics-collection.md#tunnelcollector). It reads the interface through the controller's [`PeerStatsReader`](#peerstatsreader) and names each device peer by the node ID the peer index holds for its key.
+
+```go
+type MeshPeerStat struct {
+    NodeID        string
+    Endpoint      netip.AddrPort
+    LastHandshake time.Time
+    RxBytes, TxBytes uint64
+}
+
+var ErrPeerStatsUnsupported = errors.New("wireguard: controller cannot read peer stats")
+```
+
+- It returns `ErrPeerStatsUnsupported` when the manager has no controller or the controller is not a `PeerStatsReader`, and wraps a read error as `wireguard: mesh peer stats: <cause>`.
+- It keeps only the device peers whose key `PeerIndex.NodeIDsByPublicKey` maps. A key the index does not know, such as one left on the device after a peer's key rotation, is dropped.
+- It keeps peers with no handshake (a zero `LastHandshake`), because the metrics report them.
+- It returns the result sorted by `NodeID`, and an empty, non-nil slice when nothing maps.
+- `Endpoint` passes through unfiltered. The handshake reporter applies the wire rules.
 
 ### Lifecycle
 

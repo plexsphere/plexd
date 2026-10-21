@@ -25,6 +25,7 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 13 | `POST` | `/v1/nodes/{node_id}/metrics` | Metrics batch |
 | 14 | `POST` | `/v1/nodes/{node_id}/logs` | Log batch |
 | 15 | `POST` | `/v1/nodes/{node_id}/audit` | Audit batch |
+| 16 | `POST` | `/v1/nodes/{node_id}/handshakes` | Per-peer WireGuard handshake report |
 
 ## Registration & Identity
 
@@ -344,6 +345,104 @@ Called after STUN discovery, then on a deadline derived from the response (see b
 | `404 Not Found` | `endpoint_peer_not_found` | Node is not a known peer; heals via re-registration |
 | `410 Gone` | `endpoint_peer_gone` | Node was removed; heals via re-registration |
 | `413 Payload Too Large` | `endpoint_body_too_large` | Body exceeds 4 KiB |
+
+## Mesh Edge Health
+
+### POST /v1/nodes/{node_id}/handshakes
+
+Reports, for every mesh peer the node has completed a WireGuard handshake with,
+the age of the latest handshake and the endpoint WireGuard used for it. The
+control plane keeps the latest observation per directed edge and derives each
+mesh edge's `status`, `mode`, `handshake_age_seconds` and `endpoint` from it. The
+report carries no transfer counters: per-peer `rx_bytes` and `tx_bytes` travel as
+`tunnel_health` samples on the [metrics batch](#observability).
+
+**Request body** (`HandshakeReportRequest`):
+
+```json
+{
+  "observed_at": "2026-10-21T10:15:30Z",
+  "peers": [
+    {
+      "peer_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2",
+      "last_handshake_age_seconds": 42,
+      "endpoint": "198.51.100.7:51820"
+    },
+    {
+      "peer_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3",
+      "last_handshake_age_seconds": 117,
+      "endpoint": "[2001:db8::7]:51820"
+    }
+  ]
+}
+```
+
+- `observed_at`: RFC 3339 UTC, the node's wall clock when it assembled the
+  report. The server refuses a value more than 60s from its own time. The field
+  only gates the request: the server anchors every age on its own receive time,
+  so the node's clock never enters the edge status.
+- `peers`: always an array, never `null`, with at most 4096 entries. It lists
+  every peer the node has completed a handshake with and omits a peer with no
+  handshake yet. An empty array is a valid report that records nothing.
+- `peer_node_id`: the peer's node ID, a UUID that is not all zeros. No two
+  entries may name the same peer. An ID that names the reporting node itself, an
+  unknown node, a node of another Domain or a deregistered peer is counted as
+  `ignored`, not refused.
+- `last_handshake_age_seconds`: whole seconds since the latest completed
+  handshake, measured when the report was assembled, between 0 and 2147483647.
+- `endpoint`: the endpoint WireGuard currently uses for the peer, as `host:port`
+  with an IPv6 host in brackets. The port is in 1..65535, the address is not
+  unspecified, and the host carries no IPv6 zone.
+
+Every `400` refuses the whole report, so one bad entry would cost every edge in
+it. plexd therefore applies these rules before it sends: it leaves out an entry
+whose node ID is not a non-zero UUID or whose endpoint cannot be sent, unmaps an
+IPv4-mapped IPv6 address, strips an IPv6 zone, and keeps one entry per peer. See
+[Handshake Reporter](heartbeat-service.md#handshake-reporter) for the full build
+rules.
+
+**Response** (`200 OK`, `HandshakeReportResponse`):
+
+```json
+{
+  "accepted_at": "2026-10-21T10:15:30.123Z",
+  "recorded": 2,
+  "ignored": 0
+}
+```
+
+`accepted_at` is the server receive time every age was anchored on. `recorded`
+counts the entries stored as the latest observation of their edge, `ignored` the
+entries naming any other ID.
+
+**Cadence.** plexd reports once per `heartbeat.interval` (default 30s), from a
+loop of its own rather than inside the heartbeat, and only when its WireGuard
+interface came up. It sends nothing when the loop starts, since no handshake can
+exist yet, and then reports on every tick, an empty `peers` array included.
+
+**No replay.** Every attempt carries a freshly assembled body with a new
+`observed_at` and new ages. A failed report is never re-sent: the server anchors
+each age on its receive time, so a replayed age would make the handshake look
+newer than it was. The next tick sends a fresh report instead. `ReportHandshakes`
+has no internal retry, and Go's HTTP transport does not replay a `POST`.
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning | plexd behavior |
+|---|---|---|---|
+| `200 OK` | — | Report accepted; body is a `HandshakeReportResponse` | Logged at Debug; after a not-served phase, one Info line that the control plane accepts reports |
+| `400 Bad Request` | `malformed_handshake_report` | Body is not valid JSON or carries an unknown field; `observed_at` or `peers` is missing; `peers` is `null` or holds more than 4096 entries; an entry misses `peer_node_id` or `last_handshake_age_seconds`, carries a zero `peer_node_id`, an age outside 0..2147483647, or a `peer_node_id` another entry already named | Logged at Warn; the next tick sends a fresh report |
+| `400 Bad Request` | `handshake_clock_skew` | `observed_at` more than 60s from server time | Logged at Error, asking the operator to synchronize the system clock via NTP; the next tick sends a fresh report |
+| `400 Bad Request` | `handshake_endpoint_unparseable` | An `endpoint` is not a `host:port` pair, its port is 0, its address is unspecified, or it carries an IPv6 zone; the `detail` names the entry index | Logged at Warn; the next tick sends a fresh report |
+| `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked | Logged at Warn; the next tick sends a fresh report |
+| `403 Forbidden` | `node_id_mismatch` | The NSK belongs to a different node than the path | Logged at Warn; the next tick sends a fresh report |
+| `404 Not Found` | any, or none | An older control plane that does not serve the operation | Logged once at Info as not served; plexd keeps reporting every interval |
+| `413 Payload Too Large` | `handshake_report_too_large` | Body exceeds 1 MiB | Logged at Warn; the next tick sends a fresh report |
+| `500 Internal Server Error` | `internal` | Server error, for example a failed write of the observations | Logged at Warn; the next tick sends a fresh report |
+| `501 Not Implemented` | `handshakes_not_provisioned` | The control plane has not wired its handshake recording service | Logged once at Info as not served; plexd keeps reporting every interval |
+
+`api.IsHandshakeReportNotServed` classifies the two not-served answers. A `501`
+with any other code is an ordinary failure and logged at Warn.
 
 ## Reconciliation & State
 
