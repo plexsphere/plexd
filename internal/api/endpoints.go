@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -198,6 +199,48 @@ func (c *ControlPlane) FetchSecret(ctx context.Context, nodeID, name string, ver
 		Version: v,
 		KID:     resp.Header.Get("X-Plexsphere-Secret-KID"),
 	}, nil
+}
+
+// FetchEdgePSK retrieves the pairwise WireGuard PSK for the edge between the
+// node and peerNodeID as the raw envelope the control plane seals under the
+// node's NSK. The body must be exactly EdgePSKEnvelopeSize bytes, and both the
+// X-Plexsphere-PSK-KID and X-Plexsphere-PSK-Epoch headers must be present: the
+// epoch is part of the additional authenticated data the envelope is opened
+// with. A non-2xx answer returns the *APIError the problem body describes.
+//
+// The body is key material, so no error this returns quotes it.
+// GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk
+func (c *ControlPlane) FetchEdgePSK(ctx context.Context, nodeID, peerNodeID string) (*EdgePSKEnvelope, error) {
+	path := fmt.Sprintf("/v1/nodes/%s/peers/%s/psk", url.PathEscape(nodeID), url.PathEscape(peerNodeID))
+
+	resp, err := c.doRequestRaw(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	reader, err := decodedBody(resp, EdgePSKEnvelopeSize+1)
+	if err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, EdgePSKEnvelopeSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("api: read edge psk envelope: %w", err)
+	}
+	if len(data) != EdgePSKEnvelopeSize {
+		return nil, fmt.Errorf("api: fetch edge psk: envelope is %d bytes, want %d", len(data), EdgePSKEnvelopeSize)
+	}
+
+	kid := resp.Header.Get("X-Plexsphere-PSK-KID")
+	if kid == "" {
+		return nil, errors.New("api: fetch edge psk: response missing X-Plexsphere-PSK-KID")
+	}
+	epoch := resp.Header.Get("X-Plexsphere-PSK-Epoch")
+	if epoch == "" {
+		return nil, errors.New("api: fetch edge psk: response missing X-Plexsphere-PSK-Epoch")
+	}
+
+	return &EdgePSKEnvelope{Data: data, KID: kid, Epoch: epoch}, nil
 }
 
 // ExecutionCallback posts a single execution lifecycle callback and returns the

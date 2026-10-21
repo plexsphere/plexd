@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1905,5 +1906,166 @@ func TestReportSessionActivity_Success(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("ReportSessionActivity: %v", err)
+	}
+}
+
+// testEdgePSKEnvelope is a 60-byte body of the edge-PSK envelope's shape. The
+// client treats it as opaque bytes; opening it is the wireguard package's job.
+var testEdgePSKEnvelope = bytes.Repeat([]byte{0xa5}, EdgePSKEnvelopeSize)
+
+const testEdgePSKEpoch = "2026-01-01T00:00:00.000000000Z|2026-01-01T00:00:01.000000000Z"
+
+// serveEdgePSK answers like the control plane's 200: the octet-stream body and
+// the three headers the contract requires.
+func serveEdgePSK(w http.ResponseWriter, body []byte) {
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Plexsphere-PSK-KID", "nsk-kid-1")
+	w.Header().Set("X-Plexsphere-PSK-Epoch", testEdgePSKEpoch)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+func TestFetchEdgePSK_Success(t *testing.T) {
+	var gotAuth string
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/v1/nodes/n1/peers/p1/psk" {
+			t.Errorf("path = %s, want /v1/nodes/n1/peers/p1/psk", r.URL.Path)
+		}
+		serveEdgePSK(w, testEdgePSKEnvelope)
+	})
+
+	env, err := client.FetchEdgePSK(context.Background(), "n1", "p1")
+	if err != nil {
+		t.Fatalf("FetchEdgePSK: %v", err)
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer test-token")
+	}
+	if !bytes.Equal(env.Data, testEdgePSKEnvelope) {
+		t.Error("Data is not the served envelope")
+	}
+	if env.KID != "nsk-kid-1" {
+		t.Errorf("KID = %q, want %q", env.KID, "nsk-kid-1")
+	}
+	if env.Epoch != testEdgePSKEpoch {
+		t.Errorf("Epoch = %q, want %q", env.Epoch, testEdgePSKEpoch)
+	}
+}
+
+func TestFetchEdgePSK_EnvelopeLength(t *testing.T) {
+	for _, n := range []int{59, 61, 0} {
+		t.Run(strconv.Itoa(n), func(t *testing.T) {
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				serveEdgePSK(w, bytes.Repeat([]byte{0xa5}, n))
+			})
+			env, err := client.FetchEdgePSK(context.Background(), "n1", "p1")
+			want := fmt.Sprintf("api: fetch edge psk: envelope is %d bytes, want 60", n)
+			if err == nil || err.Error() != want {
+				t.Fatalf("err = %v, want %q", err, want)
+			}
+			if env != nil {
+				t.Error("an envelope was returned alongside the error")
+			}
+		})
+	}
+}
+
+func TestFetchEdgePSK_MissingHeader(t *testing.T) {
+	for _, header := range []string{"X-Plexsphere-PSK-KID", "X-Plexsphere-PSK-Epoch"} {
+		t.Run(header, func(t *testing.T) {
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("X-Plexsphere-PSK-KID", "nsk-kid-1")
+				w.Header().Set("X-Plexsphere-PSK-Epoch", testEdgePSKEpoch)
+				w.Header().Del(header)
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(testEdgePSKEnvelope)
+			})
+			_, err := client.FetchEdgePSK(context.Background(), "n1", "p1")
+			want := "api: fetch edge psk: response missing " + header
+			if err == nil || err.Error() != want {
+				t.Fatalf("err = %v, want %q", err, want)
+			}
+		})
+	}
+}
+
+func TestFetchEdgePSK_TransportError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	client, err := NewControlPlane(Config{BaseURL: srv.URL}, "1.0.0-test", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetAuthToken("test-token")
+	srv.Close() // close so the request fails at the transport level
+
+	env, err := client.FetchEdgePSK(context.Background(), "n1", "p1")
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("err = %v, want *url.Error", err)
+	}
+	if env != nil {
+		t.Error("an envelope was returned alongside the error")
+	}
+}
+
+func TestFetchEdgePSK_RateLimited(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"status":429,"detail":"per-node edge-PSK fetch rate limit exceeded.","code":"per_node_rate_limited"}`))
+	})
+
+	_, err := client.FetchEdgePSK(context.Background(), "n1", "p1")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want *APIError", err)
+	}
+	if apiErr.RetryAfter != 7*time.Second {
+		t.Errorf("RetryAfter = %v, want 7s", apiErr.RetryAfter)
+	}
+}
+
+func TestFetchEdgePSK_NotReady(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":409,"detail":"an endpoint PSK has not been provisioned yet; retry on the next reconcile.","code":"psk_not_ready"}`))
+	})
+
+	_, err := client.FetchEdgePSK(context.Background(), "n1", "p1")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusConflict || apiErr.Code != "psk_not_ready" {
+		t.Errorf("APIError = %d %q, want 409 %q", apiErr.StatusCode, apiErr.Code, "psk_not_ready")
+	}
+}
+
+func TestFetchEdgePSK_PathParametersEscaped(t *testing.T) {
+	// Verify both IDs are escaped, so neither can climb out of its segment.
+	var gotPath string
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RawPath
+		if gotPath == "" {
+			gotPath = r.URL.Path
+		}
+		serveEdgePSK(w, testEdgePSKEnvelope)
+	})
+
+	if _, err := client.FetchEdgePSK(context.Background(), "../n1", "p1/../../x"); err != nil {
+		t.Fatalf("FetchEdgePSK: %v", err)
+	}
+
+	const want = "/v1/nodes/..%2Fn1/peers/p1%2F..%2F..%2Fx/psk"
+	if gotPath != want {
+		t.Errorf("path = %s, want %s", gotPath, want)
 	}
 }
