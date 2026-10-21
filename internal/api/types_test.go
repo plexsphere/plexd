@@ -587,6 +587,34 @@ func TestSnapshotPeer_OmitsEmptyFallbackEndpoint(t *testing.T) {
 	}
 }
 
+func TestSnapshotPeer_Endpoint(t *testing.T) {
+	const withEndpoint = `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2","mesh_ip":"10.99.0.3","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","endpoint":"198.51.100.7:51820"}`
+	var got SnapshotPeer
+	if err := json.Unmarshal([]byte(withEndpoint), &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.Endpoint != "198.51.100.7:51820" {
+		t.Errorf("Endpoint = %q, want %q", got.Endpoint, "198.51.100.7:51820")
+	}
+
+	const withoutEndpoint = `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2","mesh_ip":"10.99.0.3","public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}`
+	var absent SnapshotPeer
+	if err := json.Unmarshal([]byte(withoutEndpoint), &absent); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if absent.Endpoint != "" {
+		t.Errorf("Endpoint = %q for a peer without the key, want empty", absent.Endpoint)
+	}
+
+	data, err := json.Marshal(absent)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if s := string(data); strings.Contains(s, `"endpoint"`) {
+		t.Errorf("endpoint should be omitted when empty, got: %s", s)
+	}
+}
+
 func TestPolicyRule_PortsOmittedWhenNil(t *testing.T) {
 	// Nil Ports → no "ports" key (icmp carries no ports).
 	orig := PolicyRule{Action: "allow", Protocol: "icmp", SourceCIDR: "10.0.0.0/8", DestinationCIDR: "10.0.0.0/8"}

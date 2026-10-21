@@ -88,6 +88,35 @@ func TestComputeDiff_PeersUpdated(t *testing.T) {
 		}
 	})
 
+	t.Run("endpoint-only change is an update", func(t *testing.T) {
+		for _, tc := range []struct{ name, from, to string }{
+			{"new value", "198.51.100.7:51820", "198.51.100.8:51820"},
+			{"first observation", "", "198.51.100.7:51820"},
+			{"observation went stale", "198.51.100.7:51820", ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				desired := &api.NodeStateSnapshot{
+					Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", Endpoint: tc.to}},
+				}
+				current := &api.NodeStateSnapshot{
+					Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", Endpoint: tc.from}},
+				}
+
+				diff := ComputeDiff(desired, current)
+
+				if len(diff.PeersToUpdate) != 1 {
+					t.Fatalf("expected 1 peer to update on endpoint change %q -> %q, got %d", tc.from, tc.to, len(diff.PeersToUpdate))
+				}
+				if diff.PeersToUpdate[0].Endpoint != tc.to {
+					t.Errorf("updated Endpoint = %q, want %q", diff.PeersToUpdate[0].Endpoint, tc.to)
+				}
+				if len(diff.PeersToAdd) != 0 || len(diff.PeersToRemove) != 0 {
+					t.Errorf("expected no adds/removes, got add=%d remove=%d", len(diff.PeersToAdd), len(diff.PeersToRemove))
+				}
+			})
+		}
+	})
+
 	t.Run("identical peer is not an update", func(t *testing.T) {
 		peer := api.SnapshotPeer{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820"}
 		desired := &api.NodeStateSnapshot{Peers: []api.SnapshotPeer{peer}}
