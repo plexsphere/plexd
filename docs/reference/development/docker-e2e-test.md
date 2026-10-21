@@ -12,7 +12,7 @@ The test runs fourteen phases:
 
 1. **Initial assertions** — all 7 counters >= 1 (agent started and contacted all endpoints)
 2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, and metrics data
-3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously), then a handshake report and a `tunnel_health` sample for a fixture peer when WireGuard came up in the container (script phase `4b`)
+3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously), then a handshake report and a `tunnel_health` sample for a fixture peer when WireGuard came up in the container (script phase `4b`), and an edge PSK fetch for each fixture peer under the same condition (script phase `4c`)
 4. **Log injection** — injects a log file via `docker cp`, verifies logs_count increases (FileSource pipeline works)
 5. **Agent restart for audit** — restarts the plexd container and verifies `local_audit_count` increases (ProcessSource fires per-process). The platform leg carries nothing: plexd's own `process` source is outside the ingest contract's closed enum (`auditd`, `k8s`), so `audit_count` must stay at 0.
 6. **SSE event injection** — injects a `node_state_updated` event and verifies state_count increases (proves SSE stream is connected)
@@ -117,6 +117,21 @@ With the line it checks three things:
 3. **Tunnel metrics name a fixture peer.** Polls `GET /test/last-request/metrics` for up to 30 seconds for at least one `tunnel_health` sample whose `labels.peer_id` is one of the two fixture node IDs (`0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1`, `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2`). The tunnel collector keeps peers with no handshake, so the samples exist without one.
 
 This phase is the only run anywhere that reads a kernel WireGuard device through `NetlinkController.PeerStats`, so it must not be weakened to the skip path.
+
+### Phase 3 (cont.): Edge PSKs
+
+Runs as script phase `4c`, directly after phase `4b`, and checks that plexd fetches and opens the [edge PSK](../../guide/security.md#pre-shared-keys-psk) of each fixture peer from the mock's [PSK route](mock-api-server.md#get-v1-nodes-id-peers-peer-node-id-psk). The e2e config leaves `wireguard.edge_psk` unset, which reads as enabled.
+
+plexd fetches edge PSKs only when its WireGuard interface came up, so the phase reuses phase `4b`'s check for `wireguard interface configured`. Without the line it prints:
+
+```text
+SKIP: edge psk (WireGuard did not come up in this container)
+```
+
+With the line it checks two things:
+
+1. Polls `GET /test/assertions` for up to 60 seconds until `edge_psk_count` >= 2, which shows the mock served both envelopes. plexd syncs its edge PSKs on every pull, before the WireGuard handler adds the peers, so the first pull after start fetches the PSK of both fixture peers.
+2. For each fixture node ID, polls `dc logs plexd` for up to 30 seconds for an `edge psk fetched` line naming that peer, which shows plexd opened its envelope. plexd writes the line only after the envelope opened under the NSK with the edge's additional authenticated data. The line names the peer and the epoch, never the key. The log is read line by line and matched with `case`, for the same `pipefail` reason as in phase `4b`.
 
 ### Phase 4: Log Injection
 

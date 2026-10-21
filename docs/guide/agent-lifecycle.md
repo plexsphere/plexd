@@ -166,7 +166,7 @@ Each reconciliation cycle:
 2. **Dispatch** the delivery-queue blocks. Today that is `executions`, the channel through which the control plane delivers action dispatches. This step runs on **every** successful pull, before the diff, so a queued action executes even when nothing has drifted.
 3. **Diff** the snapshot against the local snapshot by presence: peer add/remove/update, and per-block change flags for policy, bridge, and the state/reports buckets. `executions` is a queue rather than desired state, so it is neither stored nor diffed.
 4. **Apply corrections** for any detected drift:
-   - Add/remove WireGuard peers (membership comes from the `peers` block; AllowedIPs derived as `mesh_ip/32`, no PSK)
+   - Add, update or remove WireGuard peers. Membership comes from the `peers` block, AllowedIPs are derived as `mesh_ip/32`, and the endpoint is the peer's direct `endpoint` when it is usable and its `fallback_endpoint` otherwise. The PSK is the edge PSK plexd fetched for the peer's current public key; a peer gets none while plexd holds no PSK for it, for example with `wireguard.edge_psk: false`. plexd syncs the edge PSKs on every successful pull before the diff, so a new peer can get its PSK in the same cycle that adds it (see [Pre-Shared Keys](/guide/security#pre-shared-keys-psk))
    - Rebuild nftables rules from the merged `policy` block, but only when its fingerprint changed
    - Reconcile the bridge subtrees (relay, user access, ingress, site-to-site)
    - Feed the node state cache from the `state` block

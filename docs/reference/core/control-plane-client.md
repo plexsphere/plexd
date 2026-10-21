@@ -74,6 +74,7 @@ All methods accept a `context.Context` for cancellation and return typed respons
 | `UpdateCapabilities`  | `PUT`           | `/v1/nodes/{node_id}/capabilities`                | `CapabilityManifestRequest`| —               |
 | `ReportEndpoint`      | `PUT`           | `/v1/nodes/{node_id}/endpoint`                    | `EndpointRequest`    | `*EndpointResponse`   |
 | `FetchSecret`         | `GET`           | `/v1/nodes/{node_id}/secrets/{name}` (optional `?version=N`) | —          | `*SecretEnvelope`     |
+| `FetchEdgePSK`        | `GET`           | `/v1/nodes/{node_id}/peers/{peer_node_id}/psk`     | —                    | `*EdgePSKEnvelope`    |
 | `PutStateReport`      | `PUT`           | `/v1/nodes/{node_id}/state/reports/{key}`          | `NodeStateReportRequest` | `*NodeStateReportResponse` |
 | `DeleteStateReport`   | `DELETE`        | `/v1/nodes/{node_id}/state/reports/{key}`          | —                    | — (`204 No Content`)  |
 | `ExecutionCallback`   | `POST`          | `/v1/nodes/{node_id}/executions/{execution_id}`    | `ExecutionCallbackRequest` | `*ExecutionCallbackResponse` |
@@ -84,6 +85,8 @@ All methods accept a `context.Context` for cancellation and return typed respons
 | `ReportSessionActivity` | `POST`        | `/v1/nodes/{node_id}/sessions/{session_id}`        | `SessionActivityRequest` | — (`204 No Content`) |
 | `ReportIntegrityViolations` | `POST`    | `/v1/nodes/{node_id}/integrity-violations`         | `IntegrityViolationsRequest` | —            |
 | `ReportHandshakes`    | `POST`          | `/v1/nodes/{node_id}/handshakes`                   | `HandshakeReportRequest` | `*HandshakeReportResponse` |
+
+`FetchEdgePSK` takes the node ID and the peer's node ID, path-escapes both, and returns the envelope only when the body is exactly `EdgePSKEnvelopeSize` (60) bytes and both the `X-Plexsphere-PSK-KID` and `X-Plexsphere-PSK-Epoch` headers are present. The body is key material, so no error it returns quotes it. See [API Types](api-types.md#edge-psk) for the envelope.
 
 ### Generic Helpers
 
@@ -121,6 +124,8 @@ if errors.Is(err, api.ErrUnauthorized) {
 `IsSessionRevokedOrExpired(err error) bool` classifies the answers to `ReportSessionActivity`. It extracts the `*APIError` with `errors.As`, so a wrapped error is classified too, and reports true for a `409` carrying `session_already_revoked` or `session_expired`. Everything else is false, including a `400` `malformed_session_activity`, which is a verdict on the row rather than on the session; a `501` `access_session_not_provisioned`, which faults the callback endpoint rather than the session, and that endpoint may be provisioned mid-session; and a `404` `session_not_found`, which is not a terminal state but the `sessions` block and the session store disagreeing — two separate reads, so a lagging replica or a record written after the block was rendered produces it, and the entry standing in the block is the control plane still asking for the session. All three stay retryable. A true answer is the control plane's verdict that the session has reached a terminal state, and the node reads it as the drain signal: the entry leaves the `sessions` block on a following pull and the block drain performs the teardown. The answer itself never closes a session.
 
 `IsHandshakeReportNotServed(err error) bool` classifies the answers to `ReportHandshakes`. It is true for an `*APIError` with status `404`, whatever its code, and for a `501` carrying `handshakes_not_provisioned`: both mean the control plane does not serve the operation yet. Everything else is false, including a `501` with another code. The [handshake reporter](heartbeat-service.md#handshake-reporter) logs a true answer once at Info and keeps reporting every interval.
+
+`IsEdgePSKNotServed(err error) bool` classifies the answers to `FetchEdgePSK`. It is true for an `*APIError` with status `404` and any code but `peer_not_found`, and for a `501` carrying `psk_delivery_not_provisioned`: a control plane older than the operation has no route for it, and its router answers `404` with whatever code its not-found handler writes. A `404` `peer_not_found` is the operation's own answer while the peer has not landed in the Domain yet, so it is false, and the [edge PSK store](../networking/wireguard.md#edge-psks) retries it on the next pull. The store logs a true answer once at Info and sends at most one request per pull until the control plane serves edge PSKs.
 
 `APIError.CorrelationID` carries the `correlation_id` member of the control plane's problem document; when the document has no id, the client falls back to the `X-Correlation-Id` header of that same response. Both sources are read only from an `application/problem+json` response, so an id minted by a proxy or gateway that answered in place of the control plane is not presented as a control-plane id. The header itself is not authenticated, so that gate is the whole guarantee: a tracing proxy that passes the control plane's problem document through untouched and stamps its own `X-Correlation-Id` on it is indistinguishable, and a fallback id may be that proxy's request id rather than one the control-plane log keys. The field also stays empty for an id longer than 256 bytes, which is dropped rather than truncated because a truncated id keys nothing, and any unprintable rune is stripped — from the message the error string renders alongside the id as well — so a hostile intermediary cannot forge a log line or emit a terminal escape through the error string. `APIError.Code`, the third response-derived field the error string renders, is guarded by rejection rather than stripping: a code longer than 128 bytes or carrying any unprintable rune is dropped whole, because stripping a rune out of it could collapse a forged code onto a live one the classifiers branch on. A set id is appended to the error string as a trailing ` (correlation_id=...)` segment, so every logged failure line carries it. The id keys the control-plane log, so an operator can quote it there.
 
@@ -209,12 +214,16 @@ only request a reconcile.
 | `EventBridgeConfigUpdated` | `bridge_config_updated` | `bridge.HandleBridgeConfigUpdated` → reconcile |
 | `EventActionRequest`       | `action_request`        | `TriggerReconcile()`                        |
 | `EventSessionSetup`        | `session_setup`         | `TriggerReconcile()`                        |
+| `EventPeerEndpointChanged` | `peer_endpoint_changed` | `TriggerReconcile()`                        |
 
 `action_request` carries no dispatch of its own: action executions are delivered
 in the `executions` block of the state pull, so the event only pulls the next
 reconcile forward and the resulting pull carries the dispatch. `session_setup` is
 the same optimisation for mediated access: the session is delivered in the
 `sessions` block of that pull, and the event only pulls it forward.
+`peer_endpoint_changed` works the same way for peer endpoints: each peer's direct
+endpoint rides the `peers` block of the state pull as `SnapshotPeer.Endpoint`, and
+plexd never decodes the event's payload.
 
 **Documented-coming** — named now so the agent can subscribe once the platform's 14-type taxonomy starts emitting them:
 
@@ -223,7 +232,6 @@ the same optimisation for mediated access: the session is delivered in the
 | `EventPeerRegistered`      | `peer_registered`       | `TriggerReconcile()`        |
 | `EventPeerPSKAssigned`     | `peer_psk_assigned`     | `TriggerReconcile()`        |
 | `EventPeerDeregistered`    | `peer_deregistered`     | `TriggerReconcile()`        |
-| `EventPeerEndpointChanged` | `peer_endpoint_changed` | `TriggerReconcile()`        |
 | `EventPeerKeyRotated`      | `peer_key_rotated`      | `TriggerReconcile()`        |
 | `EventRotateKeys`          | `rotate_keys`           | key rotator's `RotateNow`   |
 | `EventSigningKeyRotated`   | `signing_key_rotated`   | `Ed25519Verifier.Rotate`    |

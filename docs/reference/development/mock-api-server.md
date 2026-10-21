@@ -36,7 +36,7 @@ The gate exists because its absence hid a shipped defect: the mock used to admit
 The mock refuses what the real handlers refuse, because a fixture that accepts
 more than the contract hides exactly the defects the suite exists to catch. The
 first three gates were added after a release shipped past them; the handshake
-report was gated from the start:
+report and the edge PSK route were gated from the start:
 
 - **`PUT /v1/nodes/{id}/capabilities`** strict-decodes a `CapabilityManifestRequest`
   (`DisallowUnknownFields`) and enforces its invariants: a non-empty
@@ -84,6 +84,11 @@ report was gated from the start:
   missing, has port 0, an unspecified address or a zone. A report naming no
   fixture peer is still accepted: its entries count as `ignored`, as upstream.
   See [the route](#post-v1-nodes-id-handshakes) for the full order.
+- **`GET /v1/nodes/{id}/peers/{peer_node_id}/psk`** answers
+  `403 node_id_mismatch` for an `id` other than the registered node, then
+  `404 peer_not_found` for a `peer_node_id` that is not one of the two fixture
+  peers or names the node itself. Only a request that passes both gets an
+  envelope. See [the route](#get-v1-nodes-id-peers-peer-node-id-psk).
 
 ### `GET /test/bearer`
 
@@ -394,6 +399,44 @@ Docker e2e run expects: the fixture peers never complete a handshake.
 
 **Error:** Denials use `application/problem+json` with the codes above. Returns `405` if the HTTP method is not `POST`.
 
+### `GET /v1/nodes/{id}/peers/{peer_node_id}/psk`
+
+Serves the edge PSKs of the two fixture peers the way the control plane does:
+each PSK is sealed under the mock NSK (`mockNSK`, the `nsk` that registration
+returns) with the contract's additional authenticated data, and the envelope is
+the raw response body. `edge_psk_count` increments only on a `200`.
+
+**Answer order.** The handler returns at the first refusal:
+
+1. `403` `node_id_mismatch` if `id` is not the registered node (`0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3`).
+2. `404` `peer_not_found` if `peer_node_id` is not a fixture peer (`0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1` or `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2`) or equals `id`.
+
+**Response:** `200 OK`, a 60-byte `application/octet-stream` body
+(`<12-byte nonce> || <32-byte PSK + 16-byte GCM tag>`, with a fresh random
+nonce per response) and these headers:
+
+| Header | Value |
+|--------|-------|
+| `X-Plexsphere-PSK-KID` | `mock-nsk-1` |
+| `X-Plexsphere-PSK-Epoch` | the fixed epoch below, the same for every envelope |
+| `Cache-Control` | `no-store` |
+
+The PSK for a peer is the SHA-256 of `mock-edge-psk|<peer_node_id>`. The
+envelope is sealed with this additional authenticated data:
+
+```text
+plexsphere/mesh/edge-psk/v1|0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3|<peer_node_id>|2026-01-01T00:00:00.000000000Z|2026-01-01T00:00:01.000000000Z
+```
+
+Everything after the peer node id is the epoch from the
+`X-Plexsphere-PSK-Epoch` header, which itself contains a `|`. The epoch is
+fixed, so a re-fetch is never older than the envelope already in force and
+plexd's epoch floor never refuses one.
+
+**Counter:** Increments `edge_psk_count` only on a `200`.
+
+**Error:** Refusals use `application/problem+json` with the codes above. A request without the bearer envelope is refused with `401` by the [authentication gate](#authentication). Returns `405` if the HTTP method is not `GET`.
+
 ### `GET /v1/nodes/{id}/state`
 
 Returns the active `NodeStateSnapshot` fixture built by `newStateFixture`. By
@@ -407,7 +450,7 @@ The active fixture can be replaced at runtime via `POST /test/configure-state`.
 
 | Block | Default Value |
 |-------|---------------|
-| `peers` | 2 mesh peers (node_id ascending), no `psk`/`allowed_ips`/`endpoint` |
+| `peers` | 2 mesh peers (node_id ascending), no `psk`/`allowed_ips`; `...a0b1` carries only `fallback_endpoint`, `...a0b2` only a direct `endpoint` |
 | `reachability` | `{"state":"never_reported", ...}` — the mock accepts heartbeats but never evaluates them into a projection |
 | `policy` | merged block: 2 rules, `fingerprint` from `policyFingerprint` |
 | `bridge.relay` | 1 relay session assignment (`relay-sess-001`) |
@@ -437,7 +480,8 @@ comparison key and never re-derives it from the rules.
     {
       "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
       "mesh_ip": "10.99.0.3",
-      "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+      "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "endpoint": "198.51.100.20:51820"
     }
   ],
   "reachability": {"state": "never_reported", "changed_at": "2026-01-01T00:00:00Z"},
@@ -871,6 +915,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "session_activity_rejected_count": 0,
   "integrity_violation_count": 0,
   "handshake_report_count": 0,
+  "edge_psk_count": 0,
   "inject_event_count": 0,
   "events_request_count": 0,
   "local_metrics_count": 0,
@@ -1199,6 +1244,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `session_activity_rejected_count` | `POST /v1/nodes/{id}/sessions/{sid}` (liveness refusals only: `404` / `409`) |
 | `integrity_violation_count` | `POST /v1/nodes/{id}/integrity-violations` (accepted batches only, one per request regardless of batch size) |
 | `handshake_report_count` | `POST /v1/nodes/{id}/handshakes` (accepted reports only, `200`) |
+| `edge_psk_count` | `GET /v1/nodes/{id}/peers/{peer_node_id}/psk` (served `200` envelopes only) |
 | `inject_event_count` | `POST /test/inject-event` |
 | `events_request_count` | `GET /v1/nodes/{id}/events` (every request, including descoped `501` and `400`) |
 | `local_metrics_count` | `POST /local/metrics` (TLS) |

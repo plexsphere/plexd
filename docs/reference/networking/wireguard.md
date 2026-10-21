@@ -19,6 +19,9 @@ All OS-level WireGuard operations go through a `WGController` interface, enablin
 | `InterfaceName` | `string` | `plexd0`   | WireGuard network interface name     |
 | `ListenPort`    | `int`    | `51820` | UDP listen port                      |
 | `MTU`           | `int`    | `0`     | Interface MTU (0 = system default)   |
+| `EdgePSK`       | `*bool`  | `nil` (enabled) | Fetch each edge's PSK and program it on the peer (`edge_psk`). See [Edge PSKs](#edge-psks) |
+
+`EdgePSK` is a pointer so that an omitted key stays apart from an explicit `false`. `EdgePSKEnabled()` returns the effective value: true unless the field is set to `false`. `ApplyDefaults` leaves the field alone, so a `false` survives it.
 
 ```go
 cfg := wireguard.Config{
@@ -36,6 +39,7 @@ if err := cfg.Validate(); err != nil {
 |-----------------|-----------------------------|---------------------------------------------------------|
 | `ListenPort`    | Must be 1–65535             | `wireguard: config: ListenPort must be between 1 and 65535` |
 | `MTU`           | Must be >= 0                | `wireguard: config: MTU must not be negative`           |
+| `EdgePSK`       | Not validated; any value is accepted | none                                           |
 
 ## WGController
 
@@ -224,6 +228,8 @@ func PeerConfigFromAPI(peer api.Peer) (PeerConfig, error)
 - `Endpoint`: copied as-is (may be empty for NAT-traversal peers)
 - `AllowedIPs`: copied as-is
 
+For a mesh peer, `api.Peer.PSK` is the edge PSK the [edge PSK store](#edge-psks) holds for the peer's node ID and current public key, base64-encoded, and empty while the store holds none. `NetlinkController.AddPeer` and the [userspace backend](#userspace-backend) leave the device peer's preshared key as it is when `PeerConfig.PSK` is empty, and its endpoint as it is when `Endpoint` is empty. Every write replaces the allowed IPs.
+
 ## PeerIndex
 
 Thread-safe mapping from peer IDs (control plane identifiers) to base64-encoded public keys (WireGuard identifiers). Protected by `sync.RWMutex`.
@@ -252,7 +258,7 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 ```
 
 - Applies config defaults via `cfg.ApplyDefaults()`
-- Creates an empty `PeerIndex`
+- Creates an empty `PeerIndex` and an empty record of programmed peers
 
 ### Methods
 
@@ -268,6 +274,18 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 | `ConfigurePeers`| `(ctx context.Context, peers []api.Peer) error`                              | Bulk-adds peers with context cancellation; individual errors logged |
 | `PeerIndex`     | `() *PeerIndex`                                                              | Returns the peer index                                         |
 | `MeshPeerStats` | `() ([]MeshPeerStat, error)`                                                 | Reads the mesh interface's peers and maps them to node IDs; see [Mesh peer stats](#mesh-peer-stats) |
+| `MeshPrefix`    | `() netip.Prefix`                                                            | The Domain mesh prefix the interface was set up with; see [Mesh prefix](#mesh-prefix) |
+| `SetPeerPSK`    | `(peerNodeID, publicKey string, psk []byte) error`                           | Rewrites the programmed peer of `peerNodeID` with `psk` when it was last written with `publicKey`; see [Installing a PSK](#installing-a-psk) |
+
+The package function `ProgrammedEndpoint` (`handler.go`) picks the endpoint written for a snapshot peer from the peer and `MeshPrefix()`; see [Endpoint selection](#endpoint-selection).
+
+### Programmed peers
+
+The manager records the last `api.Peer` it wrote per node ID, because `SetPeerPSK` has to repeat a peer's allowed IPs to write its PSK. `AddPeer` and `UpdatePeer` record the peer after a successful device write, `ConfigurePeers` replaces the record with the peers it wrote, and `RemovePeerByID` drops the entry after a successful removal. One mutex serializes these writes with `SetPeerPSK`, since the reconcile handler and the edge PSK store write the same peers from different call paths.
+
+### Mesh prefix
+
+`Setup` records the prefix of the address it assigns, masked: the Domain mesh CIDR (`10.99.0.0/24` for mesh IP `10.99.0.5` and `domain_mesh_cidr` `10.99.0.0/24`), or the mesh IP's host `/32` when the identity carries no usable `domain_mesh_cidr`. `MeshPrefix` returns it, and returns the zero prefix before `Setup` succeeds. [Endpoint selection](#endpoint-selection) refuses a direct endpoint inside it.
 
 ### Mesh peer stats
 
@@ -309,7 +327,7 @@ if err := mgr.ConfigurePeers(ctx, registerResponse.Peers); err != nil {
     log.Fatal(err)
 }
 
-// Individual peer operations (driven by SSE events or reconciliation)
+// Individual peer operations (driven by reconciliation; see ReconcileHandler)
 mgr.AddPeer(newPeer)
 mgr.UpdatePeer(updatedPeer)
 mgr.RemovePeerByID("peer-123")
@@ -326,6 +344,7 @@ if err := mgr.Teardown(); err != nil {
 2. `ConfigureAddress(name, meshIP+"/<prefix>")` — assign the mesh IP. The prefix length comes from the registration `domain_mesh_cidr`, so the kernel installs an on-link route for the whole mesh (which the snapshot peers, advertised as `mesh_ip/32`, rely on). Identities without the field, or with an unparseable value, fall back to a host `/32` (the unparseable case is logged as a warning). On macOS the on-link route is not implicit and `DarwinController` installs it explicitly (see [macOS controller](#macos-controller))
 3. `SetMTU(name, mtu)` — only if `Config.MTU > 0`
 4. `SetInterfaceUp(name)` — bring the interface up
+5. Record the address's masked prefix as the [mesh prefix](#mesh-prefix)
 
 ### Error Handling
 
@@ -335,6 +354,7 @@ if err := mgr.Teardown(); err != nil {
 | `RemovePeerByID`  | Returns error                    | —                          |
 | `UpdatePeer`      | Returns error                    | —                          |
 | `ConfigurePeers`  | Logged at error, continues       | Returns context error      |
+| `SetPeerPSK`      | Returns `wireguard: set peer psk: <cause>` | —                |
 
 ### Logging
 
@@ -345,6 +365,7 @@ All log entries use `component=wireguard`. Private keys and PSKs are never logge
 | `Info`  | Interface configured         | `interface`, `listen_port`, `mesh_ip` |
 | `Info`  | Peers configured (bulk)      | `count`                               |
 | `Debug` | Peer added/removed/updated   | `peer_id`                             |
+| `Debug` | Peer PSK set (`peer psk set`) | `peer_id`                            |
 | `Error` | Peer operation failed (bulk) | `peer_id`, `error`                    |
 
 ## ReconcileHandler
@@ -352,8 +373,16 @@ All log entries use `component=wireguard`. Private keys and PSKs are never logge
 Factory function returning a `reconcile.ReconcileHandler` that applies peer changes from the `StateDiff`. Peer membership comes solely from the snapshot `peers` block.
 
 ```go
-func ReconcileHandler(mgr *Manager) reconcile.ReconcileHandler
+func ReconcileHandler(mgr *Manager, psks EdgePSKLookup) reconcile.ReconcileHandler
+
+// EdgePSKLookup returns the edge PSK fetched for a peer, keyed by the peer's
+// node ID and the public key it was fetched for.
+type EdgePSKLookup interface {
+    Lookup(peerNodeID, publicKey string) ([]byte, bool)
+}
 ```
+
+`*EdgePSKs` implements `EdgePSKLookup`; see [Edge PSKs](#edge-psks). A nil `psks` programs no PSK.
 
 ### Processing Order
 
@@ -361,22 +390,49 @@ func ReconcileHandler(mgr *Manager) reconcile.ReconcileHandler
 2. **Updates** — `diff.PeersToUpdate` via `UpdatePeer`
 3. **Adds** — `diff.PeersToAdd` via `AddPeer`
 
-Adds and updates carry `api.SnapshotPeer` entries, converted to the WireGuard `api.Peer` by `peerFromSnapshot`:
+Adds and updates carry `api.SnapshotPeer` entries, converted to the WireGuard `api.Peer` by `peerFromSnapshot(p, mgr.MeshPrefix(), psk)`:
 
-- `AllowedIPs` is derived locally as `mesh_ip/32` — the snapshot never sends allowed IPs.
-- `Endpoint` is the peer's `fallback_endpoint` (the relay target). Direct endpoints keep arriving via the untouched `peer_endpoint_changed` SSE path.
-- **No PSK is fabricated** — peers are configured without a preshared key. PSK distribution is deferred until the control plane exposes one.
+- `AllowedIPs` is derived locally as `mesh_ip/32`. The snapshot never sends allowed IPs. A `mesh_ip` that is not a bare IPv4 address fails the peer.
+- `Endpoint` is the one `ProgrammedEndpoint` picks: the peer's direct `endpoint` from the pull when it is usable, otherwise its `fallback_endpoint` (the relay target), which may be empty. See [Endpoint selection](#endpoint-selection).
+- `PSK` is the key `psks.Lookup` returns for the peer's node ID and current `public_key`, base64-encoded. A PSK fetched for another public key is never returned, so a peer whose key changed gets no PSK until the store holds one for the new key. With no PSK the field stays empty, and the store writes the PSK through [`SetPeerPSK`](#installing-a-psk) once it arrives.
 
 Individual failures are logged and collected. The handler returns an aggregated error via `errors.Join` (nil if all succeed). This ensures the reconciler marks the cycle as failed and retries on the next tick.
+
+### Endpoint selection
+
+```go
+func ProgrammedEndpoint(p api.SnapshotPeer, mesh netip.Prefix) (endpoint string, directRejected bool)
+```
+
+`ProgrammedEndpoint` returns the peer's direct `endpoint` when it is usable, and its `fallback_endpoint` otherwise. A direct endpoint is usable when all of these hold:
+
+- It parses with `netip.ParseAddrPort` and its port is not 0.
+- Its address carries no zone.
+- Its address, with an IPv4-mapped IPv6 address unmapped, is not unspecified, loopback, multicast, link-local unicast or link-local multicast.
+- It lies outside `mesh`, the Domain mesh prefix from [`MeshPrefix`](#mesh-prefix). An endpoint inside it would be routed through the mesh interface, so WireGuard would send the peer's encrypted packets into its own tunnel. A zero `mesh` skips this check.
+
+A usable endpoint is returned in canonical form, so `[::ffff:10.0.0.5]:51820` becomes `10.0.0.5:51820`. The fallback is returned as the pull sent it and is never validated, because the contract allows a hostname there.
+
+`directRejected` is true only when the peer carried a non-empty `endpoint` that was refused. An absent `endpoint` means the peer has no fresh NAT observation, and the fallback is then the expected choice. For a refused endpoint the handler logs at `warn`:
+
+```
+wireguard: peer direct endpoint unusable, programming the relay fallback  component=wireguard peer_id=<node id> endpoint=10.99.0.4:51820 fallback=203.0.113.1:51820
+```
+
+The differ compares `endpoint` as well as `fallback_endpoint`, so a peer whose direct endpoint appears, changes or disappears lands in `PeersToUpdate` and is written again.
 
 ### Registration
 
 ```go
 mgr := wireguard.NewManager(ctrl, wireguard.Config{}, logger)
+psks := wireguard.NewEdgePSKs(client, identity.NodeID, nsk, mgr, logger)
 
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(wireguard.ReconcileHandler(mgr))
+r.RegisterDispatchHandler(wireguard.EdgePSKDispatchHandler(psks))
+r.RegisterHandler(wireguard.ReconcileHandler(mgr, psks))
 ```
+
+Without edge PSKs, pass a nil `EdgePSKLookup` interface value, as `plexd up` does. A nil `*EdgePSKs` stored in the interface is not nil to the handler, and its `Lookup` panics.
 
 The agent registers this handler **only when WireGuard `Setup` succeeded**. On hosts without a programmable WireGuard stack the interface fails to come up, the agent continues without WireGuard, and the peer reconcile handler is skipped — a handler that failed every cycle would hold the reconciler snapshot back and prevent convergence (for example, the policy fingerprint short-circuit could never hold).
 
@@ -385,14 +441,127 @@ The agent registers this handler **only when WireGuard `Setup` succeeded**. On h
 There are no WireGuard-specific SSE handlers. Peers are programmed from the
 authoritative state snapshot, not from fine-grained events. The peer topology
 events (`peer_registered`, `peer_psk_assigned`, `peer_deregistered`,
-`peer_endpoint_changed`, `peer_key_rotated`) carry opaque payloads and dispatch to
-`TriggerReconcile()`; the reconcile loop then pulls the snapshot and
+`peer_endpoint_changed`, `peer_key_rotated`) dispatch to `TriggerReconcile()`, and
+plexd never decodes their payloads. The reconcile loop then pulls the snapshot, the
+[edge PSK store](#edge-psks) (when edge PSKs are on) syncs against its peers, and
 `ReconcileHandler` (see above) converges the interface.
 
-`peerFromSnapshot(api.SnapshotPeer) (api.Peer, error)` builds each programmed
-peer from a snapshot entry, deriving `AllowedIPs` locally as `mesh_ip/32`. The
-manager then adds, updates, or removes peers so the interface matches the desired
-set.
+`peerFromSnapshot(p api.SnapshotPeer, mesh netip.Prefix, psk []byte) (api.Peer, error)`
+builds each programmed peer from a snapshot entry: `AllowedIPs` derived locally as
+`mesh_ip/32`, the endpoint [`ProgrammedEndpoint`](#endpoint-selection) picks, and
+`psk` base64-encoded (none for a nil `psk`). The manager then adds, updates, or
+removes peers so the interface matches the desired set.
+
+## Edge PSKs
+
+The control plane derives a WireGuard preshared key for every edge, the pair of nodes at the two ends of a tunnel, and serves it to each end sealed under that node's NSK on `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk` (see [Edge PSK](../core/api-endpoints.md#edge-psk) in the API endpoints reference). `EdgePSKs` (`internal/wireguard/psk.go`) fetches each peer's PSK, opens it, refuses an envelope older than the one in force, and installs it on the device peer. It keeps the PSKs in memory, where the reconcile handler looks them up for the peers it adds or updates.
+
+```go
+type EdgePSKFetcher interface {
+    FetchEdgePSK(ctx context.Context, nodeID, peerNodeID string) (*api.EdgePSKEnvelope, error)
+}
+
+type EdgePSKInstaller interface {
+    SetPeerPSK(peerNodeID, publicKey string, psk []byte) error
+}
+
+func NewEdgePSKs(fetcher EdgePSKFetcher, nodeID string, nsk []byte, installer EdgePSKInstaller, logger *slog.Logger) *EdgePSKs
+func EdgePSKDispatchHandler(s *EdgePSKs) reconcile.DispatchHandler
+```
+
+`*api.ControlPlane` implements the fetcher and `*Manager` the installer. `NewEdgePSKs` copies the NSK, and every log line it writes carries `component=wireguard`.
+
+| Method          | Signature                                                  | Description |
+|-----------------|------------------------------------------------------------|-------------|
+| `Lookup`        | `(peerNodeID, publicKey string) ([]byte, bool)`            | A copy of the PSK held for the peer when it was fetched for `publicKey`, stale or not. Implements [`EdgePSKLookup`](#reconcilehandler) |
+| `InvalidateAll` | `()`                                                       | Marks every PSK stale, so the next `Sync` fetches each peer's again |
+| `Sync`          | `(ctx context.Context, peers []api.SnapshotPeer)`          | Forgets the peers missing from `peers`, fetches the PSKs that are due, and installs every PSK the installer has not accepted yet. Returns nothing |
+
+### Wiring in plexd up
+
+`plexd up` builds the store only when the WireGuard interface came up and `wireguard.edge_psk` is on. It decodes the NSK with `identity.SecretKey()`; an NSK that does not decode logs `edge psk disabled, the node secret key does not decode` at `warn` with `error`, and the agent runs without edge PSKs. With the store built:
+
+- `EdgePSKDispatchHandler(store)` is registered as a [dispatch handler](../core/reconciliation.md#dispatchhandler), so `Sync` runs with the pull's `peers` on every successful pull, drift or not. Dispatch handlers run before the reconcile handlers, so a new peer's PSK is in the store when `ReconcileHandler` adds the peer in the same cycle.
+- The store is the `EdgePSKLookup` passed to `ReconcileHandler`.
+- The key rotator gets `rotationReconcileTrigger` as its reconcile trigger. Its `TriggerReconcile` calls `InvalidateAll` and then triggers the reconcile. The rotator fires the trigger once per committed rotation (see [Mesh key rotation](../core/key-storage.md#mesh-key-rotation-rotate-keys)), so the pull that follows fetches every PSK again.
+
+A failed fetch never fails the WireGuard reconcile handler. A handler that fails every cycle holds the reconciler snapshot back, and a control plane that does not serve edge PSKs fails every fetch.
+
+### Fetch rule
+
+`Sync` fetches a peer's PSK when:
+
+1. the peer first appears in the pull,
+2. its `public_key` changed since its PSK was fetched, or
+3. this node completed its own key rotation since then (`InvalidateAll`).
+
+A peer whose fetch failed or was answered as not ready, or whose envelope was refused or did not open, holds no current PSK, so it stays due for a later pull. Once every peer holds a current PSK, a pull with an unchanged peer set sends no request. A stale PSK stays on the device, and `Lookup` keeps returning it, until its replacement arrives. A rotation that completes while a fetch is in flight leaves the fetched PSK stale, so the next pull fetches it again. For a peer that leaves the pull, the store forgets its PSK (zeroing the key) and its epoch floor.
+
+The due peers are fetched one at a time in node-ID order, and no lock is held during a request. After the pass, unless its context was cancelled, `Sync` installs every PSK the installer has not accepted yet, again in node-ID order.
+
+### Control plane answers
+
+| Answer | What the store does |
+|---|---|
+| `200` with a 60-byte envelope and both headers | Checks the epoch floor, opens the envelope and stores the PSK, which the install step at the end of the pass writes to the device. Logs `wireguard: edge psk fetched` |
+| `404 peer_not_found`, `409 psk_not_ready` | Not ready yet. `peer_not_found` is the lag after a peer registers, which the contract asks the agent to retry. Logs at `debug`, goes on to the next peer, and retries on the next pull |
+| `404` with no code or any code but `peer_not_found`, `501 psk_delivery_not_provisioned` | The control plane does not serve edge PSKs (`api.IsEdgePSKNotServed`). Ends the pass, so an older control plane sees at most one request per pull, and retries on the next pull |
+| `429` | Pauses every fetch for `Retry-After`, at least 1 s, and ends the pass. Until the pause ends, `Sync` only forgets departed peers: it fetches and installs nothing |
+| `403`, any code | Terminal under the contract (`node_deregistered` says this node was revoked). The store stops: no later `Sync` sends a request or installs anything |
+| Transport error | A refused connection, a request timeout or any other `*url.Error`. Logs `wireguard: edge psk: control plane unreachable, retrying on the next pull` and ends the pass: the remaining peers would fail the same way, and the fetches run before the reconcile handlers, so a hanging control plane costs one request timeout (`api.request_timeout`, 30 s by default) per pull instead of one per peer |
+| Any other error | Includes a malformed `200`. Logs `wireguard: edge psk: fetch failed`, goes on to the next peer, and retries on the next pull |
+
+A cancelled context ends the pass at once, and nothing is installed.
+
+### Opening the envelope
+
+`api.ControlPlane.FetchEdgePSK` requires a body of exactly `api.EdgePSKEnvelopeSize` (60) bytes, a 12-byte nonce followed by the 32-byte PSK sealed with its 16-byte GCM tag, and both the `X-Plexsphere-PSK-KID` and `X-Plexsphere-PSK-Epoch` headers. The store opens the envelope with AES-256-GCM under the 32-byte NSK and this additional authenticated data:
+
+```
+plexsphere/mesh/edge-psk/v1|<self node id>|<peer node id>|<epoch>
+```
+
+Both node IDs are trimmed and lowercased, and the epoch is the header's value verbatim. The prefix must stay byte-identical to the control plane's constant. Binding the two IDs keeps another edge's envelope, or a secret envelope sealed with no additional data, from opening as this edge's PSK. Binding the epoch makes the epoch header a trustworthy statement of the envelope's age. The KID must be present, but the store does not use it: plexd holds one NSK.
+
+Every cipher or tag failure returns `wireguard: open edge psk: authentication failed`, with no detail. The other errors are `wireguard: open edge psk: nsk must be 32 bytes` and `wireguard: open edge psk: plaintext is <n> bytes, want 32`. The store logs any of them as `wireguard: edge psk: open failed` and installs nothing.
+
+### Epoch floor
+
+The store keeps the highest epoch it accepted for each peer. An envelope whose epoch sorts below it is refused before it is opened, logged as `wireguard: edge psk: refusing an envelope older than the epoch in force`, and installs nothing. An equal epoch is accepted. The comparison is a plain string compare, because the epoch is fixed-width UTC, so byte order is chronological order.
+
+The floor survives a change of the peer's public key, so an envelope from before the peer's rotation is refused as well. It is dropped when the peer leaves the pull. Floors and PSKs live in memory only: a restarted plexd fetches every PSK again, with no floor.
+
+### Installing a PSK
+
+`Manager.SetPeerPSK(peerNodeID, publicKey, psk)` writes the PSK to the device:
+
+- With no [programmed peer](#programmed-peers) for the node ID, or one programmed with another public key, it writes nothing and returns nil. The PSK belongs to a different device peer, and the reconcile handler takes it from the store through `Lookup` when it next adds or updates the peer with that key.
+- Otherwise it rewrites the programmed peer with its allowed IPs, which every device write replaces, the PSK, and an empty endpoint, which leaves the device's endpoint as it is. It then records the PSK on the programmed peer.
+- A device error returns `wireguard: set peer psk: <cause>`. The store logs `wireguard: edge psk: install failed`, and the next pull retries the install without fetching again.
+
+### Edge PSK log lines
+
+| Level   | Message | Keys |
+|---------|---------|------|
+| `Info`  | `wireguard: edge psk fetched` | `peer_id`, `epoch` |
+| `Info`  | `wireguard: edge psk: control plane does not serve edge psks, retrying on later pulls` | `status`, `code` |
+| `Info`  | `wireguard: edge psk: control plane serves edge psks` | none |
+| `Warn`  | `wireguard: edge psk: rate limited, pausing fetches` | `retry_after` |
+| `Error` | `wireguard: edge psk: control plane refused this node, stopping edge psk fetches` | `code` |
+| `Debug` | `wireguard: edge psk: not ready, retrying on the next pull` | `peer_id`, `code` |
+| `Warn`  | `wireguard: edge psk: control plane unreachable, retrying on the next pull` | `peer_id`, `error` |
+| `Warn`  | `wireguard: edge psk: fetch failed` | `peer_id`, `error` |
+| `Warn`  | `wireguard: edge psk: refusing an envelope older than the epoch in force` | `peer_id` |
+| `Warn`  | `wireguard: edge psk: open failed` | `peer_id`, `error` |
+| `Warn`  | `wireguard: edge psk: install failed` | `peer_id`, `error` |
+
+The not-served line is logged when the store enters that state, not on every pull, and the serves line on the first success after it. No log line or error carries a key, an envelope or the NSK.
+
+### Turning edge PSKs off
+
+`wireguard.edge_psk` (`Config.EdgePSK`) defaults to true; see [Configuration Reference](../core/configuration.md#wireguard). WireGuard needs the same PSK on both ends of a tunnel, and the [NAT relay](../bridge/nat-relay.md#data-flow) forwards the WireGuard packets end to end. An edge between a plexd that installs edge PSKs and an older plexd therefore fails, direct and relayed, until both ends match.
+
+During a rolling upgrade, set `edge_psk: false` on the upgraded nodes, and turn it back on once every node of the Domain runs a plexd that installs edge PSKs. With the setting false and the interface up, `plexd up` logs `edge psk disabled by wireguard.edge_psk` at `info`, builds no store, registers no dispatch handler, passes a nil lookup to `ReconcileHandler`, and gives the key rotator the reconciler itself as its trigger. `plexd up` reads the setting once, when it starts.
 
 ## Integration Points
 
@@ -415,6 +584,20 @@ The reconcile handler ensures WireGuard state converges to desired state even af
 Peer topology events trigger a reconcile for a prompt convergence; the reconcile
 loop also catches any missed changes on its next cycle. The snapshot pull, not the
 event payload, is authoritative.
+
+The pull is the only source of a peer's direct endpoint. `peer_endpoint_changed`
+only moves the next pull forward, and that pull carries the new endpoint. With edge
+PSKs on, `peer_psk_assigned` moves the store's next sync forward the same way. That
+sync fetches every PSK still due under the [fetch rule](#fetch-rule), such as one
+the control plane answered with `409 psk_not_ready`, and sends no request for a PSK
+the store holds as current.
+
+### Node API peer list
+
+`GET /v1/peers` on the node API, and with it [`plexd peers`](../core/cli.md#plexd-peers),
+reports for each peer the endpoint plexd programs, direct or fallback. The agent's
+peer snapshot calls `ProgrammedEndpoint` with `MeshPrefix()` when the WireGuard
+interface came up, and with the zero prefix otherwise.
 
 ### Graceful Shutdown
 

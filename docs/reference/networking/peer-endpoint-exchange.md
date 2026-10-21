@@ -6,9 +6,9 @@ feature: PXD-0007
 
 # Peer Endpoint Exchange
 
-The `internal/peerexchange` package orchestrates the exchange of discovered public endpoints between mesh peers. It wires together STUN-based NAT discovery (`internal/nat`), control plane endpoint reporting (`internal/api`), and WireGuard peer configuration (`internal/wireguard`) into a single lifecycle component.
+The `internal/peerexchange` package orchestrates the exchange of discovered public endpoints between mesh peers. It wires together STUN-based NAT discovery (`internal/nat`) and control plane endpoint reporting (`internal/api`) into a single lifecycle component.
 
-The Exchanger is a thin orchestration layer. It delegates STUN discovery and the refresh loop to `nat.Discoverer.Run`, SSE event handling to `wireguard.HandlePeerEndpointChanged`, and endpoint reporting to `api.ControlPlane.ReportEndpoint`. No discovery, reporting, or WireGuard logic is duplicated.
+The Exchanger is a thin orchestration layer. It delegates STUN discovery and the refresh loop to `nat.Discoverer.Run` and endpoint reporting to `api.ControlPlane.ReportEndpoint`. No discovery or reporting logic is duplicated. The Exchanger covers the outbound half only: the endpoints of other peers reach this node on the reconciliation state pull, not through the Exchanger (see [Data Flow](#data-flow)).
 
 ## Config
 
@@ -38,7 +38,7 @@ cfg.ApplyDefaults()
 cfg.Enabled = false
 ```
 
-When disabled, `Run` returns nil immediately. SSE handlers for inbound peer endpoint updates are still registered, so the node receives updates from peers that do use STUN.
+When disabled, `Run` returns nil immediately. The node still receives the endpoints of peers that do use STUN, because those arrive on the reconciliation state pull.
 
 ## Exchanger
 
@@ -49,7 +49,6 @@ Central component managing the endpoint exchange lifecycle.
 ```go
 func NewExchanger(
     discoverer *nat.Discoverer,
-    wgManager  *wireguard.Manager,
     cpClient   *api.ControlPlane,
     cfg        Config,
     logger     *slog.Logger,
@@ -59,7 +58,6 @@ func NewExchanger(
 | Parameter    | Description                                       |
 |--------------|---------------------------------------------------|
 | `discoverer` | NAT discoverer (advertises the WireGuard listen port in reported endpoints) |
-| `wgManager`  | WireGuard manager (applies inbound `peer_endpoint_changed` SSE updates) |
 | `cpClient`   | Control plane client (wrapped as `nat.EndpointReporter`) |
 | `cfg`        | Endpoint exchange configuration                   |
 | `logger`     | Structured logger (`log/slog`)                    |
@@ -70,7 +68,6 @@ func NewExchanger(
 
 | Method             | Signature                                          | Description                                                        |
 |--------------------|----------------------------------------------------|--------------------------------------------------------------------|
-| `RegisterHandlers` | `(sseManager *api.SSEManager)`                     | Registers `peer_endpoint_changed` SSE handler                      |
 | `Run`              | `(ctx context.Context, nodeID string) error`       | Starts discovery + reporting loop (blocks until context cancelled)  |
 | `LastResult`       | `() *nat.DiscoveryResult`                          | Most recent NAT info (thread-safe, nil before first discovery)     |
 
@@ -80,27 +77,17 @@ func NewExchanger(
 // 1. Create dependencies
 stunClient := &nat.UDPSTUNClient{Timeout: natCfg.Timeout}
 discoverer := nat.NewDiscoverer(stunClient, natCfg, wgCfg.ListenPort, logger)
-wgManager  := wireguard.NewManager(ctrl, wgCfg, logger)
 cpClient, _ := api.NewControlPlane(apiCfg, version, logger)
 
 // 2. Create exchanger
 cfg := peerexchange.Config{}
 cfg.Config = natCfg
-exchanger := peerexchange.NewExchanger(discoverer, wgManager, cpClient, cfg, logger)
+exchanger := peerexchange.NewExchanger(discoverer, cpClient, cfg, logger)
 
-// 3. Register SSE handlers (before SSEManager.Start)
-exchanger.RegisterHandlers(sseManager)
-
-// 4. Run exchange loop (blocks until ctx done)
+// 3. Run exchange loop (blocks until ctx done)
 err := exchanger.Run(ctx, nodeID)
 // returns ctx.Err() on cancellation
 ```
-
-### RegisterHandlers
-
-Registers `wireguard.HandlePeerEndpointChanged` for `peer_endpoint_changed` SSE events on the provided `SSEManager`. Must be called before `SSEManager.Start`.
-
-Handlers are registered regardless of the `Enabled` flag. When NAT is disabled, the node still receives inbound endpoint updates from peers that use STUN.
 
 ### Run
 
@@ -164,17 +151,19 @@ The adapter is created inside `Run` with the `cpClient` from the Exchanger. The 
   │ STUN Servers│
   └─────────────┘
 
-  Inbound (SSE events)
-  ┌──────────────┐  peer_endpoint_    ┌──────────────┐  UpdatePeer  ┌─────────────────┐
-  │ Control Plane│  changed (SSE)     │ SSEManager   │─────────────▶│ WireGuard       │
-  │ (api pkg)    │───────────────────▶│ (api pkg)    │              │ Manager         │
-  └──────────────┘                    └──────────────┘              │ (wireguard pkg) │
-                                                                    └─────────────────┘
+  Inbound (reconciliation state pull)
+  ┌──────────────┐  GET /v1/nodes/{id}/state  ┌──────────────┐  AddPeer,    ┌─────────────────┐
+  │ Control Plane│───────────────────────────▶│ Reconciler   │  UpdatePeer  │ WireGuard       │
+  │ (api pkg)    │  peers[].endpoint          │ (reconcile)  │─────────────▶│ Manager         │
+  └──────┬───────┘                            └──────▲───────┘              │ (wireguard pkg) │
+         │ peer_endpoint_changed (SSE)               │                      └─────────────────┘
+         └───────────────────────────────────────────┘
+           triggers a reconcile; the payload is never decoded
 ```
 
 **Outbound path** (report loop): STUN discovery produces the node's public endpoint. The Exchanger reports it to the control plane via `controlPlaneReporter` and receives a `stale_after` freshness deadline that schedules the next report. The response no longer carries peer endpoints.
 
-**Inbound path** (SSE): When a remote peer discovers a new endpoint, the control plane pushes a `peer_endpoint_changed` SSE event. The registered `wireguard.HandlePeerEndpointChanged` handler updates WireGuard immediately, without waiting for the next report cycle. Once issue #20 lands, the reconciliation state pull carries peer endpoints too.
+**Inbound path** (state pull): The endpoint a remote peer reports reaches this node as the `endpoint` member of that peer in `GET /v1/nodes/{node_id}/state`. The member is absent while the peer has no fresh observation. When a peer reports a new endpoint, the control plane pushes a `peer_endpoint_changed` SSE event. `plexd up` registers the event as a reconcile trigger and never decodes its payload, so the new endpoint arrives on the pull the event brings forward. The WireGuard reconcile handler then programs the peer's direct endpoint when it is usable and its `fallback_endpoint` otherwise (see [WireGuard](wireguard.md#reconcilehandler)).
 
 ## Integration Points
 
@@ -187,14 +176,13 @@ The adapter is created inside `Run` with the `cpClient` from the Exchanger. The 
 
 ### With internal/wireguard
 
-- `wireguard.Manager` applies inbound peer endpoint updates driven by the SSE handler
-- `wireguard.HandlePeerEndpointChanged` provides the SSE event handler
+The Exchanger does not program WireGuard. Inbound peer endpoints reach the device through `wireguard.ReconcileHandler`, which the reconciler runs when a state pull shows drift (a changed `endpoint` counts as a peer update), and `wireguard.ProgrammedEndpoint` picks the direct endpoint or the relay fallback.
 
 ### With internal/api
 
 - `api.ControlPlane.ReportEndpoint` reports endpoints (wrapped by adapter)
-- `api.SSEManager.RegisterHandler` registers the SSE handler
-- `api.EventPeerEndpointChanged` is the event type constant
+- `api.SnapshotPeer.Endpoint` carries a peer's direct endpoint on the state pull
+- `api.EventPeerEndpointChanged` is the event type `plexd up` registers as a reconcile trigger; the Exchanger registers no SSE handler
 
 ## Error Handling
 
@@ -214,6 +202,5 @@ All log entries use `component=exchange`.
 |---------|---------------------------------------|-----------------------------|
 | `Info`  | Starting endpoint exchange            | `node_id`                   |
 | `Info`  | NAT traversal disabled                | (none)                      |
-| `Debug` | SSE handler registered                | (none)                      |
 
 Discovery and reporting logs use `component=nat` (from the `nat` package). See [NAT Traversal](nat-traversal.md) for those log entries.
