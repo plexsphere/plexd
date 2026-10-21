@@ -19,10 +19,12 @@ import (
 )
 
 // Compile-time checks that DarwinController is a controller the manager can
-// drive and that the readiness check can resolve a kernel name through.
+// drive, that the readiness check can resolve a kernel name through, and that
+// the handshake report and tunnel metrics can read peer state from.
 var (
 	_ WGController     = (*DarwinController)(nil)
 	_ OSInterfaceNamer = (*DarwinController)(nil)
+	_ PeerStatsReader  = (*DarwinController)(nil)
 )
 
 // namedTUN is a trackedTUN that reports a fixed name, standing in for the
@@ -682,6 +684,12 @@ func TestDarwinController_PeerOperationsDelegate(t *testing.T) {
 		t.Fatalf("uapi dump = %q, want the peer", dump)
 	}
 
+	stats, err := c.PeerStats("plexd0")
+	if err != nil {
+		t.Fatalf("PeerStats: %v", err)
+	}
+	assertPeerStats(t, stats, []PeerStat{{PublicKey: peerKey.PublicKey()}})
+
 	rotated := mustKey(t)
 	before := privateKeyHex(ipcGet(t, c.backend, "plexd0"))
 	if err := c.SetPrivateKey("plexd0", rotated[:]); err != nil {
@@ -711,6 +719,9 @@ func TestDarwinController_PeerOperations_Unknown(t *testing.T) {
 	}
 	if err := c.SetPrivateKey("plexd0", key[:]); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("SetPrivateKey = %v, want os.ErrNotExist", err)
+	}
+	if _, err := c.PeerStats("plexd0"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("PeerStats = %v, want os.ErrNotExist", err)
 	}
 }
 

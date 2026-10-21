@@ -416,6 +416,11 @@ func (c *WindowsController) RemovePeer(iface string, publicKey []byte) error {
 	return c.backend.RemovePeer(iface, publicKey)
 }
 
+// PeerStats reads every peer's runtime state from the interface.
+func (c *WindowsController) PeerStats(name string) ([]PeerStat, error) {
+	return c.backend.PeerStats(name)
+}
+
 // SetPrivateKey replaces the interface's private key without touching its
 // listen port or peers.
 func (c *WindowsController) SetPrivateKey(name string, privateKey []byte) error {

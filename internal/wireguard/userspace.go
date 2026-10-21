@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
@@ -246,6 +249,24 @@ func (b *UserspaceBackend) RemovePeer(name string, publicKey []byte) error {
 	return nil
 }
 
+// PeerStats reads every peer's runtime state from the named device through
+// the same in-process UAPI that configures it, so it needs no privilege and
+// no served socket. A device that does not exist returns an error wrapping
+// os.ErrNotExist.
+func (b *UserspaceBackend) PeerStats(name string) ([]PeerStat, error) {
+	dev, err := b.device(name)
+	if err != nil {
+		return nil, fmt.Errorf("wireguard: peer stats: %w", err)
+	}
+
+	dump, err := dev.IpcGet()
+	if err != nil {
+		return nil, fmt.Errorf("wireguard: peer stats: read device: %w", err)
+	}
+
+	return parseUAPIPeerStats(dump)
+}
+
 // device returns the running device for name, or os.ErrNotExist. The returned
 // error is unwrapped so callers add their own operation prefix.
 func (b *UserspaceBackend) device(name string) (*device.Device, error) {
@@ -299,6 +320,102 @@ func peerUAPI(cfg PeerConfig) (string, error) {
 	}
 
 	return b.String(), nil
+}
+
+// parseUAPIPeerStats reads the peers out of a UAPI get dump, the text
+// device.IpcGet returns: device keys first, then for each peer a public_key
+// line followed by that peer's keys. A public_key line starts a new peer;
+// endpoint, last_handshake_time_sec and _nsec, rx_bytes and tx_bytes fill it.
+// Empty lines and every other key are skipped.
+//
+// A handshake time of sec 0 and nsec 0 is the zero time.Time, and any other
+// pair is time.Unix(sec, nsec). wgctrl's own UAPI parser requires both to be
+// positive, which drops a handshake that lands on a whole second.
+//
+// DECISION: no error quotes a line or a value of a skipped key. The dump
+// carries the device's private_key and every peer's preshared_key, and an
+// error here ends up in the agent's log, so an error names only a line number
+// or one of the parsed keys. Values of the parsed keys are not secret, so the
+// parse errors wrapped for them may echo the value.
+func parseUAPIPeerStats(dump string) ([]PeerStat, error) {
+	stats := []PeerStat{}
+
+	var (
+		cur       *PeerStat
+		sec, nsec int64
+	)
+	// finish completes the peer being read, which needs both handshake time
+	// lines, and appends it.
+	finish := func() {
+		if cur == nil {
+			return
+		}
+		if sec != 0 || nsec != 0 {
+			cur.LastHandshake = time.Unix(sec, nsec)
+		}
+		stats = append(stats, *cur)
+	}
+
+	for i, line := range strings.Split(dump, "\n") {
+		if line == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("wireguard: peer stats: line %d has no '='", i+1)
+		}
+
+		switch key {
+		case "public_key":
+			pub, err := parseHexKey(value)
+			if err != nil {
+				return nil, fmt.Errorf("wireguard: peer stats: parse %s: %w", key, err)
+			}
+			finish()
+			cur = &PeerStat{PublicKey: pub}
+			sec, nsec = 0, 0
+			continue
+		case "endpoint", "last_handshake_time_sec", "last_handshake_time_nsec", "rx_bytes", "tx_bytes":
+			// A peer key belongs to the peer its public_key line opened.
+			if cur == nil {
+				return nil, fmt.Errorf("wireguard: peer stats: %s before public_key", key)
+			}
+		default:
+			continue
+		}
+
+		var err error
+		switch key {
+		case "endpoint":
+			cur.Endpoint, err = netip.ParseAddrPort(value)
+		case "last_handshake_time_sec":
+			sec, err = strconv.ParseInt(value, 10, 64)
+		case "last_handshake_time_nsec":
+			nsec, err = strconv.ParseInt(value, 10, 64)
+		case "rx_bytes":
+			cur.RxBytes, err = strconv.ParseUint(value, 10, 64)
+		case "tx_bytes":
+			cur.TxBytes, err = strconv.ParseUint(value, 10, 64)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("wireguard: peer stats: parse %s: %w", key, err)
+		}
+	}
+	finish()
+
+	return stats, nil
+}
+
+// parseHexKey decodes a UAPI key, which is exactly 64 hex characters.
+func parseHexKey(s string) ([32]byte, error) {
+	var key [32]byte
+	if want := hex.EncodedLen(len(key)); len(s) != want {
+		return key, fmt.Errorf("%d hex characters, want %d", len(s), want)
+	}
+	if _, err := hex.Decode(key[:], []byte(s)); err != nil {
+		return key, err
+	}
+	return key, nil
 }
 
 // hexKey renders a wgtypes.Key as the lowercase hex the UAPI protocol expects.

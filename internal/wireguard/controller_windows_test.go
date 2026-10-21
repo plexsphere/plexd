@@ -18,11 +18,15 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-// Compile-time check that WindowsController is a controller the manager can
-// drive. It deliberately does not implement OSInterfaceNamer: the Wintun
+// Compile-time checks that WindowsController is a controller the manager can
+// drive and that the handshake report and tunnel metrics can read peer state
+// from. It deliberately does not implement OSInterfaceNamer: the Wintun
 // adapter carries the configured name, which TestWindowsController_
 // NoOSInterfaceNamer pins.
-var _ WGController = (*WindowsController)(nil)
+var (
+	_ WGController    = (*WindowsController)(nil)
+	_ PeerStatsReader = (*WindowsController)(nil)
+)
 
 // winTUN is a trackedTUN that also answers the two methods the controller needs
 // from a Wintun device, recording what MTU the running device was told.
@@ -687,6 +691,12 @@ func TestWindowsController_PeerOperationsDelegate(t *testing.T) {
 		t.Errorf("uapi dump = %q, want the peer present", dump)
 	}
 
+	stats, err := c.PeerStats("plexd0")
+	if err != nil {
+		t.Fatalf("PeerStats: %v", err)
+	}
+	assertPeerStats(t, stats, []PeerStat{{PublicKey: peerKey.PublicKey()}})
+
 	before := privateKeyHex(ipcGet(t, c.backend, "plexd0"))
 	newKey := mustKey(t)
 	if err := c.SetPrivateKey("plexd0", newKey[:]); err != nil {
@@ -716,6 +726,9 @@ func TestWindowsController_PeerOperations_Unknown(t *testing.T) {
 	}
 	if err := c.SetPrivateKey("plexd0", key[:]); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("SetPrivateKey = %v, want os.ErrNotExist", err)
+	}
+	if _, err := c.PeerStats("plexd0"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("PeerStats = %v, want os.ErrNotExist", err)
 	}
 }
 

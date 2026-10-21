@@ -277,3 +277,42 @@ func (c *NetlinkController) RemovePeer(iface string, publicKey []byte) error {
 
 	return nil
 }
+
+// PeerStats reads every peer's runtime state from the named interface. Like
+// AddPeer it opens a wgctrl client per call; the handshake reporter and the
+// tunnel collector each call it once per interval, so a long-lived netlink
+// socket would buy nothing. A missing interface returns an error wrapping
+// os.ErrNotExist, which wgctrl maps from ENODEV.
+//
+// wgctrl already gives a zero LastHandshakeTime for a peer that never
+// completed a handshake, so it passes through unchanged.
+func (c *NetlinkController) PeerStats(name string) ([]PeerStat, error) {
+	client, err := wgctrl.New()
+	if err != nil {
+		return nil, fmt.Errorf("wireguard: peer stats: open wgctrl: %w", err)
+	}
+	defer client.Close()
+
+	dev, err := client.Device(name)
+	if err != nil {
+		return nil, fmt.Errorf("wireguard: peer stats: read device: %w", err)
+	}
+
+	stats := make([]PeerStat, 0, len(dev.Peers))
+	for _, p := range dev.Peers {
+		stat := PeerStat{
+			PublicKey:     p.PublicKey,
+			LastHandshake: p.LastHandshakeTime,
+			RxBytes:       uint64(p.ReceiveBytes),
+			TxBytes:       uint64(p.TransmitBytes),
+		}
+		// A peer the kernel knows no endpoint for has a nil Endpoint; its
+		// PeerStat keeps the invalid zero AddrPort.
+		if p.Endpoint != nil {
+			stat.Endpoint = p.Endpoint.AddrPort()
+		}
+		stats = append(stats, stat)
+	}
+
+	return stats, nil
+}
