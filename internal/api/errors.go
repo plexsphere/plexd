@@ -149,6 +149,31 @@ func IsHandshakeReportNotServed(err error) bool {
 	}
 }
 
+// IsEdgePSKNotServed reports whether err says the control plane does not serve
+// GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk: a 404 with any code but
+// peer_not_found, or a 501 carrying the psk_delivery_not_provisioned problem
+// code.
+//
+// A control plane older than the operation has no route for it, and its router
+// answers 404 with whatever its not-found handler writes, so no code can be
+// required of it. The operation's own 404 is peer_not_found: the peer has not
+// landed in the Domain yet, the post-registration lag the contract asks the
+// agent to retry on its next reconcile, so it is not a missing surface.
+func IsEdgePSKNotServed(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.StatusCode {
+	case http.StatusNotFound:
+		return apiErr.Code != "peer_not_found"
+	case http.StatusNotImplemented:
+		return apiErr.Code == "psk_delivery_not_provisioned"
+	default:
+		return false
+	}
+}
+
 // IsSessionRevokedOrExpired reports whether err is the control plane's verdict
 // that the session a session activity callback names has reached a terminal
 // state: a 409 carrying session_already_revoked or session_expired. Like the

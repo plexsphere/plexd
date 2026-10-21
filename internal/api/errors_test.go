@@ -701,6 +701,35 @@ func TestIsHandshakeReportNotServed(t *testing.T) {
 	}
 }
 
+func TestIsEdgePSKNotServed(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// An older control plane has no route, so its router's 404 carries
+		// whatever code its not-found handler writes, or none.
+		{"404 without a code", &APIError{StatusCode: 404}, true},
+		{"404 with a router code", &APIError{StatusCode: 404, Code: "not_found"}, true},
+		{"wrapped 404", fmt.Errorf("fetch edge psk: %w", &APIError{StatusCode: 404}), true},
+		{"501 with the provisioning code", &APIError{StatusCode: 501, Code: "psk_delivery_not_provisioned"}, true},
+		{"404 peer_not_found is the post-registration lag", &APIError{StatusCode: 404, Code: "peer_not_found"}, false},
+		{"409 psk_not_ready", &APIError{StatusCode: 409, Code: "psk_not_ready"}, false},
+		{"429 rate limited", &APIError{StatusCode: 429, Code: "per_node_rate_limited"}, false},
+		{"403 node deregistered", &APIError{StatusCode: 403, Code: "node_deregistered"}, false},
+		{"501 with another surface's code", &APIError{StatusCode: 501, Code: "handshakes_not_provisioned"}, false},
+		{"non-API error", errors.New("dial tcp: timeout"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsEdgePSKNotServed(tt.err); got != tt.want {
+				t.Errorf("IsEdgePSKNotServed(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestErrHandshakeReportTooMany(t *testing.T) {
 	const want = "handshake report exceeds 4096 peers"
 	if got := ErrHandshakeReportTooMany.Error(); got != want {

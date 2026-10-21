@@ -232,6 +232,26 @@ type SecretEnvelope struct {
 }
 
 // ---------------------------------------------------------------------------
+// Edge PSK  GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk
+// ---------------------------------------------------------------------------
+
+// EdgePSKEnvelopeSize is the exact length of an edge-PSK envelope: the 12-byte
+// AES-256-GCM nonce, the 32-byte PSK and the 16-byte GCM tag.
+const EdgePSKEnvelopeSize = 60
+
+// EdgePSKEnvelope is the pairwise WireGuard PSK for one edge as GET
+// /v1/nodes/{id}/peers/{peer_node_id}/psk serves it, sealed under the calling
+// node's NSK: Data is <12-byte nonce> || <32-byte PSK + 16-byte GCM tag>, KID
+// and Epoch come from the X-Plexsphere-PSK-KID and X-Plexsphere-PSK-Epoch
+// headers. Epoch is part of the envelope's additional authenticated data and
+// is used verbatim to open it. Data is key material and is never logged.
+type EdgePSKEnvelope struct {
+	Data  []byte
+	KID   string
+	Epoch string
+}
+
+// ---------------------------------------------------------------------------
 // Reports  PUT/DELETE /v1/nodes/{node_id}/state/reports/{key}
 // ---------------------------------------------------------------------------
 
