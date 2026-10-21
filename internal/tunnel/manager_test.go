@@ -408,6 +408,9 @@ func TestSessionManager_CloseSessionReturnsMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession() error: %v", err)
 	}
+	// CreateSession stamped the session's start; a close inside the same
+	// Windows clock tick would measure exactly 0s.
+	settleClockPast(t, time.Since(processStart))
 
 	info := mgr.CloseSession("meta1", "test")
 	if info == nil {
