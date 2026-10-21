@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"regexp"
@@ -256,6 +257,24 @@ func runAgent(ctx context.Context) error {
 		}
 	}
 
+	// 5a-1. Edge PSKs. With the interface up, plexd fetches each edge's PSK and
+	// programs it on the peer, unless wireguard.edge_psk turns that off for a
+	// rolling upgrade: WireGuard needs the same PSK on both ends of a tunnel, so
+	// an edge to a node that installs none fails until both ends match.
+	var edgePSKs *wireguard.EdgePSKs
+	if wgReady {
+		if cfg.WireGuard.EdgePSKEnabled() {
+			if nsk, err := identity.SecretKey(); err != nil {
+				logger.Warn("edge psk disabled, the node secret key does not decode", "error", err)
+			} else {
+				edgePSKs = wireguard.NewEdgePSKs(client, identity.NodeID, nsk, wgMgr, logger)
+				clear(nsk)
+			}
+		} else {
+			logger.Info("edge psk disabled by wireguard.edge_psk")
+		}
+	}
+
 	// 5b. Initialize NAT traversal and peer exchange.
 	stunClient := &nat.UDPSTUNClient{Timeout: cfg.NAT.Timeout}
 	natDiscoverer := nat.NewDiscoverer(stunClient, cfg.NAT, cfg.WireGuard.ListenPort, logger)
@@ -491,7 +510,13 @@ func runAgent(ctx context.Context) error {
 	if wgReady {
 		device = wgMgr
 	}
-	rotator := agent.NewKeyRotator(client, identity, cfg.DataDir, device, reconciler, logger)
+	// A completed rotation is the contract's third re-fetch trigger for edge
+	// PSKs, so the rotator's reconcile trigger marks them stale first.
+	var rotationTrigger agent.ReconcileTrigger = reconciler
+	if edgePSKs != nil {
+		rotationTrigger = rotationReconcileTrigger{rt: reconciler, psks: edgePSKs}
+	}
+	rotator := agent.NewKeyRotator(client, identity, cfg.DataDir, device, rotationTrigger, logger)
 
 	// Register rotate_keys SSE handler (starts a single-flight key rotation;
 	// the rotator triggers the reconcile itself after the swap). Unlike the
@@ -701,6 +726,9 @@ func runAgent(ctx context.Context) error {
 
 	// Set up peer and policy snapshot providers for the node API.
 	peerSnap := &peerSnapshot{}
+	if wgReady {
+		peerSnap.mesh = wgMgr.MeshPrefix()
+	}
 	policySnap := &policySnapshot{}
 	nodeAPISrv.SetPeerProvider(peerSnap)
 	nodeAPISrv.SetPolicyProvider(policySnap)
@@ -747,6 +775,15 @@ func runAgent(ctx context.Context) error {
 	// while its state pulls keep succeeding has no other way to learn that.
 	reconciler.RegisterDispatchHandler(reconcile.NewReachabilityObserver(logger).Handle)
 
+	// Edge PSKs are fetched on every successful pull, drift or not: a failed
+	// fetch must retry without failing the WireGuard reconcile handler, which
+	// would hold the snapshot back on every control plane that does not serve
+	// the operation. Dispatch handlers run before the reconcile handlers, so a
+	// new peer's PSK is in the store when the WireGuard handler adds the peer.
+	if edgePSKs != nil {
+		reconciler.RegisterDispatchHandler(wireguard.EdgePSKDispatchHandler(edgePSKs))
+	}
+
 	// Register the WireGuard reconcile handler only when the interface came up.
 	// A handler that fails every cycle would hold back the reconciler snapshot,
 	// so the fingerprint short-circuit could never converge on such hosts. The
@@ -754,7 +791,13 @@ func runAgent(ctx context.Context) error {
 	// same device and are skipped on the same condition, so this one line
 	// accounts for all three.
 	if wgReady {
-		reconciler.RegisterHandler(wireguard.ReconcileHandler(wgMgr, nil))
+		// The typed lookup keeps the interface a true nil when edge PSKs are
+		// off, as the rotator's device variable does.
+		var psksLookup wireguard.EdgePSKLookup
+		if edgePSKs != nil {
+			psksLookup = edgePSKs
+		}
+		reconciler.RegisterHandler(wireguard.ReconcileHandler(wgMgr, psksLookup))
 	} else {
 		logger.Warn("wireguard unavailable, skipping peer reconcile handler, handshake reports and tunnel metrics")
 	}
@@ -1248,6 +1291,9 @@ func (a *agentLogProvider) RecentLines(n int) []string {
 type peerSnapshot struct {
 	mu    sync.RWMutex
 	peers []nodeapi.PeerStatus
+	// mesh is the Domain mesh prefix endpoint selection checks direct
+	// endpoints against, so each peer reports the endpoint plexd programs.
+	mesh netip.Prefix
 }
 
 func (ps *peerSnapshot) PeerStatuses() []nodeapi.PeerStatus {
@@ -1263,12 +1309,26 @@ func (ps *peerSnapshot) update(apiPeers []api.SnapshotPeer) {
 			ID:        p.NodeID,
 			PublicKey: p.PublicKey,
 			MeshIP:    p.MeshIP,
-			Endpoint:  p.FallbackEndpoint,
 		}
+		statuses[i].Endpoint, _ = wireguard.ProgrammedEndpoint(p, ps.mesh)
 	}
 	ps.mu.Lock()
 	ps.peers = statuses
 	ps.mu.Unlock()
+}
+
+// rotationReconcileTrigger is the reconcile trigger the key rotator fires once a
+// rotation committed. It marks every edge PSK stale before it triggers the
+// reconcile, so the pull that follows fetches each peer's PSK again: this node's
+// rotation reissues its half of every edge key.
+type rotationReconcileTrigger struct {
+	rt   agent.ReconcileTrigger
+	psks *wireguard.EdgePSKs
+}
+
+func (t rotationReconcileTrigger) TriggerReconcile() {
+	t.psks.InvalidateAll()
+	t.rt.TriggerReconcile()
 }
 
 // policySnapshot implements nodeapi.PolicyProvider with a thread-safe cached
