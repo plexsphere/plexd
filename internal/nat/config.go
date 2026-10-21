@@ -3,6 +3,7 @@ package nat
 
 import (
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -46,6 +47,28 @@ type Config struct {
 	// the loop. Must be positive.
 	// Default: 10s (set by ApplyDefaults).
 	MinReportInterval time.Duration `yaml:"min_report_interval"`
+
+	// LocalCandidates controls whether the node publishes its local interface
+	// addresses as endpoint candidates. A pointer, so an unset key stays
+	// distinguishable from an explicit false: publishing is the default, and
+	// `local_candidates: false` must survive ApplyDefaults exactly as written
+	// rather than be decided by its zero-value heuristic. It is independent of
+	// Enabled, because a node whose STUN servers are unreachable still has LAN
+	// addresses a peer can dial.
+	// Default: true (nil reads as enabled).
+	LocalCandidates *bool `yaml:"local_candidates"`
+
+	// CandidateInterfaces restricts the published candidates to the named
+	// interfaces. Empty publishes every eligible interface. A named interface
+	// is published even when its name marks it as virtual (docker0, br-...),
+	// because naming it is the operator's choice.
+	CandidateInterfaces []string `yaml:"candidate_interfaces"`
+}
+
+// LocalCandidatesEnabled returns the effective LocalCandidates setting: true
+// unless explicitly set to false.
+func (c *Config) LocalCandidatesEnabled() bool {
+	return c.LocalCandidates == nil || *c.LocalCandidates
 }
 
 // ApplyDefaults sets default values for zero-valued fields.
@@ -73,7 +96,14 @@ func (c *Config) ApplyDefaults() {
 }
 
 // Validate checks that configuration values are within acceptable ranges.
+// CandidateInterfaces is checked before the Enabled early return, because the
+// candidate publisher runs whether or not STUN traversal is enabled.
 func (c *Config) Validate() error {
+	for _, name := range c.CandidateInterfaces {
+		if strings.TrimSpace(name) == "" {
+			return errors.New("nat: config: CandidateInterfaces must not contain an empty name")
+		}
+	}
 	if !c.Enabled {
 		return nil
 	}
