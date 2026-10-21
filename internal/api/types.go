@@ -110,8 +110,8 @@ type SnapshotPeer struct {
 	// Endpoint is the peer's direct WireGuard endpoint as host:port (an IPv6
 	// host in brackets), the address it last reported through PUT
 	// /v1/nodes/{node_id}/endpoint. It is absent while the peer has no fresh
-	// observation. FallbackEndpoint is the relay target programmed instead
-	// when Endpoint is absent or unusable.
+	// observation. FallbackEndpoint is the relay target, the last entry of the
+	// dial order the WireGuard manager tries.
 	Endpoint         string `json:"endpoint,omitempty"`
 	FallbackEndpoint string `json:"fallback_endpoint,omitempty"`
 	// EndpointCandidates are the peer's last accepted, unexpired endpoint
