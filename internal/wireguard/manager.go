@@ -21,6 +21,11 @@ type Manager struct {
 	cfg    Config
 	logger *slog.Logger
 	peers  *PeerIndex
+
+	// meshPrefix is the prefix the interface address carries, masked: the
+	// Domain mesh CIDR, or the mesh IP's host /32 when the identity has no
+	// usable CIDR. It is zero until Setup succeeds.
+	meshPrefix netip.Prefix
 }
 
 // NewManager creates a new Manager. Config defaults are applied automatically.
@@ -40,7 +45,8 @@ func (m *Manager) Setup(ctx context.Context, identity *registration.NodeIdentity
 		return fmt.Errorf("wireguard: setup: %w", err)
 	}
 
-	if err := m.ctrl.ConfigureAddress(m.cfg.InterfaceName, m.interfaceAddress(identity)); err != nil {
+	address := m.interfaceAddress(identity)
+	if err := m.ctrl.ConfigureAddress(m.cfg.InterfaceName, address); err != nil {
 		return fmt.Errorf("wireguard: setup: %w", err)
 	}
 
@@ -52,6 +58,12 @@ func (m *Manager) Setup(ctx context.Context, identity *registration.NodeIdentity
 
 	if err := m.ctrl.SetInterfaceUp(m.cfg.InterfaceName); err != nil {
 		return fmt.Errorf("wireguard: setup: %w", err)
+	}
+
+	// interfaceAddress joins the mesh IP with a prefix length, so the parse
+	// fails only for an unparseable mesh IP, which leaves the prefix zero.
+	if prefix, err := netip.ParsePrefix(address); err == nil {
+		m.meshPrefix = prefix.Masked()
 	}
 
 	m.logger.Info("wireguard interface configured",
@@ -98,6 +110,17 @@ func (m *Manager) interfaceAddress(identity *registration.NodeIdentity) string {
 		return identity.MeshIP + "/32"
 	}
 	return fmt.Sprintf("%s/%d", identity.MeshIP, prefix.Bits())
+}
+
+// MeshPrefix returns the Domain mesh prefix the interface was set up with, or
+// the mesh IP's host /32 when the identity carried no usable domain_mesh_cidr.
+// It is the zero prefix before Setup succeeds.
+//
+// A peer endpoint inside this prefix would be routed through the mesh
+// interface itself, so WireGuard would send a peer's encrypted packets into
+// its own tunnel; endpoint selection refuses such an endpoint.
+func (m *Manager) MeshPrefix() netip.Prefix {
+	return m.meshPrefix
 }
 
 // Teardown deletes the WireGuard interface.

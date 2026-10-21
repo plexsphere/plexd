@@ -128,6 +128,35 @@ func TestManager_Setup_InterfaceAddressPrefix(t *testing.T) {
 	}
 }
 
+func TestManager_MeshPrefix(t *testing.T) {
+	tests := []struct {
+		name           string
+		domainMeshCIDR string
+		want           netip.Prefix
+	}{
+		{"domain mesh cidr", "10.99.0.0/24", netip.MustParsePrefix("10.99.0.0/24")},
+		{"no domain mesh cidr gives the host /32", "", netip.MustParsePrefix("10.99.0.5/32")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr := NewManager(&mockController{}, Config{}, discardLogger())
+			if got := mgr.MeshPrefix(); got.IsValid() {
+				t.Fatalf("MeshPrefix() before Setup = %v, want the zero prefix", got)
+			}
+
+			identity := testIdentity()
+			identity.MeshIP = "10.99.0.5"
+			identity.DomainMeshCIDR = tt.domainMeshCIDR
+			if err := mgr.Setup(context.Background(), identity); err != nil {
+				t.Fatalf("Setup() returned error: %v", err)
+			}
+			if got := mgr.MeshPrefix(); got != tt.want {
+				t.Errorf("MeshPrefix() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestManager_Setup_WithMTU(t *testing.T) {
 	ctrl := &mockController{}
 	mgr := NewManager(ctrl, Config{MTU: 1420}, discardLogger())
