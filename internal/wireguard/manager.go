@@ -228,7 +228,7 @@ func (m *Manager) UpdatePrivateKey(privateKey []byte) error {
 
 // AddPeer adds a peer to the WireGuard interface and updates the peer index.
 func (m *Manager) AddPeer(peer api.Peer) error {
-	peerCfg, err := PeerConfigFromAPI(peer)
+	peerCfg, err := m.peerConfig(peer, peer.Endpoint)
 	if err != nil {
 		return fmt.Errorf("wireguard: add peer: %w", err)
 	}
@@ -289,7 +289,7 @@ func (m *Manager) RemovePeerByID(peerID string) error {
 
 // UpdatePeer updates a peer configuration. WireGuard AddPeer is idempotent (upsert).
 func (m *Manager) UpdatePeer(peer api.Peer) error {
-	peerCfg, err := PeerConfigFromAPI(peer)
+	peerCfg, err := m.peerConfig(peer, peer.Endpoint)
 	if err != nil {
 		return fmt.Errorf("wireguard: update peer: %w", err)
 	}
@@ -323,7 +323,7 @@ func (m *Manager) ConfigurePeers(ctx context.Context, peers []api.Peer) error {
 			return fmt.Errorf("wireguard: configure peers: %w", err)
 		}
 
-		peerCfg, err := PeerConfigFromAPI(peer)
+		peerCfg, err := m.peerConfig(peer, peer.Endpoint)
 		if err != nil {
 			m.logger.Error("failed to convert peer config",
 				"component", "wireguard",
@@ -368,9 +368,7 @@ func (m *Manager) SetPeerPSK(peerNodeID, publicKey string, psk []byte) error {
 	}
 
 	peer.PSK = base64.StdEncoding.EncodeToString(psk)
-	write := peer
-	write.Endpoint = ""
-	peerCfg, err := PeerConfigFromAPI(write)
+	peerCfg, err := m.peerConfig(peer, "")
 	if err != nil {
 		return fmt.Errorf("wireguard: set peer psk: %w", err)
 	}
@@ -384,6 +382,21 @@ func (m *Manager) SetPeerPSK(peerNodeID, publicKey string, psk []byte) error {
 		"peer_id", peerNodeID,
 	)
 	return nil
+}
+
+// peerConfig builds the device write for peer with endpoint as its endpoint
+// and the configured keepalive interval. Every mesh peer write goes through
+// it: both controllers write the interval on every call, so a write that left
+// it out would clear the keepalive. An empty endpoint leaves the device peer's
+// endpoint as it is.
+func (m *Manager) peerConfig(peer api.Peer, endpoint string) (PeerConfig, error) {
+	cfg, err := PeerConfigFromAPI(peer)
+	if err != nil {
+		return PeerConfig{}, err
+	}
+	cfg.Endpoint = endpoint
+	cfg.PersistentKeepalive = int(m.cfg.KeepaliveInterval() / time.Second)
+	return cfg, nil
 }
 
 // PeerIndex returns the peer index.

@@ -315,9 +315,9 @@ func peerUAPI(cfg PeerConfig) (string, error) {
 		fmt.Fprintf(&b, "preshared_key=%s\n", hexKey(psk))
 	}
 
-	if cfg.PersistentKeepalive > 0 {
-		fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", cfg.PersistentKeepalive)
-	}
+	// Always written: an interval of 0 is what clears a keepalive an earlier
+	// write left on the peer, as NetlinkController.AddPeer does.
+	fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", cfg.PersistentKeepalive)
 
 	return b.String(), nil
 }

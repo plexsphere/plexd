@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 type nopWriterLinux struct{}
@@ -136,5 +137,51 @@ func TestSetMTUNonExistent(t *testing.T) {
 	expected := "wireguard: set mtu:"
 	if len(err.Error()) < len(expected) || err.Error()[:len(expected)] != expected {
 		t.Errorf("expected error prefix %q, got %q", expected, err.Error())
+	}
+}
+
+func TestNetlinkPeerConfig_Keepalive(t *testing.T) {
+	key := make([]byte, 32)
+	for _, tt := range []struct {
+		keepalive int
+		want      time.Duration
+	}{
+		{0, 0},
+		{25, 25 * time.Second},
+	} {
+		cfg, err := netlinkPeerConfig(PeerConfig{PublicKey: key, PersistentKeepalive: tt.keepalive})
+		if err != nil {
+			t.Fatalf("netlinkPeerConfig(%d): %v", tt.keepalive, err)
+		}
+		// A nil interval would leave the device's keepalive as it is, so a 0 must
+		// arrive as a pointer to clear one an earlier run programmed.
+		if cfg.PersistentKeepaliveInterval == nil {
+			t.Fatalf("PersistentKeepaliveInterval = nil for %d, want a pointer to %v", tt.keepalive, tt.want)
+		}
+		if got := *cfg.PersistentKeepaliveInterval; got != tt.want {
+			t.Errorf("PersistentKeepaliveInterval = %v for %d, want %v", got, tt.keepalive, tt.want)
+		}
+	}
+}
+
+func TestNetlinkPeerConfig_ParseErrors(t *testing.T) {
+	key := make([]byte, 32)
+	tests := []struct {
+		name string
+		cfg  PeerConfig
+		want string
+	}{
+		{"bad public key", PeerConfig{PublicKey: []byte{1, 2, 3}}, "wireguard: add peer: parse public key:"},
+		{"bad endpoint", PeerConfig{PublicKey: key, Endpoint: "not-an-endpoint"}, "wireguard: add peer: resolve endpoint:"},
+		{"bad allowed IP", PeerConfig{PublicKey: key, AllowedIPs: []string{"10.0.0.2"}}, `wireguard: add peer: parse allowed IP "10.0.0.2":`},
+		{"bad psk", PeerConfig{PublicKey: key, PSK: []byte{1, 2, 3}}, "wireguard: add peer: parse psk:"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := netlinkPeerConfig(tt.cfg)
+			if err == nil || !strings.HasPrefix(err.Error(), tt.want) {
+				t.Errorf("netlinkPeerConfig() error = %v, want prefix %q", err, tt.want)
+			}
+		})
 	}
 }
