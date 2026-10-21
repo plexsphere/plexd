@@ -1339,8 +1339,9 @@ func (a *agentLogProvider) RecentLines(n int) []string {
 type peerSnapshot struct {
 	mu    sync.RWMutex
 	peers []nodeapi.PeerStatus
-	// mesh is the Domain mesh prefix endpoint selection checks direct
-	// endpoints against, so each peer reports the endpoint plexd programs.
+	// mesh is the Domain mesh prefix the dial order checks direct endpoints
+	// against, so each peer reports the endpoint the pull gives it without
+	// its candidates, as wireguard.ProgrammedEndpoint picks it.
 	mesh netip.Prefix
 }
 
