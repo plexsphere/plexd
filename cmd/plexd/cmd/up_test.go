@@ -3,7 +3,10 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -2692,5 +2695,307 @@ func TestControlPlaneSessionReporter_SSHCommandStartedReturnsConflict(t *testing
 	}
 	if !api.IsSessionRevokedOrExpired(err) {
 		t.Errorf("error = %v, want it classified as revoked", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge PSKs and direct endpoints
+// ---------------------------------------------------------------------------
+
+const (
+	upPSKPeerID     = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"
+	upPSKPeerKey    = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+	upPSKPeerDirect = "198.51.100.7:51820"
+	upPSKEpoch      = "2026-01-01T00:00:00.000000000Z|2026-01-01T00:00:01.000000000Z"
+)
+
+// upPSKKey is the edge PSK the PSK control plane serves for upPSKPeerID.
+var upPSKKey = bytes.Repeat([]byte{0x77}, 32)
+
+// sealUpEdgePSK seals key for the edge self→peer the way the control plane
+// does: AES-256-GCM under nsk, with the contract's additional authenticated
+// data spelled out here rather than taken from the wireguard package.
+func sealUpEdgePSK(t *testing.T, nsk, key []byte, self, peer, epoch string) []byte {
+	t.Helper()
+	block, err := aes.NewCipher(nsk)
+	if err != nil {
+		t.Fatalf("aes.NewCipher: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("cipher.NewGCM: %v", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	aad := "plexsphere/mesh/edge-psk/v1|" + self + "|" + peer + "|" + epoch
+	return gcm.Seal(nonce, nonce, key, []byte(aad))
+}
+
+// pskControlPlane registers the node, serves a state pull with one peer that
+// carries a direct endpoint, and serves that peer's edge PSK sealed under the
+// node's NSK. It counts state pulls and PSK requests.
+type pskControlPlane struct {
+	mu          sync.Mutex
+	statePulls  int
+	pskRequests []string
+}
+
+func newPSKControlPlane(t *testing.T) (*pskControlPlane, string) {
+	t.Helper()
+	cp := &pskControlPlane{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/register":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(api.RegisterResponse{
+				NodeID:           upTestNodeID,
+				MeshIP:           "100.64.0.1",
+				SigningPublicKey: upTestSigningKey,
+				SigningKeyID:     upTestSigningKID,
+				NSK:              upTestNSK,
+				DomainMeshCIDR:   "100.64.0.0/10",
+				PeerSnapshot:     []api.RegisterPeer{},
+			})
+			return
+		case strings.HasSuffix(r.URL.Path, "/state"):
+			cp.mu.Lock()
+			cp.statePulls++
+			cp.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(api.NodeStateSnapshot{
+				Peers: []api.SnapshotPeer{{
+					NodeID:           upPSKPeerID,
+					MeshIP:           "100.64.0.2",
+					PublicKey:        upPSKPeerKey,
+					Endpoint:         upPSKPeerDirect,
+					FallbackEndpoint: "203.0.113.1:51820",
+				}},
+			})
+			return
+		case strings.HasSuffix(r.URL.Path, "/psk"):
+			cp.mu.Lock()
+			cp.pskRequests = append(cp.pskRequests, r.URL.Path)
+			cp.mu.Unlock()
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("X-Plexsphere-PSK-KID", "nsk-kid-1")
+			w.Header().Set("X-Plexsphere-PSK-Epoch", upPSKEpoch)
+			w.Header().Set("Cache-Control", "no-store")
+			_, _ = w.Write(sealUpEdgePSK(t, upTestNSKBytes, upPSKKey, upTestNodeID, upPSKPeerID, upPSKEpoch))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(srv.Close)
+	return cp, srv.URL
+}
+
+func (cp *pskControlPlane) counts() (statePulls, pskRequests int) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.statePulls, len(cp.pskRequests)
+}
+
+// recordingWGController is a WGController that brings the interface up and
+// records every peer configuration it is asked to write.
+type recordingWGController struct {
+	statsWGController
+	mu      sync.Mutex
+	written []wireguard.PeerConfig
+}
+
+func (c *recordingWGController) AddPeer(_ string, cfg wireguard.PeerConfig) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.written = append(c.written, cfg)
+	return nil
+}
+
+func (c *recordingWGController) writes() []wireguard.PeerConfig {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]wireguard.PeerConfig(nil), c.written...)
+}
+
+// With the interface up, the first pull's peer is programmed with its direct
+// endpoint and the edge PSK fetched for it: the PSK dispatch handler runs
+// before the WireGuard handler adds the peer.
+func TestRunUp_ProgramsEdgePSKAndDirectEndpoint(t *testing.T) {
+	// Outside a cluster no PlexdHook list runs; an ambient
+	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+	cp, apiBase := newPSKControlPlane(t)
+	ctrl := &recordingWGController{}
+	useWGController(t, ctrl)
+	writeUpConfig(t, apiBase, upDaemonYAML(t))
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if pulls, _ := cp.counts(); pulls > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the daemon never pulled its state")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		var programmed *wireguard.PeerConfig
+		for _, cfg := range ctrl.writes() {
+			if base64.StdEncoding.EncodeToString(cfg.PublicKey) == upPSKPeerKey {
+				programmed = &cfg
+			}
+		}
+		if programmed != nil && bytes.Equal(programmed.PSK, upPSKKey) {
+			if programmed.Endpoint != upPSKPeerDirect {
+				t.Errorf("peer endpoint = %q, want the direct endpoint %q", programmed.Endpoint, upPSKPeerDirect)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			_, requests := cp.counts()
+			t.Fatalf("the peer was not programmed with its edge PSK within 5s of the first pull (PSK requests: %d)", requests)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cp.mu.Lock()
+	path := cp.pskRequests[0]
+	cp.mu.Unlock()
+	if want := "/v1/nodes/" + upTestNodeID + "/peers/" + upPSKPeerID + "/psk"; path != want {
+		t.Errorf("PSK request path = %s, want %s", path, want)
+	}
+}
+
+// With edge PSKs off, or without the interface, the daemon fetches no PSK
+// while its state pulls keep arriving at a 1s reconcile interval.
+func TestRunUp_SkipsEdgePSKs(t *testing.T) {
+	tests := []struct {
+		name  string
+		ctrl  wireguard.WGController
+		extra string
+	}{
+		{"edge_psk false", &statsWGController{}, "wireguard:\n  edge_psk: false\n"},
+		{"no wireguard", statsReadingSetupRefusingWGController{}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Outside a cluster no PlexdHook list runs; an ambient
+			// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+			t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+			cp, apiBase := newPSKControlPlane(t)
+			useWGController(t, tt.ctrl)
+			writeUpConfig(t, apiBase, upDaemonYAML(t)+"reconcile:\n  interval: 1s\n"+tt.extra)
+			shutdown := startRunUp(t)
+			defer shutdown()
+
+			deadline := time.Now().Add(30 * time.Second)
+			var first int
+			for first == 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("the daemon never pulled its state")
+				}
+				first, _ = cp.counts()
+				time.Sleep(10 * time.Millisecond)
+			}
+			window := time.Now().Add(3 * time.Second)
+			for time.Now().Before(window) {
+				if _, requests := cp.counts(); requests > 0 {
+					t.Fatalf("the daemon sent %d PSK request(s), want none", requests)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if pulls, _ := cp.counts(); pulls < first+2 {
+				t.Errorf("state pulls = %d after a 3s window that opened at %d, want at least two more at a 1s interval", pulls, first)
+			}
+		})
+	}
+}
+
+// countingTrigger is an agent.ReconcileTrigger that runs onTrigger each time.
+type countingTrigger struct {
+	calls     int
+	onTrigger func()
+}
+
+func (c *countingTrigger) TriggerReconcile() {
+	c.calls++
+	if c.onTrigger != nil {
+		c.onTrigger()
+	}
+}
+
+// fixedEdgePSKFetcher serves the same sealed PSK for every request and counts
+// them.
+type fixedEdgePSKFetcher struct {
+	t        *testing.T
+	requests int
+}
+
+func (f *fixedEdgePSKFetcher) FetchEdgePSK(_ context.Context, nodeID, peerNodeID string) (*api.EdgePSKEnvelope, error) {
+	f.requests++
+	return &api.EdgePSKEnvelope{
+		Data:  sealUpEdgePSK(f.t, upTestNSKBytes, upPSKKey, nodeID, peerNodeID, upPSKEpoch),
+		KID:   "nsk-kid-1",
+		Epoch: upPSKEpoch,
+	}, nil
+}
+
+type nopPSKInstaller struct{}
+
+func (nopPSKInstaller) SetPeerPSK(string, string, []byte) error { return nil }
+
+func TestRotationReconcileTrigger_InvalidatesBeforeTriggering(t *testing.T) {
+	fetcher := &fixedEdgePSKFetcher{t: t}
+	psks := wireguard.NewEdgePSKs(fetcher, upTestNodeID, upTestNSKBytes, nopPSKInstaller{}, slog.New(slog.DiscardHandler))
+	peers := []api.SnapshotPeer{{NodeID: upPSKPeerID, MeshIP: "100.64.0.2", PublicKey: upPSKPeerKey}}
+	psks.Sync(context.Background(), peers)
+	if fetcher.requests != 1 {
+		t.Fatalf("requests after the first Sync = %d, want 1", fetcher.requests)
+	}
+
+	// The wrapped trigger syncs when it fires: a PSK already stale by then is
+	// fetched again inside it.
+	var requestsAtTrigger int
+	inner := &countingTrigger{onTrigger: func() {
+		psks.Sync(context.Background(), peers)
+		requestsAtTrigger = fetcher.requests
+	}}
+	rotationReconcileTrigger{rt: inner, psks: psks}.TriggerReconcile()
+
+	if inner.calls != 1 {
+		t.Errorf("wrapped trigger calls = %d, want 1", inner.calls)
+	}
+	if requestsAtTrigger != 2 {
+		t.Errorf("requests when the wrapped trigger fired = %d, want 2: the PSKs were not stale yet", requestsAtTrigger)
+	}
+}
+
+func TestPeerSnapshot_UpdateReportsProgrammedEndpoint(t *testing.T) {
+	ps := &peerSnapshot{mesh: netip.MustParsePrefix("10.99.0.0/24")}
+	ps.update([]api.SnapshotPeer{
+		{NodeID: "direct", Endpoint: "198.51.100.7:51820", FallbackEndpoint: "203.0.113.1:51820"},
+		{NodeID: "in-mesh", Endpoint: "10.99.0.4:51820", FallbackEndpoint: "203.0.113.1:51820"},
+		{NodeID: "no-endpoint", FallbackEndpoint: "203.0.113.1:51820"},
+	})
+
+	want := map[string]string{
+		"direct":      "198.51.100.7:51820",
+		"in-mesh":     "203.0.113.1:51820",
+		"no-endpoint": "203.0.113.1:51820",
+	}
+	for _, status := range ps.PeerStatuses() {
+		if status.Endpoint != want[status.ID] {
+			t.Errorf("peer %s Endpoint = %q, want %q", status.ID, status.Endpoint, want[status.ID])
+		}
 	}
 }
