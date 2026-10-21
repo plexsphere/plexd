@@ -363,6 +363,13 @@ func (c *DarwinController) RemovePeer(iface string, publicKey []byte) error {
 	return c.backend.RemovePeer(iface, publicKey)
 }
 
+// PeerStats reads every peer's runtime state from the interface. It takes the
+// configured name, not the utunN one, because the backend keys the device by
+// it.
+func (c *DarwinController) PeerStats(name string) ([]PeerStat, error) {
+	return c.backend.PeerStats(name)
+}
+
 // SetPrivateKey replaces the interface's private key without touching its
 // listen port or peers.
 func (c *DarwinController) SetPrivateKey(name string, privateKey []byte) error {

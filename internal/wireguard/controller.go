@@ -3,6 +3,8 @@ package wireguard
 import (
 	"encoding/base64"
 	"fmt"
+	"net/netip"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
@@ -37,6 +39,28 @@ type OSInterfaceNamer interface {
 	// OSInterfaceName returns the kernel's name for the interface created
 	// under the configured name, and false when no such interface exists.
 	OSInterfaceName(name string) (string, bool)
+}
+
+// PeerStat is one peer's runtime state as the device reports it.
+type PeerStat struct {
+	PublicKey     [32]byte
+	Endpoint      netip.AddrPort // invalid when the device knows no endpoint
+	LastHandshake time.Time      // zero when no handshake has completed
+	RxBytes       uint64
+	TxBytes       uint64
+}
+
+// PeerStatsReader is implemented by controllers that can read peer runtime state.
+//
+// It is optional, like OSInterfaceNamer, rather than a WGController method:
+// only the handshake report and the tunnel metrics read the device, and adding
+// the method to WGController would force it onto every test double that
+// implements the interface for unrelated reasons. Callers type-assert, and a
+// controller without it reports nothing.
+type PeerStatsReader interface {
+	// PeerStats returns every peer on the named device, in the device's order.
+	// A device that does not exist returns an error wrapping os.ErrNotExist.
+	PeerStats(name string) ([]PeerStat, error)
 }
 
 // PeerConfig holds the WireGuard-native configuration for a single peer.

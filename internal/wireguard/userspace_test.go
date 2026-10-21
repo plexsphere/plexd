@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,10 @@ import (
 	"golang.zx2c4.com/wireguard/tun/tuntest"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
+
+// Compile-time check that the backend the macOS and Windows controllers
+// delegate to can read peer state on every platform.
+var _ PeerStatsReader = (*UserspaceBackend)(nil)
 
 // trackedTUN wraps a tun.Device and records whether Close has been called, so
 // a test can assert the backend closed the tun it was handed. It also stays
@@ -161,6 +166,35 @@ func TestUserspaceBackend_HandshakeOverChannelBind(t *testing.T) {
 		if secs := handshakeSeconds(ipcGet(t, tc.b, tc.name)); secs <= 0 {
 			t.Errorf("%s last_handshake_time_sec = %d, want > 0", tc.name, secs)
 		}
+	}
+
+	stats, err := ba.PeerStats("wg-a")
+	if err != nil {
+		t.Fatalf("PeerStats(wg-a): %v", err)
+	}
+	if len(stats) != 1 {
+		t.Fatalf("PeerStats(wg-a) returned %d peers, want 1: %+v", len(stats), stats)
+	}
+	st := stats[0]
+	if st.PublicKey != keyB.PublicKey() {
+		t.Errorf("PublicKey = %x, want B's %x", st.PublicKey, keyB.PublicKey())
+	}
+	// wireguard-go roams a peer's endpoint to the source of its latest
+	// authenticated packet, and bindtest labels every packet bind 0 receives
+	// as coming from its target6, ChannelEndpoint(3). B's handshake response
+	// therefore replaces the configured 127.0.0.1:1 with 127.0.0.1:3 before A
+	// sends its first ping. The roamed value is what proves PeerStats reports
+	// the endpoint WireGuard uses rather than the one plexd configured.
+	if want := netip.MustParseAddrPort("127.0.0.1:3"); st.Endpoint != want {
+		t.Errorf("Endpoint = %v, want the roamed %v", st.Endpoint, want)
+	}
+	if st.LastHandshake.IsZero() {
+		t.Error("LastHandshake is zero after the pings")
+	} else if age := time.Since(st.LastHandshake); age < 0 || age > time.Minute {
+		t.Errorf("LastHandshake = %v (age %v), want within the last minute", st.LastHandshake, age)
+	}
+	if st.RxBytes == 0 || st.TxBytes == 0 {
+		t.Errorf("RxBytes = %d, TxBytes = %d, want both non-zero", st.RxBytes, st.TxBytes)
 	}
 }
 
@@ -562,6 +596,227 @@ func TestUserspaceBackend_RemovePeer_RemovesPeer(t *testing.T) {
 	}
 }
 
+func TestUserspaceBackend_PeerStats_NoHandshake(t *testing.T) {
+	b := createOnePeerDevice(t)
+
+	stats, err := b.PeerStats("wg-a")
+	if err != nil {
+		t.Fatalf("PeerStats on a device without peers: %v", err)
+	}
+	if stats == nil || len(stats) != 0 {
+		t.Fatalf("PeerStats on a device without peers = %#v, want an empty non-nil slice", stats)
+	}
+
+	peer := mustKey(t)
+	if err := b.AddPeer("wg-a", PeerConfig{PublicKey: pubBytes(peer), AllowedIPs: []string{"10.0.0.2/32"}}); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+
+	stats, err = b.PeerStats("wg-a")
+	if err != nil {
+		t.Fatalf("PeerStats: %v", err)
+	}
+	// No endpoint and no traffic: the peer is there with nothing but its key.
+	want := []PeerStat{{PublicKey: peer.PublicKey()}}
+	assertPeerStats(t, stats, want)
+}
+
+func TestUserspaceBackend_PeerStats_Unknown(t *testing.T) {
+	b := newTestBackend(t, bindtest.NewChannelBinds()[0])
+	_, err := b.PeerStats("nope")
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("err = %v, want os.ErrNotExist", err)
+	}
+	assertPrefix(t, err, "wireguard: peer stats:")
+}
+
+func TestParseUAPIPeerStats(t *testing.T) {
+	var (
+		privHex = strings.Repeat("deadbeef", 8)
+		pskHex  = strings.Repeat("feedface", 8)
+		pubAHex = strings.Repeat("0a", 32)
+		pubBHex = strings.Repeat("0b", 32)
+		pubA    = [32]byte(bytes.Repeat([]byte{0x0a}, 32))
+		pubB    = [32]byte(bytes.Repeat([]byte{0x0b}, 32))
+	)
+	device := "private_key=" + privHex + "\nlisten_port=51820\nfwmark=42\n"
+
+	tests := []struct {
+		name string
+		dump string
+		want []PeerStat
+	}{
+		{
+			name: "empty dump",
+			dump: "",
+			want: []PeerStat{},
+		},
+		{
+			name: "device keys only",
+			dump: device,
+			want: []PeerStat{},
+		},
+		{
+			name: "every field",
+			dump: device +
+				"public_key=" + pubAHex + "\n" +
+				"preshared_key=" + pskHex + "\n" +
+				"protocol_version=1\n" +
+				"endpoint=198.51.100.7:51820\n" +
+				"last_handshake_time_sec=1700000005\n" +
+				"last_handshake_time_nsec=250\n" +
+				"tx_bytes=1024\n" +
+				"rx_bytes=2048\n" +
+				"persistent_keepalive_interval=0\n" +
+				"allowed_ip=10.0.0.2/32\n" +
+				"allowed_ip=fd00::2/128\n",
+			want: []PeerStat{{
+				PublicKey:     pubA,
+				Endpoint:      netip.MustParseAddrPort("198.51.100.7:51820"),
+				LastHandshake: time.Unix(1700000005, 250),
+				RxBytes:       2048,
+				TxBytes:       1024,
+			}},
+		},
+		{
+			name: "no handshake is the zero time",
+			dump: "public_key=" + pubAHex + "\nlast_handshake_time_sec=0\nlast_handshake_time_nsec=0\n",
+			want: []PeerStat{{PublicKey: pubA}},
+		},
+		{
+			// wgctrl's parser needs both values positive and would drop this one.
+			name: "handshake on a whole second",
+			dump: "public_key=" + pubAHex + "\nlast_handshake_time_sec=1700000000\nlast_handshake_time_nsec=0\n",
+			want: []PeerStat{{PublicKey: pubA, LastHandshake: time.Unix(1700000000, 0)}},
+		},
+		{
+			name: "no endpoint line leaves the endpoint invalid",
+			dump: "public_key=" + pubAHex + "\ntx_bytes=7\nrx_bytes=9\n",
+			want: []PeerStat{{PublicKey: pubA, RxBytes: 9, TxBytes: 7}},
+		},
+		{
+			// The zone survives here; the handshake reporter strips it.
+			name: "zoned endpoint kept",
+			dump: "public_key=" + pubAHex + "\nendpoint=[fe80::1%eth0]:51820\n",
+			want: []PeerStat{{PublicKey: pubA, Endpoint: netip.MustParseAddrPort("[fe80::1%eth0]:51820")}},
+		},
+		{
+			// The second peer has no handshake lines and must not inherit the
+			// first peer's time.
+			name: "two peers in dump order",
+			dump: device +
+				"public_key=" + pubBHex + "\nendpoint=[2001:db8::7]:51820\n" +
+				"last_handshake_time_sec=1700000000\nlast_handshake_time_nsec=5\n" +
+				"public_key=" + pubAHex + "\nendpoint=198.51.100.7:51820\n",
+			want: []PeerStat{
+				{PublicKey: pubB, Endpoint: netip.MustParseAddrPort("[2001:db8::7]:51820"), LastHandshake: time.Unix(1700000000, 5)},
+				{PublicKey: pubA, Endpoint: netip.MustParseAddrPort("198.51.100.7:51820")},
+			},
+		},
+		{
+			name: "empty lines and errno skipped",
+			dump: "\n\npublic_key=" + pubAHex + "\n\nerrno=0\n\n",
+			want: []PeerStat{{PublicKey: pubA}},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseUAPIPeerStats(tc.dump)
+			if err != nil {
+				t.Fatalf("parseUAPIPeerStats: %v", err)
+			}
+			if got == nil {
+				t.Fatal("parseUAPIPeerStats returned a nil slice, want non-nil")
+			}
+			assertPeerStats(t, got, tc.want)
+		})
+	}
+}
+
+func TestParseUAPIPeerStats_Errors(t *testing.T) {
+	// Distinctive key material in every dump, so the test can tell whether an
+	// error text leaked it.
+	var (
+		privHex = strings.Repeat("deadbeef", 8)
+		pskHex  = strings.Repeat("feedface", 8)
+		pubHex  = strings.Repeat("0a", 32)
+	)
+	device := "private_key=" + privHex + "\nlisten_port=51820\n"
+	peer := "public_key=" + pubHex + "\npreshared_key=" + pskHex + "\nprotocol_version=1\n"
+
+	tests := []struct {
+		name string
+		dump string
+		want string // exact text when wantPrefix is false
+		// wantPrefix makes want a prefix: the wrapped parse error's own text
+		// comes from the standard library.
+		wantPrefix bool
+	}{
+		{
+			name:       "63 hex char public_key",
+			dump:       device + "public_key=" + pubHex[:63] + "\npreshared_key=" + pskHex + "\n",
+			want:       "wireguard: peer stats: parse public_key:",
+			wantPrefix: true,
+		},
+		{
+			name:       "non-hex public_key",
+			dump:       device + "public_key=" + strings.Repeat("zz", 32) + "\npreshared_key=" + pskHex + "\n",
+			want:       "wireguard: peer stats: parse public_key:",
+			wantPrefix: true,
+		},
+		{
+			name:       "unparseable endpoint",
+			dump:       device + peer + "endpoint=not-an-endpoint\n",
+			want:       "wireguard: peer stats: parse endpoint:",
+			wantPrefix: true,
+		},
+		{
+			name:       "non-numeric rx_bytes",
+			dump:       device + peer + "rx_bytes=lots\n",
+			want:       "wireguard: peer stats: parse rx_bytes:",
+			wantPrefix: true,
+		},
+		{
+			name:       "non-numeric last_handshake_time_sec",
+			dump:       device + peer + "last_handshake_time_sec=yesterday\n",
+			want:       "wireguard: peer stats: parse last_handshake_time_sec:",
+			wantPrefix: true,
+		},
+		{
+			// A private_key line that lost its '=' is the worst case: the
+			// whole line is the secret.
+			name: "line without =",
+			dump: "listen_port=51820\n" + privHex + "\n" + peer,
+			want: "wireguard: peer stats: line 2 has no '='",
+		},
+		{
+			name: "endpoint before public_key",
+			dump: device + "preshared_key=" + pskHex + "\nendpoint=198.51.100.7:51820\n" + peer,
+			want: "wireguard: peer stats: endpoint before public_key",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseUAPIPeerStats(tc.dump)
+			if err == nil {
+				t.Fatalf("parseUAPIPeerStats = %+v, want an error", got)
+			}
+			if tc.wantPrefix {
+				assertPrefix(t, err, tc.want)
+			} else if err.Error() != tc.want {
+				t.Errorf("err = %q, want %q", err, tc.want)
+			}
+			for _, secret := range []string{privHex, pskHex} {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("err = %q quotes key material %s", err, secret)
+				}
+			}
+		})
+	}
+}
+
 func TestDeviceLogger_MapsLevels(t *testing.T) {
 	var buf strings.Builder
 	logger := slogTextLogger(&buf)
@@ -587,6 +842,22 @@ func assertPrefix(t *testing.T, err error, prefix string) {
 	t.Helper()
 	if err == nil || !strings.HasPrefix(err.Error(), prefix) {
 		t.Fatalf("err = %v, want prefix %q", err, prefix)
+	}
+}
+
+// assertPeerStats compares peer stats field by field, the handshake time with
+// time.Time.Equal so a location difference cannot fail an equal instant.
+func assertPeerStats(t *testing.T, got, want []PeerStat) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d peer stats, want %d:\ngot  %+v\nwant %+v", len(got), len(want), got, want)
+	}
+	for i := range want {
+		g, w := got[i], want[i]
+		if g.PublicKey != w.PublicKey || g.Endpoint != w.Endpoint ||
+			!g.LastHandshake.Equal(w.LastHandshake) || g.RxBytes != w.RxBytes || g.TxBytes != w.TxBytes {
+			t.Errorf("peer stat %d:\ngot  %+v\nwant %+v", i, g, w)
+		}
 	}
 }
 
