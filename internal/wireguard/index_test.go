@@ -1,6 +1,8 @@
 package wireguard
 
 import (
+	"bytes"
+	"encoding/base64"
 	"fmt"
 	"sync"
 	"testing"
@@ -92,6 +94,74 @@ func TestPeerIndex_LoadFromPeers(t *testing.T) {
 		if key != p.PublicKey {
 			t.Errorf("Lookup(%s) = %q, want %q", p.ID, key, p.PublicKey)
 		}
+	}
+}
+
+// testKey returns a 32-byte key filled with b and its base64 form, the shape
+// the control plane hands the index.
+func testKey(b byte) ([32]byte, string) {
+	raw := bytes.Repeat([]byte{b}, 32)
+	return [32]byte(raw), base64.StdEncoding.EncodeToString(raw)
+}
+
+func TestPeerIndex_NodeIDsByPublicKey_Empty(t *testing.T) {
+	idx := NewPeerIndex()
+
+	got := idx.NodeIDsByPublicKey()
+	if got == nil || len(got) != 0 {
+		t.Errorf("NodeIDsByPublicKey() = %#v, want an empty map", got)
+	}
+}
+
+func TestPeerIndex_NodeIDsByPublicKey_MapsDecodedKeys(t *testing.T) {
+	keyA, b64A := testKey(0x0a)
+	keyB, b64B := testKey(0x0b)
+	idx := NewPeerIndex()
+	idx.Add("peer-a", b64A)
+	idx.Add("peer-b", b64B)
+
+	got := idx.NodeIDsByPublicKey()
+	if len(got) != 2 {
+		t.Fatalf("NodeIDsByPublicKey() has %d entries, want 2: %v", len(got), got)
+	}
+	if got[keyA] != "peer-a" {
+		t.Errorf("NodeIDsByPublicKey()[keyA] = %q, want %q", got[keyA], "peer-a")
+	}
+	if got[keyB] != "peer-b" {
+		t.Errorf("NodeIDsByPublicKey()[keyB] = %q, want %q", got[keyB], "peer-b")
+	}
+}
+
+func TestPeerIndex_NodeIDsByPublicKey_SkipsUndecodable(t *testing.T) {
+	keyA, b64A := testKey(0x0a)
+	idx := NewPeerIndex()
+	idx.Add("peer-a", b64A)
+	idx.Add("not-base64", "not base64!")
+	idx.Add("short", base64.StdEncoding.EncodeToString(make([]byte, 31)))
+
+	got := idx.NodeIDsByPublicKey()
+	if len(got) != 1 || got[keyA] != "peer-a" {
+		t.Errorf("NodeIDsByPublicKey() = %v, want only peer-a", got)
+	}
+}
+
+func TestPeerIndex_NodeIDsByPublicKey_SharedKeyLeftOut(t *testing.T) {
+	keyA, b64A := testKey(0x0a)
+	shared, b64Shared := testKey(0x0c)
+	idx := NewPeerIndex()
+	idx.Add("peer-a", b64A)
+	// Three holders, so a third ID cannot claim the key once the second
+	// removed it.
+	idx.Add("peer-x", b64Shared)
+	idx.Add("peer-y", b64Shared)
+	idx.Add("peer-z", b64Shared)
+
+	got := idx.NodeIDsByPublicKey()
+	if id, ok := got[shared]; ok {
+		t.Errorf("NodeIDsByPublicKey()[shared] = %q, want the shared key left out", id)
+	}
+	if len(got) != 1 || got[keyA] != "peer-a" {
+		t.Errorf("NodeIDsByPublicKey() = %v, want only peer-a", got)
 	}
 }
 

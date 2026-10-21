@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/registration"
@@ -529,5 +531,155 @@ func TestManager_OSInterfaceName_NilController(t *testing.T) {
 
 	if got := mgr.OSInterfaceName(); got != "plexd0" {
 		t.Errorf("OSInterfaceName() = %q, want %q", got, "plexd0")
+	}
+}
+
+// statsController is a mockController that can also read peer runtime state,
+// the shape every production controller has. It returns stats and err as
+// configured and records the interface name it was asked for.
+type statsController struct {
+	mockController
+	stats []PeerStat
+	err   error
+}
+
+func (c *statsController) PeerStats(name string) ([]PeerStat, error) {
+	c.mu.Lock()
+	c.calls = append(c.calls, mockCall{Method: "PeerStats", Args: []interface{}{name}})
+	c.mu.Unlock()
+	return c.stats, c.err
+}
+
+// keyedPeer returns testPeer(id) carrying key as its public key. testPeer
+// gives every peer the same all-zero key, which the reverse index leaves out
+// as shared.
+func keyedPeer(id, b64Key string) api.Peer {
+	p := testPeer(id)
+	p.PublicKey = b64Key
+	return p
+}
+
+func TestManager_MeshPeerStats_MapsIndexedPeers(t *testing.T) {
+	keyA, b64A := testKey(0x0a)
+	keyB, b64B := testKey(0x0b)
+	rotatedOut, b64RotatedOut := testKey(0x0c)
+
+	ctrl := &statsController{}
+	mgr := NewManager(ctrl, Config{}, discardLogger())
+
+	if err := mgr.AddPeer(keyedPeer("node-a", b64A)); err != nil {
+		t.Fatalf("AddPeer(node-a): %v", err)
+	}
+	// node-b rotated its key: the index holds the new one, while the device
+	// still carries the old key next to it.
+	if err := mgr.AddPeer(keyedPeer("node-b", b64RotatedOut)); err != nil {
+		t.Fatalf("AddPeer(node-b): %v", err)
+	}
+	if err := mgr.UpdatePeer(keyedPeer("node-b", b64B)); err != nil {
+		t.Fatalf("UpdatePeer(node-b): %v", err)
+	}
+
+	handshake := time.Unix(1700000000, 0)
+	ctrl.stats = []PeerStat{
+		{PublicKey: keyB, Endpoint: netip.MustParseAddrPort("[2001:db8::7]:51820"), RxBytes: 10, TxBytes: 20},
+		{PublicKey: rotatedOut, Endpoint: netip.MustParseAddrPort("203.0.113.9:51820"), LastHandshake: handshake, RxBytes: 1, TxBytes: 2},
+		{PublicKey: keyA, Endpoint: netip.MustParseAddrPort("198.51.100.7:51820"), LastHandshake: handshake, RxBytes: 2048, TxBytes: 1024},
+	}
+
+	got, err := mgr.MeshPeerStats()
+	if err != nil {
+		t.Fatalf("MeshPeerStats: %v", err)
+	}
+
+	// Sorted by NodeID, the rotated-out key dropped, and node-b kept although
+	// it never completed a handshake.
+	want := []MeshPeerStat{
+		{NodeID: "node-a", Endpoint: netip.MustParseAddrPort("198.51.100.7:51820"), LastHandshake: handshake, RxBytes: 2048, TxBytes: 1024},
+		{NodeID: "node-b", Endpoint: netip.MustParseAddrPort("[2001:db8::7]:51820"), RxBytes: 10, TxBytes: 20},
+	}
+	assertMeshPeerStats(t, got, want)
+
+	calls := ctrl.callsFor("PeerStats")
+	if len(calls) != 1 || calls[0].Args[0] != "plexd0" {
+		t.Errorf("PeerStats calls = %v, want one for plexd0", calls)
+	}
+}
+
+func TestManager_MeshPeerStats_NothingMaps(t *testing.T) {
+	unindexed, _ := testKey(0x0d)
+
+	for _, tc := range []struct {
+		name  string
+		stats []PeerStat
+	}{
+		{name: "device without peers", stats: nil},
+		{name: "only unindexed peers", stats: []PeerStat{{PublicKey: unindexed}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := &statsController{stats: tc.stats}
+			mgr := NewManager(ctrl, Config{}, discardLogger())
+
+			got, err := mgr.MeshPeerStats()
+			if err != nil {
+				t.Fatalf("MeshPeerStats: %v", err)
+			}
+			if got == nil || len(got) != 0 {
+				t.Errorf("MeshPeerStats() = %#v, want an empty non-nil slice", got)
+			}
+		})
+	}
+}
+
+func TestManager_MeshPeerStats_Unsupported(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ctrl WGController
+	}{
+		// mockController does not implement PeerStatsReader.
+		{name: "controller without PeerStats", ctrl: &mockController{}},
+		// plexd up builds a Manager even where newWGController returns nil.
+		{name: "nil controller", ctrl: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := NewManager(tc.ctrl, Config{}, discardLogger())
+
+			got, err := mgr.MeshPeerStats()
+			if !errors.Is(err, ErrPeerStatsUnsupported) {
+				t.Fatalf("MeshPeerStats() error = %v, want ErrPeerStatsUnsupported", err)
+			}
+			if got != nil {
+				t.Errorf("MeshPeerStats() = %v, want nil with the error", got)
+			}
+		})
+	}
+}
+
+func TestManager_MeshPeerStats_ReadError(t *testing.T) {
+	readErr := errors.New("netlink: boom")
+	ctrl := &statsController{err: readErr}
+	mgr := NewManager(ctrl, Config{}, discardLogger())
+
+	_, err := mgr.MeshPeerStats()
+	if !errors.Is(err, readErr) {
+		t.Fatalf("MeshPeerStats() error = %v, want it to wrap %v", err, readErr)
+	}
+	if want := "wireguard: mesh peer stats: netlink: boom"; err.Error() != want {
+		t.Errorf("MeshPeerStats() error = %q, want %q", err, want)
+	}
+}
+
+// assertMeshPeerStats compares mesh peer stats field by field, the handshake
+// time with time.Time.Equal.
+func assertMeshPeerStats(t *testing.T, got, want []MeshPeerStat) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d mesh peer stats, want %d:\ngot  %+v\nwant %+v", len(got), len(want), got, want)
+	}
+	for i := range want {
+		g, w := got[i], want[i]
+		if g.NodeID != w.NodeID || g.Endpoint != w.Endpoint ||
+			!g.LastHandshake.Equal(w.LastHandshake) || g.RxBytes != w.RxBytes || g.TxBytes != w.TxBytes {
+			t.Errorf("mesh peer stat %d:\ngot  %+v\nwant %+v", i, g, w)
+		}
 	}
 }
