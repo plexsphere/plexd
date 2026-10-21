@@ -11,7 +11,7 @@ import (
 func sampleSnapshot() *api.NodeStateSnapshot {
 	return &api.NodeStateSnapshot{
 		Peers: []api.SnapshotPeer{
-			{NodeID: "node-1", PublicKey: "pk-1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820"},
+			{NodeID: "node-1", PublicKey: "pk-1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820", EndpointCandidates: []string{"10.0.0.5:51820"}},
 		},
 		// Populated so the never-stored assertions below bite instead of holding
 		// vacuously against a fixture that never carried the block.
@@ -112,6 +112,7 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 
 	// Mutate the source after Update — snapshot must be unaffected.
 	desired.Peers[0].NodeID = "mutated"
+	desired.Peers[0].EndpointCandidates[0] = "mutated"
 	desired.Policy.Rules[0].Action = "deny"
 	desired.Policy.Rules[0].Ports.From = 8443
 	desired.Bridge.UserAccess.Peers[0].AllowedIPs[0] = "mutated"
@@ -123,6 +124,9 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 
 	if got.Peers[0].NodeID == "mutated" {
 		t.Error("Peers were not copied on Update")
+	}
+	if got.Peers[0].EndpointCandidates[0] == "mutated" {
+		t.Error("Peer endpoint candidates were not copied on Update")
 	}
 	if got.Policy.Rules[0].Action == "deny" {
 		t.Error("Policy rules were not copied on Update")
@@ -152,6 +156,7 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 
 	// Mutate the returned value — snapshot must be unaffected.
 	got.Peers[0].NodeID = "mutated"
+	got.Peers[0].EndpointCandidates[0] = "mutated"
 	got.Policy.Rules[0].Action = "deny"
 	got.Policy.Rules[0].Ports.To = 8443
 	got.Bridge.UserAccess.Peers[0].AllowedIPs[0] = "mutated"
@@ -162,6 +167,9 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 
 	if got2.Peers[0].NodeID == "mutated" {
 		t.Error("Get did not return a copy of Peers")
+	}
+	if got2.Peers[0].EndpointCandidates[0] == "mutated" {
+		t.Error("Get did not return a copy of the peer endpoint candidates")
 	}
 	if got2.Policy.Rules[0].Action == "deny" {
 		t.Error("Get did not return a copy of Policy rules")
