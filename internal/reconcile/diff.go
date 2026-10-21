@@ -116,6 +116,7 @@ func diffPeers(desired, current []api.SnapshotPeer, diff *StateDiff) {
 func peerChanged(desired, current api.SnapshotPeer) bool {
 	return desired.MeshIP != current.MeshIP ||
 		desired.PublicKey != current.PublicKey ||
+		desired.Endpoint != current.Endpoint ||
 		desired.FallbackEndpoint != current.FallbackEndpoint
 }
 

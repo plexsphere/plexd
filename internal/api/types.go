@@ -95,13 +95,19 @@ type NodeStateSnapshot struct {
 
 // SnapshotPeer is a reconciliation peer entry in NodeStateSnapshot. It is a
 // separate type from RegisterPeer (one Go type per contract schema) and carries
-// NO psk, allowed_ips, or endpoint: AllowedIPs are derived locally as
-// mesh_ip/32, fallback_endpoint is the relay target programmed as the WireGuard
-// endpoint, and no preshared key is fabricated.
+// the peer's direct endpoint but NO psk or allowed_ips: AllowedIPs are derived
+// locally as mesh_ip/32, and the pairwise edge PSK is fetched per edge from
+// GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk, never projected.
 type SnapshotPeer struct {
-	NodeID           string `json:"node_id"`
-	MeshIP           string `json:"mesh_ip"`
-	PublicKey        string `json:"public_key"`
+	NodeID    string `json:"node_id"`
+	MeshIP    string `json:"mesh_ip"`
+	PublicKey string `json:"public_key"`
+	// Endpoint is the peer's direct WireGuard endpoint as host:port (an IPv6
+	// host in brackets), the address it last reported through PUT
+	// /v1/nodes/{node_id}/endpoint. It is absent while the peer has no fresh
+	// observation. FallbackEndpoint is the relay target programmed instead
+	// when Endpoint is absent or unusable.
+	Endpoint         string `json:"endpoint,omitempty"`
 	FallbackEndpoint string `json:"fallback_endpoint,omitempty"`
 }
 
