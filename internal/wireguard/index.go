@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"encoding/base64"
 	"sync"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -60,6 +61,39 @@ func (p *PeerIndex) LoadFromPeers(peers []api.Peer) {
 	for _, peer := range peers {
 		p.index[peer.ID] = peer.PublicKey
 	}
+}
+
+// NodeIDsByPublicKey returns the reverse mapping, from each stored public
+// key's raw bytes to its peer ID. It is what turns a device read, which knows
+// peers only by key, back into the control plane's node IDs.
+//
+// A stored key that is not valid base64 or does not decode to 32 bytes is
+// skipped, because no device peer can carry it. A key two peer IDs share is
+// left out: the device holds a single peer for it, and attributing that peer's
+// state to either ID would report an edge no single node owns.
+func (p *PeerIndex) NodeIDsByPublicKey() map[[32]byte]string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	byKey := make(map[[32]byte]string, len(p.index))
+	shared := make(map[[32]byte]bool)
+	for peerID, publicKey := range p.index {
+		raw, err := base64.StdEncoding.DecodeString(publicKey)
+		if err != nil || len(raw) != 32 {
+			continue
+		}
+		key := [32]byte(raw)
+		if shared[key] {
+			continue
+		}
+		if _, dup := byKey[key]; dup {
+			delete(byKey, key)
+			shared[key] = true
+			continue
+		}
+		byKey[key] = peerID
+	}
+	return byKey
 }
 
 // Count returns the number of peers in the index.
