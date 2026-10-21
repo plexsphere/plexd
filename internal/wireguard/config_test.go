@@ -1,6 +1,10 @@
 package wireguard
 
-import "testing"
+import (
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
 
 func TestConfig_Defaults(t *testing.T) {
 	cfg := Config{}
@@ -66,5 +70,36 @@ func TestConfig_ValidateAcceptsCustomValues(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() = %v, want nil", err)
+	}
+}
+
+func TestConfig_EdgePSKEnabled(t *testing.T) {
+	enabled, disabled := true, false
+	tests := []struct {
+		name string
+		cfg  Config
+		want bool
+	}{
+		{"unset", Config{}, true},
+		{"true", Config{EdgePSK: &enabled}, true},
+		{"false", Config{EdgePSK: &disabled}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.cfg.ApplyDefaults()
+			if got := tt.cfg.EdgePSKEnabled(); got != tt.want {
+				t.Errorf("EdgePSKEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfig_EdgePSKYAML(t *testing.T) {
+	var cfg Config
+	if err := yaml.Unmarshal([]byte("edge_psk: false\n"), &cfg); err != nil {
+		t.Fatalf("yaml.Unmarshal: %v", err)
+	}
+	if cfg.EdgePSKEnabled() {
+		t.Error("edge_psk: false parsed as enabled")
 	}
 }

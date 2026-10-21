@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -711,4 +712,112 @@ func assertMeshPeerStats(t *testing.T, got, want []MeshPeerStat) {
 			t.Errorf("mesh peer stat %d:\ngot  %+v\nwant %+v", i, g, w)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// SetPeerPSK
+// ---------------------------------------------------------------------------
+
+func TestManager_SetPeerPSK(t *testing.T) {
+	_, b64A := testKey(0x0a)
+	psk := bytes.Repeat([]byte{0x42}, 32)
+
+	t.Run("programmed peer", func(t *testing.T) {
+		ctrl := &mockController{}
+		mgr := NewManager(ctrl, Config{}, discardLogger())
+		if err := mgr.AddPeer(keyedPeer("node-a", b64A)); err != nil {
+			t.Fatalf("AddPeer: %v", err)
+		}
+		if err := mgr.SetPeerPSK("node-a", b64A, psk); err != nil {
+			t.Fatalf("SetPeerPSK: %v", err)
+		}
+		calls := ctrl.callsFor("AddPeer")
+		if len(calls) != 2 {
+			t.Fatalf("AddPeer calls = %d, want 2", len(calls))
+		}
+		cfg := calls[1].Args[1].(PeerConfig)
+		if !bytes.Equal(cfg.PSK, psk) {
+			t.Error("the write does not carry the PSK")
+		}
+		if len(cfg.AllowedIPs) != 1 || cfg.AllowedIPs[0] != "10.0.0.2/32" {
+			t.Errorf("AllowedIPs = %v, want the recorded [10.0.0.2/32]", cfg.AllowedIPs)
+		}
+		if cfg.Endpoint != "" {
+			t.Errorf("Endpoint = %q, want empty so the device keeps its endpoint", cfg.Endpoint)
+		}
+	})
+
+	t.Run("unknown node and another public key", func(t *testing.T) {
+		ctrl := &mockController{}
+		mgr := NewManager(ctrl, Config{}, discardLogger())
+		if err := mgr.AddPeer(keyedPeer("node-a", b64A)); err != nil {
+			t.Fatalf("AddPeer: %v", err)
+		}
+		_, b64Other := testKey(0x0b)
+		if err := mgr.SetPeerPSK("node-unknown", b64A, psk); err != nil {
+			t.Errorf("SetPeerPSK(unknown node) = %v, want nil", err)
+		}
+		if err := mgr.SetPeerPSK("node-a", b64Other, psk); err != nil {
+			t.Errorf("SetPeerPSK(another public key) = %v, want nil", err)
+		}
+		if n := len(ctrl.callsFor("AddPeer")); n != 1 {
+			t.Errorf("AddPeer calls = %d, want no write beyond the AddPeer", n)
+		}
+	})
+
+	t.Run("controller error", func(t *testing.T) {
+		ctrl := &mockController{}
+		mgr := NewManager(ctrl, Config{}, discardLogger())
+		if err := mgr.AddPeer(keyedPeer("node-a", b64A)); err != nil {
+			t.Fatalf("AddPeer: %v", err)
+		}
+		ctrl.addPeerErr = errors.New("netlink: busy")
+		err := mgr.SetPeerPSK("node-a", b64A, psk)
+		if err == nil || !strings.HasPrefix(err.Error(), "wireguard: set peer psk:") {
+			t.Errorf("err = %v, want it wrapped as wireguard: set peer psk:", err)
+		}
+	})
+
+	t.Run("removed peer", func(t *testing.T) {
+		ctrl := &mockController{}
+		mgr := NewManager(ctrl, Config{}, discardLogger())
+		if err := mgr.AddPeer(keyedPeer("node-a", b64A)); err != nil {
+			t.Fatalf("AddPeer: %v", err)
+		}
+		if err := mgr.RemovePeerByID("node-a"); err != nil {
+			t.Fatalf("RemovePeerByID: %v", err)
+		}
+		if err := mgr.SetPeerPSK("node-a", b64A, psk); err != nil {
+			t.Errorf("SetPeerPSK after removal = %v, want nil", err)
+		}
+		if n := len(ctrl.callsFor("AddPeer")); n != 1 {
+			t.Errorf("AddPeer calls = %d, want no write for a removed peer", n)
+		}
+	})
+}
+
+func TestManager_SetPeerPSK_ConcurrentWithUpdatePeer(t *testing.T) {
+	_, b64A := testKey(0x0a)
+	ctrl := &mockController{}
+	mgr := NewManager(ctrl, Config{}, discardLogger())
+	peer := keyedPeer("node-a", b64A)
+	if err := mgr.AddPeer(peer); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			_ = mgr.SetPeerPSK("node-a", b64A, bytes.Repeat([]byte{0x42}, 32))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			_ = mgr.UpdatePeer(peer)
+		}
+	}()
+	wg.Wait()
 }
