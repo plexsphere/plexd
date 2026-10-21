@@ -32,7 +32,7 @@ func (s *stateSnapshot) Get() api.NodeStateSnapshot {
 	defer s.mu.RUnlock()
 
 	return api.NodeStateSnapshot{
-		Peers:   slices.Clone(s.peers),
+		Peers:   copyPeers(s.peers),
 		Policy:  copyPolicy(s.policy),
 		Bridge:  copyBridge(s.bridge),
 		State:   copyBlock(s.state),
@@ -47,7 +47,7 @@ func (s *stateSnapshot) Update(desired *api.NodeStateSnapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.peers = slices.Clone(desired.Peers)
+	s.peers = copyPeers(desired.Peers)
 	s.policy = copyPolicy(desired.Policy)
 	s.bridge = copyBridge(desired.Bridge)
 	s.state = copyBlock(desired.State)
@@ -57,6 +57,14 @@ func (s *stateSnapshot) Update(desired *api.NodeStateSnapshot) {
 // ---------------------------------------------------------------------------
 // Deep-copy helpers
 // ---------------------------------------------------------------------------
+
+func copyPeers(src []api.SnapshotPeer) []api.SnapshotPeer {
+	dst := slices.Clone(src)
+	for i := range dst {
+		dst[i].EndpointCandidates = slices.Clone(src[i].EndpointCandidates)
+	}
+	return dst
+}
 
 func copyPolicy(src *api.PolicySnapshot) *api.PolicySnapshot {
 	if src == nil {

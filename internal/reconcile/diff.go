@@ -3,6 +3,7 @@ package reconcile
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -113,11 +114,16 @@ func diffPeers(desired, current []api.SnapshotPeer, diff *StateDiff) {
 	}
 }
 
+// peerChanged reports whether a field the WireGuard handler programs from
+// differs. EndpointCandidates compare in order, because the order is the dial
+// order; slices.Equal treats nil and empty as equal, so a pull that drops the
+// field and one that carries [] read the same.
 func peerChanged(desired, current api.SnapshotPeer) bool {
 	return desired.MeshIP != current.MeshIP ||
 		desired.PublicKey != current.PublicKey ||
 		desired.Endpoint != current.Endpoint ||
-		desired.FallbackEndpoint != current.FallbackEndpoint
+		desired.FallbackEndpoint != current.FallbackEndpoint ||
+		!slices.Equal(desired.EndpointCandidates, current.EndpointCandidates)
 }
 
 // diffPolicy is presence-aware. When both blocks are populated it compares ONLY

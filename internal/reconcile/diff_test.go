@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -114,6 +115,52 @@ func TestComputeDiff_PeersUpdated(t *testing.T) {
 					t.Errorf("expected no adds/removes, got add=%d remove=%d", len(diff.PeersToAdd), len(diff.PeersToRemove))
 				}
 			})
+		}
+	})
+
+	t.Run("endpoint_candidates-only change is an update", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			from, to []string
+		}{
+			{"first candidates", nil, []string{"10.0.0.5:51820"}},
+			{"candidate replaced", []string{"10.0.0.5:51820"}, []string{"10.0.0.6:51820"}},
+			{"order changed", []string{"10.0.0.5:51820", "172.31.4.9:51820"}, []string{"172.31.4.9:51820", "10.0.0.5:51820"}},
+			{"candidates withdrawn", []string{"10.0.0.5:51820"}, nil},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				desired := &api.NodeStateSnapshot{
+					Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", EndpointCandidates: tc.to}},
+				}
+				current := &api.NodeStateSnapshot{
+					Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", EndpointCandidates: tc.from}},
+				}
+
+				diff := ComputeDiff(desired, current)
+
+				if len(diff.PeersToUpdate) != 1 {
+					t.Fatalf("PeersToUpdate = %d, want 1", len(diff.PeersToUpdate))
+				}
+				if got := diff.PeersToUpdate[0].EndpointCandidates; !slices.Equal(got, tc.to) {
+					t.Errorf("updated EndpointCandidates = %v, want %v", got, tc.to)
+				}
+				if len(diff.PeersToAdd) != 0 || len(diff.PeersToRemove) != 0 {
+					t.Errorf("add/remove = %d/%d, want 0/0", len(diff.PeersToAdd), len(diff.PeersToRemove))
+				}
+			})
+		}
+	})
+
+	t.Run("nil and empty endpoint_candidates are not an update", func(t *testing.T) {
+		desired := &api.NodeStateSnapshot{
+			Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", EndpointCandidates: []string{}}},
+		}
+		current := &api.NodeStateSnapshot{
+			Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1"}},
+		}
+
+		if diff := ComputeDiff(desired, current); len(diff.PeersToUpdate) != 0 {
+			t.Errorf("nil vs empty candidates should not update, got %d", len(diff.PeersToUpdate))
 		}
 	})
 
