@@ -27,6 +27,7 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 15 | `POST` | `/v1/nodes/{node_id}/audit` | Audit batch |
 | 16 | `POST` | `/v1/nodes/{node_id}/handshakes` | Per-peer WireGuard handshake report |
 | 17 | `GET` | `/v1/nodes/{node_id}/peers/{peer_node_id}/psk` | Pairwise edge PSK (NSK-encrypted octet-stream) |
+| 18 | `PUT` | `/v1/nodes/{node_id}/endpoint-candidates` | Local endpoint candidate reporting |
 
 ## Registration & Identity
 
@@ -350,6 +351,78 @@ Called after STUN discovery, then on a deadline derived from the response (see b
 | `410 Gone` | `endpoint_peer_gone` | Node was removed; heals via re-registration |
 | `413 Payload Too Large` | `endpoint_body_too_large` | Body exceeds 4 KiB |
 
+### PUT /v1/nodes/{node_id}/endpoint-candidates
+
+Reports the node's local interface addresses, each joined with its WireGuard
+listen port, as endpoint candidates. Each report replaces every candidate the
+node reported before. Peers receive them as `endpoint_candidates` in the `peers`
+block of the [state pull](#get-v1-nodes-node-id-state) and try them in their
+[dial order](../networking/wireguard.md#dial-order). The operation is separate
+from [`PUT /v1/nodes/{node_id}/endpoint`](#put-v1-nodes-node-id-endpoint), and
+plexd reports on it from a loop of its own, so a node whose STUN discovery fails
+still publishes its local addresses. See
+[Local endpoint candidates](../networking/nat-traversal.md#local-endpoint-candidates)
+for how plexd gathers them.
+
+**Request body** (`EndpointCandidatesRequest`, at most 4 KiB):
+
+```json
+{
+  "candidates": ["10.0.0.5:51820", "[fd00:10::5]:51820"],
+  "reported_at": "2026-10-21T10:15:30Z"
+}
+```
+
+- `candidates`: required array of 0 to 8 distinct entries. Each is an IPv4
+  address or a bracketed IPv6 address without a zone, joined with a port in
+  1..65535. The host is not loopback, link-local, multicast or unspecified.
+  `null` is refused, and `[]` withdraws every earlier candidate.
+- `reported_at`: required, RFC 3339 UTC, within 60s of server time.
+
+`ReportEndpointCandidates` sends a nil `Candidates` as `[]`, and refuses more
+than `MaxEndpointCandidates` (8) entries with an error matching
+`ErrEndpointCandidatesTooMany` before any request.
+
+**Response** (`200 OK`, `EndpointCandidatesResponse`):
+
+```json
+{
+  "accepted_at": "2026-10-21T10:15:30Z",
+  "stale_after": "2026-10-21T10:20:30Z"
+}
+```
+
+`stale_after` is the deadline after which the control plane drops the set.
+plexd schedules its next report from it as it does the endpoint report: 30s
+before `stale_after`, floored at `nat.min_report_interval` and capped by
+`nat.refresh_interval`. A zero `stale_after`, and any failure, gives
+`refresh_interval`.
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning | plexd behavior |
+|---|---|---|---|
+| `200 OK` | — | Set accepted; body is an `EndpointCandidatesResponse` | Logged at Debug; also at Info for the first accepted set and for a set that differs from the last accepted one, and once at Info after a not-served phase. The next report follows `stale_after` |
+| `400 Bad Request` | `malformed_endpoint_candidates` | Body is not valid JSON, carries an unknown member or misses one; `candidates` is `null`, holds more than 8 entries or repeats an entry | Logged at Warn as `send failed`; retried next cycle |
+| `400 Bad Request` | `endpoint_clock_skew` | `reported_at` more than 60s from server time | Logged at Warn as `rejected for clock skew`; retried next cycle |
+| `400 Bad Request` | `endpoint_candidate_unparseable` | An entry is not a usable `host:port`; the `detail` names the entry index | Logged at Warn as `send failed`; retried next cycle |
+| `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked | Logged at Warn as `send failed`; retried next cycle |
+| `403 Forbidden` | `node_id_mismatch` | The NSK belongs to a different node than the path | Logged at Warn as `send failed`; retried next cycle |
+| `404 Not Found` | `endpoint_peer_not_found` | The control plane has not registered the node as a peer yet | Logged at Warn as `rejected, this node is not registered as a peer`; retried next cycle |
+| `404 Not Found` | any other, or none | An older control plane that does not serve the operation | Logged once at Info as not served; plexd keeps reporting every cycle |
+| `410 Gone` | `endpoint_peer_gone` | Node was removed | Logged at Warn as `rejected, this node is not registered as a peer`; retried next cycle |
+| `413 Payload Too Large` | `endpoint_candidates_body_too_large` | Body exceeds 4 KiB | Logged at Warn as `send failed`; retried next cycle |
+| `500 Internal Server Error` | — | Server error | Logged at Warn as `send failed`; retried next cycle |
+| `501 Not Implemented` | `endpoint_candidates_not_provisioned` | The control plane has not provisioned the operation | Logged once at Info as not served; plexd keeps reporting every cycle |
+
+`api.IsEndpointCandidatesNotServed` classifies the two not-served answers: a
+`404` with any code but `endpoint_peer_not_found`, and a `501` carrying
+`endpoint_candidates_not_provisioned`. A `404 endpoint_peer_not_found` is the
+operation's own answer when the node reports before the control plane has
+registered it as a peer, which a later cycle heals, so it is false. A `501` with
+any other code is an ordinary failure and logged at Warn. Every failed report
+waits `nat.refresh_interval` before the next one.
+
 ## Mesh Edge Health
 
 ### POST /v1/nodes/{node_id}/handshakes
@@ -563,7 +636,8 @@ absence.
       "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
       "mesh_ip": "10.99.0.2",
       "public_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
-      "fallback_endpoint": "203.0.113.1:51820"
+      "fallback_endpoint": "203.0.113.1:51820",
+      "endpoint_candidates": ["192.0.2.10:51820"]
     },
     {
       "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
@@ -633,18 +707,29 @@ absence.
 A peer's `endpoint` is its direct WireGuard endpoint as `host:port` (an IPv6
 host in brackets), the address the peer last reported through
 [`PUT /v1/nodes/{node_id}/endpoint`](#put-v1-nodes-node-id-endpoint). It is
-absent while the peer has no fresh NAT observation. plexd programs `endpoint`
-when it is usable and `fallback_endpoint`, the relay target, otherwise. The
-pull carries no PSK: plexd fetches the pairwise PSK of each edge from
-[`GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`](#edge-psk). A direct
-endpoint is usable when it parses as an IP address and a non-zero port, carries
-no IPv6 zone, names an address that is not unspecified, loopback, multicast or
-link-local (an IPv4-mapped IPv6 address is unmapped first), and lies outside
-the Domain mesh prefix (the node's own mesh IP as a host /32 when registration
-returned no usable `domain_mesh_cidr`). plexd logs a refused one at Warn and
-programs the fallback instead. `fallback_endpoint` is not validated, since the
-contract allows a hostname there. A change of `endpoint` alone is enough for
-the differ to update the peer.
+absent while the peer has no fresh NAT observation. A peer's
+`endpoint_candidates` are its last accepted, unexpired candidates from
+[`PUT /v1/nodes/{node_id}/endpoint-candidates`](#put-v1-nodes-node-id-endpoint-candidates),
+as `host:port` strings in the order the peer sent them; the member is absent
+when the peer has none, and on every control plane that does not deliver them.
+The pull carries no PSK: plexd fetches the pairwise PSK of each edge from
+[`GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`](#edge-psk).
+
+plexd tries a peer's endpoints in a fixed dial order and keeps the first one
+that completes a WireGuard handshake: the candidates on a subnet this node is
+also on, then `endpoint` when it is usable, then the remaining candidates, then
+`fallback_endpoint`, the relay target. A direct endpoint or candidate is usable
+when it parses as an IP address and a non-zero port, carries no IPv6 zone,
+names an address that is not unspecified, loopback, multicast or link-local (an
+IPv4-mapped IPv6 address is unmapped first), and lies outside the Domain mesh
+prefix (the node's own mesh IP as a host /32 when registration returned no
+usable `domain_mesh_cidr`). plexd leaves a refused one out of the order, and
+logs a refused `endpoint` at Warn and refused candidates at Debug.
+`fallback_endpoint` is not validated, since the contract allows a hostname
+there. A change of `endpoint`, `fallback_endpoint` or `endpoint_candidates`,
+the candidates' order included, is enough for the differ to update the peer.
+See [Dial order](../networking/wireguard.md#dial-order) and
+[Endpoint selection](../networking/wireguard.md#endpoint-selection).
 
 `reachability` is the control plane's own verdict about this node, derived from
 the heartbeats it has admitted. `state` is one of `healthy`, `stale`,

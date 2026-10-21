@@ -36,7 +36,8 @@ The gate exists because its absence hid a shipped defect: the mock used to admit
 The mock refuses what the real handlers refuse, because a fixture that accepts
 more than the contract hides exactly the defects the suite exists to catch. The
 first three gates were added after a release shipped past them; the handshake
-report and the edge PSK route were gated from the start:
+report, the edge PSK route and the endpoint candidates route were gated from the
+start:
 
 - **`PUT /v1/nodes/{id}/capabilities`** strict-decodes a `CapabilityManifestRequest`
   (`DisallowUnknownFields`) and enforces its invariants: a non-empty
@@ -89,6 +90,18 @@ report and the edge PSK route were gated from the start:
   `404 peer_not_found` for a `peer_node_id` that is not one of the two fixture
   peers or names the node itself. Only a request that passes both gets an
   envelope. See [the route](#get-v1-nodes-id-peers-peer-node-id-psk).
+- **`PUT /v1/nodes/{id}/endpoint-candidates`** caps the body at 4 KiB
+  (`413 endpoint_candidates_body_too_large`) and strict-decodes it into
+  mock-local pointer types, so a missing or `null` member is refused as missing
+  rather than passing as a zero value. It answers in the contract's gate order:
+  `400 malformed_endpoint_candidates` for invalid JSON, an unknown field, a
+  missing or `null` `candidates`, a missing or zero `reported_at`, more than 8
+  entries, or an entry spelled exactly like an earlier one; then
+  `400 endpoint_clock_skew` for a `reported_at` more than 60s from the mock's
+  clock; then `400 endpoint_candidate_unparseable` for an entry that fails
+  `netip.ParseAddrPort`, has port 0 or a zone, or names a loopback, link-local,
+  multicast or unspecified host. An empty array is accepted. See
+  [the route](#put-v1-nodes-id-endpoint-candidates).
 
 ### `GET /test/bearer`
 
@@ -347,6 +360,54 @@ closed `nat_type` enum, clock-skew tolerance, and a routable `ip:port`.
 
 **Error:** Denials use `application/problem+json` with the codes above. Returns `405` if the HTTP method is not `PUT`.
 
+### `PUT /v1/nodes/{id}/endpoint-candidates`
+
+Enforces the endpoint candidates contract: a 4 KiB body cap, strict JSON
+decoding, the report's structural invariants, clock-skew tolerance, and a
+dialable `host:port` per entry. The body is captured under
+`endpoint-candidates` and decoded into mock-local pointer types, so a missing or
+`null` member is told apart from a zero one. The bound of 8 entries is the
+mock's own copy of the contract's, not `api.MaxEndpointCandidates`, so it checks
+the contract rather than the agent's reading of it.
+`endpoint_candidates_count` increments only when every check passes.
+
+**Validation order.** The handler returns at the first failure:
+
+1. **Body size** → `413` `endpoint_candidates_body_too_large` if the body exceeds 4 KiB.
+2. **Body decode** → `400` `malformed_endpoint_candidates` if the body is not valid JSON or carries an unknown field.
+3. **Report shape** → `400` `malformed_endpoint_candidates` if `candidates` is missing or `null`, `reported_at` is missing or zero, `candidates` holds more than 8 entries, or an entry repeats an earlier one exactly. The `detail` of a repeat names the entry: `candidates[<i>] repeats an earlier entry.`
+4. **Clock skew** → `400` `endpoint_clock_skew` if `reported_at` is more than 60s from the mock's clock in either direction.
+5. **Entries** → `400` `endpoint_candidate_unparseable` if an entry fails `netip.ParseAddrPort`, has port 0 or a zone, or its host, with an IPv4-mapped IPv6 address unmapped, is loopback, link-local unicast, link-local multicast, multicast or unspecified. The `detail` names the entry: `candidates[<i>] is not a host:port pair with a non-zero port, a routable address and no zone.`
+
+**Request body:**
+
+```json
+{
+  "candidates": ["10.0.0.5:51820", "[fd00:10::5]:51820"],
+  "reported_at": "2026-10-21T10:15:30Z"
+}
+```
+
+`"candidates": []` is a valid report that withdraws every earlier candidate.
+
+**Response:** `200 OK`
+
+```json
+{
+  "accepted_at": "2026-10-21T10:15:30Z",
+  "stale_after": "2026-10-21T10:20:30Z"
+}
+```
+
+`stale_after` is `accepted_at` plus the TTL `POST /test/configure-endpoint` sets
+for the endpoint report (default 5m).
+
+**Content-Type:** `application/json` (errors use `application/problem+json`).
+
+**Counter:** Increments `endpoint_candidates_count` only when every check passes.
+
+**Error:** Denials use `application/problem+json` with the codes above. A request without the bearer envelope is refused with `401` by the [authentication gate](#authentication). Returns `405` if the HTTP method is not `PUT`.
+
 ### `POST /v1/nodes/{id}/handshakes`
 
 Enforces the v1 handshake report contract (`PostNodeHandshakes`): a 1 MiB body
@@ -450,7 +511,7 @@ The active fixture can be replaced at runtime via `POST /test/configure-state`.
 
 | Block | Default Value |
 |-------|---------------|
-| `peers` | 2 mesh peers (node_id ascending), no `psk`/`allowed_ips`; `...a0b1` carries only `fallback_endpoint`, `...a0b2` only a direct `endpoint` |
+| `peers` | 2 mesh peers (node_id ascending), no `psk`/`allowed_ips`; `...a0b1` carries `fallback_endpoint` and one `endpoint_candidates` entry (`192.0.2.10:51820`) but no direct `endpoint`, `...a0b2` only a direct `endpoint` |
 | `reachability` | `{"state":"never_reported", ...}` — the mock accepts heartbeats but never evaluates them into a projection |
 | `policy` | merged block: 2 rules, `fingerprint` from `policyFingerprint` |
 | `bridge.relay` | 1 relay session assignment (`relay-sess-001`) |
@@ -460,6 +521,13 @@ The active fixture can be replaced at runtime via `POST /test/configure-state`.
 | `state` / `reports` | `metadata` (2 entries), `data` (2 entries), `reports` (`[]`) |
 | `executions` | `[]` — no dispatch queued; phases configure entries explicitly |
 | `sessions` | `[]` — no session issued; phases configure entries explicitly |
+
+The two peers give the agent's dial order both shapes. Peer `...a0b1`'s order is
+its candidate `192.0.2.10:51820`, then its fallback `203.0.113.1:51820`. No node
+holds its key, so no handshake ever completes, and on a device that came up the
+agent's endpoint selection switches it from the first entry to the second once
+the first times out. The [Docker e2e run](docker-e2e-test.md#phase-3-cont-endpoint-candidates-and-endpoint-selection)
+asserts that switch.
 
 The `fingerprint` is produced by the mock-internal `policyFingerprint` helper — a
 44-char base64 SHA-256 over the compact-JSON encoding of the rules slice. This
@@ -475,7 +543,8 @@ comparison key and never re-derives it from the rules.
       "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
       "mesh_ip": "10.99.0.2",
       "public_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
-      "fallback_endpoint": "203.0.113.1:51820"
+      "fallback_endpoint": "203.0.113.1:51820",
+      "endpoint_candidates": ["192.0.2.10:51820"]
     },
     {
       "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
@@ -902,6 +971,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "key_rotate_count": 0,
   "capabilities_count": 0,
   "endpoint_count": 0,
+  "endpoint_candidates_count": 0,
   "secrets_count": 0,
   "secrets_rate_limited_count": 0,
   "report_put_count": 0,
@@ -1050,9 +1120,9 @@ Alias for `POST /test/configure-state`. Same behavior.
 
 ### `POST /test/configure-endpoint`
 
-Sets the `stale_after` TTL applied by `PUT /v1/nodes/{id}/endpoint`. Lets a test
-shorten the TTL below the refresh interval to exercise the deadline-driven
-re-report path.
+Sets the `stale_after` TTL applied by `PUT /v1/nodes/{id}/endpoint` and
+`PUT /v1/nodes/{id}/endpoint-candidates`. Lets a test shorten the TTL below the
+refresh interval to exercise the deadline-driven re-report path.
 
 **Request body:**
 
@@ -1231,6 +1301,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `key_rotate_count` | `POST /v1/keys/rotate` (completed rotations only) |
 | `capabilities_count` | `PUT /v1/nodes/{id}/capabilities` (accepted manifests only) |
 | `endpoint_count` | `PUT /v1/nodes/{id}/endpoint` |
+| `endpoint_candidates_count` | `PUT /v1/nodes/{id}/endpoint-candidates` (accepted reports only, `200`) |
 | `secrets_count` | `GET /v1/nodes/{id}/secrets/{key}` (served `200` envelopes only) |
 | `secrets_rate_limited_count` | `GET /v1/nodes/{id}/secrets/{key}` (armed `429` responses only) |
 | `report_put_count` | `PUT /v1/nodes/{id}/state/reports/{key}` (accepted upserts only) |

@@ -329,7 +329,7 @@ On reader error, returns `nil, fmt.Errorf("metrics: tunnel: %w", err)`.
 
 ### Wiring in `plexd up`
 
-`plexd up` registers a `TunnelCollector` only when the WireGuard interface came up. Without the interface it logs `wireguard unavailable, skipping peer reconcile handler, handshake reports and tunnel metrics`. The collector adds no configuration of its own: it follows `metrics.enabled` and `metrics.collect_interval`.
+`plexd up` registers a `TunnelCollector` only when the WireGuard interface came up. Without the interface it logs `wireguard unavailable, skipping peer reconcile handler, handshake reports, tunnel metrics, endpoint selection and endpoint candidates`. The collector adds no configuration of its own: it follows `metrics.enabled` and `metrics.collect_interval`.
 
 Its reader is `wgTunnelStatsReader` (`cmd/plexd/cmd/up.go`), which calls [`wireguard.Manager.MeshPeerStats`](../networking/wireguard.md#mesh-peer-stats) and maps each mesh peer to one `TunnelStats`:
 

@@ -12,7 +12,7 @@ The test runs fourteen phases:
 
 1. **Initial assertions** — all 7 counters >= 1 (agent started and contacted all endpoints)
 2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, and metrics data
-3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously), then a handshake report and a `tunnel_health` sample for a fixture peer when WireGuard came up in the container (script phase `4b`), and an edge PSK fetch for each fixture peer under the same condition (script phase `4c`)
+3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously), then a handshake report and a `tunnel_health` sample for a fixture peer when WireGuard came up in the container (script phase `4b`), an edge PSK fetch for each fixture peer under the same condition (script phase `4c`), and an endpoint candidates report and an endpoint selection switch on a fixture peer under the same condition (script phase `4d`)
 4. **Log injection** — injects a log file via `docker cp`, verifies logs_count increases (FileSource pipeline works)
 5. **Agent restart for audit** — restarts the plexd container and verifies `local_audit_count` increases (ProcessSource fires per-process). The platform leg carries nothing: plexd's own `process` source is outside the ingest contract's closed enum (`auditd`, `k8s`), so `audit_count` must stay at 0.
 6. **SSE event injection** — injects a `node_state_updated` event and verifies state_count increases (proves SSE stream is connected)
@@ -132,6 +132,24 @@ With the line it checks two things:
 
 1. Polls `GET /test/assertions` for up to 60 seconds until `edge_psk_count` >= 2, which shows the mock served both envelopes. plexd syncs its edge PSKs on every pull, before the WireGuard handler adds the peers, so the first pull after start fetches the PSK of both fixture peers.
 2. For each fixture node ID, polls `dc logs plexd` for up to 30 seconds for an `edge psk fetched` line naming that peer, which shows plexd opened its envelope. plexd writes the line only after the envelope opened under the NSK with the edge's additional authenticated data. The line names the peer and the epoch, never the key. The log is read line by line and matched with `case`, for the same `pipefail` reason as in phase `4b`.
+
+### Phase 3 (cont.): Endpoint Candidates and Endpoint Selection
+
+Runs as script phase `4d`, directly after phase `4c`, and checks the two halves of endpoint candidates: the [candidate publisher](../networking/nat-traversal.md#local-endpoint-candidates) reporting this container's addresses to the mock's [candidates route](mock-api-server.md#put-v1-nodes-id-endpoint-candidates), and [endpoint selection](../networking/wireguard.md#endpoint-selection) moving a fixture peer along its dial order. The e2e config leaves `wireguard.persistent_keepalive` and `nat.local_candidates` unset, which read as 25s and enabled.
+
+plexd publishes candidates and runs endpoint selection only when its WireGuard interface came up, so the phase reuses phase `4b`'s check for `wireguard interface configured`. Without the line it prints:
+
+```text
+SKIP: endpoint candidates and endpoint selection (WireGuard did not come up in this container)
+```
+
+With the line it checks three things:
+
+1. Polls `GET /test/assertions` every 3 seconds for up to 30 seconds until `endpoint_candidates_count` >= 1. The publisher reports once when it starts, so the report has usually landed by the time the phase runs.
+2. Reads `GET /test/last-request/endpoint-candidates` and asserts with `jq` that the body has exactly the keys `candidates` and `reported_at`, that `candidates` is an array of 1 to 8 entries, that every entry ends in `:51820` (the `wireguard.listen_port` in `plexd-e2e.yaml`), and that no entry starts with `10.99.0.`, the mock's mesh prefix. Each `jq` expression answers `true` only when its check holds, so a `jq` error fails the check rather than passing it.
+3. Polls `dc logs plexd` every 3 seconds for up to 75 seconds for a line that contains both `trying next endpoint candidate` and the fixture node ID `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1`. That peer's dial order is its candidate `192.0.2.10:51820`, then its fallback `203.0.113.1:51820`. No node holds its key, so no handshake completes, and endpoint selection switches to the fallback once the first entry has gone 30 seconds without one (the 25s keepalive plus 5s). The 75 seconds cover that timeout, counted from the pull that programmed the peer, with room for the 5-second selection tick and a slow start. The log is read line by line and matched with `case`, as in phase `4b`.
+
+This phase is the only run anywhere that switches an endpoint on a real device, so it must not be weakened to the skip path.
 
 ### Phase 4: Log Injection
 
