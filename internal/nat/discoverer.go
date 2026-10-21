@@ -265,11 +265,7 @@ func (d *Discoverer) Run(ctx context.Context, reporter EndpointReporter, nodeID 
 // each shortened cycle is logged and MinReportInterval bounds how far it can
 // go.
 func (d *Discoverer) nextDelay(staleAfter time.Time) time.Duration {
-	if staleAfter.IsZero() {
-		return d.cfg.RefreshInterval
-	}
-	deadlineDelay := time.Until(staleAfter) - endpointReportMargin
-	delay := min(d.cfg.RefreshInterval, max(d.cfg.MinReportInterval, deadlineDelay))
+	delay := reportDelay(d.cfg, staleAfter, time.Now())
 	if delay < d.cfg.RefreshInterval {
 		d.logger.Warn("control plane deadline shortens the endpoint report cadence",
 			"component", "nat",
@@ -280,4 +276,17 @@ func (d *Discoverer) nextDelay(staleAfter time.Time) time.Duration {
 		)
 	}
 	return delay
+}
+
+// reportDelay is the arithmetic behind nextDelay, shared with the candidate
+// publisher: RefreshInterval for a zero staleAfter, otherwise
+// endpointReportMargin before the deadline as seen from now, floored at
+// MinReportInterval and capped at RefreshInterval. It logs nothing, so each
+// caller words its own Warn on a shortened cadence.
+func reportDelay(cfg Config, staleAfter, now time.Time) time.Duration {
+	if staleAfter.IsZero() {
+		return cfg.RefreshInterval
+	}
+	deadlineDelay := staleAfter.Sub(now) - endpointReportMargin
+	return min(cfg.RefreshInterval, max(cfg.MinReportInterval, deadlineDelay))
 }

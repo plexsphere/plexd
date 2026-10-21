@@ -1,8 +1,11 @@
 package nat
 
 import (
+	"slices"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestConfig_Defaults(t *testing.T) {
@@ -169,5 +172,93 @@ func TestConfig_ValidateAcceptsCustomValues(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() = %v, want nil", err)
+	}
+}
+
+func TestConfig_LocalCandidatesEnabled(t *testing.T) {
+	enabled, disabled := true, false
+	tests := []struct {
+		name  string
+		value *bool
+		want  bool
+	}{
+		{name: "nil", value: nil, want: true},
+		{name: "true", value: &enabled, want: true},
+		{name: "false", value: &disabled, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{LocalCandidates: tt.value}
+			if got := cfg.LocalCandidatesEnabled(); got != tt.want {
+				t.Errorf("LocalCandidatesEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfig_ValidateRejectsEmptyCandidateInterface(t *testing.T) {
+	const want = "nat: config: CandidateInterfaces must not contain an empty name"
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{name: "enabled", cfg: Config{
+			Enabled:             true,
+			STUNServers:         DefaultSTUNServers,
+			RefreshInterval:     60 * time.Second,
+			Timeout:             5 * time.Second,
+			MinReportInterval:   10 * time.Second,
+			CandidateInterfaces: []string{"ens3", " "},
+		}},
+		// The publisher runs whether or not STUN traversal is enabled, so the
+		// check must not hide behind the Enabled early return.
+		{name: "disabled", cfg: Config{
+			Enabled:             false,
+			CandidateInterfaces: []string{"ens3", " "},
+		}},
+		{name: "empty string", cfg: Config{
+			Enabled:             false,
+			CandidateInterfaces: []string{""},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate() = nil, want error for an empty CandidateInterfaces entry")
+			}
+			if err.Error() != want {
+				t.Errorf("Validate() error = %q, want %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+func TestConfig_ValidateAcceptsCandidateInterfaces(t *testing.T) {
+	cfg := Config{CandidateInterfaces: []string{"ens3", "eth1"}}
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil", err)
+	}
+}
+
+func TestConfig_LocalCandidatesYAML(t *testing.T) {
+	var cfg Config
+	if err := yaml.Unmarshal([]byte("local_candidates: false\ncandidate_interfaces: [ens3]\n"), &cfg); err != nil {
+		t.Fatalf("yaml.Unmarshal: %v", err)
+	}
+	if cfg.LocalCandidatesEnabled() {
+		t.Error("local_candidates: false parsed as enabled")
+	}
+	if want := []string{"ens3"}; !slices.Equal(cfg.CandidateInterfaces, want) {
+		t.Errorf("CandidateInterfaces = %v, want %v", cfg.CandidateInterfaces, want)
+	}
+
+	var unset Config
+	if err := yaml.Unmarshal([]byte("refresh_interval: 30s\n"), &unset); err != nil {
+		t.Fatalf("yaml.Unmarshal: %v", err)
+	}
+	if !unset.LocalCandidatesEnabled() {
+		t.Error("absent local_candidates parsed as disabled, want enabled")
 	}
 }
