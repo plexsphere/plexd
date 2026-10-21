@@ -771,6 +771,248 @@ func TestReportHandshakes_EmptyBody(t *testing.T) {
 	}
 }
 
+// testCandidatesReportedAt is the reported_at of the contract's request example.
+var testCandidatesReportedAt = time.Date(2026, 10, 21, 10, 15, 30, 0, time.UTC)
+
+// testCandidates builds n distinct, well-formed endpoint candidates.
+func testCandidates(n int) []string {
+	candidates := make([]string, n)
+	for i := range candidates {
+		candidates[i] = fmt.Sprintf("10.0.0.%d:51820", i+1)
+	}
+	return candidates
+}
+
+// strictDecodeEndpointCandidates decodes body the way the control plane's
+// handler does, refusing an unknown field, and fails the test when it does not
+// decode.
+func strictDecodeEndpointCandidates(t *testing.T, body []byte) EndpointCandidatesRequest {
+	t.Helper()
+	var req EndpointCandidatesRequest
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		t.Fatalf("strict decode of the endpoint candidate report: %v (body: %s)", err, body)
+	}
+	return req
+}
+
+func TestReportEndpointCandidates_Success(t *testing.T) {
+	acceptedAt := testCandidatesReportedAt.Add(123 * time.Millisecond)
+	staleAfter := acceptedAt.Add(5 * time.Minute)
+
+	var gotMethod, gotPath, gotAuth string
+	var gotBody []byte
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		var err error
+		if gotBody, err = io.ReadAll(r.Body); err != nil {
+			t.Errorf("read request: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(EndpointCandidatesResponse{
+			AcceptedAt: acceptedAt,
+			StaleAfter: staleAfter,
+		})
+	})
+
+	candidates := []string{"10.0.0.5:51820", "[fd00:10::5]:51820"}
+	resp, err := client.ReportEndpointCandidates(context.Background(), "n1", EndpointCandidatesRequest{
+		Candidates: candidates,
+		ReportedAt: testCandidatesReportedAt,
+	})
+	if err != nil {
+		t.Fatalf("ReportEndpointCandidates: %v", err)
+	}
+
+	if gotMethod != http.MethodPut {
+		t.Errorf("method = %s, want PUT", gotMethod)
+	}
+	if gotPath != "/v1/nodes/n1/endpoint-candidates" {
+		t.Errorf("path = %s, want /v1/nodes/n1/endpoint-candidates", gotPath)
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer test-token")
+	}
+
+	got := strictDecodeEndpointCandidates(t, gotBody)
+	if !got.ReportedAt.Equal(testCandidatesReportedAt) {
+		t.Errorf("reported_at = %v, want %v", got.ReportedAt, testCandidatesReportedAt)
+	}
+	if !slices.Equal(got.Candidates, candidates) {
+		t.Errorf("candidates = %v, want %v", got.Candidates, candidates)
+	}
+
+	if !resp.AcceptedAt.Equal(acceptedAt) {
+		t.Errorf("AcceptedAt = %v, want %v", resp.AcceptedAt, acceptedAt)
+	}
+	if !resp.StaleAfter.Equal(staleAfter) {
+		t.Errorf("StaleAfter = %v, want %v", resp.StaleAfter, staleAfter)
+	}
+}
+
+// An empty report withdraws every earlier candidate, but the contract answers
+// a null candidates with 400 malformed_endpoint_candidates. A nil slice, which
+// is what a node without an eligible address naturally holds, must therefore
+// reach the wire as an empty array, without touching the caller's request.
+func TestReportEndpointCandidates_CandidatesNeverNull(t *testing.T) {
+	tests := []struct {
+		name       string
+		candidates []string
+	}{
+		{"nil", nil},
+		{"empty", []string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body []byte
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				var err error
+				if body, err = io.ReadAll(r.Body); err != nil {
+					t.Errorf("read request: %v", err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"accepted_at":"2026-10-21T10:15:30Z","stale_after":"2026-10-21T10:20:30Z"}`)
+			})
+
+			req := EndpointCandidatesRequest{Candidates: tt.candidates, ReportedAt: testCandidatesReportedAt}
+			if _, err := client.ReportEndpointCandidates(context.Background(), "n1", req); err != nil {
+				t.Fatalf("ReportEndpointCandidates: %v", err)
+			}
+
+			const want = `{"candidates":[],"reported_at":"2026-10-21T10:15:30Z"}`
+			if got := strings.TrimSpace(string(body)); got != want {
+				t.Errorf("request body =\n  %s\nwant\n  %s", got, want)
+			}
+			if (req.Candidates == nil) != (tt.candidates == nil) || len(req.Candidates) != 0 {
+				t.Errorf("caller's Candidates = %#v after the call, want %#v", req.Candidates, tt.candidates)
+			}
+		})
+	}
+}
+
+func TestReportEndpointCandidates_Ceiling(t *testing.T) {
+	t.Run("over the ceiling is refused unsent", func(t *testing.T) {
+		client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Errorf("an oversized candidate report reached the control plane: %s", r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		})
+
+		resp, err := client.ReportEndpointCandidates(context.Background(), "n1", EndpointCandidatesRequest{
+			Candidates: testCandidates(MaxEndpointCandidates + 1),
+			ReportedAt: testCandidatesReportedAt,
+		})
+		if !errors.Is(err, ErrEndpointCandidatesTooMany) {
+			t.Fatalf("error = %v, want %v", err, ErrEndpointCandidatesTooMany)
+		}
+		const wantMsg = "api: report endpoint candidates: 9 candidates: endpoint candidate report exceeds 8 candidates"
+		if err.Error() != wantMsg {
+			t.Errorf("error = %q, want %q", err.Error(), wantMsg)
+		}
+		if resp != nil {
+			t.Errorf("response = %+v, want nil", resp)
+		}
+	})
+
+	t.Run("at the ceiling is sent", func(t *testing.T) {
+		var gotBody []byte
+		client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			var err error
+			if gotBody, err = io.ReadAll(r.Body); err != nil {
+				t.Errorf("read request: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"accepted_at":"2026-10-21T10:15:30Z","stale_after":"2026-10-21T10:20:30Z"}`)
+		})
+
+		candidates := testCandidates(MaxEndpointCandidates)
+		if _, err := client.ReportEndpointCandidates(context.Background(), "n1", EndpointCandidatesRequest{
+			Candidates: candidates,
+			ReportedAt: testCandidatesReportedAt,
+		}); err != nil {
+			t.Fatalf("ReportEndpointCandidates: %v", err)
+		}
+		if got := strictDecodeEndpointCandidates(t, gotBody); !slices.Equal(got.Candidates, candidates) {
+			t.Errorf("request candidates = %v, want %v", got.Candidates, candidates)
+		}
+	})
+}
+
+// A gateway that answers 200 with no body has not handed back a receipt, and
+// the caller must not read the zero stale_after as "no deadline".
+func TestReportEndpointCandidates_EmptyBody(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	resp, err := client.ReportEndpointCandidates(context.Background(), "n1", EndpointCandidatesRequest{
+		ReportedAt: testCandidatesReportedAt,
+	})
+	if err == nil || !strings.HasPrefix(err.Error(), "api: decode response:") {
+		t.Fatalf("error = %v, want one starting %q", err, "api: decode response:")
+	}
+	if resp != nil {
+		t.Errorf("response = %+v, want nil", resp)
+	}
+}
+
+func TestReportEndpointCandidates_UnparseableProblem(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"title":"Bad Request","status":400,"detail":"candidates[1] is not a host:port pair with a non-zero port, a routable address and no zone.","code":"endpoint_candidate_unparseable"}`)
+	})
+
+	resp, err := client.ReportEndpointCandidates(context.Background(), "n1", EndpointCandidatesRequest{
+		Candidates: []string{"10.0.0.5:51820", "10.0.0.6:0"},
+		ReportedAt: testCandidatesReportedAt,
+	})
+	if resp != nil {
+		t.Errorf("response = %+v, want nil", resp)
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("errors.As failed to extract *APIError: %v", err)
+	}
+	if apiErr.StatusCode != http.StatusBadRequest {
+		t.Errorf("StatusCode = %d, want 400", apiErr.StatusCode)
+	}
+	if apiErr.Code != "endpoint_candidate_unparseable" {
+		t.Errorf("Code = %q, want %q", apiErr.Code, "endpoint_candidate_unparseable")
+	}
+}
+
+func TestReportEndpointCandidates_PathParametersEscaped(t *testing.T) {
+	// Verify the nodeID is escaped, so it cannot climb out of its segment.
+	var gotPath string
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RawPath
+		if gotPath == "" {
+			gotPath = r.URL.Path
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"accepted_at":"2026-10-21T10:15:30Z","stale_after":"2026-10-21T10:20:30Z"}`))
+	})
+
+	_, err := client.ReportEndpointCandidates(context.Background(), "../../../etc/passwd", EndpointCandidatesRequest{
+		ReportedAt: testCandidatesReportedAt,
+	})
+	if err != nil {
+		t.Fatalf("ReportEndpointCandidates: %v", err)
+	}
+
+	const want = "/v1/nodes/..%2F..%2F..%2Fetc%2Fpasswd/endpoint-candidates"
+	if gotPath != want {
+		t.Errorf("path = %s, want %s", gotPath, want)
+	}
+}
+
 func TestFetchSecret_Success(t *testing.T) {
 	envelope := []byte("\x00\x01\x02nonce+ciphertext+tag-bytes")
 	var gotQuery string

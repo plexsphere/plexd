@@ -42,10 +42,15 @@ type RegisterPeer struct {
 
 // Peer is the internal WireGuard programming shape built by peerFromSnapshot.
 type Peer struct {
-	ID         string   `json:"id"`
-	PublicKey  string   `json:"public_key"`
-	MeshIP     string   `json:"mesh_ip"`
-	Endpoint   string   `json:"endpoint"`
+	ID        string `json:"id"`
+	PublicKey string `json:"public_key"`
+	MeshIP    string `json:"mesh_ip"`
+	// Endpoint is the first entry of Endpoints, or empty when the peer has no
+	// endpoint to dial.
+	Endpoint string `json:"endpoint"`
+	// Endpoints is the peer's dial order: the endpoints the WireGuard manager
+	// tries one after another until a handshake completes.
+	Endpoints  []string `json:"endpoints,omitempty"`
 	AllowedIPs []string `json:"allowed_ips"`
 	PSK        string   `json:"psk"`
 }
@@ -109,6 +114,11 @@ type SnapshotPeer struct {
 	// when Endpoint is absent or unusable.
 	Endpoint         string `json:"endpoint,omitempty"`
 	FallbackEndpoint string `json:"fallback_endpoint,omitempty"`
+	// EndpointCandidates are the peer's last accepted, unexpired endpoint
+	// candidates (PUT /v1/nodes/{node_id}/endpoint-candidates) as host:port
+	// strings, in the order the peer sent them. The field is absent when the
+	// peer has none, and on every control plane that does not deliver them.
+	EndpointCandidates []string `json:"endpoint_candidates,omitempty"`
 }
 
 // ReachabilitySnapshot is the interior of the snapshot's reachability block: the
@@ -666,6 +676,35 @@ type EndpointRequest struct {
 
 type EndpointResponse struct {
 	AcceptedAt time.Time `json:"accepted_at"`
+	StaleAfter time.Time `json:"stale_after"`
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint Candidates  PUT /v1/nodes/{node_id}/endpoint-candidates
+// ---------------------------------------------------------------------------
+
+// MaxEndpointCandidates is the contract's ceiling on one candidate report.
+const MaxEndpointCandidates = 8
+
+// EndpointCandidatesRequest is the body of
+// PUT /v1/nodes/{node_id}/endpoint-candidates: the node's local interface
+// addresses joined with its WireGuard listen port. Each report replaces the
+// previous set, so an empty Candidates withdraws every earlier candidate.
+type EndpointCandidatesRequest struct {
+	// Candidates holds 0 to MaxEndpointCandidates distinct host:port strings,
+	// an IPv6 host in brackets and without a zone. A null array is refused,
+	// so ReportEndpointCandidates sends nil as [].
+	Candidates []string `json:"candidates"` // never null on the wire
+	// ReportedAt must lie within 60 seconds of server time, or the report is
+	// refused with 400 endpoint_clock_skew.
+	ReportedAt time.Time `json:"reported_at"`
+}
+
+// EndpointCandidatesResponse is the 200 body of
+// PUT /v1/nodes/{node_id}/endpoint-candidates.
+type EndpointCandidatesResponse struct {
+	AcceptedAt time.Time `json:"accepted_at"`
+	// StaleAfter is the deadline after which the control plane drops the set.
 	StaleAfter time.Time `json:"stale_after"`
 }
 

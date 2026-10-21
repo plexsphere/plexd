@@ -96,6 +96,33 @@ func (c *ControlPlane) ReportEndpoint(ctx context.Context, nodeID string, req En
 	return &resp, nil
 }
 
+// ReportEndpointCandidates reports the node's local endpoint candidates, which
+// replace every candidate it reported before, and returns the control plane's
+// receipt.
+//
+// A nil Candidates is sent as an empty array: the contract refuses a null
+// candidates with 400 malformed_endpoint_candidates, while an empty array
+// withdraws the earlier set. The substitution is made on a copy, so the
+// caller's request is left as passed. A report over MaxEndpointCandidates is
+// refused here, before any request, as ReportHandshakes refuses an oversized
+// report.
+// PUT /v1/nodes/{node_id}/endpoint-candidates
+func (c *ControlPlane) ReportEndpointCandidates(ctx context.Context, nodeID string, req EndpointCandidatesRequest) (*EndpointCandidatesResponse, error) {
+	if len(req.Candidates) > MaxEndpointCandidates {
+		return nil, fmt.Errorf("api: report endpoint candidates: %d candidates: %w", len(req.Candidates), ErrEndpointCandidatesTooMany)
+	}
+	body := req
+	if body.Candidates == nil {
+		body.Candidates = []string{}
+	}
+	var resp EndpointCandidatesResponse
+	path := fmt.Sprintf("/v1/nodes/%s/endpoint-candidates", url.PathEscape(nodeID))
+	if err := c.doRequest(ctx, http.MethodPut, path, body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // ReportHandshakes reports the age of the latest WireGuard handshake with each
 // mesh peer and the endpoint WireGuard used for it, and returns the control
 // plane's receipt.

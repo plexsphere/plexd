@@ -742,6 +742,46 @@ func TestErrHandshakeReportTooMany(t *testing.T) {
 	}
 }
 
+func TestIsEndpointCandidatesNotServed(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// An older control plane has no route, so its router's 404 carries
+		// whatever code its not-found handler writes, or none.
+		{"404 without a code", &APIError{StatusCode: 404}, true},
+		{"404 with a router code", &APIError{StatusCode: 404, Code: "not_found"}, true},
+		{"wrapped 404", fmt.Errorf("report endpoint candidates: %w", &APIError{StatusCode: 404}), true},
+		{"501 with the provisioning code", &APIError{StatusCode: 501, Code: "endpoint_candidates_not_provisioned"}, true},
+		{"404 endpoint_peer_not_found is the first-report race", &APIError{StatusCode: 404, Code: "endpoint_peer_not_found"}, false},
+		{"410 endpoint_peer_gone", &APIError{StatusCode: 410, Code: "endpoint_peer_gone"}, false},
+		{"501 with another surface's code", &APIError{StatusCode: 501, Code: "handshakes_not_provisioned"}, false},
+		{"500", &APIError{StatusCode: 500}, false},
+		{"non-API error", errors.New("dial tcp: timeout"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsEndpointCandidatesNotServed(tt.err); got != tt.want {
+				t.Errorf("IsEndpointCandidatesNotServed(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestErrEndpointCandidatesTooMany(t *testing.T) {
+	const want = "endpoint candidate report exceeds 8 candidates"
+	if got := ErrEndpointCandidatesTooMany.Error(); got != want {
+		t.Errorf("ErrEndpointCandidatesTooMany.Error() = %q, want %q", got, want)
+	}
+
+	wrapped := fmt.Errorf("api: report endpoint candidates: %d candidates: %w", 9, ErrEndpointCandidatesTooMany)
+	if !errors.Is(wrapped, ErrEndpointCandidatesTooMany) {
+		t.Errorf("errors.Is(wrapped, ErrEndpointCandidatesTooMany) = false, want true")
+	}
+}
+
 func TestIsSessionRevokedOrExpired(t *testing.T) {
 	tests := []struct {
 		name string
