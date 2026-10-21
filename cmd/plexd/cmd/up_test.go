@@ -2407,6 +2407,197 @@ func TestRunUp_SkipsHandshakeReportsWithoutWireGuard(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Endpoint candidates
+// ---------------------------------------------------------------------------
+
+// candidateReport is one request the candidate control plane received on a
+// path ending in /endpoint-candidates.
+type candidateReport struct {
+	method string
+	path   string
+	body   []byte
+}
+
+// candidateControlPlane registers the node with upTestMeshPrefix as its Domain
+// mesh prefix, counts heartbeats, records every endpoint candidate report and
+// answers everything else with an empty JSON object.
+type candidateControlPlane struct {
+	mu         sync.Mutex
+	heartbeats int
+	reports    []candidateReport
+}
+
+// upTestMeshPrefix is the Domain mesh prefix the candidate control plane
+// registers the node into.
+var upTestMeshPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+func newCandidateControlPlane(t *testing.T) (*candidateControlPlane, string) {
+	t.Helper()
+	cp := &candidateControlPlane{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/register":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(api.RegisterResponse{
+				NodeID:           upTestNodeID,
+				MeshIP:           "100.64.0.1",
+				SigningPublicKey: upTestSigningKey,
+				SigningKeyID:     upTestSigningKID,
+				NSK:              upTestNSK,
+				DomainMeshCIDR:   upTestMeshPrefix.String(),
+				PeerSnapshot:     []api.RegisterPeer{},
+			})
+			return
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			cp.mu.Lock()
+			cp.heartbeats++
+			cp.mu.Unlock()
+		case strings.HasSuffix(r.URL.Path, "/endpoint-candidates"):
+			raw, _ := io.ReadAll(r.Body)
+			cp.mu.Lock()
+			cp.reports = append(cp.reports, candidateReport{method: r.Method, path: r.URL.Path, body: raw})
+			cp.mu.Unlock()
+			now := time.Now().UTC()
+			_ = json.NewEncoder(w).Encode(api.EndpointCandidatesResponse{AcceptedAt: now, StaleAfter: now.Add(5 * time.Minute)})
+			return
+		}
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(srv.Close)
+	return cp, srv.URL
+}
+
+func (cp *candidateControlPlane) counts() (heartbeats, reports int) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.heartbeats, len(cp.reports)
+}
+
+// waitForFirstHeartbeat blocks until the daemon has sent a heartbeat and
+// returns how many it has sent by then. The heartbeat starts after
+// registration and every subsystem before it, so the window over the
+// publisher opens there; how long startup takes is not what these tests pin.
+func (cp *candidateControlPlane) waitForFirstHeartbeat(t *testing.T) int {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if heartbeats, _ := cp.counts(); heartbeats > 0 {
+			return heartbeats
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the daemon never sent a heartbeat")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// With the interface up, the daemon publishes this host's interface addresses
+// joined with its listen port, leaving out every address of the mesh prefix.
+// The host's own interfaces decide how many entries there are, so an empty
+// report is accepted as well; its shape is what this test pins.
+func TestRunUp_PublishesEndpointCandidates(t *testing.T) {
+	// Outside a cluster no PlexdHook list runs; an ambient
+	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+	const listenPort = 51999
+	cp, apiBase := newCandidateControlPlane(t)
+	useWGController(t, &statsWGController{})
+	writeUpConfig(t, apiBase, upDaemonYAML(t)+"heartbeat:\n  interval: 1s\nwireguard:\n  listen_port: 51999\n")
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	cp.waitForFirstHeartbeat(t)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, reports := cp.counts(); reports > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no endpoint candidate report within 5s of the first heartbeat")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cp.mu.Lock()
+	report := cp.reports[0]
+	cp.mu.Unlock()
+
+	if report.method != http.MethodPut {
+		t.Errorf("candidate report method = %s, want PUT", report.method)
+	}
+	if want := "/v1/nodes/" + upTestNodeID + "/endpoint-candidates"; report.path != want {
+		t.Errorf("candidate report path = %s, want %s", report.path, want)
+	}
+
+	// Strict decoding, as the handler does: an unknown field fails here.
+	var req api.EndpointCandidatesRequest
+	dec := json.NewDecoder(bytes.NewReader(report.body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		t.Fatalf("candidate report is not contract-shaped: %v (body: %s)", err, report.body)
+	}
+	if req.Candidates == nil {
+		t.Errorf("candidates is null, want an array (body: %s)", report.body)
+	}
+	if len(req.Candidates) > api.MaxEndpointCandidates {
+		t.Errorf("%d candidates, want at most %d (body: %s)", len(req.Candidates), api.MaxEndpointCandidates, report.body)
+	}
+	for _, c := range req.Candidates {
+		ap, err := netip.ParseAddrPort(c)
+		if err != nil {
+			t.Errorf("candidate %q is not host:port: %v", c, err)
+			continue
+		}
+		if ap.Port() != listenPort {
+			t.Errorf("candidate %q does not end in :%d", c, listenPort)
+		}
+		if upTestMeshPrefix.Contains(ap.Addr()) {
+			t.Errorf("candidate %q lies inside the mesh prefix %s", c, upTestMeshPrefix)
+		}
+	}
+}
+
+// The publisher is off with nat.local_candidates: false, and without the
+// interface, since a node without it accepts no tunnel. Heartbeats show the
+// daemon is otherwise running through the same window.
+func TestRunUp_SkipsEndpointCandidates(t *testing.T) {
+	tests := []struct {
+		name  string
+		ctrl  wireguard.WGController
+		extra string
+	}{
+		{"local_candidates false", &statsWGController{}, "nat:\n  local_candidates: false\n"},
+		{"WireGuard did not come up", setupRefusingWGController{}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Outside a cluster no PlexdHook list runs; an ambient
+			// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+			t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+			cp, apiBase := newCandidateControlPlane(t)
+			useWGController(t, tt.ctrl)
+			writeUpConfig(t, apiBase, upDaemonYAML(t)+"heartbeat:\n  interval: 1s\n"+tt.extra)
+			shutdown := startRunUp(t)
+			defer shutdown()
+
+			first := cp.waitForFirstHeartbeat(t)
+			window := time.Now().Add(3 * time.Second)
+			for time.Now().Before(window) {
+				if _, reports := cp.counts(); reports > 0 {
+					t.Fatalf("the daemon sent %d endpoint candidate report(s)", reports)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if heartbeats, _ := cp.counts(); heartbeats < first+2 {
+				t.Errorf("heartbeats = %d after a 3s window that opened at %d, want at least two more at a 1s interval", heartbeats, first)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Session activity rows
 // ---------------------------------------------------------------------------
 
