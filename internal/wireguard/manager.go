@@ -23,30 +23,40 @@ type Manager struct {
 	logger *slog.Logger
 	peers  *PeerIndex
 
-	// mu serializes the device writes that record a peer in programmed with
-	// SetPeerPSK, which rewrites a recorded peer: the reconcile handler and the
-	// edge-PSK store write the same peers from different call paths.
+	// mu guards dial and serializes every mesh peer device write: the
+	// reconcile handler, the edge-PSK store and endpoint selection write the
+	// same peers from different call paths.
 	mu sync.Mutex
-	// programmed is the last peer written per node ID, which SetPeerPSK needs:
-	// every device write replaces the peer's allowed IPs, so a PSK alone cannot
-	// be written without them.
-	programmed map[string]api.Peer
+	// dial is the endpoint selection state per node ID. Its peer is the last
+	// peer written, which SetPeerPSK needs as well: every device write replaces
+	// the peer's allowed IPs, so a PSK alone cannot be written without them.
+	dial map[string]*dialState
 
 	// meshPrefix is the prefix the interface address carries, masked: the
 	// Domain mesh CIDR, or the mesh IP's host /32 when the identity has no
 	// usable CIDR. It is zero until Setup succeeds.
 	meshPrefix netip.Prefix
+
+	// localPrefixes returns the prefixes of this host's interface addresses
+	// that a candidate may be on-link with. It returns nil, nil until
+	// SetLocalPrefixes replaces it.
+	localPrefixes func() ([]netip.Prefix, error)
+
+	// now is endpoint selection's clock; tests replace it.
+	now func() time.Time
 }
 
 // NewManager creates a new Manager. Config defaults are applied automatically.
 func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager {
 	cfg.ApplyDefaults()
 	return &Manager{
-		ctrl:       ctrl,
-		cfg:        cfg,
-		logger:     logger,
-		peers:      NewPeerIndex(),
-		programmed: make(map[string]api.Peer),
+		ctrl:          ctrl,
+		cfg:           cfg,
+		logger:        logger,
+		peers:         NewPeerIndex(),
+		dial:          make(map[string]*dialState),
+		localPrefixes: func() ([]netip.Prefix, error) { return nil, nil },
+		now:           time.Now,
 	}
 }
 
@@ -132,6 +142,13 @@ func (m *Manager) interfaceAddress(identity *registration.NodeIdentity) string {
 // its own tunnel; endpoint selection refuses such an endpoint.
 func (m *Manager) MeshPrefix() netip.Prefix {
 	return m.meshPrefix
+}
+
+// SetLocalPrefixes sets the function the reconcile handler reads this host's
+// interface prefixes from, to order a peer's on-link candidates first. Call
+// it before the handler runs.
+func (m *Manager) SetLocalPrefixes(fn func() ([]netip.Prefix, error)) {
+	m.localPrefixes = fn
 }
 
 // Teardown deletes the WireGuard interface.
@@ -226,20 +243,16 @@ func (m *Manager) UpdatePrivateKey(privateKey []byte) error {
 	return nil
 }
 
-// AddPeer adds a peer to the WireGuard interface and updates the peer index.
+// AddPeer adds a peer to the WireGuard interface with the first entry of its
+// dial order as the endpoint, starts its endpoint selection, and updates the
+// peer index.
 func (m *Manager) AddPeer(peer api.Peer) error {
-	peerCfg, err := m.peerConfig(peer, peer.Endpoint)
-	if err != nil {
-		return fmt.Errorf("wireguard: add peer: %w", err)
-	}
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.ctrl.AddPeer(m.cfg.InterfaceName, peerCfg); err != nil {
+	if err := m.programFirst(peer); err != nil {
 		return fmt.Errorf("wireguard: add peer: %w", err)
 	}
 
-	m.programmed[peer.ID] = peer
 	m.peers.Add(peer.ID, peer.PublicKey)
 
 	m.logger.Debug("peer added",
@@ -276,7 +289,7 @@ func (m *Manager) RemovePeerByID(peerID string) error {
 		return fmt.Errorf("wireguard: remove peer: %w", err)
 	}
 
-	delete(m.programmed, peerID)
+	delete(m.dial, peerID)
 	m.peers.Remove(peerID)
 
 	m.logger.Debug("peer removed",
@@ -288,19 +301,35 @@ func (m *Manager) RemovePeerByID(peerID string) error {
 }
 
 // UpdatePeer updates a peer configuration. WireGuard AddPeer is idempotent (upsert).
+//
+// A connected peer whose public key is unchanged keeps the endpoint on the
+// device, which may be one WireGuard roamed to: the write carries no endpoint,
+// and the selection resumes from the new order's position of the entry last
+// programmed. Any other peer starts over from the first entry of its new
+// order, like AddPeer. A rotated key is a new device peer to WireGuard, which
+// has no endpoint yet.
 func (m *Manager) UpdatePeer(peer api.Peer) error {
-	peerCfg, err := m.peerConfig(peer, peer.Endpoint)
-	if err != nil {
-		return fmt.Errorf("wireguard: update peer: %w", err)
-	}
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.ctrl.AddPeer(m.cfg.InterfaceName, peerCfg); err != nil {
-		return fmt.Errorf("wireguard: update peer: %w", err)
+
+	st, ok := m.dial[peer.ID]
+	if !ok || !st.connected || st.peer.PublicKey != peer.PublicKey {
+		if err := m.programFirst(peer); err != nil {
+			return fmt.Errorf("wireguard: update peer: %w", err)
+		}
+	} else {
+		peerCfg, err := m.peerConfig(peer, "")
+		if err != nil {
+			return fmt.Errorf("wireguard: update peer: %w", err)
+		}
+		if err := m.ctrl.AddPeer(m.cfg.InterfaceName, peerCfg); err != nil {
+			return fmt.Errorf("wireguard: update peer: %w", err)
+		}
+		programmed := st.endpoint()
+		st.peer = peer
+		st.idx = max(slices.Index(st.order(), programmed), 0)
 	}
 
-	m.programmed[peer.ID] = peer
 	m.peers.Update(peer.ID, peer.PublicKey)
 
 	m.logger.Debug("peer updated",
@@ -316,14 +345,15 @@ func (m *Manager) ConfigurePeers(ctx context.Context, peers []api.Peer) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.peers.LoadFromPeers(peers)
-	m.programmed = make(map[string]api.Peer, len(peers))
+	m.dial = make(map[string]*dialState, len(peers))
 
 	for _, peer := range peers {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("wireguard: configure peers: %w", err)
 		}
 
-		peerCfg, err := m.peerConfig(peer, peer.Endpoint)
+		st := &dialState{peer: peer}
+		peerCfg, err := m.peerConfig(peer, st.endpoint())
 		if err != nil {
 			m.logger.Error("failed to convert peer config",
 				"component", "wireguard",
@@ -341,7 +371,8 @@ func (m *Manager) ConfigurePeers(ctx context.Context, peers []api.Peer) error {
 			)
 			continue
 		}
-		m.programmed[peer.ID] = peer
+		st.programmedAt = m.now()
+		m.dial[peer.ID] = st
 	}
 
 	m.logger.Info("peers configured",
@@ -362,11 +393,12 @@ func (m *Manager) ConfigurePeers(ctx context.Context, peers []api.Peer) error {
 func (m *Manager) SetPeerPSK(peerNodeID, publicKey string, psk []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	peer, ok := m.programmed[peerNodeID]
-	if !ok || peer.PublicKey != publicKey {
+	st, ok := m.dial[peerNodeID]
+	if !ok || st.peer.PublicKey != publicKey {
 		return nil
 	}
 
+	peer := st.peer
 	peer.PSK = base64.StdEncoding.EncodeToString(psk)
 	peerCfg, err := m.peerConfig(peer, "")
 	if err != nil {
@@ -375,12 +407,29 @@ func (m *Manager) SetPeerPSK(peerNodeID, publicKey string, psk []byte) error {
 	if err := m.ctrl.AddPeer(m.cfg.InterfaceName, peerCfg); err != nil {
 		return fmt.Errorf("wireguard: set peer psk: %w", err)
 	}
-	m.programmed[peerNodeID] = peer
+	st.peer = peer
 
 	m.logger.Debug("peer psk set",
 		"component", "wireguard",
 		"peer_id", peerNodeID,
 	)
+	return nil
+}
+
+// programFirst writes peer with the first entry of its dial order and starts
+// its endpoint selection over. Callers hold m.mu. A failed write records no
+// state, as it adds no index entry.
+func (m *Manager) programFirst(peer api.Peer) error {
+	st := &dialState{peer: peer}
+	peerCfg, err := m.peerConfig(peer, st.endpoint())
+	if err != nil {
+		return err
+	}
+	if err := m.ctrl.AddPeer(m.cfg.InterfaceName, peerCfg); err != nil {
+		return err
+	}
+	st.programmedAt = m.now()
+	m.dial[peer.ID] = st
 	return nil
 }
 
