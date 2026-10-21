@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -287,6 +288,243 @@ func TestSystemCollectors(t *testing.T) {
 	}
 	if _, ok := got[0].(*metrics.SystemCollector); !ok {
 		t.Errorf("systemCollectors(reader)[0] = %T, want *metrics.SystemCollector", got[0])
+	}
+}
+
+// Node IDs for the tunnel stats tests, chosen so that sorting by node ID puts
+// handshakePeerID first.
+const (
+	handshakePeerID   = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"
+	noHandshakePeerID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2"
+)
+
+// newIndexedWGManager returns a Manager over ctrl whose peer index maps
+// handshakePeerID to keyA and noHandshakePeerID to keyB, the way the reconcile
+// handler leaves it after adding both peers.
+func newIndexedWGManager(t *testing.T, ctrl wireguard.WGController, keyA, keyB [32]byte) *wireguard.Manager {
+	t.Helper()
+	mgr := wireguard.NewManager(ctrl, wireguard.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	for _, peer := range []api.Peer{
+		{ID: handshakePeerID, PublicKey: base64.StdEncoding.EncodeToString(keyA[:])},
+		{ID: noHandshakePeerID, PublicKey: base64.StdEncoding.EncodeToString(keyB[:])},
+	} {
+		if err := mgr.AddPeer(peer); err != nil {
+			t.Fatalf("AddPeer(%s): %v", peer.ID, err)
+		}
+	}
+	return mgr
+}
+
+// The tunnel_health group is fed from the device read the handshake reporter
+// also uses. A peer that never completed a handshake is kept and reported as
+// not succeeded, because that is the peer an operator is looking for; packet
+// loss is reported as the "no measurement" value, because plexd measures none.
+func TestWGTunnelStatsReader_ReadTunnelStats(t *testing.T) {
+	keyA := [32]byte(bytes.Repeat([]byte{0xa1}, 32))
+	keyB := [32]byte(bytes.Repeat([]byte{0xb2}, 32))
+
+	t.Run("maps each mesh peer", func(t *testing.T) {
+		handshake := time.Date(2026, 10, 21, 9, 30, 0, 0, time.UTC)
+		ctrl := &statsWGController{peers: []wireguard.PeerStat{
+			// No handshake yet: the device has only sent initiations.
+			{PublicKey: keyB, TxBytes: 148},
+			{
+				PublicKey:     keyA,
+				Endpoint:      netip.MustParseAddrPort("198.51.100.7:51820"),
+				LastHandshake: handshake,
+				RxBytes:       4096,
+				TxBytes:       2048,
+			},
+		}}
+		reader := &wgTunnelStatsReader{mgr: newIndexedWGManager(t, ctrl, keyA, keyB)}
+
+		got, err := reader.ReadTunnelStats(context.Background())
+		if err != nil {
+			t.Fatalf("ReadTunnelStats() error = %v", err)
+		}
+		want := []metrics.TunnelStats{
+			{
+				PeerID:             handshakePeerID,
+				LastHandshakeTime:  handshake,
+				RxBytes:            4096,
+				TxBytes:            2048,
+				HandshakeSucceeded: true,
+				PacketLossPercent:  -1,
+			},
+			{
+				PeerID:             noHandshakePeerID,
+				TxBytes:            148,
+				HandshakeSucceeded: false,
+				PacketLossPercent:  -1,
+			},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("ReadTunnelStats() = %+v, want %+v", got, want)
+		}
+		if !got[1].LastHandshakeTime.IsZero() {
+			t.Errorf("LastHandshakeTime of a peer without a handshake = %v, want the zero time", got[1].LastHandshakeTime)
+		}
+	})
+
+	t.Run("empty device", func(t *testing.T) {
+		reader := &wgTunnelStatsReader{mgr: newIndexedWGManager(t, &statsWGController{}, keyA, keyB)}
+
+		got, err := reader.ReadTunnelStats(context.Background())
+		if err != nil {
+			t.Fatalf("ReadTunnelStats() error = %v", err)
+		}
+		if got == nil || len(got) != 0 {
+			t.Errorf("ReadTunnelStats() = %#v, want an empty slice", got)
+		}
+	})
+
+	t.Run("read error is wrapped", func(t *testing.T) {
+		readErr := errors.New("netlink dump interrupted")
+		mgr := newIndexedWGManager(t, &statsWGController{err: readErr}, keyA, keyB)
+		_, cause := mgr.MeshPeerStats()
+		if cause == nil {
+			t.Fatal("MeshPeerStats() error = nil, want the read error")
+		}
+		reader := &wgTunnelStatsReader{mgr: mgr}
+
+		got, err := reader.ReadTunnelStats(context.Background())
+		if err == nil {
+			t.Fatalf("ReadTunnelStats() = %+v, want an error", got)
+		}
+		if want := "plexd up: tunnel stats: " + cause.Error(); err.Error() != want {
+			t.Errorf("ReadTunnelStats() error = %q, want %q", err, want)
+		}
+		if !errors.Is(err, readErr) {
+			t.Errorf("ReadTunnelStats() error = %v, want it to wrap %v", err, readErr)
+		}
+	})
+
+	t.Run("controller without a stats reader", func(t *testing.T) {
+		reader := &wgTunnelStatsReader{mgr: newIndexedWGManager(t, setupRefusingWGController{}, keyA, keyB)}
+
+		_, err := reader.ReadTunnelStats(context.Background())
+		if !errors.Is(err, wireguard.ErrPeerStatsUnsupported) {
+			t.Errorf("ReadTunnelStats() error = %v, want it to wrap %v", err, wireguard.ErrPeerStatsUnsupported)
+		}
+		if err != nil && !strings.HasPrefix(err.Error(), "plexd up: tunnel stats: ") {
+			t.Errorf("ReadTunnelStats() error = %q, want the plexd up: tunnel stats: prefix", err)
+		}
+	})
+}
+
+// stubTunnelReader answers with a fixed set of peers and counts its reads, so
+// the collector order can be pinned without a WireGuard device.
+type stubTunnelReader struct {
+	stats []metrics.TunnelStats
+	reads int
+}
+
+func (r *stubTunnelReader) ReadTunnelStats(context.Context) ([]metrics.TunnelStats, error) {
+	r.reads++
+	return r.stats, nil
+}
+
+// TestBuildMetricsCollectors pins which collectors a node runs and in which
+// order: the tunnel collector only when WireGuard came up, the node_resources
+// collector only on a platform with a system reader, and the agent stats
+// collector always, last.
+func TestBuildMetricsCollectors(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	tests := []struct {
+		name         string
+		tunnelReader metrics.TunnelStatsReader
+		sysReader    metrics.SystemReader
+		want         []string
+	}{
+		{
+			name:         "tunnel and system readers",
+			tunnelReader: &stubTunnelReader{},
+			sysReader:    stubSystemReader{},
+			want:         []string{"*metrics.TunnelCollector", "*metrics.SystemCollector", "*metrics.AgentStatsCollector"},
+		},
+		{
+			name:      "no tunnel reader",
+			sysReader: stubSystemReader{},
+			want:      []string{"*metrics.SystemCollector", "*metrics.AgentStatsCollector"},
+		},
+		{
+			name: "neither reader",
+			want: []string{"*metrics.AgentStatsCollector"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildMetricsCollectors(tt.tunnelReader, tt.sysReader, time.Now(), logger)
+			types := make([]string, len(got))
+			for i, c := range got {
+				types[i] = fmt.Sprintf("%T", c)
+			}
+			if !reflect.DeepEqual(types, tt.want) {
+				t.Errorf("buildMetricsCollectors() = %v, want %v", types, tt.want)
+			}
+		})
+	}
+}
+
+// groupRecordingReporter records the group of every point the metrics manager
+// reports, in the order it reports them.
+type groupRecordingReporter struct{ groups []string }
+
+func (r *groupRecordingReporter) ReportMetrics(_ context.Context, _ string, batch api.MetricBatch) error {
+	for _, p := range batch {
+		r.groups = append(r.groups, p.Group)
+	}
+	return nil
+}
+
+// cancelingCollector collects nothing and cancels the context the metrics
+// manager runs under. Appended after the collectors under test, it ends Run
+// after exactly one collect cycle: the manager then flushes on ctx.Done.
+type cancelingCollector struct{ cancel context.CancelFunc }
+
+func (c cancelingCollector) Collect(context.Context) ([]api.MetricPoint, error) {
+	c.cancel()
+	return nil, nil
+}
+
+// A node with more peers than the metrics buffer holds per report window has
+// to lose tunnel points, not its node_resources and agent_stats points. With a
+// batch size of 1 the buffer keeps two points, so one collect cycle over five
+// peers overflows it and the flush on shutdown shows which two survived.
+//
+// The context is cancelled at the end of the first cycle rather than before
+// Run: AgentStatsCollector refuses a cancelled context, so an already-cancelled
+// one would drop the agent point for a reason that has nothing to do with the
+// trim, and the flush would show the last tunnel point beside the system one.
+// The trailing collector adds no point, so the buffer it leaves is the one the
+// collectors under test built.
+func TestBuildMetricsCollectors_TrimDropsTunnelPointsFirst(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	peers := make([]metrics.TunnelStats, 5)
+	for i := range peers {
+		peers[i] = metrics.TunnelStats{PeerID: fmt.Sprintf("peer-%d", i), PacketLossPercent: -1}
+	}
+	tunnelReader := &stubTunnelReader{stats: peers}
+	reporter := &groupRecordingReporter{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := metrics.Config{Enabled: true, CollectInterval: time.Hour, ReportInterval: time.Hour, BatchSize: 1}
+	collectors := buildMetricsCollectors(tunnelReader, stubSystemReader{}, time.Now(), logger)
+	collectors = append(collectors, cancelingCollector{cancel: cancel})
+	mgr := metrics.NewManager(cfg, collectors, reporter, "node", logger)
+	if err := mgr.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v, want context.Canceled", err)
+	}
+
+	if tunnelReader.reads != 1 {
+		t.Fatalf("tunnel reader read %d times, want once: the cycle must collect the tunnel points it then trims", tunnelReader.reads)
+	}
+	if want := []string{metrics.GroupSystem, metrics.GroupAgent}; !reflect.DeepEqual(reporter.groups, want) {
+		t.Errorf("reported groups = %v, want %v", reporter.groups, want)
 	}
 }
 
@@ -884,6 +1122,45 @@ func (setupRefusingWGController) SetMTU(string, int) error                   { r
 func (setupRefusingWGController) AddPeer(string, wireguard.PeerConfig) error { return nil }
 func (setupRefusingWGController) RemovePeer(string, []byte) error            { return nil }
 func (setupRefusingWGController) SetPrivateKey(string, []byte) error         { return nil }
+
+// statsWGController is a WGController that also reads peer stats. Every method
+// that would touch the operating system succeeds without doing so, so
+// Manager.Setup brings the interface "up" on any host, without privilege, and
+// runUp starts what it gates on wgReady. PeerStats answers with peers and err;
+// the zero value is a device with no peers.
+//
+// The fields are set before the controller is handed over and only read
+// afterwards, so the daemon's goroutines share it without a lock.
+type statsWGController struct {
+	peers []wireguard.PeerStat
+	err   error
+}
+
+var _ wireguard.PeerStatsReader = (*statsWGController)(nil)
+
+func (*statsWGController) CreateInterface(string, []byte, int) error        { return nil }
+func (*statsWGController) DeleteInterface(string) error                     { return nil }
+func (*statsWGController) ConfigureAddress(string, string) error            { return nil }
+func (*statsWGController) SetInterfaceUp(string) error                      { return nil }
+func (*statsWGController) SetMTU(string, int) error                         { return nil }
+func (*statsWGController) AddPeer(string, wireguard.PeerConfig) error       { return nil }
+func (*statsWGController) RemovePeer(string, []byte) error                  { return nil }
+func (*statsWGController) SetPrivateKey(string, []byte) error               { return nil }
+func (c *statsWGController) PeerStats(string) ([]wireguard.PeerStat, error) { return c.peers, c.err }
+
+// statsReadingSetupRefusingWGController refuses Setup exactly as
+// setupRefusingWGController does, yet can read peer stats from a device with
+// no peers. A test that wants to prove runUp gates the device readers on
+// wgReady needs both halves: over setupRefusingWGController alone a reader
+// that ran anyway would only get ErrPeerStatsUnsupported and send nothing, so
+// the test could not tell a missing gate from a present one.
+type statsReadingSetupRefusingWGController struct{ setupRefusingWGController }
+
+var _ wireguard.PeerStatsReader = statsReadingSetupRefusingWGController{}
+
+func (statsReadingSetupRefusingWGController) PeerStats(string) ([]wireguard.PeerStat, error) {
+	return nil, nil
+}
 
 func useWGController(t *testing.T, ctrl wireguard.WGController) {
 	t.Helper()
@@ -1955,6 +2232,174 @@ func assertWireDigest(t *testing.T, field, value string) {
 	}
 	if len(raw) != sha256.Size {
 		t.Errorf("%s = %q decodes to %d bytes, want %d (a hex digest decodes to 48)", field, value, len(raw), sha256.Size)
+	}
+}
+
+// handshakeReport is one request the handshake control plane received on a
+// path ending in /handshakes, stamped with the test's clock on arrival.
+type handshakeReport struct {
+	method   string
+	path     string
+	body     []byte
+	received time.Time
+}
+
+// handshakeControlPlane registers the node, counts heartbeats, records every
+// handshake report and answers everything else with an empty JSON object.
+type handshakeControlPlane struct {
+	mu         sync.Mutex
+	heartbeats int
+	reports    []handshakeReport
+}
+
+func newHandshakeControlPlane(t *testing.T) (*handshakeControlPlane, string) {
+	t.Helper()
+	cp := &handshakeControlPlane{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/register":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(api.RegisterResponse{
+				NodeID:           upTestNodeID,
+				MeshIP:           "100.64.0.1",
+				SigningPublicKey: upTestSigningKey,
+				SigningKeyID:     upTestSigningKID,
+				NSK:              upTestNSK,
+				DomainMeshCIDR:   "100.64.0.0/10",
+				PeerSnapshot:     []api.RegisterPeer{},
+			})
+			return
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			cp.mu.Lock()
+			cp.heartbeats++
+			cp.mu.Unlock()
+		case strings.HasSuffix(r.URL.Path, "/handshakes"):
+			raw, _ := io.ReadAll(r.Body)
+			cp.mu.Lock()
+			cp.reports = append(cp.reports, handshakeReport{
+				method:   r.Method,
+				path:     r.URL.Path,
+				body:     raw,
+				received: time.Now(),
+			})
+			cp.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(api.HandshakeReportResponse{AcceptedAt: time.Now().UTC()})
+			return
+		}
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(srv.Close)
+	return cp, srv.URL
+}
+
+func (cp *handshakeControlPlane) counts() (heartbeats, reports int) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.heartbeats, len(cp.reports)
+}
+
+// waitForFirstHeartbeat blocks until the daemon has sent a heartbeat and
+// returns how many it has sent by then. The heartbeat and the handshake
+// reporter start together, after registration and every subsystem before
+// them, so the first heartbeat is where a window over the reporter's cadence
+// opens; how long startup takes is not what these tests pin.
+func (cp *handshakeControlPlane) waitForFirstHeartbeat(t *testing.T) int {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if heartbeats, _ := cp.counts(); heartbeats > 0 {
+			return heartbeats
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the daemon never sent a heartbeat")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// With the interface up, the daemon reports handshakes once per heartbeat
+// interval. The fake device holds no peers, which is exactly the report a
+// freshly started node sends: an empty peers array, never null, which the
+// control plane refuses with 400 malformed_handshake_report.
+func TestRunUp_ReportsHandshakesEveryHeartbeatInterval(t *testing.T) {
+	// Outside a cluster no PlexdHook list runs; an ambient
+	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+	cp, apiBase := newHandshakeControlPlane(t)
+	useWGController(t, &statsWGController{})
+	writeUpConfig(t, apiBase, upDaemonYAML(t)+"heartbeat:\n  interval: 1s\n")
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	cp.waitForFirstHeartbeat(t)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, reports := cp.counts(); reports > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no handshake report within 5s of the first heartbeat, with a 1s heartbeat interval")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cp.mu.Lock()
+	report := cp.reports[0]
+	cp.mu.Unlock()
+
+	if report.method != http.MethodPost {
+		t.Errorf("handshake report method = %s, want POST", report.method)
+	}
+	if want := "/v1/nodes/" + upTestNodeID + "/handshakes"; report.path != want {
+		t.Errorf("handshake report path = %s, want %s", report.path, want)
+	}
+
+	// Strict decoding, as the handler does: an unknown field fails here.
+	var req api.HandshakeReportRequest
+	dec := json.NewDecoder(bytes.NewReader(report.body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		t.Fatalf("handshake report is not contract-shaped: %v (body: %s)", err, report.body)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(report.body, &fields); err != nil {
+		t.Fatalf("decode handshake report fields: %v (body: %s)", err, report.body)
+	}
+	if got := string(fields["peers"]); got != "[]" {
+		t.Errorf(`handshake report "peers" = %s, want [] (body: %s)`, got, report.body)
+	}
+	if skew := report.received.Sub(req.ObservedAt); skew < -5*time.Second || skew > 5*time.Second {
+		t.Errorf("observed_at = %v is %v away from the test clock at arrival (%v), want within 5s", req.ObservedAt, skew, report.received)
+	}
+}
+
+// Without the interface there is no device to read, so the daemon sends no
+// handshake report at all, while its heartbeats show it is otherwise running
+// at the same 1s interval the reporter would have ticked at. The controller
+// refuses setup but can read stats, so only the wgReady gate keeps the report
+// off the wire (see statsReadingSetupRefusingWGController).
+func TestRunUp_SkipsHandshakeReportsWithoutWireGuard(t *testing.T) {
+	// Outside a cluster no PlexdHook list runs; an ambient
+	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+	cp, apiBase := newHandshakeControlPlane(t)
+	useWGController(t, statsReadingSetupRefusingWGController{})
+	writeUpConfig(t, apiBase, upDaemonYAML(t)+"heartbeat:\n  interval: 1s\n")
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	first := cp.waitForFirstHeartbeat(t)
+	window := time.Now().Add(3 * time.Second)
+	for time.Now().Before(window) {
+		if _, reports := cp.counts(); reports > 0 {
+			t.Fatalf("the daemon sent %d handshake report(s) although WireGuard did not come up", reports)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if heartbeats, _ := cp.counts(); heartbeats < first+2 {
+		t.Errorf("heartbeats = %d after a 3s window that opened at %d, want at least two more at a 1s interval", heartbeats, first)
 	}
 }
 

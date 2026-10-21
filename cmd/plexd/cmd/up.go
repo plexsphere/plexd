@@ -749,11 +749,14 @@ func runAgent(ctx context.Context) error {
 
 	// Register the WireGuard reconcile handler only when the interface came up.
 	// A handler that fails every cycle would hold back the reconciler snapshot,
-	// so the fingerprint short-circuit could never converge on such hosts.
+	// so the fingerprint short-circuit could never converge on such hosts. The
+	// handshake reporter (step 17a) and the tunnel collector (step 13) read the
+	// same device and are skipped on the same condition, so this one line
+	// accounts for all three.
 	if wgReady {
 		reconciler.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
 	} else {
-		logger.Warn("wireguard unavailable, skipping peer reconcile handler")
+		logger.Warn("wireguard unavailable, skipping peer reconcile handler, handshake reports and tunnel metrics")
 	}
 
 	// Register policy reconcile handler.
@@ -782,9 +785,16 @@ func runAgent(ctx context.Context) error {
 		}
 	}
 
-	// 13. Create metrics collectors and manager.
-	metricsCollectors := systemCollectors(sysReader, logger)
-	metricsCollectors = append(metricsCollectors, metrics.NewAgentStatsCollector(startTime, nil, logger))
+	// 13. Create metrics collectors and manager. The tunnel collector reads the
+	// mesh device, so it exists only when the interface came up. The typed
+	// reader variable keeps the interface a true nil otherwise, which is what
+	// buildMetricsCollectors checks: a nil *wgTunnelStatsReader stored in it
+	// would compare non-nil and register a collector that fails every cycle.
+	var tunnelReader metrics.TunnelStatsReader
+	if wgReady {
+		tunnelReader = &wgTunnelStatsReader{mgr: wgMgr}
+	}
+	metricsCollectors := buildMetricsCollectors(tunnelReader, sysReader, startTime, logger)
 
 	var metricsReporter metrics.MetricsReporter = metrics.NewPlatformReporter(client, logger)
 	if cfg.Metrics.LocalEndpoint.URL != "" {
@@ -871,6 +881,20 @@ func runAgent(ctx context.Context) error {
 		defer wg.Done()
 		_ = heartbeat.Run(ctx)
 	}()
+
+	// 17a. Start handshake reporter. It ticks at the heartbeat's interval
+	// because the contract asks for one report per heartbeat interval, and it
+	// runs beside the heartbeat rather than inside it so a slow report never
+	// delays the liveness signal. Without the interface there is no device to
+	// read, and a reporter that fails every tick would only log.
+	if wgReady {
+		handshakeReporter := agent.NewHandshakeReporter(hbCfg.Interval, identity.NodeID, client, wgMgr, logger)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = handshakeReporter.Run(ctx)
+		}()
+	}
 
 	// 18. Start reconciler.
 	wg.Add(1)
@@ -1121,6 +1145,37 @@ func (a *agentHealthProvider) ConnectedPeers() int {
 func (a *agentHealthProvider) Uptime() time.Duration    { return time.Since(a.startTime) }
 func (a *agentHealthProvider) LastHeartbeat() time.Time { return time.Time{} }
 func (a *agentHealthProvider) LastReconcile() time.Time { return time.Time{} }
+
+// wgTunnelStatsReader adapts the WireGuard manager to metrics.TunnelStatsReader,
+// so the tunnel_health group carries each mesh peer's transfer counters and
+// handshake state. It reads the device through Manager.MeshPeerStats, the same
+// path the handshake reporter takes, and reports every peer the peer index
+// maps, a peer that never completed a handshake included: that peer is the
+// one handshake_succeeded 0 exists for.
+//
+// DECISION: PacketLossPercent is -1, the documented "no measurement" value.
+// plexd sends no probes and the device counts no lost packets, so a 0 would
+// claim a loss-free link nobody measured.
+type wgTunnelStatsReader struct{ mgr *wireguard.Manager }
+
+func (r *wgTunnelStatsReader) ReadTunnelStats(_ context.Context) ([]metrics.TunnelStats, error) {
+	peers, err := r.mgr.MeshPeerStats()
+	if err != nil {
+		return nil, fmt.Errorf("plexd up: tunnel stats: %w", err)
+	}
+	stats := make([]metrics.TunnelStats, 0, len(peers))
+	for _, p := range peers {
+		stats = append(stats, metrics.TunnelStats{
+			PeerID:             p.NodeID,
+			LastHandshakeTime:  p.LastHandshake,
+			RxBytes:            p.RxBytes,
+			TxBytes:            p.TxBytes,
+			HandshakeSucceeded: !p.LastHandshake.IsZero(),
+			PacketLossPercent:  -1,
+		})
+	}
+	return stats, nil
+}
 
 // agentMeshReconnector adapts the reconciler to actions.MeshReconnector.
 type agentMeshReconnector struct {
@@ -1607,6 +1662,29 @@ func systemCollectors(sysReader metrics.SystemReader, logger *slog.Logger) []met
 		return nil
 	}
 	return []metrics.Collector{metrics.NewSystemCollector(sysReader, logger)}
+}
+
+// buildMetricsCollectors returns the collectors the metrics manager runs, in
+// the order it runs them: the tunnel collector when tunnelReader is non-nil,
+// then the node_resources collector when the platform has a system reader (see
+// systemCollectors), then the agent stats collector, which every node has.
+// tunnelReader is nil when the WireGuard interface did not come up.
+//
+// DECISION: the tunnel collector runs first. The manager's buffer keeps at
+// most 2 × batch_size points (200 by default) and drops the oldest when a
+// collect overflows it (metrics.Manager.enforceCapacity). A node collects one
+// tunnel point per peer every 15 s, so above 48 peers the buffer trims within
+// one 60 s report window. Collected first, the tunnel points are always older
+// than the system and agent points of the same cycle, so a trim drops tunnel
+// points before it drops the newest node_resources and agent_stats points.
+// Keeping the order in this one function is what lets a test pin it.
+func buildMetricsCollectors(tunnelReader metrics.TunnelStatsReader, sysReader metrics.SystemReader, startTime time.Time, logger *slog.Logger) []metrics.Collector {
+	var collectors []metrics.Collector
+	if tunnelReader != nil {
+		collectors = append(collectors, metrics.NewTunnelCollector(tunnelReader, logger))
+	}
+	collectors = append(collectors, systemCollectors(sysReader, logger)...)
+	return append(collectors, metrics.NewAgentStatsCollector(startTime, nil, logger))
 }
 
 // loadMergedConfig parses the config file at path — an absent one is not fatal
