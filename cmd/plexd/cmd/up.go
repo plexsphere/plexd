@@ -754,7 +754,7 @@ func runAgent(ctx context.Context) error {
 	// same device and are skipped on the same condition, so this one line
 	// accounts for all three.
 	if wgReady {
-		reconciler.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
+		reconciler.RegisterHandler(wireguard.ReconcileHandler(wgMgr, nil))
 	} else {
 		logger.Warn("wireguard unavailable, skipping peer reconcile handler, handshake reports and tunnel metrics")
 	}
