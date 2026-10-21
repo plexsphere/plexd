@@ -9,6 +9,8 @@
 #   - Handshake report and tunnel_health samples (skipped when WireGuard
 #     did not come up in the container)
 #   - Edge PSK fetches for both fixture peers (same skip condition)
+#   - Endpoint candidates report and an endpoint selection switch on a
+#     fixture peer (same skip condition)
 #   - Request body validation (registration token, heartbeat, capabilities)
 #   - Log injection (docker cp into container, verify logs_count increases)
 #   - Agent restart for audit verification (ProcessSource fires per-process)
@@ -890,6 +892,103 @@ else
     done
 
     echo "=== Phase 4c PASSED: edge PSKs ==="
+fi
+
+# ===================================================================
+# Phase 4d: endpoint candidates and endpoint selection
+#
+# plexd publishes its endpoint candidates and runs endpoint selection only when
+# its interface came up, so the phase shares phase 4b's skip condition. The
+# publisher reports once at start, so its first report has landed by now.
+#
+# Fixture peer ...a0b1 never completes a handshake (no node holds its key), so
+# on a kernel device its dial order, 192.0.2.10:51820 (its candidate) and then
+# 203.0.113.1:51820 (its fallback), advances once the first entry has gone 30s
+# without one: the 25s keepalive plus 5s. This is the only run anywhere that
+# switches an endpoint on a real device, so it must not be weakened to the skip
+# path.
+# ===================================================================
+echo "=== Testing endpoint candidates and endpoint selection ==="
+
+if [ "${WG_CONFIGURED}" -eq 0 ]; then
+    echo "SKIP: endpoint candidates and endpoint selection (WireGuard did not come up in this container)"
+else
+    EC_TIMEOUT=30
+    EC_ELAPSED=0
+    EC_COUNT=0
+    while [ "${EC_ELAPSED}" -lt "${EC_TIMEOUT}" ]; do
+        RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+        if [ -n "${RESPONSE}" ]; then
+            EC_COUNT=$(get_counter "${RESPONSE}" "endpoint_candidates_count")
+            if [ "${EC_COUNT}" -ge 1 ]; then
+                break
+            fi
+        fi
+        sleep 3
+        EC_ELAPSED=$((EC_ELAPSED + 3))
+    done
+    if [ "${EC_COUNT}" -lt 1 ]; then
+        fail "endpoint_candidates_count=${EC_COUNT} after ${EC_TIMEOUT}s, want >= 1 (the publisher reports once at start)"
+    fi
+    echo "  PASS: endpoint_candidates_count=${EC_COUNT} >= 1"
+
+    # The mock accepted the report, so its gates passed. What is left to pin is
+    # that the body carries the contract's two members and nothing else, and
+    # that its candidates are this container's addresses joined with the
+    # WireGuard listen port (51820 in plexd-e2e.yaml), none of them in the
+    # mock's mesh prefix 10.99.0.0/24. Each jq answers "true" only when its
+    # check holds, so a jq error fails the check rather than passing it.
+    EC_BODY=$(curl -sf "http://localhost:18080/test/last-request/endpoint-candidates" 2>/dev/null || true)
+    if [ -z "${EC_BODY}" ]; then
+        fail "no captured endpoint candidates body"
+    fi
+    EC_KEYS=$(echo "${EC_BODY}" | jq -c 'keys' 2>/dev/null || true)
+    if [ "${EC_KEYS}" != '["candidates","reported_at"]' ]; then
+        fail "endpoint candidates body has keys ${EC_KEYS:-<not a JSON object>}, want exactly [\"candidates\",\"reported_at\"] (body: ${EC_BODY})"
+    fi
+    EC_SIZED=$(echo "${EC_BODY}" | jq -r '(.candidates | type) == "array" and (.candidates | length) >= 1 and (.candidates | length) <= 8' 2>/dev/null || true)
+    if [ "${EC_SIZED}" != "true" ]; then
+        fail "endpoint candidates is not an array of 1 to 8 entries (body: ${EC_BODY})"
+    fi
+    EC_PORTS=$(echo "${EC_BODY}" | jq -r 'all(.candidates[]; endswith(":51820"))' 2>/dev/null || true)
+    if [ "${EC_PORTS}" != "true" ]; then
+        fail "not every endpoint candidate ends in the listen port :51820 (body: ${EC_BODY})"
+    fi
+    EC_OFF_MESH=$(echo "${EC_BODY}" | jq -r 'any(.candidates[]; startswith("10.99.0.")) | not' 2>/dev/null || true)
+    if [ "${EC_OFF_MESH}" != "true" ]; then
+        fail "an endpoint candidate lies in the mesh prefix 10.99.0.0/24 (body: ${EC_BODY})"
+    fi
+    echo "  PASS: endpoint candidates body is {candidates, reported_at}: 1 to 8 entries on :51820, none in the mesh prefix"
+
+    # Read line by line and match with case, as in phase 4c: no grep -q in a
+    # pipeline. By now the switch has usually been logged already; the 75s cover
+    # the first entry's 30s timeout, counted from the pull that programmed it,
+    # with room for the 5s selection tick and a slow start.
+    SWITCH_TIMEOUT=75
+    SWITCH_ELAPSED=0
+    SWITCH_FOUND=0
+    while [ "${SWITCH_ELAPSED}" -lt "${SWITCH_TIMEOUT}" ]; do
+        PLEXD_LOGS=$(dc logs plexd 2>/dev/null || true)
+        while IFS= read -r SWITCH_LINE; do
+            case "${SWITCH_LINE}" in
+                *"trying next endpoint candidate"*"${FIXTURE_PEER_B1}"* | *"${FIXTURE_PEER_B1}"*"trying next endpoint candidate"*)
+                    SWITCH_FOUND=1
+                    break
+                    ;;
+            esac
+        done <<< "${PLEXD_LOGS}"
+        if [ "${SWITCH_FOUND}" -eq 1 ]; then
+            break
+        fi
+        sleep 3
+        SWITCH_ELAPSED=$((SWITCH_ELAPSED + 3))
+    done
+    if [ "${SWITCH_FOUND}" -eq 0 ]; then
+        fail "no 'trying next endpoint candidate' log line for peer ${FIXTURE_PEER_B1} within ${SWITCH_TIMEOUT}s: its dial order (192.0.2.10:51820, then 203.0.113.1:51820) never advanced"
+    fi
+    echo "  PASS: plexd logged 'trying next endpoint candidate' for peer ${FIXTURE_PEER_B1}"
+
+    echo "=== Phase 4d PASSED: endpoint candidates and endpoint selection ==="
 fi
 
 # ===================================================================
