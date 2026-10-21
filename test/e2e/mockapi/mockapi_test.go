@@ -896,15 +896,17 @@ func TestState_ReturnsPeersAndPolicy(t *testing.T) {
 			t.Errorf("peers JSON must not contain %s: %s", forbidden, envelope["peers"])
 		}
 	}
-	// Peer ...a0b1 carries only its relay fallback and peer ...a0b2 only a
-	// direct endpoint, so the agent's endpoint selection meets both branches.
+	// Peer ...a0b1 carries no direct endpoint, only an endpoint candidate and
+	// its relay fallback (TestState_ServesFixtureEndpointCandidates pins the
+	// candidate), and peer ...a0b2 only a direct endpoint, so the agent's dial
+	// order meets both shapes.
 	var peers []map[string]json.RawMessage
 	if err := json.Unmarshal(envelope["peers"], &peers); err != nil {
 		t.Fatalf("unmarshal peers: %v", err)
 	}
 	if len(peers) == 2 {
 		if _, ok := peers[0]["endpoint"]; ok {
-			t.Errorf("peer %s carries an endpoint, want only its fallback: %s", peers[0]["node_id"], envelope["peers"])
+			t.Errorf("peer %s carries an endpoint, want none: %s", peers[0]["node_id"], envelope["peers"])
 		}
 		if got := string(peers[1]["endpoint"]); got != `"198.51.100.20:51820"` {
 			t.Errorf("peer %s endpoint = %s, want \"198.51.100.20:51820\"", peers[1]["node_id"], got)
@@ -1448,6 +1450,8 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/n1/endpoint", validEndpointBody())
 	resp.Body.Close()
+	resp = doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/n1/endpoint-candidates", endpointCandidatesBody("10.0.0.5:51820"))
+	resp.Body.Close()
 	resp, err = http.Get(ts.URL + "/v1/nodes/n1/secrets/db-password")
 	if err != nil {
 		t.Fatalf("GET secrets: %v", err)
@@ -1504,6 +1508,9 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	}
 	if a.EndpointCount != 1 {
 		t.Errorf("endpoint_count = %d, want 1", a.EndpointCount)
+	}
+	if a.EndpointCandidatesCount != 1 {
+		t.Errorf("endpoint_candidates_count = %d, want 1", a.EndpointCandidatesCount)
 	}
 	if a.SecretsCount != 1 {
 		t.Errorf("secrets_count = %d, want 1", a.SecretsCount)
@@ -1577,6 +1584,7 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodGet, "/v1/nodes/node-1/state", ""},
 		{http.MethodPut, "/v1/nodes/node-1/capabilities", capabilitiesBody},
 		{http.MethodPut, "/v1/nodes/node-1/endpoint", validEndpointBody()},
+		{http.MethodPut, "/v1/nodes/node-1/endpoint-candidates", endpointCandidatesBody("10.0.0.5:51820")},
 		{http.MethodGet, "/v1/nodes/node-1/secrets/key1", ""},
 		{http.MethodPost, "/v1/nodes/node-1/metrics", metricsBatchBody},
 		{http.MethodPost, "/v1/nodes/node-1/logs", logsBatchBody},
@@ -2395,6 +2403,401 @@ func TestEndpoint_ConfigureTTL(t *testing.T) {
 	defer wrong.Body.Close()
 	if wrong.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("GET configure-endpoint status = %d, want %d", wrong.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint candidates endpoint (issue #98)
+// ---------------------------------------------------------------------------
+
+// endpointCandidatesPath is PUT /v1/nodes/{mockNode}/endpoint-candidates.
+const endpointCandidatesPath = "/v1/nodes/" + testMockNodeID + "/endpoint-candidates"
+
+// endpointCandidatesBodyAt renders an endpoint candidates report made at
+// reportedAt that carries candidates, an empty array when there are none.
+func endpointCandidatesBodyAt(reportedAt time.Time, candidates ...string) string {
+	if candidates == nil {
+		candidates = []string{}
+	}
+	list, err := json.Marshal(candidates)
+	if err != nil {
+		panic("marshal candidates: " + err.Error()) // a []string always marshals
+	}
+	return fmt.Sprintf(`{"candidates":%s,"reported_at":%q}`, list, reportedAt.UTC().Format(time.RFC3339Nano))
+}
+
+// endpointCandidatesBody renders a report made now, so it never trips the
+// mock's clock-skew check.
+func endpointCandidatesBody(candidates ...string) string {
+	return endpointCandidatesBodyAt(time.Now(), candidates...)
+}
+
+// decodeEndpointCandidatesReceipt strict-decodes a 200 endpoint candidates
+// answer.
+func decodeEndpointCandidatesReceipt(t *testing.T, resp *http.Response) api.EndpointCandidatesResponse {
+	t.Helper()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+	var receipt api.EndpointCandidatesResponse
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&receipt); err != nil {
+		t.Fatalf("decode receipt: %v", err)
+	}
+	return receipt
+}
+
+// An empty array is a valid report that withdraws every earlier candidate, and
+// up to eight distinct routable entries are accepted. Each accepted report
+// answers accepted_at and stale_after, the latter the endpoint TTL (5 minutes
+// by default) later, and only an accepted report is counted.
+func TestEndpointCandidates_AcceptsAndCountsOnlyTheAccepted(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	eight := make([]string, 8)
+	for i := range eight {
+		eight[i] = fmt.Sprintf("10.0.0.%d:51820", i+1)
+	}
+
+	reports := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"empty array", endpointCandidatesBody(), http.StatusOK},
+		{"two valid entries", endpointCandidatesBody("10.0.0.5:51820", "[fd00:10::5]:51820"), http.StatusOK},
+		{"null candidates", `{"candidates":null,"reported_at":"` + time.Now().UTC().Format(time.RFC3339Nano) + `"}`, http.StatusBadRequest},
+		{"eight entries, the ceiling", endpointCandidatesBody(eight...), http.StatusOK},
+		{"IPv4-mapped public address and the port bounds", endpointCandidatesBody("[::ffff:203.0.113.5]:1", "[2001:db8::5]:65535"), http.StatusOK},
+		{"unparseable entry", endpointCandidatesBody("10.0.0.5:51820", "10.0.0.6:0"), http.StatusBadRequest},
+	}
+
+	accepted := int64(0)
+	for _, rep := range reports {
+		resp := doRequest(t, http.MethodPut, ts.URL+endpointCandidatesPath, rep.body)
+		if rep.want != http.StatusOK {
+			if resp.StatusCode != rep.want {
+				t.Errorf("%s: status = %d, want %d", rep.name, resp.StatusCode, rep.want)
+			}
+			resp.Body.Close()
+			continue
+		}
+		receipt := decodeEndpointCandidatesReceipt(t, resp)
+		resp.Body.Close()
+		accepted++
+		if receipt.AcceptedAt.IsZero() {
+			t.Errorf("%s: accepted_at is unset", rep.name)
+		}
+		if got := receipt.StaleAfter.Sub(receipt.AcceptedAt); got != 5*time.Minute {
+			t.Errorf("%s: stale_after - accepted_at = %v, want %v", rep.name, got, 5*time.Minute)
+		}
+	}
+
+	if a := getAssertions(t, ts.URL); a.EndpointCandidatesCount != accepted {
+		t.Errorf("endpoint_candidates_count = %d, want %d (the accepted reports only)", a.EndpointCandidatesCount, accepted)
+	}
+}
+
+// TestEndpointCandidates_DenialTaxonomy walks the contract's 400 refusals in
+// its gate order: structure, then the clock, then each entry's form. A report
+// that breaks an earlier gate is refused by that one, whatever it breaks later,
+// and a refused report is never counted.
+func TestEndpointCandidates_DenialTaxonomy(t *testing.T) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	nine := make([]string, 9)
+	for i := range nine {
+		nine[i] = fmt.Sprintf("10.0.0.%d:51820", i+1)
+	}
+	unparseable := func(i int) string {
+		return fmt.Sprintf("candidates[%d] is not a host:port pair with a non-zero port, a routable address and no zone.", i)
+	}
+
+	tests := []struct {
+		name       string
+		body       string
+		wantCode   string
+		wantDetail string // checked only when non-empty
+	}{
+		{"not json", "not-json", "malformed_endpoint_candidates", ""},
+		{"unknown field", `{"candidates":[],"reported_at":"` + now + `","endpoint":"203.0.113.10:51820"}`, "malformed_endpoint_candidates", ""},
+		{"candidates not an array", `{"candidates":"10.0.0.5:51820","reported_at":"` + now + `"}`, "malformed_endpoint_candidates", ""},
+		{"candidates missing", `{"reported_at":"` + now + `"}`, "malformed_endpoint_candidates", "candidates is required and must be an array, not null."},
+		{"candidates null", `{"candidates":null,"reported_at":"` + now + `"}`, "malformed_endpoint_candidates", "candidates is required and must be an array, not null."},
+		{"reported_at missing", `{"candidates":["10.0.0.5:51820"]}`, "malformed_endpoint_candidates", "reported_at is required and must not be the zero time."},
+		{"reported_at zero", `{"candidates":["10.0.0.5:51820"],"reported_at":"0001-01-01T00:00:00Z"}`, "malformed_endpoint_candidates", "reported_at is required and must not be the zero time."},
+		{"nine entries", endpointCandidatesBody(nine...), "malformed_endpoint_candidates", "candidates carries 9 entries, at most 8 are accepted."},
+		{"duplicate entry", endpointCandidatesBody("10.0.0.5:51820", "10.0.0.6:51820", "10.0.0.5:51820"), "malformed_endpoint_candidates", "candidates[2] repeats an earlier entry."},
+		{
+			// Structure is judged before the clock.
+			"malformed beats clock skew",
+			`{"candidates":null,"reported_at":"` + time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano) + `"}`,
+			"malformed_endpoint_candidates", "",
+		},
+		{
+			// A duplicate is structural, so it is judged before the entries' form.
+			"malformed beats unparseable",
+			endpointCandidatesBody("10.0.0.6:0", "10.0.0.6:0"),
+			"malformed_endpoint_candidates", "candidates[1] repeats an earlier entry.",
+		},
+		{"reported_at 61 s old", endpointCandidatesBodyAt(time.Now().Add(-61*time.Second), "10.0.0.5:51820"), "endpoint_clock_skew", ""},
+		// The table is built before the first subtest runs, and every moment
+		// spent since brings a future reported_at closer to the window, so this
+		// case keeps a margin a slow runner cannot use up.
+		{"reported_at 2 min ahead", endpointCandidatesBodyAt(time.Now().Add(2*time.Minute), "10.0.0.5:51820"), "endpoint_clock_skew", ""},
+		{"clock skew beats unparseable", endpointCandidatesBodyAt(time.Now().Add(-61*time.Second), "10.0.0.6:0"), "endpoint_clock_skew", ""},
+		{
+			"port 0 names its index",
+			endpointCandidatesBody("10.0.0.5:51820", "10.0.0.6:0"),
+			"endpoint_candidate_unparseable",
+			"candidates[1] is not a host:port pair with a non-zero port, a routable address and no zone.",
+		},
+		{"empty entry", endpointCandidatesBody(""), "endpoint_candidate_unparseable", unparseable(0)},
+		{"without a port", endpointCandidatesBody("10.0.0.5"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"port above 65535", endpointCandidatesBody("10.0.0.5:65536"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"a hostname", endpointCandidatesBody("node-b.example:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv6 without brackets", endpointCandidatesBody("fd00:10::5:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"zoned IPv6 address", endpointCandidatesBody("[fd00:10::5%eth0]:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv4 loopback", endpointCandidatesBody("127.0.0.1:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv6 loopback", endpointCandidatesBody("[::1]:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv4-mapped loopback", endpointCandidatesBody("[::ffff:127.0.0.1]:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv4 link-local unicast", endpointCandidatesBody("169.254.10.9:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv6 link-local unicast", endpointCandidatesBody("[fe80::1]:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv4-mapped link-local unicast", endpointCandidatesBody("[::ffff:169.254.10.9]:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv4 link-local multicast", endpointCandidatesBody("224.0.0.251:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv6 link-local multicast", endpointCandidatesBody("[ff02::1]:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv4 multicast", endpointCandidatesBody("239.1.2.3:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv6 multicast", endpointCandidatesBody("[ff05::2]:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv4 unspecified", endpointCandidatesBody("0.0.0.0:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		{"IPv6 unspecified", endpointCandidatesBody("[::]:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+		// netip classifies an IPv4-mapped address as unspecified only once it
+		// is unmapped, so this case is the one that needs the handler's Unmap.
+		{"IPv4-mapped unspecified", endpointCandidatesBody("[::ffff:0.0.0.0]:51820"), "endpoint_candidate_unparseable", unparseable(0)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, http.MethodPut, ts.URL+endpointCandidatesPath, tt.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusBadRequest, body)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+				t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+			}
+
+			var problem map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			for _, member := range []string{"type", "title", "status", "detail", "instance"} {
+				if _, ok := problem[member]; !ok {
+					t.Errorf("problem missing required member %q", member)
+				}
+			}
+			if problem["code"] != tt.wantCode {
+				t.Errorf("code = %v, want %q (detail: %v)", problem["code"], tt.wantCode, problem["detail"])
+			}
+			if tt.wantDetail != "" && problem["detail"] != tt.wantDetail {
+				t.Errorf("detail = %v, want %q", problem["detail"], tt.wantDetail)
+			}
+			if problem["instance"] != endpointCandidatesPath {
+				t.Errorf("instance = %v, want %q", problem["instance"], endpointCandidatesPath)
+			}
+
+			// A refused report must not be counted as accepted.
+			if a := getAssertions(t, ts.URL); a.EndpointCandidatesCount != 0 {
+				t.Errorf("endpoint_candidates_count = %d, want 0", a.EndpointCandidatesCount)
+			}
+		})
+	}
+}
+
+// The 4 KiB cap is inclusive and exact: a report padded to 4096 bytes is
+// accepted, and one byte more draws the contract's 413 before any decoding.
+func TestEndpointCandidates_BodyCap(t *testing.T) {
+	const capBytes = 4096
+	padded := func(n int) string {
+		body := endpointCandidatesBody("10.0.0.5:51820")
+		return body + strings.Repeat(" ", n-len(body))
+	}
+
+	t.Run("exactly 4 KiB is accepted", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		resp := doRequest(t, http.MethodPut, ts.URL+endpointCandidatesPath, padded(capBytes))
+		defer resp.Body.Close()
+		decodeEndpointCandidatesReceipt(t, resp)
+	})
+
+	t.Run("one byte more is refused", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		resp := doRequest(t, http.MethodPut, ts.URL+endpointCandidatesPath, padded(capBytes+1))
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+			t.Errorf("Content-Type = %q, want %q", ct, "application/problem+json")
+		}
+
+		var problem map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+			t.Fatalf("decode problem: %v", err)
+		}
+		if problem["code"] != "endpoint_candidates_body_too_large" {
+			t.Errorf("code = %v, want %q", problem["code"], "endpoint_candidates_body_too_large")
+		}
+		if a := getAssertions(t, ts.URL); a.EndpointCandidatesCount != 0 {
+			t.Errorf("endpoint_candidates_count = %d, want 0", a.EndpointCandidatesCount)
+		}
+	})
+}
+
+// The accepted report's stale_after follows the TTL /test/configure-endpoint
+// sets, the one the endpoint report answers with too.
+func TestEndpointCandidates_StaleAfterFollowsConfiguredTTL(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	cfg := doRequest(t, http.MethodPost, ts.URL+"/test/configure-endpoint", `{"ttl_seconds":40}`)
+	cfg.Body.Close()
+	if cfg.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-endpoint status = %d, want %d", cfg.StatusCode, http.StatusNoContent)
+	}
+
+	resp := doRequest(t, http.MethodPut, ts.URL+endpointCandidatesPath, endpointCandidatesBody("10.0.0.5:51820"))
+	defer resp.Body.Close()
+	receipt := decodeEndpointCandidatesReceipt(t, resp)
+	if got := receipt.StaleAfter.Sub(receipt.AcceptedAt); got != 40*time.Second {
+		t.Errorf("stale_after - accepted_at = %v, want %v", got, 40*time.Second)
+	}
+}
+
+// The body is captured under endpoint-candidates, which is what the Docker e2e
+// run reads back to check the agent's report.
+func TestEndpointCandidates_CapturesRequestBody(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	body := endpointCandidatesBody("10.0.0.5:51820", "[fd00:10::5]:51820")
+	resp := doRequest(t, http.MethodPut, ts.URL+endpointCandidatesPath, body)
+	decodeEndpointCandidatesReceipt(t, resp)
+	resp.Body.Close()
+
+	if got := string(getCapturedBody(t, ts.URL, "endpoint-candidates")); got != body {
+		t.Errorf("captured body = %s, want %s", got, body)
+	}
+}
+
+func TestEndpointCandidates_WrongMethod_Returns405(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		t.Run(method, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, method, ts.URL+endpointCandidatesPath, "")
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+			}
+		})
+	}
+}
+
+// The route sits behind the bearer-envelope gate like every node route: a
+// report without the envelope, or with any other credential, is a 401 that
+// reaches neither the handler nor its counter.
+func TestEndpointCandidates_RequiresBearerEnvelope(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+	}{
+		{"no header", ""},
+		{"wrong credential", "Bearer wrong-token-value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := mockapi.New()
+			ts := httptest.NewServer(srv.Handler())
+			t.Cleanup(ts.Close)
+
+			req, err := http.NewRequest(http.MethodPut, ts.URL+endpointCandidatesPath, strings.NewReader(endpointCandidatesBody("10.0.0.5:51820")))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("PUT endpoint-candidates: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+			}
+
+			a := srv.Assertions()
+			if a.UnauthorizedCount != 1 {
+				t.Errorf("unauthorized_count = %d, want 1", a.UnauthorizedCount)
+			}
+			if a.EndpointCandidatesCount != 0 {
+				t.Errorf("endpoint_candidates_count = %d, want 0", a.EndpointCandidatesCount)
+			}
+		})
+	}
+}
+
+// Peer ...a0b1 carries one endpoint candidate, so on a device that came up its
+// dial order is 192.0.2.10:51820, then its fallback 203.0.113.1:51820, and the
+// Docker e2e run sees endpoint selection switch it once the first entry times
+// out. Peer ...a0b2 carries none, so the member is absent from its JSON.
+func TestState_ServesFixtureEndpointCandidates(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/v1/nodes/" + testMockNodeID + "/state")
+	if err != nil {
+		t.Fatalf("GET state: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var envelope struct {
+		Peers []map[string]json.RawMessage `json:"peers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	if len(envelope.Peers) != 2 {
+		t.Fatalf("len(peers) = %d, want 2", len(envelope.Peers))
+	}
+
+	for _, p := range envelope.Peers {
+		var id string
+		if err := json.Unmarshal(p["node_id"], &id); err != nil {
+			t.Fatalf("decode node_id %s: %v", p["node_id"], err)
+		}
+		raw, ok := p["endpoint_candidates"]
+		switch id {
+		case testFixturePeerB1:
+			var got []string
+			if !ok {
+				t.Errorf("peer %s carries no endpoint_candidates, want [\"192.0.2.10:51820\"]", id)
+			} else if err := json.Unmarshal(raw, &got); err != nil || len(got) != 1 || got[0] != "192.0.2.10:51820" {
+				t.Errorf("peer %s endpoint_candidates = %s, want [\"192.0.2.10:51820\"]", id, raw)
+			}
+		case testFixturePeerB2:
+			if ok {
+				t.Errorf("peer %s endpoint_candidates = %s, want the member absent", id, raw)
+			}
+		default:
+			t.Errorf("unexpected fixture peer %q", id)
+		}
 	}
 }
 

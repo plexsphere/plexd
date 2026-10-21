@@ -49,6 +49,7 @@ type AssertionCounters struct {
 	KeyRotateCount          int64 `json:"key_rotate_count"`
 	CapabilitiesCount       int64 `json:"capabilities_count"`
 	EndpointCount           int64 `json:"endpoint_count"`
+	EndpointCandidatesCount int64 `json:"endpoint_candidates_count"`
 	SecretsCount            int64 `json:"secrets_count"`
 	SecretsRateLimitedCount int64 `json:"secrets_rate_limited_count"`
 	ReportPutCount          int64 `json:"report_put_count"`
@@ -91,6 +92,7 @@ type Server struct {
 	keyRotateCount               atomic.Int64
 	capabilitiesCount            atomic.Int64
 	endpointCount                atomic.Int64
+	endpointCandidatesCount      atomic.Int64
 	secretsCount                 atomic.Int64
 	secretCurrentVersion         atomic.Int64
 	secretRateLimitNext          atomic.Int64
@@ -237,6 +239,7 @@ func (s *Server) Assertions() AssertionCounters {
 		KeyRotateCount:               s.keyRotateCount.Load(),
 		CapabilitiesCount:            s.capabilitiesCount.Load(),
 		EndpointCount:                s.endpointCount.Load(),
+		EndpointCandidatesCount:      s.endpointCandidatesCount.Load(),
 		SecretsCount:                 s.secretsCount.Load(),
 		SecretsRateLimitedCount:      s.secretsRateLimitedCount.Load(),
 		ReportPutCount:               s.reportPutCount.Load(),
@@ -262,9 +265,14 @@ func (s *Server) Assertions() AssertionCounters {
 
 // newStateFixture builds the desired-state NodeStateSnapshot envelope served by
 // GET /v1/nodes/{id}/state. The two peers mirror fixtureRegisterPeers (node_id
-// ascending, self excluded) and carry no psk/allowed_ips. Peer ...a0b1 has only
-// its relay fallback and peer ...a0b2 only a direct endpoint, so the agent's
-// endpoint selection meets both branches; the merged
+// ascending, self excluded) and carry no psk/allowed_ips. Peer ...a0b1 has one
+// endpoint candidate (192.0.2.10:51820) and its relay fallback but no direct
+// endpoint, and peer ...a0b2 only a direct endpoint, so the agent's dial order
+// meets both shapes. Peer ...a0b1's order is 192.0.2.10:51820, then its
+// fallback 203.0.113.1:51820: no node holds its key, so no handshake ever
+// completes, and on a device that came up the agent's endpoint selection
+// switches it from the first entry to the second once the first times out. The
+// Docker e2e run asserts that switch. The merged
 // policy fingerprint is derived with policyFingerprint; the bridge subtree
 // carries the four child configs; and both state and reports mirror one another
 // (the contract splits them for forward compatibility).
@@ -289,10 +297,11 @@ func newStateFixture() api.NodeStateSnapshot {
 	return api.NodeStateSnapshot{
 		Peers: []api.SnapshotPeer{
 			{
-				NodeID:           "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
-				MeshIP:           "10.99.0.2",
-				PublicKey:        "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
-				FallbackEndpoint: "203.0.113.1:51820",
+				NodeID:             "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+				MeshIP:             "10.99.0.2",
+				PublicKey:          "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+				FallbackEndpoint:   "203.0.113.1:51820",
+				EndpointCandidates: []string{"192.0.2.10:51820"},
 			},
 			{
 				NodeID:    "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2",
@@ -476,6 +485,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/keys/rotate", s.handleKeyRotate)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/capabilities", s.handleCapabilities)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/endpoint", s.handleEndpoint)
+	s.mux.HandleFunc("PUT /v1/nodes/{id}/endpoint-candidates", s.handleEndpointCandidates)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/secrets/{key}", s.handleSecrets)
 	s.mux.HandleFunc("PUT /v1/nodes/{id}/state/reports/{key}", s.handlePutStateReport)
 	s.mux.HandleFunc("DELETE /v1/nodes/{id}/state/reports/{key}", s.handleDeleteStateReport)
@@ -512,6 +522,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/keys/rotate", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/capabilities", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/endpoint", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/endpoint-candidates", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/secrets/{key}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/state/reports/{key}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/executions/{eid}", methodNotAllowed)
@@ -1280,6 +1291,133 @@ func (s *Server) handleEndpoint(w http.ResponseWriter, r *http.Request) {
 		AcceptedAt: now,
 		StaleAfter: now.Add(s.getEndpointTTL()),
 	})
+}
+
+// Endpoint candidates contract bounds. maxEndpointCandidates is the mock's own
+// copy of the contract's 8 rather than api.MaxEndpointCandidates, so it checks
+// the contract, not the agent's reading of it.
+const (
+	maxEndpointCandidatesBody = 4096
+	maxEndpointCandidates     = 8
+)
+
+// handleEndpointCandidates handles PUT /v1/nodes/{id}/endpoint-candidates, the
+// node's report of its local interface addresses joined with its WireGuard
+// listen port. It enforces the contract's gates in order: the 4 KiB body cap
+// (413 endpoint_candidates_body_too_large), the strict decode and the
+// structural invariants of checkEndpointCandidates (400
+// malformed_endpoint_candidates), the 60-second clock window (400
+// endpoint_clock_skew), and the form of each entry (400
+// endpoint_candidate_unparseable, naming the entry index). An empty array is a
+// valid report that withdraws every earlier candidate. The counter increments
+// only on the 200, whose stale_after follows the TTL /test/configure-endpoint
+// sets for the endpoint report.
+//
+// The decode target is mock-local rather than api.EndpointCandidatesRequest,
+// for the reason handleHandshakes gives: the agent's struct turns a missing
+// member into a zero value and a null array into nil, while the mock's pointers
+// keep both missing, so an agent that drops a member or sends null is refused
+// here as it would be by the control plane.
+func (s *Server) handleEndpointCandidates(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxEndpointCandidatesBody)
+	data, err := s.captureBody("endpoint-candidates", r)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, "endpoint_candidates_body_too_large",
+				fmt.Sprintf("request body exceeds the %d-byte endpoint candidates cap.", maxEndpointCandidatesBody))
+			return
+		}
+		writeProblem(w, r, http.StatusBadRequest, "malformed_endpoint_candidates", "invalid request body")
+		return
+	}
+
+	var req endpointCandidatesBody
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_endpoint_candidates",
+			"request body is not a valid EndpointCandidatesRequest: "+err.Error())
+		return
+	}
+	if detail := checkEndpointCandidates(req); detail != "" {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_endpoint_candidates", detail)
+		return
+	}
+
+	// Clock skew: reported_at must be within 60s of server time either way.
+	if skew := time.Since(*req.ReportedAt); skew > 60*time.Second || skew < -60*time.Second {
+		writeProblem(w, r, http.StatusBadRequest, "endpoint_clock_skew",
+			"reported_at is more than 60 seconds away from server time.")
+		return
+	}
+
+	for i, c := range *req.Candidates {
+		if !candidateEndpoint(c) {
+			writeProblem(w, r, http.StatusBadRequest, "endpoint_candidate_unparseable",
+				fmt.Sprintf("candidates[%d] is not a host:port pair with a non-zero port, a routable address and no zone.", i))
+			return
+		}
+	}
+
+	s.endpointCandidatesCount.Add(1)
+
+	now := time.Now().UTC()
+	writeJSON(w, http.StatusOK, api.EndpointCandidatesResponse{
+		AcceptedAt: now,
+		StaleAfter: now.Add(s.getEndpointTTL()),
+	})
+}
+
+// endpointCandidatesBody is the mock's reading of an endpoint candidates
+// report. Both members are pointers, so a missing or null one decodes to nil
+// and is refused as missing instead of passing as a zero value.
+type endpointCandidatesBody struct {
+	Candidates *[]string  `json:"candidates"`
+	ReportedAt *time.Time `json:"reported_at"`
+}
+
+// checkEndpointCandidates runs the contract's structural invariants over a
+// decoded endpoint candidates report and returns the detail of the first one it
+// breaks, or "" when the report is well formed. Every one of them answers 400
+// malformed_endpoint_candidates. The entries' form is not checked here: it has
+// a code of its own and is judged only after the clock. A duplicate is an entry
+// spelled exactly like an earlier one.
+func checkEndpointCandidates(req endpointCandidatesBody) string {
+	if req.Candidates == nil {
+		return "candidates is required and must be an array, not null."
+	}
+	if req.ReportedAt == nil || req.ReportedAt.IsZero() {
+		return "reported_at is required and must not be the zero time."
+	}
+	candidates := *req.Candidates
+	if len(candidates) > maxEndpointCandidates {
+		return fmt.Sprintf("candidates carries %d entries, at most %d are accepted.", len(candidates), maxEndpointCandidates)
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	for i, c := range candidates {
+		if _, dup := seen[c]; dup {
+			return fmt.Sprintf("candidates[%d] repeats an earlier entry.", i)
+		}
+		seen[c] = struct{}{}
+	}
+	return ""
+}
+
+// candidateEndpoint reports whether c is an endpoint candidate the contract
+// accepts: a host:port netip.ParseAddrPort reads (an IPv6 host in brackets), a
+// port in 1..65535, no IPv6 zone, and a host that, once an IPv4-mapped IPv6
+// address is unmapped, is not loopback, link-local unicast or multicast,
+// multicast, or unspecified. Unlike reportableEndpoint it refuses loopback and
+// link-local hosts, because a candidate is an address another node dials.
+func candidateEndpoint(c string) bool {
+	ap, err := netip.ParseAddrPort(c)
+	if err != nil || ap.Port() == 0 || ap.Addr().Zone() != "" {
+		return false
+	}
+	addr := ap.Addr().Unmap()
+	return !addr.IsLoopback() && !addr.IsLinkLocalUnicast() && !addr.IsLinkLocalMulticast() &&
+		!addr.IsMulticast() && !addr.IsUnspecified()
 }
 
 // handleSecrets handles GET /v1/nodes/{id}/secrets/{key}. It validates the key
