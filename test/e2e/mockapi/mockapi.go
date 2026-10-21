@@ -25,9 +25,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"regexp"
 	"sort"
 	"strconv"
@@ -61,6 +63,7 @@ type AssertionCounters struct {
 	// session activity endpoint. A structural 400 counts nowhere.
 	SessionActivityRejectedCount int64 `json:"session_activity_rejected_count"`
 	IntegrityViolationCount      int64 `json:"integrity_violation_count"`
+	HandshakeReportCount         int64 `json:"handshake_report_count"`
 	InjectEventCount             int64 `json:"inject_event_count"`
 	EventsRequestCount           int64 `json:"events_request_count"`
 	LocalMetricsCount            int64 `json:"local_metrics_count"`
@@ -102,6 +105,7 @@ type Server struct {
 	sessionActivityCount         atomic.Int64
 	sessionActivityRejectedCount atomic.Int64
 	integrityViolationCount      atomic.Int64
+	handshakeReportCount         atomic.Int64
 	injectEventCount             atomic.Int64
 	eventsRequestCount           atomic.Int64
 	localMetricsCount            atomic.Int64
@@ -243,6 +247,7 @@ func (s *Server) Assertions() AssertionCounters {
 		SessionActivityCount:         s.sessionActivityCount.Load(),
 		SessionActivityRejectedCount: s.sessionActivityRejectedCount.Load(),
 		IntegrityViolationCount:      s.integrityViolationCount.Load(),
+		HandshakeReportCount:         s.handshakeReportCount.Load(),
 		InjectEventCount:             s.injectEventCount.Load(),
 		EventsRequestCount:           s.eventsRequestCount.Load(),
 		LocalMetricsCount:            s.localMetricsCount.Load(),
@@ -475,6 +480,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/nodes/{id}/audit", s.handleAudit)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/sessions/{sid}", s.handleSessionActivity)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/integrity-violations", s.handleIntegrityViolations)
+	s.mux.HandleFunc("POST /v1/nodes/{id}/handshakes", s.handleHandshakes)
 
 	// Release channel fixture (outside /v1: this plays the GitHub release host,
 	// not the control plane).
@@ -508,6 +514,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/audit", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/sessions/{sid}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/integrity-violations", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/handshakes", methodNotAllowed)
 	s.mux.HandleFunc("/releases/{tag}/{asset}", methodNotAllowed)
 	s.mux.HandleFunc("/test/state", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-state", methodNotAllowed)
@@ -2191,6 +2198,186 @@ func checkIntegrityViolation(v api.IntegrityViolationReport) (code, detail strin
 			"expected_checksum must be 32 bytes, standard-padded base64"
 	}
 	return "", ""
+}
+
+// handleHandshakes handles POST /v1/nodes/{id}/handshakes, the per-peer
+// WireGuard handshake report the control plane derives each mesh edge's status
+// from. It answers in the contract's gate order: the 1 MiB body cap (413
+// handshake_report_too_large), the strict decode and the structural invariants
+// of checkHandshakeReport (400 malformed_handshake_report), the 60-second clock
+// window (400 handshake_clock_skew), and the endpoint form (400
+// handshake_endpoint_unparseable, naming the entry index). The order is part of
+// the contract: every structural check runs over the whole report before the
+// clock or any endpoint is looked at, so a report breaking both is refused as
+// malformed. An accepted report answers 200 with recorded counting the entries
+// that name a peer of the current state fixture and ignored the rest, which is
+// what the control plane does for the node itself, an unknown id or a
+// deregistered peer. The counter increments only on the 200.
+//
+// The decode target is mock-local rather than api.HandshakeReportRequest, for
+// the reason handleIntegrityViolations is strict: a fixture that reads the
+// agent's own shape agrees with the agent and with nothing else. The agent's
+// struct turns a missing member into a zero value; the mock's pointers keep it
+// missing, so an agent that drops a field is refused here as it would be there.
+func (s *Server) handleHandshakes(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxHandshakeReportBody)
+	data, err := s.captureBody("handshakes", r)
+	if err == nil && len(data) == maxHandshakeReportBody {
+		// captureBody stops reading at maxCapturedBody, which is the same 1 MiB
+		// as the cap, so the MaxBytesReader beneath it never reads the byte that
+		// would trip it and a longer body arrives truncated rather than refused.
+		// Draining the rest tells a body of exactly 1 MiB from a longer one; the
+		// MaxBytesReader stops the drain one byte past the cap.
+		_, err = io.Copy(io.Discard, r.Body)
+	}
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, "handshake_report_too_large",
+				fmt.Sprintf("request body exceeds the %d-byte handshake report cap.", maxHandshakeReportBody))
+			return
+		}
+		writeProblem(w, r, http.StatusBadRequest, "malformed_handshake_report", "invalid request body")
+		return
+	}
+
+	var req handshakeReportBody
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_handshake_report",
+			"request body is not a valid HandshakeReportRequest: "+err.Error())
+		return
+	}
+	if detail := checkHandshakeReport(req); detail != "" {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_handshake_report", detail)
+		return
+	}
+
+	// Clock skew: observed_at must be within 60s of server time either way.
+	if skew := time.Since(*req.ObservedAt); skew > 60*time.Second || skew < -60*time.Second {
+		writeProblem(w, r, http.StatusBadRequest, "handshake_clock_skew",
+			"observed_at is more than 60 seconds away from server time.")
+		return
+	}
+
+	peers := *req.Peers
+	for i, p := range peers {
+		if !reportableEndpoint(p.Endpoint) {
+			writeProblem(w, r, http.StatusBadRequest, "handshake_endpoint_unparseable",
+				fmt.Sprintf("peers[%d].endpoint is not a host:port pair with a non-zero port, a specified address, and no zone.", i))
+			return
+		}
+	}
+
+	live := s.fixturePeerIDs()
+	resp := api.HandshakeReportResponse{AcceptedAt: time.Now().UTC()}
+	for _, p := range peers {
+		if _, ok := live[strings.ToLower(*p.PeerNodeID)]; ok {
+			resp.Recorded++
+		} else {
+			resp.Ignored++
+		}
+	}
+
+	s.handshakeReportCount.Add(1)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// Handshake report contract bounds. maxHandshakeReportPeers is the mock's own
+// copy of the contract's 4096 rather than api.MaxHandshakeReportPeers, so it
+// checks the contract, not the agent's reading of it: a client constant that
+// drifted upwards would otherwise move the mock's ceiling with it.
+const (
+	maxHandshakeReportBody  = 1 << 20
+	maxHandshakeReportPeers = 4096
+)
+
+// handshakeReportBody is the mock's reading of a handshake report. Every member
+// is a pointer, so a missing or null one decodes to nil and is refused as
+// missing instead of passing as a zero value. The age is an int64, so a value
+// outside the contract's int32 range reaches the range check in
+// checkHandshakeReport instead of failing the decode with a less telling error.
+type handshakeReportBody struct {
+	ObservedAt *time.Time              `json:"observed_at"`
+	Peers      *[]handshakeReportEntry `json:"peers"`
+}
+
+// handshakeReportEntry is one entry of a handshakeReportBody.
+type handshakeReportEntry struct {
+	PeerNodeID              *string `json:"peer_node_id"`
+	LastHandshakeAgeSeconds *int64  `json:"last_handshake_age_seconds"`
+	Endpoint                *string `json:"endpoint"`
+}
+
+// checkHandshakeReport runs the contract's structural invariants over a decoded
+// handshake report and returns the detail of the first one it breaks, or ""
+// when the report is well formed. Every one of them answers 400
+// malformed_handshake_report. The endpoint is not checked here: it has a code
+// of its own and is judged only after the clock.
+//
+// A peer_node_id repeats regardless of case, since a UUID's hex digits are
+// case-insensitive and two spellings of one id name the same edge.
+func checkHandshakeReport(req handshakeReportBody) string {
+	if req.ObservedAt == nil || req.ObservedAt.IsZero() {
+		return "observed_at is required and must not be the zero time."
+	}
+	if req.Peers == nil {
+		return "peers is required and must be an array, not null."
+	}
+	peers := *req.Peers
+	if len(peers) > maxHandshakeReportPeers {
+		return fmt.Sprintf("peers carries %d entries, at most %d are accepted.", len(peers), maxHandshakeReportPeers)
+	}
+	seen := make(map[string]struct{}, len(peers))
+	for i, p := range peers {
+		switch {
+		case p.PeerNodeID == nil:
+			return fmt.Sprintf("peers[%d].peer_node_id is required.", i)
+		case !uuidRe.MatchString(*p.PeerNodeID) || *p.PeerNodeID == "00000000-0000-0000-0000-000000000000":
+			return fmt.Sprintf("peers[%d].peer_node_id is not a non-zero UUID.", i)
+		case p.LastHandshakeAgeSeconds == nil:
+			return fmt.Sprintf("peers[%d].last_handshake_age_seconds is required.", i)
+		case *p.LastHandshakeAgeSeconds < 0 || *p.LastHandshakeAgeSeconds > math.MaxInt32:
+			return fmt.Sprintf("peers[%d].last_handshake_age_seconds is outside 0..%d.", i, math.MaxInt32)
+		}
+		id := strings.ToLower(*p.PeerNodeID)
+		if _, dup := seen[id]; dup {
+			return fmt.Sprintf("peers[%d].peer_node_id names a peer an earlier entry already named.", i)
+		}
+		seen[id] = struct{}{}
+	}
+	return ""
+}
+
+// reportableEndpoint reports whether a handshake report entry's endpoint is one
+// the contract accepts: present, a host:port netip.ParseAddrPort reads (an IPv6
+// host in brackets), a port in 1..65535, an address that is not unspecified,
+// and no IPv6 zone. Unlike routableEndpoint it admits loopback and link-local
+// addresses, because WireGuard may use either and the contract refuses neither.
+func reportableEndpoint(endpoint *string) bool {
+	if endpoint == nil {
+		return false
+	}
+	ap, err := netip.ParseAddrPort(*endpoint)
+	if err != nil {
+		return false
+	}
+	return ap.Port() != 0 && !ap.Addr().IsUnspecified() && ap.Addr().Zone() == ""
+}
+
+// fixturePeerIDs returns the lowercased node ids of the peers the current state
+// fixture lists. They stand in for the live peers of the node's Domain, the only
+// ids a handshake report entry is recorded for; following the fixture rather
+// than a fixed list keeps the answer true after SetState changes the peers.
+func (s *Server) fixturePeerIDs() map[string]struct{} {
+	s.stateFixtureMu.RLock()
+	defer s.stateFixtureMu.RUnlock()
+	ids := make(map[string]struct{}, len(s.stateFixture.Peers))
+	for _, p := range s.stateFixture.Peers {
+		ids[strings.ToLower(p.NodeID)] = struct{}{}
+	}
+	return ids
 }
 
 // SetState updates the mutable state fixture returned by GET /v1/nodes/{id}/state

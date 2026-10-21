@@ -1461,6 +1461,8 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/integrity-violations", integrityViolationBody)
 	resp.Body.Close()
+	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/handshakes", handshakeBody())
+	resp.Body.Close()
 
 	// Inject one SSE event.
 	envJSON, _ := json.Marshal(makeEnvelope("test_mixed", "evt-mixed-001", json.RawMessage(`{}`)))
@@ -1520,6 +1522,9 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	if a.IntegrityViolationCount != 1 {
 		t.Errorf("integrity_violation_count = %d, want 1", a.IntegrityViolationCount)
 	}
+	if a.HandshakeReportCount != 1 {
+		t.Errorf("handshake_report_count = %d, want 1", a.HandshakeReportCount)
+	}
 	if a.InjectEventCount != 1 {
 		t.Errorf("inject_event_count = %d, want 1", a.InjectEventCount)
 	}
@@ -1562,6 +1567,7 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPost, "/v1/nodes/node-1/audit", auditBatchBody},
 		{http.MethodPost, "/v1/nodes/" + testMockNodeID + "/sessions/sess-conc", `{"tcp":{"phase":"session_started"}}`},
 		{http.MethodPost, "/v1/nodes/node-1/integrity-violations", integrityViolationBody},
+		{http.MethodPost, "/v1/nodes/node-1/handshakes", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:51820"))},
 		{http.MethodPost, "/test/inject-event", `{"id":"e1","type":"conc","payload":{},"signature":"s"}`},
 	}
 
@@ -3482,6 +3488,393 @@ func TestIntegrityViolations_WrongMethod_Returns405(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Handshake report endpoint (issue #100)
+// ---------------------------------------------------------------------------
+
+// The state fixture's two peers. A handshake report entry naming one of them is
+// recorded; any other id is ignored.
+const (
+	testFixturePeerB1 = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"
+	testFixturePeerB2 = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2"
+	// testUnknownPeer is a well-formed UUID no fixture lists.
+	testUnknownPeer = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f9"
+)
+
+// handshakesURL builds POST /v1/nodes/{mockNode}/handshakes.
+func handshakesURL(baseURL string) string {
+	return baseURL + "/v1/nodes/" + testMockNodeID + "/handshakes"
+}
+
+// handshakeEntry renders one contract-valid handshake report entry.
+func handshakeEntry(peerID string, age int64, endpoint string) string {
+	return fmt.Sprintf(`{"peer_node_id":%q,"last_handshake_age_seconds":%d,"endpoint":%q}`, peerID, age, endpoint)
+}
+
+// handshakeBodyAt renders a handshake report observed at observedAt, carrying
+// the given entries verbatim.
+func handshakeBodyAt(observedAt time.Time, entries ...string) string {
+	return fmt.Sprintf(`{"observed_at":%q,"peers":[%s]}`,
+		observedAt.UTC().Format(time.RFC3339Nano), strings.Join(entries, ","))
+}
+
+// handshakeBody renders a handshake report observed now, so it never trips the
+// mock's clock-skew check.
+func handshakeBody(entries ...string) string {
+	return handshakeBodyAt(time.Now(), entries...)
+}
+
+// decodeHandshakeReceipt strict-decodes a 200 handshake report answer.
+func decodeHandshakeReceipt(t *testing.T, resp *http.Response) api.HandshakeReportResponse {
+	t.Helper()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+	var receipt api.HandshakeReportResponse
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&receipt); err != nil {
+		t.Fatalf("decode receipt: %v", err)
+	}
+	return receipt
+}
+
+func TestHandshakes_RecordsFixturePeersAndIgnoresTheRest(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	body := handshakeBody(
+		handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:51820"),
+		handshakeEntry(testUnknownPeer, 130, "[2001:db8::7]:51820"),
+	)
+	resp := doRequest(t, http.MethodPost, handshakesURL(ts.URL), body)
+	defer resp.Body.Close()
+
+	receipt := decodeHandshakeReceipt(t, resp)
+	if receipt.Recorded != 1 || receipt.Ignored != 1 {
+		t.Errorf("recorded = %d, ignored = %d, want 1 and 1", receipt.Recorded, receipt.Ignored)
+	}
+	if receipt.AcceptedAt.IsZero() {
+		t.Error("accepted_at is unset")
+	}
+
+	if a := getAssertions(t, ts.URL); a.HandshakeReportCount != 1 {
+		t.Errorf("handshake_report_count = %d, want 1", a.HandshakeReportCount)
+	}
+	if got := string(getCapturedBody(t, ts.URL, "handshakes")); got != body {
+		t.Errorf("captured body = %s, want %s", got, body)
+	}
+}
+
+// An empty report is valid and records nothing. It is the only body the e2e run
+// ever sends, because the fixture peers never complete a handshake.
+func TestHandshakes_EmptyPeers_Returns200(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodPost, handshakesURL(ts.URL), handshakeBody())
+	defer resp.Body.Close()
+
+	receipt := decodeHandshakeReceipt(t, resp)
+	if receipt.Recorded != 0 || receipt.Ignored != 0 {
+		t.Errorf("recorded = %d, ignored = %d, want 0 and 0", receipt.Recorded, receipt.Ignored)
+	}
+	if a := getAssertions(t, ts.URL); a.HandshakeReportCount != 1 {
+		t.Errorf("handshake_report_count = %d, want 1", a.HandshakeReportCount)
+	}
+}
+
+// The recorded count follows the current state fixture, the mock's stand-in for
+// the Domain's live peers: once the fixture drops its peers, an id it used to
+// list is ignored, as a deregistered peer is.
+func TestHandshakes_RecordedFollowsStateFixture(t *testing.T) {
+	srv, ts := newTestServer(t)
+
+	body := handshakeBody(
+		handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:51820"),
+		handshakeEntry(strings.ToUpper(testFixturePeerB2), 9, "198.51.100.8:51820"),
+	)
+	resp := doRequest(t, http.MethodPost, handshakesURL(ts.URL), body)
+	receipt := decodeHandshakeReceipt(t, resp)
+	resp.Body.Close()
+	if receipt.Recorded != 2 || receipt.Ignored != 0 {
+		t.Errorf("default fixture: recorded = %d, ignored = %d, want 2 and 0 (ids compare case-insensitively)",
+			receipt.Recorded, receipt.Ignored)
+	}
+
+	srv.SetState(api.NodeStateSnapshot{})
+	resp = doRequest(t, http.MethodPost, handshakesURL(ts.URL), body)
+	receipt = decodeHandshakeReceipt(t, resp)
+	resp.Body.Close()
+	if receipt.Recorded != 0 || receipt.Ignored != 2 {
+		t.Errorf("peerless fixture: recorded = %d, ignored = %d, want 0 and 2", receipt.Recorded, receipt.Ignored)
+	}
+}
+
+// TestHandshakes_RefusesNonContractBody walks the contract's 400 refusals in its
+// gate order. A refused report is never counted, and a report that breaks an
+// earlier gate is refused by that one, whatever it breaks later.
+func TestHandshakes_RefusesNonContractBody(t *testing.T) {
+	valid := handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:51820")
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tooMany := make([]string, 4097)
+	for i := range tooMany {
+		tooMany[i] = handshakeEntry(fmt.Sprintf("%08x-0000-4000-8000-%012x", i+1, i+1), 5, "198.51.100.7:51820")
+	}
+
+	tests := []struct {
+		name       string
+		body       string
+		wantCode   string
+		wantDetail string // checked only when non-empty
+	}{
+		{"not json", "not-json", "malformed_handshake_report", ""},
+		{"unknown field", `{"observed_at":"` + now + `","peers":[],"node_id":"x"}`, "malformed_handshake_report", ""},
+		{
+			"unknown entry field",
+			handshakeBody(`{"peer_node_id":"` + testFixturePeerB1 + `","last_handshake_age_seconds":5,"endpoint":"198.51.100.7:51820","rx_bytes":1}`),
+			"malformed_handshake_report", "",
+		},
+		{"observed_at missing", `{"peers":[]}`, "malformed_handshake_report", ""},
+		{"observed_at zero", `{"observed_at":"0001-01-01T00:00:00Z","peers":[]}`, "malformed_handshake_report", ""},
+		{"peers missing", `{"observed_at":"` + now + `"}`, "malformed_handshake_report", ""},
+		{"peers null", `{"observed_at":"` + now + `","peers":null}`, "malformed_handshake_report", ""},
+		{"more than 4096 entries", handshakeBody(tooMany...), "malformed_handshake_report", ""},
+		{
+			"peer_node_id missing",
+			handshakeBody(`{"last_handshake_age_seconds":5,"endpoint":"198.51.100.7:51820"}`),
+			"malformed_handshake_report", "",
+		},
+		{"peer_node_id not a uuid", handshakeBody(handshakeEntry("peer-1", 5, "198.51.100.7:51820")), "malformed_handshake_report", ""},
+		{
+			"peer_node_id all zero",
+			handshakeBody(handshakeEntry("00000000-0000-0000-0000-000000000000", 5, "198.51.100.7:51820")),
+			"malformed_handshake_report", "",
+		},
+		{
+			"age missing",
+			handshakeBody(`{"peer_node_id":"` + testFixturePeerB1 + `","endpoint":"198.51.100.7:51820"}`),
+			"malformed_handshake_report", "",
+		},
+		{"age -1", handshakeBody(handshakeEntry(testFixturePeerB1, -1, "198.51.100.7:51820")), "malformed_handshake_report", ""},
+		{"age above int32", handshakeBody(handshakeEntry(testFixturePeerB1, 2147483648, "198.51.100.7:51820")), "malformed_handshake_report", ""},
+		{
+			"repeated peer_node_id",
+			handshakeBody(valid, handshakeEntry(testFixturePeerB1, 9, "198.51.100.8:51820")),
+			"malformed_handshake_report", "",
+		},
+		{
+			"repeated peer_node_id in another case",
+			handshakeBody(valid, handshakeEntry(strings.ToUpper(testFixturePeerB1), 9, "198.51.100.8:51820")),
+			"malformed_handshake_report", "",
+		},
+		{
+			// Structure is judged over the whole report before the clock.
+			"malformed beats clock skew",
+			handshakeBodyAt(time.Now().Add(-time.Hour), handshakeEntry(testFixturePeerB1, -1, "198.51.100.7:51820")),
+			"malformed_handshake_report", "",
+		},
+		{
+			// A later entry's structure is judged before an earlier entry's endpoint.
+			"malformed beats endpoint",
+			handshakeBody(handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:0"), handshakeEntry(testUnknownPeer, -1, "198.51.100.8:51820")),
+			"malformed_handshake_report", "",
+		},
+		{"observed_at 61 s old", handshakeBodyAt(time.Now().Add(-61*time.Second), valid), "handshake_clock_skew", ""},
+		// The table is built before the first subtest runs, and every moment
+		// spent since brings a future observed_at closer to the window, so this
+		// case keeps a margin a slow runner cannot use up.
+		{"observed_at 2 min ahead", handshakeBodyAt(time.Now().Add(2*time.Minute), valid), "handshake_clock_skew", ""},
+		{
+			"clock skew beats endpoint",
+			handshakeBodyAt(time.Now().Add(-61*time.Second), handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:0")),
+			"handshake_clock_skew", "",
+		},
+		{
+			"port 0",
+			handshakeBody(valid, handshakeEntry(testUnknownPeer, 5, "198.51.100.7:0")),
+			"handshake_endpoint_unparseable",
+			"peers[1].endpoint is not a host:port pair with a non-zero port, a specified address, and no zone.",
+		},
+		{
+			"endpoint missing",
+			handshakeBody(`{"peer_node_id":"` + testFixturePeerB1 + `","last_handshake_age_seconds":5}`),
+			"handshake_endpoint_unparseable",
+			"peers[0].endpoint is not a host:port pair with a non-zero port, a specified address, and no zone.",
+		},
+		{"endpoint without a port", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "198.51.100.7")), "handshake_endpoint_unparseable", ""},
+		{"endpoint a hostname", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "node-b.example:51820")), "handshake_endpoint_unparseable", ""},
+		{"IPv6 endpoint without brackets", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "2001:db8::7:51820")), "handshake_endpoint_unparseable", ""},
+		{"unspecified IPv4 address", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "0.0.0.0:51820")), "handshake_endpoint_unparseable", ""},
+		{"unspecified IPv6 address", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "[::]:51820")), "handshake_endpoint_unparseable", ""},
+		{"zoned IPv6 address", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "[fe80::1%eth0]:51820")), "handshake_endpoint_unparseable", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, http.MethodPost, handshakesURL(ts.URL), tt.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusBadRequest, body)
+			}
+			if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/problem+json") {
+				t.Errorf("content-type = %q, want application/problem+json", ct)
+			}
+
+			var problem map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			if problem["code"] != tt.wantCode {
+				t.Errorf("code = %v, want %q (detail: %v)", problem["code"], tt.wantCode, problem["detail"])
+			}
+			if tt.wantDetail != "" && problem["detail"] != tt.wantDetail {
+				t.Errorf("detail = %v, want %q", problem["detail"], tt.wantDetail)
+			}
+
+			// A refused report must not be counted as delivered.
+			if a := getAssertions(t, ts.URL); a.HandshakeReportCount != 0 {
+				t.Errorf("handshake_report_count = %d, want 0", a.HandshakeReportCount)
+			}
+		})
+	}
+}
+
+// The contract's ceiling is inclusive: 4096 entries are a valid report.
+func TestHandshakes_AcceptsTheEntryCeiling(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	entries := make([]string, 4096)
+	for i := range entries {
+		entries[i] = handshakeEntry(fmt.Sprintf("%08x-0000-4000-8000-%012x", i+1, i+1), 5, "198.51.100.7:51820")
+	}
+	resp := doRequest(t, http.MethodPost, handshakesURL(ts.URL), handshakeBody(entries...))
+	defer resp.Body.Close()
+
+	receipt := decodeHandshakeReceipt(t, resp)
+	if receipt.Recorded != 0 || receipt.Ignored != 4096 {
+		t.Errorf("recorded = %d, ignored = %d, want 0 and 4096", receipt.Recorded, receipt.Ignored)
+	}
+}
+
+// The contract refuses what WireGuard never uses for a peer and nothing else: a
+// loopback or link-local endpoint without a zone is as reportable as a public
+// one.
+func TestHandshakes_AcceptsLoopbackAndLinkLocalEndpoints(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	body := handshakeBody(
+		handshakeEntry(testFixturePeerB1, 0, "127.0.0.1:1"),
+		handshakeEntry(testFixturePeerB2, 2147483647, "[fe80::1]:51820"),
+	)
+	resp := doRequest(t, http.MethodPost, handshakesURL(ts.URL), body)
+	defer resp.Body.Close()
+
+	receipt := decodeHandshakeReceipt(t, resp)
+	if receipt.Recorded != 2 {
+		t.Errorf("recorded = %d, want 2", receipt.Recorded)
+	}
+}
+
+// The 1 MiB cap is inclusive and exact. captureBody keeps exactly 1 MiB too, so
+// without the handler's own check a longer body would arrive truncated and draw
+// a 400 instead of the contract's 413.
+func TestHandshakes_BodyCap(t *testing.T) {
+	const capBytes = 1 << 20
+	padded := func(n int) string {
+		body := handshakeBody()
+		return body + strings.Repeat(" ", n-len(body))
+	}
+
+	t.Run("exactly 1 MiB is accepted", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		resp := doRequest(t, http.MethodPost, handshakesURL(ts.URL), padded(capBytes))
+		defer resp.Body.Close()
+		decodeHandshakeReceipt(t, resp)
+	})
+
+	t.Run("one byte more is refused", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		resp := doRequest(t, http.MethodPost, handshakesURL(ts.URL), padded(capBytes+1))
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
+		}
+
+		var problem map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+			t.Fatalf("decode problem: %v", err)
+		}
+		if problem["code"] != "handshake_report_too_large" {
+			t.Errorf("code = %v, want %q", problem["code"], "handshake_report_too_large")
+		}
+		if a := getAssertions(t, ts.URL); a.HandshakeReportCount != 0 {
+			t.Errorf("handshake_report_count = %d, want 0", a.HandshakeReportCount)
+		}
+	})
+}
+
+func TestHandshakes_WrongMethod_Returns405(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp, err := http.Get(handshakesURL(ts.URL))
+	if err != nil {
+		t.Fatalf("GET handshakes: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// The route sits behind the bearer-envelope gate like every node route: a
+// report without the envelope, or with any other credential, is a 401 that
+// reaches neither the handler nor its counter.
+func TestHandshakes_RequiresBearerEnvelope(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+	}{
+		{"no header", ""},
+		{"wrong credential", "Bearer wrong-token-value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := mockapi.New()
+			ts := httptest.NewServer(srv.Handler())
+			t.Cleanup(ts.Close)
+
+			req, err := http.NewRequest(http.MethodPost, handshakesURL(ts.URL), strings.NewReader(handshakeBody()))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("POST handshakes: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+			}
+
+			a := srv.Assertions()
+			if a.UnauthorizedCount != 1 {
+				t.Errorf("unauthorized_count = %d, want 1", a.UnauthorizedCount)
+			}
+			if a.HandshakeReportCount != 0 {
+				t.Errorf("handshake_report_count = %d, want 0", a.HandshakeReportCount)
+			}
+		})
 	}
 }
 
