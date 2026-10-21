@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/tls"
@@ -888,10 +890,24 @@ func TestState_ReturnsPeersAndPolicy(t *testing.T) {
 		}
 	}
 
-	// The peers JSON must never carry psk/allowed_ips/endpoint.
-	for _, forbidden := range []string{`"psk"`, `"allowed_ips"`, `"endpoint"`} {
+	// The peers JSON must never carry psk/allowed_ips: PSKs are fetched per edge.
+	for _, forbidden := range []string{`"psk"`, `"allowed_ips"`} {
 		if bytes.Contains(envelope["peers"], []byte(forbidden)) {
 			t.Errorf("peers JSON must not contain %s: %s", forbidden, envelope["peers"])
+		}
+	}
+	// Peer ...a0b1 carries only its relay fallback and peer ...a0b2 only a
+	// direct endpoint, so the agent's endpoint selection meets both branches.
+	var peers []map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["peers"], &peers); err != nil {
+		t.Fatalf("unmarshal peers: %v", err)
+	}
+	if len(peers) == 2 {
+		if _, ok := peers[0]["endpoint"]; ok {
+			t.Errorf("peer %s carries an endpoint, want only its fallback: %s", peers[0]["node_id"], envelope["peers"])
+		}
+		if got := string(peers[1]["endpoint"]); got != `"198.51.100.20:51820"` {
+			t.Errorf("peer %s endpoint = %s, want \"198.51.100.20:51820\"", peers[1]["node_id"], got)
 		}
 	}
 
@@ -1568,6 +1584,7 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPost, "/v1/nodes/" + testMockNodeID + "/sessions/sess-conc", `{"tcp":{"phase":"session_started"}}`},
 		{http.MethodPost, "/v1/nodes/node-1/integrity-violations", integrityViolationBody},
 		{http.MethodPost, "/v1/nodes/node-1/handshakes", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:51820"))},
+		{http.MethodGet, "/v1/nodes/" + testMockNodeID + "/peers/" + testFixturePeerB1 + "/psk", ""},
 		{http.MethodPost, "/test/inject-event", `{"id":"e1","type":"conc","payload":{},"signature":"s"}`},
 	}
 
@@ -6337,5 +6354,140 @@ func TestSessionToken_WrongMethod_Returns405(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Edge PSK
+// ---------------------------------------------------------------------------
+
+const testEdgePSKEpoch = "2026-01-01T00:00:00.000000000Z|2026-01-01T00:00:01.000000000Z"
+
+func edgePSKURL(base, nodeID, peerID string) string {
+	return base + "/v1/nodes/" + nodeID + "/peers/" + peerID + "/psk"
+}
+
+// openTestEdgePSK opens an edge-PSK envelope with the contract's additional
+// authenticated data spelled out here, independently of plexd's own code.
+func openTestEdgePSK(t *testing.T, nsk, envelope []byte, self, peer, epoch string) []byte {
+	t.Helper()
+	block, err := aes.NewCipher(nsk)
+	if err != nil {
+		t.Fatalf("aes.NewCipher: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("cipher.NewGCM: %v", err)
+	}
+	aad := []byte("plexsphere/mesh/edge-psk/v1|" + self + "|" + peer + "|" + epoch)
+	plaintext, err := gcm.Open(nil, envelope[:gcm.NonceSize()], envelope[gcm.NonceSize():], aad)
+	if err != nil {
+		t.Fatalf("the envelope does not open with the contract's AAD: %v", err)
+	}
+	return plaintext
+}
+
+func TestEdgePSK_ServesSealedFixturePSK(t *testing.T) {
+	srv, ts := newTestServer(t)
+
+	resp, err := http.Get(edgePSKURL(ts.URL, testMockNodeID, testFixturePeerB1))
+	if err != nil {
+		t.Fatalf("GET psk: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	for header, want := range map[string]string{
+		"Content-Type":           "application/octet-stream",
+		"Cache-Control":          "no-store",
+		"X-Plexsphere-PSK-KID":   "mock-nsk-1",
+		"X-Plexsphere-PSK-Epoch": testEdgePSKEpoch,
+	} {
+		if got := resp.Header.Get(header); got != want {
+			t.Errorf("%s = %q, want %q", header, got, want)
+		}
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if len(body) != 60 {
+		t.Fatalf("body is %d bytes, want 60", len(body))
+	}
+	plaintext := openTestEdgePSK(t, srv.NSK(), body, testMockNodeID, testFixturePeerB1, testEdgePSKEpoch)
+	want := sha256.Sum256([]byte("mock-edge-psk|" + testFixturePeerB1))
+	if !bytes.Equal(plaintext, want[:]) {
+		t.Error("the envelope does not carry the fixture PSK")
+	}
+
+	if a := getAssertions(t, ts.URL); a.EdgePSKCount != 1 {
+		t.Errorf("edge_psk_count = %d, want 1", a.EdgePSKCount)
+	}
+}
+
+func TestEdgePSK_Refusals(t *testing.T) {
+	tests := []struct {
+		name, nodeID, peerID string
+		wantStatus           int
+		wantCode             string
+	}{
+		{"another node", "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0ff", testFixturePeerB1, http.StatusForbidden, "node_id_mismatch"},
+		{"unknown peer", testMockNodeID, "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0ff", http.StatusNotFound, "peer_not_found"},
+		{"peer is the node itself", testMockNodeID, testMockNodeID, http.StatusNotFound, "peer_not_found"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, ts := newTestServer(t)
+			resp, err := http.Get(edgePSKURL(ts.URL, tt.nodeID, tt.peerID))
+			if err != nil {
+				t.Fatalf("GET psk: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			var problem struct {
+				Code string `json:"code"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			if problem.Code != tt.wantCode {
+				t.Errorf("code = %q, want %q", problem.Code, tt.wantCode)
+			}
+			if a := srv.Assertions(); a.EdgePSKCount != 0 {
+				t.Errorf("edge_psk_count = %d after a refusal, want 0", a.EdgePSKCount)
+			}
+		})
+	}
+}
+
+func TestEdgePSK_WrongMethod_Returns405(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodPost, edgePSKURL(ts.URL, testMockNodeID, testFixturePeerB1), "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestEdgePSK_RequiresBearer(t *testing.T) {
+	srv := mockapi.New()
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(edgePSKURL(ts.URL, testMockNodeID, testFixturePeerB1))
+	if err != nil {
+		t.Fatalf("GET psk: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+	if a := srv.Assertions(); a.EdgePSKCount != 0 {
+		t.Errorf("edge_psk_count = %d without the bearer envelope, want 0", a.EdgePSKCount)
 	}
 }
