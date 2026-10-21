@@ -275,6 +275,28 @@ func runAgent(ctx context.Context) error {
 		}
 	}
 
+	// 5a-2. Local endpoint candidates. The candidate publisher (step 24a)
+	// reports this node's interface addresses, and the WireGuard reconcile
+	// handler orders a peer's candidates on a subnet this node shares first.
+	// Both read the interfaces through one filter, which leaves out the mesh
+	// interface under both its names and every address of the mesh prefix:
+	// a peer dialing one of those would route WireGuard into its own tunnel.
+	var candidateFilter nat.CandidateFilter
+	if wgReady {
+		candidateFilter = nat.CandidateFilter{
+			Interfaces:        cfg.NAT.CandidateInterfaces,
+			ExcludeInterfaces: []string{cfg.WireGuard.InterfaceName, wgMgr.OSInterfaceName()},
+			ExcludePrefix:     wgMgr.MeshPrefix(),
+		}
+		wgMgr.SetLocalPrefixes(func() ([]netip.Prefix, error) {
+			ifaces, err := nat.SystemInterfaces()
+			if err != nil {
+				return nil, err
+			}
+			return nat.EligiblePrefixes(ifaces, candidateFilter), nil
+		})
+	}
+
 	// 5b. Initialize NAT traversal and peer exchange.
 	stunClient := &nat.UDPSTUNClient{Timeout: cfg.NAT.Timeout}
 	natDiscoverer := nat.NewDiscoverer(stunClient, cfg.NAT, cfg.WireGuard.ListenPort, logger)
@@ -787,9 +809,10 @@ func runAgent(ctx context.Context) error {
 	// Register the WireGuard reconcile handler only when the interface came up.
 	// A handler that fails every cycle would hold back the reconciler snapshot,
 	// so the fingerprint short-circuit could never converge on such hosts. The
-	// handshake reporter (step 17a) and the tunnel collector (step 13) read the
-	// same device and are skipped on the same condition, so this one line
-	// accounts for all three.
+	// handshake reporter (step 17a), the tunnel collector (step 13), endpoint
+	// selection (step 17b) and the endpoint candidate publisher (step 24a)
+	// need the same device and are skipped on the same condition, so this one
+	// line accounts for all five.
 	if wgReady {
 		// The typed lookup keeps the interface a true nil when edge PSKs are
 		// off, as the rotator's device variable does.
@@ -799,7 +822,7 @@ func runAgent(ctx context.Context) error {
 		}
 		reconciler.RegisterHandler(wireguard.ReconcileHandler(wgMgr, psksLookup))
 	} else {
-		logger.Warn("wireguard unavailable, skipping peer reconcile handler, handshake reports and tunnel metrics")
+		logger.Warn("wireguard unavailable, skipping peer reconcile handler, handshake reports, tunnel metrics, endpoint selection and endpoint candidates")
 	}
 
 	// Register policy reconcile handler.
@@ -939,6 +962,16 @@ func runAgent(ctx context.Context) error {
 		}()
 	}
 
+	// 17b. Start endpoint selection. It tries each peer's dial order until a
+	// handshake completes, reading the same device as the handshake reporter.
+	if wgReady {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = wgMgr.RunEndpointSelection(ctx, wireguard.EndpointSelectionInterval)
+		}()
+	}
+
 	// 18. Start reconciler.
 	wg.Add(1)
 	go func() {
@@ -1030,6 +1063,21 @@ func runAgent(ctx context.Context) error {
 			logger.Error("peer exchange stopped", "error", err)
 		}
 	}()
+
+	// 24a. Start endpoint candidate publisher. It runs on its own loop, apart
+	// from STUN and peer_exchange: a node whose STUN servers are unreachable
+	// still publishes its LAN addresses. A node without the WireGuard
+	// interface accepts no tunnel, so it publishes nothing.
+	if wgReady && cfg.NAT.LocalCandidatesEnabled() {
+		candidatePublisher := nat.NewCandidatePublisher(func() ([]string, int, error) {
+			return nat.GatherCandidates(cfg.WireGuard.ListenPort, candidateFilter)
+		}, cfg.NAT, logger)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = candidatePublisher.Run(ctx, client, identity.NodeID)
+		}()
+	}
 
 	// 25. Start tunnel mesh server.
 	wg.Add(1)
