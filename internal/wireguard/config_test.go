@@ -2,6 +2,7 @@ package wireguard
 
 import (
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -101,5 +102,64 @@ func TestConfig_EdgePSKYAML(t *testing.T) {
 	}
 	if cfg.EdgePSKEnabled() {
 		t.Error("edge_psk: false parsed as enabled")
+	}
+}
+
+func TestConfig_KeepaliveInterval(t *testing.T) {
+	zero := time.Duration(0)
+	tests := []struct {
+		name string
+		cfg  Config
+		want time.Duration
+	}{
+		{"unset", Config{}, 25 * time.Second},
+		{"0s", Config{PersistentKeepalive: &zero}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.cfg.ApplyDefaults()
+			if got := tt.cfg.KeepaliveInterval(); got != tt.want {
+				t.Errorf("KeepaliveInterval() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfig_PersistentKeepaliveYAML(t *testing.T) {
+	var cfg Config
+	if err := yaml.Unmarshal([]byte("persistent_keepalive: 10s\n"), &cfg); err != nil {
+		t.Fatalf("yaml.Unmarshal: %v", err)
+	}
+	if got := cfg.KeepaliveInterval(); got != 10*time.Second {
+		t.Errorf("KeepaliveInterval() = %v, want 10s", got)
+	}
+}
+
+func TestConfig_ValidateRejectsInvalidKeepalive(t *testing.T) {
+	tests := []struct {
+		value time.Duration
+		want  string
+	}{
+		{-time.Second, "wireguard: config: PersistentKeepalive must not be negative"},
+		{65536 * time.Second, "wireguard: config: PersistentKeepalive must not exceed 65535s"},
+		{1500 * time.Millisecond, "wireguard: config: PersistentKeepalive must be a whole number of seconds"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value.String(), func(t *testing.T) {
+			cfg := Config{PersistentKeepalive: &tt.value}
+			cfg.ApplyDefaults()
+			err := cfg.Validate()
+			if err == nil || err.Error() != tt.want {
+				t.Errorf("Validate() = %v, want %q", err, tt.want)
+			}
+		})
+	}
+
+	for _, ok := range []time.Duration{0, 25 * time.Second, 65535 * time.Second} {
+		cfg := Config{PersistentKeepalive: &ok}
+		cfg.ApplyDefaults()
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() with %v = %v, want nil", ok, err)
+		}
 	}
 }

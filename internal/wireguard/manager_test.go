@@ -490,6 +490,49 @@ func TestManager_ConfigurePeers(t *testing.T) {
 	}
 }
 
+// Every mesh peer write carries the configured keepalive: 25 s by default, and
+// 0 under persistent_keepalive: 0s, which both controllers write as well so it
+// clears a keepalive an earlier run left on the device.
+func TestManager_PeerWritesCarryKeepalive(t *testing.T) {
+	zero := time.Duration(0)
+	configs := []struct {
+		name string
+		cfg  Config
+		want int
+	}{
+		{"default", Config{}, 25},
+		{"0s", Config{PersistentKeepalive: &zero}, 0},
+	}
+	writes := []struct {
+		name  string
+		write func(*Manager) error
+	}{
+		{"AddPeer", func(m *Manager) error { return m.AddPeer(testPeer("peer-1")) }},
+		{"UpdatePeer", func(m *Manager) error { return m.UpdatePeer(testPeer("peer-1")) }},
+		{"ConfigurePeers", func(m *Manager) error {
+			return m.ConfigurePeers(context.Background(), []api.Peer{testPeer("peer-1")})
+		}},
+	}
+	for _, c := range configs {
+		for _, w := range writes {
+			t.Run(c.name+"/"+w.name, func(t *testing.T) {
+				ctrl := &mockController{}
+				mgr := NewManager(ctrl, c.cfg, discardLogger())
+				if err := w.write(mgr); err != nil {
+					t.Fatalf("%s: %v", w.name, err)
+				}
+				cfgs := addPeerConfigs(t, ctrl)
+				if len(cfgs) != 1 {
+					t.Fatalf("AddPeer calls = %d, want 1", len(cfgs))
+				}
+				if cfgs[0].PersistentKeepalive != c.want {
+					t.Errorf("PersistentKeepalive = %d, want %d", cfgs[0].PersistentKeepalive, c.want)
+				}
+			})
+		}
+	}
+}
+
 func TestManager_ConfigurePeers_ContextCancellation(t *testing.T) {
 	ctrl := &mockController{}
 	mgr := NewManager(ctrl, Config{}, discardLogger())
@@ -744,6 +787,11 @@ func TestManager_SetPeerPSK(t *testing.T) {
 		}
 		if cfg.Endpoint != "" {
 			t.Errorf("Endpoint = %q, want empty so the device keeps its endpoint", cfg.Endpoint)
+		}
+		// Both controllers write the keepalive on every call, so a PSK write
+		// without it would clear the peer's keepalive.
+		if cfg.PersistentKeepalive != 25 {
+			t.Errorf("PersistentKeepalive = %d, want the default 25", cfg.PersistentKeepalive)
 		}
 	})
 

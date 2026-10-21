@@ -553,6 +553,48 @@ func TestUserspaceBackend_AddPeer_Keepalive(t *testing.T) {
 	}
 }
 
+// A write with an interval of 0 must clear the keepalive an earlier write left
+// on the peer: that is what a persistent_keepalive of 0s relies on after a run
+// that programmed one.
+func TestUserspaceBackend_AddPeer_KeepaliveCleared(t *testing.T) {
+	b := createOnePeerDevice(t)
+	peer := mustKey(t)
+	cfg := PeerConfig{PublicKey: pubBytes(peer), AllowedIPs: []string{"10.0.0.2/32"}, PersistentKeepalive: 25}
+	if err := b.AddPeer("wg-a", cfg); err != nil {
+		t.Fatalf("AddPeer(25): %v", err)
+	}
+	if got, _ := uapiValue(ipcGet(t, b, "wg-a"), "persistent_keepalive_interval"); got != "25" {
+		t.Fatalf("persistent_keepalive_interval = %q after AddPeer(25), want 25", got)
+	}
+
+	cfg.PersistentKeepalive = 0
+	if err := b.AddPeer("wg-a", cfg); err != nil {
+		t.Fatalf("AddPeer(0): %v", err)
+	}
+	if got, _ := uapiValue(ipcGet(t, b, "wg-a"), "persistent_keepalive_interval"); got != "0" {
+		t.Errorf("persistent_keepalive_interval = %q after AddPeer(0), want 0", got)
+	}
+}
+
+func TestPeerUAPI_Keepalive(t *testing.T) {
+	peer := mustKey(t)
+	for _, tt := range []struct {
+		keepalive int
+		want      string
+	}{
+		{0, "persistent_keepalive_interval=0\n"},
+		{25, "persistent_keepalive_interval=25\n"},
+	} {
+		uapi, err := peerUAPI(PeerConfig{PublicKey: pubBytes(peer), PersistentKeepalive: tt.keepalive})
+		if err != nil {
+			t.Fatalf("peerUAPI(%d): %v", tt.keepalive, err)
+		}
+		if !strings.Contains(uapi, tt.want) {
+			t.Errorf("peerUAPI(%d) = %q, want it to contain %q", tt.keepalive, uapi, tt.want)
+		}
+	}
+}
+
 func TestUserspaceBackend_RemovePeer_Unknown(t *testing.T) {
 	b := newTestBackend(t, bindtest.NewChannelBinds()[0])
 	peer := mustKey(t)

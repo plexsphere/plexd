@@ -185,50 +185,16 @@ func (c *NetlinkController) SetMTU(name string, mtu int) error {
 // A new wgctrl client is created per call to avoid stale netlink socket issues
 // across long-lived controller instances. The creation cost is negligible.
 func (c *NetlinkController) AddPeer(iface string, cfg PeerConfig) error {
+	peerCfg, err := netlinkPeerConfig(cfg)
+	if err != nil {
+		return err
+	}
+
 	client, err := wgctrl.New()
 	if err != nil {
 		return fmt.Errorf("wireguard: add peer: open wgctrl: %w", err)
 	}
 	defer client.Close()
-
-	pubKey, err := wgtypes.NewKey(cfg.PublicKey)
-	if err != nil {
-		return fmt.Errorf("wireguard: add peer: parse public key: %w", err)
-	}
-
-	peerCfg := wgtypes.PeerConfig{
-		PublicKey:  pubKey,
-		ReplaceAllowedIPs: true,
-	}
-
-	if cfg.Endpoint != "" {
-		udpAddr, err := net.ResolveUDPAddr("udp", cfg.Endpoint)
-		if err != nil {
-			return fmt.Errorf("wireguard: add peer: resolve endpoint: %w", err)
-		}
-		peerCfg.Endpoint = udpAddr
-	}
-
-	for _, cidr := range cfg.AllowedIPs {
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			return fmt.Errorf("wireguard: add peer: parse allowed IP %q: %w", cidr, err)
-		}
-		peerCfg.AllowedIPs = append(peerCfg.AllowedIPs, *ipNet)
-	}
-
-	if len(cfg.PSK) > 0 {
-		psk, err := wgtypes.NewKey(cfg.PSK)
-		if err != nil {
-			return fmt.Errorf("wireguard: add peer: parse psk: %w", err)
-		}
-		peerCfg.PresharedKey = &psk
-	}
-
-	if cfg.PersistentKeepalive > 0 {
-		keepalive := time.Duration(cfg.PersistentKeepalive) * time.Second
-		peerCfg.PersistentKeepaliveInterval = &keepalive
-	}
 
 	err = client.ConfigureDevice(iface, wgtypes.Config{
 		Peers: []wgtypes.PeerConfig{peerCfg},
@@ -243,6 +209,54 @@ func (c *NetlinkController) AddPeer(iface string, cfg PeerConfig) error {
 	)
 
 	return nil
+}
+
+// netlinkPeerConfig translates cfg into the wgctrl peer configuration AddPeer
+// writes. An empty Endpoint leaves the device peer's endpoint as it is, and an
+// empty PSK its preshared key.
+//
+// The keepalive interval is always set. wgctrl leaves the device's interval
+// as it is for a nil PersistentKeepaliveInterval and clears it for a pointer
+// to 0, so a 0 here has to reach the device as a pointer: that is how a
+// keepalive an earlier run left on a peer is cleared.
+func netlinkPeerConfig(cfg PeerConfig) (wgtypes.PeerConfig, error) {
+	pubKey, err := wgtypes.NewKey(cfg.PublicKey)
+	if err != nil {
+		return wgtypes.PeerConfig{}, fmt.Errorf("wireguard: add peer: parse public key: %w", err)
+	}
+
+	keepalive := time.Duration(cfg.PersistentKeepalive) * time.Second
+	peerCfg := wgtypes.PeerConfig{
+		PublicKey:                   pubKey,
+		ReplaceAllowedIPs:           true,
+		PersistentKeepaliveInterval: &keepalive,
+	}
+
+	if cfg.Endpoint != "" {
+		udpAddr, err := net.ResolveUDPAddr("udp", cfg.Endpoint)
+		if err != nil {
+			return wgtypes.PeerConfig{}, fmt.Errorf("wireguard: add peer: resolve endpoint: %w", err)
+		}
+		peerCfg.Endpoint = udpAddr
+	}
+
+	for _, cidr := range cfg.AllowedIPs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return wgtypes.PeerConfig{}, fmt.Errorf("wireguard: add peer: parse allowed IP %q: %w", cidr, err)
+		}
+		peerCfg.AllowedIPs = append(peerCfg.AllowedIPs, *ipNet)
+	}
+
+	if len(cfg.PSK) > 0 {
+		psk, err := wgtypes.NewKey(cfg.PSK)
+		if err != nil {
+			return wgtypes.PeerConfig{}, fmt.Errorf("wireguard: add peer: parse psk: %w", err)
+		}
+		peerCfg.PresharedKey = &psk
+	}
+
+	return peerCfg, nil
 }
 
 // RemovePeer removes a peer from the named WireGuard interface by public key.
