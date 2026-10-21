@@ -6,6 +6,8 @@
 #
 # Extended tests:
 #   - Periodic loop verification (counters >= 2 after additional wait)
+#   - Handshake report and tunnel_health samples (skipped when WireGuard
+#     did not come up in the container)
 #   - Request body validation (registration token, heartbeat, capabilities)
 #   - Log injection (docker cp into container, verify logs_count increases)
 #   - Agent restart for audit verification (ProcessSource fires per-process)
@@ -730,6 +732,103 @@ if [ "${PERIODIC_ELAPSED}" -ge "${PERIODIC_TIMEOUT}" ]; then
         done
     fi
     fail "periodic counters not met"
+fi
+
+# ===================================================================
+# Phase 4b: handshake report and tunnel_health
+#
+# Both channels read the WireGuard device, and plexd starts them only when its
+# interface came up, so a container without kernel WireGuard skips the phase.
+# Where the interface did come up, this is the only run anywhere that reads a
+# kernel device through NetlinkController.PeerStats: the unit tests cover the
+# userspace backend and a refused netlink call only. It must not be weakened to
+# the skip path.
+#
+# The fixture peers never complete a handshake: no node holds their keys, one
+# carries a documentation-range endpoint and the other none. The report is
+# therefore always {"observed_at", "peers": []}, while the tunnel collector,
+# which keeps peers without a handshake, still labels samples with their ids.
+# ===================================================================
+echo "=== Testing the handshake report and tunnel_health samples ==="
+
+FIXTURE_PEER_B1="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"
+FIXTURE_PEER_B2="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2"
+
+# The log is read into a variable and matched with case rather than piped into
+# grep -q: grep -q exits at its first match, the writer it leaves behind can die
+# on the closed pipe, and under pipefail that reports a present line as missing.
+PLEXD_LOGS=$(dc logs plexd 2>/dev/null || true)
+case "${PLEXD_LOGS}" in
+    *"wireguard interface configured"*) WG_CONFIGURED=1 ;;
+    *) WG_CONFIGURED=0 ;;
+esac
+
+if [ "${WG_CONFIGURED}" -eq 0 ]; then
+    echo "SKIP: handshake report and tunnel_health (WireGuard did not come up in this container)"
+else
+    # The e2e config keeps the default 30s heartbeat.interval, and the reporter
+    # sends nothing at start, so its first report lands one interval in. 90s
+    # covers that interval twice over plus a refused or slow first attempt.
+    HS_TIMEOUT=90
+    HS_ELAPSED=0
+    HS_COUNT=0
+    while [ "${HS_ELAPSED}" -lt "${HS_TIMEOUT}" ]; do
+        RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+        if [ -n "${RESPONSE}" ]; then
+            HS_COUNT=$(get_counter "${RESPONSE}" "handshake_report_count")
+            if [ "${HS_COUNT}" -ge 1 ]; then
+                break
+            fi
+        fi
+        sleep 3
+        HS_ELAPSED=$((HS_ELAPSED + 3))
+    done
+    if [ "${HS_COUNT}" -lt 1 ]; then
+        fail "handshake_report_count=${HS_COUNT} after ${HS_TIMEOUT}s, want >= 1 (the reporter posts once per heartbeat interval)"
+    fi
+    echo "  PASS: handshake_report_count=${HS_COUNT} >= 1"
+
+    # The mock accepted the report, so its gates passed; what is left to pin is
+    # that the body carries the contract's two members and nothing else, and an
+    # empty peers array rather than null.
+    HS_BODY=$(curl -sf "http://localhost:18080/test/last-request/handshakes" 2>/dev/null || true)
+    if [ -z "${HS_BODY}" ]; then
+        fail "no captured handshake report body"
+    fi
+    HS_KEYS=$(echo "${HS_BODY}" | jq -c 'keys' 2>/dev/null || true)
+    if [ "${HS_KEYS}" != '["observed_at","peers"]' ]; then
+        fail "handshake report body has keys ${HS_KEYS:-<not a JSON object>}, want exactly [\"observed_at\",\"peers\"] (body: ${HS_BODY})"
+    fi
+    HS_PEERS=$(echo "${HS_BODY}" | jq -r 'if (.peers | type) == "array" then (.peers | length) else "not an array" end' 2>/dev/null || true)
+    if [ "${HS_PEERS}" != "0" ]; then
+        fail "handshake report peers is ${HS_PEERS}, want an empty array: the fixture peers never complete a handshake (body: ${HS_BODY})"
+    fi
+    echo "  PASS: handshake report body is {observed_at, peers: []}"
+
+    # The metrics reporter posts every 10s and the capture keeps only the last
+    # batch, so the poll waits for one that carries a fixture peer's sample.
+    TH_TIMEOUT=30
+    TH_ELAPSED=0
+    TH_PEERS=""
+    while [ "${TH_ELAPSED}" -lt "${TH_TIMEOUT}" ]; do
+        METRICS_BODY=$(curl -sf "http://localhost:18080/test/last-request/metrics" 2>/dev/null || true)
+        if [ -n "${METRICS_BODY}" ]; then
+            TH_PEERS=$(echo "${METRICS_BODY}" | jq -r --arg b1 "${FIXTURE_PEER_B1}" --arg b2 "${FIXTURE_PEER_B2}" '
+                [.[] | select(.group == "tunnel_health") | .labels.peer_id
+                    | select(. == $b1 or . == $b2)] | unique | join(",")' 2>/dev/null || true)
+            if [ -n "${TH_PEERS}" ]; then
+                break
+            fi
+        fi
+        sleep 3
+        TH_ELAPSED=$((TH_ELAPSED + 3))
+    done
+    if [ -z "${TH_PEERS}" ]; then
+        fail "no tunnel_health sample labelled with a fixture peer within ${TH_TIMEOUT}s (last metrics body: ${METRICS_BODY:-<none>})"
+    fi
+    echo "  PASS: metrics carry tunnel_health samples labelled with fixture peer(s) ${TH_PEERS}"
+
+    echo "=== Phase 4b PASSED: handshake report and tunnel_health ==="
 fi
 
 # ===================================================================
