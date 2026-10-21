@@ -137,7 +137,7 @@ A non-positive `interval` becomes `DefaultHeartbeatInterval` (30s). Every log li
 
 The reporter is a loop of its own that ticks at `heartbeat.interval`. It does not ride on the heartbeat request, because a slow report would then delay the liveness signal. It sends nothing when `Run` starts, since no handshake can exist yet, and then reports on every tick. A tick with no handshake sends `"peers": []`: the contract asks for one report per heartbeat interval, and an empty report is valid and records nothing.
 
-`plexd up` starts the reporter only when the WireGuard interface came up. Otherwise it logs `wireguard unavailable, skipping peer reconcile handler, handshake reports and tunnel metrics` and sends no report. The report has no configuration key of its own: it follows `heartbeat.interval`.
+`plexd up` starts the reporter only when the WireGuard interface came up. Otherwise it logs `wireguard unavailable, skipping peer reconcile handler, handshake reports, tunnel metrics, endpoint selection and endpoint candidates` and sends no report. The report has no configuration key of its own: it follows `heartbeat.interval`.
 
 A failed report is never retried within its tick. The next tick reads the device again and builds a fresh body with a fresh `observed_at` and fresh ages, because the control plane anchors each age on its own receive time and a replayed age would make the handshake look newer than it was. There is no final report on shutdown either.
 

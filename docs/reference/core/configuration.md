@@ -318,6 +318,7 @@ WireGuard interface and peer management. See [WireGuard Tunnel Management](../ne
 | `listen_port` | int | `51820` | UDP listen port for WireGuard |
 | `mtu` | int | `0` | MTU for the WireGuard interface. `0` means use system default. |
 | `edge_psk` | bool | `true` | Fetch each edge's PSK from the control plane and program it on the peer. An omitted key means enabled; an explicit `false` is preserved. Takes effect only when the WireGuard interface came up. See [Edge PSKs](../networking/wireguard.md#edge-psks). |
+| `persistent_keepalive` | duration | `25s` | Keepalive interval written on every mesh peer. It holds open the NAT mapping a node opened by dialing out, and endpoint selection depends on it to try a newly programmed endpoint. `0s` turns the keepalive off, clears one an earlier run left on the device, and turns endpoint selection off, so every peer keeps the first entry of its dial order. Must be a whole number of seconds between `0s` and `65535s`. See [Endpoint selection](../networking/wireguard.md#endpoint-selection). |
 
 WireGuard needs the same PSK on both ends of a tunnel, and the NAT relay forwards the WireGuard packets end to end, so an edge between a plexd that installs edge PSKs and an older plexd fails, direct and relayed, until both ends match. During a rolling upgrade, set `edge_psk: false` on the upgraded nodes, and set it back to `true` (or remove the key) once every node of the Domain runs a plexd that installs edge PSKs. A node with the setting off and its WireGuard interface up logs `edge psk disabled by wireguard.edge_psk` when `plexd up` starts. See [Turning edge PSKs off](../networking/wireguard.md#turning-edge-psks-off).
 
@@ -336,6 +337,10 @@ STUN-based NAT traversal. See [NAT Traversal via STUN](../networking/nat-travers
 | `refresh_interval` | duration | `60s` | Interval between STUN binding refreshes. Minimum: `10s`. |
 | `timeout` | duration | `5s` | Per-server STUN request timeout |
 | `min_report_interval` | duration | `10s` | Floor on the endpoint report cadence derived from the control plane's `stale_after`. A short server-side deadline can otherwise drive STUN queries and endpoint reports above `refresh_interval`; raise this to bound how far the control plane may accelerate the loop. Must be positive. |
+| `local_candidates` | bool | `true` | Publish the node's local interface addresses, joined with `wireguard.listen_port`, as endpoint candidates. An omitted key means enabled; an explicit `false` is preserved. Takes effect only when the WireGuard interface came up, and does not depend on `enabled`. See [Local endpoint candidates](../networking/nat-traversal.md#local-endpoint-candidates). |
+| `candidate_interfaces` | []string | `[]` (every eligible interface) | Interface names to publish candidates from. A listed name is published even when its name marks it as virtual (`docker0`, `br-...`). An empty or whitespace-only entry fails validation, also when `enabled` is false. |
+
+`local_candidates` and `candidate_interfaces` are read from the `nat` block only: `plexd up` does not read them from `peer_exchange`. The candidate publisher reports on its own cadence, which follows `stale_after`, `refresh_interval` and `min_report_interval` as the endpoint report does. Peers on the same network reach a published candidate only when UDP `wireguard.listen_port` is open on that local address.
 
 Source: `internal/nat/config.go`
 
@@ -554,6 +559,7 @@ wireguard:
   listen_port: 51820
   # mtu: 0                  # 0 = system default
   # edge_psk: true          # false during a rolling upgrade, until every node installs edge PSKs
+  # persistent_keepalive: 25s  # 0s turns the keepalive and endpoint selection off
 
 nat:
   enabled: true
@@ -561,6 +567,8 @@ nat:
   refresh_interval: 60s      # min: 10s
   timeout: 5s
   min_report_interval: 10s   # floor on the stale_after-driven cadence
+  # local_candidates: true   # false publishes no local endpoint candidates
+  # candidate_interfaces: [] # empty = every eligible interface; read from nat only
 
 peer_exchange:
   enabled: true

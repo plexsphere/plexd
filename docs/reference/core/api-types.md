@@ -68,7 +68,8 @@ SSE `peer_*` events.
 | `ID`         | `string`   | `"id"`         | Peer node ID               |
 | `PublicKey`  | `string`   | `"public_key"` | WireGuard public key       |
 | `MeshIP`     | `string`   | `"mesh_ip"`    | Mesh IP address            |
-| `Endpoint`   | `string`   | `"endpoint"`   | Endpoint plexd programs: the peer's direct `endpoint` when it is usable, its `fallback_endpoint` otherwise |
+| `Endpoint`   | `string`   | `"endpoint"`   | First entry of `Endpoints`, or empty when the peer has no endpoint to dial |
+| `Endpoints`  | `[]string` | `"endpoints,omitempty"` | The peer's dial order: the endpoints the WireGuard manager tries one after another until a handshake completes (see [Dial order](../networking/wireguard.md#dial-order)) |
 | `AllowedIPs` | `[]string` | `"allowed_ips"`| `mesh_ip/32`, derived locally |
 | `PSK`        | `string`   | `"psk"`        | Edge PSK fetched for the peer's current public key, standard base64; empty when plexd holds none |
 
@@ -134,20 +135,24 @@ from it, and the edge PSK store reads it on the dispatch seam.
 
 **SnapshotPeer**
 
-Carries the peer's direct `endpoint` but **no** `psk` or `allowed_ips`. plexd
-derives `AllowedIPs` locally as `mesh_ip/32`. plexd programs `endpoint` as the
-WireGuard endpoint when it is usable and `fallback_endpoint` (the relay target)
-otherwise (see [Endpoint selection](../networking/wireguard.md#endpoint-selection)).
+Carries the peer's direct `endpoint` and its `endpoint_candidates` but **no**
+`psk` or `allowed_ips`. plexd derives `AllowedIPs` locally as `mesh_ip/32`. plexd
+builds the peer's dial order from the candidates on a subnet this node is also
+on, then `endpoint` when it is usable, then the remaining candidates, then
+`fallback_endpoint` (the relay target), and keeps the first entry that completes
+a WireGuard handshake (see [Dial order](../networking/wireguard.md#dial-order)
+and [Endpoint selection](../networking/wireguard.md#endpoint-selection)).
 Unless `wireguard.edge_psk` is `false`, plexd fetches the pairwise edge PSK per
 edge from `GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk` (see
 [Edge PSK](#edge-psk)).
 
-A direct endpoint is usable when it parses as an IP address and port with a
-non-zero port and no zone, its address (an IPv4-mapped address is unmapped first)
-is not unspecified, loopback, multicast or link-local, and it lies outside the
-Domain mesh prefix. plexd logs a refused endpoint at Warn and programs the
-fallback. `fallback_endpoint` is not validated, because the contract allows a
-hostname there.
+A direct endpoint or candidate is usable when it parses as an IP address and
+port with a non-zero port and no zone, its address (an IPv4-mapped address is
+unmapped first) is not unspecified, loopback, multicast or link-local, and it
+lies outside the Domain mesh prefix. plexd leaves a refused one out of the
+order, logging a refused `endpoint` at Warn and refused candidates at Debug.
+`fallback_endpoint` is not validated, because the contract allows a hostname
+there.
 
 | Field              | Type     | JSON Tag                        | Description                   |
 |--------------------|----------|---------------------------------|-------------------------------|
@@ -156,6 +161,7 @@ hostname there.
 | `PublicKey`        | `string` | `"public_key"`                  | Peer WireGuard public key     |
 | `Endpoint`         | `string` | `"endpoint,omitempty"`          | Peer's direct WireGuard endpoint as `host:port` (an IPv6 host in brackets), the address it last reported through `PUT /v1/nodes/{node_id}/endpoint`; absent while the peer has no fresh observation |
 | `FallbackEndpoint` | `string` | `"fallback_endpoint,omitempty"` | Optional relay/fallback endpoint |
+| `EndpointCandidates` | `[]string` | `"endpoint_candidates,omitempty"` | The peer's last accepted, unexpired endpoint candidates (`PUT /v1/nodes/{node_id}/endpoint-candidates`) as `host:port` strings, in the order the peer sent them; absent when the peer has none and on every control plane that does not deliver them |
 
 **ReachabilitySnapshot**
 
@@ -642,6 +648,42 @@ The response does not carry peer endpoints. Each peer's direct endpoint rides th
 state pull as `SnapshotPeer.Endpoint` (see [State](#state)). A
 `peer_endpoint_changed` SSE event only triggers a reconcile, and plexd never
 decodes its payload.
+
+## Endpoint Candidates
+
+### `PUT /v1/nodes/{node_id}/endpoint-candidates`
+
+The node's local interface addresses, each joined with its WireGuard listen
+port. Each report replaces the previous set. Peers receive the set as
+`SnapshotPeer.EndpointCandidates` (see [State](#state)). See
+[Control Plane API Endpoints](api-endpoints.md#put-v1-nodes-node-id-endpoint-candidates)
+for the field rules and error taxonomy.
+
+**EndpointCandidatesRequest**
+
+| Field        | Type        | JSON Tag        | Description                                    |
+|--------------|-------------|-----------------|------------------------------------------------|
+| `Candidates` | `[]string`  | `"candidates"`  | 0 to `MaxEndpointCandidates` (8) distinct `host:port` strings, an IPv6 host in brackets and without a zone; `[]` when empty, never `null`. An empty array withdraws every earlier candidate |
+| `ReportedAt` | `time.Time` | `"reported_at"` | RFC 3339 UTC; the server refuses a value more than 60s from its own time with `400 endpoint_clock_skew` |
+
+`ReportEndpointCandidates` sends a nil `Candidates` as an empty array, on a
+copy, so the caller's request is left as passed: the control plane answers
+`null` with `400 malformed_endpoint_candidates`. More than
+`MaxEndpointCandidates` entries return an error matching
+`ErrEndpointCandidatesTooMany` without sending a request.
+
+**EndpointCandidatesResponse** (`200 OK`)
+
+| Field        | Type        | JSON Tag        | Description                                    |
+|--------------|-------------|-----------------|------------------------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | Server receive time                            |
+| `StaleAfter` | `time.Time` | `"stale_after"` | Deadline after which the control plane drops the set; drives the next report |
+
+**Constants**
+
+| Constant                | Value | Description                                          |
+|-------------------------|-------|------------------------------------------------------|
+| `MaxEndpointCandidates` | `8`   | Most candidates one report may carry                 |
 
 ## Handshakes
 

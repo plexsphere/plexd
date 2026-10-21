@@ -20,8 +20,11 @@ All OS-level WireGuard operations go through a `WGController` interface, enablin
 | `ListenPort`    | `int`    | `51820` | UDP listen port                      |
 | `MTU`           | `int`    | `0`     | Interface MTU (0 = system default)   |
 | `EdgePSK`       | `*bool`  | `nil` (enabled) | Fetch each edge's PSK and program it on the peer (`edge_psk`). See [Edge PSKs](#edge-psks) |
+| `PersistentKeepalive` | `*time.Duration` | `nil` (25s) | Keepalive interval written on every mesh peer (`persistent_keepalive`). See [Endpoint selection](#endpoint-selection) |
 
 `EdgePSK` is a pointer so that an omitted key stays apart from an explicit `false`. `EdgePSKEnabled()` returns the effective value: true unless the field is set to `false`. `ApplyDefaults` leaves the field alone, so a `false` survives it.
+
+`PersistentKeepalive` is a pointer for the same reason: an omitted key reads as the default, and an explicit `0s` turns the keepalive off. `KeepaliveInterval()` returns the effective value, `DefaultPersistentKeepalive` (25s) when the field is nil. The keepalive makes WireGuard send an empty packet to an idle mesh peer, which holds open the NAT mapping a node opened by dialing out, and which makes WireGuard start a handshake towards an endpoint newly programmed on an idle peer. [Endpoint selection](#endpoint-selection) depends on that handshake, so `0s` turns it off as well.
 
 ```go
 cfg := wireguard.Config{
@@ -29,7 +32,7 @@ cfg := wireguard.Config{
 }
 cfg.ApplyDefaults() // sets InterfaceName to "plexd0", ListenPort stays 51821
 if err := cfg.Validate(); err != nil {
-    log.Fatal(err) // rejects port <=0 or >65535, negative MTU
+    log.Fatal(err) // rejects port <=0 or >65535, negative MTU, an invalid keepalive
 }
 ```
 
@@ -40,6 +43,11 @@ if err := cfg.Validate(); err != nil {
 | `ListenPort`    | Must be 1–65535             | `wireguard: config: ListenPort must be between 1 and 65535` |
 | `MTU`           | Must be >= 0                | `wireguard: config: MTU must not be negative`           |
 | `EdgePSK`       | Not validated; any value is accepted | none                                           |
+| `PersistentKeepalive` | Must be >= 0          | `wireguard: config: PersistentKeepalive must not be negative` |
+| `PersistentKeepalive` | Must be <= 65535s     | `wireguard: config: PersistentKeepalive must not exceed 65535s` |
+| `PersistentKeepalive` | Must be a whole number of seconds | `wireguard: config: PersistentKeepalive must be a whole number of seconds` |
+
+The keepalive rules check `KeepaliveInterval()`, so an omitted key passes as 25s. WireGuard carries the interval as a 16-bit count of seconds.
 
 ## WGController
 
@@ -211,7 +219,7 @@ type PeerConfig struct {
     Endpoint            string   // host:port (may be empty)
     AllowedIPs          []string // e.g., ["10.0.0.2/32"]
     PSK                 []byte   // nil if no pre-shared key
-    PersistentKeepalive int      // seconds (0 = disabled)
+    PersistentKeepalive int      // seconds; always written, 0 clears it
 }
 ```
 
@@ -227,8 +235,13 @@ func PeerConfigFromAPI(peer api.Peer) (PeerConfig, error)
 - `PSK`: decoded if non-empty; `nil` if empty string
 - `Endpoint`: copied as-is (may be empty for NAT-traversal peers)
 - `AllowedIPs`: copied as-is
+- `PersistentKeepalive`: always 0
+
+The manager never writes that result as it is. Every mesh peer write goes through `Manager.peerConfig(peer, endpoint)`, which calls `PeerConfigFromAPI`, then sets `Endpoint` to the entry of the [dial order](#dial-order) being programmed (empty to leave the device's endpoint alone) and `PersistentKeepalive` to `KeepaliveInterval()` in whole seconds. `AddPeer`, `UpdatePeer`, `ConfigurePeers`, `SetPeerPSK` and the endpoint selection switch all build their write through it.
 
 For a mesh peer, `api.Peer.PSK` is the edge PSK the [edge PSK store](#edge-psks) holds for the peer's node ID and current public key, base64-encoded, and empty while the store holds none. `NetlinkController.AddPeer` and the [userspace backend](#userspace-backend) leave the device peer's preshared key as it is when `PeerConfig.PSK` is empty, and its endpoint as it is when `Endpoint` is empty. Every write replaces the allowed IPs.
+
+Both write the keepalive interval on every call. `NetlinkController.AddPeer` builds its wgctrl configuration in `netlinkPeerConfig`, which always sets `PersistentKeepaliveInterval`: wgctrl leaves the device's interval as it is for a nil pointer and clears it for a pointer to 0. The userspace backend's `peerUAPI` always emits `persistent_keepalive_interval=<n>`. A `persistent_keepalive: 0s` therefore clears a keepalive an earlier run left on a device peer. Bridge peers get no keepalive: `internal/bridge/wg_controller.go` passes a `PeerConfig` without the field, and the Linux access and site-to-site controllers build their wgctrl configuration without one.
 
 ## PeerIndex
 
@@ -258,7 +271,8 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 ```
 
 - Applies config defaults via `cfg.ApplyDefaults()`
-- Creates an empty `PeerIndex` and an empty record of programmed peers
+- Creates an empty `PeerIndex` and an empty [dial state](#programmed-peers) map
+- Sets a local-prefix function that returns no prefixes, until `SetLocalPrefixes` replaces it
 
 ### Methods
 
@@ -267,25 +281,27 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 | `Setup`         | `(ctx context.Context, identity *registration.NodeIdentity) error`           | Creates interface, assigns the mesh IP with the `domain_mesh_cidr` prefix (fallback `/32`), sets MTU if > 0, brings up |
 | `Teardown`      | `() error`                                                                   | Deletes the WireGuard interface                                |
 | `OSInterfaceName` | `() string`                                                                | The name the OS knows the interface by (`utunN` on macOS), else `Config.InterfaceName` |
-| `AddPeer`       | `(peer api.Peer) error`                                                      | Translates and adds peer; updates index                        |
+| `AddPeer`       | `(peer api.Peer) error`                                                      | Writes the peer with the first entry of its dial order and starts its endpoint selection; updates index |
 | `RemovePeer`    | `(publicKey []byte) error`                                                   | Removes peer by raw public key                                 |
-| `RemovePeerByID`| `(peerID string) error`                                                      | Resolves ID via index, removes peer, cleans index              |
-| `UpdatePeer`    | `(peer api.Peer) error`                                                      | Upserts peer config (AddPeer is idempotent); updates index     |
-| `ConfigurePeers`| `(ctx context.Context, peers []api.Peer) error`                              | Bulk-adds peers with context cancellation; individual errors logged |
+| `RemovePeerByID`| `(peerID string) error`                                                      | Resolves ID via index, removes peer, drops its dial state, cleans index |
+| `UpdatePeer`    | `(peer api.Peer) error`                                                      | Rewrites the peer (AddPeer is idempotent): a connected peer with an unchanged key keeps its device endpoint, any other starts its dial order over; updates index. See [Endpoint selection](#endpoint-selection) |
+| `ConfigurePeers`| `(ctx context.Context, peers []api.Peer) error`                              | Bulk-adds peers as `AddPeer` does, with context cancellation, and replaces the dial state with the peers it wrote; individual errors logged |
 | `PeerIndex`     | `() *PeerIndex`                                                              | Returns the peer index                                         |
 | `MeshPeerStats` | `() ([]MeshPeerStat, error)`                                                 | Reads the mesh interface's peers and maps them to node IDs; see [Mesh peer stats](#mesh-peer-stats) |
 | `MeshPrefix`    | `() netip.Prefix`                                                            | The Domain mesh prefix the interface was set up with; see [Mesh prefix](#mesh-prefix) |
-| `SetPeerPSK`    | `(peerNodeID, publicKey string, psk []byte) error`                           | Rewrites the programmed peer of `peerNodeID` with `psk` when it was last written with `publicKey`; see [Installing a PSK](#installing-a-psk) |
+| `SetPeerPSK`    | `(peerNodeID, publicKey string, psk []byte) error`                           | Rewrites the stored peer of `peerNodeID` with `psk` when it was last written with `publicKey`; see [Installing a PSK](#installing-a-psk) |
+| `SetLocalPrefixes` | `(fn func() ([]netip.Prefix, error))`                                     | Sets the function the reconcile handler reads this host's interface prefixes from, to order a peer's on-link candidates first. Call it before the handler runs. See [Dial order](#dial-order) |
+| `RunEndpointSelection` | `(ctx context.Context, interval time.Duration) error`                 | Tries each peer's dial order until a handshake completes, one pass per `interval`, until `ctx` is done; see [Endpoint selection](#endpoint-selection) |
 
-The package function `ProgrammedEndpoint` (`handler.go`) picks the endpoint written for a snapshot peer from the peer and `MeshPrefix()`; see [Endpoint selection](#endpoint-selection).
+The package function `ProgrammedEndpoint` (`handler.go`) returns the endpoint the pull gives a snapshot peer without its candidates, from the peer and `MeshPrefix()`; see [Dial order](#dial-order).
 
 ### Programmed peers
 
-The manager records the last `api.Peer` it wrote per node ID, because `SetPeerPSK` has to repeat a peer's allowed IPs to write its PSK. `AddPeer` and `UpdatePeer` record the peer after a successful device write, `ConfigurePeers` replaces the record with the peers it wrote, and `RemovePeerByID` drops the entry after a successful removal. One mutex serializes these writes with `SetPeerPSK`, since the reconcile handler and the edge PSK store write the same peers from different call paths.
+The manager keeps a dial state per node ID: the last `api.Peer` it wrote, the position in the peer's dial order of the endpoint programmed on the device, when that endpoint was programmed, and whether a fresh handshake shows the peer connected. `SetPeerPSK` reads the stored peer, because it has to repeat a peer's allowed IPs to write its PSK, and [endpoint selection](#endpoint-selection) reads the rest. `AddPeer` and `UpdatePeer` store the state after a successful device write, `ConfigurePeers` replaces the whole map with the peers it wrote, and `RemovePeerByID` drops the entry after a successful removal. A failed device write in `AddPeer`, `UpdatePeer` or `SetPeerPSK` leaves the state as it was, so a peer whose first write failed has none. One mutex guards the map and serializes every mesh peer device write, since the reconcile handler, the edge PSK store and endpoint selection write the same peers from different call paths.
 
 ### Mesh prefix
 
-`Setup` records the prefix of the address it assigns, masked: the Domain mesh CIDR (`10.99.0.0/24` for mesh IP `10.99.0.5` and `domain_mesh_cidr` `10.99.0.0/24`), or the mesh IP's host `/32` when the identity carries no usable `domain_mesh_cidr`. `MeshPrefix` returns it, and returns the zero prefix before `Setup` succeeds. [Endpoint selection](#endpoint-selection) refuses a direct endpoint inside it.
+`Setup` records the prefix of the address it assigns, masked: the Domain mesh CIDR (`10.99.0.0/24` for mesh IP `10.99.0.5` and `domain_mesh_cidr` `10.99.0.0/24`), or the mesh IP's host `/32` when the identity carries no usable `domain_mesh_cidr`. `MeshPrefix` returns it, and returns the zero prefix before `Setup` succeeds. The [dial order](#dial-order) refuses a direct endpoint or candidate inside it, and `plexd up` publishes no [local endpoint candidate](./nat-traversal.md#local-endpoint-candidates) inside it.
 
 ### Mesh peer stats
 
@@ -307,6 +323,71 @@ var ErrPeerStatsUnsupported = errors.New("wireguard: controller cannot read peer
 - It keeps peers with no handshake (a zero `LastHandshake`), because the metrics report them.
 - It returns the result sorted by `NodeID`, and an empty, non-nil slice when nothing maps.
 - `Endpoint` passes through unfiltered. The handshake reporter applies the wire rules.
+
+### Endpoint selection
+
+WireGuard holds one endpoint per peer. Endpoint selection (`dial.go`) programs the entries of a peer's [dial order](#dial-order) one after another and keeps the first one that completes a WireGuard handshake. The order only says which entry to try first; a completed handshake proves the choice.
+
+A peer's order is `api.Peer.Endpoints`, or `Endpoint` alone when `Endpoints` is empty and `Endpoint` is set, so a caller that sets only `Endpoint` keeps working. The selection state lives in the manager's [dial state](#programmed-peers), and the device writes change it as follows:
+
+- `AddPeer` programs the first entry of the order, or no endpoint for an empty order, and starts the trial: position 0, programmed now, not connected. `ConfigurePeers` does the same for each peer it loads.
+- `UpdatePeer` on a connected peer whose public key is unchanged writes the peer with an empty endpoint, which both controllers leave untouched on the device, so an endpoint WireGuard roamed to stays. It stores the new peer, sets the position to where the entry last programmed sits in the new order (0 when it is no longer there), and keeps the connected flag and the timestamp.
+- `UpdatePeer` on a peer that is not connected, or whose public key changed, behaves like `AddPeer` with the new order. WireGuard keys peers by public key, so a rotated key is a new device peer that has no endpoint yet.
+- `SetPeerPSK` writes an empty endpoint and leaves the selection as it is.
+- `RemovePeerByID` drops the state once the device removal succeeds, so a removed peer is never switched.
+
+#### The trial
+
+Each pass reads the device through [`MeshPeerStats`](#mesh-peer-stats) before it takes the manager's mutex. A read error, `ErrPeerStatsUnsupported` included, ends the pass with nothing written. A peer is fresh when the device reports a non-zero `LastHandshake` for it that is younger than 180 s: WireGuard rekeys a session it uses every two minutes and refuses one older than 180 s, so an older handshake says the path no longer carries traffic. One entry is tried for the keepalive interval plus 5 s, 30 s with the default keepalive. The pass walks the peers in node-ID order:
+
+| Peer | What the pass does |
+|---|---|
+| Fresh, not marked connected | Marks it connected and logs `wireguard: endpoint selected` with the endpoint the device reports, which may be one WireGuard roamed to |
+| Fresh, marked connected | Nothing |
+| Not fresh, marked connected | Clears the mark, restarts the timer and logs `wireguard: peer handshake went stale, resuming endpoint selection`. The entry on the device gets a full trial before the next switch |
+| Not fresh, not connected, with fewer than 2 entries or programmed less than the trial ago | Nothing |
+| Not fresh, not connected, trial over | Programs the next entry (after the last one, the first again), restarts the timer and logs `wireguard: trying next endpoint candidate` |
+
+A peer counts as connected while its latest handshake is younger than 180 s. Neither a pass nor `UpdatePeer` rewrites the device endpoint of a connected peer, so WireGuard roaming, a peer answering from another address, stays in effect.
+
+A failed switch logs `wireguard: endpoint switch failed`, leaves the peer on the entry still programmed, and joins `wireguard: switch endpoint of peer <node id>: <cause>` into the pass's error. The timer restarts all the same, so the next attempt at that entry follows a full trial later.
+
+The trial depends on the keepalive. WireGuard starts a handshake only when it sends something, and the keepalive timer is what makes it send to an entry newly programmed on an idle peer. A switch happens on the first pass after the trial ran out, so up to one interval late. With the defaults, an order of ten entries, the contract's cap of eight candidates plus the direct endpoint and the fallback, reaches its fallback after about 270 s and has tried every entry after about 300 s. A restarted plexd starts every peer at the first entry again.
+
+#### RunEndpointSelection
+
+```go
+const EndpointSelectionInterval = 5 * time.Second
+
+func (m *Manager) RunEndpointSelection(ctx context.Context, interval time.Duration) error
+```
+
+- With `persistent_keepalive: 0s` it logs `wireguard: endpoint selection disabled, persistent_keepalive is 0s` and returns nil at once. Every peer keeps the first entry of its dial order.
+- Otherwise it logs `wireguard: endpoint selection started` with `interval` and `timeout` (the trial) and runs a pass on every tick, the first one interval after it starts.
+- A pass that returns `ErrPeerStatsUnsupported` logs `wireguard: endpoint selection unavailable, the controller cannot read peer stats` and returns nil. Peers keep the entry they have.
+- Any other pass error logs `wireguard: endpoint selection pass failed` with `error`, and the next tick runs again.
+- It returns nil once `ctx` is done.
+
+`plexd up` runs it with `EndpointSelectionInterval` as step 17b, only when the WireGuard interface came up.
+
+#### Cost
+
+The keepalive sends one empty data packet (32 bytes of payload) per idle peer every 25 s and keeps a rekey handshake running about every 2 minutes per peer, so a node with 100 idle peers sends about 4 packets per second. Endpoint selection adds one device read every 5 s, the reconcile handler one interface read each time it runs, and the [candidate publisher](./nat-traversal.md#local-endpoint-candidates) one `PUT` per cycle (60 s by default).
+
+#### Endpoint selection log lines
+
+All carry `component=wireguard`.
+
+| Level  | Message | Keys |
+|--------|---------|------|
+| `Info` | `wireguard: endpoint selection started` | `interval`, `timeout` |
+| `Info` | `wireguard: endpoint selection disabled, persistent_keepalive is 0s` | none |
+| `Info` | `wireguard: endpoint selection unavailable, the controller cannot read peer stats` | none |
+| `Info` | `wireguard: endpoint selected` | `peer_id`, `endpoint` (empty when the device reports none) |
+| `Info` | `wireguard: peer handshake went stale, resuming endpoint selection` | `peer_id` |
+| `Info` | `wireguard: trying next endpoint candidate` | `peer_id`, `endpoint`, `attempt` (the entry's 1-based position), `of` (the order's length) |
+| `Warn` | `wireguard: endpoint switch failed` | `peer_id`, `endpoint`, `error` |
+| `Warn` | `wireguard: endpoint selection pass failed` | `error` |
 
 ### Lifecycle
 
@@ -355,6 +436,7 @@ if err := mgr.Teardown(); err != nil {
 | `UpdatePeer`      | Returns error                    | —                          |
 | `ConfigurePeers`  | Logged at error, continues       | Returns context error      |
 | `SetPeerPSK`      | Returns `wireguard: set peer psk: <cause>` | —                |
+| `RunEndpointSelection` | A failed switch is logged at warn and the pass goes on | Returns nil |
 
 ### Logging
 
@@ -367,6 +449,8 @@ All log entries use `component=wireguard`. Private keys and PSKs are never logge
 | `Debug` | Peer added/removed/updated   | `peer_id`                             |
 | `Debug` | Peer PSK set (`peer psk set`) | `peer_id`                            |
 | `Error` | Peer operation failed (bulk) | `peer_id`, `error`                    |
+
+Endpoint selection writes the lines in [Endpoint selection log lines](#endpoint-selection-log-lines), and the reconcile handler the dial order lines in [Dial order](#dial-order).
 
 ## ReconcileHandler
 
@@ -390,36 +474,56 @@ type EdgePSKLookup interface {
 2. **Updates** — `diff.PeersToUpdate` via `UpdatePeer`
 3. **Adds** — `diff.PeersToAdd` via `AddPeer`
 
-Adds and updates carry `api.SnapshotPeer` entries, converted to the WireGuard `api.Peer` by `peerFromSnapshot(p, mgr.MeshPrefix(), psk)`:
+Adds and updates carry `api.SnapshotPeer` entries, converted to the WireGuard `api.Peer` by `peerFromSnapshot(p, order, psk)`, where `order` is the peer's [dial order](#dial-order):
 
 - `AllowedIPs` is derived locally as `mesh_ip/32`. The snapshot never sends allowed IPs. A `mesh_ip` that is not a bare IPv4 address fails the peer.
-- `Endpoint` is the one `ProgrammedEndpoint` picks: the peer's direct `endpoint` from the pull when it is usable, otherwise its `fallback_endpoint` (the relay target), which may be empty. See [Endpoint selection](#endpoint-selection).
+- `Endpoints` is the dial order and `Endpoint` its first entry, empty for an empty order. The manager programs the first entry and [endpoint selection](#endpoint-selection) moves along the order until a handshake completes. See [Dial order](#dial-order).
 - `PSK` is the key `psks.Lookup` returns for the peer's node ID and current `public_key`, base64-encoded. A PSK fetched for another public key is never returned, so a peer whose key changed gets no PSK until the store holds one for the new key. With no PSK the field stays empty, and the store writes the PSK through [`SetPeerPSK`](#installing-a-psk) once it arrives.
 
 Individual failures are logged and collected. The handler returns an aggregated error via `errors.Join` (nil if all succeed). This ensures the reconciler marks the cycle as failed and retries on the next tick.
 
-### Endpoint selection
+### Dial order
 
 ```go
+func dialOrder(p api.SnapshotPeer, local []netip.Prefix, mesh netip.Prefix) (order []string, dropped int)
 func ProgrammedEndpoint(p api.SnapshotPeer, mesh netip.Prefix) (endpoint string, directRejected bool)
 ```
 
-`ProgrammedEndpoint` returns the peer's direct `endpoint` when it is usable, and its `fallback_endpoint` otherwise. A direct endpoint is usable when all of these hold:
+The handler reads this host's interface prefixes, through the function [`SetLocalPrefixes`](#methods) set, and `MeshPrefix()` once per call. For each peer it adds or updates, `dialOrder` builds the order in which [endpoint selection](#endpoint-selection) tries the peer's endpoints:
+
+1. the peer's `endpoint_candidates` that are on-link, on a subnet this node is also on
+2. the peer's direct `endpoint`, when it is usable
+3. the remaining, off-link candidates
+4. the peer's `fallback_endpoint` (the relay target), when it is set
+
+Candidates keep the order the pull lists them in within each group. A duplicate keeps its first position. A peer with no usable candidate, no usable direct endpoint and no fallback gets an empty order and is programmed without an endpoint.
+
+The direct endpoint and each candidate are held to the same rules. One is usable when all of these hold:
 
 - It parses with `netip.ParseAddrPort` and its port is not 0.
 - Its address carries no zone.
 - Its address, with an IPv4-mapped IPv6 address unmapped, is not unspecified, loopback, multicast, link-local unicast or link-local multicast.
 - It lies outside `mesh`, the Domain mesh prefix from [`MeshPrefix`](#mesh-prefix). An endpoint inside it would be routed through the mesh interface, so WireGuard would send the peer's encrypted packets into its own tunnel. A zero `mesh` skips this check.
 
-A usable endpoint is returned in canonical form, so `[::ffff:10.0.0.5]:51820` becomes `10.0.0.5:51820`. The fallback is returned as the pull sent it and is never validated, because the contract allows a hostname there.
+A usable endpoint enters the order in canonical form, so `[::ffff:10.0.0.5]:51820` becomes `10.0.0.5:51820`. The fallback enters it as the pull sent it and is never validated, because the contract allows a hostname there.
 
-`directRejected` is true only when the peer carried a non-empty `endpoint` that was refused. An absent `endpoint` means the peer has no fresh NAT observation, and the fallback is then the expected choice. For a refused endpoint the handler logs at `warn`:
+A candidate is on-link when a local prefix of the same address family contains it. Only a prefix shorter than a host prefix counts: a `/32` or `/128` says nothing about the addresses next to it, so it makes nothing on-link. In `plexd up` the local prefixes are the prefixes of the host addresses [`nat.EligiblePrefixes`](./nat-traversal.md#local-endpoint-candidates) accepts, under the filter the candidate publisher uses. When they cannot be read, the handler logs at `warn` and orders every candidate as off-link, which still tries each of them:
 
 ```
-wireguard: peer direct endpoint unusable, programming the relay fallback  component=wireguard peer_id=<node id> endpoint=10.99.0.4:51820 fallback=203.0.113.1:51820
+wireguard: read local prefixes failed, ordering every candidate as off-link  component=wireguard error=<cause>
 ```
 
-The differ compares `endpoint` as well as `fallback_endpoint`, so a peer whose direct endpoint appears, changes or disappears lands in `PeersToUpdate` and is written again.
+A refused direct endpoint is left out of the order and logged at `warn`. An absent `endpoint` means the peer has no fresh NAT observation and logs nothing.
+
+```
+wireguard: peer direct endpoint unusable, leaving it out of the dial order  component=wireguard peer_id=<node id> endpoint=10.99.0.4:51820 fallback=203.0.113.1:51820
+```
+
+Refused candidates are counted in `dropped` and logged at `debug` as `wireguard: dropped endpoint candidates` with `peer_id` and `count`.
+
+`ProgrammedEndpoint` returns what the pull gives a peer without its candidates: the direct `endpoint` when it is usable, the `fallback_endpoint` otherwise. `directRejected` is true only when the peer carried a non-empty `endpoint` that was refused, which is what the handler's `warn` line keys on. The node API's peer list shows this endpoint (see [Node API peer list](#node-api-peer-list)); the endpoint on the device is the one endpoint selection settles on.
+
+The differ compares `endpoint`, `fallback_endpoint` and `endpoint_candidates`, the candidates in order, so a peer whose direct endpoint, fallback or candidates appear, change, reorder or disappear lands in `PeersToUpdate` and is written again. A missing and an empty `endpoint_candidates` compare equal.
 
 ### Registration
 
@@ -434,6 +538,8 @@ r.RegisterHandler(wireguard.ReconcileHandler(mgr, psks))
 
 Without edge PSKs, pass a nil `EdgePSKLookup` interface value, as `plexd up` does. A nil `*EdgePSKs` stored in the interface is not nil to the handler, and its `Lookup` panics.
 
+`plexd up` calls `mgr.SetLocalPrefixes` in step 5a-2, before the handler first runs, with a function that returns `nat.EligiblePrefixes` over `nat.SystemInterfaces()` and passes a read error through. Without that call the handler orders every candidate as off-link.
+
 The agent registers this handler **only when WireGuard `Setup` succeeded**. On hosts without a programmable WireGuard stack the interface fails to come up, the agent continues without WireGuard, and the peer reconcile handler is skipped — a handler that failed every cycle would hold the reconciler snapshot back and prevent convergence (for example, the policy fingerprint short-circuit could never hold).
 
 ## Peer Programming
@@ -446,11 +552,12 @@ plexd never decodes their payloads. The reconcile loop then pulls the snapshot, 
 [edge PSK store](#edge-psks) (when edge PSKs are on) syncs against its peers, and
 `ReconcileHandler` (see above) converges the interface.
 
-`peerFromSnapshot(p api.SnapshotPeer, mesh netip.Prefix, psk []byte) (api.Peer, error)`
+`peerFromSnapshot(p api.SnapshotPeer, order []string, psk []byte) (api.Peer, error)`
 builds each programmed peer from a snapshot entry: `AllowedIPs` derived locally as
-`mesh_ip/32`, the endpoint [`ProgrammedEndpoint`](#endpoint-selection) picks, and
-`psk` base64-encoded (none for a nil `psk`). The manager then adds, updates, or
-removes peers so the interface matches the desired set.
+`mesh_ip/32`, `Endpoints` set to the [dial order](#dial-order) and `Endpoint` to its
+first entry, and `psk` base64-encoded (none for a nil `psk`). The manager then adds,
+updates, or removes peers so the interface matches the desired set, and
+[endpoint selection](#endpoint-selection) settles each peer's endpoint.
 
 ## Edge PSKs
 
@@ -535,8 +642,8 @@ The floor survives a change of the peer's public key, so an envelope from before
 
 `Manager.SetPeerPSK(peerNodeID, publicKey, psk)` writes the PSK to the device:
 
-- With no [programmed peer](#programmed-peers) for the node ID, or one programmed with another public key, it writes nothing and returns nil. The PSK belongs to a different device peer, and the reconcile handler takes it from the store through `Lookup` when it next adds or updates the peer with that key.
-- Otherwise it rewrites the programmed peer with its allowed IPs, which every device write replaces, the PSK, and an empty endpoint, which leaves the device's endpoint as it is. It then records the PSK on the programmed peer.
+- With no [dial state](#programmed-peers) for the node ID, or one stored with another public key, it writes nothing and returns nil. The PSK belongs to a different device peer, and the reconcile handler takes it from the store through `Lookup` when it next adds or updates the peer with that key.
+- Otherwise it rewrites the stored peer with its allowed IPs, which every device write replaces, the PSK, the keepalive interval, and an empty endpoint, which leaves the device's endpoint as it is. It then records the PSK on the stored peer. The endpoint selection state is left as it is.
 - A device error returns `wireguard: set peer psk: <cause>`. The store logs `wireguard: edge psk: install failed`, and the next pull retries the install without fetching again.
 
 ### Edge PSK log lines
@@ -585,8 +692,9 @@ Peer topology events trigger a reconcile for a prompt convergence; the reconcile
 loop also catches any missed changes on its next cycle. The snapshot pull, not the
 event payload, is authoritative.
 
-The pull is the only source of a peer's direct endpoint. `peer_endpoint_changed`
-only moves the next pull forward, and that pull carries the new endpoint. With edge
+The pull is the only source of a peer's direct endpoint and its endpoint candidates.
+`peer_endpoint_changed` only moves the next pull forward, and that pull carries the
+new endpoint. With edge
 PSKs on, `peer_psk_assigned` moves the store's next sync forward the same way. That
 sync fetches every PSK still due under the [fetch rule](#fetch-rule), such as one
 the control plane answered with `409 psk_not_ready`, and sends no request for a PSK
@@ -595,9 +703,13 @@ the store holds as current.
 ### Node API peer list
 
 `GET /v1/peers` on the node API, and with it [`plexd peers`](../core/cli.md#plexd-peers),
-reports for each peer the endpoint plexd programs, direct or fallback. The agent's
-peer snapshot calls `ProgrammedEndpoint` with `MeshPrefix()` when the WireGuard
-interface came up, and with the zero prefix otherwise.
+reports for each peer the endpoint [`ProgrammedEndpoint`](#dial-order) returns: its
+usable direct endpoint, else its fallback. The agent's peer snapshot calls it with
+`MeshPrefix()` when the WireGuard interface came up, and with the zero prefix
+otherwise. The list shows neither the candidates nor the endpoint
+[endpoint selection](#endpoint-selection) settled on; `wg show` and the
+[handshake report](../core/heartbeat-service.md#handshake-reporter) carry the
+endpoint on the device.
 
 ### Graceful Shutdown
 

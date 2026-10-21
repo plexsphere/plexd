@@ -6,7 +6,7 @@ feature: PXD-0006
 
 # NAT Traversal via STUN
 
-The `internal/nat` package discovers a node's public endpoint using STUN servers, classifies the NAT type, and reports the result to the control plane. Peers behind NAT use the discovered endpoints to establish direct WireGuard connections.
+The `internal/nat` package discovers a node's public endpoint using STUN servers, classifies the NAT type, and reports the result to the control plane. Peers behind NAT use the discovered endpoints to establish direct WireGuard connections. The package also publishes the node's local interface addresses as [endpoint candidates](#local-endpoint-candidates), which peers on the same network dial directly.
 
 All STUN network operations go through a `STUNClient` interface, enabling full unit testing without real STUN servers or UDP sockets. The STUN protocol implementation covers RFC 5389 Binding requests and XOR-MAPPED-ADDRESS parsing using only the Go standard library.
 
@@ -20,6 +20,10 @@ All STUN network operations go through a `STUNClient` interface, enabling full u
 | `STUNServers`     | `[]string`      | `["stun.l.google.com:19302", "stun.cloudflare.com:3478"]`   | STUN server addresses (host:port)   |
 | `RefreshInterval` | `time.Duration` | `60s`                                                        | Interval between STUN refreshes     |
 | `Timeout`         | `time.Duration` | `5s`                                                         | Per-server STUN request timeout     |
+| `LocalCandidates` | `*bool`         | `nil` (enabled)                                              | Publish local endpoint candidates (`local_candidates`); see [Local endpoint candidates](#local-endpoint-candidates) |
+| `CandidateInterfaces` | `[]string`  | empty (every eligible interface)                             | Allowlist of interface names to publish candidates from (`candidate_interfaces`) |
+
+`LocalCandidates` is a pointer so that an omitted key stays apart from an explicit `false`. `LocalCandidatesEnabled()` returns the effective value: true unless the field is set to `false`. It is independent of `Enabled`, because a node whose STUN servers are unreachable still has local addresses a peer can dial.
 
 ```go
 cfg := nat.Config{
@@ -40,8 +44,9 @@ if err := cfg.Validate(); err != nil {
 | `STUNServers`     | Non-empty when `Enabled=true` | `nat: config: STUNServers must not be empty when enabled` |
 | `RefreshInterval` | >= 10s                        | `nat: config: RefreshInterval must be at least 10s`       |
 | `Timeout`         | > 0                           | `nat: config: Timeout must be positive`                   |
+| `CandidateInterfaces` | No empty or whitespace-only entry | `nat: config: CandidateInterfaces must not contain an empty name` |
 
-When `Enabled=false`, validation is skipped entirely.
+When `Enabled=false`, every rule but the `CandidateInterfaces` check is skipped. That check runs first, because the candidate publisher runs whether or not STUN traversal is enabled.
 
 ## STUNClient
 
@@ -231,6 +236,96 @@ Internal function that sends the discovered endpoint to the control plane and re
 
 `Discoverer.reportEndpoint` wraps `report` and owns the failure logging. A rejection means the control plane no longer holds this node's peer record; re-reporting cannot clear it, and because heartbeats keep succeeding, no other health signal turns red. Consecutive rejections are therefore counted: the first two log at `Warn`, the third and beyond log at `Error` with `consecutive_rejections`, which is alertable. A successful report clears the streak; a transient failure leaves it intact, since it says nothing about whether the peer record came back. Recovery still requires re-registration — the loop surfaces the condition rather than resolving it.
 
+## Local endpoint candidates
+
+Two nodes behind one NAT router both publish the router's address as their STUN endpoint. The node therefore also publishes its local interface addresses, each joined with the WireGuard listen port, on [`PUT /v1/nodes/{node_id}/endpoint-candidates`](../core/api-endpoints.md#put-v1-nodes-node-id-endpoint-candidates). Peers receive them as `endpoint_candidates` on the state pull, try the ones on a subnet they share first, and keep the first entry that completes a handshake (see [Dial order](wireguard.md#dial-order) and [Endpoint selection](wireguard.md#endpoint-selection)).
+
+A peer on the same network reaches a candidate only when UDP `wireguard.listen_port` is open on that local address. Where a host or network firewall drops it, the peer's trial of the candidate times out and the peer moves on to the next entry of its dial order.
+
+### Gathering
+
+```go
+type Interface struct {
+    Name     string
+    Index    int
+    Flags    net.Flags
+    Prefixes []netip.Prefix
+}
+
+type CandidateFilter struct {
+    Interfaces        []string     // allowlist; empty means every eligible interface
+    ExcludeInterfaces []string     // always skipped
+    ExcludePrefix     netip.Prefix // addresses inside it are skipped; the zero prefix skips nothing
+}
+
+func SystemInterfaces() ([]Interface, error)
+func EligiblePrefixes(ifaces []Interface, f CandidateFilter) []netip.Prefix
+func SelectCandidates(ifaces []Interface, port int, f CandidateFilter) (candidates []string, truncated int)
+func GatherCandidates(port int, f CandidateFilter) (candidates []string, truncated int, err error)
+```
+
+`SystemInterfaces` reads `net.Interfaces()` and each interface's addresses. A failed listing returns `nat: list interfaces: <cause>`. An interface whose addresses cannot be read is skipped, and an address that is not a `*net.IPNet` is ignored. An IPv4-mapped IPv6 address becomes the IPv4 address it carries, with 96 bits taken off its prefix length (`::ffff:10.0.0.5/120` becomes `10.0.0.5/24`).
+
+An interface is eligible under these rules, in order:
+
+1. It is up, and it is neither a loopback nor a point-to-point interface. Point-to-point covers kernel WireGuard, tun and utun devices.
+2. Its name is not in `ExcludeInterfaces`. `plexd up` passes the mesh interface under both its names, `wireguard.interface_name` and the name the OS knows it by (`utunN` on macOS).
+3. With a non-empty `Interfaces` (`nat.candidate_interfaces`), its name is in that list. A listed name skips rule 4.
+4. With an empty `Interfaces`, its name does not start with `docker`, `br-`, `veth`, `virbr`, `cni`, `flannel`, `cali`, `cilium`, `lxcbr`, `lxdbr`, `vxlan`, `kube-`, `podman`, `tailscale` or `zt`. These container, bridge, overlay and VPN interfaces exist on many hosts at once (Docker's `172.17.0.1` is on every Docker host), so a peer that dialed one would reach its own host.
+
+An address on an eligible interface is skipped when it is invalid, unspecified, loopback, link-local unicast, link-local multicast, interface-local multicast or multicast, or when it lies inside `ExcludePrefix`. `plexd up` passes the Domain mesh prefix there ([`Manager.MeshPrefix`](wireguard.md#mesh-prefix)): a peer that dialed a mesh address would route WireGuard's packets into its own tunnel.
+
+`SelectCandidates` renders each eligible address joined with `port` as a `host:port` string, an IPv6 host in brackets and without a zone. It sorts IPv4 before IPv6, then by the lower interface index, then by the lower address, so a report is stable across cycles and the cap keeps the same addresses. An address on two interfaces is published once, at its first position. Past `api.MaxEndpointCandidates` (8) it keeps the first eight and counts the rest in `truncated`. Nothing eligible yields an empty, non-nil slice, the report that withdraws every earlier candidate.
+
+`EligiblePrefixes` returns the prefixes of the eligible addresses under the same rules, neither deduplicated nor capped. The WireGuard manager reads them to tell which of a peer's candidates share a subnet with this node. `GatherCandidates` is `SystemInterfaces` followed by `SelectCandidates`, and returns a read error unchanged.
+
+`plexd up` builds one filter in step 5a-2, when the WireGuard interface came up: `Interfaces` from `nat.candidate_interfaces`, `ExcludeInterfaces` with the mesh interface's two names, and `ExcludePrefix` with the mesh prefix. The publisher gathers through it, and the function `Manager.SetLocalPrefixes` receives returns `EligiblePrefixes` over `SystemInterfaces()` through it.
+
+### CandidatePublisher
+
+```go
+type CandidateReporter interface {
+    ReportEndpointCandidates(ctx context.Context, nodeID string, req api.EndpointCandidatesRequest) (*api.EndpointCandidatesResponse, error)
+}
+
+func NewCandidatePublisher(gather func() ([]string, int, error), cfg Config, logger *slog.Logger) *CandidatePublisher
+func (p *CandidatePublisher) Run(ctx context.Context, reporter CandidateReporter, nodeID string) error
+```
+
+`*api.ControlPlane` satisfies `CandidateReporter`. `gather` returns the candidates and how many were dropped past the cap; `cfg` supplies `RefreshInterval` and `MinReportInterval`. Every line the publisher logs carries `component=nat`.
+
+`Run` logs `nat: endpoint candidates: started`, reports at once, and then reports once per cycle until `ctx` is done, when it returns nil. No answer ends the loop. One cycle:
+
+1. Call `gather`. An error logs a `Warn` and sends nothing.
+2. Send `{"candidates": [...], "reported_at": <now, UTC>}`, also when there are no candidates: the empty array withdraws the candidates reported before.
+3. On an error, say nothing when `ctx` is done, and log it by its cause otherwise (see below).
+4. On success, log the recovery line after a not-served phase, an `Info` line for the first accepted set and for a set that differs from the last accepted one, and a `Debug` line for every accepted report.
+
+After an accepted report the next one follows `stale_after` as the [Discoverer's](#run-sequence) does: 30s before the deadline, floored at `MinReportInterval` and capped at `RefreshInterval`, and `RefreshInterval` for a zero `stale_after`. A deadline that shortens the cadence below `RefreshInterval` logs a `Warn`. After any failure, a failed interface read included, the next cycle follows `RefreshInterval`.
+
+A control plane that does not serve the operation answers `404` with any code but `endpoint_peer_not_found`, or `501 endpoint_candidates_not_provisioned` ([`api.IsEndpointCandidatesNotServed`](../core/control-plane-client.md#error-types)). The publisher logs that once at `Info` when it enters the state, keeps reporting every `RefreshInterval` so an upgraded control plane is picked up without a restart, and logs one `Info` line on the first success after it.
+
+### Wiring in plexd up
+
+Step 24a starts the publisher when the WireGuard interface came up and `nat.local_candidates` is not `false`. It gathers with `GatherCandidates(wireguard.listen_port, filter)` and reports for the node's ID. It does not depend on `nat.enabled`, on STUN or on `peer_exchange.enabled`: a node whose STUN servers are unreachable still publishes its local addresses, while a failed initial STUN discovery ends the endpoint report loop. A node whose WireGuard interface did not come up accepts no tunnel and publishes nothing; `plexd up` logs `wireguard unavailable, skipping peer reconcile handler, handshake reports, tunnel metrics, endpoint selection and endpoint candidates` at `Warn`.
+
+### Publisher log lines
+
+| Level   | Message | Keys |
+|---------|---------|------|
+| `Info`  | `nat: endpoint candidates: started` | none |
+| `Info`  | `nat: endpoint candidates: published` | `candidates`, `truncated` |
+| `Debug` | `nat: endpoint candidates: accepted` | `count`, `stale_after` |
+| `Info`  | `nat: endpoint candidates: control plane does not accept endpoint candidates, retrying every interval` | `status`, `code` |
+| `Info`  | `nat: endpoint candidates: control plane accepts endpoint candidates` | none |
+| `Warn`  | `nat: endpoint candidates: read interfaces failed` | `error` |
+| `Warn`  | `nat: endpoint candidates: rejected, this node is not registered as a peer` | `code` (`endpoint_peer_not_found` or `endpoint_peer_gone`) |
+| `Warn`  | `nat: endpoint candidates: rejected for clock skew` | `error` |
+| `Warn`  | `nat: endpoint candidates: send failed` | `error` |
+| `Warn`  | `nat: endpoint candidates: control plane deadline shortens the report cadence` | `delay`, `refresh_interval`, `min_report_interval`, `stale_after` |
+
+`send failed` covers every failure the other lines do not, among them `400 malformed_endpoint_candidates`, `400 endpoint_candidate_unparseable`, `401`, `403`, `413`, `500`, a `501` with another code and a transport error. A peer rejection clears once the control plane registers the node, and a clock skew once NTP corrects the clock, so both are logged on every cycle rather than once.
+
 ## STUN Protocol Details
 
 The package implements RFC 5389 STUN Binding Requests using only the Go standard library (`encoding/binary`, `net`).
@@ -323,3 +418,5 @@ All log entries use `component=nat`.
 | `Warn`  | Control plane deadline shortens the report cadence | `delay`, `refresh_interval`, `min_report_interval`, `stale_after` |
 | `Warn`/`Error` | Endpoint report rejected     | `error`, `consecutive_rejections` (404/410; `Error` from the third in a row) |
 | `Debug` | STUN binding succeeded              | `server`, `mapped_address`             |
+
+The candidate publisher's lines are listed under [Publisher log lines](#publisher-log-lines).
