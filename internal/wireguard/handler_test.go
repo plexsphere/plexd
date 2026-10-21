@@ -318,7 +318,7 @@ func TestReconcileHandler_WarnsOnRejectedEndpoint(t *testing.T) {
 	}
 	out := logs.String()
 	for _, want := range []string{
-		"peer direct endpoint unusable, programming the relay fallback",
+		"peer direct endpoint unusable, leaving it out of the dial order",
 		"level=WARN",
 		"endpoint=10.99.0.4:51820",
 		"fallback=203.0.113.1:51820",
