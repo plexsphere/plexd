@@ -594,6 +594,50 @@ plane receives the same two values as the manifest's flat fields.
 The response no longer carries peer endpoints. Inbound peer endpoint updates
 arrive via the `peer_endpoint_changed` SSE event.
 
+## Handshakes
+
+### `POST /v1/nodes/{node_id}/handshakes`
+
+The per-peer WireGuard handshake report the control plane derives mesh edge
+health from. The handler decodes with unknown fields refused, and every `400`
+refuses the whole report. See
+[Control Plane API Endpoints](api-endpoints.md#mesh-edge-health) for the wire
+examples and error taxonomy.
+
+**HandshakeReportRequest**
+
+| Field        | Type                    | JSON Tag        | Description                                    |
+|--------------|-------------------------|-----------------|------------------------------------------------|
+| `ObservedAt` | `time.Time`             | `"observed_at"` | Node wall clock when the report was assembled; the server refuses a skew above 60s |
+| `Peers`      | `[]HandshakeReportPeer` | `"peers"`       | 0 to `MaxHandshakeReportPeers` (4096) entries; `[]` when empty, never `null` |
+
+`ReportHandshakes` replaces a nil `Peers` with an empty slice before it marshals
+the body, because the control plane answers `null` with
+`400 malformed_handshake_report`. More than `MaxHandshakeReportPeers` entries
+return an error matching `ErrHandshakeReportTooMany` without sending a request.
+
+**HandshakeReportPeer**
+
+| Field                     | Type     | JSON Tag                       | Description                                    |
+|---------------------------|----------|--------------------------------|------------------------------------------------|
+| `PeerNodeID`              | `string` | `"peer_node_id"`               | Peer node ID, a non-zero UUID; unique within the report |
+| `LastHandshakeAgeSeconds` | `int32`  | `"last_handshake_age_seconds"` | Seconds since the latest completed handshake, 0 to 2147483647 |
+| `Endpoint`                | `string` | `"endpoint"`                   | Endpoint WireGuard uses for the peer, `host:port` with an IPv6 host in brackets; a non-zero port, a specified address and no zone |
+
+**HandshakeReportResponse** (`200 OK`)
+
+| Field        | Type        | JSON Tag        | Description                                    |
+|--------------|-------------|-----------------|------------------------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | Server receive time every age was anchored on  |
+| `Recorded`   | `int`       | `"recorded"`    | Entries stored as the latest observation of their edge |
+| `Ignored`    | `int`       | `"ignored"`     | Entries naming the node itself, an unknown node, a node of another Domain, or a deregistered peer |
+
+**Constants**
+
+| Constant                  | Value  | Description                                          |
+|---------------------------|--------|------------------------------------------------------|
+| `MaxHandshakeReportPeers` | `4096` | Most entries one report may carry (the contract's `maxItems`) |
+
 ## Key Rotation
 
 ### `POST /v1/keys/rotate`

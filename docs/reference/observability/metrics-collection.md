@@ -327,6 +327,31 @@ Returns one `MetricPoint` per peer with `Group="tunnel"` and `PeerID` set. Each 
 
 On reader error, returns `nil, fmt.Errorf("metrics: tunnel: %w", err)`.
 
+### Wiring in `plexd up`
+
+`plexd up` registers a `TunnelCollector` only when the WireGuard interface came up. Without the interface it logs `wireguard unavailable, skipping peer reconcile handler, handshake reports and tunnel metrics`. The collector adds no configuration of its own: it follows `metrics.enabled` and `metrics.collect_interval`.
+
+Its reader is `wgTunnelStatsReader` (`cmd/plexd/cmd/up.go`), which calls [`wireguard.Manager.MeshPeerStats`](../networking/wireguard.md#mesh-peer-stats) and maps each mesh peer to one `TunnelStats`:
+
+| `TunnelStats` field  | Value                                                              |
+|----------------------|--------------------------------------------------------------------|
+| `PeerID`             | The peer's node ID                                                 |
+| `LastHandshakeTime`  | The latest completed handshake; zero when none has completed      |
+| `RxBytes`, `TxBytes` | The device's byte counters for the peer                            |
+| `HandshakeSucceeded` | `true` when a handshake has completed                              |
+| `HandshakeStale`     | Set by the collector when the handshake is older than 5 minutes    |
+| `PacketLossPercent`  | Always `-1`, the "no measurement" value: plexd measures no packet loss |
+
+A peer with no handshake is kept, so it reports `handshake_succeeded` as 0 instead of disappearing from the metrics. An empty device yields an empty slice. A failed read returns `plexd up: tunnel stats: <cause>`, which the collector wraps as `metrics: tunnel: plexd up: tunnel stats: <cause>` and the manager logs at Warn as `collector failed`.
+
+#### Collector order
+
+`buildMetricsCollectors` (`cmd/plexd/cmd/up.go`) returns the collectors in this order: the `TunnelCollector` when a tunnel reader exists, then the `SystemCollector`, then the `AgentStatsCollector`. The order matters because the manager's buffer holds at most `2 × BatchSize` points (200 with the default batch size of 100) and drops the oldest when it overflows. One `tunnel` point per peer per 15s collect means a node with more than 48 peers trims within one 60s report window. With the tunnel collector first, each cycle appends the `system` and `agent` points last, so a trim drops older tunnel points before it drops the newest `node_resources` and `agent_stats` points.
+
+#### Volume
+
+The control-plane leg flattens each tunnel point into six `tunnel_health` samples labelled with `peer_id`: `rx_bytes`, `tx_bytes`, `handshake_succeeded`, `handshake_stale`, `packet_loss_percent` and `last_handshake_timestamp_seconds` (see [Flattening](#flattening)). Each collect therefore adds six samples per mesh peer. The control plane's ingest accepts any sample name and value in the `tunnel_health` group, the `-1` packet loss included.
+
 ## LatencyCollector
 
 Measures per-peer round-trip latency via an injectable `Pinger` and `PeerLister`.
@@ -604,6 +629,7 @@ err := mgr.Run(ctx)
 ### Buffer Management
 
 - Collected `MetricPoint`s are appended to an internal buffer protected by `sync.Mutex`
+- The buffer holds at most `2 × BatchSize` points; after each collector's append, and after a failed report puts its batch back, the oldest points beyond that limit are dropped (see [Collector order](#collector-order))
 - On report tick, the buffer is swapped out atomically (lock, copy reference, set to nil, unlock)
 - Empty buffers skip the report call entirely
 - On shutdown, remaining buffered points are flushed with a background context
@@ -836,5 +862,7 @@ mgr := metrics.NewManager(cfg.Metrics, collectors, metricsReporter, identity.Nod
 See [Local Endpoint Integration Tests](../development/local-endpoint-integration-tests.md) for the full integration test suite covering dual delivery, error isolation, credential resolution, and TLS skip-verify across all three pipelines.
 
 ### With wireguard.Manager
+
+`wireguard.Manager.MeshPeerStats()` feeds the `TunnelCollector` through `wgTunnelStatsReader` (see [Wiring in `plexd up`](#wiring-in-plexd-up)).
 
 `wireguard.Manager.PeerIndex()` can serve as the basis for a `PeerLister` implementation, providing the list of active peer IDs to the `LatencyCollector`.

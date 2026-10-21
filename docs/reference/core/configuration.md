@@ -117,7 +117,7 @@ Periodic heartbeat reporting to the control plane.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `interval` | duration | `30s` | Heartbeat send interval |
+| `interval` | duration | `30s` | Heartbeat send interval. It also paces the [handshake report](heartbeat-service.md#handshake-reporter) (`POST /v1/nodes/{node_id}/handshakes`). Keep it at or below the Domain's reachability heartbeat interval: the control plane floors its edge thresholds at 180s plus the Domain's interval, so a longer local interval makes mesh edges read `stale` between reports. |
 
 > `node_id` is set at runtime from the registration identity. It does not appear in the YAML.
 
@@ -470,7 +470,7 @@ registration:
   max_retry_duration: 5m
 
 heartbeat:
-  interval: 30s
+  interval: 30s              # also paces the handshake report
 
 reconcile:
   interval: 60s              # min: 1s

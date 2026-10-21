@@ -12,7 +12,7 @@ The test runs fourteen phases:
 
 1. **Initial assertions** — all 7 counters >= 1 (agent started and contacted all endpoints)
 2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, and metrics data
-3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously)
+3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously), then a handshake report and a `tunnel_health` sample for a fixture peer when WireGuard came up in the container (script phase `4b`)
 4. **Log injection** — injects a log file via `docker cp`, verifies logs_count increases (FileSource pipeline works)
 5. **Agent restart for audit** — restarts the plexd container and verifies `local_audit_count` increases (ProcessSource fires per-process). The platform leg carries nothing: plexd's own `process` source is outside the ingest contract's closed enum (`auditd`, `k8s`), so `audit_count` must stay at 0.
 6. **SSE event injection** — injects a `node_state_updated` event and verifies state_count increases (proves SSE stream is connected)
@@ -99,6 +99,24 @@ Uses `GET /test/last-request/{endpoint}` to verify the content of request payloa
 ### Phase 3: Periodic Loop Verification
 
 Waits up to 60 seconds for `heartbeat_count` and `metrics_count` to reach >= 2. These are self-generating periodic loops. Logs and audit are tested separately via injection and restart.
+
+### Phase 3 (cont.): Handshake Report and Tunnel Health
+
+Runs as script phase `4b`, directly after the periodic-loop phase in `test.sh`, and checks the two channels that read the WireGuard device: the [handshake report](../core/heartbeat-service.md#handshake-reporter) and the `tunnel_health` metrics group.
+
+plexd starts both only when its WireGuard interface came up, so the phase first reads the plexd container's log into a variable (`dc logs plexd`) and looks for `wireguard interface configured` with a `case` statement. It does not use `grep -q` in a pipeline: under `pipefail`, `grep -q` exits at the first match, the writer upstream can fail on the closed pipe, and the pipeline then reports a present line as missing. Without the line the phase prints:
+
+```text
+SKIP: handshake report and tunnel_health (WireGuard did not come up in this container)
+```
+
+With the line it checks three things:
+
+1. **A report arrived.** Polls `GET /test/assertions` for up to 90 seconds until `handshake_report_count` >= 1. The e2e config keeps the default 30s `heartbeat.interval`, and the reporter sends its first report one interval after it starts.
+2. **The body is an empty report.** Reads `GET /test/last-request/handshakes` and asserts with `jq` that the body has exactly the keys `observed_at` and `peers`, and that `peers` is an array of length 0. The fixture peers never complete a handshake, and the reporter omits a peer without one.
+3. **Tunnel metrics name a fixture peer.** Polls `GET /test/last-request/metrics` for up to 30 seconds for at least one `tunnel_health` sample whose `labels.peer_id` is one of the two fixture node IDs (`0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1`, `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2`). The tunnel collector keeps peers with no handshake, so the samples exist without one.
+
+This phase is the only run anywhere that reads a kernel WireGuard device through `NetlinkController.PeerStats`, so it must not be weakened to the skip path.
 
 ### Phase 4: Log Injection
 

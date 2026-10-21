@@ -34,8 +34,9 @@ The gate exists because its absence hid a shipped defect: the mock used to admit
 ### Request validation the fixture enforces
 
 The mock refuses what the real handlers refuse, because a fixture that accepts
-more than the contract hides exactly the defects the suite exists to catch. Three
-gates were added after a release shipped past them:
+more than the contract hides exactly the defects the suite exists to catch. The
+first three gates were added after a release shipped past them; the handshake
+report was gated from the start:
 
 - **`PUT /v1/nodes/{id}/capabilities`** strict-decodes a `CapabilityManifestRequest`
   (`DisallowUnknownFields`) and enforces its invariants: a non-empty
@@ -71,6 +72,18 @@ gates were added after a release shipped past them:
   serve) and decoded the agent's own shape, so the agent's reports agreed with
   the fixture and with nothing else. A violation never fires during an e2e run,
   so this handler is the only place the divergence can be caught.
+- **`POST /v1/nodes/{id}/handshakes`** caps the body at 1 MiB
+  (`413 handshake_report_too_large`) and strict-decodes it into mock-local
+  pointer types, so a missing field is told apart from a zero one. It answers in
+  the contract's gate order: `400 malformed_handshake_report` for a missing or
+  zero `observed_at`, a missing or `null` `peers`, more than 4096 entries, a
+  `peer_node_id` that is missing, not a UUID or all zeros, an age that is missing
+  or outside 0..2147483647, or a repeated `peer_node_id`; then
+  `400 handshake_clock_skew` for an `observed_at` more than 60s from the mock's
+  clock; then `400 handshake_endpoint_unparseable` for an `endpoint` that is
+  missing, has port 0, an unspecified address or a zone. A report naming no
+  fixture peer is still accepted: its entries count as `ignored`, as upstream.
+  See [the route](#post-v1-nodes-id-handshakes) for the full order.
 
 ### `GET /test/bearer`
 
@@ -328,6 +341,58 @@ closed `nat_type` enum, clock-skew tolerance, and a routable `ip:port`.
 **Counter:** Increments `endpoint_count` only when every check passes.
 
 **Error:** Denials use `application/problem+json` with the codes above. Returns `405` if the HTTP method is not `PUT`.
+
+### `POST /v1/nodes/{id}/handshakes`
+
+Enforces the v1 handshake report contract (`PostNodeHandshakes`): a 1 MiB body
+cap, strict JSON decoding, the per-entry invariants, clock-skew tolerance, and a
+sendable `host:port` per entry. The body is captured under `handshakes` and
+decoded into mock-local pointer types, so a missing field is told apart from a
+zero one. `handshake_report_count` increments only when every check passes.
+
+**Validation order.** The handler returns at the first failure:
+
+1. **Body size** → `413` `handshake_report_too_large` if the body exceeds 1 MiB.
+2. **Body decode** → `400` `malformed_handshake_report` if the body is not valid JSON or carries an unknown field.
+3. **Report shape** → `400` `malformed_handshake_report` if `observed_at` is missing or zero, `peers` is missing or `null`, `peers` holds more than 4096 entries, a `peer_node_id` is missing, does not match the UUID pattern or is all zeros, an age is missing, below 0 or above 2147483647, or a `peer_node_id` repeats.
+4. **Clock skew** → `400` `handshake_clock_skew` if `observed_at` is more than 60s from the mock's clock.
+5. **Endpoints** → `400` `handshake_endpoint_unparseable` if an `endpoint` is missing, fails `netip.ParseAddrPort`, has port 0, an unspecified address or a zone. The `detail` names the entry: `peers[<i>].endpoint is not a host:port pair with a non-zero port, a specified address, and no zone.`
+
+**Request body:**
+
+```json
+{
+  "observed_at": "2026-10-21T10:15:30Z",
+  "peers": [
+    {
+      "peer_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+      "last_handshake_age_seconds": 42,
+      "endpoint": "198.51.100.7:51820"
+    }
+  ]
+}
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "accepted_at": "2026-10-21T10:15:30Z",
+  "recorded": 1,
+  "ignored": 0
+}
+```
+
+`recorded` counts the entries naming a fixture peer (`0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1`
+or `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2`), `ignored` every other entry. A report
+with `"peers": []` is answered `recorded: 0, ignored: 0`, which is what the
+Docker e2e run expects: the fixture peers never complete a handshake.
+
+**Content-Type:** `application/json` (errors use `application/problem+json`).
+
+**Counter:** Increments `handshake_report_count` only when every check passes.
+
+**Error:** Denials use `application/problem+json` with the codes above. Returns `405` if the HTTP method is not `POST`.
 
 ### `GET /v1/nodes/{id}/state`
 
@@ -805,6 +870,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "session_activity_count": 0,
   "session_activity_rejected_count": 0,
   "integrity_violation_count": 0,
+  "handshake_report_count": 0,
   "inject_event_count": 0,
   "events_request_count": 0,
   "local_metrics_count": 0,
@@ -1132,6 +1198,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `session_activity_count` | `POST /v1/nodes/{id}/sessions/{sid}` (accepted rows only) |
 | `session_activity_rejected_count` | `POST /v1/nodes/{id}/sessions/{sid}` (liveness refusals only: `404` / `409`) |
 | `integrity_violation_count` | `POST /v1/nodes/{id}/integrity-violations` (accepted batches only, one per request regardless of batch size) |
+| `handshake_report_count` | `POST /v1/nodes/{id}/handshakes` (accepted reports only, `200`) |
 | `inject_event_count` | `POST /test/inject-event` |
 | `events_request_count` | `GET /v1/nodes/{id}/events` (every request, including descoped `501` and `400`) |
 | `local_metrics_count` | `POST /local/metrics` (TLS) |
