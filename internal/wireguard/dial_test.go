@@ -119,6 +119,68 @@ func TestDialOrder_CanonicalizesAndDeduplicates(t *testing.T) {
 	}
 }
 
+// The control plane lists a peer's peer-observed endpoints, NAT mappings other
+// nodes of the Domain completed handshakes over, ahead of its local candidates.
+// plexd orders them by the on-link rule like every other candidate.
+func TestDialOrder_PeerObservedEndpoints(t *testing.T) {
+	tests := []struct {
+		name       string
+		candidates []string
+		endpoint   string
+		local      []netip.Prefix
+		want       []string
+	}{
+		{
+			"off-link mapping at the head",
+			[]string{"198.51.100.30:40001", "10.0.0.5:51820", "172.31.4.9:51820"},
+			"198.51.100.7:51820",
+			[]netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")},
+			[]string{"10.0.0.5:51820", "198.51.100.7:51820", "198.51.100.30:40001", "172.31.4.9:51820", "203.0.113.1:51820"},
+		},
+		{
+			"mapping on the direct endpoint's address",
+			[]string{"198.51.100.7:10482"},
+			"198.51.100.7:51820",
+			nil,
+			[]string{"198.51.100.7:51820", "198.51.100.7:10482", "203.0.113.1:51820"},
+		},
+		{
+			"no direct endpoint",
+			[]string{"198.51.100.30:40001", "172.31.4.9:51820"},
+			"",
+			nil,
+			[]string{"198.51.100.30:40001", "172.31.4.9:51820", "203.0.113.1:51820"},
+		},
+		{
+			"mapping on a subnet this node shares",
+			[]string{"198.51.100.30:40001", "172.31.4.9:51820"},
+			"192.0.2.7:51820",
+			[]netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
+			[]string{"198.51.100.30:40001", "192.0.2.7:51820", "172.31.4.9:51820", "203.0.113.1:51820"},
+		},
+		{
+			"IPv6 mapping",
+			[]string{"[2001:db8::30]:40001", "10.0.0.5:51820"},
+			"198.51.100.7:51820",
+			[]netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")},
+			[]string{"10.0.0.5:51820", "198.51.100.7:51820", "[2001:db8::30]:40001", "203.0.113.1:51820"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := api.SnapshotPeer{
+				EndpointCandidates: tt.candidates,
+				Endpoint:           tt.endpoint,
+				FallbackEndpoint:   "203.0.113.1:51820",
+			}
+			order, dropped := dialOrder(p, tt.local, testMesh)
+			if !slices.Equal(order, tt.want) || dropped != 0 {
+				t.Errorf("dialOrder() = (%v, %d), want (%v, 0)", order, dropped, tt.want)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ReconcileHandler and the dial order
 // ---------------------------------------------------------------------------
