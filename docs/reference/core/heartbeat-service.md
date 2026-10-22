@@ -25,11 +25,14 @@ sequenceDiagram
     participant CP as Control Plane
 
     HS->>HS: Send initial heartbeat
-    loop Every 30s (configurable)
+    loop Every 30s (configurable), or the probe delay while parked
         HS->>HS: Build HeartbeatRequest
         HS->>CP: POST /v1/nodes/{id}/heartbeat
         alt 200 OK
             CP-->>HS: HeartbeatResponse
+            opt parked
+                HS->>HS: Unpark: onCredentialRefused(false)
+            end
             opt reconcile = true
                 HS->>HS: TriggerReconcile()
             end
@@ -38,7 +41,7 @@ sequenceDiagram
             end
         else 401 Unauthorized
             CP-->>HS: ErrUnauthorized
-            HS->>HS: onAuthFailure() → re-register
+            HS->>HS: Count the refusal, park on the third: onCredentialRefused(true)
         else Other error
             CP-->>HS: Error
             HS->>HS: Log error, continue
@@ -47,8 +50,8 @@ sequenceDiagram
 ```
 
 1. Send one heartbeat immediately on start
-2. Start a ticker at the configured interval (default 30s)
-3. On each tick, build and send a `HeartbeatRequest`
+2. After every send, wait for the configured interval (default 30s), or for the probe delay while the service is parked (see [Credential Park](#credential-park))
+3. When the wait ends, build and send a `HeartbeatRequest`
 4. Process the `HeartbeatResponse` directive flags
 5. Continue until context is cancelled
 
@@ -96,28 +99,77 @@ control plane.
 
 ### 401 Unauthorized
 
-When the heartbeat receives a 401 error (`api.ErrUnauthorized`), the `onAuthFailure` callback is invoked. In production (`plexd up`), this triggers re-registration:
+A heartbeat answered `401` (`api.ErrUnauthorized`) counts as a refusal of the node's credential, whatever its problem code. The control plane answers `nsk_invalid` for a removed Node and `nsk_revoked` for a revoked credential, the mock API server answers `unauthorized`, and an older control plane sends no code. Only the heartbeat counts refusals: a `401` on another route is logged by its caller and does not count.
 
-1. Call `registrar.Register(ctx)` to obtain a new identity
-2. Update the control plane client auth token via `client.SetAuthToken()`
-3. Log the re-registration result
-
-If re-registration fails, the error is logged and the heartbeat continues retrying on the next tick.
+A refusal below `CredentialRefusedThreshold` (3) logs a Warn with the count. Three refused heartbeats with no accepted heartbeat between them park the service (see [Credential Park](#credential-park)). Only an accepted heartbeat resets the count.
 
 ### Clock Skew
 
-When the heartbeat is rejected with the `clock_skew` problem code — the control plane found `client_now` more than 60s from its own time — the service logs at **error** level, instructing the operator to synchronize the system clock via NTP. There is no extra retry; the next attempt is the next 30s tick.
+When the heartbeat is rejected with the `clock_skew` problem code — the control plane found `client_now` more than 60s from its own time — the service logs at **error** level, instructing the operator to synchronize the system clock via NTP. There is no extra retry; the next attempt is the next 30s tick, or the next probe while parked.
 
 ### Other Errors
 
-Non-401 errors are logged at error level. The heartbeat loop continues on the next tick interval.
+Non-401 errors are logged at error level. They leave the refusal count unchanged, because they say nothing about the credential. The heartbeat loop continues after the configured interval, or, while parked, after the doubled probe delay.
+
+## Credential Park
+
+Parking calls the `onCredentialRefused` callback with `true` and logs one Error line that names the cause and the way to enrol again. In `plexd up` the callback marks the shared control-plane client refused first, so no loop sends between the decision and the gate. From then on every request that presents the NSK bearer fails locally with `api.ErrCredentialRefused` before any I/O (see [Authentication](control-plane-client.md#authentication)). The heartbeat is exempt, and so is `POST /v1/register`, which carries no bearer. The callback then sets the node-API metadata key `control_plane_credential` to `refused`, which `plexd status` reports, and turns `/readyz` to `503` with `not ready: node credential refused` (see [health](configuration.md#health)).
+
+The data plane stays up while parked: the WireGuard interface, the peers, the firewall, the mesh server and the local node API keep running.
+
+`CredentialRefusedThreshold` and `MaxCredentialProbeInterval` are constants, not configuration keys. The parked state is not persisted: a restarted agent starts unparked and parks again within three heartbeats if the credential is still refused.
+
+### Probe Schedule
+
+While parked, the heartbeat is a probe of the credential. The first probe goes out twice `heartbeat.interval` after parking. Every probe that fails, refused or otherwise, doubles the delay. No delay exceeds `MaxCredentialProbeInterval` (1h), the first one included.
+
+At the default 30s interval the agent parks on the third refused heartbeat, about 60s after the first. It then probes 1, 3, 7, 15, 31 and 63 minutes after parking, and hourly after that.
+
+### Resume and Recovery
+
+A probe answered `200` unparks the service: it calls `onCredentialRefused(false)`, logs one Info line and returns to `heartbeat.interval`. The `reconcile` and `rotate_keys` flags of that response are handled as on any accepted heartbeat. Every other loop resumes on its next cycle without a restart. The SSE stream is the exception: once a connect is refused, by a `401` or by the gate, it stops for good, and readiness answers `not ready: event delivery stopped` until a restart. The reconciler's pull keeps the node converged meanwhile.
+
+A control-plane fault that refuses every NSK parks the agent the same way, and the next accepted probe clears it with no operator action. The credential of a removed Node is not accepted again. To enrol the machine again, run `plexd deregister`, provide a fresh bootstrap token, and restart plexd (see [Troubleshooting](../../guide/troubleshooting.md#node-removed-from-the-control-plane)).
+
+### Quiet Failure Logs
+
+While parked, the loops that call the control plane on every cycle fail locally on every cycle. These lines then drop from Warn to Debug, with the same message and attributes, so the park line is the one an operator sees:
+
+| Message | Source |
+|---------|--------|
+| `FetchState failed` | `internal/reconcile`: the state pull |
+| `agent: handshake report: send failed` | `internal/agent`: the handshake reporter |
+| `agent: key rotation: resubmitting the staged rotation failed, retrying` | `internal/agent`: the key-rotation recovery sweep, which resubmits a staged rotation key with a backoff capped at 2 minutes |
+| `endpoint report failed` | `internal/nat`: the endpoint discoverer |
+| `nat: endpoint candidates: send failed` | `internal/nat`: the endpoint candidate publisher |
+| `metrics report failed`, `local metrics report failed` | `internal/metrics` |
+| `log report failed`, `local log report failed` | `internal/logfwd` |
+| `audit report failed`, `local audit report failed` | `internal/auditfwd` |
+| `buffer overflow, dropping oldest entries` | `internal/logfwd` and `internal/auditfwd`: the forwarder buffer, which repeats the line on every collect cycle once the refused reports have filled it |
+| `using cached credential` | `internal/metrics`, `internal/logfwd` and `internal/auditfwd`: the local endpoint's credential fetch. A decrypt failure still logs at Warn |
+| `report delete failed`, `report put failed` | `internal/nodeapi`: the report sync |
+
+A failure line drops to Debug only when its error is `api.ErrCredentialRefused`, and the overflow line only while the forwarder's last report failed that way, which happens only while the heartbeat is parked. Every other error at these sites, and every other overflow, keeps its Warn. Nothing else changes: the loops keep their buffers, their dirty report keys and their cadence, and deliver what those buffers still hold on resume. The log and audit forwarders and the metrics manager hold at most twice their batch size and drop the oldest entries beyond that, so a long park leaves only the newest ones to deliver.
+
+Every other control-plane call keeps its logging, because none fails on every cycle while parked. Edge-PSK fetches, execution callbacks, session reports and integrity-violation reports (filed when a hook delivered for execution fails its pinned checksum) are started by a state pull, which the gate refuses, so nothing new starts while parked. Work a pull started before the park, such as an open session or a running action, logs a refused callback once per event. The capabilities report runs once at startup. A secret request through the local node API is answered `503` and logs `secret fetch failed` at Error, once per request. The key-rotation sweep's `agent: key rotation: reusing the staged rotation key` repeats with each resubmit and stays at Info, because it is not a failure line.
+
+### Logging
+
+Every heartbeat line carries `component=heartbeat`.
+
+| Level | Message | When |
+|-------|---------|------|
+| Warn  | `agent: heartbeat: credential refused` | A refused heartbeat below the threshold; carries `error`, `consecutive` and `threshold` |
+| Error | `agent: heartbeat: node credential refused, the Node was removed from the control plane or its credential revoked; control-plane calls suspended` | The service parks; carries `node_id`, `code` (the problem code, empty when the answer carries none), `consecutive`, `next_probe` and `enrol_again` (`run 'plexd deregister', provide a fresh bootstrap token, and restart plexd`) |
+| Debug | `agent: heartbeat: probe refused` | A probe is refused while parked; carries `error` and `next_probe` |
+| Info  | `agent: heartbeat: node credential accepted again, control-plane calls resumed` | A probe is accepted and the service unparks |
 
 ## Callbacks
 
 | Method                | Signature      | Description                                |
 |-----------------------|----------------|--------------------------------------------|
 | `SetReconcileTrigger` | `ReconcileTrigger` | Reconciler to trigger on `reconcile=true` |
-| `SetOnAuthFailure`    | `func()`       | Called on 401 Unauthorized                 |
+| `SetOnCredentialRefused` | `func(refused bool)` | Called with `true` when the service parks and with `false` when a probe is accepted again |
 | `SetOnRotateKeys`     | `func()`       | Called on `rotate_keys=true`               |
 | `SetBuildRequest`     | `func() HeartbeatRequest` | Custom request builder          |
 
@@ -168,7 +220,7 @@ Entries are sorted by age ascending, then by `peer_node_id`. Beyond `api.MaxHand
 
 ### Not-served behavior
 
-A control plane that predates the operation answers `404`, and one that has not wired its handshake recording service answers `501 handshakes_not_provisioned`. `api.IsHandshakeReportNotServed` is true for both. The reporter logs the not-served line once, on the transition into that state, and keeps trying every tick. When a report is accepted again it logs the recovery line once and clears the state. This is the pattern `PlatformReporter` uses for `501 observability_ingest_not_provisioned`. Every other failure, a `501` with another code included, logs at Warn or Error on every tick it occurs.
+A control plane that predates the operation answers `404`, and one that has not wired its handshake recording service answers `501 handshakes_not_provisioned`. `api.IsHandshakeReportNotServed` is true for both. The reporter logs the not-served line once, on the transition into that state, and keeps trying every tick. When a report is accepted again it logs the recovery line once and clears the state. This is the pattern `PlatformReporter` uses for `501 observability_ingest_not_provisioned`. Every other failure, a `501` with another code included, logs at Warn or Error on every tick it occurs, except `api.ErrCredentialRefused` while the heartbeat is parked, which logs `agent: handshake report: send failed` at Debug (see [Quiet Failure Logs](#quiet-failure-logs)).
 
 ### Logging
 
@@ -180,7 +232,8 @@ A control plane that predates the operation answers `404`, and one that has not 
 | Warn  | `agent: handshake report: more peers than the contract allows, reporting the most recent` | `truncated > 0`; carries `peers` and `max` |
 | Info  | `agent: handshake report: control plane does not accept handshake reports, retrying every interval` | The first not-served answer; carries `status` and `code` |
 | Error | `agent: handshake report: rejected for clock skew, synchronize the system clock via NTP` | `400 handshake_clock_skew`: `observed_at` is more than 60s from the control plane's time |
-| Warn  | `agent: handshake report: send failed` | Any other failure; carries `error` |
+| Debug | `agent: handshake report: send failed` | `api.ErrCredentialRefused`: the heartbeat is parked and no request was sent; carries `error` |
+| Warn  | `agent: handshake report: send failed` | Any other failure except a refused credential; carries `error` |
 | Info  | `agent: handshake report: control plane accepts handshake reports` | The first accepted report after a not-served answer |
 | Debug | `agent: handshake report: accepted` | Every accepted report; carries `sent`, `recorded`, `ignored` and `accepted_at` |
 
@@ -192,7 +245,7 @@ In `plexd up`, the heartbeat service is wired as follows:
 HeartbeatService
 ├── client: ControlPlane (sends heartbeat RPCs)
 ├── reconcileTrigger: Reconciler (triggers state reconciliation)
-├── onAuthFailure: re-registers → updates auth token
+├── onCredentialRefused: credentialRefusedPublisher (marks the shared client refused, then the node-API cache and the health listener; set at step 12, once the node API server exists)
 └── onRotateKeys: triggers reconcile (key material itself arrives via the signing_key_rotated SSE event)
 ```
 

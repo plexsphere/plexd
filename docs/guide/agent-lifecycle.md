@@ -73,7 +73,7 @@ Heartbeat payload:
 | `200 OK` + `{ "reconcile": true }` | Trigger immediate reconciliation (out-of-band hint) |
 | `200 OK` + `{ "rotate_keys": true }` | Trigger the mesh-key rotation flow: generate, stage, submit, swap (redundant with SSE, serves as fallback) |
 | `400 Bad Request` + `{ "code": "clock_skew" }` | `client_now` drifted more than 60s from the control plane; sync the system clock via NTP |
-| `401 Unauthorized` | Node identity invalid, re-register |
+| `401 Unauthorized` + `{ "code": "nsk_invalid" }` (or `nsk_revoked`, `unauthorized`) | The node's credential is refused. Three refused heartbeats with no accepted one between them park the agent: it stops calling the control plane and keeps probing with the heartbeat (see [Credential Park](../reference/core/heartbeat-service.md#credential-park)) |
 
 If a node misses **3 consecutive heartbeats** (i.e. no heartbeat received for `3 x heartbeat.interval`), the control plane marks the node as `unreachable` and notifies peer nodes. After **10 consecutive missed heartbeats**, the node is marked `offline` and its peers remove it from their active tunnel configuration. The node re-establishes tunnels automatically when it comes back online and resumes heartbeats.
 

@@ -172,6 +172,7 @@ Dedicated listener for the unauthenticated Kubernetes probe endpoints `/healthz`
 | The node holds a registered identity | `not ready: registration pending` |
 | The WireGuard interface is up and the deny-by-default firewall baseline is installed | `not ready: data plane not configured` |
 | The WireGuard interface is still present and up | `not ready: data plane lost` |
+| The control plane accepts the node's credential | `not ready: node credential refused` |
 | Event delivery to the control plane is working | `not ready: event delivery stopped` or `not ready: event delivery degraded` |
 | Every long-running subsystem is still running | `not ready: subsystem stopped` |
 
@@ -182,6 +183,8 @@ The data plane is re-checked rather than latched at startup, so an interface del
 `not ready: subsystem stopped` means a goroutine that should run for the life of the process exited before shutdown — the reconciler or the node API server. Nothing restarts them and `/healthz` stays `200` by design, so readiness is the only signal; the log line names which subsystem, the response body never does.
 
 For the delivery condition, `streaming` and `pull_only` both count as a working path and `degraded_polling` does not. `not ready: event delivery stopped` is separate: it means the SSE goroutine exited for good — a permanent failure or a rejected node secret — which the delivery mode alone cannot express, because the reconnect engine returns without ever transitioning it.
+
+`not ready: node credential refused` means the heartbeat parked after three refused heartbeats: the Node was removed from the control plane or its credential revoked (see [Credential Park](heartbeat-service.md#credential-park)). It is checked before event delivery because the SSE stream stops on the same refusal, and `not ready: event delivery stopped` would otherwise hide the cause. It clears when a heartbeat probe is accepted again. A stream that stopped is not restarted then, so the node answers `not ready: event delivery stopped` until a restart, while the reconciler's pull keeps it converged.
 
 Two consequences are worth knowing before you alert on readiness: the mode only turns to `degraded_polling` after the SSE polling-fallback window (default `5m`), so a node whose stream just broke still reports ready until the window elapses; and a node reports `200` in the short window between its data plane coming up and its first SSE connect. A restart that loads a persisted identity is ready without a fresh registration round-trip.
 

@@ -59,7 +59,13 @@ Kubernetes the pod goes NotReady until SSE reconnects.
 A stream that stops for good — a permanent failure, or a node secret the control
 plane rotated or revoked — never reaches `degraded_polling`: the reconnect engine
 returns instead, leaving the mode at its last value. `/readyz` covers that case
-separately and answers `503` with `not ready: event delivery stopped`.
+separately and answers `503` with `not ready: event delivery stopped`. For a
+stream stopped by a refused node secret, `/readyz` answers
+`not ready: node credential refused` once the heartbeat parks on the refusal
+(see [Credential Park](../reference/core/heartbeat-service.md#credential-park)).
+That reason is checked before event delivery, so it names the cause. If a later
+probe is accepted, the stopped stream is not restarted, and `/readyz` returns to
+`not ready: event delivery stopped` until plexd restarts.
 
 ### `pull_only`
 

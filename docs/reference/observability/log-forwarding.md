@@ -197,8 +197,8 @@ func NewMultiReporter(platform, local LogReporter, logger *slog.Logger) *MultiRe
 |-----------------|--------------|--------------|-------------|
 | success | success | `nil` | — |
 | error | success | platform error | — |
-| success | error | `nil` | Local error logged as warning |
-| error | error | platform error | Local error logged as warning |
+| success | error | `nil` | Local error logged as warning (Debug for `api.ErrCredentialRefused`) |
+| error | error | platform error | Local error logged as warning (Debug for `api.ErrCredentialRefused`) |
 
 Only the platform error is returned. The `Forwarder` uses the return value for retry/retain decisions—local failures must not trigger batch retention.
 
@@ -673,7 +673,7 @@ err := fwd.Run(ctx)
 
 - Collected `LogEntry` values are appended to an internal buffer protected by `sync.Mutex`
 - Buffer capacity is bounded at `2 * BatchSize` entries
-- When the buffer exceeds capacity, the oldest entries are dropped and a warning is logged with the count of dropped entries
+- When the buffer exceeds capacity, the oldest entries are dropped and a warning is logged with the count of dropped entries (at Debug while the heartbeat is parked on a refused credential)
 - On report tick, the buffer is swapped out atomically (lock, copy reference, set to nil, unlock)
 - Empty buffers skip the report call entirely
 - Large batches are split into multiple API calls of at most `BatchSize` entries each
@@ -811,9 +811,9 @@ type LogEntry struct {
 |---------------------------------|--------------------------------------------------------------|
 | Source returns error            | Log warn, skip source, continue with others                  |
 | Source panics                   | Recover panic, log error, continue with other sources        |
-| Reporter returns error          | Log warn, retain unsent entries in buffer, retry next cycle  |
+| Reporter returns error          | Log warn (debug for `api.ErrCredentialRefused`), retain unsent entries in buffer, retry next cycle |
 | All sources fail                | Empty buffer, report tick is a no-op                         |
-| Buffer exceeds capacity         | Drop oldest entries, log warn with dropped count             |
+| Buffer exceeds capacity         | Drop oldest entries, log warn (debug while the heartbeat is parked) with dropped count |
 | Context cancelled (shutdown)    | Best-effort flush, return `ctx.Err()`                        |
 | Log forwarding disabled         | Return nil immediately, no goroutines started                |
 
@@ -826,11 +826,13 @@ All log entries use `component=logfwd`.
 | `Info` | Log forwarding disabled            | `component`                 |
 | `Warn` | Source failed                      | `component`, `error`        |
 | `Warn` | Log report failed                  | `component`, `error`        |
-| `Warn` | Buffer overflow, dropping entries  | `component`, `dropped`      |
+| `Warn` (`Debug` while the heartbeat is parked) | Buffer overflow, dropping entries | `component`, `dropped` |
 | `Warn` | Event Log events dropped           | `component`, `dropped`, `error` |
 | `Warn` | Using cached credential            | `component`, `error`        |
 | `Warn` | Local log report failed            | `component`, `error`        |
 | `Info` | Local endpoint enabled             | `pipeline`, `url`           |
+
+While the heartbeat is parked on a refused credential (see [Quiet Failure Logs](../core/heartbeat-service.md#quiet-failure-logs)), `log report failed`, `local log report failed` and the `using cached credential` that follows a failed secret fetch log at Debug, with the same message and attributes, when their error is `api.ErrCredentialRefused`. So does `buffer overflow, dropping oldest entries`, which repeats on every collect cycle once the refused reports have filled the buffer. The `using cached credential` that follows a failed decrypt stays at Warn.
 
 ## Integration Points
 

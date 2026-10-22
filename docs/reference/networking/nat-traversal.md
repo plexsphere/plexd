@@ -234,7 +234,7 @@ Internal function that sends the discovered endpoint to the control plane and re
 
 `endpoint_clock_skew` (400) is deliberately **not** retried. `reported_at` is read from the same clock that produced the rejected timestamp, so an immediate second attempt carries an equally skewed value and is rejected identically — it would only double the request volume during the NTP incident that caused the skew. The heartbeat path already reports clock skew with the actionable "synchronize the system clock via NTP" guidance.
 
-`Discoverer.reportEndpoint` wraps `report` and owns the failure logging. A rejection means the control plane no longer holds this node's peer record; re-reporting cannot clear it, and because heartbeats keep succeeding, no other health signal turns red. Consecutive rejections are therefore counted: the first two log at `Warn`, the third and beyond log at `Error` with `consecutive_rejections`, which is alertable. A successful report clears the streak; a transient failure leaves it intact, since it says nothing about whether the peer record came back. Recovery still requires re-registration — the loop surfaces the condition rather than resolving it.
+`Discoverer.reportEndpoint` wraps `report` and owns the failure logging. A rejection means the control plane no longer holds this node's peer record; re-reporting cannot clear it, and because heartbeats keep succeeding, no other health signal turns red. Consecutive rejections are therefore counted: the first two log at `Warn`, the third and beyond log at `Error` with `consecutive_rejections`, which is alertable. A successful report clears the streak; a transient failure leaves it intact, since it says nothing about whether the peer record came back. A refused credential (`api.ErrCredentialRefused`) while the heartbeat is parked leaves it intact too, and logs `endpoint report failed` at `Debug` (see [Quiet Failure Logs](../core/heartbeat-service.md#quiet-failure-logs)). Recovery still requires re-registration — the loop surfaces the condition rather than resolving it.
 
 ## Local endpoint candidates
 
@@ -321,10 +321,10 @@ Step 24a starts the publisher when the WireGuard interface came up and `nat.loca
 | `Warn`  | `nat: endpoint candidates: read interfaces failed` | `error` |
 | `Warn`  | `nat: endpoint candidates: rejected, this node is not registered as a peer` | `code` (`endpoint_peer_not_found` or `endpoint_peer_gone`) |
 | `Warn`  | `nat: endpoint candidates: rejected for clock skew` | `error` |
-| `Warn`  | `nat: endpoint candidates: send failed` | `error` |
+| `Warn` (`Debug` for `api.ErrCredentialRefused`) | `nat: endpoint candidates: send failed` | `error` |
 | `Warn`  | `nat: endpoint candidates: control plane deadline shortens the report cadence` | `delay`, `refresh_interval`, `min_report_interval`, `stale_after` |
 
-`send failed` covers every failure the other lines do not, among them `400 malformed_endpoint_candidates`, `400 endpoint_candidate_unparseable`, `401`, `403`, `413`, `500`, a `501` with another code and a transport error. A peer rejection clears once the control plane registers the node, and a clock skew once NTP corrects the clock, so both are logged on every cycle rather than once.
+`send failed` covers every failure the other lines do not, among them `400 malformed_endpoint_candidates`, `400 endpoint_candidate_unparseable`, `401`, `403`, `413`, `500`, a `501` with another code and a transport error. A peer rejection clears once the control plane registers the node, and a clock skew once NTP corrects the clock, so both are logged on every cycle rather than once. A refused credential (`api.ErrCredentialRefused`), which the client returns without a request while the heartbeat is parked, logs `send failed` at `Debug`, because the heartbeat names the cause once when it parks (see [Quiet Failure Logs](../core/heartbeat-service.md#quiet-failure-logs)).
 
 ## STUN Protocol Details
 
@@ -400,6 +400,7 @@ The NAT discovery module registers no SSE handler. `plexd up` registers `peer_en
 | STUN refresh failure           | Log warn, keep previous endpoint, retry next cycle |
 | `endpoint_clock_skew` (400)   | Not retried; wrapped, logged at warn, waits for the next cycle |
 | `endpoint_peer_not_found` (404) / `endpoint_peer_gone` (410) | Count the streak; warn, then error from the third consecutive rejection. Heals only via re-registration |
+| Refused credential (`api.ErrCredentialRefused`, heartbeat parked) | Log debug, leave the rejection streak unchanged, continue refresh loop (see [Quiet Failure Logs](../core/heartbeat-service.md#quiet-failure-logs)) |
 | Endpoint report failure (other) | Log warn, continue refresh loop                  |
 | Context cancellation          | Clean abort, return `ctx.Err()`                    |
 
@@ -414,7 +415,7 @@ All log entries use `component=nat`.
 | `Warn`  | STUN binding failed                 | `server`, `error` (also covers a non-routable mapped address) |
 | `Warn`  | NAT classification incomplete       | (no second server responded)           |
 | `Warn`  | STUN refresh failed                 | `error`                                |
-| `Warn`  | Endpoint report failed              | `error`                                |
+| `Warn` (`Debug` for `api.ErrCredentialRefused`) | Endpoint report failed | `error`                       |
 | `Warn`  | Control plane deadline shortens the report cadence | `delay`, `refresh_interval`, `min_report_interval`, `stale_after` |
 | `Warn`/`Error` | Endpoint report rejected     | `error`, `consecutive_rejections` (404/410; `Error` from the third in a row) |
 | `Debug` | STUN binding succeeded              | `server`, `mapped_address`             |

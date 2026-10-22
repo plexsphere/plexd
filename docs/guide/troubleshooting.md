@@ -34,6 +34,36 @@ plexd logs     # View service logs
 
 Verify that the bootstrap token has not expired and that the node can reach the control plane API (`PLEXD_API`).
 
+## Node removed from the control plane
+
+```bash
+plexd status
+plexd logs | grep "credential refused"
+```
+
+When the Node is removed from the control plane, or its credential revoked, the control plane answers every heartbeat `401`. After three refused heartbeats with no accepted one between them, about 60s at the default interval, the agent parks: it stops calling the control plane and logs one Error line:
+
+```
+agent: heartbeat: node credential refused, the Node was removed from the control plane or its credential revoked; control-plane calls suspended
+```
+
+The line carries `node_id`, `code` (the problem code of the refusal, `nsk_invalid` for a removed Node), `consecutive`, `next_probe` and `enrol_again`. The two refused heartbeats before it log a Warn, `agent: heartbeat: credential refused`. While parked, the other loops log their refused calls at Debug, so the park line is the one to look for (see [Quiet Failure Logs](../reference/core/heartbeat-service.md#quiet-failure-logs)). A long park fills the buffers of the metrics, log and audit pipelines, which then keep only their newest entries; the log and audit forwarders log that overflow at Debug as well. `plexd status` prints the same cause after the counts:
+
+```
+The control plane refuses this node's credential: the Node was removed or its credential revoked.
+To enrol again, run 'plexd deregister', provide a fresh bootstrap token, and restart plexd.
+```
+
+`/readyz` answers `503` with `not ready: node credential refused`. The WireGuard interface, the firewall, the mesh server and the local node API stay up.
+
+To enrol the machine again:
+
+1. Run `plexd deregister` to remove the old identity (see [`plexd deregister`](../reference/core/cli.md#plexd-deregister)).
+2. Provide a fresh bootstrap token from the control plane (see [Source Priority](../reference/core/registration.md#source-priority) for where plexd reads it).
+3. Restart plexd. It registers as a new Node.
+
+A fault on the control plane side refuses the credential the same way and parks the agent with the same line. The agent keeps probing with the heartbeat, after 1, 3, 7, 15, 31 and 63 minutes at the default interval and hourly after that, and resumes on its own on the next accepted probe. It then logs `agent: heartbeat: node credential accepted again, control-plane calls resumed`. If the Node still exists on the control plane, wait for that probe instead of enrolling again.
+
 ## No peers connected
 
 ```bash

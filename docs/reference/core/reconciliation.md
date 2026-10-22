@@ -129,7 +129,7 @@ Each cycle follows this sequence:
 ```mermaid
 flowchart TD
     START([Tick / Trigger]) --> FETCH[FetchState]
-    FETCH -->|error| SKIP_ERR[Log warn, skip cycle]
+    FETCH -->|error| SKIP_ERR[Log warn or debug, skip cycle]
     FETCH -->|ok| DISPATCH[Invoke dispatch handlers]
     DISPATCH --> DIFF[ComputeDiff]
     DIFF --> EMPTY{Diff empty?}
@@ -155,7 +155,7 @@ flowchart TD
 
 | Error Source       | Behavior                                              |
 |--------------------|-------------------------------------------------------|
-| `FetchState` error | Logged at warn, tick skipped, loop continues          |
+| `FetchState` error | Logged at warn, or at debug for `api.ErrCredentialRefused` while the heartbeat is parked (see [Quiet Failure Logs](heartbeat-service.md#quiet-failure-logs)); tick skipped, loop continues |
 | Handler error      | Logged at error, other handlers still run, snapshot held back |
 | Handler panic      | Recovered with stack trace, treated as error          |
 | Dispatch handler panic | Recovered with stack trace, logged at error; never counts as a handler failure and never holds the snapshot back |
@@ -173,7 +173,7 @@ All log entries use structured keys with `component=reconcile`:
 | `drift`          | Compact `diff.Summary()`, e.g. `"peers+1-0~2 policy bridge state reports"` (or `"none"`) |
 | `duration`       | Cycle execution time                 |
 | `handler_failed` | Whether any handler returned error   |
-| `error`          | Error details (on warn/error levels) |
+| `error`          | Error details (on warn/error levels, and on the debug-level `FetchState failed` for a refused credential) |
 
 ## StateDiff
 

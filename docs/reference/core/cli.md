@@ -53,7 +53,7 @@ plexd up [--config /path/to/config.yaml] [--log-level debug]
 5e. Initialize bridge subsystem (bridge mode only — ACME, ingress, user access, site-to-site)
 6. Create SSE manager with handlers for signing keys, WireGuard peers, tunnel, policy, and bridge events
 7. Create reconciler with handlers for WireGuard, policy, and bridge reconciliation
-8. Create heartbeat service with subsystem status enrichment, auth-failure, and key-rotation callbacks
+8. Create heartbeat service with subsystem status enrichment and key-rotation callbacks; its credential-refused callback is set in step 12, once the node API server exists
 9. Create integrity store + verifier
 10. Create action executor, register 11 built-in actions, register the action dispatcher on the reconciler, report capabilities
 11. Create hook watcher
@@ -191,6 +191,22 @@ plexd status
 ```
 
 Displays metadata entry count, data key count, secret key count, and report key count. If the agent is not running, prints an error.
+
+When the control plane refuses the node's credential and the agent has parked (see [Credential Park](heartbeat-service.md#credential-park)), the metadata carries `control_plane_credential: refused`, and two lines follow the counts after a blank line:
+
+```
+Metadata entries: 2
+Data keys:        0
+Secret keys:      0
+Report keys:      0
+
+The control plane refuses this node's credential: the Node was removed or its credential revoked.
+To enrol again, run 'plexd deregister', provide a fresh bootstrap token, and restart plexd.
+
+Metadata:
+  control_plane_credential: refused
+  delivery_mode: streaming
+```
 
 ### `plexd peers`
 
