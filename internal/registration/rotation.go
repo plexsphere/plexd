@@ -72,8 +72,8 @@ func ClearPendingKey(dataDir string) error {
 // receipt keeps the previous LastRotation, which happens when the server answers
 // 422 unchanged on a crash-retry of an already-committed rotation. Rotation only
 // ever owns private_key and last_rotation; every other identity field is taken
-// from disk, so a re-registration that happened after id was loaded is not
-// overwritten with the caller's stale copy.
+// from disk, so a registration that wrote the identity after id was loaded is
+// not overwritten with the caller's stale copy.
 func CommitRotatedKey(dataDir string, id *NodeIdentity, kp *Keypair, receipt *RotationReceipt) error {
 	// identityMu makes the read-modify-write below atomic against a concurrent
 	// SaveIdentity; see its declaration for what interleaving would otherwise
@@ -81,9 +81,10 @@ func CommitRotatedKey(dataDir string, id *NodeIdentity, kp *Keypair, receipt *Ro
 	identityMu.Lock()
 	defer identityMu.Unlock()
 
-	// Re-read identity.json first: id may predate a re-registration that wrote a
+	// Re-read identity.json first: id may predate a registration that wrote a
 	// new node_id, mesh_ip, and node_secret_key. Serialising the caller's copy
-	// would rebind the on-disk credential to the deleted node's identity.
+	// would rebind the on-disk credential to a node the control plane no longer
+	// knows.
 	current, err := LoadIdentity(dataDir)
 	if err != nil {
 		return fmt.Errorf("registration: commit rotated key: %w", err)

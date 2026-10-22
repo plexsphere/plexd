@@ -616,7 +616,6 @@ func runAgent(ctx context.Context) error {
 	}
 	heartbeat := agent.NewHeartbeatService(hbCfg, client, logger)
 	heartbeat.SetReconcileTrigger(reconciler)
-	heartbeat.SetOnAuthFailure(reRegisterOnAuthFailure(ctx, registrar, logger))
 	heartbeat.SetOnRotateKeys(func() {
 		logger.Info("heartbeat signaled key rotation, starting key rotation")
 		go func() {
@@ -1717,30 +1716,6 @@ func discoveredPlexdHooks(hooks []kubernetes.PlexdHook, logger *slog.Logger) []a
 		out = out[:maxPlexdHooks]
 	}
 	return out
-}
-
-// reRegisterOnAuthFailure returns the heartbeat's auth-failure callback: a
-// heartbeat the control plane refuses means the node's credential is no longer
-// accepted, and re-registering is the only recovery the agent can perform on
-// its own.
-//
-// The callback deliberately leaves the credential alone. Register arms the
-// shared client with the bearer envelope itself, on both of its paths, so the
-// recovery is complete when it returns. Setting the token here from the
-// returned identity — as this callback once did, with the raw base64
-// NodeSecretKey — replaces the envelope with a credential the control plane
-// answers 401 to, so the next heartbeat fails the same way and the fallback
-// that exists to recover the node is what keeps it broken.
-func reRegisterOnAuthFailure(ctx context.Context, registrar *registration.Registrar, logger *slog.Logger) func() {
-	return func() {
-		logger.Warn("heartbeat auth failure, attempting re-registration")
-		newIdentity, err := registrar.Register(ctx)
-		if err != nil {
-			logger.Error("re-registration failed", "error", err)
-			return
-		}
-		logger.Info("re-registration successful", "node_id", newIdentity.NodeID)
-	}
 }
 
 // controlPlaneReporter adapts api.ControlPlane to the integrity.ViolationReporter interface.

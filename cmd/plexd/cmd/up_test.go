@@ -1547,15 +1547,6 @@ func (cp *authRecordingControlPlane) registerCount() int {
 	return cp.registrations
 }
 
-// authFor returns the Authorization header last seen on path, and whether the
-// path was requested at all.
-func (cp *authRecordingControlPlane) authFor(path string) (string, bool) {
-	cp.mu.Lock()
-	defer cp.mu.Unlock()
-	auth, ok := cp.auth[path]
-	return auth, ok
-}
-
 // allAuth returns the Authorization header last seen on each path.
 func (cp *authRecordingControlPlane) allAuth() map[string]string {
 	cp.mu.Lock()
@@ -1726,61 +1717,10 @@ func TestRunUp_PresentsBearerEnvelopeAfterRegistration(t *testing.T) {
 	})
 }
 
-// The heartbeat's auth-failure fallback is the only recovery the agent can
-// perform on its own from a refused credential, and re-arming the client after
-// it is what turned that recovery into the thing that guaranteed the failure:
-// Register leaves the envelope on the client, an assignment after it replaced
-// the envelope with a credential the control plane answers 401 to, and the next
-// heartbeat one interval later failed the same way, indefinitely.
-func TestReRegisterOnAuthFailure_LeavesTheRegistrarsEnvelopeArmed(t *testing.T) {
-	cp, apiBase := newAuthRecordingControlPlane(t)
-	client, err := api.NewControlPlane(api.Config{BaseURL: apiBase}, "test", discardLogger())
-	if err != nil {
-		t.Fatalf("create client: %v", err)
-	}
-	// What a 401 heartbeat means: the credential on the client is one the
-	// control plane no longer accepts.
-	client.SetAuthToken("stale-credential")
-
-	registrar := newRegistrar(client, registration.Config{
-		DataDir:          t.TempDir(),
-		TokenValue:       "psb_test_token",
-		ProjectID:        "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0",
-		ResourceHandle:   "auth-failure-test",
-		MaxRetryDuration: time.Second,
-	}, discardLogger())
-
-	reRegisterOnAuthFailure(context.Background(), registrar, discardLogger())()
-
-	if n := cp.registerCount(); n != 1 {
-		t.Fatalf("control plane saw %d registrations, want 1 from the fallback", n)
-	}
-
-	// The credential is only observable in what the client sends, which is also
-	// the only form in which it matters.
-	if _, err := client.Heartbeat(context.Background(), upTestNodeID, api.HeartbeatRequest{}); err != nil {
-		t.Fatalf("Heartbeat after re-registration: %v", err)
-	}
-	path := "/v1/nodes/" + upTestNodeID + "/heartbeat"
-	got, ok := cp.authFor(path)
-	if !ok {
-		t.Fatalf("control plane saw no request on %s", path)
-	}
-	if want := wantBearerEnvelope(t, upTestNodeID, upTestNSKBytes); got != want {
-		t.Errorf("Authorization after the fallback = %q, want the new identity's envelope %q", got, want)
-	}
-	if got == "Bearer "+upTestNSK {
-		t.Error("the fallback left the raw nsk on the client, so the next heartbeat 401s the same way")
-	}
-	if got == "Bearer stale-credential" {
-		t.Error("the fallback left the refused credential on the client")
-	}
-}
-
 // The one rule that keeps the two layers from drifting apart again: the
 // registrar owns the client's bearer, and nothing else assigns it. The
-// production code is the subject — a test may still arm a client to set a
-// scenario up, as the fallback test above does.
+// production code is the subject: a test may still arm a client to set a
+// scenario up.
 func TestNoProductionCodeOutsideRegistrationSetsTheBearer(t *testing.T) {
 	root := filepath.Join("..", "..", "..")
 	// Where the credential is legitimately owned or defined.
