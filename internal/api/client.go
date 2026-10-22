@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,6 +38,10 @@ type ControlPlane struct {
 
 	mu        sync.RWMutex
 	authToken string
+
+	// credentialRefused gates every request that presents the bearer; see
+	// SetCredentialRefused.
+	credentialRefused atomic.Bool
 }
 
 // NewControlPlane creates a new ControlPlane client with the given configuration.
@@ -98,6 +103,47 @@ func withoutAuth(ctx context.Context) context.Context {
 // authSuppressed reports whether ctx was marked by withoutAuth.
 func authSuppressed(ctx context.Context) bool {
 	return ctx.Value(noAuthKey{}) != nil
+}
+
+// SetCredentialRefused marks the node's credential as refused by the control
+// plane, or clears that mark. While it is set, every request that would present
+// the bearer fails with ErrCredentialRefused before any I/O, so a removed Node
+// stops calling the control plane. Two requests are exempt: POST /v1/register,
+// which carries no bearer, and the heartbeat, which is the probe that decides
+// when the mark is cleared again.
+func (c *ControlPlane) SetCredentialRefused(refused bool) {
+	c.credentialRefused.Store(refused)
+}
+
+// CredentialRefused reports whether the credential is currently marked refused.
+func (c *ControlPlane) CredentialRefused() bool {
+	return c.credentialRefused.Load()
+}
+
+// credentialProbeKey marks a request context as the credential probe, which
+// the refused-credential gate lets through.
+type credentialProbeKey struct{}
+
+// asCredentialProbe returns a context whose request passes the
+// refused-credential gate. Only the heartbeat uses it: it is the one call that
+// must keep asking the control plane whether the credential is accepted again.
+func asCredentialProbe(ctx context.Context) context.Context {
+	return context.WithValue(ctx, credentialProbeKey{}, struct{}{})
+}
+
+// isCredentialProbe reports whether ctx was marked by asCredentialProbe.
+func isCredentialProbe(ctx context.Context) bool {
+	return ctx.Value(credentialProbeKey{}) != nil
+}
+
+// refusedCredentialGate returns ErrCredentialRefused when the credential is
+// marked refused and the request built from ctx is neither unauthenticated
+// (withoutAuth) nor the credential probe.
+func (c *ControlPlane) refusedCredentialGate(ctx context.Context) error {
+	if c.credentialRefused.Load() && !authSuppressed(ctx) && !isCredentialProbe(ctx) {
+		return ErrCredentialRefused
+	}
+	return nil
 }
 
 // getAuthToken returns the current bearer token.
@@ -256,6 +302,10 @@ func (c *ControlPlane) sendRequest(ctx context.Context, method, path string, bod
 // silently muted the capability report on every node whose manifest crossed the
 // threshold.
 func (c *ControlPlane) newRequest(ctx context.Context, method, path, contentType string, raw []byte, allowGzip bool) (*http.Request, error) {
+	if err := c.refusedCredentialGate(ctx); err != nil {
+		return nil, err
+	}
+
 	var bodyReader io.Reader
 	var compressed bool
 

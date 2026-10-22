@@ -28,6 +28,11 @@ func (c *ControlPlane) Register(ctx context.Context, req RegisterRequest) (*Regi
 // The caller is responsible for closing the response body.
 // GET /v1/nodes/{node_id}/events
 func (c *ControlPlane) ConnectSSE(ctx context.Context, nodeID, lastEventID string) (*http.Response, error) {
+	// The stream builds its own request rather than going through newRequest,
+	// so it checks the refused-credential gate itself.
+	if err := c.refusedCredentialGate(ctx); err != nil {
+		return nil, err
+	}
 	path := fmt.Sprintf("/v1/nodes/%s/events", url.PathEscape(nodeID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
@@ -59,10 +64,13 @@ func (c *ControlPlane) ConnectSSE(ctx context.Context, nodeID, lastEventID strin
 
 // Heartbeat sends a heartbeat to the control plane.
 // POST /v1/nodes/{node_id}/heartbeat
+//
+// The heartbeat is never stopped by the refused-credential gate: it is the
+// probe whose acceptance clears the mark (see SetCredentialRefused).
 func (c *ControlPlane) Heartbeat(ctx context.Context, nodeID string, req HeartbeatRequest) (*HeartbeatResponse, error) {
 	var resp HeartbeatResponse
 	path := fmt.Sprintf("/v1/nodes/%s/heartbeat", url.PathEscape(nodeID))
-	if err := c.doRequest(ctx, http.MethodPost, path, req, &resp); err != nil {
+	if err := c.doRequest(asCredentialProbe(ctx), http.MethodPost, path, req, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil

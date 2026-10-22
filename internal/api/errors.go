@@ -77,6 +77,14 @@ var (
 	ErrServer          = &APIError{StatusCode: 500, Message: "server error"}
 )
 
+// ErrCredentialRefused is returned before any HTTP request by every call that
+// presents the node's bearer credential while the client is marked refused
+// (see ControlPlane.SetCredentialRefused). The heartbeat marks it after the
+// control plane keeps answering 401, which is how a removed Node's agent stops
+// calling at its usual rates. It is deliberately not an *APIError: no response
+// was received, so errors.Is(err, ErrUnauthorized) stays false for it.
+var ErrCredentialRefused = errors.New("api: node credential refused by the control plane, requests suspended until a heartbeat is accepted")
+
 // ErrSecretNameInvalid is returned by FetchSecret before any HTTP request
 // when the requested secret name is outside the contract's name grammar.
 var ErrSecretNameInvalid = fmt.Errorf("secret name is outside the grammar %s", secretNamePattern)

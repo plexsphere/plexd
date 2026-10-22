@@ -31,6 +31,12 @@ const (
 
 // ClassifyError determines the appropriate reconnection action for an error.
 func ClassifyError(err error) FailureAction {
+	// A refused credential fails before any request, so it is no *APIError,
+	// and the early return below would read it as a transient network error.
+	// It is the 401 the heartbeat already saw, so it is classified as one.
+	if errors.Is(err, ErrCredentialRefused) {
+		return RetryAuth
+	}
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) {
 		// Network errors or other non-API errors are transient
