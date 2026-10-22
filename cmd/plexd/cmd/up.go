@@ -772,6 +772,12 @@ func runAgent(ctx context.Context) error {
 	sseMgr.SetOnModeChange(onModeChange)
 	onModeChange(sseMgr.Mode())
 
+	// When the heartbeat parks on a credential the control plane keeps
+	// refusing, gate the shared client and surface the refusal in `plexd
+	// status` and readiness; an accepted probe lifts all three again. The
+	// heartbeat starts below, so the callback is in place before its first send.
+	heartbeat.SetOnCredentialRefused(credentialRefusedPublisher(client, nodeAPISrv.Cache(), healthSrv))
+
 	// Register nodeapi reconcile handler so cache updates on drift. The pull is
 	// authoritative: node_state_updated triggers a reconcile (see above), and
 	// this handler refreshes the node API cache from the resulting snapshot.
@@ -1734,6 +1740,24 @@ func deliveryModePublisher(cache *nodeapi.StateCache, logger *slog.Logger) func(
 	return func(mode api.DeliveryMode) {
 		cache.SetDeliveryMode(string(mode))
 		logger.Info("event delivery mode changed", "mode", mode)
+	}
+}
+
+// credentialRefusedPublisher returns the heartbeat's credential-refused
+// callback, which fans one transition out to the shared client's gate, the
+// node-API cache metadata and the health listener's readiness state. healthSrv
+// is nil when the health listener is disabled.
+//
+// The client goes first, so no loop sends a request between the heartbeat's
+// decision to park and the gate that stops it. It logs nothing: the heartbeat
+// logs the refusal and the recovery itself.
+func credentialRefusedPublisher(client *api.ControlPlane, cache *nodeapi.StateCache, healthSrv *health.Server) func(bool) {
+	return func(refused bool) {
+		client.SetCredentialRefused(refused)
+		cache.SetCredentialRefused(refused)
+		if healthSrv != nil {
+			healthSrv.SetCredentialRefused(refused)
+		}
 	}
 }
 

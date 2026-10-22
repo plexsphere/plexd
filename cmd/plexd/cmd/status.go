@@ -44,6 +44,15 @@ func runStatus(cmd *cobra.Command, _ []string) error {
 	fmt.Fprintf(w, "Secret keys:      %d\n", len(summary.SecretKeys))
 	fmt.Fprintf(w, "Report keys:      %d\n", len(summary.ReportKeys))
 
+	// The agent overlays this key while the heartbeat is parked on a credential
+	// the control plane refuses. Nothing the agent does on its own recovers a
+	// removed Node, so the operator gets the cause and the way back up front.
+	if summary.Metadata["control_plane_credential"] == "refused" {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "The control plane refuses this node's credential: the Node was removed or its credential revoked.")
+		fmt.Fprintln(w, "To enrol again, run 'plexd deregister', provide a fresh bootstrap token, and restart plexd.")
+	}
+
 	if len(summary.Metadata) > 0 {
 		fmt.Fprintln(w, "\nMetadata:")
 		for k, v := range summary.Metadata {
