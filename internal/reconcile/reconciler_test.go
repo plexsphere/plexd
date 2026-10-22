@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -587,6 +588,51 @@ func TestReconciler_NoDispatchOnFetchError(t *testing.T) {
 	}
 	if fetcher.getFetchCount() != 2 {
 		t.Errorf("FetchState called %d times, want 2", fetcher.getFetchCount())
+	}
+}
+
+// While the heartbeat has parked the agent, every pull fails locally with
+// api.ErrCredentialRefused. The heartbeat names the cause once, so the
+// reconciler must not repeat it as a Warn on every cycle.
+func TestReconciler_FetchStateFailureLogLevel(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantLevel slog.Level
+	}{
+		{name: "refused credential", err: fmt.Errorf("x: %w", api.ErrCredentialRefused), wantLevel: slog.LevelDebug},
+		{name: "other error", err: errors.New("boom"), wantLevel: slog.LevelWarn},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fetcher := &mockFetcher{
+				fetchFunc: func(_ context.Context, _ string) (*api.NodeStateSnapshot, error) {
+					return nil, tt.err
+				},
+			}
+			logs := newRecordingHandler()
+			r := NewReconciler(fetcher, Config{Interval: time.Hour}, slog.New(logs))
+
+			r.runCycle(context.Background(), "node-1")
+
+			if n := logs.count("FetchState failed"); n != 1 {
+				t.Fatalf("FetchState failed records = %d, want 1; got %v", n, logs.all())
+			}
+			rec := logs.last(t, "FetchState failed")
+			if rec.level != tt.wantLevel {
+				t.Errorf("level = %v, want %v", rec.level, tt.wantLevel)
+			}
+			wantString(t, rec, "component", "reconcile")
+			wantString(t, rec, "node_id", "node-1")
+			wantString(t, rec, "error", tt.err.Error())
+			if tt.wantLevel == slog.LevelDebug {
+				for _, other := range logs.all() {
+					if other.level >= slog.LevelWarn {
+						t.Errorf("record %q at %v, want nothing at Warn or above for a refused credential", other.msg, other.level)
+					}
+				}
+			}
+		})
 	}
 }
 

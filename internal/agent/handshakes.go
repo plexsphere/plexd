@@ -158,7 +158,10 @@ func (r *HandshakeReporter) reportOnce(ctx context.Context) {
 // unprovisioned ingest: the reporter keeps sending on its interval and the
 // condition clears by itself once the control plane is upgraded, so it is not
 // worth a warning per tick. A clock skew refusal is logged at Error naming the
-// fix, since it repeats on every tick until the operator acts.
+// fix, since it repeats on every tick until the operator acts. A refused
+// credential is a send failure logged at Debug: the heartbeat names the cause
+// once when it parks the agent, and every tick until a probe is accepted would
+// repeat it as a Warn.
 func (r *HandshakeReporter) logSendError(ctx context.Context, err error) {
 	if ctx.Err() != nil {
 		return
@@ -167,6 +170,8 @@ func (r *HandshakeReporter) logSendError(ctx context.Context, err error) {
 	var apiErr *api.APIError
 	isAPIErr := errors.As(err, &apiErr)
 	switch {
+	case errors.Is(err, api.ErrCredentialRefused):
+		r.logger.DebugContext(ctx, "agent: handshake report: send failed", "error", err)
 	case api.IsHandshakeReportNotServed(err):
 		if !r.notServed {
 			r.logger.InfoContext(ctx, "agent: handshake report: control plane does not accept handshake reports, retrying every interval",

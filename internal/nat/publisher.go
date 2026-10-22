@@ -125,10 +125,12 @@ func (p *CandidatePublisher) cycle(ctx context.Context, reporter CandidateReport
 // that arrives once ctx is done is the shutdown itself and is not logged.
 // A control plane that does not serve the operation is logged once, at Info,
 // since it is the expected state until the control plane ships the
-// operation. Every other failure is a Warn on every cycle: none of them says
-// the operation is missing, and each may clear on a later cycle, a peer
-// rejection once the control plane registers the node and a clock skew once
-// NTP corrects the clock.
+// operation. A refused credential is a send failure logged at Debug, since
+// the heartbeat names the cause once when it parks the agent. Every other
+// failure is a Warn on every cycle: none of them says the operation is
+// missing, and each may clear on a later cycle, a peer rejection once the
+// control plane registers the node and a clock skew once NTP corrects the
+// clock.
 func (p *CandidatePublisher) logFailure(ctx context.Context, err error) {
 	if ctx.Err() != nil {
 		return
@@ -136,6 +138,8 @@ func (p *CandidatePublisher) logFailure(ctx context.Context, err error) {
 	var apiErr *api.APIError
 	isAPIErr := errors.As(err, &apiErr)
 	switch {
+	case errors.Is(err, api.ErrCredentialRefused):
+		p.logger.Debug("nat: endpoint candidates: send failed", "error", err)
 	case api.IsEndpointCandidatesNotServed(err):
 		if !p.notServed {
 			p.logger.Info("nat: endpoint candidates: control plane does not accept endpoint candidates, retrying every interval",

@@ -322,6 +322,93 @@ func TestReportSyncer_TransportErrorRetriesOnTimer(t *testing.T) {
 	<-done
 }
 
+// While the heartbeat has parked the agent, every publish fails locally with
+// api.ErrCredentialRefused. The heartbeat names the cause once, so the syncer
+// logs the failure at Debug instead of a Warn per key and round, and keeps the
+// key dirty as for any other retryable failure.
+func TestReportSyncer_RefusedCredentialLoggedAtDebug(t *testing.T) {
+	refused := fmt.Errorf("x: %w", api.ErrCredentialRefused)
+	tests := []struct {
+		name      string
+		delete    bool
+		err       error
+		wantMsg   string
+		wantLevel slog.Level
+	}{
+		{name: "put, refused credential", err: refused, wantMsg: "report put failed", wantLevel: slog.LevelDebug},
+		{name: "put, other error", err: errors.New("boom"), wantMsg: "report put failed", wantLevel: slog.LevelWarn},
+		{name: "delete, refused credential", delete: true, err: refused, wantMsg: "report delete failed", wantLevel: slog.LevelDebug},
+		{name: "delete, other error", delete: true, err: errors.New("boom"), wantMsg: "report delete failed", wantLevel: slog.LevelWarn},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fail := func(string) error { return tt.err }
+			client := &fakeReportClient{putErr: fail, deleteErr: fail}
+			s, rec := newTestSyncer(client, 10*time.Millisecond)
+
+			if tt.delete {
+				s.NotifyChange(nil, []string{"cpu-load"})
+			} else {
+				s.NotifyChange([]ReportEntry{reportEntry("cpu-load", `{"v":1}`, 1)}, nil)
+			}
+			if !s.flush(context.Background(), "node-1") {
+				t.Error("flush returned false, want true (the failed key stays dirty for a retry)")
+			}
+			if got := dirtyKeys(s); !reflect.DeepEqual(got, []string{"cpu-load"}) {
+				t.Errorf("dirty keys = %v, want [cpu-load]", got)
+			}
+			if n := rec.count(tt.wantLevel, tt.wantMsg); n != 1 {
+				t.Errorf("%v logs %q = %d, want 1", tt.wantLevel, tt.wantMsg, n)
+			}
+			if tt.wantLevel == slog.LevelDebug {
+				if n := rec.count(slog.LevelWarn, "") + rec.count(slog.LevelError, ""); n != 0 {
+					t.Errorf("logs at Warn or above = %d, want 0 for a refused credential", n)
+				}
+			}
+		})
+	}
+}
+
+// A put the gate refused is delivered by the retry once the agent resumes.
+func TestReportSyncer_RefusedPutDeliveredOnRetry(t *testing.T) {
+	attempts := 0
+	client := &fakeReportClient{
+		putErr: func(string) error {
+			attempts++
+			if attempts == 1 {
+				return fmt.Errorf("x: %w", api.ErrCredentialRefused)
+			}
+			return nil
+		},
+	}
+	s, rec := newTestSyncer(client, 10*time.Millisecond)
+
+	s.NotifyChange([]ReportEntry{reportEntry("cpu-load", `{"v":1}`, 1)}, nil)
+	if !s.flush(context.Background(), "node-1") {
+		t.Error("refused flush returned false, want true (retry armed)")
+	}
+	if got := dirtyKeys(s); !reflect.DeepEqual(got, []string{"cpu-load"}) {
+		t.Fatalf("dirty keys after the refused put = %v, want [cpu-load]", got)
+	}
+	if n := rec.count(slog.LevelWarn, "report put failed"); n != 0 {
+		t.Errorf("warn logs for the refused put = %d, want 0", n)
+	}
+
+	if s.flush(context.Background(), "node-1") {
+		t.Error("retry flush returned true, want false (the put was accepted)")
+	}
+	puts := client.putCalls()
+	if len(puts) != 2 {
+		t.Fatalf("PutStateReport calls = %d, want 2 (the refused put and the retry)", len(puts))
+	}
+	if puts[1].key != "cpu-load" || puts[1].req.Value != `{"v":1}` {
+		t.Errorf("retried put = %s %q, want cpu-load %q", puts[1].key, puts[1].req.Value, `{"v":1}`)
+	}
+	if got := dirtyKeys(s); len(got) != 0 {
+		t.Errorf("dirty keys after the retry = %v, want none", got)
+	}
+}
+
 func TestReportSyncer_CancellationPreservesDirty(t *testing.T) {
 	client := &fakeReportClient{}
 	// A long debounce so the change is never flushed before we cancel.

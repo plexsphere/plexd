@@ -413,6 +413,39 @@ func TestCandidatePublisher_FailuresWarnAndWaitRefreshInterval(t *testing.T) {
 	}
 }
 
+// While the heartbeat has parked the agent, every report fails locally with
+// api.ErrCredentialRefused. The heartbeat names the cause once, so the
+// publisher logs the failure at Debug and keeps its cadence.
+func TestCandidatePublisher_RefusedCredentialLoggedAtDebug(t *testing.T) {
+	const sendFailedMsg = "nat: endpoint candidates: send failed"
+	tests := []struct {
+		name      string
+		err       error
+		wantLevel string
+	}{
+		{name: "refused credential", err: fmt.Errorf("x: %w", api.ErrCredentialRefused), wantLevel: "level=DEBUG"},
+		{name: "other error", err: errors.New("boom"), wantLevel: "level=WARN"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := &syncBuffer{}
+			p := newTestPublisher(staticGather("10.0.0.5:51820"), logs)
+			reporter := newFakeCandidateReporter(candidateAnswer{err: tt.err})
+
+			if got := p.cycle(context.Background(), reporter, "node-1"); got != 50*time.Millisecond {
+				t.Errorf("cycle delay = %v, want RefreshInterval (50ms) after a failure", got)
+			}
+			lines := logLines(logs, sendFailedMsg)
+			if len(lines) != 1 || !strings.Contains(lines[0], tt.wantLevel) || !strings.Contains(lines[0], "error=") {
+				t.Errorf("%q lines = %q, want one %s carrying the error", sendFailedMsg, lines, tt.wantLevel)
+			}
+			if tt.wantLevel == "level=DEBUG" && (strings.Contains(logs.String(), "level=WARN") || strings.Contains(logs.String(), "level=ERROR")) {
+				t.Errorf("logs = %s, want nothing at Warn or above for a refused credential", logs.String())
+			}
+		})
+	}
+}
+
 func TestCandidatePublisher_PublishedOnFirstAndChangedSets(t *testing.T) {
 	logs := &syncBuffer{}
 	sets := []struct {

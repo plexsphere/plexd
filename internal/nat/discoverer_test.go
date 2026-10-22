@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -649,6 +650,46 @@ func TestReportEndpoint_EscalatesConsecutiveRejections(t *testing.T) {
 	d.reportEndpoint(context.Background(), reporter, "node-1", result)
 	if d.rejections != 0 {
 		t.Errorf("rejections = %d after success, want 0", d.rejections)
+	}
+}
+
+// While the heartbeat has parked the agent, every report fails locally with
+// api.ErrCredentialRefused. The heartbeat names the cause once, so the
+// discoverer logs the failure at Debug instead of a Warn per cycle.
+func TestReportEndpoint_RefusedCredentialLoggedAtDebug(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantLevel string
+	}{
+		{name: "refused credential", err: fmt.Errorf("x: %w", api.ErrCredentialRefused), wantLevel: "level=DEBUG"},
+		{name: "other error", err: errors.New("boom"), wantLevel: "level=WARN"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			d := &Discoverer{
+				cfg:    Config{RefreshInterval: time.Minute, MinReportInterval: 10 * time.Second},
+				logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+			}
+			reporter := &mockReporter{errs: []error{tt.err}}
+			result := &DiscoveryResult{Endpoint: "203.0.113.1:12345", NATType: NATFullCone}
+
+			d.reportEndpoint(context.Background(), reporter, "node-1", result)
+
+			logged := buf.String()
+			if n := strings.Count(logged, `msg="endpoint report failed"`); n != 1 {
+				t.Fatalf("endpoint report failed lines = %d, want 1; logs:\n%s", n, logged)
+			}
+			for _, want := range []string{tt.wantLevel, "component=nat", "error="} {
+				if !strings.Contains(logged, want) {
+					t.Errorf("log %q, want it to contain %q", logged, want)
+				}
+			}
+			if tt.wantLevel == "level=DEBUG" && (strings.Contains(logged, "level=WARN") || strings.Contains(logged, "level=ERROR")) {
+				t.Errorf("log %q, want nothing at Warn or above for a refused credential", logged)
+			}
+		})
 	}
 }
 
