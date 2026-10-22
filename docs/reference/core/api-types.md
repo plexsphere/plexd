@@ -161,7 +161,7 @@ there.
 | `PublicKey`        | `string` | `"public_key"`                  | Peer WireGuard public key     |
 | `Endpoint`         | `string` | `"endpoint,omitempty"`          | Peer's direct WireGuard endpoint as `host:port` (an IPv6 host in brackets), the address it last reported through `PUT /v1/nodes/{node_id}/endpoint`; absent while the peer has no fresh observation |
 | `FallbackEndpoint` | `string` | `"fallback_endpoint,omitempty"` | Optional relay/fallback endpoint |
-| `EndpointCandidates` | `[]string` | `"endpoint_candidates,omitempty"` | The peer's last accepted, unexpired endpoint candidates (`PUT /v1/nodes/{node_id}/endpoint-candidates`) as `host:port` strings, in the order the peer sent them; absent when the peer has none and on every control plane that does not deliver them |
+| `EndpointCandidates` | `[]string` | `"endpoint_candidates,omitempty"` | The peer's endpoint candidates as `host:port` strings, at most 8: first its peer-observed endpoints, the addresses at which at least two live nodes of the Domain report a direct handshake with it, then its last accepted, unexpired local candidates (`PUT /v1/nodes/{node_id}/endpoint-candidates`) in the order it sent them (see [State](api-endpoints.md#get-v1-nodes-node-id-state)); absent when the peer has none and on every control plane that does not deliver them |
 
 **ReachabilitySnapshot**
 

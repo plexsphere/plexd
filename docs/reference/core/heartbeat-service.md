@@ -175,7 +175,7 @@ Every heartbeat line carries `component=heartbeat`.
 
 ## Handshake Reporter
 
-`HandshakeReporter` (`internal/agent/handshakes.go`) reports, for every mesh peer, the age of the latest completed WireGuard handshake and the endpoint WireGuard used for it to `POST /v1/nodes/{node_id}/handshakes`. The control plane derives each mesh edge's status, mode, handshake age and endpoint from these reports. See [Control Plane API Endpoints](api-endpoints.md#mesh-edge-health) for the wire format and status codes.
+`HandshakeReporter` (`internal/agent/handshakes.go`) reports, for every mesh peer, the age of the latest completed WireGuard handshake and the endpoint WireGuard used for it to `POST /v1/nodes/{node_id}/handshakes`. The control plane derives each mesh edge's status, mode, handshake age and endpoint from these reports, and turns an endpoint at least two nodes report for the same peer into a peer-observed endpoint on the pulls of every node of the Domain except that peer (see [Peer-observed endpoints](../networking/peer-endpoint-exchange.md#peer-observed-endpoints)). See [Control Plane API Endpoints](api-endpoints.md#mesh-edge-health) for the wire format and status codes.
 
 ```go
 func NewHandshakeReporter(interval time.Duration, nodeID string, client HandshakeReportClient, source MeshPeerStatsSource, logger *slog.Logger) *HandshakeReporter
