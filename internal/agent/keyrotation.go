@@ -309,8 +309,15 @@ func (r *KeyRotator) RecoverPending(ctx context.Context) {
 			if rerr := r.Rotate(ctx); rerr != nil {
 				// Without this line a control plane that keeps failing the
 				// resubmit leaves the node retrying forever with no
-				// operator-visible signal.
-				r.logger.WarnContext(ctx, "agent: key rotation: resubmitting the staged rotation failed, retrying",
+				// operator-visible signal. A refused credential is logged at
+				// Debug: the heartbeat names the cause once when it parks the
+				// agent, and every resubmit until a probe is accepted would
+				// repeat it as a Warn.
+				level := slog.LevelWarn
+				if errors.Is(rerr, api.ErrCredentialRefused) {
+					level = slog.LevelDebug
+				}
+				r.logger.Log(ctx, level, "agent: key rotation: resubmitting the staged rotation failed, retrying",
 					"delay", delay, "error", rerr)
 			}
 			wait = delay

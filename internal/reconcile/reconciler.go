@@ -128,7 +128,14 @@ func (r *Reconciler) runCycle(ctx context.Context, nodeID string) {
 	if err != nil {
 		// Don't log if the context was cancelled (graceful shutdown).
 		if ctx.Err() == nil {
-			r.logger.Warn("FetchState failed",
+			// A refused credential is logged at Debug: the heartbeat names
+			// the cause once when it parks the agent, and every cycle until
+			// a probe is accepted would repeat it as a Warn.
+			level := slog.LevelWarn
+			if errors.Is(err, api.ErrCredentialRefused) {
+				level = slog.LevelDebug
+			}
+			r.logger.Log(ctx, level, "FetchState failed",
 				"component", "reconcile",
 				"node_id", nodeID,
 				"error", err,

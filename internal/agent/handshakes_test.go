@@ -751,6 +751,47 @@ func TestHandshakeReporter_SendErrorsAreNotRetriedWithinTheTick(t *testing.T) {
 	}
 }
 
+// While the heartbeat has parked the agent, every send fails locally with
+// api.ErrCredentialRefused. The heartbeat names the cause once, so the
+// reporter logs the failure at Debug instead of a Warn per tick.
+func TestHandshakeReporter_RefusedCredentialLoggedAtDebug(t *testing.T) {
+	const sendFailedMsg = "agent: handshake report: send failed"
+	tests := []struct {
+		name      string
+		err       error
+		wantLevel string
+	}{
+		{name: "refused credential", err: fmt.Errorf("x: %w", api.ErrCredentialRefused), wantLevel: "level=DEBUG"},
+		{name: "other error", err: errors.New("boom"), wantLevel: "level=WARN"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &fakeHandshakeClient{errs: []error{tt.err}}
+			logger, logs := newDebugLogger()
+			r := newFixedClockReporter(client, &fakeStatsSource{}, logger)
+
+			r.reportOnce(context.Background())
+
+			if n := client.calls(); n != 1 {
+				t.Errorf("reports = %d within one tick, want 1 (no retry)", n)
+			}
+			got := logs.String()
+			line := logLine(t, got, sendFailedMsg)
+			for _, want := range []string{tt.wantLevel, "error="} {
+				if !strings.Contains(line, want) {
+					t.Errorf("send failed log = %q, want it to contain %q", line, want)
+				}
+			}
+			if tt.wantLevel == "level=DEBUG" && (strings.Contains(got, "level=WARN") || strings.Contains(got, "level=ERROR")) {
+				t.Errorf("logs = %s, want nothing at Warn or above for a refused credential", got)
+			}
+			if r.notServed {
+				t.Error("notServed set by a failure that is not a not-served answer")
+			}
+		})
+	}
+}
+
 func TestHandshakeReporter_CancelledSendIsNotLogged(t *testing.T) {
 	client := &fakeHandshakeClient{errs: []error{context.Canceled}}
 	logger, logs := newDebugLogger()

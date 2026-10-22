@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/plexsphere/plexd/internal/api"
 )
 
 // endpointReportMargin is how far before the server-side stale_after deadline
@@ -178,12 +180,16 @@ func (d *Discoverer) updateLastResult(endpoint string, natType NATType, stunServ
 // silent per-cycle Warn forever: after endpointRejectionEscalation cycles
 // the condition is logged at Error, which is alertable. A successful report
 // clears the streak; a transient failure leaves it intact, since it says
-// nothing about whether the peer record came back.
+// nothing about whether the peer record came back. A refused credential
+// leaves it intact too and is logged at Debug: the heartbeat names the cause
+// once when it parks the agent.
 func (d *Discoverer) reportEndpoint(ctx context.Context, reporter EndpointReporter, nodeID string, result *DiscoveryResult) time.Time {
 	staleAfter, err := report(ctx, reporter, nodeID, result)
 	switch {
 	case err == nil:
 		d.rejections = 0
+	case errors.Is(err, api.ErrCredentialRefused):
+		d.logger.Debug("endpoint report failed", "component", "nat", "error", err)
 	case errors.Is(err, errEndpointRejected):
 		d.rejections++
 		level := slog.LevelWarn

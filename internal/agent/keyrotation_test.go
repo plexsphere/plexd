@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -880,5 +882,62 @@ func TestKeyRotator_RecoverPending_BackoffAndCancel(t *testing.T) {
 	// The staged key is untouched — every retry kept it for a later attempt.
 	if !pendingExists(t, dir) {
 		t.Error("rotation_pending_key gone, want it to survive a persistent 5xx")
+	}
+}
+
+// While the heartbeat has parked the agent, every resubmit of a staged key
+// fails locally with api.ErrCredentialRefused. The heartbeat names the cause
+// once, so the sweep logs the failed resubmit at Debug instead of a Warn per
+// retry.
+func TestKeyRotator_RecoverPending_RefusedCredentialLoggedAtDebug(t *testing.T) {
+	const retryMsg = "agent: key rotation: resubmitting the staged rotation failed, retrying"
+	tests := []struct {
+		name      string
+		err       error
+		wantLevel string
+	}{
+		{name: "refused credential", err: fmt.Errorf("x: %w", api.ErrCredentialRefused), wantLevel: "level=DEBUG"},
+		{name: "other error", err: errors.New("boom"), wantLevel: "level=WARN"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &fakeRotateClient{err: tt.err}
+			_, dir, id, rt := newTestRotator(t, client, &fakeDeviceUpdater{})
+			logger, logs := newDebugLogger()
+			r := NewKeyRotator(client, id, dir, &fakeDeviceUpdater{}, rt, logger)
+			// The backoff outlasts the test, so the sweep resubmits once.
+			r.recoverInitial = time.Hour
+			r.recoverMax = time.Hour
+
+			kp, err := registration.GenerateKeypair()
+			if err != nil {
+				t.Fatalf("GenerateKeypair: %v", err)
+			}
+			if err := registration.SavePendingKey(dir, kp); err != nil {
+				t.Fatalf("SavePendingKey: %v", err)
+			}
+
+			stop := startRecovery(t, r)
+			waitFor(t, 2*time.Second, func() bool { return countLogLines(logs.String(), retryMsg) > 0 })
+			stop()
+
+			if got := client.getCalls(); got != 1 {
+				t.Errorf("HTTP calls = %d, want 1", got)
+			}
+			got := logs.String()
+			line := logLine(t, got, retryMsg)
+			for _, want := range []string{tt.wantLevel, "delay=1h0m0s", "error="} {
+				if !strings.Contains(line, want) {
+					t.Errorf("retry log = %q, want it to contain %q", line, want)
+				}
+			}
+			if above := recordsAt(got, "WARN", "ERROR"); tt.wantLevel == "level=DEBUG" && len(above) > 0 {
+				t.Errorf("records at Warn or above = %q, want none for a refused credential", above)
+			}
+			// The staged key is kept for the resubmit after the backoff.
+			if !pendingExists(t, dir) {
+				t.Error("rotation_pending_key gone, want it kept for the next resubmit")
+			}
+		})
 	}
 }

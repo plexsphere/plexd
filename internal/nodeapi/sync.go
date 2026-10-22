@@ -220,7 +220,7 @@ func (s *ReportSyncer) syncKey(ctx context.Context, nodeID, key string, entry *R
 				return syncNotProvisioned
 			}
 		}
-		s.logger.Warn("report delete failed", "key", key, "error", err)
+		s.logger.Log(ctx, publishFailureLevel(err), "report delete failed", "key", key, "error", err)
 		return syncKeepDirty
 	}
 
@@ -241,8 +241,19 @@ func (s *ReportSyncer) syncKey(ctx context.Context, nodeID, key string, entry *R
 			return syncNotProvisioned
 		}
 	}
-	s.logger.Warn("report put failed", "key", key, "error", err)
+	s.logger.Log(ctx, publishFailureLevel(err), "report put failed", "key", key, "error", err)
 	return syncKeepDirty
+}
+
+// publishFailureLevel is the level a publish that leaves its key dirty is
+// logged at. A refused credential is Debug: the heartbeat names the cause once
+// when it parks the agent, and the key is retried every round until a probe
+// is accepted, so a Warn would repeat it per key and round.
+func publishFailureLevel(err error) slog.Level {
+	if errors.Is(err, api.ErrCredentialRefused) {
+		return slog.LevelDebug
+	}
+	return slog.LevelWarn
 }
 
 // clearIfUnchanged removes key from the dirty map only if it still holds the
