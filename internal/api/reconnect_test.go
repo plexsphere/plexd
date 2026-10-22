@@ -851,3 +851,53 @@ func TestReconnect_NilModeChangeCallback(t *testing.T) {
 		t.Errorf("mode = %q, want pull_only", got)
 	}
 }
+
+// A refused credential fails before any request, so it is no *APIError; it
+// must still be treated as the 401 it stands for, wrapped or not, rather than
+// as a transient network error that backs off into the polling fallback.
+func TestClassifyError_CredentialRefused(t *testing.T) {
+	for _, err := range []error{ErrCredentialRefused, fmt.Errorf("sse: %w", ErrCredentialRefused)} {
+		if action := ClassifyError(err); action != RetryAuth {
+			t.Errorf("ClassifyError(%v) = %v, want RetryAuth", err, action)
+		}
+	}
+}
+
+func TestReconnect_CredentialRefusedStopsWithoutBackoffOrPolling(t *testing.T) {
+	e := fastEngine(discardLogger())
+	clk := newRecordingClock()
+	e.SetClock(clk)
+
+	// The engine must stop on the first refusal: a second attempt or a poll
+	// means it backed off instead, and since the fake clock never blocks it
+	// would spin forever. Cancelling there makes Run return and the test fail.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var connectCalls, pollCalls atomic.Int32
+	connectFn := func(ctx context.Context) error {
+		if connectCalls.Add(1) > 1 {
+			cancel()
+		}
+		return ErrCredentialRefused
+	}
+	pollFn := func(ctx context.Context) error {
+		pollCalls.Add(1)
+		cancel()
+		return nil
+	}
+
+	err := e.Run(ctx, connectFn, pollFn)
+	if !errors.Is(err, ErrCredentialRefused) {
+		t.Fatalf("Run() = %v, want ErrCredentialRefused", err)
+	}
+	if n := connectCalls.Load(); n != 1 {
+		t.Errorf("connect calls = %d, want 1", n)
+	}
+	if n := pollCalls.Load(); n != 0 {
+		t.Errorf("poll calls = %d, want 0", n)
+	}
+	if d := clk.delays(); len(d) != 0 {
+		t.Errorf("engine waited %v, want no wait", d)
+	}
+}

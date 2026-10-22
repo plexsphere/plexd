@@ -17,6 +17,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -2309,5 +2311,158 @@ func TestFetchEdgePSK_PathParametersEscaped(t *testing.T) {
 	const want = "/v1/nodes/..%2Fn1/peers/p1%2F..%2F..%2Fx/psk"
 	if gotPath != want {
 		t.Errorf("path = %s, want %s", gotPath, want)
+	}
+}
+
+// While the credential is marked refused, every call that presents the bearer
+// must fail locally, before any request reaches the control plane: that is the
+// whole point of parking a removed Node.
+func TestCredentialRefused_GatesBearerCallsBeforeAnyRequest(t *testing.T) {
+	var hits atomic.Int64
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+	client.SetCredentialRefused(true)
+	ctx := context.Background()
+
+	calls := map[string]func() error{
+		"FetchState": func() error {
+			_, err := client.FetchState(ctx, "n1")
+			return err
+		},
+		"ReportHandshakes": func() error {
+			_, err := client.ReportHandshakes(ctx, "n1", HandshakeReportRequest{})
+			return err
+		},
+		"PutStateReport": func() error {
+			_, err := client.PutStateReport(ctx, "n1", "health", NodeStateReportRequest{})
+			return err
+		},
+		"ReportMetrics (ingest)": func() error {
+			_, err := client.ReportMetrics(ctx, "n1", []MetricSample{{}})
+			return err
+		},
+		"ConnectSSE": func() error {
+			resp, err := client.ConnectSSE(ctx, "n1", "")
+			if resp != nil {
+				resp.Body.Close()
+			}
+			return err
+		},
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); !errors.Is(err, ErrCredentialRefused) {
+				t.Errorf("err = %v, want ErrCredentialRefused", err)
+			}
+		})
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("HTTP handler hit %d times, want 0", n)
+	}
+}
+
+// The heartbeat is the probe that decides when the mark is lifted, and
+// registration carries no bearer, so the gate lets both through.
+func TestCredentialRefused_HeartbeatAndRegisterPassTheGate(t *testing.T) {
+	var mu sync.Mutex
+	auth := map[string]string{}
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auth[r.URL.Path] = r.Header.Get("Authorization")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/register" {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(RegisterResponse{NodeID: "n1", MeshIP: "10.0.0.1"})
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	})
+	client.SetCredentialRefused(true)
+
+	if _, err := client.Heartbeat(context.Background(), "n1", HeartbeatRequest{}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	if _, err := client.Register(context.Background(), RegisterRequest{ProjectID: "p"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got, ok := auth["/v1/nodes/n1/heartbeat"]; !ok || got != "Bearer test-token" {
+		t.Errorf("heartbeat Authorization = %q (sent %v), want %q", got, ok, "Bearer test-token")
+	}
+	if got, ok := auth["/v1/register"]; !ok || got != "" {
+		t.Errorf("register Authorization = %q (sent %v), want empty", got, ok)
+	}
+}
+
+func TestCredentialRefused_ClearingTheMarkReopensTheGate(t *testing.T) {
+	var gotAuth string
+	var hits int
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	})
+
+	if client.CredentialRefused() {
+		t.Fatal("CredentialRefused() = true on a new client, want false")
+	}
+	if _, err := client.FetchState(context.Background(), "n1"); err != nil {
+		t.Fatalf("FetchState on a new client: %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("hits after the first pull = %d, want 1", hits)
+	}
+
+	client.SetCredentialRefused(true)
+	if _, err := client.FetchState(context.Background(), "n1"); !errors.Is(err, ErrCredentialRefused) {
+		t.Fatalf("FetchState while refused: err = %v, want ErrCredentialRefused", err)
+	}
+	if hits != 1 {
+		t.Fatalf("hits while refused = %d, want 1", hits)
+	}
+
+	client.SetCredentialRefused(false)
+	if client.CredentialRefused() {
+		t.Error("CredentialRefused() = true after clearing the mark, want false")
+	}
+	if _, err := client.FetchState(context.Background(), "n1"); err != nil {
+		t.Fatalf("FetchState after clearing the mark: %v", err)
+	}
+	if hits != 2 {
+		t.Errorf("hits after clearing the mark = %d, want 2", hits)
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Errorf("Authorization after clearing the mark = %q, want %q", gotAuth, "Bearer test-token")
+	}
+}
+
+// The gate is local; it must not change what a real 401 from the control plane
+// looks like to its callers, and the two errors must not match each other.
+func TestCredentialRefused_DistinctFromAControlPlane401(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"type":"about:blank","title":"Unauthorized","status":401,"code":"nsk_invalid"}`))
+	})
+
+	_, err := client.FetchState(context.Background(), "n1")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusUnauthorized || apiErr.Code != "nsk_invalid" {
+		t.Fatalf("err = %v, want the control plane's 401 nsk_invalid", err)
+	}
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("errors.Is(err, ErrUnauthorized) = false, want true")
+	}
+	if errors.Is(err, ErrCredentialRefused) {
+		t.Errorf("errors.Is(err, ErrCredentialRefused) = true, want false")
+	}
+	if errors.Is(ErrCredentialRefused, ErrUnauthorized) {
+		t.Errorf("errors.Is(ErrCredentialRefused, ErrUnauthorized) = true, want false")
 	}
 }
