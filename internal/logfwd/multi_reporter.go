@@ -48,7 +48,7 @@ func (m *MultiReporter) ReportLogs(ctx context.Context, nodeID string, batch api
 	wg.Wait()
 
 	if localErr != nil {
-		m.logger.Warn("local log report failed", "component", "logfwd", "error", localErr)
+		m.logger.Log(ctx, failureLevel(localErr), "local log report failed", "component", "logfwd", "error", localErr)
 	}
 
 	return platformErr

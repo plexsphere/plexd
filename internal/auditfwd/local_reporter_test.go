@@ -7,6 +7,7 @@ import (
 	"crypto/cipher"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -276,6 +277,70 @@ func TestLocalReporter_UsesStaleCacheOnFetchError(t *testing.T) {
 	}
 	if rec.Level != slog.LevelWarn {
 		t.Errorf("log level = %v, want WARN", rec.Level)
+	}
+}
+
+// TestLocalReporter_LogsRefusedCredentialFallbackAtDebug pins that falling back
+// to the cached token because the secret fetch was refused locally for the
+// node credential is logged at Debug, while any other fetch failure stays a
+// Warn.
+func TestLocalReporter_LogsRefusedCredentialFallbackAtDebug(t *testing.T) {
+	cases := []struct {
+		name  string
+		err   error
+		level slog.Level
+	}{
+		{"refused credential", fmt.Errorf("x: %w", api.ErrCredentialRefused), slog.LevelDebug},
+		{"other failure", errors.New("boom"), slog.LevelWarn},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+
+			fetcher := &mockSecretFetcher{
+				resp: &api.SecretEnvelope{Data: encryptTestSecret(testNSK(), "stale-token"), Version: 1},
+			}
+
+			ch := &capturingHandler{}
+			reporter := newTestLocalReporter(srv.URL, fetcher, srv.Client())
+			reporter.logger = slog.New(ch)
+			// A zero TTL makes every call fetch again, so the second call
+			// takes the fetch-error branch with the token the first cached.
+			reporter.cacheTTL = 0
+
+			batch := api.AuditBatch{
+				{Timestamp: time.Now(), Source: "test", EventType: "TEST", Action: "a", Result: "ok", Hostname: "h"},
+			}
+			if err := reporter.ReportAudit(context.Background(), "node-1", batch); err != nil {
+				t.Fatalf("initial call: %v", err)
+			}
+			fetcher.mu.Lock()
+			fetcher.err = tc.err
+			fetcher.mu.Unlock()
+			if err := reporter.ReportAudit(context.Background(), "node-1", batch); err != nil {
+				t.Fatalf("expected stale fallback to succeed, got: %v", err)
+			}
+			if fetcher.callCount() != 2 {
+				t.Fatalf("FetchSecret calls = %d, want 2", fetcher.callCount())
+			}
+
+			rec := ch.find("using cached credential")
+			if rec == nil {
+				t.Fatal("expected a log about using cached credential")
+			}
+			if rec.Level != tc.level {
+				t.Errorf("log level = %v, want %v", rec.Level, tc.level)
+			}
+			ch.mu.Lock()
+			n := len(ch.records)
+			ch.mu.Unlock()
+			if n != 1 {
+				t.Errorf("records = %d, want only the cached-credential fallback", n)
+			}
+		})
 	}
 }
 

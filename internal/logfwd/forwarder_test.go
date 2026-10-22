@@ -272,6 +272,57 @@ func TestForwarder_Run_RetainsOnReportError(t *testing.T) {
 	}
 }
 
+// TestForwarder_FlushLogsRefusedCredentialAtDebug pins that a report refused
+// locally for the node credential is logged at Debug, since it fails the same
+// way on every flush until a heartbeat is accepted again, while any other
+// failure stays a Warn. Either way the entries are retained and the failure
+// is counted.
+func TestForwarder_FlushLogsRefusedCredentialAtDebug(t *testing.T) {
+	cases := []struct {
+		name  string
+		err   error
+		level slog.Level
+	}{
+		{"refused credential", fmt.Errorf("x: %w", api.ErrCredentialRefused), slog.LevelDebug},
+		{"other failure", errors.New("boom"), slog.LevelWarn},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := &capturingHandler{}
+			rep := &mockLogReporter{err: tc.err}
+			f := NewForwarder(testForwarderConfig(time.Hour, time.Hour), nil, rep, "node-1", "host-1", slog.New(handler))
+
+			f.mu.Lock()
+			f.buffer = append(f.buffer, testEntries("journald", 5)...)
+			f.mu.Unlock()
+
+			f.flush(context.Background())
+
+			rec := handler.find("log report failed")
+			if rec == nil {
+				t.Fatal("expected a log about the failed report")
+			}
+			if rec.Level != tc.level {
+				t.Errorf("log level = %v, want %v", rec.Level, tc.level)
+			}
+			handler.mu.Lock()
+			n := len(handler.records)
+			handler.mu.Unlock()
+			if n != 1 {
+				t.Errorf("records = %d, want only the report failure", n)
+			}
+
+			_, bufLen, _, errCount, _ := f.Status()
+			if bufLen != 5 {
+				t.Errorf("buffer = %d entries, want the 5 retained", bufLen)
+			}
+			if errCount != 1 {
+				t.Errorf("report errors = %d, want 1", errCount)
+			}
+		})
+	}
+}
+
 func TestForwarder_Run_DropsOldestWhenOverCapacity(t *testing.T) {
 	cfg := Config{
 		Enabled:         true,
@@ -556,5 +607,73 @@ func TestForwarder_Run_DropsOldestLogsWarning(t *testing.T) {
 	}
 	if dropped != int64(5) {
 		t.Errorf("dropped = %v, want 5", dropped)
+	}
+}
+
+// TestForwarder_OverflowLogsAtDebugWhileRefused pins that a buffer overflow is
+// logged at Debug while the last report was refused for the node credential,
+// since the full buffer then overflows on every collect cycle until a
+// heartbeat is accepted again, and at Warn before any report, after any other
+// failure and once a report is delivered again.
+func TestForwarder_OverflowLogsAtDebugWhileRefused(t *testing.T) {
+	refused := fmt.Errorf("x: %w", api.ErrCredentialRefused)
+	cases := []struct {
+		name    string
+		flushes []error // the reporter's result for each flush before the overflow
+		level   slog.Level
+	}{
+		{"before any report", nil, slog.LevelWarn},
+		{"after a refused credential", []error{refused}, slog.LevelDebug},
+		{"after another failure", []error{errors.New("boom")}, slog.LevelWarn},
+		{"after a refused credential and a delivered report", []error{refused, nil}, slog.LevelWarn},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := &capturingHandler{}
+			cfg := Config{
+				Enabled:         true,
+				CollectInterval: time.Hour,
+				ReportInterval:  time.Hour,
+				BatchSize:       5, // capacity = 10
+			}
+			src := &mockLogSource{entries: testEntries("journald", 6)}
+			rep := &mockLogReporter{}
+			f := NewForwarder(cfg, []LogSource{src}, rep, "node-1", "host-1", slog.New(handler))
+
+			// Buffer 6 entries, within capacity, then run the case's flushes.
+			f.collect(context.Background())
+			for _, err := range tc.flushes {
+				rep.mu.Lock()
+				rep.err = err
+				rep.mu.Unlock()
+				f.flush(context.Background())
+			}
+			// Two more collects push the buffer past capacity whether or not
+			// a flush delivered it.
+			f.collect(context.Background())
+			f.collect(context.Background())
+
+			handler.mu.Lock()
+			defer handler.mu.Unlock()
+			overflows := 0
+			for _, r := range handler.records {
+				if r.Message == "buffer overflow, dropping oldest entries" {
+					overflows++
+					if r.Level != tc.level {
+						t.Errorf("overflow log level = %v, want %v", r.Level, tc.level)
+					}
+					if r.Attrs["component"] != "logfwd" {
+						t.Errorf("component = %v, want logfwd", r.Attrs["component"])
+					}
+					continue
+				}
+				if tc.level == slog.LevelDebug && r.Level >= slog.LevelWarn {
+					t.Errorf("%v log %q, want nothing at Warn while refused", r.Level, r.Message)
+				}
+			}
+			if overflows == 0 {
+				t.Fatal("expected a log about dropping entries")
+			}
+		})
 	}
 }

@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -126,7 +127,7 @@ func (m *Manager) flush(ctx context.Context) {
 		chunk := batch[:min(batchSize, len(batch))]
 
 		if err := m.reporter.ReportMetrics(ctx, m.nodeID, chunk); err != nil {
-			m.logger.Warn("metrics report failed", "component", "metrics", "error", err)
+			m.logger.Log(ctx, failureLevel(err), "metrics report failed", "component", "metrics", "error", err)
 			// Retain unsent data: put remaining batch back into buffer.
 			m.mu.Lock()
 			m.buffer = append(batch, m.buffer...)
@@ -137,4 +138,16 @@ func (m *Manager) flush(ctx context.Context) {
 
 		batch = batch[len(chunk):]
 	}
+}
+
+// failureLevel is the level a failed report, or a credential fetch that falls
+// back to the cached credential, is logged at. A refused node credential is
+// logged at Debug: the heartbeat logs that cause once at Error, and the call
+// fails the same way every cycle until a heartbeat is accepted again. Any
+// other failure stays a Warn.
+func failureLevel(err error) slog.Level {
+	if errors.Is(err, api.ErrCredentialRefused) {
+		return slog.LevelDebug
+	}
+	return slog.LevelWarn
 }
