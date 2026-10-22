@@ -3,6 +3,7 @@ package logfwd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -117,6 +118,44 @@ func TestMultiReporter_PlatformSucceedLocalFail(t *testing.T) {
 	}
 	if rec.Level != slog.LevelWarn {
 		t.Errorf("log level = %v, want WARN", rec.Level)
+	}
+}
+
+// TestMultiReporter_LogsRefusedLocalCredentialAtDebug pins that a local report
+// failing because its credential fetch was refused locally is logged at Debug,
+// while any other local failure stays a Warn.
+func TestMultiReporter_LogsRefusedLocalCredentialAtDebug(t *testing.T) {
+	cases := []struct {
+		name  string
+		err   error
+		level slog.Level
+	}{
+		{"refused credential", fmt.Errorf("x: %w", api.ErrCredentialRefused), slog.LevelDebug},
+		{"other failure", errors.New("boom"), slog.LevelWarn},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := &capturingHandler{}
+			mr := NewMultiReporter(&stubReporter{}, &stubReporter{err: tc.err}, slog.New(handler))
+
+			if err := mr.ReportLogs(context.Background(), "node-1", testBatch()); err != nil {
+				t.Fatalf("expected nil error (local failure is logged, not returned), got %v", err)
+			}
+
+			rec := handler.find("local log report failed")
+			if rec == nil {
+				t.Fatal("expected a log about the local failure")
+			}
+			if rec.Level != tc.level {
+				t.Errorf("log level = %v, want %v", rec.Level, tc.level)
+			}
+			handler.mu.Lock()
+			n := len(handler.records)
+			handler.mu.Unlock()
+			if n != 1 {
+				t.Errorf("records = %d, want only the local failure", n)
+			}
+		})
 	}
 }
 

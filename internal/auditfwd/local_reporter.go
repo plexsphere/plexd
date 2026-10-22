@@ -118,7 +118,7 @@ func (r *LocalReporter) resolveToken(ctx context.Context) (string, error) {
 	secret, err := r.fetcher.FetchSecret(ctx, r.nodeID, r.secretKey, 0)
 	if err != nil {
 		if r.cachedToken != "" {
-			r.logger.Warn("using cached credential", "component", "auditfwd", "error", err)
+			r.logger.Log(ctx, failureLevel(err), "using cached credential", "component", "auditfwd", "error", err)
 			return r.cachedToken, nil
 		}
 		return "", fmt.Errorf("auditfwd: fetch secret: %w", err)

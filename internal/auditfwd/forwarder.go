@@ -2,6 +2,7 @@ package auditfwd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -29,6 +30,8 @@ type Forwarder struct {
 	buffer       []api.AuditEntry
 	lastReportAt time.Time
 	reportErrors int
+	// reportRefused records whether the last report was refused for the node credential.
+	reportRefused bool
 }
 
 // NewForwarder creates a new Forwarder. Config defaults are applied automatically.
@@ -105,12 +108,19 @@ func (f *Forwarder) safeCollect(ctx context.Context, s AuditSource) (entries []a
 }
 
 // enforceCapacity drops the oldest entries when buffer exceeds bufferCapacityMultiplier*BatchSize.
-// Must be called with f.mu held.
+// The drop is logged at Debug while the last report was refused for the node
+// credential, since every flush then fails and the full buffer overflows on
+// each collect cycle until a heartbeat is accepted again, and at Warn
+// otherwise. Must be called with f.mu held.
 func (f *Forwarder) enforceCapacity() {
 	limit := bufferCapacityMultiplier * f.cfg.BatchSize
 	if len(f.buffer) > limit {
 		dropped := len(f.buffer) - limit
-		f.logger.Warn("buffer overflow, dropping oldest entries", "component", "auditfwd", "dropped", dropped)
+		level := slog.LevelWarn
+		if f.reportRefused {
+			level = slog.LevelDebug
+		}
+		f.logger.Log(context.Background(), level, "buffer overflow, dropping oldest entries", "component", "auditfwd", "dropped", dropped)
 		f.buffer = f.buffer[len(f.buffer)-limit:]
 	}
 }
@@ -132,11 +142,12 @@ func (f *Forwarder) flush(ctx context.Context) {
 		chunk := batch[:min(batchSize, len(batch))]
 
 		if err := f.reporter.ReportAudit(ctx, f.nodeID, chunk); err != nil {
-			f.logger.Warn("audit report failed", "component", "auditfwd", "error", err)
+			f.logger.Log(ctx, failureLevel(err), "audit report failed", "component", "auditfwd", "error", err)
 			// Retain unsent data: put remaining batch back into buffer.
 			f.mu.Lock()
 			f.buffer = append(batch, f.buffer...)
 			f.reportErrors++
+			f.reportRefused = errors.Is(err, api.ErrCredentialRefused)
 			f.enforceCapacity()
 			f.mu.Unlock()
 			return
@@ -147,6 +158,7 @@ func (f *Forwarder) flush(ctx context.Context) {
 
 	f.mu.Lock()
 	f.lastReportAt = time.Now()
+	f.reportRefused = false
 	f.mu.Unlock()
 }
 
@@ -155,4 +167,16 @@ func (f *Forwarder) Status() (enabled bool, bufferSize, sourceCount, errorCount 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.cfg.Enabled, len(f.buffer), len(f.sources), f.reportErrors, f.lastReportAt
+}
+
+// failureLevel is the level a failed report, or a credential fetch that falls
+// back to the cached credential, is logged at. A refused node credential is
+// logged at Debug: the heartbeat logs that cause once at Error, and the call
+// fails the same way every cycle until a heartbeat is accepted again. Any
+// other failure stays a Warn.
+func failureLevel(err error) slog.Level {
+	if errors.Is(err, api.ErrCredentialRefused) {
+		return slog.LevelDebug
+	}
+	return slog.LevelWarn
 }

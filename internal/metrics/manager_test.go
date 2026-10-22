@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -306,6 +308,73 @@ func TestManager_RetainOnReportError(t *testing.T) {
 
 	if bufLen != 5 {
 		t.Errorf("expected 5 points retained in buffer after report error, got %d", bufLen)
+	}
+}
+
+// TestManager_FlushLogsRefusedCredentialAtDebug pins that a report refused
+// locally for the node credential is logged at Debug, since it fails the same
+// way on every flush until a heartbeat is accepted again, while any other
+// failure stays a Warn.
+func TestManager_FlushLogsRefusedCredentialAtDebug(t *testing.T) {
+	cases := []struct {
+		name  string
+		err   error
+		level slog.Level
+	}{
+		{"refused credential", fmt.Errorf("x: %w", api.ErrCredentialRefused), slog.LevelDebug},
+		{"other failure", errors.New("boom"), slog.LevelWarn},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ch := &capturingHandler{}
+			rep := &mockReporter{err: tc.err}
+			m := NewManager(testConfig(time.Hour, time.Hour), nil, rep, "node-1", slog.New(ch))
+
+			m.mu.Lock()
+			m.buffer = append(m.buffer, testPoints(GroupSystem, 5)...)
+			m.mu.Unlock()
+
+			m.flush(context.Background())
+
+			if n := countLog(ch, tc.level, "metrics report failed"); n != 1 {
+				t.Errorf("%s records %q = %d, want 1", tc.level, "metrics report failed", n)
+			}
+			if n := len(ch.getRecords()); n != 1 {
+				t.Errorf("records = %d, want only the report failure", n)
+			}
+		})
+	}
+}
+
+// TestManager_DeliversPointsRetainedByRefusedFlush pins that a flush refused
+// for the node credential keeps its points, so the first flush after the
+// refusal lifts delivers them.
+func TestManager_DeliversPointsRetainedByRefusedFlush(t *testing.T) {
+	rep := &mockReporter{err: fmt.Errorf("x: %w", api.ErrCredentialRefused), errOnce: true}
+	m := NewManager(testConfig(time.Hour, time.Hour), nil, rep, "node-1", discardLogger())
+
+	m.mu.Lock()
+	m.buffer = append(m.buffer, testPoints(GroupSystem, 5)...)
+	m.mu.Unlock()
+
+	m.flush(context.Background()) // refused
+	m.flush(context.Background()) // accepted
+
+	if rep.callCount() != 2 {
+		t.Fatalf("reporter calls = %d, want 2", rep.callCount())
+	}
+	rep.mu.Lock()
+	delivered := len(rep.calls[1].Batch)
+	rep.mu.Unlock()
+	if delivered != 5 {
+		t.Errorf("second flush delivered %d points, want the 5 the refused flush retained", delivered)
+	}
+
+	m.mu.Lock()
+	bufLen := len(m.buffer)
+	m.mu.Unlock()
+	if bufLen != 0 {
+		t.Errorf("buffer = %d points after the accepted flush, want 0", bufLen)
 	}
 }
 

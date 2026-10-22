@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -115,6 +116,37 @@ func TestMultiReporter_PlatformSucceedLocalFail(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected warning log about local metrics report failure")
+	}
+}
+
+// TestMultiReporter_LogsRefusedLocalCredentialAtDebug pins that a local report
+// failing because its credential fetch was refused locally is logged at Debug,
+// while any other local failure stays a Warn.
+func TestMultiReporter_LogsRefusedLocalCredentialAtDebug(t *testing.T) {
+	cases := []struct {
+		name  string
+		err   error
+		level slog.Level
+	}{
+		{"refused credential", fmt.Errorf("x: %w", api.ErrCredentialRefused), slog.LevelDebug},
+		{"other failure", errors.New("boom"), slog.LevelWarn},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ch := &capturingHandler{}
+			m := NewMultiReporter(&stubReporter{}, &stubReporter{err: tc.err}, slog.New(ch))
+
+			if err := m.ReportMetrics(context.Background(), "node-1", testPoints(GroupSystem, 1)); err != nil {
+				t.Fatalf("expected nil (platform succeeded), got %v", err)
+			}
+
+			if n := countLog(ch, tc.level, "local metrics report failed"); n != 1 {
+				t.Errorf("%s records %q = %d, want 1", tc.level, "local metrics report failed", n)
+			}
+			if n := len(ch.getRecords()); n != 1 {
+				t.Errorf("records = %d, want only the local failure", n)
+			}
+		})
 	}
 }
 

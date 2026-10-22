@@ -441,6 +441,58 @@ func TestLocalReporter_UsesStaleCacheOnFetchError(t *testing.T) {
 	}
 }
 
+// TestLocalReporter_LogsRefusedCredentialFallbackAtDebug pins that falling back
+// to the cached token because the secret fetch was refused locally for the
+// node credential is logged at Debug, while any other fetch failure stays a
+// Warn.
+func TestLocalReporter_LogsRefusedCredentialFallbackAtDebug(t *testing.T) {
+	cases := []struct {
+		name  string
+		err   error
+		level slog.Level
+	}{
+		{"refused credential", fmt.Errorf("x: %w", api.ErrCredentialRefused), slog.LevelDebug},
+		{"other failure", errors.New("boom"), slog.LevelWarn},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+
+			fetcher := newTestFetcher("stale-tok")
+			fetcher.failAfter = 1
+			fetcher.failErr = tc.err
+
+			ch := &capturingHandler{}
+			srv, reporter := newTestReporter(t, handler, fetcher)
+			defer srv.Close()
+			reporter.logger = slog.New(ch)
+			// A zero TTL makes every call fetch again, so the second call
+			// takes the fetch-error branch with the token the first cached.
+			reporter.cacheTTL = 0
+
+			batch := api.MetricBatch{{Timestamp: time.Now(), Group: GroupSystem, Data: json.RawMessage(`{}`)}}
+			if err := reporter.ReportMetrics(context.Background(), "node-1", batch); err != nil {
+				t.Fatalf("first call: %v", err)
+			}
+			if err := reporter.ReportMetrics(context.Background(), "node-1", batch); err != nil {
+				t.Fatalf("stale fallback: %v", err)
+			}
+			if fetcher.callCount() != 2 {
+				t.Fatalf("FetchSecret calls = %d, want 2", fetcher.callCount())
+			}
+
+			if n := countLog(ch, tc.level, "using cached credential"); n != 1 {
+				t.Errorf("%s records %q = %d, want 1", tc.level, "using cached credential", n)
+			}
+			if n := len(ch.getRecords()); n != 1 {
+				t.Errorf("records = %d, want only the cached-credential fallback", n)
+			}
+		})
+	}
+}
+
 func TestLocalReporter_ReturnsErrorWhenNoCacheAndFetchFails(t *testing.T) {
 	var called atomic.Bool
 	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

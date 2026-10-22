@@ -10,7 +10,7 @@ import (
 
 // MultiReporter dispatches audit batches to both a platform and a local
 // reporter in parallel. The platform error is always returned; a local
-// failure is logged as a warning but does not affect the caller.
+// failure is logged but does not affect the caller.
 type MultiReporter struct {
 	platform AuditReporter
 	local    AuditReporter
@@ -27,7 +27,8 @@ func NewMultiReporter(platform, local AuditReporter, logger *slog.Logger) *Multi
 }
 
 // ReportAudit sends the batch to both reporters concurrently.
-// Only the platform error is returned; local errors are logged as warnings.
+// Only the platform error is returned; a local error is logged at the level
+// failureLevel gives.
 func (m *MultiReporter) ReportAudit(ctx context.Context, nodeID string, batch api.AuditBatch) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -48,7 +49,7 @@ func (m *MultiReporter) ReportAudit(ctx context.Context, nodeID string, batch ap
 	wg.Wait()
 
 	if localErr != nil {
-		m.logger.Warn("local audit report failed", "component", "auditfwd", "error", localErr)
+		m.logger.Log(ctx, failureLevel(localErr), "local audit report failed", "component", "auditfwd", "error", localErr)
 	}
 
 	return platformErr
