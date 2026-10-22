@@ -114,10 +114,16 @@ type SnapshotPeer struct {
 	// dial order the WireGuard manager tries.
 	Endpoint         string `json:"endpoint,omitempty"`
 	FallbackEndpoint string `json:"fallback_endpoint,omitempty"`
-	// EndpointCandidates are the peer's last accepted, unexpired endpoint
-	// candidates (PUT /v1/nodes/{node_id}/endpoint-candidates) as host:port
-	// strings, in the order the peer sent them. The field is absent when the
-	// peer has none, and on every control plane that does not deliver them.
+	// EndpointCandidates are the peer's endpoint candidates as host:port
+	// strings, at most MaxEndpointCandidates. The control plane lists first
+	// the peer's peer-observed endpoints: each address and port at which at
+	// least two live nodes of the Domain reported, through
+	// POST /v1/nodes/{node_id}/handshakes, a direct handshake with the peer
+	// within the Domain's endpoint TTL. The peer's last accepted, unexpired
+	// local candidates (PUT /v1/nodes/{node_id}/endpoint-candidates) follow,
+	// in the order the peer sent them. The wire does not mark which entry is
+	// which, and plexd orders them alike. The field is absent when the peer
+	// has none, and on every control plane that does not deliver them.
 	EndpointCandidates []string `json:"endpoint_candidates,omitempty"`
 }
 
