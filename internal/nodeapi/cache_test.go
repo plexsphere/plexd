@@ -606,3 +606,104 @@ func TestStateCache_LoadDropsOutOfGrammarReportKeys(t *testing.T) {
 		t.Errorf("OrphanedReportKeys() after reload = %v, want nil", got)
 	}
 }
+
+// TestStateCache_CredentialRefusedOverlay guards the control_plane_credential
+// key that /v1/state and plexd status read: like delivery_mode it is overlaid on
+// the metadata view, and only while the control plane refuses the credential.
+func TestStateCache_CredentialRefusedOverlay(t *testing.T) {
+	sc := NewStateCache(t.TempDir(), discardLogger())
+	if err := sc.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// A nil metadata map, as UpdateMetadata stores for a nil input: the overlay
+	// has to build a map of its own rather than write into it.
+	sc.UpdateMetadata(nil)
+
+	sc.SetCredentialRefused(true)
+	if got, want := sc.GetMetadata(), map[string]string{"control_plane_credential": "refused"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("GetMetadata() = %v, want %v", got, want)
+	}
+	if val, ok := sc.GetMetadataKey("control_plane_credential"); !ok || val != "refused" {
+		t.Errorf("GetMetadataKey(control_plane_credential) = (%q, %v), want (%q, true)", val, ok, "refused")
+	}
+
+	sc.SetDeliveryMode(string(api.DeliveryModePullOnly))
+	want := map[string]string{"control_plane_credential": "refused", "delivery_mode": "pull_only"}
+	if got := sc.GetMetadata(); !reflect.DeepEqual(got, want) {
+		t.Errorf("GetMetadata() with a delivery mode = %v, want %v", got, want)
+	}
+
+	sc.SetCredentialRefused(false)
+	if got, want := sc.GetMetadata(), map[string]string{"delivery_mode": "pull_only"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("GetMetadata() after clearing = %v, want %v", got, want)
+	}
+	if val, ok := sc.GetMetadataKey("control_plane_credential"); ok || val != "" {
+		t.Errorf("GetMetadataKey(control_plane_credential) after clearing = (%q, %v), want (\"\", false)", val, ok)
+	}
+}
+
+// TestStateCache_CredentialRefusedOverridesSnapshotKey proves the overlay wins
+// over a snapshot-delivered key of the same name while the flag is set, and
+// that the snapshot value shows again once it is cleared.
+func TestStateCache_CredentialRefusedOverridesSnapshotKey(t *testing.T) {
+	sc := NewStateCache(t.TempDir(), discardLogger())
+	if err := sc.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	sc.UpdateMetadata(map[string]string{"control_plane_credential": "x"})
+
+	sc.SetCredentialRefused(true)
+	if got := sc.GetMetadata()["control_plane_credential"]; got != "refused" {
+		t.Errorf("GetMetadata()[control_plane_credential] = %q, want %q", got, "refused")
+	}
+	if val, ok := sc.GetMetadataKey("control_plane_credential"); !ok || val != "refused" {
+		t.Errorf("GetMetadataKey(control_plane_credential) = (%q, %v), want (%q, true)", val, ok, "refused")
+	}
+
+	sc.SetCredentialRefused(false)
+	if got := sc.GetMetadata()["control_plane_credential"]; got != "x" {
+		t.Errorf("GetMetadata()[control_plane_credential] after clearing = %q, want %q", got, "x")
+	}
+	if val, ok := sc.GetMetadataKey("control_plane_credential"); !ok || val != "x" {
+		t.Errorf("GetMetadataKey(control_plane_credential) after clearing = (%q, %v), want (%q, true)", val, ok, "x")
+	}
+}
+
+// TestStateCache_CredentialRefusedNotPersisted guards against a refused mark
+// that survives a restart: the heartbeat detects a refusal again on its own,
+// and a persisted mark would outlive a control plane fixed meanwhile. A fresh
+// cache loads the directory twice: once after the mark is set on top of written
+// metadata, against a setter that persists the overlaid view, and once after
+// the metadata is written again while the mark is set, against a persist path
+// that stores the overlaid view instead of the snapshot map.
+func TestStateCache_CredentialRefusedNotPersisted(t *testing.T) {
+	dir := t.TempDir()
+	sc := NewStateCache(dir, discardLogger())
+	if err := sc.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	assertNotOnDisk := func(when string) {
+		t.Helper()
+		loaded := NewStateCache(dir, discardLogger())
+		if err := loaded.Load(); err != nil {
+			t.Fatalf("Load %s: %v", when, err)
+		}
+		meta := loaded.GetMetadata()
+		if meta["env"] != "prod" {
+			t.Errorf("loaded metadata %s env = %q, want %q", when, meta["env"], "prod")
+		}
+		if val, ok := meta["control_plane_credential"]; ok {
+			t.Errorf("loaded metadata %s carries control_plane_credential = %q, want no key", when, val)
+		}
+	}
+
+	sc.UpdateMetadata(map[string]string{"env": "prod"})
+	sc.SetCredentialRefused(true)
+	assertNotOnDisk("after the mark is set")
+
+	sc.UpdateMetadata(map[string]string{"env": "prod"})
+	if got := sc.GetMetadata()["control_plane_credential"]; got != "refused" {
+		t.Fatalf("GetMetadata()[control_plane_credential] before reload = %q, want %q", got, "refused")
+	}
+	assertNotOnDisk("after a write while the mark is set")
+}

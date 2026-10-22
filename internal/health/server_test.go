@@ -268,6 +268,132 @@ func TestReadyz_SubsystemStopped(t *testing.T) {
 	}
 }
 
+// TestReadyz_CredentialRefused guards the readiness reason for a node whose
+// credential the control plane refuses. The event stream stops on the same
+// refusal, so the reason has to win over "event delivery stopped", which would
+// otherwise hide the cause; and unlike the delivery stop it clears again once a
+// heartbeat is accepted.
+func TestReadyz_CredentialRefused(t *testing.T) {
+	srv := NewServer(Config{}, testLogger())
+	h := srv.Handler()
+
+	srv.SetRegistered()
+	srv.SetDataPlaneReady()
+
+	steps := []struct {
+		name       string
+		transition func()
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "credential refused",
+			transition: func() { srv.SetCredentialRefused(true) },
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "not ready: node credential refused\n",
+		},
+		{
+			name:       "credential accepted again",
+			transition: func() { srv.SetCredentialRefused(false) },
+			wantStatus: http.StatusOK,
+			wantBody:   "ok\n",
+		},
+		{
+			name: "credential refused while event delivery stops on the same refusal",
+			transition: func() {
+				srv.SetCredentialRefused(true)
+				srv.SetDeliveryStopped()
+			},
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "not ready: node credential refused\n",
+		},
+		{
+			// The event stream is not restarted after a resume, so the delivery
+			// stop outlives the refusal.
+			name:       "credential accepted again after event delivery stopped",
+			transition: func() { srv.SetCredentialRefused(false) },
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "not ready: event delivery stopped\n",
+		},
+	}
+
+	for _, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			step.transition()
+			status, body := probe(t, h, "/readyz")
+			if status != step.wantStatus {
+				t.Errorf("status = %d, want %d", status, step.wantStatus)
+			}
+			if body != step.wantBody {
+				t.Errorf("body = %q, want %q", body, step.wantBody)
+			}
+		})
+	}
+}
+
+// TestReadyz_CredentialRefusedAfterDataPlane guards where the refused-credential
+// reason sits in the readiness order: after registration and the data plane. A
+// node without a registered identity or a data plane in place is not serving
+// whatever the control plane makes of its credential, so those reasons name the
+// first unmet condition and have to win over the refusal.
+func TestReadyz_CredentialRefusedAfterDataPlane(t *testing.T) {
+	srv := NewServer(Config{}, testLogger())
+	h := srv.Handler()
+
+	// The refusal is recorded first and stays set throughout, so every step
+	// shows whether the reason ahead of it still wins.
+	steps := []struct {
+		name       string
+		transition func()
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "credential refused before registration",
+			transition: func() { srv.SetCredentialRefused(true) },
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "not ready: registration pending\n",
+		},
+		{
+			name:       "credential refused while the data plane is not up yet",
+			transition: srv.SetRegistered,
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "not ready: data plane not configured\n",
+		},
+		{
+			name:       "credential refused with the data plane up",
+			transition: srv.SetDataPlaneReady,
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "not ready: node credential refused\n",
+		},
+		{
+			name:       "credential refused while the data plane is lost",
+			transition: func() { srv.recordDataPlaneVerdict(true, errors.New("interface plexd0 not found")) },
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "not ready: data plane lost\n",
+		},
+		{
+			name:       "credential refused once the data plane is back",
+			transition: func() { srv.recordDataPlaneVerdict(false, nil) },
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "not ready: node credential refused\n",
+		},
+	}
+
+	for _, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			step.transition()
+			status, body := probe(t, h, "/readyz")
+			if status != step.wantStatus {
+				t.Errorf("status = %d, want %d", status, step.wantStatus)
+			}
+			if body != step.wantBody {
+				t.Errorf("body = %q, want %q", body, step.wantBody)
+			}
+		})
+	}
+}
+
 func TestReadyz_PullOnlyIsReady(t *testing.T) {
 	srv := NewServer(Config{}, testLogger())
 	srv.SetRegistered()
