@@ -266,6 +266,77 @@ func TestDeliveryModePublisher(t *testing.T) {
 	}
 }
 
+// TestCredentialRefusedPublisher verifies the heartbeat's credential-refused
+// callback gates the shared client, surfaces the refusal as the
+// control_plane_credential metadata key and as its own readiness reason, and
+// that an accepted credential lifts all three again. Without a health listener
+// the client and the cache still follow.
+func TestCredentialRefusedPublisher(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	newClient := func(t *testing.T) *api.ControlPlane {
+		t.Helper()
+		client, err := api.NewControlPlane(api.Config{BaseURL: "https://api.example.com"}, "test", discardLogger())
+		if err != nil {
+			t.Fatalf("create client: %v", err)
+		}
+		return client
+	}
+	assertMark := func(t *testing.T, client *api.ControlPlane, cache *nodeapi.StateCache, refused bool) {
+		t.Helper()
+		if got := client.CredentialRefused(); got != refused {
+			t.Errorf("client.CredentialRefused() = %v, want %v", got, refused)
+		}
+		got, ok := cache.GetMetadataKey("control_plane_credential")
+		if refused && (got != "refused" || !ok) {
+			t.Errorf("control_plane_credential = (%q, %v), want (refused, true)", got, ok)
+		}
+		if !refused && ok {
+			t.Errorf("control_plane_credential = %q, want the key absent", got)
+		}
+	}
+
+	t.Run("with a health listener", func(t *testing.T) {
+		client := newClient(t)
+		cache := nodeapi.NewStateCache(t.TempDir(), logger)
+		healthSrv := health.NewServer(health.Config{}, logger)
+		// Every condition readiness checks ahead of the credential holds, so
+		// the refusal is the only reason it can fail.
+		healthSrv.SetRegistered()
+		healthSrv.SetDataPlaneReady()
+		readyz := func() (int, string) {
+			rec := httptest.NewRecorder()
+			healthSrv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			return rec.Code, rec.Body.String()
+		}
+
+		publish := credentialRefusedPublisher(client, cache, healthSrv)
+
+		publish(true)
+		assertMark(t, client, cache, true)
+		if code, body := readyz(); code != http.StatusServiceUnavailable || body != "not ready: node credential refused\n" {
+			t.Errorf("/readyz = %d %q, want 503 %q", code, body, "not ready: node credential refused\n")
+		}
+
+		publish(false)
+		assertMark(t, client, cache, false)
+		if code, body := readyz(); code != http.StatusOK {
+			t.Errorf("/readyz = %d %q after the credential was accepted again, want 200", code, body)
+		}
+	})
+
+	t.Run("without a health listener", func(t *testing.T) {
+		client := newClient(t)
+		cache := nodeapi.NewStateCache(t.TempDir(), logger)
+
+		publish := credentialRefusedPublisher(client, cache, nil)
+
+		publish(true)
+		assertMark(t, client, cache, true)
+		publish(false)
+		assertMark(t, client, cache, false)
+	})
+}
+
 // stubSystemReader stands in for a platform reader so systemCollectors can be
 // exercised on every operating system.
 type stubSystemReader struct{}
@@ -1598,6 +1669,65 @@ func assertEveryCallPresentsEnvelope(t *testing.T, cp *authRecordingControlPlane
 	}
 }
 
+// refusingControlPlane stands in for a control plane that removed this Node: it
+// answers 401 nsk_invalid on every route but POST /v1/register until accept is
+// called, and 200 with an empty JSON object from then on. Registration carries
+// no credential, so it answers 403 token_consumed instead, as the control plane
+// does for the spent token of a removed Node. It counts the requests on every
+// path.
+type refusingControlPlane struct {
+	mu       sync.Mutex
+	accepted bool
+	requests map[string]int
+}
+
+func newRefusingControlPlane(t *testing.T) (*refusingControlPlane, string) {
+	t.Helper()
+	cp := &refusingControlPlane{requests: make(map[string]int)}
+	srv := httptest.NewServer(http.HandlerFunc(cp.serve))
+	t.Cleanup(srv.Close)
+	return cp, srv.URL
+}
+
+func (cp *refusingControlPlane) serve(w http.ResponseWriter, r *http.Request) {
+	cp.mu.Lock()
+	cp.requests[r.URL.Path]++
+	accepted := cp.accepted
+	cp.mu.Unlock()
+
+	switch {
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/register":
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"title":"Forbidden","code":"token_consumed"}`)
+	case accepted:
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{}"))
+	default:
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"title":"Unauthorized","code":"nsk_invalid"}`)
+	}
+}
+
+// accept makes the control plane admit the node credential again.
+func (cp *refusingControlPlane) accept() {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	cp.accepted = true
+}
+
+// counts returns the number of requests seen so far on each path.
+func (cp *refusingControlPlane) counts() map[string]int {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	out := make(map[string]int, len(cp.requests))
+	for path, n := range cp.requests {
+		out[path] = n
+	}
+	return out
+}
+
 // upDaemonYAML is the extra config a test needs to run the whole daemon rather
 // than stop at registration: no firewall enforcement, no tunnel listener, and a
 // node-API socket short enough to bind on every platform.
@@ -1715,6 +1845,112 @@ func TestRunUp_PresentsBearerEnvelopeAfterRegistration(t *testing.T) {
 			t.Errorf("control plane saw %d registrations, want 0 for a resumed identity", n)
 		}
 	})
+}
+
+// A Node the control plane removed has every call that carries its credential
+// answered 401, and every loop of the daemon used to keep calling at its usual
+// rate for as long as the machine ran. Once the heartbeat parks on three refused
+// heartbeats, the whole daemon has to fall silent toward the control plane, with
+// the heartbeat's backed-off probe as the only call left, and plexd status has
+// to say why. An accepted probe resumes the loops on their next cycle, without a
+// restart.
+func TestRunUp_ParksOnARefusedCredentialAndResumes(t *testing.T) {
+	// Outside a cluster no PlexdHook list runs; an ambient
+	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+	cp, apiBase := newRefusingControlPlane(t)
+	// upDaemonYAML, with the socket path kept so the test reads what plexd
+	// status reads. The third heartbeat parks 200ms in, and the probes then
+	// follow 200ms, 400ms, 800ms and 1.6s apart.
+	socketPath := shortSocketPath(t)
+	dataDir := writeUpConfig(t, apiBase, fmt.Sprintf(`policy:
+  enabled: false
+tunnel:
+  enabled: false
+node_api:
+  socket_path: %s
+heartbeat:
+  interval: 100ms
+reconcile:
+  interval: 1s
+`, socketPath))
+	seedIdentity(t, dataDir, upResumedNodeID, upResumedNSK)
+
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	// One client for every poll, so the polls share a connection.
+	nodeAPI := newSocketClient(socketPath)
+	defer nodeAPI.CloseIdleConnections()
+	// credential reads the control_plane_credential metadata key the way plexd
+	// status does. It fails while the node API is not serving yet.
+	credential := func() (value string, present bool, err error) {
+		resp, err := nodeAPI.Get(socketURL("/v1/state"))
+		if err != nil {
+			return "", false, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", false, fmt.Errorf("GET /v1/state: %s", resp.Status)
+		}
+		var summary nodeapi.StateSummary
+		if err := json.NewDecoder(resp.Body).Decode(&summary); err != nil {
+			return "", false, err
+		}
+		value, present = summary.Metadata["control_plane_credential"]
+		return value, present, nil
+	}
+
+	heartbeatPath := "/v1/nodes/" + upResumedNodeID + "/heartbeat"
+	statePath := "/v1/nodes/" + upResumedNodeID + "/state"
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if value, _, err := credential(); err == nil && value == "refused" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("control_plane_credential never read refused: the heartbeat did not park, or nothing published it")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Parked: the gate stops every loop before it sends, so nothing but the
+	// heartbeat's probe reaches the control plane. The window spans two
+	// reconcile cycles, and with the probes backing off from 200ms at most three
+	// of them fall into it.
+	before := cp.counts()
+	quiet := time.Now().Add(2 * time.Second)
+	for time.Now().Before(quiet) {
+		for path, n := range cp.counts() {
+			if path != heartbeatPath && n != before[path] {
+				t.Fatalf("%d requests on %s while parked, want none: only the heartbeat probes", n-before[path], path)
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	parked := cp.counts()
+	if n := parked[heartbeatPath] - before[heartbeatPath]; n > 3 {
+		t.Errorf("%d heartbeats in 2s while parked, want at most 3 backed-off probes", n)
+	}
+
+	// The next probe is accepted, which lifts the mark, and the reconciler's
+	// next cycle pulls state again.
+	cp.accept()
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		_, present, err := credential()
+		cleared := err == nil && !present
+		pulls := cp.counts()[statePath] - parked[statePath]
+		if cleared && pulls > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("5s after the control plane accepted the credential: control_plane_credential cleared = %v and %d state pulls, want it cleared and a pull", cleared, pulls)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // The one rule that keeps the two layers from drifting apart again: the
