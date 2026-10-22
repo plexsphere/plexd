@@ -238,7 +238,7 @@ Internal function that sends the discovered endpoint to the control plane and re
 
 ## Local endpoint candidates
 
-Two nodes behind one NAT router both publish the router's address as their STUN endpoint. The node therefore also publishes its local interface addresses, each joined with the WireGuard listen port, on [`PUT /v1/nodes/{node_id}/endpoint-candidates`](../core/api-endpoints.md#put-v1-nodes-node-id-endpoint-candidates). Peers receive them as `endpoint_candidates` on the state pull, try the ones on a subnet they share first, and keep the first entry that completes a handshake (see [Dial order](wireguard.md#dial-order) and [Endpoint selection](wireguard.md#endpoint-selection)).
+Two nodes behind one NAT router both publish the router's address as their STUN endpoint. The node therefore also publishes its local interface addresses, each joined with the WireGuard listen port, on [`PUT /v1/nodes/{node_id}/endpoint-candidates`](../core/api-endpoints.md#put-v1-nodes-node-id-endpoint-candidates). Peers receive them as `endpoint_candidates` on the state pull, after any peer-observed endpoints of this node, which the control plane lists first and which can push trailing local candidates past the cap of 8 (see [Peer-observed endpoints](peer-endpoint-exchange.md#peer-observed-endpoints)). Peers try the ones on a subnet they share first, and keep the first entry that completes a handshake (see [Dial order](wireguard.md#dial-order) and [Endpoint selection](wireguard.md#endpoint-selection)).
 
 A peer on the same network reaches a candidate only when UDP `wireguard.listen_port` is open on that local address. Where a host or network firewall drops it, the peer's trial of the candidate times out and the peer moves on to the next entry of its dial order.
 

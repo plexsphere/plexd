@@ -498,6 +498,8 @@ The handler reads this host's interface prefixes, through the function [`SetLoca
 
 Candidates keep the order the pull lists them in within each group. A duplicate keeps its first position. A peer with no usable candidate, no usable direct endpoint and no fallback gets an empty order and is programmed without an endpoint.
 
+The control plane lists a peer's peer-observed endpoints, NAT mappings other nodes of the Domain completed handshakes over, ahead of its local candidates (see [State](../core/api-endpoints.md#get-v1-nodes-node-id-state)). The on-link test, not the wire position, decides where one lands. A mapping is usually off-link, so it comes after the direct endpoint and ahead of the later off-link candidates. It is on-link, and comes first, only when this node has an address in a prefix that contains it, such as a public address configured on an eligible interface. A mapping on the direct endpoint's address with another port, such as a published `:51820` that the peer's router maps to `:10482`, is a separate entry, tried right after the endpoint.
+
 The direct endpoint and each candidate are held to the same rules. One is usable when all of these hold:
 
 - It parses with `netip.ParseAddrPort` and its port is not 0.

@@ -165,7 +165,19 @@ The adapter is created inside `Run` with the `cpClient` from the Exchanger. The 
 
 **Outbound path** (report loop): STUN discovery produces the node's public endpoint. The Exchanger reports it to the control plane via `controlPlaneReporter` and receives a `stale_after` freshness deadline that schedules the next report. The response no longer carries peer endpoints.
 
-**Inbound path** (state pull): The endpoint a remote peer reports reaches this node as the `endpoint` member of that peer in `GET /v1/nodes/{node_id}/state`. The member is absent while the peer has no fresh observation. When a peer reports a new endpoint, the control plane pushes a `peer_endpoint_changed` SSE event. `plexd up` registers the event as a reconcile trigger and never decodes its payload, so the new endpoint arrives on the pull the event brings forward. The same pull carries the peer's `endpoint_candidates`. The WireGuard reconcile handler builds the peer's dial order from its candidates, its usable direct endpoint and its `fallback_endpoint`, and endpoint selection keeps the first entry that completes a handshake (see [Dial order](wireguard.md#dial-order)).
+**Inbound path** (state pull): The endpoint a remote peer reports reaches this node as the `endpoint` member of that peer in `GET /v1/nodes/{node_id}/state`. The member is absent while the peer has no fresh observation. When a peer reports a new endpoint, the control plane pushes a `peer_endpoint_changed` SSE event. `plexd up` registers the event as a reconcile trigger and never decodes its payload, so the new endpoint arrives on the pull the event brings forward. The same pull carries the peer's `endpoint_candidates`: its peer-observed endpoints first, then its local candidates (see [Peer-observed endpoints](#peer-observed-endpoints)). The WireGuard reconcile handler builds the peer's dial order from its candidates, its usable direct endpoint and its `fallback_endpoint`, and endpoint selection keeps the first entry that completes a handshake (see [Dial order](wireguard.md#dial-order)).
+
+### Peer-observed endpoints
+
+A peer's `endpoint_candidates` can hold addresses the peer never reported: its peer-observed endpoints, which the control plane lists ahead of its local candidates. They come from other nodes' handshake reports. Every node's [handshake reporter](../core/heartbeat-service.md#handshake-reporter) sends the endpoint WireGuard used for each peer it completed a handshake with, so this node counts as one of a peer's observers while it has a direct handshake with that peer within the Domain's endpoint TTL. A handshake through the peer's relay fallback never counts. The rule that turns those reports into a candidate is under [State](../core/api-endpoints.md#get-v1-nodes-node-id-state).
+
+The wire does not mark which entry is which, so plexd orders a peer-observed endpoint like any other candidate (see [Dial order](wireguard.md#dial-order)). A mapping is usually off-link, so it is tried after the peer's usable direct endpoint and before its fallback.
+
+A peer-observed endpoint appears on a pull once a second node reports it, and leaves once fewer than two of those reports are within the Domain's endpoint TTL. Each change is a change to `endpoint_candidates`, so the differ updates the peer: a peer that is not connected restarts at the first entry of its dial order, and a connected peer keeps the endpoint on its device (see [Endpoint selection](wireguard.md#endpoint-selection)).
+
+A wrong entry costs one trial, the keepalive interval plus 5 s (30 s by default), because WireGuard completes a handshake only with the holder of the peer's key. plexd holds every entry to the usability rules of the direct endpoint, the Domain mesh prefix check included, which the control plane does not apply.
+
+`nat.local_candidates: false` withholds only this node's local candidates. Peers still receive its peer-observed endpoints, because those come from other nodes' reports.
 
 ## Integration Points
 
@@ -184,7 +196,7 @@ The Exchanger does not program WireGuard. Inbound peer endpoints reach the devic
 ### With internal/api
 
 - `api.ControlPlane.ReportEndpoint` reports endpoints (wrapped by adapter)
-- `api.SnapshotPeer.Endpoint` carries a peer's direct endpoint on the state pull, and `api.SnapshotPeer.EndpointCandidates` its local endpoint candidates
+- `api.SnapshotPeer.Endpoint` carries a peer's direct endpoint on the state pull, and `api.SnapshotPeer.EndpointCandidates` its endpoint candidates (peer-observed endpoints, then local candidates)
 - `api.EventPeerEndpointChanged` is the event type `plexd up` registers as a reconcile trigger; the Exchanger registers no SSE handler
 
 ## Error Handling

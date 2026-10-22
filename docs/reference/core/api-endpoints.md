@@ -356,8 +356,10 @@ Called after STUN discovery, then on a deadline derived from the response (see b
 Reports the node's local interface addresses, each joined with its WireGuard
 listen port, as endpoint candidates. Each report replaces every candidate the
 node reported before. Peers receive them as `endpoint_candidates` in the `peers`
-block of the [state pull](#get-v1-nodes-node-id-state) and try them in their
-[dial order](../networking/wireguard.md#dial-order). The operation is separate
+block of the [state pull](#get-v1-nodes-node-id-state), after the node's
+peer-observed endpoints, and try them in their
+[dial order](../networking/wireguard.md#dial-order). When both together exceed
+8, the pull leaves off the trailing candidates. The operation is separate
 from [`PUT /v1/nodes/{node_id}/endpoint`](#put-v1-nodes-node-id-endpoint), and
 plexd reports on it from a loop of its own, so a node whose STUN discovery fails
 still publishes its local addresses. See
@@ -430,9 +432,15 @@ waits `nat.refresh_interval` before the next one.
 Reports, for every mesh peer the node has completed a WireGuard handshake with,
 the age of the latest handshake and the endpoint WireGuard used for it. The
 control plane keeps the latest observation per directed edge and derives each
-mesh edge's `status`, `mode`, `handshake_age_seconds` and `endpoint` from it. The
-report carries no transfer counters: per-peer `rx_bytes` and `tx_bytes` travel as
-`tunnel_health` samples on the [metrics batch](#observability).
+mesh edge's `status`, `mode`, `handshake_age_seconds` and `endpoint` from it.
+When at least two live nodes report a direct handshake with the same peer at the
+same endpoint within the Domain's endpoint TTL, the control plane also lists that
+endpoint as a peer-observed endpoint at the head of the peer's
+`endpoint_candidates` on the [state pull](#get-v1-nodes-node-id-state) of every
+node of the Domain except the peer, unless it equals the peer's `endpoint`, its
+`fallback_endpoint` or one of its local candidates. The report carries no
+transfer counters: per-peer `rx_bytes` and `tx_bytes` travel as `tunnel_health`
+samples on the [metrics batch](#observability).
 
 **Request body** (`HandshakeReportRequest`):
 
@@ -707,11 +715,25 @@ absence.
 A peer's `endpoint` is its direct WireGuard endpoint as `host:port` (an IPv6
 host in brackets), the address the peer last reported through
 [`PUT /v1/nodes/{node_id}/endpoint`](#put-v1-nodes-node-id-endpoint). It is
-absent while the peer has no fresh NAT observation. A peer's
-`endpoint_candidates` are its last accepted, unexpired candidates from
-[`PUT /v1/nodes/{node_id}/endpoint-candidates`](#put-v1-nodes-node-id-endpoint-candidates),
-as `host:port` strings in the order the peer sent them; the member is absent
-when the peer has none, and on every control plane that does not deliver them.
+absent while the peer has no fresh NAT observation.
+
+A peer's `endpoint_candidates` lists, as `host:port` strings, first the peer's
+peer-observed endpoints, sorted by address and port. A peer-observed endpoint is
+an address and port at which at least two live nodes of the Domain reported,
+through [`POST /v1/nodes/{node_id}/handshakes`](#post-v1-nodes-node-id-handshakes),
+a direct WireGuard handshake with the peer that completed within the Domain's
+endpoint TTL. A handshake at the peer's `fallback_endpoint` never counts. The
+control plane leaves one out when it equals the peer's `endpoint`, its
+`fallback_endpoint`, one of its local candidates or an earlier entry, or when it
+has port 0, a zone, or a loopback, link-local, multicast or unspecified address.
+The peer's last accepted, unexpired local candidates from
+[`PUT /v1/nodes/{node_id}/endpoint-candidates`](#put-v1-nodes-node-id-endpoint-candidates)
+follow, in the order the peer sent them. The list holds at most 8 entries: when
+both together exceed 8, the control plane drops the trailing local candidates.
+Only nodes of the peer's Domain receive them. The member is absent when no entry
+remains, and on every control plane that does not deliver it. A control plane
+older than peer-observed endpoints lists only the local candidates.
+
 The pull carries no PSK: plexd fetches the pairwise PSK of each edge from
 [`GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`](#edge-psk).
 
