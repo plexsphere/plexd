@@ -285,8 +285,9 @@ func TestCommitRotatedKey_ReReadsIdentityAfterReRegistration(t *testing.T) {
 		t.Fatalf("SaveIdentity(stale): %v", err)
 	}
 
-	// A re-registration replaces the identity on disk while the rotator still
-	// holds the pre-registration struct.
+	// A registration replaces the identity on disk while the rotator still holds
+	// the struct it captured earlier. No caller does this in-process today; the
+	// commit must still not undo it.
 	fresh := &NodeIdentity{
 		NodeID:           "node-new",
 		MeshIP:           "100.64.0.9",
@@ -336,11 +337,12 @@ func TestCommitRotatedKey_ReReadsIdentityAfterReRegistration(t *testing.T) {
 }
 
 func TestCommitRotatedKey_ConcurrentWithSaveIdentity(t *testing.T) {
-	// Re-registration runs on the heartbeat goroutine while a rotation runs on
-	// its own; both read-modify-write the identity file group. Interleaved, the
-	// commit either fails inside SaveIdentity's identity.json removal window or
-	// rewrites identity.json from a snapshot taken before the re-registration,
-	// leaving an identity.json that disagrees with node_secret_key.
+	// SaveIdentity (startup registration, or any future caller) and
+	// CommitRotatedKey (the rotator goroutine) both read-modify-write the
+	// identity file group. Interleaved without identityMu, the commit either
+	// fails inside SaveIdentity's identity.json removal window or rewrites
+	// identity.json from a snapshot taken before the registration, leaving an
+	// identity.json that disagrees with node_secret_key.
 	dir := t.TempDir()
 
 	nskFor := func(i int) string {

@@ -125,14 +125,15 @@ func parseNodeUUID(s string) ([]byte, error) {
 }
 
 // identityMu serialises every mutation of the identity file group in the data
-// dir. Re-registration (SaveIdentity, driven by the heartbeat goroutine) and
-// key rotation (CommitRotatedKey, driven by the rotator goroutine) both
-// read-modify-write that group. Without this lock a commit can read
-// identity.json inside SaveIdentity's remove-and-rewrite window — failing
-// outright — or rewrite it from a snapshot taken before the re-registration,
-// binding the rotated private key to the node the control plane just deleted.
-// Every writer of the group must hold it; LoadIdentity does not, so functions
-// holding it may read freely.
+// dir. SaveIdentity (called by registration) and CommitRotatedKey (called by
+// the key rotator) both read-modify-write that group. plexd up finishes startup
+// registration before it builds the rotator, so today the two never overlap and
+// the lock is defensive. If a future caller ran them concurrently, a commit
+// could read identity.json inside SaveIdentity's remove-and-rewrite window —
+// failing outright — or rewrite it from a snapshot taken before the
+// registration, binding the rotated private key to a node the control plane no
+// longer knows. Every writer of the group must hold it; LoadIdentity does not,
+// so functions holding it may read freely.
 var identityMu sync.Mutex
 
 // SaveIdentity persists the node identity atomically to dataDir.

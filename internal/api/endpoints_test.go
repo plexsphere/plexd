@@ -113,9 +113,9 @@ func TestRegister_Success(t *testing.T) {
 
 // POST /v1/register is security: [] — it must never carry the shared bearer
 // token, and it must not blank that token on the client the heartbeat, SSE, and
-// reconcile paths share. Otherwise those concurrent requests would go out
-// unauthenticated during a re-registration and, for SSE, exit for good on the
-// resulting 401.
+// reconcile paths share, so any caller that registers on a live client leaves
+// the credential those paths use intact. Via withoutAuth it also passes the
+// refused-credential gate.
 func TestRegister_OmitsAuthHeaderAndPreservesToken(t *testing.T) {
 	var registerAuth, followupAuth string
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {

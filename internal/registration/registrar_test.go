@@ -1341,9 +1341,10 @@ func TestNodeIdentity_SecretKeyDecodesNSK(t *testing.T) {
 }
 
 // The client is shared with the heartbeat, SSE, state, and reconcile paths. A
-// re-registration that fails must leave the previous credential in place
-// instead of wedging every later request as unauthenticated. Register never
-// touches the shared token, so the previous nsk is still there for later calls.
+// registration that fails must leave whatever credential the client already
+// holds in place: POST /v1/register is security: [] and a failed Register
+// leaves the shared token alone, so a previous nsk still authenticates later
+// calls.
 func TestRegistrar_LeavesPreviousAuthTokenOnFailedRegistration(t *testing.T) {
 	var registerAuth, followupAuth string
 	var mu sync.Mutex
