@@ -203,7 +203,7 @@ Asserts that both platform counters (`metrics_count`, `logs_count`, `audit_count
 
 ### Phase 20: Bearer Envelope on Every Authenticated Call
 
-Every phase above runs through the mock's bearer-envelope gate, so this one states the outcome: `unauthorized_count` is 0 across the whole run, and the agent log carries no `heartbeat auth failure`. Both halves matter — an agent that registers successfully and is then refused on every later call looks healthy while delivering nothing, which is how the defect in issue #60 reached two releases. A phase that drives an authenticated route itself presents the same envelope, fetched once from `GET /test/bearer`.
+Every phase above runs through the mock's bearer-envelope gate, so this one states the outcome: `unauthorized_count` is 0 across the whole run, and the agent log carries no `credential refused` line, which the heartbeat logs as a Warn on the first two `401`s in a row and as an Error when the third parks the agent. Both halves matter — an agent that registers successfully and is then refused on every later call looks healthy while delivering nothing, which is how the defect in issue #60 reached two releases. A phase that drives an authenticated route itself presents the same envelope, fetched once from `GET /test/bearer`.
 
 ### Phase 14: Graceful Shutdown
 
