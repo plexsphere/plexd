@@ -63,6 +63,7 @@ const (
 	bodyRegistrationPending = "not ready: registration pending\n"
 	bodyDataPlanePending    = "not ready: data plane not configured\n"
 	bodyDataPlaneLost       = "not ready: data plane lost\n"
+	bodyCredentialRefused   = "not ready: node credential refused\n"
 	bodyDeliveryStopped     = "not ready: event delivery stopped\n"
 	bodyDeliveryDegraded    = "not ready: event delivery degraded\n"
 	bodySubsystemStopped    = "not ready: subsystem stopped\n"
@@ -81,13 +82,14 @@ type Server struct {
 	// dataPlaneCheckPeriod. Tests shorten it.
 	checkPeriod time.Duration
 
-	mu               sync.Mutex
-	registered       bool
-	dataPlaneReady   bool
-	dataPlaneLost    bool
-	deliveryStopped  bool
-	subsystemStopped bool
-	mode             api.DeliveryMode
+	mu                sync.Mutex
+	registered        bool
+	dataPlaneReady    bool
+	dataPlaneLost     bool
+	credentialRefused bool
+	deliveryStopped   bool
+	subsystemStopped  bool
+	mode              api.DeliveryMode
 }
 
 // NewServer creates a new Server. Config defaults are applied automatically.
@@ -190,6 +192,18 @@ func (s *Server) SetDeliveryStopped() {
 	s.deliveryStopped = true
 }
 
+// SetCredentialRefused records whether the control plane refuses the node
+// credential. Unlike the delivery stop it is not a latch: the heartbeat keeps
+// probing while the credential is refused, and clears the mark again once a
+// probe is accepted.
+//
+// It logs nothing: the heartbeat logs the refusal and the recovery itself.
+func (s *Server) SetCredentialRefused(refused bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.credentialRefused = refused
+}
+
 // SetSubsystemStopped records that a long-running subsystem exited before
 // shutdown. Readiness answers 503 from then on: nothing restarts these
 // goroutines, so the process stays alive while no longer doing the work the node
@@ -231,16 +245,19 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 // handleReadyz answers readiness: 200 only when the node has a registered
-// identity, a mesh data plane that is still in place, a working event-delivery
-// path to the control plane, and every long-running subsystem alive. The
-// conditions are checked in the order the agent establishes them, so the
-// reported reason names the first one still unmet: an unregistered node has no
-// data plane to bring up yet, and a node without a data plane is not serving
-// regardless of how its event stream is doing.
+// identity, a mesh data plane that is still in place, a node credential the
+// control plane accepts, a working event-delivery path to the control plane,
+// and every long-running subsystem alive. The conditions are checked in the
+// order the agent establishes them, so the reported reason names the first one
+// still unmet: an unregistered node has no data plane to bring up yet, and a
+// node without a data plane is not serving regardless of how its event stream
+// is doing. A refused credential comes before event delivery because the event
+// stream stops on the same refusal, and "event delivery stopped" would hide the
+// cause.
 func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	registered, dataPlaneReady := s.registered, s.dataPlaneReady
-	dataPlaneLost := s.dataPlaneLost
+	dataPlaneLost, credentialRefused := s.dataPlaneLost, s.credentialRefused
 	deliveryStopped, subsystemStopped := s.deliveryStopped, s.subsystemStopped
 	mode := s.mode
 	s.mu.Unlock()
@@ -252,6 +269,8 @@ func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 		writePlain(w, http.StatusServiceUnavailable, bodyDataPlanePending)
 	case dataPlaneLost:
 		writePlain(w, http.StatusServiceUnavailable, bodyDataPlaneLost)
+	case credentialRefused:
+		writePlain(w, http.StatusServiceUnavailable, bodyCredentialRefused)
 	case deliveryStopped:
 		writePlain(w, http.StatusServiceUnavailable, bodyDeliveryStopped)
 	case !deliveryReady(mode):

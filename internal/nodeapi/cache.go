@@ -42,9 +42,13 @@ type StateCache struct {
 	// metadata map so the authoritative pull reconcile, which rebuilds that map
 	// from scratch on every cycle, cannot clobber it.
 	deliveryMode string
-	data         map[string]api.DataEntry
-	secretIndex  []api.SecretRef
-	reports      map[string]ReportEntry
+	// credentialRefused records that the control plane refuses the node
+	// credential. Like deliveryMode it is held apart from the snapshot-owned
+	// metadata map and surfaced only through the metadata view.
+	credentialRefused bool
+	data              map[string]api.DataEntry
+	secretIndex       []api.SecretRef
+	reports           map[string]ReportEntry
 	// orphanedReports holds the keys of persisted reports Load rejected because
 	// they predate the current key grammar. They are unreachable through every
 	// local route, so the syncer is the only thing that can still act on them.
@@ -233,8 +237,32 @@ func (sc *StateCache) SetDeliveryMode(mode string) {
 	sc.deliveryMode = mode
 }
 
+// credentialMetadataKey is the synthetic metadata key under which a refused
+// node credential is surfaced, and credentialRefusedValue is the value the
+// overlay gives it. Like delivery_mode it is overlaid on the metadata view
+// rather than stored: while the control plane refuses the credential the key
+// reads "refused", overriding a snapshot-delivered key of the same name;
+// otherwise it carries whatever the snapshot delivered, if anything.
+const (
+	credentialMetadataKey  = "control_plane_credential"
+	credentialRefusedValue = "refused"
+)
+
+// SetCredentialRefused records whether the control plane refuses the node
+// credential. It is stored separately from the snapshot-owned metadata map and
+// is intentionally not persisted: the heartbeat detects a refused credential
+// again within three heartbeats of a restart, and a persisted mark would outlive
+// a control plane that was fixed meanwhile.
+func (sc *StateCache) SetCredentialRefused(refused bool) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.credentialRefused = refused
+}
+
 // GetMetadata returns a copy of the metadata map, with the delivery-mode
-// diagnostic overlaid as the delivery_mode key when a mode is set.
+// diagnostic overlaid as the delivery_mode key when a mode is set, and the
+// control_plane_credential key overlaid as "refused" while the control plane
+// refuses the node credential.
 func (sc *StateCache) GetMetadata() map[string]string {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
@@ -245,16 +273,27 @@ func (sc *StateCache) GetMetadata() map[string]string {
 		}
 		m[deliveryModeMetadataKey] = sc.deliveryMode
 	}
+	if sc.credentialRefused {
+		if m == nil {
+			m = make(map[string]string, 1)
+		}
+		m[credentialMetadataKey] = credentialRefusedValue
+	}
 	return m
 }
 
 // GetMetadataKey returns the value for a metadata key and whether it exists.
-// The delivery_mode key resolves to the delivery-mode diagnostic.
+// The delivery_mode key resolves to the delivery-mode diagnostic, and the
+// control_plane_credential key to "refused" while the control plane refuses the
+// node credential.
 func (sc *StateCache) GetMetadataKey(key string) (string, bool) {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 	if key == deliveryModeMetadataKey && sc.deliveryMode != "" {
 		return sc.deliveryMode, true
+	}
+	if key == credentialMetadataKey && sc.credentialRefused {
+		return credentialRefusedValue, true
 	}
 	v, ok := sc.metadata[key]
 	return v, ok
