@@ -3609,10 +3609,11 @@ echo "=== Phase 19 PASSED: release-verdict upgrade flow ==="
 #
 # Every phase above ran through the mock's bearer-envelope gate, so this one
 # only has to state the outcome: across the whole run the control plane refused
-# nothing, and the agent never logged the auth failure that would have driven a
-# re-registration loop. Both halves matter — v0.3.0 registered successfully and
-# then 401ed on every later call, which looks like a healthy node until the
-# reports it never delivered are missed (issue #60).
+# nothing, and the agent never logged a refused credential. Its heartbeat warns
+# on the first two 401s in a row and logs an Error when the third parks the
+# agent and suspends its control-plane calls. Both halves matter — v0.3.0
+# registered successfully and then 401ed on every later call, which looks like
+# a healthy node until the reports it never delivered are missed (issue #60).
 # ===================================================================
 echo "=== Testing that every authenticated call presented the NSK envelope ==="
 
@@ -3622,11 +3623,11 @@ if [ "${UNAUTHORIZED}" != "0" ]; then
 fi
 echo "  PASS: unauthorized_count = 0 across the whole run"
 
-AUTH_FAILURES=$(dc logs plexd 2>/dev/null | grep -c "heartbeat auth failure" || true)
-if [ "${AUTH_FAILURES}" != "0" ]; then
-    fail "plexd logged ${AUTH_FAILURES} heartbeat auth failure(s), so the credential it presents is being refused"
+CREDENTIAL_REFUSALS=$(dc logs plexd 2>/dev/null | grep -c "credential refused" || true)
+if [ "${CREDENTIAL_REFUSALS}" != "0" ]; then
+    fail "plexd logged ${CREDENTIAL_REFUSALS} credential refused line(s), so the control plane refuses the credential it presents"
 fi
-echo "  PASS: no heartbeat auth failure in the agent log"
+echo "  PASS: no credential refused line in the agent log"
 
 echo "=== Phase 20 PASSED: bearer envelope on every authenticated call ==="
 
