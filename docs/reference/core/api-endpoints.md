@@ -167,7 +167,7 @@ Sent at `heartbeat.interval` (default 30s).
 | `400 Bad Request` | `clock_skew` | `client_now` more than 60s from server time |
 | `400 Bad Request` | `binary_checksum_empty` | `binary_checksum` missing or not a valid SHA-256 encoding |
 | `400 Bad Request` | `binary_version_empty` | `binary_version` missing |
-| `401 Unauthorized` | — | Node identity invalid, re-register |
+| `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked. Three refused heartbeats with no accepted one between them park the agent (see [Credential Park](heartbeat-service.md#credential-park)) |
 
 ## Key Management
 

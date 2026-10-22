@@ -22,8 +22,11 @@ Before starting, understand these design properties:
 
 - **Dual delivery.** When a local endpoint is configured, data is sent to both
   the control plane and the local endpoint concurrently and independently.
-- **Error isolation.** Local endpoint failures are logged as warnings but
-  **never** block or affect platform delivery. The control plane always
+- **Error isolation.** Local endpoint failures are logged as warnings (at debug
+  level when the failure is `api.ErrCredentialRefused`, the node credential
+  refused while the heartbeat is parked, see
+  [Quiet Failure Logs](../reference/core/heartbeat-service.md#quiet-failure-logs)),
+  but **never** block or affect platform delivery. The control plane always
   receives its data regardless of local endpoint health.
 - **Fire-and-forget.** Local endpoint delivery has no retry or backoff
   mechanism. If a POST fails, the batch is not retried — the next scheduled
@@ -72,7 +75,10 @@ the actual token through the following flow:
 
 - Resolved tokens are cached in memory with a **5-minute TTL**.
 - If a refresh fetch or decryption fails and a stale cached token exists, the
-  stale token is used as a fallback and a warning is logged.
+  stale token is used as a fallback and a warning is logged. A fetch refused
+  with `api.ErrCredentialRefused`, while the heartbeat is parked on a refused
+  node credential, logs the same line at debug level instead (see
+  [Quiet Failure Logs](../reference/core/heartbeat-service.md#quiet-failure-logs)).
 - If no cached token exists and the fetch fails, the delivery is skipped for
   that cycle.
 

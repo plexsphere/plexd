@@ -85,7 +85,7 @@ flowchart TD
 5e. **Initialize Bridge** (bridge mode only) — create bridge manager, ACME, ingress, user access, site-to-site managers; run Setup on each
 6. **Create SSE manager** — `api.NewSSEManager()` with handlers for signing key rotation, WireGuard peer events, tunnel events, policy events, and bridge events (bridge mode)
 7. **Create reconciler** — `reconcile.NewReconciler()` with handlers for WireGuard, policy, and bridge reconciliation
-8. **Create heartbeat service** — `agent.NewHeartbeatService()` with subsystem status enrichment, auth-failure callback, and key-rotation callback
+8. **Create heartbeat service** — `agent.NewHeartbeatService()` with subsystem status enrichment and key-rotation callback; its credential-refused callback is set in step 12, once the node API server exists
 9. **Create integrity store + verifier** — `integrity.NewStore()` and `integrity.NewVerifier()` for hook checksums
 10. **Create action executor** — `actions.NewExecutor()`, register 11 built-in actions, register `actions.NewDispatcher()` on the reconciler as a dispatch handler, report capabilities to control plane
 11. **Create hook watcher** — `actions.NewHookWatcher()` for filesystem hook scanning
@@ -159,7 +159,7 @@ flowchart TD
 
 1. **Bootstrap** — node registers using a bootstrap token (file, env var, or metadata service)
 2. **Node Secret Key** — registration returns a `NodeSecretKey` used for all subsequent API authentication
-3. **Heartbeat Auth** — each heartbeat uses the node secret key; on 401 Unauthorized, the `onAuthFailure` callback triggers re-registration
+3. **Heartbeat Auth** — each heartbeat uses the node secret key; three heartbeats answered 401 Unauthorized (`unauthorized`, `nsk_invalid` or `nsk_revoked`) with no accepted one between them park the agent, which then stops calling the control plane and probes the credential with the heartbeat (see [Credential Park](reference/core/heartbeat-service.md#credential-park))
 4. **Key Rotation** — on `signing_key_rotated` SSE events or heartbeat `RotateKeys` flag, the Ed25519 verifier keys are updated
 
 ## SSE Event Types

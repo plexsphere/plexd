@@ -193,6 +193,9 @@ All files are written atomically (temp file + fsync + rename). Directories are c
 | `GetReport`        | `(key string) (ReportEntry, bool)`                                          | Returns single report entry                                   |
 | `PutReport`        | `(key, contentType string, payload json.RawMessage, ifMatch *int) (ReportEntry, error)` | Creates/updates report with optimistic locking       |
 | `DeleteReport`     | `(key string) error`                                                         | Removes report entry and its file                             |
+| `SetCredentialRefused` | `(refused bool)`                                                         | Overlays or removes the `control_plane_credential` metadata key; not persisted |
+
+`SetCredentialRefused(true)` is called when the heartbeat parks on a refused credential (see [Credential Park](heartbeat-service.md#credential-park)), and `SetCredentialRefused(false)` when a probe is accepted again. While the flag is set, `GetMetadata` and `GetMetadataKey` overlay the key `control_plane_credential` with the value `refused`; otherwise the key carries whatever the snapshot delivered, and is absent when the snapshot has none. The overlay is not persisted: a cache loaded after a restart does not carry it. Like `delivery_mode` (see [Reading a Node's Event Delivery Mode](../../how-to/delivery-modes.md)), it overrides a snapshot-delivered key of the same name. `GET /v1/state` and the metadata endpoints return it, and `plexd status` prints the two refusal lines when it reads `refused` (see [`plexd status`](cli.md#plexd-status)).
 
 ### ReportEntry
 
@@ -248,7 +251,7 @@ The node ID is supplied later to `Run` because the syncer is constructed in
 1. **Notification** — `NotifyChange` merges entries (pending PUTs) and deleted keys (pending deletes) into the dirty map and sends a non-blocking signal.
 2. **Debounce** — after a signal, waits `DebouncePeriod` (default 5s) to coalesce a burst before flushing.
 3. **Flush** — snapshots the dirty map and reconciles each key **in ascending key order**, one at a time: a `nil` entry is a `DELETE`, otherwise a `PUT`. A key is cleared only if it still holds the snapshotted version, so a write that raced the flush stays dirty for the next round.
-4. **Retryable failure** — a key left dirty by a transient error is re-flushed on a **30-second** timer, without waiting for a new local mutation.
+4. **Retryable failure** — a key left dirty by a transient error is re-flushed on a **30-second** timer, without waiting for a new local mutation. The failure logs `report put failed` or `report delete failed` at Warn, or at Debug for `api.ErrCredentialRefused` while the heartbeat is parked (see [Quiet Failure Logs](heartbeat-service.md#quiet-failure-logs)); the key stays dirty either way.
 5. **`DELETE` 404** — `report_not_found` is treated as success (the report is already absent upstream).
 6. **`PUT` 400** — `invalid_report` is a permanent refusal; the key is dropped with a Warn (unreachable once the local API enforces the same grammar and cap, kept as defense in depth).
 7. **Not provisioned (501)** — a `reports_not_provisioned` refusal aborts the flush and **suppresses every HTTP attempt for 5 minutes**, logging the transition once; the keys stay dirty until the window elapses.

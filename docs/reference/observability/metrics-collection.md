@@ -527,7 +527,7 @@ On each `ReportMetrics` call, `LocalReporter` resolves a bearer token via the fo
 
 | Scenario | Behavior |
 |----------|----------|
-| Fetch or decrypt fails, stale cache exists | Log warning, return stale cached token |
+| Fetch or decrypt fails, stale cache exists | Log warning (Debug for `api.ErrCredentialRefused`), return stale cached token |
 | Fetch or decrypt fails, no cache | Return error, no HTTP POST is made |
 
 The cache is protected by `sync.RWMutex` with a double-checked locking pattern, making it safe for concurrent `ReportMetrics` calls.
@@ -569,8 +569,8 @@ func NewMultiReporter(platform, local MetricsReporter, logger *slog.Logger) *Mul
 |-----------------|--------------|--------------|-------------|
 | success | success | `nil` | — |
 | error | success | platform error | — |
-| success | error | `nil` | Local error logged as warning |
-| error | error | platform error | Local error logged as warning |
+| success | error | `nil` | Local error logged as warning (Debug for `api.ErrCredentialRefused`) |
+| error | error | platform error | Local error logged as warning (Debug for `api.ErrCredentialRefused`) |
 
 Only the platform error is returned. This is critical because the `Manager` uses the return value to decide whether to retain the batch in its buffer for retry. Local endpoint failures must not trigger batch retention.
 
@@ -803,7 +803,7 @@ type MetricPoint struct {
 | Scenario                        | Behavior                                            |
 |---------------------------------|-----------------------------------------------------|
 | Collector returns error         | Log warn, skip collector, continue with others      |
-| Reporter returns error          | Log warn, buffer is cleared, continue next cycle    |
+| Reporter returns error          | Log warn (debug for `api.ErrCredentialRefused`), buffer is cleared, continue next cycle |
 | All collectors fail             | Empty buffer, report tick is a no-op                |
 | Ping fails for a peer           | Log warn, record RTTNano=-1, continue other peers   |
 | Context cancelled mid-collect   | Partial results returned by latency collector       |
@@ -823,6 +823,8 @@ All log entries use `component=metrics`.
 | `Warn` | Using cached credential    | `component`, `error` |
 | `Warn` | Local metrics report failed| `component`, `error` |
 | `Info` | Local endpoint enabled     | `pipeline`, `url`  |
+
+While the heartbeat is parked on a refused credential (see [Quiet Failure Logs](../core/heartbeat-service.md#quiet-failure-logs)), `metrics report failed`, `local metrics report failed` and the `using cached credential` that follows a failed secret fetch log at Debug, with the same message and attributes, when their error is `api.ErrCredentialRefused`. The `using cached credential` that follows a failed decrypt stays at Warn.
 
 ## Integration Points
 

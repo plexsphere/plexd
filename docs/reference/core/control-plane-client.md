@@ -58,7 +58,9 @@ client.SetAuthToken(bearer)
 
 Thread-safe via `sync.RWMutex`. The token is injected as `Authorization: Bearer {token}` on every request. After registration the registrar arms the client with the NSK bearer envelope (`nsk_<env>_<base64url(node_id || nsk)>`, see the [registration reference](registration.md#bearertoken)) — never the raw NSK, which the control plane refuses with `401`.
 
-The registrar is the sole owner of this credential: it arms the client on both of its paths (resumed identity and fresh registration), and no other production code calls `SetAuthToken`. One client is shared by every post-registration consumer — heartbeat, SSE, reconciler, key rotator, peer exchange, actions, node API, and the platform reporters — so a later assignment does not degrade one caller, it mutes all of them at once. Callers that need a credential re-armed re-register; they do not set the token themselves.
+The registrar is the sole owner of this credential: it arms the client on both of its paths (resumed identity and fresh registration), and no other production code calls `SetAuthToken`. One client is shared by every post-registration consumer — heartbeat, SSE, reconciler, key rotator, peer exchange, actions, node API, and the platform reporters — so a later assignment does not degrade one caller, it mutes all of them at once.
+
+When the heartbeat parks on a credential the control plane keeps refusing, `plexd up` marks the client with `SetCredentialRefused(true)` through the heartbeat's credential-refused callback (see [Heartbeat Service](heartbeat-service.md#credential-park)), and `CredentialRefused()` reports the mark. While it is set, every request that would present the bearer fails with `ErrCredentialRefused` before any I/O: `newRequest` checks the mark first, and `ConnectSSE`, which builds its own request, checks it too. Three calls pass: `POST /v1/register` carries no bearer, `UploadExecutionOutput` sends to a presigned URL without the bearer, and the heartbeat is the probe whose acceptance clears the mark again. `ErrCredentialRefused` is not an `*APIError`, so `errors.Is(err, ErrUnauthorized)` is false for it.
 
 ### API Methods
 
@@ -116,7 +118,10 @@ HTTP errors are mapped to structured `*APIError` values supporting `errors.Is` a
 ```go
 resp, err := client.FetchState(ctx, nodeID)
 if errors.Is(err, api.ErrUnauthorized) {
-    // re-authenticate
+    // the credential was refused; only the heartbeat decides whether to
+    // park (see Authentication)
+} else if errors.Is(err, api.ErrCredentialRefused) {
+    // no request was sent; retry on the next cycle
 } else if errors.Is(err, api.ErrRateLimit) {
     var apiErr *api.APIError
     errors.As(err, &apiErr)
@@ -270,6 +275,9 @@ Manages SSE reconnection with exponential backoff and polling fallback.
 | 429 Rate Limited                          | `RespectServer` — use Retry-After header        |
 | 403 / 404                                 | `PermanentFailure` — stop reconnection          |
 | 501 `signed_event_bus_not_provisioned`    | `RetryDescoped` — switch to pull-only delivery  |
+| `ErrCredentialRefused`                    | `RetryAuth` — invoke callback, stop             |
+
+`ErrCredentialRefused` is classified ahead of the check for an `*APIError`, which would otherwise read it as a transient network error. It stands for the `401` the heartbeat already saw, so the stream stops on it as on a `401` instead of backing off into the polling fallback.
 
 A 501 carrying `signed_event_bus_not_provisioned` is classified ahead of the generic 5xx match: it is a durable descope of the event stream, not a transient error, so it is answered by pull-only delivery rather than backoff. A 501 with any other code, a 503 `event_stream_unavailable`, and network errors stay on the transient path.
 
