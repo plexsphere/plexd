@@ -67,6 +67,36 @@ func TestConfig_SSEReprobeIntervalDefault(t *testing.T) {
 	}
 }
 
+func TestConfig_ValidateSSEIdleTimeout(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout time.Duration
+		wantErr string
+	}{
+		{"negative", -time.Second, "api: config: SSEIdleTimeout must not be negative"},
+		{"zero is valid before defaults", 0, ""},
+		{"default is valid", DefaultSSEIdleTimeout, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{BaseURL: "https://api.example.com", SSEIdleTimeout: tt.timeout}
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Validate() = nil, want %q", tt.wantErr)
+			}
+			if err.Error() != tt.wantErr {
+				t.Errorf("Validate() error = %q, want %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestConfig_ValidateSSEReprobeInterval(t *testing.T) {
 	tests := []struct {
 		name     string

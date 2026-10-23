@@ -69,6 +69,12 @@ func (c *Config) Validate() error {
 	if c.BaseURL == "" {
 		return errors.New("api: config: BaseURL is required")
 	}
+	// The idle timeout is the only bound on an open event stream: the request
+	// timeout ends at the response headers, and a negative value would disable
+	// the idle reader entirely.
+	if c.SSEIdleTimeout < 0 {
+		return errors.New("api: config: SSEIdleTimeout must not be negative")
+	}
 	if c.SSEReprobeInterval < 0 {
 		return errors.New("api: config: SSEReprobeInterval must not be negative")
 	}
