@@ -11,6 +11,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/fsutil"
 )
 
 // ViolationReporter abstracts control plane violation reporting for testability.
@@ -32,6 +33,9 @@ type Verifier struct {
 
 	mu             sync.Mutex
 	binaryChecksum string
+
+	// watchDir is a seam over fsutil.WatchDir, replaced in tests.
+	watchDir func(ctx context.Context, dir string, onRetry func(error)) (*fsnotify.Watcher, error)
 }
 
 // NewVerifier creates a Verifier with the given configuration, store, reporter, and logger.
@@ -41,6 +45,7 @@ func NewVerifier(cfg Config, store *Store, reporter ViolationReporter, logger *s
 		store:    store,
 		reporter: reporter,
 		logger:   logger.With("component", "integrity"),
+		watchDir: fsutil.WatchDir,
 	}
 }
 
@@ -331,17 +336,16 @@ func (v *Verifier) watchHooksDir(ctx context.Context, nodeID string) {
 		return
 	}
 
-	watcher, err := fsnotify.NewWatcher()
+	watcher, err := v.watchDir(ctx, v.cfg.HooksDir, func(err error) {
+		v.logger.Warn("integrity: a hook vanished while the watch was set up; retrying", "path", v.cfg.HooksDir, "error", err)
+	})
 	if err != nil {
-		v.logger.Warn("integrity: failed to create fsnotify watcher", "error", err)
+		if ctx.Err() == nil {
+			v.logger.Warn("integrity: failed to watch hooks dir", "path", v.cfg.HooksDir, "error", err)
+		}
 		return
 	}
 	defer watcher.Close()
-
-	if err := watcher.Add(v.cfg.HooksDir); err != nil {
-		v.logger.Warn("integrity: failed to watch hooks dir", "path", v.cfg.HooksDir, "error", err)
-		return
-	}
 
 	v.logger.Info("integrity: watching hooks dir for changes", "path", v.cfg.HooksDir)
 

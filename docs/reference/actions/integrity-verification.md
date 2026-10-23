@@ -274,6 +274,8 @@ heartbeat := api.HeartbeatRequest{
 
 When `Config.Enabled` is `false`, returns immediately. Otherwise starts a `time.Ticker` at `Config.VerifyInterval` and calls `VerifyBinary`, `VerifyHooksDir`, and `VerifyHostKey` on each tick. Blocks until the context is cancelled.
 
+When `WatchEnabled` is true and `HooksDir` is set, `Run` also watches `HooksDir`, set up through `fsutil.WatchDir`. A hook that vanishes while the watch is set up makes it set the watch up again, up to 10 attempts; a set-up failure is logged at Warn and the periodic sweep keeps running.
+
 ### Detectors
 
 Every violation names the detector that surfaced it, from the contract's closed set:
@@ -367,7 +369,7 @@ func (r *controlPlaneReporter) ReportViolations(ctx context.Context, nodeID stri
 
 ### With internal/fsutil
 
-`Store` uses `fsutil.WriteFileAtomic` for crash-safe checksum persistence. Concurrent readers never see a partially written file.
+`Store` uses `fsutil.WriteFileAtomic` for crash-safe checksum persistence. Concurrent readers never see a partially written file. The hooks-directory watcher sets up its watch with `fsutil.WatchDir`.
 
 ### With internal/registration
 
@@ -400,3 +402,5 @@ All log entries use `component=integrity`.
 | `Error` | Binary hash failed            | `path`, `error`                          |
 | `Error` | Periodic verification failed  | `error`                                  |
 | `Warn`  | Failed to report violation    | `error`                                  |
+| `Warn`  | integrity: a hook vanished while the watch was set up; retrying | `path`, `error` |
+| `Warn`  | integrity: failed to watch hooks dir | `path`, `error`                   |
