@@ -162,7 +162,9 @@ exits 0, or 1 on an error. It is not run by hand, and runs in one of two modes:
 | Child | `--child`, when plexd starts it because the socket does not exist | Every `--trusted-key` (standard base64); no config is read and nothing is pinned |
 
 `--trusted-key` in socket mode, `--child` without `--trusted-key`, and a run that
-is neither socket-activated nor `--child` (or both) are refused. The socket mode
+is neither socket-activated nor `--child` (or both) are refused. On macOS only the
+child mode exists: a run without `--child` is refused with `plexd session-helper:
+plexd starts it as its own child (--child); macOS has no helper socket`. The socket mode
 unsets `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES` before it starts anything.
 Resolving the key fails on a malformed pin
 (`session helper: pinned key <path> is malformed`), on an unregistered node when

@@ -1009,7 +1009,7 @@ on the terminal callback.
 A one-of activity record carrying exactly one of `ssh`, `k8s`, or `tcp`. plexd
 emits `tcp` rows for a tcp session: a `session_started` row when the listener
 comes up and a `session_ended` row on close. It emits `ssh` rows for an ssh
-session, served on Linux: the same two lifecycle rows, plus two command rows
+session, served on Linux and macOS: the same two lifecycle rows, plus two command rows
 around every `exec`. It emits no `k8s` rows.
 
 **Request body** (tcp `session_started`). `listener_endpoint` is the address the node

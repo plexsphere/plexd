@@ -6,7 +6,7 @@ feature: PXD-0009
 
 # Secure Access Tunneling
 
-The `internal/tunnel` package provides platform-mediated access to mesh nodes through WireGuard tunnels without exposing services to the public internet. The control plane declares a node's live sessions in the `sessions` block of the reconciliation state pull; the node agent holds its listeners level with that block, opening a listener bound to the mesh IP for each entry it can provision, and reporting activity back to the control plane. A `tcp` entry gets a TCP listener that forwards connections to the target host. On Linux, an `ssh` entry gets an SSH listener that starts a shell or one command for the session's user (see [SSH Sessions](#ssh-sessions)).
+The `internal/tunnel` package provides platform-mediated access to mesh nodes through WireGuard tunnels without exposing services to the public internet. The control plane declares a node's live sessions in the `sessions` block of the reconciliation state pull; the node agent holds its listeners level with that block, opening a listener bound to the mesh IP for each entry it can provision, and reporting activity back to the control plane. A `tcp` entry gets a TCP listener that forwards connections to the target host. On Linux and macOS, an `ssh` entry gets an SSH listener that starts a shell or one command for the session's user (see [SSH Sessions](#ssh-sessions)).
 
 The block is **desired state, not a delivery queue**: an entry stands for as long as its session is valid, and its disappearance is the teardown signal. Revocation and hard expiry both reach the node as that same absence — there is no revocation event to answer and no terminal status to report.
 
@@ -51,7 +51,7 @@ Control Plane
 1. The reconciler pulls `GET /v1/nodes/{node_id}/state` on its cadence, or immediately when an SSE event — `session_setup` among them — triggers a cycle
 2. `Dispatcher.Handle` runs on every successful pull, **before** the empty-diff short-circuit, so an unchanged snapshot still reconciles sessions
 3. Teardown pass: every live session whose entry is no longer in the block is closed, with the reason derived from its capped local expiry
-4. Provision pass, in block order: each entry not yet settled is validated and, if it is a `tcp` entry or, on Linux, an `ssh` entry, handed to `SessionManager.CreateSession`, which opens a listener on `meshIP:0`
+4. Provision pass, in block order: each entry not yet settled is validated and, if it is a `tcp` entry or, on Linux and macOS, an `ssh` entry, handed to `SessionManager.CreateSession`, which opens a listener on `meshIP:0`
 5. Report pass: once the block is provisioned, `SessionActivityReporter.ReportSessionStarted` posts a `session_started` row per listener whose row is still outstanding — the `tcp` row with the target host and port, or the `ssh` lifecycle row, each with the `listener_endpoint` the listener actually bound. A row that does not land is re-posted on the next pull from the same listener, so `listener_endpoint` stays stable across attempts. The posts run concurrently and each is bounded, so a stalled control plane cannot hold the reconciler's single goroutine for the length of the block. A row answered with a terminal-state verdict (a `409` `session_already_revoked` or `session_expired`, classified by `api.IsSessionRevokedOrExpired`) is settled rather than re-posted and is logged at Info (`session no longer live server-side; awaiting the drain`); the listener stays up and the block drain performs the teardown, and every pull that still carries the settled entry warns that the listener is forwarding for a session the platform has withdrawn. A `404` `session_not_found` is not a terminal state — the block and the session store are separate reads that can disagree — so it stays on the re-post path
 6. A client connects through the mesh to that listener; `Session` forwards to the target
 7. A session ends when its entry drains from the block, when its capped expiry fires, when its idle window elapses, or on `Shutdown`
@@ -69,7 +69,7 @@ Control Plane
 | `SSHListenAddr`  | `string`        | —       | SSH mesh server listen address (empty = no SSH server) |
 | `HostKeyDir`     | `string`        | —       | Directory for SSH host key (empty = transient key)     |
 | `SSHSessionsEnabled` | `*bool`     | `true`  | `ssh_sessions_enabled`: whether the node serves mediated ssh sessions; read through `SSHSessionsAllowed()`, where nil means true |
-| `SessionSigningPublicKey` | `string` | —     | `session_signing_public_key`: standard-base64 Ed25519 key the session helper verifies tokens against; empty means the helper pins the identity's key (see [Trust anchor](#trust-anchor)) |
+| `SessionSigningPublicKey` | `string` | —     | `session_signing_public_key`: standard-base64 Ed25519 key the session helper verifies tokens against; empty means the helper pins the identity's key. Read only by Linux's socket-activated session helper; unused on macOS (see [Trust anchor](#trust-anchor)) |
 
 ```go
 cfg := tunnel.Config{
@@ -156,7 +156,7 @@ func NewSessionManager(cfg Config, meshIP string, logger *slog.Logger) *SessionM
 | Method           | Signature                                                          | Description                                              |
 |------------------|--------------------------------------------------------------------|----------------------------------------------------------|
 | `CreateSession`  | `(ctx context.Context, sess api.NodeStateSession) (string, error)` | Validates one entry of the `sessions` block, creates and starts its session, and returns the bound listener address |
-| `SetSSHSessionDeps` | `(deps SSHSessionDeps)`                                         | Wires the host key, signing keys, command reporter and session launcher ssh sessions need; `plexd up` calls it on Linux |
+| `SetSSHSessionDeps` | `(deps SSHSessionDeps)`                                         | Wires the host key, signing keys, command reporter and session launcher ssh sessions need; `plexd up` calls it on Linux and macOS |
 | `CloseSession`   | `(sessionID string, reason string) *ClosedSessionInfo`             | Closes and removes a session by ID; returns session info |
 | `Shutdown`       | `()`                                                               | Closes all active sessions, reporting each through the on-closed callback |
 | `ActiveSessions` | `() map[string]time.Time`                                          | Snapshot of live session IDs and their **capped** local expiry; the dispatcher's teardown input |
@@ -164,7 +164,7 @@ func NewSessionManager(cfg Config, meshIP string, logger *slog.Logger) *SessionM
 
 ### CreateSession Validation
 
-`tcp` entries are provisionable everywhere, `ssh` entries on Linux once
+`tcp` entries are provisionable everywhere, `ssh` entries on Linux and macOS once
 `SetSSHSessionDeps` wired them. The dispatcher filters the block before calling in;
 the kind guard repeats the check so the manager is safe to call on its own. Both
 kinds share one session map, so `MaxSessions` and the `DefaultTimeout` cap count
@@ -175,7 +175,7 @@ them together.
 | Tunneling disabled     | `cfg.Enabled == false`                      | `ErrTunnelingDisabled` (`tunnel: tunneling is disabled`) |
 | Not provisionable      | `Kind` is neither `tcp` nor `ssh`, or the entry lacks the target of its kind | `tunnel: session kind is not provisionable` |
 | Missing fields (`tcp`) | Empty ID, empty host, or port outside 1-65535 | `tunnel: invalid session setup: ...`              |
-| Unsupported (`ssh`)    | Not Linux                                   | `ErrSSHSessionsUnsupported` (`tunnel: ssh sessions are not supported on this platform`) |
+| Unsupported (`ssh`)    | Neither Linux nor macOS                     | `ErrSSHSessionsUnsupported` (`tunnel: ssh sessions are not supported on this platform`) |
 | Refused (`ssh`)        | `ssh_sessions_enabled: false`               | `ErrSSHSessionsDisabled` (`tunnel: ssh sessions are disabled on this node`) |
 | Missing user (`ssh`)   | Empty `target.ssh.user`                     | `tunnel: invalid session setup: ssh target user is required` |
 | Not wired (`ssh`)      | Any `SSHSessionDeps` member is nil          | `tunnel: ssh sessions are not wired: host key, signing keys, command reporter and session launcher are required` |
@@ -293,7 +293,7 @@ live, or permanently settled — so a settled entry is a no-op on every later pu
 | Live session not yet in `known`                    | Recorded as known; the listener is already bound, so no second setup     | yes     |
 | `expires_at` is the zero time                      | Warning (`session carries no expires_at; refusing to provision`)          | yes     |
 | `expires_at` is not in the future                  | Info (`session expired; waiting for the control plane to drain the entry`) | yes     |
-| `kind` is `k8s`, or `ssh` off Linux                | One warning (`unsupported session kind; no listener provisioned`); no listener, no activity row | yes |
+| `kind` is `k8s`, or `ssh` off Linux and macOS      | One warning (`unsupported session kind; no listener provisioned`); no listener, no activity row | yes |
 | `kind` is none of the three the contract names     | Warning (`unrecognised session kind; no listener provisioned`) — the target is fine, the kind is not one this build knows | yes |
 | `tcp` or `ssh` entry without the target of its kind, or with more than one target member set | Warning (`session target does not match kind`)  | yes     |
 | Valid `tcp` or `ssh` entry, `CreateSession` succeeds | Listener bound; `ReportSessionStarted` posts the `session_started` row with `listener_endpoint` | yes |
@@ -304,8 +304,8 @@ live, or permanently settled — so a settled entry is a no-op on every later pu
 | `CreateSession` fails otherwise                    | Warning (`session listener setup failed`); left unsettled so the next pull retries | **no** |
 
 `k8s` entries are part of the contract but not of this agent's mediation, and
-`ssh` entries are served on Linux only. Both are settled rather than retried, so
-the warning is emitted once per entry rather than once per pull. An `ssh` entry
+`ssh` entries are served on Linux and macOS only. Both are settled rather than
+retried, so the warning is emitted once per entry rather than once per pull. An `ssh` entry
 with an empty user, or one reaching a manager nobody wired, is a setup failure and
 is retried.
 
@@ -370,8 +370,8 @@ type NodeStateSession struct {
 
 Exactly one member is set, matching `Kind` — `SessionKindSSH` (`ssh`),
 `SessionKindK8s` (`k8s`), or `SessionKindTCP` (`tcp`). This agent provisions `tcp`
-entries, and `ssh` entries on Linux; `k8s` entries, and `ssh` entries elsewhere,
-are decoded and settled as unsupported. The ssh listener takes the allowed-command
+entries, and `ssh` entries on Linux and macOS; `k8s` entries, and `ssh` entries
+on Windows, are decoded and settled as unsupported. The ssh listener takes the allowed-command
 list from the session token, not from `SessionTargetSSH.AllowedCommands`.
 
 ```go
@@ -557,15 +557,15 @@ mgr.Shutdown()
 `unsupported session kind; no listener provisioned` warning and produces no
 activity row, so there is nothing to tear down when the entry later drains. No
 kube-apiserver proxy contract exists yet. `ssh` entries get the same treatment on
-macOS and Windows.
+Windows.
 
 ## SSH Sessions
 
-On Linux, an `ssh` entry of the `sessions` block becomes an SSH-2 listener that a
-client logs in to with the session's token, as the `## SSH session listener`
-section of plexsphere's agent contract specifies. macOS and Windows settle `ssh`
-entries as unsupported. A node owner refuses ssh sessions, and keeps serving tcp
-ones, with `tunnel.ssh_sessions_enabled: false`.
+On Linux and macOS, an `ssh` entry of the `sessions` block becomes an SSH-2
+listener that a client logs in to with the session's token, as the
+`## SSH session listener` section of plexsphere's agent contract specifies.
+Windows settles `ssh` entries as unsupported. A node owner refuses ssh sessions,
+and keeps serving tcp ones, with `tunnel.ssh_sessions_enabled: false`.
 
 ### Listener
 
@@ -629,12 +629,20 @@ stderr line with exit status 1.
 
 ### Session helper
 
-plexd's unit bounds it to `CAP_NET_ADMIN CAP_NET_RAW` and hides `/home`, so a shell
+On Linux, plexd's unit bounds it to `CAP_NET_ADMIN CAP_NET_RAW` and hides `/home`, so a shell
 plexd forked could not become the login user. Every process therefore starts in
 the session helper, `plexd session-helper`:
 
 - When `/run/plexd-session-helper.sock` exists, plexd connects to it. The `plexd-session-helper.socket` unit (`Accept=yes`) then starts one root instance of `plexd-session-helper@.service` per connection, outside plexd's sandbox. A connection the socket refuses is an error: plexd never falls back to a child helper there, because that would run the shell inside the sandbox.
 - Without the socket, plexd starts its own binary as `plexd session-helper --child --trusted-key <key>…` over a socketpair, trusting the keys plexd trusts. The child has plexd's own privileges, which is no boundary, so it pins nothing; hosts without a sandbox (OpenWrt, containers) need no extra unit. Under systemd plexd warns once that the socket is not listening, since shells then cannot switch users.
+
+On macOS there is no helper socket. plexd always starts its own binary as
+`plexd session-helper --child --trusted-key <key>…` over a socketpair, trusting
+the keys plexd trusts. plexd runs as root under launchd with no sandbox, so the
+child switches users itself, and its token check is a consistency check, not a
+boundary. When plexd runs as the launchd daemon, the child's log lines go
+through the same writer as plexd's own, to `/Library/Logs/plexd/plexd.log`, so
+they follow a newsyslog rotation.
 
 The protocol is one request per connection. plexd sends one JSON line of at most
 16 KiB, with the process's file descriptors as `SCM_RIGHTS`: the pty slave, or
@@ -644,9 +652,11 @@ means "stop the process".
 
 Whatever plexd checked, the helper:
 
-1. verifies the token again, against its own trust anchor;
+1. verifies the token again: the socket-activated helper against its own trust anchor, a child helper (always on macOS) against the keys plexd passed it;
 2. enforces the allowed-command list and the mode rules;
-3. resolves the user from `/etc/passwd`, with supplementary groups from `/etc/group`; NSS sources such as LDAP are not consulted, and an empty shell field means `/bin/sh`;
+3. resolves the user:
+   - on Linux from `/etc/passwd`, with supplementary groups from `/etc/group`; NSS sources such as LDAP are not consulted, and an empty shell field means `/bin/sh`;
+   - on macOS from the local directory node, with `dscl -plist . -read /Users/<name> RecordName UniqueID PrimaryGroupID NFSHomeDirectory UserShell`. A name that is empty, `.`, `..` or contains `/` is refused before `dscl` runs. `dscl` also finds a record by any of its names and in any case, so the name must be the record's first `RecordName` exactly: `ROOT`, or `www` for `_www`, is refused as not existing. An account absent from the local node, such as an Active Directory or Open Directory network account, is refused as not existing. A missing `UserShell` means `/bin/sh`. Supplementary groups come from `getgrouplist`, and at most the first 16 apply (macOS's `NGROUPS_MAX`);
 4. starts a login shell, or `<shell> -c <command>`, as that user in a new session and process group, in the home directory, with exactly `HOME`, `USER`, `LOGNAME`, `SHELL` and `PATH` in the environment, plus `TERM` with a pty, which it first hands to that user, as sshd does;
 5. sends `SIGHUP` to the process group when plexd hangs up, and `SIGKILL` 2 s later;
 6. once the process exits, kills what is left of its group and answers with the exit code, or 128 plus the signal for a death by signal.
@@ -655,6 +665,10 @@ No PAM session, no utmp, wtmp or lastlog record and no resource limit apply: ple
 links no libpam.
 
 ### Trust anchor
+
+This section applies to Linux's socket-activated helper. On macOS the child
+helper trusts the keys plexd passes and pins nothing, and
+`tunnel.session_signing_public_key` is not read.
 
 The socket-activated helper verifies tokens against one key:
 
@@ -686,8 +700,12 @@ The listener itself closes on the drain.
 
 ### Deployment notes
 
-- A host installed before the helper units keeps its old `plexd.service` until `plexd install` runs again; `service.upgrade` does not rewrite units. Until then plexd uses the child helper and warns, and every login as a user other than root fails. `plexd install` writes the units and reloads systemd but neither enables nor starts the socket, so run `plexd install && systemctl restart plexd`: plexd pulls the socket in through `Wants=` when it starts.
+- A Linux host installed before the helper units keeps its old `plexd.service` until `plexd install` runs again; `service.upgrade` does not rewrite units. Until then plexd uses the child helper and warns, and every login as a user other than root fails. `plexd install` writes the units and reloads systemd but neither enables nor starts the socket, so run `plexd install && systemctl restart plexd`: plexd pulls the socket in through `Wants=` when it starts.
 - Nodes without a usable shell, such as the distroless Kubernetes DaemonSet and container images, should set `tunnel.ssh_sessions_enabled: false`: their listeners would come up, and every launch would fail.
+- On macOS the pf policy governs mesh traffic addressed to the node itself and ends in a default deny (see [What the rules govern](./pf-wfp-firewall.md#what-the-rules-govern)). A session listener, ssh or tcp, is therefore reachable only where the node's compiled policy allows inbound mesh TCP to the node. Otherwise the `session_started` row is posted, but clients time out. plexd opens no port itself.
+- macOS privacy protection (TCC) may keep processes plexd starts from reading protected folders such as Desktop, Documents and Downloads, unless plexd has Full Disk Access. Grant it in System Settings or through an MDM privacy profile.
+- On macOS an `exec` runs with `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, so Homebrew's `/opt/homebrew/bin` is not on it. A login shell rebuilds `PATH` through `/etc/zprofile` (`path_helper`).
+- A Mac upgraded to this release serves ssh sessions unless it sets `tunnel.ssh_sessions_enabled: false`.
 
 ## Logging
 
@@ -727,8 +745,10 @@ All log entries use `component=tunnel`. Session-scoped entries add `session_id`.
 | `Error` | Session entry carries no session_id; dropping | `kind`                       |
 | `Error` | Failed to dial target          | `target`, `error`                           |
 
-The session helper logs to its own unit's journal (`journalctl -u 'plexd-session-helper@*'`),
-or to plexd's stderr in child mode, as text: `session helper started process`
+The session helper logs to its own unit's journal (`journalctl -u 'plexd-session-helper@*'`)
+under socket activation. In child mode it logs to plexd's stderr, which on macOS
+is the daemon log file (`/Library/Logs/plexd/plexd.log`) when plexd runs as the
+launchd daemon. Its lines are text: `session helper started process`
 (`session_id`, `user`, `mode`, `command`, `pid`), `session helper process exited`
 (`session_id`, `exit_status`) and `pinned the session signing key` (`path`,
 `sha256`) at Info, and `session helper refused a request` (`session_id`,

@@ -206,6 +206,12 @@ sudo chown root:wheel /Library/LaunchDaemons/com.plexsphere.plexd.plist
 sudo chmod 644 /Library/LaunchDaemons/com.plexsphere.plexd.plist
 ```
 
+### An ssh session client times out
+
+The control plane got the `session_started` row, so the listener is up, but the client never connects. The node's pf policy ends in a default deny and allows no inbound mesh TCP to the node, so it drops the client's connection attempt. plexd opens no port itself.
+
+Add a policy rule that allows the client's mesh traffic to the node, or set `policy.enabled: false`. See [What the rules govern](../reference/networking/pf-wfp-firewall.md#what-the-rules-govern) and the SSH Sessions [deployment notes](../reference/networking/secure-access-tunneling.md#deployment-notes).
+
 ## See also
 
 - [Platform Support](../guide/platform-support.md) — what macOS supports, feature by feature

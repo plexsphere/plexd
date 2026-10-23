@@ -820,8 +820,8 @@ pull, so a consumer must tolerate re-observing the same `SessionID`.
 | `SessionKindK8s`  | `k8s` | Mediates a Kubernetes API session; `Target.K8s` is set |
 | `SessionKindTCP`  | `tcp` | Mediates a plain TCP forward; `Target.TCP` is set  |
 
-This agent provisions `tcp` entries, and `ssh` entries on Linux; `k8s` entries,
-and `ssh` entries on macOS and Windows, are decoded and settled as unsupported.
+This agent provisions `tcp` entries, and `ssh` entries on Linux and macOS; `k8s`
+entries, and `ssh` entries on Windows, are decoded and settled as unsupported.
 See
 [Secure Access Tunneling](../networking/secure-access-tunneling.md) for how plexd
 consumes the block.
