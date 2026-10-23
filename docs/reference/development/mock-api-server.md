@@ -321,16 +321,18 @@ The mock deliberately does **not** model `404 keys_rotate_peer_not_found` or
 ### `PUT /v1/nodes/{id}/endpoint`
 
 Enforces the v1 endpoint contract: a 4 KiB body cap, strict JSON decoding, a
-closed `nat_type` enum, clock-skew tolerance, and a routable `ip:port`.
-`endpoint_count` increments only when every check passes.
+closed `nat_type` enum, a closed `port_mapping` enum, clock-skew tolerance,
+and a routable `ip:port`. `endpoint_count` increments only when every check
+passes.
 
 **Validation order.** The handler returns at the first failure:
 
 1. **Body size** → `413` `endpoint_body_too_large` if the body exceeds 4 KiB.
 2. **Body decode** → `400` `malformed_endpoint_request` if strict decoding fails.
 3. **NAT type** → `400` `malformed_endpoint_request` if `nat_type` is outside `full_cone`, `restricted`, `port_restricted`, `symmetric`, `unknown`.
-4. **Clock skew** → `400` `endpoint_clock_skew` if `reported_at` is more than 60s from server time in either direction.
-5. **Routable endpoint** → `400` `endpoint_unparseable` if `endpoint` is not `ip:port` with a port in 1–65535 and a non-loopback, non-link-local, non-unspecified host.
+4. **Port mapping** → `400` `malformed_endpoint_request` if `port_mapping` is present, not `null`, and outside `preserved`, `translated`. The empty string is refused; `null` counts as an absent member, as on the control plane.
+5. **Clock skew** → `400` `endpoint_clock_skew` if `reported_at` is more than 60s from server time in either direction.
+6. **Routable endpoint** → `400` `endpoint_unparseable` if `endpoint` is not `ip:port` with a port in 1–65535 and a non-loopback, non-link-local, non-unspecified host.
 
 **Request body:**
 
@@ -338,6 +340,7 @@ closed `nat_type` enum, clock-skew tolerance, and a routable `ip:port`.
 {
   "endpoint": "203.0.113.7:51820",
   "nat_type": "full_cone",
+  "port_mapping": "translated",
   "reported_at": "2026-07-19T19:32:35Z"
 }
 ```
