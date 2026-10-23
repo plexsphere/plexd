@@ -429,10 +429,10 @@ func runAgent(ctx context.Context) error {
 	})
 
 	// Mediated ssh sessions start their processes through the session helper,
-	// which only Linux has. Elsewhere ssh entries stay settled as unsupported.
-	// A node that serves no ssh sessions skips the wiring, and with it the
-	// warning about a missing helper socket; the manager settles its ssh
-	// entries as disabled.
+	// which Linux and macOS have. Elsewhere ssh entries stay settled as
+	// unsupported. A node that serves no ssh sessions skips the wiring, and
+	// with it the warning about a missing helper socket; the manager settles
+	// its ssh entries as disabled.
 	if cfg.Tunnel.Enabled && cfg.Tunnel.SSHSessionsAllowed() {
 		if launcher := newSessionLauncher(verifier, logger); launcher != nil {
 			meshServer.SessionManager().SetSSHSessionDeps(tunnel.SSHSessionDeps{

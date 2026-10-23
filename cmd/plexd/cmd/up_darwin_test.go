@@ -3,12 +3,16 @@
 package cmd
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"testing"
 
+	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/bridge"
 	"github.com/plexsphere/plexd/internal/logfwd"
 	"github.com/plexsphere/plexd/internal/metrics"
 	"github.com/plexsphere/plexd/internal/policy"
+	"github.com/plexsphere/plexd/internal/tunnel"
 	"github.com/plexsphere/plexd/internal/wireguard"
 )
 
@@ -148,5 +152,21 @@ func TestTunnelAddress_Darwin(t *testing.T) {
 				t.Errorf("tunnelAddress(%q) = %q, want %q", tt.meshIP, got, tt.want)
 			}
 		})
+	}
+}
+
+// macOS serves ssh sessions through the child session helper, so plexd up
+// wires a launcher there.
+func TestNewSessionLauncher_Darwin(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launcher := newSessionLauncher(api.NewEd25519Verifier("kid", pub), discardLogger())
+	if launcher == nil {
+		t.Fatal("newSessionLauncher() = nil, want the child session helper client on macOS")
+	}
+	if _, ok := launcher.(*tunnel.SessionHelperClient); !ok {
+		t.Errorf("newSessionLauncher() = %T, want *tunnel.SessionHelperClient", launcher)
 	}
 }

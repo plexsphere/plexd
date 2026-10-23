@@ -357,9 +357,9 @@ func TestDaemonLogWriter_NilStderr(t *testing.T) {
 func restoreDaemonLogGlobals(t *testing.T) {
 	t.Helper()
 
-	logDir, handler, stderr := packaging.DefaultLogDir, newLogHandler, os.Stderr
+	logDir, handler, stderr, installed := packaging.DefaultLogDir, newLogHandler, os.Stderr, daemonLog
 	t.Cleanup(func() {
-		packaging.DefaultLogDir, newLogHandler, os.Stderr = logDir, handler, stderr
+		packaging.DefaultLogDir, newLogHandler, os.Stderr, daemonLog = logDir, handler, stderr, installed
 	})
 }
 
@@ -374,6 +374,10 @@ func installDaemonLogFile(t *testing.T) {
 	w := useDaemonLogFile()
 	if w == nil {
 		t.Fatal("useDaemonLogFile() = nil, want the writer when stderr is the daemon log file")
+	}
+	// A child session helper writes through the same writer.
+	if daemonLog != w {
+		t.Errorf("daemonLog = %v, want the writer useDaemonLogFile installed", daemonLog)
 	}
 	t.Cleanup(func() {
 		if err := w.Close(); err != nil {

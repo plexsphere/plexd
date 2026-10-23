@@ -3,7 +3,10 @@
 package cmd
 
 import (
+	"crypto/ed25519"
 	"log/slog"
+	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -109,8 +112,21 @@ func tunnelAddress(meshIP string) string {
 	return meshIP + "/32"
 }
 
-// newSessionLauncher returns nil: mediated ssh sessions are served on Linux
-// only, so ssh entries stay settled as unsupported on macOS.
-func newSessionLauncher(_ *api.Ed25519Verifier, _ *slog.Logger) tunnel.SessionLauncher {
-	return nil
+// newSessionLauncher returns the launcher ssh sessions start their processes
+// through: this binary run as `plexd session-helper --child`, trusting the
+// verifier's keys. macOS has no helper socket, so the client gets an empty
+// path. The child's log lines go through the daemon log writer, which follows
+// newsyslog's rotation of the daemon log; on fd 2 they would land in the file
+// newsyslog renamed away.
+func newSessionLauncher(verifier *api.Ed25519Verifier, logger *slog.Logger) tunnel.SessionLauncher {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = os.Args[0]
+	}
+	child := func(keys []ed25519.PublicKey) *exec.Cmd {
+		cmd := exec.Command(exe, sessionHelperChildArgs(keys)...)
+		cmd.Stderr = sessionHelperStderr()
+		return cmd
+	}
+	return tunnel.NewSessionHelperClient("", child, verifier, logger)
 }
