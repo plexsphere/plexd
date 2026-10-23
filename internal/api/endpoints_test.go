@@ -1725,6 +1725,318 @@ func TestConnectSSE_SetsHeaders(t *testing.T) {
 	}
 }
 
+// newTimeoutTestClient creates a ControlPlane client with the given request
+// timeout, backed by the given handler.
+func newTimeoutTestClient(t *testing.T, requestTimeout time.Duration, handler http.HandlerFunc) *ControlPlane {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	client, err := NewControlPlane(Config{BaseURL: srv.URL, RequestTimeout: requestTimeout}, "1.0.0-test", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetAuthToken("test-token")
+	return client
+}
+
+// backstopContext returns a context that ends 10s into the test, so a
+// regression that leaves a request unbounded fails the test instead of hanging
+// it until the go test timeout. Its cleanup runs before the test server's,
+// which unblocks a handler still waiting on its request.
+func backstopContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+// The request timeout must not cut an open stream: the shared client's Timeout
+// also covers reading the body, which ended every stream at
+// api.request_timeout.
+func TestConnectSSE_BodyOutlivesRequestTimeout(t *testing.T) {
+	const requestTimeout = 300 * time.Millisecond
+	release := make(chan struct{})
+	client := newTimeoutTestClient(t, requestTimeout, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = io.WriteString(w, "data: end\n\n")
+	})
+
+	resp, err := client.ConnectSSE(backstopContext(t), "n1", "")
+	if err != nil {
+		t.Fatalf("ConnectSSE: %v", err)
+	}
+	defer resp.Body.Close()
+
+	time.Sleep(2 * requestTimeout)
+	close(release)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body %v after the headers: %v", 2*requestTimeout, err)
+	}
+	if !strings.HasSuffix(string(body), "data: end\n\n") {
+		t.Errorf("body = %q, want it to end with %q", body, "data: end\n\n")
+	}
+}
+
+// The stream's request context stays open past the request timeout and ends
+// when the body is closed, so a closed stream does not stay registered on the
+// caller's context.
+func TestConnectSSE_CloseReleasesRequestContext(t *testing.T) {
+	const requestTimeout = 300 * time.Millisecond
+	client := newTimeoutTestClient(t, requestTimeout, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+
+	resp, err := client.ConnectSSE(backstopContext(t), "n1", "")
+	if err != nil {
+		t.Fatalf("ConnectSSE: %v", err)
+	}
+	reqCtx := resp.Request.Context()
+
+	time.Sleep(2 * requestTimeout)
+	if err := reqCtx.Err(); err != nil {
+		resp.Body.Close()
+		t.Fatalf("request context ended %v after the headers: %v, want it open", 2*requestTimeout, err)
+	}
+
+	resp.Body.Close()
+	if err := reqCtx.Err(); !errors.Is(err, context.Canceled) {
+		t.Errorf("request context after Close = %v, want context.Canceled", err)
+	}
+}
+
+// The request timeout still bounds stream setup: a server that accepts the
+// request and never answers ends the connect with ErrSSEConnectTimeout.
+func TestConnectSSE_SetupBoundedByRequestTimeout(t *testing.T) {
+	const requestTimeout = 100 * time.Millisecond
+	client := newTimeoutTestClient(t, requestTimeout, func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	})
+
+	start := time.Now()
+	resp, err := client.ConnectSSE(backstopContext(t), "n1", "")
+	elapsed := time.Since(start)
+	if resp != nil {
+		resp.Body.Close()
+		t.Fatal("ConnectSSE returned a response, want nil")
+	}
+	if !errors.Is(err, ErrSSEConnectTimeout) {
+		t.Fatalf("err = %v, want ErrSSEConnectTimeout", err)
+	}
+	if !strings.Contains(err.Error(), "no response within 100ms") {
+		t.Errorf("err = %q, want it to name the 100ms timeout", err)
+	}
+	if got := ClassifyError(err); got != RetryTransient {
+		t.Errorf("ClassifyError = %v, want RetryTransient", got)
+	}
+	if elapsed < requestTimeout || elapsed > 5*time.Second {
+		t.Errorf("ConnectSSE returned after %v, want between %v and 5s", elapsed, requestTimeout)
+	}
+}
+
+// A non-2xx answer whose body stalls is bounded by the request timeout too:
+// the setup timer stays armed while the problem body is read.
+func TestConnectSSE_StalledErrorBodyBoundedByRequestTimeout(t *testing.T) {
+	const requestTimeout = 200 * time.Millisecond
+	client := newTimeoutTestClient(t, requestTimeout, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusBadGateway)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+
+	start := time.Now()
+	resp, err := client.ConnectSSE(backstopContext(t), "n1", "")
+	elapsed := time.Since(start)
+	if resp != nil {
+		resp.Body.Close()
+		t.Fatal("ConnectSSE returned a response, want nil")
+	}
+	if !errors.Is(err, ErrServer) {
+		t.Errorf("err = %v, want the 502 as ErrServer", err)
+	}
+	if errors.Is(err, ErrSSEConnectTimeout) {
+		t.Errorf("err = %v, want the status error, not ErrSSEConnectTimeout", err)
+	}
+	if elapsed < requestTimeout || elapsed > 5*time.Second {
+		t.Errorf("ConnectSSE returned after %v, want between %v and 5s", elapsed, requestTimeout)
+	}
+}
+
+// A non-positive request timeout means no timeout, as it does for
+// http.Client, so the setup timer is not armed at all.
+func TestConnectSSE_NonPositiveRequestTimeoutArmsNoTimer(t *testing.T) {
+	client := newTimeoutTestClient(t, -time.Second, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(300 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: x\n\n")
+	})
+
+	resp, err := client.ConnectSSE(backstopContext(t), "n1", "")
+	if err != nil {
+		t.Fatalf("ConnectSSE: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "data: x\n\n" {
+		t.Errorf("body = %q, want %q", body, "data: x\n\n")
+	}
+}
+
+func TestConnectSSE_TransportErrorIsNotConnectTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	closedURL := srv.URL
+	srv.Close()
+
+	client, err := NewControlPlane(Config{BaseURL: closedURL}, "1.0.0-test", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	resp, err := client.ConnectSSE(backstopContext(t), "n1", "")
+	elapsed := time.Since(start)
+	if resp != nil {
+		resp.Body.Close()
+		t.Fatal("ConnectSSE returned a response, want nil")
+	}
+	if err == nil || !strings.HasPrefix(err.Error(), "api: SSE connect: ") {
+		t.Fatalf("err = %v, want the api: SSE connect: transport error", err)
+	}
+	if errors.Is(err, ErrSSEConnectTimeout) {
+		t.Errorf("err = %v, want a transport error, not ErrSSEConnectTimeout", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("ConnectSSE returned after %v, want under 5s", elapsed)
+	}
+}
+
+// The caller's context ending is not a connect timeout: Run must see the
+// cancellation to exit on shutdown.
+func TestConnectSSE_ParentCancelIsNotConnectTimeout(t *testing.T) {
+	check := func(t *testing.T, err error, want error) {
+		t.Helper()
+		if !errors.Is(err, want) {
+			t.Errorf("err = %v, want %v", err, want)
+		}
+		if errors.Is(err, ErrSSEConnectTimeout) {
+			t.Errorf("err = %v, want no ErrSSEConnectTimeout", err)
+		}
+		if err == nil || !strings.HasPrefix(err.Error(), "api: SSE connect: ") {
+			t.Errorf("err = %v, want the api: SSE connect: prefix", err)
+		}
+	}
+
+	t.Run("cancelled while waiting for headers", func(t *testing.T) {
+		entered := make(chan struct{})
+		var once sync.Once
+		client := newTimeoutTestClient(t, 5*time.Second, func(_ http.ResponseWriter, r *http.Request) {
+			once.Do(func() { close(entered) })
+			<-r.Context().Done()
+		})
+		ctx, cancel := context.WithCancel(backstopContext(t))
+		defer cancel()
+		go func() {
+			select {
+			case <-entered:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+
+		resp, err := client.ConnectSSE(ctx, "n1", "")
+		if resp != nil {
+			resp.Body.Close()
+			t.Fatal("ConnectSSE returned a response, want nil")
+		}
+		check(t, err, context.Canceled)
+	})
+
+	t.Run("deadline while waiting for headers", func(t *testing.T) {
+		client := newTimeoutTestClient(t, 5*time.Second, func(_ http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+		})
+		ctx, cancel := context.WithTimeout(backstopContext(t), 50*time.Millisecond)
+		defer cancel()
+
+		resp, err := client.ConnectSSE(ctx, "n1", "")
+		if resp != nil {
+			resp.Body.Close()
+			t.Fatal("ConnectSSE returned a response, want nil")
+		}
+		check(t, err, context.DeadlineExceeded)
+	})
+}
+
+func TestConnectSSE_EmptyBodyClosesCleanly(t *testing.T) {
+	client := newTimeoutTestClient(t, 2*time.Second, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// Flushing commits a chunked body, so the read below goes through the
+		// transport's body rather than http.NoBody.
+		w.(http.Flusher).Flush()
+	})
+
+	resp, err := client.ConnectSSE(backstopContext(t), "n1", "")
+	if err != nil {
+		t.Fatalf("ConnectSSE: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || len(body) != 0 {
+		t.Errorf("ReadAll = %q, %v; want an empty body and no error", body, err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+// The problem body is read before the request is released: the server sends it
+// only after the headers, so a connect that cancels first never sees the code
+// pull-only classification keys on.
+func TestConnectSSE_ProblemBodyReadBeforeRelease(t *testing.T) {
+	client := newTimeoutTestClient(t, 2*time.Second, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusNotImplemented)
+		w.(http.Flusher).Flush()
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = io.WriteString(w, `{"title":"not provisioned","code":"signed_event_bus_not_provisioned"}`)
+	})
+
+	resp, err := client.ConnectSSE(backstopContext(t), "n1", "")
+	if resp != nil {
+		resp.Body.Close()
+		t.Fatal("ConnectSSE returned a response, want nil")
+	}
+	if !IsEventBusNotProvisioned(err) {
+		t.Errorf("err = %v, want the 501 signed_event_bus_not_provisioned", err)
+	}
+	if errors.Is(err, ErrSSEConnectTimeout) {
+		t.Errorf("err = %v, want the status error, not ErrSSEConnectTimeout", err)
+	}
+}
+
 func TestEndpoints_PathParametersEscaped(t *testing.T) {
 	// Verify that special characters in path parameters are properly escaped.
 	maliciousNodeID := "../../../etc/passwd"

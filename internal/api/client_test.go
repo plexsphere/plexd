@@ -275,6 +275,44 @@ func TestClient_NewControlPlane_AppliesDefaults(t *testing.T) {
 	}
 }
 
+// Taking the request timeout off the event stream must leave it on every other
+// call, including after a stream has been opened on the same client.
+func TestClient_RequestTimeoutStillBoundsBodyRead(t *testing.T) {
+	const requestTimeout = 300 * time.Millisecond
+	c := newTimeoutTestClient(t, requestTimeout, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/v1/nodes/n1/events" {
+			_, _ = io.WriteString(w, "data: x\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{"a":`)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+	ctx := backstopContext(t)
+
+	resp, err := c.ConnectSSE(ctx, "n1", "")
+	if err != nil {
+		t.Fatalf("ConnectSSE: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	start := time.Now()
+	var out map[string]any
+	err = c.GetJSON(ctx, "/v1/health", &out)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("GetJSON error = %v, want the request timeout", err)
+	}
+	if !strings.Contains(err.Error(), "Client.Timeout") {
+		t.Errorf("GetJSON error = %q, want the client's request timeout, not the test's backstop", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("GetJSON returned after %v, want under 5s", elapsed)
+	}
+}
+
 func TestClient_SetAuthToken_ThreadSafe(t *testing.T) {
 	cfg := Config{
 		BaseURL: "https://example.com",

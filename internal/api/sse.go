@@ -16,6 +16,10 @@ import (
 // within the configured idle timeout period.
 var ErrSSEIdleTimeout = errors.New("api: SSE idle timeout")
 
+// ErrSSEConnectTimeout is returned when the SSE request does not reach its
+// response headers within the client's request timeout.
+var ErrSSEConnectTimeout = errors.New("api: SSE connect timeout")
+
 // idleTimeoutReader wraps an io.ReadCloser and enforces an idle timeout.
 // If no data is read within the timeout, the underlying reader is closed
 // to unblock any pending Read call, and subsequent reads return ErrSSEIdleTimeout.

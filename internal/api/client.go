@@ -249,7 +249,8 @@ func decodedBody(resp *http.Response, limit int64) (io.Reader, error) {
 }
 
 // doRequestRaw sends an HTTP request and returns the raw response without
-// reading or closing the body. Used for SSE streams and artifact downloads.
+// reading or closing the body. FetchSecret and FetchEdgePSK use it to read
+// their envelopes, and the request timeout bounds that read too.
 // The caller is responsible for closing the response body.
 func (c *ControlPlane) doRequestRaw(ctx context.Context, method, path string, body any) (*http.Response, error) {
 	resp, err := c.sendRequest(ctx, method, path, body)
