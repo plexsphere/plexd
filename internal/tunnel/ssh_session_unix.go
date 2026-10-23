@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package tunnel
 
@@ -20,8 +20,8 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// sshSessionsSupported is true on Linux, the one platform with a session
-// helper that can start processes as the login user.
+// sshSessionsSupported is true on Linux and macOS, the platforms with a
+// session helper that can start processes as the login user.
 const sshSessionsSupported = true
 
 // DECISION: one listener per ssh session, on an ephemeral port of the mesh

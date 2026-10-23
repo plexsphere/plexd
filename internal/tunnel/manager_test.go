@@ -845,7 +845,7 @@ func TestSessionManager_DisabledRejectsAll(t *testing.T) {
 func requireSSHSessions(t *testing.T) {
 	t.Helper()
 	if !sshSessionsSupported {
-		t.Skip("ssh sessions are served on Linux only")
+		t.Skip("ssh sessions are served on Linux and macOS only")
 	}
 }
 
