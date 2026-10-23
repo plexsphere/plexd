@@ -31,9 +31,9 @@ const sessionStartedReportTimeout = 15 * time.Second
 // Revocation and hard expiry both reach the node as that same absence — there is
 // no revocation callback to answer and no terminal status to report.
 //
-// tcp sessions are provisioned everywhere, and ssh sessions on Linux. A k8s
-// entry, and an ssh entry off Linux, is decoded and settled as unsupported: one
-// warning, no listener, no activity row.
+// tcp sessions are provisioned everywhere, and ssh sessions on Linux and
+// macOS. A k8s entry, and an ssh entry elsewhere, is decoded and settled as
+// unsupported: one warning, no listener, no activity row.
 //
 // A Dispatcher is not safe for concurrent use. Handle is invoked only from the
 // reconcile goroutine, one cycle at a time, so its maps need no mutex.
@@ -237,9 +237,9 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 		}
 
 		// k8s sessions are part of the contract but not of this agent's
-		// mediation, and ssh sessions are served on Linux only. Both are settled
-		// rather than retried, so the warning is emitted once per entry rather
-		// than once per pull.
+		// mediation, and ssh sessions are served on Linux and macOS only. Both
+		// are settled rather than retried, so the warning is emitted once per
+		// entry rather than once per pull.
 		if entry.Kind == api.SessionKindK8s || (entry.Kind == api.SessionKindSSH && !sshSessionsSupported) {
 			d.logger.Warn("unsupported session kind; no listener provisioned",
 				"session_id", entry.SessionID,

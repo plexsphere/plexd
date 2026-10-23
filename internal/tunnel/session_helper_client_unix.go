@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package tunnel
 
@@ -113,8 +113,14 @@ func (c *SessionHelperClient) Launch(ctx context.Context, req LaunchRequest, fil
 	// The helper holds its own copies now, so the process's streams reach EOF
 	// once it and its descendants are done with them.
 	closeFiles(files)
-	if err == nil && (n != len(line) || oobn != len(oob)) {
+	if err == nil && oobn != len(oob) {
 		err = io.ErrShortWrite
+	}
+	// One sendmsg takes at most what the socket buffer holds, 8176 bytes on
+	// macOS, and a token alone may be 8192. The descriptors went with the
+	// first part; the helper reads on until the newline.
+	if err == nil && n < len(line) {
+		_, err = conn.Write(line[n:])
 	}
 	if err != nil {
 		conn.Close()

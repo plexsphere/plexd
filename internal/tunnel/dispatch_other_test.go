@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package tunnel
 
@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-// Off Linux an ssh entry is settled like a k8s one: one warning, no listener,
-// no activity row, even with ssh sessions wired.
-func TestDispatcher_SSHUnsupportedOffLinux(t *testing.T) {
+// Off Linux and macOS an ssh entry is settled like a k8s one: one warning, no
+// listener, no activity row, even with ssh sessions wired.
+func TestDispatcher_SSHUnsupportedPlatform(t *testing.T) {
 	d, mgr, reporter, logs := newTestDispatcher(t, Config{})
 	deps, _ := newSSHTestDeps(t, reporter, &fakeLauncher{})
 	mgr.SetSSHSessionDeps(deps)
@@ -33,7 +33,7 @@ func TestDispatcher_SSHUnsupportedOffLinux(t *testing.T) {
 	}
 }
 
-func TestSessionManager_SSHUnsupportedOffLinux(t *testing.T) {
+func TestSessionManager_SSHUnsupportedPlatform(t *testing.T) {
 	mgr := newTestManager(t, Config{})
 	deps, _ := newSSHTestDeps(t, &mockReporter{}, &fakeLauncher{})
 	mgr.SetSSHSessionDeps(deps)

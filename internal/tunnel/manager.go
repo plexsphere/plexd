@@ -79,7 +79,7 @@ func (m *SessionManager) SetSSHSessionDeps(deps SSHSessionDeps) {
 // CreateSession creates and starts a tunnel session for one entry of the pull's
 // sessions block and returns the bound listener address. tcp entries become a
 // TCP forward to their target. ssh entries become an SSH listener, on Linux and
-// once SetSSHSessionDeps wired it; they are refused with
+// macOS and once SetSSHSessionDeps wired it; they are refused with
 // ErrSSHSessionsUnsupported elsewhere and with ErrSSHSessionsDisabled when the
 // node refuses ssh sessions. Any other kind is not provisionable: the session
 // dispatcher filters the block before calling in, and the kind guard here keeps

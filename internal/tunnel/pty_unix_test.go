@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package tunnel
 
@@ -28,6 +28,9 @@ func openTestPTY(t *testing.T) (master, slave *os.File) {
 
 func TestOpenPTY_RoundTrip(t *testing.T) {
 	master, slave := openTestPTY(t)
+	if !strings.HasPrefix(slave.Name(), ptySlavePrefix) {
+		t.Errorf("slave = %s, want a name under %s", slave.Name(), ptySlavePrefix)
+	}
 
 	if _, err := slave.Write([]byte("hello\n")); err != nil {
 		t.Fatalf("write the slave: %v", err)
