@@ -1,22 +1,28 @@
 package integrity
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/fsutil"
 )
 
 // mockReporter records the violations and the batches the Verifier reports.
@@ -872,5 +878,154 @@ func TestVerifier_VerifyHostKey_NoKeyIsNoOp(t *testing.T) {
 				t.Errorf("unexpected violations: %v", viol)
 			}
 		})
+	}
+}
+
+// syncBuffer is a bytes.Buffer that is safe to write from the verifier's
+// goroutines while a test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// newWatchTestVerifier returns a Verifier that watches hooksDir and logs into
+// logs, with a baseline stored for every file already in hooksDir.
+func newWatchTestVerifier(t *testing.T, hooksDir string, reporter *mockReporter, logs *syncBuffer) *Verifier {
+	t.Helper()
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	entries, err := os.ReadDir(hooksDir)
+	if err != nil {
+		t.Fatalf("read hooks dir: %v", err)
+	}
+	for _, e := range entries {
+		path := filepath.Join(hooksDir, e.Name())
+		sum, err := HashFile(path)
+		if err != nil {
+			t.Fatalf("hash %s: %v", path, err)
+		}
+		if err := store.Set(path, sum); err != nil {
+			t.Fatalf("store set: %v", err)
+		}
+	}
+	return NewVerifier(Config{
+		Enabled:        true,
+		HooksDir:       hooksDir,
+		VerifyInterval: time.Hour,
+		WatchEnabled:   true,
+	}, store, reporter, slog.New(slog.NewTextHandler(logs, nil)))
+}
+
+func TestVerifier_WatchHooksDir_RetriesWhenAHookVanishes(t *testing.T) {
+	hooksDir := t.TempDir()
+	hookPath := writeTempFile(t, hooksDir, "test-hook.sh", "#!/bin/sh\necho original")
+
+	reporter := &mockReporter{}
+	logs := &syncBuffer{}
+	v := newWatchTestVerifier(t, hooksDir, reporter, logs)
+
+	ready := make(chan struct{})
+	v.watchDir = func(ctx context.Context, dir string, onRetry func(error)) (*fsnotify.Watcher, error) {
+		vanished := filepath.Join(dir, "vanished")
+		onRetry(fmt.Errorf("%q: %w", vanished, &fs.PathError{Op: "lstat", Path: vanished, Err: fs.ErrNotExist}))
+		fsw, err := fsutil.WatchDir(ctx, dir, onRetry)
+		close(ready)
+		return fsw, err
+	}
+
+	// The timeout ends a watchHooksDir that never calls v.watchDir.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		v.watchHooksDir(ctx, "node-1")
+	}()
+
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watchHooksDir did not set up its watch through v.watchDir")
+	}
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\necho tampered"), 0o644); err != nil {
+		t.Fatalf("write tampered hook: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !slices.ContainsFunc(reporter.get(), func(r api.IntegrityViolationReport) bool {
+		return r.ArtifactID == hookPath && r.DetectedBy == api.IntegrityDetectorInotify
+	}) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the watcher to report the tampered hook after a retried setup")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	want := `level=WARN msg="integrity: a hook vanished while the watch was set up; retrying" component=integrity path=` + hooksDir
+	if got := logs.String(); !strings.Contains(got, want) {
+		t.Errorf("log = %q, want it to contain %q", got, want)
+	}
+}
+
+func TestVerifier_WatchHooksDir_SetupErrorIsLogged(t *testing.T) {
+	hooksDir := t.TempDir()
+	reporter := &mockReporter{}
+	logs := &syncBuffer{}
+	v := newWatchTestVerifier(t, hooksDir, reporter, logs)
+	v.watchDir = func(context.Context, string, func(error)) (*fsnotify.Watcher, error) {
+		return nil, fmt.Errorf("%q: %w", hooksDir, &fs.PathError{Op: "open", Path: hooksDir, Err: fs.ErrPermission})
+	}
+
+	// The timeout ends a watchHooksDir that never calls v.watchDir.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	v.watchHooksDir(ctx, "node-1")
+
+	want := `level=WARN msg="integrity: failed to watch hooks dir" component=integrity path=` + hooksDir
+	if got := logs.String(); !strings.Contains(got, want) || !strings.Contains(got, "permission denied") {
+		t.Errorf("log = %q, want it to contain %q and the error", got, want)
+	}
+	if got := reporter.get(); len(got) != 0 {
+		t.Errorf("violations = %v, want none", got)
+	}
+}
+
+func TestVerifier_WatchHooksDir_CancelDuringSetupLogsNoFailure(t *testing.T) {
+	hooksDir := t.TempDir()
+	logs := &syncBuffer{}
+	v := newWatchTestVerifier(t, hooksDir, &mockReporter{}, logs)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	called := false
+	v.watchDir = func(ctx context.Context, _ string, _ func(error)) (*fsnotify.Watcher, error) {
+		called = true
+		cancel()
+		return nil, ctx.Err()
+	}
+
+	v.watchHooksDir(ctx, "node-1")
+
+	if !called {
+		t.Fatal("watchHooksDir did not set up its watch through v.watchDir")
+	}
+	if got := logs.String(); strings.Contains(got, "failed to watch hooks dir") {
+		t.Errorf("log = %q, want no setup failure after cancellation", got)
 	}
 }
