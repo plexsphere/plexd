@@ -3,10 +3,14 @@
 package fsutil
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 // seedReplacePair writes a target and a source file and returns their paths.
@@ -79,5 +83,66 @@ func TestReplaceFile_SurfacesTheErrorPastTheBudget(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < replaceBudget {
 		t.Errorf("replaceFile gave up after %v, want it to retry for at least %v", elapsed, replaceBudget)
+	}
+}
+
+// replaceRefused reports whether err is WriteFileAtomic giving up on its
+// final replace because another handle held the target past replaceBudget.
+// Only the rename counts: Windows refusing to create, write or sync the temp
+// file is an *os.PathError and stays a failure.
+func replaceRefused(err error) bool {
+	var linkErr *os.LinkError
+	return errors.As(err, &linkErr) && linkErr.Op == "rename" && heldByAnotherHandle(err)
+}
+
+func TestReplaceRefused(t *testing.T) {
+	refusal := &os.LinkError{Op: "rename", Old: "a", New: "b", Err: windows.ERROR_ACCESS_DENIED}
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"access denied on rename", refusal, true},
+		{"sharing violation on rename", &os.LinkError{Op: "rename", Old: "a", New: "b", Err: windows.ERROR_SHARING_VIOLATION}, true},
+		{"wrapped refusal", fmt.Errorf("save: %w", refusal), true},
+		{"other rename error", &os.LinkError{Op: "rename", Old: "a", New: "b", Err: windows.ERROR_FILE_NOT_FOUND}, false},
+		{"access denied on open", &os.PathError{Op: "open", Path: "a", Err: windows.ERROR_ACCESS_DENIED}, false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := replaceRefused(tt.err); got != tt.want {
+				t.Errorf("replaceRefused(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWriteFileAtomic_ConcurrentSameFileOutlastsARefusedReplace holds the
+// target open while the concurrent same-file writers start, so their replaces
+// run out of budget the way three did on a slow CI runner. The run must
+// accept exactly that and still pass every other check it makes.
+func TestWriteFileAtomic_ConcurrentSameFileOutlastsARefusedReplace(t *testing.T) {
+	hold := 2 * replaceBudget
+	refused := writeSameFileConcurrently(t, func(target string) {
+		held, err := os.Open(target)
+		if err != nil {
+			t.Fatalf("open target: %v", err)
+		}
+		// The writers' first replaces start right after the hold begins, so
+		// they run out of budget long before the handle goes away. The reader's
+		// opens share read and write with this handle, so it keeps reading.
+		released := make(chan struct{})
+		go func() {
+			time.Sleep(hold)
+			held.Close()
+			close(released)
+		}()
+		// Registered after the helper's t.TempDir, so it runs first and the
+		// directory is never removed under an open handle.
+		t.Cleanup(func() { <-released })
+	})
+	if refused == 0 {
+		t.Errorf("no write was refused while the target was held for %v", hold)
 	}
 }

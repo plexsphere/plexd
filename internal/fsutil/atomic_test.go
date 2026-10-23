@@ -306,34 +306,74 @@ func readSettled(path string) ([]byte, error) {
 }
 
 func TestWriteFileAtomic_ConcurrentSameFile(t *testing.T) {
-	// Writers of the same target must not share a temp file: a shared temp
-	// inode lets one writer's buffer land in the file another already renamed
-	// into place, so a reader sees a mix of both payloads. The payloads differ
-	// in length here because that is what makes the mix observable.
+	writeSameFileConcurrently(t, nil)
+}
+
+// writeSameFileConcurrently runs 8 writers of one target against a reader
+// and returns how many writes gave up because the replace was refused.
+// beforeWriters, when not nil, runs after the seed write and before the
+// writers start.
+//
+// Writers of the same target must not share a temp file: a shared temp
+// inode lets one writer's buffer land in the file another already renamed
+// into place, so a reader sees a mix of both payloads. The payloads differ
+// in length here because that is what makes the mix observable.
+//
+// A write that gives up because Windows refused the replace for the whole
+// retry budget is not a failure: that is WriteFileAtomic's documented
+// outcome while another handle holds the target, whatever holds it. Such a
+// write must still leave no temp file and the previous content whole, and
+// every writer must land at least one write. The retry itself is pinned by
+// TestReplaceFile_RetriesWhileTargetIsOpen, which releases a held target
+// after 200 ms and so fails on a budget much shorter than that, and by
+// TestReplaceFile_SurfacesTheErrorPastTheBudget.
+func writeSameFileConcurrently(t *testing.T, beforeWriters func(target string)) (refused int) {
 	dir := t.TempDir()
 	const name = "shared.json"
 	const goroutines = 8
 	const iterations = 40
+	target := filepath.Join(dir, name)
 
 	payloads := make([][]byte, goroutines)
 	for g := range goroutines {
 		payloads[g] = bytes.Repeat([]byte{byte('a' + g)}, 16*(g+1))
+	}
+	isPayload := func(got []byte) bool {
+		for _, p := range payloads {
+			if bytes.Equal(got, p) {
+				return true
+			}
+		}
+		return false
 	}
 
 	// Seed the target so every read below has a file to open.
 	if err := WriteFileAtomic(dir, name, payloads[0], 0o600); err != nil {
 		t.Fatalf("seed write: %v", err)
 	}
+	if beforeWriters != nil {
+		beforeWriters(target)
+	}
 
 	var writers sync.WaitGroup
 	writers.Add(goroutines)
 	errs := make(chan error, goroutines*iterations+1)
+	// Each writer counts into its own index only, and the counts are read
+	// after writers.Wait().
+	landed := make([]int, goroutines)
+	refusedBy := make([]int, goroutines)
 
 	for g := range goroutines {
 		go func(id int) {
 			defer writers.Done()
 			for range iterations {
-				if err := WriteFileAtomic(dir, name, payloads[id], 0o600); err != nil {
+				err := WriteFileAtomic(dir, name, payloads[id], 0o600)
+				switch {
+				case err == nil:
+					landed[id]++
+				case replaceRefused(err):
+					refusedBy[id]++
+				default:
 					errs <- fmt.Errorf("goroutine %d: %w", id, err)
 				}
 			}
@@ -351,19 +391,12 @@ func TestWriteFileAtomic_ConcurrentSameFile(t *testing.T) {
 				return
 			default:
 			}
-			got, err := readSettled(filepath.Join(dir, name))
+			got, err := readSettled(target)
 			if err != nil {
 				errs <- fmt.Errorf("read: %w", err)
 				return
 			}
-			whole := false
-			for _, p := range payloads {
-				if bytes.Equal(got, p) {
-					whole = true
-					break
-				}
-			}
-			if !whole {
+			if !isPayload(got) {
 				errs <- fmt.Errorf("torn content observed: %q", got)
 				return
 			}
@@ -378,7 +411,27 @@ func TestWriteFileAtomic_ConcurrentSameFile(t *testing.T) {
 	for err := range errs {
 		t.Errorf("%v", err)
 	}
+	for g := range goroutines {
+		if landed[g] == 0 {
+			t.Errorf("goroutine %d landed none of its %d writes (%d refused)", g, iterations, refusedBy[g])
+		}
+		refused += refusedBy[g]
+	}
+
+	// A refused write leaves the previous content in place, so the target
+	// must still hold exactly one payload once every writer has stopped.
+	got, err := readSettled(target)
+	if err != nil {
+		t.Errorf("final read: %v", err)
+	} else if !isPayload(got) {
+		t.Errorf("final content is not one whole payload: %q", got)
+	}
+
+	if refused > 0 {
+		t.Logf("%d of %d writes gave up after Windows refused the replace for the whole retry budget", refused, goroutines*iterations)
+	}
 	assertNoTempFiles(t, dir)
+	return refused
 }
 
 func TestWriteFileAtomic_Permissions(t *testing.T) {
