@@ -463,6 +463,9 @@ func TestReportEndpoint_Success(t *testing.T) {
 		if req.NATType != "full_cone" {
 			t.Errorf("NATType = %q, want %q", req.NATType, "full_cone")
 		}
+		if req.PortMapping != "preserved" {
+			t.Errorf("PortMapping = %q, want %q", req.PortMapping, "preserved")
+		}
 		if !req.ReportedAt.Equal(reportedAt) {
 			t.Errorf("ReportedAt = %v, want %v", req.ReportedAt, reportedAt)
 		}
@@ -476,9 +479,10 @@ func TestReportEndpoint_Success(t *testing.T) {
 	})
 
 	resp, err := client.ReportEndpoint(context.Background(), "n1", EndpointRequest{
-		Endpoint:   "1.2.3.4:51820",
-		NATType:    "full_cone",
-		ReportedAt: reportedAt,
+		Endpoint:    "1.2.3.4:51820",
+		NATType:     "full_cone",
+		PortMapping: "preserved",
+		ReportedAt:  reportedAt,
 	})
 	if err != nil {
 		t.Fatalf("ReportEndpoint: %v", err)

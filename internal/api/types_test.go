@@ -208,25 +208,44 @@ func TestTypesHeartbeatResponse(t *testing.T) {
 
 func TestTypesEndpointRequest(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	orig := EndpointRequest{
-		Endpoint:   "203.0.113.9:51820",
-		NATType:    "full_cone",
-		ReportedAt: now,
+	tests := []struct {
+		name        string
+		portMapping string
+		wantKeys    []string
+	}{
+		{name: "with port_mapping", portMapping: "translated", wantKeys: []string{"endpoint", "nat_type", "port_mapping", "reported_at"}},
+		// An empty value is omitted, so the body stays what a control plane
+		// without the member accepts.
+		{name: "without port_mapping", wantKeys: []string{"endpoint", "nat_type", "reported_at"}},
 	}
-	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
 
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-	if len(raw) != 3 {
-		t.Errorf("expected exactly 3 JSON keys, got %d: %v", len(raw), raw)
-	}
-	for _, key := range []string{"endpoint", "nat_type", "reported_at"} {
-		if _, ok := raw[key]; !ok {
-			t.Errorf("expected JSON key %q", key)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			orig := EndpointRequest{
+				Endpoint:    "203.0.113.9:51820",
+				NATType:     "full_cone",
+				PortMapping: tt.portMapping,
+				ReportedAt:  now,
+			}
+			data, got := roundTrip(t, orig)
+			requireEqual(t, orig, got)
+
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(data, &raw); err != nil {
+				t.Fatal(err)
+			}
+			if len(raw) != len(tt.wantKeys) {
+				t.Errorf("expected exactly %d JSON keys, got %d: %s", len(tt.wantKeys), len(raw), data)
+			}
+			for _, key := range tt.wantKeys {
+				if _, ok := raw[key]; !ok {
+					t.Errorf("expected JSON key %q", key)
+				}
+			}
+			if tt.portMapping != "" && string(raw["port_mapping"]) != `"`+tt.portMapping+`"` {
+				t.Errorf("port_mapping = %s, want %q", raw["port_mapping"], tt.portMapping)
+			}
+		})
 	}
 }
 
