@@ -36,35 +36,18 @@ func TestWatcher_InitialScan(t *testing.T) {
 	writeExecutable(t, dir, "alpha.sh", "#!/bin/sh\necho alpha\n")
 	writeExecutable(t, dir, "beta.sh", "#!/bin/sh\necho beta\n")
 
-	var mu sync.Mutex
-	var received [][]api.HookInfo
-	onChange := func(hooks []api.HookInfo) {
-		mu.Lock()
-		defer mu.Unlock()
-		cp := make([]api.HookInfo, len(hooks))
-		copy(cp, hooks)
-		received = append(received, cp)
-	}
+	rec := &hookRecorder{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	w := NewHookWatcher(dir, onChange, nil, testLogger())
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
 
 	watchDone := make(chan error, 1)
 	go func() { watchDone <- w.Watch(ctx) }()
 
-	// Wait for initial scan
-	time.Sleep(200 * time.Millisecond)
+	_, initial := rec.waitFor(t, 0, anyHooks, "onChange was not called for initial scan")
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	if len(received) < 1 {
-		t.Fatal("onChange was not called for initial scan")
-	}
-
-	initial := received[0]
 	if len(initial) != 2 {
 		t.Fatalf("initial scan hooks = %d, want 2", len(initial))
 	}
@@ -92,53 +75,27 @@ func TestWatcher_InitialScan(t *testing.T) {
 func TestWatcher_NewFileRegistered(t *testing.T) {
 	dir := t.TempDir()
 
-	var mu sync.Mutex
-	var received [][]api.HookInfo
-	onChange := func(hooks []api.HookInfo) {
-		mu.Lock()
-		defer mu.Unlock()
-		cp := make([]api.HookInfo, len(hooks))
-		copy(cp, hooks)
-		received = append(received, cp)
-	}
+	rec := &hookRecorder{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	w := NewHookWatcher(dir, onChange, nil, testLogger())
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
 
 	watchDone := make(chan error, 1)
 	go func() { watchDone <- w.Watch(ctx) }()
 
-	// Wait for initial scan
-	time.Sleep(200 * time.Millisecond)
+	initial, _ := rec.waitFor(t, 0, anyHooks, "onChange was not called for initial scan")
 
 	// Create executable file
 	writeExecutable(t, dir, "new-hook", "#!/bin/sh\necho hello\n")
 
-	// Wait for debounce + processing
-	time.Sleep(500 * time.Millisecond)
-
-	mu.Lock()
-	// Initial call (empty) + at least one call with the new hook
-	found := false
-	for _, hooks := range received {
-		for _, h := range hooks {
-			if h.Name == "new-hook" {
-				found = true
-				if h.Source != "local" {
-					t.Errorf("hook Source = %q, want %q", h.Source, "local")
-				}
-				if h.Checksum == "" {
-					t.Error("hook Checksum is empty")
-				}
-			}
-		}
+	_, hooks := rec.waitFor(t, initial+1, namesAre("new-hook"), "new-hook was not registered")
+	if hooks[0].Source != "local" {
+		t.Errorf("hook Source = %q, want %q", hooks[0].Source, "local")
 	}
-	mu.Unlock()
-
-	if !found {
-		t.Fatal("new-hook was not registered")
+	if hooks[0].Checksum == "" {
+		t.Error("hook Checksum is empty")
 	}
 
 	cancel()
@@ -156,15 +113,7 @@ func TestWatcher_ModifiedFileUpdatesChecksum(t *testing.T) {
 	dir := t.TempDir()
 	writeExecutable(t, dir, "myhook", "#!/bin/sh\necho v1\n")
 
-	var mu sync.Mutex
-	var received [][]api.HookInfo
-	onChange := func(hooks []api.HookInfo) {
-		mu.Lock()
-		defer mu.Unlock()
-		cp := make([]api.HookInfo, len(hooks))
-		copy(cp, hooks)
-		received = append(received, cp)
-	}
+	rec := &hookRecorder{}
 
 	var intMu sync.Mutex
 	var integrityAlerts []struct{ name, oldSum, newSum string }
@@ -177,27 +126,22 @@ func TestWatcher_ModifiedFileUpdatesChecksum(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	w := NewHookWatcher(dir, onChange, onIntegrity, testLogger())
+	w := NewHookWatcher(dir, rec.onChange, onIntegrity, testLogger())
 
 	watchDone := make(chan error, 1)
 	go func() { watchDone <- w.Watch(ctx) }()
 
-	// Wait for initial scan
-	time.Sleep(200 * time.Millisecond)
-
-	mu.Lock()
-	if len(received) < 1 {
-		mu.Unlock()
-		t.Fatal("no initial scan callback")
-	}
-	oldChecksum := received[0][0].Checksum
-	mu.Unlock()
+	initial, hooks := rec.waitFor(t, 0, namesAre("myhook"), "no initial scan callback")
+	oldChecksum := hooks[0].Checksum
 
 	// Modify the file
 	writeExecutable(t, dir, "myhook", "#!/bin/sh\necho v2\n")
 
-	// Wait for debounce + processing
-	time.Sleep(500 * time.Millisecond)
+	// processFile calls onIntegrity before onChange, so the alert is recorded
+	// by the time the updated hook is.
+	rec.waitFor(t, initial+1, func(hooks []api.HookInfo) bool {
+		return len(hooks) == 1 && hooks[0].Name == "myhook" && hooks[0].Checksum != oldChecksum
+	}, "hook checksum was not updated after modification")
 
 	intMu.Lock()
 	if len(integrityAlerts) < 1 {
@@ -217,19 +161,8 @@ func TestWatcher_ModifiedFileUpdatesChecksum(t *testing.T) {
 		t.Error("integrity alert newChecksum should differ from old")
 	}
 
-	// Verify the hook was updated in onChange
-	mu.Lock()
-	var latestChecksum string
-	for _, hooks := range received {
-		for _, h := range hooks {
-			if h.Name == "myhook" {
-				latestChecksum = h.Checksum
-			}
-		}
-	}
-	mu.Unlock()
-
-	if latestChecksum == oldChecksum {
+	// The watcher's state, not only a past callback, holds the new checksum.
+	if hooks := w.Hooks(); len(hooks) != 1 || hooks[0].Checksum == oldChecksum {
 		t.Error("hook checksum was not updated after modification")
 	}
 
@@ -241,6 +174,11 @@ func TestWatcher_ModifiedFileUpdatesChecksum(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("watcher did not exit")
+	}
+
+	// The last callback is what executor.SetHooks would be left holding.
+	if last := rec.last(); len(last) != 1 || last[0].Checksum == oldChecksum {
+		t.Errorf("last callback = %v, want myhook with a new checksum", last)
 	}
 }
 
@@ -631,37 +569,19 @@ func TestWatcher_SidecarUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var mu sync.Mutex
-	var received [][]api.HookInfo
-	onChange := func(hooks []api.HookInfo) {
-		mu.Lock()
-		defer mu.Unlock()
-		cp := make([]api.HookInfo, len(hooks))
-		copy(cp, hooks)
-		received = append(received, cp)
-	}
+	rec := &hookRecorder{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	w := NewHookWatcher(dir, onChange, nil, testLogger())
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
 
 	watchDone := make(chan error, 1)
 	go func() { watchDone <- w.Watch(ctx) }()
 
-	// Wait for initial scan
-	time.Sleep(200 * time.Millisecond)
-
-	mu.Lock()
-	if len(received) < 1 || len(received[0]) < 1 {
-		mu.Unlock()
-		t.Fatal("no initial scan callback")
-	}
-	initialDesc := received[0][0].Description
-	mu.Unlock()
-
-	if initialDesc != "Initial description" {
-		t.Fatalf("initial description = %q, want %q", initialDesc, "Initial description")
+	initial, hooks := rec.waitFor(t, 0, namesAre("deploy.sh"), "no initial scan callback")
+	if hooks[0].Description != "Initial description" {
+		t.Fatalf("initial description = %q, want %q", hooks[0].Description, "Initial description")
 	}
 
 	// Update sidecar
@@ -674,22 +594,14 @@ func TestWatcher_SidecarUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait for debounce + processing
-	time.Sleep(500 * time.Millisecond)
+	rec.waitFor(t, initial+1, func(hooks []api.HookInfo) bool {
+		return len(hooks) == 1 && hooks[0].Name == "deploy.sh" && hooks[0].Description == "Updated description"
+	}, `description after sidecar update was not reported as "Updated description"`)
 
-	mu.Lock()
-	var latestDesc string
-	for _, hooks := range received {
-		for _, h := range hooks {
-			if h.Name == "deploy.sh" {
-				latestDesc = h.Description
-			}
-		}
-	}
-	mu.Unlock()
-
-	if latestDesc != "Updated description" {
-		t.Errorf("description after sidecar update = %q, want %q", latestDesc, "Updated description")
+	// The watcher's state, not only a past callback, holds the update.
+	hooks = w.Hooks()
+	if len(hooks) != 1 || hooks[0].Description != "Updated description" {
+		t.Errorf("description after sidecar update = %v, want %q", hooks, "Updated description")
 	}
 
 	cancel()
@@ -700,108 +612,55 @@ func TestWatcher_SidecarUpdate(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("watcher did not exit")
+	}
+
+	// The last callback is what executor.SetHooks would be left holding.
+	if last := rec.last(); len(last) != 1 || last[0].Description != "Updated description" {
+		t.Errorf("description in the last callback = %v, want %q", last, "Updated description")
 	}
 }
 
 func TestWatcher_FullLifecycle(t *testing.T) {
 	dir := t.TempDir()
 
-	type event struct {
-		op    string // "initial", "update"
-		names []string
-	}
-
-	var mu sync.Mutex
-	var events []event
-
-	onChange := func(hooks []api.HookInfo) {
-		mu.Lock()
-		defer mu.Unlock()
-		names := make([]string, len(hooks))
-		for i, h := range hooks {
-			names[i] = h.Name
-		}
-		op := "update"
-		if len(events) == 0 {
-			op = "initial"
-		}
-		events = append(events, event{op: op, names: names})
-	}
+	rec := &hookRecorder{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	w := NewHookWatcher(dir, onChange, nil, testLogger())
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
 
 	watchDone := make(chan error, 1)
 	go func() { watchDone <- w.Watch(ctx) }()
 
-	// Wait for initial scan (empty dir).
-	time.Sleep(200 * time.Millisecond)
-
-	mu.Lock()
-	if len(events) < 1 {
-		mu.Unlock()
-		t.Fatal("no initial callback")
+	// Initial scan (empty dir).
+	i, initial := rec.waitFor(t, 0, anyHooks, "no initial callback")
+	if len(initial) != 0 {
+		t.Fatalf("initial hooks = %v, want empty", hookNames(initial))
 	}
-	if len(events[0].names) != 0 {
-		mu.Unlock()
-		t.Fatalf("initial hooks = %v, want empty", events[0].names)
-	}
-	mu.Unlock()
 
 	// Phase 1: Add hook-a.
 	writeExecutable(t, dir, "hook-a", "#!/bin/sh\necho a\n")
-	time.Sleep(500 * time.Millisecond)
-
-	mu.Lock()
-	lastNames := events[len(events)-1].names
-	mu.Unlock()
-	if len(lastNames) != 1 || lastNames[0] != "hook-a" {
-		t.Fatalf("after adding hook-a, hooks = %v, want [hook-a]", lastNames)
-	}
+	i, _ = rec.waitFor(t, i+1, namesAre("hook-a"), "after adding hook-a, hooks are not [hook-a]")
 
 	// Phase 2: Add hook-b.
 	writeExecutable(t, dir, "hook-b", "#!/bin/sh\necho b\n")
-	time.Sleep(500 * time.Millisecond)
-
-	mu.Lock()
-	lastNames = events[len(events)-1].names
-	mu.Unlock()
-	if len(lastNames) != 2 {
-		t.Fatalf("after adding hook-b, hooks count = %d, want 2", len(lastNames))
-	}
+	i, hooks := rec.waitFor(t, i+1, namesAre("hook-a", "hook-b"), "after adding hook-b, hooks are not [hook-a hook-b]")
+	checksumA := hooks[0].Checksum
 
 	// Phase 3: Modify hook-a.
 	writeExecutable(t, dir, "hook-a", "#!/bin/sh\necho a-v2\n")
-	time.Sleep(500 * time.Millisecond)
-
-	mu.Lock()
-	lastNames = events[len(events)-1].names
-	mu.Unlock()
-	if len(lastNames) != 2 {
-		t.Fatalf("after modifying hook-a, hooks count = %d, want 2", len(lastNames))
-	}
+	i, _ = rec.waitFor(t, i+1, func(hooks []api.HookInfo) bool {
+		return slices.Equal(hookNames(hooks), []string{"hook-a", "hook-b"}) && hooks[0].Checksum != checksumA
+	}, "after modifying hook-a, hooks are not [hook-a hook-b] with hook-a's new checksum")
 
 	// Phase 4: Remove hook-a.
 	if err := os.Remove(filepath.Join(dir, "hook-a")); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(500 * time.Millisecond)
-
-	mu.Lock()
-	lastNames = events[len(events)-1].names
-	mu.Unlock()
-	if len(lastNames) != 1 || lastNames[0] != "hook-b" {
-		t.Fatalf("after removing hook-a, hooks = %v, want [hook-b]", lastNames)
-	}
-
-	// Verify ordering: callbacks should be in chronological order.
-	mu.Lock()
-	totalEvents := len(events)
-	mu.Unlock()
-	if totalEvents < 4 {
-		t.Errorf("total callbacks = %d, want at least 4 (initial + add + add + modify/remove)", totalEvents)
+	rec.waitFor(t, i+1, namesAre("hook-b"), "after removing hook-a, hooks are not [hook-b]")
+	if got := hookNames(w.Hooks()); !slices.Equal(got, []string{"hook-b"}) {
+		t.Fatalf("after removing hook-a, Hooks() = %v, want [hook-b]", got)
 	}
 
 	cancel()
@@ -812,6 +671,11 @@ func TestWatcher_FullLifecycle(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("watcher did not exit")
+	}
+
+	// The last callback is what executor.SetHooks would be left holding.
+	if got := hookNames(rec.last()); !slices.Equal(got, []string{"hook-b"}) {
+		t.Errorf("last callback = %v, want [hook-b]", got)
 	}
 }
 
@@ -844,12 +708,13 @@ func TestWatcher_CapabilitiesReReport(t *testing.T) {
 	watchDone := make(chan error, 1)
 	go func() { watchDone <- w.Watch(ctx) }()
 
-	// Wait for initial scan.
-	time.Sleep(200 * time.Millisecond)
-
-	// Add a hook.
+	// Add a hook. Written before the watch is in place, it is in the initial
+	// scan, which runs after the watch; written after, it arrives as an event.
 	writeExecutable(t, dir, "deploy", "#!/bin/sh\necho deploying\n")
-	time.Sleep(500 * time.Millisecond)
+	waitFor(t, 5*time.Second, func() bool {
+		_, hooks := executor.Capabilities()
+		return len(hooks) == 1
+	})
 
 	// Verify capabilities now include the hook.
 	builtins, hooks = executor.Capabilities()
@@ -863,11 +728,14 @@ func TestWatcher_CapabilitiesReReport(t *testing.T) {
 		t.Errorf("hook name = %q, want %q", hooks[0].Name, "deploy")
 	}
 
-	// Remove the hook.
+	// Remove the hook. Capabilities lists it, so the watch is in place.
 	if err := os.Remove(filepath.Join(dir, "deploy")); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(500 * time.Millisecond)
+	waitFor(t, 5*time.Second, func() bool {
+		_, hooks := executor.Capabilities()
+		return len(hooks) == 0
+	})
 
 	// Verify capabilities no longer include the hook.
 	builtins, hooks = executor.Capabilities()
@@ -895,18 +763,18 @@ func TestWatcher_HooksSnapshot(t *testing.T) {
 	writeExecutable(t, dir, "alpha", "#!/bin/sh\necho alpha\n")
 	writeExecutable(t, dir, "bravo", "#!/bin/sh\necho bravo\n")
 
-	onChange := func(hooks []api.HookInfo) {}
+	rec := &hookRecorder{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	w := NewHookWatcher(dir, onChange, nil, testLogger())
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
 
 	watchDone := make(chan error, 1)
 	go func() { watchDone <- w.Watch(ctx) }()
 
-	// Wait for initial scan
-	time.Sleep(200 * time.Millisecond)
+	// The initial scan fills the map before its callback.
+	rec.waitFor(t, 0, anyHooks, "onChange was not called for initial scan")
 
 	hooks := w.Hooks()
 	if len(hooks) != 3 {
@@ -1002,6 +870,9 @@ func (r *hookRecorder) waitFor(t *testing.T, from int, match func([]api.HookInfo
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// anyHooks accepts every callback.
+func anyHooks([]api.HookInfo) bool { return true }
 
 // namesAre accepts a callback whose hook names are exactly want, in order. No
 // names accepts an empty hook list.
