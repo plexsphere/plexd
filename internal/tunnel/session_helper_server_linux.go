@@ -24,9 +24,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// passwdPath is where the session helper resolves login users. It is a
-// variable so tests can point it at a fixture.
-var passwdPath = "/etc/passwd"
+// loginUserLookup resolves the login user of a request. It is a variable so
+// tests can point it at a passwd fixture.
+var loginUserLookup = func(name string) (loginUser, error) {
+	return lookupPasswdUser("/etc/passwd", name)
+}
+
+// maxSupplementaryGroups is the most supplementary groups a process the helper
+// starts gets: Linux's NGROUPS_MAX, which no account reaches.
+const maxSupplementaryGroups = 65536
 
 const (
 	// sessionHelperIOTimeout bounds reading the request and writing the
@@ -46,7 +52,7 @@ const sessionHelperPath = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 // RunSessionHelper serves one request of the session helper protocol on conn
 // (see SessionHelperClient) and verifies it against keys: the session token,
 // the mode against the token's allowed commands, and the login user against
-// /etc/passwd. It then starts the shell or command as that user, in its own
+// the node's local accounts (loginUserLookup). It then starts the shell or command as that user, in its own
 // session and process group, with the received descriptors as its standard
 // streams, and answers with its exit status.
 //
@@ -106,7 +112,7 @@ func RunSessionHelper(conn *net.UnixConn, keys []ed25519.PublicKey, logger *slog
 		return refuse(fmt.Sprintf("unknown mode %q", req.Mode))
 	}
 
-	account, err := lookupLoginUser(req.User)
+	account, err := loginUserLookup(req.User)
 	if err != nil {
 		return refuse(err.Error())
 	}
@@ -301,13 +307,13 @@ type loginUser struct {
 	groups      []uint32
 }
 
-// lookupLoginUser resolves name from passwdPath. Supplementary groups come from
-// os/user, which reads /etc/group; the primary group stands in when that
-// fails. NSS sources such as LDAP are not consulted.
-func lookupLoginUser(name string) (loginUser, error) {
-	f, err := os.Open(passwdPath)
+// lookupPasswdUser resolves name from the passwd file at path. Supplementary
+// groups come from os/user, which reads /etc/group; the primary group stands
+// in when that fails. NSS sources such as LDAP are not consulted.
+func lookupPasswdUser(path, name string) (loginUser, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return loginUser{}, fmt.Errorf("read %s: %w", passwdPath, err)
+		return loginUser{}, fmt.Errorf("read %s: %w", path, err)
 	}
 	defer f.Close()
 
@@ -320,7 +326,7 @@ func lookupLoginUser(name string) (loginUser, error) {
 		uid, uidErr := strconv.ParseUint(fields[2], 10, 32)
 		gid, gidErr := strconv.ParseUint(fields[3], 10, 32)
 		if uidErr != nil || gidErr != nil {
-			return loginUser{}, fmt.Errorf("user %q has a malformed entry in %s", name, passwdPath)
+			return loginUser{}, fmt.Errorf("user %q has a malformed entry in %s", name, path)
 		}
 		u := loginUser{name: name, uid: uint32(uid), gid: uint32(gid), home: fields[5], shell: fields[6]}
 		if u.shell == "" {
@@ -330,7 +336,7 @@ func lookupLoginUser(name string) (loginUser, error) {
 		return u, nil
 	}
 	if err := scanner.Err(); err != nil {
-		return loginUser{}, fmt.Errorf("read %s: %w", passwdPath, err)
+		return loginUser{}, fmt.Errorf("read %s: %w", path, err)
 	}
 	return loginUser{}, fmt.Errorf("user %q does not exist on this node", name)
 }
@@ -386,8 +392,13 @@ func buildSessionCommand(req LaunchRequest, u loginUser, files []*os.File) *exec
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: req.PTY, Ctty: 0}
 	// A helper already running as the login user (the child helper, started by
 	// an unprivileged plexd) cannot and need not switch.
+	//
+	// DECISION: a process gets at most maxSupplementaryGroups groups, because
+	// setgroups(2) refuses more with EINVAL and the process would not start.
+	// getgrouplist lists the primary group first, so it is always kept.
 	if int(u.uid) != os.Getuid() {
-		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: u.uid, Gid: u.gid, Groups: u.groups}
+		groups := u.groups[:min(len(u.groups), maxSupplementaryGroups)]
+		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: u.uid, Gid: u.gid, Groups: groups}
 	}
 	return cmd
 }

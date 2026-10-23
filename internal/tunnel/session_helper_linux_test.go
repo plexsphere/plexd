@@ -47,7 +47,7 @@ func runTestSessionHelperChild() int {
 		return 1
 	}
 	if p := os.Getenv("PLEXD_TEST_SESSION_HELPER_PASSWD"); p != "" {
-		passwdPath = p
+		loginUserLookup = passwdFixtureLookup(p)
 	}
 	fc, err := net.FileConn(os.NewFile(3, "plexd-session-helper"))
 	if err != nil {
@@ -66,9 +66,24 @@ func runTestSessionHelperChild() int {
 // switch.
 const helperUser = "plexd-helper-test"
 
-// usePasswdFixture points passwdPath at a file holding one entry for
-// helperUser with the current uid and gid, a fresh home and shell. It returns
-// the fixture's path.
+// passwdFixtureLookup resolves login users from the passwd file at path, on
+// every platform, in place of the platform's own lookup.
+func passwdFixtureLookup(path string) func(string) (loginUser, error) {
+	return func(name string) (loginUser, error) { return lookupPasswdUser(path, name) }
+}
+
+// useLoginUserLookup points the helper's user lookup at the passwd file at
+// path until the test ends.
+func useLoginUserLookup(t *testing.T, path string) {
+	t.Helper()
+	prev := loginUserLookup
+	loginUserLookup = passwdFixtureLookup(path)
+	t.Cleanup(func() { loginUserLookup = prev })
+}
+
+// usePasswdFixture points the helper's user lookup at a file holding one entry
+// for helperUser with the current uid and gid, a fresh home and shell. It
+// returns the fixture's path.
 func usePasswdFixture(t *testing.T, shell string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -81,9 +96,7 @@ func usePasswdFixture(t *testing.T, shell string) string {
 	if err := os.WriteFile(path, []byte(entry), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	prev := passwdPath
-	passwdPath = path
-	t.Cleanup(func() { passwdPath = prev })
+	useLoginUserLookup(t, path)
 	return path
 }
 
@@ -319,9 +332,7 @@ func newSocketHelperAs(t *testing.T, uid int) *helperFixture {
 	if err := os.WriteFile(passwd, []byte(entry), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	prev := passwdPath
-	passwdPath = passwd
-	t.Cleanup(func() { passwdPath = prev })
+	useLoginUserLookup(t, passwd)
 
 	pub, priv := newSigningKey(t)
 	return &helperFixture{
@@ -498,6 +509,28 @@ func TestSessionHelper_ScrubbedEnvironment(t *testing.T) {
 		if !seen[name] {
 			t.Errorf("env lacks %s", name)
 		}
+	}
+}
+
+// A process gets at most maxSupplementaryGroups groups, the primary group
+// first: setgroups(2) refuses more, and the process would not start.
+func TestBuildSessionCommand_CapsGroups(t *testing.T) {
+	groups := make([]uint32, 20)
+	for i := range groups {
+		groups[i] = uint32(1000 + i)
+	}
+	u := loginUser{name: helperUser, uid: uint32(os.Getuid() + 1), gid: 1000, home: "/", shell: "/bin/sh", groups: groups}
+	cmd := buildSessionCommand(LaunchRequest{Mode: LaunchModeExec, Command: "id"}, u, make([]*os.File, 3))
+
+	cred := cmd.SysProcAttr.Credential
+	if cred == nil {
+		t.Fatal("no credential for a user other than the current one")
+	}
+	if want := min(len(groups), maxSupplementaryGroups); len(cred.Groups) != want {
+		t.Errorf("%d supplementary groups, want %d", len(cred.Groups), want)
+	}
+	if len(cred.Groups) == 0 || cred.Groups[0] != groups[0] {
+		t.Errorf("groups = %v, want the primary group %d first", cred.Groups, groups[0])
 	}
 }
 
