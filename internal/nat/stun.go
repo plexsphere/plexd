@@ -79,6 +79,21 @@ func (t NATType) Wire() string {
 	}
 }
 
+// PortMapping records whether the NAT kept the STUN probe's source port,
+// and so whether the published endpoint was observed or assumed. Its values
+// are the wire values of the endpoint report's port_mapping member.
+type PortMapping string
+
+const (
+	// PortPreserved: the mapped port equals the probe's source port. The
+	// published endpoint (mapped IP, WireGuard listen port) matches what
+	// discovery observed.
+	PortPreserved PortMapping = "preserved"
+	// PortTranslated: the NAT assigned its own port. The published endpoint
+	// assumes the router forwards or preserves the WireGuard listen port.
+	PortTranslated PortMapping = "translated"
+)
+
 // stunMagicCookie is the fixed magic cookie value per RFC 5389.
 const stunMagicCookie uint32 = 0x2112A442
 

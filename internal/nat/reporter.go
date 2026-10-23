@@ -33,9 +33,10 @@ var errEndpointRejected = errors.New("control plane rejected the endpoint")
 // actionable NTP guidance.
 func report(ctx context.Context, reporter EndpointReporter, nodeID string, result *DiscoveryResult) (time.Time, error) {
 	resp, err := reporter.ReportEndpoint(ctx, nodeID, api.EndpointRequest{
-		Endpoint:   result.Endpoint,
-		NATType:    result.NATType.Wire(),
-		ReportedAt: time.Now().UTC(),
+		Endpoint:    result.Endpoint,
+		NATType:     result.NATType.Wire(),
+		PortMapping: string(result.PortMapping),
+		ReportedAt:  time.Now().UTC(),
 	})
 	if err != nil {
 		var apiErr *api.APIError

@@ -27,8 +27,9 @@ const endpointRejectionEscalation = 3
 
 // DiscoveryResult holds the outcome of a STUN discovery cycle.
 type DiscoveryResult struct {
-	Endpoint string // "ip:port" format
-	NATType  NATType
+	Endpoint    string // "ip:port" format
+	NATType     NATType
+	PortMapping PortMapping
 }
 
 // Discoverer performs STUN-based NAT traversal to discover the node's public endpoint.
@@ -40,9 +41,9 @@ type DiscoveryResult struct {
 // interface is up. The mapped address therefore describes the STUN socket's
 // mapping, and the published endpoint carries the mapped IP with the
 // advertised WireGuard listen port instead. That endpoint is exact wherever
-// the NAT preserves or forwards the port; where it translates ports
-// per-mapping, nat_type (symmetric) remains the signal that direct dialing
-// is unreliable.
+// the NAT preserves the port; where it translates ports, the reported
+// port_mapping (translated) marks the endpoint as an assumption that holds
+// only where the router forwards or preserves the listen port.
 type Discoverer struct {
 	client STUNClient
 	cfg    Config
@@ -125,11 +126,13 @@ func (d *Discoverer) Discover(ctx context.Context) (*DiscoveryResult, error) {
 		return nil, fmt.Errorf("nat: discover: all STUN servers failed")
 	}
 
-	// A mapped port equal to the source port means no port translation — no NAT.
+	// A mapped port equal to the source port means no port translation — no
+	// NAT, and the published endpoint is what discovery observed. The first
+	// binding alone settles the port mapping; a second one only classifies.
 	if firstAddr.Port == stunPort {
-		endpoint := d.advertisedEndpoint(firstAddr)
-		d.updateLastResult(endpoint, NATNone, firstServer)
-		return &DiscoveryResult{Endpoint: endpoint, NATType: NATNone}, nil
+		result := DiscoveryResult{Endpoint: d.advertisedEndpoint(firstAddr), NATType: NATNone, PortMapping: PortPreserved}
+		d.updateLastResult(result, firstServer)
+		return &result, nil
 	}
 
 	// Try remaining servers to get a second binding for NAT classification.
@@ -153,25 +156,41 @@ func (d *Discoverer) Discover(ctx context.Context) (*DiscoveryResult, error) {
 		d.logger.Warn("NAT classification incomplete: no second STUN server responded", "component", "nat")
 	}
 
-	endpoint := d.advertisedEndpoint(firstAddr)
-	d.updateLastResult(endpoint, natType, firstServer)
-	return &DiscoveryResult{Endpoint: endpoint, NATType: natType}, nil
+	result := DiscoveryResult{Endpoint: d.advertisedEndpoint(firstAddr), NATType: natType, PortMapping: PortTranslated}
+	// Warn on the way into translated only: Discover runs once per refresh,
+	// and a node behind a port forward of the listen port publishes a
+	// working endpoint, so a Warn every cycle would be noise.
+	if prev := d.updateLastResult(result, firstServer); prev != PortTranslated {
+		d.logger.Warn("NAT translates ports, the published endpoint assumes the WireGuard listen port is forwarded",
+			"component", "nat",
+			"endpoint", result.Endpoint,
+			"nat_type", string(result.NATType),
+			"stun_port", stunPort,
+			"mapped_port", firstAddr.Port,
+		)
+	}
+	return &result, nil
 }
 
-func (d *Discoverer) updateLastResult(endpoint string, natType NATType, stunServer string) {
+// updateLastResult stores result as the most recent discovery and returns
+// the PortMapping of the result it replaced, empty before the first.
+func (d *Discoverer) updateLastResult(result DiscoveryResult, stunServer string) PortMapping {
 	d.mu.Lock()
-	d.lastResult = &DiscoveryResult{
-		Endpoint: endpoint,
-		NATType:  natType,
+	var prev PortMapping
+	if d.lastResult != nil {
+		prev = d.lastResult.PortMapping
 	}
+	d.lastResult = &result
 	d.mu.Unlock()
 
 	d.logger.Info("endpoint discovered",
 		"component", "nat",
-		"endpoint", endpoint,
-		"nat_type", string(natType),
+		"endpoint", result.Endpoint,
+		"nat_type", string(result.NATType),
+		"port_mapping", string(result.PortMapping),
 		"stun_server", stunServer,
 	)
+	return prev
 }
 
 // reportEndpoint reports result and returns the server's stale_after
