@@ -588,12 +588,11 @@ func sendRawRequest(t *testing.T, req LaunchRequest, n int) helperResponse {
 // sendRawLine is sendRawRequest for a request line given as bytes.
 func sendRawLine(t *testing.T, line []byte, n int) helperResponse {
 	t.Helper()
-	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	local, remote, err := newSocketpair()
 	if err != nil {
 		t.Fatal(err)
 	}
-	unixConn := func(fd int) *net.UnixConn {
-		f := os.NewFile(uintptr(fd), "pair")
+	unixConn := func(f *os.File) *net.UnixConn {
 		defer f.Close()
 		c, err := net.FileConn(f)
 		if err != nil {
@@ -601,7 +600,7 @@ func sendRawLine(t *testing.T, line []byte, n int) helperResponse {
 		}
 		return c.(*net.UnixConn)
 	}
-	client, server := unixConn(pair[0]), unixConn(pair[1])
+	client, server := unixConn(local), unixConn(remote)
 	defer client.Close()
 	defer server.Close()
 
@@ -920,6 +919,81 @@ func TestSessionHelperClient_SocketPathStates(t *testing.T) {
 			t.Error("no child helper was started for a path that holds no socket")
 		}
 	})
+
+	// macOS has no helper socket and passes an empty path: the child runs,
+	// and nothing is stat'ed.
+	t.Run("empty path starts the child", func(t *testing.T) {
+		passwd := usePasswdFixture(t, "/bin/sh")
+		echo := req
+		echo.Command = "echo hi"
+		client := NewSessionHelperClient("", testHelperChild(passwd), staticKeys{pub}, discardLogger())
+		res := launchPiped(context.Background(), t, client, echo, nil)
+		if res.err != nil || res.status != 0 || res.stdout != "hi\n" {
+			t.Errorf("Launch() = %d, %v, stdout %q; want 0 and hi", res.status, res.err, res.stdout)
+		}
+	})
+}
+
+// The child helper writes its log lines where the child func points its
+// stderr, so plexd on macOS can route them through its daemon log writer; a
+// child func that sets none leaves the child on plexd's own stderr.
+func TestSessionHelperClient_ChildStderr(t *testing.T) {
+	pub, priv := newSigningKey(t)
+	passwd := usePasswdFixture(t, "/bin/sh")
+	req := LaunchRequest{
+		Version: 1, SessionID: "sess-helper", User: helperUser, Mode: LaunchModeExec, Command: "echo hi",
+		Token: sessionToken(t, priv, "sess-helper", helperUser, nil),
+	}
+	newChild := testHelperChild(passwd)
+
+	t.Run("set by the child func", func(t *testing.T) {
+		var stderr bytes.Buffer
+		client := NewSessionHelperClient("", func(keys []ed25519.PublicKey) *exec.Cmd {
+			cmd := newChild(keys)
+			cmd.Stderr = &stderr
+			return cmd
+		}, staticKeys{pub}, discardLogger())
+		if res := launchPiped(context.Background(), t, client, req, nil); res.err != nil || res.status != 0 {
+			t.Fatalf("Launch() = %d, %v", res.status, res.err)
+		}
+		if !strings.Contains(stderr.String(), "session helper started process") {
+			t.Errorf("child stderr = %q, want the helper's log lines", stderr.String())
+		}
+	})
+
+	t.Run("left unset", func(t *testing.T) {
+		var cmd *exec.Cmd
+		client := NewSessionHelperClient("", func(keys []ed25519.PublicKey) *exec.Cmd {
+			cmd = newChild(keys)
+			return cmd
+		}, staticKeys{pub}, discardLogger())
+		if res := launchPiped(context.Background(), t, client, req, nil); res.err != nil || res.status != 0 {
+			t.Fatalf("Launch() = %d, %v", res.status, res.err)
+		}
+		if cmd.Stderr != os.Stderr {
+			t.Errorf("child stderr = %v, want plexd's own stderr", cmd.Stderr)
+		}
+	})
+}
+
+// Both ends of the socketpair are closed on exec, so a process the helper or
+// another goroutine starts never inherits one.
+func TestNewSocketpair_CloseOnExec(t *testing.T) {
+	local, remote, err := newSocketpair()
+	if err != nil {
+		t.Fatalf("newSocketpair() error: %v", err)
+	}
+	defer local.Close()
+	defer remote.Close()
+	for _, f := range []*os.File{local, remote} {
+		flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
+		if err != nil {
+			t.Fatalf("F_GETFD on %s: %v", f.Name(), err)
+		}
+		if flags&unix.FD_CLOEXEC == 0 {
+			t.Errorf("%s is not closed on exec", f.Name())
+		}
+	}
 }
 
 func TestSessionHelperClient_ResponseErrors(t *testing.T) {
