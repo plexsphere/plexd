@@ -629,3 +629,83 @@ func TestSSE_IdleTimeoutTriggersReconnect(t *testing.T) {
 		t.Fatal("Connect did not return within 5s — idle timeout not enforced")
 	}
 }
+
+// An open stream outlives the request timeout: an event sent well after it is
+// still dispatched, and Connect returns only when the server ends the stream.
+func TestSSE_StreamOutlivesRequestTimeout(t *testing.T) {
+	const requestTimeout = 300 * time.Millisecond
+	const eventAfter = 3 * requestTimeout
+	envelopeJSON := `{"id":"evt_001","type":"node_state_updated","issued_at":"2025-01-01T00:00:00Z","payload":{},"signature":"sig"}`
+
+	client := newTimeoutTestClient(t, requestTimeout, func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+
+		keepAlive := time.NewTicker(100 * time.Millisecond)
+		defer keepAlive.Stop()
+		send := time.After(eventAfter)
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-keepAlive.C:
+				fmt.Fprint(w, ":keep-alive\n\n")
+				flusher.Flush()
+			case <-send:
+				fmt.Fprintf(w, "data: %s\nid: evt_001\n\n", envelopeJSON)
+				flusher.Flush()
+				return
+			}
+		}
+	})
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dispatcher := NewEventDispatcher(logger)
+	var handled atomic.Int64
+	dispatcher.Register("node_state_updated", func(context.Context, Envelope) error {
+		handled.Add(1)
+		return nil
+	})
+	stream := NewSSEStream(client, nil, dispatcher, 3*time.Second, logger)
+
+	start := time.Now()
+	err := stream.Connect(backstopContext(t), "n1")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if elapsed < eventAfter {
+		t.Errorf("Connect returned after %v, want no earlier than %v (the request timeout cut the stream)", elapsed, eventAfter)
+	}
+	if n := handled.Load(); n != 1 {
+		t.Errorf("handler ran %d times, want 1", n)
+	}
+}
+
+// With the request timeout off the open stream, the idle timeout is what ends
+// a silent one, even when it is longer than the request timeout.
+func TestSSE_IdleTimeoutBoundsOpenStream(t *testing.T) {
+	const requestTimeout = 300 * time.Millisecond
+	const idleTimeout = 700 * time.Millisecond
+	client := newTimeoutTestClient(t, requestTimeout, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stream := NewSSEStream(client, nil, NewEventDispatcher(logger), idleTimeout, logger)
+
+	start := time.Now()
+	err := stream.Connect(backstopContext(t), "n1")
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrSSEIdleTimeout) {
+		t.Fatalf("Connect error = %v, want ErrSSEIdleTimeout", err)
+	}
+	if elapsed < idleTimeout || elapsed > 5*time.Second {
+		t.Errorf("Connect returned after %v, want between %v and 5s", elapsed, idleTimeout)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"time"
 )
 
 // Register sends a registration request to the control plane.
@@ -26,6 +27,13 @@ func (c *ControlPlane) Register(ctx context.Context, req RegisterRequest) (*Regi
 
 // ConnectSSE opens an SSE connection to the node event stream.
 // The caller is responsible for closing the response body.
+//
+// The request timeout bounds only the setup: the wait for the response headers
+// and, on a non-2xx answer, the read of its problem body. Headers that do not
+// arrive in time fail with ErrSSEConnectTimeout; a problem body that stalls
+// still yields the status as an *APIError, without whatever part of the body
+// did not arrive. Once the stream is open, the request timeout no longer
+// applies, and SSEStream bounds a silent stream with its idle timeout.
 // GET /v1/nodes/{node_id}/events
 func (c *ControlPlane) ConnectSSE(ctx context.Context, nodeID, lastEventID string) (*http.Response, error) {
 	// The stream builds its own request rather than going through newRequest,
@@ -34,8 +42,10 @@ func (c *ControlPlane) ConnectSSE(ctx context.Context, nodeID, lastEventID strin
 		return nil, err
 	}
 	path := fmt.Sprintf("/v1/nodes/%s/events", url.PathEscape(nodeID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	connectCtx, cancel := context.WithCancel(ctx)
+	req, err := http.NewRequestWithContext(connectCtx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("api: create SSE request: %w", err)
 	}
 
@@ -49,17 +59,69 @@ func (c *ControlPlane) ConnectSSE(ctx context.Context, nodeID, lastEventID strin
 		req.Header.Set("Last-Event-ID", lastEventID)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	// The shared client's Timeout also covers reading the body, so it would cut
+	// the stream at the request timeout. The stream uses a copy without it, and
+	// a timer that cancels the request bounds the setup instead. A non-positive
+	// timeout means no timeout, as it does for http.Client. Whether the timer
+	// fired is read from Stop, never from connectCtx, which the caller's ctx
+	// ending also cancels.
+	stream := *c.httpClient
+	stream.Timeout = 0
+	timeout := c.httpClient.Timeout
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.AfterFunc(timeout, cancel)
+	}
+	// stopTimer stops the setup timer and reports whether it had already fired.
+	stopTimer := func() (fired bool) { return timer != nil && !timer.Stop() }
+	connectTimeoutErr := func() error {
+		return fmt.Errorf("%w: no response within %s", ErrSSEConnectTimeout, timeout)
+	}
+
+	resp, err := stream.Do(req)
 	if err != nil {
+		fired := stopTimer()
+		cancel()
+		if fired {
+			return nil, connectTimeoutErr()
+		}
 		return nil, fmt.Errorf("api: SSE connect: %w", err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		defer resp.Body.Close()
-		return nil, errorFromResponse(resp)
+		// The timer stays armed while the problem body is read, so a body that
+		// stalls cannot hang the connect. The status is known either way.
+		apiErr := errorFromResponse(resp)
+		resp.Body.Close()
+		stopTimer()
+		cancel()
+		return nil, apiErr
 	}
 
+	if stopTimer() {
+		// The timer fired as the headers arrived; the body is already cancelled.
+		resp.Body.Close()
+		cancel()
+		return nil, connectTimeoutErr()
+	}
+
+	resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
 	return resp, nil
+}
+
+// cancelOnCloseBody releases the stream's request context when the body is
+// closed, so an ended stream does not stay registered on the caller's context.
+// It holds no state of its own, so concurrent and repeated Close calls are as
+// safe as they are on the wrapped body.
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 // Heartbeat sends a heartbeat to the control plane.
