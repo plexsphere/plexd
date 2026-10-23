@@ -559,7 +559,7 @@ func TestSSHSession_ExecFailsClosed(t *testing.T) {
 	if n := len(launcher.launches()); n != 0 {
 		t.Errorf("launcher called %d times, want 0", n)
 	}
-	if !strings.Contains(h.logs.String(), "ssh command not recorded by the control plane; refusing to run it") {
+	if !strings.Contains(h.logs.String(), `level=WARN msg="ssh command not recorded by the control plane; refusing to run it"`) {
 		t.Error("the refusal was not warned about")
 	}
 }

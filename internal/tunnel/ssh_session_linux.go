@@ -449,16 +449,18 @@ func (s *sshSession) runProcess(ctx context.Context, conn *ssh.ServerConn, ch ss
 		err := s.deps.Commands.ReportSSHCommandStarted(reportCtx, s.entry.SessionID, command, startedAt)
 		cancel()
 		if err != nil {
+			// Logged before the client is told, so the refusal is in the log
+			// by the time the client sees the channel close.
+			s.logger.Warn("ssh command not recorded by the control plane; refusing to run it",
+				"command", command,
+				"error", err,
+			)
 			fmt.Fprintf(ch.Stderr(), "plexd: the control plane did not record this command; it was not run: %v\r\n", err)
 			sendExitStatus(ch, 1)
 			ch.Close()
 			if st.slave != nil {
 				st.slave.Close()
 			}
-			s.logger.Warn("ssh command not recorded by the control plane; refusing to run it",
-				"command", command,
-				"error", err,
-			)
 			if api.IsSessionRevokedOrExpired(err) {
 				s.logger.Info("ssh session revoked or expired server-side; closing the connection")
 				conn.Close()
