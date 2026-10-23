@@ -26,6 +26,17 @@ func newTestDiscoverer(client *mockSTUNClient, servers []string, localPort int) 
 	return NewDiscoverer(client, cfg, localPort, discardLogger())
 }
 
+// newLoggingDiscoverer is newTestDiscoverer, advertising port 51820, with its
+// log written to logs.
+func newLoggingDiscoverer(client *mockSTUNClient, servers []string, logs *syncBuffer) *Discoverer {
+	d := newTestDiscoverer(client, servers, 51820)
+	d.logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return d
+}
+
+// translatesPortsMsg is the Warn Discover logs on the way into PortTranslated.
+const translatesPortsMsg = "NAT translates ports, the published endpoint assumes the WireGuard listen port is forwarded"
+
 func TestDiscover_ClassifiesFullCone(t *testing.T) {
 	addr := MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: 12345}
 	client := &mockSTUNClient{
@@ -64,17 +75,23 @@ func TestDiscover_ClassifiesSymmetric(t *testing.T) {
 	if result.NATType != NATSymmetric {
 		t.Errorf("expected NATSymmetric, got %s", result.NATType)
 	}
+	if result.PortMapping != PortTranslated {
+		t.Errorf("PortMapping = %q, want %q", result.PortMapping, PortTranslated)
+	}
 }
 
 func TestDiscover_ClassifiesNone(t *testing.T) {
 	// The mapped port matching the STUN source port is what marks "no NAT";
 	// the IP must still be routable to be publishable as an endpoint.
+	// stun2 maps to another port and must never be asked: one binding that
+	// kept the port settles both the classification and the port mapping.
 	client := &mockSTUNClient{
 		results: map[string]mockBindResult{
 			"stun1:3478": {Addr: MappedAddress{IP: net.IPv4(198, 51, 100, 7), Port: mockEphemeralPort}},
+			"stun2:3478": {Addr: MappedAddress{IP: net.IPv4(198, 51, 100, 7), Port: 10482}},
 		},
 	}
-	d := newTestDiscoverer(client, []string{"stun1:3478"}, 51820)
+	d := newTestDiscoverer(client, []string{"stun1:3478", "stun2:3478"}, 51820)
 
 	result, err := d.Discover(context.Background())
 	if err != nil {
@@ -83,8 +100,15 @@ func TestDiscover_ClassifiesNone(t *testing.T) {
 	if result.NATType != NATNone {
 		t.Errorf("expected NATNone, got %s", result.NATType)
 	}
+	if result.PortMapping != PortPreserved {
+		t.Errorf("PortMapping = %q, want %q", result.PortMapping, PortPreserved)
+	}
 	if result.Endpoint != "198.51.100.7:51820" {
 		t.Errorf("unexpected endpoint: %s", result.Endpoint)
+	}
+	calls := client.allCalls()
+	if len(calls) != 1 || calls[0].ServerAddr != "stun1:3478" {
+		t.Errorf("Bind calls = %+v, want exactly one, to stun1:3478", calls)
 	}
 }
 
@@ -104,8 +128,233 @@ func TestDiscover_ClassifiesUnknownOnPartialFailure(t *testing.T) {
 	if result.NATType != NATUnknown {
 		t.Errorf("expected NATUnknown, got %s", result.NATType)
 	}
+	if result.PortMapping != PortTranslated {
+		t.Errorf("PortMapping = %q, want %q", result.PortMapping, PortTranslated)
+	}
 	if result.Endpoint != "203.0.113.1:51820" {
 		t.Errorf("unexpected endpoint: %s", result.Endpoint)
+	}
+}
+
+// The lab case: the router maps the STUN socket to a port of its own and
+// both servers see the same mapping. The mapping is endpoint-independent, so
+// nat_type stays full_cone, and the published endpoint keeps the listen port,
+// which only a port forward makes reachable, so the port mapping says the
+// endpoint is an assumption. A node behind such a forward reports the same.
+func TestDiscover_PortTranslatingFullConeKeepsListenPort(t *testing.T) {
+	addr := MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: 10482}
+	client := &mockSTUNClient{
+		results: map[string]mockBindResult{
+			"stun1:3478": {Addr: addr},
+			"stun2:3478": {Addr: addr},
+		},
+	}
+	d := newTestDiscoverer(client, []string{"stun1:3478", "stun2:3478"}, 51820)
+
+	result, err := d.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NATType != NATFullCone {
+		t.Errorf("NATType = %s, want %s", result.NATType, NATFullCone)
+	}
+	if result.PortMapping != PortTranslated {
+		t.Errorf("PortMapping = %q, want %q", result.PortMapping, PortTranslated)
+	}
+	if result.Endpoint != "203.0.113.1:51820" {
+		t.Errorf("Endpoint = %s, want 203.0.113.1:51820", result.Endpoint)
+	}
+}
+
+// With no STUN server configured there is no binding, so there is nothing
+// to classify, store or warn about.
+func TestDiscover_NoSTUNServers(t *testing.T) {
+	logs := &syncBuffer{}
+	d := newLoggingDiscoverer(&mockSTUNClient{}, []string{}, logs)
+
+	_, err := d.Discover(context.Background())
+	if err == nil || err.Error() != "nat: discover: all STUN servers failed" {
+		t.Fatalf("err = %v, want %q", err, "nat: discover: all STUN servers failed")
+	}
+	if got := d.LastResult(); got != nil {
+		t.Errorf("LastResult() = %+v, want nil", got)
+	}
+	if lines := logLines(logs, translatesPortsMsg); len(lines) != 0 {
+		t.Errorf("logged %d %q lines, want none: %v", len(lines), translatesPortsMsg, lines)
+	}
+}
+
+// A cycle in which every binding fails keeps the earlier result. It is no
+// way out of PortTranslated either, so the translated cycle after it does
+// not warn again.
+func TestDiscover_FailedCycleKeepsLastResult(t *testing.T) {
+	translated := map[string]mockBindResult{
+		"stun1:3478": {Addr: MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: 10482}},
+		"stun2:3478": {Addr: MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: 10482}},
+	}
+	client := &mockSTUNClient{results: translated}
+	logs := &syncBuffer{}
+	d := newLoggingDiscoverer(client, []string{"stun1:3478", "stun2:3478"}, logs)
+
+	if _, err := d.Discover(context.Background()); err != nil {
+		t.Fatalf("first cycle: %v", err)
+	}
+
+	client.mu.Lock()
+	client.results = map[string]mockBindResult{
+		"stun1:3478": {Err: context.DeadlineExceeded},
+		"stun2:3478": {Err: context.DeadlineExceeded},
+	}
+	client.mu.Unlock()
+
+	_, err := d.Discover(context.Background())
+	if err == nil || err.Error() != "nat: discover: all STUN servers failed" {
+		t.Fatalf("failed cycle: err = %v, want %q", err, "nat: discover: all STUN servers failed")
+	}
+	last := d.LastResult()
+	if last == nil || last.PortMapping != PortTranslated || last.Endpoint != "203.0.113.1:51820" {
+		t.Fatalf("LastResult() = %+v, want the first cycle's 203.0.113.1:51820 with %q", last, PortTranslated)
+	}
+	if lines := logLines(logs, translatesPortsMsg); len(lines) != 1 {
+		t.Errorf("after the failed cycle: %d %q lines, want 1: %v", len(lines), translatesPortsMsg, lines)
+	}
+
+	client.mu.Lock()
+	client.results = translated
+	client.mu.Unlock()
+
+	if _, err := d.Discover(context.Background()); err != nil {
+		t.Fatalf("third cycle: %v", err)
+	}
+	if lines := logLines(logs, translatesPortsMsg); len(lines) != 1 {
+		t.Errorf("after the third cycle: %d %q lines, want 1: %v", len(lines), translatesPortsMsg, lines)
+	}
+}
+
+// Every discovery names its port mapping on the endpoint discovered line,
+// so the log shows whether the published endpoint was observed or assumed.
+// A first discovery with a translated port warns whatever the mapping's
+// classification, and one that kept the port never warns.
+func TestDiscover_LogsPortMapping(t *testing.T) {
+	translated := MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: 10482}
+	kept := MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: mockEphemeralPort}
+	tests := []struct {
+		name        string
+		results     map[string]mockBindResult
+		wantNATType NATType
+		want        PortMapping
+		wantWarns   int
+	}{
+		{
+			name:        "full cone",
+			results:     map[string]mockBindResult{"stun1:3478": {Addr: translated}, "stun2:3478": {Addr: translated}},
+			wantNATType: NATFullCone, want: PortTranslated, wantWarns: 1,
+		},
+		{
+			// The second binding keeps the source port, but only the first
+			// binding settles the port mapping.
+			name:        "symmetric, second binding keeps the port",
+			results:     map[string]mockBindResult{"stun1:3478": {Addr: translated}, "stun2:3478": {Addr: kept}},
+			wantNATType: NATSymmetric, want: PortTranslated, wantWarns: 1,
+		},
+		{
+			name:        "unknown",
+			results:     map[string]mockBindResult{"stun1:3478": {Addr: translated}, "stun2:3478": {Err: errors.New("timeout")}},
+			wantNATType: NATUnknown, want: PortTranslated, wantWarns: 1,
+		},
+		{
+			name:        "port preserved",
+			results:     map[string]mockBindResult{"stun1:3478": {Addr: kept}, "stun2:3478": {Addr: translated}},
+			wantNATType: NATNone, want: PortPreserved, wantWarns: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := &syncBuffer{}
+			d := newLoggingDiscoverer(&mockSTUNClient{results: tt.results}, []string{"stun1:3478", "stun2:3478"}, logs)
+
+			result, err := d.Discover(context.Background())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.NATType != tt.wantNATType || result.PortMapping != tt.want {
+				t.Fatalf("result = %s/%q, want %s/%q", result.NATType, result.PortMapping, tt.wantNATType, tt.want)
+			}
+
+			lines := logLines(logs, "endpoint discovered")
+			if len(lines) != 1 {
+				t.Fatalf("endpoint discovered lines = %d, want 1; logs:\n%s", len(lines), logs.String())
+			}
+			if want := "port_mapping=" + string(tt.want); !strings.Contains(lines[0], want) {
+				t.Errorf("endpoint discovered line %q, want it to contain %q", lines[0], want)
+			}
+
+			warns := logLines(logs, translatesPortsMsg)
+			if len(warns) != tt.wantWarns {
+				t.Fatalf("%q lines = %d, want %d; logs:\n%s", translatesPortsMsg, len(warns), tt.wantWarns, logs.String())
+			}
+			for _, w := range warns {
+				if want := "nat_type=" + string(tt.wantNATType); !strings.Contains(w, want) {
+					t.Errorf("Warn line %q, want it to contain %q", w, want)
+				}
+			}
+		})
+	}
+}
+
+// The Warn names an assumption that a port forward makes true, so it fires
+// on the way into translated, the first discovery included, and not on
+// every refresh cycle a port-forwarded node runs.
+func TestDiscover_WarnsOnTransitionIntoTranslated(t *testing.T) {
+	translated := map[string]mockBindResult{
+		"stun1:3478": {Addr: MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: 10482}},
+		"stun2:3478": {Addr: MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: 10482}},
+	}
+	// The mock sends from mockEphemeralPort, so mapping back to it is a
+	// preserved port.
+	preserved := map[string]mockBindResult{
+		"stun1:3478": {Addr: MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: mockEphemeralPort}},
+	}
+	cycles := []struct {
+		results   map[string]mockBindResult
+		want      PortMapping
+		wantWarns int // Warn lines logged so far
+	}{
+		{results: translated, want: PortTranslated, wantWarns: 1},
+		{results: translated, want: PortTranslated, wantWarns: 1},
+		{results: translated, want: PortTranslated, wantWarns: 1},
+		{results: preserved, want: PortPreserved, wantWarns: 1},
+		{results: translated, want: PortTranslated, wantWarns: 2},
+	}
+
+	client := &mockSTUNClient{}
+	logs := &syncBuffer{}
+	d := newLoggingDiscoverer(client, []string{"stun1:3478", "stun2:3478"}, logs)
+
+	for i, c := range cycles {
+		client.mu.Lock()
+		client.results = c.results
+		client.mu.Unlock()
+
+		result, err := d.Discover(context.Background())
+		if err != nil {
+			t.Fatalf("cycle %d: %v", i+1, err)
+		}
+		if result.PortMapping != c.want {
+			t.Fatalf("cycle %d: PortMapping = %q, want %q", i+1, result.PortMapping, c.want)
+		}
+		if lines := logLines(logs, translatesPortsMsg); len(lines) != c.wantWarns {
+			t.Fatalf("after cycle %d: %d %q lines, want %d: %v", i+1, len(lines), translatesPortsMsg, c.wantWarns, lines)
+		}
+	}
+
+	for _, line := range logLines(logs, translatesPortsMsg) {
+		for _, want := range []string{"level=WARN", "component=nat", "endpoint=203.0.113.1:51820", "nat_type=full_cone", "stun_port=40000", "mapped_port=10482"} {
+			if !strings.Contains(line, want) {
+				t.Errorf("Warn line %q, want it to contain %q", line, want)
+			}
+		}
 	}
 }
 
@@ -279,6 +528,22 @@ func TestLastResult_AfterDiscovery(t *testing.T) {
 	if info.NATType != NATFullCone {
 		t.Errorf("unexpected NATType: %s", info.NATType)
 	}
+	if info.PortMapping != PortTranslated {
+		t.Errorf("PortMapping = %q, want %q", info.PortMapping, PortTranslated)
+	}
+
+	// The next cycle's port mapping replaces it.
+	client.mu.Lock()
+	client.results = map[string]mockBindResult{
+		"stun1:3478": {Addr: MappedAddress{IP: net.IPv4(203, 0, 113, 1), Port: mockEphemeralPort}},
+	}
+	client.mu.Unlock()
+	if _, err := d.Discover(context.Background()); err != nil {
+		t.Fatalf("second cycle: %v", err)
+	}
+	if got := d.LastResult().PortMapping; got != PortPreserved {
+		t.Errorf("PortMapping after the second cycle = %q, want %q", got, PortPreserved)
+	}
 }
 
 func TestLastResult_ConcurrentAccess(t *testing.T) {
@@ -398,6 +663,10 @@ func TestRun_InitialDiscoveryAndReport(t *testing.T) {
 	}
 	if call.Report.NATType != string(NATFullCone) {
 		t.Errorf("expected nat type full_cone, got %s", call.Report.NATType)
+	}
+	// The mock maps the probe to port 12345 while it left from 40000.
+	if call.Report.PortMapping != string(PortTranslated) {
+		t.Errorf("port mapping = %q, want %q", call.Report.PortMapping, PortTranslated)
 	}
 }
 
