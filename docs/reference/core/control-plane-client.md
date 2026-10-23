@@ -17,8 +17,8 @@ The `internal/api` package provides the Go client for communicating with the Ple
 | `BaseURL`               | `string`        | —       | Control plane API base URL (required)          |
 | `TLSInsecureSkipVerify` | `bool`          | `false` | Disable TLS certificate verification           |
 | `ConnectTimeout`        | `time.Duration` | `10s`   | TCP connection timeout                         |
-| `RequestTimeout`        | `time.Duration` | `30s`   | Full HTTP request/response timeout             |
-| `SSEIdleTimeout`        | `time.Duration` | `90s`   | Max idle time before SSE reconnect (now honored) |
+| `RequestTimeout`        | `time.Duration` | `30s`   | Full HTTP request/response timeout; bounds only the setup of the SSE stream |
+| `SSEIdleTimeout`        | `time.Duration` | `90s`   | Max idle time before SSE reconnect; the only bound on an open stream. Must not be negative |
 | `SSEReprobeInterval`    | `time.Duration` | `10m`   | How often pull-only delivery re-probes a descoped SSE endpoint |
 
 ```go
@@ -43,7 +43,7 @@ func NewControlPlane(cfg Config, version string, logger *slog.Logger) (*ControlP
 ```
 
 - Applies config defaults and validates
-- Configures TLS, connect timeout, request timeout
+- Configures TLS, connect timeout, request timeout (`ConnectSSE` sends through a copy without the request timeout, see [SSE Stream](#sse-stream))
 - Sets `User-Agent: plexd/{version}` on all requests
 - Gzip-compresses request bodies larger than 1 KiB **on the three observability ingest operations only** — they are the ones whose contract accepts `Content-Encoding: gzip`. Every other handler decodes the body as it arrives, so a compressed one is read as JSON and refused with `400`, naming the gzip magic byte as `invalid character '\x1f'`.
 - Transparently decompresses gzip responses
@@ -328,6 +328,7 @@ W3C-compliant `text/event-stream` line protocol parser.
 `SSEStream` wraps the parser with HTTP connectivity, envelope parsing, verification, and dispatching.
 
 - Connects via `ControlPlane.ConnectSSE` with `Accept: text/event-stream`
+- `RequestTimeout` bounds only the setup: the wait for the response headers and, on a non-2xx answer, the read of its problem body. Headers that do not arrive in time fail with `ErrSSEConnectTimeout`, which `ClassifyError` treats as `RetryTransient`. A problem body that stalls still yields the status as an `*APIError`; its `code` is lost if it had not arrived, so a stalled `501` is classified as transient rather than descoped. An open stream is not cut by `RequestTimeout`: it ends when the control plane closes it, when the caller's context ends, when the body is closed, or when no byte arrives within the idle timeout (`SSEIdleTimeout`, 90s by default). The control plane's keep-alive comments, every 25s, keep a healthy stream from going idle
 - Sends `Last-Event-ID` header on reconnection
 - Parses each `data:` payload as an `Envelope`
 - Passes envelope through `EventVerifier` before dispatching

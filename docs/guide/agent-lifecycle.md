@@ -79,7 +79,7 @@ If a node misses **3 consecutive heartbeats** (i.e. no heartbeat received for `3
 
 ### SSE Reconnection
 
-The SSE stream is the primary channel for real-time updates. When the connection drops:
+The SSE stream is the primary channel for real-time updates. An open stream stays up until the control plane closes it, or until `api.sse_idle_timeout` (90s by default) passes without a byte arriving, keep-alive comments included. `api.request_timeout` bounds only setting the stream up. When the connection drops:
 
 1. plexd detects the disconnect and begins reconnection with **exponential backoff**: 1s, 2s, 4s, 8s, ... up to a maximum of 60s.
 2. **Jitter** of +/-25% is applied to each backoff interval to prevent thundering herd effects when many nodes reconnect simultaneously (e.g. after a control plane restart).
