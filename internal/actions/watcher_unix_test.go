@@ -3,15 +3,24 @@
 package actions
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/fsutil"
 	"github.com/plexsphere/plexd/internal/integrity"
 )
 
@@ -239,14 +248,57 @@ func TestWatcher_DeletedFileUnregistered(t *testing.T) {
 	dir := t.TempDir()
 	writeExecutable(t, dir, "to-delete", "#!/bin/sh\necho delete me\n")
 
-	var mu sync.Mutex
-	var received [][]api.HookInfo
+	rec := &hookRecorder{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+
+	watchDone := make(chan error, 1)
+	go func() { watchDone <- w.Watch(ctx) }()
+
+	// The initial scan runs once the watch is in place, so a deletion from
+	// here on is reported.
+	initial, _ := rec.waitFor(t, 0, namesAre("to-delete"), "initial scan did not report to-delete")
+
+	// Delete the file
+	if err := os.Remove(filepath.Join(dir, "to-delete")); err != nil {
+		t.Fatal(err)
+	}
+
+	rec.waitFor(t, initial+1, namesAre(), "onChange was not called with empty hooks after deletion")
+
+	cancel()
+	select {
+	case err := <-watchDone:
+		if err != nil {
+			t.Fatalf("Watch() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher did not exit")
+	}
+}
+
+func TestWatcher_ChangeDuringStartupNoticed(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "present-at-start", "#!/bin/sh\necho present\n")
+
+	rec := &hookRecorder{}
+	var once sync.Once
 	onChange := func(hooks []api.HookInfo) {
-		mu.Lock()
-		defer mu.Unlock()
-		cp := make([]api.HookInfo, len(hooks))
-		copy(cp, hooks)
-		received = append(received, cp)
+		rec.onChange(hooks)
+		// The first callback is the initial scan's, made before Watch's event
+		// loop starts. A hook removed and a hook added here land where a
+		// watcher that scans before it watches would never see them.
+		once.Do(func() {
+			if err := os.Remove(filepath.Join(dir, "present-at-start")); err != nil {
+				t.Errorf("remove during startup: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "added-at-start"), []byte("#!/bin/sh\necho added\n"), 0o755); err != nil {
+				t.Errorf("add during startup: %v", err)
+			}
+		})
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -257,31 +309,8 @@ func TestWatcher_DeletedFileUnregistered(t *testing.T) {
 	watchDone := make(chan error, 1)
 	go func() { watchDone <- w.Watch(ctx) }()
 
-	// Wait for initial scan
-	time.Sleep(200 * time.Millisecond)
-
-	// Delete the file
-	if err := os.Remove(filepath.Join(dir, "to-delete")); err != nil {
-		t.Fatal(err)
-	}
-
-	// Wait for debounce + processing
-	time.Sleep(500 * time.Millisecond)
-
-	mu.Lock()
-	// Find the last callback with an empty hooks list
-	var foundEmpty bool
-	for i := len(received) - 1; i >= 0; i-- {
-		if len(received[i]) == 0 {
-			foundEmpty = true
-			break
-		}
-	}
-	mu.Unlock()
-
-	if !foundEmpty {
-		t.Fatal("onChange was not called with empty hooks after deletion")
-	}
+	initial, _ := rec.waitFor(t, 0, namesAre("present-at-start"), "initial scan did not report present-at-start")
+	rec.waitFor(t, initial+1, namesAre("added-at-start"), "a hook removed and a hook added during startup were not both reported")
 
 	cancel()
 	select {
@@ -291,6 +320,108 @@ func TestWatcher_DeletedFileUnregistered(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("watcher did not exit")
+	}
+}
+
+// vanishedHookError is the error fsnotify's kqueue backend (macOS and the BSDs)
+// returns from Add when a file it listed in the directory is gone before it
+// opens it.
+func vanishedHookError(dir string) error {
+	path := filepath.Join(dir, "vanished")
+	return fmt.Errorf("%q: %w", path, &fs.PathError{Op: "lstat", Path: path, Err: fs.ErrNotExist})
+}
+
+func TestWatcher_RetriesWhenAHookVanishesDuringSetup(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "survivor", "#!/bin/sh\necho survivor\n")
+
+	rec := &hookRecorder{}
+	logs := &syncBuffer{}
+	w := NewHookWatcher(dir, rec.onChange, nil, slog.New(slog.NewTextHandler(logs, nil)))
+	w.watchDir = func(ctx context.Context, dir string, onRetry func(error)) (*fsnotify.Watcher, error) {
+		onRetry(vanishedHookError(dir))
+		return fsutil.WatchDir(ctx, dir, onRetry)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	watchDone := make(chan error, 1)
+	go func() { watchDone <- w.Watch(ctx) }()
+
+	initial, _ := rec.waitFor(t, 0, namesAre("survivor"), "initial scan did not run after the retried setup")
+
+	writeExecutable(t, dir, "added-later", "#!/bin/sh\necho later\n")
+	rec.waitFor(t, initial+1, namesAre("added-later", "survivor"), "a hook added after the retried setup was not reported")
+
+	cancel()
+	select {
+	case err := <-watchDone:
+		if err != nil {
+			t.Fatalf("Watch() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher did not exit")
+	}
+
+	want := `level=WARN msg="actions: watcher: a hook vanished while the watch was set up; retrying" component=actions error=`
+	if got := logs.String(); !strings.Contains(got, want) {
+		t.Errorf("log = %q, want it to contain %q", got, want)
+	}
+}
+
+func TestWatcher_SetupErrorScansThenStops(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "kept", "#!/bin/sh\necho kept\n")
+
+	rec := &hookRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+	setupErr := fmt.Errorf("%q: %w", dir, &fs.PathError{Op: "open", Path: dir, Err: fs.ErrPermission})
+	w.watchDir = func(context.Context, string, func(error)) (*fsnotify.Watcher, error) {
+		return nil, setupErr
+	}
+
+	// The timeout turns a Watch that bypasses the seam into a failure instead
+	// of a hang.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := w.Watch(ctx); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("Watch() error = %v, want fs.ErrPermission", err)
+	}
+	// The hooks on disk are still reported once, as before the watch.
+	if got := rec.count(); got != 1 {
+		t.Fatalf("onChange calls = %d, want 1", got)
+	}
+	if got := hookNames(rec.last()); !slices.Equal(got, []string{"kept"}) {
+		t.Errorf("hooks after a failed set-up = %v, want [kept]", got)
+	}
+}
+
+func TestWatcher_CancelDuringSetup(t *testing.T) {
+	dir := t.TempDir()
+
+	rec := &hookRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+
+	// The timeout turns a Watch that bypasses the seam into a failure instead
+	// of a hang.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	called := false
+	w.watchDir = func(ctx context.Context, _ string, _ func(error)) (*fsnotify.Watcher, error) {
+		called = true
+		cancel()
+		return nil, ctx.Err()
+	}
+
+	if err := w.Watch(ctx); err != nil {
+		t.Fatalf("Watch() error = %v, want nil", err)
+	}
+	if !called {
+		t.Fatal("Watch did not set up its watch through w.watchDir")
+	}
+	if got := rec.count(); got != 0 {
+		t.Errorf("onChange calls = %d, want 0", got)
 	}
 }
 
@@ -814,4 +945,95 @@ func TestWatcher_HooksSnapshot(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("watcher did not exit")
 	}
+}
+
+// hookRecorder is an onChange callback that records every hook list a
+// HookWatcher reports, in call order.
+type hookRecorder struct {
+	mu    sync.Mutex
+	calls [][]api.HookInfo
+}
+
+func (r *hookRecorder) onChange(hooks []api.HookInfo) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, slices.Clone(hooks))
+}
+
+func (r *hookRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
+}
+
+// last returns the newest callback, or nil before the first.
+func (r *hookRecorder) last() []api.HookInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.calls) == 0 {
+		return nil
+	}
+	return r.calls[len(r.calls)-1]
+}
+
+// waitFor waits up to 5 s for a callback at index from or later that match
+// accepts, and returns its index and hook list. Otherwise it fails the test
+// with msg and the hook names of the last callback.
+func (r *hookRecorder) waitFor(t *testing.T, from int, match func([]api.HookInfo) bool, msg string) (int, []api.HookInfo) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		r.mu.Lock()
+		for i := from; i < len(r.calls); i++ {
+			if match(r.calls[i]) {
+				hooks := r.calls[i]
+				r.mu.Unlock()
+				return i, hooks
+			}
+		}
+		last := "none"
+		if n := len(r.calls); n > 0 {
+			last = fmt.Sprint(hookNames(r.calls[n-1]))
+		}
+		r.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatalf("%s (last callback: %s)", msg, last)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// namesAre accepts a callback whose hook names are exactly want, in order. No
+// names accepts an empty hook list.
+func namesAre(want ...string) func([]api.HookInfo) bool {
+	return func(hooks []api.HookInfo) bool {
+		return slices.Equal(hookNames(hooks), want)
+	}
+}
+
+func hookNames(hooks []api.HookInfo) []string {
+	names := make([]string, len(hooks))
+	for i, h := range hooks {
+		names[i] = h.Name
+	}
+	return names
+}
+
+// syncBuffer is a bytes.Buffer that is safe to write from the watcher's
+// goroutines while a test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

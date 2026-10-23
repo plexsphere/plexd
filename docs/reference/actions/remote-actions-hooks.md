@@ -595,8 +595,8 @@ type IntegrityAlertCallback func(hookName, oldChecksum, newChecksum string)
 ### Watch Lifecycle
 
 1. Create hooks directory if it does not exist
-2. Perform initial scan: read all executable files, compute checksums, call `onChange`
-3. Start `fsnotify` watcher on the hooks directory
+2. Start the `fsnotify` watch with `fsutil.WatchDir`. A hook that vanishes while the watch is set up (macOS and the BSDs) makes it set the watch up again after 100 ms, up to 10 attempts. If set-up still fails, `Watch` runs the initial scan once and returns the error, so the hooks on disk stay registered without live updates
+3. Perform the initial scan: read all executable files, compute checksums, call `onChange`. The scan runs after the watch is in place, so a hook changed during start-up is in the scan, arrives as an event, or both
 4. On file create/write/chmod: debounce (200ms), then re-read file, compute checksum, update hooks map, call `onChange`
 5. On file remove/rename: debounce, remove from hooks map, call `onChange`
 6. On `.json` sidecar change: debounce, re-read the parent hook's metadata
@@ -1022,6 +1022,7 @@ All log entries use `component=actions`.
 | `Warn`  | execution deadline lapsed before the run started | `execution_id`, `expires_at` |
 | `Warn`  | failed to send terminal callback | `execution_id`, `attempts`, `error`      |
 | `Warn`  | failed to send callback for rejected execution | `execution_id`, `status`, `error` |
+| `Warn`  | actions: watcher: a hook vanished while the watch was set up; retrying | `error` |
 | `Error` | execution entry carries no execution_id; dropping | `action`                |
 | `Error` | orphan report undelivered across repeated pulls; leaving the execution to server-side expiry | `execution_id`, `passes` |
 | `Error` | claim callback refused; aborting execution | `execution_id`, `status`, `error` |
