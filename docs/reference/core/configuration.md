@@ -80,8 +80,8 @@ Control plane HTTP client configuration.
 | `base_url` | string | — (required) | Control plane API base URL, e.g. `https://api.plexsphere.com`. Required in the merged configuration — the value may come from the file, `--api`, or `PLEXD_API`. |
 | `tls_insecure_skip_verify` | bool | `false` | Disable TLS certificate verification. **WARNING:** Only for development/testing. |
 | `connect_timeout` | duration | `10s` | Maximum time to wait for a TCP connection |
-| `request_timeout` | duration | `30s` | Maximum time for a complete HTTP request/response cycle |
-| `sse_idle_timeout` | duration | `90s` | Maximum idle time on the SSE stream before reconnecting |
+| `request_timeout` | duration | `30s` | Maximum time for a complete HTTP request/response cycle. On the SSE event stream it bounds only the setup: the wait for the response headers, and the problem body of a non-2xx answer. It does not cut an open stream. |
+| `sse_idle_timeout` | duration | `90s` | Maximum idle time on the SSE stream before reconnecting. It is the only bound on an open stream: any byte resets it, the control plane's keep-alive comments included. Must not be negative. |
 | `sse_reprobe_interval` | duration | `10m` | How often pull-only delivery re-probes the SSE endpoint after the control plane descoped it. Must be at least `1s` when set. |
 
 Source: `internal/api/config.go`
