@@ -406,13 +406,16 @@ func TestACMEIntegration_ConcurrentTLSConfigAccess(t *testing.T) {
 				t.Errorf("AllowedHosts len = %d, want 2", len(hosts))
 			}
 
-			// GetCertificate(nil) — the underlying autocert.Manager
-			// panics on nil hello, so we recover. This verifies the
-			// method doesn't deadlock or race.
-			func() {
-				defer func() { _ = recover() }()
-				_, _ = mgr.GetCertificate(nil)
-			}()
+			// GetCertificate() — should not race. The hello carries no
+			// server name, so autocert refuses it before it reads its
+			// cache or the network. Never pass a nil hello: autocert
+			// dereferences it, and on windows/amd64 the access
+			// violation that raises can corrupt the heap
+			// (golang/go#81238).
+			cert, err := mgr.GetCertificate(&tls.ClientHelloInfo{})
+			if cert != nil || err == nil || !strings.HasPrefix(err.Error(), "acme/autocert: ") {
+				t.Errorf("GetCertificate(empty hello) = %v, %v; want nil and an acme/autocert error", cert, err)
+			}
 		}()
 	}
 
