@@ -64,15 +64,18 @@ jobs:
       # resolved before sudo resets PATH, and the two cache variables let root
       # reuse what the step above downloaded and built instead of filling a
       # second cache under /var/root. -v is what makes a skip visible in the log
-      # rather than passing as a bare ok.
+      # rather than passing as a bare ok. The two session helper tests start a
+      # shell as uid 65534 and hand it the pty, which needs root as well; they
+      # skip on every other runner, so this is where the switch of users is
+      # exercised.
       - name: Run privileged macOS tests
         if: runner.os == 'macOS'
         run: |
           sudo env GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" \
             PLEXD_TEST_REAL_PF=1 \
             "$(command -v go)" test -race -count=1 -v \
-            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real|TestPFController_Real|TestWGControllers_RealUTUN)$' \
-            ./internal/wireguard/ ./internal/bridge/ ./internal/policy/
+            -run '^(TestDarwinController_RealUTUN|TestDarwinRouteController_Real|TestPFController_Real|TestWGControllers_RealUTUN|TestSessionHelper_PTYBelongsToLoginUser|TestSessionHelper_RefusedPTYKeepsItsOwner)$' \
+            ./internal/wireguard/ ./internal/bridge/ ./internal/policy/ ./internal/tunnel/
 
       # Creating a Wintun adapter needs the driver DLL and Administrator. The
       # Windows runner is already elevated, so the gate is this variable rather
