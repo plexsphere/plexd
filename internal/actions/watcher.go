@@ -13,6 +13,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/plexsphere/plexd/internal/api"
+	"github.com/plexsphere/plexd/internal/fsutil"
 	"github.com/plexsphere/plexd/internal/integrity"
 )
 
@@ -38,6 +39,9 @@ type HookWatcher struct {
 
 	mu    sync.Mutex
 	hooks map[string]api.HookInfo // name -> hook info
+
+	// watchDir is a seam over fsutil.WatchDir, replaced in tests.
+	watchDir func(ctx context.Context, dir string, onRetry func(error)) (*fsnotify.Watcher, error)
 }
 
 // NewHookWatcher creates a new HookWatcher.
@@ -45,10 +49,11 @@ func NewHookWatcher(hooksDir string, onChange HookChangeCallback, onIntegrity In
 	return &HookWatcher{
 		hooksDir:       hooksDir,
 		logger:         logger.With("component", "actions"),
-		onChange:        onChange,
+		onChange:       onChange,
 		onIntegrity:    onIntegrity,
 		debouncePeriod: 200 * time.Millisecond,
 		hooks:          make(map[string]api.HookInfo),
+		watchDir:       fsutil.WatchDir,
 	}
 }
 
@@ -59,18 +64,23 @@ func (w *HookWatcher) Watch(ctx context.Context) error {
 		return err
 	}
 
-	// Initial scan.
-	w.initialScan()
-
-	fsw, err := fsnotify.NewWatcher()
+	fsw, err := w.watchDir(ctx, w.hooksDir, func(err error) {
+		w.logger.Warn("actions: watcher: a hook vanished while the watch was set up; retrying", "error", err)
+	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		// Report the hooks on disk once anyway, so a failed watch costs live
+		// updates, not the hooks the agent starts with.
+		w.initialScan()
 		return err
 	}
 	defer fsw.Close()
 
-	if err := fsw.Add(w.hooksDir); err != nil {
-		return err
-	}
+	// Scan only once the watch is in place: a hook added, changed or removed
+	// from here on is in the scan, arrives as an event, or both.
+	w.initialScan()
 
 	// Per-file debounce timers.
 	timersMu := sync.Mutex{}
