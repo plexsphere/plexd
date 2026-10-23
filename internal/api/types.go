@@ -675,9 +675,14 @@ type HookInfo struct {
 // ---------------------------------------------------------------------------
 
 type EndpointRequest struct {
-	Endpoint   string    `json:"endpoint"`
-	NATType    string    `json:"nat_type"`
-	ReportedAt time.Time `json:"reported_at"`
+	Endpoint string `json:"endpoint"`
+	NATType  string `json:"nat_type"`
+	// PortMapping is "preserved" or "translated": whether the NAT kept the
+	// STUN probe's source port, and so whether Endpoint was observed or
+	// assumed. Omitted when empty. A control plane that predates the member
+	// refuses it with 400 malformed_endpoint_request.
+	PortMapping string    `json:"port_mapping,omitempty"`
+	ReportedAt  time.Time `json:"reported_at"`
 }
 
 type EndpointResponse struct {
