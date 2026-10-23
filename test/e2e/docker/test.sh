@@ -455,7 +455,7 @@ if [ "${HB_NAT_SUMMARY_TYPE}" != "object" ]; then
 fi
 echo "  PASS: heartbeat body nat_summary is a JSON object"
 
-# 3f. Endpoint report body must carry {endpoint, nat_type, reported_at}.
+# 3f. Endpoint report body must carry {endpoint, nat_type, port_mapping, reported_at}.
 # STUN discovery must complete before plexd can report an endpoint, so this
 # can lag the heartbeat; poll the endpoint_count assertion counter first.
 echo "  --- endpoint report body ---"
@@ -494,6 +494,15 @@ case "${EP_NAT_TYPE}" in
         echo "  PASS: endpoint body nat_type='${EP_NAT_TYPE}'" ;;
     *)
         fail "endpoint body nat_type='${EP_NAT_TYPE}', want one of full_cone|restricted|port_restricted|symmetric|unknown" ;;
+esac
+
+# Discovery always settles the port mapping, and the report carries it.
+EP_PORT_MAPPING=$(echo "${EP_BODY}" | jq -r '.port_mapping // empty')
+case "${EP_PORT_MAPPING}" in
+    preserved|translated)
+        echo "  PASS: endpoint body port_mapping='${EP_PORT_MAPPING}'" ;;
+    *)
+        fail "endpoint body port_mapping='${EP_PORT_MAPPING}', want preserved or translated" ;;
 esac
 
 EP_REPORTED_AT=$(echo "${EP_BODY}" | jq -r '.reported_at // empty')

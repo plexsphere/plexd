@@ -2292,6 +2292,13 @@ func TestEndpoint_DenialTaxonomy(t *testing.T) {
 		{name: "body_too_large", mutate: func(m map[string]any) { m["endpoint"] = strings.Repeat("a", 5000) }, wantStatus: http.StatusRequestEntityTooLarge, wantCode: "endpoint_body_too_large"},
 		{name: "unknown_field", mutate: func(m map[string]any) { m["surprise"] = "x" }, wantStatus: http.StatusBadRequest, wantCode: "malformed_endpoint_request"},
 		{name: "nat_type_outside_enum", mutate: func(m map[string]any) { m["nat_type"] = "cone" }, wantStatus: http.StatusBadRequest, wantCode: "malformed_endpoint_request"},
+		{name: "port_mapping_preserved", mutate: func(m map[string]any) { m["port_mapping"] = "preserved" }, wantStatus: http.StatusOK},
+		{name: "port_mapping_translated", mutate: func(m map[string]any) { m["port_mapping"] = "translated" }, wantStatus: http.StatusOK},
+		// JSON null counts as an absent member.
+		{name: "port_mapping_null", mutate: func(m map[string]any) { m["port_mapping"] = nil }, wantStatus: http.StatusOK},
+		{name: "port_mapping_outside_enum", mutate: func(m map[string]any) { m["port_mapping"] = "forwarded" }, wantStatus: http.StatusBadRequest, wantCode: "malformed_endpoint_request"},
+		// The empty string is refused, not read as absent.
+		{name: "port_mapping_empty", mutate: func(m map[string]any) { m["port_mapping"] = "" }, wantStatus: http.StatusBadRequest, wantCode: "malformed_endpoint_request"},
 		{name: "reported_at_skew", mutate: func(m map[string]any) { m["reported_at"] = time.Now().UTC().Add(61 * time.Second).Format(time.RFC3339) }, wantStatus: http.StatusBadRequest, wantCode: "endpoint_clock_skew"},
 		{name: "loopback_host", mutate: func(m map[string]any) { m["endpoint"] = "127.0.0.1:51820" }, wantStatus: http.StatusBadRequest, wantCode: "endpoint_unparseable"},
 		{name: "link_local_host", mutate: func(m map[string]any) { m["endpoint"] = "169.254.10.9:51820" }, wantStatus: http.StatusBadRequest, wantCode: "endpoint_unparseable"},

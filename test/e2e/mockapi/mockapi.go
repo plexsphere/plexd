@@ -1245,8 +1245,8 @@ func isBase64Digest(v string) bool {
 
 // handleEndpoint handles PUT /v1/nodes/{id}/endpoint. It enforces the v1
 // endpoint contract: a 4 KiB body cap, strict decoding, a closed nat_type enum,
-// clock-skew tolerance, and a routable ip:port. The counter increments only
-// when every check passes.
+// a closed port_mapping enum, clock-skew tolerance, and a routable ip:port.
+// The counter increments only when every check passes.
 func (s *Server) handleEndpoint(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	data, err := s.captureBody("endpoint", r)
@@ -1270,6 +1270,22 @@ func (s *Server) handleEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	if !validNATType(req.NATType) {
 		writeProblem(w, r, http.StatusBadRequest, "malformed_endpoint_request", "nat_type is outside the accepted enum")
+		return
+	}
+
+	// port_mapping is checked on its own decode: api.EndpointRequest omits an
+	// empty value, so it cannot tell "" from an absent member. The contract
+	// refuses "" and treats null as absent. A Decoder, like the strict decode
+	// above, leaves bytes after the object alone, as the control plane does.
+	var presence struct {
+		PortMapping *string `json:"port_mapping"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&presence); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_endpoint_request", "endpoint body is malformed")
+		return
+	}
+	if presence.PortMapping != nil && !validPortMapping(*presence.PortMapping) {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_endpoint_request", "port_mapping is outside the accepted enum")
 		return
 	}
 
@@ -3282,6 +3298,16 @@ func isJSONObject(raw json.RawMessage) bool {
 func validNATType(t string) bool {
 	switch t {
 	case "full_cone", "restricted", "port_restricted", "symmetric", "unknown":
+		return true
+	default:
+		return false
+	}
+}
+
+// validPortMapping reports whether m is inside the closed endpoint port_mapping enum.
+func validPortMapping(m string) bool {
+	switch m {
+	case "preserved", "translated":
 		return true
 	default:
 		return false
