@@ -320,12 +320,14 @@ Called after STUN discovery, then on a deadline derived from the response (see b
 {
   "endpoint": "203.0.113.7:51820",
   "nat_type": "full_cone",
+  "port_mapping": "translated",
   "reported_at": "2026-07-19T19:32:35Z"
 }
 ```
 
 - `endpoint` — the discovered public endpoint as `ip:port`.
 - `nat_type` — one of `full_cone`, `restricted`, `port_restricted`, `symmetric`, `unknown`.
+- `port_mapping` — whether the NAT kept the STUN probe's source port. `preserved`: the published `endpoint` is what discovery observed. `translated`: the NAT assigned its own port, so `endpoint`, the observed address joined with the WireGuard listen port, holds only where the router forwards or preserves that port. Omitted when empty. The control plane refuses any other value, the empty string included, with `400 malformed_endpoint_request`. It stores the value and shows it beside the Node's endpoint on the Domain's mesh topology; peers never receive it on the state pull. The member needs a control plane with [plexsphere/plexsphere#892](https://github.com/plexsphere/plexsphere/issues/892). An older one strict-decodes the body and answers `400 malformed_endpoint_request` to every report, so the node's endpoint goes stale until the control plane is upgraded.
 - `reported_at` — RFC 3339 UTC, stamped fresh per attempt.
 
 **Response** (`200 OK`):
@@ -344,7 +346,7 @@ Called after STUN discovery, then on a deadline derived from the response (see b
 | Status | Problem `code` | Meaning |
 |---|---|---|
 | `200 OK` | — | Endpoint accepted |
-| `400 Bad Request` | `malformed_endpoint_request` | Strict-decode failure, or `nat_type` outside the enum |
+| `400 Bad Request` | `malformed_endpoint_request` | Strict-decode failure, or `nat_type` or `port_mapping` outside its enum |
 | `400 Bad Request` | `endpoint_clock_skew` | `reported_at` more than 60s from server time |
 | `400 Bad Request` | `endpoint_unparseable` | `endpoint` is not a routable `ip:port` (bad port, or loopback/link-local/unspecified host) |
 | `404 Not Found` | `endpoint_peer_not_found` | Node is not a known peer; heals via re-registration |

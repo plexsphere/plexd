@@ -108,11 +108,22 @@ Classified NAT behavior based on comparing mapped addresses from multiple STUN s
 
 The wire enum also includes `restricted` and `port_restricted`, which this classifier does not currently emit.
 
+### PortMapping
+
+`PortMapping` records whether the published endpoint was observed or assumed. It comes from the first successful binding alone and travels as the `port_mapping` member of the endpoint report:
+
+| Constant         | Value          | Meaning                                                                                                  |
+|------------------|----------------|----------------------------------------------------------------------------------------------------------|
+| `PortPreserved`  | `"preserved"`  | The mapped port equals the probe's source port. The published endpoint matches what discovery observed.  |
+| `PortTranslated` | `"translated"` | The NAT assigned its own port. The published endpoint assumes the router forwards or preserves the WireGuard listen port. |
+
+It is independent of `nat_type`, which keeps describing the mapping: two servers that see the same translated mapping still classify `full_cone`, with `port_mapping` `translated`. `NATNone` always goes with `preserved`, and `NATFullCone`, `NATSymmetric` and `NATUnknown` always go with `translated`, because discovery asks a second server only once the first one saw a translated port. On the wire both values can arrive with `nat_type` `full_cone`, since `NATNone` is sent as `full_cone`. A node behind a port forward of the listen port reports `translated` as well and keeps a working endpoint: discovery cannot tell it apart from a router that forwards nothing.
+
 ## Discoverer
 
 Central coordinator for STUN discovery, NAT classification, and endpoint reporting.
 
-The published endpoint is the STUN-mapped IP joined with `advertisePort` — the WireGuard listen port peers must dial — not the mapped port, which describes the discovery socket's own mapping. That endpoint is exact wherever the NAT preserves or forwards the port; where it translates ports per-mapping, the reported `nat_type` (`symmetric`) signals that direct dialing is unreliable.
+The published endpoint is the STUN-mapped IP joined with `advertisePort` — the WireGuard listen port peers must dial — not the mapped port, which describes the discovery socket's own mapping. That endpoint is exact wherever the NAT preserves the port. Where the NAT translates ports, the reported `port_mapping` (`translated`) marks the endpoint as an assumption that holds only where the router forwards or preserves the listen port (see [PortMapping](#portmapping)).
 
 ### Constructor
 
@@ -139,8 +150,9 @@ func NewDiscoverer(client STUNClient, cfg Config, advertisePort int, logger *slo
 
 ```go
 type DiscoveryResult struct {
-    Endpoint string  // "ip:port" format
-    NATType  NATType
+    Endpoint    string      // "ip:port" format
+    NATType     NATType
+    PortMapping PortMapping // "preserved" or "translated"
 }
 ```
 
@@ -208,9 +220,10 @@ type EndpointReporter interface {
 ```go
 // Request: PUT /v1/nodes/{node_id}/endpoint
 type EndpointRequest struct {
-    Endpoint   string    `json:"endpoint"`    // "203.0.113.5:51820"
-    NATType    string    `json:"nat_type"`    // "full_cone", "restricted", "port_restricted", "symmetric", "unknown"
-    ReportedAt time.Time `json:"reported_at"` // RFC 3339 UTC, fresh per attempt
+    Endpoint    string    `json:"endpoint"`               // "203.0.113.5:51820"
+    NATType     string    `json:"nat_type"`               // "full_cone", "restricted", "port_restricted", "symmetric", "unknown"
+    PortMapping string    `json:"port_mapping,omitempty"` // "preserved", "translated"; omitted when empty
+    ReportedAt  time.Time `json:"reported_at"`            // RFC 3339 UTC, fresh per attempt
 }
 
 // Response
@@ -226,7 +239,7 @@ The response no longer carries peer endpoints. Inbound peer endpoints arrive on 
 
 Internal function that sends the discovered endpoint to the control plane and returns the `stale_after` deadline.
 
-1. Build an `EndpointRequest` with a fresh `reported_at` and the `Wire()` NAT type
+1. Build an `EndpointRequest` with a fresh `reported_at`, the `Wire()` NAT type and the result's `port_mapping`
 2. Call `reporter.ReportEndpoint`
 3. On `endpoint_peer_not_found` (404) or `endpoint_peer_gone` (410): wrap the error in the internal `errEndpointRejected` sentinel so the caller can count the streak
 4. Any other error is wrapped `nat: report endpoint: <cause>`
@@ -401,6 +414,7 @@ The NAT discovery module registers no SSE handler. `plexd up` registers `peer_en
 | `endpoint_clock_skew` (400)   | Not retried; wrapped, logged at warn, waits for the next cycle |
 | `endpoint_peer_not_found` (404) / `endpoint_peer_gone` (410) | Count the streak; warn, then error from the third consecutive rejection. Heals only via re-registration |
 | Refused credential (`api.ErrCredentialRefused`, heartbeat parked) | Log debug, leave the rejection streak unchanged, continue refresh loop (see [Quiet Failure Logs](../core/heartbeat-service.md#quiet-failure-logs)) |
+| `malformed_endpoint_request` (400) from a control plane without `port_mapping` support | Log warn on every cycle, continue refresh loop; the node's endpoint goes stale until the control plane is upgraded |
 | Endpoint report failure (other) | Log warn, continue refresh loop                  |
 | Context cancellation          | Clean abort, return `ctx.Err()`                    |
 
@@ -410,10 +424,11 @@ All log entries use `component=nat`.
 
 | Level   | Event                               | Keys                                   |
 |---------|-------------------------------------|----------------------------------------|
-| `Info`  | Endpoint discovered                 | `endpoint`, `nat_type`, `stun_server`  |
+| `Info`  | Endpoint discovered                 | `endpoint`, `nat_type`, `port_mapping`, `stun_server` |
 | `Info`  | Endpoint changed                    | `old_endpoint`, `new_endpoint`         |
 | `Warn`  | STUN binding failed                 | `server`, `error` (also covers a non-routable mapped address) |
 | `Warn`  | NAT classification incomplete       | (no second server responded)           |
+| `Warn`  | NAT translates ports                | `endpoint`, `nat_type`, `stun_port`, `mapped_port` (on the transition into `translated`, the first discovery included, not every cycle) |
 | `Warn`  | STUN refresh failed                 | `error`                                |
 | `Warn` (`Debug` for `api.ErrCredentialRefused`) | Endpoint report failed | `error`                       |
 | `Warn`  | Control plane deadline shortens the report cadence | `delay`, `refresh_interval`, `min_report_interval`, `stale_after` |

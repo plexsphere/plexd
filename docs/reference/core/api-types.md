@@ -635,6 +635,7 @@ plane receives the same two values as the manifest's flat fields.
 |--------------|-------------|-----------------|----------------------------------------|
 | `Endpoint`   | `string`    | `"endpoint"`    | Discovered public endpoint (`ip:port`) |
 | `NATType`    | `string`    | `"nat_type"`    | Wire NAT type (`full_cone`, `restricted`, `port_restricted`, `symmetric`, `unknown`) |
+| `PortMapping` | `string`   | `"port_mapping,omitempty"` | Whether the NAT kept the STUN probe's source port: `preserved` or `translated`; omitted when empty |
 | `ReportedAt` | `time.Time` | `"reported_at"` | RFC 3339 UTC, stamped fresh per attempt |
 
 **EndpointResponse**
