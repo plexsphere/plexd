@@ -10,45 +10,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
-
-	"github.com/spf13/cobra"
 
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/fsutil"
 	"github.com/plexsphere/plexd/internal/registration"
 	"github.com/plexsphere/plexd/internal/tunnel"
 )
-
-var (
-	sessionHelperChild       bool
-	sessionHelperTrustedKeys []string
-)
-
-var sessionHelperCmd = &cobra.Command{
-	Use:   "session-helper",
-	Short: "Start one process of a mediated ssh session",
-	Long: "Serve one request of plexd's session helper protocol on fd 3: verify the\n" +
-		"session token, then start a login shell or one command as the session's user.\n\n" +
-		"It is not run by hand. plexd-session-helper.socket starts one instance per\n" +
-		"connection, and reads the signing key from tunnel.session_signing_public_key or,\n" +
-		"without it, from the key it pinned from identity.json on its first run. Where the\n" +
-		"socket does not exist, plexd starts the helper as its own child with --child and\n" +
-		"the keys it trusts.",
-	Hidden:       true,
-	Args:         cobra.NoArgs,
-	SilenceUsage: true,
-	RunE:         runSessionHelper,
-}
-
-func init() {
-	sessionHelperCmd.Flags().BoolVar(&sessionHelperChild, "child", false, "serve the socketpair plexd passed as fd 3")
-	sessionHelperCmd.Flags().StringArrayVar(&sessionHelperTrustedKeys, "trusted-key", nil, "standard-base64 Ed25519 key session tokens may be signed with (only with --child)")
-	rootCmd.AddCommand(sessionHelperCmd)
-}
 
 // selectHelperMode reports whether the helper runs socket-activated (systemd
 // Accept=yes hands it one connection as fd 3) rather than as plexd's child,
@@ -66,56 +36,31 @@ func selectHelperMode(listenPID, listenFDs string, pid int, child bool, trustedK
 	return activated, nil
 }
 
-func runSessionHelper(_ *cobra.Command, _ []string) error {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-
+// sessionHelperKeys returns the keys the helper verifies session tokens
+// against: the socket-activated helper's trust anchor, or the keys plexd passed
+// a child helper.
+func sessionHelperKeys(logger *slog.Logger) ([]ed25519.PublicKey, error) {
 	socket, err := selectHelperMode(os.Getenv("LISTEN_PID"), os.Getenv("LISTEN_FDS"), os.Getpid(), sessionHelperChild, sessionHelperTrustedKeys)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if !socket {
+		return parseTrustedKeys(sessionHelperTrustedKeys)
 	}
 
-	var keys []ed25519.PublicKey
-	if socket {
-		// The process the helper starts must not believe it was socket-activated.
-		for _, name := range []string{"LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"} {
-			_ = os.Unsetenv(name)
-		}
-		cfg, _, err := agent.ParseConfig(cfgFile)
-		if err != nil {
-			return fmt.Errorf("session helper: %w", err)
-		}
-		key, err := resolveHelperSigningKey(cfg, filepath.Join(filepath.Dir(cfgFile), "session-signing-key"), logger)
-		if err != nil {
-			return err
-		}
-		keys = []ed25519.PublicKey{key}
-	} else {
-		// DECISION: child mode pins nothing and reads no config. It runs with
-		// plexd's own privileges, so it guards nothing plexd could not do
-		// itself, and it trusts the keys plexd passes, which follow plexd's
-		// signing-key rotations.
-		for _, s := range sessionHelperTrustedKeys {
-			key, err := tunnel.ParseSessionSigningPublicKey(s)
-			if err != nil {
-				return fmt.Errorf("session helper: --trusted-key: %w", err)
-			}
-			keys = append(keys, key)
-		}
+	// The process the helper starts must not believe it was socket-activated.
+	for _, name := range []string{"LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"} {
+		_ = os.Unsetenv(name)
 	}
-
-	f := os.NewFile(3, "plexd-session-helper")
-	fc, err := net.FileConn(f)
-	f.Close()
+	cfg, _, err := agent.ParseConfig(cfgFile)
 	if err != nil {
-		return fmt.Errorf("session helper: fd 3: %w", err)
+		return nil, fmt.Errorf("session helper: %w", err)
 	}
-	conn, ok := fc.(*net.UnixConn)
-	if !ok {
-		fc.Close()
-		return errors.New("session helper: fd 3 is not a Unix socket")
+	key, err := resolveHelperSigningKey(cfg, filepath.Join(filepath.Dir(cfgFile), "session-signing-key"), logger)
+	if err != nil {
+		return nil, err
 	}
-	defer conn.Close()
-	return tunnel.RunSessionHelper(conn, keys, logger)
+	return []ed25519.PublicKey{key}, nil
 }
 
 // resolveHelperSigningKey returns the key the socket-activated helper verifies

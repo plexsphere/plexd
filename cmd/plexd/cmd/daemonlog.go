@@ -135,6 +135,10 @@ func daemonLogWriter(stderr *os.File, path string) *reopeningLogFile {
 	return newReopeningLogFile(path)
 }
 
+// daemonLog is the writer useDaemonLogFile installed, and nil while it
+// installed none. A child session helper writes its log lines through it.
+var daemonLog *reopeningLogFile
+
 // useDaemonLogFile swaps newLogHandler to write through a reopeningLogFile
 // when the process's stderr is the service manager's daemon log file. That is
 // the macOS case: launchd points StandardOutPath and StandardErrorPath at the
@@ -163,5 +167,6 @@ func useDaemonLogFile() *reopeningLogFile {
 	newLogHandler = func(lvl slog.Level) slog.Handler {
 		return slog.NewTextHandler(w, &slog.HandlerOptions{Level: lvl})
 	}
+	daemonLog = w
 	return w
 }

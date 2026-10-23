@@ -4,7 +4,6 @@ package cmd
 
 import (
 	"crypto/ed25519"
-	"encoding/base64"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -82,7 +81,9 @@ func newSessionLauncher(verifier *api.Ed25519Verifier, logger *slog.Logger) tunn
 		exe = "/proc/self/exe"
 	}
 	child := func(keys []ed25519.PublicKey) *exec.Cmd {
-		return exec.Command(exe, sessionHelperChildArgs(keys)...)
+		cmd := exec.Command(exe, sessionHelperChildArgs(keys)...)
+		cmd.Stderr = sessionHelperStderr()
+		return cmd
 	}
 	if os.Getenv("INVOCATION_ID") != "" {
 		if info, err := os.Stat(tunnel.DefaultSessionHelperSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
@@ -92,14 +93,4 @@ func newSessionLauncher(verifier *api.Ed25519Verifier, logger *slog.Logger) tunn
 		}
 	}
 	return tunnel.NewSessionHelperClient(tunnel.DefaultSessionHelperSocket, child, verifier, logger)
-}
-
-// sessionHelperChildArgs is the command line of the child helper, trusting
-// keys.
-func sessionHelperChildArgs(keys []ed25519.PublicKey) []string {
-	args := []string{"session-helper", "--child"}
-	for _, key := range keys {
-		args = append(args, "--trusted-key", base64.StdEncoding.EncodeToString(key))
-	}
-	return args
 }
