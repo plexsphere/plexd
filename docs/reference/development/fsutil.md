@@ -6,7 +6,7 @@ feature: PXD-0034
 
 # File System Utilities
 
-The `internal/fsutil` package provides file system primitives for crash-safe persistence. Its primary export, `WriteFileAtomic`, ensures that readers never observe a partially-written file by writing to a temporary file, calling `fsync`, and then performing an atomic rename.
+The `internal/fsutil` package provides file system primitives for crash-safe persistence and for watching a directory. Its primary export, `WriteFileAtomic`, ensures that readers never observe a partially-written file by writing to a temporary file, calling `fsync`, and then performing an atomic rename. `WatchDir` sets up an `fsnotify` watch on a directory, and sets it up again when a file in the directory vanishes while that runs.
 
 ## WriteFileAtomic
 
@@ -39,6 +39,26 @@ Returns `nil` on success. On failure, returns the underlying `os` error from whi
 6. On any error, the temporary file is removed via `defer os.Remove`
 
 Because `os.Rename` is atomic on POSIX filesystems, concurrent readers will see either the old content or the new content — never a partial write.
+
+## WatchDir
+
+Returns an `fsnotify` watcher on `dir`, set up again when a file in `dir` vanishes while the watch is being set up.
+
+```go
+func WatchDir(ctx context.Context, dir string, onRetry func(err error)) (*fsnotify.Watcher, error)
+```
+
+On macOS and the BSDs, fsnotify's kqueue backend lists `dir` and then inspects and opens every file in it while it adds the directory. A file removed after the listing, before fsnotify opens it, fails the add with an error wrapping `fs.ErrNotExist`. The failed watcher keeps the directory registered, and a second add on it skips the files, so `WatchDir` closes it, calls `onRetry` with the error when `onRetry` is not nil, waits 100 ms, and sets the watch up again on a new watcher. It makes at most 10 attempts and then returns the last error, so a file that keeps failing the add as missing ends set-up instead of looping. A dangling symlink in `dir` is one: fsnotify v1.9.0 follows it when it opens the entry, so every attempt fails and set-up ends with the 10th attempt's error. On Linux (inotify) and Windows (`ReadDirectoryChangesW`), the add watches the directory alone, so a vanishing file cannot fail it; its errors, such as a missing or unreadable directory or the inotify watch limit (`no space left on device`), are returned without a retry.
+
+| Case | Result |
+|------|--------|
+| A file in `dir` vanished during the add | The watcher is closed, `onRetry` is called, and the watch is set up again after 100 ms |
+| The add still fails that way on the 10th attempt | That attempt's error is returned |
+| `dir` itself is gone | The `fs.ErrNotExist` error is returned without a retry |
+| Any other error from `fsnotify.NewWatcher` or the add | Returned as it is |
+| `ctx` is done while waiting to retry | `ctx.Err()` is returned |
+
+`WatchDir` closes a failed watcher before it retries or returns. With fsnotify v1.9.0 on kqueue, `Close` does not release the descriptors the watch opened, so each retried attempt there leaves one open for `dir` and one for each file fsnotify opened before the failure; the 10-attempt cap bounds that per set-up.
 
 ## Usage Examples
 
