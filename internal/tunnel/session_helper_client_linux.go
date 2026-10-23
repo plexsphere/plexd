@@ -54,7 +54,8 @@ var _ SessionLauncher = (*SessionHelperClient)(nil)
 
 // NewSessionHelperClient returns a client that dials socketPath when it is a
 // Unix socket, and otherwise starts child(keys) with one end of a socketpair as
-// its fd 3.
+// its fd 3. An empty socketPath always starts the child: macOS has no helper
+// socket. The child's stderr is plexd's own unless child set one.
 func NewSessionHelperClient(socketPath string, child func(keys []ed25519.PublicKey) *exec.Cmd, keys SigningKeySource, logger *slog.Logger) *SessionHelperClient {
 	return &SessionHelperClient{
 		socketPath: socketPath,
@@ -173,34 +174,36 @@ func (c *SessionHelperClient) Launch(ctx context.Context, req LaunchRequest, fil
 // the child runs inside plexd's own sandbox, so falling back would silently
 // start shells that cannot switch users. A path whose state cannot be read is
 // an error for the same reason. Without the socket (OpenWrt, containers, a host
-// installed before the helper units) the child helper runs with plexd's own
-// privileges, which is no boundary; it trusts the keys plexd passes it and
-// pins nothing.
+// installed before the helper units, and macOS, which passes an empty path)
+// the child helper runs with plexd's own privileges, which is no boundary; it
+// trusts the keys plexd passes it and pins nothing.
 func (c *SessionHelperClient) connect() (*net.UnixConn, func(time.Duration), error) {
 	noChild := func(time.Duration) {}
 
-	info, err := os.Stat(c.socketPath)
-	switch {
-	case err == nil && info.Mode()&os.ModeSocket != 0:
-		conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: c.socketPath, Net: "unix"})
-		if err != nil {
-			return nil, nil, fmt.Errorf("tunnel: session helper: dial %s: %w", c.socketPath, err)
+	if c.socketPath != "" {
+		info, err := os.Stat(c.socketPath)
+		switch {
+		case err == nil && info.Mode()&os.ModeSocket != 0:
+			conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: c.socketPath, Net: "unix"})
+			if err != nil {
+				return nil, nil, fmt.Errorf("tunnel: session helper: dial %s: %w", c.socketPath, err)
+			}
+			return conn, noChild, nil
+		case err != nil && !errors.Is(err, os.ErrNotExist):
+			return nil, nil, fmt.Errorf("tunnel: session helper: stat %s: %w", c.socketPath, err)
 		}
-		return conn, noChild, nil
-	case err != nil && !errors.Is(err, os.ErrNotExist):
-		return nil, nil, fmt.Errorf("tunnel: session helper: stat %s: %w", c.socketPath, err)
 	}
 
-	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	local, remote, err := newSocketpair()
 	if err != nil {
-		return nil, nil, fmt.Errorf("tunnel: session helper: socketpair: %w", err)
+		return nil, nil, err
 	}
-	local := os.NewFile(uintptr(pair[0]), "plexd-session-helper")
-	remote := os.NewFile(uintptr(pair[1]), "plexd-session-helper-child")
 
 	cmd := c.child(c.keys.TrustedKeys(time.Now()))
 	cmd.ExtraFiles = []*os.File{remote}
-	cmd.Stderr = os.Stderr
+	if cmd.Stderr == nil {
+		cmd.Stderr = os.Stderr
+	}
 	err = cmd.Start()
 	remote.Close()
 	if err != nil {
@@ -230,6 +233,24 @@ func (c *SessionHelperClient) connect() (*net.UnixConn, func(time.Duration), err
 		return nil, nil, fmt.Errorf("tunnel: session helper: wrap the socketpair: %w", err)
 	}
 	return fc.(*net.UnixConn), waitChild, nil
+}
+
+// newSocketpair returns both ends of a connected Unix stream socketpair, each
+// closed on exec. macOS has no SOCK_CLOEXEC, so the flag is set after the pair
+// exists, under syscall.ForkLock the way the net package does there: a child
+// another goroutine forks meanwhile cannot inherit either end.
+func newSocketpair() (local, remote *os.File, err error) {
+	syscall.ForkLock.RLock()
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err == nil {
+		unix.CloseOnExec(pair[0])
+		unix.CloseOnExec(pair[1])
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
+		return nil, nil, fmt.Errorf("tunnel: session helper: socketpair: %w", err)
+	}
+	return os.NewFile(uintptr(pair[0]), "plexd-session-helper"), os.NewFile(uintptr(pair[1]), "plexd-session-helper-child"), nil
 }
 
 func closeFiles(files []*os.File) {
