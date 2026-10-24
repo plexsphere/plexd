@@ -2761,7 +2761,8 @@ echo "=== Phase 12a PASSED: state report roundtrip and status publisher ==="
 # Drive the Local Node API secret route against the mock's envelope
 # contract: prove ?version=N threads through (the current version and an
 # older one both echo their number in the 200 body), that a version above
-# the current one is an honest 404, and that an armed per-node 429 passes
+# the current one is an honest 404, that Accept: application/octet-stream
+# returns the bare value as the body, and that an armed per-node 429 passes
 # through with its Retry-After header before the service recovers to 200.
 # A background reporter refetch may consume the armed 429 before our curl
 # does, so the mock's secrets_rate_limited_count is an equally valid proof.
@@ -2805,6 +2806,22 @@ if [ "${SEC_V3_STATUS}" = "404" ]; then
     echo "  PASS: GET secrets ?version=3 -> 404 (above current)"
 else
     fail "secret ?version=3 returned status ${SEC_V3_STATUS}, want 404"
+fi
+
+# (c2) Accept: application/octet-stream returns the bare value as the body,
+#      with the version in X-Plexd-Secret-Version. size_download proves the
+#      body has no trailing newline, which the $(...) capture would strip.
+SEC_RAW_HDRS=$(curl -s -D - -o /dev/null -w 'size=%{size_download}\n' "${NAPI_AUTH[@]}" \
+    -H "Accept: application/octet-stream" "${SEC_URL}" 2>/dev/null | tr -d '\r' || true)
+SEC_RAW_BODY=$(curl -sf "${NAPI_AUTH[@]}" -H "Accept: application/octet-stream" "${SEC_URL}" 2>/dev/null || true)
+if [ "$(echo "${SEC_RAW_HDRS}" | awk 'NR==1{print $2}')" = "200" ] \
+    && echo "${SEC_RAW_HDRS}" | grep -qix 'content-type: application/octet-stream' \
+    && echo "${SEC_RAW_HDRS}" | grep -qix 'x-plexd-secret-version: 2' \
+    && echo "${SEC_RAW_HDRS}" | grep -qx 'size=22' \
+    && [ "${SEC_RAW_BODY}" = "e2e-local-bearer-token" ]; then
+    echo "  PASS: GET secrets/local-bearer-token as octet-stream -> 200 raw body version=2"
+else
+    fail "raw secret fetch returned headers '${SEC_RAW_HDRS}' body '${SEC_RAW_BODY}', want 200 octet-stream version=2 body=e2e-local-bearer-token"
 fi
 
 # Arm a single per-node 429 carrying Retry-After: 5.
