@@ -1136,7 +1136,16 @@ if [ "${OPTCM_ELAPSED}" -ge "${OPTCM_TIMEOUT}" ]; then
 fi
 
 # The agent must say why it started without a file, not silently pick defaults.
-if kubectl -n "${NAMESPACE}" logs -l app.kubernetes.io/name=plexd --tail=200 | grep -q "config file not found"; then
+# The log is read into a variable and matched with case rather than piped into
+# grep -q: grep -q exits at its first match, kubectl writes the log line by line
+# and dies on the closed pipe, and under pipefail that reports a present line as
+# missing.
+PLEXD_LOGS=$(kubectl -n "${NAMESPACE}" logs -l app.kubernetes.io/name=plexd --tail=200 || true)
+case "${PLEXD_LOGS}" in
+    *"config file not found"*) CONFIG_WARNING_FOUND=1 ;;
+    *) CONFIG_WARNING_FOUND=0 ;;
+esac
+if [ "${CONFIG_WARNING_FOUND}" -eq 1 ]; then
     echo "  PASS: fall-back warning names the missing config file"
 else
     echo "FAIL: expected 'config file not found' warning in plexd logs"
