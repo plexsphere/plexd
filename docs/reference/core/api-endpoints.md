@@ -824,6 +824,8 @@ compares it. A Linux session helper that already pinned a key keeps its pin; see
 ### GET /v1/nodes/{node_id}/secrets/{key}
 
 Called on-demand when a consumer requests a secret via the Local Node API. The
+local-endpoint reporters also call it to resolve their bearer token: a `403` or
+`404` drops the token they cached, and every other failure keeps it. The
 `{key}` is validated client-side against the name grammar
 `^[a-z][a-z0-9_-]{0,62}$` **before any request is sent** — a name outside the
 grammar fails locally without touching the control plane. An optional

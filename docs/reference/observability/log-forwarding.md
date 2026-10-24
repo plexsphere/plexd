@@ -168,7 +168,7 @@ Defined in the `logfwd` package. The `api.ControlPlane` client satisfies this in
 
 ### Credential Resolution
 
-Same flow as `metrics.LocalReporter`: check cache (5-minute TTL) → `FetchSecret` → `DecryptSecret` → update cache. Falls back to stale cached token on fetch/decrypt failure. Protected by `sync.RWMutex` with double-checked locking.
+Same flow as `metrics.LocalReporter`: check cache (5-minute TTL) → `FetchSecret` → `DecryptSecret` → update cache. Falls back to stale cached token on fetch/decrypt failure, except on a 403 or 404 from the fetch, which drops the cached token and fails the send. Protected by `sync.RWMutex` with double-checked locking.
 
 ### ReportLogs Behavior
 
@@ -829,6 +829,7 @@ All log entries use `component=logfwd`.
 | `Warn` (`Debug` while the heartbeat is parked) | Buffer overflow, dropping entries | `component`, `dropped` |
 | `Warn` | Event Log events dropped           | `component`, `dropped`, `error` |
 | `Warn` | Using cached credential            | `component`, `error`        |
+| `Warn` | Dropping revoked credential        | `component`, `error`        |
 | `Warn` | Local log report failed            | `component`, `error`        |
 | `Info` | Local endpoint enabled             | `pipeline`, `url`           |
 
