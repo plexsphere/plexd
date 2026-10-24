@@ -235,6 +235,168 @@ func TestSigningKeyRotatedHandler(t *testing.T) {
 	})
 }
 
+// signingKeyFixture is a verifier seeded the way plexd up seeds it, from the
+// identity seedIdentity writes, plus the handler under test over dataDir.
+type signingKeyFixture struct {
+	verifier *api.Ed25519Verifier
+	rec      *recordingHandler
+	handle   func(*api.NodeStateSigningKey)
+}
+
+func newSigningKeyFixture(t *testing.T, dataDir string) signingKeyFixture {
+	t.Helper()
+	pub, err := base64.StdEncoding.DecodeString(upTestSigningKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier := api.NewEd25519Verifier(upTestSigningKID, ed25519.PublicKey(pub))
+	rec := newRecordingHandler()
+	handler := signingKeyDispatchHandler(verifier, dataDir, api.NodeStateSigningKey{
+		KeyID:     upTestSigningKID,
+		PublicKey: upTestSigningKey,
+	}, slog.New(rec))
+	return signingKeyFixture{
+		verifier: verifier,
+		rec:      rec,
+		handle: func(key *api.NodeStateSigningKey) {
+			handler(context.Background(), &api.NodeStateSnapshot{SigningKey: key})
+		},
+	}
+}
+
+func TestSigningKeyDispatchHandler(t *testing.T) {
+	newPub, newPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newKey := &api.NodeStateSigningKey{KeyID: "kid-new", PublicKey: base64.StdEncoding.EncodeToString(newPub)}
+	const (
+		installed = "installed signing key from state pull"
+		rejected  = "signing key from state pull rejected"
+		retrying  = "signing key not persisted; retrying on the next pull"
+	)
+
+	t.Run("a null block changes nothing", func(t *testing.T) {
+		dataDir := t.TempDir()
+		seedIdentity(t, dataDir, upTestNodeID, upTestNSK)
+		before, err := os.ReadFile(filepath.Join(dataDir, "identity.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := newSigningKeyFixture(t, dataDir)
+
+		f.handle(nil)
+
+		if got := f.verifier.TrustedKeys(time.Now()); len(got) != 1 || base64.StdEncoding.EncodeToString(got[0]) != upTestSigningKey {
+			t.Errorf("TrustedKeys = %v, want only the registration key", got)
+		}
+		after, err := os.ReadFile(filepath.Join(dataDir, "identity.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Error("identity.json changed on a null block")
+		}
+		if n := f.rec.countAt(slog.LevelInfo) + f.rec.countAt(slog.LevelWarn); n != 0 {
+			t.Errorf("logged %d Info or Warn records, want none", n)
+		}
+	})
+
+	t.Run("a new key is installed and persisted once", func(t *testing.T) {
+		dataDir := t.TempDir()
+		seedIdentity(t, dataDir, upTestNodeID, upTestNSK)
+		f := newSigningKeyFixture(t, dataDir)
+
+		f.handle(newKey)
+
+		attrs := f.rec.attrsOf(slog.LevelInfo, installed)
+		if attrs == nil || attrs["key_id"] != "kid-new" || attrs["public_key"] != newKey.PublicKey {
+			t.Errorf("Info %q attrs = %v, want key_id kid-new and the base64 public_key", installed, attrs)
+		}
+		if err := f.verifier.Verify(context.Background(), signRotationEnvelope(t, newPriv, "kid-new")); err != nil {
+			t.Errorf("envelope under the installed key: %v", err)
+		}
+		err := f.verifier.Verify(context.Background(), signRotationEnvelope(t, otherPriv, upTestSigningKID))
+		if err == nil || err.Error() != "api: verifier: unknown signing key id" {
+			t.Errorf("envelope under the registration key id: error = %v, want unknown signing key id", err)
+		}
+		id, err := registration.LoadIdentity(dataDir)
+		if err != nil {
+			t.Fatalf("LoadIdentity: %v", err)
+		}
+		if id.SigningKeyID != "kid-new" || id.SigningPublicKey != newKey.PublicKey {
+			t.Errorf("persisted pair = (%q, %q), want the installed key", id.SigningKeyID, id.SigningPublicKey)
+		}
+
+		f.handle(newKey)
+		if n := f.rec.count(slog.LevelInfo, installed); n != 1 {
+			t.Errorf("Info %q logged %d times over two identical pulls, want 1", installed, n)
+		}
+	})
+
+	t.Run("an invalid key is refused and logged once per value", func(t *testing.T) {
+		dataDir := t.TempDir()
+		seedIdentity(t, dataDir, upTestNodeID, upTestNSK)
+		f := newSigningKeyFixture(t, dataDir)
+		bad := &api.NodeStateSigningKey{KeyID: "kid-bad", PublicKey: "AAAA"}
+
+		f.handle(bad)
+		f.handle(bad)
+		if n := f.rec.count(slog.LevelWarn, rejected); n != 1 {
+			t.Errorf("Warn %q logged %d times over two identical pulls, want 1", rejected, n)
+		}
+		if got := f.verifier.TrustedKeys(time.Now()); len(got) != 1 || base64.StdEncoding.EncodeToString(got[0]) != upTestSigningKey {
+			t.Errorf("TrustedKeys = %v, want the registration key untouched", got)
+		}
+
+		f.handle(&api.NodeStateSigningKey{KeyID: "kid-bad", PublicKey: "BBBB"})
+		if n := f.rec.count(slog.LevelWarn, rejected); n != 2 {
+			t.Errorf("Warn %q logged %d times after a different invalid key, want 2", rejected, n)
+		}
+	})
+
+	t.Run("a failed persist is retried on every pull", func(t *testing.T) {
+		dataDir := t.TempDir() // no identity yet, so the commit fails
+		f := newSigningKeyFixture(t, dataDir)
+
+		f.handle(newKey)
+		if n := f.rec.count(slog.LevelInfo, installed); n != 1 {
+			t.Fatalf("Info %q logged %d times, want 1: the key installs even when it cannot be persisted", installed, n)
+		}
+		if n := f.rec.count(slog.LevelWarn, retrying); n != 1 {
+			t.Fatalf("Warn %q logged %d times, want 1", retrying, n)
+		}
+
+		f.handle(newKey)
+		if n := f.rec.count(slog.LevelWarn, retrying); n != 2 {
+			t.Errorf("Warn %q logged %d times after a second pull, want 2", retrying, n)
+		}
+		if n := f.rec.count(slog.LevelInfo, installed); n != 1 {
+			t.Errorf("Info %q logged %d times after a second pull, want still 1", installed, n)
+		}
+
+		seedIdentity(t, dataDir, upTestNodeID, upTestNSK)
+		f.handle(newKey)
+		if n := f.rec.count(slog.LevelWarn, retrying); n != 2 {
+			t.Errorf("Warn %q logged %d times after the identity appeared, want still 2", retrying, n)
+		}
+		if n := f.rec.count(slog.LevelInfo, installed); n != 1 {
+			t.Errorf("Info %q logged %d times after the identity appeared, want still 1", installed, n)
+		}
+		id, err := registration.LoadIdentity(dataDir)
+		if err != nil {
+			t.Fatalf("LoadIdentity: %v", err)
+		}
+		if id.SigningKeyID != "kid-new" {
+			t.Errorf("persisted key id = %q, want kid-new", id.SigningKeyID)
+		}
+	})
+}
+
 // TestDeliveryModePublisher verifies the publisher surfaces the delivery mode as
 // the delivery_mode metadata key, that a later transition overwrites it, and
 // that it is held apart from the snapshot-owned metadata map so a reconcile that
