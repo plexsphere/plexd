@@ -579,9 +579,12 @@ and keeps serving tcp ones, with `tunnel.ssh_sessions_enabled: false`.
 
 The client logs in as the entry's `target.ssh.user`, with the session token as
 password; password is the only method offered. `VerifySessionToken` checks the
-token against the keys the envelope verifier trusts at that moment (the current
-signing key, plus the previous one during a rotation's grace window), in this
-order:
+token against the keys the envelope verifier trusts at that moment: the current
+signing key (registration's, or the one a later state pull or
+`signing_key_rotated` event installed), plus the previous one during a
+rotation's grace window. A pulled key that differs from the current one replaces
+it and ends any grace window, because a node trusts exactly one key of its
+Domain. The checks run in this order:
 
 1. at most 8192 bytes of three raw-base64url segments whose header and claims are JSON objects
 2. `alg` is `EdDSA`; `kid` is not consulted, since the contract binds the key and not its id
@@ -679,11 +682,33 @@ Both units make `/etc` read-only for plexd, so a compromised plexd cannot replac
 the anchor, and without a token the control plane signed it cannot start a shell.
 A malformed pin fails every login until it is fixed. The helper does not follow
 signing-key rotations: once the Domain key rotates, it refuses every token until
-an operator sets `tunnel.session_signing_public_key` to the new key. Deleting the
-pin does not help, because the next run pins `identity.json`'s key again, and
-plexd writes that file only at registration. The same holds once the node
-re-registers with another Domain: `plexd deregister` leaves the pin in place, so
-set the new Domain's key there as well.
+an operator sets `tunnel.session_signing_public_key` to the new key or deletes
+the pin. plexd rewrites `identity.json`'s signing key whenever a state pull
+carries a new one, so a helper that has not pinned yet pins the key plexd last
+persisted, and deleting the pin makes the next run pin that key. The same holds
+once the node re-registers with another Domain: `plexd deregister` leaves the pin
+in place, so set the new Domain's key there as well.
+
+The trust model does not move: plexd could always rewrite its own
+`identity.json`, and the boundary is the pin in read-only `/etc`. plexd logs each
+key a state pull installs at Info as `installed signing key from state pull`,
+with `key_id` and `public_key`; that `public_key` is the value to set in
+`tunnel.session_signing_public_key`.
+
+::: warning Nodes enrolled before the per-Domain signing key
+A node enrolled before
+[plexsphere/plexsphere#918](https://github.com/plexsphere/plexsphere/pull/918)
+stored a static signing key that no signer holds, and a helper that ran before
+plexd persisted the Domain key pinned that key. plexd learns the Domain key from
+the state pull and accepts the login, but the helper refuses every shell and
+command: the client's stderr reads
+`plexd: tunnel: session helper refused: token refused: tunnel: session token: signature does not verify against a trusted key`.
+Set `tunnel.session_signing_public_key` to the `public_key` of plexd's
+`installed signing key from state pull` log line, or delete
+`/etc/plexd/session-signing-key` so that the next run pins the key plexd
+persisted. Delete the pin only once plexd has persisted the key, that is, once
+it no longer logs `signing key not persisted; retrying on the next pull`.
+:::
 
 ### Lifetime
 

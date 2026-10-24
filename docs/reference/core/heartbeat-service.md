@@ -246,7 +246,7 @@ HeartbeatService
 ├── client: ControlPlane (sends heartbeat RPCs)
 ├── reconcileTrigger: Reconciler (triggers state reconciliation)
 ├── onCredentialRefused: credentialRefusedPublisher (marks the shared client refused, then the node-API cache and the health listener; set at step 12, once the node API server exists)
-└── onRotateKeys: triggers reconcile (key material itself arrives via the signing_key_rotated SSE event)
+└── onRotateKeys: starts a mesh key rotation (rotator.Rotate) in its own goroutine; the Domain signing key arrives with the state pull's signing_key block instead
 ```
 
 The handshake reporter starts after the heartbeat goroutine (step `17a`), only when the WireGuard interface came up:

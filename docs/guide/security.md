@@ -68,33 +68,44 @@ The client configures the local WireGuard interface from the registration respon
 
 ### Phase 3: Steady State
 
-The control plane pushes peer and key updates via SSE. Every SSE event is signed with the control plane's Ed25519 signing key. The client verifies the signature before applying any change.
+The control plane pushes peer and key updates via SSE. Every SSE event is signed with the Ed25519 signing key of the node's Domain. The client verifies the signature before applying any change.
 
 **Signed Event Envelope:**
 
-Every SSE event is wrapped in a signed envelope. The `signature` covers the canonical JSON serialization of all fields except `signature` itself (i.e. `id`, `type`, `scope`, `key_id`, `issued_at`, and `payload`):
+Every SSE event is wrapped in a signed envelope:
 
 ```json
 {
-  "id": "evt_d4e5f6",
+  "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0",
   "type": "node_state_updated",
-  "scope": "node:n_abc123",
-  "key_id": "did:web:plexsphere.com#key-2026-01",
+  "scope": "domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1",
+  "key_id": "signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1-1767225600000000000",
   "issued_at": "2026-01-15T10:30:00Z",
   "payload": { "revision": 42 },
   "signature": "base64-encoded-ed25519-signature"
 }
 ```
 
+The `signature` is an Ed25519 signature over the SHA-512 digest of the envelope's canonical bytes, not over the bytes themselves. The "Signed event envelope" section of plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere) defines the canonical bytes: one JSON object with the members `id`, `issued_at`, `key_id`, `payload`, `scope` and `type` in that order, no whitespace, and never `signature`. `issued_at` is UTC with exactly nine fractional digits. `scope` becomes an object: `domain:<uuid>` turns into `{"id":"<uuid>","kind":"domain"}`, `platform` turns into `{"id":"00000000-0000-0000-0000-000000000000","kind":"platform"}`, and any other scope cannot be verified. The payload is decoded and written again, with object keys sorted at every depth and numbers normalised (`1.50` becomes `1.5`). plexd rebuilds these bytes from the decoded fields, so the wire JSON's member order, time format, payload key order and number spelling do not matter. For the envelope above they are:
+
+```text
+{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0","issued_at":"2026-01-15T10:30:00.000000000Z","key_id":"signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1-1767225600000000000","payload":{"revision":42},"scope":{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1","kind":"domain"},"type":"node_state_updated"}
+```
+
+See [Event Verification](../reference/core/event-verification.md) for the full rules and the error each failed check returns.
+
 **Verification on every event:**
 
-1. Select the signing key by the envelope's `key_id` — the current signing key, or the previous key during a rotation grace window — and verify the Ed25519 signature over the canonical JSON of all fields except `signature`, using the control plane's signing public key (received during registration).
-2. Check `issued_at` staleness (max 5 minutes) and reject timestamps too far in the future.
-3. If any check fails, reject the event and log it; the event is skipped and never dispatched.
+1. Check `issued_at` staleness (max 5 minutes) and reject timestamps more than 5 minutes in the future.
+2. Select the signing key by the envelope's `key_id`: the Domain signing key the node holds, which registration handed it and a later state pull or `signing_key_rotated` event may have replaced, or the previous key while a `signing_key_rotated` grace window is open. Any other `key_id` is rejected.
+3. Rebuild the canonical bytes, hash them with SHA-512, and verify the Ed25519 signature over that digest with the selected key.
+4. If any check fails, reject the event and log it; the event is skipped and never dispatched.
 
-This ensures that even if the TLS connection is compromised (e.g. through a rogue proxy or certificate authority), events cannot be forged. Duplicate or reordered deliveries are harmless because the reconciler's authoritative state pull, not the event payload, is the source of truth.
+This ensures that even if the TLS connection is compromised (e.g. through a rogue proxy or certificate authority), events cannot be forged without the private half of the key the node trusts. That key comes from registration and the state pull, which TLS alone protects (see below). Duplicate or reordered deliveries are harmless because the reconciler's authoritative state pull, not the event payload, is the source of truth.
 
-Action dispatch is the one case where that distinction cuts both ways. A dispatch is read only from the `executions` block of the NSK-authenticated state pull, so no event payload — forged, replayed, or reordered — can make a node run an action. But the state response itself carries **no** application-layer signature: unlike an SSE envelope, it is protected by TLS alone. An attacker able to present a certificate the node's system trust store accepts — a misissued certificate, a rogue CA, or a deployment that set `tls_insecure_skip_verify` — can therefore inject an `executions` entry naming any registered action. Signing the executions block is a control-plane contract change and is not yet available; until it is, treat the TLS trust path (and never enabling `tls_insecure_skip_verify` outside a lab) as the boundary that protects remote execution.
+Action dispatch is one case where that distinction cuts both ways. A dispatch is read only from the `executions` block of the NSK-authenticated state pull, so no event payload — forged, replayed, or reordered — can make a node run an action. But the state response itself carries **no** application-layer signature: unlike an SSE envelope, it is protected by TLS alone. An attacker able to present a certificate the node's system trust store accepts — a misissued certificate, a rogue CA, or a deployment that set `tls_insecure_skip_verify` — can therefore inject an `executions` entry naming any registered action. Signing the executions block is a control-plane contract change and is not yet available; until it is, treat the TLS trust path (and never enabling `tls_insecure_skip_verify` outside a lab) as the boundary that protects remote execution.
+
+The same holds for the Domain signing key, which the state response carries in its `signing_key` block. An attacker in that position can hand the node a key of its own, which plexd installs as the only key it trusts and persists, and can then sign envelopes and session tokens the node accepts. On Linux, a socket-activated session helper that has already pinned a key keeps refusing tokens signed with any other key (see [Trust anchor](../reference/networking/secure-access-tunneling.md#trust-anchor)).
 
 **SSE Events:**
 
@@ -108,7 +119,7 @@ Action dispatch is the one case where that distinction cuts both ways. A dispatc
 | `session_setup` | Trigger a state reconcile — the payload is opaque; the session is provisioned from the `sessions` block of the authoritative state pull, never from the event (see [Secure Access Tunneling](../reference/networking/secure-access-tunneling.md)) |
 | `session_revoked` | Trigger a state reconcile — the payload is opaque; the session leaving the `sessions` block is what tears the listener down, so the reconcile's drain does the revocation |
 | `rotate_keys` | Generate new Curve25519 keypair and initiate key rotation (see [Phase 4: Key Rotation](#phase-4-key-rotation)) |
-| `signing_key_rotated` | Update the control plane's signing public key, selected by `key_id` (see [Signing Key Rotation](#signing-key-rotation)) |
+| `signing_key_rotated` | Update the signing public key, selected by `key_id`. The control plane does not send this event today; a rotation reaches the node through the state pull (see [Signing Key Rotation](#signing-key-rotation)) |
 
 ### Phase 4: Key Rotation
 
@@ -138,21 +149,27 @@ When a node is force-removed from the control plane, all peers that had a tunnel
 
 ### Signing Key Rotation
 
-The control plane's Ed25519 signing key (used for SSE event signatures and session JWTs) can be rotated independently of WireGuard mesh keys. During rotation, both the old and the new key are valid for a transition period.
+The Domain's Ed25519 signing key (used for SSE event signatures and session JWTs) can be rotated independently of WireGuard mesh keys. Every state pull carries the Domain's current key in its `signing_key` block, so once an operator rotates the key, the node picks up the incoming key on its next pull, within one reconcile interval.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant CP as Control Plane
 
-    CP->>C: SSE: signing_key_rotated (signed with current key)<br/>{new_signing_public_key, valid_from, transition_period: "24h"}
-    C->>C: Verify with current key
-    C->>C: Store new key, keep old key
-    Note over C: During transition period:<br/>accept events signed with either key
-    Note over C: After transition:<br/>remove old key, only accept new key
+    Note over CP: Operator rotates the Domain's signing key
+    C->>CP: GET /v1/nodes/{node_id}/state (reconcile)
+    CP-->>C: {..., signing_key: {key_id, public_key}}
+    C->>C: Install as the only trusted key (no grace window)
+    C->>C: Persist to signing_public_key and identity.json
 ```
 
-The `signing_key_rotated` event is signed with the **current** (old) key, which the node already trusts. This creates a chain of trust - each key vouches for its successor.
+plexd installs a pulled key that differs from the one it holds as the only key it trusts, and drops the old key at once: a pull install keeps no grace window. Until that pull the node refuses envelopes signed with the new key, and after it those signed with the old key. The pull carries every change those envelopes announced, so the node still converges. plexd writes the new key to the `signing_public_key` file and to `identity.json`, so a restart starts from it, and retries a failed write on every pull. plexd logs a new key as `installed signing key from state pull` with its `key_id` and `public_key`.
+
+A `signing_key` of `null` means the control plane could not name the key this time (the Domain has no key yet, or the Signing Service was unreachable): plexd keeps the key it holds and never drops it. A key plexd cannot install (an empty `key_id`, or a public key that is not 32 bytes in standard base64) changes nothing, and plexd logs it as `signing key from state pull rejected` once, and not again until a pull carries a different key.
+
+On Linux, a socket-activated session helper keeps the key it pinned, or the one `tunnel.session_signing_public_key` sets, and does not follow the pulled key. After a rotation, and on nodes enrolled before [plexsphere/plexsphere#918](https://github.com/plexsphere/plexsphere/pull/918) whose pin holds a key no signer uses, ssh logins fail at the helper until you set `tunnel.session_signing_public_key` to the `public_key` of the `installed signing key from state pull` line. A helper that uses the pin also recovers when you delete `/etc/plexd/session-signing-key`: its next run pins the key plexd persisted, so delete it only once plexd no longer logs `signing key not persisted; retrying on the next pull` (see [Trust anchor](../reference/networking/secure-access-tunneling.md#trust-anchor)).
+
+plexd also handles a `signing_key_rotated` SSE event, which the control plane does not send today. Its payload names the new key (`key_id`, `public_key`) and may name the key it replaces (`previous_key_id`) with a deadline (`transition_expires`). When plexd holds that previous key, it keeps accepting it until the deadline. The event is signed with the **current** (old) key, which the node already trusts, so each key vouches for its successor. A later pull that carries a different key replaces both and ends the grace window.
 
 ### Pre-Shared Keys (PSK)
 
@@ -182,7 +199,7 @@ WireGuard needs the same PSK on both ends of a tunnel, and a [NAT relay](../refe
 | Bootstrap token stolen | Attacker could register a rogue node | One-time-use + short TTL limits the attack window |
 | MITM during registration | Could intercept public key exchange and signing key | TLS + server certificate validation on all control plane communication |
 | MITM on SSE stream | Could inject forged events (peer changes, action requests, key rotations) | Ed25519 signature verification on every event; TLS as first layer; forged events rejected without valid signature |
-| Signing key compromised | Attacker can forge SSE events until key is rotated | Signing key rotation via `signing_key_rotated` event (signed with current key); transition period for graceful rollover |
+| Signing key compromised | Attacker can forge SSE events until key is rotated | Operator rotates the Domain's signing key; every node installs the incoming key from its next state pull, within one reconcile interval, and refuses envelopes signed with the old key at once (a pull install keeps no grace window) |
 | Session token stolen | Attacker could execute scoped actions on target node | Short TTL, node-bound, scoped action list, revocation on session end |
 | Unauthorized local action execution | SSH user runs actions without permission | Requires valid session JWT; `--local` restricted to root and logged as emergency |
 | Unauthorized secret access (local) | Attacker on node reads secrets via socket or K8s Secret | Linux/macOS: socket requires root or `plexd-secrets`; Windows: pipe requires an elevated Administrator or LocalSystem token; K8s Secrets contain only NSK-encrypted ciphertext; decryption requires plexd API with valid bearer token + live control plane |

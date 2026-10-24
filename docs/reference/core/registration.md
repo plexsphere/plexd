@@ -145,6 +145,19 @@ is the domain mesh address range (e.g. `100.64.0.0/10`). Both are read from the
 `POST /v1/register` response. Legacy `identity.json` files written before these
 keys existed still load — the missing fields decode as empty strings.
 
+`SigningPublicKey` and `SigningKeyID` hold the signing key that registration
+handed out until a state pull carries another. The pull
+(`GET /v1/nodes/{node_id}/state`) carries the Domain signing key in its
+`signing_key` block; when the verifier accepts a pulled key that differs from
+the persisted pair, `plexd up` writes it into `identity.json` and the
+`signing_public_key` file with [`CommitSigningKey`](#commitsigningkey), so
+plexd starts from that key after a restart. A `null` or absent block keeps the
+persisted pair. Unless `tunnel.session_signing_public_key` is set, Linux's
+socket-activated session helper pins the identity's signing key on its first
+run, so a helper that has not pinned yet pins the key plexd last persisted. A
+helper that already pinned keeps its pin (see
+[Trust anchor](../networking/secure-access-tunneling.md#trust-anchor)).
+
 ### Data Directory Layout
 
 ```
@@ -158,6 +171,14 @@ keys existed still load — the missing fields decode as empty strings.
 - Directory created with `0700` permissions if missing
 - All files written atomically (temp file + fsync + rename)
 - `PrivateKey` and `NodeSecretKey` use `json:"-"` tags to prevent accidental JSON serialization
+
+`SaveIdentity` writes the whole group at registration, and two functions
+rewrite part of it later. `CommitRotatedKey` rewrites `private_key` and
+`identity.json`'s `last_rotation` after a mesh key rotation.
+`CommitSigningKey` rewrites the `signing_public_key` file and `identity.json`'s
+`signing_key_id` and `signing_public_key` when a state pull carries a new
+signing key. Both re-read the group first and write back every field they do
+not own as loaded.
 
 ### BearerToken
 
@@ -193,6 +214,28 @@ if errors.Is(err, registration.ErrNotRegistered) {
     // no identity files — need to register
 }
 ```
+
+### CommitSigningKey
+
+```go
+func CommitSigningKey(dataDir, keyID, publicKey string) error
+```
+
+Persists a Domain signing key learned after registration. `plexd up` calls it
+when a state pull carries a `signing_key` the verifier accepts and that differs
+from the pair the identity files hold. A failure logs
+`signing key not persisted; retrying on the next pull` at Warn, and plexd
+retries the commit on every pull until it succeeds.
+
+Holding the lock that `SaveIdentity` and `CommitRotatedKey` also take, it
+re-reads the identity group with `LoadIdentity`, writes the
+`signing_public_key` file, then rewrites `identity.json` with the new
+`signing_key_id` and `signing_public_key`. Every other field, `last_rotation`
+included, is written back as loaded. When `LoadIdentity` fails, for example
+with `ErrNotRegistered` on an empty data directory, it returns an error that
+starts with `registration: commit signing key:` and wraps that failure, and it
+writes nothing. A crash between the two writes leaves a mismatched pair, which
+the next pull repairs.
 
 ## ErrNotRegistered
 

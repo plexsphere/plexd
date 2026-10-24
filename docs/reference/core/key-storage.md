@@ -36,8 +36,8 @@ The directory is also referenced by `registration.data_dir` and `node_api.data_d
 | `rotation_pending_key` | Curve25519 private key (staged) | X25519 (WireGuard) | Staged private key for an in-flight rotation; same base64 encoding as `private_key`; removed on completion or discard | Generated locally when a rotation is signaled |
 | (in-memory, per peer) | Pre-Shared Key (PSK) | 256-bit symmetric | Post-quantum defense layer for each peer pair | Control plane, delivered with peer configuration |
 | `node_secret_key` | Node Secret Key (NSK) | AES-256-GCM | Decrypts secret values fetched from the control plane | Control plane, issued during registration |
-| `signing_public_key` | Ed25519 public key | Ed25519 | Verifies SSE event signatures and session JWT tokens | Control plane, issued during registration |
-| `identity.json` | Node identity metadata | N/A | Stores `node_id`, `mesh_ip`, and `signing_public_key` | Control plane registration response |
+| `signing_public_key` | Ed25519 public key | Ed25519 | Verifies SSE event signatures and session JWT tokens | Control plane, issued during registration and carried by the state pull's `signing_key` block |
+| `identity.json` | Node identity metadata | N/A | Stores `node_id`, `mesh_ip`, `signing_key_id`, and `signing_public_key` | Control plane registration response; the two signing fields are rewritten from the state pull |
 | (bootstrap token file) | Bootstrap token | N/A | One-time authentication for initial registration | Provisioned externally (file, env var, or metadata service) |
 
 ### Curve25519 Private Key
@@ -70,19 +70,31 @@ The control plane's Ed25519 signing public key is used by the node for two purpo
 1. **SSE event signature verification** -- every `Envelope` received on the SSE stream is verified against this key before dispatch (see [Event Verification](event-verification.md)).
 2. **Session JWT validation** -- session tokens presented during secure access tunneling are validated using the same key.
 
+The node learns the key, and the id it signs under, from two sources:
+
+- Registration: `POST /v1/register` returns `signing_key_id` and `signing_public_key`, which `SaveIdentity` writes with the rest of the identity.
+- The state pull: every `GET /v1/nodes/{node_id}/state` response carries the key as the `signing_key` block (`key_id`, and `public_key` as the 32-byte key in standard base64), as the "Domain signing key" section of plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere) describes it. plexd installs it into the verifier on every successful pull and persists a key that differs from the stored pair (see [Signing Key from the State Pull](#signing-key-from-the-state-pull)). A `null` or absent block means the node keeps the key it holds, never that it drops it. A node enrolled before its Domain had a key of its own learns that key here.
+
 The key is stored as a raw string in `data_dir/signing_public_key` and also recorded in `identity.json`. On load, the file value takes precedence if it differs from the JSON field (a warning is logged).
 
-During signing key rotation, the control plane sends a `signing_key_rotated` SSE event containing:
+The key id is recorded in `identity.json` as `signing_key_id`. At startup plexd seeds the verifier from this persisted pair, so a node that installed a key from a pull restarts with that key. A key installed from a pull reaches ssh session logins too, because the ssh session listener checks tokens against the verifier's keys. The mesh SSH server (`tunnel.ssh_listen_addr`) keeps the key it loaded at start, which after a restart is the persisted key.
+
+`CommitSigningKey(dataDir, keyID, publicKey)` (`internal/registration/signing_key.go`) persists a pulled key. It holds the lock that `SaveIdentity` and `CommitRotatedKey` hold, re-reads the identity, writes the `signing_public_key` file first and then `identity.json` with the new `signing_key_id` and `signing_public_key`, and writes every other field (`last_rotation` included) back as it was loaded. On a data dir that holds no identity it returns an error wrapping `ErrNotRegistered` and writes nothing. A crash between the two writes leaves a mismatched pair. The next pull's key differs from that pair in at least one field, so plexd installs and commits the key again.
+
+The Linux socket-activated session helper trusts `tunnel.session_signing_public_key` when it is set. Otherwise it pins the signing key from `identity.json` at `/etc/plexd/session-signing-key` on its first run. Because a pull can rewrite `identity.json`, a helper that has not pinned yet pins the key plexd last persisted, and deleting the pin makes it pin that key again. A helper that already pinned a key keeps it. See [Trust anchor](../networking/secure-access-tunneling.md#trust-anchor) for nodes whose pin holds an older key.
+
+plexd also handles a `signing_key_rotated` SSE event, which plexsphere's agent contract does not define. Its payload is `api.SigningKeyRotation`:
 
 ```go
-type SigningKeys struct {
-    Current           string     `json:"current"`
-    Previous          string     `json:"previous,omitempty"`
-    TransitionExpires *time.Time `json:"transition_expires,omitempty"`
+type SigningKeyRotation struct {
+    KeyID             string    `json:"key_id"`
+    PublicKey         string    `json:"public_key"`
+    PreviousKeyID     string    `json:"previous_key_id"`
+    TransitionExpires time.Time `json:"transition_expires"`
 }
 ```
 
-Both the current and previous keys are held in memory for the transition period (`TransitionExpires`), allowing events signed with either key to pass verification. Once the transition expires, only the current key is used.
+`Rotate` makes the event's key current. It keeps the previous key in memory as a grace entry only when `previous_key_id` names a key the verifier holds and `transition_expires` is set. Until that deadline, events signed with either key pass verification; after it, only the current key is used. The event changes only the verifier in memory and writes nothing to disk. A different key installed from the state pull drops the grace entry (see [Signing Key from the State Pull](#signing-key-from-the-state-pull)).
 
 ### Bootstrap Token
 
@@ -110,7 +122,7 @@ All key files are written with mode `0600` (owner read/write only). The `data_di
 | Path | Mode | Contents |
 |------|------|----------|
 | `data_dir/` | `0700` | Key storage directory |
-| `data_dir/identity.json` | `0600` | `node_id`, `mesh_ip`, `signing_public_key`, `last_rotation` (rotation receipt) (JSON) |
+| `data_dir/identity.json` | `0600` | `node_id`, `mesh_ip`, `signing_key_id`, `signing_public_key`, `last_rotation` (rotation receipt) (JSON) |
 | `data_dir/private_key` | `0600` | Base64-encoded Curve25519 private key |
 | `data_dir/rotation_pending_key` | `0600` | Base64-encoded staged rotation private key |
 | `data_dir/node_secret_key` | `0600` | Raw AES-256 Node Secret Key |
@@ -136,6 +148,8 @@ Key rotation can be triggered in two ways:
 - **Heartbeat response** -- the control plane sets `rotate_keys: true` in the `HeartbeatResponse`, causing the node to trigger reconciliation which performs the rotation.
 - **SSE events** -- specific events signal individual key rotations.
 
+The Domain signing key also changes through the state pull's `signing_key` block (see [Signing Key from the State Pull](#signing-key-from-the-state-pull)).
+
 #### Mesh Key Rotation (`rotate_keys`)
 
 1. Control plane signals rotation via the heartbeat `rotate_keys` flag or the `rotate_keys` SSE event.
@@ -155,12 +169,25 @@ The NSK is rotated together with mesh keys or independently via the control plan
 - The control plane re-encrypts all secrets with the new NSK.
 - Secrets are fetched in real-time (not cached as plaintext), so no historical ciphertext accumulates on-node.
 
+#### Signing Key from the State Pull
+
+When an operator rotates the Domain signing key, the control plane serves the incoming key in the `signing_key` block, so the node's next pull carries it. The dispatch handler that applies the block is registered first among the reconcile dispatch handlers, so the rest of the cycle already runs under the pulled key. On every successful pull:
+
+1. A `null` or absent block changes nothing. plexd logs `state pull carried no signing key; keeping the installed one` at Debug.
+2. The verifier's `Install` refuses a block with no `key_id`, or a `public_key` that is not standard base64 or does not decode to 32 bytes. The keys stay as they were, and plexd logs `signing key from state pull rejected` (`key_id`, `error`) at Warn once, not again on every pull that repeats the same block.
+3. A key whose id and bytes both equal the current pair changes nothing and leaves a rotation's grace entry in place. Any other key replaces the current key and drops the grace entry, because a node trusts exactly one Domain key. plexd logs `installed signing key from state pull` with `key_id` and `public_key` at Info; that `public_key` is the value an operator sets as `tunnel.session_signing_public_key` for a session helper that pinned an older key.
+4. A pulled key that differs from the persisted pair is written with `CommitSigningKey`. A failed write logs `signing key not persisted; retrying on the next pull` (`key_id`, `error`) at Warn and is retried on every pull.
+
+A pull install has no transition period: from that pull on, the verifier accepts envelopes signed with the new key only.
+
 #### Signing Key Rotation (`signing_key_rotated`)
 
-1. Control plane sends a `signing_key_rotated` SSE event (signed with the current key).
-2. The event payload contains the new `current` key, the `previous` key, and a `transition_expires` timestamp.
-3. The node's `EventVerifier` is updated to accept signatures from both keys for the transition period.
+1. A `signing_key_rotated` SSE event arrives, signed with a key the verifier already accepts.
+2. The event payload carries the new key's `key_id` and `public_key`, a `previous_key_id`, and a `transition_expires` timestamp.
+3. The node's `Ed25519Verifier` makes the new key current. It accepts signatures from the previous key until `transition_expires` only when `previous_key_id` names a key the verifier holds and the deadline is set.
 4. After the transition expires, only the new key is used for verification.
+
+The event updates the verifier in memory only. A later pull that carries a different key replaces the current key and drops the grace entry.
 
 ### Deletion
 
@@ -173,7 +200,7 @@ The NSK is rotated together with mesh keys or independently via the control plan
 - **Atomic writes**: `fsutil.WriteFileAtomic` ensures that a crash during a write never leaves a corrupted or partial key file on disk.
 - **No plaintext secret caching**: secrets are decrypted in memory on demand via the NSK. No plaintext secret values are persisted to disk.
 - **One-time bootstrap token**: the token is deleted after registration, limiting the window for token theft and replay.
-- **Transition period for signing keys**: during rotation, both old and new signing keys are accepted, preventing event verification failures during rollover. After the transition expires, only the new key is trusted.
+- **Transition period for signing keys**: during a rotation announced by a `signing_key_rotated` event that names the previous key and a deadline, both old and new signing keys are accepted, preventing event verification failures during rollover. After the transition expires, only the new key is trusted. A key installed from the state pull has no transition period: it replaces the current key, because a node trusts exactly one Domain key.
 - **PSK as post-quantum layer**: even if the Curve25519 key exchange is compromised (e.g., by a future quantum computer), the per-peer PSK provides an additional symmetric encryption layer that protects captured traffic.
 - **NSK rotation invalidates old ciphertext**: after NSK rotation, secrets encrypted with the old key cannot be decrypted by the node. The control plane re-encrypts with the new NSK.
 - **TLS on all control plane communication**: key material is exchanged over TLS-protected channels, mitigating interception during registration and key rotation.
@@ -185,7 +212,9 @@ The NSK is rotated together with mesh keys or independently via the control plan
 | Identity persistence | `internal/registration/identity.go` |
 | Registration flow | `internal/registration/registrar.go` |
 | Atomic file writes | `internal/fsutil/atomic.go` |
-| Signing key rotation handler | `cmd/plexd/cmd/up.go` |
+| Signing key rotation and state pull handlers | `cmd/plexd/cmd/up.go` |
+| Signing key install and rotation | `internal/api/verifier.go` |
+| Signing key persistence | `internal/registration/signing_key.go` |
 | WireGuard peer key rotation | `internal/wireguard/handler.go` |
 | Key rotate API endpoint | `internal/api/endpoints.go` |
 | Key rotation service | `internal/agent/keyrotation.go` |

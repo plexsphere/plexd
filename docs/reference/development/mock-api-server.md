@@ -219,6 +219,12 @@ The `peer_snapshot` uses the narrow `RegisterPeer` shape (no `psk`,
 register contract specifies (44 characters). plexd decodes it back into the
 32-byte AES-256-GCM key it uses to open secret envelopes.
 
+`signing_key_id` and `signing_public_key` are the mock's current signing key:
+`did:web:plexsphere.com#key-e2e` and the public half of an Ed25519 key pair
+generated per server start, until `POST /test/rotate-signing-key` replaces
+them. A registration after a rotation answers with the new key, and every state
+pull carries the same key in its `signing_key` block.
+
 **Content-Type:** `application/json`
 
 **Counter:** Increments `registration_count` on each call.
@@ -509,6 +515,10 @@ rules, the `reachability` projection, all four bridge subtrees, the `state`
 and `reports` blocks (which mirror one another), and empty `executions` and
 `sessions` blocks.
 The active fixture can be replaced at runtime via `POST /test/configure-state`.
+The `signing_key` block is not read from the fixture: every response sets it to
+the mock's current signing key, the key `POST /v1/register` hands out, whatever
+the configured fixture holds. A pull after `POST /test/rotate-signing-key`
+therefore hands the node the new key.
 
 **Default fixture blocks:**
 
@@ -524,6 +534,7 @@ The active fixture can be replaced at runtime via `POST /test/configure-state`.
 | `state` / `reports` | `metadata` (2 entries), `data` (2 entries), `reports` (`[]`) |
 | `executions` | `[]` — no dispatch queued; phases configure entries explicitly |
 | `sessions` | `[]` — no session issued; phases configure entries explicitly |
+| `signing_key` | the mock's current signing key (`key_id` `did:web:plexsphere.com#key-e2e` until `POST /test/rotate-signing-key`), set on every response rather than read from the fixture |
 
 The two peers give the agent's dial order both shapes. Peer `...a0b1`'s order is
 its candidate `192.0.2.10:51820`, then its fallback `203.0.113.1:51820`. No node
@@ -650,7 +661,8 @@ comparison key and never re-derives it from the rules.
     "reports": []
   },
   "executions": [],
-  "sessions": []
+  "sessions": [],
+  "signing_key": {"key_id": "did:web:plexsphere.com#key-e2e", "public_key": "<base64 Ed25519 public key, generated per server start>"}
 }
 ```
 
@@ -717,7 +729,7 @@ Server-Sent Events (SSE) endpoint for the signed event stream. There is **no** u
 ```
 id: 1
 event: node_state_updated
-data: {"id":"evt-inject-001","type":"node_state_updated","scope":"","key_id":"did:web:plexsphere.com#key-e2e","issued_at":"2026-01-01T00:00:00Z","payload":{"revision":42},"signature":"<base64-ed25519>"}
+data: {"id":"evt-inject-001","type":"node_state_updated","scope":"domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1","key_id":"did:web:plexsphere.com#key-e2e","issued_at":"2026-01-01T00:00:00Z","payload":{"revision":42},"signature":"<base64-ed25519>"}
 ```
 
 **Sequencing and ring buffer:** every broadcast is assigned the next stream sequence (the first is `1`) and recorded in a bounded replay ring (capacity 64; the oldest entry is dropped past that). Recording happens regardless of connected clients and regardless of descoped mode, so a later reconnect can replay from a cursor.
@@ -1004,7 +1016,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
 
 Broadcasts a signed `Envelope` to all connected SSE clients and records it in the replay ring. The caller supplies only the identifying fields; the mock stamps the rest and signs the envelope so the agent's verifier accepts it.
 
-**Request body:** `id`, `type`, `scope`, and `payload`. Both `id` and `type` are required.
+**Request body:** `id`, `type`, `scope`, and `payload`. Both `id` and `type` are required. The mock replaces the `scope` the caller sends (see below).
 
 ```json
 {
@@ -1022,7 +1034,9 @@ block via `POST /test/configure-state`. `session_setup` and `session_revoked`
 behave the same way — neither carries a session nor a teardown, so the session
 must be configured into (or dropped from) the `sessions` block the same way.
 
-**Fields the mock stamps:** `issued_at` (current time), `key_id` (`did:web:plexsphere.com#key-e2e`), the stream sequence (the `id:` frame line), and `signature` (a valid Ed25519 signature over the shared canonical form, `api.CanonicalBytes`).
+**Fields the mock stamps:** `scope` (`domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1`, replacing whatever the request sent), `issued_at` (current time), `key_id` (the current signing key id, `did:web:plexsphere.com#key-e2e` until `POST /test/rotate-signing-key`), the stream sequence (the `id:` frame line), and `signature` (a valid Ed25519 signature over `api.SignedMessage`, the SHA-512 digest of the shared canonical form `api.CanonicalBytes`).
+
+The mock signs the way the "Signed event envelope" section of plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere) specifies: the signature covers the digest, not the canonical bytes. The stamped scope is the Domain of that section's worked example. The canonical form carries only `platform` or `domain:<uuid>`, so a free-form scope such as `node:n_abc123` could not be signed at all.
 
 **Response:** `204 No Content`
 
@@ -1035,7 +1049,7 @@ must be configured into (or dropped from) the `sessions` block the same way.
 - Increments `inject_event_count` on each call
 - Request body is captured and retrievable via `GET /test/last-request/inject_event`
 
-**Error:** Returns `400` if the request body is not valid JSON or is missing `id` or `type`. Returns `405` if the HTTP method is not `POST`.
+**Error:** Returns `400` if the request body is not valid JSON or is missing `id` or `type`. Returns `400` with `{"error": "mockapi: sign envelope: <cause>"}` if the payload is one the canonical form cannot carry, such as a number out of float64 range (`1e400`); that envelope is neither recorded in the replay ring nor broadcast, and `inject_event_count` does not move. Returns `405` if the HTTP method is not `POST`.
 
 ### `POST /test/configure-state`
 
@@ -1088,6 +1102,7 @@ result back — that is what the e2e helper `configure_executions` does. The
 - Any valid `NodeStateSnapshot` JSON is accepted, including minimal objects with `null` blocks
 - Decoding is **strict**: a misspelled or renamed key anywhere in the envelope is a `400`, not a `204` that silently stores a zero-valued block
 - Each configured execution seeds the callback state machine (see below)
+- A configured `signing_key` is stored (and `GetState()` returns it) but never served: `GET /v1/nodes/{id}/state` replaces it with the mock's current signing key
 - Request body is captured and retrievable via `GET /test/last-request/configure_state`
 
 **Execution seeding:** the configured `status` of each entry tells the mock what the
@@ -1200,9 +1215,10 @@ enum: `streaming` or `descoped`.
 ### `POST /test/session-token`
 
 Mints the token a mediated ssh session logs in with: a compact JWS signed with
-the mock's signing key, the key `POST /v1/register` hands out as
-`signing_public_key`, so plexd and its session helper accept it the way they
-accept a token the control plane signed with the Domain key.
+the mock's current signing key, the key `POST /v1/register` hands out as
+`signing_public_key` and every state pull carries in `signing_key`, so plexd and
+its session helper accept it the way they accept a token the control plane
+signed with the Domain key.
 
 **Request body:**
 
@@ -1213,7 +1229,9 @@ accept a token the control plane signed with the Domain key.
 `allowed_commands` is optional.
 
 **Response:** `200 OK` with `{"token": "<header>.<claims>.<signature>"}`. The
-header is `{"alg":"EdDSA","kid":"did:web:plexsphere.com#key-e2e","typ":"at+jwt"}`.
+header is `{"alg":"EdDSA","kid":"<key id>","typ":"at+jwt"}`, where `kid` is the
+current signing key id (`did:web:plexsphere.com#key-e2e` until
+`POST /test/rotate-signing-key`).
 The claims are `iss` `plexsphere://domain/e2e`, `aud` `resource://e2e`, `sub`
 `identity://e2e`, `jti` equal to `session_id`, `kind` `ssh`, `target`
 `{"kind":"ssh","user":…,"allowed_commands":…}`, and `iat`, `nbf` and `exp` in Unix
@@ -1222,6 +1240,43 @@ seconds, with `iat` and `nbf` now and `exp` now plus `ttl_seconds`.
 **Error:** Returns `400` if the body is not valid JSON, `session_id` or `user` is
 empty, or `ttl_seconds` is outside 1 to 3600. Returns `405` if the HTTP method is
 not `POST`.
+
+### `POST /test/rotate-signing-key`
+
+Replaces the mock's Domain signing key with a fresh Ed25519 key pair, named the
+way the control plane names a key it mints for a Domain. This is what a node
+enrolled before its Domain had a key of its own meets: the control plane signs
+with a key the node did not get at registration, and the node learns that key
+only from the state pull. The [Docker e2e run](docker-e2e-test.md) uses it to
+prove that plexd installs the pulled key, verifies events signed with it, and
+starts from it after a restart.
+
+**Request body:** none. The handler does not read the body.
+
+**Response:** `200 OK`
+
+```json
+{
+  "key_id": "signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1-1767225600000000000",
+  "public_key": "<base64 Ed25519 public key>"
+}
+```
+
+The answer has the shape of `api.NodeStateSigningKey`. `key_id` is
+`signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1-<unix nanos>` and
+`public_key` is the 32-byte public key in standard base64.
+
+**Behavior:**
+
+- Every later envelope, session token, registration and pull uses the new key: `POST /test/inject-event` stamps its id and signs with it, `POST /test/session-token` names it in `kid` and signs with it, and `POST /v1/register` and `GET /v1/nodes/{id}/state` hand it out.
+- The old key is gone at once: the mock keeps no grace window and signs nothing more with it. A node refuses the envelopes signed with the new key (`api: verifier: unknown signing key id`) until a pull has carried that key.
+- Each call mints another key. The initial key id `did:web:plexsphere.com#key-e2e` comes back only when the server restarts.
+- A Linux session helper that already pinned the earlier key at `/etc/plexd/session-signing-key` keeps verifying ssh session tokens against its pin. See [Trust anchor](../networking/secure-access-tunneling.md#trust-anchor).
+- The key is guarded by `sync.RWMutex`, so a rotation never races a signer or a pull. No counter moves and no request body is captured.
+
+**Content-Type:** `application/json`
+
+**Error:** Returns `500` if generating the key pair fails. Returns `405` if the HTTP method is not `POST`.
 
 ### `GET /test/last-request/{endpoint}`
 
@@ -1340,6 +1395,7 @@ All responses use the same JSON field names as the types in `internal/api`:
 - `PolicySnapshot` / `PolicyRule` / `PortRange` — `internal/api.PolicySnapshot` / `internal/api.PolicyRule` / `internal/api.PortRange`
 - `BridgeSnapshot` — `internal/api.BridgeSnapshot`
 - `NodeStateBlock` / `StateEntry` — `internal/api.NodeStateBlock` / `internal/api.StateEntry`
+- `NodeStateSigningKey` — `internal/api.NodeStateSigningKey`
 - `Envelope` — `internal/api.Envelope`
 - `Peer` — `internal/api.Peer`
 - `RelayConfig` / `RelaySessionAssignment` — `internal/api.RelayConfig` / `internal/api.RelaySessionAssignment`

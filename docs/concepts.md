@@ -77,7 +77,7 @@ flowchart TD
 2. **Set up logger** — structured `slog` logger with configured level
 3. **Create control plane client** — `api.NewControlPlane()` with API config and build version
 4. **Register** — `registrar.Register()` loads or creates node identity (fatal on failure)
-5. **Create Ed25519 verifier** — decode the control plane's signing public key from identity
+5. **Create Ed25519 verifier** — decode the control plane's signing public key from identity (the key registration returned, or a newer one a state pull carried and the agent persisted); `signingKeyDispatchHandler`, registered first among the reconcile [dispatch handlers](reference/core/reconciliation.md#registered-dispatch-handlers), installs the key every state pull carries
 5a. **Initialize WireGuard** — create WireGuard interface, configure address and MTU, bring interface up
 5b. **Initialize NAT + Peer Exchange** — create STUN client, NAT discoverer, and peer exchanger
 5c. **Initialize Network Policy** — create policy engine, firewall controller, and enforcer
@@ -160,7 +160,7 @@ flowchart TD
 1. **Bootstrap** — node registers using a bootstrap token (file, env var, or metadata service)
 2. **Node Secret Key** — registration returns a `NodeSecretKey` used for all subsequent API authentication
 3. **Heartbeat Auth** — each heartbeat uses the node secret key; three heartbeats answered 401 Unauthorized (`unauthorized`, `nsk_invalid` or `nsk_revoked`) with no accepted one between them park the agent, which then stops calling the control plane and probes the credential with the heartbeat (see [Credential Park](reference/core/heartbeat-service.md#credential-park))
-4. **Key Rotation** — on `signing_key_rotated` SSE events or heartbeat `RotateKeys` flag, the Ed25519 verifier keys are updated
+4. **Signing Key** — the Ed25519 verifier checks SSE envelopes and ssh session tokens against the Domain signing key. Every successful state pull installs the key its `signing_key` block carries (`verifier.Install`) and persists it into the identity files, so a restart starts from it. A `null` block keeps the installed key, and a key the verifier refuses changes nothing. A `signing_key_rotated` SSE event installs a new key too (`verifier.Rotate`) and can keep the previous key trusted until the rotation's `transition_expires`; a pulled key that differs from the current one ends that grace window, because a node trusts exactly one key of its Domain. The mesh SSH server's JWT verifier (step 5d) is separate: it keeps the key decoded at start and picks up a pulled key only after a restart
 
 ## SSE Event Types
 
@@ -181,7 +181,7 @@ only request a reconcile.
 | `peer_endpoint_changed` | documented-coming | Triggers a reconcile |
 | `peer_key_rotated` | documented-coming | Triggers a reconcile |
 | `rotate_keys` | documented-coming | Starts a key rotation (`rotator.RotateNow`) |
-| `signing_key_rotated` | documented-coming | Updates the Ed25519 verifier key (`verifier.Rotate`) |
+| `signing_key_rotated` | documented-coming | Updates the Ed25519 verifier key (`verifier.Rotate`); every state pull also installs the key its `signing_key` block carries (`verifier.Install`) |
 | `session_revoked` | documented-coming | Triggers a reconcile — the block drain does the teardown |
 
 **Contract** types are emitted by the control plane today. **Documented-coming**
