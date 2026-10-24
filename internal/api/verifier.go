@@ -98,7 +98,8 @@ func (v *Ed25519Verifier) TrustedKeys(now time.Time) []ed25519.PublicKey {
 
 // Verify checks the freshness and Ed25519 signature of an envelope. It selects
 // the verifying key by the envelope's key id, honouring the rotation grace
-// window for the previous key.
+// window for the previous key, and checks the signature over SignedMessage, the
+// SHA-512 digest of the envelope's canonical bytes.
 func (v *Ed25519Verifier) Verify(_ context.Context, env Envelope) error {
 	if env.Signature == "" {
 		return fmt.Errorf("api: verifier: missing signature")
@@ -131,11 +132,14 @@ func (v *Ed25519Verifier) Verify(_ context.Context, env Envelope) error {
 	if err != nil {
 		return fmt.Errorf("api: verifier: signature verification failed")
 	}
-	canonical, err := CanonicalBytes(env)
+	// The canonical form gets its own error: an envelope plexd cannot
+	// canonicalise names that cause in the "event verification failed" line,
+	// instead of reading like a signature made with the wrong key.
+	msg, err := SignedMessage(env)
 	if err != nil {
-		return fmt.Errorf("api: verifier: signature verification failed")
+		return fmt.Errorf("api: verifier: canonical form: %w", err)
 	}
-	if !ed25519.Verify(key, canonical, sigBytes) {
+	if !ed25519.Verify(key, msg, sigBytes) {
 		return fmt.Errorf("api: verifier: signature verification failed")
 	}
 

@@ -173,22 +173,24 @@ func TestBuildHeartbeatRequest(t *testing.T) {
 	})
 }
 
-// signRotationEnvelope builds an envelope signed over its canonical bytes with
-// the given key and key id, used to prove which key the verifier accepts.
+// signRotationEnvelope builds an envelope signed the way the control plane
+// signs one, over the SHA-512 digest of its canonical bytes, with the given key
+// and key id, used to prove which key the verifier accepts.
 func signRotationEnvelope(t *testing.T, priv ed25519.PrivateKey, keyID string) api.Envelope {
 	t.Helper()
 	env := api.Envelope{
 		ID:       "evt-rot-1",
 		Type:     api.EventPolicyUpdated,
+		Scope:    "domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1",
 		KeyID:    keyID,
 		IssuedAt: time.Now().UTC(),
 		Payload:  json.RawMessage(`{}`),
 	}
-	canonical, err := api.CanonicalBytes(env)
+	msg, err := api.SignedMessage(env)
 	if err != nil {
-		t.Fatalf("canonical bytes: %v", err)
+		t.Fatalf("signed message: %v", err)
 	}
-	env.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, canonical))
+	env.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, msg))
 	return env
 }
 

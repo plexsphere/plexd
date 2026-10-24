@@ -395,6 +395,11 @@ const (
 	// mockSigningKeyID is the key id the mock stamps on every signed envelope and
 	// returns from register; the agent's verifier selects the signing key by it.
 	mockSigningKeyID = "did:web:plexsphere.com#key-e2e"
+	// mockDomainID is the Domain the mock's node belongs to, the one of the
+	// agent contract's worked example. Every envelope the mock signs carries
+	// mockSigningScope, its wire scope.
+	mockDomainID     = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1"
+	mockSigningScope = "domain:" + mockDomainID
 	// mockAPIVersion is the value stamped in the X-Plexsphere-API-Version header
 	// on the events stream, matching the /v1 route prefix the mock serves.
 	mockAPIVersion = "v1"
@@ -2892,8 +2897,10 @@ func (s *Server) BroadcastSSE(envelope api.Envelope) {
 }
 
 // handleInjectEvent handles POST /test/inject-event.
-// It sets issued_at to the current time and computes a valid ed25519 signature
-// so the agent's verifier accepts the event.
+// It sets issued_at to the current time and the scope to the mock's Domain, and
+// computes a valid ed25519 signature so the agent's verifier accepts the event.
+// A payload the canonical form cannot carry, such as a number out of float64
+// range, is a 400.
 func (s *Server) handleInjectEvent(w http.ResponseWriter, r *http.Request) {
 	var envelope api.Envelope
 	if !s.decodeBody(w, r, "inject_event", &envelope) {
@@ -2906,7 +2913,10 @@ func (s *Server) handleInjectEvent(w http.ResponseWriter, r *http.Request) {
 
 	// Override timestamp and sign the envelope so it passes verification.
 	envelope.IssuedAt = time.Now().UTC()
-	s.signEnvelope(&envelope)
+	if err := s.signEnvelope(&envelope); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 
 	// A rotate_keys event arms a pending rotation (issue #21).
 	if envelope.Type == api.EventRotateKeys {
@@ -2920,17 +2930,20 @@ func (s *Server) handleInjectEvent(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// signEnvelope stamps the mock's signing key id on the envelope and computes a
-// valid ed25519 signature over the shared canonical form (api.CanonicalBytes)
-// using the mock API's signing key.
-func (s *Server) signEnvelope(envelope *api.Envelope) {
+// signEnvelope stamps the mock's Domain scope and signing key id on the
+// envelope, overriding whatever the injector sent, and signs it the way the
+// control plane does: Ed25519 over api.SignedMessage, the SHA-512 digest of the
+// shared canonical form.
+func (s *Server) signEnvelope(envelope *api.Envelope) error {
+	envelope.Scope = mockSigningScope
 	envelope.KeyID = mockSigningKeyID
-	canonical, err := api.CanonicalBytes(*envelope)
+	msg, err := api.SignedMessage(*envelope)
 	if err != nil {
-		panic("mockapi: marshal canonical envelope: " + err.Error())
+		return fmt.Errorf("mockapi: sign envelope: %w", err)
 	}
-	sig := ed25519.Sign(s.signingPrivateKey, canonical)
+	sig := ed25519.Sign(s.signingPrivateKey, msg)
 	envelope.Signature = base64.StdEncoding.EncodeToString(sig)
+	return nil
 }
 
 // handleLastRequest handles GET /test/last-request/{endpoint}.

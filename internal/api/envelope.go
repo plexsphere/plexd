@@ -1,9 +1,16 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha512"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -79,33 +86,208 @@ func ParseEnvelope(data []byte) (Envelope, error) {
 	return env, nil
 }
 
-// canonicalEnvelope is the deterministic representation over which an envelope
-// signature is computed. Its members and order are fixed: id, type, scope,
-// key_id, issued_at, payload — and never the signature.
-type canonicalEnvelope struct {
-	ID       string          `json:"id"`
-	Type     string          `json:"type"`
-	Scope    string          `json:"scope"`
-	KeyID    string          `json:"key_id"`
-	IssuedAt time.Time       `json:"issued_at"`
-	Payload  json.RawMessage `json:"payload"`
+// canonicalTimeLayout is how issued_at appears in the canonical bytes: UTC with
+// exactly nine fractional digits, whatever the wire carried.
+const canonicalTimeLayout = "2006-01-02T15:04:05.000000000Z"
+
+// platformScopeID is the id the canonical bytes give the platform scope, which
+// has no id of its own on the wire.
+const platformScopeID = "00000000-0000-0000-0000-000000000000"
+
+// CanonicalBytes returns the bytes an envelope's signature covers, as the
+// "Signed event envelope" section of plexsphere's agent contract
+// (docs/reference/api/plexd-agent-contract.md) defines them: one JSON object
+// with exactly the members id, issued_at, key_id, payload, scope and type in
+// that order, no whitespace, and never the signature. issued_at is UTC with
+// nine fractional digits, scope is an object rather than the wire string, and
+// the payload is decoded and written again with sorted keys and normalised
+// numbers. An absent or empty Payload is null.
+//
+// The frame's data: line is not the signed message: its member order, time
+// format and payload spelling are whatever the control plane's encoder wrote,
+// so the bytes are rebuilt from the decoded values. This is the single
+// canonical-form seam shared by the agent's verifier and the mock control
+// plane, and it mirrors the control plane's own CanonicalBytes
+// (internal/signing/envelope/canonical.go in plexsphere).
+func CanonicalBytes(env Envelope) ([]byte, error) {
+	scope, err := canonicalScope(env.Scope)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := canonicalPayload(env.Payload)
+	if err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString(`{"id":`)
+	buf.Write(encodeString(env.ID))
+	buf.WriteString(`,"issued_at":`)
+	buf.Write(encodeString(env.IssuedAt.UTC().Format(canonicalTimeLayout)))
+	buf.WriteString(`,"key_id":`)
+	buf.Write(encodeString(env.KeyID))
+	buf.WriteString(`,"payload":`)
+	buf.Write(payload)
+	buf.WriteString(`,"scope":`)
+	buf.Write(scope)
+	buf.WriteString(`,"type":`)
+	buf.Write(encodeString(env.Type))
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
 }
 
-// CanonicalBytes returns the canonical signing bytes for an envelope: a JSON
-// object with exactly the fields id, type, scope, key_id, issued_at, payload in
-// that order and no signature member. A nil Payload serializes as
-// "payload":null. It is the single canonical-form seam shared between the agent
-// and the mock control plane; the control plane's own helper is unpublished, so
-// this shape is an author-approved assumption until the platform documents it.
-func CanonicalBytes(env Envelope) ([]byte, error) {
-	return json.Marshal(canonicalEnvelope{
-		ID:       env.ID,
-		Type:     env.Type,
-		Scope:    env.Scope,
-		KeyID:    env.KeyID,
-		IssuedAt: env.IssuedAt,
-		Payload:  env.Payload,
-	})
+// SignedMessage returns the message an envelope's Ed25519 signature is made
+// over: the 64-byte SHA-512 digest of its CanonicalBytes. The control plane
+// signs the digest, not the canonical bytes themselves, so verifying the bytes
+// directly fails for every envelope.
+func SignedMessage(env Envelope) ([]byte, error) {
+	canonical, err := CanonicalBytes(env)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha512.Sum512(canonical)
+	return sum[:], nil
+}
+
+// canonicalScope renders the wire scope as the canonical object
+// {"id":…,"kind":…}. "platform" carries the zero UUID; "domain:<uuid>" carries
+// its UUID, which must be in the lowercase hyphenated form the control plane
+// writes. The zero UUID needs no special case under domain: the control plane
+// never signs that scope, so no signature over it exists.
+func canonicalScope(scope string) ([]byte, error) {
+	kind, id := "platform", platformScopeID
+	if scope != "platform" {
+		rest, ok := strings.CutPrefix(scope, "domain:")
+		if !ok || !isCanonicalUUID(rest) {
+			return nil, fmt.Errorf("api: envelope: canonical scope %q: want \"platform\" or \"domain:<uuid>\"", scope)
+		}
+		kind, id = "domain", rest
+	}
+	// Both values are plain hex, hyphens and letters, so they need no escaping.
+	return []byte(`{"id":"` + id + `","kind":"` + kind + `"}`), nil
+}
+
+// isCanonicalUUID reports whether s is 36 characters of lowercase hex in
+// 8-4-4-4-12 groups.
+func isCanonicalUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := range len(s) {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// canonicalPayload decodes the payload and writes it again in canonical form.
+// Decoding with UseNumber keeps each number's literal so canonicalNumber can
+// normalise it, and a second JSON value after the first is refused rather than
+// silently dropped.
+func canonicalPayload(raw json.RawMessage) ([]byte, error) {
+	if len(raw) == 0 {
+		return []byte("null"), nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, fmt.Errorf("api: envelope: canonical payload: %w", err)
+	}
+	if dec.More() {
+		return nil, errors.New("api: envelope: canonical payload: more than one JSON value")
+	}
+	var buf bytes.Buffer
+	if err := canonicalValue(&buf, v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// canonicalValue writes one decoded JSON value: object members sorted by key
+// at every depth (byte order, which is UTF-8 order), array elements in order.
+// The cases are exactly what encoding/json produces with UseNumber.
+func canonicalValue(buf *bytes.Buffer, v any) error {
+	switch t := v.(type) {
+	case nil:
+		buf.WriteString("null")
+	case bool:
+		buf.WriteString(strconv.FormatBool(t))
+	case string:
+		buf.Write(encodeString(t))
+	case json.Number:
+		n, err := canonicalNumber(string(t))
+		if err != nil {
+			return err
+		}
+		buf.WriteString(n)
+	case map[string]any:
+		buf.WriteByte('{')
+		for i, k := range slices.Sorted(maps.Keys(t)) {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			buf.Write(encodeString(k))
+			buf.WriteByte(':')
+			if err := canonicalValue(buf, t[k]); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte('}')
+	case []any:
+		buf.WriteByte('[')
+		for i, elem := range t {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := canonicalValue(buf, elem); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+	default:
+		return fmt.Errorf("api: envelope: canonical payload: unsupported JSON value %T", v)
+	}
+	return nil
+}
+
+// canonicalNumber normalises a number literal so numerically equal payloads
+// give equal bytes: a literal that parses as a 64-bit signed or unsigned
+// integer is written in plain decimal, and any other is parsed as a float64
+// and written in its shortest round-trip form (1.50 is 1.5, 1e3 is 1000).
+func canonicalNumber(s string) (string, error) {
+	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return strconv.FormatInt(i, 10), nil
+	}
+	if u, err := strconv.ParseUint(s, 10, 64); err == nil {
+		return strconv.FormatUint(u, 10), nil
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return "", fmt.Errorf("api: envelope: canonical payload: number %q: %w", s, err)
+	}
+	return strconv.FormatFloat(f, 'g', -1, 64), nil
+}
+
+// encodeString writes s as a JSON string the way encoding/json does with HTML
+// escaping turned off: <, > and & stay raw, while control characters, U+2028
+// and U+2029 are escaped.
+func encodeString(s string) []byte {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	// Encoding a string never fails: invalid UTF-8 becomes U+FFFD.
+	_ = enc.Encode(s)
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
 }
 
 // ---------------------------------------------------------------------------

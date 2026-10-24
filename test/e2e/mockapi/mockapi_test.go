@@ -1100,8 +1100,24 @@ func TestEvents_InjectRoundTripVerifies(t *testing.T) {
 	if env.KeyID == "" || env.Signature == "" {
 		t.Fatalf("mock did not stamp key_id/signature: %+v", env)
 	}
+	// The request sent scope node/n1; the mock signs under its Domain instead.
+	if env.Scope != "domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1" {
+		t.Errorf("scope = %q, want the mock's Domain scope", env.Scope)
+	}
 	if err := verifier.Verify(context.Background(), env); err != nil {
 		t.Errorf("agent verifier rejected mock-signed envelope: %v", err)
+	}
+}
+
+// TestInjectEvent_UncanonicalPayload_Returns400 pins that a payload the
+// canonical form cannot carry is refused rather than signed or dropped.
+func TestInjectEvent_UncanonicalPayload_Returns400(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", `{"id":"evt-big","type":"node_state_updated","payload":1e400}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
 	}
 }
 
