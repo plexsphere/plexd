@@ -74,10 +74,18 @@ the actual token through the following flow:
 ### Token Caching
 
 - Resolved tokens are cached in memory with a **5-minute TTL**.
-- If a refresh fetch or decryption fails and a stale cached token exists, the
-  stale token is used as a fallback and a warning is logged. A fetch refused
-  with `api.ErrCredentialRefused`, while the heartbeat is parked on a refused
-  node credential, logs the same line at debug level instead (see
+- If the control plane answers the fetch with `403` (the Node's read grant was
+  revoked) or `404` (the Secret was deleted), plexd drops the cached token,
+  logs `dropping revoked credential` at warning level, and posts nothing to the
+  endpoint. Each later delivery fetches again and resumes once a fetch
+  succeeds; until then the control plane records each `403` as a denied read.
+  A token fetched less than 5 minutes earlier stays in use until its TTL runs
+  out, so forwarding stops within 5 minutes of the revocation.
+- If a refresh fails for any other reason (a rate limit, a control-plane
+  outage, a transport error) or decryption fails, and a stale cached token
+  exists, the stale token is used as a fallback and a warning is logged. A
+  fetch refused with `api.ErrCredentialRefused`, while the heartbeat is parked
+  on a refused node credential, logs the same line at debug level instead (see
   [Quiet Failure Logs](../reference/core/heartbeat-service.md#quiet-failure-logs)).
 - If no cached token exists and the fetch fails, the delivery is skipped for
   that cycle.
@@ -257,7 +265,8 @@ requires a specific ingest format.
 | HTTP 401/403 from endpoint | Bearer token incorrect or expired | Update the secret in the control plane with the correct token |
 | HTTP 4xx/5xx from endpoint | Endpoint rejected the request | Check the endpoint's own logs; verify the URL path |
 | `local * report failed` warnings | Endpoint unreachable or returning errors | Check connectivity and endpoint health. Platform delivery is unaffected. |
-| `using cached credential` warning | Token refresh failed; stale token in use | Check control plane connectivity. Cached token used until refresh succeeds. |
+| `using cached credential` warning | Token refresh failed (rate limit, control-plane outage, transport error or decryption); stale token in use | Check control plane connectivity. Cached token used until refresh succeeds. |
+| `dropping revoked credential` warning | The control plane answered the credential fetch with 403 or 404: the Node's read grant on `secret_key` was revoked, or the Secret was deleted | Grant the Node's Resource read access again, point `secret_key` at a Secret the Node may read, or remove `local_endpoint` from the pipeline |
 
 ### Verifying End-to-End Delivery
 

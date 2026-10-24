@@ -527,8 +527,9 @@ On each `ReportMetrics` call, `LocalReporter` resolves a bearer token via the fo
 
 | Scenario | Behavior |
 |----------|----------|
-| Fetch or decrypt fails, stale cache exists | Log warning (Debug for `api.ErrCredentialRefused`), return stale cached token |
-| Fetch or decrypt fails, no cache | Return error, no HTTP POST is made |
+| Fetch answers 403 or 404 (`api.IsSecretAccessRevoked`) | Drop the cached token, log `dropping revoked credential` at Warn when one was cached, return error, no HTTP POST is made |
+| Any other fetch failure, or decrypt fails, stale cache exists | Log warning (Debug for `api.ErrCredentialRefused`), return stale cached token |
+| Any other fetch failure, or decrypt fails, no cache | Return error, no HTTP POST is made |
 
 The cache is protected by `sync.RWMutex` with a double-checked locking pattern, making it safe for concurrent `ReportMetrics` calls.
 
@@ -821,6 +822,7 @@ All log entries use `component=metrics`.
 | `Warn` | Metrics report failed      | `component`, `error` |
 | `Warn` | Latency ping failed        | `peer_id`, `error` |
 | `Warn` | Using cached credential    | `component`, `error` |
+| `Warn` | Dropping revoked credential | `component`, `error` |
 | `Warn` | Local metrics report failed| `component`, `error` |
 | `Info` | Local endpoint enabled     | `pipeline`, `url`  |
 

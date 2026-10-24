@@ -161,7 +161,7 @@ Defined in the `auditfwd` package. The `api.ControlPlane` client satisfies this 
 
 ### Credential Resolution
 
-Same flow as `metrics.LocalReporter`: check cache (5-minute TTL) → `FetchSecret` → `DecryptSecret` → update cache. Falls back to stale cached token on fetch/decrypt failure. Protected by `sync.RWMutex` with double-checked locking.
+Same flow as `metrics.LocalReporter`: check cache (5-minute TTL) → `FetchSecret` → `DecryptSecret` → update cache. Falls back to stale cached token on fetch/decrypt failure, except on a 403 or 404 from the fetch, which drops the cached token and fails the send. Protected by `sync.RWMutex` with double-checked locking.
 
 ### ReportAudit Behavior
 
@@ -601,6 +601,7 @@ All log entries use `component=auditfwd`.
 | `Warn` | Audit report failed                | `component`, `error`        |
 | `Warn` (`Debug` while the heartbeat is parked) | Buffer overflow, dropping entries | `component`, `dropped` |
 | `Warn` | Using stale cached credential      | `component`, `error`        |
+| `Warn` | Dropping revoked credential        | `component`, `error`        |
 | `Warn` | Local audit report failed          | `component`, `error`        |
 | `Info` | Local endpoint enabled             | `pipeline`, `url`           |
 
