@@ -3,6 +3,7 @@ package nodeapi
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -430,6 +431,337 @@ func TestHandler_GetSecretValue_NoCaching(t *testing.T) {
 	if got := fetcher.callCount(); got != 2 {
 		t.Errorf("fetcher call count = %d, want 2 (no handler-side caching)", got)
 	}
+}
+
+// octetStream is the Accept value that selects the raw secret body.
+const octetStream = "application/octet-stream"
+
+// getWithAccept sends a GET to url with one Accept header line per entry of
+// accept, and none when accept is empty.
+func getWithAccept(t *testing.T, url string, accept ...string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequest %s: %v", url, err)
+	}
+	for _, a := range accept {
+		req.Header.Add("Accept", a)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	return resp
+}
+
+func readBody(t *testing.T, resp *http.Response) []byte {
+	t.Helper()
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return body
+}
+
+// decodeError returns the error field of a JSON error body.
+func decodeError(t *testing.T, body []byte) string {
+	t.Helper()
+	var result struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("decode error body %q: %v", body, err)
+	}
+	return result.Error
+}
+
+func TestHandler_GetSecretValue_OctetStream(t *testing.T) {
+	nsk := testKey(t)
+	// The largest value the control plane stores: the 1 MiB envelope less
+	// its 12-byte nonce and 16-byte GCM tag.
+	largest := make([]byte, 1048548)
+	if _, err := rand.Read(largest); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		value      []byte
+		wantLength string
+	}{
+		{"binary", []byte("\xff\xfe\x00\x80keystore"), "12"},
+		{"largest", largest, "1048548"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fetcher := &mockSecretFetcher{
+				envelope: &api.SecretEnvelope{Data: testEncrypt(t, nsk, string(tc.value)), Version: 4, KID: "kid-1"},
+			}
+			srv := newSecretTestServer(t, fetcher, nsk, discardLogger())
+
+			resp := getWithAccept(t, srv.URL+"/v1/state/secrets/db-pass", octetStream)
+			body := readBody(t, resp)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+			if !bytes.Equal(body, tc.value) {
+				t.Errorf("body is not the stored value: got %d bytes, want %d", len(body), len(tc.value))
+			}
+			if got := resp.Header.Get("Content-Type"); got != octetStream {
+				t.Errorf("Content-Type = %q, want %q", got, octetStream)
+			}
+			if got := resp.Header.Get("Content-Length"); got != tc.wantLength {
+				t.Errorf("Content-Length = %q, want %q", got, tc.wantLength)
+			}
+			if got := resp.Header.Get("X-Plexd-Secret-Version"); got != "4" {
+				t.Errorf("X-Plexd-Secret-Version = %q, want %q", got, "4")
+			}
+		})
+	}
+}
+
+func TestHandler_GetSecretValue_EmptyValue(t *testing.T) {
+	nsk := testKey(t)
+	fetcher := &mockSecretFetcher{
+		envelope: &api.SecretEnvelope{Data: testEncrypt(t, nsk, ""), Version: 2},
+	}
+	srv := newSecretTestServer(t, fetcher, nsk, discardLogger())
+	url := srv.URL + "/v1/state/secrets/db-pass"
+
+	resp := getWithAccept(t, url, octetStream)
+	body := readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("raw: status = %d, want 200", resp.StatusCode)
+	}
+	if len(body) != 0 {
+		t.Errorf("raw: body = %q, want empty", body)
+	}
+	if got := resp.Header.Get("Content-Length"); got != "0" {
+		t.Errorf("raw: Content-Length = %q, want %q", got, "0")
+	}
+	if got := resp.Header.Get("X-Plexd-Secret-Version"); got != "2" {
+		t.Errorf("raw: X-Plexd-Secret-Version = %q, want %q", got, "2")
+	}
+
+	resp = mustGet(t, url)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("JSON: status = %d, want 200", resp.StatusCode)
+	}
+	var result struct {
+		Value *string `json:"value"`
+	}
+	decodeJSON(t, resp, &result)
+	if result.Value == nil || *result.Value != "" {
+		t.Errorf("JSON: value = %v, want an empty string", result.Value)
+	}
+}
+
+func TestHandler_GetSecretValue_AcceptSelection(t *testing.T) {
+	nsk := testKey(t)
+	fetcher := &mockSecretFetcher{
+		envelope: &api.SecretEnvelope{Data: testEncrypt(t, nsk, "s3cret"), Version: 1},
+	}
+	srv := newSecretTestServer(t, fetcher, nsk, discardLogger())
+
+	const asJSON = "application/json"
+	tests := []struct {
+		name   string
+		accept []string
+		want   string
+	}{
+		{"absent", nil, asJSON},
+		{"any type", []string{"*/*"}, asJSON},
+		{"any application type", []string{"application/*"}, asJSON},
+		{"json", []string{"application/json"}, asJSON},
+		{"text", []string{"text/plain"}, asJSON},
+		{"octet-stream at q=0", []string{"application/octet-stream;q=0"}, asJSON},
+		{"octet-stream with a q that does not parse", []string{"application/octet-stream;q=abc"}, asJSON},
+		{"malformed element", []string{";;, application/json"}, asJSON},
+		{"octet-stream", []string{octetStream}, octetStream},
+		{"octet-stream in mixed case", []string{"Application/Octet-Stream"}, octetStream},
+		{"octet-stream after json", []string{"application/json, application/octet-stream;q=0.5"}, octetStream},
+		{"octet-stream on a second header line", []string{"application/json", "application/octet-stream"}, octetStream},
+		{"octet-stream after a malformed element", []string{";;, application/octet-stream"}, octetStream},
+		{"octet-stream after one with a q that does not parse", []string{"application/octet-stream;q=abc, application/octet-stream"}, octetStream},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := getWithAccept(t, srv.URL+"/v1/state/secrets/db-pass", tc.accept...)
+			body := readBody(t, resp)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body: %s", resp.StatusCode, body)
+			}
+			if got := resp.Header.Get("Content-Type"); got != tc.want {
+				t.Fatalf("Content-Type = %q, want %q", got, tc.want)
+			}
+			if tc.want == octetStream {
+				if string(body) != "s3cret" {
+					t.Errorf("body = %q, want %q", body, "s3cret")
+				}
+				return
+			}
+			var result struct {
+				Value string `json:"value"`
+			}
+			if err := json.Unmarshal(body, &result); err != nil {
+				t.Fatalf("decode JSON: %v", err)
+			}
+			if result.Value != "s3cret" {
+				t.Errorf("value = %q, want %q", result.Value, "s3cret")
+			}
+		})
+	}
+}
+
+func TestHandler_GetSecretValue_NonUTF8RefusedAsJSON(t *testing.T) {
+	const value = "\xff\xfeKEYSTORE-MARKER\x80"
+	const wantError = "secret value is not valid UTF-8; request it with Accept: application/octet-stream"
+
+	tests := []struct {
+		name   string
+		accept []string
+	}{
+		{"no Accept", nil},
+		{"any type", []string{"*/*"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			nsk := testKey(t)
+			fetcher := &mockSecretFetcher{
+				envelope: &api.SecretEnvelope{Data: testEncrypt(t, nsk, value), Version: 6},
+			}
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, nil))
+			srv := newSecretTestServer(t, fetcher, nsk, logger)
+
+			resp := getWithAccept(t, srv.URL+"/v1/state/secrets/db-pass", tc.accept...)
+			body := readBody(t, resp)
+			if resp.StatusCode != http.StatusNotAcceptable {
+				t.Fatalf("status = %d, want 406", resp.StatusCode)
+			}
+			if got := resp.Header.Get("Content-Type"); got != "application/json" {
+				t.Errorf("Content-Type = %q, want %q", got, "application/json")
+			}
+			if got := decodeError(t, body); got != wantError {
+				t.Errorf("error = %q, want %q", got, wantError)
+			}
+			if got := resp.Header.Get("X-Plexd-Secret-Version"); got != "" {
+				t.Errorf("X-Plexd-Secret-Version = %q, want none", got)
+			}
+
+			logOut := buf.String()
+			for _, want := range []string{"level=WARN", "secret value refused as JSON: not valid UTF-8", "key=db-pass", "version=6"} {
+				if !strings.Contains(logOut, want) {
+					t.Errorf("log missing %q: %s", want, logOut)
+				}
+			}
+			if strings.Contains(logOut, "KEYSTORE-MARKER") {
+				t.Errorf("log carries the secret value: %s", logOut)
+			}
+		})
+	}
+}
+
+func TestHandler_GetSecretValue_UTF8ControlCharsJSON(t *testing.T) {
+	// Each value is valid UTF-8, so JSON carries it intact: NUL and U+2028 are
+	// escaped, and a literal U+FFFD is a character, not a sign of bad bytes.
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{"NUL and U+2028", "a\x00b\u2028c"},
+		{"literal U+FFFD", "pass\ufffdword"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			nsk := testKey(t)
+			fetcher := &mockSecretFetcher{
+				envelope: &api.SecretEnvelope{Data: testEncrypt(t, nsk, tc.value), Version: 1},
+			}
+			srv := newSecretTestServer(t, fetcher, nsk, discardLogger())
+
+			resp := mustGet(t, srv.URL+"/v1/state/secrets/db-pass")
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+			var result struct {
+				Value string `json:"value"`
+			}
+			decodeJSON(t, resp, &result)
+			if result.Value != tc.value {
+				t.Errorf("value = %q, want %q", result.Value, tc.value)
+			}
+		})
+	}
+}
+
+func TestHandler_GetSecretValue_OctetStreamErrors(t *testing.T) {
+	// Every refusal answers in JSON, whatever the caller asked for, and none
+	// carries the version header of a served value.
+	checkJSONError := func(t *testing.T, resp *http.Response, wantStatus int, wantError string) {
+		t.Helper()
+		body := readBody(t, resp)
+		if resp.StatusCode != wantStatus {
+			t.Errorf("status = %d, want %d", resp.StatusCode, wantStatus)
+		}
+		if got := resp.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q, want %q", got, "application/json")
+		}
+		if got := decodeError(t, body); got != wantError {
+			t.Errorf("error = %q, want %q", got, wantError)
+		}
+		if got := resp.Header.Get("X-Plexd-Secret-Version"); got != "" {
+			t.Errorf("X-Plexd-Secret-Version = %q, want none", got)
+		}
+	}
+
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantError  string
+		wantRetry  string
+	}{
+		{"name invalid", fmt.Errorf("api: fetch secret: %w", api.ErrSecretNameInvalid), http.StatusBadRequest, "invalid secret key", ""},
+		{"not found", api.ErrNotFound, http.StatusNotFound, "not found", ""},
+		{"forbidden", api.ErrForbidden, http.StatusForbidden, "forbidden", ""},
+		{"rate limited", &api.APIError{StatusCode: 429, Code: "per_node_rate_limited", RetryAfter: 5 * time.Second}, http.StatusTooManyRequests, "rate limited", "5"},
+		{"transport", errors.New("connection refused"), http.StatusServiceUnavailable, "control plane unavailable", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fetcher := &mockSecretFetcher{err: tc.err}
+			srv := newSecretTestServer(t, fetcher, testKey(t), discardLogger())
+
+			resp := getWithAccept(t, srv.URL+"/v1/state/secrets/db-pass", octetStream)
+			if got := resp.Header.Get("Retry-After"); got != tc.wantRetry {
+				t.Errorf("Retry-After = %q, want %q", got, tc.wantRetry)
+			}
+			checkJSONError(t, resp, tc.wantStatus, tc.wantError)
+		})
+	}
+
+	t.Run("decryption failure", func(t *testing.T) {
+		fetcher := &mockSecretFetcher{
+			envelope: &api.SecretEnvelope{Data: []byte("this is not a valid envelope"), Version: 7},
+		}
+		srv := newSecretTestServer(t, fetcher, testKey(t), discardLogger())
+
+		resp := getWithAccept(t, srv.URL+"/v1/state/secrets/db-pass", octetStream)
+		checkJSONError(t, resp, http.StatusInternalServerError, "internal error")
+	})
+
+	t.Run("invalid version", func(t *testing.T) {
+		fetcher := &mockSecretFetcher{}
+		srv := newSecretTestServer(t, fetcher, testKey(t), discardLogger())
+
+		resp := getWithAccept(t, srv.URL+"/v1/state/secrets/db-pass?version=0", octetStream)
+		checkJSONError(t, resp, http.StatusBadRequest, "invalid version")
+		if got := fetcher.callCount(); got != 0 {
+			t.Errorf("fetcher call count = %d, want 0", got)
+		}
+	})
 }
 
 func TestHandler_GetReportAll(t *testing.T) {

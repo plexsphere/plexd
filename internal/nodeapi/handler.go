@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
@@ -253,6 +257,33 @@ func (h *Handler) handleGetSecretsList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, index)
 }
 
+// secretVersionHeader carries the version of a secret value served as a raw
+// octet-stream body, which has no field to hold it.
+const secretVersionHeader = "X-Plexd-Secret-Version"
+
+// acceptsOctetStream reports whether the Accept header lines name
+// application/octet-stream with a quality above zero. Wildcards do not count:
+// curl sends */* by default, and those callers keep getting JSON. An element
+// that does not parse, or whose q does not parse, is skipped.
+func acceptsOctetStream(accept []string) bool {
+	for _, line := range accept {
+		for _, elem := range strings.Split(line, ",") {
+			mediaType, params, err := mime.ParseMediaType(strings.TrimSpace(elem))
+			if err != nil || mediaType != "application/octet-stream" {
+				continue
+			}
+			q, ok := params["q"]
+			if !ok {
+				return true
+			}
+			if v, err := strconv.ParseFloat(q, 64); err == nil && v > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (h *Handler) handleGetSecretValue(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
@@ -292,6 +323,23 @@ func (h *Handler) handleGetSecretValue(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.logger.Error("secret decryption failed", "key", key, "kid", resp.KID, "version", resp.Version, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	if acceptsOctetStream(r.Header.Values("Accept")) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(plaintext)))
+		w.Header().Set(secretVersionHeader, strconv.Itoa(resp.Version))
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, plaintext)
+		return
+	}
+
+	// A JSON string cannot carry bytes that are not valid UTF-8: the encoder
+	// would replace them with U+FFFD and serve a corrupted value as a 200.
+	if !utf8.ValidString(plaintext) {
+		h.logger.Warn("secret value refused as JSON: not valid UTF-8", "key", key, "version", resp.Version)
+		writeError(w, http.StatusNotAcceptable, "secret value is not valid UTF-8; request it with Accept: application/octet-stream")
 		return
 	}
 
