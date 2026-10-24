@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -830,6 +831,41 @@ func TestIsIngestTooLarge(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := IsIngestTooLarge(tt.err); got != tt.want {
 				t.Errorf("IsIngestTooLarge(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsSecretAccessRevoked(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"403 permission_denied", &APIError{StatusCode: 403, Code: "permission_denied"}, true},
+		{"403 without a code", &APIError{StatusCode: 403}, true},
+		{"404 secret_not_found", &APIError{StatusCode: 404, Code: "secret_not_found"}, true},
+		{"404 secret_version_not_found", &APIError{StatusCode: 404, Code: "secret_version_not_found"}, true},
+		{"404 without a code", &APIError{StatusCode: 404}, true},
+		{"wrapped 403", fmt.Errorf("fetch secret: %w", &APIError{StatusCode: 403, Code: "permission_denied"}), true},
+		// None of these says the grant is gone, so the cached token stays the fallback.
+		{"401 unauthorized", &APIError{StatusCode: 401, Code: "unauthorized"}, false},
+		{"429 per_node_rate_limited", &APIError{StatusCode: 429, Code: "per_node_rate_limited"}, false},
+		{"429 per_domain_rate_limited", &APIError{StatusCode: 429, Code: "per_domain_rate_limited"}, false},
+		{"500", &APIError{StatusCode: 500}, false},
+		{"501 secrets_not_provisioned", &APIError{StatusCode: 501, Code: "secrets_not_provisioned"}, false},
+		{"503 openbao_unavailable", &APIError{StatusCode: 503, Code: "openbao_unavailable"}, false},
+		{"503 authz_unavailable", &APIError{StatusCode: 503, Code: "authz_unavailable"}, false},
+		{"refused credential", fmt.Errorf("x: %w", ErrCredentialRefused), false},
+		{"invalid secret name", ErrSecretNameInvalid, false},
+		{"deadline exceeded", context.DeadlineExceeded, false},
+		{"non-API error", errors.New("dial tcp: connection refused"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsSecretAccessRevoked(tt.err); got != tt.want {
+				t.Errorf("IsSecretAccessRevoked(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}

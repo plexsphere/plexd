@@ -274,6 +274,16 @@ func IsIngestTooLarge(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusRequestEntityTooLarge
 }
 
+// IsSecretAccessRevoked reports whether err is the secret fetch's verdict that
+// the Node may not read the secret: a 403 (no read grant, or a revoked one) or
+// a 404 (no such Secret, or no value at the version read), with any problem
+// code or none. The local-endpoint reporters drop their cached bearer token on
+// it. Every other failure, including a 401, ErrCredentialRefused, a 429 and
+// any 5xx, says nothing about the grant and is not classified here.
+func IsSecretAccessRevoked(err error) bool {
+	return errors.Is(err, ErrForbidden) || errors.Is(err, ErrNotFound)
+}
+
 // maxErrorBody is the maximum number of bytes read from an error response body.
 const maxErrorBody = 4096
 
