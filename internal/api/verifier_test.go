@@ -6,26 +6,33 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
 
-// signEnvelope returns an envelope signed over its canonical bytes with priv,
-// carrying the given key id, issued_at and payload.
+// testDomainScope is the wire scope the test envelopes are signed under: the
+// Domain of the agent contract's worked example.
+const testDomainScope = "domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1"
+
+// signEnvelope returns an envelope signed the way the control plane signs one,
+// over the SHA-512 digest of its canonical bytes, with priv, carrying the given
+// key id, issued_at and payload under testDomainScope.
 func signEnvelope(t *testing.T, priv ed25519.PrivateKey, keyID string, issuedAt time.Time, payload json.RawMessage) Envelope {
 	t.Helper()
 	env := Envelope{
 		ID:       "evt-001",
 		Type:     "policy_updated",
+		Scope:    testDomainScope,
 		KeyID:    keyID,
 		IssuedAt: issuedAt,
 		Payload:  payload,
 	}
-	canonical, err := CanonicalBytes(env)
+	msg, err := SignedMessage(env)
 	if err != nil {
-		t.Fatalf("canonical bytes: %v", err)
+		t.Fatalf("signed message: %v", err)
 	}
-	env.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, canonical))
+	env.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, msg))
 	return env
 }
 
@@ -45,6 +52,45 @@ func TestEd25519Verifier_ValidSignature(t *testing.T) {
 	env := signEnvelope(t, priv, "kid-1", time.Now(), json.RawMessage(`{"peer_id":"node-1"}`))
 	if err := v.Verify(context.Background(), env); err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
+	}
+}
+
+// TestEd25519Verifier_SignsTheDigest pins what the signature covers: the
+// SHA-512 digest of the canonical bytes, not the bytes themselves. The payload
+// carries unsorted keys and a float so the canonical form has work to do.
+func TestEd25519Verifier_SignsTheDigest(t *testing.T) {
+	pub, priv := generateKey(t)
+	v := NewEd25519Verifier("kid-1", pub)
+	payload := json.RawMessage(`{"z":1.50,"a":{"y":[2,1],"b":"x"}}`)
+
+	env := signEnvelope(t, priv, "kid-1", time.Now(), payload)
+	if err := v.Verify(context.Background(), env); err != nil {
+		t.Fatalf("envelope signed over the digest: %v", err)
+	}
+
+	canonical, err := CanonicalBytes(env)
+	if err != nil {
+		t.Fatalf("canonical bytes: %v", err)
+	}
+	env.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(priv, canonical))
+	err = v.Verify(context.Background(), env)
+	if err == nil || err.Error() != "api: verifier: signature verification failed" {
+		t.Errorf("envelope signed over the raw canonical bytes: error = %v, want %q", err, "api: verifier: signature verification failed")
+	}
+}
+
+// TestEd25519Verifier_CanonicalFormError pins that an envelope plexd cannot
+// canonicalise is refused with its cause, not as a bad signature.
+func TestEd25519Verifier_CanonicalFormError(t *testing.T) {
+	pub, priv := generateKey(t)
+	v := NewEd25519Verifier("kid-1", pub)
+
+	env := signEnvelope(t, priv, "kid-1", time.Now(), json.RawMessage(`{}`))
+	env.Scope = "node"
+	err := v.Verify(context.Background(), env)
+	const prefix = "api: verifier: canonical form: api: envelope: canonical scope"
+	if err == nil || !strings.HasPrefix(err.Error(), prefix) {
+		t.Errorf("error = %v, want prefix %q", err, prefix)
 	}
 }
 

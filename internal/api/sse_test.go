@@ -38,6 +38,33 @@ func TestSSEParser_SingleLineEvent(t *testing.T) {
 	}
 }
 
+// TestSSEParser_AgentContractFrame feeds the agent contract's worked-example
+// frame through the parser: its signature: line is not a field the parser
+// knows and is ignored, and the data: line parses into the envelope whose
+// scope string and signature the canonical form and the verifier read.
+func TestSSEParser_AgentContractFrame(t *testing.T) {
+	input := "id: 1\nevent: policy_updated\ndata: " + contractExampleData + "\nsignature: " + contractExampleSignature + "\n\n"
+	parser := NewSSEParser(strings.NewReader(input))
+
+	evt, ok := parser.Next()
+	if !ok {
+		t.Fatal("expected an event, got none")
+	}
+	if evt.ID != "1" || evt.Type != "policy_updated" || evt.Data != contractExampleData {
+		t.Fatalf("event = %+v, want id 1, type policy_updated and the example data line", evt)
+	}
+	env, err := ParseEnvelope([]byte(evt.Data))
+	if err != nil {
+		t.Fatalf("ParseEnvelope: %v", err)
+	}
+	if env.Scope != "domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1" {
+		t.Errorf("Scope = %q, want the wire string", env.Scope)
+	}
+	if env.Signature != contractExampleSignature {
+		t.Errorf("Signature = %q, want %q", env.Signature, contractExampleSignature)
+	}
+}
+
 func TestSSEParser_MultiLineData(t *testing.T) {
 	input := "data: line1\ndata: line2\n\n"
 	parser := NewSSEParser(strings.NewReader(input))
