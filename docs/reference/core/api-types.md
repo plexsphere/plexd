@@ -110,7 +110,7 @@ never serialized on its own.
 
 The desired-state envelope. Every block key is **always present on the wire**: a
 `null` value means "block not populated", never "field absent", so the differ
-distinguishes a nil pointer from a populated block. None of the eight fields carry
+distinguishes a nil pointer from a populated block. None of the nine fields carry
 `omitempty`.
 
 | Field          | Type                   | JSON Tag         | Description                                              |
@@ -123,14 +123,17 @@ distinguishes a nil pointer from a populated block. None of the eight fields car
 | `Reports`      | `*NodeStateBlock`      | `"reports"`      | Mirrors `state` today (forward-compat split)           |
 | `Executions`   | `[]NodeStateExecution` | `"executions"`   | Pending action dispatches; `[]` when empty, never `null` |
 | `Sessions`     | `*[]NodeStateSession`  | `"sessions"`     | Live mediated-access sessions; `[]` when empty, never `null` on the wire. A pointer, like the block fields above: a `nil` value is a block the control plane did **not** populate, which is not a teardown signal |
+| `SigningKey`   | `*NodeStateSigningKey` | `"signing_key"`  | The key the node's Domain signs envelopes and session tokens with. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) means "keep the key you hold", never "drop it" |
 
-Three members are consumed on the dispatch seam rather than by the differ.
+Four members are consumed on the dispatch seam rather than by the differ.
 `executions` is not desired state at all — it is a delivery queue, documented
 under [Executions](#executions) below. `sessions` *is* desired state, but state
 the tunnel dispatcher converges on itself, documented under
 [Sessions](#sessions) below. `reachability` is not state to converge on either:
 the reachability observer decodes it leniently and logs the verdict when it
-changes. `peers` goes to both: the differ drives the WireGuard reconcile handler
+changes. `signing_key` has nothing to converge on: the first dispatch handler
+installs and persists it (see `NodeStateSigningKey` below).
+`peers` goes to both: the differ drives the WireGuard reconcile handler
 from it, and the edge PSK store reads it on the dispatch seam.
 
 **SnapshotPeer**
@@ -247,6 +250,23 @@ unattributed.
 | `Key`         | `string` | `"key"`                     | Entry key               |
 | `Value`       | `string` | `"value"`                   | Opaque string value     |
 | `WorkloadTag` | `string` | `"workload_tag,omitempty"`  | Owning workload, if any |
+
+**NodeStateSigningKey**
+
+The interior of the `signing_key` block: the Domain signing key as the "Domain
+signing key" section of plexsphere's agent contract
+(`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
+describes it, in the encodings `POST /v1/register` uses for `signing_key_id` and
+`signing_public_key`. plexd installs the key every successful pull carries into
+the verifier that checks event envelopes and ssh session tokens (a key whose id
+or bytes differ from the current pair replaces it and drops any rotation grace
+entry), and writes a key that differs from the persisted pair to the
+`signing_public_key` file and `identity.json`, so a restart starts from it.
+
+| Field       | Type     | JSON Tag       | Description                                         |
+|-------------|----------|----------------|-----------------------------------------------------|
+| `KeyID`     | `string` | `"key_id"`     | Id the key signs under; plexd rejects an empty one  |
+| `PublicKey` | `string` | `"public_key"` | 32-byte Ed25519 public key in standard base64; plexd rejects any other length |
 
 ### Supporting types
 
@@ -998,7 +1018,7 @@ Returns `text/event-stream` with signed event envelopes.
 | `KeyID`     | `string`          | `"key_id"`     | Key id that selects the verifying signing key |
 | `IssuedAt`  | `time.Time`       | `"issued_at"`  | Event timestamp                               |
 | `Payload`   | `json.RawMessage` | `"payload"`    | Event-specific JSON payload                   |
-| `Signature` | `string`          | `"signature"`  | Base64 Ed25519 signature over the canonical form |
+| `Signature` | `string`          | `"signature"`  | Base64 Ed25519 signature over the SHA-512 digest of the canonical form |
 
 `ParseEnvelope` requires `id` and `type`. See [Event Verification](event-verification.md)
 for the canonical form and signature rules.

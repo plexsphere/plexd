@@ -59,7 +59,7 @@ after registration via `PUT /v1/nodes/{node_id}/capabilities`.
 {
   "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3",
   "mesh_ip": "100.64.0.1",
-  "signing_public_key": "MCowBQYDK2VwAyEA0123456789abcdefghijklmnopqrstuvwxyz0123=",
+  "signing_public_key": "PUAXw+hDiVqStwqnTRt+vJyYLM8uxJaMwM1V8Sr0Zgw=",
   "signing_key_id": "did:web:plexsphere.com#key-2026-04",
   "nsk": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
   "peer_snapshot": [],
@@ -114,7 +114,7 @@ Long-lived SSE connection. Supports `Last-Event-ID` header for replay after reco
 | `session_setup` | Opaque; triggers a reconcile — the session itself rides the `sessions` block of the state pull |
 | `session_revoked` | Opaque; triggers a reconcile — the session leaving the `sessions` block is what tears it down |
 | `rotate_keys` | Key rotation trigger |
-| `signing_key_rotated` | New signing public key, valid_from, transition period |
+| `signing_key_rotated` | New signing key (`key_id`, `public_key`), `previous_key_id`, `transition_expires`. The state pull's `signing_key` block also carries the key (see [`GET /v1/nodes/{node_id}/state`](#get-v1-nodes-node-id-state)) |
 | `node_state_updated` | Updated metadata and data entries |
 | `node_secrets_updated` | Updated secret names and versions (never values) |
 
@@ -710,7 +710,11 @@ absence.
       "expires_at": "2026-01-01T01:00:00Z",
       "idle_timeout_seconds": 900
     }
-  ]
+  ],
+  "signing_key": {
+    "key_id": "signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1-1767225600000000000",
+    "public_key": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+  }
 }
 ```
 
@@ -787,6 +791,33 @@ opaquely; `expires_at` is an absolute UTC timestamp; `idle_timeout_seconds` abse
 or `0` means the session has no idle window. See
 [Secure Access Tunneling](/reference/networking/secure-access-tunneling) for how
 plexd consumes it.
+
+`signing_key` is the key the node's Domain signs event envelopes and session
+tokens with, as the "Domain signing key" section of plexsphere's agent contract
+(`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
+describes it. `key_id` is the id the key signs under and `public_key` is the
+32-byte Ed25519 public key in standard base64, the encodings `POST /v1/register`
+uses for `signing_key_id` and `signing_public_key`. The block is `null` when the
+control plane cannot say: the Domain has no key yet, or the control plane could
+not reach its Signing Service. plexd then keeps the key it holds, as it does when
+a control plane older than the block leaves the key out; `null` never means
+"drop the key". plexd reads the block on every successful pull, drift or
+not. A key that differs from the one it holds goes into the verifier that checks
+both [event envelopes](event-verification.md) and ssh session tokens, replaces
+the current key and ends any rotation grace window, since a node trusts exactly
+one key of its Domain. plexd logs it at Info as
+`installed signing key from state pull` with `key_id` and `public_key`. A pulled
+key that differs from the pair plexd persisted is written into the
+`signing_public_key` file and `identity.json` (see
+[Key Storage](key-storage.md#ed25519-signing-public-key)), so a restart starts
+from it. A failed write is logged at Warn as
+`signing key not persisted; retrying on the next pull` and retried on every
+pull. A key plexd cannot install (an empty `key_id`, or a `public_key` that is
+not 32 bytes of standard base64) changes nothing and is logged at Warn as
+`signing key from state pull rejected` once, and not again until a pull carries
+a different key. The block is not desired state: the differ neither stores nor
+compares it. A Linux session helper that already pinned a key keeps its pin; see
+[Trust anchor](../networking/secure-access-tunneling.md#trust-anchor).
 
 ## Secrets
 

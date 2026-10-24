@@ -10,9 +10,11 @@ The `internal/reconcile` package implements the core convergence loop that keeps
 
 The pull is one-way: plexd does not report drift corrections back to the control plane. `POST /v1/nodes/{node_id}/drift` no longer exists. Applied-correction visibility will return as node-authored state reports (issue #23).
 
-The envelope carries eight always-present blocks — `peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`, and `sessions`. A `null` block means "not populated" rather than "field absent", so the differ compares by presence: a `null` block and a populated block are distinct states, and switching between them drives convergence.
+The envelope carries nine always-present blocks — `peers`, `reachability`, `policy`, `bridge`, `state`, `reports`, `executions`, `sessions`, and `signing_key`. A `null` block means "not populated" rather than "field absent", so the differ compares by presence: a `null` block and a populated block are distinct states, and switching between them drives convergence.
 
 `executions` and `sessions` are the exceptions: both are consumed by the dispatch stage on every successful pull and neither is stored in the local snapshot nor diffed. `executions` is a delivery queue rather than desired state; `sessions` is desired state, but state the tunnel dispatcher converges on itself rather than through the differ.
+
+`signing_key` is consumed by the dispatch stage too, and is not desired state at all: it is the key the node's Domain signs envelopes and session tokens with, and the signing-key dispatch handler installs it on every successful pull. It is neither stored nor diffed. A `null` block means "keep the key you hold", never "drop it".
 
 ## Config
 
@@ -65,6 +67,8 @@ They return nothing: a dispatch problem is the handler's own to report and never
 Two blocks are consumed on this seam. `executions` is a delivery queue: `actions.Dispatcher.Handle` redelivers each entry until its execution settles through the callback. `sessions` is desired state rather than a queue — an entry stands for as long as its session is valid, and its disappearance is the teardown signal — but `tunnel.Dispatcher.Handle` converges it here rather than behind the diff, because an entry a transient failure left unprovisioned has to be retried on the next pull whether or not the snapshot moved.
 
 The [edge PSK store](../networking/wireguard.md#edge-psks) also runs on this seam, through `wireguard.EdgePSKDispatchHandler`, when the WireGuard interface came up, `wireguard.edge_psk` is not `false` and the node secret key decodes. It reads the `peers` block, which the differ sees as well, and fetches the edge PSK of a peer that first appears, of a peer whose `public_key` changed, and of every peer after this node's own key rotation. It runs here rather than behind the diff so that a failed fetch retries on every pull, drift or not, without failing the WireGuard reconcile handler and holding the snapshot back: the store logs the failure and retries on the next pull. Because dispatch handlers run before the reconcile handlers, a new peer's PSK is fetched before the WireGuard handler adds the peer in the same cycle.
+
+The `signing_key` block is also consumed on this seam, by `signingKeyDispatchHandler` in `cmd/plexd/cmd/up.go`. It is registered first among the dispatch handlers, so the rest of the cycle already runs under the key the pull carried. A `null` block keeps the installed key and logs `state pull carried no signing key; keeping the installed one` at debug. Any other block goes to `api.Ed25519Verifier.Install` on the verifier that checks envelopes and ssh session tokens. A key `Install` refuses changes nothing and logs `signing key from state pull rejected` at warn (with `key_id` and `error`), once until a pull carries a different key. A new key logs `installed signing key from state pull` at info with `key_id` and `public_key`; that `public_key` is the value an operator sets as `tunnel.session_signing_public_key` for a session helper that pinned the previous key. A pulled key that differs from the pair the identity files hold is written there with `registration.CommitSigningKey`, so a restart seeds the verifier from it. A failed write logs `signing key not persisted; retrying on the next pull` at warn (with `key_id` and `error`) and is retried on every pull.
 
 ## Reconciler
 
@@ -208,7 +212,7 @@ Comparison logic by block:
 | State   | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
 | Reports | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
 
-The policy `Fingerprint` is a 44-char base64 SHA-256 that the server computes over its canonical rule stream. plexd treats it as an opaque comparison key and **never re-derives it from the rules**: a revision-only bump (same fingerprint, new `revision_id`) or any rule-array difference that keeps the fingerprint equal is **not** a change, so the ruleset rebuild short-circuits. `reachability` is the control plane's verdict about this node, not desired state, so it is never diffed or stored — the reachability observer decodes it on every successful pull and logs the verdict when it changes, and that is the whole of what plexd does with it. `executions` is a delivery queue whose entries are consumed once by the dispatch stage and settled through the execution callback, not converged on, so it too is never diffed or stored — there is no `ExecutionsChanged` flag, and a pull carrying only new executions still reports an empty diff.
+The policy `Fingerprint` is a 44-char base64 SHA-256 that the server computes over its canonical rule stream. plexd treats it as an opaque comparison key and **never re-derives it from the rules**: a revision-only bump (same fingerprint, new `revision_id`) or any rule-array difference that keeps the fingerprint equal is **not** a change, so the ruleset rebuild short-circuits. `reachability` is the control plane's verdict about this node, not desired state, so it is never diffed or stored — the reachability observer decodes it on every successful pull and logs the verdict when it changes, and that is the whole of what plexd does with it. `executions` is a delivery queue whose entries are consumed once by the dispatch stage and settled through the execution callback, not converged on, so it too is never diffed or stored — there is no `ExecutionsChanged` flag, and a pull carrying only new executions still reports an empty diff. `signing_key` is not desired state either, so it is never diffed or stored: there is no `SigningKeyChanged` flag, the signing-key dispatch handler installs the key on every successful pull, and a pull whose only change is a new key reports an empty diff.
 
 ### Summary
 
@@ -236,7 +240,7 @@ In-memory cache of the last known desired state, protected by `sync.RWMutex`.
 | `Get() api.NodeStateSnapshot`                  | Returns a deep copy of the current snapshot     |
 | `Update(desired *api.NodeStateSnapshot)`       | Atomically replaces all blocks (deep copy)      |
 
-All methods deep-copy data to prevent aliasing between snapshot and caller. `reachability` is not desired state, so `Get` always returns it as `nil` and `Update` never stores it; the reachability observer has already read and logged the block on the dispatch seam by the time `Update` runs. The same holds for `executions`: the dispatch stage has already consumed the block by the time `Update` runs, and storing it would make a redelivered entry look like drift.
+All methods deep-copy data to prevent aliasing between snapshot and caller. `reachability` is not desired state, so `Get` always returns it as `nil` and `Update` never stores it; the reachability observer has already read and logged the block on the dispatch seam by the time `Update` runs. The same holds for `executions`: the dispatch stage has already consumed the block by the time `Update` runs, and storing it would make a redelivered entry look like drift. `signing_key` is not desired state either: `Get` always returns it as `nil` and `Update` never stores it, because the signing-key dispatch handler has already consumed the block by the time `Update` runs and the differ has nothing to converge on.
 
 > Drift reporting has been removed. There is no `BuildDriftReport`, `DriftReport`, or `DriftCorrection`, and `POST /v1/nodes/{node_id}/drift` does not exist upstream. Node-authored state reports (issue #23) will carry applied-correction visibility instead.
 
@@ -273,12 +277,13 @@ The agent registers these handlers (in `cmd/plexd/cmd/up.go`):
 | `policy.ReconcileHandler`        | Rebuild the nftables ruleset from the merged `policy` block on a fingerprint change |
 | bridge sub-handlers              | Reconcile relay, user-access, ingress, and site-to-site subtrees      |
 
-Signing-key rotation is no longer a reconcile handler: key material comes from registration and the `signing_key_rotated` SSE event.
+Signing-key rotation is no longer a reconcile handler. Key material comes from registration, from the pull's `signing_key` block through the signing-key dispatch handler below, and from the `signing_key_rotated` SSE event.
 
 ### Registered Dispatch Handlers
 
 | Handler                    | Responsibility                                                     |
 |----------------------------|--------------------------------------------------------------------|
+| `signingKeyDispatchHandler` | Install the pull's `signing_key` into the verifier that checks envelopes and ssh session tokens, and persist it into the identity files (registered first among the dispatch handlers; see [DispatchHandler](#dispatchhandler)) |
 | `actions.Dispatcher.Handle`| Turn each entry of the `executions` block into an action execution |
 | `wireguard.EdgePSKDispatchHandler` | Fetch, open and install the edge PSKs the `peers` block makes due (registered only when the WireGuard interface came up, `wireguard.edge_psk` is not `false` and the node secret key decodes) |
 

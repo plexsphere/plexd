@@ -15,7 +15,7 @@ The test runs fourteen phases:
 3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously), then a handshake report and a `tunnel_health` sample for a fixture peer when WireGuard came up in the container (script phase `4b`), an edge PSK fetch for each fixture peer under the same condition (script phase `4c`), and an endpoint candidates report and an endpoint selection switch on a fixture peer under the same condition (script phase `4d`)
 4. **Log injection** — injects a log file via `docker cp`, verifies logs_count increases (FileSource pipeline works)
 5. **Agent restart for audit** — restarts the plexd container and verifies `local_audit_count` increases (ProcessSource fires per-process). The platform leg carries nothing: plexd's own `process` source is outside the ingest contract's closed enum (`auditd`, `k8s`), so `audit_count` must stay at 0.
-6. **SSE event injection** — injects a `node_state_updated` event and verifies state_count increases (proves SSE stream is connected)
+6. **SSE event injection** — injects a `node_state_updated` event and verifies state_count increases (proves SSE stream is connected), then switches the mock to a new signing key and verifies that a pull installs it, that an event signed with it is dispatched, and that plexd starts from the persisted key after a restart (script phase `7c`)
 7. **Session lifecycle from the state pull** — splices a `tcp` entry into the snapshot's `sessions` block and verifies a `session_started` activity row carrying `listener_endpoint`, then re-posts the snapshot **without** the entry: the `session_ended` row the drain produces is answered `409 session_already_revoked`, so the test verifies `session_activity_rejected_count` advances by 1 while `session_activity_count` stays at the started leg's +1, and that the captured row still carries `plexd_close` and numeric byte counters; a second entry carrying `idle_timeout_seconds` verifies the idle window closes a session on its own with `idle_timeout`
 8. **Session events as pull triggers** — injects `session_setup` and `session_revoked` envelopes with opaque payloads, verifies each advances `state_count` while leaving `session_activity_count` unchanged
 9. **Convergence cycle** — posts a mutated `NodeStateSnapshot` envelope via `/test/configure-state`, verifies `state_count` advances AND a reconcile cycle reports `policy` drift
@@ -165,6 +165,18 @@ That entry travels to the local endpoint only. Its source is plexd's own `proces
 
 Injects a `node_state_updated` event via `POST /test/inject-event` and verifies that `state_count` increases, proving the SSE stream is connected and event-driven reconciliation works.
 
+### Phase 6 (cont.): Signing Key from the State Pull
+
+Runs as script phase `7c` and covers a node that holds a signing key its Domain no longer signs with, which learns the Domain key only from the state pull's `signing_key` block (see [Key from the state pull](../core/event-verification.md#key-from-the-state-pull)). Every check fails the suite; none is a soft warning.
+
+1. `POST /test/rotate-signing-key` switches the mock to a fresh key and answers with its `key_id`. From then on the mock signs every envelope with that key and every pull carries it; plexd still holds the key it registered with.
+2. The phase posts the mock's default heartbeat response, `{"reconcile":true,"rotate_keys":false}`, so the next heartbeat triggers a pull, and leaves it in place for the later phases. It then polls the plexd log for up to 60 seconds for an `installed signing key from state pull` line naming the new key id.
+3. It injects `node_state_updated` event `evt-e2e-sigkey-001`, signed with the new key, and requires `state_count` to rise within 15 seconds with no `event verification failed` line naming the event.
+4. It reads `/var/lib/plexd/identity.json` from the container with `head` and requires `"signing_key_id"` to hold the new key id: plexd persisted the key.
+5. It restarts the plexd container and waits up to 60 seconds until `events_request_count` has risen, so the restarted agent opened its event stream, and `state_count` has risen after that. It requires that `registration_count` did not move and that the log gained an `existing identity loaded` line: the restarted agent resumed the identity it persisted, since a new registration would hand it the mock's current key and prove nothing. It then injects `evt-e2e-sigkey-002` and requires the same rise and no verification failure, and requires that the log still holds exactly one `installed signing key from state pull` line for the key: the restarted process started from the persisted key and had nothing to install.
+
+Like phase `4b`, the phase reads the plexd log into a variable and matches lines with `case`, never with `grep -q` in a pipeline.
+
 ### Phase 7: Session Lifecycle from the State Pull
 
 Drives the whole mediated-access lifecycle through the `sessions` block (script phase `8e`). Splicing a `tcp` entry with a future `expires_at` into that block provisions a listener: the test polls `session_activity_count` to +1 and asserts the captured row carries `tcp.phase = session_started`, the configured `target_host` / `target_port`, and a non-empty `host:port` `listener_endpoint` — the address the listener actually bound. Re-posting the snapshot with an empty `sessions` array is the teardown signal. The `session_ended` row is posted for a session the mock holds as revoked, so it is answered `409 session_already_revoked`: the leg polls `session_activity_rejected_count` to +1 and asserts `session_activity_count` stayed at the started leg's +1, because a refused row is not counted as accepted. The captured-row assertions still hold, since the mock captures the body before validation: the row is `session_ended` with `terminated_by = plexd_close` and `bytes_in` / `bytes_out` present as numbers. The node cannot tell a revocation from a control plane that failed to serve the block, so it never claims `operator_revoke`, and it logs the `409` at Warn, carrying the byte counters the refused row failed to deliver. There is no revocation endpoint and no teardown event; the drain is the whole mechanism.
@@ -222,7 +234,7 @@ The container receives configuration from three sources:
 | CLI flag `--api` | `http://mock-api:8080` | Overrides API base URL (redundant with config, belt-and-suspenders) |
 | Env var `PLEXD_BOOTSTRAP_TOKEN` | `e2e-test-token` | Bootstrap token for registration |
 
-A `tmpfs` mount at `/var/lib/plexd` provides a writable data directory.
+An anonymous volume at `/var/lib/plexd` provides a writable data directory that survives `dc restart plexd`, as the data directory of a real node survives a reboot: a restarted agent resumes the identity it persisted rather than registering again. `dc down -v` removes the volume. `/var/run/plexd` is a `tmpfs` mount.
 
 ## Usage
 
