@@ -1,6 +1,7 @@
 package nodeapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -909,19 +910,24 @@ func TestServer_PublishReport(t *testing.T) {
 }
 
 // TestServer_SecretProxy exercises the secret proxy endpoint: successful
-// decrypt, 503 on control plane failure, and 404 on ErrNotFound.
+// decrypt, 503 on control plane failure, 404 on ErrNotFound, and a binary
+// value served intact as octet-stream and refused as JSON.
 func TestServer_SecretProxy(t *testing.T) {
 	defer verifyNoLeaks(t)
 
 	nsk := testKey(t)
 	secretPlaintext := "super-secret-password"
 	envelope := testEncrypt(t, nsk, secretPlaintext)
+	keystore := []byte("\x30\x82\xff\xfe\x00\x80keystore")
+	keystoreEnvelope := testEncrypt(t, nsk, string(keystore))
 
 	client := &configurableTestClient{
 		fetchSecret: func(_ context.Context, nodeID, name string, version int) (*api.SecretEnvelope, error) {
 			switch name {
 			case "db-password":
 				return &api.SecretEnvelope{Data: envelope, Version: 3}, nil
+			case "keystore":
+				return &api.SecretEnvelope{Data: keystoreEnvelope, Version: 5}, nil
 			case "missing-key":
 				return nil, api.ErrNotFound
 			default:
@@ -999,6 +1005,41 @@ func TestServer_SecretProxy(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("GET unreachable secret status = %d, want 503", resp.StatusCode)
+	}
+
+	// Test 4: A binary value read as octet-stream arrives byte for byte.
+	req, err := http.NewRequest(http.MethodGet, "http://unix/v1/state/secrets/keystore", nil)
+	if err != nil {
+		cancel()
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Accept", "application/octet-stream")
+	resp, err = httpClient.Do(req)
+	if err != nil {
+		cancel()
+		t.Fatalf("GET keystore as octet-stream: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET keystore as octet-stream status = %d, want 200", resp.StatusCode)
+	}
+	if !bytes.Equal(body, keystore) {
+		t.Errorf("keystore body = %x, want %x", body, keystore)
+	}
+	if got := resp.Header.Get("X-Plexd-Secret-Version"); got != "5" {
+		t.Errorf("keystore X-Plexd-Secret-Version = %q, want %q", got, "5")
+	}
+
+	// Test 5: The same value requested as JSON is refused, not mangled.
+	resp, err = httpClient.Get("http://unix/v1/state/secrets/keystore")
+	if err != nil {
+		cancel()
+		t.Fatalf("GET keystore as JSON: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotAcceptable {
+		t.Errorf("GET keystore as JSON status = %d, want 406", resp.StatusCode)
 	}
 
 	cancel()

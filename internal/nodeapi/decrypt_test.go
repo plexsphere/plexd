@@ -1,6 +1,7 @@
 package nodeapi
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -48,6 +49,22 @@ func TestDecryptSecret_Success(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("DecryptSecret() = %q, want %q", got, want)
+	}
+}
+
+func TestDecryptSecret_PreservesNonUTF8Bytes(t *testing.T) {
+	// The node API serves the returned string as a raw body, so the
+	// conversion from the decrypted bytes must not touch invalid UTF-8.
+	key := testKey(t)
+	want := []byte{0xff, 0xfe, 0x00, 0x80, 0xc3}
+	envelope := testEncrypt(t, key, string(want))
+
+	got, err := DecryptSecret(key, envelope)
+	if err != nil {
+		t.Fatalf("DecryptSecret() error = %v, want nil", err)
+	}
+	if !bytes.Equal([]byte(got), want) {
+		t.Errorf("DecryptSecret() = %x, want %x", got, want)
 	}
 }
 
