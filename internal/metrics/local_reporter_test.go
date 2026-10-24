@@ -893,3 +893,262 @@ func TestLocalReporter_ServerClosesConnectionMidResponse(t *testing.T) {
 		t.Fatal("expected error when server closes connection")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Revoked credentials
+// ---------------------------------------------------------------------------
+
+// postRecorder is a local endpoint that records the Authorization header of
+// every POST it receives.
+type postRecorder struct {
+	mu    sync.Mutex
+	auths []string
+}
+
+func (p *postRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.mu.Lock()
+	p.auths = append(p.auths, r.Header.Get("Authorization"))
+	p.mu.Unlock()
+	w.WriteHeader(http.StatusOK)
+}
+
+func (p *postRecorder) got() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.auths...)
+}
+
+// dropRecords returns the captured "dropping revoked credential" records.
+func dropRecords(ch *capturingHandler) []slog.Record {
+	var out []slog.Record
+	for _, r := range ch.getRecords() {
+		if r.Message == "dropping revoked credential" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestLocalReporter_DropsCachedCredentialOnRevocation pins that a 403 or 404
+// from the secret fetch drops the cached token instead of falling back to it:
+// the send fails without a POST, the drop is logged once, and every later send
+// fetches again.
+func TestLocalReporter_DropsCachedCredentialOnRevocation(t *testing.T) {
+	// The fetch answers that say the Node may no longer read the secret,
+	// each with the sentinel the send's error must match.
+	cases := []struct {
+		name   string
+		err    error
+		target error
+	}{
+		{"403 permission_denied", &api.APIError{StatusCode: 403, Code: "permission_denied"}, api.ErrForbidden},
+		{"403 without a code", &api.APIError{StatusCode: 403}, api.ErrForbidden},
+		{"404 secret_not_found", &api.APIError{StatusCode: 404, Code: "secret_not_found"}, api.ErrNotFound},
+		{"404 secret_version_not_found", &api.APIError{StatusCode: 404, Code: "secret_version_not_found"}, api.ErrNotFound},
+		{"wrapped 403", fmt.Errorf("fetch: %w", &api.APIError{StatusCode: 403, Code: "permission_denied"}), api.ErrForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint := &postRecorder{}
+			fetcher := newTestFetcher("cached-tok")
+			fetcher.failAfter = 1
+			fetcher.failErr = tc.err
+
+			ch := &capturingHandler{}
+			srv, reporter := newTestReporter(t, endpoint, fetcher)
+			defer srv.Close()
+			reporter.logger = slog.New(ch)
+			// A zero TTL makes every call fetch again, so the second call
+			// takes the fetch-error branch with the token the first cached.
+			reporter.cacheTTL = 0
+
+			batch := api.MetricBatch{{Timestamp: time.Now(), Group: GroupSystem, Data: json.RawMessage(`{}`)}}
+			if err := reporter.ReportMetrics(context.Background(), "node-1", batch); err != nil {
+				t.Fatalf("first call: %v", err)
+			}
+
+			err := reporter.ReportMetrics(context.Background(), "node-1", batch)
+			if !errors.Is(err, tc.target) {
+				t.Fatalf("second call error = %v, want one matching %v", err, tc.target)
+			}
+			if !strings.Contains(err.Error(), "metrics: fetch secret:") {
+				t.Errorf("error = %q, want metrics: fetch secret prefix", err.Error())
+			}
+			if got := endpoint.got(); len(got) != 1 {
+				t.Fatalf("POSTs = %q, want only the first call's", got)
+			}
+
+			drops := dropRecords(ch)
+			if len(drops) != 1 {
+				t.Fatalf("%q records = %d, want 1", "dropping revoked credential", len(drops))
+			}
+			if drops[0].Level != slog.LevelWarn {
+				t.Errorf("drop level = %v, want WARN", drops[0].Level)
+			}
+			attrs := map[string]string{}
+			drops[0].Attrs(func(a slog.Attr) bool {
+				attrs[a.Key] = fmt.Sprintf("%v", a.Value)
+				return true
+			})
+			if attrs["component"] != "metrics" {
+				t.Errorf("drop component = %q, want metrics", attrs["component"])
+			}
+			if _, ok := attrs["error"]; !ok {
+				t.Error("drop record carries no error attribute")
+			}
+
+			for _, r := range ch.getRecords() {
+				if r.Message == "using cached credential" {
+					t.Errorf("unexpected %q record at %v", r.Message, r.Level)
+				}
+				if strings.Contains(r.Message, "cached-tok") {
+					t.Errorf("log message contains the token: %q", r.Message)
+				}
+				r.Attrs(func(a slog.Attr) bool {
+					if strings.Contains(fmt.Sprintf("%v", a.Value), "cached-tok") {
+						t.Errorf("log attr %q contains the token", a.Key)
+					}
+					return true
+				})
+			}
+
+			// The cache stays empty: the next send fetches again and fails
+			// the same way, without a second drop.
+			err = reporter.ReportMetrics(context.Background(), "node-1", batch)
+			if !errors.Is(err, tc.target) {
+				t.Fatalf("third call error = %v, want one matching %v", err, tc.target)
+			}
+			if fetcher.callCount() != 3 {
+				t.Errorf("FetchSecret calls = %d, want 3", fetcher.callCount())
+			}
+			if got := endpoint.got(); len(got) != 1 {
+				t.Errorf("POSTs = %q, want only the first call's", got)
+			}
+			if n := len(dropRecords(ch)); n != 1 {
+				t.Errorf("%q records = %d, want still 1", "dropping revoked credential", n)
+			}
+		})
+	}
+}
+
+// TestLocalReporter_ResumesAfterRevocationOnSuccessfulFetch pins that once a
+// revocation dropped the token, the first fetch that succeeds again restores
+// forwarding with the token it returned.
+func TestLocalReporter_ResumesAfterRevocationOnSuccessfulFetch(t *testing.T) {
+	endpoint := &postRecorder{}
+	fetcher := newTestFetcher("cached-tok")
+	fetcher.failAfter = 1
+	fetcher.failErr = &api.APIError{StatusCode: 403, Code: "permission_denied"}
+
+	srv, reporter := newTestReporter(t, endpoint, fetcher)
+	defer srv.Close()
+	reporter.cacheTTL = 0
+
+	batch := api.MetricBatch{{Timestamp: time.Now(), Group: GroupSystem, Data: json.RawMessage(`{}`)}}
+	if err := reporter.ReportMetrics(context.Background(), "node-1", batch); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if err := reporter.ReportMetrics(context.Background(), "node-1", batch); !errors.Is(err, api.ErrForbidden) {
+		t.Fatalf("revoked call error = %v, want one matching api.ErrForbidden", err)
+	}
+
+	// The grant is restored, and the fetch serves a new version.
+	fetcher.mu.Lock()
+	fetcher.failAfter = 0
+	fetcher.failErr = nil
+	fetcher.resp = &api.SecretEnvelope{Data: encryptTestSecret(testNSK(), "regranted-tok"), Version: 2}
+	fetcher.mu.Unlock()
+
+	if err := reporter.ReportMetrics(context.Background(), "node-1", batch); err != nil {
+		t.Fatalf("call after the grant was restored: %v", err)
+	}
+	want := []string{"Bearer cached-tok", "Bearer regranted-tok"}
+	if got := endpoint.got(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("Authorization headers = %q, want %q", got, want)
+	}
+}
+
+// TestLocalReporter_RevocationWithoutCacheReturnsError pins that a 403 with
+// nothing cached fails every send, fetching again each time, and logs no drop.
+func TestLocalReporter_RevocationWithoutCacheReturnsError(t *testing.T) {
+	endpoint := &postRecorder{}
+	fetcher := &mockSecretFetcher{err: &api.APIError{StatusCode: 403, Code: "permission_denied"}}
+
+	ch := &capturingHandler{}
+	srv, reporter := newTestReporter(t, endpoint, fetcher)
+	defer srv.Close()
+	reporter.logger = slog.New(ch)
+	reporter.cacheTTL = 0
+
+	batch := api.MetricBatch{{Timestamp: time.Now(), Group: GroupSystem, Data: json.RawMessage(`{}`)}}
+	for i := 0; i < 2; i++ {
+		if err := reporter.ReportMetrics(context.Background(), "node-1", batch); !errors.Is(err, api.ErrForbidden) {
+			t.Fatalf("call %d error = %v, want one matching api.ErrForbidden", i+1, err)
+		}
+	}
+	if fetcher.callCount() != 2 {
+		t.Errorf("FetchSecret calls = %d, want 2", fetcher.callCount())
+	}
+	if got := endpoint.got(); len(got) != 0 {
+		t.Errorf("POSTs = %q, want none", got)
+	}
+	if n := len(dropRecords(ch)); n != 0 {
+		t.Errorf("%q records = %d, want 0", "dropping revoked credential", n)
+	}
+}
+
+// TestLocalReporter_KeepsCachedCredentialOnNonRevocationFetchError pins that a
+// fetch failure that says nothing about the grant still falls back to the
+// cached token.
+func TestLocalReporter_KeepsCachedCredentialOnNonRevocationFetchError(t *testing.T) {
+	// Fetch failures that say nothing about the grant, each with the level
+	// the fallback to the cached token is logged at.
+	cases := []struct {
+		name  string
+		err   error
+		level slog.Level
+	}{
+		{"401 unauthorized", &api.APIError{StatusCode: 401, Code: "unauthorized"}, slog.LevelWarn},
+		{"refused credential", fmt.Errorf("x: %w", api.ErrCredentialRefused), slog.LevelDebug},
+		{"429 per_node_rate_limited", &api.APIError{StatusCode: 429, Code: "per_node_rate_limited", RetryAfter: 7 * time.Second}, slog.LevelWarn},
+		{"500", &api.APIError{StatusCode: 500}, slog.LevelWarn},
+		{"501 secrets_not_provisioned", &api.APIError{StatusCode: 501, Code: "secrets_not_provisioned"}, slog.LevelWarn},
+		{"503 openbao_unavailable", &api.APIError{StatusCode: 503, Code: "openbao_unavailable"}, slog.LevelWarn},
+		{"503 authz_unavailable", &api.APIError{StatusCode: 503, Code: "authz_unavailable"}, slog.LevelWarn},
+		{"deadline exceeded", context.DeadlineExceeded, slog.LevelWarn},
+		{"transport error", errors.New("dial tcp: connection refused"), slog.LevelWarn},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint := &postRecorder{}
+			fetcher := newTestFetcher("cached-tok")
+			fetcher.failAfter = 1
+			fetcher.failErr = tc.err
+
+			ch := &capturingHandler{}
+			srv, reporter := newTestReporter(t, endpoint, fetcher)
+			defer srv.Close()
+			reporter.logger = slog.New(ch)
+			reporter.cacheTTL = 0
+
+			batch := api.MetricBatch{{Timestamp: time.Now(), Group: GroupSystem, Data: json.RawMessage(`{}`)}}
+			if err := reporter.ReportMetrics(context.Background(), "node-1", batch); err != nil {
+				t.Fatalf("first call: %v", err)
+			}
+			if err := reporter.ReportMetrics(context.Background(), "node-1", batch); err != nil {
+				t.Fatalf("fallback call: %v", err)
+			}
+
+			want := []string{"Bearer cached-tok", "Bearer cached-tok"}
+			if got := endpoint.got(); strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Errorf("Authorization headers = %q, want %q", got, want)
+			}
+			if n := countLog(ch, tc.level, "using cached credential"); n != 1 {
+				t.Errorf("%s records %q = %d, want 1", tc.level, "using cached credential", n)
+			}
+			if n := len(dropRecords(ch)); n != 0 {
+				t.Errorf("%q records = %d, want 0", "dropping revoked credential", n)
+			}
+		})
+	}
+}
