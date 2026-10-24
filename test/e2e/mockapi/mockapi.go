@@ -161,8 +161,13 @@ type Server struct {
 	lastRequests   map[string][]byte
 	lastRequestsMu sync.RWMutex
 
+	// The Domain signing key, guarded by signingMu: POST /test/rotate-signing-key
+	// replaces it while envelopes, session tokens, registrations and pulls read
+	// it. currentSigningKey reads all three under one lock.
+	signingMu           sync.RWMutex
 	signingPrivateKey   ed25519.PrivateKey
 	signingPublicKeyB64 string
+	signingKeyID        string
 
 	nsk                 []byte // 32-byte AES-256-GCM key for secret encryption
 	expectedBearerToken string // plaintext bearer token for local endpoint auth
@@ -199,6 +204,7 @@ func New() *Server {
 		mux:                 http.NewServeMux(),
 		signingPrivateKey:   priv,
 		signingPublicKeyB64: pubB64,
+		signingKeyID:        mockSigningKeyID,
 		// A deterministic 32-byte key that is deliberately not valid UTF-8, so
 		// the suite cannot pass by accident if nsk ever regresses to being
 		// emitted as a raw string instead of base64.
@@ -392,8 +398,10 @@ func policyFingerprint(rules []api.PolicyRule) string {
 const (
 	mockProjectID = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0"
 	mockNodeID    = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3"
-	// mockSigningKeyID is the key id the mock stamps on every signed envelope and
-	// returns from register; the agent's verifier selects the signing key by it.
+	// mockSigningKeyID is the id of the key the mock starts with: it stamps it on
+	// every signed envelope and returns it from register and on every pull until
+	// POST /test/rotate-signing-key replaces the key. The agent's verifier selects
+	// the signing key by it.
 	mockSigningKeyID = "did:web:plexsphere.com#key-e2e"
 	// mockDomainID is the Domain the mock's node belongs to, the one of the
 	// agent contract's worked example. Every envelope the mock signs carries
@@ -519,6 +527,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
 	s.mux.HandleFunc("GET /test/bearer", s.handleBearer)
 	s.mux.HandleFunc("POST /test/session-token", s.handleSessionToken)
+	s.mux.HandleFunc("POST /test/rotate-signing-key", s.handleRotateSigningKey)
 
 	// Method-not-allowed fallbacks.
 	s.mux.HandleFunc("/v1/health", methodNotAllowed)
@@ -548,6 +557,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/test/configure-events", methodNotAllowed)
 	s.mux.HandleFunc("/test/inject-event", methodNotAllowed)
 	s.mux.HandleFunc("/test/session-token", methodNotAllowed)
+	s.mux.HandleFunc("/test/rotate-signing-key", methodNotAllowed)
 }
 
 // maxCapturedBody bounds how many bytes captureBody keeps per request. The
@@ -766,11 +776,12 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	s.nodePublicKey = req.PublicKey
 	s.keyRotationMu.Unlock()
 
+	signingKeyID, _, signingPublicKey := s.currentSigningKey()
 	resp := api.RegisterResponse{
 		NodeID:           mockNodeID,
 		MeshIP:           "10.99.0.1",
-		SigningPublicKey: s.signingPublicKeyB64,
-		SigningKeyID:     mockSigningKeyID,
+		SigningPublicKey: signingPublicKey,
+		SigningKeyID:     signingKeyID,
 		// NSK is standard-padded base64 per the register contract; plexd
 		// decodes it back into the 32-byte AES-256-GCM key.
 		NSK:            base64.StdEncoding.EncodeToString(s.nsk),
@@ -849,11 +860,15 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 // is served through projectExecutions, so every pull reports the live callback
 // status of each entry still awaiting delivery. The sessions block is served
 // through projectSessions, so every pull redelivers the sessions that are still
-// live.
+// live. The signing_key block always carries the mock's current signing key,
+// whatever the configured snapshot holds, so a pull after
+// POST /test/rotate-signing-key hands the node the new key.
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.stateCount.Add(1)
 	state := s.GetState()
 	state.Executions = s.projectExecutions(state.Executions)
+	signingKeyID, _, signingPublicKey := s.currentSigningKey()
+	state.SigningKey = &api.NodeStateSigningKey{KeyID: signingKeyID, PublicKey: signingPublicKey}
 	served := s.projectSessions(*state.Sessions)
 	state.Sessions = &served
 	writeJSON(w, http.StatusOK, state)
@@ -2642,7 +2657,7 @@ func (s *Server) SetState(state api.NodeStateSnapshot) {
 
 // GetState returns the current state fixture with the peers, executions, and
 // sessions slices normalized to non-nil so they always serialize as [] rather
-// than null. The eight envelope blocks carry no omitempty, so all keys are
+// than null. The nine envelope blocks carry no omitempty, so all keys are
 // emitted (null for unpopulated blocks).
 //
 // The result is a SHALLOW copy: the policy, bridge, state, and reports pointers
@@ -2713,8 +2728,9 @@ func (s *Server) handleConfigureHeartbeat(w http.ResponseWriter, r *http.Request
 
 // handleSessionToken handles POST /test/session-token. It mints the token a
 // mediated ssh session logs in with: a compact JWS signed with the mock's
-// signing key, the way the control plane signs one with the Domain key, so plexd
-// and its session helper accept it against the key registration handed out. The
+// current signing key, the way the control plane signs one with the Domain key,
+// so plexd and its session helper accept it against the key registration or the
+// last pull handed out. The
 // body is {"session_id","user","allowed_commands"?,"ttl_seconds"}; the answer is
 // 200 {"token":"..."}. An empty session_id or user, or a ttl_seconds outside 1
 // to 3600, is a 400.
@@ -2741,9 +2757,10 @@ func (s *Server) handleSessionToken(w http.ResponseWriter, r *http.Request) {
 	if len(body.AllowedCommands) > 0 {
 		target["allowed_commands"] = body.AllowedCommands
 	}
+	signingKeyID, signingKey, _ := s.currentSigningKey()
 	now := time.Now().Unix()
 	// Maps of strings, string slices and integers always marshal.
-	header, _ := json.Marshal(map[string]string{"alg": "EdDSA", "typ": "at+jwt", "kid": mockSigningKeyID})
+	header, _ := json.Marshal(map[string]string{"alg": "EdDSA", "typ": "at+jwt", "kid": signingKeyID})
 	claims, _ := json.Marshal(map[string]any{
 		"iss":    "plexsphere://domain/e2e",
 		"aud":    "resource://e2e",
@@ -2756,8 +2773,41 @@ func (s *Server) handleSessionToken(w http.ResponseWriter, r *http.Request) {
 		"exp":    now + int64(body.TTLSeconds),
 	})
 	signingInput := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(claims)
-	sig := ed25519.Sign(s.signingPrivateKey, []byte(signingInput))
+	sig := ed25519.Sign(signingKey, []byte(signingInput))
 	writeJSON(w, http.StatusOK, map[string]string{"token": signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)})
+}
+
+// handleRotateSigningKey handles POST /test/rotate-signing-key. It replaces the
+// mock's Domain signing key with a fresh Ed25519 pair named the way the control
+// plane names a minted Domain key, and answers 200 {"key_id","public_key"}. The
+// body is not read. From then on envelopes, session tokens, registrations and
+// pulls use the new key, and the old one is gone: like the control plane, the
+// mock keeps no grace window, so a node trusts the new key only once a pull
+// has carried it.
+func (s *Server) handleRotateSigningKey(w http.ResponseWriter, _ *http.Request) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "generate signing key: " + err.Error()})
+		return
+	}
+	keyID := fmt.Sprintf("signing-domain-%s-%d", mockDomainID, time.Now().UnixNano())
+	pubB64 := base64.StdEncoding.EncodeToString(pub)
+
+	s.signingMu.Lock()
+	s.signingPrivateKey = priv
+	s.signingPublicKeyB64 = pubB64
+	s.signingKeyID = keyID
+	s.signingMu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]string{"key_id": keyID, "public_key": pubB64})
+}
+
+// currentSigningKey returns the mock's signing key id, private key and base64
+// public key, read together under signingMu.
+func (s *Server) currentSigningKey() (keyID string, priv ed25519.PrivateKey, pubB64 string) {
+	s.signingMu.RLock()
+	defer s.signingMu.RUnlock()
+	return s.signingKeyID, s.signingPrivateKey, s.signingPublicKeyB64
 }
 
 // SetEndpointTTL updates the stale_after TTL applied by the endpoint handler.
@@ -2930,18 +2980,19 @@ func (s *Server) handleInjectEvent(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// signEnvelope stamps the mock's Domain scope and signing key id on the
+// signEnvelope stamps the mock's Domain scope and current signing key id on the
 // envelope, overriding whatever the injector sent, and signs it the way the
 // control plane does: Ed25519 over api.SignedMessage, the SHA-512 digest of the
 // shared canonical form.
 func (s *Server) signEnvelope(envelope *api.Envelope) error {
+	keyID, signingKey, _ := s.currentSigningKey()
 	envelope.Scope = mockSigningScope
-	envelope.KeyID = mockSigningKeyID
+	envelope.KeyID = keyID
 	msg, err := api.SignedMessage(*envelope)
 	if err != nil {
 		return fmt.Errorf("mockapi: sign envelope: %w", err)
 	}
-	sig := ed25519.Sign(s.signingPrivateKey, msg)
+	sig := ed25519.Sign(signingKey, msg)
 	envelope.Signature = base64.StdEncoding.EncodeToString(sig)
 	return nil
 }
