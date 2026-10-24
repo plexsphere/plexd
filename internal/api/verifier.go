@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -80,6 +81,39 @@ func (v *Ed25519Verifier) Rotate(rot SigningKeyRotation) error {
 		v.transitionExpires = time.Time{}
 	}
 	return nil
+}
+
+// Install makes the signing key a state pull carried the current key. It
+// reports whether anything changed: a key whose id and bytes both equal the
+// current pair is a no-op that leaves a rotation's grace entry alone, while any
+// other key replaces the current one and drops the grace entry, because the
+// node trusts exactly one key of its Domain. Comparing the bytes as well as the
+// id is what lets a pull repair a pair persisted torn. On any error the
+// installed keys are left unchanged.
+func (v *Ed25519Verifier) Install(key NodeStateSigningKey) (bool, error) {
+	if key.KeyID == "" {
+		return false, errors.New("api: verifier: install: missing key_id")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(key.PublicKey)
+	if err != nil {
+		return false, fmt.Errorf("api: verifier: install: public key: %w", err)
+	}
+	if len(decoded) != ed25519.PublicKeySize {
+		return false, fmt.Errorf("api: verifier: install: public key: invalid length: got %d, want %d", len(decoded), ed25519.PublicKeySize)
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if key.KeyID == v.currentKID && v.currentKey.Equal(ed25519.PublicKey(decoded)) {
+		return false, nil
+	}
+	v.currentKID = key.KeyID
+	v.currentKey = ed25519.PublicKey(decoded)
+	v.previousKID = ""
+	v.previousKey = nil
+	v.transitionExpires = time.Time{}
+	return true, nil
 }
 
 // TrustedKeys returns the signing keys a session token may be signed with at

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -297,6 +298,173 @@ func TestEd25519Verifier_RotateErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// installKey is the NodeStateSigningKey a state pull would carry for pub.
+func installKey(keyID string, pub ed25519.PublicKey) NodeStateSigningKey {
+	return NodeStateSigningKey{KeyID: keyID, PublicKey: base64.StdEncoding.EncodeToString(pub)}
+}
+
+func TestEd25519Verifier_Install(t *testing.T) {
+	oldPub, oldPriv := generateKey(t)
+	newPub, newPriv := generateKey(t)
+
+	t.Run("new pair replaces the current key", func(t *testing.T) {
+		v := NewEd25519Verifier("kid-old", oldPub)
+		changed, err := v.Install(installKey("kid-new", newPub))
+		if err != nil || !changed {
+			t.Fatalf("Install = %v, %v; want true, nil", changed, err)
+		}
+		if got := v.TrustedKeys(time.Now()); len(got) != 1 || !got[0].Equal(newPub) {
+			t.Errorf("TrustedKeys = %d keys, want only the installed key", len(got))
+		}
+		if err := v.Verify(context.Background(), signEnvelope(t, newPriv, "kid-new", time.Now(), json.RawMessage(`{}`))); err != nil {
+			t.Errorf("envelope under the installed key: %v", err)
+		}
+		err = v.Verify(context.Background(), signEnvelope(t, oldPriv, "kid-old", time.Now(), json.RawMessage(`{}`)))
+		if err == nil || err.Error() != "api: verifier: unknown signing key id" {
+			t.Errorf("envelope under the replaced key: error = %v, want %q", err, "api: verifier: unknown signing key id")
+		}
+	})
+
+	t.Run("same pair keeps the grace entry", func(t *testing.T) {
+		v := NewEd25519Verifier("kid-old", oldPub)
+		if err := v.Rotate(SigningKeyRotation{
+			KeyID:             "kid-new",
+			PublicKey:         base64.StdEncoding.EncodeToString(newPub),
+			PreviousKeyID:     "kid-old",
+			TransitionExpires: time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("rotate: %v", err)
+		}
+		changed, err := v.Install(installKey("kid-new", newPub))
+		if err != nil || changed {
+			t.Fatalf("Install = %v, %v; want false, nil", changed, err)
+		}
+		if got := v.TrustedKeys(time.Now()); len(got) != 2 {
+			t.Errorf("TrustedKeys = %d keys, want the current and the grace key", len(got))
+		}
+	})
+
+	t.Run("a different key drops the grace entry", func(t *testing.T) {
+		otherPub, _ := generateKey(t)
+		v := NewEd25519Verifier("kid-old", oldPub)
+		if err := v.Rotate(SigningKeyRotation{
+			KeyID:             "kid-new",
+			PublicKey:         base64.StdEncoding.EncodeToString(newPub),
+			PreviousKeyID:     "kid-old",
+			TransitionExpires: time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("rotate: %v", err)
+		}
+		changed, err := v.Install(installKey("kid-x", otherPub))
+		if err != nil || !changed {
+			t.Fatalf("Install = %v, %v; want true, nil", changed, err)
+		}
+		if got := v.TrustedKeys(time.Now()); len(got) != 1 || !got[0].Equal(otherPub) {
+			t.Errorf("TrustedKeys = %d keys, want only the installed key", len(got))
+		}
+		err = v.Verify(context.Background(), signEnvelope(t, oldPriv, "kid-old", time.Now(), json.RawMessage(`{}`)))
+		if err == nil || err.Error() != "api: verifier: unknown signing key id" {
+			t.Errorf("envelope under the grace key: error = %v, want %q", err, "api: verifier: unknown signing key id")
+		}
+	})
+
+	t.Run("same key id with other bytes replaces the key", func(t *testing.T) {
+		v := NewEd25519Verifier("kid-1", oldPub)
+		changed, err := v.Install(installKey("kid-1", newPub))
+		if err != nil || !changed {
+			t.Fatalf("Install = %v, %v; want true, nil", changed, err)
+		}
+		if err := v.Verify(context.Background(), signEnvelope(t, newPriv, "kid-1", time.Now(), json.RawMessage(`{}`))); err != nil {
+			t.Errorf("envelope under the installed bytes: %v", err)
+		}
+	})
+}
+
+func TestEd25519Verifier_InstallErrors(t *testing.T) {
+	oldPub, oldPriv := generateKey(t)
+
+	tests := []struct {
+		name    string
+		key     NodeStateSigningKey
+		wantErr string // exact when set
+		prefix  string // prefix when set
+	}{
+		{
+			name:    "empty key id",
+			key:     installKey("", oldPub),
+			wantErr: "api: verifier: install: missing key_id",
+		},
+		{
+			name:   "non-base64 public key",
+			key:    NodeStateSigningKey{KeyID: "kid-new", PublicKey: "%%%"},
+			prefix: "api: verifier: install: public key:",
+		},
+		{
+			name:    "31-byte public key",
+			key:     NodeStateSigningKey{KeyID: "kid-new", PublicKey: base64.StdEncoding.EncodeToString(make([]byte, 31))},
+			wantErr: "api: verifier: install: public key: invalid length: got 31, want 32",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := NewEd25519Verifier("kid-old", oldPub)
+			changed, err := v.Install(tt.key)
+			if err == nil || changed {
+				t.Fatalf("Install = %v, %v; want false and an error", changed, err)
+			}
+			if tt.wantErr != "" && err.Error() != tt.wantErr {
+				t.Errorf("error = %q, want %q", err.Error(), tt.wantErr)
+			}
+			if tt.prefix != "" && !strings.HasPrefix(err.Error(), tt.prefix) {
+				t.Errorf("error = %q, want prefix %q", err.Error(), tt.prefix)
+			}
+			// Keys unchanged: an envelope under the old kid still verifies.
+			if err := v.Verify(context.Background(), signEnvelope(t, oldPriv, "kid-old", time.Now(), json.RawMessage(`{}`))); err != nil {
+				t.Errorf("old kid failed to verify after a rejected install: %v", err)
+			}
+		})
+	}
+}
+
+// TestEd25519Verifier_InstallConcurrent runs Install against Verify and
+// TrustedKeys; under -race it proves the reconcile goroutine may install while
+// the event stream verifies and ssh logins read the keys.
+func TestEd25519Verifier_InstallConcurrent(t *testing.T) {
+	pubA, privA := generateKey(t)
+	pubB, _ := generateKey(t)
+	v := NewEd25519Verifier("kid-a", pubA)
+	env := signEnvelope(t, privA, "kid-a", time.Now(), json.RawMessage(`{}`))
+
+	var wg sync.WaitGroup
+	for i := range 4 {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			for j := range 50 {
+				if (i+j)%2 == 0 {
+					_, _ = v.Install(installKey("kid-a", pubA))
+				} else {
+					_, _ = v.Install(installKey("kid-b", pubB))
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				_ = v.Verify(context.Background(), env)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				_ = v.TrustedKeys(time.Now())
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestEd25519Verifier_FreshnessAndSignatureErrors(t *testing.T) {
