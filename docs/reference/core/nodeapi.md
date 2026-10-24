@@ -325,7 +325,7 @@ A denied peer produces `secret access denied` at Warn with `pid`, `uid` and `gid
 
 ## HTTP API Endpoints
 
-All endpoints return `Content-Type: application/json`. Error responses use the format `{"error": "<message>"}`.
+All endpoints return `Content-Type: application/json`, except a secret value read raw from `GET /v1/state/secrets/{key}` (described below). Error responses use the format `{"error": "<message>"}`.
 
 ### GET /v1/state
 
@@ -405,11 +405,37 @@ control plane on each request, decrypted with the node secret key, and returned
 as plaintext. An optional `?version=N` query (a positive integer) selects an
 older version; omitting it returns the current version.
 
-**Response** `200 OK`:
+The value comes in one of two representations, chosen by the `Accept` header.
+
+**JSON** (the default) `200 OK`:
 
 ```json
 {"key": "db-password", "value": "s3cret", "version": 1}
 ```
+
+A JSON string cannot carry bytes that are not valid UTF-8, so a value that is
+not valid UTF-8 is never sent this way: the request answers `406` instead, and
+plexd logs the key and version at `WARN` (never the value). NUL, other control
+characters and U+2028 are valid UTF-8 and arrive escaped and intact.
+
+**Raw** `200 OK`, when `Accept` names `application/octet-stream`: the body is
+the value itself, byte for byte, with `Content-Type: application/octet-stream`
+and `Content-Length` set. This is how to read a binary value such as a
+keystore or a DER certificate. The metadata rides in a response header, and
+the key is the one in the path:
+
+| Header | Meaning |
+|---|---|
+| `X-Plexd-Secret-Version` | Version of the returned value (a positive integer) |
+
+The raw body is selected when any element of any `Accept` header line has the
+media type `application/octet-stream` (matched without regard to case) and
+either no `q` parameter or a `q` above zero. Wildcards such as `*/*` (curl's
+default) and `application/*` do not select it, nor does `q=0`; an element that
+does not parse is ignored. Every other request gets JSON.
+
+Every error answers with a JSON body `{"error": "<message>"}`, whichever
+representation was asked for, and carries no `X-Plexd-Secret-Version`.
 
 | Status | Condition                          |
 |--------|------------------------------------|
@@ -417,9 +443,15 @@ older version; omitting it returns the current version.
 | `400`  | `?version` is not a positive integer, or the key is outside the grammar `^[a-z][a-z0-9_-]{0,62}$` |
 | `403`  | Node not authorized to access this secret |
 | `404`  | Secret — or the requested version — not found on the control plane |
+| `406`  | The value is not valid UTF-8 and was asked for as JSON; send `Accept: application/octet-stream` |
 | `429`  | Upstream rate limit; a `Retry-After` header copies the upstream wait in seconds |
 | `500`  | Decryption failed                  |
 | `503`  | Control plane unavailable          |
+
+A `406` is decided after the fetch, because only the decrypted bytes show
+whether JSON can carry them. The control plane has therefore already recorded
+the read on its audit chain and counted it against the per-Node and per-Domain
+rate limits.
 
 ### GET /v1/state/report
 

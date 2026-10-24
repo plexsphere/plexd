@@ -270,8 +270,8 @@ curl -s --unix-socket /var/run/plexd/api.sock \
   "http://localhost/v1/state/secrets/db_password?version=1" | jq .
 ```
 
-The endpoint maps upstream failures to these statuses (the body is always
-`{"error": "<message>"}`):
+The endpoint answers failures with these statuses (the body is always
+`{"error": "<message>"}`, also for a raw read):
 
 | Status | Error message               | Cause                                                         |
 |--------|-----------------------------|--------------------------------------------------------------|
@@ -279,6 +279,7 @@ The endpoint maps upstream failures to these statuses (the body is always
 | `400`  | `invalid secret key`        | Key is outside `^[a-z][a-z0-9_-]{0,62}$`                      |
 | `403`  | `forbidden`                 | Node is not authorized to access this secret                 |
 | `404`  | `not found`                 | The secret key — or the requested `?version` — does not exist |
+| `406`  | `secret value is not valid UTF-8; request it with Accept: application/octet-stream` | The value is binary and was asked for as JSON; read it raw (below) |
 | `429`  | `rate limited`              | Upstream fetch rate limit; a `Retry-After` header carries the wait in seconds |
 | `503`  | `control plane unavailable` | Control plane unreachable                                    |
 
@@ -287,6 +288,26 @@ For example, an unreachable control plane returns `503`:
 ```json
 { "error": "control plane unavailable" }
 ```
+
+### Read a binary secret value
+
+A JSON string cannot carry bytes that are not valid UTF-8, so a binary value
+such as a keystore or a DER certificate is read raw. Send
+`Accept: application/octet-stream` and the body is the value itself, byte for
+byte:
+
+```bash
+curl -s --unix-socket /var/run/plexd/api.sock \
+  -H "Accept: application/octet-stream" \
+  -o keystore.p12 -w "%{http_code}\n" \
+  http://localhost/v1/state/secrets/tls_keystore
+```
+
+The version arrives in the `X-Plexd-Secret-Version` response header; add
+`-D -` to print it. `?version=N` works the same way as for JSON. The same
+secret read without the header answers `406`, so a script that expects JSON
+never receives a corrupted value. `Accept: */*`, curl's default, keeps the
+JSON form.
 
 ## Managing Report Entries
 
@@ -456,6 +477,7 @@ Requests without a token or with an invalid token receive `401 Unauthorized`:
 | 401         | `unauthorized`               | Missing or invalid bearer token on the TCP listener           | Pass `-H "Authorization: Bearer <token>"` with the correct token    |
 | 403         | `forbidden: insufficient privileges for secret access` | Peer is not root or a `plexd-secrets` member (Linux, macOS), or not elevated / LocalSystem (Windows) | Add the user to `plexd-secrets` and re-login, or run from an elevated shell on Windows |
 | 404         | `not found`                  | Key does not exist in metadata, data, secrets, or report      | Verify the key name; list available keys first                      |
+| 406         | `secret value is not valid UTF-8; request it with Accept: application/octet-stream` | The secret value is binary and was requested as JSON | Send `-H 'Accept: application/octet-stream'`                        |
 | 409         | `version conflict`           | `If-Match` version does not match current version             | Re-read the entry, use the latest version in `If-Match`             |
 | 503         | `control plane unavailable`  | Control plane unreachable when fetching a secret value         | Verify network connectivity; check plexd logs for details           |
 
