@@ -35,8 +35,12 @@ services:
       - ./docker/plexd-e2e.yaml:/etc/plexd/config.yaml:ro
       - ./docker/nodeapi-token:/etc/plexd/nodeapi-token:ro
       - ./docker/hooks:/etc/plexd/hooks:ro
-    tmpfs:
+      # The data dir is a volume, not a tmpfs, so it survives `dc restart plexd`
+      # the way /var/lib/plexd survives a reboot: the restarted agent resumes the
+      # identity it persisted instead of registering again. `dc down -v`
+      # removes it.
       - /var/lib/plexd
+    tmpfs:
       - /var/run/plexd
     depends_on:
       mock-api:
