@@ -1109,6 +1109,182 @@ func TestEvents_InjectRoundTripVerifies(t *testing.T) {
 	}
 }
 
+// registerMock registers against the mock and returns its answer.
+func registerMock(t *testing.T, baseURL string) api.RegisterResponse {
+	t.Helper()
+	resp := doRequest(t, http.MethodPost, baseURL+"/v1/register", registerBody)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	var reg api.RegisterResponse
+	if err := json.NewDecoder(resp.Body).Decode(&reg); err != nil {
+		t.Fatalf("decode register: %v", err)
+	}
+	return reg
+}
+
+// rotateMockSigningKey calls POST /test/rotate-signing-key and returns the new
+// key it answers with.
+func rotateMockSigningKey(t *testing.T, baseURL string) api.NodeStateSigningKey {
+	t.Helper()
+	resp := doRequest(t, http.MethodPost, baseURL+"/test/rotate-signing-key", "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rotate-signing-key status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var key api.NodeStateSigningKey
+	if err := json.NewDecoder(resp.Body).Decode(&key); err != nil {
+		t.Fatalf("decode rotate-signing-key: %v", err)
+	}
+	return key
+}
+
+// TestState_CarriesTheSigningKey pins that every pull carries the key register
+// handed out, also when the configured snapshot holds another one.
+func TestState_CarriesTheSigningKey(t *testing.T) {
+	_, ts := newTestServer(t)
+	reg := registerMock(t, ts.URL)
+	want := api.NodeStateSigningKey{KeyID: reg.SigningKeyID, PublicKey: reg.SigningPublicKey}
+
+	if got := getState(t, ts.URL).SigningKey; got == nil || *got != want {
+		t.Fatalf("signing_key = %+v, want register's %+v", got, want)
+	}
+
+	configured := getState(t, ts.URL)
+	configured.SigningKey = &api.NodeStateSigningKey{KeyID: "configured", PublicKey: "AAAA"}
+	body, err := json.Marshal(configured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", string(body))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+	if got := getState(t, ts.URL).SigningKey; got == nil || *got != want {
+		t.Errorf("signing_key after configure-state = %+v, want register's %+v", got, want)
+	}
+}
+
+// TestRotateSigningKey_RoundTrip walks the path a node enrolled before its
+// Domain had a key of its own takes: the mock switches keys, the node refuses
+// the next envelope until a pull hands it the new key, and then accepts both
+// the envelope and a session token signed with it.
+func TestRotateSigningKey_RoundTrip(t *testing.T) {
+	_, ts := newTestServer(t)
+	verifier := mockVerifier(t, ts.URL)
+
+	key := rotateMockSigningKey(t, ts.URL)
+	if !strings.HasPrefix(key.KeyID, "signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1-") {
+		t.Errorf("key_id = %q, want the minted Domain key form", key.KeyID)
+	}
+	if pub, err := base64.StdEncoding.DecodeString(key.PublicKey); err != nil || len(pub) != ed25519.PublicKeySize {
+		t.Fatalf("public_key %q decodes to %d bytes (err %v), want 32", key.PublicKey, len(pub), err)
+	}
+	pulled := getState(t, ts.URL).SigningKey
+	if pulled == nil || *pulled != key {
+		t.Fatalf("pull's signing_key = %+v, want the rotated %+v", pulled, key)
+	}
+
+	resp := connectSSE(t, ts.URL, "node-1", 5*time.Second)
+	defer resp.Body.Close()
+	frames := startSSEFrames(resp.Body)
+	inject := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", `{"id":"evt-rotated","type":"node_state_updated","payload":{}}`)
+	inject.Body.Close()
+	if inject.StatusCode != http.StatusNoContent {
+		t.Fatalf("inject status = %d, want %d", inject.StatusCode, http.StatusNoContent)
+	}
+	frame, ok := frames.next(3 * time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for injected event")
+	}
+	env := sseFrameEnvelope(t, frame)
+	if env.KeyID != key.KeyID {
+		t.Errorf("envelope key_id = %q, want the rotated %q", env.KeyID, key.KeyID)
+	}
+	if err := verifier.Verify(context.Background(), env); err == nil || err.Error() != "api: verifier: unknown signing key id" {
+		t.Errorf("verifier from register: error = %v, want unknown signing key id", err)
+	}
+	if changed, err := verifier.Install(*pulled); err != nil || !changed {
+		t.Fatalf("Install(pulled) = %v, %v; want true, nil", changed, err)
+	}
+	if err := verifier.Verify(context.Background(), env); err != nil {
+		t.Errorf("verifier after installing the pulled key: %v", err)
+	}
+
+	tokenResp := mintMockSessionToken(t, ts.URL, `{"session_id":"sess-rotated","user":"root","ttl_seconds":600}`)
+	defer tokenResp.Body.Close()
+	if tokenResp.StatusCode != http.StatusOK {
+		t.Fatalf("session-token status = %d, want %d", tokenResp.StatusCode, http.StatusOK)
+	}
+	var answer struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(tokenResp.Body).Decode(&answer); err != nil {
+		t.Fatalf("decode token: %v", err)
+	}
+	now := time.Now()
+	if _, err := tunnel.VerifySessionToken(answer.Token, verifier.TrustedKeys(now), "sess-rotated", "root", now); err != nil {
+		t.Errorf("session token under the rotated key: %v", err)
+	}
+}
+
+func TestRotateSigningKey_WrongMethod(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodGet, ts.URL+"/test/rotate-signing-key", "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// TestRotateSigningKey_ConcurrentWithInject rotates the key while 20 goroutines
+// inject events and pulls read it; under -race it proves every reader takes
+// the key under signingMu.
+func TestRotateSigningKey_ConcurrentWithInject(t *testing.T) {
+	_, ts := newTestServer(t)
+	sseResp := connectSSE(t, ts.URL, "node-1", 10*time.Second)
+	defer sseResp.Body.Close()
+	startSSEFrames(sseResp.Body)
+
+	var wg sync.WaitGroup
+	for i := range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range 5 {
+				body := fmt.Sprintf(`{"id":"evt-conc-%d-%d","type":"node_state_updated","payload":{}}`, i, j)
+				resp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", body)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusNoContent {
+					t.Errorf("inject %d/%d: status = %d, want %d", i, j, resp.StatusCode, http.StatusNoContent)
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// This loop checks each status with t.Errorf, as the other concurrency
+		// tests do, rather than through helpers that stop with t.Fatalf.
+		for i := range 10 {
+			for _, req := range []struct{ method, path string }{
+				{http.MethodPost, "/test/rotate-signing-key"},
+				{http.MethodGet, "/v1/nodes/node-1/state"},
+			} {
+				resp := doRequest(t, req.method, ts.URL+req.path, "")
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Errorf("%s %s #%d: status = %d, want %d", req.method, req.path, i, resp.StatusCode, http.StatusOK)
+				}
+			}
+		}
+	}()
+	wg.Wait()
+}
+
 // TestInjectEvent_UncanonicalPayload_Returns400 pins that a payload the
 // canonical form cannot carry is refused rather than signed or dropped.
 func TestInjectEvent_UncanonicalPayload_Returns400(t *testing.T) {
