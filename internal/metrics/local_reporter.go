@@ -109,9 +109,10 @@ func (r *LocalReporter) ReportMetrics(ctx context.Context, nodeID string, batch 
 }
 
 // resolveToken returns a bearer token, using a cached value when still valid.
-// On fetch or decrypt failure it falls back to a stale cached token (with a
-// warning log, or a debug log for a refused node credential) rather than
-// failing outright.
+// On a 403 or 404 from the fetch it drops the cached token and fails, since the
+// Node may no longer read the secret. On any other fetch failure, or a decrypt
+// failure, it falls back to a stale cached token (with a warning log, or a
+// debug log for a refused node credential) rather than failing outright.
 func (r *LocalReporter) resolveToken(ctx context.Context) (string, error) {
 	r.mu.RLock()
 	if r.cachedToken != "" && time.Since(r.fetchedAt) < r.cacheTTL {
@@ -131,6 +132,14 @@ func (r *LocalReporter) resolveToken(ctx context.Context) (string, error) {
 
 	resp, err := r.fetcher.FetchSecret(ctx, r.nodeID, r.secretKey, 0)
 	if err != nil {
+		if api.IsSecretAccessRevoked(err) {
+			if r.cachedToken != "" {
+				r.logger.Warn("dropping revoked credential", "component", "metrics", "error", err)
+				r.cachedToken = ""
+				r.fetchedAt = time.Time{}
+			}
+			return "", fmt.Errorf("metrics: fetch secret: %w", err)
+		}
 		if r.cachedToken != "" {
 			r.logger.Log(ctx, failureLevel(err), "using cached credential", "component", "metrics", "error", err)
 			return r.cachedToken, nil
