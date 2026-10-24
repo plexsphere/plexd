@@ -1204,6 +1204,148 @@ fi
 echo "=== Phase 7b PASSED: policy_updated SSE event ==="
 
 # ===================================================================
+# Phase 7c: the state pull installs a new signing key
+# ===================================================================
+# A node enrolled before its Domain had a key of its own holds a key the
+# control plane does not sign with, and learns the Domain key only from the
+# pull's signing_key block. The mock switches keys; a pull hands plexd the new
+# one, an event signed with it is verified and dispatched, and the key survives
+# a restart because plexd persisted it. Every check here fails the suite.
+echo "=== Testing signing key installation from the state pull ==="
+
+SIGKEY_INSTALLED="installed signing key from state pull"
+
+# sigkey_log_count TEXT1 TEXT2: print how many plexd log lines carry both texts.
+# The log is read into a variable and matched line by line with case, as phase
+# 4c does: no grep -q in a pipeline under pipefail.
+sigkey_log_count() {
+    local logs line n=0
+    logs=$(dc logs plexd 2>/dev/null || true)
+    while IFS= read -r line; do
+        case "${line}" in
+            *"$1"*)
+                case "${line}" in
+                    *"$2"*) n=$((n + 1)) ;;
+                esac
+                ;;
+        esac
+    done <<< "${logs}"
+    echo "${n}"
+}
+
+# sigkey_inject_and_check EVENT_ID: inject a node_state_updated event, then fail
+# unless it raises state_count within 15s and no verification failure names it.
+sigkey_inject_and_check() {
+    local evt_id=$1 before after status elapsed=0
+    before=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "{\"id\":\"${evt_id}\",\"type\":\"node_state_updated\",\"scope\":\"node\",\"payload\":{}}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "injecting ${evt_id} returned status ${status}, want 204"
+    fi
+    while :; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+        after=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+        if [ "${after}" -gt "${before}" ]; then
+            break
+        fi
+        if [ "${elapsed}" -ge 15 ]; then
+            fail "state_count did not rise within 15s after ${evt_id} (before=${before}, after=${after})"
+        fi
+    done
+    if [ "$(sigkey_log_count "event verification failed" "${evt_id}")" != "0" ]; then
+        fail "plexd logged event verification failed for ${evt_id}"
+    fi
+    echo "  PASS: ${evt_id} verified, state_count rose from ${before} to ${after}"
+}
+
+# 1. Switch the mock to a fresh Domain key.
+ROTATE_RESP=$(curl -sf -X POST "http://localhost:18080/test/rotate-signing-key" 2>/dev/null || true)
+NEW_KID=$(echo "${ROTATE_RESP}" | jq -r '.key_id // empty')
+if [ -z "${NEW_KID}" ]; then
+    fail "rotate-signing-key did not answer 200 with a key_id (body: ${ROTATE_RESP})"
+fi
+echo "  mock signs with ${NEW_KID} now"
+
+# 2. A pull hands plexd the new key. Heartbeat reconcile hints nudge the pull;
+# the mock answers them by default, so the response posted here is that default
+# and stays in place for the later phases.
+curl -sf -X POST -H "Content-Type: application/json" \
+    -d '{"reconcile":true,"rotate_keys":false}' \
+    "http://localhost:18080/test/configure-heartbeat" >/dev/null 2>&1 \
+    || fail "configure-heartbeat for the signing key pull failed"
+SIGKEY_TIMEOUT=60
+SIGKEY_ELAPSED=0
+until [ "$(sigkey_log_count "${SIGKEY_INSTALLED}" "${NEW_KID}")" -ge 1 ]; do
+    if [ "${SIGKEY_ELAPSED}" -ge "${SIGKEY_TIMEOUT}" ]; then
+        fail "plexd did not log '${SIGKEY_INSTALLED}' for ${NEW_KID} within ${SIGKEY_TIMEOUT}s"
+    fi
+    sleep 2
+    SIGKEY_ELAPSED=$((SIGKEY_ELAPSED + 2))
+done
+echo "  PASS: a pull installed ${NEW_KID}"
+
+# 3. An event signed with the new key is verified and dispatched.
+sigkey_inject_and_check "evt-e2e-sigkey-001"
+
+# 4. plexd persisted the key into its identity.
+IDENTITY_JSON=$(dc exec -T plexd head -c 8192 /var/lib/plexd/identity.json 2>/dev/null || true)
+case "${IDENTITY_JSON}" in
+    *"\"signing_key_id\": \"${NEW_KID}\""*) ;;
+    *) fail "identity.json does not hold ${NEW_KID}: ${IDENTITY_JSON}" ;;
+esac
+echo "  PASS: identity.json holds ${NEW_KID}"
+
+# 5. After a restart plexd starts from the persisted key. The data dir is a
+# volume, so the restarted agent resumes its identity rather than registering
+# again: a new registration would hand it the mock's current key and prove
+# nothing about the persisted one. Wait until the restarted agent has opened its
+# event stream and a pull has followed, so the next injected event has a stream
+# to arrive on.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+EVREQ_BEFORE_RESTART=$(get_counter "${RESPONSE}" "events_request_count")
+REG_BEFORE_RESTART=$(get_counter "${RESPONSE}" "registration_count")
+RESUMED_BEFORE_RESTART=$(sigkey_log_count "existing identity loaded" "existing identity loaded")
+dc restart plexd
+RESTART_ELAPSED=0
+STATE_AT_STREAM=""
+while :; do
+    sleep 2
+    RESTART_ELAPSED=$((RESTART_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -z "${STATE_AT_STREAM}" ]; then
+        if [ "$(get_counter "${RESPONSE}" "events_request_count")" -gt "${EVREQ_BEFORE_RESTART}" ]; then
+            STATE_AT_STREAM=$(get_counter "${RESPONSE}" "state_count")
+        fi
+    elif [ "$(get_counter "${RESPONSE}" "state_count")" -gt "${STATE_AT_STREAM}" ]; then
+        break
+    fi
+    if [ "${RESTART_ELAPSED}" -ge 60 ]; then
+        fail "the restarted plexd did not reopen its event stream and pull within 60s"
+    fi
+done
+REG_AFTER_RESTART=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "registration_count")
+if [ "${REG_AFTER_RESTART}" != "${REG_BEFORE_RESTART}" ]; then
+    fail "the restarted plexd registered again (registration_count ${REG_BEFORE_RESTART} -> ${REG_AFTER_RESTART}) instead of resuming its persisted identity"
+fi
+RESUMED_AFTER_RESTART=$(sigkey_log_count "existing identity loaded" "existing identity loaded")
+if [ "${RESUMED_AFTER_RESTART}" -le "${RESUMED_BEFORE_RESTART}" ]; then
+    fail "the restarted plexd did not log 'existing identity loaded'"
+fi
+echo "  PASS: the restarted plexd resumed its persisted identity without registering"
+sigkey_inject_and_check "evt-e2e-sigkey-002"
+INSTALL_LINES=$(sigkey_log_count "${SIGKEY_INSTALLED}" "${NEW_KID}")
+if [ "${INSTALL_LINES}" != "1" ]; then
+    fail "plexd logged '${SIGKEY_INSTALLED}' for ${NEW_KID} ${INSTALL_LINES} times, want 1: the restart did not start from the persisted key"
+fi
+echo "  PASS: the restarted plexd started from the persisted key"
+
+echo "=== Phase 7c PASSED: the state pull installs a new signing key ==="
+
+# ===================================================================
 # Phase 8: Action execution from the pull's executions block
 # ===================================================================
 echo "=== Testing action execution from the executions block ==="
