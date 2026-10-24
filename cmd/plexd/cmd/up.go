@@ -783,6 +783,16 @@ func runAgent(ctx context.Context) error {
 	// this handler refreshes the node API cache from the resulting snapshot.
 	reconciler.RegisterHandler(nodeAPISrv.ReconcileHandler())
 
+	// The pull carries the Domain signing key on every successful cycle. It is
+	// installed into the verifier that checks envelopes and ssh session tokens
+	// and persisted, first among the dispatch handlers, so the rest of the
+	// cycle already runs under it. A node enrolled before its Domain had a key
+	// of its own learns the key here.
+	reconciler.RegisterDispatchHandler(signingKeyDispatchHandler(verifier, cfg.DataDir, api.NodeStateSigningKey{
+		KeyID:     identity.SigningKeyID,
+		PublicKey: identity.SigningPublicKey,
+	}, logger))
+
 	// Action dispatches are consumed from the pull's executions block on every
 	// successful cycle, drift or not: the block is a delivery queue that
 	// redelivers each entry until its execution settles through the callback.
@@ -1567,6 +1577,55 @@ func signingKeyRotatedHandler(verifier *api.Ed25519Verifier, logger *slog.Logger
 		}
 		logger.Info("signing keys rotated via SSE", "key_id", rot.KeyID)
 		return nil
+	}
+}
+
+// signingKeyDispatchHandler returns the dispatch handler that installs the
+// signing key every state pull carries and persists it into the identity files,
+// so the verifier that checks envelopes and ssh session tokens follows the
+// Domain key, and a restart starts from it. A null block keeps the installed
+// key. A key the verifier refuses leaves the keys as they were and is logged
+// once, and not again until a pull carries a different key, since a control
+// plane serving a broken block serves it on every pull. A pulled key that
+// differs from the persisted pair is committed whether or not it changed the
+// verifier, so a failed commit is retried on the next pull.
+//
+// persisted is the pair the identity files hold at startup. The reconcile
+// goroutine is the only caller, one cycle at a time, so the closure's state
+// needs no mutex.
+func signingKeyDispatchHandler(verifier *api.Ed25519Verifier, dataDir string, persisted api.NodeStateSigningKey, logger *slog.Logger) reconcile.DispatchHandler {
+	var lastRejected *api.NodeStateSigningKey
+	return func(_ context.Context, desired *api.NodeStateSnapshot) {
+		if desired.SigningKey == nil {
+			logger.Debug("state pull carried no signing key; keeping the installed one")
+			return
+		}
+		pulled := *desired.SigningKey
+
+		changed, err := verifier.Install(pulled)
+		if err != nil {
+			if lastRejected == nil || *lastRejected != pulled {
+				logger.Warn("signing key from state pull rejected", "key_id", pulled.KeyID, "error", err)
+				lastRejected = &pulled
+			}
+			return
+		}
+		lastRejected = nil
+		if changed {
+			// public_key is the value an operator copies into
+			// tunnel.session_signing_public_key for a session helper that pinned
+			// the previous key.
+			logger.Info("installed signing key from state pull", "key_id", pulled.KeyID, "public_key", pulled.PublicKey)
+		}
+
+		if pulled == persisted {
+			return
+		}
+		if err := registration.CommitSigningKey(dataDir, pulled.KeyID, pulled.PublicKey); err != nil {
+			logger.Warn("signing key not persisted; retrying on the next pull", "key_id", pulled.KeyID, "error", err)
+			return
+		}
+		persisted = pulled
 	}
 }
 
