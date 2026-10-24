@@ -80,7 +80,7 @@ type HeartbeatResponse struct {
 // GET /v1/nodes/{node_id}/state. Every block key is always present on the wire:
 // a null value means "block not populated", never "field absent". The differ
 // therefore distinguishes a nil pointer from a populated block, so none of the
-// eight fields carry omitempty.
+// nine fields carry omitempty.
 type NodeStateSnapshot struct {
 	Peers        []SnapshotPeer       `json:"peers"`
 	Reachability json.RawMessage      `json:"reachability"`
@@ -96,6 +96,21 @@ type NodeStateSnapshot struct {
 	// not populate the block" (null, or a key a build predating the block never
 	// wrote). A nil pointer is the second case and is not a teardown signal.
 	Sessions *[]NodeStateSession `json:"sessions"`
+	// SigningKey is the key the node's Domain signs envelopes and session
+	// tokens with. A nil value, the wire's null or a key a control plane
+	// predating the block never wrote, means the control plane could not say
+	// this time: the node keeps the key it holds, and never drops it.
+	SigningKey *NodeStateSigningKey `json:"signing_key"`
+}
+
+// NodeStateSigningKey is the signing_key block of the state pull, the Domain
+// signing key as the "Domain signing key" section of plexsphere's agent
+// contract (docs/reference/api/plexd-agent-contract.md) describes it: the id
+// the key signs under and its 32-byte Ed25519 public key in standard base64,
+// the same encodings POST /v1/register uses.
+type NodeStateSigningKey struct {
+	KeyID     string `json:"key_id"`
+	PublicKey string `json:"public_key"`
 }
 
 // SnapshotPeer is a reconciliation peer entry in NodeStateSnapshot. It is a

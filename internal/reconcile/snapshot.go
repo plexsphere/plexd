@@ -10,7 +10,9 @@ import (
 // stateSnapshot holds the last-known desired state received from the control
 // plane.  All access is protected by a sync.RWMutex so concurrent goroutines
 // can safely read while the reconcile loop writes. Reachability is the node's
-// own health projection, not desired state, so it is never stored.
+// own health projection, not desired state, so it is never stored. Neither is
+// the signing key: a dispatch handler installs it on every pull, and there is
+// nothing for the differ to converge on.
 type stateSnapshot struct {
 	mu      sync.RWMutex
 	peers   []api.SnapshotPeer
@@ -26,7 +28,7 @@ func NewStateSnapshot() *stateSnapshot {
 }
 
 // Get returns a deep copy of the current snapshot as an api.NodeStateSnapshot.
-// Reachability is not desired state, so it is always nil.
+// Reachability and SigningKey are not desired state, so they are always nil.
 func (s *stateSnapshot) Get() api.NodeStateSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

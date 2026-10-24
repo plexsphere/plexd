@@ -520,19 +520,23 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 				IdleTimeoutSeconds: 300,
 			},
 		},
+		SigningKey: &NodeStateSigningKey{
+			KeyID:     "signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1-1767225600000000000",
+			PublicKey: "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+		},
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Exactly the eight contract keys must appear.
+	// Exactly the nine contract keys must appear.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 8 {
-		t.Errorf("expected exactly 8 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 9 {
+		t.Errorf("expected exactly 9 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "signing_key"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
@@ -570,7 +574,7 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		t.Error("policy:{} should decode to a non-nil pointer, distinct from null")
 	}
 
-	// Marshalling nil blocks emits literal null with all eight keys PRESENT.
+	// Marshalling nil blocks emits literal null with all nine keys PRESENT.
 	out, err := json.Marshal(NodeStateSnapshot{})
 	if err != nil {
 		t.Fatalf("marshal zero value: %v", err)
@@ -579,7 +583,10 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if err := json.Unmarshal(out, &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions"} {
+	if len(raw) != 9 {
+		t.Errorf("expected exactly 9 JSON keys, got %d: %v", len(raw), raw)
+	}
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "signing_key"} {
 		v, ok := raw[key]
 		if !ok {
 			t.Errorf("key %q absent, want present with null value", key)
@@ -591,6 +598,30 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		if string(v) != "null" {
 			t.Errorf("key %q = %s, want null", key, v)
 		}
+	}
+}
+
+// TestNodeStateSnapshot_SigningKeyBlock pins the shapes the signing_key block
+// arrives in. null and an absent key both decode to a nil pointer, which the
+// node reads as "keep the key you hold"; a populated block carries both values.
+func TestNodeStateSnapshot_SigningKeyBlock(t *testing.T) {
+	const others = `"peers":[],"reachability":null,"policy":null,"bridge":null,"state":null,"reports":null,"executions":[],"sessions":[]`
+	for _, src := range []string{`{` + others + `,"signing_key":null}`, `{` + others + `}`} {
+		var snap NodeStateSnapshot
+		if err := json.Unmarshal([]byte(src), &snap); err != nil {
+			t.Fatalf("unmarshal %s: %v", src, err)
+		}
+		if snap.SigningKey != nil {
+			t.Errorf("signing_key from %s = %+v, want a nil pointer", src, snap.SigningKey)
+		}
+	}
+
+	var snap NodeStateSnapshot
+	if err := json.Unmarshal([]byte(`{`+others+`,"signing_key":{"key_id":"k","public_key":"p"}}`), &snap); err != nil {
+		t.Fatalf("unmarshal populated: %v", err)
+	}
+	if snap.SigningKey == nil || snap.SigningKey.KeyID != "k" || snap.SigningKey.PublicKey != "p" {
+		t.Errorf("signing_key = %+v, want key_id k and public_key p", snap.SigningKey)
 	}
 }
 
