@@ -19,6 +19,8 @@
 #     (ack/started/terminal callbacks)
 #   - Executions resumed from a seeded status (no re-ack, no re-run)
 #   - action_request is a pull trigger, not a delivery channel
+#   - Secret index fed from the state pull's secrets block, with
+#     node_secrets_updated as a pull trigger
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Pull-only delivery under a descoped event bus (quiet SSE re-probing)
@@ -267,6 +269,60 @@ SESSNUDGEEOF
         "http://localhost:18080/test/inject-event" 2>/dev/null || true)
     if [ "${status}" != "204" ]; then
         fail "[${tag}] sessions nudge injection returned status ${status}, want 204"
+    fi
+}
+
+# --- Helper: configure the secrets block ---
+# Args: <tag> <secrets-json-array> [nudge-type]. The secrets block is the node's
+# secret inventory, which feeds the Local Node API secret index.
+# configure-state REPLACES the whole snapshot fixture, so the block is spliced
+# into the live snapshot and every other block travels back verbatim. With a
+# nudge type, an envelope of that type follows so the agent pulls the new block
+# right away; without one, the caller decides what makes the agent pull. The tag
+# keeps the envelope id unique per call.
+#
+# NOTE: reading the live snapshot is a real GET on the state endpoint and
+# therefore INCREMENTS state_count. A phase gating on state_count must take its
+# baseline AFTER calling this helper.
+configure_secrets() {
+    local tag=$1 entries=$2 nudge=${3:-}
+
+    local snapshot spliced status
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    # printf, not echo: the fixture carries backslash escapes (an embedded
+    # newline in the certs/ca data entry) that must travel back byte for byte.
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson e "${entries}" '.secrets = $e')
+
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+
+    if [ -z "${nudge}" ]; then
+        return 0
+    fi
+    local payload
+    payload=$(cat <<SECNUDGEEOF
+{
+    "id": "evt-e2e-sec-nudge-${tag}",
+    "type": "${nudge}",
+    "scope": "node",
+    "payload": "{\"node_id\":\"e2e-node-1\"}"
+}
+SECNUDGEEOF
+    )
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${payload}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] secrets nudge injection returned status ${status}, want 204"
     fi
 }
 
@@ -3009,6 +3065,103 @@ else
 fi
 
 echo "=== Phase 12b PASSED: versioned and rate-limited secret fetches ==="
+
+# ===================================================================
+# Phase 12c: secret index from the inventory
+# ===================================================================
+# The pull's secrets block feeds the Local Node API secret index: GET
+# /v1/state/secrets lists each entry under its name as key, in pull order.
+# node_secrets_updated carries the full inventory too, but plexd only takes it
+# as a reason to pull now, so step (b) changes the block without a nudge and
+# proves the event pulls it. Step (c) empties the index again before Phase 13
+# replaces the whole fixture.
+echo "=== Testing the secret index fed from the inventory ==="
+
+SECLIST_URL="${NODE_API_URL}/v1/state/secrets"
+
+# wait_secret_index <tag> <want-compact-json> <timeout-seconds> polls the
+# secret listing until it prints want, and fails the suite with what it last
+# saw otherwise.
+wait_secret_index() {
+    local tag=$1 want=$2 timeout=$3 elapsed=0 got=""
+    while true; do
+        got=$(curl -sf "${NAPI_AUTH[@]}" "${SECLIST_URL}" 2>/dev/null | jq -c . 2>/dev/null || true)
+        if [ "${got}" = "${want}" ]; then
+            echo "  PASS: [${tag}] GET /v1/state/secrets -> ${got}"
+            return 0
+        fi
+        if [ "${elapsed}" -ge "${timeout}" ]; then
+            fail "[${tag}] GET /v1/state/secrets = '${got}' after ${timeout}s, want '${want}'"
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+}
+
+# (a) The pull fills the index, mapping each name onto the listing's key.
+configure_secrets "seclist-a" '[{"name":"api-token","version":1},{"name":"db-password","version":2}]' node_state_updated
+wait_secret_index "seclist-a" '[{"key":"api-token","version":1},{"key":"db-password","version":2}]' 30
+
+# (b) node_secrets_updated pulls a changed inventory. The block changes without
+# a nudge, and the baseline is taken after the splice, which reads the state
+# endpoint itself. A window shorter than the heartbeat's ~30s cadence does not
+# keep a heartbeat-driven pull out of it, so the heartbeat fixture stops asking
+# for a reconcile for the length of the step. The only other untriggered pull is
+# the 60s reconcile ticker, which step (a)'s nudge reset moments ago. A
+# state_count advance inside the 15s window can then only come from the event.
+curl -sf -X POST -H "Content-Type: application/json" \
+    -d '{"reconcile":false,"rotate_keys":false}' \
+    "http://localhost:18080/test/configure-heartbeat" >/dev/null 2>&1 \
+    || fail "configure-heartbeat (reconcile off) failed"
+configure_secrets "seclist-b" '[{"name":"db-password","version":3}]'
+STATE_BEFORE_SECRETS=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+
+SECRETS_EVENT=$(cat <<'SECEVENTEOF'
+{
+    "id": "evt-e2e-secrets-001",
+    "type": "node_secrets_updated",
+    "scope": "node",
+    "payload": {"event_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","occurred_at":"2026-01-01T00:00:00Z","node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3","secrets":[{"name":"db-password","version":3}]}
+}
+SECEVENTEOF
+)
+SECRETS_EVENT_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${SECRETS_EVENT}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${SECRETS_EVENT_STATUS}" != "204" ]; then
+    fail "node_secrets_updated injection returned status ${SECRETS_EVENT_STATUS}, want 204"
+fi
+
+SECRETS_TIMEOUT=15
+SECRETS_ELAPSED=0
+SECRETS_STATE_PASSED=0
+while [ "${SECRETS_ELAPSED}" -lt "${SECRETS_TIMEOUT}" ]; do
+    sleep 2
+    SECRETS_ELAPSED=$((SECRETS_ELAPSED + 2))
+    STATE_AFTER_SECRETS=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    if [ "${STATE_AFTER_SECRETS}" -gt "${STATE_BEFORE_SECRETS}" ]; then
+        echo "  PASS: state_count increased from ${STATE_BEFORE_SECRETS} to ${STATE_AFTER_SECRETS} after node_secrets_updated"
+        SECRETS_STATE_PASSED=1
+        break
+    fi
+done
+if [ "${SECRETS_STATE_PASSED}" -ne 1 ]; then
+    fail "state_count did not advance within ${SECRETS_TIMEOUT}s of node_secrets_updated (stayed at ${STATE_BEFORE_SECRETS})"
+fi
+wait_secret_index "seclist-b" '[{"key":"db-password","version":3}]' 15
+
+# Restore the heartbeat fixture the later phases expect.
+curl -sf -X POST -H "Content-Type: application/json" \
+    -d '{"reconcile":true,"rotate_keys":false}' \
+    "http://localhost:18080/test/configure-heartbeat" >/dev/null 2>&1 \
+    || fail "configure-heartbeat (reconcile on) failed"
+
+# (c) [] says the node may read nothing, and empties the index.
+configure_secrets "seclist-c" '[]' node_state_updated
+wait_secret_index "seclist-c" '[]' 30
+
+echo "=== Phase 12c PASSED: secret index from the inventory ==="
 
 # ===================================================================
 # Phase 13: Converge cycle (full envelope mutation)
