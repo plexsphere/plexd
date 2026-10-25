@@ -399,6 +399,56 @@ func TestWrapSecretAuth_MetadataNotProtected(t *testing.T) {
 	}
 }
 
+// TestWrapSecretAuth_StateSummaryHidesSecretNames proves GET /v1/state stays
+// open to every peer, but is marked so its summary names no secret for a peer
+// the policy refuses and for one whose credentials cannot be read. Nothing is
+// logged, and no other route is marked.
+func TestWrapSecretAuth_StateSummaryHidesSecretNames(t *testing.T) {
+	tests := []struct {
+		name       string
+		path       string
+		allow      bool
+		withCreds  bool
+		wantHidden bool
+	}{
+		{name: "refused peer", path: "/v1/state", allow: false, withCreds: true, wantHidden: true},
+		{name: "no credentials", path: "/v1/state", allow: true, withCreds: false, wantHidden: true},
+		{name: "admitted peer", path: "/v1/state", allow: true, withCreds: true, wantHidden: false},
+		{name: "metadata", path: "/v1/state/metadata"},
+		{name: "data entry", path: "/v1/state/data/key"},
+		{name: "report entry", path: "/v1/state/report/key"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var served, hidden bool
+			inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				served = true
+				hidden = secretNamesHidden(r.Context())
+				w.WriteHeader(http.StatusOK)
+			})
+			var buf bytes.Buffer
+			wrapped := wrapSecretAuth(inner, fakeSecretPolicy{allow: tc.allow}, bufferLogger(&buf))
+
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			if tc.withCreds {
+				req = req.WithContext(context.WithValue(req.Context(), peerCredKey{}, &PeerCredentials{}))
+			}
+			rec := httptest.NewRecorder()
+			wrapped.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK || !served {
+				t.Errorf("status = %d, served = %v, want 200 from the inner handler", rec.Code, served)
+			}
+			if hidden != tc.wantHidden {
+				t.Errorf("secretNamesHidden = %v, want %v", hidden, tc.wantHidden)
+			}
+			if buf.Len() != 0 {
+				t.Errorf("logged %q, want nothing", buf.String())
+			}
+		})
+	}
+}
+
 func TestIsSecretPath(t *testing.T) {
 	tests := []struct {
 		path string

@@ -177,6 +177,10 @@ func (h *Handler) handleGetState(w http.ResponseWriter, r *http.Request) {
 	metadata := h.cache.GetMetadata()
 	data := h.cache.GetData()
 	secrets := h.cache.GetSecretIndex()
+	if secretNamesHidden(r.Context()) {
+		// The peer may not list secrets, so the summary names none.
+		secrets = nil
+	}
 	reports := h.cache.GetReports()
 
 	dataKeys := make([]dataKeySummary, 0, len(data))

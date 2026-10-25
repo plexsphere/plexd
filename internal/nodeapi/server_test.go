@@ -208,7 +208,9 @@ func TestServer_TCPListener(t *testing.T) {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
 
-	// Request with valid token → 200.
+	// Request with valid token → 200. The bearer token admits the secret
+	// routes, so the summary names the secrets the index holds.
+	srv.cache.UpdateSecretIndex([]api.SecretRef{{Key: "db-pass", Version: 2}})
 	req, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/v1/state", nil)
 	req.Header.Set("Authorization", "Bearer test-token-123")
 	resp2, err := http.DefaultClient.Do(req)
@@ -216,10 +218,19 @@ func TestServer_TCPListener(t *testing.T) {
 		cancel()
 		t.Fatalf("GET with token: %v", err)
 	}
+	var summary StateSummary
+	decodeErr := json.NewDecoder(resp2.Body).Decode(&summary)
 	resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
 		cancel()
 		t.Fatalf("status = %d, want 200", resp2.StatusCode)
+	}
+	if decodeErr != nil {
+		cancel()
+		t.Fatalf("decode /v1/state: %v", decodeErr)
+	}
+	if len(summary.SecretKeys) != 1 || summary.SecretKeys[0].Key != "db-pass" {
+		t.Errorf("secret_keys over TCP = %+v, want [{db-pass 2}]", summary.SecretKeys)
 	}
 
 	cancel()
@@ -1462,16 +1473,32 @@ func TestServerSecretAuthEnabled(t *testing.T) {
 
 	httpClient := localClient(cfg.SocketPath)
 
-	// The state endpoint carries no secret values and stays open.
+	// The state endpoint carries no secret values and stays open, but it names
+	// the secrets only to a peer the secret policy admits.
+	srv.cache.UpdateSecretIndex([]api.SecretRef{{Key: "db-pass", Version: 2}})
 	resp, err := httpClient.Get("http://localhost/v1/state")
 	if err != nil {
 		cancel()
 		t.Fatalf("GET /v1/state: %v", err)
 	}
+	var summary StateSummary
+	decodeErr := json.NewDecoder(resp.Body).Decode(&summary)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		cancel()
 		t.Errorf("GET /v1/state: status = %d, want 200", resp.StatusCode)
+	}
+	if decodeErr != nil {
+		cancel()
+		t.Fatalf("decode /v1/state: %v", decodeErr)
+	}
+	wantNamed := 0
+	if currentPeerIsPrivileged() {
+		wantNamed = 1
+	}
+	if len(summary.SecretKeys) != wantNamed {
+		cancel()
+		t.Errorf("GET /v1/state: secret_keys = %+v, want %d entries", summary.SecretKeys, wantNamed)
 	}
 
 	// The secret routes admit only a privileged peer.
