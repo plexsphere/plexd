@@ -346,6 +346,20 @@ func TestComputeDiff_ReportsTransitions(t *testing.T) {
 	}
 }
 
+// TestComputeDiff_SecretsNotDiffed proves the secret inventory never counts as
+// drift: the node API's dispatch handler consumes it on every pull, so a pull
+// whose only change is the secrets block reports an empty diff.
+func TestComputeDiff_SecretsNotDiffed(t *testing.T) {
+	desired := &api.NodeStateSnapshot{Secrets: &[]api.NodeStateSecret{{Name: "db-password", Version: 3}}}
+	current := &api.NodeStateSnapshot{Secrets: &[]api.NodeStateSecret{{Name: "db-password", Version: 2}}}
+	if diff := ComputeDiff(desired, current); !diff.IsEmpty() {
+		t.Errorf("a secrets-only change: diff = %+v, want empty", diff)
+	}
+	if diff := ComputeDiff(desired, &api.NodeStateSnapshot{}); !diff.IsEmpty() {
+		t.Errorf("secrets against a nil block: diff = %+v, want empty", diff)
+	}
+}
+
 func TestComputeDiff_NilDesired(t *testing.T) {
 	diff := ComputeDiff(nil, &api.NodeStateSnapshot{Policy: &api.PolicySnapshot{Fingerprint: "fp"}})
 	if !diff.IsEmpty() {

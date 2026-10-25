@@ -12,7 +12,8 @@ import (
 // can safely read while the reconcile loop writes. Reachability is the node's
 // own health projection, not desired state, so it is never stored. Neither is
 // the signing key: a dispatch handler installs it on every pull, and there is
-// nothing for the differ to converge on.
+// nothing for the differ to converge on. Nor is the secret inventory: the node
+// API's dispatch handler hands it to the secret index on every pull.
 type stateSnapshot struct {
 	mu      sync.RWMutex
 	peers   []api.SnapshotPeer
@@ -28,7 +29,7 @@ func NewStateSnapshot() *stateSnapshot {
 }
 
 // Get returns a deep copy of the current snapshot as an api.NodeStateSnapshot.
-// Reachability and SigningKey are not desired state, so they are always nil.
+// Reachability, SigningKey and Secrets are not stored, so they are always nil.
 func (s *stateSnapshot) Get() api.NodeStateSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

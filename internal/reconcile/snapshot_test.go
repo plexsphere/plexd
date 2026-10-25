@@ -47,6 +47,7 @@ func sampleSnapshot() *api.NodeStateSnapshot {
 			Data:     []api.StateEntry{},
 			Reports:  []api.StateEntry{},
 		},
+		Secrets: &[]api.NodeStateSecret{{Name: "db-password", Version: 2}},
 	}
 }
 
@@ -102,6 +103,11 @@ func TestStateSnapshot_Update(t *testing.T) {
 	// Reachability is not desired state.
 	if got.Reachability != nil {
 		t.Errorf("expected nil Reachability after update, got %v", got.Reachability)
+	}
+	// Neither is the secret inventory: the node API's dispatch handler
+	// consumes it on every pull.
+	if got.Secrets != nil {
+		t.Errorf("expected nil Secrets after update, got %v", got.Secrets)
 	}
 }
 
