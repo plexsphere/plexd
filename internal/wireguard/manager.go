@@ -44,6 +44,18 @@ type Manager struct {
 
 	// now is endpoint selection's clock; tests replace it.
 	now func() time.Time
+
+	// probe measures the uplink: it returns the largest IPv4 packet size, in
+	// bytes, that reached a STUN server. It is nil until SetPathMTUProbe sets
+	// it, and the interface then keeps DefaultMTU unless Config.MTU pins one.
+	probe func(context.Context) (int, error)
+	// mtu is the MTU last programmed on the interface, and raiseTo the higher
+	// MTU the last probe round asked for, 0 when no raise is pending. Only
+	// Setup touches them, and after it returns only the single RunMTUProbe
+	// goroutine does, so they need no lock. SetMTU does not take mu, which
+	// serializes peer writes only.
+	mtu     int
+	raiseTo int
 }
 
 // NewManager creates a new Manager. Config defaults are applied automatically.
@@ -61,7 +73,15 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager {
 }
 
 // Setup creates and configures the WireGuard interface using the node identity.
+//
+// It chooses the interface MTU first: a positive Config.MTU pins it, otherwise
+// one round of the path MTU probe sizes it with MeshMTU, and without a probe,
+// or when the round fails, it is DefaultMTU. The round runs before
+// CreateInterface, so a round that waits out its timeout holds up startup
+// without a half-configured interface on the host meanwhile.
 func (m *Manager) Setup(ctx context.Context, identity *registration.NodeIdentity) error {
+	mtu, source, pathMTU := m.chooseMTU(ctx)
+
 	if err := m.ctrl.CreateInterface(m.cfg.InterfaceName, identity.PrivateKey, m.cfg.ListenPort); err != nil {
 		return fmt.Errorf("wireguard: setup: %w", err)
 	}
@@ -71,9 +91,15 @@ func (m *Manager) Setup(ctx context.Context, identity *registration.NodeIdentity
 		return fmt.Errorf("wireguard: setup: %w", err)
 	}
 
-	if m.cfg.MTU > 0 {
-		if err := m.ctrl.SetMTU(m.cfg.InterfaceName, m.cfg.MTU); err != nil {
+	// Every controller creates the device at DefaultMTU, so an MTU nobody
+	// pinned needs a write only when it differs, and a node on a full-size
+	// uplink makes the calls it made before detection existed.
+	if m.cfg.MTU > 0 || mtu != DefaultMTU {
+		if err := m.ctrl.SetMTU(m.cfg.InterfaceName, mtu); err != nil {
 			return fmt.Errorf("wireguard: setup: %w", err)
+		}
+		if source == mtuSourceProbe {
+			m.warnBelowMinimum(pathMTU)
 		}
 	}
 
@@ -86,13 +112,20 @@ func (m *Manager) Setup(ctx context.Context, identity *registration.NodeIdentity
 	if prefix, err := netip.ParsePrefix(address); err == nil {
 		m.meshPrefix = prefix.Masked()
 	}
+	m.mtu = mtu
 
-	m.logger.Info("wireguard interface configured",
+	attrs := []any{
 		"component", "wireguard",
 		"interface", m.cfg.InterfaceName,
 		"listen_port", m.cfg.ListenPort,
 		"mesh_ip", identity.MeshIP,
-	)
+		"mtu", mtu,
+		"mtu_source", source,
+	}
+	if source == mtuSourceProbe {
+		attrs = append(attrs, "path_mtu", pathMTU)
+	}
+	m.logger.Info("wireguard interface configured", attrs...)
 
 	return nil
 }

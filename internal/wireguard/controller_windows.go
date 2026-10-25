@@ -218,7 +218,9 @@ func (c *WindowsController) createAdapter(name string, privateKey []byte, listen
 	}
 
 	// device.DefaultMTU is 1420, what the Linux kernel gives a WireGuard link,
-	// so a Config.MTU of 0 ("system default") means the same on both platforms.
+	// so the device starts at the same MTU on both platforms. Manager.Setup
+	// calls SetMTU when Config.MTU pins a value or MTU detection picks another
+	// one, and RunMTUProbe can call it again at runtime.
 	tdev, err := c.createTUN(name, device.DefaultMTU)
 	if err != nil {
 		// Without a hint an operator reads only "Access is denied." or "The
@@ -241,9 +243,10 @@ func (c *WindowsController) createAdapter(name string, privateKey []byte, listen
 	luid := wd.LUID()
 
 	// CreateTUN records the MTU in wireguard-go's own field without programming
-	// the interface, and Manager.Setup calls SetMTU only when the configuration
-	// asks for one. Without this the adapter would keep the driver's default
-	// while the device encapsulated for 1420.
+	// the interface, and Manager.Setup calls SetMTU only when Config.MTU pins a
+	// value or MTU detection picks one other than 1420 (RunMTUProbe can call it
+	// again at runtime). Without this the adapter would keep the driver's
+	// default while the device encapsulated for 1420.
 	if err := c.ipcfg.SetMTU(luid, device.DefaultMTU); err != nil {
 		tdev.Close()
 		return fmt.Errorf("wireguard: create interface: set default mtu: %w", err)
