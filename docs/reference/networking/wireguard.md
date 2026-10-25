@@ -18,7 +18,7 @@ All OS-level WireGuard operations go through a `WGController` interface, enablin
 |-----------------|----------|---------|--------------------------------------|
 | `InterfaceName` | `string` | `plexd0`   | WireGuard network interface name     |
 | `ListenPort`    | `int`    | `51820` | UDP listen port                      |
-| `MTU`           | `int`    | `0`     | Interface MTU (0 = system default)   |
+| `MTU`           | `int`    | `0`     | Interface MTU. `0` sizes the interface to the uplink, a positive value pins it. See [MTU detection](#mtu-detection) |
 | `EdgePSK`       | `*bool`  | `nil` (enabled) | Fetch each edge's PSK and program it on the peer (`edge_psk`). See [Edge PSKs](#edge-psks) |
 | `PersistentKeepalive` | `*time.Duration` | `nil` (25s) | Keepalive interval written on every mesh peer (`persistent_keepalive`). See [Endpoint selection](#endpoint-selection) |
 
@@ -164,7 +164,7 @@ A utun is point-to-point, so the `inet` form takes the destination address after
 
 `DeleteInterface` runs no command: closing the device closes the tun, and the kernel then destroys the `utunN` with its addresses and routes.
 
-A `Config.MTU` of `0` leaves the device at wireguard-go's `device.DefaultMTU` of 1420, the same value the Linux kernel gives a WireGuard link, so "system default" means the same on both platforms.
+The device starts at wireguard-go's `device.DefaultMTU` of 1420, the same value the Linux kernel gives a WireGuard link. With a `Config.MTU` of `0`, 1420 is the starting value on both platforms, and [MTU detection](#mtu-detection) can lower it through the `SetMTU` command above.
 
 ## Windows controller
 
@@ -201,7 +201,7 @@ The adapter is recorded before the wait starts, so the wait runs outside the con
 
 The address carries its own prefix length, and Windows installs the on-link route for that prefix itself, the way Linux does when an address is added. macOS is the exception that needs the route added by hand. Routes for peer `AllowedIPs` beyond the address prefix belong to the bridge route controller, as they do everywhere else. An address already on the adapter is reported as `ERROR_OBJECT_ALREADY_EXISTS`, which the controller treats as success.
 
-The MTU is programmed twice over an interface's life: once at creation, to 1420, and again whenever the configuration asks for another value. Creating the adapter records the MTU in wireguard-go's own field without telling the interface, and no OS event ever reports an MTU change back on Windows, so the controller both programs the interface and pushes the value to the running device. A `Config.MTU` of `0` therefore still means 1420, as it does on Linux and macOS.
+The MTU is programmed once at creation, to 1420, and again on every `SetMTU`: for a `Config.MTU` that pins another value, or when [MTU detection](#mtu-detection) changes it at startup or on a later round. Creating the adapter records the MTU in wireguard-go's own field without telling the interface, and no OS event ever reports an MTU change back on Windows, so the controller both programs the interface and pushes the value to the running device. With a `Config.MTU` of `0`, 1420 is the starting value, as it is on Linux and macOS, and detection can lower it from there.
 
 `SetInterfaceUp` runs nothing: a Wintun adapter's media state is connected from the moment its session starts inside `CreateTUN`. `DeleteInterface` runs nothing either, because closing the device closes the tun, which ends the session and closes the adapter; Windows then removes it with its addresses and routes. The adapter is scoped to the handles that own it, so it also disappears if the process dies without a clean shutdown.
 
@@ -278,7 +278,7 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 
 | Method          | Signature                                                                    | Description                                                    |
 |-----------------|------------------------------------------------------------------------------|----------------------------------------------------------------|
-| `Setup`         | `(ctx context.Context, identity *registration.NodeIdentity) error`           | Creates interface, assigns the mesh IP with the `domain_mesh_cidr` prefix (fallback `/32`), sets MTU if > 0, brings up |
+| `Setup`         | `(ctx context.Context, identity *registration.NodeIdentity) error`           | Chooses the MTU, probing the uplink when no MTU is pinned, then creates interface, assigns the mesh IP with the `domain_mesh_cidr` prefix (fallback `/32`), sets MTU when it is pinned or not 1420, brings up. See [Setup Sequence](#setup-sequence) |
 | `Teardown`      | `() error`                                                                   | Deletes the WireGuard interface                                |
 | `OSInterfaceName` | `() string`                                                                | The name the OS knows the interface by (`utunN` on macOS), else `Config.InterfaceName` |
 | `AddPeer`       | `(peer api.Peer) error`                                                      | Writes the peer with the first entry of its dial order and starts its endpoint selection; updates index |
@@ -292,6 +292,8 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 | `SetPeerPSK`    | `(peerNodeID, publicKey string, psk []byte) error`                           | Rewrites the stored peer of `peerNodeID` with `psk` when it was last written with `publicKey`; see [Installing a PSK](#installing-a-psk) |
 | `SetLocalPrefixes` | `(fn func() ([]netip.Prefix, error))`                                     | Sets the function the reconcile handler reads this host's interface prefixes from, to order a peer's on-link candidates first. Call it before the handler runs. See [Dial order](#dial-order) |
 | `RunEndpointSelection` | `(ctx context.Context, interval time.Duration) error`                 | Tries each peer's dial order until a handshake completes, one pass per `interval`, until `ctx` is done; see [Endpoint selection](#endpoint-selection) |
+| `SetPathMTUProbe` | `(probe func(context.Context) (int, error))`                              | Sets the function `Setup` and `RunMTUProbe` measure the uplink's path MTU with. Call it before `Setup`. See [MTU detection](#mtu-detection) |
+| `RunMTUProbe`   | `(ctx context.Context, interval time.Duration) error`                        | Measures the uplink again once per `interval` and lowers or raises the MTU to fit, until `ctx` is done; see [Probing again](#probing-again) |
 
 The package function `ProgrammedEndpoint` (`handler.go`) returns the endpoint the pull gives a snapshot peer without its candidates, from the peer and `MeshPrefix()`; see [Dial order](#dial-order).
 
@@ -389,6 +391,117 @@ All carry `component=wireguard`.
 | `Warn` | `wireguard: endpoint switch failed` | `peer_id`, `endpoint`, `error` |
 | `Warn` | `wireguard: endpoint selection pass failed` | `error` |
 
+### MTU detection
+
+WireGuard sends every mesh packet inside a UDP datagram on the uplink. When the uplink carries less than the interface MTU plus that encapsulation, full-size mesh packets are lost without an error: pings and handshakes are small and pass, while every TCP connection over the mesh stalls at its first full-size segment. DS-Lite over PPPoE, common on the consumer and carrier-grade uplinks edge nodes sit behind, puts the path at 1452 bytes. The manager therefore sizes the interface to what the uplink carries (`mtu.go`), measured with the [path MTU probe](./nat-traversal.md#path-mtu-probe).
+
+```go
+// DefaultMTU is the MTU Linux and wireguard-go give a WireGuard link: 1500 minus 80.
+const DefaultMTU = 1420
+
+// MinMTU is the smallest MTU detection programs.
+const MinMTU = 1280
+
+// MTUProbeInterval is how often RunMTUProbe measures the uplink again in plexd up.
+const MTUProbeInterval = 10 * time.Minute
+
+func MeshMTU(pathMTU int) int
+func (m *Manager) SetPathMTUProbe(probe func(context.Context) (int, error))
+func (m *Manager) RunMTUProbe(ctx context.Context, interval time.Duration) error
+```
+
+#### Sizing rule
+
+`MeshMTU` turns `pathMTU`, the largest IPv4 packet in bytes that reached a STUN server, into the interface MTU:
+
+```
+MeshMTU(pathMTU) = min(1420, max(1280, pathMTU - 80))
+```
+
+80 bytes is WireGuard's worst-case encapsulation: an IPv6 header (40), UDP (8) and WireGuard's data header and tag (16 + 16). The probe measures IPv4, which needs only 60, but peers can dial this node's IPv6 candidates. WireGuard uses the same 80 for its own default (1420 = 1500 − 80), so a node on a 1500-byte uplink keeps exactly 1420.
+
+| Path MTU | Mesh MTU |
+|---|---|
+| 9000 | 1420, the cap |
+| 1500 | 1420 |
+| 1492 (PPPoE) | 1412 |
+| 1452 (DS-Lite over PPPoE) | 1372 |
+| 1360 and below, the probe's 48-byte baseline included | 1280, the floor |
+
+The cap keeps a node on a jumbo-frame uplink at the 1420 every node had before detection. When `pathMTU − 80` is below 1280, `Setup` or a round still programs 1280 and logs `wireguard: uplink carries less than the mesh minimum mtu` with `path_mtu` and `mtu`.
+
+#### At startup
+
+`plexd up` calls `SetPathMTUProbe` before `Setup` with a function that runs [`nat.ProbePathMTU`](./nat-traversal.md#path-mtu-probe) over `nat.stun_servers` with `nat.MTUProbeTimeout` (2 s). `Setup` chooses the MTU first, before it calls `CreateInterface`:
+
+| Case | MTU | `mtu_source` |
+|---|---|---|
+| `Config.MTU > 0` | That value. The probe is never called | `config` |
+| A probe is set and returns a path MTU | `MeshMTU(pathMTU)` | `probe` |
+| A probe is set and returns an error | 1420. Logs `wireguard: mtu probe inconclusive, using the default mtu` with the error | `default` |
+| No probe is set | 1420 | `default` |
+
+`SetMTU` keeps its place between `ConfigureAddress` and `SetInterfaceUp`. It runs when `Config.MTU > 0` or when the chosen MTU is not 1420. All three controllers create the device at 1420, so a 1420 result needs no call, and a node without a pinned MTU on a 1500-byte uplink makes the same controller calls it made before detection. A `SetMTU` error fails `Setup` with `wireguard: setup: <cause>`. The `wireguard interface configured` line carries `mtu`, `mtu_source` and, with `mtu_source=probe`, the measured `path_mtu`.
+
+Startup waits for the probe round. On a healthy uplink that is one round trip to the STUN servers. It takes up to 2 s only while some probe goes unanswered: on a black-holed uplink, or when no STUN server is reachable.
+
+#### Probing again
+
+An uplink can change after startup, through LTE failover or a laptop changing networks. `RunMTUProbe` measures it again on every tick of `interval`:
+
+- It returns nil at once when no probe is set or `Config.MTU > 0`.
+- Otherwise it logs `wireguard: mtu probe started` with `interval` and runs a round on every tick. The startup probe in `Setup` counts as the first round, so the first tick comes one interval after start.
+- It returns nil once `ctx` is done.
+
+`plexd up` runs it with `MTUProbeInterval` as step 17c, only when the WireGuard interface came up.
+
+A round compares the target, `MeshMTU(pathMTU)`, with the MTU last programmed:
+
+| Round | What it does |
+|---|---|
+| Target below the current MTU | Calls `SetMTU` with the target at once and logs `wireguard: mesh mtu lowered` |
+| Target above the current MTU and equal to the pending raise | Calls `SetMTU` with the target and logs `wireguard: mesh mtu raised` |
+| Target above the current MTU, with no pending raise or another one | Records the target as the pending raise and logs `wireguard: higher mesh mtu seen, raising when the next probe agrees` at `debug`. No device write |
+| Target equal to the current MTU | Clears the pending raise |
+| The probe returned an error | Keeps the MTU, clears the pending raise, and logs `wireguard: mtu probe inconclusive, keeping the current mtu` |
+| `ctx` done, during or after the probe | Returns without touching the device and logs nothing. Shutdown deletes the interface before it waits for the loop |
+
+A lower MTU applies at once, because the uplink already loses packets at the current one. A higher MTU applies only when two rounds in a row ask for the same target, 10 minutes apart in `plexd up`. A round with another target, the current MTU or a failed probe in between starts the wait over.
+
+A failed `SetMTU` logs `wireguard: mesh mtu change failed`, keeps the MTU last programmed, and clears the pending raise. The next round retries a failed lowering, because a target below the MTU applies at once. A failed raise starts the two-round wait over: the next round records the raise again, and the one after writes it. A successful `SetMTU` records the new MTU and clears the pending raise.
+
+Only `Setup` touches the MTU last programmed and the pending raise, and after it returns only the one `RunMTUProbe` goroutine does, so they need no lock. `SetMTU` does not take the mutex that serializes peer writes.
+
+#### Turning detection off
+
+- `wireguard.mtu` above 0 pins the MTU. `Setup` programs it with `mtu_source=config` and never calls the probe, and `RunMTUProbe` returns at once. `wireguard.mtu: 1420` pins the MTU plexd used before detection.
+- `nat.enabled: false` turns detection off. `plexd up` sets no probe, and when `wireguard.mtu` is 0 it logs `mesh mtu detection disabled by nat.enabled` at `info`. The interface comes up at 1420 with `mtu_source=default`. A `nat` block that sets only `enabled: false` does not get there: the block's zero-value heuristic sets `enabled` back to `true` when `stun_servers`, `refresh_interval`, `timeout` and `min_report_interval` are all unset, so set one of them beside it (see [Config](./nat-traversal.md#config)).
+
+#### Limits
+
+- WireGuard has one MTU per interface, so peers on the same LAN get the reduced MTU too.
+- The probe measures the path to the STUN servers over IPv4, in the outbound direction. An IPv6-only node gets an inconclusive probe and keeps 1420. A bottleneck on a path the STUN traffic does not cross stays unseen; pin the MTU with `wireguard.mtu` there.
+- A peer keeps its own MTU. TCP over the mesh fits in both directions, because the lowered side announces the smaller MSS. Non-TCP packets above the reduced size that the far side sends can still be lost.
+- Only the mesh interface is sized. The bridge access and site-to-site interfaces do not carry mesh traffic over the uplink the probe measures.
+
+#### MTU detection log lines
+
+All carry `component=wireguard`.
+
+| Level | Message | Keys | When |
+|-------|---------|------|------|
+| `Info` | `wireguard interface configured` | `interface`, `listen_port`, `mesh_ip`, `mtu`, `mtu_source` (`config`, `probe`, `default`), `path_mtu` (only with `probe`) | `Setup` succeeded |
+| `Warn` | `wireguard: mtu probe inconclusive, using the default mtu` | `mtu` (1420), `error` | The startup probe failed |
+| `Warn` | `wireguard: uplink carries less than the mesh minimum mtu` | `path_mtu`, `mtu` (1280) | `Setup` or a round programs 1280 because `pathMTU − 80 < 1280` |
+| `Info` | `wireguard: mtu probe started` | `interval` | `RunMTUProbe` begins |
+| `Info` | `wireguard: mesh mtu lowered` | `old_mtu`, `mtu`, `path_mtu` | A round lowered the MTU |
+| `Info` | `wireguard: mesh mtu raised` | `old_mtu`, `mtu`, `path_mtu` | A second agreeing round raised it |
+| `Debug` | `wireguard: higher mesh mtu seen, raising when the next probe agrees` | `mtu`, `raise_to`, `path_mtu` | A round asked for a raise |
+| `Warn` | `wireguard: mtu probe inconclusive, keeping the current mtu` | `mtu`, `error` | A round's probe failed |
+| `Warn` | `wireguard: mesh mtu change failed` | `old_mtu`, `mtu`, `error` | A round's `SetMTU` failed |
+
+`plexd up` itself logs `mesh mtu detection disabled by nat.enabled` at `info` when `nat.enabled` is false and `wireguard.mtu` is 0.
+
 ### Lifecycle
 
 ```go
@@ -397,11 +510,19 @@ logger := slog.Default()
 // Create manager with a WGController implementation
 mgr := wireguard.NewManager(ctrl, wireguard.Config{}, logger)
 
+// Size the interface to the uplink; without a probe it comes up at 1420
+mgr.SetPathMTUProbe(func(ctx context.Context) (int, error) {
+    return nat.ProbePathMTU(ctx, natCfg.STUNServers, nat.MTUProbeTimeout)
+})
+
 // Setup interface using node identity from registration
 identity, _ := registration.LoadIdentity("/var/lib/plexd")
 if err := mgr.Setup(ctx, identity); err != nil {
     log.Fatal(err)
 }
+
+// Measure the uplink again every 10 minutes (blocks until ctx is done)
+go mgr.RunMTUProbe(ctx, wireguard.MTUProbeInterval)
 
 // Configure initial peers from registration response
 if err := mgr.ConfigurePeers(ctx, registerResponse.Peers); err != nil {
@@ -421,11 +542,12 @@ if err := mgr.Teardown(); err != nil {
 
 ### Setup Sequence
 
-1. `CreateInterface(name, privateKey, listenPort)` — create WireGuard interface with node's private key
-2. `ConfigureAddress(name, meshIP+"/<prefix>")` — assign the mesh IP. The prefix length comes from the registration `domain_mesh_cidr`, so the kernel installs an on-link route for the whole mesh (which the snapshot peers, advertised as `mesh_ip/32`, rely on). Identities without the field, or with an unparseable value, fall back to a host `/32` (the unparseable case is logged as a warning). On macOS the on-link route is not implicit and `DarwinController` installs it explicitly (see [macOS controller](#macos-controller))
-3. `SetMTU(name, mtu)` — only if `Config.MTU > 0`
-4. `SetInterfaceUp(name)` — bring the interface up
-5. Record the address's masked prefix as the [mesh prefix](#mesh-prefix)
+1. Choose the MTU: `Config.MTU` when it is above 0; otherwise, with a probe set through `SetPathMTUProbe`, `MeshMTU` of the path MTU it measures, or 1420 when it returns an error; otherwise 1420. The probe runs before any controller call (see [At startup](#at-startup))
+2. `CreateInterface(name, privateKey, listenPort)` — create WireGuard interface with node's private key
+3. `ConfigureAddress(name, meshIP+"/<prefix>")` — assign the mesh IP. The prefix length comes from the registration `domain_mesh_cidr`, so the kernel installs an on-link route for the whole mesh (which the snapshot peers, advertised as `mesh_ip/32`, rely on). Identities without the field, or with an unparseable value, fall back to a host `/32` (the unparseable case is logged as a warning). On macOS the on-link route is not implicit and `DarwinController` installs it explicitly (see [macOS controller](#macos-controller))
+4. `SetMTU(name, mtu)` — only if `Config.MTU > 0` or the chosen MTU is not 1420, the MTU every controller creates the device with
+5. `SetInterfaceUp(name)` — bring the interface up
+6. Record the address's masked prefix as the [mesh prefix](#mesh-prefix)
 
 ### Error Handling
 
@@ -437,6 +559,7 @@ if err := mgr.Teardown(); err != nil {
 | `ConfigurePeers`  | Logged at error, continues       | Returns context error      |
 | `SetPeerPSK`      | Returns `wireguard: set peer psk: <cause>` | —                |
 | `RunEndpointSelection` | A failed switch is logged at warn and the pass goes on | Returns nil |
+| `RunMTUProbe`     | A failed probe or `SetMTU` is logged at warn. The next round probes again and retries a failed lowering; a failed raise starts the two-round wait over | Returns nil |
 
 ### Logging
 
@@ -444,13 +567,13 @@ All log entries use `component=wireguard`. Private keys and PSKs are never logge
 
 | Level   | Event                        | Keys                                  |
 |---------|------------------------------|---------------------------------------|
-| `Info`  | Interface configured         | `interface`, `listen_port`, `mesh_ip` |
+| `Info`  | Interface configured         | `interface`, `listen_port`, `mesh_ip`, `mtu`, `mtu_source`, `path_mtu` (only with `mtu_source=probe`) |
 | `Info`  | Peers configured (bulk)      | `count`                               |
 | `Debug` | Peer added/removed/updated   | `peer_id`                             |
 | `Debug` | Peer PSK set (`peer psk set`) | `peer_id`                            |
 | `Error` | Peer operation failed (bulk) | `peer_id`, `error`                    |
 
-Endpoint selection writes the lines in [Endpoint selection log lines](#endpoint-selection-log-lines), and the reconcile handler the dial order lines in [Dial order](#dial-order).
+Endpoint selection writes the lines in [Endpoint selection log lines](#endpoint-selection-log-lines), MTU detection the lines in [MTU detection log lines](#mtu-detection-log-lines), and the reconcile handler the dial order lines in [Dial order](#dial-order).
 
 ## ReconcileHandler
 
