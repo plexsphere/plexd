@@ -520,6 +520,10 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 				IdleTimeoutSeconds: 300,
 			},
 		},
+		Secrets: &[]NodeStateSecret{
+			{Name: "api-token", Version: 1},
+			{Name: "db-password", Version: 2},
+		},
 		SigningKey: &NodeStateSigningKey{
 			KeyID:     "signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1-1767225600000000000",
 			PublicKey: "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
@@ -528,15 +532,15 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Exactly the nine contract keys must appear.
+	// Exactly the ten contract keys must appear.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 9 {
-		t.Errorf("expected exactly 9 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 10 {
+		t.Errorf("expected exactly 10 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "signing_key"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
@@ -574,7 +578,7 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		t.Error("policy:{} should decode to a non-nil pointer, distinct from null")
 	}
 
-	// Marshalling nil blocks emits literal null with all nine keys PRESENT.
+	// Marshalling nil blocks emits literal null with all ten keys PRESENT.
 	out, err := json.Marshal(NodeStateSnapshot{})
 	if err != nil {
 		t.Fatalf("marshal zero value: %v", err)
@@ -583,10 +587,10 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if err := json.Unmarshal(out, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 9 {
-		t.Errorf("expected exactly 9 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 10 {
+		t.Errorf("expected exactly 10 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "signing_key"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key"} {
 		v, ok := raw[key]
 		if !ok {
 			t.Errorf("key %q absent, want present with null value", key)
@@ -622,6 +626,51 @@ func TestNodeStateSnapshot_SigningKeyBlock(t *testing.T) {
 	}
 	if snap.SigningKey == nil || snap.SigningKey.KeyID != "k" || snap.SigningKey.PublicKey != "p" {
 		t.Errorf("signing_key = %+v, want key_id k and public_key p", snap.SigningKey)
+	}
+}
+
+// TestNodeStateSnapshot_SecretsBlock pins the shapes the secrets block arrives
+// in. A populated block carries each entry's name and version, and [] decodes to
+// a non-nil pointer to an empty slice: the node may read nothing. null and an
+// absent key both decode to a nil pointer, which the node API reads as "keep the
+// secret index". None of them is a decode error.
+func TestNodeStateSnapshot_SecretsBlock(t *testing.T) {
+	const others = `"peers":[],"reachability":null,"policy":null,"bridge":null,"state":null,"reports":null,"executions":[],"sessions":[]`
+
+	var populated NodeStateSnapshot
+	if err := json.Unmarshal([]byte(`{`+others+`,"secrets":[{"name":"db-password","version":2}]}`), &populated); err != nil {
+		t.Fatalf("unmarshal populated: %v", err)
+	}
+	want := []NodeStateSecret{{Name: "db-password", Version: 2}}
+	if populated.Secrets == nil || !slices.Equal(*populated.Secrets, want) {
+		t.Errorf("secrets = %#v, want a pointer to %#v", populated.Secrets, want)
+	}
+
+	tests := []struct {
+		name    string
+		src     string
+		wantNil bool
+	}{
+		{name: "empty array", src: `{` + others + `,"secrets":[]}`},
+		{name: "null", src: `{` + others + `,"secrets":null}`, wantNil: true},
+		{name: "key absent", src: `{` + others + `}`, wantNil: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var snap NodeStateSnapshot
+			if err := json.Unmarshal([]byte(tt.src), &snap); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if tt.wantNil {
+				if snap.Secrets != nil {
+					t.Errorf("secrets = %#v, want a nil pointer", snap.Secrets)
+				}
+				return
+			}
+			if snap.Secrets == nil || len(*snap.Secrets) != 0 {
+				t.Errorf("secrets = %#v, want a non-nil pointer to an empty slice", snap.Secrets)
+			}
+		})
 	}
 }
 

@@ -38,6 +38,13 @@ const (
 	// the tier — the resulting pull carries the session.
 	EventSessionSetup = "session_setup"
 
+	// EventNodeSecretsUpdated carries the node's full secret inventory, but the
+	// inventory also rides the secrets block of the state pull, which is
+	// authoritative: the payload is treated as opaque and the event triggers a
+	// reconcile like the rest of the tier, so an event that arrives late can
+	// never roll the node API's secret index back.
+	EventNodeSecretsUpdated = "node_secrets_updated"
+
 	// Documented-coming family: types that land with the platform's 14-type
 	// taxonomy. They are already named so the agent can subscribe to them once
 	// the control plane starts emitting them; every one triggers a reconcile.

@@ -429,6 +429,7 @@ func TestEventTypeConstants(t *testing.T) {
 		{"EventBridgeConfigUpdated", EventBridgeConfigUpdated, "bridge_config_updated"},
 		{"EventActionRequest", EventActionRequest, "action_request"},
 		{"EventSessionSetup", EventSessionSetup, "session_setup"},
+		{"EventNodeSecretsUpdated", EventNodeSecretsUpdated, "node_secrets_updated"},
 
 		// Documented-coming family.
 		{"EventPeerRegistered", EventPeerRegistered, "peer_registered"},

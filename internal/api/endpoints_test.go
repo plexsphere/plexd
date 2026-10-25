@@ -1107,6 +1107,30 @@ func TestFetchSecret_NameInvalid(t *testing.T) {
 	}
 }
 
+// TestValidSecretName pins ValidSecretName to the grammar FetchSecret enforces:
+// a lowercase letter first, then at most 62 of [a-z0-9_-].
+func TestValidSecretName(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"a", true},
+		{"db-password", true},
+		{"db_password2", true},
+		{"a" + strings.Repeat("b", 62), true},
+		{"", false},
+		{"Db", false},
+		{"1abc", false},
+		{"tls/server.key", false},
+		{"a" + strings.Repeat("b", 63), false},
+	}
+	for _, tt := range tests {
+		if got := ValidSecretName(tt.name); got != tt.want {
+			t.Errorf("ValidSecretName(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
 func TestFetchSecret_NegativeVersion(t *testing.T) {
 	var hits int
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
