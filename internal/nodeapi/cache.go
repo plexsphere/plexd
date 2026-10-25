@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -210,16 +211,23 @@ func (sc *StateCache) UpdateData(entries []api.DataEntry) {
 	sc.data = newData
 }
 
-// UpdateSecretIndex replaces the secret index in memory and persists to
-// secrets.json.
-func (sc *StateCache) UpdateSecretIndex(refs []api.SecretRef) {
+// UpdateSecretIndex replaces the secret index in memory and persists it to
+// secrets.json, and reports whether the index changed. An index equal to the
+// one held, with nil and empty counting as equal, changes nothing and is not
+// written again. A failed write is logged, and the index in memory is replaced
+// all the same.
+func (sc *StateCache) UpdateSecretIndex(refs []api.SecretRef) bool {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
+	if slices.Equal(sc.secretIndex, refs) {
+		return false
+	}
 	cp := make([]api.SecretRef, len(refs))
 	copy(cp, refs)
 	sc.secretIndex = cp
 	sc.persistJSON(filepath.Join(sc.stateDir(), "secrets.json"), sc.secretIndex)
+	return true
 }
 
 // deliveryModeMetadataKey is the synthetic metadata key under which the SSE

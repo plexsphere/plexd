@@ -384,6 +384,40 @@ func TestHandler_GetSecretValue_ErrorMapping(t *testing.T) {
 	}
 }
 
+// TestHandler_GetSecretValue_FetchErrorKeepsIndex proves a fetch the control
+// plane refuses leaves the secret index alone: right after a grant the fetch
+// can still answer 403 for a name the inventory lists, and only an inventory
+// that leaves the name out takes it away.
+func TestHandler_GetSecretValue_FetchErrorKeepsIndex(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{"forbidden", api.ErrForbidden, http.StatusForbidden},
+		{"not found", api.ErrNotFound, http.StatusNotFound},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, cache := newTestHandler(t, &mockSecretFetcher{err: tc.err})
+			cache.UpdateSecretIndex([]api.SecretRef{{Key: "db-pass", Version: 1}})
+
+			resp := mustGet(t, srv.URL+"/v1/state/secrets/db-pass")
+			resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+
+			resp = mustGet(t, srv.URL+"/v1/state/secrets")
+			var listed []api.SecretRef
+			decodeJSON(t, resp, &listed)
+			if want := (api.SecretRef{Key: "db-pass", Version: 1}); len(listed) != 1 || listed[0] != want {
+				t.Errorf("listed after the refused fetch = %v, want [%v]", listed, want)
+			}
+		})
+	}
+}
+
 func TestHandler_GetSecretValue_DecryptionFailure(t *testing.T) {
 	// A garbage envelope cannot be decrypted → 500, and the error log carries
 	// kid and version attributes alongside the key.

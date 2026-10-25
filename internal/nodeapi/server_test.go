@@ -302,8 +302,9 @@ func TestServer_ReconcileHandler(t *testing.T) {
 		t.Fatal("socket did not appear")
 	}
 
-	// Pre-seed the secret index so we can assert reconcile leaves it untouched
-	// (secret refs no longer ride the snapshot).
+	// Pre-seed the secret index so we can assert reconcile leaves it untouched:
+	// only SecretIndexDispatchHandler writes it, even when the snapshot carries
+	// a secrets block.
 	srv.cache.UpdateSecretIndex([]api.SecretRef{{Key: "db-pass", Version: 2}})
 
 	// Pre-seed a data entry the next snapshot no longer carries, to prove the
@@ -326,6 +327,7 @@ func TestServer_ReconcileHandler(t *testing.T) {
 			Data:     []api.StateEntry{{Key: "cfg", Value: "hello"}},
 			Reports:  []api.StateEntry{},
 		},
+		Secrets: &[]api.NodeStateSecret{{Name: "other", Version: 9}},
 	}
 	if err := handler(ctx, desired, reconcile.StateDiff{StateChanged: true}); err != nil {
 		cancel()
@@ -409,6 +411,239 @@ func TestServer_ReconcileHandler(t *testing.T) {
 
 	cancel()
 	<-errCh
+}
+
+// newSecretIndexTestServer builds a Server over dataDir whose log lands in buf,
+// with its cache loaded, and an HTTP server serving the node API from that
+// cache, for the secret index dispatch handler tests.
+func newSecretIndexTestServer(t *testing.T, dataDir string, buf *bytes.Buffer) (*Server, *httptest.Server) {
+	t.Helper()
+	srv := NewServer(Config{DataDir: dataDir}, &serverTestClient{}, make([]byte, 32), bufferLogger(buf))
+	if err := srv.cache.Load(); err != nil {
+		t.Fatalf("cache.Load: %v", err)
+	}
+	ts := httptest.NewServer(NewHandler(srv.cache, &mockSecretFetcher{}, "node-1", nil, discardLogger()).Mux())
+	t.Cleanup(ts.Close)
+	return srv, ts
+}
+
+// listedSecrets returns the compacted body GET /v1/state/secrets answers.
+func listedSecrets(t *testing.T, baseURL string) string {
+	t.Helper()
+	resp := mustGet(t, baseURL+"/v1/state/secrets")
+	body := readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/state/secrets: status = %d, want 200", resp.StatusCode)
+	}
+	return compactJSON(t, body)
+}
+
+// compactJSON returns data as compact JSON.
+func compactJSON(t *testing.T, data []byte) string {
+	t.Helper()
+	var out bytes.Buffer
+	if err := json.Compact(&out, data); err != nil {
+		t.Fatalf("compact %s: %v", data, err)
+	}
+	return out.String()
+}
+
+// logLines returns the lines of a text log that carry the message msg.
+func logLines(log, msg string) []string {
+	var lines []string
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, `msg="`+msg+`"`) {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// inventory returns a snapshot whose secrets block holds entries.
+func inventory(entries ...api.NodeStateSecret) *api.NodeStateSnapshot {
+	if entries == nil {
+		entries = []api.NodeStateSecret{}
+	}
+	return &api.NodeStateSnapshot{Secrets: &entries}
+}
+
+// TestServer_SecretIndexDispatchHandler proves the pull's secrets block feeds
+// the secret index: entries are listed under their name as key, in pull order;
+// an unchanged inventory changes nothing; a nil block keeps the index; and []
+// empties it. Each change logs one Info line with the entry count, and a nil
+// block one Debug line.
+func TestServer_SecretIndexDispatchHandler(t *testing.T) {
+	var buf bytes.Buffer
+	srv, ts := newSecretIndexTestServer(t, t.TempDir(), &buf)
+	handler := srv.SecretIndexDispatchHandler()
+	ctx := context.Background()
+	const updated = "secret index updated"
+
+	populated := inventory(
+		api.NodeStateSecret{Name: "api-token", Version: 1},
+		api.NodeStateSecret{Name: "db-password", Version: 2},
+	)
+	handler(ctx, populated)
+	const want = `[{"key":"api-token","version":1},{"key":"db-password","version":2}]`
+	if got := listedSecrets(t, ts.URL); got != want {
+		t.Errorf("listed = %s, want %s", got, want)
+	}
+	if lines := logLines(buf.String(), updated); len(lines) != 1 ||
+		!strings.Contains(lines[0], "level=INFO") || !strings.Contains(lines[0], "count=2") {
+		t.Errorf("%q lines = %q, want one at INFO with count=2", updated, lines)
+	}
+
+	// The same inventory again changes nothing and logs nothing.
+	handler(ctx, populated)
+	if lines := logLines(buf.String(), updated); len(lines) != 1 {
+		t.Errorf("after an unchanged pull, %q lines = %q, want 1", updated, lines)
+	}
+
+	// A nil block keeps the index.
+	handler(ctx, &api.NodeStateSnapshot{})
+	if got := listedSecrets(t, ts.URL); got != want {
+		t.Errorf("after a nil block, listed = %s, want %s", got, want)
+	}
+	if lines := logLines(buf.String(), "state pull carried no secret inventory; keeping the secret index"); len(lines) != 1 ||
+		!strings.Contains(lines[0], "level=DEBUG") {
+		t.Errorf("nil-block lines = %q, want one at DEBUG", lines)
+	}
+
+	// [] says the node may read nothing.
+	handler(ctx, inventory())
+	if got := listedSecrets(t, ts.URL); got != "[]" {
+		t.Errorf("after [], listed = %s, want []", got)
+	}
+	if lines := logLines(buf.String(), updated); len(lines) != 2 ||
+		!strings.Contains(lines[1], "level=INFO") || !strings.Contains(lines[1], "count=0") {
+		t.Errorf("after [], %q lines = %q, want a second one at INFO with count=0", updated, lines)
+	}
+}
+
+// TestServer_SecretIndexDispatchHandlerDropsEntries proves the index leaves out
+// an entry whose name the fetch would refuse, one whose version is below 1 and
+// one whose name a kept entry already has, logging each at Warn with its
+// reason, and only again once the set of dropped entries changes. The Info
+// line counts the entries the index kept, not the ones the pull carried.
+func TestServer_SecretIndexDispatchHandlerDropsEntries(t *testing.T) {
+	var buf bytes.Buffer
+	srv, ts := newSecretIndexTestServer(t, t.TempDir(), &buf)
+	handler := srv.SecretIndexDispatchHandler()
+	ctx := context.Background()
+	const dropped = "secret inventory entry dropped"
+
+	bad := inventory(
+		api.NodeStateSecret{Name: "Bad", Version: 1},
+		api.NodeStateSecret{Name: "ok", Version: 0},
+		api.NodeStateSecret{Name: "ok", Version: 1},
+		api.NodeStateSecret{Name: "ok", Version: 2},
+		api.NodeStateSecret{Name: "zz", Version: 1},
+	)
+	handler(ctx, bad)
+	if got, want := listedSecrets(t, ts.URL), `[{"key":"ok","version":1},{"key":"zz","version":1}]`; got != want {
+		t.Errorf("listed = %s, want %s", got, want)
+	}
+	wantDropped := []string{
+		`name=Bad version=1 reason="invalid name"`,
+		`name=ok version=0 reason="invalid version"`,
+		`name=ok version=2 reason="duplicate name"`,
+	}
+	lines := logLines(buf.String(), dropped)
+	if len(lines) != len(wantDropped) {
+		t.Fatalf("%q lines = %q, want %d", dropped, lines, len(wantDropped))
+	}
+	for i, want := range wantDropped {
+		if !strings.Contains(lines[i], "level=WARN") || !strings.Contains(lines[i], want) {
+			t.Errorf("dropped line %d = %q, want level=WARN and %s", i, lines[i], want)
+		}
+	}
+	if lines := logLines(buf.String(), "secret index updated"); len(lines) != 1 || !strings.Contains(lines[0], "count=2") {
+		t.Errorf("index update lines = %q, want one with count=2", lines)
+	}
+
+	// The same dropped entries are not logged again.
+	buf.Reset()
+	handler(ctx, bad)
+	if lines := logLines(buf.String(), dropped); len(lines) != 0 {
+		t.Errorf("after a repeat pull, %q lines = %q, want none", dropped, lines)
+	}
+
+	// A different bad entry is.
+	buf.Reset()
+	handler(ctx, inventory(
+		api.NodeStateSecret{Name: "other/name", Version: 1},
+		api.NodeStateSecret{Name: "ok", Version: 1},
+	))
+	if lines := logLines(buf.String(), dropped); len(lines) != 1 || !strings.Contains(lines[0], "name=other/name") {
+		t.Errorf("after a new bad entry, %q lines = %q, want one naming other/name", dropped, lines)
+	}
+}
+
+// TestServer_SecretIndexDispatchHandlerReplacesLoadedIndex proves an index an
+// older release persisted is served until the first pull, which replaces it.
+func TestServer_SecretIndexDispatchHandlerReplacesLoadedIndex(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "state", "secrets.json"), []byte(`[{"key":"stale","version":7}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	srv, ts := newSecretIndexTestServer(t, dir, &buf)
+	if got, want := listedSecrets(t, ts.URL), `[{"key":"stale","version":7}]`; got != want {
+		t.Fatalf("loaded index = %s, want %s", got, want)
+	}
+
+	srv.SecretIndexDispatchHandler()(context.Background(), inventory(api.NodeStateSecret{Name: "fresh", Version: 1}))
+	const want = `[{"key":"fresh","version":1}]`
+	if got := listedSecrets(t, ts.URL); got != want {
+		t.Errorf("after the first pull, listed = %s, want %s", got, want)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "state", "secrets.json"))
+	if err != nil {
+		t.Fatalf("read secrets.json: %v", err)
+	}
+	if got := compactJSON(t, data); got != want {
+		t.Errorf("secrets.json = %s, want %s", got, want)
+	}
+}
+
+// TestServer_SecretIndexDispatchHandlerPersistFailure proves a secrets.json that
+// cannot be written does not hold the index back: the new list is served and
+// the change logged, and the failed write is logged too. A non-empty directory
+// where the file belongs fails the atomic rename for any user, root included.
+func TestServer_SecretIndexDispatchHandlerPersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	var buf bytes.Buffer
+	srv, ts := newSecretIndexTestServer(t, dir, &buf)
+	if err := os.MkdirAll(filepath.Join(dir, "state", "secrets.json", "blocker"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	srv.SecretIndexDispatchHandler()(context.Background(), inventory(api.NodeStateSecret{Name: "db-password", Version: 2}))
+	if got, want := listedSecrets(t, ts.URL), `[{"key":"db-password","version":2}]`; got != want {
+		t.Errorf("listed = %s, want %s", got, want)
+	}
+	for _, msg := range []string{"persist write failed", "secret index updated"} {
+		if lines := logLines(buf.String(), msg); len(lines) != 1 {
+			t.Errorf("%q lines = %q, want 1:\n%s", msg, lines, buf.String())
+		}
+	}
+}
+
+// TestSecretIndexFromInventory_Empty proves an empty or nil inventory maps to
+// an empty, non-nil index and drops nothing.
+func TestSecretIndexFromInventory_Empty(t *testing.T) {
+	for _, in := range [][]api.NodeStateSecret{nil, {}} {
+		refs, dropped := secretIndexFromInventory(in)
+		if refs == nil || len(refs) != 0 {
+			t.Errorf("secretIndexFromInventory(%#v) refs = %#v, want an empty non-nil slice", in, refs)
+		}
+		if len(dropped) != 0 {
+			t.Errorf("secretIndexFromInventory(%#v) dropped = %v, want none", in, dropped)
+		}
+	}
 }
 
 // TestServer_ReconcileHandlerPreservesDeliveryMode proves the authoritative pull

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -288,9 +289,8 @@ func (s *Server) Start(ctx context.Context, nodeID string) error {
 // an api.DataEntry payload under dataStateContentType. A nil state block
 // authoritatively clears both buckets.
 //
-// The secret index is not fed here: secret references no longer ride the
-// snapshot and secret values are always fetched live, so the pull leaves it
-// untouched.
+// The secret index is not fed here: SecretIndexDispatchHandler replaces it from
+// the pull's secrets block on every successful pull, drift or not.
 func (s *Server) ReconcileHandler() reconcile.ReconcileHandler {
 	return func(ctx context.Context, desired *api.NodeStateSnapshot, diff reconcile.StateDiff) error {
 		if !diff.StateChanged {
@@ -317,6 +317,75 @@ func (s *Server) ReconcileHandler() reconcile.ReconcileHandler {
 		s.cache.UpdateData(entries)
 		return nil
 	}
+}
+
+// SecretIndexDispatchHandler returns a reconcile.DispatchHandler that feeds the
+// secret index from the secrets block of every successful state pull, drift or
+// not, so GET /v1/state/secrets lists the Secrets the node may read. It
+// compares the pulled inventory with the index the cache holds, not with the
+// last pull, so an index loaded from a file an older release wrote converges
+// on the first pull. A nil block, which a control plane that predates it
+// sends, keeps the index. An entry the index cannot carry is dropped and
+// logged at Warn, once until the set of dropped entries changes. The reconcile
+// goroutine is the only caller, one cycle at a time, so the closure's state
+// needs no mutex.
+func (s *Server) SecretIndexDispatchHandler() reconcile.DispatchHandler {
+	var lastDropped []droppedSecret
+	return func(_ context.Context, desired *api.NodeStateSnapshot) {
+		if desired.Secrets == nil {
+			s.logger.Debug("state pull carried no secret inventory; keeping the secret index")
+			return
+		}
+		refs, dropped := secretIndexFromInventory(*desired.Secrets)
+		if !slices.Equal(dropped, lastDropped) {
+			for _, d := range dropped {
+				s.logger.Warn("secret inventory entry dropped",
+					"name", d.entry.Name, "version", d.entry.Version, "reason", d.reason)
+			}
+			lastDropped = dropped
+		}
+		if s.cache.UpdateSecretIndex(refs) {
+			s.logger.Info("secret index updated", "count", len(refs))
+		}
+	}
+}
+
+// droppedSecret is an inventory entry the secret index leaves out, with the
+// reason it was refused.
+type droppedSecret struct {
+	entry  api.NodeStateSecret
+	reason string
+}
+
+// secretIndexFromInventory maps the pull's secret inventory onto the secret
+// index, keeping the order the pull carries. It drops an entry whose name the
+// fetch would refuse, one whose version is below 1, and one whose name an
+// earlier kept entry already has, so the index lists only names a consumer can
+// fetch. The index is never nil: an empty inventory maps to an empty index, as
+// the wire's [] does.
+func secretIndexFromInventory(inventory []api.NodeStateSecret) ([]api.SecretRef, []droppedSecret) {
+	refs := make([]api.SecretRef, 0, len(inventory))
+	var dropped []droppedSecret
+	kept := make(map[string]struct{}, len(inventory))
+	for _, entry := range inventory {
+		_, dup := kept[entry.Name]
+		var reason string
+		switch {
+		case !api.ValidSecretName(entry.Name):
+			reason = "invalid name"
+		case entry.Version < 1:
+			reason = "invalid version"
+		case dup:
+			reason = "duplicate name"
+		}
+		if reason != "" {
+			dropped = append(dropped, droppedSecret{entry: entry, reason: reason})
+			continue
+		}
+		kept[entry.Name] = struct{}{}
+		refs = append(refs, api.SecretRef{Key: entry.Name, Version: entry.Version})
+	}
+	return refs, dropped
 }
 
 // dataStateContentType is stamped on every data entry the pull derives from the
