@@ -225,6 +225,7 @@ only request a reconcile.
 | `EventActionRequest`       | `action_request`        | `TriggerReconcile()`                        |
 | `EventSessionSetup`        | `session_setup`         | `TriggerReconcile()`                        |
 | `EventPeerEndpointChanged` | `peer_endpoint_changed` | `TriggerReconcile()`                        |
+| `EventNodeSecretsUpdated`  | `node_secrets_updated`  | `TriggerReconcile()`                        |
 
 `action_request` carries no dispatch of its own: action executions are delivered
 in the `executions` block of the state pull, so the event only pulls the next
@@ -234,6 +235,9 @@ the same optimisation for mediated access: the session is delivered in the
 `peer_endpoint_changed` works the same way for peer endpoints: each peer's direct
 endpoint rides the `peers` block of the state pull as `SnapshotPeer.Endpoint`, and
 plexd never decodes the event's payload.
+`node_secrets_updated` carries the node's full secret inventory, but plexd never
+decodes it, because the inventory rides the `secrets` block of the state pull,
+which feeds the node API's secret index.
 
 **Documented-coming** — named now so the agent can subscribe once the platform's 14-type taxonomy starts emitting them:
 

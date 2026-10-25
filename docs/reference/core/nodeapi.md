@@ -20,7 +20,7 @@ The `internal/nodeapi` package exposes node state to local consumers (sidecar ag
 | `HTTPTokenFile`   | `string`        | —                          | Path to file containing HTTP bearer token    |
 | `DebouncePeriod`  | `time.Duration` | `5s`                       | Debounce period for report sync coalescing   |
 | `ShutdownTimeout` | `time.Duration` | `5s`                       | Maximum time to wait for graceful shutdown   |
-| `SecretAuthEnabled`| `bool`         | `false`                    | Peer-credential auth for the secret routes: SO_PEERCRED on Linux, LOCAL_PEERCRED on macOS, the pipe client's process token on Windows (see [Local peer authorization](#local-peer-authorization)) |
+| `SecretAuthEnabled`| `bool`         | `false`                    | Peer-credential auth for the secret routes, and for the secret names in `GET /v1/state` (`secret_keys` is `[]` for a peer the policy refuses): SO_PEERCRED on Linux, LOCAL_PEERCRED on macOS, the pipe client's process token on Windows (see [Local peer authorization](#local-peer-authorization)) |
 | `DataDir`         | `string`        | —                          | Data directory for cache persistence (required) |
 
 > The TCP listener serves the authenticated `/v1` routes only. The Kubernetes probe endpoints `/healthz` and `/readyz` come from a separate, unauthenticated health listener configured by the top-level `health` block (default `:9101`). That listener is enabled and bound independently of `HTTPEnabled`. See the [Configuration Reference](configuration.md#health).
@@ -72,7 +72,7 @@ func NewServer(cfg Config, client NodeAPIClient, nsk []byte, logger *slog.Logger
 ```
 
 - Applies config defaults via `cfg.ApplyDefaults()`
-- Creates a `StateCache` eagerly so that `ReconcileHandler` can be called before `Start`
+- Creates a `StateCache` eagerly so that `ReconcileHandler` and `SecretIndexDispatchHandler` can be called before `Start`
 - Logger tagged with `component=nodeapi`
 - `nsk` is the 32-byte node secret key used for AES-256-GCM secret decryption
 
@@ -82,6 +82,7 @@ func NewServer(cfg Config, client NodeAPIClient, nsk []byte, logger *slog.Logger
 |-------------------------|------------------------------------------------------------------|---------------------------------------------------------------------|
 | `Start`                 | `(ctx context.Context, nodeID string) error`                     | Blocking; runs listeners and syncer until context cancelled         |
 | `ReconcileHandler`      | `() reconcile.ReconcileHandler`                                  | Returns a handler that feeds the cache from the snapshot `state` block |
+| `SecretIndexDispatchHandler` | `() reconcile.DispatchHandler`                              | Returns a dispatch handler that feeds the secret index from the snapshot `secrets` block on every successful pull (see [SecretIndexDispatchHandler](#secretindexdispatchhandler)) |
 | `PublishReport`         | `(key, contentType string, payload json.RawMessage) error`       | Writes a report through the cache and notifies the syncer; holds `key`/`payload` to the same grammar and 4096-byte cap as the local HTTP API |
 | `ReportPayload`         | `(key string) (json.RawMessage, bool)`                           | Returns the payload currently stored under `key`; internal producers compare against it so a report another local caller overwrote or deleted is re-asserted |
 
@@ -101,6 +102,10 @@ srv := nodeapi.NewServer(nodeapi.Config{
 
 // Register reconcile handler (feeds the cache from the state pull).
 reconciler.RegisterHandler(srv.ReconcileHandler())
+
+// Register the secret index dispatch handler (feeds the secret index from the
+// pull's secrets block on every successful pull).
+reconciler.RegisterDispatchHandler(srv.SecretIndexDispatchHandler())
 
 // Start blocks until context cancelled.
 ctx, cancel := context.WithCancel(context.Background())
@@ -183,7 +188,7 @@ All files are written atomically (temp file + fsync + rename). Directories are c
 | `Load`             | `() error`                                                                   | Reads persisted state from disk; creates directories if absent|
 | `UpdateMetadata`   | `(m map[string]string)`                                                      | Replaces metadata; persists to `metadata.json`                |
 | `UpdateData`       | `(entries []api.DataEntry)`                                                  | Replaces data entries; persists each to `data/{key}.json`; removes stale files |
-| `UpdateSecretIndex`| `(refs []api.SecretRef)`                                                     | Replaces secret index; persists to `secrets.json`             |
+| `UpdateSecretIndex`| `(refs []api.SecretRef) bool`                                                | Replaces the secret index and persists it to `secrets.json`; returns `false` and writes nothing when the list equals the index (`nil` and empty count as equal) |
 | `GetMetadata`      | `() map[string]string`                                                       | Returns copy of metadata map                                  |
 | `GetMetadataKey`   | `(key string) (string, bool)`                                               | Returns single metadata value                                 |
 | `GetData`          | `() map[string]api.DataEntry`                                               | Returns copy of data map                                      |
@@ -302,6 +307,8 @@ The endpoint itself is protected by the platform's own mechanism, and every plat
 
 The gate fails closed. A peer whose credentials cannot be read is answered `403` and logged as `failed to get peer credentials` at Error. That covers a connection that is neither a pipe nor a socket, a client process token that cannot be opened, and every Unix other than Linux and macOS, where the package has no implementation.
 
+When `SecretAuthEnabled` is set, which `plexd up` always does for the local listener, `GET /v1/state` names the secrets only to a peer the policy admits. The route stays open to any peer that can open the endpoint and always answers `200`, but its `secret_keys` member is `[]` for a peer the policy refuses and for a peer whose credentials cannot be read. Nothing is logged and nothing is refused. `plexd status` reads this route, so its `Secret keys` line counts 0 for a caller the policy refuses (see [`plexd status`](cli.md#plexd-status)). The TCP listener, behind its bearer token, is not gated and lists the names.
+
 The platform builds the policy that decides who passes:
 
 ```go
@@ -341,6 +348,8 @@ Returns a summary of all cached state.
   "report_keys": [{"key": "k", "version": 1}]
 }
 ```
+
+When `SecretAuthEnabled` is set, `secret_keys` is `[]` for a peer the secret policy refuses or whose credentials cannot be read, and the route still answers `200`. See [Local peer authorization](#local-peer-authorization).
 
 ### GET /v1/state/metadata
 
@@ -397,6 +406,19 @@ Returns the secret reference index (keys and versions, not values).
 ```json
 [{"key": "db-password", "version": 1}]
 ```
+
+The list is the node's secret inventory, taken from the `secrets` block of the
+state pull by [`SecretIndexDispatchHandler`](#secretindexdispatchhandler). Each
+inventory entry's `name` is listed as `key`, in the order the pull carries. The
+list is `[]` when the node may read no secret. The index is persisted to
+`secrets.json`, so it survives a restart: the route serves the persisted list
+until the next pull feeds the index.
+
+A name that was just granted can answer `403` on `GET /v1/state/secrets/{key}`
+for a few seconds: the control plane writes the grant's reader tuple a few
+seconds after the grant, and the pull reads the grants themselves. A `403` or
+`404` from that fetch never removes the name from the list; only an inventory
+that leaves the name out removes it.
 
 ### GET /v1/state/secrets/{key}
 
@@ -557,8 +579,9 @@ The node API no longer registers its own SSE handlers. The cache metadata map an
 the versioned data store are refreshed by the reconcile handler (below) whenever
 the pulled state snapshot changes; `node_state_updated` SSE events drive this
 indirectly by dispatching to `TriggerReconcile()`, which re-pulls the snapshot.
-The secret index is updated through the `UpdateSecretIndex` cache method, which no
-longer rides an SSE event.
+The secret index is fed by [`SecretIndexDispatchHandler`](#secretindexdispatchhandler)
+from the pull's `secrets` block on every successful pull. The `node_secrets_updated`
+SSE event only triggers a reconcile.
 
 ## Integration Points
 
@@ -579,9 +602,36 @@ The handler runs when `diff.StateChanged` and feeds the cache from the snapshot
 | `state.data` bucket     | `UpdateData`       | Each opaque string `value` is JSON-encoded into a `DataEntry` payload with content type `text/plain; charset=utf-8` |
 
 A `null` `state` block authoritatively clears both the metadata map and the data
-entries. The secret index is **not** fed here — it no longer rides the snapshot, and the
-`node_secrets_updated` SSE event that once fed it has been removed.
-`UpdateSecretIndex` remains a cache method.
+entries. The secret index is **not** fed here;
+[`SecretIndexDispatchHandler`](#secretindexdispatchhandler) feeds it.
+
+### SecretIndexDispatchHandler
+
+Register the dispatch handler before starting the reconciliation loop. `plexd up`
+registers it right after `signingKeyDispatchHandler`:
+
+```go
+reconciler.RegisterDispatchHandler(srv.SecretIndexDispatchHandler())
+```
+
+The handler feeds the secret index from the `secrets` block of the state pull. It
+runs on every successful pull, drift or not (see
+[DispatchHandler](reconciliation.md#dispatchhandler)). It compares the pulled
+inventory with the index the cache holds, not with the last pull, so an index
+loaded from a file an older release wrote converges on the first pull.
+
+- A `null` or missing `secrets` block keeps the index unchanged. A control plane that predates the block sends none.
+- Each entry's `name` becomes the `Key` of an `api.SecretRef` (the listing's `key`), and its `version` is kept. The index keeps the order the pull carries.
+- An empty block empties the index.
+- An entry is dropped when its name is outside `^[a-z][a-z0-9_-]{0,62}$` (reason `invalid name`), when its version is below 1 (`invalid version`), or when an earlier kept entry already has its name (`duplicate name`; the first such entry is kept). The dropped entries are logged once until their set changes, so a control plane that keeps serving the same bad entry does not log on every pull.
+- `UpdateSecretIndex` replaces the index and persists it to `{data_dir}/state/secrets.json` only when the list differs from the index. A failed write is logged by the cache as `persist write failed` at Error, and the index in memory still serves the new list.
+- The handler never fails a reconcile cycle. A failed pull runs no dispatch handler, so the index keeps its last list.
+
+| Level | Message | When |
+|-------|---------|------|
+| Debug | `state pull carried no secret inventory; keeping the secret index` | The pull's `secrets` block is `null` or missing; the index is unchanged |
+| Warn  | `secret inventory entry dropped` | An entry is dropped; carries `name`, `version` and `reason` (`invalid name`, `invalid version` or `duplicate name`). Logged once until the set of dropped entries changes |
+| Info  | `secret index updated` | The index changed; carries `count`, the number of entries |
 
 ### ControlPlane Client
 
@@ -840,11 +890,11 @@ The `.spec` (including `nodeId`, `meshIp`, `metadata`, `data`, `secretRefs`) is 
 
 ### Downstream Sync (Control Plane to Node)
 
-1. On initial connect, plexd fetches the node state from `GET /v1/nodes/{node_id}/state` (the reconciliation endpoint). The `NodeStateSnapshot` `state` block feeds the cache: its `metadata` bucket becomes the metadata map and its `data` bucket becomes the cached data entries. Secret references no longer ride the snapshot.
-2. During steady state, the control plane emits a `node_state_updated` SSE event when node state changes. Its payload is opaque: the agent responds by triggering a reconcile, which re-pulls the snapshot and refreshes the cache. There is no separate secrets SSE event.
+1. On initial connect, plexd fetches the node state from `GET /v1/nodes/{node_id}/state` (the reconciliation endpoint). The `NodeStateSnapshot` `state` block feeds the cache: its `metadata` bucket becomes the metadata map and its `data` bucket becomes the cached data entries. Its `secrets` block, the node's secret inventory (names and versions only), feeds the secret index through `SecretIndexDispatchHandler` on every successful pull.
+2. During steady state, the control plane emits a `node_state_updated` SSE event when node state changes. Its payload is opaque: the agent responds by triggering a reconcile, which re-pulls the snapshot and refreshes the cache. When the node's secret inventory changes, the control plane emits `node_secrets_updated`. plexd treats its payload as opaque too and only triggers a reconcile. The pull's `secrets` block is the only writer of the secret index, so an event that arrives late can never roll the index back.
 3. Secret names and versions are held in the local secret index (`UpdateSecretIndex`), so the listing endpoints reflect the current state without carrying any secret values - **never plaintext nor ciphertext**.
 4. Secret values are fetched **on demand** when a consumer requests them via `GET /v1/state/secrets/{key}`. plexd proxies to `GET /v1/nodes/{node_id}/secrets/{key}` on the control plane, which returns the NSK-encrypted ciphertext. plexd decrypts with the local NSK and returns the plaintext to the authorized caller. No plaintext is persisted.
-5. The reconciliation loop compares the local state cache (metadata and data, from the snapshot `state` block) against the control plane, correcting any drift. The secret index no longer has an SSE event, and secret values are always fetched live.
+5. The reconciliation loop compares the local state cache (metadata and data, from the snapshot `state` block) against the control plane, correcting any drift. The secret index is not part of that diff: the pull's `secrets` block feeds it on every successful pull, and secret values are always fetched live. A plexd release that does not read the `secrets` block never writes the index. After a rollback to such a release, plexd serves the last persisted `{data_dir}/state/secrets.json` unchanged until that file is removed.
 
 ### Upstream Sync (Node to Control Plane)
 

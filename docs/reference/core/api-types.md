@@ -110,7 +110,7 @@ never serialized on its own.
 
 The desired-state envelope. Every block key is **always present on the wire**: a
 `null` value means "block not populated", never "field absent", so the differ
-distinguishes a nil pointer from a populated block. None of the nine fields carry
+distinguishes a nil pointer from a populated block. None of the ten fields carry
 `omitempty`.
 
 | Field          | Type                   | JSON Tag         | Description                                              |
@@ -123,9 +123,10 @@ distinguishes a nil pointer from a populated block. None of the nine fields carr
 | `Reports`      | `*NodeStateBlock`      | `"reports"`      | Mirrors `state` today (forward-compat split)           |
 | `Executions`   | `[]NodeStateExecution` | `"executions"`   | Pending action dispatches; `[]` when empty, never `null` |
 | `Sessions`     | `*[]NodeStateSession`  | `"sessions"`     | Live mediated-access sessions; `[]` when empty, never `null` on the wire. A pointer, like the block fields above: a `nil` value is a block the control plane did **not** populate, which is not a teardown signal |
+| `Secrets`      | `*[]NodeStateSecret`   | `"secrets"`      | The node's secret inventory, ordered by name ascending; `[]` when the node may read nothing, never `null` on the wire. A pointer, like `Sessions`: a `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the node API's secret index, and `[]` empties it |
 | `SigningKey`   | `*NodeStateSigningKey` | `"signing_key"`  | The key the node's Domain signs envelopes and session tokens with. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) means "keep the key you hold", never "drop it" |
 
-Four members are consumed on the dispatch seam rather than by the differ.
+Five members are consumed on the dispatch seam rather than by the differ.
 `executions` is not desired state at all — it is a delivery queue, documented
 under [Executions](#executions) below. `sessions` *is* desired state, but state
 the tunnel dispatcher converges on itself, documented under
@@ -133,6 +134,8 @@ the tunnel dispatcher converges on itself, documented under
 the reachability observer decodes it leniently and logs the verdict when it
 changes. `signing_key` has nothing to converge on: the first dispatch handler
 installs and persists it (see `NodeStateSigningKey` below).
+`secrets` is never diffed: the node API's `SecretIndexDispatchHandler` replaces
+the secret index from it on every successful pull (see `NodeStateSecret` below).
 `peers` goes to both: the differ drives the WireGuard reconcile handler
 from it, and the edge PSK store reads it on the dispatch seam.
 
@@ -268,11 +271,30 @@ entry), and writes a key that differs from the persisted pair to the
 | `KeyID`     | `string` | `"key_id"`     | Id the key signs under; plexd rejects an empty one  |
 | `PublicKey` | `string` | `"public_key"` | 32-byte Ed25519 public key in standard base64; plexd rejects any other length |
 
+**NodeStateSecret**
+
+One entry of the `secrets` block: a Secret the node may read, as the "Secret
+inventory" section of plexsphere's agent contract
+(`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
+describes it. The entry carries the Secret's name and current version, never its
+value; plexd fetches the value from `GET /v1/nodes/{node_id}/secrets/{key}` (see
+[Secrets](#secrets)). The node API's `SecretIndexDispatchHandler` maps `Name`
+onto `SecretRef.Key`, keeps `Version`, and keeps the pull order. It drops an
+entry whose name is outside the grammar, whose version is below 1, or whose name
+an earlier kept entry already has, and logs each dropped entry at Warn as
+`secret inventory entry dropped`, once until the set of dropped entries changes.
+
+| Field     | Type     | JSON Tag    | Description                                         |
+|-----------|----------|-------------|-----------------------------------------------------|
+| `Name`    | `string` | `"name"`    | The Secret's name, matching `^[a-z][a-z0-9_-]{0,62}$`; becomes `SecretRef.Key` in the node API's secret index |
+| `Version` | `int`    | `"version"` | The Secret's current version, at least 1            |
+
 ### Supporting types
 
-These types are still part of the API but no longer ride the state snapshot.
-`SigningKeyRotation` is the payload of the `signing_key_rotated` SSE event;
-`SecretRef` is the shape of the local node API's secret index; `DataEntry` is the
+These types are part of the API but are not members of the state snapshot.
+`SigningKeyRotation` is the payload of the `signing_key_rotated` SSE event.
+`SecretRef` is the entry of the local node API's secret index, fed from the
+pull's `NodeStateSecret` entries (the name becomes `key`). `DataEntry` is the
 shape the local node API serves for cached data entries.
 
 **SigningKeyRotation**
@@ -298,7 +320,7 @@ shape the local node API serves for cached data entries.
 
 | Field    | Type   | JSON Tag    | Description      |
 |----------|--------|-------------|------------------|
-| `Key`    | `string`| `"key"`    | Secret key name  |
+| `Key`    | `string`| `"key"`    | The Secret's name, from `NodeStateSecret.Name` |
 | `Version`| `int`  | `"version"` | Secret version   |
 
 ## Secrets
@@ -1037,6 +1059,7 @@ Reconcile-driving payloads are opaque — the state pull is authoritative.
 | `EventActionRequest`       | `action_request`        | contract          |
 | `EventSessionSetup`        | `session_setup`         | contract          |
 | `EventPeerEndpointChanged` | `peer_endpoint_changed` | contract          |
+| `EventNodeSecretsUpdated`  | `node_secrets_updated`  | contract          |
 | `EventPeerRegistered`      | `peer_registered`       | documented-coming |
 | `EventPeerPSKAssigned`     | `peer_psk_assigned`     | documented-coming |
 | `EventPeerDeregistered`    | `peer_deregistered`     | documented-coming |
@@ -1052,6 +1075,12 @@ same shape for mediated access — the session is delivered in the `sessions` bl
 of that pull. `session_revoked` is the same shape from the other end: a session
 leaving the `sessions` block is what tears it down, so the event only pulls the
 observing reconcile forward.
+
+`node_secrets_updated` is a contract type whose payload carries the node's full
+secret inventory. plexd treats the payload as opaque and only triggers a
+reconcile, because the `secrets` block of the state pull is authoritative. The
+pull is the only writer of the node API's secret index, so an event that arrives
+late can never roll the index back.
 
 `peer_endpoint_changed` is a contract type the control plane emits now, and plexd
 treats it as a reconcile trigger. Its payload is never decoded: each peer's direct
