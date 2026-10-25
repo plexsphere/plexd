@@ -121,6 +121,63 @@ func TestLoadMergedConfig_AbsentFile(t *testing.T) {
 	}
 }
 
+func TestMeshMTUProbe(t *testing.T) {
+	if probe := meshMTUProbe(nat.Config{Enabled: false}); probe != nil {
+		t.Error("meshMTUProbe(nat.enabled false) returned a probe, want nil")
+	}
+
+	probe := meshMTUProbe(nat.Config{Enabled: true, STUNServers: []string{"127.0.0.1:1"}})
+	if probe == nil {
+		t.Fatal("meshMTUProbe(nat.enabled true) = nil, want a probe")
+	}
+	// A cancelled context ends the round before anything is sent. Its error
+	// comes back only when the closure hands its context to the probe.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := probe(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("probe(cancelled ctx) error = %v, want context.Canceled", err)
+	}
+
+	// With a live context the round goes to the configured server, and the
+	// error names it. Nothing listens on port 1, so loopback refuses the
+	// probes at once; on Windows, where Go turns UDP's connection resets
+	// off, the round runs out its timeout instead.
+	want := nat.ErrMTUProbeInconclusive.Error() + ": 127.0.0.1:1: "
+	if _, err := probe(context.Background()); !errors.Is(err, nat.ErrMTUProbeInconclusive) {
+		t.Errorf("probe() error = %v, want nat.ErrMTUProbeInconclusive", err)
+	} else if !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("probe() error = %q, want it to start with %q", err, want)
+	}
+
+	// A server that never answers holds every probe until the round's
+	// timeout ends it, which must be nat.MTUProbeTimeout. The context runs
+	// out after that plus a 2s margin, so a closure that gave the round a
+	// longer timeout fails here at the margin rather than when its own
+	// timeout ends.
+	silent, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = silent.Close() })
+	addr := silent.LocalAddr().String()
+
+	probe = meshMTUProbe(nat.Config{Enabled: true, STUNServers: []string{addr}})
+	bound := nat.MTUProbeTimeout + 2*time.Second
+	ctx, cancel = context.WithTimeout(context.Background(), bound)
+	defer cancel()
+	start := time.Now()
+	_, err = probe(ctx)
+	if elapsed := time.Since(start); elapsed >= bound {
+		t.Errorf("probe(silent server) took %v, want under %v (nat.MTUProbeTimeout plus a 2s margin)", elapsed, bound)
+	}
+	want = nat.ErrMTUProbeInconclusive.Error() + ": " + addr + ": "
+	if !errors.Is(err, nat.ErrMTUProbeInconclusive) {
+		t.Errorf("probe(silent server) error = %v, want nat.ErrMTUProbeInconclusive", err)
+	} else if !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("probe(silent server) error = %q, want it to start with %q", err, want)
+	}
+}
+
 func TestBuildHeartbeatRequest(t *testing.T) {
 	t.Run("nil NAT info yields empty non-nil summary", func(t *testing.T) {
 		req := buildHeartbeatRequest("checksum-abc", "1.2.3", nil)
