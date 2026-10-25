@@ -208,6 +208,8 @@ Metadata:
   delivery_mode: streaming
 ```
 
+`Secret keys` counts the names `GET /v1/state` lists, which are only the names the caller may see: `0` for a caller the secret policy refuses (on Linux and macOS, one that is neither root nor a member of `plexd-secrets`).
+
 ### `plexd peers`
 
 List mesh peers from the local agent.

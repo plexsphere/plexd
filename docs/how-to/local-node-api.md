@@ -26,8 +26,8 @@ internals, see [Local Node API Reference](../reference/core/nodeapi.md).
 
    | Group            | Grants access to                      |
    |------------------|---------------------------------------|
-   | `plexd`          | All endpoints except secret values    |
-   | `plexd-secrets`  | Secret-value endpoints (`/v1/state/secrets/{key}`) |
+   | `plexd`          | All endpoints except the secret routes; `GET /v1/state` lists no secret keys |
+   | `plexd-secrets`  | Secret list and value endpoints (`/v1/state/secrets` and `/v1/state/secrets/{key}`) |
 
    `deploy/install.sh` creates both groups. If you installed plexd another
    way, create them first, then add your user (or service account) to the
@@ -138,13 +138,18 @@ Example response:
     { "key": "nginx.conf", "version": 3, "content_type": "text/plain" }
   ],
   "secret_keys": [
-    { "key": "tls/server.key", "version": 1 }
+    { "key": "tls_server_key", "version": 1 }
   ],
   "report_keys": [
     { "key": "health", "version": 5 }
   ]
 }
 ```
+
+On the local endpoint, `secret_keys` names secrets only for a caller that may
+read them: root or a member of `plexd-secrets` on Linux and macOS, an elevated
+Administrator or LocalSystem on Windows. For any other caller it is `[]`, and
+the request still answers `200`.
 
 ## Reading Metadata
 
@@ -235,6 +240,13 @@ URL-encoding.
 
 ### List available secret keys
 
+`GET /v1/state/secrets` lists the control plane's inventory for this node: the
+Secrets the node may read, by name and current version. plexd refreshes the
+list on every state pull and right after a `node_secrets_updated` event. A name
+granted moments ago can answer `403` on read for a few seconds: the inventory
+lists a grant at once, and the control plane authorizes the read a few seconds
+later.
+
 ```bash
 curl -s --unix-socket /var/run/plexd/api.sock \
   http://localhost/v1/state/secrets | jq .
@@ -242,8 +254,8 @@ curl -s --unix-socket /var/run/plexd/api.sock \
 
 ```json
 [
-  { "key": "tls_server_key", "version": 1 },
-  { "key": "db_password", "version": 2 }
+  { "key": "db_password", "version": 2 },
+  { "key": "tls_server_key", "version": 1 }
 ]
 ```
 

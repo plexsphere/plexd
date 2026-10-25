@@ -512,8 +512,8 @@ plexd's epoch floor never refuses one.
 Returns the active `NodeStateSnapshot` fixture built by `newStateFixture`. By
 default it is an enriched envelope containing two peers, a merged policy with two
 rules, the `reachability` projection, all four bridge subtrees, the `state`
-and `reports` blocks (which mirror one another), and empty `executions` and
-`sessions` blocks.
+and `reports` blocks (which mirror one another), and empty `executions`,
+`sessions`, and `secrets` blocks.
 The active fixture can be replaced at runtime via `POST /test/configure-state`.
 The `signing_key` block is not read from the fixture: every response sets it to
 the mock's current signing key, the key `POST /v1/register` hands out, whatever
@@ -534,6 +534,7 @@ therefore hands the node the new key.
 | `state` / `reports` | `metadata` (2 entries), `data` (2 entries), `reports` (`[]`) |
 | `executions` | `[]` — no dispatch queued; phases configure entries explicitly |
 | `sessions` | `[]` — no session issued; phases configure entries explicitly |
+| `secrets` | `[]` (no inventory; phases configure entries explicitly) |
 | `signing_key` | the mock's current signing key (`key_id` `did:web:plexsphere.com#key-e2e` until `POST /test/rotate-signing-key`), set on every response rather than read from the fixture |
 
 The two peers give the agent's dial order both shapes. Peer `...a0b1`'s order is
@@ -662,6 +663,7 @@ comparison key and never re-derives it from the rules.
   },
   "executions": [],
   "sessions": [],
+  "secrets": [],
   "signing_key": {"key_id": "did:web:plexsphere.com#key-e2e", "public_key": "<base64 Ed25519 public key, generated per server start>"}
 }
 ```

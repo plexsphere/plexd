@@ -107,6 +107,8 @@ Action dispatch is one case where that distinction cuts both ways. A dispatch is
 
 The same holds for the Domain signing key, which the state response carries in its `signing_key` block. An attacker in that position can hand the node a key of its own, which plexd installs as the only key it trusts and persists, and can then sign envelopes and session tokens the node accepts. On Linux, a socket-activated session helper that has already pinned a key keeps refusing tokens signed with any other key (see [Trust anchor](../reference/networking/secure-access-tunneling.md#trust-anchor)).
 
+The state response's `secrets` block, the node's secret inventory, is likewise protected by TLS alone, with no application-layer signature. A forged entry only lists a name, because the control plane authorizes every value fetch.
+
 **SSE Events:**
 
 | SSE Event | Client Action |
@@ -118,6 +120,7 @@ The same holds for the Domain signing key, which the state response carries in i
 | `action_request` | Trigger a state reconcile — the payload is opaque; action dispatches are delivered in the `executions` block of the authoritative state pull, never by the event (see [Remote Actions and Hooks](../reference/actions/remote-actions-hooks.md)) |
 | `session_setup` | Trigger a state reconcile — the payload is opaque; the session is provisioned from the `sessions` block of the authoritative state pull, never from the event (see [Secure Access Tunneling](../reference/networking/secure-access-tunneling.md)) |
 | `session_revoked` | Trigger a state reconcile — the payload is opaque; the session leaving the `sessions` block is what tears the listener down, so the reconcile's drain does the revocation |
+| `node_secrets_updated` | Trigger a state reconcile; the payload is opaque, and the secret inventory is read from the `secrets` block of the authoritative state pull, which feeds the Local Node API secret index (see [List available secret keys](../how-to/local-node-api.md#list-available-secret-keys)) |
 | `rotate_keys` | Generate new Curve25519 keypair and initiate key rotation (see [Phase 4: Key Rotation](#phase-4-key-rotation)) |
 | `signing_key_rotated` | Update the signing public key, selected by `key_id`. The control plane does not send this event today; a rotation reaches the node through the state pull (see [Signing Key Rotation](#signing-key-rotation)) |
 

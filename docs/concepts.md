@@ -175,6 +175,7 @@ only request a reconcile.
 | `bridge_config_updated` | contract | `bridge.HandleBridgeConfigUpdated` — triggers a reconcile (bridge mode) |
 | `action_request` | contract | Triggers a reconcile — the dispatch rides the `executions` block of the resulting pull |
 | `session_setup` | contract | Triggers a reconcile — the session rides the `sessions` block of the resulting pull |
+| `node_secrets_updated` | contract | Triggers a reconcile; the inventory rides the `secrets` block of the resulting pull, which feeds the node API's secret index |
 | `peer_registered` | documented-coming | Triggers a reconcile |
 | `peer_psk_assigned` | documented-coming | Triggers a reconcile |
 | `peer_deregistered` | documented-coming | Triggers a reconcile |

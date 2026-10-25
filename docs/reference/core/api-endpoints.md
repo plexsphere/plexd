@@ -116,7 +116,7 @@ Long-lived SSE connection. Supports `Last-Event-ID` header for replay after reco
 | `rotate_keys` | Key rotation trigger |
 | `signing_key_rotated` | New signing key (`key_id`, `public_key`), `previous_key_id`, `transition_expires`. The state pull's `signing_key` block also carries the key (see [`GET /v1/nodes/{node_id}/state`](#get-v1-nodes-node-id-state)) |
 | `node_state_updated` | Updated metadata and data entries |
-| `node_secrets_updated` | Updated secret names and versions (never values) |
+| `node_secrets_updated` | The node's full secret inventory (names and versions, never values). Opaque; triggers a reconcile, because the inventory rides the state pull's `secrets` block (see [`GET /v1/nodes/{node_id}/state`](#get-v1-nodes-node-id-state)) |
 
 | Response | Meaning |
 |---|---|
@@ -711,6 +711,10 @@ absence.
       "idle_timeout_seconds": 900
     }
   ],
+  "secrets": [
+    { "name": "api-token", "version": 1 },
+    { "name": "db-password", "version": 2 }
+  ],
   "signing_key": {
     "key_id": "signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1-1767225600000000000",
     "public_key": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
@@ -818,6 +822,38 @@ not 32 bytes of standard base64) changes nothing and is logged at Warn as
 a different key. The block is not desired state: the differ neither stores nor
 compares it. A Linux session helper that already pinned a key keeps its pin; see
 [Trust anchor](../networking/secure-access-tunneling.md#trust-anchor).
+
+`secrets` is the node's secret inventory, as the "Secret inventory" section of
+plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in
+plexsphere/plexsphere) describes it: one entry per Secret the node may read,
+with its `name` and current `version`, never its value. A `name` matches
+`^[a-z][a-z0-9_-]{0,62}$`, the grammar of the [secret fetch](#secrets), and a
+`version` is an integer of at least 1. Entries are ordered by `name` ascending.
+The control plane sends `[]` when the node may read nothing, never `null`. plexd
+reads the block on every successful pull, drift or not, and replaces the secret
+index that [`GET /v1/state/secrets`](nodeapi.md#get-v1-state-secrets) lists:
+each entry's `name` becomes the listing's `key`, its `version` is kept, and so
+is the pull's order. `[]` empties the index. A `null` value, or a key missing
+because the control plane predates the block, means the control plane did not
+say, and plexd keeps the index it holds. When the index changes, plexd logs
+`secret index updated` at Info with `count`. plexd drops an entry whose name is
+outside the grammar (`invalid name`), whose version is below 1
+(`invalid version`), or whose name an earlier kept entry already has
+(`duplicate name`; the first entry is kept). It logs each at Warn as
+`secret inventory entry dropped` with `name`, `version` and `reason`, once, and
+not again until the set of dropped entries changes.
+
+The pull, not the `node_secrets_updated` event, writes the index. The event
+carries the same full inventory, but plexd treats its payload as opaque and only
+triggers a reconcile, so an event that arrives late can never roll the index
+back. The cost is one extra state pull per inventory change. A failed pull
+leaves the index as it is. The index holds no values:
+`GET /v1/state/secrets/{key}` fetches the value live from
+[`GET /v1/nodes/{node_id}/secrets/{key}`](#secrets), and a `403` or `404` there
+never removes the entry from the index. Only an inventory that leaves the name
+out removes it. A name granted moments ago can answer `403` for a few seconds:
+the control plane writes the grant's reader tuple a few seconds after the grant,
+and the pull reads the grants themselves.
 
 ## Secrets
 
