@@ -206,6 +206,57 @@ func TestStateCache_UpdateSecretIndex(t *testing.T) {
 	}
 }
 
+// TestStateCache_UpdateSecretIndexReportsChange pins what UpdateSecretIndex
+// reports: a list that differs from the index replaces and persists it, while
+// an equal one, nil and empty counting as equal, changes nothing and writes no
+// file.
+func TestStateCache_UpdateSecretIndexReportsChange(t *testing.T) {
+	dir := t.TempDir()
+	sc := NewStateCache(dir, discardLogger())
+	if err := sc.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	path := filepath.Join(dir, "state", "secrets.json")
+
+	// A fresh cache holds no index, so an empty list is no change.
+	if sc.UpdateSecretIndex([]api.SecretRef{}) {
+		t.Error("UpdateSecretIndex([]) on a fresh cache = true, want false")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("secrets.json after an unchanged update: stat err = %v, want not exist", err)
+	}
+
+	refs := []api.SecretRef{{Key: "db-password", Version: 2}}
+	if !sc.UpdateSecretIndex(refs) {
+		t.Error("UpdateSecretIndex(changed) = false, want true")
+	}
+	if got := sc.GetSecretIndex(); !reflect.DeepEqual(got, refs) {
+		t.Errorf("GetSecretIndex() = %v, want %v", got, refs)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read secrets.json: %v", err)
+	}
+	var fileRefs []api.SecretRef
+	if err := json.Unmarshal(data, &fileRefs); err != nil {
+		t.Fatalf("unmarshal secrets.json: %v", err)
+	}
+	if !reflect.DeepEqual(fileRefs, refs) {
+		t.Errorf("secrets.json = %v, want %v", fileRefs, refs)
+	}
+
+	// An equal list is no change, and the file is not written again.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if sc.UpdateSecretIndex([]api.SecretRef{{Key: "db-password", Version: 2}}) {
+		t.Error("UpdateSecretIndex(equal) = true, want false")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("secrets.json after an equal update: stat err = %v, want not exist", err)
+	}
+}
+
 func TestStateCache_LoadFromDisk(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := filepath.Join(dir, "state")
