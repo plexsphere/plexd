@@ -11,6 +11,8 @@
 #   - Edge PSK fetches for both fixture peers (same skip condition)
 #   - Endpoint candidates report and an endpoint selection switch on a
 #     fixture peer (same skip condition)
+#   - Mesh MTU sized from the uplink probe and held by the device (same
+#     skip condition)
 #   - Request body validation (registration token, heartbeat, capabilities)
 #   - Log injection (docker cp into container, verify logs_count increases)
 #   - Agent restart for audit verification (ProcessSource fires per-process)
@@ -1054,6 +1056,104 @@ else
     echo "  PASS: plexd logged 'trying next endpoint candidate' for peer ${FIXTURE_PEER_B1}"
 
     echo "=== Phase 4d PASSED: endpoint candidates and endpoint selection ==="
+fi
+
+# ===================================================================
+# Phase 4e: mesh mtu
+#
+# There is a mesh MTU to check only when the interface came up, so the phase
+# shares phase 4b's skip condition. The e2e config leaves wireguard.mtu unset
+# and nat.enabled true, so Setup probes the STUN servers before it creates the
+# interface and logs the result on its "wireguard interface configured" line.
+# The uplink decides the value: a 1500-byte path gives 1420, a 1492-byte PPPoE
+# path 1412 and a 1452-byte path of DS-Lite over PPPoE 1372, so the phase
+# checks a range, never a fixed number.
+#
+# An inconclusive probe fails the phase rather than skipping it: phase 3f
+# already needs outbound UDP to both default STUN servers, so a probe that
+# heard none of them is a broken probe. The unit tests probe a loopback fake
+# server; this is the only run anywhere that probes real STUN servers across a
+# real uplink and programs the result on a kernel device, so it must not be
+# weakened to the skip path.
+# ===================================================================
+echo "=== Testing the mesh mtu ==="
+
+if [ "${WG_CONFIGURED}" -eq 0 ]; then
+    echo "SKIP: mesh mtu (WireGuard did not come up in this container)"
+else
+    # Read line by line and match with case, as in phase 4c: no grep -q in a
+    # pipeline. No restart has happened yet, so the first line is the one
+    # Setup wrote at start.
+    PLEXD_LOGS=$(dc logs plexd 2>/dev/null || true)
+    MTU_SETUP_LINE=""
+    while IFS= read -r MTU_LOG_LINE; do
+        case "${MTU_LOG_LINE}" in
+            *"wireguard interface configured"*) MTU_SETUP_LINE=${MTU_LOG_LINE}; break ;;
+        esac
+    done <<< "${PLEXD_LOGS}"
+    if [ -z "${MTU_SETUP_LINE}" ]; then
+        fail "no 'wireguard interface configured' line in the plexd log, although phase 4b found one"
+    fi
+
+    # The leading space in each pattern keeps " path_mtu=" from matching
+    # " mtu=". A key that is missing leaves its value empty.
+    MTU_SOURCE=""
+    case "${MTU_SETUP_LINE}" in
+        *" mtu_source="*) MTU_SOURCE=${MTU_SETUP_LINE#* mtu_source=}; MTU_SOURCE=${MTU_SOURCE%% *} ;;
+    esac
+    MTU_LOGGED=""
+    case "${MTU_SETUP_LINE}" in
+        *" mtu="*) MTU_LOGGED=${MTU_SETUP_LINE#* mtu=}; MTU_LOGGED=${MTU_LOGGED%% *} ;;
+    esac
+
+    case "${MTU_SOURCE}" in
+        probe) ;;
+        default)
+            fail "the interface came up with mtu_source=default: the startup probe heard no STUN server, see the 'wireguard: mtu probe inconclusive, using the default mtu' warning in the plexd log (line: ${MTU_SETUP_LINE})"
+            ;;
+        *)
+            fail "the interface came up with mtu_source=${MTU_SOURCE:-<missing>}, want probe: plexd-e2e.yaml leaves wireguard.mtu unset (line: ${MTU_SETUP_LINE})"
+            ;;
+    esac
+    echo "  PASS: the interface came up with mtu_source=probe"
+
+    case "${MTU_LOGGED}" in
+        "" | *[!0-9]*)
+            fail "the interface came up with mtu=${MTU_LOGGED:-<missing>}, want a number (line: ${MTU_SETUP_LINE})"
+            ;;
+    esac
+    if [ "${MTU_LOGGED}" -lt 1280 ] || [ "${MTU_LOGGED}" -gt 1420 ]; then
+        fail "the interface came up with mtu=${MTU_LOGGED}, want 1280 to 1420 (line: ${MTU_SETUP_LINE})"
+    fi
+    echo "  PASS: the interface came up with mtu=${MTU_LOGGED}, within 1280 to 1420"
+
+    # The device must hold what the line says. The interface name comes from
+    # plexd-e2e.yaml, and head is the image's busybox applet. The re-probe
+    # loop's first round comes 10 minutes after start, after this phase has
+    # run, so the device still holds the MTU Setup programmed.
+    DEVICE_MTU=$(dc exec -T plexd head -c 16 /sys/class/net/wg-plexd/mtu 2>/dev/null | tr -d '\r\n' || true)
+    if [ "${DEVICE_MTU}" != "${MTU_LOGGED}" ]; then
+        fail "wg-plexd has mtu ${DEVICE_MTU:-<unreadable>}, want ${MTU_LOGGED}, the mtu plexd logged"
+    fi
+    echo "  PASS: wg-plexd has mtu ${DEVICE_MTU}, as logged"
+
+    # Step 17c starts the re-probe loop next to endpoint selection, whose
+    # switch phase 4d has already seen, so its start line is in the log by now.
+    MTU_LOOP_FOUND=0
+    while IFS= read -r MTU_LOG_LINE; do
+        case "${MTU_LOG_LINE}" in
+            *"wireguard: mtu probe started"*"interval=10m0s"* | *"interval=10m0s"*"wireguard: mtu probe started"*)
+                MTU_LOOP_FOUND=1
+                break
+                ;;
+        esac
+    done <<< "${PLEXD_LOGS}"
+    if [ "${MTU_LOOP_FOUND}" -eq 0 ]; then
+        fail "no 'wireguard: mtu probe started' log line with interval=10m0s: step 17c did not start the re-probe loop"
+    fi
+    echo "  PASS: plexd logged 'wireguard: mtu probe started' with interval=10m0s"
+
+    echo "=== Phase 4e PASSED: mesh mtu ==="
 fi
 
 # ===================================================================
