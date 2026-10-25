@@ -78,7 +78,7 @@ flowchart TD
 3. **Create control plane client** — `api.NewControlPlane()` with API config and build version
 4. **Register** — `registrar.Register()` loads or creates node identity (fatal on failure)
 5. **Create Ed25519 verifier** — decode the control plane's signing public key from identity (the key registration returned, or a newer one a state pull carried and the agent persisted); `signingKeyDispatchHandler`, registered first among the reconcile [dispatch handlers](reference/core/reconciliation.md#registered-dispatch-handlers), installs the key every state pull carries
-5a. **Initialize WireGuard** — create WireGuard interface, configure address and MTU, bring interface up
+5a. **Initialize WireGuard** — measure the uplink's path MTU with the STUN servers, create WireGuard interface, configure address and MTU, bring interface up. The interface MTU is sized to the uplink unless `wireguard.mtu` pins it or `nat.enabled` is false (see [MTU detection](reference/networking/wireguard.md#mtu-detection))
 5b. **Initialize NAT + Peer Exchange** — create STUN client, NAT discoverer, and peer exchanger
 5c. **Initialize Network Policy** — create policy engine, firewall controller, and enforcer
 5d. **Initialize Tunnel** — load/generate host key, create JWT verifier and mesh server

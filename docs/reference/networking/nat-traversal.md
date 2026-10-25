@@ -8,7 +8,7 @@ feature: PXD-0006
 
 The `internal/nat` package discovers a node's public endpoint using STUN servers, classifies the NAT type, and reports the result to the control plane. Peers behind NAT use the discovered endpoints to establish direct WireGuard connections. The package also publishes the node's local interface addresses as [endpoint candidates](#local-endpoint-candidates), which peers on the same network dial directly.
 
-All STUN network operations go through a `STUNClient` interface, enabling full unit testing without real STUN servers or UDP sockets. The STUN protocol implementation covers RFC 5389 Binding requests and XOR-MAPPED-ADDRESS parsing using only the Go standard library.
+Discovery's STUN network operations go through a `STUNClient` interface, enabling full unit testing without real STUN servers or UDP sockets. The [path MTU probe](#path-mtu-probe), which measures how large a packet the uplink carries, opens its own sockets, and its tests run against a STUN server on loopback. The STUN protocol implementation covers RFC 5389 Binding requests, the padded requests of the probe, and XOR-MAPPED-ADDRESS parsing using the Go standard library. The probe also uses `golang.org/x/sys` to set the don't-fragment option on its sockets.
 
 ## Config
 
@@ -16,7 +16,7 @@ All STUN network operations go through a `STUNClient` interface, enabling full u
 
 | Field             | Type            | Default                                                      | Description                         |
 |-------------------|-----------------|--------------------------------------------------------------|-------------------------------------|
-| `Enabled`         | `bool`          | `true`                                                       | Whether NAT traversal is active     |
+| `Enabled`         | `bool`          | `true`                                                       | Whether NAT traversal is active. `false` also turns the [path MTU probe](#path-mtu-probe) off |
 | `STUNServers`     | `[]string`      | `["stun.l.google.com:19302", "stun.cloudflare.com:3478"]`   | STUN server addresses (host:port)   |
 | `RefreshInterval` | `time.Duration` | `60s`                                                        | Interval between STUN refreshes     |
 | `Timeout`         | `time.Duration` | `5s`                                                         | Per-server STUN request timeout     |
@@ -35,7 +35,7 @@ if err := cfg.Validate(); err != nil {
 }
 ```
 
-`ApplyDefaults` sets `Enabled=true` on a zero-valued Config (when `STUNServers == nil && RefreshInterval == 0 && Timeout == 0`). If any field is already set, `Enabled` is left as-is. To disable NAT traversal, set `Enabled=false` after calling `ApplyDefaults`.
+`ApplyDefaults` sets `Enabled=true` on a zero-valued Config (when `STUNServers == nil && RefreshInterval == 0 && Timeout == 0 && MinReportInterval == 0`). If any field is already set, `Enabled` is left as-is. To disable NAT traversal, set `Enabled=false` after calling `ApplyDefaults`. In the config file, a `nat` block that sets only `enabled: false` is therefore read as enabled; set `stun_servers`, `refresh_interval`, `timeout` or `min_report_interval` beside it.
 
 ### Validation Rules
 
@@ -339,9 +339,79 @@ Step 24a starts the publisher when the WireGuard interface came up and `nat.loca
 
 `send failed` covers every failure the other lines do not, among them `400 malformed_endpoint_candidates`, `400 endpoint_candidate_unparseable`, `401`, `403`, `413`, `500`, a `501` with another code and a transport error. A peer rejection clears once the control plane registers the node, and a clock skew once NTP corrects the clock, so both are logged on every cycle rather than once. A refused credential (`api.ErrCredentialRefused`), which the client returns without a request while the heartbeat is parked, logs `send failed` at `Debug`, because the heartbeat names the cause once when it parks (see [Quiet Failure Logs](../core/heartbeat-service.md#quiet-failure-logs)).
 
+## Path MTU probe
+
+`ProbePathMTU` (`mtu_probe.go`) measures the largest IPv4 packet the uplink carries to the STUN servers. The WireGuard manager sizes the mesh interface from the result, at startup and every 10 minutes (see [MTU detection](wireguard.md#mtu-detection)).
+
+```go
+// MTUProbeSizes are the IPv4 packet sizes ProbePathMTU tries, in bytes.
+var MTUProbeSizes = []int{1500, 1492, 1480, 1472, 1460, 1452, 1440, 1428, 1420, 1400, 1380, 1360}
+
+// MTUProbeTimeout bounds one probe round.
+const MTUProbeTimeout = 2 * time.Second
+
+var ErrMTUProbeInconclusive = errors.New("nat: mtu probe: no STUN server answered")
+
+// ProbePathMTU returns the largest IPv4 packet size, in bytes, that reached a STUN server.
+func ProbePathMTU(ctx context.Context, servers []string, timeout time.Duration) (int, error)
+```
+
+Every probe is one Binding Request sent with the don't-fragment (DF) bit set, so a router that cannot forward it drops it instead of fragmenting it, and an answer proves the uplink carried a packet of that size. A ladder entry is the whole IPv4 packet: the IPv4 header (20), UDP (8) and a [padded Binding Request](#padded-binding-request) of the entry minus 28 bytes. Each round also sends a baseline, the unpadded 20-byte request, 48 bytes as an IPv4 packet. The responses never echo the padding, so the probe measures the outbound direction only.
+
+### A round
+
+- The servers are probed concurrently. Each server is resolved once, with `net.SplitHostPort` and `net.DefaultResolver.LookupNetIP` for `"ip4"`, under the round's context. The probe does not use `net.ResolveUDPAddr`, which takes no context: a DNS server that hangs could then hold startup past the round's bound.
+- For each server, the baseline and the 12 ladder sizes are probed concurrently, each on its own `udp4` socket from `net.Dialer{Control: setDontFragment}`. Each probe gets its own socket because Linux reports "fragmentation needed" as `EMSGSIZE` on the next read of the socket that sent the packet, and a shared socket could not say which probe the error belongs to.
+- Each probe writes one request with a fresh random transaction ID, then reads into a 2048-byte buffer until a datagram is a response to that request. A datagram that is not is skipped and the read goes on.
+- A response counts when it is at least 20 bytes long, carries the magic cookie and the probe's transaction ID, and is a Binding Success Response (`0x0101`) or a Binding Error Response (`0x0111`). An error response counts because a server without RFC 5780 answers the comprehension-required PADDING attribute (`0x0026`) with 420 Unknown Attribute, and that answer proves the request arrived.
+- A probe ends at its answer or at its first write or read error. The errors include `EMSGSIZE` on write when the local link is smaller than the probe, `EMSGSIZE` on read after "fragmentation needed", `ECONNREFUSED` after "port unreachable", and the timeout. They are not told apart: a probe without an answer means the size was not carried.
+- The round runs under one context that ends after `timeout` (`MTUProbeTimeout`, 2 s, in `plexd up`) or when `ctx` is done, whichever comes first. When it ends, a function registered with `context.AfterFunc` sets the deadline of every probe socket to now, which ends the reads still waiting.
+- The round ends when every probe has ended. On a healthy uplink it returns after one round trip, and only unanswered probes wait for `timeout`.
+
+The probe logs nothing; its caller does.
+
+### The result
+
+| Outcome | Returns |
+|---|---|
+| Some probe of some server was answered | The largest answered size over all servers, and `nil` |
+| Only the baseline was answered | `48`, `nil`, which `MeshMTU` floors at 1280 |
+| No probe of any server was answered | `0` and `ErrMTUProbeInconclusive` wrapping the per-server errors, joined. Each one reads `<server>: <cause>`, the cause being the resolve error, the dial or don't-fragment error, or the baseline probe's read error |
+| `servers` is empty or nil | `0` and `ErrMTUProbeInconclusive` alone, at once, without opening a socket |
+| `ctx` was done when the round ended | `0` and `nat: mtu probe: <ctx error>`, whatever was answered |
+
+The result is the maximum over the servers, not the minimum. An answer proves the uplink carried that size, and one probe lost on one server must not lower the mesh MTU.
+
+### Don't-fragment per OS
+
+```go
+func setDontFragment(network, address string, c syscall.RawConn) error
+```
+
+The dialer calls it on each socket before the socket connects. It returns the `RawConn.Control` error as it is and wraps a `setsockopt` error as `nat: mtu probe: set don't-fragment: <cause>`. The options come from `golang.org/x/sys`.
+
+| OS | File | Option |
+|---|---|---|
+| Linux | `dontfrag_linux.go` | `IP_MTU_DISCOVER` = `IP_PMTUDISC_PROBE` (`unix.SetsockoptInt`) |
+| macOS | `dontfrag_darwin.go` | `IP_DONTFRAG` = `1` (`unix.SetsockoptInt`) |
+| Windows | `dontfrag_windows.go` | `IP_MTU_DISCOVER` = `IP_PMTUDISC_PROBE` (`windows.SetsockoptInt`) |
+| Any other | `dontfrag_other.go` | None. Returns `nat: mtu probe: don't-fragment is not supported on this platform`. plexd has no WireGuard controller there |
+
+`IP_PMTUDISC_PROBE` sets DF and ignores the path MTU the kernel cached from an earlier "fragmentation needed", so every round measures again instead of failing locally against an old value. Linux keeps such a value for 10 minutes, and `ip route get` shows it as `mtu`. A probe larger than the local link still fails on write with `EMSGSIZE`, which covers a node whose own link is the smaller one, such as PPPoE on the node itself or a cloud network at 1450 bytes.
+
+### Trust and cost
+
+STUN responses are unauthenticated (see `MappedAddress.Routable` in `stun.go`). A random 96-bit transaction ID per probe keeps off-path senders out. An on-path attacker can at most hold the MTU at 1420 by forging answers, or push it to 1280 by dropping probes, and `MeshMTU` bounds both.
+
+A round sends 13 datagrams per server, 17,332 bytes of IPv4 packets: the 12 ladder sizes and the 48-byte baseline. With the two default servers that is about 35 KB per node every 10 minutes. Startup waits up to `MTUProbeTimeout` (2 s) only while some probe goes unanswered: on a black-holed uplink, or when no STUN server is reachable.
+
+### The probe in plexd up
+
+`plexd up` sets the probe on the WireGuard manager only when `nat.enabled` is true, so `nat.enabled: false` turns the MTU probe off. `nat.enabled` is also the key `Validate` ties to a non-empty `stun_servers`: the list is checked only while it is on. It does not stop endpoint discovery's STUN queries to the same servers; those follow `peer_exchange.enabled`, which starts the discoverer. The probe runs over `nat.stun_servers` with `MTUProbeTimeout`; `nat.timeout` does not apply to it. The probe itself does not depend on `peer_exchange.enabled`. A `nat` block that sets only `enabled: false` is read as enabled (see [Config](#config)), so the probe still runs.
+
 ## STUN Protocol Details
 
-The package implements RFC 5389 STUN Binding Requests using only the Go standard library (`encoding/binary`, `net`).
+The package implements RFC 5389 STUN Binding Requests with the Go standard library (`encoding/binary`, `net`). The path MTU probe also uses `golang.org/x/sys` (`unix` on Linux and macOS, `windows` on Windows) to set the don't-fragment option on its sockets.
 
 ### Binding Request Format (20 bytes)
 
@@ -364,6 +434,32 @@ The package implements RFC 5389 STUN Binding Requests using only the Go standard
 - Magic Cookie: `0x2112A442` (fixed per RFC 5389)
 - Transaction ID: 12 bytes, cryptographically random
 
+### Padded Binding Request
+
+`buildPaddedBindingRequest(transactionID, size)` builds the request of a [path MTU probe](#path-mtu-probe): a Binding Request of exactly `size` bytes, made of the 20-byte header with message length `size − 20` and one PADDING attribute (`0x0026`, RFC 5780) whose value is `size − 24` zero bytes. Callers pass only a `size` of at least 24 that is a multiple of 4; every ladder entry minus 28 is one.
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|0 0|  Binding Request (0x0001) |   Message Length (size - 20)  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                   Magic Cookie (0x2112A442)                   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+|                    Transaction ID (96 bits)                   |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|        PADDING (0x0026)       |  Attribute Length (size - 24) |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+|                  Value: size - 24 zero bytes                  |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+For the 1500-byte ladder entry `size` is 1472: message length 1452, attribute length 1448.
+
 ### Binding Response Parsing
 
 The parser validates:
@@ -371,6 +467,8 @@ The parser validates:
 - Magic cookie matches `0x2112A442`
 - Transaction ID matches the request
 - Message type is `0x0101` (Binding Success Response)
+
+The path MTU probe reads no attribute. `isResponseTo` accepts a datagram of at least 20 bytes that carries the magic cookie and the request's transaction ID, with type `0x0101` (Binding Success Response) or `0x0111` (Binding Error Response).
 
 ### XOR-MAPPED-ADDRESS (0x0020)
 
@@ -435,4 +533,4 @@ All log entries use `component=nat`.
 | `Warn`/`Error` | Endpoint report rejected     | `error`, `consecutive_rejections` (404/410; `Error` from the third in a row) |
 | `Debug` | STUN binding succeeded              | `server`, `mapped_address`             |
 
-The candidate publisher's lines are listed under [Publisher log lines](#publisher-log-lines).
+The candidate publisher's lines are listed under [Publisher log lines](#publisher-log-lines). The path MTU probe logs nothing; the WireGuard manager logs its outcome (see [MTU detection log lines](wireguard.md#mtu-detection-log-lines)).

@@ -12,7 +12,7 @@ The test runs fourteen phases:
 
 1. **Initial assertions** — all 7 counters >= 1 (agent started and contacted all endpoints)
 2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, and metrics data
-3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously), then a handshake report and a `tunnel_health` sample for a fixture peer when WireGuard came up in the container (script phase `4b`), an edge PSK fetch for each fixture peer under the same condition (script phase `4c`), and an endpoint candidates report and an endpoint selection switch on a fixture peer under the same condition (script phase `4d`)
+3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously), then a handshake report and a `tunnel_health` sample for a fixture peer when WireGuard came up in the container (script phase `4b`), an edge PSK fetch for each fixture peer under the same condition (script phase `4c`), an endpoint candidates report and an endpoint selection switch on a fixture peer under the same condition (script phase `4d`), and a mesh MTU sized by the uplink probe and held by the device under the same condition (script phase `4e`)
 4. **Log injection** — injects a log file via `docker cp`, verifies logs_count increases (FileSource pipeline works)
 5. **Agent restart for audit** — restarts the plexd container and verifies `local_audit_count` increases (ProcessSource fires per-process). The platform leg carries nothing: plexd's own `process` source is outside the ingest contract's closed enum (`auditd`, `k8s`), so `audit_count` must stay at 0.
 6. **SSE event injection** — injects a `node_state_updated` event and verifies state_count increases (proves SSE stream is connected), then switches the mock to a new signing key and verifies that a pull installs it, that an event signed with it is dispatched, and that plexd starts from the persisted key after a restart (script phase `7c`)
@@ -150,6 +150,25 @@ With the line it checks three things:
 3. Polls `dc logs plexd` every 3 seconds for up to 75 seconds for a line that contains both `trying next endpoint candidate` and the fixture node ID `0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1`. That peer's dial order is its candidate `192.0.2.10:51820`, then its fallback `203.0.113.1:51820`. No node holds its key, so no handshake completes, and endpoint selection switches to the fallback once the first entry has gone 30 seconds without one (the 25s keepalive plus 5s). The 75 seconds cover that timeout, counted from the pull that programmed the peer, with room for the 5-second selection tick and a slow start. The log is read line by line and matched with `case`, as in phase `4b`.
 
 This phase is the only run anywhere that switches an endpoint on a real device, so it must not be weakened to the skip path.
+
+### Phase 3 (cont.): Mesh MTU
+
+Runs as script phase `4e`, directly after phase `4d`, and checks [mesh MTU detection](../networking/wireguard.md#mtu-detection): plexd measures the uplink with the [path MTU probe](../networking/nat-traversal.md#path-mtu-probe), sizes its WireGuard interface to the result, and starts the 10-minute re-probe loop. The e2e config leaves `wireguard.mtu` unset and sets `nat.enabled: true`, so `Setup` probes the STUN servers before it creates the interface.
+
+There is a mesh MTU to check only when the WireGuard interface came up, so the phase reuses phase `4b`'s check for `wireguard interface configured`. Without the line it prints:
+
+```text
+SKIP: mesh mtu (WireGuard did not come up in this container)
+```
+
+With the line, the phase reads `dc logs plexd` into a variable once and takes the first `wireguard interface configured` line. No restart has happened yet, so that is the line `Setup` wrote at start. It reads the values of `mtu_source=` and `mtu=` with parameter expansion, matching each key with a space in front of it so that `path_mtu=` does not match. Lines are matched with `case`, for the same `pipefail` reason as in phase `4b`. It then checks four things:
+
+1. **The probe chose the MTU.** `mtu_source` must be `probe`. When it is `default`, the startup probe heard no STUN server, and the phase fails with a message that points at the `wireguard: mtu probe inconclusive, using the default mtu` warning in the plexd log. Any other value fails too.
+2. **The MTU is in range.** `mtu` must be a number from 1280 to 1420. The phase checks a range, not a value, because the uplink decides it: a 1500-byte path gives 1420, a 1492-byte PPPoE path 1412, and a 1452-byte path of DS-Lite over PPPoE 1372.
+3. **The device holds the logged MTU.** Reads `/sys/class/net/wg-plexd/mtu` with `dc exec -T plexd head -c 16`, strips the newline on the host, and requires the same number as the log line. `wg-plexd` is the `wireguard.interface_name` in `plexd-e2e.yaml`, and `head` is the busybox applet in the e2e image. The re-probe loop's first round comes 10 minutes after start, after the phase has run, so the device still holds what `Setup` programmed.
+4. **The re-probe loop started.** Requires a line that contains both `wireguard: mtu probe started` and `interval=10m0s`. `RunMTUProbe` logs it first thing when step 17c of `plexd up` starts the loop, next to the endpoint selection that phase `4d` has already seen at work.
+
+An inconclusive probe fails the phase instead of skipping it. The suite's endpoint report check already needs outbound UDP to `stun.l.google.com` and `stun.cloudflare.com`, so a probe that heard neither server is broken. The unit tests probe a loopback fake server. This phase is the only run anywhere that probes real STUN servers across a real uplink and programs the result on a kernel device, so it must not be weakened to the skip path.
 
 ### Phase 4: Log Injection
 

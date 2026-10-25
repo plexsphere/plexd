@@ -79,9 +79,24 @@ A node behind a router that translates ports peers with every publicly reachable
 
 ```bash
 plexd policies        # Check active policies
+plexd logs | grep mtu # Check the mesh MTU
 ```
 
 Network policies may be blocking traffic. Verify that the desired communication is allowed by the policies configured in the control plane.
+
+If pings and WireGuard handshakes pass but TCP connections over the mesh stall, the uplink may carry less than the mesh MTU plus WireGuard's 80 bytes of encapsulation. Small packets get through and full-size ones are lost without an error, so a connection hangs at its first full-size segment. SSH, for example, hangs in key exchange. A DS-Lite uplink over PPPoE carries 1452-byte packets, which fit a mesh MTU of at most 1372.
+
+plexd sizes the interface to the uplink when it starts, and measures again every 10 minutes. The `wireguard interface configured` line shows what it chose:
+
+```text
+level=INFO msg="wireguard interface configured" component=wireguard interface=plexd0 listen_port=51820 mesh_ip=10.99.0.5 mtu=1372 mtu_source=probe path_mtu=1452
+```
+
+- `mtu` is the MTU the interface came up with, and `path_mtu` the largest IPv4 packet the probe got through to a STUN server.
+- `mtu_source=probe` means the probe measured the uplink, and `config` that `wireguard.mtu` pins the MTU. `default` means the interface came up at 1420 unmeasured: either detection is off, which logs `mesh mtu detection disabled by nat.enabled`, or no STUN server answered, which logs `wireguard: mtu probe inconclusive, using the default mtu` with the error.
+- A later change logs `wireguard: mesh mtu lowered` or `wireguard: mesh mtu raised` with `old_mtu`, `mtu` and `path_mtu`. A round without an answer logs `wireguard: mtu probe inconclusive, keeping the current mtu`, and an uplink too small even for the 1280-byte floor logs `wireguard: uplink carries less than the mesh minimum mtu`.
+
+The probe measures only the outbound IPv4 path to the STUN servers. It cannot see a bottleneck on a path to a peer that the STUN traffic does not cross, and it gets no answer where UDP to the STUN servers is blocked. In those cases set `wireguard.mtu` to the path MTU minus 80, for example `1372` for a 1452-byte path, and restart plexd. A positive value pins the MTU and turns detection off. See [MTU detection](../reference/networking/wireguard.md#mtu-detection).
 
 ## Hook execution fails with integrity violation
 

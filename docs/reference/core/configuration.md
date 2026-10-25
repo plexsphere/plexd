@@ -319,7 +319,7 @@ WireGuard interface and peer management. See [WireGuard Tunnel Management](../ne
 |-------|------|---------|-------------|
 | `interface_name` | string | `plexd0` | Name of the WireGuard interface. On macOS the kernel names the device `utunN`; this value still keys the device, its UAPI socket (`wg show plexd0`) and the log lines, and a value of the form `utunN` requests that unit. See [macOS controller](../networking/wireguard.md#macos-controller). On Windows the value names the Wintun adapter itself, and its GUID is derived from it: see [Windows controller](../networking/wireguard.md#windows-controller) |
 | `listen_port` | int | `51820` | UDP listen port for WireGuard |
-| `mtu` | int | `0` | MTU for the WireGuard interface. `0` means use system default. |
+| `mtu` | int | `0` | MTU for the WireGuard interface. `0` sizes the interface to the uplink: `plexd up` measures the uplink's path MTU with the STUN servers in `nat.stun_servers` at startup and every 10 minutes, and sets the MTU to the path MTU minus 80 bytes, between `1280` and `1420`. A positive value pins the MTU and turns detection off; `1420` pins the default plexd used before detection. Detection also needs `nat.enabled`. See [MTU detection](../networking/wireguard.md#mtu-detection). |
 | `edge_psk` | bool | `true` | Fetch each edge's PSK from the control plane and program it on the peer. An omitted key means enabled; an explicit `false` is preserved. Takes effect only when the WireGuard interface came up. See [Edge PSKs](../networking/wireguard.md#edge-psks). |
 | `persistent_keepalive` | duration | `25s` | Keepalive interval written on every mesh peer. It holds open the NAT mapping a node opened by dialing out, and endpoint selection depends on it to try a newly programmed endpoint. `0s` turns the keepalive off, clears one an earlier run left on the device, and turns endpoint selection off, so every peer keeps the first entry of its dial order. Must be a whole number of seconds between `0s` and `65535s`. See [Endpoint selection](../networking/wireguard.md#endpoint-selection). |
 
@@ -335,7 +335,7 @@ STUN-based NAT traversal. See [NAT Traversal via STUN](../networking/nat-travers
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Enable NAT traversal |
+| `enabled` | bool | `true` | Enable NAT traversal. `false` also turns mesh MTU detection off, so the WireGuard interface comes up at `1420` unless `wireguard.mtu` pins another value (see [MTU detection](../networking/wireguard.md#turning-detection-off)). Defaults to `true` via zero-value heuristic: a `nat` block that sets none of `stun_servers`, `refresh_interval`, `timeout` and `min_report_interval` is read as enabled, so `enabled: false` alone keeps detection on. Set one of those fields beside it (see [Config](../networking/nat-traversal.md#config)). |
 | `stun_servers` | []string | (built-in list) | List of STUN server addresses (host:port) |
 | `refresh_interval` | duration | `60s` | Interval between STUN binding refreshes. Minimum: `10s`. |
 | `timeout` | duration | `5s` | Per-server STUN request timeout |
@@ -560,12 +560,12 @@ audit_fwd:
 wireguard:
   interface_name: plexd0
   listen_port: 51820
-  # mtu: 0                  # 0 = system default
+  # mtu: 0                  # 0 = sized to the uplink; a positive value pins it
   # edge_psk: true          # false during a rolling upgrade, until every node installs edge PSKs
   # persistent_keepalive: 25s  # 0s turns the keepalive and endpoint selection off
 
 nat:
-  enabled: true
+  enabled: true              # false also turns mesh MTU detection off
   # stun_servers:            # default built-in list
   refresh_interval: 60s      # min: 10s
   timeout: 5s
