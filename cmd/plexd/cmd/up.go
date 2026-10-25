@@ -248,6 +248,13 @@ func runAgent(ctx context.Context) error {
 	wgMgr := wireguard.NewManager(wgCtrl, cfg.WireGuard, logger)
 	wgReady := false
 	if wgCtrl != nil {
+		// Setup sizes the interface to what the uplink carries, measured with
+		// the STUN servers NAT discovery uses, unless wireguard.mtu pins it.
+		if probe := meshMTUProbe(cfg.NAT); probe != nil {
+			wgMgr.SetPathMTUProbe(probe)
+		} else if cfg.WireGuard.MTU == 0 {
+			logger.Info("mesh mtu detection disabled by nat.enabled")
+		}
 		if err := wgMgr.Setup(ctx, identity); err != nil {
 			logger.Warn("wireguard setup failed, continuing without WireGuard",
 				"error", err,
@@ -998,6 +1005,18 @@ func runAgent(ctx context.Context) error {
 		}()
 	}
 
+	// 17c. Start the mesh MTU re-probe. Setup measured the uplink once; the
+	// loop measures it again, because an uplink can get worse after startup
+	// (LTE failover, a laptop changing networks) and a mesh MTU it no longer
+	// carries is lost without an error.
+	if wgReady {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = wgMgr.RunMTUProbe(ctx, wireguard.MTUProbeInterval)
+		}()
+	}
+
 	// 18. Start reconciler.
 	wg.Add(1)
 	go func() {
@@ -1227,6 +1246,20 @@ func meshInterfaceOwned(name, meshIP string) (bool, error) {
 		return false, nil
 	}
 	return false, nil
+}
+
+// meshMTUProbe returns the function the WireGuard manager measures the uplink
+// with: one round of padded STUN probes against the configured servers. It
+// returns nil when nat.enabled is off, which turns the MTU probe off; Validate
+// checks the server list only while it is on.
+func meshMTUProbe(natCfg nat.Config) func(context.Context) (int, error) {
+	if !natCfg.Enabled {
+		return nil
+	}
+	servers := natCfg.STUNServers
+	return func(ctx context.Context) (int, error) {
+		return nat.ProbePathMTU(ctx, servers, nat.MTUProbeTimeout)
+	}
 }
 
 // agentNodeInfo adapts agent identity to actions.NodeInfoProvider.
