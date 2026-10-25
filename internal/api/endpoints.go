@@ -241,6 +241,12 @@ const secretNamePattern = `^[a-z][a-z0-9_-]{0,62}$`
 
 var secretNameRe = regexp.MustCompile(secretNamePattern)
 
+// ValidSecretName reports whether name is inside the control plane's
+// secret-name grammar, so it names a secret FetchSecret can ask for.
+func ValidSecretName(name string) bool {
+	return secretNameRe.MatchString(name)
+}
+
 // maxSecretEnvelopeSize is the contract's 1 MiB ciphertext cap plus the
 // 12-byte nonce and 16-byte GCM tag.
 const maxSecretEnvelopeSize = 1<<20 + 28

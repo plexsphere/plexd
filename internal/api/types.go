@@ -80,7 +80,7 @@ type HeartbeatResponse struct {
 // GET /v1/nodes/{node_id}/state. Every block key is always present on the wire:
 // a null value means "block not populated", never "field absent". The differ
 // therefore distinguishes a nil pointer from a populated block, so none of the
-// nine fields carry omitempty.
+// ten fields carry omitempty.
 type NodeStateSnapshot struct {
 	Peers        []SnapshotPeer       `json:"peers"`
 	Reachability json.RawMessage      `json:"reachability"`
@@ -96,6 +96,12 @@ type NodeStateSnapshot struct {
 	// not populate the block" (null, or a key a build predating the block never
 	// wrote). A nil pointer is the second case and is not a teardown signal.
 	Sessions *[]NodeStateSession `json:"sessions"`
+	// Secrets is the node's secret inventory, ordered by name. It is a pointer
+	// for the reason Sessions is: [] says the node may read nothing and empties
+	// the node API's secret index, while a nil value, the wire's null or a key a
+	// control plane predating the block never wrote, means the control plane did
+	// not say this time, and the index is kept.
+	Secrets *[]NodeStateSecret `json:"secrets"`
 	// SigningKey is the key the node's Domain signs envelopes and session
 	// tokens with. A nil value, the wire's null or a key a control plane
 	// predating the block never wrote, means the control plane could not say
@@ -111,6 +117,17 @@ type NodeStateSnapshot struct {
 type NodeStateSigningKey struct {
 	KeyID     string `json:"key_id"`
 	PublicKey string `json:"public_key"`
+}
+
+// NodeStateSecret is one entry of the secrets block of the state pull, a Secret
+// the node may read as the "Secret inventory" section of plexsphere's agent
+// contract (docs/reference/api/plexd-agent-contract.md) describes it: its name
+// and current version, never its value, which the node fetches through
+// GET /v1/nodes/{node_id}/secrets/{name}. The node API maps Name onto the key
+// of its secret index (SecretRef.Key).
+type NodeStateSecret struct {
+	Name    string `json:"name"`
+	Version int    `json:"version"`
 }
 
 // SnapshotPeer is a reconciliation peer entry in NodeStateSnapshot. It is a
@@ -242,6 +259,9 @@ type DataEntry struct {
 	UpdatedAt   time.Time       `json:"updated_at"`
 }
 
+// SecretRef is one entry of the local node API's secret index, the list
+// GET /v1/state/secrets serves. It is fed from the NodeStateSecret entries of
+// the state pull, whose name becomes Key.
 type SecretRef struct {
 	Key     string `json:"key"`
 	Version int    `json:"version"`
