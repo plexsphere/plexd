@@ -104,8 +104,9 @@ func (c *DarwinController) CreateInterface(name string, privateKey []byte, liste
 	}
 
 	// device.DefaultMTU is 1420, what the Linux kernel gives a WireGuard link,
-	// so a Config.MTU of 0 ("system default") means the same on both
-	// platforms. SetMTU overrides it when the configuration asks.
+	// so the device starts at the same MTU on both platforms. Manager.Setup
+	// calls SetMTU when Config.MTU pins a value or MTU detection picks another
+	// one, and RunMTUProbe can call it again at runtime.
 	tdev, err := c.createTUN(tunName, device.DefaultMTU)
 	if err != nil {
 		if errors.Is(err, unix.EPERM) {

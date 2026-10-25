@@ -16,7 +16,8 @@ type Config struct {
 	// Default: 51820
 	ListenPort int `yaml:"listen_port"`
 
-	// MTU is the interface MTU. 0 means system default.
+	// MTU is the interface MTU. 0 sizes the interface to the uplink (see
+	// MeshMTU); a positive value pins it.
 	MTU int `yaml:"mtu"`
 
 	// EdgePSK controls whether plexd fetches each edge's PSK from the control

@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -34,8 +36,9 @@ func testPeer(id string) api.Peer {
 }
 
 func TestManager_Setup(t *testing.T) {
+	var logs bytes.Buffer
 	ctrl := &mockController{}
-	mgr := NewManager(ctrl, Config{}, discardLogger())
+	mgr := NewManager(ctrl, Config{}, slogTextLogger(&logs))
 
 	err := mgr.Setup(context.Background(), testIdentity())
 	if err != nil {
@@ -70,6 +73,14 @@ func TestManager_Setup(t *testing.T) {
 	mtu := ctrl.callsFor("SetMTU")
 	if len(mtu) != 0 {
 		t.Errorf("expected 0 SetMTU calls, got %d", len(mtu))
+	}
+
+	// Without a probe the interface keeps the MTU every controller creates it
+	// at, and the log says so.
+	assertLogLine(t, logs.String(), "wireguard interface configured",
+		"level=INFO", "component=wireguard", "mtu=1420 mtu_source=default")
+	if line := logLine(logs.String(), "wireguard interface configured"); strings.Contains(line, "path_mtu=") {
+		t.Errorf("configured line carries path_mtu without a probe:\n%s", line)
 	}
 }
 
@@ -159,8 +170,12 @@ func TestManager_MeshPrefix(t *testing.T) {
 }
 
 func TestManager_Setup_WithMTU(t *testing.T) {
+	var logs bytes.Buffer
 	ctrl := &mockController{}
-	mgr := NewManager(ctrl, Config{MTU: 1420}, discardLogger())
+	mgr := NewManager(ctrl, Config{MTU: 1420}, slogTextLogger(&logs))
+	// A pinned MTU turns detection off, so a probe set next to it never runs.
+	p := &stubProbe{pathMTU: 1452}
+	mgr.SetPathMTUProbe(p.probe)
 
 	err := mgr.Setup(context.Background(), testIdentity())
 	if err != nil {
@@ -171,8 +186,199 @@ func TestManager_Setup_WithMTU(t *testing.T) {
 	if len(mtu) != 1 {
 		t.Fatalf("expected 1 SetMTU call, got %d", len(mtu))
 	}
+	if mtu[0].Args[0] != "plexd0" {
+		t.Errorf("SetMTU iface = %v, want plexd0", mtu[0].Args[0])
+	}
 	if mtu[0].Args[1] != 1420 {
 		t.Errorf("SetMTU mtu = %v, want 1420", mtu[0].Args[1])
+	}
+	if p.rounds != 0 {
+		t.Errorf("probe ran %d times, want never with a pinned MTU", p.rounds)
+	}
+	assertLogLine(t, logs.String(), "wireguard interface configured", "mtu=1420 mtu_source=config")
+	if line := logLine(logs.String(), "wireguard interface configured"); strings.Contains(line, "path_mtu=") {
+		t.Errorf("configured line carries path_mtu for a pinned MTU:\n%s", line)
+	}
+}
+
+func TestManager_Setup_ProbeLowers(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	mgr := NewManager(ctrl, Config{}, slogTextLogger(&logs))
+	mgr.SetPathMTUProbe((&stubProbe{pathMTU: 1452}).probe)
+
+	if err := mgr.Setup(context.Background(), testIdentity()); err != nil {
+		t.Fatalf("Setup() returned error: %v", err)
+	}
+
+	if got := setMTUs(t, ctrl); !slices.Equal(got, []int{1372}) {
+		t.Errorf("SetMTU calls = %v, want [1372]", got)
+	}
+	want := []string{"CreateInterface", "ConfigureAddress", "SetMTU", "SetInterfaceUp"}
+	if got := callMethods(ctrl); !slices.Equal(got, want) {
+		t.Errorf("controller calls = %v, want %v", got, want)
+	}
+	assertLogLine(t, logs.String(), "wireguard interface configured",
+		"level=INFO", "component=wireguard", "mtu=1372 mtu_source=probe path_mtu=1452")
+}
+
+func TestManager_Setup_ProbeFullSize(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	mgr := NewManager(ctrl, Config{}, slogTextLogger(&logs))
+	mgr.SetPathMTUProbe((&stubProbe{pathMTU: 1500}).probe)
+
+	if err := mgr.Setup(context.Background(), testIdentity()); err != nil {
+		t.Fatalf("Setup() returned error: %v", err)
+	}
+
+	if got := setMTUs(t, ctrl); len(got) != 0 {
+		t.Errorf("SetMTU calls = %v, want none for the MTU the device is created at", got)
+	}
+	assertLogLine(t, logs.String(), "wireguard interface configured", "mtu=1420 mtu_source=probe path_mtu=1500")
+}
+
+func TestManager_Setup_ProbeRunsFirst(t *testing.T) {
+	ctrl := &mockController{}
+	mgr := NewManager(ctrl, Config{}, discardLogger())
+	seen := -1
+	mgr.SetPathMTUProbe(func(context.Context) (int, error) {
+		seen = len(callMethods(ctrl))
+		return 1452, nil
+	})
+
+	if err := mgr.Setup(context.Background(), testIdentity()); err != nil {
+		t.Fatalf("Setup() returned error: %v", err)
+	}
+
+	if seen != 0 {
+		t.Errorf("probe saw %d controller calls, want 0 (the probe was not called when -1)", seen)
+	}
+}
+
+func TestManager_Setup_ProbeInconclusive(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	mgr := NewManager(ctrl, Config{}, slogTextLogger(&logs))
+	p := &stubProbe{err: errors.New("nat: mtu probe: no STUN server answered")}
+	mgr.SetPathMTUProbe(p.probe)
+
+	if err := mgr.Setup(context.Background(), testIdentity()); err != nil {
+		t.Fatalf("Setup() returned error: %v, want nil for an inconclusive probe", err)
+	}
+
+	if got := setMTUs(t, ctrl); len(got) != 0 {
+		t.Errorf("SetMTU calls = %v, want none", got)
+	}
+	out := logs.String()
+	assertLogLine(t, out, "wireguard: mtu probe inconclusive, using the default mtu",
+		"level=WARN", "component=wireguard", "mtu=1420", "nat: mtu probe: no STUN server answered")
+	assertLogLine(t, out, "wireguard interface configured", "mtu=1420 mtu_source=default")
+	if line := logLine(out, "wireguard interface configured"); strings.Contains(line, "path_mtu=") {
+		t.Errorf("configured line carries path_mtu after an inconclusive probe:\n%s", line)
+	}
+}
+
+func TestManager_Setup_ProbeFloor(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	mgr := NewManager(ctrl, Config{}, slogTextLogger(&logs))
+	mgr.SetPathMTUProbe((&stubProbe{pathMTU: 48}).probe)
+
+	if err := mgr.Setup(context.Background(), testIdentity()); err != nil {
+		t.Fatalf("Setup() returned error: %v", err)
+	}
+
+	if got := setMTUs(t, ctrl); !slices.Equal(got, []int{1280}) {
+		t.Errorf("SetMTU calls = %v, want [1280]", got)
+	}
+	out := logs.String()
+	assertLogLine(t, out, "wireguard: uplink carries less than the mesh minimum mtu",
+		"level=WARN", "component=wireguard", "path_mtu=48 mtu=1280")
+	assertLogLine(t, out, "wireguard interface configured", "mtu=1280 mtu_source=probe path_mtu=48")
+}
+
+// A 1360-byte uplink carries MinMTU mesh packets exactly, so only an uplink
+// below it gets the floor warning.
+func TestManager_Setup_ProbeFloorBoundary(t *testing.T) {
+	tests := []struct {
+		name    string
+		pathMTU int
+		warn    bool
+	}{
+		{name: "uplink that fits the minimum", pathMTU: 1360, warn: false},
+		{name: "uplink one byte short of the minimum", pathMTU: 1359, warn: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			ctrl := &mockController{}
+			mgr := NewManager(ctrl, Config{}, slogTextLogger(&logs))
+			mgr.SetPathMTUProbe((&stubProbe{pathMTU: tt.pathMTU}).probe)
+
+			if err := mgr.Setup(context.Background(), testIdentity()); err != nil {
+				t.Fatalf("Setup() returned error: %v", err)
+			}
+
+			if got := setMTUs(t, ctrl); !slices.Equal(got, []int{1280}) {
+				t.Errorf("SetMTU calls = %v, want [1280]", got)
+			}
+			out := logs.String()
+			const warning = "wireguard: uplink carries less than the mesh minimum mtu"
+			if !tt.warn {
+				if strings.Contains(out, warning) {
+					t.Errorf("floor warning for a %d-byte uplink:\n%s", tt.pathMTU, out)
+				}
+				return
+			}
+			assertLogLine(t, out, warning, "level=WARN", fmt.Sprintf("path_mtu=%d mtu=1280", tt.pathMTU))
+		})
+	}
+}
+
+// RunMTUProbe's rounds compare with the MTU Setup programmed, so after a
+// startup probe lowered the interface, a full-size uplink raises it back from
+// that MTU once two rounds agree.
+func TestManager_Setup_RecordsProbedMTU(t *testing.T) {
+	var logs bytes.Buffer
+	ctrl := &mockController{}
+	mgr := NewManager(ctrl, Config{}, slogTextLogger(&logs))
+	p := &stubProbe{pathMTU: 1452}
+	mgr.SetPathMTUProbe(p.probe)
+
+	if err := mgr.Setup(context.Background(), testIdentity()); err != nil {
+		t.Fatalf("Setup() returned error: %v", err)
+	}
+	adjustAt(mgr, p, 1500)
+	if got := setMTUs(t, ctrl); !slices.Equal(got, []int{1372}) {
+		t.Fatalf("SetMTU calls after the first round = %v, want Setup's [1372] only", got)
+	}
+	adjustAt(mgr, p, 1500)
+
+	if got := setMTUs(t, ctrl); !slices.Equal(got, []int{1372, 1420}) {
+		t.Errorf("SetMTU calls after the second round = %v, want Setup's [1372] and the raise [1420]", got)
+	}
+	assertLogLine(t, logs.String(), "wireguard: mesh mtu raised", "old_mtu=1372 mtu=1420 path_mtu=1500")
+}
+
+func TestManager_Setup_ProbedMTUError(t *testing.T) {
+	cause := errors.New("netlink: device busy")
+	ctrl := &mockController{setMTUErr: cause}
+	mgr := NewManager(ctrl, Config{}, discardLogger())
+	mgr.SetPathMTUProbe((&stubProbe{pathMTU: 1452}).probe)
+
+	err := mgr.Setup(context.Background(), testIdentity())
+	if err == nil {
+		t.Fatal("Setup() expected error, got nil")
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("error %q does not wrap cause", err.Error())
+	}
+	if !strings.HasPrefix(err.Error(), "wireguard: setup:") {
+		t.Errorf("error %q does not start with 'wireguard: setup:'", err.Error())
+	}
+	if su := ctrl.callsFor("SetInterfaceUp"); len(su) != 0 {
+		t.Errorf("expected 0 SetInterfaceUp calls after SetMTU error, got %d", len(su))
 	}
 }
 
