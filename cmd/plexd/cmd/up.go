@@ -574,6 +574,10 @@ func runAgent(ctx context.Context) error {
 	// blocks, the events only pull them forward. session_revoked is the same
 	// shape from the other end — a session leaving the sessions block is what
 	// tears it down, so the event only pulls the observing reconcile forward.
+	// node_secrets_updated carries the node's full secret inventory, but the
+	// inventory also rides the pull's secrets block, which feeds the node API's
+	// secret index, so the event only pulls that forward too: an event that
+	// arrives late can never roll the index back.
 	triggerReconcile := func(_ context.Context, _ api.Envelope) error {
 		reconciler.TriggerReconcile()
 		return nil
@@ -583,6 +587,7 @@ func runAgent(ctx context.Context) error {
 		api.EventActionRequest,
 		api.EventSessionSetup,
 		api.EventSessionRevoked,
+		api.EventNodeSecretsUpdated,
 		api.EventPeerRegistered,
 		api.EventPeerPSKAssigned,
 		api.EventPeerDeregistered,
@@ -792,6 +797,12 @@ func runAgent(ctx context.Context) error {
 		KeyID:     identity.SigningKeyID,
 		PublicKey: identity.SigningPublicKey,
 	}, logger))
+
+	// The pull's secrets block is the node's secret inventory, names and
+	// versions only. It replaces the node API's secret index on every
+	// successful cycle, drift or not, so GET /v1/state/secrets lists what the
+	// node may read; node_secrets_updated only pulls it forward (see above).
+	reconciler.RegisterDispatchHandler(nodeAPISrv.SecretIndexDispatchHandler())
 
 	// Action dispatches are consumed from the pull's executions block on every
 	// successful cycle, drift or not: the block is a delivery queue that
