@@ -101,12 +101,14 @@ const stunMagicCookie uint32 = 0x2112A442
 const (
 	stunBindingRequest         uint16 = 0x0001
 	stunBindingSuccessResponse uint16 = 0x0101
+	stunBindingErrorResponse   uint16 = 0x0111
 )
 
 // STUN attribute types.
 const (
 	stunAttrMappedAddress    uint16 = 0x0001
 	stunAttrXORMappedAddress uint16 = 0x0020
+	stunAttrPadding          uint16 = 0x0026 // RFC 5780 PADDING
 )
 
 // STUN address families.
@@ -123,6 +125,44 @@ func buildBindingRequest(transactionID [12]byte) []byte {
 	binary.BigEndian.PutUint32(buf[4:8], stunMagicCookie)
 	copy(buf[8:20], transactionID[:])
 	return buf
+}
+
+// buildPaddedBindingRequest creates a STUN Binding Request of exactly size
+// bytes, so the path MTU probe can put a datagram of a chosen size on the
+// wire. It is the 20-byte header followed by one PADDING attribute whose value
+// is size-24 zero bytes. size must be at least 24 and a multiple of 4: an
+// attribute value ends on a 4-byte boundary, and the message length counts
+// whole attributes.
+func buildPaddedBindingRequest(transactionID [12]byte, size int) []byte {
+	buf := make([]byte, size)
+	binary.BigEndian.PutUint16(buf[0:2], stunBindingRequest)
+	binary.BigEndian.PutUint16(buf[2:4], uint16(size-20))
+	binary.BigEndian.PutUint32(buf[4:8], stunMagicCookie)
+	copy(buf[8:20], transactionID[:])
+	binary.BigEndian.PutUint16(buf[20:22], stunAttrPadding)
+	binary.BigEndian.PutUint16(buf[22:24], uint16(size-24))
+	return buf
+}
+
+// isResponseTo reports whether data is a Binding success or error response to
+// the request with transactionID. Only the header is checked, because the
+// path MTU probe asks whether its request arrived, not what the server saw.
+//
+// An error response counts as an answer. PADDING is comprehension-required,
+// so a server without RFC 5780 rejects a padded request with 420 Unknown
+// Attribute, and that rejection proves the request reached it as surely as a
+// success response does.
+func isResponseTo(data []byte, transactionID [12]byte) bool {
+	if len(data) < 20 {
+		return false
+	}
+	switch binary.BigEndian.Uint16(data[0:2]) {
+	case stunBindingSuccessResponse, stunBindingErrorResponse:
+	default:
+		return false
+	}
+	return binary.BigEndian.Uint32(data[4:8]) == stunMagicCookie &&
+		[12]byte(data[8:20]) == transactionID
 }
 
 // parseBindingResponse parses a STUN Binding Response and extracts the XOR-MAPPED-ADDRESS.
