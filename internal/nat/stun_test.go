@@ -60,6 +60,70 @@ func TestBuildBindingRequest_DifferentTransactionIDs(t *testing.T) {
 	}
 }
 
+func TestBuildPaddedBindingRequest(t *testing.T) {
+	var txID [12]byte
+	copy(txID[:], []byte("PADDEDTXID!!"))
+
+	req := buildPaddedBindingRequest(txID, 1472)
+	if len(req) != 1472 {
+		t.Fatalf("len(req) = %d, want 1472", len(req))
+	}
+
+	if msgType := binary.BigEndian.Uint16(req[0:2]); msgType != 0x0001 {
+		t.Errorf("message type = 0x%04X, want 0x0001", msgType)
+	}
+	if msgLen := binary.BigEndian.Uint16(req[2:4]); msgLen != 1452 {
+		t.Errorf("message length = %d, want 1452", msgLen)
+	}
+	if cookie := binary.BigEndian.Uint32(req[4:8]); cookie != 0x2112A442 {
+		t.Errorf("magic cookie = 0x%08X, want 0x2112A442", cookie)
+	}
+	if !bytes.Equal(req[8:20], txID[:]) {
+		t.Errorf("transaction ID = %x, want %x", req[8:20], txID[:])
+	}
+	if attrType := binary.BigEndian.Uint16(req[20:22]); attrType != 0x0026 {
+		t.Errorf("attribute type = 0x%04X, want 0x0026 (PADDING)", attrType)
+	}
+	if attrLen := binary.BigEndian.Uint16(req[22:24]); attrLen != 1448 {
+		t.Errorf("attribute length = %d, want 1448", attrLen)
+	}
+	if !bytes.Equal(req[24:], make([]byte, 1448)) {
+		t.Error("PADDING value is not all zero bytes")
+	}
+}
+
+func TestIsResponseTo(t *testing.T) {
+	var txID [12]byte
+	copy(txID[:], []byte("RESPONSETXID"))
+
+	var otherTxID [12]byte
+	copy(otherTxID[:], []byte("SOMEONEELSE!"))
+
+	wrongCookie := buildTestResponse(0x0101, txID, nil)
+	binary.BigEndian.PutUint32(wrongCookie[4:8], 0xDEADBEEF)
+
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"success response", buildTestResponse(0x0101, txID, nil), true},
+		{"error response", buildTestResponse(0x0111, txID, nil), true},
+		{"different transaction ID", buildTestResponse(0x0101, otherTxID, nil), false},
+		{"wrong magic cookie", wrongCookie, false},
+		{"binding request", buildTestResponse(0x0001, txID, nil), false},
+		{"19-byte datagram", buildTestResponse(0x0101, txID, nil)[:19], false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isResponseTo(tt.data, txID); got != tt.want {
+				t.Errorf("isResponseTo() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseBindingResponse_XORMappedAddressIPv4(t *testing.T) {
 	// Build a STUN Binding Success Response with XOR-MAPPED-ADDRESS.
 	// Target: IP 203.0.113.5, port 54321
