@@ -2655,13 +2655,14 @@ func (s *Server) SetState(state api.NodeStateSnapshot) {
 	}
 }
 
-// GetState returns the current state fixture with the peers, executions, and
-// sessions slices normalized to non-nil so they always serialize as [] rather
-// than null. The nine envelope blocks carry no omitempty, so all keys are
-// emitted (null for unpopulated blocks).
+// GetState returns the current state fixture with the peers, executions,
+// sessions, and secrets slices normalized to non-nil so they always serialize
+// as [] rather than null. The ten envelope blocks carry no omitempty, so all
+// keys are emitted (null for unpopulated blocks).
 //
 // The result is a SHALLOW copy: the policy, bridge, state, and reports pointers
-// and the peers, executions, and sessions backing arrays alias the live fixture.
+// and the peers, executions, sessions, and secrets backing arrays alias the
+// live fixture.
 // Reading is safe — SetState replaces the whole struct under the mutex, so no
 // caller observes a half-written fixture — but callers must NOT mutate through
 // the returned pointers or slices, which would race the state handler serving a
@@ -2678,6 +2679,9 @@ func (s *Server) GetState() api.NodeStateSnapshot {
 	}
 	if state.Sessions == nil {
 		state.Sessions = &[]api.NodeStateSession{}
+	}
+	if state.Secrets == nil {
+		state.Secrets = &[]api.NodeStateSecret{}
 	}
 	return state
 }

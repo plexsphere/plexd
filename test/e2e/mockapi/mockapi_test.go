@@ -5166,6 +5166,47 @@ func TestState_EmptySessionsSerializeAsArray(t *testing.T) {
 	})
 }
 
+// TestState_EmptySecretsSerializeAsArray proves the pull serves the secrets
+// block as [] when no phase configured one, never null, as the contract
+// requires of an empty inventory.
+func TestState_EmptySecretsSerializeAsArray(t *testing.T) {
+	_, ts := newTestServer(t)
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", `{}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	envelope := stateEnvelope(t, ts.URL)
+	if got, ok := envelope["secrets"]; !ok || string(got) != "[]" {
+		t.Errorf("secrets = %s, want [] (never null)", got)
+	}
+}
+
+// TestState_ConfiguredSecretsServed proves a secrets block configured through
+// /test/configure-state is served verbatim and in order.
+func TestState_ConfiguredSecretsServed(t *testing.T) {
+	_, ts := newTestServer(t)
+	want := []api.NodeStateSecret{
+		{Name: "api-token", Version: 1},
+		{Name: "db-password", Version: 2},
+	}
+	body, err := json.Marshal(api.NodeStateSnapshot{Secrets: &want})
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-state", string(body))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	got := getState(t, ts.URL).Secrets
+	if got == nil || !reflect.DeepEqual(*got, want) {
+		t.Errorf("served secrets = %v, want %v", got, want)
+	}
+}
+
 func TestConfigureState_RepostDrainsSessions(t *testing.T) {
 	_, ts := newTestServer(t)
 	const (
