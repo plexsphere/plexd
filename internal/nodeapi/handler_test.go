@@ -156,6 +156,49 @@ func TestHandler_GetState_Empty(t *testing.T) {
 	}
 }
 
+// TestHandler_GetState_SecretNamesHidden proves the summary lists no secret key
+// for a request wrapSecretAuth marked, and leaves the other members alone.
+func TestHandler_GetState_SecretNamesHidden(t *testing.T) {
+	cache := NewStateCache(t.TempDir(), discardLogger())
+	if err := cache.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cache.UpdateMetadata(map[string]string{"env": "prod"})
+	cache.UpdateData([]api.DataEntry{{Key: "cfg", ContentType: "application/json", Payload: json.RawMessage(`{}`), Version: 2}})
+	cache.UpdateSecretIndex([]api.SecretRef{{Key: "db-pass", Version: 1}})
+	if _, err := cache.PutReport("health", "application/json", json.RawMessage(`{"ok":true}`), nil); err != nil {
+		t.Fatalf("PutReport: %v", err)
+	}
+	mux := NewHandler(cache, &mockSecretFetcher{}, "node-1", nil, discardLogger()).Mux()
+
+	get := func(ctx context.Context) (StateSummary, string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/state", nil).WithContext(ctx))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		var summary StateSummary
+		if err := json.Unmarshal(rec.Body.Bytes(), &summary); err != nil {
+			t.Fatalf("decode %s: %v", rec.Body.String(), err)
+		}
+		return summary, rec.Body.String()
+	}
+
+	hidden, body := get(context.WithValue(context.Background(), secretNamesHiddenKey{}, true))
+	if !strings.Contains(body, `"secret_keys":[]`) {
+		t.Errorf("marked request: body = %s, want secret_keys []", body)
+	}
+	if hidden.Metadata["env"] != "prod" || len(hidden.DataKeys) != 1 || len(hidden.ReportKeys) != 1 {
+		t.Errorf("marked request: summary = %+v, want metadata, data_keys and report_keys as before", hidden)
+	}
+
+	shown, _ := get(context.Background())
+	if len(shown.SecretKeys) != 1 || shown.SecretKeys[0].Key != "db-pass" {
+		t.Errorf("unmarked request: secret_keys = %+v, want [{db-pass 1}]", shown.SecretKeys)
+	}
+}
+
 func TestHandler_GetMetadataAll(t *testing.T) {
 	srv, cache := newTestHandler(t, &mockSecretFetcher{})
 	cache.UpdateMetadata(map[string]string{"role": "worker", "region": "us-east"})

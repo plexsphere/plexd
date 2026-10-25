@@ -1,6 +1,7 @@
 package nodeapi
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
@@ -77,17 +78,38 @@ func SecretAuthMiddleware(policy SecretPolicy, getter PeerCredGetter, logger *sl
 }
 
 // wrapSecretAuth sends the secret routes of next through SecretAuthMiddleware
-// and leaves every other route untouched.
+// and leaves every other route open. GET /v1/state stays open to every peer,
+// but its summary names the secrets only to a peer the policy admits: for any
+// other peer, and for one whose credentials cannot be read, the request is
+// marked so the summary lists no secret keys.
 func wrapSecretAuth(next http.Handler, policy SecretPolicy, logger *slog.Logger) http.Handler {
-	protected := SecretAuthMiddleware(policy, contextPeerCredGetter{}, logger)(next)
+	getter := contextPeerCredGetter{}
+	protected := SecretAuthMiddleware(policy, getter, logger)(next)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1/state/secrets") {
 			protected.ServeHTTP(w, r)
 			return
 		}
+		if r.URL.Path == "/v1/state" {
+			cred, err := getter.GetPeerCredentials(r)
+			if err != nil || !policy.AllowSecrets(cred) {
+				r = r.WithContext(context.WithValue(r.Context(), secretNamesHiddenKey{}, true))
+			}
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// secretNamesHiddenKey is the context key under which wrapSecretAuth marks a
+// GET /v1/state request whose peer may not list secrets.
+type secretNamesHiddenKey struct{}
+
+// secretNamesHidden reports whether wrapSecretAuth marked the request: its peer
+// may not list secrets, so the state summary must not name them either.
+func secretNamesHidden(ctx context.Context) bool {
+	hidden, _ := ctx.Value(secretNamesHiddenKey{}).(bool)
+	return hidden
 }
 
 func writeSecretAuthError(w http.ResponseWriter) {
