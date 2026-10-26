@@ -154,15 +154,47 @@ func TestTerminatedByFromReason(t *testing.T) {
 		{"drained maps to plexd_close", reasonDrained, api.TerminatedByPlexdClose},
 		{"shutdown maps to plexd_close", reasonShutdown, api.TerminatedByPlexdClose},
 		{"empty maps to plexd_close", "", api.TerminatedByPlexdClose},
-		// The node never asserts an operator action: a drained entry is
-		// indistinguishable from a block the control plane failed to serve.
-		{"revoked is not a reason the node produces", "revoked", api.TerminatedByPlexdClose},
+		// Only the session_revoked handler passes reasonRevoked, so only a close
+		// caused by that signed event reports operator_revoke. A drained entry
+		// is indistinguishable from a block the control plane failed to serve,
+		// so the drain above still reports plexd_close.
+		{"revoked maps to operator_revoke", reasonRevoked, api.TerminatedByOperatorRevoke},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := TerminatedByFromReason(tt.reason); got != tt.want {
 				t.Errorf("TerminatedByFromReason(%q) = %q, want %q", tt.reason, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCloseReasonForRevocation(t *testing.T) {
+	tests := []struct {
+		revokeReason   string
+		wantReason     string
+		wantRecognised bool
+	}{
+		{api.RevokeReasonOperatorRequest, reasonRevoked, true},
+		{api.RevokeReasonPolicyViolation, reasonRevoked, true},
+		{api.RevokeReasonIdentityCompromise, reasonRevoked, true},
+		{api.RevokeReasonResourceDecommissioned, reasonRevoked, true},
+		// The sweeper's reasons keep their own terminated_by values.
+		{api.RevokeReasonTTLExpired, reasonExpired, true},
+		{api.RevokeReasonIdleTimeout, reasonIdle, true},
+		// A value outside the contract's six still closes the session as a
+		// revocation, but is flagged so the handler can warn about it.
+		{"", reasonRevoked, false},
+		{"quota_exceeded", reasonRevoked, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.revokeReason, func(t *testing.T) {
+			reason, recognised := closeReasonForRevocation(tt.revokeReason)
+			if reason != tt.wantReason || recognised != tt.wantRecognised {
+				t.Errorf("closeReasonForRevocation(%q) = (%q, %v), want (%q, %v)",
+					tt.revokeReason, reason, recognised, tt.wantReason, tt.wantRecognised)
 			}
 		})
 	}

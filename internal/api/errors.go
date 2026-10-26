@@ -222,7 +222,8 @@ func IsEndpointCandidatesNotServed(err error) bool {
 //
 // What it settles on is a drain signal, not a teardown. The answer itself never
 // closes a session: the entry leaves the sessions block on a following pull, and
-// the block drain performs the teardown.
+// the block drain, or a verified session_revoked event naming the session,
+// performs the teardown.
 //
 // A 404 session_not_found is deliberately not classified here. It is not a
 // terminal state but the sessions block and the session store disagreeing — a

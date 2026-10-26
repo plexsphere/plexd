@@ -28,15 +28,20 @@ const sessionStartedReportTimeout = 15 * time.Second
 // the node's mediated-access listeners level with it. The block is desired
 // state, not a delivery queue like the executions block: an entry stands for as
 // long as the session is valid, and its disappearance is the teardown signal.
-// Revocation and hard expiry both reach the node as that same absence — there is
-// no revocation callback to answer and no terminal status to report.
+// A revocation the control plane announces in a verified session_revoked event
+// is closed first, by the handler SessionRevokedHandler returns; for every other
+// revocation, and for a hard expiry, the absence is the only signal there is —
+// there is no revocation callback to answer and no terminal status to report.
 //
 // tcp sessions are provisioned everywhere, and ssh sessions on Linux and
 // macOS. A k8s entry, and an ssh entry elsewhere, is decoded and settled as
 // unsupported: one warning, no listener, no activity row.
 //
-// A Dispatcher is not safe for concurrent use. Handle is invoked only from the
-// reconcile goroutine, one cycle at a time, so its maps need no mutex.
+// Handle is not safe for concurrent use. It is invoked only from the reconcile
+// goroutine, one cycle at a time, so the maps only it touches need no mutex. The
+// handler SessionRevokedHandler returns runs on the SSE goroutine, concurrently
+// with Handle; it touches only the SessionManager, which locks for itself, and
+// the revoked set, which revokedMu guards.
 //
 // The pass carries no dispatch budget, unlike the executions block's: it is
 // bounded by the live sessions the manager caps at MaxSessions plus the length
@@ -68,12 +73,24 @@ type Dispatcher struct {
 	// goneStanding holds the ids the control plane answered as revoked or
 	// expired while their entry still stood in the block. That answer settles
 	// the row and performs no teardown, so the listener keeps forwarding to the
-	// target until the block drains the entry — the one state in which the node
+	// target until the block drains the entry, or a verified session_revoked
+	// event naming the session closes it — the one state in which the node
 	// knowingly serves access the platform has already withdrawn. Every later
 	// pull that still carries such an entry re-states it as a warning, so the
 	// condition stays alertable instead of ending with the single Info line that
 	// settled the row.
 	goneStanding map[string]struct{}
+
+	// revoked maps the ids a verified session_revoked event named to the close
+	// reason the event's revoke_reason maps to. The control plane never makes a
+	// revoked session live again, so an entry carrying such an id — one a pull
+	// rendered before the revocation committed can still list — is settled
+	// rather than provisioned: without this, an entry whose started row was
+	// still outstanding would get its listener bound again. It drains with the
+	// entry, like the maps above. The event handler writes it from the SSE
+	// goroutine, so unlike them it is guarded by revokedMu.
+	revokedMu sync.Mutex
+	revoked   map[string]string
 }
 
 // NewDispatcher creates a Dispatcher that provisions the pull's sessions block
@@ -86,7 +103,26 @@ func NewDispatcher(manager *SessionManager, reporter SessionActivityReporter, lo
 		known:        make(map[string]struct{}),
 		unreported:   make(map[string]string),
 		goneStanding: make(map[string]struct{}),
+		revoked:      make(map[string]string),
 	}
+}
+
+// markRevoked records that a verified session_revoked event named sessionID,
+// with the close reason its revoke_reason maps to.
+func (d *Dispatcher) markRevoked(sessionID, reason string) {
+	d.revokedMu.Lock()
+	defer d.revokedMu.Unlock()
+	d.revoked[sessionID] = reason
+}
+
+// revokedReason reports whether a verified session_revoked event named
+// sessionID while its entry has stood in the block, and the close reason the
+// event mapped to.
+func (d *Dispatcher) revokedReason(sessionID string) (string, bool) {
+	d.revokedMu.Lock()
+	defer d.revokedMu.Unlock()
+	reason, ok := d.revoked[sessionID]
+	return reason, ok
 }
 
 // startedSession is one listener this pass provisioned, held until the report
@@ -152,7 +188,9 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 		// The node cannot tell a revocation from a block the control plane failed
 		// to serve; only a lapsed local expiry is self-evident. Anything else is
 		// reported as a local close rather than asserted as an operator action in
-		// the audit trail.
+		// the audit trail. A revocation announced by a verified session_revoked
+		// event has normally been closed already, with its reason, by the handler
+		// SessionRevokedHandler returns, so it is no longer live here.
 		reason := reasonExpired
 		if time.Now().Before(expiresAt) {
 			reason = reasonDrained
@@ -190,6 +228,19 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 					"session_id", entry.SessionID,
 				)
 			}
+			continue
+		}
+
+		// A verified session_revoked event named this session, so the entry can
+		// only stand in a pull rendered before the revocation committed. It is
+		// settled, never provisioned: the event closed the listener, and binding
+		// it again would serve access the platform has withdrawn.
+		if _, revoked := d.revokedReason(entry.SessionID); revoked {
+			d.logger.Info("session was revoked by a signed event; not provisioning it",
+				"session_id", entry.SessionID,
+			)
+			delete(d.unreported, entry.SessionID)
+			d.known[entry.SessionID] = struct{}{}
 			continue
 		}
 
@@ -276,6 +327,20 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 		addr, err := d.manager.CreateSession(ctx, entry)
 		switch {
 		case err == nil:
+			// An event that landed after the revoked check above, while the
+			// listener came up, found no live session to close. The handler
+			// records the id before it closes and CreateSession made the session
+			// live before it returned, so checking again here closes it in every
+			// interleaving — with the event's reason, and without reporting a
+			// listener the platform has withdrawn.
+			if reason, revoked := d.revokedReason(entry.SessionID); revoked {
+				d.logger.Info("session was revoked by a signed event while its listener came up; closing it",
+					"session_id", entry.SessionID,
+				)
+				d.manager.CloseSession(entry.SessionID, reason)
+				d.known[entry.SessionID] = struct{}{}
+				break
+			}
 			// The entry is settled by the report pass below, not here: an entry
 			// whose started row never lands stays unsettled so the next pull
 			// rebuilds it.
@@ -332,12 +397,12 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 			if err := d.reporter.ReportSessionStarted(reportCtx, s.entry, s.addr); err != nil {
 				// A revoked-or-expired verdict settles the row but never tears
 				// the listener down: the entry draining from the block on a
-				// later pull is what closes it, so the block stays the single
-				// driver of desired state. It is the only answer that settles —
-				// a 404 is the block and the session store disagreeing rather
-				// than a terminal state, and the entry standing in the block is
-				// the control plane still asking for the session, so it stays on
-				// the re-post path below.
+				// later pull, or a verified session_revoked event naming the
+				// session, is what closes it, never this answer. It is the only
+				// answer that settles — a 404 is the block and the session store
+				// disagreeing rather than a terminal state, and the entry
+				// standing in the block is the control plane still asking for
+				// the session, so it stays on the re-post path below.
 				if api.IsSessionRevokedOrExpired(err) {
 					s.gone = true
 					d.logger.Info("session no longer live server-side; awaiting the drain",
@@ -390,6 +455,13 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 			delete(d.goneStanding, id)
 		}
 	}
+	d.revokedMu.Lock()
+	for id := range d.revoked {
+		if _, ok := present[id]; !ok {
+			delete(d.revoked, id)
+		}
+	}
+	d.revokedMu.Unlock()
 }
 
 // targetMatchesKind reports whether a tcp or ssh entry carries the target of its
