@@ -2136,15 +2136,13 @@ echo "=== Phase 8g PASSED: action_request is a pull trigger ==="
 # carrying the address the listener actually bound (listener_endpoint); the same
 # entry draining out of the block is the teardown signal, closing the listener
 # and reporting a tcp session_ended row with explicit byte counters and
-# terminated_by plexd_close — the node cannot tell a revocation from a control
-# plane that failed to serve the block, so it never claims operator_revoke.
-# The started row posts while the session is live, so the control plane records
-# it. The drain-driven ended row posts for a session the control plane already
-# holds as revoked, so the platform-faithful answer is 409
-# session_already_revoked. That row is captured but counted on
-# session_activity_rejected_count rather than session_activity_count, and the
-# agent warns that the refused row's byte counters are recorded only in its own
-# log, since nothing re-posts an ended row.
+# terminated_by plexd_close — with no session_revoked event, the node cannot
+# tell a revocation from a control plane that failed to serve the block, so it
+# does not claim operator_revoke. The started row posts while the session is
+# live, so the control plane records it. The drain-driven ended row posts for a
+# session the control plane already holds as revoked, which records the ending
+# row of such a session once (plexsphere/plexsphere#931), so it is accepted and
+# counted on session_activity_count like the started row.
 echo "=== Testing pull-driven TCP session lifecycle ==="
 
 # ExpiresAt 5 minutes ahead in RFC 3339 UTC (GNU date -d, BSD date -v fallback).
@@ -2219,13 +2217,14 @@ else
 fi
 
 # Drain the entry out of the sessions block: its disappearance is the teardown
-# signal, there is no separate revocation event.
+# signal. This phase sends no session_revoked event, so the drain alone closes
+# the session (phase 8j covers the event).
 configure_sessions "8e-drain" "[]"
 echo "  tcp session drained from the sessions block"
 
-# Poll session_activity_rejected_count to +1 (session_ended row): the ended row
-# is posted for a session the control plane holds as revoked, so it is refused
-# with 409 session_already_revoked and counted as rejected.
+# Poll session_activity_count to +2 (the session_ended row): the ended row is
+# posted for a session the control plane holds as revoked, which records the
+# ending row of such a session once, so it is accepted like the started row.
 REV_ELAPSED=0
 SESS_END_PASSED=0
 while [ "${REV_ELAPSED}" -lt "${SESS_TIMEOUT}" ]; do
@@ -2233,11 +2232,11 @@ while [ "${REV_ELAPSED}" -lt "${SESS_TIMEOUT}" ]; do
     REV_ELAPSED=$((REV_ELAPSED + 2))
     RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
     if [ -n "${RESPONSE}" ]; then
-        SESS_REJ_AFTER=$(get_counter "${RESPONSE}" "session_activity_rejected_count")
-        if [ "${SESS_REJ_AFTER}" -ge $((SESS_REJ_BEFORE + 1)) ]; then
-            echo "  PASS: session_activity_rejected_count advanced from ${SESS_REJ_BEFORE} to ${SESS_REJ_AFTER} (>= +1)"
+        SESS_AFTER=$(get_counter "${RESPONSE}" "session_activity_count")
+        if [ "${SESS_AFTER}" -ge $((SESS_BEFORE + 2)) ]; then
+            echo "  PASS: session_activity_count advanced from ${SESS_BEFORE} to ${SESS_AFTER} (>= +2)"
             # Read from the same response, so both counters describe one moment.
-            SESS_AFTER=$(get_counter "${RESPONSE}" "session_activity_count")
+            SESS_REJ_AFTER=$(get_counter "${RESPONSE}" "session_activity_rejected_count")
             SESS_END_PASSED=1
             break
         fi
@@ -2245,20 +2244,19 @@ while [ "${REV_ELAPSED}" -lt "${SESS_TIMEOUT}" ]; do
 done
 
 if [ "${SESS_END_PASSED}" -eq 0 ]; then
-    SESS_REJ_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_rejected_count")
-    fail "session_activity_rejected_count did not reach $((SESS_REJ_BEFORE + 1)) after the drain (before=${SESS_REJ_BEFORE}, after=${SESS_REJ_AFTER})"
+    SESS_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_count")
+    fail "session_activity_count did not reach $((SESS_BEFORE + 2)) after the drain (before=${SESS_BEFORE}, after=${SESS_AFTER})"
 fi
 
-# The refused row leaves the accepted counter where the started leg left it.
-if [ "${SESS_AFTER}" -eq $((SESS_BEFORE + 1)) ]; then
-    echo "  PASS: session_activity_count stayed at ${SESS_AFTER} (the rejected ended row was not counted as accepted)"
+# The ended row was recorded, not refused.
+if [ "${SESS_REJ_AFTER}" -eq "${SESS_REJ_BEFORE}" ]; then
+    echo "  PASS: session_activity_rejected_count stayed at ${SESS_REJ_AFTER} (the ended row was recorded)"
 else
-    fail "session_activity_count = ${SESS_AFTER} after the drain, want $((SESS_BEFORE + 1)): the rejected session_ended row must not be counted as accepted"
+    fail "session_activity_rejected_count = ${SESS_REJ_AFTER} after the drain, want ${SESS_REJ_BEFORE}: the session_ended row of a revoked session must be recorded"
 fi
 
 # Validate the session_ended row: phase, terminated_by, and numeric byte
-# counters (jq numbers so an absent field fails the check). The mock captures
-# the body before validation, so the refused row is still the last capture.
+# counters (jq numbers so an absent field fails the check).
 REV_BODY=$(curl -sf "http://localhost:18080/test/last-request/session_activity" 2>/dev/null || true)
 if [ -z "${REV_BODY}" ]; then
     fail "no session_activity body captured after the drain"
@@ -2269,9 +2267,10 @@ if [ "${REV_PHASE}" = "session_ended" ]; then
 else
     fail "session_activity tcp.phase = '${REV_PHASE}', want 'session_ended'"
 fi
-# The entry drained before its expiry lapsed. That may be a revocation or a
-# control plane that failed to serve the block, and the node cannot tell them
-# apart, so it reports a local close rather than asserting an operator action.
+# The entry drained before its expiry lapsed, with no session_revoked event.
+# That may be a revocation or a control plane that failed to serve the block,
+# and the node cannot tell them apart, so it reports a local close rather than
+# asserting an operator action.
 REV_TERM=$(echo "${REV_BODY}" | jq -r '.tcp.terminated_by // empty')
 if [ "${REV_TERM}" = "plexd_close" ]; then
     echo "  PASS: session_activity tcp.terminated_by = 'plexd_close'"

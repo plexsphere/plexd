@@ -1024,23 +1024,32 @@ else
 fi
 
 # Step 6: draining the block closes both listeners. Each session_ended row
-# posts for a session the mock already holds as revoked, so both are refused
-# and counted as rejected, as the tcp drain is in the docker suite.
+# posts for a session the mock already holds as revoked, which records the
+# ending row of such a session once, as the control plane does since
+# plexsphere/plexsphere#931: both are accepted and none is refused, as the tcp
+# drain is in the docker suite.
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+SSH_ACT_BEFORE=$(get_counter "${RESPONSE}" "session_activity_count")
 SSH_REJ_BEFORE=$(get_counter "${RESPONSE}" "session_activity_rejected_count")
 configure_sessions "ssh-drain" "[]"
 SSH_ELAPSED=0
+SSH_ACT_AFTER=${SSH_ACT_BEFORE}
 SSH_REJ_AFTER=${SSH_REJ_BEFORE}
 while [ "${SSH_ELAPSED}" -lt 60 ]; do
-    SSH_REJ_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_rejected_count")
-    if [ "${SSH_REJ_AFTER}" -ge $((SSH_REJ_BEFORE + 2)) ]; then
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    SSH_ACT_AFTER=$(get_counter "${RESPONSE}" "session_activity_count")
+    SSH_REJ_AFTER=$(get_counter "${RESPONSE}" "session_activity_rejected_count")
+    if [ "${SSH_ACT_AFTER}" -ge $((SSH_ACT_BEFORE + 2)) ]; then
         break
     fi
     sleep 2
     SSH_ELAPSED=$((SSH_ELAPSED + 2))
 done
-if [ "${SSH_REJ_AFTER}" -lt $((SSH_REJ_BEFORE + 2)) ]; then
-    fail "session_activity_rejected_count went from ${SSH_REJ_BEFORE} to ${SSH_REJ_AFTER} after the drain, want +2"
+if [ "${SSH_ACT_AFTER}" -lt $((SSH_ACT_BEFORE + 2)) ]; then
+    fail "session_activity_count went from ${SSH_ACT_BEFORE} to ${SSH_ACT_AFTER} after the drain, want +2"
+fi
+if [ "${SSH_REJ_AFTER}" -ne "${SSH_REJ_BEFORE}" ]; then
+    fail "session_activity_rejected_count went from ${SSH_REJ_BEFORE} to ${SSH_REJ_AFTER} after the drain, want it unchanged"
 fi
 BODY=$(last_session_activity)
 if [ "$(echo "${BODY}" | jq -r '.ssh.phase // empty')" = "session_ended" ] && [ "$(echo "${BODY}" | jq -r '.ssh.terminated_by // empty')" = "plexd_close" ]; then

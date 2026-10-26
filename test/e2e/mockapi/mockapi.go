@@ -133,11 +133,20 @@ type Server struct {
 	stateFixture   api.NodeStateSnapshot
 	stateFixtureMu sync.RWMutex
 
-	// sessionRegistry holds the session_id of every session ever configured
-	// through SetState, guarded by stateFixtureMu. It is never pruned, so an id
-	// that has been drained out of the fixture stays distinguishable from one
-	// that was never configured at all.
-	sessionRegistry map[string]struct{}
+	// sessionRegistry maps the session_id of every session ever configured
+	// through SetState to the kind of the entry last configured under it,
+	// guarded by stateFixtureMu. It is never pruned, so an id that has been
+	// drained out of the fixture stays distinguishable from one that was never
+	// configured at all, and its kind still decides whether its ending row is
+	// recorded.
+	sessionRegistry map[string]string
+
+	// sessionLifecycle maps a session_id to the phase of the newest lifecycle
+	// row (a tcp row, or an ssh row with a phase) the mock accepted for it, the
+	// mock's stand-in for the control plane's activity log. A revoked or expired
+	// session records its ending row only while this is not session_ended.
+	sessionLifecycleMu sync.Mutex
+	sessionLifecycle   map[string]string
 
 	heartbeatFixture   api.HeartbeatResponse
 	heartbeatFixtureMu sync.RWMutex
@@ -212,7 +221,8 @@ func New() *Server {
 		expectedBearerToken: "e2e-local-bearer-token",
 		consumedNonces:      make(map[string]struct{}),
 		execStates:          make(map[string]string),
-		sessionRegistry:     make(map[string]struct{}),
+		sessionRegistry:     make(map[string]string),
+		sessionLifecycle:    make(map[string]string),
 		execUploads:         make(map[string]*execUpload),
 		eventClients:        make(map[uint64]*sseClient),
 		eventsMode:          eventsModeStreaming,
@@ -2242,8 +2252,8 @@ func activityMatchesKind(req api.SessionActivityRequest, kind string) bool {
 // session that is just being configured as a revoked one. configured reports
 // whether the current fixture carries the entry, returned in entry with its
 // expires_at for the caller to judge; registered reports whether the id was ever
-// configured.
-func (s *Server) resolveSession(sessionID string) (entry api.NodeStateSession, configured, registered bool) {
+// configured, and registeredKind is the kind it was last configured with.
+func (s *Server) resolveSession(sessionID string) (entry api.NodeStateSession, configured, registered bool, registeredKind string) {
 	s.stateFixtureMu.RLock()
 	defer s.stateFixtureMu.RUnlock()
 	if s.stateFixture.Sessions != nil {
@@ -2254,8 +2264,59 @@ func (s *Server) resolveSession(sessionID string) (entry api.NodeStateSession, c
 			}
 		}
 	}
-	_, registered = s.sessionRegistry[sessionID]
-	return entry, configured, registered
+	registeredKind, registered = s.sessionRegistry[sessionID]
+	return entry, configured, registered, registeredKind
+}
+
+// lifecyclePhase returns the phase of a lifecycle row: every tcp row, and an
+// ssh row that carries a phase. It is empty for an ssh command row and a k8s
+// row, which are not lifecycle rows.
+func lifecyclePhase(req api.SessionActivityRequest) string {
+	switch {
+	case req.TCP != nil:
+		return req.TCP.Phase
+	case req.SSH != nil:
+		return req.SSH.Phase
+	default:
+		return ""
+	}
+}
+
+// admitsEndOfDeadSession mirrors the control plane's rule of the same name: a
+// revoked or expired session admits only the session_ended row of an ssh or
+// tcp listener, reported in the member its kind calls for. A mislabelled row is
+// refused like every other row on such a session.
+func admitsEndOfDeadSession(req api.SessionActivityRequest, kind string) bool {
+	return lifecyclePhase(req) == api.TCPPhaseSessionEnded &&
+		(kind == api.SessionKindSSH || kind == api.SessionKindTCP) &&
+		activityMatchesKind(req, kind)
+}
+
+// recordLifecycle stores the phase of an accepted lifecycle row as the
+// session's newest; a row that is not a lifecycle row changes nothing.
+func (s *Server) recordLifecycle(sessionID string, req api.SessionActivityRequest) {
+	phase := lifecyclePhase(req)
+	if phase == "" {
+		return
+	}
+	s.sessionLifecycleMu.Lock()
+	defer s.sessionLifecycleMu.Unlock()
+	s.sessionLifecycle[sessionID] = phase
+}
+
+// recordEndOfDeadSession records the ending row of a revoked or expired session
+// and reports whether it did. Like the control plane's HasSessionEndedEvent, it
+// refuses the row once the session's newest lifecycle row is already a
+// session_ended, so a listener's end is recorded once while a listener bound
+// again after it still gets its own. The check and the record share one lock.
+func (s *Server) recordEndOfDeadSession(sessionID string) bool {
+	s.sessionLifecycleMu.Lock()
+	defer s.sessionLifecycleMu.Unlock()
+	if s.sessionLifecycle[sessionID] == api.TCPPhaseSessionEnded {
+		return false
+	}
+	s.sessionLifecycle[sessionID] = api.TCPPhaseSessionEnded
+	return true
 }
 
 // handleSessionActivity handles POST /v1/nodes/{id}/sessions/{sid}, the v1
@@ -2265,14 +2326,20 @@ func (s *Server) resolveSession(sessionID string) (entry api.NodeStateSession, c
 //
 // The structural gates run first, so a malformed row is a 400 whatever session
 // it names. Liveness resolves next, against the configured fixture and the
-// session registry: a configured entry whose expires_at has lapsed is a 409
-// session_expired, an id configured earlier and drained since is a 409
-// session_already_revoked, and an id never configured is a 404
-// session_not_found, each of them whatever member the row populates. Only a live
-// session reaches the kind cross-check, where a row whose member disagrees with
-// the entry's kind is a 400 (the spec folds that mismatch into the structural
-// code). The liveness refusals count on sessionActivityRejectedCount, the
-// accepted rows on sessionActivityCount, and a 400 on neither.
+// session registry: a configured entry whose expires_at has lapsed is expired,
+// an id configured earlier and drained since is revoked, and an id never
+// configured is a 404 session_not_found whatever member the row populates. Only
+// a live session reaches the kind cross-check, where a row whose member
+// disagrees with the entry's kind is a 400 (the spec folds that mismatch into
+// the structural code).
+//
+// A revoked or expired session, like the control plane since
+// plexsphere/plexsphere#931, records exactly one row: the session_ended row of
+// an ssh or tcp listener in the member its kind calls for, accepted with 204
+// unless the session's newest lifecycle row is already a session_ended. Every
+// other row on it is a 409, session_expired or session_already_revoked. The
+// liveness refusals count on sessionActivityRejectedCount, the accepted rows
+// on sessionActivityCount, and a 400 on neither.
 func (s *Server) handleSessionActivity(w http.ResponseWriter, r *http.Request) {
 	if r.PathValue("id") != mockNodeID {
 		writeProblem(w, r, http.StatusForbidden, "nsk_node_mismatch", "node id does not match this node's identity")
@@ -2298,7 +2365,8 @@ func (s *Server) handleSessionActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entry, configured, registered := s.resolveSession(r.PathValue("sid"))
+	sessionID := r.PathValue("sid")
+	entry, configured, registered, registeredKind := s.resolveSession(sessionID)
 	switch {
 	case configured && entry.ExpiresAt.After(time.Now()):
 		if !activityMatchesKind(req, entry.Kind) {
@@ -2306,14 +2374,19 @@ func (s *Server) handleSessionActivity(w http.ResponseWriter, r *http.Request) {
 				"activity variant does not match the session's kind")
 			return
 		}
+		s.recordLifecycle(sessionID, req)
 	case configured:
-		s.sessionActivityRejectedCount.Add(1)
-		writeProblem(w, r, http.StatusConflict, "session_expired", "session has expired")
-		return
+		if !admitsEndOfDeadSession(req, entry.Kind) || !s.recordEndOfDeadSession(sessionID) {
+			s.sessionActivityRejectedCount.Add(1)
+			writeProblem(w, r, http.StatusConflict, "session_expired", "session has expired")
+			return
+		}
 	case registered:
-		s.sessionActivityRejectedCount.Add(1)
-		writeProblem(w, r, http.StatusConflict, "session_already_revoked", "session has been revoked")
-		return
+		if !admitsEndOfDeadSession(req, registeredKind) || !s.recordEndOfDeadSession(sessionID) {
+			s.sessionActivityRejectedCount.Add(1)
+			writeProblem(w, r, http.StatusConflict, "session_already_revoked", "session has been revoked")
+			return
+		}
 	default:
 		s.sessionActivityRejectedCount.Add(1)
 		writeProblem(w, r, http.StatusNotFound, "session_not_found", "no session resolves for this node and session id")
@@ -2636,7 +2709,7 @@ func (s *Server) SetState(state api.NodeStateSnapshot) {
 	if state.Sessions != nil {
 		for _, session := range *state.Sessions {
 			if session.SessionID != "" {
-				s.sessionRegistry[session.SessionID] = struct{}{}
+				s.sessionRegistry[session.SessionID] = session.Kind
 			}
 		}
 	}
