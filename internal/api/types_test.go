@@ -1915,6 +1915,37 @@ func TestSigningKeyRotation_JSONDecode(t *testing.T) {
 	}
 }
 
+// TestSessionRevocation_JSONDecode proves the session_revoked payload decodes
+// from the control plane's SSEEventSessionRevoked keys into every field.
+func TestSessionRevocation_JSONDecode(t *testing.T) {
+	raw := `{
+		"session_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+		"jti": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+		"revoked_at": "2026-10-26T07:00:00Z",
+		"revoke_reason": "operator_request"
+	}`
+
+	var rev SessionRevocation
+	if err := json.Unmarshal([]byte(raw), &rev); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	const id = "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"
+	if rev.SessionID != id {
+		t.Errorf("SessionID = %q, want %q", rev.SessionID, id)
+	}
+	if rev.JTI != id {
+		t.Errorf("JTI = %q, want %q", rev.JTI, id)
+	}
+	wantTime := time.Date(2026, 10, 26, 7, 0, 0, 0, time.UTC)
+	if !rev.RevokedAt.Equal(wantTime) {
+		t.Errorf("RevokedAt = %v, want %v", rev.RevokedAt, wantTime)
+	}
+	if rev.RevokeReason != RevokeReasonOperatorRequest {
+		t.Errorf("RevokeReason = %q, want %q", rev.RevokeReason, RevokeReasonOperatorRequest)
+	}
+}
+
 func TestLocalEndpointConfig_Validate(t *testing.T) {
 	tests := []struct {
 		name       string

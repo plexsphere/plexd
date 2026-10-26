@@ -251,6 +251,30 @@ type SigningKeyRotation struct {
 	TransitionExpires time.Time `json:"transition_expires"`
 }
 
+// SessionRevocation is the payload of the session_revoked event: the revoked
+// session, the revoked token's jti (equal to the session id), and when and why
+// the control plane revoked it. Its shape is the control plane's
+// SSEEventSessionRevoked schema.
+type SessionRevocation struct {
+	SessionID    string    `json:"session_id"`
+	JTI          string    `json:"jti"`
+	RevokedAt    time.Time `json:"revoked_at"`
+	RevokeReason string    `json:"revoke_reason"`
+}
+
+// Reasons the control plane revokes a session, carried on
+// SessionRevocation.RevokeReason. The first four are operator-driven, supplied
+// on the explicit revoke call; the last two are set by the control plane's
+// sweeper when the session reaches its hard expiry or its idle timeout.
+const (
+	RevokeReasonOperatorRequest        = "operator_request"
+	RevokeReasonPolicyViolation        = "policy_violation"
+	RevokeReasonIdentityCompromise     = "identity_compromise"
+	RevokeReasonResourceDecommissioned = "resource_decommissioned"
+	RevokeReasonTTLExpired             = "ttl_expired"
+	RevokeReasonIdleTimeout            = "idle_timeout"
+)
+
 type DataEntry struct {
 	Key         string          `json:"key"`
 	ContentType string          `json:"content_type"`

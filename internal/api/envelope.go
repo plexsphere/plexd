@@ -56,9 +56,12 @@ const (
 	EventPeerKeyRotated      = "peer_key_rotated"
 	EventSigningKeyRotated   = "signing_key_rotated"
 
-	// EventSessionRevoked carries no teardown of its own: a session leaving the
-	// pull's sessions block is what closes it, so this event only pulls the
-	// observing reconcile forward.
+	// EventSessionRevoked names a session the control plane revoked, in a
+	// SessionRevocation payload. tunnel.Dispatcher.SessionRevokedHandler closes
+	// that session when it is live and reports the payload's revoke_reason as
+	// its terminated_by, then triggers a reconcile. The session leaving the
+	// pull's sessions block stays the teardown for a revocation whose event
+	// never arrives.
 	EventSessionRevoked = "session_revoked"
 )
 
