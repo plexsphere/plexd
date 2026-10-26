@@ -129,7 +129,7 @@ if errors.Is(err, api.ErrUnauthorized) {
 }
 ```
 
-`IsSessionRevokedOrExpired(err error) bool` classifies the answers to `ReportSessionActivity`. It extracts the `*APIError` with `errors.As`, so a wrapped error is classified too, and reports true for a `409` carrying `session_already_revoked` or `session_expired`. Everything else is false, including a `400` `malformed_session_activity`, which is a verdict on the row rather than on the session; a `501` `access_session_not_provisioned`, which faults the callback endpoint rather than the session, and that endpoint may be provisioned mid-session; and a `404` `session_not_found`, which is not a terminal state but the `sessions` block and the session store disagreeing — two separate reads, so a lagging replica or a record written after the block was rendered produces it, and the entry standing in the block is the control plane still asking for the session. All three stay retryable. A true answer is the control plane's verdict that the session has reached a terminal state, and the node reads it as the drain signal: the entry leaves the `sessions` block on a following pull and the block drain performs the teardown. The answer itself never closes a session.
+`IsSessionRevokedOrExpired(err error) bool` classifies the answers to `ReportSessionActivity`. It extracts the `*APIError` with `errors.As`, so a wrapped error is classified too, and reports true for a `409` carrying `session_already_revoked` or `session_expired`. Everything else is false, including a `400` `malformed_session_activity`, which is a verdict on the row rather than on the session; a `501` `access_session_not_provisioned`, which faults the callback endpoint rather than the session, and that endpoint may be provisioned mid-session; and a `404` `session_not_found`, which is not a terminal state but the `sessions` block and the session store disagreeing — two separate reads, so a lagging replica or a record written after the block was rendered produces it, and the entry standing in the block is the control plane still asking for the session. All three stay retryable. A true answer is the control plane's verdict that the session has reached a terminal state, and the node reads it as the drain signal: the entry leaves the `sessions` block on a following pull and the block drain, or a verified `session_revoked` event naming the session, performs the teardown. The answer itself never closes a session.
 
 `IsHandshakeReportNotServed(err error) bool` classifies the answers to `ReportHandshakes`. It is true for an `*APIError` with status `404`, whatever its code, and for a `501` carrying `handshakes_not_provisioned`: both mean the control plane does not serve the operation yet. Everything else is false, including a `501` with another code. The [handshake reporter](heartbeat-service.md#handshake-reporter) logs a true answer once at Info and keeps reporting every interval.
 
@@ -213,7 +213,8 @@ Routes verified events to registered handlers by the envelope's `type`.
 
 The SSE event set is organized in two tiers. Payloads of the reconcile-driving
 types are opaque: the reconciler's state pull is authoritative, so those events
-only request a reconcile.
+only request a reconcile. `session_revoked` is the exception: its payload names
+the session to close before the reconcile.
 
 **Contract** — currently emitted by the control plane per the OpenAPI events document:
 
@@ -226,6 +227,7 @@ only request a reconcile.
 | `EventSessionSetup`        | `session_setup`         | `TriggerReconcile()`                        |
 | `EventPeerEndpointChanged` | `peer_endpoint_changed` | `TriggerReconcile()`                        |
 | `EventNodeSecretsUpdated`  | `node_secrets_updated`  | `TriggerReconcile()`                        |
+| `EventSessionRevoked`      | `session_revoked`       | `tunnel.Dispatcher.SessionRevokedHandler`: closes the named session, then `TriggerReconcile()` |
 
 `action_request` carries no dispatch of its own: action executions are delivered
 in the `executions` block of the state pull, so the event only pulls the next
@@ -239,6 +241,34 @@ plexd never decodes the event's payload.
 decodes it, because the inventory rides the `secrets` block of the state pull,
 which feeds the node API's secret index.
 
+`session_revoked` is not a plain reconcile trigger. Its payload, an
+`api.SessionRevocation`, names the session the control plane revoked, and
+`plexd up` registers `tunnel.Dispatcher.SessionRevokedHandler` for it. A payload
+that does not decode, or whose `session_id` is empty or differs from its `jti`,
+closes nothing: the handler calls `TriggerReconcile()` and returns the error,
+which the `EventDispatcher` logs at Error as `event handler failed`. Otherwise
+the handler maps `revoke_reason` to a close reason: the four operator-driven
+reasons (`operator_request`, `policy_violation`, `identity_compromise`,
+`resource_decommissioned`) report `terminated_by` `operator_revoke`,
+`ttl_expired` reports `ttl_expired`, and `idle_timeout` reports `idle_timeout`.
+An empty or unrecognised reason reports `operator_revoke` and logs at Warn as
+`session_revoked carries an unrecognised revoke_reason; reporting operator_revoke`.
+The handler records the id in the tunnel dispatcher's revoked set, then, on its
+own goroutine, closes the session with `SessionManager.CloseSession` and logs at
+Info either `session_revoked closed the session` (with `session_id`,
+`revoke_reason`, and `terminated_by`) or
+`session_revoked names no live session; nothing to close` (with `session_id` and
+`revoke_reason`). Only then does it call `TriggerReconcile()`, so the pull cannot
+drain the session first and report it as `plexd_close`. The `session_ended` row
+goes out through the `SessionManager`'s on-closed callback, like every other
+close. A pull rendered before the revocation committed can still list the entry;
+the tunnel dispatcher settles it instead of provisioning it and logs
+`session was revoked by a signed event; not provisioning it` at Info, and a
+listener such a pull was already binding when the event landed is closed with
+the event's reason as soon as it is up. The revoked
+set forgets the id once the entry leaves the block. A session leaving the
+`sessions` block stays the teardown for a revocation whose event never arrives.
+
 **Documented-coming** — named now so the agent can subscribe once the platform's 14-type taxonomy starts emitting them:
 
 | Constant                   | Value                   | Dispatch target             |
@@ -249,11 +279,6 @@ which feeds the node API's secret index.
 | `EventPeerKeyRotated`      | `peer_key_rotated`      | `TriggerReconcile()`        |
 | `EventRotateKeys`          | `rotate_keys`           | key rotator's `RotateNow`   |
 | `EventSigningKeyRotated`   | `signing_key_rotated`   | `Ed25519Verifier.Rotate`    |
-| `EventSessionRevoked`      | `session_revoked`       | `TriggerReconcile()`        |
-
-`session_revoked` carries no teardown of its own: a session leaving the `sessions`
-block of the state pull is what closes it, so the event only pulls the observing
-reconcile forward.
 
 ## ReconnectEngine
 

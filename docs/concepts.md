@@ -166,7 +166,8 @@ flowchart TD
 
 The SSE manager processes events in two tiers. Payloads of the reconcile-driving
 types are opaque — the reconciler's state pull is authoritative, so those events
-only request a reconcile.
+only request a reconcile. `session_revoked` is the exception: its payload names
+the session to close before the reconcile.
 
 | Event | Tier | Handler |
 |-------|------|---------|
@@ -175,6 +176,7 @@ only request a reconcile.
 | `bridge_config_updated` | contract | `bridge.HandleBridgeConfigUpdated` — triggers a reconcile (bridge mode) |
 | `action_request` | contract | Triggers a reconcile — the dispatch rides the `executions` block of the resulting pull |
 | `session_setup` | contract | Triggers a reconcile — the session rides the `sessions` block of the resulting pull |
+| `session_revoked` | contract | Closes the live session the payload names with the reason it carries (`tunnel.Dispatcher.SessionRevokedHandler`), then triggers a reconcile; the block drain stays the teardown when the event is missed |
 | `node_secrets_updated` | contract | Triggers a reconcile; the inventory rides the `secrets` block of the resulting pull, which feeds the node API's secret index |
 | `peer_registered` | documented-coming | Triggers a reconcile |
 | `peer_psk_assigned` | documented-coming | Triggers a reconcile |
@@ -183,7 +185,6 @@ only request a reconcile.
 | `peer_key_rotated` | documented-coming | Triggers a reconcile |
 | `rotate_keys` | documented-coming | Starts a key rotation (`rotator.RotateNow`) |
 | `signing_key_rotated` | documented-coming | Updates the Ed25519 verifier key (`verifier.Rotate`); every state pull also installs the key its `signing_key` block carries (`verifier.Install`) |
-| `session_revoked` | documented-coming | Triggers a reconcile — the block drain does the teardown |
 
 **Contract** types are emitted by the control plane today. **Documented-coming**
 types are named so the agent can subscribe once the platform's 14-type taxonomy

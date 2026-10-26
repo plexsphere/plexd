@@ -8,7 +8,7 @@ feature: PXD-0009
 
 The `internal/tunnel` package provides platform-mediated access to mesh nodes through WireGuard tunnels without exposing services to the public internet. The control plane declares a node's live sessions in the `sessions` block of the reconciliation state pull; the node agent holds its listeners level with that block, opening a listener bound to the mesh IP for each entry it can provision, and reporting activity back to the control plane. A `tcp` entry gets a TCP listener that forwards connections to the target host. On Linux and macOS, an `ssh` entry gets an SSH listener that starts a shell or one command for the session's user (see [SSH Sessions](#ssh-sessions)).
 
-The block is **desired state, not a delivery queue**: an entry stands for as long as its session is valid, and its disappearance is the teardown signal. Revocation and hard expiry both reach the node as that same absence — there is no revocation event to answer and no terminal status to report.
+The block is **desired state, not a delivery queue**: an entry stands for as long as its session is valid, and its disappearance is the teardown signal. Revocation and hard expiry both reach the node as that same absence, and there is no terminal status to report. A revocation the control plane also announces in a verified `session_revoked` event is closed when the event arrives, unless a pull drained it first (see [SSE Event Stream](#sse-event-stream-internal-api)); the absence stays the teardown for every revocation whose event never arrives.
 
 ## Data Flow
 
@@ -52,10 +52,10 @@ Control Plane
 2. `Dispatcher.Handle` runs on every successful pull, **before** the empty-diff short-circuit, so an unchanged snapshot still reconciles sessions
 3. Teardown pass: every live session whose entry is no longer in the block is closed, with the reason derived from its capped local expiry
 4. Provision pass, in block order: each entry not yet settled is validated and, if it is a `tcp` entry or, on Linux and macOS, an `ssh` entry, handed to `SessionManager.CreateSession`, which opens a listener on `meshIP:0`
-5. Report pass: once the block is provisioned, `SessionActivityReporter.ReportSessionStarted` posts a `session_started` row per listener whose row is still outstanding — the `tcp` row with the target host and port, or the `ssh` lifecycle row, each with the `listener_endpoint` the listener actually bound. A row that does not land is re-posted on the next pull from the same listener, so `listener_endpoint` stays stable across attempts. The posts run concurrently and each is bounded, so a stalled control plane cannot hold the reconciler's single goroutine for the length of the block. A row answered with a terminal-state verdict (a `409` `session_already_revoked` or `session_expired`, classified by `api.IsSessionRevokedOrExpired`) is settled rather than re-posted and is logged at Info (`session no longer live server-side; awaiting the drain`); the listener stays up and the block drain performs the teardown, and every pull that still carries the settled entry warns that the listener is forwarding for a session the platform has withdrawn. A `404` `session_not_found` is not a terminal state — the block and the session store are separate reads that can disagree — so it stays on the re-post path
+5. Report pass: once the block is provisioned, `SessionActivityReporter.ReportSessionStarted` posts a `session_started` row per listener whose row is still outstanding — the `tcp` row with the target host and port, or the `ssh` lifecycle row, each with the `listener_endpoint` the listener actually bound. A row that does not land is re-posted on the next pull from the same listener, so `listener_endpoint` stays stable across attempts. The posts run concurrently and each is bounded, so a stalled control plane cannot hold the reconciler's single goroutine for the length of the block. A row answered with a terminal-state verdict (a `409` `session_already_revoked` or `session_expired`, classified by `api.IsSessionRevokedOrExpired`) is settled rather than re-posted and is logged at Info (`session no longer live server-side; awaiting the drain`); the listener stays up until the block drain, or a verified `session_revoked` event naming the session, closes it, and every pull that still carries the settled entry warns that the listener is forwarding for a session the platform has withdrawn. A `404` `session_not_found` is not a terminal state — the block and the session store are separate reads that can disagree — so it stays on the re-post path
 6. A client connects through the mesh to that listener; `Session` forwards to the target
-7. A session ends when its entry drains from the block, when its capped expiry fires, when its idle window elapses, or on `Shutdown`
-8. The `SessionManager`'s on-closed callback fires the production reporter's `ReportSessionEnded`, posting a `session_ended` row with a `terminated_by` reason for every close reason, `Shutdown` included: the `tcp` row carries the byte counters, the `ssh` row picks its shape from `ClosedSessionInfo.Kind`. For a drain-driven close the platform already holds the session as revoked or expired and answers `409`; the row is fire-once and nothing re-posts it, so plexd warns (`tunnel session ended row refused; its counters are recorded only here`) and carries the byte counters and `terminated_by` into that line, which is where they survive
+7. A session ends when its entry drains from the block, when a verified `session_revoked` event names it (`Dispatcher.SessionRevokedHandler`), when its capped expiry fires, when its idle window elapses, or on `Shutdown`
+8. The `SessionManager`'s on-closed callback fires the production reporter's `ReportSessionEnded`, posting a `session_ended` row with a `terminated_by` reason for every close reason, `Shutdown` included: the `tcp` row carries the byte counters, the `ssh` row picks its shape from `ClosedSessionInfo.Kind`. For a close caused by the drain or by a `session_revoked` event the platform already holds the session as revoked or expired, and it records the ending row of the session's current listener once instead of refusing it. A `409` to the ending row means the listener's end is already recorded, or a control plane that predates that rule; the row is fire-once and nothing re-posts it, so plexd warns (`tunnel session ended row refused; its counters are recorded only here`, or `ssh session ended row refused; its terminating reason is recorded only here` for an ssh session) and carries `terminated_by`, plus a `tcp` row's byte counters, into that line, which is where they survive
 
 ## Config
 
@@ -243,10 +243,14 @@ runs on every successful pull, before the diff.
 ```go
 func NewDispatcher(manager *SessionManager, reporter SessionActivityReporter, logger *slog.Logger) *Dispatcher
 func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
+func (d *Dispatcher) SessionRevokedHandler(trigger api.ReconcileTrigger) api.EventHandler
 ```
 
-A `Dispatcher` is **not** safe for concurrent use: `Handle` is invoked only from the
-reconcile goroutine, one cycle at a time.
+`Handle` is **not** safe for concurrent use: it is invoked only from the
+reconcile goroutine, one cycle at a time. The handler `SessionRevokedHandler`
+returns (see [SSE Event Stream](#sse-event-stream-internal-api)) runs on the SSE
+goroutine, concurrently with `Handle`; it touches only the `SessionManager`,
+which locks for itself, and the `revoked` set, which a mutex guards.
 
 ### Unpopulated Block
 
@@ -273,11 +277,19 @@ only discriminator the node has for why an entry left:
 | Capped expiry is still in the future | `drained` | `plexd_close`         |
 | Capped expiry has passed             | `expired` | `ttl_expired`             |
 
-The node never reports `operator_revoke`. Only a lapsed local expiry is
+A session a verified `session_revoked` event already closed is no longer live
+here, so this pass does not close it again: its `session_ended` row went out
+with the `terminated_by` the event's `revoke_reason` maps to.
+
+A drain does not report `operator_revoke`. Only a lapsed local expiry is
 self-evident; an entry that simply is not there may be a revocation, a lagging
 read replica, a control plane mid-rollout, or a filtering gateway, and the node
 cannot tell them apart. Asserting a human action in the audit trail on that
-evidence would answer "who revoked this session?" confidently and wrongly.
+evidence would answer "who revoked this session?" confidently and wrongly. The
+node reports `operator_revoke` only for a close caused by a verified
+`session_revoked` event, which is signed and names the session. A pull that
+drains the entry before that event arrives still reports `plexd_close`, and the
+late event finds no live session to close.
 
 ### Provision Pass
 
@@ -289,6 +301,8 @@ live, or permanently settled — so a settled entry is a no-op on every later pu
 |----------------------------------------------------|-------------------------------------------------------------------------|---------|
 | Empty `session_id`                                 | Error log (`session entry carries no session_id; dropping`), entry dropped | n/a (never enters `known`) |
 | Already in `known`                                 | No-op                                                                    | already |
+| In the `revoked` set (a verified `session_revoked` event named it) | Info (`session was revoked by a signed event; not provisioning it`); not provisioned, and an outstanding `session_started` row is dropped | yes |
+| Valid entry the event revoked while `CreateSession` was binding its listener | Info (`session was revoked by a signed event while its listener came up; closing it`); the listener is closed at once with the event's reason and no `session_started` row is posted | yes |
 | Live session with an outstanding `session_started` row | The row is re-posted from the address the listener already holds; no second setup | **no** |
 | Live session not yet in `known`                    | Recorded as known; the listener is already bound, so no second setup     | yes     |
 | `expires_at` is the zero time                      | Warning (`session carries no expires_at; refusing to provision`)          | yes     |
@@ -298,7 +312,7 @@ live, or permanently settled — so a settled entry is a no-op on every later pu
 | `tcp` or `ssh` entry without the target of its kind, or with more than one target member set | Warning (`session target does not match kind`)  | yes     |
 | Valid `tcp` or `ssh` entry, `CreateSession` succeeds | Listener bound; `ReportSessionStarted` posts the `session_started` row with `listener_endpoint` | yes |
 | The `session_started` row does not reach the control plane | Warning; the listener stays bound and the entry is left unsettled so the next pull re-posts the row from the same `listener_endpoint` | **no** |
-| The `session_started` row is answered `409 session_already_revoked` / `session_expired` | Info (`session no longer live server-side; awaiting the drain`); the listener stays bound, the entry is settled, the teardown waits for the block drain, and each later pull still carrying the entry warns | yes |
+| The `session_started` row is answered `409 session_already_revoked` / `session_expired` | Info (`session no longer live server-side; awaiting the drain`); the listener stays bound, the entry is settled, the teardown waits for the block drain or a verified `session_revoked` event, and each later pull still carrying the entry warns | yes |
 | `CreateSession` returns `ErrTunnelingDisabled`     | Warning (`tunneling is disabled; no listener provisioned`) — configuration, not weather | yes |
 | `CreateSession` returns `ErrSSHSessionsDisabled`   | Warning (`ssh sessions are disabled on this node; no listener provisioned`) | yes |
 | `CreateSession` fails otherwise                    | Warning (`session listener setup failed`); left unsettled so the next pull retries | **no** |
@@ -309,11 +323,17 @@ retried, so the warning is emitted once per entry rather than once per pull. An 
 with an empty user, or one reaching a manager nobody wired, is a setup failure and
 is retried.
 
-An entry draining from the block also prunes its ID from `known` and from the
-outstanding-row set, which bounds both by the size of the block. The pass carries
-no dispatch budget: it is bounded by the live sessions `MaxSessions` caps plus the
-length of the block, and its only network call is a single bounded activity post
-per session whose started row is still outstanding.
+The `revoked` set holds the IDs a verified `session_revoked` event named. The
+control plane never makes a revoked session live again, but a pull rendered
+before the revocation committed can still list its entry; that entry is settled
+rather than provisioned, so the listener the event closed is not bound again.
+
+An entry draining from the block also prunes its ID from `known`, from the
+outstanding-row set and from the `revoked` set, which bounds all three by the
+size of the block. The pass carries no dispatch budget: it is bounded by the
+live sessions `MaxSessions` caps plus the length of the block, and its only
+network call is a single bounded activity post per session whose started row is
+still outstanding.
 
 ### Registration
 
@@ -322,6 +342,7 @@ mgr := tunnel.NewSessionManager(tunnel.Config{}, meshIP, logger)
 
 sessionDispatcher := tunnel.NewDispatcher(mgr, reporter, logger)
 reconciler.RegisterDispatchHandler(sessionDispatcher.Handle)
+sseMgr.RegisterHandler(api.EventSessionRevoked, sessionDispatcher.SessionRevokedHandler(reconciler))
 ```
 
 ## SessionActivityReporter
@@ -341,7 +362,7 @@ type SSHCommandReporter interface {
 
 The production implementation, `controlPlaneSessionReporter` in `cmd/plexd/cmd/up.go`, posts an `api.SessionActivityRequest` to `api.ControlPlane.ReportSessionActivity` (`POST /v1/nodes/{node_id}/sessions/{session_id}`). For a `tcp` entry `ReportSessionStarted` emits a `tcp` `session_started` row with the target and `listenerEndpoint`, the address the listener actually bound, so the control plane has somewhere to send the operator; for an `ssh` entry it emits the `ssh` lifecycle row with `listener_endpoint`. `ReportSessionEnded(ctx, sessionID, info *ClosedSessionInfo, terminatedBy)` emits a `session_ended` row: the `tcp` row with the byte counters, or, when `info.Kind` is `ssh`, the `ssh` row with `terminated_by` only. `ReportSessionEnded` is not on the interface: it is fired from the `SessionManager`'s on-closed callback that `plexd up` wires with `SetOnClosed`. The same type implements `SSHCommandReporter`, whose two rows the ssh listener posts around every `exec` (see [Commands and activity rows](#commands-and-activity-rows)); both return the post's error.
 
-`ReportSessionStarted` returns the post's error because the row is not merely an audit record: `listener_endpoint` is the operator's only route to the listener, so the dispatcher has to know whether the row landed. A terminal-state answer (`api.IsSessionRevokedOrExpired`: a `409` `session_already_revoked` or `session_expired`) settles the entry and is logged at Info; the listener stays bound until the block drain closes it. Every other error (a transport failure, a `400`, a `404` `session_not_found`, a `501` `access_session_not_provisioned`, a `5xx`) keeps the listener bound, leaves the entry unsettled, and re-posts the row on the next pull from the same `listener_endpoint`, logged at Warn. `ReportSessionEnded` returns nothing and is fire-once from the on-closed callback: a `409` is logged at Warn carrying the byte counters and `terminated_by` (the drain-driven ended row is answered `409` by design, and nothing re-posts it, so the line is where that payload survives), any other failure at Error, and nothing is retried.
+`ReportSessionStarted` returns the post's error because the row is not merely an audit record: `listener_endpoint` is the operator's only route to the listener, so the dispatcher has to know whether the row landed. A terminal-state answer (`api.IsSessionRevokedOrExpired`: a `409` `session_already_revoked` or `session_expired`) settles the entry and is logged at Info; the listener stays bound until the block drain, or a verified `session_revoked` event naming the session, closes it. Every other error (a transport failure, a `400`, a `404` `session_not_found`, a `501` `access_session_not_provisioned`, a `5xx`) keeps the listener bound, leaves the entry unsettled, and re-posts the row on the next pull from the same `listener_endpoint`, logged at Warn. `ReportSessionEnded` returns nothing and is fire-once from the on-closed callback: a `409` is logged at Warn carrying `terminated_by` and, for a `tcp` row, the byte counters (the control plane records the ending row of a revoked or expired `ssh` or `tcp` session's current listener once, unless its newest lifecycle row is already a `session_ended`, so a `409` to it means the listener's end is already recorded, or a control plane that predates that rule; nothing re-posts the row, so the line is where that payload survives), any other failure at Error, and nothing is retried.
 
 ## API Types
 
@@ -464,21 +485,60 @@ type SSHActivity struct {
 
 | Close reason   | Wire value (`terminated_by`) | Produced when                                                     |
 |----------------|------------------------------|--------------------------------------------------------------------|
-| `expired`      | `ttl_expired`                | The capped expiry timer fired, or the entry drained after it lapsed |
-| `idle`         | `idle_timeout`               | The idle window elapsed with no byte flow                          |
+| `expired`      | `ttl_expired`                | The capped expiry timer fired, the entry drained after it lapsed, or a `session_revoked` event carried `revoke_reason` `ttl_expired` |
+| `idle`         | `idle_timeout`               | The idle window elapsed with no byte flow, or a `session_revoked` event carried `revoke_reason` `idle_timeout` |
+| `revoked`      | `operator_revoke`            | A `session_revoked` event carried an operator-driven `revoke_reason`, or an empty or unrecognised one |
 | `drained`      | `plexd_close`                | The entry left the block while the session still had time on it     |
 | `shutdown`     | `plexd_close`                | The node is going down                                              |
 
 The reasons are constants in `internal/tunnel`, not bare literals: they are the
 only input to this mapping, so producer and consumer share one vocabulary.
-`operator_revoke` is never produced by the node.
+`operator_revoke` is produced only for `revoked`, which only the
+`session_revoked` handler passes; a drain never produces it.
+
+`closeReasonForRevocation` maps the `revoke_reason` of a verified
+`session_revoked` event (see [SessionRevocation](#sessionrevocation)) to the
+close reason the handler passes to `CloseSession`:
+
+| `revoke_reason`           | Constant                                 | Close reason | Wire value (`terminated_by`) |
+|---------------------------|------------------------------------------|--------------|------------------------------|
+| `operator_request`        | `api.RevokeReasonOperatorRequest`        | `revoked`    | `operator_revoke`            |
+| `policy_violation`        | `api.RevokeReasonPolicyViolation`        | `revoked`    | `operator_revoke`            |
+| `identity_compromise`     | `api.RevokeReasonIdentityCompromise`     | `revoked`    | `operator_revoke`            |
+| `resource_decommissioned` | `api.RevokeReasonResourceDecommissioned` | `revoked`    | `operator_revoke`            |
+| `ttl_expired`             | `api.RevokeReasonTTLExpired`             | `expired`    | `ttl_expired`                |
+| `idle_timeout`            | `api.RevokeReasonIdleTimeout`            | `idle`       | `idle_timeout`               |
+| Empty or unrecognised     | n/a                                      | `revoked`    | `operator_revoke`, with a Warn (`session_revoked carries an unrecognised revoke_reason; reporting operator_revoke`) |
+
+The first four are operator-driven, supplied on the control plane's explicit
+revoke call. The last two are set by the control plane's sweeper when the
+session reaches its hard expiry or its idle timeout, so they keep the
+`terminated_by` the node's own timers would report. An unrecognised value still
+maps to `revoked`, because the close is still caused by the event.
 
 The `session_ended` row is emitted by the `SessionManager`'s on-closed
-callback for **every** close reason: TTL expiry, idle timeout, operator revocation,
-and node shutdown alike. The row is the only carrier of a session's byte counters and
+callback for **every** close reason: TTL expiry, idle timeout, revocation
+(closed by a verified `session_revoked` event or by the drain), and node
+shutdown alike. The row is the only carrier of a session's byte counters and
 `terminated_by`, so skipping it on shutdown would leave the control plane's
 audit record for every live session truncated — the node going offline says the
 session ended, but not how much traffic it carried.
+
+### SessionRevocation
+
+The payload of the `session_revoked` event: the revoked session, the revoked
+token's `jti` (equal to the session ID), and when and why the control plane
+revoked it. The contract names six `RevokeReason` values, the `RevokeReason*`
+constants (see [terminated_by mapping](#terminated-by-mapping)).
+
+```go
+type SessionRevocation struct {
+    SessionID    string    `json:"session_id"`
+    JTI          string    `json:"jti"`
+    RevokedAt    time.Time `json:"revoked_at"`
+    RevokeReason string    `json:"revoke_reason"`
+}
+```
 
 ## Integration Points
 
@@ -491,16 +551,40 @@ nothing else in the snapshot moved.
 
 ### SSE Event Stream (`internal/api`)
 
-The tunnel package registers **no** SSE handlers. Two event types relate to
-sessions, and both are plain reconcile triggers whose payloads are never parsed:
+The tunnel package provides one SSE handler, the one
+`Dispatcher.SessionRevokedHandler` returns, which `plexd up` registers for
+`session_revoked` in place of a plain reconcile trigger. Two event types relate
+to sessions:
 
 | Event Type        | Tier              | Effect                                                                |
 |-------------------|-------------------|------------------------------------------------------------------------|
-| `session_setup`   | contract          | Triggers a reconcile; the resulting pull carries the session in its `sessions` block |
-| `session_revoked` | documented-coming | Triggers a reconcile; the drain in the `sessions` block does the teardown |
+| `session_setup`   | contract          | A plain reconcile trigger whose payload plexd does not parse; the resulting pull carries the session in its `sessions` block |
+| `session_revoked` | contract          | `SessionRevokedHandler` closes the session the payload names, reporting the `terminated_by` its `revoke_reason` maps to, then triggers a reconcile |
 
-Neither event is required for correctness — a node that misses one converges on
-its own reconcile cadence. They exist only to shorten the window.
+The SSE stream verifies the envelope's signature and freshness before any
+handler runs. The `session_revoked` handler then:
+
+1. Decodes the payload as `api.SessionRevocation`. A payload that does not decode, an empty `session_id`, or a `jti` that differs from `session_id` closes nothing: the handler triggers a reconcile and returns the error, which the event dispatcher logs at Error (`event handler failed`).
+2. Maps `revoke_reason` to a close reason with `closeReasonForRevocation` (see [terminated_by mapping](#terminated-by-mapping)). An empty or unrecognised value is logged at Warn (`session_revoked carries an unrecognised revoke_reason; reporting operator_revoke`) and still closes the session as `revoked`.
+3. Records the session ID in the dispatcher's `revoked` set, with the close reason, so a pull rendered before the revocation committed cannot provision the session again (see [Provision Pass](#provision-pass)). When such a pull is already binding the listener as the event lands, the handler's close finds no live session; `Handle` checks the set again once `CreateSession` returns and closes the listener it just bound with the event's reason, without posting its `session_started` row (`session was revoked by a signed event while its listener came up; closing it`).
+4. On its own goroutine, calls `SessionManager.CloseSession` with that reason. The close blocks on the session's drain and on the bounded `session_ended` post, and the SSE stream dispatches its handlers one after another, so it does not run on the SSE goroutine. The `session_ended` row goes out through the on-closed callback like that of any other close. The handler logs Info `session_revoked closed the session` (`session_id`, `revoke_reason`, `terminated_by`), or Info `session_revoked names no live session; nothing to close` (`session_id`, `revoke_reason`) when the drain or a local timer closed the session first, or it was never provisioned on this node.
+5. Triggers the reconcile only after the close returned, so the pull it starts cannot drain the session first and report it as `plexd_close`.
+
+The event and the drain race. A pull that drains the entry before the event
+arrives closes the session as `drained` and reports `plexd_close`, and a session
+whose capped local expiry fires first reports `ttl_expired`; either way the late
+event finds no live session and only triggers a pull.
+
+The envelope verifier keeps no nonce, so a captured `session_revoked` can be
+replayed. A replay can only name a session the control plane already revoked,
+which never becomes live again, so it finds nothing to close and only triggers a
+pull.
+
+Neither event is required for correctness: a node that misses one converges on
+its own reconcile cadence, and the drain in the `sessions` block tears down a
+revoked session whose event never arrives. `session_setup` exists only to
+shorten the window; `session_revoked` also shortens it, and lets the node report
+why the session ended.
 
 ### Control Plane API (`internal/api`)
 
@@ -548,7 +632,7 @@ mgr.Shutdown()
 2. Control plane verifies RBAC permissions and issues the session, adding a `tcp` entry to the node's `sessions` block. It may also emit a `session_setup` event to pull the node's next reconcile forward.
 3. On its next pull, plexd sees the entry, opens a TCP listener on the mesh interface, and reports a `session_started` row carrying the bound `listener_endpoint`.
 4. Connections arriving on that listener are forwarded through the encrypted mesh to the target host and port.
-5. The session ends when the control plane drops the entry from the block (`plexd_close`), when its capped expiry fires (`ttl_expired`), when its idle window elapses (`idle_timeout`), or on node shutdown (`plexd_close`). The `session_ended` row carries the byte counters and the reason.
+5. The session ends when the control plane drops the entry from the block (`plexd_close`), when a verified `session_revoked` event names it (`operator_revoke` for an operator-driven `revoke_reason`, `ttl_expired` or `idle_timeout` for the sweeper's), when its capped expiry fires (`ttl_expired`), when its idle window elapses (`idle_timeout`), or on node shutdown (`plexd_close`). The `session_ended` row carries the byte counters and the reason.
 
 ### Kubernetes Sessions
 
@@ -712,16 +796,19 @@ it no longer logs `signing key not persisted; retrying on the next pull`.
 
 ### Lifetime
 
-An ssh session ends like a tcp one: when its entry drains (`plexd_close`), when its
-capped expiry fires (`ttl_expired`), when its idle window elapses
-(`idle_timeout`), or on shutdown (`plexd_close`). Any byte on any of its
+An ssh session ends like a tcp one: when its entry drains (`plexd_close`), when a
+verified `session_revoked` event names it (`operator_revoke` for an
+operator-driven `revoke_reason`, `ttl_expired` or `idle_timeout` for the
+sweeper's), when its capped expiry fires (`ttl_expired`), when its idle window
+elapses (`idle_timeout`), or on shutdown (`plexd_close`). Any byte on any of its
 connections is activity. The close ends every connection within the drain bound
 and stops each running process through its helper; under socket activation
 systemd also kills the instance's cgroup.
 
 The helper cannot see the sessions block, so it cannot honour a revocation: a
 compromised plexd can reuse a token a client presented until that token's `exp`.
-The listener itself closes on the drain.
+The listener itself closes on the drain, or earlier on a verified
+`session_revoked` event.
 
 ### Deployment notes
 
@@ -765,6 +852,11 @@ All log entries use `component=tunnel`. Session-scoped entries add `session_id`.
 | `Warn`  | Session target does not match kind | `session_id`, `kind`                    |
 | `Warn`  | Tunneling is disabled; no listener provisioned | `session_id`                |
 | `Warn`  | Session listener setup failed  | `session_id`, `error`                       |
+| `Info`  | Session was revoked by a signed event; not provisioning it | `session_id`      |
+| `Info`  | Session was revoked by a signed event while its listener came up; closing it | `session_id` |
+| `Info`  | session_revoked closed the session | `session_id`, `revoke_reason`, `terminated_by` |
+| `Info`  | session_revoked names no live session; nothing to close | `session_id`, `revoke_reason` |
+| `Warn`  | session_revoked carries an unrecognised revoke_reason; reporting operator_revoke | `session_id`, `revoke_reason` |
 | `Debug` | Connection rejected (duplicate)| —                                           |
 | `Debug` | Session not found for close    | `session_id`                                |
 | `Error` | Session entry carries no session_id; dropping | `kind`                       |

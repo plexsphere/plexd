@@ -112,7 +112,7 @@ Long-lived SSE connection. Supports `Last-Event-ID` header for replay after reco
 | `policy_updated` | Full policy ruleset (L3/L4 rules scoped to mesh IPs) |
 | `action_request` | Opaque; triggers a reconcile — the dispatch itself rides the `executions` block of the state pull |
 | `session_setup` | Opaque; triggers a reconcile — the session itself rides the `sessions` block of the state pull |
-| `session_revoked` | Opaque; triggers a reconcile — the session leaving the `sessions` block is what tears it down |
+| `session_revoked` | The revoked session's `session_id`, `jti` (equal to `session_id`), `revoked_at`, and `revoke_reason`. plexd closes the named session when it is live, reports the `terminated_by` its `revoke_reason` maps to, then triggers a reconcile. A payload that does not decode, or whose `session_id` is empty or differs from its `jti`, closes nothing and only triggers the reconcile. The session leaving the `sessions` block stays the teardown for a revocation whose event never arrives |
 | `rotate_keys` | Key rotation trigger |
 | `signing_key_rotated` | New signing key (`key_id`, `public_key`), `previous_key_id`, `transition_expires`. The state pull's `signing_key` block also carries the key (see [`GET /v1/nodes/{node_id}/state`](#get-v1-nodes-node-id-state)) |
 | `node_state_updated` | Updated metadata and data entries |
@@ -788,7 +788,9 @@ for how plexd consumes it.
 `sessions` carries the node's live mediated-access sessions. It is desired state
 rather than a queue: an entry stands for as long as its session is valid, and its
 disappearance — on revocation or hard expiry — is the teardown signal, so there is
-no revocation event to answer and no terminal status to report. It is always an
+no revocation callback to answer and no terminal status to report. A revocation
+the control plane announces in a signed `session_revoked` event is normally closed by that
+event first (see [SSE Event Stream](#sse-event-stream)). It is always an
 array (`[]` when empty, never `null`). `kind` is one of `ssh`, `k8s`, or `tcp` and
 selects the single member of `target`; `jti` equals `session_id` and is carried
 opaquely; `expires_at` is an absolute UTC timestamp; `idle_timeout_seconds` absent
@@ -1098,10 +1100,17 @@ set on started rows only:
 
 **Request body** (tcp `session_ended`). `bytes_in` (operator→target) and `bytes_out`
 (target→operator) are explicit, present even when `0`; `terminated_by` is one of
-`ttl_expired`, `idle_timeout`, `operator_revoke`, or `plexd_close`. plexd itself
-never sends `operator_revoke`: a revoked session reaches the node as the absence
+`ttl_expired`, `idle_timeout`, `operator_revoke`, or `plexd_close`. plexd sends
+`operator_revoke` only for a session it closed because a verified
+`session_revoked` event named it with an operator-driven `revoke_reason`
+(`operator_request`, `policy_violation`, `identity_compromise`, or
+`resource_decommissioned`) or with an empty or unrecognised one; the event's
+`ttl_expired` and `idle_timeout` reasons are reported as `ttl_expired` and
+`idle_timeout`. A revocation without the event reaches the node as the absence
 of its entry, which is indistinguishable from a control plane that failed to
-serve the block, so a drained entry is reported as `plexd_close`:
+serve the block, so a drained entry is reported as `plexd_close`, also when a
+pull drains it before the event arrives (the late event then finds no live
+session to close):
 
 ```json
 {
@@ -1152,19 +1161,28 @@ the second once the command exited. Times are UTC:
 | `400 Bad Request` (`malformed_session_activity`) | Body is unreadable, fails strict decoding, violates the one-of contract, mixes the ssh lifecycle and command shapes, or populates a member other than the session's kind |
 | `403 Forbidden` (`nsk_node_mismatch`) | Record targets a node other than the caller's identity |
 | `404 Not Found` (`session_not_found`) | No session resolves for this node and session id |
-| `409 Conflict` (`session_already_revoked`) | The session has been revoked |
-| `409 Conflict` (`session_expired`) | The session's `expires_at` has lapsed |
+| `409 Conflict` (`session_already_revoked`) | The session has been revoked, and the row is not the one `session_ended` row such a session still records (see below) |
+| `409 Conflict` (`session_expired`) | The session's `expires_at` has lapsed, and the row is not the one `session_ended` row such a session still records (see below) |
 
 The two `409` answers are terminal states of the session: neither goes back to
-live. plexd classifies them with `api.IsSessionRevokedOrExpired` and reads them
-as the drain signal rather than as a retryable error — a `session_started` row
-answered this way is settled instead of re-posted, and a `session_ended` row
-answered this way is logged at Warn carrying the counters it failed to deliver.
-It is the expected answer for every drain-driven close, since the control plane
-already holds the session as revoked or expired by the time the node has observed
-the drain. The teardown itself stays with the `sessions` block drain: the answer
-never closes a session, and while the block keeps carrying an entry answered this
-way, every pull warns that its listener is still forwarding. On an ssh command
+live. A revoked or expired ssh or tcp session still records one row: the first
+`session_ended` row of its current listener, reported in the member its kind
+calls for, is accepted with `204`. Every other row on such a session, a second
+`session_ended` row included, is a `409`. plexd classifies them with
+`api.IsSessionRevokedOrExpired` and reads them as the drain signal rather than as
+a retryable error — a `session_started` row answered this way is settled instead
+of re-posted, and a `session_ended` row answered this way is logged at Warn
+carrying its `terminated_by` and, for a `tcp` row, the byte counters it failed to
+deliver. A close caused by a drain or by a
+`session_revoked` event posts its `session_ended` row into a session the control
+plane already holds as revoked or expired, so that row is normally accepted. A
+`409` to it means the end of that listener is already recorded, or that the
+control plane predates
+[plexsphere/plexsphere#931](https://github.com/plexsphere/plexsphere/issues/931)
+and refuses every row on a revoked or expired session. The answer never closes a
+session: the teardown stays with the `sessions` block drain (or a verified
+`session_revoked` event), and while the block keeps carrying an entry answered
+this way, every pull warns that its listener is still forwarding. On an ssh command
 row that precedes an `exec` the answer means the command does not run, and it
 closes the client's connection.
 
