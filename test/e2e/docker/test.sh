@@ -2358,12 +2358,169 @@ configure_sessions "8i-drain" "[]"
 echo "=== Phase 8i PASSED: idle window closes the session ==="
 
 # ===================================================================
+# Phase 8j: a signed session_revoked closes the session it names
+# ===================================================================
+# A verified session_revoked event names the session the control plane revoked,
+# and the node closes that session at once, reporting the reason the payload
+# carries: operator_request becomes terminated_by operator_revoke. The event is
+# injected while the entry still stands in the sessions block, so no pull can
+# close the session, and it has no idle window and a 5-minute expiry: the event
+# is the only thing that can produce the ending row inside the window. The mock
+# still holds the session as live, so it records that row. Draining the entry
+# afterwards finds no live session, so no second ending row is posted.
+echo "=== Testing that a signed session_revoked closes the session it names ==="
+
+REVOKE_SESSION="sess-e2e-revoke-001"
+EXPIRES_AT=$(date -u -d "+5 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+5M +%Y-%m-%dT%H:%M:%SZ)
+
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+[ -n "${RESPONSE}" ] || fail "assert endpoint unreachable while baselining Phase 8j"
+REVK_BEFORE=$(get_counter "${RESPONSE}" "session_activity_count")
+REVK_REJ_BEFORE=$(get_counter "${RESPONSE}" "session_activity_rejected_count")
+echo "  session_activity_count before: ${REVK_BEFORE}"
+echo "  session_activity_rejected_count before: ${REVK_REJ_BEFORE}"
+
+configure_sessions "8j-issue" \
+    "$(session_entry "${REVOKE_SESSION}" "127.0.0.1" 8080 "${EXPIRES_AT}")"
+echo "  tcp session configured in the sessions block"
+
+# Poll session_activity_count to +1 (the session_started row).
+REVK_TIMEOUT=30
+REVK_ELAPSED=0
+REVK_START_PASSED=0
+while [ "${REVK_ELAPSED}" -lt "${REVK_TIMEOUT}" ]; do
+    sleep 2
+    REVK_ELAPSED=$((REVK_ELAPSED + 2))
+    REVK_STARTED=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_count")
+    if [ "${REVK_STARTED}" -ge $((REVK_BEFORE + 1)) ]; then
+        REVK_START_PASSED=1
+        break
+    fi
+done
+if [ "${REVK_START_PASSED}" -eq 0 ]; then
+    fail "session_activity_count did not reach $((REVK_BEFORE + 1)) after the sessions block was configured (before=${REVK_BEFORE})"
+fi
+REVK_START_PHASE=$(curl -sf "http://localhost:18080/test/last-request/session_activity" 2>/dev/null | jq -r '.tcp.phase // empty')
+if [ "${REVK_START_PHASE}" = "session_started" ]; then
+    echo "  PASS: session_started row posted (session_activity_count=${REVK_STARTED})"
+else
+    fail "session_activity tcp.phase = '${REVK_START_PHASE}' after provisioning, want 'session_started'"
+fi
+
+# Inject the signed event while the entry still stands in the block.
+REVOKED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+REVK_EVENT=$(cat <<REVKEOF
+{
+    "id": "evt-e2e-sess-revoke-001",
+    "type": "session_revoked",
+    "scope": "node",
+    "payload": {
+        "session_id": "${REVOKE_SESSION}",
+        "jti": "${REVOKE_SESSION}",
+        "revoked_at": "${REVOKED_AT}",
+        "revoke_reason": "operator_request"
+    }
+}
+REVKEOF
+)
+REVK_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d "${REVK_EVENT}" \
+    "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+if [ "${REVK_STATUS}" != "204" ]; then
+    fail "session_revoked event injection returned status ${REVK_STATUS}, want 204"
+fi
+echo "  session_revoked injected for ${REVOKE_SESSION} with revoke_reason operator_request"
+
+# Poll session_activity_count to +1 over the started row (the session_ended
+# row) within a window no pull could close the session in.
+REVK_END_TIMEOUT=15
+REVK_ELAPSED=0
+REVK_END_PASSED=0
+while [ "${REVK_ELAPSED}" -lt "${REVK_END_TIMEOUT}" ]; do
+    sleep 1
+    REVK_ELAPSED=$((REVK_ELAPSED + 1))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        REVK_ENDED=$(get_counter "${RESPONSE}" "session_activity_count")
+        if [ "${REVK_ENDED}" -ge $((REVK_STARTED + 1)) ]; then
+            REVK_REJ_AFTER=$(get_counter "${RESPONSE}" "session_activity_rejected_count")
+            echo "  PASS: session_activity_count advanced from ${REVK_STARTED} to ${REVK_ENDED} within ${REVK_ELAPSED}s of the event"
+            REVK_END_PASSED=1
+            break
+        fi
+    fi
+done
+if [ "${REVK_END_PASSED}" -eq 0 ]; then
+    fail "session_activity_count did not reach $((REVK_STARTED + 1)) within ${REVK_END_TIMEOUT}s after session_revoked (the entry still stands, so only the event can close the session)"
+fi
+if [ "${REVK_REJ_AFTER}" -eq "${REVK_REJ_BEFORE}" ]; then
+    echo "  PASS: session_activity_rejected_count unchanged at ${REVK_REJ_AFTER}"
+else
+    fail "session_activity_rejected_count moved from ${REVK_REJ_BEFORE} to ${REVK_REJ_AFTER} after session_revoked"
+fi
+
+# The ending row reports the revocation, with numeric byte counters.
+REVK_BODY=$(curl -sf "http://localhost:18080/test/last-request/session_activity" 2>/dev/null || true)
+[ -n "${REVK_BODY}" ] || fail "no session_activity body captured after session_revoked"
+REVK_PHASE=$(echo "${REVK_BODY}" | jq -r '.tcp.phase // empty')
+if [ "${REVK_PHASE}" = "session_ended" ]; then
+    echo "  PASS: session_activity tcp.phase = 'session_ended'"
+else
+    fail "session_activity tcp.phase = '${REVK_PHASE}' after session_revoked, want 'session_ended'"
+fi
+REVK_TERM=$(echo "${REVK_BODY}" | jq -r '.tcp.terminated_by // empty')
+if [ "${REVK_TERM}" = "operator_revoke" ]; then
+    echo "  PASS: session_activity tcp.terminated_by = 'operator_revoke'"
+else
+    fail "session_activity tcp.terminated_by = '${REVK_TERM}' after session_revoked, want 'operator_revoke'"
+fi
+if echo "${REVK_BODY}" | jq -e '(.tcp.bytes_in | numbers) and (.tcp.bytes_out | numbers)' >/dev/null 2>&1; then
+    echo "  PASS: session_activity tcp.bytes_in and tcp.bytes_out are present as numbers"
+else
+    fail "session_activity tcp.bytes_in or tcp.bytes_out is not present as a number: ${REVK_BODY}"
+fi
+
+# Drain the entry. The session is already closed, so the pull that sees the
+# drain posts nothing further.
+configure_sessions "8j-drain" "[]"
+# configure_sessions reads the live snapshot, which counts on state_count, so the
+# baseline is taken after it.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+REVK_STATE_BEFORE=$(get_counter "${RESPONSE}" "state_count")
+REVK_ELAPSED=0
+REVK_PULLED=0
+while [ "${REVK_ELAPSED}" -lt 30 ]; do
+    sleep 2
+    REVK_ELAPSED=$((REVK_ELAPSED + 2))
+    if [ "$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")" -gt "${REVK_STATE_BEFORE}" ]; then
+        REVK_PULLED=1
+        break
+    fi
+done
+[ "${REVK_PULLED}" -eq 1 ] || fail "no state pull within 30s of draining ${REVOKE_SESSION}"
+# The pull's dispatch runs after the state GET it counted; give it time to post
+# a row it should not post.
+sleep 5
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+REVK_FINAL=$(get_counter "${RESPONSE}" "session_activity_count")
+REVK_REJ_FINAL=$(get_counter "${RESPONSE}" "session_activity_rejected_count")
+if [ "${REVK_FINAL}" -eq "${REVK_ENDED}" ] && [ "${REVK_REJ_FINAL}" -eq "${REVK_REJ_AFTER}" ]; then
+    echo "  PASS: the drain posted no second ending row (accepted ${REVK_FINAL}, rejected ${REVK_REJ_FINAL})"
+else
+    fail "activity counters moved after the drain (accepted ${REVK_ENDED} -> ${REVK_FINAL}, rejected ${REVK_REJ_AFTER} -> ${REVK_REJ_FINAL}): the revoked session posted a second ending row"
+fi
+
+echo "=== Phase 8j PASSED: a signed session_revoked closes the session it names ==="
+
+# ===================================================================
 # Phase 8h: session events are pull triggers, not delivery channels
 # ===================================================================
 # The session lifecycle is delivered in the sessions block of the pull.
-# session_setup and session_revoked only pull the observing reconcile forward:
-# nothing in their payloads is parsed, so an opaque payload must still move
-# state_count while leaving the session activity untouched.
+# session_setup only pulls the observing reconcile forward: its payload is never
+# parsed. session_revoked's payload is parsed (phase 8j), but one that names no
+# session closes nothing and still pulls. Either way an opaque payload must
+# still move state_count while leaving the session activity untouched.
 echo "=== Testing session events as pull triggers ==="
 
 RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
@@ -2434,8 +2591,9 @@ SESS_BEFORE_REVOKE=$(get_counter "${RESPONSE}" "session_activity_count")
 echo "  state_count before session_revoked: ${STATE_BEFORE_REVOKE}"
 echo "  session_activity_count before session_revoked: ${SESS_BEFORE_REVOKE}"
 
-# session_revoked is the same shape of trigger: the drain in the sessions block
-# is the teardown signal, the event only asks for a reconcile.
+# This session_revoked carries a JSON string where the payload object belongs,
+# so plexd refuses it as malformed ("event handler failed") and closes nothing,
+# but it still triggers the reconcile.
 REVOKE_PAYLOAD=$(cat <<'REVOKEEOF'
 {
     "id": "evt-e2e-sess-push-002",
@@ -2480,7 +2638,7 @@ SESS_AFTER_REVOKE=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
 if [ "${SESS_AFTER_REVOKE}" -eq "${SESS_BEFORE_REVOKE}" ]; then
     echo "  PASS: session_activity_count unchanged at ${SESS_AFTER_REVOKE} after session_revoked"
 else
-    fail "session_activity_count moved from ${SESS_BEFORE_REVOKE} to ${SESS_AFTER_REVOKE} after session_revoked; the payload was acted on"
+    fail "session_activity_count moved from ${SESS_BEFORE_REVOKE} to ${SESS_AFTER_REVOKE} after session_revoked; a malformed payload closed a session"
 fi
 
 echo "=== Phase 8h PASSED: session events are pull triggers ==="
