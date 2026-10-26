@@ -181,9 +181,11 @@ func (v *Ed25519Verifier) Verify(_ context.Context, env Envelope) error {
 	// so there is nothing unique to record here. Replay protection is delegated
 	// to (a) the TLS transport, which keeps captured envelopes off the wire, and
 	// (b) the idempotence of what a verified event triggers — every production
-	// event drives an authoritative reconcile pull, and a replayed rotate_keys
-	// only re-requests a rotation the control plane rejects (409) when none is
-	// pending. This is a deliberate trade-off of the no-nonce contract, not an
-	// oversight; see docs/reference/core/event-verification.md.
+	// event drives an authoritative reconcile pull, a replayed rotate_keys only
+	// re-requests a rotation the control plane rejects (409) when none is
+	// pending, and a replayed session_revoked can only close a session the
+	// control plane already revoked, which never becomes live again, so it finds
+	// nothing to close. This is a deliberate trade-off of the no-nonce contract,
+	// not an oversight; see docs/reference/core/event-verification.md.
 	return nil
 }
