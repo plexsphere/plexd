@@ -293,6 +293,7 @@ an earlier kept entry already has, and logs each dropped entry at Warn as
 
 These types are part of the API but are not members of the state snapshot.
 `SigningKeyRotation` is the payload of the `signing_key_rotated` SSE event.
+`SessionRevocation` is the payload of the `session_revoked` SSE event.
 `SecretRef` is the entry of the local node API's secret index, fed from the
 pull's `NodeStateSecret` entries (the name becomes `key`). `DataEntry` is the
 shape the local node API serves for cached data entries.
@@ -305,6 +306,32 @@ shape the local node API serves for cached data entries.
 | `PublicKey`         | `string`    | `"public_key"`          | Base64 Ed25519 public key of the new current key |
 | `PreviousKeyID`     | `string`    | `"previous_key_id"`     | Prior key id kept valid during the grace window  |
 | `TransitionExpires` | `time.Time` | `"transition_expires"`  | When the previous key id stops being accepted    |
+
+**SessionRevocation**
+
+| Field          | Type        | JSON Tag          | Description                                        |
+|----------------|-------------|-------------------|----------------------------------------------------|
+| `SessionID`    | `string`    | `"session_id"`    | Id of the session the control plane revoked        |
+| `JTI`          | `string`    | `"jti"`           | The revoked session token's jti, equal to `session_id`; plexd closes nothing when the two differ or `session_id` is empty |
+| `RevokedAt`    | `time.Time` | `"revoked_at"`    | When the control plane revoked the session         |
+| `RevokeReason` | `string`    | `"revoke_reason"` | One of the `RevokeReason*` values                  |
+
+**RevokeReason constants**
+
+Carried on `SessionRevocation.RevokeReason`. The first four are operator-driven,
+supplied on the explicit revoke call; the last two are set by the control
+plane's sweeper. The description names the `terminated_by` plexd reports on the
+`session_ended` row of the session the event closes. An empty or unrecognised
+value is reported as `operator_revoke` too, with a Warn.
+
+| Constant                             | Value                     | Description                                      |
+|--------------------------------------|---------------------------|--------------------------------------------------|
+| `RevokeReasonOperatorRequest`        | `operator_request`        | Operator-driven; reported as `operator_revoke`   |
+| `RevokeReasonPolicyViolation`        | `policy_violation`        | Operator-driven; reported as `operator_revoke`   |
+| `RevokeReasonIdentityCompromise`     | `identity_compromise`     | Operator-driven; reported as `operator_revoke`   |
+| `RevokeReasonResourceDecommissioned` | `resource_decommissioned` | Operator-driven; reported as `operator_revoke`   |
+| `RevokeReasonTTLExpired`             | `ttl_expired`             | Sweeper, at the session's hard expiry; reported as `ttl_expired` |
+| `RevokeReasonIdleTimeout`            | `idle_timeout`            | Sweeper, at the session's idle timeout; reported as `idle_timeout` |
 
 **DataEntry**
 
@@ -812,8 +839,11 @@ violates that contract by omitting or nulling the key decodes to a `nil`
 as an empty block — emptiness tears every live session down, so the two cases
 must stay distinguishable. An entry appears when the control plane issues the
 session and disappears on revocation or hard expiry — that disappearance *is* the
-teardown signal, so there is no separate teardown event, no revocation callback to
-answer, and no terminal status to report. A live entry is redelivered on every
+teardown signal, so there is no revocation callback to answer and no terminal
+status to report. A revocation the control plane announces in a verified
+`session_revoked` event is normally closed by that event first (see
+[Event Types](#event-types)); the disappearance stays the teardown for every
+other revocation. A live entry is redelivered on every
 pull, so a consumer must tolerate re-observing the same `SessionID`.
 
 | Field                | Type            | JSON Tag                            | Description                                                          |
@@ -947,7 +977,7 @@ Shared by the `session_ended` rows of both kinds.
 | `TerminatedByTTLExpired`     | `ttl_expired`    | Session reached its time-to-live              |
 | `TerminatedByIdleTimeout`    | `idle_timeout`   | Idle window elapsed with no byte flow          |
 | `TerminatedByPlexdClose`     | `plexd_close`    | plexd closed the session locally              |
-| `TerminatedByOperatorRevoke` | `operator_revoke`| Operator's access was revoked. Part of the wire enum; **never produced by plexd**, which cannot tell a revocation from a block the control plane failed to serve |
+| `TerminatedByOperatorRevoke` | `operator_revoke`| Operator's access was revoked. Reported only for a close caused by a verified `session_revoked` event; a drained entry without the event is reported as `plexd_close`, because plexd cannot tell a revocation from a block the control plane failed to serve |
 
 ## Integrity
 
@@ -1049,7 +1079,7 @@ for the canonical form and signature rules.
 
 The event set is organized in two tiers. Contract types are emitted today;
 documented-coming types are named for the platform's 14-type taxonomy.
-Reconcile-driving payloads are opaque — the state pull is authoritative.
+Reconcile-driving payloads are opaque — the state pull is authoritative. `session_revoked` is the exception: its payload names the session to close before the reconcile.
 
 | Constant                   | Value                   | Tier              |
 |----------------------------|-------------------------|-------------------|
@@ -1060,21 +1090,29 @@ Reconcile-driving payloads are opaque — the state pull is authoritative.
 | `EventSessionSetup`        | `session_setup`         | contract          |
 | `EventPeerEndpointChanged` | `peer_endpoint_changed` | contract          |
 | `EventNodeSecretsUpdated`  | `node_secrets_updated`  | contract          |
+| `EventSessionRevoked`      | `session_revoked`       | contract          |
 | `EventPeerRegistered`      | `peer_registered`       | documented-coming |
 | `EventPeerPSKAssigned`     | `peer_psk_assigned`     | documented-coming |
 | `EventPeerDeregistered`    | `peer_deregistered`     | documented-coming |
 | `EventPeerKeyRotated`      | `peer_key_rotated`      | documented-coming |
 | `EventRotateKeys`          | `rotate_keys`           | documented-coming |
 | `EventSigningKeyRotated`   | `signing_key_rotated`   | documented-coming |
-| `EventSessionRevoked`      | `session_revoked`       | documented-coming |
 
 `action_request` is a contract type with an opaque payload: action dispatches are
 delivered in the `executions` block of the state pull, so the event only triggers
 a reconcile and the resulting pull carries the dispatch. `session_setup` is the
 same shape for mediated access — the session is delivered in the `sessions` block
-of that pull. `session_revoked` is the same shape from the other end: a session
-leaving the `sessions` block is what tears it down, so the event only pulls the
-observing reconcile forward.
+of that pull.
+
+`session_revoked` is a contract type whose payload plexd decodes, as a
+`SessionRevocation` naming the session the control plane revoked.
+`tunnel.Dispatcher.SessionRevokedHandler` closes that session when it is live,
+reports the `terminated_by` its `revoke_reason` maps to (see **RevokeReason
+constants** under [Supporting types](#supporting-types)), and only then triggers
+a reconcile, so the pull cannot drain the session first. A payload that does not
+decode, or whose `session_id` is empty or differs from its `jti`, closes nothing:
+the handler triggers the reconcile and returns the error. A session leaving the
+`sessions` block stays the teardown for a revocation whose event never arrives.
 
 `node_secrets_updated` is a contract type whose payload carries the node's full
 secret inventory. plexd treats the payload as opaque and only triggers a

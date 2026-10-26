@@ -824,18 +824,33 @@ Liveness resolves `{sid}` against the configured `sessions` block and against a
 `session_id` registry that `POST /test/configure-state` (and `PUT /test/state`)
 fills from every configured entry carrying a non-empty `session_id` and never
 prunes, so an id drained out of the block stays distinguishable from one that
-was never configured. A configured entry whose `expires_at` is in the future is
+was never configured. The registry also keeps the `kind` each id was last
+configured with. A configured entry whose `expires_at` is in the future is
 live, and the row's populated member has to be the one its `kind` calls for (an
 `ssh` member for an `ssh` entry, `k8s` for `k8s`, `tcp` for `tcp`): a match
 increments `session_activity_count` and returns `204 No Content`, a mismatch is
 a `400 malformed_session_activity` with the detail
 `activity variant does not match the session's kind`, which counts on neither
 counter (the spec folds the kind mismatch into the structural code). A
-configured entry whose `expires_at` has lapsed is a `409 session_expired`, an id
-in the registry but no longer in the block is a `409 session_already_revoked`,
-and an id in neither is a `404 session_not_found`; each of those three
-increments `session_activity_rejected_count`. Configuring the id again makes it
-live again. The body is captured before validation, so
+configured entry whose `expires_at` has lapsed is expired, an id in the registry
+but no longer in the block is revoked, and an id in neither is a
+`404 session_not_found`, which increments `session_activity_rejected_count`.
+
+An expired or revoked session is dead, and like the control plane since
+[plexsphere/plexsphere#931](https://github.com/plexsphere/plexsphere/issues/931)
+the mock records one row on it: the `session_ended` row of an `ssh` or `tcp`
+session, in the member its `kind` calls for (`ssh.phase` or `tcp.phase` set to
+`session_ended`). That row is answered `204 No Content` and increments
+`session_activity_count`, unless the newest lifecycle row the mock accepted for
+the session (a `tcp` row, or an `ssh` row with a `phase`) is already a
+`session_ended`. So a listener's end is recorded once, and a listener bound
+again after it still gets its own. Every other row on a dead session is a
+`409 session_expired` (expired) or `409 session_already_revoked` (revoked) and
+increments `session_activity_rejected_count`: a second `session_ended`, a
+`session_started`, an `ssh` command row, any row on a `k8s` session, and a row
+whose member does not match the session's `kind`, which on a dead session is a
+`409` rather than a `400`. Configuring the id again makes it live again. The
+body is captured before validation, so
 `GET /test/last-request/session_activity` holds the last posted row whether or
 not it was accepted. The mock accepts configured sessions of any kind, so `k8s`
 rows are testable against it even though plexd produces none.
@@ -847,12 +862,12 @@ an unknown field. The value itself is not validated.
 
 | Status | Problem `code` | Meaning |
 |---|---|---|
-| `204 No Content` | — | Activity record accepted |
-| `400 Bad Request` | `malformed_session_activity` | Unreadable body, strict-decode failure, a one-of / per-kind violation, or a row whose member does not match the session's `kind` |
+| `204 No Content` | — | Activity record accepted: a row on a live session, or the one `session_ended` row a dead `ssh` or `tcp` session records |
+| `400 Bad Request` | `malformed_session_activity` | Unreadable body, strict-decode failure, a one-of / per-kind violation, or a row whose member does not match a live session's `kind` |
 | `403 Forbidden` | `nsk_node_mismatch` | `{id}` does not match the mock node identity |
 | `404 Not Found` | `session_not_found` | No session resolves for this node and session id |
-| `409 Conflict` | `session_already_revoked` | The id was configured earlier and has drained out of the block since |
-| `409 Conflict` | `session_expired` | The configured entry's `expires_at` has lapsed |
+| `409 Conflict` | `session_already_revoked` | The id was configured earlier and has drained out of the block since, and the row is not the one `session_ended` row such a session records |
+| `409 Conflict` | `session_expired` | The configured entry's `expires_at` has lapsed, and the row is not the one `session_ended` row such a session records |
 
 ### `PUT /v1/nodes/{id}/state/reports/{key}`
 
@@ -1032,9 +1047,39 @@ Broadcasts a signed `Envelope` to all connected SSE clients and records it in th
 Injecting `action_request` is possible too, but it delivers no dispatch: like
 `node_state_updated` its payload is opaque and it only nudges the agent into an
 immediate reconcile. The dispatch itself must be configured into the `executions`
-block via `POST /test/configure-state`. `session_setup` and `session_revoked`
-behave the same way — neither carries a session nor a teardown, so the session
-must be configured into (or dropped from) the `sessions` block the same way.
+block via `POST /test/configure-state`. `session_setup` behaves the same way:
+it carries no session, so the session must be configured into the `sessions`
+block the same way.
+
+`session_revoked` is not opaque: plexd decodes its payload, closes the session it
+names when that session is live, and only then pulls. The payload must be an
+object carrying `session_id`, a `jti` equal to it, `revoked_at` and
+`revoke_reason`:
+
+```json
+{
+  "id": "evt-e2e-sess-revoke-001",
+  "type": "session_revoked",
+  "scope": "node",
+  "payload": {
+    "session_id": "sess-e2e-revoke-001",
+    "jti": "sess-e2e-revoke-001",
+    "revoked_at": "2026-10-26T12:00:00Z",
+    "revoke_reason": "operator_request"
+  }
+}
+```
+
+`revoke_reason` decides the `terminated_by` of the ending row: `operator_request`,
+`policy_violation`, `identity_compromise` and `resource_decommissioned` report
+`operator_revoke`, `ttl_expired` reports `ttl_expired`, `idle_timeout` reports
+`idle_timeout`, and an empty or unrecognised value reports `operator_revoke`
+with a Warn. A payload that does not decode (the JSON string `"{}"`, for
+example), or whose `session_id` is empty or differs from its `jti`, closes
+nothing; the event dispatcher logs `event handler failed`, and plexd still
+pulls. The mock does not act on the payload and changes no state of its own: the
+session stays live in the mock until it is dropped from the `sessions` block,
+so the ending row the event produces is accepted as a row on a live session.
 
 **Fields the mock stamps:** `scope` (`domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1`, replacing whatever the request sent), `issued_at` (current time), `key_id` (the current signing key id, `did:web:plexsphere.com#key-e2e` until `POST /test/rotate-signing-key`), the stream sequence (the `id:` frame line), and `signature` (a valid Ed25519 signature over `api.SignedMessage`, the SHA-512 digest of the shared canonical form `api.CanonicalBytes`).
 

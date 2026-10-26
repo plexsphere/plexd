@@ -88,7 +88,7 @@ Drives a mediated ssh session through the sessions block, the socket-activated s
 3. Checks that `/etc/plexd/session-signing-key` has mode `644` and holds `signing_public_key` from `identity.json`, the key the helper pinned on its first run.
 4. Adds an entry for `e2e`, waits for its own `session_started` row, and expects `id -un` to print `e2e`, which proves the helper switched uid.
 5. Expects `exit 3` to exit `3`, and a token minted for another session id to end with `255` and `Permission denied`.
-6. Drains the block and waits for `session_activity_rejected_count` to rise by 2: both `session_ended` rows post for sessions the mock already holds as revoked, as the tcp drain does in the docker suite. The last body is an ssh `session_ended` row with `terminated_by` `plexd_close`.
+6. Drains the block, waits up to 60 s for `session_activity_count` to rise by 2, and requires `session_activity_rejected_count` unchanged: both `session_ended` rows post for sessions the mock already holds as revoked, and the mock, like the control plane, records the ending row of such a session once, so both are accepted, as the tcp drain is in the docker suite. The last body is an ssh `session_ended` row with `terminated_by` `plexd_close`.
 
 ### 13. Start after a reboot
 
