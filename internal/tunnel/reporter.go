@@ -32,25 +32,55 @@ const (
 	reasonIdle = "idle"
 	// reasonShutdown is the node going down.
 	reasonShutdown = "shutdown"
+	// reasonRevoked is the control plane revoking the session and saying so in
+	// a verified session_revoked event.
+	reasonRevoked = "revoked"
 )
 
 // TerminatedByFromReason maps an internal session close reason to the wire
 // terminated_by enum reported on a session_ended row: reasonExpired becomes
-// ttl_expired, reasonIdle becomes idle_timeout, and every other reason becomes
-// plexd_close.
+// ttl_expired, reasonIdle becomes idle_timeout, reasonRevoked becomes
+// operator_revoke, and every other reason becomes plexd_close.
 //
-// api.TerminatedByOperatorRevoke is never produced here. It is a factual claim
-// about a human action, and the node cannot make it: a revocation reaches the
-// node as the absence of the entry, which is indistinguishable from a control
-// plane that failed to serve the block. Asserting it would write a confidently
-// wrong answer into the audit trail on every degraded pull.
+// api.TerminatedByOperatorRevoke is produced only for reasonRevoked, which only
+// the session_revoked handler passes: the agent contract defines
+// operator_revoke as a close caused by that event, and the event is signed and
+// names the session. A drain never produces it. A revocation the node learns
+// only from the pull reaches it as the absence of the entry, which is
+// indistinguishable from a control plane that failed to serve the block, and
+// asserting a revocation on that evidence would write a confidently wrong
+// answer into the audit trail on every degraded pull.
 func TerminatedByFromReason(reason string) string {
 	switch reason {
 	case reasonExpired:
 		return api.TerminatedByTTLExpired
 	case reasonIdle:
 		return api.TerminatedByIdleTimeout
+	case reasonRevoked:
+		return api.TerminatedByOperatorRevoke
 	default:
 		return api.TerminatedByPlexdClose
+	}
+}
+
+// closeReasonForRevocation maps a session_revoked event's revoke_reason to the
+// close reason handed to CloseSession. The sweeper's two reasons keep their own
+// terminated_by values: a session the control plane ended at its hard expiry or
+// its idle timeout is reported as ttl_expired or idle_timeout, as the node's
+// own timers would report it. The four operator-driven reasons become
+// reasonRevoked. recognised is false for a value outside the six the contract
+// names, the empty string included; such a value still maps to reasonRevoked,
+// because the close is still caused by the event.
+func closeReasonForRevocation(revokeReason string) (reason string, recognised bool) {
+	switch revokeReason {
+	case api.RevokeReasonTTLExpired:
+		return reasonExpired, true
+	case api.RevokeReasonIdleTimeout:
+		return reasonIdle, true
+	case api.RevokeReasonOperatorRequest, api.RevokeReasonPolicyViolation,
+		api.RevokeReasonIdentityCompromise, api.RevokeReasonResourceDecommissioned:
+		return reasonRevoked, true
+	default:
+		return reasonRevoked, false
 	}
 }

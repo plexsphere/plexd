@@ -19,15 +19,21 @@ import (
 // countingHandler counts emitted log records by message so a test can pin log
 // cadence — that a settled entry warns exactly once across repeated pulls, for
 // instance, rather than once per pull. It also keeps the level each message was
-// emitted at, so a test can pin that a routine outcome is not warned about.
+// emitted at, so a test can pin that a routine outcome is not warned about, and
+// the attributes it last carried.
 type countingHandler struct {
 	mu     sync.Mutex
 	counts map[string]int
 	levels map[string]slog.Level
+	attrs  map[string]map[string]string
 }
 
 func newCountingHandler() *countingHandler {
-	return &countingHandler{counts: make(map[string]int), levels: make(map[string]slog.Level)}
+	return &countingHandler{
+		counts: make(map[string]int),
+		levels: make(map[string]slog.Level),
+		attrs:  make(map[string]map[string]string),
+	}
 }
 
 func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
@@ -37,6 +43,12 @@ func (h *countingHandler) Handle(_ context.Context, rec slog.Record) error {
 	defer h.mu.Unlock()
 	h.counts[rec.Message]++
 	h.levels[rec.Message] = rec.Level
+	attrs := make(map[string]string)
+	rec.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.String()
+		return true
+	})
+	h.attrs[rec.Message] = attrs
 	return nil
 }
 
@@ -56,6 +68,14 @@ func (h *countingHandler) level(msg string) slog.Level {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.levels[msg]
+}
+
+// attr returns the value of the attribute key on the last record emitted with
+// msg, or "" when that record carried no such attribute.
+func (h *countingHandler) attr(msg, key string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.attrs[msg][key]
 }
 
 // newTestDispatcher wires a Dispatcher onto a real SessionManager. The manager
@@ -547,6 +567,226 @@ func TestDispatcher_LocallyClosedSessionIsNotReprovisioned(t *testing.T) {
 	}
 }
 
+// TestDispatcher_RevokedEntryIsNotReprovisioned covers the one entry the known
+// set does not settle: a session whose started row is still outstanding. A pull
+// rendered before the revocation committed can still carry its entry after the
+// session_revoked event closed it, and without the revoked set the dispatcher
+// would bind the listener of a revoked session again.
+func TestDispatcher_RevokedEntryIsNotReprovisioned(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	d, mgr, reporter, logs := newTestDispatcher(t, Config{})
+	mu, records := recordCloses(mgr)
+
+	reporter.mu.Lock()
+	reporter.startedErr = errors.New("control plane unreachable")
+	reporter.mu.Unlock()
+
+	snapshot := sessionsSnapshot(echoSession(t, "sess-revoked-outstanding", echoAddr))
+	d.Handle(context.Background(), snapshot)
+	if mgr.ActiveCount() != 1 {
+		t.Fatalf("expected the listener to be up, ActiveCount()=%d", mgr.ActiveCount())
+	}
+
+	trigger := newFakeTrigger()
+	env := revokedEnvelope(revocationPayload(t, "sess-revoked-outstanding", api.RevokeReasonOperatorRequest))
+	if err := d.SessionRevokedHandler(trigger)(context.Background(), env); err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	trigger.wait(t)
+	if mgr.ActiveCount() != 0 {
+		t.Fatalf("expected the event to close the session, ActiveCount()=%d", mgr.ActiveCount())
+	}
+
+	// The stale pull still carries the entry.
+	d.Handle(context.Background(), snapshot)
+
+	if mgr.ActiveCount() != 0 {
+		t.Errorf("expected the revoked session to stay closed, ActiveCount()=%d", mgr.ActiveCount())
+	}
+	if n := logs.count(revokedSettledMsg); n != 1 {
+		t.Errorf("%q logged %d times, want 1", revokedSettledMsg, n)
+	}
+	if lvl := logs.level(revokedSettledMsg); lvl != slog.LevelInfo {
+		t.Errorf("%q logged at %v, want INFO", revokedSettledMsg, lvl)
+	}
+	reporter.mu.Lock()
+	if len(reporter.startedCalls) != 1 {
+		t.Errorf("started rows = %d, want 1: the revoked entry must not be provisioned again", len(reporter.startedCalls))
+	}
+	reporter.mu.Unlock()
+	mu.Lock()
+	if len(*records) != 1 {
+		t.Errorf("expected 1 close, got %d", len(*records))
+	}
+	mu.Unlock()
+
+	// Once the entry drains, the revoked set forgets the id like the other maps.
+	d.Handle(context.Background(), sessionsSnapshot())
+	d.revokedMu.Lock()
+	defer d.revokedMu.Unlock()
+	if len(d.revoked) != 0 {
+		t.Errorf("revoked set holds %d ids after the drain, want 0", len(d.revoked))
+	}
+}
+
+// hookHandler is a slog.Handler that runs hook whenever a record with message
+// msg is emitted, so a test can act at the exact point a log line marks.
+type hookHandler struct {
+	msg  string
+	hook func()
+}
+
+func (h *hookHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *hookHandler) Handle(_ context.Context, rec slog.Record) error {
+	if rec.Message == h.msg && h.hook != nil {
+		h.hook()
+	}
+	return nil
+}
+
+func (h *hookHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *hookHandler) WithGroup(string) slog.Handler { return h }
+
+// TestDispatcher_RevocationDuringProvisionClosesTheSession covers an event that
+// lands after the provision loop checked the revoked set but before
+// CreateSession made the session live. The handler then finds no live session
+// to close, so Handle must close the listener it just bound, with the event's
+// reason, instead of reporting it. The event is delivered from CreateSession's
+// own log line about capping the grant, which it emits before it takes its
+// lock: a grant past the 30-minute default cap makes it fire.
+func TestDispatcher_RevocationDuringProvisionClosesTheSession(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	hook := &hookHandler{msg: "session expiry capped below the granted expires_at; the session will end early"}
+	mgr := NewSessionManager(Config{}, "127.0.0.1", slog.New(hook))
+	t.Cleanup(mgr.Shutdown)
+	reporter := &mockReporter{}
+	logs := newCountingHandler()
+	d := NewDispatcher(mgr, reporter, slog.New(logs))
+	mu, records := recordCloses(mgr)
+	trigger := newFakeTrigger()
+	handler := d.SessionRevokedHandler(trigger)
+
+	entry := echoSession(t, "sess-revoked-midway", echoAddr)
+	entry.ExpiresAt = time.Now().Add(2 * time.Hour)
+	env := revokedEnvelope(revocationPayload(t, entry.SessionID, api.RevokeReasonOperatorRequest))
+	delivered := false
+	hook.hook = func() {
+		hook.hook = nil
+		delivered = true
+		if err := handler(context.Background(), env); err != nil {
+			t.Errorf("handler error: %v", err)
+		}
+		// The handler's close runs before the session is live, so it finds
+		// nothing to close.
+		trigger.wait(t)
+	}
+
+	snapshot := sessionsSnapshot(entry)
+	d.Handle(context.Background(), snapshot)
+	if !delivered {
+		t.Fatal("the revocation was not delivered while CreateSession ran")
+	}
+	if n := logs.count(revokedNoLiveMsg); n != 1 {
+		t.Fatalf("%q logged %d times, want 1: the event did not land in the window", revokedNoLiveMsg, n)
+	}
+
+	if mgr.ActiveCount() != 0 {
+		t.Errorf("expected the revoked session to be closed, ActiveCount()=%d", mgr.ActiveCount())
+	}
+	if n := logs.count(revokedDuringProvisionMsg); n != 1 {
+		t.Errorf("%q logged %d times, want 1", revokedDuringProvisionMsg, n)
+	}
+	if lvl := logs.level(revokedDuringProvisionMsg); lvl != slog.LevelInfo {
+		t.Errorf("%q logged at %v, want INFO", revokedDuringProvisionMsg, lvl)
+	}
+
+	// A later pull that still carries the entry leaves it closed.
+	d.Handle(context.Background(), snapshot)
+
+	if mgr.ActiveCount() != 0 {
+		t.Errorf("expected the revoked session to stay closed, ActiveCount()=%d", mgr.ActiveCount())
+	}
+	reporter.mu.Lock()
+	if len(reporter.startedCalls) != 0 {
+		t.Errorf("started rows = %d, want 0: a listener the event revoked must not be reported", len(reporter.startedCalls))
+	}
+	reporter.mu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*records) != 1 || (*records)[0].reason != reasonRevoked {
+		t.Errorf("closes = %+v, want one with reason %q", *records, reasonRevoked)
+	}
+}
+
+func TestDispatcher_RevokedReportedEntryStaysClosed(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	d, mgr, reporter, _ := newTestDispatcher(t, Config{})
+	mu, records := recordCloses(mgr)
+
+	snapshot := sessionsSnapshot(echoSession(t, "sess-revoked-reported", echoAddr))
+	d.Handle(context.Background(), snapshot)
+
+	trigger := newFakeTrigger()
+	env := revokedEnvelope(revocationPayload(t, "sess-revoked-reported", api.RevokeReasonOperatorRequest))
+	if err := d.SessionRevokedHandler(trigger)(context.Background(), env); err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	trigger.wait(t)
+
+	d.Handle(context.Background(), snapshot)
+	d.Handle(context.Background(), snapshot)
+
+	if mgr.ActiveCount() != 0 {
+		t.Errorf("expected the revoked session to stay closed, ActiveCount()=%d", mgr.ActiveCount())
+	}
+	reporter.mu.Lock()
+	if len(reporter.startedCalls) != 1 {
+		t.Errorf("started rows = %d, want 1", len(reporter.startedCalls))
+	}
+	reporter.mu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*records) != 1 || (*records)[0].reason != reasonRevoked {
+		t.Errorf("closes = %+v, want one with reason %q", *records, reasonRevoked)
+	}
+}
+
+// TestDispatcher_DrainBeforeEventReportsPlexdClose pins the race the event
+// cannot win: a pull that lands between the revocation's commit and the event
+// drains the entry first, and the late event finds nothing left to close.
+func TestDispatcher_DrainBeforeEventReportsPlexdClose(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	d, mgr, _, logs := newTestDispatcher(t, Config{})
+	mu, records := recordCloses(mgr)
+
+	d.Handle(context.Background(), sessionsSnapshot(echoSession(t, "sess-drained-first", echoAddr)))
+	d.Handle(context.Background(), sessionsSnapshot())
+
+	trigger := newFakeTrigger()
+	env := revokedEnvelope(revocationPayload(t, "sess-drained-first", api.RevokeReasonOperatorRequest))
+	if err := d.SessionRevokedHandler(trigger)(context.Background(), env); err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	trigger.wait(t)
+
+	if n := logs.count(revokedNoLiveMsg); n != 1 {
+		t.Errorf("%q logged %d times, want 1", revokedNoLiveMsg, n)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*records) != 1 {
+		t.Fatalf("expected 1 close, got %d", len(*records))
+	}
+	if (*records)[0].reason != reasonDrained {
+		t.Errorf("close reason = %q, want %q", (*records)[0].reason, reasonDrained)
+	}
+	if got := TerminatedByFromReason((*records)[0].reason); got != api.TerminatedByPlexdClose {
+		t.Errorf("terminated_by = %q, want %q", got, api.TerminatedByPlexdClose)
+	}
+}
+
 func TestDispatcher_IdleTimeoutClosesProvisionedSession(t *testing.T) {
 	echoAddr := startEchoServer(t)
 	d, mgr, _, _ := newTestDispatcher(t, Config{})
@@ -761,7 +1001,7 @@ const (
 // verdict is durable — re-posting the row draws the identical status for as long
 // as the entry stands — so the entry is settled instead of retried. It is not a
 // teardown signal: the listener stays bound until the entry drains from the
-// block, which keeps the block the single driver of desired state.
+// block, or a verified session_revoked event naming the session closes it.
 func TestDispatcher_SessionGoneSettlesStartedRow(t *testing.T) {
 	echoAddr := startEchoServer(t)
 	d, mgr, reporter, logs := newTestDispatcher(t, Config{})
