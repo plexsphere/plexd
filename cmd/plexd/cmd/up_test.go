@@ -3079,15 +3079,16 @@ const (
 	endedFailedMsg     = "tunnel session ended report failed"
 )
 
-// The ended row of a drain-driven teardown reaches a control plane that already
-// holds the session as revoked or expired, because the node only closes the
-// listener after it has observed the drain. Its refusal is therefore the answer
-// every revocation and every hard expiry produces, so it is not reported as a
-// failure of this node — but the row is fire-once and is the sole carrier of the
-// transfer volumes and the terminating reason, so the refusal loses audit data
-// for exactly the sessions an operator cut. The line is therefore a warning and
-// carries the row's payload, which makes it the only surviving record of it. Any
-// other error keeps the Error level.
+// The ended row of a teardown caused by a drain or a session_revoked event
+// reaches a control plane that already holds the session as revoked or expired.
+// A control plane since plexsphere/plexsphere#931 records that row once, so a
+// refusal means the listener's end is already recorded, or that the control
+// plane predates the change and refuses every row on a dead session. Neither is
+// a failure of this node — but the row is fire-once and is the sole carrier of
+// the transfer volumes and the terminating reason, so the refusal loses audit
+// data for exactly the sessions an operator cut. The line is therefore a
+// warning and carries the row's payload, which makes it the only surviving
+// record of it. Any other error keeps the Error level.
 //
 // The test swaps the process-global default logger, so it must not run in
 // parallel.

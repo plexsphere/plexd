@@ -5478,6 +5478,135 @@ func TestSessionActivity_ReconfiguredSessionIsLiveAgain(t *testing.T) {
 	assertActivityCounters(t, ts.URL, 1, 0)
 }
 
+// postActivity posts one session activity row and returns its status and, for a
+// problem answer, its problem code.
+func postActivity(t *testing.T, baseURL, sid, body string) (int, string) {
+	t.Helper()
+	resp := doRequest(t, http.MethodPost, sessionURL(baseURL, sid), body)
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return resp.StatusCode, ""
+	}
+	return resp.StatusCode, problemCode(t, resp)
+}
+
+// TestSessionActivity_DeadSessionRecordsOneEndingRow covers the control plane's
+// admission since plexsphere/plexsphere#931: a revoked or expired ssh or tcp
+// session records the session_ended row of its listener once, and answers the
+// usual 409 to the same row posted again.
+func TestSessionActivity_DeadSessionRecordsOneEndingRow(t *testing.T) {
+	expired := stateSession("sess-dead", 22)
+	expired.ExpiresAt = time.Now().UTC().Add(-time.Minute)
+
+	tests := []struct {
+		name     string
+		session  api.NodeStateSession
+		drain    bool
+		body     string
+		wantCode string
+	}{
+		{"revoked_tcp", stateSession("sess-dead", 22), true, `{"tcp":{"phase":"session_ended","bytes_in":10,"bytes_out":20,"terminated_by":"operator_revoke"}}`, "session_already_revoked"},
+		{"revoked_ssh", sessionOfKind("sess-dead", api.SessionKindSSH), true, `{"ssh":{"phase":"session_ended","terminated_by":"operator_revoke"}}`, "session_already_revoked"},
+		{"expired_tcp", expired, false, `{"tcp":{"phase":"session_ended","bytes_in":0,"bytes_out":0,"terminated_by":"ttl_expired"}}`, "session_expired"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			configureSessions(t, ts.URL, tt.session)
+			if tt.drain {
+				configureSessions(t, ts.URL)
+			}
+
+			if status, code := postActivity(t, ts.URL, "sess-dead", tt.body); status != http.StatusNoContent {
+				t.Fatalf("first session_ended = %d %q, want 204", status, code)
+			}
+			status, code := postActivity(t, ts.URL, "sess-dead", tt.body)
+			if status != http.StatusConflict || code != tt.wantCode {
+				t.Errorf("second session_ended = %d %q, want 409 %q", status, code, tt.wantCode)
+			}
+			assertActivityCounters(t, ts.URL, 1, 1)
+		})
+	}
+}
+
+// TestSessionActivity_DeadSessionRefusesOtherRows pins that the ending row is
+// the only row a dead session records: anything else, a session_ended in the
+// member another kind calls for included, keeps the 409.
+func TestSessionActivity_DeadSessionRefusesOtherRows(t *testing.T) {
+	tests := []struct {
+		name string
+		kind string
+		body string
+	}{
+		{"ssh_ended_on_tcp_session", api.SessionKindTCP, `{"ssh":{"phase":"session_ended","terminated_by":"plexd_close"}}`},
+		{"ssh_command", api.SessionKindSSH, `{"ssh":{"command":"ls"}}`},
+		{"tcp_started", api.SessionKindTCP, `{"tcp":{"phase":"session_started"}}`},
+		{"k8s_row", api.SessionKindK8s, `{"k8s":{"verb":"get"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			configureSessions(t, ts.URL, sessionOfKind("sess-dead", tt.kind))
+			configureSessions(t, ts.URL)
+
+			status, code := postActivity(t, ts.URL, "sess-dead", tt.body)
+			if status != http.StatusConflict || code != "session_already_revoked" {
+				t.Errorf("status = %d %q, want 409 %q", status, code, "session_already_revoked")
+			}
+			assertActivityCounters(t, ts.URL, 0, 1)
+		})
+	}
+}
+
+// TestSessionActivity_EndRecordedWhileLiveRefusedAfterRevoke covers a listener
+// whose end the session already recorded while it was live: after the
+// revocation, a further ending row is refused.
+func TestSessionActivity_EndRecordedWhileLiveRefusedAfterRevoke(t *testing.T) {
+	_, ts := newTestServer(t)
+	configureSessions(t, ts.URL, stateSession("sess-ended", 22))
+
+	for _, body := range []string{
+		`{"tcp":{"phase":"session_started"}}`,
+		`{"tcp":{"phase":"session_ended","bytes_in":0,"bytes_out":0,"terminated_by":"idle_timeout"}}`,
+	} {
+		if status, code := postActivity(t, ts.URL, "sess-ended", body); status != http.StatusNoContent {
+			t.Fatalf("live row %s = %d %q, want 204", body, status, code)
+		}
+	}
+	configureSessions(t, ts.URL)
+
+	status, code := postActivity(t, ts.URL, "sess-ended", `{"tcp":{"phase":"session_ended","bytes_in":0,"bytes_out":0,"terminated_by":"plexd_close"}}`)
+	if status != http.StatusConflict || code != "session_already_revoked" {
+		t.Errorf("ending row after the revocation = %d %q, want 409 %q", status, code, "session_already_revoked")
+	}
+	assertActivityCounters(t, ts.URL, 2, 1)
+}
+
+// TestSessionActivity_RebindAfterEndAdmitsNextEnd covers a listener bound again
+// after its predecessor ended, as a node does after a restart: the newest
+// lifecycle row is a session_started, so the new listener's end is recorded.
+func TestSessionActivity_RebindAfterEndAdmitsNextEnd(t *testing.T) {
+	_, ts := newTestServer(t)
+	configureSessions(t, ts.URL, stateSession("sess-rebound", 22))
+
+	for _, body := range []string{
+		`{"tcp":{"phase":"session_started"}}`,
+		`{"tcp":{"phase":"session_ended","bytes_in":0,"bytes_out":0,"terminated_by":"plexd_close"}}`,
+		`{"tcp":{"phase":"session_started"}}`,
+	} {
+		if status, code := postActivity(t, ts.URL, "sess-rebound", body); status != http.StatusNoContent {
+			t.Fatalf("live row %s = %d %q, want 204", body, status, code)
+		}
+	}
+	configureSessions(t, ts.URL)
+
+	status, code := postActivity(t, ts.URL, "sess-rebound", `{"tcp":{"phase":"session_ended","bytes_in":0,"bytes_out":0,"terminated_by":"operator_revoke"}}`)
+	if status != http.StatusNoContent {
+		t.Errorf("ending row of the rebound listener = %d %q, want 204", status, code)
+	}
+	assertActivityCounters(t, ts.URL, 4, 0)
+}
+
 func TestSessionActivity_ForeignNodeID_Returns403(t *testing.T) {
 	_, ts := newTestServer(t)
 

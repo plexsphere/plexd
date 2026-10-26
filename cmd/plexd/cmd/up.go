@@ -1549,16 +1549,19 @@ func (r *controlPlaneSessionReporter) ReportSessionEnded(ctx context.Context, se
 		}
 	}
 	if err := r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, req); err != nil {
-		// A drain-driven close posts its row into a session the control plane
-		// already holds as revoked or expired, so the refusal is the expected
-		// answer of every revocation and hard expiry rather than a fault of this
-		// node. It is still audit data going missing, and for exactly the
-		// sessions an investigation asks about: the row is fire-once, nothing
-		// re-posts it, and it is the sole carrier of the terminating reason and,
-		// for a tcp session, of the transfer volumes. So the answer is warned
-		// about rather than noted, and the row's payload is carried into the
-		// line, which is the only place it survives. An ssh session counts no
-		// bytes, so its line carries none.
+		// A close caused by a drain or a session_revoked event posts its row into
+		// a session the control plane already holds as revoked or expired. A
+		// control plane since plexsphere/plexsphere#931 records the ending row of
+		// such a session once, so this refusal now means the end of this
+		// listener is already recorded, or that the control plane predates that
+		// change and refuses every row on a dead session. Either way it is not a
+		// fault of this node. It is still audit data going missing, and for
+		// exactly the sessions an investigation asks about: the row is
+		// fire-once, nothing re-posts it, and it is the sole carrier of the
+		// terminating reason and, for a tcp session, of the transfer volumes. So
+		// the answer is warned about rather than noted, and the row's payload is
+		// carried into the line, which is the only place it survives. An ssh
+		// session counts no bytes, so its line carries none.
 		if api.IsSessionRevokedOrExpired(err) {
 			msg := "ssh session ended row refused; its terminating reason is recorded only here"
 			attrs := []any{"session_id", sessionID, "kind", info.Kind}
