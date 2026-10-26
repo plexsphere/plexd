@@ -578,9 +578,8 @@ func runAgent(ctx context.Context) error {
 	// types from the documented-coming taxonomy. action_request and
 	// session_setup join them as push-latency optimisations: the dispatch and
 	// the session themselves are delivered in the pull's executions and sessions
-	// blocks, the events only pull them forward. session_revoked is the same
-	// shape from the other end — a session leaving the sessions block is what
-	// tears it down, so the event only pulls the observing reconcile forward.
+	// blocks, the events only pull them forward. session_revoked is registered
+	// with the session dispatcher below, because it closes the session it names.
 	// node_secrets_updated carries the node's full secret inventory, but the
 	// inventory also rides the pull's secrets block, which feeds the node API's
 	// secret index, so the event only pulls that forward too: an event that
@@ -593,7 +592,6 @@ func runAgent(ctx context.Context) error {
 		api.EventNodeStateUpdated,
 		api.EventActionRequest,
 		api.EventSessionSetup,
-		api.EventSessionRevoked,
 		api.EventNodeSecretsUpdated,
 		api.EventPeerRegistered,
 		api.EventPeerPSKAssigned,
@@ -820,9 +818,17 @@ func runAgent(ctx context.Context) error {
 	// Mediated-access sessions are consumed from the pull's sessions block on
 	// every successful cycle too, but that block is desired state: a listener is
 	// provisioned when its entry appears and torn down when the entry drains,
-	// which is the only teardown signal there is.
+	// unless a verified session_revoked event closed it first (registered
+	// below).
 	sessionDispatcher := tunnel.NewDispatcher(meshServer.SessionManager(), sessionReporter, logger)
 	reconciler.RegisterDispatchHandler(sessionDispatcher.Handle)
+
+	// A verified session_revoked event names the session the control plane
+	// revoked, so the dispatcher closes that session at once and reports the
+	// reason the event carries, then pulls. The drain stays the teardown for a
+	// revocation whose event never arrives. Registered before sseMgr.Start, like
+	// every other SSE handler.
+	sseMgr.RegisterHandler(api.EventSessionRevoked, sessionDispatcher.SessionRevokedHandler(reconciler))
 
 	// The reachability block is the control plane's own verdict about this node,
 	// not desired state: it is observed and logged on every successful pull, and
