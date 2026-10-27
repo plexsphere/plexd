@@ -50,7 +50,11 @@ type Peer struct {
 	Endpoint string `json:"endpoint"`
 	// Endpoints is the peer's dial order: the endpoints the WireGuard manager
 	// tries one after another until a handshake completes.
-	Endpoints  []string `json:"endpoints,omitempty"`
+	Endpoints []string `json:"endpoints,omitempty"`
+	// Fallback is the peer's fallback_endpoint when that is the last entry of
+	// Endpoints, and empty otherwise. Endpoint selection holds that entry as
+	// long as the entries before it took together.
+	Fallback   string   `json:"fallback,omitempty"`
 	AllowedIPs []string `json:"allowed_ips"`
 	PSK        string   `json:"psk"`
 }

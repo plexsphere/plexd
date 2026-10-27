@@ -22,10 +22,12 @@ const EndpointSelectionInterval = 5 * time.Second
 // says the path no longer carries traffic.
 const connectedHandshakeAge = 180 * time.Second
 
-// endpointTrialMargin is added to the keepalive interval to give how long one
-// entry of a dial order is tried. The keepalive is what makes WireGuard send
-// to a newly programmed endpoint of an idle peer, and the margin leaves the
-// handshake that send starts time to complete.
+// endpointTrialMargin is added to the keepalive interval to give one trial,
+// how long an entry of a dial order is tried; the relay fallback that ends an
+// order is tried for one trial per entry before it (see dialState.trial). The
+// keepalive is what makes WireGuard send to a newly programmed endpoint of an
+// idle peer, and the margin leaves the handshake that send starts time to
+// complete.
 const endpointTrialMargin = 5 * time.Second
 
 // dialState is one peer's endpoint selection: the peer as last written, the
@@ -55,6 +57,20 @@ func (s *dialState) endpoint() string {
 		return ""
 	}
 	return order[s.idx]
+}
+
+// trial returns how long the entry at idx of the dial order is tried, given
+// timeout, one trial. The peer's Fallback, when it is the last entry of an
+// order of two or more, is tried for one trial per entry before it, so it is
+// held as long as those entries took together. Each of two peers that dial one
+// relay then spends at least half its cycle on it, and their relay windows
+// overlap or touch. Every other entry is tried for timeout.
+func (s *dialState) trial(idx int, timeout time.Duration) time.Duration {
+	order := s.order()
+	if idx > 0 && idx == len(order)-1 && s.peer.Fallback != "" && order[idx] == s.peer.Fallback {
+		return timeout * time.Duration(idx)
+	}
+	return timeout
 }
 
 // dialOrder returns the endpoints plexd tries for p, in order: the candidates
@@ -121,12 +137,15 @@ func isOnLink(addr netip.Addr, local []netip.Prefix) bool {
 // connectedHandshakeAge is connected, and its device endpoint is left alone,
 // so WireGuard's roaming stays in effect. A peer that is not connected is
 // moved to the next entry of its dial order once the current one has been
-// tried for the keepalive interval plus endpointTrialMargin.
+// tried for its trial (see dialState.trial): the keepalive interval plus
+// endpointTrialMargin, or for a Fallback that ends an order of n entries,
+// n-1 times that. The switch is logged with the trial of the entry it
+// programs.
 //
 // The device is read before mu is taken. A read error, ErrPeerStatsUnsupported
 // included, is returned unchanged with no state touched. A failed switch is
 // logged, leaves the peer on the entry still programmed, and is joined into
-// the returned error; its next attempt waits a full trial again.
+// the returned error; its next attempt waits that entry's full trial again.
 func (m *Manager) selectEndpoints() error {
 	stats, err := m.MeshPeerStats()
 	if err != nil {
@@ -175,7 +194,7 @@ func (m *Manager) selectEndpoints() error {
 		}
 
 		order := st.order()
-		if len(order) < 2 || now.Sub(st.programmedAt) < timeout {
+		if len(order) < 2 || now.Sub(st.programmedAt) < st.trial(st.idx, timeout) {
 			continue
 		}
 		next := (st.idx + 1) % len(order)
@@ -201,6 +220,7 @@ func (m *Manager) selectEndpoints() error {
 			"endpoint", order[next],
 			"attempt", next+1,
 			"of", len(order),
+			"trial", st.trial(next, timeout),
 		)
 	}
 	return errors.Join(errs...)
