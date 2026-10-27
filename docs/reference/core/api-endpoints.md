@@ -28,6 +28,7 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 16 | `POST` | `/v1/nodes/{node_id}/handshakes` | Per-peer WireGuard handshake report |
 | 17 | `GET` | `/v1/nodes/{node_id}/peers/{peer_node_id}/psk` | Pairwise edge PSK (NSK-encrypted octet-stream) |
 | 18 | `PUT` | `/v1/nodes/{node_id}/endpoint-candidates` | Local endpoint candidate reporting |
+| 19 | `GET` | `/v1/nodes/{node_id}/sessions/{session_id}/connections/{connection_id}` | ssh session connection (WebSocket upgrade) |
 
 ## Registration & Identity
 
@@ -113,6 +114,7 @@ Long-lived SSE connection. Supports `Last-Event-ID` header for replay after reco
 | `action_request` | Opaque; triggers a reconcile — the dispatch itself rides the `executions` block of the state pull |
 | `session_setup` | Opaque; triggers a reconcile — the session itself rides the `sessions` block of the state pull |
 | `session_revoked` | The revoked session's `session_id`, `jti` (equal to `session_id`), `revoked_at`, and `revoke_reason`. plexd closes the named session when it is live, reports the `terminated_by` its `revoke_reason` maps to, then triggers a reconcile. A payload that does not decode, or whose `session_id` is empty or differs from its `jti`, closes nothing and only triggers the reconcile. The session leaving the `sessions` block stays the teardown for a revocation whose event never arrives |
+| `session_connect` | The ssh session a client attached to (`session_id`), the one-time `connection_id` of the connection the node is asked to open for it, and `expires_at`, after which the control plane no longer accepts that connection; `event_id` and `occurred_at` ride along and plexd ignores them. plexd opens the connection with [`GET /v1/nodes/{node_id}/sessions/{session_id}/connections/{connection_id}`](#get-v1-nodes-node-id-sessions-session-id-connections-connection-id) when the session is a live ssh session, and triggers no reconcile. A payload that does not decode, or whose `session_id` or `connection_id` is empty, opens nothing |
 | `rotate_keys` | Key rotation trigger |
 | `signing_key_rotated` | New signing key (`key_id`, `public_key`), `previous_key_id`, `transition_expires`. The state pull's `signing_key` block also carries the key (see [`GET /v1/nodes/{node_id}/state`](#get-v1-nodes-node-id-state)) |
 | `node_state_updated` | Updated metadata and data entries |
@@ -1156,10 +1158,15 @@ session to close):
 ```
 
 **Request body** (ssh `session_started` and `session_ended`). A lifecycle row
-carries no command fields and no byte counters:
+carries no command fields and no byte counters. An ssh session binds no
+listener, so its started row carries no `listener_endpoint` and means the session
+is ready to serve the connections the control plane asks for (see
+[below](#get-v1-nodes-node-id-sessions-session-id-connections-connection-id));
+the control plane still admits the started row with an endpoint that older
+agents post:
 
 ```json
-{"ssh": {"phase": "session_started", "listener_endpoint": "10.99.0.1:40000"}}
+{"ssh": {"phase": "session_started"}}
 ```
 
 ```json
@@ -1223,6 +1230,45 @@ the entry standing in the block is the control plane still asking for the
 session. It therefore keeps the ordinary handling, as every other answer does: a
 started row is re-posted on the next pull and an ended row is logged at Error and
 dropped.
+
+### GET /v1/nodes/{node_id}/sessions/{session_id}/connections/{connection_id} {#get-v1-nodes-node-id-sessions-session-id-connections-connection-id}
+
+The connection a verified `session_connect` event asks the node to open for one
+of its ssh sessions, as plexsphere/plexsphere#928 defines it. `{session_id}` and
+`{connection_id}` are the event payload's members, path-escaped. The request is
+a WebSocket upgrade (RFC 6455) with no body, sent over HTTP/1.1 through the same
+client, TLS settings and base URL as every other call, with
+`Authorization: Bearer <NSK bearer>` and `User-Agent: plexd/<version>`.
+Compression is off. The control plane splices the client that attached to the
+session onto the socket, and each binary message carries raw SSH bytes in either
+direction, so SSH runs end to end between the client and plexd.
+
+The control plane pings the connection every 30 s. plexd answers the pings and
+does not count them as session activity, so they cannot hold an idle session
+open. A text message closes the connection with status `1003`, a close with
+`1000` or `1001` ends it normally. plexd closes its side with `1000` when it
+can: it cancels a read in flight first, which closes the socket, so the control
+plane may see the connection end without a close frame.
+
+plexd does not judge `expires_at` against its own clock: the envelope verifier
+admits envelopes up to 5 minutes off while the control plane waits seconds for
+the connection, so a node clock slightly ahead would drop every request. The
+control plane refuses a connection that comes too late with the `404`. A failed
+open is not retried, because each attach mints a new `connection_id`.
+A refused upgrade is returned as an `*APIError` carrying the status and the
+problem `code`, read from the first 1024 bytes of the body, and plexd logs it at
+Warn (`session connection to the control plane failed`).
+
+| Response | Meaning |
+|---|---|
+| `101 Switching Protocols` | Connection accepted; the WebSocket carries the session's SSH bytes until either side closes it |
+| `401 Unauthorized` | Invalid node identity |
+| `403 Forbidden` (`nsk_node_mismatch`) | The path names a node other than the caller's identity |
+| `404 Not Found` (`session_connection_not_found`) | No pending connection with this id for this node's session: unknown, minted for another session, already opened, or past its `expires_at` |
+| `409 Conflict` (`session_not_active`) | The session is no longer active |
+| `426 Upgrade Required` (`upgrade_required`) | The request is not a WebSocket upgrade |
+| `501 Not Implemented` (`access_attach_not_provisioned`) | The control plane does not serve session connections |
+| `502 Bad Gateway` (`session_connection_forward_failed`) | The control plane could not forward the connection to the replica the client is attached to |
 
 ## Observability
 

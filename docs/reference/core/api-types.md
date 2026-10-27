@@ -316,6 +316,7 @@ an earlier kept entry already has, and logs each dropped entry at Warn as
 These types are part of the API but are not members of the state snapshot.
 `SigningKeyRotation` is the payload of the `signing_key_rotated` SSE event.
 `SessionRevocation` is the payload of the `session_revoked` SSE event.
+`SessionConnectRequest` is the payload of the `session_connect` SSE event.
 `SecretRef` is the entry of the local node API's secret index, fed from the
 pull's `NodeStateSecret` entries (the name becomes `key`). `DataEntry` is the
 shape the local node API serves for cached data entries.
@@ -354,6 +355,18 @@ value is reported as `operator_revoke` too, with a Warn.
 | `RevokeReasonResourceDecommissioned` | `resource_decommissioned` | Operator-driven; reported as `operator_revoke`   |
 | `RevokeReasonTTLExpired`             | `ttl_expired`             | Sweeper, at the session's hard expiry; reported as `ttl_expired` |
 | `RevokeReasonIdleTimeout`            | `idle_timeout`            | Sweeper, at the session's idle timeout; reported as `idle_timeout` |
+
+**SessionConnectRequest**
+
+Its shape is the control plane's `access.SessionConnectRequested` event. The
+payload also carries that event's `event_id` and `occurred_at` header members,
+which plexd does not read.
+
+| Field          | Type        | JSON Tag          | Description                                        |
+|----------------|-------------|-------------------|----------------------------------------------------|
+| `SessionID`    | `string`    | `"session_id"`    | Id of the ssh session a client attached to         |
+| `ConnectionID` | `string`    | `"connection_id"` | One-time id of the connection the node is asked to open; the last segment of [`GET /v1/nodes/{node_id}/sessions/{session_id}/connections/{connection_id}`](api-endpoints.md#get-v1-nodes-node-id-sessions-session-id-connections-connection-id). plexd opens nothing when it or `session_id` is empty |
+| `ExpiresAt`    | `time.Time` | `"expires_at"`    | When the control plane stops accepting the connection. plexd does not judge it against its own clock; the control plane refuses a late connection with `404 session_connection_not_found` |
 
 **DataEntry**
 
@@ -939,9 +952,11 @@ server but not emitted. Success is `204 No Content`.
 
 A row takes one of two shapes. A command row carries `command`, optionally with
 `exit_code`, `started_at` and `completed_at`. A lifecycle row carries `phase`
-plus `listener_endpoint` on `session_started` or `terminated_by` on
-`session_ended`, and no command fields. plexd never posts an empty `command`: the
-server refuses a row that mixes the shapes.
+plus `terminated_by` on `session_ended`, and no command fields. An ssh session
+binds no listener, so plexd sends no `listener_endpoint`; the field stays for
+the `session_started` rows older agents post with one, which the server still
+admits. plexd never posts an empty `command`: the server refuses a row that
+mixes the shapes.
 
 | Field              | Type         | JSON Tag                         | Description                            |
 |--------------------|--------------|----------------------------------|----------------------------------------|
@@ -950,14 +965,14 @@ server refuses a row that mixes the shapes.
 | `StartedAt`        | `*time.Time` | `"started_at,omitempty"`         | RFC 3339 start time (UTC)              |
 | `CompletedAt`      | `*time.Time` | `"completed_at,omitempty"`       | RFC 3339 completion time (UTC)         |
 | `Phase`            | `string`     | `"phase,omitempty"`              | One of the `SSHPhase*` values; lifecycle rows only |
-| `ListenerEndpoint` | `string`     | `"listener_endpoint,omitempty"`  | Address the ssh listener bound; `session_started` rows only |
+| `ListenerEndpoint` | `string`     | `"listener_endpoint,omitempty"`  | Never sent by plexd, because an ssh session binds no listener; kept for the `session_started` rows older agents post |
 | `TerminatedBy`     | `string`     | `"terminated_by,omitempty"`      | One of the `TerminatedBy*` values; `session_ended` rows only |
 
 **SSHPhase constants**
 
 | Constant                 | Value             | Description                           |
 |--------------------------|-------------------|---------------------------------------|
-| `SSHPhaseSessionStarted` | `session_started` | The listener of an SSH session is up  |
+| `SSHPhaseSessionStarted` | `session_started` | An SSH session is ready to serve the connections the control plane asks for |
 | `SSHPhaseSessionEnded`   | `session_ended`   | Close of an SSH session               |
 
 **K8sActivity**
@@ -1099,9 +1114,11 @@ for the canonical form and signature rules.
 
 ### Event Types
 
-The event set is organized in two tiers. Contract types are emitted today;
-documented-coming types are named for the platform's 14-type taxonomy.
-Reconcile-driving payloads are opaque — the state pull is authoritative. `session_revoked` is the exception: its payload names the session to close before the reconcile.
+The event set is organized in two tiers. Contract types are emitted today,
+except `session_connect`, which only a control plane with
+[plexsphere/plexsphere#928](https://github.com/plexsphere/plexsphere/issues/928) emits; documented-coming types are named for
+the platform's 14-type taxonomy.
+Reconcile-driving payloads are opaque — the state pull is authoritative. `session_revoked` is the exception: its payload names the session to close before the reconcile. `session_connect` drives no reconcile at all: its payload names a connection to open.
 
 | Constant                   | Value                   | Tier              |
 |----------------------------|-------------------------|-------------------|
@@ -1113,6 +1130,7 @@ Reconcile-driving payloads are opaque — the state pull is authoritative. `sess
 | `EventPeerEndpointChanged` | `peer_endpoint_changed` | contract          |
 | `EventNodeSecretsUpdated`  | `node_secrets_updated`  | contract          |
 | `EventSessionRevoked`      | `session_revoked`       | contract          |
+| `EventSessionConnect`      | `session_connect`       | contract          |
 | `EventPeerRegistered`      | `peer_registered`       | documented-coming |
 | `EventPeerPSKAssigned`     | `peer_psk_assigned`     | documented-coming |
 | `EventPeerDeregistered`    | `peer_deregistered`     | documented-coming |
@@ -1135,6 +1153,15 @@ a reconcile, so the pull cannot drain the session first. A payload that does not
 decode, or whose `session_id` is empty or differs from its `jti`, closes nothing:
 the handler triggers the reconcile and returns the error. A session leaving the
 `sessions` block stays the teardown for a revocation whose event never arrives.
+
+`session_connect` is a contract type whose payload plexd decodes, as a
+`SessionConnectRequest` (see [Supporting types](#supporting-types)) naming one
+connection of an ssh session a client attached to.
+`tunnel.Dispatcher.SessionConnectHandler` opens that connection with
+`ControlPlane.OpenSessionConnection` when the session is a live ssh session,
+and serves the session's SSH login on it. It triggers no reconcile, because the
+event carries no desired state. A payload that does not decode, or whose
+`session_id` or `connection_id` is empty, opens nothing and returns the error.
 
 `node_secrets_updated` is a contract type whose payload carries the node's full
 secret inventory. plexd treats the payload as opaque and only triggers a
