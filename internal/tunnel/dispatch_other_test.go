@@ -5,6 +5,7 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 )
@@ -41,5 +42,18 @@ func TestSessionManager_SSHUnsupportedPlatform(t *testing.T) {
 	_, err := mgr.CreateSession(context.Background(), sshEntry("sess-ssh", "ops", time.Now().Add(5*time.Minute)))
 	if !errors.Is(err, ErrSSHSessionsUnsupported) {
 		t.Errorf("CreateSession() error = %v, want ErrSSHSessionsUnsupported", err)
+	}
+}
+
+// Off Linux and macOS there is no ssh session to serve a connection.
+func TestSessionManager_ConnectSSHSessionUnsupportedPlatform(t *testing.T) {
+	mgr := newTestManager(t, Config{})
+	dialed := false
+	err := mgr.ConnectSSHSession("sess-ssh", "conn-1", func(context.Context) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("dialed")
+	})
+	if !errors.Is(err, ErrSSHSessionsUnsupported) || dialed {
+		t.Errorf("ConnectSSHSession() error = %v, dialed = %v, want ErrSSHSessionsUnsupported before any dial", err, dialed)
 	}
 }

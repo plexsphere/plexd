@@ -87,7 +87,6 @@ type LaunchRequest struct {
 // sshSessionParams carries what newSSHSession builds an ssh session from.
 type sshSessionParams struct {
 	entry     api.NodeStateSession
-	meshIP    string
 	expiresAt time.Time
 	deps      SSHSessionDeps
 	logger    *slog.Logger

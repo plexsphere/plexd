@@ -18,9 +18,10 @@ type MeshServer struct {
 }
 
 // NewMeshServer creates a MeshServer that manages the SSH server and session
-// manager. meshIP is the node's registered mesh address, which every session
-// listener binds — it is the reachability boundary of an otherwise
-// unauthenticated forward, so it comes from the node identity rather than being
+// manager. meshIP is the node's registered mesh address, which every tcp
+// session listener binds (an ssh session binds none) — it is the reachability
+// boundary of an otherwise unauthenticated forward, so it comes from the node
+// identity rather than being
 // guessed from the SSH listen address, which is empty in both documented
 // configurations and would bind every interface on the host.
 // If cfg.SSHListenAddr is empty, the SSH server is not created.

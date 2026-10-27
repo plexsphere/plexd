@@ -10,12 +10,18 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+	"go.uber.org/goleak"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
 
@@ -74,7 +80,8 @@ type sshHarness struct {
 	logs     *syncBuffer
 	priv     ed25519.PrivateKey
 	entry    api.NodeStateSession
-	addr     string
+	// conns numbers the connections dial opens, for their connection ids.
+	conns atomic.Int32
 }
 
 const sshTestUser = "ops"
@@ -94,11 +101,10 @@ func startSSHHarness(t *testing.T, launcher *fakeLauncher, setup func(*api.NodeS
 	if setup != nil {
 		setup(&entry)
 	}
-	addr, err := mgr.CreateSession(context.Background(), entry)
-	if err != nil {
+	if _, err := mgr.CreateSession(context.Background(), entry); err != nil {
 		t.Fatalf("CreateSession() error: %v", err)
 	}
-	return &sshHarness{mgr: mgr, reporter: reporter, launcher: launcher, logs: logs, priv: priv, entry: entry, addr: addr}
+	return &sshHarness{mgr: mgr, reporter: reporter, launcher: launcher, logs: logs, priv: priv, entry: entry}
 }
 
 // token mints a valid token for the harness's session and user.
@@ -107,13 +113,59 @@ func (h *sshHarness) token(t *testing.T, allowed []string) string {
 	return sessionToken(t, h.priv, h.entry.SessionID, sshTestUser, allowed)
 }
 
+// dial asks the session for a connection the way a session_connect event
+// does, with a loopback TCP pair standing in for the WebSocket to the control
+// plane, and logs in over the client's end.
 func (h *sshHarness) dial(user, password string) (*ssh.Client, error) {
-	return ssh.Dial("tcp", h.addr, &ssh.ClientConfig{
+	var client net.Conn
+	connectionID := fmt.Sprintf("conn-%d", h.conns.Add(1))
+	err := h.mgr.ConnectSSHSession(h.entry.SessionID, connectionID, func(context.Context) (net.Conn, error) {
+		server, c, err := connPair()
+		client = c
+		return server, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sshClientOver(client, user, password)
+}
+
+// connPair returns the two ends of a loopback TCP connection. net.Pipe does
+// not stand in for one here: it buffers nothing, and both ends of an SSH
+// handshake write their version line before either reads.
+func connPair() (server, client net.Conn, err error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer ln.Close()
+	client, err = net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		return nil, nil, err
+	}
+	server, err = ln.Accept()
+	if err != nil {
+		client.Close()
+		return nil, nil, err
+	}
+	return server, client, nil
+}
+
+// sshClientOver logs in as user with password over conn, which it closes when
+// the handshake fails.
+func sshClientOver(conn net.Conn, user, password string) (*ssh.Client, error) {
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	c, chans, reqs, err := ssh.NewClientConn(conn, "plexd", &ssh.ClientConfig{
 		User:            user,
 		Auth:            []ssh.AuthMethod{ssh.Password(password)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         5 * time.Second,
 	})
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return ssh.NewClient(c, chans, reqs), nil
 }
 
 // login dials as the session's user with a fresh token and closes the client
@@ -166,6 +218,11 @@ func TestSSHSession_AcceptsTokenLogin(t *testing.T) {
 	logs := h.logs.String()
 	if !strings.Contains(logs, "ssh login accepted") {
 		t.Errorf("logs lack the accepted login:\n%s", logs)
+	}
+	// The connection's peer is always the control plane, so the line names the
+	// connection the session_connect event asked for instead.
+	if !strings.Contains(logs, "connection_id=conn-1") || strings.Contains(logs, "remote_addr") {
+		t.Errorf("logs do not name the connection by its connection_id:\n%s", logs)
 	}
 	if strings.Contains(logs, token) {
 		t.Error("the logs carry the session token")
@@ -693,15 +750,19 @@ func TestSSHSession_ConnectionAndChannelLimits(t *testing.T) {
 			first = client
 		}
 	}
-	if client, err := h.dial(sshTestUser, h.token(t, nil)); err == nil {
-		client.Close()
-		t.Error("a fifth concurrent connection completed its handshake, want it closed")
+	dialed := false
+	err := h.mgr.ConnectSSHSession(h.entry.SessionID, "fifth", func(context.Context) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("dialed")
+	})
+	if !errors.Is(err, ErrSSHConnectionLimit) || dialed {
+		t.Errorf("a fifth connection: error = %v, dialed = %v, want ErrSSHConnectionLimit before any dial", err, dialed)
 	}
 
 	for i := 0; i < sshMaxChannelsPerConn; i++ {
 		newSSHChannel(t, first)
 	}
-	_, err := first.NewSession()
+	_, err = first.NewSession()
 	var openErr *ssh.OpenChannelError
 	if !errors.As(err, &openErr) || openErr.Reason != ssh.ResourceShortage {
 		t.Errorf("eleventh channel error = %v, want an OpenChannelError with ResourceShortage", err)
@@ -837,4 +898,300 @@ func TestSSHSession_IdleTimeout(t *testing.T) {
 			t.Errorf("the session idled out while the client kept writing, ActiveCount()=%d", h.mgr.ActiveCount())
 		}
 	})
+}
+
+// An ssh session binds nothing, so neither an empty mesh address nor a wildcard
+// keeps a node from serving one, while a tcp session there is still refused.
+func TestSessionManager_SSHSessionNeedsNoMeshAddress(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	for _, meshIP := range []string{"", "0.0.0.0"} {
+		t.Run(fmt.Sprintf("mesh ip %q", meshIP), func(t *testing.T) {
+			mgr := NewSessionManager(Config{}, meshIP, slog.Default())
+			t.Cleanup(mgr.Shutdown)
+			deps, _ := newSSHTestDeps(t, &mockReporter{}, &fakeLauncher{})
+			mgr.SetSSHSessionDeps(deps)
+
+			addr, err := mgr.CreateSession(context.Background(), sshEntry("sess-ssh", sshTestUser, time.Now().Add(5*time.Minute)))
+			if err != nil || addr != "" {
+				t.Fatalf("CreateSession(ssh) = %q, %v, want an empty address and no error", addr, err)
+			}
+			_, err = mgr.CreateSession(context.Background(), echoSession(t, "sess-tcp", echoAddr))
+			if err == nil || !strings.Contains(err.Error(), "is not a bindable unicast address") {
+				t.Errorf("CreateSession(tcp) error = %v, want the mesh address refused", err)
+			}
+		})
+	}
+}
+
+// Every refusal of ConnectSSHSession comes before it opens anything.
+func TestSessionManager_ConnectSSHSessionRefusals(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	off := false
+	for _, tt := range []struct {
+		name      string
+		cfg       Config
+		sessionID string
+		want      error
+	}{
+		{"unknown id", Config{}, "sess-unknown", ErrSessionNotLive},
+		{"empty id", Config{}, "", ErrSessionNotLive},
+		{"tcp session", Config{}, "sess-tcp", ErrNotSSHSession},
+		{"ssh sessions disabled", Config{Enabled: true, MaxSessions: 10, DefaultTimeout: 5 * time.Minute, SSHSessionsEnabled: &off}, "sess-ssh", ErrSSHSessionsDisabled},
+		{"tunneling disabled", Config{Enabled: false, MaxSessions: 10, DefaultTimeout: 5 * time.Minute}, "sess-ssh", ErrTunnelingDisabled},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr := NewSessionManager(tt.cfg, "127.0.0.1", slog.Default())
+			t.Cleanup(mgr.Shutdown)
+			deps, _ := newSSHTestDeps(t, &mockReporter{}, &fakeLauncher{})
+			mgr.SetSSHSessionDeps(deps)
+			// Under the disabled configurations these are refused too; the
+			// refusal under test does not depend on them.
+			_, _ = mgr.CreateSession(context.Background(), sshEntry("sess-ssh", sshTestUser, time.Now().Add(5*time.Minute)))
+			_, _ = mgr.CreateSession(context.Background(), echoSession(t, "sess-tcp", echoAddr))
+
+			dialed := false
+			err := mgr.ConnectSSHSession(tt.sessionID, "conn-1", func(context.Context) (net.Conn, error) {
+				dialed = true
+				return nil, errors.New("dialed")
+			})
+			if !errors.Is(err, tt.want) {
+				t.Errorf("ConnectSSHSession() error = %v, want %v", err, tt.want)
+			}
+			if dialed {
+				t.Error("ConnectSSHSession dialed before refusing")
+			}
+		})
+	}
+}
+
+// pendingDials reads how many connections of the harness's session are still
+// being opened (white-box).
+func pendingDials(h *sshHarness) int {
+	h.mgr.mu.Lock()
+	s := h.mgr.sessions[h.entry.SessionID].(*sshSession)
+	h.mgr.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pending
+}
+
+// A connection being opened holds its slot, so a burst of events cannot open
+// more connections than the limit while their dials are in flight.
+func TestSSHSession_ConnectionLimitCountsDialsInFlight(t *testing.T) {
+	h := startSSHHarness(t, &fakeLauncher{}, nil)
+
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < sshMaxConnsPerSession; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = h.mgr.ConnectSSHSession(h.entry.SessionID, fmt.Sprintf("blocked-%d", i), func(context.Context) (net.Conn, error) {
+				<-release
+				return nil, errors.New("control plane unreachable")
+			})
+		}()
+	}
+	waitForCondition(t, 3*time.Second, func() bool { return pendingDials(h) == sshMaxConnsPerSession })
+
+	dialed := false
+	err := h.mgr.ConnectSSHSession(h.entry.SessionID, "fifth", func(context.Context) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("dialed")
+	})
+	close(release)
+	wg.Wait()
+	if !errors.Is(err, ErrSSHConnectionLimit) || dialed {
+		t.Errorf("a fifth connection while four dial: error = %v, dialed = %v, want ErrSSHConnectionLimit before any dial", err, dialed)
+	}
+}
+
+// A dial that fails gives its slot back and reports why.
+func TestSSHSession_FailedDialFreesItsSlot(t *testing.T) {
+	h := startSSHHarness(t, &fakeLauncher{}, nil)
+
+	err := h.mgr.ConnectSSHSession(h.entry.SessionID, "failing", func(context.Context) (net.Conn, error) {
+		return nil, errors.New("control plane unreachable")
+	})
+	if err == nil || err.Error() != "tunnel: open session connection: control plane unreachable" {
+		t.Fatalf("ConnectSSHSession() error = %v, want the dial's error wrapped", err)
+	}
+	for i := 0; i < sshMaxConnsPerSession; i++ {
+		h.login(t, nil)
+	}
+}
+
+// Closing the session cancels a dial in flight, and nothing it started is left
+// running.
+func TestSSHSession_CloseCancelsDialInFlight(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	h := startSSHHarness(t, &fakeLauncher{}, nil)
+
+	dialing := make(chan struct{})
+	returned := make(chan error, 1)
+	go func() {
+		returned <- h.mgr.ConnectSSHSession(h.entry.SessionID, "in-flight", func(ctx context.Context) (net.Conn, error) {
+			close(dialing)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+	}()
+	awaitClosed(t, dialing, 3*time.Second, "the dial")
+	h.mgr.CloseSession(h.entry.SessionID, reasonDrained)
+
+	select {
+	case err := <-returned:
+		if !errors.Is(err, errSessionClosedWhileConnecting) {
+			t.Errorf("ConnectSSHSession() error = %v, want errSessionClosedWhileConnecting", err)
+		}
+	case <-time.After(drainTimeout + time.Second):
+		t.Fatal("ConnectSSHSession did not return after the session closed")
+	}
+}
+
+// A connection that opens after the session closed is closed again instead of
+// being served.
+func TestSSHSession_ConnectionOpenedAfterCloseIsClosed(t *testing.T) {
+	h := startSSHHarness(t, &fakeLauncher{}, nil)
+
+	var client net.Conn
+	dialing := make(chan struct{})
+	returned := make(chan error, 1)
+	go func() {
+		returned <- h.mgr.ConnectSSHSession(h.entry.SessionID, "late", func(ctx context.Context) (net.Conn, error) {
+			close(dialing)
+			<-ctx.Done()
+			server, c, err := connPair()
+			client = c
+			return server, err
+		})
+	}()
+	awaitClosed(t, dialing, 3*time.Second, "the dial")
+	h.mgr.CloseSession(h.entry.SessionID, reasonDrained)
+
+	if err := <-returned; !errors.Is(err, errSessionClosedWhileConnecting) {
+		t.Fatalf("ConnectSSHSession() error = %v, want errSessionClosedWhileConnecting", err)
+	}
+	defer client.Close()
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := client.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Errorf("read from the late connection = %v, want io.EOF: the session closed it", err)
+	}
+}
+
+// wsControlPlane is a stand-in for the control plane's node connection route.
+// serve runs on every connection it accepts; the connections close when the
+// test ends.
+func wsControlPlane(t *testing.T, serve func(ctx context.Context, c *websocket.Conn)) *api.ControlPlane {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { _ = c.CloseNow() }()
+			serve(ctx, c)
+		}()
+	}))
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+		srv.Close()
+	})
+	cp, err := api.NewControlPlane(api.Config{BaseURL: srv.URL}, "1.0.0-test", slog.Default())
+	if err != nil {
+		t.Fatalf("NewControlPlane() error: %v", err)
+	}
+	return cp
+}
+
+func connectOverWebSocket(t *testing.T, h *sshHarness, cp *api.ControlPlane, connectionID string) {
+	t.Helper()
+	err := h.mgr.ConnectSSHSession(h.entry.SessionID, connectionID, func(ctx context.Context) (net.Conn, error) {
+		return cp.OpenSessionConnection(ctx, "node-1", h.entry.SessionID, connectionID)
+	})
+	if err != nil {
+		t.Fatalf("ConnectSSHSession() error: %v", err)
+	}
+}
+
+// Closing a session does not wait on a control plane that never answers the
+// WebSocket close: the session's handlers drain within drainTimeout.
+func TestSSHSession_CloseDoesNotWaitForTheControlPlane(t *testing.T) {
+	h := startSSHHarness(t, &fakeLauncher{}, nil)
+	// The control plane's end never reads, so it never answers a close frame.
+	cp := wsControlPlane(t, func(ctx context.Context, _ *websocket.Conn) { <-ctx.Done() })
+	connectOverWebSocket(t, h, cp, "silent")
+	client := h.login(t, nil)
+	waitForCondition(t, 3*time.Second, func() bool { return strings.Contains(h.logs.String(), "ssh login accepted") })
+
+	start := time.Now()
+	h.mgr.CloseSession(h.entry.SessionID, reasonDrained)
+	if took := time.Since(start); took > drainTimeout+time.Second {
+		t.Errorf("CloseSession took %v, want at most %v", took, drainTimeout+time.Second)
+	}
+	if strings.Contains(h.logs.String(), "timed out waiting for ssh handlers to drain") {
+		t.Error("the handlers waited on the control plane's close past drainTimeout")
+	}
+	waited := make(chan struct{})
+	go func() {
+		_ = client.Wait()
+		close(waited)
+	}()
+	awaitClosed(t, waited, time.Second, "the other client's disconnect")
+}
+
+// The control plane's WebSocket pings keep its socket alive, not the session:
+// a connection that carries only pings idles out.
+func TestSSHSession_PingsDoNotHoldAnIdleSessionOpen(t *testing.T) {
+	h := startSSHHarness(t, &fakeLauncher{}, func(e *api.NodeStateSession) { e.IdleTimeoutSeconds = 1 })
+	mu, records := recordCloses(h.mgr)
+
+	var pongs atomic.Int32
+	cp := wsControlPlane(t, func(ctx context.Context, c *websocket.Conn) {
+		// A ping completes only once its pong is read, so the control plane
+		// reads, and discards the node's SSH version line, while it pings.
+		go func() {
+			for {
+				if _, _, err := c.Read(ctx); err != nil {
+					return
+				}
+			}
+		}()
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := c.Ping(ctx); err != nil {
+					return
+				}
+				pongs.Add(1)
+			}
+		}
+	})
+	connectOverWebSocket(t, h, cp, "pinged")
+
+	waitForCondition(t, 5*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(*records) == 1
+	})
+	mu.Lock()
+	reason := (*records)[0].reason
+	mu.Unlock()
+	if got := TerminatedByFromReason(reason); got != api.TerminatedByIdleTimeout {
+		t.Errorf("terminated_by = %q, want %q", got, api.TerminatedByIdleTimeout)
+	}
+	if n := pongs.Load(); n < 3 {
+		t.Errorf("the connection answered %d pings before the session idled out, want at least 3", n)
+	}
 }

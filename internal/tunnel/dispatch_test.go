@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"strconv"
@@ -1271,22 +1270,42 @@ func TestDispatcher_ProvisionsSSHEntry(t *testing.T) {
 	if got.SessionID != "sess-ssh" || got.Kind != api.SessionKindSSH || got.User != "ops" {
 		t.Errorf("started row = %+v, want the ssh entry for ops", got)
 	}
-	host, _, err := net.SplitHostPort(got.ListenerEndpoint)
-	if err != nil || host != "127.0.0.1" {
-		t.Fatalf("listener_endpoint = %q, want 127.0.0.1:<port>", got.ListenerEndpoint)
+	// An ssh session binds no listener, so its row names no endpoint: the
+	// control plane asks for each connection instead.
+	if got.ListenerEndpoint != "" {
+		t.Errorf("listener_endpoint = %q, want none", got.ListenerEndpoint)
 	}
+}
 
-	// The reported endpoint is the listener itself: it answers with the SSH
-	// identification line.
-	conn, err := net.DialTimeout("tcp", got.ListenerEndpoint, 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial the reported endpoint: %v", err)
+// An ssh entry's undelivered started row stays on the re-post path like a tcp
+// one, with no endpoint to keep stable.
+func TestDispatcher_UndeliveredSSHStartedRowIsReposted(t *testing.T) {
+	requireSSHSessions(t)
+	d, mgr, reporter, _ := newSSHTestDispatcher(t, Config{})
+	reporter.mu.Lock()
+	reporter.startedErr = errors.New("control plane unreachable")
+	reporter.mu.Unlock()
+
+	snapshot := sessionsSnapshot(sshEntry("sess-ssh", "ops", time.Now().Add(5*time.Minute)))
+	d.Handle(context.Background(), snapshot)
+	reporter.mu.Lock()
+	reporter.startedErr = nil
+	reporter.mu.Unlock()
+	d.Handle(context.Background(), snapshot)
+	d.Handle(context.Background(), snapshot)
+
+	if mgr.ActiveCount() != 1 {
+		t.Fatalf("expected ActiveCount()=1, got %d", mgr.ActiveCount())
 	}
-	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	banner := make([]byte, len("SSH-2.0-plexd"))
-	if _, err := io.ReadFull(conn, banner); err != nil || string(banner) != "SSH-2.0-plexd" {
-		t.Errorf("endpoint banner = %q (%v), want SSH-2.0-plexd", banner, err)
+	reporter.mu.Lock()
+	defer reporter.mu.Unlock()
+	if len(reporter.startedCalls) != 2 {
+		t.Fatalf("started rows = %d, want the undelivered one and its re-post", len(reporter.startedCalls))
+	}
+	for i, call := range reporter.startedCalls {
+		if call.SessionID != "sess-ssh" || call.ListenerEndpoint != "" {
+			t.Errorf("started row %d = %+v, want sess-ssh with no endpoint", i, call)
+		}
 	}
 }
 
