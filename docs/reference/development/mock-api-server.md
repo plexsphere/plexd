@@ -527,7 +527,7 @@ therefore hands the node the new key.
 | `peers` | 2 mesh peers (node_id ascending), no `psk`/`allowed_ips`; `...a0b1` carries `fallback_endpoint` and one `endpoint_candidates` entry (`192.0.2.10:51820`) but no direct `endpoint`, `...a0b2` only a direct `endpoint` |
 | `reachability` | `{"state":"never_reported", ...}` — the mock accepts heartbeats but never evaluates them into a projection |
 | `policy` | merged block: 2 rules, `fingerprint` from `policyFingerprint` |
-| `bridge.relay` | 1 relay session assignment (`relay-sess-001`) |
+| `bridge.relay` | `enabled: true`, `listen_port` 51820, 1 assignment for peer `...a0b1` at its fallback `203.0.113.1` port 51820 |
 | `bridge.user_access` | `enabled: true`, interface `wg-access0`, 1 peer |
 | `bridge.ingress` | `enabled: true`, 1 rule (`ingress-001`, port 443) |
 | `bridge.site_to_site` | `enabled: true`, 1 tunnel (`s2s-001`) |
@@ -543,6 +543,11 @@ holds its key, so no handshake ever completes, and on a device that came up the
 agent's endpoint selection switches it from the first entry to the second once
 the first times out. The [Docker e2e run](docker-e2e-test.md#phase-3-cont-endpoint-candidates-and-endpoint-selection)
 asserts that switch.
+
+The relay block's one assignment is peer `...a0b1`, whose `fallback_endpoint`
+`203.0.113.1:51820` names the relay. No Docker e2e phase reads the block,
+because the Docker suite runs node mode only, and a node outside bridge mode
+ignores it.
 
 The `fingerprint` is produced by the mock-internal `policyFingerprint` helper — a
 44-char base64 SHA-256 over the compact-JSON encoding of the rules slice. This
@@ -590,14 +595,13 @@ comparison key and never re-derives it from the rules.
   },
   "bridge": {
     "relay": {
-      "sessions": [
+      "enabled": true,
+      "listen_port": 51820,
+      "assignments": [
         {
-          "session_id": "relay-sess-001",
-          "peer_a_id": "peer-001",
-          "peer_a_endpoint": "203.0.113.1:51820",
-          "peer_b_id": "peer-003",
-          "peer_b_endpoint": "203.0.113.3:51820",
-          "expires_at": "2099-12-31T23:59:59Z"
+          "peer_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+          "fallback_endpoint": "203.0.113.1",
+          "fallback_endpoint_port": 51820
         }
       ]
     },
@@ -1445,7 +1449,7 @@ All responses use the same JSON field names as the types in `internal/api`:
 - `NodeStateSigningKey` — `internal/api.NodeStateSigningKey`
 - `Envelope` — `internal/api.Envelope`
 - `Peer` — `internal/api.Peer`
-- `RelayConfig` / `RelaySessionAssignment` — `internal/api.RelayConfig` / `internal/api.RelaySessionAssignment`
+- `RelayConfig` / `RelayAssignment` — `internal/api.RelayConfig` / `internal/api.RelayAssignment`
 - `UserAccessConfig` / `UserAccessPeer` — `internal/api.UserAccessConfig` / `internal/api.UserAccessPeer`
 - `IngressConfig` / `IngressRule` — `internal/api.IngressConfig` / `internal/api.IngressRule`
 - `SiteToSiteConfig` / `SiteToSiteTunnel` — `internal/api.SiteToSiteConfig` / `internal/api.SiteToSiteTunnel`

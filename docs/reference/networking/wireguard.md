@@ -340,21 +340,25 @@ A peer's order is `api.Peer.Endpoints`, or `Endpoint` alone when `Endpoints` is 
 
 #### The trial
 
-Each pass reads the device through [`MeshPeerStats`](#mesh-peer-stats) before it takes the manager's mutex. A read error, `ErrPeerStatsUnsupported` included, ends the pass with nothing written. A peer is fresh when the device reports a non-zero `LastHandshake` for it that is younger than 180 s: WireGuard rekeys a session it uses every two minutes and refuses one older than 180 s, so an older handshake says the path no longer carries traffic. One entry is tried for the keepalive interval plus 5 s, 30 s with the default keepalive. The pass walks the peers in node-ID order:
+Each pass reads the device through [`MeshPeerStats`](#mesh-peer-stats) before it takes the manager's mutex. A read error, `ErrPeerStatsUnsupported` included, ends the pass with nothing written. A peer is fresh when the device reports a non-zero `LastHandshake` for it that is younger than 180 s: WireGuard rekeys a session it uses every two minutes and refuses one older than 180 s, so an older handshake says the path no longer carries traffic. One entry is tried for the keepalive interval plus 5 s, 30 s with the default keepalive.
+
+The relay fallback is held longer. `api.Peer.Fallback` holds the peer's `fallback_endpoint` when that is the last entry of the order, and is empty otherwise. When the entry programmed sits at a position `idx` greater than 0, is the last entry, and equals `Fallback`, it is tried for `idx` times the trial instead of one trial: as long as the entries before it took together. Each side of a pair then spends at least half its cycle on the relay, so the relay windows of two peers behind hard NATs always overlap or touch. A two-entry order behaves as with one trial per entry, and a connected peer is never switched. A node on an older plexd keeps the 30 s trial on its fallback, and the [NAT relay](../bridge/nat-relay.md) serves it like any other peer.
+
+The pass walks the peers in node-ID order:
 
 | Peer | What the pass does |
 |---|---|
 | Fresh, not marked connected | Marks it connected and logs `wireguard: endpoint selected` with the endpoint the device reports, which may be one WireGuard roamed to |
 | Fresh, marked connected | Nothing |
-| Not fresh, marked connected | Clears the mark, restarts the timer and logs `wireguard: peer handshake went stale, resuming endpoint selection`. The entry on the device gets a full trial before the next switch |
-| Not fresh, not connected, with fewer than 2 entries or programmed less than the trial ago | Nothing |
-| Not fresh, not connected, trial over | Programs the next entry (after the last one, the first again), restarts the timer and logs `wireguard: trying next endpoint candidate` |
+| Not fresh, marked connected | Clears the mark, restarts the timer and logs `wireguard: peer handshake went stale, resuming endpoint selection`. The entry on the device gets its full trial, the hold for a held fallback, before the next switch |
+| Not fresh, not connected, with fewer than 2 entries or programmed less than the entry's trial ago | Nothing |
+| Not fresh, not connected, trial over | Programs the next entry (after the last one, the first again), restarts the timer and logs `wireguard: trying next endpoint candidate` with `trial`, how long it tries the entry it programmed: one trial, or the longer hold above for the fallback |
 
 A peer counts as connected while its latest handshake is younger than 180 s. Neither a pass nor `UpdatePeer` rewrites the device endpoint of a connected peer, so WireGuard roaming, a peer answering from another address, stays in effect.
 
-A failed switch logs `wireguard: endpoint switch failed`, leaves the peer on the entry still programmed, and joins `wireguard: switch endpoint of peer <node id>: <cause>` into the pass's error. The timer restarts all the same, so the next attempt at that entry follows a full trial later.
+A failed switch logs `wireguard: endpoint switch failed`, leaves the peer on the entry still programmed, and joins `wireguard: switch endpoint of peer <node id>: <cause>` into the pass's error. The timer restarts all the same, so the next attempt follows that entry's full trial later: one trial, or the hold when the peer is still on the held fallback.
 
-The trial depends on the keepalive. WireGuard starts a handshake only when it sends something, and the keepalive timer is what makes it send to an entry newly programmed on an idle peer. A switch happens on the first pass after the trial ran out, so up to one interval late. With the defaults, an order of ten entries, the contract's cap of eight candidates plus the direct endpoint and the fallback, reaches its fallback after about 270 s and has tried every entry after about 300 s. A restarted plexd starts every peer at the first entry again.
+The trial depends on the keepalive. WireGuard starts a handshake only when it sends something, and the keepalive timer is what makes it send to an entry newly programmed on an idle peer. A switch happens on the first pass after the trial ran out, so up to one interval late. With the defaults, an order of ten entries, the contract's cap of eight candidates plus the direct endpoint and the fallback, reaches its fallback after about 270 s, holds it for about 270 s, and returns to the first entry after about 540 s, one cycle. A restarted plexd starts every peer at the first entry again.
 
 #### RunEndpointSelection
 
@@ -387,7 +391,7 @@ All carry `component=wireguard`.
 | `Info` | `wireguard: endpoint selection unavailable, the controller cannot read peer stats` | none |
 | `Info` | `wireguard: endpoint selected` | `peer_id`, `endpoint` (empty when the device reports none) |
 | `Info` | `wireguard: peer handshake went stale, resuming endpoint selection` | `peer_id` |
-| `Info` | `wireguard: trying next endpoint candidate` | `peer_id`, `endpoint`, `attempt` (the entry's 1-based position), `of` (the order's length) |
+| `Info` | `wireguard: trying next endpoint candidate` | `peer_id`, `endpoint`, `attempt` (the entry's 1-based position), `of` (the order's length), `trial` (how long the entry just programmed is tried, such as `30s`, or `1m0s` for the fallback that ends a three-entry order) |
 | `Warn` | `wireguard: endpoint switch failed` | `peer_id`, `endpoint`, `error` |
 | `Warn` | `wireguard: endpoint selection pass failed` | `error` |
 
@@ -601,6 +605,7 @@ Adds and updates carry `api.SnapshotPeer` entries, converted to the WireGuard `a
 
 - `AllowedIPs` is derived locally as `mesh_ip/32`. The snapshot never sends allowed IPs. A `mesh_ip` that is not a bare IPv4 address fails the peer.
 - `Endpoints` is the dial order and `Endpoint` its first entry, empty for an empty order. The manager programs the first entry and [endpoint selection](#endpoint-selection) moves along the order until a handshake completes. See [Dial order](#dial-order).
+- `Fallback` is the peer's `fallback_endpoint` when that is the last entry of the order, and empty otherwise, such as for a peer without a fallback, or one whose fallback duplicates a candidate and keeps the candidate's earlier position. [Endpoint selection](#the-trial) holds this entry longer.
 - `PSK` is the key `psks.Lookup` returns for the peer's node ID and current `public_key`, base64-encoded. A PSK fetched for another public key is never returned, so a peer whose key changed gets no PSK until the store holds one for the new key. With no PSK the field stays empty, and the store writes the PSK through [`SetPeerPSK`](#installing-a-psk) once it arrives.
 
 Individual failures are logged and collected. The handler returns an aggregated error via `errors.Join` (nil if all succeed). This ensures the reconciler marks the cycle as failed and retries on the next tick.
@@ -680,7 +685,8 @@ plexd never decodes their payloads. The reconcile loop then pulls the snapshot, 
 `peerFromSnapshot(p api.SnapshotPeer, order []string, psk []byte) (api.Peer, error)`
 builds each programmed peer from a snapshot entry: `AllowedIPs` derived locally as
 `mesh_ip/32`, `Endpoints` set to the [dial order](#dial-order) and `Endpoint` to its
-first entry, and `psk` base64-encoded (none for a nil `psk`). The manager then adds,
+first entry, `Fallback` set to the `fallback_endpoint` when it ends the order, and
+`psk` base64-encoded (none for a nil `psk`). The manager then adds,
 updates, or removes peers so the interface matches the desired set, and
 [endpoint selection](#endpoint-selection) settles each peer's endpoint.
 

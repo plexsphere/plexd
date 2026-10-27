@@ -94,7 +94,7 @@ flowchart TD
 14. **Create log sources + forwarder** — platform log source (journald on Linux, the launchd log file on macOS, the Event Log on Windows), file sources from `file_patterns`, `logfwd.NewForwarder()`
 15. **Create audit sources + forwarder** — process source, `auditfwd.NewForwarder()`
 
-**Goroutines (10 in node mode, 11 in bridge mode):**
+**Goroutines (the same in node and bridge mode):**
 
 After initialization, goroutines are started via a `sync.WaitGroup`:
 
@@ -108,7 +108,8 @@ After initialization, goroutines are started via a `sync.WaitGroup`:
 8. **Audit Forwarder** — `auditForwarder.Run()` — collect and forward audit events
 9. **Peer Exchange** — `exchanger.Run()` — STUN discovery and endpoint exchange loop
 10. **Mesh Server** — `meshServer.Start()` — tunnel SSH server
-11. **Bridge Relay** (bridge mode only) — `bridgeMgr.StartRelay()` — UDP relay listener
+
+The bridge's NAT relay is not a startup goroutine. In bridge mode with `bridge.relay_enabled` set, the reconciler's `RelayReconcileHandler` starts it on the first cycle whose state pull enables it, and stops it when a pull disables it or the bridge tears down (see [NAT Relay](reference/bridge/nat-relay.md#relayreconcilehandler)).
 
 ## Shutdown Sequence
 
