@@ -7,11 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
+	"sync"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // Register sends a registration request to the control plane.
@@ -507,6 +511,88 @@ func (c *ControlPlane) DeleteStateReport(ctx context.Context, nodeID, key string
 func (c *ControlPlane) ReportSessionActivity(ctx context.Context, nodeID, sessionID string, req SessionActivityRequest) error {
 	path := fmt.Sprintf("/v1/nodes/%s/sessions/%s", url.PathEscape(nodeID), url.PathEscape(sessionID))
 	return c.doRequest(ctx, http.MethodPost, path, req, nil)
+}
+
+// errSessionConnectionUnnamed is returned by OpenSessionConnection for a call
+// that does not name the node, the session and the connection.
+var errSessionConnectionUnnamed = errors.New("api: open session connection: node_id, session_id and connection_id are required")
+
+// OpenSessionConnection opens the connection a session_connect event asked
+// for: a WebSocket, authenticated with the node's bearer, whose binary messages
+// carry the ssh session's SSH bytes in both directions. A refused upgrade comes
+// back as an *APIError with the status and the problem code, such as 404
+// session_connection_not_found once the request expired or 409
+// session_not_active for a session that ended. ctx bounds the handshake only;
+// the returned connection lives until Close. Read returns only the payload of
+// binary messages: pings are answered inside it, a normal close reads as
+// io.EOF, and a text message closes the connection and fails the read.
+// GET /v1/nodes/{node_id}/sessions/{session_id}/connections/{connection_id}
+//
+// DECISION: the handshake goes over the API client's own transport, so the
+// connection reaches the control plane the way every other call does, with the
+// same TLS settings, connect timeout and base URL. That transport sets its own
+// TLSClientConfig without ForceAttemptHTTP2 and so speaks HTTP/1.1, which the
+// WebSocket upgrade needs. The handshake context does not bound the connection,
+// which lives as long as a client stays attached to the session.
+func (c *ControlPlane) OpenSessionConnection(ctx context.Context, nodeID, sessionID, connectionID string) (net.Conn, error) {
+	// The upgrade builds its own request rather than going through newRequest,
+	// so it checks the refused-credential gate itself.
+	if err := c.refusedCredentialGate(ctx); err != nil {
+		return nil, err
+	}
+	if nodeID == "" || sessionID == "" || connectionID == "" {
+		return nil, errSessionConnectionUnnamed
+	}
+	path := fmt.Sprintf("/v1/nodes/%s/sessions/%s/connections/%s",
+		url.PathEscape(nodeID), url.PathEscape(sessionID), url.PathEscape(connectionID))
+
+	header := http.Header{}
+	if token := c.getAuthToken(); token != "" {
+		header.Set("Authorization", "Bearer "+token)
+	}
+	header.Set("User-Agent", userAgentPrefix+c.version)
+
+	// The shared client's Timeout would bound the handshake only, as ctx does;
+	// a copy without it leaves ctx the single bound.
+	client := *c.httpClient
+	client.Timeout = 0
+	conn, resp, err := websocket.Dial(ctx, c.baseURL+path, &websocket.DialOptions{
+		HTTPClient: &client,
+		HTTPHeader: header,
+	})
+	if err != nil {
+		// The dialer keeps the first 1024 bytes of a refused upgrade's body,
+		// enough for the problem document the code is read from.
+		if resp != nil && resp.StatusCode != http.StatusSwitchingProtocols {
+			return nil, fmt.Errorf("api: open session connection: %w", errorFromResponse(resp))
+		}
+		return nil, fmt.Errorf("api: open session connection: %w", err)
+	}
+	return &sessionConn{Conn: websocket.NetConn(context.Background(), conn, websocket.MessageBinary)}, nil
+}
+
+// sessionConn is the connection OpenSessionConnection returns.
+//
+// DECISION: Close returns at once and runs the WebSocket close on its own
+// goroutine. That close writes the close frame and then waits for the peer's,
+// up to 5 s each, and an ssh session closes its connections from a handler's
+// defer and from its own Close, which drainTimeout bounds: a control plane that
+// never answered would hold the connection's slot and the session's close for
+// that long. The close cancels pending reads and writes before the handshake,
+// so a blocked Read still returns promptly; cancelling a Read in flight closes
+// the socket, so the peer may see it end without the close frame.
+type sessionConn struct {
+	net.Conn
+	closeOnce sync.Once
+}
+
+// Close starts the close handshake with status 1000, once, and returns nil.
+// The frame is best effort: see the DECISION above.
+func (c *sessionConn) Close() error {
+	c.closeOnce.Do(func() {
+		go func() { _ = c.Conn.Close() }()
+	})
+	return nil
 }
 
 // ReportIntegrityViolations reports a batch of integrity violations to the

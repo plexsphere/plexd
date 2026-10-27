@@ -185,7 +185,10 @@ func (v *Ed25519Verifier) Verify(_ context.Context, env Envelope) error {
 	// re-requests a rotation the control plane rejects (409) when none is
 	// pending, and a replayed session_revoked can only close a session the
 	// control plane already revoked, which never becomes live again, so it finds
-	// nothing to close. This is a deliberate trade-off of the no-nonce contract,
+	// nothing to close. A replayed session_connect makes the node open a
+	// connection the control plane refuses with 404 session_connection_not_found
+	// once the request expired, and a login on any connection still needs the
+	// session token. This is a deliberate trade-off of the no-nonce contract,
 	// not an oversight; see docs/reference/core/event-verification.md.
 	return nil
 }

@@ -63,6 +63,14 @@ const (
 	// pull's sessions block stays the teardown for a revocation whose event
 	// never arrives.
 	EventSessionRevoked = "session_revoked"
+
+	// EventSessionConnect asks the node to open one connection for an ssh
+	// session it serves, in a SessionConnectRequest payload. The control plane
+	// sends it when a client attaches to the session, and
+	// tunnel.Dispatcher.SessionConnectHandler opens the connection with
+	// ControlPlane.OpenSessionConnection and serves the session's SSH login on
+	// it. It carries no desired state, so it triggers no reconcile.
+	EventSessionConnect = "session_connect"
 )
 
 // ---------------------------------------------------------------------------
