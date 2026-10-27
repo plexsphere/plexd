@@ -670,7 +670,17 @@ absence.
     ]
   },
   "bridge": {
-    "relay": { "sessions": [] },
+    "relay": {
+      "enabled": true,
+      "listen_port": 51820,
+      "assignments": [
+        {
+          "peer_node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+          "fallback_endpoint": "203.0.113.1",
+          "fallback_endpoint_port": 51820
+        }
+      ]
+    },
     "user_access": null,
     "ingress": null,
     "site_to_site": null
@@ -760,8 +770,28 @@ logs a refused `endpoint` at Warn and refused candidates at Debug.
 `fallback_endpoint` is not validated, since the contract allows a hostname
 there. A change of `endpoint`, `fallback_endpoint` or `endpoint_candidates`,
 the candidates' order included, is enough for the differ to update the peer.
+plexd tries each entry for one trial, the WireGuard keepalive plus 5 s, and
+holds the fallback longer: when `fallback_endpoint` is the last entry and other
+entries come before it, plexd tries it as long as those entries took together.
+Two nodes behind hard NATs are then on the relay at the same time. With the
+default keepalive, a ten-entry order reaches the fallback after about 270 s,
+stays on it for about 270 s, and starts over after about 540 s. A two-entry
+order behaves as before, and a connected peer is never switched.
 See [Dial order](../networking/wireguard.md#dial-order) and
 [Endpoint selection](../networking/wireguard.md#endpoint-selection).
+
+`bridge.relay` asks a bridge to relay WireGuard for the peers whose
+`fallback_endpoint` names it. A bridge listens only when its local
+[`bridge.relay_enabled`](configuration.md#bridge) is true and the block carries
+`enabled: true`. It then binds UDP `listen_port`, which is authoritative, and
+forwards among the peers of the same pull's `peers` block, routing each
+datagram by its WireGuard header. Without local consent it logs a Warn and
+opens no socket. A `null` block, or `enabled: false`, stops a running relay.
+`assignments` lists the peers that dial this bridge as their fallback, each as
+`peer_node_id` with the `fallback_endpoint` host and `fallback_endpoint_port`
+it dials. plexd decodes and carries it, and the relay does not read it. A change of `enabled`, `listen_port` or an assignment is bridge
+drift. A node outside bridge mode ignores the block. See
+[NAT Relay](../bridge/nat-relay.md).
 
 `reachability` is the control plane's own verdict about this node, derived from
 the heartbeats it has admitted. `state` is one of `healthy`, `stale`,

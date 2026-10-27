@@ -62,7 +62,7 @@ plexd up [--config /path/to/config.yaml] [--log-level debug]
 14. Create log sources + forwarder
 15. Create audit sources + forwarder
 
-**Goroutines (10 node mode, 11 bridge mode):** SSE, Heartbeat, Reconciler, Node API, Hook Watcher, Metrics, Log Forwarder, Audit Forwarder, Peer Exchange, Mesh Server, Bridge Relay (bridge mode only).
+**Goroutines (the same in node and bridge mode):** SSE, Heartbeat, Reconciler, Node API, Hook Watcher, Metrics, Log Forwarder, Audit Forwarder, Peer Exchange, Mesh Server. A bridge's NAT relay starts and stops from the reconciler when the state pull enables or disables it, not as a startup goroutine.
 
 **Shutdown:** On SIGTERM/SIGINT — cancel context, `sseMgr.Shutdown()`, `executor.Shutdown()`, mesh server shutdown, bridge teardowns (bridge mode), policy enforcer teardown, WireGuard teardown, wait for goroutines with 30s drain timeout.
 

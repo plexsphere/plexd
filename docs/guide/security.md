@@ -228,7 +228,7 @@ plexd requires the following network connectivity. All control plane communicati
 
 | Direction | Protocol | Port | Destination | Purpose |
 |---|---|---|---|---|
-| Inbound | UDP/51820 | 51820 | NAT relay clients | WireGuard relay for nodes behind symmetric NAT |
+| Inbound | UDP | pulled `listen_port` | NAT relay clients | WireGuard relay for nodes behind symmetric NAT, when `bridge.relay_enabled` is true and the control plane enables the relay. The control plane sets the port per bridge, in the state pull's `bridge.relay.listen_port`. See [NAT Relay](../reference/bridge/nat-relay.md) |
 | Inbound | TCP/443 | 443 | Public internet | Public ingress (if `ingress.enabled`) |
 | Inbound | UDP/51821 | 51821 | User access clients | WireGuard user access (if configured) |
 | Outbound | UDP/varies | - | Site-to-site peers | VPN tunnels to external networks |

@@ -70,6 +70,7 @@ SSE `peer_*` events.
 | `MeshIP`     | `string`   | `"mesh_ip"`    | Mesh IP address            |
 | `Endpoint`   | `string`   | `"endpoint"`   | First entry of `Endpoints`, or empty when the peer has no endpoint to dial |
 | `Endpoints`  | `[]string` | `"endpoints,omitempty"` | The peer's dial order: the endpoints the WireGuard manager tries one after another until a handshake completes (see [Dial order](../networking/wireguard.md#dial-order)) |
+| `Fallback`   | `string`   | `"fallback,omitempty"` | The peer's `fallback_endpoint` when it is the last entry of `Endpoints`, empty otherwise. Endpoint selection holds that entry as long as the entries before it took together (see [The trial](../networking/wireguard.md#the-trial)) |
 | `AllowedIPs` | `[]string` | `"allowed_ips"`| `mesh_ip/32`, derived locally |
 | `PSK`        | `string`   | `"psk"`        | Edge PSK fetched for the peer's current public key, standard base64; empty when plexd holds none |
 
@@ -221,16 +222,37 @@ A single inclusive destination port range (`from <= to`).
 **BridgeSnapshot**
 
 Carries the four bridge subtrees. Each child is present-but-nullable; there are
-no base fields on the wire. Inner shapes (`RelayConfig`, `UserAccessConfig`,
-`IngressConfig`, `SiteToSiteConfig`) are documented under
-[Bridge Mode](/reference/bridge/bridge-mode).
+no base fields on the wire. `RelayConfig` and `RelayAssignment` follow below; the
+other inner shapes (`UserAccessConfig`, `IngressConfig`, `SiteToSiteConfig`) are
+documented under [Bridge Mode](/reference/bridge/bridge-mode).
 
 | Field        | Type                | JSON Tag           | Description                     |
 |--------------|---------------------|--------------------|---------------------------------|
-| `Relay`      | `*RelayConfig`      | `"relay"`          | Relay session assignments       |
+| `Relay`      | `*RelayConfig`      | `"relay"`          | Relay request: whether this bridge relays, on which UDP port, and the peers whose fallback names it |
 | `UserAccess` | `*UserAccessConfig` | `"user_access"`    | User access configuration       |
 | `Ingress`    | `*IngressConfig`    | `"ingress"`        | Public ingress configuration    |
 | `SiteToSite` | `*SiteToSiteConfig` | `"site_to_site"`   | Site-to-site VPN configuration  |
+
+**RelayConfig**
+
+The `bridge.relay` block, the control plane's `NodeStateBridgeRelay`. A bridge
+relays only when its local `bridge.relay_enabled` is true and `Enabled` is true;
+it then listens on `ListenPort` and forwards among the peers of the same pull.
+See [NAT Relay](/reference/bridge/nat-relay).
+
+| Field         | Type                | JSON Tag          | Description                                  |
+|---------------|---------------------|-------------------|----------------------------------------------|
+| `Enabled`     | `bool`              | `"enabled"`       | Whether the control plane asks this bridge to relay |
+| `ListenPort`  | `int`               | `"listen_port"`   | UDP port the relay listens on; authoritative |
+| `Assignments` | `[]RelayAssignment` | `"assignments"`   | Peers whose `fallback_endpoint` names this bridge. Decoded and carried; the relay does not read it |
+
+**RelayAssignment**
+
+| Field                  | Type     | JSON Tag                   | Description                              |
+|------------------------|----------|----------------------------|------------------------------------------|
+| `PeerNodeID`           | `string` | `"peer_node_id"`           | Node ID of a peer whose fallback names this bridge |
+| `FallbackEndpoint`     | `string` | `"fallback_endpoint"`      | Host of the fallback that peer dials     |
+| `FallbackEndpointPort` | `int`    | `"fallback_endpoint_port"` | Port of the fallback that peer dials     |
 
 **NodeStateBlock**
 

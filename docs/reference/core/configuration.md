@@ -423,10 +423,7 @@ Gateway bridge mode operation. Active when `mode: bridge` and `bridge.enabled: t
 | `access_interface` | string | `eth1` | Access-side network interface. The kernel name on Linux and macOS (`eth1`, `en1`); on Windows the adapter's friendly name, as `Get-NetAdapter` lists it (`Ethernet`) |
 | `access_subnets` | []string | — | Subnets routable via the access interface |
 | `enable_nat` | bool | `true` | Enable NAT masquerading on the access interface. On macOS the masquerade is a `nat` rule in plexd's pf anchor; on Windows a WinNAT object scoped to the mesh prefix, which translates mesh-sourced traffic only. See [pf & WFP Firewall Controllers](../networking/pf-wfp-firewall.md#nat) |
-| `relay_enabled` | bool | `false` | Enable UDP relay for NAT traversal |
-| `relay_listen_port` | int | `51821` | Relay UDP listen port |
-| `max_relay_sessions` | int | `100` | Maximum concurrent relay sessions |
-| `session_ttl` | duration | `5m` | Relay session TTL |
+| `relay_enabled` | bool | `false` | Local consent to relay WireGuard for NAT traversal. The relay listens only when this is `true` and the state pull's `bridge.relay` block carries `enabled: true`, on the block's `listen_port`. Requires `enabled: true`. See [NAT Relay](../bridge/nat-relay.md#consent) |
 | `ingress_enabled` | bool | `false` | Enable public ingress |
 | `max_ingress_rules` | int | `20` | Maximum ingress rules |
 | `ingress_dial_timeout` | duration | `10s` | Timeout for dialing backend targets |
@@ -446,6 +443,8 @@ Gateway bridge mode operation. Active when `mode: bridge` and `bridge.enabled: t
 | `acme_allowed_hosts` | []string | — | Hostnames allowed for ACME certificates |
 | `acme_email` | string | — | ACME account contact email |
 | `acme_directory_url` | string | — | Override ACME directory URL (default: Let's Encrypt production) |
+
+The keys `relay_listen_port`, `max_relay_sessions` and `session_ttl` are removed: the relay's port comes from the state pull, and the relay keeps no session cap or session TTL. A config file that still sets them keeps loading, because unknown keys are ignored, and they have no effect. See [NAT Relay](../bridge/nat-relay.md).
 
 Source: `internal/bridge/config.go`
 

@@ -254,13 +254,13 @@ dispatcher.Register(api.EventBridgeConfigUpdated, bridge.HandleBridgeConfigUpdat
 
 ### Reconciliation Loop
 
-The bridge feature sub-handlers plug into `internal/reconcile` alongside the WireGuard and policy handlers. There is no longer a top-level bridge handler:
+The bridge feature sub-handlers plug into `internal/reconcile` alongside the WireGuard and policy handlers. There is no longer a top-level bridge handler. `plexd up` registers the relay handler whenever bridge mode runs, with `bridgeMgr.Relay()`, which is nil when `bridge.relay_enabled` is false; the handler then only warns when a pull enables the relay (see [NAT Relay](nat-relay.md#relayreconcilehandler)):
 
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
 r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
-r.RegisterHandler(bridge.RelayReconcileHandler(relay, logger))
+r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger)) // relay may be nil
 r.RegisterHandler(bridge.UserAccessReconcileHandler(uaMgr, logger))
 r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 r.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
