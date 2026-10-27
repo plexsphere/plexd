@@ -840,17 +840,21 @@ fi
 echo "=== Local endpoint delivery PASSED ==="
 
 # --- Mediated ssh session ---
-# An ssh entry in the sessions block makes plexd bind an SSH listener on its
-# mesh address and report it on a session_started row. A client logs in as the
-# entry's user with the session token as password, and plexd starts the
-# command through plexd-session-helper.socket, whose root helper verifies the
-# token again against the key it pinned from identity.json. The listener binds
-# the mesh address the mock assigns, so the client dials from inside the
-# container.
+# An ssh entry in the sessions block readies plexd's session listener for it,
+# which binds no port, and plexd reports a session_started row without a
+# listener_endpoint. Every login takes the path a console terminal takes
+# through the control plane: the client connects to a relay the mock opens
+# through /test/session-connect, the mock publishes a signed session_connect
+# event, plexd opens a WebSocket to the mock's connection route with its NSK
+# bearer and serves the session's SSH login on it, and the mock splices the
+# client to that socket. The client logs in as the entry's user with the
+# session token as password, and plexd starts the command through
+# plexd-session-helper.socket, whose root helper verifies the token again
+# against the key it pinned from identity.json. The client runs inside the
+# systemd container and dials the relay's port on the mock container.
 echo "=== Testing mediated ssh session ==="
 
 NODE_ID="0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3"
-MESH_IP="10.99.0.1"
 # One password prompt: a refused token then ends ssh with 255 and "Permission
 # denied" instead of sshpass giving up on the repeated prompt with its own 5.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
@@ -910,11 +914,35 @@ mint_session_token() {
     echo "${token}"
 }
 
-# Run one command over ssh from inside the container; stderr lands in SSH_ERR.
+# Open a relay to one session through the mock, as a client attaching to it
+# does, and print the port the relay listens on. Once a client connects to the
+# port, the relay publishes session_connect and waits 10 s for plexd's
+# connection before it closes the client. It runs inside a command
+# substitution, where fail would end only the subshell and its message would
+# land in the caller's variable, so a missing port is reported on stderr and
+# returned as 1.
+session_connect() {
+    local session_id=$1 port
+    port=$(curl -sf -X POST -H "Content-Type: application/json" \
+        -d "{\"session_id\": \"${session_id}\"}" \
+        "http://localhost:18080/test/session-connect" 2>/dev/null | jq -r '.port // empty' 2>/dev/null || true)
+    if [ -z "${port}" ]; then
+        echo "FAIL: POST /test/session-connect for ${session_id} answered no port" >&2
+        return 1
+    fi
+    echo "${port}"
+}
+
+# Run one command over ssh from inside the container, through a relay opened
+# for the session, so the login runs over a WebSocket plexd opened to the mock;
+# stderr lands in SSH_ERR. A relay that could not be opened returns 1, a status
+# no step expects of ssh.
 ssh_in_node() {
-    local token=$1 port=$2 user=$3 command=$4
+    local token=$1 session_id=$2 user=$3 command=$4 port
+    : >"${SSH_ERR}"
+    port=$(session_connect "${session_id}") || return 1
     docker exec -e SSHPASS="${token}" "${SYSTEMD_CONTAINER}" \
-        sshpass -e ssh "${SSH_OPTS[@]}" -p "${port}" "${user}@${MESH_IP}" "${command}" 2>"${SSH_ERR}"
+        sshpass -e ssh "${SSH_OPTS[@]}" -p "${port}" "${user}@${MOCKAPI_CONTAINER}" "${command}" 2>"${SSH_ERR}"
 }
 
 last_session_activity() {
@@ -926,33 +954,33 @@ SSH_EXPIRES_AT=$(date -u -d "+10 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || dat
 ROOT_ENTRY=$(ssh_session_entry "sess-e2e-ssh-root" "root" "${SSH_EXPIRES_AT}")
 USER_ENTRY=$(ssh_session_entry "sess-e2e-ssh-user" "e2e" "${SSH_EXPIRES_AT}")
 
-# Step 1: an entry for root brings up a listener on the mesh address.
+# Step 1: an entry for root readies its session, which binds no port, so its
+# session_started row carries no listener_endpoint.
 configure_sessions "ssh-root" "[${ROOT_ENTRY}]"
-ROOT_ENDPOINT=""
+ROOT_STARTED=""
 SSH_ELAPSED=0
 while [ "${SSH_ELAPSED}" -lt 60 ]; do
     BODY=$(last_session_activity)
     if [ "$(echo "${BODY}" | jq -r '.ssh.phase // empty' 2>/dev/null)" = "session_started" ]; then
-        ROOT_ENDPOINT=$(echo "${BODY}" | jq -r '.ssh.listener_endpoint // empty')
+        ROOT_STARTED=${BODY}
         break
     fi
     sleep 2
     SSH_ELAPSED=$((SSH_ELAPSED + 2))
 done
-if [ -z "${ROOT_ENDPOINT}" ]; then
+if [ -z "${ROOT_STARTED}" ]; then
     docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>/dev/null || true
     fail "no ssh session_started row within 60s of configuring the root entry"
 fi
-case "${ROOT_ENDPOINT}" in
-    "${MESH_IP}":*) echo "  PASS: ssh session_started row carries listener_endpoint ${ROOT_ENDPOINT}" ;;
-    *) fail "ssh listener_endpoint = '${ROOT_ENDPOINT}', want ${MESH_IP}:<port>" ;;
-esac
-ROOT_PORT=${ROOT_ENDPOINT##*:}
+if [ "$(echo "${ROOT_STARTED}" | jq '.ssh | has("listener_endpoint")')" != "false" ]; then
+    fail "the ssh session_started row ${ROOT_STARTED} carries listener_endpoint, want none"
+fi
+echo "  PASS: the ssh session_started row carries no listener_endpoint"
 
 # Step 2: log in as root with the session token and run one command.
 ROOT_TOKEN=$(mint_session_token "sess-e2e-ssh-root" "root")
 SSH_RC=0
-SSH_OUT=$(ssh_in_node "${ROOT_TOKEN}" "${ROOT_PORT}" root 'id -un') || SSH_RC=$?
+SSH_OUT=$(ssh_in_node "${ROOT_TOKEN}" "sess-e2e-ssh-root" root 'id -un') || SSH_RC=$?
 if [ "${SSH_RC}" -ne 0 ] || [ "${SSH_OUT}" != "root" ]; then
     cat "${SSH_ERR}"
     fail "ssh 'id -un' as root exited ${SSH_RC} and printed '${SSH_OUT}', want 0 and 'root'"
@@ -976,27 +1004,36 @@ else
     fail "session-signing-key mode '${PIN_MODE}' holds '${PIN_KEY}', want 644 and '${IDENTITY_KEY}'"
 fi
 
-# Step 4: a second entry for an unprivileged user gets its own listener, and the
-# helper switches to that user.
+# Step 4: a second entry for an unprivileged user gets a session of its own,
+# and the helper switches to that user. Started rows no longer carry an
+# endpoint to tell them apart, so the step waits for the activity counter to
+# rise past its value before the entry and checks that the newest row is an
+# ssh session_started.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+SSH_ACT_BEFORE=$(get_counter "${RESPONSE}" "session_activity_count")
 configure_sessions "ssh-user" "[${ROOT_ENTRY}, ${USER_ENTRY}]"
-USER_ENDPOINT=""
 SSH_ELAPSED=0
+SSH_ACT_AFTER=${SSH_ACT_BEFORE}
 while [ "${SSH_ELAPSED}" -lt 60 ]; do
-    BODY=$(last_session_activity)
-    ENDPOINT=$(echo "${BODY}" | jq -r 'select(.ssh.phase == "session_started") | .ssh.listener_endpoint // empty' 2>/dev/null || true)
-    if [ -n "${ENDPOINT}" ] && [ "${ENDPOINT}" != "${ROOT_ENDPOINT}" ]; then
-        USER_ENDPOINT=${ENDPOINT}
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    SSH_ACT_AFTER=$(get_counter "${RESPONSE}" "session_activity_count")
+    if [ "${SSH_ACT_AFTER}" -gt "${SSH_ACT_BEFORE}" ]; then
         break
     fi
     sleep 2
     SSH_ELAPSED=$((SSH_ELAPSED + 2))
 done
-if [ -z "${USER_ENDPOINT}" ]; then
-    fail "no second ssh session_started row within 60s of configuring the e2e entry"
+if [ "${SSH_ACT_AFTER}" -le "${SSH_ACT_BEFORE}" ]; then
+    fail "session_activity_count stayed at ${SSH_ACT_BEFORE} for 60s after configuring the e2e entry, want a session_started row"
 fi
+BODY=$(last_session_activity)
+if [ "$(echo "${BODY}" | jq -r '.ssh.phase // empty' 2>/dev/null)" != "session_started" ]; then
+    fail "last session activity = ${BODY}, want the ssh session_started row of the e2e entry"
+fi
+echo "  PASS: the e2e entry posted an ssh session_started row"
 USER_TOKEN=$(mint_session_token "sess-e2e-ssh-user" "e2e")
 SSH_RC=0
-SSH_OUT=$(ssh_in_node "${USER_TOKEN}" "${USER_ENDPOINT##*:}" e2e 'id -un') || SSH_RC=$?
+SSH_OUT=$(ssh_in_node "${USER_TOKEN}" "sess-e2e-ssh-user" e2e 'id -un') || SSH_RC=$?
 if [ "${SSH_RC}" -ne 0 ] || [ "${SSH_OUT}" != "e2e" ]; then
     cat "${SSH_ERR}"
     fail "ssh 'id -un' as e2e exited ${SSH_RC} and printed '${SSH_OUT}', want 0 and 'e2e'"
@@ -1006,7 +1043,7 @@ echo "  PASS: ssh 'id -un' printed e2e (the helper switched uid)"
 # Step 5: the exit status travels back, and a token for another session is
 # refused.
 SSH_RC=0
-ssh_in_node "${ROOT_TOKEN}" "${ROOT_PORT}" root 'exit 3' >/dev/null || SSH_RC=$?
+ssh_in_node "${ROOT_TOKEN}" "sess-e2e-ssh-root" root 'exit 3' >/dev/null || SSH_RC=$?
 if [ "${SSH_RC}" -eq 3 ]; then
     echo "  PASS: ssh 'exit 3' exited 3"
 else
@@ -1015,7 +1052,7 @@ else
 fi
 OTHER_TOKEN=$(mint_session_token "sess-e2e-other" "root")
 SSH_RC=0
-ssh_in_node "${OTHER_TOKEN}" "${ROOT_PORT}" root 'id -un' >/dev/null || SSH_RC=$?
+ssh_in_node "${OTHER_TOKEN}" "sess-e2e-ssh-root" root 'id -un' >/dev/null || SSH_RC=$?
 if [ "${SSH_RC}" -eq 255 ] && grep -q "Permission denied" "${SSH_ERR}"; then
     echo "  PASS: a token for another session was refused (exit 255, Permission denied)"
 else
@@ -1023,7 +1060,7 @@ else
     fail "a token for another session exited ${SSH_RC}, want 255 with 'Permission denied'"
 fi
 
-# Step 6: draining the block closes both listeners. Each session_ended row
+# Step 6: draining the block closes both sessions. Each session_ended row
 # posts for a session the mock already holds as revoked, which records the
 # ending row of such a session once, as the control plane does since
 # plexsphere/plexsphere#931: both are accepted and none is refused, as the tcp
@@ -1056,6 +1093,53 @@ if [ "$(echo "${BODY}" | jq -r '.ssh.phase // empty')" = "session_ended" ] && [ 
     echo "  PASS: the drain posted ssh session_ended rows with terminated_by plexd_close"
 else
     fail "last session activity = ${BODY}, want an ssh session_ended row with terminated_by plexd_close"
+fi
+
+# Step 7: a session_connect for the drained root session opens nothing. plexd
+# finds no live ssh session and logs why, so the relay waits out its 10 s for a
+# connection that never comes and closes the client, and ssh, which never saw
+# a server banner, exits 255.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+CONN_BEFORE=$(get_counter "${RESPONSE}" "session_connection_count")
+CONN_TIMEOUT_BEFORE=$(get_counter "${RESPONSE}" "session_connection_timeout_count")
+JOURNAL_SINCE=$(docker exec "${SYSTEMD_CONTAINER}" date '+%Y-%m-%d %H:%M:%S')
+SSH_RC=0
+ssh_in_node "${ROOT_TOKEN}" "sess-e2e-ssh-root" root 'id -un' >/dev/null || SSH_RC=$?
+if [ "${SSH_RC}" -ne 255 ]; then
+    cat "${SSH_ERR}"
+    fail "ssh through a relay for the drained root session exited ${SSH_RC}, want 255"
+fi
+echo "  PASS: ssh through a relay for the drained root session exited 255"
+# The relay counts its timeout before it closes the client, so the counter has
+# moved once ssh returns; the poll only covers an ssh that gave up early.
+CONN_ELAPSED=0
+CONN_TIMEOUT_AFTER=${CONN_TIMEOUT_BEFORE}
+CONN_AFTER=${CONN_BEFORE}
+while [ "${CONN_ELAPSED}" -lt 20 ]; do
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    CONN_TIMEOUT_AFTER=$(get_counter "${RESPONSE}" "session_connection_timeout_count")
+    CONN_AFTER=$(get_counter "${RESPONSE}" "session_connection_count")
+    if [ "${CONN_TIMEOUT_AFTER}" -ge $((CONN_TIMEOUT_BEFORE + 1)) ]; then
+        break
+    fi
+    sleep 2
+    CONN_ELAPSED=$((CONN_ELAPSED + 2))
+done
+if [ "${CONN_TIMEOUT_AFTER}" -ne $((CONN_TIMEOUT_BEFORE + 1)) ]; then
+    fail "session_connection_timeout_count went from ${CONN_TIMEOUT_BEFORE} to ${CONN_TIMEOUT_AFTER}, want +1"
+fi
+if [ "${CONN_AFTER}" -ne "${CONN_BEFORE}" ]; then
+    fail "session_connection_count went from ${CONN_BEFORE} to ${CONN_AFTER}, want it unchanged"
+fi
+echo "  PASS: the relay timed out (session_connection_timeout_count +1) and session_connection_count stayed ${CONN_BEFORE}"
+# A here-string, not a pipe: under pipefail, grep -q leaving early could fail
+# the writer of a long journal and read as no match.
+STEP7_JOURNAL=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager --since "${JOURNAL_SINCE}" 2>/dev/null || true)
+if grep -qF "session_connect names no live ssh session; not connecting" <<<"${STEP7_JOURNAL}"; then
+    echo "  PASS: plexd logged that the session_connect names no live ssh session"
+else
+    echo "${STEP7_JOURNAL}"
+    fail "journalctl -u plexd since ${JOURNAL_SINCE} lacks 'session_connect names no live ssh session; not connecting'"
 fi
 rm -f "${SSH_ERR}"
 
