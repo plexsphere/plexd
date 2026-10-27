@@ -1,7 +1,6 @@
 package bridge
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -30,7 +29,7 @@ func NewManager(ctrl RouteController, cfg Config, logger *slog.Logger) *Manager 
 
 	var relay *Relay
 	if cfg.RelayEnabled {
-		relay = NewRelay(cfg.RelayListenPort, cfg.MaxRelaySessions, cfg.SessionTTL, logger)
+		relay = NewRelay(logger)
 	}
 
 	return &Manager{
@@ -193,25 +192,11 @@ func (m *Manager) Teardown() error {
 	return errors.Join(errs...)
 }
 
-// Relay returns the relay instance, or nil if relay is not configured.
+// Relay returns the relay, or nil when local consent (Config.RelayEnabled) is
+// off. The relay runs only while the state pull enables it; see
+// RelayReconcileHandler.
 func (m *Manager) Relay() *Relay {
 	return m.relay
-}
-
-// StartRelay starts the relay UDP listener. No-op if relay is not configured.
-func (m *Manager) StartRelay(ctx context.Context) error {
-	if m.relay == nil {
-		return nil
-	}
-	return m.relay.Start(ctx)
-}
-
-// StopRelay stops the relay. No-op if relay is not configured.
-func (m *Manager) StopRelay() error {
-	if m.relay == nil {
-		return nil
-	}
-	return m.relay.Stop()
 }
 
 // UpdateRoutes computes the diff between current active routes and the desired
@@ -271,7 +256,7 @@ func (m *Manager) BridgeStatus() *api.BridgeInfo {
 		ActiveRoutes:    len(m.activeRoutes),
 	}
 	if m.relay != nil {
-		info.RelayEnabled = true
+		info.RelayEnabled = m.relay.Running()
 		info.ActiveRelaySessions = m.relay.ActiveCount()
 	}
 	return info
@@ -292,7 +277,6 @@ func (m *Manager) BridgeCapabilities() map[string]string {
 	}
 	if m.cfg.RelayEnabled {
 		caps["relay"] = "true"
-		caps["relay_listen_port"] = fmt.Sprintf("%d", m.cfg.RelayListenPort)
 	}
 	return caps
 }

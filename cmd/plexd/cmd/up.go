@@ -874,11 +874,12 @@ func runAgent(ctx context.Context) error {
 		return nil
 	})
 
-	// Register bridge reconcile handlers (conditional).
+	// Register bridge reconcile handlers (conditional). The relay handler runs
+	// whenever bridge mode does: the state pull starts and stops the relay,
+	// and with local consent off (a nil relay) the handler says that the
+	// control plane asks for one.
 	if bridgeMgr != nil {
-		if relay := bridgeMgr.Relay(); relay != nil {
-			reconciler.RegisterHandler(bridge.RelayReconcileHandler(relay, logger))
-		}
+		reconciler.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
 		if ingressMgr != nil {
 			reconciler.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 		}
@@ -1138,17 +1139,6 @@ func runAgent(ctx context.Context) error {
 			logger.Error("mesh server stopped", "error", err)
 		}
 	}()
-
-	// 26. Start bridge relay (bridge mode only).
-	if bridgeMgr != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := bridgeMgr.StartRelay(ctx); err != nil {
-				logger.Error("bridge relay stopped", "error", err)
-			}
-		}()
-	}
 
 	// Wait for shutdown signal.
 	<-ctx.Done()

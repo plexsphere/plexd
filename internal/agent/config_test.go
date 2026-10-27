@@ -293,6 +293,37 @@ func TestParseConfig_ActionsDisabledByFile(t *testing.T) {
 	}
 }
 
+// TestParseConfig_RemovedRelayKeys pins that a file written for an older
+// plexd keeps loading: the relay's port, session cap and TTL moved to the
+// state pull, and the keys that set them locally now have no effect.
+func TestParseConfig_RemovedRelayKeys(t *testing.T) {
+	yaml := `
+mode: bridge
+bridge:
+  enabled: true
+  access_interface: eth1
+  access_subnets: ["10.0.0.0/24"]
+  relay_enabled: true
+  relay_listen_port: 51821
+  max_relay_sessions: 100
+  session_ttl: 5m
+`
+	path := writeTemp(t, yaml)
+	cfg, found, err := ParseConfig(path)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true for an existing file")
+	}
+	if !cfg.Bridge.RelayEnabled {
+		t.Error("Bridge.RelayEnabled = false, want true")
+	}
+	if err := cfg.Bridge.Validate(); err != nil {
+		t.Errorf("Bridge.Validate() = %v, want nil", err)
+	}
+}
+
 func TestParseConfig_AbsentFile(t *testing.T) {
 	// The DaemonSet mounts the config as optional, so a missing file must yield
 	// a defaulted config that flags and environment overrides can complete.

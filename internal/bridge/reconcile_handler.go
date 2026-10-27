@@ -10,57 +10,42 @@ import (
 	"github.com/plexsphere/plexd/internal/reconcile"
 )
 
-// RelayReconcileHandler returns a reconcile.ReconcileHandler that reconciles
-// relay sessions to match the desired bridge relay subtree. Sessions not in the
-// desired state are removed; missing sessions are added. The handler is
-// presence-aware: a nil Bridge or nil Relay child means "not populated", so it
-// reconciles against an empty desired set and tears down stale sessions.
+// RelayReconcileHandler returns a reconcile.ReconcileHandler that runs the
+// relay the desired bridge.relay block asks for. relay is nil when local
+// consent, bridge.relay_enabled, is off.
+//
+// A nil Bridge or Relay child, or Enabled false, stops a running relay. With
+// Enabled true the relay is configured on ListenPort with the snapshot's
+// peers, so a bind failure fails the reconcile cycle and the next pull
+// retries it. With Enabled true and no relay, the handler only warns.
 func RelayReconcileHandler(relay *Relay, logger *slog.Logger) reconcile.ReconcileHandler {
 	return func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
 		if desired == nil {
 			return nil
 		}
 
-		var sessions []api.RelaySessionAssignment
-		if desired.Bridge != nil && desired.Bridge.Relay != nil {
-			sessions = desired.Bridge.Relay.Sessions
+		var block *api.RelayConfig
+		if desired.Bridge != nil {
+			block = desired.Bridge.Relay
 		}
-
-		// Build desired set keyed by SessionID.
-		desiredSet := make(map[string]api.RelaySessionAssignment, len(sessions))
-		for _, s := range sessions {
-			desiredSet[s.SessionID] = s
-		}
-
-		// Remove stale sessions.
-		currentIDs := relay.SessionIDs()
-		for _, id := range currentIDs {
-			if _, ok := desiredSet[id]; !ok {
-				relay.RemoveSession(id)
+		if block == nil || !block.Enabled {
+			if relay == nil || !relay.Running() {
+				return nil
 			}
-		}
-
-		// Add missing sessions.
-		currentSet := make(map[string]bool, len(currentIDs))
-		for _, id := range currentIDs {
-			currentSet[id] = true
-		}
-
-		var errs []error
-		for id, assignment := range desiredSet {
-			if currentSet[id] {
-				continue
+			if err := relay.Stop(); err != nil {
+				return err
 			}
-			if err := relay.AddSession(assignment); err != nil {
-				logger.Error("relay reconcile: add session failed",
-					"session_id", id,
-					"error", err,
-				)
-				errs = append(errs, err)
-			}
+			logger.Info("relay disabled by the control plane", "component", "bridge")
+			return nil
 		}
-
-		return errors.Join(errs...)
+		if relay == nil {
+			logger.Warn("relay: the control plane enables the relay, but bridge.relay_enabled is false",
+				"component", "bridge",
+				"listen_port", block.ListenPort,
+			)
+			return nil
+		}
+		return relay.Configure(block.ListenPort, desired.Peers)
 	}
 }
 

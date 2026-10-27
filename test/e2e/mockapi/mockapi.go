@@ -336,15 +336,16 @@ func newStateFixture() api.NodeStateSnapshot {
 			Rules:       rules,
 		},
 		Bridge: &api.BridgeSnapshot{
+			// The relay block's one assignment is peer ...a0b1, whose
+			// fallback_endpoint 203.0.113.1:51820 names the relay.
 			Relay: &api.RelayConfig{
-				Sessions: []api.RelaySessionAssignment{
+				Enabled:    true,
+				ListenPort: 51820,
+				Assignments: []api.RelayAssignment{
 					{
-						SessionID:     "relay-sess-001",
-						PeerAID:       "peer-001",
-						PeerAEndpoint: "203.0.113.1:51820",
-						PeerBID:       "peer-003",
-						PeerBEndpoint: "203.0.113.3:51820",
-						ExpiresAt:     time.Date(2099, 12, 31, 23, 59, 59, 0, time.UTC),
+						PeerNodeID:           "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+						FallbackEndpoint:     "203.0.113.1",
+						FallbackEndpointPort: 51820,
 					},
 				},
 			},

@@ -1070,20 +1070,23 @@ type BridgeInfo struct {
 	ActiveSiteToSiteTunnels int    `json:"active_site_to_site_tunnels"`
 }
 
-// RelayConfig is the relay configuration pushed from the control plane.
-// It contains the list of relay session assignments for this bridge node.
+// RelayConfig is the bridge.relay block of the state pull, the control
+// plane's NodeStateBridgeRelay. When Enabled is true and local consent
+// (bridge.relay_enabled) allows it, the bridge relays WireGuard on UDP
+// ListenPort among the peers the same pull lists. Assignments is carried as
+// the control plane sends it, and the relay does not read it.
 type RelayConfig struct {
-	Sessions []RelaySessionAssignment `json:"sessions"`
+	Enabled     bool              `json:"enabled"`
+	ListenPort  int               `json:"listen_port"`
+	Assignments []RelayAssignment `json:"assignments"`
 }
 
-// RelaySessionAssignment represents a relay session assigned by the control plane.
-type RelaySessionAssignment struct {
-	SessionID     string    `json:"session_id"`
-	PeerAID       string    `json:"peer_a_id"`
-	PeerAEndpoint string    `json:"peer_a_endpoint"`
-	PeerBID       string    `json:"peer_b_id"`
-	PeerBEndpoint string    `json:"peer_b_endpoint"`
-	ExpiresAt     time.Time `json:"expires_at"`
+// RelayAssignment is one entry of RelayConfig.Assignments: a peer whose
+// fallback names this bridge, and the fallback that peer dials.
+type RelayAssignment struct {
+	PeerNodeID           string `json:"peer_node_id"`
+	FallbackEndpoint     string `json:"fallback_endpoint"`
+	FallbackEndpointPort int    `json:"fallback_endpoint_port"`
 }
 
 // ---------------------------------------------------------------------------

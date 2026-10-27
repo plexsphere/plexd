@@ -5916,21 +5916,40 @@ func TestState_ReturnsRelayChild(t *testing.T) {
 	if state.Bridge == nil || state.Bridge.Relay == nil {
 		t.Fatal("Bridge.Relay is nil")
 	}
-	if len(state.Bridge.Relay.Sessions) != 1 {
-		t.Fatalf("len(Relay.Sessions) = %d, want 1", len(state.Bridge.Relay.Sessions))
+	relay := state.Bridge.Relay
+	if !relay.Enabled {
+		t.Error("Relay.Enabled = false, want true")
 	}
-	sess := state.Bridge.Relay.Sessions[0]
-	if sess.SessionID == "" {
-		t.Error("Relay.Sessions[0].SessionID is empty")
+	if relay.ListenPort != 51820 {
+		t.Errorf("Relay.ListenPort = %d, want 51820", relay.ListenPort)
 	}
-	if sess.PeerAID == "" || sess.PeerBID == "" {
-		t.Error("Relay.Sessions[0] has empty peer IDs")
+	if len(relay.Assignments) != 1 {
+		t.Fatalf("len(Relay.Assignments) = %d, want 1", len(relay.Assignments))
 	}
-	if sess.PeerAEndpoint == "" || sess.PeerBEndpoint == "" {
-		t.Error("Relay.Sessions[0] has empty peer endpoints")
+	a := relay.Assignments[0]
+	if a.PeerNodeID != "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1" {
+		t.Errorf("Relay.Assignments[0].PeerNodeID = %q, want 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", a.PeerNodeID)
 	}
-	if sess.ExpiresAt.IsZero() {
-		t.Error("Relay.Sessions[0].ExpiresAt is zero")
+	if a.FallbackEndpoint != "203.0.113.1" {
+		t.Errorf("Relay.Assignments[0].FallbackEndpoint = %q, want 203.0.113.1", a.FallbackEndpoint)
+	}
+	if a.FallbackEndpointPort != 51820 {
+		t.Errorf("Relay.Assignments[0].FallbackEndpointPort = %d, want 51820", a.FallbackEndpointPort)
+	}
+
+	// The assignment mirrors the fallback_endpoint of the peer it names.
+	found := false
+	for _, p := range state.Peers {
+		if p.NodeID != a.PeerNodeID {
+			continue
+		}
+		found = true
+		if want := a.FallbackEndpoint + ":" + strconv.Itoa(a.FallbackEndpointPort); p.FallbackEndpoint != want {
+			t.Errorf("peer %s fallback_endpoint = %q, want %q to match its relay assignment", p.NodeID, p.FallbackEndpoint, want)
+		}
+	}
+	if !found {
+		t.Errorf("no peer %s in the fixture, want the peer the relay assignment names", a.PeerNodeID)
 	}
 }
 

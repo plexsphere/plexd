@@ -7,10 +7,6 @@ import (
 )
 
 const (
-	DefaultRelayListenPort  = 51821
-	DefaultMaxRelaySessions = 100
-	DefaultSessionTTL       = 5 * time.Minute
-
 	DefaultUserAccessInterfaceName = "wg-access"
 	DefaultUserAccessListenPort    = 51822
 	DefaultMaxAccessPeers          = 50
@@ -40,21 +36,11 @@ type Config struct {
 	// nil means use default (true); explicit false disables NAT.
 	EnableNAT *bool `yaml:"enable_nat"`
 
-	// RelayEnabled controls whether the bridge node serves as a relay.
+	// RelayEnabled is the local consent to serve as a relay: the relay runs
+	// only while this is true and the state pull's bridge.relay block is
+	// enabled, on the port that block names.
 	// Default: false. Requires Enabled=true.
 	RelayEnabled bool `yaml:"relay_enabled"`
-
-	// RelayListenPort is the UDP port for relay traffic.
-	// Default: 51821
-	RelayListenPort int `yaml:"relay_listen_port"`
-
-	// MaxRelaySessions is the maximum number of concurrent relay sessions.
-	// Default: 100
-	MaxRelaySessions int `yaml:"max_relay_sessions"`
-
-	// SessionTTL is the time-to-live for relay sessions.
-	// Default: 5m. Minimum: 30s.
-	SessionTTL time.Duration `yaml:"session_ttl"`
 
 	// UserAccessEnabled controls whether user access integration is active.
 	// Default: false. Requires Enabled=true.
@@ -150,15 +136,6 @@ func (c *Config) natEnabled() bool {
 // ApplyDefaults sets default values for zero-valued fields.
 func (c *Config) ApplyDefaults() {
 	// EnableNAT is handled via natEnabled(); nil means default true.
-	if c.RelayListenPort == 0 {
-		c.RelayListenPort = DefaultRelayListenPort
-	}
-	if c.MaxRelaySessions == 0 {
-		c.MaxRelaySessions = DefaultMaxRelaySessions
-	}
-	if c.SessionTTL == 0 {
-		c.SessionTTL = DefaultSessionTTL
-	}
 	if c.UserAccessInterfaceName == "" {
 		c.UserAccessInterfaceName = DefaultUserAccessInterfaceName
 	}
@@ -212,17 +189,6 @@ func (c *Config) Validate() error {
 	for _, subnet := range c.AccessSubnets {
 		if _, _, err := net.ParseCIDR(subnet); err != nil {
 			return fmt.Errorf("bridge: config: invalid CIDR %q: %w", subnet, err)
-		}
-	}
-	if c.RelayEnabled {
-		if c.RelayListenPort < 1 || c.RelayListenPort > 65535 {
-			return fmt.Errorf("bridge: config: RelayListenPort must be between 1 and 65535")
-		}
-		if c.MaxRelaySessions <= 0 {
-			return fmt.Errorf("bridge: config: MaxRelaySessions must be positive when relay is enabled")
-		}
-		if c.SessionTTL < 30*time.Second {
-			return fmt.Errorf("bridge: config: SessionTTL must be at least 30s")
 		}
 	}
 	if c.UserAccessEnabled {

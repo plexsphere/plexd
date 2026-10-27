@@ -488,7 +488,11 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 			},
 		},
 		Bridge: &BridgeSnapshot{
-			Relay: &RelayConfig{Sessions: []RelaySessionAssignment{{SessionID: "r1", ExpiresAt: now}}},
+			Relay: &RelayConfig{
+				Enabled:     true,
+				ListenPort:  51821,
+				Assignments: []RelayAssignment{{PeerNodeID: "n-002", FallbackEndpoint: "1.2.3.4", FallbackEndpointPort: 51820}},
+			},
 		},
 		State: &NodeStateBlock{
 			Metadata: []StateEntry{{Key: "region", Value: "us-east"}},
@@ -1339,64 +1343,62 @@ func TestTypesBridgeInfo(t *testing.T) {
 	requireEqual(t, relay, gotRelay)
 }
 
+// TestRelayConfig_JSONRoundTrip pins the bridge.relay block in the control
+// plane's NodeStateBridgeRelay shape: a populated block decodes field for field
+// and re-encodes to the same bytes, an empty assignment list stays an empty
+// list, and a null block is no relay at all.
 func TestRelayConfig_JSONRoundTrip(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := RelayConfig{
-		Sessions: []RelaySessionAssignment{
-			{
-				SessionID:     "relay-001",
-				PeerAID:       "n-001",
-				PeerAEndpoint: "1.2.3.4:51820",
-				PeerBID:       "n-002",
-				PeerBEndpoint: "5.6.7.8:51820",
-				ExpiresAt:     now.Add(1 * time.Hour),
-			},
-			{
-				SessionID:     "relay-002",
-				PeerAID:       "n-003",
-				PeerAEndpoint: "9.10.11.12:51820",
-				PeerBID:       "n-004",
-				PeerBEndpoint: "13.14.15.16:51820",
-				ExpiresAt:     now.Add(2 * time.Hour),
-			},
-		},
-	}
-	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// Verify snake_case key.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := raw["sessions"]; !ok {
-		t.Errorf("expected JSON key %q", "sessions")
-	}
-}
-
-func TestRelaySessionAssignment_JSONRoundTrip(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	orig := RelaySessionAssignment{
-		SessionID:     "relay-001",
-		PeerAID:       "n-001",
-		PeerAEndpoint: "1.2.3.4:51820",
-		PeerBID:       "n-002",
-		PeerBEndpoint: "5.6.7.8:51820",
-		ExpiresAt:     now.Add(1 * time.Hour),
-	}
-	data, got := roundTrip(t, orig)
-	requireEqual(t, orig, got)
-
-	// Verify snake_case keys.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-	for _, key := range []string{"session_id", "peer_a_id", "peer_a_endpoint", "peer_b_id", "peer_b_endpoint", "expires_at"} {
-		if _, ok := raw[key]; !ok {
-			t.Errorf("expected JSON key %q", key)
+	t.Run("populated block", func(t *testing.T) {
+		const block = `{"enabled":true,"listen_port":51821,"assignments":[{"peer_node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","fallback_endpoint":"203.0.113.50","fallback_endpoint_port":51821}]}`
+		var got RelayConfig
+		if err := json.Unmarshal([]byte(block), &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
 		}
-	}
+		want := RelayConfig{
+			Enabled:    true,
+			ListenPort: 51821,
+			Assignments: []RelayAssignment{
+				{PeerNodeID: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1", FallbackEndpoint: "203.0.113.50", FallbackEndpointPort: 51821},
+			},
+		}
+		if got.Enabled != want.Enabled || got.ListenPort != want.ListenPort || !slices.Equal(got.Assignments, want.Assignments) {
+			t.Errorf("decoded = %#v, want %#v", got, want)
+		}
+
+		out, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if string(out) != block {
+			t.Errorf("re-encoded block differs\nwant: %s\n got: %s", block, out)
+		}
+	})
+
+	t.Run("disabled block without assignments", func(t *testing.T) {
+		var got RelayConfig
+		if err := json.Unmarshal([]byte(`{"enabled":false,"listen_port":51821,"assignments":[]}`), &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got.Enabled {
+			t.Error("Enabled = true, want false")
+		}
+		if got.ListenPort != 51821 {
+			t.Errorf("ListenPort = %d, want 51821", got.ListenPort)
+		}
+		if got.Assignments == nil || len(got.Assignments) != 0 {
+			t.Errorf("Assignments = %#v, want empty non-nil slice", got.Assignments)
+		}
+	})
+
+	t.Run("null relay block", func(t *testing.T) {
+		var got BridgeSnapshot
+		if err := json.Unmarshal([]byte(`{"relay":null,"user_access":null,"ingress":null,"site_to_site":null}`), &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got.Relay != nil {
+			t.Errorf("Relay = %+v, want a nil pointer", got.Relay)
+		}
+	})
 }
 
 func TestBridgeInfo_RelayFields_JSONRoundTrip(t *testing.T) {

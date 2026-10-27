@@ -266,8 +266,11 @@ func TestComputeDiff_PolicyPopulatedToNull(t *testing.T) {
 }
 
 func TestComputeDiff_BridgeTransitions(t *testing.T) {
-	populated := &api.BridgeSnapshot{Relay: &api.RelayConfig{Sessions: []api.RelaySessionAssignment{{SessionID: "r1"}}}}
-	changed := &api.BridgeSnapshot{Relay: &api.RelayConfig{Sessions: []api.RelaySessionAssignment{{SessionID: "r2"}}}}
+	// The two relay blocks share Enabled and Assignments and differ only in
+	// listen_port, so the deep change below is a listen_port change.
+	assignments := []api.RelayAssignment{{PeerNodeID: "p1", FallbackEndpoint: "203.0.113.1", FallbackEndpointPort: 51820}}
+	populated := &api.BridgeSnapshot{Relay: &api.RelayConfig{Enabled: true, ListenPort: 51820, Assignments: assignments}}
+	changed := &api.BridgeSnapshot{Relay: &api.RelayConfig{Enabled: true, ListenPort: 51821, Assignments: assignments}}
 
 	tests := []struct {
 		name    string

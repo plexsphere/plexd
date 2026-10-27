@@ -1,316 +1,623 @@
 package bridge
 
 import (
-	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
+	"slices"
 	"sync"
 	"time"
+
+	"golang.zx2c4.com/wireguard/device"
+	"golang.zx2c4.com/wireguard/ratelimiter"
 
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// RelaySession represents a relay session forwarding UDP packets between two peers.
-type RelaySession struct {
-	SessionID string
-	PeerAAddr *net.UDPAddr
-	PeerBAddr *net.UDPAddr
+const (
+	// relayFanoutWindow is how long the source of a pending initiation keeps
+	// receiving the initiations the relay cannot place. It is no longer than
+	// the 30 s Linux conntrack timeout for an unanswered UDP flow, so the
+	// initiator's NAT mapping is still open.
+	relayFanoutWindow = 30 * time.Second
 
-	conn   *net.UDPConn // shared relay socket
+	// relayFanoutMax is the most sources one initiation is fanned out to.
+	relayFanoutMax = 8
+
+	// relayIndexTTL is WireGuard's RejectAfterTime: no session outlives it
+	// without a new handshake. A session index unused for this long is
+	// dropped, and a peer address not seen for this long is no longer fresh.
+	relayIndexTTL = 180 * time.Second
+
+	// relaySweepInterval is how often the sweeper deletes expired indices.
+	relaySweepInterval = 30 * time.Second
+
+	// relayMaxIndices caps the index table.
+	relayMaxIndices = 1 << 16
+
+	// relayFullWarnInterval is the least time between two "relay: index table
+	// full" lines.
+	relayFullWarnInterval = time.Minute
+
+	relayBufSize = 65535
+)
+
+// relayConn is the part of *net.UDPConn the relay uses, so a test can inject
+// read and write errors.
+type relayConn interface {
+	ReadFromUDPAddrPort(b []byte) (int, netip.AddrPort, error)
+	WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error)
+	LocalAddr() net.Addr
+	Close() error
+}
+
+// handshakeLimiter is the part of ratelimiter.Ratelimiter the relay uses.
+// Every loopback socket in a test shares one source IP, so tests that send
+// more handshake messages than the burst swap it out.
+type handshakeLimiter interface {
+	Allow(ip netip.Addr) bool
+	Close()
+}
+
+// relayPeer is a peer the state pull lists: its node ID, the mac1 checker
+// keyed to its public key, and the address the relay last attributed one of
+// its datagrams to.
+type relayPeer struct {
+	nodeID  string
+	checker *device.CookieChecker
+	addr    netip.AddrPort
+	seen    time.Time
+}
+
+// relayIndex is a WireGuard session index the relay saw. A pending index is
+// the sender index of an initiation: partner is the peer whose key verified
+// its mac1, and src the initiator's source address, since the initiator is
+// not known yet. A session index is one side of a handshake the relay
+// forwarded: owner is the peer that chose the index, so datagrams naming it
+// as receiver go to owner, and partner is the other side.
+type relayIndex struct {
+	pending bool
+	owner   *relayPeer
+	partner *relayPeer
+	src     netip.AddrPort
+	used    time.Time
+}
+
+// relayRun is one bound socket and the goroutines serving it.
+type relayRun struct {
+	conn    relayConn
+	port    int
+	limiter handshakeLimiter
+
+	stop       chan struct{} // closed to end the sweeper
+	dispatched chan struct{} // closed when the dispatch loop returns
+	swept      chan struct{} // closed when the sweeper returns
+}
+
+// Relay forwards WireGuard between the peers of a state pull through one UDP
+// socket. It works out each datagram's destination from the WireGuard message
+// header: an initiation goes to the peer whose public key verifies its mac1,
+// every other message by its receiver index. It holds no private or
+// preshared key, decrypts nothing, and never answers a datagram.
+type Relay struct {
 	logger *slog.Logger
 
-	mu     sync.Mutex
-	closed bool
+	// Seams, replaced by tests before the first Configure.
+	listen     func(port int) (relayConn, error)
+	newLimiter func() handshakeLimiter
+	now        func() time.Time
+	maxIndices int
+
+	// life serializes Configure and Stop, so a start and a stop never
+	// interleave.
+	life sync.Mutex
+
+	// mu guards run, peers, indices and fullWarnedAt.
+	mu           sync.Mutex
+	run          *relayRun
+	peers        map[device.NoisePublicKey]*relayPeer
+	indices      map[uint32]*relayIndex
+	fullWarnedAt time.Time
 }
 
-// Forward sends data to the peer that is NOT the source.
-// If srcAddr matches PeerA, forward to PeerB and vice versa.
-// Packets from unknown sources are dropped.
-func (s *RelaySession) Forward(srcAddr *net.UDPAddr, data []byte) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return
-	}
-	s.mu.Unlock()
-
-	var dst *net.UDPAddr
-	switch srcAddr.String() {
-	case s.PeerAAddr.String():
-		dst = s.PeerBAddr
-	case s.PeerBAddr.String():
-		dst = s.PeerAAddr
-	default:
-		s.logger.Debug("relay: dropping packet from unknown source",
-			"component", "bridge",
-			"session_id", s.SessionID,
-			"source", srcAddr.String(),
-		)
-		return
-	}
-
-	if _, err := s.conn.WriteToUDP(data, dst); err != nil {
-		s.logger.Error("relay: forward failed",
-			"component", "bridge",
-			"session_id", s.SessionID,
-			"dst", dst.String(),
-			"error", err,
-		)
-	}
-}
-
-// Close marks the session as closed. Idempotent.
-func (s *RelaySession) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil
-	}
-	s.closed = true
-	s.logger.Info("relay session closed",
-		"component", "bridge",
-		"session_id", s.SessionID,
-	)
-	return nil
-}
-
-// Relay manages a UDP listener and relay sessions.
-type Relay struct {
-	listenPort  int
-	maxSessions int
-	sessionTTL  time.Duration
-	logger      *slog.Logger
-
-	mu        sync.RWMutex
-	conn      *net.UDPConn
-	sessions  map[string]*RelaySession
-	addrIndex map[string]*RelaySession // srcAddr.String() -> session for O(1) lookup
-	timers    map[string]*time.Timer   // TTL timers per session
-	active    bool
-}
-
-// NewRelay creates a new Relay.
-func NewRelay(listenPort, maxSessions int, sessionTTL time.Duration, logger *slog.Logger) *Relay {
+// NewRelay returns a relay that is not running. It opens no socket; Configure
+// starts it.
+func NewRelay(logger *slog.Logger) *Relay {
 	return &Relay{
-		listenPort:  listenPort,
-		maxSessions: maxSessions,
-		sessionTTL:  sessionTTL,
-		logger:      logger.With("component", "bridge"),
-		sessions:    make(map[string]*RelaySession),
-		addrIndex:   make(map[string]*RelaySession),
-		timers:      make(map[string]*time.Timer),
+		logger:     logger.With("component", "bridge"),
+		listen:     listenRelay,
+		newLimiter: newHandshakeLimiter,
+		now:        time.Now,
+		maxIndices: relayMaxIndices,
+		peers:      make(map[device.NoisePublicKey]*relayPeer),
+		indices:    make(map[uint32]*relayIndex),
 	}
 }
 
-// Start opens a UDP socket and begins the dispatch loop.
-func (r *Relay) Start(ctx context.Context) error {
-	addr := &net.UDPAddr{IP: net.IPv4zero, Port: r.listenPort}
-	conn, err := net.ListenUDP("udp4", addr)
+// listenRelay binds UDP port on the dual-stack wildcard address.
+func listenRelay(port int) (relayConn, error) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
 	if err != nil {
-		return fmt.Errorf("bridge: relay: listen on :%d: %w", r.listenPort, err)
+		return nil, err
 	}
+	return conn, nil
+}
+
+// newHandshakeLimiter returns wireguard-go's handshake rate limiter, 20
+// messages per second per source IP with a burst of 5.
+func newHandshakeLimiter() handshakeLimiter {
+	l := new(ratelimiter.Ratelimiter)
+	l.Init()
+	return l
+}
+
+// Configure runs the relay on UDP listenPort and forwards among peers. A
+// relay running on another port is stopped first; a relay not running is
+// started. The peer set is then replaced: a peer whose node ID and public key
+// are unchanged keeps its learned address, a new or re-keyed peer starts
+// fresh, and a peer no longer listed is deleted with every index that names
+// it. A peer with an invalid or a repeated public key is skipped with a Warn.
+// A repeated call with the same port and peers changes nothing.
+func (r *Relay) Configure(listenPort int, peers []api.SnapshotPeer) error {
+	if listenPort < 1 || listenPort > 65535 {
+		return fmt.Errorf("bridge: relay: listen_port %d out of range", listenPort)
+	}
+
+	r.life.Lock()
+	defer r.life.Unlock()
 
 	r.mu.Lock()
-	r.conn = conn
-	r.active = true
+	run := r.run
 	r.mu.Unlock()
-
-	r.logger.Info("relay started",
-		"listen_port", r.listenPort,
-	)
-
-	go r.dispatchLoop(ctx, conn)
+	if run != nil && run.port != listenPort {
+		r.stopLocked()
+		run = nil
+	}
+	if run == nil {
+		if err := r.start(listenPort); err != nil {
+			return err
+		}
+	}
+	r.setPeers(peers)
 	return nil
 }
 
-const relayBufSize = 65535
+// start binds port and starts the dispatch loop and the sweeper. Callers
+// hold r.life.
+func (r *Relay) start(port int) error {
+	conn, err := r.listen(port)
+	if err != nil {
+		return fmt.Errorf("bridge: relay: listen on :%d: %w", port, err)
+	}
+	run := &relayRun{
+		conn:       conn,
+		port:       port,
+		limiter:    r.newLimiter(),
+		stop:       make(chan struct{}),
+		dispatched: make(chan struct{}),
+		swept:      make(chan struct{}),
+	}
+	r.mu.Lock()
+	r.run = run
+	r.mu.Unlock()
 
-func (r *Relay) dispatchLoop(ctx context.Context, conn *net.UDPConn) {
-	buf := make([]byte, relayBufSize)
+	go r.dispatchLoop(run)
+	go r.sweepLoop(run)
 
-	go func() {
-		<-ctx.Done()
-		conn.Close()
-	}()
+	r.logger.Info("relay started", "listen_port", port)
+	return nil
+}
 
-	for {
-		n, srcAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			return // conn closed
-		}
+// Stop closes the socket, ends the dispatch loop and the sweeper, closes the
+// rate limiter and clears all state. Stopping a relay that is not running
+// returns nil and logs nothing.
+func (r *Relay) Stop() error {
+	r.life.Lock()
+	defer r.life.Unlock()
+	r.stopLocked()
+	return nil
+}
 
-		r.mu.RLock()
-		session, ok := r.addrIndex[srcAddr.String()]
-		r.mu.RUnlock()
+// stopLocked is Stop for a caller holding r.life. It releases r.mu before it
+// waits, because the dispatch loop takes r.mu for every datagram.
+func (r *Relay) stopLocked() {
+	r.mu.Lock()
+	run := r.run
+	r.run = nil
+	r.mu.Unlock()
+	if run == nil {
+		return
+	}
 
-		if !ok {
-			r.logger.Debug("relay: packet from unregistered address",
-				"source", srcAddr.String(),
-			)
+	// A close error leaves nothing to undo: the dispatch loop ends on the
+	// next read either way.
+	_ = run.conn.Close()
+	close(run.stop)
+	<-run.dispatched
+	<-run.swept
+	// Only now that the dispatch loop is gone: Close panics when called twice,
+	// and Allow after Close can panic.
+	run.limiter.Close()
+
+	r.mu.Lock()
+	r.peers = make(map[device.NoisePublicKey]*relayPeer)
+	r.indices = make(map[uint32]*relayIndex)
+	r.fullWarnedAt = time.Time{}
+	r.mu.Unlock()
+
+	r.logger.Info("relay stopped", "listen_port", run.port)
+}
+
+// Running reports whether the relay has a socket bound.
+func (r *Relay) Running() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.run != nil
+}
+
+// ListenAddr returns the local address of the relay socket, or nil while the
+// relay is not running.
+func (r *Relay) ListenAddr() net.Addr {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.run == nil {
+		return nil
+	}
+	return r.run.conn.LocalAddr()
+}
+
+// ActiveCount returns the number of distinct unordered peer pairs among the
+// session indices used within relayIndexTTL.
+func (r *Relay) ActiveCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.now()
+	pairs := make(map[[2]string]struct{})
+	for _, idx := range r.indices {
+		if idx.pending || now.Sub(idx.used) >= relayIndexTTL {
 			continue
 		}
+		pair := [2]string{idx.owner.nodeID, idx.partner.nodeID}
+		if pair[0] > pair[1] {
+			pair[0], pair[1] = pair[1], pair[0]
+		}
+		pairs[pair] = struct{}{}
+	}
+	return len(pairs)
+}
 
-		data := make([]byte, n)
-		copy(data, buf[:n])
+// setPeers replaces the peer set from peers; see Configure.
+func (r *Relay) setPeers(peers []api.SnapshotPeer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-		session.Forward(srcAddr, data)
+	next := make(map[device.NoisePublicKey]*relayPeer, len(peers))
+	for _, p := range peers {
+		key, ok := decodeRelayKey(p.PublicKey)
+		if !ok {
+			r.logger.Warn("relay: skipping peer with invalid public key", "peer_id", p.NodeID)
+			continue
+		}
+		if _, dup := next[key]; dup {
+			r.logger.Warn("relay: skipping peer with duplicate public key", "peer_id", p.NodeID)
+			continue
+		}
+		if old, ok := r.peers[key]; ok && old.nodeID == p.NodeID {
+			next[key] = old
+			continue
+		}
+		peer := &relayPeer{nodeID: p.NodeID, checker: new(device.CookieChecker)}
+		peer.checker.Init(key)
+		next[key] = peer
+	}
+
+	kept := make(map[*relayPeer]bool, len(next))
+	for _, p := range next {
+		kept[p] = true
+	}
+	for i, idx := range r.indices {
+		if (idx.owner != nil && !kept[idx.owner]) || (idx.partner != nil && !kept[idx.partner]) {
+			delete(r.indices, i)
+		}
+	}
+	r.peers = next
+}
+
+// decodeRelayKey decodes a public key from standard base64 of 32 bytes.
+func decodeRelayKey(s string) (device.NoisePublicKey, bool) {
+	var key device.NoisePublicKey
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil || len(b) != len(key) {
+		return key, false
+	}
+	copy(key[:], b)
+	return key, true
+}
+
+// dispatchLoop reads datagrams from run's socket into one buffer, works out
+// their destinations under r.mu, and writes them after releasing it. It ends
+// when the socket is closed.
+func (r *Relay) dispatchLoop(run *relayRun) {
+	defer close(run.dispatched)
+
+	buf := make([]byte, relayBufSize)
+	var dsts []netip.AddrPort
+	for {
+		n, src, err := run.conn.ReadFromUDPAddrPort(buf)
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			r.logger.Debug("relay: read failed", "error", err)
+			continue
+		}
+		src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
+		b := buf[:n]
+
+		dsts = r.route(run, b, src, dsts[:0])
+		for _, dst := range dsts {
+			if _, err := run.conn.WriteToUDPAddrPort(b, dst); err != nil {
+				r.logger.Debug("relay: forward failed", "dst", dst.String(), "error", err)
+			}
+		}
 	}
 }
 
-// AddSession creates and registers a new relay session.
-func (r *Relay) AddSession(assignment api.RelaySessionAssignment) error {
-	if assignment.SessionID == "" {
-		return fmt.Errorf("bridge: relay: empty session ID")
+// route appends to dsts the addresses b, received from src, is forwarded to,
+// and updates the relay's state. A datagram it cannot forward is logged as
+// dropped and gets no destination.
+func (r *Relay) route(run *relayRun, b []byte, src netip.AddrPort, dsts []netip.AddrPort) []netip.AddrPort {
+	msg, ok := parseWGMessage(b)
+	if !ok {
+		r.drop(src, "not_wireguard")
+		return dsts
 	}
-
-	peerA, err := net.ResolveUDPAddr("udp", assignment.PeerAEndpoint)
-	if err != nil {
-		return fmt.Errorf("bridge: relay: resolve peer A endpoint %q: %w", assignment.PeerAEndpoint, err)
-	}
-	peerB, err := net.ResolveUDPAddr("udp", assignment.PeerBEndpoint)
-	if err != nil {
-		return fmt.Errorf("bridge: relay: resolve peer B endpoint %q: %w", assignment.PeerBEndpoint, err)
-	}
-	if peerA.String() == peerB.String() {
-		return fmt.Errorf("bridge: relay: peer A and peer B endpoints must differ: %s", peerA.String())
+	if msg.typ == device.MessageInitiationType || msg.typ == device.MessageResponseType {
+		if !run.limiter.Allow(src.Addr()) {
+			r.drop(src, "rate_limited")
+			return dsts
+		}
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := r.now()
 
-	if _, exists := r.sessions[assignment.SessionID]; exists {
-		return fmt.Errorf("bridge: relay: duplicate session ID: %s", assignment.SessionID)
+	var reason string
+	switch msg.typ {
+	case device.MessageInitiationType:
+		dsts, reason = r.routeInitiation(b, msg, src, now, dsts)
+	case device.MessageResponseType:
+		dsts, reason = r.routeResponse(b, msg, src, now, dsts)
+	case device.MessageCookieReplyType:
+		dsts, reason = r.routeCookieReply(msg, src, dsts)
+	default:
+		dsts, reason = r.routeTransport(msg, src, now, dsts)
 	}
-	if len(r.sessions) >= r.maxSessions {
-		return fmt.Errorf("bridge: relay: max sessions reached (%d)", r.maxSessions)
+	if reason != "" {
+		r.drop(src, reason)
+	}
+	return dsts
+}
+
+// routeInitiation forwards an initiation to the peer T whose key verifies its
+// mac1: to T's address when fresh, otherwise to the recent pending initiators
+// (see fanout). It records the sender index as pending for T.
+func (r *Relay) routeInitiation(b []byte, msg wgMessage, src netip.AddrPort, now time.Time, dsts []netip.AddrPort) ([]netip.AddrPort, string) {
+	target := r.mac1Peer(b, nil)
+	if target == nil {
+		return dsts, "unknown_target"
+	}
+	direct := r.fresh(target, now)
+	if direct && target.addr == src {
+		return dsts, "no_route"
+	}
+	if !r.room(msg.sender, now) {
+		return dsts, "index_table_full"
+	}
+	r.indices[msg.sender] = &relayIndex{pending: true, partner: target, src: src, used: now}
+
+	if direct {
+		return append(dsts, target.addr), ""
+	}
+	n := len(dsts)
+	dsts = r.fanout(src, now, dsts)
+	if len(dsts) == n {
+		return dsts, "no_route"
+	}
+	return dsts, ""
+}
+
+// routeResponse forwards a response to the source of the pending initiation
+// it answers, when its mac1 verifies for a peer I other than that
+// initiation's target T. Both addresses are learned from it, and both indices
+// become session indices.
+func (r *Relay) routeResponse(b []byte, msg wgMessage, src netip.AddrPort, now time.Time, dsts []netip.AddrPort) ([]netip.AddrPort, string) {
+	pending, ok := r.indices[msg.receiver]
+	if !ok || !pending.pending {
+		return dsts, "unknown_index"
+	}
+	initiator := r.mac1Peer(b, pending.partner)
+	if initiator == nil {
+		return dsts, "unknown_target"
+	}
+	if pending.src == src {
+		return dsts, "no_route"
+	}
+	if !r.room(msg.sender, now) {
+		return dsts, "index_table_full"
+	}
+	// The sweep room may run can expire the pending index itself.
+	if r.indices[msg.receiver] != pending {
+		return dsts, "unknown_index"
 	}
 
-	session := &RelaySession{
-		SessionID: assignment.SessionID,
-		PeerAAddr: peerA,
-		PeerBAddr: peerB,
-		conn:      r.conn,
-		logger:    r.logger,
+	target := pending.partner
+	r.learn(target, src, now)
+	r.learn(initiator, pending.src, now)
+	r.indices[msg.receiver] = &relayIndex{owner: initiator, partner: target, used: now}
+	r.indices[msg.sender] = &relayIndex{owner: target, partner: initiator, used: now}
+	return append(dsts, pending.src), ""
+}
+
+// routeCookieReply forwards a cookie reply to the side that chose its
+// receiver index: a pending initiation's source, or a session owner.
+func (r *Relay) routeCookieReply(msg wgMessage, src netip.AddrPort, dsts []netip.AddrPort) ([]netip.AddrPort, string) {
+	idx, ok := r.indices[msg.receiver]
+	if !ok {
+		return dsts, "unknown_index"
 	}
+	dst := idx.src
+	if !idx.pending {
+		dst = idx.owner.addr
+	}
+	if !dst.IsValid() || dst == src {
+		return dsts, "no_route"
+	}
+	return append(dsts, dst), ""
+}
 
-	r.sessions[assignment.SessionID] = session
-	r.addrIndex[peerA.String()] = session
-	r.addrIndex[peerB.String()] = session
+// routeTransport forwards a transport message to the owner of its receiver
+// index, and learns the partner's address from it.
+func (r *Relay) routeTransport(msg wgMessage, src netip.AddrPort, now time.Time, dsts []netip.AddrPort) ([]netip.AddrPort, string) {
+	idx, ok := r.indices[msg.receiver]
+	if !ok || idx.pending {
+		return dsts, "unknown_index"
+	}
+	dst := idx.owner.addr
+	if !dst.IsValid() || dst == src {
+		return dsts, "no_route"
+	}
+	r.learn(idx.partner, src, now)
+	idx.used = now
+	return append(dsts, dst), ""
+}
 
-	// Start TTL timer.
-	ttl := r.sessionTTL
-	if !assignment.ExpiresAt.IsZero() {
-		remaining := time.Until(assignment.ExpiresAt)
-		if remaining > 0 && remaining < ttl {
-			ttl = remaining
+// mac1Peer returns the peer other than exclude whose public key verifies b's
+// mac1, or nil. Public keys are unique, so at most one peer verifies.
+func (r *Relay) mac1Peer(b []byte, exclude *relayPeer) *relayPeer {
+	for _, p := range r.peers {
+		if p != exclude && p.checker.CheckMAC1(b) {
+			return p
 		}
 	}
-	timer := time.AfterFunc(ttl, func() {
-		r.RemoveSession(assignment.SessionID)
-	})
-	r.timers[assignment.SessionID] = timer
-
-	r.logger.Info("relay session added",
-		"session_id", assignment.SessionID,
-		"peer_a", peerA.String(),
-		"peer_b", peerB.String(),
-		"ttl", ttl.String(),
-	)
-
 	return nil
 }
 
-// RemoveSession closes and removes a session by ID. No-op if not found.
-func (r *Relay) RemoveSession(sessionID string) {
-	r.mu.Lock()
-	session, ok := r.sessions[sessionID]
-	if !ok {
-		r.mu.Unlock()
+// fresh reports whether p has an address seen within relayIndexTTL.
+func (r *Relay) fresh(p *relayPeer, now time.Time) bool {
+	return p.addr.IsValid() && now.Sub(p.seen) < relayIndexTTL
+}
+
+// fanout appends the distinct sources of pending indices younger than
+// relayFanoutWindow, newest first and at most relayFanoutMax, leaving out src
+// and every peer's fresh address. An initiator behind a symmetric NAT is
+// reachable only at the mapping its own initiation opened, so the relay sends
+// an initiation it cannot place to the initiators waiting on it. Only the real
+// target's WireGuard accepts it, because mac1 is keyed to the target's key.
+func (r *Relay) fanout(src netip.AddrPort, now time.Time, dsts []netip.AddrPort) []netip.AddrPort {
+	known := make(map[netip.AddrPort]bool, len(r.peers))
+	for _, p := range r.peers {
+		if r.fresh(p, now) {
+			known[p.addr] = true
+		}
+	}
+	var waiting []*relayIndex
+	for _, idx := range r.indices {
+		if idx.pending && now.Sub(idx.used) < relayFanoutWindow && idx.src != src && !known[idx.src] {
+			waiting = append(waiting, idx)
+		}
+	}
+	slices.SortFunc(waiting, func(a, b *relayIndex) int { return b.used.Compare(a.used) })
+
+	sent := make(map[netip.AddrPort]bool, relayFanoutMax)
+	for _, idx := range waiting {
+		if len(sent) == relayFanoutMax {
+			break
+		}
+		if sent[idx.src] {
+			continue
+		}
+		sent[idx.src] = true
+		dsts = append(dsts, idx.src)
+	}
+	return dsts
+}
+
+// learn sets p's address to addr and marks it seen. The address is cleared
+// from any other peer that held it.
+func (r *Relay) learn(p *relayPeer, addr netip.AddrPort, now time.Time) {
+	p.seen = now
+	if p.addr == addr {
 		return
 	}
-
-	// Stop TTL timer.
-	if timer, ok := r.timers[sessionID]; ok {
-		timer.Stop()
-		delete(r.timers, sessionID)
+	for _, other := range r.peers {
+		if other != p && other.addr == addr {
+			other.addr = netip.AddrPort{}
+		}
 	}
-
-	// Remove from addr index.
-	delete(r.addrIndex, session.PeerAAddr.String())
-	delete(r.addrIndex, session.PeerBAddr.String())
-	delete(r.sessions, sessionID)
-	r.mu.Unlock()
-
-	session.Close()
+	p.addr = addr
+	r.logger.Info("relay: peer address learned", "peer_id", p.nodeID, "address", addr.String())
 }
 
-// Stop closes all sessions and the UDP listener. Idempotent.
-func (r *Relay) Stop() error {
+// room reports whether index i can be recorded: it exists already, or the
+// table holds fewer than maxIndices. A full table is swept first. A table
+// still full is logged at Warn, at most once per relayFullWarnInterval.
+func (r *Relay) room(i uint32, now time.Time) bool {
+	if _, ok := r.indices[i]; ok || len(r.indices) < r.maxIndices {
+		return true
+	}
+	r.sweepLocked(now)
+	if len(r.indices) < r.maxIndices {
+		return true
+	}
+	if r.fullWarnedAt.IsZero() || now.Sub(r.fullWarnedAt) >= relayFullWarnInterval {
+		r.fullWarnedAt = now
+		r.logger.Warn("relay: index table full", "max_indices", r.maxIndices)
+	}
+	return false
+}
+
+// sweepLoop runs sweep every relaySweepInterval until run stops.
+func (r *Relay) sweepLoop(run *relayRun) {
+	defer close(run.swept)
+
+	ticker := time.NewTicker(relaySweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-run.stop:
+			return
+		case <-ticker.C:
+			r.sweep(r.now())
+		}
+	}
+}
+
+// sweep deletes pending indices older than relayFanoutWindow and session
+// indices unused for relayIndexTTL.
+func (r *Relay) sweep(now time.Time) {
 	r.mu.Lock()
-	if !r.active {
-		r.mu.Unlock()
-		return nil
-	}
-	r.active = false
-
-	// Stop all timers.
-	for _, timer := range r.timers {
-		timer.Stop()
-	}
-	r.timers = make(map[string]*time.Timer)
-
-	// Collect sessions to close.
-	sessions := make([]*RelaySession, 0, len(r.sessions))
-	for _, s := range r.sessions {
-		sessions = append(sessions, s)
-	}
-	r.sessions = make(map[string]*RelaySession)
-	r.addrIndex = make(map[string]*RelaySession)
-
-	conn := r.conn
-	r.conn = nil
-	r.mu.Unlock()
-
-	// Close all sessions.
-	for _, s := range sessions {
-		s.Close()
-	}
-
-	// Close UDP listener.
-	if conn != nil {
-		conn.Close()
-	}
-
-	r.logger.Info("relay stopped")
-	return nil
+	defer r.mu.Unlock()
+	r.sweepLocked(now)
 }
 
-// ActiveCount returns the number of active relay sessions.
-func (r *Relay) ActiveCount() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return len(r.sessions)
+func (r *Relay) sweepLocked(now time.Time) {
+	for i, idx := range r.indices {
+		ttl := relayIndexTTL
+		if idx.pending {
+			ttl = relayFanoutWindow
+		}
+		if now.Sub(idx.used) >= ttl {
+			delete(r.indices, i)
+		}
+	}
 }
 
-// SessionIDs returns the IDs of all active sessions.
-func (r *Relay) SessionIDs() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	ids := make([]string, 0, len(r.sessions))
-	for id := range r.sessions {
-		ids = append(ids, id)
-	}
-	return ids
-}
-
-// ListenAddr returns the local address of the relay UDP listener.
-// Returns nil if not started.
-func (r *Relay) ListenAddr() net.Addr {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.conn == nil {
-		return nil
-	}
-	return r.conn.LocalAddr()
+// drop logs a datagram from src the relay does not forward.
+func (r *Relay) drop(src netip.AddrPort, reason string) {
+	r.logger.Debug("relay: dropped datagram", "source", src, "reason", reason)
 }

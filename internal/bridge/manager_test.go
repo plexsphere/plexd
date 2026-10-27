@@ -1,7 +1,6 @@
 package bridge
 
 import (
-	"context"
 	"fmt"
 	"testing"
 )
@@ -419,36 +418,6 @@ func TestManager_NewManager_WithoutRelay(t *testing.T) {
 	}
 }
 
-func TestManager_StartRelay_NilRelay(t *testing.T) {
-	ctrl := &mockRouteController{}
-	cfg := Config{
-		Enabled:         true,
-		AccessInterface: "eth1",
-		AccessSubnets:   []string{"10.0.0.0/24"},
-		RelayEnabled:    false,
-	}
-	mgr := NewManager(ctrl, cfg, discardLogger())
-
-	if err := mgr.StartRelay(context.Background()); err != nil {
-		t.Fatalf("StartRelay with nil relay should return nil, got %v", err)
-	}
-}
-
-func TestManager_StopRelay_NilRelay(t *testing.T) {
-	ctrl := &mockRouteController{}
-	cfg := Config{
-		Enabled:         true,
-		AccessInterface: "eth1",
-		AccessSubnets:   []string{"10.0.0.0/24"},
-		RelayEnabled:    false,
-	}
-	mgr := NewManager(ctrl, cfg, discardLogger())
-
-	if err := mgr.StopRelay(); err != nil {
-		t.Fatalf("StopRelay with nil relay should return nil, got %v", err)
-	}
-}
-
 func TestManager_Teardown_WithRelay(t *testing.T) {
 	ctrl := &mockRouteController{}
 	cfg := Config{
@@ -463,12 +432,19 @@ func TestManager_Teardown_WithRelay(t *testing.T) {
 	if err := mgr.Setup("wg0"); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
+	relay := mgr.Relay()
+	relay.listen = loopbackRelayListen
+	if err := relay.Configure(51821, nil); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
 
-	// DO NOT call StartRelay to avoid goroutine leaks.
 	if err := mgr.Teardown(); err != nil {
 		t.Fatalf("Teardown: %v", err)
 	}
 
+	if relay.Running() {
+		t.Error("relay still running after Teardown")
+	}
 	if mgr.BridgeStatus() != nil {
 		t.Error("BridgeStatus should be nil after teardown")
 	}
@@ -493,8 +469,20 @@ func TestManager_BridgeStatus_WithRelay(t *testing.T) {
 	if info == nil {
 		t.Fatal("BridgeStatus should not be nil when active")
 	}
+	if info.RelayEnabled {
+		t.Error("BridgeInfo.RelayEnabled = true before the state pull configured the relay")
+	}
+
+	relay := mgr.Relay()
+	relay.listen = loopbackRelayListen
+	if err := relay.Configure(51821, nil); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	t.Cleanup(func() { _ = relay.Stop() })
+
+	info = mgr.BridgeStatus()
 	if !info.RelayEnabled {
-		t.Error("BridgeInfo.RelayEnabled should be true")
+		t.Error("BridgeInfo.RelayEnabled = false with the relay listening")
 	}
 	if info.ActiveRelaySessions != 0 {
 		t.Errorf("BridgeInfo.ActiveRelaySessions = %d, want 0", info.ActiveRelaySessions)
@@ -518,8 +506,8 @@ func TestManager_BridgeCapabilities_WithRelay(t *testing.T) {
 	if caps["relay"] != "true" {
 		t.Errorf("caps[relay] = %q, want %q", caps["relay"], "true")
 	}
-	if caps["relay_listen_port"] != "51821" {
-		t.Errorf("caps[relay_listen_port] = %q, want %q", caps["relay_listen_port"], "51821")
+	if port, ok := caps["relay_listen_port"]; ok {
+		t.Errorf("caps[relay_listen_port] = %q, want no such key: the port comes from the state pull", port)
 	}
 }
 
