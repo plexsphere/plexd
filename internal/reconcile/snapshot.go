@@ -105,7 +105,9 @@ func copyRelay(src *api.RelayConfig) *api.RelayConfig {
 	if src == nil {
 		return nil
 	}
-	return &api.RelayConfig{Sessions: slices.Clone(src.Sessions)}
+	cp := *src
+	cp.Assignments = slices.Clone(src.Assignments)
+	return &cp
 }
 
 func copyUserAccess(src *api.UserAccessConfig) *api.UserAccessConfig {

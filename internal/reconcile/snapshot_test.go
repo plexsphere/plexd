@@ -194,6 +194,57 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 	}
 }
 
+// TestStateSnapshot_CopiesRelayAssignments proves copyRelay clones the relay
+// assignments on both Update and Get, and keeps an empty list empty: a nil
+// copy of the [] a pull decodes would make ComputeDiff report bridge drift on
+// every pull.
+func TestStateSnapshot_CopiesRelayAssignments(t *testing.T) {
+	snap := NewStateSnapshot()
+	desired := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Relay: &api.RelayConfig{
+				Enabled:    true,
+				ListenPort: 51821,
+				Assignments: []api.RelayAssignment{
+					{PeerNodeID: "node-1", FallbackEndpoint: "203.0.113.50", FallbackEndpointPort: 51821},
+				},
+			},
+		},
+	}
+	snap.Update(desired)
+
+	got := snap.Get()
+	if diff := ComputeDiff(desired, &got); diff.BridgeChanged {
+		t.Fatalf("stored relay = %+v, want %+v", got.Bridge.Relay, desired.Bridge.Relay)
+	}
+
+	// Mutate the source after Update — snapshot must be unaffected.
+	desired.Bridge.Relay.Assignments[0].PeerNodeID = "mutated"
+	if got2 := snap.Get(); got2.Bridge.Relay.Assignments[0].PeerNodeID == "mutated" {
+		t.Error("Relay assignments were not copied on Update")
+	}
+
+	// Mutate the returned value — snapshot must be unaffected.
+	got.Bridge.Relay.Assignments[0].FallbackEndpoint = "mutated"
+	if got3 := snap.Get(); got3.Bridge.Relay.Assignments[0].FallbackEndpoint == "mutated" {
+		t.Error("Get did not return a copy of the relay assignments")
+	}
+
+	empty := &api.NodeStateSnapshot{
+		Bridge: &api.BridgeSnapshot{
+			Relay: &api.RelayConfig{ListenPort: 51821, Assignments: []api.RelayAssignment{}},
+		},
+	}
+	snap.Update(empty)
+	got = snap.Get()
+	if got.Bridge.Relay.Assignments == nil {
+		t.Error("empty relay assignments were copied to nil, want an empty non-nil slice")
+	}
+	if diff := ComputeDiff(empty, &got); diff.BridgeChanged {
+		t.Error("an unchanged relay block with no assignments reads as bridge drift")
+	}
+}
+
 func TestStateSnapshot_ConcurrentAccess(t *testing.T) {
 	snap := NewStateSnapshot()
 	desired := sampleSnapshot()
