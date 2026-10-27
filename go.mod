@@ -3,6 +3,7 @@ module github.com/plexsphere/plexd
 go 1.26.0
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/ebitengine/purego v0.11.0
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/google/nftables v0.3.0

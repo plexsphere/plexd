@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -21,6 +22,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // newEndpointTestClient creates a ControlPlane client backed by the given handler.
@@ -2491,6 +2494,458 @@ func TestReportSessionActivity_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReportSessionActivity: %v", err)
 	}
+}
+
+// acceptSessionConn upgrades r the way the control plane's node connection
+// route does and closes the server's end when the test ends.
+func acceptSessionConn(t *testing.T, w http.ResponseWriter, r *http.Request) *websocket.Conn {
+	t.Helper()
+	c, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		t.Errorf("accept: %v", err)
+		return nil
+	}
+	t.Cleanup(func() { _ = c.CloseNow() })
+	return c
+}
+
+// serveSessionConns starts a control plane whose connection route hands every
+// accepted WebSocket to the returned channel, and a client against it.
+func serveSessionConns(t *testing.T) (*ControlPlane, <-chan *websocket.Conn) {
+	t.Helper()
+	accepted := make(chan *websocket.Conn, 4)
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if c := acceptSessionConn(t, w, r); c != nil {
+			accepted <- c
+		}
+	})
+	return client, accepted
+}
+
+func receiveSessionConn(t *testing.T, accepted <-chan *websocket.Conn) *websocket.Conn {
+	t.Helper()
+	select {
+	case c := <-accepted:
+		return c
+	case <-time.After(5 * time.Second):
+		t.Fatal("the control plane accepted no connection within 5s")
+		return nil
+	}
+}
+
+func openTestSessionConn(t *testing.T, client *ControlPlane) net.Conn {
+	t.Helper()
+	conn, err := client.OpenSessionConnection(context.Background(), "n1", "s1", "c1")
+	if err != nil {
+		t.Fatalf("OpenSessionConnection: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+// sessionRoundTrip writes ping from the node's side, expects it as one binary message
+// on the control plane's side, answers pong and expects it back.
+func sessionRoundTrip(t *testing.T, conn net.Conn, server *websocket.Conn) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("node write: %v", err)
+	}
+	typ, got, err := server.Read(ctx)
+	if err != nil || typ != websocket.MessageBinary || string(got) != "ping" {
+		t.Fatalf("control plane read = %v %q (%v), want a binary ping", typ, got, err)
+	}
+	if err := server.Write(ctx, websocket.MessageBinary, []byte("pong")); err != nil {
+		t.Fatalf("control plane write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 16)
+	n, err := conn.Read(buf)
+	if err != nil || string(buf[:n]) != "pong" {
+		t.Fatalf("node read = %q (%v), want pong", buf[:n], err)
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+}
+
+// TestOpenSessionConnection_CarriesBytesBothWays proves the connection reaches
+// the node connection route with the node's bearer and the agent's user agent,
+// and carries SSH bytes as binary messages in both directions.
+func TestOpenSessionConnection_CarriesBytesBothWays(t *testing.T) {
+	accepted := make(chan *websocket.Conn, 1)
+	var (
+		mu                  sync.Mutex
+		path, auth, uaValue string
+	)
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		path, auth, uaValue = r.URL.EscapedPath(), r.Header.Get("Authorization"), r.Header.Get("User-Agent")
+		mu.Unlock()
+		if c := acceptSessionConn(t, w, r); c != nil {
+			accepted <- c
+		}
+	})
+
+	conn := openTestSessionConn(t, client)
+	sessionRoundTrip(t, conn, receiveSessionConn(t, accepted))
+
+	mu.Lock()
+	defer mu.Unlock()
+	if path != "/v1/nodes/n1/sessions/s1/connections/c1" {
+		t.Errorf("path = %q, want /v1/nodes/n1/sessions/s1/connections/c1", path)
+	}
+	if auth != "Bearer test-token" {
+		t.Errorf("Authorization = %q, want Bearer test-token", auth)
+	}
+	if uaValue != "plexd/1.0.0-test" {
+		t.Errorf("User-Agent = %q, want plexd/1.0.0-test", uaValue)
+	}
+}
+
+// TestOpenSessionConnection_TLS proves the shared transport upgrades over TLS,
+// which needs it to speak HTTP/1.1.
+func TestOpenSessionConnection_TLS(t *testing.T) {
+	accepted := make(chan *websocket.Conn, 1)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if c := acceptSessionConn(t, w, r); c != nil {
+			accepted <- c
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewControlPlane(Config{BaseURL: srv.URL, TLSInsecureSkipVerify: true}, "1.0.0-test", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetAuthToken("test-token")
+
+	conn := openTestSessionConn(t, client)
+	sessionRoundTrip(t, conn, receiveSessionConn(t, accepted))
+}
+
+// TestOpenSessionConnection_EscapesPathSegments proves an id from the event can
+// only ever name a path segment on the configured control plane.
+func TestOpenSessionConnection_EscapesPathSegments(t *testing.T) {
+	var (
+		mu         sync.Mutex
+		path, host string
+	)
+	client, srv := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		path, host = r.URL.EscapedPath(), r.Host
+		mu.Unlock()
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	if _, err := client.OpenSessionConnection(context.Background(), "n1", "s1", "a/b"); err == nil {
+		t.Fatal("OpenSessionConnection succeeded against a 404")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if path != "/v1/nodes/n1/sessions/s1/connections/a%2Fb" {
+		t.Errorf("path = %q, want the escaped segment a%%2Fb", path)
+	}
+	if want := strings.TrimPrefix(srv.URL, "http://"); host != want {
+		t.Errorf("host = %q, want %q", host, want)
+	}
+}
+
+// TestOpenSessionConnection_RefusedUpgrade proves every answer the node
+// connection route refuses with comes back as an *APIError carrying its status
+// and problem code.
+func TestOpenSessionConnection_RefusedUpgrade(t *testing.T) {
+	for _, tt := range []struct {
+		status int
+		code   string
+	}{
+		{http.StatusForbidden, "nsk_node_mismatch"},
+		{http.StatusNotFound, "session_connection_not_found"},
+		{http.StatusConflict, "session_not_active"},
+		{http.StatusUpgradeRequired, "upgrade_required"},
+		{http.StatusNotImplemented, "access_attach_not_provisioned"},
+		{http.StatusBadGateway, "session_connection_forward_failed"},
+	} {
+		t.Run(tt.code, func(t *testing.T) {
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.WriteHeader(tt.status)
+				fmt.Fprintf(w, `{"code":%q,"detail":"refused"}`, tt.code)
+			})
+
+			conn, err := client.OpenSessionConnection(context.Background(), "n1", "s1", "c1")
+			if conn != nil {
+				t.Errorf("OpenSessionConnection returned a connection with error %v", err)
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("error = %v, want an *APIError", err)
+			}
+			if apiErr.StatusCode != tt.status || apiErr.Code != tt.code {
+				t.Errorf("APIError = %d %q, want %d %q", apiErr.StatusCode, apiErr.Code, tt.status, tt.code)
+			}
+		})
+	}
+}
+
+// fakeControlPlaneListener accepts TCP connections and hands each to serve,
+// which owns it; the listener and every connection close when the test ends.
+func fakeControlPlaneListener(t *testing.T, serve func(net.Conn)) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		ln.Close()
+		wg.Wait()
+	})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				serve(c)
+			}()
+		}
+	}()
+	return "http://" + ln.Addr().String()
+}
+
+// TestOpenSessionConnection_TransportError proves a control plane that hangs up
+// without answering surfaces as a wrapped transport error, not an *APIError.
+func TestOpenSessionConnection_TransportError(t *testing.T) {
+	baseURL := fakeControlPlaneListener(t, func(c net.Conn) { c.Close() })
+	client, err := NewControlPlane(Config{BaseURL: baseURL}, "1.0.0-test", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.OpenSessionConnection(context.Background(), "n1", "s1", "c1")
+	if err == nil || !strings.HasPrefix(err.Error(), "api: open session connection:") {
+		t.Fatalf("error = %v, want one starting with api: open session connection:", err)
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		t.Errorf("error = %v, want a transport error, not an *APIError", err)
+	}
+}
+
+// TestOpenSessionConnection_HandshakeDeadline proves the caller's context bounds
+// an upgrade the control plane never answers.
+func TestOpenSessionConnection_HandshakeDeadline(t *testing.T) {
+	done := make(chan struct{})
+	baseURL := fakeControlPlaneListener(t, func(c net.Conn) {
+		defer c.Close()
+		<-done
+	})
+	t.Cleanup(func() { close(done) })
+	client, err := NewControlPlane(Config{BaseURL: baseURL}, "1.0.0-test", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err = client.OpenSessionConnection(ctx, "n1", "s1", "c1")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want one wrapping context.DeadlineExceeded", err)
+	}
+}
+
+// TestOpenSessionConnection_RequiresIDs proves a call that does not name the
+// session and the connection sends nothing.
+func TestOpenSessionConnection_RequiresIDs(t *testing.T) {
+	var requests atomic.Int32
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+	})
+
+	for _, ids := range [][3]string{{"n1", "", "c1"}, {"n1", "s1", ""}, {"", "s1", "c1"}} {
+		_, err := client.OpenSessionConnection(context.Background(), ids[0], ids[1], ids[2])
+		if err == nil || err.Error() != "api: open session connection: node_id, session_id and connection_id are required" {
+			t.Errorf("OpenSessionConnection(%q) error = %v, want the required-ids error", ids, err)
+		}
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("control plane received %d requests, want none", n)
+	}
+}
+
+// TestOpenSessionConnection_RefusedCredential proves a refused credential stops
+// the upgrade before any I/O, like every other call that presents the bearer.
+func TestOpenSessionConnection_RefusedCredential(t *testing.T) {
+	var requests atomic.Int32
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+	})
+	client.SetCredentialRefused(true)
+
+	if _, err := client.OpenSessionConnection(context.Background(), "n1", "s1", "c1"); !errors.Is(err, ErrCredentialRefused) {
+		t.Fatalf("error = %v, want ErrCredentialRefused", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("control plane received %d requests, want none", n)
+	}
+}
+
+// TestOpenSessionConnection_OutlivesHandshakeContext proves the context only
+// bounds the handshake: the connection keeps carrying bytes once it is done.
+func TestOpenSessionConnection_OutlivesHandshakeContext(t *testing.T) {
+	client, accepted := serveSessionConns(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	conn, err := client.OpenSessionConnection(ctx, "n1", "s1", "c1")
+	if err != nil {
+		t.Fatalf("OpenSessionConnection: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	cancel()
+
+	sessionRoundTrip(t, conn, receiveSessionConn(t, accepted))
+}
+
+// TestOpenSessionConnection_PingsAreNotData proves pings are answered inside
+// Read and never surface as bytes, so they cannot count as session activity.
+func TestOpenSessionConnection_PingsAreNotData(t *testing.T) {
+	client, accepted := serveSessionConns(t)
+	conn := openTestSessionConn(t, client)
+	server := receiveSessionConn(t, accepted)
+
+	read := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 16)
+		n, err := conn.Read(buf)
+		if err != nil {
+			read <- "error: " + err.Error()
+			return
+		}
+		read <- string(buf[:n])
+	}()
+
+	// A ping completes only once its pong is read, so the control plane reads
+	// in the background while it pings.
+	ctx, cancel := context.WithTimeout(server.CloseRead(context.Background()), 5*time.Second)
+	defer cancel()
+	for i := 0; i < 3; i++ {
+		if err := server.Ping(ctx); err != nil {
+			t.Fatalf("ping %d: %v", i+1, err)
+		}
+	}
+	if err := server.Write(ctx, websocket.MessageBinary, []byte("x")); err != nil {
+		t.Fatalf("control plane write: %v", err)
+	}
+
+	select {
+	case got := <-read:
+		if got != "x" {
+			t.Errorf("first Read = %q, want x", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read returned nothing within 5s")
+	}
+}
+
+// TestOpenSessionConnection_TextMessageFailsRead proves a text message, which
+// cannot carry SSH bytes, fails the read instead of reaching the SSH server.
+func TestOpenSessionConnection_TextMessageFailsRead(t *testing.T) {
+	client, accepted := serveSessionConns(t)
+	conn := openTestSessionConn(t, client)
+	server := receiveSessionConn(t, accepted)
+
+	// The control plane reads, as the gateway does, so it answers the close
+	// frame the refused message draws and the read fails at once.
+	ctx, cancel := context.WithTimeout(server.CloseRead(context.Background()), 5*time.Second)
+	defer cancel()
+	if err := server.Write(ctx, websocket.MessageText, []byte("hi")); err != nil {
+		t.Fatalf("control plane write: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	start := time.Now()
+	if n, err := conn.Read(make([]byte, 16)); err == nil {
+		t.Errorf("Read of a text message returned %d bytes and no error", n)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("Read took %v to fail, want the text message to fail it, not the deadline", took)
+	}
+}
+
+// TestOpenSessionConnection_CloseDoesNotWait proves Close returns at once when
+// the control plane never answers the close frame. No Read is in flight: one
+// would have its cancellation close the socket and end the handshake early, so
+// only a connection nobody reads shows whether Close waits.
+func TestOpenSessionConnection_CloseDoesNotWait(t *testing.T) {
+	client, accepted := serveSessionConns(t)
+	conn, err := client.OpenSessionConnection(context.Background(), "n1", "s1", "c1")
+	if err != nil {
+		t.Fatalf("OpenSessionConnection: %v", err)
+	}
+	// The control plane's end never reads, so it never answers the close frame.
+	server := receiveSessionConn(t, accepted)
+
+	start := time.Now()
+	if err := conn.Close(); err != nil {
+		t.Errorf("Close() = %v, want nil", err)
+	}
+	if took := time.Since(start); took > 100*time.Millisecond {
+		t.Errorf("Close took %v, want under 100ms", took)
+	}
+	// Ending the control plane's side lets the close handshake give up, so no
+	// goroutine outlives the test.
+	_ = server.CloseNow()
+}
+
+// TestOpenSessionConnection_CloseEndsABlockedRead proves Close ends a Read that
+// waits on the connection, as the SSH server's reader always does.
+func TestOpenSessionConnection_CloseEndsABlockedRead(t *testing.T) {
+	client, accepted := serveSessionConns(t)
+	conn := openTestSessionConn(t, client)
+	server := receiveSessionConn(t, accepted)
+
+	// The reader takes one message and then waits for the next, which the
+	// control plane never sends.
+	firstRead := make(chan struct{})
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		if _, err := conn.Read(buf); err != nil {
+			readErr <- err
+			return
+		}
+		close(firstRead)
+		_, err := conn.Read(buf)
+		readErr <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Write(ctx, websocket.MessageBinary, []byte("x")); err != nil {
+		t.Fatalf("control plane write: %v", err)
+	}
+	select {
+	case <-firstRead:
+	case err := <-readErr:
+		t.Fatalf("first Read: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("first Read returned nothing within 5s")
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Errorf("Close() = %v, want nil", err)
+	}
+	select {
+	case err := <-readErr:
+		if err == nil {
+			t.Error("the waiting Read returned no error after Close")
+		}
+	case <-time.After(time.Second):
+		t.Error("the waiting Read did not return within 1s of Close")
+	}
+	_ = server.CloseNow()
 }
 
 // testEdgePSKEnvelope is a 60-byte body of the edge-PSK envelope's shape. The

@@ -1948,6 +1948,34 @@ func TestSessionRevocation_JSONDecode(t *testing.T) {
 	}
 }
 
+// TestSessionConnectRequest_JSONDecode proves the session_connect payload
+// decodes from the control plane's access.SessionConnectRequested keys, beside
+// the event header members plexd does not read.
+func TestSessionConnectRequest_JSONDecode(t *testing.T) {
+	raw := `{
+		"event_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
+		"occurred_at": "2026-10-27T09:00:00Z",
+		"session_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+		"connection_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2",
+		"expires_at": "2026-10-27T09:00:10Z"
+	}`
+
+	var req SessionConnectRequest
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if want := "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"; req.SessionID != want {
+		t.Errorf("SessionID = %q, want %q", req.SessionID, want)
+	}
+	if want := "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2"; req.ConnectionID != want {
+		t.Errorf("ConnectionID = %q, want %q", req.ConnectionID, want)
+	}
+	if want := time.Date(2026, 10, 27, 9, 0, 10, 0, time.UTC); !req.ExpiresAt.Equal(want) {
+		t.Errorf("ExpiresAt = %v, want %v", req.ExpiresAt, want)
+	}
+}
+
 func TestLocalEndpointConfig_Validate(t *testing.T) {
 	tests := []struct {
 		name       string

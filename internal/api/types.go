@@ -266,6 +266,18 @@ type SessionRevocation struct {
 	RevokeReason string    `json:"revoke_reason"`
 }
 
+// SessionConnectRequest is the payload of the session_connect event: the ssh
+// session a client attached to, the one-time id of the connection the node is
+// asked to open for it, and the instant after which the control plane no
+// longer accepts that connection. Its shape is the control plane's
+// access.SessionConnectRequested event, whose event_id and occurred_at header
+// members plexd does not read.
+type SessionConnectRequest struct {
+	SessionID    string    `json:"session_id"`
+	ConnectionID string    `json:"connection_id"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+
 // Reasons the control plane revokes a session, carried on
 // SessionRevocation.RevokeReason. The first four are operator-driven, supplied
 // on the explicit revoke call; the last two are set by the control plane's
@@ -881,8 +893,10 @@ type SessionActivityRequest struct {
 // the command runs, and once with ExitCode and CompletedAt after it exited.
 //
 // A lifecycle row carries Phase, one of the SSHPhase* values, plus
-// ListenerEndpoint on session_started or TerminatedBy (one of the
-// TerminatedBy* values) on session_ended, and no command fields.
+// TerminatedBy (one of the TerminatedBy* values) on session_ended, and no
+// command fields. An ssh session binds no listener, so plexd sends no
+// ListenerEndpoint; the field stays for the session_started rows older agents
+// post with one, which the control plane still admits.
 //
 // plexd never posts an empty Command; the control plane refuses a row that
 // mixes the two shapes.
@@ -934,7 +948,8 @@ const (
 
 // SSH session lifecycle phases reported on an SSHActivity.
 const (
-	// SSHPhaseSessionStarted marks the listener of an SSH session coming up.
+	// SSHPhaseSessionStarted marks an SSH session ready to serve the
+	// connections the control plane asks for.
 	SSHPhaseSessionStarted = "session_started"
 	// SSHPhaseSessionEnded marks the close of an SSH session.
 	SSHPhaseSessionEnded = "session_ended"
