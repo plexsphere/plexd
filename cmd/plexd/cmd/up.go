@@ -578,8 +578,10 @@ func runAgent(ctx context.Context) error {
 	// types from the documented-coming taxonomy. action_request and
 	// session_setup join them as push-latency optimisations: the dispatch and
 	// the session themselves are delivered in the pull's executions and sessions
-	// blocks, the events only pull them forward. session_revoked is registered
-	// with the session dispatcher below, because it closes the session it names.
+	// blocks, the events only pull them forward. session_revoked and
+	// session_connect are registered with the session dispatcher below, because
+	// the first closes the session it names and the second opens a connection
+	// for it.
 	// node_secrets_updated carries the node's full secret inventory, but the
 	// inventory also rides the pull's secrets block, which feeds the node API's
 	// secret index, so the event only pulls that forward too: an event that
@@ -829,6 +831,13 @@ func runAgent(ctx context.Context) error {
 	// revocation whose event never arrives. Registered before sseMgr.Start, like
 	// every other SSE handler.
 	sseMgr.RegisterHandler(api.EventSessionRevoked, sessionDispatcher.SessionRevokedHandler(reconciler))
+
+	// A verified session_connect event asks for one connection of a live ssh
+	// session, so the dispatcher opens it to the control plane and serves the
+	// session's login on it. It carries no desired state and triggers no pull.
+	// Registered whatever the tunnel configuration says, so a node that serves
+	// no ssh sessions logs why it opens nothing instead of dropping the event.
+	sseMgr.RegisterHandler(api.EventSessionConnect, sessionDispatcher.SessionConnectHandler(&controlPlaneSessionConnector{cp: client, nodeID: identity.NodeID}))
 
 	// The reachability block is the control plane's own verdict about this node,
 	// not desired state: it is observed and logged on every successful pull, and
@@ -1498,20 +1507,23 @@ func (s *auditForwarderStatus) ForwarderStatus() nodeapi.ForwarderStatus {
 // plane. A tcp session is an opaque TCP forward, so it gets tcp rows: a
 // session_started row when the listener is up and a session_ended row carrying
 // byte counters and a terminated_by reason on close. An ssh session gets the
-// ssh lifecycle rows, which carry the listener endpoint and the terminated_by
-// reason, and one command row before and one after every command it runs.
+// ssh lifecycle rows, a session_started row when it is ready to serve
+// connections and a session_ended row carrying the terminated_by reason, and
+// one command row before and one after every command it runs.
 type controlPlaneSessionReporter struct {
 	cp     *api.ControlPlane
 	nodeID string
 }
 
-// ReportSessionStarted returns the post's error rather than logging it away: the
-// row carries the listener endpoint the operator connects to, so the dispatcher
-// has to know whether it arrived.
+// ReportSessionStarted returns the post's error rather than logging it away: a
+// tcp row carries the listener endpoint the operator connects to, and an ssh
+// row is what the control plane waits for before it asks for a connection, so
+// the dispatcher has to know whether it arrived. An ssh session binds no
+// listener, so its row carries no endpoint.
 func (r *controlPlaneSessionReporter) ReportSessionStarted(ctx context.Context, entry api.NodeStateSession, listenerEndpoint string) error {
 	var req api.SessionActivityRequest
 	if entry.Kind == api.SessionKindSSH {
-		req.SSH = &api.SSHActivity{Phase: api.SSHPhaseSessionStarted, ListenerEndpoint: listenerEndpoint}
+		req.SSH = &api.SSHActivity{Phase: api.SSHPhaseSessionStarted}
 	} else {
 		req.TCP = &api.TCPActivity{
 			Phase:            api.TCPPhaseSessionStarted,
@@ -1583,6 +1595,17 @@ func (r *controlPlaneSessionReporter) ReportSSHCommandExited(ctx context.Context
 	return r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, api.SessionActivityRequest{
 		SSH: &api.SSHActivity{Command: command, ExitCode: &exitCode, StartedAt: &started, CompletedAt: &completed},
 	})
+}
+
+// controlPlaneSessionConnector opens the connections session_connect events
+// ask for, to the control plane, under this node's id.
+type controlPlaneSessionConnector struct {
+	cp     *api.ControlPlane
+	nodeID string
+}
+
+func (c *controlPlaneSessionConnector) OpenSessionConnection(ctx context.Context, sessionID, connectionID string) (net.Conn, error) {
+	return c.cp.OpenSessionConnection(ctx, c.nodeID, sessionID, connectionID)
 }
 
 // buildHeartbeatRequest assembles the v1 heartbeat request. NATSummary is

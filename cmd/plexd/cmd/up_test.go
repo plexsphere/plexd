@@ -28,6 +28,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/health"
@@ -3218,6 +3220,37 @@ func captureSessionRows(t *testing.T, status int, body string) (*controlPlaneSes
 	}
 }
 
+// The connector opens the connection a session_connect event asked for on the
+// node connection route of this node's id.
+func TestControlPlaneSessionConnector_OpensTheNodeConnectionRoute(t *testing.T) {
+	paths := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.Path
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		_ = c.Close(websocket.StatusNormalClosure, "")
+	}))
+	t.Cleanup(srv.Close)
+	client, err := api.NewControlPlane(api.Config{BaseURL: srv.URL}, "1.0.0-test", discardLogger())
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	client.SetAuthToken("test-token")
+
+	connector := &controlPlaneSessionConnector{cp: client, nodeID: upTestNodeID}
+	conn, err := connector.OpenSessionConnection(context.Background(), "sess-ssh", "conn-1")
+	if err != nil {
+		t.Fatalf("OpenSessionConnection() error: %v", err)
+	}
+	defer conn.Close()
+	if path, want := <-paths, "/v1/nodes/"+upTestNodeID+"/sessions/sess-ssh/connections/conn-1"; path != want {
+		t.Errorf("path = %q, want %q", path, want)
+	}
+}
+
 func TestControlPlaneSessionReporter_PostsActivityRows(t *testing.T) {
 	reporter, rows := captureSessionRows(t, http.StatusNoContent, "")
 	ctx := context.Background()
@@ -3236,6 +3269,8 @@ func TestControlPlaneSessionReporter_PostsActivityRows(t *testing.T) {
 		Target:    api.SessionTarget{TCP: &api.SessionTargetTCP{Host: "10.0.0.5", Port: 22}},
 	}
 
+	// An ssh session binds no listener; an endpoint handed in anyway is not
+	// reported.
 	if err := reporter.ReportSessionStarted(ctx, sshEntry, "10.99.0.1:40000"); err != nil {
 		t.Fatalf("ReportSessionStarted(ssh) error: %v", err)
 	}
@@ -3254,7 +3289,7 @@ func TestControlPlaneSessionReporter_PostsActivityRows(t *testing.T) {
 	}, api.TerminatedByPlexdClose)
 
 	want := []string{
-		`{"ssh":{"phase":"session_started","listener_endpoint":"10.99.0.1:40000"}}`,
+		`{"ssh":{"phase":"session_started"}}`,
 		`{"ssh":{"phase":"session_ended","terminated_by":"idle_timeout"}}`,
 		`{"ssh":{"command":"uptime","started_at":"2026-09-24T08:00:00Z"}}`,
 		`{"ssh":{"command":"uptime","exit_code":0,"started_at":"2026-09-24T08:00:00Z","completed_at":"2026-09-24T08:00:03Z"}}`,
