@@ -216,6 +216,64 @@ func TestReconcileHandler_HandsTheManagerTheDialOrder(t *testing.T) {
 	}
 }
 
+// Fallback names the fallback_endpoint only where it ends the dial order, the
+// entry endpoint selection holds.
+func TestReconcileHandler_SetsTheFallback(t *testing.T) {
+	tests := []struct {
+		name       string
+		candidates []string
+		fallback   string
+		wantOrder  []string
+		want       string
+	}{
+		{
+			"fallback ends the dial order",
+			[]string{"172.31.4.9:51820"},
+			"203.0.113.1:51820",
+			[]string{"198.51.100.7:51820", "172.31.4.9:51820", "203.0.113.1:51820"},
+			"203.0.113.1:51820",
+		},
+		{
+			"fallback keeps a candidate's earlier position",
+			[]string{"203.0.113.1:51820", "172.31.4.9:51820"},
+			"203.0.113.1:51820",
+			[]string{"198.51.100.7:51820", "203.0.113.1:51820", "172.31.4.9:51820"},
+			"",
+		},
+		{
+			"no fallback",
+			[]string{"172.31.4.9:51820"},
+			"",
+			[]string{"198.51.100.7:51820", "172.31.4.9:51820"},
+			"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr := setupMeshManager(t, &mockController{}, discardLogger())
+			handler := ReconcileHandler(mgr, nil)
+
+			peer := snapshotPeer("peer-1", "10.99.0.2", tt.fallback)
+			peer.Endpoint = "198.51.100.7:51820"
+			peer.EndpointCandidates = tt.candidates
+			if err := handler(context.Background(), nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
+				t.Fatalf("add: %v", err)
+			}
+
+			st := mgr.dial["peer-1"]
+			if st == nil {
+				t.Fatal("no dial state for peer-1 after the add")
+			}
+			if !slices.Equal(st.peer.Endpoints, tt.wantOrder) {
+				t.Fatalf("Endpoints = %v, want %v", st.peer.Endpoints, tt.wantOrder)
+			}
+			if st.peer.Fallback != tt.want {
+				t.Errorf("Fallback = %q, want %q", st.peer.Fallback, tt.want)
+			}
+		})
+	}
+}
+
 func TestReconcileHandler_PrefixErrorOrdersEveryCandidateOffLink(t *testing.T) {
 	var logs bytes.Buffer
 	ctrl := &mockController{}
@@ -378,6 +436,47 @@ func TestSelectEndpoints_AdvancesWithoutAHandshake(t *testing.T) {
 		"peer_id=node-a",
 		"endpoint=198.51.100.7:51820 attempt=2 of=3",
 		"endpoint=10.0.0.5:51820 attempt=1 of=3",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log does not contain %q:\n%s", want, out)
+		}
+	}
+}
+
+// A Fallback that ends the dial order is held as long as the entries before
+// it took together: two trials in a three-entry order.
+func TestSelectEndpoints_HoldsTheFallback(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
+	_, b64 := testKey(0x0a)
+	peer := orderedPeer("node-a", b64, threeEntries...)
+	peer.Fallback = threeEntries[2]
+	if err := mgr.AddPeer(peer); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+
+	for _, step := range []struct {
+		after time.Duration
+		want  []string
+	}{
+		{30 * time.Second, []string{threeEntries[0], threeEntries[1]}},
+		{60 * time.Second, []string{threeEntries[0], threeEntries[1], threeEntries[2]}},
+		{90 * time.Second, []string{threeEntries[0], threeEntries[1], threeEntries[2]}},
+		{119 * time.Second, []string{threeEntries[0], threeEntries[1], threeEntries[2]}},
+		{120 * time.Second, []string{threeEntries[0], threeEntries[1], threeEntries[2], threeEntries[0]}},
+	} {
+		clock.Set(selectionStart.Add(step.after))
+		mustSelect(t, mgr)
+		if got := writtenEndpoints(t, ctrl); !slices.Equal(got, step.want) {
+			t.Fatalf("written endpoints after %v = %v, want %v", step.after, got, step.want)
+		}
+	}
+
+	out := logs.String()
+	for _, want := range []string{
+		"endpoint=198.51.100.7:51820 attempt=2 of=3 trial=30s",
+		"endpoint=203.0.113.1:51820 attempt=3 of=3 trial=1m0s",
+		"endpoint=10.0.0.5:51820 attempt=1 of=3 trial=30s",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("log does not contain %q:\n%s", want, out)
