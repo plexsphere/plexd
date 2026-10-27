@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"sync"
 	"time"
@@ -18,18 +19,43 @@ import (
 // errors.Is can settle the session instead of retrying it on every pull.
 var ErrTunnelingDisabled = errors.New("tunnel: tunneling is disabled")
 
+// The refusals of ConnectSSHSession that come before it opens anything, beside
+// ErrTunnelingDisabled, ErrSSHSessionsUnsupported and ErrSSHSessionsDisabled.
+var (
+	// ErrSessionNotLive is returned for an id no live session carries: one that
+	// was never provisioned here, or one that already closed.
+	ErrSessionNotLive = errors.New("tunnel: no live session with this id")
+	// ErrNotSSHSession is returned for a live session of another kind.
+	ErrNotSSHSession = errors.New("tunnel: the session is not an ssh session")
+	// ErrSSHConnectionLimit is returned while the session holds as many
+	// connections, open or still opening, as it may.
+	ErrSSHConnectionLimit = errors.New("tunnel: the ssh session is at its connection limit")
+)
+
+// errSessionClosedWhileConnecting is returned by ConnectSSHSession when the
+// session closed while its connection was being opened; the connection is
+// closed again.
+var errSessionClosedWhileConnecting = errors.New("tunnel: the session closed while its connection opened")
+
+// sshConnector is a session that serves connections the control plane asks
+// for. connect opens one with dial and serves the session's SSH login on it.
+type sshConnector interface {
+	connect(connectionID string, dial func(context.Context) (net.Conn, error)) error
+}
+
 // maxIdleTimeoutSeconds bounds the idle window a session entry may carry. It is
 // far above any usable window and only exists to keep the seconds-to-Duration
 // multiplication from overflowing into a negative value.
 const maxIdleTimeoutSeconds = 24 * 60 * 60
 
 // managedSession is what the SessionManager needs from a session of any kind:
-// a listener to start, a close, an idle window, and the facts its expiry timer,
-// the dispatcher's teardown pass and the session_ended row are built from.
+// a start, a close, an idle window, and the facts its expiry timer, the
+// dispatcher's teardown pass and the session_ended row are built from.
 // Sessions of every kind share one map, so MaxSessions and the DefaultTimeout
 // cap count them together.
 type managedSession interface {
-	// Start binds the session's listener and returns its address. Everything
+	// Start starts the session and returns its listener's address: a tcp
+	// session binds one, an ssh session binds none and returns "". Everything
 	// the session runs hangs off a child of ctx that Close cancels.
 	Start(ctx context.Context) (string, error)
 	Close() error
@@ -78,13 +104,15 @@ func (m *SessionManager) SetSSHSessionDeps(deps SSHSessionDeps) {
 
 // CreateSession creates and starts a tunnel session for one entry of the pull's
 // sessions block and returns the bound listener address. tcp entries become a
-// TCP forward to their target. ssh entries become an SSH listener, on Linux and
-// macOS and once SetSSHSessionDeps wired it; they are refused with
-// ErrSSHSessionsUnsupported elsewhere and with ErrSSHSessionsDisabled when the
-// node refuses ssh sessions. Any other kind is not provisionable: the session
-// dispatcher filters the block before calling in, and the kind guard here keeps
-// the manager safe to call on its own. Sessions of both kinds count against
-// MaxSessions together.
+// TCP forward to their target, bound on the mesh address. ssh entries become an
+// SSH session served over the connections plexd opens to the control plane on
+// request (see ConnectSSHSession), so they bind nothing and return an empty
+// address, on Linux and macOS and once SetSSHSessionDeps wired it; they are
+// refused with ErrSSHSessionsUnsupported elsewhere and with
+// ErrSSHSessionsDisabled when the node refuses ssh sessions. Any other kind is
+// not provisionable: the session dispatcher filters the block before calling
+// in, and the kind guard here keeps the manager safe to call on its own.
+// Sessions of both kinds count against MaxSessions together.
 func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSession) (string, error) {
 	if !m.cfg.Enabled {
 		return "", ErrTunnelingDisabled
@@ -133,7 +161,7 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 		return "", fmt.Errorf("tunnel: invalid idle_timeout_seconds: %d", sess.IdleTimeoutSeconds)
 	}
 
-	// A session listener carries no authentication of its own, so the mesh
+	// A tcp session listener carries no authentication of its own, so the mesh
 	// address it binds is the whole of its reachability boundary. The address is
 	// copied verbatim from the control plane's registration response into
 	// identity.json, so it is parsed here rather than trusted: an empty value,
@@ -141,7 +169,9 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 	// ::) would each have net.Listen bind every unicast address on the host and
 	// publish an unauthenticated forward to an internal service on the node's
 	// public and LAN interfaces. A multicast one binds a group address instead
-	// of the node's own, which is not a reachability boundary either.
+	// of the node's own, which is not a reachability boundary either. An ssh
+	// session binds nothing, so it never reads the mesh address, and a node
+	// without a usable one still serves it.
 	//
 	// The guard runs on the address net.Listen would actually bind, not on the
 	// parsed one: netip.Addr.IsUnspecified matches exactly 0.0.0.0 and ::, while
@@ -150,10 +180,12 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 	// "::%eth0". Validating the parsed form would classify those two differently
 	// from the bind they produce. WithZone must precede Unmap — a zoned address
 	// is never Is4In6, so Unmap alone is a no-op on "::ffff:0.0.0.0%eth0".
-	meshAddr, err := netip.ParseAddr(m.meshIP)
-	bindAddr := meshAddr.WithZone("").Unmap()
-	if err != nil || bindAddr.IsUnspecified() || bindAddr.IsMulticast() {
-		return "", fmt.Errorf("tunnel: mesh IP %q is not a bindable unicast address; refusing to bind a session listener", m.meshIP)
+	if sess.Kind == api.SessionKindTCP {
+		meshAddr, err := netip.ParseAddr(m.meshIP)
+		bindAddr := meshAddr.WithZone("").Unmap()
+		if err != nil || bindAddr.IsUnspecified() || bindAddr.IsMulticast() {
+			return "", fmt.Errorf("tunnel: mesh IP %q is not a bindable unicast address; refusing to bind a session listener", m.meshIP)
+		}
 	}
 
 	now := time.Now()
@@ -189,9 +221,9 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 
 	var session managedSession
 	if sess.Kind == api.SessionKindSSH {
+		var err error
 		session, err = newSSHSession(sshSessionParams{
 			entry:     sess,
-			meshIP:    m.meshIP,
 			expiresAt: expiresAt,
 			deps:      sshDeps,
 			logger:    m.logger,
@@ -236,14 +268,49 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 		})
 	}
 
-	m.logger.Info("session created",
-		"session_id", sess.SessionID,
-		"kind", sess.Kind,
-		"listen_addr", addr,
-		"expires_at", expiresAt.String(),
-	)
+	attrs := []any{"session_id", sess.SessionID, "kind", sess.Kind}
+	if sess.Kind == api.SessionKindTCP {
+		attrs = append(attrs, "listen_addr", addr)
+	}
+	m.logger.Info("session created", append(attrs, "expires_at", expiresAt.String())...)
 
 	return addr, nil
+}
+
+// ConnectSSHSession serves one connection of the live ssh session sessionID,
+// the one a session_connect event named connectionID: dial opens it to the
+// control plane, and the session runs its SSH login on it under the session's
+// own limits and lifetime. Every refusal comes before dial runs: tunneling or
+// ssh sessions switched off (ErrTunnelingDisabled, ErrSSHSessionsDisabled), a
+// platform without ssh sessions (ErrSSHSessionsUnsupported), an id no live
+// session carries (ErrSessionNotLive), a session of another kind
+// (ErrNotSSHSession), or one already holding its connection limit
+// (ErrSSHConnectionLimit). A failed dial is returned wrapped. Closing the
+// session cancels a dial in flight.
+func (m *SessionManager) ConnectSSHSession(sessionID, connectionID string, dial func(context.Context) (net.Conn, error)) error {
+	if !m.cfg.Enabled {
+		return ErrTunnelingDisabled
+	}
+	if !sshSessionsSupported {
+		return ErrSSHSessionsUnsupported
+	}
+	if !m.cfg.SSHSessionsAllowed() {
+		return ErrSSHSessionsDisabled
+	}
+
+	m.mu.Lock()
+	session, ok := m.sessions[sessionID]
+	m.mu.Unlock()
+	if !ok {
+		return ErrSessionNotLive
+	}
+	connector, ok := session.(sshConnector)
+	if !ok {
+		return ErrNotSSHSession
+	}
+	// The dial blocks on the control plane, so it runs outside the manager's
+	// lock; a session closing meanwhile refuses it through connect.
+	return connector.connect(connectionID, dial)
 }
 
 // ClosedSessionInfo contains metadata about a session that was closed. Kind is

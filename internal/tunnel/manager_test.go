@@ -953,8 +953,8 @@ func TestSessionManager_MaxSessionsCountsBothKinds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSession(ssh) error: %v", err)
 	}
-	if host, _, _ := net.SplitHostPort(addr); host != "127.0.0.1" {
-		t.Errorf("ssh listener bound %q, want the mesh address", addr)
+	if addr != "" {
+		t.Errorf("ssh session returned the address %q, want none: it binds no listener", addr)
 	}
 
 	for _, entry := range []api.NodeStateSession{

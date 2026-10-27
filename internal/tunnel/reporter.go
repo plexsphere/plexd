@@ -9,9 +9,11 @@ import (
 // SessionActivityReporter reports a session's session_started row to the
 // control plane: the tcp row, which carries the target, for a tcp entry, and the
 // ssh lifecycle row for an ssh entry. The session dispatcher posts it once the
-// listener is up, so the row carries the bound listener address. That address is
-// the operator's only route to the listener, so the error is returned rather
-// than swallowed: a dropped row leaves a listener nobody can reach. The matching
+// session is up. For a tcp entry listenerEndpoint is the bound listener address,
+// the operator's only route to the listener; an ssh session binds none, so it is
+// empty, and the row tells the control plane the session is ready to serve the
+// connections it asks for. Either way the error is returned rather than
+// swallowed: a dropped row leaves a session nobody can reach. The matching
 // session_ended row is emitted from the SessionManager's on-closed callback, not
 // through here.
 type SessionActivityReporter interface {

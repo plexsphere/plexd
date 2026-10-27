@@ -24,14 +24,18 @@ import (
 // session helper that can start processes as the login user.
 const sshSessionsSupported = true
 
-// DECISION: one listener per ssh session, on an ephemeral port of the mesh
-// address, the way a tcp session binds one. The mesh SSHServer
-// (tunnel.ssh_listen_addr) is left as it is: it serves direct-tcpip, which the
-// session contract refuses, and takes its token from the public-key blob.
+// DECISION: an ssh session binds no listener. The control plane asks for each
+// connection with a signed session_connect event, and plexd opens it out to the
+// control plane (SessionManager.ConnectSSHSession), so the session needs
+// neither a mesh address nor an inbound port, and the control plane needs no
+// route into the mesh. The mesh SSHServer (tunnel.ssh_listen_addr) is left as
+// it is: it serves direct-tcpip, which the session contract refuses, and takes
+// its token from the public-key blob.
 //
-// DECISION: the listener presents the node's existing host key, whose
+// DECISION: the session presents the node's existing host key, whose
 // fingerprint the capability manifest already carries. Clients do not pin it
-// (contract §d): the session token is what authenticates the pair.
+// (contract §d): the control plane accepted the connection from this node's
+// NSK, and the session token is what authenticates the pair.
 //
 // DECISION: the limits below keep one session from exhausting the node. Channels
 // are counted while they are open, so a multiplexed connection can run commands
@@ -53,6 +57,11 @@ const (
 // timeout.
 const sshCommandReportTimeout = sessionStartedReportTimeout
 
+// sessionConnectTimeout bounds opening one connection to the control plane, for
+// the same reason: it covers the TCP connect, the TLS handshake and the
+// WebSocket upgrade, and must clear the API client's own connect timeout.
+const sessionConnectTimeout = sessionStartedReportTimeout
+
 // launchRequestVersion is the only version of LaunchRequest there is.
 const launchRequestVersion = 1
 
@@ -65,12 +74,12 @@ const (
 
 var errSSHLoginUser = errors.New("tunnel: ssh: login user does not match the session")
 
-// sshSession serves one mediated ssh session: an SSH-2 listener that admits the
-// session's user with the session token as password, and starts a shell or one
-// command per session channel through the SessionLauncher.
+// sshSession serves one mediated ssh session: an SSH-2 server, run on every
+// connection the control plane asks for, that admits the session's user with
+// the session token as password and starts a shell or one command per session
+// channel through the SessionLauncher.
 type sshSession struct {
 	entry     api.NodeStateSession
-	meshIP    string
 	expiresAt time.Time
 	startTime time.Time
 	deps      SSHSessionDeps
@@ -83,15 +92,22 @@ type sshSession struct {
 	// activityClock holds the last byte on any connection.
 	activityClock
 
-	listener net.Listener
-	cancel   context.CancelFunc
+	// ctx is the session's own context, set by Start and cancelled by Close.
+	// Every connection and every dial in flight hangs off it.
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	mu     sync.Mutex
 	closed bool
 	// conns holds the raw connections, so Close can end one mid-handshake.
 	conns map[net.Conn]struct{}
-	// wg tracks every goroutine serving the session. Each Add happens on a
-	// goroutine that itself holds a count, so it never races Close's Wait.
+	// pending counts the connections being opened, which hold a slot of the
+	// connection limit until their dial returns.
+	pending int
+	// wg tracks every goroutine serving the session and every connection being
+	// opened. Each Add happens on a goroutine that itself holds a count, or in
+	// connect under mu while the session is open, so it never races Close's
+	// Wait.
 	wg sync.WaitGroup
 }
 
@@ -100,7 +116,6 @@ var _ managedSession = (*sshSession)(nil)
 func newSSHSession(p sshSessionParams) (managedSession, error) {
 	s := &sshSession{
 		entry:     p.entry,
-		meshIP:    p.meshIP,
 		expiresAt: p.expiresAt,
 		startTime: time.Now(),
 		deps:      p.deps,
@@ -129,67 +144,71 @@ func (s *sshSession) closedInfo() ClosedSessionInfo {
 	return ClosedSessionInfo{Kind: api.SessionKindSSH}
 }
 
-// Start binds the listener on an ephemeral port of the mesh address and serves
-// it on a child of ctx that Close cancels.
+// Start makes the session ready to serve connections on a child of ctx that
+// Close cancels. It binds nothing and returns an empty address.
 func (s *sshSession) Start(ctx context.Context) (string, error) {
-	ctx, s.cancel = context.WithCancel(ctx)
-
-	addr := net.JoinHostPort(s.meshIP, "0")
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		s.cancel()
-		return "", fmt.Errorf("tunnel: listen on %s: %w", addr, err)
-	}
-	s.listener = ln
-	// The bind is the first activity, as for a tcp session.
+	s.ctx, s.cancel = context.WithCancel(ctx)
+	// Readiness is the first activity, as a tcp session's bind is.
 	s.stamp()
-	context.AfterFunc(ctx, func() { ln.Close() })
 
-	s.logger.Info("ssh session started",
-		"listen_addr", ln.Addr().String(),
-		"user", s.entry.Target.SSH.User,
-	)
-
-	s.wg.Add(1)
-	go s.acceptLoop(ctx)
+	s.logger.Info("ssh session ready", "user", s.entry.Target.SSH.User)
 
 	// The monitor is not tracked in wg: it calls onIdle, which closes the
-	// session and waits for wg. It returns once ctx is cancelled.
+	// session and waits for wg. It returns once the session's ctx is cancelled.
 	if s.idleTimeout > 0 {
-		go runIdleMonitor(ctx, s.idleTimeout, s.idleFor, s.onIdle)
+		go runIdleMonitor(s.ctx, s.idleTimeout, s.idleFor, s.onIdle)
 	}
-	return ln.Addr().String(), nil
+	return "", nil
 }
 
-func (s *sshSession) acceptLoop(ctx context.Context) {
-	defer s.wg.Done()
-	for {
-		raw, err := s.listener.Accept()
-		if err != nil {
-			return // The listener was closed.
-		}
-		if !s.register(raw) {
-			raw.Close()
-			s.logger.Debug("ssh connection refused: session connection limit reached",
-				"remote_addr", raw.RemoteAddr().String(),
-			)
-			continue
-		}
-		s.wg.Add(1)
-		go s.handleConn(ctx, raw)
-	}
-}
-
-// register records raw as a live connection unless the session is closed or
-// at its connection limit.
-func (s *sshSession) register(raw net.Conn) bool {
+// connect opens one connection with dial and serves the session's SSH login on
+// it. The connection holds a slot of sshMaxConnsPerSession from before the dial
+// until its handler returns, so connections being opened count against the
+// limit with the open ones.
+func (s *sshSession) connect(connectionID string, dial func(context.Context) (net.Conn, error)) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed || len(s.conns) >= sshMaxConnsPerSession {
-		return false
+	if s.closed {
+		s.mu.Unlock()
+		return ErrSessionNotLive
+	}
+	if len(s.conns)+s.pending >= sshMaxConnsPerSession {
+		s.mu.Unlock()
+		return ErrSSHConnectionLimit
+	}
+	s.pending++
+	// The count is taken under mu while the session is open, and Close marks it
+	// closed under mu before it waits, so this Add always happens before Close's
+	// Wait. handleConn releases it, or the failure paths below do.
+	s.wg.Add(1)
+	s.mu.Unlock()
+
+	// Close cancels s.ctx, which aborts a dial in flight.
+	dialCtx, cancel := context.WithTimeout(s.ctx, sessionConnectTimeout)
+	raw, err := dial(dialCtx)
+	cancel()
+
+	s.mu.Lock()
+	s.pending--
+	// A session that closed during the dial cancelled it, so its failure is the
+	// close's doing, not the control plane's.
+	if s.closed {
+		s.mu.Unlock()
+		if raw != nil {
+			raw.Close()
+		}
+		s.wg.Done()
+		return errSessionClosedWhileConnecting
+	}
+	if err != nil {
+		s.mu.Unlock()
+		s.wg.Done()
+		return fmt.Errorf("tunnel: open session connection: %w", err)
 	}
 	s.conns[raw] = struct{}{}
-	return true
+	s.mu.Unlock()
+
+	go s.handleConn(s.ctx, raw, connectionID)
+	return nil
 }
 
 func (s *sshSession) unregister(raw net.Conn) {
@@ -198,12 +217,25 @@ func (s *sshSession) unregister(raw net.Conn) {
 	delete(s.conns, raw)
 }
 
+// sessionConnAddr names a connection by the connection_id its session_connect
+// event carried. Every connection's peer is the control plane, so the id is
+// what tells one apart from another in the log.
+type sessionConnAddr string
+
+func (a sessionConnAddr) Network() string { return "plexd-session-connection" }
+func (a sessionConnAddr) String() string  { return string(a) }
+
 // sshActivityConn stamps the session's activity on every byte it carries, so a
-// session in use never idles out.
+// session in use never idles out. Only SSH bytes count: the WebSocket the
+// connection rides answers pings inside its Read, and they never reach here.
+// RemoteAddr names the connection, so the SSH server's ConnMetadata does too.
 type sshActivityConn struct {
 	net.Conn
-	session *sshSession
+	session      *sshSession
+	connectionID string
 }
+
+func (c *sshActivityConn) RemoteAddr() net.Addr { return sessionConnAddr(c.connectionID) }
 
 func (c *sshActivityConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
@@ -221,7 +253,7 @@ func (c *sshActivityConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (s *sshSession) handleConn(ctx context.Context, raw net.Conn) {
+func (s *sshSession) handleConn(ctx context.Context, raw net.Conn, connectionID string) {
 	defer s.wg.Done()
 	defer s.unregister(raw)
 	defer raw.Close()
@@ -229,9 +261,9 @@ func (s *sshSession) handleConn(ctx context.Context, raw net.Conn) {
 	defer stop()
 
 	_ = raw.SetDeadline(time.Now().Add(sshHandshakeTimeout))
-	conn, chans, reqs, err := ssh.NewServerConn(&sshActivityConn{Conn: raw, session: s}, s.config)
+	conn, chans, reqs, err := ssh.NewServerConn(&sshActivityConn{Conn: raw, session: s, connectionID: connectionID}, s.config)
 	if err != nil {
-		s.logger.Debug("ssh handshake failed", "remote_addr", raw.RemoteAddr().String(), "error", err)
+		s.logger.Debug("ssh handshake failed", "connection_id", connectionID, "error", err)
 		return
 	}
 	defer conn.Close()
@@ -283,11 +315,12 @@ func (s *sshSession) handleConn(ctx context.Context, raw net.Conn) {
 
 // checkPassword admits the session's user with a token VerifySessionToken
 // accepts, and hands the token and its allowed-command list to the connection.
-// Neither the token nor any part of it is logged.
+// Neither the token nor any part of it is logged. The connection's RemoteAddr is
+// its sessionConnAddr, so the log names the connection_id.
 func (s *sshSession) checkPassword(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 	refuse := func(err error) (*ssh.Permissions, error) {
 		s.logger.Warn("ssh login refused",
-			"remote_addr", conn.RemoteAddr().String(),
+			"connection_id", conn.RemoteAddr().String(),
 			"user", conn.User(),
 			"error", err,
 		)
@@ -302,7 +335,7 @@ func (s *sshSession) checkPassword(conn ssh.ConnMetadata, password []byte) (*ssh
 		return refuse(err)
 	}
 	s.logger.Info("ssh login accepted",
-		"remote_addr", conn.RemoteAddr().String(),
+		"connection_id", conn.RemoteAddr().String(),
 		"user", conn.User(),
 	)
 	// DECISION: allowed_commands comes from the verified token's target claim,
@@ -607,8 +640,8 @@ func sendExitStatus(ch ssh.Channel, status int) {
 }
 
 // Close ends the session idempotently: it cancels everything the session runs,
-// closes the listener and every connection, and waits at most drainTimeout for
-// the handlers.
+// dials in flight included, closes every connection, and waits at most
+// drainTimeout for the handlers.
 func (s *sshSession) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -624,9 +657,6 @@ func (s *sshSession) Close() error {
 
 	if s.cancel != nil {
 		s.cancel()
-	}
-	if s.listener != nil {
-		s.listener.Close()
 	}
 	for _, c := range conns {
 		c.Close()

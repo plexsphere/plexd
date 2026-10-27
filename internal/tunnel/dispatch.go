@@ -63,11 +63,13 @@ type Dispatcher struct {
 	// unreported maps the id of a provisioned session whose started row has not
 	// reached the control plane to the address its listener holds. The row is
 	// re-posted from that address on every later pull until it lands, rather
-	// than the listener being rebuilt: the ephemeral port is the operator's only
-	// route in, so giving it up would publish a different listener_endpoint per
-	// attempt and pair each one with a spurious session_ended row. It drains on
-	// the first delivered row or a revoked-or-expired answer, and otherwise with
-	// the entry itself.
+	// than the listener being rebuilt: a tcp session's ephemeral port is the
+	// operator's only route in, so giving it up would publish a different
+	// listener_endpoint per attempt and pair each one with a spurious
+	// session_ended row. An ssh session binds no listener, so its address is
+	// empty, and its row is re-posted the same way. It drains on the first
+	// delivered row or a revoked-or-expired answer, and otherwise with the entry
+	// itself.
 	unreported map[string]string
 
 	// goneStanding holds the ids the control plane answered as revoked or
@@ -385,15 +387,17 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 			defer reportWg.Done()
 			reportCtx, cancel := context.WithTimeout(ctx, sessionStartedReportTimeout)
 			defer cancel()
-			// The started row carries the ephemeral port that is the operator's
-			// only route to the listener, so an undelivered row leaves a bound
-			// listener nobody can reach until it lands. The listener is kept and
-			// the entry left unsettled, so the next pull re-posts the same
-			// endpoint; tearing it down instead would forfeit the port, and a
-			// control plane too slow to answer within the bound would then see a
-			// session_ended row and a fresh listener_endpoint on every pull for
-			// the whole TTL of the entry. The capped expiry timer is what
-			// reclaims a listener whose row never lands.
+			// A tcp session's started row carries the ephemeral port that is the
+			// operator's only route to the listener, so an undelivered row leaves
+			// a bound listener nobody can reach until it lands. The listener is
+			// kept and the entry left unsettled, so the next pull re-posts the
+			// same endpoint; tearing it down instead would forfeit the port, and
+			// a control plane too slow to answer within the bound would then see
+			// a session_ended row and a fresh listener_endpoint on every pull for
+			// the whole TTL of the entry. An ssh session's row carries no
+			// endpoint, and until it lands the control plane asks for no
+			// connection; it is kept and re-posted the same way. The capped
+			// expiry timer is what reclaims a session whose row never lands.
 			if err := d.reporter.ReportSessionStarted(reportCtx, s.entry, s.addr); err != nil {
 				// A revoked-or-expired verdict settles the row but never tears
 				// the listener down: the entry draining from the block on a
