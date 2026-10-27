@@ -6,6 +6,7 @@ package mockapi
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdsa"
@@ -38,6 +39,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"github.com/plexsphere/plexd/internal/api"
 )
 
@@ -63,14 +66,23 @@ type AssertionCounters struct {
 	// SessionActivityRejectedCount counts the liveness refusals (404/409) of the
 	// session activity endpoint. A structural 400 counts nowhere.
 	SessionActivityRejectedCount int64 `json:"session_activity_rejected_count"`
-	IntegrityViolationCount      int64 `json:"integrity_violation_count"`
-	HandshakeReportCount         int64 `json:"handshake_report_count"`
-	EdgePSKCount                 int64 `json:"edge_psk_count"`
-	InjectEventCount             int64 `json:"inject_event_count"`
-	EventsRequestCount           int64 `json:"events_request_count"`
-	LocalMetricsCount            int64 `json:"local_metrics_count"`
-	LocalLogsCount               int64 `json:"local_logs_count"`
-	LocalAuditCount              int64 `json:"local_audit_count"`
+	// SessionConnectionCount counts the connections the session connection
+	// route handed to a waiting relay.
+	SessionConnectionCount int64 `json:"session_connection_count"`
+	// SessionConnectionRejectedCount counts the session connection route's
+	// 404, 409 and 426 answers. Its 403 for another node's path counts nowhere.
+	SessionConnectionRejectedCount int64 `json:"session_connection_rejected_count"`
+	// SessionConnectionTimeoutCount counts the relays that waited out their
+	// expires_at without the node's connection.
+	SessionConnectionTimeoutCount int64 `json:"session_connection_timeout_count"`
+	IntegrityViolationCount       int64 `json:"integrity_violation_count"`
+	HandshakeReportCount          int64 `json:"handshake_report_count"`
+	EdgePSKCount                  int64 `json:"edge_psk_count"`
+	InjectEventCount              int64 `json:"inject_event_count"`
+	EventsRequestCount            int64 `json:"events_request_count"`
+	LocalMetricsCount             int64 `json:"local_metrics_count"`
+	LocalLogsCount                int64 `json:"local_logs_count"`
+	LocalAuditCount               int64 `json:"local_audit_count"`
 	// UnauthorizedCount counts requests refused by the bearer-envelope gate. A
 	// node that presents the wrong credential drives this above zero, which is
 	// exactly the defect the suite failed to catch before the gate existed.
@@ -80,41 +92,56 @@ type AssertionCounters struct {
 // DefaultKeepAliveInterval is the default interval between SSE keep-alive comments.
 const DefaultKeepAliveInterval = 15 * time.Second
 
+// DefaultSessionConnectWait is how long a relay waits for the node's
+// connection by default: the control plane's default
+// PLEXSPHERE_ACCESS_ATTACH_DIAL_TIMEOUT.
+const DefaultSessionConnectWait = 10 * time.Second
+
 // Server is a mock Central API server that returns fixture data.
 type Server struct {
 	// KeepAliveInterval controls the SSE keep-alive comment interval.
 	// Defaults to DefaultKeepAliveInterval (15s). Set before calling Handler().
 	KeepAliveInterval time.Duration
 
-	registerCount                atomic.Int64
-	heartbeatCount               atomic.Int64
-	stateCount                   atomic.Int64
-	keyRotateCount               atomic.Int64
-	capabilitiesCount            atomic.Int64
-	endpointCount                atomic.Int64
-	endpointCandidatesCount      atomic.Int64
-	secretsCount                 atomic.Int64
-	secretCurrentVersion         atomic.Int64
-	secretRateLimitNext          atomic.Int64
-	secretRetryAfterSeconds      atomic.Int64
-	secretsRateLimitedCount      atomic.Int64
-	reportPutCount               atomic.Int64
-	reportDeleteCount            atomic.Int64
-	executionCallbackCount       atomic.Int64
-	executionUploadCount         atomic.Int64
-	metricsCount                 atomic.Int64
-	logsCount                    atomic.Int64
-	auditCount                   atomic.Int64
-	sessionActivityCount         atomic.Int64
-	sessionActivityRejectedCount atomic.Int64
-	integrityViolationCount      atomic.Int64
-	handshakeReportCount         atomic.Int64
-	edgePSKCount                 atomic.Int64
-	injectEventCount             atomic.Int64
-	eventsRequestCount           atomic.Int64
-	localMetricsCount            atomic.Int64
-	localLogsCount               atomic.Int64
-	localAuditCount              atomic.Int64
+	// SessionConnectWait is how long a relay opened through
+	// POST /test/session-connect waits for the node's connection once it has
+	// published session_connect, and so how far ahead the event's expires_at
+	// lies. Defaults to DefaultSessionConnectWait (10s). Set before calling
+	// Handler().
+	SessionConnectWait time.Duration
+
+	registerCount                  atomic.Int64
+	heartbeatCount                 atomic.Int64
+	stateCount                     atomic.Int64
+	keyRotateCount                 atomic.Int64
+	capabilitiesCount              atomic.Int64
+	endpointCount                  atomic.Int64
+	endpointCandidatesCount        atomic.Int64
+	secretsCount                   atomic.Int64
+	secretCurrentVersion           atomic.Int64
+	secretRateLimitNext            atomic.Int64
+	secretRetryAfterSeconds        atomic.Int64
+	secretsRateLimitedCount        atomic.Int64
+	reportPutCount                 atomic.Int64
+	reportDeleteCount              atomic.Int64
+	executionCallbackCount         atomic.Int64
+	executionUploadCount           atomic.Int64
+	metricsCount                   atomic.Int64
+	logsCount                      atomic.Int64
+	auditCount                     atomic.Int64
+	sessionActivityCount           atomic.Int64
+	sessionActivityRejectedCount   atomic.Int64
+	sessionConnectionCount         atomic.Int64
+	sessionConnectionRejectedCount atomic.Int64
+	sessionConnectionTimeoutCount  atomic.Int64
+	integrityViolationCount        atomic.Int64
+	handshakeReportCount           atomic.Int64
+	edgePSKCount                   atomic.Int64
+	injectEventCount               atomic.Int64
+	eventsRequestCount             atomic.Int64
+	localMetricsCount              atomic.Int64
+	localLogsCount                 atomic.Int64
+	localAuditCount                atomic.Int64
 
 	// Signed event stream state (issue #25), all guarded by eventsMu. Every
 	// broadcast envelope is assigned a monotonic stream sequence (the first is
@@ -147,6 +174,15 @@ type Server struct {
 	// session records its ending row only while this is not session_ended.
 	sessionLifecycleMu sync.Mutex
 	sessionLifecycle   map[string]string
+
+	// pendingSessionConns maps the connection_id of every relay that has
+	// published session_connect and still waits for the node to the connection
+	// it awaits, guarded by pendingSessionConnsMu. The route that delivers the
+	// node's connection and the relay that gives up at expires_at each remove
+	// the entry under the lock before they act, so exactly one of them decides
+	// the connection's outcome.
+	pendingSessionConnsMu sync.Mutex
+	pendingSessionConns   map[string]*pendingSessionConn
 
 	heartbeatFixture   api.HeartbeatResponse
 	heartbeatFixtureMu sync.RWMutex
@@ -209,6 +245,7 @@ func New() *Server {
 
 	s := &Server{
 		KeepAliveInterval:   DefaultKeepAliveInterval,
+		SessionConnectWait:  DefaultSessionConnectWait,
 		lastRequests:        make(map[string][]byte),
 		mux:                 http.NewServeMux(),
 		signingPrivateKey:   priv,
@@ -223,6 +260,7 @@ func New() *Server {
 		execStates:          make(map[string]string),
 		sessionRegistry:     make(map[string]string),
 		sessionLifecycle:    make(map[string]string),
+		pendingSessionConns: make(map[string]*pendingSessionConn),
 		execUploads:         make(map[string]*execUpload),
 		eventClients:        make(map[uint64]*sseClient),
 		eventsMode:          eventsModeStreaming,
@@ -249,33 +287,36 @@ func (s *Server) Handler() http.Handler {
 // Assertions returns a snapshot of the current call counters.
 func (s *Server) Assertions() AssertionCounters {
 	return AssertionCounters{
-		RegisterCount:                s.registerCount.Load(),
-		HeartbeatCount:               s.heartbeatCount.Load(),
-		StateCount:                   s.stateCount.Load(),
-		KeyRotateCount:               s.keyRotateCount.Load(),
-		CapabilitiesCount:            s.capabilitiesCount.Load(),
-		EndpointCount:                s.endpointCount.Load(),
-		EndpointCandidatesCount:      s.endpointCandidatesCount.Load(),
-		SecretsCount:                 s.secretsCount.Load(),
-		SecretsRateLimitedCount:      s.secretsRateLimitedCount.Load(),
-		ReportPutCount:               s.reportPutCount.Load(),
-		ReportDeleteCount:            s.reportDeleteCount.Load(),
-		ExecutionCallbackCount:       s.executionCallbackCount.Load(),
-		ExecutionUploadCount:         s.executionUploadCount.Load(),
-		MetricsCount:                 s.metricsCount.Load(),
-		LogsCount:                    s.logsCount.Load(),
-		AuditCount:                   s.auditCount.Load(),
-		SessionActivityCount:         s.sessionActivityCount.Load(),
-		SessionActivityRejectedCount: s.sessionActivityRejectedCount.Load(),
-		IntegrityViolationCount:      s.integrityViolationCount.Load(),
-		HandshakeReportCount:         s.handshakeReportCount.Load(),
-		EdgePSKCount:                 s.edgePSKCount.Load(),
-		InjectEventCount:             s.injectEventCount.Load(),
-		EventsRequestCount:           s.eventsRequestCount.Load(),
-		LocalMetricsCount:            s.localMetricsCount.Load(),
-		LocalLogsCount:               s.localLogsCount.Load(),
-		LocalAuditCount:              s.localAuditCount.Load(),
-		UnauthorizedCount:            s.unauthorizedCount.Load(),
+		RegisterCount:                  s.registerCount.Load(),
+		HeartbeatCount:                 s.heartbeatCount.Load(),
+		StateCount:                     s.stateCount.Load(),
+		KeyRotateCount:                 s.keyRotateCount.Load(),
+		CapabilitiesCount:              s.capabilitiesCount.Load(),
+		EndpointCount:                  s.endpointCount.Load(),
+		EndpointCandidatesCount:        s.endpointCandidatesCount.Load(),
+		SecretsCount:                   s.secretsCount.Load(),
+		SecretsRateLimitedCount:        s.secretsRateLimitedCount.Load(),
+		ReportPutCount:                 s.reportPutCount.Load(),
+		ReportDeleteCount:              s.reportDeleteCount.Load(),
+		ExecutionCallbackCount:         s.executionCallbackCount.Load(),
+		ExecutionUploadCount:           s.executionUploadCount.Load(),
+		MetricsCount:                   s.metricsCount.Load(),
+		LogsCount:                      s.logsCount.Load(),
+		AuditCount:                     s.auditCount.Load(),
+		SessionActivityCount:           s.sessionActivityCount.Load(),
+		SessionActivityRejectedCount:   s.sessionActivityRejectedCount.Load(),
+		SessionConnectionCount:         s.sessionConnectionCount.Load(),
+		SessionConnectionRejectedCount: s.sessionConnectionRejectedCount.Load(),
+		SessionConnectionTimeoutCount:  s.sessionConnectionTimeoutCount.Load(),
+		IntegrityViolationCount:        s.integrityViolationCount.Load(),
+		HandshakeReportCount:           s.handshakeReportCount.Load(),
+		EdgePSKCount:                   s.edgePSKCount.Load(),
+		InjectEventCount:               s.injectEventCount.Load(),
+		EventsRequestCount:             s.eventsRequestCount.Load(),
+		LocalMetricsCount:              s.localMetricsCount.Load(),
+		LocalLogsCount:                 s.localLogsCount.Load(),
+		LocalAuditCount:                s.localAuditCount.Load(),
+		UnauthorizedCount:              s.unauthorizedCount.Load(),
 	}
 }
 
@@ -519,6 +560,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/nodes/{id}/logs", s.handleLogs)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/audit", s.handleAudit)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/sessions/{sid}", s.handleSessionActivity)
+	s.mux.HandleFunc("GET /v1/nodes/{id}/sessions/{sid}/connections/{cid}", s.handleSessionConnection)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/integrity-violations", s.handleIntegrityViolations)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/handshakes", s.handleHandshakes)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/peers/{peer_node_id}/psk", s.handleEdgePSK)
@@ -538,6 +580,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
 	s.mux.HandleFunc("GET /test/bearer", s.handleBearer)
 	s.mux.HandleFunc("POST /test/session-token", s.handleSessionToken)
+	s.mux.HandleFunc("POST /test/session-connect", s.handleSessionConnect)
 	s.mux.HandleFunc("POST /test/rotate-signing-key", s.handleRotateSigningKey)
 
 	// Method-not-allowed fallbacks.
@@ -556,6 +599,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/logs", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/audit", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/sessions/{sid}", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/sessions/{sid}/connections/{cid}", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/integrity-violations", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/handshakes", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/peers/{peer_node_id}/psk", methodNotAllowed)
@@ -568,6 +612,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/test/configure-events", methodNotAllowed)
 	s.mux.HandleFunc("/test/inject-event", methodNotAllowed)
 	s.mux.HandleFunc("/test/session-token", methodNotAllowed)
+	s.mux.HandleFunc("/test/session-connect", methodNotAllowed)
 	s.mux.HandleFunc("/test/rotate-signing-key", methodNotAllowed)
 }
 
@@ -2398,6 +2443,132 @@ func (s *Server) handleSessionActivity(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// headerHasToken reports whether any of h's values for name lists token, one
+// of its comma-separated elements, compared case-insensitively.
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, value := range h.Values(name) {
+		for _, element := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(element), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// pendingSessionConn is a connection a relay awaits: the session it was minted
+// for, the instant the relay stops waiting, and the channel the route hands
+// the node's connection over on. deliver holds one connection, so the one
+// request that takes the entry never blocks on it.
+type pendingSessionConn struct {
+	sessionID string
+	expiresAt time.Time
+	deliver   chan net.Conn
+}
+
+// awaitsSessionConnection reports whether a relay still awaits connectionID
+// for sessionID.
+func (s *Server) awaitsSessionConnection(sessionID, connectionID string) bool {
+	s.pendingSessionConnsMu.Lock()
+	defer s.pendingSessionConnsMu.Unlock()
+	pending, ok := s.pendingSessionConns[connectionID]
+	return ok && pending.sessionID == sessionID && time.Now().Before(pending.expiresAt)
+}
+
+// deliverSessionConnection hands conn to the relay that awaits connectionID
+// for sessionID and reports whether one still did. The entry leaves the
+// registry, the delivery counts and the connection is buffered under one lock
+// acquisition, so a relay whose deadline fires meanwhile finds the entry gone
+// and the connection waiting, and a counter read after the splice carried
+// bytes already shows the delivery.
+func (s *Server) deliverSessionConnection(sessionID, connectionID string, conn net.Conn) bool {
+	s.pendingSessionConnsMu.Lock()
+	defer s.pendingSessionConnsMu.Unlock()
+	pending, ok := s.pendingSessionConns[connectionID]
+	if !ok || pending.sessionID != sessionID || !time.Now().Before(pending.expiresAt) {
+		return false
+	}
+	delete(s.pendingSessionConns, connectionID)
+	s.sessionConnectionCount.Add(1)
+	pending.deliver <- conn
+	return true
+}
+
+// withdrawSessionConnection removes pending from the registry for a relay
+// that waited out its expires_at, and reports whether it was still there. A
+// false answer means the route took the entry first, and its connection is
+// already on pending.deliver.
+func (s *Server) withdrawSessionConnection(connectionID string, pending *pendingSessionConn) bool {
+	s.pendingSessionConnsMu.Lock()
+	defer s.pendingSessionConnsMu.Unlock()
+	if s.pendingSessionConns[connectionID] != pending {
+		return false
+	}
+	delete(s.pendingSessionConns, connectionID)
+	return true
+}
+
+// handleSessionConnection handles
+// GET /v1/nodes/{id}/sessions/{sid}/connections/{cid}, where the node opens
+// the connection a session_connect event asked for. It answers as the control
+// plane does (plexsphere/plexsphere#928, boundary 3), in the same order: a path
+// id other than this node's is a 403 nsk_node_mismatch; a connection id no
+// relay awaits, one whose expires_at has passed, or one minted for another
+// session is a 404 session_connection_not_found; a session the fixture does not
+// configure, or whose expires_at has passed, is a 409 session_not_active; and a
+// request whose Upgrade header does not name websocket, or whose Connection
+// header does not name upgrade, is a 426 upgrade_required. The 404, 409 and 426 answers count on
+// sessionConnectionRejectedCount.
+//
+// Otherwise it accepts the upgrade, takes the entry out of the registry, and
+// hands the connection, carried in binary messages, to the waiting relay, so a
+// second open of the same id is a 404. A relay that stopped waiting between
+// the check and the handover gets nothing, and the connection is closed
+// instead.
+func (s *Server) handleSessionConnection(w http.ResponseWriter, r *http.Request) {
+	if r.PathValue("id") != mockNodeID {
+		writeProblem(w, r, http.StatusForbidden, "nsk_node_mismatch", "node id does not match this node's identity")
+		return
+	}
+
+	sessionID, connectionID := r.PathValue("sid"), r.PathValue("cid")
+	if !s.awaitsSessionConnection(sessionID, connectionID) {
+		s.sessionConnectionRejectedCount.Add(1)
+		writeProblem(w, r, http.StatusNotFound, "session_connection_not_found",
+			"no connection with this id is awaited for this session")
+		return
+	}
+	if entry, configured, _, _ := s.resolveSession(sessionID); !configured || !entry.ExpiresAt.After(time.Now()) {
+		s.sessionConnectionRejectedCount.Add(1)
+		writeProblem(w, r, http.StatusConflict, "session_not_active", "session is not active")
+		return
+	}
+	// Both headers, as websocket.Accept requires: a request missing either would
+	// otherwise draw Accept's own plain-text 426, without the problem code and
+	// uncounted.
+	if !headerHasToken(r.Header, "Upgrade", "websocket") || !headerHasToken(r.Header, "Connection", "upgrade") {
+		s.sessionConnectionRejectedCount.Add(1)
+		// RFC 9110 requires a 426 to name the protocol the client must switch to.
+		w.Header().Set("Upgrade", "websocket")
+		writeProblem(w, r, http.StatusUpgradeRequired, "upgrade_required",
+			"the session connection must be opened as a WebSocket upgrade")
+		return
+	}
+
+	ws, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		// Accept has answered the request itself.
+		slog.Warn("handleSessionConnection: accept failed", "connection_id", connectionID, "error", err)
+		return
+	}
+	// The connection outlives this request, so the request's context, which
+	// the hijack leaves undefined, must not bound it.
+	conn := websocket.NetConn(context.Background(), ws, websocket.MessageBinary)
+	if !s.deliverSessionConnection(sessionID, connectionID, conn) {
+		conn.Close()
+	}
+}
+
 // handleIntegrityViolations handles POST /v1/nodes/{id}/integrity-violations. It
 // strict-decodes the contract's batch envelope and enforces the invariants the
 // real handler runs every entry through: a 1-to-128 entry batch, closed kind and
@@ -2853,6 +3024,170 @@ func (s *Server) handleSessionToken(w http.ResponseWriter, r *http.Request) {
 	signingInput := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(claims)
 	sig := ed25519.Sign(signingKey, []byte(signingInput))
 	writeJSON(w, http.StatusOK, map[string]string{"token": signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)})
+}
+
+// sessionConnectAcceptWindow bounds how long the listener that
+// POST /test/session-connect binds waits for its one client.
+const sessionConnectAcceptWindow = 60 * time.Second
+
+// handleSessionConnect handles POST /test/session-connect, the mock's stand-in
+// for a browser terminal or plexctl ssh attaching to an ssh session. The body
+// is {"session_id"}, and an empty session_id is a 400. It mints a connection_id,
+// binds a TCP listener on an ephemeral port of every interface, and answers
+// 200 {"connection_id","port"}. relaySessionConnection then plays the control
+// plane's side of the attach for the one client that connects to the port, so
+// a script that runs ssh against the port logs in over a WebSocket plexd
+// opened.
+//
+// DECISION: the fixture publishes session_connect for any session_id, live or
+// not, where the control plane publishes it only for a session whose newest
+// lifecycle row is session_started. The session connection route still judges
+// the session when the node connects, and the looser fixture lets a suite
+// prove that a node refuses an event for a session it no longer serves.
+func (s *Server) handleSessionConnect(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"session_id"`
+	}
+	if !s.decodeBody(w, r, "session_connect", &body) {
+		return
+	}
+	if body.SessionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session_id is required"})
+		return
+	}
+
+	// Every interface, not loopback: the scripts connect from another
+	// container on the suite's network.
+	ln, err := net.ListenTCP("tcp", &net.TCPAddr{})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "listen: " + err.Error()})
+		return
+	}
+	connectionID := newUUID()
+	go s.relaySessionConnection(ln, body.SessionID, connectionID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"connection_id": connectionID,
+		"port":          ln.Addr().(*net.TCPAddr).Port,
+	})
+}
+
+// relaySessionConnection plays the control plane's side of one attach on the
+// listener handleSessionConnect bound. It accepts one client within
+// sessionConnectAcceptWindow and closes the listener. On that accept, as the
+// control plane does when a client attaches, it registers the connection it
+// awaits with an expires_at SessionConnectWait ahead, publishes the signed
+// session_connect event that asks the node for it, and waits until expires_at.
+// A delivered connection is spliced to the client until either side ends. A
+// relay that waits out expires_at closes the client and counts on
+// sessionConnectionTimeoutCount.
+func (s *Server) relaySessionConnection(ln *net.TCPListener, sessionID, connectionID string) {
+	var client net.Conn
+	err := ln.SetDeadline(time.Now().Add(sessionConnectAcceptWindow))
+	if err == nil {
+		client, err = ln.Accept()
+	}
+	ln.Close()
+	if err != nil {
+		return
+	}
+
+	now := time.Now()
+	pending := &pendingSessionConn{
+		sessionID: sessionID,
+		expiresAt: now.Add(s.SessionConnectWait),
+		deliver:   make(chan net.Conn, 1),
+	}
+	envelope, err := s.sessionConnectEnvelope(sessionID, connectionID, now, pending.expiresAt)
+	if err != nil {
+		slog.Error("relaySessionConnection: build session_connect", "connection_id", connectionID, "error", err)
+		client.Close()
+		return
+	}
+	// Registered before the broadcast, so a node that answers the event at once
+	// finds the entry.
+	s.pendingSessionConnsMu.Lock()
+	s.pendingSessionConns[connectionID] = pending
+	s.pendingSessionConnsMu.Unlock()
+	s.BroadcastSSE(envelope)
+
+	timer := time.NewTimer(time.Until(pending.expiresAt))
+	defer timer.Stop()
+	select {
+	case node := <-pending.deliver:
+		spliceSessionConnection(client, node)
+	case <-timer.C:
+		if !s.withdrawSessionConnection(connectionID, pending) {
+			// The route took the entry before the deadline, and its
+			// connection is already buffered.
+			spliceSessionConnection(client, <-pending.deliver)
+			return
+		}
+		// Counted before the close, so a client that has read its end of the
+		// stream already sees the timeout on the counter.
+		s.sessionConnectionTimeoutCount.Add(1)
+		client.Close()
+	}
+}
+
+// sessionConnectEnvelope builds the signed session_connect envelope a relay
+// publishes. The payload has the shape of the control plane's
+// access.SessionConnectRequested event: the event_id and occurred_at header
+// members, which plexd does not read, the session, the connection id, and the
+// instant after which the control plane no longer accepts the connection.
+// signEnvelope stamps the Domain scope and the signing key id.
+func (s *Server) sessionConnectEnvelope(sessionID, connectionID string, now, expiresAt time.Time) (api.Envelope, error) {
+	payload, err := json.Marshal(map[string]string{
+		"event_id":      newUUID(),
+		"occurred_at":   now.UTC().Format(time.RFC3339Nano),
+		"session_id":    sessionID,
+		"connection_id": connectionID,
+		"expires_at":    expiresAt.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return api.Envelope{}, fmt.Errorf("mockapi: marshal session_connect payload: %w", err)
+	}
+	envelope := api.Envelope{
+		ID:       "evt-session-connect-" + connectionID,
+		Type:     api.EventSessionConnect,
+		IssuedAt: now.UTC(),
+		Payload:  payload,
+	}
+	if err := s.signEnvelope(&envelope); err != nil {
+		return api.Envelope{}, err
+	}
+	return envelope, nil
+}
+
+// spliceSessionConnection copies bytes between an attached client and the
+// node's connection in both directions, as the control plane's gateway does,
+// until either direction ends. It then closes both, which ends the other
+// direction too, and returns once both copies have.
+func spliceSessionConnection(client, node net.Conn) {
+	var closeOnce sync.Once
+	closeBoth := func() {
+		client.Close()
+		node.Close()
+	}
+	toNodeDone := make(chan struct{})
+	go func() {
+		defer close(toNodeDone)
+		_, _ = io.Copy(node, client)
+		closeOnce.Do(closeBoth)
+	}()
+	_, _ = io.Copy(client, node)
+	closeOnce.Do(closeBoth)
+	<-toNodeDone
+}
+
+// newUUID returns a random (version 4) UUID in the canonical 8-4-4-4-12 form.
+func newUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("mockapi: rand.Read uuid: " + err.Error())
+	}
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // handleRotateSigningKey handles POST /test/rotate-signing-key. It replaces the

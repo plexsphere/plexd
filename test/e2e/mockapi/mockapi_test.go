@@ -7,24 +7,32 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
+	"go.uber.org/goleak"
 
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/nodeapi"
@@ -207,14 +215,18 @@ var localCounterFields = map[string]bool{
 // request, and a run in which it moves at all is a failing run — the tests that
 // drive it assert on it directly. SessionActivityRejectedCount advances only on
 // a liveness refusal, which a fan-out posting to a seeded live session never
-// draws.
+// draws. The three SessionConnection counters advance only through a relay
+// that POST /test/session-connect opened, which the flat fan-out never opens.
 var statefulCounterFields = map[string]bool{
-	"KeyRotateCount":               true,
-	"ExecutionUploadCount":         true,
-	"SecretsRateLimitedCount":      true,
-	"EventsRequestCount":           true,
-	"UnauthorizedCount":            true,
-	"SessionActivityRejectedCount": true,
+	"KeyRotateCount":                 true,
+	"ExecutionUploadCount":           true,
+	"SecretsRateLimitedCount":        true,
+	"EventsRequestCount":             true,
+	"UnauthorizedCount":              true,
+	"SessionActivityRejectedCount":   true,
+	"SessionConnectionCount":         true,
+	"SessionConnectionRejectedCount": true,
+	"SessionConnectionTimeoutCount":  true,
 }
 
 // assertAllCountersEqual checks that every field in the AssertionCounters struct
@@ -1912,6 +1924,12 @@ func TestConcurrentCounters(t *testing.T) {
 	// liveness refusal was drawn.
 	if a.SessionActivityRejectedCount != 0 {
 		t.Errorf("session_activity_rejected_count = %d, want 0", a.SessionActivityRejectedCount)
+	}
+	// No relay was opened, so no session connection was delivered, refused or
+	// waited out.
+	if a.SessionConnectionCount != 0 || a.SessionConnectionRejectedCount != 0 || a.SessionConnectionTimeoutCount != 0 {
+		t.Errorf("session connection counters = %d/%d/%d (delivered/rejected/timed out), want 0/0/0",
+			a.SessionConnectionCount, a.SessionConnectionRejectedCount, a.SessionConnectionTimeoutCount)
 	}
 	// Every request above presented the node's envelope, so nothing may have
 	// been turned away.
@@ -5273,8 +5291,11 @@ func TestSessionActivity_ValidRows(t *testing.T) {
 }
 
 // plexd posts two lifecycle rows per ssh session and a command row per command.
+// Its session_started row carries no listener_endpoint since an ssh session
+// binds no listener, and the row older agents post with one is still admitted.
 func TestSessionActivity_SSHLifecycleRows(t *testing.T) {
 	for _, body := range []string{
+		`{"ssh":{"phase":"session_started"}}`,
 		`{"ssh":{"phase":"session_started","listener_endpoint":"10.99.0.1:40000"}}`,
 		`{"ssh":{"phase":"session_ended","terminated_by":"plexd_close"}}`,
 		`{"ssh":{"command":"ls"}}`,
@@ -5630,6 +5651,629 @@ func TestSessionActivity_WrongMethod_Returns405(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Session connections (issue #137)
+// ---------------------------------------------------------------------------
+
+// canonicalUUIDRe matches a version 4 UUID in canonical lowercase form, the
+// shape of the ids the relay mints.
+var canonicalUUIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// verifyNoGoroutineLeak fails the test when a goroutine started during it
+// outlives it, a relay and its splice included. Called before the test builds
+// its server, the check runs after every later cleanup, the server's close
+// among them.
+func verifyNoGoroutineLeak(t *testing.T) {
+	t.Helper()
+	ignore := goleak.IgnoreCurrent()
+	t.Cleanup(func() { goleak.VerifyNone(t, ignore) })
+}
+
+// newSessionConnectServer serves a fresh mock whose relays wait the given time
+// for the node's connection.
+func newSessionConnectServer(t *testing.T, wait time.Duration) (*mockapi.Server, *httptest.Server) {
+	t.Helper()
+	srv := mockapi.New()
+	srv.SessionConnectWait = wait
+	ts := httptest.NewServer(withBearerEnvelope(srv))
+	t.Cleanup(ts.Close)
+	return srv, ts
+}
+
+// sessionConnectionURL builds
+// GET /v1/nodes/{nodeID}/sessions/{sid}/connections/{cid}.
+func sessionConnectionURL(baseURL, nodeID, sid, cid string) string {
+	return baseURL + "/v1/nodes/" + nodeID + "/sessions/" + sid + "/connections/" + cid
+}
+
+// openRelay asks the mock for a relay to sessionID through
+// POST /test/session-connect and returns the minted connection id and the
+// port the relay listens on.
+func openRelay(t *testing.T, baseURL, sessionID string) (connectionID string, port int) {
+	t.Helper()
+	resp := doRequest(t, http.MethodPost, baseURL+"/test/session-connect", fmt.Sprintf(`{"session_id":%q}`, sessionID))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("session-connect status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var answer struct {
+		ConnectionID string `json:"connection_id"`
+		Port         int    `json:"port"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
+		t.Fatalf("decode session-connect answer: %v", err)
+	}
+	if !canonicalUUIDRe.MatchString(answer.ConnectionID) {
+		t.Fatalf("connection_id = %q, want a canonical UUID", answer.ConnectionID)
+	}
+	if answer.Port < 1 || answer.Port > 65535 {
+		t.Fatalf("port = %d, want an ephemeral port", answer.Port)
+	}
+	return answer.ConnectionID, answer.Port
+}
+
+// attachClient connects a client to the relay on port, as a browser terminal
+// attaches, and returns it with the session_connect envelope the relay
+// published on frames. The relay registers the connection it awaits before it
+// publishes, so once this returns the route finds the connection id.
+func attachClient(t *testing.T, port int, frames *sseFrames) (net.Conn, api.Envelope) {
+	t.Helper()
+	client, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 5*time.Second)
+	if err != nil {
+		t.Fatalf("connect to the relay on port %d: %v", port, err)
+	}
+	t.Cleanup(func() { client.Close() })
+	frame, ok := frames.next(5 * time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for the session_connect event")
+	}
+	env := sseFrameEnvelope(t, frame)
+	if env.Type != api.EventSessionConnect {
+		t.Fatalf("event type = %q, want %q", env.Type, api.EventSessionConnect)
+	}
+	return client, env
+}
+
+// dialNode opens the connection the node opens for a session_connect event:
+// a WebSocket on target with the node's bearer, read and written as binary
+// messages. The dial's error and response are returned for a refused open.
+func dialNode(t *testing.T, srv *mockapi.Server, target string) (net.Conn, *http.Response, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ws, resp, err := websocket.Dial(ctx, target, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + srv.BearerEnvelope()}},
+	})
+	if err != nil {
+		return nil, resp, err
+	}
+	conn := websocket.NetConn(context.Background(), ws, websocket.MessageBinary)
+	t.Cleanup(func() { conn.Close() })
+	return conn, resp, nil
+}
+
+// mustDialNode opens the node's connection on target and fails the test when
+// the mock refuses it.
+func mustDialNode(t *testing.T, srv *mockapi.Server, target string) net.Conn {
+	t.Helper()
+	conn, resp, err := dialNode(t, srv, target)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("open the node's connection: %v (status %d)", err, status)
+	}
+	return conn
+}
+
+// assertCarries writes payload into from and fails the test unless to reads
+// exactly those bytes. The write runs on its own goroutine, so a payload larger
+// than the socket buffers cannot stall the read.
+func assertCarries(t *testing.T, from, to net.Conn, payload []byte) {
+	t.Helper()
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := from.Write(payload)
+		wrote <- err
+	}()
+	if err := to.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(to, got); err != nil {
+		t.Fatalf("read the spliced bytes: %v", err)
+	}
+	if err := to.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear read deadline: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("the spliced bytes differ from the bytes written")
+	}
+	if err := <-wrote; err != nil {
+		t.Fatalf("write the bytes to splice: %v", err)
+	}
+}
+
+// awaitHangUp reads conn until its peer hangs up and returns the bytes read and
+// the read's error, nil for a clean end of stream. It fails the test when conn
+// is still open after 5 s.
+//
+// A relay that hangs up on the node's connection while it is reading from it
+// drops the TCP connection at once, and that can beat the close frame, so the
+// node's read may end in an error rather than EOF. Only the client's plain TCP
+// connection is held to a clean end.
+func awaitHangUp(t *testing.T, conn net.Conn, what string) ([]byte, error) {
+	t.Helper()
+	type result struct {
+		data []byte
+		err  error
+	}
+	ended := make(chan result, 1)
+	go func() {
+		data, err := io.ReadAll(conn)
+		ended <- result{data, err}
+	}()
+	select {
+	case r := <-ended:
+		return r.data, r.err
+	case <-time.After(5 * time.Second):
+		conn.Close()
+		<-ended
+		t.Fatalf("%s is still open 5s later", what)
+		return nil, nil
+	}
+}
+
+// TestSessionConnection_RouteRefusals covers the answers the connection route
+// gives before it accepts an upgrade, each against a relay still waiting, and
+// that none of them takes the connection id: every relay is then served once
+// its session is live again.
+func TestSessionConnection_RouteRefusals(t *testing.T) {
+	verifyNoGoroutineLeak(t)
+	srv, ts := newTestServer(t)
+	live := sessionOfKind("sess-conn-live", api.SessionKindSSH)
+	other := sessionOfKind("sess-conn-other", api.SessionKindSSH)
+	drained := sessionOfKind("sess-conn-drained", api.SessionKindSSH)
+	lapsed := sessionOfKind("sess-conn-lapsed", api.SessionKindSSH)
+	lapsed.ExpiresAt = time.Now().UTC().Add(-time.Minute)
+	configureSessions(t, ts.URL, live, other, drained, lapsed)
+
+	resp := connectSSE(t, ts.URL, testMockNodeID, 30*time.Second)
+	defer resp.Body.Close()
+	frames := startSSEFrames(resp.Body)
+
+	liveCID, port := openRelay(t, ts.URL, live.SessionID)
+	liveClient, _ := attachClient(t, port, frames)
+	drainedCID, port := openRelay(t, ts.URL, drained.SessionID)
+	drainedClient, _ := attachClient(t, port, frames)
+	lapsedCID, port := openRelay(t, ts.URL, lapsed.SessionID)
+	lapsedClient, _ := attachClient(t, port, frames)
+	// The fixture stops listing the drained session after its relay began to
+	// wait, as a revocation that lands during an attach does.
+	configureSessions(t, ts.URL, live, other, lapsed)
+
+	// The route sits behind the bearer gate like every node route.
+	gated := httptest.NewServer(srv.Handler())
+	t.Cleanup(gated.Close)
+
+	tests := []struct {
+		name string
+		url  string
+		// plain sends a GET without the upgrade headers, upgradeOnly one with
+		// Upgrade but no Connection: Upgrade, where the others dial a
+		// WebSocket as the node does.
+		plain       bool
+		upgradeOnly bool
+		bearer      bool
+		wantStatus  int
+		wantCode    string
+	}{
+		{
+			name:       "another node's path",
+			url:        sessionConnectionURL(ts.URL, "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0ff", live.SessionID, liveCID),
+			bearer:     true,
+			wantStatus: http.StatusForbidden, wantCode: "nsk_node_mismatch",
+		},
+		{
+			name:       "unknown connection id",
+			url:        sessionConnectionURL(ts.URL, testMockNodeID, live.SessionID, "0190a8b8-a0c0-4a0a-8a0a-a0a0a0a0a0ff"),
+			bearer:     true,
+			wantStatus: http.StatusNotFound, wantCode: "session_connection_not_found",
+		},
+		{
+			name:       "connection id minted for another session",
+			url:        sessionConnectionURL(ts.URL, testMockNodeID, other.SessionID, liveCID),
+			bearer:     true,
+			wantStatus: http.StatusNotFound, wantCode: "session_connection_not_found",
+		},
+		{
+			name:       "session the fixture no longer lists",
+			url:        sessionConnectionURL(ts.URL, testMockNodeID, drained.SessionID, drainedCID),
+			bearer:     true,
+			wantStatus: http.StatusConflict, wantCode: "session_not_active",
+		},
+		{
+			name:       "session past its expires_at",
+			url:        sessionConnectionURL(ts.URL, testMockNodeID, lapsed.SessionID, lapsedCID),
+			bearer:     true,
+			wantStatus: http.StatusConflict, wantCode: "session_not_active",
+		},
+		{
+			name:       "no upgrade headers",
+			url:        sessionConnectionURL(ts.URL, testMockNodeID, live.SessionID, liveCID),
+			plain:      true,
+			bearer:     true,
+			wantStatus: http.StatusUpgradeRequired, wantCode: "upgrade_required",
+		},
+		{
+			name:        "upgrade without connection upgrade",
+			url:         sessionConnectionURL(ts.URL, testMockNodeID, live.SessionID, liveCID),
+			upgradeOnly: true,
+			bearer:      true,
+			wantStatus:  http.StatusUpgradeRequired, wantCode: "upgrade_required",
+		},
+		{
+			name:       "no bearer",
+			url:        sessionConnectionURL(gated.URL, testMockNodeID, live.SessionID, liveCID),
+			wantStatus: http.StatusUnauthorized, wantCode: "unauthorized",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var resp *http.Response
+			switch {
+			case tt.plain:
+				resp = doRequest(t, http.MethodGet, tt.url, "")
+				defer resp.Body.Close()
+			case tt.upgradeOnly:
+				req, err := http.NewRequest(http.MethodGet, tt.url, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Connection", "keep-alive")
+				resp, err = http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatalf("GET %s: %v", tt.url, err)
+				}
+				defer resp.Body.Close()
+			case tt.bearer:
+				conn, dialResp, err := dialNode(t, srv, tt.url)
+				if err == nil {
+					conn.Close()
+					t.Fatal("the WebSocket upgrade succeeded, want it refused")
+				}
+				if dialResp == nil {
+					t.Fatalf("dial error %v carries no response", err)
+				}
+				resp = dialResp
+			default:
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				ws, dialResp, err := websocket.Dial(ctx, tt.url, nil)
+				if err == nil {
+					_ = ws.CloseNow()
+					t.Fatal("the WebSocket upgrade succeeded without the bearer, want it refused")
+				}
+				if dialResp == nil {
+					t.Fatalf("dial error %v carries no response", err)
+				}
+				resp = dialResp
+			}
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			if code := problemCode(t, resp); code != tt.wantCode {
+				t.Errorf("code = %q, want %q", code, tt.wantCode)
+			}
+			if tt.wantStatus == http.StatusUpgradeRequired && resp.Header.Get("Upgrade") != "websocket" {
+				t.Errorf("Upgrade = %q, want websocket", resp.Header.Get("Upgrade"))
+			}
+		})
+	}
+
+	// The two 404s, the two 409s and the two 426s count; the 403 and the
+	// gate's 401 do not.
+	a := srv.Assertions()
+	if a.SessionConnectionRejectedCount != 6 {
+		t.Errorf("session_connection_rejected_count = %d, want 6", a.SessionConnectionRejectedCount)
+	}
+	if a.UnauthorizedCount != 1 {
+		t.Errorf("unauthorized_count = %d, want 1", a.UnauthorizedCount)
+	}
+	if a.SessionConnectionCount != 0 || a.SessionConnectionTimeoutCount != 0 {
+		t.Errorf("session_connection_count = %d, session_connection_timeout_count = %d, want 0 and 0",
+			a.SessionConnectionCount, a.SessionConnectionTimeoutCount)
+	}
+
+	// No refusal took a connection id: with both sessions live again, each
+	// relay is served, and hanging up its client ends the node's connection.
+	lapsed.ExpiresAt = time.Now().UTC().Add(time.Hour)
+	configureSessions(t, ts.URL, live, other, drained, lapsed)
+	for _, relay := range []struct {
+		sid, cid string
+		client   net.Conn
+	}{
+		{live.SessionID, liveCID, liveClient},
+		{drained.SessionID, drainedCID, drainedClient},
+		{lapsed.SessionID, lapsedCID, lapsedClient},
+	} {
+		node := mustDialNode(t, srv, sessionConnectionURL(ts.URL, testMockNodeID, relay.sid, relay.cid))
+		assertCarries(t, relay.client, node, []byte("attach "+relay.sid))
+		relay.client.Close()
+		// The node's read may end in an error rather than EOF: see awaitHangUp.
+		_, _ = awaitHangUp(t, node, "the node's connection for "+relay.sid)
+	}
+	if got := srv.Assertions().SessionConnectionCount; got != 3 {
+		t.Errorf("session_connection_count = %d, want 3", got)
+	}
+}
+
+func TestSessionConnect_RequiresSessionID(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{"empty session_id", `{"session_id":""}`},
+		{"no session_id", `{}`},
+		{"not json", `not json`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			resp := doRequest(t, http.MethodPost, ts.URL+"/test/session-connect", tc.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			}
+		})
+	}
+}
+
+func TestSessionConnect_WrongMethod_Returns405(t *testing.T) {
+	_, ts := newTestServer(t)
+	for _, tc := range []struct {
+		method, path string
+	}{
+		{http.MethodGet, "/test/session-connect"},
+		{http.MethodPost, "/v1/nodes/" + testMockNodeID + "/sessions/sess-1/connections/conn-1"},
+	} {
+		resp := doRequest(t, tc.method, ts.URL+tc.path, "")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s status = %d, want %d", tc.method, tc.path, resp.StatusCode, http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+// TestSessionConnect_SplicesNodeConnectionToClient walks one attach: the
+// client on the relay's port makes the mock publish one signed session_connect
+// naming the session and the minted connection id, the node's WebSocket on the
+// route is spliced to the client byte for byte in both directions, the id
+// serves once, and the client hanging up ends the node's connection.
+func TestSessionConnect_SplicesNodeConnectionToClient(t *testing.T) {
+	verifyNoGoroutineLeak(t)
+	srv, ts := newTestServer(t)
+	verifier := mockVerifier(t, ts.URL)
+	session := sessionOfKind("sess-conn-splice", api.SessionKindSSH)
+	configureSessions(t, ts.URL, session)
+
+	resp := connectSSE(t, ts.URL, testMockNodeID, 30*time.Second)
+	defer resp.Body.Close()
+	frames := startSSEFrames(resp.Body)
+
+	cid, port := openRelay(t, ts.URL, session.SessionID)
+	client, env := attachClient(t, port, frames)
+
+	if want := "evt-session-connect-" + cid; env.ID != want {
+		t.Errorf("event id = %q, want %q", env.ID, want)
+	}
+	if err := verifier.Verify(context.Background(), env); err != nil {
+		t.Errorf("the agent's verifier refused the session_connect envelope: %v", err)
+	}
+	var req api.SessionConnectRequest
+	if err := json.Unmarshal(env.Payload, &req); err != nil {
+		t.Fatalf("decode the session_connect payload: %v", err)
+	}
+	if req.SessionID != session.SessionID || req.ConnectionID != cid {
+		t.Errorf("payload names session %q and connection %q, want %q and %q",
+			req.SessionID, req.ConnectionID, session.SessionID, cid)
+	}
+	if got := req.ExpiresAt.Sub(env.IssuedAt); got != mockapi.DefaultSessionConnectWait {
+		t.Errorf("expires_at lies %v after issued_at, want %v", got, mockapi.DefaultSessionConnectWait)
+	}
+	var header struct {
+		EventID    string    `json:"event_id"`
+		OccurredAt time.Time `json:"occurred_at"`
+	}
+	if err := json.Unmarshal(env.Payload, &header); err != nil {
+		t.Fatalf("decode the session_connect header members: %v", err)
+	}
+	if !canonicalUUIDRe.MatchString(header.EventID) || header.EventID == cid {
+		t.Errorf("event_id = %q, want a canonical UUID of its own", header.EventID)
+	}
+	if !header.OccurredAt.Equal(env.IssuedAt) {
+		t.Errorf("occurred_at = %v, want the envelope's issued_at %v", header.OccurredAt, env.IssuedAt)
+	}
+
+	// The relay takes one client and closes its listener before it publishes.
+	if second, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 10*time.Second); err == nil {
+		second.Close()
+		t.Error("a second client reached the relay's port, want the listener closed after the first")
+	}
+
+	target := sessionConnectionURL(ts.URL, testMockNodeID, session.SessionID, cid)
+	node := mustDialNode(t, srv, target)
+	toNode := make([]byte, 64*1024)
+	if _, err := rand.Read(toNode); err != nil {
+		t.Fatalf("generate bytes: %v", err)
+	}
+	toClient := make([]byte, 256)
+	for i := range toClient {
+		toClient[i] = byte(255 - i)
+	}
+	assertCarries(t, client, node, toNode)
+	assertCarries(t, node, client, toClient)
+	a := srv.Assertions()
+	if a.SessionConnectionCount != 1 {
+		t.Errorf("session_connection_count = %d, want 1", a.SessionConnectionCount)
+	}
+	if a.SessionConnectionTimeoutCount != 0 {
+		t.Errorf("session_connection_timeout_count = %d, want 0", a.SessionConnectionTimeoutCount)
+	}
+
+	// The id serves once.
+	if conn, resp, err := dialNode(t, srv, target); err == nil {
+		conn.Close()
+		t.Error("a second open of the delivered connection id succeeded, want 404")
+	} else if resp == nil || resp.StatusCode != http.StatusNotFound || problemCode(t, resp) != "session_connection_not_found" {
+		t.Errorf("a second open of the delivered connection id failed with %v, want 404 session_connection_not_found", err)
+	}
+	if got := srv.Assertions().SessionConnectionRejectedCount; got != 1 {
+		t.Errorf("session_connection_rejected_count = %d, want 1", got)
+	}
+
+	client.Close()
+	// The node's read may end in an error rather than EOF: see awaitHangUp.
+	_, _ = awaitHangUp(t, node, "the node's connection after the client hung up")
+
+	// Exactly one session_connect: the next frame is an event injected now.
+	marker, _ := json.Marshal(makeEnvelope("marker", "evt-conn-marker", json.RawMessage(`{}`)))
+	injectResp := doRequest(t, http.MethodPost, ts.URL+"/test/inject-event", string(marker))
+	injectResp.Body.Close()
+	frame, ok := frames.next(5 * time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for the marker event")
+	}
+	if got := sseFrameEnvelope(t, frame); got.ID != "evt-conn-marker" {
+		t.Errorf("next event after the attach = %q (%s), want the marker", got.ID, got.Type)
+	}
+}
+
+// TestSessionConnect_ServesTheAgentsClient drives the attach with the agent's
+// own client: api.ControlPlane.OpenSessionConnection, presenting the node's
+// bearer to the gate itself, opens the connection the relay awaits, and reads
+// the route's refusal of a second open as the *APIError its caller logs.
+func TestSessionConnect_ServesTheAgentsClient(t *testing.T) {
+	verifyNoGoroutineLeak(t)
+	srv, ts := newTestServer(t)
+	gated := httptest.NewServer(srv.Handler())
+	t.Cleanup(gated.Close)
+	session := sessionOfKind("sess-conn-agent", api.SessionKindSSH)
+	configureSessions(t, ts.URL, session)
+
+	resp := connectSSE(t, ts.URL, testMockNodeID, 30*time.Second)
+	defer resp.Body.Close()
+	frames := startSSEFrames(resp.Body)
+
+	cp, err := api.NewControlPlane(api.Config{BaseURL: gated.URL}, "e2e", slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewControlPlane: %v", err)
+	}
+	cp.SetAuthToken(srv.BearerEnvelope())
+
+	cid, port := openRelay(t, ts.URL, session.SessionID)
+	client, _ := attachClient(t, port, frames)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	node, err := cp.OpenSessionConnection(ctx, testMockNodeID, session.SessionID, cid)
+	if err != nil {
+		t.Fatalf("OpenSessionConnection: %v", err)
+	}
+	t.Cleanup(func() { node.Close() })
+	assertCarries(t, client, node, []byte("SSH-2.0-OpenSSH_9.6\r\n"))
+	assertCarries(t, node, client, []byte("SSH-2.0-plexd\r\n"))
+	a := srv.Assertions()
+	if a.SessionConnectionCount != 1 || a.UnauthorizedCount != 0 {
+		t.Errorf("session_connection_count = %d, unauthorized_count = %d, want 1 and 0",
+			a.SessionConnectionCount, a.UnauthorizedCount)
+	}
+
+	_, err = cp.OpenSessionConnection(ctx, testMockNodeID, session.SessionID, cid)
+	var apiErr *api.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound || apiErr.Code != "session_connection_not_found" {
+		t.Errorf("a second open = %v, want an *APIError with 404 session_connection_not_found", err)
+	}
+
+	client.Close()
+	// The node's read may end in an error rather than EOF: see awaitHangUp.
+	_, _ = awaitHangUp(t, node, "the agent's connection after the client hung up")
+}
+
+// TestSessionConnect_NodeHangUpClosesClient covers the other direction of the
+// splice: the node closing its connection ends the client's.
+func TestSessionConnect_NodeHangUpClosesClient(t *testing.T) {
+	verifyNoGoroutineLeak(t)
+	srv, ts := newTestServer(t)
+	session := sessionOfKind("sess-conn-hangup", api.SessionKindSSH)
+	configureSessions(t, ts.URL, session)
+
+	resp := connectSSE(t, ts.URL, testMockNodeID, 30*time.Second)
+	defer resp.Body.Close()
+	frames := startSSEFrames(resp.Body)
+
+	cid, port := openRelay(t, ts.URL, session.SessionID)
+	client, _ := attachClient(t, port, frames)
+	node := mustDialNode(t, srv, sessionConnectionURL(ts.URL, testMockNodeID, session.SessionID, cid))
+	assertCarries(t, node, client, []byte("SSH-2.0-plexd\r\n"))
+
+	node.Close()
+	if _, err := awaitHangUp(t, client, "the client after the node hung up"); err != nil {
+		t.Errorf("the client's read ended with %v, want EOF", err)
+	}
+}
+
+// TestSessionConnect_RelayTimesOutWithoutNode covers a node that never
+// connects: the relay closes its client once expires_at passes, counts the
+// timeout, and the expired connection id is a 404 from then on.
+func TestSessionConnect_RelayTimesOutWithoutNode(t *testing.T) {
+	verifyNoGoroutineLeak(t)
+	srv, ts := newSessionConnectServer(t, 300*time.Millisecond)
+	session := sessionOfKind("sess-conn-timeout", api.SessionKindSSH)
+	configureSessions(t, ts.URL, session)
+
+	resp := connectSSE(t, ts.URL, testMockNodeID, 30*time.Second)
+	defer resp.Body.Close()
+	frames := startSSEFrames(resp.Body)
+
+	cid, port := openRelay(t, ts.URL, session.SessionID)
+	client, env := attachClient(t, port, frames)
+	var req api.SessionConnectRequest
+	if err := json.Unmarshal(env.Payload, &req); err != nil {
+		t.Fatalf("decode the session_connect payload: %v", err)
+	}
+
+	data, err := awaitHangUp(t, client, "the client of a relay the node never served")
+	if err != nil || len(data) != 0 {
+		t.Errorf("the client read %q and ended with %v, want EOF and nothing", data, err)
+	}
+	if now := time.Now(); now.Before(req.ExpiresAt) {
+		t.Errorf("the relay closed its client at %v, before expires_at %v", now, req.ExpiresAt)
+	}
+	a := srv.Assertions()
+	if a.SessionConnectionTimeoutCount != 1 {
+		t.Errorf("session_connection_timeout_count = %d, want 1", a.SessionConnectionTimeoutCount)
+	}
+	if a.SessionConnectionCount != 0 {
+		t.Errorf("session_connection_count = %d, want 0", a.SessionConnectionCount)
+	}
+
+	// The connection id expired with the relay's wait.
+	conn, dialResp, err := dialNode(t, srv, sessionConnectionURL(ts.URL, testMockNodeID, session.SessionID, cid))
+	if err == nil {
+		conn.Close()
+		t.Fatal("an open after expires_at succeeded, want 404")
+	}
+	if dialResp == nil || dialResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("an open after expires_at failed with %v, want 404", err)
+	}
+	if code := problemCode(t, dialResp); code != "session_connection_not_found" {
+		t.Errorf("code = %q, want %q", code, "session_connection_not_found")
+	}
+	if got := srv.Assertions().SessionConnectionRejectedCount; got != 1 {
+		t.Errorf("session_connection_rejected_count = %d, want 1", got)
 	}
 }
 
