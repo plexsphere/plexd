@@ -821,8 +821,10 @@ admits:
 So `{"ssh":{}}`, `{"ssh":{"command":"ls","phase":"session_started"}}`,
 `{"ssh":{"phase":"session_paused"}}` and
 `{"ssh":{"phase":"session_ended","listener_endpoint":"10.99.0.1:1"}}` are all
-`400 malformed_session_activity`. A record that clears those structural gates goes
-on to liveness resolution.
+`400 malformed_session_activity`. An `ssh` `session_started` row is admitted with
+or without `listener_endpoint`: plexd posts it without one, because an ssh
+session binds no listener, and an older agent posts it with one. A record that
+clears those structural gates goes on to liveness resolution.
 
 Liveness resolves `{sid}` against the configured `sessions` block and against a
 `session_id` registry that `POST /test/configure-state` (and `PUT /test/state`)
@@ -872,6 +874,36 @@ an unknown field. The value itself is not validated.
 | `404 Not Found` | `session_not_found` | No session resolves for this node and session id |
 | `409 Conflict` | `session_already_revoked` | The id was configured earlier and has drained out of the block since, and the row is not the one `session_ended` row such a session records |
 | `409 Conflict` | `session_expired` | The configured entry's `expires_at` has lapsed, and the row is not the one `session_ended` row such a session records |
+
+### `GET /v1/nodes/{id}/sessions/{sid}/connections/{cid}`
+
+The connection plexd opens for an ssh session when a `session_connect` event
+asks for one. `{cid}` must be a connection that `POST /test/session-connect`
+minted and is still waiting for (see [below](#post-test-session-connect)). The
+route sits behind the bearer gate like every `/v1/` route, so a request without
+the NSK bearer is a `401` that increments `unauthorized_count`. It then answers
+in this order:
+
+1. `{id}` other than the mock node identity: `403 nsk_node_mismatch`.
+2. `{cid}` unknown, past its `expires_at`, or minted for another session: `404 session_connection_not_found`.
+3. `{sid}` not found configured in the `sessions` block, or configured with an `expires_at` that has passed: `409 session_not_active`.
+4. An `Upgrade` header other than `websocket`, compared case-insensitively: `426 upgrade_required`, whose own `Upgrade` header names `websocket`.
+
+A request that passes all four is accepted as a WebSocket (`101`), and the
+connection's binary messages are handed to the waiting relay as a byte stream.
+The pending entry is deleted on delivery, so a second connection for the same
+`{cid}` is a `404`. Every delivery increments `session_connection_count`; the
+`404`, `409` and `426` answers increment `session_connection_rejected_count`.
+Any method other than `GET` is a `405`.
+
+| Status | Problem `code` | Meaning |
+|---|---|---|
+| `101 Switching Protocols` | — | Connection delivered to the relay waiting for `{cid}` |
+| `401 Unauthorized` | `unauthorized` | The bearer-envelope gate refused the credential |
+| `403 Forbidden` | `nsk_node_mismatch` | `{id}` does not match the mock node identity |
+| `404 Not Found` | `session_connection_not_found` | No relay is waiting for `{cid}` on this session: unknown, expired, minted for another session, or already delivered |
+| `409 Conflict` | `session_not_active` | The session is not configured, or its `expires_at` has lapsed |
+| `426 Upgrade Required` | `upgrade_required` | The request is not a WebSocket upgrade: its `Upgrade` header does not name `websocket`, or its `Connection` header does not name `upgrade` |
 
 ### `PUT /v1/nodes/{id}/state/reports/{key}`
 
@@ -1019,6 +1051,9 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "audit_count": 0,
   "session_activity_count": 0,
   "session_activity_rejected_count": 0,
+  "session_connection_count": 0,
+  "session_connection_rejected_count": 0,
+  "session_connection_timeout_count": 0,
   "integrity_violation_count": 0,
   "handshake_report_count": 0,
   "edge_psk_count": 0,
@@ -1292,6 +1327,34 @@ seconds, with `iat` and `nbf` now and `exp` now plus `ttl_seconds`.
 empty, or `ttl_seconds` is outside 1 to 3600. Returns `405` if the HTTP method is
 not `POST`.
 
+### `POST /test/session-connect`
+
+Plays the control plane's side of an attach to an ssh session, so a test can log
+in through a connection plexd opened. The mock opens a relay port for one client
+and, once that client connects, asks plexd for a connection the way the control
+plane does on an attach.
+
+**Request body:**
+
+```json
+{"session_id": "sess-e2e-ssh-root"}
+```
+
+**Response:** `200 OK` with `{"connection_id": "<uuid>", "port": N}`. The mock
+mints `connection_id` in UUID form from `crypto/rand` and binds a TCP listener on
+`:0`, whose port it returns.
+
+**Behavior:**
+
+- In the background the listener accepts one client within 60 s and then closes.
+- On that accept the mock registers the pending connection with an `expires_at` 10 s ahead (the Go field `SessionConnectWait` changes the wait in in-process tests), then signs and broadcasts a `session_connect` envelope, id `evt-session-connect-<connection_id>`, whose payload carries `event_id`, `occurred_at`, `session_id`, `connection_id` and `expires_at`. The broadcast is recorded in the replay ring like any other.
+- It waits until `expires_at` for plexd to open [`GET /v1/nodes/{id}/sessions/{sid}/connections/{cid}`](#get-v1-nodes-id-sessions-sid-connections-cid). A delivered connection is spliced to the client with `io.Copy` in both directions, and both close when either direction ends, so an SSH client on the port talks to plexd's session listener byte for byte.
+- A relay plexd never connects to closes its client at `expires_at` and increments `session_connection_timeout_count`.
+- The mock publishes the event for any `session_id`, live or not, where the control plane publishes it only for a session whose newest lifecycle row is `session_started`. The connection route still judges the session when plexd connects, and the looser fixture lets a suite prove that plexd refuses an event for a session it no longer serves.
+- The request body is captured and retrievable via `GET /test/last-request/session_connect`.
+
+**Error:** Returns `400` if the body is not valid JSON or `session_id` is empty. Returns `405` if the HTTP method is not `POST`.
+
 ### `POST /test/rotate-signing-key`
 
 Replaces the mock's Domain signing key with a fresh Ed25519 key pair, named the
@@ -1422,6 +1485,9 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `audit_count` | `POST /v1/nodes/{id}/audit` |
 | `session_activity_count` | `POST /v1/nodes/{id}/sessions/{sid}` (accepted rows only) |
 | `session_activity_rejected_count` | `POST /v1/nodes/{id}/sessions/{sid}` (liveness refusals only: `404` / `409`) |
+| `session_connection_count` | `GET /v1/nodes/{id}/sessions/{sid}/connections/{cid}` (connections delivered to a relay) |
+| `session_connection_rejected_count` | `GET /v1/nodes/{id}/sessions/{sid}/connections/{cid}` (`404` / `409` / `426` answers) |
+| `session_connection_timeout_count` | `POST /test/session-connect` (relays that waited out `expires_at` without a connection) |
 | `integrity_violation_count` | `POST /v1/nodes/{id}/integrity-violations` (accepted batches only, one per request regardless of batch size) |
 | `handshake_report_count` | `POST /v1/nodes/{id}/handshakes` (accepted reports only, `200`) |
 | `edge_psk_count` | `GET /v1/nodes/{id}/peers/{peer_node_id}/psk` (served `200` envelopes only) |

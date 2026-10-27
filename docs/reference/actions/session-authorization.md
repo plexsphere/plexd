@@ -21,7 +21,7 @@ User                Platform / CP              plexd (Target Node)
  |                       |                            |
  |                       |-- Session in the state --->|
  |                       |   pull's sessions block    |-- Start SSH session
- |<======== SSH session (tunneled through mesh) =====>|-- Inject PLEXD_SESSION_TOKEN
+ |<===== SSH session (relayed over plexd's socket) ==>|-- Inject PLEXD_SESSION_TOKEN
  |                       |                            |
  |-- plexd actions run -------------------------------->|
  |   diagnostics.collect |                            |-- Read token from env

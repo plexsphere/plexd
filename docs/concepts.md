@@ -168,7 +168,8 @@ flowchart TD
 The SSE manager processes events in two tiers. Payloads of the reconcile-driving
 types are opaque — the reconciler's state pull is authoritative, so those events
 only request a reconcile. `session_revoked` is the exception: its payload names
-the session to close before the reconcile.
+the session to close before the reconcile. `session_connect` drives no reconcile
+at all: its payload names a connection to open.
 
 | Event | Tier | Handler |
 |-------|------|---------|
@@ -178,6 +179,7 @@ the session to close before the reconcile.
 | `action_request` | contract | Triggers a reconcile — the dispatch rides the `executions` block of the resulting pull |
 | `session_setup` | contract | Triggers a reconcile — the session rides the `sessions` block of the resulting pull |
 | `session_revoked` | contract | Closes the live session the payload names with the reason it carries (`tunnel.Dispatcher.SessionRevokedHandler`), then triggers a reconcile; the block drain stays the teardown when the event is missed |
+| `session_connect` | contract | Opens the connection the payload names for a live ssh session and serves the session's SSH login on it (`tunnel.Dispatcher.SessionConnectHandler`); triggers no reconcile. Only a control plane with [plexsphere/plexsphere#928](https://github.com/plexsphere/plexsphere/issues/928) emits it |
 | `node_secrets_updated` | contract | Triggers a reconcile; the inventory rides the `secrets` block of the resulting pull, which feeds the node API's secret index |
 | `peer_registered` | documented-coming | Triggers a reconcile |
 | `peer_psk_assigned` | documented-coming | Triggers a reconcile |

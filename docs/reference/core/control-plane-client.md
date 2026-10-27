@@ -43,7 +43,7 @@ func NewControlPlane(cfg Config, version string, logger *slog.Logger) (*ControlP
 ```
 
 - Applies config defaults and validates
-- Configures TLS, connect timeout, request timeout (`ConnectSSE` sends through a copy without the request timeout, see [SSE Stream](#sse-stream))
+- Configures TLS, connect timeout, request timeout (`ConnectSSE` and `OpenSessionConnection` send through a copy without the request timeout, see [SSE Stream](#sse-stream))
 - Sets `User-Agent: plexd/{version}` on all requests
 - Gzip-compresses request bodies larger than 1 KiB **on the three observability ingest operations only** — they are the ones whose contract accepts `Content-Encoding: gzip`. Every other handler decodes the body as it arrives, so a compressed one is read as JSON and refused with `400`, naming the gzip magic byte as `invalid character '\x1f'`.
 - Transparently decompresses gzip responses
@@ -60,7 +60,7 @@ Thread-safe via `sync.RWMutex`. The token is injected as `Authorization: Bearer 
 
 The registrar is the sole owner of this credential: it arms the client on both of its paths (resumed identity and fresh registration), and no other production code calls `SetAuthToken`. One client is shared by every post-registration consumer — heartbeat, SSE, reconciler, key rotator, peer exchange, actions, node API, and the platform reporters — so a later assignment does not degrade one caller, it mutes all of them at once.
 
-When the heartbeat parks on a credential the control plane keeps refusing, `plexd up` marks the client with `SetCredentialRefused(true)` through the heartbeat's credential-refused callback (see [Heartbeat Service](heartbeat-service.md#credential-park)), and `CredentialRefused()` reports the mark. While it is set, every request that would present the bearer fails with `ErrCredentialRefused` before any I/O: `newRequest` checks the mark first, and `ConnectSSE`, which builds its own request, checks it too. Three calls pass: `POST /v1/register` carries no bearer, `UploadExecutionOutput` sends to a presigned URL without the bearer, and the heartbeat is the probe whose acceptance clears the mark again. `ErrCredentialRefused` is not an `*APIError`, so `errors.Is(err, ErrUnauthorized)` is false for it.
+When the heartbeat parks on a credential the control plane keeps refusing, `plexd up` marks the client with `SetCredentialRefused(true)` through the heartbeat's credential-refused callback (see [Heartbeat Service](heartbeat-service.md#credential-park)), and `CredentialRefused()` reports the mark. While it is set, every request that would present the bearer fails with `ErrCredentialRefused` before any I/O: `newRequest` checks the mark first, and `ConnectSSE` and `OpenSessionConnection`, which build their own requests, check it too. Three calls pass: `POST /v1/register` carries no bearer, `UploadExecutionOutput` sends to a presigned URL without the bearer, and the heartbeat is the probe whose acceptance clears the mark again. `ErrCredentialRefused` is not an `*APIError`, so `errors.Is(err, ErrUnauthorized)` is false for it.
 
 ### API Methods
 
@@ -86,12 +86,15 @@ All methods accept a `context.Context` for cancellation and return typed respons
 | `ReportLogs`          | `POST`          | `/v1/nodes/{node_id}/logs`                        | `[]LogLine` (NDJSON)  | `*IngestReceipt`      |
 | `ReportAudit`         | `POST`          | `/v1/nodes/{node_id}/audit`                       | `[]AuditEvent` (NDJSON)| `*IngestReceipt`     |
 | `ReportSessionActivity` | `POST`        | `/v1/nodes/{node_id}/sessions/{session_id}`        | `SessionActivityRequest` | — (`204 No Content`) |
+| `OpenSessionConnection` | `GET` (WebSocket upgrade) | `/v1/nodes/{node_id}/sessions/{session_id}/connections/{connection_id}` | — | `net.Conn` (`101 Switching Protocols`) |
 | `ReportIntegrityViolations` | `POST`    | `/v1/nodes/{node_id}/integrity-violations`         | `IntegrityViolationsRequest` | —            |
 | `ReportHandshakes`    | `POST`          | `/v1/nodes/{node_id}/handshakes`                   | `HandshakeReportRequest` | `*HandshakeReportResponse` |
 
 `FetchEdgePSK` takes the node ID and the peer's node ID, path-escapes both, and returns the envelope only when the body is exactly `EdgePSKEnvelopeSize` (60) bytes and both the `X-Plexsphere-PSK-KID` and `X-Plexsphere-PSK-Epoch` headers are present. The body is key material, so no error it returns quotes it. See [API Types](api-types.md#edge-psk) for the envelope.
 
 `ReportEndpointCandidates` path-escapes the node ID and sends a nil `Candidates` as `[]`, on a copy, because the contract refuses `null`. A report with more than `MaxEndpointCandidates` (8) entries returns `api: report endpoint candidates: <n> candidates:` wrapping `ErrEndpointCandidatesTooMany`, without a request. See [API Types](api-types.md#endpoint-candidates).
+
+`OpenSessionConnection(ctx, nodeID, sessionID, connectionID)` opens the connection a `session_connect` event asked for (see [Event Type Constants](#event-type-constants)). It checks the refused-credential mark first, and an empty node, session or connection id returns `api: open session connection: node_id, session_id and connection_id are required`, both before any I/O. It path-escapes the three ids and dials a WebSocket with `github.com/coder/websocket` through a copy of the shared HTTP client without its `Timeout`, so the connection reaches the control plane over the same TLS settings, connect timeout and base URL as every other call, and carries `Authorization: Bearer {token}` and `User-Agent: plexd/{version}`. The shared transport sets its own `TLSClientConfig` without `ForceAttemptHTTP2`, so it speaks HTTP/1.1, which the upgrade needs. `ctx` bounds the handshake only: the connection lives until `Close`. A refused upgrade returns `api: open session connection:` wrapping an `*APIError` with the status and the problem `code`, such as `404 session_connection_not_found` or `409 session_not_active`; any other failure wraps its cause under the same prefix. The returned `net.Conn` reads and writes the payload of binary messages only: pings are answered inside `Read`, a close with status `1000` or `1001` reads as `io.EOF`, and a text message closes the connection with `1003` and fails the read. `Close` starts the close handshake (status `1000`) on its own goroutine, once, and returns nil at once: the handshake waits up to 5 s for each close frame, and an ssh session closes its connections under a 2 s drain bound. Pending reads and writes are cancelled first, so a blocked `Read` still returns promptly; cancelling a `Read` in flight closes the socket, so the `1000` frame may not reach the control plane. See [API Endpoints](api-endpoints.md#get-v1-nodes-node-id-sessions-session-id-connections-connection-id).
 
 ### Generic Helpers
 
@@ -214,7 +217,8 @@ Routes verified events to registered handlers by the envelope's `type`.
 The SSE event set is organized in two tiers. Payloads of the reconcile-driving
 types are opaque: the reconciler's state pull is authoritative, so those events
 only request a reconcile. `session_revoked` is the exception: its payload names
-the session to close before the reconcile.
+the session to close before the reconcile. `session_connect` drives no reconcile
+at all: its payload names a connection to open.
 
 **Contract** — currently emitted by the control plane per the OpenAPI events document:
 
@@ -228,6 +232,7 @@ the session to close before the reconcile.
 | `EventPeerEndpointChanged` | `peer_endpoint_changed` | `TriggerReconcile()`                        |
 | `EventNodeSecretsUpdated`  | `node_secrets_updated`  | `TriggerReconcile()`                        |
 | `EventSessionRevoked`      | `session_revoked`       | `tunnel.Dispatcher.SessionRevokedHandler`: closes the named session, then `TriggerReconcile()` |
+| `EventSessionConnect`      | `session_connect`       | `tunnel.Dispatcher.SessionConnectHandler`: opens the named connection of a live ssh session; no reconcile. Only a control plane with [plexsphere/plexsphere#928](https://github.com/plexsphere/plexsphere/issues/928) emits it |
 
 `action_request` carries no dispatch of its own: action executions are delivered
 in the `executions` block of the state pull, so the event only pulls the next
@@ -268,6 +273,30 @@ listener such a pull was already binding when the event landed is closed with
 the event's reason as soon as it is up. The revoked
 set forgets the id once the entry leaves the block. A session leaving the
 `sessions` block stays the teardown for a revocation whose event never arrives.
+
+`session_connect` is not a reconcile trigger either. Its payload, an
+`api.SessionConnectRequest`, names the ssh session a client attached to and the
+one-time `connection_id` of the connection the node is asked to open, and
+`plexd up` registers `tunnel.Dispatcher.SessionConnectHandler` for it
+unconditionally, so a node with tunneling or ssh sessions off logs why it
+refuses instead of dropping the event at Debug. A payload that does not decode
+returns `tunnel: session_connect payload: <cause>`, and one whose `session_id`
+or `connection_id` is empty returns
+`tunnel: session_connect payload names no connection: session_id or connection_id is empty`;
+the `EventDispatcher` logs either at Error as `event handler failed`, and
+nothing opens. Otherwise the handler returns nil at once and, on its own
+goroutine, calls `SessionManager.ConnectSSHSession`, which opens the connection
+through `OpenSessionConnection` with the identity's node id and serves the
+session's SSH login on it. It logs exactly one line carrying `session_id` and
+`connection_id`: Info `session connection opened`, Info
+`session_connect names no live ssh session; not connecting`, Warn
+`session_connect cannot be served on this node; not connecting` (with `error`),
+Info `session closed while its connection opened; closed the connection`, or
+Warn `session connection to the control plane failed` (with `error`, where an
+`*APIError` names its status and code). plexd does not judge `expires_at`
+against its own clock and does not retry a failed open, and the handler never
+calls `TriggerReconcile()`. See
+[Secure Access Tunneling](../networking/secure-access-tunneling.md#listener).
 
 **Documented-coming** — named now so the agent can subscribe once the platform's 14-type taxonomy starts emitting them:
 
