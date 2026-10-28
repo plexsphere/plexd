@@ -109,6 +109,17 @@ type sshSession struct {
 	// connect under mu while the session is open, so it never races Close's
 	// Wait.
 	wg sync.WaitGroup
+	// shell is the session's kept shell, nil while none runs. It is guarded by
+	// mu.
+	shell *keptShell
+	// served holds the connections past their handshake whose channels are
+	// served. A connection leaves it when it ends, or when a takeover closes
+	// it. It is guarded by mu.
+	served map[*ssh.ServerConn]struct{}
+
+	// shellMu serializes the interactive shell requests of every connection,
+	// so they start at most one kept shell and take it over one at a time.
+	shellMu sync.Mutex
 }
 
 var _ managedSession = (*sshSession)(nil)
@@ -121,6 +132,7 @@ func newSSHSession(p sshSessionParams) (managedSession, error) {
 		deps:      p.deps,
 		logger:    p.logger.With("session_id", p.entry.SessionID),
 		conns:     make(map[net.Conn]struct{}),
+		served:    make(map[*ssh.ServerConn]struct{}),
 	}
 	s.config = &ssh.ServerConfig{
 		ServerVersion:    "SSH-2.0-plexd",
@@ -269,11 +281,12 @@ func (s *sshSession) handleConn(ctx context.Context, raw net.Conn, connectionID 
 	defer conn.Close()
 	_ = raw.SetDeadline(time.Time{})
 
-	// Global requests, tcpip-forward among them, are all refused.
+	// Global requests other than shell-state, tcpip-forward among them, are
+	// refused.
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		ssh.DiscardRequests(reqs)
+		s.serveGlobalRequests(conn, reqs)
 	}()
 
 	allowed, ok := conn.Permissions.ExtraData[sshExtAllowedCommands].([]string)
@@ -281,6 +294,10 @@ func (s *sshSession) handleConn(ctx context.Context, raw net.Conn, connectionID 
 		s.logger.Warn("ssh connection carries no allowed-command list; closing it")
 		return
 	}
+
+	s.mu.Lock()
+	s.served[conn] = struct{}{}
+	s.mu.Unlock()
 
 	var open atomic.Int32
 	var channels sync.WaitGroup
@@ -308,6 +325,9 @@ func (s *sshSession) handleConn(ctx context.Context, raw net.Conn, connectionID 
 			s.serveChannel(ctx, conn, allowed, ch, chReqs)
 		}()
 	}
+	s.mu.Lock()
+	delete(s.served, conn)
+	s.mu.Unlock()
 	// The connection keeps its slot until its channels' processes are gone, so
 	// a client that hangs up cannot start more processes than the limits allow.
 	channels.Wait()
@@ -352,7 +372,11 @@ func (s *sshSession) checkPassword(conn ssh.ConnMetadata, password []byte) (*ssh
 type channelState struct {
 	master, slave *os.File
 	term          string
-	started       bool
+	// rows and cols are the size the granted pty-req asked for.
+	rows, cols uint32
+	started    bool
+	// kept is the session's kept shell once the channel is attached to it.
+	kept *keptShell
 }
 
 // serveChannel answers the requests of one session channel. The loop keeps
@@ -369,6 +393,10 @@ func (s *sshSession) serveChannel(ctx context.Context, conn *ssh.ServerConn, all
 		if !st.started && st.master != nil {
 			st.master.Close()
 			st.slave.Close()
+		}
+		// The kept shell runs on without the channel.
+		if st.kept != nil && st.kept.detach(ch) {
+			s.logger.Info("ssh kept shell detached", "connection_id", conn.RemoteAddr().String())
 		}
 		ch.Close()
 	}()
@@ -388,7 +416,20 @@ func (s *sshSession) serveChannel(ctx context.Context, conn *ssh.ServerConn, all
 		}()
 	}
 
-	for req := range reqs {
+	// queued holds the requests the channel sent while its shell request
+	// waited; they are answered first, in the order they came.
+	var queued []*ssh.Request
+	for {
+		var req *ssh.Request
+		if len(queued) > 0 {
+			req, queued = queued[0], queued[1:]
+		} else {
+			r, ok := <-reqs
+			if !ok {
+				break
+			}
+			req = r
+		}
 		switch req.Type {
 		case "pty-req":
 			var p struct {
@@ -418,16 +459,29 @@ func (s *sshSession) serveChannel(ctx context.Context, conn *ssh.ServerConn, all
 				}
 				// Terminal modes are ignored; the kernel's tty defaults apply.
 				st.master, st.slave, st.term = master, slave, p.Term
+				st.rows, st.cols = p.Rows, p.Cols
 				_ = req.Reply(true, nil)
 			}
 
 		case "window-change":
 			var p struct{ Cols, Rows, Width, Height uint32 }
-			if st.master == nil || ssh.Unmarshal(req.Payload, &p) != nil {
+			if ssh.Unmarshal(req.Payload, &p) != nil {
 				_ = req.Reply(false, nil)
 				continue
 			}
-			_ = req.Reply(setWinsize(st.master, p.Rows, p.Cols) == nil, nil)
+			switch {
+			case st.kept != nil:
+				_ = req.Reply(st.kept.resize(ch, p.Rows, p.Cols), nil)
+			case st.master != nil:
+				resized := setWinsize(st.master, p.Rows, p.Cols) == nil
+				if resized {
+					// A reattach applies the size the channel asked for last.
+					st.rows, st.cols = p.Rows, p.Cols
+				}
+				_ = req.Reply(resized, nil)
+			default:
+				_ = req.Reply(false, nil)
+			}
 
 		case "shell":
 			switch {
@@ -435,6 +489,8 @@ func (s *sshSession) serveChannel(ctx context.Context, conn *ssh.ServerConn, all
 				refuse(req, "a process already started")
 			case len(allowed) > 0:
 				refuse(req, "interactive shell is not allowed for this session")
+			case st.master != nil:
+				queued = s.serveKeptShellDraining(conn, ch, req, &st, reqs)
 			default:
 				run(req, LaunchModeShell, "")
 			}
@@ -502,7 +558,7 @@ func (s *sshSession) runProcess(ctx context.Context, conn *ssh.ServerConn, ch ss
 		}
 	}
 
-	status, launchErr := s.launch(ctx, conn, ch, mode, command, st)
+	status, launchErr := s.launch(ctx, conn, ch, nil, mode, command, st)
 	if launchErr != nil {
 		fmt.Fprintf(ch.Stderr(), "plexd: %v\r\n", launchErr)
 		status = 1
@@ -532,10 +588,12 @@ func (s *sshSession) runProcess(ctx context.Context, conn *ssh.ServerConn, ch ss
 	s.logger.Info("ssh process exited", "mode", mode, "exit_status", status)
 }
 
-// launch builds the process's standard streams, wires them to the channel, and
-// runs the launcher. Once it returns, the output has been carried to the
-// channel, or drainTimeout has passed trying.
-func (s *sshSession) launch(ctx context.Context, conn *ssh.ServerConn, ch ssh.Channel, mode, command string, st channelState) (int, error) {
+// launch builds the process's standard streams, wires them to the channel, or
+// for a kept shell its pty's output to keep, and runs the launcher. Once it
+// returns, the output has been carried, or drainTimeout has passed trying. A
+// kept shell's input is carried by each channel attached to it, so ch is nil
+// then.
+func (s *sshSession) launch(ctx context.Context, conn *ssh.ServerConn, ch ssh.Channel, keep *keptShell, mode, command string, st channelState) (int, error) {
 	var (
 		files   []*os.File
 		outputs []*os.File // plexd's ends the output copies read from
@@ -550,7 +608,11 @@ func (s *sshSession) launch(ctx context.Context, conn *ssh.ServerConn, ch ssh.Ch
 		}()
 	}
 
-	if st.slave != nil {
+	switch {
+	case keep != nil:
+		files = []*os.File{st.slave}
+		copyOut(keep, st.master)
+	case st.slave != nil:
 		files = []*os.File{st.slave}
 		// The input copy ends when the channel does; it is not waited for.
 		s.wg.Add(1)
@@ -559,7 +621,7 @@ func (s *sshSession) launch(ctx context.Context, conn *ssh.ServerConn, ch ssh.Ch
 			_, _ = io.Copy(st.master, ch)
 		}()
 		copyOut(ch, st.master)
-	} else {
+	default:
 		pipes, err := newStdioPipes()
 		if err != nil {
 			return 1, err
@@ -590,6 +652,9 @@ func (s *sshSession) launch(ctx context.Context, conn *ssh.ServerConn, ch ssh.Ch
 	// The launcher closes files; closing them again is harmless and keeps a
 	// launcher that failed before taking them from leaving the copies waiting.
 	closeFiles(files)
+	if keep != nil {
+		keep.end()
+	}
 
 	drained := make(chan struct{})
 	go func() {
