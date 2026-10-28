@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -56,5 +57,38 @@ func TestSSHSession_RefusedPTYExecClosesThePTY(t *testing.T) {
 	waitForCondition(t, 2*time.Second, func() bool { return countFDs(t, isPTY) <= before })
 	if n := len(launcher.launches()); n != 0 {
 		t.Errorf("launcher called %d times, want 0", n)
+	}
+}
+
+// Criterion: the pty descriptors counted after the kept shell started return
+// to that count within 2 s after three reattaches from new connections, each
+// of which allocated a pty of its own.
+func TestSSHSession_KeptShellReattachClosesTheSparePTYs(t *testing.T) {
+	// An *os.File nothing references any more is closed by its finalizer once
+	// the garbage collector runs, which the polling below would trigger. With
+	// the collector off, only the closes plexd makes itself bring the count
+	// back.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+
+	l := newFakeShellLauncher()
+	h := startSSHHarness(t, l.fakeLauncher, nil)
+	isPTY := func(target string) bool { return target == "/dev/ptmx" || strings.HasPrefix(target, "/dev/pts/") }
+
+	openKeptShell(t, h.login(t, nil), "xterm", 24, 80)
+	l.awaitRun(t, 0)
+	before := countFDs(t, isPTY)
+
+	var last *shellChannel
+	for i := 0; i < 3; i++ {
+		client := h.login(t, nil)
+		last = openKeptShell(t, client, "xterm", 24, 80)
+		wantShellState(t, client, "reattached")
+	}
+	waitForCondition(t, 2*time.Second, func() bool { return countFDs(t, isPTY) <= before })
+	// The kept shell's own pty is still open: the shell still answers.
+	last.send(t, "say x")
+	last.out.await(t, "out-x-out")
+	if n := len(l.launches()); n != 1 {
+		t.Errorf("launcher called %d times, want 1", n)
 	}
 }
