@@ -211,6 +211,7 @@ value means the session has no idle window.
 - `idle_timeout_seconds` is validated on the way in: a negative value, or one large enough to overflow the seconds-to-`Duration` multiplication, is rejected rather than silently read as "no idle window"
 - Byte flow re-arms the window: every forwarded chunk of a tcp session, and every SSH byte read from or written to any connection of an ssh session, stamps the session's last activity, so the monitor either closes the session or waits out the remaining window
 - WebSocket ping and pong frames are not activity. The control plane pings each ssh session connection every 30 s, and those frames are answered inside the connection's `Read` and never reach the session, so they cannot hold an idle session open
+- A kept shell's output while no client is attached is not activity: it goes into the replay buffer, not onto a connection, so a session whose shell no client reattached within the window closes with `idle_timeout` (see [Kept shell](#kept-shell))
 - Activity is stamped as a monotonic offset, not a wall-clock time: an NTP step or a VM snapshot resume cannot stretch or collapse the window
 - `Start` counts as the first activity (the listener bind of a tcp session, the start of an ssh session), so a session no connection ever reaches idles out one window after `Start`
 - The close runs through `CloseSession(id, "idle")` like any other, so the `session_ended` row still carries the byte counters and, via the reason, a `terminated_by` of `idle_timeout`
@@ -765,17 +766,77 @@ line and no error carries the token. `iss` and `aud` are not checked.
 
 | Request | Answer |
 |---------|--------|
-| `session` channel | Accepted; one process per channel |
+| `session` channel | Accepted; one process per channel, except that a channel attached to the kept shell holds no process of its own |
 | Any other channel type (`direct-tcpip`, `x11`, `auth-agent@openssh.com`) | Rejected with `administratively prohibited` |
-| Global requests (`tcpip-forward` among them) | Refused |
+| Global requests | `shell-state@plexsphere.com` is answered as [Kept shell](#kept-shell) describes. Every other one, `tcpip-forward` among them, is refused |
 | `pty-req` | Allocates a pty sized from the request; terminal modes are ignored. Refused once a process started or a pty exists. A failed allocation answers false, and a later `shell` or `exec` runs without a pty |
-| `window-change` | Resizes the pty |
-| `shell` | Starts the user's login shell. Refused when the token lists allowed commands |
+| `window-change` | Resizes the pty, the kept shell's only while the channel is attached to it. The size it sets is the one a later reattach applies |
+| `shell` | With a granted `pty-req`, starts the session's kept shell or reattaches to it; without one, starts the user's login shell bound to the channel. Refused when the token lists allowed commands |
 | `exec` | Runs the command through the user's shell. Refused when it is empty, over 1024 bytes, or, under a non-empty allowed-command list, not byte-equal to one of its entries |
 | `env`, `subsystem` (`sftp` included), `x11-req`, `auth-agent-req@openssh.com`, `signal`, anything else | Refused |
 
 The allowed-command list comes from the verified token's `target` claim, not from
 the pull entry, so the list plexd checks is the list the session helper enforces.
+
+### Kept shell
+
+An ssh session keeps one interactive shell on the node for as long as the
+session lives, outside the connection that started it, and attaches a later
+connection of the same session to that running shell. A closed browser
+terminal, a reloaded page, a dropped network or an interrupted `plexctl ssh` no
+longer ends the work running in it. plexd implements the agent side of the
+kept-shell contract as plexsphere/plexsphere#948 defines it:
+
+1. An interactive shell is a `shell` request on a channel whose `pty-req` plexd granted. The first one on a live session starts the session's kept shell, and a session has at most one: plexd serves the interactive `shell` requests of all its connections one at a time. A `shell` without a granted `pty-req`, and every `exec`, stay bound to their channel: closing the channel stops them, and nothing reattaches to them. A session whose token lists allowed commands refuses `shell`.
+2. While the kept shell runs, a later interactive `shell` on any connection of the session reattaches to it. plexd applies that request's `pty-req` rows and columns to the shell's pty and ignores its terminal type and modes, so the shell keeps the `TERM` it started with. plexd writes the most recent output the shell produced, at most the last 65,536 bytes, to the channel, then relays live output, and answers the `shell` request with success. No output is lost or doubled between the replay and the live output. The attachment is recorded before the answer, so a `shell-state@plexsphere.com` request sent right after the answer finds it.
+3. When a channel on another connection is attached to the kept shell at that moment, plexd first sends that older connection the global request `shell-taken-over@plexsphere.com` with `want_reply` false and an empty payload (RFC 4254 section 4). It then closes that connection, and only then answers the new `shell` request. The closed connection gives its slot of the four-connection limit back.
+4. When the attached channel or its connection ends for any other reason, plexd logs `ssh kept shell detached`, and the shell keeps running with no client attached. Its output goes into the 64 KiB replay buffer, as it does while a client is attached.
+5. plexd answers the global request `shell-state@plexsphere.com` (`want_reply` true, empty payload; plexd ignores the payload) with `SSH_MSG_REQUEST_SUCCESS` carrying exactly one SSH `string` (RFC 4251 section 5): `started` when a channel of this connection started the kept shell and is attached to it, `reattached` when a channel of this connection reattached and is attached. Every other case answers failure: no `shell` yet, a shell without a pty, an `exec`, a session whose token lists allowed commands, a channel that detached, a shell that exited.
+6. The kept shell ends in three ways:
+   - It exits on its own. The attached channel, if there is one, gets `exit-status` as a channel-bound shell's does, and a launch error reaches it as a `plexd: <error>` stderr line with exit status 1. The next interactive `shell` starts a new kept shell with an empty buffer.
+   - The session closes, for any reason: the entry drains, `expires_at` passes, the idle window elapses, a `session_revoked` event names it, or plexd shuts down. The helper sends `SIGHUP` to the shell's process group and `SIGKILL` 2 s later, as for every process, and the kept shell does not change the `session_ended` row's `terminated_by`.
+   - plexd stops. A kept shell does not survive a restart: the session helper stops the shell once plexd's connection to it closes, which plexd's exit does.
+7. Only SSH bytes on a connection are activity, as for every ssh session. A detached shell's output is not, so a session whose shell no client reattached within `idle_timeout_seconds` closes with `idle_timeout`.
+
+plexd sends the takeover's global request on its own goroutine and waits for it
+at most `drainTimeout`, 2 s, before it closes the older connection, so an older
+connection whose transport no longer drains, on a dropped network for instance,
+cannot hold up the new client. plexd sends no `SSH_MSG_DISCONNECT`, because
+`golang.org/x/crypto/ssh` has no API that sends one: the global request is
+followed by the close, and the WebSocket under the connection closes with status
+`1000`. plexd logs `ssh kept shell taken over` with the new connection's
+`connection_id` and the older one's `previous_connection_id`. The request is
+best effort during a key re-exchange: `golang.org/x/crypto/ssh` holds a packet
+sent then until the exchange completes, and the close that follows ends the
+exchange, so the older client sees the close alone.
+
+When the attached channel belongs to the connection that sends the new
+interactive `shell`, plexd closes that older channel without `exit-status`,
+sends no global request, keeps the connection open, and reattaches the new
+channel. Rule 3 covers another connection only, and closing the requester's
+connection would end its own new channel. The `ssh kept shell taken over` line
+then carries the same id as `connection_id` and `previous_connection_id`.
+
+Five more rules keep one connection from holding the others up:
+
+- While a channel's interactive `shell` request waits for its turn, plexd keeps reading that channel's other requests and answers them after the `shell` request, in the order they came: replies carry no id, so a client matches them to its requests by order. `golang.org/x/crypto/ssh` queues at most 16 requests per channel and reads the whole connection on one loop, so a channel whose requests went unread would stall its connection. Each `window-change` that wants no reply replaces the one before it. A channel that sends more than 64 requests meanwhile has its connection closed, and plexd logs `ssh channel sent too many requests while its shell request waited; closing the connection` at Warn.
+- A `shell` request whose channel closed while it waited is refused (`ssh request refused`, reason `the channel closed`).
+- The shell counts as exited as soon as its process is gone, while its last output may still be on the way to the attached channel. An interactive `shell` in that moment starts a new kept shell instead of taking the old one over, and the attached channel still gets the exit status.
+- A `shell` request that waited for the session's turn on a connection a takeover closed meanwhile, or one that ended, is refused (`ssh request refused`, reason `the connection is closing`), so it cannot take the shell from the connection that just took it.
+- Once the takeover is done, plexd writes the replay and the answer to the requesting connection. A connection that does not take them within `drainTimeout`, 2 s, is closed, and plexd logs `ssh kept shell request not answered within the drain bound; closing the connection` at Warn. The next interactive `shell` then proceeds.
+
+A connection attached to the kept shell gives its slot back as soon as it ends.
+A channel-bound process keeps its connection's slot until the process is gone,
+so that a client that hangs up cannot start more processes than the limits
+allow. The kept shell belongs to the session, at most one runs, and a reconnect
+reattaches to it, so the same bound holds without the slot.
+
+The replay buffer lives in plexd's memory only, never on disk: at most 65,536
+bytes per session, freed when the shell ends, and `tunnel.max_sessions` bounds
+the sessions. No log line carries the replay or any other output byte. plexd
+keeps reading a detached shell's output into the buffer, so a shell that never
+stops printing costs CPU until the session closes, which the idle window bounds
+for a session that has one.
 
 ### Commands and activity rows
 
@@ -882,8 +943,10 @@ operator-driven `revoke_reason`, `ttl_expired` or `idle_timeout` for the
 sweeper's), when its capped expiry fires (`ttl_expired`), when its idle window
 elapses (`idle_timeout`), or on shutdown (`plexd_close`). Any SSH byte on any of
 its connections is activity; WebSocket pings are not. The close ends every connection within the drain bound
-and stops each running process through its helper; under socket activation
-systemd also kills the instance's cgroup.
+and stops each running process through its helper, the kept shell included,
+whether or not a client is attached to it; under socket activation systemd also
+kills the instance's cgroup. A restart of plexd ends the kept shell as well (see
+[Kept shell](#kept-shell)).
 
 The helper cannot see the sessions block, so it cannot honour a revocation: a
 compromised plexd can reuse a token a client presented until that token's `exp`.
@@ -919,10 +982,16 @@ All log entries use `component=tunnel`. Session-scoped entries add `session_id`.
 | `Info`  | ssh login accepted             | `connection_id`, `user`                     |
 | `Info`  | ssh request refused            | `request`, `reason`                         |
 | `Info`  | ssh process exited             | `mode`, `exit_status` (a number, never a signal name) |
+| `Info`  | ssh kept shell started         | `connection_id`                             |
+| `Info`  | ssh kept shell reattached      | `connection_id`, `replay_bytes`             |
+| `Info`  | ssh kept shell taken over      | `connection_id`, `previous_connection_id` (equal when the attached channel was on the same connection) |
+| `Info`  | ssh kept shell detached        | `connection_id`                             |
 | `Info`  | ssh session revoked or expired server-side; closing the connection | — |
 | `Info`  | ssh session closed             | `duration`                                  |
 | `Warn`  | ssh login refused              | `connection_id`, `user`, `error`            |
 | `Warn`  | ssh pty allocation failed      | `error`                                     |
+| `Warn`  | ssh kept shell request not answered within the drain bound; closing the connection | `connection_id` |
+| `Warn`  | ssh channel sent too many requests while its shell request waited; closing the connection | `connection_id` |
 | `Warn`  | ssh command not recorded by the control plane; refusing to run it | `command`, `error` |
 | `Warn`  | ssh command exit not recorded  | `command`, `exit_code`, `error`             |
 | `Warn`  | ssh session launch failed      | `mode`, `error`                             |
