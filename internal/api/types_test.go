@@ -2229,6 +2229,19 @@ func TestSessionActivityRequest_TCPStarted(t *testing.T) {
 	}
 }
 
+// A session_active row carries the phase alone: every other TCPActivity field
+// is omitempty, so the wire bytes are a constant.
+func TestSessionActivityRequest_TCPActive(t *testing.T) {
+	data, err := json.Marshal(SessionActivityRequest{TCP: &TCPActivity{Phase: TCPPhaseSessionActive}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `{"tcp":{"phase":"session_active"}}`
+	if string(data) != want {
+		t.Errorf("marshal = %s, want %s", data, want)
+	}
+}
+
 func TestSessionActivityRequest_TCPEnded(t *testing.T) {
 	var in, out int64 = 0, 0
 	req := SessionActivityRequest{
