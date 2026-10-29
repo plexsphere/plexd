@@ -20,6 +20,14 @@ type SessionActivityReporter interface {
 	ReportSessionStarted(ctx context.Context, entry api.NodeStateSession, listenerEndpoint string) error
 }
 
+// TCPActivityReporter posts a tcp session's session_active row: the tunnel
+// forwarded bytes since its previous one. It returns the post's error, which
+// decides whether the session stops reporting, warns, or retries the row at the
+// end of its interval.
+type TCPActivityReporter interface {
+	ReportSessionActive(ctx context.Context, sessionID string) error
+}
+
 // The close reasons handed to CloseSession. They are the sole input to
 // TerminatedByFromReason, which turns them into the wire terminated_by value the
 // control plane audits on, so producer and consumer share this vocabulary

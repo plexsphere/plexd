@@ -348,6 +348,85 @@ func TestSessionManager_IdleMonitorStopsOnOtherClose(t *testing.T) {
 	}
 }
 
+// echoByte sends one byte through the tunnel at addr and reads its echo back,
+// so bytes cross the tunnel both ways.
+func echoByte(t *testing.T, addr string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Dial() error: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatalf("Write() error: %v", err)
+	}
+	buf := make([]byte, 1)
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("ReadFull() error: %v", err)
+	}
+}
+
+func TestSessionManager_TCPSessionReportsActivity(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	mgr := newTestManager(t, Config{})
+	rec := newActivityRecorder(nil)
+	mgr.SetTCPActivityReporter(rec)
+
+	setup := echoSession(t, "activity-tcp", echoAddr)
+	setup.IdleTimeoutSeconds = 4
+	addr, err := mgr.CreateSession(context.Background(), setup)
+	if err != nil {
+		t.Fatalf("CreateSession() error: %v", err)
+	}
+
+	// The interval follows the entry's idle window: a quarter of 4s.
+	mgr.mu.Lock()
+	report := mgr.sessions["activity-tcp"].(*Session).report
+	mgr.mu.Unlock()
+	if report == nil {
+		t.Fatal("session has no activity report")
+	}
+	if report.interval != time.Second {
+		t.Errorf("report interval = %v, want 1s", report.interval)
+	}
+
+	echoByte(t, addr)
+	rec.next(t, "activity-tcp", time.Second)
+
+	// The close cancels the report with its session; TestMain's goleak check
+	// reports a report goroutine that outlives it.
+	mgr.CloseSession("activity-tcp", reasonDrained)
+	rec.none(t, 200*time.Millisecond)
+}
+
+// An entry without an idle window still reports, at the 60s interval, so its
+// sources are wrapped for the report alone.
+func TestSessionManager_TCPSessionWithoutIdleWindowReportsActivity(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	mgr := newTestManager(t, Config{})
+	rec := newActivityRecorder(nil)
+	mgr.SetTCPActivityReporter(rec)
+
+	addr, err := mgr.CreateSession(context.Background(), echoSession(t, "activity-no-idle", echoAddr))
+	if err != nil {
+		t.Fatalf("CreateSession() error: %v", err)
+	}
+
+	mgr.mu.Lock()
+	report := mgr.sessions["activity-no-idle"].(*Session).report
+	mgr.mu.Unlock()
+	if report == nil {
+		t.Fatal("session has no activity report")
+	}
+	if report.interval != 60*time.Second {
+		t.Errorf("report interval = %v, want 60s", report.interval)
+	}
+
+	echoByte(t, addr)
+	rec.next(t, "activity-no-idle", time.Second)
+}
+
 func TestSessionManager_DefaultTimeoutCapsExpiry(t *testing.T) {
 	echoAddr := startEchoServer(t)
 	mgr := newTestManager(t, Config{

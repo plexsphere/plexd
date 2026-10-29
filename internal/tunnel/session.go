@@ -44,8 +44,12 @@ type Session struct {
 	// onIdle is invoked once by the idle monitor when the window elapses without
 	// byte flow, set by the manager before Start alongside idleTimeout.
 	onIdle func()
+	// report posts the session's session_active rows while its tunnel forwards
+	// bytes, set by the manager before Start. It is nil unless a reporter is
+	// wired.
+	report *activityReport
 	// activityClock holds the last observed activity: the listener bind, then
-	// every forwarded chunk while an idle window is armed.
+	// every forwarded chunk while an idle window or an activity report is armed.
 	activityClock
 
 	logger *slog.Logger
@@ -75,8 +79,9 @@ func (c *activityClock) idleFor() time.Duration {
 }
 
 // activityReader wraps a forwarding source so that every chunk it yields stamps
-// the session's last-activity timestamp. Only used while an idle window is
-// armed; see the fast-path note in forward.
+// the session's last-activity timestamp and, with an activity report armed,
+// marks the bytes for its next row. Only used while an idle window or an
+// activity report is armed; see the fast-path note in forward.
 type activityReader struct {
 	src     io.Reader
 	session *Session
@@ -86,6 +91,9 @@ func (r *activityReader) Read(p []byte) (int, error) {
 	n, err := r.src.Read(p)
 	if n > 0 {
 		r.session.stamp()
+		if r.session.report != nil {
+			r.session.report.observe()
+		}
 	}
 	return n, err
 }
@@ -109,9 +117,10 @@ func NewSession(sessionID, targetHost string, targetPort int, meshIP string, exp
 }
 
 // Start opens a TCP listener bound to the mesh IP and begins accepting
-// connections. Everything the session runs — the accept loop and, when an idle
-// window is armed, the idle monitor — hangs off the child context Start derives
-// here, which Close cancels; nothing outlives the session.
+// connections. Everything the session runs hangs off the child context Start
+// derives here, which Close cancels: the accept loop, the idle monitor when an
+// idle window is armed, and the activity report when a reporter is wired.
+// Nothing outlives the session.
 func (s *Session) Start(ctx context.Context) (string, error) {
 	ctx, s.cancel = context.WithCancel(ctx)
 
@@ -137,6 +146,12 @@ func (s *Session) Start(ctx context.Context) (string, error) {
 	// it cannot outlive the session it watches.
 	if s.idleTimeout > 0 {
 		go s.idleMonitor(ctx)
+	}
+
+	// The activity report runs on the same child context, so it cannot outlive
+	// the session either.
+	if s.report != nil {
+		go s.report.run(ctx, s.logger)
 	}
 
 	return ln.Addr().String(), nil
@@ -249,9 +264,11 @@ func (s *Session) forward(ctx context.Context, clientConn net.Conn) {
 	// syscall pair per 32 KiB chunk in both directions. Sessions with an idle
 	// window are the exception: there the sources are wrapped so every chunk
 	// stamps activity, deliberately trading the fast path for the byte-flow
-	// observation the idle window needs.
+	// observation the idle window needs. A session with an activity report is
+	// the second exception, because the report needs the same observation: it
+	// learns from it that bytes crossed and a session_active row is due.
 	clientSrc, targetSrc := io.Reader(clientConn), io.Reader(targetConn)
-	if s.idleTimeout > 0 {
+	if s.idleTimeout > 0 || s.report != nil {
 		clientSrc = &activityReader{src: clientConn, session: s}
 		targetSrc = &activityReader{src: targetConn, session: s}
 	}
@@ -348,6 +365,13 @@ var _ managedSession = (*Session)(nil)
 func (s *Session) setIdle(timeout time.Duration, onIdle func()) {
 	s.idleTimeout = timeout
 	s.onIdle = onIdle
+}
+
+// setActivityReporter arms the session's activity report before Start: its
+// tunnel then posts session_active rows through reporter, at most one per
+// interval.
+func (s *Session) setActivityReporter(reporter TCPActivityReporter, interval time.Duration) {
+	s.report = newActivityReport(reporter, s.SessionID, interval)
 }
 
 func (s *Session) expiry() time.Time { return s.expiresAt }
