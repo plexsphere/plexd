@@ -1018,7 +1018,11 @@ func runAgent(ctx context.Context) error {
 
 	// 17b. Start endpoint selection. It tries each peer's dial order until a
 	// handshake completes, reading the same device as the handshake reporter.
+	// A peer connected over its relay that falls silent is probed with a
+	// datagram the host routes into the mesh interface, so a relay that
+	// stopped forwarding is dialed again within about a minute.
 	if wgReady {
+		wgMgr.SetRelayProbe(wireguard.SendRelayProbe)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
