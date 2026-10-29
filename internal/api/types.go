@@ -927,7 +927,8 @@ type K8sActivity struct {
 // is set only on session_started rows. BytesIn (operator to target) and
 // BytesOut (target to operator) are pointers so a session_ended row carries
 // explicit zeros while a session_started row omits the byte counters.
-// TerminatedBy, when set, is one of the TerminatedBy* values.
+// TerminatedBy, when set, is one of the TerminatedBy* values. A session_active
+// row carries Phase alone.
 type TCPActivity struct {
 	Phase            string `json:"phase"`
 	TargetHost       string `json:"target_host,omitempty"`
@@ -942,6 +943,9 @@ type TCPActivity struct {
 const (
 	// TCPPhaseSessionStarted marks the opening of a TCP session.
 	TCPPhaseSessionStarted = "session_started"
+	// TCPPhaseSessionActive reports that a TCP session forwarded bytes since its
+	// previous session_active row. The row carries Phase alone.
+	TCPPhaseSessionActive = "session_active"
 	// TCPPhaseSessionEnded marks the close of a TCP session.
 	TCPPhaseSessionEnded = "session_ended"
 )
