@@ -1794,6 +1794,7 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPost, "/v1/nodes/node-1/logs", logsBatchBody},
 		{http.MethodPost, "/v1/nodes/node-1/audit", auditBatchBody},
 		{http.MethodPost, "/v1/nodes/" + testMockNodeID + "/sessions/sess-conc", `{"tcp":{"phase":"session_started"}}`},
+		{http.MethodPost, "/v1/nodes/" + testMockNodeID + "/sessions/sess-conc", `{"tcp":{"phase":"session_active"}}`},
 		{http.MethodPost, "/v1/nodes/node-1/integrity-violations", integrityViolationBody},
 		{http.MethodPost, "/v1/nodes/node-1/handshakes", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:51820"))},
 		{http.MethodGet, "/v1/nodes/" + testMockNodeID + "/peers/" + testFixturePeerB1 + "/psk", ""},
@@ -5387,6 +5388,15 @@ func assertActivityCounters(t *testing.T, baseURL string, wantAccepted, wantReje
 	}
 }
 
+// assertSessionActiveCount checks the counter of accepted session_active rows,
+// which moves apart from the two assertActivityCounters reads.
+func assertSessionActiveCount(t *testing.T, baseURL string, want int64) {
+	t.Helper()
+	if a := getAssertions(t, baseURL); a.SessionActiveCount != want {
+		t.Errorf("session_active_count = %d, want %d", a.SessionActiveCount, want)
+	}
+}
+
 func TestSessionActivity_KindMismatch_Returns400(t *testing.T) {
 	_, ts := newTestServer(t)
 	configureSessions(t, ts.URL, sessionOfKind("sess-kind", api.SessionKindSSH))
@@ -5562,6 +5572,7 @@ func TestSessionActivity_DeadSessionRefusesOtherRows(t *testing.T) {
 		{"ssh_ended_on_tcp_session", api.SessionKindTCP, `{"ssh":{"phase":"session_ended","terminated_by":"plexd_close"}}`},
 		{"ssh_command", api.SessionKindSSH, `{"ssh":{"command":"ls"}}`},
 		{"tcp_started", api.SessionKindTCP, `{"tcp":{"phase":"session_started"}}`},
+		{"tcp_active", api.SessionKindTCP, `{"tcp":{"phase":"session_active"}}`},
 		{"k8s_row", api.SessionKindK8s, `{"k8s":{"verb":"get"}}`},
 	}
 	for _, tt := range tests {
@@ -5575,6 +5586,7 @@ func TestSessionActivity_DeadSessionRefusesOtherRows(t *testing.T) {
 				t.Errorf("status = %d %q, want 409 %q", status, code, "session_already_revoked")
 			}
 			assertActivityCounters(t, ts.URL, 0, 1)
+			assertSessionActiveCount(t, ts.URL, 0)
 		})
 	}
 }
@@ -5626,6 +5638,118 @@ func TestSessionActivity_RebindAfterEndAdmitsNextEnd(t *testing.T) {
 		t.Errorf("ending row of the rebound listener = %d %q, want 204", status, code)
 	}
 	assertActivityCounters(t, ts.URL, 4, 0)
+}
+
+// TestSessionActivity_SessionActiveTouchesOnly covers the row a tcp tunnel
+// posts while it forwards bytes. The control plane records it only as a
+// last-active touch, so the mock counts it on session_active_count and on
+// neither activity counter.
+func TestSessionActivity_SessionActiveTouchesOnly(t *testing.T) {
+	_, ts := newTestServer(t)
+	configureSessions(t, ts.URL, stateSession("sess-active", 22))
+
+	const body = `{"tcp":{"phase":"session_active"}}`
+	for i := 1; i <= 2; i++ {
+		if status, code := postActivity(t, ts.URL, "sess-active", body); status != http.StatusNoContent {
+			t.Fatalf("session_active row #%d = %d %q, want 204", i, status, code)
+		}
+	}
+	assertSessionActiveCount(t, ts.URL, 2)
+	assertActivityCounters(t, ts.URL, 0, 0)
+	if captured := getCapturedBody(t, ts.URL, "session_activity"); string(captured) != body {
+		t.Errorf("captured session_activity = %q, want %q", captured, body)
+	}
+}
+
+// Only a tcp tunnel posts session_active rows. On a live session of another
+// kind the row's tcp member is the kind mismatch the control plane refuses, and
+// on an id no session carries it is the 404 every row draws.
+func TestSessionActivity_SessionActiveOutsideALiveTCPSession(t *testing.T) {
+	tests := []struct {
+		name       string
+		kind       string
+		wantStatus int
+		wantCode   string
+		wantReject int64
+	}{
+		{"ssh_session", api.SessionKindSSH, http.StatusBadRequest, "malformed_session_activity", 0},
+		{"k8s_session", api.SessionKindK8s, http.StatusBadRequest, "malformed_session_activity", 0},
+		{"unknown_session", "", http.StatusNotFound, "session_not_found", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			sid := "sess-unknown"
+			if tt.kind != "" {
+				sid = "sess-" + tt.kind
+				configureSessions(t, ts.URL, sessionOfKind(sid, tt.kind))
+			}
+
+			status, code := postActivity(t, ts.URL, sid, `{"tcp":{"phase":"session_active"}}`)
+			if status != tt.wantStatus || code != tt.wantCode {
+				t.Errorf("status = %d %q, want %d %q", status, code, tt.wantStatus, tt.wantCode)
+			}
+			assertSessionActiveCount(t, ts.URL, 0)
+			assertActivityCounters(t, ts.URL, 0, tt.wantReject)
+		})
+	}
+}
+
+// The listener endpoint belongs on the session_started row, and the control
+// plane answers a session_active row that names one with a 400.
+func TestSessionActivity_SessionActiveWithListenerEndpoint_Returns400(t *testing.T) {
+	_, ts := newTestServer(t)
+	configureSessions(t, ts.URL, stateSession("sess-active", 22))
+
+	status, code := postActivity(t, ts.URL, "sess-active", `{"tcp":{"phase":"session_active","listener_endpoint":"10.99.0.1:40000"}}`)
+	if status != http.StatusBadRequest || code != "malformed_session_activity" {
+		t.Errorf("status = %d %q, want 400 %q", status, code, "malformed_session_activity")
+	}
+	assertSessionActiveCount(t, ts.URL, 0)
+	assertActivityCounters(t, ts.URL, 0, 0)
+}
+
+// A session_active row is not the ending row, so an expired session refuses it
+// like any other row, and the refusal counts as one.
+func TestSessionActivity_SessionActiveOnExpiredSession_Returns409(t *testing.T) {
+	_, ts := newTestServer(t)
+	expired := stateSession("sess-active-exp", 22)
+	expired.ExpiresAt = time.Now().UTC().Add(-time.Minute)
+	configureSessions(t, ts.URL, expired)
+
+	status, code := postActivity(t, ts.URL, "sess-active-exp", `{"tcp":{"phase":"session_active"}}`)
+	if status != http.StatusConflict || code != "session_expired" {
+		t.Errorf("status = %d %q, want 409 %q", status, code, "session_expired")
+	}
+	assertSessionActiveCount(t, ts.URL, 0)
+	assertActivityCounters(t, ts.URL, 0, 1)
+}
+
+// TestSessionActivity_SessionActiveIsNotALifecycleRow pins that a
+// session_active row leaves the session's newest lifecycle row alone. Recorded
+// as one, it would hide the session_ended row before it, and the revoked
+// session would record a second end for a listener that already ended.
+func TestSessionActivity_SessionActiveIsNotALifecycleRow(t *testing.T) {
+	_, ts := newTestServer(t)
+	configureSessions(t, ts.URL, stateSession("sess-touched", 22))
+
+	for _, body := range []string{
+		`{"tcp":{"phase":"session_started"}}`,
+		`{"tcp":{"phase":"session_ended","bytes_in":0,"bytes_out":0,"terminated_by":"plexd_close"}}`,
+		`{"tcp":{"phase":"session_active"}}`,
+	} {
+		if status, code := postActivity(t, ts.URL, "sess-touched", body); status != http.StatusNoContent {
+			t.Fatalf("live row %s = %d %q, want 204", body, status, code)
+		}
+	}
+	configureSessions(t, ts.URL)
+
+	status, code := postActivity(t, ts.URL, "sess-touched", `{"tcp":{"phase":"session_ended","bytes_in":0,"bytes_out":0,"terminated_by":"operator_revoke"}}`)
+	if status != http.StatusConflict || code != "session_already_revoked" {
+		t.Errorf("ending row after the revocation = %d %q, want 409 %q", status, code, "session_already_revoked")
+	}
+	assertSessionActiveCount(t, ts.URL, 1)
+	assertActivityCounters(t, ts.URL, 2, 1)
 }
 
 func TestSessionActivity_ForeignNodeID_Returns403(t *testing.T) {

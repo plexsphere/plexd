@@ -66,6 +66,10 @@ type AssertionCounters struct {
 	// SessionActivityRejectedCount counts the liveness refusals (404/409) of the
 	// session activity endpoint. A structural 400 counts nowhere.
 	SessionActivityRejectedCount int64 `json:"session_activity_rejected_count"`
+	// SessionActiveCount counts the accepted tcp session_active rows. They count
+	// on no other counter, because the control plane records them only as a
+	// last-active touch.
+	SessionActiveCount int64 `json:"session_active_count"`
 	// SessionConnectionCount counts the connections the session connection
 	// route handed to a waiting relay.
 	SessionConnectionCount int64 `json:"session_connection_count"`
@@ -131,6 +135,7 @@ type Server struct {
 	auditCount                     atomic.Int64
 	sessionActivityCount           atomic.Int64
 	sessionActivityRejectedCount   atomic.Int64
+	sessionActiveCount             atomic.Int64
 	sessionConnectionCount         atomic.Int64
 	sessionConnectionRejectedCount atomic.Int64
 	sessionConnectionTimeoutCount  atomic.Int64
@@ -169,9 +174,10 @@ type Server struct {
 	sessionRegistry map[string]string
 
 	// sessionLifecycle maps a session_id to the phase of the newest lifecycle
-	// row (a tcp row, or an ssh row with a phase) the mock accepted for it, the
-	// mock's stand-in for the control plane's activity log. A revoked or expired
-	// session records its ending row only while this is not session_ended.
+	// row (a tcp session_started or session_ended row, or an ssh row with a
+	// phase) the mock accepted for it, the mock's stand-in for the control
+	// plane's activity log. A revoked or expired session records its ending row
+	// only while this is not session_ended.
 	sessionLifecycleMu sync.Mutex
 	sessionLifecycle   map[string]string
 
@@ -305,6 +311,7 @@ func (s *Server) Assertions() AssertionCounters {
 		AuditCount:                     s.auditCount.Load(),
 		SessionActivityCount:           s.sessionActivityCount.Load(),
 		SessionActivityRejectedCount:   s.sessionActivityRejectedCount.Load(),
+		SessionActiveCount:             s.sessionActiveCount.Load(),
 		SessionConnectionCount:         s.sessionConnectionCount.Load(),
 		SessionConnectionRejectedCount: s.sessionConnectionRejectedCount.Load(),
 		SessionConnectionTimeoutCount:  s.sessionConnectionTimeoutCount.Load(),
@@ -2245,7 +2252,15 @@ func validSessionActivity(req api.SessionActivityRequest) bool {
 	case req.K8s != nil:
 		return req.K8s.Verb != ""
 	default:
-		if req.TCP.Phase != api.TCPPhaseSessionStarted && req.TCP.Phase != api.TCPPhaseSessionEnded {
+		switch req.TCP.Phase {
+		case api.TCPPhaseSessionStarted, api.TCPPhaseSessionEnded:
+		case api.TCPPhaseSessionActive:
+			// The control plane answers a session_active row that names a
+			// listener with a 400: the endpoint belongs on session_started.
+			if req.TCP.ListenerEndpoint != "" {
+				return false
+			}
+		default:
 			return false
 		}
 		if req.TCP.TerminatedBy != "" && !validTerminatedBy(req.TCP.TerminatedBy) {
@@ -2314,12 +2329,16 @@ func (s *Server) resolveSession(sessionID string) (entry api.NodeStateSession, c
 	return entry, configured, registered, registeredKind
 }
 
-// lifecyclePhase returns the phase of a lifecycle row: every tcp row, and an
-// ssh row that carries a phase. It is empty for an ssh command row and a k8s
-// row, which are not lifecycle rows.
+// lifecyclePhase returns the phase of a lifecycle row: a tcp session_started
+// or session_ended row, and an ssh row that carries a phase. It is empty for a
+// tcp session_active row, an ssh command row and a k8s row, which are not
+// lifecycle rows.
 func lifecyclePhase(req api.SessionActivityRequest) string {
 	switch {
 	case req.TCP != nil:
+		if req.TCP.Phase == api.TCPPhaseSessionActive {
+			return ""
+		}
 		return req.TCP.Phase
 	case req.SSH != nil:
 		return req.SSH.Phase
@@ -2383,9 +2402,17 @@ func (s *Server) recordEndOfDeadSession(sessionID string) bool {
 // plexsphere/plexsphere#931, records exactly one row: the session_ended row of
 // an ssh or tcp listener in the member its kind calls for, accepted with 204
 // unless the session's newest lifecycle row is already a session_ended. Every
-// other row on it is a 409, session_expired or session_already_revoked. The
-// liveness refusals count on sessionActivityRejectedCount, the accepted rows
-// on sessionActivityCount, and a 400 on neither.
+// other row on it is a 409, session_expired or session_already_revoked.
+//
+// A tcp session_active row is a touch only: the control plane advances the
+// session's last_active_at for it and writes no activity-log row. On a live
+// session the mock answers it 204, counts it on sessionActiveCount alone and
+// leaves the session's newest lifecycle row as it was. On a revoked or expired
+// session it draws the 409 like any other row but the ending one.
+//
+// The liveness refusals count on sessionActivityRejectedCount, the accepted
+// session_active rows on sessionActiveCount, the other accepted rows on
+// sessionActivityCount, and a 400 on none of them.
 func (s *Server) handleSessionActivity(w http.ResponseWriter, r *http.Request) {
 	if r.PathValue("id") != mockNodeID {
 		writeProblem(w, r, http.StatusForbidden, "nsk_node_mismatch", "node id does not match this node's identity")
@@ -2418,6 +2445,11 @@ func (s *Server) handleSessionActivity(w http.ResponseWriter, r *http.Request) {
 		if !activityMatchesKind(req, entry.Kind) {
 			writeProblem(w, r, http.StatusBadRequest, "malformed_session_activity",
 				"activity variant does not match the session's kind")
+			return
+		}
+		if req.TCP != nil && req.TCP.Phase == api.TCPPhaseSessionActive {
+			s.sessionActiveCount.Add(1)
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		s.recordLifecycle(sessionID, req)
