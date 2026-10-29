@@ -946,7 +946,7 @@ server but not emitted. Success is `204 No Content`.
 |-------|----------------|-------------------|---------------------------------|
 | `SSH` | `*SSHActivity` | `"ssh,omitempty"` | SSH session lifecycle or command row |
 | `K8s` | `*K8sActivity` | `"k8s,omitempty"` | Per-request Kubernetes API row   |
-| `TCP` | `*TCPActivity` | `"tcp,omitempty"` | TCP session lifecycle row        |
+| `TCP` | `*TCPActivity` | `"tcp,omitempty"` | TCP session lifecycle or `session_active` row |
 
 **SSHActivity**
 
@@ -990,7 +990,7 @@ mixes the shapes.
 
 | Field          | Type    | JSON Tag                   | Description                                             |
 |----------------|---------|----------------------------|---------------------------------------------------------|
-| `Phase`        | `string`| `"phase"`                  | One of the `TCPPhase*` values                           |
+| `Phase`        | `string`| `"phase"`                  | One of the `TCPPhase*` values; a `session_active` row carries the phase alone |
 | `TargetHost`   | `string`| `"target_host,omitempty"`  | Forward target host                                     |
 | `TargetPort`   | `int`   | `"target_port,omitempty"`  | Forward target port                                     |
 | `ListenerEndpoint` | `string`| `"listener_endpoint,omitempty"` | Address the node's listener bound; set on `session_started` rows only |
@@ -1003,6 +1003,7 @@ mixes the shapes.
 | Constant                 | Value             | Description                  |
 |--------------------------|-------------------|------------------------------|
 | `TCPPhaseSessionStarted` | `session_started` | Opening of a TCP session     |
+| `TCPPhaseSessionActive`  | `session_active`  | The TCP session forwarded bytes since its previous `session_active` row |
 | `TCPPhaseSessionEnded`   | `session_ended`   | Close of a TCP session       |
 
 **TerminatedBy constants**

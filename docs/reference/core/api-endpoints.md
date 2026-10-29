@@ -1111,8 +1111,10 @@ on the terminal callback.
 
 A one-of activity record carrying exactly one of `ssh`, `k8s`, or `tcp`. plexd
 emits `tcp` rows for a tcp session: a `session_started` row when the listener
-comes up and a `session_ended` row on close. It emits `ssh` rows for an ssh
-session, served on Linux and macOS: the same two lifecycle rows, plus two command rows
+comes up, `session_active` rows while the tunnel forwards bytes, and a
+`session_ended` row on close. It emits `ssh` rows for an ssh
+session, served on Linux and macOS: the two lifecycle rows, `session_started` and
+`session_ended`, with no `session_active` row, plus two command rows
 around every `exec`. It emits no `k8s` rows.
 
 **Request body** (tcp `session_started`). `listener_endpoint` is the address the node
@@ -1155,6 +1157,20 @@ session to close):
     "terminated_by": "plexd_close"
   }
 }
+```
+
+**Request body** (tcp `session_active`). The row carries `phase` alone and says
+that the tunnel forwarded bytes since the node's previous `session_active` row.
+plexd posts the first one as soon as a byte crosses after an interval without a
+row, then one at the end of each interval in which bytes crossed, and none once a
+whole interval passed without a byte. The interval is
+`min(60 s, idle_timeout_seconds / 4)`, or 60 s for an entry whose
+`idle_timeout_seconds` is `0`. On a live session the control plane advances the
+session's `last_active_at` and appends no row to its activity log (see
+[Activity Reports](../networking/secure-access-tunneling.md#activity-reports)):
+
+```json
+{"tcp": {"phase": "session_active"}}
 ```
 
 **Request body** (ssh `session_started` and `session_ended`). A lifecycle row
@@ -1230,6 +1246,15 @@ the entry standing in the block is the control plane still asking for the
 session. It therefore keeps the ordinary handling, as every other answer does: a
 started row is re-posted on the next pull and an ended row is logged at Error and
 dropped.
+
+A tcp `session_active` row is posted by the tunnel's own reporter, not by the
+pull, and plexd reads each answer to it this way: `204` means the row is
+recorded; a `409` `session_already_revoked` or `session_expired` stops the
+session's reports; a `400`, which a control plane that predates the row answers
+as `400 invalid_session_activity`, is warned about once per session and not
+retried, though later bytes still post; every other answer, a `401 nsk_invalid`,
+the `404`, a `5xx`, a transport error or a timeout among them, is retried at the
+end of the interval. None of them closes the tunnel.
 
 ### GET /v1/nodes/{node_id}/sessions/{session_id}/connections/{connection_id} {#get-v1-nodes-node-id-sessions-session-id-connections-connection-id}
 

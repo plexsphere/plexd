@@ -811,8 +811,9 @@ The `404` / `409` / `413` problem bodies carry no machine `code`.
 The v1 session activity record. The mock enforces the node-id guard, a 16 KiB body
 cap, strict decoding, and the one-of `ssh` / `k8s` / `tcp` contract: exactly one
 member must be set, and that member must satisfy its per-kind rules —
-`k8s.verb` non-empty, `tcp.phase` one of `session_started` / `session_ended` with
-a valid `terminated_by` when set, or one of the two `ssh` shapes the control plane
+`k8s.verb` non-empty, `tcp.phase` one of `session_started` / `session_active` /
+`session_ended` with a valid `terminated_by` when set and, on `session_active`,
+no `listener_endpoint`, or one of the two `ssh` shapes the control plane
 admits:
 
 - a lifecycle row (`phase` set) carries no `command`, `exit_code`, `started_at` or `completed_at`; its phase is `session_started` without `terminated_by`, or `session_ended` without `listener_endpoint` and with a valid `terminated_by` when set;
@@ -823,8 +824,12 @@ So `{"ssh":{}}`, `{"ssh":{"command":"ls","phase":"session_started"}}`,
 `{"ssh":{"phase":"session_ended","listener_endpoint":"10.99.0.1:1"}}` are all
 `400 malformed_session_activity`. An `ssh` `session_started` row is admitted with
 or without `listener_endpoint`: plexd posts it without one, because an ssh
-session binds no listener, and an older agent posts it with one. A record that
-clears those structural gates goes on to liveness resolution.
+session binds no listener, and an older agent posts it with one. A `tcp`
+`session_active` row with a `listener_endpoint`, such as
+`{"tcp":{"phase":"session_active","listener_endpoint":"10.99.0.1:40000"}}`, is a
+`400 malformed_session_activity` too, because the control plane refuses it with
+a `400`. A record that clears those structural gates goes on to liveness
+resolution.
 
 Liveness resolves `{sid}` against the configured `sessions` block and against a
 `session_id` registry that `POST /test/configure-state` (and `PUT /test/state`)
@@ -834,7 +839,8 @@ was never configured. The registry also keeps the `kind` each id was last
 configured with. A configured entry whose `expires_at` is in the future is
 live, and the row's populated member has to be the one its `kind` calls for (an
 `ssh` member for an `ssh` entry, `k8s` for `k8s`, `tcp` for `tcp`): a match
-increments `session_activity_count` and returns `204 No Content`, a mismatch is
+increments `session_activity_count`, or `session_active_count` for a `tcp`
+`session_active` row (see below), and returns `204 No Content`, a mismatch is
 a `400 malformed_session_activity` with the detail
 `activity variant does not match the session's kind`, which counts on neither
 counter (the spec folds the kind mismatch into the structural code). A
@@ -848,18 +854,30 @@ the mock records one row on it: the `session_ended` row of an `ssh` or `tcp`
 session, in the member its `kind` calls for (`ssh.phase` or `tcp.phase` set to
 `session_ended`). That row is answered `204 No Content` and increments
 `session_activity_count`, unless the newest lifecycle row the mock accepted for
-the session (a `tcp` row, or an `ssh` row with a `phase`) is already a
-`session_ended`. So a listener's end is recorded once, and a listener bound
-again after it still gets its own. Every other row on a dead session is a
-`409 session_expired` (expired) or `409 session_already_revoked` (revoked) and
-increments `session_activity_rejected_count`: a second `session_ended`, a
-`session_started`, an `ssh` command row, any row on a `k8s` session, and a row
+the session (a `tcp` row other than `session_active`, or an `ssh` row with a
+`phase`) is already a `session_ended`. So a listener's end is recorded once, and
+a listener bound again after it still gets its own. Every other row on a dead
+session is a `409 session_expired` (expired) or `409 session_already_revoked`
+(revoked) and increments `session_activity_rejected_count`: a second
+`session_ended`, a `session_started`, a `tcp` `session_active` row, an `ssh`
+command row, any row on a `k8s` session, and a row
 whose member does not match the session's `kind`, which on a dead session is a
 `409` rather than a `400`. Configuring the id again makes it live again. The
 body is captured before validation, so
 `GET /test/last-request/session_activity` holds the last posted row whether or
 not it was accepted. The mock accepts configured sessions of any kind, so `k8s`
 rows are testable against it even though plexd produces none.
+
+A `tcp` `session_active` row on a live session is a touch only: the control
+plane records it as an advance of the session's `last_active_at` and appends no
+row to the session's activity log. The mock answers it `204 No Content` and
+counts it on `session_active_count` alone, never on `session_activity_count`, so
+a suite's exact arithmetic on that counter does not move with a tunnel's
+traffic. It is not a lifecycle row either: it never becomes the session's newest
+lifecycle row, so a `session_ended` posted after a drain is judged by the
+`session_started` or `session_ended` row before it. On a revoked or expired
+session it takes the `409` paths above and counts on
+`session_activity_rejected_count`.
 
 Strict decoding means the accepted `tcp` fields are exactly those of
 `api.TCPActivity`, `listener_endpoint` among them — a node that reports the
@@ -869,7 +887,7 @@ an unknown field. The value itself is not validated.
 | Status | Problem `code` | Meaning |
 |---|---|---|
 | `204 No Content` | — | Activity record accepted: a row on a live session, or the one `session_ended` row a dead `ssh` or `tcp` session records |
-| `400 Bad Request` | `malformed_session_activity` | Unreadable body, strict-decode failure, a one-of / per-kind violation, or a row whose member does not match a live session's `kind` |
+| `400 Bad Request` | `malformed_session_activity` | Unreadable body, strict-decode failure, a one-of / per-kind violation (a `tcp` `session_active` row with a `listener_endpoint` among them), or a row whose member does not match a live session's `kind` |
 | `403 Forbidden` | `nsk_node_mismatch` | `{id}` does not match the mock node identity |
 | `404 Not Found` | `session_not_found` | No session resolves for this node and session id |
 | `409 Conflict` | `session_already_revoked` | The id was configured earlier and has drained out of the block since, and the row is not the one `session_ended` row such a session records |
@@ -1051,6 +1069,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "audit_count": 0,
   "session_activity_count": 0,
   "session_activity_rejected_count": 0,
+  "session_active_count": 0,
   "session_connection_count": 0,
   "session_connection_rejected_count": 0,
   "session_connection_timeout_count": 0,
@@ -1483,8 +1502,9 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `metrics_count` | `POST /v1/nodes/{id}/metrics` |
 | `logs_count` | `POST /v1/nodes/{id}/logs` |
 | `audit_count` | `POST /v1/nodes/{id}/audit` |
-| `session_activity_count` | `POST /v1/nodes/{id}/sessions/{sid}` (accepted rows only) |
+| `session_activity_count` | `POST /v1/nodes/{id}/sessions/{sid}` (accepted rows only, tcp `session_active` rows excepted) |
 | `session_activity_rejected_count` | `POST /v1/nodes/{id}/sessions/{sid}` (liveness refusals only: `404` / `409`) |
+| `session_active_count` | `POST /v1/nodes/{id}/sessions/{sid}` (accepted tcp `session_active` rows only, which count on no other counter) |
 | `session_connection_count` | `GET /v1/nodes/{id}/sessions/{sid}/connections/{cid}` (connections delivered to a relay) |
 | `session_connection_rejected_count` | `GET /v1/nodes/{id}/sessions/{sid}/connections/{cid}` (`404` / `409` / `426` answers) |
 | `session_connection_timeout_count` | `POST /test/session-connect` (relays that waited out `expires_at` without a connection) |
