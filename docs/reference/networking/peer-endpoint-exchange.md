@@ -173,7 +173,7 @@ A peer's `endpoint_candidates` can hold addresses the peer never reported: its p
 
 The wire does not mark which entry is which, so plexd orders a peer-observed endpoint like any other candidate (see [Dial order](wireguard.md#dial-order)). A mapping is usually off-link, so it is tried after the peer's usable direct endpoint and before its fallback.
 
-A peer-observed endpoint appears on a pull once a second node reports it, and leaves once fewer than two of those reports are within the Domain's endpoint TTL. Each change is a change to `endpoint_candidates`, so the differ updates the peer: a peer that is not connected restarts at the first entry of its dial order, and a connected peer keeps the endpoint on its device (see [Endpoint selection](wireguard.md#endpoint-selection)).
+A peer-observed endpoint appears on a pull once a second node reports it, and leaves once fewer than two of those reports are within the Domain's endpoint TTL. Each change is a change to `endpoint_candidates`, so the differ updates the peer: a peer that runs over its relay, or ran over it before its connection failed, stays on the relay, another connected peer keeps the endpoint on its device, and any other peer restarts at the first entry of its dial order (see [Endpoint selection](wireguard.md#endpoint-selection)).
 
 A wrong entry costs one trial, the keepalive interval plus 5 s (30 s by default), because WireGuard completes a handshake only with the holder of the peer's key. plexd holds every entry to the usability rules of the direct endpoint, the Domain mesh prefix check included, which the control plane does not apply.
 

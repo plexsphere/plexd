@@ -337,7 +337,7 @@ Its reader is `wgTunnelStatsReader` (`cmd/plexd/cmd/up.go`), which calls [`wireg
 |----------------------|--------------------------------------------------------------------|
 | `PeerID`             | The peer's node ID                                                 |
 | `LastHandshakeTime`  | The latest completed handshake; zero when none has completed      |
-| `RxBytes`, `TxBytes` | The device's byte counters for the peer                            |
+| `RxBytes`, `TxBytes` | The device's byte counters for the peer. They restart from 0 when plexd adds the device peer anew, after a key rotation or a [relay re-dial](../networking/wireguard.md#relay-liveness-probe) |
 | `HandshakeSucceeded` | `true` when a handshake has completed                              |
 | `HandshakeStale`     | Set by the collector when the handshake is older than 5 minutes    |
 | `PacketLossPercent`  | Always `-1`, the "no measurement" value: plexd measures no packet loss |
