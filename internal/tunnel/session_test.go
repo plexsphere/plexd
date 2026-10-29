@@ -447,9 +447,9 @@ func TestSession_IdleWindowStampsActivityBothDirections(t *testing.T) {
 }
 
 func TestSession_WithoutIdleWindowActivityStaysAtBind(t *testing.T) {
-	// Without an idle window the sources stay unwrapped so io.Copy keeps its
-	// splice(2) fast path, which means byte flow does not stamp activity: the
-	// bind timestamp is all a session without a window ever reports.
+	// Without an idle window or an activity reporter the sources stay unwrapped
+	// so io.Copy keeps its splice(2) fast path, which means byte flow does not
+	// stamp activity: the bind timestamp is all such a session ever reports.
 	echoAddr := startEchoServer(t)
 	host, portStr, _ := net.SplitHostPort(echoAddr)
 	port := mustAtoi(t, portStr)

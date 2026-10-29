@@ -81,6 +81,9 @@ type SessionManager struct {
 	sessions map[string]managedSession
 	onClosed func(sessionID, reason string, info *ClosedSessionInfo)
 	sshDeps  SSHSessionDeps
+	// tcpActivity posts the session_active rows of tcp sessions created after
+	// it was set. Nil means they post none.
+	tcpActivity TCPActivityReporter
 }
 
 // NewSessionManager creates a new SessionManager with default config applied.
@@ -100,6 +103,15 @@ func (m *SessionManager) SetSSHSessionDeps(deps SSHSessionDeps) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sshDeps = deps
+}
+
+// SetTCPActivityReporter wires the reporter tcp sessions post their
+// session_active rows through. Until it is called, tcp sessions post none, and
+// a session keeps the reporter it was created with.
+func (m *SessionManager) SetTCPActivityReporter(r TCPActivityReporter) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tcpActivity = r
 }
 
 // CreateSession creates and starts a tunnel session for one entry of the pull's
@@ -233,7 +245,14 @@ func (m *SessionManager) CreateSession(ctx context.Context, sess api.NodeStateSe
 			return "", err
 		}
 	} else {
-		session = NewSession(sess.SessionID, sess.Target.TCP.Host, sess.Target.TCP.Port, m.meshIP, expiresAt, m.logger)
+		tcp := NewSession(sess.SessionID, sess.Target.TCP.Host, sess.Target.TCP.Port, m.meshIP, expiresAt, m.logger)
+		// Only a tcp tunnel reports its traffic: the control plane counts an
+		// ssh session's at its attach gateway. Like the idle window, the report
+		// is armed before start, which launches it.
+		if m.tcpActivity != nil {
+			tcp.setActivityReporter(m.tcpActivity, activityReportInterval(sess.IdleTimeoutSeconds))
+		}
+		session = tcp
 	}
 
 	// The idle window is set before start because start arms the idle monitor,
