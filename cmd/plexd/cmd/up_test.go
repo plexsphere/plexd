@@ -3284,6 +3284,9 @@ func TestControlPlaneSessionReporter_PostsActivityRows(t *testing.T) {
 	if err := reporter.ReportSessionStarted(ctx, tcpEntry, "10.99.0.1:40001"); err != nil {
 		t.Fatalf("ReportSessionStarted(tcp) error: %v", err)
 	}
+	if err := reporter.ReportSessionActive(ctx, "sess-tcp"); err != nil {
+		t.Fatalf("ReportSessionActive() error: %v", err)
+	}
 	reporter.ReportSessionEnded(ctx, "sess-tcp", &tunnel.ClosedSessionInfo{
 		Kind: api.SessionKindTCP, TargetHost: "10.0.0.5", TargetPort: 22, BytesIn: 4096, BytesOut: 8192,
 	}, api.TerminatedByPlexdClose)
@@ -3294,6 +3297,7 @@ func TestControlPlaneSessionReporter_PostsActivityRows(t *testing.T) {
 		`{"ssh":{"command":"uptime","started_at":"2026-09-24T08:00:00Z"}}`,
 		`{"ssh":{"command":"uptime","exit_code":0,"started_at":"2026-09-24T08:00:00Z","completed_at":"2026-09-24T08:00:03Z"}}`,
 		`{"tcp":{"phase":"session_started","target_host":"10.0.0.5","target_port":22,"listener_endpoint":"10.99.0.1:40001"}}`,
+		`{"tcp":{"phase":"session_active"}}`,
 		`{"tcp":{"phase":"session_ended","target_host":"10.0.0.5","target_port":22,"bytes_in":4096,"bytes_out":8192,"terminated_by":"plexd_close"}}`,
 	}
 	got := rows()
@@ -3313,6 +3317,21 @@ func TestControlPlaneSessionReporter_SSHCommandStartedReturnsConflict(t *testing
 	reporter, _ := captureSessionRows(t, http.StatusConflict, `{"code":"session_already_revoked"}`)
 
 	err := reporter.ReportSSHCommandStarted(context.Background(), "sess-ssh", "uptime", time.Now())
+	var apiErr *api.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict {
+		t.Fatalf("error = %v, want the 409 APIError", err)
+	}
+	if !api.IsSessionRevokedOrExpired(err) {
+		t.Errorf("error = %v, want it classified as revoked", err)
+	}
+}
+
+// A tunnel stops its session_active rows on a 409 that the session is no longer
+// live, so the refusal has to reach it intact.
+func TestControlPlaneSessionReporter_SessionActiveReturnsConflict(t *testing.T) {
+	reporter, _ := captureSessionRows(t, http.StatusConflict, `{"code":"session_already_revoked"}`)
+
+	err := reporter.ReportSessionActive(context.Background(), "sess-tcp")
 	var apiErr *api.APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict {
 		t.Fatalf("error = %v, want the 409 APIError", err)

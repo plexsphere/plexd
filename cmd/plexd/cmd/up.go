@@ -435,6 +435,11 @@ func runAgent(ctx context.Context) error {
 		sessionReporter.ReportSessionEnded(reportCtx, sessionID, info, tunnel.TerminatedByFromReason(reason))
 	})
 
+	// A tcp tunnel posts session_active rows while it forwards bytes. No
+	// control-plane component sees a byte of the tunnel, so the rows are what
+	// keeps the control plane's idle sweeper away from a tunnel in use.
+	meshServer.SessionManager().SetTCPActivityReporter(sessionReporter)
+
 	// Mediated ssh sessions start their processes through the session helper,
 	// which Linux and macOS have. Elsewhere ssh entries stay settled as
 	// unsupported. A node that serves no ssh sessions skips the wiring, and
@@ -1505,7 +1510,8 @@ func (s *auditForwarderStatus) ForwarderStatus() nodeapi.ForwarderStatus {
 
 // controlPlaneSessionReporter reports session activity rows to the control
 // plane. A tcp session is an opaque TCP forward, so it gets tcp rows: a
-// session_started row when the listener is up and a session_ended row carrying
+// session_started row when the listener is up, a session_active row at most once
+// per interval while the tunnel forwards bytes, and a session_ended row carrying
 // byte counters and a terminated_by reason on close. An ssh session gets the
 // ssh lifecycle rows, a session_started row when it is ready to serve
 // connections and a session_ended row carrying the terminated_by reason, and
@@ -1533,6 +1539,16 @@ func (r *controlPlaneSessionReporter) ReportSessionStarted(ctx context.Context, 
 		}
 	}
 	return r.cp.ReportSessionActivity(ctx, r.nodeID, entry.SessionID, req)
+}
+
+// ReportSessionActive posts a tcp session's session_active row. The error is
+// returned unchanged, because its answer decides what the session's report does
+// next: a 409 that the session is no longer live stops it, a 400 is warned about
+// once, and every other failure is retried at the end of the interval.
+func (r *controlPlaneSessionReporter) ReportSessionActive(ctx context.Context, sessionID string) error {
+	return r.cp.ReportSessionActivity(ctx, r.nodeID, sessionID, api.SessionActivityRequest{
+		TCP: &api.TCPActivity{Phase: api.TCPPhaseSessionActive},
+	})
 }
 
 func (r *controlPlaneSessionReporter) ReportSessionEnded(ctx context.Context, sessionID string, info *tunnel.ClosedSessionInfo, terminatedBy string) {
