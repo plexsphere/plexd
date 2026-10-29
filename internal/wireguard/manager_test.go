@@ -820,13 +820,22 @@ type statsController struct {
 	mockController
 	stats []PeerStat
 	err   error
+
+	// onRead, when set, runs after the stats are read and before they are
+	// returned, as a write another goroutine makes while a selection pass
+	// waits for the manager's mutex.
+	onRead func()
 }
 
 func (c *statsController) PeerStats(name string) ([]PeerStat, error) {
 	c.mu.Lock()
 	c.calls = append(c.calls, mockCall{Method: "PeerStats", Args: []interface{}{name}})
 	c.mu.Unlock()
-	return c.stats, c.err
+	stats, err := c.stats, c.err
+	if c.onRead != nil {
+		c.onRead()
+	}
+	return stats, err
 }
 
 // keyedPeer returns testPeer(id) carrying key as its public key. testPeer
