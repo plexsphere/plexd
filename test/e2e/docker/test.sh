@@ -21,6 +21,7 @@
 #     (ack/started/terminal callbacks)
 #   - Executions resumed from a seeded status (no re-ack, no re-run)
 #   - action_request is a pull trigger, not a delivery channel
+#   - tcp tunnel traffic reported as session_active rows
 #   - Secret index fed from the state pull's secrets block, with
 #     node_secrets_updated as a pull trigger
 #   - Key rotation completes end to end via RotateKeys flag
@@ -2512,6 +2513,195 @@ else
 fi
 
 echo "=== Phase 8j PASSED: a signed session_revoked closes the session it names ==="
+
+# ===================================================================
+# Phase 8k: tcp tunnel traffic reported as session_active rows
+# ===================================================================
+# No control-plane component sees a byte of a tunnel, so plexd reports its
+# traffic as session_active rows, which keep the control plane's idle sweeper
+# away from a tunnel in use. The interval is min(60s, idle_timeout_seconds/4),
+# so the 24s idle window gives 6s. Two requests go through the tunnel, the
+# second straight after the first, both within 3s of the first. The first byte
+# after an interval without a row posts at once, so right after the second
+# request exactly one row has landed: the bytes that crossed after it wait for
+# the one row at the end of that interval. Once a whole interval passes without
+# a byte the tunnel posts nothing, and the 13s quiet window spans two interval
+# ends, so a tunnel that kept posting would show. The tunnel targets the mock's
+# own unauthenticated health route, and the first request reads its answer back,
+# so bytes cross both ways. nc dials the listener from inside the plexd
+# container, which plexd's nftables chain does not filter: it hooks forward
+# only. The mock counts the row on session_active_count alone, so
+# session_activity_count still moves only for the started and ended rows.
+echo "=== Testing tcp tunnel traffic reported as session_active rows ==="
+
+ACT_SESSION="sess-e2e-active"
+EXPIRES_AT=$(date -u -d "+5 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+5M +%Y-%m-%dT%H:%M:%SZ)
+
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+[ -n "${RESPONSE}" ] || fail "assert endpoint unreachable while baselining Phase 8k"
+ACT_BEFORE=$(get_counter "${RESPONSE}" "session_activity_count")
+ACT_ACTIVE_BEFORE=$(get_counter "${RESPONSE}" "session_active_count")
+echo "  session_activity_count before: ${ACT_BEFORE}"
+echo "  session_active_count before: ${ACT_ACTIVE_BEFORE}"
+
+configure_sessions "8k-issue" \
+    "$(session_entry "${ACT_SESSION}" "mock-api" 8080 "${EXPIRES_AT}" 24)"
+echo "  tcp session to mock-api:8080 with a 24s idle window configured in the sessions block"
+
+# Poll session_activity_count to +1 (the session_started row).
+ACT_TIMEOUT=30
+ACT_ELAPSED=0
+ACT_START_PASSED=0
+while [ "${ACT_ELAPSED}" -lt "${ACT_TIMEOUT}" ]; do
+    sleep 2
+    ACT_ELAPSED=$((ACT_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        ACT_STARTED=$(get_counter "${RESPONSE}" "session_activity_count")
+        if [ "${ACT_STARTED}" -ge $((ACT_BEFORE + 1)) ]; then
+            echo "  PASS: session_activity_count advanced from ${ACT_BEFORE} to ${ACT_STARTED} (the session_started row)"
+            ACT_START_PASSED=1
+            break
+        fi
+    fi
+done
+if [ "${ACT_START_PASSED}" -eq 0 ]; then
+    ACT_STARTED=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_count")
+    fail "session_activity_count did not reach $((ACT_BEFORE + 1)) after the sessions block was configured (before=${ACT_BEFORE}, after=${ACT_STARTED})"
+fi
+
+# The started row carries the address the listener bound, which is where nc
+# connects.
+ACT_EP=$(curl -sf "http://localhost:18080/test/last-request/session_activity" 2>/dev/null | jq -r '.tcp.listener_endpoint // empty' 2>/dev/null || true)
+if ! echo "${ACT_EP}" | grep -Eq '^.+:[0-9]+$'; then
+    fail "session_activity tcp.listener_endpoint = '${ACT_EP}' after provisioning, want a non-empty host:port"
+fi
+ACT_EP_HOST=${ACT_EP%:*}
+ACT_EP_PORT=${ACT_EP##*:}
+echo "  listener endpoint: ${ACT_EP_HOST} port ${ACT_EP_PORT}"
+
+# Nothing has crossed the tunnel yet, so it has posted no session_active row.
+ACT_IDLE=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_active_count")
+if [ "${ACT_IDLE}" -eq "${ACT_ACTIVE_BEFORE}" ]; then
+    echo "  PASS: session_active_count unchanged at ${ACT_IDLE} before any traffic"
+else
+    fail "session_active_count moved from ${ACT_ACTIVE_BEFORE} to ${ACT_IDLE} before any byte crossed the tunnel"
+fi
+
+# The first request keeps nc's stdin open for a second, so the mock's answer
+# comes back before nc half-closes its socket: the tunnel ends both halves as
+# soon as either direction ends. The second request only sends. Each nc's exit
+# status proves the connect, the answer proves the way back, and the
+# session_active_count reads below prove the bytes were seen.
+ACT_NC_ANSWER_CMD="{ printf 'GET /v1/health HTTP/1.0\r\n\r\n'; /bin/busybox sleep 1; } | /bin/busybox nc -w 3 ${ACT_EP_HOST} ${ACT_EP_PORT}"
+ACT_NC_SEND_CMD="printf 'GET /v1/health HTTP/1.0\r\n\r\n' | /bin/busybox nc -w 3 ${ACT_EP_HOST} ${ACT_EP_PORT}"
+
+ACT_T0=$(date +%s)
+ACT_NC_STATUS=0
+ACT_ANSWER=$(dc exec -T plexd /bin/busybox sh -c "${ACT_NC_ANSWER_CMD}" 2>/dev/null) || ACT_NC_STATUS=$?
+[ "${ACT_NC_STATUS}" -eq 0 ] || fail "first nc through the listener at ${ACT_EP} exited with status ${ACT_NC_STATUS}, want 0"
+ACT_STATUS_LINE=${ACT_ANSWER%%$'\n'*}
+ACT_STATUS_LINE=${ACT_STATUS_LINE%$'\r'}
+case "${ACT_STATUS_LINE}" in
+    HTTP/1.*) echo "  PASS: the mock's answer came back through the tunnel (${ACT_STATUS_LINE})" ;;
+    *) fail "first nc through the listener at ${ACT_EP} read '${ACT_STATUS_LINE}', want an HTTP/1.x status line from the mock" ;;
+esac
+
+ACT_NC_STATUS=0
+dc exec -T plexd /bin/busybox sh -c "${ACT_NC_SEND_CMD}" >/dev/null || ACT_NC_STATUS=$?
+[ "${ACT_NC_STATUS}" -eq 0 ] || fail "second nc through the listener at ${ACT_EP} exited with status ${ACT_NC_STATUS}, want 0"
+ACT_SENT_IN=$(( $(date +%s) - ACT_T0 ))
+echo "  two requests sent through the tunnel in ${ACT_SENT_IN}s"
+
+# The rest of the phase relies on both requests landing well inside the first
+# 6s interval. Whole seconds round down, so 3 means under 4s.
+if [ "${ACT_SENT_IN}" -gt 3 ]; then
+    fail "the two requests took ${ACT_SENT_IN}s, want them within 3s of the first: this host is too slow for the phase's timing"
+fi
+
+# Exactly one row has landed: the first bytes posted at once, and the bytes
+# after them, the answer and the second request, wait for the interval's end.
+ACT_FIRST=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_active_count")
+if [ "${ACT_FIRST}" -eq $((ACT_ACTIVE_BEFORE + 1)) ]; then
+    echo "  PASS: session_active_count at ${ACT_FIRST} within ${ACT_SENT_IN}s of the first request"
+else
+    fail "session_active_count = ${ACT_FIRST} within ${ACT_SENT_IN}s of the first request, want $((ACT_ACTIVE_BEFORE + 1)): the first bytes post at once and later bytes wait for the 6s interval's end"
+fi
+
+# The row carries the phase alone.
+ACT_BODY=$(curl -sf "http://localhost:18080/test/last-request/session_activity" 2>/dev/null | jq -c . 2>/dev/null || true)
+if [ "${ACT_BODY}" = '{"tcp":{"phase":"session_active"}}' ]; then
+    echo "  PASS: session_activity body = ${ACT_BODY}"
+else
+    fail "session_activity body = '${ACT_BODY}' after the first request, want '{\"tcp\":{\"phase\":\"session_active\"}}'"
+fi
+
+# Poll session_active_count to +2 for up to 10s: the row at the end of the
+# first interval, which covers the answer and the second request.
+ACT_ELAPSED=0
+ACT_SECOND_PASSED=0
+while [ "${ACT_ELAPSED}" -lt 10 ]; do
+    sleep 1
+    ACT_ELAPSED=$((ACT_ELAPSED + 1))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        ACT_SECOND=$(get_counter "${RESPONSE}" "session_active_count")
+        if [ "${ACT_SECOND}" -ge $((ACT_ACTIVE_BEFORE + 2)) ]; then
+            echo "  PASS: session_active_count advanced to ${ACT_SECOND} within ${ACT_ELAPSED}s of the second request"
+            ACT_SECOND_PASSED=1
+            break
+        fi
+    fi
+done
+if [ "${ACT_SECOND_PASSED}" -eq 0 ]; then
+    ACT_SECOND=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_active_count")
+    fail "session_active_count did not reach $((ACT_ACTIVE_BEFORE + 2)) within 10s of the second request (before=${ACT_ACTIVE_BEFORE}, after=${ACT_SECOND}): bytes inside an interval must be posted at its end"
+fi
+
+# 13s with no traffic, more than two 6s intervals: a quiet tunnel posts nothing.
+sleep 13
+ACT_QUIET=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_active_count")
+if [ "${ACT_QUIET}" -eq $((ACT_ACTIVE_BEFORE + 2)) ]; then
+    echo "  PASS: session_active_count stayed at ${ACT_QUIET} over the 13s quiet window"
+else
+    fail "session_active_count = ${ACT_QUIET} after the 13s quiet window, want $((ACT_ACTIVE_BEFORE + 2)): a tunnel with no traffic must post no session_active row"
+fi
+
+# Drain the entry so the session does not reach a later phase. The drain, or
+# the 24s idle window if the pull is slower, ends the session with one
+# session_ended row. Wait for it here, so it cannot land inside phase 8h's
+# session_activity_count baseline.
+configure_sessions "8k-drain" "[]"
+echo "  tcp session drained from the sessions block"
+ACT_ELAPSED=0
+ACT_END_PASSED=0
+while [ "${ACT_ELAPSED}" -lt "${ACT_TIMEOUT}" ]; do
+    sleep 2
+    ACT_ELAPSED=$((ACT_ELAPSED + 2))
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -n "${RESPONSE}" ]; then
+        ACT_ENDED=$(get_counter "${RESPONSE}" "session_activity_count")
+        if [ "${ACT_ENDED}" -ge $((ACT_BEFORE + 2)) ]; then
+            # Read from the same response, so both counters describe one moment.
+            ACT_FINAL=$(get_counter "${RESPONSE}" "session_active_count")
+            ACT_END_PASSED=1
+            break
+        fi
+    fi
+done
+if [ "${ACT_END_PASSED}" -eq 0 ]; then
+    ACT_ENDED=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "session_activity_count")
+    fail "session_activity_count did not reach $((ACT_BEFORE + 2)) after the drain (before=${ACT_BEFORE}, after=${ACT_ENDED}): the session_ended row did not land"
+fi
+# The session_active rows counted on session_active_count alone, and closing
+# the session posted no final one.
+if [ "${ACT_ENDED}" -eq $((ACT_BEFORE + 2)) ] && [ "${ACT_FINAL}" -eq $((ACT_ACTIVE_BEFORE + 2)) ]; then
+    echo "  PASS: session_activity_count at ${ACT_ENDED} (started and ended rows), session_active_count at ${ACT_FINAL}"
+else
+    fail "after the drain session_activity_count = ${ACT_ENDED} (want $((ACT_BEFORE + 2))) and session_active_count = ${ACT_FINAL} (want $((ACT_ACTIVE_BEFORE + 2)))"
+fi
+
+echo "=== Phase 8k PASSED: tcp tunnel traffic reported as session_active rows ==="
 
 # ===================================================================
 # Phase 8h: session events are pull triggers, not delivery channels
