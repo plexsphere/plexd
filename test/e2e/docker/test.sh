@@ -9,8 +9,9 @@
 #   - Handshake report and tunnel_health samples (skipped when WireGuard
 #     did not come up in the container)
 #   - Edge PSK fetches for both fixture peers (same skip condition)
-#   - Endpoint candidates report and an endpoint selection switch on a
-#     fixture peer (same skip condition)
+#   - Endpoint candidates report, an endpoint selection switch on a
+#     fixture peer, and its move to a new relay fallback (same skip
+#     condition)
 #   - Mesh MTU sized from the uplink probe and held by the device (same
 #     skip condition)
 #   - Request body validation (registration token, heartbeat, capabilities)
@@ -44,6 +45,26 @@ dc() { docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" "$@"; }
 get_counter() {
     local response=$1 key=$2
     echo "${response}" | jq -r ".${key} // 0"
+}
+
+# --- Helper: count the log lines that carry every given string ---
+# Args: <log> <needle>... Prints how many lines of log contain each needle, in
+# any order. The log is matched line by line with case rather than piped into
+# grep -c: a writer cut off by a closed pipe fails the pipeline under pipefail
+# (see phase 4b).
+count_log_lines() {
+    local log=$1 line needle n=0
+    shift
+    while IFS= read -r line; do
+        for needle in "$@"; do
+            case "${line}" in
+                *"${needle}"*) ;;
+                *) continue 2 ;;
+            esac
+        done
+        n=$((n + 1))
+    done <<< "${log}"
+    echo "${n}"
 }
 
 # --- Helper: base64-decode stdin portably across GNU and BSD/macOS ---
@@ -190,6 +211,63 @@ NUDGEEOF
         "http://localhost:18080/test/inject-event" 2>/dev/null || true)
     if [ "${status}" != "204" ]; then
         fail "[${tag}] executions nudge injection returned status ${status}, want 204"
+    fi
+}
+
+# --- Helper: set one peer's fallback_endpoint and nudge the agent ---
+# Args: <tag> <node-id> <fallback>. configure-state REPLACES the whole snapshot
+# fixture, so the field is spliced into that peer of the live snapshot and
+# every other peer and block travels back verbatim, as in
+# configure_executions_no_nudge. A node_state_updated envelope follows, so the
+# agent pulls the changed peer right away instead of waiting out the ~30s
+# heartbeat reconcile cadence. The tag keeps the envelope id unique per call.
+#
+# NOTE: reading the live snapshot is a real GET on the state endpoint and
+# therefore INCREMENTS state_count. A phase gating on state_count must take its
+# baseline AFTER calling this helper.
+configure_peer_fallback() {
+    local tag=$1 node_id=$2 fallback=$3
+
+    local snapshot matched spliced status
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    # A node id the snapshot does not carry would leave the fixture as it was
+    # and give the agent nothing to apply, so the splice must hit one peer.
+    matched=$(printf '%s' "${snapshot}" | jq -r --arg id "${node_id}" '[.peers[]? | select(.node_id == $id)] | length' 2>/dev/null || true)
+    if [ "${matched}" != "1" ]; then
+        fail "[${tag}] the live snapshot carries ${matched:-no} peer(s) with node_id ${node_id}, want 1"
+    fi
+    # printf, not echo: the fixture carries backslash escapes (an embedded
+    # newline in the certs/ca data entry) that must travel back byte for byte.
+    spliced=$(printf '%s' "${snapshot}" | jq --arg id "${node_id}" --arg f "${fallback}" \
+        '.peers |= map(if .node_id == $id then .fallback_endpoint = $f else . end)')
+
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+
+    local payload
+    payload=$(cat <<FALLBACKNUDGEEOF
+{
+    "id": "evt-e2e-fallback-nudge-${tag}",
+    "type": "node_state_updated",
+    "scope": "node",
+    "payload": "{\"node_id\":\"e2e-node-1\"}"
+}
+FALLBACKNUDGEEOF
+    )
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${payload}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] fallback nudge injection returned status ${status}, want 204"
     fi
 }
 
@@ -975,6 +1053,16 @@ fi
 # without one: the 25s keepalive plus 5s. This is the only run anywhere that
 # switches an endpoint on a real device, so it must not be weakened to the skip
 # path.
+#
+# The fallback is then held for 30s too before the order starts over, and each
+# switch lands on a 5s selection tick, so the switch onto 203.0.113.1:51820
+# comes back every 60 to 70s. The phase waits for the next one and, while plexd
+# holds the peer on that relay, has the mock name 203.0.113.2:51820 as the
+# peer's fallback and nudges a pull. plexd must move the peer to the new relay
+# at once, logging "relay fallback changed, moving to the new relay", and must
+# log no failed switch for it. The move removes the peer from the kernel device
+# and adds it again. The phase then puts 203.0.113.1:51820 back the same way,
+# so later phases see the fixture as it was.
 # ===================================================================
 echo "=== Testing endpoint candidates and endpoint selection ==="
 
@@ -1055,6 +1143,60 @@ else
         fail "no 'trying next endpoint candidate' log line for peer ${FIXTURE_PEER_B1} within ${SWITCH_TIMEOUT}s: its dial order (192.0.2.10:51820, then 203.0.113.1:51820) never advanced"
     fi
     echo "  PASS: plexd logged 'trying next endpoint candidate' for peer ${FIXTURE_PEER_B1}"
+
+    # Wait for the next switch onto the fallback: it starts a 30s hold on the
+    # relay, and the new fallback must arrive inside it. The waits below run on
+    # the wall clock, and each loop reads the log once more at its deadline.
+    # One cycle of the order is at most 70s (two 30s trials, each ending on
+    # the next 5s tick), and a switch just before the baseline means a full
+    # cycle, so the wait covers 70s plus the 2s poll and a pull's worth of
+    # slack.
+    RELAY_LOGS=$(dc logs plexd 2>/dev/null || true)
+    RELAY_HOLDS_BEFORE=$(count_log_lines "${RELAY_LOGS}" "trying next endpoint candidate" "${FIXTURE_PEER_B1}" "203.0.113.1:51820")
+    RELAY_FAILS_BEFORE=$(count_log_lines "${RELAY_LOGS}" "endpoint switch failed" "${FIXTURE_PEER_B1}")
+    RELAY_HOLD_TIMEOUT=80
+    RELAY_HOLD_START=${SECONDS}
+    while :; do
+        RELAY_LOGS=$(dc logs plexd 2>/dev/null || true)
+        RELAY_HOLDS=$(count_log_lines "${RELAY_LOGS}" "trying next endpoint candidate" "${FIXTURE_PEER_B1}" "203.0.113.1:51820")
+        if [ "${RELAY_HOLDS}" -gt "${RELAY_HOLDS_BEFORE}" ] || [ $((SECONDS - RELAY_HOLD_START)) -ge "${RELAY_HOLD_TIMEOUT}" ]; then
+            break
+        fi
+        sleep 2
+    done
+    RELAY_HOLD_WAITED=$((SECONDS - RELAY_HOLD_START))
+    if [ "${RELAY_HOLDS}" -le "${RELAY_HOLDS_BEFORE}" ]; then
+        fail "no new 'trying next endpoint candidate' log line for peer ${FIXTURE_PEER_B1} naming its fallback 203.0.113.1:51820 within ${RELAY_HOLD_TIMEOUT}s (${RELAY_HOLDS_BEFORE} before the wait): the dial order never came back to the relay"
+    fi
+    echo "  PASS: plexd switched peer ${FIXTURE_PEER_B1} to its fallback 203.0.113.1:51820 again after ${RELAY_HOLD_WAITED}s"
+
+    # Name a new relay while the hold runs. Until the fallback is put back, the
+    # only line that can name both addresses is the move from 203.0.113.1:51820
+    # to 203.0.113.2:51820, so the count of such lines must grow.
+    RELAY_MOVES_BEFORE=$(count_log_lines "${RELAY_LOGS}" "relay fallback changed, moving to the new relay" "${FIXTURE_PEER_B1}" "203.0.113.1:51820" "203.0.113.2:51820")
+    configure_peer_fallback "relay-move" "${FIXTURE_PEER_B1}" "203.0.113.2:51820"
+    RELAY_MOVE_TIMEOUT=24
+    RELAY_MOVE_START=${SECONDS}
+    while :; do
+        RELAY_LOGS=$(dc logs plexd 2>/dev/null || true)
+        RELAY_MOVES=$(count_log_lines "${RELAY_LOGS}" "relay fallback changed, moving to the new relay" "${FIXTURE_PEER_B1}" "203.0.113.1:51820" "203.0.113.2:51820")
+        if [ "${RELAY_MOVES}" -gt "${RELAY_MOVES_BEFORE}" ] || [ $((SECONDS - RELAY_MOVE_START)) -ge "${RELAY_MOVE_TIMEOUT}" ]; then
+            break
+        fi
+        sleep 2
+    done
+    RELAY_MOVE_WAITED=$((SECONDS - RELAY_MOVE_START))
+    if [ "${RELAY_MOVES}" -le "${RELAY_MOVES_BEFORE}" ]; then
+        fail "no 'relay fallback changed, moving to the new relay' log line for peer ${FIXTURE_PEER_B1} from 203.0.113.1:51820 to 203.0.113.2:51820 within ${RELAY_MOVE_TIMEOUT}s of the nudge that named the new fallback: plexd kept the peer on the old relay"
+    fi
+    RELAY_FAILS=$(count_log_lines "${RELAY_LOGS}" "endpoint switch failed" "${FIXTURE_PEER_B1}")
+    if [ "${RELAY_FAILS}" -gt "${RELAY_FAILS_BEFORE}" ]; then
+        fail "plexd logged $((RELAY_FAILS - RELAY_FAILS_BEFORE)) new 'endpoint switch failed' line(s) for peer ${FIXTURE_PEER_B1} while it moved the peer to 203.0.113.2:51820"
+    fi
+    echo "  PASS: plexd logged 'relay fallback changed, moving to the new relay' for peer ${FIXTURE_PEER_B1} (203.0.113.1:51820 to 203.0.113.2:51820) after ${RELAY_MOVE_WAITED}s, with no new 'endpoint switch failed' line"
+
+    configure_peer_fallback "relay-restore" "${FIXTURE_PEER_B1}" "203.0.113.1:51820"
+    echo "  restored fallback_endpoint 203.0.113.1:51820 on peer ${FIXTURE_PEER_B1}"
 
     echo "=== Phase 4d PASSED: endpoint candidates and endpoint selection ==="
 fi
