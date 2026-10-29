@@ -284,22 +284,23 @@ func NewManager(ctrl WGController, cfg Config, logger *slog.Logger) *Manager
 | `AddPeer`       | `(peer api.Peer) error`                                                      | Writes the peer with the first entry of its dial order and starts its endpoint selection; updates index |
 | `RemovePeer`    | `(publicKey []byte) error`                                                   | Removes peer by raw public key                                 |
 | `RemovePeerByID`| `(peerID string) error`                                                      | Resolves ID via index, removes peer, drops its dial state, cleans index |
-| `UpdatePeer`    | `(peer api.Peer) error`                                                      | Rewrites the peer (AddPeer is idempotent): a connected peer with an unchanged key keeps its device endpoint, any other starts its dial order over; updates index. See [Endpoint selection](#endpoint-selection) |
+| `UpdatePeer`    | `(peer api.Peer) error`                                                      | Rewrites the peer (AddPeer is idempotent) by the first of five ordered rules that applies: a new key starts its dial order over, a peer on its relay fallback moves to a new fallback on a fresh device peer, a relayed peer keeps its relay, a connected peer keeps its device endpoint, and any other starts its dial order over; updates index. See [Endpoint selection](#endpoint-selection) |
 | `ConfigurePeers`| `(ctx context.Context, peers []api.Peer) error`                              | Bulk-adds peers as `AddPeer` does, with context cancellation, and replaces the dial state with the peers it wrote; individual errors logged |
 | `PeerIndex`     | `() *PeerIndex`                                                              | Returns the peer index                                         |
 | `MeshPeerStats` | `() ([]MeshPeerStat, error)`                                                 | Reads the mesh interface's peers and maps them to node IDs; see [Mesh peer stats](#mesh-peer-stats) |
 | `MeshPrefix`    | `() netip.Prefix`                                                            | The Domain mesh prefix the interface was set up with; see [Mesh prefix](#mesh-prefix) |
 | `SetPeerPSK`    | `(peerNodeID, publicKey string, psk []byte) error`                           | Rewrites the stored peer of `peerNodeID` with `psk` when it was last written with `publicKey`; see [Installing a PSK](#installing-a-psk) |
 | `SetLocalPrefixes` | `(fn func() ([]netip.Prefix, error))`                                     | Sets the function the reconcile handler reads this host's interface prefixes from, to order a peer's on-link candidates first. Call it before the handler runs. See [Dial order](#dial-order) |
+| `SetRelayProbe` | `(send func(meshIP netip.Addr) error)`                                       | Sets the function endpoint selection sends the relay liveness probe with; `plexd up` passes `SendRelayProbe`. Call it before `RunEndpointSelection`. Without it no probe goes out. See [Relay liveness probe](#relay-liveness-probe) |
 | `RunEndpointSelection` | `(ctx context.Context, interval time.Duration) error`                 | Tries each peer's dial order until a handshake completes, one pass per `interval`, until `ctx` is done; see [Endpoint selection](#endpoint-selection) |
 | `SetPathMTUProbe` | `(probe func(context.Context) (int, error))`                              | Sets the function `Setup` and `RunMTUProbe` measure the uplink's path MTU with. Call it before `Setup`. See [MTU detection](#mtu-detection) |
 | `RunMTUProbe`   | `(ctx context.Context, interval time.Duration) error`                        | Measures the uplink again once per `interval` and lowers or raises the MTU to fit, until `ctx` is done; see [Probing again](#probing-again) |
 
-The package function `ProgrammedEndpoint` (`handler.go`) returns the endpoint the pull gives a snapshot peer without its candidates, from the peer and `MeshPrefix()`; see [Dial order](#dial-order).
+The package function `ProgrammedEndpoint` (`handler.go`) returns the endpoint the pull gives a snapshot peer without its candidates, from the peer and `MeshPrefix()`; see [Dial order](#dial-order). The package function `SendRelayProbe` (`dial.go`) is the sender `plexd up` passes to `SetRelayProbe`; see [Relay liveness probe](#relay-liveness-probe).
 
 ### Programmed peers
 
-The manager keeps a dial state per node ID: the last `api.Peer` it wrote, the position in the peer's dial order of the endpoint programmed on the device, when that endpoint was programmed, and whether a fresh handshake shows the peer connected. `SetPeerPSK` reads the stored peer, because it has to repeat a peer's allowed IPs to write its PSK, and [endpoint selection](#endpoint-selection) reads the rest. `AddPeer` and `UpdatePeer` store the state after a successful device write, `ConfigurePeers` replaces the whole map with the peers it wrote, and `RemovePeerByID` drops the entry after a successful removal. A failed device write in `AddPeer`, `UpdatePeer` or `SetPeerPSK` leaves the state as it was, so a peer whose first write failed has none. One mutex guards the map and serializes every mesh peer device write, since the reconcile handler, the edge PSK store and endpoint selection write the same peers from different call paths.
+The manager keeps a dial state per node ID: the last `api.Peer` it wrote, the position in the peer's dial order of the endpoint programmed on the device, when that endpoint was programmed, and whether a fresh handshake shows the peer connected. It also records whether the peer is [relayed](#the-trial), last seen connected over its relay fallback, when a relay re-dial last replaced its device peer, and the [relay liveness probe](#relay-liveness-probe)'s state: the device's `RxBytes` for the peer at the last pass, when the silence window started (the counter moved, the peer turned connected or came back on the relay, or a probe send failed), when the outstanding probe went out (zero when none is), and whether the last probe send failed. `SetPeerPSK` reads the stored peer, because it has to repeat a peer's allowed IPs to write its PSK, and [endpoint selection](#endpoint-selection) reads the rest. `AddPeer` and `UpdatePeer` store the state after a successful device write, `ConfigurePeers` replaces the whole map with the peers it wrote, and `RemovePeerByID` drops the entry after a successful removal. A failed device write in `AddPeer`, `UpdatePeer` or `SetPeerPSK` leaves the state as it was, so a peer whose first write failed has none. One mutex guards the map and serializes every mesh peer device write, since the reconcile handler, the edge PSK store and endpoint selection write the same peers from different call paths.
 
 ### Mesh prefix
 
@@ -333,32 +334,98 @@ WireGuard holds one endpoint per peer. Endpoint selection (`dial.go`) programs t
 A peer's order is `api.Peer.Endpoints`, or `Endpoint` alone when `Endpoints` is empty and `Endpoint` is set, so a caller that sets only `Endpoint` keeps working. The selection state lives in the manager's [dial state](#programmed-peers), and the device writes change it as follows:
 
 - `AddPeer` programs the first entry of the order, or no endpoint for an empty order, and starts the trial: position 0, programmed now, not connected. `ConfigurePeers` does the same for each peer it loads.
-- `UpdatePeer` on a connected peer whose public key is unchanged writes the peer with an empty endpoint, which both controllers leave untouched on the device, so an endpoint WireGuard roamed to stays. It stores the new peer, sets the position to where the entry last programmed sits in the new order (0 when it is no longer there), and keeps the connected flag and the timestamp.
-- `UpdatePeer` on a peer that is not connected, or whose public key changed, behaves like `AddPeer` with the new order. WireGuard keys peers by public key, so a rotated key is a new device peer that has no endpoint yet.
+- `UpdatePeer` applies the first of the five rules below that fits.
 - `SetPeerPSK` writes an empty endpoint and leaves the selection as it is.
 - `RemovePeerByID` drops the state once the device removal succeeds, so a removed peer is never switched.
+
+`UpdatePeer` checks its rules in this order:
+
+1. **No state, or a new key.** It behaves like `AddPeer` with the new order. WireGuard keys peers by public key, so a rotated key is a new device peer that has no endpoint yet. The new state is not relayed.
+2. **A new relay.** When the entry programmed is the peer's `Fallback`, the peer is relayed or not connected, and the update names a different, non-empty `Fallback`, the peer moves at once. A connected peer that is not relayed runs on a direct path WireGuard roamed to, which the move would cut, so rule 4 keeps it. `UpdatePeer` [dials the new relay](#relay-liveness-probe) on a fresh device peer, logs `wireguard: relay fallback changed, moving to the new relay`, and stores a new state at the new fallback's position: programmed now, not connected, relayed when the old state was, and the probe started over. A peer in its relay hold that never connected moves the same way, and its hold starts over on the new relay.
+3. **A relayed peer on the same relay.** A [relayed](#the-trial) peer whose `Fallback` is unchanged keeps its relay, connected or not. The write carries an empty endpoint, the position moves to the fallback's in the new order, and the connected flag, the timestamp and the probe's state stay. A relayed peer that waits for its partner is never sent back to the first entry.
+4. **A connected peer.** The write carries an empty endpoint, which both controllers leave untouched on the device, so an endpoint WireGuard roamed to stays. It stores the new peer, sets the position to where the entry last programmed sits in the new order (0 when it is no longer there), and keeps the connected flag and the timestamp. A relayed peer gets here only when the update drops its `Fallback`, and it stops being relayed.
+5. **Any other peer.** It behaves like `AddPeer` with the new order.
+
+A failed write returns `wireguard: update peer: <cause>` and leaves the state as it was. A move the device refuses has the cause `remove device peer: <cause>` or `add device peer: <cause>`, and the reconciler keeps its snapshot and retries the update on its next cycle.
 
 #### The trial
 
 Each pass reads the device through [`MeshPeerStats`](#mesh-peer-stats) before it takes the manager's mutex. A read error, `ErrPeerStatsUnsupported` included, ends the pass with nothing written. A peer is fresh when the device reports a non-zero `LastHandshake` for it that is younger than 180 s: WireGuard rekeys a session it uses every two minutes and refuses one older than 180 s, so an older handshake says the path no longer carries traffic. One entry is tried for the keepalive interval plus 5 s, 30 s with the default keepalive.
 
-The relay fallback is held longer. `api.Peer.Fallback` holds the peer's `fallback_endpoint` when that is the last entry of the order, and is empty otherwise. When the entry programmed sits at a position `idx` greater than 0, is the last entry, and equals `Fallback`, it is tried for `idx` times the trial instead of one trial: as long as the entries before it took together. Each side of a pair then spends at least half its cycle on the relay, so the relay windows of two peers behind hard NATs always overlap or touch. A two-entry order behaves as with one trial per entry, and a connected peer is never switched. A node on an older plexd keeps the 30 s trial on its fallback, and the [NAT relay](../bridge/nat-relay.md) serves it like any other peer.
+The relay fallback is held longer. `api.Peer.Fallback` holds the peer's `fallback_endpoint` when that is the last entry of the order, and is empty otherwise. When the entry programmed sits at a position `idx` greater than 0, is the last entry, and equals `Fallback`, it is tried for `idx` times the trial instead of one trial: as long as the entries before it took together. Each side of a pair then spends at least half its cycle on the relay, so the relay windows of two peers behind hard NATs always overlap or touch. A two-entry order behaves as with one trial per entry. A node on an older plexd keeps the 30 s trial on its fallback, and the [NAT relay](../bridge/nat-relay.md) serves it like any other peer.
+
+A connected peer is relayed when it runs over its relay: the entry programmed is its `Fallback` and, when that `Fallback` is an address and the device reports an endpoint, the device's endpoint is that address (an IPv4-mapped address compares as IPv4). A device endpoint elsewhere means the peer opened a direct path and WireGuard roamed to it, which a relay move must not cut and the probe must not judge. A hostname `Fallback` cannot be compared, so for it the entry programmed decides. Each pass that finds the peer's handshake fresh sets the mark again, so a peer that roams off the relay or back is followed, and a peer that is not connected keeps the mark it had when it was last connected. A relayed peer stays on its relay, because the direct entries before it already failed. The pass never programs another entry of its order. It dials the relay again when the [relay liveness probe](#relay-liveness-probe) goes unanswered, when the handshake goes stale, and after each hold that passes without a handshake. The peer walks its direct entries again only when an update drops its `Fallback`, when its key rotates, when it is removed and added again, after a restart, or when WireGuard roamed it to a direct path that then failed: that peer lost the mark while connected, so its stale handshake resumes endpoint selection as for any peer that is not relayed.
 
 The pass walks the peers in node-ID order:
 
 | Peer | What the pass does |
 |---|---|
-| Fresh, not marked connected | Marks it connected and logs `wireguard: endpoint selected` with the endpoint the device reports, which may be one WireGuard roamed to |
-| Fresh, marked connected | Nothing |
-| Not fresh, marked connected | Clears the mark, restarts the timer and logs `wireguard: peer handshake went stale, resuming endpoint selection`. The entry on the device gets its full trial, the hold for a held fallback, before the next switch |
-| Not fresh, not connected, with fewer than 2 entries or programmed less than the entry's trial ago | Nothing |
-| Not fresh, not connected, trial over | Programs the next entry (after the last one, the first again), restarts the timer and logs `wireguard: trying next endpoint candidate` with `trial`, how long it tries the entry it programmed: one trial, or the longer hold above for the fallback |
+| Fresh, not marked connected | Marks it connected, marks it relayed when it runs over its relay and clears the mark otherwise, starts the probe's silence window, and logs `wireguard: endpoint selected` with the endpoint the device reports, which may be one WireGuard roamed to, and `relayed` |
+| Fresh, marked connected, not relayed | Nothing |
+| Fresh, marked connected, relayed | Runs the [relay liveness probe](#relay-liveness-probe), which dials the relay again when the probe goes unanswered. A peer that came back on its relay starts a new silence window first |
+| Not fresh, marked connected, relayed | Clears the mark, logs `wireguard: relayed peer handshake went stale, dialing the relay again` and dials the relay again |
+| Not fresh, marked connected, not relayed | Clears the mark, restarts the timer and logs `wireguard: peer handshake went stale, resuming endpoint selection`. The entry on the device gets its full trial, the hold for a held fallback, before the next switch |
+| Not fresh, not connected, relayed, programmed less than the relay's trial ago | Nothing |
+| Not fresh, not connected, relayed, trial over | Logs `wireguard: still no handshake over the relay, dialing it again` with `trial` and dials the relay again. The order's length does not matter, and no other entry is programmed |
+| Not fresh, not connected, not relayed, with fewer than 2 entries or programmed less than the entry's trial ago | Nothing |
+| Not fresh, not connected, not relayed, trial over | Programs the next entry (after the last one, the first again), restarts the timer and logs `wireguard: trying next endpoint candidate` with `trial`, how long it tries the entry it programmed: one trial, or the longer hold above for the fallback |
 
-A peer counts as connected while its latest handshake is younger than 180 s. Neither a pass nor `UpdatePeer` rewrites the device endpoint of a connected peer, so WireGuard roaming, a peer answering from another address, stays in effect.
+The relay's trial is the hold above when the fallback ends an order of two or more entries, and one trial when the relay is the order's only entry. A relay re-dial removes the device peer and adds it again with the fallback as its endpoint; see [Relay liveness probe](#relay-liveness-probe) for why. A successful one leaves the peer relayed, not connected, programmed now, and with its probe started over.
 
-A failed switch logs `wireguard: endpoint switch failed`, leaves the peer on the entry still programmed, and joins `wireguard: switch endpoint of peer <node id>: <cause>` into the pass's error. The timer restarts all the same, so the next attempt follows that entry's full trial later: one trial, or the hold when the peer is still on the held fallback.
+A peer counts as connected while its latest handshake is younger than 180 s. Neither a pass nor `UpdatePeer` rewrites the device endpoint of a connected peer, so WireGuard roaming, a peer answering from another address, stays in effect. The relay makes two exceptions: a pass dials the relay again for a relayed peer whose probe went unanswered while its handshake is still fresh, and `UpdatePeer` moves a relayed peer to a new fallback.
 
-The trial depends on the keepalive. WireGuard starts a handshake only when it sends something, and the keepalive timer is what makes it send to an entry newly programmed on an idle peer. A switch happens on the first pass after the trial ran out, so up to one interval late. With the defaults, an order of ten entries, the contract's cap of eight candidates plus the direct endpoint and the fallback, reaches its fallback after about 270 s, holds it for about 270 s, and returns to the first entry after about 540 s, one cycle. A restarted plexd starts every peer at the first entry again.
+A relay re-dial replaces the device peer while a pass may already have read the device: the pass reads it before it takes the mutex, and `UpdatePeer` can move a peer in between. So a handshake older than the device peer's last replacement does not count as fresh. It belongs to the dropped session, and the pass leaves the new device peer not connected until a handshake completes on it.
+
+A failed switch logs `wireguard: endpoint switch failed`, leaves the peer on the entry still programmed, and joins `wireguard: switch endpoint of peer <node id>: <cause>` into the pass's error. The timer restarts all the same, so the next attempt follows that entry's full trial later: one trial, or the hold when the peer is still on the held fallback. A failed relay re-dial logs the same line with the fallback as `endpoint` and joins the same error, whose cause is `remove device peer: <cause>` or `add device peer: <cause>` for a write the device refused. It leaves the peer relayed and not connected and restarts its timer, so the next re-dial follows one relay trial later, unless a fresh handshake marks the peer connected first.
+
+The trial depends on the keepalive. WireGuard starts a handshake only when it sends something, and the keepalive timer is what makes it send to an entry newly programmed on an idle peer. A switch happens on the first pass after the trial ran out, so up to one interval late. With the defaults, an order of ten entries, the contract's cap of eight candidates plus the direct endpoint and the fallback, reaches its fallback after about 270 s, holds it for about 270 s, and returns to the first entry after about 540 s, one cycle. A relayed peer whose relay never completes a handshake is dialed again once per relay trial: every 30 s for an order of one or two entries, every 270 s for ten. A restarted plexd starts every peer at the first entry again.
+
+#### Relay liveness probe
+
+A fresh handshake does not show that a relay still forwards. A WireGuard session stays valid for up to 180 s after the relay stopped, and a relayed peer would wait out that age before its handshake went stale. A device counter that stands still does not show that the relay stopped either. A received keepalive restarts WireGuard's own keepalive timer, so on an idle tunnel one side can receive nothing until the next rekey, about two minutes later. A data packet is different: WireGuard answers one with a keepalive within 10 s when it has nothing else to send. The probe sends such a packet into a silent tunnel and watches for the answer.
+
+```go
+const relayProbeTimeout = 15 * time.Second // the verdict window
+const relayProbePort = 9                   // the discard port
+
+func (m *Manager) SetRelayProbe(send func(meshIP netip.Addr) error)
+func SendRelayProbe(meshIP netip.Addr) error
+```
+
+`SetRelayProbe` sets the function the probe is sent with. Call it before `RunEndpointSelection`, like `SetLocalPrefixes`. `SendRelayProbe` is the sender `plexd up` passes. It sends one UDP datagram of one zero byte to port 9 of `meshIP`. The host routes the datagram into the mesh interface, and WireGuard carries it to the peer as data. Nothing has to listen on the port: the peer's WireGuard answers the data packet whatever the host behind it does with the datagram. `SendRelayProbe` refuses an address that is not IPv4, because mesh IPs are IPv4, with `wireguard: relay probe: mesh ip <ip> is not IPv4`, and wraps a failed dial or write as `wireguard: relay probe <ip>: <cause>`.
+
+Each pass checks a [relayed](#the-trial) peer that is marked connected and whose handshake is fresh against the device's `RxBytes` for it:
+
+| Peer | What the pass does |
+|---|---|
+| `RxBytes` moved since the last pass | Records the counter, restarts the silence window and clears an outstanding probe |
+| Silent for less than one trial, no probe outstanding | Nothing |
+| Silent for one trial, no probe outstanding | Sends the probe to the peer's mesh IP and logs `wireguard: relayed peer silent, probing` at Debug |
+| Probe outstanding for less than 15 s | Nothing |
+| Probe outstanding for 15 s, `RxBytes` unmoved | Logs `wireguard: relayed peer did not answer the probe, dialing the relay again` with `silent_for` and dials the relay again |
+
+The silence window is one trial, the keepalive interval plus 5 s, 30 s with the default keepalive. It starts when the peer turns connected or comes back on its relay, again each time the counter moves, and again after a failed send, so a peer that receives traffic is never probed. The verdict window, `relayProbeTimeout`, is fixed at 15 s: WireGuard's `KeepaliveTimeout` of 10 s, in which a live path answers the probe, plus its `RekeyTimeout` of 5 s for the answer to arrive.
+
+No probe goes out without a sender, or to a peer whose `MeshIP` does not parse or lies outside the [mesh prefix](#mesh-prefix). With the host `/32` of an identity without `domain_mesh_cidr`, or the zero prefix before `Setup`, the host would route the datagram past the mesh interface, and its silence would read as a dead relay. Without a probe, a relayed peer counts as failed only once its handshake goes stale.
+
+A failed send logs `wireguard: relay probe send failed` with `error`, at Warn the first time and at Debug while the sends keep failing. It restarts the silence window, so no verdict follows a probe that never left, and the next attempt follows one trial later. A send that succeeds ends the run of failures, and the next failure logs at Warn again. The probe is sent under the manager's mutex, because one UDP send does not block.
+
+With the defaults, a 25 s keepalive and a pass every 5 s:
+
+- The pass that counts the relay's last packet starts the silence window, up to 5 s after the packet arrived.
+- The probe goes out on the first pass 30 s or more after that pass.
+- The verdict comes on the first pass 15 s or more after the probe, and dials the relay again.
+- A relay that stops forwarding is therefore dialed again 45 to 50 s after its last packet. A pass reads the clock after it reads the device, so a window can miss its closing pass by a fraction of a second and close one pass later. With both windows late, the re-dial comes up to 60 s after the last packet.
+
+Without the probe, a relayed peer waits until its handshake is 180 s old. With it, a relay that restarted and lost its index table carries the pair again within about a minute. A dead relay stays dead until the control plane names another one, and `UpdatePeer` then moves the peer at once.
+
+Every re-dial of a relay is the same write, whether it follows a fallback change, an unanswered probe, a stale relayed handshake or a relay trial without a handshake: plexd removes the device peer and adds it again with its `Fallback` as the endpoint. The relay routes a transport message by its receiver index and drops one whose index it does not hold, with reason `unknown_index` (see [Forwarding Table](../bridge/nat-relay.md#forwarding-table)). A write that only changed the endpoint would keep the peer's session, which a new or restarted relay does not know. WireGuard starts a new handshake on its own only after 15 s of unanswered data, or once the session is 120 to 180 s old. The new device peer has no session. Its write turns the keepalive interval on, and wireguard-go sends a keepalive when that happens, which starts a handshake at once. The Linux kernel module is assumed to do the same.
+
+A failed add leaves the peer off the device until the next attempt. That attempt's remove names a key the device does not hold, which the [userspace backend](#userspace-backend) accepts. The Linux kernel module is assumed to accept it as well.
+
+A re-dial makes a new device peer, as a key rotation does, so its handshake time and byte counters start over. The [handshake report](../core/heartbeat-service.md#handshake-reporter) leaves the peer out until its new handshake completes, as it does for any new device peer, and the [tunnel metrics](../observability/metrics-collection.md#tunnelcollector) count its `rx_bytes` and `tx_bytes` from 0 again.
+
+The probe costs at most one datagram per relayed peer per silence window, sent only while the peer receives nothing and answered by one 32-byte keepalive. A re-dial costs one extra handshake. The probe is off with `persistent_keepalive: 0s`, which turns endpoint selection off, and without `SetRelayProbe`. Nothing on the wire changes: the peer's WireGuard answers the probe, not its plexd, so the probe works against a peer on any version, and a node on an older plexd keeps the 180 s hold.
 
 #### RunEndpointSelection
 
@@ -369,16 +436,16 @@ func (m *Manager) RunEndpointSelection(ctx context.Context, interval time.Durati
 ```
 
 - With `persistent_keepalive: 0s` it logs `wireguard: endpoint selection disabled, persistent_keepalive is 0s` and returns nil at once. Every peer keeps the first entry of its dial order.
-- Otherwise it logs `wireguard: endpoint selection started` with `interval` and `timeout` (the trial) and runs a pass on every tick, the first one interval after it starts.
+- Otherwise it logs `wireguard: endpoint selection started` with `interval`, `timeout` (the trial) and `relay_probe`, true when `SetRelayProbe` set a sender, and runs a pass on every tick, the first one interval after it starts.
 - A pass that returns `ErrPeerStatsUnsupported` logs `wireguard: endpoint selection unavailable, the controller cannot read peer stats` and returns nil. Peers keep the entry they have.
 - Any other pass error logs `wireguard: endpoint selection pass failed` with `error`, and the next tick runs again.
 - It returns nil once `ctx` is done.
 
-`plexd up` runs it with `EndpointSelectionInterval` as step 17b, only when the WireGuard interface came up.
+`plexd up` runs it with `EndpointSelectionInterval` as step 17b, only when the WireGuard interface came up. The step first calls `SetRelayProbe(wireguard.SendRelayProbe)`, so the probe is on and the started line carries `relay_probe=true`.
 
 #### Cost
 
-The keepalive sends one empty data packet (32 bytes of payload) per idle peer every 25 s and keeps a rekey handshake running about every 2 minutes per peer, so a node with 100 idle peers sends about 4 packets per second. Endpoint selection adds one device read every 5 s, the reconcile handler one interface read each time it runs, and the [candidate publisher](./nat-traversal.md#local-endpoint-candidates) one `PUT` per cycle (60 s by default).
+The keepalive sends one empty data packet (32 bytes of payload) per idle peer every 25 s and keeps a rekey handshake running about every 2 minutes per peer, so a node with 100 idle peers sends about 4 packets per second. Endpoint selection adds one device read every 5 s, the reconcile handler one interface read each time it runs, and the [candidate publisher](./nat-traversal.md#local-endpoint-candidates) one `PUT` per cycle (60 s by default). The [relay liveness probe](#relay-liveness-probe) adds at most one datagram per relayed peer that received nothing for 30 s, answered by one keepalive, and each relay re-dial one handshake.
 
 #### Endpoint selection log lines
 
@@ -386,13 +453,19 @@ All carry `component=wireguard`.
 
 | Level  | Message | Keys |
 |--------|---------|------|
-| `Info` | `wireguard: endpoint selection started` | `interval`, `timeout` |
+| `Info` | `wireguard: endpoint selection started` | `interval`, `timeout`, `relay_probe` (true when `SetRelayProbe` set a sender) |
 | `Info` | `wireguard: endpoint selection disabled, persistent_keepalive is 0s` | none |
 | `Info` | `wireguard: endpoint selection unavailable, the controller cannot read peer stats` | none |
-| `Info` | `wireguard: endpoint selected` | `peer_id`, `endpoint` (empty when the device reports none) |
+| `Info` | `wireguard: endpoint selected` | `peer_id`, `endpoint` (empty when the device reports none), `relayed` (true when the peer connected on its `Fallback`) |
 | `Info` | `wireguard: peer handshake went stale, resuming endpoint selection` | `peer_id` |
 | `Info` | `wireguard: trying next endpoint candidate` | `peer_id`, `endpoint`, `attempt` (the entry's 1-based position), `of` (the order's length), `trial` (how long the entry just programmed is tried, such as `30s`, or `1m0s` for the fallback that ends a three-entry order) |
-| `Warn` | `wireguard: endpoint switch failed` | `peer_id`, `endpoint`, `error` |
+| `Info` | `wireguard: relay fallback changed, moving to the new relay` | `peer_id`, `from` (the old `Fallback`), `to` (the new one). Logged by `UpdatePeer` |
+| `Debug` | `wireguard: relayed peer silent, probing` | `peer_id`, `mesh_ip`, `silent_for` (the time since the silence window started, such as `30s`; after a failed send it counts from that send) |
+| `Warn`, `Debug` | `wireguard: relay probe send failed` | `peer_id`, `mesh_ip`, `error`. `Warn` for the first failure, `Debug` while the sends keep failing |
+| `Info` | `wireguard: relayed peer did not answer the probe, dialing the relay again` | `peer_id`, `endpoint` (the `Fallback`), `silent_for` (the time since the silence window started, such as `45s`) |
+| `Info` | `wireguard: relayed peer handshake went stale, dialing the relay again` | `peer_id`, `endpoint` (the `Fallback`) |
+| `Info` | `wireguard: still no handshake over the relay, dialing it again` | `peer_id`, `endpoint` (the `Fallback`), `trial` (the relay's trial, such as `30s`) |
+| `Warn` | `wireguard: endpoint switch failed` | `peer_id`, `endpoint` (the `Fallback` for a failed relay re-dial), `error` |
 | `Warn` | `wireguard: endpoint selection pass failed` | `error` |
 
 ### MTU detection
@@ -533,6 +606,11 @@ if err := mgr.ConfigurePeers(ctx, registerResponse.Peers); err != nil {
     log.Fatal(err)
 }
 
+// Probe relayed peers that fall silent, then try each peer's dial order
+// every 5 seconds (blocks until ctx is done)
+mgr.SetRelayProbe(wireguard.SendRelayProbe)
+go mgr.RunEndpointSelection(ctx, wireguard.EndpointSelectionInterval)
+
 // Individual peer operations (driven by reconciliation; see ReconcileHandler)
 mgr.AddPeer(newPeer)
 mgr.UpdatePeer(updatedPeer)
@@ -559,10 +637,10 @@ if err := mgr.Teardown(); err != nil {
 |-------------------|----------------------------------|----------------------------|
 | `AddPeer`         | Returns error                    | —                          |
 | `RemovePeerByID`  | Returns error                    | —                          |
-| `UpdatePeer`      | Returns error                    | —                          |
+| `UpdatePeer`      | Returns `wireguard: update peer: <cause>` and leaves the state as it was. A failed move to a new relay names `remove device peer` or `add device peer`, and the reconciler retries it on its next cycle | — |
 | `ConfigurePeers`  | Logged at error, continues       | Returns context error      |
 | `SetPeerPSK`      | Returns `wireguard: set peer psk: <cause>` | —                |
-| `RunEndpointSelection` | A failed switch is logged at warn and the pass goes on | Returns nil |
+| `RunEndpointSelection` | A failed switch or relay re-dial is logged at warn and the pass goes on; the next re-dial follows one relay trial later. A failed probe send is logged at warn, then at debug while it keeps failing, and takes no verdict: the next probe follows one trial later | Returns nil |
 | `RunMTUProbe`     | A failed probe or `SetMTU` is logged at warn. The next round probes again and retries a failed lowering; a failed raise starts the two-round wait over | Returns nil |
 
 ### Logging

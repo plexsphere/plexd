@@ -778,9 +778,21 @@ entries come before it, plexd tries it as long as those entries took together.
 Two nodes behind hard NATs are then on the relay at the same time. With the
 default keepalive, a ten-entry order reaches the fallback after about 270 s,
 stays on it for about 270 s, and starts over after about 540 s. A two-entry
-order behaves as before, and a connected peer is never switched.
-See [Dial order](../networking/wireguard.md#dial-order) and
-[Endpoint selection](../networking/wireguard.md#endpoint-selection).
+order behaves as before. plexd never switches a peer connected on a direct
+path, and follows three rules for the relay. A peer dialing
+`fallback_endpoint` moves at once when the pull names another one, on a fresh
+WireGuard session, unless it is connected over a direct path WireGuard roamed
+to; plexd tells that path from the device's endpoint, which it can compare
+only with a `fallback_endpoint` that is an address. A peer that runs over the
+relay and received nothing for one trial gets a probe through the tunnel, and
+plexd dials the relay again when nothing comes back within 15 s. Such a peer
+stays on the relay after its connection fails, and plexd tries its direct
+entries again only when the pull drops `fallback_endpoint` or the peer, its
+key rotates, plexd restarts, or WireGuard roamed it to a direct path that then
+failed.
+See [Dial order](../networking/wireguard.md#dial-order),
+[Endpoint selection](../networking/wireguard.md#endpoint-selection) and
+[Relay liveness probe](../networking/wireguard.md#relay-liveness-probe).
 
 `bridge.relay` asks a bridge to relay WireGuard for the peers whose
 `fallback_endpoint` names it. A bridge listens only when its local
