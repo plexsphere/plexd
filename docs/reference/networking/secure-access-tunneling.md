@@ -53,7 +53,7 @@ Control Plane
 3. Teardown pass: every live session whose entry is no longer in the block is closed, with the reason derived from its capped local expiry
 4. Provision pass, in block order: each entry not yet settled is validated and, if it is a `tcp` entry or, on Linux and macOS, an `ssh` entry, handed to `SessionManager.CreateSession`. A `tcp` session opens a listener on `meshIP:0`. An `ssh` session binds nothing and needs no mesh address: it is ready to serve the connections the control plane asks for (see [Listener](#listener))
 5. Report pass: once the block is provisioned, `SessionActivityReporter.ReportSessionStarted` posts a `session_started` row per session whose row is still outstanding. The `tcp` row carries the target host and port and the `listener_endpoint` the listener actually bound. The `ssh` lifecycle row carries the phase alone, no `listener_endpoint`, and means the session is ready to serve. A row that does not land is re-posted on the next pull from the same session, so a `tcp` row's `listener_endpoint` stays stable across attempts. The posts run concurrently and each is bounded, so a stalled control plane cannot hold the reconciler's single goroutine for the length of the block. A row answered with a terminal-state verdict (a `409` `session_already_revoked` or `session_expired`, classified by `api.IsSessionRevokedOrExpired`) is settled rather than re-posted and is logged at Info (`session no longer live server-side; awaiting the drain`); the listener stays up until the block drain, or a verified `session_revoked` event naming the session, closes it, and every pull that still carries the settled entry warns that the listener is forwarding for a session the platform has withdrawn. A `404` `session_not_found` is not a terminal state — the block and the session store are separate reads that can disagree — so it stays on the re-post path
-6. A client connects through the mesh to a `tcp` listener, and `Session` forwards to the target. A client of an `ssh` session attaches through the control plane, which sends a `session_connect` event for each connection; plexd opens it to the control plane, outside the reconcile cycle
+6. A client connects through the mesh to a `tcp` listener, and `Session` forwards to the target. While bytes cross, the session posts `session_active` rows through `TCPActivityReporter.ReportSessionActive`, at most one per interval, so the control plane's idle sweeper does not revoke a tunnel in use (see [Activity Reports](#activity-reports)). A client of an `ssh` session attaches through the control plane, which sends a `session_connect` event for each connection; plexd opens it to the control plane, outside the reconcile cycle
 7. A session ends when its entry drains from the block, when a verified `session_revoked` event names it (`Dispatcher.SessionRevokedHandler`), when its capped expiry fires, when its idle window elapses, or on `Shutdown`
 8. The `SessionManager`'s on-closed callback fires the production reporter's `ReportSessionEnded`, posting a `session_ended` row with a `terminated_by` reason for every close reason, `Shutdown` included: the `tcp` row carries the byte counters, the `ssh` row picks its shape from `ClosedSessionInfo.Kind`. For a close caused by the drain or by a `session_revoked` event the platform already holds the session as revoked or expired, and it records the ending row of the session's current listener once instead of refusing it. A `409` to the ending row means the listener's end is already recorded, or a control plane that predates that rule; the row is fire-once and nothing re-posts it, so plexd warns (`tunnel session ended row refused; its counters are recorded only here`, or `ssh session ended row refused; its terminating reason is recorded only here` for an ssh session) and carries `terminated_by`, plus a `tcp` row's byte counters, into that line, which is where they survive
 
@@ -118,7 +118,7 @@ func NewSession(sessionID, targetHost string, targetPort int, meshIP string, exp
 
 | Method       | Signature                                  | Description                                              |
 |--------------|--------------------------------------------|----------------------------------------------------------|
-| `Start`      | `(ctx context.Context) (string, error)`    | Opens TCP listener on meshIP:0, starts accept loop and, when an idle window is armed, the idle monitor |
+| `Start`      | `(ctx context.Context) (string, error)`    | Opens TCP listener on meshIP:0, starts accept loop and, when an idle window is armed, the idle monitor and, when an activity reporter is wired, the activity report |
 | `Close`      | `() error`                                 | Idempotent shutdown: cancels context, closes listener and connection, then waits (bounded) for the forwarding goroutines so the byte counters are complete |
 | `IdleFor`    | `() time.Duration`                         | How long the session has gone without observed byte flow, measured monotonically |
 | `ListenAddr` | `() string`                                | Returns listener address or empty string if not started  |
@@ -158,6 +158,7 @@ func NewSessionManager(cfg Config, meshIP string, logger *slog.Logger) *SessionM
 | `CreateSession`  | `(ctx context.Context, sess api.NodeStateSession) (string, error)` | Validates one entry of the `sessions` block, creates and starts its session, and returns the bound listener address of a tcp session, or an empty address for an ssh session, which binds nothing |
 | `ConnectSSHSession` | `(sessionID, connectionID string, dial func(context.Context) (net.Conn, error)) error` | Opens one connection of a live ssh session with `dial` and serves the session's login on it; the `session_connect` handler calls it (see [Listener](#listener)) |
 | `SetSSHSessionDeps` | `(deps SSHSessionDeps)`                                         | Wires the host key, signing keys, command reporter and session launcher ssh sessions need; `plexd up` calls it on Linux and macOS |
+| `SetTCPActivityReporter` | `(r TCPActivityReporter)`                                  | Wires the reporter tcp sessions post their `session_active` rows through. Until it is called, tcp sessions post none, and a session keeps the reporter it was created with; `plexd up` calls it (see [Activity Reports](#activity-reports)) |
 | `CloseSession`   | `(sessionID string, reason string) *ClosedSessionInfo`             | Closes and removes a session by ID; returns session info |
 | `Shutdown`       | `()`                                                               | Closes all active sessions, reporting each through the on-closed callback |
 | `ActiveSessions` | `() map[string]time.Time`                                          | Snapshot of live session IDs and their **capped** local expiry; the dispatcher's teardown input |
@@ -216,6 +217,52 @@ value means the session has no idle window.
 - `Start` counts as the first activity (the listener bind of a tcp session, the start of an ssh session), so a session no connection ever reaches idles out one window after `Start`
 - The close runs through `CloseSession(id, "idle")` like any other, so the `session_ended` row still carries the byte counters and, via the reason, a `terminated_by` of `idle_timeout`
 - The monitor is started by `Session.Start` on its own child context and exits when that context is cancelled, which every close reaches
+
+### Activity Reports
+
+An operator's client dials a tcp session's listener over the mesh, so no
+control-plane component sees a byte of the tunnel, and the control plane's idle
+sweeper revokes a session whose `last_active_at` is `idle_timeout_seconds` old.
+While a tcp tunnel forwards bytes, its session therefore posts the row
+`{"tcp":{"phase":"session_active"}}` through
+`TCPActivityReporter.ReportSessionActive`, and the control plane advances the
+session's `last_active_at` to the instant it records the row. A quiet tunnel
+posts nothing and still idles out, on the node and on the control plane. plexd
+follows the rules of the
+[TCP session activity](https://github.com/plexsphere/plexsphere/blob/4c954bd1416cdaeb34d3d84cad5c042a75baab53/docs/reference/api/plexd-agent-contract.md#tcp-session-activity)
+section of plexsphere's agent contract:
+
+- The interval is `min(60 s, idle_timeout_seconds / 4)`, with `idle_timeout_seconds` read from the session's entry in the pull, and 60 s when it is `0`. `activityReportInterval` divides the duration, not the seconds, so a 10 s window gives a 2.5 s interval. The control plane issues no session without an idle window, but a tcp session with `idle_timeout_seconds` `0` still reports, every 60 s, as the contract says
+- The first row goes out as soon as a byte crosses after an interval without a row. After a row, one more row goes out at the end of each interval in which bytes crossed, and none once a whole interval passed without a byte. A tunnel therefore posts at most one row per interval, and the last bytes of a tunnel that goes quiet are still reported. Each interval is measured from the start of the post that opened it
+- Each post is bounded by `sessionActiveReportTimeout`, 15 s, which stays above `api.DefaultConnectTimeout` for the reason `sessionStartedReportTimeout` documents. The post runs on the session's own goroutine, never on the reconciler's, so a slow post only delays that session's next row
+- Only tcp sessions report. The control plane counts an ssh session's terminal traffic at its attach gateway, and plexd serves no k8s session
+- Until `SessionManager.SetTCPActivityReporter` is called, tcp sessions post no row, and a session keeps the reporter it was created with. `plexd up` wires the production reporter (see [SessionActivityReporter](#sessionactivityreporter))
+
+The answer to each post decides what the session does next. No answer closes
+the tunnel:
+
+| Answer | The session | Log line |
+|--------|-------------|----------|
+| `204` | The row is recorded | Debug `session_active row recorded` |
+| `409` `session_already_revoked` or `session_expired` (`api.IsSessionRevokedOrExpired`) | The session is no longer live server-side, so it stops reporting. The tunnel stays up until the block drain, or a verified `session_revoked` event, closes it | Info `session no longer live server-side; stopping its activity reports`, with `error` |
+| Any `400`, such as the `400 invalid_session_activity` of a control plane that predates the row | The row is not recorded and not retried: its bytes never change, so a re-post would draw the same answer. Later bytes still post, so a control plane rolled forward mid-session records the next row | Warn `control plane refused the session_active row; it revokes the tunnel one idle timeout after it started`, with `error`, on the session's first `400` only |
+| Anything else: `401 nsk_invalid`, `404 session_not_found`, any `5xx`, a transport error, the 15 s bound running out, `api.ErrCredentialRefused` | The row is not recorded. The bytes are marked unreported again, so the end of the interval retries the row even when the tunnel went quiet | Warn `session activity report failed; retrying at the end of the interval`, with `error` |
+
+A control plane that refuses the row with a `400` revokes the session one idle
+timeout after its `session_started` row, whether or not the tunnel still
+forwards bytes, which is what the Warn line says. A session with an idle window
+stops retrying once its own idle close ends it, and a session that closes while
+a post is in flight stops without a log line.
+
+The reports cost one goroutine per tcp session with a wired reporter. `Start`
+runs it on the child context it derives, like the idle monitor, so every close
+stops it. Each forwarded chunk costs two atomic operations, plus a non-blocking
+wake-up of that goroutine while the report is quiet, and a tunnel posts at most
+one row per interval. To see the chunks, a session with a wired reporter wraps
+both forwarding sources, as a session with an idle window does, and gives up the
+`splice(2)` fast path `io.Copy` takes between two TCP connections. Every session
+the control plane issues carries an idle window, so it has given that path up
+already.
 
 ### Lifecycle
 
@@ -364,7 +411,7 @@ therefore logs why it refuses the event instead of dropping it at Debug.
 
 ## SessionActivityReporter
 
-Interface for reporting a session's `session_started` row to the control plane. Abstracted for testability.
+Interface for reporting a session's `session_started` row to the control plane, beside `SSHCommandReporter` for an ssh session's command rows and `TCPActivityReporter` for a tcp session's `session_active` rows. Abstracted for testability.
 
 ```go
 type SessionActivityReporter interface {
@@ -375,9 +422,13 @@ type SSHCommandReporter interface {
     ReportSSHCommandStarted(ctx context.Context, sessionID, command string, startedAt time.Time) error
     ReportSSHCommandExited(ctx context.Context, sessionID, command string, exitCode int, startedAt, completedAt time.Time) error
 }
+
+type TCPActivityReporter interface {
+    ReportSessionActive(ctx context.Context, sessionID string) error
+}
 ```
 
-The production implementation, `controlPlaneSessionReporter` in `cmd/plexd/cmd/up.go`, posts an `api.SessionActivityRequest` to `api.ControlPlane.ReportSessionActivity` (`POST /v1/nodes/{node_id}/sessions/{session_id}`). `listenerEndpoint` is a tcp listener's bound address and empty for an ssh session. For a `tcp` entry `ReportSessionStarted` emits a `tcp` `session_started` row with the target and `listenerEndpoint`, the address the listener actually bound, so the control plane has somewhere to send the operator; for an `ssh` entry it emits the `ssh` lifecycle row with the phase alone and ignores `listenerEndpoint`. `ReportSessionEnded(ctx, sessionID, info *ClosedSessionInfo, terminatedBy)` emits a `session_ended` row: the `tcp` row with the byte counters, or, when `info.Kind` is `ssh`, the `ssh` row with `terminated_by` only. `ReportSessionEnded` is not on the interface: it is fired from the `SessionManager`'s on-closed callback that `plexd up` wires with `SetOnClosed`. The same type implements `SSHCommandReporter`, whose two rows the ssh listener posts around every `exec` (see [Commands and activity rows](#commands-and-activity-rows)); both return the post's error.
+The production implementation, `controlPlaneSessionReporter` in `cmd/plexd/cmd/up.go`, posts an `api.SessionActivityRequest` to `api.ControlPlane.ReportSessionActivity` (`POST /v1/nodes/{node_id}/sessions/{session_id}`). `listenerEndpoint` is a tcp listener's bound address and empty for an ssh session. For a `tcp` entry `ReportSessionStarted` emits a `tcp` `session_started` row with the target and `listenerEndpoint`, the address the listener actually bound, so the control plane has somewhere to send the operator; for an `ssh` entry it emits the `ssh` lifecycle row with the phase alone and ignores `listenerEndpoint`. `ReportSessionEnded(ctx, sessionID, info *ClosedSessionInfo, terminatedBy)` emits a `session_ended` row: the `tcp` row with the byte counters, or, when `info.Kind` is `ssh`, the `ssh` row with `terminated_by` only. `ReportSessionEnded` is not on the interface: it is fired from the `SessionManager`'s on-closed callback that `plexd up` wires with `SetOnClosed`. The same type implements `SSHCommandReporter`, whose two rows the ssh listener posts around every `exec` (see [Commands and activity rows](#commands-and-activity-rows)); both return the post's error. It also implements `TCPActivityReporter`, which `plexd up` wires with `SetTCPActivityReporter` so the rows keep the control plane's idle sweeper away from a tunnel in use: `ReportSessionActive(ctx, sessionID)` emits the `tcp` row `{"tcp":{"phase":"session_active"}}` and returns the post's error unchanged, because the answer decides whether the session stops reporting, warns, or retries the row at the end of its interval (see [Activity Reports](#activity-reports)).
 
 `ReportSessionStarted` returns the post's error because the row is not merely an audit record. For a tcp session `listener_endpoint` is the operator's only route to the listener, and for an ssh session the row is what makes the control plane ask for connections, since it sends `session_connect` only for a session whose newest lifecycle row is `session_started`. Either way the dispatcher has to know whether the row landed. A terminal-state answer (`api.IsSessionRevokedOrExpired`: a `409` `session_already_revoked` or `session_expired`) settles the entry and is logged at Info; the session stays up until the block drain, or a verified `session_revoked` event naming the session, closes it. Every other error (a transport failure, a `400`, a `404` `session_not_found`, a `501` `access_session_not_provisioned`, a `5xx`) keeps the session up, leaves the entry unsettled, and re-posts the row on the next pull, a `tcp` row from the same `listener_endpoint`, logged at Warn. `ReportSessionEnded` returns nothing and is fire-once from the on-closed callback: a `409` is logged at Warn carrying `terminated_by` and, for a `tcp` row, the byte counters (the control plane records the ending row of a revoked or expired `ssh` or `tcp` session's current listener once, unless its newest lifecycle row is already a `session_ended`, so a `409` to it means the listener's end is already recorded, or a control plane that predates that rule; nothing re-posts the row, so the line is where that payload survives), any other failure at Error, and nothing is retried.
 
@@ -454,8 +505,11 @@ type SessionActivityRequest struct {
 
 ### TCPActivity
 
-The `tcp` member: a session lifecycle row. `Phase` is `session_started` or
-`session_ended`. `ListenerEndpoint` is the node's bound listener address and is set
+The `tcp` member: a session lifecycle row, or a row reporting traffic. `Phase` is
+`session_started` or `session_ended` on the two lifecycle rows, or
+`session_active` on the rows a tunnel posts while it forwards bytes (see
+[Activity Reports](#activity-reports)). A `session_active` row carries `Phase`
+alone. `ListenerEndpoint` is the node's bound listener address and is set
 on `session_started` rows only. `BytesIn` (operator→target) and `BytesOut`
 (target→operator) are pointers so a `session_ended` row carries explicit zeros
 while a `session_started` row omits the byte counters. `TerminatedBy`, when set, is
@@ -635,7 +689,7 @@ sessions, via two methods of `api.ControlPlane`:
 
 | Method                  | Endpoint                             | When Called                                                            |
 |-------------------------|--------------------------------------|------------------------------------------------------------------------|
-| `ReportSessionActivity` | `POST /v1/nodes/{id}/sessions/{sid}` | Session ready (`session_started`), session close (`session_ended`), and around every ssh `exec` (the two command rows) |
+| `ReportSessionActivity` | `POST /v1/nodes/{id}/sessions/{sid}` | Session ready (`session_started`), at most once per interval while a tcp tunnel forwards bytes (`session_active`), session close (`session_ended`), and around every ssh `exec` (the two command rows) |
 | `OpenSessionConnection` | `GET /v1/nodes/{id}/sessions/{sid}/connections/{cid}` (WebSocket upgrade) | A verified `session_connect` event names a connection of a live ssh session (see [Listener](#listener)) |
 
 ### WireGuard Mesh (`internal/wireguard`)
@@ -675,7 +729,7 @@ mgr.Shutdown()
 1. User requests access through the platform UI/CLI.
 2. Control plane verifies RBAC permissions and issues the session, adding a `tcp` entry to the node's `sessions` block. It may also emit a `session_setup` event to pull the node's next reconcile forward.
 3. On its next pull, plexd sees the entry, opens a TCP listener on the mesh interface, and reports a `session_started` row carrying the bound `listener_endpoint`.
-4. Connections arriving on that listener are forwarded through the encrypted mesh to the target host and port.
+4. Connections arriving on that listener are forwarded through the encrypted mesh to the target host and port. plexd reports the traffic as it flows, in `session_active` rows, at most one per interval, so the control plane does not revoke the session as idle while the tunnel is in use; a quiet tunnel posts nothing (see [Activity Reports](#activity-reports)).
 5. The session ends when the control plane drops the entry from the block (`plexd_close`), when a verified `session_revoked` event names it (`operator_revoke` for an operator-driven `revoke_reason`, `ttl_expired` or `idle_timeout` for the sweeper's), when its capped expiry fires (`ttl_expired`), when its idle window elapses (`idle_timeout`), or on node shutdown (`plexd_close`). The `session_ended` row carries the byte counters and the reason.
 
 ### Kubernetes Sessions
@@ -973,6 +1027,10 @@ All log entries use `component=tunnel`. Session-scoped entries add `session_id`.
 | `Info`  | Session started                | `listen_addr`, `target`                     |
 | `Info`  | Session created                | `session_id`, `kind`, `expires_at`, and `listen_addr` for a tcp session |
 | `Info`  | Session closed                 | `session_id`, `kind`, `reason`, `duration`  |
+| `Debug` | session_active row recorded    | `session_id`                                |
+| `Info`  | session no longer live server-side; stopping its activity reports | `session_id`, `error` |
+| `Warn`  | control plane refused the session_active row; it revokes the tunnel one idle timeout after it started | `session_id`, `error`; on the session's first `400` only |
+| `Warn`  | session activity report failed; retrying at the end of the interval | `session_id`, `error` |
 | `Info`  | ssh session ready              | `user`                                      |
 | `Info`  | session connection opened      | `session_id`, `connection_id`               |
 | `Info`  | session_connect names no live ssh session; not connecting | `session_id`, `connection_id` |
