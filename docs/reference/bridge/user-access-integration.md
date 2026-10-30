@@ -356,7 +356,7 @@ The user access reconcile handler plugs into `internal/reconcile` alongside exis
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
 r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
-r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
+r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 ```
 

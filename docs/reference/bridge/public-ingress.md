@@ -242,7 +242,7 @@ Returns a `reconcile.ReconcileHandler` that synchronizes ingress rules to match 
 
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
+r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 ```
@@ -342,7 +342,7 @@ The ingress reconcile handler plugs into `internal/reconcile` alongside existing
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
 r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
-r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
+r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 ```
