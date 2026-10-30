@@ -295,9 +295,9 @@ fine-grained `user_access_*` constants have been removed.
 
 The implementation deviates from the original plan in two areas:
 
-1. **UserAccessInfo placement**: Plan task 1.1 specifies `BridgeInfo.UserAccess *UserAccessInfo`, but the implementation places it as `HeartbeatRequest.UserAccess *UserAccessInfo` instead. User access is a separate capability from bridge status, and placing it at the top level of `HeartbeatRequest` alongside `Bridge *BridgeInfo` keeps concerns cleanly separated.
+1. **UserAccessInfo placement**: The original plan specifies `BridgeInfo.UserAccess *UserAccessInfo`, but the implementation places it as `HeartbeatRequest.UserAccess *UserAccessInfo` instead. User access is a separate capability from bridge status, and placing it at the top level of `HeartbeatRequest` alongside `Bridge *BridgeInfo` keeps concerns cleanly separated.
 
-2. **AccessSubnets reuse**: Plan task 1.2 mentions a `UserAccessSubnets []string` config field, but the implementation reuses the existing `AccessSubnets` field since user access shares the same bridge access interface and exposes the same mesh CIDRs to VPN clients. Adding a separate `UserAccessSubnets` field would duplicate configuration with no behavioral difference.
+2. **AccessSubnets reuse**: The original plan mentions a `UserAccessSubnets []string` config field, but the implementation reuses the existing `AccessSubnets` field since user access shares the same bridge access interface and exposes the same mesh CIDRs to VPN clients. Adding a separate `UserAccessSubnets` field would duplicate configuration with no behavioral difference.
 
 ## Error Prefixes
 

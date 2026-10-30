@@ -82,7 +82,7 @@ print_counter_results() {
     done
 }
 
-# --- Diagnostics function (REQ-008) ---
+# --- Diagnostics function ---
 print_diagnostics() {
     echo "--- Diagnostics ---"
     echo "==> Network inspect:"
@@ -113,7 +113,7 @@ fail() {
     exit 1
 }
 
-# --- Cleanup trap (REQ-002, REQ-006) ---
+# --- Cleanup trap ---
 cleanup() {
     echo "--- Cleaning up ---"
     if [ "${TEST_FAILED}" -ne 0 ]; then
@@ -140,7 +140,7 @@ docker rm -f "${MOCKAPI_CONTAINER}" 2>/dev/null || true
 docker rm -f "${SYSTEMD_CONTAINER}" 2>/dev/null || true
 docker network rm "${NETWORK_NAME}" 2>/dev/null || true
 
-# --- Build images (REQ-001) ---
+# --- Build images ---
 echo "=== Building mock-api image ==="
 docker build -f "${REPO_ROOT}/test/e2e/mockapi/Dockerfile" -t "${MOCKAPI_IMAGE}" "${REPO_ROOT}"
 
@@ -155,11 +155,11 @@ docker run --rm \
     "golang:${GO_VERSION}-alpine" \
     sh -c 'CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o /build/plexd-linux-amd64 ./cmd/plexd'
 
-# --- Create network (REQ-002) ---
+# --- Create network ---
 echo "=== Creating Docker network ==="
 docker network create "${NETWORK_NAME}"
 
-# --- Start mock-api container (REQ-004) ---
+# --- Start mock-api container ---
 echo "=== Starting mock-api container ==="
 docker run -d \
     --name "${MOCKAPI_CONTAINER}" \
@@ -195,7 +195,7 @@ if [ -z "${MOCK_BEARER}" ]; then
 fi
 MOCK_AUTH=(-H "Authorization: Bearer ${MOCK_BEARER}")
 
-# --- Start systemd container and install plexd (REQ-002, REQ-003, REQ-007) ---
+# --- Start systemd container and install plexd ---
 echo "=== Starting systemd container ==="
 docker run -d \
     --name "${SYSTEMD_CONTAINER}" \
@@ -226,12 +226,12 @@ if [ "${BOOT_ELAPSED}" -ge "${BOOT_TIMEOUT}" ]; then
     fail "systemd did not boot within ${BOOT_TIMEOUT}s"
 fi
 
-# Install plexd binary and service unit (REQ-003, REQ-007).
+# Install plexd binary and service unit.
 echo "=== Installing plexd into systemd container ==="
 docker exec "${SYSTEMD_CONTAINER}" bash -c \
     'cp /opt/plexd-binary /usr/local/bin/plexd && chmod +x /usr/local/bin/plexd && cp /opt/plexd.service /opt/plexd-session-helper.socket /opt/plexd-session-helper@.service /etc/systemd/system/'
 
-# Write plexd config pointing at mock-api (REQ-004).
+# Write plexd config pointing at mock-api.
 docker exec "${SYSTEMD_CONTAINER}" bash -c "cat > /etc/plexd/config.yaml <<EOF
 api:
   base_url: http://${MOCKAPI_CONTAINER}:8080
@@ -285,7 +285,7 @@ docker exec "${SYSTEMD_CONTAINER}" bash -c 'printf %s "psb_test_e2eproject_node_
 # units instead of running it, and the unit keeps /etc read-only for plexd.
 docker exec "${SYSTEMD_CONTAINER}" mkdir -p /etc/plexd/hooks
 
-# --- Start service and poll assertions (REQ-003, REQ-004) ---
+# --- Start service and poll assertions ---
 echo "=== Enabling and starting plexd service ==="
 docker exec "${SYSTEMD_CONTAINER}" systemctl daemon-reload
 docker exec "${SYSTEMD_CONTAINER}" systemctl enable --now plexd
@@ -307,7 +307,7 @@ else
     fail "plexd-session-helper.socket is '${HELPER_SOCKET_STATE}', want 'active'"
 fi
 
-# Poll mock-api assertion endpoint (REQ-004).
+# Poll mock-api assertion endpoint.
 echo "=== Polling assertion endpoint ==="
 ASSERT_URL="http://localhost:18080/test/assertions"
 POLL_ELAPSED=0
@@ -1173,7 +1173,7 @@ else
     fail "plexd state after the simulated reboot is '${REBOOT_STATE}', want 'active'"
 fi
 
-# --- Clean shutdown verification (REQ-005) ---
+# --- Clean shutdown verification ---
 echo "=== Stopping plexd service ==="
 docker exec "${SYSTEMD_CONTAINER}" systemctl stop plexd
 
@@ -1193,7 +1193,7 @@ else
     echo "  WARN: exit code is ${EXIT_CODE} (non-zero, may indicate unclean shutdown)"
 fi
 
-# Check journalctl for crash indicators (REQ-005, task 1.6).
+# Check journalctl for crash indicators.
 echo "=== Checking for crash indicators in journalctl ==="
 CRASH_OUTPUT=$(docker exec "${SYSTEMD_CONTAINER}" journalctl -u plexd --no-pager 2>/dev/null || true)
 CRASH_FOUND=0

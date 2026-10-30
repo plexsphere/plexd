@@ -706,7 +706,7 @@ func TestLocalReporter_TokenNotInLogs(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Edge case tests: credential cache (Task 2.2)
+// Edge case tests: credential cache
 // ---------------------------------------------------------------------------
 
 func TestLocalReporter_TTLBoundary_ExactExpiry(t *testing.T) {
@@ -822,7 +822,7 @@ func TestLocalReporter_EmptyBatchStillPosts(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Edge case tests: HTTP behavior (Task 2.3)
+// Edge case tests: HTTP behavior
 // ---------------------------------------------------------------------------
 
 func TestLocalReporter_LargeBatch(t *testing.T) {

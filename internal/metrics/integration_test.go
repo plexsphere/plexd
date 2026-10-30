@@ -77,7 +77,7 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) 
 }
 
 // ---------------------------------------------------------------------------
-// REQ-001, REQ-003, REQ-005, REQ-008: Dual delivery happy path
+// Dual delivery happy path
 // ---------------------------------------------------------------------------
 
 func TestIntegration_DualDelivery_BothReceiveSameBatch(t *testing.T) {
@@ -208,7 +208,7 @@ func TestIntegration_DualDelivery_CredentialResolution(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-002: Platform-only when URL empty
+// Platform-only when URL empty
 // ---------------------------------------------------------------------------
 
 func TestIntegration_PlatformOnly_WhenURLEmpty(t *testing.T) {
@@ -294,7 +294,7 @@ func TestIntegration_ConditionalWiring_Pattern(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-004, REQ-009: Error isolation
+// Error isolation
 // ---------------------------------------------------------------------------
 
 func TestIntegration_LocalDown_PlatformUnaffected(t *testing.T) {
@@ -417,7 +417,7 @@ func TestIntegration_CredentialFailure_PlatformStillReceives(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-006, REQ-010: TLS skip-verify
+// TLS skip-verify
 // ---------------------------------------------------------------------------
 
 func TestIntegration_TLSSkipVerify_SelfSignedSucceeds(t *testing.T) {

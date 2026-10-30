@@ -64,7 +64,7 @@ func (d *DefaultDetector) Detect() *KubernetesEnvironment {
 		return &KubernetesEnvironment{InCluster: false}
 	}
 
-	// Check that the SA token file exists (REQ-001: partial environment).
+	// Check that the SA token file exists (partial environment).
 	if _, err := os.Stat(DefaultTokenPath); err != nil {
 		logger.Warn("kubernetes: partial environment detected: KUBERNETES_SERVICE_HOST set but SA token missing",
 			"component", "kubernetes", "token_path", DefaultTokenPath)
