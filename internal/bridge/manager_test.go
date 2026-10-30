@@ -3,6 +3,8 @@ package bridge
 import (
 	"fmt"
 	"testing"
+
+	"github.com/plexsphere/plexd/internal/api"
 )
 
 func TestManager_Setup_Enabled(t *testing.T) {
@@ -530,6 +532,62 @@ func TestManager_BridgeCapabilities_WithoutRelay(t *testing.T) {
 	}
 	if caps["relay_listen_port"] != "" {
 		t.Errorf("caps[relay_listen_port] = %q, want empty", caps["relay_listen_port"])
+	}
+}
+
+func TestManager_RelayStatusTracker(t *testing.T) {
+	tests := []struct {
+		relayEnabled bool
+		want         RelayStatus
+	}{
+		{relayEnabled: true, want: RelayStatus{State: api.RelayStateRunning, ListenPort: 51821}},
+		{relayEnabled: false, want: RelayStatus{State: api.RelayStateNotConsented}},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("RelayEnabled=%v", tt.relayEnabled), func(t *testing.T) {
+			ctrl := &mockRouteController{}
+			cfg := Config{
+				Enabled:         true,
+				AccessInterface: "eth1",
+				AccessSubnets:   []string{"10.0.0.0/24"},
+				EnableNAT:       BoolPtr(false),
+				RelayEnabled:    tt.relayEnabled,
+			}
+			mgr := NewManager(ctrl, cfg, discardLogger())
+
+			status := mgr.RelayStatusTracker()
+			if status == nil {
+				t.Fatal("RelayStatusTracker() = nil, want a tracker")
+			}
+			if mgr.RelayStatusTracker() != status {
+				t.Error("RelayStatusTracker() returned another tracker on the second call")
+			}
+
+			if err := mgr.Setup("wg0"); err != nil {
+				t.Fatalf("Setup: %v", err)
+			}
+			if relay := mgr.Relay(); relay != nil {
+				relay.listen = loopbackRelayListen
+				t.Cleanup(func() { _ = relay.Stop() })
+			}
+			h := RelayReconcileHandler(mgr.Relay(), status, discardLogger())
+			if err := runHandler(t, h, relaySnapshot(&api.RelayConfig{Enabled: true, ListenPort: 51821})); err != nil {
+				t.Fatalf("handler: %v", err)
+			}
+			before, ok := status.Get()
+			if !ok || before.State != tt.want.State || before.ListenPort != tt.want.ListenPort {
+				t.Fatalf("status = %+v (known %v), want state %s on port %d", before, ok, tt.want.State, tt.want.ListenPort)
+			}
+			takeSignal(status)
+
+			if err := mgr.Teardown(); err != nil {
+				t.Fatalf("Teardown: %v", err)
+			}
+			wantRelayStatus(t, status, before)
+			if takeSignal(status) {
+				t.Error("Teardown signalled a status change")
+			}
+		})
 	}
 }
 

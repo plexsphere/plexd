@@ -11,14 +11,21 @@ import (
 )
 
 // RelayReconcileHandler returns a reconcile.ReconcileHandler that runs the
-// relay the desired bridge.relay block asks for. relay is nil when local
-// consent, bridge.relay_enabled, is off.
+// relay the desired bridge.relay block asks for and records on status the
+// state each snapshot leaves the relay in, for the RelayStatusReporter to send.
+// relay is nil when local consent, bridge.relay_enabled, is off. status must
+// not be nil.
 //
-// A nil Bridge or Relay child, or Enabled false, stops a running relay. With
-// Enabled true the relay is configured on ListenPort with the snapshot's
-// peers, so a bind failure fails the reconcile cycle and the next pull
-// retries it. With Enabled true and no relay, the handler only warns.
-func RelayReconcileHandler(relay *Relay, logger *slog.Logger) reconcile.ReconcileHandler {
+// A nil Bridge or Relay child, or Enabled false, stops a running relay and
+// records stopped, also when relay is nil or not running, so a relay whose
+// last bind failed reads stopped once the pull disables it. With Enabled true
+// the relay is configured on ListenPort with the snapshot's peers, so a bind
+// failure fails the reconcile cycle and the next pull retries it. The status
+// then comes from Relay.Bound: running on the bound port while the relay runs,
+// bind_failed on ListenPort when Configure failed on a valid port, and stopped
+// otherwise. With Enabled true and no relay, the handler only warns and records
+// not_consented. A nil snapshot records nothing.
+func RelayReconcileHandler(relay *Relay, status *RelayStatusTracker, logger *slog.Logger) reconcile.ReconcileHandler {
 	return func(_ context.Context, desired *api.NodeStateSnapshot, _ reconcile.StateDiff) error {
 		if desired == nil {
 			return nil
@@ -29,13 +36,13 @@ func RelayReconcileHandler(relay *Relay, logger *slog.Logger) reconcile.Reconcil
 			block = desired.Bridge.Relay
 		}
 		if block == nil || !block.Enabled {
-			if relay == nil || !relay.Running() {
-				return nil
+			if relay != nil && relay.Running() {
+				if err := relay.Stop(); err != nil {
+					return err
+				}
+				logger.Info("relay disabled by the control plane", "component", "bridge")
 			}
-			if err := relay.Stop(); err != nil {
-				return err
-			}
-			logger.Info("relay disabled by the control plane", "component", "bridge")
+			status.Set(RelayStatus{State: api.RelayStateStopped})
 			return nil
 		}
 		if relay == nil {
@@ -43,9 +50,27 @@ func RelayReconcileHandler(relay *Relay, logger *slog.Logger) reconcile.Reconcil
 				"component", "bridge",
 				"listen_port", block.ListenPort,
 			)
+			status.Set(RelayStatus{State: api.RelayStateNotConsented})
 			return nil
 		}
-		return relay.Configure(block.ListenPort, desired.Peers)
+
+		err := relay.Configure(block.ListenPort, desired.Peers)
+		// Configure stops a relay on another port before it binds, so a bind
+		// failure leaves the relay stopped and it reads bind_failed on the
+		// pulled port. An out-of-range port fails before anything changes: a
+		// relay running on its old port keeps reading running there, and one
+		// that was not running reads stopped, because the contract refuses
+		// bind_failed without a valid port.
+		port, boundAt, running := relay.Bound()
+		switch {
+		case running:
+			status.Set(RelayStatus{State: api.RelayStateRunning, ListenPort: port, BoundAt: boundAt})
+		case err != nil && block.ListenPort >= 1 && block.ListenPort <= 65535:
+			status.Set(RelayStatus{State: api.RelayStateBindFailed, ListenPort: block.ListenPort})
+		default:
+			status.Set(RelayStatus{State: api.RelayStateStopped})
+		}
+		return err
 	}
 }
 

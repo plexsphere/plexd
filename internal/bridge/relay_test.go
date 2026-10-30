@@ -1282,6 +1282,47 @@ func TestRelay_StopIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRelay_Bound(t *testing.T) {
+	r, _, clock := testRelay(t)
+	wantBound := func(step string, wantPort int, wantAt time.Time) {
+		t.Helper()
+		port, at, ok := r.Bound()
+		if !ok || port != wantPort || !at.Equal(wantAt) {
+			t.Errorf("%s: Bound = (%d, %v, %v), want (%d, %v, true)", step, port, at, ok, wantPort, wantAt)
+		}
+	}
+
+	if port, at, ok := r.Bound(); ok {
+		t.Errorf("before the first Configure: Bound = (%d, %v, true), want ok false", port, at)
+	}
+
+	if err := r.Configure(51821, nil); err != nil {
+		t.Fatalf("Configure(51821): %v", err)
+	}
+	wantBound("Configure(51821)", 51821, relayStart)
+
+	clock.Add(7 * time.Second)
+	if err := r.Configure(51822, nil); err != nil {
+		t.Fatalf("Configure(51822): %v", err)
+	}
+	wantBound("Configure(51822) 7s later", 51822, relayStart.Add(7*time.Second))
+
+	// The clock moves on, but a call on the same port binds nothing.
+	clock.Add(3 * time.Second)
+	a := newWGPeer(t, "node-a", 0x10)
+	if err := r.Configure(51822, snapshotPeers(a)); err != nil {
+		t.Fatalf("Configure(51822, peers): %v", err)
+	}
+	wantBound("Configure(51822, peers)", 51822, relayStart.Add(7*time.Second))
+
+	if err := r.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if port, at, ok := r.Bound(); ok {
+		t.Errorf("after Stop: Bound = (%d, %v, true), want ok false", port, at)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // RelayReconcileHandler
 // ---------------------------------------------------------------------------
@@ -1300,7 +1341,7 @@ func TestRelayReconcileHandler_NilSnapshot(t *testing.T) {
 	if err := r.Configure(51821, nil); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
-	h := RelayReconcileHandler(r, discardLogger())
+	h := RelayReconcileHandler(r, NewRelayStatusTracker(), discardLogger())
 	if err := runHandler(t, h, nil); err != nil {
 		t.Fatalf("handler(nil) = %v, want nil", err)
 	}
@@ -1322,7 +1363,7 @@ func TestRelayReconcileHandler_DisabledStopsTheRelay(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			r, _, _ := testRelay(t)
 			logger, logs := newRelayLogger()
-			h := RelayReconcileHandler(r, logger)
+			h := RelayReconcileHandler(r, NewRelayStatusTracker(), logger)
 			if err := runHandler(t, h, relaySnapshot(&api.RelayConfig{Enabled: true, ListenPort: 51821})); err != nil {
 				t.Fatalf("enable: %v", err)
 			}
@@ -1353,7 +1394,7 @@ func TestRelayReconcileHandler_DisabledStopsTheRelay(t *testing.T) {
 
 func TestRelayReconcileHandler_NoLocalConsent(t *testing.T) {
 	logger, logs := newRelayLogger()
-	h := RelayReconcileHandler(nil, logger)
+	h := RelayReconcileHandler(nil, NewRelayStatusTracker(), logger)
 	if err := runHandler(t, h, relaySnapshot(&api.RelayConfig{Enabled: true, ListenPort: 51821})); err != nil {
 		t.Fatalf("handler = %v, want nil", err)
 	}
@@ -1371,7 +1412,7 @@ func TestRelayReconcileHandler_BindFailure(t *testing.T) {
 	r.listen = func(int) (relayConn, error) {
 		return nil, &net.OpError{Op: "listen", Net: "udp", Err: syscall.EADDRINUSE}
 	}
-	h := RelayReconcileHandler(r, discardLogger())
+	h := RelayReconcileHandler(r, NewRelayStatusTracker(), discardLogger())
 	err := runHandler(t, h, relaySnapshot(&api.RelayConfig{Enabled: true, ListenPort: 51821}))
 	if err == nil || !strings.HasPrefix(err.Error(), "bridge: relay: listen on :51821: ") {
 		t.Fatalf("handler = %v, want the listen error", err)
@@ -1388,10 +1429,158 @@ func TestRelayReconcileHandler_ConfiguresThePulledPeers(t *testing.T) {
 	r, _, _ := testRelay(t)
 	a := newWGPeer(t, "node-a", 0x10)
 	b := newWGPeer(t, "node-b", 0x20)
-	h := RelayReconcileHandler(r, discardLogger())
+	h := RelayReconcileHandler(r, NewRelayStatusTracker(), discardLogger())
 	block := &api.RelayConfig{Enabled: true, ListenPort: 51821}
 	if err := runHandler(t, h, relaySnapshot(block, snapshotPeers(a, b)...)); err != nil {
 		t.Fatalf("handler: %v", err)
 	}
 	handshake(t, r, a, b, 3, 2)
+}
+
+func TestRelayReconcileHandler_StatusPerBranch(t *testing.T) {
+	enabled := relaySnapshot(&api.RelayConfig{Enabled: true, ListenPort: 51821})
+	disabled := relaySnapshot(&api.RelayConfig{Enabled: false, ListenPort: 51821})
+	stopped := RelayStatus{State: api.RelayStateStopped}
+	tests := []struct {
+		name    string
+		noRelay bool
+		steps   []*api.NodeStateSnapshot
+		want    *RelayStatus // nil: no status set
+	}{
+		{name: "enabled", steps: []*api.NodeStateSnapshot{enabled}, want: &RelayStatus{State: api.RelayStateRunning, ListenPort: 51821, BoundAt: relayStart}},
+		{name: "enabled false after enabled", steps: []*api.NodeStateSnapshot{enabled, disabled}, want: &stopped},
+		{name: "relay null after enabled", steps: []*api.NodeStateSnapshot{enabled, relaySnapshot(nil)}, want: &stopped},
+		{name: "empty snapshot after enabled", steps: []*api.NodeStateSnapshot{enabled, {}}, want: &stopped},
+		{name: "nil snapshot", steps: []*api.NodeStateSnapshot{nil}},
+		{name: "nil relay, enabled", noRelay: true, steps: []*api.NodeStateSnapshot{enabled}, want: &RelayStatus{State: api.RelayStateNotConsented}},
+		{name: "nil relay, disabled", noRelay: true, steps: []*api.NodeStateSnapshot{disabled}, want: &stopped},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var relay *Relay
+			if !tt.noRelay {
+				relay, _, _ = testRelay(t)
+			}
+			status := NewRelayStatusTracker()
+			h := RelayReconcileHandler(relay, status, discardLogger())
+			for i, desired := range tt.steps {
+				if err := runHandler(t, h, desired); err != nil {
+					t.Fatalf("step %d: handler = %v, want nil", i+1, err)
+				}
+			}
+
+			if tt.want == nil {
+				if s, ok := status.Get(); ok {
+					t.Errorf("status = %+v, want none set", s)
+				}
+				if takeSignal(status) {
+					t.Error("Changed signalled with no status set")
+				}
+				return
+			}
+			wantRelayStatus(t, status, *tt.want)
+			if !takeSignal(status) {
+				t.Error("Changed not signalled")
+			}
+		})
+	}
+}
+
+func TestRelayReconcileHandler_StatusOnBindFailure(t *testing.T) {
+	failListen := func(int) (relayConn, error) {
+		return nil, &net.OpError{Op: "listen", Net: "udp", Err: syscall.EADDRINUSE}
+	}
+	tests := []struct {
+		name       string
+		runningOn  int // 0: the relay is not running before the failed bind
+		listenPort int
+	}{
+		{name: "from stopped", listenPort: 51821},
+		{name: "from running on another port", runningOn: 51821, listenPort: 51822},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _, _ := testRelay(t)
+			status := NewRelayStatusTracker()
+			h := RelayReconcileHandler(r, status, discardLogger())
+			if tt.runningOn != 0 {
+				if err := runHandler(t, h, relaySnapshot(&api.RelayConfig{Enabled: true, ListenPort: tt.runningOn})); err != nil {
+					t.Fatalf("enable %d: %v", tt.runningOn, err)
+				}
+			}
+
+			r.listen = failListen
+			err := runHandler(t, h, relaySnapshot(&api.RelayConfig{Enabled: true, ListenPort: tt.listenPort}))
+			if !errors.Is(err, syscall.EADDRINUSE) {
+				t.Fatalf("handler = %v, want the listen error", err)
+			}
+			wantRelayStatus(t, status, RelayStatus{State: api.RelayStateBindFailed, ListenPort: tt.listenPort})
+
+			if err := runHandler(t, h, relaySnapshot(&api.RelayConfig{Enabled: false, ListenPort: tt.listenPort})); err != nil {
+				t.Fatalf("disable: %v", err)
+			}
+			wantRelayStatus(t, status, RelayStatus{State: api.RelayStateStopped})
+		})
+	}
+}
+
+func TestRelayReconcileHandler_StatusOnOutOfRangePort(t *testing.T) {
+	t.Run("a running relay keeps reading running", func(t *testing.T) {
+		r, _, _ := testRelay(t)
+		status := NewRelayStatusTracker()
+		h := RelayReconcileHandler(r, status, discardLogger())
+		if err := runHandler(t, h, relaySnapshot(&api.RelayConfig{Enabled: true, ListenPort: 51821})); err != nil {
+			t.Fatalf("enable: %v", err)
+		}
+		takeSignal(status)
+
+		err := runHandler(t, h, relaySnapshot(&api.RelayConfig{Enabled: true, ListenPort: 70000}))
+		if err == nil || err.Error() != "bridge: relay: listen_port 70000 out of range" {
+			t.Fatalf("handler = %v, want the out-of-range error", err)
+		}
+		wantRelayStatus(t, status, RelayStatus{State: api.RelayStateRunning, ListenPort: 51821, BoundAt: relayStart})
+		if takeSignal(status) {
+			t.Error("Changed signalled for a status that did not change")
+		}
+	})
+
+	// Both ends of the range: the contract refuses bind_failed on a port
+	// outside 1..65535, so neither may be reported as one.
+	for _, port := range []int{0, 70000} {
+		t.Run(fmt.Sprintf("a relay that is not running reads stopped on port %d", port), func(t *testing.T) {
+			r, _, _ := testRelay(t)
+			status := NewRelayStatusTracker()
+			h := RelayReconcileHandler(r, status, discardLogger())
+
+			err := runHandler(t, h, relaySnapshot(&api.RelayConfig{Enabled: true, ListenPort: port}))
+			if want := fmt.Sprintf("bridge: relay: listen_port %d out of range", port); err == nil || err.Error() != want {
+				t.Fatalf("handler = %v, want %q", err, want)
+			}
+			wantRelayStatus(t, status, RelayStatus{State: api.RelayStateStopped})
+		})
+	}
+}
+
+func TestRelayReconcileHandler_PeerChangeSignalsNothing(t *testing.T) {
+	r, _, _ := testRelay(t)
+	a := newWGPeer(t, "node-a", 0x10)
+	b := newWGPeer(t, "node-b", 0x20)
+	status := NewRelayStatusTracker()
+	h := RelayReconcileHandler(r, status, discardLogger())
+	block := &api.RelayConfig{Enabled: true, ListenPort: 51821}
+
+	if err := runHandler(t, h, relaySnapshot(block, snapshotPeers(a, b)...)); err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if !takeSignal(status) {
+		t.Fatal("enabling the relay did not signal")
+	}
+
+	if err := runHandler(t, h, relaySnapshot(block, snapshotPeers(a)...)); err != nil {
+		t.Fatalf("handler with a changed peer set: %v", err)
+	}
+	if takeSignal(status) {
+		t.Error("a changed peer set signalled")
+	}
+	wantRelayStatus(t, status, RelayStatus{State: api.RelayStateRunning, ListenPort: 51821, BoundAt: relayStart})
 }
