@@ -115,14 +115,15 @@ func diffPeers(desired, current []api.SnapshotPeer, diff *StateDiff) {
 }
 
 // peerChanged reports whether a field the WireGuard handler programs from
-// differs. EndpointCandidates compare in order, because the order is the dial
-// order; slices.Equal treats nil and empty as equal, so a pull that drops the
-// field and one that carries [] read the same.
+// differs. FallbackEndpoints and EndpointCandidates compare in order, because
+// the order is the dial order; slices.Equal treats nil and empty as equal, so a
+// pull that drops a field and one that carries [] read the same.
 func peerChanged(desired, current api.SnapshotPeer) bool {
 	return desired.MeshIP != current.MeshIP ||
 		desired.PublicKey != current.PublicKey ||
 		desired.Endpoint != current.Endpoint ||
 		desired.FallbackEndpoint != current.FallbackEndpoint ||
+		!slices.Equal(desired.FallbackEndpoints, current.FallbackEndpoints) ||
 		!slices.Equal(desired.EndpointCandidates, current.EndpointCandidates)
 }
 

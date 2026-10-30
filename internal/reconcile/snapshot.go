@@ -64,6 +64,7 @@ func (s *stateSnapshot) Update(desired *api.NodeStateSnapshot) {
 func copyPeers(src []api.SnapshotPeer) []api.SnapshotPeer {
 	dst := slices.Clone(src)
 	for i := range dst {
+		dst[i].FallbackEndpoints = slices.Clone(src[i].FallbackEndpoints)
 		dst[i].EndpointCandidates = slices.Clone(src[i].EndpointCandidates)
 	}
 	return dst

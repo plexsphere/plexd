@@ -164,6 +164,50 @@ func TestComputeDiff_PeersUpdated(t *testing.T) {
 		}
 	})
 
+	t.Run("fallback_endpoints-only change is an update", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			from, to []string
+		}{
+			{"standby replaced", []string{"203.0.113.1:51820", "203.0.113.2:51820"}, []string{"203.0.113.1:51820", "203.0.113.3:51820"}},
+			{"standbys reordered", []string{"203.0.113.1:51820", "203.0.113.2:51820", "203.0.113.3:51820"}, []string{"203.0.113.1:51820", "203.0.113.3:51820", "203.0.113.2:51820"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				desired := &api.NodeStateSnapshot{
+					Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", FallbackEndpoint: tc.to[0], FallbackEndpoints: tc.to}},
+				}
+				current := &api.NodeStateSnapshot{
+					Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", FallbackEndpoint: tc.from[0], FallbackEndpoints: tc.from}},
+				}
+
+				diff := ComputeDiff(desired, current)
+
+				if len(diff.PeersToUpdate) != 1 {
+					t.Fatalf("PeersToUpdate = %d, want 1", len(diff.PeersToUpdate))
+				}
+				if got := diff.PeersToUpdate[0].FallbackEndpoints; !slices.Equal(got, tc.to) {
+					t.Errorf("updated FallbackEndpoints = %v, want %v", got, tc.to)
+				}
+				if len(diff.PeersToAdd) != 0 || len(diff.PeersToRemove) != 0 {
+					t.Errorf("add/remove = %d/%d, want 0/0", len(diff.PeersToAdd), len(diff.PeersToRemove))
+				}
+			})
+		}
+	})
+
+	t.Run("nil and empty fallback_endpoints are not an update", func(t *testing.T) {
+		desired := &api.NodeStateSnapshot{
+			Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", FallbackEndpoints: []string{}}},
+		}
+		current := &api.NodeStateSnapshot{
+			Peers: []api.SnapshotPeer{{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1"}},
+		}
+
+		if diff := ComputeDiff(desired, current); len(diff.PeersToUpdate) != 0 {
+			t.Errorf("nil vs empty fallback_endpoints should not update, got %d", len(diff.PeersToUpdate))
+		}
+	})
+
 	t.Run("identical peer is not an update", func(t *testing.T) {
 		peer := api.SnapshotPeer{NodeID: "p1", PublicKey: "pk1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820"}
 		desired := &api.NodeStateSnapshot{Peers: []api.SnapshotPeer{peer}}
