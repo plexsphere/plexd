@@ -81,7 +81,7 @@ print_counter_results() {
     done
 }
 
-# --- Diagnostics function (REQ-008) ---
+# --- Diagnostics function ---
 print_diagnostics() {
     echo "--- Diagnostics ---"
     echo "==> Pod status:"
@@ -148,7 +148,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- Pre-flight checks (REQ-009) ---
+# --- Pre-flight checks ---
 for cmd in kind kubectl docker curl jq; do
     if ! command -v "${cmd}" &>/dev/null; then
         echo "FAIL: required command '${cmd}' not found"
@@ -156,14 +156,14 @@ for cmd in kind kubectl docker curl jq; do
     fi
 done
 
-# --- Create kind cluster (REQ-001) ---
+# --- Create kind cluster ---
 echo "=== Deleting pre-existing kind cluster (if any) ==="
 kind delete cluster --name "${CLUSTER_NAME}" 2>/dev/null || true
 
 echo "=== Creating kind cluster '${CLUSTER_NAME}' ==="
 kind create cluster --name "${CLUSTER_NAME}" --wait 60s
 
-# --- Build and load images (REQ-002) ---
+# --- Build and load images ---
 echo "=== Building mock-api image ==="
 docker build -f "${MOCKAPI_DOCKERFILE}" -t mockapi:e2e "${REPO_ROOT}"
 
@@ -174,7 +174,7 @@ echo "=== Loading images into kind ==="
 kind load docker-image mockapi:e2e --name "${CLUSTER_NAME}"
 kind load docker-image plexd:e2e --name "${CLUSTER_NAME}"
 
-# --- Apply manifests (REQ-003, REQ-004) ---
+# --- Apply manifests ---
 echo "=== Creating namespace '${NAMESPACE}' ==="
 kubectl create namespace "${NAMESPACE}"
 
@@ -231,7 +231,7 @@ echo "=== Creating bootstrap secret ==="
 kubectl -n "${NAMESPACE}" create secret generic plexd-bootstrap \
     --from-literal=token=psb_test_e2eproject_node_e2ee2ee2ee2ee2ee2ee2e22
 
-echo "=== Creating plexd E2E configmap (REQ-004) ==="
+echo "=== Creating plexd E2E configmap ==="
 kubectl -n "${NAMESPACE}" create configmap plexd-config \
     --from-literal=config.yaml="$(cat <<'CONFIGEOF'
 api:
@@ -300,7 +300,7 @@ sed "s/namespace: plexd-system/namespace: ${NAMESPACE}/" "${DAEMONSET_DIR}/daemo
     | sed 's/imagePullPolicy: Always/imagePullPolicy: Never/' \
     | kubectl apply -f -
 
-# --- Wait for readiness (REQ-005) ---
+# --- Wait for readiness ---
 echo "=== Waiting for mock-api to be ready ==="
 kubectl -n "${NAMESPACE}" rollout status deployment/mock-api --timeout=60s
 
@@ -311,7 +311,7 @@ if ! kubectl -n "${NAMESPACE}" rollout status daemonset/plexd --timeout="${TIMEO
     exit 1
 fi
 
-# --- Port-forward and assertions (REQ-006, REQ-007) ---
+# --- Port-forward and assertions ---
 echo "=== Starting port-forward to mock-api ==="
 kubectl -n "${NAMESPACE}" port-forward svc/mock-api 18080:8080 &
 PF_PID=$!

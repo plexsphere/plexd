@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# Ubuntu-based systemd container for E2E testing (REQ-001).
+# Ubuntu-based systemd container for E2E testing.
 # Runs systemd as PID 1 so that plexd can be installed and managed
 # as a real systemd service, validating the full install-enable-start
 # lifecycle.

@@ -270,7 +270,7 @@ func (s *SSEStream) Connect(ctx context.Context, nodeID string) error {
 		s.onConnected()
 	}
 
-	// Wrap body with idle timeout enforcement (REQ-011).
+	// Wrap body with idle timeout enforcement.
 	// If no data arrives within idleTimeout, the reader returns an error
 	// which breaks out of the parse loop and triggers reconnection.
 	idleReader := newIdleTimeoutReader(resp.Body, s.idleTimeout)

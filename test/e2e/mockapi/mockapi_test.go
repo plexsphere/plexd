@@ -428,7 +428,7 @@ func TestHealth_WrongMethod_Returns405(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-002: POST /v1/register (Task 2.2)
+// POST /v1/register
 // ---------------------------------------------------------------------------
 
 func TestRegister_ReturnsFixtureAndCounterViaHTTP(t *testing.T) {
@@ -701,7 +701,7 @@ func TestRegister_WrongMethod_Returns405(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-003: POST /v1/nodes/{id}/heartbeat (Task 2.3)
+// POST /v1/nodes/{id}/heartbeat
 // ---------------------------------------------------------------------------
 
 func TestHeartbeat_ReturnsReconcileTrueAndCounterIncrements(t *testing.T) {
@@ -856,7 +856,7 @@ func TestHeartbeat_DenialTaxonomy(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-004: GET /v1/nodes/{id}/state (Task 2.4)
+// GET /v1/nodes/{id}/state
 // ---------------------------------------------------------------------------
 
 // policyFingerprint mirrors the mock's MOCK-INTERNAL canonicalization so the
@@ -965,7 +965,7 @@ func TestState_ReturnsPeersAndPolicy(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-006: GET /v1/nodes/{id}/events (Task 2.6)
+// GET /v1/nodes/{id}/events
 // ---------------------------------------------------------------------------
 
 func TestEvents_SSEStream(t *testing.T) {
@@ -1614,7 +1614,7 @@ func TestEvents_RequestCountIncrements(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-007: GET /test/assertions (Task 2.7)
+// GET /test/assertions
 // ---------------------------------------------------------------------------
 
 func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
@@ -1765,7 +1765,7 @@ func TestAssertions_InitialZero(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-008: Concurrent counters (Task 2.8)
+// Concurrent counters
 // ---------------------------------------------------------------------------
 
 func TestConcurrentCounters(t *testing.T) {
@@ -6531,7 +6531,7 @@ func TestHandler_NotNil(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SSE broadcast / inject-event (Task 1.1)
+// SSE broadcast / inject-event
 // ---------------------------------------------------------------------------
 
 func TestInjectEvent_DeliversToConnectedClient(t *testing.T) {
@@ -6635,7 +6635,7 @@ func TestInjectEvent_InvalidBody_Returns400(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// State enriched fixture tests (Task 1.3)
+// State enriched fixture tests
 // ---------------------------------------------------------------------------
 
 func getState(t *testing.T, baseURL string) api.NodeStateSnapshot {
@@ -6907,7 +6907,7 @@ func TestBroadcastSSE_Programmatic(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SetState / GetState (Task 1.2)
+// SetState / GetState
 // ---------------------------------------------------------------------------
 
 func TestSetState_UpdatesSnapshot(t *testing.T) {
@@ -7150,7 +7150,7 @@ func TestSetState_WrongMethod_Returns405(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /test/configure-state (REQ-003)
+// POST /test/configure-state
 // ---------------------------------------------------------------------------
 
 func TestConfigureState_ReplacesActiveFixture(t *testing.T) {
@@ -7325,7 +7325,7 @@ func TestSetState_PutCapturesRequestBody(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Concurrency: inject-event + configure-state (Task 3.5, REQ-009)
+// Concurrency: inject-event + configure-state
 // ---------------------------------------------------------------------------
 
 func TestConcurrent_InjectEventAndConfigureState(t *testing.T) {

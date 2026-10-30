@@ -71,19 +71,19 @@ These construct a `mockSecretFetcher` with a pre-sealed `api.SecretEnvelope` tha
 
 ## Test Coverage Matrix
 
-| Scenario | Metrics | LogFwd | AuditFwd | Requirements |
-|----------|---------|--------|----------|--------------|
-| Dual delivery happy path (full run loop) | `TestIntegration_DualDelivery_BothReceiveSameBatch` | `TestIntegration_DualDelivery_BothReceiveSameLogBatch` | `TestIntegration_DualDelivery_BothReceiveSameAuditBatch` | REQ-001, REQ-003, REQ-008 |
-| Credential resolution (bearer token in header) | `TestIntegration_DualDelivery_CredentialResolution` | `TestIntegration_DualDelivery_CredentialResolution` | `TestIntegration_DualDelivery_CredentialResolution` | REQ-005, REQ-008 |
-| Platform-only when URL empty | `TestIntegration_PlatformOnly_WhenURLEmpty` | — | — | REQ-002 |
-| Conditional wiring pattern | `TestIntegration_ConditionalWiring_Pattern` | — | — | REQ-002 |
-| Local endpoint returns HTTP 500 | `TestIntegration_LocalDown_PlatformUnaffected` | — | — | REQ-004, REQ-009 |
-| Local HTTP 500 with full run loop | `TestIntegration_LocalHTTP500_PlatformUnaffected` | `TestIntegration_LocalDown_PlatformReceivesLogs` | `TestIntegration_LocalDown_PlatformReceivesAudit` | REQ-004, REQ-009 |
-| Credential failure, platform unaffected | `TestIntegration_CredentialFailure_PlatformStillReceives` | `TestIntegration_CredentialFailure_LogFwd` | `TestIntegration_CredentialFailure_AuditFwd` | REQ-005, REQ-009 |
-| TLS skip-verify succeeds (self-signed) | `TestIntegration_TLSSkipVerify_SelfSignedSucceeds` | `TestIntegration_TLSSkipVerify_LogFwd` | `TestIntegration_TLSSkipVerify_AuditFwd` | REQ-006, REQ-010 |
-| TLS strict verify rejects self-signed | `TestIntegration_TLSStrictVerify_SelfSignedFails` | `TestIntegration_TLSStrictVerify_LogFwd` | `TestIntegration_TLSStrictVerify_AuditFwd` | REQ-006, REQ-010 |
+| Scenario | Metrics | LogFwd | AuditFwd |
+|----------|---------|--------|----------|
+| Dual delivery happy path (full run loop) | `TestIntegration_DualDelivery_BothReceiveSameBatch` | `TestIntegration_DualDelivery_BothReceiveSameLogBatch` | `TestIntegration_DualDelivery_BothReceiveSameAuditBatch` |
+| Credential resolution (bearer token in header) | `TestIntegration_DualDelivery_CredentialResolution` | `TestIntegration_DualDelivery_CredentialResolution` | `TestIntegration_DualDelivery_CredentialResolution` |
+| Platform-only when URL empty | `TestIntegration_PlatformOnly_WhenURLEmpty` | — | — |
+| Conditional wiring pattern | `TestIntegration_ConditionalWiring_Pattern` | — | — |
+| Local endpoint returns HTTP 500 | `TestIntegration_LocalDown_PlatformUnaffected` | — | — |
+| Local HTTP 500 with full run loop | `TestIntegration_LocalHTTP500_PlatformUnaffected` | `TestIntegration_LocalDown_PlatformReceivesLogs` | `TestIntegration_LocalDown_PlatformReceivesAudit` |
+| Credential failure, platform unaffected | `TestIntegration_CredentialFailure_PlatformStillReceives` | `TestIntegration_CredentialFailure_LogFwd` | `TestIntegration_CredentialFailure_AuditFwd` |
+| TLS skip-verify succeeds (self-signed) | `TestIntegration_TLSSkipVerify_SelfSignedSucceeds` | `TestIntegration_TLSSkipVerify_LogFwd` | `TestIntegration_TLSSkipVerify_AuditFwd` |
+| TLS strict verify rejects self-signed | `TestIntegration_TLSStrictVerify_SelfSignedFails` | `TestIntegration_TLSStrictVerify_LogFwd` | `TestIntegration_TLSStrictVerify_AuditFwd` |
 
-The metrics pipeline carries extra coverage for platform-only wiring (REQ-002) and the conditional wiring pattern from `up.go` since the pattern is identical across all three pipelines.
+The metrics pipeline carries extra coverage for platform-only wiring and the conditional wiring pattern from `up.go` since the pattern is identical across all three pipelines.
 
 ## Test Patterns
 

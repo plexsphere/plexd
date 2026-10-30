@@ -856,7 +856,7 @@ func (e *Executor) buildHookEnv(nodeID, executionID string, params map[string]st
 }
 
 // limitedWriter is an io.Writer that discards bytes beyond a maximum limit,
-// preventing unbounded memory allocation during command execution (REQ-003).
+// preventing unbounded memory allocation during command execution.
 type limitedWriter struct {
 	buf []byte
 	max int64

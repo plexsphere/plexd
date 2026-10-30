@@ -97,7 +97,7 @@ func newLogTestFetcher(token string) *mockSecretFetcher {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-001, REQ-003, REQ-005, REQ-008: Dual delivery happy path
+// Dual delivery happy path
 // ---------------------------------------------------------------------------
 
 func TestIntegration_DualDelivery_BothReceiveSameLogBatch(t *testing.T) {
@@ -215,7 +215,7 @@ func TestIntegration_DualDelivery_CredentialResolution(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-004, REQ-009: Error isolation
+// Error isolation
 // ---------------------------------------------------------------------------
 
 func TestIntegration_LocalDown_PlatformReceivesLogs(t *testing.T) {
@@ -280,7 +280,7 @@ func TestIntegration_CredentialFailure_LogFwd(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-006, REQ-010: TLS skip-verify
+// TLS skip-verify
 // ---------------------------------------------------------------------------
 
 func TestIntegration_TLSSkipVerify_LogFwd(t *testing.T) {

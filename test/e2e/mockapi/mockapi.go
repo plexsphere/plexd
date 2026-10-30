@@ -702,7 +702,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRegister handles POST /v1/register (REQ-002). It enforces the full
+// handleRegister handles POST /v1/register. It enforces the full
 // registration contract from issue #18: success is 201, and every denial is an
 // RFC 9457 application/problem+json body mirroring the platform taxonomy. The
 // bootstrap token is consumed (its nonce recorded) only on the 201 branch.
@@ -854,7 +854,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, resp)
 }
 
-// handleHeartbeat handles POST /v1/nodes/{id}/heartbeat (REQ-003). It enforces
+// handleHeartbeat handles POST /v1/nodes/{id}/heartbeat. It enforces
 // the v1 heartbeat contract: strict decoding, a required nat_summary object,
 // clock-skew tolerance, and checksum/version shape. The counter increments only
 // when every check passes, so invalid requests do not count.
@@ -919,7 +919,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleState handles GET /v1/nodes/{id}/state (REQ-004). The executions block
+// handleState handles GET /v1/nodes/{id}/state. The executions block
 // is served through projectExecutions, so every pull reports the live callback
 // status of each entry still awaiting delivery. The sessions block is served
 // through projectSessions, so every pull redelivers the sessions that are still
@@ -988,7 +988,7 @@ func (s *Server) projectSessions(configured []api.NodeStateSession) []api.NodeSt
 	return served
 }
 
-// handleEvents handles GET /v1/nodes/{id}/events (REQ-006), the pull-only signed
+// handleEvents handles GET /v1/nodes/{id}/events, the pull-only signed
 // event stream. It tails from now unless a Last-Event-ID cursor asks to replay
 // the buffered envelopes with a higher sequence, keeps the stream live until the
 // client disconnects, and honours the descope contract: when descoped it answers
@@ -1106,7 +1106,7 @@ func writeSSEEvent(w io.Writer, ev storedEvent) {
 	fmt.Fprint(w, "\n")
 }
 
-// handleAssertions handles GET /test/assertions (REQ-007).
+// handleAssertions handles GET /test/assertions.
 func (s *Server) handleAssertions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.Assertions())
 }
