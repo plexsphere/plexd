@@ -859,6 +859,62 @@ type HandshakeReportResponse struct {
 }
 
 // ---------------------------------------------------------------------------
+// Relay Status  PUT /v1/nodes/{node_id}/relay-status
+// ---------------------------------------------------------------------------
+
+// Relay states of a RelayStatusRequest.
+const (
+	// RelayStateRunning marks a relay whose socket is bound on ListenPort.
+	RelayStateRunning = "running"
+	// RelayStateStopped marks a relay that does not run: the pull does not
+	// enable it, names a listen_port outside 1..65535, or plexd stops it
+	// because it shuts down.
+	RelayStateStopped = "stopped"
+	// RelayStateBindFailed marks a relay whose socket could not be bound on
+	// ListenPort.
+	RelayStateBindFailed = "bind_failed"
+	// RelayStateNotConsented marks a relay the pull enables while
+	// bridge.relay_enabled does not consent to it.
+	RelayStateNotConsented = "not_consented"
+)
+
+// MaxRelayStatusBoundSeconds is the contract's ceiling on bound_seconds.
+const MaxRelayStatusBoundSeconds = 315360000
+
+// RelayStatusRequest is the body of PUT /v1/nodes/{node_id}/relay-status: the
+// state of the bridge's relay as the node reports it. ListenPort accompanies
+// running and bind_failed, BoundSeconds only running. A member the state
+// requires or forbids is refused with 400 invalid_relay_status, and an
+// out-of-range value or a null member with 400 malformed_relay_status. The
+// handler decodes with DisallowUnknownFields, so the struct carries the
+// contract's fields and nothing else.
+//
+// The control plane anchors BoundSeconds on its own receive time, so a body is
+// only true for the attempt it was assembled for, and the agent builds a fresh
+// one for every attempt.
+type RelayStatusRequest struct {
+	// State is one of the RelayState* constants.
+	State string `json:"state"`
+	// ListenPort is the relay's UDP port, in 1..65535. It stays a plain int:
+	// 0 is never a valid port, and the two states that forbid the member leave
+	// it 0, so omitempty drops it exactly where it must be absent.
+	ListenPort int `json:"listen_port,omitempty"`
+	// BoundSeconds is the whole seconds since the relay socket was bound, in
+	// 0..MaxRelayStatusBoundSeconds. It is a pointer because 0 is a valid
+	// value, for a socket bound less than a second ago: a plain int64 with
+	// omitempty would drop it, and the control plane would refuse the running
+	// report with 400 invalid_relay_status. nil omits the member, as every
+	// state but running requires.
+	BoundSeconds *int64 `json:"bound_seconds,omitempty"`
+}
+
+// RelayStatusResponse is the 200 body of PUT /v1/nodes/{node_id}/relay-status.
+type RelayStatusResponse struct {
+	// AcceptedAt is the server receive time BoundSeconds was anchored on.
+	AcceptedAt time.Time `json:"accepted_at"`
+}
+
+// ---------------------------------------------------------------------------
 // Key Rotation  POST /v1/keys/rotate
 // ---------------------------------------------------------------------------
 

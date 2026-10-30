@@ -226,6 +226,22 @@ func (c *ControlPlane) ReportHandshakes(ctx context.Context, nodeID string, req 
 	return &resp, nil
 }
 
+// ReportRelayStatus reports the state of the bridge's relay and returns the
+// control plane's receipt.
+//
+// It validates nothing and sends the request as passed: the agent's request
+// builder produces only the shapes the contract admits, and the control plane
+// refuses any other with 400 invalid_relay_status or malformed_relay_status.
+// PUT /v1/nodes/{node_id}/relay-status
+func (c *ControlPlane) ReportRelayStatus(ctx context.Context, nodeID string, req RelayStatusRequest) (*RelayStatusResponse, error) {
+	var resp RelayStatusResponse
+	path := fmt.Sprintf("/v1/nodes/%s/relay-status", url.PathEscape(nodeID))
+	if err := c.doRequest(ctx, http.MethodPut, path, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // FetchState retrieves the desired-state snapshot for a node.
 // GET /v1/nodes/{node_id}/state
 func (c *ControlPlane) FetchState(ctx context.Context, nodeID string) (*NodeStateSnapshot, error) {

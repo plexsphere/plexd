@@ -1022,6 +1022,231 @@ func TestReportEndpointCandidates_PathParametersEscaped(t *testing.T) {
 	}
 }
 
+// testRelayStatusAccepted is a 200 body of PUT /v1/nodes/{node_id}/relay-status.
+const testRelayStatusAccepted = `{"accepted_at":"2026-10-30T10:15:30.123Z"}`
+
+func TestReportRelayStatus_Success(t *testing.T) {
+	var gotMethod, gotPath, gotContentType, gotAuth string
+	var gotBody []byte
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotContentType = r.Header.Get("Content-Type")
+		gotAuth = r.Header.Get("Authorization")
+		var err error
+		if gotBody, err = io.ReadAll(r.Body); err != nil {
+			t.Errorf("read request: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, testRelayStatusAccepted)
+	})
+
+	boundSeconds := int64(30)
+	resp, err := client.ReportRelayStatus(context.Background(), "node-1", RelayStatusRequest{
+		State:        RelayStateRunning,
+		ListenPort:   51821,
+		BoundSeconds: &boundSeconds,
+	})
+	if err != nil {
+		t.Fatalf("ReportRelayStatus: %v", err)
+	}
+
+	if gotMethod != http.MethodPut {
+		t.Errorf("method = %s, want PUT", gotMethod)
+	}
+	if gotPath != "/v1/nodes/node-1/relay-status" {
+		t.Errorf("path = %s, want /v1/nodes/node-1/relay-status", gotPath)
+	}
+	if gotContentType != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", gotContentType, "application/json")
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer test-token")
+	}
+
+	const wantBody = `{"state":"running","listen_port":51821,"bound_seconds":30}`
+	if got := strings.TrimSpace(string(gotBody)); got != wantBody {
+		t.Errorf("request body =\n  %s\nwant\n  %s", got, wantBody)
+	}
+
+	wantAcceptedAt := time.Date(2026, 10, 30, 10, 15, 30, 123_000_000, time.UTC)
+	if !resp.AcceptedAt.Equal(wantAcceptedAt) {
+		t.Errorf("AcceptedAt = %v, want %v", resp.AcceptedAt, wantAcceptedAt)
+	}
+}
+
+// A socket bound less than a second ago has been bound for 0 seconds. The
+// contract requires bound_seconds for running, so the 0 must reach the wire
+// rather than be dropped as a zero value and refused as missing.
+func TestReportRelayStatus_ZeroBoundSeconds(t *testing.T) {
+	var body []byte
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		if body, err = io.ReadAll(r.Body); err != nil {
+			t.Errorf("read request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, testRelayStatusAccepted)
+	})
+
+	boundSeconds := int64(0)
+	if _, err := client.ReportRelayStatus(context.Background(), "node-1", RelayStatusRequest{
+		State:        RelayStateRunning,
+		ListenPort:   51821,
+		BoundSeconds: &boundSeconds,
+	}); err != nil {
+		t.Fatalf("ReportRelayStatus: %v", err)
+	}
+
+	const want = `{"state":"running","listen_port":51821,"bound_seconds":0}`
+	if got := strings.TrimSpace(string(body)); got != want {
+		t.Errorf("request body =\n  %s\nwant\n  %s", got, want)
+	}
+}
+
+// The contract refuses a member a state forbids with 400 invalid_relay_status,
+// so a state that leaves ListenPort 0 and BoundSeconds nil must send neither.
+func TestReportRelayStatus_MembersPerState(t *testing.T) {
+	tests := []struct {
+		name string
+		req  RelayStatusRequest
+		want string
+	}{
+		{"stopped", RelayStatusRequest{State: RelayStateStopped}, `{"state":"stopped"}`},
+		{"not_consented", RelayStatusRequest{State: RelayStateNotConsented}, `{"state":"not_consented"}`},
+		{"bind_failed", RelayStatusRequest{State: RelayStateBindFailed, ListenPort: 51821}, `{"state":"bind_failed","listen_port":51821}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body []byte
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				var err error
+				if body, err = io.ReadAll(r.Body); err != nil {
+					t.Errorf("read request: %v", err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, testRelayStatusAccepted)
+			})
+
+			if _, err := client.ReportRelayStatus(context.Background(), "node-1", tt.req); err != nil {
+				t.Fatalf("ReportRelayStatus: %v", err)
+			}
+			if got := strings.TrimSpace(string(body)); got != tt.want {
+				t.Errorf("request body =\n  %s\nwant\n  %s", got, tt.want)
+			}
+		})
+	}
+}
+
+// A refusal must survive the client's error mapping in the shape the reporter
+// reads: the problem code of a 400, and the bare 404 an older router writes
+// with no body, which IsRelayStatusNotServed takes for a missing surface.
+func TestReportRelayStatus_ErrorAnswers(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		contentType   string
+		body          string
+		wantCode      string
+		wantNotServed bool
+	}{
+		{"400 invalid_relay_status", http.StatusBadRequest,
+			"application/problem+json", `{"title":"Bad Request","status":400,"detail":"bound_seconds is required when state is running.","code":"invalid_relay_status"}`,
+			"invalid_relay_status", false},
+		{"404 with an empty body", http.StatusNotFound,
+			"", "",
+			"", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if tt.contentType != "" {
+					w.Header().Set("Content-Type", tt.contentType)
+				}
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			})
+
+			resp, err := client.ReportRelayStatus(context.Background(), "node-1", RelayStatusRequest{State: RelayStateRunning, ListenPort: 51821})
+			if resp != nil {
+				t.Errorf("response = %+v, want nil", resp)
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("errors.As failed to extract *APIError: %v", err)
+			}
+			if apiErr.StatusCode != tt.status {
+				t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, tt.status)
+			}
+			if apiErr.Code != tt.wantCode {
+				t.Errorf("Code = %q, want %q", apiErr.Code, tt.wantCode)
+			}
+			if got := IsRelayStatusNotServed(err); got != tt.wantNotServed {
+				t.Errorf("IsRelayStatusNotServed(%v) = %v, want %v", err, got, tt.wantNotServed)
+			}
+		})
+	}
+}
+
+// The reporter's context ends at shutdown, possibly while a report waits on
+// a slow control plane. The call must end with it and say why.
+func TestReportRelayStatus_ContextCanceled(t *testing.T) {
+	entered := make(chan struct{})
+	var once sync.Once
+	client, _ := newEndpointTestClient(t, func(_ http.ResponseWriter, r *http.Request) {
+		// The server watches the connection for the client hanging up only
+		// once the request body is read, so the handler reads it before it
+		// waits. Otherwise its context would never end and the server's
+		// Close would wait on it forever.
+		_, _ = io.Copy(io.Discard, r.Body)
+		once.Do(func() { close(entered) })
+		<-r.Context().Done()
+	})
+	ctx, cancel := context.WithCancel(backstopContext(t))
+	defer cancel()
+	go func() {
+		select {
+		case <-entered:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	resp, err := client.ReportRelayStatus(ctx, "node-1", RelayStatusRequest{State: RelayStateStopped})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want %v", err, context.Canceled)
+	}
+	if resp != nil {
+		t.Errorf("response = %+v, want nil", resp)
+	}
+}
+
+func TestReportRelayStatus_PathParametersEscaped(t *testing.T) {
+	// Verify the nodeID is escaped, so it cannot climb out of its segment.
+	var gotPath string
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RawPath
+		if gotPath == "" {
+			gotPath = r.URL.Path
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, testRelayStatusAccepted)
+	})
+
+	_, err := client.ReportRelayStatus(context.Background(), "../../../etc/passwd", RelayStatusRequest{State: RelayStateStopped})
+	if err != nil {
+		t.Fatalf("ReportRelayStatus: %v", err)
+	}
+
+	const want = "/v1/nodes/..%2F..%2F..%2Fetc%2Fpasswd/relay-status"
+	if gotPath != want {
+		t.Errorf("path = %s, want %s", gotPath, want)
+	}
+}
+
 func TestFetchSecret_Success(t *testing.T) {
 	envelope := []byte("\x00\x01\x02nonce+ciphertext+tag-bytes")
 	var gotQuery string
