@@ -198,11 +198,11 @@ func (r *HandshakeReporter) logSendError(ctx context.Context, err error) {
 // so sending it would take every edge in the report down with it.
 //
 // The endpoint is unmapped and its zone stripped before it is rendered. An
-// IPv4-mapped IPv6 address would never match the plain IPv4 fallback endpoint
-// the control plane compares against to tell a direct link from a relayed one,
-// and a zoned one is refused for the whole report. Stripping the zone is
-// preferred over leaving the peer out, which would make a working link-local
-// edge read never_reported.
+// IPv4-mapped IPv6 address would never match any of the peer's plain IPv4
+// relays the control plane compares against to tell a direct link from a
+// relayed one, and a zoned one is refused for the whole report. Stripping the
+// zone is preferred over leaving the peer out, which would make a working
+// link-local edge read never_reported.
 //
 // The age is observedAt minus the handshake, floored to whole seconds, clamped
 // to 0 when the handshake postdates observedAt (a wall clock stepped back) and

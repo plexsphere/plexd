@@ -211,7 +211,7 @@ Each tick runs these steps in order:
 | `LastHandshake` is zero | Left out without a count: the contract omits a peer with no handshake |
 | `NodeID` is not a UUID, or is `00000000-0000-0000-0000-000000000000` | Left out and counted in `skipped`: one such ID gets the whole report refused with `400 malformed_handshake_report` |
 | Endpoint is invalid, has port 0, or an unspecified address | Left out and counted in `skipped` |
-| Endpoint is an IPv4-mapped IPv6 address (`[::ffff:198.51.100.7]:51820`) | Unmapped to `198.51.100.7:51820`; otherwise the control plane's `mode: relayed` comparison against the plain-IPv4 fallback endpoint never matches |
+| Endpoint is an IPv4-mapped IPv6 address (`[::ffff:198.51.100.7]:51820`) | Unmapped to `198.51.100.7:51820`; otherwise the control plane's `mode: relayed` comparison against each of the peer's plain-IPv4 relays never matches |
 | Endpoint carries an IPv6 zone (`[fe80::1%eth0]:51820`) | Zone stripped to `[fe80::1]:51820`. The control plane refuses a zoned endpoint with `400 handshake_endpoint_unparseable` for the whole report, and leaving the peer out instead would make a working link-local edge read `never_reported` |
 | `NodeID` appears twice | The entry with the smaller age is kept |
 
