@@ -117,7 +117,7 @@ Periodic heartbeat reporting to the control plane.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `interval` | duration | `30s` | Heartbeat send interval. It also paces the [handshake report](heartbeat-service.md#handshake-reporter) (`POST /v1/nodes/{node_id}/handshakes`). Keep it at or below the Domain's reachability heartbeat interval: the control plane floors its edge thresholds at 180s plus the Domain's interval, so a longer local interval makes mesh edges read `stale` between reports. |
+| `interval` | duration | `30s` | Heartbeat send interval. It also paces the [handshake report](heartbeat-service.md#handshake-reporter) (`POST /v1/nodes/{node_id}/handshakes`) and, on a bridge, the [relay status report](../bridge/nat-relay.md#relay-status-report) (`PUT /v1/nodes/{node_id}/relay-status`), which the control plane counts as absent when it is not repeated within three of the Domain's heartbeat intervals. Keep it at or below the Domain's reachability heartbeat interval: the control plane floors its edge thresholds at 180s plus the Domain's interval, so a longer local interval makes mesh edges read `stale` between reports. |
 
 > `node_id` is set at runtime from the registration identity. It does not appear in the YAML.
 

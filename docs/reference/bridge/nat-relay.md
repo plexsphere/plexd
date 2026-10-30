@@ -74,6 +74,7 @@ func NewRelay(logger *slog.Logger) *Relay // opens no socket
 func (r *Relay) Configure(listenPort int, peers []api.SnapshotPeer) error
 func (r *Relay) Stop() error // idempotent
 func (r *Relay) Running() bool
+func (r *Relay) Bound() (port int, at time.Time, ok bool)
 func (r *Relay) ActiveCount() int
 func (r *Relay) ListenAddr() net.Addr
 ```
@@ -83,6 +84,7 @@ func (r *Relay) ListenAddr() net.Addr
 | `Configure`   | Binds `listenPort` when needed and replaces the peer set with `peers`; see [Configure](#configure) |
 | `Stop`        | Closes the socket and clears all state; see [Stop](#stop) |
 | `Running`     | Whether a socket is bound |
+| `Bound`       | The port the socket is bound on and when `Configure` bound it; `ok` is false while the relay is not running. A call that only changes the peers keeps both, and a new port rebinds with a new instant. The [relay status report](#relay-status-report) reads it |
 | `ActiveCount` | The number of distinct unordered peer pairs among session indices used within the last 180 s (`relayIndexTTL`) |
 | `ListenAddr`  | The local address of the bound socket; nil while the relay is not running |
 
@@ -126,17 +128,19 @@ dispatcher.Register(api.EventBridgeConfigUpdated,
 ## RelayReconcileHandler
 
 ```go
-func RelayReconcileHandler(relay *Relay, logger *slog.Logger) reconcile.ReconcileHandler
+func RelayReconcileHandler(relay *Relay, status *RelayStatusTracker, logger *slog.Logger) reconcile.ReconcileHandler
 ```
 
-Returns a `reconcile.ReconcileHandler` that runs the relay the pull's `bridge.relay` block asks for. `relay` is nil when local consent, `bridge.relay_enabled`, is off.
+Returns a `reconcile.ReconcileHandler` that runs the relay the pull's `bridge.relay` block asks for. `relay` is nil when local consent, `bridge.relay_enabled`, is off. `status` must not be nil: the handler records in it the state each branch leaves behind, which the [relay status report](#relay-status-report) sends to the control plane.
 
-| Desired snapshot | What the handler does |
-|------------------|-----------------------|
-| `nil` | Returns nil |
-| `bridge` is `null`, `bridge.relay` is `null`, or `enabled` is `false` | Stops the relay and returns nil. Logs `relay disabled by the control plane` at Info when a relay was running, so a second such snapshot logs nothing |
-| `enabled: true`, `relay` is nil | Logs the Warn `relay: the control plane enables the relay, but bridge.relay_enabled is false` with `listen_port`, and returns nil |
-| `enabled: true`, `relay` is set | Returns `relay.Configure(listen_port, peers)`, with the `peers` of the same snapshot |
+| Desired snapshot | What the handler does | Status it sets |
+|------------------|-----------------------|----------------|
+| `nil` | Returns nil | None |
+| `bridge` is `null`, `bridge.relay` is `null`, or `enabled` is `false` | Stops the relay and returns nil. Logs `relay disabled by the control plane` at Info when a relay was running, so a second such snapshot logs nothing | `stopped`, also when `relay` is nil or not running, so a relay whose last bind failed reads `stopped` once the pull disables it |
+| `enabled: true`, `relay` is nil | Logs the Warn `relay: the control plane enables the relay, but bridge.relay_enabled is false` with `listen_port`, and returns nil | `not_consented` |
+| `enabled: true`, `relay` is set | Returns `relay.Configure(listen_port, peers)`, with the `peers` of the same snapshot | From `relay.Bound()`: `running` on its port and bind instant when the relay runs; otherwise `bind_failed` on `listen_port` when `Configure` failed and `listen_port` is in 1..65535; otherwise `stopped` |
+
+The last row covers three cases. A bind failure leaves the relay stopped, since `Configure` stops a relay on another port before it binds, so the relay reads `bind_failed` on the pulled port. An out-of-range `listen_port` fails before anything changes: a relay running on its old port keeps reading `running` on that port, and one that was not running reads `stopped`, because the contract refuses `bind_failed` without a valid port. The handler returns `Configure`'s error in every case.
 
 A `Configure` error, such as a bind failure, fails the reconcile cycle. The reconciler then holds its snapshot back, so the next pull sees the same drift and calls the handler again (see [Reconciliation Cycle](../core/reconciliation.md#reconciliation-cycle)).
 
@@ -144,14 +148,17 @@ Reconcile handlers run only on a cycle with drift. The differ compares the bridg
 
 ### Registration
 
-`plexd up` registers the handler whenever bridge mode runs, passing `bridgeMgr.Relay()`, which is nil without local consent:
+`plexd up` registers the handler whenever bridge mode runs, passing `bridgeMgr.Relay()`, which is nil without local consent, and `bridgeMgr.RelayStatusTracker()`. It also starts the [relay status reporter](#reporter) on the same tracker, at `heartbeat.interval`:
 
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
+r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
+
+reporter := bridge.NewRelayStatusReporter(statusInterval, nodeID, client, bridgeMgr.RelayStatusTracker(), logger)
+go reporter.Run(ctx)
 ```
 
-No relay goroutine starts at startup. The relay starts on the first reconcile cycle whose pull enables it, and stops when a pull disables it or the bridge tears down.
+The relay opens no socket at startup. It starts on the first reconcile cycle whose pull enables it, and stops when a pull disables it or the bridge tears down. The reporter starts with bridge mode and sends nothing until the handler first ran.
 
 ## Forwarding
 
@@ -254,6 +261,98 @@ See [Relay liveness probe](../networking/wireguard.md#relay-liveness-probe) for 
 
 Versions mix: a node on an older plexd dials the relay with the old 30 s trial and holds a relayed peer until its handshake is 180 s old, and the relay serves it like any other peer. The probe is answered by the peer's WireGuard, not by its plexd, so it works against a node on any version. A bridge on an older plexd relays nothing.
 
+## Relay Status Report
+
+A bridge reports the state of its relay to the control plane with [`PUT /v1/nodes/{node_id}/relay-status`](../core/api-endpoints.md#relay-status), so the control plane stops assigning a relay that does not run. Without the report, a relay that cannot bind its socket stays every relayed pair's fallback while its bridge keeps heartbeating, although plexd knows the bind failed. Only a node in bridge mode reports. No configuration key turns the report on or off: a bridge reports at its `heartbeat.interval`.
+
+### Reported States
+
+The [reconcile handler](#relayreconcilehandler) records the state each of its branches leaves behind:
+
+| State | Members sent | The handler sets it when |
+|-------|--------------|--------------------------|
+| `running` | `listen_port`, `bound_seconds` | The pull enables the relay and `Relay.Bound` reports a bound socket: after `Configure` succeeded, or after it refused an out-of-range `listen_port` while the relay kept running on its old port, which the report then names |
+| `stopped` | none | The pull carries no `bridge` block, no `bridge.relay` block, or `enabled: false`, whether or not a relay exists or runs; or `Configure` refused an out-of-range `listen_port` on a relay that was not running |
+| `bind_failed` | `listen_port` | The pull enables the relay on a `listen_port` in 1..65535, and `Configure` could not bind it |
+| `not_consented` | none | The pull enables the relay, but `bridge.relay_enabled` is false, so the manager created no relay |
+
+A bridge without relay consent reports too: `stopped` while the pull does not enable the relay, `not_consented` once it does. plexd also sends `stopped` once at [shutdown](#shutdown-report), without recording it.
+
+### Status Tracker
+
+`RelayStatusTracker` (`relay_status.go`) sits between the handler and the reporter. It holds the latest status and signals each change. The [manager](#manager-integration) always creates one, with or without local consent.
+
+```go
+type RelayStatus struct {
+    State      string    // one of the api.RelayState* constants
+    ListenPort int       // running and bind_failed; 0 otherwise
+    BoundAt    time.Time // running; zero otherwise
+}
+
+func NewRelayStatusTracker() *RelayStatusTracker
+func (t *RelayStatusTracker) Set(s RelayStatus)
+func (t *RelayStatusTracker) Get() (RelayStatus, bool)
+func (t *RelayStatusTracker) Changed() <-chan struct{}
+```
+
+- `Set` stores the status. When no status was held, or the new one differs from the held one, it signals on `Changed` without blocking. Two statuses are equal when `State` and `ListenPort` match and `BoundAt.Equal` holds, so the same instant in another `time.Location` is no change.
+- `Changed` has a capacity of 1. Several `Set` calls before the reporter wakes collapse into one signal, and the reporter then reads the latest status.
+- `Get` returns the held status, and false until the first `Set`.
+
+A reconcile cycle that only changes the relay's peers sets an equal status and signals nothing.
+
+### Reporter
+
+`RelayStatusReporter` sends the report from a goroutine of its own, never from inside the reconcile handler, so a slow control plane never delays a reconcile cycle.
+
+```go
+type RelayStatusClient interface {
+    ReportRelayStatus(ctx context.Context, nodeID string, req api.RelayStatusRequest) (*api.RelayStatusResponse, error)
+}
+
+func NewRelayStatusReporter(interval time.Duration, nodeID string, client RelayStatusClient, status *RelayStatusTracker, logger *slog.Logger) *RelayStatusReporter
+func (r *RelayStatusReporter) Run(ctx context.Context) error // always returns nil
+```
+
+`*api.ControlPlane` satisfies `RelayStatusClient`. A non-positive `interval` becomes 30 s, the default `heartbeat.interval`. `Run` logs `relay status: reporter started` and then sends one report:
+
+1. when the tracker signals a change, after which the interval restarts, so an unchanged state goes out once per interval and never twice in quick succession after a change;
+2. on every tick of the interval, an unchanged state included;
+3. once more as `stopped` when `ctx` ends (see [Shutdown Report](#shutdown-report)).
+
+A send does nothing while the tracker holds no status, so plexd reports nothing before the handler first ran. Until then it does not know the relay's state, and a `stopped` sent at start, followed a moment later by `running` from the first reconcile, could move the relay's pairs away and back on every start. A bridge whose first pull carries no drift never runs the handler and sends nothing, which is harmless: the control plane reads the report only for an enabled relay, and enabling one is bridge drift.
+
+Each send builds a fresh body from the held status. `listen_port` goes with `running` and `bind_failed`. For `running`, `bound_seconds` is the time since `BoundAt` in whole seconds, floored, 0 when negative and at most 315360000 (`api.MaxRelayStatusBoundSeconds`). Both instants come from `time.Now`, so the difference uses Go's monotonic clock, and a stepped wall clock does not move it.
+
+A failed send is not retried within its tick. The control plane anchors `bound_seconds` on its receive time, so the next send builds a fresh body, and a lost report sent on a change reaches the control plane at the next tick, at most one interval later.
+
+`plexd up` starts the reporter only in bridge mode, with the heartbeat's interval. It does not wait for the WireGuard interface, because the relay needs no WireGuard device. The cost is one `PUT` of under 100 bytes per bridge per interval, plus one per state change and one at shutdown.
+
+### Answers
+
+No answer stops the loop, and none touches the relay:
+
+| Answer | Reporter behavior |
+|--------|-------------------|
+| `200 OK` | Debug `relay status: accepted`. Info `relay status: reported` for the first accepted status and for one that differs from the last reported one, so an unchanged re-send logs at Debug only. After a not-served phase, one Info `relay status: control plane accepts relay status reports` |
+| `404` with any code but `relay_status_node_gone`, or `501 relay_status_not_provisioned` | The control plane does not serve the report, as `api.IsRelayStatusNotServed` classifies it. Info `relay status: control plane does not accept relay status reports, retrying every interval` on entering that state only. plexd keeps reporting every interval and keeps relaying as the pull says |
+| `404 relay_status_node_gone` | The node was removed while the request ran. Warn `relay status: rejected, this node was removed` on every send. It does not enter the not-served state |
+| `api.ErrCredentialRefused` | Debug `relay status: send failed`. The heartbeat parked the agent on a refused credential and names the cause once |
+| Any error after `ctx` ended | Nothing, because that is the shutdown |
+| Anything else, `400 malformed_relay_status` and `400 invalid_relay_status` included | Warn `relay status: send failed` |
+
+### Shutdown Report
+
+When `ctx` ends, the reporter sends `{"state":"stopped"}` once more under a context of its own, which the cancelled `ctx` does not reach, bounded by 5 s (`relayStatusShutdownTimeout`). It logs `relay status: reported stopped at shutdown` on success and the Warn `relay status: shutdown report failed` on any error. A control plane that does not answer within 5 s gives an error wrapping `context.DeadlineExceeded`. The reporter makes no shutdown send while the tracker holds no status or while the control plane does not serve the report.
+
+The 5 s fit in the 30 s the shutdown of `plexd up` waits for every goroutine, and the shutdown sequence needs no step of its own: cancelling `ctx` triggers the report. The report can reach the control plane before the bridge teardown closes the relay socket, which only moves the pairs off a relay that is about to stop.
+
+A bridge stopped for good gives up its pairs within about 15 s this way, instead of about 100 s until its heartbeat reads stale. The accepted cost: every restart and self-upgrade of a bridge moves its pairs away and back, and in a Domain with one bridge the pairs lose their `fallback_endpoint` until the restarted agent reports `running`.
+
+### What the Control Plane Does
+
+The control plane keeps the latest report per node and reads it only for a bridge whose relay is enabled. A relay whose report in force is anything but `running` on the pulled `listen_port` reads `not_running`, and the control plane stops assigning it: its pairs move to another bridge within about 15 s, or lose their `fallback_endpoint` when the Domain has no other bridge that relays. A report stays in force only while it is repeated within three heartbeat intervals, 90 s under the default policy, which is why plexd sends an unchanged state again once per interval. A report identical to the stored one only refreshes the instant it was last seen. A node that never reports, or whose last report aged out, keeps the behavior it had before the report existed: its relay is judged by the data path alone. A control plane that predates the report answers `404`, and plexd keeps relaying as the pull says. See [Relay status](https://github.com/plexsphere/plexsphere/blob/main/docs/reference/api/plexd-agent-contract.md#relay-status) in plexsphere's agent contract for the rules and the timing.
+
 ## Security Properties
 
 - The bridge holds no private or preshared key of any peer and decrypts nothing. It reads only the message type and indices, and checks `mac1` with the peers' public keys.
@@ -265,13 +364,14 @@ Versions mix: a node on an older plexd dials the relay with the old 30 s trial a
 
 ## Manager Integration
 
-`NewManager` creates the relay with `NewRelay(logger)` when `Config.RelayEnabled` is `true`. The relay opens no socket until the reconcile handler configures it.
+`NewManager` creates the relay with `NewRelay(logger)` when `Config.RelayEnabled` is `true`. The relay opens no socket until the reconcile handler configures it. `NewManager` always creates a `RelayStatusTracker`, with or without `RelayEnabled`, because a bridge without local consent reports its relay's state too (see [Relay Status Report](#relay-status-report)).
 
-| Method  | Signature   | Description |
-|---------|-------------|-------------|
-| `Relay` | `() *Relay` | Returns the relay; nil without `RelayEnabled` |
+| Method               | Signature                 | Description |
+|----------------------|---------------------------|-------------|
+| `Relay`              | `() *Relay`               | Returns the relay; nil without `RelayEnabled` |
+| `RelayStatusTracker` | `() *RelayStatusTracker`  | Returns the relay's [status tracker](#status-tracker), which the reconcile handler sets and the reporter reads; never nil |
 
-`Teardown()` calls `relay.Stop()` as part of bridge teardown. Errors are aggregated with other teardown errors.
+`Teardown()` calls `relay.Stop()` as part of bridge teardown. Errors are aggregated with other teardown errors. It leaves the status tracker as it was: the reporter sends the last `stopped` on its own when `ctx` ends.
 
 ### BridgeStatus with Relay
 
@@ -309,16 +409,20 @@ mgr.Setup("plexd0")
 
 // Register handlers; the relay starts when a pull enables it
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.RelayReconcileHandler(mgr.Relay(), logger))
+r.RegisterHandler(bridge.RelayReconcileHandler(mgr.Relay(), mgr.RelayStatusTracker(), logger))
 
 dispatcher := api.NewEventDispatcher(logger)
 dispatcher.Register(api.EventBridgeConfigUpdated,
     bridge.HandleBridgeConfigUpdated(r))
 
+// Report the relay's state on change and once per heartbeat interval
+reporter := bridge.NewRelayStatusReporter(30*time.Second, nodeID, client, mgr.RelayStatusTracker(), logger)
+go reporter.Run(ctx)
+
 // Run reconciler
 go r.Run(ctx, nodeID)
 
-// Graceful shutdown
+// Graceful shutdown; the reporter sends a last stopped within 5 s
 <-ctx.Done()
 mgr.Teardown() // stops relay, removes routes, disables forwarding
 ```
@@ -413,10 +517,20 @@ All relay log lines carry `component=bridge`.
 | `Info`  | `relay stopped` | `listen_port` |
 | `Info`  | `relay disabled by the control plane` | none |
 | `Info`  | `relay: peer address learned` | `peer_id`, `address` |
+| `Info`  | `relay status: reporter started` | `interval` |
+| `Info`  | `relay status: reported` | `state`, and `listen_port` and `bound_seconds` when set; logged for the first accepted status and for one that differs from the last reported one |
+| `Info`  | `relay status: control plane does not accept relay status reports, retrying every interval` | `status`, `code`; logged on entering the not-served state only |
+| `Info`  | `relay status: control plane accepts relay status reports` | none; logged once after a not-served phase |
+| `Info`  | `relay status: reported stopped at shutdown` | none |
 | `Warn`  | `relay: the control plane enables the relay, but bridge.relay_enabled is false` | `listen_port` |
 | `Warn`  | `relay: skipping peer with invalid public key` | `peer_id` |
 | `Warn`  | `relay: skipping peer with duplicate public key` | `peer_id` |
 | `Warn`  | `relay: index table full` | `max_indices`; logged at most once a minute |
+| `Warn`  | `relay status: rejected, this node was removed` | `code`; logged on every send |
+| `Warn`  | `relay status: send failed` | `error` |
+| `Warn`  | `relay status: shutdown report failed` | `error` |
 | `Debug` | `relay: dropped datagram` | `source`, `reason` (`not_wireguard`, `rate_limited`, `unknown_target`, `unknown_index`, `no_route` or `index_table_full`) |
 | `Debug` | `relay: read failed` | `error` |
 | `Debug` | `relay: forward failed` | `dst`, `error` |
+| `Debug` | `relay status: accepted` | `state`, `accepted_at` |
+| `Debug` | `relay status: send failed` | `error`; logged instead of the Warn while the client holds a refused credential (`api.ErrCredentialRefused`) |

@@ -834,6 +834,53 @@ return an error matching `ErrHandshakeReportTooMany` without sending a request.
 |---------------------------|--------|------------------------------------------------------|
 | `MaxHandshakeReportPeers` | `4096` | Most entries one report may carry (the contract's `maxItems`) |
 
+## Relay Status
+
+### `PUT /v1/nodes/{node_id}/relay-status`
+
+The state of a bridge's relay, which the control plane reads to stop assigning
+a relay that does not run. The handler decodes with unknown members refused, and
+`State` decides which other members a report carries. See
+[Control Plane API Endpoints](api-endpoints.md#relay-status) for the wire
+examples and error taxonomy, and
+[NAT Relay](../bridge/nat-relay.md#relay-status-report) for how plexd derives
+the state.
+
+**RelayStatusRequest**
+
+| Field          | Type     | JSON Tag                    | Description                                    |
+|----------------|----------|-----------------------------|------------------------------------------------|
+| `State`        | `string` | `"state"`                   | One of the `RelayState*` constants             |
+| `ListenPort`   | `int`    | `"listen_port,omitempty"`   | The relay's UDP port, 1..65535; set for `running` and `bind_failed`, left 0 and so omitted otherwise |
+| `BoundSeconds` | `*int64` | `"bound_seconds,omitempty"` | Whole seconds since the relay socket was bound, 0 to `MaxRelayStatusBoundSeconds`; set for `running`, left nil and so omitted otherwise |
+
+`BoundSeconds` is a pointer because 0 is a valid value, for a socket bound less
+than a second ago: a plain `int64` with `omitempty` would drop it, and the
+control plane would refuse the `running` report with
+`400 invalid_relay_status`. `ListenPort` stays a plain `int`: 0 is never a valid
+port, and the two states that forbid the member leave it 0, so `omitempty` drops
+it exactly where it must be absent. A member the state requires or forbids is
+refused with `400 invalid_relay_status`, and an out-of-range value or a `null`
+member with `400 malformed_relay_status`. `ReportRelayStatus` checks none of
+this and sends the request as passed. The server anchors `BoundSeconds` on its
+receive time, so plexd builds a fresh request for every attempt.
+
+**RelayStatusResponse** (`200 OK`)
+
+| Field        | Type        | JSON Tag        | Description                                    |
+|--------------|-------------|-----------------|------------------------------------------------|
+| `AcceptedAt` | `time.Time` | `"accepted_at"` | Server receive time `BoundSeconds` was anchored on |
+
+**Constants**
+
+| Constant                     | Value             | Description                                          |
+|------------------------------|-------------------|------------------------------------------------------|
+| `RelayStateRunning`          | `"running"`       | The relay socket is bound on `ListenPort`            |
+| `RelayStateStopped`          | `"stopped"`       | The relay does not run: the pull does not enable it, names a `listen_port` outside 1..65535, or plexd stops it because it shuts down |
+| `RelayStateBindFailed`       | `"bind_failed"`   | The relay socket could not be bound on `ListenPort`  |
+| `RelayStateNotConsented`     | `"not_consented"` | The pull enables a relay that `bridge.relay_enabled` does not consent to |
+| `MaxRelayStatusBoundSeconds` | `315360000`       | The contract's ceiling on `bound_seconds`, 3650 days |
+
 ## Key Rotation
 
 ### `POST /v1/keys/rotate`

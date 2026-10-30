@@ -29,6 +29,7 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 17 | `GET` | `/v1/nodes/{node_id}/peers/{peer_node_id}/psk` | Pairwise edge PSK (NSK-encrypted octet-stream) |
 | 18 | `PUT` | `/v1/nodes/{node_id}/endpoint-candidates` | Local endpoint candidate reporting |
 | 19 | `GET` | `/v1/nodes/{node_id}/sessions/{session_id}/connections/{connection_id}` | ssh session connection (WebSocket upgrade) |
+| 20 | `PUT` | `/v1/nodes/{node_id}/relay-status` | Relay status report (bridges) |
 
 ## Registration & Identity
 
@@ -532,6 +533,113 @@ has no internal retry, and Go's HTTP transport does not replay a `POST`.
 
 `api.IsHandshakeReportNotServed` classifies the two not-served answers. A `501`
 with any other code is an ordinary failure and logged at Warn.
+
+## Relay Status
+
+### PUT /v1/nodes/{node_id}/relay-status
+
+Reports the state of a bridge's relay, so the control plane stops assigning a
+relay that does not run. The control plane keeps the latest report per node and
+reads it only for a bridge whose relay is enabled. A relay whose report in force
+is anything but `running` on the pulled `listen_port` reads `not_running`, and
+its pairs move to another bridge within about 15s, or lose their
+`fallback_endpoint` when the Domain has no other bridge that relays. See
+[Relay Status Report](../bridge/nat-relay.md#relay-status-report) for how plexd
+derives the state from its relay.
+
+**Request body** (`RelayStatusRequest`, at most 4 KiB) takes one of four shapes:
+
+```json
+{ "state": "running", "listen_port": 51821, "bound_seconds": 30 }
+```
+
+```json
+{ "state": "stopped" }
+```
+
+```json
+{ "state": "bind_failed", "listen_port": 51821 }
+```
+
+```json
+{ "state": "not_consented" }
+```
+
+- `state`: required, one of `running`, `stopped`, `bind_failed` and
+  `not_consented`. `running` means the relay socket is bound on `listen_port`;
+  `stopped`, that the relay does not run because the pull does not enable it,
+  names a `listen_port` outside 1..65535, or plexd shuts down; `bind_failed`,
+  that plexd could not bind `listen_port`; and `not_consented`, that the pull
+  enables a relay that `bridge.relay_enabled` does not consent to.
+- `listen_port`: the relay's UDP port, 1..65535. Required for `running` and
+  `bind_failed`, forbidden otherwise.
+- `bound_seconds`: whole seconds since the relay socket was bound,
+  0..315360000. Required for `running`, forbidden otherwise. The server anchors
+  the seconds on its own receive time, so the node's clock never enters the
+  relay's health.
+
+The control plane decodes the body with unknown members refused. A member the
+state requires or forbids answers `400 invalid_relay_status` with a `detail`
+naming the member. An unknown member, an out-of-range value or a `null` member
+answers `400 malformed_relay_status`. `ReportRelayStatus` validates nothing,
+because plexd builds only these four shapes: it floors `bound_seconds` to whole
+seconds, sends 0 for a socket bound less than a second ago, and clamps the
+value to 315360000.
+
+**Response** (`200 OK`, `RelayStatusResponse`):
+
+```json
+{
+  "accepted_at": "2026-10-30T10:15:30.123Z"
+}
+```
+
+`accepted_at` is the server receive time `bound_seconds` was anchored on. A
+report identical to the stored one only refreshes the instant the control plane
+last saw it.
+
+**Cadence.** plexd reports from a loop of its own, never from inside the relay
+reconcile handler, so a slow control plane never delays a reconcile cycle. It
+sends a report when the relay's state changes, and again once per
+`heartbeat.interval` (default 30s) while nothing changes. The interval restarts
+after every report sent on a change, so an unchanged state never goes out twice
+in quick succession. The re-send keeps the report in force: the control plane
+counts a report not repeated within three heartbeat intervals, 90s under the
+default policy, as absent. When plexd shuts down it sends a last `stopped`,
+bounded by 5s, so a bridge stopped for good gives up its pairs within about 15s
+instead of waiting for its heartbeat to read stale. plexd sends nothing before
+the relay reconcile handler first ran, because until then it does not know the
+relay's state, and a node outside bridge mode sends nothing at all.
+
+**No replay.** Every attempt carries a freshly built body with a new
+`bound_seconds`. A failed report is not retried within its tick: the server
+anchors `bound_seconds` on its receive time, so a replayed body would date the
+bind later than it happened. The next tick, at most one interval later, sends a
+fresh report instead. `ReportRelayStatus` has no internal retry, and Go's HTTP
+transport does not replay a `PUT`.
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable `code`:
+
+| Status | Problem `code` | Meaning | plexd behavior |
+|---|---|---|---|
+| `200 OK` | — | Report accepted; body is a `RelayStatusResponse` | Logged at Debug; also at Info for the first accepted status and for one that differs from the last reported one, and once at Info after a not-served phase |
+| `400 Bad Request` | `malformed_relay_status` | Body is not valid JSON, carries an unknown member or data after the report, or misses `state`; `state` is outside the four states, `listen_port` outside 1..65535 or `bound_seconds` outside 0..315360000; or `listen_port` or `bound_seconds` is `null` | Logged at Warn as `send failed`; the next tick sends a fresh report |
+| `400 Bad Request` | `invalid_relay_status` | A member the state requires is missing, or one it forbids is present; the `detail` names the member | Logged at Warn as `send failed`; the next tick sends a fresh report |
+| `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked | Logged at Warn as `send failed`; the next tick sends a fresh report. Once the heartbeat has parked the agent on the refused credential, no request leaves and the failure is logged at Debug |
+| `403 Forbidden` | `node_id_mismatch` | The NSK belongs to a different node than the path | Logged at Warn as `send failed`; the next tick sends a fresh report |
+| `404 Not Found` | `relay_status_node_gone` | The node was removed while the request ran | Logged at Warn as `rejected, this node was removed` on every send; plexd keeps reporting every interval |
+| `404 Not Found` | any other, or none | An older control plane that does not serve the operation | Logged once at Info as not served; plexd keeps reporting every interval and keeps relaying as the pull says |
+| `413 Payload Too Large` | `relay_status_body_too_large` | Body exceeds 4 KiB | Logged at Warn as `send failed`; the next tick sends a fresh report |
+| `500 Internal Server Error` | `internal` | Server error, for example a failed write of the report | Logged at Warn as `send failed`; the next tick sends a fresh report |
+| `501 Not Implemented` | `relay_status_not_provisioned` | The control plane has not provisioned the operation | Logged once at Info as not served; plexd keeps reporting every interval and keeps relaying as the pull says |
+
+`api.IsRelayStatusNotServed` classifies the two not-served answers: a `404`
+with any code but `relay_status_node_gone`, and a `501` carrying
+`relay_status_not_provisioned`. A `404 relay_status_node_gone` is the
+operation's own answer, a verdict on the node rather than a missing route, so
+it is false. A `501` with any other code is an ordinary failure and logged at
+Warn. No answer stops the reporter, and none touches the relay. While the
+control plane does not serve the report, plexd sends no `stopped` at shutdown.
 
 ## Edge PSK
 

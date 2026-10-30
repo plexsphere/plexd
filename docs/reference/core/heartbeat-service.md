@@ -142,6 +142,7 @@ While parked, the loops that call the control plane on every cycle fail locally 
 | `agent: key rotation: resubmitting the staged rotation failed, retrying` | `internal/agent`: the key-rotation recovery sweep, which resubmits a staged rotation key with a backoff capped at 2 minutes |
 | `endpoint report failed` | `internal/nat`: the endpoint discoverer |
 | `nat: endpoint candidates: send failed` | `internal/nat`: the endpoint candidate publisher |
+| `relay status: send failed` | `internal/bridge`: the relay status reporter, in bridge mode |
 | `metrics report failed`, `local metrics report failed` | `internal/metrics` |
 | `log report failed`, `local log report failed` | `internal/logfwd` |
 | `audit report failed`, `local audit report failed` | `internal/auditfwd` |

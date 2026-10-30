@@ -249,7 +249,7 @@ Returns a `reconcile.ReconcileHandler` that synchronizes tunnels to match the de
 
 ```go
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
-r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
+r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 r.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
@@ -382,7 +382,7 @@ The site-to-site reconcile handler plugs into `internal/reconcile` alongside exi
 r := reconcile.NewReconciler(client, reconcile.Config{}, logger)
 r.RegisterHandler(wireguard.ReconcileHandler(wgMgr))
 r.RegisterHandler(policy.ReconcileHandler(enforcer, "plexd0"))
-r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
+r.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
 r.RegisterHandler(bridge.UserAccessReconcileHandler(accessMgr, logger))
 r.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 r.RegisterHandler(bridge.SiteToSiteReconcileHandler(s2sMgr, logger))
