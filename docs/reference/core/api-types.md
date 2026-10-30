@@ -70,7 +70,7 @@ SSE `peer_*` events.
 | `MeshIP`     | `string`   | `"mesh_ip"`    | Mesh IP address            |
 | `Endpoint`   | `string`   | `"endpoint"`   | First entry of `Endpoints`, or empty when the peer has no endpoint to dial |
 | `Endpoints`  | `[]string` | `"endpoints,omitempty"` | The peer's dial order: the endpoints the WireGuard manager tries one after another until a handshake completes (see [Dial order](../networking/wireguard.md#dial-order)) |
-| `Fallback`   | `string`   | `"fallback,omitempty"` | The peer's `fallback_endpoint` when it is the last entry of `Endpoints`, empty otherwise. Endpoint selection holds that entry as long as the entries before it took together (see [The trial](../networking/wireguard.md#the-trial)) |
+| `Fallbacks`  | `[]string` | `"fallbacks,omitempty"` | The peer's relays as they end `Endpoints`, in dial order: the relay of its assigned bridge first, then its standby relays. Nil when the peer has no relay. Endpoint selection holds each relay as long as the entries before the first relay took together, and only a peer that connected over a relay dials the standbys (see [The trial](../networking/wireguard.md#the-trial)) |
 | `AllowedIPs` | `[]string` | `"allowed_ips"`| `mesh_ip/32`, derived locally |
 | `PSK`        | `string`   | `"psk"`        | Edge PSK fetched for the peer's current public key, standard base64; empty when plexd holds none |
 
@@ -145,8 +145,9 @@ from it, and the edge PSK store reads it on the dispatch seam.
 Carries the peer's direct `endpoint` and its `endpoint_candidates` but **no**
 `psk` or `allowed_ips`. plexd derives `AllowedIPs` locally as `mesh_ip/32`. plexd
 builds the peer's dial order from the candidates on a subnet this node is also
-on, then `endpoint` when it is usable, then the remaining candidates, then
-`fallback_endpoint` (the relay target), and keeps the first entry that completes
+on, then `endpoint` when it is usable, then the remaining candidates, then the
+peer's relays (`fallback_endpoints`, or `fallback_endpoint` alone when that list
+is absent or empty), and keeps the first entry that completes
 a WireGuard handshake (see [Dial order](../networking/wireguard.md#dial-order)
 and [Endpoint selection](../networking/wireguard.md#endpoint-selection)).
 Unless `wireguard.edge_psk` is `false`, plexd fetches the pairwise edge PSK per
@@ -158,8 +159,11 @@ port with a non-zero port and no zone, its address (an IPv4-mapped address is
 unmapped first) is not unspecified, loopback, multicast or link-local, and it
 lies outside the Domain mesh prefix. plexd leaves a refused one out of the
 order, logging a refused `endpoint` at Warn and refused candidates at Debug.
-`fallback_endpoint` is not validated, because the contract allows a hostname
-there.
+plexd does not validate the relays in `fallback_endpoints` or
+`fallback_endpoint`, because the contract allows a hostname there. It skips an
+empty relay entry and a repeated one, and it does not cap the list. When
+`fallback_endpoints` is not empty, the dial order does not use
+`fallback_endpoint`, and plexd does not check that the two agree.
 
 | Field              | Type     | JSON Tag                        | Description                   |
 |--------------------|----------|---------------------------------|-------------------------------|
@@ -167,7 +171,8 @@ there.
 | `MeshIP`           | `string` | `"mesh_ip"`                     | Peer mesh IP address          |
 | `PublicKey`        | `string` | `"public_key"`                  | Peer WireGuard public key     |
 | `Endpoint`         | `string` | `"endpoint,omitempty"`          | Peer's direct WireGuard endpoint as `host:port` (an IPv6 host in brackets), the address it last reported through `PUT /v1/nodes/{node_id}/endpoint`; absent while the peer has no fresh observation |
-| `FallbackEndpoint` | `string` | `"fallback_endpoint,omitempty"` | Optional relay/fallback endpoint |
+| `FallbackEndpoint` | `string` | `"fallback_endpoint,omitempty"` | The first entry of `FallbackEndpoints`, and the only relay a control plane that predates the set sends. The dial order uses it only when `FallbackEndpoints` is empty. Absent while the peer has no relay |
+| `FallbackEndpoints` | `[]string` | `"fallback_endpoints,omitempty"` | The peer's relays as `host:port` (an IPv6 host in brackets) in dial order, at most 4 by the contract: the relay of the peer's assigned bridge first, then its standby relays. Both nodes of a pair receive the same list for each other, and it never names this node. Absent while the peer has no relay; `null` reads as absent |
 | `EndpointCandidates` | `[]string` | `"endpoint_candidates,omitempty"` | The peer's endpoint candidates as `host:port` strings, at most 8: first its peer-observed endpoints, the addresses at which at least two live nodes of the Domain report a direct handshake with it, then its last accepted, unexpired local candidates (`PUT /v1/nodes/{node_id}/endpoint-candidates`) in the order it sent them (see [State](api-endpoints.md#get-v1-nodes-node-id-state)); absent when the peer has none and on every control plane that does not deliver them |
 
 **ReachabilitySnapshot**
@@ -228,7 +233,7 @@ documented under [Bridge Mode](/reference/bridge/bridge-mode).
 
 | Field        | Type                | JSON Tag           | Description                     |
 |--------------|---------------------|--------------------|---------------------------------|
-| `Relay`      | `*RelayConfig`      | `"relay"`          | Relay request: whether this bridge relays, on which UDP port, and the peers whose fallback names it |
+| `Relay`      | `*RelayConfig`      | `"relay"`          | Relay request: whether this bridge relays, on which UDP port, and the peers whose first relay it is |
 | `UserAccess` | `*UserAccessConfig` | `"user_access"`    | User access configuration       |
 | `Ingress`    | `*IngressConfig`    | `"ingress"`        | Public ingress configuration    |
 | `SiteToSite` | `*SiteToSiteConfig` | `"site_to_site"`   | Site-to-site VPN configuration  |
@@ -244,15 +249,15 @@ See [NAT Relay](/reference/bridge/nat-relay).
 |---------------|---------------------|-------------------|----------------------------------------------|
 | `Enabled`     | `bool`              | `"enabled"`       | Whether the control plane asks this bridge to relay |
 | `ListenPort`  | `int`               | `"listen_port"`   | UDP port the relay listens on; authoritative |
-| `Assignments` | `[]RelayAssignment` | `"assignments"`   | Peers whose `fallback_endpoint` names this bridge. Decoded and carried; the relay does not read it |
+| `Assignments` | `[]RelayAssignment` | `"assignments"`   | Peers whose first relay is this bridge; a peer that has this bridge only as a standby relay is not listed. Decoded and carried; the relay does not read it |
 
 **RelayAssignment**
 
 | Field                  | Type     | JSON Tag                   | Description                              |
 |------------------------|----------|----------------------------|------------------------------------------|
-| `PeerNodeID`           | `string` | `"peer_node_id"`           | Node ID of a peer whose fallback names this bridge |
-| `FallbackEndpoint`     | `string` | `"fallback_endpoint"`      | Host of the fallback that peer dials     |
-| `FallbackEndpointPort` | `int`    | `"fallback_endpoint_port"` | Port of the fallback that peer dials     |
+| `PeerNodeID`           | `string` | `"peer_node_id"`           | Node ID of a peer whose first relay is this bridge |
+| `FallbackEndpoint`     | `string` | `"fallback_endpoint"`      | Host of that peer's first relay          |
+| `FallbackEndpointPort` | `int`    | `"fallback_endpoint_port"` | Port of that peer's first relay          |
 
 **NodeStateBlock**
 

@@ -33,7 +33,7 @@ Peer A                                                        Peer B
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-1. A node dials the relay as the last entry of a peer's [dial order](../networking/wireguard.md#dial-order): the peer's `fallback_endpoint`, which the control plane points at a bridge that relays.
+1. A node dials the relays as the last entries of a peer's [dial order](../networking/wireguard.md#dial-order): the peer's relay set, `fallback_endpoints`, whose first entry is its `fallback_endpoint`. The control plane lists at most 4, each on a bridge that relays: the relay of the peer's assigned bridge first, then its standby relays. A control plane that predates the set sends only `fallback_endpoint`, which makes a set of one. A candidate or direct endpoint equal to a relay is not dialed before the relays, so the relays always end the order complete and in set order. The node dials a standby only for a peer last seen connected over a relay, when that relay fails (see [Meeting on the Relay](#meeting-on-the-relay)).
 2. The relay reads every datagram from one UDP socket, bound on the `listen_port` of the bridge's state pull, and classifies it by its WireGuard header (see [Message Classification](#message-classification)).
 3. It finds the destination: for a handshake initiation, the listed peer whose public key verifies the message's `mac1`; for every other message, the peer that owns the message's receiver index. It learns each peer's current address from the handshake and transport messages that peer sends.
 4. It writes the datagram unchanged to that address from the same socket.
@@ -249,17 +249,19 @@ The dispatch goroutine reads with `ReadFromUDPAddrPort` into one 65535-byte buff
 
 ## Meeting on the Relay
 
-Two peers behind hard NATs connect only when both are on the relay at the same time. [Endpoint selection](../networking/wireguard.md#the-trial) therefore holds a peer's `fallback_endpoint`, when it ends the dial order, as long as the entries before it took together, so two such windows always overlap or touch.
+Two peers behind hard NATs connect only when both are on the same relay at the same time. [Endpoint selection](../networking/wireguard.md#the-trial) therefore holds every relay of a peer's set, the first and each standby, as long as the entries before the first relay took together, so two such windows always overlap or touch. A peer that never connected only ever holds the first relay: after it, its walk starts over at the first entry, and it never dials a standby. A pull that changes a peer in this hold and does not move it to a new relay starts its walk over, a change of only a standby included.
 
-A node does not wait for a relayed peer's handshake to turn 180 s old before it dials a relay again:
+A node does not wait for a relayed peer's handshake to turn 180 s old before it dials a relay:
 
-- When a pull names a new `fallback_endpoint` for a peer on the old relay, the node dials the new relay at once. A peer the node reaches from the relay's address, or that is not connected, counts as on the relay; a peer that opened a direct path while the relay entry was programmed keeps that path. With a hostname `fallback_endpoint` the node cannot compare addresses, so the programmed entry decides and such a peer moves too. It removes the device peer and adds it again, because the new relay would drop every packet of the old session with reason `unknown_index`. The fresh device peer has no session, so its next send starts a handshake over the new relay. Both nodes do this once their pulls name the new relay, and [First Contact](#first-contact) pairs their new initiations.
-- A peer that runs over the relay, which the node tells from the relay's address on the peer's packets, is probed once it has received nothing for one trial, 30 s by default. The probe is one datagram through the tunnel, which the peer's WireGuard answers on a live path. When the received-byte counter still has not moved 15 s later, the node dials the relay again the same way. A relay that restarted and lost its [index table](#index-table-and-sweeper) carries the pair again within about a minute.
-- Such a peer stays on the relay after its connection fails. The node dials the relay again, at once and after each hold without a handshake, and never goes back to the direct entries, which already failed. It tries them again only when a pull drops the `fallback_endpoint` or the peer, when the peer's key rotates, or after a restart. A peer that WireGuard roamed off the relay to a direct path no longer counts as on the relay, and walks its dial order again when that path fails.
+- When a pull takes away the relay a peer is on, the node dials the pull's first relay at once. A pull that still names relays takes the relay away when the relay is not among them, or when the first relay changed to one other than the relay the peer is on. A peer the node reaches from the address of one of its relays counts as on that relay, whichever entry is programmed, and a peer that is not connected counts as on the relay programmed; a peer that opened a direct path while a relay entry was programmed keeps that path. When the set holds a hostname, the node cannot tell a direct path from that relay, so the programmed entry decides and such a peer moves too. It removes the device peer and adds it again, because the new relay would drop every packet of the old session with reason `unknown_index`. The fresh device peer has no session, so its next send starts a handshake over the new relay. Both nodes do this once their pulls name the new relay, and [First Contact](#first-contact) pairs their new initiations.
+- A peer that runs over one of its relays, which the node tells from that relay's address on the peer's packets, is probed once it has received nothing for one trial, 30 s by default. The probe is one datagram through the tunnel, which the peer's WireGuard answers on a live path. When the received-byte counter still has not moved 15 s later, the node dials the next relay of the set the same way, and after the last relay the first again. With the defaults, a relay that stops forwarding is left 45 to 50 s after its last packet, up to 60 s. In a set of one the next relay is the same relay, so a relay that restarted and lost its [index table](#index-table-and-sweeper) carries the pair again within about a minute.
+- Such a peer stays on its relays after its connection fails and dials the next one. It does so at once and after each relay hold without a handshake, and never goes back to the direct entries, which already failed. It tries them again only when a pull leaves the peer no relay or drops the peer, when the peer's key rotates, or after a restart. A peer that WireGuard roamed from one relay of its set to another counts as on the relay that carries it. A peer that WireGuard roamed off its relays to a direct path no longer counts as on a relay, and walks its dial order again, up to its first relay, when that path fails.
+
+Both nodes of a pair hold the same relay set for each other and detect a dead relay in the same window, so without a pull they move to the same standby. With the defaults, the relay hold of at least 30 s and the 30 s a pending initiation stays a [fan-out](#first-contact) target together absorb the gap between the two sides. A standby relay carries the pair without an assignment for it, because a relay forwards among every peer of its pull. A relayed peer keeps a standby it moved to while the pull still lists that standby and names the same first relay, or names that standby first, so a pull that still names the dead relay first does not send it back.
 
 See [Relay liveness probe](../networking/wireguard.md#relay-liveness-probe) for the timing.
 
-Versions mix: a node on an older plexd dials the relay with the old 30 s trial and holds a relayed peer until its handshake is 180 s old, and the relay serves it like any other peer. The probe is answered by the peer's WireGuard, not by its plexd, so it works against a node on any version. A bridge on an older plexd relays nothing.
+Versions mix: a node on an older plexd dials the relay with the old 30 s trial and holds a relayed peer until its handshake is 180 s old, and the relay serves it like any other peer. Any older plexd dials only `fallback_endpoint`, the first relay, and never a standby. A pair with one side on an older plexd therefore fails over only when the control plane names a new first relay: the older side keeps dialing the first relay, and the newer side comes back to it each time it wraps around the set. A control plane without `fallback_endpoints` gives each peer at most one relay, which the node holds and dials again as described above. The probe is answered by the peer's WireGuard, not by its plexd, so it works against a node on any version. A bridge on an older plexd relays nothing.
 
 ## Relay Status Report
 
@@ -445,7 +447,7 @@ type RelayConfig struct {
 |---------------|-------------|
 | `Enabled`     | Whether the control plane asks this bridge to relay |
 | `ListenPort`  | The UDP port the relay listens on |
-| `Assignments` | The peers whose `fallback_endpoint` names this bridge. Decoded and carried; the relay does not read it |
+| `Assignments` | The peers whose first relay is this bridge. A peer that holds this bridge only as a standby relay is not listed, and the relay forwards for it all the same. Decoded and carried; the relay does not read it |
 
 ### RelayAssignment
 
@@ -459,9 +461,9 @@ type RelayAssignment struct {
 
 | Field                  | Description |
 |------------------------|-------------|
-| `PeerNodeID`           | Node ID of a peer whose fallback names this bridge |
-| `FallbackEndpoint`     | The host of the fallback that peer dials |
-| `FallbackEndpointPort` | The port of the fallback that peer dials |
+| `PeerNodeID`           | Node ID of a peer whose first relay is this bridge |
+| `FallbackEndpoint`     | The host of that peer's first relay |
+| `FallbackEndpointPort` | The port of that peer's first relay |
 
 ```json
 {

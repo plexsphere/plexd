@@ -62,7 +62,7 @@ The client configures the local WireGuard interface from the registration respon
 
 1. Create WireGuard interface (`plexd0`)
 2. Assign mesh IP and set private key
-3. Fetch each peer's edge PSK (see [Pre-Shared Keys](#pre-shared-keys-psk)), then add each peer with its public key, endpoint, allowed IPs, and PSK (the endpoint is the first entry of the peer's dial order: its endpoint candidates on a shared subnet, its usable direct endpoint, its other candidates, then its relay fallback; plexd moves along the order until a handshake completes)
+3. Fetch each peer's edge PSK (see [Pre-Shared Keys](#pre-shared-keys-psk)), then add each peer with its public key, endpoint, allowed IPs, and PSK (the endpoint is the first entry of the peer's dial order: its endpoint candidates on a shared subnet, its usable direct endpoint, its other candidates, then its relays in the order the control plane lists them; plexd moves along the order until a handshake completes)
 4. Run STUN discovery and report the node's public endpoint to the control plane
 5. Receive the peers' NAT-discovered endpoints on later state pulls (a `peer_endpoint_changed` event brings the next pull forward) and update WireGuard accordingly
 

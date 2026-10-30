@@ -442,8 +442,8 @@ When at least two live nodes report a direct handshake with the same peer at the
 same endpoint within the Domain's endpoint TTL, the control plane also lists that
 endpoint as a peer-observed endpoint at the head of the peer's
 `endpoint_candidates` on the [state pull](#get-v1-nodes-node-id-state) of every
-node of the Domain except the peer, unless it equals the peer's `endpoint`, its
-`fallback_endpoint` or one of its local candidates. The report carries no
+node of the Domain except the peer, unless it equals the peer's `endpoint`, one
+of its relays or one of its local candidates. The report carries no
 transfer counters: per-peer `rx_bytes` and `tx_bytes` travel as `tunnel_health`
 samples on the [metrics batch](#observability).
 
@@ -756,7 +756,8 @@ absence.
       "node_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
       "mesh_ip": "10.99.0.2",
       "public_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
-      "fallback_endpoint": "203.0.113.1:51820",
+      "fallback_endpoint": "203.0.113.2:51820",
+      "fallback_endpoints": ["203.0.113.2:51820", "203.0.113.3:51820"],
       "endpoint_candidates": ["192.0.2.10:51820"]
     },
     {
@@ -852,9 +853,9 @@ peer-observed endpoints, sorted by address and port. A peer-observed endpoint is
 an address and port at which at least two live nodes of the Domain reported,
 through [`POST /v1/nodes/{node_id}/handshakes`](#post-v1-nodes-node-id-handshakes),
 a direct WireGuard handshake with the peer that completed within the Domain's
-endpoint TTL. A handshake at the peer's `fallback_endpoint` never counts. The
-control plane leaves one out when it equals the peer's `endpoint`, its
-`fallback_endpoint`, one of its local candidates or an earlier entry, or when it
+endpoint TTL. A handshake at one of the peer's relays (see `fallback_endpoints`
+below) never counts. The control plane leaves one out when it equals the peer's
+`endpoint`, one of its relays, one of its local candidates or an earlier entry, or when it
 has port 0, a zone, or a loopback, link-local, multicast or unspecified address.
 The peer's last accepted, unexpired local candidates from
 [`PUT /v1/nodes/{node_id}/endpoint-candidates`](#put-v1-nodes-node-id-endpoint-candidates)
@@ -864,54 +865,90 @@ Only nodes of the peer's Domain receive them. The member is absent when no entry
 remains, and on every control plane that does not deliver it. A control plane
 older than peer-observed endpoints lists only the local candidates.
 
+A peer's `fallback_endpoints` lists the peer's relays as `host:port` strings
+(an IPv6 host in brackets), in dial order, at most 4. The first is the relay of
+the peer's assigned bridge. The standby relays follow it, in the order the
+control plane ranks them. `fallback_endpoint` is always the list's first entry,
+and the only relay a control plane older than the list sends. Both nodes of a
+pair receive the same list for each other, and the list never names this node.
+When this node is the peer's assigned bridge, the list starts with the peer's
+first standby relay.
+Both members are absent when the list is empty. plexd takes a peer's relay set
+from `fallback_endpoints` when the list holds an entry, and then ignores
+`fallback_endpoint` without checking that the two agree. Otherwise the set is
+`fallback_endpoint` alone, or empty. A `null` list reads as an absent one, and
+a value that is not an array of strings fails the pull's decode. plexd does not
+validate the entries, since the contract allows a hostname there, and does not
+cap their number. It skips an empty or repeated entry. A change of the list,
+its order included, is enough for the differ to update the peer, so a pull that
+only changes a standby reaches the WireGuard handler.
+
 The pull carries no PSK: plexd fetches the pairwise PSK of each edge from
 [`GET /v1/nodes/{node_id}/peers/{peer_node_id}/psk`](#edge-psk).
 
 plexd tries a peer's endpoints in a fixed dial order and keeps the first one
 that completes a WireGuard handshake: the candidates on a subnet this node is
 also on, then `endpoint` when it is usable, then the remaining candidates, then
-`fallback_endpoint`, the relay target. A direct endpoint or candidate is usable
+the peer's relays in the order of its set. A candidate or `endpoint` equal to a
+relay is left out, so the relays always end the order whole and in set order,
+the same on both sides of a pair. A direct endpoint or candidate is usable
 when it parses as an IP address and a non-zero port, carries no IPv6 zone,
 names an address that is not unspecified, loopback, multicast or link-local (an
 IPv4-mapped IPv6 address is unmapped first), and lies outside the Domain mesh
 prefix (the node's own mesh IP as a host /32 when registration returned no
 usable `domain_mesh_cidr`). plexd leaves a refused one out of the order, and
 logs a refused `endpoint` at Warn and refused candidates at Debug.
-`fallback_endpoint` is not validated, since the contract allows a hostname
-there. A change of `endpoint`, `fallback_endpoint` or `endpoint_candidates`,
+A change of `endpoint`, `fallback_endpoint` or `endpoint_candidates`,
 the candidates' order included, is enough for the differ to update the peer.
 plexd tries each entry for one trial, the WireGuard keepalive plus 5 s, and
-holds the fallback longer: when `fallback_endpoint` is the last entry and other
-entries come before it, plexd tries it as long as those entries took together.
-Two nodes behind hard NATs are then on the relay at the same time. With the
-default keepalive, a ten-entry order reaches the fallback after about 270 s,
-stays on it for about 270 s, and starts over after about 540 s. A two-entry
-order behaves as before. plexd never switches a peer connected on a direct
-path, and follows three rules for the relay. A peer dialing
-`fallback_endpoint` moves at once when the pull names another one, on a fresh
-WireGuard session, unless it is connected over a direct path WireGuard roamed
-to; plexd tells that path from the device's endpoint, which it can compare
-only with a `fallback_endpoint` that is an address. A peer that runs over the
-relay and received nothing for one trial gets a probe through the tunnel, and
-plexd dials the relay again when nothing comes back within 15 s. Such a peer
-stays on the relay after its connection fails, and plexd tries its direct
-entries again only when the pull drops `fallback_endpoint` or the peer, its
-key rotates, plexd restarts, or WireGuard roamed it to a direct path that then
-failed.
+holds every relay longer: it tries each relay, the first and each standby, as
+long as the entries before the first relay took together. Two nodes behind hard
+NATs are then on the first relay at the same time. When the order starts with
+the relays, each relay gets one trial. With the default keepalive, a peer with
+nine entries before its first relay reaches that relay after about 270 s, stays
+on it for about 270 s, and starts over after about 540 s. Only a relayed peer,
+one last seen connected over one of its relays, dials the standbys. Any other
+peer walks its order only up to and including the first relay.
+
+plexd never switches a peer connected on a direct path. A peer that runs over a
+relay and received nothing for one trial gets a probe through the tunnel.
+plexd dials the next relay of a relayed peer's set, on a fresh WireGuard
+session, when nothing comes back from the probe within 15 s, when the handshake
+goes stale, or when a relay's hold passes without a handshake. The next relay
+after the last is the first, and for a set of one it is the same relay again.
+Both sides of a pair hold the same set and detect a dead relay in the same
+window, so they reach the same standby without a pull. On a pull, a peer that
+dials a relay and is relayed or not connected moves at once to the pull's first
+relay, on a fresh WireGuard session, when the pull names relays but no longer
+its relay, or names a new first relay that is not its relay. Otherwise, a relayed
+peer whose relay the pull still names keeps it, connected or not, a standby it
+moved to on its own included: a pull that still names the dead first relay
+first does not move it back. A pull never moves a peer connected over a direct
+path WireGuard roamed to; plexd tells that path from the device's endpoint,
+which it can compare only with a relay that is an address. Any other peer that
+is not connected starts its walk over when a pull changes it, even when the
+pull only changes a standby. A relayed peer tries its direct entries again only
+when the pull drops every relay or the peer, its key rotates, plexd restarts,
+or WireGuard roamed it to a direct path that then failed. A plexd that predates
+`fallback_endpoints` dials only `fallback_endpoint`, and dials it again when it
+fails, so a pair with one such side fails over only when the control plane
+names a new first relay.
 See [Dial order](../networking/wireguard.md#dial-order),
 [Endpoint selection](../networking/wireguard.md#endpoint-selection) and
 [Relay liveness probe](../networking/wireguard.md#relay-liveness-probe).
 
-`bridge.relay` asks a bridge to relay WireGuard for the peers whose
-`fallback_endpoint` names it. A bridge listens only when its local
+`bridge.relay` asks a bridge to relay WireGuard for the pairs that hold it
+among their relays. A bridge listens only when its local
 [`bridge.relay_enabled`](configuration.md#bridge) is true and the block carries
 `enabled: true`. It then binds UDP `listen_port`, which is authoritative, and
 forwards among the peers of the same pull's `peers` block, routing each
-datagram by its WireGuard header. Without local consent it logs a Warn and
+datagram by its WireGuard header. A standby relay therefore carries a pair
+without holding its assignment. Without local consent a bridge logs a Warn and
 opens no socket. A `null` block, or `enabled: false`, stops a running relay.
-`assignments` lists the peers that dial this bridge as their fallback, each as
+`assignments` lists the peers whose first relay is this bridge, each as
 `peer_node_id` with the `fallback_endpoint` host and `fallback_endpoint_port`
-it dials. plexd decodes and carries it, and the relay does not read it. A change of `enabled`, `listen_port` or an assignment is bridge
+it dials. A peer that holds this bridge only as a standby relay is not listed.
+plexd decodes and carries the list, and the relay does not read it. A change of `enabled`, `listen_port` or an assignment is bridge
 drift. A node outside bridge mode ignores the block. See
 [NAT Relay](../bridge/nat-relay.md).
 

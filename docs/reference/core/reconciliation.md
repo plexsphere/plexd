@@ -210,7 +210,7 @@ Comparison logic by block:
 
 | Block   | Match Key         | Detection                                                                 |
 |---------|-------------------|---------------------------------------------------------------------------|
-| Peers   | `SnapshotPeer.NodeID` | Add/remove by node ID; update when `MeshIP`, `PublicKey`, `Endpoint`, `FallbackEndpoint`, or `EndpointCandidates` differs. Candidates compare in order, because the order is the dial order; nil and empty compare equal |
+| Peers   | `SnapshotPeer.NodeID` | Add/remove by node ID; update when `MeshIP`, `PublicKey`, `Endpoint`, `FallbackEndpoint`, `FallbackEndpoints`, or `EndpointCandidates` differs. Relays and candidates compare in order, because the order is the dial order; nil and empty compare equal |
 | Policy  | —                 | Presence-aware; when both blocks are populated it compares **only** the `Fingerprint` byte-for-byte |
 | Bridge  | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
 | State   | —                 | Presence-aware; both populated → `reflect.DeepEqual`                       |
@@ -277,7 +277,7 @@ The agent registers these handlers (in `cmd/plexd/cmd/up.go`):
 | Handler                          | Responsibility                                                        |
 |----------------------------------|----------------------------------------------------------------------|
 | `nodeapi` cache handler          | Feed the local state cache from the snapshot `state` block           |
-| `wireguard.ReconcileHandler`     | Apply peer add/remove/update from the `peers` block, with each peer's [dial order](../networking/wireguard.md#dial-order) (on-link `endpoint_candidates`, the usable direct `endpoint`, off-link candidates, `fallback_endpoint`) and the edge PSK held for its current public key (registered only when the WireGuard interface came up) |
+| `wireguard.ReconcileHandler`     | Apply peer add/remove/update from the `peers` block, with each peer's [dial order](../networking/wireguard.md#dial-order) (on-link `endpoint_candidates`, the usable direct `endpoint`, off-link candidates, then the relays from `fallback_endpoints`, or from `fallback_endpoint` on a control plane that predates the set) and the edge PSK held for its current public key (registered only when the WireGuard interface came up) |
 | `policy.ReconcileHandler`        | Rebuild the nftables ruleset from the merged `policy` block on a fingerprint change |
 | bridge sub-handlers              | Reconcile relay, user-access, ingress, and site-to-site subtrees      |
 
