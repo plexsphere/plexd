@@ -344,18 +344,20 @@ func (m *Manager) RemovePeerByID(peerID string) error {
 //   - A peer with no state, or whose public key changed, starts over from the
 //     first entry of its new order, like AddPeer. A rotated key is a new
 //     device peer to WireGuard, which has no endpoint yet.
-//   - A peer whose programmed entry is its Fallback, and that is relayed or
-//     not connected, moves to a new, non-empty Fallback at once, on a fresh
-//     device peer (see redialRelay), and logs the move. A connected peer that
-//     is not relayed runs on a path it roamed to (see relayedOver), which the
-//     move would cut.
-//   - A relayed peer whose Fallback is unchanged stays on its relay, connected
-//     or not: the write carries no endpoint, and the position moves to the
-//     Fallback's in the new order.
+//   - A peer whose programmed entry is one of its Fallbacks, and that is
+//     relayed or not connected, moves to the update's first relay at once, on
+//     a fresh device peer (see redialRelay), when the update takes its relay
+//     away (see relayMoved), and logs the move. A connected peer that is not
+//     relayed runs on a path it roamed to (see relayedOver), which the move
+//     would cut.
+//   - A relayed peer whose relay is still among the update's Fallbacks stays
+//     on it, connected or not, even on a standby it moved to on its own: the
+//     write carries no endpoint, and the position moves to the relay's in the
+//     new order.
 //   - A connected peer keeps the endpoint on the device, which may be one
 //     WireGuard roamed to: the write carries no endpoint, and the selection
 //     resumes from the new order's position of the entry last programmed. A
-//     relayed peer gets here only when its new order has no Fallback, and it
+//     relayed peer gets here only when the update has no Fallbacks, and it
 //     stops being relayed.
 //   - Any other peer starts over from the first entry of its new order.
 //
@@ -378,29 +380,31 @@ func (m *Manager) UpdatePeer(peer api.Peer) error {
 		if err := m.programFirst(peer); err != nil {
 			return fmt.Errorf("wireguard: update peer: %w", err)
 		}
-	case st.onFallback() && (st.relayed || !st.connected) && peer.Fallback != "" && peer.Fallback != st.peer.Fallback:
+	case st.onFallback() && (st.relayed || !st.connected) && relayMoved(st, peer):
+		from, to := st.endpoint(), peer.Fallbacks[0]
 		// Read before the write: the new device peer can complete a
 		// handshake before redialRelay returns, and that handshake must
 		// count as the new session's.
 		now := m.now()
-		if err := m.redialRelay(peer); err != nil {
+		if err := m.redialRelay(peer, to); err != nil {
 			return fmt.Errorf("wireguard: update peer: %w", err)
 		}
 		moved := &dialState{peer: peer, relayed: st.relayed}
-		moved.onRelay(now)
+		moved.onRelay(now, to)
 		m.dial[peer.ID] = moved
 		m.logger.Info("wireguard: relay fallback changed, moving to the new relay",
 			"component", "wireguard",
 			"peer_id", peer.ID,
-			"from", st.peer.Fallback,
-			"to", peer.Fallback,
+			"from", from,
+			"to", to,
 		)
-	case st.relayed && peer.Fallback == st.peer.Fallback:
+	case st.relayed && slices.Contains(peer.Fallbacks, st.endpoint()):
+		relay := st.endpoint()
 		if err := keepEndpoint(); err != nil {
 			return fmt.Errorf("wireguard: update peer: %w", err)
 		}
 		st.peer = peer
-		st.idx = max(slices.Index(st.order(), peer.Fallback), 0)
+		st.idx = max(slices.Index(st.order(), relay), 0)
 	case st.connected:
 		if err := keepEndpoint(); err != nil {
 			return fmt.Errorf("wireguard: update peer: %w", err)
@@ -423,6 +427,24 @@ func (m *Manager) UpdatePeer(peer api.Peer) error {
 	)
 
 	return nil
+}
+
+// relayMoved reports whether an update to peer takes away the relay st has
+// programmed: the update names relays, and either that relay is not among
+// them, or the first relay changed to one that is not that relay. A standby a
+// relayed peer moved to on its own therefore stays while the control plane
+// still names the same first relay, or names that standby first, and the peer
+// follows the control plane once it names another one. st must be on one of
+// its Fallbacks.
+func relayMoved(st *dialState, peer api.Peer) bool {
+	if len(peer.Fallbacks) == 0 {
+		return false
+	}
+	relay := st.endpoint()
+	if !slices.Contains(peer.Fallbacks, relay) {
+		return true
+	}
+	return peer.Fallbacks[0] != st.peer.Fallbacks[0] && peer.Fallbacks[0] != relay
 }
 
 // ConfigurePeers bulk-configures all peers. Individual errors are logged but not returned.
@@ -518,8 +540,8 @@ func (m *Manager) programFirst(peer api.Peer) error {
 	return nil
 }
 
-// redialRelay writes peer anew with its Fallback, the relay, as the endpoint:
-// it removes the device peer and adds it again. A write that only set the
+// redialRelay writes peer anew with relay, one of its Fallbacks, as the
+// endpoint: it removes the device peer and adds it again. A write that only set the
 // endpoint would keep the peer's WireGuard session, and a relay drops every
 // packet of a session whose handshake it did not forward, while WireGuard
 // starts a new handshake on its own only after 15 s of unanswered data, or
@@ -532,8 +554,8 @@ func (m *Manager) programFirst(peer api.Peer) error {
 // remove then names a key the device does not hold. The userspace backend
 // accepts that (see UserspaceBackend.RemovePeer), and the Linux module is
 // assumed to as well.
-func (m *Manager) redialRelay(peer api.Peer) error {
-	peerCfg, err := m.peerConfig(peer, peer.Fallback)
+func (m *Manager) redialRelay(peer api.Peer, relay string) error {
+	peerCfg, err := m.peerConfig(peer, relay)
 	if err != nil {
 		return err
 	}
