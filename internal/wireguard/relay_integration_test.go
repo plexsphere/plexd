@@ -212,8 +212,17 @@ func (n *meshNode) peerOn(relay string) api.Peer {
 		AllowedIPs: []string{netip.PrefixFrom(n.ip, 32).String()},
 		Endpoint:   relay,
 		Endpoints:  []string{relay},
-		Fallback:   relay,
+		Fallbacks:  []string{relay},
 	}
+}
+
+// peerOnSet returns n as the mesh peer of its partner, dialed through relays
+// alone, in order: they are its whole dial order and its relay set.
+func (n *meshNode) peerOnSet(relays ...string) api.Peer {
+	p := n.peerOn(relays[0])
+	p.Endpoints = relays
+	p.Fallbacks = relays
+	return p
 }
 
 // startRelay runs a relay for a and b on a free UDP port and returns it with
@@ -489,4 +498,74 @@ func TestRelayIntegration_ProbeRedialsARestartedRelay(t *testing.T) {
 	t.Logf("both nodes handshook over the restarted relay after %v", time.Since(restartedAt).Round(time.Millisecond))
 
 	pingBoth(t, a, b, 2, 10*time.Second)
+}
+
+// TestRelayIntegration_PairFailsOverToTheStandbyOnItsOwn connects two Managers
+// over relay E, the first of their relay set E, F, and stops E without telling
+// either Manager. Each one probes its silent peer, gets no answer and dials F,
+// the next relay of the set, so the pair handshakes over F with no update in
+// between.
+func TestRelayIntegration_PairFailsOverToTheStandbyOnItsOwn(t *testing.T) {
+	t.Parallel()
+	relayLogs := &logBuffer{}
+	dumpOnFailure(t, relayLogs)
+
+	a := newMeshNode(t, "node-a", "10.99.0.1")
+	b := newMeshNode(t, "node-b", "10.99.0.2")
+	relayE, e := startRelay(t, relayLogs, "E", a, b)
+	_, f := startRelay(t, relayLogs, "F", a, b)
+
+	a.mgr.SetRelayProbe(a.sendProbe)
+	b.mgr.SetRelayProbe(b.sendProbe)
+	a.startSelection()
+	b.startSelection()
+
+	if err := a.mgr.AddPeer(b.peerOnSet(e, f)); err != nil {
+		t.Fatalf("%s: AddPeer(%s): %v", a.id, b.id, err)
+	}
+	if err := b.mgr.AddPeer(a.peerOnSet(e, f)); err != nil {
+		t.Fatalf("%s: AddPeer(%s): %v", b.id, a.id, err)
+	}
+	pingBoth(t, a, b, 1, 20*time.Second)
+	waitSelectedRelayed(t, a, b)
+	waitSelectedRelayed(t, b, a)
+
+	if err := relayE.Stop(); err != nil {
+		t.Fatalf("relay E: Stop: %v, want nil", err)
+	}
+	// No handshake completes over E once it stopped, so one later than this
+	// that the device reports at F's address went through F.
+	stoppedAt := time.Now()
+	relayF := netip.MustParseAddrPort(f)
+
+	overF := func(n, partner *meshNode) bool {
+		stats, err := n.mgr.MeshPeerStats()
+		if err != nil {
+			t.Fatalf("%s: MeshPeerStats: %v", n.id, err)
+		}
+		i := slices.IndexFunc(stats, func(s wireguard.MeshPeerStat) bool { return s.NodeID == partner.id })
+		if i < 0 {
+			return false
+		}
+		endpoint := netip.AddrPortFrom(stats[i].Endpoint.Addr().Unmap(), stats[i].Endpoint.Port())
+		return stats[i].LastHandshake.After(stoppedAt) && endpoint == relayF
+	}
+	if !waitFor(45*time.Second, func() bool { return overF(a, b) && overF(b, a) }) {
+		t.Fatalf("after 45s a handshake over F later than E's stop: %s = %t, %s = %t, want both",
+			a.id, overF(a, b), b.id, overF(b, a))
+	}
+	t.Logf("both nodes handshook over the standby relay after %v", time.Since(stoppedAt).Round(time.Millisecond))
+
+	pingBoth(t, a, b, 2, 10*time.Second)
+
+	for _, n := range []struct{ node, partner *meshNode }{{a, b}, {b, a}} {
+		log := n.node.logs.String()
+		fields := []string{"peer_id=" + n.partner.id, "from=" + e, "endpoint=" + f}
+		if !logged(log, "wireguard: relayed peer did not answer the probe, dialing the relay again", fields...) {
+			t.Errorf(`%s: no "wireguard: relayed peer did not answer the probe, dialing the relay again" line with %v`, n.node.id, fields)
+		}
+		if logged(log, "wireguard: relay fallback changed, moving to the new relay") {
+			t.Errorf(`%s: logged "wireguard: relay fallback changed, moving to the new relay", want no update`, n.node.id)
+		}
+	}
 }

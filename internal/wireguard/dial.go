@@ -25,8 +25,8 @@ const EndpointSelectionInterval = 5 * time.Second
 const connectedHandshakeAge = 180 * time.Second
 
 // endpointTrialMargin is added to the keepalive interval to give one trial,
-// how long an entry of a dial order is tried; the relay fallback that ends an
-// order is tried for one trial per entry before it (see dialState.trial). The
+// how long an entry of a dial order is tried; each relay that ends an order is
+// tried for one trial per entry before the first relay (see dialState.trial). The
 // keepalive is what makes WireGuard send to a newly programmed endpoint of an
 // idle peer, and the margin leaves the handshake that send starts time to
 // complete.
@@ -44,17 +44,19 @@ const relayProbeTimeout = 15 * time.Second
 const relayProbePort = 9
 
 // dialState is one peer's endpoint selection: the peer as last written, the
-// position in its dial order of the endpoint programmed on the device, when
-// that endpoint was programmed or the peer was last seen connected, and
-// whether a fresh handshake shows the peer connected.
+// position in its dial order of the endpoint programmed on the device (after a
+// failed relay re-dial, of the relay it tried; see redialInPass), when that
+// endpoint was programmed or the peer was last seen connected, and whether a
+// fresh handshake shows the peer connected.
 //
-// relayed records that the peer was last seen connected over its relay (see
-// relayedOver). A relayed peer stays on its relay: when its connection fails,
-// plexd dials the relay again instead of the direct entries before it, which
-// already failed. relayed implies onFallback. recreatedAt is when a relay
-// re-dial last replaced the device peer; a handshake older than that belongs
-// to the session the re-dial dropped. The remaining fields are the relay
-// liveness probe's state (see checkRelay).
+// relayed records that the peer was last seen connected over one of its
+// relays (see relayedOver). A relayed peer stays on its relays: when its
+// connection fails, plexd dials the next relay of its set instead of the
+// direct entries before them, which already failed. relayed implies
+// onFallback. recreatedAt is when a relay re-dial last replaced the device
+// peer; a handshake older than that belongs to the session the re-dial
+// dropped. The remaining fields are the relay liveness probe's state (see
+// checkRelay).
 type dialState struct {
 	peer         api.Peer
 	idx          int
@@ -87,37 +89,94 @@ func (s *dialState) endpoint() string {
 	return order[s.idx]
 }
 
-// onFallback reports whether the entry programmed is the peer's Fallback, the
-// relay.
+// onFallback reports whether the entry programmed is one of the peer's
+// Fallbacks, a relay.
 func (s *dialState) onFallback() bool {
-	return s.peer.Fallback != "" && s.endpoint() == s.peer.Fallback
+	endpoint := s.endpoint()
+	return endpoint != "" && slices.Contains(s.peer.Fallbacks, endpoint)
 }
 
-// relayedOver reports whether stat shows the peer reached over its relay: the
-// entry programmed is its Fallback and, when that Fallback is an address and
-// the device reports an endpoint, the device's endpoint is that address. A
-// device endpoint elsewhere means WireGuard roamed to a path the peer opened
-// directly, which a relay move must not cut and the probe must not judge. A
-// hostname Fallback cannot be compared, so the entry programmed decides.
-func (s *dialState) relayedOver(stat MeshPeerStat) bool {
+// firstRelay returns the position of the peer's first relay in its dial
+// order, or -1 when it has no relay. The Fallbacks end the order whole (see
+// dialOrder), so the first relay sits right after the direct entries.
+func (s *dialState) firstRelay() int {
+	if len(s.peer.Fallbacks) == 0 {
+		return -1
+	}
+	return max(len(s.order())-len(s.peer.Fallbacks), 0)
+}
+
+// walk returns the entries a peer that is not relayed cycles through: its
+// dial order up to and including its first relay, or the whole order when it
+// has no relay. The standby relays are never walked: only a relayed peer
+// dials them (see nextRelay).
+func (s *dialState) walk() []string {
+	order := s.order()
+	if first := s.firstRelay(); first >= 0 {
+		return order[:min(first+1, len(order))]
+	}
+	return order
+}
+
+// nextRelay returns the relay a relayed peer dials when the one programmed
+// fails: the entry of Fallbacks after it, wrapping around to the first after
+// the last, or the first when the entry programmed is not a relay. For a set
+// of one it is that relay again. It returns "" for a peer without relays,
+// which relayed rules out.
+func (s *dialState) nextRelay() string {
+	relays := s.peer.Fallbacks
+	if len(relays) == 0 {
+		return ""
+	}
+	i := slices.Index(relays, s.endpoint())
+	if i < 0 {
+		return relays[0]
+	}
+	return relays[(i+1)%len(relays)]
+}
+
+// relayedOver reports the relay stat shows the peer reached over, if any. A
+// device endpoint equal to a relay that is an address names that relay,
+// whatever entry is programmed: WireGuard roams a peer to the address its
+// partner's initiation came from, so a peer programmed on a direct entry or on
+// another relay can run over this one. Without a device endpoint, the entry
+// programmed decides. A device endpoint that matches no relay means WireGuard
+// roamed to a path the peer opened directly, which a relay move must not cut
+// and the probe must not judge, unless the entry programmed is a relay and the
+// set holds a hostname, which cannot be compared: then the entry programmed
+// decides.
+func (s *dialState) relayedOver(stat MeshPeerStat) (relay string, ok bool) {
+	if stat.Endpoint.IsValid() {
+		unmapped := func(ap netip.AddrPort) netip.AddrPort { return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()) }
+		device := unmapped(stat.Endpoint)
+		hostname := false
+		for _, r := range s.peer.Fallbacks {
+			ap, err := netip.ParseAddrPort(r)
+			if err != nil {
+				hostname = true
+				continue
+			}
+			if unmapped(ap) == device {
+				return r, true
+			}
+		}
+		if !hostname {
+			return "", false
+		}
+	}
 	if !s.onFallback() {
-		return false
+		return "", false
 	}
-	fallback, err := netip.ParseAddrPort(s.peer.Fallback)
-	if err != nil || !stat.Endpoint.IsValid() {
-		return true
-	}
-	unmapped := func(ap netip.AddrPort) netip.AddrPort { return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()) }
-	return unmapped(stat.Endpoint) == unmapped(fallback)
+	return s.endpoint(), true
 }
 
-// onRelay records that the peer's relay was just written on a fresh device
-// peer (see Manager.redialRelay): the position is the Fallback's, the peer is
-// not connected, its timer restarts, and the probe starts over, because the
-// new device peer counts its bytes from 0. The Fallback always ends the order
-// (see peerFromSnapshot), so its position is found.
-func (s *dialState) onRelay(now time.Time) {
-	s.idx = max(slices.Index(s.order(), s.peer.Fallback), 0)
+// onRelay records that relay, one of the peer's relays, was just written on a
+// fresh device peer (see Manager.redialRelay): the position is the relay's,
+// the peer is not connected, its timer restarts, and the probe starts over,
+// because the new device peer counts its bytes from 0. The Fallbacks end the
+// order (see dialOrder), so the relay's position is found.
+func (s *dialState) onRelay(now time.Time, relay string) {
+	s.idx = max(slices.Index(s.order(), relay), 0)
 	s.connected = false
 	s.programmedAt = now
 	s.recreatedAt = now
@@ -127,29 +186,51 @@ func (s *dialState) onRelay(now time.Time) {
 }
 
 // trial returns how long the entry at idx of the dial order is tried, given
-// timeout, one trial. The peer's Fallback, when it is the last entry of an
-// order of two or more, is tried for one trial per entry before it, so it is
-// held as long as those entries took together. Each of two peers that dial one
-// relay then spends at least half its cycle on it, and their relay windows
-// overlap or touch. Every other entry is tried for timeout.
+// timeout, one trial. A relay, any entry of the peer's Fallbacks, is tried for
+// one trial per entry before the first relay when there are any, so it is held
+// as long as those entries took together. Each of two peers that dial one
+// relay then spends at least half its walk on it, and their relay windows
+// overlap or touch. Every relay of the set gets the same hold, so two relayed
+// peers that rotate through the set keep the gap between them. Every other
+// entry is tried for timeout.
 func (s *dialState) trial(idx int, timeout time.Duration) time.Duration {
 	order := s.order()
-	if idx > 0 && idx == len(order)-1 && s.peer.Fallback != "" && order[idx] == s.peer.Fallback {
-		return timeout * time.Duration(idx)
+	if first := s.firstRelay(); first > 0 && idx < len(order) && slices.Contains(s.peer.Fallbacks, order[idx]) {
+		return timeout * time.Duration(first)
 	}
 	return timeout
 }
 
+// relaySet returns p's relays in dial order: its fallback_endpoints when the
+// pull carries any, otherwise its fallback_endpoint alone, the only relay a
+// control plane that predates the set sends, and nil when it has neither.
+// fallback_endpoint is not read beside a non-empty fallback_endpoints, whose
+// first entry the contract makes it. The entries are not validated, because
+// the contract allows a hostname there.
+func relaySet(p api.SnapshotPeer) []string {
+	if len(p.FallbackEndpoints) > 0 {
+		return p.FallbackEndpoints
+	}
+	if p.FallbackEndpoint != "" {
+		return []string{p.FallbackEndpoint}
+	}
+	return nil
+}
+
 // dialOrder returns the endpoints plexd tries for p, in order: the candidates
 // on a subnet this node is also on, then p's direct endpoint when it is usable,
-// then the remaining candidates, then the relay fallback. A duplicate keeps its
-// first position. dropped counts the candidates refused because they are not
-// usable by the rules usableDirectEndpoint applies to the direct endpoint.
+// then the remaining candidates, then p's relays (see relaySet). A duplicate
+// keeps its first position, except that a candidate or direct endpoint equal
+// to a relay is left out: the relays end the order whole and in set order, as
+// they do in the other side's order for this node. An empty relay entry is
+// skipped. relays counts the entries that end the order as relays, and
+// dropped the candidates refused because they are not usable by the rules
+// usableDirectEndpoint applies to the direct endpoint.
 //
 // A candidate is on-link when an entry of local of the same family contains
 // it. A host prefix (/32 or /128) makes nothing on-link: it says nothing about
 // the addresses next to it.
-func dialOrder(p api.SnapshotPeer, local []netip.Prefix, mesh netip.Prefix) (order []string, dropped int) {
+func dialOrder(p api.SnapshotPeer, local []netip.Prefix, mesh netip.Prefix) (order []string, relays, dropped int) {
 	var onLink, offLink []string
 	for _, c := range p.EndpointCandidates {
 		ap, ok := usableEndpoint(c, mesh)
@@ -164,25 +245,36 @@ func dialOrder(p api.SnapshotPeer, local []netip.Prefix, mesh netip.Prefix) (ord
 		}
 	}
 
+	set := relaySet(p)
 	seen := make(map[string]bool)
-	add := func(endpoint string) {
+	add := func(endpoint string) bool {
 		if endpoint == "" || seen[endpoint] {
-			return
+			return false
 		}
 		seen[endpoint] = true
 		order = append(order, endpoint)
+		return true
+	}
+	addDirect := func(endpoint string) {
+		if !slices.Contains(set, endpoint) {
+			add(endpoint)
+		}
 	}
 	for _, c := range onLink {
-		add(c)
+		addDirect(c)
 	}
 	if direct, ok := usableDirectEndpoint(p.Endpoint, mesh); ok {
-		add(direct)
+		addDirect(direct)
 	}
 	for _, c := range offLink {
-		add(c)
+		addDirect(c)
 	}
-	add(p.FallbackEndpoint)
-	return order, dropped
+	for _, r := range set {
+		if add(r) {
+			relays++
+		}
+	}
+	return order, relays, dropped
 }
 
 // isOnLink reports whether an entry of local of addr's family, shorter than a
@@ -203,22 +295,25 @@ func isOnLink(addr netip.Addr, local []netip.Prefix) bool {
 // tracks, in node-ID order. A peer whose latest handshake is younger than
 // connectedHandshakeAge is connected, and its device endpoint is left alone,
 // so WireGuard's roaming stays in effect. A peer that is not connected is
-// moved to the next entry of its dial order once the current one has been
-// tried for its trial (see dialState.trial): the keepalive interval plus
-// endpointTrialMargin, or for a Fallback that ends an order of n entries,
-// n-1 times that. The switch is logged with the trial of the entry it
+// moved to the next entry of its walk (see dialState.walk) once the current
+// one has been tried for its trial (see dialState.trial): the keepalive
+// interval plus endpointTrialMargin, or for a relay that follows n direct
+// entries, n times that. The switch is logged with the trial of the entry it
 // programs.
 //
-// A relayed peer (see dialState) never moves to another entry. While it is
+// A relayed peer (see dialState) never moves to a direct entry. While it is
 // connected, checkRelay probes it once it falls silent. When its handshake
-// goes stale, or the probe goes unanswered, its relay is dialed again on a
-// fresh device peer, and again each time the relay's trial passes without a
-// handshake.
+// goes stale, or the probe goes unanswered, the next relay of its set is
+// dialed on a fresh device peer, and the next one again each time a relay's
+// trial passes without a handshake.
 //
 // The device is read before mu is taken. A read error, ErrPeerStatsUnsupported
-// included, is returned unchanged with no state touched. A failed switch is
-// logged, leaves the peer on the entry still programmed, and is joined into
-// the returned error; its next attempt waits that entry's full trial again.
+// included, is returned unchanged with no state touched. A failed switch of
+// the walk is logged, leaves the peer on the entry still programmed, and is
+// joined into the returned error; its next attempt waits that entry's full
+// trial again. A failed relay re-dial is logged and joined the same way, but
+// moves the peer's position to the relay it tried, so the next attempt, one
+// relay hold later, dials the relay after it (see redialInPass).
 func (m *Manager) selectEndpoints() error {
 	stats, err := m.MeshPeerStats()
 	if err != nil {
@@ -250,7 +345,11 @@ func (m *Manager) selectEndpoints() error {
 		switch {
 		case isFresh && !st.connected:
 			st.connected = true
-			st.relayed = st.relayedOver(stat)
+			relay, relayed := st.relayedOver(stat)
+			st.relayed = relayed
+			if relayed {
+				st.idx = max(slices.Index(st.order(), relay), 0)
+			}
 			st.rxBytes = stat.RxBytes
 			st.rxAt = now
 			st.probedAt = time.Time{}
@@ -267,9 +366,11 @@ func (m *Manager) selectEndpoints() error {
 			)
 			continue
 		case isFresh:
-			relayed := st.relayedOver(stat)
-			if relayed && !st.relayed {
-				// Back on the relay: the silence window starts now.
+			relay, relayed := st.relayedOver(stat)
+			if relayed && (!st.relayed || relay != st.endpoint()) {
+				// Back on a relay, or roamed to another one: the silence
+				// window starts now.
+				st.idx = max(slices.Index(st.order(), relay), 0)
 				st.rxBytes = stat.RxBytes
 				st.rxAt = now
 				st.probedAt = time.Time{}
@@ -285,12 +386,14 @@ func (m *Manager) selectEndpoints() error {
 			st.connected = false
 			st.programmedAt = now
 			if st.relayed {
+				next := st.nextRelay()
 				m.logger.Info("wireguard: relayed peer handshake went stale, dialing the relay again",
 					"component", "wireguard",
 					"peer_id", nodeID,
-					"endpoint", st.peer.Fallback,
+					"from", st.endpoint(),
+					"endpoint", next,
 				)
-				if err := m.redialInPass(nodeID, st, now); err != nil {
+				if err := m.redialInPass(nodeID, st, next, now); err != nil {
 					errs = append(errs, err)
 				}
 				continue
@@ -307,25 +410,33 @@ func (m *Manager) selectEndpoints() error {
 			if now.Sub(st.programmedAt) < trial {
 				continue
 			}
+			next := st.nextRelay()
 			m.logger.Info("wireguard: still no handshake over the relay, dialing it again",
 				"component", "wireguard",
 				"peer_id", nodeID,
-				"endpoint", st.peer.Fallback,
+				"from", st.endpoint(),
+				"endpoint", next,
 				"trial", trial,
 			)
-			if err := m.redialInPass(nodeID, st, now); err != nil {
+			if err := m.redialInPass(nodeID, st, next, now); err != nil {
 				errs = append(errs, err)
 			}
 			continue
 		}
 
-		order := st.order()
-		if len(order) < 2 || now.Sub(st.programmedAt) < st.trial(st.idx, timeout) {
+		// A peer that lost its relayed mark while on a standby sits beyond its
+		// walk, and goes back to the walk's first entry.
+		walk := st.walk()
+		stranded := st.idx >= len(walk)
+		if len(walk) == 0 || (len(walk) < 2 && !stranded) || now.Sub(st.programmedAt) < st.trial(st.idx, timeout) {
 			continue
 		}
-		next := (st.idx + 1) % len(order)
+		next := 0
+		if !stranded {
+			next = (st.idx + 1) % len(walk)
+		}
 		st.programmedAt = now
-		peerCfg, err := m.peerConfig(st.peer, order[next])
+		peerCfg, err := m.peerConfig(st.peer, walk[next])
 		if err == nil {
 			err = m.ctrl.AddPeer(m.cfg.InterfaceName, peerCfg)
 		}
@@ -333,7 +444,7 @@ func (m *Manager) selectEndpoints() error {
 			m.logger.Warn("wireguard: endpoint switch failed",
 				"component", "wireguard",
 				"peer_id", nodeID,
-				"endpoint", order[next],
+				"endpoint", walk[next],
 				"error", err,
 			)
 			errs = append(errs, fmt.Errorf("wireguard: switch endpoint of peer %s: %w", nodeID, err))
@@ -343,9 +454,9 @@ func (m *Manager) selectEndpoints() error {
 		m.logger.Info("wireguard: trying next endpoint candidate",
 			"component", "wireguard",
 			"peer_id", nodeID,
-			"endpoint", order[next],
+			"endpoint", walk[next],
 			"attempt", next+1,
-			"of", len(order),
+			"of", len(walk),
 			"trial", st.trial(next, timeout),
 		)
 	}
@@ -363,7 +474,8 @@ func (m *Manager) selectEndpoints() error {
 //
 // So once the peer's RxBytes has not moved for one trial, the probe sends a
 // datagram through the tunnel to the peer's mesh IP, and a counter that has
-// still not moved relayProbeTimeout later dials the relay again. A failed
+// still not moved relayProbeTimeout later dials the next relay of the peer's
+// set, which is the same relay for a set of one. A failed
 // send restarts the silence, so no verdict follows a probe that never left;
 // it logs at Warn the first time and at Debug while the sends keep failing.
 // No probe goes out without a sender, or to a mesh IP outside the mesh
@@ -384,13 +496,15 @@ func (m *Manager) checkRelay(nodeID string, st *dialState, stat MeshPeerStat, no
 		if now.Sub(st.probedAt) < relayProbeTimeout {
 			return nil
 		}
+		next := st.nextRelay()
 		m.logger.Info("wireguard: relayed peer did not answer the probe, dialing the relay again",
 			"component", "wireguard",
 			"peer_id", nodeID,
-			"endpoint", st.peer.Fallback,
+			"from", st.endpoint(),
+			"endpoint", next,
 			"silent_for", now.Sub(st.rxAt),
 		)
-		return m.redialInPass(nodeID, st, now)
+		return m.redialInPass(nodeID, st, next, now)
 	}
 	if m.sendProbe == nil || now.Sub(st.rxAt) < timeout {
 		return nil
@@ -425,24 +539,29 @@ func (m *Manager) checkRelay(nodeID string, st *dialState, stat MeshPeerStat, no
 	return nil
 }
 
-// redialInPass dials st's relay again on a fresh device peer during a pass. A
-// failed attempt is logged and wrapped like a failed switch, and leaves the
-// peer not connected with its timer restarted, so the next attempt follows
-// one trial of the relay later, unless a fresh handshake on the device peer a
-// failed remove left in place marks the peer connected first.
-func (m *Manager) redialInPass(nodeID string, st *dialState, now time.Time) error {
-	if err := m.redialRelay(st.peer); err != nil {
+// redialInPass dials relay, one of st's relays, on a fresh device peer during
+// a pass. A failed attempt is logged and wrapped like a failed switch. It still
+// moves the peer's position to relay and leaves it not connected with its
+// timer restarted, so the next attempt, one trial of the relay later, dials
+// the relay after it: a relay the device keeps refusing, such as a hostname
+// that no longer resolves, must not hold the peer back from the rest of its
+// set. A fresh handshake on the device peer a failed remove left in place
+// marks the peer connected again first, over the relay it came from (see
+// dialState.relayedOver).
+func (m *Manager) redialInPass(nodeID string, st *dialState, relay string, now time.Time) error {
+	if err := m.redialRelay(st.peer, relay); err != nil {
 		m.logger.Warn("wireguard: endpoint switch failed",
 			"component", "wireguard",
 			"peer_id", nodeID,
-			"endpoint", st.peer.Fallback,
+			"endpoint", relay,
 			"error", err,
 		)
+		st.idx = max(slices.Index(st.order(), relay), 0)
 		st.connected = false
 		st.programmedAt = now
 		return fmt.Errorf("wireguard: switch endpoint of peer %s: %w", nodeID, err)
 	}
-	st.onRelay(now)
+	st.onRelay(now, relay)
 	return nil
 }
 

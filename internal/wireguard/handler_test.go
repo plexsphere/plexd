@@ -22,13 +22,15 @@ func newTestManager(ctrl WGController) *Manager {
 // ReconcileHandler tests
 // ---------------------------------------------------------------------------
 
-// snapshotPeer builds an api.SnapshotPeer with a valid 32-byte base64 key.
-func snapshotPeer(nodeID, meshIP, fallback string) api.SnapshotPeer {
+// snapshotPeer builds an api.SnapshotPeer with a valid 32-byte base64 key,
+// fallback as its fallback_endpoint and relays as its fallback_endpoints.
+func snapshotPeer(nodeID, meshIP, fallback string, relays ...string) api.SnapshotPeer {
 	return api.SnapshotPeer{
-		NodeID:           nodeID,
-		MeshIP:           meshIP,
-		PublicKey:        base64.StdEncoding.EncodeToString(make([]byte, 32)),
-		FallbackEndpoint: fallback,
+		NodeID:            nodeID,
+		MeshIP:            meshIP,
+		PublicKey:         base64.StdEncoding.EncodeToString(make([]byte, 32)),
+		FallbackEndpoint:  fallback,
+		FallbackEndpoints: relays,
 	}
 }
 

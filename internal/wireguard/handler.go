@@ -22,8 +22,9 @@ type EdgePSKLookup interface {
 // changes from the StateDiff to the WireGuard interface via the Manager.
 // PeersToRemove are node IDs resolved through the peer index; adds and updates
 // are converted from the snapshot shape via peerFromSnapshot, with the dial
-// order dialOrder builds and the edge PSK psks holds for the peer's current
-// public key. A nil psks programs no PSK.
+// order dialOrder builds, the relays that end it as Fallbacks, and the edge
+// PSK psks holds for the peer's current public key. A nil psks programs no
+// PSK.
 // Order: removes first, then updates, then adds.
 // Individual failures are logged and collected; an aggregated error is returned.
 //
@@ -113,8 +114,8 @@ func (m *Manager) snapshotPeer(p api.SnapshotPeer, psks EdgePSKLookup, local []n
 			psk = key
 		}
 	}
-	order, dropped := dialOrder(p, local, mesh)
-	peer, err := peerFromSnapshot(p, order, psk)
+	order, relays, dropped := dialOrder(p, local, mesh)
+	peer, err := peerFromSnapshot(p, order, order[len(order)-relays:], psk)
 	if err != nil {
 		return api.Peer{}, err
 	}
@@ -139,28 +140,28 @@ func (m *Manager) snapshotPeer(p api.SnapshotPeer, psks EdgePSKLookup, local []n
 // peerFromSnapshot converts a reconciliation SnapshotPeer into the WireGuard
 // api.Peer. AllowedIPs are derived locally as mesh_ip/32, Endpoints is order,
 // the dial order endpoint selection tries, and Endpoint its first entry (empty
-// for an empty order). Fallback is p's fallback_endpoint when that is the last
-// entry of order, which endpoint selection then holds longer than the others,
-// and empty otherwise, as when a candidate equal to it holds an earlier
-// position. psk, the edge PSK fetched for the peer, is carried base64-encoded;
-// a nil psk programs none.
+// for an empty order). Fallbacks is fallbacks, the relays that end order (see
+// dialOrder), and nil when there are none; endpoint selection holds them
+// longer than the others and moves a relayed peer along them. psk, the edge
+// PSK fetched for the peer, is carried base64-encoded; a nil psk programs
+// none.
 //
 // AllowedIPs is WireGuard's cryptokey routing table — the authorization boundary
 // deciding which source addresses a peer key may send from. MeshIP is therefore
 // validated as a bare IPv4 address rather than string-concatenated: an IPv6
 // mesh_ip would parse as a /32 host route only after masking a 128-bit address
 // into a /32 prefix, silently authorizing a huge range through the tunnel.
-func peerFromSnapshot(p api.SnapshotPeer, order []string, psk []byte) (api.Peer, error) {
+func peerFromSnapshot(p api.SnapshotPeer, order, fallbacks []string, psk []byte) (api.Peer, error) {
 	addr, err := netip.ParseAddr(p.MeshIP)
 	if err != nil || !addr.Is4() {
 		return api.Peer{}, fmt.Errorf("wireguard: peer %s: invalid mesh_ip %q", p.NodeID, p.MeshIP)
 	}
-	var endpoint, fallback string
+	var endpoint string
 	if len(order) > 0 {
 		endpoint = order[0]
-		if p.FallbackEndpoint != "" && order[len(order)-1] == p.FallbackEndpoint {
-			fallback = p.FallbackEndpoint
-		}
+	}
+	if len(fallbacks) == 0 {
+		fallbacks = nil
 	}
 	var pskB64 string
 	if psk != nil {
@@ -172,7 +173,7 @@ func peerFromSnapshot(p api.SnapshotPeer, order []string, psk []byte) (api.Peer,
 		MeshIP:     p.MeshIP,
 		Endpoint:   endpoint,
 		Endpoints:  order,
-		Fallback:   fallback,
+		Fallbacks:  fallbacks,
 		AllowedIPs: []string{netip.PrefixFrom(addr, 32).String()},
 		PSK:        pskB64,
 	}, nil

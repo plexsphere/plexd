@@ -817,6 +817,21 @@ func TestSnapshotPeer_FallbackEndpoints(t *testing.T) {
 	}
 }
 
+func TestPeer_FallbacksTag(t *testing.T) {
+	orig := Peer{ID: "n-002", Endpoints: []string{"203.0.113.1:51820", "203.0.113.2:51820"}, Fallbacks: []string{"203.0.113.1:51820", "203.0.113.2:51820"}}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+	if s := string(data); !strings.Contains(s, `"fallbacks":["203.0.113.1:51820","203.0.113.2:51820"]`) {
+		t.Errorf("fallbacks should serialize under the fallbacks key, got: %s", s)
+	}
+
+	orig.Fallbacks = nil
+	data, _ = roundTrip(t, orig)
+	if s := string(data); strings.Contains(s, `"fallbacks"`) {
+		t.Errorf("fallbacks should be omitted when nil, got: %s", s)
+	}
+}
+
 func TestPeer_EndpointsTag(t *testing.T) {
 	orig := Peer{ID: "n-002", Endpoint: "10.0.0.5:51820", Endpoints: []string{"10.0.0.5:51820", "203.0.113.1:51820"}}
 	data, got := roundTrip(t, orig)

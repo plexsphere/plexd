@@ -34,7 +34,7 @@ func TestDialOrder_WithoutCandidates(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p := api.SnapshotPeer{Endpoint: tt.endpoint, FallbackEndpoint: tt.fallback}
-			order, dropped := dialOrder(p, nil, testMesh)
+			order, _, dropped := dialOrder(p, nil, testMesh)
 			if !slices.Equal(order, tt.want) || dropped != 0 {
 				t.Errorf("dialOrder() = (%v, %d), want (%v, 0)", order, dropped, tt.want)
 			}
@@ -50,7 +50,7 @@ func TestDialOrder_OnLinkCandidatesFirst(t *testing.T) {
 	}
 	local := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
 
-	order, dropped := dialOrder(p, local, testMesh)
+	order, _, dropped := dialOrder(p, local, testMesh)
 
 	want := []string{"10.0.0.5:51820", "198.51.100.7:51820", "172.31.4.9:51820", "203.0.113.1:51820"}
 	if !slices.Equal(order, want) || dropped != 0 {
@@ -76,7 +76,7 @@ func TestDialOrder_NoUsableLocalPrefix(t *testing.T) {
 		{"host prefix", []netip.Prefix{netip.MustParsePrefix("10.0.0.5/32")}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			order, _ := dialOrder(p, tt.local, testMesh)
+			order, _, _ := dialOrder(p, tt.local, testMesh)
 			if !slices.Equal(order, want) {
 				t.Errorf("dialOrder() = %v, want %v", order, want)
 			}
@@ -98,7 +98,7 @@ func TestDialOrder_DropsUnusableCandidates(t *testing.T) {
 	for _, c := range unusable {
 		t.Run(c, func(t *testing.T) {
 			p := api.SnapshotPeer{EndpointCandidates: []string{c}, FallbackEndpoint: "203.0.113.1:51820"}
-			order, dropped := dialOrder(p, nil, testMesh)
+			order, _, dropped := dialOrder(p, nil, testMesh)
 			if want := []string{"203.0.113.1:51820"}; !slices.Equal(order, want) || dropped != 1 {
 				t.Errorf("dialOrder() = (%v, %d), want (%v, 1)", order, dropped, want)
 			}
@@ -111,7 +111,7 @@ func TestDialOrder_CanonicalizesAndDeduplicates(t *testing.T) {
 		EndpointCandidates: []string{"[::ffff:10.0.0.5]:51820", "198.51.100.7:51820"},
 		Endpoint:           "198.51.100.7:51820",
 	}
-	order, dropped := dialOrder(p, nil, testMesh)
+	order, _, dropped := dialOrder(p, nil, testMesh)
 	// The candidate equal to the direct endpoint keeps its first position,
 	// which is the direct endpoint's, ahead of the off-link candidates.
 	want := []string{"198.51.100.7:51820", "10.0.0.5:51820"}
@@ -174,7 +174,7 @@ func TestDialOrder_PeerObservedEndpoints(t *testing.T) {
 				Endpoint:           tt.endpoint,
 				FallbackEndpoint:   "203.0.113.1:51820",
 			}
-			order, dropped := dialOrder(p, tt.local, testMesh)
+			order, _, dropped := dialOrder(p, tt.local, testMesh)
 			if !slices.Equal(order, tt.want) || dropped != 0 {
 				t.Errorf("dialOrder() = (%v, %d), want (%v, 0)", order, dropped, tt.want)
 			}
@@ -217,36 +217,57 @@ func TestReconcileHandler_HandsTheManagerTheDialOrder(t *testing.T) {
 	}
 }
 
-// Fallback names the fallback_endpoint only where it ends the dial order, the
-// entry endpoint selection holds.
-func TestReconcileHandler_SetsTheFallback(t *testing.T) {
+// Fallbacks is the relay set as it ends the dial order, whole and in set
+// order: a candidate equal to a relay leaves the entries before the relays.
+func TestReconcileHandler_SetsTheFallbacks(t *testing.T) {
+	const r1, r2 = "203.0.113.1:51820", "203.0.113.2:51820"
 	tests := []struct {
 		name       string
 		candidates []string
 		fallback   string
+		relays     []string
 		wantOrder  []string
-		want       string
+		want       []string
 	}{
 		{
-			"fallback ends the dial order",
+			"the relay set ends the dial order",
 			[]string{"172.31.4.9:51820"},
-			"203.0.113.1:51820",
-			[]string{"198.51.100.7:51820", "172.31.4.9:51820", "203.0.113.1:51820"},
-			"203.0.113.1:51820",
+			r1,
+			[]string{r1, r2},
+			[]string{"198.51.100.7:51820", "172.31.4.9:51820", r1, r2},
+			[]string{r1, r2},
 		},
 		{
-			"fallback keeps a candidate's earlier position",
-			[]string{"203.0.113.1:51820", "172.31.4.9:51820"},
-			"203.0.113.1:51820",
-			[]string{"198.51.100.7:51820", "203.0.113.1:51820", "172.31.4.9:51820"},
-			"",
+			"fallback_endpoint alone is a set of one",
+			[]string{"172.31.4.9:51820"},
+			r1,
+			nil,
+			[]string{"198.51.100.7:51820", "172.31.4.9:51820", r1},
+			[]string{r1},
 		},
 		{
-			"no fallback",
+			"a relay equal to a candidate keeps its place in the set",
+			[]string{r1, "172.31.4.9:51820"},
+			r1,
+			[]string{r1, r2},
+			[]string{"198.51.100.7:51820", "172.31.4.9:51820", r1, r2},
+			[]string{r1, r2},
+		},
+		{
+			"a fallback_endpoint equal to a candidate ends the order",
+			[]string{r1, "172.31.4.9:51820"},
+			r1,
+			nil,
+			[]string{"198.51.100.7:51820", "172.31.4.9:51820", r1},
+			[]string{r1},
+		},
+		{
+			"no relay",
 			[]string{"172.31.4.9:51820"},
 			"",
+			nil,
 			[]string{"198.51.100.7:51820", "172.31.4.9:51820"},
-			"",
+			nil,
 		},
 	}
 	for _, tt := range tests {
@@ -254,7 +275,7 @@ func TestReconcileHandler_SetsTheFallback(t *testing.T) {
 			mgr := setupMeshManager(t, &mockController{}, discardLogger())
 			handler := ReconcileHandler(mgr, nil)
 
-			peer := snapshotPeer("peer-1", "10.99.0.2", tt.fallback)
+			peer := snapshotPeer("peer-1", "10.99.0.2", tt.fallback, tt.relays...)
 			peer.Endpoint = "198.51.100.7:51820"
 			peer.EndpointCandidates = tt.candidates
 			if err := handler(context.Background(), nil, reconcile.StateDiff{PeersToAdd: []api.SnapshotPeer{peer}}); err != nil {
@@ -268,8 +289,8 @@ func TestReconcileHandler_SetsTheFallback(t *testing.T) {
 			if !slices.Equal(st.peer.Endpoints, tt.wantOrder) {
 				t.Fatalf("Endpoints = %v, want %v", st.peer.Endpoints, tt.wantOrder)
 			}
-			if st.peer.Fallback != tt.want {
-				t.Errorf("Fallback = %q, want %q", st.peer.Fallback, tt.want)
+			if !slices.Equal(st.peer.Fallbacks, tt.want) || (tt.want == nil) != (st.peer.Fallbacks == nil) {
+				t.Errorf("Fallbacks = %#v, want %#v", st.peer.Fallbacks, tt.want)
 			}
 		})
 	}
@@ -451,7 +472,7 @@ func TestSelectEndpoints_HoldsTheFallback(t *testing.T) {
 	mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
 	_, b64 := testKey(0x0a)
 	peer := orderedPeer("node-a", b64, threeEntries...)
-	peer.Fallback = threeEntries[2]
+	peer.Fallbacks = []string{threeEntries[2]}
 	if err := mgr.AddPeer(peer); err != nil {
 		t.Fatalf("AddPeer: %v", err)
 	}
@@ -862,6 +883,15 @@ func relayStat(key [32]byte, at time.Time, rx uint64) PeerStat {
 	return s
 }
 
+// directStat returns relayStat with relayOrder[0] as the device endpoint, as
+// for a peer connected on its direct entry: relayedOver reads a device
+// endpoint equal to a relay as relayed, whatever entry is programmed.
+func directStat(key [32]byte, at time.Time, rx uint64) PeerStat {
+	s := relayStat(key, at, rx)
+	s.Endpoint = netip.MustParseAddrPort(relayOrder[0])
+	return s
+}
+
 // directEndpoint is an endpoint a peer reaches this node from directly.
 var directEndpoint = netip.MustParseAddrPort("198.51.100.9:51820")
 
@@ -876,7 +906,7 @@ func relayedManager(t *testing.T, logs *bytes.Buffer, mutate func(*api.Peer)) (*
 	mgr.meshPrefix = netip.MustParsePrefix("10.0.0.0/24")
 	key, b64 := testKey(0x0a)
 	peer := orderedPeer("node-a", b64, relayOrder...)
-	peer.Fallback = relayOrder[1]
+	peer.Fallbacks = []string{relayOrder[1]}
 	if mutate != nil {
 		mutate(&peer)
 	}
@@ -900,7 +930,7 @@ func relayedManager(t *testing.T, logs *bytes.Buffer, mutate func(*api.Peer)) (*
 // with fallback as its Fallback, keyed with b64.
 func relayUpdate(b64, fallback string) api.Peer {
 	p := orderedPeer("node-a", b64, relayOrder[0], fallback)
-	p.Fallback = fallback
+	p.Fallbacks = []string{fallback}
 	return p
 }
 
@@ -1007,7 +1037,7 @@ func TestUpdatePeer_NewFallbackMovesAPeerInItsRelayHold(t *testing.T) {
 	mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
 	_, b64 := testKey(0x0a)
 	peer := orderedPeer("node-a", b64, relayOrder...)
-	peer.Fallback = relayOrder[1]
+	peer.Fallbacks = []string{relayOrder[1]}
 	if err := mgr.AddPeer(peer); err != nil {
 		t.Fatalf("AddPeer: %v", err)
 	}
@@ -1038,7 +1068,7 @@ func TestUpdatePeer_NewFallbackMovesAPeerInItsRelayHold(t *testing.T) {
 func TestUpdatePeer_RelayedPeerKeepsItsRelay(t *testing.T) {
 	_, b64 := testKey(0x0a)
 	update := orderedPeer("node-a", b64, "172.31.4.9:51820", relayOrder[0], relayOrder[1])
-	update.Fallback = relayOrder[1]
+	update.Fallbacks = []string{relayOrder[1]}
 
 	t.Run("connected", func(t *testing.T) {
 		var logs bytes.Buffer
@@ -1121,7 +1151,7 @@ func TestUpdatePeer_NewFallbackOffTheRelayKeepsTodaysRules(t *testing.T) {
 		var logs bytes.Buffer
 		mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
 		peer := orderedPeer("node-a", b64, relayOrder...)
-		peer.Fallback = relayOrder[1]
+		peer.Fallbacks = []string{relayOrder[1]}
 		if err := mgr.AddPeer(peer); err != nil {
 			t.Fatalf("AddPeer: %v", err)
 		}
@@ -1130,7 +1160,7 @@ func TestUpdatePeer_NewFallbackOffTheRelayKeepsTodaysRules(t *testing.T) {
 
 	t.Run("connected", func(t *testing.T) {
 		mgr, ctrl, clock := start(t)
-		ctrl.stats = []PeerStat{relayStat(key, selectionStart.Add(10*time.Second), 100)}
+		ctrl.stats = []PeerStat{directStat(key, selectionStart.Add(10*time.Second), 100)}
 		passAt(t, mgr, clock, 10*time.Second)
 		if st := mgr.dial["node-a"]; !st.connected || st.relayed {
 			t.Fatalf("connected over a direct entry: connected = %v, relayed = %v, want true, false", st.connected, st.relayed)
@@ -1191,8 +1221,8 @@ func TestUpdatePeer_RelayMoveWriteFailures(t *testing.T) {
 		if got := deviceWrites(ctrl)[before:]; !slices.Equal(got, []string{"remove"}) {
 			t.Errorf("device writes = %v, want the RemovePeer alone", got)
 		}
-		if st := mgr.dial["node-a"]; st.peer.Fallback != relayOrder[1] || !st.connected {
-			t.Errorf("state = Fallback %q, connected %v, want it unchanged", st.peer.Fallback, st.connected)
+		if st := mgr.dial["node-a"]; !slices.Equal(st.peer.Fallbacks, []string{relayOrder[1]}) || !st.connected {
+			t.Errorf("state = Fallbacks %v, connected %v, want it unchanged", st.peer.Fallbacks, st.connected)
 		}
 	})
 
@@ -1210,8 +1240,8 @@ func TestUpdatePeer_RelayMoveWriteFailures(t *testing.T) {
 		if got := deviceWrites(ctrl)[before:]; !slices.Equal(got, []string{"remove", "add " + newRelay}) {
 			t.Errorf("device writes = %v, want the RemovePeer and the failed AddPeer", got)
 		}
-		if st := mgr.dial["node-a"]; st.peer.Fallback != relayOrder[1] || !st.connected {
-			t.Errorf("state = Fallback %q, connected %v, want it unchanged", st.peer.Fallback, st.connected)
+		if st := mgr.dial["node-a"]; !slices.Equal(st.peer.Fallbacks, []string{relayOrder[1]}) || !st.connected {
+			t.Errorf("state = Fallbacks %v, connected %v, want it unchanged", st.peer.Fallbacks, st.connected)
 		}
 	})
 }
@@ -1225,11 +1255,11 @@ func TestSelectEndpoints_MarksAPeerConnectedOverTheRelayRelayed(t *testing.T) {
 	mgr, ctrl, clock := newSelectionManager(Config{}, &direct)
 	key, b64 := testKey(0x0a)
 	peer := orderedPeer("node-a", b64, relayOrder...)
-	peer.Fallback = relayOrder[1]
+	peer.Fallbacks = []string{relayOrder[1]}
 	if err := mgr.AddPeer(peer); err != nil {
 		t.Fatalf("AddPeer: %v", err)
 	}
-	ctrl.stats = []PeerStat{relayStat(key, selectionStart.Add(10*time.Second), 100)}
+	ctrl.stats = []PeerStat{directStat(key, selectionStart.Add(10*time.Second), 100)}
 	passAt(t, mgr, clock, 10*time.Second)
 	requireLogLine(t, direct.String(), "wireguard: endpoint selected", "peer_id=node-a", "relayed=false")
 }
@@ -1353,11 +1383,11 @@ func TestSelectEndpoints_NoProbeWithoutASenderOrOutsideTheMeshPrefix(t *testing.
 		mgr.meshPrefix = netip.MustParsePrefix("10.0.0.0/24")
 		key, b64 := testKey(0x0a)
 		peer := orderedPeer("node-a", b64, relayOrder...)
-		peer.Fallback = relayOrder[1]
+		peer.Fallbacks = []string{relayOrder[1]}
 		if err := mgr.AddPeer(peer); err != nil {
 			t.Fatalf("AddPeer: %v", err)
 		}
-		ctrl.stats = []PeerStat{relayStat(key, selectionStart.Add(31*time.Second), 100)}
+		ctrl.stats = []PeerStat{directStat(key, selectionStart.Add(31*time.Second), 100)}
 		passAt(t, mgr, clock, 31*time.Second) // connected on 10.0.0.5:51820
 		probe := &fakeProbe{}
 		mgr.SetRelayProbe(probe.send)
@@ -1558,7 +1588,7 @@ func TestUpdatePeer_MoveStampsTheReplacementBeforeTheWrite(t *testing.T) {
 	mgr.now = clock.Now
 	key, b64 := testKey(0x0a)
 	peer := orderedPeer("node-a", b64, relayOrder...)
-	peer.Fallback = relayOrder[1]
+	peer.Fallbacks = []string{relayOrder[1]}
 	if err := mgr.AddPeer(peer); err != nil {
 		t.Fatalf("AddPeer: %v", err)
 	}
@@ -1601,7 +1631,7 @@ func TestSelectEndpoints_RelayedFollowsTheDeviceEndpoint(t *testing.T) {
 		mgr.meshPrefix = netip.MustParsePrefix("10.0.0.0/24")
 		key, _ := testKey(0x0a)
 		peer := orderedPeer("node-a", b64, relayOrder...)
-		peer.Fallback = relayOrder[1]
+		peer.Fallbacks = []string{relayOrder[1]}
 		if err := mgr.AddPeer(peer); err != nil {
 			t.Fatalf("AddPeer: %v", err)
 		}
@@ -1669,7 +1699,7 @@ func TestSelectEndpoints_RelayedFollowsTheDeviceEndpoint(t *testing.T) {
 		mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
 		key, _ := testKey(0x0a)
 		peer := orderedPeer("node-a", b64, relayOrder[0], hostRelay)
-		peer.Fallback = hostRelay
+		peer.Fallbacks = []string{hostRelay}
 		if err := mgr.AddPeer(peer); err != nil {
 			t.Fatalf("AddPeer: %v", err)
 		}
@@ -1689,14 +1719,14 @@ func TestUpdatePeer_UnchangedFallbackRestartsAPeerInItsRelayHold(t *testing.T) {
 	mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
 	_, b64 := testKey(0x0a)
 	peer := orderedPeer("node-a", b64, relayOrder...)
-	peer.Fallback = relayOrder[1]
+	peer.Fallbacks = []string{relayOrder[1]}
 	if err := mgr.AddPeer(peer); err != nil {
 		t.Fatalf("AddPeer: %v", err)
 	}
 	passAt(t, mgr, clock, 30*time.Second)
 
 	update := orderedPeer("node-a", b64, "172.31.4.9:51820", relayOrder[0], relayOrder[1])
-	update.Fallback = relayOrder[1]
+	update.Fallbacks = []string{relayOrder[1]}
 	before := len(deviceWrites(ctrl))
 	if err := mgr.UpdatePeer(update); err != nil {
 		t.Fatalf("UpdatePeer: %v", err)
@@ -1721,4 +1751,528 @@ func TestSendRelayProbe(t *testing.T) {
 			t.Errorf("SendRelayProbe(%v) = %v, want %q", tc.addr, err, tc.want)
 		}
 	}
+}
+
+// The relay set of the standby tests: the first relay R1 is relayOrder[1], so
+// relayStat reports a peer reached over R1, and R2 and R3 stand by.
+const (
+	standbyR1 = "203.0.113.1:51820"
+	standbyR2 = "203.0.113.2:51820"
+	standbyR3 = "203.0.113.3:51820"
+)
+
+// standbyOrder is a dial order of one direct entry and the relay set R1, R2,
+// R3. The first relay sits at position 1, so every relay's hold is one trial.
+var standbyOrder = []string{"10.0.0.5:51820", standbyR1, standbyR2, standbyR3}
+
+// standbySet gives p the order standbyOrder and its relays as Fallbacks; it is
+// relayedManager's mutate for the standby tests.
+func standbySet(p *api.Peer) {
+	p.Endpoints = standbyOrder
+	p.Endpoint = standbyOrder[0]
+	p.Fallbacks = standbyOrder[1:]
+}
+
+// withRelays returns node-a keyed with b64, ordered order, with its last
+// relays entries as its Fallbacks.
+func withRelays(b64 string, relays int, order ...string) api.Peer {
+	p := orderedPeer("node-a", b64, order...)
+	p.Fallbacks = order[len(order)-relays:]
+	return p
+}
+
+// movedToR2 returns relayedManager's peer on standbyOrder after an unanswered
+// probe moved it to R2 at 76 s: relayed, not connected, at position 2, with a
+// fake probe sender set.
+func movedToR2(t *testing.T, logs *bytes.Buffer) (*Manager, *statsController, *fakeClock, [32]byte) {
+	t.Helper()
+	mgr, ctrl, clock, key := relayedManager(t, logs, standbySet)
+	probe := &fakeProbe{}
+	mgr.SetRelayProbe(probe.send)
+	passAt(t, mgr, clock, 61*time.Second)
+	passAt(t, mgr, clock, 76*time.Second)
+	if st := mgr.dial["node-a"]; st.idx != 2 || !st.relayed || st.connected {
+		t.Fatalf("after the unanswered probe idx = %d, relayed = %v, connected = %v, want 2, true, false", st.idx, st.relayed, st.connected)
+	}
+	return mgr, ctrl, clock, key
+}
+
+func TestDialOrder_RelaySet(t *testing.T) {
+	const direct, cand = "198.51.100.7:51820", "172.31.4.9:51820"
+	tests := []struct {
+		name       string
+		candidates []string
+		fallback   string
+		relays     []string
+		want       []string
+		wantRelays int
+	}{
+		{"the set ends the order", []string{cand}, standbyR1, []string{standbyR1, standbyR2}, []string{direct, cand, standbyR1, standbyR2}, 2},
+		{"fallback_endpoint alone is a set of one", []string{cand}, standbyR1, nil, []string{direct, cand, standbyR1}, 1},
+		{"the set wins over fallback_endpoint", []string{cand}, "203.0.113.9:51820", []string{standbyR1, standbyR2}, []string{direct, cand, standbyR1, standbyR2}, 2},
+		{"an empty set leaves fallback_endpoint", []string{cand}, standbyR1, []string{}, []string{direct, cand, standbyR1}, 1},
+		{"empty and repeated relays are skipped", []string{cand}, standbyR1, []string{"", standbyR1, standbyR1, standbyR2}, []string{direct, cand, standbyR1, standbyR2}, 2},
+		{"a candidate equal to a relay leaves the direct part", []string{standbyR1, cand}, standbyR1, []string{standbyR1, standbyR2}, []string{direct, cand, standbyR1, standbyR2}, 2},
+		{"a candidate equal to fallback_endpoint leaves the direct part", []string{standbyR1, cand}, standbyR1, nil, []string{direct, cand, standbyR1}, 1},
+		{"no relay", []string{cand}, "", nil, []string{direct, cand}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := api.SnapshotPeer{
+				Endpoint:           direct,
+				EndpointCandidates: tt.candidates,
+				FallbackEndpoint:   tt.fallback,
+				FallbackEndpoints:  tt.relays,
+			}
+			order, relays, dropped := dialOrder(p, nil, testMesh)
+			if !slices.Equal(order, tt.want) || relays != tt.wantRelays || dropped != 0 {
+				t.Errorf("dialOrder() = (%v, %d, %d), want (%v, %d, 0)", order, relays, dropped, tt.want, tt.wantRelays)
+			}
+		})
+	}
+}
+
+func TestSelectEndpoints_NeverConnectedPeerNeverWalksTheStandbys(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
+	_, b64 := testKey(0x0a)
+	peer := orderedPeer("node-a", b64, standbyOrder...)
+	peer.Fallbacks = standbyOrder[1:]
+	if err := mgr.AddPeer(peer); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+	for after := 5 * time.Second; after <= 300*time.Second; after += 5 * time.Second {
+		passAt(t, mgr, clock, after)
+	}
+
+	// The walk switches every 30 s, to R1 at 30, 90, ... s and back at 60,
+	// 120, ... s, and never programs R2 or R3.
+	want := []string{standbyOrder[0]}
+	for i := 1; i <= 10; i++ {
+		want = append(want, standbyOrder[i%2])
+	}
+	if got := writtenEndpoints(t, ctrl); !slices.Equal(got, want) {
+		t.Errorf("written endpoints = %v, want %v", got, want)
+	}
+	lines := logLines(logs.String(), "wireguard: trying next endpoint candidate")
+	if len(lines) != 10 {
+		t.Fatalf("%d trying next endpoint candidate lines, want 10:\n%s", len(lines), logs.String())
+	}
+	for _, line := range lines {
+		words := strings.Fields(line)
+		if !slices.Contains(words, "of=2") || !slices.Contains(words, "trial=30s") {
+			t.Errorf("line %q, want of=2 and trial=30s", line)
+		}
+	}
+}
+
+func TestSelectEndpoints_ProgrammedOnADirectEntryReachedOverARelay(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
+	mgr.meshPrefix = netip.MustParsePrefix("10.0.0.0/24")
+	key, b64 := testKey(0x0a)
+	peer := orderedPeer("node-a", b64, standbyOrder...)
+	peer.Fallbacks = standbyOrder[1:]
+	if err := mgr.AddPeer(peer); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+	probe := &fakeProbe{}
+	mgr.SetRelayProbe(probe.send)
+
+	// Programmed on 10.0.0.5:51820, but WireGuard roamed to R1, where the
+	// partner's initiation came from.
+	ctrl.stats = []PeerStat{relayStat(key, selectionStart.Add(10*time.Second), 100)}
+	passAt(t, mgr, clock, 10*time.Second)
+	requireLogLine(t, logs.String(), "wireguard: endpoint selected", "peer_id=node-a", "endpoint="+standbyR1, "relayed=true")
+	if st := mgr.dial["node-a"]; st.idx != 1 || !st.relayed || !st.connected {
+		t.Fatalf("idx = %d, relayed = %v, connected = %v, want 1, true, true", st.idx, st.relayed, st.connected)
+	}
+
+	passAt(t, mgr, clock, 40*time.Second)
+	if len(probe.sent) != 1 {
+		t.Errorf("probes = %v, want one once the relayed peer was silent for a trial", probe.sent)
+	}
+}
+
+func TestSelectEndpoints_UnansweredProbeDialsTheNextRelay(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, _ := relayedManager(t, &logs, standbySet)
+	probe := &fakeProbe{}
+	mgr.SetRelayProbe(probe.send)
+	passAt(t, mgr, clock, 61*time.Second)
+	if len(probe.sent) != 1 {
+		t.Fatalf("probes at 61 s = %v, want one", probe.sent)
+	}
+
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 76*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + standbyR2}; !slices.Equal(got, want) {
+		t.Errorf("device writes = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String(), "wireguard: relayed peer did not answer the probe, dialing the relay again",
+		"peer_id=node-a", "from="+standbyR1, "endpoint="+standbyR2, "silent_for=45s")
+	if st := mgr.dial["node-a"]; st.idx != 2 || !st.relayed || st.connected {
+		t.Errorf("idx = %d, relayed = %v, connected = %v, want 2, true, false", st.idx, st.relayed, st.connected)
+	}
+}
+
+func TestSelectEndpoints_RelayHoldWithoutAHandshakeDialsTheNextRelay(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, _ := movedToR2(t, &logs)
+
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 106*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + standbyR3}; !slices.Equal(got, want) {
+		t.Fatalf("device writes after R2's hold = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String(), "wireguard: still no handshake over the relay, dialing it again",
+		"peer_id=node-a", "from="+standbyR2, "endpoint="+standbyR3, "trial=30s")
+
+	before = len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 136*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + standbyR1}; !slices.Equal(got, want) {
+		t.Fatalf("device writes after R3's hold = %v, want %v, wrapping around to the first relay", got, want)
+	}
+	requireLogLine(t, logs.String(), "wireguard: still no handshake over the relay, dialing it again",
+		"peer_id=node-a", "from="+standbyR3, "endpoint="+standbyR1, "trial=30s")
+
+	for after := 141 * time.Second; after <= 300*time.Second; after += 5 * time.Second {
+		passAt(t, mgr, clock, after)
+	}
+	if slices.Contains(deviceWrites(ctrl)[before:], "add "+standbyOrder[0]) {
+		t.Errorf("a relayed peer was programmed on a direct entry: %v", deviceWrites(ctrl)[before:])
+	}
+}
+
+func TestSelectEndpoints_StaleRelayedPeerDialsTheNextRelay(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, _ := relayedManager(t, &logs, standbySet)
+
+	// No probe sender: only the handshake's age, 180 s after 31 s, says the
+	// relay is gone.
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 211*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + standbyR2}; !slices.Equal(got, want) {
+		t.Errorf("device writes = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String(), "wireguard: relayed peer handshake went stale, dialing the relay again",
+		"peer_id=node-a", "from="+standbyR1, "endpoint="+standbyR2)
+}
+
+func TestSelectEndpoints_SetOfOneRedialsTheSameRelay(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, _ := relayedManager(t, &logs, nil)
+	probe := &fakeProbe{}
+	mgr.SetRelayProbe(probe.send)
+	passAt(t, mgr, clock, 61*time.Second)
+
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 76*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + relayOrder[1]}; !slices.Equal(got, want) {
+		t.Errorf("device writes = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String(), "wireguard: relayed peer did not answer the probe, dialing the relay again",
+		"peer_id=node-a", "from="+relayOrder[1], "endpoint="+relayOrder[1])
+}
+
+func TestSelectEndpoints_RelayedFollowsARoamBetweenRelays(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key := movedToR2(t, &logs)
+
+	// Programmed on R2, the partner's initiation arrives over R1.
+	mark := logs.Len()
+	ctrl.stats = []PeerStat{relayStat(key, selectionStart.Add(80*time.Second), 100)}
+	passAt(t, mgr, clock, 80*time.Second)
+	requireLogLine(t, logs.String()[mark:], "wireguard: endpoint selected", "peer_id=node-a", "endpoint="+standbyR1, "relayed=true")
+	if st := mgr.dial["node-a"]; st.idx != 1 || !st.relayed || !st.connected {
+		t.Fatalf("idx = %d, relayed = %v, connected = %v, want 1, true, true", st.idx, st.relayed, st.connected)
+	}
+
+	// The next failure advances from R1, the relay that carried the tunnel.
+	mgr.SetRelayProbe(nil)
+	mark = logs.Len()
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 260*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + standbyR2}; !slices.Equal(got, want) {
+		t.Errorf("device writes = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String()[mark:], "wireguard: relayed peer handshake went stale, dialing the relay again",
+		"peer_id=node-a", "from="+standbyR1, "endpoint="+standbyR2)
+}
+
+func TestSelectEndpoints_ConnectedPeerFollowsARoamBetweenRelays(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key := relayedManager(t, &logs, standbySet)
+	probe := &fakeProbe{}
+	mgr.SetRelayProbe(probe.send)
+
+	// Connected over R1 since 31 s, the peer roams to R2 at 40 s.
+	roamed := relayStat(key, selectionStart.Add(40*time.Second), 100)
+	roamed.Endpoint = netip.MustParseAddrPort(standbyR2)
+	ctrl.stats = []PeerStat{roamed}
+	passAt(t, mgr, clock, 40*time.Second)
+	if st := mgr.dial["node-a"]; st.idx != 2 || !st.relayed || !st.connected {
+		t.Fatalf("idx = %d, relayed = %v, connected = %v, want 2, true, true", st.idx, st.relayed, st.connected)
+	}
+
+	// The silence window starts over at 40 s, not at 31 s.
+	passAt(t, mgr, clock, 61*time.Second)
+	if len(probe.sent) != 0 {
+		t.Fatalf("probes at 61 s = %v, want none: the roam starts a new silence window", probe.sent)
+	}
+	passAt(t, mgr, clock, 70*time.Second)
+	if len(probe.sent) != 1 {
+		t.Fatalf("probes at 70 s = %v, want one", probe.sent)
+	}
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 85*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + standbyR3}; !slices.Equal(got, want) {
+		t.Errorf("device writes = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String(), "wireguard: relayed peer did not answer the probe, dialing the relay again",
+		"peer_id=node-a", "from="+standbyR2, "endpoint="+standbyR3, "silent_for=45s")
+}
+
+func TestSelectEndpoints_HostnameRelayIsJudgedByTheEntryProgrammed(t *testing.T) {
+	const hostRelay = "relay-e.example:51821"
+	var logs bytes.Buffer
+	mgr, ctrl, clock := newSelectionManager(Config{}, &logs)
+	key, b64 := testKey(0x0a)
+	if err := mgr.AddPeer(withRelays(b64, 2, "10.0.0.5:51820", hostRelay, standbyR2)); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+	passAt(t, mgr, clock, 30*time.Second)
+	if got := mgr.dial["node-a"].endpoint(); got != hostRelay {
+		t.Fatalf("entry programmed at 30 s = %q, want %q", got, hostRelay)
+	}
+
+	// A device endpoint that matches no address relay may be the hostname's.
+	ctrl.stats = []PeerStat{handshakeAt(key, selectionStart.Add(31*time.Second))}
+	passAt(t, mgr, clock, 31*time.Second)
+	requireLogLine(t, logs.String(), "wireguard: endpoint selected", "peer_id=node-a", "relayed=true")
+	if st := mgr.dial["node-a"]; st.idx != 1 || !st.relayed {
+		t.Errorf("idx = %d, relayed = %v, want 1, true", st.idx, st.relayed)
+	}
+}
+
+func TestSelectEndpoints_NextRelayDialFailure(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key := relayedManager(t, &logs, standbySet)
+	probe := &fakeProbe{}
+	mgr.SetRelayProbe(probe.send)
+	passAt(t, mgr, clock, 61*time.Second)
+
+	removeErr := errors.New("netlink: busy")
+	ctrl.removePeerErr = removeErr
+	clock.Set(selectionStart.Add(76 * time.Second))
+	err := mgr.selectEndpoints()
+	if err == nil || !strings.HasPrefix(err.Error(), "wireguard: switch endpoint of peer node-a: remove device peer:") || !errors.Is(err, removeErr) {
+		t.Fatalf("selectEndpoints = %v, want wireguard: switch endpoint of peer node-a: remove device peer: wrapping %v", err, removeErr)
+	}
+	requireLogLine(t, logs.String(), "wireguard: endpoint switch failed", "level=WARN", "peer_id=node-a", "endpoint="+standbyR2)
+	if st := mgr.dial["node-a"]; st.idx != 2 || !st.relayed || st.connected {
+		t.Fatalf("after the failed dial idx = %d, relayed = %v, connected = %v, want 2, true, false", st.idx, st.relayed, st.connected)
+	}
+
+	// One hold later the next attempt moves on to the relay after the one
+	// the device refused.
+	ctrl.removePeerErr = nil
+	ctrl.stats = []PeerStat{{PublicKey: key}}
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 106*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + standbyR3}; !slices.Equal(got, want) {
+		t.Errorf("device writes = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String(), "wireguard: still no handshake over the relay, dialing it again",
+		"peer_id=node-a", "from="+standbyR2, "endpoint="+standbyR3)
+}
+
+func TestUpdatePeer_StandbyChangeKeepsTheRelay(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, _, _ := relayedManager(t, &logs, standbySet)
+	_, b64 := testKey(0x0a)
+
+	before := len(deviceWrites(ctrl))
+	if err := mgr.UpdatePeer(withRelays(b64, 2, "10.0.0.5:51820", standbyR1, "203.0.113.4:51820")); err != nil {
+		t.Fatalf("UpdatePeer: %v", err)
+	}
+	if got := deviceWrites(ctrl)[before:]; !slices.Equal(got, []string{"add "}) {
+		t.Errorf("device writes = %v, want one AddPeer that leaves the endpoint", got)
+	}
+	if st := mgr.dial["node-a"]; st.idx != 1 || !st.relayed || !st.connected {
+		t.Errorf("idx = %d, relayed = %v, connected = %v, want 1, true, true", st.idx, st.relayed, st.connected)
+	}
+}
+
+// reconnectedOnR2 returns movedToR2's peer after it connected again over R2
+// at 80 s: relayed, connected, at position 2.
+func reconnectedOnR2(t *testing.T, logs *bytes.Buffer) (*Manager, *statsController) {
+	t.Helper()
+	mgr, ctrl, clock, key := movedToR2(t, logs)
+	over := relayStat(key, selectionStart.Add(80*time.Second), 100)
+	over.Endpoint = netip.MustParseAddrPort(standbyR2)
+	ctrl.stats = []PeerStat{over}
+	passAt(t, mgr, clock, 80*time.Second)
+	if st := mgr.dial["node-a"]; st.idx != 2 || !st.relayed || !st.connected {
+		t.Fatalf("after the handshake over R2 idx = %d, relayed = %v, connected = %v, want 2, true, true", st.idx, st.relayed, st.connected)
+	}
+	return mgr, ctrl
+}
+
+// checkStandbyUpdate applies update to reconnectedOnR2's peer and checks the
+// device writes and the position. An empty from means the peer keeps R2,
+// connected; otherwise it moves to the update's first relay, logging the move
+// from from.
+func checkStandbyUpdate(t *testing.T, update api.Peer, writes []string, idx int, from string) {
+	t.Helper()
+	var logs bytes.Buffer
+	mgr, ctrl := reconnectedOnR2(t, &logs)
+	mark := logs.Len()
+
+	before := len(deviceWrites(ctrl))
+	if err := mgr.UpdatePeer(update); err != nil {
+		t.Fatalf("UpdatePeer: %v", err)
+	}
+	if got := deviceWrites(ctrl)[before:]; !slices.Equal(got, writes) {
+		t.Errorf("device writes = %v, want %v", got, writes)
+	}
+	st := mgr.dial["node-a"]
+	moves := logLines(logs.String()[mark:], "wireguard: relay fallback changed, moving to the new relay")
+	if from == "" {
+		if st.idx != idx || !st.relayed || !st.connected {
+			t.Errorf("idx = %d, relayed = %v, connected = %v, want %d, true, true", st.idx, st.relayed, st.connected, idx)
+		}
+		if len(moves) != 0 {
+			t.Errorf("move lines %v, want none", moves)
+		}
+		return
+	}
+	if st.idx != idx || !st.relayed || st.connected {
+		t.Errorf("idx = %d, relayed = %v, connected = %v, want %d, true, false", st.idx, st.relayed, st.connected, idx)
+	}
+	requireLogLine(t, logs.String()[mark:], "wireguard: relay fallback changed, moving to the new relay",
+		"peer_id=node-a", "from="+from, "to="+update.Fallbacks[0])
+}
+
+func TestUpdatePeer_PeerOnAStandbyKeepsItWhileTheFirstRelayStays(t *testing.T) {
+	_, b64 := testKey(0x0a)
+	checkStandbyUpdate(t, withRelays(b64, 3, "172.31.4.9:51820", "10.0.0.5:51820", standbyR1, standbyR2, standbyR3),
+		[]string{"add "}, 3, "")
+}
+
+func TestUpdatePeer_PeerOnAStandbyKeepsItWhenItBecomesFirst(t *testing.T) {
+	_, b64 := testKey(0x0a)
+	checkStandbyUpdate(t, withRelays(b64, 2, "10.0.0.5:51820", standbyR2, standbyR3), []string{"add "}, 1, "")
+}
+
+func TestUpdatePeer_PeerOnAStandbyFollowsANewFirstRelay(t *testing.T) {
+	_, b64 := testKey(0x0a)
+	checkStandbyUpdate(t, withRelays(b64, 2, "10.0.0.5:51820", standbyR3, standbyR2),
+		[]string{"remove", "add " + standbyR3}, 1, standbyR2)
+}
+
+func TestUpdatePeer_PeerOnADroppedStandbyMovesToTheFirstRelay(t *testing.T) {
+	_, b64 := testKey(0x0a)
+	checkStandbyUpdate(t, withRelays(b64, 2, "10.0.0.5:51820", standbyR1, standbyR3),
+		[]string{"remove", "add " + standbyR1}, 1, standbyR2)
+}
+
+// strandOnR2 takes a peer connected over R2 at position posR2 off the relay:
+// at 90 s WireGuard roams it to a direct path, which clears the relayed mark
+// and leaves the position on R2, and at 270 s that handshake goes stale.
+func strandOnR2(t *testing.T, mgr *Manager, ctrl *statsController, clock *fakeClock, key [32]byte, posR2 int) {
+	t.Helper()
+	over := relayStat(key, selectionStart.Add(80*time.Second), 100)
+	over.Endpoint = netip.MustParseAddrPort(standbyR2)
+	ctrl.stats = []PeerStat{over}
+	passAt(t, mgr, clock, 80*time.Second)
+	direct := relayStat(key, selectionStart.Add(90*time.Second), 200)
+	direct.Endpoint = directEndpoint
+	ctrl.stats = []PeerStat{direct}
+	passAt(t, mgr, clock, 90*time.Second)
+	if st := mgr.dial["node-a"]; st.idx != posR2 || st.relayed || !st.connected {
+		t.Fatalf("after the roam to a direct path idx = %d, relayed = %v, connected = %v, want %d, false, true", st.idx, st.relayed, st.connected, posR2)
+	}
+	passAt(t, mgr, clock, 270*time.Second)
+	if st := mgr.dial["node-a"]; st.connected {
+		t.Fatal("still connected after the direct handshake went stale")
+	}
+}
+
+func TestSelectEndpoints_StrandedPeerGoesBackToTheWalksFirstEntry(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key := movedToR2(t, &logs)
+	strandOnR2(t, mgr, ctrl, clock, key, 2)
+
+	// R2 lies beyond the walk 10.0.0.5, R1. Once its hold ends the peer goes
+	// back to the walk's first entry, not to R1 after it.
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 295*time.Second)
+	if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+		t.Fatalf("device writes within R2's hold = %v, want none", got)
+	}
+	passAt(t, mgr, clock, 300*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"add " + standbyOrder[0]}; !slices.Equal(got, want) {
+		t.Errorf("device writes = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String(), "wireguard: trying next endpoint candidate",
+		"peer_id=node-a", "endpoint="+standbyOrder[0], "attempt=1", "of=2")
+}
+
+func TestSelectEndpoints_StrandedPeerWithoutDirectEntriesGoesBackToTheFirstRelay(t *testing.T) {
+	var logs bytes.Buffer
+	relays := []string{standbyR1, standbyR2}
+	mgr, ctrl, clock, key := relayedManager(t, &logs, func(p *api.Peer) {
+		p.Endpoints = relays
+		p.Endpoint = relays[0]
+		p.Fallbacks = relays
+	})
+	probe := &fakeProbe{}
+	mgr.SetRelayProbe(probe.send)
+	passAt(t, mgr, clock, 61*time.Second)
+	passAt(t, mgr, clock, 76*time.Second)
+	if st := mgr.dial["node-a"]; st.idx != 1 || !st.relayed {
+		t.Fatalf("after the unanswered probe idx = %d, relayed = %v, want 1, true", st.idx, st.relayed)
+	}
+	strandOnR2(t, mgr, ctrl, clock, key, 1)
+
+	// The walk is R1 alone, which would never switch; the stranded peer still
+	// goes back to it once R2's trial ends.
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 300*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"add " + standbyR1}; !slices.Equal(got, want) {
+		t.Errorf("device writes = %v, want %v", got, want)
+	}
+}
+
+func TestSelectEndpoints_EveryRelaySharesTheFirstRelaysHold(t *testing.T) {
+	var logs bytes.Buffer
+	twoDirect := []string{"10.0.0.5:51820", "172.31.4.9:51820", standbyR1, standbyR2}
+	mgr, ctrl, clock, _ := relayedManager(t, &logs, func(p *api.Peer) {
+		p.Endpoints = twoDirect
+		p.Fallbacks = twoDirect[2:]
+	})
+	probe := &fakeProbe{}
+	mgr.SetRelayProbe(probe.send)
+	passAt(t, mgr, clock, 61*time.Second)
+	passAt(t, mgr, clock, 76*time.Second)
+	if got := mgr.dial["node-a"].endpoint(); got != standbyR2 {
+		t.Fatalf("entry programmed after the unanswered probe = %q, want %q", got, standbyR2)
+	}
+
+	// Two direct entries come before the first relay, so the standby R2 is
+	// held for two trials, as R1 is, before the next relay is dialed.
+	before := len(deviceWrites(ctrl))
+	for after := 81 * time.Second; after < 136*time.Second; after += 5 * time.Second {
+		passAt(t, mgr, clock, after)
+	}
+	if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+		t.Fatalf("device writes within R2's hold = %v, want none", got)
+	}
+	passAt(t, mgr, clock, 136*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"remove", "add " + standbyR1}; !slices.Equal(got, want) {
+		t.Errorf("device writes after R2's hold = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String(), "wireguard: still no handshake over the relay, dialing it again",
+		"peer_id=node-a", "from="+standbyR2, "endpoint="+standbyR1, "trial=1m0s")
 }
