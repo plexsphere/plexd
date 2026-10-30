@@ -893,7 +893,7 @@ func runAgent(ctx context.Context) error {
 	// and with local consent off (a nil relay) the handler says that the
 	// control plane asks for one.
 	if bridgeMgr != nil {
-		reconciler.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), logger))
+		reconciler.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
 		if ingressMgr != nil {
 			reconciler.RegisterHandler(bridge.IngressReconcileHandler(ingressMgr, logger))
 		}

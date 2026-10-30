@@ -16,6 +16,10 @@ type Manager struct {
 	logger *slog.Logger
 	relay  *Relay
 
+	// relayStatus exists with or without local consent: a bridge without it
+	// reports stopped or not_consented. It is safe for concurrent use.
+	relayStatus *RelayStatusTracker
+
 	// tracked state
 	active        bool
 	meshIface     string
@@ -37,6 +41,7 @@ func NewManager(ctrl RouteController, cfg Config, logger *slog.Logger) *Manager 
 		cfg:          cfg,
 		logger:       logger,
 		relay:        relay,
+		relayStatus:  NewRelayStatusTracker(),
 		activeRoutes: make(map[string]struct{}),
 	}
 }
@@ -197,6 +202,14 @@ func (m *Manager) Teardown() error {
 // RelayReconcileHandler.
 func (m *Manager) Relay() *Relay {
 	return m.relay
+}
+
+// RelayStatusTracker returns the tracker RelayReconcileHandler records the
+// relay's state on and the RelayStatusReporter reads. It is never nil, with or
+// without local consent, and Teardown leaves it as it is: the reporter sends
+// its own stopped report when plexd shuts down.
+func (m *Manager) RelayStatusTracker() *RelayStatusTracker {
+	return m.relayStatus
 }
 
 // UpdateRoutes computes the diff between current active routes and the desired

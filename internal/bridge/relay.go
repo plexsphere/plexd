@@ -91,6 +91,7 @@ type relayRun struct {
 	conn    relayConn
 	port    int
 	limiter handshakeLimiter
+	boundAt time.Time // when the socket was bound, from Relay.now
 
 	stop       chan struct{} // closed to end the sweeper
 	dispatched chan struct{} // closed when the dispatch loop returns
@@ -196,6 +197,7 @@ func (r *Relay) start(port int) error {
 		conn:       conn,
 		port:       port,
 		limiter:    r.newLimiter(),
+		boundAt:    r.now(),
 		stop:       make(chan struct{}),
 		dispatched: make(chan struct{}),
 		swept:      make(chan struct{}),
@@ -256,6 +258,17 @@ func (r *Relay) Running() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.run != nil
+}
+
+// Bound returns the port the relay socket is bound on and when it was
+// bound. ok is false while the relay is not running.
+func (r *Relay) Bound() (port int, at time.Time, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.run == nil {
+		return 0, time.Time{}, false
+	}
+	return r.run.port, r.run.boundAt, true
 }
 
 // ListenAddr returns the local address of the relay socket, or nil while the
