@@ -199,10 +199,10 @@ func TestUserspaceBackend_HandshakeOverChannelBind(t *testing.T) {
 }
 
 func TestUserspaceBackend_HandshakeOverLoopbackUDP(t *testing.T) {
-	b := newTestBackend(t, conn.NewDefaultBind())
+	b := newTestBackend(t, newDefaultBind())
 	// Restore the real bind: newTestBackend forced a single shared instance,
 	// but two UDP devices each need their own.
-	b.newBind = conn.NewDefaultBind
+	b.newBind = newDefaultBind
 
 	keyA := mustKey(t)
 	keyB := mustKey(t)
@@ -330,7 +330,7 @@ func TestUserspaceBackend_CreateDevice_PortInUse(t *testing.T) {
 	port := held.LocalAddr().(*net.UDPAddr).Port
 
 	b := newTestBackend(t, nil)
-	b.newBind = conn.NewDefaultBind
+	b.newBind = newDefaultBind
 
 	tdev := newTrackedTUN()
 	key := mustKey(t)
