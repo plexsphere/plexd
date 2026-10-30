@@ -785,6 +785,38 @@ func TestSnapshotPeer_EndpointCandidates(t *testing.T) {
 	}
 }
 
+func TestSnapshotPeer_FallbackEndpoints(t *testing.T) {
+	const withSet = `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","mesh_ip":"10.99.0.2","public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=","fallback_endpoint":"203.0.113.1:51820","fallback_endpoints":["203.0.113.1:51820","[2001:db8::1]:51821"]}`
+	var got SnapshotPeer
+	if err := json.Unmarshal([]byte(withSet), &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if want := []string{"203.0.113.1:51820", "[2001:db8::1]:51821"}; !slices.Equal(got.FallbackEndpoints, want) {
+		t.Errorf("FallbackEndpoints = %v, want %v", got.FallbackEndpoints, want)
+	}
+
+	for name, doc := range map[string]string{
+		"without the key": `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","mesh_ip":"10.99.0.2","public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=","fallback_endpoint":"203.0.113.1:51820"}`,
+		"with null":       `{"node_id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1","mesh_ip":"10.99.0.2","public_key":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=","fallback_endpoints":null}`,
+	} {
+		var absent SnapshotPeer
+		if err := json.Unmarshal([]byte(doc), &absent); err != nil {
+			t.Fatalf("%s: Unmarshal: %v", name, err)
+		}
+		if absent.FallbackEndpoints != nil {
+			t.Errorf("%s: FallbackEndpoints = %#v, want nil", name, absent.FallbackEndpoints)
+		}
+	}
+
+	data, err := json.Marshal(SnapshotPeer{NodeID: "n-001", FallbackEndpoint: "203.0.113.1:51820"})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if s := string(data); strings.Contains(s, `"fallback_endpoints"`) {
+		t.Errorf("fallback_endpoints should be omitted when nil, got: %s", s)
+	}
+}
+
 func TestPeer_EndpointsTag(t *testing.T) {
 	orig := Peer{ID: "n-002", Endpoint: "10.0.0.5:51820", Endpoints: []string{"10.0.0.5:51820", "203.0.113.1:51820"}}
 	data, got := roundTrip(t, orig)

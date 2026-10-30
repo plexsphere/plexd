@@ -11,7 +11,7 @@ import (
 func sampleSnapshot() *api.NodeStateSnapshot {
 	return &api.NodeStateSnapshot{
 		Peers: []api.SnapshotPeer{
-			{NodeID: "node-1", PublicKey: "pk-1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820", EndpointCandidates: []string{"10.0.0.5:51820"}},
+			{NodeID: "node-1", PublicKey: "pk-1", MeshIP: "10.0.0.1", FallbackEndpoint: "1.2.3.4:51820", FallbackEndpoints: []string{"1.2.3.4:51820", "5.6.7.8:51820"}, EndpointCandidates: []string{"10.0.0.5:51820"}},
 		},
 		// Populated so the never-stored assertions below bite instead of holding
 		// vacuously against a fixture that never carried the block.
@@ -118,6 +118,7 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 
 	// Mutate the source after Update — snapshot must be unaffected.
 	desired.Peers[0].NodeID = "mutated"
+	desired.Peers[0].FallbackEndpoints[0] = "mutated"
 	desired.Peers[0].EndpointCandidates[0] = "mutated"
 	desired.Policy.Rules[0].Action = "deny"
 	desired.Policy.Rules[0].Ports.From = 8443
@@ -130,6 +131,9 @@ func TestStateSnapshot_UpdateCopiesData(t *testing.T) {
 
 	if got.Peers[0].NodeID == "mutated" {
 		t.Error("Peers were not copied on Update")
+	}
+	if got.Peers[0].FallbackEndpoints[0] == "mutated" {
+		t.Error("Peer fallback endpoints were not copied on Update")
 	}
 	if got.Peers[0].EndpointCandidates[0] == "mutated" {
 		t.Error("Peer endpoint candidates were not copied on Update")
@@ -162,6 +166,7 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 
 	// Mutate the returned value — snapshot must be unaffected.
 	got.Peers[0].NodeID = "mutated"
+	got.Peers[0].FallbackEndpoints[0] = "mutated"
 	got.Peers[0].EndpointCandidates[0] = "mutated"
 	got.Policy.Rules[0].Action = "deny"
 	got.Policy.Rules[0].Ports.To = 8443
@@ -173,6 +178,9 @@ func TestStateSnapshot_GetReturnsCopy(t *testing.T) {
 
 	if got2.Peers[0].NodeID == "mutated" {
 		t.Error("Get did not return a copy of Peers")
+	}
+	if got2.Peers[0].FallbackEndpoints[0] == "mutated" {
+		t.Error("Get did not return a copy of the peer fallback endpoints")
 	}
 	if got2.Peers[0].EndpointCandidates[0] == "mutated" {
 		t.Error("Get did not return a copy of the peer endpoint candidates")

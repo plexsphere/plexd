@@ -294,6 +294,28 @@ func TestFetchState_ReturnsSnapshot(t *testing.T) {
 	}
 }
 
+// TestFetchState_MalformedFallbackEndpoints proves a fallback_endpoints that
+// is not an array of strings fails the pull's decode like any malformed pull,
+// rather than being read as an empty set.
+func TestFetchState_MalformedFallbackEndpoints(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"peers":[{"node_id":"p1","mesh_ip":"10.0.0.2","public_key":"pk1",` +
+			`"fallback_endpoint":"203.0.113.1:51820","fallback_endpoints":"203.0.113.1:51820"}],` +
+			`"reachability":null,"policy":null,"bridge":null,"state":null,"reports":null,"executions":[]}`))
+	})
+
+	_, err := client.FetchState(context.Background(), "n1")
+	if err == nil || !strings.HasPrefix(err.Error(), "api: decode response:") {
+		t.Fatalf("FetchState error = %v, want one that starts with api: decode response:", err)
+	}
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) {
+		t.Errorf("FetchState error = %v, want it to wrap a *json.UnmarshalTypeError", err)
+	}
+}
+
 func TestRotateKeys_Success(t *testing.T) {
 	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
