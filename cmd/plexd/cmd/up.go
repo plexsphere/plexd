@@ -891,7 +891,8 @@ func runAgent(ctx context.Context) error {
 	// Register bridge reconcile handlers (conditional). The relay handler runs
 	// whenever bridge mode does: the state pull starts and stops the relay,
 	// and with local consent off (a nil relay) the handler says that the
-	// control plane asks for one.
+	// control plane asks for one. It records the relay's state on the
+	// manager's tracker, which the reporter of step 17d sends.
 	if bridgeMgr != nil {
 		reconciler.RegisterHandler(bridge.RelayReconcileHandler(bridgeMgr.Relay(), bridgeMgr.RelayStatusTracker(), logger))
 		if ingressMgr != nil {
@@ -1039,6 +1040,23 @@ func runAgent(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			_ = wgMgr.RunMTUProbe(ctx, wireguard.MTUProbeInterval)
+		}()
+	}
+
+	// 17d. Start the relay status reporter on a bridge. It sends what the
+	// relay handler records on the tracker from a goroutine of its own, so a
+	// slow control plane never delays a reconcile cycle, and it ticks at the
+	// heartbeat's interval because the control plane keeps a report in force
+	// only while it is repeated within three of them. It does not wait for
+	// wgReady: the relay binds a UDP socket of its own and needs no WireGuard
+	// device. Cancelling ctx makes it send a last stopped report, bounded by
+	// 5 s, and the wg.Wait of the shutdown sequence waits for it.
+	if bridgeMgr != nil {
+		relayStatusReporter := bridge.NewRelayStatusReporter(statusInterval, identity.NodeID, client, bridgeMgr.RelayStatusTracker(), logger)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = relayStatusReporter.Run(ctx)
 		}()
 	}
 
