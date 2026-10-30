@@ -213,6 +213,31 @@ func IsEndpointCandidatesNotServed(err error) bool {
 	}
 }
 
+// IsRelayStatusNotServed reports whether err says the control plane does not
+// serve PUT /v1/nodes/{node_id}/relay-status: a 404 with any code but
+// relay_status_node_gone, or a 501 carrying the relay_status_not_provisioned
+// problem code.
+//
+// A control plane older than the operation has no route for it, and its router
+// answers 404 with whatever its not-found handler writes, so no code can be
+// required of it. The operation's own 404 is relay_status_node_gone: the node
+// was removed while the request ran, a verdict on the node rather than a
+// missing surface.
+func IsRelayStatusNotServed(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.StatusCode {
+	case http.StatusNotFound:
+		return apiErr.Code != "relay_status_node_gone"
+	case http.StatusNotImplemented:
+		return apiErr.Code == "relay_status_not_provisioned"
+	default:
+		return false
+	}
+}
+
 // IsSessionRevokedOrExpired reports whether err is the control plane's verdict
 // that the session a session activity callback names has reached a terminal
 // state: a 409 carrying session_already_revoked or session_expired. Like the
