@@ -1,10 +1,6 @@
 package wireguard
 
-import (
-	"testing"
-
-	"golang.zx2c4.com/wireguard/conn"
-)
+import "testing"
 
 // NewLoopbackUserspaceBackend returns a backend for the tests of package
 // wireguard_test. Each device it creates binds a UDP socket of its own, so
@@ -13,9 +9,9 @@ import (
 // cleanup.
 func NewLoopbackUserspaceBackend(t *testing.T) *UserspaceBackend {
 	t.Helper()
-	b := newTestBackend(t, conn.NewDefaultBind())
+	b := newTestBackend(t, newDefaultBind())
 	// newTestBackend hands every device the one bind it was given, but each
 	// device needs its own socket.
-	b.newBind = conn.NewDefaultBind
+	b.newBind = newDefaultBind
 	return b
 }

@@ -42,7 +42,7 @@ type UserspaceBackend struct {
 	logger  *slog.Logger
 
 	// newBind and uapiListen are seams: production wires them to
-	// conn.NewDefaultBind and the per-platform uapiListen, and tests swap in a
+	// newDefaultBind and the per-platform uapiListen, and tests swap in a
 	// channel bind and a loopback listener.
 	newBind    func() conn.Bind
 	uapiListen func(name string) (net.Listener, error)
@@ -61,7 +61,7 @@ func NewUserspaceBackend(logger *slog.Logger) *UserspaceBackend {
 	return &UserspaceBackend{
 		devices:    make(map[string]*userspaceDevice),
 		logger:     logger,
-		newBind:    conn.NewDefaultBind,
+		newBind:    newDefaultBind,
 		uapiListen: uapiListen,
 	}
 }
