@@ -3,6 +3,7 @@ package actions
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -27,19 +28,34 @@ type hookMetadata struct {
 // Individual file errors (hash failures, unreadable sidecars) are logged at warn
 // level but do not prevent discovery of other hooks.
 func DiscoverHooks(hooksDir string, logger *slog.Logger) ([]api.HookInfo, error) {
+	hooks, _, err := scanHooks(hooksDir, logger, integrity.HashFile)
+	return hooks, err
+}
+
+// scanHooks is DiscoverHooks with the hash as a parameter. It also returns the
+// names of the executable files it could not read, so a caller that already
+// lists one of them can keep its entry: a transient read error says nothing
+// about whether the hook is still there. A file that is gone is not a failure.
+func scanHooks(hooksDir string, logger *slog.Logger, hash func(string) (string, error)) (hooks []api.HookInfo, failed []string, err error) {
 	if hooksDir == "" {
-		return []api.HookInfo{}, nil
+		return []api.HookInfo{}, nil, nil
 	}
 
 	entries, err := os.ReadDir(hooksDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return []api.HookInfo{}, nil
+			return []api.HookInfo{}, nil, nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
 
-	var hooks []api.HookInfo
+	unreadable := func(name, msg string, err error) {
+		if errors.Is(err, fs.ErrNotExist) {
+			return
+		}
+		logger.Warn(msg, "file", name, "error", err)
+		failed = append(failed, name)
+	}
 
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -55,7 +71,7 @@ func DiscoverHooks(hooksDir string, logger *slog.Logger) ([]api.HookInfo, error)
 
 		info, err := entry.Info()
 		if err != nil {
-			logger.Warn("actions: discovery: stat failed", "file", name, "error", err)
+			unreadable(name, "actions: discovery: stat failed", err)
 			continue
 		}
 
@@ -66,9 +82,28 @@ func DiscoverHooks(hooksDir string, logger *slog.Logger) ([]api.HookInfo, error)
 
 		fullPath := filepath.Join(hooksDir, name)
 
-		checksum, err := integrity.HashFile(fullPath)
+		// Stat follows a symlink, so a link to an executable regular file stays
+		// a hook. Anything else stops here because opening a FIFO to hash it
+		// blocks until a writer appears, and the scan would block with it.
+		target, err := os.Stat(fullPath)
 		if err != nil {
-			logger.Warn("actions: discovery: hash failed", "file", name, "error", err)
+			unreadable(name, "actions: discovery: stat failed", err)
+			continue
+		}
+		if !target.Mode().IsRegular() {
+			logger.Warn("actions: discovery: not a regular file", "file", name, "mode", target.Mode().String())
+			continue
+		}
+
+		// The mode checked above is a symlink's own, which always has the
+		// executable bits. The target's decides, as it does in processFile.
+		if target.Mode().Perm()&0o111 == 0 {
+			continue
+		}
+
+		checksum, err := hash(fullPath)
+		if err != nil {
+			unreadable(name, "actions: discovery: hash failed", err)
 			continue
 		}
 
@@ -80,7 +115,7 @@ func DiscoverHooks(hooksDir string, logger *slog.Logger) ([]api.HookInfo, error)
 
 		// Try to load sidecar metadata.
 		sidecarPath := fullPath + ".json"
-		if data, err := os.ReadFile(sidecarPath); err == nil {
+		if data, err := readSidecar(sidecarPath); err == nil {
 			var meta hookMetadata
 			if err := json.Unmarshal(data, &meta); err != nil {
 				logger.Warn("actions: discovery: sidecar parse failed", "file", sidecarPath, "error", err)
@@ -103,5 +138,18 @@ func DiscoverHooks(hooksDir string, logger *slog.Logger) ([]api.HookInfo, error)
 		return hooks[i].Name < hooks[j].Name
 	})
 
-	return hooks, nil
+	return hooks, failed, nil
+}
+
+// readSidecar reads the sidecar file at path. Anything but a regular file is an
+// error, because reading a FIFO blocks the way hashing one does.
+func readSidecar(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("actions: sidecar %s is not a regular file", path)
+	}
+	return os.ReadFile(path)
 }

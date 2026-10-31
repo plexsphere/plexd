@@ -4,8 +4,15 @@ package actions
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/plexsphere/plexd/internal/api"
@@ -239,5 +246,194 @@ func TestDiscoverHooks_JsonFilesSkipped(t *testing.T) {
 	}
 	if hooks[0].Name != "hook.sh" {
 		t.Errorf("hooks[0].Name = %q, want %q", hooks[0].Name, "hook.sh")
+	}
+}
+
+func TestScanHooks_ReportsAFileThatFailsToHash(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "broken", "#!/bin/sh\necho broken\n")
+	writeExecutable(t, dir, "good", "#!/bin/sh\necho good\n")
+
+	logs := &syncBuffer{}
+	hash := func(path string) (string, error) {
+		if filepath.Base(path) == "broken" {
+			return "", fmt.Errorf("read %s: %w", path, syscall.EIO)
+		}
+		return integrity.HashFile(path)
+	}
+
+	hooks, failed, err := scanHooks(dir, slog.New(slog.NewTextHandler(logs, nil)), hash)
+	if err != nil {
+		t.Fatalf("scanHooks() error = %v", err)
+	}
+	wantHooks(t, "hooks", hooks, "good")
+	if !slices.Equal(failed, []string{"broken"}) {
+		t.Errorf("failed = %v, want [broken]", failed)
+	}
+	want := `level=WARN msg="actions: discovery: hash failed" file=broken `
+	if got := logs.String(); !strings.Contains(got, want) {
+		t.Errorf("log = %q, want it to contain %q", got, want)
+	}
+}
+
+func TestScanHooks_FileGoneBeforeTheHashIsNoFailure(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "gone", "#!/bin/sh\necho gone\n")
+
+	logs := &syncBuffer{}
+	hash := func(path string) (string, error) {
+		return "", fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
+	}
+
+	hooks, failed, err := scanHooks(dir, slog.New(slog.NewTextHandler(logs, nil)), hash)
+	if err != nil {
+		t.Fatalf("scanHooks() error = %v", err)
+	}
+	wantHooks(t, "hooks", hooks)
+	if len(failed) != 0 {
+		t.Errorf("failed = %v, want none", failed)
+	}
+	if got := logs.String(); got != "" {
+		t.Errorf("log = %q, want nothing for a file that is gone", got)
+	}
+}
+
+func TestScanHooks_SkipsWhatIsNotARegularFile(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "good", "#!/bin/sh\necho good\n")
+	pipe := filepath.Join(dir, "pipe")
+	if err := syscall.Mkfifo(pipe, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(pipe, filepath.Join(dir, "link-to-pipe")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(dir, "link-to-directory")); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &syncBuffer{}
+	var hashed []string
+	hash := func(path string) (string, error) {
+		hashed = append(hashed, filepath.Base(path))
+		return "digest", nil
+	}
+
+	hooks, failed, err := scanHooks(dir, slog.New(slog.NewTextHandler(logs, nil)), hash)
+	if err != nil {
+		t.Fatalf("scanHooks() error = %v", err)
+	}
+	wantHooks(t, "hooks", hooks, "good")
+	if !slices.Equal(hashed, []string{"good"}) {
+		t.Errorf("hashed = %v, want [good]: a non-regular file must not reach the hash", hashed)
+	}
+	if len(failed) != 0 {
+		t.Errorf("failed = %v, want none: a non-regular file is not a hook to keep", failed)
+	}
+	for _, file := range []string{"link-to-directory", "link-to-pipe", "pipe"} {
+		want := `level=WARN msg="actions: discovery: not a regular file" file=` + file + " "
+		if got := logs.String(); !strings.Contains(got, want) {
+			t.Errorf("log = %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+func TestScanHooks_SymlinkToARegularFileStaysAHook(t *testing.T) {
+	dir := t.TempDir()
+	target := writeExecutable(t, t.TempDir(), "real", "#!/bin/sh\necho real\n")
+	if err := os.Symlink(target, filepath.Join(dir, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	want, err := integrity.HashFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hooks, failed, err := scanHooks(dir, testLogger(), integrity.HashFile)
+	if err != nil {
+		t.Fatalf("scanHooks() error = %v", err)
+	}
+	wantHooks(t, "hooks", hooks, "linked")
+	if hooks[0].Checksum != want {
+		t.Errorf("checksum = %q, want the target's %q", hooks[0].Checksum, want)
+	}
+	if len(failed) != 0 {
+		t.Errorf("failed = %v, want none", failed)
+	}
+}
+
+// The directory entry's mode is the link's own, which always has the executable
+// bits, so only the target's mode says whether the link can run.
+func TestScanHooks_SymlinkToANonExecutableFileIsNoHook(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "real")
+	if err := os.WriteFile(target, []byte("#!/bin/sh\necho real\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "linked")); err != nil {
+		t.Fatal(err)
+	}
+
+	hooks, failed, err := scanHooks(dir, testLogger(), integrity.HashFile)
+	if err != nil {
+		t.Fatalf("scanHooks() error = %v", err)
+	}
+	wantHooks(t, "hooks", hooks)
+	if len(failed) != 0 {
+		t.Errorf("failed = %v, want none", failed)
+	}
+}
+
+func TestScanHooks_DanglingSymlinkIsNoFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Symlink(filepath.Join(dir, "missing"), filepath.Join(dir, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &syncBuffer{}
+	hooks, failed, err := scanHooks(dir, slog.New(slog.NewTextHandler(logs, nil)), integrity.HashFile)
+	if err != nil {
+		t.Fatalf("scanHooks() error = %v", err)
+	}
+	wantHooks(t, "hooks", hooks)
+	if len(failed) != 0 {
+		t.Errorf("failed = %v, want none", failed)
+	}
+	if got := logs.String(); got != "" {
+		t.Errorf("log = %q, want nothing for a link to nothing", got)
+	}
+}
+
+func TestScanHooks_ReportsAFileThatFailsToStat(t *testing.T) {
+	dir := t.TempDir()
+	// A link to itself lists and lstats, and fails the stat with ELOOP.
+	if err := os.Symlink("loop", filepath.Join(dir, "loop")); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := &syncBuffer{}
+	hooks, failed, err := scanHooks(dir, slog.New(slog.NewTextHandler(logs, nil)), integrity.HashFile)
+	if err != nil {
+		t.Fatalf("scanHooks() error = %v", err)
+	}
+	wantHooks(t, "hooks", hooks)
+	if !slices.Equal(failed, []string{"loop"}) {
+		t.Errorf("failed = %v, want [loop]", failed)
+	}
+	want := `level=WARN msg="actions: discovery: stat failed" file=loop `
+	if got := logs.String(); !strings.Contains(got, want) {
+		t.Errorf("log = %q, want it to contain %q", got, want)
+	}
+}
+
+func TestScanHooks_ReturnsADirectoryReadError(t *testing.T) {
+	file := writeExecutable(t, t.TempDir(), "not-a-directory", "#!/bin/sh\n")
+
+	hooks, failed, err := scanHooks(file, testLogger(), integrity.HashFile)
+	if !errors.Is(err, syscall.ENOTDIR) {
+		t.Fatalf("scanHooks() error = %v, want ENOTDIR", err)
+	}
+	if hooks != nil || failed != nil {
+		t.Errorf("scanHooks() = %v, %v, want nil results alongside the error", hooks, failed)
 	}
 }

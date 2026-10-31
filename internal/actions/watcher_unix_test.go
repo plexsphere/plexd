@@ -12,9 +12,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -813,6 +816,840 @@ func TestWatcher_HooksSnapshot(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("watcher did not exit")
 	}
+}
+
+func TestWatcher_ReloadFindsAHookWrittenWithNoWatchRunning(t *testing.T) {
+	dir := t.TempDir()
+
+	rec := &hookRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+
+	path := writeExecutable(t, dir, "deploy", "#!/bin/sh\necho deploy\n")
+	want, err := integrity.HashFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hooks, err := w.Reload()
+	if err != nil {
+		t.Fatalf("Reload() error = %v", err)
+	}
+
+	wantHooks(t, "Reload()", hooks, "deploy")
+	if hooks[0].Checksum != want {
+		t.Errorf("checksum = %q, want %q", hooks[0].Checksum, want)
+	}
+	wantHooks(t, "Hooks()", w.Hooks(), "deploy")
+	if got := rec.count(); got != 1 {
+		t.Fatalf("onChange calls = %d, want 1", got)
+	}
+	wantHooks(t, "onChange", rec.last(), "deploy")
+}
+
+func TestWatcher_ReloadDropsAHookDeletedWithNoWatchRunning(t *testing.T) {
+	dir := t.TempDir()
+	path := writeExecutable(t, dir, "deleted", "#!/bin/sh\necho deleted\n")
+	writeExecutable(t, dir, "kept", "#!/bin/sh\necho kept\n")
+
+	rec := &hookRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+
+	hooks, err := w.Reload()
+	if err != nil {
+		t.Fatalf("first Reload() error = %v", err)
+	}
+	wantHooks(t, "first Reload()", hooks, "deleted", "kept")
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	hooks, err = w.Reload()
+	if err != nil {
+		t.Fatalf("second Reload() error = %v", err)
+	}
+	wantHooks(t, "second Reload()", hooks, "kept")
+	wantHooks(t, "Hooks()", w.Hooks(), "kept")
+	wantHooks(t, "onChange", rec.last(), "kept")
+}
+
+// hashingVerifier is a HookVerifier that hashes the hook file, as
+// integrity.Verifier does, and records the digest each run was verified against.
+type hashingVerifier struct {
+	mu       sync.Mutex
+	expected []string
+}
+
+func (v *hashingVerifier) VerifyHook(_ context.Context, _, hookPath, expectedChecksum string) (bool, error) {
+	v.mu.Lock()
+	v.expected = append(v.expected, expectedChecksum)
+	v.mu.Unlock()
+
+	result, err := integrity.VerifyFile(hookPath, expectedChecksum, true)
+	if err != nil {
+		return false, err
+	}
+	return result.OK, nil
+}
+
+func (v *hashingVerifier) expectedChecksums() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return slices.Clone(v.expected)
+}
+
+func TestWatcher_ReloadOfAnEditedHookReportsTheNewDigestAndLeavesThePin(t *testing.T) {
+	dir := t.TempDir()
+	path := writeExecutable(t, dir, "deploy", "#!/bin/sh\necho v1\n")
+	first, err := integrity.HashFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Config{Enabled: boolPtr(true), HooksDir: dir}
+	cfg.ApplyDefaults()
+	reporter := &mockReporter{}
+	verifier := &hashingVerifier{}
+	executor := NewExecutor(cfg, reporter, verifier, testLogger())
+
+	alerts := &integrityRecorder{}
+	w := NewHookWatcher(dir, executor.SetHooks, alerts.onIntegrity, testLogger())
+
+	// The first reload pins the digest, as the boot scan does.
+	if _, err := w.Reload(); err != nil {
+		t.Fatalf("first Reload() error = %v", err)
+	}
+	if got := alerts.all(); len(got) != 0 {
+		t.Fatalf("alerts after the first reload = %v, want none", got)
+	}
+
+	writeExecutable(t, dir, "deploy", "#!/bin/sh\necho v2\n")
+	edited, err := integrity.HashFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hooks, err := w.Reload()
+	if err != nil {
+		t.Fatalf("second Reload() error = %v", err)
+	}
+	wantHooks(t, "second Reload()", hooks, "deploy")
+	if hooks[0].Checksum != edited {
+		t.Errorf("reloaded checksum = %q, want the edited digest %q", hooks[0].Checksum, edited)
+	}
+	want := []integrityAlert{{"deploy", first, edited}}
+	if got := alerts.all(); !slices.Equal(got, want) {
+		t.Errorf("alerts = %v, want %v", got, want)
+	}
+
+	// The manifest reads the live digest, which is how the control plane sees
+	// the drift.
+	if _, reported := executor.Capabilities(); len(reported) != 1 || reported[0].Checksum != edited {
+		t.Errorf("Capabilities() hooks = %v, want deploy with the edited digest", reported)
+	}
+
+	mustExecute(t, executor, "node-1", pendingHookExec("exec-edited", "deploy"))
+	waitFor(t, 5*time.Second, func() bool {
+		return len(reporter.getCallbacks()) >= 3
+	})
+
+	cbs := reporter.getCallbacks()
+	assertStatuses(t, cbs, []string{api.ExecutionStatusAck, api.ExecutionStatusStarted, api.ExecutionStatusFailed})
+	wantErr := "integrity check failed for hook: deploy"
+	if got := cbs[len(cbs)-1].Error; !strings.Contains(got, wantErr) {
+		t.Errorf("terminal error = %q, want it to contain %q", got, wantErr)
+	}
+	if got := verifier.expectedChecksums(); !slices.Equal(got, []string{first}) {
+		t.Errorf("verified against %v, want the first digest %q", got, first)
+	}
+
+	// A reload that finds nothing new raises no second alert.
+	if _, err := w.Reload(); err != nil {
+		t.Fatalf("third Reload() error = %v", err)
+	}
+	if got := alerts.all(); len(got) != 1 {
+		t.Errorf("alerts after a reload with no edit = %v, want the one from the edit", got)
+	}
+}
+
+// replaceWithFile swaps the directory at dir for a regular file, so reading it
+// fails with ENOTDIR.
+func replaceWithFile(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, []byte("not a directory\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWatcher_ReloadErrorLeavesTheListAlone(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "hooks")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, dir, "deploy", "#!/bin/sh\necho deploy\n")
+
+	rec := &hookRecorder{}
+	alerts := &integrityRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, alerts.onIntegrity, testLogger())
+
+	before, err := w.Reload()
+	if err != nil {
+		t.Fatalf("first Reload() error = %v", err)
+	}
+	wantHooks(t, "first Reload()", before, "deploy")
+	calls := rec.count()
+
+	replaceWithFile(t, dir)
+
+	hooks, err := w.Reload()
+	if !errors.Is(err, syscall.ENOTDIR) {
+		t.Fatalf("Reload() error = %v, want ENOTDIR", err)
+	}
+	if want := "actions: watcher: scan " + dir + ": "; !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("Reload() error = %q, want the prefix %q", err, want)
+	}
+	if hooks != nil {
+		t.Errorf("Reload() hooks = %v, want nil", hooks)
+	}
+	if got := w.Hooks(); !reflect.DeepEqual(got, before) {
+		t.Errorf("Hooks() after the failed scan = %v, want %v", got, before)
+	}
+	if got := rec.count(); got != calls {
+		t.Errorf("onChange calls = %d, want %d: a failed scan fires no callback", got, calls)
+	}
+	if got := alerts.all(); len(got) != 0 {
+		t.Errorf("alerts = %v, want none", got)
+	}
+}
+
+func TestWatcher_ReloadOfAMissingDirectoryIsAnEmptyList(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "hooks")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, dir, "deploy", "#!/bin/sh\necho deploy\n")
+
+	rec := &hookRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+
+	if _, err := w.Reload(); err != nil {
+		t.Fatalf("first Reload() error = %v", err)
+	}
+	wantHooks(t, "Hooks() before the directory is removed", w.Hooks(), "deploy")
+
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	hooks, err := w.Reload()
+	if err != nil {
+		t.Fatalf("Reload() error = %v, want nil", err)
+	}
+	if hooks == nil {
+		t.Fatal("Reload() hooks = nil, want a non-nil empty list")
+	}
+	wantHooks(t, "Reload()", hooks)
+	wantHooks(t, "Hooks()", w.Hooks())
+	if got := rec.count(); got != 2 {
+		t.Fatalf("onChange calls = %d, want 2", got)
+	}
+	wantHooks(t, "onChange", rec.last())
+}
+
+func TestWatcher_ReloadKeepsAHookThatFailsToHash(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "flaky", "#!/bin/sh\necho flaky\n")
+	if err := os.WriteFile(filepath.Join(dir, "flaky.json"), []byte(`{"description":"from the sidecar"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, dir, "steady", "#!/bin/sh\necho steady\n")
+
+	rec := &hookRecorder{}
+	alerts := &integrityRecorder{}
+	logs := &syncBuffer{}
+	w := NewHookWatcher(dir, rec.onChange, alerts.onIntegrity, slog.New(slog.NewTextHandler(logs, nil)))
+
+	before, err := w.Reload()
+	if err != nil {
+		t.Fatalf("first Reload() error = %v", err)
+	}
+	wantHooks(t, "first Reload()", before, "flaky", "steady")
+	flaky := before[0]
+	if flaky.Description != "from the sidecar" {
+		t.Fatalf("description = %q, want the sidecar's", flaky.Description)
+	}
+
+	// flaky is edited too, so a retained entry cannot be told from a fresh one
+	// by accident. never-listed has no entry to keep.
+	writeExecutable(t, dir, "flaky", "#!/bin/sh\necho edited\n")
+	writeExecutable(t, dir, "never-listed", "#!/bin/sh\necho never\n")
+	writeExecutable(t, dir, "added", "#!/bin/sh\necho added\n")
+	w.hashFile = func(path string) (string, error) {
+		switch filepath.Base(path) {
+		case "flaky", "never-listed":
+			return "", fmt.Errorf("read %s: %w", path, syscall.EIO)
+		}
+		return integrity.HashFile(path)
+	}
+
+	hooks, err := w.Reload()
+	if err != nil {
+		t.Fatalf("Reload() error = %v", err)
+	}
+	wantHooks(t, "Reload()", hooks, "added", "flaky", "steady")
+	if !reflect.DeepEqual(hooks[1], flaky) {
+		t.Errorf("flaky after a failed hash = %+v, want the previous entry %+v", hooks[1], flaky)
+	}
+	wantHooks(t, "onChange", rec.last(), "added", "flaky", "steady")
+	if got := alerts.all(); len(got) != 0 {
+		t.Errorf("alerts = %v, want none: an unread hook has no new digest", got)
+	}
+	for _, file := range []string{"flaky", "never-listed"} {
+		want := `level=WARN msg="actions: discovery: hash failed" component=actions file=` + file + " "
+		if got := logs.String(); !strings.Contains(got, want) {
+			t.Errorf("log = %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+func TestWatcher_ReloadDropsAFileThatVanishesDuringTheScan(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "steady", "#!/bin/sh\necho steady\n")
+	writeExecutable(t, dir, "vanishing", "#!/bin/sh\necho vanishing\n")
+
+	logs := &syncBuffer{}
+	w := NewHookWatcher(dir, (&hookRecorder{}).onChange, nil, slog.New(slog.NewTextHandler(logs, nil)))
+
+	hooks, err := w.Reload()
+	if err != nil {
+		t.Fatalf("first Reload() error = %v", err)
+	}
+	wantHooks(t, "first Reload()", hooks, "steady", "vanishing")
+
+	// The file goes away after the directory was listed and stat'ed, so only
+	// the hash notices.
+	w.hashFile = func(path string) (string, error) {
+		if filepath.Base(path) == "vanishing" {
+			if err := os.Remove(path); err != nil {
+				t.Errorf("remove during the scan: %v", err)
+			}
+		}
+		return integrity.HashFile(path)
+	}
+
+	hooks, err = w.Reload()
+	if err != nil {
+		t.Fatalf("Reload() error = %v", err)
+	}
+	wantHooks(t, "Reload()", hooks, "steady")
+	if got := logs.String(); strings.Contains(got, "hash failed") {
+		t.Errorf("log = %q, want no hash warning for a file that is gone", got)
+	}
+}
+
+func TestWatcher_ProcessFileKeepsAHookThatFailsToHash(t *testing.T) {
+	dir := t.TempDir()
+	path := writeExecutable(t, dir, "deploy", "#!/bin/sh\necho v1\n")
+
+	rec := &hookRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+
+	before, err := w.Reload()
+	if err != nil {
+		t.Fatalf("Reload() error = %v", err)
+	}
+	calls := rec.count()
+
+	writeExecutable(t, dir, "deploy", "#!/bin/sh\necho v2\n")
+	w.hashFile = func(string) (string, error) {
+		return "", fmt.Errorf("read %s: %w", path, syscall.EIO)
+	}
+	w.processFile("deploy")
+
+	if got := w.Hooks(); !reflect.DeepEqual(got, before) {
+		t.Errorf("Hooks() after a failed hash = %v, want %v", got, before)
+	}
+	if got := rec.count(); got != calls {
+		t.Errorf("onChange calls = %d, want %d", got, calls)
+	}
+}
+
+// Only a file that is gone leaves the list. A link to itself fails the stat with
+// ELOOP, which stands for any failure that says nothing about the hook and, unlike
+// a permission error, also fails for root.
+func TestWatcher_ProcessFileRemovesOnlyAHookThatIsGone(t *testing.T) {
+	dir := t.TempDir()
+	path := writeExecutable(t, dir, "deploy", "#!/bin/sh\necho v1\n")
+
+	rec := &hookRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+
+	before, err := w.Reload()
+	if err != nil {
+		t.Fatalf("Reload() error = %v", err)
+	}
+	calls := rec.count()
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(path, path); err != nil {
+		t.Fatal(err)
+	}
+	w.processFile("deploy")
+
+	if got := w.Hooks(); !reflect.DeepEqual(got, before) {
+		t.Errorf("Hooks() after a failed stat = %v, want %v", got, before)
+	}
+	if got := rec.count(); got != calls {
+		t.Errorf("onChange calls = %d, want %d", got, calls)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	w.processFile("deploy")
+
+	wantHooks(t, "Hooks() after the file went", w.Hooks())
+}
+
+// A scan and a file event judge a symlink by the same mode. If they disagreed, the
+// list would flip with whichever saw the link last, and every flip is a PUT.
+func TestWatcher_ScanAndFileEventAgreeOnASymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := writeExecutable(t, t.TempDir(), "real", "#!/bin/sh\necho real\n")
+	if err := os.Symlink(target, filepath.Join(dir, "linked")); err != nil {
+		t.Fatal(err)
+	}
+
+	w := NewHookWatcher(dir, func([]api.HookInfo) {}, nil, testLogger())
+
+	for _, tc := range []struct {
+		name string
+		mode os.FileMode
+		want []string
+	}{
+		{"executable target", 0o755, []string{"linked"}},
+		{"target lost its executable bit", 0o644, nil},
+		{"target got it back", 0o755, []string{"linked"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.Chmod(target, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+
+			hooks, err := w.Reload()
+			if err != nil {
+				t.Fatalf("Reload() error = %v", err)
+			}
+			wantHooks(t, "Reload()", hooks, tc.want...)
+
+			w.processFile("linked")
+			wantHooks(t, "Hooks() after a file event", w.Hooks(), tc.want...)
+		})
+	}
+}
+
+func TestWatcher_InitialScanPrunesAHookDeletedAfterAReload(t *testing.T) {
+	dir := t.TempDir()
+	path := writeExecutable(t, dir, "deleted", "#!/bin/sh\necho deleted\n")
+	writeExecutable(t, dir, "kept", "#!/bin/sh\necho kept\n")
+
+	rec := &hookRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+
+	hooks, err := w.Reload()
+	if err != nil {
+		t.Fatalf("Reload() error = %v", err)
+	}
+	wantHooks(t, "Reload()", hooks, "deleted", "kept")
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	startWatch(t, w)
+
+	_, initial := rec.waitFor(t, 1, anyHooks, "onChange was not called for the initial scan")
+	wantHooks(t, "the initial scan's onChange", initial, "kept")
+	wantHooks(t, "Hooks()", w.Hooks(), "kept")
+}
+
+func TestWatcher_InitialScanFailureReportsTheCurrentList(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "hooks")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, dir, "deploy", "#!/bin/sh\necho deploy\n")
+
+	rec := &hookRecorder{}
+	logs := &syncBuffer{}
+	w := NewHookWatcher(dir, rec.onChange, nil, slog.New(slog.NewTextHandler(logs, nil)))
+
+	if _, err := w.Reload(); err != nil {
+		t.Fatalf("Reload() error = %v", err)
+	}
+	calls := rec.count()
+
+	replaceWithFile(t, dir)
+	w.initialScan()
+
+	if got := rec.count(); got != calls+1 {
+		t.Fatalf("onChange calls = %d, want %d", got, calls+1)
+	}
+	wantHooks(t, "onChange", rec.last(), "deploy")
+	want := `level=WARN msg="actions: watcher: initial scan failed" component=actions error=`
+	if got := logs.String(); !strings.Contains(got, want) {
+		t.Errorf("log = %q, want it to contain %q", got, want)
+	}
+}
+
+func TestWatcher_ClearedExecutableBitLeavesTheList(t *testing.T) {
+	dir := t.TempDir()
+	path := writeExecutable(t, dir, "cleared", "#!/bin/sh\necho cleared\n")
+	writeExecutable(t, dir, "kept", "#!/bin/sh\necho kept\n")
+
+	rec := &hookRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+	w.debouncePeriod = time.Millisecond
+
+	startWatch(t, w)
+
+	initial, _ := rec.waitFor(t, 0, namesAre("cleared", "kept"), "initial scan did not report both hooks")
+
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec.waitFor(t, initial+1, namesAre("kept"), "a hook that lost its executable bit stayed listed")
+	wantHooks(t, "Hooks()", w.Hooks(), "kept")
+}
+
+func TestWatcher_HookReplacedByAFIFOLeavesTheList(t *testing.T) {
+	dir := t.TempDir()
+	path := writeExecutable(t, dir, "replaced", "#!/bin/sh\necho replaced\n")
+	writeExecutable(t, dir, "kept", "#!/bin/sh\necho kept\n")
+
+	rec := &hookRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+	w.debouncePeriod = time.Millisecond
+	// Opening the FIFO would block until a writer appears, so the seam turns a
+	// watcher that hashes it into a failure instead of a hang.
+	w.hashFile = func(path string) (string, error) {
+		if fi, err := os.Stat(path); err == nil && fi.Mode()&fs.ModeNamedPipe != 0 {
+			t.Errorf("hashed the FIFO at %s", path)
+			return "", errors.New("refusing to open a FIFO")
+		}
+		return integrity.HashFile(path)
+	}
+
+	startWatch(t, w)
+
+	initial, _ := rec.waitFor(t, 0, namesAre("kept", "replaced"), "initial scan did not report both hooks")
+
+	// A rename over the hook leaves the name in place, so on inotify the only
+	// event is the one that sends processFile to the FIFO.
+	fifo := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(fifo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(fifo, path); err != nil {
+		t.Fatal(err)
+	}
+
+	rec.waitFor(t, initial+1, namesAre("kept"), "a hook replaced by a FIFO stayed listed")
+	wantHooks(t, "Hooks()", w.Hooks(), "kept")
+}
+
+func TestWatcher_ReloadSkipsAnExecutableFIFO(t *testing.T) {
+	tests := []struct {
+		name string
+		fifo string
+	}{
+		{name: "in place of a hook", fifo: "pipe"},
+		{name: "in place of a sidecar", fifo: "kept.json"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeExecutable(t, dir, "kept", "#!/bin/sh\necho kept\n")
+			fifo := filepath.Join(dir, tt.fifo)
+			if err := syscall.Mkfifo(fifo, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			w := NewHookWatcher(dir, (&hookRecorder{}).onChange, nil, testLogger())
+
+			type result struct {
+				hooks []api.HookInfo
+				err   error
+			}
+			done := make(chan result, 1)
+			go func() {
+				hooks, err := w.Reload()
+				done <- result{hooks, err}
+			}()
+
+			select {
+			case res := <-done:
+				if res.err != nil {
+					t.Fatalf("Reload() error = %v", res.err)
+				}
+				wantHooks(t, "Reload()", res.hooks, "kept")
+			case <-time.After(5 * time.Second):
+				// Becoming the FIFO's writer ends the blocked read, so the
+				// leak check does not report this failure a second time.
+				if f, err := os.OpenFile(fifo, os.O_RDWR, 0); err == nil {
+					_ = f.Close()
+				}
+				<-done
+				t.Fatal("Reload blocked on a FIFO")
+			}
+		})
+	}
+}
+
+// processFile reads the sidecar with mu and changeMu held, so a read that blocks
+// would stop every later event and every reload behind it.
+func TestWatcher_ProcessFileSkipsAFIFOSidecar(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "kept", "#!/bin/sh\necho kept\n")
+	fifo := filepath.Join(dir, "kept.json")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := NewHookWatcher(dir, (&hookRecorder{}).onChange, nil, testLogger())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.processFile("kept")
+	}()
+
+	select {
+	case <-done:
+		wantHooks(t, "Hooks()", w.Hooks(), "kept")
+	case <-time.After(5 * time.Second):
+		// Becoming the FIFO's writer ends the blocked read, so the leak check
+		// does not report this failure a second time.
+		if f, err := os.OpenFile(fifo, os.O_RDWR, 0); err == nil {
+			_ = f.Close()
+		}
+		<-done
+		t.Fatal("processFile blocked on a FIFO sidecar")
+	}
+}
+
+// TestWatcher_LastOnChangeCarriesTheNewestList holds one delivery back while
+// more hooks change and a Reload runs around it. Without changeMu the writers
+// around it deliver newer lists first, and the list held back lands last and
+// stays in the executor. Each case holds back a different writer, because each
+// takes changeMu in a place of its own.
+func TestWatcher_LastOnChangeCarriesTheNewestList(t *testing.T) {
+	// stallBound is how long the held delivery waits for the writers around it.
+	// With changeMu in place they cannot finish first, so a passing run waits
+	// all of it. A host too slow to finish in time can only hide a missing lock,
+	// never fail a correct build.
+	const stallBound = 50 * time.Millisecond
+	// deadlock bounds waits that end at once unless the watcher is stuck.
+	const deadlock = 30 * time.Second
+	const changedHooks = 16
+
+	type startTimer func(name string, fn func())
+
+	tests := []struct {
+		name string
+		// write starts the writer whose delivery is held back.
+		write func(t *testing.T, w *HookWatcher, onTimer startTimer)
+	}{
+		{
+			name: "file event",
+			write: func(_ *testing.T, w *HookWatcher, onTimer startTimer) {
+				onTimer("first", func() { w.processFile("first") })
+			},
+		},
+		{
+			name: "reload",
+			write: func(t *testing.T, w *HookWatcher, _ startTimer) {
+				if _, err := w.Reload(); err != nil {
+					t.Errorf("Reload() error = %v", err)
+				}
+			},
+		},
+		{
+			name: "initial scan",
+			write: func(_ *testing.T, w *HookWatcher, _ startTimer) {
+				w.initialScan()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			doomed := writeExecutable(t, dir, "doomed", "#!/bin/sh\necho doomed\n")
+			writeExecutable(t, dir, "kept", "#!/bin/sh\necho kept\n")
+
+			rec := &hookRecorder{}
+			var armed atomic.Bool
+			var heldBack []string
+			stalled := make(chan struct{})
+			release := make(chan struct{})
+			delivered := make(chan struct{})
+			onChange := func(hooks []api.HookInfo) {
+				if !armed.CompareAndSwap(true, false) {
+					rec.onChange(hooks)
+					return
+				}
+				heldBack = hookNames(hooks)
+				close(stalled)
+				<-release
+				rec.onChange(hooks)
+				close(delivered)
+			}
+
+			w := NewHookWatcher(dir, onChange, nil, testLogger())
+			w.debouncePeriod = time.Millisecond
+			if _, err := w.Reload(); err != nil {
+				t.Fatalf("Reload() error = %v", err)
+			}
+
+			// The timers run through w.debounce, as Watch's event loop has them
+			// run, which is where changeMu is taken for a file event. Driving it
+			// directly fixes how many there are, which fsnotify would not.
+			var timersMu sync.Mutex
+			timers := make(map[string]*time.Timer)
+			onTimer := func(name string, fn func()) {
+				w.debounce(&timersMu, timers, name, fn)
+			}
+
+			writeExecutable(t, dir, "first", "#!/bin/sh\necho first\n")
+			armed.Store(true)
+			go tt.write(t, w, onTimer)
+			select {
+			case <-stalled:
+			case <-time.After(deadlock):
+				t.Fatal("no delivery reached the stall")
+			}
+
+			// The held delivery predates all of this.
+			var around sync.WaitGroup
+			want := []string{"first"}
+			if err := os.Remove(doomed); err != nil {
+				t.Fatal(err)
+			}
+			around.Add(1)
+			onTimer("doomed", func() {
+				defer around.Done()
+				w.removeHook("doomed")
+			})
+			for i := range changedHooks {
+				name := fmt.Sprintf("hook-%02d", i)
+				writeExecutable(t, dir, name, "#!/bin/sh\necho "+name+"\n")
+				want = append(want, name)
+				around.Add(1)
+				onTimer(name, func() {
+					defer around.Done()
+					w.processFile(name)
+				})
+			}
+			want = append(want, "kept")
+			around.Add(1)
+			go func() {
+				defer around.Done()
+				if _, err := w.Reload(); err != nil {
+					t.Errorf("Reload() error = %v", err)
+				}
+			}()
+
+			settled := make(chan struct{})
+			go func() {
+				around.Wait()
+				close(settled)
+			}()
+			select {
+			case <-settled:
+			case <-time.After(stallBound):
+			}
+			close(release)
+
+			for _, done := range []<-chan struct{}{delivered, settled} {
+				select {
+				case <-done:
+				case <-time.After(deadlock):
+					t.Fatal("the writers did not finish")
+				}
+			}
+
+			// The stall is only a test of ordering while the list it holds is
+			// older than the final one.
+			if !slices.Equal(heldBack, []string{"doomed", "first", "kept"}) {
+				t.Fatalf("held-back list = %v, want [doomed first kept]", heldBack)
+			}
+			wantHooks(t, "the last onChange", rec.last(), want...)
+			wantHooks(t, "Hooks()", w.Hooks(), want...)
+		})
+	}
+}
+
+// startWatch runs w.Watch until the test ends. A test that needs the watch to
+// be in place waits for the initial scan's callback, which comes after it.
+func startWatch(t *testing.T, w *HookWatcher) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Watch(ctx) }()
+
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Watch() error = %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("watcher did not exit")
+		}
+	})
+}
+
+// wantHooks fails the test unless hooks carries exactly the names in want, in
+// that order. No names accepts an empty list.
+func wantHooks(t *testing.T, what string, hooks []api.HookInfo, want ...string) {
+	t.Helper()
+	if got := hookNames(hooks); !slices.Equal(got, want) {
+		t.Errorf("%s = %v, want %v", what, got, want)
+	}
+}
+
+// integrityAlert is one onIntegrity call.
+type integrityAlert struct {
+	name, oldChecksum, newChecksum string
+}
+
+// integrityRecorder is an onIntegrity callback that records every alert a
+// HookWatcher raises, in call order.
+type integrityRecorder struct {
+	mu     sync.Mutex
+	alerts []integrityAlert
+}
+
+func (r *integrityRecorder) onIntegrity(name, oldChecksum, newChecksum string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.alerts = append(r.alerts, integrityAlert{name, oldChecksum, newChecksum})
+}
+
+func (r *integrityRecorder) all() []integrityAlert {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.alerts)
 }
 
 // hookRecorder is an onChange callback that records every hook list a

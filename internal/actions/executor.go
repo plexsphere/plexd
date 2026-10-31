@@ -154,9 +154,11 @@ func (e *Executor) RegisterBuiltin(name, description string, params []api.Action
 // every write, so verifying an execution against the snapshot digest would
 // compare a file with a hash of itself and pass for any bytes an attacker with
 // write access to the hooks directory puts there. The pin is therefore recorded
-// once, at first discovery — the digest this node also reports to the control
-// plane — and never updated: a hook whose bytes change afterwards fails
-// verification and stays unrunnable until the agent restarts and re-attests it.
+// once, at first discovery, and never updated: a hook whose bytes change
+// afterwards fails verification and stays unrunnable until the agent restarts
+// and re-attests it. The pin matches the first report to the control plane only.
+// Later reports carry the digest the watcher last computed, which is how the
+// control plane sees the drift.
 func (e *Executor) SetHooks(hooks []api.HookInfo) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
