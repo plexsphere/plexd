@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1220,10 +1221,11 @@ func (m *mockActionRunner) RunLocal(_ context.Context, _ string, _ map[string]st
 
 type mockHookReloader struct {
 	hooks []api.HookInfo
+	err   error
 }
 
-func (m *mockHookReloader) Hooks() []api.HookInfo {
-	return m.hooks
+func (m *mockHookReloader) Reload() ([]api.HookInfo, error) {
+	return m.hooks, m.err
 }
 
 func newTestHandlerWithActions(t *testing.T, provider ActionProvider, reloader HookReloader) *httptest.Server {
@@ -1528,6 +1530,77 @@ func TestHandler_ReloadHooks(t *testing.T) {
 	}
 	if result.Hooks[0].Name != "refreshed.sh" {
 		t.Errorf("hook name = %q, want %q", result.Hooks[0].Name, "refreshed.sh")
+	}
+}
+
+func TestHandler_ReloadHooks_ScanFailure(t *testing.T) {
+	const scanErr = "actions: watcher: scan /etc/plexd/hooks: not a directory"
+	srv := newTestHandlerWithActions(t, nil, &mockHookReloader{
+		// The hooks must not reach a response that reports a failure.
+		hooks: []api.HookInfo{{Name: "stale.sh"}},
+		err:   errors.New(scanErr),
+	})
+
+	resp, err := http.Post(srv.URL+"/v1/hooks/reload", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+
+	// The whole body, because Unmarshal refuses what a second value would leave
+	// behind and a single Decode would not see it.
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("body %q: %v", raw, err)
+	}
+
+	want := map[string]any{"error": scanErr}
+	if !reflect.DeepEqual(result, want) {
+		t.Errorf("body = %v, want %v", result, want)
+	}
+}
+
+func TestHandler_ReloadHooks_EmptyList(t *testing.T) {
+	tests := []struct {
+		name  string
+		hooks []api.HookInfo
+	}{
+		{name: "empty", hooks: []api.HookInfo{}},
+		{name: "nil", hooks: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestHandlerWithActions(t, nil, &mockHookReloader{hooks: tt.hooks})
+
+			resp, err := http.Post(srv.URL+"/v1/hooks/reload", "application/json", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+
+			raw, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var body bytes.Buffer
+			if err := json.Compact(&body, raw); err != nil {
+				t.Fatalf("compact %q: %v", raw, err)
+			}
+			if got, want := body.String(), `{"status":"reloaded","hooks":[]}`; got != want {
+				t.Errorf("body = %s, want %s", got, want)
+			}
+		})
 	}
 }
 
