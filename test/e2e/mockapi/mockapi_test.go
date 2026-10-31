@@ -2426,6 +2426,119 @@ func TestCapabilities_InventoryViolations_Return422(t *testing.T) {
 	}
 }
 
+// TestConfigureCapabilities asserts POST /test/configure-capabilities fails
+// exactly the next N manifests and that a refused body changes nothing.
+func TestConfigureCapabilities(t *testing.T) {
+	configure := func(t *testing.T, baseURL, body string, want int) {
+		t.Helper()
+		resp := doRequest(t, http.MethodPost, baseURL+"/test/configure-capabilities", body)
+		defer resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Fatalf("configure-capabilities(%q) status = %d, want %d", body, resp.StatusCode, want)
+		}
+	}
+	put := func(t *testing.T, baseURL, body string) *http.Response {
+		t.Helper()
+		resp := doRequest(t, http.MethodPut, baseURL+"/v1/nodes/node-1/capabilities", body)
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	t.Run("fails_exactly_the_next_n_puts", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configure(t, ts.URL, `{"fail_next":2}`, http.StatusNoContent)
+
+		// Each failed PUT carries its own version, so the captured body below can
+		// only be that PUT's and not one left behind by an earlier request.
+		for i := 1; i <= 2; i++ {
+			body := manifestWith(t, map[string]any{"binary_version": fmt.Sprintf("v1.2.%d", i)})
+			assertProblem(t, put(t, ts.URL, body), http.StatusInternalServerError, "internal")
+
+			if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 0 {
+				t.Errorf("PUT %d: capabilities_count = %d, want 0 for a failed PUT", i, a.CapabilitiesCount)
+			}
+			if got := getCapturedBody(t, ts.URL, "capabilities"); string(got) != body {
+				t.Errorf("PUT %d: captured body = %q, want %q", i, got, body)
+			}
+		}
+
+		// The count is spent: the third PUT is accepted and is the only one counted.
+		if resp := put(t, ts.URL, capabilitiesBody); resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("third PUT status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+		}
+		if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+			t.Errorf("capabilities_count = %d, want 1", a.CapabilitiesCount)
+		}
+	})
+
+	t.Run("fails_ahead_of_validation", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configure(t, ts.URL, `{"fail_next":1}`, http.StatusNoContent)
+
+		// The same invalid manifest meets the armed failure first and the
+		// validation only once the count is spent.
+		assertProblem(t, put(t, ts.URL, "not-json"), http.StatusInternalServerError, "internal")
+		if got := getCapturedBody(t, ts.URL, "capabilities"); string(got) != "not-json" {
+			t.Errorf("captured body = %q, want %q", got, "not-json")
+		}
+		assertProblem(t, put(t, ts.URL, "not-json"), http.StatusBadRequest, "malformed_capabilities_request")
+	})
+
+	t.Run("zero_clears_a_pending_count", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configure(t, ts.URL, `{"fail_next":5}`, http.StatusNoContent)
+		configure(t, ts.URL, `{"fail_next":0}`, http.StatusNoContent)
+
+		if resp := put(t, ts.URL, capabilitiesBody); resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("PUT status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+		}
+		if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+			t.Errorf("capabilities_count = %d, want 1", a.CapabilitiesCount)
+		}
+	})
+
+	t.Run("refused_body_keeps_the_pending_count", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configure(t, ts.URL, `{"fail_next":1}`, http.StatusNoContent)
+
+		for _, body := range []string{
+			`{"fail_next":-1}`,
+			"garbage",
+			"",
+			`{"fail_next":"2"}`,
+			`{"fail_next":1.5}`,
+			`{"fail_nxt":2}`,
+		} {
+			configure(t, ts.URL, body, http.StatusBadRequest)
+		}
+
+		// The count armed before the refused bodies is still one: not cleared by
+		// them and not raised by the one that names 2.
+		assertProblem(t, put(t, ts.URL, capabilitiesBody), http.StatusInternalServerError, "internal")
+		if resp := put(t, ts.URL, capabilitiesBody); resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("second PUT status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+		}
+	})
+
+	t.Run("get_answers_405", func(t *testing.T) {
+		_, ts := newTestServer(t)
+
+		resp, err := http.Get(ts.URL + "/test/configure-capabilities")
+		if err != nil {
+			t.Fatalf("GET configure-capabilities: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+		}
+		// net/http answers 405 on its own for a route with a method, in plain
+		// text. The JSON body is what shows the mock's own fallback is registered.
+		if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Endpoint (NAT) endpoint
 // ---------------------------------------------------------------------------

@@ -119,6 +119,7 @@ type Server struct {
 	stateCount                     atomic.Int64
 	keyRotateCount                 atomic.Int64
 	capabilitiesCount              atomic.Int64
+	capabilitiesFailNext           atomic.Int64
 	endpointCount                  atomic.Int64
 	endpointCandidatesCount        atomic.Int64
 	secretsCount                   atomic.Int64
@@ -581,6 +582,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /test/configure-state", s.handleSetState)
 	s.mux.HandleFunc("POST /test/configure-heartbeat", s.handleConfigureHeartbeat)
 	s.mux.HandleFunc("POST /test/configure-endpoint", s.handleConfigureEndpoint)
+	s.mux.HandleFunc("POST /test/configure-capabilities", s.handleConfigureCapabilities)
 	s.mux.HandleFunc("POST /test/configure-secrets", s.handleConfigureSecrets)
 	s.mux.HandleFunc("POST /test/configure-events", s.handleConfigureEvents)
 	s.mux.HandleFunc("POST /test/inject-event", s.handleInjectEvent)
@@ -615,6 +617,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/test/configure-state", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-heartbeat", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-endpoint", methodNotAllowed)
+	s.mux.HandleFunc("/test/configure-capabilities", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-secrets", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-events", methodNotAllowed)
 	s.mux.HandleFunc("/test/inject-event", methodNotAllowed)
@@ -1189,6 +1192,22 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeProblem(w, r, http.StatusBadRequest, "malformed_capabilities_request", "invalid request body")
 		return
+	}
+
+	// Armed failure: exactly the next capabilitiesFailNext manifests answer a
+	// 500. It sits after the capture, so a test can read what a failed PUT
+	// carried, and ahead of validation, so that a manifest the mock would refuse
+	// still meets the failure the test asked for. The CompareAndSwap decrement
+	// keeps the "exactly N" guarantee under concurrent PUTs and cannot pass zero.
+	for {
+		n := s.capabilitiesFailNext.Load()
+		if n <= 0 {
+			break
+		}
+		if s.capabilitiesFailNext.CompareAndSwap(n, n-1) {
+			writeProblem(w, r, http.StatusInternalServerError, "internal", "failure armed by POST /test/configure-capabilities")
+			return
+		}
 	}
 
 	var req api.CapabilityManifestRequest
@@ -3283,6 +3302,35 @@ func (s *Server) handleConfigureEndpoint(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	s.SetEndpointTTL(time.Duration(body.TTLSeconds) * time.Second)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleConfigureCapabilities handles POST /test/configure-capabilities. It sets
+// from {"fail_next": N} how many of the next manifests handleCapabilities fails,
+// replacing any pending count, so an N of 0 clears one. Decoding is strict: a
+// misspelled field would otherwise read as 0 and disarm a failure a test relies
+// on. An unknown field, a malformed body, or a negative N is a 400 and leaves the
+// pending count alone.
+func (s *Server) handleConfigureCapabilities(w http.ResponseWriter, r *http.Request) {
+	data, err := s.captureBody("configure_capabilities", r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	var body struct {
+		FailNext int64 `json:"fail_next"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if body.FailNext < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "fail_next must not be negative"})
+		return
+	}
+	s.capabilitiesFailNext.Store(body.FailNext)
 	w.WriteHeader(http.StatusNoContent)
 }
 
