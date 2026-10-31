@@ -6,6 +6,7 @@
 #
 # Extended tests:
 #   - Request body validation (registration token, heartbeat node_id, capabilities)
+#   - Live PlexdHook inventory (a resource created and deleted while plexd runs)
 #   - Periodic loop verification (heartbeat/metrics/logs/audit counters >= 2)
 #   - Pod restart resilience (delete pod, verify re-registration)
 #   - Action execution via the state pull's executions block (ack/started/terminal callbacks)
@@ -187,10 +188,11 @@ kubectl get crd plexdnodestates.plexd.plexsphere.com
 kubectl get crd plexdhooks.plexd.plexsphere.com
 kubectl wait --for=condition=Established crd/plexdhooks.plexd.plexsphere.com --timeout=60s
 
-# Two PlexdHooks for the boot-time discovery, created before the DaemonSet so
-# the first manifest already sees them. Only the digest-pinned one can be
-# reported; the tag-pinned one must stay out of plexd_hooks. Nothing runs
-# them: plexd up starts no PlexdHook controller.
+# Two PlexdHooks for the list plexd takes at boot, created before the DaemonSet
+# so the first manifest already sees them. A third follows after Phase 3 while
+# plexd runs, for the watch that keeps the list current. Only the digest-pinned
+# one can be reported; the tag-pinned one must stay out of plexd_hooks. Nothing
+# runs them: plexd up starts no PlexdHook controller.
 PINNED_HOOK_DIGEST="sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 echo "=== Creating PlexdHook fixtures ==="
 kubectl -n "${NAMESPACE}" apply -f - <<HOOKEOF
@@ -461,10 +463,10 @@ echo "  PASS: heartbeat body nat_summary is a JSON object"
 # Capability manifest: the contract's flat envelope, with a binary_checksum that
 # decodes to 32 bytes (hex decodes to 48 and is refused) and no nested `binary`
 # object, which the handler rejects as unknown. It carries both inventories: the
-# eleven builtin actions, and in plexd_hooks the PlexdHooks plexd listed in its
-# namespace at boot. Only the digest-pinned fixture is reportable; the
-# tag-pinned one is dropped, and no timeout_seconds goes out because the CRD has
-# no field for it.
+# eleven builtin actions, and in plexd_hooks the PlexdHooks in plexd's namespace,
+# listed at boot and followed through a watch after that, as the check after
+# Phase 3 shows. Only the digest-pinned fixture is reportable; the tag-pinned one is
+# dropped, and no timeout_seconds goes out because the CRD has no field for it.
 CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
 if [ -z "${CAPS_BODY}" ]; then
     echo "FAIL: no captured capabilities request body"
@@ -560,6 +562,59 @@ if [ "${PERIODIC_ELAPSED}" -ge "${PERIODIC_TIMEOUT}" ]; then
     print_diagnostics
     exit 1
 fi
+
+# ===================================================================
+# Live PlexdHook inventory
+# ===================================================================
+# The inventory follows the cluster while plexd runs. A hook created now cannot
+# come from the boot list, and no pod restarts here, so it has to arrive through
+# the watch. This exercises what the fake API server in internal/kubernetes
+# cannot: a real API server's watch stream and the plexdhooks watch grant in
+# deploy/kubernetes/rbac.yaml. e2e-pinned must stay in the list throughout.
+#
+# This runs after Phase 3 on purpose. Without a working watch plexd still lists
+# on its backoff, at about 5, 15, 35 and 75 seconds after it starts, and early on
+# two of those lists can answer both waits below, so a missing grant would pass
+# nine runs in ten. Phase 3 needs a second heartbeat, which puts this at least 30
+# seconds in, where the lists are too far apart to answer both.
+#
+# wait_for_plexd_hooks polls the captured manifest for up to 30 seconds. Args:
+# <what> <jq-filter>, with $digest bound to PINNED_HOOK_DIGEST.
+wait_for_plexd_hooks() {
+    local what=$1 filter=$2 elapsed=0 body=""
+    while [ "${elapsed}" -lt 30 ]; do
+        body=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
+        if echo "${body}" | jq -e --arg digest "${PINNED_HOOK_DIGEST}" "${filter}" >/dev/null 2>&1; then
+            echo "  PASS: ${what} after ${elapsed}s"
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    echo "FAIL: ${what} did not happen within 30s (plexd_hooks: $(echo "${body}" | jq -c '.plexd_hooks' 2>/dev/null || true))"
+    print_diagnostics
+    exit 1
+}
+
+echo "=== Creating PlexdHook e2e-late while plexd runs ==="
+kubectl -n "${NAMESPACE}" apply -f - <<HOOKEOF
+apiVersion: plexd.plexsphere.com/v1alpha1
+kind: PlexdHook
+metadata:
+  name: e2e-late
+spec:
+  hookName: e2e-late
+  jobTemplate:
+    image: busybox@${PINNED_HOOK_DIGEST}
+HOOKEOF
+wait_for_plexd_hooks "PlexdHook e2e-late reached plexd_hooks beside e2e-pinned" '
+    ([.plexd_hooks[]?.name] | sort) == ["e2e-late", "e2e-pinned"]
+    and any(.plexd_hooks[]; .name == "e2e-late" and .image_digest == $digest)'
+
+echo "=== Deleting PlexdHook e2e-late while plexd runs ==="
+kubectl -n "${NAMESPACE}" delete plexdhook e2e-late
+wait_for_plexd_hooks "PlexdHook e2e-late left plexd_hooks and e2e-pinned remained" '
+    [.plexd_hooks[]?.name] == ["e2e-pinned"]'
 
 # ===================================================================
 # Phase 4: Pod restart resilience
