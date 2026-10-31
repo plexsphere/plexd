@@ -89,6 +89,10 @@ Uses `GET /test/last-request/{endpoint}` to verify the content of request payloa
 
 Waits up to 60 seconds for `heartbeat_count` and `metrics_count` to reach >= 2, proving that self-generating periodic loops run continuously. Logs and audit are tested via pod restart.
 
+The phase then checks the live [PlexdHook inventory](../actions/plexdhook-crd.md#keeping-the-list-current). With plexd running and no pod restart, it creates the digest-pinned PlexdHook `e2e-late` and polls `GET /test/last-request/capabilities` for up to 30 seconds until `plexd_hooks` holds `e2e-late` beside `e2e-pinned`. It then deletes `e2e-late` and polls for up to 30 seconds until `e2e-pinned` is alone. The boot list cannot produce either result, so this covers what the fake API server in `internal/kubernetes` cannot: a real API server's watch stream and the `plexdhooks` `watch` grant in `deploy/kubernetes/rbac.yaml`.
+
+The check runs after the second heartbeat on purpose. Without a working watch, plexd still lists on its backoff, at about 5, 15, 35 and 75 seconds after it starts. Earlier in the run two of those lists can answer both polls, so a missing grant would pass. From 30 seconds on they are too far apart to do that.
+
 ### 9. Pod restart resilience
 
 Deletes the plexd pod and waits for the DaemonSet controller to schedule a new pod. Verifies:

@@ -215,7 +215,9 @@ This creates a non-privileged Job on the target node that runs `df -h /dev/sda1`
 
 ## Capability manifest reporting
 
-At boot, plexd lists the `PlexdHook` resources in the namespace its ServiceAccount runs in and reports them to the control plane in the `plexd_hooks` field of its capability manifest. The list runs once, with a 10-second budget. It is not a watch, so a resource created, changed, or deleted later is reported at the next agent restart. The `plexdhooks` `list` grant in the `plexd` ClusterRole authorizes it. Discovery never blocks boot: when the CRD is not installed, the grant is missing, or the API server does not answer, plexd logs one warning and sends the manifest without `plexd_hooks`.
+plexd reports the `PlexdHook` resources in the namespace its ServiceAccount runs in to the control plane, in the `plexd_hooks` field of its [capability manifest](remote-actions-hooks.md#capability-announcement). It lists them at boot, with a 10-second budget, and then follows a watch, so a resource created, changed, or deleted while the agent runs reaches the control plane within seconds, with no pod restart. The `plexdhooks` `list` and `watch` grants in the `plexd` ClusterRole cover both. The inventory only reads these resources: `plexd up` starts no `PlexdHookController` and runs no Job.
+
+Discovery never blocks boot. When the CRD is not installed, the grant is missing, or the API server does not answer, plexd logs one warning and sends the first manifest without `plexd_hooks`. The watch loop keeps trying, and the list goes out with the next successful list.
 
 Each reported entry is built from one resource:
 
@@ -223,7 +225,7 @@ Each reported entry is built from one resource:
 |-------------------|-------------------------------------------------------------------------|
 | `name`            | `metadata.name`                                                         |
 | `image_digest`    | The `sha256:<64 lowercase hex>` digest after the last `@` of the image the Job runs |
-| `parameters`      | `spec.parameters` as a name-to-value map; a repeated name keeps the later value |
+| `parameters`      | `spec.parameters` as a name-to-value map; a repeated name keeps the later value. A hook with a NUL character in a parameter stays out of the catalog with a warning, because the control plane cannot store one |
 | `sandbox`         | `true` unless `spec.privileged` is set, matching the [security context](#security-context) the Job gets |
 | `timeout_seconds` | Never sent: the CRD has no timeout field                                |
 
@@ -237,6 +239,38 @@ spec:
 ```
 
 Entries are sorted by name and capped at 128, the contract's limit; the warning for a larger set names how many were left out. Resources in other namespaces are not listed.
+
+### Keeping the list current
+
+The watch is only a change signal, and the list stays the source of truth, which needs no `resourceVersion` bookkeeping:
+
+1. plexd opens a watch under a 10-minute limit and lists once. The list after every open catches a deletion that happened with no watch running.
+2. An event starts a one-second wait, and every event in that second is discarded, so a burst costs one list. An open replays each existing resource as `ADDED`, so a healthy pod costs one held connection and about two lists per 10 minutes.
+3. The 10-minute limit ends a stream that died silently. A stream that lived at least a minute reopens at once. A stream that ended sooner, a failed open, and a failed list all back off, from 5 seconds doubling to 5 minutes.
+4. A failed open still lists, so a role that grants `list` and not `watch` gets a list about every 5 minutes.
+
+The watch limit and the backoff carry 25% jitter, so a fleet does not stay in phase after an API server restart. Every list has the same 10-second budget as the boot list.
+
+A successful list that returns the same `(name, resourceVersion)` pairs as the one before changes nothing, so a hook whose image has no digest logs its omission warning once per change and not after every watch. A list that differs replaces the snapshot and notifies the [capability reporter](remote-actions-hooks.md#when-the-manifest-is-sent). Deleting the last resource takes the `plexd_hooks` key off the manifest, which is how the control plane learns the list is empty.
+
+A list that fails keeps the last good list and reports nothing. The control plane replaces its stored row on every PUT, so a missing key means none, and sending the manifest without `plexd_hooks` on a transient API server failure would erase every PlexdHook from that row. A failed boot list has no good list to keep, which is why it leaves `plexd_hooks` off the first manifest.
+
+The control plane pins the first image digest it receives for a PlexdHook on a Node as that hook's baseline and never advances it, so changing a hook's image is drift. plexd reports the new digest within seconds, and that PUT and every later accepted PUT carrying it raises an integrity alert with the recommended action `quarantine_node`.
+
+### Log lines
+
+| Message                                                                | Level | Attributes                     | Meaning |
+|------------------------------------------------------------------------|-------|--------------------------------|---------|
+| `plexd hook discovery skipped: the ServiceAccount namespace is empty` | Warn  |                                | No namespace to list; no watch runs |
+| `plexd hook discovery skipped`                                         | Warn  | `error`                        | The lister could not be built; no watch runs |
+| `plexd hook discovery failed`                                          | Warn  | `namespace`, `error`           | The boot list failed; the first manifest goes out without `plexd_hooks` |
+| `plexd hook watch failed`                                              | Warn  | `namespace`, `error`, `retry_in` | First failure of an outage: an open or a list failed. Repeats log at Debug |
+| `plexd hook watch restored`                                            | Info  | `namespace`                    | An open and its list both succeeded after an outage |
+| `plexd hook watch ended early`                                         | Debug | `namespace`, `retry_in`        | A stream ended within its first minute; the next open backs off |
+| `plexd hook omitted from the capability manifest`                      | Warn  | `hook`, `image`, `reason`      | The image is not pinned by a digest, or a parameter contains a NUL character, which the control plane cannot store |
+| `plexd hooks beyond the capability manifest cap omitted`               | Warn  | `cap`, `dropped`               | More than 128 reportable resources |
+
+A cluster with no CRD logs one warning, `plexd hook discovery failed`, and nothing else above Debug. A role that grants `list` and not `watch` logs one `plexd hook watch failed` and never `plexd hook watch restored`, because its opens keep failing.
 
 ## See also
 

@@ -105,10 +105,10 @@ plexd hooks verify    # Check all hook checksums
 plexd logs            # Look for integrity_violation events
 ```
 
-A checksum mismatch means the hook script was modified after plexd computed its initial checksum. This can happen if the file was updated manually without reloading hooks. Run `plexd hooks reload` to re-scan and recompute checksums, then retry. If the mismatch is unexpected, investigate whether the file was modified by an unauthorized process.
+A checksum mismatch means the hook script changed after plexd pinned its digest, which it does the first time a plexd process discovers the hook. `plexd hooks reload` does not clear it: a reload re-scans the directory and reports what it finds, and it moves no pin. An edited hook runs again after an agent restart, not after a reload. The control plane holds a baseline of its own, the first digest it received for the hook, so an edit also raises an integrity alert there and dispatch stays refused until it accepts the new digest. See [What an Edit Does](../how-to/custom-hook-scripts.md#what-an-edit-does). If the mismatch is unexpected, investigate whether the file was modified by an unauthorized process.
 
 ::: warning
-An unexpected checksum mismatch could indicate that a hook script was modified by an unauthorized process. Investigate before simply reloading.
+An unexpected checksum mismatch could indicate that a hook script was modified by an unauthorized process. Investigate before you restart the agent, because a restart pins whatever bytes are on disk at that moment.
 :::
 
 ## SSE stream keeps disconnecting

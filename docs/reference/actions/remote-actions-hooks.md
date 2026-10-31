@@ -284,9 +284,9 @@ When a callback is refused — a problem response whose `code` is `nsk_node_mism
 
 #### Hook Integrity Pinning
 
-The pull entry carries **no** checksum, so hook trust anchors on a digest the node pins itself: the one recorded the **first** time this process discovered the hook — the same digest it reports to the control plane in its capabilities.
+The pull entry carries **no** checksum, so hook trust anchors on a digest the node pins itself: the one recorded the **first** time this process discovered the hook. The pin matches the first report of the hook to the control plane only. Later reports carry the digest the watcher last computed, which can differ from the pin after an edit, and that difference is how the control plane sees the drift.
 
-The pin is what makes the check meaningful. `HookWatcher` re-hashes a hook on every write and pushes the new digest through `SetHooks`, so verifying against the live snapshot would compare a file with a hash of itself and pass for whatever bytes are on disk — including an attacker's, since the integrity callback only logs. A pin is therefore never updated and never dropped for the life of the process: a hook whose bytes change after discovery fails verification, files an integrity violation, and stays unrunnable until the agent restarts and re-attests it. That is also why a legitimately edited hook needs an agent restart before it can be dispatched again.
+The pin is what makes the check meaningful. `HookWatcher` re-hashes a hook on every write and pushes the new digest through `SetHooks`, so verifying against the live snapshot would compare a file with a hash of itself and pass for whatever bytes are on disk, including an attacker's, since the integrity callback only logs. A pin is therefore never updated and never dropped for the life of the process: a hook whose bytes change after discovery fails verification, files an integrity violation, and stays unrunnable until the agent restarts and re-attests it. That is also why a legitimately edited hook needs an agent restart before it can run again. `plexd hooks reload` is not a substitute: it re-scans the directory and moves no pin.
 
 Upstream integrity — whether this node should run this hook at all — is the control plane's server-side dispatch gating, not a field the node re-checks.
 
@@ -563,7 +563,7 @@ Returns newline-separated log lines in stdout.
 
 ## HookWatcher
 
-Monitors a hooks directory for filesystem changes using `fsnotify`. Replaces the one-time `DiscoverHooks` call with a continuous watch loop.
+Monitors a hooks directory for filesystem changes using `fsnotify`, and re-scans it on demand through `Reload`. Replaces the one-time `DiscoverHooks` call with a continuous watch loop.
 
 ### Constructor
 
@@ -587,31 +587,57 @@ type IntegrityAlertCallback func(hookName, oldChecksum, newChecksum string)
 
 ### Methods
 
-| Method  | Signature                                 | Description                                       |
-|---------|-------------------------------------------|---------------------------------------------------|
-| `Watch` | `(ctx context.Context) error`             | Monitor directory; blocks until ctx is cancelled   |
-| `Hooks` | `() []api.HookInfo`                       | Return sorted snapshot of current hooks            |
+| Method   | Signature                                 | Description                                       |
+|----------|-------------------------------------------|---------------------------------------------------|
+| `Watch`  | `(ctx context.Context) error`             | Monitor directory; blocks until ctx is cancelled   |
+| `Reload` | `() ([]api.HookInfo, error)`              | Re-scan the directory, replace the list, and return it; works with or without `Watch` running |
+| `Hooks`  | `() []api.HookInfo`                       | Return sorted snapshot of current hooks            |
 
 ### Watch Lifecycle
 
 1. Create hooks directory if it does not exist
 2. Start the `fsnotify` watch with `fsutil.WatchDir`. A hook that vanishes while the watch is set up (macOS and the BSDs) makes it set the watch up again after 100 ms, up to 10 attempts. If set-up still fails, `Watch` runs the initial scan once and returns the error, so the hooks on disk stay registered without live updates
-3. Perform the initial scan: read all executable files, compute checksums, call `onChange`. The scan runs after the watch is in place, so a hook changed during start-up is in the scan, arrives as an event, or both
-4. On file create/write/chmod: debounce (200ms), then re-read file, compute checksum, update hooks map, call `onChange`
+3. Perform the initial scan, the same scan `Reload` runs. It replaces the list, so it also prunes a hook removed since the boot scan. A scan that fails logs `actions: watcher: initial scan failed` and reports the current list once. The scan runs after the watch is in place, so a hook changed during start-up is in the scan, arrives as an event, or both
+4. On file create/write/chmod: debounce (200ms), then stat the file. A file that is not a regular, executable file leaves the list. Otherwise compute the checksum, update the hooks map, and call `onChange`. A hook that fails to hash keeps its entry, and `actions: watcher: hash failed` is logged
 5. On file remove/rename: debounce, remove from hooks map, call `onChange`
 6. On `.json` sidecar change: debounce, re-read the parent hook's metadata
 7. On checksum change for an existing hook: call `onIntegrity` with old and new checksums
 8. On context cancellation: stop all timers, return nil
 
+The watch is not restarted when it fails: `plexd up` logs `hook watcher stopped`, the hook list stays as it was, and `plexd hooks reload` is how to refresh it on such a node.
+
+### Reload
+
+`Reload` runs the scan `DiscoverHooks` runs, replaces the list with the result, and returns it sorted by name. It reports through the same callbacks as a file event: `onIntegrity` once per hook whose digest changed, then `onChange`.
+
+| Case | Result |
+|------|--------|
+| A file vanished since the last scan | It leaves the list |
+| A file fails to hash | It keeps its last digest and a warning is logged. One transient read error must not remove a hook from the executor and the capability manifest, because no later event would bring it back. A file the watcher did not list stays unlisted |
+| A file with an executable bit is not a regular file | It is skipped with the warning `actions: discovery: not a regular file`, because opening a FIFO to hash it would block the scan. A file with no executable bit is skipped silently, whatever it is. A symlink counts by its target: a link to a FIFO warns, and a link to an executable regular file stays a hook. A change to the target raises no file event, so it reaches the list through a reload or a restart, and until the restart the pin refuses a changed target at dispatch |
+| The directory does not exist | An empty list and a nil error |
+| The directory cannot be read | The error `actions: watcher: scan <dir>: <cause>`, the list left as it was, and no callback fired |
+
+`Reload` moves no pin. `SetHooks` receives the new digest and leaves the [integrity anchor](#hook-integrity-pinning) where it was, so an edited hook runs again after an agent restart, not after a reload.
+
+### Change Ordering
+
+Debounce timers run on separate goroutines, so `Reload` and the timers take one lock, `changeMu`, across the change to the list and the `onChange` call that reports it. Concurrent reloads therefore run one at a time, and the last `onChange` always carries the newest list. The lock is held across `onChange`, which must not block.
+
 ### Integration with Executor
 
-In `cmd/plexd/cmd/up.go`, the watcher is wired to the executor:
+In `cmd/plexd/cmd/up.go`, the watcher is wired to the executor and the capability reporter:
 
 ```go
-hookWatcher := actions.NewHookWatcher(cfg.Actions.HooksDir, executor.SetHooks, onIntegrityAlert, logger)
+hookWatcher := actions.NewHookWatcher(cfg.Actions.HooksDir, func(hooks []api.HookInfo) {
+    executor.SetHooks(hooks)
+    capabilityReporter.Notify()
+}, onIntegrityAlert, logger)
 ```
 
-When hooks change, `executor.SetHooks` is called, updating `Capabilities()` output. It does **not** move the integrity anchor of a hook the executor has already seen — see [Hook Integrity Pinning](#hook-integrity-pinning). The `Hooks()` method satisfies the `nodeapi.HookReloader` interface.
+When hooks change, `executor.SetHooks` is called, updating `Capabilities()` output, and `Notify` asks the [capability reporter](#capability-announcement) for a new report. Neither blocks. `SetHooks` does **not** move the integrity anchor of a hook the executor has already seen; see [Hook Integrity Pinning](#hook-integrity-pinning). `Reload` satisfies the `nodeapi.HookReloader` interface.
+
+`plexd up` runs `Reload` once before it starts anything that reads the hook list, so a dispatch the reconciler delivers does not meet an empty list, unless that scan fails or outlives its 10-second wait, and the first scan records the pins. `Watch` starts later, at step 20.
 
 ## Local API Endpoints
 
@@ -666,7 +692,7 @@ Lists all registered hooks (subset of GET /v1/actions response).
 
 ### POST /v1/hooks/reload
 
-Triggers a re-scan of hooks via the `HookReloader` interface (satisfied by `HookWatcher.Hooks()`).
+Re-scans the hooks directory via the `HookReloader` interface (satisfied by `HookWatcher.Reload()`) and returns the resulting list. The route takes no input. It hashes every hook file, so it keeps the guards every route has: the socket's permissions, and the bearer token on the optional HTTP listener.
 
 **Response:**
 
@@ -676,6 +702,14 @@ Triggers a re-scan of hooks via the `HookReloader` interface (satisfied by `Hook
   "hooks": [...]
 }
 ```
+
+`hooks` is `[]` for an empty directory, never `null`.
+
+| Status | Condition | Body |
+|--------|-----------|------|
+| `200`  | Scan finished | `status` and `hooks` as above |
+| `500`  | The directory could not be read; the list stays as it was | `{"error": "actions: watcher: scan <dir>: <cause>"}` |
+| `503`  | No reloader is wired in | `{"error": "hook reloader not available"}` |
 
 ## CLI Commands
 
@@ -697,7 +731,14 @@ Reads hooks via `GET /v1/hooks` and checks that each hook has a checksum. Report
 
 ### plexd hooks reload
 
-Triggers a hook re-scan via `POST /v1/hooks/reload`. Reports the status and hook count.
+Re-scans the hooks directory via `POST /v1/hooks/reload`. Prints the status and the hook count:
+
+```text
+Status: reloaded
+Hooks:  2
+```
+
+A `500` makes the command exit non-zero with `plexd hooks reload: unexpected status 500: ...`. A reload moves no pin: an edited hook runs again after an agent restart, not after a reload.
 
 ## DiscoverHooks
 
@@ -708,7 +749,7 @@ func DiscoverHooks(hooksDir string, logger *slog.Logger) ([]api.HookInfo, error)
 ```
 
 1. Returns empty slice (not nil) if `hooksDir` is empty or does not exist
-2. Skips directories, non-executable files, and `.json` sidecar files
+2. Skips directories, non-executable files, `.json` sidecar files, and anything that is not a regular file. A symlink to an executable regular file stays a hook, and the target's mode decides. The watch covers the directory and not a link's target, so a change to the target reaches the list only through a scan
 3. Computes SHA-256 via `integrity.HashFile` for each executable
 4. Parses optional `.json` sidecar for metadata (description, parameters, timeout, sandbox)
 5. Results sorted by name
@@ -903,7 +944,7 @@ const (
 
 ### CapabilityManifestRequest
 
-Sent to `PUT /v1/nodes/{node_id}/capabilities` once at boot; see [Capability Announcement](#capability-announcement). Defined in `internal/api/types.go`.
+Sent to `PUT /v1/nodes/{node_id}/capabilities` at boot and after each change; see [Capability Announcement](#capability-announcement). Defined in `internal/api/types.go`.
 
 ```go
 type CapabilityManifestRequest struct {
@@ -922,7 +963,7 @@ type CapabilityManifestRequest struct {
 
 - `api.NodeStateExecution` is the pull entry the dispatcher consumes
 - `api.ControlPlane.ExecutionCallback` and `UploadExecutionOutput` are the production implementations of `ActionReporter`
-- `api.ControlPlane.UpdateCapabilities` sends discovered capabilities
+- `api.ControlPlane.UpdateCapabilities` is the production implementation of `agent.CapabilityClient`, through which the capability reporter sends the manifest
 
 ### With internal/integrity
 
@@ -964,17 +1005,30 @@ exec.RegisterBuiltin("logs.snapshot", "Snapshot logs", snapshotParams, actions.L
 dispatcher := actions.NewDispatcher(exec, nodeID, logger)
 reconciler.RegisterDispatchHandler(dispatcher.Handle)
 
-// 5. Create hook watcher (replaces one-time DiscoverHooks)
-watcher := actions.NewHookWatcher(cfg.HooksDir, exec.SetHooks, onIntegrityAlert, logger)
+// 5. Create the capability reporter; buildManifest reads exec.Capabilities()
+reporter := agent.NewCapabilityReporter(nodeID, client, buildManifest, logger)
 
-// 6. Wire to nodeapi
+// 6. Create hook watcher (replaces one-time DiscoverHooks)
+watcher := actions.NewHookWatcher(cfg.HooksDir, func(hooks []api.HookInfo) {
+    exec.SetHooks(hooks)
+    reporter.Notify()
+}, onIntegrityAlert, logger)
+
+// 7. Scan once, so the executor's hook list and the boot manifest hold the
+//    hooks on disk before anything reads them
+if _, err := watcher.Reload(); err != nil {
+    logger.Warn("boot hook scan failed", "error", err)
+}
+
+// 8. Wire to nodeapi
 nodeAPISrv.SetActionProvider(exec)
 nodeAPISrv.SetHookReloader(watcher)
 
-// 7. Start watcher goroutine
+// 9. Start the watcher and reporter goroutines
 go watcher.Watch(ctx)
+go reporter.Run(ctx)
 
-// 8. On shutdown
+// 10. On shutdown
 exec.Shutdown(ctx)
 ```
 
@@ -1199,10 +1253,9 @@ on the terminal callback.
 ## Capability Announcement
 
 plexd announces what it can run in the capability manifest it sends to
-`PUT /v1/nodes/{node_id}/capabilities` once at boot, after registration.
-Registration itself carries no capabilities. The manifest is not re-sent while
-the agent runs: a hook added, changed, or removed later is reported at the next
-restart.
+`PUT /v1/nodes/{node_id}/capabilities`. Registration itself carries no
+capabilities. `agent.CapabilityReporter` (`internal/agent/capabilities.go`) owns
+the manifest: it sends it at boot and keeps it current while the agent runs.
 
 ```json
 {
@@ -1238,14 +1291,107 @@ restart.
 | Field | Source | Content |
 |---|---|---|
 | `builtin_actions` | `Executor.Capabilities()` | Every registered builtin, sorted by name: `name`, `description`, and `parameters[]` in registration order (`name`, `type`, `required`, `default`, `description`). A builtin without parameters carries no `parameters` key |
-| `declared_hooks` | Hook scripts in `hooks_dir` | `name` and the payload's SHA-256 as 32 bytes of standard-padded base64 |
-| `plexd_hooks` | `PlexdHook` resources in the ServiceAccount's namespace, listed at boot (Kubernetes only) | `name`, `image_digest`, `parameters` map, `sandbox`; see [PlexdHook CRD](plexdhook-crd.md#capability-manifest-reporting) |
+| `declared_hooks` | Hook scripts in `hooks_dir` | `name` and the payload's SHA-256 as 32 bytes of standard-padded base64. The digest is the one the watcher last computed, which can differ from the executor's pin after an edit |
+| `plexd_hooks` | `PlexdHook` resources in the ServiceAccount's namespace (Kubernetes only) | `name`, `image_digest`, `parameters` map, `sandbox`; see [PlexdHook CRD](plexdhook-crd.md#capability-manifest-reporting) |
 
 The control plane refuses a manifest whole when one entry breaks an invariant,
 so plexd drops an entry it cannot report (a script hook without a usable digest,
 a PlexdHook whose image is not pinned by a digest) with a warning instead of
-sending it. The status codes are listed under
+sending it. Past 128 hooks of either kind it keeps the first 128 by name and logs
+how many it dropped. The status codes are listed under
 [API Endpoints](../core/api-endpoints.md#put-v1-nodes-node-id-capabilities).
+
+The manifest carries a hook's name and digest only. Its description, parameters,
+timeout, and sandbox level stay in the sidecar file and do not reach the control
+plane, so an edit of the sidecar alone changes nothing in the manifest.
+
+An absent key means none, because the control plane replaces its stored row on
+every PUT. `declared_hooks` leaves the manifest when the last hook is removed, and
+that is what clears the list at the control plane.
+
+### When the Manifest Is Sent
+
+**At boot.** `plexd up` runs the PlexdHook boot list, builds the reporter, creates
+the hook watcher, and runs the watcher's first scan with `Reload` before the
+reporter starts, so the boot manifest carries the hooks on disk. Boot waits for
+that scan for at most 10 seconds, because the scan hashes every hook and a hung
+mount must not stop the agent. The hook list stays empty until a scan succeeds, so
+a scan that fails or outlives the wait leaves the boot manifest without hooks, and
+a dispatch in that window is rejected with `unknown_action`. A scan still running
+also holds up the watch's initial scan and `plexd hooks reload`. A scan that
+finishes late reports through `onChange`. A failed PlexdHook boot list leaves
+`plexd_hooks` off that first manifest.
+
+**When something changes.** The hook watcher's `onChange` and the PlexdHook
+[inventory](plexdhook-crd.md#keeping-the-list-current) call `Notify`, which never
+blocks. So a script hook that is added, changed, or removed reaches the control
+plane within seconds, and so does a change to the PlexdHook resources in the
+agent's namespace. `plexd hooks reload` feeds the reporter the same way.
+
+A notification waits for a quiet period of 1 second, restarted by each further
+notification and bounded at 10 seconds after the first one. A burst therefore
+costs one PUT, and a hook rewritten in a loop is still reported. The quiet period
+also gives a write in progress time to finish, but it does not replace an
+[atomic install](../../how-to/custom-hook-scripts.md#step-3-deploy-to-the-hooks-directory).
+
+**What it skips.** Each attempt builds the manifest and compares it with the one
+last accepted. A send that matches is skipped, so a `touch` on a hook sends
+nothing. The last accepted manifest lives in memory, so a restart always sends
+once.
+
+**No periodic re-send.** plexd sends only when the manifest changed or a send is
+still owed, because every accepted PUT that carries a drifted hook raises another
+integrity alert at the control plane, whether or not the manifest changed.
+
+### Retries
+
+A failed PUT is retried until one is accepted, the boot manifest included. The
+delay starts at 5 seconds and doubles with each failure up to 5 minutes (5, 10,
+20, 40, 80, 160, then 300 seconds), and each delay moves by up to 25% either way,
+so agents that failed together do not retry in step. A `429` whose `Retry-After`
+gives a number of seconds longer than that delay waits that long, even past 5
+minutes, because the control plane asked for that wait. plexd reads the header on
+no other status.
+
+A refusal is retried too. A refused PUT changes nothing at the control plane, the
+delay holds it to about 12 attempts an hour, and an upgraded control plane then
+clears the refusal with no agent restart.
+
+| While a retry is pending | What happens |
+|---|---|
+| A notification changed the content | It sends once its quiet period ends. Another failure keeps doubling the delay, and the notification does not reset it |
+| A notification changed nothing | The retry timer is left alone, so a looping `touch` cannot defeat the backoff |
+| A `Retry-After` wait is running | Nothing sends until it ends, whatever changed, and the timer then delivers the newest content |
+| The content is back to the accepted manifest | The retry stops and the backoff resets, because the control plane already holds it |
+
+Every attempt calls the build function, so a retry always carries the newest
+content.
+
+A network error, a timeout, or a 5xx does not prove the PUT was not stored, since
+a PUT that committed can lose its response. After one, plexd forgets what was last
+accepted, so the next attempt always sends, even when the content is back to that
+manifest. A 4xx stopped before the write, so plexd keeps what was last accepted.
+
+A credential the heartbeat has parked fails before any I/O. That failure does not
+grow the delay: the reporter retries about every 5 seconds and delivers within
+about one such delay of the [mark lifting](../core/heartbeat-service.md#quiet-failure-logs).
+
+### Log Lines
+
+The two `agent: capability report:` lines carry `component=capability-report`; the others are logged by `plexd up` without it.
+
+| Message | Level | Attributes | Meaning |
+|---|---|---|---|
+| `agent: capability report: accepted` | Info | `declared_hooks`, `plexd_hooks` (counts) | A PUT was accepted |
+| `agent: capability report: send failed` | Warn | `error`, `retry_in` | A PUT failed and a retry is armed. Logged at Debug for `api.ErrCredentialRefused`, and not at all for a cancelled context at shutdown |
+| `boot hook scan failed` | Warn | `error` | The boot scan failed; boot carries on |
+| `boot hook scan timed out; hooks are reported when it finishes` | Warn | `timeout` | The boot scan outlived its 10 seconds |
+| `hooks beyond the capability manifest cap omitted` | Warn | `cap`, `dropped` | More than 128 script hooks |
+| `hook omitted from the capability manifest` | Warn | `hook`, `error` | A hook's digest could not be converted to the wire form, or its name is blank or not valid UTF-8, which the control plane cannot store. The hook stays on the node |
+| `hook integrity change detected` | Warn | `hook`, `old_checksum`, `new_checksum` | The watcher computed a new digest for a known hook |
+
+The PlexdHook watch's lines are listed under
+[PlexdHook CRD](plexdhook-crd.md#log-lines).
 
 ## Kubernetes CRD Hooks
 

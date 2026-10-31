@@ -266,30 +266,33 @@ func NewHTTPTokenReviewClient(apiServer, saTokenPath string) *HTTPTokenReviewCli
 
 ## HookLister
 
-Lists `PlexdHook` resources through the API server for the capability manifest. It is one authenticated GET per call: no watch, no write.
+Lists and watches `PlexdHook` resources through the API server for the capability manifest. A list is one authenticated GET and a watch is one authenticated GET held open as a stream. Neither writes.
 
 ```go
 func NewInClusterHookLister(env *KubernetesEnvironment) (*HookLister, error)
 func (l *HookLister) ListPlexdHooks(ctx context.Context, namespace string) ([]PlexdHook, error)
+func (l *HookLister) WatchPlexdHooks(ctx context.Context, namespace string) (<-chan PlexdHookEvent, error)
 ```
 
 - Connects to `https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT`; construction fails when either variable is unset
 - Trusts the cluster CA at `DefaultCACertPath`; construction fails when the bundle cannot be read or holds no certificate
-- GETs `/apis/plexd.plexsphere.com/v1alpha1/namespaces/{namespace}/plexdhooks`
-- Reads the service account token from `env.ServiceAccountToken` on every call, because the kubelet rotates it
-- Has no timeout of its own; the caller's context bounds each call
+- GETs `/apis/plexd.plexsphere.com/v1alpha1/namespaces/{namespace}/plexdhooks`; a watch adds `?watch=true` and no `resourceVersion`, so 410 Gone cannot occur and the API server starts by replaying every existing resource as `ADDED`
+- Reads the service account token from `env.ServiceAccountToken` on every call and every watch open, because the kubelet rotates it
+- Has no overall timeout, because a watch lasts as long as its stream; the caller's context bounds each call, and the transport allows 10 seconds each for the TLS handshake and for the response headers
 - TLS minimum version: 1.2
 
 | Response     | Result                                           |
 |--------------|--------------------------------------------------|
-| `200 OK`     | The resources, or an empty slice                 |
+| `200 OK`     | The resources or an empty slice, or for a watch the event channel |
 | `401`, `403` | Error wrapping `ErrUnauthorized`                 |
 | `404`        | Error wrapping `ErrNotFound` (CRD not installed) |
 | Other status | Error naming the status                          |
 
-### Boot-time PlexdHook discovery
+The event channel delivers `ADDED`, `MODIFIED`, and `DELETED` frames with the metadata unnested and skips `BOOKMARK` frames. It closes when the stream ends, a frame does not decode, a frame has type `ERROR`, or the context ends. It carries no reason, because the answer to each of these is to open a new watch.
 
-`plexd up` runs `DefaultDetector.Detect()` before it sends the capability manifest. In a pod it lists the `PlexdHook` resources in the ServiceAccount's namespace once, with a 10-second budget, and reports the digest-pinned ones as `plexd_hooks` (see [PlexdHook CRD](../actions/plexdhook-crd.md#capability-manifest-reporting)). The existing `plexdhooks` `get, list, watch` grant in the `plexd` ClusterRole authorizes the list, so no RBAC change is needed. Outside a cluster the step costs one environment variable check. Inside one, a missing grant, a missing CRD, a timeout, or an unreachable API server logs one warning, and the manifest goes out without `plexd_hooks`. The node boots either way.
+### PlexdHook inventory
+
+`plexd up` runs `DefaultDetector.Detect()` before it builds the capability reporter. In a pod it lists the `PlexdHook` resources in the ServiceAccount's namespace with a 10-second budget and reports the digest-pinned ones as `plexd_hooks`. A goroutine then watches those resources for as long as the agent runs and reports the list again when it changes (see [PlexdHook CRD](../actions/plexdhook-crd.md#keeping-the-list-current)). The existing `plexdhooks` `get, list, watch` grant in the `plexd` ClusterRole covers both the list and the watch, so no RBAC change is needed. Outside a cluster the step costs one environment variable check and no watch runs. Inside one, a missing grant, a missing CRD, a timeout, or an unreachable API server at boot logs one warning, and the first manifest goes out without `plexd_hooks`. The node boots either way, and the list reaches the control plane once a later list succeeds.
 
 ## Kubernetes manifests
 

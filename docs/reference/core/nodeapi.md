@@ -573,6 +573,37 @@ object `{}` when no policy is active (or no policy provider is wired).
 }
 ```
 
+### POST /v1/hooks/reload
+
+Re-scans the hooks directory through the `HookReloader` the agent wires in, which
+is `HookWatcher.Reload`, and returns the resulting list. The route takes no body
+and does not need the hook watch to be running. The other action and hook routes
+are listed under
+[Local API Endpoints](../actions/remote-actions-hooks.md#local-api-endpoints).
+
+**Response** `200 OK`:
+
+```json
+{
+  "status": "reloaded",
+  "hooks": [
+    { "name": "deploy.sh", "description": "Deploy", "source": "local", "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "parameters": null, "timeout": "", "sandbox": "" }
+  ]
+}
+```
+
+`hooks` is `[]` for an empty directory, never `null`.
+
+| Status | Condition                                                                  |
+|--------|----------------------------------------------------------------------------|
+| `200`  | Scan finished. A hook that failed to hash keeps its last digest            |
+| `500`  | The directory could not be read. The list stays as it was, no callback fires, and `error` carries the cause |
+| `503`  | No hook reloader is wired in                                               |
+
+A reload moves no integrity pin, so an edited hook stays refused until the agent
+restarts; see
+[Hook Integrity Pinning](../actions/remote-actions-hooks.md#hook-integrity-pinning).
+
 ## Cache Updates
 
 The node API no longer registers its own SSE handlers. The cache metadata map and
