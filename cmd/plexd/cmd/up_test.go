@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2267,9 +2268,79 @@ func TestDeclaredHooks(t *testing.T) {
 	if got := declaredHooks([]api.HookInfo{{Name: "bad", Checksum: "zzzz"}}, discardLogger()); got != nil {
 		t.Errorf("declaredHooks with no convertible entry = %+v, want nil", got)
 	}
+
+	// Past the contract's cap the control plane refuses the whole manifest with
+	// 400 declared_hooks_too_many. The watcher sorts by name, so the input here
+	// is sorted and the lowest names are the ones kept.
+	hooksNamed := func(n int) []api.HookInfo {
+		hooks := make([]api.HookInfo, 0, n)
+		for i := range n {
+			hooks = append(hooks, api.HookInfo{Name: fmt.Sprintf("hook-%03d", i), Checksum: hexDigest})
+		}
+		return hooks
+	}
+	t.Run("past the cap", func(t *testing.T) {
+		rec := newRecordingHandler()
+		got := declaredHooks(hooksNamed(129), slog.New(rec))
+		if len(got) != 128 {
+			t.Fatalf("declaredHooks returned %d entries, want 128", len(got))
+		}
+		if first, last := got[0].Name, got[len(got)-1].Name; first != "hook-000" || last != "hook-127" {
+			t.Errorf("kept %s..%s, want hook-000..hook-127", first, last)
+		}
+		if n := rec.count(slog.LevelWarn, declaredHooksCappedMsg); n != 1 {
+			t.Fatalf("cap warnings = %d, want 1", n)
+		}
+		if attrs := rec.attrsOf(slog.LevelWarn, declaredHooksCappedMsg); attrs["cap"] != "128" || attrs["dropped"] != "1" {
+			t.Errorf("cap warning attrs = %v, want cap=128 dropped=1", attrs)
+		}
+	})
+	t.Run("at the cap", func(t *testing.T) {
+		rec := newRecordingHandler()
+		if got := declaredHooks(hooksNamed(128), slog.New(rec)); len(got) != 128 {
+			t.Errorf("declaredHooks returned %d entries, want 128", len(got))
+		}
+		if n := rec.count(slog.LevelWarn, declaredHooksCappedMsg); n != 0 {
+			t.Errorf("cap warnings = %d, want 0", n)
+		}
+	})
+	// An entry dropped as unconvertible does not count: the cap is on what goes
+	// out, so this list fits and nothing is lost to it.
+	t.Run("an unconvertible entry does not count", func(t *testing.T) {
+		rec := newRecordingHandler()
+		hooks := append([]api.HookInfo{{Name: "bad", Checksum: "zzzz"}}, hooksNamed(128)...)
+		if got := declaredHooks(hooks, slog.New(rec)); len(got) != 128 {
+			t.Errorf("declaredHooks returned %d entries, want 128", len(got))
+		}
+		if n := rec.count(slog.LevelWarn, declaredHooksCappedMsg); n != 0 {
+			t.Errorf("cap warnings = %d, want 0", n)
+		}
+	})
+	// A blank name is refused with 400 declared_hook_invalid. JSON turns invalid
+	// UTF-8 into U+FFFD, so the last two arrive as one name, which is refused
+	// with 400 declared_hook_duplicate. Either would cost the whole manifest.
+	t.Run("a name the contract cannot carry", func(t *testing.T) {
+		rec := newRecordingHandler()
+		got := declaredHooks([]api.HookInfo{
+			{Name: " ", Checksum: hexDigest},
+			{Name: "\t", Checksum: hexDigest},
+			{Name: " ", Checksum: hexDigest},
+			{Name: "a\xfe", Checksum: hexDigest},
+			{Name: "a\xff", Checksum: hexDigest},
+			{Name: "deploy", Checksum: hexDigest},
+		}, slog.New(rec))
+		if want := (api.DeclaredHook{Name: "deploy", Checksum: wantChecksum}); len(got) != 1 || got[0] != want {
+			t.Errorf("declaredHooks = %+v, want only %+v", got, want)
+		}
+		if n := rec.count(slog.LevelWarn, declaredHookOmittedMsg); n != 5 {
+			t.Errorf("omission warnings = %d, want 5", n)
+		}
+	})
 }
 
 const (
+	declaredHookOmittedMsg    = "hook omitted from the capability manifest"
+	declaredHooksCappedMsg    = "hooks beyond the capability manifest cap omitted"
 	plexdHookOmittedMsg       = "plexd hook omitted from the capability manifest"
 	plexdHookParamRepeatedMsg = "plexd hook parameter repeated; the later value is reported"
 	plexdHooksCappedMsg       = "plexd hooks beyond the capability manifest cap omitted"
@@ -2364,6 +2435,39 @@ func TestDiscoveredPlexdHooks(t *testing.T) {
 	}
 }
 
+// The CRD lets a NUL through, and the control plane's jsonb column cannot store
+// one, so a single such parameter would make every PUT fail with a 500 for as long
+// as the resource exists. Both a value and a name do that.
+func TestDiscoveredPlexdHooks_DropsANULParameter(t *testing.T) {
+	const digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	spec := func(p kubernetes.PlexdHookParam) kubernetes.PlexdHookSpec {
+		return kubernetes.PlexdHookSpec{
+			JobTemplate: &kubernetes.PlexdHookJobTemplate{Image: "busybox@" + digest},
+			Parameters:  []kubernetes.PlexdHookParam{{Name: "ok", Value: "1"}, p},
+		}
+	}
+
+	rec := newRecordingHandler()
+	got := discoveredPlexdHooks([]kubernetes.PlexdHook{
+		{Name: "nul-in-value", Spec: spec(kubernetes.PlexdHookParam{Name: "target", Value: "a\x00b"})},
+		{Name: "nul-in-name", Spec: spec(kubernetes.PlexdHookParam{Name: "tar\x00get", Value: "b"})},
+		{Name: "clean", Spec: spec(kubernetes.PlexdHookParam{Name: "target", Value: "b"})},
+	}, slog.New(rec))
+
+	want := []api.DiscoveredPlexdHook{{
+		Name:        "clean",
+		ImageDigest: digest,
+		Parameters:  map[string]string{"ok": "1", "target": "b"},
+		Sandbox:     true,
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("discoveredPlexdHooks = %+v, want %+v", got, want)
+	}
+	if n := rec.count(slog.LevelWarn, plexdHookOmittedMsg); n != 2 {
+		t.Errorf("omission warnings = %d, want 2", n)
+	}
+}
+
 // Past the contract's cap the manifest would be refused whole, so the first
 // entries by name go out and the rest are counted in a warning.
 func TestDiscoveredPlexdHooks_CapsAtContractLimit(t *testing.T) {
@@ -2386,96 +2490,6 @@ func TestDiscoveredPlexdHooks_CapsAtContractLimit(t *testing.T) {
 	}
 	if attrs := rec.attrsOf(slog.LevelWarn, plexdHooksCappedMsg); attrs["dropped"] != "1" {
 		t.Errorf("cap warning attrs = %v, want dropped=1", attrs)
-	}
-}
-
-// fakeHookLister answers ListPlexdHooks from fixed values and records what it
-// was asked.
-type fakeHookLister struct {
-	hooks []kubernetes.PlexdHook
-	err   error
-
-	namespace   string
-	deadline    time.Time
-	hasDeadline bool
-}
-
-func (f *fakeHookLister) ListPlexdHooks(ctx context.Context, namespace string) ([]kubernetes.PlexdHook, error) {
-	f.namespace = namespace
-	f.deadline, f.hasDeadline = ctx.Deadline()
-	return f.hooks, f.err
-}
-
-// Discovery never blocks or fails boot. Outside a cluster it says nothing;
-// inside one, every way it can fail is one warning and no plexd_hooks.
-func TestDiscoverPlexdHooks(t *testing.T) {
-	inCluster := &kubernetes.KubernetesEnvironment{InCluster: true, Namespace: "plexd-system\n", ServiceAccountToken: "/token"}
-	listed := []kubernetes.PlexdHook{{Name: "nightly-backup"}}
-	transportErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
-
-	for _, tc := range []struct {
-		name            string
-		env             *kubernetes.KubernetesEnvironment
-		constructErr    error
-		listErr         error
-		want            []kubernetes.PlexdHook
-		wantWarnings    int
-		wantConstructed bool
-		wantListed      bool
-	}{
-		{name: "no environment"},
-		{name: "not in cluster", env: &kubernetes.KubernetesEnvironment{}},
-		{name: "blank namespace", env: &kubernetes.KubernetesEnvironment{InCluster: true, Namespace: " \n"}, wantWarnings: 1},
-		{name: "lister construction fails", env: inCluster, constructErr: errors.New("no cluster CA"), wantWarnings: 1, wantConstructed: true},
-		{name: "missing RBAC", env: inCluster, listErr: fmt.Errorf("list: %w", kubernetes.ErrUnauthorized), wantWarnings: 1, wantConstructed: true, wantListed: true},
-		{name: "CRD not installed", env: inCluster, listErr: fmt.Errorf("list: %w", kubernetes.ErrNotFound), wantWarnings: 1, wantConstructed: true, wantListed: true},
-		{name: "list times out", env: inCluster, listErr: fmt.Errorf("list: %w", context.DeadlineExceeded), wantWarnings: 1, wantConstructed: true, wantListed: true},
-		{name: "transport error", env: inCluster, listErr: fmt.Errorf("list: %w", transportErr), wantWarnings: 1, wantConstructed: true, wantListed: true},
-		{name: "listed", env: inCluster, want: listed, wantConstructed: true, wantListed: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// The fake returns hooks even alongside an error, so a caller that
-			// used them anyway would show here.
-			lister := &fakeHookLister{hooks: listed, err: tc.listErr}
-			constructed := false
-			newLister := func(*kubernetes.KubernetesEnvironment) (plexdHookLister, error) {
-				constructed = true
-				if tc.constructErr != nil {
-					return nil, tc.constructErr
-				}
-				return lister, nil
-			}
-
-			rec := newRecordingHandler()
-			start := time.Now()
-			got := discoverPlexdHooks(context.Background(), tc.env, newLister, slog.New(rec))
-			end := time.Now()
-
-			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("discoverPlexdHooks = %+v, want %+v", got, tc.want)
-			}
-			if n := rec.countAt(slog.LevelWarn); n != tc.wantWarnings {
-				t.Errorf("warnings = %d, want %d", n, tc.wantWarnings)
-			}
-			if constructed != tc.wantConstructed {
-				t.Errorf("lister constructed = %v, want %v", constructed, tc.wantConstructed)
-			}
-			if listedNow := lister.namespace != ""; listedNow != tc.wantListed {
-				t.Fatalf("list called = %v, want %v", listedNow, tc.wantListed)
-			}
-			if !tc.wantListed {
-				return
-			}
-			if lister.namespace != "plexd-system" {
-				t.Errorf("listed namespace %q, want the trimmed %q", lister.namespace, "plexd-system")
-			}
-			// The list runs under its own 10-second budget.
-			if !lister.hasDeadline ||
-				lister.deadline.Before(start.Add(plexdHookDiscoveryTimeout)) ||
-				lister.deadline.After(end.Add(plexdHookDiscoveryTimeout)) {
-				t.Errorf("list deadline = %v (set %v), want %v after the call", lister.deadline, lister.hasDeadline, plexdHookDiscoveryTimeout)
-			}
-		})
 	}
 }
 
@@ -2635,6 +2649,461 @@ func assertWireDigest(t *testing.T, field, value string) {
 	if len(raw) != sha256.Size {
 		t.Errorf("%s = %q decodes to %d bytes, want %d (a hex digest decodes to 48)", field, value, len(raw), sha256.Size)
 	}
+}
+
+// capabilityCapture is a control plane that admits a registration, answers 204
+// to every PUT of the capability manifest and keeps each body in arrival order,
+// because which PUT carries a hook is what the boot manifest tests are about. It
+// counts heartbeats too, which is how they see the daemon still running.
+type capabilityCapture struct {
+	mu         sync.Mutex
+	bodies     [][]byte
+	heartbeats int
+}
+
+func newCapabilityCapture(t *testing.T) (*capabilityCapture, string) {
+	t.Helper()
+	cp := &capabilityCapture{}
+	srv := httptest.NewServer(http.HandlerFunc(cp.serve))
+	t.Cleanup(srv.Close)
+	return cp, srv.URL
+}
+
+func (cp *capabilityCapture) serve(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/register":
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(api.RegisterResponse{
+			NodeID:           upTestNodeID,
+			MeshIP:           "100.64.0.1",
+			SigningPublicKey: upTestSigningKey,
+			SigningKeyID:     upTestSigningKID,
+			NSK:              upTestNSK,
+			DomainMeshCIDR:   "100.64.0.0/10",
+			PeerSnapshot:     []api.RegisterPeer{},
+		})
+		return
+	case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/capabilities"):
+		raw, _ := io.ReadAll(r.Body)
+		cp.mu.Lock()
+		cp.bodies = append(cp.bodies, raw)
+		cp.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+		cp.mu.Lock()
+		cp.heartbeats++
+		cp.mu.Unlock()
+	}
+	_, _ = w.Write([]byte("{}"))
+}
+
+// firstBody blocks until the first PUT arrives and returns its body.
+func (cp *capabilityCapture) firstBody(t *testing.T) []byte {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		cp.mu.Lock()
+		var first []byte
+		if len(cp.bodies) > 0 {
+			first = cp.bodies[0]
+		}
+		cp.mu.Unlock()
+		if first != nil {
+			return first
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the daemon never reported its capability manifest")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// allBodies returns every PUT body received so far.
+func (cp *capabilityCapture) allBodies() [][]byte {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return append([][]byte(nil), cp.bodies...)
+}
+
+// waitForNextHeartbeat blocks until a heartbeat arrives after this call, which
+// shows the daemon past the point the caller is interested in and still running.
+func (cp *capabilityCapture) waitForNextHeartbeat(t *testing.T) {
+	t.Helper()
+	cp.mu.Lock()
+	seen := cp.heartbeats
+	cp.mu.Unlock()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		cp.mu.Lock()
+		now := cp.heartbeats
+		cp.mu.Unlock()
+		if now > seen {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the daemon sent no further heartbeat")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// useRecordingDaemonLog sends the daemon's log to a recording handler for one
+// test. The handler takes every record, whatever level the config sets.
+func useRecordingDaemonLog(t *testing.T) *recordingHandler {
+	t.Helper()
+	rec := newRecordingHandler()
+	old := newLogHandler
+	t.Cleanup(func() { newLogHandler = old })
+	newLogHandler = func(slog.Level) slog.Handler { return rec }
+	return rec
+}
+
+// The boot manifest is the first thing the control plane learns about a node's
+// hooks, and a hook missing from it is refused with action_not_declared. A later
+// send would not show up here: the assertion reads the first PUT, not the newest.
+func TestRunUp_BootManifestCarriesHooksOnDisk(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need the executable bit and /bin/sh, which windows lacks")
+	}
+	// Outside a cluster no PlexdHook list runs; an ambient
+	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+	payload := []byte("#!/bin/sh\nexit 0\n")
+	hooksDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(hooksDir, "deploy"), payload, 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	t.Setenv("PLEXD_HOOKS_DIR", hooksDir)
+
+	cp, apiBase := newCapabilityCapture(t)
+	writeUpConfig(t, apiBase, upDaemonYAML(t))
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	first := cp.firstBody(t)
+	var manifest api.CapabilityManifestRequest
+	if err := json.Unmarshal(first, &manifest); err != nil {
+		t.Fatalf("decode manifest: %v (body: %s)", err, first)
+	}
+	sum := sha256.Sum256(payload)
+	want := []api.DeclaredHook{{Name: "deploy", Checksum: base64.StdEncoding.EncodeToString(sum[:])}}
+	if !reflect.DeepEqual(manifest.DeclaredHooks, want) {
+		t.Errorf("first manifest declared_hooks = %+v, want %+v (body: %s)", manifest.DeclaredHooks, want, first)
+	}
+}
+
+// TestRunUp_BootManifestCarriesHooksOnDisk can pass with the scan in the wrong
+// place, because a small hook hashes faster than the reporter starts. Holding the
+// scan open takes the speed out of it: nothing may reach the control plane until
+// the scan is done, and that order is what puts the hooks in the boot manifest.
+func TestRunUp_NoManifestGoesOutDuringTheBootScan(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need the executable bit and /bin/sh, which windows lacks")
+	}
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+	hooksDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(hooksDir, "deploy"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	t.Setenv("PLEXD_HOOKS_DIR", hooksDir)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	scan := bootHookScan
+	t.Cleanup(func() { bootHookScan = scan })
+	bootHookScan = func(ctx context.Context, reload func() ([]api.HookInfo, error), timeout time.Duration, logger *slog.Logger) {
+		close(entered)
+		// ctx ends the hold too, so a failed assertion cannot wedge the shutdown.
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		scan(ctx, reload, timeout, logger)
+	}
+
+	cp, apiBase := newCapabilityCapture(t)
+	writeUpConfig(t, apiBase, upDaemonYAML(t))
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("runAgent never ran the boot scan")
+	}
+
+	// A correct build sends nothing however long this takes, so a slow host can
+	// only hide a wrong order, never fail a right one.
+	time.Sleep(300 * time.Millisecond)
+	if got := cp.allBodies(); len(got) != 0 {
+		t.Errorf("%d manifest(s) sent while the boot scan was running", len(got))
+	}
+	close(release)
+
+	first := cp.firstBody(t)
+	var manifest api.CapabilityManifestRequest
+	if err := json.Unmarshal(first, &manifest); err != nil {
+		t.Fatalf("decode manifest: %v (body: %s)", err, first)
+	}
+	if len(manifest.DeclaredHooks) != 1 || manifest.DeclaredHooks[0].Name != "deploy" {
+		t.Errorf("first manifest declared_hooks = %+v, want deploy (body: %s)", manifest.DeclaredHooks, first)
+	}
+}
+
+// An absent key means "none" at the control plane, so nothing to report leaves the
+// key off, and no state of hooks_dir stops the daemon. A regular file in place of
+// the directory is a real scan failure: the daemon logs it and reports without
+// hooks. That case needs the Windows guard above all, because there ENOTDIR matches
+// fs.ErrNotExist and the scan would succeed.
+func TestRunUp_BootManifestOmitsDeclaredHooks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need the executable bit and /bin/sh, which windows lacks")
+	}
+
+	for _, tc := range []struct {
+		name     string
+		hooksDir func(t *testing.T) string
+		wantScan string
+	}{
+		{name: "empty directory", hooksDir: func(t *testing.T) string { return t.TempDir() }},
+		{
+			name: "no executable file",
+			hooksDir: func(t *testing.T) string {
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("not a hook"), 0o644); err != nil {
+					t.Fatalf("write file: %v", err)
+				}
+				return dir
+			},
+		},
+		{name: "missing directory", hooksDir: func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing") }},
+		{
+			name: "regular file in place of the directory",
+			hooksDir: func(t *testing.T) string {
+				path := filepath.Join(t.TempDir(), "hooks")
+				if err := os.WriteFile(path, []byte("not a directory"), 0o644); err != nil {
+					t.Fatalf("write file: %v", err)
+				}
+				return path
+			},
+			wantScan: "not a directory",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Outside a cluster no PlexdHook list runs; an ambient
+			// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+			t.Setenv("KUBERNETES_SERVICE_HOST", "")
+			t.Setenv("PLEXD_HOOKS_DIR", tc.hooksDir(t))
+
+			cp, apiBase := newCapabilityCapture(t)
+			writeUpConfig(t, apiBase, upDaemonYAML(t)+"heartbeat:\n  interval: 100ms\n")
+			rec := useRecordingDaemonLog(t)
+			shutdown := startRunUp(t)
+			defer shutdown()
+
+			// A manifest with the rest of its content, or the absent key below
+			// would prove nothing.
+			first := cp.firstBody(t)
+			if !bytes.Contains(first, []byte(`"builtin_actions"`)) {
+				t.Fatalf("first body is not a manifest: %s", first)
+			}
+
+			cp.waitForNextHeartbeat(t)
+
+			for _, body := range cp.allBodies() {
+				if bytes.Contains(body, []byte(`"declared_hooks"`)) {
+					t.Errorf("manifest carries declared_hooks: %s", body)
+				}
+			}
+			n := rec.count(slog.LevelWarn, bootHookScanFailedMsg)
+			if tc.wantScan == "" {
+				if n != 0 {
+					t.Errorf("scan warnings = %d, want 0", n)
+				}
+				return
+			}
+			if n != 1 {
+				t.Fatalf("scan warnings = %d, want 1", n)
+			}
+			if got := rec.attrsOf(slog.LevelWarn, bootHookScanFailedMsg)["error"]; !strings.Contains(got, tc.wantScan) {
+				t.Errorf("scan warning error = %q, want it to contain %q", got, tc.wantScan)
+			}
+		})
+	}
+}
+
+// A hook change reaches the control plane through the watcher's onChange, which
+// has to feed the executor's list and wake the reporter. The change here goes
+// through the reload route rather than an inotify event, so the test holds on a
+// host with no inotify instances to spare.
+func TestRunUp_ReportsAHookFoundAfterBoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need the executable bit and /bin/sh, which windows lacks")
+	}
+	// Outside a cluster no PlexdHook list runs; an ambient
+	// KUBERNETES_SERVICE_HOST must not turn this into a cluster test.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	hooksDir := t.TempDir()
+	t.Setenv("PLEXD_HOOKS_DIR", hooksDir)
+
+	socketPath := shortSocketPath(t)
+	cp, apiBase := newCapabilityCapture(t)
+	writeUpConfig(t, apiBase, fmt.Sprintf(`policy:
+  enabled: false
+tunnel:
+  enabled: false
+node_api:
+  socket_path: %s
+`, socketPath))
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	if first := cp.firstBody(t); bytes.Contains(first, []byte(`"declared_hooks"`)) {
+		t.Fatalf("first manifest carries declared_hooks before any hook exists: %s", first)
+	}
+
+	if err := os.WriteFile(filepath.Join(hooksDir, "deploy"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	nodeAPI := newSocketClient(socketPath)
+	defer nodeAPI.CloseIdleConnections()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		resp, err := nodeAPI.Post(socketURL("/v1/hooks/reload"), "application/json", nil)
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("reload never answered 200: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	for {
+		for _, body := range cp.allBodies() {
+			if bytes.Contains(body, []byte(`"deploy"`)) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no manifest reported the hook the reload found")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+const (
+	bootHookScanFailedMsg   = "boot hook scan failed"
+	bootHookScanTimedOutMsg = "boot hook scan timed out; hooks are reported when it finishes"
+)
+
+// The scan runs before heartbeats start, so whatever it does it must not keep boot
+// from going on. Each case calls awaitBootHookScan on a goroutine of its own, so
+// one that blocks fails the test instead of hanging it.
+func TestAwaitBootHookScan(t *testing.T) {
+	const testWait = 10 * time.Second
+	if bootHookScanTimeout != 10*time.Second {
+		t.Errorf("bootHookScanTimeout = %v, want 10s", bootHookScanTimeout)
+	}
+
+	await := func(t *testing.T, ctx context.Context, scan func() ([]api.HookInfo, error), timeout time.Duration, rec *recordingHandler) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			awaitBootHookScan(ctx, scan, timeout, slog.New(rec))
+		}()
+		select {
+		case <-done:
+		case <-time.After(testWait):
+			t.Fatal("awaitBootHookScan did not return")
+		}
+	}
+
+	t.Run("a scan that finishes", func(t *testing.T) {
+		rec := newRecordingHandler()
+		scans := 0
+		await(t, context.Background(), func() ([]api.HookInfo, error) {
+			scans++
+			return nil, nil
+		}, time.Hour, rec)
+		if scans != 1 {
+			t.Errorf("scans = %d, want 1", scans)
+		}
+		if n := rec.countAt(slog.LevelWarn); n != 0 {
+			t.Errorf("warnings = %d, want 0", n)
+		}
+	})
+
+	t.Run("a scan that blocks", func(t *testing.T) {
+		rec := newRecordingHandler()
+		release := make(chan struct{})
+		defer close(release)
+		await(t, context.Background(), func() ([]api.HookInfo, error) {
+			<-release
+			return nil, nil
+		}, 10*time.Millisecond, rec)
+		if n := rec.count(slog.LevelWarn, bootHookScanTimedOutMsg); n != 1 {
+			t.Errorf("timeout warnings = %d, want 1", n)
+		}
+	})
+
+	t.Run("a scan that fails", func(t *testing.T) {
+		rec := newRecordingHandler()
+		scanErr := errors.New("actions: watcher: scan /hooks: not a directory")
+		await(t, context.Background(), func() ([]api.HookInfo, error) {
+			return nil, scanErr
+		}, time.Hour, rec)
+		if got := rec.attrsOf(slog.LevelWarn, bootHookScanFailedMsg)["error"]; got != scanErr.Error() {
+			t.Errorf("scan warning error = %q, want %q", got, scanErr)
+		}
+		if n := rec.count(slog.LevelWarn, bootHookScanTimedOutMsg); n != 0 {
+			t.Errorf("timeout warnings = %d, want 0", n)
+		}
+	})
+
+	// The wait is over by then, and nothing else would report the failure.
+	t.Run("a scan that fails after the timeout", func(t *testing.T) {
+		rec := newRecordingHandler()
+		release := make(chan struct{})
+		await(t, context.Background(), func() ([]api.HookInfo, error) {
+			<-release
+			return nil, errors.New("scan failed late")
+		}, 10*time.Millisecond, rec)
+		if n := rec.count(slog.LevelWarn, bootHookScanFailedMsg); n != 0 {
+			t.Fatalf("scan warnings = %d before the scan ended, want 0", n)
+		}
+		close(release)
+		deadline := time.Now().Add(testWait)
+		for rec.count(slog.LevelWarn, bootHookScanFailedMsg) != 1 {
+			if time.Now().After(deadline) {
+				t.Fatal("the late scan error was not logged")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
+
+	t.Run("a cancelled context", func(t *testing.T) {
+		rec := newRecordingHandler()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		release := make(chan struct{})
+		defer close(release)
+		await(t, ctx, func() ([]api.HookInfo, error) {
+			<-release
+			return nil, nil
+		}, time.Hour, rec)
+		if n := rec.countAt(slog.LevelWarn); n != 0 {
+			t.Errorf("warnings = %d, want 0", n)
+		}
+	})
 }
 
 // handshakeReport is one request the handshake control plane received on a

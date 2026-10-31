@@ -18,6 +18,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 
@@ -714,34 +715,40 @@ func runAgent(ctx context.Context) error {
 			{Name: "since", Type: "string", Required: false, Description: "Duration filter (e.g. 5m, 1h)"},
 		}, actions.LogsSnapshot(&agentLogProvider{ringBuffer: logRingBuffer}))
 
-	// Report the capability manifest to the control plane. The manifest carries
-	// the binary version and digest, the SSH host-key fingerprint the integrity
-	// correlator watches for rotation, the declared hooks, and two inventories.
-	// builtin_actions is the executor's name-sorted action list, sent whole: the
-	// builtins registered above sit far below the contract's 128-action and
-	// 64-parameter caps. plexd_hooks carries the PlexdHook resources a pod finds
-	// in its ServiceAccount's namespace, listed once here and never watched.
-	// Outside a cluster that costs one environment lookup, and a failed list only
-	// leaves the key off.
+	// Build what reports the capability manifest to the control plane. The
+	// manifest carries the binary version and digest, the SSH host-key
+	// fingerprint the integrity correlator watches for rotation, the declared
+	// hooks, and two inventories. builtin_actions is the executor's name-sorted
+	// action list, sent whole: the builtins registered above sit far below the
+	// contract's 128-action and 64-parameter caps. plexd_hooks carries the
+	// PlexdHook resources a pod finds in its ServiceAccount's namespace, kept
+	// current by plexdHooks. Outside a cluster that costs one environment lookup,
+	// and a failed boot list only leaves the key off.
+	//
+	// The reporter calls this closure on every attempt, so a retry always sends
+	// the newest content. It starts at step 20a, after the boot scan below, which
+	// is what puts the hooks on disk in the first manifest.
 	kubeEnv := (&kubernetes.DefaultDetector{Logger: logger}).Detect()
-	plexdHooks := discoverPlexdHooks(ctx, kubeEnv, newInClusterHookLister, logger)
-	capsActions, capsHooks := executor.Capabilities()
-	caps := api.CapabilityManifestRequest{
-		BinaryVersion:         buildVersion,
-		BinaryChecksum:        wireChecksum,
-		SSHHostKeyFingerprint: tunnel.HostKeyFingerprint(hostKey),
-		DeclaredHooks:         declaredHooks(capsHooks, logger),
-		PlexdHooks:            discoveredPlexdHooks(plexdHooks, logger),
-		BuiltinActions:        capsActions,
-	}
-	if err := client.UpdateCapabilities(ctx, identity.NodeID, caps); err != nil {
-		logger.Warn("capabilities report failed", "error", err)
-	}
+	plexdHooks := newPlexdHookInventory(ctx, kubeEnv, newInClusterHookLister, logger)
+	capabilityReporter := agent.NewCapabilityReporter(identity.NodeID, client, func() api.CapabilityManifestRequest {
+		capsActions, capsHooks := executor.Capabilities()
+		return api.CapabilityManifestRequest{
+			BinaryVersion:         buildVersion,
+			BinaryChecksum:        wireChecksum,
+			SSHHostKeyFingerprint: tunnel.HostKeyFingerprint(hostKey),
+			DeclaredHooks:         declaredHooks(capsHooks, logger),
+			PlexdHooks:            plexdHooks.snapshot(),
+			BuiltinActions:        capsActions,
+		}
+	}, logger)
 
 	// 11. Create hook watcher.
 	hookWatcher := actions.NewHookWatcher(
 		cfg.Actions.HooksDir,
-		executor.SetHooks,
+		func(hooks []api.HookInfo) {
+			executor.SetHooks(hooks)
+			capabilityReporter.Notify()
+		},
 		func(hookName, oldChecksum, newChecksum string) {
 			logger.Warn("hook integrity change detected",
 				"hook", hookName,
@@ -751,6 +758,11 @@ func runAgent(ctx context.Context) error {
 		},
 		logger,
 	)
+
+	// Scan hooks_dir before anything can read the hook list. The reconciler starts
+	// ahead of the watch and a dispatch it delivers must not meet an empty list,
+	// and the first scan pins each hook's integrity anchor.
+	bootHookScan(ctx, hookWatcher.Reload, bootHookScanTimeout, logger)
 
 	// 12. Create node API server.
 	cfg.NodeAPI.SecretAuthEnabled = true
@@ -1114,6 +1126,24 @@ func runAgent(ctx context.Context) error {
 		if err := hookWatcher.Watch(ctx); err != nil {
 			logger.Error("hook watcher stopped", "error", err)
 		}
+	}()
+
+	// 20a. Start the capability reporter. Its first attempt is the boot manifest,
+	// and it retries that until one is accepted. The hook watcher's onChange and
+	// the PlexdHook inventory notify it of every later change.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = capabilityReporter.Run(ctx)
+	}()
+
+	// 20b. Start the PlexdHook inventory's watch. It takes Notify here rather than
+	// at construction because the reporter's build closure needs the inventory
+	// first. Outside a cluster it returns at once.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		plexdHooks.run(ctx, capabilityReporter.Notify)
 	}()
 
 	// 21. Start metrics manager.
@@ -1740,12 +1770,22 @@ func signingKeyDispatchHandler(verifier *api.Ed25519Verifier, dataDir string, pe
 // A hook whose checksum is missing or not a SHA-256 digest is dropped with a
 // warning rather than sent: the manifest is validated as a whole, so one
 // unusable entry would cost the binary version and digest of the entire report.
+// The same goes for a name the contract cannot carry. A blank one is refused, and
+// JSON turns invalid UTF-8 into U+FFFD, so two such names arrive as a duplicate.
+//
+// The result is capped at maxDeclaredHooks for the same reason. It keeps the
+// first entries of the list it receives, which the hook watcher sorts by name.
 func declaredHooks(hooks []api.HookInfo, logger *slog.Logger) []api.DeclaredHook {
 	if len(hooks) == 0 {
 		return nil
 	}
 	out := make([]api.DeclaredHook, 0, len(hooks))
 	for _, h := range hooks {
+		if strings.TrimSpace(h.Name) == "" || !utf8.ValidString(h.Name) {
+			logger.Warn("hook omitted from the capability manifest",
+				"hook", h.Name, "error", "the name is blank or not valid UTF-8")
+			continue
+		}
 		checksum, err := integrity.WireChecksum(h.Checksum)
 		if err != nil {
 			logger.Warn("hook omitted from the capability manifest",
@@ -1757,13 +1797,55 @@ func declaredHooks(hooks []api.HookInfo, logger *slog.Logger) []api.DeclaredHook
 	if len(out) == 0 {
 		return nil
 	}
+	if len(out) > maxDeclaredHooks {
+		logger.Warn("hooks beyond the capability manifest cap omitted",
+			"cap", maxDeclaredHooks, "dropped", len(out)-maxDeclaredHooks)
+		out = out[:maxDeclaredHooks]
+	}
 	return out
 }
 
-// plexdHookDiscoveryTimeout bounds the boot-time PlexdHook list, so an API
-// server that does not answer holds the capability manifest back by at most
-// this long.
+// bootHookScanTimeout bounds how long boot waits for the first scan of hooks_dir.
+// The scan hashes every hook, so a hung mount could otherwise stop runAgent
+// before heartbeats start, with SIGTERM unable to get through.
+const bootHookScanTimeout = 10 * time.Second
+
+// bootHookScan is awaitBootHookScan behind a seam, so a test can hold the scan
+// open and see that nothing overtakes it.
+var bootHookScan = awaitBootHookScan
+
+// awaitBootHookScan runs scan in its own goroutine and returns when scan returns,
+// ctx ends, or timeout passes. Neither a failed scan nor a slow one stops boot: a
+// failure is logged and the manifest goes out without hooks, and a scan that
+// outlives the wait still reaches the reporter through onChange when it ends.
+func awaitBootHookScan(ctx context.Context, scan func() ([]api.HookInfo, error), timeout time.Duration, logger *slog.Logger) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Logged here so a scan that outlives the wait still reports its error.
+		if _, err := scan(); err != nil {
+			logger.Warn("boot hook scan failed", "error", err)
+		}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-timer.C:
+		logger.Warn("boot hook scan timed out; hooks are reported when it finishes", "timeout", timeout)
+	}
+}
+
+// plexdHookDiscoveryTimeout bounds every PlexdHook list, so an API server that
+// does not answer holds the capability manifest back at boot by at most this
+// long, and the inventory's later lists cannot stall its watch.
 const plexdHookDiscoveryTimeout = 10 * time.Second
+
+// maxDeclaredHooks is the manifest's declared_hooks ceiling. A manifest carrying
+// more is refused whole with 400 declared_hooks_too_many.
+const maxDeclaredHooks = 128
 
 // maxPlexdHooks is the manifest's plexd_hooks ceiling. A manifest carrying more
 // is refused whole with 422 plexd_hooks_too_many.
@@ -1773,51 +1855,21 @@ const maxPlexdHooks = 128
 // plexd_hooks entry.
 var imageDigestRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
-// plexdHookLister lists the PlexdHook resources in one namespace;
+// plexdHookLister lists and watches the PlexdHook resources in one namespace;
 // kubernetes.HookLister is the production implementation.
 type plexdHookLister interface {
 	ListPlexdHooks(ctx context.Context, namespace string) ([]kubernetes.PlexdHook, error)
+	WatchPlexdHooks(ctx context.Context, namespace string) (<-chan kubernetes.PlexdHookEvent, error)
 }
 
 // newInClusterHookLister adapts kubernetes.NewInClusterHookLister to the
-// constructor discoverPlexdHooks takes.
+// constructor newPlexdHookInventory takes.
 func newInClusterHookLister(env *kubernetes.KubernetesEnvironment) (plexdHookLister, error) {
 	lister, err := kubernetes.NewInClusterHookLister(env)
 	if err != nil {
 		return nil, err
 	}
 	return lister, nil
-}
-
-// discoverPlexdHooks lists the PlexdHook resources in the namespace the pod's
-// ServiceAccount runs in: one list at boot, never a watch, so a hook created
-// later appears at the next restart. Outside a cluster it returns nil without a
-// word. Inside one, every failure (no namespace, no lister, a list refused for
-// want of RBAC or a CRD, or one that outlives its budget) logs one warning and
-// returns nil: the manifest goes out without plexd_hooks and boot carries on.
-func discoverPlexdHooks(ctx context.Context, env *kubernetes.KubernetesEnvironment, newLister func(*kubernetes.KubernetesEnvironment) (plexdHookLister, error), logger *slog.Logger) []kubernetes.PlexdHook {
-	if env == nil || !env.InCluster {
-		return nil
-	}
-	namespace := strings.TrimSpace(env.Namespace)
-	if namespace == "" {
-		logger.Warn("plexd hook discovery skipped: the ServiceAccount namespace is empty")
-		return nil
-	}
-	lister, err := newLister(env)
-	if err != nil {
-		logger.Warn("plexd hook discovery skipped", "error", err)
-		return nil
-	}
-
-	listCtx, cancel := context.WithTimeout(ctx, plexdHookDiscoveryTimeout)
-	defer cancel()
-	hooks, err := lister.ListPlexdHooks(listCtx, namespace)
-	if err != nil {
-		logger.Warn("plexd hook discovery failed", "namespace", namespace, "error", err)
-		return nil
-	}
-	return hooks
 }
 
 // discoveredPlexdHooks converts listed PlexdHook resources into the manifest's
@@ -1830,7 +1882,10 @@ func discoverPlexdHooks(ctx context.Context, env *kubernetes.KubernetesEnvironme
 //     whose image is not pinned by a canonical sha256 digest (the busybox:latest
 //     default included) is dropped.
 //   - parameters folds the spec's name/value list into a map; a repeated name
-//     keeps the later value.
+//     keeps the later value. A hook with a NUL in a parameter's name or value is
+//     dropped: the control plane stores parameters as jsonb, which cannot hold
+//     one, so it would answer every PUT with a 500, and the inventory would keep
+//     sending that resource until someone deleted it.
 //   - sandbox mirrors the controller, which runs every hook that is not
 //     privileged with a read-only root filesystem and all capabilities dropped.
 //   - timeout_seconds stays unset: the CRD has no field to fill it from.
@@ -1852,6 +1907,11 @@ func discoveredPlexdHooks(hooks []kubernetes.PlexdHook, logger *slog.Logger) []a
 		if !imageDigestRe.MatchString(digest) {
 			logger.Warn("plexd hook omitted from the capability manifest",
 				"hook", h.Name, "image", image, "reason", "image is not pinned by a sha256 digest")
+			continue
+		}
+		if hasNULParameter(h.Spec.Parameters) {
+			logger.Warn("plexd hook omitted from the capability manifest",
+				"hook", h.Name, "image", image, "reason", "a parameter contains a NUL character")
 			continue
 		}
 
@@ -1885,6 +1945,17 @@ func discoveredPlexdHooks(hooks []kubernetes.PlexdHook, logger *slog.Logger) []a
 		out = out[:maxPlexdHooks]
 	}
 	return out
+}
+
+// hasNULParameter reports whether a parameter's name or value holds a NUL
+// character.
+func hasNULParameter(params []kubernetes.PlexdHookParam) bool {
+	for _, p := range params {
+		if strings.ContainsRune(p.Name, 0) || strings.ContainsRune(p.Value, 0) {
+			return true
+		}
+	}
+	return false
 }
 
 // controlPlaneReporter adapts api.ControlPlane to the integrity.ViolationReporter interface.

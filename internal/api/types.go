@@ -681,10 +681,12 @@ type CapabilityManifestRequest struct {
 	// DeclaredHooks are the hooks the agent advertises, at most 128, with
 	// unique names. Omitted when empty rather than sent as null.
 	DeclaredHooks []DeclaredHook `json:"declared_hooks,omitempty"`
-	// PlexdHooks are the PlexdHook resources the agent discovered in its
-	// ServiceAccount's namespace at boot, at most 128, with unique names.
-	// Omitted when the agent runs outside a cluster or found nothing it can
-	// report, rather than sent as null.
+	// PlexdHooks are the PlexdHook resources the agent found in its
+	// ServiceAccount's namespace, at most 128, with unique names. The agent
+	// reports the list again when those resources change. Omitted when the
+	// agent runs outside a cluster or found nothing it can report, rather than
+	// sent as null, and a missing key means none: every PUT replaces the stored
+	// list whole.
 	PlexdHooks []DiscoveredPlexdHook `json:"plexd_hooks,omitempty"`
 	// BuiltinActions is the inventory of builtin actions the agent implements,
 	// sorted by name, each with its parameters in registration order. Omitted
