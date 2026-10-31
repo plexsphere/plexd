@@ -146,7 +146,8 @@ type KubeClient interface {
 	DeleteSecret(ctx context.Context, namespace, name string) error
 
 	// WatchPlexdHooks starts a watch on PlexdHook resources in the given namespace.
-	// Returns a channel that receives events until the context is cancelled.
+	// Returns a channel that receives events and closes when the stream ends,
+	// a frame cannot be used, or the context is cancelled.
 	WatchPlexdHooks(ctx context.Context, namespace string) (<-chan PlexdHookEvent, error)
 
 	// UpdatePlexdHookStatus updates the status subresource of a PlexdHook resource.
