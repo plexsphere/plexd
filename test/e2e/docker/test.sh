@@ -27,6 +27,8 @@
 #     node_secrets_updated as a pull trigger
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
+#   - Capability manifest kept current: a hook added, changed, touched, reloaded
+#     and removed in the running container, and a failed PUT retried
 #   - Pull-only delivery under a descoped event bus (quiet SSE re-probing)
 #   - Last-Event-ID resume replays buffered envelopes after a descope window
 #   - release-verdict upgrade flow (checksum + offline Sigstore verification)
@@ -84,6 +86,23 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
     sha256_hex() { shasum -a 256 | awk '{print $1}'; }
 fi
+
+# --- Helper: print a capability manifest's declared_hooks names, comma-joined ---
+# An absent list prints nothing, so a comparison with the wanted names fails on
+# it instead of passing over it.
+declared_hook_names() {
+    printf '%s' "$1" | jq -r '[.declared_hooks[]?.name] | join(",")'
+}
+
+# --- Helper: print the digest a capability manifest declares for a hook ---
+# Args: <manifest> <hook>. The wire carries base64, and this prints lowercase
+# hex so the result compares directly with sha256_hex. A hook the manifest does
+# not list prints nothing.
+declared_hook_hex() {
+    local checksum
+    checksum=$(printf '%s' "$1" | jq -r --arg name "$2" '.declared_hooks[]? | select(.name == $name) | .checksum')
+    printf '%s' "${checksum}" | b64_decode | od -An -tx1 | tr -d ' \n'
+}
 
 # Counter JSON keys (shared across extraction, checking, and reporting).
 # audit_count is deliberately absent: the audit ingest contract's source enum is
@@ -710,6 +729,28 @@ if [ "${CAPS_UPGRADE_PARAMS}" != "version:true,checksum:true" ]; then
     fail "service.upgrade declares parameters [${CAPS_UPGRADE_PARAMS}], want [version:true,checksum:true] in that order"
 fi
 echo "  PASS: capability manifest is contract-shaped (version=${CAPS_VERSION}, 32-byte digest, 11 builtins by name)"
+
+# declared_hooks is what the boot scan found: the one hook the image ships, with
+# the digest of the file. An absent list fails here, and it is what an agent
+# sends when it builds the manifest ahead of that scan.
+BIGOUT_HEX=$(sha256_hex < "${SCRIPT_DIR}/hooks/e2e-bigout")
+CAPS_HOOK_NAMES=$(declared_hook_names "${CAPS_BODY}")
+if [ "${CAPS_HOOK_NAMES}" != "e2e-bigout" ]; then
+    fail "capability manifest declared_hooks = [${CAPS_HOOK_NAMES}], want exactly e2e-bigout (body: ${CAPS_BODY})"
+fi
+CAPS_HOOK_HEX=$(declared_hook_hex "${CAPS_BODY}" e2e-bigout)
+if [ "${CAPS_HOOK_HEX}" != "${BIGOUT_HEX}" ]; then
+    fail "declared_hooks digest of e2e-bigout = ${CAPS_HOOK_HEX}, want ${BIGOUT_HEX}, the SHA-256 of the file"
+fi
+# /test/last-request/capabilities returns the newest PUT, so a broken boot order
+# would otherwise pass through the second send: a first manifest without the
+# hook, then the scan's notification correcting it a second later. The count is
+# read after the body, so any send the body could show is in the count.
+CAPS_COUNT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "capabilities_count")
+if [ "${CAPS_COUNT}" != "1" ]; then
+    fail "capabilities_count = ${CAPS_COUNT}, want 1: the checks above must have read the first manifest"
+fi
+echo "  PASS: the first capability manifest declares e2e-bigout with the digest of the file"
 
 # 3d. Metrics body must be a non-empty JSON array of MetricSample records: every
 # element carries a group inside the wire enum, a non-empty name, a numeric
@@ -3174,9 +3215,21 @@ if [ -n "${CAPS_BODY}" ]; then
         *) fail "ssh_host_key_fingerprint='${CAPS_FP}', want the SHA256:<base64> form" ;;
     esac
 
-    # declared_hooks is optional and absent when the agent advertises none; when
-    # present every entry needs a name and a 32-byte base64 digest.
-    BAD_HOOKS=$(echo "${CAPS_BODY}" | jq '[.declared_hooks[]? | select((.name // "") == "" or (.checksum // "") == "")] | length')
+    # This agent has a hook on disk, so an absent declared_hooks fails: the key
+    # goes missing only when the agent has none. By now the agent has restarted
+    # twice, so this also shows that every boot keeps reporting e2e-bigout.
+    # Every entry needs a name and a 32-byte base64 digest.
+    CAPS_HOOK_NAMES=$(declared_hook_names "${CAPS_BODY}")
+    if [ "${CAPS_HOOK_NAMES}" != "e2e-bigout" ]; then
+        fail "capability manifest declared_hooks = [${CAPS_HOOK_NAMES}], want exactly e2e-bigout (body: ${CAPS_BODY})"
+    fi
+    CAPS_HOOK_HEX=$(declared_hook_hex "${CAPS_BODY}" e2e-bigout)
+    if [ "${CAPS_HOOK_HEX}" = "${BIGOUT_HEX}" ]; then
+        echo "  PASS: declared_hooks holds e2e-bigout with the digest of the file"
+    else
+        fail "declared_hooks digest of e2e-bigout = ${CAPS_HOOK_HEX}, want ${BIGOUT_HEX}, the SHA-256 of the file"
+    fi
+    BAD_HOOKS=$(echo "${CAPS_BODY}" | jq '[.declared_hooks[] | select((.name // "") == "" or (.checksum // "") == "")] | length')
     if [ "${BAD_HOOKS}" -eq 0 ]; then
         echo "  PASS: declared_hooks entries all carry a name and a checksum"
     else
@@ -3265,6 +3318,162 @@ assert_ingest_reject "metrics_group_bogus" 400 ingest_batch_malformed \
 # (b) A well-shaped batch with NO sent-at header is stopped by the header gate.
 assert_ingest_reject "metrics_missing_sent_at" 400 ingest_sent_at_invalid \
     '[{"group":"node_resources","name":"cpu_usage_percent","value":1,"timestamp":"2026-07-21T00:00:00Z"}]'
+
+# 10f. The manifest follows the hooks directory while the agent runs. Phase 3c
+# and step 10c read what a boot reports. This step changes the directory in the
+# running container and reads each change back from the mock. The changes run in
+# order, and each waits for its PUT, so that no count below catches the PUT of
+# the change before it. Only the step's own hook is written: e2e-bigout gets a
+# touch and keeps its digest.
+LIVE_HOOKS_DIR="/etc/plexd/hooks"
+
+# live_hook_text prints the script a test hook holds. Args: <marker>. Each marker
+# is one revision of the file, so a new marker is a new digest.
+live_hook_text() {
+    printf '#!/bin/sh\necho %s\n' "$1"
+}
+
+# install_live_hook writes a hook into the running container. Args: <hook>
+# <marker>. The script travels over stdin, so the container holds exactly the
+# bytes live_hook_text prints and the digest taken here is the one to expect.
+install_live_hook() {
+    live_hook_text "$2" | dc exec -T plexd /bin/busybox sh -c \
+        "/bin/busybox cat > ${LIVE_HOOKS_DIR}/$1 && /bin/busybox chmod 0755 ${LIVE_HOOKS_DIR}/$1"
+}
+
+# wait_for_declared_hooks polls the captured manifest for up to 10 seconds, until
+# declared_hooks is exactly the given names and the given hook has the given
+# digest. Args: <step> <comma-joined names> [<hook> <hex digest>]. The hook
+# defaults to e2e-bigout, so a step that names none still proves it remains.
+wait_for_declared_hooks() {
+    local step=$1 want_names=$2 hook=${3:-e2e-bigout} want_hex=${4:-${BIGOUT_HEX}}
+    local elapsed=0 body
+    while :; do
+        body=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
+        if [ "$(declared_hook_names "${body}")" = "${want_names}" ] \
+            && [ "$(declared_hook_hex "${body}" "${hook}")" = "${want_hex}" ]; then
+            echo "  PASS: [${step}] declared_hooks = [${want_names}] with ${hook} at its digest, after ${elapsed}s"
+            return 0
+        fi
+        if [ "${elapsed}" -ge 10 ]; then
+            fail "[${step}] the manifest did not reach declared_hooks = [${want_names}] with ${hook} at ${want_hex} within 10s (body: ${body})"
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+}
+
+# (1) A hook watch that could not start leaves the agent running on its boot
+# scan, so every poll below would time out with nothing to say why. Rule that out
+# first: the watch needs an inotify instance, and those are scarce on a host that
+# runs kind clusters.
+PLEXD_LOGS=$(dc logs plexd 2>&1) || fail "dc logs plexd failed: ${PLEXD_LOGS}"
+WATCHER_STOPPED=$(count_log_lines "${PLEXD_LOGS}" "hook watcher stopped")
+if [ "${WATCHER_STOPPED}" != "0" ]; then
+    fail "plexd logged 'hook watcher stopped' ${WATCHER_STOPPED} time(s), so the step below cannot run: check the host's inotify limit, fs.inotify.max_user_instances"
+fi
+echo "  PASS: the hook watcher is running"
+
+# (2) Add: a new hook reaches the control plane with its digest.
+LIVE_HEX=$(live_hook_text one | sha256_hex)
+install_live_hook e2e-live one || fail "could not write e2e-live into the container"
+wait_for_declared_hooks "add" "e2e-bigout,e2e-live" e2e-live "${LIVE_HEX}"
+
+# (3) Change: an edit reaches the control plane as a new digest.
+LIVE_HEX=$(live_hook_text two | sha256_hex)
+install_live_hook e2e-live two || fail "could not rewrite e2e-live in the container"
+wait_for_declared_hooks "change" "e2e-bigout,e2e-live" e2e-live "${LIVE_HEX}"
+
+# (4) Remove: the entry leaves the manifest and e2e-bigout remains.
+dc exec -T plexd /bin/busybox rm "${LIVE_HOOKS_DIR}/e2e-live" \
+    || fail "could not remove e2e-live from the container"
+wait_for_declared_hooks "remove" "e2e-bigout"
+
+# (5) No-op control: a touch fires the watcher, but the manifest stays equal to
+# the accepted one, so no PUT follows. The control plane raises an integrity
+# alert on every accepted PUT that carries a drifted hook, so a repeat is not
+# harmless. Five seconds is several quiet periods.
+CAPS_BEFORE_TOUCH=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "capabilities_count")
+dc exec -T plexd /bin/busybox touch "${LIVE_HOOKS_DIR}/e2e-bigout" \
+    || fail "could not touch e2e-bigout in the container"
+sleep 5
+CAPS_AFTER_TOUCH=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "capabilities_count")
+if [ "${CAPS_AFTER_TOUCH}" -eq "${CAPS_BEFORE_TOUCH}" ]; then
+    echo "  PASS: [no-op] touch on e2e-bigout left capabilities_count at ${CAPS_AFTER_TOUCH} for 5s"
+else
+    fail "[no-op] touch on e2e-bigout moved capabilities_count from ${CAPS_BEFORE_TOUCH} to ${CAPS_AFTER_TOUCH}, want no PUT"
+fi
+
+# (6) Reload: the write and the reload share one sh -c, so the reload answers
+# inside the watcher's 200 ms debounce. The watcher does not list e2e-live at
+# that moment, and only a scan of the directory can count it. The CLI prints
+# "Hooks:  %d" with two spaces, so the count is parsed as a field.
+LIVE_HEX=$(live_hook_text three | sha256_hex)
+RELOAD_OUT=$(live_hook_text three | dc exec -T plexd /bin/busybox sh -c \
+    "/bin/busybox cat > ${LIVE_HOOKS_DIR}/e2e-live && /bin/busybox chmod 0755 ${LIVE_HOOKS_DIR}/e2e-live && /usr/local/bin/plexd hooks reload" 2>&1) \
+    || fail "[reload] plexd hooks reload failed in the container: ${RELOAD_OUT}"
+RELOAD_HOOKS=$(printf '%s\n' "${RELOAD_OUT}" | awk '$1 == "Hooks:" { print $2 }')
+HOOKS_ON_DISK=$(dc exec -T plexd /bin/busybox ls "${LIVE_HOOKS_DIR}" 2>&1) \
+    || fail "[reload] could not list ${LIVE_HOOKS_DIR} in the container: ${HOOKS_ON_DISK}"
+HOOKS_ON_DISK_COUNT=$(printf '%s\n' "${HOOKS_ON_DISK}" | wc -l | tr -d ' ')
+if [ "${HOOKS_ON_DISK_COUNT}" != "2" ]; then
+    fail "[reload] ${LIVE_HOOKS_DIR} holds ${HOOKS_ON_DISK_COUNT} entries, want e2e-bigout and e2e-live: ${HOOKS_ON_DISK}"
+fi
+if [ "${RELOAD_HOOKS}" = "${HOOKS_ON_DISK_COUNT}" ]; then
+    echo "  PASS: [reload] plexd hooks reload reports the ${RELOAD_HOOKS} hooks on disk"
+else
+    fail "[reload] plexd hooks reload reports '${RELOAD_HOOKS}' hooks, want the ${HOOKS_ON_DISK_COUNT} on disk (output: ${RELOAD_OUT})"
+fi
+# The reload feeds the reporter like any other change. Removing e2e-live before
+# that PUT lands would put the manifest back to the accepted one and send
+# nothing, so wait for it, and then for the PUT the removal causes.
+wait_for_declared_hooks "reload" "e2e-bigout,e2e-live" e2e-live "${LIVE_HEX}"
+dc exec -T plexd /bin/busybox rm "${LIVE_HOOKS_DIR}/e2e-live" \
+    || fail "[reload] could not remove e2e-live from the container"
+wait_for_declared_hooks "reload cleanup" "e2e-bigout"
+
+# (7) Failed PUT: the restarted agent's boot PUT and its first retry both meet a
+# 500, and the second retry lands. The retries wait about 5 and 10 seconds. The
+# mock answers the 500 ahead of its counter, so capabilities_count moves only on
+# delivery, which also proves the agent is back for phase 12. dc logs spans every
+# run of the container, so the failures count from a baseline.
+SEND_FAILED_LINE="agent: capability report: send failed"
+PLEXD_LOGS=$(dc logs plexd 2>&1) || fail "dc logs plexd failed: ${PLEXD_LOGS}"
+SEND_FAILED_BEFORE=$(count_log_lines "${PLEXD_LOGS}" "${SEND_FAILED_LINE}")
+FAIL_NEXT_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"fail_next": 2}' \
+    "http://localhost:18080/test/configure-capabilities" 2>/dev/null || true)
+if [ "${FAIL_NEXT_STATUS}" != "204" ]; then
+    fail "configure-capabilities returned status ${FAIL_NEXT_STATUS}, want 204"
+fi
+CAPS_BEFORE_RESTART=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "capabilities_count")
+dc restart plexd
+RETRY_TIMEOUT=30
+RETRY_ELAPSED=0
+while :; do
+    CAPS_AFTER_RESTART=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "capabilities_count")
+    if [ "${CAPS_AFTER_RESTART}" -gt "${CAPS_BEFORE_RESTART}" ]; then
+        echo "  PASS: [failed PUT] capabilities_count grew from ${CAPS_BEFORE_RESTART} to ${CAPS_AFTER_RESTART} after ${RETRY_ELAPSED}s"
+        break
+    fi
+    if [ "${RETRY_ELAPSED}" -ge "${RETRY_TIMEOUT}" ]; then
+        fail "[failed PUT] capabilities_count stayed at ${CAPS_BEFORE_RESTART} for ${RETRY_TIMEOUT}s after the restart: the manifest was not delivered"
+    fi
+    sleep 1
+    RETRY_ELAPSED=$((RETRY_ELAPSED + 1))
+done
+PLEXD_LOGS=$(dc logs plexd 2>&1) || fail "dc logs plexd failed: ${PLEXD_LOGS}"
+SEND_FAILED_AFTER=$(count_log_lines "${PLEXD_LOGS}" "${SEND_FAILED_LINE}")
+SEND_FAILED_DELTA=$((SEND_FAILED_AFTER - SEND_FAILED_BEFORE))
+if [ "${SEND_FAILED_DELTA}" = "2" ]; then
+    echo "  PASS: [failed PUT] plexd logged '${SEND_FAILED_LINE}' twice"
+else
+    fail "[failed PUT] plexd logged '${SEND_FAILED_LINE}' ${SEND_FAILED_DELTA} time(s) (${SEND_FAILED_BEFORE} -> ${SEND_FAILED_AFTER}), want 2"
+fi
+# The container layer survives a restart, and the manifest that landed is the
+# one the failed sends carried.
+wait_for_declared_hooks "failed PUT" "e2e-bigout"
 
 echo "=== Phase 10 PASSED: deeper body validation ==="
 

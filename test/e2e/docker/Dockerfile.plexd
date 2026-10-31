@@ -33,6 +33,10 @@ FROM gcr.io/distroless/static-debian12
 COPY --from=builder /runtime-dirs/ /
 COPY --from=shell /shellfs/bin/ /bin/
 COPY --from=builder --chown=65534:65534 /build/plexd /usr/local/bin/plexd
+# The hook fixture lives in the image, not in a bind mount, because a running
+# test adds hooks: the container layer takes those writes, survives
+# `dc restart plexd`, and leaves no root-owned files in the repository.
+COPY test/e2e/docker/hooks/ /etc/plexd/hooks/
 
 USER 65534:65534
 

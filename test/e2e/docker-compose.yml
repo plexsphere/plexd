@@ -34,7 +34,10 @@ services:
     volumes:
       - ./docker/plexd-e2e.yaml:/etc/plexd/config.yaml:ro
       - ./docker/nodeapi-token:/etc/plexd/nodeapi-token:ro
-      - ./docker/hooks:/etc/plexd/hooks:ro
+      # /etc/plexd/hooks is not mounted: the image ships the hook fixture. A
+      # running test adds hooks, and a bind mount would leave root-owned files
+      # in the repository.
+      #
       # The data dir is a volume, not a tmpfs, so it survives `dc restart plexd`
       # the way /var/lib/plexd survives a reboot: the restarted agent resumes the
       # identity it persisted instead of registering again. `dc down -v`
