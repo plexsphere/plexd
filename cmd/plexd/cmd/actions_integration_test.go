@@ -374,6 +374,76 @@ func TestIntegration_HooksReload(t *testing.T) {
 	}
 }
 
+func TestIntegration_HooksReloadRescansDisk(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need the executable bit and /bin/sh, which windows lacks")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hooksDir := t.TempDir()
+
+	cfg := actions.Config{Enabled: boolPtr(true), HooksDir: hooksDir}
+	cfg.ApplyDefaults()
+	executor := actions.NewExecutor(cfg, noopActionReporter{}, noopHookVerifier{}, discardLogger())
+
+	// Watch never runs, so a reload is the only way the watcher can learn of
+	// the hook.
+	watcher := actions.NewHookWatcher(hooksDir, executor.SetHooks, nil, discardLogger())
+
+	socketPath := startTestNodeAPI(t, ctx, executor, watcher)
+
+	reload := func() []api.HookInfo {
+		t.Helper()
+		resp, err := socketPost(socketPath, "/v1/hooks/reload", "application/json", nil)
+		if err != nil {
+			t.Fatalf("socketPost(/v1/hooks/reload): %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		var result hooksReloadResponseMsg
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if result.Status != "reloaded" {
+			t.Errorf("status = %q, want %q", result.Status, "reloaded")
+		}
+		return result.Hooks
+	}
+
+	hookPath := filepath.Join(hooksDir, "deploy.sh")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\necho deploy\n"), 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+
+	hooks := reload()
+	if len(hooks) != 1 || hooks[0].Name != "deploy.sh" {
+		t.Fatalf("hooks after writing deploy.sh = %+v, want deploy.sh", hooks)
+	}
+	if _, listed := executor.Capabilities(); len(listed) != 1 {
+		t.Errorf("executor hooks after writing deploy.sh = %+v, want deploy.sh", listed)
+	}
+
+	if err := os.Remove(hookPath); err != nil {
+		t.Fatalf("remove hook: %v", err)
+	}
+
+	if hooks := reload(); len(hooks) != 0 {
+		t.Errorf("hooks after deleting deploy.sh = %+v, want none", hooks)
+	}
+	if _, listed := executor.Capabilities(); len(listed) != 0 {
+		t.Errorf("executor hooks after deleting deploy.sh = %+v, want none", listed)
+	}
+}
+
 // jsonReader returns an io.Reader for JSON data.
 func jsonReader(data []byte) io.Reader {
 	return bytes.NewReader(data)

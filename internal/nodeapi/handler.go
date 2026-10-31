@@ -26,9 +26,9 @@ type ActionProvider interface {
 	Capabilities() ([]api.ActionInfo, []api.HookInfo)
 }
 
-// HookReloader triggers a re-scan of hooks from the filesystem.
+// HookReloader re-scans the hooks on the filesystem and returns the result.
 type HookReloader interface {
-	Hooks() []api.HookInfo
+	Reload() ([]api.HookInfo, error)
 }
 
 // PeerStatus describes a single mesh peer's status.
@@ -596,7 +596,11 @@ func (h *Handler) handleReloadHooks(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "hook reloader not available")
 		return
 	}
-	hooks := h.hookReloader.Hooks()
+	hooks, err := h.hookReloader.Reload()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if hooks == nil {
 		hooks = []api.HookInfo{}
 	}

@@ -200,6 +200,17 @@ func TestHooksReloadCommand(t *testing.T) {
 	}
 }
 
+func TestHooksReloadCommand_ScanFailure(t *testing.T) {
+	socketPath := startTestSocketServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "scan failed"})
+	}))
+	overrideSocketPath(t, socketPath)
+
+	assertCmdError(t, `plexd hooks reload: unexpected status 500: {"error":"scan failed"}`, "hooks", "reload")
+}
+
 func TestHooksListCommand_Help(t *testing.T) {
 	output := executeHelp(t, "hooks", "list", "--help")
 	if !strings.Contains(output, "list") {
