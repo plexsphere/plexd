@@ -139,6 +139,7 @@ While parked, the loops that call the control plane on every cycle fail locally 
 |---------|--------|
 | `FetchState failed` | `internal/reconcile`: the state pull |
 | `agent: handshake report: send failed` | `internal/agent`: the handshake reporter |
+| `agent: capability report: send failed` | `internal/agent`: the [capability reporter](../actions/remote-actions-hooks.md#retries), which keeps a pending manifest and retries it about every 5 seconds, so it delivers within about one such delay of the mark lifting |
 | `agent: key rotation: resubmitting the staged rotation failed, retrying` | `internal/agent`: the key-rotation recovery sweep, which resubmits a staged rotation key with a backoff capped at 2 minutes |
 | `endpoint report failed` | `internal/nat`: the endpoint discoverer |
 | `nat: endpoint candidates: send failed` | `internal/nat`: the endpoint candidate publisher |
@@ -152,7 +153,7 @@ While parked, the loops that call the control plane on every cycle fail locally 
 
 A failure line drops to Debug only when its error is `api.ErrCredentialRefused`, and the overflow line only while the forwarder's last report failed that way, which happens only while the heartbeat is parked. Every other error at these sites, and every other overflow, keeps its Warn. Nothing else changes: the loops keep their buffers, their dirty report keys and their cadence, and deliver what those buffers still hold on resume. The log and audit forwarders and the metrics manager hold at most twice their batch size and drop the oldest entries beyond that, so a long park leaves only the newest ones to deliver.
 
-Every other control-plane call keeps its logging, because none fails on every cycle while parked. Edge-PSK fetches, execution callbacks, session reports and integrity-violation reports (filed when a hook delivered for execution fails its pinned checksum) are started by a state pull, which the gate refuses, so nothing new starts while parked. Work a pull started before the park, such as an open session or a running action, logs a refused callback once per event. The capabilities report runs once at startup. A secret request through the local node API is answered `503` and logs `secret fetch failed` at Error, once per request. The key-rotation sweep's `agent: key rotation: reusing the staged rotation key` repeats with each resubmit and stays at Info, because it is not a failure line.
+Every other control-plane call keeps its logging, because none fails on every cycle while parked. Edge-PSK fetches, execution callbacks, session reports and integrity-violation reports (filed when a hook delivered for execution fails its pinned checksum) are started by a state pull, which the gate refuses, so nothing new starts while parked. Work a pull started before the park, such as an open session or a running action, logs a refused callback once per event. A secret request through the local node API is answered `503` and logs `secret fetch failed` at Error, once per request. The key-rotation sweep's `agent: key rotation: reusing the staged rotation key` repeats with each resubmit and stays at Info, because it is not a failure line.
 
 ### Logging
 

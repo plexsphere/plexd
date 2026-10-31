@@ -55,14 +55,14 @@ plexd up [--config /path/to/config.yaml] [--log-level debug]
 7. Create reconciler with handlers for WireGuard, policy, and bridge reconciliation
 8. Create heartbeat service with subsystem status enrichment and key-rotation callbacks; its credential-refused callback is set in step 12, once the node API server exists
 9. Create integrity store + verifier
-10. Create action executor, register 11 built-in actions, register the action dispatcher on the reconciler, report capabilities
-11. Create hook watcher
+10. Create action executor, register 11 built-in actions, register the action dispatcher on the reconciler, list the `PlexdHook` resources in a pod's namespace, build the capability reporter
+11. Create hook watcher, then run its first scan of `hooks_dir` and wait for it, for at most 10 seconds
 12. Create node API server, wire reconcile handler
 13. Create metrics collectors + manager
 14. Create log sources + forwarder
 15. Create audit sources + forwarder
 
-**Goroutines (the same in node and bridge mode):** SSE, Heartbeat, Reconciler, Node API, Hook Watcher, Metrics, Log Forwarder, Audit Forwarder, Peer Exchange, Mesh Server. A bridge's NAT relay starts and stops from the reconciler when the state pull enables or disables it, not as a startup goroutine.
+**Goroutines (the same in node and bridge mode):** SSE, Heartbeat, Reconciler, Node API, Hook Watcher, Capability Reporter, PlexdHook Inventory, Metrics, Log Forwarder, Audit Forwarder, Peer Exchange, Mesh Server. The capability reporter sends the boot manifest when it starts and retries it until one is accepted, then reports each hook or `PlexdHook` change. The PlexdHook inventory returns at once outside a cluster. A bridge's NAT relay starts and stops from the reconciler when the state pull enables or disables it, not as a startup goroutine.
 
 **Shutdown:** On SIGTERM/SIGINT — cancel context, `sseMgr.Shutdown()`, `executor.Shutdown()`, mesh server shutdown, bridge teardowns (bridge mode), policy enforcer teardown, WireGuard teardown, wait for goroutines with 30s drain timeout.
 
@@ -361,7 +361,11 @@ Run integrity verification on all registered hooks.
 
 #### `plexd hooks reload`
 
-Trigger a re-scan of action hooks.
+Re-scan the hooks directory and print the result: a `Status:` line and a `Hooks:` count. The scan needs no running hook watch, so this is how to refresh the list on a node that logged `hook watcher stopped`.
+
+A hook that fails to hash keeps its last digest, and the agent logs a warning. When the scan itself fails, the agent answers `500`, leaves the list as it was, and the command exits non-zero with `plexd hooks reload: unexpected status 500: ...`.
+
+A reload feeds the [capability manifest](../actions/remote-actions-hooks.md#capability-announcement) like any other hook change. It moves no [integrity pin](../actions/remote-actions-hooks.md#hook-integrity-pinning): an edited hook runs again after an agent restart, not after a reload.
 
 ## Local Endpoint Communication
 

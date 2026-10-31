@@ -11,7 +11,7 @@ Validates that a containerised plexd agent successfully registers, sends heartbe
 The test runs fourteen phases:
 
 1. **Initial assertions** — all 7 counters >= 1 (agent started and contacted all endpoints)
-2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, and metrics data
+2. **Request body validation** — verifies registration token, heartbeat structure, capabilities payload, and metrics data, then that the capability manifest follows the hooks directory while the agent runs and that a failed PUT is retried (script step `10f`)
 3. **Periodic loop verification** — heartbeat and metrics counters >= 2 (self-generating loops run continuously), then a handshake report and a `tunnel_health` sample for a fixture peer when WireGuard came up in the container (script phase `4b`), an edge PSK fetch for each fixture peer under the same condition (script phase `4c`), an endpoint candidates report, an endpoint selection switch on a fixture peer and its move to a new relay fallback under the same condition (script phase `4d`), and a mesh MTU sized by the uplink probe and held by the device under the same condition (script phase `4e`)
 4. **Log injection** — injects a log file via `docker cp`, verifies logs_count increases (FileSource pipeline works)
 5. **Agent restart for audit** — restarts the plexd container and verifies `local_audit_count` increases (ProcessSource fires per-process). The platform leg carries nothing: plexd's own `process` source is outside the ingest contract's closed enum (`auditd`, `k8s`), so `audit_count` must stay at 0.
@@ -41,7 +41,7 @@ The test runs fourteen phases:
 | Service | Image | Port | Purpose |
 |---------|-------|------|---------|
 | `mock-api` | Built from `test/e2e/mockapi/Dockerfile` | 8080 (host: 18080), 8443 (host: 18443) | Returns fixture responses, tracks call counters, TLS local endpoint |
-| `plexd` | Built from `deploy/docker/Dockerfile` | — | Agent under test, connects to mock-api |
+| `plexd` | Built from `test/e2e/docker/Dockerfile.plexd` | — | Agent under test, connects to mock-api |
 
 ### Startup Ordering
 
@@ -93,8 +93,22 @@ Uses `GET /test/last-request/{endpoint}` to verify the content of request payloa
 |----------|-----------------|
 | `register` | `token` (non-empty), `hostname` (non-empty), `public_key` (non-empty) |
 | `heartbeat` | Valid JSON with `timestamp` field (node_id is in URL path, not body) |
-| `capabilities` | `binary_version` (non-empty), `binary_checksum` (32-byte base64 digest), `builtin_actions` equal to the eleven builtins sorted by name, each with a description, `service.upgrade` declaring `version` then `checksum` as required; `plexd_hooks`, `binary`, and `hooks` absent |
+| `capabilities` | `binary_version` (non-empty), `binary_checksum` (32-byte base64 digest), `builtin_actions` equal to the eleven builtins sorted by name, each with a description, `service.upgrade` declaring `version` then `checksum` as required; `declared_hooks` exactly `e2e-bigout` with the SHA-256 of `test/e2e/docker/hooks/e2e-bigout`, where an absent list fails; `capabilities_count` exactly 1, so these checks read the first manifest and a broken boot order cannot pass through a later send; `plexd_hooks`, `binary`, and `hooks` absent |
 | `metrics` | Array with >= 1 data point |
+
+### Phase 2 (cont.): Capability Manifest Kept Current
+
+Runs as script step `10f`, the last step of script phase `10`, after step `10c` has required `declared_hooks` to hold `e2e-bigout` again late in the run, once the agent has restarted. It changes the hooks directory of the running container and reads each change back from the mock through `GET /test/last-request/capabilities`. Each change waits for its PUT, so no count catches the PUT of the change before it. Writes and removals touch only the step's own hook, `e2e-live`, and every check fails the suite.
+
+1. **The watch runs.** It requires no `hook watcher stopped` line in the plexd log. The watch needs an inotify instance, and those are scarce on a host that runs kind clusters, so without this check every poll below would time out with nothing to say why.
+2. **Add.** It writes `e2e-live` into the container over stdin and polls for up to 10 seconds until `declared_hooks` is exactly `e2e-bigout` and `e2e-live`, with the digest of the bytes it wrote.
+3. **Change.** It rewrites `e2e-live` and polls the same way for the new digest.
+4. **Remove.** It removes `e2e-live` and polls until `declared_hooks` is `e2e-bigout` alone.
+5. **No-op control.** It reads `capabilities_count`, runs `touch` on `e2e-bigout`, waits 5 seconds, and requires the count unchanged. The watcher fires, but the manifest equals the one last accepted, so no PUT follows.
+6. **Reload.** It writes `e2e-live` again and runs `plexd hooks reload` in one `sh -c`, so the reload answers inside the watcher's 200 ms debounce and only a scan of the directory can count the file. It parses the `Hooks:` field, which the CLI prints with two spaces, and requires it to equal the two entries on disk. It then waits for the PUT that carries `e2e-live` with its digest, removes the file, and waits for the PUT the removal causes. Removing the file before the first PUT lands would put the manifest back to the accepted one and send nothing.
+7. **Failed PUT.** It counts the `agent: capability report: send failed` lines as a baseline, arms `{"fail_next": 2}` through [`POST /test/configure-capabilities`](mock-api-server.md#post-test-configure-capabilities), and runs `dc restart plexd`. The boot PUT and the first retry meet a `500`, and the second retry lands. It polls for up to 30 seconds until `capabilities_count` grows, which the mock moves only on delivery and which also proves the agent is back for script phase `12`. It then requires exactly two new `send failed` lines and a delivered manifest of `e2e-bigout` alone, since the container layer survives the restart.
+
+Inside the container every applet except `sh`, `head`, and `tr` runs as `/bin/busybox <applet>`, because the image links only those three.
 
 ### Phase 3: Periodic Loop Verification
 
@@ -289,6 +303,8 @@ The container receives configuration from three sources:
 
 An anonymous volume at `/var/lib/plexd` provides a writable data directory that survives `dc restart plexd`, as the data directory of a real node survives a reboot: a restarted agent resumes the identity it persisted rather than registering again. `dc down -v` removes the volume. `/var/run/plexd` is a `tmpfs` mount.
 
+The hook fixture ships in the image: the final stage of `test/e2e/docker/Dockerfile.plexd` copies `test/e2e/docker/hooks/` to `/etc/plexd/hooks/`, and no bind mount covers that path. Step `10f` adds hooks while the agent runs, so the directory has to be writable. The container layer takes those writes and survives `dc restart plexd`, and files the suite creates never land root-owned in the repository.
+
 ## Usage
 
 ```bash
@@ -340,6 +356,8 @@ docker compose -f test/e2e/docker-compose.yml -p plexd-e2e down -v
 | `test/e2e/docker-compose.yml` | Service definitions, network, healthcheck |
 | `test/e2e/docker/test.sh` | Orchestration script (build, wait, assert, cleanup) |
 | `test/e2e/docker/plexd-e2e.yaml` | Minimal plexd config for the E2E test |
+| `test/e2e/docker/Dockerfile.plexd` | E2E plexd image: the production runtime plus a static busybox shell and the hook fixture |
+| `test/e2e/docker/hooks/` | Hook fixture copied into the image (`e2e-bigout`) |
 | `test/e2e/mockapi/Dockerfile` | Mock API image (includes wget for healthcheck) |
 | `deploy/docker/Dockerfile` | plexd production image |
 | `Makefile` | `test-e2e-docker` target |

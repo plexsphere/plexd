@@ -221,9 +221,17 @@ fetches every edge PSK again from
 
 ### PUT /v1/nodes/{node_id}/capabilities
 
-plexd sends its capability manifest once at boot, after registration. It is not
-re-sent while the agent runs: a hook added, changed, or removed later is reported
-at the next restart.
+plexd sends its capability manifest at boot, after registration and its first
+hook scan. It sends the manifest again when a script hook is added, changed, or
+removed and when the PlexdHook resources in its namespace change, within seconds
+of the change. A send that matches the manifest last accepted is skipped. There
+is no periodic re-send, because every accepted PUT that carries a drifted hook
+raises another integrity alert. See
+[Capability Announcement](../actions/remote-actions-hooks.md#capability-announcement).
+
+Each PUT is a snapshot: the control plane replaces its stored row with the body.
+An absent `declared_hooks` or `plexd_hooks` key therefore means none, never
+"unchanged".
 
 **Request body** (`CapabilityManifestRequest`):
 
@@ -261,8 +269,8 @@ at the next restart.
 | `binary_version` | Yes | Agent version, non-empty after trimming |
 | `binary_checksum` | Yes | SHA-256 of the running binary: 32 bytes, standard-padded base64 |
 | `ssh_host_key_fingerprint` | No | `SHA256:<base64>` host-key fingerprint |
-| `declared_hooks` | No | Script hooks from the hooks directory, each a name and a 32-byte base64 payload digest; at most 128, unique names |
-| `plexd_hooks` | No | `PlexdHook` resources discovered at boot in the ServiceAccount's namespace; at most 128, unique names. Absent outside Kubernetes |
+| `declared_hooks` | No | Script hooks from the hooks directory, each a name and a 32-byte base64 payload digest; at most 128, unique names. The digest is the one the hook watcher last computed, which can differ from the executor's pin after an edit |
+| `plexd_hooks` | No | `PlexdHook` resources in the ServiceAccount's namespace; at most 128, unique names. Absent outside Kubernetes, and absent from the first manifest when the boot list failed |
 | `builtin_actions` | No | The builtin actions the agent implements, sorted by name; at most 128 actions, at most 64 parameters each |
 
 A `plexd_hooks` entry carries `name`, `image_digest` in canonical
@@ -277,7 +285,9 @@ as `null` or `[]`.
 The control plane refuses a manifest whole, binary version and checksum
 included, so plexd sends only entries it knows are valid. A PlexdHook whose image
 is not pinned by a digest is left out with a warning; see
-[PlexdHook CRD](../actions/plexdhook-crd.md#capability-manifest-reporting).
+[PlexdHook CRD](../actions/plexdhook-crd.md#capability-manifest-reporting). Past
+128 hooks of either kind, plexd keeps the first 128 by name and logs how many it
+dropped.
 
 **Responses.** The contract answers `200 OK` with a `CapabilityManifestResponse`
 (`accepted_at`, `fields_changed`, `host_key_changed`); plexd does not read the
@@ -307,9 +317,12 @@ entry that breaks an invariant is a `422`:
 | `500 Internal Server Error` | `internal` | Server error |
 | `501 Not Implemented` | `capabilities_not_provisioned` | The control plane has not wired its capability store yet |
 
-plexd logs a failed report as a warning and carries on. It does not retry the
-report without the inventories: a control plane that refuses them has to be
-upgraded.
+plexd logs a failed report as a warning and retries it until one is accepted. The
+delay starts at 5 seconds and doubles up to 5 minutes, with 25% jitter, and a
+`429`'s longer `Retry-After`, in seconds, wins. A refusal is retried too: a refused PUT stores nothing
+and raises nothing, and an upgraded control plane then clears the refusal with no
+agent restart. plexd never drops the inventories to get a refused manifest
+through. See [Retries](../actions/remote-actions-hooks.md#retries).
 
 ## NAT Endpoint Discovery
 

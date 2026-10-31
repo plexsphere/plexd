@@ -1265,6 +1265,28 @@ refresh interval to exercise the deadline-driven re-report path.
 
 **Go API:** The `Server` also exposes `SetEndpointTTL(time.Duration)` for direct use in Go test code.
 
+### `POST /test/configure-capabilities`
+
+Arms a failure of `PUT /v1/nodes/{id}/capabilities`. Lets a test exercise the
+agent's retry of a failed capability report.
+
+**Request body:** strict-decoded: an unknown field is a `400`.
+
+```json
+{ "fail_next": 2 }
+```
+
+**Response:** `204 No Content`.
+
+**Behavior:**
+
+- `fail_next` sets how many of the next PUTs fail, replacing any pending count, so `0` clears one.
+- An armed PUT is captured first, so `GET /test/last-request/capabilities` shows what it carried, and is then answered `500` with problem code `internal`, before validation and before `capabilities_count` moves.
+- The count is decremented once per PUT, so exactly N PUTs fail, also under concurrent requests.
+- Request body is captured and retrievable via `GET /test/last-request/configure_capabilities`.
+
+**Error:** Returns `400` if the body is not valid JSON, contains an unknown field, or sets a negative `fail_next` (`{"error": "fail_next must not be negative"}`), and leaves the pending count alone. Returns `405` if the HTTP method is not `POST`.
+
 ### `POST /test/configure-secrets`
 
 Arms the dials the secret handler reads: the served `current_version`, the count

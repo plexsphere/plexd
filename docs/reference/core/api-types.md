@@ -658,7 +658,7 @@ type alias for `[]AuditEntry`
 | `BinaryChecksum`        | `string`                | `"binary_checksum"`                     | Running binary's SHA-256: 32 bytes, standard-padded base64 |
 | `SSHHostKeyFingerprint` | `string`                | `"ssh_host_key_fingerprint,omitempty"`  | Optional `SHA256:<base64>` host-key fingerprint         |
 | `DeclaredHooks`         | `[]DeclaredHook`        | `"declared_hooks,omitempty"`            | Optional hook declarations, at most 128, unique names   |
-| `PlexdHooks`            | `[]DiscoveredPlexdHook` | `"plexd_hooks,omitempty"`               | Optional PlexdHook resources discovered at boot, at most 128, unique names |
+| `PlexdHooks`            | `[]DiscoveredPlexdHook` | `"plexd_hooks,omitempty"`               | Optional PlexdHook resources in the ServiceAccount's namespace, at most 128, unique names |
 | `BuiltinActions`        | `[]ActionInfo`          | `"builtin_actions,omitempty"`           | Optional builtin action inventory sorted by name, at most 128 actions of at most 64 parameters |
 
 **DeclaredHook**
@@ -695,6 +695,10 @@ outright:
 - **Empty inventories are omitted.** Both inventory fields and
   `ActionInfo.Parameters` are `omitempty`, so an empty list leaves its key off
   instead of sending `null` where the contract expects an array.
+
+A missing key means none, because the control plane replaces its stored row on
+every PUT. A manifest that leaves `declared_hooks` or `plexd_hooks` off clears
+that list; it does not keep what the last manifest reported.
 
 **BinaryInfo** — the node API's local view of the running binary. The control
 plane receives the same two values as the manifest's flat fields.

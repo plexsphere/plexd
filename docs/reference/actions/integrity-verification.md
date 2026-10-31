@@ -82,18 +82,22 @@ The SSH server keeps serving the key it loaded at startup, so a key that changes
 
 The expected checksum is the digest the executor **pinned** the first time this
 process discovered the hook, not the one `HookWatcher` last recomputed. It does
-**not** come from the control plane — an action dispatch carries no checksum on
-the wire — so this check answers "are these still the bytes the node discovered
-and reported to the control plane?", catching a swap between discovery and
-execution.
+**not** come from the control plane, because an action dispatch carries no
+checksum on the wire. This check therefore answers "are these still the bytes the
+node discovered?", catching a swap between discovery and execution.
+
+The pin matches the first report of the hook to the control plane only. Later
+capability manifests carry the digest the watcher last computed, so after an edit
+the manifest and the pin differ. That is how the control plane sees the drift.
 
 The pin matters because `HookWatcher` re-hashes a hook on every write and pushes
 the new digest into the executor. Verifying against that live digest would
 compare the file with a hash of itself and pass for any bytes on disk, so the
 executor records a hook's digest once and never updates it: a hook whose bytes
 change after discovery is refused, files a violation, and stays unrunnable until
-the agent restarts and re-attests it. Changing a hook in place therefore requires
-an agent restart before it can be dispatched again.
+the agent restarts and re-attests it. `plexd hooks reload` re-hashes the hooks
+through the same watcher and moves no pin, so changing a hook in place requires
+an agent restart, not a reload, before it can run again.
 
 The pin is process-local, so re-attestation on restart is both the recovery path
 for a legitimate hook change and the limit of the control: a restart re-anchors

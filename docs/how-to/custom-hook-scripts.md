@@ -78,9 +78,10 @@ underscore) are replaced with underscores. For example, a parameter named
 
 ## Step 2: Create an Optional Metadata Sidecar
 
-A JSON sidecar file provides metadata about the hook to the control plane.
-The sidecar file must have the same name as the hook script with a `.json`
-extension.
+A JSON sidecar file provides metadata about the hook, which plexd lists on the
+local node API. The capability manifest carries only the hook's name and digest,
+so the sidecar does not reach the control plane. The sidecar file must have the
+same name as the hook script with a `.json` extension.
 
 ```bash
 cat > /tmp/restart-service.sh.json << 'EOF'
@@ -124,21 +125,31 @@ discovered but reported without metadata.
 
 ## Step 3: Deploy to the Hooks Directory
 
-Copy the script and optional sidecar to the configured hooks directory and
-ensure the script is executable.
+Install the script atomically: write it, executable, to another path on the same
+filesystem as the hooks directory, then `mv` it into the directory. A rename puts
+the finished file in place in one step. `/tmp` is often a different filesystem,
+where `mv` falls back to a copy, so stage the file beside the hooks directory.
 
 ```bash
-# Copy files
-sudo cp /tmp/restart-service.sh /etc/plexd/hooks/restart-service
+# Copy the optional sidecar
 sudo cp /tmp/restart-service.sh.json /etc/plexd/hooks/restart-service.json
-
-# Set permissions
-sudo chmod 755 /etc/plexd/hooks/restart-service
 sudo chmod 644 /etc/plexd/hooks/restart-service.json
+
+# Stage the script on the same filesystem, executable
+sudo install -m 755 /tmp/restart-service.sh /etc/plexd/restart-service.new
+
+# Move it into place
+sudo mv /etc/plexd/restart-service.new /etc/plexd/hooks/restart-service
 
 # Verify
 ls -la /etc/plexd/hooks/
 ```
+
+> **Warning**: The first digest the control plane receives for a hook is pinned as
+> its baseline. If plexd reports a half-written file, that digest becomes the
+> baseline and the finished file counts as an edit, with the consequences under
+> [What an Edit Does](#what-an-edit-does). plexd waits a quiet second before it
+> reports, which covers a short write but does not replace an atomic install.
 
 > **Note**: The hook name used in action requests is the filename (without
 > extension). In this example, the action name is `restart-service`.
@@ -149,32 +160,45 @@ plexd automatically discovers new and changed hooks using the `HookWatcher`,
 which monitors the hooks directory with `fsnotify`. Adding a hook needs no
 restart. **Changing** one does: the digest a hook is executed against is pinned
 at first discovery and the watcher cannot move it, so an edited hook is refused
-until the agent restarts (see [Verify the Checksum](#verify-the-checksum)).
+until the agent restarts (see [What an Edit Does](#what-an-edit-does)).
 
 When a hook file is added, modified, or removed, plexd:
 
 1. Detects the filesystem event (with debouncing)
-2. Scans the file for executability
+2. Checks that the file is a regular, executable file. Anything else is skipped,
+   and a hook that stops being one leaves the list
 3. Computes the SHA-256 checksum
 4. Parses the sidecar metadata file (if present)
-5. Reports updated capabilities to the control plane
+5. Reports the updated capability manifest to the control plane, within seconds
 
-The initial scan at startup also follows this process for all existing hooks.
+The report waits for a quiet second, so a burst of changes costs one report, and
+it is skipped when the manifest matches the one last accepted, as it does after a
+`touch` on a hook or a sidecar edit. A report that fails is retried on a backoff
+until it lands; see [Retries](../reference/actions/remote-actions-hooks.md#retries).
+
+The scan at startup follows the same process for all existing hooks, and it runs
+before plexd sends its first manifest, so that manifest carries the hooks on disk.
+
+`plexd hooks reload` runs the same scan on demand and prints the result. It is how
+to refresh the list on a node that logged `hook watcher stopped`, because a watch
+that failed is not restarted.
 
 ## Step 5: Verify Discovery
 
 Check the agent logs to confirm the hook was discovered:
 
 ```bash
-plexd logs | grep -i hook
+plexd logs | grep -i -E 'hook|capability report'
 ```
 
 `plexd logs` reads whatever log the host's service manager keeps, so the same
 command works on Linux and macOS. Its Linux equivalent is
 `journalctl -u plexd --since "1 minute ago"`.
 
-You should see discovery-related log entries. The hook will appear in the
-capabilities reported to the control plane with its computed checksum.
+You should see `agent: capability report: accepted` with the new `declared_hooks`
+count, usually within two seconds. The hook then appears in the capabilities the control plane
+holds, with its computed checksum. `agent: capability report: send failed` means
+the report has not landed yet and plexd is retrying it on its own.
 
 ### Verify the Checksum
 
@@ -192,13 +216,32 @@ the agent restarts, because the watcher deliberately cannot move the pin. That i
 what makes the check meaningful: a digest refreshed on every write would only
 compare the file with a hash of itself.
 
-To roll out a changed hook, deploy the new file and restart the agent, which
-re-discovers it and re-reports the new checksum to the control plane.
-
 The dispatch itself carries **no** checksum. Whether this node may run this hook
 at all is decided upstream by the control plane's server-side dispatch gating; the
 node's own check answers a narrower question: are these still the bytes it
-discovered and reported?
+discovered?
+
+### What an Edit Does
+
+The manifest carries the digest the watcher last computed, which can differ from
+the digest plexd pinned, so an edit reaches the control plane within seconds as a
+new digest for a known hook. Two checks then refuse the hook, one on each side:
+
+- **The control plane** pinned the first digest it received as the hook's
+  baseline. A later digest raises an integrity alert with the recommended action
+  `quarantine_node` and refuses dispatch until the control plane accepts the new
+  digest. Every accepted PUT that still carries the drifted digest raises another
+  alert, which is why plexd has no periodic re-send.
+- **The node** keeps the digest it pinned. An edited hook runs again after an
+  agent restart, not after `plexd hooks reload`, which re-scans the directory and
+  moves no pin.
+
+To roll out a changed hook, install the new file atomically, as in
+[Step 3](#step-3-deploy-to-the-hooks-directory), and restart the agent, which pins
+the new bytes and reports the new digest. Replacing a hook with `mv` is still an
+edit, and so is removing a hook and adding it back with other bytes, because a pin
+outlives the file. The control plane refuses dispatch until it accepts the new
+digest, whether or not the agent has restarted.
 
 ## Step 6: Trigger from the Control Plane
 
@@ -263,12 +306,15 @@ Control Plane                          Node (plexd)
 | Hook missing from capabilities | `hooks_dir` not configured       | Set `hooks_dir` in actions config                   |
 | Hook missing from capabilities | File has `.json` extension       | Remove `.json` extension from the script filename  |
 | Hook missing from capabilities | File is in a subdirectory        | Move to the hooks directory root (subdirs skipped) |
+| Hook missing from capabilities | Not a regular file, such as a FIFO | Install a regular file; a symlink to an executable one is fine, but plexd watches the link and not its target, so run `plexd hooks reload` after changing the target |
+| Hook missing from capabilities | `agent: capability report: send failed` in the log | plexd retries on its own; the `error` attribute names what to fix |
+| Hook missing from capabilities | `hook watcher stopped` in the log | Fix the cause, then run `plexd hooks reload` or restart the agent |
 
 ### Hook Execution Fails
 
 | Symptom                        | Cause                             | Fix                                                |
 |--------------------------------|-----------------------------------|----------------------------------------------------|
-| Status `error`, integrity fail | The file changed after the agent pinned its digest | Restart the agent so it re-discovers and re-attests the hook |
+| Status `error`, integrity fail | The file changed after the agent pinned its digest | Restart the agent so it re-discovers and re-attests the hook; a reload does not clear this |
 | Status `error`, file not found | Hook in capabilities but missing  | Verify file exists at `hooks_dir/<action-name>`     |
 | Status `failed`, `error="action timed out"` | Script outran the run deadline, which is whatever is left of the entry's `expires_at`, capped by `max_action_timeout` | Optimize the script, or raise `max_action_timeout` and have the control plane dispatch a later `expires_at` |
 | Status `failed`, exit code > 0 | Script returned non-zero exit     | Check stderr in result for error details           |
