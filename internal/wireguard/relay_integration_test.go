@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"log/slog"
+	"maps"
 	"net"
 	"net/netip"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
@@ -399,6 +401,252 @@ func dumpOnFailure(t *testing.T, logs *logBuffer) {
 	})
 }
 
+// relayFrontBufSize holds the largest UDP datagram.
+const relayFrontBufSize = 65535
+
+// movedBackLine is what a node logs when it moves a peer back from a relay its
+// session does not run over.
+const movedBackLine = "wireguard: relayed peer roamed to a relay its session does not run over, moving it back"
+
+// frontDatagram is one datagram a node sent while a relayFront was frozen, and
+// the node's address.
+type frontDatagram struct {
+	src netip.AddrPort
+	b   []byte
+}
+
+// relayFront is a UDP socket nodes dial as the relay, which forwards their
+// datagrams to the real relay and its answers back. It freezes a relay the way
+// pausing a guest does: what the nodes send waits and comes out in order at the
+// resume, where stopping the relay would discard it. The relay's clock keeps
+// running, which does not matter under the relay's 180 s index TTL: the
+// session stays as fresh to it as a clock that stood still would keep it.
+//
+// Every node's source is 127.0.0.1, so a source is keyed by its netip.AddrPort,
+// and each one gets a back socket of its own, because the relay tells peers
+// apart by the address it reads them from.
+type relayFront struct {
+	t     *testing.T
+	conn  *net.UDPConn
+	addr  netip.AddrPort
+	relay netip.AddrPort
+
+	nodesRead chan struct{}  // closed when readNodes returns
+	answers   sync.WaitGroup // counts the readRelay goroutines
+
+	// mu guards backs, frozen and queue. thaw holds it through the replay, and
+	// readNodes takes it per datagram, so nothing overtakes the queue.
+	mu     sync.Mutex
+	backs  map[netip.AddrPort]*net.UDPConn
+	frozen bool
+	queue  []frontDatagram
+}
+
+// newRelayFront starts a front before the relay at address relay. It is closed
+// on cleanup.
+func newRelayFront(t *testing.T, relay string) *relayFront {
+	t.Helper()
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: relayLoopback.AsSlice()})
+	if err != nil {
+		t.Fatalf("listen on %s: %v", relayLoopback, err)
+	}
+	f := &relayFront{
+		t:         t,
+		conn:      conn,
+		addr:      netip.AddrPortFrom(relayLoopback, uint16(conn.LocalAddr().(*net.UDPAddr).Port)),
+		relay:     netip.MustParseAddrPort(relay),
+		nodesRead: make(chan struct{}),
+		backs:     make(map[netip.AddrPort]*net.UDPConn),
+	}
+	go f.readNodes()
+	t.Cleanup(f.close)
+	return f
+}
+
+// readNodes queues or forwards each node's datagrams until the front socket
+// closes. Like the relay's dispatch loop, it ends on a closed socket alone and
+// skips any other read error.
+func (f *relayFront) readNodes() {
+	defer close(f.nodesRead)
+	buf := make([]byte, relayFrontBufSize)
+	for {
+		n, src, err := f.conn.ReadFromUDPAddrPort(buf)
+		if errors.Is(err, net.ErrClosed) {
+			return
+		}
+		if err != nil {
+			continue
+		}
+		src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
+
+		f.mu.Lock()
+		if f.frozen {
+			f.queue = append(f.queue, frontDatagram{src: src, b: bytes.Clone(buf[:n])})
+		} else if err := f.forward(src, buf[:n]); err != nil {
+			f.t.Errorf("front: forward a datagram from %s: %v", src, err)
+		}
+		f.mu.Unlock()
+	}
+}
+
+// forward writes b to the relay from src's back socket, which src's first
+// datagram opens. Callers hold f.mu.
+func (f *relayFront) forward(src netip.AddrPort, b []byte) error {
+	back, ok := f.backs[src]
+	if !ok {
+		var err error
+		back, err = net.ListenUDP("udp4", &net.UDPAddr{IP: relayLoopback.AsSlice()})
+		if err != nil {
+			return err
+		}
+		f.backs[src] = back
+		f.answers.Add(1)
+		go f.readRelay(back, src)
+	}
+	_, err := back.WriteToUDPAddrPort(b, f.relay)
+	return err
+}
+
+// readRelay forwards the relay's datagrams on back to node from the front
+// socket until back closes. A write that fails loses one datagram, as a
+// network may.
+func (f *relayFront) readRelay(back *net.UDPConn, node netip.AddrPort) {
+	defer f.answers.Done()
+	buf := make([]byte, relayFrontBufSize)
+	for {
+		n, _, err := back.ReadFromUDPAddrPort(buf)
+		if errors.Is(err, net.ErrClosed) {
+			return
+		}
+		if err != nil {
+			continue
+		}
+		_, _ = f.conn.WriteToUDPAddrPort(buf[:n], node)
+	}
+}
+
+// freeze makes the front queue what nodes send, in order, with their sources.
+func (f *relayFront) freeze() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.frozen = true
+}
+
+// thaw replays the queue in order at full speed, as a resumed relay drains its
+// socket, and forwards what nodes send from then on. The queue stays readable
+// through initiations.
+func (f *relayFront) thaw() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.frozen = false
+	for _, d := range f.queue {
+		if err := f.forward(d.src, d.b); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// inject writes b to the node at to from the front socket, bypassing the
+// relay, so the node reads it as coming from the relay it dials.
+func (f *relayFront) inject(to netip.AddrPort, b []byte) error {
+	_, err := f.conn.WriteToUDPAddrPort(b, to)
+	return err
+}
+
+// initiations returns the handshake initiations in the queue per source,
+// oldest first, during the freeze and after the thaw alike.
+func (f *relayFront) initiations() map[netip.AddrPort][][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	queued := make(map[netip.AddrPort][][]byte)
+	for _, d := range f.queue {
+		if len(d.b) == device.MessageInitiationSize && d.b[0] == device.MessageInitiationType {
+			queued[d.src] = append(queued[d.src], d.b)
+		}
+	}
+	return queued
+}
+
+// close ends both kinds of goroutine. readNodes goes first: it is what opens a
+// back socket, so none opens after the loop that closes them.
+func (f *relayFront) close() {
+	_ = f.conn.Close()
+	<-f.nodesRead
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, back := range f.backs {
+		_ = back.Close()
+	}
+	f.answers.Wait()
+}
+
+// heldOn counts the initiations the relay name held back, in log.
+func heldOn(log, name string) int {
+	n := 0
+	for line := range strings.SplitSeq(log, "\n") {
+		if logged(line, "relay: dropped datagram", "relay="+name, "reason=held_for_retry") {
+			n++
+		}
+	}
+	return n
+}
+
+// deviceStat returns n's device state of its peer partner, and false when the
+// device does not list it, as for a moment during a re-dial.
+func deviceStat(t *testing.T, n, partner *meshNode) (wireguard.MeshPeerStat, bool) {
+	t.Helper()
+	stats, err := n.mgr.MeshPeerStats()
+	if err != nil {
+		t.Fatalf("%s: MeshPeerStats: %v", n.id, err)
+	}
+	i := slices.IndexFunc(stats, func(s wireguard.MeshPeerStat) bool { return s.NodeID == partner.id })
+	if i < 0 {
+		return wireguard.MeshPeerStat{}, false
+	}
+	return stats[i], true
+}
+
+// deviceEndpoint returns the endpoint of s in the form relay addresses have.
+func deviceEndpoint(s wireguard.MeshPeerStat) netip.AddrPort {
+	return netip.AddrPortFrom(s.Endpoint.Addr().Unmap(), s.Endpoint.Port())
+}
+
+// pingEverySecond writes a ping from each of a and b to the other into its TUN
+// once a second, the first ones at once, until stop is called. Each write gives
+// up on stop, so a device that no longer reads its TUN cannot keep the goroutine
+// alive. stop returns once the goroutine has ended, and a second call does
+// nothing.
+func pingEverySecond(a, b *meshNode) (stop func()) {
+	done := make(chan struct{})
+	ended := make(chan struct{})
+	send := func(from, to *meshNode) bool {
+		select {
+		case from.tun.Outbound <- tuntest.Ping(to.ip, from.ip):
+			return true
+		case <-done:
+			return false
+		}
+	}
+	go func() {
+		defer close(ended)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for send(a, b) && send(b, a) {
+			select {
+			case <-ticker.C:
+			case <-done:
+				return
+			}
+		}
+	}()
+	return sync.OnceFunc(func() {
+		close(done)
+		<-ended
+	})
+}
+
 // TestRelayIntegration_FallbackChangeMovesThePairAtOnce connects two Managers
 // over relay E, stops E, and names relay F as both peers' fallback. Each
 // Manager writes its peer anew on F, so the pair handshakes over F at once
@@ -567,5 +815,188 @@ func TestRelayIntegration_PairFailsOverToTheStandbyOnItsOwn(t *testing.T) {
 		if logged(log, "wireguard: relay fallback changed, moving to the new relay") {
 			t.Errorf(`%s: logged "wireguard: relay fallback changed, moving to the new relay", want no update`, n.node.id)
 		}
+	}
+}
+
+// TestRelayIntegration_ResumedRelayLeavesThePairAlone freezes relay F under a
+// connected pair behind a relayFront. Unanswered data makes each node's
+// WireGuard send initiations, which queue on the frozen relay, and each Manager
+// probes its silent peer and dials the standby E on a fresh device peer. Of the
+// handshake on E, the initiator keeps no timestamp of its partner, so it would
+// accept any queued initiation of the partner, and WireGuard would move its
+// endpoint to F, which does not know the session.
+//
+// So when F resumes, it must hold the backlog back and the pair must not notice.
+// The test then injects the queued initiations past the relay, the stale packet
+// no relay can stop, and the node must move its peer back to E within one pass
+// and keep the session.
+func TestRelayIntegration_ResumedRelayLeavesThePairAlone(t *testing.T) {
+	t.Parallel()
+	relayLogs := &logBuffer{}
+	dumpOnFailure(t, relayLogs)
+
+	a := newMeshNode(t, "node-a", "10.99.0.1")
+	b := newMeshNode(t, "node-b", "10.99.0.2")
+	_, e := startRelay(t, relayLogs, "E", a, b)
+	_, f := startRelay(t, relayLogs, "F", a, b)
+	front := newRelayFront(t, f)
+
+	a.mgr.SetRelayProbe(a.sendProbe)
+	b.mgr.SetRelayProbe(b.sendProbe)
+	a.startSelection()
+	b.startSelection()
+
+	if err := a.mgr.AddPeer(b.peerOnSet(front.addr.String(), e)); err != nil {
+		t.Fatalf("%s: AddPeer(%s): %v", a.id, b.id, err)
+	}
+	if err := b.mgr.AddPeer(a.peerOnSet(front.addr.String(), e)); err != nil {
+		t.Fatalf("%s: AddPeer(%s): %v", b.id, a.id, err)
+	}
+	pingBoth(t, a, b, 1, 20*time.Second)
+	waitSelectedRelayed(t, a, b)
+	waitSelectedRelayed(t, b, a)
+
+	front.freeze()
+	// No handshake completes over the frozen relay, so one later than this
+	// that the device reports at E's address went through E.
+	frozenAt := time.Now()
+	relayE := netip.MustParseAddrPort(e)
+
+	// The keepalives are not data, so they start no handshake. WireGuard's
+	// 15 s timer starts with the first unanswered ping, and fires inside the
+	// roughly 21 s the probe takes to condemn the relay.
+	stopPings := pingEverySecond(a, b)
+	defer stopPings()
+
+	overE := func(n, partner *meshNode) bool {
+		stat, ok := deviceStat(t, n, partner)
+		return ok && stat.LastHandshake.After(frozenAt) && deviceEndpoint(stat) == relayE
+	}
+	if !waitFor(45*time.Second, func() bool { return overE(a, b) && overE(b, a) }) {
+		t.Fatalf("after 45s a handshake over E later than the freeze: %s = %t, %s = %t, want both",
+			a.id, overE(a, b), b.id, overE(b, a))
+	}
+	stopPings()
+	t.Logf("both nodes handshook over the standby relay after %v", time.Since(frozenAt).Round(time.Millisecond))
+
+	queued := front.initiations()
+	counts := make(map[string]int, len(queued))
+	for src, initiations := range queued {
+		counts[src.String()] = len(initiations)
+	}
+	if len(queued) != 2 {
+		t.Fatalf("queued initiations per source before the thaw = %v, want at least one from each of the two nodes", counts)
+	}
+	t.Logf("queued initiations per source: %v", counts)
+
+	type side struct{ node, partner *meshNode }
+	sides := []side{{a, b}, {b, a}}
+
+	handshakes := make(map[string]time.Time, len(sides))
+	for _, s := range sides {
+		stat, ok := deviceStat(t, s.node, s.partner)
+		if !ok {
+			t.Fatalf("%s: the device does not list %s before the thaw", s.node.id, s.partner.id)
+		}
+		handshakes[s.node.id] = stat.LastHandshake
+	}
+
+	if err := front.thaw(); err != nil {
+		t.Fatalf("thaw the front: %v", err)
+	}
+	thawedAt := time.Now()
+
+	// A roamed endpoint lasts at most until the partner's next packet, 1 s at
+	// this keepalive, so every sample has to look, and a pass may restore it
+	// before one does, which the log line then shows.
+	sample := time.NewTicker(50 * time.Millisecond)
+	defer sample.Stop()
+	for time.Since(thawedAt) < 3*time.Second {
+		for _, s := range sides {
+			stat, ok := deviceStat(t, s.node, s.partner)
+			if !ok {
+				t.Fatalf("%s: %v after the thaw the device does not list %s", s.node.id, time.Since(thawedAt).Round(time.Millisecond), s.partner.id)
+			}
+			if endpoint := deviceEndpoint(stat); endpoint == front.addr {
+				t.Fatalf("%s: %v after the thaw the device endpoint of %s is the resumed relay %s, want E %s",
+					s.node.id, time.Since(thawedAt).Round(time.Millisecond), s.partner.id, endpoint, relayE)
+			}
+			if !stat.LastHandshake.Equal(handshakes[s.node.id]) {
+				t.Fatalf("%s: %v after the thaw the last handshake with %s is %v, want %v unchanged",
+					s.node.id, time.Since(thawedAt).Round(time.Millisecond), s.partner.id, stat.LastHandshake, handshakes[s.node.id])
+			}
+			if logged(s.node.logs.String(), movedBackLine) {
+				t.Fatalf("%s: %v after the thaw logged %q, want nothing to move back",
+					s.node.id, time.Since(thawedAt).Round(time.Millisecond), movedBackLine)
+			}
+		}
+		<-sample.C
+	}
+
+	// A front that lost the backlog would pass everything above too.
+	if held := heldOn(relayLogs.String(), "F"); held < len(queued) {
+		t.Errorf("relay F held %d initiations after the thaw, want at least one from each of the %d nodes", held, len(queued))
+	}
+
+	pingBoth(t, a, b, 2, 2*time.Second)
+
+	// pingBoth just restarted the partner's 1 s keepalive timer, so the 100 ms
+	// pass runs before the partner's next packet could heal the device. The
+	// node that was the handshake's initiator accepts an injected initiation
+	// and the other refuses it, so one direction of each round is a no-op.
+	sources := slices.Collect(maps.Keys(queued))
+	rounds := max(len(queued[sources[0]]), len(queued[sources[1]]))
+	injected := 0
+	var injectedAt time.Time
+	movedBack := func() int {
+		return slices.IndexFunc(sides, func(s side) bool { return logged(s.node.logs.String(), movedBackLine) })
+	}
+	if !waitFor(5*time.Second, func() bool {
+		if movedBack() >= 0 {
+			return true
+		}
+		if injected == rounds || time.Since(injectedAt) < 300*time.Millisecond {
+			return false
+		}
+		for i, src := range sources {
+			if injected >= len(queued[src]) {
+				continue
+			}
+			if err := front.inject(sources[1-i], queued[src][injected]); err != nil {
+				t.Fatalf("inject an initiation from %s at %s: %v", src, sources[1-i], err)
+			}
+		}
+		injected++
+		injectedAt = time.Now()
+		return false
+	}) {
+		ending := "before injection ran out of initiations"
+		if injected == rounds {
+			ending = "and injection ran out of initiations"
+		}
+		t.Fatalf("after 5s neither node logged %q: %d of %d rounds injected from %v %s",
+			movedBackLine, injected, rounds, counts, ending)
+	}
+	moved := sides[movedBack()]
+	t.Logf("%s moved its peer back after %d of %d rounds of injected initiations", moved.node.id, injected, rounds)
+
+	// The partner's next packet would heal the device too, but it is up to 1 s
+	// away: only the write puts the device back on E this soon.
+	if stat, ok := deviceStat(t, moved.node, moved.partner); !ok || deviceEndpoint(stat) != relayE {
+		t.Fatalf("%s: right after the move back the device endpoint of %s is %v (listed = %t), want E %s",
+			moved.node.id, moved.partner.id, stat.Endpoint, ok, relayE)
+	}
+
+	pingBoth(t, a, b, 3, 2*time.Second)
+
+	// The write kept the session: a re-dial would have needed a new handshake
+	// for the pings above.
+	stat, ok := deviceStat(t, moved.node, moved.partner)
+	if !ok {
+		t.Fatalf("%s: the device does not list %s after the move back", moved.node.id, moved.partner.id)
+	}
+	if !stat.LastHandshake.Equal(handshakes[moved.node.id]) {
+		t.Errorf("%s: the last handshake with %s after the move back is %v, want %v unchanged",
+			moved.node.id, moved.partner.id, stat.LastHandshake, handshakes[moved.node.id])
 	}
 }
