@@ -131,11 +131,9 @@ func (w *HookWatcher) Watch(ctx context.Context) error {
 			// For .json sidecar changes, trigger re-read of the parent hook.
 			if strings.HasSuffix(name, ".json") {
 				hookName := strings.TrimSuffix(name, ".json")
-				if !isRemove {
-					w.debounce(&timersMu, timers, hookName, func() {
-						w.processFile(hookName)
-					})
-				}
+				w.debounce(&timersMu, timers, hookName, func() {
+					w.processFile(hookName)
+				})
 				continue
 			}
 
@@ -250,8 +248,10 @@ func (w *HookWatcher) initialScan() {
 	}
 }
 
-// processFile handles a file create/write/chmod event. It runs from debounce's
-// timer, under changeMu.
+// processFile rebuilds a hook's entry from the disk after an event on the hook or
+// on its sidecar, so a sidecar's removal or rename reaches the hook the way its
+// write does. With no hook of that name it ends in removeHook, which is then a
+// no-op. It runs from debounce's timer, under changeMu.
 func (w *HookWatcher) processFile(name string) {
 	fullPath := filepath.Join(w.hooksDir, name)
 
@@ -312,6 +312,8 @@ func (w *HookWatcher) processFile(name string) {
 			h.Timeout = meta.Timeout
 			h.Sandbox = meta.Sandbox
 		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		w.logger.Warn("actions: watcher: sidecar read failed", "file", sidecarPath, "error", err)
 	}
 
 	w.hooks[name] = h

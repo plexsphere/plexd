@@ -623,6 +623,139 @@ func TestWatcher_SidecarUpdate(t *testing.T) {
 	}
 }
 
+func TestWatcher_SidecarRemovalClearsMetadata(t *testing.T) {
+	testSidecarLossClearsMetadata(t, os.Remove)
+}
+
+func TestWatcher_SidecarRenamedAwayClearsMetadata(t *testing.T) {
+	testSidecarLossClearsMetadata(t, func(sidecar string) error {
+		return os.Rename(sidecar, filepath.Join(t.TempDir(), filepath.Base(sidecar)))
+	})
+}
+
+// testSidecarLossClearsMetadata watches a hook whose sidecar declares every
+// metadata field, runs lose on the sidecar, and expects the hook to keep only
+// what its own file gives it. The hook file does not change, so its digest stays
+// and no integrity alert is due.
+func testSidecarLossClearsMetadata(t *testing.T, lose func(sidecar string) error) {
+	t.Helper()
+
+	dir := t.TempDir()
+	writeExecutable(t, dir, "deploy.sh", "#!/bin/sh\necho deploy\n")
+	sidecar := writeSidecar(t, dir, "deploy.sh", declaredMetadata)
+
+	rec := &hookRecorder{}
+	alerts := &integrityRecorder{}
+	logs := &syncBuffer{}
+	w := NewHookWatcher(dir, rec.onChange, alerts.onIntegrity, slog.New(slog.NewTextHandler(logs, nil)))
+	w.debouncePeriod = time.Millisecond
+
+	startWatch(t, w)
+
+	initial, hooks := rec.waitFor(t, 0, namesAre("deploy.sh"), "initial scan did not report deploy.sh")
+	declared := hooks[0]
+	if declared.Description == "" || len(declared.Parameters) == 0 || declared.Timeout == "" || declared.Sandbox == "" {
+		t.Fatalf("initial hook = %+v, want all four metadata fields set", declared)
+	}
+
+	if err := lose(sidecar); err != nil {
+		t.Fatal(err)
+	}
+
+	_, hooks = rec.waitFor(t, initial+1, func(hooks []api.HookInfo) bool {
+		return len(hooks) == 1 && hooks[0].Description == ""
+	}, fmt.Sprintf("the hook kept its sidecar's description %q", declared.Description))
+
+	want := []api.HookInfo{withoutMetadata(declared)}
+	if !reflect.DeepEqual(hooks, want) {
+		t.Errorf("onChange without the sidecar = %+v, want %+v", hooks, want)
+	}
+	if got := w.Hooks(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Hooks() without the sidecar = %+v, want %+v", got, want)
+	}
+	if got := alerts.all(); len(got) != 0 {
+		t.Errorf("alerts = %v, want none: the hook file did not change", got)
+	}
+	if got := logs.String(); strings.Contains(got, "sidecar read failed") {
+		t.Errorf("log = %q, want no read failure for a sidecar that is gone", got)
+	}
+}
+
+func TestWatcher_SidecarReplacedByRename(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "deploy.sh", "#!/bin/sh\necho deploy\n")
+	sidecar := writeSidecar(t, dir, "deploy.sh", declaredMetadata)
+	// Written outside the hooks directory, so the rename is the only event.
+	replacement := writeSidecar(t, t.TempDir(), "next", hookMetadata{Description: "Replaced description", Timeout: "5s"})
+
+	rec := &hookRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+	w.debouncePeriod = time.Millisecond
+
+	startWatch(t, w)
+
+	initial, hooks := rec.waitFor(t, 0, namesAre("deploy.sh"), "initial scan did not report deploy.sh")
+	want := withoutMetadata(hooks[0])
+	want.Description = "Replaced description"
+	want.Timeout = "5s"
+
+	if err := os.Rename(replacement, sidecar); err != nil {
+		t.Fatal(err)
+	}
+
+	_, hooks = rec.waitFor(t, initial+1, func(hooks []api.HookInfo) bool {
+		return len(hooks) == 1 && hooks[0].Description == "Replaced description"
+	}, "the replaced sidecar's metadata was not reported")
+
+	if !reflect.DeepEqual(hooks, []api.HookInfo{want}) {
+		t.Errorf("onChange after the rename = %+v, want %+v", hooks, want)
+	}
+	if got := w.Hooks(); !reflect.DeepEqual(got, []api.HookInfo{want}) {
+		t.Errorf("Hooks() after the rename = %+v, want %+v", got, want)
+	}
+}
+
+// A sidecar's removal re-reads the hook named by its stem, and here no hook has
+// that name. Two hooks added after the removal are the sync point. Debounce
+// timers can finish out of order, so a callback from the removal could still
+// follow the first hook's. The second hook starts only once the first is
+// reported, by which time the removal's timer has run.
+func TestWatcher_OrphanSidecarRemovalIsSilent(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "kept", "#!/bin/sh\necho kept\n")
+	orphan := writeSidecar(t, dir, "orphan", hookMetadata{Description: "no hook owns this"})
+
+	rec := &hookRecorder{}
+	w := NewHookWatcher(dir, rec.onChange, nil, testLogger())
+	w.debouncePeriod = time.Millisecond
+
+	startWatch(t, w)
+
+	initial, _ := rec.waitFor(t, 0, namesAre("kept"), "initial scan did not report kept")
+
+	// A rename brings a hook in with one event, so it costs one callback and the
+	// count below is exact. A write would cost one or two.
+	moveIn := func(name string) {
+		t.Helper()
+		hook := writeExecutable(t, t.TempDir(), name, "#!/bin/sh\necho "+name+"\n")
+		if err := os.Rename(hook, filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := os.Remove(orphan); err != nil {
+		t.Fatal(err)
+	}
+	moveIn("first")
+	at, _ := rec.waitFor(t, initial+1, namesAre("first", "kept"), "the hook added after the removal was not reported")
+	moveIn("second")
+	rec.waitFor(t, at+1, namesAre("first", "kept", "second"), "the second hook was not reported")
+
+	if got, want := rec.count(), initial+3; got != want {
+		t.Errorf("onChange calls = %d, want %d: removing an orphan sidecar fired onChange", got, want)
+	}
+}
+
 func TestWatcher_FullLifecycle(t *testing.T) {
 	dir := t.TempDir()
 
@@ -1445,6 +1578,80 @@ func TestWatcher_ProcessFileSkipsAFIFOSidecar(t *testing.T) {
 	}
 }
 
+// A FIFO in a sidecar's place costs the hook its metadata, not its entry. Each
+// case starts from a sidecar that declares metadata, so a hook left with none
+// cannot pass by never having had any.
+func TestWatcher_FIFOSidecarWarnsOnce(t *testing.T) {
+	t.Run("Reload", func(t *testing.T) {
+		dir := t.TempDir()
+		writeExecutable(t, dir, "deploy.sh", "#!/bin/sh\necho deploy\n")
+		sidecar := writeSidecar(t, dir, "deploy.sh", declaredMetadata)
+
+		logs := &syncBuffer{}
+		w := NewHookWatcher(dir, (&hookRecorder{}).onChange, nil, slog.New(slog.NewTextHandler(logs, nil)))
+
+		hooks, err := w.Reload()
+		if err != nil {
+			t.Fatalf("first Reload() error = %v", err)
+		}
+		wantHooks(t, "first Reload()", hooks, "deploy.sh")
+		want := []api.HookInfo{withoutMetadata(hooks[0])}
+
+		swapInFIFO(t, sidecar)
+
+		hooks, err = w.Reload()
+		if err != nil {
+			t.Fatalf("second Reload() error = %v", err)
+		}
+		if !reflect.DeepEqual(hooks, want) {
+			t.Errorf("Reload() = %+v, want %+v", hooks, want)
+		}
+		wantOneSidecarWarning(t, logs, "actions: discovery: sidecar read failed", sidecar)
+	})
+
+	t.Run("file event", func(t *testing.T) {
+		dir := t.TempDir()
+		writeExecutable(t, dir, "deploy.sh", "#!/bin/sh\necho deploy\n")
+		writeExecutable(t, dir, "other", "#!/bin/sh\necho one\n")
+		sidecar := writeSidecar(t, dir, "deploy.sh", declaredMetadata)
+
+		rec := &hookRecorder{}
+		logs := &syncBuffer{}
+		// The watcher keeps its real debounce here. One read of the swap is what
+		// that debounce gives: kqueue reports the swap as a burst of events.
+		w := NewHookWatcher(dir, rec.onChange, nil, slog.New(slog.NewTextHandler(logs, nil)))
+
+		startWatch(t, w)
+
+		initial, hooks := rec.waitFor(t, 0, namesAre("deploy.sh", "other"), "initial scan did not report the hooks")
+		want := []api.HookInfo{withoutMetadata(hooks[0]), hooks[1]}
+
+		// After the scan, so the line this logs is the watcher's.
+		swapInFIFO(t, sidecar)
+
+		at, hooks := rec.waitFor(t, initial+1, func(hooks []api.HookInfo) bool {
+			return len(hooks) == 2 && hooks[0].Description == ""
+		}, "the hook kept its metadata with a FIFO in its sidecar's place")
+		if !reflect.DeepEqual(hooks, want) {
+			t.Errorf("onChange = %+v, want %+v", hooks, want)
+		}
+		if got := w.Hooks(); !reflect.DeepEqual(got, want) {
+			t.Errorf("Hooks() = %+v, want %+v", got, want)
+		}
+
+		// A second read of the FIFO would come from an event already queued, so
+		// the next change is the point to count at. That change leaves the
+		// directory's entries alone, because kqueue never marks a FIFO as seen
+		// and reports it as created again on every change to those entries.
+		writeExecutable(t, dir, "other", "#!/bin/sh\necho two\n")
+		rec.waitFor(t, at+1, func(hooks []api.HookInfo) bool {
+			return len(hooks) == 2 && hooks[1].Checksum != want[1].Checksum
+		}, "the rewrite of the other hook was not reported")
+
+		wantOneSidecarWarning(t, logs, "actions: watcher: sidecar read failed", sidecar)
+	})
+}
+
 // TestWatcher_LastOnChangeCarriesTheNewestList holds one delivery back while
 // more hooks change and a Reload runs around it. Without changeMu the writers
 // around it deliver newer lists first, and the list held back lands last and
@@ -1594,6 +1801,64 @@ func TestWatcher_LastOnChangeCarriesTheNewestList(t *testing.T) {
 			wantHooks(t, "the last onChange", rec.last(), want...)
 			wantHooks(t, "Hooks()", w.Hooks(), want...)
 		})
+	}
+}
+
+// declaredMetadata sets every sidecar field, so a test that expects them gone
+// cannot pass on a field that was never there.
+var declaredMetadata = hookMetadata{
+	Description: "Deploy to production",
+	Parameters:  []api.ActionParam{{Name: "target", Type: "string", Required: true, Description: "Target address"}},
+	Timeout:     "30s",
+	Sandbox:     "none",
+}
+
+// writeSidecar writes meta as the sidecar of the hook called name and returns
+// the sidecar's path.
+func writeSidecar(t *testing.T, dir, name string, meta hookMetadata) string {
+	t.Helper()
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name+".json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// withoutMetadata returns the entry h's own file gives it, with nothing a
+// sidecar declares.
+func withoutMetadata(h api.HookInfo) api.HookInfo {
+	return api.HookInfo{Name: h.Name, Source: h.Source, Checksum: h.Checksum}
+}
+
+// swapInFIFO renames a new FIFO onto path, so the path is never empty. A watch
+// sees one event on inotify and a burst on kqueue, which the debounce folds.
+func swapInFIFO(t *testing.T, path string) {
+	t.Helper()
+	fifo := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(fifo, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// wantOneSidecarWarning fails the test unless logs holds one sidecar read
+// failure and it is msg, naming file. The error attribute repeats the path, so
+// the match has to include the file key.
+func wantOneSidecarWarning(t *testing.T, logs *syncBuffer, msg, file string) {
+	t.Helper()
+	got := logs.String()
+	if n := strings.Count(got, "sidecar read failed"); n != 1 {
+		t.Errorf("log = %q, want one sidecar read failure, found %d", got, n)
+	}
+	want := `level=WARN msg="` + msg + `" component=actions file=` + file + " error="
+	if !strings.Contains(got, want) {
+		t.Errorf("log = %q, want it to contain %q", got, want)
 	}
 }
 

@@ -230,6 +230,21 @@ func TestDiscoverHooks_SidecarParseError(t *testing.T) {
 	}
 }
 
+func TestDiscoverHooks_MissingSidecarLogsNothing(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "plain.sh", "#!/bin/sh\necho plain\n")
+
+	logs := &syncBuffer{}
+	hooks, err := DiscoverHooks(dir, slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatalf("DiscoverHooks() error = %v", err)
+	}
+	wantHooks(t, "hooks", hooks, "plain.sh")
+	if got := logs.String(); got != "" {
+		t.Errorf("log = %q, want nothing for a hook with no sidecar", got)
+	}
+}
+
 func TestDiscoverHooks_JsonFilesSkipped(t *testing.T) {
 	dir := t.TempDir()
 	writeExecutable(t, dir, "hook.sh", "#!/bin/sh\necho hook\n")
