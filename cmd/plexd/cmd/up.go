@@ -725,9 +725,12 @@ func runAgent(ctx context.Context) error {
 	// current by plexdHooks. Outside a cluster that costs one environment lookup,
 	// and a failed boot list only leaves the key off.
 	//
-	// The reporter calls this closure on every attempt, so a retry always sends
-	// the newest content. It starts at step 20a, after the boot scan below, which
-	// is what puts the hooks on disk in the first manifest.
+	// The reporter calls this closure on every attempt, so a retry sends the
+	// newest content. The exception is a manifest the control plane refuses for
+	// its hook metadata: while the content stays the same, a retry carries the
+	// short form with that metadata left off. The reporter starts at step 20a,
+	// after the boot scan below, which is what puts the hooks on disk in the
+	// first manifest.
 	kubeEnv := (&kubernetes.DefaultDetector{Logger: logger}).Detect()
 	plexdHooks := newPlexdHookInventory(ctx, kubeEnv, newInClusterHookLister, logger)
 	capabilityReporter := agent.NewCapabilityReporter(identity.NodeID, client, func() api.CapabilityManifestRequest {
@@ -1765,7 +1768,8 @@ func signingKeyDispatchHandler(verifier *api.Ed25519Verifier, dataDir string, pe
 
 // declaredHooks converts the executor's hook inventory into the manifest's
 // declared_hooks entries, re-encoding each checksum from the hex the integrity
-// package works in into the base64 the contract carries.
+// package works in into the base64 the contract carries. Each entry also carries
+// what the hook's sidecar declares, as far as withHookMetadata lets it through.
 //
 // A hook whose checksum is missing or not a SHA-256 digest is dropped with a
 // warning rather than sent: the manifest is validated as a whole, so one
@@ -1792,7 +1796,7 @@ func declaredHooks(hooks []api.HookInfo, logger *slog.Logger) []api.DeclaredHook
 				"hook", h.Name, "error", err)
 			continue
 		}
-		out = append(out, api.DeclaredHook{Name: h.Name, Checksum: checksum})
+		out = append(out, withHookMetadata(api.DeclaredHook{Name: h.Name, Checksum: checksum}, h, logger))
 	}
 	if len(out) == 0 {
 		return nil
@@ -1803,6 +1807,102 @@ func declaredHooks(hooks []api.HookInfo, logger *slog.Logger) []api.DeclaredHook
 		out = out[:maxDeclaredHooks]
 	}
 	return out
+}
+
+// withHookMetadata copies what h's sidecar declares onto entry. One field past
+// the contract's limits costs the whole manifest, so such a field is left off
+// with a warning and the hook keeps the others: the operator still gets a usable
+// description when only the timeout is wrong. Parameters go as a whole list,
+// because a form with a required parameter missing misleads.
+//
+// The reporter builds the manifest on every attempt, so a warning repeats on
+// every attempt, like the ones in declaredHooks.
+func withHookMetadata(entry api.DeclaredHook, h api.HookInfo, logger *slog.Logger) api.DeclaredHook {
+	omit := func(field string, err error) {
+		logger.Warn("hook metadata omitted from the capability manifest",
+			"hook", h.Name, "field", field, "error", err)
+	}
+	if hookTextValid(h.Description, maxHookTextChars) {
+		entry.Description = h.Description
+	} else {
+		omit("description", fmt.Errorf("more than %d characters or a NUL", maxHookTextChars))
+	}
+	// A sidecar's "parameters": [] stays nil, so it compares equal to a sidecar
+	// without the key and stays off the wire.
+	if err := hookParametersError(h.Parameters); err != nil {
+		omit("parameters", err)
+	} else if len(h.Parameters) > 0 {
+		entry.Parameters = h.Parameters
+	}
+	if seconds, err := hookTimeoutSeconds(h.Timeout); err != nil {
+		omit("timeout", err)
+	} else {
+		entry.TimeoutSeconds = seconds
+	}
+	if hookTextValid(h.Sandbox, maxHookSandboxChars) {
+		entry.SandboxLevel = h.Sandbox
+	} else {
+		omit("sandbox", fmt.Errorf("more than %d characters or a NUL", maxHookSandboxChars))
+	}
+	return entry
+}
+
+// hookTextValid reports whether s fits a text field of a declared hook: no NUL,
+// and at most maxChars runes. This is the control plane's own check.
+// encoding/json decodes a sidecar to valid UTF-8, so the rune count here is the
+// count there.
+func hookTextValid(s string, maxChars int) bool {
+	return !strings.ContainsRune(s, 0) && utf8.RuneCountInString(s) <= maxChars
+}
+
+// hookParametersError returns what stops params from going on the manifest, or
+// nil. Names are compared raw, as the control plane compares them, so "a" and
+// " a" are two parameters. Required has no limit.
+func hookParametersError(params []api.ActionParam) error {
+	if len(params) > maxHookParameters {
+		return fmt.Errorf("%d parameters, at most %d are accepted", len(params), maxHookParameters)
+	}
+	seen := make(map[string]struct{}, len(params))
+	for i, p := range params {
+		// The position names the parameter here, because the name cannot.
+		if strings.TrimSpace(p.Name) == "" {
+			return fmt.Errorf("parameter %d of %d has a blank name", i+1, len(params))
+		}
+		if _, dup := seen[p.Name]; dup {
+			return fmt.Errorf("parameter %q is declared twice", p.Name)
+		}
+		seen[p.Name] = struct{}{}
+		for _, text := range []struct{ field, value string }{
+			{"name", p.Name},
+			{"type", p.Type},
+			{"default", p.Default},
+			{"description", p.Description},
+		} {
+			if !hookTextValid(text.value, maxHookTextChars) {
+				return fmt.Errorf("parameter %q: %s has more than %d characters or a NUL", p.Name, text.field, maxHookTextChars)
+			}
+		}
+	}
+	return nil
+}
+
+// hookTimeoutSeconds converts a sidecar's timeout to the contract's whole
+// seconds. The empty string means none declared and is checked first, because
+// time.ParseDuration refuses it. The range is checked ahead of the rounding,
+// which would overflow near the largest duration. Rounding goes up so that
+// "500ms" reports 1 and not 0, which reads as none declared.
+func hookTimeoutSeconds(timeout string) (int64, error) {
+	if timeout == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(timeout)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 || d > maxHookTimeout {
+		return 0, fmt.Errorf("timeout %s is outside the range 0 to %s", d, maxHookTimeout)
+	}
+	return int64((d + time.Second - 1) / time.Second), nil
 }
 
 // bootHookScanTimeout bounds how long boot waits for the first scan of hooks_dir.
@@ -1846,6 +1946,22 @@ const plexdHookDiscoveryTimeout = 10 * time.Second
 // maxDeclaredHooks is the manifest's declared_hooks ceiling. A manifest carrying
 // more is refused whole with 400 declared_hooks_too_many.
 const maxDeclaredHooks = 128
+
+// The contract's limits on what a declared hook's sidecar declares. A manifest
+// past one is refused whole, with 400 declared_hooks_too_many past
+// maxHookParameters and 400 declared_hook_invalid past the others. The text
+// limits count Unicode code points.
+const (
+	// maxHookTextChars caps the description, and the name, type, default, and
+	// description of each parameter.
+	maxHookTextChars = 4096
+	// maxHookSandboxChars caps the sandbox level.
+	maxHookSandboxChars = 64
+	// maxHookParameters caps the parameters of one hook.
+	maxHookParameters = 64
+	// maxHookTimeout is the contract's 86400 seconds as a duration.
+	maxHookTimeout = 24 * time.Hour
+)
 
 // maxPlexdHooks is the manifest's plexd_hooks ceiling. A manifest carrying more
 // is refused whole with 422 plexd_hooks_too_many.

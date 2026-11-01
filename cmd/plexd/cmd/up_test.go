@@ -2295,6 +2295,42 @@ func TestDeclaredHooks(t *testing.T) {
 			t.Errorf("cap warning attrs = %v, want cap=128 dropped=1", attrs)
 		}
 	})
+	// The cap cuts entries, not what they carry, so the entries it keeps must
+	// still hold their metadata.
+	t.Run("past the cap with metadata", func(t *testing.T) {
+		rec := newRecordingHandler()
+		params := []api.ActionParam{{Name: "region", Type: "string", Required: true, Description: "Target region"}}
+		hooks := hooksNamed(129)
+		for i := range hooks {
+			hooks[i].Description = "Runs " + hooks[i].Name
+			hooks[i].Parameters = params
+			hooks[i].Timeout = "30s"
+			hooks[i].Sandbox = "none"
+		}
+		got := declaredHooks(hooks, slog.New(rec))
+		if len(got) != 128 {
+			t.Fatalf("declaredHooks returned %d entries, want 128", len(got))
+		}
+		if n := rec.count(slog.LevelWarn, declaredHooksCappedMsg); n != 1 {
+			t.Fatalf("cap warnings = %d, want 1", n)
+		}
+		if attrs := rec.attrsOf(slog.LevelWarn, declaredHooksCappedMsg); attrs["cap"] != "128" || attrs["dropped"] != "1" {
+			t.Errorf("cap warning attrs = %v, want cap=128 dropped=1", attrs)
+		}
+		for i := range 128 {
+			want := api.DeclaredHook{
+				Name:           fmt.Sprintf("hook-%03d", i),
+				Checksum:       wantChecksum,
+				Description:    fmt.Sprintf("Runs hook-%03d", i),
+				Parameters:     params,
+				TimeoutSeconds: 30,
+				SandboxLevel:   "none",
+			}
+			if !reflect.DeepEqual(got[i], want) {
+				t.Errorf("entry %d = %+v, want %+v", i, got[i], want)
+			}
+		}
+	})
 	t.Run("at the cap", func(t *testing.T) {
 		rec := newRecordingHandler()
 		if got := declaredHooks(hooksNamed(128), slog.New(rec)); len(got) != 128 {
@@ -2341,10 +2377,469 @@ func TestDeclaredHooks(t *testing.T) {
 const (
 	declaredHookOmittedMsg    = "hook omitted from the capability manifest"
 	declaredHooksCappedMsg    = "hooks beyond the capability manifest cap omitted"
+	hookMetadataOmittedMsg    = "hook metadata omitted from the capability manifest"
 	plexdHookOmittedMsg       = "plexd hook omitted from the capability manifest"
 	plexdHookParamRepeatedMsg = "plexd hook parameter repeated; the later value is reported"
 	plexdHooksCappedMsg       = "plexd hooks beyond the capability manifest cap omitted"
 )
+
+// metadataHook returns a hook that declares all four fields, and the entry it
+// converts to. Each test below breaks one field and compares the rest against
+// this entry, because a hook keeps what it can carry.
+func metadataHook() (api.HookInfo, api.DeclaredHook) {
+	sum := sha256.Sum256([]byte("hook payload"))
+	// Built twice, so a test that edits the hook's list leaves the entry's alone.
+	params := func() []api.ActionParam {
+		return []api.ActionParam{
+			{Name: "region", Type: "string", Required: true, Description: "Target region"},
+			{Name: "dry_run", Type: "bool", Default: "false", Description: "Report without changing anything"},
+		}
+	}
+	hook := api.HookInfo{
+		Name:        "deploy",
+		Description: "Rolls the deployment forward",
+		Checksum:    hex.EncodeToString(sum[:]),
+		Parameters:  params(),
+		Timeout:     "30s",
+		Sandbox:     "none",
+	}
+	entry := api.DeclaredHook{
+		Name:           "deploy",
+		Checksum:       base64.StdEncoding.EncodeToString(sum[:]),
+		Description:    "Rolls the deployment forward",
+		Parameters:     params(),
+		TimeoutSeconds: 30,
+		SandboxLevel:   "none",
+	}
+	return hook, entry
+}
+
+// declareOne converts one hook through declaredHooks and returns its entry with
+// a log of its own, because attrsOf reads the first matching record. It fails the
+// test when the hook is gone: broken metadata costs a field, never the hook.
+func declareOne(t *testing.T, h api.HookInfo) (api.DeclaredHook, *recordingHandler) {
+	t.Helper()
+	rec := newRecordingHandler()
+	got := declaredHooks([]api.HookInfo{h}, slog.New(rec))
+	if len(got) != 1 {
+		t.Fatalf("declaredHooks returned %d entries (%+v), want the hook kept", len(got), got)
+	}
+	return got[0], rec
+}
+
+// assertOmitted pins the one warning a left-off field logs. wantErr is a part of
+// the error attribute.
+func assertOmitted(t *testing.T, rec *recordingHandler, field, wantErr string) {
+	t.Helper()
+	if n := rec.count(slog.LevelWarn, hookMetadataOmittedMsg); n != 1 {
+		t.Fatalf("omission warnings = %d, want 1", n)
+	}
+	attrs := rec.attrsOf(slog.LevelWarn, hookMetadataOmittedMsg)
+	if attrs["hook"] != "deploy" || attrs["field"] != field {
+		t.Errorf("omission attrs = %v, want hook=deploy field=%s", attrs, field)
+	}
+	if !strings.Contains(attrs["error"], wantErr) {
+		t.Errorf("omission error = %q, want it to contain %q", attrs["error"], wantErr)
+	}
+}
+
+// assertNotOmitted pins that nothing was left off.
+func assertNotOmitted(t *testing.T, rec *recordingHandler) {
+	t.Helper()
+	if n := rec.countAt(slog.LevelWarn); n != 0 {
+		t.Errorf("warnings = %d, want 0", n)
+	}
+}
+
+// assertEntry compares a converted entry with the one wanted.
+func assertEntry(t *testing.T, got, want api.DeclaredHook) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("entry = %+v, want %+v", got, want)
+	}
+}
+
+func TestDeclaredHooks_CarriesSidecarMetadata(t *testing.T) {
+	hook, want := metadataHook()
+	got, rec := declareOne(t, hook)
+	assertEntry(t, got, want)
+	assertNotOmitted(t, rec)
+}
+
+// A hook with no sidecar goes on the wire as it did before the entry grew, which
+// is what a control plane that predates the contract accepts.
+func TestDeclaredHooks_NoMetadataMarshalsToTheShortEntry(t *testing.T) {
+	hook, entry := metadataHook()
+	got, rec := declareOne(t, api.HookInfo{Name: hook.Name, Checksum: hook.Checksum})
+	assertNotOmitted(t, rec)
+
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal entry: %v", err)
+	}
+	if want := `{"name":"deploy","checksum":"` + entry.Checksum + `"}`; string(raw) != want {
+		t.Errorf("marshaled entry = %s, want %s", raw, want)
+	}
+}
+
+// A sidecar's "parameters": [] must compare equal to a sidecar without the key,
+// or the reporter sees a change where the wire shows none.
+func TestDeclaredHooks_EmptyParametersStayOffTheWire(t *testing.T) {
+	for name, params := range map[string][]api.ActionParam{
+		"nil":   nil,
+		"empty": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			hook, _ := metadataHook()
+			hook.Parameters = params
+			got, rec := declareOne(t, hook)
+			if got.Parameters != nil {
+				t.Errorf("Parameters = %#v, want nil", got.Parameters)
+			}
+			assertNotOmitted(t, rec)
+
+			raw, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal entry: %v", err)
+			}
+			if strings.Contains(string(raw), `"parameters"`) {
+				t.Errorf("marshaled entry carries parameters: %s", raw)
+			}
+		})
+	}
+}
+
+func TestDeclaredHooks_NoTimeoutDeclared(t *testing.T) {
+	for _, timeout := range []string{"", "0s"} {
+		t.Run("timeout "+timeout, func(t *testing.T) {
+			hook, want := metadataHook()
+			hook.Timeout = timeout
+			want.TimeoutSeconds = 0
+			got, rec := declareOne(t, hook)
+			assertEntry(t, got, want)
+			assertNotOmitted(t, rec)
+
+			raw, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal entry: %v", err)
+			}
+			if strings.Contains(string(raw), `"timeout_seconds"`) {
+				t.Errorf("marshaled entry carries timeout_seconds: %s", raw)
+			}
+		})
+	}
+}
+
+// The rounding goes up because a sub-second timeout must not read as none
+// declared, and the top of the table sits on the contract's 86400.
+func TestHookTimeoutSeconds_RoundsUp(t *testing.T) {
+	tests := []struct {
+		timeout string
+		want    int64
+	}{
+		{"", 0},
+		{"0s", 0},
+		{"1ns", 1},
+		{"500ms", 1},
+		{"1s", 1},
+		{"1001ms", 2},
+		{"1500ms", 2},
+		{"30s", 30},
+		{"23h59m59.5s", 86400},
+		{"24h", 86400},
+	}
+	for _, tt := range tests {
+		t.Run("timeout "+tt.timeout, func(t *testing.T) {
+			got, err := hookTimeoutSeconds(tt.timeout)
+			if err != nil {
+				t.Fatalf("hookTimeoutSeconds(%q): %v", tt.timeout, err)
+			}
+			if got != tt.want {
+				t.Errorf("hookTimeoutSeconds(%q) = %d, want %d", tt.timeout, got, tt.want)
+			}
+
+			hook, want := metadataHook()
+			hook.Timeout = tt.timeout
+			want.TimeoutSeconds = tt.want
+			entry, rec := declareOne(t, hook)
+			assertEntry(t, entry, want)
+			assertNotOmitted(t, rec)
+		})
+	}
+}
+
+func TestDeclaredHooks_BadTimeoutKeepsTheOtherFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout string
+		wantErr string
+	}{
+		{"past the bound", "24h0m1s", "0 to 24h0m0s"},
+		{"one nanosecond past the bound", "24h0m0.000000001s", "0 to 24h0m0s"},
+		// Rounded first, this one wraps past zero. The bound has to see it raw.
+		{"the largest duration", "2562047h47m16.854775807s", "0 to 24h0m0s"},
+		{"negative", "-5s", "0 to 24h0m0s"},
+		// Rounded first, this one reads 0, which means none declared.
+		{"negative by less than a second", "-500ms", "0 to 24h0m0s"},
+		{"no unit", "30", "missing unit"},
+		{"not a duration", "soon", "invalid duration"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hook, want := metadataHook()
+			hook.Timeout = tt.timeout
+			want.TimeoutSeconds = 0
+			got, rec := declareOne(t, hook)
+			assertEntry(t, got, want)
+			assertOmitted(t, rec, "timeout", tt.wantErr)
+		})
+	}
+}
+
+// Characters are code points, so the fixture is multi-byte: a limit counted in
+// bytes fails at the limit, not past it.
+func TestDeclaredHooks_DescriptionLimit(t *testing.T) {
+	t.Run("at the limit", func(t *testing.T) {
+		hook, want := metadataHook()
+		hook.Description = strings.Repeat("é", 4096)
+		want.Description = hook.Description
+		got, rec := declareOne(t, hook)
+		assertEntry(t, got, want)
+		assertNotOmitted(t, rec)
+	})
+	t.Run("past the limit", func(t *testing.T) {
+		hook, want := metadataHook()
+		hook.Description = strings.Repeat("é", 4097)
+		want.Description = ""
+		got, rec := declareOne(t, hook)
+		assertEntry(t, got, want)
+		assertOmitted(t, rec, "description", "4096")
+	})
+	// The count covers the string as written, as the control plane's does.
+	t.Run("past the limit by a trailing newline", func(t *testing.T) {
+		hook, want := metadataHook()
+		hook.Description = strings.Repeat("é", 4096) + "\n"
+		want.Description = ""
+		got, rec := declareOne(t, hook)
+		assertEntry(t, got, want)
+		assertOmitted(t, rec, "description", "4096")
+	})
+}
+
+func TestDeclaredHooks_SandboxLimit(t *testing.T) {
+	t.Run("at the limit", func(t *testing.T) {
+		hook, want := metadataHook()
+		hook.Sandbox = strings.Repeat("é", 64)
+		want.SandboxLevel = hook.Sandbox
+		got, rec := declareOne(t, hook)
+		assertEntry(t, got, want)
+		assertNotOmitted(t, rec)
+	})
+	t.Run("past the limit", func(t *testing.T) {
+		hook, want := metadataHook()
+		hook.Sandbox = strings.Repeat("é", 65)
+		want.SandboxLevel = ""
+		got, rec := declareOne(t, hook)
+		assertEntry(t, got, want)
+		assertOmitted(t, rec, "sandbox", "64")
+	})
+}
+
+func TestDeclaredHooks_ParameterCountLimit(t *testing.T) {
+	paramsNamed := func(n int) []api.ActionParam {
+		params := make([]api.ActionParam, 0, n)
+		for i := range n {
+			params = append(params, api.ActionParam{Name: fmt.Sprintf("param-%02d", i), Type: "string"})
+		}
+		return params
+	}
+	t.Run("at the limit", func(t *testing.T) {
+		hook, want := metadataHook()
+		hook.Parameters = paramsNamed(64)
+		want.Parameters = paramsNamed(64)
+		got, rec := declareOne(t, hook)
+		assertEntry(t, got, want)
+		assertNotOmitted(t, rec)
+	})
+	t.Run("past the limit", func(t *testing.T) {
+		hook, want := metadataHook()
+		hook.Parameters = paramsNamed(65)
+		want.Parameters = nil
+		got, rec := declareOne(t, hook)
+		assertEntry(t, got, want)
+		assertOmitted(t, rec, "parameters", "65 parameters")
+	})
+}
+
+// One bad name takes the whole list: a form with a required parameter missing
+// misleads.
+func TestDeclaredHooks_ParameterNameRules(t *testing.T) {
+	good := api.ActionParam{Name: "region", Type: "string", Required: true}
+	tests := []struct {
+		name    string
+		params  []api.ActionParam
+		wantErr string
+	}{
+		{"empty", []api.ActionParam{good, {Name: ""}}, "blank name"},
+		{"whitespace only", []api.ActionParam{good, {Name: " \t"}}, "blank name"},
+		{"declared twice", []api.ActionParam{good, {Name: "region"}}, "declared twice"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hook, want := metadataHook()
+			hook.Parameters = tt.params
+			want.Parameters = nil
+			got, rec := declareOne(t, hook)
+			assertEntry(t, got, want)
+			assertOmitted(t, rec, "parameters", tt.wantErr)
+		})
+	}
+
+	// The control plane compares names raw, so these two are distinct there.
+	t.Run("names that differ only in whitespace", func(t *testing.T) {
+		params := []api.ActionParam{good, {Name: " region"}}
+		hook, want := metadataHook()
+		hook.Parameters = params
+		want.Parameters = params
+		got, rec := declareOne(t, hook)
+		assertEntry(t, got, want)
+		assertNotOmitted(t, rec)
+	})
+}
+
+// parameterTextFields sets each text field of a parameter, so a limit test can
+// walk them all.
+var parameterTextFields = map[string]func(p *api.ActionParam, s string){
+	"name":        func(p *api.ActionParam, s string) { p.Name = s },
+	"type":        func(p *api.ActionParam, s string) { p.Type = s },
+	"default":     func(p *api.ActionParam, s string) { p.Default = s },
+	"description": func(p *api.ActionParam, s string) { p.Description = s },
+}
+
+func TestDeclaredHooks_ParameterTextLimits(t *testing.T) {
+	for field, set := range parameterTextFields {
+		t.Run(field+" at the limit", func(t *testing.T) {
+			hook, want := metadataHook()
+			set(&hook.Parameters[1], strings.Repeat("é", 4096))
+			set(&want.Parameters[1], strings.Repeat("é", 4096))
+			got, rec := declareOne(t, hook)
+			assertEntry(t, got, want)
+			assertNotOmitted(t, rec)
+		})
+		t.Run(field+" past the limit", func(t *testing.T) {
+			hook, want := metadataHook()
+			set(&hook.Parameters[1], strings.Repeat("é", 4097))
+			want.Parameters = nil
+			got, rec := declareOne(t, hook)
+			assertEntry(t, got, want)
+			assertOmitted(t, rec, "parameters", field+" has more than 4096 characters")
+		})
+	}
+}
+
+// The contract refuses a NUL in any of these strings, so one costs the whole
+// manifest however short the string is.
+func TestDeclaredHooks_NULIsLeftOff(t *testing.T) {
+	const withNUL = "a\x00b"
+	t.Run("description", func(t *testing.T) {
+		hook, want := metadataHook()
+		hook.Description = withNUL
+		want.Description = ""
+		got, rec := declareOne(t, hook)
+		assertEntry(t, got, want)
+		assertOmitted(t, rec, "description", "NUL")
+	})
+	t.Run("sandbox", func(t *testing.T) {
+		hook, want := metadataHook()
+		hook.Sandbox = withNUL
+		want.SandboxLevel = ""
+		got, rec := declareOne(t, hook)
+		assertEntry(t, got, want)
+		assertOmitted(t, rec, "sandbox", "NUL")
+	})
+	for field, set := range parameterTextFields {
+		t.Run("parameter "+field, func(t *testing.T) {
+			hook, want := metadataHook()
+			set(&hook.Parameters[1], withNUL)
+			want.Parameters = nil
+			got, rec := declareOne(t, hook)
+			assertEntry(t, got, want)
+			assertOmitted(t, rec, "parameters", field+" has more than 4096 characters or a NUL")
+		})
+	}
+}
+
+// Each field fails on its own, so a hook with all four broken still reports
+// with its name and digest, and the log names every field.
+func TestDeclaredHooks_EveryFieldBrokenKeepsTheHook(t *testing.T) {
+	hook, entry := metadataHook()
+	hook.Description = "a\x00b"
+	hook.Parameters = []api.ActionParam{{Name: ""}}
+	hook.Timeout = "soon"
+	hook.Sandbox = "a\x00b"
+	got, rec := declareOne(t, hook)
+	assertEntry(t, got, api.DeclaredHook{Name: entry.Name, Checksum: entry.Checksum})
+	if n := rec.count(slog.LevelWarn, hookMetadataOmittedMsg); n != 4 {
+		t.Errorf("omission warnings = %d, want 4", n)
+	}
+}
+
+// The error reaches an operator through the log, so it has to name both the
+// violation and the parameter.
+func TestHookParametersError(t *testing.T) {
+	tests := []struct {
+		name    string
+		params  []api.ActionParam
+		wantErr []string
+	}{
+		{name: "nil"},
+		{name: "empty", params: []api.ActionParam{}},
+		{
+			name:    "too many",
+			params:  make([]api.ActionParam, 65),
+			wantErr: []string{"65 parameters", "at most 64"},
+		},
+		{
+			name:    "blank name",
+			params:  []api.ActionParam{{Name: "region"}, {Name: "  "}, {Name: "zone"}},
+			wantErr: []string{"parameter 2 of 3", "blank name"},
+		},
+		{
+			name:    "declared twice",
+			params:  []api.ActionParam{{Name: "region"}, {Name: "region"}},
+			wantErr: []string{`"region"`, "declared twice"},
+		},
+		{
+			name:    "text past the limit",
+			params:  []api.ActionParam{{Name: "region", Type: strings.Repeat("x", 4097)}},
+			wantErr: []string{`"region"`, "type", "4096"},
+		},
+		{
+			name:    "a NUL in the name",
+			params:  []api.ActionParam{{Name: "a\x00b"}},
+			wantErr: []string{`"a\x00b"`, "name", "NUL"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := hookParametersError(tt.params)
+			if len(tt.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("hookParametersError = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("hookParametersError = nil, want an error")
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("hookParametersError = %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+}
 
 // discoveredPlexdHooks turns listed PlexdHook resources into plexd_hooks
 // entries. It follows declaredHooks: an entry the control plane would refuse
@@ -2790,6 +3285,61 @@ func TestRunUp_BootManifestCarriesHooksOnDisk(t *testing.T) {
 	}
 	sum := sha256.Sum256(payload)
 	want := []api.DeclaredHook{{Name: "deploy", Checksum: base64.StdEncoding.EncodeToString(sum[:])}}
+	if !reflect.DeepEqual(manifest.DeclaredHooks, want) {
+		t.Errorf("first manifest declared_hooks = %+v, want %+v (body: %s)", manifest.DeclaredHooks, want, first)
+	}
+}
+
+// The boot scan reads each sidecar, so the first manifest already tells the
+// control plane what a hook does. No sidecar edit or later send is involved: the
+// assertion reads the first PUT.
+func TestRunUp_BootManifestCarriesSidecarMetadata(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need the executable bit and /bin/sh, which windows lacks")
+	}
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+	payload := []byte("#!/bin/sh\nexit 0\n")
+	hooksDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(hooksDir, "deploy"), payload, 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	sidecar := []byte(`{
+		"description": "Rolls the deployment forward",
+		"parameters": [
+			{"name": "region", "type": "string", "required": true, "description": "Target region"},
+			{"name": "dry_run", "type": "bool", "default": "false", "description": "Report without changing anything"}
+		],
+		"timeout": "1500ms",
+		"sandbox": "none"
+	}`)
+	if err := os.WriteFile(filepath.Join(hooksDir, "deploy.json"), sidecar, 0o644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	t.Setenv("PLEXD_HOOKS_DIR", hooksDir)
+
+	cp, apiBase := newCapabilityCapture(t)
+	writeUpConfig(t, apiBase, upDaemonYAML(t))
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	first := cp.firstBody(t)
+	var manifest api.CapabilityManifestRequest
+	if err := json.Unmarshal(first, &manifest); err != nil {
+		t.Fatalf("decode manifest: %v (body: %s)", err, first)
+	}
+	sum := sha256.Sum256(payload)
+	want := []api.DeclaredHook{{
+		Name:        "deploy",
+		Checksum:    base64.StdEncoding.EncodeToString(sum[:]),
+		Description: "Rolls the deployment forward",
+		Parameters: []api.ActionParam{
+			{Name: "region", Type: "string", Required: true, Description: "Target region"},
+			{Name: "dry_run", Type: "bool", Default: "false", Description: "Report without changing anything"},
+		},
+		TimeoutSeconds: 2,
+		SandboxLevel:   "none",
+	}}
 	if !reflect.DeepEqual(manifest.DeclaredHooks, want) {
 		t.Errorf("first manifest declared_hooks = %+v, want %+v (body: %s)", manifest.DeclaredHooks, want, first)
 	}
