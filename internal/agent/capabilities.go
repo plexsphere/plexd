@@ -27,10 +27,16 @@ const (
 	capabilityMaxDelay = 10 * time.Second
 
 	// capabilityRetryMin is the delay after the first failed send. It doubles
-	// with each further failure up to capabilityRetryMax, which holds a
-	// refused manifest to about 12 attempts an hour.
+	// with each further failure up to capabilityRetryMax, which holds a refusal
+	// that retries to about 12 attempts an hour.
 	capabilityRetryMin = 5 * time.Second
 	capabilityRetryMax = 5 * time.Minute
+
+	// capabilityWideRetry is how long the short form stands in for a refused
+	// wide manifest before plexd tries the wide form again. Each try leaves an
+	// audit row at the control plane, and a refusal clears only with an upgrade
+	// or a smaller manifest, so a pace of minutes would buy nothing.
+	capabilityWideRetry = 1 * time.Hour
 )
 
 // CapabilityClient sends the capability manifest to the control plane.
@@ -41,18 +47,37 @@ type CapabilityClient interface {
 // CapabilityReporter owns the manifest at PUT /v1/nodes/{node_id}/capabilities.
 // It sends the manifest when Run starts, sends it again after a Notify that
 // changed it, and retries a failed send until one is accepted. Every attempt
-// calls build, so a retry always carries the newest content.
+// calls build, so a retry carries the newest content. The exception is a
+// manifest the control plane refuses for its hook metadata: while the content
+// stays the same, the Node keeps reporting in the short form, whose entries
+// hold a name and a checksum. The wide form goes out again when its content
+// changes and once an hour.
 //
-// DECISION: a manifest equal to the last accepted one is not sent, and nothing
-// is re-sent on a timer. The control plane raises an integrity alert on every
-// accepted PUT that carries a drifted hook, whether or not the manifest
-// changed, so a repeat would only repeat the alert. The accepted manifest lives
-// in memory, so a restart always sends once.
+// DECISION: a manifest the control plane is known to hold is never re-sent. The
+// control plane raises an integrity alert on every accepted PUT that carries a
+// drifted hook, whether or not the manifest changed, so a repeat of an accepted
+// manifest would only repeat the alert. The hourly attempt is the one send that
+// no change and no failure asks for, and it runs only while plexd holds back
+// metadata the control plane has not seen. A refused attempt stores nothing and
+// raises no integrity alert. An accepted one delivers new content once. The
+// accepted manifest lives in memory, so a restart always sends once.
 //
 // DECISION: every failure retries, a refusal included. A refused PUT stores
 // nothing and raises nothing at the control plane, capabilityRetryMax bounds
 // the rate, and a control plane that gets upgraded then clears the refusal
-// without an agent restart.
+// without an agent restart. The exception is a wide manifest refused per
+// api.IsHookMetadataRefused, which is not retried on the backoff. Its short
+// form leaves at once, and the wide form is tried on a change or hourly,
+// bounded by capabilityWideRetry rather than capabilityRetryMax. An upgraded
+// control plane clears that refusal without a restart too.
+//
+// DECISION: the fallback keys on an HTTP refusal, not on repeated transport
+// failures. A control-plane outage must not strip metadata from every Node on
+// recovery, and a count of unanswered PUTs cannot tell an outage from a path
+// that cannot carry the wide form. So a wide manifest that fails with no HTTP
+// answer keeps retrying wide. The cost falls on a Node whose link is too slow
+// to carry a near-budget manifest or whose proxy cuts the upload silently: its
+// manifest stops updating until the wide form gets through.
 type CapabilityReporter struct {
 	nodeID string
 	client CapabilityClient
@@ -64,6 +89,7 @@ type CapabilityReporter struct {
 	maxDelay    time.Duration
 	retryMin    time.Duration
 	retryMax    time.Duration
+	wideRetry   time.Duration
 
 	// jitter spreads a retry delay. It is Jitter outside tests.
 	jitter func(time.Duration) time.Duration
@@ -96,6 +122,17 @@ type CapabilityReporter struct {
 	// stays armed until Run receives from it.
 	retry      *time.Timer
 	retryArmed bool
+
+	// refused is the manifest, as built, that the control plane last refused for
+	// its hook metadata. The match is exact, so any change to the content earns
+	// the wide form a new try. It stays set until a wide manifest is accepted or
+	// the wide timer fires, so metadata that comes back unchanged before then
+	// stays short.
+	refused *api.CapabilityManifestRequest
+
+	// wideTimer ends the hourly wait for the next try of the wide form. It runs
+	// from the last refusal until a wide manifest is accepted or it fires.
+	wideTimer *time.Timer
 }
 
 // NewCapabilityReporter creates a CapabilityReporter that reports for nodeID
@@ -110,6 +147,7 @@ func NewCapabilityReporter(nodeID string, client CapabilityClient, build func() 
 		maxDelay:    capabilityMaxDelay,
 		retryMin:    capabilityRetryMin,
 		retryMax:    capabilityRetryMax,
+		wideRetry:   capabilityWideRetry,
 		jitter:      Jitter,
 		now:         time.Now,
 		notify:      make(chan struct{}, 1),
@@ -127,13 +165,16 @@ func (r *CapabilityReporter) Notify() {
 }
 
 // Run makes one attempt with no quiet period, so a failed boot PUT retries, and
-// then attempts on every notification and whenever the retry timer fires, until
-// ctx is cancelled. Run always returns nil.
+// then attempts on every notification and whenever the retry timer or the wide
+// timer fires, until ctx is cancelled. Run always returns nil.
 func (r *CapabilityReporter) Run(ctx context.Context) error {
 	r.backoff = r.retryMin
 	r.retry = time.NewTimer(r.retryMin)
 	r.retry.Stop()
 	defer r.retry.Stop()
+	r.wideTimer = time.NewTimer(r.wideRetry)
+	r.wideTimer.Stop()
+	defer r.wideTimer.Stop()
 
 	r.attempt(ctx, false)
 	for {
@@ -143,6 +184,10 @@ func (r *CapabilityReporter) Run(ctx context.Context) error {
 		case <-r.retry.C:
 			r.retryArmed = false
 			r.attempt(ctx, false)
+		case <-r.wideTimer.C:
+			// notified is true so a Retry-After hold still holds.
+			r.refused = nil
+			r.attempt(ctx, true)
 		case <-r.notify:
 			if !r.waitQuiet(ctx) {
 				return nil
@@ -177,10 +222,11 @@ func (r *CapabilityReporter) waitQuiet(ctx context.Context) bool {
 }
 
 // attempt builds the manifest and sends it unless the control plane already
-// holds it. notified says a notification asked for the attempt, which unlike
-// the retry timer may have to leave the send to that timer.
+// holds it. notified says a notification or the wide timer asked for the
+// attempt, which unlike the retry timer may have to leave the send to that
+// timer.
 func (r *CapabilityReporter) attempt(ctx context.Context, notified bool) {
-	manifest := r.build()
+	manifest := r.wireForm(r.build())
 	if r.accepted != nil && reflect.DeepEqual(*r.accepted, manifest) {
 		r.clearRetry()
 		return
@@ -189,6 +235,15 @@ func (r *CapabilityReporter) attempt(ctx context.Context, notified bool) {
 		return
 	}
 	r.send(ctx, manifest)
+}
+
+// wireForm returns built, or its short form while the control plane has refused
+// exactly this content.
+func (r *CapabilityReporter) wireForm(built api.CapabilityManifestRequest) api.CapabilityManifestRequest {
+	if r.refused != nil && reflect.DeepEqual(*r.refused, built) {
+		return withoutHookMetadata(built)
+	}
+	return built
 }
 
 // deferToRetry reports whether a notification's attempt should send nothing and
@@ -214,13 +269,22 @@ func (r *CapabilityReporter) deferToRetry(manifest api.CapabilityManifestRequest
 	return r.retryArmed && r.attempted != nil && reflect.DeepEqual(*r.attempted, manifest)
 }
 
-// send makes one PUT of manifest and records the outcome.
+// send makes one PUT of manifest and records the outcome. A refusal of the
+// manifest's hook metadata adds the short form's PUT through fallBack.
 func (r *CapabilityReporter) send(ctx context.Context, manifest api.CapabilityManifestRequest) {
 	if err := r.client.UpdateCapabilities(ctx, r.nodeID, manifest); err != nil {
+		if api.IsHookMetadataRefused(err) && carriesHookMetadata(manifest) {
+			r.fallBack(ctx, manifest, err)
+			return
+		}
 		r.recordFailure(ctx, manifest, err)
 		return
 	}
 
+	if carriesHookMetadata(manifest) {
+		r.refused = nil
+		r.wideTimer.Stop()
+	}
 	r.accepted = &manifest
 	r.attempted = nil
 	r.holdUntil = time.Time{}
@@ -228,7 +292,32 @@ func (r *CapabilityReporter) send(ctx context.Context, manifest api.CapabilityMa
 	r.logger.InfoContext(ctx, "agent: capability report: accepted",
 		"declared_hooks", len(manifest.DeclaredHooks),
 		"plexd_hooks", len(manifest.PlexdHooks),
+		"hook_metadata", carriesHookMetadata(manifest),
 	)
+}
+
+// fallBack keeps the Node reporting after the control plane refused the hook
+// metadata in wide. The refusal is not a failure, so it does not grow the
+// backoff, record attempted, or arm a retry, and the short form leaves at once.
+// That form carries no metadata, so it cannot fall back twice, and a failure of
+// it takes the recordFailure path. A short form the control plane already holds
+// needs no PUT, so a sidecar edit alone costs one refused wide PUT, and the
+// retry state clears as it does when the short form is accepted.
+func (r *CapabilityReporter) fallBack(ctx context.Context, wide api.CapabilityManifestRequest, err error) {
+	r.refused = &wide
+	wait := r.jitter(r.wideRetry)
+	r.wideTimer.Reset(wait)
+	r.logger.WarnContext(ctx, "agent: capability report: hook metadata refused; sending names and digests",
+		"error", err,
+		"wide_retry_in", wait,
+	)
+
+	short := withoutHookMetadata(wide)
+	if r.accepted != nil && reflect.DeepEqual(*r.accepted, short) {
+		r.clearRetry()
+		return
+	}
+	r.send(ctx, short)
 }
 
 // recordFailure arms the retry for a failed send of manifest. A cancelled ctx is
@@ -291,6 +380,32 @@ func (r *CapabilityReporter) clearRetry() {
 	r.retry.Stop()
 	r.retryArmed = false
 	r.backoff = r.retryMin
+}
+
+// carriesHookMetadata reports whether any entry of manifest holds more than a
+// name and a checksum.
+func carriesHookMetadata(manifest api.CapabilityManifestRequest) bool {
+	for _, h := range manifest.DeclaredHooks {
+		if h.Description != "" || h.SandboxLevel != "" || h.TimeoutSeconds != 0 || len(h.Parameters) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutHookMetadata returns the short form of manifest. It builds a new
+// DeclaredHooks slice, so the manifest refused points at stays whole. It keeps
+// a nil slice nil, so a manifest with no hooks equals its short form.
+func withoutHookMetadata(manifest api.CapabilityManifestRequest) api.CapabilityManifestRequest {
+	if manifest.DeclaredHooks == nil {
+		return manifest
+	}
+	short := make([]api.DeclaredHook, len(manifest.DeclaredHooks))
+	for i, h := range manifest.DeclaredHooks {
+		short[i] = api.DeclaredHook{Name: h.Name, Checksum: h.Checksum}
+	}
+	manifest.DeclaredHooks = short
+	return manifest
 }
 
 // nextDelay returns how long to wait after a failed send: the jittered backoff,
