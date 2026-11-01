@@ -30,8 +30,9 @@ const (
 	// stay out of the way of what the test asserts.
 	capabilityNeverFires = time.Hour
 
-	capabilitySendFailed = "agent: capability report: send failed"
-	capabilityAccepted   = "agent: capability report: accepted"
+	capabilitySendFailed  = "agent: capability report: send failed"
+	capabilityAccepted    = "agent: capability report: accepted"
+	capabilityWideRefused = "agent: capability report: hook metadata refused; sending names and digests"
 )
 
 var (
@@ -43,6 +44,7 @@ var (
 	errCapabilityNetwork     = errors.New("dial tcp 198.51.100.1:443: connect: connection refused")
 	errCapabilityTimeout     = fmt.Errorf("put capabilities: %w", context.DeadlineExceeded)
 	errCapabilityTooMany     = &api.APIError{StatusCode: 400, Code: "declared_hooks_too_many", Message: "too many hooks"}
+	errCapabilityMalformed   = &api.APIError{StatusCode: 400, Code: "malformed_capabilities_request", Message: "unknown key"}
 )
 
 func capabilityManifest(digest string) api.CapabilityManifestRequest {
@@ -51,6 +53,19 @@ func capabilityManifest(digest string) api.CapabilityManifestRequest {
 		BinaryChecksum: "Y2hlY2tzdW0=",
 		DeclaredHooks:  []api.DeclaredHook{{Name: "hook", Checksum: digest}},
 	}
+}
+
+// wideManifest is capabilityManifest with all four metadata fields on its
+// entry, so its short form equals capabilityManifest(digest). Each call builds
+// a new slice, which keeps an expected value apart from what the reporter was
+// handed.
+func wideManifest(digest, description string) api.CapabilityManifestRequest {
+	m := capabilityManifest(digest)
+	m.DeclaredHooks[0].Description = description
+	m.DeclaredHooks[0].Parameters = []api.ActionParam{{Name: "target", Type: "string", Required: true, Description: "what to act on"}}
+	m.DeclaredHooks[0].TimeoutSeconds = 30
+	m.DeclaredHooks[0].SandboxLevel = "none"
+	return m
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +199,7 @@ func newCapabilityRig(errs ...error) *capabilityRig {
 	r.maxDelay = capabilityNeverFires
 	r.retryMin = capabilityNeverFires
 	r.retryMax = capabilityNeverFires
+	r.wideRetry = capabilityNeverFires
 	r.jitter = delays.jitter
 
 	return &capabilityRig{reporter: r, client: client, source: source, delays: delays, logs: logs}
@@ -289,6 +305,18 @@ func (rig *capabilityRig) assertPuts(t *testing.T, want ...api.CapabilityManifes
 	}
 }
 
+// assertNoAttemptFor fails the test if an attempt runs within d. A wide timer
+// that fires after acceptance finds an equal manifest and sends nothing, so
+// only the build count can show that it stayed silent.
+func (rig *capabilityRig) assertNoAttemptFor(t *testing.T, d time.Duration) {
+	t.Helper()
+	builds := rig.source.count()
+	time.Sleep(d)
+	if got := rig.source.count(); got != builds {
+		t.Errorf("builds = %d after %v, want %d: an attempt ran", got, d, builds)
+	}
+}
+
 // newFrozenClock returns a clock that reads testObservedAt until advanced, so a
 // hold is judged by the test and not by how long the test took.
 func newFrozenClock() *steppingClock {
@@ -318,6 +346,7 @@ func TestCapabilityReporter_ConstructorValues(t *testing.T) {
 		{"maxDelay", r.maxDelay, 10 * time.Second},
 		{"retryMin", r.retryMin, 5 * time.Second},
 		{"retryMax", r.retryMax, 5 * time.Minute},
+		{"wideRetry", r.wideRetry, 1 * time.Hour},
 	}
 	for _, d := range durations {
 		if d.got != d.want {
@@ -606,7 +635,7 @@ func TestCapabilityReporter_LogsAcceptedWithBothCounts(t *testing.T) {
 	stop()
 
 	line := logLine(t, rig.logs.String(), capabilityAccepted)
-	for _, want := range []string{"level=INFO", "component=capability-report", "declared_hooks=2", "plexd_hooks=1"} {
+	for _, want := range []string{"level=INFO", "component=capability-report", "declared_hooks=2", "plexd_hooks=1", "hook_metadata=false"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("accepted line %q lacks %q", line, want)
 		}
@@ -1132,6 +1161,547 @@ func TestCapabilityReporter_CredentialRefusedIsNotRecordedAsAttempted(t *testing
 	rig.waitPuts(t, 2)
 
 	rig.assertPuts(t, manifestA, manifestA)
+}
+
+// ---------------------------------------------------------------------------
+// Hook metadata fallback
+// ---------------------------------------------------------------------------
+
+func TestCapabilityReporter_WideAcceptedOnFirstPut(t *testing.T) {
+	const wideRetry = 5 * time.Millisecond
+	rig := newCapabilityRig()
+	rig.reporter.wideRetry = wideRetry
+	rig.source.set(wideManifest("digest-a", "one"))
+	stop := rig.run(t)
+
+	rig.waitPuts(t, 1)
+	rig.assertNoAttemptFor(t, 10*wideRetry)
+	stop()
+
+	rig.assertPuts(t, wideManifest("digest-a", "one"))
+	line := logLine(t, rig.logs.String(), capabilityAccepted)
+	if !strings.Contains(line, "hook_metadata=true") {
+		t.Errorf("accepted line %q lacks hook_metadata=true", line)
+	}
+}
+
+func TestCapabilityReporter_RefusalFallsBackToShort(t *testing.T) {
+	// The accepted short PUT resets retryArmed and the backoff by itself, so
+	// the recorded delays carry this test. wideRetry differs from retryMin so a
+	// backoff arm cannot pass for the wide arm, and retryMax sits above
+	// retryMin so a doubling would show.
+	const wideRetry = 2 * capabilityNeverFires
+	type refusal struct {
+		name string
+		err  error
+	}
+	tests := []refusal{
+		{name: "400 malformed_capabilities_request", err: errCapabilityMalformed},
+		{name: "400 declared_hook_invalid", err: &api.APIError{StatusCode: 400, Code: "declared_hook_invalid"}},
+		{name: "400 declared_hooks_too_many", err: errCapabilityTooMany},
+		{name: "413 capabilities_body_too_large", err: &api.APIError{StatusCode: 413, Code: "capabilities_body_too_large"}},
+		{name: "413 with no code", err: &api.APIError{StatusCode: 413}},
+		{name: "413 with a code plexd does not know", err: &api.APIError{StatusCode: 413, Code: "body_limit"}},
+	}
+	// The client wraps what it returns, so each refusal also arrives wrapped.
+	for _, tt := range tests {
+		tests = append(tests, refusal{name: "wrapped " + tt.name, err: fmt.Errorf("put capabilities: %w", tt.err)})
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rig := newCapabilityRig(tt.err)
+			rig.reporter.wideRetry = wideRetry
+			rig.reporter.retryMax = 8 * capabilityNeverFires
+			rig.source.set(wideManifest("digest-a", "one"))
+			stop := rig.run(t)
+
+			rig.waitPuts(t, 2)
+			stop()
+
+			rig.assertPuts(t, wideManifest("digest-a", "one"), manifestA)
+			if got, want := rig.delays.recorded(), []time.Duration{wideRetry}; !slices.Equal(got, want) {
+				t.Errorf("nominal delays = %v, want %v", got, want)
+			}
+			logs := rig.logs.String()
+			if got := countLogLines(logs, capabilitySendFailed); got != 0 {
+				t.Errorf("failure lines = %d, want 0; logs:\n%s", got, logs)
+			}
+
+			r := rig.reporter
+			if r.retryArmed {
+				t.Error("retry armed by a refusal that fell back")
+			}
+			if r.backoff != r.retryMin {
+				t.Errorf("backoff = %v, want %v", r.backoff, r.retryMin)
+			}
+			if want := wideManifest("digest-a", "one"); r.refused == nil || !reflect.DeepEqual(*r.refused, want) {
+				t.Errorf("refused = %+v, want the wide manifest", r.refused)
+			}
+			if r.accepted == nil || !reflect.DeepEqual(*r.accepted, manifestA) {
+				t.Errorf("accepted = %+v, want the short form", r.accepted)
+			}
+		})
+	}
+}
+
+func TestCapabilityReporter_FallbackLogs(t *testing.T) {
+	rig := newCapabilityRig(errCapabilityMalformed)
+	rig.reporter.wideRetry = 2 * capabilityNeverFires
+	rig.source.set(wideManifest("digest-a", "one"))
+	stop := rig.run(t)
+	rig.waitPuts(t, 2)
+	stop()
+
+	logs := rig.logs.String()
+	line := logLine(t, logs, capabilityWideRefused)
+	for _, want := range []string{"level=WARN", "component=capability-report", "error=", "malformed_capabilities_request", "wide_retry_in=2h0m0s"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("refused line %q lacks %q", line, want)
+		}
+	}
+	if line := logLine(t, logs, capabilityAccepted); !strings.Contains(line, "hook_metadata=false") {
+		t.Errorf("accepted line %q lacks hook_metadata=false", line)
+	}
+}
+
+// wideRetry stays at the rig's hour, so only the jittered delay can bring the
+// third PUT. The line reports the delay the timer really got.
+func TestCapabilityReporter_WideTimerTakesTheJitteredDelay(t *testing.T) {
+	rig := newCapabilityRig(errCapabilityMalformed)
+	rig.delays.actual = 7 * time.Millisecond
+	rig.source.set(wideManifest("digest-a", "one"))
+	stop := rig.run(t)
+
+	rig.waitPuts(t, 3)
+	stop()
+
+	line := logLine(t, rig.logs.String(), capabilityWideRefused)
+	if !strings.Contains(line, "wide_retry_in=7ms") {
+		t.Errorf("refused line %q lacks wide_retry_in=7ms", line)
+	}
+}
+
+func TestCapabilityReporter_RefusalWithoutMetadataTakesTheBackoff(t *testing.T) {
+	rig := newCapabilityRig(errCapabilityMalformed)
+	rig.reporter.wideRetry = 2 * capabilityNeverFires
+	rig.reporter.retryMax = 8 * capabilityNeverFires
+	stop := rig.run(t)
+	rig.waitPuts(t, 1)
+	rig.flush(t)
+	stop()
+
+	rig.assertPuts(t, manifestA)
+	if got, want := rig.delays.recorded(), []time.Duration{capabilityNeverFires}; !slices.Equal(got, want) {
+		t.Errorf("nominal delays = %v, want %v", got, want)
+	}
+	logs := rig.logs.String()
+	if got := countLogLines(logs, capabilitySendFailed); got != 1 {
+		t.Errorf("failure lines = %d, want 1; logs:\n%s", got, logs)
+	}
+	if got := countLogLines(logs, capabilityWideRefused); got != 0 {
+		t.Errorf("refused lines = %d, want 0; logs:\n%s", got, logs)
+	}
+
+	r := rig.reporter
+	if !r.retryArmed {
+		t.Error("no retry armed after an ordinary refusal")
+	}
+	if want := 2 * capabilityNeverFires; r.backoff != want {
+		t.Errorf("backoff = %v, want %v", r.backoff, want)
+	}
+	if r.refused != nil {
+		t.Errorf("refused = %+v, want nil", r.refused)
+	}
+}
+
+func TestCapabilityReporter_OtherRefusalKeepsRetryingWide(t *testing.T) {
+	rig := newCapabilityRig(&api.APIError{StatusCode: 400, Code: "binary_checksum_invalid"})
+	rig.reporter.retryMin = time.Millisecond
+	rig.reporter.retryMax = time.Millisecond
+	rig.source.set(wideManifest("digest-a", "one"))
+	rig.run(t)
+
+	rig.waitPuts(t, 2)
+	rig.flush(t)
+
+	rig.assertPuts(t, wideManifest("digest-a", "one"), wideManifest("digest-a", "one"))
+	if got, want := rig.delays.recorded(), []time.Duration{time.Millisecond}; !slices.Equal(got, want) {
+		t.Errorf("nominal delays = %v, want %v", got, want)
+	}
+	logs := rig.logs.String()
+	if got := countLogLines(logs, capabilitySendFailed); got != 1 {
+		t.Errorf("failure lines = %d, want 1; logs:\n%s", got, logs)
+	}
+	if got := countLogLines(logs, capabilityWideRefused); got != 0 {
+		t.Errorf("refused lines = %d, want 0; logs:\n%s", got, logs)
+	}
+}
+
+func TestCapabilityReporter_WideFailureKeepsRetryingWide(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "network error", err: errCapabilityNetwork},
+		{name: "503", err: errCapabilityUnavailable},
+		{name: "refused credential", err: api.ErrCredentialRefused},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rig := newCapabilityRig(tt.err)
+			rig.reporter.retryMin = time.Millisecond
+			rig.reporter.retryMax = time.Millisecond
+			rig.source.set(wideManifest("digest-a", "one"))
+			rig.run(t)
+
+			rig.waitPuts(t, 2)
+			rig.flush(t)
+
+			rig.assertPuts(t, wideManifest("digest-a", "one"), wideManifest("digest-a", "one"))
+			logs := rig.logs.String()
+			if got := countLogLines(logs, capabilityWideRefused); got != 0 {
+				t.Errorf("refused lines = %d, want 0; logs:\n%s", got, logs)
+			}
+		})
+	}
+}
+
+func TestCapabilityReporter_CancelledWidePutDoesNotFallBack(t *testing.T) {
+	rig := newCapabilityRig()
+	rig.client.block = true
+	rig.source.set(wideManifest("digest-a", "one"))
+	stop := rig.run(t)
+	rig.waitPuts(t, 1)
+
+	stop()
+
+	rig.assertPuts(t, wideManifest("digest-a", "one"))
+	logs := rig.logs.String()
+	for _, msg := range []string{capabilitySendFailed, capabilityWideRefused} {
+		if got := countLogLines(logs, msg); got != 0 {
+			t.Errorf("lines with %q = %d for a cancelled request, want 0; logs:\n%s", msg, got, logs)
+		}
+	}
+}
+
+func TestCapabilityReporter_NotifyAfterFallbackSendsNothing(t *testing.T) {
+	rig := newCapabilityRig(errCapabilityMalformed)
+	rig.source.set(wideManifest("digest-a", "one"))
+	rig.run(t)
+	rig.waitPuts(t, 2)
+
+	builds := rig.source.count()
+	rig.notifyAndSettle(t)
+
+	if got := rig.source.count(); got <= builds {
+		t.Fatalf("builds = %d, want more than %d: the attempt never ran", got, builds)
+	}
+	rig.assertPuts(t, wideManifest("digest-a", "one"), manifestA)
+}
+
+func TestCapabilityReporter_DescriptionChangeAfterFallback(t *testing.T) {
+	const wideRetry = 2 * capabilityNeverFires
+	rig := newCapabilityRig(errCapabilityMalformed, nil, errCapabilityMalformed)
+	rig.reporter.wideRetry = wideRetry
+	rig.source.set(wideManifest("digest-a", "one"))
+	rig.run(t)
+	rig.waitPuts(t, 2)
+
+	rig.source.set(wideManifest("digest-a", "two"))
+	rig.reporter.Notify()
+	rig.waitPuts(t, 3)
+	rig.flush(t)
+
+	// The short form of the new content is what the control plane holds.
+	rig.assertPuts(t, wideManifest("digest-a", "one"), manifestA, wideManifest("digest-a", "two"))
+	want := []time.Duration{wideRetry, wideRetry}
+	if got := rig.delays.recorded(); !slices.Equal(got, want) {
+		t.Errorf("nominal delays = %v, want %v", got, want)
+	}
+}
+
+// The first refusal arms the timer for an hour, so only the second refusal's arm
+// can bring the fourth PUT.
+func TestCapabilityReporter_LaterRefusalRearmsTheWideTimer(t *testing.T) {
+	rig := newCapabilityRig(errCapabilityMalformed, nil, errCapabilityMalformed)
+	rig.client.onCall = func(n int) {
+		if n == 1 {
+			rig.delays.mu.Lock()
+			rig.delays.actual = 5 * time.Millisecond
+			rig.delays.mu.Unlock()
+			rig.source.set(wideManifest("digest-a", "two"))
+			rig.reporter.Notify()
+		}
+	}
+	rig.source.set(wideManifest("digest-a", "one"))
+	rig.run(t)
+
+	rig.waitPuts(t, 4)
+	rig.flush(t)
+
+	two := wideManifest("digest-a", "two")
+	rig.assertPuts(t, wideManifest("digest-a", "one"), manifestA, two, two)
+}
+
+// A failure of the new content grew the backoff, and the refusal that follows
+// needs no PUT, because the control plane already holds its short form. stop
+// comes before the read, not flush: a further attempt would clear the backoff
+// on its own.
+func TestCapabilityReporter_HeldShortFormClearsTheRetry(t *testing.T) {
+	const retryMin = time.Millisecond
+	rig := newCapabilityRig(errCapabilityMalformed, nil, &api.APIError{StatusCode: 429}, errCapabilityMalformed)
+	rig.reporter.retryMin = retryMin
+	rig.reporter.retryMax = 8 * retryMin
+	rig.source.set(wideManifest("digest-a", "one"))
+	stop := rig.run(t)
+	rig.waitPuts(t, 2)
+
+	rig.source.set(wideManifest("digest-a", "two"))
+	rig.reporter.Notify()
+	rig.waitPuts(t, 4)
+	stop()
+
+	two := wideManifest("digest-a", "two")
+	rig.assertPuts(t, wideManifest("digest-a", "one"), manifestA, two, two)
+	if got := rig.reporter.backoff; got != retryMin {
+		t.Errorf("backoff = %v, want %v", got, retryMin)
+	}
+}
+
+func TestCapabilityReporter_ChecksumChangeAfterFallback(t *testing.T) {
+	rig := newCapabilityRig(errCapabilityMalformed, nil, errCapabilityMalformed)
+	rig.source.set(wideManifest("digest-a", "one"))
+	rig.run(t)
+	rig.waitPuts(t, 2)
+
+	rig.source.set(wideManifest("digest-b", "one"))
+	rig.reporter.Notify()
+	rig.waitPuts(t, 4)
+	rig.flush(t)
+
+	rig.assertPuts(t, wideManifest("digest-a", "one"), manifestA, wideManifest("digest-b", "one"), manifestB)
+}
+
+func TestCapabilityReporter_ChangedWideAcceptedAfterFallback(t *testing.T) {
+	const wideRetry = 40 * time.Millisecond
+	rig := newCapabilityRig(errCapabilityMalformed)
+	rig.reporter.wideRetry = wideRetry
+	rig.client.onCall = func(n int) {
+		if n == 1 {
+			rig.source.set(wideManifest("digest-a", "two"))
+			rig.reporter.Notify()
+		}
+	}
+	rig.source.set(wideManifest("digest-a", "one"))
+	stop := rig.run(t)
+
+	rig.waitPuts(t, 3)
+	rig.flush(t)
+	rig.assertNoAttemptFor(t, 2*wideRetry)
+	stop()
+
+	rig.assertPuts(t, wideManifest("digest-a", "one"), manifestA, wideManifest("digest-a", "two"))
+	if rig.reporter.refused != nil {
+		t.Errorf("refused = %+v, want nil", rig.reporter.refused)
+	}
+}
+
+func TestCapabilityReporter_WideTimerStillRefused(t *testing.T) {
+	const wideRetry = time.Millisecond
+	// Past this list the fake accepts, which ends the run with a fifth PUT.
+	rig := newCapabilityRig(errCapabilityMalformed, nil, errCapabilityMalformed, errCapabilityMalformed)
+	rig.reporter.wideRetry = wideRetry
+	rig.source.set(wideManifest("digest-a", "one"))
+	stop := rig.run(t)
+
+	rig.waitPuts(t, 5)
+	stop()
+
+	wide := wideManifest("digest-a", "one")
+	rig.assertPuts(t, wide, manifestA, wide, wide, wide)
+	want := []time.Duration{wideRetry, wideRetry, wideRetry}
+	if got := rig.delays.recorded(); !slices.Equal(got, want) {
+		t.Errorf("nominal delays = %v, want %v", got, want)
+	}
+	if got := countLogLines(rig.logs.String(), capabilityWideRefused); got != 3 {
+		t.Errorf("refused lines = %d, want 3", got)
+	}
+}
+
+func TestCapabilityReporter_WideTimerAccepted(t *testing.T) {
+	const wideRetry = 5 * time.Millisecond
+	rig := newCapabilityRig(errCapabilityMalformed)
+	rig.reporter.wideRetry = wideRetry
+	rig.source.set(wideManifest("digest-a", "one"))
+	stop := rig.run(t)
+
+	rig.waitPuts(t, 3)
+	rig.assertNoAttemptFor(t, 10*wideRetry)
+	stop()
+
+	rig.assertPuts(t, wideManifest("digest-a", "one"), manifestA, wideManifest("digest-a", "one"))
+	if got, want := rig.delays.recorded(), []time.Duration{wideRetry}; !slices.Equal(got, want) {
+		t.Errorf("nominal delays = %v, want %v", got, want)
+	}
+	if got := countLogLines(rig.logs.String(), capabilityAccepted); got != 2 {
+		t.Errorf("accepted lines = %d, want 2", got)
+	}
+	if rig.reporter.refused != nil {
+		t.Errorf("refused = %+v, want nil", rig.reporter.refused)
+	}
+}
+
+func TestCapabilityReporter_WideTimerRespectsTheHold(t *testing.T) {
+	const hold = 150 * time.Millisecond
+	rig := newCapabilityRig(errCapabilityMalformed, &api.APIError{StatusCode: 429, RetryAfter: hold})
+	rig.reporter.now = newFrozenClock().now
+	rig.reporter.retryMin = time.Millisecond
+	rig.reporter.retryMax = time.Millisecond
+	rig.reporter.wideRetry = time.Millisecond
+	rig.source.set(wideManifest("digest-a", "one"))
+	rig.run(t)
+
+	// The second build is the wide timer's attempt, which the hold keeps off
+	// the wire. It clears refused, so the retry that ends the hold carries wide.
+	rig.waitBuilds(t, 2)
+	rig.waitPuts(t, 3)
+	rig.flush(t)
+
+	rig.assertPuts(t, wideManifest("digest-a", "one"), manifestA, wideManifest("digest-a", "one"))
+	_, sentAt := rig.client.recorded()
+	if gap := sentAt[2].Sub(sentAt[1]); gap < hold {
+		t.Errorf("wide form went out %v after the 429, want at least the hold %v", gap, hold)
+	}
+}
+
+func TestCapabilityReporter_ShortFailureRetriesShort(t *testing.T) {
+	const retryMin = time.Millisecond
+	rig := newCapabilityRig(errCapabilityMalformed, errCapabilityUnavailable)
+	rig.reporter.retryMin = retryMin
+	rig.reporter.retryMax = 8 * retryMin
+	rig.source.set(wideManifest("digest-a", "one"))
+	rig.run(t)
+
+	rig.waitPuts(t, 3)
+	rig.flush(t)
+
+	rig.assertPuts(t, wideManifest("digest-a", "one"), manifestA, manifestA)
+
+	// retryMin on the second delay shows the refusal left the backoff alone.
+	want := []time.Duration{capabilityNeverFires, retryMin}
+	if got := rig.delays.recorded(); !slices.Equal(got, want) {
+		t.Errorf("nominal delays = %v, want %v", got, want)
+	}
+}
+
+func TestCapabilityReporter_WideTimerFailureRetriesWide(t *testing.T) {
+	wide := wideManifest("digest-a", "one")
+	tests := []struct {
+		name string
+		errs []error
+		want []api.CapabilityManifestRequest
+	}{
+		{
+			name: "until accepted",
+			errs: []error{errCapabilityMalformed, nil, errCapabilityUnavailable},
+			want: []api.CapabilityManifestRequest{wide, manifestA, wide, wide},
+		},
+		{
+			// The 503 cleared accepted, so the short form goes out again, and
+			// the re-armed timer then finds a control plane that accepts.
+			name: "until refused",
+			errs: []error{errCapabilityMalformed, nil, errCapabilityUnavailable, errCapabilityMalformed},
+			want: []api.CapabilityManifestRequest{wide, manifestA, wide, wide, manifestA, wide},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rig := newCapabilityRig(tt.errs...)
+			rig.reporter.retryMin = time.Millisecond
+			rig.reporter.retryMax = time.Millisecond
+			rig.reporter.wideRetry = time.Millisecond
+			rig.source.set(wideManifest("digest-a", "one"))
+			rig.run(t)
+
+			rig.waitPuts(t, len(tt.want))
+			rig.flush(t)
+
+			rig.assertPuts(t, tt.want...)
+		})
+	}
+}
+
+func TestCapabilityReporter_MetadataRemovedAfterFallback(t *testing.T) {
+	rig := newCapabilityRig(errCapabilityMalformed)
+	rig.reporter.wideRetry = 5 * time.Millisecond
+	rig.client.onCall = func(n int) {
+		if n == 1 {
+			rig.source.set(manifestA)
+			rig.reporter.Notify()
+		}
+	}
+	rig.source.set(wideManifest("digest-a", "one"))
+	rig.run(t)
+
+	// The boot, the notification and the wide timer, the last two in either
+	// order. Each of those two finds the built manifest equal to the accepted
+	// one.
+	rig.waitBuilds(t, 3)
+	rig.flush(t)
+
+	rig.assertPuts(t, wideManifest("digest-a", "one"), manifestA)
+}
+
+func TestCapabilityReporter_CarriesHookMetadata(t *testing.T) {
+	plain := api.DeclaredHook{Name: "a", Checksum: "x"}
+	tests := []struct {
+		name  string
+		hooks []api.DeclaredHook
+		want  bool
+	}{
+		{name: "no hooks", hooks: nil, want: false},
+		{name: "name and checksum", hooks: []api.DeclaredHook{plain}, want: false},
+		{name: "empty parameters", hooks: []api.DeclaredHook{{Name: "a", Checksum: "x", Parameters: []api.ActionParam{}}}, want: false},
+		{name: "description", hooks: []api.DeclaredHook{{Name: "a", Checksum: "x", Description: "d"}}, want: true},
+		{name: "parameters", hooks: []api.DeclaredHook{{Name: "a", Checksum: "x", Parameters: []api.ActionParam{{Name: "p"}}}}, want: true},
+		{name: "timeout", hooks: []api.DeclaredHook{{Name: "a", Checksum: "x", TimeoutSeconds: 1}}, want: true},
+		{name: "sandbox level", hooks: []api.DeclaredHook{{Name: "a", Checksum: "x", SandboxLevel: "none"}}, want: true},
+		{name: "a later entry", hooks: []api.DeclaredHook{plain, {Name: "b", Checksum: "y", Description: "d"}}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := carriesHookMetadata(api.CapabilityManifestRequest{DeclaredHooks: tt.hooks})
+			if got != tt.want {
+				t.Errorf("carriesHookMetadata(%+v) = %v, want %v", tt.hooks, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCapabilityReporter_WithoutHookMetadataLeavesTheOriginalWhole(t *testing.T) {
+	// Only the entries change, so everything else goes out as built.
+	withTheRest := func(m api.CapabilityManifestRequest) api.CapabilityManifestRequest {
+		m.SSHHostKeyFingerprint = "SHA256:abc"
+		m.PlexdHooks = []api.DiscoveredPlexdHook{{Name: "p", ImageDigest: "sha256:0"}}
+		m.BuiltinActions = []api.ActionInfo{{Name: "a", Description: "d"}}
+		return m
+	}
+	wide := withTheRest(wideManifest("digest-a", "one"))
+
+	got := withoutHookMetadata(wide)
+
+	if want := withTheRest(capabilityManifest("digest-a")); !reflect.DeepEqual(got, want) {
+		t.Errorf("withoutHookMetadata() = %+v, want %+v", got, want)
+	}
+	if whole := withTheRest(wideManifest("digest-a", "one")); !reflect.DeepEqual(wide, whole) {
+		t.Errorf("the original became %+v, want %+v", wide, whole)
+	}
+}
+
+func TestCapabilityReporter_WithoutHookMetadataKeepsANilSliceNil(t *testing.T) {
+	if got := withoutHookMetadata(api.CapabilityManifestRequest{}); got.DeclaredHooks != nil {
+		t.Errorf("DeclaredHooks = %+v, want nil", got.DeclaredHooks)
+	}
 }
 
 // ---------------------------------------------------------------------------
