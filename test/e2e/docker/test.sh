@@ -28,7 +28,9 @@
 #   - Key rotation completes end to end via RotateKeys flag
 #   - Deeper body validation (metrics, audit, logs, capabilities fields)
 #   - Capability manifest kept current: a hook added, changed, touched, reloaded
-#     and removed in the running container, and a failed PUT retried
+#     and removed in the running container, a sidecar's metadata reported, the
+#     short entry sent to a control plane that refuses metadata, and a failed
+#     PUT retried
 #   - Pull-only delivery under a descoped event bus (quiet SSE re-probing)
 #   - Last-Event-ID resume replays buffered envelopes after a descope window
 #   - release-verdict upgrade flow (checksum + offline Sigstore verification)
@@ -3321,10 +3323,12 @@ assert_ingest_reject "metrics_missing_sent_at" 400 ingest_sent_at_invalid \
 
 # 10f. The manifest follows the hooks directory while the agent runs. Phase 3c
 # and step 10c read what a boot reports. This step changes the directory in the
-# running container and reads each change back from the mock. The changes run in
-# order, and each waits for its PUT, so that no count below catches the PUT of
-# the change before it. Only the step's own hook is written: e2e-bigout gets a
-# touch and keeps its digest.
+# running container and reads each change back from the mock. The numbered
+# checks run in order, and each waits for its last PUT, so that no count below
+# catches a PUT of the check before it. Checks (7) and (8) each make two changes
+# with one wait: a hook and its sidecar land in one PUT or in two. Only the
+# step's own hook and its sidecar are written: e2e-bigout gets a touch and keeps
+# its digest.
 LIVE_HOOKS_DIR="/etc/plexd/hooks"
 
 # live_hook_text prints the script a test hook holds. Args: <marker>. Each marker
@@ -3339,6 +3343,13 @@ live_hook_text() {
 install_live_hook() {
     live_hook_text "$2" | dc exec -T plexd /bin/busybox sh -c \
         "/bin/busybox cat > ${LIVE_HOOKS_DIR}/$1 && /bin/busybox chmod 0755 ${LIVE_HOOKS_DIR}/$1"
+}
+
+# install_live_sidecar writes a hook's sidecar into the running container. Args:
+# <hook> <json>. The JSON travels over stdin, so its quotes never reach a shell.
+install_live_sidecar() {
+    printf '%s\n' "$2" | dc exec -T plexd /bin/busybox sh -c \
+        "/bin/busybox cat > ${LIVE_HOOKS_DIR}/$1.json"
 }
 
 # wait_for_declared_hooks polls the captured manifest for up to 10 seconds, until
@@ -3361,6 +3372,43 @@ wait_for_declared_hooks() {
         sleep 1
         elapsed=$((elapsed + 1))
     done
+}
+
+# wait_for_hook_entry polls the captured manifest for up to 10 seconds, until a
+# jq filter holds on one hook's declared_hooks entry. Args: <step> <hook> <jq
+# filter>. A hook the manifest does not list never holds: select gives jq no
+# output, and -e exits 4. The mock captures a refused PUT too, so a pass here
+# says what the agent sent, not that the mock accepted it.
+wait_for_hook_entry() {
+    local step=$1 hook=$2 filter=$3
+    local elapsed=0 body
+    while :; do
+        body=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
+        if printf '%s' "${body}" | jq -e --arg name "${hook}" \
+            ".declared_hooks[]? | select(.name == \$name) | ${filter}" >/dev/null 2>&1; then
+            echo "  PASS: [${step}] ${hook} holds ${filter}, after ${elapsed}s"
+            return 0
+        fi
+        if [ "${elapsed}" -ge 10 ]; then
+            fail "[${step}] the ${hook} entry did not reach ${filter} within 10s (body: ${body})"
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+}
+
+# configure_capabilities posts to POST /test/configure-capabilities and requires
+# a 204: a refusal the test believes it armed or lifted would void the check.
+# Args: <step> <json>. One POST sets every setting, so a field left out resets.
+configure_capabilities() {
+    local step=$1 body=$2 status
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${body}" \
+        "http://localhost:18080/test/configure-capabilities" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${step}] configure-capabilities returned status ${status}, want 204"
+    fi
 }
 
 # (1) A hook watch that could not start leaves the agent running on its boot
@@ -3432,7 +3480,92 @@ dc exec -T plexd /bin/busybox rm "${LIVE_HOOKS_DIR}/e2e-live" \
     || fail "[reload] could not remove e2e-live from the container"
 wait_for_declared_hooks "reload cleanup" "e2e-bigout"
 
-# (7) Failed PUT: the restarted agent's boot PUT and its first retry both meet a
+# (7) Sidecar: its four fields reach the control plane, an edit moves them and
+# leaves the digest alone, and its removal leaves the short entry. The hook and
+# the sidecar share one debounce key, so they land in one PUT or in two, and
+# either way the last PUT carries the metadata. The marker is not four, because
+# (8) rewrites the hook and its waits need a digest that is new.
+LIVE_HEX=$(live_hook_text sidecar | sha256_hex)
+install_live_hook e2e-live sidecar || fail "[sidecar] could not write e2e-live into the container"
+install_live_sidecar e2e-live '{"description":"live one","parameters":[{"name":"target","type":"string","required":true}],"timeout":"90s","sandbox":"none"}' \
+    || fail "[sidecar] could not write e2e-live.json into the container"
+wait_for_hook_entry "sidecar" e2e-live \
+    '.description == "live one" and .parameters[0].name == "target" and .parameters[0].required and .timeout_seconds == 90 and .sandbox_level == "none"'
+
+install_live_sidecar e2e-live '{"description":"live two"}' \
+    || fail "[sidecar edit] could not rewrite e2e-live.json in the container"
+wait_for_hook_entry "sidecar edit" e2e-live '.description == "live two"'
+CAPS_BODY=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
+CAPS_HOOK_HEX=$(declared_hook_hex "${CAPS_BODY}" e2e-live)
+if [ "${CAPS_HOOK_HEX}" = "${LIVE_HEX}" ]; then
+    echo "  PASS: [sidecar edit] the digest of e2e-live did not move"
+else
+    fail "[sidecar edit] digest of e2e-live = ${CAPS_HOOK_HEX}, want ${LIVE_HEX}"
+fi
+
+# The body before this carries a description, so the filter cannot pass on it.
+dc exec -T plexd /bin/busybox rm "${LIVE_HOOKS_DIR}/e2e-live.json" \
+    || fail "[sidecar removed] could not remove e2e-live.json from the container"
+wait_for_hook_entry "sidecar removed" e2e-live 'keys == ["checksum", "name"]'
+
+# (8) Older control plane: a refused manifest still lands, short and with the
+# new digest, and the metadata comes back with no restart once the refusal
+# lifts. dc logs spans every run of the container, so the refusals count from a
+# baseline.
+REFUSED_LINE="hook metadata refused"
+PLEXD_LOGS=$(dc logs plexd 2>&1) || fail "dc logs plexd failed: ${PLEXD_LOGS}"
+REFUSED_BEFORE=$(count_log_lines "${PLEXD_LOGS}" "${REFUSED_LINE}")
+configure_capabilities "older control plane" '{"refuse_hook_metadata": true}'
+CAPS_BEFORE_SHORT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "capabilities_count")
+
+# The sidecar goes first. A hook rewritten first, with the sidecar more than a
+# quiet period behind it, is a short PUT the mock accepts: both waits below pass
+# on that body and the count reads before any refusal. With the sidecar first,
+# the new digest goes out wide, so a refusal comes before the short PUT.
+LIVE_HEX=$(live_hook_text four | sha256_hex)
+install_live_sidecar e2e-live '{"description":"live three"}' \
+    || fail "[older control plane] could not write e2e-live.json into the container"
+install_live_hook e2e-live four || fail "[older control plane] could not rewrite e2e-live in the container"
+# The digest wait goes first. The keys filter alone passes on the short body (7)
+# left, and the digest alone passes on the refused wide body, which the mock
+# captures too. Only the short PUT of the new digest passes both, in this order.
+wait_for_declared_hooks "older control plane" "e2e-bigout,e2e-live" e2e-live "${LIVE_HEX}"
+wait_for_hook_entry "older control plane" e2e-live 'keys == ["checksum", "name"]'
+PLEXD_LOGS=$(dc logs plexd 2>&1) || fail "dc logs plexd failed: ${PLEXD_LOGS}"
+REFUSED_AFTER=$(count_log_lines "${PLEXD_LOGS}" "${REFUSED_LINE}")
+if [ "${REFUSED_AFTER}" -gt "${REFUSED_BEFORE}" ]; then
+    echo "  PASS: [older control plane] plexd logged '${REFUSED_LINE}' (${REFUSED_BEFORE} -> ${REFUSED_AFTER})"
+else
+    fail "[older control plane] plexd logged no new '${REFUSED_LINE}' line (${REFUSED_BEFORE} -> ${REFUSED_AFTER})"
+fi
+# The mock captures a refused body too, so the waits do not show that the short
+# manifest landed. The counter moves only on acceptance, and while the refusal
+# stands only a short manifest can move it.
+CAPS_AFTER_SHORT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "capabilities_count")
+if [ "${CAPS_AFTER_SHORT}" -gt "${CAPS_BEFORE_SHORT}" ]; then
+    echo "  PASS: [older control plane] the short manifest landed (capabilities_count ${CAPS_BEFORE_SHORT} -> ${CAPS_AFTER_SHORT})"
+else
+    fail "[older control plane] capabilities_count stayed at ${CAPS_BEFORE_SHORT}: the short manifest was not accepted"
+fi
+
+# The same goes for the wide manifest here.
+configure_capabilities "upgraded control plane" '{"refuse_hook_metadata": false}'
+CAPS_BEFORE_LIFT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "capabilities_count")
+install_live_sidecar e2e-live '{"description":"live four"}' \
+    || fail "[upgraded control plane] could not rewrite e2e-live.json in the container"
+wait_for_hook_entry "upgraded control plane" e2e-live '.description == "live four"'
+CAPS_AFTER_LIFT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "capabilities_count")
+if [ "${CAPS_AFTER_LIFT}" -gt "${CAPS_BEFORE_LIFT}" ]; then
+    echo "  PASS: [upgraded control plane] the wide manifest landed with no restart (capabilities_count ${CAPS_BEFORE_LIFT} -> ${CAPS_AFTER_LIFT})"
+else
+    fail "[upgraded control plane] capabilities_count stayed at ${CAPS_BEFORE_LIFT}: the wide manifest was not accepted"
+fi
+
+dc exec -T plexd /bin/busybox rm "${LIVE_HOOKS_DIR}/e2e-live.json" "${LIVE_HOOKS_DIR}/e2e-live" \
+    || fail "[older control plane] could not remove e2e-live and its sidecar from the container"
+wait_for_declared_hooks "older control plane cleanup" "e2e-bigout"
+
+# (9) Failed PUT: the restarted agent's boot PUT and its first retry both meet a
 # 500, and the second retry lands. The retries wait about 5 and 10 seconds. The
 # mock answers the 500 ahead of its counter, so capabilities_count moves only on
 # delivery, which also proves the agent is back for phase 12. dc logs spans every
@@ -3440,13 +3573,7 @@ wait_for_declared_hooks "reload cleanup" "e2e-bigout"
 SEND_FAILED_LINE="agent: capability report: send failed"
 PLEXD_LOGS=$(dc logs plexd 2>&1) || fail "dc logs plexd failed: ${PLEXD_LOGS}"
 SEND_FAILED_BEFORE=$(count_log_lines "${PLEXD_LOGS}" "${SEND_FAILED_LINE}")
-FAIL_NEXT_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
-    -X POST -H "Content-Type: application/json" \
-    -d '{"fail_next": 2}' \
-    "http://localhost:18080/test/configure-capabilities" 2>/dev/null || true)
-if [ "${FAIL_NEXT_STATUS}" != "204" ]; then
-    fail "configure-capabilities returned status ${FAIL_NEXT_STATUS}, want 204"
-fi
+configure_capabilities "failed PUT" '{"fail_next": 2}'
 CAPS_BEFORE_RESTART=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "capabilities_count")
 dc restart plexd
 RETRY_TIMEOUT=30
@@ -3474,6 +3601,8 @@ fi
 # The container layer survives a restart, and the manifest that landed is the
 # one the failed sends carried.
 wait_for_declared_hooks "failed PUT" "e2e-bigout"
+# e2e-bigout has no sidecar, so its entry stays short across the restart.
+wait_for_hook_entry "failed PUT" e2e-bigout 'keys == ["checksum", "name"]'
 
 echo "=== Phase 10 PASSED: deeper body validation ==="
 
