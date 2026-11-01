@@ -898,3 +898,44 @@ func TestIsSecretAccessRevoked(t *testing.T) {
 		})
 	}
 }
+
+func TestIsHookMetadataRefused(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"400 malformed_capabilities_request", &APIError{StatusCode: 400, Code: "malformed_capabilities_request"}, true},
+		{"400 declared_hook_invalid", &APIError{StatusCode: 400, Code: "declared_hook_invalid"}, true},
+		{"400 declared_hooks_too_many", &APIError{StatusCode: 400, Code: "declared_hooks_too_many"}, true},
+		{"413 capabilities_body_too_large", &APIError{StatusCode: 413, Code: "capabilities_body_too_large"}, true},
+		{"413 without a code", &APIError{StatusCode: 413}, true},
+		{"413 with a code plexd does not know", &APIError{StatusCode: 413, Code: "body_limit"}, true},
+		{"wrapped 400 malformed_capabilities_request", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 400, Code: "malformed_capabilities_request"}), true},
+		{"wrapped 400 declared_hook_invalid", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 400, Code: "declared_hook_invalid"}), true},
+		{"wrapped 400 declared_hooks_too_many", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 400, Code: "declared_hooks_too_many"}), true},
+		{"wrapped 413 capabilities_body_too_large", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 413, Code: "capabilities_body_too_large"}), true},
+		{"wrapped 413 without a code", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 413}), true},
+		{"wrapped 413 with a code plexd does not know", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 413, Code: "body_limit"}), true},
+		// The short entry would draw each of these again, or the failure says
+		// nothing about the metadata, so the manifest keeps its wide form.
+		{"nil", nil, false},
+		{"deadline exceeded", context.DeadlineExceeded, false},
+		{"refused credential", ErrCredentialRefused, false},
+		{"non-API error", errors.New("dial tcp: connection refused"), false},
+		{"400 binary_checksum_invalid", &APIError{StatusCode: 400, Code: "binary_checksum_invalid"}, false},
+		{"400 without a code", &APIError{StatusCode: 400}, false},
+		{"401", &APIError{StatusCode: 401}, false},
+		{"422 plexd_hook_invalid", &APIError{StatusCode: 422, Code: "plexd_hook_invalid"}, false},
+		{"422 with a code that refuses on a 400", &APIError{StatusCode: 422, Code: "declared_hook_invalid"}, false},
+		{"429", &APIError{StatusCode: 429}, false},
+		{"500", &APIError{StatusCode: 500}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsHookMetadataRefused(tt.err); got != tt.want {
+				t.Errorf("IsHookMetadataRefused(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}

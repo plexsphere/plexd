@@ -2523,3 +2523,53 @@ func TestDiscoveredPlexdHook_WireShape(t *testing.T) {
 		t.Errorf("parameters = %s, want a string map", got)
 	}
 }
+
+// requireEqual cannot see a key renamed on both sides, so the exact bytes pin
+// the four keys the contract names.
+func TestDeclaredHook_JSONRoundTrip(t *testing.T) {
+	orig := DeclaredHook{
+		Name:        "post-install",
+		Checksum:    testDigestB64,
+		Description: "Runs after install",
+		Parameters: []ActionParam{
+			{Name: "target", Type: "string", Required: true, Default: "/srv", Description: "Where to install"},
+			{Name: "force", Type: "bool", Description: "Overwrite what is there"},
+		},
+		TimeoutSeconds: 90,
+		SandboxLevel:   "none",
+	}
+	data, got := roundTrip(t, orig)
+	requireEqual(t, orig, got)
+
+	want := `{"name":"post-install","checksum":"` + testDigestB64 + `",` +
+		`"description":"Runs after install",` +
+		`"parameters":[` +
+		`{"name":"target","type":"string","required":true,"default":"/srv","description":"Where to install"},` +
+		`{"name":"force","type":"bool","required":false,"description":"Overwrite what is there"}],` +
+		`"timeout_seconds":90,"sandbox_level":"none"}`
+	if string(data) != want {
+		t.Errorf("entry = %s, want %s", data, want)
+	}
+}
+
+// A hook with no metadata stays on the wire as the short entry, which every
+// control plane accepts. An empty parameter list counts as none.
+func TestDeclaredHook_OmitsEmptyMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hook DeclaredHook
+	}{
+		{name: "nil parameters", hook: DeclaredHook{Name: "post-install", Checksum: testDigestB64}},
+		{name: "empty parameters", hook: DeclaredHook{Name: "post-install", Checksum: testDigestB64, Parameters: []ActionParam{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(tc.hook)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if want := `{"name":"post-install","checksum":"` + testDigestB64 + `"}`; string(data) != want {
+				t.Errorf("entry = %s, want %s", data, want)
+			}
+		})
+	}
+}

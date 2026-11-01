@@ -465,6 +465,57 @@ func TestUpdateCapabilities_OmitsEmptyOptionalFields(t *testing.T) {
 	}
 }
 
+// The reporter falls back to the short entry on the 413, so the client must
+// surface it even though the server stops reading long before the upload ends.
+// net/http reports a write error instead when one arrives ahead of the
+// response, and the reporter would then keep retrying the wide form. The server
+// here reads the body the way the control plane's handler does. The manifest is
+// far past what socket buffers hold, so the client is still writing when the
+// server answers.
+func TestUpdateCapabilities_OverBudgetSurfacesThe413(t *testing.T) {
+	const budget = 1 << 20
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, budget)
+		var caps CapabilityManifestRequest
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		err := dec.Decode(&caps)
+		var maxErr *http.MaxBytesError
+		if !errors.As(err, &maxErr) {
+			t.Errorf("decode = %v, want a *http.MaxBytesError", err)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = io.WriteString(w, `{"title":"Capabilities Body Too Large","code":"capabilities_body_too_large"}`)
+	})
+
+	err := client.UpdateCapabilities(context.Background(), "n1", CapabilityManifestRequest{
+		BinaryVersion:  "v1.2.3",
+		BinaryChecksum: testDigestB64,
+		DeclaredHooks: []DeclaredHook{{
+			Name:        "post-install",
+			Checksum:    testDigestB64,
+			Description: strings.Repeat("x", 16<<20),
+		}},
+	})
+
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("UpdateCapabilities = %v, want a 413", err)
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("UpdateCapabilities = %T, want an *APIError", err)
+	}
+	if apiErr.Code != "capabilities_body_too_large" {
+		t.Errorf("Code = %q, want %q", apiErr.Code, "capabilities_body_too_large")
+	}
+	if !IsHookMetadataRefused(err) {
+		t.Errorf("IsHookMetadataRefused(%v) = false, want true", err)
+	}
+}
+
 func TestReportEndpoint_Success(t *testing.T) {
 	reportedAt := time.Now().UTC().Truncate(time.Second)
 	acceptedAt := reportedAt.Add(time.Second)
