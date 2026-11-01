@@ -38,6 +38,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 
@@ -120,6 +121,7 @@ type Server struct {
 	keyRotateCount                 atomic.Int64
 	capabilitiesCount              atomic.Int64
 	capabilitiesFailNext           atomic.Int64
+	capabilitiesRefuseMetadata     atomic.Bool
 	endpointCount                  atomic.Int64
 	endpointCandidatesCount        atomic.Int64
 	secretsCount                   atomic.Int64
@@ -1175,21 +1177,40 @@ func (s *Server) handleKeyRotate(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCapabilities handles PUT /v1/nodes/{id}/capabilities, the capability
-// manifest. It strict-decodes the contract's envelope and enforces its
+// manifest. A body past 1 MiB is refused with 413 capabilities_body_too_large.
+// Up to that cap it strict-decodes the contract's envelope and enforces its
 // invariants: a non-empty binary_version, a binary_checksum that decodes to
 // exactly 32 bytes, a canonical ssh_host_key_fingerprint when present, and
-// declared_hooks that are unique, named, and carry a 32-byte digest, each
-// refused with 400. The two advertised inventories, plexd_hooks and
-// builtin_actions, are refused with 422 when an entry breaks one of theirs
-// (see checkPlexdHooks and checkBuiltinActions).
+// declared_hooks that are unique, carry a name with no NUL and a 32-byte
+// digest, and keep their metadata inside its limits (see
+// checkDeclaredHookMetadata), each refused with 400. The two advertised
+// inventories, plexd_hooks and builtin_actions, are refused with 422 when an
+// entry breaks one of theirs (see checkPlexdHooks and checkBuiltinActions).
+//
+// POST /test/configure-capabilities arms two exceptions: fail_next answers a
+// 500 ahead of the decode, and refuse_hook_metadata answers a manifest with
+// hook metadata as a control plane that predates those fields does.
 //
 // Strictness is the point. The fixture used to decode into whatever shape the
 // agent happened to send and count it, so a manifest the real handler refuses
 // — the wrong envelope, a hex checksum, or a gzip-encoded body — passed here
 // and the capability report was silently dead on every deployed node.
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxCapabilitiesBody)
 	data, err := s.captureBody("capabilities", r)
+	if err == nil && len(data) == maxCapabilitiesBody {
+		// captureBody stops reading at the same 1 MiB as the cap, so a longer body
+		// arrives truncated rather than refused. Draining the rest tells a body of
+		// exactly 1 MiB from a longer one, as handleHandshakes does.
+		_, err = io.Copy(io.Discard, r.Body)
+	}
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeProblem(w, r, http.StatusRequestEntityTooLarge, "capabilities_body_too_large",
+				fmt.Sprintf("request body exceeds the %d-byte capabilities envelope cap.", maxCapabilitiesBody))
+			return
+		}
 		writeProblem(w, r, http.StatusBadRequest, "malformed_capabilities_request", "invalid request body")
 		return
 	}
@@ -1197,8 +1218,9 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	// Armed failure: exactly the next capabilitiesFailNext manifests answer a
 	// 500. It sits after the capture, so a test can read what a failed PUT
 	// carried, and ahead of validation, so that a manifest the mock would refuse
-	// still meets the failure the test asked for. The CompareAndSwap decrement
-	// keeps the "exactly N" guarantee under concurrent PUTs and cannot pass zero.
+	// still meets the failure the test asked for. A body past the cap never gets
+	// here and spends no count. The CompareAndSwap decrement keeps the "exactly N"
+	// guarantee under concurrent PUTs and cannot pass zero.
 	for {
 		n := s.capabilitiesFailNext.Load()
 		if n <= 0 {
@@ -1216,6 +1238,16 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	if err := dec.Decode(&req); err != nil {
 		writeProblem(w, r, http.StatusBadRequest, "malformed_capabilities_request",
 			"request body is not a valid CapabilityManifestRequest envelope: "+err.Error())
+		return
+	}
+
+	// Armed refusal: a control plane that predates the hook metadata decodes as
+	// strictly as the mock and stops at the first of those keys. So this answers
+	// here, ahead of every invariant below, and with the decode's own code. The
+	// armed failure above still comes first, so a test can fail a wide PUT.
+	if s.capabilitiesRefuseMetadata.Load() && carriesHookMetadata(req.DeclaredHooks) {
+		writeProblem(w, r, http.StatusBadRequest, "malformed_capabilities_request",
+			"declared_hooks carries an unknown field")
 		return
 	}
 
@@ -1240,9 +1272,9 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 	seen := make(map[string]struct{}, len(req.DeclaredHooks))
 	for _, h := range req.DeclaredHooks {
-		if strings.TrimSpace(h.Name) == "" || !isBase64Digest(h.Checksum) {
+		if strings.TrimSpace(h.Name) == "" || strings.ContainsRune(h.Name, 0) || !isBase64Digest(h.Checksum) {
 			writeProblem(w, r, http.StatusBadRequest, "declared_hook_invalid",
-				"each declared hook needs a name and a 32-byte base64 checksum")
+				"each declared hook needs a name with no NUL and a 32-byte base64 checksum")
 			return
 		}
 		if _, dup := seen[h.Name]; dup {
@@ -1251,6 +1283,12 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		seen[h.Name] = struct{}{}
+		// The real handler looks for a repeated name before it builds the entry,
+		// so a repeated hook answers declared_hook_duplicate whatever it carries.
+		if code, detail := checkDeclaredHookMetadata(h); code != "" {
+			writeProblem(w, r, http.StatusBadRequest, code, detail)
+			return
+		}
 	}
 
 	// The two inventories fail as 422, not 400: the envelope decoded, but a
@@ -1269,8 +1307,22 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// maxCapabilitiesBody is the contract's 1 MiB cap on the manifest as a whole,
+// however valid each field is.
+const maxCapabilitiesBody = 1 << 20
+
 // maxDeclaredHooks is the manifest's per-request declared_hooks ceiling.
 const maxDeclaredHooks = 128
+
+// The limits on a declared hook's metadata: the mock's own copy of the
+// contract's numbers, so it checks the contract and not the agent's reading of
+// it. The text limits count Unicode code points.
+const (
+	maxDeclaredHookText           = 4096
+	maxDeclaredHookSandboxLevel   = 64
+	maxDeclaredHookParameters     = 64
+	maxDeclaredHookTimeoutSeconds = 86400
+)
 
 // The manifest's inventory ceilings: entries per inventory, and parameters per
 // builtin action.
@@ -1279,6 +1331,65 @@ const (
 	maxBuiltinActions          = 128
 	maxBuiltinActionParameters = 64
 )
+
+// carriesHookMetadata reports whether any entry carries one of the four fields
+// a short {name, checksum} entry leaves out.
+func carriesHookMetadata(hooks []api.DeclaredHook) bool {
+	for _, h := range hooks {
+		if h.Description != "" || len(h.Parameters) > 0 || h.TimeoutSeconds != 0 || h.SandboxLevel != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// checkDeclaredHookMetadata enforces the limits on what a hook's sidecar
+// declares and returns the 400 problem code and detail of the first violation,
+// or an empty code. It runs in the real constructor's order, and the order
+// shows in the code: a bad description, sandbox_level, or timeout_seconds
+// answers declared_hook_invalid even on a hook with too many parameters.
+// Parameter names are compared raw, so "a" and " a" are two parameters.
+// Parameters that are `null` decode to none and pass.
+func checkDeclaredHookMetadata(h api.DeclaredHook) (code, detail string) {
+	const invalid = "declared_hook_invalid"
+	if !hookTextValid(h.Description, maxDeclaredHookText) {
+		return invalid, fmt.Sprintf("declared hook %s: description must be at most %d characters with no NUL", h.Name, maxDeclaredHookText)
+	}
+	if !hookTextValid(h.SandboxLevel, maxDeclaredHookSandboxLevel) {
+		return invalid, fmt.Sprintf("declared hook %s: sandbox_level must be at most %d characters with no NUL", h.Name, maxDeclaredHookSandboxLevel)
+	}
+	if h.TimeoutSeconds < 0 || h.TimeoutSeconds > maxDeclaredHookTimeoutSeconds {
+		return invalid, fmt.Sprintf("declared hook %s: timeout_seconds must be between 0 and %d", h.Name, maxDeclaredHookTimeoutSeconds)
+	}
+	if len(h.Parameters) > maxDeclaredHookParameters {
+		return "declared_hooks_too_many",
+			fmt.Sprintf("declared hook %s declares %d parameters, at most %d are accepted", h.Name, len(h.Parameters), maxDeclaredHookParameters)
+	}
+	params := make(map[string]struct{}, len(h.Parameters))
+	for _, p := range h.Parameters {
+		if _, dup := params[p.Name]; dup {
+			return invalid, "declared hook " + h.Name + " declares a parameter name twice"
+		}
+		params[p.Name] = struct{}{}
+		if strings.TrimSpace(p.Name) == "" {
+			return invalid, "declared hook " + h.Name + " declares a parameter without a name"
+		}
+	}
+	for _, p := range h.Parameters {
+		for _, text := range []string{p.Name, p.Type, p.Default, p.Description} {
+			if !hookTextValid(text, maxDeclaredHookText) {
+				return invalid, fmt.Sprintf("declared hook %s: parameter text must be at most %d characters with no NUL", h.Name, maxDeclaredHookText)
+			}
+		}
+	}
+	return "", ""
+}
+
+// hookTextValid reports whether s fits a text field of a declared hook: at most
+// maxChars code points, and no NUL.
+func hookTextValid(s string, maxChars int) bool {
+	return !strings.ContainsRune(s, 0) && utf8.RuneCountInString(s) <= maxChars
+}
 
 // checkPlexdHooks enforces the plexd_hooks invariants and returns the 422
 // problem code and detail of the first violation, or an empty code.
@@ -3305,12 +3416,14 @@ func (s *Server) handleConfigureEndpoint(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleConfigureCapabilities handles POST /test/configure-capabilities. It sets
-// from {"fail_next": N} how many of the next manifests handleCapabilities fails,
-// replacing any pending count, so an N of 0 clears one. Decoding is strict: a
-// misspelled field would otherwise read as 0 and disarm a failure a test relies
-// on. An unknown field, a malformed body, or a negative N is a 400 and leaves the
-// pending count alone.
+// handleConfigureCapabilities handles POST /test/configure-capabilities. From
+// {"fail_next": N, "refuse_hook_metadata": B} it sets how many of the next
+// manifests handleCapabilities fails, and whether it refuses a manifest with
+// hook metadata as an older control plane does. One POST sets both, so a field
+// left out resets to its zero value: an N of 0 clears a pending count, and a
+// missing B lifts the refusal. Decoding is strict: a misspelled field would
+// otherwise read as its zero value and disarm what a test relies on. An unknown
+// field, a malformed body, or a negative N is a 400 and changes neither setting.
 func (s *Server) handleConfigureCapabilities(w http.ResponseWriter, r *http.Request) {
 	data, err := s.captureBody("configure_capabilities", r)
 	if err != nil {
@@ -3318,7 +3431,8 @@ func (s *Server) handleConfigureCapabilities(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var body struct {
-		FailNext int64 `json:"fail_next"`
+		FailNext           int64 `json:"fail_next"`
+		RefuseHookMetadata bool  `json:"refuse_hook_metadata"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -3331,6 +3445,7 @@ func (s *Server) handleConfigureCapabilities(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	s.capabilitiesFailNext.Store(body.FailNext)
+	s.capabilitiesRefuseMetadata.Store(body.RefuseHookMetadata)
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -2312,6 +2312,40 @@ func actionParamEntries(n int) []map[string]any {
 	return out
 }
 
+// declaredHookEntry is a declared_hooks entry: a name, a valid digest, and the
+// given metadata members.
+func declaredHookEntry(name string, metadata map[string]any) map[string]any {
+	entry := map[string]any{"name": name, "checksum": wireDigest}
+	for k, v := range metadata {
+		entry[k] = v
+	}
+	return entry
+}
+
+// wideHookEntry is a declared_hooks entry carrying all four metadata fields.
+func wideHookEntry() map[string]any {
+	return declaredHookEntry("nightly", map[string]any{
+		"description":     "rotates the nightly backup",
+		"parameters":      []map[string]any{actionParamEntry("retention")},
+		"timeout_seconds": 300,
+		"sandbox_level":   "none",
+	})
+}
+
+// hookManifest is a manifest declaring the given hooks.
+func hookManifest(t *testing.T, entries ...map[string]any) string {
+	t.Helper()
+	return manifestWith(t, map[string]any{"declared_hooks": entries})
+}
+
+// hookParams is a hook's parameters member holding one parameter whose field is
+// set to value.
+func hookParams(field, value string) map[string]any {
+	param := actionParamEntry("retention")
+	param[field] = value
+	return map[string]any{"parameters": []map[string]any{param}}
+}
+
 // Both inventories in the shape the contract defines are accepted and counted,
 // up to and including their caps.
 func TestCapabilities_ValidInventories_Accepted(t *testing.T) {
@@ -2426,8 +2460,262 @@ func TestCapabilities_InventoryViolations_Return422(t *testing.T) {
 	}
 }
 
+// An entry carrying all four metadata fields is accepted and counted.
+func TestCapabilities_WideEntryAccepted(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", hookManifest(t, wideHookEntry()))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusNoContent, body)
+	}
+	if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+		t.Errorf("capabilities_count = %d, want 1", a.CapabilitiesCount)
+	}
+}
+
+// Each metadata rule accepts a value at its limit and refuses one past it, and
+// a refused manifest is not counted. A case sends one rule, because 64
+// parameters with four 4096-character fields is a mebibyte of text alone and
+// draws the 413. The text is multi-byte, so a limit counted in bytes fails at
+// the limit, not only past it.
+func TestCapabilities_HookMetadataLimits(t *testing.T) {
+	text := func(n int) string { return strings.Repeat("é", n) }
+
+	for _, tc := range []struct {
+		name string
+		at   map[string]any
+		past map[string]any
+		code string
+	}{
+		{name: "description", code: "declared_hook_invalid",
+			at:   map[string]any{"description": text(4096)},
+			past: map[string]any{"description": text(4097)}},
+		// The count covers the string as written, whitespace included.
+		{name: "description counted raw", code: "declared_hook_invalid",
+			at:   map[string]any{"description": text(4096)},
+			past: map[string]any{"description": text(4096) + "\n"}},
+		{name: "sandbox_level", code: "declared_hook_invalid",
+			at:   map[string]any{"sandbox_level": text(64)},
+			past: map[string]any{"sandbox_level": text(65)}},
+		{name: "timeout_seconds ceiling", code: "declared_hook_invalid",
+			at:   map[string]any{"timeout_seconds": 86400},
+			past: map[string]any{"timeout_seconds": 86401}},
+		{name: "timeout_seconds floor", code: "declared_hook_invalid",
+			at:   map[string]any{"timeout_seconds": 0},
+			past: map[string]any{"timeout_seconds": -1}},
+		{name: "parameter count", code: "declared_hooks_too_many",
+			at:   map[string]any{"parameters": actionParamEntries(64)},
+			past: map[string]any{"parameters": actionParamEntries(65)}},
+		{name: "parameter name", code: "declared_hook_invalid",
+			at: hookParams("name", text(4096)), past: hookParams("name", text(4097))},
+		{name: "parameter type", code: "declared_hook_invalid",
+			at: hookParams("type", text(4096)), past: hookParams("type", text(4097))},
+		{name: "parameter default", code: "declared_hook_invalid",
+			at: hookParams("default", text(4096)), past: hookParams("default", text(4097))},
+		{name: "parameter description", code: "declared_hook_invalid",
+			at: hookParams("description", text(4096)), past: hookParams("description", text(4097))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			target := ts.URL + "/v1/nodes/node-1/capabilities"
+
+			at := doRequest(t, http.MethodPut, target, hookManifest(t, declaredHookEntry("nightly", tc.at)))
+			defer at.Body.Close()
+			if at.StatusCode != http.StatusNoContent {
+				body, _ := io.ReadAll(at.Body)
+				t.Fatalf("at the limit: status = %d, want %d (body: %s)", at.StatusCode, http.StatusNoContent, body)
+			}
+			if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+				t.Fatalf("capabilities_count = %d, want 1 at the limit", a.CapabilitiesCount)
+			}
+
+			past := doRequest(t, http.MethodPut, target, hookManifest(t, declaredHookEntry("nightly", tc.past)))
+			defer past.Body.Close()
+			assertProblem(t, past, http.StatusBadRequest, tc.code)
+			if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+				t.Errorf("capabilities_count = %d, want 1 after a refused manifest", a.CapabilitiesCount)
+			}
+		})
+	}
+}
+
+// Every metadata value the contract forbids refuses the whole manifest.
+func TestCapabilities_HookMetadataViolations(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		entry map[string]any
+	}{
+		{name: "negative timeout", entry: declaredHookEntry("nightly", map[string]any{"timeout_seconds": -1})},
+		{name: "timeout past a day", entry: declaredHookEntry("nightly", map[string]any{"timeout_seconds": 86401})},
+		{name: "NUL in the description", entry: declaredHookEntry("nightly", map[string]any{"description": "a\x00b"})},
+		{name: "NUL in the sandbox level", entry: declaredHookEntry("nightly", map[string]any{"sandbox_level": "a\x00b"})},
+		{name: "NUL in the hook name", entry: declaredHookEntry("night\x00ly", nil)},
+		{name: "empty parameter name", entry: declaredHookEntry("nightly", hookParams("name", ""))},
+		{name: "blank parameter name", entry: declaredHookEntry("nightly", hookParams("name", "   "))},
+		{name: "repeated parameter name", entry: declaredHookEntry("nightly", map[string]any{
+			"parameters": []map[string]any{actionParamEntry("retention"), actionParamEntry("retention")},
+		})},
+		{name: "NUL in a parameter name", entry: declaredHookEntry("nightly", hookParams("name", "a\x00b"))},
+		{name: "NUL in a parameter type", entry: declaredHookEntry("nightly", hookParams("type", "a\x00b"))},
+		{name: "NUL in a parameter default", entry: declaredHookEntry("nightly", hookParams("default", "a\x00b"))},
+		{name: "NUL in a parameter description", entry: declaredHookEntry("nightly", hookParams("description", "a\x00b"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", hookManifest(t, tc.entry))
+			defer resp.Body.Close()
+			assertProblem(t, resp, http.StatusBadRequest, "declared_hook_invalid")
+			if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 0 {
+				t.Errorf("capabilities_count = %d, want 0 for a refused manifest", a.CapabilitiesCount)
+			}
+		})
+	}
+}
+
+// One entry that breaks a rule refuses the whole manifest, wherever it sits.
+func TestCapabilities_HookMetadataViolationOnALaterEntry(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", hookManifest(t,
+		declaredHookEntry("first", nil),
+		declaredHookEntry("second", map[string]any{"timeout_seconds": -1})))
+	defer resp.Body.Close()
+	assertProblem(t, resp, http.StatusBadRequest, "declared_hook_invalid")
+	if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 0 {
+		t.Errorf("capabilities_count = %d, want 0 for a refused manifest", a.CapabilitiesCount)
+	}
+}
+
+// A manifest breaking two rules gets the code the real handler reaches first:
+// a repeated hook before its metadata, and the hook's own fields, then the
+// parameter cap, before any one parameter.
+func TestCapabilities_HookMetadataOrder(t *testing.T) {
+	blankFirst := actionParamEntries(65)
+	blankFirst[0]["name"] = " "
+
+	for _, tc := range []struct {
+		name    string
+		entries []map[string]any
+		code    string
+	}{
+		{name: "a repeated hook outranks its metadata", code: "declared_hook_duplicate",
+			entries: []map[string]any{
+				declaredHookEntry("nightly", nil),
+				declaredHookEntry("nightly", map[string]any{"timeout_seconds": -1}),
+			}},
+		{name: "a bad description outranks the parameter cap", code: "declared_hook_invalid",
+			entries: []map[string]any{declaredHookEntry("nightly", map[string]any{
+				"description": strings.Repeat("a", 4097), "parameters": actionParamEntries(65),
+			})}},
+		{name: "a bad sandbox level outranks the parameter cap", code: "declared_hook_invalid",
+			entries: []map[string]any{declaredHookEntry("nightly", map[string]any{
+				"sandbox_level": strings.Repeat("a", 65), "parameters": actionParamEntries(65),
+			})}},
+		{name: "a bad timeout outranks the parameter cap", code: "declared_hook_invalid",
+			entries: []map[string]any{declaredHookEntry("nightly", map[string]any{
+				"timeout_seconds": -1, "parameters": actionParamEntries(65),
+			})}},
+		{name: "the parameter cap outranks a blank parameter name", code: "declared_hooks_too_many",
+			entries: []map[string]any{declaredHookEntry("nightly", map[string]any{"parameters": blankFirst})}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", hookManifest(t, tc.entries...))
+			defer resp.Body.Close()
+			assertProblem(t, resp, http.StatusBadRequest, tc.code)
+		})
+	}
+}
+
+// Parameter names are compared raw, as the real handler compares them, so two
+// names that trim alike are two parameters.
+func TestCapabilities_HookParameterNamesComparedRaw(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	body := hookManifest(t, declaredHookEntry("nightly", map[string]any{
+		"parameters": []map[string]any{actionParamEntry("retention"), actionParamEntry(" retention")},
+	}))
+	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+// A hook may reach the handler with `"parameters": null`. That is zero
+// parameters, not a violation.
+func TestCapabilities_NullHookParameters_Accepted(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	body := hookManifest(t, declaredHookEntry("nightly", map[string]any{"parameters": nil}))
+	if !strings.Contains(body, `"parameters":null`) {
+		t.Fatalf("fixture lost its null parameters: %s", body)
+	}
+
+	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+	if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+		t.Errorf("capabilities_count = %d, want 1", a.CapabilitiesCount)
+	}
+}
+
+// An entry key outside the contract fails the strict decode. HookInfo's source
+// is the near miss: plexd holds it and the wire does not carry it.
+func TestCapabilities_UnknownHookKey_Refused(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	body := hookManifest(t, declaredHookEntry("nightly", map[string]any{"source": "local"}))
+	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", body)
+	defer resp.Body.Close()
+	assertProblem(t, resp, http.StatusBadRequest, "malformed_capabilities_request")
+	if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 0 {
+		t.Errorf("capabilities_count = %d, want 0 for a refused manifest", a.CapabilitiesCount)
+	}
+}
+
+func TestCapabilities_BodyCap(t *testing.T) {
+	const capBytes = 1 << 20
+	padded := func(n int) string {
+		return capabilitiesBody + strings.Repeat(" ", n-len(capabilitiesBody))
+	}
+
+	t.Run("exactly 1 MiB is accepted", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", padded(capBytes))
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+		}
+		if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+			t.Errorf("capabilities_count = %d, want 1", a.CapabilitiesCount)
+		}
+	})
+
+	t.Run("one byte more is refused", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", padded(capBytes+1))
+		defer resp.Body.Close()
+		assertProblem(t, resp, http.StatusRequestEntityTooLarge, "capabilities_body_too_large")
+		if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 0 {
+			t.Errorf("capabilities_count = %d, want 0", a.CapabilitiesCount)
+		}
+		// The capture runs ahead of the cap, so a test can read what was refused.
+		if got := getCapturedBody(t, ts.URL, "capabilities"); len(got) != capBytes {
+			t.Errorf("captured %d bytes, want %d", len(got), capBytes)
+		}
+	})
+}
+
 // TestConfigureCapabilities asserts POST /test/configure-capabilities fails
-// exactly the next N manifests and that a refused body changes nothing.
+// exactly the next N manifests, refuses hook metadata while that is armed, and
+// that a refused body changes nothing.
 func TestConfigureCapabilities(t *testing.T) {
 	configure := func(t *testing.T, baseURL, body string, want int) {
 		t.Helper()
@@ -2499,7 +2787,7 @@ func TestConfigureCapabilities(t *testing.T) {
 
 	t.Run("refused_body_keeps_the_pending_count", func(t *testing.T) {
 		_, ts := newTestServer(t)
-		configure(t, ts.URL, `{"fail_next":1}`, http.StatusNoContent)
+		configure(t, ts.URL, `{"fail_next":1,"refuse_hook_metadata":true}`, http.StatusNoContent)
 
 		for _, body := range []string{
 			`{"fail_next":-1}`,
@@ -2508,15 +2796,153 @@ func TestConfigureCapabilities(t *testing.T) {
 			`{"fail_next":"2"}`,
 			`{"fail_next":1.5}`,
 			`{"fail_nxt":2}`,
+			`{"refuse_hook_metadata":"yes"}`,
+			`{"fail_next":2,"refuse_hook_metadata":"yes"}`,
+			`{"fail_next":-1,"refuse_hook_metadata":false}`,
 		} {
 			configure(t, ts.URL, body, http.StatusBadRequest)
 		}
 
 		// The count armed before the refused bodies is still one: not cleared by
-		// them and not raised by the one that names 2.
+		// them and not raised by the ones that name 2.
 		assertProblem(t, put(t, ts.URL, capabilitiesBody), http.StatusInternalServerError, "internal")
 		if resp := put(t, ts.URL, capabilitiesBody); resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("second PUT status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+		}
+		// The refusal armed beside it is still set: no refused body lifted it.
+		assertProblem(t, put(t, ts.URL, hookManifest(t, wideHookEntry())), http.StatusBadRequest, "malformed_capabilities_request")
+	})
+
+	t.Run("refused_body_does_not_arm_the_refusal", func(t *testing.T) {
+		_, ts := newTestServer(t)
+
+		for _, body := range []string{
+			`{"refuse_hook_metadata":"yes"}`,
+			`{"fail_next":-1,"refuse_hook_metadata":true}`,
+		} {
+			configure(t, ts.URL, body, http.StatusBadRequest)
+		}
+
+		if resp := put(t, ts.URL, hookManifest(t, wideHookEntry())); resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("wide PUT status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+		}
+	})
+
+	t.Run("armed_refusal_refuses_a_wide_manifest_and_takes_a_short_one", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configure(t, ts.URL, `{"refuse_hook_metadata":true}`, http.StatusNoContent)
+
+		wide := hookManifest(t, wideHookEntry())
+		assertProblem(t, put(t, ts.URL, wide), http.StatusBadRequest, "malformed_capabilities_request")
+		if got := getCapturedBody(t, ts.URL, "capabilities"); string(got) != wide {
+			t.Errorf("captured body = %q, want %q", got, wide)
+		}
+		if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 0 {
+			t.Errorf("capabilities_count = %d, want 0 for a refused manifest", a.CapabilitiesCount)
+		}
+
+		if resp := put(t, ts.URL, hookManifest(t, declaredHookEntry("nightly", nil))); resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("short PUT status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+		}
+		if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+			t.Errorf("capabilities_count = %d, want 1", a.CapabilitiesCount)
+		}
+	})
+
+	t.Run("armed_refusal_sees_each_field_on_any_entry", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configure(t, ts.URL, `{"refuse_hook_metadata":true}`, http.StatusNoContent)
+
+		for _, metadata := range []map[string]any{
+			{"description": "rotates the nightly backup"},
+			{"parameters": actionParamEntries(1)},
+			{"timeout_seconds": 300},
+			{"sandbox_level": "none"},
+		} {
+			body := hookManifest(t, declaredHookEntry("short", nil), declaredHookEntry("wide", metadata))
+			assertProblem(t, put(t, ts.URL, body), http.StatusBadRequest, "malformed_capabilities_request")
+		}
+	})
+
+	t.Run("armed_refusal_reads_null_parameters_as_none", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configure(t, ts.URL, `{"refuse_hook_metadata":true}`, http.StatusNoContent)
+
+		// One parameter is metadata, so this PUT shows the refusal is armed.
+		oneParameter := hookManifest(t, declaredHookEntry("nightly", map[string]any{"parameters": actionParamEntries(1)}))
+		assertProblem(t, put(t, ts.URL, oneParameter), http.StatusBadRequest, "malformed_capabilities_request")
+
+		null := hookManifest(t, declaredHookEntry("nightly", map[string]any{"parameters": nil}))
+		if resp := put(t, ts.URL, null); resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("null parameters: status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+		}
+		if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+			t.Errorf("capabilities_count = %d, want 1", a.CapabilitiesCount)
+		}
+	})
+
+	t.Run("armed_refusal_stays_ahead_of_the_invariants", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configure(t, ts.URL, `{"refuse_hook_metadata":true}`, http.StatusNoContent)
+
+		// An older decoder stops at the key, so it never sees the value is bad.
+		body := hookManifest(t, declaredHookEntry("nightly", map[string]any{"timeout_seconds": -1}))
+		assertProblem(t, put(t, ts.URL, body), http.StatusBadRequest, "malformed_capabilities_request")
+
+		// Nor does it reach the envelope's own checks.
+		body = manifestWith(t, map[string]any{
+			"binary_version": "",
+			"declared_hooks": []map[string]any{wideHookEntry()},
+		})
+		assertProblem(t, put(t, ts.URL, body), http.StatusBadRequest, "malformed_capabilities_request")
+	})
+
+	t.Run("armed_failure_stays_ahead_of_the_refusal", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configure(t, ts.URL, `{"fail_next":1,"refuse_hook_metadata":true}`, http.StatusNoContent)
+
+		wide := hookManifest(t, wideHookEntry())
+		assertProblem(t, put(t, ts.URL, wide), http.StatusInternalServerError, "internal")
+		assertProblem(t, put(t, ts.URL, wide), http.StatusBadRequest, "malformed_capabilities_request")
+	})
+
+	t.Run("body_cap_stays_ahead_of_the_failure", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configure(t, ts.URL, `{"fail_next":1}`, http.StatusNoContent)
+
+		tooLarge := capabilitiesBody + strings.Repeat(" ", 1<<20)
+		assertProblem(t, put(t, ts.URL, tooLarge), http.StatusRequestEntityTooLarge, "capabilities_body_too_large")
+
+		// The refused body spent no count, so the next PUT still meets the failure.
+		assertProblem(t, put(t, ts.URL, capabilitiesBody), http.StatusInternalServerError, "internal")
+	})
+
+	t.Run("disarmed_refusal_takes_a_wide_manifest", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configure(t, ts.URL, `{"refuse_hook_metadata":true}`, http.StatusNoContent)
+		configure(t, ts.URL, `{"refuse_hook_metadata":false}`, http.StatusNoContent)
+
+		if resp := put(t, ts.URL, hookManifest(t, wideHookEntry())); resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("wide PUT status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+		}
+		if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+			t.Errorf("capabilities_count = %d, want 1", a.CapabilitiesCount)
+		}
+	})
+
+	t.Run("a_field_left_out_resets", func(t *testing.T) {
+		_, ts := newTestServer(t)
+
+		configure(t, ts.URL, `{"refuse_hook_metadata":true}`, http.StatusNoContent)
+		configure(t, ts.URL, `{"fail_next":0}`, http.StatusNoContent)
+		if resp := put(t, ts.URL, hookManifest(t, wideHookEntry())); resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("PUT after a POST without refuse_hook_metadata: status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+		}
+
+		configure(t, ts.URL, `{"fail_next":1}`, http.StatusNoContent)
+		configure(t, ts.URL, `{"refuse_hook_metadata":false}`, http.StatusNoContent)
+		if resp := put(t, ts.URL, capabilitiesBody); resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("PUT after a POST without fail_next: status = %d, want %d", resp.StatusCode, http.StatusNoContent)
 		}
 	})
 
