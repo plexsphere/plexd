@@ -2055,6 +2055,260 @@ func TestSelectEndpoints_HostnameRelayIsJudgedByTheEntryProgrammed(t *testing.T)
 	}
 }
 
+// movedBackLine is the message of a move back.
+const movedBackLine = "wireguard: relayed peer roamed to a relay its session does not run over, moving it back"
+
+// mixedHostRelay is the hostname entry of mixedSet.
+const mixedHostRelay = "relay-e.example:51821"
+
+// mixedSet gives p a relay set of mixedHostRelay and the address R2; it is
+// relayedManager's mutate for a peer connected over the hostname. The address
+// relayStat reports, R1, matches no entry, so the entry programmed decides.
+func mixedSet(p *api.Peer) {
+	p.Endpoints = []string{standbyOrder[0], mixedHostRelay, standbyR2}
+	p.Endpoint = p.Endpoints[0]
+	p.Fallbacks = p.Endpoints[1:]
+}
+
+// roamedStat returns relayStat with relay as the endpoint the device reports,
+// as for a peer WireGuard roamed there.
+func roamedStat(key [32]byte, at time.Time, rx uint64, relay string) PeerStat {
+	s := relayStat(key, at, rx)
+	s.Endpoint = netip.MustParseAddrPort(relay)
+	return s
+}
+
+// A stale packet roamed the device to a relay that never forwarded the
+// session's handshake. The write only sets the endpoint: the session still runs
+// over the relay programmed, and a remove would cut it.
+func TestSelectEndpoints_RoamWithoutAHandshakeGoesBackToTheRelay(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key := relayedManager(t, &logs, standbySet)
+	probe := &fakeProbe{}
+	mgr.SetRelayProbe(probe.send)
+	session := selectionStart.Add(31 * time.Second)
+
+	// Silent over R1 since 31 s, so this pass would send the first probe. The
+	// packet that roamed the device is counted, as on a real device.
+	const stalePacket = 148
+	ctrl.stats = []PeerStat{roamedStat(key, session, 100+stalePacket, standbyR2)}
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 61*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"add " + standbyR1}; !slices.Equal(got, want) {
+		t.Errorf("device writes = %v, want %v", got, want)
+	}
+	st := mgr.dial["node-a"]
+	if st.idx != 1 || !st.relayed || !st.connected {
+		t.Errorf("idx = %d, relayed = %v, connected = %v, want 1, true, true", st.idx, st.relayed, st.connected)
+	}
+	requireLogLine(t, logs.String(), movedBackLine,
+		"level=INFO", "component=wireguard", "peer_id=node-a", "from="+standbyR2, "endpoint="+standbyR1)
+
+	// The pass skips the probe and leaves its state.
+	if len(probe.sent) != 0 {
+		t.Errorf("probes on the pass that moved the peer back = %v, want none", probe.sent)
+	}
+	if st.rxBytes != 100 || !st.rxAt.Equal(session) || !st.probedAt.IsZero() {
+		t.Errorf("probe state = rxBytes %d, rxAt %v, probedAt %v, want it untouched", st.rxBytes, st.rxAt, st.probedAt)
+	}
+
+	// The next pass reads those bytes as received, so the silence window starts
+	// over there. Taking them in the move back could swallow a real answer that
+	// arrived in the same interval, and a false verdict cuts a working session.
+	ctrl.stats = []PeerStat{relayStat(key, session, 100+stalePacket)}
+	before = len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 66*time.Second)
+	if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+		t.Errorf("device writes with the device back on the relay = %v, want none", got)
+	}
+	if len(probe.sent) != 0 {
+		t.Errorf("probes on the pass after = %v, want none", probe.sent)
+	}
+	passAt(t, mgr, clock, 96*time.Second)
+	if len(probe.sent) != 1 {
+		t.Errorf("probes one trial later = %v, want one", probe.sent)
+	}
+}
+
+// The device changes LastHandshake only when a handshake completes, so an older
+// value is a new session, one that completed after the wall clock stepped back.
+func TestSelectEndpoints_OlderHandshakeIsANewSession(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key := relayedManager(t, &logs, standbySet)
+
+	ctrl.stats = []PeerStat{roamedStat(key, selectionStart.Add(10*time.Second), 100, standbyR2)}
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 36*time.Second)
+	if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+		t.Errorf("device writes = %v, want none", got)
+	}
+	if got := mgr.dial["node-a"].endpoint(); got != standbyR2 {
+		t.Errorf("entry programmed = %q, want %q, the relay of the new session", got, standbyR2)
+	}
+}
+
+func TestSelectEndpoints_LeavesTheDeviceAlone(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(*api.Peer)
+		reported    []netip.AddrPort // the device endpoint at each pass, all in the session of 31 s
+		wantIdx     int
+		wantRelayed bool
+	}{
+		{
+			name:        "a relayed peer with no device endpoint",
+			mutate:      standbySet,
+			reported:    []netip.AddrPort{{}},
+			wantIdx:     1,
+			wantRelayed: true,
+		},
+		{
+			// The direct path ends the relayed mark, and the relay it then
+			// reports is followed as today.
+			name:        "a peer that is not relayed at a relay's address",
+			mutate:      standbySet,
+			reported:    []netip.AddrPort{directEndpoint, netip.MustParseAddrPort(standbyR2)},
+			wantIdx:     2,
+			wantRelayed: true,
+		},
+		{
+			// The address may be the hostname's, so the entry programmed
+			// decides, and it is where the peer already is.
+			name:        "a roam to an address no entry of a set with a hostname names",
+			mutate:      mixedSet,
+			reported:    []netip.AddrPort{directEndpoint},
+			wantIdx:     1,
+			wantRelayed: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			mgr, ctrl, clock, key := relayedManager(t, &logs, tt.mutate)
+			before := len(deviceWrites(ctrl))
+			after := 31 * time.Second
+			for _, endpoint := range tt.reported {
+				s := relayStat(key, selectionStart.Add(31*time.Second), 100)
+				s.Endpoint = endpoint
+				ctrl.stats = []PeerStat{s}
+				after += 5 * time.Second
+				passAt(t, mgr, clock, after)
+			}
+			if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+				t.Errorf("device writes = %v, want none", got)
+			}
+			if lines := logLines(logs.String(), movedBackLine); len(lines) != 0 {
+				t.Errorf("move back logged: %v", lines)
+			}
+			if st := mgr.dial["node-a"]; st.idx != tt.wantIdx || st.relayed != tt.wantRelayed || !st.connected {
+				t.Errorf("idx = %d, relayed = %v, connected = %v, want %d, %v, true", st.idx, st.relayed, st.connected, tt.wantIdx, tt.wantRelayed)
+			}
+		})
+	}
+}
+
+// relayedOver matches an address entry before it considers a hostname, so a
+// set that mixes the two can name the relay a peer roamed to.
+func TestSelectEndpoints_MixedSetMovesBackToTheHostnameRelay(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key := relayedManager(t, &logs, mixedSet)
+	if got := mgr.dial["node-a"].endpoint(); got != mixedHostRelay {
+		t.Fatalf("entry programmed = %q, want %q", got, mixedHostRelay)
+	}
+
+	ctrl.stats = []PeerStat{roamedStat(key, selectionStart.Add(31*time.Second), 100, standbyR2)}
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 36*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"add " + mixedHostRelay}; !slices.Equal(got, want) {
+		t.Errorf("device writes = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String(), movedBackLine, "peer_id=node-a", "from="+standbyR2, "endpoint="+mixedHostRelay)
+	if st := mgr.dial["node-a"]; st.idx != 1 || !st.relayed || !st.connected {
+		t.Errorf("idx = %d, relayed = %v, connected = %v, want 1, true, true", st.idx, st.relayed, st.connected)
+	}
+}
+
+// A stale packet that lands within one pass of a handshake gets its relay
+// taken for the session's. The partner's next packet heals the device, so
+// moving it back on every pass would undo that until the next handshake.
+func TestSelectEndpoints_MovesBackOncePerSession(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key := relayedManager(t, &logs, standbySet)
+	session := selectionStart.Add(31 * time.Second)
+
+	ctrl.stats = []PeerStat{roamedStat(key, session, 100, standbyR2)}
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 36*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"add " + standbyR1}; !slices.Equal(got, want) {
+		t.Fatalf("device writes on the first roam = %v, want %v", got, want)
+	}
+	if st := mgr.dial["node-a"]; st.idx != 1 {
+		t.Fatalf("idx after the first roam = %d, want 1", st.idx)
+	}
+
+	// The second roam of the session is followed, and stays followed.
+	before = len(deviceWrites(ctrl))
+	for _, after := range []time.Duration{41 * time.Second, 46 * time.Second} {
+		passAt(t, mgr, clock, after)
+		if st := mgr.dial["node-a"]; st.idx != 2 || !st.relayed || !st.connected {
+			t.Fatalf("at %v idx = %d, relayed = %v, connected = %v, want 2, true, true", after, st.idx, st.relayed, st.connected)
+		}
+	}
+	if got := deviceWrites(ctrl)[before:]; len(got) != 0 {
+		t.Fatalf("device writes on the second roam = %v, want none", got)
+	}
+	if n := len(logLines(logs.String(), movedBackLine)); n != 1 {
+		t.Fatalf("%d move back lines after the second roam, want 1:\n%s", n, logs.String())
+	}
+
+	// A new handshake over R2 is a new session, whose roam is judged afresh.
+	session = selectionStart.Add(50 * time.Second)
+	ctrl.stats = []PeerStat{roamedStat(key, session, 200, standbyR2)}
+	passAt(t, mgr, clock, 51*time.Second)
+	ctrl.stats = []PeerStat{roamedStat(key, session, 200, standbyR3)}
+	before = len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 56*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"add " + standbyR2}; !slices.Equal(got, want) {
+		t.Errorf("device writes on a roam after a new handshake = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String(), movedBackLine, "peer_id=node-a", "from="+standbyR3, "endpoint="+standbyR2)
+	if st := mgr.dial["node-a"]; st.idx != 2 {
+		t.Errorf("idx after the move back = %d, want 2", st.idx)
+	}
+}
+
+func TestSelectEndpoints_MoveBackWriteFailure(t *testing.T) {
+	var logs bytes.Buffer
+	mgr, ctrl, clock, key := relayedManager(t, &logs, standbySet)
+
+	ctrl.stats = []PeerStat{roamedStat(key, selectionStart.Add(31*time.Second), 100, standbyR2)}
+	addErr := errors.New("refused")
+	ctrl.addPeerErr = addErr
+	clock.Set(selectionStart.Add(36 * time.Second))
+	err := mgr.selectEndpoints()
+	if want := "wireguard: switch endpoint of peer node-a: refused"; err == nil || err.Error() != want || !errors.Is(err, addErr) {
+		t.Fatalf("selectEndpoints = %v, want %q wrapping %v", err, want, addErr)
+	}
+	requireLogLine(t, logs.String(), "wireguard: endpoint switch failed",
+		"level=WARN", "component=wireguard", "peer_id=node-a", "endpoint="+standbyR1, "error=refused")
+	if lines := logLines(logs.String(), movedBackLine); len(lines) != 0 {
+		t.Errorf("move back logged for a failed write: %v", lines)
+	}
+	if st := mgr.dial["node-a"]; st.idx != 1 || !st.relayed || !st.connected {
+		t.Errorf("idx = %d, relayed = %v, connected = %v, want 1, true, true", st.idx, st.relayed, st.connected)
+	}
+
+	// Nothing was recorded, so the failed write does not use up the session's
+	// one move back.
+	ctrl.addPeerErr = nil
+	before := len(deviceWrites(ctrl))
+	passAt(t, mgr, clock, 41*time.Second)
+	if got, want := deviceWrites(ctrl)[before:], []string{"add " + standbyR1}; !slices.Equal(got, want) {
+		t.Errorf("device writes on the next pass = %v, want %v", got, want)
+	}
+	requireLogLine(t, logs.String(), movedBackLine, "peer_id=node-a", "from="+standbyR2, "endpoint="+standbyR1)
+}
+
 func TestSelectEndpoints_NextRelayDialFailure(t *testing.T) {
 	var logs bytes.Buffer
 	mgr, ctrl, clock, key := relayedManager(t, &logs, standbySet)
