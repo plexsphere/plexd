@@ -125,6 +125,8 @@ func scanHooks(hooksDir string, logger *slog.Logger, hash func(string) (string, 
 				h.Timeout = meta.Timeout
 				h.Sandbox = meta.Sandbox
 			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			logger.Warn("actions: discovery: sidecar read failed", "file", sidecarPath, "error", err)
 		}
 
 		hooks = append(hooks, h)
