@@ -267,10 +267,24 @@ func waitIndex(t *testing.T, r *Relay, i uint32, pending bool) {
 }
 
 // handshake completes a first contact between a and b through r, which must
-// already list both: a's initiation for b waits as pending, b's initiation
-// for a is fanned out to a, and a's response reaches b. aIdx is a's session
-// index and bIdx b's.
+// already list both, and sends one transport message each way, as a session
+// does. aIdx is a's session index and bIdx b's.
 func handshake(t *testing.T, r *Relay, a, b *wgPeer, aIdx, bIdx uint32) {
+	t.Helper()
+	handshakeOnly(t, r, a, b, aIdx, bIdx)
+
+	toA := transportTo(aIdx, 0)
+	send(t, b.conn, r, toA)
+	expectRecv(t, a, toA)
+	toB := transportTo(bIdx, 0)
+	send(t, a.conn, r, toB)
+	expectRecv(t, b, toB)
+}
+
+// handshakeOnly is handshake with no transport message: a's initiation for b
+// waits as pending, b's initiation for a is fanned out to a, and a's response
+// reaches b.
+func handshakeOnly(t *testing.T, r *Relay, a, b *wgPeer, aIdx, bIdx uint32) {
 	t.Helper()
 	send(t, a.conn, r, initiationFor(aIdx+1_000_000, b))
 	waitIndex(t, r, aIdx+1_000_000, true)
@@ -301,6 +315,53 @@ func mustConfigure(t *testing.T, r *Relay, peers ...*wgPeer) {
 	if err := r.Configure(51821, snapshotPeers(peers...)); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
+}
+
+// heldReason is the drop reason of an initiation the relay keeps back.
+const heldReason = "reason=held_for_retry"
+
+// expectHeld sends an initiation with index sender from from for to, and waits
+// until the relay has logged it as held.
+func expectHeld(t *testing.T, r *Relay, logs *relayLog, from, to *wgPeer, sender uint32) {
+	t.Helper()
+	n := logs.count(heldReason)
+	send(t, from.conn, r, initiationFor(sender, to))
+	logs.waitFor(t, heldReason, n+1)
+}
+
+// expectForwarded sends an initiation with index sender from from for to, and
+// expects to to read it.
+func expectForwarded(t *testing.T, r *Relay, from, to *wgPeer, sender uint32) {
+	t.Helper()
+	init := initiationFor(sender, to)
+	send(t, from.conn, r, init)
+	expectRecv(t, to, init)
+}
+
+// forwarded sends init from from and reports whether to read it, false when
+// the relay held it instead. Waiting for one of the two tells a caller that
+// walks the clock that the relay has dealt with init.
+func forwarded(t *testing.T, r *Relay, logs *relayLog, from, to *wgPeer, init []byte) bool {
+	t.Helper()
+	n := logs.count(heldReason)
+	send(t, from.conn, r, init)
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if logs.count(heldReason) > n {
+			return false
+		}
+		if receives(to.conn, init, time.Millisecond) {
+			return true
+		}
+	}
+	t.Fatalf("the relay neither held nor forwarded %x:\n%s", init, logs.String())
+	return false
+}
+
+// pairCount returns how many pairs the relay remembers.
+func pairCount(r *Relay) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.pairs)
 }
 
 // ---------------------------------------------------------------------------
@@ -567,7 +628,7 @@ func TestRelay_IndexTableFull(t *testing.T) {
 }
 
 func TestRelay_ActiveCount(t *testing.T) {
-	r, _, clock := testRelay(t)
+	r, logs, clock := testRelay(t)
 	a := newWGPeer(t, "node-a", 0x10)
 	b := newWGPeer(t, "node-b", 0x20)
 	mustConfigure(t, r, a, b)
@@ -580,8 +641,10 @@ func TestRelay_ActiveCount(t *testing.T) {
 		t.Fatalf("ActiveCount after one handshake = %d, want 1", n)
 	}
 
-	// A second handshake of the same pair: B's address is fresh now, so the
-	// initiation goes straight to B.
+	// A second handshake of the same pair: the relay holds the first initiation,
+	// and B's address is fresh now, so the retry goes straight to B.
+	expectHeld(t, r, logs, a, b, 11)
+	clock.Add(relayRetryMin)
 	init := initiationFor(12, b)
 	send(t, a.conn, r, init)
 	expectRecv(t, b, init)
@@ -600,13 +663,16 @@ func TestRelay_ActiveCount(t *testing.T) {
 }
 
 func TestRelay_ForwardsCookieReplies(t *testing.T) {
-	r, _, _ := testRelay(t)
+	r, logs, clock := testRelay(t)
 	a := newWGPeer(t, "node-a", 0x10)
 	b := newWGPeer(t, "node-b", 0x20)
 	mustConfigure(t, r, a, b)
 	handshake(t, r, a, b, 3, 2)
 
 	// A cookie reply to a pending initiation goes to the initiation's source.
+	// With a session, only the retry leaves a pending initiation.
+	expectHeld(t, r, logs, a, b, 19)
+	clock.Add(relayRetryMin)
 	init := initiationFor(20, b)
 	send(t, a.conn, r, init)
 	expectRecv(t, b, init)
@@ -743,7 +809,7 @@ func TestRelay_FanoutLeavesOutConnectedPeers(t *testing.T) {
 }
 
 func TestRelay_NeverAnswersAHandshake(t *testing.T) {
-	r, logs, _ := testRelay(t)
+	r, logs, clock := testRelay(t)
 	a := newWGPeer(t, "node-a", 0x10)
 	b := newWGPeer(t, "node-b", 0x20)
 	mustConfigure(t, r, a, b)
@@ -755,7 +821,10 @@ func TestRelay_NeverAnswersAHandshake(t *testing.T) {
 	expectNothing(t, "A", a.conn)
 	logs.waitFor(t, "reason=no_route", base+1)
 
-	// A response from the source of the initiation it answers.
+	// A response from the source of the initiation it answers. With a session,
+	// only the retry leaves an initiation to answer.
+	expectHeld(t, r, logs, a, b, 49)
+	clock.Add(relayRetryMin)
 	init := initiationFor(51, b)
 	send(t, a.conn, r, init)
 	expectRecv(t, b, init)
@@ -854,9 +923,15 @@ func TestRelay_StopForgetsEverything(t *testing.T) {
 	b := newWGPeer(t, "node-b", 0x20)
 	mustConfigure(t, r, a, b)
 	handshake(t, r, a, b, 3, 2)
+	if n := pairCount(r); n != 1 {
+		t.Fatalf("pairs after a handshake = %d, want 1", n)
+	}
 
 	if err := r.Stop(); err != nil {
 		t.Fatalf("Stop: %v", err)
+	}
+	if n := pairCount(r); n != 0 {
+		t.Errorf("pairs after Stop = %d, want none", n)
 	}
 	mustConfigure(t, r, a, b)
 	send(t, b.conn, r, transportTo(3, 1))
@@ -914,6 +989,412 @@ func TestRelay_UnmapsSourcesOnTheDualStackSocket(t *testing.T) {
 	}
 	if strings.Contains(out, "::ffff:") {
 		t.Errorf("an IPv4-mapped address reached the relay's state:\n%s", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Holding an initiation until its retry
+// ---------------------------------------------------------------------------
+
+func TestRelay_BacklogOfInitiationsIsHeld(t *testing.T) {
+	r, logs, _ := testRelay(t)
+	r.maxIndices = 3 // the table is full after the handshake, and a hold needs no room
+	a := newWGPeer(t, "node-a", 0x10)
+	b := newWGPeer(t, "node-b", 0x20)
+	mustConfigure(t, r, a, b)
+	handshake(t, r, a, b, 3, 2)
+
+	var senders []uint32
+	for i := range uint32(6) {
+		send(t, a.conn, r, initiationFor(100+i, b))
+		send(t, b.conn, r, initiationFor(200+i, a))
+		senders = append(senders, 100+i, 200+i)
+	}
+	logs.waitFor(t, heldReason, 12)
+	expectNothing(t, "A", a.conn)
+	expectNothing(t, "B", b.conn)
+	if n := logs.count(heldReason); n != 12 {
+		t.Errorf("held %d initiations, want 12", n)
+	}
+	if n := logs.count("index_table_full"); n != 0 {
+		t.Errorf("%d held initiations asked for room in the table, want none", n)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, i := range senders {
+		if _, ok := r.indices[i]; ok {
+			t.Errorf("held initiation %d left an index", i)
+		}
+	}
+}
+
+func TestRelay_ForwardsAnInitiationOnItsRetry(t *testing.T) {
+	r, logs, clock := testRelay(t)
+	a := newWGPeer(t, "node-a", 0x10)
+	b := newWGPeer(t, "node-b", 0x20)
+	mustConfigure(t, r, a, b)
+	handshake(t, r, a, b, 3, 2)
+
+	expectHeld(t, r, logs, a, b, 10)
+	expectNothing(t, "B", b.conn)
+
+	clock.Add(relayRetryMin)
+	expectForwarded(t, r, a, b, 11)
+
+	// The response reaches A, and the new session carries transport both ways.
+	resp := responseFor(12, 11, a)
+	send(t, b.conn, r, resp)
+	expectRecv(t, a, resp)
+	toB := transportTo(12, 1)
+	send(t, a.conn, r, toB)
+	expectRecv(t, b, toB)
+	toA := transportTo(11, 1)
+	send(t, b.conn, r, toA)
+	expectRecv(t, a, toA)
+}
+
+func TestRelay_RetryBeforeTheMinimumStaysHeld(t *testing.T) {
+	r, logs, clock := testRelay(t)
+	a := newWGPeer(t, "node-a", 0x10)
+	b := newWGPeer(t, "node-b", 0x20)
+	mustConfigure(t, r, a, b)
+	handshake(t, r, a, b, 3, 2)
+
+	expectHeld(t, r, logs, a, b, 10)
+
+	clock.Add(3 * time.Second)
+	expectHeld(t, r, logs, a, b, 11)
+	expectNothing(t, "B", b.conn)
+
+	clock.Add(2 * time.Second)
+	expectForwarded(t, r, a, b, 12)
+}
+
+func TestRelay_ResponseEndsTheHold(t *testing.T) {
+	r, logs, clock := testRelay(t)
+	a := newWGPeer(t, "node-a", 0x10)
+	b := newWGPeer(t, "node-b", 0x20)
+	mustConfigure(t, r, a, b)
+	handshake(t, r, a, b, 3, 2)
+
+	expectHeld(t, r, logs, a, b, 10)
+	clock.Add(relayRetryMin)
+	expectForwarded(t, r, a, b, 11)
+
+	// The forwarded retry ends nothing: a retry can be lost, and the next one
+	// must pass too.
+	expectForwarded(t, r, a, b, 12)
+
+	resp := responseFor(13, 12, a)
+	send(t, b.conn, r, resp)
+	expectRecv(t, a, resp)
+
+	// The new session carries its first packet, and the clock has not moved, so
+	// a hold still running would let this one pass.
+	toB := transportTo(13, 0)
+	send(t, a.conn, r, toB)
+	expectRecv(t, b, toB)
+	expectHeld(t, r, logs, a, b, 14)
+	expectNothing(t, "B", b.conn)
+}
+
+func TestRelay_ForgedInitiationsCannotStarveARetry(t *testing.T) {
+	const (
+		// retryEvery is WireGuard's retry at its largest jitter.
+		retryEvery = 5*time.Second + 334*time.Millisecond
+		// walk stays under relayIndexTTL, so the session lives throughout.
+		walk = 90 * time.Second
+		// maxHeld is the longest run of held retries: a hold lasts
+		// relayRetryMin, which is shorter than retryEvery, so one retry at
+		// most falls into it.
+		maxHeld = 1
+	)
+	for _, forgeEvery := range []time.Duration{
+		500 * time.Millisecond,
+		2 * time.Second,
+		3 * time.Second,
+		relayRetryMin,
+		5 * time.Second,
+		retryEvery,
+		7 * time.Second,
+		relayHoldWindow,
+	} {
+		t.Run(fmt.Sprintf("forged every %s", forgeEvery), func(t *testing.T) {
+			r, logs, clock := testRelay(t)
+			a := newWGPeer(t, "node-a", 0x10)
+			b := newWGPeer(t, "node-b", 0x20)
+			mustConfigure(t, r, a, b)
+			handshake(t, r, a, b, 3, 2)
+
+			sender := uint32(100)
+			initiation := func() []byte {
+				sender++
+				return initiationFor(sender, b)
+			}
+
+			// The forger spoofs A's address, so it sends from A's socket. A
+			// forged initiation goes first when both fall on one instant,
+			// which is the order that suits it.
+			var at time.Duration
+			nextForged, nextRetry := forgeEvery, retryEvery
+			held := 0
+			for nextRetry <= walk {
+				if nextForged <= nextRetry {
+					clock.Add(nextForged - at)
+					at = nextForged
+					nextForged += forgeEvery
+					forwarded(t, r, logs, a, b, initiation())
+					continue
+				}
+				clock.Add(nextRetry - at)
+				at = nextRetry
+				nextRetry += retryEvery
+				if forwarded(t, r, logs, a, b, initiation()) {
+					held = 0
+					continue
+				}
+				held++
+				if held > maxHeld {
+					t.Fatalf("%d retries in a row held by %s", held, at)
+				}
+			}
+		})
+	}
+}
+
+func TestRelay_HoldWindowExpires(t *testing.T) {
+	r, logs, clock := testRelay(t)
+	a := newWGPeer(t, "node-a", 0x10)
+	b := newWGPeer(t, "node-b", 0x20)
+	mustConfigure(t, r, a, b)
+	handshake(t, r, a, b, 3, 2)
+
+	// No retry came, so the next initiation counts as a first one.
+	expectHeld(t, r, logs, a, b, 10)
+	clock.Add(relayHoldWindow)
+	expectHeld(t, r, logs, a, b, 11)
+	expectNothing(t, "B", b.conn)
+
+	// The new hold runs from that initiation, not from the first.
+	clock.Add(relayRetryMin - time.Nanosecond)
+	expectHeld(t, r, logs, a, b, 12)
+	clock.Add(time.Nanosecond)
+	expectForwarded(t, r, a, b, 13)
+
+	// A forwarded retry changes nothing: initiations pass until the window
+	// ends, and then a new hold starts.
+	clock.Add(relayHoldWindow - relayRetryMin - time.Nanosecond)
+	expectForwarded(t, r, a, b, 14)
+	clock.Add(time.Nanosecond)
+	expectHeld(t, r, logs, a, b, 15)
+}
+
+func TestRelay_ForwardsWithoutAHold(t *testing.T) {
+	tests := []struct {
+		name string
+		// setup brings the relay to the case and returns the peer whose socket
+		// sends the initiation for b.
+		setup func(t *testing.T, r *Relay, clock *relayClock, a, b, c *wgPeer) *wgPeer
+	}{
+		{
+			name: "a pair the relay never carried",
+			setup: func(_ *testing.T, r *Relay, _ *relayClock, a, b, _ *wgPeer) *wgPeer {
+				setAddr(r, a.id, a.addr())
+				setAddr(r, b.id, b.addr())
+				return a
+			},
+		},
+		{
+			// A device that re-dialed drops the response, so the pair may have
+			// no session, whatever the relay forwarded.
+			name: "a handshake that carried no transport message",
+			setup: func(t *testing.T, r *Relay, _ *relayClock, a, b, _ *wgPeer) *wgPeer {
+				handshakeOnly(t, r, a, b, 3, 2)
+				return a
+			},
+		},
+		{
+			name: "a source that matches no peer",
+			setup: func(t *testing.T, r *Relay, _ *relayClock, a, b, c *wgPeer) *wgPeer {
+				handshake(t, r, a, b, 3, 2)
+				return c
+			},
+		},
+		{
+			name: "a third peer",
+			setup: func(t *testing.T, r *Relay, _ *relayClock, a, b, c *wgPeer) *wgPeer {
+				handshake(t, r, a, b, 3, 2)
+				setAddr(r, c.id, c.addr())
+				return c
+			},
+		},
+		{
+			name: "session indices last used relayIndexTTL ago",
+			setup: func(t *testing.T, r *Relay, clock *relayClock, a, b, _ *wgPeer) *wgPeer {
+				handshake(t, r, a, b, 3, 2)
+				clock.Add(relayIndexTTL)
+				setAddr(r, b.id, b.addr())
+				return a
+			},
+		},
+		{
+			name: "session indices swept after relayIndexTTL",
+			setup: func(t *testing.T, r *Relay, clock *relayClock, a, b, _ *wgPeer) *wgPeer {
+				handshake(t, r, a, b, 3, 2)
+				clock.Add(relayIndexTTL)
+				r.sweep(clock.Now())
+				setAddr(r, b.id, b.addr())
+				return a
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, logs, clock := testRelay(t)
+			a := newWGPeer(t, "node-a", 0x10)
+			b := newWGPeer(t, "node-b", 0x20)
+			c := newWGPeer(t, "node-c", 0x30)
+			mustConfigure(t, r, a, b, c)
+
+			from := tt.setup(t, r, clock, a, b, c)
+			expectForwarded(t, r, from, b, 70)
+			waitIndex(t, r, 70, true)
+			if n := logs.count(heldReason); n != 0 {
+				t.Errorf("held %d initiations, want none", n)
+			}
+		})
+	}
+}
+
+func TestRelay_HoldChecksWhoOwnsTheIndex(t *testing.T) {
+	tests := []struct {
+		name string
+		// overwrite brings A and B's session to the case and returns the peer
+		// whose socket sends the initiation for b.
+		overwrite func(t *testing.T, r *Relay, a, c, d, twin *wgPeer) *wgPeer
+		held      bool
+	}{
+		{
+			name: "both indices taken by another pair",
+			overwrite: func(t *testing.T, r *Relay, a, c, d, _ *wgPeer) *wgPeer {
+				handshake(t, r, c, d, 3, 2)
+				return a
+			},
+		},
+		{
+			name: "both indices taken by a pair that shares one peer",
+			overwrite: func(t *testing.T, r *Relay, a, c, _, _ *wgPeer) *wgPeer {
+				handshake(t, r, a, c, 3, 2)
+				return a
+			},
+		},
+		{
+			name: "a peer with the same node ID",
+			overwrite: func(t *testing.T, r *Relay, _, c, _, twin *wgPeer) *wgPeer {
+				handshake(t, r, twin, c, 5, 4)
+				return twin
+			},
+		},
+		{
+			name: "one index left, owned by the target",
+			overwrite: func(t *testing.T, r *Relay, a, c, d, _ *wgPeer) *wgPeer {
+				handshake(t, r, c, d, 3, 5)
+				return a
+			},
+			held: true,
+		},
+		{
+			name: "one index left, owned by the initiator",
+			overwrite: func(t *testing.T, r *Relay, a, c, d, _ *wgPeer) *wgPeer {
+				handshake(t, r, c, d, 2, 5)
+				return a
+			},
+			held: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, logs, _ := testRelay(t)
+			a := newWGPeer(t, "node-a", 0x10)
+			b := newWGPeer(t, "node-b", 0x20)
+			c := newWGPeer(t, "node-c", 0x30)
+			d := newWGPeer(t, "node-d", 0x40)
+			twin := newWGPeer(t, "node-a", 0x50) // setPeers dedupes keys, not node IDs
+			mustConfigure(t, r, a, b, c, d, twin)
+			handshake(t, r, a, b, 3, 2)
+
+			from := tt.overwrite(t, r, a, c, d, twin)
+			if got := forwarded(t, r, logs, from, b, initiationFor(90, b)); got == tt.held {
+				t.Errorf("forwarded = %v, want %v", got, !tt.held)
+			}
+		})
+	}
+}
+
+func TestRelay_SweepDropsDeadPairs(t *testing.T) {
+	r, logs, clock := testRelay(t)
+	a := newWGPeer(t, "node-a", 0x10)
+	b := newWGPeer(t, "node-b", 0x20)
+	mustConfigure(t, r, a, b)
+	handshake(t, r, a, b, 3, 2)
+
+	// Transport to A keeps index 3 alive, and index 2 ages from the handshake.
+	clock.Add(relayIndexTTL - time.Second)
+	toA := transportTo(3, 1)
+	send(t, b.conn, r, toA)
+	expectRecv(t, a, toA)
+
+	has := func(i uint32) bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		_, ok := r.indices[i]
+		return ok
+	}
+
+	clock.Add(time.Second)
+	r.sweep(clock.Now())
+	if has(2) || !has(3) {
+		t.Fatalf("at relayIndexTTL: index 2 held = %v, index 3 held = %v; want only 3", has(2), has(3))
+	}
+	if n := pairCount(r); n != 1 {
+		t.Fatalf("pairs with one index left = %d, want 1", n)
+	}
+
+	// The index that is left still shows a session.
+	expectHeld(t, r, logs, a, b, 10)
+
+	clock.Add(relayIndexTTL)
+	r.sweep(clock.Now())
+	if has(3) {
+		t.Fatal("index 3 outlived relayIndexTTL")
+	}
+	if n := pairCount(r); n != 0 {
+		t.Errorf("pairs with no index left = %d, want none", n)
+	}
+}
+
+// A pair whose indices another pair took holds no session, although its
+// indices are still in the table. Keeping it would let pairs grow with the
+// listed peers instead of with the index table.
+func TestRelay_SweepDropsAPairWhoseIndicesWereTaken(t *testing.T) {
+	r, _, clock := testRelay(t)
+	a := newWGPeer(t, "node-a", 0x10)
+	b := newWGPeer(t, "node-b", 0x20)
+	c := newWGPeer(t, "node-c", 0x30)
+	d := newWGPeer(t, "node-d", 0x40)
+	mustConfigure(t, r, a, b, c, d)
+	handshake(t, r, a, b, 3, 2)
+	handshake(t, r, c, d, 3, 2)
+	if n := pairCount(r); n != 2 {
+		t.Fatalf("pairs after two handshakes = %d, want 2", n)
+	}
+
+	r.sweep(clock.Now())
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.pairs[pairKey(r.indices[2].owner, r.indices[2].partner)]; !ok || len(r.pairs) != 1 {
+		t.Errorf("pairs after a sweep = %d, want only the pair that owns the indices", len(r.pairs))
 	}
 }
 
@@ -1219,7 +1700,7 @@ func TestRelay_ConfigureKeepsWhatStillHolds(t *testing.T) {
 }
 
 func TestRelay_ConfigureForgetsARekeyedPeer(t *testing.T) {
-	r, logs, _ := testRelay(t)
+	r, logs, clock := testRelay(t)
 	a := newWGPeer(t, "node-a", 0x10)
 	b := newWGPeer(t, "node-b", 0x20)
 	mustConfigure(t, r, a, b)
@@ -1230,6 +1711,22 @@ func TestRelay_ConfigureForgetsARekeyedPeer(t *testing.T) {
 	send(t, a.conn, r, transportTo(2, 1))
 	logs.waitFor(t, "reason=unknown_index", 1)
 	expectNothing(t, "B", b.conn)
+
+	// The node ID still finds the pair, but Configure deleted its indices, so
+	// neither side waits for a retry and the next sweep drops the entry.
+	if n := pairCount(r); n != 1 {
+		t.Fatalf("pairs before the sweep = %d, want the rekeyed peer's old one", n)
+	}
+	setAddr(r, rekeyed.id, rekeyed.addr())
+	expectForwarded(t, r, rekeyed, a, 80)
+	expectForwarded(t, r, a, rekeyed, 81)
+	if n := logs.count(heldReason); n != 0 {
+		t.Errorf("%d initiations of a rekeyed peer were held, want none", n)
+	}
+	r.sweep(clock.Now())
+	if n := pairCount(r); n != 0 {
+		t.Errorf("pairs after the sweep = %d, want none", n)
+	}
 }
 
 func TestRelay_ConfigureBindsTheWildcardAddress(t *testing.T) {
