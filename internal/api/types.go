@@ -667,6 +667,14 @@ type AuditEntry struct {
 // checksum with it. The agent therefore sends only entries the contract
 // accepts: at most 128 per inventory, unique names, at most 64 parameters per
 // action, and a canonical image digest on every PlexdHook.
+//
+// A declared hook's metadata has limits of its own: a description and each
+// parameter text field at most 4096 characters, at most 64 parameters per hook,
+// timeout_seconds 0 to 86400, sandbox_level at most 64 characters, and no NUL
+// in any of them. Characters are Unicode code points. Those violations answer
+// 400, not 422: declared_hooks_too_many past 64 parameters and
+// declared_hook_invalid otherwise. A control plane that predates the fields
+// refuses them with 400 malformed_capabilities_request.
 type CapabilityManifestRequest struct {
 	// BinaryVersion is the agent version string, non-empty after trimming.
 	BinaryVersion string `json:"binary_version"`
@@ -694,13 +702,30 @@ type CapabilityManifestRequest struct {
 	BuiltinActions []ActionInfo `json:"builtin_actions,omitempty"`
 }
 
-// DeclaredHook pairs a hook name with the digest of its payload, so the
-// integrity correlator can see a hook change without re-fetching it.
+// DeclaredHook is one hook the agent advertises. Its name and the digest of its
+// payload let the integrity correlator see a hook change without re-fetching
+// it. The four fields after them come from the hook's sidecar and describe the
+// hook for an operator. They gate nothing and sit outside its digest, so a
+// sidecar edit changes them and leaves Checksum alone.
 type DeclaredHook struct {
 	Name string `json:"name"`
 	// Checksum is the hook payload's SHA-256 as 32 raw bytes in
 	// standard-padded base64, same encoding as BinaryChecksum.
 	Checksum string `json:"checksum"`
+	// Description says what the hook does, at most 4096 characters. Omitted
+	// when the sidecar declares none.
+	Description string `json:"description,omitempty"`
+	// Parameters are the parameters the hook expects, in sidecar order, at most
+	// 64. Each name is non-empty after trimming and unique within the hook.
+	// Omitted when empty rather than sent as null.
+	Parameters []ActionParam `json:"parameters,omitempty"`
+	// TimeoutSeconds is the timeout the sidecar declares, in whole seconds from
+	// 0 to 86400. 0 means none declared, and the key stays off the wire.
+	TimeoutSeconds int64 `json:"timeout_seconds,omitempty"`
+	// SandboxLevel is the sandbox level the sidecar declares, at most 64
+	// characters. The contract keeps it free-form. Omitted when the sidecar
+	// declares none.
+	SandboxLevel string `json:"sandbox_level,omitempty"`
 }
 
 // DiscoveredPlexdHook is one PlexdHook resource as the manifest reports it (the

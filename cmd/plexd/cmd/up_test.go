@@ -2255,7 +2255,7 @@ func TestDeclaredHooks(t *testing.T) {
 		t.Fatalf("declaredHooks returned %d entries (%+v), want %d", len(got), got, len(want))
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Errorf("entry %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
@@ -2329,7 +2329,7 @@ func TestDeclaredHooks(t *testing.T) {
 			{Name: "a\xff", Checksum: hexDigest},
 			{Name: "deploy", Checksum: hexDigest},
 		}, slog.New(rec))
-		if want := (api.DeclaredHook{Name: "deploy", Checksum: wantChecksum}); len(got) != 1 || got[0] != want {
+		if want := (api.DeclaredHook{Name: "deploy", Checksum: wantChecksum}); len(got) != 1 || !reflect.DeepEqual(got[0], want) {
 			t.Errorf("declaredHooks = %+v, want only %+v", got, want)
 		}
 		if n := rec.count(slog.LevelWarn, declaredHookOmittedMsg); n != 5 {

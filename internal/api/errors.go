@@ -310,6 +310,40 @@ func IsSecretAccessRevoked(err error) bool {
 	return errors.Is(err, ErrForbidden) || errors.Is(err, ErrNotFound)
 }
 
+// IsHookMetadataRefused reports whether err is a refusal of a capability
+// manifest that the short declared-hook entry can answer: a 413 with any code
+// or none, or a 400 carrying the malformed_capabilities_request,
+// declared_hook_invalid or declared_hooks_too_many problem code.
+//
+// A control plane refuses a manifest whole, so the reporter answers each of
+// these by dropping the hook metadata, which keeps a failure of the metadata
+// from costing the manifest. A 400 malformed_capabilities_request comes from a
+// control plane that predates the fields and refuses them as unknown keys. A
+// 400 declared_hook_invalid or declared_hooks_too_many means plexd's copy of
+// the limits has drifted from the control plane's. A 413 means the manifest is
+// over budget. It ignores the code because any layer on the path can say so,
+// and a proxy's own 413 carries no problem code.
+//
+// Every other failure says nothing about the metadata and is not classified
+// here. That includes a 400 with another code or none, such as
+// binary_checksum_invalid, which the short entry would draw again.
+func IsHookMetadataRefused(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.StatusCode {
+	case http.StatusRequestEntityTooLarge:
+		return true
+	case http.StatusBadRequest:
+		return apiErr.Code == "malformed_capabilities_request" ||
+			apiErr.Code == "declared_hook_invalid" ||
+			apiErr.Code == "declared_hooks_too_many"
+	default:
+		return false
+	}
+}
+
 // maxErrorBody is the maximum number of bytes read from an error response body.
 const maxErrorBody = 4096
 
