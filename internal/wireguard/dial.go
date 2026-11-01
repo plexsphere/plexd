@@ -55,8 +55,11 @@ const relayProbePort = 9
 // direct entries before them, which already failed. relayed implies
 // onFallback. recreatedAt is when a relay re-dial last replaced the device
 // peer; a handshake older than that belongs to the session the re-dial
-// dropped. The remaining fields are the relay liveness probe's state (see
-// checkRelay).
+// dropped. handshakeAt tells a new session from the one a pass already saw, so
+// a roam that brought no handshake is recognized. A re-dial needs no reset of
+// it: the peer is then not connected, and turning connected sets it.
+// restoredFor limits a session to one move back (see restoreRelay). The
+// remaining fields are the relay liveness probe's state (see checkRelay).
 type dialState struct {
 	peer         api.Peer
 	idx          int
@@ -65,6 +68,8 @@ type dialState struct {
 
 	relayed      bool
 	recreatedAt  time.Time
+	handshakeAt  time.Time // the peer's LastHandshake at the last pass that found it fresh
+	restoredFor  time.Time // the LastHandshake of the session a move back was last written for
 	rxBytes      uint64    // the device's RxBytes for the peer at the last pass
 	rxAt         time.Time // when the silence window started: rxBytes changed, the peer turned connected or came back on the relay, or a probe send failed
 	probedAt     time.Time // when the outstanding probe went out, zero when none is
@@ -139,12 +144,15 @@ func (s *dialState) nextRelay() string {
 // device endpoint equal to a relay that is an address names that relay,
 // whatever entry is programmed: WireGuard roams a peer to the address its
 // partner's initiation came from, so a peer programmed on a direct entry or on
-// another relay can run over this one. Without a device endpoint, the entry
-// programmed decides. A device endpoint that matches no relay means WireGuard
-// roamed to a path the peer opened directly, which a relay move must not cut
-// and the probe must not judge, unless the entry programmed is a relay and the
-// set holds a hostname, which cannot be compared: then the entry programmed
-// decides.
+// another relay can run over this one. A stale packet roams the device the
+// same way, so this says where the device sends, not that the session runs
+// there; selectEndpoints tells the two apart by the handshake. Without a
+// device endpoint, the entry programmed decides. A device endpoint that
+// matches no relay means WireGuard roamed to a path the peer opened directly,
+// which a relay move must not cut and the probe must not judge, unless the
+// entry programmed is a relay and the set holds a hostname, which cannot be
+// compared: then the entry programmed decides. An address entry of such a set
+// still matches first, so only a device endpoint no entry names gets there.
 func (s *dialState) relayedOver(stat MeshPeerStat) (relay string, ok bool) {
 	if stat.Endpoint.IsValid() {
 		unmapped := func(ap netip.AddrPort) netip.AddrPort { return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()) }
@@ -294,18 +302,23 @@ func isOnLink(addr netip.Addr, local []netip.Prefix) bool {
 // selectEndpoints runs one pass of endpoint selection over every peer it
 // tracks, in node-ID order. A peer whose latest handshake is younger than
 // connectedHandshakeAge is connected, and its device endpoint is left alone,
-// so WireGuard's roaming stays in effect. A peer that is not connected is
-// moved to the next entry of its walk (see dialState.walk) once the current
-// one has been tried for its trial (see dialState.trial): the keepalive
-// interval plus endpointTrialMargin, or for a relay that follows n direct
-// entries, n times that. The switch is logged with the trial of the entry it
-// programs.
+// so WireGuard's roaming stays in effect, with the two exceptions below, a
+// re-dial after an unanswered probe and a move back. A peer that is not
+// connected is moved to the next entry of its walk (see dialState.walk) once
+// the current one has been tried for its trial (see dialState.trial): the
+// keepalive interval plus endpointTrialMargin, or for a relay that follows n
+// direct entries, n times that. The switch is logged with the trial of the
+// entry it programs.
 //
 // A relayed peer (see dialState) never moves to a direct entry. While it is
 // connected, checkRelay probes it once it falls silent. When its handshake
 // goes stale, or the probe goes unanswered, the next relay of its set is
 // dialed on a fresh device peer, and the next one again each time a relay's
-// trial passes without a handshake.
+// trial passes without a handshake. A connected relayed peer the device
+// reports at another relay of its set follows that relay when a new handshake
+// came with the roam. Without one it is moved back to the entry programmed,
+// once per session, and a second roam in the session is followed (see
+// restoreRelay).
 //
 // The device is read before mu is taken. A read error, ErrPeerStatsUnsupported
 // included, is returned unchanged with no state touched. A failed switch of
@@ -313,7 +326,9 @@ func isOnLink(addr netip.Addr, local []netip.Prefix) bool {
 // joined into the returned error; its next attempt waits that entry's full
 // trial again. A failed relay re-dial is logged and joined the same way, but
 // moves the peer's position to the relay it tried, so the next attempt, one
-// relay hold later, dials the relay after it (see redialInPass).
+// relay hold later, dials the relay after it (see redialInPass). A failed move
+// back is logged and joined too, and records nothing, so the next pass writes
+// again.
 func (m *Manager) selectEndpoints() error {
 	stats, err := m.MeshPeerStats()
 	if err != nil {
@@ -345,6 +360,7 @@ func (m *Manager) selectEndpoints() error {
 		switch {
 		case isFresh && !st.connected:
 			st.connected = true
+			st.handshakeAt = stat.LastHandshake
 			relay, relayed := st.relayedOver(stat)
 			st.relayed = relayed
 			if relayed {
@@ -367,9 +383,35 @@ func (m *Manager) selectEndpoints() error {
 			continue
 		case isFresh:
 			relay, relayed := st.relayedOver(stat)
+			// The device changes LastHandshake only when a handshake completes,
+			// so any change is a new session, even an older value after the
+			// wall clock stepped back.
+			sameSession := stat.LastHandshake.Equal(st.handshakeAt)
+			st.handshakeAt = stat.LastHandshake
+			// A relay drops every packet of a session whose handshake it did
+			// not forward (see redialRelay), so a roam between relays with no
+			// new handshake almost always means a stale packet moved the
+			// device, and the session still runs over the entry programmed. A
+			// pass that reads the device in the round trip before a partner's
+			// initiation completes sees the same thing: its write costs at most
+			// a packet, and the next pass follows the new handshake. A position
+			// can be wrong too, when the stale packet landed within one pass of
+			// the handshake and the pass took its relay for the session's. The
+			// partner's next packet then heals the device, and a move back
+			// would undo that on every pass until the next handshake. So a
+			// session gets one move back, and a second roam falls through to
+			// the follow below, which heals the position.
+			if sameSession && st.relayed && relayed && relay != st.endpoint() && !stat.LastHandshake.Equal(st.restoredFor) {
+				if err := m.restoreRelay(nodeID, st, relay); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+				st.restoredFor = stat.LastHandshake
+				continue
+			}
 			if relayed && (!st.relayed || relay != st.endpoint()) {
-				// Back on a relay, or roamed to another one: the silence
-				// window starts now.
+				// Back on a relay, or on another one after a new handshake or
+				// a second roam in the session: the silence window starts now.
 				st.idx = max(slices.Index(st.order(), relay), 0)
 				st.rxBytes = stat.RxBytes
 				st.rxAt = now
@@ -461,6 +503,37 @@ func (m *Manager) selectEndpoints() error {
 		)
 	}
 	return errors.Join(errs...)
+}
+
+// restoreRelay writes the entry programmed back to the device of a relayed
+// peer that roamed, with no new handshake, to roamed, another of its relays.
+// It does not remove the device peer: the session over the entry programmed is
+// valid, and a re-dial would cut it. The position, connected, relayed and the
+// probe's state stay as they are, because the session never left that entry. A
+// failed write is logged and wrapped like a failed switch of the walk. Callers
+// hold m.mu.
+func (m *Manager) restoreRelay(nodeID string, st *dialState, roamed string) error {
+	endpoint := st.endpoint()
+	peerCfg, err := m.peerConfig(st.peer, endpoint)
+	if err == nil {
+		err = m.ctrl.AddPeer(m.cfg.InterfaceName, peerCfg)
+	}
+	if err != nil {
+		m.logger.Warn("wireguard: endpoint switch failed",
+			"component", "wireguard",
+			"peer_id", nodeID,
+			"endpoint", endpoint,
+			"error", err,
+		)
+		return fmt.Errorf("wireguard: switch endpoint of peer %s: %w", nodeID, err)
+	}
+	m.logger.Info("wireguard: relayed peer roamed to a relay its session does not run over, moving it back",
+		"component", "wireguard",
+		"peer_id", nodeID,
+		"from", roamed,
+		"endpoint", endpoint,
+	)
+	return nil
 }
 
 // checkRelay runs the relay liveness probe for a relayed peer whose handshake
