@@ -24,6 +24,19 @@ const (
 	// initiator's NAT mapping is still open.
 	relayFanoutWindow = 30 * time.Second
 
+	// relayRetryMin is how long after the first held initiation the relay
+	// forwards the next one. WireGuard repeats an unanswered initiation after
+	// its RekeyTimeout of 5 s plus up to 334 ms of jitter, and a backlog drains
+	// in milliseconds, so a backlog ends inside this time and a retry does not.
+	// The 1 s margin absorbs network jitter. A retry that arrives earlier stays
+	// held, and the one after it passes.
+	relayRetryMin = 4 * time.Second
+
+	// relayHoldWindow is how long a hold lasts. Past it, an initiation counts
+	// as a first one again. Two retries fit in it at WireGuard's largest
+	// jitter, and it ends well before the next 120 s rekey.
+	relayHoldWindow = 15 * time.Second
+
 	// relayFanoutMax is the most sources one initiation is fanned out to.
 	relayFanoutMax = 8
 
@@ -32,7 +45,8 @@ const (
 	// dropped, and a peer address not seen for this long is no longer fresh.
 	relayIndexTTL = 180 * time.Second
 
-	// relaySweepInterval is how often the sweeper deletes expired indices.
+	// relaySweepInterval is how often the sweeper deletes expired indices and
+	// the pairs left with neither of theirs.
 	relaySweepInterval = 30 * time.Second
 
 	// relayMaxIndices caps the index table.
@@ -77,13 +91,26 @@ type relayPeer struct {
 // its mac1, and src the initiator's source address, since the initiator is
 // not known yet. A session index is one side of a handshake the relay
 // forwarded: owner is the peer that chose the index, so datagrams naming it
-// as receiver go to owner, and partner is the other side.
+// as receiver go to owner, and partner is the other side. carried records that
+// a transport message named it, which is what shows the handshake completed: a
+// device that re-dialed in the meantime drops the response the relay forwarded.
 type relayIndex struct {
 	pending bool
 	owner   *relayPeer
 	partner *relayPeer
 	src     netip.AddrPort
 	used    time.Time
+	carried bool
+}
+
+// relayPair is two peers the relay forwarded a handshake for: the session
+// indices of their latest handshake, and when the relay last started to hold
+// an initiation of theirs, zero until it first does. A forwarded retry leaves
+// heldAt set, so a forger cannot start a new hold right after each forward. A
+// response clears it by replacing the entry.
+type relayPair struct {
+	indices [2]uint32
+	heldAt  time.Time
 }
 
 // relayRun is one bound socket and the goroutines serving it.
@@ -101,8 +128,10 @@ type relayRun struct {
 // Relay forwards WireGuard between the peers of a state pull through one UDP
 // socket. It works out each datagram's destination from the WireGuard message
 // header: an initiation goes to the peer whose public key verifies its mac1,
-// every other message by its receiver index. It holds no private or
-// preshared key, decrypts nothing, and never answers a datagram.
+// every other message by its receiver index. An initiation between two peers
+// that hold a session waits for its retry, so a backlog that queued while the
+// relay was frozen cannot move them to it (see holdInitiation). It holds no
+// private or preshared key, decrypts nothing, and never answers a datagram.
 type Relay struct {
 	logger *slog.Logger
 
@@ -116,11 +145,12 @@ type Relay struct {
 	// interleave.
 	life sync.Mutex
 
-	// mu guards run, peers, indices and fullWarnedAt.
+	// mu guards run, peers, indices, pairs and fullWarnedAt.
 	mu           sync.Mutex
 	run          *relayRun
 	peers        map[device.NoisePublicKey]*relayPeer
 	indices      map[uint32]*relayIndex
+	pairs        map[[2]string]*relayPair
 	fullWarnedAt time.Time
 }
 
@@ -135,6 +165,7 @@ func NewRelay(logger *slog.Logger) *Relay {
 		maxIndices: relayMaxIndices,
 		peers:      make(map[device.NoisePublicKey]*relayPeer),
 		indices:    make(map[uint32]*relayIndex),
+		pairs:      make(map[[2]string]*relayPair),
 	}
 }
 
@@ -247,6 +278,7 @@ func (r *Relay) stopLocked() {
 	r.mu.Lock()
 	r.peers = make(map[device.NoisePublicKey]*relayPeer)
 	r.indices = make(map[uint32]*relayIndex)
+	r.pairs = make(map[[2]string]*relayPair)
 	r.fullWarnedAt = time.Time{}
 	r.mu.Unlock()
 
@@ -293,13 +325,18 @@ func (r *Relay) ActiveCount() int {
 		if idx.pending || now.Sub(idx.used) >= relayIndexTTL {
 			continue
 		}
-		pair := [2]string{idx.owner.nodeID, idx.partner.nodeID}
-		if pair[0] > pair[1] {
-			pair[0], pair[1] = pair[1], pair[0]
-		}
-		pairs[pair] = struct{}{}
+		pairs[pairKey(idx.owner, idx.partner)] = struct{}{}
 	}
 	return len(pairs)
+}
+
+// pairKey returns the key of the unordered pair of a and b: their node IDs in
+// sorted order.
+func pairKey(a, b *relayPeer) [2]string {
+	if a.nodeID > b.nodeID {
+		return [2]string{b.nodeID, a.nodeID}
+	}
+	return [2]string{a.nodeID, b.nodeID}
 }
 
 // setPeers replaces the peer set from peers; see Configure.
@@ -381,7 +418,8 @@ func (r *Relay) dispatchLoop(run *relayRun) {
 
 // route appends to dsts the addresses b, received from src, is forwarded to,
 // and updates the relay's state. A datagram it cannot forward is logged as
-// dropped and gets no destination.
+// dropped and gets no destination, and so is an initiation it could forward
+// but holds for its retry.
 func (r *Relay) route(run *relayRun, b []byte, src netip.AddrPort, dsts []netip.AddrPort) []netip.AddrPort {
 	msg, ok := parseWGMessage(b)
 	if !ok {
@@ -418,7 +456,9 @@ func (r *Relay) route(run *relayRun, b []byte, src netip.AddrPort, dsts []netip.
 
 // routeInitiation forwards an initiation to the peer T whose key verifies its
 // mac1: to T's address when fresh, otherwise to the recent pending initiators
-// (see fanout). It records the sender index as pending for T.
+// (see fanout). It records the sender index as pending for T. An initiation
+// holdInitiation keeps back is dropped before that, because nothing can answer
+// it.
 func (r *Relay) routeInitiation(b []byte, msg wgMessage, src netip.AddrPort, now time.Time, dsts []netip.AddrPort) ([]netip.AddrPort, string) {
 	target := r.mac1Peer(b, nil)
 	if target == nil {
@@ -427,6 +467,9 @@ func (r *Relay) routeInitiation(b []byte, msg wgMessage, src netip.AddrPort, now
 	direct := r.fresh(target, now)
 	if direct && target.addr == src {
 		return dsts, "no_route"
+	}
+	if r.holdInitiation(target, src, now) {
+		return dsts, "held_for_retry"
 	}
 	if !r.room(msg.sender, now) {
 		return dsts, "index_table_full"
@@ -444,10 +487,66 @@ func (r *Relay) routeInitiation(b []byte, msg wgMessage, src netip.AddrPort, now
 	return dsts, ""
 }
 
+// holdInitiation reports whether the relay keeps back an initiation for target
+// from src. A relay that resumes after a freeze reads the initiations queued
+// on its socket, and a node that accepts one moves its endpoint here, off the
+// relay its session now runs over. An initiation's age is encrypted and the
+// relay's clock stood still, so only the timing after the resume separates a
+// stale initiation from a live one: a backlog drains in milliseconds, and
+// WireGuard retries about 5 s later.
+//
+// So the first initiation of two peers with a live session starts a hold, and
+// what follows within relayRetryMin stays held. Until relayHoldWindow ends,
+// every later initiation passes, and only then can a new hold start. A forged
+// initiation can therefore never hold more than the first relayRetryMin of a
+// window, and WireGuard's next retry lands after it. A source that is no peer,
+// or two peers with no live session, is first contact and passes at once.
+func (r *Relay) holdInitiation(target *relayPeer, src netip.AddrPort, now time.Time) bool {
+	var initiator *relayPeer
+	for _, p := range r.peers {
+		if p != target && p.addr == src {
+			initiator = p
+			break
+		}
+	}
+	if initiator == nil {
+		return false
+	}
+	pair, ok := r.pairs[pairKey(initiator, target)]
+	if !ok || !r.sessionLive(pair, initiator, target, now) {
+		return false
+	}
+	if pair.heldAt.IsZero() || now.Sub(pair.heldAt) >= relayHoldWindow {
+		pair.heldAt = now
+		return true
+	}
+	return now.Sub(pair.heldAt) < relayRetryMin
+}
+
+// sessionLive reports whether one of pair's indices is a session index of a
+// and b that carried a transport message and was used within relayIndexTTL. A
+// handshake that carried nothing may not have completed, and holding the next
+// attempt would delay a pair that has no session. It checks who owns the index
+// because another pair's handshake can overwrite it, and because two peers can
+// share a node ID and with it a pair key.
+func (r *Relay) sessionLive(pair *relayPair, a, b *relayPeer, now time.Time) bool {
+	for _, i := range pair.indices {
+		idx, ok := r.indices[i]
+		if !ok || idx.pending || !idx.carried || now.Sub(idx.used) >= relayIndexTTL {
+			continue
+		}
+		if (idx.owner == a && idx.partner == b) || (idx.owner == b && idx.partner == a) {
+			return true
+		}
+	}
+	return false
+}
+
 // routeResponse forwards a response to the source of the pending initiation
 // it answers, when its mac1 verifies for a peer I other than that
-// initiation's target T. Both addresses are learned from it, and both indices
-// become session indices.
+// initiation's target T. Both addresses are learned from it, both indices
+// become session indices, and the pair is recorded with them, which ends a
+// hold on it.
 func (r *Relay) routeResponse(b []byte, msg wgMessage, src netip.AddrPort, now time.Time, dsts []netip.AddrPort) ([]netip.AddrPort, string) {
 	pending, ok := r.indices[msg.receiver]
 	if !ok || !pending.pending {
@@ -473,6 +572,7 @@ func (r *Relay) routeResponse(b []byte, msg wgMessage, src netip.AddrPort, now t
 	r.learn(initiator, pending.src, now)
 	r.indices[msg.receiver] = &relayIndex{owner: initiator, partner: target, used: now}
 	r.indices[msg.sender] = &relayIndex{owner: target, partner: initiator, used: now}
+	r.pairs[pairKey(initiator, target)] = &relayPair{indices: [2]uint32{msg.receiver, msg.sender}}
 	return append(dsts, pending.src), ""
 }
 
@@ -506,6 +606,7 @@ func (r *Relay) routeTransport(msg wgMessage, src netip.AddrPort, now time.Time,
 	}
 	r.learn(idx.partner, src, now)
 	idx.used = now
+	idx.carried = true
 	return append(dsts, dst), ""
 }
 
@@ -610,8 +711,8 @@ func (r *Relay) sweepLoop(run *relayRun) {
 	}
 }
 
-// sweep deletes pending indices older than relayFanoutWindow and session
-// indices unused for relayIndexTTL.
+// sweep deletes pending indices older than relayFanoutWindow, session indices
+// unused for relayIndexTTL, and pairs with neither of their indices left.
 func (r *Relay) sweep(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -628,6 +729,23 @@ func (r *Relay) sweepLocked(now time.Time) {
 			delete(r.indices, i)
 		}
 	}
+	for key, pair := range r.pairs {
+		if !r.holdsIndex(key, pair) {
+			delete(r.pairs, key)
+		}
+	}
+}
+
+// holdsIndex reports whether one of pair's indices is still a session index of
+// the two peers of key. Another pair's handshake can overwrite an index, so
+// finding it in indices is not enough, and pairs would outgrow the index table.
+func (r *Relay) holdsIndex(key [2]string, pair *relayPair) bool {
+	for _, i := range pair.indices {
+		if idx, ok := r.indices[i]; ok && !idx.pending && pairKey(idx.owner, idx.partner) == key {
+			return true
+		}
+	}
+	return false
 }
 
 // drop logs a datagram from src the relay does not forward.
