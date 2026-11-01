@@ -39,17 +39,25 @@ first three gates were added after a release shipped past them; the handshake
 report, the edge PSK route and the endpoint candidates route were gated from the
 start:
 
-- **`PUT /v1/nodes/{id}/capabilities`** strict-decodes a `CapabilityManifestRequest`
+- **`PUT /v1/nodes/{id}/capabilities`** caps the body at 1 MiB
+  (`413 capabilities_body_too_large`), strict-decodes a `CapabilityManifestRequest`
   (`DisallowUnknownFields`) and enforces its invariants: a non-empty
   `binary_version`, a `binary_checksum` that decodes to exactly 32 bytes of
   standard-padded base64, a canonical `SHA256:<base64>` fingerprint when present,
-  and `declared_hooks` that are unique, named, and carry a 32-byte digest. A hex
-  digest decodes to 48 bytes and is refused with `binary_checksum_invalid`; a
-  gzip-compressed body fails the decode, as it does upstream. The fixture used to
-  decode into whatever shape the agent sent and count it. The two advertised
-  inventories are checked after that, `plexd_hooks` first, and a violation is
-  answered `422` with the contract's code: `plexd_hook_invalid` (empty name,
-  non-canonical `image_digest`, negative `timeout_seconds`),
+  and `declared_hooks` that are unique, named with no NUL, and carry a 32-byte
+  digest. A hex digest decodes to 48 bytes and is refused with
+  `binary_checksum_invalid`; a gzip-compressed body fails the decode, as it does
+  upstream. The fixture used to decode into whatever shape the agent sent and
+  count it. A declared hook's metadata stays inside the contract's limits: a
+  `description` of at most 4096 characters, a `sandbox_level` of at most 64, a
+  `timeout_seconds` from 0 to 86400, and parameters with names that are not blank
+  and not repeated, with `name`, `type`, `default`, and `description` at most 4096
+  characters each. Characters are code points, a NUL in any of these strings is
+  refused, and `"parameters": null` counts as none. A violation answers
+  `400 declared_hook_invalid`, or `400 declared_hooks_too_many` past 64 parameters.
+  The two advertised inventories are checked after that, `plexd_hooks` first, and
+  a violation is answered `422` with the contract's code: `plexd_hook_invalid`
+  (empty name, non-canonical `image_digest`, negative `timeout_seconds`),
   `plexd_hook_duplicate`, `plexd_hooks_too_many` (over 128),
   `builtin_action_invalid` (empty action or parameter name, or a parameter
   declared twice), `builtin_action_duplicate`, and `builtin_actions_too_many`
@@ -1267,25 +1275,28 @@ refresh interval to exercise the deadline-driven re-report path.
 
 ### `POST /test/configure-capabilities`
 
-Arms a failure of `PUT /v1/nodes/{id}/capabilities`. Lets a test exercise the
-agent's retry of a failed capability report.
+Arms a failure of `PUT /v1/nodes/{id}/capabilities`, a refusal of its hook
+metadata, or both. Lets a test exercise the agent's retry of a failed capability
+report and its fallback to the short manifest entry.
 
 **Request body:** strict-decoded: an unknown field is a `400`.
 
 ```json
-{ "fail_next": 2 }
+{ "fail_next": 2, "refuse_hook_metadata": true }
 ```
 
 **Response:** `204 No Content`.
 
 **Behavior:**
 
+- One POST sets both fields, so a field left out resets to its zero value: `{"fail_next": 2}` also lifts a refusal, and `{"refuse_hook_metadata": true}` also clears a pending count.
 - `fail_next` sets how many of the next PUTs fail, replacing any pending count, so `0` clears one.
-- An armed PUT is captured first, so `GET /test/last-request/capabilities` shows what it carried, and is then answered `500` with problem code `internal`, before validation and before `capabilities_count` moves.
+- An armed PUT is captured first, so `GET /test/last-request/capabilities` shows what it carried, and is then answered `500` with problem code `internal`, before validation and before `capabilities_count` moves. A body past the 1 MiB cap answers its `413` and spends no count.
 - The count is decremented once per PUT, so exactly N PUTs fail, also under concurrent requests.
+- `refuse_hook_metadata`, while true, answers a manifest in which any `declared_hooks` entry carries metadata with `400 malformed_capabilities_request`, as a control plane that predates those fields does. The refusal comes right after the strict decode and ahead of every invariant, and an armed `fail_next` comes before it. The body is captured first and `capabilities_count` does not move. A manifest of short entries passes.
 - Request body is captured and retrievable via `GET /test/last-request/configure_capabilities`.
 
-**Error:** Returns `400` if the body is not valid JSON, contains an unknown field, or sets a negative `fail_next` (`{"error": "fail_next must not be negative"}`), and leaves the pending count alone. Returns `405` if the HTTP method is not `POST`.
+**Error:** Returns `400` if the body is not valid JSON, contains an unknown field or a value of the wrong type, or sets a negative `fail_next` (`{"error": "fail_next must not be negative"}`), and changes neither field. Returns `405` if the HTTP method is not `POST`.
 
 ### `POST /test/configure-secrets`
 

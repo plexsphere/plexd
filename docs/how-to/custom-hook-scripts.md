@@ -78,10 +78,14 @@ underscore) are replaced with underscores. For example, a parameter named
 
 ## Step 2: Create an Optional Metadata Sidecar
 
-A JSON sidecar file provides metadata about the hook, which plexd lists on the
-local node API. The capability manifest carries only the hook's name and digest,
-so the sidecar does not reach the control plane. The sidecar file must have the
+A JSON sidecar file provides metadata about the hook. plexd lists it on the local
+node API and reports it in the capability manifest, so the control plane can show
+an operator what the hook does and what it expects. The sidecar file must have the
 same name as the hook script with a `.json` extension.
+
+> **Warning**: A sidecar's content reaches the control plane and everyone who holds
+> `read` there, and no setting keeps it on the node. A sidecar must hold no secret,
+> whether in a description or in a parameter's `default`.
 
 ```bash
 cat > /tmp/restart-service.sh.json << 'EOF'
@@ -103,25 +107,45 @@ EOF
 
 ### Sidecar Fields
 
-| Field         | Type            | Description                                    |
-|---------------|-----------------|------------------------------------------------|
-| `description` | `string`        | Human-readable description of the hook         |
-| `parameters`  | `[]ActionParam` | List of expected parameters with types         |
-| `timeout`     | `string`        | Suggested default timeout (e.g. `"30s"`)       |
-| `sandbox`     | `string`        | Sandbox mode hint (reserved for future use)    |
+| Field         | Manifest key      | Type            | Limit           | Description                                    |
+|---------------|-------------------|-----------------|-----------------|------------------------------------------------|
+| `description` | `description`     | `string`        | 4096 characters | Human-readable description of the hook         |
+| `parameters`  | `parameters`      | `[]ActionParam` | 64 parameters   | List of expected parameters with types         |
+| `timeout`     | `timeout_seconds` | `string`        | 24 hours        | Suggested default timeout in [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration) format (e.g. `"30s"`), reported in whole seconds, rounded up |
+| `sandbox`     | `sandbox_level`   | `string`        | 64 characters   | Sandbox mode hint, free-form                   |
+
+Characters are Unicode code points, and a NUL in any string breaks its limit. The
+manifest as a whole has a 1 MiB budget, so sidecars inside every limit can still
+be refused together; see
+[When Hook Metadata Is Refused](../reference/actions/remote-actions-hooks.md#when-hook-metadata-is-refused).
+
+`timeout` needs a unit, so `"30"` breaks the rule, and so does a negative value.
+`"1500ms"` reports 2 and `"500ms"` reports 1. `"0s"` declares no timeout, and the
+key stays off the manifest.
+
+plexd reports `timeout` and `sandbox` as written and does not enforce them yet. A
+script still runs until the action timeout, and a sandbox level changes nothing
+about how it runs.
 
 Each parameter entry:
 
-| Field         | Type     | Description                           |
-|---------------|----------|---------------------------------------|
-| `name`        | `string` | Parameter name                        |
-| `type`        | `string` | Type hint (`string`, `bool`, `int`)   |
-| `required`    | `bool`   | Whether the parameter is required     |
-| `default`     | `string` | Default value for optional parameters |
-| `description` | `string` | Human-readable description            |
+| Field         | Type     | Limit           | Description                           |
+|---------------|----------|-----------------|---------------------------------------|
+| `name`        | `string` | 4096 characters | Parameter name, not blank after trimming and unique within the hook |
+| `type`        | `string` | 4096 characters | Type hint (`string`, `bool`, `int`)   |
+| `required`    | `bool`   | None            | Whether the parameter is required     |
+| `default`     | `string` | 4096 characters | Default value for optional parameters |
+| `description` | `string` | 4096 characters | Human-readable description            |
 
-The sidecar file is optional. If missing or malformed, the hook is still
-discovered but reported without metadata.
+A parameter reaches the manifest under the same keys. One parameter that breaks a
+rule leaves the whole `parameters` list off the manifest, because a form with a
+required parameter missing misleads the operator who fills it in.
+
+The sidecar file is optional. If it is missing, malformed, or unreadable, the hook
+is still discovered but reported without metadata. A field that breaks a limit is
+left off the manifest with a warning, and the hook stays with its other fields,
+because the control plane refuses a manifest whole and one bad field would
+otherwise cost every hook on the node.
 
 ## Step 3: Deploy to the Hooks Directory
 
@@ -162,7 +186,8 @@ restart. **Changing** one does: the digest a hook is executed against is pinned
 at first discovery and the watcher cannot move it, so an edited hook is refused
 until the agent restarts (see [What an Edit Does](#what-an-edit-does)).
 
-When a hook file is added, modified, or removed, plexd:
+When a hook file is added, modified, or removed, or its sidecar is edited or
+removed, plexd:
 
 1. Detects the filesystem event (with debouncing)
 2. Checks that the file is a regular, executable file. Anything else is skipped,
@@ -172,9 +197,17 @@ When a hook file is added, modified, or removed, plexd:
 5. Reports the updated capability manifest to the control plane, within seconds
 
 The report waits for a quiet second, so a burst of changes costs one report, and
-it is skipped when the manifest matches the one last accepted, as it does after a
-`touch` on a hook or a sidecar edit. A report that fails is retried on a backoff
-until it lands; see [Retries](../reference/actions/remote-actions-hooks.md#retries).
+it is skipped when the manifest matches the one last accepted, as it is after a
+`touch` on a hook or its sidecar. A sidecar edit or removal changes the manifest,
+so it is reported. A sidecar sits outside the hook's digest, so the change moves
+no digest and needs no restart.
+
+A report that fails is retried on a backoff until it lands; see
+[Retries](../reference/actions/remote-actions-hooks.md#retries). A control plane
+that refuses the hook metadata is the exception: plexd sends the hook's name and
+digest at once, and tries the metadata again when the content changes and about
+hourly. See
+[When Hook Metadata Is Refused](../reference/actions/remote-actions-hooks.md#when-hook-metadata-is-refused).
 
 The scan at startup follows the same process for all existing hooks, and it runs
 before plexd sends its first manifest, so that manifest carries the hooks on disk.
@@ -231,7 +264,9 @@ new digest for a known hook. Two checks then refuse the hook, one on each side:
   baseline. A later digest raises an integrity alert with the recommended action
   `quarantine_node` and refuses dispatch until the control plane accepts the new
   digest. Every accepted PUT that still carries the drifted digest raises another
-  alert, which is why plexd has no periodic re-send.
+  alert, which is why plexd has no periodic re-send of a manifest the control
+  plane holds. A sidecar edit on such a hook is one more accepted PUT, so it raises
+  one more alert.
 - **The node** keeps the digest it pinned. An edited hook runs again after an
   agent restart, not after `plexd hooks reload`, which re-scans the directory and
   moves no pin.
@@ -309,6 +344,10 @@ Control Plane                          Node (plexd)
 | Hook missing from capabilities | Not a regular file, such as a FIFO | Install a regular file; a symlink to an executable one is fine, but plexd watches the link and not its target, so run `plexd hooks reload` after changing the target |
 | Hook missing from capabilities | `agent: capability report: send failed` in the log | plexd retries on its own; the `error` attribute names what to fix |
 | Hook missing from capabilities | `hook watcher stopped` in the log | Fix the cause, then run `plexd hooks reload` or restart the agent |
+| Hook reported without metadata | A field breaks a limit: `hook metadata omitted from the capability manifest` in the log | The `field` and `error` attributes name what to fix in the sidecar; the hook's other fields are still reported |
+| Hook reported without metadata | The control plane refused it: `agent: capability report: hook metadata refused; sending names and digests` in the log | The `error` attribute names the refusal. Upgrade an older control plane, or trim the sidecars of a manifest over its 1 MiB budget. plexd tries again on its own when the content changes and about hourly |
+| Hook reported without metadata | Sidecar unreadable: `sidecar read failed` in the log | Make the file the `file` attribute names a regular, readable file |
+| Hook reported without metadata | Sidecar malformed: `sidecar parse failed` in the log | Fix the JSON in the file the `file` attribute names |
 
 ### Hook Execution Fails
 
