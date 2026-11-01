@@ -663,10 +663,19 @@ type alias for `[]AuditEntry`
 
 **DeclaredHook**
 
-| Field      | Type     | JSON Tag     | Description                                        |
-|------------|----------|--------------|----------------------------------------------------|
-| `Name`     | `string` | `"name"`     | Hook identifier, non-empty                         |
-| `Checksum` | `string` | `"checksum"` | Hook payload SHA-256: 32 bytes, standard-padded base64 |
+| Field            | Type            | JSON Tag                      | Description                                        |
+|------------------|-----------------|-------------------------------|----------------------------------------------------|
+| `Name`           | `string`        | `"name"`                      | Hook identifier, non-empty                         |
+| `Checksum`       | `string`        | `"checksum"`                  | Hook payload SHA-256: 32 bytes, standard-padded base64 |
+| `Description`    | `string`        | `"description,omitempty"`     | What the hook does, at most 4096 characters        |
+| `Parameters`     | `[]ActionParam` | `"parameters,omitempty"`      | What the hook expects, in sidecar order, at most 64. Each `Name` is non-empty after trimming and unique within the hook, and `Name`, `Type`, `Default`, and `Description` are at most 4096 characters each |
+| `TimeoutSeconds` | `int64`         | `"timeout_seconds,omitempty"` | The timeout the sidecar declares, in whole seconds from 0 to 86400. 0 means none declared |
+| `SandboxLevel`   | `string`        | `"sandbox_level,omitempty"`   | The sandbox level the sidecar declares, at most 64 characters, free-form |
+
+The last four fields come from the hook's sidecar and describe the hook. They gate
+nothing and sit outside its digest, so a hook with no sidecar marshals to `name`
+and `checksum` alone. Characters are Unicode code points, and a NUL in any of these
+strings is refused.
 
 **DiscoveredPlexdHook** — one `PlexdHook` resource as the manifest reports it
 (the contract's `PlexdHook` schema).
@@ -691,10 +700,15 @@ outright:
   an invariant is answered `422`, and the binary version and checksum are lost
   with it. plexd therefore sends only entries it knows are valid: at most 128 per
   inventory, at most 64 parameters per action, unique names, and a canonical
-  image digest on every PlexdHook.
-- **Empty inventories are omitted.** Both inventory fields and
-  `ActionInfo.Parameters` are `omitempty`, so an empty list leaves its key off
-  instead of sending `null` where the contract expects an array.
+  image digest on every PlexdHook. A declared hook's metadata that breaks a limit
+  is answered `400`, not `422`: `declared_hooks_too_many` past 64 parameters and
+  `declared_hook_invalid` otherwise. plexd leaves such a field off with a warning,
+  and a manifest refused anyway for its metadata goes out again in the short
+  `name` and `checksum` form.
+- **Empty inventories are omitted.** Both inventory fields,
+  `ActionInfo.Parameters`, and `DeclaredHook.Parameters` are `omitempty`, so an
+  empty list leaves its key off instead of sending `null` where the contract
+  expects an array.
 
 A missing key means none, because the control plane replaces its stored row on
 every PUT. A manifest that leaves `declared_hooks` or `plexd_hooks` off clears

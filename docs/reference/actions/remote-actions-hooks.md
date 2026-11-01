@@ -600,7 +600,7 @@ type IntegrityAlertCallback func(hookName, oldChecksum, newChecksum string)
 3. Perform the initial scan, the same scan `Reload` runs. It replaces the list, so it also prunes a hook removed since the boot scan. A scan that fails logs `actions: watcher: initial scan failed` and reports the current list once. The scan runs after the watch is in place, so a hook changed during start-up is in the scan, arrives as an event, or both
 4. On file create/write/chmod: debounce (200ms), then stat the file. A file that is not a regular, executable file leaves the list. Otherwise compute the checksum, update the hooks map, and call `onChange`. A hook that fails to hash keeps its entry, and `actions: watcher: hash failed` is logged
 5. On file remove/rename: debounce, remove from hooks map, call `onChange`
-6. On `.json` sidecar change: debounce, re-read the parent hook's metadata
+6. On `.json` sidecar create/write/chmod/remove/rename: debounce, then rebuild the parent hook's entry from disk, so a sidecar that went away takes its metadata with it. A `.json` file no hook owns changes nothing
 7. On checksum change for an existing hook: call `onIntegrity` with old and new checksums
 8. On context cancellation: stop all timers, return nil
 
@@ -753,7 +753,7 @@ func DiscoverHooks(hooksDir string, logger *slog.Logger) ([]api.HookInfo, error)
 3. Computes SHA-256 via `integrity.HashFile` for each executable
 4. Parses optional `.json` sidecar for metadata (description, parameters, timeout, sandbox)
 5. Results sorted by name
-6. Individual file errors logged at warn level; valid hooks still returned
+6. Individual file errors, an unreadable sidecar among them, logged at warn level; valid hooks still returned
 
 Windows reports no executable bit on a regular file, so nothing is ever discovered there and no hook can be dispatched. Hook scripts are a Linux and macOS feature; see [Platform Support](../../guide/platform-support.md).
 
@@ -776,6 +776,25 @@ A hook named `deploy` can have a sidecar file `deploy.json`:
   "sandbox": "none"
 }
 ```
+
+> **Warning**: A sidecar's content reaches the control plane and everyone who holds `read` there, and no setting keeps it on the node. A sidecar must hold no secret.
+
+The capability manifest carries what the sidecar declares, under these keys and limits:
+
+| Sidecar key | Manifest key | Type | Limit |
+|---|---|---|---|
+| `description` | `description` | string | At most 4096 characters |
+| `parameters` | `parameters` | array of `ActionParam` | At most 64. Each `name` is not blank after trimming and is unique within the hook, compared raw, so `"a"` and `" a"` are two parameters. `name`, `type`, `default`, and `description` are at most 4096 characters each. `required` has no limit |
+| `timeout` | `timeout_seconds` | `time.ParseDuration` string | 0 to 24 hours. The manifest carries whole seconds, rounded up, so `"1500ms"` reports 2 and `"500ms"` reports 1 rather than 0. `"0s"` or no key means none declared and leaves the manifest key off |
+| `sandbox` | `sandbox_level` | string | At most 64 characters, free-form |
+
+Characters are Unicode code points, and a NUL in any of these strings breaks its limit.
+
+plexd reports `timeout` and `sandbox` as written and does not enforce them yet: a `timeout` above `max_action_timeout` reports as written, and a declared level changes nothing about how the hook runs.
+
+A field that breaks a limit is left off the manifest with the warning `hook metadata omitted from the capability manifest`, and the hook stays with its other fields, because one field past a limit would otherwise cost the whole manifest. One parameter that breaks a rule leaves off the whole `parameters` list, because a form with a required parameter missing misleads. An empty `parameters` list stays off the manifest.
+
+A missing sidecar logs nothing. A malformed one logs `sidecar parse failed` and an unreadable one logs `sidecar read failed`, and anything but a regular file counts as unreadable. A symlink counts as its target, so a dangling one reads as missing. In each case the hook stays listed with no metadata, and plexd keeps no earlier value of it.
 
 ## Parameter Passing
 
@@ -1077,6 +1096,8 @@ All log entries use `component=actions`.
 | `Warn`  | failed to send terminal callback | `execution_id`, `attempts`, `error`      |
 | `Warn`  | failed to send callback for rejected execution | `execution_id`, `status`, `error` |
 | `Warn`  | actions: watcher: a hook vanished while the watch was set up; retrying | `error` |
+| `Warn`  | actions: discovery: sidecar read failed | `file`, `error`                 |
+| `Warn`  | actions: watcher: sidecar read failed | `file`, `error`                   |
 | `Error` | execution entry carries no execution_id; dropping | `action`                |
 | `Error` | orphan report undelivered across repeated pulls; leaving the execution to server-side expiry | `execution_id`, `passes` |
 | `Error` | claim callback refused; aborting execution | `execution_id`, `status`, `error` |
@@ -1263,7 +1284,16 @@ the manifest: it sends it at boot and keeps it current while the agent runs.
   "binary_checksum": "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg=",
   "ssh_host_key_fingerprint": "SHA256:6QGz1Q4iE2zG5p2N3oRZb8ZsT4nKqJgY3oZmP8eFvWk=",
   "declared_hooks": [
-    { "name": "backup", "checksum": "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg=" }
+    {
+      "name": "backup",
+      "checksum": "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg=",
+      "description": "Back up the data directory",
+      "parameters": [
+        { "name": "target", "type": "string", "required": true, "description": "Target address" }
+      ],
+      "timeout_seconds": 300,
+      "sandbox_level": "none"
+    }
   ],
   "plexd_hooks": [
     {
@@ -1291,7 +1321,7 @@ the manifest: it sends it at boot and keeps it current while the agent runs.
 | Field | Source | Content |
 |---|---|---|
 | `builtin_actions` | `Executor.Capabilities()` | Every registered builtin, sorted by name: `name`, `description`, and `parameters[]` in registration order (`name`, `type`, `required`, `default`, `description`). A builtin without parameters carries no `parameters` key |
-| `declared_hooks` | Hook scripts in `hooks_dir` | `name` and the payload's SHA-256 as 32 bytes of standard-padded base64. The digest is the one the watcher last computed, which can differ from the executor's pin after an edit |
+| `declared_hooks` | Hook scripts in `hooks_dir` and their sidecars | `name` and the payload's SHA-256 as 32 bytes of standard-padded base64, plus what the sidecar declares: `description`, `parameters`, `timeout_seconds`, and `sandbox_level`, each left off when not declared. The digest is the one the watcher last computed, which can differ from the executor's pin after an edit |
 | `plexd_hooks` | `PlexdHook` resources in the ServiceAccount's namespace (Kubernetes only) | `name`, `image_digest`, `parameters` map, `sandbox`; see [PlexdHook CRD](plexdhook-crd.md#capability-manifest-reporting) |
 
 The control plane refuses a manifest whole when one entry breaks an invariant,
@@ -1301,9 +1331,16 @@ sending it. Past 128 hooks of either kind it keeps the first 128 by name and log
 how many it dropped. The status codes are listed under
 [API Endpoints](../core/api-endpoints.md#put-v1-nodes-node-id-capabilities).
 
-The manifest carries a hook's name and digest only. Its description, parameters,
-timeout, and sandbox level stay in the sidecar file and do not reach the control
-plane, so an edit of the sidecar alone changes nothing in the manifest.
+Hook metadata follows the same rule one field at a time: a sidecar field past its
+[limit](#sidecar-metadata-format) is left off with a warning, and the hook stays.
+A manifest the control plane refuses anyway for its metadata goes out again in a
+short form; see [When Hook Metadata Is Refused](#when-hook-metadata-is-refused).
+
+The four metadata fields describe a hook. They gate nothing and sit outside its
+digest, so a sidecar edit changes the manifest and moves no digest and no pin. A
+hook with no sidecar reports `name` and `checksum` alone. A sidecar's content
+reaches the control plane and everyone who holds `read` there, so it must hold no
+secret.
 
 An absent key means none, because the control plane replaces its stored row on
 every PUT. `declared_hooks` leaves the manifest when the last hook is removed, and
@@ -1325,27 +1362,38 @@ finishes late reports through `onChange`. A failed PlexdHook boot list leaves
 **When something changes.** The hook watcher's `onChange` and the PlexdHook
 [inventory](plexdhook-crd.md#keeping-the-list-current) call `Notify`, which never
 blocks. So a script hook that is added, changed, or removed reaches the control
-plane within seconds, and so does a change to the PlexdHook resources in the
-agent's namespace. `plexd hooks reload` feeds the reporter the same way.
+plane within seconds, and so does a sidecar's edit or removal and a change to the
+PlexdHook resources in the agent's namespace. `plexd hooks reload` feeds the
+reporter the same way.
 
 A notification waits for a quiet period of 1 second, restarted by each further
 notification and bounded at 10 seconds after the first one. A burst therefore
-costs one PUT, and a hook rewritten in a loop is still reported. The quiet period
+costs one PUT at a control plane that accepts the manifest, and a hook rewritten
+in a loop is still reported. A control plane that refuses the hook metadata sees
+the PUTs in the [cost table](#when-hook-metadata-is-refused). The quiet period
 also gives a write in progress time to finish, but it does not replace an
 [atomic install](../../how-to/custom-hook-scripts.md#step-3-deploy-to-the-hooks-directory).
 
 **What it skips.** Each attempt builds the manifest and compares it with the one
-last accepted. A send that matches is skipped, so a `touch` on a hook sends
-nothing. The last accepted manifest lives in memory, so a restart always sends
-once.
+last accepted. A send that matches is skipped, so a `touch` on a hook or its
+sidecar sends nothing. The last accepted manifest lives in memory, so a restart
+always sends once.
 
-**No periodic re-send.** plexd sends only when the manifest changed or a send is
-still owed, because every accepted PUT that carries a drifted hook raises another
-integrity alert at the control plane, whether or not the manifest changed.
+**No periodic re-send.** A manifest the control plane is known to hold is never
+re-sent. plexd sends only when the manifest changed or a send is still owed,
+because every accepted PUT that carries a drifted hook raises another integrity
+alert at the control plane, whether or not the manifest changed. The one send
+that no change and no failure asks for is the
+[hourly attempt](#when-hook-metadata-is-refused), which runs only while plexd
+holds back metadata the control plane has not seen. A refused attempt stores
+nothing and raises no alert, and an accepted one delivers new content once. A
+sidecar edit on a hook with a drifted digest raises one more alert, as any
+accepted PUT does.
 
 ### Retries
 
-A failed PUT is retried until one is accepted, the boot manifest included. The
+A failed PUT is retried until one is accepted, the boot manifest included, unless
+it was [refused for its hook metadata](#when-hook-metadata-is-refused). The
 delay starts at 5 seconds and doubles with each failure up to 5 minutes (5, 10,
 20, 40, 80, 160, then 300 seconds), and each delay moves by up to 25% either way,
 so agents that failed together do not retry in step. A `429` whose `Retry-After`
@@ -1353,9 +1401,9 @@ gives a number of seconds longer than that delay waits that long, even past 5
 minutes, because the control plane asked for that wait. plexd reads the header on
 no other status.
 
-A refusal is retried too. A refused PUT changes nothing at the control plane, the
-delay holds it to about 12 attempts an hour, and an upgraded control plane then
-clears the refusal with no agent restart.
+Any other refusal is retried too. A refused PUT changes nothing at the control
+plane, the delay holds it to about 12 attempts an hour, and an upgraded control
+plane then clears the refusal with no agent restart.
 
 | While a retry is pending | What happens |
 |---|---|
@@ -1364,8 +1412,9 @@ clears the refusal with no agent restart.
 | A `Retry-After` wait is running | Nothing sends until it ends, whatever changed, and the timer then delivers the newest content |
 | The content is back to the accepted manifest | The retry stops and the backoff resets, because the control plane already holds it |
 
-Every attempt calls the build function, so a retry always carries the newest
-content.
+Every attempt calls the build function, so a retry carries the newest content.
+The one exception is content the control plane refused for its hook metadata: a
+retry of that content carries the short form.
 
 A network error, a timeout, or a 5xx does not prove the PUT was not stored, since
 a PUT that committed can lose its response. After one, plexd forgets what was last
@@ -1376,18 +1425,83 @@ A credential the heartbeat has parked fails before any I/O. That failure does no
 grow the delay: the reporter retries about every 5 seconds and delivers within
 about one such delay of the [mark lifting](../core/heartbeat-service.md#quiet-failure-logs).
 
+### When Hook Metadata Is Refused
+
+The control plane refuses a manifest whole, so a refusal of the hook metadata
+would otherwise cost the Node its binary version, its digests, and every hook.
+plexd answers by sending the short form of the manifest, whose `declared_hooks`
+entries hold `name` and `checksum` and nothing else. `api.IsHookMetadataRefused`
+names the refusals that trigger this:
+
+| Status | Problem `code` | Why it falls back |
+|---|---|---|
+| `400` | `malformed_capabilities_request` | A control plane that predates the metadata refuses its keys as unknown |
+| `413` | Any, or none | The manifest is over budget, 1 MiB or 32 KiB on a control plane that predates the metadata, whichever layer said so. A proxy's own `413` carries no code |
+| `400` | `declared_hook_invalid` or `declared_hooks_too_many` | plexd's copy of the limits has drifted from the control plane's, which must cost the metadata and not the manifest |
+
+Only a manifest that carries metadata falls back. One that carries none has
+nothing to drop, so the same refusal takes the backoff under [Retries](#retries).
+Every other failure takes that backoff too, including a `400` with another code,
+such as `binary_checksum_invalid`, which the short form would draw again.
+
+The refusal is not a failure. It takes no backoff and arms no retry, so the short
+form leaves at once, and plexd logs
+`agent: capability report: hook metadata refused; sending names and digests`.
+When the control plane already holds that short form, no second PUT goes out. A
+short PUT that fails takes the backoff, and its retry carries the short form.
+
+The Node comes back on its own. plexd tries the wide form again when the built
+content changes, and otherwise about an hour after the last refusal: 45 to 75
+minutes, because the timer carries the jitter of the backoff. An accepted wide PUT
+ends the fallback, so an upgraded control plane clears it with no agent restart.
+The refusal lives in memory, so a restart starts again from the wide form.
+
+While the built manifest still carries metadata, a control plane that refuses it
+sees these PUTs:
+
+| Event | PUTs |
+|---|---|
+| Boot, or any agent restart | 2: wide refused, short accepted |
+| Notification with nothing changed | 0 |
+| Sidecar edit alone | 1: wide refused, and the short form equals what the control plane holds |
+| Hook added, changed, or removed | 2: wide refused, short accepted |
+| Hourly attempt with nothing changed | 1: wide refused |
+
+Each hourly attempt that is refused leaves one audit row at the control plane. That
+cost lasts as long as the control plane stays old or the manifest stays over
+budget, and it stops at the first accepted wide PUT. A change that leaves no
+metadata in the built manifest has no wide form to refuse, so it goes out as an
+ordinary send, or sends nothing when the control plane already holds it.
+
+plexd does not check the budget itself, because the control plane owns that
+number. A refused manifest can be far larger than an accepted one: plexd marshals
+it whole, and the upload ends when the control plane stops reading at its cap.
+That costs one such upload per change or per hour, and the warning names the
+refusal.
+
+The fallback keys on a refusal, so a wide manifest that fails with no HTTP answer
+keeps retrying wide. A link too slow to finish the upload within the request
+timeout (`api.request_timeout`, 30 seconds by default) hits this limit, and so does
+a proxy that cuts the upload with no answer. On such a path the manifest stops
+updating until the wide form gets through. plexd accepts that cost because a
+control-plane outage must not strip metadata from every Node on recovery, and a
+count of unanswered PUTs cannot tell an outage from a path that cannot carry the
+wide form.
+
 ### Log Lines
 
-The two `agent: capability report:` lines carry `component=capability-report`; the others are logged by `plexd up` without it.
+The three `agent: capability report:` lines carry `component=capability-report`; the others are logged by `plexd up` without it.
 
 | Message | Level | Attributes | Meaning |
 |---|---|---|---|
-| `agent: capability report: accepted` | Info | `declared_hooks`, `plexd_hooks` (counts) | A PUT was accepted |
+| `agent: capability report: accepted` | Info | `declared_hooks`, `plexd_hooks` (counts), `hook_metadata` (bool) | A PUT was accepted. `hook_metadata` says whether that manifest carried any |
+| `agent: capability report: hook metadata refused; sending names and digests` | Warn | `error`, `wide_retry_in` | The control plane [refused the hook metadata](#when-hook-metadata-is-refused). `wide_retry_in` says when the hourly attempt runs. The line repeats with each refusal, which keeps the state visible |
 | `agent: capability report: send failed` | Warn | `error`, `retry_in` | A PUT failed and a retry is armed. Logged at Debug for `api.ErrCredentialRefused`, and not at all for a cancelled context at shutdown |
 | `boot hook scan failed` | Warn | `error` | The boot scan failed; boot carries on |
 | `boot hook scan timed out; hooks are reported when it finishes` | Warn | `timeout` | The boot scan outlived its 10 seconds |
 | `hooks beyond the capability manifest cap omitted` | Warn | `cap`, `dropped` | More than 128 script hooks |
 | `hook omitted from the capability manifest` | Warn | `hook`, `error` | A hook's digest could not be converted to the wire form, or its name is blank or not valid UTF-8, which the control plane cannot store. The hook stays on the node |
+| `hook metadata omitted from the capability manifest` | Warn | `hook`, `field`, `error` | A sidecar field breaks its [limit](#sidecar-metadata-format). `field` is the sidecar key. The hook and its other fields stay on the manifest. The line repeats on every attempt, because every attempt builds the manifest |
 | `hook integrity change detected` | Warn | `hook`, `old_checksum`, `new_checksum` | The watcher computed a new digest for a known hook |
 
 The PlexdHook watch's lines are listed under

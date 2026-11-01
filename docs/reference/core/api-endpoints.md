@@ -223,10 +223,12 @@ fetches every edge PSK again from
 
 plexd sends its capability manifest at boot, after registration and its first
 hook scan. It sends the manifest again when a script hook is added, changed, or
-removed and when the PlexdHook resources in its namespace change, within seconds
-of the change. A send that matches the manifest last accepted is skipped. There
-is no periodic re-send, because every accepted PUT that carries a drifted hook
-raises another integrity alert. See
+removed, when a hook's sidecar is edited or removed, and when the PlexdHook
+resources in its namespace change, within seconds of the change. A send that
+matches the manifest last accepted is skipped. There is no periodic re-send of a
+manifest the control plane holds, because every accepted PUT that carries a
+drifted hook raises another integrity alert. The one timed send is the hourly
+attempt after a refusal of the hook metadata, described below. See
 [Capability Announcement](../actions/remote-actions-hooks.md#capability-announcement).
 
 Each PUT is a snapshot: the control plane replaces its stored row with the body.
@@ -241,7 +243,16 @@ An absent `declared_hooks` or `plexd_hooks` key therefore means none, never
   "binary_checksum": "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg=",
   "ssh_host_key_fingerprint": "SHA256:6QGz1Q4iE2zG5p2N3oRZb8ZsT4nKqJgY3oZmP8eFvWk=",
   "declared_hooks": [
-    { "name": "post-install", "checksum": "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg=" }
+    {
+      "name": "post-install",
+      "checksum": "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg=",
+      "description": "Run after a package install",
+      "parameters": [
+        { "name": "package", "type": "string", "required": true, "description": "Package that was installed" }
+      ],
+      "timeout_seconds": 300,
+      "sandbox_level": "none"
+    }
   ],
   "plexd_hooks": [
     {
@@ -269,9 +280,20 @@ An absent `declared_hooks` or `plexd_hooks` key therefore means none, never
 | `binary_version` | Yes | Agent version, non-empty after trimming |
 | `binary_checksum` | Yes | SHA-256 of the running binary: 32 bytes, standard-padded base64 |
 | `ssh_host_key_fingerprint` | No | `SHA256:<base64>` host-key fingerprint |
-| `declared_hooks` | No | Script hooks from the hooks directory, each a name and a 32-byte base64 payload digest; at most 128, unique names. The digest is the one the hook watcher last computed, which can differ from the executor's pin after an edit |
+| `declared_hooks` | No | Script hooks from the hooks directory, each a name, a 32-byte base64 payload digest, and what its sidecar declares; at most 128, unique names. The digest is the one the hook watcher last computed, which can differ from the executor's pin after an edit |
 | `plexd_hooks` | No | `PlexdHook` resources in the ServiceAccount's namespace; at most 128, unique names. Absent outside Kubernetes, and absent from the first manifest when the boot list failed |
 | `builtin_actions` | No | The builtin actions the agent implements, sorted by name; at most 128 actions, at most 64 parameters each |
+
+A `declared_hooks` entry carries `name` and `checksum`, and optionally what the
+hook's sidecar declares: `description` (at most 4096 characters), `parameters`
+(at most 64, each shaped like a `builtin_actions` parameter, with a `name` that is
+non-empty after trimming and unique within the hook, and `name`, `type`, `default`
+and `description` at most 4096 characters each), `timeout_seconds` (0 to 86400;
+0 or absent means none declared) and `sandbox_level` (at most 64 characters,
+free-form). Characters are Unicode code points, and a NUL in any of these strings
+is refused. These fields describe the hook: they gate nothing and sit outside its
+digest. A sidecar's content is readable by everyone who holds `read` at the
+control plane, so it must hold no secret.
 
 A `plexd_hooks` entry carries `name`, `image_digest` in canonical
 `sha256:<64 lowercase hex>` form, and optionally `parameters` (a string map),
@@ -287,7 +309,9 @@ included, so plexd sends only entries it knows are valid. A PlexdHook whose imag
 is not pinned by a digest is left out with a warning; see
 [PlexdHook CRD](../actions/plexdhook-crd.md#capability-manifest-reporting). Past
 128 hooks of either kind, plexd keeps the first 128 by name and logs how many it
-dropped.
+dropped. A sidecar field past its limit is left off with a warning, and the hook
+stays; see
+[Sidecar Metadata Format](../actions/remote-actions-hooks.md#sidecar-metadata-format).
 
 **Responses.** The contract answers `200 OK` with a `CapabilityManifestResponse`
 (`accepted_at`, `fields_changed`, `host_key_changed`); plexd does not read the
@@ -301,13 +325,13 @@ entry that breaks an invariant is a `422`:
 | `400 Bad Request` | `binary_version_empty` | `binary_version` is missing or blank |
 | `400 Bad Request` | `binary_checksum_invalid` | `binary_checksum` does not decode to 32 bytes |
 | `400 Bad Request` | `ssh_host_key_fingerprint_invalid` | The fingerprint is set but not `SHA256:<base64>` |
-| `400 Bad Request` | `declared_hook_invalid` | A declared hook has an empty name or a checksum that is not 32 bytes |
+| `400 Bad Request` | `declared_hook_invalid` | A declared hook has an empty name or a checksum that is not 32 bytes, or its metadata breaks a limit |
 | `400 Bad Request` | `declared_hook_duplicate` | Two declared hooks share a name |
-| `400 Bad Request` | `declared_hooks_too_many` | More than 128 declared hooks |
+| `400 Bad Request` | `declared_hooks_too_many` | More than 128 declared hooks, or one hook with more than 64 parameters |
 | `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked |
 | `403 Forbidden` | `node_id_mismatch` | The NSK belongs to a different node than the path |
 | `404 Not Found` | `capabilities_node_not_found` | No node row for the path |
-| `413 Payload Too Large` | `capabilities_body_too_large` | Body exceeds 32 KiB |
+| `413 Payload Too Large` | `capabilities_body_too_large` | Body exceeds 1 MiB, or 32 KiB on a control plane that predates hook metadata |
 | `422 Unprocessable Entity` | `plexd_hook_invalid` | A `plexd_hooks` entry has an empty name, a non-canonical `image_digest`, or a negative `timeout_seconds` |
 | `422 Unprocessable Entity` | `plexd_hook_duplicate` | Two `plexd_hooks` entries share a name |
 | `422 Unprocessable Entity` | `plexd_hooks_too_many` | More than 128 `plexd_hooks` entries |
@@ -323,6 +347,16 @@ delay starts at 5 seconds and doubles up to 5 minutes, with 25% jitter, and a
 and raises nothing, and an upgraded control plane then clears the refusal with no
 agent restart. plexd never drops the inventories to get a refused manifest
 through. See [Retries](../actions/remote-actions-hooks.md#retries).
+
+The one exception is hook metadata. A manifest that carries it and draws a `413`,
+or a `400` with `malformed_capabilities_request`, `declared_hook_invalid`, or
+`declared_hooks_too_many`, takes no backoff: it goes out again at once in a short
+form, each `declared_hooks` entry holding `name` and `checksum` alone. A control
+plane that predates the metadata answers that `400 malformed_capabilities_request`
+for the unknown keys. plexd tries the wide form again when the built content
+changes and otherwise about hourly, 45 to 75 minutes with jitter, and each hourly
+attempt that is refused leaves one audit row at the control plane. See
+[When Hook Metadata Is Refused](../actions/remote-actions-hooks.md#when-hook-metadata-is-refused).
 
 ## NAT Endpoint Discovery
 
