@@ -6,7 +6,7 @@ feature: PXD-0012
 
 # NAT Relay
 
-The NAT relay extends bridge mode (`internal/bridge`) to forward WireGuard between two peers that cannot reach each other directly, such as two nodes behind symmetric NATs. A bridge relays when both its local config and its state pull allow it. It listens on the UDP port the pull names and forwards among the peers the same pull lists. It works out each datagram's destination from the WireGuard message header: a handshake initiation goes to the peer whose public key verifies its `mac1`, and every other message goes by its receiver index. The relay does not need to know either peer's public address in advance. It holds no private or preshared key, decrypts nothing and never answers a datagram.
+The NAT relay extends bridge mode (`internal/bridge`) to forward WireGuard between two peers that cannot reach each other directly, such as two nodes behind symmetric NATs. A bridge relays when both its local config and its state pull allow it. It listens on the UDP port the pull names and forwards among the peers the same pull lists. It works out each datagram's destination from the WireGuard message header: a handshake initiation goes to the peer whose public key verifies its `mac1`, and every other message goes by its receiver index. An initiation between two peers with a live session on this relay waits for its retry (see [Forwarding Table](#forwarding-table)). The relay does not need to know either peer's public address in advance. It holds no private or preshared key, decrypts nothing and never answers a datagram.
 
 ## Data Flow
 
@@ -36,7 +36,7 @@ Peer A                                                        Peer B
 1. A node dials the relays as the last entries of a peer's [dial order](../networking/wireguard.md#dial-order): the peer's relay set, `fallback_endpoints`, whose first entry is its `fallback_endpoint`. The control plane lists at most 4, each on a bridge that relays: the relay of the peer's assigned bridge first, then its standby relays. A control plane that predates the set sends only `fallback_endpoint`, which makes a set of one. A candidate or direct endpoint equal to a relay is not dialed before the relays, so the relays always end the order complete and in set order. The node dials a standby only for a peer last seen connected over a relay, when that relay fails (see [Meeting on the Relay](#meeting-on-the-relay)).
 2. The relay reads every datagram from one UDP socket, bound on the `listen_port` of the bridge's state pull, and classifies it by its WireGuard header (see [Message Classification](#message-classification)).
 3. It finds the destination: for a handshake initiation, the listed peer whose public key verifies the message's `mac1`; for every other message, the peer that owns the message's receiver index. It learns each peer's current address from the handshake and transport messages that peer sends.
-4. It writes the datagram unchanged to that address from the same socket.
+4. It writes the datagram unchanged to that address from the same socket. An initiation that waits for its retry is dropped and never written (see [Forwarding Table](#forwarding-table)).
 
 The reconcile loop drives the relay. On each pull that shows drift, the pull's `bridge.relay` block and `peers` list reach [`RelayReconcileHandler`](#relayreconcilehandler), which calls `Configure` or `Stop`.
 
@@ -67,7 +67,7 @@ if err := cfg.Validate(); err != nil {
 
 ## Relay
 
-`Relay` (`relay.go`) owns the UDP socket, the peer set and the index table. The `Manager` creates it; the reconcile handler starts, reconfigures and stops it.
+`Relay` (`relay.go`) owns the UDP socket, the peer set, the index table and the pair table. The `Manager` creates it; the reconcile handler starts, reconfigures and stops it.
 
 ```go
 func NewRelay(logger *slog.Logger) *Relay // opens no socket
@@ -104,11 +104,11 @@ func (r *Relay) ListenAddr() net.Addr
 
 ### Stop
 
-`Stop` closes the socket, ends the dispatch and sweeper goroutines, closes the rate limiter, clears every peer and index, and logs `relay stopped`. It is idempotent: on a relay that is not running it returns nil and logs nothing, so a repeated disable stays quiet. A relay restart loses all state, and WireGuard's next handshake rebuilds it.
+`Stop` closes the socket, ends the dispatch and sweeper goroutines, closes the rate limiter, clears every peer, index and pair, and logs `relay stopped`. It is idempotent: on a relay that is not running it returns nil and logs nothing, so a repeated disable stays quiet. A relay restart loses all state, and WireGuard's next handshake rebuilds it.
 
 ### Concurrency
 
-- One mutex guards the running socket, the peers and the indices. The dispatch loop takes it for every datagram that passes classification and the rate limit, and releases it before it writes.
+- One mutex guards the running socket, the peers, the indices and the pairs. The dispatch loop takes it for every datagram that passes classification and the rate limit, and releases it before it writes.
 - A second mutex serializes `Configure` and `Stop`, so bridge teardown and the reconcile loop never interleave a start with a stop.
 - `Stop` releases the first mutex before it waits for the goroutines, because the dispatch loop takes it, and closes the rate limiter only after the dispatch loop has returned.
 
@@ -179,10 +179,11 @@ A handshake message carries a `mac1` keyed to its receiver's public key. Each re
 
 ### State
 
-One mutex guards two maps:
+One mutex guards three maps:
 
 - `peers` maps a public key to `relayPeer{nodeID, checker, addr, seen}`: the peer's node ID, its cookie checker, its last learned address and when that address was last set.
-- `indices` maps a `uint32` index to `relayIndex{pending, owner, partner, src, used}`. A pending index records an initiation that has no response yet; a session index belongs to a completed handshake.
+- `indices` maps a `uint32` index to `relayIndex{pending, owner, partner, src, used, carried}`. A pending index records an initiation that has no response yet; a session index belongs to a handshake the relay forwarded, and `carried` records that a transport message named it.
+- `pairs` maps two peers' node IDs, in sorted order, to `relayPair{indices, heldAt}`: the session indices of their latest handshake, and when the relay last started to hold back an initiation of theirs, zero until it first does.
 
 Every source address is unmapped (`Addr().Unmap()`) before use, so an IPv4 peer reads the same on the dual-stack socket. A peer's address is fresh while its `seen` is younger than `relayIndexTTL`.
 
@@ -190,6 +191,8 @@ Every source address is unmapped (`Addr().Unmap()`) before use, so an IPv4 peer 
 |----------|-------|---------|
 | `relayFanoutWindow` | 30 s | How long a pending initiation stays a [fan-out](#first-contact) target; no longer than the 30 s Linux conntrack timeout for an unanswered UDP flow |
 | `relayFanoutMax` | 8 | The most addresses one initiation fans out to |
+| `relayRetryMin` | 4 s | How long after the first initiation it holds back the relay forwards the next one. WireGuard repeats an unanswered initiation after its `RekeyTimeout` of 5 s plus up to 334 ms of jitter, and the 1 s margin absorbs network jitter |
+| `relayHoldWindow` | 15 s | How long after that first initiation an initiation counts as a first one again. Two retries fit in it at WireGuard's largest jitter, and it ends well before the next 120 s rekey |
 | `relayIndexTTL` | 180 s | WireGuard's `RejectAfterTime`: no session outlives it without a new handshake. Also how long a learned address stays fresh |
 | `relaySweepInterval` | 30 s | How often the sweeper runs |
 | `relayMaxIndices` | 65536 (`1 << 16`) | The most live indices |
@@ -198,12 +201,14 @@ Every source address is unmapped (`Addr().Unmap()`) before use, so an IPv4 peer 
 
 | Message | Accepted when | Sent to | State change |
 |---|---|---|---|
-| Initiation | the rate limiter allows the source IP, and `CheckMAC1` succeeds for exactly one peer T | T's address when fresh. Otherwise every distinct `src` of a pending index younger than `relayFanoutWindow` that is neither this datagram's source nor any peer's fresh address, newest first, at most `relayFanoutMax` | `indices[sender] = pending{partner: T, src, used: now}`, replacing an existing entry |
-| Response | the rate limiter allows the source IP, `indices[receiver]` is pending, and `CheckMAC1` succeeds for a peer I other than that pending entry's T | the pending entry's `src` | T's address := source, I's address := pending `src`, `indices[receiver] = session{owner: I, partner: T}`, `indices[sender] = session{owner: T, partner: I}` |
+| Initiation | the rate limiter allows the source IP, `CheckMAC1` succeeds for exactly one peer T, and the relay does not hold the initiation back for its retry (see below) | T's address when fresh. Otherwise every distinct `src` of a pending index younger than `relayFanoutWindow` that is neither this datagram's source nor any peer's fresh address, newest first, at most `relayFanoutMax` | `indices[sender] = pending{partner: T, src, used: now}`, replacing an existing entry |
+| Response | the rate limiter allows the source IP, `indices[receiver]` is pending, and `CheckMAC1` succeeds for a peer I other than that pending entry's T | the pending entry's `src` | T's address := source, I's address := pending `src`, `indices[receiver] = session{owner: I, partner: T}`, `indices[sender] = session{owner: T, partner: I}`, `pairs[{I, T}] = {indices: [receiver, sender]}`, replacing an existing entry, which clears `heldAt` |
 | Cookie reply | `indices[receiver]` exists | a pending entry's `src`, or a session owner's address | none |
-| Transport | `indices[receiver]` is a session index whose owner has an address | the owner's address | the partner's address := source, `used` := now |
+| Transport | `indices[receiver]` is a session index whose owner has an address | the owner's address | the partner's address := source, `used` := now, `carried` := true |
 
-The relay never sends a datagram back to its own source: a computed destination equal to the source is skipped. A datagram whose only destination is its own source changes no state and is dropped with reason `no_route`. An initiation with no fresh target and an empty fan-out still records its pending index, so a later initiation can fan out to it, and is dropped with reason `no_route`.
+The relay never sends a datagram back to its own source: a computed destination equal to the source is skipped. A datagram whose only destination is its own source changes no state and is dropped with reason `no_route`. An initiation with no fresh target and an empty fan-out still records its pending index, so a later initiation can fan out to it, and is dropped with reason `no_route`. An initiation the relay holds back records no pending index in any case, because nothing can answer it.
+
+The relay holds back an initiation for its retry when its source is the address of a peer I other than T, and I and T have a session index that carried a transport message and was used within the last 180 s (`relayIndexTTL`). The first such initiation is dropped with reason `held_for_retry`, and so is each one after it for 4 s (`relayRetryMin`). An initiation 4 s or more after that first one is forwarded, and so is every later one, until a response replaces the pair's entry and clears `heldAt`. After 15 s (`relayHoldWindow`) with no response, an initiation counts as a first one again. An initiation from a source that matches no peer, between two peers the relay never carried, after a handshake that carried no transport message, which a device that re-dialed may have dropped, or for a session past `relayIndexTTL` goes out at once, so [First Contact](#first-contact) and a standby that takes over a pair are not delayed. See [Meeting on the Relay](#meeting-on-the-relay) for why.
 
 Every datagram the table does not accept is dropped and never answered. The relay logs it at Debug as `relay: dropped datagram` with `source` and `reason`:
 
@@ -214,6 +219,7 @@ Every datagram the table does not accept is dropped and never answered. The rela
 | `unknown_target` | An initiation whose `mac1` verifies for no listed peer, or a response whose `mac1` verifies for no listed peer other than the pending entry's target |
 | `unknown_index` | A response, cookie reply or transport message whose receiver index the relay does not hold, or does not hold as the kind of index the [table](#forwarding-table) requires |
 | `no_route` | Accepted, but no destination is left: an initiation with no fresh target and an empty fan-out, a cookie reply or transport message whose index owner has no address, or a datagram whose only destination is its own source |
+| `held_for_retry` | An initiation between two peers with a live session that the relay holds back for its retry, by the rule under the [table](#forwarding-table) |
 | `index_table_full` | Would record a new index while the table is still full after a sweep; see [Index Table and Sweeper](#index-table-and-sweeper) |
 
 ### First Contact
@@ -235,9 +241,11 @@ Setting a peer's address clears that address from any other peer that held it, s
 
 A transport datagram, the bulk of relayed traffic, costs one map lookup. A handshake message costs one `CheckMAC1` per listed peer. The rate limiter bounds that scan: it is wireguard-go's `ratelimiter.Ratelimiter`, 20 handshake messages per second per source IP with a burst of 5, the limit WireGuard itself applies to handshakes. Initiations and responses pass through it. Each start creates and initializes a fresh limiter, and `Stop` closes it.
 
+An initiation that passes the limiter and its `mac1` check costs one more scan of the peers, to find its initiator. That scan is cheaper than the `CheckMAC1` scan before it, and the same limit bounds it. A rekey over the relay finishes about 5 s later, because its first initiation waits for the retry. That costs nothing while the old session lives on for up to 180 s.
+
 ### Index Table and Sweeper
 
-The sweeper runs every 30 s (`relaySweepInterval`). It deletes pending indices older than 30 s (`relayFanoutWindow`) and session indices unused for 180 s (`relayIndexTTL`). When 65536 indices (`relayMaxIndices`) are live, recording a new one first runs the sweep. If the table is still full, the datagram is dropped with reason `index_table_full`, and `relay: index table full` is logged at Warn at most once a minute.
+The sweeper runs every 30 s (`relaySweepInterval`). It deletes pending indices older than 30 s (`relayFanoutWindow`), session indices unused for 180 s (`relayIndexTTL`) and pairs with neither of their indices left. When 65536 indices (`relayMaxIndices`) are live, recording a new one first runs the sweep. If the table is still full, the datagram is dropped with reason `index_table_full`, and `relay: index table full` is logged at Warn at most once a minute.
 
 ### Dispatch Loop
 
@@ -253,15 +261,17 @@ Two peers behind hard NATs connect only when both are on the same relay at the s
 
 A node does not wait for a relayed peer's handshake to turn 180 s old before it dials a relay:
 
-- When a pull takes away the relay a peer is on, the node dials the pull's first relay at once. A pull that still names relays takes the relay away when the relay is not among them, or when the first relay changed to one other than the relay the peer is on. A peer the node reaches from the address of one of its relays counts as on that relay, whichever entry is programmed, and a peer that is not connected counts as on the relay programmed; a peer that opened a direct path while a relay entry was programmed keeps that path. When the set holds a hostname, the node cannot tell a direct path from that relay, so the programmed entry decides and such a peer moves too. It removes the device peer and adds it again, because the new relay would drop every packet of the old session with reason `unknown_index`. The fresh device peer has no session, so its next send starts a handshake over the new relay. Both nodes do this once their pulls name the new relay, and [First Contact](#first-contact) pairs their new initiations.
+- When a pull takes away the relay a peer is on, the node dials the pull's first relay at once. A pull that still names relays takes the relay away when the relay is not among them, or when the first relay changed to one other than the relay the peer is on. A peer the node reaches from the address of one of its relays counts as on that relay, whichever entry is programmed. The exception is a relayed peer that roamed there from another relay with no new handshake: it counts as on the relay programmed, and the node [moves it back](../networking/wireguard.md#the-trial), once per session. A peer that is not connected counts as on the relay programmed; a peer that opened a direct path while a relay entry was programmed keeps that path. When the set holds a hostname, the node cannot tell a direct path from that relay, so the programmed entry decides and such a peer moves too. It removes the device peer and adds it again, because the new relay would drop every packet of the old session with reason `unknown_index`. The fresh device peer has no session, so its next send starts a handshake over the new relay. Both nodes do this once their pulls name the new relay, and [First Contact](#first-contact) pairs their new initiations. A pair that returns to a relay it left under 180 s ago still has a live session there, so its handshake [waits one retry](#forwarding-table).
 - A peer that runs over one of its relays, which the node tells from that relay's address on the peer's packets, is probed once it has received nothing for one trial, 30 s by default. The probe is one datagram through the tunnel, which the peer's WireGuard answers on a live path. When the received-byte counter still has not moved 15 s later, the node dials the next relay of the set the same way, and after the last relay the first again. With the defaults, a relay that stops forwarding is left 45 to 50 s after its last packet, up to 60 s. In a set of one the next relay is the same relay, so a relay that restarted and lost its [index table](#index-table-and-sweeper) carries the pair again within about a minute.
-- Such a peer stays on its relays after its connection fails and dials the next one. It does so at once and after each relay hold without a handshake, and never goes back to the direct entries, which already failed. It tries them again only when a pull leaves the peer no relay or drops the peer, when the peer's key rotates, or after a restart. A peer that WireGuard roamed from one relay of its set to another counts as on the relay that carries it. A peer that WireGuard roamed off its relays to a direct path no longer counts as on a relay, and walks its dial order again, up to its first relay, when that path fails.
+- Such a peer stays on its relays after its connection fails and dials the next one. It does so at once and after each relay hold without a handshake, and never goes back to the direct entries, which already failed. It tries them again only when a pull leaves the peer no relay or drops the peer, when the peer's key rotates, or after a restart. A peer that WireGuard roamed from one relay of its set to another with a new handshake counts as on the relay that carries it. A peer that WireGuard roamed off its relays to a direct path no longer counts as on a relay, and walks its dial order again, up to its first relay, when that path fails.
 
 Both nodes of a pair hold the same relay set for each other and detect a dead relay in the same window, so without a pull they move to the same standby. With the defaults, the relay hold of at least 30 s and the 30 s a pending initiation stays a [fan-out](#first-contact) target together absorb the gap between the two sides. A standby relay carries the pair without an assignment for it, because a relay forwards among every peer of its pull. A relayed peer keeps a standby it moved to while the pull still lists that standby and names the same first relay, or names that standby first, so a pull that still names the dead relay first does not send it back.
 
 See [Relay liveness probe](../networking/wireguard.md#relay-liveness-probe) for the timing.
 
-Versions mix: a node on an older plexd dials the relay with the old 30 s trial and holds a relayed peer until its handshake is 180 s old, and the relay serves it like any other peer. Any older plexd dials only `fallback_endpoint`, the first relay, and never a standby. A pair with one side on an older plexd therefore fails over only when the control plane names a new first relay: the older side keeps dialing the first relay, and the newer side comes back to it each time it wraps around the set. A control plane without `fallback_endpoints` gives each peer at most one relay, which the node holds and dials again as described above. The probe is answered by the peer's WireGuard, not by its plexd, so it works against a node on any version. A bridge on an older plexd relays nothing.
+A frozen bridge, such as a paused VM, can cut a pair that moved on when it resumes. Its socket queues the initiations the pair's WireGuard retries during the freeze. The guest's clock stops, so the session and the addresses still look fresh afterwards, and an initiation's timestamp is encrypted, so the relay cannot see its age. A re-dialed device peer has no recorded timestamp, so WireGuard accepts a queued initiation and moves the peer's endpoint to the resumed bridge, which drops the packets of the pair's new session with reason `unknown_index`. WireGuard repeats an unanswered initiation no sooner than 5 s later, and a backlog drains in milliseconds, so the relay [holds back the first initiation](#forwarding-table) of a pair it carries and forwards a later retry. Two paths stay open. When the freeze starts 4 s or more after the relay held back a rekey, and before its retry arrives, the queued initiations pass, which is roughly 1 % of pairs per freeze. A node that reached the standby by a roam kept its old keypair, so a queued transport packet, which the relay forwards by index, authenticates and moves it too. The node's [move back](../networking/wireguard.md#the-trial) bounds both at one 5 s pass. Holding back needs only the bridge upgraded, and the move back only the node. The cost: a pair that returns to a relay it left under 180 s ago, by that relay's clock, waits one retry.
+
+Versions mix: a node on an older plexd dials the relay with the old 30 s trial and holds a relayed peer until its handshake is 180 s old, and the relay serves it like any other peer. Any older plexd dials only `fallback_endpoint`, the first relay, and never a standby. A pair with one side on an older plexd therefore fails over only when the control plane names a new first relay: the older side keeps dialing the first relay, and the newer side comes back to it each time it wraps around the set. A control plane without `fallback_endpoints` gives each peer at most one relay, which the node holds and dials again as described above. The probe is answered by the peer's WireGuard, not by its plexd, so it works against a node on any version. A bridge on a plexd before v0.19.0 predates this relay and relays nothing (see [Removed: the Session-Based Relay](#removed-the-session-based-relay)).
 
 ## Relay Status Report
 
@@ -358,11 +368,11 @@ The control plane keeps the latest report per node and reads it only for a bridg
 ## Security Properties
 
 - The bridge holds no private or preshared key of any peer and decrypts nothing. It reads only the message type and indices, and checks `mac1` with the peers' public keys.
-- The relay never answers a datagram. Every drop is silent, and it sends only the datagrams it forwards, never back to their source.
+- The relay never answers a datagram. Every drop is silent, an initiation it holds back for its retry included, and it sends only the datagrams it forwards, never back to their source.
 - A handshake message whose `mac1` names no listed peer is dropped, so a sender that knows no peer's public key cannot get an initiation forwarded.
 - A fan-out reaches at most 8 addresses, each of which sent a `mac1`-valid initiation within the last 30 s, and only the real target's WireGuard accepts the initiation.
 - The handshake rate limit, 20 messages per second per source IP with a burst of 5, bounds the `mac1` scan. The index table holds at most 65536 entries.
-- Not defended: a Domain node or an on-path attacker that forges WireGuard headers can make the relay misroute a pair, a denial of service, but never gets plaintext, and the next genuine packet restores the address.
+- Not defended: a Domain node or an on-path attacker that forges WireGuard headers can make the relay misroute a pair, a denial of service, but never gets plaintext, and the next genuine packet restores the address. A forged initiation from a peer's address can delay that pair's handshake by at most one retry, because the relay then holds back the pair's initiations for 4 s.
 
 ## Manager Integration
 
@@ -531,7 +541,7 @@ All relay log lines carry `component=bridge`.
 | `Warn`  | `relay status: rejected, this node was removed` | `code`; logged on every send |
 | `Warn`  | `relay status: send failed` | `error` |
 | `Warn`  | `relay status: shutdown report failed` | `error` |
-| `Debug` | `relay: dropped datagram` | `source`, `reason` (`not_wireguard`, `rate_limited`, `unknown_target`, `unknown_index`, `no_route` or `index_table_full`) |
+| `Debug` | `relay: dropped datagram` | `source`, `reason` (`not_wireguard`, `rate_limited`, `unknown_target`, `unknown_index`, `no_route`, `held_for_retry` or `index_table_full`) |
 | `Debug` | `relay: read failed` | `error` |
 | `Debug` | `relay: forward failed` | `dst`, `error` |
 | `Debug` | `relay status: accepted` | `state`, `accepted_at` |
