@@ -705,8 +705,9 @@ type CapabilityManifestRequest struct {
 // DeclaredHook is one hook the agent advertises. Its name and the digest of its
 // payload let the integrity correlator see a hook change without re-fetching
 // it. The four fields after them come from the hook's sidecar and describe the
-// hook for an operator. They gate nothing and sit outside its digest, so a
-// sidecar edit changes them and leaves Checksum alone.
+// hook for an operator. They gate nothing at the control plane and sit outside
+// its digest, so a sidecar edit changes them and leaves Checksum alone. plexd
+// applies the sidecar's timeout and sandbox when it runs the hook.
 type DeclaredHook struct {
 	Name string `json:"name"`
 	// Checksum is the hook payload's SHA-256 as 32 raw bytes in
