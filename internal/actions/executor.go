@@ -113,6 +113,9 @@ type Executor struct {
 	reporter ActionReporter
 	verifier HookVerifier
 	logger   *slog.Logger
+	// hookOwnerUID is the uid that must own a hook file. It stays 0, root, in
+	// production. Only tests set it, because go test runs unprivileged.
+	hookOwnerUID uint32
 
 	mu           sync.Mutex
 	wg           sync.WaitGroup
@@ -593,6 +596,14 @@ func (e *Executor) runAction(ctx context.Context, nodeID string, entry api.NodeS
 	duration := time.Since(start)
 	status, errMsg := terminalOutcome(runErr, exitCode, timeoutCtx, ctx)
 
+	if errors.Is(runErr, errHookRefused) {
+		e.logger.Warn("hook refused",
+			"execution_id", entry.ExecutionID,
+			"hook", entry.Action,
+			"error", runErr,
+		)
+	}
+
 	// The terminal callback is the only transition out of started and must be
 	// delivered even when shutdown has already cancelled ctx (Shutdown cancels
 	// every actionCtx directly). Detach the report leg from that cancellation,
@@ -805,8 +816,11 @@ func (e *Executor) runHook(ctx context.Context, nodeID string, entry api.NodeSta
 
 	hookPath := filepath.Join(e.cfg.HooksDir, entry.Action)
 
-	if _, err := os.Stat(hookPath); errors.Is(err, os.ErrNotExist) {
-		return "", "", 1, fmt.Errorf("hook not found: %s", entry.Action)
+	if err := checkHookFile(e.cfg.HooksDir, entry.Action, e.hookOwnerUID); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", "", 1, fmt.Errorf("hook not found: %s", entry.Action)
+		}
+		return "", "", 1, err
 	}
 
 	ok, err := e.verifier.VerifyHook(ctx, nodeID, hookPath, pinnedChecksum)
