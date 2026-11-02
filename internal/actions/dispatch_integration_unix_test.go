@@ -149,6 +149,7 @@ func TestIntegration_FullActionLifecycle(t *testing.T) {
 
 	newExecutor := func(reporter ActionReporter) *Executor {
 		exec := NewExecutor(cfg, reporter, verifier, integrationLogger())
+		exec.hookOwnerUID = uint32(os.Getuid())
 		exec.RegisterBuiltin("gather_info", "Gather info", nil, func(_ context.Context, _ map[string]string) (string, string, int, error) {
 			return `{"status":"ok"}`, "", 0, nil
 		})
@@ -236,6 +237,7 @@ func TestIntegration_ConcurrencyBackpressure(t *testing.T) {
 	cfg := integrationConfig(hooksDir)
 	cfg.MaxConcurrent = maxConcurrent
 	exec := NewExecutor(cfg, reporter, verifier, integrationLogger())
+	exec.hookOwnerUID = uint32(os.Getuid())
 	exec.SetHooks([]api.HookInfo{
 		{Name: "concurrent-hook", Source: "local", Checksum: hookChecksum},
 	})
@@ -302,6 +304,7 @@ func TestIntegration_HookIntegrityAndExecution(t *testing.T) {
 	t.Run("valid_integrity", func(t *testing.T) {
 		reporter := &integrationReporter{}
 		exec := NewExecutor(cfg, reporter, newRealVerifier(t, noopViolationReporter{}), integrationLogger())
+		exec.hookOwnerUID = uint32(os.Getuid())
 		exec.SetHooks(hooks)
 		dispatcher := NewDispatcher(exec, "node-integrity", integrationLogger())
 
@@ -347,6 +350,7 @@ func TestIntegration_HookIntegrityAndExecution(t *testing.T) {
 		violations := &recordingViolationReporter{}
 		reporter := &integrationReporter{}
 		exec := NewExecutor(integrationConfig(driftDir), reporter, newRealVerifier(t, violations), integrationLogger())
+		exec.hookOwnerUID = uint32(os.Getuid())
 		exec.SetHooks(discovered)
 		dispatcher := NewDispatcher(exec, "node-integrity", integrationLogger())
 
@@ -395,6 +399,7 @@ func TestIntegration_ShutdownCancelsExecutions(t *testing.T) {
 	verifier := newRealVerifier(t, noopViolationReporter{})
 
 	exec := NewExecutor(integrationConfig(hooksDir), reporter, verifier, integrationLogger())
+	exec.hookOwnerUID = uint32(os.Getuid())
 
 	// Register a blocking builtin.
 	builtinStarted := make(chan struct{})
@@ -466,6 +471,7 @@ func TestIntegration_WatcherFeedsExecutor(t *testing.T) {
 	verifier := newRealVerifier(t, noopViolationReporter{})
 
 	exec := NewExecutor(integrationConfig(hooksDir), reporter, verifier, integrationLogger())
+	exec.hookOwnerUID = uint32(os.Getuid())
 
 	// Wire HookWatcher onChange to executor.SetHooks — this is the integration point.
 	watcher := NewHookWatcher(hooksDir, exec.SetHooks, nil, integrationLogger())

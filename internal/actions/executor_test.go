@@ -226,7 +226,9 @@ func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
 
 func newTestExecutor(cfg Config, reporter *mockReporter, verifier *mockVerifier) *Executor {
 	cfg.ApplyDefaults()
-	return NewExecutor(cfg, reporter, verifier, testLogger())
+	exec := NewExecutor(cfg, reporter, verifier, testLogger())
+	exec.hookOwnerUID = uint32(os.Getuid())
+	return exec
 }
 
 func TestExecutor_RunBuiltin_Success(t *testing.T) {

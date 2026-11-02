@@ -1044,6 +1044,7 @@ func TestWatcher_ReloadOfAnEditedHookReportsTheNewDigestAndLeavesThePin(t *testi
 	reporter := &mockReporter{}
 	verifier := &hashingVerifier{}
 	executor := NewExecutor(cfg, reporter, verifier, testLogger())
+	executor.hookOwnerUID = uint32(os.Getuid())
 
 	alerts := &integrityRecorder{}
 	w := NewHookWatcher(dir, executor.SetHooks, alerts.onIntegrity, testLogger())
