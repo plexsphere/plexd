@@ -1,6 +1,7 @@
 package actions
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -12,6 +13,55 @@ import (
 // errHookRefused marks a hook plexd will not run. The message after it is the
 // terminal callback's error.
 var errHookRefused = errors.New("hook refused")
+
+// hookDeclaration is what a hook's sidecar says about how it runs.
+type hookDeclaration struct {
+	timeout time.Duration // 0 means none declared
+}
+
+// loadHookDeclaration reads the sidecar of the hook name from disk and refuses
+// one plexd cannot honour. It reads the disk rather than the hooks snapshot,
+// which cannot tell a missing sidecar from a malformed one, and only the
+// missing one lets the hook run.
+//
+// A sidecar value has no length limit here, so the refusals quote at most 64
+// characters of it: the control plane answers 400 to an error over 4096
+// characters, which would strand the execution at started. The quoting also
+// escapes a NUL, which a JSON string can carry.
+func loadHookDeclaration(hooksDir, name string, ownerUID uint32) (hookDeclaration, error) {
+	if err := validateHookName(name); err != nil {
+		return hookDeclaration{}, err
+	}
+
+	// The sidecar gates the run and sits outside the digest, so it gets the same
+	// checks as its hook. Otherwise an account that can write it could lift a
+	// refusal.
+	sidecar := name + ".json"
+	if err := checkHookFile(hooksDir, sidecar, ownerUID); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return hookDeclaration{}, nil
+		}
+		return hookDeclaration{}, err
+	}
+
+	data, err := readSidecar(filepath.Join(hooksDir, sidecar))
+	if err != nil {
+		return hookDeclaration{}, fmt.Errorf("%w: sidecar %s: %w", errHookRefused, sidecar, err)
+	}
+	var meta hookMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return hookDeclaration{}, fmt.Errorf("%w: sidecar %s: %w", errHookRefused, sidecar, err)
+	}
+
+	if meta.Sandbox != "" && meta.Sandbox != "none" {
+		return hookDeclaration{}, fmt.Errorf("%w: sandbox level %.64q is not implemented; plexd runs hooks at level none only", errHookRefused, meta.Sandbox)
+	}
+	timeout, err := ParseHookTimeout(meta.Timeout)
+	if err != nil {
+		return hookDeclaration{}, fmt.Errorf("%w: sidecar %s declares an unusable timeout %.64q: want a duration from 0 to 24h", errHookRefused, sidecar, meta.Timeout)
+	}
+	return hookDeclaration{timeout: timeout}, nil
+}
 
 // MaxHookTimeout is the largest timeout a sidecar can declare, the contract's
 // 86400 seconds as a duration.

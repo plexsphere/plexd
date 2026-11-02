@@ -46,6 +46,11 @@ const (
 // plane still holds at started but whose run did not survive an agent restart.
 const orphanedRunError = "execution lost to an agent restart"
 
+// actionTimedOutError is the terminal error of a run its deadline ended.
+// runAction names the limit that set the deadline when it was not the
+// dispatch's own.
+const actionTimedOutError = "action timed out"
+
 // deadlineLapsedError is the terminal error reported for an execution whose
 // absolute deadline ran out while the claim handshake was still in flight, so
 // the run never started.
@@ -505,7 +510,7 @@ func callbackRefused(err error) bool {
 func terminalOutcome(runErr error, exitCode int, timeoutCtx, parentCtx context.Context) (status, errMsg string) {
 	if runErr != nil {
 		if timeoutCtx.Err() == context.DeadlineExceeded {
-			return api.ExecutionStatusFailed, "action timed out"
+			return api.ExecutionStatusFailed, actionTimedOutError
 		}
 		if parentCtx.Err() == context.Canceled {
 			return api.ExecutionStatusCancelled, ""
@@ -520,6 +525,23 @@ func terminalOutcome(runErr error, exitCode int, timeoutCtx, parentCtx context.C
 		return api.ExecutionStatusFailed, ""
 	}
 	return api.ExecutionStatusSucceeded, ""
+}
+
+// runBound returns a run's deadline: the smallest of what is left of the
+// dispatch deadline, the hook's declared timeout, and the ceiling. A declared
+// 0 means none. The label names the limit that won, empty for the dispatch
+// deadline, and capped reports that the ceiling won. A tie keeps the earlier
+// value, so the dispatch deadline wins ties and a hook timeout equal to the
+// ceiling is labelled as the hook's.
+func runBound(remaining, declared, ceiling time.Duration) (bound time.Duration, label string, capped bool) {
+	bound = remaining
+	if declared > 0 && declared < bound {
+		bound, label = declared, "hook timeout "+declared.String()
+	}
+	if ceiling < bound {
+		bound, label, capped = ceiling, "max_action_timeout "+ceiling.String(), true
+	}
+	return bound, label, capped
 }
 
 func (e *Executor) runAction(ctx context.Context, nodeID string, entry api.NodeStateExecution, params map[string]string, cancel context.CancelFunc) {
@@ -552,7 +574,8 @@ func (e *Executor) runAction(ctx context.Context, nodeID string, entry api.NodeS
 	}()
 
 	// The entry carries an absolute deadline, not a relative timeout: the run
-	// gets whatever is left of it, clamped to the configured maximum. Execute's
+	// gets whatever is left of it, cut to the hook's declared timeout and to the
+	// configured maximum when either is shorter (runBound). Execute's
 	// claim handshake runs synchronously ahead of this, so a slow control plane
 	// can consume the whole remainder. Handing the run an already-lapsed
 	// deadline would kill a hook at Start while a builtin that does not watch its
@@ -576,8 +599,18 @@ func (e *Executor) runAction(ctx context.Context, nodeID string, entry api.NodeS
 		})
 		return
 	}
-	timeout := min(remaining, e.cfg.MaxActionTimeout)
 
+	// A builtin never reads a sidecar, even one beside a hook of its name, so
+	// its bound stays what it was.
+	var decl hookDeclaration
+	var declErr error
+	if entry.Type == api.ActionKindHook {
+		decl, declErr = loadHookDeclaration(e.cfg.HooksDir, entry.Action, e.hookOwnerUID)
+	}
+	timeout, label, capped := runBound(remaining, decl.timeout, e.cfg.MaxActionTimeout)
+
+	// A refused run still gets the timeout context, because terminalOutcome
+	// reads it.
 	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, timeout)
 	defer timeoutCancel()
 
@@ -587,20 +620,41 @@ func (e *Executor) runAction(ctx context.Context, nodeID string, entry api.NodeS
 	var exitCode int
 	var runErr error
 
-	if entry.Type == api.ActionKindBuiltin {
+	switch {
+	case declErr != nil:
+		exitCode, runErr = 1, declErr
+	case entry.Type == api.ActionKindBuiltin:
 		stdout, stderr, exitCode, runErr = e.runBuiltin(timeoutCtx, entry.Action, params)
-	} else {
+	default:
 		stdout, stderr, exitCode, runErr = e.runHook(timeoutCtx, nodeID, entry, params)
 	}
 
 	duration := time.Since(start)
 	status, errMsg := terminalOutcome(runErr, exitCode, timeoutCtx, ctx)
+	if errMsg == actionTimedOutError && label != "" {
+		errMsg += ": " + label
+	}
 
-	if errors.Is(runErr, errHookRefused) {
+	refused := errors.Is(runErr, errHookRefused)
+	if refused {
 		e.logger.Warn("hook refused",
 			"execution_id", entry.ExecutionID,
 			"hook", entry.Action,
 			"error", runErr,
+		)
+	}
+	// Logged once the run is over, because runHook can refuse a run too, and a
+	// run that never started was not cut short by the ceiling.
+	if capped && !refused && declErr == nil {
+		requested := remaining
+		if decl.timeout > 0 {
+			requested = min(remaining, decl.timeout)
+		}
+		e.logger.Warn("run deadline capped by max_action_timeout",
+			"execution_id", entry.ExecutionID,
+			"action", entry.Action,
+			"ceiling", e.cfg.MaxActionTimeout,
+			"requested", requested,
 		)
 	}
 
