@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -952,4 +953,144 @@ func TestExecutor_HookSidecarDanglingSymlink(t *testing.T) {
 	exec, reporter, _ := newHookExecutor(Config{HooksDir: dir}, "deploy")
 
 	wantSucceeded(t, runToTerminal(t, exec, reporter, pendingHookExec("exec-sidecar-dangling", "deploy")))
+}
+
+// ticker is a hook's background child for the process group tests. It appends
+// to a file every 50ms for as long as its alive file exists. A test reads that
+// file and never a pid, because a killed child can stay a zombie that signal 0
+// still finds. It ignores SIGTERM, so only the SIGKILL the limit sends stops
+// it.
+type ticker struct {
+	ticks string
+	alive string
+}
+
+// newTicker returns a ticker the test stops when it ends, whether or not the
+// run killed it.
+func newTicker(t *testing.T) ticker {
+	t.Helper()
+	dir := t.TempDir()
+	tk := ticker{ticks: filepath.Join(dir, "ticks"), alive: filepath.Join(dir, "alive")}
+	if err := os.WriteFile(tk.alive, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Remove(tk.alive); err != nil {
+			t.Error(err)
+		}
+		// The child checks the alive file before each tick, so once the file
+		// holds still for a few ticks the child has stopped.
+		last := tk.size(t)
+		waitFor(t, 5*time.Second, func() bool {
+			time.Sleep(200 * time.Millisecond)
+			now := tk.size(t)
+			still := now == last
+			last = now
+			return still
+		})
+	})
+	return tk
+}
+
+// hook returns a hook script that starts the child, with redirect applied to
+// its output, and then runs rest. The child writes through a descriptor it
+// opened once, so it cannot create the file again while the test's temporary
+// directory is being removed.
+func (tk ticker) hook(redirect, rest string) string {
+	return fmt.Sprintf("#!/bin/sh\n( trap '' TERM; exec 3>>%q; while [ -e %q ]; do echo tick >&3; sleep 0.05; done ) %s &\n%s\n",
+		tk.ticks, tk.alive, redirect, rest)
+}
+
+func (tk ticker) size(t *testing.T) int64 {
+	t.Helper()
+	info, err := os.Stat(tk.ticks)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Size()
+}
+
+// wantStopped fails the test unless the child ticked and then stopped, compared
+// at two reads 500ms apart.
+func (tk ticker) wantStopped(t *testing.T) {
+	t.Helper()
+	first := tk.size(t)
+	if first == 0 {
+		t.Fatal("the child never ticked")
+	}
+	time.Sleep(500 * time.Millisecond)
+	if second := tk.size(t); second != first {
+		t.Errorf("ticks grew from %d to %d bytes after the run ended, want the child killed with the hook", first, second)
+	}
+}
+
+func TestExecutor_HookProcessGroupKilledAtTheLimit(t *testing.T) {
+	tk := newTicker(t)
+	dir := t.TempDir()
+	writeExecutable(t, dir, "ticker", tk.hook("", "echo before the kill\nwait"))
+	writeRawSidecar(t, dir, "ticker", `{"timeout":"300ms"}`)
+	exec, reporter, _ := newHookExecutor(Config{HooksDir: dir}, "ticker")
+
+	terminal := runToTerminal(t, exec, reporter, pendingHookExec("exec-group-limit", "ticker"))
+
+	wantTimedOut(t, terminal, "action timed out: hook timeout 300ms")
+	if got := decodeInline(t, terminal.Output); !strings.Contains(got, "before the kill") {
+		t.Errorf("output = %q, want what the hook wrote before the kill", got)
+	}
+	tk.wantStopped(t)
+}
+
+// A hook that exits by itself is unchanged: a child it leaves behind keeps
+// running. The child must not hold the hook's output open, or the run ends
+// failed with exec.ErrWaitDelay, as it did before the group kill.
+func TestExecutor_HookProcessGroupOutlivesAHookThatExits(t *testing.T) {
+	tk := newTicker(t)
+	dir := t.TempDir()
+	writeExecutable(t, dir, "ticker", tk.hook(">/dev/null 2>&1", "exit 0"))
+	exec, reporter, _ := newHookExecutor(Config{HooksDir: dir}, "ticker")
+
+	wantSucceeded(t, runToTerminal(t, exec, reporter, pendingHookExec("exec-group-exit", "ticker")))
+
+	first := tk.size(t)
+	waitFor(t, 5*time.Second, func() bool {
+		return tk.size(t) > first
+	})
+}
+
+// Once Run has reaped the script its group is gone. A cancel that comes that
+// late must read as a process that is done, or Wait would report the kill's
+// error for a run that exited 0.
+func TestSetHookProcessGroup_CancelAfterExitIsDone(t *testing.T) {
+	cmd := exec.CommandContext(context.Background(), "/bin/sh", "-c", "exit 0")
+	setHookProcessGroup(cmd)
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cmd.Cancel(); !errors.Is(err, os.ErrProcessDone) {
+		t.Errorf("Cancel() after exit = %v, want os.ErrProcessDone", err)
+	}
+}
+
+func TestExecutor_HookProcessGroupKilledAtShutdown(t *testing.T) {
+	tk := newTicker(t)
+	dir := t.TempDir()
+	writeExecutable(t, dir, "ticker", tk.hook(">/dev/null 2>&1", "wait"))
+	exec, reporter, _ := newHookExecutor(Config{HooksDir: dir}, "ticker")
+
+	mustExecute(t, exec, "node-1", pendingHookExec("exec-group-shutdown", "ticker"))
+	waitFor(t, 5*time.Second, func() bool {
+		return tk.size(t) > 0
+	})
+	exec.Shutdown(context.Background())
+
+	assertStatuses(t, reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusCancelled,
+	})
+	tk.wantStopped(t)
 }

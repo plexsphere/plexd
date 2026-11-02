@@ -23,9 +23,10 @@ import (
 	"github.com/plexsphere/plexd/internal/api"
 )
 
-// waitDelayAfterKill is the grace period for a process to exit after context
-// cancellation before it is forcibly killed. This gives child processes time
-// to handle SIGTERM and flush buffers.
+// waitDelayAfterKill bounds how long Wait holds a hook's output pipes open. Its
+// timer starts when the run's context ends or the script exits, whichever comes
+// first, so a child that keeps the pipes, including one that left the process
+// group with setsid and escaped the kill, cannot hold the run open.
 const waitDelayAfterKill = 500 * time.Millisecond
 
 // truncationSuffix is appended to output that was truncated due to exceeding MaxOutputBytes.
@@ -886,6 +887,7 @@ func (e *Executor) runHook(ctx context.Context, nodeID string, entry api.NodeSta
 	}
 
 	cmd := exec.CommandContext(ctx, hookPath)
+	setHookProcessGroup(cmd)
 	cmd.WaitDelay = waitDelayAfterKill
 	cmd.Env = e.buildHookEnv(nodeID, entry.ExecutionID, params)
 
