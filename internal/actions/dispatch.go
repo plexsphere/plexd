@@ -49,6 +49,12 @@ const maxDeferrals = 5
 // execution reaches a terminal status through the callback, so suppressing the
 // re-observations is the node's job.
 //
+// The one thing a re-observation can still carry is a cancel request, set on
+// the entry of a run in flight. It is forwarded to the executor while the
+// block's ids are collected, ahead of the settled check and of the budget: the
+// run's id sits in handled, so the pass itself never reads that entry again,
+// and a pass that spends its budget must not hold back a stop.
+//
 // A Dispatcher is not safe for concurrent use. Handle is invoked only from the
 // reconcile goroutine, one cycle at a time, so handled needs no mutex.
 type Dispatcher struct {
@@ -61,7 +67,8 @@ type Dispatcher struct {
 	// on every later pull until the entry drains from the block, which is also
 	// the signal to forget it again. It is only ever a hint that an entry needs
 	// no further work: the executor, not this set, is authoritative on whether a
-	// run is still in flight.
+	// run is still in flight. A cancel request is forwarded before this set is
+	// consulted, because the run it stops is one whose id the set holds.
 	handled map[string]struct{}
 
 	// deferrals counts, per execution id, the passes on which the orphan report
@@ -70,6 +77,13 @@ type Dispatcher struct {
 	// block for the life of it. It is pruned alongside handled when the entry
 	// drains.
 	deferrals map[string]int
+
+	// cancelled is the set of execution ids whose cancel request this
+	// dispatcher forwarded to a run the executor held. The block repeats the
+	// request on every pull until the run's terminal report drains the entry,
+	// so the set is what forwards and logs it once. It is pruned alongside
+	// handled when the entry drains.
+	cancelled map[string]struct{}
 }
 
 // NewDispatcher creates a Dispatcher that dispatches the pull's executions
@@ -81,6 +95,7 @@ func NewDispatcher(executor *Executor, nodeID string, logger *slog.Logger) *Disp
 		logger:    logger.With("component", "actions"),
 		handled:   make(map[string]struct{}),
 		deferrals: make(map[string]int),
+		cancelled: make(map[string]struct{}),
 	}
 }
 
@@ -93,6 +108,13 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 	present := make(map[string]struct{}, len(desired.Executions))
 	for _, entry := range desired.Executions {
 		present[entry.ExecutionID] = struct{}{}
+		// A cancel is forwarded here rather than in the pass below, which skips
+		// the settled id of a run in flight and can stop on its budget before
+		// it reaches the entry. An entry without an id has nothing to cancel
+		// and is dropped by the pass.
+		if entry.ExecutionID != "" && entry.CancelRequestedAt != nil {
+			d.forwardCancel(entry)
+		}
 	}
 
 	deadline := time.Now().Add(dispatchBudget)
@@ -159,6 +181,21 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 
 		switch entry.Status {
 		case api.ExecutionStatusPending, api.ExecutionStatusAck:
+			// The control plane ends a waiting target itself when its
+			// Execution is cancelled, so it never serves one with a request. An
+			// entry that carries one anyway is not started, with actions
+			// disabled too, and gets no callback: a claim or a rejection walk
+			// on it would be answered execution_already_terminal.
+			if entry.CancelRequestedAt != nil {
+				d.logger.Warn("execution entry carries a cancel request but never started; not starting it",
+					"execution_id", entry.ExecutionID,
+					"action", entry.Action,
+					"status", entry.Status,
+				)
+				d.handled[entry.ExecutionID] = struct{}{}
+				continue
+			}
+
 			// The disabled gate sits inside the status roster: an entry whose
 			// status this build does not know must not be driven through a
 			// rejection walk, which would guess a transition path from a state
@@ -232,4 +269,35 @@ func (d *Dispatcher) Handle(ctx context.Context, desired *api.NodeStateSnapshot)
 			delete(d.deferrals, id)
 		}
 	}
+	for id := range d.cancelled {
+		if _, ok := present[id]; !ok {
+			delete(d.cancelled, id)
+		}
+	}
+}
+
+// forwardCancel hands the cancel request entry carries to the executor, once
+// per id. It sends no callback: the run reports cancelled through its own
+// terminal report once its context ends, or its real outcome when it finished
+// first. A request for a run the executor does not hold is left to the pass,
+// which reports a started entry lost, as after a restart, and never starts a
+// waiting one.
+func (d *Dispatcher) forwardCancel(entry api.NodeStateExecution) {
+	if _, forwarded := d.cancelled[entry.ExecutionID]; forwarded {
+		return
+	}
+	if !d.executor.Cancel(entry.ExecutionID) {
+		return
+	}
+	d.cancelled[entry.ExecutionID] = struct{}{}
+	// The stopped run leaves the executor as soon as its report is sent,
+	// which can be before the pass reaches the entry. Settling the id here
+	// keeps the pass from reading that run as lost to a restart when a block
+	// that briefly omitted the entry has pruned it from handled.
+	d.handled[entry.ExecutionID] = struct{}{}
+	d.logger.Info("cancel requested; stopping the run",
+		"execution_id", entry.ExecutionID,
+		"action", entry.Action,
+		"cancel_requested_at", *entry.CancelRequestedAt,
+	)
 }

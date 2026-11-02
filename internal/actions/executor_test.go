@@ -1889,3 +1889,406 @@ func TestExecutor_RejectStopsOnRefusal(t *testing.T) {
 		})
 	}
 }
+
+// latch is a channel a test opens to let a blocked fake go on. The test's
+// cleanup opens it too, so a test that fails before opening it leaves nothing
+// blocked behind for the package's goroutine leak check.
+type latch struct {
+	ch   chan struct{}
+	once sync.Once
+}
+
+func newLatch(t *testing.T) *latch {
+	l := &latch{ch: make(chan struct{})}
+	t.Cleanup(l.open)
+	return l
+}
+
+func (l *latch) open() { l.once.Do(func() { close(l.ch) }) }
+
+// blockingBuiltin returns a builtin that runs until release is closed or its
+// context ends, and signals started once per run. A release ends the run with
+// "done" and exit 0. An ended context ends it the way a built-in that watches
+// its context reports a stop: with what it wrote so far and the context's
+// error.
+func blockingBuiltin(started chan<- struct{}, release <-chan struct{}) BuiltinFunc {
+	return func(ctx context.Context, _ map[string]string) (string, string, int, error) {
+		started <- struct{}{}
+		select {
+		case <-release:
+			return "done", "", 0, nil
+		case <-ctx.Done():
+			return "partial", "", 1, ctx.Err()
+		}
+	}
+}
+
+// waitStarted waits for one signal on started.
+func waitStarted(t *testing.T, started <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run did not start")
+	}
+}
+
+func TestExecutor_CancelStopsBuiltinThatWatchesItsContext(t *testing.T) {
+	reporter := &mockReporter{}
+	exec := newTestExecutor(Config{}, reporter, &mockVerifier{ok: true})
+	started := make(chan struct{}, 1)
+	exec.RegisterBuiltin("test.block", "Blocking action", nil, blockingBuiltin(started, newLatch(t).ch))
+
+	mustExecute(t, exec, "node-1", pendingExec("exec-cancel", "test.block"))
+	waitStarted(t, started)
+
+	if !exec.Cancel("exec-cancel") {
+		t.Fatal("Cancel() = false, want true for a run in flight")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return exec.ActiveCount() == 0
+	})
+
+	cbs := reporter.getCallbacks()
+	assertStatuses(t, cbs, []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusCancelled,
+	})
+	terminal := cbs[2]
+	if terminal.Error != "" {
+		t.Errorf("terminal error = %q, want empty for a cancel", terminal.Error)
+	}
+	if got := decodeInline(t, terminal.Output); got != "partial" {
+		t.Errorf("inline output = %q, want %q", got, "partial")
+	}
+}
+
+// A built-in that ignores its context cannot be stopped. It finishes, and its
+// own outcome is what the run reports, not a cancel it never noticed.
+func TestExecutor_CancelLeavesBuiltinThatIgnoresItsContext(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stdout     string
+		exitCode   int
+		wantStatus string
+	}{
+		{name: "succeeds", stdout: "done", exitCode: 0, wantStatus: api.ExecutionStatusSucceeded},
+		{name: "fails", exitCode: 2, wantStatus: api.ExecutionStatusFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reporter := &mockReporter{}
+			exec := newTestExecutor(Config{}, reporter, &mockVerifier{ok: true})
+			started := make(chan struct{}, 1)
+			release := newLatch(t)
+			exec.RegisterBuiltin("test.ignore", "Context-ignoring action", nil, func(_ context.Context, _ map[string]string) (string, string, int, error) {
+				started <- struct{}{}
+				<-release.ch
+				return tc.stdout, "", tc.exitCode, nil
+			})
+
+			mustExecute(t, exec, "node-1", pendingExec("exec-ignore", "test.ignore"))
+			waitStarted(t, started)
+
+			if !exec.Cancel("exec-ignore") {
+				t.Fatal("Cancel() = false, want true for a run in flight")
+			}
+			if !exec.IsActive("exec-ignore") {
+				t.Error("the run left the executor on the cancel, want it running until it finishes")
+			}
+			release.open()
+			waitFor(t, 5*time.Second, func() bool {
+				return exec.ActiveCount() == 0
+			})
+
+			cbs := reporter.getCallbacks()
+			assertStatuses(t, cbs, []string{api.ExecutionStatusAck, api.ExecutionStatusStarted, tc.wantStatus})
+			terminal := cbs[2]
+			if terminal.ExitCode == nil || *terminal.ExitCode != tc.exitCode {
+				t.Errorf("terminal exit_code = %v, want pointer to %d", terminal.ExitCode, tc.exitCode)
+			}
+			if tc.stdout != "" {
+				if got := decodeInline(t, terminal.Output); got != tc.stdout {
+					t.Errorf("inline output = %q, want %q", got, tc.stdout)
+				}
+			}
+		})
+	}
+}
+
+func TestExecutor_CancelTwiceReportsOnce(t *testing.T) {
+	reporter := &mockReporter{}
+	exec := newTestExecutor(Config{}, reporter, &mockVerifier{ok: true})
+	started := make(chan struct{}, 1)
+	release := newLatch(t)
+	// The run outlives the end of its context until it is released, so the
+	// second call lands on a run whose context the first already ended.
+	exec.RegisterBuiltin("test.linger", "Lingering action", nil, func(ctx context.Context, _ map[string]string) (string, string, int, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		<-release.ch
+		return "partial", "", 1, ctx.Err()
+	})
+
+	mustExecute(t, exec, "node-1", pendingExec("exec-cancel-twice", "test.linger"))
+	waitStarted(t, started)
+
+	if !exec.Cancel("exec-cancel-twice") {
+		t.Fatal("first Cancel() = false, want true for a run in flight")
+	}
+	if !exec.Cancel("exec-cancel-twice") {
+		t.Fatal("second Cancel() = false, want true for a run still in flight")
+	}
+	release.open()
+	waitFor(t, 5*time.Second, func() bool {
+		return exec.ActiveCount() == 0
+	})
+
+	assertStatuses(t, reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusCancelled,
+	})
+}
+
+func TestExecutor_CancelWithoutRun(t *testing.T) {
+	reporter := &mockReporter{}
+	exec := newTestExecutor(Config{}, reporter, &mockVerifier{ok: true})
+
+	for _, id := range []string{"", "exec-unknown"} {
+		if exec.Cancel(id) {
+			t.Errorf("Cancel(%q) = true, want false on an executor with no run", id)
+		}
+	}
+	if cbs := reporter.getCallbacks(); len(cbs) != 0 {
+		t.Errorf("callbacks = %v, want none", cbs)
+	}
+}
+
+// holdingReporter is a mockReporter that holds the terminal callback until the
+// test opens release, so a test can act on a run whose result is computed but
+// not yet reported. The run stays in the executor until its report is sent.
+// It gives up when the callback's own context ends.
+type holdingReporter struct {
+	mockReporter
+	release *latch
+	held    chan struct{}
+	once    sync.Once
+}
+
+func (r *holdingReporter) ExecutionCallback(ctx context.Context, nodeID, executionID string, req api.ExecutionCallbackRequest) (*api.ExecutionCallbackResponse, error) {
+	if req.Status != api.ExecutionStatusAck && req.Status != api.ExecutionStatusStarted {
+		r.once.Do(func() { close(r.held) })
+		select {
+		case <-r.release.ch:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return r.mockReporter.ExecutionCallback(ctx, nodeID, executionID, req)
+}
+
+// A cancel that lands once the run is over stops nothing. The report leg runs
+// on a context detached from the action's, so the run reports what it did.
+func TestExecutor_CancelWhileTerminalHeldReportsRealOutcome(t *testing.T) {
+	reporter := &holdingReporter{release: newLatch(t), held: make(chan struct{})}
+	cfg := Config{}
+	cfg.ApplyDefaults()
+	exec := NewExecutor(cfg, reporter, &mockVerifier{ok: true}, testLogger())
+	exec.RegisterBuiltin("test.echo", "Echo action", nil, func(_ context.Context, _ map[string]string) (string, string, int, error) {
+		return "hello", "", 0, nil
+	})
+
+	mustExecute(t, exec, "node-1", pendingExec("exec-held", "test.echo"))
+	select {
+	case <-reporter.held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the terminal callback never arrived")
+	}
+
+	if !exec.Cancel("exec-held") {
+		t.Fatal("Cancel() = false, want true while the run's report is outstanding")
+	}
+	reporter.release.open()
+	waitFor(t, 5*time.Second, func() bool {
+		return exec.ActiveCount() == 0
+	})
+
+	cbs := reporter.getCallbacks()
+	assertStatuses(t, cbs, []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusSucceeded,
+	})
+	if got := decodeInline(t, cbs[2].Output); got != "hello" {
+		t.Errorf("inline output = %q, want %q", got, "hello")
+	}
+}
+
+// Cancel is per run: unlike Shutdown, it leaves every other run going.
+func TestExecutor_CancelStopsOnlyItsRun(t *testing.T) {
+	reporter := &mockReporter{}
+	exec := newTestExecutor(Config{}, reporter, &mockVerifier{ok: true})
+	started := make(chan struct{}, 2)
+	release := newLatch(t)
+	exec.RegisterBuiltin("test.block", "Blocking action", nil, blockingBuiltin(started, release.ch))
+
+	mustExecute(t, exec, "node-1", pendingExec("exec-stopped", "test.block"))
+	waitStarted(t, started)
+	mustExecute(t, exec, "node-1", pendingExec("exec-kept", "test.block"))
+	waitStarted(t, started)
+
+	if !exec.Cancel("exec-stopped") {
+		t.Fatal("Cancel() = false, want true for a run in flight")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return !exec.IsActive("exec-stopped")
+	})
+	if !exec.IsActive("exec-kept") {
+		t.Fatal("the other run left the executor on the cancel")
+	}
+
+	// Only the kept run is left to take the release.
+	release.open()
+	waitFor(t, 5*time.Second, func() bool {
+		return exec.ActiveCount() == 0
+	})
+	assertStatuses(t, reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusCancelled,
+		api.ExecutionStatusSucceeded,
+	})
+}
+
+// The cancelled report is a terminal report like any other: a transient
+// failure is retried, and a refusal is not.
+func TestExecutor_CancelledTerminalRetriedAfterTransientError(t *testing.T) {
+	reporter := &mockReporter{
+		statusErrs:      map[string]error{api.ExecutionStatusCancelled: errors.New("connection reset")},
+		statusErrBudget: map[string]int{api.ExecutionStatusCancelled: 2},
+	}
+	exec := newTestExecutor(Config{}, reporter, &mockVerifier{ok: true})
+	started := make(chan struct{}, 1)
+	exec.RegisterBuiltin("test.block", "Blocking action", nil, blockingBuiltin(started, newLatch(t).ch))
+
+	mustExecute(t, exec, "node-1", pendingExec("exec-cancel-retry", "test.block"))
+	waitStarted(t, started)
+	if !exec.Cancel("exec-cancel-retry") {
+		t.Fatal("Cancel() = false, want true for a run in flight")
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		return exec.ActiveCount() == 0
+	})
+
+	assertStatuses(t, reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusCancelled,
+		api.ExecutionStatusCancelled,
+		api.ExecutionStatusCancelled,
+	})
+}
+
+func TestExecutor_CancelledTerminalRefusalNotRetried(t *testing.T) {
+	reporter := &mockReporter{statusErrs: map[string]error{
+		api.ExecutionStatusCancelled: &api.APIError{StatusCode: 409, Code: api.CodeExecutionAlreadyTerminal},
+	}}
+	exec := newTestExecutor(Config{}, reporter, &mockVerifier{ok: true})
+	started := make(chan struct{}, 1)
+	exec.RegisterBuiltin("test.block", "Blocking action", nil, blockingBuiltin(started, newLatch(t).ch))
+
+	mustExecute(t, exec, "node-1", pendingExec("exec-cancel-refused", "test.block"))
+	waitStarted(t, started)
+	if !exec.Cancel("exec-cancel-refused") {
+		t.Fatal("Cancel() = false, want true for a run in flight")
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return exec.ActiveCount() == 0
+	})
+
+	assertStatuses(t, reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusCancelled,
+	})
+}
+
+// blockingReconnector is a MeshReconnector that runs until its context ends
+// and then fails with the context's error, as a reconnect a stop cuts short
+// does. started receives once per call. Closing release ends it with nil.
+type blockingReconnector struct {
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (r *blockingReconnector) Reconnect(ctx context.Context) error {
+	r.started <- struct{}{}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.release:
+		return nil
+	}
+}
+
+// runMeshReconnect dispatches mesh.reconnect over a blockingReconnector,
+// lets stop end the run once the reconnect is under way, and returns the
+// run's terminal callback and the JSON the built-in wrote.
+func runMeshReconnect(t *testing.T, entry api.NodeStateExecution, stop func(*Executor)) (api.ExecutionCallbackRequest, meshReconnectResult) {
+	t.Helper()
+	reporter := &mockReporter{}
+	exec := newTestExecutor(Config{}, reporter, &mockVerifier{ok: true})
+	reconnector := &blockingReconnector{started: make(chan struct{}, 1), release: newLatch(t).ch}
+	exec.RegisterBuiltin("mesh.reconnect", "Reconnect the mesh", nil, MeshReconnect(reconnector))
+
+	mustExecute(t, exec, "node-1", entry)
+	waitStarted(t, reconnector.started)
+	stop(exec)
+	waitFor(t, 5*time.Second, func() bool {
+		return exec.ActiveCount() == 0
+	})
+
+	cbs := reporter.getCallbacks()
+	if len(cbs) != 3 {
+		t.Fatalf("callbacks = %v, want ack, started, and one terminal", cbs)
+	}
+	var result meshReconnectResult
+	if err := json.Unmarshal([]byte(decodeInline(t, cbs[2].Output)), &result); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+	return cbs[2], result
+}
+
+func TestExecutor_CancelMeshReconnect(t *testing.T) {
+	entry := pendingExec("exec-reconnect-cancel", "mesh.reconnect")
+	terminal, result := runMeshReconnect(t, entry, func(exec *Executor) {
+		if !exec.Cancel(entry.ExecutionID) {
+			t.Error("Cancel() = false, want true for a run in flight")
+		}
+	})
+
+	if terminal.Status != api.ExecutionStatusCancelled || terminal.Error != "" {
+		t.Errorf("terminal = %s %q, want %s with no error", terminal.Status, terminal.Error, api.ExecutionStatusCancelled)
+	}
+	if result.Status != "failed" || result.Error != context.Canceled.Error() {
+		t.Errorf("output = %+v, want status failed with error %q", result, context.Canceled.Error())
+	}
+}
+
+// Before mesh.reconnect returned the stop as an error, a run its deadline
+// ended reported failed with no error at all.
+func TestExecutor_MeshReconnectDeadlineExceeded(t *testing.T) {
+	entry := pendingExec("exec-reconnect-deadline", "mesh.reconnect")
+	entry.ExpiresAt = time.Now().Add(time.Second)
+	terminal, result := runMeshReconnect(t, entry, func(*Executor) {})
+
+	if terminal.Status != api.ExecutionStatusFailed || terminal.Error != actionTimedOutError {
+		t.Errorf("terminal = %s %q, want %s %q", terminal.Status, terminal.Error, api.ExecutionStatusFailed, actionTimedOutError)
+	}
+	if result.Status != "failed" || result.Error != context.DeadlineExceeded.Error() {
+		t.Errorf("output = %+v, want status failed with error %q", result, context.DeadlineExceeded.Error())
+	}
+}

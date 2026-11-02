@@ -3,6 +3,7 @@ package actions
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -588,5 +589,261 @@ func TestDispatcher_RejectionUnsettledOnTransientFailure(t *testing.T) {
 	}
 	if _, settled := d.handled[entry.ExecutionID]; !settled {
 		t.Error("the completed rejection did not settle the entry")
+	}
+}
+
+// cancelHarness is a dispatcher over an executor carrying test.block, a
+// builtin that runs until its context ends or the test opens release.
+type cancelHarness struct {
+	d        *Dispatcher
+	exec     *Executor
+	reporter *mockReporter
+	started  chan struct{}
+	release  *latch
+}
+
+// newCancelHarness builds a cancelHarness whose dispatcher logs to logger.
+func newCancelHarness(t *testing.T, logger *slog.Logger) *cancelHarness {
+	t.Helper()
+	h := &cancelHarness{
+		reporter: &mockReporter{},
+		started:  make(chan struct{}, 4),
+		release:  newLatch(t),
+	}
+	h.exec = newTestExecutor(Config{}, h.reporter, &mockVerifier{ok: true})
+	h.exec.RegisterBuiltin("test.block", "Blocking action", nil, blockingBuiltin(h.started, h.release.ch))
+	h.exec.RegisterBuiltin("test.echo", "Echo action", nil, func(_ context.Context, _ map[string]string) (string, string, int, error) {
+		return "hello", "", 0, nil
+	})
+	h.d = NewDispatcher(h.exec, "node-1", logger)
+	return h
+}
+
+// startRun dispatches a pending test.block entry under id and returns it as
+// the control plane serves it once the run has started.
+func (h *cancelHarness) startRun(t *testing.T, id string) api.NodeStateExecution {
+	t.Helper()
+	entry := pendingExec(id, "test.block")
+	h.d.Handle(context.Background(), snapshot(entry))
+	waitStarted(t, h.started)
+	entry.Status = api.ExecutionStatusStarted
+	return entry
+}
+
+// withCancelRequest returns entry carrying the mark the control plane sets
+// once an operator cancelled the Execution. plexd never compares its value
+// with its own clock, so a fixed instant will do.
+func withCancelRequest(entry api.NodeStateExecution) api.NodeStateExecution {
+	at := time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC)
+	entry.CancelRequestedAt = &at
+	return entry
+}
+
+func TestDispatcher_CancelForwardedToRunningEntry(t *testing.T) {
+	h := newCancelHarness(t, testLogger())
+	entry := h.startRun(t, "exec-cancel")
+
+	h.d.Handle(context.Background(), snapshot(withCancelRequest(entry)))
+	waitFor(t, 5*time.Second, func() bool {
+		return h.exec.ActiveCount() == 0
+	})
+
+	// The run reports the stop itself. The dispatcher sends nothing, and above
+	// all no failed report for a run it stopped.
+	assertStatuses(t, h.reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusCancelled,
+	})
+}
+
+// orderingReporter is a mockReporter whose callbacks for one execution wait
+// until another has left the executor. It lets a test make a pass reach a
+// later entry only once a run the same pass stopped is gone.
+type orderingReporter struct {
+	mockReporter
+	exec      *Executor
+	held      string
+	untilGone string
+}
+
+func (r *orderingReporter) ExecutionCallback(ctx context.Context, nodeID, executionID string, req api.ExecutionCallbackRequest) (*api.ExecutionCallbackResponse, error) {
+	if executionID == r.held {
+		tick := time.NewTicker(10 * time.Millisecond)
+		defer tick.Stop()
+		for r.exec.IsActive(r.untilGone) {
+			select {
+			case <-tick.C:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
+	return r.mockReporter.ExecutionCallback(ctx, nodeID, executionID, req)
+}
+
+// A pull that briefly omits an entry prunes its settled id. When the entry
+// comes back carrying a cancel request, the stopped run can leave the executor
+// before the pass reaches the entry, and the pass must not then report it lost
+// to a restart on top of the cancelled report the run sent.
+func TestDispatcher_CancelledRunNotReportedLostAfterPrune(t *testing.T) {
+	reporter := &orderingReporter{held: "exec-next", untilGone: "exec-cancel"}
+	cfg := Config{}
+	cfg.ApplyDefaults()
+	exec := NewExecutor(cfg, reporter, &mockVerifier{ok: true}, testLogger())
+	reporter.exec = exec
+	started := make(chan struct{}, 1)
+	exec.RegisterBuiltin("test.block", "Blocking action", nil, blockingBuiltin(started, newLatch(t).ch))
+	exec.RegisterBuiltin("test.echo", "Echo action", nil, func(_ context.Context, _ map[string]string) (string, string, int, error) {
+		return "hello", "", 0, nil
+	})
+	d := NewDispatcher(exec, "node-1", testLogger())
+
+	running := pendingExec("exec-cancel", "test.block")
+	d.Handle(context.Background(), snapshot(running))
+	waitStarted(t, started)
+	d.Handle(context.Background(), snapshot())
+
+	// exec-next comes first in the block, and its claim waits until the stopped
+	// run has left the executor, so the pass reaches exec-cancel with no run
+	// behind it.
+	running.Status = api.ExecutionStatusStarted
+	next := pendingExec("exec-next", "test.echo")
+	d.Handle(context.Background(), snapshot(next, withCancelRequest(running)))
+	waitFor(t, 5*time.Second, func() bool {
+		return exec.ActiveCount() == 0
+	})
+
+	assertStatuses(t, reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusCancelled,
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusSucceeded,
+	})
+}
+
+// The control plane never serves a waiting entry with a cancel request, since
+// it ends such a target itself. One that arrives anyway is never started, and
+// with actions disabled it is not walked to failed either: both would be
+// answered execution_already_terminal.
+func TestDispatcher_CancelRequestOnWaitingEntryNeverStarts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{name: "actions enabled", cfg: Config{}},
+		{name: "actions disabled", cfg: Config{Enabled: boolPtr(false)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, exec, reporter := newTestDispatcher(t, tc.cfg)
+			pending := withCancelRequest(pendingExec("exec-pending", "test.echo"))
+			acked := withCancelRequest(pendingExec("exec-acked", "test.echo"))
+			acked.Status = api.ExecutionStatusAck
+
+			d.Handle(context.Background(), snapshot(pending, acked))
+
+			if cbs := reporter.getCallbacks(); len(cbs) != 0 {
+				t.Errorf("callbacks = %v, want none", cbs)
+			}
+			if got := exec.ActiveCount(); got != 0 {
+				t.Errorf("active count = %d, want 0", got)
+			}
+			for _, id := range []string{pending.ExecutionID, acked.ExecutionID} {
+				if _, settled := d.handled[id]; !settled {
+					t.Errorf("%s was not marked handled", id)
+				}
+			}
+		})
+	}
+}
+
+// A started entry whose run this process does not hold is the agent restart
+// case, cancel request or not: this process stopped nothing, so the contract's
+// cancelled does not fit, and the run is reported lost.
+func TestDispatcher_CancelRequestForRunNotHeldReportedLost(t *testing.T) {
+	d, _, reporter := newTestDispatcher(t, Config{})
+	entry := withCancelRequest(pendingExec("exec-lost", "test.echo"))
+	entry.Status = api.ExecutionStatusStarted
+
+	d.Handle(context.Background(), snapshot(entry))
+
+	cbs := reporter.getCallbacks()
+	assertStatuses(t, cbs, []string{api.ExecutionStatusFailed})
+	if cbs[0].Error != orphanedRunError {
+		t.Errorf("terminal error = %q, want %q", cbs[0].Error, orphanedRunError)
+	}
+	if _, forwarded := d.cancelled[entry.ExecutionID]; forwarded {
+		t.Error("a cancel the executor had no run for was recorded as forwarded")
+	}
+}
+
+// The cancel is forwarded while the block's ids are collected, so a pass that
+// stops on its budget, here at the first entry, still stops the run.
+func TestDispatcher_CancelForwardedUnderSpentBudget(t *testing.T) {
+	h := newCancelHarness(t, testLogger())
+	running := h.startRun(t, "exec-cancel")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	fresh := pendingExec("exec-fresh", "test.echo")
+	h.d.Handle(ctx, snapshot(fresh, withCancelRequest(running)))
+	waitFor(t, 5*time.Second, func() bool {
+		return h.exec.ActiveCount() == 0
+	})
+
+	assertStatuses(t, h.reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusCancelled,
+	})
+	if _, settled := h.d.handled[fresh.ExecutionID]; settled {
+		t.Error("the entry the spent pass never reached was marked handled")
+	}
+}
+
+func TestDispatcher_RunWithoutCancelRequestKeepsRunning(t *testing.T) {
+	h := newCancelHarness(t, testLogger())
+	running := h.startRun(t, "exec-running")
+
+	h.d.Handle(context.Background(), snapshot(running))
+
+	if !h.exec.IsActive(running.ExecutionID) {
+		t.Fatal("the run left the executor without a cancel request")
+	}
+	h.release.open()
+	waitFor(t, 5*time.Second, func() bool {
+		return h.exec.ActiveCount() == 0
+	})
+	assertStatuses(t, h.reporter.getCallbacks(), []string{
+		api.ExecutionStatusAck,
+		api.ExecutionStatusStarted,
+		api.ExecutionStatusSucceeded,
+	})
+}
+
+func TestDispatcher_DrainPrunesCancelled(t *testing.T) {
+	h := newCancelHarness(t, testLogger())
+	entry := withCancelRequest(h.startRun(t, "exec-cancel"))
+
+	h.d.Handle(context.Background(), snapshot(entry))
+	waitFor(t, 5*time.Second, func() bool {
+		return h.exec.ActiveCount() == 0
+	})
+	if _, forwarded := h.d.cancelled[entry.ExecutionID]; !forwarded {
+		t.Fatal("the forwarded cancel was not recorded")
+	}
+
+	h.d.Handle(context.Background(), snapshot())
+
+	if _, ok := h.d.cancelled[entry.ExecutionID]; ok {
+		t.Error("cancelled still holds the drained id")
+	}
+	if _, ok := h.d.handled[entry.ExecutionID]; ok {
+		t.Error("handled still holds the drained id")
+	}
+	if _, ok := h.d.deferrals[entry.ExecutionID]; ok {
+		t.Error("deferrals still holds the drained id")
 	}
 }
