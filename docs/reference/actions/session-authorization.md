@@ -87,7 +87,7 @@ The session JWT itself is not revoked on the node. Token validation consults no 
 
 ## Local Transport via Unix Socket
 
-The `plexd actions run` CLI does not execute actions directly. It connects to the plexd daemon via a Unix socket (`/var/run/plexd.sock`), ensuring locally triggered actions go through the same path as control-plane-dispatched ones: token validation, integrity checks, sandbox, resource limits, and audit.
+The `plexd actions run` CLI does not execute actions directly. It connects to the plexd daemon via a Unix socket (`/var/run/plexd.sock`), ensuring locally triggered actions go through the same path as control-plane-dispatched ones: token validation, integrity checks, and audit.
 
 ```
 plexd actions run diagnostics.collect --param include_network=true
@@ -96,7 +96,6 @@ plexd actions run diagnostics.collect --param include_network=true
                                                     |-- Validate session JWT
                                                     |-- Check action scope
                                                     |-- Verify hook integrity
-                                                    |-- Apply sandbox + limits
                                                     |-- Execute
                                                     +-- Report to control plane
 ```

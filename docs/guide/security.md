@@ -12,6 +12,7 @@ title: Security & Trust Model
 - **Mesh traffic** is encrypted end-to-end via WireGuard.
 - **Compromised nodes** can be force-removed from the control plane, triggering key rotation across all affected peers.
 - **Hook integrity** is enforced via SHA-256 checksums computed at discovery, monitored via inotify, and re-verified before every execution against the digest pinned at first discovery — there is no checksum on the wire, and the inotify watcher deliberately cannot move that pin. Mismatches block execution and trigger alerts.
+- **Hook file checks** run before every execution: plexd refuses to run a hook whose script or sidecar is not owned by root, is group- or other-writable, is not a regular file, or resolves outside the hooks directory. It also refuses a hook whose sidecar declares a sandbox level other than `none`, the only level plexd implements, rather than run it without the isolation it asks for. A refused run reports `failed` with an `error` that names the cause.
 - **Binary verification** - plexd reports its own SHA-256 checksum at registration and with every heartbeat. The control plane compares against known-good checksums per version.
 
 ## Key Exchange and Trust Model
