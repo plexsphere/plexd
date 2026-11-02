@@ -393,14 +393,22 @@ type NodeStateReportResponse struct {
 // any as a float64 and every integer beyond 2^53 would reach the action
 // rewritten. The raw form hands the value to the action exactly as the control
 // plane sent it.
+//
+// CancelRequestedAt is present only on a started entry, once an operator
+// cancelled the Execution: the control plane ends a pending or ack target at
+// once, and such an entry leaves the block. Its presence is the signal to stop
+// the run; plexd never compares its value with its own clock. A JSON null and an
+// absent key both decode to nil. A value that is not an RFC 3339 string fails
+// the decode of the whole state response, as a malformed expires_at does.
 type NodeStateExecution struct {
-	ExecutionID string                     `json:"execution_id"`
-	Action      string                     `json:"action"`
-	Type        string                     `json:"type"`
-	Parameters  map[string]json.RawMessage `json:"parameters"`
-	Status      string                     `json:"status"`
-	RequestedAt time.Time                  `json:"requested_at"`
-	ExpiresAt   time.Time                  `json:"expires_at"`
+	ExecutionID       string                     `json:"execution_id"`
+	Action            string                     `json:"action"`
+	Type              string                     `json:"type"`
+	Parameters        map[string]json.RawMessage `json:"parameters"`
+	Status            string                     `json:"status"`
+	RequestedAt       time.Time                  `json:"requested_at"`
+	ExpiresAt         time.Time                  `json:"expires_at"`
+	CancelRequestedAt *time.Time                 `json:"cancel_requested_at,omitempty"`
 }
 
 // The two legal values of a NodeStateExecution.Type.

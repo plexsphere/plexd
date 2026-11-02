@@ -1154,6 +1154,88 @@ func TestTypesNodeStateExecution(t *testing.T) {
 	if nulled.Status != ExecutionStatusAck {
 		t.Errorf("Status = %q, want %q", nulled.Status, ExecutionStatusAck)
 	}
+	// An entry nobody cancelled omits cancel_requested_at, so the keys above are
+	// the whole wire shape.
+	if nulled.CancelRequestedAt != nil {
+		t.Errorf("CancelRequestedAt = %v for an entry without the key, want nil", nulled.CancelRequestedAt)
+	}
+}
+
+// TestTypesNodeStateExecution_CancelRequestedAt pins the optional cancel request
+// a started entry carries once an operator cancelled its Execution.
+func TestTypesNodeStateExecution_CancelRequestedAt(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	requested := now.Add(-time.Minute)
+	orig := NodeStateExecution{
+		ExecutionID:       "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0",
+		Action:            "deploy",
+		Type:              ActionKindHook,
+		Status:            ExecutionStatusStarted,
+		RequestedAt:       now.Add(-5 * time.Minute),
+		ExpiresAt:         now.Add(5 * time.Minute),
+		CancelRequestedAt: &requested,
+	}
+
+	t.Run("set", func(t *testing.T) {
+		data, got := roundTrip(t, orig)
+		requireEqual(t, orig, got)
+
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) != 8 {
+			t.Errorf("expected exactly 8 JSON keys, got %d: %v", len(raw), raw)
+		}
+		if _, ok := raw["cancel_requested_at"]; !ok {
+			t.Error(`expected JSON key "cancel_requested_at"`)
+		}
+		if got.CancelRequestedAt == nil || !got.CancelRequestedAt.Equal(requested) {
+			t.Errorf("CancelRequestedAt = %v, want %v", got.CancelRequestedAt, requested)
+		}
+	})
+
+	t.Run("nil is omitted", func(t *testing.T) {
+		plain := orig
+		plain.CancelRequestedAt = nil
+		data, err := json.Marshal(plain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) != 7 {
+			t.Errorf("expected exactly 7 JSON keys, got %d: %v", len(raw), raw)
+		}
+		if _, ok := raw["cancel_requested_at"]; ok {
+			t.Error(`unexpected JSON key "cancel_requested_at" for a nil request`)
+		}
+	})
+
+	t.Run("null decodes to nil", func(t *testing.T) {
+		const body = `{"execution_id":"exec-1","action":"deploy","type":"hook","parameters":null,` +
+			`"status":"started","requested_at":"2026-01-01T00:00:00Z","expires_at":"2026-01-01T00:05:00Z",` +
+			`"cancel_requested_at":null}`
+		var got NodeStateExecution
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got.CancelRequestedAt != nil {
+			t.Errorf("CancelRequestedAt = %v for a null value, want nil", got.CancelRequestedAt)
+		}
+	})
+
+	t.Run("malformed value fails the decode", func(t *testing.T) {
+		const body = `{"execution_id":"exec-1","action":"deploy","type":"hook","parameters":null,` +
+			`"status":"started","requested_at":"2026-01-01T00:00:00Z","expires_at":"2026-01-01T00:05:00Z",` +
+			`"cancel_requested_at":"yesterday"}`
+		var got NodeStateExecution
+		if err := json.Unmarshal([]byte(body), &got); err == nil {
+			t.Fatalf("unmarshal of a malformed cancel_requested_at succeeded with %v, want an error", got.CancelRequestedAt)
+		}
+	})
 }
 
 func TestTypesNodeStateSession(t *testing.T) {
