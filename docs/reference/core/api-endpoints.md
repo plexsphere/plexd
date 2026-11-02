@@ -1020,8 +1020,16 @@ every pull until its execution reaches a terminal status through the
 [execution callback](#action-execution-callbacks), so a consumer
 must tolerate re-observing the same `execution_id`. `expires_at` is an absolute
 UTC deadline, not a relative timeout; the entry carries no callback URL and no
-hook checksum. See [Remote Actions and Hooks](/reference/actions/remote-actions-hooks)
-for how plexd consumes it.
+hook checksum. A `started` entry may carry `cancel_requested_at` once an operator
+cancelled its Execution; a cancel moves a `pending` or `ack` target to
+`cancelled` at once, and that entry leaves the block. plexd reads the field on
+its next pull and stops a run it holds: a killed hook, or a built-in that reports
+the stop, is reported `cancelled`, and a run that finished first or does not
+watch its context reports its real outcome. A `started` entry this process does not run is
+still reported lost with `failed`, and a `pending` or `ack` entry carrying the
+field is never started. See [Remote Actions and Hooks](/reference/actions/remote-actions-hooks)
+for how plexd consumes it, and [Cancel](/reference/actions/remote-actions-hooks#cancel)
+for what a cancelled run reports.
 
 `sessions` carries the node's live mediated-access sessions. It is desired state
 rather than a queue: an entry stands for as long as its session is valid, and its

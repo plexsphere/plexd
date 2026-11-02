@@ -492,6 +492,7 @@ callback URL and **no** hook checksum.
 | `Status`      | `string`         | `"status"`       | `pending`, `ack`, or `started`                         |
 | `RequestedAt` | `time.Time`      | `"requested_at"` | When the control plane dispatched the execution        |
 | `ExpiresAt`   | `time.Time`      | `"expires_at"`   | Absolute UTC deadline, **not** a relative timeout      |
+| `CancelRequestedAt` | `*time.Time` | `"cancel_requested_at,omitempty"` | Present only on a `started` entry, once an operator cancelled the Execution; its presence is the signal to stop the run, and plexd never compares its value with its own clock. A JSON `null` and an absent key both decode to nil, and a value that is not an RFC 3339 string fails the decode of the whole state response (see [Cancel](../actions/remote-actions-hooks.md#cancel)) |
 
 **ActionKind constants**
 

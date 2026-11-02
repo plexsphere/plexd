@@ -32,12 +32,14 @@ Control Plane
 └──────────┬───────────┘
            │
      ┌─────┴──────────────────────────────────────┐
+     │ 0. cancel requested, run active → Cancel   │
      │ 1. no execution_id?    → drop, no callback │
      │ 2. already handled?    → skip              │
      │ 3. run still active?   → skip              │
      │ 4. budget short of one? → stop, next pull  │
      │ 5. expires_at absent/lapsed? → skip        │
      │ 6. status pending/ack  → Executor.Execute  │
+     │    (cancel requested   → not started)      │
      │    (actions disabled   → reject)           │
      │ 7. status started      → FailOrphan        │
      └──────────┬─────────────────────────────────┘
@@ -149,16 +151,18 @@ The signature matches `reconcile.DispatchHandler`. A `Dispatcher` is **not** saf
 
 ### Decision Table
 
-Each entry of the block is evaluated in block order:
+Each entry of the block is evaluated in block order. The first row is checked for every entry while the block's ids are collected, so it comes before every other row and outside the pass budget:
 
 | Condition                                    | Outcome                                                                  | Callbacks |
 |----------------------------------------------|--------------------------------------------------------------------------|-----------|
+| `cancel_requested_at` is set and the executor is running that execution | `Executor.Cancel` stops the run, and the id is marked settled. Logged at info, once per execution | none from the dispatcher; the run sends its own terminal (see [Cancel](#cancel)) |
 | `execution_id` is empty                      | Dropped, never run: there is no callback route and no identity to deduplicate, cancel, or audit on | none |
 | Execution id already settled by this dispatcher | Skipped                                                                | none      |
 | The executor is still running that execution | Marked settled again; the executor, not the settled set, is authoritative on in-flight runs | none |
 | Less than one settlement (15s) of the pass budget (20s) is left | The remaining entries are left for the next pull, logged at warn | none |
 | `expires_at` is absent (the zero time)       | Refused and marked settled, logged at warn — never folded into the lapsed case below, which would silently discard every dispatch | none |
 | `expires_at` is not after now                | Skipped; expiry is the control plane's move                              | none      |
+| `status` is `pending` or `ack`, `cancel_requested_at` is set | Not started and marked settled, logged at warn, whatever `Config.Enabled` says | none |
 | `status` is `pending` or `ack`, `Config.Enabled` is `false` | Fail-fast rejection with `error=actions_disabled`           | `ack` → `started` → `failed` |
 | `status` is `pending` or `ack`               | `Executor.Execute`                                                       | see [Execute Flow](#execute-flow) |
 | `status` is `started`                        | `Executor.FailOrphan`: the run was lost to an agent restart; an undelivered report is retried on the next pull, at most 5 times | `failed`  |
@@ -167,6 +171,8 @@ Each entry of the block is evaluated in block order:
 There is no `timeout` wire status: a lapsed entry is dropped without a callback because the control plane sets the timeout itself.
 
 The `Config.Enabled` gate sits **inside** the `pending`/`ack` case, not ahead of the status switch: a status this build cannot place must not be driven through a rejection walk, which would guess a transition path from a state the node does not understand.
+
+A `pending` or `ack` entry that carries `cancel_requested_at` is stopped ahead of that gate, so it gets neither a run nor a rejection walk. The dispatcher logs `execution entry carries a cancel request but never started; not starting it` at warn, with `execution_id`, `action`, and `status`. The control plane never serves such an entry, because a cancel moves a `pending` or `ack` target to `cancelled` at once, and a claim on it would be answered `409 execution_already_terminal`.
 
 The pass budget bounds the whole of `Handle`, which runs on the reconcile goroutine ahead of peer, policy, and bridge convergence. Block size is the control plane's to choose and nothing caps it, so without a budget a degraded control plane pins the reconciliation cycle open for the length of the block. Entries the pass never reaches are redelivered by the next pull, so an exhausted budget only defers work — and the entry it stopped on is named in the log line.
 
@@ -177,6 +183,12 @@ The budget gates which entries the pass *starts*, never how long a settlement al
 The dispatcher keeps a set of settled execution ids — dispatched, rejected, expired, or reported lost — so a re-observed entry is a no-op. An id is forgotten the moment its entry drains from the block: the control plane only drains a settled execution, so the id can never be re-observed. That bounds the set by the size of the block.
 
 The set is a hint, not the run state. `Executor.IsActive` is authoritative on whether a run is still in flight, and the dispatcher consults it before doing anything else with an entry: a block that transiently omits an entry prunes its id, and without that check the next pull would report a live run lost or dispatch it a second time.
+
+A cancel request is forwarded before the settled check. A run in flight is in the set, and every later pull skips its entry at that check, so a forward placed after it would never read the request. The forward runs in the loop that collects the block's ids, ahead of the budgeted pass, so a pass that spends its budget never delays a cancel. Forwarding sends no callback.
+
+When `Executor.Cancel` finds the run, the dispatcher also marks the id settled. Without the mark, a run whose id an earlier block pruned by briefly omitting the entry could report and leave the executor's active set before the pass reaches its entry, and the entry would then reach the `started` row and be reported lost.
+
+A second set, `cancelled`, holds the ids whose cancel this dispatcher forwarded, so the info line `cancel requested; stopping the run` is written once per execution, with `execution_id`, `action`, and `cancel_requested_at`. A forward for an id already in it returns at once. A forward that finds no run records nothing and logs nothing, and the rows of the [Decision Table](#decision-table) decide what the entry needs. The set is pruned with the settled set when the entry drains.
 
 An entry whose `Execute` or rejection walk returned `ErrDispatchDeferred` is deliberately **not** marked settled, so the next pull retries it. That covers both local backpressure and a transient control-plane failure that cut a callback sequence short: in either case the execution is still unresolved, and suppressing the entry would strand it until the control plane's own expiry fires.
 
@@ -193,6 +205,8 @@ plexd keeps no execution state across a restart, so the entry's `status` is what
 | `started`          | The run was in flight and did not survive the restart  | Report `failed` with `error=execution lost to an agent restart`; **never** re-execute |
 
 Actions are not idempotent, which is why a `started` entry is reported lost rather than repeated. `started` → `failed` is a legal edge, so the single terminal callback settles the execution.
+
+A `started` entry that carries `cancel_requested_at` is reported lost the same way, as `failed` with `error=execution lost to an agent restart`, not as `cancelled`. The contract keeps `cancelled` for a run the node stopped, and this process stopped nothing.
 
 ## Executor
 
@@ -222,6 +236,7 @@ Logger is tagged with `component=actions`.
 | `Capabilities`    | `() ([]api.ActionInfo, []api.HookInfo)`                                         | Return registered builtins, sorted by name, and hooks for reporting |
 | `Execute`         | `(ctx context.Context, nodeID string, entry api.NodeStateExecution) error`      | Main entry point for action execution                |
 | `FailOrphan`      | `(ctx context.Context, nodeID, executionID string)`                             | Report a run lost to an agent restart as `failed`    |
+| `Cancel`          | `(executionID string) bool`                                                      | Stop that execution's run on a cancel request; false when no such run is active (see [Cancel](#cancel)) |
 | `Shutdown`        | `(ctx context.Context)`                                                         | Cancel all running executions, reject new ones       |
 | `ActiveCount`     | `() int`                                                                         | Number of currently running actions                  |
 | `IsActive`        | `(executionID string) bool`                                                      | Whether that execution is running right now          |
@@ -273,7 +288,7 @@ When a callback is refused — a problem response whose `code` is `nsk_node_mism
 2. Load the hook's declaration: for an entry of type `hook`, `loadHookDeclaration` reads the sidecar from disk and returns its timeout or a refusal (see [Sidecar at Run Time](#sidecar-at-run-time)). A builtin reads no sidecar, even one beside a hook of its name
 3. Derive the run deadline with `runBound`: the smallest of what is left of `expires_at`, the hook's declared timeout, and `Config.MaxActionTimeout` (see [Run Deadline](#run-deadline))
 4. Dispatch: a refused declaration skips `runHook` and fails the run with exit code 1 and the refusal as its error. Otherwise the run goes to `runBuiltin` or `runHook`
-5. Determine the terminal status via `terminalOutcome`: `succeeded` (exit 0), `failed` (non-zero exit, timeout, refusal, or run error), or `cancelled` (parent context cancelled). A timeout's `error` names the limit that set the deadline, unless it was `expires_at`
+5. Determine the terminal status via `terminalOutcome`: `succeeded` (exit 0), `failed` (non-zero exit, timeout, refusal, or run error), or `cancelled` (a run error after the action context was cancelled, at `Shutdown` or on a [cancel request](#cancel)). A timeout's `error` names the limit that set the deadline, unless it was `expires_at`
 6. Log `hook refused` at warn for a refused run, and `run deadline capped by max_action_timeout` at warn when the ceiling set the deadline of a run that was not refused
 7. Build the terminal `ExecutionCallbackRequest` with `Status`, `ExitCode`, `Error`, and `Output` (base64 inline when ≤ 16 KiB, otherwise the declare → upload → object-key leg)
 8. Post the terminal callback via `ActionReporter.ExecutionCallback`, retrying a transient failure up to three times with exponential backoff (500 ms, 1 s) — the terminal callback is the only transition out of `started`, so giving up after one attempt would pin the invocation there forever. A coded refusal stops the retry immediately.
@@ -335,9 +350,9 @@ Discovery does not apply these checks. A refused hook stays in the capability ma
 
 #### Process Group
 
-`runHook` starts the hook in a process group of its own, and the end of the run's context, at the run deadline or on `Shutdown`, sends `SIGKILL` to the whole group, so the script's children end with it. `WaitDelay` then bounds how long `Wait` holds the output pipes open, so a child that left the group with `setsid` and escaped the kill cannot hold the run open. A hook that exits by itself is unchanged, and a background child it leaves behind keeps running.
+`runHook` starts the hook in a process group of its own, and the end of the run's context, at the run deadline, on a [cancel request](#cancel), or on `Shutdown`, sends `SIGKILL` to the whole group, so the script's children end with it. `WaitDelay` then bounds how long `Wait` holds the output pipes open, so a child that left the group with `setsid` and escaped the kill cannot hold the run open. A hook that exits by itself is unchanged, and a background child it leaves behind keeps running.
 
-A limit that lands after the script has exited, while a child still holds the output pipes, sends no group kill, because `exec.Cmd` has stopped watching the context by then.
+A limit or a cancel request that lands after the script has exited, while a child still holds the output pipes, sends no group kill, because `exec.Cmd` has stopped watching the context by then.
 
 #### Hook Integrity Pinning
 
@@ -353,6 +368,29 @@ Upstream integrity — whether this node should run this hook at all — is the 
 2. Collects all active cancel functions
 3. Calls each cancel function to cancel running contexts
 4. Subsequent `Execute` calls return `ErrDispatchDeferred` with `reason=shutting_down`, so the pull redelivers them to the next agent process
+
+### Cancel
+
+```go
+func (e *Executor) Cancel(executionID string) bool
+```
+
+`Cancel` stops one run on a cancel request. It reads the run's cancel function from the active map under the mutex, calls it after unlocking, and reports whether it found one. An empty or unknown id returns false and does nothing. A second call for the same run does nothing more, because a cancel function is idempotent. `Cancel` leaves `shuttingDown` alone, so other dispatches go on.
+
+The dispatcher calls it for an entry that carries `cancel_requested_at` (see [Handled Set](#handled-set)). `Cancel` sends no callback, and the run's own terminal callback says how the run ended:
+
+| What the cancel finds | Terminal callback |
+|---|---|
+| A running hook | Its process group is killed with `SIGKILL`, with no grace period (see [Process Group](#process-group)). `cancelled` with exit code -1 and the output captured so far, inline or uploaded by the 16 KiB rule |
+| A running built-in that reports the stop | `cancelled`, with the output the built-in returned (see [Built-in Actions](#built-in-actions)) |
+| A running built-in that does not watch its context | The built-in finishes, and the run reports its real outcome |
+| A run whose result is already computed | Its real outcome, because the report leg is detached from the action context. The dispatcher still logs `cancel requested; stopping the run` |
+
+`cancelled` carries an empty `error`. The control plane takes `cancelled` from `started` only, from a node that stopped the run at its own shutdown or on a cancel request. A run that finished first reports its real outcome, and a run whose report never lands ends at the Execution's timeout. A `cancelled` report gets the retries of any terminal callback and is not sent again on a later pull.
+
+plexd learns of a cancel on its next pull: at most `reconcile.interval` later (60 s by default), sooner when a heartbeat or an event triggers the pull. The control plane sends no event for a cancel.
+
+A run started through the local API (`plexd actions run`) is not in the active map. It is bound to its HTTP request and has no Execution to cancel.
 
 ## ErrDispatchDeferred
 
@@ -411,6 +449,21 @@ type NodeInfoProvider interface {
 
 ## Built-in Actions
 
+A built-in runs under the run's context, which the run deadline, a [cancel request](#cancel), and `Shutdown` end. Six built-ins pass that context on to a call and report a stop. When such a call fails while the context has ended, the built-in returns an error that wraps the context's own error, so `errors.Is` finds `context.Canceled` or `context.DeadlineExceeded` in it. A cancel of one of them then reports `cancelled`, and its deadline reports `failed` with `error` `action timed out`, or `action timed out: max_action_timeout <d>` when the ceiling set the deadline. A call that fails while the context is live returns what the built-in's section describes, with no error.
+
+| Built-in | Output and exit code of a stopped run | Error returned |
+|---|---|---|
+| `diagnostics.collect` | The JSON collected so far on stdout, exit code 1 | `diagnostics collect: <cause>` |
+| `diagnostics.ping_peer` | What `ping` printed before the kill, on stderr, with the exit code of the killed process, or 1 when the process never started | `ping <peer_id>: <cause>` |
+| `diagnostics.traceroute_peer` | What the traceroute binary printed before the kill, in the same way | `traceroute <peer_id>: <cause>` |
+| `service.restart` | The service manager's error on stderr, exit code 1 | `service restart: <cause>` |
+| `service.upgrade`, in its restart step | The `upgraded_restart_failed` JSON on stdout, exit code 1 | `service upgrade: restart: <cause>` |
+| `mesh.reconnect` | The `failed` JSON on stdout, exit code 1 | `mesh reconnect: <cause>` |
+
+`<cause>` is `context canceled` or `context deadline exceeded`. The error never reaches the control plane, whose terminal callback carries the status, the exit code, and the output. Only the [local API](#post-v1-actions-run) shows it, in `stderr` with `status` `error`, and its request context ends only when the client has gone.
+
+The other five built-ins, `system.info`, `health.check`, `config.dump`, `logs.snapshot`, and `service.reload_config`, take no notice of their context. A cancel or a deadline that meets one of them lets it finish, and the run reports its real outcome.
+
 ### diagnostics.collect
 
 Collects system diagnostics (hostname, OS, architecture, CPU count, memory, disk, load average, kernel version, network interfaces, processes) and returns them as JSON. Gracefully handles missing `/proc` data by using fallback values.
@@ -454,6 +507,8 @@ The macOS and Windows commands are addressed by absolute path, as are the ping a
 
 Linux resolves the same binaries from the system directories (`/usr/sbin`, `/sbin`, `/usr/bin`, `/bin`) first and only falls back to a `PATH` lookup for distributions that place them elsewhere. The daemon runs as root under systemd, so it must not take the first `PATH` match either: an entry ahead of those directories that an unprivileged account can write to — a unit drop-in extending `PATH`, an operator shell carrying `~/bin` — would otherwise run with root rights.
 
+The platform reader's `ReadStats`, the network listing, and the process listing take the run's context. The built-in reports a stop only when one of those calls failed while the context had ended: it then returns the JSON collected so far with exit code 1, so a cancel request reports `cancelled` and the run deadline reports `failed` with `error` `action timed out`. A call that fails while the context is live leaves its field empty, with exit code 0. A run that collected everything returns exit code 0 and no error, even when the context ended after its last call.
+
 ### diagnostics.ping_peer
 
 Pings a mesh peer and reports latency. The binary and its flags are picked per platform, because the flag letters and the unit of the wait differ:
@@ -473,6 +528,8 @@ Returns ping output in stdout. Exit code 0 on success, 1 on failure (unreachable
 
 On Windows the exit status is not the whole answer: `ping.exe` exits 0 for any ICMP response, a router's `Destination host unreachable` and a `TTL expired in transit` included. The reply is therefore checked for the `TTL=` token of a real echo reply, the one part of the line Windows does not localize, and an answer without it is reported as exit code 1 with the output on stderr. `iputils` and BSD `ping` report the same case through the exit status, so their output is not read.
 
+A cancel request or the run deadline kills `ping`. A cancel reports `cancelled`, and the deadline reports `failed` with `error` `action timed out`. Either report carries what `ping` printed before the kill, with the exit code of the killed process: -1 on Linux and macOS, where the kill is a signal, and 1 on Windows, where the kill ends `ping.exe` with exit status 1. A run stopped before `ping` started reports exit code 1.
+
 ### diagnostics.traceroute_peer
 
 Traceroute to a mesh peer. The binary and its flags are picked per platform:
@@ -490,11 +547,17 @@ Traceroute to a mesh peer. The binary and its flags are picked per platform:
 
 Returns traceroute output in stdout. Exit code 1 with the error `traceroute not available` when neither the Linux system directories nor the `PATH` lookup hold the binary; macOS and Windows ship it at a fixed path.
 
+A cancel request or the run deadline kills the traceroute binary. A cancel reports `cancelled`, and the deadline reports `failed` with `error` `action timed out`. Either report carries what the binary printed before the kill, with the exit code of the killed process: -1 on Linux and macOS and 1 on Windows, as for `ping`. A run stopped before the binary started reports exit code 1.
+
 ### service.restart
 
 Asks the host's service manager to restart plexd: `systemctl restart plexd` on Linux, `launchctl kickstart -k system/com.plexsphere.plexd` on macOS, a detached `Restart-Service plexd` on Windows. No parameters required.
 
 The action returns exit code 1 with the error `service manager not available` when the manager cannot be driven from the daemon's process, and exit code 1 with the manager's own error on stderr when the restart is refused.
+
+A restart that fails while the run's context has ended returns the same stderr and exit code 1, with an error that wraps the context's. A cancel request then reports `cancelled`, and the run deadline reports `failed` with `error` `action timed out`.
+
+A restart through `systemctl restart plexd` stops plexd itself: systemd kills the `systemctl` child in plexd's cgroup, while the `SIGTERM` it sends plexd cancels plexd's root context and with it the run. The run's report, if it lands before plexd exits, usually reads `cancelled`: in the contract, a run the node stopped at its own shutdown. When plexd sees the `systemctl` child die before the shutdown has ended the run's context, the report reads `failed` with the manager's error on stderr, as before.
 
 ### service.reload_config
 
@@ -537,6 +600,8 @@ Upgrades plexd to a specified version from the release channel. The action downl
 | `upgraded_restart_failed` | 1 | Binary replaced but the restart failed |
 | `checksum_mismatch` | 1 | Download SHA-256 differs from the dispatched `checksum`; binary untouched |
 | `bundle_verification_failed` | 1 | Sigstore bundle verification failed; binary untouched |
+
+The restart step reports a stop the way [`service.restart`](#service-restart) does. A restart that fails while the run's context has ended comes after the new binary is in place, so stdout still carries the `upgraded_restart_failed` JSON, with the `message` `binary replaced, restart failed: <error>`, and the exit code is 1. The error returned wraps the context's, so a cancel request reports `cancelled` and the run deadline reports `failed` with `error` `action timed out`. The steps ahead of the restart return their errors as well, so a download that a cancel request or the deadline cuts short reports the same way. A restart through `systemctl restart plexd` stops plexd itself, as it does for `service.restart`, so the run's report, if it lands before plexd exits, usually reads `cancelled`, and reads `failed` when plexd sees the `systemctl` child die before the shutdown has ended the run's context.
 
 On checksum mismatch, the upgrade is aborted and the original binary is preserved:
 
@@ -602,6 +667,8 @@ Status is `"healthy"` if `tunnel_count > 0`, otherwise `"degraded"`.
 Triggers mesh reconnection via the reconciler. On success, returns `{"status": "reconnected"}`. On failure, returns exit code 1 with `{"status": "failed", "error": "..."}`.
 
 No parameters required.
+
+A reconnect that fails because its context ended returns the same JSON and exit code 1, with an error that wraps the context's. A cancel request then reports `cancelled`, and the run deadline reports `failed` with `error` `action timed out`.
 
 ### config.dump
 
@@ -908,8 +975,8 @@ The terminal callback carries one of three statuses, chosen by `terminalOutcome`
 | Status      | Meaning                                                                                       |
 |-------------|-----------------------------------------------------------------------------------------------|
 | `succeeded` | Action completed with exit code 0                                                              |
-| `failed`    | Non-zero exit, a timeout (`error="action timed out"`, or with the limit after a colon, as in `"action timed out: hook timeout 30s"`; see [Run Deadline](#run-deadline)), a refused hook (`error` starts with `hook refused: `), or a run error (message in `error`) |
-| `cancelled` | Parent context was cancelled (e.g., during shutdown)                                          |
+| `failed`    | Non-zero exit, a timeout (`error="action timed out"`, or with the limit after a colon, as in `"action timed out: hook timeout 30s"`; see [Run Deadline](#run-deadline)), a refused hook (`error` starts with `hook refused: `), or a run error (message in `error`). A built-in that reports a stop and reaches its deadline carries `error="action timed out"`, or `"action timed out: max_action_timeout <d>"` when the ceiling set the deadline (see [Built-in Actions](#built-in-actions)) |
+| `cancelled` | The action context was cancelled, at `Shutdown` or on a [cancel request](#cancel), and the run ended with an error: a killed hook, or a built-in that reports the stop. `error` is empty |
 
 ## Rejection Reasons
 
@@ -939,17 +1006,20 @@ One entry of the `executions` block of `GET /v1/nodes/{node_id}/state`.
 
 ```go
 type NodeStateExecution struct {
-    ExecutionID string                     `json:"execution_id"`
-    Action      string                     `json:"action"`
-    Type        string                     `json:"type"`
-    Parameters  map[string]json.RawMessage `json:"parameters"`
-    Status      string                     `json:"status"`
-    RequestedAt time.Time                  `json:"requested_at"`
-    ExpiresAt   time.Time                  `json:"expires_at"`
+    ExecutionID       string                     `json:"execution_id"`
+    Action            string                     `json:"action"`
+    Type              string                     `json:"type"`
+    Parameters        map[string]json.RawMessage `json:"parameters"`
+    Status            string                     `json:"status"`
+    RequestedAt       time.Time                  `json:"requested_at"`
+    ExpiresAt         time.Time                  `json:"expires_at"`
+    CancelRequestedAt *time.Time                 `json:"cancel_requested_at,omitempty"`
 }
 ```
 
 `ExpiresAt` is an absolute UTC deadline, not a relative timeout; a missing or `null` value decodes to the zero time, which the dispatcher refuses rather than treats as lapsed. `Parameters` is nullable: a JSON `null` decodes to a nil map, and each value is held as raw JSON so a large integer reaches the action with every digit intact. The entry carries no callback URL and no hook checksum.
+
+`CancelRequestedAt` is present only on a `started` entry, once an operator cancelled the Execution: the control plane moves a `pending` or `ack` target to `cancelled` at once, and that entry leaves the block. Its presence is the signal to stop the run (see [Cancel](#cancel)), and plexd never compares its value with its own clock. A JSON `null` and an absent key both decode to nil. A value that is not an RFC 3339 string fails the decode of the whole state response, as a malformed `expires_at` does.
 
 ### ActionKind constants
 
@@ -1169,10 +1239,12 @@ All log entries use `component=actions`.
 |---------|-------------------------------|---------------------------------------------|
 | `Info`  | execution expired; leaving the timeout to the control plane | `execution_id`, `action`, `expires_at` |
 | `Info`  | Action completed              | `execution_id`, `status`, `duration`        |
+| `Info`  | cancel requested; stopping the run | `execution_id`, `action`, `cancel_requested_at` |
 | `Warn`  | dispatch deferred             | `execution_id`, `action`, `reason`          |
 | `Warn`  | Action rejected               | `execution_id`, `action`, `reason`          |
 | `Warn`  | execution lost to an agent restart; reporting failed | `execution_id`       |
 | `Warn`  | unexpected execution status in the pull block | `execution_id`, `action`, `status` |
+| `Warn`  | execution entry carries a cancel request but never started; not starting it | `execution_id`, `action`, `status` |
 | `Warn`  | execution carries no expires_at; refusing to dispatch | `execution_id`, `action`     |
 | `Warn`  | dispatch budget exhausted; the remaining entries wait for the next pull | `execution_id`, `budget` |
 | `Warn`  | claim callback failed; deferring the dispatch | `execution_id`, `status`, `error` |
@@ -1222,6 +1294,7 @@ never `null`) and ordered by `requested_at`, then `execution_id`.
 | `status` | string | `pending`, `ack`, or `started` — the status the control plane currently holds |
 | `requested_at` | timestamp | When the control plane dispatched the execution |
 | `expires_at` | timestamp | Absolute UTC deadline, **not** a relative timeout |
+| `cancel_requested_at` | timestamp | Optional. Present only on a `started` entry once an operator cancelled the Execution; plexd stops a run it holds (see [Cancel](#cancel)) and never compares the value with its own clock |
 
 There is no `callback_url` (the callback path is derived from the node and
 execution ids) and no `checksum` (hook integrity anchors on the digest the node
