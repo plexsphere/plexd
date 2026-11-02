@@ -695,6 +695,15 @@ state machine:
 | execution is tracked non-terminally | served with the **live** status, not the configured one |
 | execution is untracked | served verbatim |
 
+The projection copies each entry and changes only its `status`, so a configured
+`cancel_requested_at` is served as configured, and an entry configured without it
+is served with no `cancel_requested_at` key. An entry that carries the field
+while its execution is `pending` or `ack` (the status the mock tracks, or the
+configured one when it tracks none) is recorded as `cancelled` when it is
+configured (see the execution seeding of
+[`POST /test/configure-state`](#post-test-configure-state)), so the projection
+drains it.
+
 The result is a freshly allocated slice, so the configured entries are never
 rewritten in place, and it is never `nil` — the block always serializes as `[]`
 rather than `null`.
@@ -1229,7 +1238,23 @@ execution rather than only a fresh one:
 
 Seeding is **seed-if-absent**: an execution the mock is already tracking is left
 alone, so re-posting the same fixture can never regress an execution the node has
-already advanced.
+already advanced. The cancel rule below is the one case in which `SetState`
+overwrites a tracked state.
+
+**Cancel of a waiting target:** an entry that carries `cancel_requested_at` stages
+an operator's cancel of its Execution, and the mock does what the control plane
+does to a target that has not started. The status the rule reads is the tracked
+one, or the configured one when the mock does not track the execution:
+
+| Status the rule reads | Effect |
+|-----------------------|--------|
+| `pending` / `ack` | the execution is recorded as `cancelled`, overwriting a tracked state. The entry drains from the next pull, and the node's late `ack` or `started` is answered `409 execution_already_terminal` |
+| `started` | the execution keeps its state, and the entry is served with the field |
+| terminal | left alone |
+
+A node's `cancelled` for an execution the mock never saw is still answered
+`409 invalid_state_transition` by the
+[legal transitions](#post-v1-nodes-id-executions-eid).
 
 **Session issuance and revocation:** sessions seed nothing — there is no callback
 state machine to stage. A configured entry is issued by the mere fact of being

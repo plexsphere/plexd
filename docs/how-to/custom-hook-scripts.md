@@ -75,7 +75,7 @@ underscore) are replaced with underscores. For example, a parameter named
 - Exit code 0 indicates success; non-zero indicates failure
 - Stdout and stderr are captured and sent to the control plane
 - Output is truncated at `MaxOutputBytes` (default 1 MiB)
-- The script and every process in its process group are killed when the run reaches its deadline: the smallest of what is left of the entry's `expires_at`, the sidecar's `timeout`, and `max_action_timeout` (10 minutes by default). A deadline that lands after the script has exited kills nothing, so a background child it left behind keeps running
+- The script and every process in its process group are killed when the run reaches its deadline: the smallest of what is left of the entry's `expires_at`, the sidecar's `timeout`, and `max_action_timeout` (10 minutes by default). They are killed the same way when an operator cancels the Execution, which plexd reads on its next pull. A deadline or a cancel that lands after the script has exited kills nothing, so a background child it left behind keeps running
 
 ## Step 2: Create an Optional Metadata Sidecar
 
@@ -320,7 +320,7 @@ The node will:
 1. **Claim**: post an execution callback with `status=ack`, then one with `status=started` — both before anything runs, so an execution the control plane still holds at `ack` is known not to have executed
 2. **Check**: read the sidecar and check the script and the sidecar on disk. A sidecar plexd cannot use, a sandbox level other than `none`, or a file that is not root-owned, is group- or other-writable, is not a regular file, or resolves outside the hooks directory refuses the run, which then reports `failed` without starting the script
 3. **Verify**: compare the hook's SHA-256 against the digest pinned at first discovery
-4. **Run**: execute the script with `PLEXD_PARAM_SERVICE=nginx`, in a process group of its own, until the run deadline
+4. **Run**: execute the script with `PLEXD_PARAM_SERVICE=nginx`, in a process group of its own, until the run deadline. A cancel request that a later pull carries kills the group too
 5. **Report**: post a terminal callback (`succeeded`, `failed`, or `cancelled`) with the exit code and captured output
 
 Each step is one `POST /v1/nodes/{node_id}/executions/{execution_id}` callback.
@@ -379,6 +379,7 @@ Control Plane                          Node (plexd)
 | Status `failed`, `error="action timed out"` | Script outran the entry's `expires_at` | Optimize the script, or have the control plane dispatch a later `expires_at` |
 | Status `failed`, `error="action timed out: hook timeout <d>"` | Script outran the `timeout` its sidecar declares | Optimize the script, or raise `timeout` in the sidecar |
 | Status `failed`, `error="action timed out: max_action_timeout <d>"` | Script outran `max_action_timeout`, which caps the entry's `expires_at` and the sidecar's `timeout`; the agent logs `run deadline capped by max_action_timeout` | Optimize the script, or raise `max_action_timeout` in the node's actions configuration |
+| Status `cancelled`, exit code -1 | An operator cancelled the Execution while the script ran, or the agent shut down, and plexd killed the script's process group | Nothing to fix on the node. The output holds what the script printed before the kill |
 | Status `failed`, `error` starts with `hook refused: sidecar <name>.json: ` | plexd cannot read or parse the sidecar | Fix the JSON, or make the sidecar a regular file plexd can read. Remove it if the hook needs no metadata |
 | Status `failed`, `error=hook refused: sidecar <name>.json declares an unusable timeout "<value>": want a duration from 0 to 24h` | The sidecar's `timeout` has no unit, is negative, or is over 24 hours | Write a duration such as `"30s"`, or remove the key |
 | Status `failed`, `error=hook refused: sandbox level "<value>" is not implemented; plexd runs hooks at level none only` | The sidecar declares a sandbox level plexd does not implement | Set `"sandbox": "none"` or remove the key; see [Sandbox Options](../reference/actions/sandbox-options.md) |
