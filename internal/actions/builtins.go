@@ -137,6 +137,12 @@ func PingPeer(info NodeInfoProvider) BuiltinFunc {
 		cmd := exec.CommandContext(ctx, name, args...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
+			// A ping killed when its context ended exits like one that found
+			// the peer unreachable. Returning the stop as the error is what
+			// lets the executor report it as a stop.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", string(out), commandExitCode(cmd), fmt.Errorf("ping %s: %w", target, ctxErr)
+			}
 			if cmd.ProcessState != nil {
 				return "", string(out), cmd.ProcessState.ExitCode(), nil
 			}
@@ -172,7 +178,8 @@ type diagnosticsCollectResult struct {
 // Optional parameters: "include_network" (default "true"), "include_processes" (default "true").
 // The reader fills "memory_total" and "load_avg" where the /proc files yield
 // nothing, which is the case on macOS and Windows. A nil reader keeps the
-// /proc-only behaviour.
+// /proc-only behaviour. A reading or listing that the end of the context cut
+// short makes it return the partial JSON with exit 1 and the context's error.
 func DiagnosticsCollect(reader metrics.SystemReader) BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
 		includeNetwork := params["include_network"] != "false"
@@ -205,6 +212,13 @@ func DiagnosticsCollect(reader metrics.SystemReader) BuiltinFunc {
 			loadAvg = strings.TrimSpace(string(data))
 		}
 
+		// cutShort records that a call taking ctx failed after ctx had ended.
+		// Every such call soft-fails into an empty field, so without it a
+		// stopped collection would read as a complete one. A call that failed
+		// under a live context failed for its own reasons and keeps the
+		// soft-fail, and a stop that cut nothing short changes nothing.
+		var cutShort bool
+
 		// The platform reader answers where /proc does not. On Linux the
 		// /proc reads already filled both values, so the output there is
 		// unchanged. A reader error leaves both values as the /proc reads
@@ -225,6 +239,8 @@ func DiagnosticsCollect(reader metrics.SystemReader) BuiltinFunc {
 					(stats.LoadAvg1 != 0 || stats.LoadAvg5 != 0 || stats.LoadAvg15 != 0) {
 					loadAvg = fmt.Sprintf("%.2f %.2f %.2f", stats.LoadAvg1, stats.LoadAvg5, stats.LoadAvg15)
 				}
+			} else if ctx.Err() != nil {
+				cutShort = true
 			}
 		}
 
@@ -248,18 +264,28 @@ func DiagnosticsCollect(reader metrics.SystemReader) BuiltinFunc {
 			name, args := networkListCommand()
 			if out, err := exec.CommandContext(ctx, name, args...).CombinedOutput(); err == nil {
 				result.NetworkInterfaces = string(out)
+			} else if ctx.Err() != nil {
+				cutShort = true
 			}
 		}
 		if includeProcesses {
 			name, args := processListCommand()
 			if out, err := exec.CommandContext(ctx, name, args...).CombinedOutput(); err == nil {
 				result.Processes = string(out)
+			} else if ctx.Err() != nil {
+				cutShort = true
 			}
 		}
 
 		data, err := json.MarshalIndent(result, "", "  ")
 		if err != nil {
 			return "", "", 1, fmt.Errorf("marshal diagnostics: %w", err)
+		}
+
+		// The partial collection is still returned, as the output of the run
+		// the stop ended.
+		if cutShort {
+			return string(data), "", 1, fmt.Errorf("diagnostics collect: %w", ctx.Err())
 		}
 
 		return string(data), "", 0, nil
@@ -294,6 +320,10 @@ func DiagnosticsTraceroutePeer(info NodeInfoProvider) BuiltinFunc {
 		cmd := exec.CommandContext(ctx, name, args...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
+			// As for ping: a killed trace is a stop, not an unreachable route.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", string(out), commandExitCode(cmd), fmt.Errorf("traceroute %s: %w", target, ctxErr)
+			}
 			if cmd.ProcessState != nil {
 				return "", string(out), cmd.ProcessState.ExitCode(), nil
 			}
@@ -302,6 +332,15 @@ func DiagnosticsTraceroutePeer(info NodeInfoProvider) BuiltinFunc {
 
 		return string(out), "", 0, nil
 	}
+}
+
+// commandExitCode returns the exit code of a command that ran, and 1 for one
+// that never started, which has no ProcessState.
+func commandExitCode(cmd *exec.Cmd) int {
+	if cmd.ProcessState == nil {
+		return 1
+	}
+	return cmd.ProcessState.ExitCode()
 }
 
 // ServiceRestart returns a BuiltinFunc that restarts plexd through the host's
@@ -313,6 +352,16 @@ func ServiceRestart(ctl ServiceController) BuiltinFunc {
 			return "", "", 1, fmt.Errorf("service manager not available")
 		}
 		if err := ctl.Restart(ctx); err != nil {
+			// A manager call the end of the context cut short failed because of
+			// the stop, so the stop is the error. That usually includes a
+			// restart of plexd itself: the manager's command dies with plexd
+			// while the shutdown ends the context, so its report, if it lands,
+			// reads cancelled, a run stopped at the node's own shutdown. When
+			// the command's death is seen before the shutdown has ended the
+			// context, the run reports the manager's error as before.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", err.Error(), 1, fmt.Errorf("service restart: %w", ctxErr)
+			}
 			return "", err.Error(), 1, nil
 		}
 		return "", "", 0, nil
@@ -503,6 +552,12 @@ func ServiceUpgrade(fetcher ReleaseFetcher, verifier BundleVerifier, ctl Service
 				Version: version,
 			}
 			data, _ := json.MarshalIndent(result, "", "  ")
+			// The binary is in place either way, so the output still says so.
+			// Only the error changes: a restart the end of the context cut short
+			// is the stop, as for service.restart.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return string(data), "", 1, fmt.Errorf("service upgrade: restart: %w", ctxErr)
+			}
 			return string(data), "", 1, nil
 		}
 
@@ -566,7 +621,9 @@ type meshReconnectResult struct {
 }
 
 // MeshReconnect returns a BuiltinFunc that triggers mesh reconnection.
-// On failure, returns exit code 1 with error details but no system error.
+// On failure, returns exit code 1 with error details but no system error,
+// unless the end of the context cut the reconnect short: that stop is
+// returned as the error.
 func MeshReconnect(reconnector MeshReconnector) BuiltinFunc {
 	return func(ctx context.Context, params map[string]string) (string, string, int, error) {
 		if err := reconnector.Reconnect(ctx); err != nil {
@@ -575,6 +632,9 @@ func MeshReconnect(reconnector MeshReconnector) BuiltinFunc {
 				Error:  err.Error(),
 			}
 			data, _ := json.MarshalIndent(result, "", "  ")
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return string(data), "", 1, fmt.Errorf("mesh reconnect: %w", ctxErr)
+			}
 			return string(data), "", 1, nil
 		}
 

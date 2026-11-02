@@ -1319,3 +1319,247 @@ func TestBuiltinServiceUpgrade_RestartFails(t *testing.T) {
 		t.Errorf("binary content = %q, want the new bytes despite the failed restart", got)
 	}
 }
+
+// --- built-ins that report a stop ---
+
+// TestBuiltins_Cancelled calls every built-in that passes its context on with a
+// context a cancel has ended. Each used to fold the stop into an exit code or a
+// success, so the executor saw no error and reported a cancelled run as failed,
+// or as succeeded.
+func TestBuiltins_Cancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	testBuiltinsStopped(t, ctx, context.Canceled)
+}
+
+// TestBuiltins_DeadlineExceeded repeats TestBuiltins_Cancelled with a context
+// its deadline has ended, which the executor reports as a timed-out run.
+func TestBuiltins_DeadlineExceeded(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	testBuiltinsStopped(t, ctx, context.DeadlineExceeded)
+}
+
+// testBuiltinsStopped runs each built-in that passes its context on under ctx,
+// which has already ended with stop. Each must return an error that wraps stop
+// under its own prefix, next to the output and exit code it returned before.
+func testBuiltinsStopped(t *testing.T, ctx context.Context, stop error) {
+	if !errors.Is(ctx.Err(), stop) {
+		t.Fatalf("ctx.Err() = %v, want %v", ctx.Err(), stop)
+	}
+	info := &mockNodeInfo{nodeID: "node-1", meshIP: "10.99.0.1", peerCount: 1}
+
+	tests := []struct {
+		name   string
+		prefix string
+		// call runs the built-in, checks its output and exit code, and
+		// returns its error.
+		call func(t *testing.T) error
+	}{
+		{
+			name:   "diagnostics.ping_peer",
+			prefix: "ping 127.0.0.1: ",
+			call: func(t *testing.T) error {
+				// The context ended before the command could start, so there is
+				// no output and no exit status of its own.
+				stdout, stderr, exitCode, err := PingPeer(info)(ctx, map[string]string{"peer_id": "127.0.0.1"})
+				if stdout != "" || stderr != "" {
+					t.Errorf("stdout = %q, stderr = %q, want both empty", stdout, stderr)
+				}
+				if exitCode != 1 {
+					t.Errorf("exit code = %d, want 1", exitCode)
+				}
+				return err
+			},
+		},
+		{
+			name:   "diagnostics.traceroute_peer",
+			prefix: "traceroute 127.0.0.1: ",
+			call: func(t *testing.T) error {
+				if _, _, err := tracerouteCommand("15", "127.0.0.1"); err != nil {
+					t.Skipf("traceroute not available: %v", err)
+				}
+				stdout, stderr, exitCode, err := DiagnosticsTraceroutePeer(info)(ctx, map[string]string{"peer_id": "127.0.0.1"})
+				if stdout != "" || stderr != "" {
+					t.Errorf("stdout = %q, stderr = %q, want both empty", stdout, stderr)
+				}
+				if exitCode != 1 {
+					t.Errorf("exit code = %d, want 1", exitCode)
+				}
+				return err
+			},
+		},
+		{
+			name:   "service.restart",
+			prefix: "service restart: ",
+			call: func(t *testing.T) error {
+				ctl := &fakeServiceController{available: true, err: errors.New("packaging: systemctl restart: signal: killed")}
+				stdout, stderr, exitCode, err := ServiceRestart(ctl)(ctx, nil)
+				if stdout != "" {
+					t.Errorf("stdout = %q, want empty", stdout)
+				}
+				if stderr != ctl.err.Error() {
+					t.Errorf("stderr = %q, want %q", stderr, ctl.err.Error())
+				}
+				if exitCode != 1 {
+					t.Errorf("exit code = %d, want 1", exitCode)
+				}
+				return err
+			},
+		},
+		{
+			name:   "mesh.reconnect",
+			prefix: "mesh reconnect: ",
+			call: func(t *testing.T) error {
+				// A reconnector that watches its context fails with its error.
+				stdout, _, exitCode, err := MeshReconnect(&mockMeshReconnector{err: stop})(ctx, nil)
+				if exitCode != 1 {
+					t.Errorf("exit code = %d, want 1", exitCode)
+				}
+				var result meshReconnectResult
+				if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+					t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
+				}
+				if result.Status != "failed" || result.Error != stop.Error() {
+					t.Errorf("result = %+v, want status failed with error %q", result, stop.Error())
+				}
+				return err
+			},
+		},
+		{
+			name:   "diagnostics.collect",
+			prefix: "diagnostics collect: ",
+			call: func(t *testing.T) error {
+				// The listings cannot start under the ended context, so the
+				// collection holds everything but them.
+				stdout, stderr, exitCode, err := DiagnosticsCollect(nil)(ctx, nil)
+				if stderr != "" {
+					t.Errorf("stderr = %q, want empty", stderr)
+				}
+				if exitCode != 1 {
+					t.Errorf("exit code = %d, want 1", exitCode)
+				}
+				var result map[string]any
+				if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+					t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
+				}
+				for _, key := range []string{"hostname", "os", "arch", "cpu_count", "kernel_version"} {
+					if _, ok := result[key]; !ok {
+						t.Errorf("key %q is missing, want the partial collection", key)
+					}
+				}
+				for _, key := range []string{"network_interfaces", "processes"} {
+					if _, ok := result[key]; ok {
+						t.Errorf("key %q is present, want it left out by the stop", key)
+					}
+				}
+				return err
+			},
+		},
+		{
+			name:   "service.upgrade",
+			prefix: "service upgrade: restart: ",
+			call: func(t *testing.T) error {
+				newBinary := []byte("brand-new-plexd-binary-bytes")
+				sum := sha256.Sum256(newBinary)
+				path := upgradeSeamFile(t, []byte("old binary"))
+				ctl := &fakeServiceController{available: true, err: errors.New("packaging: systemctl restart: signal: killed")}
+				fn := ServiceUpgrade(
+					&fakeReleaseFetcher{binary: newBinary, bundle: []byte(`{"bundle":true}`)},
+					&fakeBundleVerifier{},
+					ctl,
+				)
+
+				stdout, _, exitCode, err := fn(ctx, map[string]string{
+					"version":  "1.5.0",
+					"checksum": hex.EncodeToString(sum[:]),
+				})
+				if exitCode != 1 {
+					t.Errorf("exit code = %d, want 1", exitCode)
+				}
+				var result serviceUpgradeResult
+				if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+					t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
+				}
+				if result.Status != "upgraded_restart_failed" {
+					t.Errorf("status = %q, want %q", result.Status, "upgraded_restart_failed")
+				}
+				if want := "binary replaced, restart failed: " + ctl.err.Error(); result.Message != want {
+					t.Errorf("message = %q, want %q", result.Message, want)
+				}
+				// The steps ahead of the restart do not watch the context, so the
+				// binary is replaced before the stop is noticed.
+				if got, readErr := os.ReadFile(path); readErr != nil || !bytes.Equal(got, newBinary) {
+					t.Errorf("binary = %q (%v), want the new bytes", got, readErr)
+				}
+				return err
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call(t)
+			if !errors.Is(err, stop) {
+				t.Fatalf("err = %v, want one wrapping %v", err, stop)
+			}
+			if want := tc.prefix + stop.Error(); err.Error() != want {
+				t.Errorf("err = %q, want %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+// A stop that cuts no call short leaves a complete collection, so it is
+// reported as one: with both listings off and no reader, nothing in the run
+// takes the context.
+func TestBuiltinDiagnosticsCollect_CancelledWithNothingCutShort(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	stdout, _, exitCode, err := DiagnosticsCollect(nil)(ctx, map[string]string{
+		"include_network":   "false",
+		"include_processes": "false",
+	})
+	if err != nil {
+		t.Fatalf("DiagnosticsCollect() err = %v, want nil", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("DiagnosticsCollect() exit code = %d, want 0", exitCode)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\nstdout: %s", err, stdout)
+	}
+}
+
+// TestBuiltinDiagnosticsCollect_ReaderCutShort covers the third source a stop
+// can cut short, the platform reader, with both listings off so the reader is
+// the only call that takes the context.
+func TestBuiltinDiagnosticsCollect_ReaderCutShort(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("/proc fills memory_total and load_avg before the reader is consulted")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	reader := &stubSystemReader{err: fmt.Errorf("metrics: system: %w", context.Canceled)}
+
+	stdout, _, exitCode, err := DiagnosticsCollect(reader)(ctx, map[string]string{
+		"include_network":   "false",
+		"include_processes": "false",
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DiagnosticsCollect() err = %v, want one wrapping context.Canceled", err)
+	}
+	if got, want := err.Error(), "diagnostics collect: context canceled"; got != want {
+		t.Errorf("DiagnosticsCollect() err = %q, want %q", got, want)
+	}
+	if exitCode != 1 {
+		t.Errorf("DiagnosticsCollect() exit code = %d, want 1", exitCode)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("stdout is not the partial JSON: %v\nstdout: %s", err, stdout)
+	}
+}
