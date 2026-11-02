@@ -34,6 +34,8 @@
 #   - A hook run held to its sidecar's timeout with its whole process group
 #     killed, and refused for a sandbox level plexd lacks and for a
 #     group-writable hook file
+#   - A running hook stopped by the pull's cancel_requested_at, with its whole
+#     process group killed and the output it printed reported as cancelled
 #   - Pull-only delivery under a descoped event bus (quiet SSE re-probing)
 #   - Last-Event-ID resume replays buffered envelopes after a descope window
 #   - release-verdict upgrade flow (checksum + offline Sigstore verification)
@@ -3617,14 +3619,13 @@ wait_for_hook_entry "failed PUT" e2e-bigout 'keys == ["checksum", "name"]'
 # proof, not the pid.
 RUN_TICKS="/var/run/plexd/e2e-run.ticks"
 
-# wait_for_terminal_callback polls for up to 15 seconds, until the mock has
-# accepted three callbacks past the baseline and the captured body meets a jq
-# filter. Args: <step> <baseline> <jq filter>. Three is ack, started, and the
-# terminal. The mock captures a callback it refuses with 409 too, so the filter
-# says what the agent sent, and the counter, which moves only on acceptance,
-# says it landed.
-wait_for_terminal_callback() {
-    local step=$1 baseline=$2 filter=$3
+# wait_for_callback polls for up to 15 seconds, until the mock has accepted a
+# given number of callbacks past the baseline and the captured body meets a jq
+# filter. Args: <step> <baseline> <accepted> <jq filter>. The mock captures a
+# callback it refuses with 409 too, so the filter says what the agent sent, and
+# the counter, which moves only on acceptance, says it landed.
+wait_for_callback() {
+    local step=$1 baseline=$2 accepted=$3 filter=$4
     local elapsed=0 body count
     # A failed baseline read leaves it empty, and the counter check would then
     # pass on any count, leaving only the body, which the mock captures even
@@ -3635,22 +3636,28 @@ wait_for_terminal_callback() {
     while :; do
         body=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
         count=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
-        if [ "${count:-0}" -ge $((baseline + 3)) ] \
+        if [ "${count:-0}" -ge $((baseline + accepted)) ] \
             && printf '%s' "${body}" | jq -e "${filter}" >/dev/null 2>&1; then
-            echo "  PASS: [${step}] the terminal callback holds ${filter}, after ${elapsed}s"
+            echo "  PASS: [${step}] ${accepted} callbacks landed past the baseline and the last holds ${filter}, after ${elapsed}s"
             return 0
         fi
         if [ "${elapsed}" -ge 15 ]; then
-            fail "[${step}] the terminal callback did not reach ${filter} within 15s (execution_callback_count ${count:-0}, want >= $((baseline + 3)); body: ${body})"
+            fail "[${step}] the last callback did not reach ${filter} within 15s (execution_callback_count ${count:-0}, want >= $((baseline + accepted)); body: ${body})"
         fi
         sleep 1
         elapsed=$((elapsed + 1))
     done
 }
 
-# read_run_ticks prints the size of the file e2e-run appends to. The redirect
-# sits inside the sh -c, so a missing file fails the read instead of reading as
-# 0.
+# wait_for_terminal_callback waits for a run's terminal callback. Args: <step>
+# <baseline> <jq filter>. Three is ack, started, and the terminal.
+wait_for_terminal_callback() {
+    wait_for_callback "$1" "$2" 3 "$3"
+}
+
+# read_run_ticks prints the size of the file at RUN_TICKS, the one the hook
+# under test appends to: e2e-run here and e2e-cancel in 10h. The redirect sits
+# inside the sh -c, so a missing file fails the read instead of reading as 0.
 read_run_ticks() {
     dc exec -T plexd /bin/busybox sh -c "/bin/busybox wc -c < ${RUN_TICKS}" 2>&1
 }
@@ -3735,6 +3742,85 @@ configure_executions "exec-e2e-hook-run-clear" '[]'
 dc exec -T plexd /bin/busybox rm "${LIVE_HOOKS_DIR}/e2e-run" "${RUN_TICKS}" \
     || fail "[hook run cleanup] could not remove e2e-run and ${RUN_TICKS} from the container"
 wait_for_declared_hooks "hook run cleanup" "e2e-bigout"
+
+# 10h. A cancel request stops a running hook. The pull marks a started entry
+# with cancel_requested_at once an operator cancelled its Execution, and plexd
+# kills the run's process group and reports cancelled with the output it
+# captured before the kill. The hook is a new one, e2e-cancel: plexd pinned the
+# digest of e2e-run when it first found it and keeps the pin for the life of the
+# process, so a rewritten e2e-run would fail verification. As in 10g, plexd is
+# PID 1 here and reaps nothing, so the size of the file the hook's child appends
+# to is the proof of the kill, not the pid. The step proves no pull trigger:
+# every dispatch below is nudged, and a heartbeat-driven pull would deliver the
+# same block, so the heartbeat's reconcile hint stays on.
+RUN_TICKS="/var/run/plexd/e2e-cancel.ticks"
+
+# (1) The hook prints a line before it starts its child, so the cancelled report
+# has output to carry. It has no sidecar, so no timeout of its own can end the
+# run inside the step, and its manifest entry is the short one.
+printf '%s\n' '#!/bin/sh' \
+    'echo e2e-cancel started' \
+    "( while :; do echo tick >> ${RUN_TICKS}; /bin/busybox sleep 1; done ) &" \
+    'wait' \
+    | dc exec -T plexd /bin/busybox sh -c \
+        "/bin/busybox cat > ${LIVE_HOOKS_DIR}/e2e-cancel && /bin/busybox chmod 0755 ${LIVE_HOOKS_DIR}/e2e-cancel" \
+    || fail "[hook cancel] could not write e2e-cancel into the container"
+wait_for_hook_entry "hook cancel" e2e-cancel 'keys == ["checksum", "name"]'
+
+# (2) The baseline goes ahead of the dispatch, as in 10g. Two callbacks are the
+# ack and started. plexd starts the hook only once started is recorded, so the
+# file may not exist yet when that callback lands, and a failed read counts as
+# not yet. The cancel waits for the first tick: one that lands before the child
+# runs would prove nothing about the group kill.
+CB_BEFORE_CANCEL=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+configure_executions "exec-e2e-cancel-001" \
+    "$(exec_entry "exec-e2e-cancel-001" "e2e-cancel" "hook" "pending" "null")"
+wait_for_callback "hook cancel" "${CB_BEFORE_CANCEL}" 2 '.status == "started"'
+
+CANCEL_TICKS_ELAPSED=0
+while :; do
+    # The test sits in the condition, so a failed read or a size that is not a
+    # number does not end the script under set -e.
+    if CANCEL_TICKS_RUNNING=$(read_run_ticks) && [ "${CANCEL_TICKS_RUNNING}" -gt 0 ] 2>/dev/null; then
+        echo "  PASS: [hook cancel] ${RUN_TICKS} reached ${CANCEL_TICKS_RUNNING} bytes after ${CANCEL_TICKS_ELAPSED}s, so the hook's child runs"
+        break
+    fi
+    if [ "${CANCEL_TICKS_ELAPSED}" -ge 10 ]; then
+        fail "[hook cancel] ${RUN_TICKS} did not grow above 0 bytes within 10s (last read: ${CANCEL_TICKS_RUNNING}): the hook's child never ran"
+    fi
+    sleep 1
+    CANCEL_TICKS_ELAPSED=$((CANCEL_TICKS_ELAPSED + 1))
+done
+
+# (3) The same entry comes back carrying the request, under a new tag so the
+# nudge's envelope id stays unique. It is rendered at started, the status the
+# mock has tracked for it since that callback. Three callbacks are ack, started,
+# and cancelled, and the cancelled one carries what the hook printed before the
+# kill.
+configure_executions "exec-e2e-cancel-002" \
+    "$(exec_entry "exec-e2e-cancel-001" "e2e-cancel" "hook" "started" "null" \
+        | jq -c '.[0].cancel_requested_at = "2026-01-01T00:01:00Z"')"
+wait_for_callback "hook cancel" "${CB_BEFORE_CANCEL}" 3 \
+    '.status == "cancelled" and (.output.inline | @base64d | contains("e2e-cancel started"))'
+
+# (4) A child that outlived the kill appends at least twice in 3 seconds.
+CANCEL_TICKS_AT_KILL=$(read_run_ticks) \
+    || fail "[hook cancel] could not read ${RUN_TICKS} in the container: ${CANCEL_TICKS_AT_KILL}"
+sleep 3
+CANCEL_TICKS_LATER=$(read_run_ticks) \
+    || fail "[hook cancel] could not read ${RUN_TICKS} in the container: ${CANCEL_TICKS_LATER}"
+if [ "${CANCEL_TICKS_AT_KILL}" -gt 0 ] && [ "${CANCEL_TICKS_LATER}" = "${CANCEL_TICKS_AT_KILL}" ]; then
+    echo "  PASS: [hook cancel] ${RUN_TICKS} stayed at ${CANCEL_TICKS_AT_KILL} bytes for 3s after the cancelled callback"
+else
+    fail "[hook cancel] ${RUN_TICKS} went from '${CANCEL_TICKS_AT_KILL}' to '${CANCEL_TICKS_LATER}' bytes in 3s, want one size above 0: a child of the hook outlived the cancel"
+fi
+
+# (5) Cleanup: the executions block goes back to empty, and e2e-cancel and its
+# ticks leave the container, so the later phases find the fixture they expect.
+configure_executions "exec-e2e-cancel-clear" '[]'
+dc exec -T plexd /bin/busybox rm "${LIVE_HOOKS_DIR}/e2e-cancel" "${RUN_TICKS}" \
+    || fail "[hook cancel cleanup] could not remove e2e-cancel and ${RUN_TICKS} from the container"
+wait_for_declared_hooks "hook cancel cleanup" "e2e-bigout"
 
 echo "=== Phase 10 PASSED: deeper body validation ==="
 
