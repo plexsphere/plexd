@@ -402,6 +402,32 @@ func (e *Executor) Shutdown(_ context.Context) {
 	e.wg.Wait()
 }
 
+// Cancel stops the run of one execution the way Shutdown stops all of them: it
+// cancels the run's action context, which kills a hook's process group and
+// ends a built-in that watches its context. It reports whether this executor
+// held a run under executionID. An empty or unknown id does nothing and
+// reports false. A second call for the same run does nothing more, because a
+// cancel function is idempotent. Unlike Shutdown it leaves shuttingDown alone,
+// so other dispatches go on.
+//
+// The run still sends its own terminal report. A run whose result is already
+// computed when Cancel lands reports its real outcome, because that report leg
+// runs on a context detached from the action's.
+func (e *Executor) Cancel(executionID string) bool {
+	if executionID == "" {
+		return false
+	}
+
+	e.mu.Lock()
+	cancel, found := e.active[executionID]
+	e.mu.Unlock()
+
+	if found {
+		cancel()
+	}
+	return found
+}
+
 // reject fails an execution the node will not run, carrying reason as the error
 // string of the terminal callback. The control plane reaches a terminal status
 // only from started, so the rejection walks every legal edge from the status the
@@ -660,10 +686,11 @@ func (e *Executor) runAction(ctx context.Context, nodeID string, entry api.NodeS
 	}
 
 	// The terminal callback is the only transition out of started and must be
-	// delivered even when shutdown has already cancelled ctx (Shutdown cancels
-	// every actionCtx directly). Detach the report leg from that cancellation,
-	// keeping a bounded deadline of its own. terminalOutcome above still reads
-	// ctx to recognise the cancellation it reports.
+	// delivered even when shutdown or a cancel request has already cancelled
+	// ctx (Shutdown and Cancel cancel the actionCtx directly). Detach the
+	// report leg from that cancellation, keeping a bounded deadline of its own.
+	// terminalOutcome above still reads ctx to recognise the cancellation it
+	// reports.
 	reportCtx, cancelReport := context.WithTimeout(context.WithoutCancel(ctx), terminalReportTimeout)
 	defer cancelReport()
 
