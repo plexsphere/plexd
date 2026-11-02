@@ -5427,6 +5427,63 @@ func stateEnvelope(t *testing.T, baseURL string) map[string]json.RawMessage {
 	return envelope
 }
 
+// servedExecutionMembers returns the served executions block as raw JSON members
+// keyed by execution id, so a test can tell an absent key from a present one.
+func servedExecutionMembers(t *testing.T, baseURL string) map[string]map[string]json.RawMessage {
+	t.Helper()
+	var entries []map[string]json.RawMessage
+	if err := json.Unmarshal(stateEnvelope(t, baseURL)["executions"], &entries); err != nil {
+		t.Fatalf("unmarshal executions: %v", err)
+	}
+	served := make(map[string]map[string]json.RawMessage, len(entries))
+	for _, entry := range entries {
+		var eid string
+		if err := json.Unmarshal(entry["execution_id"], &eid); err != nil {
+			t.Fatalf("unmarshal execution_id %s: %v", entry["execution_id"], err)
+		}
+		served[eid] = entry
+	}
+	return served
+}
+
+// testCancelRequestedAt is the instant every cancel request in these tests
+// carries, and testCancelRequestedAtJSON is how the state handler serializes it.
+var testCancelRequestedAt = time.Date(2026, time.January, 1, 0, 1, 0, 0, time.UTC)
+
+const testCancelRequestedAtJSON = `"2026-01-01T00:01:00Z"`
+
+// withCancelRequest returns entry carrying the operator's cancel request.
+func withCancelRequest(entry api.NodeStateExecution) api.NodeStateExecution {
+	at := testCancelRequestedAt
+	entry.CancelRequestedAt = &at
+	return entry
+}
+
+// advanceExecution drives eid through the given callbacks, failing the test
+// unless each is accepted.
+func advanceExecution(t *testing.T, baseURL, eid string, statuses ...string) {
+	t.Helper()
+	for _, status := range statuses {
+		if got := callbackStatus(t, baseURL, eid, status); got != http.StatusOK {
+			t.Fatalf("callback %q for %q status = %d, want %d", status, eid, got, http.StatusOK)
+		}
+	}
+}
+
+// assertCallbackConflict posts one bare status callback and fails the test
+// unless it is answered 409 with the problem code wantCode.
+func assertCallbackConflict(t *testing.T, baseURL, eid, status, wantCode string) {
+	t.Helper()
+	resp := postExecCallback(t, baseURL, eid, fmt.Sprintf(`{"status":%q}`, status))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("callback %q for %q status = %d, want %d", status, eid, resp.StatusCode, http.StatusConflict)
+	}
+	if code := problemCode(t, resp); code != wantCode {
+		t.Errorf("callback %q for %q code = %q, want %q", status, eid, code, wantCode)
+	}
+}
+
 func TestConfigureState_SeedsExecutionStates(t *testing.T) {
 	_, ts := newTestServer(t)
 	const (
@@ -5586,6 +5643,156 @@ func TestState_EmptyExecutionsSerializeAsArray(t *testing.T) {
 			t.Errorf("executions = %s, want [] (never null)", got)
 		}
 	})
+}
+
+func TestConfigureState_CancelRequestOnStartedExecutionIsServed(t *testing.T) {
+	tests := []struct {
+		name string
+		// stage configures eid and leaves it at started carrying the request.
+		stage func(t *testing.T, baseURL, eid string)
+	}{
+		{
+			// The node inherited the run: the fixture says started.
+			name: "configured_started",
+			stage: func(t *testing.T, baseURL, eid string) {
+				configureExecutions(t, baseURL, withCancelRequest(stateExecution(eid, api.ExecutionStatusStarted)))
+			},
+		},
+		{
+			// The node advanced the run itself, and the re-posted fixture still
+			// says pending: the tracked started wins, so the run is not ended.
+			name: "tracked_started",
+			stage: func(t *testing.T, baseURL, eid string) {
+				configureExecutions(t, baseURL, stateExecution(eid, api.ExecutionStatusPending))
+				advanceExecution(t, baseURL, eid, api.ExecutionStatusAck, api.ExecutionStatusStarted)
+				configureExecutions(t, baseURL, withCancelRequest(stateExecution(eid, api.ExecutionStatusPending)))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			eid := "exec-cancel-" + tt.name
+			tt.stage(t, ts.URL, eid)
+
+			entry, ok := servedExecutionMembers(t, ts.URL)[eid]
+			if !ok {
+				t.Fatalf("served executions carry no entry for %q, want the started entry", eid)
+			}
+			if got := string(entry["status"]); got != `"started"` {
+				t.Errorf("served status = %s, want %q", got, "started")
+			}
+			if got := string(entry["cancel_requested_at"]); got != testCancelRequestedAtJSON {
+				t.Errorf("served cancel_requested_at = %s, want %s", got, testCancelRequestedAtJSON)
+			}
+
+			// The node stopped the run and reports it from started.
+			if got := callbackStatus(t, ts.URL, eid, api.ExecutionStatusCancelled); got != http.StatusOK {
+				t.Fatalf("cancelled status = %d, want %d", got, http.StatusOK)
+			}
+			if _, ok := servedExecutionMembers(t, ts.URL)[eid]; ok {
+				t.Errorf("served executions still carry %q after its cancelled callback", eid)
+			}
+		})
+	}
+}
+
+func TestConfigureState_CancelRequestEndsWaitingExecution(t *testing.T) {
+	tests := []struct {
+		status string
+		// next is the callback the node would send next for status.
+		next string
+	}{
+		{api.ExecutionStatusPending, api.ExecutionStatusAck},
+		{api.ExecutionStatusAck, api.ExecutionStatusStarted},
+	}
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			eid := "exec-cancel-waiting-" + tt.status
+			configureExecutions(t, ts.URL, withCancelRequest(stateExecution(eid, tt.status)))
+
+			if served := servedExecutionMembers(t, ts.URL); len(served) != 0 {
+				t.Errorf("served executions = %v, want none: a waiting target ends at the cancel", served)
+			}
+			assertCallbackConflict(t, ts.URL, eid, tt.next, "execution_already_terminal")
+		})
+	}
+}
+
+func TestConfigureState_CancelRequestEndsTrackedAck(t *testing.T) {
+	_, ts := newTestServer(t)
+	const eid = "exec-cancel-tracked-ack"
+	configureExecutions(t, ts.URL, stateExecution(eid, api.ExecutionStatusPending))
+	advanceExecution(t, ts.URL, eid, api.ExecutionStatusAck)
+
+	// The re-posted fixture still says pending; the tracked ack is what the
+	// cancel ends, overwriting the state the node advanced.
+	configureExecutions(t, ts.URL, withCancelRequest(stateExecution(eid, api.ExecutionStatusPending)))
+
+	if served := servedExecutionMembers(t, ts.URL); len(served) != 0 {
+		t.Errorf("served executions = %v, want none: an acknowledged target ends at the cancel", served)
+	}
+	assertCallbackConflict(t, ts.URL, eid, api.ExecutionStatusStarted, "execution_already_terminal")
+}
+
+func TestState_ExecutionWithoutCancelRequestOmitsKey(t *testing.T) {
+	_, ts := newTestServer(t)
+	const eid = "exec-cancel-absent"
+	configureExecutions(t, ts.URL, stateExecution(eid, api.ExecutionStatusPending))
+
+	entry, ok := servedExecutionMembers(t, ts.URL)[eid]
+	if !ok {
+		t.Fatalf("served executions carry no entry for %q", eid)
+	}
+	if got, ok := entry["cancel_requested_at"]; ok {
+		t.Errorf("served entry carries cancel_requested_at = %s, want no such key", got)
+	}
+}
+
+func TestConfigureState_CancelRequestLeavesSettledExecution(t *testing.T) {
+	// The re-posted fixture may carry any configured status; the tracked terminal
+	// state is what counts, so none of them revives or re-ends the execution.
+	for _, configured := range []string{api.ExecutionStatusPending, api.ExecutionStatusAck, api.ExecutionStatusStarted} {
+		t.Run(configured, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			eid := "exec-cancel-settled-" + configured
+			configureExecutions(t, ts.URL, stateExecution(eid, api.ExecutionStatusPending))
+			advanceExecution(t, ts.URL, eid, api.ExecutionStatusAck, api.ExecutionStatusStarted, api.ExecutionStatusSucceeded)
+
+			configureExecutions(t, ts.URL, withCancelRequest(stateExecution(eid, configured)))
+
+			if served := servedExecutionMembers(t, ts.URL); len(served) != 0 {
+				t.Errorf("served executions = %v, want none: a settled execution stays drained", served)
+			}
+			// The execution is still terminal, so the node's late cancelled
+			// report is refused as past the end rather than accepted.
+			assertCallbackConflict(t, ts.URL, eid, api.ExecutionStatusCancelled, "execution_already_terminal")
+			if a := getAssertions(t, ts.URL); a.ExecutionCallbackCount != 3 {
+				t.Errorf("execution_callback_count = %d, want 3", a.ExecutionCallbackCount)
+			}
+		})
+	}
+}
+
+func TestExecutionCallback_CancelledFromUnseenIsRefused(t *testing.T) {
+	tests := []struct {
+		name  string
+		stage func(t *testing.T, baseURL, eid string)
+	}{
+		{"unconfigured", func(*testing.T, string, string) {}},
+		{"configured_pending", func(t *testing.T, baseURL, eid string) {
+			configureExecutions(t, baseURL, stateExecution(eid, api.ExecutionStatusPending))
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			eid := "exec-cancel-unseen-" + tt.name
+			tt.stage(t, ts.URL, eid)
+			assertCallbackConflict(t, ts.URL, eid, api.ExecutionStatusCancelled, "invalid_state_transition")
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------

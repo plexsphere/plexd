@@ -950,6 +950,12 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 // out of the block; an entry whose expires_at is not in the future is no longer
 // served, and an entry carrying no expires_at at all is therefore never served.
 // The result is never nil, so the block serializes as [] rather than null.
+//
+// Each served entry is a copy of the configured one with only its status
+// replaced, so cancel_requested_at is served exactly as configured, and an entry
+// configured without it is served without the key. A waiting entry configured
+// with it never reaches the node: SetState records it as cancelled, so it drains
+// here like any other terminal entry.
 func (s *Server) projectExecutions(configured []api.NodeStateExecution) []api.NodeStateExecution {
 	s.execMu.Lock()
 	defer s.execMu.Unlock()
@@ -3034,6 +3040,17 @@ func (s *Server) fixturePeerIDs() map[string]struct{} {
 // two locks are never held at once: execMu is taken only after stateFixtureMu is
 // released.
 //
+// An entry carrying cancel_requested_at models the control plane's cancel of the
+// Execution. The control plane ends a target that is still waiting at once, so
+// when the entry's status is pending or ack the mock records it as cancelled:
+// the entry drains from the next pull, and the node's late ack or started is
+// answered 409 execution_already_terminal. The status checked is the tracked one
+// when the mock tracks the id, otherwise the configured one, because the node may
+// have advanced past what a re-posted fixture says. This is the one case in which
+// SetState overwrites a tracked state. A started entry keeps its state and is
+// served with the field, so the node can stop the run and report cancelled
+// itself. A terminal one is left alone.
+//
 // Every configured session carrying a session_id is also recorded in the
 // session registry, which is never pruned, so an id drained by a later snapshot
 // stays distinguishable from one that was never configured.
@@ -3052,7 +3069,19 @@ func (s *Server) SetState(state api.NodeStateSnapshot) {
 	s.execMu.Lock()
 	defer s.execMu.Unlock()
 	for _, exec := range state.Executions {
-		if _, tracked := s.execStates[exec.ExecutionID]; tracked {
+		status, tracked := s.execStates[exec.ExecutionID]
+		if !tracked {
+			status = exec.Status
+		}
+		// The cancel rule runs ahead of the skip-if-present check: a target the
+		// node has already acknowledged is tracked, and a cancel ends it all the
+		// same.
+		if exec.CancelRequestedAt != nil &&
+			(status == api.ExecutionStatusPending || status == api.ExecutionStatusAck) {
+			s.execStates[exec.ExecutionID] = api.ExecutionStatusCancelled
+			continue
+		}
+		if tracked {
 			continue
 		}
 		switch exec.Status {
