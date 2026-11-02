@@ -31,6 +31,9 @@
 #     and removed in the running container, a sidecar's metadata reported, the
 #     short entry sent to a control plane that refuses metadata, and a failed
 #     PUT retried
+#   - A hook run held to its sidecar's timeout with its whole process group
+#     killed, and refused for a sandbox level plexd lacks and for a
+#     group-writable hook file
 #   - Pull-only delivery under a descoped event bus (quiet SSE re-probing)
 #   - Last-Event-ID resume replays buffered envelopes after a descope window
 #   - release-verdict upgrade flow (checksum + offline Sigstore verification)
@@ -3347,9 +3350,11 @@ install_live_hook() {
 
 # install_live_sidecar writes a hook's sidecar into the running container. Args:
 # <hook> <json>. The JSON travels over stdin, so its quotes never reach a shell.
+# The mode is set rather than left to the exec's umask, because plexd refuses to
+# run a hook whose sidecar is group- or other-writable.
 install_live_sidecar() {
     printf '%s\n' "$2" | dc exec -T plexd /bin/busybox sh -c \
-        "/bin/busybox cat > ${LIVE_HOOKS_DIR}/$1.json"
+        "/bin/busybox cat > ${LIVE_HOOKS_DIR}/$1.json && /bin/busybox chmod 0644 ${LIVE_HOOKS_DIR}/$1.json"
 }
 
 # wait_for_declared_hooks polls the captured manifest for up to 10 seconds, until
@@ -3603,6 +3608,133 @@ fi
 wait_for_declared_hooks "failed PUT" "e2e-bigout"
 # e2e-bigout has no sidecar, so its entry stays short across the restart.
 wait_for_hook_entry "failed PUT" e2e-bigout 'keys == ["checksum", "name"]'
+
+# 10g. A hook run meets each limit plexd enforces: the timeout its sidecar
+# declares, a sandbox level plexd does not implement, and a hook file that is
+# group-writable. The hook e2e-run starts a child that appends to a file every
+# second and waits on it. plexd is PID 1 here and reaps nothing, so a killed
+# child stays a zombie that kill -0 still finds: the size of the file is the
+# proof, not the pid.
+RUN_TICKS="/var/run/plexd/e2e-run.ticks"
+
+# wait_for_terminal_callback polls for up to 15 seconds, until the mock has
+# accepted three callbacks past the baseline and the captured body meets a jq
+# filter. Args: <step> <baseline> <jq filter>. Three is ack, started, and the
+# terminal. The mock captures a callback it refuses with 409 too, so the filter
+# says what the agent sent, and the counter, which moves only on acceptance,
+# says it landed.
+wait_for_terminal_callback() {
+    local step=$1 baseline=$2 filter=$3
+    local elapsed=0 body count
+    # A failed baseline read leaves it empty, and the counter check would then
+    # pass on any count, leaving only the body, which the mock captures even
+    # for a callback it refuses.
+    case "${baseline}" in
+        '' | *[!0-9]*) fail "[${step}] no execution_callback_count baseline (got '${baseline}')" ;;
+    esac
+    while :; do
+        body=$(curl -sf "http://localhost:18080/test/last-request/execution_callback" 2>/dev/null || true)
+        count=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+        if [ "${count:-0}" -ge $((baseline + 3)) ] \
+            && printf '%s' "${body}" | jq -e "${filter}" >/dev/null 2>&1; then
+            echo "  PASS: [${step}] the terminal callback holds ${filter}, after ${elapsed}s"
+            return 0
+        fi
+        if [ "${elapsed}" -ge 15 ]; then
+            fail "[${step}] the terminal callback did not reach ${filter} within 15s (execution_callback_count ${count:-0}, want >= $((baseline + 3)); body: ${body})"
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+}
+
+# read_run_ticks prints the size of the file e2e-run appends to. The redirect
+# sits inside the sh -c, so a missing file fails the read instead of reading as
+# 0.
+read_run_ticks() {
+    dc exec -T plexd /bin/busybox sh -c "/bin/busybox wc -c < ${RUN_TICKS}" 2>&1
+}
+
+# (1) Timeout: the sidecar declares 2s, far inside the dispatch deadline and
+# max_action_timeout, so the error names the hook's own limit. The script never
+# ends by itself and its child never stops, so the ticks stop only if the kill
+# reaches the whole group. The body is not live_hook_text, so it does not go
+# through install_live_hook.
+printf '%s\n' '#!/bin/sh' \
+    "( while :; do echo tick >> ${RUN_TICKS}; /bin/busybox sleep 1; done ) &" \
+    'wait' \
+    | dc exec -T plexd /bin/busybox sh -c \
+        "/bin/busybox cat > ${LIVE_HOOKS_DIR}/e2e-run && /bin/busybox chmod 0755 ${LIVE_HOOKS_DIR}/e2e-run" \
+    || fail "[hook timeout] could not write e2e-run into the container"
+install_live_sidecar e2e-run '{"timeout":"2s"}' \
+    || fail "[hook timeout] could not write e2e-run.json into the container"
+# The manifest is built from the executor's own hook list, so a manifest that
+# lists e2e-run means a dispatch finds it.
+wait_for_hook_entry "hook timeout" e2e-run '.timeout_seconds == 2'
+
+# The baseline goes ahead of the dispatch: the nudge can bring the ack in before
+# a later read.
+CB_BEFORE_RUN=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+configure_executions "exec-e2e-limit-001" \
+    "$(exec_entry "exec-e2e-limit-001" "e2e-run" "hook" "pending" "null")"
+wait_for_terminal_callback "hook timeout" "${CB_BEFORE_RUN}" \
+    '.status == "failed" and .error == "action timed out: hook timeout 2s"'
+
+# A child that outlived the kill appends at least twice in 3 seconds.
+TICKS_AT_KILL=$(read_run_ticks) \
+    || fail "[hook timeout] could not read ${RUN_TICKS} in the container: ${TICKS_AT_KILL}"
+sleep 3
+TICKS_LATER=$(read_run_ticks) \
+    || fail "[hook timeout] could not read ${RUN_TICKS} in the container: ${TICKS_LATER}"
+if [ "${TICKS_AT_KILL}" -gt 0 ] && [ "${TICKS_LATER}" = "${TICKS_AT_KILL}" ]; then
+    echo "  PASS: [hook timeout] ${RUN_TICKS} stayed at ${TICKS_AT_KILL} bytes for 3s after the terminal callback"
+else
+    fail "[hook timeout] ${RUN_TICKS} went from '${TICKS_AT_KILL}' to '${TICKS_LATER}' bytes in 3s, want one size above 0: a child of the hook outlived the kill"
+fi
+
+# (2) Sandbox: plexd refuses a level it does not implement before the hook
+# starts, so the ticks stay where the kill left them. The body before this has
+# no sandbox_level, so the wait cannot pass on it.
+install_live_sidecar e2e-run '{"sandbox":"container"}' \
+    || fail "[hook sandbox] could not rewrite e2e-run.json in the container"
+wait_for_hook_entry "hook sandbox" e2e-run '.sandbox_level == "container"'
+
+CB_BEFORE_RUN=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+configure_executions "exec-e2e-sandbox-001" \
+    "$(exec_entry "exec-e2e-sandbox-001" "e2e-run" "hook" "pending" "null")"
+wait_for_terminal_callback "hook sandbox" "${CB_BEFORE_RUN}" \
+    '.status == "failed" and (.error | contains("is not implemented"))'
+
+TICKS_AFTER_SANDBOX=$(read_run_ticks) \
+    || fail "[hook sandbox] could not read ${RUN_TICKS} in the container: ${TICKS_AFTER_SANDBOX}"
+if [ "${TICKS_AFTER_SANDBOX}" = "${TICKS_LATER}" ]; then
+    echo "  PASS: [hook sandbox] ${RUN_TICKS} stayed at ${TICKS_LATER} bytes, so the hook did not run"
+else
+    fail "[hook sandbox] ${RUN_TICKS} went from '${TICKS_LATER}' to '${TICKS_AFTER_SANDBOX}' bytes: the refused hook ran"
+fi
+
+# (3) Mode: the sidecar goes first, because plexd reads it before it checks the
+# hook file and its sandbox refusal would come first. A chmod leaves the digest
+# and the pin alone, so the hook stays listed and only the file check can refuse
+# it.
+dc exec -T plexd /bin/busybox rm "${LIVE_HOOKS_DIR}/e2e-run.json" \
+    || fail "[hook mode] could not remove e2e-run.json from the container"
+wait_for_hook_entry "hook mode" e2e-run 'keys == ["checksum", "name"]'
+dc exec -T plexd /bin/busybox chmod 0775 "${LIVE_HOOKS_DIR}/e2e-run" \
+    || fail "[hook mode] could not make e2e-run group-writable in the container"
+
+CB_BEFORE_RUN=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+configure_executions "exec-e2e-mode-001" \
+    "$(exec_entry "exec-e2e-mode-001" "e2e-run" "hook" "pending" "null")"
+wait_for_terminal_callback "hook mode" "${CB_BEFORE_RUN}" \
+    '.status == "failed" and (.error | contains("group- or other-writable"))'
+
+# (4) Cleanup: the executions block goes back to empty, and e2e-run and its
+# ticks leave the container, so the later phases find the fixture they expect.
+configure_executions "exec-e2e-hook-run-clear" '[]'
+dc exec -T plexd /bin/busybox rm "${LIVE_HOOKS_DIR}/e2e-run" "${RUN_TICKS}" \
+    || fail "[hook run cleanup] could not remove e2e-run and ${RUN_TICKS} from the container"
+wait_for_declared_hooks "hook run cleanup" "e2e-bigout"
 
 echo "=== Phase 10 PASSED: deeper body validation ==="
 
