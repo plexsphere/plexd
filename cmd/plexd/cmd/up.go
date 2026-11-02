@@ -1887,20 +1887,13 @@ func hookParametersError(params []api.ActionParam) error {
 }
 
 // hookTimeoutSeconds converts a sidecar's timeout to the contract's whole
-// seconds. The empty string means none declared and is checked first, because
-// time.ParseDuration refuses it. The range is checked ahead of the rounding,
+// seconds. The parser checks the range, and that comes ahead of the rounding,
 // which would overflow near the largest duration. Rounding goes up so that
 // "500ms" reports 1 and not 0, which reads as none declared.
 func hookTimeoutSeconds(timeout string) (int64, error) {
-	if timeout == "" {
-		return 0, nil
-	}
-	d, err := time.ParseDuration(timeout)
+	d, err := actions.ParseHookTimeout(timeout)
 	if err != nil {
 		return 0, err
-	}
-	if d < 0 || d > maxHookTimeout {
-		return 0, fmt.Errorf("timeout %s is outside the range 0 to %s", d, maxHookTimeout)
 	}
 	return int64((d + time.Second - 1) / time.Second), nil
 }
@@ -1959,8 +1952,6 @@ const (
 	maxHookSandboxChars = 64
 	// maxHookParameters caps the parameters of one hook.
 	maxHookParameters = 64
-	// maxHookTimeout is the contract's 86400 seconds as a duration.
-	maxHookTimeout = 24 * time.Hour
 )
 
 // maxPlexdHooks is the manifest's plexd_hooks ceiling. A manifest carrying more
