@@ -672,10 +672,11 @@ type alias for `[]AuditEntry`
 | `TimeoutSeconds` | `int64`         | `"timeout_seconds,omitempty"` | The timeout the sidecar declares, in whole seconds from 0 to 86400. 0 means none declared |
 | `SandboxLevel`   | `string`        | `"sandbox_level,omitempty"`   | The sandbox level the sidecar declares, at most 64 characters, free-form |
 
-The last four fields come from the hook's sidecar and describe the hook. They gate
-nothing and sit outside its digest, so a hook with no sidecar marshals to `name`
-and `checksum` alone. Characters are Unicode code points, and a NUL in any of these
-strings is refused.
+The last four fields come from the hook's sidecar and describe the hook.
+They gate nothing at the control plane and sit outside its digest, so a hook with
+no sidecar marshals to `name` and `checksum` alone. plexd applies the sidecar's
+`timeout` and `sandbox` when it runs the hook. Characters are Unicode code points,
+and a NUL in any of these strings is refused.
 
 **DiscoveredPlexdHook** — one `PlexdHook` resource as the manifest reports it
 (the contract's `PlexdHook` schema).

@@ -62,20 +62,24 @@ Control Plane
         ┌───────────────┐
         │  goroutine    │
         │  runAction    │
+        │  hook sidecar │
+        │  runBound     │
         └───┬───────┬───┘
             │       │
    builtin  │       │ hook
             ▼       ▼
-     ┌─────────┐ ┌─────────────────────────────┐
-     │runBuiltin│ │runHook                      │
-     │ call fn  │ │ 1. Path traversal check     │
-     └────┬────┘ │ 2. Discovery-snapshot lookup │
-          │      │ 3. File existence check      │
-          │      │ 4. Verify vs pinned digest   │
-          │      │ 5. exec.CommandContext        │
-          │      │ 6. Capture stdout/stderr      │
-          │      │ 7. Truncate to MaxOutputBytes │
-          │      └──────────┬──────────────────────┘
+     ┌──────────┐ ┌───────────────────────────────┐
+     │runBuiltin│ │runHook                        │
+     │ call fn  │ │ 1. Path traversal check       │
+     └────┬─────┘ │ 2. Discovery-snapshot lookup  │
+          │       │ 3. File checks: links, type,  │
+          │       │    owner, mode                │
+          │       │ 4. Verify vs pinned digest    │
+          │       │ 5. exec.CommandContext in its │
+          │       │    own process group          │
+          │       │ 6. Capture stdout/stderr      │
+          │       │ 7. Truncate to MaxOutputBytes │
+          │       └─────────┬─────────────────────┘
           │                 │
           └────────┬────────┘
                    │
@@ -95,7 +99,7 @@ Control Plane
 | `Enabled`          | `bool`          | `true`  | Whether action execution is active       |
 | `HooksDir`         | `string`        | `/etc/plexd/hooks` (Linux) | Directory containing hook scripts ([per platform](../core/configuration.md#platform-defaults)) |
 | `MaxConcurrent`    | `int`           | `5`     | Max simultaneous action executions       |
-| `MaxActionTimeout` | `time.Duration` | `10m`   | Max duration for a single action         |
+| `MaxActionTimeout` | `time.Duration` | `10m`   | Hard ceiling on a run's deadline, over the entry's `expires_at` and the hook's declared `timeout` ([Run Deadline](#run-deadline)) |
 | `MaxOutputBytes`   | `int64`         | `1 MiB` | Max output capture size per action       |
 
 ```go
@@ -265,22 +269,75 @@ When a callback is refused — a problem response whose `code` is `nsk_node_mism
 
 ### runAction (goroutine)
 
-1. Derive the run deadline as `min(time.Until(entry.ExpiresAt), Config.MaxActionTimeout)` — the entry carries an absolute deadline, not a relative timeout, so the run gets whatever is left of it, clamped to the configured maximum. A deadline that lapses mid-run reports `failed` with `error="action timed out"`. A deadline with **nothing left of it** — the claim handshake ahead of the run is synchronous, so a slow control plane can consume the whole remainder — reports `failed` with `error="execution deadline lapsed before the run started"` without running anything: an already-lapsed context would kill a hook at `Start` while a builtin that does not watch its context would run to completion and report `succeeded` past its own deadline
-2. Dispatch to `runBuiltin` or `runHook`
-3. Determine the terminal status via `terminalOutcome`: `succeeded` (exit 0), `failed` (non-zero exit, timeout, or run error), or `cancelled` (parent context cancelled)
-4. Build the terminal `ExecutionCallbackRequest` with `Status`, `ExitCode`, `Error`, and `Output` (base64 inline when ≤ 16 KiB, otherwise the declare → upload → object-key leg)
-5. Post the terminal callback via `ActionReporter.ExecutionCallback`, retrying a transient failure up to three times with exponential backoff (500 ms, 1 s) — the terminal callback is the only transition out of `started`, so giving up after one attempt would pin the invocation there forever. A coded refusal stops the retry immediately.
-6. Remove from active map
+1. Settle a lapsed deadline. The entry carries an absolute deadline, not a relative timeout, so the run gets whatever is left of it. A deadline with **nothing left of it** — the claim handshake ahead of the run is synchronous, so a slow control plane can consume the whole remainder — reports `failed` with `error="execution deadline lapsed before the run started"` without running anything: an already-lapsed context would kill a hook at `Start` while a builtin that does not watch its context would run to completion and report `succeeded` past its own deadline
+2. Load the hook's declaration: for an entry of type `hook`, `loadHookDeclaration` reads the sidecar from disk and returns its timeout or a refusal (see [Sidecar at Run Time](#sidecar-at-run-time)). A builtin reads no sidecar, even one beside a hook of its name
+3. Derive the run deadline with `runBound`: the smallest of what is left of `expires_at`, the hook's declared timeout, and `Config.MaxActionTimeout` (see [Run Deadline](#run-deadline))
+4. Dispatch: a refused declaration skips `runHook` and fails the run with exit code 1 and the refusal as its error. Otherwise the run goes to `runBuiltin` or `runHook`
+5. Determine the terminal status via `terminalOutcome`: `succeeded` (exit 0), `failed` (non-zero exit, timeout, refusal, or run error), or `cancelled` (parent context cancelled). A timeout's `error` names the limit that set the deadline, unless it was `expires_at`
+6. Log `hook refused` at warn for a refused run, and `run deadline capped by max_action_timeout` at warn when the ceiling set the deadline of a run that was not refused
+7. Build the terminal `ExecutionCallbackRequest` with `Status`, `ExitCode`, `Error`, and `Output` (base64 inline when ≤ 16 KiB, otherwise the declare → upload → object-key leg)
+8. Post the terminal callback via `ActionReporter.ExecutionCallback`, retrying a transient failure up to three times with exponential backoff (500 ms, 1 s) — the terminal callback is the only transition out of `started`, so giving up after one attempt would pin the invocation there forever. A coded refusal stops the retry immediately.
+9. Remove from active map
+
+#### Run Deadline
+
+`runBound(remaining, declared, ceiling time.Duration) (bound time.Duration, label string, capped bool)` returns the smallest of what is left of the entry's `expires_at`, the hook's declared `timeout`, and `Config.MaxActionTimeout`. A declared 0, which is also what a builtin passes, means none. The ceiling is hard: a declared `timeout` only shortens a run, so a hook that needs more than the default 10 minutes needs `max_action_timeout` raised on its node.
+
+A run that reaches its deadline reports `failed`, and its `error` names the limit that set the deadline:
+
+| Limit that set the deadline | Terminal `error` |
+|---|---|
+| The entry's `expires_at` | `action timed out` |
+| The hook's declared `timeout` | `action timed out: hook timeout <d>`, such as `action timed out: hook timeout 30s` |
+| `Config.MaxActionTimeout` | `action timed out: max_action_timeout <d>`, such as `action timed out: max_action_timeout 10m0s` |
+
+`<d>` is the limit in Go's duration format. A tie keeps the earlier limit in the table, so `expires_at` wins every tie and a declared `timeout` equal to the ceiling is labelled as the hook's.
+
+When the ceiling set the deadline, plexd logs `run deadline capped by max_action_timeout` at warn once the run is over, with `ceiling` and `requested`: what was left of `expires_at`, or the declared `timeout` when one is shorter. A refused run logs no such line, because it never started.
+
+The run deadline covers the integrity check too, so a declared `timeout` shorter than the hash and its violation report can turn an integrity failure into a timeout, while the hook does not run either way and the manifest's digest still shows the drift.
 
 ### runHook
 
 1. **Path traversal prevention**: reject names containing `/`, `\`, or `..`
 2. **Discovery-snapshot lookup**: find the hook in the discovered hooks snapshot. A hook absent from it fails the run — `Execute` already gated this, so it is the backstop for a snapshot that changed in between
-3. **File existence**: `os.Stat` the resolved path
-4. **Integrity verification**: call `HookVerifier.VerifyHook(ctx, nodeID, hookPath, pinnedChecksum)`, where `pinnedChecksum` is the digest this process recorded the **first** time it discovered the hook — **not** a wire field, and **not** the digest `HookWatcher` last recomputed (see [Hook Integrity Pinning](#hook-integrity-pinning))
-5. **Execute**: `exec.CommandContext` with `WaitDelay=500ms`
+3. **File checks**: `checkHookFile(e.cfg.HooksDir, entry.Action, e.hookOwnerUID)` refuses a hook that leaves the hooks directory, is not a regular file, is not owned by root, or is group- or other-writable (see [Hook File Checks](#hook-file-checks)). A missing file, a dangling link among them, fails with `hook not found: <name>`
+4. **Integrity verification**: call `HookVerifier.VerifyHook(ctx, nodeID, hookPath, pinnedChecksum)`, where `pinnedChecksum` is the digest this process recorded the **first** time it discovered the hook — **not** a wire field, and **not** the digest `HookWatcher` last recomputed (see [Hook Integrity Pinning](#hook-integrity-pinning)). A hook the file checks refused never gets here, so a wrong owner files no integrity violation
+5. **Execute**: `exec.CommandContext` with `WaitDelay=500ms`, in a process group of its own (see [Process Group](#process-group))
 6. **Environment**: minimal env (`PATH`, `HOME`, `PLEXD_NODE_ID`, `PLEXD_EXECUTION_ID`) plus `PLEXD_PARAM_*` vars
 7. **Output capture**: stdout and stderr each captured in a buffer truncated to `MaxOutputBytes`; the joined body is truncated back to `MaxOutputBytes` so a hook saturating both streams stays within the per-action cap
+
+#### Hook File Checks
+
+`checkHookFile(hooksDir, name string, ownerUID uint32) error` decides whether plexd trusts a file in the hooks directory. It runs on every dispatch, for the hook in `runHook` and for its sidecar, when one exists, in [`loadHookDeclaration`](#sidecar-at-run-time). The sidecar gets the same checks because it gates the run and sits outside the digest, so an account that could write it could lift a refusal. The checks run in this order:
+
+1. Resolve the hooks directory and the file with links followed, and require the file to stay inside the directory. The directory may itself be a link, and a link to another file in the directory or in a subdirectory of it passes
+2. Require a regular file
+3. Require owner uid 0
+4. Require no group or other write bit
+
+A file that does not exist returns an error matching `fs.ErrNotExist`, and the caller decides what that means: `runHook` fails with `hook not found: <name>`, and a missing sidecar declares nothing. Every other failure refuses the run:
+
+| Failure | Terminal `error` |
+|---|---|
+| The path leaves the directory | `hook refused: <name> resolves outside the hooks directory` |
+| Not a regular file | `hook refused: <name> is not a regular file` |
+| Wrong owner | `hook refused: <name> is owned by uid <uid>, not root` |
+| Group- or other-writable | `hook refused: <name> is group- or other-writable (mode <mode>)` |
+| The owner cannot be read | `hook refused: <name>: owner unavailable` |
+| Any other resolve or stat error, such as a link loop | `hook refused: <name>: <cause>` |
+
+`<name>` is the file checked, so a sidecar reads `deploy.json`. `<mode>` is the permission bits in four octal digits, such as `0775`.
+
+Owner means uid 0 exactly. There is no exception for the agent's own uid, so an agent that does not run as root, such as the published container image at uid 65534, runs root-owned hooks only. The checks read the disk on every dispatch, so `chown root` or `chmod go-w` takes effect on the next one, with no agent restart, and neither command moves the digest or the pin.
+
+Discovery does not apply these checks. A refused hook stays in the capability manifest and on the local API, and the dispatch's `error` says why it did not run.
+
+#### Process Group
+
+`runHook` starts the hook in a process group of its own, and the end of the run's context, at the run deadline or on `Shutdown`, sends `SIGKILL` to the whole group, so the script's children end with it. `WaitDelay` then bounds how long `Wait` holds the output pipes open, so a child that left the group with `setsid` and escaped the kill cannot hold the run open. A hook that exits by itself is unchanged, and a background child it leaves behind keeps running.
+
+A limit that lands after the script has exited, while a child still holds the output pipes, sends no group kill, because `exec.Cmd` has stopped watching the context by then.
 
 #### Hook Integrity Pinning
 
@@ -614,7 +671,7 @@ The watch is not restarted when it fails: `plexd up` logs `hook watcher stopped`
 |------|--------|
 | A file vanished since the last scan | It leaves the list |
 | A file fails to hash | It keeps its last digest and a warning is logged. One transient read error must not remove a hook from the executor and the capability manifest, because no later event would bring it back. A file the watcher did not list stays unlisted |
-| A file with an executable bit is not a regular file | It is skipped with the warning `actions: discovery: not a regular file`, because opening a FIFO to hash it would block the scan. A file with no executable bit is skipped silently, whatever it is. A symlink counts by its target: a link to a FIFO warns, and a link to an executable regular file stays a hook. A change to the target raises no file event, so it reaches the list through a reload or a restart, and until the restart the pin refuses a changed target at dispatch |
+| A file with an executable bit is not a regular file | It is skipped with the warning `actions: discovery: not a regular file`, because opening a FIFO to hash it would block the scan. A file with no executable bit is skipped silently, whatever it is. A symlink counts by its target: a link to a FIFO warns, and a link to an executable regular file stays a hook. A change to the target raises no file event, so it reaches the list through a reload or a restart, and until the restart the pin refuses a changed target at dispatch. A link that resolves outside the hooks directory stays listed, and a dispatch of it is [refused](#hook-file-checks) |
 | The directory does not exist | An empty list and a nil error |
 | The directory cannot be read | The error `actions: watcher: scan <dir>: <cause>`, the list left as it was, and no callback fired |
 
@@ -749,7 +806,7 @@ func DiscoverHooks(hooksDir string, logger *slog.Logger) ([]api.HookInfo, error)
 ```
 
 1. Returns empty slice (not nil) if `hooksDir` is empty or does not exist
-2. Skips directories, non-executable files, `.json` sidecar files, and anything that is not a regular file. A symlink to an executable regular file stays a hook, and the target's mode decides. The watch covers the directory and not a link's target, so a change to the target reaches the list only through a scan
+2. Skips directories, non-executable files, `.json` sidecar files, and anything that is not a regular file. A symlink to an executable regular file stays a hook, and the target's mode decides. The watch covers the directory and not a link's target, so a change to the target reaches the list only through a scan. A link that resolves outside the hooks directory stays a hook too, and a dispatch of it is [refused](#hook-file-checks)
 3. Computes SHA-256 via `integrity.HashFile` for each executable
 4. Parses optional `.json` sidecar for metadata (description, parameters, timeout, sandbox)
 5. Results sorted by name
@@ -786,15 +843,29 @@ The capability manifest carries what the sidecar declares, under these keys and 
 | `description` | `description` | string | At most 4096 characters |
 | `parameters` | `parameters` | array of `ActionParam` | At most 64. Each `name` is not blank after trimming and is unique within the hook, compared raw, so `"a"` and `" a"` are two parameters. `name`, `type`, `default`, and `description` are at most 4096 characters each. `required` has no limit |
 | `timeout` | `timeout_seconds` | `time.ParseDuration` string | 0 to 24 hours. The manifest carries whole seconds, rounded up, so `"1500ms"` reports 2 and `"500ms"` reports 1 rather than 0. `"0s"` or no key means none declared and leaves the manifest key off |
-| `sandbox` | `sandbox_level` | string | At most 64 characters, free-form |
+| `sandbox` | `sandbox_level` | string | At most 64 characters. The manifest takes any value, and a run refuses any but `none` and the empty string |
 
 Characters are Unicode code points, and a NUL in any of these strings breaks its limit.
 
-plexd reports `timeout` and `sandbox` as written and does not enforce them yet: a `timeout` above `max_action_timeout` reports as written, and a declared level changes nothing about how the hook runs.
+plexd reports `timeout` and `sandbox` as written and applies both when it runs the hook; see [Sidecar at Run Time](#sidecar-at-run-time). A `timeout` above `max_action_timeout` reports as written, and the run still ends at `max_action_timeout`.
 
-A field that breaks a limit is left off the manifest with the warning `hook metadata omitted from the capability manifest`, and the hook stays with its other fields, because one field past a limit would otherwise cost the whole manifest. One parameter that breaks a rule leaves off the whole `parameters` list, because a form with a required parameter missing misleads. An empty `parameters` list stays off the manifest.
+A field that breaks a limit is left off the manifest with the warning `hook metadata omitted from the capability manifest`, and the hook stays with its other fields, because one field past a limit would otherwise cost the whole manifest. A `timeout` or `sandbox` left off this way still refuses every dispatch of the hook, because the run reads the same value and cannot use it. One parameter that breaks a rule leaves off the whole `parameters` list, because a form with a required parameter missing misleads. An empty `parameters` list stays off the manifest.
 
-A missing sidecar logs nothing. A malformed one logs `sidecar parse failed` and an unreadable one logs `sidecar read failed`, and anything but a regular file counts as unreadable. A symlink counts as its target, so a dangling one reads as missing. In each case the hook stays listed with no metadata, and plexd keeps no earlier value of it.
+A missing sidecar logs nothing. A malformed one logs `sidecar parse failed` and an unreadable one logs `sidecar read failed`, and anything but a regular file counts as unreadable. A symlink counts as its target, so a dangling one reads as missing. In each case the hook stays listed with no metadata, and plexd keeps no earlier value of it. A dispatch tells them apart: a missing sidecar lets the hook run, and a malformed or unreadable one refuses the run.
+
+### Sidecar at Run Time
+
+A dispatch of a hook reads its sidecar from disk, not from the hook list, because the list cannot tell a missing sidecar from a malformed one, and only the missing one lets the hook run. `loadHookDeclaration(hooksDir, name string, ownerUID uint32) (hookDeclaration, error)` runs these steps in order, and the first that fails ends the run `failed` with exit code 1 before `runHook` starts:
+
+1. The hook name passes the path traversal check `runHook` applies, or the run fails with `invalid hook name: <name>`
+2. The sidecar passes the [file checks](#hook-file-checks) the hook gets. A sidecar that does not exist, a dangling link among them, declares nothing
+3. The sidecar is read and parsed as JSON. A failure refuses the run with `hook refused: sidecar <name>.json: <cause>`. A 0-byte file fails here with `unexpected end of JSON input`, and a literal `null` or `{}` declares nothing
+4. `sandbox` is empty or `none`. Any other value refuses the run with `hook refused: sandbox level "<value>" is not implemented; plexd runs hooks at level none only`; see [Sandbox Options](sandbox-options.md)
+5. `timeout` is empty or a duration from 0 to 24 hours, by the rule the manifest applies. Any other value refuses the run with `hook refused: sidecar <name>.json declares an unusable timeout "<value>": want a duration from 0 to 24h`. A timeout above 0 joins the [run deadline](#run-deadline)
+
+`<value>` is the sidecar's value cut to its first 64 characters and printed as a quoted Go string. A sidecar value has no length limit at this point, and the control plane answers `400` to an `error` over 4096 characters, which would strand the execution at `started`. The quoting also escapes a NUL, which a JSON string can carry.
+
+Every refusal walks the claim first, so the control plane sees `ack`, `started`, and `failed`, the sequence an integrity failure shows. The hook stays listed, and plexd logs `hook refused` at warn with the same error. A fixed sidecar takes effect on the next dispatch with no agent restart, because a sidecar sits outside the hook's digest and the run reads it each time.
 
 ## Parameter Passing
 
@@ -837,7 +908,7 @@ The terminal callback carries one of three statuses, chosen by `terminalOutcome`
 | Status      | Meaning                                                                                       |
 |-------------|-----------------------------------------------------------------------------------------------|
 | `succeeded` | Action completed with exit code 0                                                              |
-| `failed`    | Non-zero exit, a timeout (`error="action timed out"`), or a run error (message in `error`)     |
+| `failed`    | Non-zero exit, a timeout (`error="action timed out"`, or with the limit after a colon, as in `"action timed out: hook timeout 30s"`; see [Run Deadline](#run-deadline)), a refused hook (`error` starts with `hook refused: `), or a run error (message in `error`) |
 | `cancelled` | Parent context was cancelled (e.g., during shutdown)                                          |
 
 ## Rejection Reasons
@@ -1069,13 +1140,26 @@ exec.Shutdown(ctx)
 | Orphan report undelivered    | Retried on the next pull, at most 5 passes; then logged at error level and left to server-side expiry |
 | Hook file missing            | `ack` + `started`, then `failed` terminal with `error` carrying the run error (e.g. `hook not found: <name>`) |
 | Hook integrity failure       | `failed` terminal with the integrity error message |
-| Hook timeout                 | Process killed; `failed` terminal with `error=action timed out` (there is no `timeout` wire status — the server sets timeout itself) |
+| Hook sidecar unreadable or malformed | Refused: `failed` terminal with `error=hook refused: sidecar <name>.json: <cause>` |
+| Hook sidecar declares an unusable `timeout` | Refused: `failed` terminal with `error=hook refused: sidecar <name>.json declares an unusable timeout "<value>": want a duration from 0 to 24h` |
+| Hook sidecar declares a sandbox level other than `none` | Refused: `failed` terminal with `error=hook refused: sandbox level "<value>" is not implemented; plexd runs hooks at level none only` |
+| Hook or sidecar resolves outside the hooks directory | Refused: `failed` terminal with `error=hook refused: <name> resolves outside the hooks directory` |
+| Hook or sidecar is not a regular file | Refused: `failed` terminal with `error=hook refused: <name> is not a regular file` |
+| Hook or sidecar not owned by root | Refused: `failed` terminal with `error=hook refused: <name> is owned by uid <uid>, not root`; no integrity violation is filed |
+| Hook or sidecar group- or other-writable | Refused: `failed` terminal with `error=hook refused: <name> is group- or other-writable (mode <mode>)` |
+| Hook or sidecar owner cannot be read | Refused: `failed` terminal with `error=hook refused: <name>: owner unavailable` |
+| Hook or sidecar fails to resolve or stat, such as a link loop | Refused: `failed` terminal with `error=hook refused: <name>: <cause>` |
+| Hook reaches the entry's `expires_at` | Process group killed, unless the script had already exited (see [Process Group](#process-group)); `failed` terminal with `error=action timed out` (there is no `timeout` wire status — the server sets timeout itself) |
+| Hook reaches its declared `timeout` | Process group killed, unless the script had already exited (see [Process Group](#process-group)); `failed` terminal with `error=action timed out: hook timeout <d>` |
+| Run reaches `max_action_timeout` | For a hook, process group killed, unless the script had already exited (see [Process Group](#process-group)); `failed` terminal with `error=action timed out: max_action_timeout <d>`, and `run deadline capped by max_action_timeout` logged at warn |
 | Hook non-zero exit           | `failed` terminal with the actual `exit_code`   |
 | Terminal callback fails      | Retried up to 3 times with exponential backoff, then logged at warn level; agent continues |
 | Ack/started callback transport error | Logged at warn level; the dispatch is deferred — nothing runs and the next pull redelivers the entry |
 | Rejection-walk callback transport error | Logged at warn level; the walk stops and the entry stays unsettled for the next pull |
 | Callback refused (`nsk_node_mismatch`, `invalid_state_transition`, `execution_already_terminal`) | Execution aborted: no run, no terminal callback; a terminal refusal is not retried |
 | Panic in action              | Recovered; `failed` terminal with `error=panic: <value>` |
+
+A refused hook walks `ack` and `started` first, then the `failed` terminal carries exit code 1, plexd logs `hook refused` at warn, and the hook neither starts nor reaches the integrity check. See [Hook File Checks](#hook-file-checks) and [Sidecar at Run Time](#sidecar-at-run-time) for the placeholders.
 
 ## Logging
 
@@ -1093,6 +1177,8 @@ All log entries use `component=actions`.
 | `Warn`  | dispatch budget exhausted; the remaining entries wait for the next pull | `execution_id`, `budget` |
 | `Warn`  | claim callback failed; deferring the dispatch | `execution_id`, `status`, `error` |
 | `Warn`  | execution deadline lapsed before the run started | `execution_id`, `expires_at` |
+| `Warn`  | hook refused                  | `execution_id`, `hook`, `error`             |
+| `Warn`  | run deadline capped by max_action_timeout | `execution_id`, `action`, `ceiling`, `requested` |
 | `Warn`  | failed to send terminal callback | `execution_id`, `attempts`, `error`      |
 | `Warn`  | failed to send callback for rejected execution | `execution_id`, `status`, `error` |
 | `Warn`  | actions: watcher: a hook vanished while the watch was set up; retrying | `error` |
@@ -1336,8 +1422,10 @@ Hook metadata follows the same rule one field at a time: a sidecar field past it
 A manifest the control plane refuses anyway for its metadata goes out again in a
 short form; see [When Hook Metadata Is Refused](#when-hook-metadata-is-refused).
 
-The four metadata fields describe a hook. They gate nothing and sit outside its
-digest, so a sidecar edit changes the manifest and moves no digest and no pin. A
+The four metadata fields describe a hook. They gate nothing at the control plane
+and sit outside its digest, so a sidecar edit changes the manifest and moves no
+digest and no pin. plexd applies the sidecar's `timeout` and `sandbox` when it
+runs the hook; see [Sidecar at Run Time](#sidecar-at-run-time). A
 hook with no sidecar reports `name` and `checksum` alone. A sidecar's content
 reaches the control plane and everyone who holds `read` there, so it must hold no
 secret.
@@ -1586,7 +1674,7 @@ Stdout and stderr are captured from the pod logs via the Kubernetes API.
 - **Hook file permissions** -- plexd verifies that hook files are owned by root and not group- or other-writable before execution.
 - **Symlink protection** -- Hook paths are resolved and validated to prevent symlink escape outside the configured hooks directory.
 - **Checksum enforcement** -- Hook checksums are verified before every execution, against the digest plexd recorded when it discovered the hook (there is no checksum on the wire). Binary checksums are reported continuously. On Kubernetes, image digests serve as checksums -- hooks without pinned digest (`@sha256:...`) are rejected.
-- **Resource isolation** -- Hooks run with cgroup limits at minimum; higher sandbox levels add namespace or container isolation. On Kubernetes, hooks always run as separate Pods with native resource limits.
+- **Resource isolation** -- Script hooks run directly on the host as plexd's user, with no CPU or memory limit from plexd. plexd implements sandbox level `none` only and refuses a hook that declares any other (see [Sandbox Options](sandbox-options.md)), and it kills a hook's whole process group at the run deadline. On Kubernetes, hooks always run as separate Pods with native resource limits.
 - **CRD privilege control** -- Kubernetes hooks requiring host-level access (`hostPID`, `hostNetwork`, `privileged`) must declare `privileged: true` in the `PlexdHook` spec. The platform can enforce approval policies.
 - **Session token scoping** -- JWTs are bound to a specific node (`node_id` claim) and a specific set of actions (`actions` claim). Tokens cannot be used on other nodes or for unauthorized actions.
 - **Session revocation** -- A verified `session_revoked` SSE event closes the live session its payload names at once, reports the `terminated_by` the payload's `revoke_reason` maps to on that session's `session_ended` row (`operator_revoke` for an operator-driven reason, `ttl_expired` or `idle_timeout` for the control plane's sweeper), and then triggers a reconcile. When a session ends, the control plane also drops its entry from the `sessions` block of the state pull; the next reconcile observes the absence and tears down a session that is still open, so the drain stays the teardown for a revocation whose event never arrives.

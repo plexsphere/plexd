@@ -203,7 +203,7 @@ Remote action execution and hook management.
 | `enabled` | bool | `true` | Enable action execution. An omitted key leaves it `true`; an explicit `false` disables execution and survives defaulting. Without a config file it defaults to `false` — see [Running without a config file](#running-without-a-config-file). |
 | `hooks_dir` | string | `/etc/plexd/hooks` (Linux) | Directory containing hook scripts. Per platform; see [Platform defaults](#platform-defaults). |
 | `max_concurrent` | int | `5` | Maximum number of concurrent actions. Minimum: `1`. |
-| `max_action_timeout` | duration | `10m` | Maximum duration for a single action. Minimum: `10s`. |
+| `max_action_timeout` | duration | `10m` | Hard ceiling on a single run. A run ends at the smallest of what is left of the dispatch's `expires_at`, the hook's declared `timeout`, and this value, so neither can lift it, and a run it cuts short fails with `action timed out: max_action_timeout <d>`. Minimum: `10s`. |
 | `max_output_bytes` | int64 | `1048576` (1 MiB) | Maximum output size per action in bytes. Minimum: `1024`. |
 
 ::: warning Upgrading from a release that used the zero-value heuristic

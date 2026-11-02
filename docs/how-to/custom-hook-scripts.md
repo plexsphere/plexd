@@ -71,10 +71,11 @@ underscore) are replaced with underscores. For example, a parameter named
 
 - Must have a shebang line (`#!/bin/sh`, `#!/bin/bash`, `#!/usr/bin/env python3`, etc.)
 - Must be executable (`chmod +x`)
+- Must be owned by root and not group- or other-writable, and so must its sidecar; see [Step 3](#step-3-deploy-to-the-hooks-directory)
 - Exit code 0 indicates success; non-zero indicates failure
 - Stdout and stderr are captured and sent to the control plane
 - Output is truncated at `MaxOutputBytes` (default 1 MiB)
-- The script is killed if it exceeds the action timeout
+- The script and every process in its process group are killed when the run reaches its deadline: the smallest of what is left of the entry's `expires_at`, the sidecar's `timeout`, and `max_action_timeout` (10 minutes by default). A deadline that lands after the script has exited kills nothing, so a background child it left behind keeps running
 
 ## Step 2: Create an Optional Metadata Sidecar
 
@@ -111,8 +112,8 @@ EOF
 |---------------|-------------------|-----------------|-----------------|------------------------------------------------|
 | `description` | `description`     | `string`        | 4096 characters | Human-readable description of the hook         |
 | `parameters`  | `parameters`      | `[]ActionParam` | 64 parameters   | List of expected parameters with types         |
-| `timeout`     | `timeout_seconds` | `string`        | 24 hours        | Suggested default timeout in [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration) format (e.g. `"30s"`), reported in whole seconds, rounded up |
-| `sandbox`     | `sandbox_level`   | `string`        | 64 characters   | Sandbox mode hint, free-form                   |
+| `timeout`     | `timeout_seconds` | `string`        | 24 hours        | How long a run may take, in [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration) format (e.g. `"30s"`), reported in whole seconds, rounded up. plexd stops the script at it |
+| `sandbox`     | `sandbox_level`   | `string`        | 64 characters   | Sandbox level: `none`, or leave the key out. plexd refuses to run a hook that declares any other level |
 
 Characters are Unicode code points, and a NUL in any string breaks its limit. The
 manifest as a whole has a 1 MiB budget, so sidecars inside every limit can still
@@ -123,9 +124,13 @@ be refused together; see
 `"1500ms"` reports 2 and `"500ms"` reports 1. `"0s"` declares no timeout, and the
 key stays off the manifest.
 
-plexd reports `timeout` and `sandbox` as written and does not enforce them yet. A
-script still runs until the action timeout, and a sandbox level changes nothing
-about how it runs.
+plexd reports `timeout` and `sandbox` as written and applies both when it runs the
+hook. A run ends at the smallest of what is left of the entry's `expires_at`, the
+`timeout`, and `max_action_timeout`, so a `timeout` above `max_action_timeout`
+does not lift the ceiling: a longer hook needs `max_action_timeout` raised on its
+node. plexd runs a hook directly on the host as plexd's own user, at sandbox level
+`none` only, and refuses a hook that declares another level; see
+[Sandbox Options](../reference/actions/sandbox-options.md).
 
 Each parameter entry:
 
@@ -146,6 +151,11 @@ is still discovered but reported without metadata. A field that breaks a limit i
 left off the manifest with a warning, and the hook stays with its other fields,
 because the control plane refuses a manifest whole and one bad field would
 otherwise cost every hook on the node.
+
+A dispatch reads the sidecar again and is stricter. A missing sidecar lets the hook
+run. A malformed or unreadable one, a `timeout` that breaks the rule above, or a
+`sandbox` other than `none` refuses every run of the hook, which stays listed. A
+fixed sidecar takes effect on the next dispatch, with no agent restart.
 
 ## Step 3: Deploy to the Hooks Directory
 
@@ -177,6 +187,13 @@ ls -la /etc/plexd/hooks/
 
 > **Note**: The hook name used in action requests is the filename (without
 > extension). In this example, the action name is `restart-service`.
+
+> **Note**: The script and its sidecar must be owned by root and not group- or
+> other-writable, as `sudo` and the modes 755 and 644 above make them. plexd checks
+> both on every dispatch and refuses the run otherwise, even for an agent that does
+> not run as root. A link must resolve to a file inside the hooks directory.
+> `chown root` or `chmod go-w` on a refused file takes effect on the next dispatch,
+> with no agent restart.
 
 ## Step 4: Hook Discovery
 
@@ -301,9 +318,10 @@ reconciliation pull:
 The node will:
 
 1. **Claim**: post an execution callback with `status=ack`, then one with `status=started` — both before anything runs, so an execution the control plane still holds at `ack` is known not to have executed
-2. **Verify**: compare the hook's SHA-256 against the digest pinned at first discovery
-3. **Run**: execute the script with `PLEXD_PARAM_SERVICE=nginx`
-4. **Report**: post a terminal callback (`succeeded`, `failed`, or `cancelled`) with the exit code and captured output
+2. **Check**: read the sidecar and check the script and the sidecar on disk. A sidecar plexd cannot use, a sandbox level other than `none`, or a file that is not root-owned, is group- or other-writable, is not a regular file, or resolves outside the hooks directory refuses the run, which then reports `failed` without starting the script
+3. **Verify**: compare the hook's SHA-256 against the digest pinned at first discovery
+4. **Run**: execute the script with `PLEXD_PARAM_SERVICE=nginx`, in a process group of its own, until the run deadline
+5. **Report**: post a terminal callback (`succeeded`, `failed`, or `cancelled`) with the exit code and captured output
 
 Each step is one `POST /v1/nodes/{node_id}/executions/{execution_id}` callback.
 The entry keeps reappearing on every pull until the terminal callback settles it.
@@ -324,8 +342,11 @@ Control Plane                          Node (plexd)
      │                                      │
      │◀── GET /v1/nodes/{id}/state ─────────│── reconciliation pull
      │─── executions: [ entry ] ───────────▶│── dispatch stage
-     │◀── callback: ack ────────────────────│── verify vs discovery digest
-     │◀── callback: started ────────────────│── execute script
+     │◀── callback: ack ────────────────────│── claim
+     │◀── callback: started ────────────────│── check sidecar and files
+     │                                      │   (a refusal reports failed)
+     │                                      │── verify vs discovery digest
+     │                                      │── execute script
      │                                      │── capture stdout/stderr
      │◀── callback: succeeded ──────────────│── report terminal status + output
      │                                      │  (entry drains from the block)
@@ -341,7 +362,7 @@ Control Plane                          Node (plexd)
 | Hook missing from capabilities | `hooks_dir` not configured       | Set `hooks_dir` in actions config                   |
 | Hook missing from capabilities | File has `.json` extension       | Remove `.json` extension from the script filename  |
 | Hook missing from capabilities | File is in a subdirectory        | Move to the hooks directory root (subdirs skipped) |
-| Hook missing from capabilities | Not a regular file, such as a FIFO | Install a regular file; a symlink to an executable one is fine, but plexd watches the link and not its target, so run `plexd hooks reload` after changing the target |
+| Hook missing from capabilities | Not a regular file, such as a FIFO | Install a regular file; a symlink to an executable one is fine, but plexd watches the link and not its target, so run `plexd hooks reload` after changing the target, and a dispatch refuses a link that resolves outside the hooks directory |
 | Hook missing from capabilities | `agent: capability report: send failed` in the log | plexd retries on its own; the `error` attribute names what to fix |
 | Hook missing from capabilities | `hook watcher stopped` in the log | Fix the cause, then run `plexd hooks reload` or restart the agent |
 | Hook reported without metadata | A field breaks a limit: `hook metadata omitted from the capability manifest` in the log | The `field` and `error` attributes name what to fix in the sidecar; the hook's other fields are still reported |
@@ -355,9 +376,23 @@ Control Plane                          Node (plexd)
 |--------------------------------|-----------------------------------|----------------------------------------------------|
 | Status `error`, integrity fail | The file changed after the agent pinned its digest | Restart the agent so it re-discovers and re-attests the hook; a reload does not clear this |
 | Status `error`, file not found | Hook in capabilities but missing  | Verify file exists at `hooks_dir/<action-name>`     |
-| Status `failed`, `error="action timed out"` | Script outran the run deadline, which is whatever is left of the entry's `expires_at`, capped by `max_action_timeout` | Optimize the script, or raise `max_action_timeout` and have the control plane dispatch a later `expires_at` |
+| Status `failed`, `error="action timed out"` | Script outran the entry's `expires_at` | Optimize the script, or have the control plane dispatch a later `expires_at` |
+| Status `failed`, `error="action timed out: hook timeout <d>"` | Script outran the `timeout` its sidecar declares | Optimize the script, or raise `timeout` in the sidecar |
+| Status `failed`, `error="action timed out: max_action_timeout <d>"` | Script outran `max_action_timeout`, which caps the entry's `expires_at` and the sidecar's `timeout`; the agent logs `run deadline capped by max_action_timeout` | Optimize the script, or raise `max_action_timeout` in the node's actions configuration |
+| Status `failed`, `error` starts with `hook refused: sidecar <name>.json: ` | plexd cannot read or parse the sidecar | Fix the JSON, or make the sidecar a regular file plexd can read. Remove it if the hook needs no metadata |
+| Status `failed`, `error=hook refused: sidecar <name>.json declares an unusable timeout "<value>": want a duration from 0 to 24h` | The sidecar's `timeout` has no unit, is negative, or is over 24 hours | Write a duration such as `"30s"`, or remove the key |
+| Status `failed`, `error=hook refused: sandbox level "<value>" is not implemented; plexd runs hooks at level none only` | The sidecar declares a sandbox level plexd does not implement | Set `"sandbox": "none"` or remove the key; see [Sandbox Options](../reference/actions/sandbox-options.md) |
+| Status `failed`, `error=hook refused: <name> is owned by uid <uid>, not root` | The script or its sidecar is not owned by root | `chown root` the file the `error` names |
+| Status `failed`, `error=hook refused: <name> is group- or other-writable (mode <mode>)` | The script or its sidecar is writable by its group or by others | `chmod go-w` the file the `error` names |
+| Status `failed`, `error=hook refused: <name> resolves outside the hooks directory` | The script or its sidecar is a link to a file outside `hooks_dir` | Install the file itself, or link to a file inside `hooks_dir` |
+| Status `failed`, `error=hook refused: <name> is not a regular file` | The script or its sidecar, or its link target, is a FIFO, a directory, or another non-regular file | Install a regular file |
+| Status `failed`, `error` starts with `hook refused: <name>: ` | plexd cannot resolve or stat the file, such as a link loop, or cannot read its owner | The rest of `error` names the cause |
 | Status `failed`, exit code > 0 | Script returned non-zero exit     | Check stderr in result for error details           |
 | Empty stdout                   | Script writes to file, not stdout | Write output to stdout (`echo`) for capture        |
+
+In a refusal that comes from a file check, `<name>` is the file checked, so a
+sidecar reads `restart-service.json`. A refused run does not start the script, and
+the agent logs `hook refused` with the same `error`.
 
 ### Parameter Issues
 

@@ -291,8 +291,10 @@ non-empty after trimming and unique within the hook, and `name`, `type`, `defaul
 and `description` at most 4096 characters each), `timeout_seconds` (0 to 86400;
 0 or absent means none declared) and `sandbox_level` (at most 64 characters,
 free-form). Characters are Unicode code points, and a NUL in any of these strings
-is refused. These fields describe the hook: they gate nothing and sit outside its
-digest. A sidecar's content is readable by everyone who holds `read` at the
+is refused. These fields describe the hook: they gate nothing at the control plane
+and sit outside its digest. plexd applies the sidecar's `timeout` and `sandbox`,
+which they report as `timeout_seconds` and `sandbox_level`, when it runs the hook.
+A sidecar's content is readable by everyone who holds `read` at the
 control plane, so it must hold no secret.
 
 A `plexd_hooks` entry carries `name`, `image_digest` in canonical
