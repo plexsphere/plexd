@@ -324,6 +324,74 @@ func (c *ControlPlane) FetchSecret(ctx context.Context, nodeID, name string, ver
 	}, nil
 }
 
+// hookNamePattern is the control plane's published-hook name grammar and the
+// single source of truth for it: hookNameRe compiles it and ErrHookNameInvalid
+// quotes it. It differs from secretNamePattern in its first character, which
+// may be a digit, and like it forbids a dot, so a published hook never shares a
+// name with a plexd built-in action.
+const hookNamePattern = `^[a-z0-9][a-z0-9_-]{0,62}$`
+
+var hookNameRe = regexp.MustCompile(hookNamePattern)
+
+// ValidHookName reports whether name is inside the control plane's
+// published-hook name grammar, so it names a hook FetchHookVersion can ask
+// for.
+func ValidHookName(name string) bool {
+	return hookNameRe.MatchString(name)
+}
+
+// maxHookVersionBody caps a hook version response. The control plane caps the
+// publish request at 2 MiB, so 4 MiB covers the same content plus the envelope
+// around it.
+const maxHookVersionBody = 4 << 20
+
+// FetchHookVersion retrieves one published hook version as the control plane
+// serves it: the signed hook_version envelope and the script in standard
+// base64. It refuses a name outside the grammar and a version below 1 before
+// any request, and a non-2xx answer returns the *APIError the problem body
+// describes, such as 404 hook_not_assigned or 503 signing_unavailable.
+//
+// It verifies nothing. The envelope names a key the caller has to hold, and the
+// script has to match the checksum of the pull entry that listed the version,
+// both of which only the caller knows, so verification is the installer's job.
+// GET /v1/nodes/{node_id}/hooks/{name}/versions/{version}
+func (c *ControlPlane) FetchHookVersion(ctx context.Context, nodeID, name string, version int) (*NodeHookVersion, error) {
+	if !hookNameRe.MatchString(name) {
+		return nil, fmt.Errorf("api: fetch hook version %q: %w", name, ErrHookNameInvalid)
+	}
+	if version < 1 {
+		return nil, fmt.Errorf("api: fetch hook version %q: version must be >= 1, got %d", name, version)
+	}
+
+	// The name is deliberately not escaped: the grammar forbids every character
+	// url.PathEscape would touch.
+	path := fmt.Sprintf("/v1/nodes/%s/hooks/%s/versions/%d", url.PathEscape(nodeID), name, version)
+
+	resp, err := c.doRequestRaw(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	reader, err := decodedBody(resp, maxHookVersionBody+1)
+	if err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, maxHookVersionBody+1))
+	if err != nil {
+		return nil, fmt.Errorf("api: read hook version: %w", err)
+	}
+	if len(data) > maxHookVersionBody {
+		return nil, errors.New("api: hook version response exceeds the 4 MiB cap")
+	}
+
+	var hv NodeHookVersion
+	if err := json.Unmarshal(data, &hv); err != nil {
+		return nil, fmt.Errorf("api: decode hook version: %w", err)
+	}
+	return &hv, nil
+}
+
 // FetchEdgePSK retrieves the pairwise WireGuard PSK for the edge between the
 // node and peerNodeID as the raw envelope the control plane seals under the
 // node's NSK. The body must be exactly EdgePSKEnvelopeSize bytes, and both the

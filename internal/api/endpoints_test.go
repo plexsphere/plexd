@@ -1647,6 +1647,237 @@ func TestFetchSecret_TransportError(t *testing.T) {
 	}
 }
 
+// testHookVersionBody is a hook version response in the shape the agent
+// contract prints. Its signature is not a real one: FetchHookVersion verifies
+// nothing, so the client tests only need the members to arrive intact.
+const testHookVersionBody = `{"envelope":{"id":"0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1","type":"hook_version",` +
+	`"scope":"domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1","key_id":"kid-1","issued_at":"2026-05-02T10:00:00Z",` +
+	`"payload":{"project_id":"p1","name":"backup-db","version":2,"checksum":"REA9yHQRkMbFu76wJTDLSMvpMnUd9WeDatQzSknU1Qg=","sandbox_level":"none"},` +
+	`"signature":"c2ln"},"script_base64":"IyEvYmluL3NoCmVjaG8gYmFja3VwCg=="}`
+
+func TestFetchHookVersion_Success(t *testing.T) {
+	var hits atomic.Int32
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/v1/nodes/n1/hooks/backup-db/versions/2" {
+			t.Errorf("path = %s, want /v1/nodes/n1/hooks/backup-db/versions/2", r.URL.Path)
+		}
+		if r.URL.RawQuery != "" {
+			t.Errorf("RawQuery = %q, want empty", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(testHookVersionBody))
+	})
+
+	hv, err := client.FetchHookVersion(context.Background(), "n1", "backup-db", 2)
+	if err != nil {
+		t.Fatalf("FetchHookVersion: %v", err)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("HTTP handler hit %d times, want 1", hits.Load())
+	}
+	env := hv.Envelope
+	if env.ID != "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1" || env.Type != HookVersionEnvelopeType || env.KeyID != "kid-1" ||
+		env.Scope != "domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1" || env.Signature != "c2ln" ||
+		!env.IssuedAt.Equal(time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)) {
+		t.Errorf("envelope = %+v, want the served members", env)
+	}
+	var payload HookVersionPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	if payload.Name != "backup-db" || payload.Version != 2 || payload.SandboxLevel != "none" {
+		t.Errorf("payload = %+v, want backup-db version 2", payload)
+	}
+	if hv.ScriptBase64 != "IyEvYmluL3NoCmVjaG8gYmFja3VwCg==" {
+		t.Errorf("ScriptBase64 = %q, want the served script", hv.ScriptBase64)
+	}
+}
+
+// A request FetchHookVersion refuses never reaches the control plane: an
+// off-grammar name, which would otherwise name a path the control plane
+// answers 404 for, and a version below 1, which no rollout lists.
+func TestFetchHookVersion_RefusedBeforeRequest(t *testing.T) {
+	var hits atomic.Int32
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	for _, name := range []string{"Backup", "backup.db", "../x", "", strings.Repeat("a", 64)} {
+		t.Run("name "+name, func(t *testing.T) {
+			_, err := client.FetchHookVersion(context.Background(), "n1", name, 1)
+			if !errors.Is(err, ErrHookNameInvalid) {
+				t.Errorf("err = %v, want ErrHookNameInvalid", err)
+			}
+		})
+	}
+	for _, version := range []int{0, -1} {
+		t.Run(fmt.Sprintf("version %d", version), func(t *testing.T) {
+			_, err := client.FetchHookVersion(context.Background(), "n1", "backup-db", version)
+			want := fmt.Sprintf(`api: fetch hook version "backup-db": version must be >= 1, got %d`, version)
+			if err == nil || err.Error() != want {
+				t.Errorf("err = %v, want %q", err, want)
+			}
+		})
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("HTTP handler hit %d times, want 0", n)
+	}
+}
+
+// TestValidHookName pins ValidHookName to the grammar FetchHookVersion
+// enforces: a lowercase letter or digit first, then at most 62 of [a-z0-9_-].
+func TestValidHookName(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"a", true},
+		{"0", true},
+		{"backup-db", true},
+		{"rotate_logs2", true},
+		{"9lives", true},
+		{"a" + strings.Repeat("b", 62), true},
+		{"", false},
+		{"Backup", false},
+		{"backup.db", false},
+		{"../x", false},
+		{"-leading", false},
+		{"_leading", false},
+		{"a" + strings.Repeat("b", 63), false},
+	}
+	for _, tt := range tests {
+		if got := ValidHookName(tt.name); got != tt.want {
+			t.Errorf("ValidHookName(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+// The contract's refusals arrive as *APIError with their problem code, which
+// the installer reports as fetch_failed with the error text.
+func TestFetchHookVersion_ProblemResponses(t *testing.T) {
+	tests := []struct {
+		status int
+		code   string
+	}{
+		{http.StatusNotFound, "hook_not_assigned"},
+		{http.StatusServiceUnavailable, "signing_unavailable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.code, func(t *testing.T) {
+			client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.WriteHeader(tt.status)
+				_, _ = fmt.Fprintf(w, `{"status":%d,"detail":"refused","code":%q}`, tt.status, tt.code)
+			})
+			hv, err := client.FetchHookVersion(context.Background(), "n1", "backup-db", 2)
+			if hv != nil {
+				t.Errorf("version = %+v, want nil", hv)
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("err = %v, want *APIError", err)
+			}
+			if apiErr.StatusCode != tt.status || apiErr.Code != tt.code {
+				t.Errorf("APIError = %d %q, want %d %q", apiErr.StatusCode, apiErr.Code, tt.status, tt.code)
+			}
+		})
+	}
+}
+
+// The body is capped at 4 MiB after decompression, so neither a large body nor
+// a small gzip body that inflates past the cap is read whole.
+func TestFetchHookVersion_BodyCap(t *testing.T) {
+	serve := func(t *testing.T, body []byte, gzipped bool) (*NodeHookVersion, error) {
+		t.Helper()
+		client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if gzipped {
+				w.Header().Set("Content-Encoding", "gzip")
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+		})
+		return client.FetchHookVersion(context.Background(), "n1", "backup-db", 2)
+	}
+	const capErr = "api: hook version response exceeds the 4 MiB cap"
+
+	t.Run("plain body over the cap", func(t *testing.T) {
+		_, err := serve(t, bytes.Repeat([]byte(" "), maxHookVersionBody+1), false)
+		if err == nil || err.Error() != capErr {
+			t.Errorf("err = %v, want %q", err, capErr)
+		}
+	})
+	t.Run("gzip body inflating past the cap", func(t *testing.T) {
+		var buf bytes.Buffer
+		gw := gzip.NewWriter(&buf)
+		if _, err := gw.Write(bytes.Repeat([]byte(" "), 2*maxHookVersionBody)); err != nil {
+			t.Fatalf("gzip write: %v", err)
+		}
+		if err := gw.Close(); err != nil {
+			t.Fatalf("gzip close: %v", err)
+		}
+		if buf.Len() >= maxHookVersionBody {
+			t.Fatalf("compressed body is %d bytes, want it under the cap", buf.Len())
+		}
+		_, err := serve(t, buf.Bytes(), true)
+		if err == nil || err.Error() != capErr {
+			t.Errorf("err = %v, want %q", err, capErr)
+		}
+	})
+	t.Run("body at the cap", func(t *testing.T) {
+		// Leading whitespace pads the valid body to exactly the cap.
+		body := append(bytes.Repeat([]byte(" "), maxHookVersionBody-len(testHookVersionBody)), testHookVersionBody...)
+		hv, err := serve(t, body, false)
+		if err != nil {
+			t.Fatalf("FetchHookVersion at the cap: %v", err)
+		}
+		if hv.Envelope.Type != HookVersionEnvelopeType {
+			t.Errorf("envelope type = %q, want %q", hv.Envelope.Type, HookVersionEnvelopeType)
+		}
+	})
+}
+
+// A body that is not JSON, such as a proxy's HTML page answered with 200, is
+// a decode error that keeps the *json.SyntaxError for the caller.
+func TestFetchHookVersion_NotJSON(t *testing.T) {
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html>gateway</html>"))
+	})
+	_, err := client.FetchHookVersion(context.Background(), "n1", "backup-db", 2)
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) {
+		t.Fatalf("err = %v, want a *json.SyntaxError", err)
+	}
+	if !strings.HasPrefix(err.Error(), "api: decode hook version: ") {
+		t.Errorf("err = %q, want the decode prefix", err.Error())
+	}
+}
+
+// The node ID is escaped into the path; the in-grammar name needs no escaping.
+func TestFetchHookVersion_NodeIDEscaped(t *testing.T) {
+	var gotPath string
+	client, _ := newEndpointTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(testHookVersionBody))
+	})
+	if _, err := client.FetchHookVersion(context.Background(), "node/id", "backup-db", 2); err != nil {
+		t.Fatalf("FetchHookVersion: %v", err)
+	}
+	if want := "/v1/nodes/node%2Fid/hooks/backup-db/versions/2"; gotPath != want {
+		t.Errorf("path = %s, want %s", gotPath, want)
+	}
+}
+
 // gunzip decompresses gzip-encoded bytes, failing the test on error.
 func gunzip(t *testing.T, data []byte) []byte {
 	t.Helper()

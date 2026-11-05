@@ -89,6 +89,11 @@ var ErrCredentialRefused = errors.New("api: node credential refused by the contr
 // when the requested secret name is outside the contract's name grammar.
 var ErrSecretNameInvalid = fmt.Errorf("secret name is outside the grammar %s", secretNamePattern)
 
+// ErrHookNameInvalid is returned by FetchHookVersion before any HTTP request
+// when the requested hook name is outside the contract's published-hook name
+// grammar.
+var ErrHookNameInvalid = fmt.Errorf("hook name is outside the grammar %s", hookNamePattern)
+
 // ErrIntegrityViolationsEmpty and ErrIntegrityViolationsTooMany are returned by
 // ReportIntegrityViolations before any HTTP request when the batch is outside
 // the contract's 1..MaxIntegrityViolationsPerBatch bounds.
@@ -311,18 +316,22 @@ func IsSecretAccessRevoked(err error) bool {
 }
 
 // IsHookMetadataRefused reports whether err is a refusal of a capability
-// manifest that the short declared-hook entry can answer: a 413 with any code
-// or none, or a 400 carrying the malformed_capabilities_request,
-// declared_hook_invalid or declared_hooks_too_many problem code.
+// manifest that the short form can answer: a 413 with any code or none, or a
+// 400 carrying the malformed_capabilities_request, declared_hook_invalid,
+// declared_hooks_too_many, hook_rollout_errors_too_many or
+// hook_rollout_error_invalid problem code.
 //
 // A control plane refuses a manifest whole, so the reporter answers each of
 // these by dropping the hook metadata, which keeps a failure of the metadata
-// from costing the manifest. A 400 malformed_capabilities_request comes from a
-// control plane that predates the fields and refuses them as unknown keys. A
-// 400 declared_hook_invalid or declared_hooks_too_many means plexd's copy of
-// the limits has drifted from the control plane's. A 413 means the manifest is
-// over budget. It ignores the code because any layer on the path can say so,
-// and a proxy's own 413 carries no problem code.
+// from costing the manifest. The metadata is every declared-hook field past
+// name and checksum, a rolled-out hook's source and version among them, and
+// the hook_rollout_errors list. A 400 malformed_capabilities_request comes
+// from a control plane that predates the fields and refuses them as unknown
+// keys. A 400 declared_hook_invalid, declared_hooks_too_many,
+// hook_rollout_errors_too_many or hook_rollout_error_invalid means plexd's
+// copy of the limits has drifted from the control plane's. A 413 means the
+// manifest is over budget. It ignores the code because any layer on the path
+// can say so, and a proxy's own 413 carries no problem code.
 //
 // Every other failure says nothing about the metadata and is not classified
 // here. That includes a 400 with another code or none, such as
@@ -338,7 +347,9 @@ func IsHookMetadataRefused(err error) bool {
 	case http.StatusBadRequest:
 		return apiErr.Code == "malformed_capabilities_request" ||
 			apiErr.Code == "declared_hook_invalid" ||
-			apiErr.Code == "declared_hooks_too_many"
+			apiErr.Code == "declared_hooks_too_many" ||
+			apiErr.Code == "hook_rollout_errors_too_many" ||
+			apiErr.Code == "hook_rollout_error_invalid"
 	default:
 		return false
 	}
