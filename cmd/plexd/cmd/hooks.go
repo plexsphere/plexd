@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -72,14 +73,20 @@ func runHooksList(cmd *cobra.Command, _ []string) error {
 		return nil
 	}
 
+	// VERSION is the published version a rolled-out hook was installed from. A
+	// hand-placed hook has none, so its cell stays empty rather than reading 0.
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-	fmt.Fprintf(w, "NAME\tSOURCE\tCHECKSUM\tDESCRIPTION\n")
+	fmt.Fprintf(w, "NAME\tSOURCE\tVERSION\tCHECKSUM\tDESCRIPTION\n")
 	for _, h := range hooks {
 		checksum := h.Checksum
 		if len(checksum) > 12 {
 			checksum = checksum[:12] + "..."
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", h.Name, h.Source, checksum, h.Description)
+		version := ""
+		if h.Version > 0 {
+			version = strconv.Itoa(h.Version)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", h.Name, h.Source, version, checksum, h.Description)
 	}
 	w.Flush()
 

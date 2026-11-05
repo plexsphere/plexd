@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -719,10 +720,24 @@ func runAgent(ctx context.Context) error {
 			{Name: "since", Type: "string", Required: false, Description: "Duration filter (e.g. 5m, 1h)"},
 		}, actions.LogsSnapshot(&agentLogProvider{ringBuffer: logRingBuffer}))
 
+	// 10a. Build the installer of the hooks the control plane rolls out. It
+	// fetches each version the pull's hooks block lists with the NSK, verifies
+	// it under the Domain signing key the verifier holds, installs it into
+	// <data_dir>/hooks, and pins it in the executor. A constructor error costs
+	// the rolled-out hooks, not the agent: builtins and hand-placed hooks run as
+	// they did before rollouts existed.
+	var rolloutInstaller *actions.RolloutInstaller
+	if installer, err := actions.NewRolloutInstaller(cfg.Actions, cfg.DataDir, identity.NodeID, client, verifier, executor, logger); err != nil {
+		logger.Error("rolled-out hooks disabled", "error", err)
+	} else {
+		rolloutInstaller = installer
+	}
+
 	// Build what reports the capability manifest to the control plane. The
 	// manifest carries the binary version and digest, the SSH host-key
 	// fingerprint the integrity correlator watches for rotation, the declared
-	// hooks, and two inventories. builtin_actions is the executor's name-sorted
+	// hooks, the published hook versions the installer could not install, and
+	// two inventories. builtin_actions is the executor's name-sorted
 	// action list, sent whole: the builtins registered above sit far below the
 	// contract's 128-action and 64-parameter caps. plexd_hooks carries the
 	// PlexdHook resources a pod finds in its ServiceAccount's namespace, kept
@@ -739,6 +754,11 @@ func runAgent(ctx context.Context) error {
 	plexdHooks := newPlexdHookInventory(ctx, kubeEnv, newInClusterHookLister, logger)
 	capabilityReporter := agent.NewCapabilityReporter(identity.NodeID, client, func() api.CapabilityManifestRequest {
 		capsActions, capsHooks := executor.Capabilities()
+		// nil leaves the key off, which the control plane stores as no errors.
+		var rolloutErrors []api.HookRolloutError
+		if rolloutInstaller != nil {
+			rolloutErrors = rolloutInstaller.Errors()
+		}
 		return api.CapabilityManifestRequest{
 			BinaryVersion:         buildVersion,
 			BinaryChecksum:        wireChecksum,
@@ -746,6 +766,7 @@ func runAgent(ctx context.Context) error {
 			DeclaredHooks:         declaredHooks(capsHooks, logger),
 			PlexdHooks:            plexdHooks.snapshot(),
 			BuiltinActions:        capsActions,
+			HookRolloutErrors:     rolloutErrors,
 		}
 	}, logger)
 
@@ -766,10 +787,65 @@ func runAgent(ctx context.Context) error {
 		logger,
 	)
 
-	// Scan hooks_dir before anything can read the hook list. The reconciler starts
-	// ahead of the watch and a dispatch it delivers must not meet an empty list,
-	// and the first scan pins each hook's integrity anchor.
-	bootHookScan(ctx, hookWatcher.Reload, bootHookScanTimeout, logger)
+	// 11a. Create the watcher of the rollout directory while rolled-out hooks are
+	// on. It feeds the executor's rollout set the way hookWatcher feeds the
+	// local one, so a hook the installer pinned reaches dispatch and the
+	// manifest. With rollouts refused, Load empties the directory and no pass
+	// installs anything, so there is nothing to watch.
+	var rolloutWatcher *actions.HookWatcher
+	if rolloutInstaller != nil && cfg.Actions.IsRolloutsEnabled() {
+		rolloutWatcher = actions.NewRolloutHookWatcher(
+			cfg.Actions.RolloutHooksDir,
+			func(hooks []api.HookInfo) {
+				executor.SetRolloutHooks(hooks)
+				capabilityReporter.Notify()
+			},
+			func(hookName, oldChecksum, newChecksum string) {
+				logger.Warn("hook integrity change detected",
+					"hook", hookName,
+					"source", api.HookSourceRollout,
+					"old_checksum", oldChecksum,
+					"new_checksum", newChecksum,
+				)
+			},
+			logger,
+		)
+	}
+
+	// A pass that installed, removed, or changed the rollout errors rescans the
+	// rollout directory at once rather than leaving it to the watch, whose
+	// events arrive debounced and not at all when the watch could not start.
+	// The rescan notifies the reporter through onChange, and the explicit
+	// Notify covers a change to the errors alone.
+	if rolloutInstaller != nil {
+		rolloutInstaller.SetOnChange(func() {
+			if rolloutWatcher != nil {
+				if _, err := rolloutWatcher.Reload(); err != nil {
+					logger.Warn("rolled-out hook rescan failed", "error", err)
+				}
+			}
+			capabilityReporter.Notify()
+		})
+	}
+
+	// Restore what the installer put into the rollout directory before this
+	// process started, ahead of the boot scan, so the scan finds only recorded
+	// files and each is already pinned to the checksum it was delivered with.
+	// A failure costs the rolled-out hooks until a later pass creates the
+	// directory, not the agent.
+	if rolloutInstaller != nil {
+		if err := rolloutInstaller.Load(); err != nil {
+			logger.Error("actions: rollout: load failed", "error", err)
+		}
+	}
+
+	// Scan hooks_dir and the rollout directory before anything can read the hook
+	// list. The reconciler starts ahead of the watch and a dispatch it delivers
+	// must not meet an empty list, and the first scan pins each hand-placed
+	// hook's integrity anchor. One scan covers both directories, so boot waits
+	// for them within one bootHookScanTimeout.
+	hookDirs := &hookDirsReloader{local: hookWatcher, rollout: rolloutWatcher, executor: executor}
+	bootHookScan(ctx, hookDirs.Reload, bootHookScanTimeout, logger)
 
 	// 12. Create node API server.
 	cfg.NodeAPI.SecretAuthEnabled = true
@@ -779,7 +855,7 @@ func runAgent(ctx context.Context) error {
 	}
 	nodeAPISrv := nodeapi.NewServer(cfg.NodeAPI, client, nsk, logger)
 	nodeAPISrv.SetActionProvider(executor)
-	nodeAPISrv.SetHookReloader(hookWatcher)
+	nodeAPISrv.SetHookReloader(hookDirs)
 
 	// Set up peer and policy snapshot providers for the node API.
 	peerSnap := &peerSnapshot{}
@@ -834,6 +910,15 @@ func runAgent(ctx context.Context) error {
 	// successful cycle, drift or not, so GET /v1/state/secrets lists what the
 	// node may read; node_secrets_updated only pulls it forward (see above).
 	reconciler.RegisterDispatchHandler(nodeAPISrv.SecretIndexDispatchHandler())
+
+	// The pull's hooks block lists the published hook versions the node should
+	// run. The installer only takes the block here and installs on its own
+	// goroutine, so a slow fetch never holds back the executions block below. A
+	// dispatch cannot name a hook before the manifest reports it, so a version
+	// installed after this cycle's dispatches loses nothing.
+	if rolloutInstaller != nil {
+		reconciler.RegisterDispatchHandler(rolloutInstaller.Handle)
+	}
 
 	// Action dispatches are consumed from the pull's executions block on every
 	// successful cycle, drift or not: the block is a delivery queue that
@@ -1126,7 +1211,9 @@ func runAgent(ctx context.Context) error {
 		statusReports.run(ctx)
 	}()
 
-	// 20. Start hook watcher.
+	// 20. Start the hook watchers and the rollout installer. A hooks block the
+	// reconciler handed the installer before this point waits in its pending
+	// slot, so the first pass runs on it.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1134,10 +1221,27 @@ func runAgent(ctx context.Context) error {
 			logger.Error("hook watcher stopped", "error", err)
 		}
 	}()
+	if rolloutWatcher != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := rolloutWatcher.Watch(ctx); err != nil {
+				logger.Error("rolled-out hook watcher stopped", "error", err)
+			}
+		}()
+	}
+	if rolloutInstaller != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = rolloutInstaller.Run(ctx)
+		}()
+	}
 
 	// 20a. Start the capability reporter. Its first attempt is the boot manifest,
-	// and it retries that until one is accepted. The hook watcher's onChange and
-	// the PlexdHook inventory notify it of every later change.
+	// and it retries that until one is accepted. The hook watchers' onChange, the
+	// rollout installer, and the PlexdHook inventory notify it of every later
+	// change.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1775,6 +1879,12 @@ func signingKeyDispatchHandler(verifier *api.Ed25519Verifier, dataDir string, pe
 // package works in into the base64 the contract carries. Each entry also carries
 // what the hook's sidecar declares, as far as withHookMetadata lets it through.
 //
+// A rolled-out hook's entry carries source rollout and the version installed,
+// so the control plane takes that version's published checksum as the hook's
+// baseline. Every other entry carries neither: the contract reads an absent
+// source as local, so a Node with no rolled-out hook sends the bytes it sent
+// before rollouts existed, which a control plane that predates them accepts.
+//
 // A hook whose checksum is missing or not a SHA-256 digest is dropped with a
 // warning rather than sent: the manifest is validated as a whole, so one
 // unusable entry would cost the binary version and digest of the entire report.
@@ -1800,7 +1910,12 @@ func declaredHooks(hooks []api.HookInfo, logger *slog.Logger) []api.DeclaredHook
 				"hook", h.Name, "error", err)
 			continue
 		}
-		out = append(out, withHookMetadata(api.DeclaredHook{Name: h.Name, Checksum: checksum}, h, logger))
+		entry := withHookMetadata(api.DeclaredHook{Name: h.Name, Checksum: checksum}, h, logger)
+		if h.Source == api.HookSourceRollout {
+			entry.Source = api.HookSourceRollout
+			entry.Version = h.Version
+		}
+		out = append(out, entry)
 	}
 	if len(out) == 0 {
 		return nil
@@ -1902,10 +2017,41 @@ func hookTimeoutSeconds(timeout string) (int64, error) {
 	return int64((d + time.Second - 1) / time.Second), nil
 }
 
-// bootHookScanTimeout bounds how long boot waits for the first scan of hooks_dir.
-// The scan hashes every hook, so a hung mount could otherwise stop runAgent
-// before heartbeats start, with SIGTERM unable to get through.
+// bootHookScanTimeout bounds how long boot waits for the first scan of hooks_dir
+// and the rollout directory. The scan hashes every hook, so a hung mount could
+// otherwise stop runAgent before heartbeats start, with SIGTERM unable to get
+// through.
 const bootHookScanTimeout = 10 * time.Second
+
+// hookDirsReloader rescans every directory plexd runs script hooks from:
+// hooks_dir, and the rollout directory when its watcher was built. It serves
+// the boot scan and POST /v1/hooks/reload. It answers with the executor's
+// merged list rather than either watcher's, because that list is what dispatch
+// and the manifest use: a rolled-out file is in it only once the installer
+// pinned it, and a hand-placed hook shadows a rolled-out one of its name.
+type hookDirsReloader struct {
+	local *actions.HookWatcher
+	// rollout is nil while rolled-out hooks are off.
+	rollout  *actions.HookWatcher
+	executor *actions.Executor
+}
+
+// Reload rescans both directories and returns the executor's hooks. It
+// rescans each even when the other fails, so one unreadable directory does not
+// keep a hook written into the other from the executor, and returns the
+// failures together.
+func (r *hookDirsReloader) Reload() ([]api.HookInfo, error) {
+	_, localErr := r.local.Reload()
+	var rolloutErr error
+	if r.rollout != nil {
+		_, rolloutErr = r.rollout.Reload()
+	}
+	if err := errors.Join(localErr, rolloutErr); err != nil {
+		return nil, err
+	}
+	_, hooks := r.executor.Capabilities()
+	return hooks, nil
+}
 
 // bootHookScan is awaitBootHookScan behind a seam, so a test can hold the scan
 // open and see that nothing overtakes it.

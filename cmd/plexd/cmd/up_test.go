@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/plexsphere/plexd/internal/actions"
 	"github.com/plexsphere/plexd/internal/agent"
 	"github.com/plexsphere/plexd/internal/api"
 	"github.com/plexsphere/plexd/internal/health"
@@ -2858,6 +2860,88 @@ func TestDeclaredHooks_EveryFieldBrokenKeepsTheHook(t *testing.T) {
 	}
 }
 
+// A rolled-out hook goes on the wire with source rollout and the version it was
+// installed from, which the control plane needs to take the published checksum
+// as the hook's baseline.
+func TestDeclaredHooks_RolloutEntryCarriesSourceAndVersion(t *testing.T) {
+	hook, want := metadataHook()
+	hook.Source = api.HookSourceRollout
+	hook.Version = 2
+	want.Source = api.HookSourceRollout
+	want.Version = 2
+	got, rec := declareOne(t, hook)
+	assertEntry(t, got, want)
+	assertNotOmitted(t, rec)
+
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal entry: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"source":"rollout","version":2`)) {
+		t.Errorf("marshaled entry = %s, want it to carry \"source\":\"rollout\",\"version\":2", raw)
+	}
+}
+
+// The contract reads an absent source as local, so a hand-placed hook is sent
+// with no source key and no version, whatever its HookInfo carries.
+func TestDeclaredHooks_LocalEntryHasNoSourceKey(t *testing.T) {
+	for _, source := range []string{api.HookSourceLocal, ""} {
+		t.Run("source "+strconv.Quote(source), func(t *testing.T) {
+			hook, want := metadataHook()
+			hook.Source = source
+			hook.Version = 7
+			got, rec := declareOne(t, hook)
+			assertEntry(t, got, want)
+			assertNotOmitted(t, rec)
+
+			raw, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal entry: %v", err)
+			}
+			for _, key := range []string{`"source"`, `"version"`} {
+				if bytes.Contains(raw, []byte(key)) {
+					t.Errorf("marshaled entry carries %s: %s", key, raw)
+				}
+			}
+		})
+	}
+}
+
+// A Node with no rolled-out hook must send the bytes it sent before rollouts
+// existed, or a control plane that predates them would refuse its manifest.
+// The literal is what declaredHooks produced for these hooks before Source and
+// Version reached the entry; the hooks carry the Source discovery stamps on a
+// hand-placed hook.
+func TestDeclaredHooks_LocalHooksMarshalAsBefore(t *testing.T) {
+	hook, _ := metadataHook()
+	hook.Source = api.HookSourceLocal
+	bare := api.HookInfo{Name: "nightly", Source: api.HookSourceLocal, Checksum: hook.Checksum, Parameters: []api.ActionParam{}}
+
+	got := declaredHooks([]api.HookInfo{hook, bare}, discardLogger())
+
+	raw, err := json.Marshal(api.CapabilityManifestRequest{
+		BinaryVersion:  "v1.2.3",
+		BinaryChecksum: "oRgzMYbPq/PeONcfPaVDlPGsFA3to6DcRfl1j0SYLuI=",
+		DeclaredHooks:  got,
+	})
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	const golden = `{"binary_version":"v1.2.3",` +
+		`"binary_checksum":"oRgzMYbPq/PeONcfPaVDlPGsFA3to6DcRfl1j0SYLuI=",` +
+		`"declared_hooks":[` +
+		`{"name":"deploy","checksum":"oRgzMYbPq/PeONcfPaVDlPGsFA3to6DcRfl1j0SYLuI=",` +
+		`"description":"Rolls the deployment forward",` +
+		`"parameters":[` +
+		`{"name":"region","type":"string","required":true,"description":"Target region"},` +
+		`{"name":"dry_run","type":"bool","required":false,"default":"false","description":"Report without changing anything"}],` +
+		`"timeout_seconds":30,"sandbox_level":"none"},` +
+		`{"name":"nightly","checksum":"oRgzMYbPq/PeONcfPaVDlPGsFA3to6DcRfl1j0SYLuI="}]}`
+	if string(raw) != golden {
+		t.Errorf("manifest =\n%s\nwant\n%s", raw, golden)
+	}
+}
+
 // The error reaches an operator through the log, so it has to name both the
 // violation and the parameter.
 func TestHookParametersError(t *testing.T) {
@@ -3224,10 +3308,29 @@ func assertWireDigest(t *testing.T, field, value string) {
 // to every PUT of the capability manifest and keeps each body in arrival order,
 // because which PUT carries a hook is what the boot manifest tests are about. It
 // counts heartbeats too, which is how they see the daemon still running.
+//
+// A state pull answers what setState stored, and {} until then. A hook version
+// fetch is counted and answered {}, which no installer accepts.
 type capabilityCapture struct {
-	mu         sync.Mutex
-	bodies     [][]byte
-	heartbeats int
+	mu          sync.Mutex
+	bodies      [][]byte
+	heartbeats  int
+	state       []byte
+	hookFetches int
+}
+
+// setState makes every later state pull answer body.
+func (cp *capabilityCapture) setState(body string) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	cp.state = []byte(body)
+}
+
+// fetchesOfHookVersions returns how many hook version fetches arrived.
+func (cp *capabilityCapture) fetchesOfHookVersions() int {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.hookFetches
 }
 
 func newCapabilityCapture(t *testing.T) (*capabilityCapture, string) {
@@ -3263,6 +3366,18 @@ func (cp *capabilityCapture) serve(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(r.URL.Path, "/heartbeat"):
 		cp.mu.Lock()
 		cp.heartbeats++
+		cp.mu.Unlock()
+	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/state"):
+		cp.mu.Lock()
+		state := cp.state
+		cp.mu.Unlock()
+		if state != nil {
+			_, _ = w.Write(state)
+			return
+		}
+	case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/hooks/"):
+		cp.mu.Lock()
+		cp.hookFetches++
 		cp.mu.Unlock()
 	}
 	_, _ = w.Write([]byte("{}"))
@@ -3620,6 +3735,450 @@ node_api:
 			t.Fatal("no manifest reported the hook the reload found")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A rolled-out hook survives a restart. Load pins what the record vouches for
+// ahead of the boot scan, which covers the rollout directory, so the boot
+// manifest reports the hook as rollout at its recorded version, and the pull's
+// absent hooks block keeps it.
+func TestRunUp_BootManifestCarriesARecordedRolledOutHook(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need the executable bit and /bin/sh, which windows lacks")
+	}
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("PLEXD_HOOKS_DIR", t.TempDir())
+	t.Setenv("PLEXD_ACTIONS_ROLLOUTS_ENABLED", "")
+
+	cp, apiBase := newCapabilityCapture(t)
+	dataDir := writeUpConfig(t, apiBase, upDaemonYAML(t))
+	sum := recordRolledOutHook(t, dataDir, "backup-db", 2, []byte("#!/bin/sh\necho backup\n"))
+
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	first := cp.firstBody(t)
+	var manifest api.CapabilityManifestRequest
+	if err := json.Unmarshal(first, &manifest); err != nil {
+		t.Fatalf("decode manifest: %v (body: %s)", err, first)
+	}
+	want := []api.DeclaredHook{{
+		Name:     "backup-db",
+		Checksum: base64.StdEncoding.EncodeToString(sum[:]),
+		Source:   api.HookSourceRollout,
+		Version:  2,
+	}}
+	if !reflect.DeepEqual(manifest.DeclaredHooks, want) {
+		t.Errorf("first manifest declared_hooks = %+v, want %+v (body: %s)", manifest.DeclaredHooks, want, first)
+	}
+	if manifest.HookRolloutErrors != nil {
+		t.Errorf("first manifest hook_rollout_errors = %+v, want none", manifest.HookRolloutErrors)
+	}
+}
+
+// recordRolledOutHook leaves what an earlier run's installer leaves behind for a
+// rolled-out hook: the script in the rollout directory under dataDir, and a
+// record that vouches for it at version. It returns the script's digest.
+func recordRolledOutHook(t *testing.T, dataDir, name string, version int, script []byte) [sha256.Size]byte {
+	t.Helper()
+	sum := sha256.Sum256(script)
+	rolloutDir := filepath.Join(dataDir, "hooks")
+	if err := os.Mkdir(rolloutDir, 0o755); err != nil {
+		t.Fatalf("create rollout directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rolloutDir, name), script, 0o755); err != nil {
+		t.Fatalf("write rolled-out hook: %v", err)
+	}
+	record := fmt.Sprintf(`{"hooks":[{"name":%q,"version":%d,"checksum":%q}]}`, name, version, hex.EncodeToString(sum[:]))
+	if err := os.WriteFile(filepath.Join(dataDir, "hook_rollouts.json"), []byte(record), 0o600); err != nil {
+		t.Fatalf("write record: %v", err)
+	}
+	return sum
+}
+
+// POST /v1/hooks/reload answers with what runUp wires to it, which rescans
+// hooks_dir and the rollout directory and answers the executor's merged list. A
+// hook written into hooks_dir just before the call is in the answer, and so is
+// the rolled-out hook the record restored, with its source and version. The
+// hooks_dir watcher on its own would answer the first and not the second.
+func TestRunUp_HookReloadListsBothDirectories(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need the executable bit and /bin/sh, which windows lacks")
+	}
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	hooksDir := t.TempDir()
+	t.Setenv("PLEXD_HOOKS_DIR", hooksDir)
+	t.Setenv("PLEXD_ACTIONS_ROLLOUTS_ENABLED", "")
+
+	socketPath := shortSocketPath(t)
+	cp, apiBase := newCapabilityCapture(t)
+	dataDir := writeUpConfig(t, apiBase, fmt.Sprintf(`policy:
+  enabled: false
+tunnel:
+  enabled: false
+node_api:
+  socket_path: %s
+`, socketPath))
+	rolledOut := recordRolledOutHook(t, dataDir, "backup-db", 2, []byte("#!/bin/sh\necho backup\n"))
+
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	// The boot manifest names the restored hook, so the boot scan is done and a
+	// reload that misses the hook is the route's doing.
+	if first := cp.firstBody(t); !bytes.Contains(first, []byte(`"backup-db"`)) {
+		t.Fatalf("first manifest does not carry the rolled-out hook: %s", first)
+	}
+
+	local := []byte("#!/bin/sh\necho deploy\n")
+	localSum := sha256.Sum256(local)
+	if err := os.WriteFile(filepath.Join(hooksDir, "deploy"), local, 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+
+	nodeAPI := newSocketClient(socketPath)
+	defer nodeAPI.CloseIdleConnections()
+	var answer struct {
+		Hooks []api.HookInfo `json:"hooks"`
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		resp, err := nodeAPI.Post(socketURL("/v1/hooks/reload"), "application/json", nil)
+		if err == nil {
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				if readErr != nil {
+					t.Fatalf("read reload answer: %v", readErr)
+				}
+				if err := json.Unmarshal(body, &answer); err != nil {
+					t.Fatalf("decode reload answer: %v (body: %s)", err, body)
+				}
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("reload never answered 200: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	type entry struct {
+		name, source, checksum string
+		version                int
+	}
+	got := make([]entry, 0, len(answer.Hooks))
+	for _, h := range answer.Hooks {
+		got = append(got, entry{name: h.Name, source: h.Source, checksum: h.Checksum, version: h.Version})
+	}
+	want := []entry{
+		{name: "backup-db", source: api.HookSourceRollout, checksum: hex.EncodeToString(rolledOut[:]), version: 2},
+		{name: "deploy", source: api.HookSourceLocal, checksum: hex.EncodeToString(localSum[:])},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("reload answered %+v, want %+v", got, want)
+	}
+}
+
+// What the installer could not install reaches the control plane in
+// hook_rollout_errors. With rollouts refused by the node owner, every version
+// the pull lists becomes an install_failed error with no fetch.
+//
+// The errors change after boot, and only the installer's onChange tells the
+// reporter: such a pass writes no file, the hooks_dir watcher has nothing to
+// report, and no rollout watcher runs while rollouts are refused. So the pull
+// lists the hook only once the boot manifest was accepted and the reporter has
+// settled what boot queued, and a later PUT has to carry the errors. A
+// reconcile interval of one second brings that pull.
+func TestRunUp_ManifestCarriesRolloutErrors(t *testing.T) {
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("PLEXD_HOOKS_DIR", t.TempDir())
+	t.Setenv("PLEXD_ACTIONS_ROLLOUTS_ENABLED", "")
+
+	cp, apiBase := newCapabilityCapture(t)
+	writeUpConfig(t, apiBase, upDaemonYAML(t)+"actions:\n  rollouts_enabled: false\nreconcile:\n  interval: 1s\n")
+	shutdown := startRunUp(t)
+	defer shutdown()
+
+	if first := cp.firstBody(t); bytes.Contains(first, []byte(`"hook_rollout_errors"`)) {
+		t.Fatalf("boot manifest carries hook_rollout_errors before a pull listed a hook: %s", first)
+	}
+
+	// The boot scan and the hooks_dir watch's first scan notify the reporter
+	// around the boot manifest, and the reporter builds again one quiet period,
+	// a second, after the last of them. That build matches the boot manifest
+	// and sends nothing. Waiting two seconds puts the pass after it, where a
+	// build that carries the errors needs the installer's onChange. A slow host
+	// can only hide a missing onChange this way, never fail a working one.
+	time.Sleep(2 * time.Second)
+	sent := len(cp.allBodies())
+	cp.setState(`{"hooks":[{"name":"backup-db","version":2,"checksum":"oRgzMYbPq/PeONcfPaVDlPGsFA3to6DcRfl1j0SYLuI="}]}`)
+
+	var body []byte
+	deadline := time.Now().Add(30 * time.Second)
+	for body == nil {
+		for _, b := range cp.allBodies()[sent:] {
+			if bytes.Contains(b, []byte(`"hook_rollout_errors"`)) {
+				body = b
+				break
+			}
+		}
+		if body != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no manifest carried hook_rollout_errors; bodies: %q", cp.allBodies())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	var manifest api.CapabilityManifestRequest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		t.Fatalf("decode manifest: %v (body: %s)", err, body)
+	}
+	detail := "rolled-out hooks are disabled on this node"
+	if runtime.GOOS == "windows" {
+		detail = "script hooks are not supported on Windows"
+	}
+	want := []api.HookRolloutError{{
+		Name:    "backup-db",
+		Version: 2,
+		Code:    api.HookRolloutCodeInstallFailed,
+		Detail:  detail,
+	}}
+	if !reflect.DeepEqual(manifest.HookRolloutErrors, want) {
+		t.Errorf("hook_rollout_errors = %+v, want %+v (body: %s)", manifest.HookRolloutErrors, want, body)
+	}
+	if n := cp.fetchesOfHookVersions(); n != 0 {
+		t.Errorf("hook version fetches = %d, want 0 with rollouts refused", n)
+	}
+}
+
+// The startup record is where an operator confirms whether this node installs
+// the scripts the control plane delivers, whichever layer set the switch.
+func TestRunUp_StartupRecordCarriesRolloutsEnabled(t *testing.T) {
+	const startingMsg = "starting plexd"
+	for _, tc := range []struct {
+		name string
+		yaml string
+		env  string
+		want string
+	}{
+		{name: "unset", want: "true"},
+		{name: "file refuses", yaml: "actions:\n  rollouts_enabled: false\n", want: "false"},
+		{name: "environment refuses", env: "false", want: "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("KUBERNETES_SERVICE_HOST", "")
+			t.Setenv("PLEXD_HOOKS_DIR", t.TempDir())
+			t.Setenv("PLEXD_ACTIONS_ROLLOUTS_ENABLED", tc.env)
+
+			cp, apiBase := newCapabilityCapture(t)
+			writeUpConfig(t, apiBase, upDaemonYAML(t)+tc.yaml)
+			rec := useRecordingDaemonLog(t)
+			shutdown := startRunUp(t)
+			defer shutdown()
+
+			// The record goes out before registration, so the boot manifest
+			// shows it written.
+			cp.firstBody(t)
+			if n := rec.count(slog.LevelInfo, startingMsg); n != 1 {
+				t.Fatalf("records %q = %d, want 1", startingMsg, n)
+			}
+			if got := rec.attrsOf(slog.LevelInfo, startingMsg)["rollouts_enabled"]; got != tc.want {
+				t.Errorf("rollouts_enabled = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// An installer that cannot be built or cannot restore its directory costs the
+// rolled-out hooks, not the agent: the failure is logged at ERROR and the node
+// keeps reporting.
+func TestRunUp_RolloutFailureLeavesTheAgentRunning(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		prepare func(t *testing.T, dataDir string)
+		msg     string
+		wantErr string
+	}{
+		{
+			// The installer removes every file it did not write from its
+			// directory, which here would be the operator's hooks.
+			name: "rollout directory is hooks_dir",
+			prepare: func(t *testing.T, dataDir string) {
+				t.Setenv("PLEXD_HOOKS_DIR", filepath.Join(dataDir, "hooks"))
+			},
+			msg:     "rolled-out hooks disabled",
+			wantErr: "is hooks_dir",
+		},
+		{
+			name: "rollout directory cannot be created",
+			prepare: func(t *testing.T, dataDir string) {
+				if runtime.GOOS == "windows" {
+					t.Skip("Load does nothing on windows, where script hooks do not run")
+				}
+				t.Setenv("PLEXD_HOOKS_DIR", t.TempDir())
+				if err := os.WriteFile(filepath.Join(dataDir, "hooks"), []byte("not a directory"), 0o644); err != nil {
+					t.Fatalf("write file: %v", err)
+				}
+			},
+			msg:     "actions: rollout: load failed",
+			wantErr: "not a directory",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("KUBERNETES_SERVICE_HOST", "")
+			t.Setenv("PLEXD_ACTIONS_ROLLOUTS_ENABLED", "")
+
+			cp, apiBase := newCapabilityCapture(t)
+			dataDir := writeUpConfig(t, apiBase, upDaemonYAML(t))
+			tc.prepare(t, dataDir)
+			rec := useRecordingDaemonLog(t)
+			shutdown := startRunUp(t)
+			defer shutdown()
+
+			if first := cp.firstBody(t); !bytes.Contains(first, []byte(`"builtin_actions"`)) {
+				t.Fatalf("first body is not a manifest: %s", first)
+			}
+			if n := rec.count(slog.LevelError, tc.msg); n != 1 {
+				t.Fatalf("errors %q = %d, want 1", tc.msg, n)
+			}
+			if got := rec.attrsOf(slog.LevelError, tc.msg)["error"]; !strings.Contains(got, tc.wantErr) {
+				t.Errorf("error attr = %q, want it to contain %q", got, tc.wantErr)
+			}
+		})
+	}
+}
+
+// The boot scan and POST /v1/hooks/reload read both directories plexd runs
+// script hooks from. A hook written into either just before the call is in the
+// answer, which is the executor's merged list: a rolled-out hook appears with
+// the version the installer pinned when it wrote the file.
+func TestHookDirsReloader_ReturnsAHookWrittenIntoEitherDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need the executable bit and /bin/sh, which windows lacks")
+	}
+	type entry struct {
+		name, source, checksum string
+		version                int
+	}
+	entries := func(hooks []api.HookInfo) []entry {
+		out := make([]entry, 0, len(hooks))
+		for _, h := range hooks {
+			out = append(out, entry{name: h.Name, source: h.Source, checksum: h.Checksum, version: h.Version})
+		}
+		return out
+	}
+	script := []byte("#!/bin/sh\nexit 0\n")
+	sum := sha256.Sum256(script)
+	digest := hex.EncodeToString(sum[:])
+
+	hooksDir, rolloutDir := t.TempDir(), t.TempDir()
+	executor := actions.NewExecutor(actions.Config{HooksDir: hooksDir, RolloutHooksDir: rolloutDir},
+		noopActionReporter{}, noopHookVerifier{}, discardLogger())
+	reloader := &hookDirsReloader{
+		local:    actions.NewHookWatcher(hooksDir, executor.SetHooks, nil, discardLogger()),
+		rollout:  actions.NewRolloutHookWatcher(rolloutDir, executor.SetRolloutHooks, nil, discardLogger()),
+		executor: executor,
+	}
+
+	if hooks, err := reloader.Reload(); err != nil || len(hooks) != 0 {
+		t.Fatalf("Reload() of empty directories = %+v, %v; want no hooks", hooks, err)
+	}
+
+	if err := os.WriteFile(filepath.Join(hooksDir, "deploy"), script, 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	hooks, err := reloader.Reload()
+	if err != nil {
+		t.Fatalf("Reload() = %v", err)
+	}
+	want := []entry{{name: "deploy", source: api.HookSourceLocal, checksum: digest}}
+	if got := entries(hooks); !reflect.DeepEqual(got, want) {
+		t.Errorf("Reload() after a write into hooks_dir = %+v, want %+v", got, want)
+	}
+
+	// The installer writes inside SwapRolloutHook, which pins the delivered
+	// version once the write succeeded.
+	if err := executor.SwapRolloutHook("backup-db", 2, digest, func() error {
+		return os.WriteFile(filepath.Join(rolloutDir, "backup-db"), script, 0o755)
+	}); err != nil {
+		t.Fatalf("SwapRolloutHook() = %v", err)
+	}
+	hooks, err = reloader.Reload()
+	if err != nil {
+		t.Fatalf("Reload() = %v", err)
+	}
+	want = []entry{
+		{name: "backup-db", source: api.HookSourceRollout, checksum: digest, version: 2},
+		{name: "deploy", source: api.HookSourceLocal, checksum: digest},
+	}
+	if got := entries(hooks); !reflect.DeepEqual(got, want) {
+		t.Errorf("Reload() after a write into the rollout directory = %+v, want %+v", got, want)
+	}
+}
+
+// With rolled-out hooks off no rollout watcher exists, and the reload reads
+// hooks_dir alone.
+func TestHookDirsReloader_WithoutARolloutWatcher(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need the executable bit and /bin/sh, which windows lacks")
+	}
+	hooksDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(hooksDir, "deploy"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+	executor := actions.NewExecutor(actions.Config{HooksDir: hooksDir}, noopActionReporter{}, noopHookVerifier{}, discardLogger())
+	reloader := &hookDirsReloader{
+		local:    actions.NewHookWatcher(hooksDir, executor.SetHooks, nil, discardLogger()),
+		executor: executor,
+	}
+
+	hooks, err := reloader.Reload()
+	if err != nil {
+		t.Fatalf("Reload() = %v", err)
+	}
+	if len(hooks) != 1 || hooks[0].Name != "deploy" || hooks[0].Source != api.HookSourceLocal {
+		t.Errorf("Reload() = %+v, want the local deploy hook alone", hooks)
+	}
+}
+
+// One directory that cannot be read fails the reload, and the other is still
+// rescanned, so its hooks reach the executor.
+func TestHookDirsReloader_OneFailingDirectoryKeepsTheOther(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hook scripts need the executable bit and /bin/sh, which windows lacks")
+	}
+	script := []byte("#!/bin/sh\nexit 0\n")
+	sum := sha256.Sum256(script)
+	digest := hex.EncodeToString(sum[:])
+
+	hooksDir := filepath.Join(t.TempDir(), "hooks")
+	if err := os.WriteFile(hooksDir, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	rolloutDir := t.TempDir()
+	executor := actions.NewExecutor(actions.Config{HooksDir: hooksDir, RolloutHooksDir: rolloutDir},
+		noopActionReporter{}, noopHookVerifier{}, discardLogger())
+	reloader := &hookDirsReloader{
+		local:    actions.NewHookWatcher(hooksDir, executor.SetHooks, nil, discardLogger()),
+		rollout:  actions.NewRolloutHookWatcher(rolloutDir, executor.SetRolloutHooks, nil, discardLogger()),
+		executor: executor,
+	}
+	if err := executor.SwapRolloutHook("backup-db", 2, digest, func() error {
+		return os.WriteFile(filepath.Join(rolloutDir, "backup-db"), script, 0o755)
+	}); err != nil {
+		t.Fatalf("SwapRolloutHook() = %v", err)
+	}
+
+	hooks, err := reloader.Reload()
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("Reload() = %+v, %v; want the hooks_dir error", hooks, err)
+	}
+	_, merged := executor.Capabilities()
+	if len(merged) != 1 || merged[0].Name != "backup-db" || merged[0].Version != 2 {
+		t.Errorf("executor hooks = %+v, want backup-db at version 2", merged)
 	}
 }
 

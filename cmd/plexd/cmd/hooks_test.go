@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -95,6 +96,45 @@ func TestHooksListCommand(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The VERSION cell is read under its header, because tabwriter pads an empty
+// cell with spaces and a substring check cannot tell an empty cell from a
+// missing column.
+func TestHooksListCommand_VersionColumn(t *testing.T) {
+	hooks := []api.HookInfo{
+		{Name: "backup-db", Source: api.HookSourceRollout, Version: 2, Checksum: "abc123", Description: "rolled out"},
+		{Name: "deploy", Source: api.HookSourceLocal, Checksum: "def456", Description: "hand placed"},
+	}
+	socketPath := startTestSocketServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(hooks)
+	}))
+	overrideSocketPath(t, socketPath)
+
+	output, err := executeCmd(t, "hooks", "list")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("output has %d lines, want a header and 2 rows:\n%s", len(lines), output)
+	}
+	header := lines[0]
+	if got, want := strings.Fields(header), []string{"NAME", "SOURCE", "VERSION", "CHECKSUM", "DESCRIPTION"}; !slices.Equal(got, want) {
+		t.Fatalf("header columns = %v, want %v", got, want)
+	}
+	start, end := strings.Index(header, "VERSION"), strings.Index(header, "CHECKSUM")
+	want := map[string]string{"backup-db": "2", "deploy": ""}
+	for _, line := range lines[1:] {
+		name := strings.Fields(line)[0]
+		if len(line) < end {
+			t.Fatalf("row %q ends before the CHECKSUM column", line)
+		}
+		if got := strings.TrimSpace(line[start:end]); got != want[name] {
+			t.Errorf("VERSION of %s = %q, want %q (output:\n%s)", name, got, want[name], output)
+		}
 	}
 }
 
