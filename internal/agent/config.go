@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"gopkg.in/yaml.v3"
 
@@ -105,13 +106,16 @@ func (c *AgentConfig) ApplyDefaults() {
 	c.PeerExchange.ApplyDefaults()
 	c.Bridge.ApplyDefaults()
 	c.Heartbeat.ApplyDefaults()
-	// Propagate the top-level data dir into the subsystem configs. All three
+	// Propagate the top-level data dir into the subsystem configs. All four
 	// fields are excluded from the YAML surface (yaml:"-"), so this is their
 	// only source. The integrity verifier watches the same host key file the
 	// tunnel loads, so it takes the path from tunnel rather than respelling it.
+	// Rolled-out hooks live under data_dir because plexd owns that directory
+	// and the systemd unit plexd generates already lets it write there.
 	c.Registration.DataDir = c.DataDir
 	c.NodeAPI.DataDir = c.DataDir
 	c.Integrity.HostKeyPath = tunnel.HostKeyPath(c.DataDir)
+	c.Actions.RolloutHooksDir = filepath.Join(c.DataDir, "hooks")
 }
 
 // Validate checks that required fields are set and values are acceptable.

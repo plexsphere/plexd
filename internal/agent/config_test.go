@@ -81,6 +81,33 @@ func TestAgentConfig_ApplyDefaults_TopLevelDataDirWins(t *testing.T) {
 	}
 }
 
+// TestAgentConfig_ApplyDefaults_RolloutHooksDir pins where rolled-out hooks
+// live: <data_dir>/hooks, derived from the top-level data dir whether that is
+// the default or set, and overwriting whatever the field held before.
+func TestAgentConfig_ApplyDefaults_RolloutHooksDir(t *testing.T) {
+	t.Run("default data dir", func(t *testing.T) {
+		var cfg AgentConfig
+		cfg.ApplyDefaults()
+
+		want := filepath.Join(DefaultDataDir, "hooks")
+		if cfg.Actions.RolloutHooksDir != want {
+			t.Errorf("Actions.RolloutHooksDir = %q, want %q", cfg.Actions.RolloutHooksDir, want)
+		}
+	})
+
+	t.Run("top-level data dir wins", func(t *testing.T) {
+		var cfg AgentConfig
+		cfg.DataDir = "/tmp/plexd-top"
+		cfg.Actions.RolloutHooksDir = "/tmp/plexd-elsewhere"
+		cfg.ApplyDefaults()
+
+		want := filepath.Join("/tmp/plexd-top", "hooks")
+		if cfg.Actions.RolloutHooksDir != want {
+			t.Errorf("Actions.RolloutHooksDir = %q, want %q", cfg.Actions.RolloutHooksDir, want)
+		}
+	})
+}
+
 func TestAgentConfig_Validate_InvalidMode(t *testing.T) {
 	cfg := validConfig()
 	cfg.Mode = "invalid"
@@ -290,6 +317,48 @@ func TestParseConfig_ActionsDisabledByFile(t *testing.T) {
 	}
 	if cfg.Actions.IsEnabled() {
 		t.Error("Actions.IsEnabled() = true, want false for an explicit enabled: false")
+	}
+}
+
+// TestParseConfig_RolloutsDisabledByFile pins the node owner's veto on
+// rolled-out hooks through the whole load: an explicit false in the file
+// survives defaulting, and it leaves the actions switch alone.
+func TestParseConfig_RolloutsDisabledByFile(t *testing.T) {
+	path := writeTemp(t, "actions:\n  rollouts_enabled: false\n")
+	cfg, found, err := ParseConfig(path)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true for an existing file")
+	}
+	if cfg.Actions.IsRolloutsEnabled() {
+		t.Error("Actions.IsRolloutsEnabled() = true, want false for an explicit rollouts_enabled: false")
+	}
+	if !cfg.Actions.IsEnabled() {
+		t.Error("Actions.IsEnabled() = false, want true: rollouts_enabled must not disable actions")
+	}
+}
+
+// TestParseConfig_RolloutHooksDirIsNoYAMLKey pins that the rollout directory
+// cannot be moved from the file. plexd owns that directory and removes what it
+// did not install there, so a key that pointed it at hooks_dir or any other
+// operator-filled directory would cost the operator's files. The loader does
+// not decode strictly, so the key loads without an error and has no effect.
+func TestParseConfig_RolloutHooksDirIsNoYAMLKey(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	yaml := fmt.Sprintf("data_dir: %q\nactions:\n  hooks_dir: /etc/plexd/hooks\n  rollout_hooks_dir: /etc/plexd/hooks\n", dataDir)
+	path := writeTemp(t, yaml)
+	cfg, found, err := ParseConfig(path)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true for an existing file")
+	}
+	want := filepath.Join(dataDir, "hooks")
+	if cfg.Actions.RolloutHooksDir != want {
+		t.Errorf("Actions.RolloutHooksDir = %q, want %q: a rollout_hooks_dir key must not set it", cfg.Actions.RolloutHooksDir, want)
 	}
 }
 

@@ -130,10 +130,14 @@ func runAgent(ctx context.Context) error {
 	// on this node, it defaults to on, and it is reached from three layers
 	// (file, absent-file fallback, PLEXD_ACTIONS_ENABLED) — so the effective
 	// value belongs in the startup record rather than in an operator's head.
+	// rollouts_enabled is reported for the same reason: it decides whether
+	// scripts the control plane delivers are installed here, it defaults to
+	// on, and it is reached from the file and PLEXD_ACTIONS_ROLLOUTS_ENABLED.
 	logger.Info("starting plexd",
 		"version", buildVersion,
 		"mode", cfg.Mode,
 		"actions_enabled", cfg.Actions.IsEnabled(),
+		"rollouts_enabled", cfg.Actions.IsRolloutsEnabled(),
 	)
 
 	// 2a. Build the policy enforcer and pre-flight its firewall backend before
@@ -2185,6 +2189,19 @@ func applyEnvOverrides(cfg *agent.AgentConfig) {
 			slog.Warn("invalid PLEXD_ACTIONS_ENABLED, leaving actions.enabled unchanged", "value", v)
 		} else {
 			cfg.Actions.Enabled = &enabled
+		}
+	}
+	if v := os.Getenv("PLEXD_ACTIONS_ROLLOUTS_ENABLED"); v != "" {
+		// Parsed like PLEXD_ACTIONS_ENABLED rather than compared against one
+		// spelling: a "False" or a "0" rendered from a values file is a node
+		// owner refusing delivered scripts and must not read as consent, and a
+		// "True" must not read as a refusal. An unparseable value leaves the
+		// setting alone and says so.
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			slog.Warn("invalid PLEXD_ACTIONS_ROLLOUTS_ENABLED, leaving actions.rollouts_enabled unchanged", "value", v)
+		} else {
+			cfg.Actions.RolloutsEnabled = &enabled
 		}
 	}
 	if v := os.Getenv("PLEXD_HOOKS_ENABLED"); v != "" {

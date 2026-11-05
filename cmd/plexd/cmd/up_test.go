@@ -969,6 +969,80 @@ func TestApplyEnvOverrides_ActionsEnabled(t *testing.T) {
 	})
 }
 
+// TestApplyEnvOverrides_RolloutsEnabled covers the node owner's veto on
+// rolled-out hooks from the environment. A spelling ParseBool accepts as false
+// is a refusal of delivered scripts and must not read as consent, and a value
+// it does not accept must leave the setting alone, with a warning, rather than
+// flip it either way. The variable must not reach actions.enabled.
+//
+// The unparseable case swaps the process-global default logger, which
+// applyEnvOverrides logs through; t.Setenv already forbids t.Parallel.
+func TestApplyEnvOverrides_RolloutsEnabled(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		// want is the effective setting after the override is applied on top of
+		// a zero-valued actions block, where nil already reads as enabled.
+		want bool
+	}{
+		{"true", "true", true},
+		{"True", "True", true},
+		{"1", "1", true},
+		{"false", "false", false},
+		{"False", "False", false},
+		{"FALSE", "FALSE", false},
+		{"0", "0", false},
+		{"f", "f", false},
+		// Not a bool: the default stands, and the operator gets a warning.
+		{"maybe", "maybe", true},
+		{"no", "no", true},
+		{"empty value is inert", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PLEXD_ACTIONS_ROLLOUTS_ENABLED", tt.value)
+			t.Setenv("PLEXD_ACTIONS_ENABLED", "")
+
+			cfg := agent.AgentConfig{}
+			applyEnvOverrides(&cfg)
+
+			if got := cfg.Actions.IsRolloutsEnabled(); got != tt.want {
+				t.Errorf("Actions.IsRolloutsEnabled() for %q = %v, want %v", tt.value, got, tt.want)
+			}
+			if cfg.Actions.Enabled != nil {
+				t.Errorf("Actions.Enabled = %v, want nil: the rollouts override must not touch actions.enabled", *cfg.Actions.Enabled)
+			}
+		})
+	}
+
+	// The mirror case of the table: an unparseable value must not undo a file
+	// that refused rollouts either, and it says why the value was ignored.
+	t.Run("unparseable leaves a disabled config alone and warns", func(t *testing.T) {
+		t.Setenv("PLEXD_ACTIONS_ROLLOUTS_ENABLED", "maybe")
+
+		logs := newRecordingHandler()
+		prev := slog.Default()
+		slog.SetDefault(slog.New(logs))
+		defer slog.SetDefault(prev)
+
+		disabled := false
+		cfg := agent.AgentConfig{}
+		cfg.Actions.RolloutsEnabled = &disabled
+		applyEnvOverrides(&cfg)
+
+		if cfg.Actions.IsRolloutsEnabled() {
+			t.Error("Actions.IsRolloutsEnabled() = true, want false: an unparseable value must not enable rollouts")
+		}
+		const msg = "invalid PLEXD_ACTIONS_ROLLOUTS_ENABLED, leaving actions.rollouts_enabled unchanged"
+		if n := logs.count(slog.LevelWarn, msg); n != 1 {
+			t.Fatalf("warnings %q = %d, want 1", msg, n)
+		}
+		if got := logs.attrsOf(slog.LevelWarn, msg)["value"]; got != "maybe" {
+			t.Errorf("warning value = %q, want %q", got, "maybe")
+		}
+	})
+}
+
 // TestApplyEnvOverrides_PolicyEnabled covers the override that lets a container
 // which cannot program nftables start at all: with enforcement on, `plexd up`
 // aborts on the firewall pre-flight, and without a config file this variable is

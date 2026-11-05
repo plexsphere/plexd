@@ -33,9 +33,28 @@ type Config struct {
 	// to survive ApplyDefaults exactly as written.
 	Enabled *bool `yaml:"enabled"`
 
+	// RolloutsEnabled is the node owner's veto on hooks the control plane
+	// rolls out. nil means use default (true); explicit false makes plexd
+	// remove every rolled-out hook, fetch none, and report each version the
+	// pull lists as install_failed. Builtins and hand-placed hooks keep
+	// working either way.
+	//
+	// It is a tri-state for the reason Enabled is: an operator who writes
+	// `rollouts_enabled: false` refuses scripts delivered by the control
+	// plane, and defaulting must not turn that refusal back into consent.
+	RolloutsEnabled *bool `yaml:"rollouts_enabled"`
+
 	// HooksDir is the directory containing hook scripts.
 	// Default: paths.HooksDir()
 	HooksDir string `yaml:"hooks_dir"`
+
+	// RolloutHooksDir is the directory plexd installs rolled-out hooks into.
+	// AgentConfig.ApplyDefaults sets it to <data_dir>/hooks, which makes it
+	// the only source of the value. It is not a YAML key because plexd owns
+	// the directory and everything in it: the path derives from data_dir like
+	// every other file plexd persists, and pointing it at a directory an
+	// operator fills would hand plexd's cleanup the operator's files.
+	RolloutHooksDir string `yaml:"-"`
 
 	// MaxConcurrent is the maximum number of actions that can run concurrently.
 	// Must be at least 1 when enabled. Default: 5.
@@ -59,11 +78,20 @@ func (c *Config) IsEnabled() bool {
 	return *c.Enabled
 }
 
-// MarshalYAML renders the effective Enabled value so a dump of the live config
-// never reports the switch that gates remote execution as `enabled: null`.
-// config.dump is what an operator reads to audit which nodes accept
-// control-plane-driven execution, and a null there reads as "unset" — which for
-// this field reads as off, while it means on.
+// IsRolloutsEnabled returns the effective RolloutsEnabled setting: true unless
+// explicitly set to false.
+func (c *Config) IsRolloutsEnabled() bool {
+	if c.RolloutsEnabled == nil {
+		return true
+	}
+	return *c.RolloutsEnabled
+}
+
+// MarshalYAML renders the effective Enabled and RolloutsEnabled values so a
+// dump of the live config never reports a switch that gates remote execution
+// as null. config.dump is what an operator reads to audit which nodes accept
+// control-plane-driven execution and delivered scripts, and a null there reads
+// as "unset" — which for these fields reads as off, while it means on.
 func (c Config) MarshalYAML() (any, error) {
 	// plain drops the method set, so encoding it does not recurse.
 	type plain Config
@@ -72,12 +100,18 @@ func (c Config) MarshalYAML() (any, error) {
 		effective := true
 		out.Enabled = &effective
 	}
+	if out.RolloutsEnabled == nil {
+		effective := true
+		out.RolloutsEnabled = &effective
+	}
 	return out, nil
 }
 
 // ApplyDefaults sets default values for zero-valued fields.
 func (c *Config) ApplyDefaults() {
-	// Enabled is handled via IsEnabled(); nil means default true.
+	// Enabled and RolloutsEnabled are handled via IsEnabled() and
+	// IsRolloutsEnabled(); nil means default true. RolloutHooksDir derives
+	// from data_dir, so AgentConfig.ApplyDefaults sets it.
 	if c.HooksDir == "" {
 		c.HooksDir = DefaultHooksDir
 	}
