@@ -30,6 +30,7 @@ plexd requires the following API endpoints on the control plane. All endpoints u
 | 18 | `PUT` | `/v1/nodes/{node_id}/endpoint-candidates` | Local endpoint candidate reporting |
 | 19 | `GET` | `/v1/nodes/{node_id}/sessions/{session_id}/connections/{connection_id}` | ssh session connection (WebSocket upgrade) |
 | 20 | `PUT` | `/v1/nodes/{node_id}/relay-status` | Relay status report (bridges) |
+| 21 | `GET` | `/v1/nodes/{node_id}/hooks/{name}/versions/{version}` | Published hook version fetch (signed envelope and script) |
 
 ## Registration & Identity
 
@@ -223,17 +224,18 @@ fetches every edge PSK again from
 
 plexd sends its capability manifest at boot, after registration and its first
 hook scan. It sends the manifest again when a script hook is added, changed, or
-removed, when a hook's sidecar is edited or removed, and when the PlexdHook
-resources in its namespace change, within seconds of the change. A send that
-matches the manifest last accepted is skipped. There is no periodic re-send of a
-manifest the control plane holds, because every accepted PUT that carries a
-drifted hook raises another integrity alert. The one timed send is the hourly
+removed, when a hook's sidecar is edited or removed, when a pass of the rollout
+installer changes the rolled-out hooks or the rollout errors, and when the
+PlexdHook resources in its namespace change, within seconds of the change. A
+send that matches the manifest last accepted is skipped. There is no periodic
+re-send of a manifest the control plane holds, because every accepted PUT that
+carries a drifted hook raises another integrity alert. The one timed send is the hourly
 attempt after a refusal of the hook metadata, described below. See
 [Capability Announcement](../actions/remote-actions-hooks.md#capability-announcement).
 
 Each PUT is a snapshot: the control plane replaces its stored row with the body.
-An absent `declared_hooks` or `plexd_hooks` key therefore means none, never
-"unchanged".
+An absent `declared_hooks`, `plexd_hooks` or `hook_rollout_errors` key therefore
+means none, never "unchanged".
 
 **Request body** (`CapabilityManifestRequest`):
 
@@ -252,6 +254,13 @@ An absent `declared_hooks` or `plexd_hooks` key therefore means none, never
       ],
       "timeout_seconds": 300,
       "sandbox_level": "none"
+    },
+    {
+      "name": "backup-db",
+      "checksum": "REA9yHQRkMbFu76wJTDLSMvpMnUd9WeDatQzSknU1Qg=",
+      "sandbox_level": "none",
+      "source": "rollout",
+      "version": 2
     }
   ],
   "plexd_hooks": [
@@ -271,6 +280,9 @@ An absent `declared_hooks` or `plexd_hooks` key therefore means none, never
         { "name": "checksum", "type": "string", "required": true, "description": "Expected SHA-256 checksum" }
       ]
     }
+  ],
+  "hook_rollout_errors": [
+    { "name": "rotate-logs", "version": 1, "code": "collision", "detail": "hooks_dir holds a hook of this name" }
   ]
 }
 ```
@@ -280,9 +292,10 @@ An absent `declared_hooks` or `plexd_hooks` key therefore means none, never
 | `binary_version` | Yes | Agent version, non-empty after trimming |
 | `binary_checksum` | Yes | SHA-256 of the running binary: 32 bytes, standard-padded base64 |
 | `ssh_host_key_fingerprint` | No | `SHA256:<base64>` host-key fingerprint |
-| `declared_hooks` | No | Script hooks from the hooks directory, each a name, a 32-byte base64 payload digest, and what its sidecar declares; at most 128, unique names. The digest is the one the hook watcher last computed, which can differ from the executor's pin after an edit |
+| `declared_hooks` | No | Script hooks from the hooks directory and the rolled-out hooks plexd installed, each a name, a 32-byte base64 payload digest, and what its sidecar declares; at most 128, unique names. The digest is the one the hook watcher last computed, which can differ from the executor's pin after an edit. A rolled-out hook's entry also carries `source` and `version` |
 | `plexd_hooks` | No | `PlexdHook` resources in the ServiceAccount's namespace; at most 128, unique names. Absent outside Kubernetes, and absent from the first manifest when the boot list failed |
 | `builtin_actions` | No | The builtin actions the agent implements, sorted by name; at most 128 actions, at most 64 parameters each |
+| `hook_rollout_errors` | No | The published hook versions the last pull listed that plexd could not install, sorted by name; at most 64. Absent when there are none |
 
 A `declared_hooks` entry carries `name` and `checksum`, and optionally what the
 hook's sidecar declares: `description` (at most 4096 characters), `parameters`
@@ -296,6 +309,17 @@ and sit outside its digest. plexd applies the sidecar's `timeout` and `sandbox`,
 which they report as `timeout_seconds` and `sandbox_level`, when it runs the hook.
 A sidecar's content is readable by everyone who holds `read` at the
 control plane, so it must hold no secret.
+
+A hook plexd installed from a published version adds two members to its entry:
+`source`, always `rollout`, and `version`, the version installed, 1 to
+2147483647. The control plane then takes that version's published checksum as
+the hook's baseline instead of the first digest the node reported. A hand-placed
+hook's entry carries neither member; the contract reads an absent `source` as
+`local`. A `hook_rollout_errors` entry carries the `name` and `version` the pull
+listed, a `code` matching `^[a-z0-9_]{1,64}$` (plexd sends `collision`,
+`verification_failed`, `fetch_failed` or `install_failed`), and an optional
+`detail` of at most 1024 code points with no NUL. See
+[Rolled-out Hooks](../actions/remote-actions-hooks.md#error-codes).
 
 A `plexd_hooks` entry carries `name`, `image_digest` in canonical
 `sha256:<64 lowercase hex>` form, and optionally `parameters` (a string map),
@@ -327,9 +351,11 @@ entry that breaks an invariant is a `422`:
 | `400 Bad Request` | `binary_version_empty` | `binary_version` is missing or blank |
 | `400 Bad Request` | `binary_checksum_invalid` | `binary_checksum` does not decode to 32 bytes |
 | `400 Bad Request` | `ssh_host_key_fingerprint_invalid` | The fingerprint is set but not `SHA256:<base64>` |
-| `400 Bad Request` | `declared_hook_invalid` | A declared hook has an empty name or a checksum that is not 32 bytes, or its metadata breaks a limit |
+| `400 Bad Request` | `declared_hook_invalid` | A declared hook has an empty name or a checksum that is not 32 bytes, its metadata breaks a limit, its `source` is neither `local` nor `rollout`, or its `version` is missing on a `rollout` entry, set on any other, or outside 1 to 2147483647 |
 | `400 Bad Request` | `declared_hook_duplicate` | Two declared hooks share a name |
 | `400 Bad Request` | `declared_hooks_too_many` | More than 128 declared hooks, or one hook with more than 64 parameters |
+| `400 Bad Request` | `hook_rollout_errors_too_many` | More than 64 `hook_rollout_errors` entries |
+| `400 Bad Request` | `hook_rollout_error_invalid` | A `hook_rollout_errors` entry breaks a limit |
 | `401 Unauthorized` | `unauthorized`, `nsk_invalid`, `nsk_revoked` | NSK bearer credential missing, invalid, or revoked |
 | `403 Forbidden` | `node_id_mismatch` | The NSK belongs to a different node than the path |
 | `404 Not Found` | `capabilities_node_not_found` | No node row for the path |
@@ -350,10 +376,13 @@ and raises nothing, and an upgraded control plane then clears the refusal with n
 agent restart. plexd never drops the inventories to get a refused manifest
 through. See [Retries](../actions/remote-actions-hooks.md#retries).
 
-The one exception is hook metadata. A manifest that carries it and draws a `413`,
-or a `400` with `malformed_capabilities_request`, `declared_hook_invalid`, or
-`declared_hooks_too_many`, takes no backoff: it goes out again at once in a short
-form, each `declared_hooks` entry holding `name` and `checksum` alone. A control
+The one exception is hook metadata, which includes a rolled-out hook's `source`
+and `version` and the `hook_rollout_errors` list. A manifest that carries it and
+draws a `413`, or a `400` with `malformed_capabilities_request`,
+`declared_hook_invalid`, `declared_hooks_too_many`,
+`hook_rollout_errors_too_many`, or `hook_rollout_error_invalid`, takes no
+backoff: it goes out again at once in a short form, each `declared_hooks` entry
+holding `name` and `checksum` alone, with no `hook_rollout_errors`. A control
 plane that predates the metadata answers that `400 malformed_capabilities_request`
 for the unknown keys. plexd tries the wide form again when the built content
 changes and otherwise about hourly, 45 to 75 minutes with jitter, and each hourly
@@ -888,7 +917,11 @@ absence.
   "signing_key": {
     "key_id": "signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1-1767225600000000000",
     "public_key": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
-  }
+  },
+  "hooks": [
+    { "name": "backup-db", "version": 2, "checksum": "REA9yHQRkMbFu76wJTDLSMvpMnUd9WeDatQzSknU1Qg=" },
+    { "name": "rotate-logs", "version": 1, "checksum": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=" }
+  ]
 }
 ```
 
@@ -1103,6 +1136,26 @@ out removes it. A name granted moments ago can answer `403` for a few seconds:
 the control plane writes the grant's reader tuple a few seconds after the grant,
 and the pull reads the grants themselves.
 
+`hooks` lists the published hook versions the node should run, as the
+"Published hooks" section of plexsphere's agent contract
+(`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
+describes it: one entry per version a rollout assigns the node, with its `name`,
+its `version` and the `checksum` of its script, never the script itself. A
+`name` matches `^[a-z0-9][a-z0-9_-]{0,62}$`, a `version` is at least 1, and the
+`checksum` is the SHA-256 of the script as 32 bytes of standard-padded base64.
+Entries are ordered by `name` ascending. The block is the node's full desired
+set, not a delta: plexd removes a hook it rolled out whose name the block no
+longer lists, and `[]` removes every one. `null` means the control plane could
+not compute the set; plexd then keeps every hook it installed, as it does when a
+control plane older than the block leaves it out. plexd reads the block on every
+successful pull, drift or not, hands it to the rollout installer, and fetches
+each listed version it has not installed from
+[`GET /v1/nodes/{node_id}/hooks/{name}/versions/{version}`](#get-v1-nodes-node-id-hooks-name-versions-version).
+No event announces a change, so a new rollout reaches the node within one
+reconcile interval, or sooner on a triggered pull. The block is not desired state
+for the differ: the reconcile snapshot neither stores nor compares it. See
+[Rolled-out Hooks](../actions/remote-actions-hooks.md#rolled-out-hooks).
+
 ## Secrets
 
 ### GET /v1/nodes/{node_id}/secrets/{key}
@@ -1142,6 +1195,90 @@ rides in response headers rather than the body:
 | `500 Internal Server Error` | — | Server error |
 | `501 Not Implemented` | `secrets_not_provisioned` | Secret storage is not provisioned for this node |
 | `503 Service Unavailable` | `openbao_unavailable` | Secret backend temporarily unavailable |
+
+## Published Hooks
+
+### GET /v1/nodes/{node_id}/hooks/{name}/versions/{version} {#get-v1-nodes-node-id-hooks-name-versions-version}
+
+Returns one published hook version, signed, with its script. plexd calls it from
+the rollout installer for each version the [`hooks` block](#get-v1-nodes-node-id-state)
+of the state pull lists and it has not installed, one fetch at a time, each under
+a 30-second deadline. The request has no body.
+
+`api.ControlPlane.FetchHookVersion(ctx, nodeID, name, version)` checks the name
+against the grammar `^[a-z0-9][a-z0-9_-]{0,62}$` **before any request is sent**
+and returns an error wrapping `api.ErrHookNameInvalid` for a name outside it. A
+version below 1 returns
+`api: fetch hook version "<name>": version must be >= 1, got <n>`, also without
+a request. The grammar forbids every character a path escape would touch, so the
+name goes into the path as it is.
+
+**Response** (`200 OK`), a `NodeHookVersion`:
+
+```json
+{
+  "envelope": {
+    "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
+    "type": "hook_version",
+    "scope": "domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
+    "key_id": "signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1-1767225600000000000",
+    "issued_at": "2026-05-02T10:00:00Z",
+    "payload": {
+      "project_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+      "name": "backup-db",
+      "version": 1,
+      "checksum": "REA9yHQRkMbFu76wJTDLSMvpMnUd9WeDatQzSknU1Qg=",
+      "description": "Dump the application database to /var/backups.",
+      "parameters": [
+        { "name": "database", "type": "string", "description": "Database to dump." }
+      ],
+      "timeout_seconds": 600,
+      "sandbox_level": "none"
+    },
+    "signature": "…"
+  },
+  "script_base64": "IyEvYmluL3NoCnBnX2R1bXAgLUZjIGFwcCA+IC92YXIvYmFja3Vwcy9hcHAuZHVtcAo="
+}
+```
+
+The envelope has the members of a [signed event envelope](event-verification.md#envelope),
+with `type` `hook_version`, `id` the version id, `scope` the Domain of the hook's
+Project, and `issued_at` the instant the version was signed. Its payload is a
+`HookVersionPayload`: `project_id`, `name`, `version`, `checksum` in the encoding
+of the pull entry's, and `sandbox_level`, always, and `description`,
+`parameters` and `timeout_seconds` only when the version declares them. The
+script sits outside the envelope, so the signature covers its checksum rather
+than its bytes. See [API Types](api-types.md#published-hooks).
+
+The body, decompressed first when the response is gzip-encoded, is capped at
+4 MiB: a larger body returns
+`api: hook version response exceeds the 4 MiB cap`, a gzip body that inflates
+past the cap included. A body that does not
+decode returns `api: decode hook version: <cause>`. `FetchHookVersion` verifies
+nothing. The installer checks the envelope type, the pair in the payload, the
+signature with `VerifySignature`, which has no freshness window because
+`issued_at` can lie days back, and the script's SHA-256 against the payload's and
+the pull entry's checksum, before it writes anything; see
+[Verification](../actions/remote-actions-hooks.md#verification).
+
+**Errors** are RFC 9457 `application/problem+json` bodies with a machine-readable
+`code`. `FetchHookVersion` returns each as an `*api.APIError`, and the installer
+reports every failure the same way:
+
+| Status | Problem `code` | Meaning | plexd behavior |
+|---|---|---|---|
+| `200 OK` | — | The version, as above | Verified and installed, or reported `verification_failed` or `install_failed` |
+| `401 Unauthorized` | `nsk_invalid`, `nsk_revoked` | The NSK does not resolve or is revoked | Reported `fetch_failed` with the error, less its `correlation_id`, as its detail, `actions: rollout: fetch failed` logged at Warn, and fetched again on the next pass |
+| `403 Forbidden` | `node_id_mismatch` | The NSK belongs to another node than the path | As for `401` |
+| `404 Not Found` | `hook_not_assigned` | The node's desired set does not list this version of this hook, as when the node's last pull predates a rollout change | As for `401`. The next pull lists the version the rollout now names |
+| `500 Internal Server Error` | `hook_version_signature_invalid` | The stored version was changed after it was published, so its signature no longer verifies; a retry gets the same answer | As for `401` |
+| `501 Not Implemented` | `published_hooks_not_provisioned` | The control plane has not wired published hooks | As for `401` |
+| `503 Service Unavailable` | `signing_unavailable` | The version has to be signed again under the Domain's active key and the Signing Service cannot be reached | As for `401` |
+
+A transport error and the 30-second deadline are reported as `fetch_failed` too.
+There is no backoff of its own: a pass runs on each successful pull that carries
+a non-null block, and each pass fetches each listed version that is not
+installed once.
 
 ## Reports
 

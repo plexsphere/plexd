@@ -201,7 +201,8 @@ Remote action execution and hook management.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable action execution. An omitted key leaves it `true`; an explicit `false` disables execution and survives defaulting. Without a config file it defaults to `false` — see [Running without a config file](#running-without-a-config-file). |
-| `hooks_dir` | string | `/etc/plexd/hooks` (Linux) | Directory containing hook scripts. Per platform; see [Platform defaults](#platform-defaults). |
+| `rollouts_enabled` | bool | `true` | Install the hooks the control plane rolls out. An omitted key leaves it `true`, also without a config file; an explicit `false` survives defaulting and is the node owner's veto on delivered scripts: plexd removes every rolled-out hook at start, fetches none, and reports each version the pull lists as `install_failed`. Builtins and the hooks in `hooks_dir` keep working. `plexd up` reports the effective value as `rollouts_enabled` in its startup log line. See [Rolled-out Hooks](../actions/remote-actions-hooks.md#rolled-out-hooks). |
+| `hooks_dir` | string | `/etc/plexd/hooks` (Linux) | Directory containing hook scripts. Per platform; see [Platform defaults](#platform-defaults). A name it holds blocks a rollout of that name. |
 | `max_concurrent` | int | `5` | Maximum number of concurrent actions. Minimum: `1`. |
 | `max_action_timeout` | duration | `10m` | Hard ceiling on a single run. A run ends at the smallest of what is left of the dispatch's `expires_at`, the hook's declared `timeout`, and this value, so neither can lift it, and a run it cuts short fails with `action timed out: max_action_timeout <d>`. Minimum: `10s`. |
 | `max_output_bytes` | int64 | `1048576` (1 MiB) | Maximum output size per action in bytes. Minimum: `1024`. |
@@ -211,6 +212,8 @@ Earlier releases derived `enabled` from the other fields: `ApplyDefaults()` set 
 
 That heuristic is gone. `enabled` now means what it says, so a file of that shape comes up with action execution **on** after the upgrade, with no config change. If those nodes are meant to stay off, add an explicit `actions.enabled: false` before rolling the binary forward. `plexd up` reports the effective value as `actions_enabled` in its startup log line, and `config.dump` reports it under `actions.enabled`.
 :::
+
+Rolled-out hooks live in `<data_dir>/hooks`, `/var/lib/plexd/hooks` on Linux, and plexd records what it installed in `<data_dir>/hook_rollouts.json`. Neither path is a YAML key: plexd owns that directory and removes every file in it that it did not write, so `hooks_dir` must not point there. plexd counts the two as the same directory when their paths match once both are made absolute, so a relative `hooks_dir` counts, or when both exist and are one directory, reached through a symlink for instance. `plexd up` then logs `rolled-out hooks disabled` at error and runs without rolled-out hooks.
 
 Source: `internal/actions/config.go`
 
@@ -499,6 +502,7 @@ health:
 
 actions:
   enabled: true
+  rollouts_enabled: true     # false refuses hooks the control plane rolls out
   hooks_dir: /etc/plexd/hooks
   max_concurrent: 5          # min: 1
   max_action_timeout: 10m    # min: 10s

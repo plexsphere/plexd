@@ -125,7 +125,7 @@ The function uses `defer os.Remove(tmpPath)` immediately after creating the temp
 
 | Package                 | Import Path                                             | Use Case                                                                 |
 |-------------------------|---------------------------------------------------------|--------------------------------------------------------------------------|
-| `actions`               | `internal/actions`                                      | Watches the hooks directory for `HookWatcher` with `WatchDir`            |
+| `actions`               | `internal/actions`                                      | Watches the hooks directory and the rollout directory for `HookWatcher` with `WatchDir`; writes every file of the rollout directory and the record `hook_rollouts.json` for `RolloutInstaller` with `WriteFileAtomic` |
 | `registration`          | `internal/registration`                                 | Persists node identity files (`identity.json`, `private_key`, `node_secret_key`, `signing_public_key`) |
 | `integrity`             | `internal/integrity`                                    | Persists checksum store (`checksums.json`) for binary and hook verification; watches the hooks directory for `Verifier.watchHooksDir` with `WatchDir` |
 | `nodeapi`               | `internal/nodeapi`                                      | Persists cached state (reports, metadata) to disk for crash recovery     |

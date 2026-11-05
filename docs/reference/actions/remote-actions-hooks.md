@@ -98,8 +98,10 @@ Control Plane
 
 | Field              | Type            | Default | Description                              |
 |--------------------|-----------------|---------|------------------------------------------|
-| `Enabled`          | `bool`          | `true`  | Whether action execution is active       |
+| `Enabled`          | `*bool`         | `true`  | Whether action execution is active. `nil` means `true` |
+| `RolloutsEnabled`  | `*bool`         | `true`  | Whether plexd installs the hooks the control plane rolls out. `nil` means `true`; `false` is the node owner's veto ([Switches and Platforms](#switches-and-platforms)) |
 | `HooksDir`         | `string`        | `/etc/plexd/hooks` (Linux) | Directory containing hook scripts ([per platform](../core/configuration.md#platform-defaults)) |
+| `RolloutHooksDir`  | `string`        | `<data_dir>/hooks` | Directory plexd installs [rolled-out hooks](#rolled-out-hooks) into. Not a YAML key: `AgentConfig.ApplyDefaults` derives it from `data_dir` |
 | `MaxConcurrent`    | `int`           | `5`     | Max simultaneous action executions       |
 | `MaxActionTimeout` | `time.Duration` | `10m`   | Hard ceiling on a run's deadline, over the entry's `expires_at` and the hook's declared `timeout` ([Run Deadline](#run-deadline)) |
 | `MaxOutputBytes`   | `int64`         | `1 MiB` | Max output capture size per action       |
@@ -114,7 +116,7 @@ if err := cfg.Validate(); err != nil {
 }
 ```
 
-`ApplyDefaults` uses zero-value detection: on a fully zero-valued `Config`, all numeric fields being zero triggers all defaults including `Enabled = true`. If any numeric field is already set (indicating explicit construction), `Enabled` is left as-is.
+`Enabled` and `RolloutsEnabled` are tri-state: `IsEnabled()` and `IsRolloutsEnabled()` read `nil` as `true`, and `ApplyDefaults` leaves both alone, so an explicit `false` survives defaulting. `MarshalYAML` renders the effective value of each, so `config.dump` shows `enabled: true` and `rollouts_enabled: true` for an omitted key rather than `null`. `ApplyDefaults` fills an empty `HooksDir` and each limit left at zero. It never sets `RolloutHooksDir`, which `AgentConfig.ApplyDefaults` sets to `filepath.Join(data_dir, "hooks")`, `/var/lib/plexd/hooks` on Linux. The path has no YAML key because plexd removes every file in that directory it did not write, and a configurable path could point that cleanup at an operator's files.
 
 ### Validation Rules
 
@@ -232,8 +234,11 @@ Logger is tagged with `component=actions`.
 | Method            | Signature                                                                       | Description                                          |
 |-------------------|---------------------------------------------------------------------------------|------------------------------------------------------|
 | `RegisterBuiltin` | `(name, description string, params []api.ActionParam, fn BuiltinFunc)`         | Register a built-in action                           |
-| `SetHooks`        | `(hooks []api.HookInfo)`                                                        | Set the discovered hooks snapshot                    |
-| `Capabilities`    | `() ([]api.ActionInfo, []api.HookInfo)`                                         | Return registered builtins, sorted by name, and hooks for reporting |
+| `SetHooks`        | `(hooks []api.HookInfo)`                                                        | Set the snapshot of `hooks_dir`, pinning each hook not seen before |
+| `SetRolloutHooks` | `(hooks []api.HookInfo)`                                                        | Set the snapshot of the rollout directory; pins nothing ([Running a Rolled-out Hook](#running-a-rolled-out-hook)) |
+| `SwapRolloutHook` | `(name string, version int, checksum string, swap func() error) error`          | Run `swap` under the swap lock, then pin `name` to `version` and the hex `checksum`. A `swap` that succeeds also gives the hook's entry in the rollout snapshot that `checksum`. A nil `swap` pins alone; a failed one leaves the pin as it was |
+| `RemoveRolloutHook` | `(name string, remove func() error) error`                                    | Run `remove` under the swap lock, then drop the pin of `name`. A failed `remove` leaves the pin as it was |
+| `Capabilities`    | `() ([]api.ActionInfo, []api.HookInfo)`                                         | Return registered builtins, sorted by name, and the merged hook list for reporting |
 | `Execute`         | `(ctx context.Context, nodeID string, entry api.NodeStateExecution) error`      | Main entry point for action execution                |
 | `FailOrphan`      | `(ctx context.Context, nodeID, executionID string)`                             | Report a run lost to an agent restart as `failed`    |
 | `Cancel`          | `(executionID string) bool`                                                      | Stop that execution's run on a cancel request; false when no such run is active (see [Cancel](#cancel)) |
@@ -248,7 +253,7 @@ Logger is tagged with `component=actions`.
 1. **Check shutting down**: if `shuttingDown`, defer with `reason=shutting_down`
 2. **Check duplicate**: if the execution id is already active, defer with `reason=already_active`
 3. **Check concurrency**: if `len(active) >= MaxConcurrent`, defer with `reason=max_concurrent_reached`
-4. **Look up action**: the entry's `type` picks the registry — `builtin` resolves **only** against the builtins map, `hook` **only** against the discovered hooks snapshot. A mistyped entry is unresolvable rather than silently routed to the other kind
+4. **Look up action**: the entry's `type` picks the registry — `builtin` resolves **only** against the builtins map, `hook` **only** against the merged hook list, which holds the hooks in `hooks_dir` and the pinned [rolled-out hooks](#rolled-out-hooks). A mistyped entry is unresolvable rather than silently routed to the other kind
 5. **Unknown action**: reject with `reason=unknown_action`; a `type` outside `builtin`/`hook` rejects with `reason=unsupported_action_type`, because the action itself may well be registered and naming the wrong cause sends the operator auditing the action registry instead of the `type` field
 6. **Claim**: post `ExecutionCallbackRequest{Status: "ack"}` — but only when the entry's `status` is `pending`, since an entry the pull already reports at `ack` has that transition recorded and repeating it would be a non-terminal self-edge answered `409` — then post `{Status: "started"}`. Both legs run **synchronously, before the run**, under a 5s deadline for the whole handshake
 7. **Execute**: launch goroutine calling `runAction` with timeout context
@@ -315,10 +320,10 @@ The run deadline covers the integrity check too, so a declared `timeout` shorter
 ### runHook
 
 1. **Path traversal prevention**: reject names containing `/`, `\`, or `..`
-2. **Discovery-snapshot lookup**: find the hook in the discovered hooks snapshot. A hook absent from it fails the run — `Execute` already gated this, so it is the backstop for a snapshot that changed in between
-3. **File checks**: `checkHookFile(e.cfg.HooksDir, entry.Action, e.hookOwnerUID)` refuses a hook that leaves the hooks directory, is not a regular file, is not owned by root, or is group- or other-writable (see [Hook File Checks](#hook-file-checks)). A missing file, a dangling link among them, fails with `hook not found: <name>`
-4. **Integrity verification**: call `HookVerifier.VerifyHook(ctx, nodeID, hookPath, pinnedChecksum)`, where `pinnedChecksum` is the digest this process recorded the **first** time it discovered the hook — **not** a wire field, and **not** the digest `HookWatcher` last recomputed (see [Hook Integrity Pinning](#hook-integrity-pinning)). A hook the file checks refused never gets here, so a wrong owner files no integrity violation
-5. **Execute**: `exec.CommandContext` with `WaitDelay=500ms`, in a process group of its own (see [Process Group](#process-group))
+2. **Discovery-snapshot lookup**: find the hook in the merged hook list. A hook absent from it fails the run — `Execute` already gated this, so it is the backstop for a snapshot that changed in between. The entry's `Source` picks the directory and the pin: `hooks_dir` and the first-discovery pin for a hand-placed hook, the rollout directory and the delivered checksum for a rolled-out one. From this lookup until the process has started, `runHook` holds the [swap lock](#running-a-rolled-out-hook) for reading
+3. **File checks**: `checkHookFile(dir, entry.Action, e.hookOwnerUID)`, where `dir` is the directory the lookup picked, refuses a hook that leaves the hooks directory, is not a regular file, is not owned by root, or is group- or other-writable (see [Hook File Checks](#hook-file-checks)). A missing file, a dangling link among them, fails with `hook not found: <name>`
+4. **Integrity verification**: call `HookVerifier.VerifyHook(ctx, nodeID, hookPath, pinnedChecksum)`, where `pinnedChecksum` is, for a hand-placed hook, the digest this process recorded the **first** time it discovered the hook — **not** a wire field, and **not** the digest `HookWatcher` last recomputed. For a rolled-out hook it is the checksum the pull delivered for the installed version (see [Hook Integrity Pinning](#hook-integrity-pinning)). A hook the file checks refused never gets here, so a wrong owner files no integrity violation
+5. **Execute**: `exec.CommandContext` with `WaitDelay=500ms`, in a process group of its own (see [Process Group](#process-group)). `Start` runs under the swap lock, which is released once the process has started, so `Wait` and the rest of the run do not hold up a swap of the hook
 6. **Environment**: minimal env (`PATH`, `HOME`, `PLEXD_NODE_ID`, `PLEXD_EXECUTION_ID`) plus `PLEXD_PARAM_*` vars
 7. **Output capture**: stdout and stderr each captured in a buffer truncated to `MaxOutputBytes`; the joined body is truncated back to `MaxOutputBytes` so a hook saturating both streams stays within the per-action cap
 
@@ -359,6 +364,10 @@ A limit or a cancel request that lands after the script has exited, while a chil
 The pull entry carries **no** checksum, so hook trust anchors on a digest the node pins itself: the one recorded the **first** time this process discovered the hook. The pin matches the first report of the hook to the control plane only. Later reports carry the digest the watcher last computed, which can differ from the pin after an edit, and that difference is how the control plane sees the drift.
 
 The pin is what makes the check meaningful. `HookWatcher` re-hashes a hook on every write and pushes the new digest through `SetHooks`, so verifying against the live snapshot would compare a file with a hash of itself and pass for whatever bytes are on disk, including an attacker's, since the integrity callback only logs. A pin is therefore never updated and never dropped for the life of the process: a hook whose bytes change after discovery fails verification, files an integrity violation, and stays unrunnable until the agent restarts and re-attests it. That is also why a legitimately edited hook needs an agent restart before it can run again. `plexd hooks reload` is not a substitute: it re-scans the directory and moves no pin.
+
+A [rolled-out hook](#rolled-out-hooks) is pinned differently. Its pin is the checksum the pull delivered for the version plexd installed, which plexd checked against the signed payload and the fetched script before it wrote a byte, so a rolled-out hook is never trusted on first use. `SwapRolloutHook` moves the pin when plexd installs a new version, so the new version runs with no agent restart and no acceptance at the control plane. `RemoveRolloutHook` drops it when the hook is withdrawn. `SetRolloutHooks`, which the rollout directory's watcher calls, never touches it, and neither does a reload.
+
+A local edit of a rolled-out file fails verification like an edit of a hand-placed hook: the run fails with `integrity check failed for hook: <name>` and files one `hook_checksum` violation detected `pre_dispatch`. A restart does not clear it, because `Load` pins each recorded hook to the checksum the record holds rather than to the bytes on disk, and a pass does not fetch the version again while the edited script is there, because it compares the pull with that record. Deleting the edited script is the local way out: a recorded hook whose script is gone counts as not installed, so the next pass fetches the listed version again, writes the delivered bytes, and pins them to the same checksum. Otherwise the hook stays refused until the control plane rolls out another version or withdraws the hook.
 
 Upstream integrity — whether this node should run this hook at all — is the control plane's server-side dispatch gating, not a field the node re-checks.
 
@@ -423,7 +432,7 @@ type HookVerifier interface {
 }
 ```
 
-The production implementation is `integrity.Verifier`, which computes SHA-256 of the hook file and compares it against the digest plexd recorded when it discovered the hook on disk.
+The production implementation is `integrity.Verifier`, which computes SHA-256 of the hook file and compares it against the hook's pin: the digest plexd recorded when it discovered a hand-placed hook on disk, or the checksum the pull delivered for a rolled-out one.
 
 ## BuiltinFunc
 
@@ -693,14 +702,17 @@ Monitors a hooks directory for filesystem changes using `fsnotify`, and re-scans
 
 ```go
 func NewHookWatcher(hooksDir string, onChange HookChangeCallback, onIntegrity IntegrityAlertCallback, logger *slog.Logger) *HookWatcher
+func NewRolloutHookWatcher(dir string, onChange HookChangeCallback, onIntegrity IntegrityAlertCallback, logger *slog.Logger) *HookWatcher
 ```
 
 | Parameter     | Description                                          |
 |---------------|------------------------------------------------------|
-| `hooksDir`    | Directory containing hook scripts                    |
+| `hooksDir`, `dir` | Directory containing hook scripts                |
 | `onChange`    | Callback invoked with the full hooks list on change  |
 | `onIntegrity` | Callback invoked when a hook's checksum changes     |
 | `logger`      | Structured logger (`log/slog`)                      |
+
+The two constructors build the same watcher and differ in the `Source` every hook it reports carries: `local` from `NewHookWatcher`, for `hooks_dir`, and `rollout` from `NewRolloutHookWatcher`, for the directory plexd installs [rolled-out hooks](#rolled-out-hooks) into. The directory decides the source, never the file. The rollout watcher therefore reports a file copied into the rollout directory by hand as `rollout`, and the executor leaves it out of the merged list, because it has no pin.
 
 ### Callbacks
 
@@ -761,7 +773,11 @@ hookWatcher := actions.NewHookWatcher(cfg.Actions.HooksDir, func(hooks []api.Hoo
 
 When hooks change, `executor.SetHooks` is called, updating `Capabilities()` output, and `Notify` asks the [capability reporter](#capability-announcement) for a new report. Neither blocks. `SetHooks` does **not** move the integrity anchor of a hook the executor has already seen; see [Hook Integrity Pinning](#hook-integrity-pinning). `Reload` satisfies the `nodeapi.HookReloader` interface.
 
-`plexd up` runs `Reload` once before it starts anything that reads the hook list, so a dispatch the reconciler delivers does not meet an empty list, unless that scan fails or outlives its 10-second wait, and the first scan records the pins. `Watch` starts later, at step 20.
+When the rollout installer exists and `rollouts_enabled` is not `false`, `plexd up` builds a second watcher with `NewRolloutHookWatcher` for the rollout directory. Its `onChange` calls `executor.SetRolloutHooks` and `Notify`, and its integrity callback logs `hook integrity change detected` with `source` `rollout`. With rolled-out hooks refused there is no second watcher, because `Load` has emptied the directory and no pass writes to it.
+
+`plexd up` hands the node API neither watcher. It wires an adapter, `hookDirsReloader`, whose `Reload` reloads `hooks_dir` and then the rollout directory, each even when the other failed, and answers with the executor's merged list rather than either watcher's: a rolled-out file is in it only once the installer pinned it, and a hand-placed hook shadows a rolled-out hook of its name. A failure of either scan returns both errors joined, and no list.
+
+`plexd up` runs that `Reload` once before it starts anything that reads the hook list, so a dispatch the reconciler delivers does not meet an empty list, unless that scan fails or outlives its 10-second wait, and the first scan records the pins of the hand-placed hooks. One wait covers both directories. The installer's `Load` runs just before it, so the scan finds the rollout directory holding only files the record vouches for, each already pinned. Both `Watch` loops and the installer's `Run` start later, at step 20.
 
 ## Local API Endpoints
 
@@ -812,11 +828,11 @@ Status values: `success` (exit 0), `failed` (non-zero exit), `error` (internal e
 
 ### GET /v1/hooks
 
-Lists all registered hooks (subset of GET /v1/actions response).
+Lists all registered hooks (subset of GET /v1/actions response): the executor's merged list, sorted by name. A rolled-out entry carries `"source": "rollout"` and the `version` it was installed from; a hand-placed entry carries `"source": "local"` and no `version` key.
 
 ### POST /v1/hooks/reload
 
-Re-scans the hooks directory via the `HookReloader` interface (satisfied by `HookWatcher.Reload()`) and returns the resulting list. The route takes no input. It hashes every hook file, so it keeps the guards every route has: the socket's permissions, and the bearer token on the optional HTTP listener.
+Re-scans `hooks_dir` and, while rolled-out hooks are on, the rollout directory via the `HookReloader` interface (satisfied by `plexd up`'s `hookDirsReloader`, see [Integration with Executor](#integration-with-executor)) and returns the executor's merged list. The route takes no input. It hashes every hook file, so it keeps the guards every route has: the socket's permissions, and the bearer token on the optional HTTP listener.
 
 **Response:**
 
@@ -832,7 +848,7 @@ Re-scans the hooks directory via the `HookReloader` interface (satisfied by `Hoo
 | Status | Condition | Body |
 |--------|-----------|------|
 | `200`  | Scan finished | `status` and `hooks` as above |
-| `500`  | The directory could not be read; the list stays as it was | `{"error": "actions: watcher: scan <dir>: <cause>"}` |
+| `500`  | A directory could not be read; its list stays as it was | `{"error": "actions: watcher: scan <dir>: <cause>"}`, one line per directory that failed |
 | `503`  | No reloader is wired in | `{"error": "hook reloader not available"}` |
 
 ## CLI Commands
@@ -847,7 +863,15 @@ Runs an action via `POST /v1/actions/run`. Accepts `--param key=value` flags for
 
 ### plexd hooks list
 
-Lists hooks via `GET /v1/hooks`. Shows NAME, SOURCE, CHECKSUM (truncated to 12 chars), and DESCRIPTION.
+Lists hooks via `GET /v1/hooks`. Shows NAME, SOURCE, VERSION, CHECKSUM (truncated to 12 chars), and DESCRIPTION. SOURCE is `local` for a hand-placed hook and `rollout` for a [rolled-out hook](#rolled-out-hooks). VERSION is the published version a rolled-out hook was installed from, and empty for a hand-placed hook:
+
+```text
+NAME       SOURCE   VERSION  CHECKSUM         DESCRIPTION
+backup-db  rollout  2        44403dc87411...  Dump the application database
+deploy     local             9f86d081884c...  Deploy
+```
+
+The list shows what the executor runs, not what the control plane asked for: a version plexd could not install is reported to the control plane in `hook_rollout_errors` and does not appear here.
 
 ### plexd hooks verify
 
@@ -855,14 +879,14 @@ Reads hooks via `GET /v1/hooks` and checks that each hook has a checksum. Report
 
 ### plexd hooks reload
 
-Re-scans the hooks directory via `POST /v1/hooks/reload`. Prints the status and the hook count:
+Re-scans `hooks_dir` and, while rolled-out hooks are on, the rollout directory via `POST /v1/hooks/reload`. Prints the status and the hook count of the executor's merged list:
 
 ```text
 Status: reloaded
 Hooks:  2
 ```
 
-A `500` makes the command exit non-zero with `plexd hooks reload: unexpected status 500: ...`. A reload moves no pin: an edited hook runs again after an agent restart, not after a reload.
+A `500` makes the command exit non-zero with `plexd hooks reload: unexpected status 500: ...`. A reload moves no pin: an edited hand-placed hook runs again after an agent restart, not after a reload, and an edited rolled-out hook runs again as [Hook Integrity Pinning](#hook-integrity-pinning) describes.
 
 ## DiscoverHooks
 
@@ -933,6 +957,200 @@ A dispatch of a hook reads its sidecar from disk, not from the hook list, becaus
 `<value>` is the sidecar's value cut to its first 64 characters and printed as a quoted Go string. A sidecar value has no length limit at this point, and the control plane answers `400` to an `error` over 4096 characters, which would strand the execution at `started`. The quoting also escapes a NUL, which a JSON string can carry.
 
 Every refusal walks the claim first, so the control plane sees `ack`, `started`, and `failed`, the sequence an integrity failure shows. The hook stays listed, and plexd logs `hook refused` at warn with the same error. A fixed sidecar takes effect on the next dispatch with no agent restart, because a sidecar sits outside the hook's digest and the run reads it each time.
+
+## Rolled-out Hooks
+
+A Project can publish a script hook at the control plane as signed, numbered versions and roll one version out to a node. The pull's [`hooks` block](../core/api-endpoints.md#get-v1-nodes-node-id-state) lists the versions the node should run, and `actions.RolloutInstaller` (`internal/actions/rollout.go`) converges on it: it fetches each listed version it has not installed with the node's NSK, verifies the Domain signature and the checksum, installs the script into a directory plexd owns, and removes the rolled-out hooks the block no longer lists. The wire is the "Published hooks" section of plexsphere's agent contract (`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere).
+
+A rolled-out hook's pin is the checksum the pull delivered, not the digest plexd first saw on disk. A new version therefore runs without an agent restart, and a local edit of a rolled-out file fails the pre-dispatch check and files an integrity violation, as an edit of a hand-placed hook does (see [Hook Integrity Pinning](#hook-integrity-pinning)).
+
+```go
+func NewRolloutInstaller(cfg Config, dataDir, nodeID string, fetcher HookVersionFetcher, verifier HookSignatureVerifier, executor *Executor, logger *slog.Logger) (*RolloutInstaller, error)
+```
+
+| Parameter  | Description |
+|------------|-------------|
+| `cfg`      | Actions configuration. `RolloutHooksDir` is the rollout directory, `HooksDir` the directory a [collision](#collision) is checked against |
+| `dataDir`  | Directory of the record, `hook_rollouts.json` |
+| `nodeID`   | Node the versions are fetched for |
+| `fetcher`  | `HookVersionFetcher`, `FetchHookVersion(ctx, nodeID, name, version)`. `*api.ControlPlane` satisfies it |
+| `verifier` | `HookSignatureVerifier`, `VerifySignature(env api.Envelope) error`. `*api.Ed25519Verifier` satisfies it |
+| `executor` | The executor the installer pins each installed hook in |
+| `logger`   | Structured logger, tagged `component=actions` |
+
+The constructor returns an error for an empty `RolloutHooksDir` or `dataDir`, a nil `fetcher`, `verifier` or `executor`, and a rollout directory that is `HooksDir`: the same path once both are made absolute and cleaned, so a relative `HooksDir` counts, or, when both exist, the same directory by `os.SameFile` on what `os.Stat` returns, which follows a symlink. It refuses that directory because the installer removes every file it did not write from its directory, which there would be the operator's hand-placed hooks. `plexd up` logs the error as `rolled-out hooks disabled` and runs on without rolled-out hooks: builtins and hand-placed hooks are unaffected, no pull's `hooks` block is read, and the manifest carries no `hook_rollout_errors`.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `Load` | `() error` | Restore what the installer put on disk before this process started (see [Load at Start](#load-at-start)) |
+| `Handle` | `(ctx context.Context, desired *api.NodeStateSnapshot)` | A `reconcile.DispatchHandler`: hand the pull's `hooks` block to `Run` and return |
+| `Run` | `(ctx context.Context) error` | Run one [pass](#the-pass) per block handed over; returns nil when `ctx` ends |
+| `Errors` | `() []api.HookRolloutError` | The rollout errors of the last pass, a copy, or nil when there are none |
+| `SetOnChange` | `(fn func())` | Register `fn`, called on `Run`'s goroutine after a pass that changed the installed hooks or the errors |
+
+### Directory and Record
+
+| Path | Mode | Content |
+|------|------|---------|
+| `<data_dir>/hooks/` | `0755` | The rollout directory, `RolloutHooksDir`: `/var/lib/plexd/hooks` on Linux, created by `Load` and again by each install |
+| `<data_dir>/hooks/<name>` | `0755` | The script, the bytes the fetch delivered |
+| `<data_dir>/hooks/<name>.json` | `0644` | A sidecar in plexd's own [format](#sidecar-metadata-format), built from the signed payload: `description`, `parameters`, `timeout` as `"<timeout_seconds>s"` when `timeout_seconds` is above 0, and `sandbox` `"none"`. An empty field is left out |
+| `<data_dir>/hook_rollouts.json` | `0600` | The record of what the installer put into the directory: `{"hooks":[{"name":"backup-db","version":2,"checksum":"<64 lowercase hex>"}]}`, sorted by name, the checksum being the delivered one in hex |
+
+Every file goes through `fsutil.WriteFileAtomic`, a temporary `.tmp-<name>-<random>` file in the same directory renamed into place, so no reader sees a partial file. Under the systemd unit `plexd install` writes, `data_dir` is among the `ReadWritePaths`, so plexd can write the directory with no unit change.
+
+plexd owns the rollout directory. Only the installer writes there, and `Load` removes every file it did not write. A subdirectory is left alone.
+
+The installer compares the pull with its record, never with the bytes on disk. A recorded hook at the listed version and checksum whose script exists counts as installed, even when the script was edited, and a recorded hook whose script is gone counts as not installed and is fetched again. A record that cannot be read or decoded, or that holds a name outside the grammar, a version below 1, a checksum that is not a lowercase hex SHA-256 digest, or a name twice, is logged as `actions: rollout: record unreadable; starting empty` and treated as empty: `Load` then removes the files it no longer vouches for, and the next pass fetches the listed versions again. A missing record is an empty one and logs nothing.
+
+### Load at Start
+
+`plexd up` calls `Load` once, after it built the rollout watcher and before the boot hook scan, so the scan finds only recorded files and each is already pinned. `Load` does this:
+
+1. Read the record.
+2. Drop each entry whose script is missing.
+3. Pin each remaining entry to its recorded version and checksum through `SwapRolloutHook` with a nil swap, which touches no file.
+4. Save the record when step 2 dropped an entry.
+5. Create the rollout directory with mode `0755`.
+6. Remove every file of the directory that is neither a recorded script nor its sidecar, which covers the `.tmp-*` leftovers of a write a crash interrupted, and log `actions: rollout: stray file removed` for each.
+
+With `rollouts_enabled: false` it removes every recorded hook and every other file of the directory instead, pins nothing, and saves an empty record. It does not create the directory. A recorded hook it cannot remove logs `actions: rollout: hook not removed` and still leaves the record, so no pass tries the removal again: the stray cleanup of the same `Load` tries once more, and so does every later start, each logging `actions: rollout: stray file not removed` while the removal fails. Nothing pins such a file, so it cannot run. On Windows it does nothing.
+
+`Load` returns an error when the rollout directory cannot be created or read. `plexd up` logs it as `actions: rollout: load failed` and keeps starting. Every later pass creates the directory again before an install, or reports `install_failed` while it cannot.
+
+### The Pass
+
+`Handle` runs on the reconcile goroutine, on every successful pull, and fetches nothing. A pull whose `hooks` block is `null`, or a control plane that predates the block and leaves it out, logs `actions: rollout: pull carried no hooks block; keeping rolled-out hooks` at Debug and changes nothing: no pass runs, nothing is removed, and the rollout errors stay as they were. Any other block, `[]` included, is copied into a one-slot pending field, and `Handle` signals `Run` without blocking. `Run` takes the newest pending block for each signal, so blocks handed over while a pass runs collapse into one next pass. The fetches therefore never hold back the rest of the reconcile cycle, the `executions` block among it. A dispatch cannot name a rolled-out hook before the manifest reports it, so a version installed after the dispatches of the same cycle loses nothing.
+
+A pass converges on the block, which is the node's full desired set, in four steps.
+
+**1. Entry validation.** An entry whose name is outside `^[a-z0-9][a-z0-9_-]{0,62}$` (`invalid name`), whose version is below 1 (`invalid version`), or whose name an earlier entry already used (`duplicate name`) is dropped and logged as `actions: rollout: entry dropped` with `name`, `version` and `reason`, once, and not again until the set of dropped entries changes. It gets no rollout error, because the control plane refuses such an error, and with it the whole manifest. A dropped entry whose name is on the grammar still counts as listed in step 2, so it keeps an installed hook of that name. An entry whose `checksum` does not decode to 32 bytes of standard base64 gets `verification_failed` with the detail `pull entry checksum is not 32 bytes of standard base64`, fetches nothing, and keeps whatever is installed under its name.
+
+**2. Removals.** Every recorded hook whose name the block does not list is removed first, so a withdrawn hook stops running even when the fetches take the rest of the pass. `RemoveRolloutHook` deletes the script, then the sidecar (one already gone is not a failure), then drops the pin, and the installer then drops the record entry and saves the record. plexd logs `actions: rollout: hook removed` with `name` and `version`. A failed unlink logs `actions: rollout: hook not removed`, keeps the pin and the record entry, and is tried again on the next pass. A run that started before the removal keeps its process; a later dispatch of the name is rejected with `unknown_action`.
+
+**3. Per-entry decision.** For each entry that step 1 neither dropped nor failed, in block order, the first rule that matches wins:
+
+| # | Rule | Outcome |
+|---|------|---------|
+| 1 | The node runs Windows | `install_failed`, `script hooks are not supported on Windows` |
+| 2 | `actions.rollouts_enabled` is `false` | `install_failed`, `rolled-out hooks are disabled on this node` |
+| 3 | `os.Lstat(<hooks_dir>/<name>)` finds an entry | `collision`, `hooks_dir holds a hook of this name`. A recorded copy of the name is removed as in step 2, and plexd logs `actions: rollout: name collision with hooks_dir`. See [Collision](#collision) |
+| 3 | `os.Lstat` fails with any error but "does not exist" | `install_failed`, `check hooks_dir: <error>` |
+| 4 | The record holds the name at the listed version, its checksum equals the pull checksum, and the script exists | Installed: nothing happens |
+| 5 | `actions.enabled` is `false` | `install_failed`, `actions are disabled on this node` |
+| 6 | The fetch fails | `fetch_failed`, with the error text less its `correlation_id` as the detail, and `actions: rollout: fetch failed` logged |
+| 7 | A [verification](#verification) check fails | `verification_failed`, with the check named, `actions: rollout: verification failed` logged at Error, and nothing written |
+| 8 | The payload's `sandbox_level` is neither empty nor `none` | `install_failed`, `sandbox level "<level>" is not implemented` |
+| 8 | The payload's `timeout_seconds` is outside 0 to 86400 | `install_failed`, `timeout_seconds <n> is outside the range 0 to 86400` |
+| 9 | The install fails | `install_failed`, with the error text, and `actions: rollout: install failed` logged |
+| 9 | Otherwise | Installed, and `actions: rollout: hook installed` logged with `name` and `version` |
+
+The fetch runs under a 30-second deadline of its own. Every way it fails reads `fetch_failed`: a transport error, the deadline, a body over the 4 MiB cap or one that is not JSON, and each problem answer, such as `404 hook_not_assigned`, `500 hook_version_signature_invalid` or `503 signing_unavailable`. The detail is the error's text, so `api: HTTP 404 (hook_not_assigned): <message>` names the problem code. It leaves out the ` (correlation_id=<id>)` a problem answer appends to that text: the control plane gives every request a new id, so with it a fetch that keeps failing the same way would change the rollout errors on every pass and send the manifest again each time. The `actions: rollout: fetch failed` line keeps the id in its `error`.
+
+The install creates the rollout directory, then calls `SwapRolloutHook` with a swap that writes the sidecar and then the script, so the executor sees the new pin only once both files are in place (see [Running a Rolled-out Hook](#running-a-rolled-out-hook)). It then records the version and saves the record. A failure in the swap leaves the previous version pinned and runnable. A write that failed after the sidecar landed leaves the new sidecar beside the old script, and the next pass repeats the install. `fsutil.WriteFileAtomic` renames the script into place before it syncs the directory, so a script write can fail after the new bytes landed, at that sync. The install then hashes the file, and when it holds the delivered checksum it logs `actions: rollout: script written but not synced` at Warn and goes on: the version is pinned, recorded, and logged as installed, because the old pin would refuse the new bytes at every dispatch as tampered. Any other failed script write fails the install. A record that cannot be saved logs `actions: rollout: record not saved` at Error and keeps the record in memory and the pin, so the hook runs; the end of every pass tries the save again until it lands.
+
+**4. Errors.** The pass replaces the rollout errors with its own, sorted by name. Past 64 it keeps the first 64 and logs `actions: rollout: too many rollout errors; reporting the first by name` with `errors` and `reported`. Each detail has every NUL replaced with U+FFFD and is cut to 1024 code points, because a detail often carries an error text from the network or the file system and an error the control plane cannot store would cost the whole manifest. An entry that was installed, or is installed now, has no error, so a fixed rollout clears its error on the next pass. A pass cut short because the agent stops leaves the errors as they were.
+
+A pass that changed the installed hooks or the errors calls the `SetOnChange` function. The one `plexd up` registers rescans the rollout directory, which hands the new files to the executor, and calls the reporter's `Notify`, so a change to the errors alone also reaches the manifest. The manifest carries the errors in [`hook_rollout_errors`](#data-model).
+
+A pass makes at most one fetch for each listed entry that is not installed, one at a time. Each successful pull that carries a non-null block starts a pass, or joins the next one while a pass runs: every `reconcile.interval` (60 s by default) and each triggered pull. A failing entry is tried again on each pass, with no backoff of its own.
+
+### Verification
+
+A fetched version is installed only when all of these hold, checked in this order. The first that fails ends the entry with `verification_failed`, a detail that names the check, and `actions: rollout: verification failed` at Error, and nothing is written:
+
+| Check | Detail on failure |
+|-------|-------------------|
+| The envelope's `type` is `hook_version` | `envelope type "<type>" is not hook_version` |
+| The payload decodes into `api.HookVersionPayload` | `payload does not decode: <cause>` |
+| The payload's `name` and `version` are the pair plexd fetched | `payload names "<name>" version <v>, not the fetched "<name>" version <v>` |
+| `VerifySignature` accepts the envelope | `signature: <cause>`, such as `signature: api: verifier: unknown signing key id` |
+| `script_base64` decodes as standard base64 | `script_base64 does not decode: <cause>` |
+| The payload's `checksum` decodes to 32 bytes of standard base64 | `payload checksum: <cause>` |
+| The SHA-256 of the script equals the payload's `checksum` | `script SHA-256 does not match the payload checksum` |
+| The payload's `checksum` equals the pull entry's `checksum` | `payload checksum does not match the pull checksum` |
+
+`VerifySignature` is the signature check of [event verification](../core/event-verification.md#verifysignature) without its freshness window. A version's `issued_at` is the instant it was signed, often days before the fetch, so the 5-minute window would refuse every version. It selects the key by the envelope's `key_id` as event verification does: the current key, or the previous key while its rotation grace window is open. The signing-key dispatch handler, which runs first in every reconcile cycle, installs the pull's `signing_key` into the same verifier, so a version fetched after a key rotation verifies under the key the pull handed out. What keeps an old version from being installed is the pull, which names the version and the checksum the script has to match.
+
+A version that fails verification is reported as a rollout error only. plexd sends no `POST /v1/nodes/{node_id}/integrity-violations` for it, because that operation's `detected_by` has no value for a fetch, and nothing reached the disk. The payload's `project_id` is not checked: the Domain signature already binds the version to the Domain.
+
+### Error Codes
+
+The manifest's `hook_rollout_errors` holds one `api.HookRolloutError` per listed version plexd could not install: the `name` and `version` the pull listed, a `code`, and a `detail`.
+
+| `code` | plexd reports it when | `detail` |
+|--------|-----------------------|----------|
+| `collision` | `hooks_dir` holds an entry of the name | `hooks_dir holds a hook of this name` |
+| `verification_failed` | The pull entry's checksum is not a SHA-256 digest, or a fetched version fails a [check](#verification) | `pull entry checksum is not 32 bytes of standard base64`, or the failed check |
+| `fetch_failed` | The fetch returned an error | The error's text, without the `correlation_id` of a problem answer |
+| `install_failed` | The platform or the configuration refuses rolled-out hooks, `hooks_dir` cannot be checked, the payload declares what plexd cannot apply, or a write failed | `script hooks are not supported on Windows`, `rolled-out hooks are disabled on this node`, `actions are disabled on this node`, `check hooks_dir: <error>`, `sandbox level "<level>" is not implemented`, `timeout_seconds <n> is outside the range 0 to 86400`, or the write's error |
+
+An entry step 1 dropped gets no error, and an entry that is installed has none.
+
+### Running a Rolled-out Hook
+
+The rollout watcher reports the files of the rollout directory to `Executor.SetRolloutHooks`, and the executor merges them with the hand-placed hooks into the one list `Capabilities()`, `Execute` and the manifest use:
+
+- Every hand-placed hook is in it, with `Source` `local`.
+- A rolled-out file is in it only while it has a pin and no hand-placed hook uses its name. Its entry carries `Source` `rollout` and the `Version` of its pin. A file with no pin, a leftover or one an account other than plexd wrote, is not listed and cannot be dispatched.
+- The list is sorted by name and recomputed on every change to either snapshot or to a pin.
+
+An install that wrote new bytes also gives the hook's entry in the rollout snapshot, when it has one, the delivered checksum along with the pin. The merged entry, and with it the manifest, therefore moves to the new version and its digest together, instead of pairing the new version with the old file's digest until the rollout watcher rescans, which the control plane would read as drift. The watcher's next scan confirms that digest or shows an edit, and the entry's sidecar fields catch up at that scan. `Load`'s pin of a recorded hook writes nothing and leaves the snapshot alone.
+
+A dispatch of a rolled-out hook reads its sidecar and its script from the rollout directory and verifies the script against the delivered checksum. The [file checks](#hook-file-checks) apply as to a hand-placed hook, so the script and its sidecar must be owned by uid 0. A plexd that runs as another user installs files it owns itself, and each dispatch of them is refused with `hook refused: <name>.json is owned by uid <uid>, not root`: a rolled-out hook always has a sidecar, and the sidecar is checked first.
+
+`SwapRolloutHook` and `RemoveRolloutHook` hold the executor's swap lock for writing from the first file they touch until the pin is updated. `runHook` holds it for reading from the pin read through the file checks, the verification, and the process start, and releases it before it waits for the process. A dispatch that races an upgrade therefore verifies the old bytes against the old pin or the new bytes against the new pin, never a mix that would file a false tamper alert, and a swap never waits for a run that may last hours. The lock covers the integrity violation report a failed verification sends, which the run's context bounds. The sidecar is read before the lock is taken, so a dispatch that races an upgrade can start the new version under the old version's timeout; the next dispatch reads the new one.
+
+### Collision
+
+A name that `hooks_dir` holds blocks a rollout of that name. Any directory entry counts, found by `os.Lstat`, a dangling link and a directory included: the executor and the manifest prefer the hand-placed hook, so a rolled-out copy would never run, and removing the operator's entry is not plexd's call. For such an entry plexd fetches nothing, removes its own rolled-out copy of the name if it has one, reports `collision`, and logs `actions: rollout: name collision with hooks_dir` on every pass. The manifest lists the hand-placed hook as `local`, with no `source` key and its own digest.
+
+A hand-placed hook that appears after a rollout installed its name takes over at once in the merged list, and the next pass removes the rolled-out copy. Once the hand-placed hook is gone, the next pass fetches and installs the listed version.
+
+### Switches and Platforms
+
+| Condition | Effect |
+|-----------|--------|
+| `actions.rollouts_enabled: false`, or `PLEXD_ACTIONS_ROLLOUTS_ENABLED=false` | The node owner's veto on delivered scripts. `Load` removes every rolled-out hook and every other file of the rollout directory and saves an empty record, `plexd up` builds no rollout watcher, and no version is fetched. Each listed version is reported `install_failed` with `rolled-out hooks are disabled on this node`. Builtins and hand-placed hooks keep working |
+| `actions.enabled: false` | No version is fetched, and each listed version that is not installed is reported `install_failed` with `actions are disabled on this node`. An installed hook stays at its version and a withdrawn one is still removed, but none runs, because every dispatch is rejected with `actions_disabled` |
+| Windows | Script hooks do not run there. `Load` does nothing, and each listed version is reported `install_failed` with `script hooks are not supported on Windows`, with no fetch |
+
+The rules apply in the order of the [decision table](#the-pass): Windows first, then the veto, then a collision, then an installed version, then `actions.enabled`. `plexd up` logs the effective `rollouts_enabled` on its `starting plexd` line, and `config.dump` reports it under `actions.rollouts_enabled`. plexd reads both switches at start, so a change takes effect on the next start.
+
+### Rollout Log Lines
+
+The installer's lines carry `component=actions`. The lines `plexd up` logs for it carry no component.
+
+| Message | Level | Attributes | Meaning |
+|---|---|---|---|
+| `actions: rollout: hook installed` | Info | `name`, `version` | A version was installed and pinned |
+| `actions: rollout: hook removed` | Info | `name`, `version` | A withdrawn hook, a collision's copy, or a hook `Load` removed under the veto |
+| `actions: rollout: stray file removed` | Info | `file` | `Load` removed a file of the rollout directory the record does not vouch for |
+| `actions: rollout: pull carried no hooks block; keeping rolled-out hooks` | Debug | | A pull carried a `null` block; no pass ran |
+| `actions: rollout: entry dropped` | Warn | `name`, `version`, `reason` | An entry with an invalid name or version, or a repeated name. Logged once until the set of dropped entries changes |
+| `actions: rollout: name collision with hooks_dir` | Warn | `name`, `version` | `hooks_dir` holds the name. Logged on every pass |
+| `actions: rollout: fetch failed` | Warn | `name`, `version`, `error` | The fetch failed; the entry reads `fetch_failed` |
+| `actions: rollout: install failed` | Warn | `name`, `version`, `error` | A verified version could not be written |
+| `actions: rollout: script written but not synced` | Warn | `name`, `version`, `error` | The script's write failed after its new bytes landed, at the directory sync. The file holds the delivered checksum, so the version is pinned and installed all the same |
+| `actions: rollout: hook not removed` | Warn | `name`, `version`, `error` | A removal failed. A pass keeps the pin and the record entry and tries again on the next pass. Under the veto `Load` logs it for a recorded hook it could not remove, and no pass tries again: the stray cleanup does, in the same `Load` and at every later start ([Load at Start](#load-at-start)) |
+| `actions: rollout: stray file not removed` | Warn | `file`, `error` | `Load` could not remove a stray file |
+| `actions: rollout: record unreadable; starting empty` | Warn | `error` | The record could not be read, decoded, or trusted |
+| `actions: rollout: too many rollout errors; reporting the first by name` | Warn | `errors`, `reported` | More than 64 errors |
+| `actions: rollout: verification failed` | Error | `name`, `version`, `error` | A fetched version failed a check and was not installed |
+| `actions: rollout: record not saved` | Error | `error` | The record could not be written; the hooks stay pinned and the save is tried again |
+| `rolled-out hooks disabled` | Error | `error` | `NewRolloutInstaller` refused the configuration |
+| `actions: rollout: load failed` | Error | `error` | `Load` could not create or read the rollout directory |
+| `rolled-out hook rescan failed` | Warn | `error` | The rescan of the rollout directory after a pass failed |
+| `rolled-out hook watcher stopped` | Error | `error` | The rollout directory's watch ended |
+| `hook integrity change detected` | Warn | `hook`, `source`, `old_checksum`, `new_checksum` | The rollout watcher computed a new digest for a file; `source` is `rollout` |
+
+### Downgrade
+
+An older plexd leaves `<data_dir>/hooks` on disk, unrun. It neither watches that directory nor reads `hook_rollouts.json`, ignores the pull's `hooks` block, and never fetches a version. After a downgrade, every rolled-out hook therefore stops running: it leaves the manifest, and a dispatch of its name is rejected with `unknown_action`. Nothing removes the files. A release that implements rollouts restores the hooks from the record at its next start, each pinned to the checksum it was delivered with, and its first pass converges on the block the pull then carries.
+
+To leave nothing behind, start the newer release once with `actions.rollouts_enabled: false` before the downgrade: `Load` then removes every rolled-out hook and every other file of the rollout directory and saves an empty record.
+
+A control plane that predates published hooks never sends the block, so the installer runs no pass and keeps whatever it installed. Such a control plane refuses the `source`, `version` and `hook_rollout_errors` keys, and plexd falls back to the short manifest, in which a rolled-out hook reads as `local`; see [When Hook Metadata Is Refused](#when-hook-metadata-is-refused).
 
 ## Parameter Passing
 
@@ -1114,6 +1332,7 @@ type CapabilityManifestRequest struct {
     DeclaredHooks         []DeclaredHook        `json:"declared_hooks,omitempty"`
     PlexdHooks            []DiscoveredPlexdHook `json:"plexd_hooks,omitempty"`
     BuiltinActions        []ActionInfo          `json:"builtin_actions,omitempty"`
+    HookRolloutErrors     []HookRolloutError    `json:"hook_rollout_errors,omitempty"`
 }
 ```
 
@@ -1124,21 +1343,31 @@ type CapabilityManifestRequest struct {
 - `api.NodeStateExecution` is the pull entry the dispatcher consumes
 - `api.ControlPlane.ExecutionCallback` and `UploadExecutionOutput` are the production implementations of `ActionReporter`
 - `api.ControlPlane.UpdateCapabilities` is the production implementation of `agent.CapabilityClient`, through which the capability reporter sends the manifest
+- `api.NodeStateHook` is the entry of the pull's `hooks` block the rollout installer consumes, and `api.HookRolloutError` the entry it reports back in the manifest
+- `api.ControlPlane.FetchHookVersion` is the production implementation of `HookVersionFetcher`, and `api.Ed25519Verifier.VerifySignature` of `HookSignatureVerifier`; both serve the [rollout installer](#rolled-out-hooks)
 
 ### With internal/integrity
 
 - `integrity.Verifier` implements `HookVerifier` for SHA-256 hook verification
 - `integrity.HashFile` is used by `DiscoverHooks` for computing hook checksums
+- `integrity.HexChecksum` decodes the wire checksum a pull entry and a hook version payload carry into the hex form `HashFile` returns, so the installer pins and compares a delivered digest the way a computed one is
+
+### With internal/fsutil
+
+- `fsutil.WriteFileAtomic` writes every file of the rollout directory and the record, so no reader sees a partial script, sidecar, or record
 
 ### With internal/reconcile
 
 `Dispatcher.Handle` satisfies `reconcile.DispatchHandler` and is registered with `RegisterDispatchHandler`, so it runs after every successful state pull and before the diff. The `action_request` SSE event is registered on the shared `triggerReconcile` closure instead, alongside `node_state_updated` and the peer family.
 
+`RolloutInstaller.Handle` is a dispatch handler too. `plexd up` registers it after the node API's `SecretIndexDispatchHandler` and before `Dispatcher.Handle`, and only when the installer was built. It hands the `hooks` block to the installer's own goroutine and returns, so the fetches never hold back the `executions` block. The reconcile snapshot neither stores nor diffs the `hooks` block.
+
 ## Lifecycle
 
 ```go
-// 1. Create config
-cfg := actions.Config{HooksDir: "/etc/plexd/hooks"}
+// 1. Create config. RolloutHooksDir has no YAML key: AgentConfig.ApplyDefaults
+//    derives it from data_dir, and Config.ApplyDefaults leaves it alone
+cfg := actions.Config{HooksDir: "/etc/plexd/hooks", RolloutHooksDir: filepath.Join(dataDir, "hooks")}
 cfg.ApplyDefaults()
 
 // 2. Create executor
@@ -1160,37 +1389,87 @@ exec.RegisterBuiltin("mesh.reconnect", "Reconnect mesh", nil, actions.MeshReconn
 exec.RegisterBuiltin("config.dump", "Dump config", nil, actions.ConfigDump(configProvider))
 exec.RegisterBuiltin("logs.snapshot", "Snapshot logs", snapshotParams, actions.LogsSnapshot(logProvider))
 
-// 4. Register the dispatcher on the reconciler; it consumes the pull's
-//    executions block on every successful cycle
+// 4. Create the rollout installer. signingVerifier is the *api.Ed25519Verifier
+//    that checks envelopes. An error leaves rolled-out hooks off and installer
+//    nil, not the agent
+installer, err := actions.NewRolloutInstaller(cfg, dataDir, nodeID, client, signingVerifier, exec, logger)
+if err != nil {
+    logger.Error("rolled-out hooks disabled", "error", err)
+}
+
+// 5. Register the installer's Handle and then the dispatcher on the
+//    reconciler. Handle only hands the pull's hooks block to installer.Run;
+//    the dispatcher consumes the executions block on every successful cycle
+if installer != nil {
+    reconciler.RegisterDispatchHandler(installer.Handle)
+}
 dispatcher := actions.NewDispatcher(exec, nodeID, logger)
 reconciler.RegisterDispatchHandler(dispatcher.Handle)
 
-// 5. Create the capability reporter; buildManifest reads exec.Capabilities()
+// 6. Create the capability reporter; buildManifest reads exec.Capabilities()
+//    and installer.Errors()
 reporter := agent.NewCapabilityReporter(nodeID, client, buildManifest, logger)
 
-// 6. Create hook watcher (replaces one-time DiscoverHooks)
+// 7. Create the hook watchers (they replace one-time DiscoverHooks): one for
+//    hooks_dir, and one for the rollout directory while rolled-out hooks are on
 watcher := actions.NewHookWatcher(cfg.HooksDir, func(hooks []api.HookInfo) {
     exec.SetHooks(hooks)
     reporter.Notify()
 }, onIntegrityAlert, logger)
+var rolloutWatcher *actions.HookWatcher
+if installer != nil && cfg.IsRolloutsEnabled() {
+    rolloutWatcher = actions.NewRolloutHookWatcher(cfg.RolloutHooksDir, func(hooks []api.HookInfo) {
+        exec.SetRolloutHooks(hooks)
+        reporter.Notify()
+    }, onRolloutIntegrityAlert, logger)
+}
 
-// 7. Scan once, so the executor's hook list and the boot manifest hold the
-//    hooks on disk before anything reads them
-if _, err := watcher.Reload(); err != nil {
+// 8. After a pass that changed the installed hooks or the rollout errors,
+//    rescan the rollout directory and notify the reporter
+if installer != nil {
+    installer.SetOnChange(func() {
+        if rolloutWatcher != nil {
+            if _, err := rolloutWatcher.Reload(); err != nil {
+                logger.Warn("rolled-out hook rescan failed", "error", err)
+            }
+        }
+        reporter.Notify()
+    })
+}
+
+// 9. Restore the rolled-out hooks from the record, each pinned to its
+//    delivered checksum, then scan both directories once, so the executor's
+//    hook list and the boot manifest hold the hooks on disk before anything
+//    reads them. hookDirsReloader is plexd up's adapter over both watchers
+if installer != nil {
+    if err := installer.Load(); err != nil {
+        logger.Error("actions: rollout: load failed", "error", err)
+    }
+}
+hookDirs := &hookDirsReloader{local: watcher, rollout: rolloutWatcher, executor: exec}
+if _, err := hookDirs.Reload(); err != nil {
     logger.Warn("boot hook scan failed", "error", err)
 }
 
-// 8. Wire to nodeapi
+// 10. Wire to nodeapi; POST /v1/hooks/reload rescans both directories
 nodeAPISrv.SetActionProvider(exec)
-nodeAPISrv.SetHookReloader(watcher)
+nodeAPISrv.SetHookReloader(hookDirs)
 
-// 9. Start the watcher and reporter goroutines
+// 11. Start the watchers, the installer, and the reporter goroutines
 go watcher.Watch(ctx)
+if rolloutWatcher != nil {
+    go rolloutWatcher.Watch(ctx)
+}
+if installer != nil {
+    go installer.Run(ctx)
+}
 go reporter.Run(ctx)
 
-// 10. On shutdown
+// 12. On shutdown
 exec.Shutdown(ctx)
 ```
+
+`plexd up` waits for the boot scan for at most 10 seconds rather than calling `Reload` inline; see [Integration with Executor](#integration-with-executor).
 
 ## Error Handling
 
@@ -1297,8 +1576,9 @@ never `null`) and ordered by `requested_at`, then `execution_id`.
 | `cancel_requested_at` | timestamp | Optional. Present only on a `started` entry once an operator cancelled the Execution; plexd stops a run it holds (see [Cancel](#cancel)) and never compares the value with its own clock |
 
 There is no `callback_url` (the callback path is derived from the node and
-execution ids) and no `checksum` (hook integrity anchors on the digest the node
-pinned at first discovery).
+execution ids) and no `checksum` (a hand-placed hook's integrity anchors on the
+digest the node pinned at first discovery, and a rolled-out hook's on the
+checksum the pull's `hooks` block delivered for the installed version).
 
 ### SSE Event: `action_request`
 
@@ -1452,6 +1732,15 @@ the manifest: it sends it at boot and keeps it current while the agent runs.
       ],
       "timeout_seconds": 300,
       "sandbox_level": "none"
+    },
+    {
+      "name": "backup-db",
+      "checksum": "REA9yHQRkMbFu76wJTDLSMvpMnUd9WeDatQzSknU1Qg=",
+      "description": "Dump the application database to /var/backups.",
+      "timeout_seconds": 600,
+      "sandbox_level": "none",
+      "source": "rollout",
+      "version": 2
     }
   ],
   "plexd_hooks": [
@@ -1471,6 +1760,9 @@ the manifest: it sends it at boot and keeps it current while the agent runs.
         { "name": "include_processes", "type": "bool", "required": false, "default": "true", "description": "Include process listing" }
       ]
     }
+  ],
+  "hook_rollout_errors": [
+    { "name": "rotate-logs", "version": 1, "code": "fetch_failed", "detail": "api: HTTP 503 (signing_unavailable): ..." }
   ]
 }
 ```
@@ -1480,8 +1772,9 @@ the manifest: it sends it at boot and keeps it current while the agent runs.
 | Field | Source | Content |
 |---|---|---|
 | `builtin_actions` | `Executor.Capabilities()` | Every registered builtin, sorted by name: `name`, `description`, and `parameters[]` in registration order (`name`, `type`, `required`, `default`, `description`). A builtin without parameters carries no `parameters` key |
-| `declared_hooks` | Hook scripts in `hooks_dir` and their sidecars | `name` and the payload's SHA-256 as 32 bytes of standard-padded base64, plus what the sidecar declares: `description`, `parameters`, `timeout_seconds`, and `sandbox_level`, each left off when not declared. The digest is the one the watcher last computed, which can differ from the executor's pin after an edit |
+| `declared_hooks` | The executor's merged hook list: hook scripts in `hooks_dir`, the pinned [rolled-out hooks](#rolled-out-hooks), and their sidecars | `name` and the payload's SHA-256 as 32 bytes of standard-padded base64, plus what the sidecar declares: `description`, `parameters`, `timeout_seconds`, and `sandbox_level`, each left off when not declared. The digest is the one the watcher last computed, which can differ from the executor's pin after an edit. A rolled-out hook's entry also carries `"source": "rollout"` and the `version` installed; a hand-placed hook's entry carries neither key |
 | `plexd_hooks` | `PlexdHook` resources in the ServiceAccount's namespace (Kubernetes only) | `name`, `image_digest`, `parameters` map, `sandbox`; see [PlexdHook CRD](plexdhook-crd.md#capability-manifest-reporting) |
+| `hook_rollout_errors` | `RolloutInstaller.Errors()` | The versions the last pull listed that plexd could not install, at most 64, sorted by name: `name`, `version`, `code`, and `detail`; see [Error Codes](#error-codes). Left off when there are none, and when the installer was not built |
 
 The control plane refuses a manifest whole when one entry breaks an invariant,
 so plexd drops an entry it cannot report (a script hook without a usable digest,
@@ -1503,9 +1796,17 @@ hook with no sidecar reports `name` and `checksum` alone. A sidecar's content
 reaches the control plane and everyone who holds `read` there, so it must hold no
 secret.
 
+A rolled-out entry tells the control plane to take the published checksum of
+that version as the hook's baseline instead of the first digest the node reported,
+so a rolled-out hook is never trusted on first use and a new version moves the
+baseline with no acceptance. A hand-placed entry is sent with no `source` key,
+which the contract reads as `local`, so a Node with no rolled-out hook sends
+exactly the manifest it sent before rollouts existed.
+
 An absent key means none, because the control plane replaces its stored row on
 every PUT. `declared_hooks` leaves the manifest when the last hook is removed, and
-that is what clears the list at the control plane.
+that is what clears the list at the control plane. `hook_rollout_errors` leaves it
+when the last error clears, which clears the errors there.
 
 ### When the Manifest Is Sent
 
@@ -1518,9 +1819,14 @@ a scan that fails or outlives the wait leaves the boot manifest without hooks, a
 a dispatch in that window is rejected with `unknown_action`. A scan still running
 also holds up the watch's initial scan and `plexd hooks reload`. A scan that
 finishes late reports through `onChange`. A failed PlexdHook boot list leaves
-`plexd_hooks` off that first manifest.
+`plexd_hooks` off that first manifest. With rolled-out hooks on, the rollout
+installer's `Load` pins the recorded hooks first and the scan covers the rollout
+directory too, so the boot manifest carries each rolled-out hook at its version.
+The rollout errors live in memory and start empty, so they reach the control
+plane once the first pass, which runs on the first pull, has finished.
 
-**When something changes.** The hook watcher's `onChange` and the PlexdHook
+**When something changes.** The hook watchers' `onChange`, the rollout
+installer after a pass that changed its hooks or its errors, and the PlexdHook
 [inventory](plexdhook-crd.md#keeping-the-list-current) call `Notify`, which never
 blocks. So a script hook that is added, changed, or removed reaches the control
 plane within seconds, and so does a sidecar's edit or removal and a change to the
@@ -1591,14 +1897,26 @@ about one such delay of the [mark lifting](../core/heartbeat-service.md#quiet-fa
 The control plane refuses a manifest whole, so a refusal of the hook metadata
 would otherwise cost the Node its binary version, its digests, and every hook.
 plexd answers by sending the short form of the manifest, whose `declared_hooks`
-entries hold `name` and `checksum` and nothing else. `api.IsHookMetadataRefused`
-names the refusals that trigger this:
+entries hold `name` and `checksum` and nothing else, and which carries no
+`hook_rollout_errors`. The metadata is every declared-hook key past `name` and
+`checksum`, a rolled-out hook's `source` and `version` among them, and the
+`hook_rollout_errors` list, and any one of them alone is enough to fall back.
+In the short form a rolled-out hook has no `source` and reads as `local` at the
+control plane. A control plane that serves rollouts gets the short form too:
+after a `413` for a manifest over its 1 MiB budget, and after a `400` with a
+limit-drift code from the table below, `hook_rollout_errors_too_many` and
+`hook_rollout_error_invalid` among them, which only such a control plane sends.
+Until it accepts a wide form, it reads each of the Node's rolled-out hooks as
+`local`, so its rollout status for the hook reads `collision`, and it holds none
+of the Node's rollout errors. `api.IsHookMetadataRefused` names the refusals that
+trigger this:
 
 | Status | Problem `code` | Why it falls back |
 |---|---|---|
 | `400` | `malformed_capabilities_request` | A control plane that predates the metadata refuses its keys as unknown |
 | `413` | Any, or none | The manifest is over budget, 1 MiB or 32 KiB on a control plane that predates the metadata, whichever layer said so. A proxy's own `413` carries no code |
 | `400` | `declared_hook_invalid` or `declared_hooks_too_many` | plexd's copy of the limits has drifted from the control plane's, which must cost the metadata and not the manifest |
+| `400` | `hook_rollout_errors_too_many` or `hook_rollout_error_invalid` | plexd's copy of the limits on `hook_rollout_errors` has drifted from the control plane's |
 
 Only a manifest that carries metadata falls back. One that carries none has
 nothing to drop, so the same refusal takes the backoff under [Retries](#retries).
@@ -1663,7 +1981,7 @@ The three `agent: capability report:` lines carry `component=capability-report`;
 | `hooks beyond the capability manifest cap omitted` | Warn | `cap`, `dropped` | More than 128 script hooks |
 | `hook omitted from the capability manifest` | Warn | `hook`, `error` | A hook's digest could not be converted to the wire form, or its name is blank or not valid UTF-8, which the control plane cannot store. The hook stays on the node |
 | `hook metadata omitted from the capability manifest` | Warn | `hook`, `field`, `error` | A sidecar field breaks its [limit](#sidecar-metadata-format). `field` is the sidecar key. The hook and its other fields stay on the manifest. The line repeats on every attempt, because every attempt builds the manifest |
-| `hook integrity change detected` | Warn | `hook`, `old_checksum`, `new_checksum` | The watcher computed a new digest for a known hook |
+| `hook integrity change detected` | Warn | `hook`, `old_checksum`, `new_checksum`, and `source` from the rollout watcher | The watcher computed a new digest for a known hook. The rollout watcher's line carries `source` `rollout`; the line of the `hooks_dir` watcher carries no `source` |
 
 The PlexdHook watch's lines are listed under
 [PlexdHook CRD](plexdhook-crd.md#log-lines).
@@ -1746,7 +2064,7 @@ Stdout and stderr are captured from the pod logs via the Kubernetes API.
 - **Signature verification** -- Every SSE event carries `issued_at` (max staleness: 5 minutes) and is verified with a kid-indexed Ed25519 signature selected by the envelope's `key_id`. Signature and staleness checks are applied uniformly to all event types; there is no nonce.
 - **Hook file permissions** -- plexd verifies that hook files are owned by root and not group- or other-writable before execution.
 - **Symlink protection** -- Hook paths are resolved and validated to prevent symlink escape outside the configured hooks directory.
-- **Checksum enforcement** -- Hook checksums are verified before every execution, against the digest plexd recorded when it discovered the hook (there is no checksum on the wire). Binary checksums are reported continuously. On Kubernetes, image digests serve as checksums -- hooks without pinned digest (`@sha256:...`) are rejected.
+- **Checksum enforcement** -- Hook checksums are verified before every execution, against the digest plexd recorded when it discovered a hand-placed hook (the dispatch carries no checksum), or against the checksum the pull delivered for a rolled-out hook, which plexd verified under the Domain signature before it installed the script. Binary checksums are reported continuously. On Kubernetes, image digests serve as checksums -- hooks without pinned digest (`@sha256:...`) are rejected.
 - **Resource isolation** -- Script hooks run directly on the host as plexd's user, with no CPU or memory limit from plexd. plexd implements sandbox level `none` only and refuses a hook that declares any other (see [Sandbox Options](sandbox-options.md)), and it kills a hook's whole process group at the run deadline. On Kubernetes, hooks always run as separate Pods with native resource limits.
 - **CRD privilege control** -- Kubernetes hooks requiring host-level access (`hostPID`, `hostNetwork`, `privileged`) must declare `privileged: true` in the `PlexdHook` spec. The platform can enforce approval policies.
 - **Session token scoping** -- JWTs are bound to a specific node (`node_id` claim) and a specific set of actions (`actions` claim). Tokens cannot be used on other nodes or for unauthorized actions.

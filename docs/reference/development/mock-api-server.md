@@ -36,8 +36,8 @@ The gate exists because its absence hid a shipped defect: the mock used to admit
 The mock refuses what the real handlers refuse, because a fixture that accepts
 more than the contract hides exactly the defects the suite exists to catch. The
 first three gates were added after a release shipped past them; the handshake
-report, the edge PSK route and the endpoint candidates route were gated from the
-start:
+report, the edge PSK route, the endpoint candidates route and the hook version
+route were gated from the start:
 
 - **`PUT /v1/nodes/{id}/capabilities`** caps the body at 1 MiB
   (`413 capabilities_body_too_large`), strict-decodes a `CapabilityManifestRequest`
@@ -55,6 +55,17 @@ start:
   characters each. Characters are code points, a NUL in any of these strings is
   refused, and `"parameters": null` counts as none. A violation answers
   `400 declared_hook_invalid`, or `400 declared_hooks_too_many` past 64 parameters.
+  A declared hook marks a rolled-out script as the contract's Published hooks
+  section asks: `source` is absent, `local` or `rollout`, and `version` is
+  required with `rollout`, refused on any other entry, and from 1 to 2147483647,
+  each breach answering `400 declared_hook_invalid`. The decode into plexd's own
+  type reads an explicit `"source": ""` as absent and `"version": 0` as no
+  version. More than 64 `hook_rollout_errors` entries answer
+  `400 hook_rollout_errors_too_many`, and an entry whose name is off the grammar
+  `^[a-z0-9][a-z0-9_-]{0,62}$`, whose version is outside 1 to 2147483647, whose
+  code does not match `^[a-z0-9_]{1,64}$`, or whose detail is over 1024 code
+  points or holds a NUL answers `400 hook_rollout_error_invalid`. Any code inside
+  the pattern passes, not only the four the contract documents.
   The two advertised inventories are checked after that, `plexd_hooks` first, and
   a violation is answered `422` with the contract's code: `plexd_hook_invalid`
   (empty name, non-canonical `image_digest`, negative `timeout_seconds`),
@@ -110,6 +121,12 @@ start:
   `netip.ParseAddrPort`, has port 0 or a zone, or names a loopback, link-local,
   multicast or unspecified host. An empty array is accepted. See
   [the route](#put-v1-nodes-id-endpoint-candidates).
+- **`GET /v1/nodes/{id}/hooks/{name}/versions/{version}`** answers
+  `403 node_id_mismatch` for an `id` other than the registered node, then
+  `404 hook_not_assigned` for a pair the state fixture's `hooks` block does not
+  list or no configured version matches, as the control plane serves only what
+  a rollout assigns the node. See
+  [the route](#get-v1-nodes-id-hooks-name-versions-version).
 
 ### `GET /test/bearer`
 
@@ -515,6 +532,67 @@ plexd's epoch floor never refuses one.
 
 **Error:** Refusals use `application/problem+json` with the codes above. A request without the bearer envelope is refused with `401` by the [authentication gate](#authentication). Returns `405` if the HTTP method is not `GET`.
 
+### `GET /v1/nodes/{id}/hooks/{name}/versions/{version}`
+
+Serves the published hook versions that
+[`POST /test/configure-hook-versions`](#post-test-configure-hook-versions)
+configured, the way the control plane's fetch does: only while the state
+fixture's `hooks` block lists the pair, with a `hook_version` envelope signed at
+serve time. `hook_fetch_count` increments only on a `200`.
+
+**Answer order.** The handler returns at the first refusal:
+
+1. `403` `node_id_mismatch` if `id` is not the registered node (`0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3`).
+2. `404` `hook_not_assigned` if `version` is not the plain decimal of a version, if no configured version matches the pair, or if the state fixture's `hooks` block does not list it. A `null` block lists nothing.
+3. `503` `signing_unavailable` while the configured `fail_next` lasts. Each such answer spends one count, decremented with a compare-and-swap so that exactly N fetches fail under concurrent requests. A fetch refused earlier spends none.
+
+**Response:** `200 OK`, the contract's `NodeHookVersion`:
+
+```json
+{
+  "envelope": {
+    "id": "<uuid fixed at configure time>",
+    "type": "hook_version",
+    "scope": "domain:<mock Domain id>",
+    "key_id": "did:web:plexsphere.com#key-e2e",
+    "issued_at": "<the instant the version was configured>",
+    "payload": {
+      "project_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0",
+      "name": "e2e-rollout",
+      "version": 1,
+      "checksum": "<standard base64 SHA-256 of the configured script>",
+      "description": "rolled out by the e2e suite",
+      "timeout_seconds": 30,
+      "sandbox_level": "none"
+    },
+    "signature": "<base64 Ed25519 signature>"
+  },
+  "script_base64": "<the script as served>"
+}
+```
+
+The envelope's `id` and `issued_at` are fixed when the version is configured,
+which stands for the moment the control plane publishes it, and every version of
+one configure call shares that instant. The envelope is signed when served, with
+the mock's current signing key, so a fetch after
+[`POST /test/rotate-signing-key`](#post-test-rotate-signing-key) names the key the
+next pull hands out, as the control plane signs a version again under the
+Domain's active key. The payload's `project_id` is the mock Project, and an empty
+configured `sandbox_level` is served as `none`, as the control plane stores an
+absent level.
+
+A configured `tamper` spoils one check plexd makes before it installs a version:
+
+| `tamper` | Served |
+|----------|--------|
+| `""` | The version as configured. It passes `api.Ed25519Verifier.VerifySignature` under the mock's current key, and its script's SHA-256 equals the payload checksum |
+| `script` | The script with one byte (a newline) appended, while the payload and the configure answer keep the checksum of the configured script |
+| `signature` | The envelope with one bit of its signature flipped |
+
+**Counter:** Increments `hook_fetch_count` only on a `200`.
+
+**Error:** Refusals use `application/problem+json` with the codes above. A request without the bearer envelope is refused with `401` by the [authentication gate](#authentication). Returns `405` if the HTTP method is not `GET`.
+
 ### `GET /v1/nodes/{id}/state`
 
 Returns the active `NodeStateSnapshot` fixture built by `newStateFixture`. By
@@ -543,6 +621,7 @@ therefore hands the node the new key.
 | `executions` | `[]` — no dispatch queued; phases configure entries explicitly |
 | `sessions` | `[]` — no session issued; phases configure entries explicitly |
 | `secrets` | `[]` (no inventory; phases configure entries explicitly) |
+| `hooks` | `null`, which keeps every hook a rollout installed and lets the [hook version fetch](#get-v1-nodes-id-hooks-name-versions-version) serve nothing; phases configure entries explicitly |
 | `signing_key` | the mock's current signing key (`key_id` `did:web:plexsphere.com#key-e2e` until `POST /test/rotate-signing-key`), set on every response rather than read from the fixture |
 
 The two peers give the agent's dial order both shapes. Peer `...a0b1`'s order is
@@ -676,7 +755,8 @@ comparison key and never re-derives it from the rules.
   "executions": [],
   "sessions": [],
   "secrets": [],
-  "signing_key": {"key_id": "did:web:plexsphere.com#key-e2e", "public_key": "<base64 Ed25519 public key, generated per server start>"}
+  "signing_key": {"key_id": "did:web:plexsphere.com#key-e2e", "public_key": "<base64 Ed25519 public key, generated per server start>"},
+  "hooks": null
 }
 ```
 
@@ -1093,6 +1173,7 @@ Test-only endpoint returning a snapshot of all call counters. Not part of the `/
   "integrity_violation_count": 0,
   "handshake_report_count": 0,
   "edge_psk_count": 0,
+  "hook_fetch_count": 0,
   "inject_event_count": 0,
   "events_request_count": 0,
   "local_metrics_count": 0,
@@ -1213,7 +1294,10 @@ Replaces the active `NodeStateSnapshot` fixture at runtime. Subsequent calls to 
 Because the call replaces the **whole** fixture, a test that only wants to queue a
 dispatch reads the live snapshot, splices its `executions` array in, and posts the
 result back — that is what the e2e helper `configure_executions` does. The
-`sessions` key works the same way, spliced by `configure_sessions`.
+`sessions` key works the same way, spliced by `configure_sessions`, and so does
+the `hooks` key, spliced by `configure_hooks`. The `hooks` block is served as
+configured, and it also decides which configured versions the
+[hook version fetch](#get-v1-nodes-id-hooks-name-versions-version) serves.
 
 **Response:** `204 No Content`
 
@@ -1318,7 +1402,7 @@ report and its fallback to the short manifest entry.
 - `fail_next` sets how many of the next PUTs fail, replacing any pending count, so `0` clears one.
 - An armed PUT is captured first, so `GET /test/last-request/capabilities` shows what it carried, and is then answered `500` with problem code `internal`, before validation and before `capabilities_count` moves. A body past the 1 MiB cap answers its `413` and spends no count.
 - The count is decremented once per PUT, so exactly N PUTs fail, also under concurrent requests.
-- `refuse_hook_metadata`, while true, answers a manifest in which any `declared_hooks` entry carries metadata with `400 malformed_capabilities_request`, as a control plane that predates those fields does. The refusal comes right after the strict decode and ahead of every invariant, and an armed `fail_next` comes before it. The body is captured first and `capabilities_count` does not move. A manifest of short entries passes.
+- `refuse_hook_metadata`, while true, answers a manifest that carries hook metadata with `400 malformed_capabilities_request` and the detail `the manifest carries an unknown field`, as a control plane that predates those fields does. Metadata is any of the six fields a short `{name, checksum}` entry leaves out on any `declared_hooks` entry, a rolled-out hook's `source` and `version` among them, or a non-empty `hook_rollout_errors`. The refusal comes right after the strict decode and ahead of every invariant, and an armed `fail_next` comes before it. The body is captured first and `capabilities_count` does not move. A manifest of short entries with no `hook_rollout_errors` passes.
 - Request body is captured and retrievable via `GET /test/last-request/configure_capabilities`.
 
 **Error:** Returns `400` if the body is not valid JSON, contains an unknown field or a value of the wrong type, or sets a negative `fail_next` (`{"error": "fail_next must not be negative"}`), and changes neither field. Returns `405` if the HTTP method is not `POST`.
@@ -1349,6 +1433,53 @@ untouched.
 - Request body is captured and retrievable via `GET /test/last-request/configure_secrets`.
 
 **Error:** Returns `400` if the body is not valid JSON or contains an unknown field. Returns `405` if the HTTP method is not `POST`.
+
+### `POST /test/configure-hook-versions`
+
+Replaces the set of published hook versions that
+[`GET /v1/nodes/{id}/hooks/{name}/versions/{version}`](#get-v1-nodes-id-hooks-name-versions-version)
+serves, and arms that route's `503`. Lets a test publish a version, splice its
+checksum into the `hooks` block, and spoil a version to prove plexd checks it.
+
+**Request body:** strict-decoded: an unknown field anywhere is a `400`.
+
+```json
+{
+  "versions": [
+    {
+      "name": "e2e-rollout",
+      "version": 1,
+      "script_base64": "IyEvYmluL3NoCmVjaG8gZTJlLXJvbGxvdXQgdjEK",
+      "description": "rolled out by the e2e suite",
+      "parameters": [],
+      "timeout_seconds": 30,
+      "sandbox_level": "",
+      "tamper": ""
+    }
+  ],
+  "fail_next": 0
+}
+```
+
+**Response:** `200 OK` with the pair and the checksum of each version, in the
+order configured. The checksum is the standard-base64 SHA-256 of the script as
+configured, which is what the `hooks` block names, so a test splices it in:
+
+```json
+{ "versions": [ { "name": "e2e-rollout", "version": 1, "checksum": "<standard base64 SHA-256>" } ] }
+```
+
+**Behavior:**
+
+- One POST replaces the whole set and the count, so a field left out empties the set or clears the count. A test that keeps a version served lists it again in every call.
+- `name` must match `^[a-z0-9][a-z0-9_-]{0,62}$` and `version` must be at least 1, and a pair may be configured once per call.
+- `script_base64` must be standard base64. `description`, `parameters`, `timeout_seconds` and `sandbox_level` go into the signed payload as configured, an empty `sandbox_level` as `none`.
+- `tamper` is `""`, `"script"`, or `"signature"`; see [the route](#get-v1-nodes-id-hooks-name-versions-version).
+- `fail_next` sets how many of the next fetches that pass the `403` and `404` gates answer `503 signing_unavailable`.
+- Every version of one call gets the same `issued_at`, the time of the call.
+- Request body is captured and retrievable via `GET /test/last-request/configure_hook_versions`.
+
+**Error:** Returns `400` with an `error` for a body that is not valid JSON, an unknown field, a negative `fail_next`, or an entry with a name off the grammar, a version below 1, a pair configured before it, a `script_base64` that is not standard base64, or an unknown `tamper`, the last five naming the entry as `versions[<i>]`. A `400` changes nothing. Returns `405` if the HTTP method is not `POST`.
 
 ### `POST /test/configure-events`
 
@@ -1569,6 +1700,7 @@ The server tracks API calls using `sync/atomic.Int64` counters. Each endpoint in
 | `integrity_violation_count` | `POST /v1/nodes/{id}/integrity-violations` (accepted batches only, one per request regardless of batch size) |
 | `handshake_report_count` | `POST /v1/nodes/{id}/handshakes` (accepted reports only, `200`) |
 | `edge_psk_count` | `GET /v1/nodes/{id}/peers/{peer_node_id}/psk` (served `200` envelopes only) |
+| `hook_fetch_count` | `GET /v1/nodes/{id}/hooks/{name}/versions/{version}` (served `200` versions only) |
 | `inject_event_count` | `POST /test/inject-event` |
 | `events_request_count` | `GET /v1/nodes/{id}/events` (every request, including descoped `501` and `400`) |
 | `local_metrics_count` | `POST /local/metrics` (TLS) |
@@ -1591,6 +1723,8 @@ All responses use the same JSON field names as the types in `internal/api`:
 - `BridgeSnapshot` — `internal/api.BridgeSnapshot`
 - `NodeStateBlock` / `StateEntry` — `internal/api.NodeStateBlock` / `internal/api.StateEntry`
 - `NodeStateSigningKey` — `internal/api.NodeStateSigningKey`
+- `NodeStateHook` — `internal/api.NodeStateHook`
+- `NodeHookVersion` / `HookVersionPayload` — `internal/api.NodeHookVersion` / `internal/api.HookVersionPayload`
 - `Envelope` — `internal/api.Envelope`
 - `Peer` — `internal/api.Peer`
 - `RelayConfig` / `RelayAssignment` — `internal/api.RelayConfig` / `internal/api.RelayAssignment`

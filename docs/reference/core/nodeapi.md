@@ -575,10 +575,16 @@ object `{}` when no policy is active (or no policy provider is wired).
 
 ### POST /v1/hooks/reload
 
-Re-scans the hooks directory through the `HookReloader` the agent wires in, which
-is `HookWatcher.Reload`, and returns the resulting list. The route takes no body
-and does not need the hook watch to be running. The other action and hook routes
-are listed under
+Re-scans the hook directories through the `HookReloader` the agent wires in and
+returns the resulting list. `plexd up` wires an adapter that reloads `hooks_dir`
+and then, while rolled-out hooks are on, the directory plexd installs them into,
+`<data_dir>/hooks`, each even when the other failed. A file written into either
+directory just before the call is in the answer, except a file in the rollout
+directory that plexd did not install, which has no pin and is never listed. The
+list is the executor's merged one, the same as `GET /v1/hooks`: a hand-placed
+hook shadows a rolled-out hook of its name. The route takes no body and does not
+need the hook watch to be running. The other action and hook routes are listed
+under
 [Local API Endpoints](../actions/remote-actions-hooks.md#local-api-endpoints).
 
 **Response** `200 OK`:
@@ -587,21 +593,30 @@ are listed under
 {
   "status": "reloaded",
   "hooks": [
+    { "name": "backup-db", "description": "Dump the application database to /var/backups.", "source": "rollout", "checksum": "44403dc8741190c6c5bbbeb02530cb48cbe932751df567836ad4334a49d4d508", "parameters": [{ "name": "database", "type": "string", "required": false, "description": "Database to dump." }], "timeout": "600s", "sandbox": "none", "version": 2 },
     { "name": "deploy.sh", "description": "Deploy", "source": "local", "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "parameters": null, "timeout": "", "sandbox": "" }
   ]
 }
 ```
 
-`hooks` is `[]` for an empty directory, never `null`.
+`source` is `local` for a hook in `hooks_dir` and `rollout` for a hook plexd
+installed from a published version. `version` is the published version a
+rolled-out hook was installed from; a `local` entry carries no `version` key.
+`GET /v1/hooks` returns the same entries, as a bare array.
+
+`hooks` is `[]` when no hook is listed, never `null`.
 
 | Status | Condition                                                                  |
 |--------|----------------------------------------------------------------------------|
 | `200`  | Scan finished. A hook that failed to hash keeps its last digest            |
-| `500`  | The directory could not be read. The list stays as it was, no callback fires, and `error` carries the cause |
+| `500`  | A directory could not be read. Its list stays as it was, no callback fires for it, and `error` carries the cause, one line per directory that failed |
 | `503`  | No hook reloader is wired in                                               |
 
-A reload moves no integrity pin, so an edited hook stays refused until the agent
-restarts; see
+A reload moves no integrity pin, so an edited hand-placed hook stays refused until
+the agent restarts, and an edited rolled-out hook until the control plane rolls out
+another version or withdraws it, or until the edited script is deleted: the next
+pass then fetches the listed version again and pins it to the same delivered
+checksum. See
 [Hook Integrity Pinning](../actions/remote-actions-hooks.md#hook-integrity-pinning).
 
 ## Cache Updates

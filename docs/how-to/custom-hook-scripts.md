@@ -374,7 +374,7 @@ Control Plane                          Node (plexd)
 
 | Symptom                        | Cause                             | Fix                                                |
 |--------------------------------|-----------------------------------|----------------------------------------------------|
-| Status `error`, integrity fail | The file changed after the agent pinned its digest | Restart the agent so it re-discovers and re-attests the hook; a reload does not clear this |
+| Status `error`, integrity fail | The file changed after the agent pinned its digest | Restart the agent so it re-discovers and re-attests the hook; a reload does not clear this. A restart does not clear it for a rolled-out hook; see [Hand-placed and Rolled-out Hooks](#hand-placed-and-rolled-out-hooks) |
 | Status `error`, file not found | Hook in capabilities but missing  | Verify file exists at `hooks_dir/<action-name>`     |
 | Status `failed`, `error="action timed out"` | Script outran the entry's `expires_at` | Optimize the script, or have the control plane dispatch a later `expires_at` |
 | Status `failed`, `error="action timed out: hook timeout <d>"` | Script outran the `timeout` its sidecar declares | Optimize the script, or raise `timeout` in the sidecar |
@@ -394,6 +394,19 @@ Control Plane                          Node (plexd)
 In a refusal that comes from a file check, `<name>` is the file checked, so a
 sidecar reads `restart-service.json`. A refused run does not start the script, and
 the agent logs `hook refused` with the same `error`.
+
+### Hand-placed and Rolled-out Hooks
+
+The control plane can also roll hooks out to a node: plexd fetches each published
+version, verifies it, and installs it into `<data_dir>/hooks`
+(`/var/lib/plexd/hooks` on Linux), a directory of its own. See
+[Rolled-out Hooks](../reference/actions/remote-actions-hooks.md#rolled-out-hooks).
+
+| Symptom                    | Cause                                   | Fix                                                |
+|----------------------------|-----------------------------------------|----------------------------------------------------|
+| A rollout of the hook's name reports `collision` | `hooks_dir` holds an entry of that name, which blocks a [rolled-out hook](../reference/actions/remote-actions-hooks.md#collision) of the name. plexd keeps running the hand-placed hook, reports it as `local`, fetches nothing for the rollout, and removes its own rolled-out copy of the name. `actions: rollout: name collision with hooks_dir` in the log | Remove the hand-placed hook to let the rollout install, or rename it; the next pull installs the listed version. Keep it, and the rollout stays at `collision` |
+| A script you put into `<data_dir>/hooks` is gone after a restart, or never listed | `<data_dir>/hooks` (`/var/lib/plexd/hooks` on Linux) belongs to plexd: it holds the hooks the control plane rolls out, lists only the files plexd installed and pinned, and removes every other file at start (`actions: rollout: stray file removed`) | Put hand-placed hooks into `hooks_dir`, never into `<data_dir>/hooks`. Do not point `hooks_dir` at `<data_dir>/hooks` either: plexd then turns rolled-out hooks off and logs `rolled-out hooks disabled` |
+| A rolled-out hook fails with `integrity check failed for hook: <name>` | Its file in `<data_dir>/hooks` was edited after plexd installed it. Its pin is the checksum the control plane delivered, and plexd restores that pin at every start | A restart does not clear it while the edited file stays. Delete the edited script, `<data_dir>/hooks/<name>`: plexd counts a recorded hook whose script is gone as not installed, so the next pull's pass fetches the listed version again and pins it to the same delivered checksum. Or have the control plane roll out a new version of the hook, or withdraw it |
 
 ### Parameter Issues
 
