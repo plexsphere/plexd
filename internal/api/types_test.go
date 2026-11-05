@@ -532,19 +532,22 @@ func TestNodeStateSnapshot_RoundTrip(t *testing.T) {
 			KeyID:     "signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1-1767225600000000000",
 			PublicKey: "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
 		},
+		Hooks: &[]NodeStateHook{
+			{Name: "backup-db", Version: 2, Checksum: "REA9yHQRkMbFu76wJTDLSMvpMnUd9WeDatQzSknU1Qg="},
+		},
 	}
 	data, got := roundTrip(t, orig)
 	requireEqual(t, orig, got)
 
-	// Exactly the ten contract keys must appear.
+	// Exactly the eleven contract keys must appear.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 10 {
-		t.Errorf("expected exactly 10 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 11 {
+		t.Errorf("expected exactly 11 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("expected JSON key %q", key)
 		}
@@ -582,7 +585,7 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 		t.Error("policy:{} should decode to a non-nil pointer, distinct from null")
 	}
 
-	// Marshalling nil blocks emits literal null with all ten keys PRESENT.
+	// Marshalling nil blocks emits literal null with all eleven keys PRESENT.
 	out, err := json.Marshal(NodeStateSnapshot{})
 	if err != nil {
 		t.Fatalf("marshal zero value: %v", err)
@@ -591,10 +594,10 @@ func TestNodeStateSnapshot_NullBlocks(t *testing.T) {
 	if err := json.Unmarshal(out, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 10 {
-		t.Errorf("expected exactly 10 JSON keys, got %d: %v", len(raw), raw)
+	if len(raw) != 11 {
+		t.Errorf("expected exactly 11 JSON keys, got %d: %v", len(raw), raw)
 	}
-	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key"} {
+	for _, key := range []string{"peers", "reachability", "policy", "bridge", "state", "reports", "executions", "sessions", "secrets", "signing_key", "hooks"} {
 		v, ok := raw[key]
 		if !ok {
 			t.Errorf("key %q absent, want present with null value", key)
@@ -673,6 +676,55 @@ func TestNodeStateSnapshot_SecretsBlock(t *testing.T) {
 			}
 			if snap.Secrets == nil || len(*snap.Secrets) != 0 {
 				t.Errorf("secrets = %#v, want a non-nil pointer to an empty slice", snap.Secrets)
+			}
+		})
+	}
+}
+
+// TestNodeStateSnapshot_HooksBlock pins the shapes the hooks block arrives in.
+// A populated block carries each entry's name, version and checksum, and []
+// decodes to a non-nil pointer to an empty slice: the node should run no
+// rolled-out hook. null and an absent key both decode to a nil pointer, which
+// the installer reads as "keep every rolled-out hook". None of them is a decode
+// error.
+func TestNodeStateSnapshot_HooksBlock(t *testing.T) {
+	const others = `"peers":[],"reachability":null,"policy":null,"bridge":null,"state":null,"reports":null,"executions":[],"sessions":[]`
+	sum := sha256.Sum256([]byte("#!/bin/sh\necho backup\n"))
+	checksum := base64.StdEncoding.EncodeToString(sum[:])
+
+	var populated NodeStateSnapshot
+	src := `{` + others + `,"hooks":[{"name":"backup-db","version":2,"checksum":"` + checksum + `"}]}`
+	if err := json.Unmarshal([]byte(src), &populated); err != nil {
+		t.Fatalf("unmarshal populated: %v", err)
+	}
+	want := []NodeStateHook{{Name: "backup-db", Version: 2, Checksum: checksum}}
+	if populated.Hooks == nil || !slices.Equal(*populated.Hooks, want) {
+		t.Errorf("hooks = %#v, want a pointer to %#v", populated.Hooks, want)
+	}
+
+	tests := []struct {
+		name    string
+		src     string
+		wantNil bool
+	}{
+		{name: "empty array", src: `{` + others + `,"hooks":[]}`},
+		{name: "null", src: `{` + others + `,"hooks":null}`, wantNil: true},
+		{name: "key absent", src: `{` + others + `}`, wantNil: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var snap NodeStateSnapshot
+			if err := json.Unmarshal([]byte(tt.src), &snap); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if tt.wantNil {
+				if snap.Hooks != nil {
+					t.Errorf("hooks = %#v, want a nil pointer", snap.Hooks)
+				}
+				return
+			}
+			if snap.Hooks == nil || len(*snap.Hooks) != 0 {
+				t.Errorf("hooks = %#v, want a non-nil pointer to an empty slice", snap.Hooks)
 			}
 		})
 	}
@@ -2653,5 +2705,180 @@ func TestDeclaredHook_OmitsEmptyMetadata(t *testing.T) {
 				t.Errorf("entry = %s, want %s", data, want)
 			}
 		})
+	}
+}
+
+// A rolled-out hook carries its source and version after the sidecar fields,
+// and a hook placed by other means carries neither key, so a node with no
+// rolled-out hook sends the entry it sent before rollouts existed.
+func TestDeclaredHook_SourceAndVersion(t *testing.T) {
+	local := DeclaredHook{Name: "post-install", Checksum: testDigestB64}
+	data, err := json.Marshal(local)
+	if err != nil {
+		t.Fatalf("marshal local: %v", err)
+	}
+	if want := `{"name":"post-install","checksum":"` + testDigestB64 + `"}`; string(data) != want {
+		t.Errorf("local entry = %s, want %s", data, want)
+	}
+
+	rollout := DeclaredHook{Name: "backup-db", Checksum: testDigestB64, Source: HookSourceRollout, Version: 2}
+	data, got := roundTrip(t, rollout)
+	requireEqual(t, rollout, got)
+	if want := `{"name":"backup-db","checksum":"` + testDigestB64 + `","source":"rollout","version":2}`; string(data) != want {
+		t.Errorf("rollout entry = %s, want %s", data, want)
+	}
+}
+
+// hook_rollout_errors stays off the wire when the node has none, because the
+// control plane reads an absent list as [] and a control plane that predates
+// the key refuses it. A populated entry carries its four members, and an empty
+// detail is left out.
+func TestCapabilityManifestRequest_HookRolloutErrors(t *testing.T) {
+	data, err := json.Marshal(CapabilityManifestRequest{BinaryVersion: "v1.2.3"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		t.Fatal(err)
+	}
+	if raw, ok := top["hook_rollout_errors"]; ok {
+		t.Errorf("hook_rollout_errors = %s, want the key absent", raw)
+	}
+
+	req := CapabilityManifestRequest{
+		BinaryVersion: "v1.2.3",
+		HookRolloutErrors: []HookRolloutError{
+			{Name: "backup-db", Version: 2, Code: HookRolloutCodeFetchFailed, Detail: "404 hook_not_assigned"},
+			{Name: "rotate-logs", Version: 1, Code: HookRolloutCodeCollision},
+		},
+	}
+	data, got := roundTrip(t, req)
+	requireEqual(t, req, got)
+	want := `"hook_rollout_errors":[` +
+		`{"name":"backup-db","version":2,"code":"fetch_failed","detail":"404 hook_not_assigned"},` +
+		`{"name":"rotate-logs","version":1,"code":"collision"}]`
+	if !strings.Contains(string(data), want) {
+		t.Errorf("manifest = %s, want it to contain %s", data, want)
+	}
+}
+
+// The four documented rollout error codes and both sources are wire values the
+// control plane names, so their spelling is pinned here.
+func TestHookRolloutWireValues(t *testing.T) {
+	for _, tt := range []struct{ got, want string }{
+		{HookVersionEnvelopeType, "hook_version"},
+		{HookSourceLocal, "local"},
+		{HookSourceRollout, "rollout"},
+		{HookRolloutCodeCollision, "collision"},
+		{HookRolloutCodeVerificationFailed, "verification_failed"},
+		{HookRolloutCodeFetchFailed, "fetch_failed"},
+		{HookRolloutCodeInstallFailed, "install_failed"},
+	} {
+		if tt.got != tt.want {
+			t.Errorf("constant = %q, want %q", tt.got, tt.want)
+		}
+	}
+	if MaxHookRolloutErrors != 64 {
+		t.Errorf("MaxHookRolloutErrors = %d, want 64", MaxHookRolloutErrors)
+	}
+	if MaxHookRolloutDetailChars != 1024 {
+		t.Errorf("MaxHookRolloutDetailChars = %d, want 1024", MaxHookRolloutDetailChars)
+	}
+}
+
+// The node API's hook list carries a rolled-out hook's version and leaves the
+// key off for a local hook, which has none.
+func TestHookInfo_Version(t *testing.T) {
+	local := HookInfo{Name: "post-install", Source: HookSourceLocal}
+	data, err := json.Marshal(local)
+	if err != nil {
+		t.Fatalf("marshal local: %v", err)
+	}
+	if strings.Contains(string(data), `"version"`) {
+		t.Errorf("local hook = %s, want no version key", data)
+	}
+
+	rollout := HookInfo{Name: "backup-db", Source: HookSourceRollout, Version: 2}
+	data, got := roundTrip(t, rollout)
+	requireEqual(t, rollout, got)
+	if !strings.Contains(string(data), `"source":"rollout"`) || !strings.Contains(string(data), `"version":2`) {
+		t.Errorf("rollout hook = %s, want source rollout and version 2", data)
+	}
+}
+
+// TestNodeHookVersion_DecodesContractExample decodes the 200 body the
+// "Published hooks" section of plexsphere's agent contract prints, and its
+// envelope's payload into HookVersionPayload.
+func TestNodeHookVersion_DecodesContractExample(t *testing.T) {
+	const body = `{
+  "envelope": {
+    "id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1",
+    "type": "hook_version",
+    "scope": "domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1",
+    "key_id": "signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1-1767225600000000000",
+    "issued_at": "2026-05-02T10:00:00Z",
+    "payload": {
+      "project_id": "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+      "name": "backup-db",
+      "version": 1,
+      "checksum": "REA9yHQRkMbFu76wJTDLSMvpMnUd9WeDatQzSknU1Qg=",
+      "description": "Dump the application database to /var/backups.",
+      "parameters": [
+        { "name": "database", "type": "string", "description": "Database to dump." }
+      ],
+      "timeout_seconds": 600,
+      "sandbox_level": "none"
+    },
+    "signature": "c2ln"
+  },
+  "script_base64": "IyEvYmluL3NoCnBnX2R1bXAgLUZjIGFwcCA+IC92YXIvYmFja3Vwcy9hcHAuZHVtcAo="
+}`
+	var hv NodeHookVersion
+	if err := json.Unmarshal([]byte(body), &hv); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	env := hv.Envelope
+	if env.ID != "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1" || env.Type != HookVersionEnvelopeType ||
+		env.Scope != "domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1" ||
+		env.KeyID != "signing-domain-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1-1767225600000000000" ||
+		!env.IssuedAt.Equal(time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)) || env.Signature != "c2ln" {
+		t.Errorf("envelope = %+v, want the contract example's members", env)
+	}
+	script, err := base64.StdEncoding.DecodeString(hv.ScriptBase64)
+	if err != nil {
+		t.Fatalf("script_base64: %v", err)
+	}
+	if want := "#!/bin/sh\npg_dump -Fc app > /var/backups/app.dump\n"; string(script) != want {
+		t.Errorf("script = %q, want %q", script, want)
+	}
+
+	var payload HookVersionPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	want := HookVersionPayload{
+		ProjectID:      "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1",
+		Name:           "backup-db",
+		Version:        1,
+		Checksum:       "REA9yHQRkMbFu76wJTDLSMvpMnUd9WeDatQzSknU1Qg=",
+		Description:    "Dump the application database to /var/backups.",
+		Parameters:     []ActionParam{{Name: "database", Type: "string", Description: "Database to dump."}},
+		TimeoutSeconds: 600,
+		SandboxLevel:   "none",
+	}
+	requireEqual(t, want, payload)
+}
+
+// The payload's optional members stay off the wire when unset, the way the
+// control plane sends a version that declares none of them. sandbox_level is
+// always present.
+func TestHookVersionPayload_OmitsUndeclaredFields(t *testing.T) {
+	p := HookVersionPayload{ProjectID: "p", Name: "backup-db", Version: 1, Checksum: testDigestB64}
+	data, got := roundTrip(t, p)
+	requireEqual(t, p, got)
+	want := `{"project_id":"p","name":"backup-db","version":1,"checksum":"` + testDigestB64 + `","sandbox_level":""}`
+	if string(data) != want {
+		t.Errorf("payload = %s, want %s", data, want)
 	}
 }

@@ -86,7 +86,7 @@ type HeartbeatResponse struct {
 // GET /v1/nodes/{node_id}/state. Every block key is always present on the wire:
 // a null value means "block not populated", never "field absent". The differ
 // therefore distinguishes a nil pointer from a populated block, so none of the
-// ten fields carry omitempty.
+// eleven fields carry omitempty.
 type NodeStateSnapshot struct {
 	Peers        []SnapshotPeer       `json:"peers"`
 	Reachability json.RawMessage      `json:"reachability"`
@@ -113,6 +113,27 @@ type NodeStateSnapshot struct {
 	// predating the block never wrote, means the control plane could not say
 	// this time: the node keeps the key it holds, and never drops it.
 	SigningKey *NodeStateSigningKey `json:"signing_key"`
+	// Hooks is the node's desired set of published hook versions, ordered by
+	// name. It is a pointer for the reason Secrets is: [] says the node should
+	// run no rolled-out hook and removes every one it installed, while a nil
+	// value, the wire's null or a key a control plane predating the block
+	// never wrote, means the control plane could not compute the set this
+	// time, and every rolled-out hook is kept.
+	Hooks *[]NodeStateHook `json:"hooks"`
+}
+
+// NodeStateHook is one entry of the hooks block of the state pull, a published
+// hook version a rollout assigns the node, as the "Published hooks" section of
+// plexsphere's agent contract (docs/reference/api/plexd-agent-contract.md)
+// describes it. It never carries the script, which the node fetches through
+// GET /v1/nodes/{node_id}/hooks/{name}/versions/{version}. Checksum is the
+// SHA-256 of that script as 32 raw bytes in standard-padded base64, the
+// encoding of a DeclaredHook's Checksum, so the fetched version is checked
+// against the digest the pull named.
+type NodeStateHook struct {
+	Name     string `json:"name"`
+	Version  int    `json:"version"`
+	Checksum string `json:"checksum"`
 }
 
 // NodeStateSigningKey is the signing_key block of the state pull, the Domain
@@ -329,6 +350,44 @@ type SecretEnvelope struct {
 	Data    []byte
 	Version int
 	KID     string
+}
+
+// ---------------------------------------------------------------------------
+// Hook versions  GET /v1/nodes/{node_id}/hooks/{name}/versions/{version}
+// ---------------------------------------------------------------------------
+
+// HookVersionEnvelopeType is the type of the envelope a published hook version
+// is signed in. The envelope is not an event and never rides the event stream,
+// so the type sits here rather than among the SSE event types.
+const HookVersionEnvelopeType = "hook_version"
+
+// NodeHookVersion is the 200 body of the hook version fetch: the signed
+// envelope that describes one published hook version, and the script itself in
+// standard base64. The script sits outside the
+// envelope, so the signature covers its checksum in the payload rather than
+// its bytes. Nothing here is verified on decode: the envelope's payload
+// decodes into HookVersionPayload, and the installer checks the signature,
+// the pair it fetched, and the script's digest before it writes anything.
+type NodeHookVersion struct {
+	Envelope     Envelope `json:"envelope"`
+	ScriptBase64 string   `json:"script_base64"`
+}
+
+// HookVersionPayload is the payload of a hook_version envelope, the contract's
+// HookVersionPayload. Name and Version repeat the pair the node fetched, and
+// Checksum is the script's SHA-256 in the encoding of NodeStateHook.Checksum.
+// Description, Parameters, TimeoutSeconds and SandboxLevel are the hook's
+// sidecar fields, signed together with its checksum, and the control plane
+// sends the first three only when the version declares them.
+type HookVersionPayload struct {
+	ProjectID      string        `json:"project_id"`
+	Name           string        `json:"name"`
+	Version        int           `json:"version"`
+	Checksum       string        `json:"checksum"`
+	Description    string        `json:"description,omitempty"`
+	Parameters     []ActionParam `json:"parameters,omitempty"`
+	TimeoutSeconds int64         `json:"timeout_seconds,omitempty"`
+	SandboxLevel   string        `json:"sandbox_level"`
 }
 
 // ---------------------------------------------------------------------------
@@ -708,6 +767,69 @@ type CapabilityManifestRequest struct {
 	// sorted by name, each with its parameters in registration order. Omitted
 	// when empty rather than sent as null.
 	BuiltinActions []ActionInfo `json:"builtin_actions,omitempty"`
+	// HookRolloutErrors are the published hook versions the node's last pull
+	// listed and the node could not install, at most MaxHookRolloutErrors.
+	// Omitted when nil rather than sent as null. The control plane stores an
+	// absent list as [], because every PUT replaces the whole snapshot, so the
+	// node clears an error by leaving it out. More than MaxHookRolloutErrors
+	// entries answer 400 hook_rollout_errors_too_many, and an entry that breaks
+	// a limit 400 hook_rollout_error_invalid.
+	HookRolloutErrors []HookRolloutError `json:"hook_rollout_errors,omitempty"`
+}
+
+// Values of DeclaredHook.Source and HookInfo.Source: where a hook the agent
+// runs came from. The wire treats an absent source as local, which is why a
+// hand-placed hook is sent with no source key at all.
+const (
+	// HookSourceLocal marks a hook placed on the node by other means than a
+	// rollout, such as a script in hooks_dir. Its pin is the digest first seen.
+	HookSourceLocal = "local"
+	// HookSourceRollout marks a script installed from a published hook
+	// version. Its pin is the checksum the pull delivered.
+	HookSourceRollout = "rollout"
+)
+
+// Codes of a HookRolloutError the contract documents. The control plane
+// accepts any code that matches ^[a-z0-9_]{1,64}$ and shows it as sent, so a
+// newer agent's code never refuses the manifest.
+const (
+	// HookRolloutCodeCollision means hooks_dir holds a hook of the rollout's
+	// name. The node leaves that hook in place, keeps reporting it as local,
+	// and reports the collision rather than resolving it.
+	HookRolloutCodeCollision = "collision"
+	// HookRolloutCodeVerificationFailed means the node fetched the version,
+	// and its signature or its checksum did not verify.
+	HookRolloutCodeVerificationFailed = "verification_failed"
+	// HookRolloutCodeFetchFailed means the node could not fetch the version.
+	HookRolloutCodeFetchFailed = "fetch_failed"
+	// HookRolloutCodeInstallFailed means the node could not install the
+	// version, or will not on this platform or under this configuration.
+	HookRolloutCodeInstallFailed = "install_failed"
+)
+
+// Limits the control plane puts on hook_rollout_errors. plexd keeps a copy so
+// a manifest it builds stays inside them; IsHookMetadataRefused covers the
+// case where the copies drift apart.
+const (
+	// MaxHookRolloutErrors is the most entries one manifest may carry.
+	MaxHookRolloutErrors = 64
+	// MaxHookRolloutDetailChars is the longest detail, in Unicode code points.
+	MaxHookRolloutDetailChars = 1024
+)
+
+// HookRolloutError is one published hook version the node could not install,
+// as the "Published hooks" section of plexsphere's agent contract
+// (docs/reference/api/plexd-agent-contract.md) describes it. Name and Version
+// are the pair the pull listed, so the operator's per-node rollout status can
+// put the error beside the rollout that caused it.
+type HookRolloutError struct {
+	Name    string `json:"name"`
+	Version int    `json:"version"`
+	// Code is one of the HookRolloutCode constants.
+	Code string `json:"code"`
+	// Detail explains the failure, at most MaxHookRolloutDetailChars code
+	// points with no NUL. Omitted when empty.
+	Detail string `json:"detail,omitempty"`
 }
 
 // DeclaredHook is one hook the agent advertises. Its name and the digest of its
@@ -715,7 +837,10 @@ type CapabilityManifestRequest struct {
 // it. The four fields after them come from the hook's sidecar and describe the
 // hook for an operator. They gate nothing at the control plane and sit outside
 // its digest, so a sidecar edit changes them and leaves Checksum alone. plexd
-// applies the sidecar's timeout and sandbox when it runs the hook.
+// applies the sidecar's timeout and sandbox when it runs the hook. Source and
+// Version, last, mark a hook a rollout installed and name its version. The
+// control plane then takes that version's published checksum as the hook's
+// baseline, so a rolled-out hook is never trusted on first use.
 type DeclaredHook struct {
 	Name string `json:"name"`
 	// Checksum is the hook payload's SHA-256 as 32 raw bytes in
@@ -735,6 +860,18 @@ type DeclaredHook struct {
 	// characters. The contract keeps it free-form. Omitted when the sidecar
 	// declares none.
 	SandboxLevel string `json:"sandbox_level,omitempty"`
+	// Source is HookSourceRollout for a script installed from a published
+	// version. It is empty, and the key stays off the wire, for a hook placed
+	// on the node by other means: the contract reads an absent source as
+	// local, so a node with no rolled-out hook sends the manifest it sent
+	// before rollouts existed. The contract also accepts HookSourceLocal, and
+	// answers any value other than those two with 400 declared_hook_invalid.
+	Source string `json:"source,omitempty"`
+	// Version is the published version installed, 1 to 2147483647. It is
+	// required with Source HookSourceRollout and refused on any other entry,
+	// both with 400 declared_hook_invalid, so it is zero, and off the wire,
+	// for every other entry.
+	Version int `json:"version,omitempty"`
 }
 
 // DiscoveredPlexdHook is one PlexdHook resource as the manifest reports it (the
@@ -788,6 +925,10 @@ type HookInfo struct {
 	Parameters  []ActionParam `json:"parameters"`
 	Timeout     string        `json:"timeout"`
 	Sandbox     string        `json:"sandbox"`
+	// Version is the published version a rolled-out hook was installed from.
+	// It is zero, and omitted, for a hook whose Source is HookSourceLocal,
+	// which has no version.
+	Version int `json:"version,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

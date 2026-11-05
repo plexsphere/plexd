@@ -2666,12 +2666,13 @@ func TestCapabilities_NullHookParameters_Accepted(t *testing.T) {
 	}
 }
 
-// An entry key outside the contract fails the strict decode. HookInfo's source
-// is the near miss: plexd holds it and the wire does not carry it.
+// An entry key outside the contract fails the strict decode. HookInfo's sandbox
+// is the near miss: plexd holds it under that name and the wire calls it
+// sandbox_level.
 func TestCapabilities_UnknownHookKey_Refused(t *testing.T) {
 	_, ts := newTestServer(t)
 
-	body := hookManifest(t, declaredHookEntry("nightly", map[string]any{"source": "local"}))
+	body := hookManifest(t, declaredHookEntry("nightly", map[string]any{"sandbox": "none"}))
 	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", body)
 	defer resp.Body.Close()
 	assertProblem(t, resp, http.StatusBadRequest, "malformed_capabilities_request")

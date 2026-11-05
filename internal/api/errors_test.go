@@ -645,6 +645,21 @@ func TestErrSecretNameInvalid(t *testing.T) {
 	}
 }
 
+func TestErrHookNameInvalid(t *testing.T) {
+	const want = "hook name is outside the grammar ^[a-z0-9][a-z0-9_-]{0,62}$"
+	if got := ErrHookNameInvalid.Error(); got != want {
+		t.Errorf("ErrHookNameInvalid.Error() = %q, want %q", got, want)
+	}
+
+	wrapped := fmt.Errorf("api: fetch hook version %q: %w", "X", ErrHookNameInvalid)
+	if !errors.Is(wrapped, ErrHookNameInvalid) {
+		t.Errorf("errors.Is(wrapped, ErrHookNameInvalid) = false, want true")
+	}
+	if errors.Is(wrapped, ErrSecretNameInvalid) {
+		t.Errorf("errors.Is(wrapped, ErrSecretNameInvalid) = true, want the two grammars kept apart")
+	}
+}
+
 func TestIsEventBusNotProvisioned(t *testing.T) {
 	tests := []struct {
 		name string
@@ -908,12 +923,16 @@ func TestIsHookMetadataRefused(t *testing.T) {
 		{"400 malformed_capabilities_request", &APIError{StatusCode: 400, Code: "malformed_capabilities_request"}, true},
 		{"400 declared_hook_invalid", &APIError{StatusCode: 400, Code: "declared_hook_invalid"}, true},
 		{"400 declared_hooks_too_many", &APIError{StatusCode: 400, Code: "declared_hooks_too_many"}, true},
+		{"400 hook_rollout_errors_too_many", &APIError{StatusCode: 400, Code: "hook_rollout_errors_too_many"}, true},
+		{"400 hook_rollout_error_invalid", &APIError{StatusCode: 400, Code: "hook_rollout_error_invalid"}, true},
 		{"413 capabilities_body_too_large", &APIError{StatusCode: 413, Code: "capabilities_body_too_large"}, true},
 		{"413 without a code", &APIError{StatusCode: 413}, true},
 		{"413 with a code plexd does not know", &APIError{StatusCode: 413, Code: "body_limit"}, true},
 		{"wrapped 400 malformed_capabilities_request", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 400, Code: "malformed_capabilities_request"}), true},
 		{"wrapped 400 declared_hook_invalid", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 400, Code: "declared_hook_invalid"}), true},
 		{"wrapped 400 declared_hooks_too_many", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 400, Code: "declared_hooks_too_many"}), true},
+		{"wrapped 400 hook_rollout_errors_too_many", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 400, Code: "hook_rollout_errors_too_many"}), true},
+		{"wrapped 400 hook_rollout_error_invalid", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 400, Code: "hook_rollout_error_invalid"}), true},
 		{"wrapped 413 capabilities_body_too_large", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 413, Code: "capabilities_body_too_large"}), true},
 		{"wrapped 413 without a code", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 413}), true},
 		{"wrapped 413 with a code plexd does not know", fmt.Errorf("put capabilities: %w", &APIError{StatusCode: 413, Code: "body_limit"}), true},
@@ -928,6 +947,7 @@ func TestIsHookMetadataRefused(t *testing.T) {
 		{"401", &APIError{StatusCode: 401}, false},
 		{"422 plexd_hook_invalid", &APIError{StatusCode: 422, Code: "plexd_hook_invalid"}, false},
 		{"422 with a code that refuses on a 400", &APIError{StatusCode: 422, Code: "declared_hook_invalid"}, false},
+		{"422 with a rollout code that refuses on a 400", &APIError{StatusCode: 422, Code: "hook_rollout_error_invalid"}, false},
 		{"429", &APIError{StatusCode: 429}, false},
 		{"500", &APIError{StatusCode: 500}, false},
 	}
