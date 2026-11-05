@@ -83,6 +83,7 @@ type AssertionCounters struct {
 	IntegrityViolationCount       int64 `json:"integrity_violation_count"`
 	HandshakeReportCount          int64 `json:"handshake_report_count"`
 	EdgePSKCount                  int64 `json:"edge_psk_count"`
+	HookFetchCount                int64 `json:"hook_fetch_count"`
 	InjectEventCount              int64 `json:"inject_event_count"`
 	EventsRequestCount            int64 `json:"events_request_count"`
 	LocalMetricsCount             int64 `json:"local_metrics_count"`
@@ -145,6 +146,7 @@ type Server struct {
 	integrityViolationCount        atomic.Int64
 	handshakeReportCount           atomic.Int64
 	edgePSKCount                   atomic.Int64
+	hookFetchCount                 atomic.Int64
 	injectEventCount               atomic.Int64
 	eventsRequestCount             atomic.Int64
 	localMetricsCount              atomic.Int64
@@ -240,6 +242,16 @@ type Server struct {
 	execUploads      map[string]*execUpload
 	execTokenCounter int
 
+	// Published hook versions (issue #156). POST /test/configure-hook-versions
+	// replaces hookVersions whole, guarded by hookVersionsMu, and the fetch
+	// serves a version only while the state fixture's hooks block also lists
+	// it, as the control plane serves only what a rollout assigns the node.
+	// hookVersionFailNext is how many of the next fetches that get that far
+	// answer 503 signing_unavailable.
+	hookVersionsMu      sync.RWMutex
+	hookVersions        map[hookVersionKey]publishedHookVersion
+	hookVersionFailNext atomic.Int64
+
 	mux *http.ServeMux
 }
 
@@ -321,6 +333,7 @@ func (s *Server) Assertions() AssertionCounters {
 		IntegrityViolationCount:        s.integrityViolationCount.Load(),
 		HandshakeReportCount:           s.handshakeReportCount.Load(),
 		EdgePSKCount:                   s.edgePSKCount.Load(),
+		HookFetchCount:                 s.hookFetchCount.Load(),
 		InjectEventCount:               s.injectEventCount.Load(),
 		EventsRequestCount:             s.eventsRequestCount.Load(),
 		LocalMetricsCount:              s.localMetricsCount.Load(),
@@ -574,6 +587,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /v1/nodes/{id}/integrity-violations", s.handleIntegrityViolations)
 	s.mux.HandleFunc("POST /v1/nodes/{id}/handshakes", s.handleHandshakes)
 	s.mux.HandleFunc("GET /v1/nodes/{id}/peers/{peer_node_id}/psk", s.handleEdgePSK)
+	s.mux.HandleFunc("GET /v1/nodes/{id}/hooks/{name}/versions/{version}", s.handleHookVersion)
 
 	// Release channel fixture (outside /v1: this plays the GitHub release host,
 	// not the control plane).
@@ -586,6 +600,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /test/configure-endpoint", s.handleConfigureEndpoint)
 	s.mux.HandleFunc("POST /test/configure-capabilities", s.handleConfigureCapabilities)
 	s.mux.HandleFunc("POST /test/configure-secrets", s.handleConfigureSecrets)
+	s.mux.HandleFunc("POST /test/configure-hook-versions", s.handleConfigureHookVersions)
 	s.mux.HandleFunc("POST /test/configure-events", s.handleConfigureEvents)
 	s.mux.HandleFunc("POST /test/inject-event", s.handleInjectEvent)
 	s.mux.HandleFunc("GET /test/last-request/{endpoint}", s.handleLastRequest)
@@ -614,6 +629,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/nodes/{id}/integrity-violations", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/handshakes", methodNotAllowed)
 	s.mux.HandleFunc("/v1/nodes/{id}/peers/{peer_node_id}/psk", methodNotAllowed)
+	s.mux.HandleFunc("/v1/nodes/{id}/hooks/{name}/versions/{version}", methodNotAllowed)
 	s.mux.HandleFunc("/releases/{tag}/{asset}", methodNotAllowed)
 	s.mux.HandleFunc("/test/state", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-state", methodNotAllowed)
@@ -621,6 +637,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/test/configure-endpoint", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-capabilities", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-secrets", methodNotAllowed)
+	s.mux.HandleFunc("/test/configure-hook-versions", methodNotAllowed)
 	s.mux.HandleFunc("/test/configure-events", methodNotAllowed)
 	s.mux.HandleFunc("/test/inject-event", methodNotAllowed)
 	s.mux.HandleFunc("/test/session-token", methodNotAllowed)
@@ -1186,16 +1203,21 @@ func (s *Server) handleKeyRotate(w http.ResponseWriter, r *http.Request) {
 // manifest. A body past 1 MiB is refused with 413 capabilities_body_too_large.
 // Up to that cap it strict-decodes the contract's envelope and enforces its
 // invariants: a non-empty binary_version, a binary_checksum that decodes to
-// exactly 32 bytes, a canonical ssh_host_key_fingerprint when present, and
+// exactly 32 bytes, a canonical ssh_host_key_fingerprint when present,
 // declared_hooks that are unique, carry a name with no NUL and a 32-byte
-// digest, and keep their metadata inside its limits (see
-// checkDeclaredHookMetadata), each refused with 400. The two advertised
+// digest, keep their metadata inside its limits (see
+// checkDeclaredHookMetadata) and mark a rolled-out hook the way the contract's
+// Published hooks section asks (see checkDeclaredHookSource), and
+// hook_rollout_errors that stay inside their limits (see
+// checkHookRolloutErrors), each refused with 400. The two advertised
 // inventories, plexd_hooks and builtin_actions, are refused with 422 when an
 // entry breaks one of theirs (see checkPlexdHooks and checkBuiltinActions).
 //
 // POST /test/configure-capabilities arms two exceptions: fail_next answers a
 // 500 ahead of the decode, and refuse_hook_metadata answers a manifest with
-// hook metadata as a control plane that predates those fields does.
+// hook metadata, a rolled-out hook's source and version and the
+// hook_rollout_errors list among it, as a control plane that predates those
+// fields does.
 //
 // Strictness is the point. The fixture used to decode into whatever shape the
 // agent happened to send and count it, so a manifest the real handler refuses
@@ -1251,9 +1273,9 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	// strictly as the mock and stops at the first of those keys. So this answers
 	// here, ahead of every invariant below, and with the decode's own code. The
 	// armed failure above still comes first, so a test can fail a wide PUT.
-	if s.capabilitiesRefuseMetadata.Load() && carriesHookMetadata(req.DeclaredHooks) {
+	if s.capabilitiesRefuseMetadata.Load() && carriesHookMetadata(req) {
 		writeProblem(w, r, http.StatusBadRequest, "malformed_capabilities_request",
-			"declared_hooks carries an unknown field")
+			"the manifest carries an unknown field")
 		return
 	}
 
@@ -1295,6 +1317,14 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 			writeProblem(w, r, http.StatusBadRequest, code, detail)
 			return
 		}
+		if detail := checkDeclaredHookSource(h); detail != "" {
+			writeProblem(w, r, http.StatusBadRequest, "declared_hook_invalid", detail)
+			return
+		}
+	}
+	if code, detail := checkHookRolloutErrors(req.HookRolloutErrors); code != "" {
+		writeProblem(w, r, http.StatusBadRequest, code, detail)
+		return
 	}
 
 	// The two inventories fail as 422, not 400: the envelope decoded, but a
@@ -1338,15 +1368,85 @@ const (
 	maxBuiltinActionParameters = 64
 )
 
-// carriesHookMetadata reports whether any entry carries one of the four fields
-// a short {name, checksum} entry leaves out.
-func carriesHookMetadata(hooks []api.DeclaredHook) bool {
-	for _, h := range hooks {
-		if h.Description != "" || len(h.Parameters) > 0 || h.TimeoutSeconds != 0 || h.SandboxLevel != "" {
+// The limits on the members a rolled-out hook adds to the manifest: the mock's
+// own copy of the numbers in the contract's Published hooks section, for the
+// reason the declared hook limits above are its own. The detail limit counts
+// Unicode code points.
+const (
+	maxHookVersion            = math.MaxInt32
+	maxHookRolloutErrors      = 64
+	maxHookRolloutDetailChars = 1024
+)
+
+var (
+	// hookNameRe is the mock's own copy of the contract's published-hook name
+	// grammar. It names the hook of a hook_rollout_errors entry and of a
+	// version POST /test/configure-hook-versions configures.
+	hookNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
+	// hookRolloutCodeRe matches a hook_rollout_errors entry's code. The
+	// contract takes any code inside it, not only the four it documents, so a
+	// newer agent's code never costs the manifest.
+	hookRolloutCodeRe = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
+)
+
+// carriesHookMetadata reports whether the manifest carries anything a control
+// plane from before the hook metadata refuses as an unknown key: one of the
+// six fields a short {name, checksum} entry leaves out, on any entry, or a
+// hook_rollout_errors entry.
+func carriesHookMetadata(req api.CapabilityManifestRequest) bool {
+	for _, h := range req.DeclaredHooks {
+		if h.Description != "" || len(h.Parameters) > 0 || h.TimeoutSeconds != 0 || h.SandboxLevel != "" ||
+			h.Source != "" || h.Version != 0 {
 			return true
 		}
 	}
-	return false
+	return len(req.HookRolloutErrors) > 0
+}
+
+// checkDeclaredHookSource enforces the contract's rules for the source and
+// version members and returns the detail of a 400 declared_hook_invalid, or an
+// empty string. source is absent, local or rollout. A rollout entry needs a
+// version from 1 to 2147483647, and any other entry may carry none. The decode
+// into plexd's own type reads an absent member as its zero value, so an
+// explicit "source":"" passes as absent, and an explicit "version":0 as no
+// version.
+func checkDeclaredHookSource(h api.DeclaredHook) string {
+	switch h.Source {
+	case "", api.HookSourceLocal:
+		if h.Version != 0 {
+			return fmt.Sprintf("declared hook %s: version is refused on an entry whose source is not rollout", h.Name)
+		}
+	case api.HookSourceRollout:
+		if h.Version < 1 || h.Version > maxHookVersion {
+			return fmt.Sprintf("declared hook %s: a rollout entry needs a version between 1 and %d", h.Name, maxHookVersion)
+		}
+	default:
+		return fmt.Sprintf("declared hook %s: source must be local or rollout", h.Name)
+	}
+	return ""
+}
+
+// checkHookRolloutErrors enforces the limits on hook_rollout_errors and returns
+// the 400 problem code and detail of the first violation, or an empty code:
+// hook_rollout_errors_too_many past 64 entries, and hook_rollout_error_invalid
+// for an entry whose name is off the grammar, whose version is outside 1 to
+// 2147483647, whose code does not match hookRolloutCodeRe, or whose detail is
+// over 1024 code points or holds a NUL.
+func checkHookRolloutErrors(errs []api.HookRolloutError) (code, detail string) {
+	if len(errs) > maxHookRolloutErrors {
+		return "hook_rollout_errors_too_many",
+			fmt.Sprintf("hook_rollout_errors carries %d entries, at most %d are accepted", len(errs), maxHookRolloutErrors)
+	}
+	for i, e := range errs {
+		if !hookNameRe.MatchString(e.Name) || e.Version < 1 || e.Version > maxHookVersion ||
+			!hookRolloutCodeRe.MatchString(e.Code) || !hookTextValid(e.Detail, maxHookRolloutDetailChars) {
+			return "hook_rollout_error_invalid", fmt.Sprintf("hook_rollout_errors entry %d breaks a limit: "+
+				"the name must match the hook name grammar, the version must be between 1 and %d, "+
+				"the code must match %s, and the detail must be at most %d characters with no NUL",
+				i, maxHookVersion, hookRolloutCodeRe, maxHookRolloutDetailChars)
+		}
+	}
+	return "", ""
 }
 
 // checkDeclaredHookMetadata enforces the limits on what a hook's sidecar
@@ -1766,6 +1866,121 @@ func mockEdgePSK(peerID string) []byte {
 func isFixturePeer(peerID string) bool {
 	for _, p := range newStateFixture().Peers {
 		if p.NodeID == peerID {
+			return true
+		}
+	}
+	return false
+}
+
+// hookVersionKey names one published hook version: a hook name and a version
+// number, the pair a hooks block entry lists and the fetch path carries.
+type hookVersionKey struct {
+	name    string
+	version int
+}
+
+// publishedHookVersion is one version POST /test/configure-hook-versions
+// configured, held the way the fetch serves it. The id and issued_at are fixed
+// when the version is configured, which stands for the moment the control
+// plane publishes it. The envelope is signed only when served, as the control
+// plane's fetch signs a version again under the Domain's active key, so a
+// fetch after POST /test/rotate-signing-key names the key the next pull hands
+// out.
+type publishedHookVersion struct {
+	id       string
+	issuedAt time.Time
+	payload  json.RawMessage
+	// scriptBase64 is the script as served. For tamper "script" it is one byte
+	// longer than the script the payload's checksum covers.
+	scriptBase64 string
+	// flipSignature is set for tamper "signature": the fetch flips one bit of
+	// the signature it made.
+	flipSignature bool
+}
+
+// The tamper modes of a configured hook version. Each spoils one check a node
+// makes before it installs a version, so a test can prove the node makes it.
+const (
+	hookTamperScript    = "script"
+	hookTamperSignature = "signature"
+)
+
+// handleHookVersion handles GET /v1/nodes/{id}/hooks/{name}/versions/{version},
+// the fetch of one published hook version, behind the NSK bearer gate every
+// node route sits behind. A path id other than the registered node is 403
+// node_id_mismatch. A pair that the state fixture's hooks block does not list,
+// or that POST /test/configure-hook-versions did not configure, is 404
+// hook_not_assigned, as is a version segment that is not the plain decimal of
+// a version, because no block can list one. While the configured fail_next
+// lasts, a fetch that gets past those answers is 503 signing_unavailable; the
+// CompareAndSwap decrement keeps the "exactly N" guarantee under concurrent
+// fetches, and a refused fetch spends no count.
+//
+// Otherwise the answer is the contract's NodeHookVersion: a hook_version
+// envelope signed now with the mock's current key, and the script in standard
+// base64. hook_fetch_count counts only that 200.
+func (s *Server) handleHookVersion(w http.ResponseWriter, r *http.Request) {
+	if r.PathValue("id") != mockNodeID {
+		writeProblem(w, r, http.StatusForbidden, "node_id_mismatch", "resolved NSK Node id does not match URL path id.")
+		return
+	}
+
+	name, rawVersion := r.PathValue("name"), r.PathValue("version")
+	version, err := strconv.Atoi(rawVersion)
+	s.hookVersionsMu.RLock()
+	published, configured := s.hookVersions[hookVersionKey{name: name, version: version}]
+	s.hookVersionsMu.RUnlock()
+	if err != nil || strconv.Itoa(version) != rawVersion || !configured || !s.hookAssigned(name, version) {
+		writeProblem(w, r, http.StatusNotFound, "hook_not_assigned", "the node's desired set does not list this version of this hook.")
+		return
+	}
+
+	for {
+		n := s.hookVersionFailNext.Load()
+		if n <= 0 {
+			break
+		}
+		if s.hookVersionFailNext.CompareAndSwap(n, n-1) {
+			writeProblem(w, r, http.StatusServiceUnavailable, "signing_unavailable", "failure armed by POST /test/configure-hook-versions")
+			return
+		}
+	}
+
+	envelope := api.Envelope{
+		ID:       published.id,
+		Type:     api.HookVersionEnvelopeType,
+		IssuedAt: published.issuedAt,
+		Payload:  published.payload,
+	}
+	if err := s.signEnvelope(&envelope); err != nil {
+		writeProblem(w, r, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	if published.flipSignature {
+		sig, err := base64.StdEncoding.DecodeString(envelope.Signature)
+		if err != nil {
+			writeProblem(w, r, http.StatusInternalServerError, "internal", "decode the mock's own signature: "+err.Error())
+			return
+		}
+		sig[0] ^= 0x01
+		envelope.Signature = base64.StdEncoding.EncodeToString(sig)
+	}
+
+	s.hookFetchCount.Add(1)
+	writeJSON(w, http.StatusOK, api.NodeHookVersion{Envelope: envelope, ScriptBase64: published.scriptBase64})
+}
+
+// hookAssigned reports whether the state fixture's hooks block lists the given
+// version of the hook name, the control plane's test of whether a rollout
+// reaches the node. A null block lists nothing.
+func (s *Server) hookAssigned(name string, version int) bool {
+	s.stateFixtureMu.RLock()
+	defer s.stateFixtureMu.RUnlock()
+	if s.stateFixture.Hooks == nil {
+		return false
+	}
+	for _, h := range *s.stateFixture.Hooks {
+		if h.Name == name && h.Version == version {
 			return true
 		}
 	}
@@ -3093,8 +3308,10 @@ func (s *Server) SetState(state api.NodeStateSnapshot) {
 
 // GetState returns the current state fixture with the peers, executions,
 // sessions, and secrets slices normalized to non-nil so they always serialize
-// as [] rather than null. The ten envelope blocks carry no omitempty, so all
-// keys are emitted (null for unpopulated blocks).
+// as [] rather than null. The eleven envelope blocks carry no omitempty, so all
+// keys are emitted (null for unpopulated blocks). The hooks block is left as
+// configured: a fixture without one serves null, which keeps every hook a
+// rollout installed.
 //
 // The result is a SHALLOW copy: the policy, bridge, state, and reports pointers
 // and the peers, executions, sessions, and secrets backing arrays alias the
@@ -3509,6 +3726,146 @@ func (s *Server) handleConfigureSecrets(w http.ResponseWriter, r *http.Request) 
 		s.secretRetryAfterSeconds.Store(body.RetryAfterSeconds)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// hookVersionConfig is one entry of POST /test/configure-hook-versions: a
+// version to serve, the sidecar fields its signed payload declares, and the
+// tamper mode that spoils it, if any.
+type hookVersionConfig struct {
+	Name           string            `json:"name"`
+	Version        int               `json:"version"`
+	ScriptBase64   string            `json:"script_base64"`
+	Description    string            `json:"description"`
+	Parameters     []api.ActionParam `json:"parameters"`
+	TimeoutSeconds int64             `json:"timeout_seconds"`
+	SandboxLevel   string            `json:"sandbox_level"`
+	Tamper         string            `json:"tamper"`
+}
+
+// configuredHookVersion is one entry of the answer to
+// POST /test/configure-hook-versions: the pair and the checksum a test splices
+// into the hooks block.
+type configuredHookVersion struct {
+	Name     string `json:"name"`
+	Version  int    `json:"version"`
+	Checksum string `json:"checksum"`
+}
+
+// handleConfigureHookVersions handles POST /test/configure-hook-versions. From
+// {"versions":[...],"fail_next":N} it replaces the whole set of published hook
+// versions the fetch serves and sets how many of the next fetches answer 503
+// signing_unavailable, so a field left out empties the set or clears the
+// count. It answers 200 {"versions":[{"name","version","checksum"}]} in the
+// order configured, the checksum being the standard-base64 SHA-256 of the
+// script as configured, so a test can splice it into the hooks block.
+//
+// Decoding is strict. An unknown field, a name off the published-hook grammar,
+// a version below 1, a pair configured twice, a script_base64 that is not
+// standard base64, a tamper other than "", "script" or "signature", or a
+// negative N is a 400 and changes nothing.
+func (s *Server) handleConfigureHookVersions(w http.ResponseWriter, r *http.Request) {
+	data, err := s.captureBody("configure_hook_versions", r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	var body struct {
+		Versions []hookVersionConfig `json:"versions"`
+		FailNext int64               `json:"fail_next"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if body.FailNext < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "fail_next must not be negative"})
+		return
+	}
+
+	// One instant for the whole set: every version configured together reads
+	// as published together.
+	issuedAt := time.Now().UTC()
+	versions := make(map[hookVersionKey]publishedHookVersion, len(body.Versions))
+	answer := make([]configuredHookVersion, 0, len(body.Versions))
+	for i, c := range body.Versions {
+		published, checksum, err := newPublishedHookVersion(c, issuedAt)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("versions[%d]: %v", i, err)})
+			return
+		}
+		key := hookVersionKey{name: c.Name, version: c.Version}
+		if _, dup := versions[key]; dup {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("versions[%d]: version %d of %s is configured twice", i, c.Version, c.Name),
+			})
+			return
+		}
+		versions[key] = published
+		answer = append(answer, configuredHookVersion{Name: c.Name, Version: c.Version, Checksum: checksum})
+	}
+
+	s.hookVersionsMu.Lock()
+	s.hookVersions = versions
+	s.hookVersionsMu.Unlock()
+	s.hookVersionFailNext.Store(body.FailNext)
+	writeJSON(w, http.StatusOK, map[string][]configuredHookVersion{"versions": answer})
+}
+
+// newPublishedHookVersion checks one configured version and builds it as the
+// fetch serves it, returning it with the wire checksum of the script as
+// configured. The payload is the contract's HookVersionPayload for the mock's
+// Project. An empty sandbox_level is served as "none", as the control plane
+// stores an absent level, so a test sets one only to send another.
+func newPublishedHookVersion(c hookVersionConfig, issuedAt time.Time) (publishedHookVersion, string, error) {
+	if !hookNameRe.MatchString(c.Name) {
+		return publishedHookVersion{}, "", fmt.Errorf("name %q is outside the grammar %s", c.Name, hookNameRe)
+	}
+	if c.Version < 1 {
+		return publishedHookVersion{}, "", fmt.Errorf("version must be at least 1, got %d", c.Version)
+	}
+	script, err := base64.StdEncoding.DecodeString(c.ScriptBase64)
+	if err != nil {
+		return publishedHookVersion{}, "", fmt.Errorf("script_base64 is not standard base64: %w", err)
+	}
+	switch c.Tamper {
+	case "", hookTamperScript, hookTamperSignature:
+	default:
+		return publishedHookVersion{}, "", fmt.Errorf("tamper %q is not one of \"\", %q or %q", c.Tamper, hookTamperScript, hookTamperSignature)
+	}
+
+	sum := sha256.Sum256(script)
+	checksum := base64.StdEncoding.EncodeToString(sum[:])
+	sandboxLevel := c.SandboxLevel
+	if sandboxLevel == "" {
+		sandboxLevel = "none"
+	}
+	payload, err := json.Marshal(api.HookVersionPayload{
+		ProjectID:      mockProjectID,
+		Name:           c.Name,
+		Version:        c.Version,
+		Checksum:       checksum,
+		Description:    c.Description,
+		Parameters:     c.Parameters,
+		TimeoutSeconds: c.TimeoutSeconds,
+		SandboxLevel:   sandboxLevel,
+	})
+	if err != nil {
+		return publishedHookVersion{}, "", fmt.Errorf("marshal payload: %w", err)
+	}
+
+	served := script
+	if c.Tamper == hookTamperScript {
+		served = append(bytes.Clone(script), '\n')
+	}
+	return publishedHookVersion{
+		id:            newUUID(),
+		issuedAt:      issuedAt,
+		payload:       payload,
+		scriptBase64:  base64.StdEncoding.EncodeToString(served),
+		flipSignature: c.Tamper == hookTamperSignature,
+	}, checksum, nil
 }
 
 // handleConfigureEvents handles POST /test/configure-events. It flips the event

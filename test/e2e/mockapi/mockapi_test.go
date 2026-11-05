@@ -24,6 +24,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1687,6 +1688,10 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	resp.Body.Close()
 	resp = doRequest(t, http.MethodPost, ts.URL+"/v1/nodes/n1/handshakes", handshakeBody())
 	resp.Body.Close()
+	// The hook version fetch serves only a version the hooks block lists.
+	publishHookVersions(t, ts.URL, hookVersionEntry("backup-db", 1, testHookScript, nil))
+	resp = doRequest(t, http.MethodGet, hookVersionURL(ts.URL, testMockNodeID, "backup-db", 1), "")
+	resp.Body.Close()
 
 	// Inject one SSE event.
 	envJSON, _ := json.Marshal(makeEnvelope("test_mixed", "evt-mixed-001", json.RawMessage(`{}`)))
@@ -1752,6 +1757,9 @@ func TestAssertions_ReturnsCorrectCountsAfterMixedCalls(t *testing.T) {
 	if a.HandshakeReportCount != 1 {
 		t.Errorf("handshake_report_count = %d, want 1", a.HandshakeReportCount)
 	}
+	if a.HookFetchCount != 1 {
+		t.Errorf("hook_fetch_count = %d, want 1", a.HookFetchCount)
+	}
 	if a.InjectEventCount != 1 {
 		t.Errorf("inject_event_count = %d, want 1", a.InjectEventCount)
 	}
@@ -1769,11 +1777,16 @@ func TestAssertions_InitialZero(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestConcurrentCounters(t *testing.T) {
-	_, ts := newTestServer(t)
+	srv, ts := newTestServer(t)
 
 	// The session activity fan-out posts tcp rows, so its id has to resolve to a
-	// live tcp session for all n of them to count as accepted.
-	configureSessions(t, ts.URL, stateSession("sess-conc", 22))
+	// live tcp session for all n of them to count as accepted. The hook version
+	// fan-out fetches a configured version, so the hooks block has to list it.
+	// One snapshot carries both blocks, because each one replaces the fixture.
+	configured := configureHookVersions(t, ts.URL, 0, hookVersionEntry("conc-hook", 1, testHookScript, nil))
+	sessions := []api.NodeStateSession{stateSession("sess-conc", 22)}
+	hooks := []api.NodeStateHook{{Name: "conc-hook", Version: 1, Checksum: configured[0].Checksum}}
+	srv.SetState(api.NodeStateSnapshot{Sessions: &sessions, Hooks: &hooks})
 
 	const n = 100
 
@@ -1798,6 +1811,7 @@ func TestConcurrentCounters(t *testing.T) {
 		{http.MethodPost, "/v1/nodes/node-1/integrity-violations", integrityViolationBody},
 		{http.MethodPost, "/v1/nodes/node-1/handshakes", handshakeBody(handshakeEntry(testFixturePeerB1, 5, "198.51.100.7:51820"))},
 		{http.MethodGet, "/v1/nodes/" + testMockNodeID + "/peers/" + testFixturePeerB1 + "/psk", ""},
+		{http.MethodGet, "/v1/nodes/" + testMockNodeID + "/hooks/conc-hook/versions/1", ""},
 		{http.MethodPost, "/test/inject-event", `{"id":"e1","type":"conc","payload":{},"signature":"s"}`},
 	}
 
@@ -8795,5 +8809,861 @@ func TestEdgePSK_RequiresBearer(t *testing.T) {
 	}
 	if a := srv.Assertions(); a.EdgePSKCount != 0 {
 		t.Errorf("edge_psk_count = %d without the bearer envelope, want 0", a.EdgePSKCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Published hook versions (issue #156)
+// ---------------------------------------------------------------------------
+
+// testHookScript is the script the published hook version fixtures serve.
+const testHookScript = "#!/bin/sh\necho backup-db\n"
+
+// lowerUUIDRe matches a lowercase hyphenated UUID, the form the contract gives
+// an envelope id.
+var lowerUUIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// hookVersionEntry is one entry of POST /test/configure-hook-versions: the given
+// pair and script, and the given extra members.
+func hookVersionEntry(name string, version int, script string, extra map[string]any) map[string]any {
+	entry := map[string]any{
+		"name":          name,
+		"version":       version,
+		"script_base64": base64.StdEncoding.EncodeToString([]byte(script)),
+	}
+	for k, v := range extra {
+		entry[k] = v
+	}
+	return entry
+}
+
+// configuredHookVersion is one entry of the answer to
+// POST /test/configure-hook-versions.
+type configuredHookVersion struct {
+	Name     string `json:"name"`
+	Version  int    `json:"version"`
+	Checksum string `json:"checksum"`
+}
+
+// hookVersionsBody is a POST /test/configure-hook-versions body carrying the
+// given versions and fail_next.
+func hookVersionsBody(t *testing.T, failNext int, entries ...map[string]any) string {
+	t.Helper()
+	if entries == nil {
+		entries = []map[string]any{}
+	}
+	data, err := json.Marshal(map[string]any{"versions": entries, "fail_next": failNext})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// configureHookVersions posts the given versions and fail_next, requires a 200,
+// and returns the answer's versions, decoded strictly so a member the route
+// grows shows up here.
+func configureHookVersions(t *testing.T, baseURL string, failNext int, entries ...map[string]any) []configuredHookVersion {
+	t.Helper()
+	resp := doRequest(t, http.MethodPost, baseURL+"/test/configure-hook-versions", hookVersionsBody(t, failNext, entries...))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("configure-hook-versions status = %d, want %d (body: %s)", resp.StatusCode, http.StatusOK, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("configure-hook-versions Content-Type = %q, want %q", ct, "application/json")
+	}
+	var answer struct {
+		Versions []configuredHookVersion `json:"versions"`
+	}
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&answer); err != nil {
+		t.Fatalf("decode configure-hook-versions answer: %v", err)
+	}
+	return answer.Versions
+}
+
+// configureHooks posts a snapshot carrying only the given hooks block.
+func configureHooks(t *testing.T, baseURL string, hooks ...api.NodeStateHook) {
+	t.Helper()
+	if hooks == nil {
+		hooks = []api.NodeStateHook{}
+	}
+	body, err := json.Marshal(api.NodeStateSnapshot{Hooks: &hooks})
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	resp := doRequest(t, http.MethodPost, baseURL+"/test/configure-state", string(body))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-state status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+// publishHookVersions configures the given versions with no armed failure and
+// a hooks block that lists each of them with its checksum, as a rollout of
+// each would, and returns the configure answer.
+func publishHookVersions(t *testing.T, baseURL string, entries ...map[string]any) []configuredHookVersion {
+	t.Helper()
+	configured := configureHookVersions(t, baseURL, 0, entries...)
+	hooks := make([]api.NodeStateHook, 0, len(configured))
+	for _, c := range configured {
+		hooks = append(hooks, api.NodeStateHook{Name: c.Name, Version: c.Version, Checksum: c.Checksum})
+	}
+	configureHooks(t, baseURL, hooks...)
+	return configured
+}
+
+func hookVersionURL(baseURL, nodeID, name string, version int) string {
+	return fmt.Sprintf("%s/v1/nodes/%s/hooks/%s/versions/%d", baseURL, nodeID, name, version)
+}
+
+// fetchHookVersion fetches a version as the registered node, requires a 200,
+// and decodes the body strictly into the contract's NodeHookVersion.
+func fetchHookVersion(t *testing.T, baseURL, name string, version int) api.NodeHookVersion {
+	t.Helper()
+	resp := doRequest(t, http.MethodGet, hookVersionURL(baseURL, testMockNodeID, name, version), "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET version %d of %s: status = %d, want %d (body: %s)", version, name, resp.StatusCode, http.StatusOK, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+	}
+	var hv api.NodeHookVersion
+	dec := json.NewDecoder(resp.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&hv); err != nil {
+		t.Fatalf("decode hook version: %v", err)
+	}
+	return hv
+}
+
+// wireChecksum is the SHA-256 of b in the wire form: 32 bytes, standard base64.
+func wireChecksum(b []byte) string {
+	sum := sha256.Sum256(b)
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+// hookVersionPayload decodes a served envelope's payload strictly into the
+// contract's HookVersionPayload.
+func hookVersionPayload(t *testing.T, hv api.NodeHookVersion) api.HookVersionPayload {
+	t.Helper()
+	var payload api.HookVersionPayload
+	dec := json.NewDecoder(bytes.NewReader(hv.Envelope.Payload))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&payload); err != nil {
+		t.Fatalf("decode hook version payload %s: %v", hv.Envelope.Payload, err)
+	}
+	return payload
+}
+
+// servedScript decodes a served version's script.
+func servedScript(t *testing.T, hv api.NodeHookVersion) []byte {
+	t.Helper()
+	script, err := base64.StdEncoding.DecodeString(hv.ScriptBase64)
+	if err != nil {
+		t.Fatalf("script_base64 is not standard base64: %v", err)
+	}
+	return script
+}
+
+// The configure answer names each version with the checksum of its script as
+// configured, in the order configured, so a test can splice it into the
+// hooks block. A tampered script keeps the checksum of the untampered one,
+// which is what makes the served script fail it.
+func TestConfigureHookVersions_AnswersChecksums(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	const otherScript = "#!/bin/sh\necho rotate-logs\n"
+	got := configureHookVersions(t, ts.URL, 0,
+		hookVersionEntry("rotate-logs", 1, otherScript, nil),
+		hookVersionEntry("backup-db", 2, testHookScript, nil),
+		hookVersionEntry("backup-db", 3, testHookScript, map[string]any{"tamper": "script"}),
+	)
+	want := []configuredHookVersion{
+		{Name: "rotate-logs", Version: 1, Checksum: wireChecksum([]byte(otherScript))},
+		{Name: "backup-db", Version: 2, Checksum: wireChecksum([]byte(testHookScript))},
+		{Name: "backup-db", Version: 3, Checksum: wireChecksum([]byte(testHookScript))},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("answer = %+v, want %+v", got, want)
+	}
+
+	// An empty set is a set too: the answer lists nothing rather than null.
+	resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-hook-versions", `{}`)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != `{"versions":[]}` {
+		t.Errorf("empty configure: status = %d, body = %s; want 200 {\"versions\":[]}", resp.StatusCode, body)
+	}
+}
+
+// Every body the route refuses answers 400 and changes nothing: neither the
+// served set nor the armed failure.
+func TestConfigureHookVersions_Refusals(t *testing.T) {
+	valid := hookVersionEntry("rotate-logs", 1, testHookScript, nil)
+	with := func(member string, value any) map[string]any {
+		return hookVersionEntry("rotate-logs", 1, testHookScript, map[string]any{member: value})
+	}
+
+	for _, tc := range []struct {
+		name string
+		body func(t *testing.T) string
+	}{
+		{"not JSON", func(*testing.T) string { return "not-json" }},
+		{"unknown top-level field", func(*testing.T) string { return `{"versions":[],"fail_nxt":1}` }},
+		{"unknown entry field", func(t *testing.T) string { return hookVersionsBody(t, 0, with("sandbox", "none")) }},
+		{"unknown parameter field", func(t *testing.T) string {
+			return hookVersionsBody(t, 0, with("parameters", []map[string]any{{"name": "database", "kind": "string"}}))
+		}},
+		{"unknown tamper", func(t *testing.T) string { return hookVersionsBody(t, 0, with("tamper", "checksum")) }},
+		{"uppercase name", func(t *testing.T) string { return hookVersionsBody(t, 0, with("name", "Backup")) }},
+		{"dotted name", func(t *testing.T) string { return hookVersionsBody(t, 0, with("name", "backup.db")) }},
+		{"path name", func(t *testing.T) string { return hookVersionsBody(t, 0, with("name", "../x")) }},
+		{"empty name", func(t *testing.T) string { return hookVersionsBody(t, 0, with("name", "")) }},
+		{"64-character name", func(t *testing.T) string { return hookVersionsBody(t, 0, with("name", strings.Repeat("a", 64))) }},
+		{"version 0", func(t *testing.T) string { return hookVersionsBody(t, 0, with("version", 0)) }},
+		{"negative version", func(t *testing.T) string { return hookVersionsBody(t, 0, with("version", -1)) }},
+		{"script not base64", func(t *testing.T) string { return hookVersionsBody(t, 0, with("script_base64", "not base64!")) }},
+		{"script in URL base64", func(t *testing.T) string {
+			return hookVersionsBody(t, 0, with("script_base64", base64.RawURLEncoding.EncodeToString([]byte{0xfb, 0xff})))
+		}},
+		{"pair configured twice", func(t *testing.T) string { return hookVersionsBody(t, 0, valid, valid) }},
+		{"negative fail_next", func(t *testing.T) string { return hookVersionsBody(t, -1, valid) }},
+		{"fail_next as a string", func(*testing.T) string { return `{"versions":[],"fail_next":"2"}` }},
+		// A refused entry after a valid one leaves the valid one out as well.
+		{"bad entry after a good one", func(t *testing.T) string {
+			return hookVersionsBody(t, 3, valid, hookVersionEntry("Backup", 1, testHookScript, nil))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			configured := configureHookVersions(t, ts.URL, 0, hookVersionEntry("backup-db", 1, testHookScript, nil))
+			configureHooks(t, ts.URL,
+				api.NodeStateHook{Name: "backup-db", Version: 1, Checksum: configured[0].Checksum},
+				api.NodeStateHook{Name: "rotate-logs", Version: 1, Checksum: configured[0].Checksum},
+			)
+
+			resp := doRequest(t, http.MethodPost, ts.URL+"/test/configure-hook-versions", tc.body(t))
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusBadRequest, body)
+			}
+
+			// The set configured before is still served, with no failure armed,
+			// and the refused body added nothing to it.
+			fetchHookVersion(t, ts.URL, "backup-db", 1)
+			notAdded := doRequest(t, http.MethodGet, hookVersionURL(ts.URL, testMockNodeID, "rotate-logs", 1), "")
+			defer notAdded.Body.Close()
+			assertProblem(t, notAdded, http.StatusNotFound, "hook_not_assigned")
+		})
+	}
+}
+
+// Each POST replaces the whole set, so a version left out is no longer served.
+func TestConfigureHookVersions_ReplacesTheSet(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	publishHookVersions(t, ts.URL, hookVersionEntry("backup-db", 1, testHookScript, nil))
+	fetchHookVersion(t, ts.URL, "backup-db", 1)
+
+	configured := configureHookVersions(t, ts.URL, 0, hookVersionEntry("backup-db", 2, testHookScript, nil))
+	configureHooks(t, ts.URL,
+		api.NodeStateHook{Name: "backup-db", Version: 1, Checksum: configured[0].Checksum},
+		api.NodeStateHook{Name: "backup-db", Version: 2, Checksum: configured[0].Checksum},
+	)
+	resp := doRequest(t, http.MethodGet, hookVersionURL(ts.URL, testMockNodeID, "backup-db", 1), "")
+	defer resp.Body.Close()
+	assertProblem(t, resp, http.StatusNotFound, "hook_not_assigned")
+	fetchHookVersion(t, ts.URL, "backup-db", 2)
+}
+
+// A served version passes the checks a node makes before it installs one: the
+// envelope is a hook_version envelope signed by the key register and the pull
+// hand out, its payload names the fetched pair, and the script hashes to the
+// payload's checksum, which is the one the configure answer gave for the
+// hooks block.
+func TestHookVersion_ServesVerifiableVersion(t *testing.T) {
+	_, ts := newTestServer(t)
+	verifier := mockVerifier(t, ts.URL)
+	pulled := pulledSigningKey(t, ts.URL)
+
+	params := []api.ActionParam{{Name: "database", Type: "string", Description: "Database to dump."}}
+	before := time.Now()
+	configured := publishHookVersions(t, ts.URL,
+		hookVersionEntry("backup-db", 2, testHookScript, map[string]any{
+			"description":     "Dump the application database.",
+			"parameters":      params,
+			"timeout_seconds": 600,
+		}),
+		hookVersionEntry("rotate-logs", 1, "#!/bin/sh\n", nil),
+	)
+	after := time.Now()
+
+	hv := fetchHookVersion(t, ts.URL, "backup-db", 2)
+	env := hv.Envelope
+	if env.Type != "hook_version" {
+		t.Errorf("type = %q, want %q", env.Type, "hook_version")
+	}
+	if !lowerUUIDRe.MatchString(env.ID) {
+		t.Errorf("id = %q, want a lowercase hyphenated UUID", env.ID)
+	}
+	if env.Scope != "domain:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1" {
+		t.Errorf("scope = %q, want the mock's Domain scope", env.Scope)
+	}
+	if env.KeyID != pulled.KeyID {
+		t.Errorf("key_id = %q, want the pull's %q", env.KeyID, pulled.KeyID)
+	}
+	if env.IssuedAt.Before(before) || env.IssuedAt.After(after) {
+		t.Errorf("issued_at = %v, want the configure time, between %v and %v", env.IssuedAt, before, after)
+	}
+	if env.IssuedAt.Location() != time.UTC {
+		t.Errorf("issued_at = %v, want UTC", env.IssuedAt)
+	}
+	if err := verifier.VerifySignature(env); err != nil {
+		t.Errorf("VerifySignature() = %v, want nil", err)
+	}
+
+	wantPayload := api.HookVersionPayload{
+		ProjectID:      testMockProjectID,
+		Name:           "backup-db",
+		Version:        2,
+		Checksum:       configured[0].Checksum,
+		Description:    "Dump the application database.",
+		Parameters:     params,
+		TimeoutSeconds: 600,
+		SandboxLevel:   "none",
+	}
+	if got := hookVersionPayload(t, hv); !reflect.DeepEqual(got, wantPayload) {
+		t.Errorf("payload = %+v, want %+v", got, wantPayload)
+	}
+	script := servedScript(t, hv)
+	if string(script) != testHookScript {
+		t.Errorf("script = %q, want %q", script, testHookScript)
+	}
+	if wireChecksum(script) != configured[0].Checksum {
+		t.Errorf("script SHA-256 = %s, want the payload checksum %s", wireChecksum(script), configured[0].Checksum)
+	}
+
+	// A version that declares no sidecar fields leaves them out of the payload,
+	// and sandbox_level, which the payload always carries, reads none.
+	bare := fetchHookVersion(t, ts.URL, "rotate-logs", 1)
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(bare.Envelope.Payload, &members); err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for k := range members {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if got, want := strings.Join(keys, ","), "checksum,name,project_id,sandbox_level,version"; got != want {
+		t.Errorf("bare payload keys = %s, want %s", got, want)
+	}
+	if got := string(members["sandbox_level"]); got != `"none"` {
+		t.Errorf("bare sandbox_level = %s, want \"none\"", got)
+	}
+	if err := verifier.VerifySignature(bare.Envelope); err != nil {
+		t.Errorf("VerifySignature(bare) = %v, want nil", err)
+	}
+
+	if a := getAssertions(t, ts.URL); a.HookFetchCount != 2 {
+		t.Errorf("hook_fetch_count = %d, want 2", a.HookFetchCount)
+	}
+}
+
+// pulledSigningKey returns the signing key the mock's pull hands the node.
+func pulledSigningKey(t *testing.T, baseURL string) api.NodeStateSigningKey {
+	t.Helper()
+	key := getState(t, baseURL).SigningKey
+	if key == nil {
+		t.Fatal("the pull carries no signing_key")
+	}
+	return *key
+}
+
+// A sandbox level the version declares is served as declared, so a test can
+// hand a node one it refuses.
+func TestHookVersion_ServesTheConfiguredSandboxLevel(t *testing.T) {
+	_, ts := newTestServer(t)
+	publishHookVersions(t, ts.URL, hookVersionEntry("backup-db", 1, testHookScript, map[string]any{"sandbox_level": "container"}))
+
+	if got := hookVersionPayload(t, fetchHookVersion(t, ts.URL, "backup-db", 1)).SandboxLevel; got != "container" {
+		t.Errorf("sandbox_level = %q, want %q", got, "container")
+	}
+}
+
+// The id and issued_at are fixed when the version is configured, and the
+// signature is made when it is served: after a key rotation the same version
+// is served under the new key, which a verifier holding only the old key
+// refuses and one that installed the pulled key accepts.
+func TestHookVersion_SignedWhenServed(t *testing.T) {
+	_, ts := newTestServer(t)
+	verifier := mockVerifier(t, ts.URL)
+	publishHookVersions(t, ts.URL, hookVersionEntry("backup-db", 1, testHookScript, nil))
+
+	first := fetchHookVersion(t, ts.URL, "backup-db", 1)
+	rotated := rotateMockSigningKey(t, ts.URL)
+	second := fetchHookVersion(t, ts.URL, "backup-db", 1)
+
+	if second.Envelope.ID != first.Envelope.ID || !second.Envelope.IssuedAt.Equal(first.Envelope.IssuedAt) {
+		t.Errorf("second fetch id/issued_at = %s/%v, want the first's %s/%v",
+			second.Envelope.ID, second.Envelope.IssuedAt, first.Envelope.ID, first.Envelope.IssuedAt)
+	}
+	if second.Envelope.KeyID != rotated.KeyID {
+		t.Errorf("key_id after the rotation = %q, want %q", second.Envelope.KeyID, rotated.KeyID)
+	}
+	if err := verifier.VerifySignature(second.Envelope); err == nil || err.Error() != "api: verifier: unknown signing key id" {
+		t.Errorf("VerifySignature under the old key = %v, want unknown signing key id", err)
+	}
+	if _, err := verifier.Install(rotated); err != nil {
+		t.Fatalf("Install(rotated) = %v", err)
+	}
+	if err := verifier.VerifySignature(second.Envelope); err != nil {
+		t.Errorf("VerifySignature under the rotated key = %v, want nil", err)
+	}
+}
+
+// Each tamper mode spoils exactly the check it names: "script" serves a script
+// that no longer hashes to the payload's checksum under a valid signature, and
+// "signature" a signature that no longer verifies over an intact script. Both
+// are served with a 200, as a node would meet them.
+func TestHookVersion_TamperModes(t *testing.T) {
+	for _, tc := range []struct {
+		tamper          string
+		wantSignatureOK bool
+		wantScriptOK    bool
+	}{
+		{tamper: "", wantSignatureOK: true, wantScriptOK: true},
+		{tamper: "script", wantSignatureOK: true, wantScriptOK: false},
+		{tamper: "signature", wantSignatureOK: false, wantScriptOK: true},
+	} {
+		t.Run("tamper="+tc.tamper, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			verifier := mockVerifier(t, ts.URL)
+			configured := publishHookVersions(t, ts.URL,
+				hookVersionEntry("backup-db", 3, testHookScript, map[string]any{"tamper": tc.tamper}))
+
+			hv := fetchHookVersion(t, ts.URL, "backup-db", 3)
+			sigErr := verifier.VerifySignature(hv.Envelope)
+			if (sigErr == nil) != tc.wantSignatureOK {
+				t.Errorf("VerifySignature() = %v, want ok = %v", sigErr, tc.wantSignatureOK)
+			}
+			if sigErr != nil && sigErr.Error() != "api: verifier: signature verification failed" {
+				t.Errorf("VerifySignature() = %v, want signature verification failed", sigErr)
+			}
+
+			script := servedScript(t, hv)
+			payload := hookVersionPayload(t, hv)
+			if payload.Checksum != configured[0].Checksum {
+				t.Errorf("payload checksum = %s, want the configured %s", payload.Checksum, configured[0].Checksum)
+			}
+			if got := wireChecksum(script) == payload.Checksum; got != tc.wantScriptOK {
+				t.Errorf("script hashes to the payload checksum = %v, want %v", got, tc.wantScriptOK)
+			}
+			if tc.tamper == "script" && string(script[:len(script)-1]) != testHookScript {
+				t.Errorf("tampered script = %q, want the configured script with one byte appended", script)
+			}
+
+			if a := getAssertions(t, ts.URL); a.HookFetchCount != 1 {
+				t.Errorf("hook_fetch_count = %d, want 1", a.HookFetchCount)
+			}
+		})
+	}
+}
+
+// A pair is served only while the fixture's hooks block lists it and a version
+// of it is configured. Every other fetch is 404 hook_not_assigned and is not
+// counted.
+func TestHookVersion_NotAssigned(t *testing.T) {
+	checksum := wireChecksum([]byte(testHookScript))
+	for _, tc := range []struct {
+		name    string
+		hooks   *[]api.NodeStateHook
+		version string
+	}{
+		{name: "null hooks block", hooks: nil, version: "1"},
+		{name: "empty hooks block", hooks: &[]api.NodeStateHook{}, version: "1"},
+		{name: "block lists another version", hooks: &[]api.NodeStateHook{{Name: "backup-db", Version: 2, Checksum: checksum}}, version: "1"},
+		{name: "block lists another hook", hooks: &[]api.NodeStateHook{{Name: "rotate-logs", Version: 1, Checksum: checksum}}, version: "1"},
+		{name: "block lists a version not configured", hooks: &[]api.NodeStateHook{{Name: "backup-db", Version: 2, Checksum: checksum}}, version: "2"},
+		{name: "version is not a number", hooks: &[]api.NodeStateHook{{Name: "backup-db", Version: 1, Checksum: checksum}}, version: "one"},
+		{name: "version with a leading zero", hooks: &[]api.NodeStateHook{{Name: "backup-db", Version: 1, Checksum: checksum}}, version: "01"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, ts := newTestServer(t)
+			configureHookVersions(t, ts.URL, 0, hookVersionEntry("backup-db", 1, testHookScript, nil))
+			srv.SetState(api.NodeStateSnapshot{Hooks: tc.hooks})
+
+			resp := doRequest(t, http.MethodGet, ts.URL+"/v1/nodes/"+testMockNodeID+"/hooks/backup-db/versions/"+tc.version, "")
+			defer resp.Body.Close()
+			assertProblem(t, resp, http.StatusNotFound, "hook_not_assigned")
+			if a := srv.Assertions(); a.HookFetchCount != 0 {
+				t.Errorf("hook_fetch_count = %d after a 404, want 0", a.HookFetchCount)
+			}
+		})
+	}
+}
+
+// A path naming another node is refused as the contract refuses it.
+func TestHookVersion_ForeignNodeID_Returns403(t *testing.T) {
+	srv, ts := newTestServer(t)
+	publishHookVersions(t, ts.URL, hookVersionEntry("backup-db", 1, testHookScript, nil))
+
+	resp := doRequest(t, http.MethodGet, hookVersionURL(ts.URL, "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0ff", "backup-db", 1), "")
+	defer resp.Body.Close()
+	assertProblem(t, resp, http.StatusForbidden, "node_id_mismatch")
+	if a := srv.Assertions(); a.HookFetchCount != 0 {
+		t.Errorf("hook_fetch_count = %d after a 403, want 0", a.HookFetchCount)
+	}
+}
+
+// fail_next answers exactly the next N fetches of an assigned version with 503
+// signing_unavailable. A fetch the mock refuses before it would sign spends no
+// count, and the next POST sets the count afresh.
+func TestHookVersion_SigningUnavailable(t *testing.T) {
+	get := func(t *testing.T, baseURL, name string) *http.Response {
+		t.Helper()
+		resp := doRequest(t, http.MethodGet, hookVersionURL(baseURL, testMockNodeID, name, 1), "")
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	t.Run("fails_exactly_the_next_n_fetches", func(t *testing.T) {
+		srv, ts := newTestServer(t)
+		configured := configureHookVersions(t, ts.URL, 2, hookVersionEntry("backup-db", 1, testHookScript, nil))
+		configureHooks(t, ts.URL, api.NodeStateHook{Name: "backup-db", Version: 1, Checksum: configured[0].Checksum})
+
+		for i := 1; i <= 2; i++ {
+			assertProblem(t, get(t, ts.URL, "backup-db"), http.StatusServiceUnavailable, "signing_unavailable")
+		}
+		fetchHookVersion(t, ts.URL, "backup-db", 1)
+		if a := srv.Assertions(); a.HookFetchCount != 1 {
+			t.Errorf("hook_fetch_count = %d, want 1: only the 200 counts", a.HookFetchCount)
+		}
+	})
+
+	t.Run("a_refused_fetch_spends_no_count", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configured := configureHookVersions(t, ts.URL, 1, hookVersionEntry("backup-db", 1, testHookScript, nil))
+		configureHooks(t, ts.URL, api.NodeStateHook{Name: "backup-db", Version: 1, Checksum: configured[0].Checksum})
+
+		assertProblem(t, get(t, ts.URL, "rotate-logs"), http.StatusNotFound, "hook_not_assigned")
+		assertProblem(t, get(t, ts.URL, "backup-db"), http.StatusServiceUnavailable, "signing_unavailable")
+		fetchHookVersion(t, ts.URL, "backup-db", 1)
+	})
+
+	t.Run("a_post_sets_the_count_afresh", func(t *testing.T) {
+		_, ts := newTestServer(t)
+		configureHookVersions(t, ts.URL, 5, hookVersionEntry("backup-db", 1, testHookScript, nil))
+		configured := configureHookVersions(t, ts.URL, 0, hookVersionEntry("backup-db", 1, testHookScript, nil))
+		configureHooks(t, ts.URL, api.NodeStateHook{Name: "backup-db", Version: 1, Checksum: configured[0].Checksum})
+
+		fetchHookVersion(t, ts.URL, "backup-db", 1)
+	})
+}
+
+// Under concurrent fetches the armed count is spent exactly: N answers are 503
+// and every other one a counted 200.
+func TestHookVersion_FailNextUnderConcurrency(t *testing.T) {
+	srv, ts := newTestServer(t)
+	const fetches, failNext = 40, 10
+	configured := configureHookVersions(t, ts.URL, failNext, hookVersionEntry("backup-db", 1, testHookScript, nil))
+	configureHooks(t, ts.URL, api.NodeStateHook{Name: "backup-db", Version: 1, Checksum: configured[0].Checksum})
+
+	var ok, unavailable atomic.Int64
+	var wg sync.WaitGroup
+	for range fetches {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// http.Get, not doRequest: a helper that stops with t.Fatalf must not
+			// run outside the test goroutine.
+			resp, err := http.Get(hookVersionURL(ts.URL, testMockNodeID, "backup-db", 1))
+			if err != nil {
+				t.Errorf("GET hook version: %v", err)
+				return
+			}
+			defer resp.Body.Close()
+			_, _ = io.Copy(io.Discard, resp.Body)
+			switch resp.StatusCode {
+			case http.StatusOK:
+				ok.Add(1)
+			case http.StatusServiceUnavailable:
+				unavailable.Add(1)
+			default:
+				t.Errorf("status = %d, want 200 or 503", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if unavailable.Load() != failNext || ok.Load() != fetches-failNext {
+		t.Errorf("answers = %d x 200, %d x 503; want %d and %d", ok.Load(), unavailable.Load(), fetches-failNext, failNext)
+	}
+	if a := srv.Assertions(); a.HookFetchCount != fetches-failNext {
+		t.Errorf("hook_fetch_count = %d, want %d", a.HookFetchCount, fetches-failNext)
+	}
+}
+
+// The fetch is a node route, so it sits behind the NSK bearer gate.
+func TestHookVersion_RequiresBearer(t *testing.T) {
+	srv := mockapi.New()
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	publishHookVersions(t, ts.URL, hookVersionEntry("backup-db", 1, testHookScript, nil))
+
+	resp := doRequest(t, http.MethodGet, hookVersionURL(ts.URL, testMockNodeID, "backup-db", 1), "")
+	defer resp.Body.Close()
+	assertProblem(t, resp, http.StatusUnauthorized, "unauthorized")
+	if a := srv.Assertions(); a.HookFetchCount != 0 {
+		t.Errorf("hook_fetch_count = %d without the bearer envelope, want 0", a.HookFetchCount)
+	}
+}
+
+// Both new routes answer another method with the mock's own JSON 405. net/http
+// answers 405 on its own for a route with a method, in plain text, so the
+// content type is what shows the fallback is registered.
+func TestHookVersionRoutes_WrongMethod_Returns405(t *testing.T) {
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/v1/nodes/" + testMockNodeID + "/hooks/backup-db/versions/1"},
+		{http.MethodPut, "/v1/nodes/" + testMockNodeID + "/hooks/backup-db/versions/1"},
+		{http.MethodGet, "/test/configure-hook-versions"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, tc.method, ts.URL+tc.path, "")
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type = %q, want %q", ct, "application/json")
+			}
+		})
+	}
+}
+
+// rolloutErrorEntry is one hook_rollout_errors entry.
+func rolloutErrorEntry(name string, version int, code, detail string) map[string]any {
+	entry := map[string]any{"name": name, "version": version, "code": code}
+	if detail != "" {
+		entry["detail"] = detail
+	}
+	return entry
+}
+
+// rolloutErrorEntries is n valid hook_rollout_errors entries.
+func rolloutErrorEntries(n int) []map[string]any {
+	out := make([]map[string]any, n)
+	for i := range out {
+		out[i] = rolloutErrorEntry(fmt.Sprintf("hook-%03d", i), 1, "fetch_failed", "")
+	}
+	return out
+}
+
+// A manifest with the members the contract's Published hooks section adds is
+// accepted and counted: rollout entries with their versions, a local entry
+// with and without its source, and rollout errors of every documented code and
+// of a code the contract does not document but whose shape it takes.
+func TestCapabilities_RolloutMembersAccepted(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	body := manifestWith(t, map[string]any{
+		"declared_hooks": []map[string]any{
+			declaredHookEntry("backup-db", map[string]any{"source": "rollout", "version": 2}),
+			declaredHookEntry("rotate-logs", map[string]any{"source": "rollout", "version": 1, "description": "rotates the logs"}),
+			declaredHookEntry("nightly", map[string]any{"source": "local"}),
+			declaredHookEntry("disk-check", nil),
+		},
+		"hook_rollout_errors": []map[string]any{
+			rolloutErrorEntry("e2e-collide", 1, "collision", "hooks_dir holds a hook of this name"),
+			rolloutErrorEntry("e2e-rollout", 3, "verification_failed", "script checksum mismatch"),
+			rolloutErrorEntry("0-first-digit", 1, "fetch_failed", ""),
+			rolloutErrorEntry("install_me", 7, "install_failed", "actions are disabled on this node"),
+			rolloutErrorEntry("newer", 1, "a_newer_agents_code_2", ""),
+		},
+	})
+	resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		got, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d (body: %s)", resp.StatusCode, http.StatusNoContent, got)
+	}
+	if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+		t.Errorf("capabilities_count = %d, want 1", a.CapabilitiesCount)
+	}
+}
+
+// Each limit on the rollout members accepts a value at the limit and refuses
+// one past it with the limit's code, and a refused manifest is not counted.
+// The detail is multi-byte, so a limit counted in bytes fails at the limit.
+func TestCapabilities_RolloutMemberLimits(t *testing.T) {
+	rolloutHook := func(version int) map[string]any {
+		return map[string]any{"declared_hooks": []map[string]any{
+			declaredHookEntry("backup-db", map[string]any{"source": "rollout", "version": version}),
+		}}
+	}
+	rolloutErrors := func(entries ...map[string]any) map[string]any {
+		return map[string]any{"hook_rollout_errors": entries}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		at, past map[string]any
+		code     string
+	}{
+		{
+			name: "declared hook version ceiling", code: "declared_hook_invalid",
+			at: rolloutHook(2147483647), past: rolloutHook(2147483648),
+		},
+		{
+			name: "declared hook version floor", code: "declared_hook_invalid",
+			at: rolloutHook(1), past: rolloutHook(0),
+		},
+		{
+			name: "rollout error count", code: "hook_rollout_errors_too_many",
+			at:   map[string]any{"hook_rollout_errors": rolloutErrorEntries(64)},
+			past: map[string]any{"hook_rollout_errors": rolloutErrorEntries(65)},
+		},
+		{
+			name: "rollout error version ceiling", code: "hook_rollout_error_invalid",
+			at:   rolloutErrors(rolloutErrorEntry("backup-db", 2147483647, "fetch_failed", "")),
+			past: rolloutErrors(rolloutErrorEntry("backup-db", 2147483648, "fetch_failed", "")),
+		},
+		{
+			name: "rollout error version floor", code: "hook_rollout_error_invalid",
+			at:   rolloutErrors(rolloutErrorEntry("backup-db", 1, "fetch_failed", "")),
+			past: rolloutErrors(rolloutErrorEntry("backup-db", 0, "fetch_failed", "")),
+		},
+		{
+			name: "rollout error name length", code: "hook_rollout_error_invalid",
+			at:   rolloutErrors(rolloutErrorEntry(strings.Repeat("a", 63), 1, "fetch_failed", "")),
+			past: rolloutErrors(rolloutErrorEntry(strings.Repeat("a", 64), 1, "fetch_failed", "")),
+		},
+		{
+			name: "rollout error code length", code: "hook_rollout_error_invalid",
+			at:   rolloutErrors(rolloutErrorEntry("backup-db", 1, strings.Repeat("a", 64), "")),
+			past: rolloutErrors(rolloutErrorEntry("backup-db", 1, strings.Repeat("a", 65), "")),
+		},
+		{
+			name: "rollout error detail length", code: "hook_rollout_error_invalid",
+			at:   rolloutErrors(rolloutErrorEntry("backup-db", 1, "fetch_failed", strings.Repeat("é", 1024))),
+			past: rolloutErrors(rolloutErrorEntry("backup-db", 1, "fetch_failed", strings.Repeat("é", 1025))),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+			target := ts.URL + "/v1/nodes/node-1/capabilities"
+
+			at := doRequest(t, http.MethodPut, target, manifestWith(t, tc.at))
+			defer at.Body.Close()
+			if at.StatusCode != http.StatusNoContent {
+				body, _ := io.ReadAll(at.Body)
+				t.Fatalf("at the limit: status = %d, want %d (body: %s)", at.StatusCode, http.StatusNoContent, body)
+			}
+
+			past := doRequest(t, http.MethodPut, target, manifestWith(t, tc.past))
+			defer past.Body.Close()
+			assertProblem(t, past, http.StatusBadRequest, tc.code)
+			if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 1 {
+				t.Errorf("capabilities_count = %d, want 1 after a refused manifest", a.CapabilitiesCount)
+			}
+		})
+	}
+}
+
+// Every breach of the rules on the rollout members refuses the whole manifest
+// with the code the contract names for it.
+func TestCapabilities_RolloutMemberViolations(t *testing.T) {
+	hook := func(metadata map[string]any) map[string]any {
+		return map[string]any{"declared_hooks": []map[string]any{
+			declaredHookEntry("first", nil),
+			declaredHookEntry("backup-db", metadata),
+		}}
+	}
+	rolloutError := func(name string, version int, code, detail string) map[string]any {
+		return map[string]any{"hook_rollout_errors": []map[string]any{
+			rolloutErrorEntry("first", 1, "fetch_failed", ""),
+			rolloutErrorEntry(name, version, code, detail),
+		}}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		extra map[string]any
+		code  string
+	}{
+		{"unknown source", hook(map[string]any{"source": "remote"}), "declared_hook_invalid"},
+		{"source in uppercase", hook(map[string]any{"source": "Rollout", "version": 1}), "declared_hook_invalid"},
+		{"rollout without a version", hook(map[string]any{"source": "rollout"}), "declared_hook_invalid"},
+		{"rollout with a negative version", hook(map[string]any{"source": "rollout", "version": -1}), "declared_hook_invalid"},
+		{"local with a version", hook(map[string]any{"source": "local", "version": 1}), "declared_hook_invalid"},
+		{"no source with a version", hook(map[string]any{"version": 2}), "declared_hook_invalid"},
+		{"error name in uppercase", rolloutError("Backup", 1, "fetch_failed", ""), "hook_rollout_error_invalid"},
+		{"error name with a dot", rolloutError("backup.db", 1, "fetch_failed", ""), "hook_rollout_error_invalid"},
+		{"error name with a path", rolloutError("../x", 1, "fetch_failed", ""), "hook_rollout_error_invalid"},
+		{"error name leading hyphen", rolloutError("-backup", 1, "fetch_failed", ""), "hook_rollout_error_invalid"},
+		{"empty error name", rolloutError("", 1, "fetch_failed", ""), "hook_rollout_error_invalid"},
+		{"negative error version", rolloutError("backup-db", -1, "fetch_failed", ""), "hook_rollout_error_invalid"},
+		{"empty code", rolloutError("backup-db", 1, "", ""), "hook_rollout_error_invalid"},
+		{"code in uppercase", rolloutError("backup-db", 1, "Collision", ""), "hook_rollout_error_invalid"},
+		{"code with a hyphen", rolloutError("backup-db", 1, "fetch-failed", ""), "hook_rollout_error_invalid"},
+		{"NUL in the detail", rolloutError("backup-db", 1, "fetch_failed", "a\x00b"), "hook_rollout_error_invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ts := newTestServer(t)
+
+			resp := doRequest(t, http.MethodPut, ts.URL+"/v1/nodes/node-1/capabilities", manifestWith(t, tc.extra))
+			defer resp.Body.Close()
+			assertProblem(t, resp, http.StatusBadRequest, tc.code)
+			if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 0 {
+				t.Errorf("capabilities_count = %d, want 0 for a refused manifest", a.CapabilitiesCount)
+			}
+		})
+	}
+}
+
+// A control plane from before published hooks refuses each rollout member as
+// an unknown key, on whatever entry it sits and whatever its value, and still
+// takes the short manifest.
+func TestConfigureCapabilities_RefusalSeesTheRolloutMembers(t *testing.T) {
+	_, ts := newTestServer(t)
+	armed := doRequest(t, http.MethodPost, ts.URL+"/test/configure-capabilities", `{"refuse_hook_metadata":true}`)
+	armed.Body.Close()
+	if armed.StatusCode != http.StatusNoContent {
+		t.Fatalf("configure-capabilities status = %d, want %d", armed.StatusCode, http.StatusNoContent)
+	}
+	target := ts.URL + "/v1/nodes/node-1/capabilities"
+
+	for _, extra := range []map[string]any{
+		{"declared_hooks": []map[string]any{declaredHookEntry("short", nil), declaredHookEntry("backup-db", map[string]any{"source": "rollout", "version": 2})}},
+		{"declared_hooks": []map[string]any{declaredHookEntry("backup-db", map[string]any{"source": "local"})}},
+		// An older decoder stops at the key, so it never sees the value breaks
+		// the rule for a version without a rollout source.
+		{"declared_hooks": []map[string]any{declaredHookEntry("backup-db", map[string]any{"version": 2})}},
+		{
+			"declared_hooks":      []map[string]any{declaredHookEntry("short", nil)},
+			"hook_rollout_errors": []map[string]any{rolloutErrorEntry("backup-db", 2, "fetch_failed", "")},
+		},
+		{"hook_rollout_errors": rolloutErrorEntries(65)},
+	} {
+		resp := doRequest(t, http.MethodPut, target, manifestWith(t, extra))
+		assertProblem(t, resp, http.StatusBadRequest, "malformed_capabilities_request")
+		resp.Body.Close()
+	}
+	if a := getAssertions(t, ts.URL); a.CapabilitiesCount != 0 {
+		t.Errorf("capabilities_count = %d, want 0 for refused manifests", a.CapabilitiesCount)
+	}
+
+	short := doRequest(t, http.MethodPut, target, hookManifest(t, declaredHookEntry("backup-db", nil)))
+	defer short.Body.Close()
+	if short.StatusCode != http.StatusNoContent {
+		t.Fatalf("short PUT status = %d, want %d", short.StatusCode, http.StatusNoContent)
 	}
 }
