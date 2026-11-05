@@ -102,6 +102,108 @@ func TestConfig_MarshalYAMLAsAgentField(t *testing.T) {
 	}
 }
 
+// TestConfig_RolloutsEnabledDefaultsToTrue pins that a node which says nothing
+// about rolled-out hooks accepts them: an omitted key, whether the actions
+// block is empty or only sets other fields, reads as on after defaulting.
+func TestConfig_RolloutsEnabledDefaultsToTrue(t *testing.T) {
+	tests := []struct {
+		name string
+		doc  string
+	}{
+		{"empty block", "{}\n"},
+		{"other keys only", "enabled: true\nmax_concurrent: 3\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cfg Config
+			if err := yaml.Unmarshal([]byte(tt.doc), &cfg); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			cfg.ApplyDefaults()
+
+			if cfg.RolloutsEnabled != nil {
+				t.Errorf("RolloutsEnabled = %v, want nil for an omitted key", *cfg.RolloutsEnabled)
+			}
+			if !cfg.IsRolloutsEnabled() {
+				t.Error("IsRolloutsEnabled() = false, want true for an omitted rollouts_enabled")
+			}
+		})
+	}
+}
+
+// TestConfig_DefaultsPreserveExplicitRolloutsDisabled pins the node owner's
+// veto against defaulting. An operator who writes `rollouts_enabled: false`
+// refuses scripts the control plane delivers, and a defaulting pass that turned
+// it back on would install them anyway.
+func TestConfig_DefaultsPreserveExplicitRolloutsDisabled(t *testing.T) {
+	tests := []struct {
+		name string
+		doc  string
+	}{
+		{"only rollouts_enabled set", "rollouts_enabled: false\n"},
+		{"with actions enabled", "enabled: true\nrollouts_enabled: false\nmax_concurrent: 3\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cfg Config
+			if err := yaml.Unmarshal([]byte(tt.doc), &cfg); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			cfg.ApplyDefaults()
+
+			if cfg.IsRolloutsEnabled() {
+				t.Error("IsRolloutsEnabled() = true, want false for an explicit rollouts_enabled: false")
+			}
+			// The veto is about delivered scripts only: it must not reach the
+			// switch that gates builtins and hand-placed hooks.
+			if !cfg.IsEnabled() {
+				t.Error("IsEnabled() = false, want true: rollouts_enabled must not disable actions")
+			}
+		})
+	}
+}
+
+// TestConfig_MarshalYAMLRendersEffectiveRolloutsEnabled pins what config.dump
+// shows for the veto on rolled-out hooks. Like Enabled it is a pointer, so an
+// unset one would marshal as null, which an operator reads as off while it
+// means on. The dump is decoded rather than searched, because the text
+// "enabled: true" is also a substring of "rollouts_enabled: true".
+func TestConfig_MarshalYAMLRendersEffectiveRolloutsEnabled(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want bool
+	}{
+		{"unset renders the effective default", Config{}, true},
+		{"explicit false is preserved", Config{RolloutsEnabled: boolPtr(false)}, false},
+		{"explicit true is preserved", Config{RolloutsEnabled: boolPtr(true)}, true},
+		{"independent of enabled", Config{Enabled: boolPtr(false)}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := yaml.Marshal(struct {
+				Actions Config `yaml:"actions"`
+			}{tt.cfg})
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+			var dump struct {
+				Actions map[string]any `yaml:"actions"`
+			}
+			if err := yaml.Unmarshal(out, &dump); err != nil {
+				t.Fatalf("Unmarshal(%q): %v", out, err)
+			}
+			got, ok := dump.Actions["rollouts_enabled"]
+			if !ok {
+				t.Fatalf("Marshal() = %q, want a rollouts_enabled key", out)
+			}
+			if got != tt.want {
+				t.Errorf("rollouts_enabled = %v, want %v (dump %q)", got, tt.want, out)
+			}
+		})
+	}
+}
+
 func TestConfig_DefaultsPreserveExisting(t *testing.T) {
 	cfg := Config{
 		MaxConcurrent: 10,
