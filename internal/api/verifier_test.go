@@ -536,3 +536,131 @@ func TestEd25519Verifier_FreshnessAndSignatureErrors(t *testing.T) {
 		t.Fatalf("valid envelope should verify: %v", err)
 	}
 }
+
+// TestEd25519Verifier_VerifySignatureIgnoresFreshness pins the split between
+// the two checks: a hook version is signed once, when it is published, so an
+// envelope signed long ago passes VerifySignature while Verify, which guards
+// the event stream, refuses the same envelope as stale.
+func TestEd25519Verifier_VerifySignatureIgnoresFreshness(t *testing.T) {
+	pub, priv := generateKey(t)
+	v := NewEd25519Verifier("kid-1", pub)
+
+	env := signEnvelope(t, priv, "kid-1", time.Now().Add(-30*24*time.Hour), json.RawMessage(`{"name":"backup-db","version":2}`))
+	if err := v.VerifySignature(env); err != nil {
+		t.Errorf("VerifySignature on a 30-day-old envelope: %v", err)
+	}
+	err := v.Verify(context.Background(), env)
+	if err == nil || err.Error() != "api: verifier: event is stale" {
+		t.Errorf("Verify on a 30-day-old envelope: error = %v, want %q", err, "api: verifier: event is stale")
+	}
+}
+
+func TestEd25519Verifier_VerifySignatureErrors(t *testing.T) {
+	pub, priv := generateKey(t)
+	issuedAt := time.Now().Add(-30 * 24 * time.Hour)
+
+	tests := []struct {
+		name    string
+		mutate  func(t *testing.T, env *Envelope)
+		wantErr string
+	}{
+		{
+			name:    "unknown key id",
+			mutate:  func(_ *testing.T, env *Envelope) { env.KeyID = "kid-unknown" },
+			wantErr: "api: verifier: unknown signing key id",
+		},
+		{
+			name:    "empty key id",
+			mutate:  func(_ *testing.T, env *Envelope) { env.KeyID = "" },
+			wantErr: "api: verifier: unknown signing key id",
+		},
+		{
+			name:    "empty signature",
+			mutate:  func(_ *testing.T, env *Envelope) { env.Signature = "" },
+			wantErr: "api: verifier: missing signature",
+		},
+		{
+			name: "flipped signature byte",
+			mutate: func(t *testing.T, env *Envelope) {
+				t.Helper()
+				sig, err := base64.StdEncoding.DecodeString(env.Signature)
+				if err != nil {
+					t.Fatalf("decode signature: %v", err)
+				}
+				sig[0] ^= 0x01
+				env.Signature = base64.StdEncoding.EncodeToString(sig)
+			},
+			wantErr: "api: verifier: signature verification failed",
+		},
+		{
+			name:    "changed issued_at",
+			mutate:  func(_ *testing.T, env *Envelope) { env.IssuedAt = env.IssuedAt.Add(time.Second) },
+			wantErr: "api: verifier: signature verification failed",
+		},
+		{
+			name:    "undecodable base64 signature",
+			mutate:  func(_ *testing.T, env *Envelope) { env.Signature = "not-valid-base64!!!" },
+			wantErr: "api: verifier: signature verification failed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := signEnvelope(t, priv, "kid-1", issuedAt, json.RawMessage(`{}`))
+			tt.mutate(t, &env)
+			err := NewEd25519Verifier("kid-1", pub).VerifySignature(env)
+			if err == nil || err.Error() != tt.wantErr {
+				t.Errorf("error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+
+	t.Run("canonical form", func(t *testing.T) {
+		env := signEnvelope(t, priv, "kid-1", issuedAt, json.RawMessage(`{}`))
+		env.Scope = "node"
+		err := NewEd25519Verifier("kid-1", pub).VerifySignature(env)
+		const prefix = "api: verifier: canonical form: "
+		if err == nil || !strings.HasPrefix(err.Error(), prefix) {
+			t.Errorf("error = %v, want prefix %q", err, prefix)
+		}
+	})
+}
+
+// VerifySignature selects the key the way Verify does: the previous key while
+// its rotation grace window is open, and no longer once it closes.
+func TestEd25519Verifier_VerifySignatureRotation(t *testing.T) {
+	oldPub, oldPriv := generateKey(t)
+	newPub, newPriv := generateKey(t)
+	newPubB64 := base64.StdEncoding.EncodeToString(newPub)
+	issuedAt := time.Now().Add(-30 * 24 * time.Hour)
+
+	rotated := func(t *testing.T, expires time.Time) *Ed25519Verifier {
+		t.Helper()
+		v := NewEd25519Verifier("kid-old", oldPub)
+		if err := v.Rotate(SigningKeyRotation{
+			KeyID:             "kid-new",
+			PublicKey:         newPubB64,
+			PreviousKeyID:     "kid-old",
+			TransitionExpires: expires,
+		}); err != nil {
+			t.Fatalf("rotate: %v", err)
+		}
+		return v
+	}
+
+	t.Run("during the grace window", func(t *testing.T) {
+		v := rotated(t, time.Now().Add(time.Hour))
+		if err := v.VerifySignature(signEnvelope(t, newPriv, "kid-new", issuedAt, json.RawMessage(`{}`))); err != nil {
+			t.Errorf("current key: %v", err)
+		}
+		if err := v.VerifySignature(signEnvelope(t, oldPriv, "kid-old", issuedAt, json.RawMessage(`{}`))); err != nil {
+			t.Errorf("previous key during its grace window: %v", err)
+		}
+	})
+	t.Run("after the grace window", func(t *testing.T) {
+		v := rotated(t, time.Now().Add(-time.Hour))
+		err := v.VerifySignature(signEnvelope(t, oldPriv, "kid-old", issuedAt, json.RawMessage(`{}`)))
+		if err == nil || err.Error() != "api: verifier: unknown signing key id" {
+			t.Errorf("previous key after its grace window: error = %v, want %q", err, "api: verifier: unknown signing key id")
+		}
+	})
+}

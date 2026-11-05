@@ -130,14 +130,11 @@ func (v *Ed25519Verifier) TrustedKeys(now time.Time) []ed25519.PublicKey {
 	return keys
 }
 
-// Verify checks the freshness and Ed25519 signature of an envelope. It selects
-// the verifying key by the envelope's key id, honouring the rotation grace
-// window for the previous key, and checks the signature over SignedMessage, the
-// SHA-512 digest of the envelope's canonical bytes.
+// Verify checks the freshness and Ed25519 signature of an event envelope. It
+// refuses an envelope without issued_at, one issued more than
+// DefaultStalenessWindow ago, and one issued more than that window ahead of
+// now, and then checks the signature with VerifySignature.
 func (v *Ed25519Verifier) Verify(_ context.Context, env Envelope) error {
-	if env.Signature == "" {
-		return fmt.Errorf("api: verifier: missing signature")
-	}
 	if env.IssuedAt.IsZero() {
 		return fmt.Errorf("api: verifier: missing issued_at")
 	}
@@ -146,6 +143,41 @@ func (v *Ed25519Verifier) Verify(_ context.Context, env Envelope) error {
 	}
 	if env.IssuedAt.After(time.Now().Add(DefaultStalenessWindow)) {
 		return fmt.Errorf("api: verifier: event timestamp is in the future")
+	}
+	if err := v.VerifySignature(env); err != nil {
+		return err
+	}
+
+	// No replay-tracking step, by design: the events contract carries no nonce,
+	// so there is nothing unique to record here. Replay protection is delegated
+	// to (a) the TLS transport, which keeps captured envelopes off the wire, and
+	// (b) the idempotence of what a verified event triggers — every production
+	// event drives an authoritative reconcile pull, a replayed rotate_keys only
+	// re-requests a rotation the control plane rejects (409) when none is
+	// pending, and a replayed session_revoked can only close a session the
+	// control plane already revoked, which never becomes live again, so it finds
+	// nothing to close. A replayed session_connect makes the node open a
+	// connection the control plane refuses with 404 session_connection_not_found
+	// once the request expired, and a login on any connection still needs the
+	// session token. This is a deliberate trade-off of the no-nonce contract,
+	// not an oversight; see docs/reference/core/event-verification.md.
+	return nil
+}
+
+// VerifySignature checks an envelope's Ed25519 signature and leaves issued_at
+// alone. It selects the verifying key by the envelope's key id, honouring the
+// rotation grace window for the previous key, and checks the signature over
+// SignedMessage, the SHA-512 digest of the envelope's canonical bytes.
+//
+// A hook_version envelope needs this without Verify's freshness window: its
+// issued_at is the instant the version was signed, often days before the node
+// fetches it, so Verify would refuse every one as stale. issued_at is still
+// part of the canonical bytes, so a changed value fails the signature. What
+// keeps an old version from being installed is the pull, which names the
+// version and the script's checksum the installer has to find.
+func (v *Ed25519Verifier) VerifySignature(env Envelope) error {
+	if env.Signature == "" {
+		return fmt.Errorf("api: verifier: missing signature")
 	}
 
 	v.mu.RLock()
@@ -176,19 +208,5 @@ func (v *Ed25519Verifier) Verify(_ context.Context, env Envelope) error {
 	if !ed25519.Verify(key, msg, sigBytes) {
 		return fmt.Errorf("api: verifier: signature verification failed")
 	}
-
-	// No replay-tracking step, by design: the events contract carries no nonce,
-	// so there is nothing unique to record here. Replay protection is delegated
-	// to (a) the TLS transport, which keeps captured envelopes off the wire, and
-	// (b) the idempotence of what a verified event triggers — every production
-	// event drives an authoritative reconcile pull, a replayed rotate_keys only
-	// re-requests a rotation the control plane rejects (409) when none is
-	// pending, and a replayed session_revoked can only close a session the
-	// control plane already revoked, which never becomes live again, so it finds
-	// nothing to close. A replayed session_connect makes the node open a
-	// connection the control plane refuses with 404 session_connection_not_found
-	// once the request expired, and a login on any connection still needs the
-	// session token. This is a deliberate trade-off of the no-nonce contract,
-	// not an oversight; see docs/reference/core/event-verification.md.
 	return nil
 }
