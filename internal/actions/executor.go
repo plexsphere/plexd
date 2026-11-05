@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -113,6 +115,13 @@ type builtinEntry struct {
 	params      []api.ActionParam
 }
 
+// rolloutPin is the integrity anchor of a rolled-out hook: the version the
+// control plane delivered and the digest it signed for that version.
+type rolloutPin struct {
+	version  int
+	checksum string // lowercase hex SHA-256, the form integrity.HashFile returns
+}
+
 // Executor orchestrates action execution, concurrency control, and result reporting.
 type Executor struct {
 	cfg      Config
@@ -123,25 +132,49 @@ type Executor struct {
 	// production. Only tests set it, because go test runs unprivileged.
 	hookOwnerUID uint32
 
-	mu           sync.Mutex
-	wg           sync.WaitGroup
-	active       map[string]context.CancelFunc // executionID → cancel
-	builtins     map[string]builtinEntry       // action name → builtin
-	hooks        []api.HookInfo                // discovered hooks snapshot
-	pinned       map[string]string             // hook name → digest at first discovery
+	// swapMu orders replacing a rolled-out hook against starting one. A swap
+	// or a removal holds it for writing from the first file it touches until
+	// the pin is updated; startHook holds it for reading from the pin read
+	// until the process has started. Without it, a dispatch landing between
+	// the rename and the pin update would verify the new bytes against the old
+	// pin and file a false tamper alert.
+	//
+	// Lock order: swapMu before mu. Nothing takes swapMu while it holds mu.
+	swapMu sync.RWMutex
+
+	mu       sync.Mutex
+	wg       sync.WaitGroup
+	active   map[string]context.CancelFunc // executionID → cancel
+	builtins map[string]builtinEntry       // action name → builtin
+	// localHooks is the snapshot of hooks_dir, as the hooks_dir watcher last
+	// reported it.
+	localHooks []api.HookInfo
+	// rolloutHooks is the snapshot of the rollout directory, as the rollout
+	// watcher last reported it. An entry runs only once it has a pin.
+	rolloutHooks []api.HookInfo
+	// hooks is the merged list Capabilities reports and Execute resolves a
+	// hook dispatch against. mergeHooks recomputes it on every change to the
+	// two snapshots or the rollout pins.
+	hooks []api.HookInfo
+	// pinned holds the digest of each hooks_dir hook at first discovery.
+	pinned map[string]string
+	// rolloutPins holds what the control plane delivered for each rolled-out
+	// hook. Only SwapRolloutHook and RemoveRolloutHook change it.
+	rolloutPins  map[string]rolloutPin
 	shuttingDown bool
 }
 
 // NewExecutor creates an Executor with the given configuration, reporter, verifier, and logger.
 func NewExecutor(cfg Config, reporter ActionReporter, verifier HookVerifier, logger *slog.Logger) *Executor {
 	return &Executor{
-		cfg:      cfg,
-		reporter: reporter,
-		verifier: verifier,
-		logger:   logger.With("component", "actions"),
-		active:   make(map[string]context.CancelFunc),
-		builtins: make(map[string]builtinEntry),
-		pinned:   make(map[string]string),
+		cfg:         cfg,
+		reporter:    reporter,
+		verifier:    verifier,
+		logger:      logger.With("component", "actions"),
+		active:      make(map[string]context.CancelFunc),
+		builtins:    make(map[string]builtinEntry),
+		pinned:      make(map[string]string),
+		rolloutPins: make(map[string]rolloutPin),
 	}
 }
 
@@ -156,8 +189,8 @@ func (e *Executor) RegisterBuiltin(name, description string, params []api.Action
 	}
 }
 
-// SetHooks sets the discovered hooks snapshot and pins the integrity anchor of
-// every hook this process has not seen before.
+// SetHooks sets the snapshot of hooks_dir, the hand-placed hooks, and pins the
+// integrity anchor of every hook this process has not seen before.
 //
 // The snapshot itself is refreshed by HookWatcher, which re-hashes a hook on
 // every write, so verifying an execution against the snapshot digest would
@@ -168,15 +201,154 @@ func (e *Executor) RegisterBuiltin(name, description string, params []api.Action
 // and re-attests it. The pin matches the first report to the control plane only.
 // Later reports carry the digest the watcher last computed, which is how the
 // control plane sees the drift.
+//
+// A hand-placed hook takes precedence over a rolled-out hook of the same name,
+// so while both exist the merged list holds the hand-placed one.
 func (e *Executor) SetHooks(hooks []api.HookInfo) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.hooks = hooks
+	e.localHooks = hooks
 	for _, h := range hooks {
 		if _, pinned := e.pinned[h.Name]; !pinned {
 			e.pinned[h.Name] = h.Checksum
 		}
 	}
+	e.mergeHooks()
+}
+
+// SetRolloutHooks sets the snapshot of the rollout directory, the hooks plexd
+// installed from versions the control plane published. It pins nothing: the
+// pin of a rolled-out hook is the checksum the control plane delivered, which
+// only SwapRolloutHook records. A file in the rollout directory that has no
+// pin, a leftover or one an account other than plexd put there, therefore
+// stays out of the merged list and cannot be dispatched.
+func (e *Executor) SetRolloutHooks(hooks []api.HookInfo) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.rolloutHooks = hooks
+	e.mergeHooks()
+}
+
+// SwapRolloutHook runs swap, which replaces the files of the rolled-out hook
+// name, and then pins name to version and checksum, the lowercase hex digest
+// the control plane signed for that version. A nil swap pins without writing,
+// for a hook already on disk. The swap and the pin update share swapMu with
+// runHook's verify and start, so no dispatch sees the new bytes under the old
+// pin or the old bytes under the new one.
+//
+// The caller passes swap rather than writing before the call, because the
+// lock has to cover the write: a dispatch between a write and the pin update
+// would refuse the new bytes as tampered.
+//
+// When swap succeeds, the entry of name in the rollout snapshot, if there is
+// one, takes checksum along with the pin, because the bytes swap just wrote
+// have that digest. The merged entry then moves to the new version and its
+// checksum together, instead of pairing the new version with the old file's
+// digest until the rollout watcher rescans, which the control plane would
+// read as drift. The watcher's next scan confirms the digest or shows real
+// tampering, and the entry's sidecar fields catch up at that scan. A nil swap
+// writes nothing and changes no snapshot.
+//
+// When swap fails, its error is returned and the pin and the merged list stay
+// as they were: the previous version stays runnable, as far as the files the
+// failed swap left behind allow.
+func (e *Executor) SwapRolloutHook(name string, version int, checksum string, swap func() error) error {
+	e.swapMu.Lock()
+	defer e.swapMu.Unlock()
+
+	if swap != nil {
+		if err := swap(); err != nil {
+			return err
+		}
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.rolloutPins[name] = rolloutPin{version: version, checksum: checksum}
+	if swap != nil {
+		if i := slices.IndexFunc(e.rolloutHooks, func(h api.HookInfo) bool { return h.Name == name }); i >= 0 {
+			// The snapshot came from the watcher, which may still hold it.
+			hooks := slices.Clone(e.rolloutHooks)
+			hooks[i].Checksum = checksum
+			e.rolloutHooks = hooks
+		}
+	}
+	e.mergeHooks()
+	return nil
+}
+
+// RemoveRolloutHook runs remove, which deletes the files of the rolled-out
+// hook name, and then drops its pin, which takes it out of the merged list. A
+// nil remove drops the pin alone. It holds swapMu like SwapRolloutHook, so a
+// run that already passed verification keeps its started process, and a later
+// dispatch is rejected as unknown_action.
+//
+// When remove fails, its error is returned and the pin and the merged list
+// stay as they were.
+func (e *Executor) RemoveRolloutHook(name string, remove func() error) error {
+	e.swapMu.Lock()
+	defer e.swapMu.Unlock()
+
+	if remove != nil {
+		if err := remove(); err != nil {
+			return err
+		}
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.rolloutPins, name)
+	e.mergeHooks()
+	return nil
+}
+
+// mergeHooks recomputes hooks from the two snapshots and the rollout pins.
+// The list holds every hand-placed hook, plus every rolled-out hook that has
+// a pin and whose name no hand-placed hook uses, sorted by name. A rolled-out
+// entry reports the version of its pin, which is the version plexd verifies
+// it against. The caller holds mu.
+//
+// The run path picks a hook's directory and pin by its Source, so the set an
+// entry came from decides that Source, not the caller: a rolled-out entry
+// always carries rollout, and a hand-placed entry never does, so it cannot
+// borrow the pin of a rolled-out hook of its name.
+func (e *Executor) mergeHooks() {
+	merged := make([]api.HookInfo, 0, len(e.localHooks)+len(e.rolloutHooks))
+	local := make(map[string]struct{}, len(e.localHooks))
+	for _, h := range e.localHooks {
+		local[h.Name] = struct{}{}
+		if h.Source == api.HookSourceRollout {
+			h.Source = api.HookSourceLocal
+		}
+		merged = append(merged, h)
+	}
+	for _, h := range e.rolloutHooks {
+		pin, pinned := e.rolloutPins[h.Name]
+		if !pinned {
+			continue
+		}
+		if _, shadowed := local[h.Name]; shadowed {
+			continue
+		}
+		h.Source = api.HookSourceRollout
+		h.Version = pin.version
+		merged = append(merged, h)
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		return merged[i].Name < merged[j].Name
+	})
+	e.hooks = merged
+}
+
+// hookOrigin returns the directory a merged hook entry runs from and the
+// digest it must match: the rollout directory and the delivered pin for a
+// rolled-out hook, hooks_dir and the first-discovery pin otherwise. The caller
+// holds mu.
+func (e *Executor) hookOrigin(h api.HookInfo) (dir, pin string) {
+	if h.Source == api.HookSourceRollout {
+		return e.cfg.RolloutHooksDir, e.rolloutPins[h.Name].checksum
+	}
+	return e.cfg.HooksDir, e.pinned[h.Name]
 }
 
 // Capabilities returns builtin action metadata and hooks for capability reporting.
@@ -628,11 +800,20 @@ func (e *Executor) runAction(ctx context.Context, nodeID string, entry api.NodeS
 	}
 
 	// A builtin never reads a sidecar, even one beside a hook of its name, so
-	// its bound stays what it was.
+	// its bound stays what it was. A hook's sidecar sits beside its script, in
+	// the directory the merged entry's Source picks. A hook dropped from the
+	// merged list since Execute looks in hooks_dir, and runHook refuses it.
+	// The sidecar is read before startHook takes swapMu, so a dispatch that
+	// races a swap can start the new version under the old version's timeout.
+	// The next dispatch reads the new one.
 	var decl hookDeclaration
 	var declErr error
 	if entry.Type == api.ActionKindHook {
-		decl, declErr = loadHookDeclaration(e.cfg.HooksDir, entry.Action, e.hookOwnerUID)
+		e.mu.Lock()
+		h, _ := lookupHook(e.hooks, entry.Action)
+		dir, _ := e.hookOrigin(h)
+		e.mu.Unlock()
+		decl, declErr = loadHookDeclaration(dir, entry.Action, e.hookOwnerUID)
 	}
 	timeout, label, capped := runBound(remaining, decl.timeout, e.cfg.MaxActionTimeout)
 
@@ -882,48 +1063,17 @@ func (e *Executor) runHook(ctx context.Context, nodeID string, entry api.NodeSta
 		return "", "", 1, err
 	}
 
-	// The pull entry carries no checksum, so hook trust anchors on the pinned
-	// digest — the one recorded when this process first discovered the hook, not
-	// the one the watcher last recomputed. A hook whose on-disk bytes drift
-	// after discovery is therefore refused and files an integrity violation.
-	// Execute already gated the lookup; this is the backstop for a hooks
-	// snapshot that changed in between.
-	e.mu.Lock()
-	_, known := lookupHook(e.hooks, entry.Action)
-	pinnedChecksum := e.pinned[entry.Action]
-	e.mu.Unlock()
-	if !known {
-		return "", "", 1, fmt.Errorf("hook not discovered: %s", entry.Action)
-	}
+	stdoutW := newLimitedWriter(e.cfg.MaxOutputBytes)
+	stderrW := newLimitedWriter(e.cfg.MaxOutputBytes)
 
-	hookPath := filepath.Join(e.cfg.HooksDir, entry.Action)
-
-	if err := checkHookFile(e.cfg.HooksDir, entry.Action, e.hookOwnerUID); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", "", 1, fmt.Errorf("hook not found: %s", entry.Action)
-		}
+	cmd, err := e.startHook(ctx, nodeID, entry, params, stdoutW, stderrW)
+	if err != nil {
 		return "", "", 1, err
 	}
 
-	ok, err := e.verifier.VerifyHook(ctx, nodeID, hookPath, pinnedChecksum)
-	if err != nil {
-		return "", "", 1, fmt.Errorf("integrity verification error: %w", err)
-	}
-	if !ok {
-		return "", "", 1, fmt.Errorf("integrity check failed for hook: %s", entry.Action)
-	}
-
-	cmd := exec.CommandContext(ctx, hookPath)
-	setHookProcessGroup(cmd)
-	cmd.WaitDelay = waitDelayAfterKill
-	cmd.Env = e.buildHookEnv(nodeID, entry.ExecutionID, params)
-
-	stdoutW := newLimitedWriter(e.cfg.MaxOutputBytes)
-	stderrW := newLimitedWriter(e.cfg.MaxOutputBytes)
-	cmd.Stdout = stdoutW
-	cmd.Stderr = stderrW
-
-	runErr := cmd.Run()
+	// The wait runs outside swapMu, so a swap of this hook does not wait for a
+	// run that may last hours.
+	runErr := cmd.Wait()
 
 	stdout := collectOutput(stdoutW)
 	stderr := collectOutput(stderrW)
@@ -937,6 +1087,66 @@ func (e *Executor) runHook(ctx context.Context, nodeID string, entry api.NodeSta
 	}
 
 	return stdout, stderr, 0, nil
+}
+
+// startHook resolves the hook of a dispatch, checks its file, verifies it
+// against its pin, and starts it with its output going to stdout and stderr.
+// An error means no process runs: a refusal, a failed verification, or a
+// failed start.
+//
+// It holds swapMu for reading from the pin read until the process has
+// started, so SwapRolloutHook cannot replace the file or move the pin in
+// between: a dispatch verifies the old bytes against the old pin or the new
+// bytes against the new pin, never a mix that files a false tamper alert.
+// That span includes the violation report a failed verification sends, which
+// the run's context bounds.
+func (e *Executor) startHook(ctx context.Context, nodeID string, entry api.NodeStateExecution, params map[string]string, stdout, stderr io.Writer) (*exec.Cmd, error) {
+	e.swapMu.RLock()
+	defer e.swapMu.RUnlock()
+
+	// The pull entry carries no checksum, so hook trust anchors on a pin, never
+	// on the digest the watcher last recomputed. A hand-placed hook is pinned
+	// to its digest at first discovery in this process, a rolled-out hook to
+	// the checksum the control plane delivered for its installed version. A
+	// hook whose on-disk bytes differ from its pin is therefore refused and
+	// files an integrity violation. Execute already gated the lookup; this is
+	// the backstop for a merged list that changed in between.
+	e.mu.Lock()
+	h, known := lookupHook(e.hooks, entry.Action)
+	hooksDir, pinnedChecksum := e.hookOrigin(h)
+	e.mu.Unlock()
+	if !known {
+		return nil, fmt.Errorf("hook not discovered: %s", entry.Action)
+	}
+
+	hookPath := filepath.Join(hooksDir, entry.Action)
+
+	if err := checkHookFile(hooksDir, entry.Action, e.hookOwnerUID); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("hook not found: %s", entry.Action)
+		}
+		return nil, err
+	}
+
+	ok, err := e.verifier.VerifyHook(ctx, nodeID, hookPath, pinnedChecksum)
+	if err != nil {
+		return nil, fmt.Errorf("integrity verification error: %w", err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("integrity check failed for hook: %s", entry.Action)
+	}
+
+	cmd := exec.CommandContext(ctx, hookPath)
+	setHookProcessGroup(cmd)
+	cmd.WaitDelay = waitDelayAfterKill
+	cmd.Env = e.buildHookEnv(nodeID, entry.ExecutionID, params)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return cmd, nil
 }
 
 // buildHookEnv constructs the minimal environment for hook execution.
