@@ -133,16 +133,34 @@ Their SHA-512 digest, in hex, is the message the signature covers:
 
 `Ed25519Verifier.Verify()` performs these checks in order, returning a descriptive error on the first failure:
 
-1. **Signature present** — a non-empty `signature`, else `api: verifier: missing signature`.
-2. **Timestamp present** — a non-zero `issued_at`, else `api: verifier: missing issued_at`.
-3. **Staleness** — `time.Since(issued_at)` must be within `DefaultStalenessWindow` (5 minutes), else `api: verifier: event is stale`.
-4. **Future timestamp** — `issued_at` must not be more than `DefaultStalenessWindow` in the future, else `api: verifier: event timestamp is in the future`.
-5. **Key selection** — a signing key is selected by the envelope's `key_id` (see below); if none matches, `api: verifier: unknown signing key id`.
-6. **Ed25519 signature** — the base64 signature is decoded and checked with the selected key against `SignedMessage(env)`, the SHA-512 digest of the canonical bytes. A signature that is not valid base64, or that does not verify, returns `api: verifier: signature verification failed`. An envelope with no canonical form returns `api: verifier: canonical form: <cause>` instead, where `<cause>` is the `CanonicalBytes` error, so the `event verification failed` log line names why plexd could not check the envelope rather than reading like a signature made with the wrong key.
+1. **Timestamp present** — a non-zero `issued_at`, else `api: verifier: missing issued_at`.
+2. **Staleness** — `time.Since(issued_at)` must be within `DefaultStalenessWindow` (5 minutes), else `api: verifier: event is stale`.
+3. **Future timestamp** — `issued_at` must not be more than `DefaultStalenessWindow` in the future, else `api: verifier: event timestamp is in the future`.
+4. **Signature** — the checks of [`VerifySignature`](#verifysignature) below, in their order.
+
+An envelope that fails a freshness check is refused before its signature is looked at, so an envelope without `issued_at` and without `signature` returns `api: verifier: missing issued_at`.
 
 There is no nonce and no replay-tracking step: the events contract carries no nonce, so replay protection is delegated to the transport and to the idempotence of what each event triggers. TLS keeps captured envelopes off the wire; every reconcile-driving event triggers an authoritative state pull (a reconcile), which is idempotent under duplicated or reordered delivery; a replayed `rotate_keys` only re-requests a rotation the control plane rejects with `409 keys_rotate_no_pending_rotation` when none is pending; a replayed `session_revoked` can only close a session the control plane already revoked, which never becomes live again, so it finds nothing to close and only triggers a pull; and a replayed `session_connect` makes the node open a connection the control plane refuses with `404 session_connection_not_found` once the request expired, while a login on any connection still needs the session token. This is a deliberate trade-off of the contract's no-nonce design, not an oversight.
 
 When verification fails, the SSE stream logs `event verification failed` (with the envelope `type` and `id`) and skips the envelope. A failed envelope is never dispatched to a handler.
+
+### VerifySignature
+
+`Ed25519Verifier.VerifySignature(env Envelope) error` checks the signature and leaves `issued_at` alone. `Verify` calls it after its freshness checks, and these are its steps, in order:
+
+1. **Signature present** — a non-empty `signature`, else `api: verifier: missing signature`.
+2. **Key selection** — a signing key is selected by the envelope's `key_id` (see below); if none matches, `api: verifier: unknown signing key id`.
+3. **Ed25519 signature** — the base64 signature is decoded and checked with the selected key against `SignedMessage(env)`, the SHA-512 digest of the canonical bytes. A signature that is not valid base64, or that does not verify, returns `api: verifier: signature verification failed`. An envelope with no canonical form returns `api: verifier: canonical form: <cause>` instead, where `<cause>` is the `CanonicalBytes` error, so the `event verification failed` log line names why plexd could not check the envelope rather than reading like a signature made with the wrong key.
+
+The rollout installer calls `VerifySignature` directly, for the `hook_version` envelope of a [published hook version](api-endpoints.md#get-v1-nodes-node-id-hooks-name-versions-version), and no freshness window applies there. That envelope's `issued_at` is the instant the version was signed, often days before the node fetches it, so `Verify` would refuse every one as stale. `issued_at` is still part of the canonical bytes, so a changed value fails the signature. What keeps an old version from being installed is the state pull, which names the version and the checksum of the script the installer has to find. See [Rolled-out Hooks](../actions/remote-actions-hooks.md#verification).
+
+`actions.HookSignatureVerifier` is the interface the installer takes, and `*Ed25519Verifier` satisfies it:
+
+```go
+type HookSignatureVerifier interface {
+    VerifySignature(env api.Envelope) error
+}
+```
 
 ## Key Selection and Rotation
 
@@ -229,5 +247,5 @@ The verifier that `Install` updates also answers `TrustedKeys`, which ssh sessio
 
 All verifier operations are safe for concurrent use:
 
-- `Verify()` acquires a read lock while selecting the key.
+- `Verify()` and `VerifySignature()` acquire a read lock while selecting the key.
 - `Rotate()` and `Install()` acquire a write lock to install the new key material.

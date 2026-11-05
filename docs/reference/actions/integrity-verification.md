@@ -76,15 +76,36 @@ The SSH server keeps serving the key it loaded at startup, so a key that changes
 ### Hook Verification
 
 1. `Verifier.VerifyHook` calls `VerifyFile` with `requireChecksum=true`
-2. Empty expected checksum returns error (hooks must have a digest pinned at discovery)
+2. Empty expected checksum returns error (every hook the executor runs has a pin)
 3. Match: returns `true` (safe to execute)
 4. Mismatch: reports violation, returns `false` (must not execute)
 
-The expected checksum is the digest the executor **pinned** the first time this
-process discovered the hook, not the one `HookWatcher` last recomputed. It does
-**not** come from the control plane, because an action dispatch carries no
-checksum on the wire. This check therefore answers "are these still the bytes the
-node discovered?", catching a swap between discovery and execution.
+For a hook in `HooksDir`, the expected checksum is the digest the executor
+**pinned** the first time this process discovered the hook, not the one
+`HookWatcher` last recomputed. It does **not** come from the dispatch, because an
+action dispatch carries no checksum on the wire. This check therefore answers
+"are these still the bytes the node discovered?", catching a swap between
+discovery and execution.
+
+For a hook the control plane rolled out into `<data_dir>/hooks`, the expected
+checksum is the one the pull's `hooks` block delivered for the installed version,
+in hex. plexd installed the script only after its SHA-256 matched that checksum
+and the Domain-signed payload of the version, so this check answers "are these
+still the bytes the control plane published?". A rolled-out hook is never trusted
+on first use, and a new version moves the pin when plexd installs it, with no
+restart. A mismatch files the same `hook_checksum` violation, detected
+`pre_dispatch`, with the path in the rollout directory as `artifact_id`. A
+restart does not re-anchor this pin: the installer restores it from its record,
+`hook_rollouts.json`, so an edited rolled-out hook stays refused until the control
+plane rolls out another version or withdraws the hook. Deleting the edited script
+also clears it: a recorded hook whose script is gone counts as not installed, so
+the next pass fetches the listed version again and pins it to the same delivered
+checksum. See
+[Rolled-out Hooks](remote-actions-hooks.md#rolled-out-hooks).
+
+A fetched version that fails its checks before install files no violation: it
+never reached the disk, and plexd reports it as a `verification_failed` rollout
+error in the capability manifest instead.
 
 The pin matches the first report of the hook to the control plane only. Later
 capability manifests carry the digest the watcher last computed, so after an edit
@@ -99,9 +120,10 @@ the agent restarts and re-attests it. `plexd hooks reload` re-hashes the hooks
 through the same watcher and moves no pin, so changing a hook in place requires
 an agent restart, not a reload, before it can run again.
 
-The pin is process-local, so re-attestation on restart is both the recovery path
-for a legitimate hook change and the limit of the control: a restart re-anchors
-the pin to whatever bytes are on disk at that moment. Write access to `HooksDir`
+The pin of a hook in `HooksDir` is process-local, so re-attestation on restart
+is both the recovery path for a legitimate hook change and the limit of the
+control: a restart re-anchors the pin to whatever bytes are on disk at that
+moment. Write access to `HooksDir`
 must therefore be treated as equivalent to code execution with the agent's
 privileges — the pin narrows the window between discovery and execution, it does
 not make an untrusted hooks directory safe.
@@ -260,7 +282,7 @@ Violations are non-fatal: the agent continues running after reporting.
 ### VerifyHook
 
 1. Calls `VerifyFile(hookPath, expectedChecksum, true)`
-2. Empty expected checksum: returns error (hooks require the digest pinned at discovery)
+2. Empty expected checksum: returns error (hooks require a pin: the digest pinned at discovery, or the checksum delivered for a rolled-out hook)
 3. Match: returns `true` (hook is safe to execute)
 4. Mismatch: reports violation, returns `false` (hook must not be executed)
 

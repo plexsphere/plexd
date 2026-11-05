@@ -74,6 +74,8 @@ The `signing_key` block is also consumed on this seam, by `signingKeyDispatchHan
 
 The `secrets` block is consumed on this seam too, by the node API's [`SecretIndexDispatchHandler`](nodeapi.md#secretindexdispatchhandler), which `cmd/plexd/cmd/up.go` registers right after `signingKeyDispatchHandler`. It replaces the secret index that `GET /v1/state/secrets` lists from the block on every successful pull, drift or not. A `null` block keeps the index and logs `state pull carried no secret inventory; keeping the secret index` at debug; an empty block empties it. `node_secrets_updated` only triggers a reconcile, so the pull is the one writer of the index.
 
+The `hooks` block is consumed on this seam as well, by `actions.RolloutInstaller.Handle`, which `cmd/plexd/cmd/up.go` registers after `SecretIndexDispatchHandler` and before the action dispatcher. The handler only copies the block into the installer's pending slot and returns: the installer fetches, verifies and installs on its own goroutine, because a fetch inside the cycle would hold back the `executions` block behind it. A `null` block keeps every rolled-out hook and logs `actions: rollout: pull carried no hooks block; keeping rolled-out hooks` at debug; an empty block removes every one. The block is neither stored nor diffed. See [Rolled-out Hooks](../actions/remote-actions-hooks.md#the-pass).
+
 ## Reconciler
 
 ### Constructor
@@ -289,6 +291,7 @@ Signing-key rotation is no longer a reconcile handler. Key material comes from r
 |----------------------------|--------------------------------------------------------------------|
 | `signingKeyDispatchHandler` | Install the pull's `signing_key` into the verifier that checks envelopes and ssh session tokens, and persist it into the identity files (registered first among the dispatch handlers; see [DispatchHandler](#dispatchhandler)) |
 | `nodeAPISrv.SecretIndexDispatchHandler()` | Replace the node API's secret index from the pull's `secrets` block (registered right after `signingKeyDispatchHandler`; `node_secrets_updated` only pulls the block forward; see [SecretIndexDispatchHandler](nodeapi.md#secretindexdispatchhandler)) |
+| `actions.RolloutInstaller.Handle` | Hand the pull's `hooks` block to the rollout installer, which fetches, verifies, installs and removes rolled-out hooks on its own goroutine, so the handler returns at once. A `null` block keeps every rolled-out hook and runs no pass (registered after `SecretIndexDispatchHandler` and before `actions.Dispatcher.Handle`, and only when the installer was built; see [Rolled-out Hooks](../actions/remote-actions-hooks.md#rolled-out-hooks)) |
 | `actions.Dispatcher.Handle`| Turn each entry of the `executions` block into an action execution |
 | `wireguard.EdgePSKDispatchHandler` | Fetch, open and install the edge PSKs the `peers` block makes due (registered only when the WireGuard interface came up, `wireguard.edge_psk` is not `false` and the node secret key decodes) |
 

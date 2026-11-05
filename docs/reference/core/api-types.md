@@ -111,8 +111,8 @@ never serialized on its own.
 
 The desired-state envelope. Every block key is **always present on the wire**: a
 `null` value means "block not populated", never "field absent", so the differ
-distinguishes a nil pointer from a populated block. None of the ten fields carry
-`omitempty`.
+distinguishes a nil pointer from a populated block. None of the eleven fields
+carry `omitempty`.
 
 | Field          | Type                   | JSON Tag         | Description                                              |
 |----------------|------------------------|------------------|---------------------------------------------------------|
@@ -126,8 +126,9 @@ distinguishes a nil pointer from a populated block. None of the ten fields carry
 | `Sessions`     | `*[]NodeStateSession`  | `"sessions"`     | Live mediated-access sessions; `[]` when empty, never `null` on the wire. A pointer, like the block fields above: a `nil` value is a block the control plane did **not** populate, which is not a teardown signal |
 | `Secrets`      | `*[]NodeStateSecret`   | `"secrets"`      | The node's secret inventory, ordered by name ascending; `[]` when the node may read nothing, never `null` on the wire. A pointer, like `Sessions`: a `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) keeps the node API's secret index, and `[]` empties it |
 | `SigningKey`   | `*NodeStateSigningKey` | `"signing_key"`  | The key the node's Domain signs envelopes and session tokens with. A `nil` value (the wire's `null`, or a pull from a control plane that predates the block and omits it) means "keep the key you hold", never "drop it" |
+| `Hooks`        | `*[]NodeStateHook`     | `"hooks"`        | The published hook versions a rollout assigns the node, ordered by name ascending: the node's full desired set. A pointer, like `Secrets`: `[]` removes every rolled-out hook, and a `nil` value (the wire's `null`, which the control plane sends when it could not compute the set, or a pull from a control plane that predates the block and omits it) keeps every one |
 
-Five members are consumed on the dispatch seam rather than by the differ.
+Six members are consumed on the dispatch seam rather than by the differ.
 `executions` is not desired state at all — it is a delivery queue, documented
 under [Executions](#executions) below. `sessions` *is* desired state, but state
 the tunnel dispatcher converges on itself, documented under
@@ -137,6 +138,8 @@ changes. `signing_key` has nothing to converge on: the first dispatch handler
 installs and persists it (see `NodeStateSigningKey` below).
 `secrets` is never diffed: the node API's `SecretIndexDispatchHandler` replaces
 the secret index from it on every successful pull (see `NodeStateSecret` below).
+`hooks` is never diffed either: the rollout installer's dispatch handler hands it
+to the installer on every successful pull (see `NodeStateHook` below).
 `peers` goes to both: the differ drives the WireGuard reconcile handler
 from it, and the edge PSK store reads it on the dispatch seam.
 
@@ -316,6 +319,27 @@ an earlier kept entry already has, and logs each dropped entry at Warn as
 | `Name`    | `string` | `"name"`    | The Secret's name, matching `^[a-z][a-z0-9_-]{0,62}$`; becomes `SecretRef.Key` in the node API's secret index |
 | `Version` | `int`    | `"version"` | The Secret's current version, at least 1            |
 
+**NodeStateHook**
+
+One entry of the `hooks` block: a published hook version a rollout assigns the
+node, as the "Published hooks" section of plexsphere's agent contract
+(`docs/reference/api/plexd-agent-contract.md` in plexsphere/plexsphere)
+describes it. The entry never carries the script; plexd fetches each version it
+has not installed from
+[`GET /v1/nodes/{node_id}/hooks/{name}/versions/{version}`](#published-hooks).
+`actions.RolloutInstaller` drops an entry whose name is outside the grammar,
+whose version is below 1, or whose name an earlier entry already has, and logs
+each dropped entry at Warn as `actions: rollout: entry dropped`, once until the
+set of dropped entries changes. It reports an entry whose checksum is not 32
+bytes of standard base64 as `verification_failed` and fetches nothing for it.
+See [Rolled-out Hooks](../actions/remote-actions-hooks.md#rolled-out-hooks).
+
+| Field      | Type     | JSON Tag     | Description                                         |
+|------------|----------|--------------|-----------------------------------------------------|
+| `Name`     | `string` | `"name"`     | The hook's name, matching `^[a-z0-9][a-z0-9_-]{0,62}$`, so it never carries a dot and never shares a name with a built-in action |
+| `Version`  | `int`    | `"version"`  | The published version, at least 1                   |
+| `Checksum` | `string` | `"checksum"` | SHA-256 of the version's script: 32 bytes, standard-padded base64, the encoding of `DeclaredHook.Checksum`. The installed hook is pinned to it |
+
 ### Supporting types
 
 These types are part of the API but are not members of the state snapshot.
@@ -439,6 +463,49 @@ handles each answer.
 | Constant              | Value | Description                                                       |
 |-----------------------|-------|-------------------------------------------------------------------|
 | `EdgePSKEnvelopeSize` | `60`  | Exact envelope length: 12-byte nonce, 32-byte PSK, 16-byte GCM tag |
+
+## Published Hooks
+
+### `GET /v1/nodes/{node_id}/hooks/{name}/versions/{version}`
+
+**NodeHookVersion**
+
+The `200` body of the hook version fetch: the signed envelope that describes one
+published hook version, and the script. The script sits outside the envelope, so
+the signature covers its checksum in the payload rather than its bytes.
+`FetchHookVersion` decodes the body and verifies nothing; the rollout installer
+checks the envelope type, the payload, the signature and the script's digest
+before it writes anything (see
+[Verification](../actions/remote-actions-hooks.md#verification)).
+
+| Field          | Type       | JSON Tag          | Description                                         |
+|----------------|------------|-------------------|-----------------------------------------------------|
+| `Envelope`     | `Envelope` | `"envelope"`      | The signed envelope: the members of an [event envelope](event-verification.md#envelope), with `type` `hook_version`, `id` the version id, `scope` the Domain of the hook's Project, and `issued_at` the instant the version was signed. Its payload is a `HookVersionPayload` |
+| `ScriptBase64` | `string`   | `"script_base64"` | The script, standard base64                         |
+
+**HookVersionPayload**
+
+The payload of a `hook_version` envelope. `Name` and `Version` repeat the pair
+the node fetched. The last four fields are the hook's sidecar fields, signed
+together with its checksum; the installer writes them into the sidecar of the
+installed script.
+
+| Field            | Type            | JSON Tag                      | Description                                        |
+|------------------|-----------------|-------------------------------|----------------------------------------------------|
+| `ProjectID`      | `string`        | `"project_id"`                | The Project that published the hook; plexd does not check it |
+| `Name`           | `string`        | `"name"`                      | The hook's name                                    |
+| `Version`        | `int`           | `"version"`                   | The published version                              |
+| `Checksum`       | `string`        | `"checksum"`                  | SHA-256 of the script, in the encoding of `NodeStateHook.Checksum` |
+| `Description`    | `string`        | `"description,omitempty"`     | What the hook does; sent only when the version declares it |
+| `Parameters`     | `[]ActionParam` | `"parameters,omitempty"`      | What the hook expects; sent only when the version declares them |
+| `TimeoutSeconds` | `int64`         | `"timeout_seconds,omitempty"` | The hook's timeout in seconds; sent only when the version declares one. plexd installs a value from 0 to 86400 |
+| `SandboxLevel`   | `string`        | `"sandbox_level"`             | Always sent. plexd installs `none` or an empty value only |
+
+**Constants**
+
+| Constant                  | Value         | Description                                          |
+|---------------------------|---------------|------------------------------------------------------|
+| `HookVersionEnvelopeType` | `hook_version` | The `type` of the envelope a published hook version is signed in. The envelope never rides the event stream |
 
 ## Reports
 
@@ -661,6 +728,7 @@ type alias for `[]AuditEntry`
 | `DeclaredHooks`         | `[]DeclaredHook`        | `"declared_hooks,omitempty"`            | Optional hook declarations, at most 128, unique names   |
 | `PlexdHooks`            | `[]DiscoveredPlexdHook` | `"plexd_hooks,omitempty"`               | Optional PlexdHook resources in the ServiceAccount's namespace, at most 128, unique names |
 | `BuiltinActions`        | `[]ActionInfo`          | `"builtin_actions,omitempty"`           | Optional builtin action inventory sorted by name, at most 128 actions of at most 64 parameters |
+| `HookRolloutErrors`     | `[]HookRolloutError`    | `"hook_rollout_errors,omitempty"`       | Optional: the published hook versions the last pull listed that the node could not install, at most 64. Omitted when nil rather than sent as `null`; the control plane stores an absent list as `[]`, so the node clears an error by leaving it out |
 
 **DeclaredHook**
 
@@ -672,12 +740,51 @@ type alias for `[]AuditEntry`
 | `Parameters`     | `[]ActionParam` | `"parameters,omitempty"`      | What the hook expects, in sidecar order, at most 64. Each `Name` is non-empty after trimming and unique within the hook, and `Name`, `Type`, `Default`, and `Description` are at most 4096 characters each |
 | `TimeoutSeconds` | `int64`         | `"timeout_seconds,omitempty"` | The timeout the sidecar declares, in whole seconds from 0 to 86400. 0 means none declared |
 | `SandboxLevel`   | `string`        | `"sandbox_level,omitempty"`   | The sandbox level the sidecar declares, at most 64 characters, free-form |
+| `Source`         | `string`        | `"source,omitempty"`          | `rollout` for a script installed from a published version. Empty, and off the wire, for every other hook: the contract reads an absent `source` as `local`. The contract also accepts `local`, and answers any other value with `400 declared_hook_invalid` |
+| `Version`        | `int`           | `"version,omitempty"`         | The published version installed, 1 to 2147483647. Required with `source` `rollout` and refused on any other entry, both with `400 declared_hook_invalid`, so it is zero, and off the wire, for every other entry |
 
-The last four fields come from the hook's sidecar and describe the hook.
-They gate nothing at the control plane and sit outside its digest, so a hook with
-no sidecar marshals to `name` and `checksum` alone. plexd applies the sidecar's
-`timeout` and `sandbox` when it runs the hook. Characters are Unicode code points,
-and a NUL in any of these strings is refused.
+The four fields after `Checksum` come from the hook's sidecar and describe the
+hook. They gate nothing at the control plane and sit outside its digest, so a
+hand-placed hook with no sidecar marshals to `name` and `checksum` alone. plexd
+applies the sidecar's `timeout` and `sandbox` when it runs the hook. Characters
+are Unicode code points, and a NUL in any of these strings is refused.
+
+`Source` and `Version` mark a hook a rollout installed. The control plane then
+takes the published checksum of that version as the hook's baseline instead of
+the first digest the node reported, so a rolled-out hook is never trusted on
+first use. A hand-placed hook is sent with neither key, so a node with no
+rolled-out hook sends the manifest it sent before rollouts existed.
+
+**HookRolloutError** — one published hook version the node could not install.
+`Name` and `Version` are the pair the pull listed, so the operator's per-node
+rollout status can put the error beside the rollout that caused it.
+
+| Field     | Type     | JSON Tag             | Description                                        |
+|-----------|----------|----------------------|----------------------------------------------------|
+| `Name`    | `string` | `"name"`             | The hook name, as the pull listed it               |
+| `Version` | `int`    | `"version"`          | The version the pull listed, 1 to 2147483647       |
+| `Code`    | `string` | `"code"`             | What went wrong, matching `^[a-z0-9_]{1,64}$`: one of the `HookRolloutCode` constants below |
+| `Detail`  | `string` | `"detail,omitempty"` | An explanation, at most 1024 code points with no NUL. plexd replaces a NUL with U+FFFD and cuts a longer detail |
+
+More than 64 entries answer `400 hook_rollout_errors_too_many`, and an entry that
+breaks a limit `400 hook_rollout_error_invalid`. plexd sends at most 64, sorted
+by name, and keeps each entry inside the limits.
+
+**Hook source and rollout constants**
+
+| Constant                            | Value                 | Description |
+|-------------------------------------|-----------------------|-------------|
+| `HookSourceLocal`                   | `local`               | A hook placed on the node by other means than a rollout, such as a script in `hooks_dir`. `HookInfo.Source` carries it; the manifest leaves the key off |
+| `HookSourceRollout`                 | `rollout`             | A script installed from a published hook version |
+| `HookRolloutCodeCollision`          | `collision`           | `hooks_dir` holds a hook of the rollout's name |
+| `HookRolloutCodeVerificationFailed` | `verification_failed` | The version's signature or checksum did not verify |
+| `HookRolloutCodeFetchFailed`        | `fetch_failed`        | The version could not be fetched |
+| `HookRolloutCodeInstallFailed`      | `install_failed`      | The version could not be installed, or will not be on this platform or under this configuration |
+| `MaxHookRolloutErrors`              | `64`                  | The most `hook_rollout_errors` entries one manifest may carry |
+| `MaxHookRolloutDetailChars`         | `1024`                | The longest `detail`, in Unicode code points |
+
+The control plane accepts any code that matches the pattern and shows it as
+sent, so a newer agent's code never refuses the manifest.
 
 **DiscoveredPlexdHook** — one `PlexdHook` resource as the manifest reports it
 (the contract's `PlexdHook` schema).
@@ -748,11 +855,12 @@ plane receives the same two values as the manifest's flat fields.
 |--------------|-----------------|-----------------|-----------------------|
 | `Name`       | `string`        | `"name"`        | Hook name             |
 | `Description`| `string`        | `"description"` | Hook description      |
-| `Source`     | `string`        | `"source"`      | Hook source path      |
+| `Source`     | `string`        | `"source"`      | Where the hook came from: `local` for a hook in `hooks_dir`, `rollout` for one plexd installed from a published version |
 | `Checksum`   | `string`        | `"checksum"`    | Source checksum       |
 | `Parameters` | `[]ActionParam` | `"parameters"`  | Hook parameters       |
 | `Timeout`    | `string`        | `"timeout"`     | Execution timeout     |
 | `Sandbox`    | `string`        | `"sandbox"`     | Sandbox type          |
+| `Version`    | `int`           | `"version,omitempty"` | The published version a rolled-out hook was installed from; zero, and omitted, for a `local` hook |
 
 ## NAT Endpoint
 

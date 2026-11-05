@@ -353,7 +353,15 @@ Manage action hooks.
 
 #### `plexd hooks list`
 
-List all registered action hooks.
+List all registered action hooks, from `GET /v1/hooks`, in the columns `NAME`, `SOURCE`, `VERSION`, `CHECKSUM` (the first 12 characters) and `DESCRIPTION`. `SOURCE` is `local` for a hook in `hooks_dir` and `rollout` for a hook plexd installed from a version the control plane published. `VERSION` is that published version, and empty for a `local` hook:
+
+```text
+NAME       SOURCE   VERSION  CHECKSUM         DESCRIPTION
+backup-db  rollout  2        44403dc87411...  Dump the application database
+deploy     local             9f86d081884c...  Deploy
+```
+
+A version plexd could not install is not listed: it reaches the control plane in the capability manifest's `hook_rollout_errors`. See [Rolled-out Hooks](../actions/remote-actions-hooks.md#rolled-out-hooks).
 
 #### `plexd hooks verify`
 
@@ -361,11 +369,11 @@ Run integrity verification on all registered hooks.
 
 #### `plexd hooks reload`
 
-Re-scan the hooks directory and print the result: a `Status:` line and a `Hooks:` count. The scan needs no running hook watch, so this is how to refresh the list on a node that logged `hook watcher stopped`.
+Re-scan `hooks_dir` and, while rolled-out hooks are on, the rollout directory `<data_dir>/hooks`, and print the result: a `Status:` line and a `Hooks:` count of the hooks the agent lists, the same as `plexd hooks list`. The scan needs no running hook watch, so this is how to refresh the list on a node that logged `hook watcher stopped` or `rolled-out hook watcher stopped`.
 
-A hook that fails to hash keeps its last digest, and the agent logs a warning. When the scan itself fails, the agent answers `500`, leaves the list as it was, and the command exits non-zero with `plexd hooks reload: unexpected status 500: ...`.
+A hook that fails to hash keeps its last digest, and the agent logs a warning. When a directory cannot be read, the agent still rescans the other one, answers `500`, leaves the list of the directory that failed as it was, and the command exits non-zero with `plexd hooks reload: unexpected status 500: ...`.
 
-A reload feeds the [capability manifest](../actions/remote-actions-hooks.md#capability-announcement) like any other hook change. It moves no [integrity pin](../actions/remote-actions-hooks.md#hook-integrity-pinning): an edited hook runs again after an agent restart, not after a reload.
+A reload feeds the [capability manifest](../actions/remote-actions-hooks.md#capability-announcement) like any other hook change. It moves no [integrity pin](../actions/remote-actions-hooks.md#hook-integrity-pinning): an edited hand-placed hook runs again after an agent restart, not after a reload, and an edited rolled-out hook runs again once its script is deleted and the next pass fetches the listed version again, or once the control plane rolls out another version.
 
 ## Local Endpoint Communication
 

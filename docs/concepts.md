@@ -58,7 +58,7 @@ flowchart TD
     end
 
     subgraph Actions/NodeAPI
-        A13 --> A14[Create action executor + capability reporter + hook watcher]
+        A13 --> A14[Create action executor + rollout installer + capability reporter + hook watchers]
         A14 --> A15[Create node API server]
     end
 
@@ -87,9 +87,9 @@ flowchart TD
 7. **Create reconciler** — `reconcile.NewReconciler()` with handlers for WireGuard, policy, and bridge reconciliation
 8. **Create heartbeat service** — `agent.NewHeartbeatService()` with subsystem status enrichment and key-rotation callback; its credential-refused callback is set in step 12, once the node API server exists
 9. **Create integrity store + verifier** — `integrity.NewStore()` and `integrity.NewVerifier()` for hook checksums
-10. **Create action executor** — `actions.NewExecutor()`, register 11 built-in actions, register `actions.NewDispatcher()` on the reconciler as a dispatch handler, list the `PlexdHook` resources in a pod's namespace, and build `agent.NewCapabilityReporter()`, which sends nothing until it starts
-11. **Create hook watcher** — `actions.NewHookWatcher()` for filesystem hook scanning, with an `onChange` that calls `executor.SetHooks()` and then the reporter's `Notify()`. plexd then runs the first scan with `hookWatcher.Reload()` and waits for it, for at most 10 seconds, so the executor's hook list is filled before anything reads it and the boot manifest carries the hooks on disk
-12. **Create node API server** — `nodeapi.NewServer()`, wire action provider, hook reloader, and reconcile handler
+10. **Create action executor** — `actions.NewExecutor()`, register 11 built-in actions, build the rollout installer with `actions.NewRolloutInstaller()` (a constructor error logs `rolled-out hooks disabled`, and the agent runs on without rolled-out hooks), register the installer's `Handle`, when it was built, and then `actions.NewDispatcher()` on the reconciler as dispatch handlers, list the `PlexdHook` resources in a pod's namespace, and build `agent.NewCapabilityReporter()`, which sends nothing until it starts
+11. **Create hook watchers** — `actions.NewHookWatcher()` for `hooks_dir`, with an `onChange` that calls `executor.SetHooks()` and then the reporter's `Notify()`, and, when the installer was built and `actions.rollouts_enabled` is not `false`, `actions.NewRolloutHookWatcher()` for the rollout directory `<data_dir>/hooks`, whose `onChange` calls `executor.SetRolloutHooks()` and `Notify()`. plexd then runs the installer's `Load()`, which restores the rolled-out hooks from `hook_rollouts.json`, pins each to the checksum it was delivered with, and removes every other file of the rollout directory. It then runs one first scan over both directories with `hookDirsReloader.Reload()` and waits for it, for at most 10 seconds, so the executor's hook list is filled before anything reads it and the boot manifest carries the hooks on disk
+12. **Create node API server** — `nodeapi.NewServer()`, wire action provider, hook reloader (the same `hookDirsReloader`, so `POST /v1/hooks/reload` rescans both directories), and reconcile handler
 13. **Create metrics collectors + manager** — system collector, agent stats collector, `metrics.NewManager()`
 14. **Create log sources + forwarder** — platform log source (journald on Linux, the launchd log file on macOS, the Event Log on Windows), file sources from `file_patterns`, `logfwd.NewForwarder()`
 15. **Create audit sources + forwarder** — process source, `auditfwd.NewForwarder()`
@@ -102,14 +102,16 @@ After initialization, goroutines are started via a `sync.WaitGroup`:
 2. **Heartbeat** — `heartbeat.Run()` — periodic heartbeats
 3. **Reconciler** — `reconciler.Run()` — periodic state reconciliation
 4. **Node API** — `nodeAPISrv.Start()` — local endpoint (a Unix socket, or a named pipe on Windows) + optional HTTP server
-5. **Hook Watcher** — `hookWatcher.Watch()` — filesystem watching for hook changes
-6. **Capability Reporter** — `capabilityReporter.Run()` — sends the boot manifest, reports each hook or `PlexdHook` change, and retries a failed send
-7. **PlexdHook Inventory** — `plexdHooks.run()` — watches the `PlexdHook` resources in a pod's namespace; returns at once outside a cluster
-8. **Metrics Manager** — `metricsMgr.Run()` — collect and report metrics
-9. **Log Forwarder** — `logForwarder.Run()` — collect and forward logs
-10. **Audit Forwarder** — `auditForwarder.Run()` — collect and forward audit events
-11. **Peer Exchange** — `exchanger.Run()` — STUN discovery and endpoint exchange loop
-12. **Mesh Server** — `meshServer.Start()` — tunnel SSH server
+5. **Hook Watcher** — `hookWatcher.Watch()` — filesystem watching for hook changes in `hooks_dir`
+6. **Rollout Hook Watcher** — `rolloutWatcher.Watch()` — filesystem watching of the rollout directory; started only when that watcher was built
+7. **Rollout Installer** — `rolloutInstaller.Run()` — one pass per `hooks` block the reconciler hands over: fetch, verify, install, and remove rolled-out hooks; started only when the installer was built
+8. **Capability Reporter** — `capabilityReporter.Run()` — sends the boot manifest, reports each hook or `PlexdHook` change and each change to the rollout errors, and retries a failed send
+9. **PlexdHook Inventory** — `plexdHooks.run()` — watches the `PlexdHook` resources in a pod's namespace; returns at once outside a cluster
+10. **Metrics Manager** — `metricsMgr.Run()` — collect and report metrics
+11. **Log Forwarder** — `logForwarder.Run()` — collect and forward logs
+12. **Audit Forwarder** — `auditForwarder.Run()` — collect and forward audit events
+13. **Peer Exchange** — `exchanger.Run()` — STUN discovery and endpoint exchange loop
+14. **Mesh Server** — `meshServer.Start()` — tunnel SSH server
 
 The bridge's NAT relay is not a startup goroutine. In bridge mode with `bridge.relay_enabled` set, the reconciler's `RelayReconcileHandler` starts it on the first cycle whose state pull enables it, and stops it when a pull disables it or the bridge tears down (see [NAT Relay](reference/bridge/nat-relay.md#relayreconcilehandler)).
 
