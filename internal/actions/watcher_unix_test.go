@@ -1006,6 +1006,76 @@ func TestWatcher_ReloadDropsAHookDeletedWithNoWatchRunning(t *testing.T) {
 	wantHooks(t, "onChange", rec.last(), "kept")
 }
 
+// A watcher on the rollout directory reports what it scans as rolled out:
+// the executor picks the directory and the pin by Source, and the manifest
+// sends it, so a scan that said local would run the hook from hooks_dir.
+func TestWatcher_RolloutWatcherReloadStampsRollout(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "backup-db", "#!/bin/sh\necho backup\n")
+	writeSidecar(t, dir, "backup-db", hookMetadata{Description: "Back up the database", Timeout: "600s", Sandbox: "none"})
+
+	rec := &hookRecorder{}
+	w := NewRolloutHookWatcher(dir, rec.onChange, nil, testLogger())
+
+	hooks, err := w.Reload()
+	if err != nil {
+		t.Fatalf("Reload() error = %v", err)
+	}
+
+	wantHooks(t, "Reload()", hooks, "backup-db")
+	if hooks[0].Description != "Back up the database" {
+		t.Errorf("Description = %q, want the sidecar's", hooks[0].Description)
+	}
+	for what, list := range map[string][]api.HookInfo{"Reload()": hooks, "Hooks()": w.Hooks(), "onChange": rec.last()} {
+		if len(list) != 1 || list[0].Source != api.HookSourceRollout {
+			t.Errorf("%s = %+v, want one entry with Source %q", what, list, api.HookSourceRollout)
+		}
+	}
+}
+
+// A file event goes through processFile rather than the scan, so it needs the
+// rollout source of its own: the hook found at the start, a hook written while
+// the watch runs, and a hook whose sidecar changes all stay rolled out.
+func TestWatcher_RolloutWatcherFileEventStampsRollout(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, dir, "existing", "#!/bin/sh\necho existing\n")
+
+	rec := &hookRecorder{}
+	w := NewRolloutHookWatcher(dir, rec.onChange, nil, testLogger())
+	startWatch(t, w)
+
+	allRollout := func(hooks []api.HookInfo) bool {
+		for _, h := range hooks {
+			if h.Source != api.HookSourceRollout {
+				return false
+			}
+		}
+		return true
+	}
+
+	initial, hooks := rec.waitFor(t, 0, namesAre("existing"), "no initial scan callback")
+	if !allRollout(hooks) {
+		t.Errorf("initial scan = %+v, want Source %q", hooks, api.HookSourceRollout)
+	}
+
+	writeExecutable(t, dir, "added", "#!/bin/sh\necho added\n")
+	added, hooks := rec.waitFor(t, initial+1, namesAre("added", "existing"), "the added hook was not reported")
+	if !allRollout(hooks) {
+		t.Errorf("after the add = %+v, want Source %q", hooks, api.HookSourceRollout)
+	}
+
+	writeSidecar(t, dir, "added", hookMetadata{Description: "Added later"})
+	_, hooks = rec.waitFor(t, added+1, func(hooks []api.HookInfo) bool {
+		return len(hooks) == 2 && hooks[0].Name == "added" && hooks[0].Description == "Added later"
+	}, "the sidecar of the added hook was not reported")
+	if !allRollout(hooks) {
+		t.Errorf("after the sidecar write = %+v, want Source %q", hooks, api.HookSourceRollout)
+	}
+	if !allRollout(w.Hooks()) {
+		t.Errorf("Hooks() = %+v, want Source %q", w.Hooks(), api.HookSourceRollout)
+	}
+}
+
 // hashingVerifier is a HookVerifier that hashes the hook file, as
 // integrity.Verifier does, and records the digest each run was verified against.
 type hashingVerifier struct {
