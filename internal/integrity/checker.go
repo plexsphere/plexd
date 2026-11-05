@@ -71,6 +71,26 @@ func WireChecksum(hexDigest string) (string, error) {
 	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
+// HexChecksum is the inverse of WireChecksum: it decodes a checksum in the
+// wire form, the 32 raw bytes in standard-padded base64, into the hex digest
+// HashFile returns. A digest the control plane delivered, such as a published
+// hook version's, can then be compared with one this package computed and
+// pinned the way a computed one is.
+//
+// Anything that does not decode to exactly 32 bytes is refused, the empty
+// string and a hex digest among them, because such a value names no SHA-256
+// digest and would pin a hook no script can match.
+func HexChecksum(wire string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(wire)
+	if err != nil {
+		return "", fmt.Errorf("integrity: hex checksum: %w", err)
+	}
+	if len(raw) != sha256.Size {
+		return "", fmt.Errorf("integrity: hex checksum: digest is %d bytes, want %d", len(raw), sha256.Size)
+	}
+	return hex.EncodeToString(raw), nil
+}
+
 // HostKeyFingerprint parses the OpenSSH private key at path and renders its
 // public half as the canonical `SHA256:<base64>` fingerprint — the form
 // `ssh-keygen -l` prints, the one the capability manifest already carries, and

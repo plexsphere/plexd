@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -268,5 +269,51 @@ func TestWireChecksum_AcceptsHashFileOutput(t *testing.T) {
 	}
 	if _, err := WireChecksum(hexDigest); err != nil {
 		t.Errorf("WireChecksum(HashFile(...)) = %v, want it to convert", err)
+	}
+}
+
+// HexChecksum undoes WireChecksum, so a digest the control plane delivered can
+// be compared with one HashFile computed.
+func TestHexChecksum_RoundTrip(t *testing.T) {
+	for _, content := range []string{"", "plexd", "#!/bin/sh\necho backup\n"} {
+		hexDigest := sha256Hex(content)
+		wire, err := WireChecksum(hexDigest)
+		if err != nil {
+			t.Fatalf("WireChecksum(%q): %v", hexDigest, err)
+		}
+		got, err := HexChecksum(wire)
+		if err != nil {
+			t.Fatalf("HexChecksum(%q): %v", wire, err)
+		}
+		if got != hexDigest {
+			t.Errorf("HexChecksum(WireChecksum(%q)) = %q, want the digest back", hexDigest, got)
+		}
+	}
+}
+
+// Only a value that decodes to exactly one SHA-256 digest is accepted. A hex
+// digest decodes as base64 to 48 bytes, so the wrong encoding is refused too.
+func TestHexChecksum_Refused(t *testing.T) {
+	sum := sha256.Sum256([]byte("plexd"))
+	for name, in := range map[string]string{
+		"31 bytes":   base64.StdEncoding.EncodeToString(sum[:31]),
+		"33 bytes":   base64.StdEncoding.EncodeToString(append(sum[:], 0)),
+		"not base64": "not base64!",
+		"empty":      "",
+		"hex digest": hex.EncodeToString(sum[:]),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := HexChecksum(in)
+			if err == nil {
+				t.Fatalf("HexChecksum(%q) = %q, want an error", in, got)
+			}
+			if got != "" {
+				t.Errorf("HexChecksum(%q) = %q alongside the error, want empty", in, got)
+			}
+			const prefix = "integrity: hex checksum: "
+			if !strings.HasPrefix(err.Error(), prefix) {
+				t.Errorf("error = %q, want prefix %q", err.Error(), prefix)
+			}
+		})
 	}
 }
