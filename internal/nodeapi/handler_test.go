@@ -1479,6 +1479,45 @@ func TestHandler_GetHooks(t *testing.T) {
 	}
 }
 
+// A rolled-out hook carries its source and the version it was installed from
+// through HookInfo, and a hand-placed one carries no version key.
+func TestHandler_GetHooks_RolloutEntry(t *testing.T) {
+	provider := &mockActionProvider{
+		hooks: []api.HookInfo{
+			{Name: "backup-db", Source: api.HookSourceRollout, Version: 2, Checksum: "aaa", Description: "Rolled out"},
+			{Name: "deploy", Source: api.HookSourceLocal, Checksum: "bbb", Description: "Hand placed"},
+		},
+	}
+	srv := newTestHandlerWithActions(t, provider, nil)
+
+	resp := mustGet(t, srv.URL+"/v1/hooks")
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	var hooks []map[string]json.RawMessage
+	if err := json.Unmarshal(body, &hooks); err != nil {
+		t.Fatalf("decode body: %v (body: %s)", err, body)
+	}
+	if len(hooks) != 2 {
+		t.Fatalf("hooks len = %d, want 2 (body: %s)", len(hooks), body)
+	}
+	if got := string(hooks[0]["source"]); got != `"rollout"` {
+		t.Errorf("rollout entry source = %s, want \"rollout\" (body: %s)", got, body)
+	}
+	if got := string(hooks[0]["version"]); got != "2" {
+		t.Errorf("rollout entry version = %s, want 2 (body: %s)", got, body)
+	}
+	if raw, ok := hooks[1]["version"]; ok {
+		t.Errorf("local entry carries version = %s, want no key (body: %s)", raw, body)
+	}
+}
+
 func TestHandler_GetHooks_NoProvider(t *testing.T) {
 	srv := newTestHandlerWithActions(t, nil, nil)
 
