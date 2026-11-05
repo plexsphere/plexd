@@ -36,6 +36,10 @@
 #     group-writable hook file
 #   - A running hook stopped by the pull's cancel_requested_at, with its whole
 #     process group killed and the output it printed reported as cancelled
+#   - A hook the control plane rolls out installed, run, and upgraded with no
+#     restart, kept by a null hooks block, refused when its fetch fails
+#     verification or hooks_dir holds its name, kept across a restart, refused
+#     to run once edited on disk, and withdrawn
 #   - Pull-only delivery under a descoped event bus (quiet SSE re-probing)
 #   - Last-Event-ID resume replays buffered envelopes after a descope window
 #   - release-verdict upgrade flow (checksum + offline Sigstore verification)
@@ -3821,6 +3825,511 @@ configure_executions "exec-e2e-cancel-clear" '[]'
 dc exec -T plexd /bin/busybox rm "${LIVE_HOOKS_DIR}/e2e-cancel" "${RUN_TICKS}" \
     || fail "[hook cancel cleanup] could not remove e2e-cancel and ${RUN_TICKS} from the container"
 wait_for_declared_hooks "hook cancel cleanup" "e2e-bigout"
+
+# 10i. A hook the control plane rolls out reaches the running agent. The pull's
+# hooks block lists the published versions the node should run. plexd fetches
+# each one it has not installed, checks the Domain signature and the checksum
+# the block names, and installs it into a directory of its own, <data_dir>/hooks.
+# The hook is pinned to the delivered checksum, so a new version runs with no
+# restart, and an edit on disk fails the pre-dispatch check as it does for a
+# hand-placed hook. The numbered checks run in order, and each starts from what
+# the one before it left: the versions the mock serves, the block, and the
+# files. A block withdraws every rolled-out hook it does not list, so each block
+# a check splices lists every hook that should stay installed.
+ROLLOUT_HOOKS_DIR="/var/lib/plexd/hooks"
+ROLLOUT_DESC="rolled out by the e2e suite"
+
+# nudge_hooks injects a node_state_updated envelope, so the agent pulls right
+# away instead of waiting out the ~30s heartbeat reconcile cadence. Args: <tag>.
+# The tag keeps the envelope id unique per call. It reads no snapshot, so the
+# only pull it adds to state_count is the one it asks for.
+nudge_hooks() {
+    local tag=$1
+
+    local payload status
+    payload=$(cat <<HOOKSNUDGEEOF
+{
+    "id": "evt-e2e-hooks-nudge-${tag}",
+    "type": "node_state_updated",
+    "scope": "node",
+    "payload": "{\"node_id\":\"e2e-node-1\"}"
+}
+HOOKSNUDGEEOF
+    )
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${payload}" \
+        "http://localhost:18080/test/inject-event" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] hooks nudge injection returned status ${status}, want 204"
+    fi
+}
+
+# configure_hooks replaces the snapshot's hooks block and nudges the agent.
+# Args: <tag> <hooks-json-array-or-null>. configure-state REPLACES the whole
+# snapshot fixture, so the block is spliced into the live snapshot the way
+# configure_secrets splices the secrets block, and every other block travels
+# back verbatim. null keeps every rolled-out hook, and [] withdraws them all.
+# nudge_hooks follows with the same tag, so the agent pulls the new block right
+# away.
+#
+# NOTE: reading the live snapshot is a real GET on the state endpoint and
+# therefore INCREMENTS state_count. A check gating on state_count must take its
+# baseline AFTER calling this helper.
+configure_hooks() {
+    local tag=$1 entries=$2
+
+    local snapshot spliced status
+    snapshot=$(curl -sf "${MOCK_AUTH[@]}" "http://localhost:18080/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3/state" 2>/dev/null || true)
+    if [ -z "${snapshot}" ]; then
+        fail "[${tag}] could not read the live node state snapshot"
+    fi
+    # printf, not echo: the fixture carries backslash escapes (an embedded
+    # newline in the certs/ca data entry) that must travel back byte for byte.
+    spliced=$(printf '%s' "${snapshot}" | jq --argjson h "${entries}" '.hooks = $h') \
+        || fail "[${tag}] could not splice the hooks block ${entries} into the live snapshot"
+
+    status=$(curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST -H "Content-Type: application/json" \
+        -d "${spliced}" \
+        "http://localhost:18080/test/configure-state" 2>/dev/null || true)
+    if [ "${status}" != "204" ]; then
+        fail "[${tag}] configure-state returned status ${status}, want 204"
+    fi
+
+    nudge_hooks "${tag}"
+}
+
+# configure_hook_versions posts a body to POST /test/configure-hook-versions and
+# prints the answer, which gives the checksum of each version it configured.
+# Args: <json>. The route replaces the whole served set, so a body lists every
+# version the block may still name. Any status but 200 prints the status and the
+# answer and returns 1, so the caller fails with them.
+configure_hook_versions() {
+    local out status answer
+    out=$(curl -s -w '\n%{http_code}' \
+        -X POST -H "Content-Type: application/json" \
+        -d "$1" \
+        "http://localhost:18080/test/configure-hook-versions" 2>&1 || true)
+    status=${out##*$'\n'}
+    answer=${out%$'\n'*}
+    answer=${answer%$'\n'}
+    if [ "${status}" != "200" ]; then
+        printf 'configure-hook-versions returned status %s, want 200 (body: %s)\n' "${status}" "${answer}"
+        return 1
+    fi
+    printf '%s\n' "${answer}"
+}
+
+# rollout_version prints one entry of a configure_hook_versions body. Args:
+# <hook> <version> <marker> [<tamper>]. The script is what live_hook_text prints
+# for the marker, read raw so that its last newline is in the base64 too. Every
+# version declares the same description and a 30s timeout.
+rollout_version() {
+    live_hook_text "$3" | jq -Rsc --arg name "$1" --argjson version "$2" \
+        --arg desc "${ROLLOUT_DESC}" --arg tamper "${4:-}" \
+        '{name: $name, version: $version, script_base64: @base64, description: $desc, timeout_seconds: 30, tamper: $tamper}'
+}
+
+# hook_version_checksum prints the checksum a configure_hook_versions answer
+# gives one version: the base64 SHA-256 of the script as configured, which is
+# what a block names. Args: <answer> <hook> <version>. A version the answer does
+# not list prints why and returns 1, so the caller fails with it rather than
+# splice an empty checksum.
+hook_version_checksum() {
+    local checksum
+    if ! checksum=$(printf '%s' "$1" | jq -r --arg name "$2" --argjson version "$3" \
+        '.versions[]? | select(.name == $name and .version == $version) | .checksum' 2>&1) \
+        || [ -z "${checksum}" ]; then
+        printf 'no checksum for %s version %s in the configure-hook-versions answer %s%s\n' \
+            "$2" "$3" "$1" "${checksum:+ (${checksum})}"
+        return 1
+    fi
+    printf '%s\n' "${checksum}"
+}
+
+# wait_for_manifest polls the captured manifest for up to 15 seconds, until a jq
+# filter over the whole body holds. Args: <step> <jq filter> [<jq option>...].
+# The options, such as --arg, go to jq ahead of the filter. wait_for_hook_entry
+# reads one declared_hooks entry for 10 seconds, but a rollout check also reads
+# hook_rollout_errors and entries that must be gone, and a fetch and its checks
+# lie between a splice and the PUT. On a pass MANIFEST_BODY holds the body that
+# passed, so the caller can check more of the same PUT. As there, the mock
+# captures a refused PUT too, so a pass says what the agent sent.
+wait_for_manifest() {
+    local step=$1 filter=$2
+    shift 2
+    local elapsed=0 body jq_err
+    while :; do
+        body=$(curl -sf "http://localhost:18080/test/last-request/capabilities" 2>/dev/null || true)
+        # jq's stdout goes nowhere and its stderr is kept, so a filter that does
+        # not compile names its error in the failure below.
+        if jq_err=$(printf '%s' "${body}" | jq -e "$@" "${filter}" 2>&1 >/dev/null); then
+            MANIFEST_BODY=${body}
+            echo "  PASS: [${step}] the manifest holds ${filter}, after ${elapsed}s"
+            return 0
+        fi
+        if [ "${elapsed}" -ge 15 ]; then
+            fail "[${step}] the manifest did not reach ${filter} within 15s (${jq_err:+jq: ${jq_err}; }body: ${body})"
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+}
+
+# rollout_file_exists prints yes or no for a file in the rollout directory of
+# the container. Args: <file>. The test runs inside the sh -c, so a failed exec
+# prints its error, which is neither answer.
+rollout_file_exists() {
+    dc exec -T plexd /bin/busybox sh -c \
+        "if /bin/busybox test -e ${ROLLOUT_HOOKS_DIR}/$1; then printf 'yes\n'; else printf 'no\n'; fi" 2>&1
+}
+
+# (1) Install: version 1 reaches the manifest as a rolled-out entry, with the
+# checksum the mock published and the description and timeout its signed
+# payload declares, which plexd wrote into the sidecar. The script plexd wrote
+# belongs to root and has mode 0755, so the executor's file check, which refuses
+# a hook another user owns or can write, lets it run. hook_fetch_count moves
+# only on a fetch the mock answered with the version.
+FETCH_BEFORE_INSTALL=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "hook_fetch_count")
+HV_ANSWER=$(configure_hook_versions "$(printf '{"versions":[%s]}' \
+    "$(rollout_version e2e-rollout 1 "e2e-rollout v1")")") \
+    || fail "[rollout install] ${HV_ANSWER}"
+V1_SUM=$(hook_version_checksum "${HV_ANSWER}" e2e-rollout 1) || fail "[rollout install] ${V1_SUM}"
+configure_hooks "rollout-install" "$(jq -nc --arg sum "${V1_SUM}" '[{name: "e2e-rollout", version: 1, checksum: $sum}]')"
+wait_for_manifest "rollout install" \
+    'any(.declared_hooks[]?; .name == "e2e-rollout" and .source == "rollout" and .version == 1 and .checksum == $v1 and .description == $desc and .timeout_seconds == 30)' \
+    --arg v1 "${V1_SUM}" --arg desc "${ROLLOUT_DESC}"
+
+ROLLOUT_STAT=$(dc exec -T plexd /bin/busybox stat -c '%a %u' "${ROLLOUT_HOOKS_DIR}/e2e-rollout" 2>&1) \
+    || fail "[rollout install] could not stat ${ROLLOUT_HOOKS_DIR}/e2e-rollout in the container: ${ROLLOUT_STAT}"
+if [ "${ROLLOUT_STAT}" = "755 0" ]; then
+    echo "  PASS: [rollout install] ${ROLLOUT_HOOKS_DIR}/e2e-rollout has mode 755 and owner uid 0"
+else
+    fail "[rollout install] ${ROLLOUT_HOOKS_DIR}/e2e-rollout has mode and owner '${ROLLOUT_STAT}', want '755 0'"
+fi
+FETCH_AFTER_INSTALL=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "hook_fetch_count")
+if [ "${FETCH_AFTER_INSTALL}" -gt "${FETCH_BEFORE_INSTALL}" ] 2>/dev/null; then
+    echo "  PASS: [rollout install] hook_fetch_count grew from ${FETCH_BEFORE_INSTALL} to ${FETCH_AFTER_INSTALL}"
+else
+    fail "[rollout install] hook_fetch_count went from '${FETCH_BEFORE_INSTALL}' to '${FETCH_AFTER_INSTALL}', want growth: the version did not come over the fetch"
+fi
+
+# (2) Run and upgrade: the installed version runs, and version 2 replaces it in
+# the running agent. The manifest lists a hook only once plexd pinned it, so a
+# manifest that lists a version means a dispatch runs that version. The served
+# set keeps version 1 until the block stops naming it. The baseline goes ahead
+# of each dispatch, as in 10g.
+CB_BEFORE_ROLLOUT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+configure_executions "exec-e2e-rollout-001" \
+    "$(exec_entry "exec-e2e-rollout-001" "e2e-rollout" "hook" "pending" "null")"
+wait_for_terminal_callback "rollout run" "${CB_BEFORE_ROLLOUT}" \
+    '.status == "succeeded" and (.output.inline | @base64d | contains("e2e-rollout v1"))'
+
+HV_ANSWER=$(configure_hook_versions "$(printf '{"versions":[%s,%s]}' \
+    "$(rollout_version e2e-rollout 1 "e2e-rollout v1")" \
+    "$(rollout_version e2e-rollout 2 "e2e-rollout v2")")") \
+    || fail "[rollout upgrade] ${HV_ANSWER}"
+V2_SUM=$(hook_version_checksum "${HV_ANSWER}" e2e-rollout 2) || fail "[rollout upgrade] ${V2_SUM}"
+configure_hooks "rollout-upgrade" "$(jq -nc --arg sum "${V2_SUM}" '[{name: "e2e-rollout", version: 2, checksum: $sum}]')"
+# Each check from here on finds e2e-rollout at version 2 with the digest of the
+# bytes the mock published for it, until (7) edits the file. The filter needs
+# --arg v2 with that checksum.
+ROLLOUT_AT_V2='any(.declared_hooks[]?; .name == "e2e-rollout" and .source == "rollout" and .version == 2 and .checksum == $v2)'
+wait_for_manifest "rollout upgrade" "${ROLLOUT_AT_V2}" --arg v2 "${V2_SUM}"
+
+CB_BEFORE_ROLLOUT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+configure_executions "exec-e2e-rollout-002" \
+    "$(exec_entry "exec-e2e-rollout-002" "e2e-rollout" "hook" "pending" "null")"
+wait_for_terminal_callback "rollout upgrade" "${CB_BEFORE_ROLLOUT}" \
+    '.status == "succeeded" and (.output.inline | @base64d | contains("e2e-rollout v2"))'
+
+# (3) Null block: a pull whose hooks block is null keeps every rolled-out hook.
+# Two pulls past the baseline mean that at least one of them ran its dispatch
+# handlers to the end before the other started. The nudge's pull may land ahead
+# of the baseline, and the heartbeat asks for one about every 30s, so the wait
+# covers two heartbeats.
+configure_hooks "rollout-null" null
+STATE_BEFORE_NULL=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+case "${STATE_BEFORE_NULL}" in
+    '' | *[!0-9]*) fail "[rollout null block] no state_count baseline (got '${STATE_BEFORE_NULL}')" ;;
+esac
+NULL_ELAPSED=0
+while :; do
+    STATE_AFTER_NULL=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "state_count")
+    if [ "${STATE_AFTER_NULL}" -ge $((STATE_BEFORE_NULL + 2)) ] 2>/dev/null; then
+        echo "  PASS: [rollout null block] state_count grew from ${STATE_BEFORE_NULL} to ${STATE_AFTER_NULL} after ${NULL_ELAPSED}s"
+        break
+    fi
+    if [ "${NULL_ELAPSED}" -ge 65 ]; then
+        fail "[rollout null block] state_count went from ${STATE_BEFORE_NULL} to '${STATE_AFTER_NULL}' in 65s, want two pulls of the null block"
+    fi
+    sleep 1
+    NULL_ELAPSED=$((NULL_ELAPSED + 1))
+done
+wait_for_manifest "rollout null block" "${ROLLOUT_AT_V2}" --arg v2 "${V2_SUM}"
+ROLLOUT_EXISTS=$(rollout_file_exists e2e-rollout) \
+    || fail "[rollout null block] could not check ${ROLLOUT_HOOKS_DIR}/e2e-rollout in the container: ${ROLLOUT_EXISTS}"
+if [ "${ROLLOUT_EXISTS}" = "yes" ]; then
+    echo "  PASS: [rollout null block] ${ROLLOUT_HOOKS_DIR}/e2e-rollout is still on disk"
+else
+    fail "[rollout null block] ${ROLLOUT_HOOKS_DIR}/e2e-rollout exists: '${ROLLOUT_EXISTS}', want 'yes'"
+fi
+
+# (4) Verification failure: version 3 is served with a byte appended to the
+# script its payload's checksum covers. plexd refuses it after the fetch,
+# writes nothing, and reports verification_failed for that version alone, so
+# version 2 stays installed and pinned. Version 2 stays served, because the
+# block names it until the splice. dc logs spans every run of the container,
+# so the log line counts from a baseline.
+VERIFY_FAILED_LINE="actions: rollout: verification failed"
+PLEXD_LOGS=$(dc logs plexd 2>&1) || fail "dc logs plexd failed: ${PLEXD_LOGS}"
+VERIFY_FAILED_BEFORE=$(count_log_lines "${PLEXD_LOGS}" "${VERIFY_FAILED_LINE}" "e2e-rollout")
+HV_ANSWER=$(configure_hook_versions "$(printf '{"versions":[%s,%s]}' \
+    "$(rollout_version e2e-rollout 2 "e2e-rollout v2")" \
+    "$(rollout_version e2e-rollout 3 "e2e-rollout v3" script)")") \
+    || fail "[rollout verification] ${HV_ANSWER}"
+V3_SUM=$(hook_version_checksum "${HV_ANSWER}" e2e-rollout 3) || fail "[rollout verification] ${V3_SUM}"
+configure_hooks "rollout-verify" "$(jq -nc --arg sum "${V3_SUM}" '[{name: "e2e-rollout", version: 3, checksum: $sum}]')"
+wait_for_manifest "rollout verification" \
+    '[.hook_rollout_errors[]? | {name, version, code}] == [{name: "e2e-rollout", version: 3, code: "verification_failed"}] and '"${ROLLOUT_AT_V2}" \
+    --arg v2 "${V2_SUM}"
+PLEXD_LOGS=$(dc logs plexd 2>&1) || fail "dc logs plexd failed: ${PLEXD_LOGS}"
+VERIFY_FAILED_AFTER=$(count_log_lines "${PLEXD_LOGS}" "${VERIFY_FAILED_LINE}" "e2e-rollout")
+if [ "${VERIFY_FAILED_AFTER}" -gt "${VERIFY_FAILED_BEFORE}" ]; then
+    echo "  PASS: [rollout verification] plexd logged '${VERIFY_FAILED_LINE}' for e2e-rollout (${VERIFY_FAILED_BEFORE} -> ${VERIFY_FAILED_AFTER})"
+else
+    fail "[rollout verification] plexd logged no new '${VERIFY_FAILED_LINE}' line for e2e-rollout (${VERIFY_FAILED_BEFORE} -> ${VERIFY_FAILED_AFTER})"
+fi
+
+# (5) Collision: a hand-placed hook of a listed name blocks the rollout of that
+# name. plexd reports collision, installs nothing of that name, and the
+# manifest lists the hand-placed hook as a local one, with no source key. The
+# file goes in first, and the manifest shows its digest before any block names
+# it, so no pass can install a rolled-out copy ahead of it. From here on the
+# served set holds e2e-rollout version 2 and e2e-collide version 1, and the
+# block lists both. The version 3 error goes with the block that named it.
+COLLIDE_MARKER="e2e-collide hand-placed"
+COLLIDE_HEX=$(live_hook_text "${COLLIDE_MARKER}" | sha256_hex)
+install_live_hook e2e-collide "${COLLIDE_MARKER}" \
+    || fail "[rollout collision] could not write e2e-collide into the container"
+wait_for_declared_hooks "rollout collision" "e2e-bigout,e2e-collide,e2e-rollout" e2e-collide "${COLLIDE_HEX}"
+
+HV_ANSWER=$(configure_hook_versions "$(printf '{"versions":[%s,%s]}' \
+    "$(rollout_version e2e-rollout 2 "e2e-rollout v2")" \
+    "$(rollout_version e2e-collide 1 "e2e-collide v1")")") \
+    || fail "[rollout collision] ${HV_ANSWER}"
+COLLIDE_SUM=$(hook_version_checksum "${HV_ANSWER}" e2e-collide 1) || fail "[rollout collision] ${COLLIDE_SUM}"
+configure_hooks "rollout-collide" "$(jq -nc --arg collide "${COLLIDE_SUM}" --arg rollout "${V2_SUM}" \
+    '[{name: "e2e-collide", version: 1, checksum: $collide}, {name: "e2e-rollout", version: 2, checksum: $rollout}]')"
+wait_for_manifest "rollout collision" \
+    '[.hook_rollout_errors[]? | {name, version, code}] == [{name: "e2e-collide", version: 1, code: "collision"}] and any(.declared_hooks[]?; .name == "e2e-collide" and (has("source") | not)) and '"${ROLLOUT_AT_V2}" \
+    --arg v2 "${V2_SUM}"
+COLLIDE_MANIFEST_HEX=$(declared_hook_hex "${MANIFEST_BODY}" e2e-collide)
+if [ "${COLLIDE_MANIFEST_HEX}" = "${COLLIDE_HEX}" ]; then
+    echo "  PASS: [rollout collision] the manifest lists e2e-collide at the digest of the hand-placed file"
+else
+    fail "[rollout collision] declared_hooks digest of e2e-collide = ${COLLIDE_MANIFEST_HEX}, want ${COLLIDE_HEX}, the SHA-256 of the hand-placed file"
+fi
+COLLIDE_EXISTS=$(rollout_file_exists e2e-collide) \
+    || fail "[rollout collision] could not check ${ROLLOUT_HOOKS_DIR}/e2e-collide in the container: ${COLLIDE_EXISTS}"
+if [ "${COLLIDE_EXISTS}" = "no" ]; then
+    echo "  PASS: [rollout collision] plexd wrote no ${ROLLOUT_HOOKS_DIR}/e2e-collide"
+else
+    fail "[rollout collision] ${ROLLOUT_HOOKS_DIR}/e2e-collide exists: '${COLLIDE_EXISTS}', want 'no'"
+fi
+
+# (6) Restart: the restarted agent loads its record of what it installed and
+# pins each hook to the checksum it was delivered with, ahead of its boot scan,
+# so its boot manifest carries the rolled-out hook. capabilities_count moves
+# only on delivery, as in 10f's check (9). A nudge reaches only an open event
+# stream, so the dispatch waits, as phase 7c does, until the restarted agent has
+# opened its stream and a pull has followed. A restart that lost the record
+# fetches version 2 again, because the block still lists it and the mock still
+# serves it, and the manifest and the dispatch would then show version 2 all the
+# same. hook_fetch_count therefore must not move from before the restart until
+# the dispatch has printed version 2.
+RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+CAPS_BEFORE_ROLLOUT_RESTART=$(get_counter "${RESPONSE}" "capabilities_count")
+EVREQ_BEFORE_ROLLOUT_RESTART=$(get_counter "${RESPONSE}" "events_request_count")
+FETCH_BEFORE_ROLLOUT_RESTART=$(get_counter "${RESPONSE}" "hook_fetch_count")
+case "${FETCH_BEFORE_ROLLOUT_RESTART}" in
+    '' | *[!0-9]*) fail "[rollout restart] no hook_fetch_count baseline (got '${FETCH_BEFORE_ROLLOUT_RESTART}')" ;;
+esac
+dc restart plexd
+ROLLOUT_RESTART_TIMEOUT=30
+ROLLOUT_RESTART_ELAPSED=0
+while :; do
+    CAPS_AFTER_ROLLOUT_RESTART=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "capabilities_count")
+    if [ "${CAPS_AFTER_ROLLOUT_RESTART}" -gt "${CAPS_BEFORE_ROLLOUT_RESTART}" ] 2>/dev/null; then
+        echo "  PASS: [rollout restart] capabilities_count grew from ${CAPS_BEFORE_ROLLOUT_RESTART} to ${CAPS_AFTER_ROLLOUT_RESTART} after ${ROLLOUT_RESTART_ELAPSED}s"
+        break
+    fi
+    if [ "${ROLLOUT_RESTART_ELAPSED}" -ge "${ROLLOUT_RESTART_TIMEOUT}" ]; then
+        fail "[rollout restart] capabilities_count stayed at ${CAPS_BEFORE_ROLLOUT_RESTART} for ${ROLLOUT_RESTART_TIMEOUT}s after the restart: the boot manifest was not delivered"
+    fi
+    sleep 1
+    ROLLOUT_RESTART_ELAPSED=$((ROLLOUT_RESTART_ELAPSED + 1))
+done
+wait_for_manifest "rollout restart" "${ROLLOUT_AT_V2}" --arg v2 "${V2_SUM}"
+
+ROLLOUT_STREAM_ELAPSED=0
+ROLLOUT_STATE_AT_STREAM=""
+while :; do
+    RESPONSE=$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)
+    if [ -z "${ROLLOUT_STATE_AT_STREAM}" ]; then
+        if [ "$(get_counter "${RESPONSE}" "events_request_count")" -gt "${EVREQ_BEFORE_ROLLOUT_RESTART}" ] 2>/dev/null; then
+            ROLLOUT_STATE_AT_STREAM=$(get_counter "${RESPONSE}" "state_count")
+        fi
+    elif [ "$(get_counter "${RESPONSE}" "state_count")" -gt "${ROLLOUT_STATE_AT_STREAM}" ] 2>/dev/null; then
+        echo "  PASS: [rollout restart] the restarted plexd opened its event stream and pulled after ${ROLLOUT_STREAM_ELAPSED}s"
+        break
+    fi
+    if [ "${ROLLOUT_STREAM_ELAPSED}" -ge 60 ]; then
+        fail "[rollout restart] the restarted plexd did not reopen its event stream and pull within 60s"
+    fi
+    sleep 1
+    ROLLOUT_STREAM_ELAPSED=$((ROLLOUT_STREAM_ELAPSED + 1))
+done
+
+CB_BEFORE_ROLLOUT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+configure_executions "exec-e2e-rollout-003" \
+    "$(exec_entry "exec-e2e-rollout-003" "e2e-rollout" "hook" "pending" "null")"
+wait_for_terminal_callback "rollout restart" "${CB_BEFORE_ROLLOUT}" \
+    '.status == "succeeded" and (.output.inline | @base64d | contains("e2e-rollout v2"))'
+FETCH_AFTER_ROLLOUT_RESTART=$(get_counter "$(curl -sf "${ASSERT_URL}" || true)" "hook_fetch_count")
+if [ "${FETCH_AFTER_ROLLOUT_RESTART}" = "${FETCH_BEFORE_ROLLOUT_RESTART}" ]; then
+    echo "  PASS: [rollout restart] hook_fetch_count stayed at ${FETCH_BEFORE_ROLLOUT_RESTART}: the restarted agent restored e2e-rollout from its record without fetching it"
+else
+    fail "[rollout restart] hook_fetch_count went from ${FETCH_BEFORE_ROLLOUT_RESTART} to '${FETCH_AFTER_ROLLOUT_RESTART}' across the restart, want no change: the restarted agent fetched e2e-rollout again instead of restoring it from its record"
+fi
+
+# (7) Tamper: an edit of the rolled-out file moves the digest the manifest
+# reports, and the entry stays at version 2: plexd compares a pull with its own
+# record, not with the bytes on disk, so the pass leaves the file alone. The pin
+# still holds the delivered checksum, so a dispatch fails its pre-dispatch check
+# and files one integrity violation. plexd sends the violation before the failed
+# callback, so the count is read once that callback has landed. Two pulls after
+# that callback must then leave the edit in place: no fetch since before the
+# edit, the same manifest entry, and the same digest on disk. A pass that
+# repaired the file could run alongside the dispatch and finish after it, so the
+# check waits for the pulls rather than read at once. The state_count baseline
+# goes ahead of a nudge, which reads no snapshot, so the nudge's pull is the
+# first of the two and a heartbeat brings the second, within 65s as in (3).
+TAMPER_LINE="echo e2e-rollout tampered"
+TAMPERED_HEX=$({ live_hook_text "e2e-rollout v2"; printf '%s\n' "${TAMPER_LINE}"; } | sha256_hex)
+FETCH_BEFORE_TAMPER=$(get_counter "$(curl -sf "${ASSERT_URL}" || true)" "hook_fetch_count")
+case "${FETCH_BEFORE_TAMPER}" in
+    '' | *[!0-9]*) fail "[rollout tamper] no hook_fetch_count baseline (got '${FETCH_BEFORE_TAMPER}')" ;;
+esac
+printf '%s\n' "${TAMPER_LINE}" | dc exec -T plexd /bin/busybox sh -c \
+    "/bin/busybox cat >> ${ROLLOUT_HOOKS_DIR}/e2e-rollout" \
+    || fail "[rollout tamper] could not append to ${ROLLOUT_HOOKS_DIR}/e2e-rollout in the container"
+wait_for_manifest "rollout tamper" \
+    'any(.declared_hooks[]?; .name == "e2e-rollout" and .source == "rollout" and .version == 2 and .checksum != $v2)' \
+    --arg v2 "${V2_SUM}"
+TAMPERED_MANIFEST_HEX=$(declared_hook_hex "${MANIFEST_BODY}" e2e-rollout)
+if [ "${TAMPERED_MANIFEST_HEX}" = "${TAMPERED_HEX}" ]; then
+    echo "  PASS: [rollout tamper] the manifest lists e2e-rollout at the digest of the edited file"
+else
+    fail "[rollout tamper] declared_hooks digest of e2e-rollout = ${TAMPERED_MANIFEST_HEX}, want ${TAMPERED_HEX}, the SHA-256 of the edited file"
+fi
+
+VIOLATIONS_BEFORE=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "integrity_violation_count")
+case "${VIOLATIONS_BEFORE}" in
+    '' | *[!0-9]*) fail "[rollout tamper] no integrity_violation_count baseline (got '${VIOLATIONS_BEFORE}')" ;;
+esac
+CB_BEFORE_ROLLOUT=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "execution_callback_count")
+configure_executions "exec-e2e-rollout-004" \
+    "$(exec_entry "exec-e2e-rollout-004" "e2e-rollout" "hook" "pending" "null")"
+wait_for_terminal_callback "rollout tamper" "${CB_BEFORE_ROLLOUT}" \
+    '.status == "failed" and (.error | contains("integrity check failed"))'
+VIOLATIONS_AFTER=$(get_counter "$(curl -sf "${ASSERT_URL}" 2>/dev/null || true)" "integrity_violation_count")
+if [ "${VIOLATIONS_AFTER}" = "$((VIOLATIONS_BEFORE + 1))" ]; then
+    echo "  PASS: [rollout tamper] integrity_violation_count grew from ${VIOLATIONS_BEFORE} to ${VIOLATIONS_AFTER}"
+else
+    fail "[rollout tamper] integrity_violation_count went from ${VIOLATIONS_BEFORE} to '${VIOLATIONS_AFTER}', want $((VIOLATIONS_BEFORE + 1))"
+fi
+
+STATE_BEFORE_TAMPER=$(get_counter "$(curl -sf "${ASSERT_URL}" || true)" "state_count")
+case "${STATE_BEFORE_TAMPER}" in
+    '' | *[!0-9]*) fail "[rollout tamper] no state_count baseline (got '${STATE_BEFORE_TAMPER}')" ;;
+esac
+nudge_hooks "rollout-tamper"
+TAMPER_ELAPSED=0
+while :; do
+    STATE_AFTER_TAMPER=$(get_counter "$(curl -sf "${ASSERT_URL}" || true)" "state_count")
+    if [ "${STATE_AFTER_TAMPER}" -ge $((STATE_BEFORE_TAMPER + 2)) ] 2>/dev/null; then
+        echo "  PASS: [rollout tamper] state_count grew from ${STATE_BEFORE_TAMPER} to ${STATE_AFTER_TAMPER} after ${TAMPER_ELAPSED}s"
+        break
+    fi
+    if [ "${TAMPER_ELAPSED}" -ge 65 ]; then
+        fail "[rollout tamper] state_count went from ${STATE_BEFORE_TAMPER} to '${STATE_AFTER_TAMPER}' in 65s, want two pulls after the failed dispatch"
+    fi
+    sleep 1
+    TAMPER_ELAPSED=$((TAMPER_ELAPSED + 1))
+done
+
+FETCH_AFTER_TAMPER=$(get_counter "$(curl -sf "${ASSERT_URL}" || true)" "hook_fetch_count")
+if [ "${FETCH_AFTER_TAMPER}" = "${FETCH_BEFORE_TAMPER}" ]; then
+    echo "  PASS: [rollout tamper] hook_fetch_count stayed at ${FETCH_BEFORE_TAMPER}: no pass fetched a copy to replace the edited file"
+else
+    fail "[rollout tamper] hook_fetch_count went from ${FETCH_BEFORE_TAMPER} to '${FETCH_AFTER_TAMPER}' since the edit, want no change: a pass fetched e2e-rollout again to replace the edited file"
+fi
+
+TAMPER_BODY=$(curl -sSf "http://localhost:18080/test/last-request/capabilities" 2>&1) \
+    || fail "[rollout tamper] could not read the captured manifest: ${TAMPER_BODY}"
+TAMPER_ENTRY=$(printf '%s' "${TAMPER_BODY}" | jq -c '[.declared_hooks[]? | select(.name == "e2e-rollout") | {source, version}]' 2>&1) \
+    || fail "[rollout tamper] could not read the e2e-rollout entry of the captured manifest: ${TAMPER_ENTRY} (body: ${TAMPER_BODY})"
+TAMPER_ENTRY_HEX=$(declared_hook_hex "${TAMPER_BODY}" e2e-rollout)
+if [ "${TAMPER_ENTRY}" = '[{"source":"rollout","version":2}]' ] && [ "${TAMPER_ENTRY_HEX}" = "${TAMPERED_HEX}" ]; then
+    echo "  PASS: [rollout tamper] the manifest still lists e2e-rollout as rollout version 2 at the digest of the edited file"
+else
+    fail "[rollout tamper] the manifest lists e2e-rollout as ${TAMPER_ENTRY} at digest '${TAMPER_ENTRY_HEX}', want [{\"source\":\"rollout\",\"version\":2}] at ${TAMPERED_HEX}, the SHA-256 of the edited file"
+fi
+
+TAMPER_DISK=$(dc exec -T plexd /bin/busybox sha256sum "${ROLLOUT_HOOKS_DIR}/e2e-rollout" 2>&1) \
+    || fail "[rollout tamper] could not hash ${ROLLOUT_HOOKS_DIR}/e2e-rollout in the container: ${TAMPER_DISK}"
+if [ "${TAMPER_DISK%% *}" = "${TAMPERED_HEX}" ]; then
+    echo "  PASS: [rollout tamper] ${ROLLOUT_HOOKS_DIR}/e2e-rollout still hashes to the digest of the edited file"
+else
+    fail "[rollout tamper] ${ROLLOUT_HOOKS_DIR}/e2e-rollout hashes to '${TAMPER_DISK}', want ${TAMPERED_HEX}, the SHA-256 of the edited file: plexd replaced it"
+fi
+
+# (8) Withdraw: an empty block withdraws every rolled-out hook. plexd deletes the
+# script and its sidecar, and the pass lists no error, so the manifest leaves
+# the hook_rollout_errors key out. The hand-placed e2e-collide is not plexd's to
+# remove, and it keeps its digest.
+configure_hooks "rollout-withdraw" '[]'
+wait_for_manifest "rollout withdraw" \
+    '[.declared_hooks[]?.name] == ["e2e-bigout", "e2e-collide"] and (has("hook_rollout_errors") | not)'
+for ROLLOUT_FILE in e2e-rollout e2e-rollout.json; do
+    ROLLOUT_EXISTS=$(rollout_file_exists "${ROLLOUT_FILE}") \
+        || fail "[rollout withdraw] could not check ${ROLLOUT_HOOKS_DIR}/${ROLLOUT_FILE} in the container: ${ROLLOUT_EXISTS}"
+    if [ "${ROLLOUT_EXISTS}" = "no" ]; then
+        echo "  PASS: [rollout withdraw] ${ROLLOUT_HOOKS_DIR}/${ROLLOUT_FILE} is gone"
+    else
+        fail "[rollout withdraw] ${ROLLOUT_HOOKS_DIR}/${ROLLOUT_FILE} exists: '${ROLLOUT_EXISTS}', want 'no'"
+    fi
+done
+COLLIDE_MANIFEST_HEX=$(declared_hook_hex "${MANIFEST_BODY}" e2e-collide)
+COLLIDE_DISK=$(dc exec -T plexd /bin/busybox sha256sum "${LIVE_HOOKS_DIR}/e2e-collide" 2>&1) \
+    || fail "[rollout withdraw] could not hash ${LIVE_HOOKS_DIR}/e2e-collide in the container: ${COLLIDE_DISK}"
+if [ "${COLLIDE_DISK%% *}" = "${COLLIDE_HEX}" ] && [ "${COLLIDE_MANIFEST_HEX}" = "${COLLIDE_HEX}" ]; then
+    echo "  PASS: [rollout withdraw] ${LIVE_HOOKS_DIR}/e2e-collide keeps its digest on disk and in the manifest"
+else
+    fail "[rollout withdraw] e2e-collide hashes to '${COLLIDE_DISK}' on disk and ${COLLIDE_MANIFEST_HEX} in the manifest, want ${COLLIDE_HEX}"
+fi
+
+# (9) Cleanup: e2e-collide leaves the container, the executions block goes back
+# to empty, the hooks block goes back to the null the fixture started with, and
+# the mock serves no version, so the later phases find the fixture they expect.
+dc exec -T plexd /bin/busybox rm "${LIVE_HOOKS_DIR}/e2e-collide" \
+    || fail "[rollout cleanup] could not remove e2e-collide from the container"
+configure_executions "exec-e2e-rollout-clear" '[]'
+configure_hooks "rollout-clear" null
+HV_ANSWER=$(configure_hook_versions '{"versions":[]}') || fail "[rollout cleanup] ${HV_ANSWER}"
+wait_for_declared_hooks "rollout cleanup" "e2e-bigout"
 
 echo "=== Phase 10 PASSED: deeper body validation ==="
 
